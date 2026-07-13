@@ -1,0 +1,34 @@
+//===- ArithToEmitRust.pdll - PDLL showcase patterns ------------*- pdll -*-===//
+//
+// This file is part of the EmitRust project.
+//
+//===----------------------------------------------------------------------===//
+//
+// PDLL showcase: declarative 1:1 rewrites of scalar Arith binary operations
+// into their EmitRust counterparts. These duplicate a subset of the C++
+// patterns in ArithToEmitRust.cpp and are only compiled and registered when
+// the top-level EMITRUST_ENABLE_PDLL CMake option is ON; the C++ patterns
+// remain the shipping baseline.
+//
+//===----------------------------------------------------------------------===//
+
+#include "mlir/Dialect/Arith/IR/ArithOps.td"
+#include "EmitRust/EmitRustOps.td"
+
+// Replaces `arith.addi` with `emitrust.add` of the same operands and type.
+Pattern ArithAddIToEmitRustAdd {
+  let root = op<arith.addi>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.add>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.subi` with `emitrust.sub` of the same operands and type.
+Pattern ArithSubIToEmitRustSub {
+  let root = op<arith.subi>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.sub>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.muli` with `emitrust.mul` of the same operands and type.
+Pattern ArithMulIToEmitRustMul {
+  let root = op<arith.muli>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.mul>(lhs, rhs) -> (resultType);
+}

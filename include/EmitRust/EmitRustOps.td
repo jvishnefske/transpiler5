@@ -1,0 +1,976 @@
+//===- EmitRustOps.td - EmitRust operations ----------------*- tablegen -*-===//
+//
+// This file is part of the EmitRust project.
+//
+//===----------------------------------------------------------------------===//
+//
+// Defines the MLIR EmitRust operations. This is the top-level TableGen file
+// of the dialect; it includes the base, type, and attribute definitions.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef EMITRUST_EMITRUSTOPS
+#define EMITRUST_EMITRUSTOPS
+
+include "EmitRust/EmitRustAttributes.td"
+include "EmitRust/EmitRustTypes.td"
+
+include "mlir/Interfaces/CallInterfaces.td"
+include "mlir/Interfaces/ControlFlowInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/Interfaces/InferTypeOpInterface.td"
+include "mlir/Interfaces/SideEffectInterfaces.td"
+
+//===----------------------------------------------------------------------===//
+// Common type constraints
+//===----------------------------------------------------------------------===//
+
+// Types usable in arithmetic and comparison operations: any integer
+// (signless, signed, or unsigned), index, f32, f64, or an opaque Rust type.
+def EmitRust_ArithmeticType
+    : AnyTypeOf<[AnyInteger, Index, F32, F64, EmitRust_OpaqueType]>;
+
+// Types usable as loop bounds: any integer or index.
+def EmitRust_IntegerOrIndexType : AnyTypeOf<[AnyInteger, Index]>;
+
+//===----------------------------------------------------------------------===//
+// UseOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_UseOp : EmitRust_Op<"use", [HasParent<"::mlir::ModuleOp">]> {
+  let summary = "Use declaration operation";
+  let description = [{
+    The `emitrust.use` operation emits a Rust `use` declaration bringing the
+    given path into scope. It may only appear at module level.
+
+    Example:
+
+    ```mlir
+    emitrust.use "std::vec::Vec"
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    use std::vec::Vec;
+    ```
+  }];
+
+  let arguments = (ins StrAttr:$path);
+  let assemblyFormat = "$path attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// VerbatimOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_VerbatimOp : EmitRust_Op<"verbatim"> {
+  let summary = "Verbatim operation";
+  let description = [{
+    The `emitrust.verbatim` operation produces no results and its value is
+    emitted as is, followed by a line break, during translation.
+
+    Note: Use with caution. This operation can have arbitrary effects on the
+    semantics of the emitted code. Use semantically more meaningful
+    operations whenever possible.
+
+    Example:
+
+    ```mlir
+    emitrust.verbatim "#![allow(dead_code)]"
+    ```
+  }];
+
+  let arguments = (ins StrAttr:$value);
+  let assemblyFormat = "$value attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// FuncOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_FuncOp : EmitRust_Op<"func", [
+  AutomaticAllocationScope, FunctionOpInterface, IsolatedFromAbove, Symbol
+]> {
+  let summary = "An operation with a name containing a single `SSACFG` region";
+  let description = [{
+    The `emitrust.func` operation represents a Rust function item. Operations
+    within the function cannot implicitly capture values defined outside of
+    the function, i.e. functions are `IsolatedFromAbove`. All external
+    references must use function arguments or attributes that establish a
+    symbolic connection. The function may have at most one result.
+
+    Example:
+
+    ```mlir
+    emitrust.func @add(%a: i32, %b: i32) -> i32 {
+      %sum = emitrust.add %a, %b : i32
+      emitrust.return %sum : i32
+    }
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    fn add(v1: i32, v2: i32) -> i32 {
+        let v3 = v1 + v2;
+        return v3;
+    }
+    ```
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       TypeAttrOf<FunctionType>:$function_type,
+                       OptionalAttr<DictArrayAttr>:$arg_attrs,
+                       OptionalAttr<DictArrayAttr>:$res_attrs);
+  let regions = (region AnyRegion:$body);
+
+  let builders = [OpBuilder<(ins
+    "::llvm::StringRef":$name, "::mlir::FunctionType":$type,
+    CArg<"::llvm::ArrayRef<::mlir::NamedAttribute>", "{}">:$attrs,
+    CArg<"::llvm::ArrayRef<::mlir::DictionaryAttr>", "{}">:$argAttrs)
+  >];
+
+  let extraClassDeclaration = [{
+    //===------------------------------------------------------------------===//
+    // FunctionOpInterface Methods
+    //===------------------------------------------------------------------===//
+
+    /// Returns the region on the current operation that is callable. This may
+    /// return null in the case of an external callable object, e.g. an
+    /// external function.
+    ::mlir::Region *getCallableRegion() {
+      return isExternal() ? nullptr : &getBody();
+    }
+
+    /// Returns the argument types of this function.
+    ::llvm::ArrayRef<::mlir::Type> getArgumentTypes() {
+      return getFunctionType().getInputs();
+    }
+
+    /// Returns the result types of this function.
+    ::llvm::ArrayRef<::mlir::Type> getResultTypes() {
+      return getFunctionType().getResults();
+    }
+  }];
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ReturnOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_ReturnOp : EmitRust_Op<"return", [Pure, HasParent<"FuncOp">,
+                                               ReturnLike, Terminator]> {
+  let summary = "Function return operation";
+  let description = [{
+    The `emitrust.return` operation represents a return within a function.
+    The operation takes zero or exactly one operand and produces no results.
+    The operand number and type must match the signature of the function
+    that contains the operation.
+
+    Example:
+
+    ```mlir
+    emitrust.func @foo() -> i32 {
+      %0 = emitrust.constant <42 : i32> : i32
+      emitrust.return %0 : i32
+    }
+    ```
+  }];
+
+  let arguments = (ins Optional<AnyType>:$operand);
+
+  let assemblyFormat = "attr-dict ($operand^ `:` type($operand))?";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// CallOpaqueOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_CallOpaqueOp : EmitRust_Op<"call_opaque"> {
+  let summary = "Opaque call operation";
+  let description = [{
+    The `emitrust.call_opaque` operation represents a call to an arbitrary
+    Rust callable identified by a non-empty string.
+
+    The optional `args` attribute controls the rendered argument list. When
+    present, arguments are taken from `args` in order: an `IntegerAttr` of
+    `index` type selects the operand with that index, a `StringAttr` renders
+    as a quoted, escaped Rust string literal, and any other typed attribute
+    renders as a constant expression. This makes it possible to pass literal
+    format strings to Rust macros, which require the format string to be a
+    literal inside the call. When `args` is absent, all operands are
+    rendered in order.
+
+    Example:
+
+    ```mlir
+    %0 = emitrust.call_opaque "foo"(%arg0) : (i32) -> i32
+    emitrust.call_opaque "println!"() : () -> ()
+    emitrust.call_opaque "print!"(%v) {args = ["x={}\n", 0 : index]}
+        : (i32) -> ()
+    ```
+    ```rust
+    // Code emitted for the last operation above.
+    print!("x={}\n", v0);
+    ```
+  }];
+
+  let arguments = (ins
+    Arg<StrAttr, "the Rust function to call">:$callee,
+    OptionalAttr<ArrayAttr>:$args,
+    Variadic<AnyType>:$operands
+  );
+  let results = (outs Variadic<AnyType>);
+
+  let assemblyFormat = [{
+    $callee `(` $operands `)` attr-dict `:` functional-type($operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ConstantOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_ConstantOp : EmitRust_Op<"constant"> {
+  let summary = "Constant operation";
+  let description = [{
+    The `emitrust.constant` operation produces an SSA value equal to some
+    constant specified by an attribute. The attribute is either a typed
+    attribute or an EmitRust opaque attribute whose value is emitted as is.
+
+    Example:
+
+    ```mlir
+    %0 = emitrust.constant <42 : i32> : i32
+    %1 = emitrust.constant <#emitrust.opaque<"i64::MAX">> : i64
+    ```
+  }];
+
+  let arguments = (ins EmitRust_OpaqueOrTypedAttr:$value);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "` ` `<` $value `>` attr-dict `:` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
+// LiteralOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_LiteralOp : EmitRust_Op<"literal", [Pure]> {
+  let summary = "Literal operation";
+  let description = [{
+    The `emitrust.literal` operation produces an SSA value whose textual
+    representation is the given non-empty string, emitted verbatim as a Rust
+    expression.
+
+    Example:
+
+    ```mlir
+    %l = emitrust.literal "x.len()" : index
+    ```
+  }];
+
+  let arguments = (ins StrAttr:$value);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$value attr-dict `:` type($result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// LetOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_LetOp : EmitRust_Op<"let", [AllTypesMatch<["init", "result"]>]> {
+  let summary = "Let binding operation";
+  let description = [{
+    The `emitrust.let` operation represents a Rust `let` binding initialized
+    with the given value. Bindings are immutable by default; the optional
+    `mut` marker makes the binding mutable, which is a prerequisite for it
+    being the destination of an `emitrust.assign`.
+
+    Example:
+
+    ```mlir
+    %v = emitrust.let %init : i32
+    %w = emitrust.let mut %init : i32
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    let v2 = v1;
+    let mut v3 = v1;
+    ```
+  }];
+
+  let arguments = (ins AnyType:$init, UnitAttr:$is_mut);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "(`mut` $is_mut^)? $init attr-dict `:` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
+// AssignOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_AssignOp : EmitRust_Op<"assign"> {
+  let summary = "Assign operation";
+  let description = [{
+    The `emitrust.assign` operation stores an SSA value to a destination.
+    Two kinds of destinations are supported, mirroring Rust's mutability
+    discipline:
+
+    - A mutable let binding: the destination must be the result of an
+      `emitrust.let` operation carrying the `mut` marker, and the value must
+      be of the same type as the destination.
+    - An lvalue: the destination is any value of `!emitrust.lvalue` type
+      (produced by `emitrust.variable`, `emitrust.member`,
+      `emitrust.subscript`, or `emitrust.deref`), and the value must be of
+      the lvalue's wrapped value type.
+
+    Assignment to anything else is rejected by the verifier. The operation
+    produces no results. The textual type is the type of the destination;
+    for an lvalue destination the value operand resolves to the lvalue's
+    wrapped value type.
+
+    Example:
+
+    ```mlir
+    %v = emitrust.let mut %init : i32
+    emitrust.assign %v = %next : i32
+    %p = emitrust.variable : !emitrust.lvalue<i32>
+    emitrust.assign %p = %next : !emitrust.lvalue<i32>
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    let mut v2 = v1;
+    v2 = v3;
+    let mut v4: i32 = 0;
+    v4 = v3;
+    ```
+  }];
+
+  let arguments = (ins AnyType:$var, AnyType:$value);
+  let results = (outs);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// StructDefOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_StructDefOp : EmitRust_Op<"struct_def", [
+    HasParent<"::mlir::ModuleOp">, Symbol]> {
+  let summary = "Struct definition operation";
+  let description = [{
+    The `emitrust.struct_def` operation defines a named Rust struct at
+    module level. The field names and field types are given as two arrays of
+    the same non-zero length; names must be non-empty and unique, and every
+    field type must be a scalar (integer, index, or float), an
+    `!emitrust.array`, or an `!emitrust.struct` (no lvalues or references).
+    Values of the struct are referenced through the `!emitrust.struct` type
+    carrying the same name.
+
+    The struct is emitted with `#[derive(Clone, Copy, Default)]`. This is an
+    MVP guarantee: all permitted field types are `Copy + Default`, and
+    arrays are limited to at most 32 elements so that the derived `Default`
+    implementation is available on all supported Rust editions.
+
+    Example:
+
+    ```mlir
+    emitrust.struct_def @Point ["x", "y"] [i32, i32]
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    #[derive(Clone, Copy, Default)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    ```
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       StrArrayAttr:$field_names,
+                       TypeArrayAttr:$field_types);
+  let results = (outs);
+
+  let assemblyFormat = "$sym_name $field_names $field_types attr-dict";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// VariableOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_VariableOp : EmitRust_Op<"variable"> {
+  let summary = "Local variable declaration operation";
+  let description = [{
+    The `emitrust.variable` operation declares a mutable local variable and
+    produces the lvalue naming its storage. The optional initializer must be
+    a typed attribute whose type equals the lvalue's wrapped value type;
+    initializers are only supported for scalar value types. Without an
+    initializer, the variable is emitted with the type's default value:
+    `0` for integers and index, `0.0` for floats, `false` for `i1`,
+    `Name::default()` for structs, and `[<element-default>; N]` for arrays.
+
+    Example:
+
+    ```mlir
+    %0 = emitrust.variable <42 : i32> : !emitrust.lvalue<i32>
+    %1 = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    let mut v0: i32 = 42;
+    let mut v1: [i32; 4] = [0; 4];
+    ```
+  }];
+
+  let arguments = (ins OptionalAttr<EmitRust_OpaqueOrTypedAttr>:$init);
+  let results = (outs EmitRust_LValueType:$result);
+
+  let builders = [
+    OpBuilder<(ins "Type":$resultType, CArg<"Attribute", "{}">:$init), [{
+      if (init)
+        $_state.addAttribute(getInitAttrName($_state.name), init);
+      $_state.addTypes(resultType);
+    }]>
+  ];
+  let skipDefaultBuilders = 1;
+
+  let assemblyFormat =
+      "(` ` `<` $init^ `>`)? attr-dict `:` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// MemberOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_MemberOp : EmitRust_Op<"member"> {
+  let summary = "Struct member place operation";
+  let description = [{
+    The `emitrust.member` operation refines a struct-typed lvalue into the
+    lvalue of one of its fields. The operand's wrapped value type must be an
+    `!emitrust.struct`; the named field is not cross-checked against the
+    corresponding `emitrust.struct_def`. The operation emits no code at its
+    program point; it contributes `.member` to the place expression of any
+    load, assign, or borrow that consumes it.
+
+    Example:
+
+    ```mlir
+    %x = emitrust.member %p["x"]
+        : (!emitrust.lvalue<!emitrust.struct<"Point">>) -> !emitrust.lvalue<i32>
+    %v = emitrust.load %x : (!emitrust.lvalue<i32>) -> i32
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    let v1: i32 = v0.x;
+    ```
+  }];
+
+  let arguments = (ins EmitRust_LValueType:$operand, StrAttr:$member);
+  let results = (outs EmitRust_LValueType:$result);
+
+  let assemblyFormat =
+      "$operand `[` $member `]` attr-dict `:` functional-type($operand, $result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// SubscriptOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_SubscriptOp : EmitRust_Op<"subscript"> {
+  let summary = "Array subscript place operation";
+  let description = [{
+    The `emitrust.subscript` operation refines an array-typed lvalue into
+    the lvalue of one of its elements. The array operand's wrapped value
+    type must be an `!emitrust.array` whose element type equals the result
+    lvalue's wrapped value type. The operation emits no code at its program
+    point; it contributes `[index as usize]` to the place expression of any
+    load, assign, or borrow that consumes it (the `as usize` cast is omitted
+    when the index is of `index` type).
+
+    Example:
+
+    ```mlir
+    %e = emitrust.subscript %a[%i]
+        : (!emitrust.lvalue<!emitrust.array<4xi32>>, index) -> !emitrust.lvalue<i32>
+    %v = emitrust.load %e : (!emitrust.lvalue<i32>) -> i32
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    let v2: i32 = v0[v1];
+    ```
+  }];
+
+  let arguments = (ins EmitRust_LValueType:$array,
+                       AnyTypeOf<[AnyInteger, Index]>:$index);
+  let results = (outs EmitRust_LValueType:$result);
+
+  let assemblyFormat =
+      "$array `[` $index `]` attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// DerefOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_DerefOp : EmitRust_Op<"deref"> {
+  let summary = "Reference dereference place operation";
+  let description = [{
+    The `emitrust.deref` operation turns a shared or mutable reference into
+    the lvalue of its pointee. The reference's pointee type must equal the
+    result lvalue's wrapped value type. The operation emits no code at its
+    program point; it contributes `(*ref)` to the place expression of any
+    load, assign, or borrow that consumes it.
+
+    Example:
+
+    ```mlir
+    %p = emitrust.deref %r : (!emitrust.mut_ref<i32>) -> !emitrust.lvalue<i32>
+    emitrust.assign %p = %v : !emitrust.lvalue<i32>
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    (*v0) = v1;
+    ```
+  }];
+
+  let arguments =
+      (ins AnyTypeOf<[EmitRust_RefType, EmitRust_MutRefType]>:$operand);
+  let results = (outs EmitRust_LValueType:$result);
+
+  let assemblyFormat =
+      "$operand attr-dict `:` functional-type($operand, $result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// LoadOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_LoadOp : EmitRust_Op<"load"> {
+  let summary = "Load operation";
+  let description = [{
+    The `emitrust.load` operation reads the current value of an lvalue. The
+    result type must equal the operand's wrapped value type. The operation
+    is emitted as a `let` binding of the place expression.
+
+    Example:
+
+    ```mlir
+    %v = emitrust.load %p : (!emitrust.lvalue<i32>) -> i32
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v1: i32 = v0;
+    ```
+  }];
+
+  let arguments = (ins EmitRust_LValueType:$operand);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$operand attr-dict `:` functional-type($operand, $result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// AddrOfOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_AddrOfOp : EmitRust_Op<"addr_of"> {
+  let summary = "Borrow operation";
+  let description = [{
+    The `emitrust.addr_of` operation borrows an lvalue, producing a shared
+    reference (`&place`) or, with the `mut` marker, a mutable reference
+    (`&mut place`). The `mut` marker must be present if and only if the
+    result is an `!emitrust.mut_ref`, and the reference's pointee type must
+    equal the operand's wrapped value type.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.addr_of %p : (!emitrust.lvalue<i32>) -> !emitrust.ref<i32>
+    %m = emitrust.addr_of mut %p
+        : (!emitrust.lvalue<i32>) -> !emitrust.mut_ref<i32>
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    let v1: &i32 = &v0;
+    let v2: &mut i32 = &mut v0;
+    ```
+  }];
+
+  let arguments = (ins EmitRust_LValueType:$operand, UnitAttr:$is_mut);
+  let results =
+      (outs AnyTypeOf<[EmitRust_RefType, EmitRust_MutRefType]>:$result);
+
+  let assemblyFormat =
+      "(`mut` $is_mut^)? $operand attr-dict `:` functional-type($operand, $result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Binary arithmetic operations
+//===----------------------------------------------------------------------===//
+
+// Base class for EmitRust binary arithmetic operations. Both operands and
+// the result share one type, which must be an integer, index, float, or
+// opaque type.
+class EmitRust_BinaryOp<string mnemonic, list<Trait> traits = []>
+    : EmitRust_Op<mnemonic,
+                  !listconcat(traits, [SameOperandsAndResultType])> {
+  let arguments = (ins EmitRust_ArithmeticType:$lhs,
+                       EmitRust_ArithmeticType:$rhs);
+  let results = (outs EmitRust_ArithmeticType:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` type($result)";
+}
+
+def EmitRust_AddOp : EmitRust_BinaryOp<"add"> {
+  let summary = "Addition operation";
+  let description = [{
+    The `emitrust.add` operation is emitted as the infix binary `+` operator.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.add %a, %b : i32
+    ```
+  }];
+}
+
+def EmitRust_SubOp : EmitRust_BinaryOp<"sub"> {
+  let summary = "Subtraction operation";
+  let description = [{
+    The `emitrust.sub` operation is emitted as the infix binary `-` operator.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.sub %a, %b : i32
+    ```
+  }];
+}
+
+def EmitRust_MulOp : EmitRust_BinaryOp<"mul"> {
+  let summary = "Multiplication operation";
+  let description = [{
+    The `emitrust.mul` operation is emitted as the infix binary `*` operator.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.mul %a, %b : i32
+    ```
+  }];
+}
+
+def EmitRust_DivOp : EmitRust_BinaryOp<"div"> {
+  let summary = "Division operation";
+  let description = [{
+    The `emitrust.div` operation is emitted as the infix binary `/` operator.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.div %a, %b : i32
+    ```
+  }];
+}
+
+def EmitRust_RemOp : EmitRust_BinaryOp<"rem"> {
+  let summary = "Remainder operation";
+  let description = [{
+    The `emitrust.rem` operation is emitted as the infix binary `%` operator.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.rem %a, %b : i32
+    ```
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// CmpOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_CmpOp : EmitRust_Op<"cmp", [SameTypeOperands]> {
+  let summary = "Comparison operation";
+  let description = [{
+    The `emitrust.cmp` operation is emitted as an infix Rust comparison.
+    Its predicate attribute defines the comparison operator:
+
+    - equal to                 (mnemonic: `eq`; integer value: `0`)
+    - not equal to             (mnemonic: `ne`; integer value: `1`)
+    - less than                (mnemonic: `lt`; integer value: `2`)
+    - less than or equal to    (mnemonic: `le`; integer value: `3`)
+    - greater than             (mnemonic: `gt`; integer value: `4`)
+    - greater than or equal to (mnemonic: `ge`; integer value: `5`)
+
+    Example:
+
+    ```mlir
+    %r = emitrust.cmp lt, %a, %b : (i32, i32) -> i1
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v3 = v1 < v2;
+    ```
+  }];
+
+  let arguments = (ins EmitRust_CmpPredicateAttr:$predicate,
+                       EmitRust_ArithmeticType:$lhs,
+                       EmitRust_ArithmeticType:$rhs);
+  let results = (outs I1:$result);
+
+  let assemblyFormat =
+      "$predicate `,` operands attr-dict `:` functional-type(operands, results)";
+}
+
+//===----------------------------------------------------------------------===//
+// CastOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_CastOp : EmitRust_Op<"cast"> {
+  let summary = "Cast operation";
+  let description = [{
+    The `emitrust.cast` operation performs an explicit type conversion and
+    is emitted as a Rust `as` cast expression.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.cast %v : i32 to i64
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v2 = v1 as i64;
+    ```
+  }];
+
+  let arguments = (ins AnyType:$source);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$source attr-dict `:` type($source) `to` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
+// IfOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_IfOp : EmitRust_Op<"if", [
+    SingleBlockImplicitTerminator<"emitrust::YieldOp">, NoRegionArguments]> {
+  let summary = "If-then-else operation";
+  let description = [{
+    The `emitrust.if` operation represents an if-then-else construct for
+    conditionally executing two regions of code. The operand is a boolean
+    value. The "then" region has exactly one block; the "else" region may be
+    absent. Blocks are terminated with `emitrust.yield`, which can be left
+    out and inserted implicitly. This operation produces no results.
+
+    Example:
+
+    ```mlir
+    emitrust.if %cond {
+      emitrust.call_opaque "then_branch"() : () -> ()
+    } else {
+      emitrust.call_opaque "else_branch"() : () -> ()
+    }
+    ```
+  }];
+
+  let arguments = (ins I1:$condition);
+  let results = (outs);
+  let regions = (region SizedRegion<1>:$thenRegion, AnyRegion:$elseRegion);
+
+  let assemblyFormat = "$condition $thenRegion (`else` $elseRegion^)? attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// ForOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_ForOp : EmitRust_Op<"for", [
+    AllTypesMatch<["lowerBound", "upperBound", "step"]>,
+    SingleBlockImplicitTerminator<"emitrust::YieldOp">]> {
+  let summary = "For operation";
+  let description = [{
+    The `emitrust.for` operation represents a Rust loop over a stepped range:
+
+    ```rust
+    for i in (lb..ub).step_by(step) { /* ... */ }
+    ```
+
+    The operation takes three SSA operands representing the lower bound,
+    upper bound, and step, all of the same integer or index type. Its single
+    region has one block whose sole argument is the induction variable, of
+    the same type as the bounds. The trailing colon-type is optional in the
+    custom syntax and defaults to `index`. The body block is terminated with
+    `emitrust.yield`, which may be left out and inserted implicitly. The
+    operation produces no results.
+
+    Example:
+
+    ```mlir
+    // Index case.
+    emitrust.for %i = %lb to %ub step %s {
+      emitrust.call_opaque "body"(%i) : (index) -> ()
+    }
+    // Integer case.
+    emitrust.for %j = %lb32 to %ub32 step %s32 : i32 {
+    }
+    ```
+  }];
+
+  let arguments = (ins EmitRust_IntegerOrIndexType:$lowerBound,
+                       EmitRust_IntegerOrIndexType:$upperBound,
+                       EmitRust_IntegerOrIndexType:$step);
+  let results = (outs);
+  let regions = (region SizedRegion<1>:$region);
+
+  let extraClassDeclaration = [{
+    /// Returns the induction variable: the single argument of the body block.
+    ::mlir::Value getInductionVar() { return getBody()->getArgument(0); }
+  }];
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// LoopOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_LoopOp : EmitRust_Op<"loop", [
+    SingleBlockImplicitTerminator<"emitrust::YieldOp">, NoRegionArguments]> {
+  let summary = "Infinite loop operation";
+  let description = [{
+    The `emitrust.loop` operation represents a Rust `loop` expression used
+    as a statement: an unconditional loop that only terminates through an
+    `emitrust.break` in its body (or by diverging). The operation takes no
+    operands and produces no results. Its single region has one block
+    without arguments, terminated with `emitrust.yield`, which may be left
+    out and inserted implicitly.
+
+    Example:
+
+    ```mlir
+    emitrust.loop {
+      emitrust.if %done {
+        emitrust.break
+      }
+    }
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    loop {
+        if v0 {
+            break;
+        }
+    }
+    ```
+  }];
+
+  let results = (outs);
+  let regions = (region SizedRegion<1>:$region);
+
+  let assemblyFormat = "$region attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// BreakOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_BreakOp : EmitRust_Op<"break"> {
+  let summary = "Loop break operation";
+  let description = [{
+    The `emitrust.break` operation exits the innermost enclosing
+    `emitrust.loop` or `emitrust.for`. It may appear anywhere inside the
+    loop body, including nested `emitrust.if` regions, but the search for
+    the enclosing loop stops at function boundaries. The operation takes no
+    operands, produces no results, and carries no traits so that it is never
+    eliminated as dead code.
+
+    Example:
+
+    ```mlir
+    emitrust.loop {
+      emitrust.break
+    }
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    loop {
+        break;
+    }
+    ```
+  }];
+
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ContinueOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_ContinueOp : EmitRust_Op<"continue"> {
+  let summary = "Loop continue operation";
+  let description = [{
+    The `emitrust.continue` operation skips to the next iteration of the
+    innermost enclosing `emitrust.loop` or `emitrust.for`. It may appear
+    anywhere inside the loop body, including nested `emitrust.if` regions,
+    but the search for the enclosing loop stops at function boundaries. The
+    operation takes no operands, produces no results, and carries no traits
+    so that it is never eliminated as dead code.
+
+    Example:
+
+    ```mlir
+    emitrust.for %i = %lb to %ub step %s {
+      emitrust.continue
+    }
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    for v3 in (v0..v1).step_by(v2 as usize) {
+        continue;
+    }
+    ```
+  }];
+
+  let assemblyFormat = "attr-dict";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// YieldOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_YieldOp : EmitRust_Op<"yield",
+    [Pure, Terminator, ParentOneOf<["IfOp", "ForOp", "LoopOp"]>]> {
+  let summary = "Block termination operation";
+  let description = [{
+    The `emitrust.yield` operation terminates the regions of `emitrust.if`,
+    `emitrust.for`, and `emitrust.loop`. It takes no operands, produces no
+    results, and emits no Rust code; it exists purely to satisfy MLIR's
+    structural requirement that blocks end with a terminator, and may be
+    omitted in the custom syntax.
+  }];
+
+  let assemblyFormat = "attr-dict";
+}
+
+#endif // EMITRUST_EMITRUSTOPS
