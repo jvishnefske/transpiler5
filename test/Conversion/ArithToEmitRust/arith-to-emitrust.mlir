@@ -1,5 +1,8 @@
-// FR: convert-arith-to-emitrust lowers scalar constants, signed binary
-// arithmetic, signed/ordered comparisons, and signed casts.
+// FR / C99-20: convert-arith-to-emitrust lowers scalar constants, signed
+// binary arithmetic, the bitwise and shift operations, the comparisons
+// with an exact Rust operator (signed integer predicates;
+// oeq/olt/ole/ogt/oge/une float predicates), scalar selects, and signed
+// casts (index_castui with zero-extension-exact rendering).
 // RUN: emitrust-opt --convert-arith-to-emitrust %s | FileCheck %s
 
 // CHECK-LABEL: func.func @constants
@@ -35,6 +38,43 @@ func.func @int_binops(%a: i32, %b: i32) -> (i32, i32, i32, i32, i32) {
   return %0, %1, %2, %3, %4 : i32, i32, i32, i32, i32
 }
 
+// Bitwise and/or/xor and the left shift are sign-agnostic and convert on
+// any integer type; shrsi converts on signless/signed types only (Rust's
+// `>>` on iN is the arithmetic shift). The unsigned-semantics shrui,
+// divui, remui, and cmpi ult/ule/ugt/uge only convert on unsigned
+// IntegerType operands — which the Arith verifier itself does not admit
+// today, so on the signless types the importer produces they stay illegal
+// (covered by unsigned-invalid.mlir) rather than silently converting to
+// the signed Rust operators.
+// CHECK-LABEL: func.func @bit_binops
+// CHECK:         emitrust.and %arg0, %arg1 : i32
+// CHECK:         emitrust.or %arg0, %arg1 : i32
+// CHECK:         emitrust.xor %arg0, %arg1 : i32
+// CHECK:         emitrust.shl %arg0, %arg1 : i32
+// CHECK:         emitrust.shr %arg0, %arg1 : i32
+// CHECK-NOT:     arith.
+func.func @bit_binops(%a: i32, %b: i32) -> (i32, i32, i32, i32, i32) {
+  %0 = arith.andi %a, %b : i32
+  %1 = arith.ori %a, %b : i32
+  %2 = arith.xori %a, %b : i32
+  %3 = arith.shli %a, %b : i32
+  %4 = arith.shrsi %a, %b : i32
+  return %0, %1, %2, %3, %4 : i32, i32, i32, i32, i32
+}
+
+// The bitwise operations also convert on the narrower and wider widths.
+// The operands are independent so that no arith folder (e.g. x & x = x)
+// removes the operation before the patterns run.
+// CHECK-LABEL: func.func @bit_binops_widths
+// CHECK:         emitrust.and %arg0, %arg1 : i8
+// CHECK:         emitrust.shr %arg2, %arg3 : i64
+// CHECK-NOT:     arith.
+func.func @bit_binops_widths(%a: i8, %b: i8, %c: i64, %d: i64) -> (i8, i64) {
+  %0 = arith.andi %a, %b : i8
+  %1 = arith.shrsi %c, %d : i64
+  return %0, %1 : i8, i64
+}
+
 // CHECK-LABEL: func.func @float_binops
 // CHECK:         emitrust.add %arg0, %arg1 : f64
 // CHECK:         emitrust.sub %arg0, %arg1 : f64
@@ -67,6 +107,10 @@ func.func @int_cmps(%a: i32, %b: i32) -> (i1, i1, i1, i1, i1, i1) {
   return %0, %1, %2, %3, %4, %5 : i1, i1, i1, i1, i1, i1
 }
 
+// Rust float `==`/`<`/`<=`/`>`/`>=` are the IEEE ordered comparisons and
+// `!=` is unordered-or-unequal, so oeq/olt/ole/ogt/oge and une map exactly.
+// `one` and the remaining unordered predicates have no Rust operator and
+// stay illegal, covered by unsigned-invalid.mlir.
 // CHECK-LABEL: func.func @float_cmps
 // CHECK:         emitrust.cmp eq, %arg0, %arg1 : (f32, f32) -> i1
 // CHECK:         emitrust.cmp ne, %arg0, %arg1 : (f32, f32) -> i1
@@ -77,7 +121,7 @@ func.func @int_cmps(%a: i32, %b: i32) -> (i1, i1, i1, i1, i1, i1) {
 // CHECK-NOT:     arith.cmpf
 func.func @float_cmps(%a: f32, %b: f32) -> (i1, i1, i1, i1, i1, i1) {
   %0 = arith.cmpf oeq, %a, %b : f32
-  %1 = arith.cmpf one, %a, %b : f32
+  %1 = arith.cmpf une, %a, %b : f32
   %2 = arith.cmpf olt, %a, %b : f32
   %3 = arith.cmpf ole, %a, %b : f32
   %4 = arith.cmpf ogt, %a, %b : f32
@@ -104,6 +148,43 @@ func.func @casts(%a: i16, %b: i64, %c: i32, %d: f64, %e: index, %f: i1)
   // illegal, covered by unsigned-invalid.mlir.
   %5 = arith.extui %f : i1 to i32
   return %0, %1, %2, %3, %4, %5 : i32, i32, f64, i32, i64, i32
+}
+
+// index_castui zero-extends. A single Rust `as usize` would SIGN-extend a
+// signed iN source (lift-cf-to-scf feeds user switch scrutinees through
+// this cast, so negative values do occur), so the lowering hops through
+// the unsigned type of the same width: `v as uN as usize`. An i1 source
+// keeps the single cast (bool as usize is 0 or 1), as does an index
+// source (usize as iN truncation is bit-exact regardless of extension).
+// CHECK-LABEL: func.func @index_castui_zext
+// CHECK:         %[[U32:.*]] = emitrust.cast %arg0 : i32 to ui32
+// CHECK:         emitrust.cast %[[U32]] : ui32 to index
+// CHECK:         %[[U64:.*]] = emitrust.cast %arg1 : i64 to ui64
+// CHECK:         emitrust.cast %[[U64]] : ui64 to index
+// CHECK:         emitrust.cast %arg2 : i1 to index
+// CHECK:         emitrust.cast %arg3 : index to i32
+// CHECK-NOT:     arith.
+func.func @index_castui_zext(%a: i32, %b: i64, %c: i1, %d: index)
+    -> (index, index, index, i32) {
+  %0 = arith.index_castui %a : i32 to index
+  %1 = arith.index_castui %b : i64 to index
+  %2 = arith.index_castui %c : i1 to index
+  %3 = arith.index_castui %d : index to i32
+  return %0, %1, %2, %3 : index, index, index, i32
+}
+
+// arith.select lowers to emitrust.select, rendered as a Rust
+// `if cond { a } else { b }` expression; the canonicalizer synthesizes it
+// from folded conditional chains.
+// CHECK-LABEL: func.func @selects
+// CHECK:         emitrust.select %arg0, %arg1, %arg2 : i32
+// CHECK:         emitrust.select %arg0, %arg3, %arg4 : f64
+// CHECK-NOT:     arith.
+func.func @selects(%c: i1, %a: i32, %b: i32, %x: f64, %y: f64)
+    -> (i32, f64) {
+  %0 = arith.select %c, %a, %b : i32
+  %1 = arith.select %c, %x, %y : f64
+  return %0, %1 : i32, f64
 }
 
 // A truncation to i1 selects the low bit, which has no Rust `as`

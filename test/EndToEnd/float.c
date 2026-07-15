@@ -1,6 +1,7 @@
 // REQUIRES: cargo
 // FR-21: differential end-to-end test: double arithmetic printed with %f (which
-// the importer maps to Rust's {:.6}, matching C's default six decimals).
+// the importer routes through the __emitrust_fmt_f64 helper; finite values
+// render as Rust's {:.6}, matching C's default six decimals).
 // main returns 0 and reports everything via printf, so lit's per-command
 // exit-code checking covers both runs and diff covers the observable
 // behavior.

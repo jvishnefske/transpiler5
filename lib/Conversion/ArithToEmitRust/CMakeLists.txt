@@ -2,11 +2,12 @@
 # arithmetic, signed/ordered comparisons, and signed casts.
 #
 # When EMITRUST_ENABLE_PDLL is ON (requires the mlir-pdll tool from the
-# `nix develop .#pdll` shell), a small PDLL showcase compiles
-# ArithToEmitRust.pdll into additional 1:1 patterns that are registered next
-# to the C++ ones. With the option OFF (the default) nothing here changes:
-# mlir-pdll is never invoked and the compiled code is bit-identical to the
-# C++-only baseline.
+# `nix develop .#pdll` shell), ArithToEmitRust.pdll compiles into duplicate
+# declarative patterns covering the full PDLL-expressible inventory
+# (constants, binary operations, per-predicate comparisons, and casts) that
+# are registered next to the C++ ones. With the option OFF (the default)
+# nothing here changes: mlir-pdll is never invoked and the compiled code is
+# bit-identical to the C++-only baseline.
 set(EMITRUST_ARITH_PDLL_DEPS "")
 set(EMITRUST_ARITH_PDLL_LIBS "")
 if(EMITRUST_ENABLE_PDLL)

@@ -43,3 +43,7 @@
 # CMake build directories (default shell and .#pdll variant)
 build/
 build-pdll/
+
+# Claude Code session worktrees and editor swap files
+.claude/worktrees/
+.*.swp

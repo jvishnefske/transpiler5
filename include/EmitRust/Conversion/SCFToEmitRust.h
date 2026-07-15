@@ -8,9 +8,9 @@
 /// Declares the conversion from the SCF dialect to the EmitRust dialect,
 /// preserving structured control flow: `scf.if` to `emitrust.if`,
 /// `scf.while` to `emitrust.loop` with an `emitrust.if` + `emitrust.break`
-/// exit, `scf.for` to `emitrust.for`, and `scf.index_switch` to a nested
-/// `emitrust.if`/else chain. SSA results are modeled as mutable
-/// `emitrust.let` bindings assigned from within the regions.
+/// exit, `scf.for` to `emitrust.for`, and `scf.index_switch` to
+/// `emitrust.switch`. SSA results are modeled as mutable `emitrust.let`
+/// bindings assigned from within the regions.
 //
 //===----------------------------------------------------------------------===//
 

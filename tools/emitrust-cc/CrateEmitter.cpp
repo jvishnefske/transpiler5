@@ -26,11 +26,12 @@ namespace emitrustcc {
 
 /// Attribute header prepended to every generated `main.rs`. The emitter's
 /// statement-per-op, mut-let style legitimately triggers these lints (for
-/// example a `let mut` that is assigned in only one `if` arm), so the
-/// generated crate silences them to stay warning-clean.
+/// example a `let mut` that is assigned in only one `if` arm), and global
+/// variables keep their original C spelling rather than SCREAMING_CASE, so
+/// the generated crate silences them to stay warning-clean.
 static constexpr llvm::StringLiteral kAllowHeader =
     "#![allow(unused_variables, unused_assignments, unused_mut, "
-    "unused_parens, dead_code)]\n";
+    "unused_parens, dead_code, non_upper_case_globals)]\n";
 
 /// Verbatim entry-point wrapper: forwards the imported C `main`'s return
 /// value as the process exit code.

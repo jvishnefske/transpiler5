@@ -38,6 +38,7 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/MathExtras.h"
 
 #include <charconv>
 #include <string>
@@ -112,8 +113,8 @@ private:
   LogicalResult emitPlaceExpr(Location loc, Value value);
 
   /// Emits the default value of `type`: `0` for integers and index, `0.0`
-  /// for floats, `false` for `i1`, `Name::default()` for structs, and
-  /// `[<element-default>; N]` for arrays.
+  /// for floats, `false` for `i1`, `Name::default()` for structs and
+  /// enums, and `[<element-default>; N]` for arrays.
   LogicalResult emitDefaultValue(Location loc, Type type);
 
   /// Emits `value` as a quoted Rust string literal, escaping backslashes,
@@ -159,10 +160,20 @@ private:
   LogicalResult emitAssign(emitrust::AssignOp assignOp);
   /// Emits `let vN: T = vA <symbol> vB;` for binary and comparison ops.
   LogicalResult emitBinary(Operation *op, StringRef symbol);
+  /// Emits `let vN: T = vA.<method>(vB);` for the method-call binary form.
+  LogicalResult emitBinaryMethod(Operation *op, StringRef method);
+  /// Emits an add/sub/mul: the `wrapping_*` method-call form when the
+  /// result type is an unsigned integer (C defines unsigned overflow as
+  /// wrap-around; Rust's infix operators panic on overflow in debug
+  /// builds), the infix `symbol` form otherwise.
+  LogicalResult emitWrappingBinary(Operation *op, StringRef symbol,
+                                   StringRef method);
   /// Emits `let vN: bool = vA <pred> vB;`.
   LogicalResult emitCmp(emitrust::CmpOp cmpOp);
   /// Emits `let vN: T = vA as T;`.
   LogicalResult emitCast(emitrust::CastOp castOp);
+  /// Emits `let vN: T = if vCond { vA } else { vB };`.
+  LogicalResult emitSelect(emitrust::SelectOp selectOp);
   /// Emits an `if` statement, with `} else {` when the else region is
   /// present and non-empty.
   LogicalResult emitIf(emitrust::IfOp ifOp);
@@ -170,8 +181,23 @@ private:
   LogicalResult emitFor(emitrust::ForOp forOp);
   /// Emits `loop { ... }`.
   LogicalResult emitLoop(emitrust::LoopOp loopOp);
+  /// Emits a `match` statement with one literal integer arm per case region
+  /// (each case value rendered in the discriminator's type) and a trailing
+  /// `_ =>` arm for the default region.
+  LogicalResult emitSwitch(emitrust::SwitchOp switchOp);
   /// Emits a `#[derive(Clone, Copy, Default)]` struct item with its fields.
   LogicalResult emitStructDef(emitrust::StructDefOp structDefOp);
+  /// Emits a `#[repr(i32)]` enum item with its variants; the first variant
+  /// carries the `#[default]` attribute.
+  LogicalResult emitEnumDef(emitrust::EnumDefOp enumDefOp);
+  /// Emits a global: `static NAME: T = <init-or-default>;` for `const`
+  /// globals, and a `thread_local!` `std::cell::Cell` item otherwise.
+  LogicalResult emitGlobal(emitrust::GlobalOp globalOp);
+  /// Emits `let vN: T = NAME;` (const global) or
+  /// `let vN: T = NAME.with(|c| c.get());` (mutable global).
+  LogicalResult emitGlobalLoad(emitrust::GlobalLoadOp loadOp);
+  /// Emits `NAME.with(|c| c.set(vX));`.
+  LogicalResult emitGlobalStore(emitrust::GlobalStoreOp storeOp);
   /// Emits `let mut vN: T = <init-or-default>;` for a local variable.
   LogicalResult emitVariable(emitrust::VariableOp variableOp);
   /// Emits `let vN: T = <place-expr>;`.
@@ -265,6 +291,10 @@ LogicalResult RustEmitter::emitType(Location loc, Type type) {
   }
   if (auto structType = dyn_cast<emitrust::StructType>(type)) {
     os << structType.getName();
+    return success();
+  }
+  if (auto enumType = dyn_cast<emitrust::EnumType>(type)) {
+    os << enumType.getName();
     return success();
   }
   // Lvalue types are never rendered; they fall through to the error below.
@@ -378,6 +408,10 @@ LogicalResult RustEmitter::emitDefaultValue(Location loc, Type type) {
     os << structType.getName() << "::default()";
     return success();
   }
+  if (auto enumType = dyn_cast<emitrust::EnumType>(type)) {
+    os << enumType.getName() << "::default()";
+    return success();
+  }
   if (auto arrayType = dyn_cast<emitrust::ArrayType>(type)) {
     os << "[";
     if (failed(emitDefaultValue(loc, arrayType.getElementType())))
@@ -448,7 +482,8 @@ LogicalResult RustEmitter::emitRegionBody(Operation *parent, Region &region) {
 LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   for (Operation &op : *moduleOp.getBody()) {
     if (!isa<emitrust::UseOp, emitrust::VerbatimOp, emitrust::FuncOp,
-             emitrust::StructDefOp>(&op))
+             emitrust::StructDefOp, emitrust::EnumDefOp,
+             emitrust::GlobalOp>(&op))
       return op.emitOpError("unable to translate op");
     if (failed(emitOperation(op)))
       return failure();
@@ -640,6 +675,26 @@ LogicalResult RustEmitter::emitBinary(Operation *op, StringRef symbol) {
   return success();
 }
 
+LogicalResult RustEmitter::emitBinaryMethod(Operation *op, StringRef method) {
+  if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+    return failure();
+  os << "." << method << "(";
+  if (failed(emitOperand(op->getLoc(), op->getOperand(1))))
+    return failure();
+  os << ");\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitWrappingBinary(Operation *op, StringRef symbol,
+                                              StringRef method) {
+  auto intType = dyn_cast<IntegerType>(op->getResult(0).getType());
+  if (intType && intType.isUnsigned())
+    return emitBinaryMethod(op, method);
+  return emitBinary(op, symbol);
+}
+
 /// Returns the Rust operator spelling for `predicate`, or an empty string if
 /// the predicate is unknown.
 static StringRef cmpPredicateSymbol(emitrust::CmpPredicate predicate) {
@@ -673,6 +728,10 @@ LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
   // as a comparison instead of a cast.
   if (op->getResult(0).getType().isInteger(1))
     return op->emitOpError("cannot translate a cast to bool");
+  // Rust has no integer-to-enum `as` cast; the verifier already rejects
+  // enum results, mirrored here for defense in depth.
+  if (isa<emitrust::EnumType>(op->getResult(0).getType()))
+    return op->emitOpError("cannot translate a cast to an enum type");
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
   if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
@@ -681,6 +740,24 @@ LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
   if (failed(emitType(op->getLoc(), op->getResult(0).getType())))
     return failure();
   os << ";\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitSelect(emitrust::SelectOp selectOp) {
+  Operation *op = selectOp.getOperation();
+  Location loc = op->getLoc();
+  if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  os << "if ";
+  if (failed(emitOperand(loc, selectOp.getCondition())))
+    return failure();
+  os << " { ";
+  if (failed(emitOperand(loc, selectOp.getTrueValue())))
+    return failure();
+  os << " } else { ";
+  if (failed(emitOperand(loc, selectOp.getFalseValue())))
+    return failure();
+  os << " };\n";
   return success();
 }
 
@@ -745,6 +822,47 @@ LogicalResult RustEmitter::emitLoop(emitrust::LoopOp loopOp) {
   return success();
 }
 
+LogicalResult RustEmitter::emitSwitch(emitrust::SwitchOp switchOp) {
+  Operation *op = switchOp.getOperation();
+  os << "match ";
+  if (failed(emitOperand(op->getLoc(), switchOp.getDiscriminator())))
+    return failure();
+  os << " {\n";
+  increaseIndent();
+  Type discriminatorType = switchOp.getDiscriminator().getType();
+  for (auto [value, region] :
+       llvm::zip(switchOp.getCases(), switchOp.getCaseRegions())) {
+    // The cases attribute stores the raw 64-bit case pattern; render it
+    // interpreted in the discriminator's Rust type so the literal arm
+    // compares equal at runtime. A usize (index) or unsigned discriminator
+    // prints the low bits as unsigned decimal (a C `case -1:` on `long`
+    // reaches a usize scrutinee as the bit pattern 2^64 - 1); a signed iN
+    // discriminator prints the sign-interpreted value of its width.
+    if (isa<IndexType>(discriminatorType)) {
+      os << static_cast<uint64_t>(value);
+    } else {
+      auto intType = cast<IntegerType>(discriminatorType);
+      unsigned width = intType.getWidth();
+      if (intType.isUnsigned())
+        os << (static_cast<uint64_t>(value) &
+               llvm::maskTrailingOnes<uint64_t>(width));
+      else
+        os << llvm::SignExtend64(value, width);
+    }
+    os << " => {\n";
+    if (failed(emitRegionBody(op, region)))
+      return failure();
+    os << "}\n";
+  }
+  os << "_ => {\n";
+  if (failed(emitRegionBody(op, switchOp.getDefaultRegion())))
+    return failure();
+  os << "}\n";
+  decreaseIndent();
+  os << "}\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   Location loc = structDefOp.getLoc();
   os << "#[derive(Clone, Copy, Default)]\n";
@@ -760,6 +878,114 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   }
   decreaseIndent();
   os << "}\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitEnumDef(emitrust::EnumDefOp enumDefOp) {
+  os << "#[repr(i32)]\n";
+  os << "#[derive(Clone, Copy, PartialEq, Default)]\n";
+  os << "enum " << enumDefOp.getSymName() << " {\n";
+  increaseIndent();
+  bool first = true;
+  for (auto [nameAttr, value] : llvm::zip_equal(enumDefOp.getVariantNames(),
+                                                enumDefOp.getVariantValues())) {
+    if (first) {
+      os << "#[default]\n";
+      first = false;
+    }
+    os << cast<StringAttr>(nameAttr).getValue() << " = " << value << ",\n";
+  }
+  decreaseIndent();
+  os << "}\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitGlobal(emitrust::GlobalOp globalOp) {
+  Location loc = globalOp.getLoc();
+  Type type = globalOp.getType();
+
+  // Emits the initializer expression: the typed init attribute when
+  // present, the type's default value otherwise (C zero-initialization of
+  // static storage).
+  auto emitInit = [&]() -> LogicalResult {
+    if (Attribute init = globalOp.getInitAttr())
+      return emitAttribute(loc, init);
+    return emitDefaultValue(loc, type);
+  };
+
+  if (globalOp.getIsConst()) {
+    // Never-written global: a plain static item read directly. The
+    // verifier guarantees the type is a scalar or array, whose default and
+    // initializer expressions are const-evaluable.
+    os << "static " << globalOp.getSymName() << ": ";
+    if (failed(emitType(loc, type)))
+      return failure();
+    os << " = ";
+    if (failed(emitInit()))
+      return failure();
+    os << ";\n";
+    return success();
+  }
+
+  // Mutable global: interior mutability through a thread-local Cell keeps
+  // the generated crate free of `unsafe` and `static mut`. Exact for the
+  // single-threaded programs the importer accepts.
+  os << "thread_local! {\n";
+  increaseIndent();
+  os << "static " << globalOp.getSymName() << ": std::cell::Cell<";
+  if (failed(emitType(loc, type)))
+    return failure();
+  os << "> = std::cell::Cell::new(";
+  if (failed(emitInit()))
+    return failure();
+  os << ");\n";
+  decreaseIndent();
+  os << "}\n";
+  return success();
+}
+
+/// Resolves the `emitrust.global` referenced by the load or store `op`, or
+/// fails with a located diagnostic when the symbol does not name one.
+static FailureOr<emitrust::GlobalOp> lookupGlobal(Operation *op,
+                                                  FlatSymbolRefAttr symbol) {
+  auto global = SymbolTable::lookupNearestSymbolFrom<emitrust::GlobalOp>(
+      op, symbol.getAttr());
+  if (!global) {
+    op->emitOpError("'") << symbol.getValue()
+                         << "' does not reference a valid emitrust.global";
+    return failure();
+  }
+  return global;
+}
+
+LogicalResult RustEmitter::emitGlobalLoad(emitrust::GlobalLoadOp loadOp) {
+  Operation *op = loadOp.getOperation();
+  FailureOr<emitrust::GlobalOp> global =
+      lookupGlobal(op, loadOp.getGlobalAttr());
+  if (failed(global))
+    return failure();
+  if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  os << global->getSymName();
+  if (!global->getIsConst())
+    os << ".with(|c| c.get())";
+  os << ";\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitGlobalStore(emitrust::GlobalStoreOp storeOp) {
+  Operation *op = storeOp.getOperation();
+  FailureOr<emitrust::GlobalOp> global =
+      lookupGlobal(op, storeOp.getGlobalAttr());
+  if (failed(global))
+    return failure();
+  if (global->getIsConst())
+    return op->emitOpError("cannot store to the immutable global @")
+           << storeOp.getGlobal();
+  os << global->getSymName() << ".with(|c| c.set(";
+  if (failed(emitOperand(op->getLoc(), storeOp.getValue())))
+    return failure();
+  os << "));\n";
   return success();
 }
 
@@ -833,29 +1059,54 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
       .Case<emitrust::AssignOp>(
           [&](emitrust::AssignOp assignOp) { return emitAssign(assignOp); })
       .Case<emitrust::AddOp>([&](emitrust::AddOp addOp) {
-        return emitBinary(addOp.getOperation(), "+");
+        return emitWrappingBinary(addOp.getOperation(), "+", "wrapping_add");
       })
       .Case<emitrust::SubOp>([&](emitrust::SubOp subOp) {
-        return emitBinary(subOp.getOperation(), "-");
+        return emitWrappingBinary(subOp.getOperation(), "-", "wrapping_sub");
       })
       .Case<emitrust::MulOp>([&](emitrust::MulOp mulOp) {
-        return emitBinary(mulOp.getOperation(), "*");
+        return emitWrappingBinary(mulOp.getOperation(), "*", "wrapping_mul");
       })
+      // Division, remainder, bitwise, and shift operators keep the infix
+      // form on every integer type: Rust's `/`, `%`, `&`, `|`, `^`, `<<`,
+      // and `>>` already match C's semantics on the matching signedness
+      // (division by zero panics where C is undefined).
       .Case<emitrust::DivOp>([&](emitrust::DivOp divOp) {
         return emitBinary(divOp.getOperation(), "/");
       })
       .Case<emitrust::RemOp>([&](emitrust::RemOp remOp) {
         return emitBinary(remOp.getOperation(), "%");
       })
+      .Case<emitrust::AndOp>([&](emitrust::AndOp andOp) {
+        return emitBinary(andOp.getOperation(), "&");
+      })
+      .Case<emitrust::OrOp>([&](emitrust::OrOp orOp) {
+        return emitBinary(orOp.getOperation(), "|");
+      })
+      .Case<emitrust::XorOp>([&](emitrust::XorOp xorOp) {
+        return emitBinary(xorOp.getOperation(), "^");
+      })
+      .Case<emitrust::ShlOp>([&](emitrust::ShlOp shlOp) {
+        return emitBinary(shlOp.getOperation(), "<<");
+      })
+      .Case<emitrust::ShrOp>([&](emitrust::ShrOp shrOp) {
+        return emitBinary(shrOp.getOperation(), ">>");
+      })
       .Case<emitrust::CmpOp>(
           [&](emitrust::CmpOp cmpOp) { return emitCmp(cmpOp); })
       .Case<emitrust::CastOp>(
           [&](emitrust::CastOp castOp) { return emitCast(castOp); })
+      .Case<emitrust::SelectOp>([&](emitrust::SelectOp selectOp) {
+        return emitSelect(selectOp);
+      })
       .Case<emitrust::IfOp>([&](emitrust::IfOp ifOp) { return emitIf(ifOp); })
       .Case<emitrust::ForOp>(
           [&](emitrust::ForOp forOp) { return emitFor(forOp); })
       .Case<emitrust::LoopOp>(
           [&](emitrust::LoopOp loopOp) { return emitLoop(loopOp); })
+      .Case<emitrust::SwitchOp>([&](emitrust::SwitchOp switchOp) {
+        return emitSwitch(switchOp);
+      })
       .Case<emitrust::BreakOp>([&](emitrust::BreakOp) {
         os << "break;\n";
         return success();
@@ -866,6 +1117,18 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
       })
       .Case<emitrust::StructDefOp>([&](emitrust::StructDefOp structDefOp) {
         return emitStructDef(structDefOp);
+      })
+      .Case<emitrust::EnumDefOp>([&](emitrust::EnumDefOp enumDefOp) {
+        return emitEnumDef(enumDefOp);
+      })
+      .Case<emitrust::GlobalOp>([&](emitrust::GlobalOp globalOp) {
+        return emitGlobal(globalOp);
+      })
+      .Case<emitrust::GlobalLoadOp>([&](emitrust::GlobalLoadOp loadOp) {
+        return emitGlobalLoad(loadOp);
+      })
+      .Case<emitrust::GlobalStoreOp>([&](emitrust::GlobalStoreOp storeOp) {
+        return emitGlobalStore(storeOp);
       })
       .Case<emitrust::VariableOp>([&](emitrust::VariableOp variableOp) {
         return emitVariable(variableOp);

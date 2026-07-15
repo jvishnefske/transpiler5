@@ -1,34 +1,603 @@
-//===- ArithToEmitRust.pdll - PDLL showcase patterns ------------*- pdll -*-===//
+//===- ArithToEmitRust.pdll - Declarative Arith patterns --------*- pdll -*-===//
 //
 // This file is part of the EmitRust project.
 //
 //===----------------------------------------------------------------------===//
 //
-// PDLL showcase: declarative 1:1 rewrites of scalar Arith binary operations
-// into their EmitRust counterparts. These duplicate a subset of the C++
-// patterns in ArithToEmitRust.cpp and are only compiled and registered when
+// PDLL implementations of every Arith-to-EmitRust pattern that is
+// expressible declaratively: the scalar constant, the signed integer and
+// float binary operations, the bitwise and shift operations (the
+// unsigned-semantics shrui/divui/remui guarded to unsigned IntegerType and
+// shrsi guarded to signless/signed, exactly as in C++), the signed
+// `arith.cmpi` predicates, the unsigned `arith.cmpi` predicates guarded to
+// unsigned operand types, and the `arith.cmpf` predicates with an exact
+// Rust operator (one pattern per predicate; all other predicates
+// deliberately have no pattern and stay illegal), the scalar
+// `arith.select`, the signed casts, the zero-extension-exact
+// `arith.index_castui` expansion, the bool-source `arith.extui`, and the
+// `arith.trunci`-to-`i1` low-bit expansion. These
+// duplicate the C++ patterns in
+// ArithToEmitRust.cpp one-for-one and are only compiled and registered when
 // the top-level EMITRUST_ENABLE_PDLL CMake option is ON; the C++ patterns
 // remain the shipping baseline.
+//
+// Every pattern carries benefit(2) so that, in the opt-in build, the
+// conversion driver prefers the PDLL patterns over their benefit-1 C++
+// duplicates: the regular conversion tests then genuinely exercise the
+// declarative rewrites, and any divergence from the C++ output fails the
+// suite.
+//
+// The EmitRust type converter is a strict identity on every type these
+// patterns can encounter (builtin integers, index, f32/f64), so binding the
+// matched result types directly is exactly equivalent to the C++ patterns'
+// convertType calls.
+//
+// Structural conversions (SCF loops/switches, function signatures) inline
+// regions and remap block arguments; they are not expressible in PDLL and
+// remain C++-only by design.
 //
 //===----------------------------------------------------------------------===//
 
 #include "mlir/Dialect/Arith/IR/ArithOps.td"
 #include "EmitRust/EmitRustOps.td"
 
+//===----------------------------------------------------------------------===//
+// Native helpers
+//===----------------------------------------------------------------------===//
+
+// Succeeds when `value` is a scalar integer or float attribute; dense and
+// other aggregate constants stay illegal (MVP boundary).
+Constraint ScalarConstantValue(value: Attr) [{
+  return ::mlir::success(
+      ::llvm::isa<::mlir::IntegerAttr, ::mlir::FloatAttr>(value));
+}];
+
+// Succeeds when `type` is not `i1`: casts producing bool have no Rust `as`
+// equivalent and are handled by the dedicated boolean patterns.
+Constraint NotBoolType(type: Type) [{
+  return ::mlir::success(!type.isInteger(1));
+}];
+
+// Succeeds when `type` is `i1`.
+Constraint BoolType(type: Type) [{
+  return ::mlir::success(type.isInteger(1));
+}];
+
+// Succeeds when `type` is an unsigned IntegerType (ui8..ui64, rendered
+// u8..u64), on which Rust's operators carry the unsigned semantics. The
+// guard for the unsigned-semantics arith operations: on a signless type
+// the signless rendering iN would execute the SIGNED operation, a silent
+// miscompile, so those stay illegal.
+Constraint UnsignedIntegerType(type: Type) [{
+  auto intType = ::llvm::dyn_cast<::mlir::IntegerType>(type);
+  return ::mlir::success(intType && intType.isUnsigned());
+}];
+
+// Succeeds when `type` is a signless or signed IntegerType (rendered iN),
+// on which Rust's `>>` is the arithmetic (sign-extending) shift: the guard
+// for `arith.shrsi`. Unsigned types and index (rendered uN/usize, whose
+// `>>` is logical) fail the constraint and stay illegal.
+Constraint SignlessOrSignedIntegerType(type: Type) [{
+  auto intType = ::llvm::dyn_cast<::mlir::IntegerType>(type);
+  return ::mlir::success(intType && !intType.isUnsigned());
+}];
+
+// Succeeds when `type` is an integer type with a Rust unsigned counterpart
+// of the same width (i8/i16/i32/i64), the sources of `arith.index_castui`
+// that must zero-extend through that unsigned type.
+Constraint RustSizedIntegerType(type: Type) [{
+  auto intType = ::llvm::dyn_cast<::mlir::IntegerType>(type);
+  if (!intType)
+    return ::mlir::failure();
+  unsigned width = intType.getWidth();
+  return ::mlir::success(width == 8 || width == 16 || width == 32 ||
+                         width == 64);
+}];
+
+// Succeeds when `type` is `i1` or `index`, the `arith.index_castui`
+// sources for which a single Rust cast is already zero-extension-exact.
+Constraint BoolOrIndexType(type: Type) [{
+  return ::mlir::success(type.isInteger(1) ||
+                         ::llvm::isa<::mlir::IndexType>(type));
+}];
+
+// Succeeds when `type` passes the EmitRust identity type converter,
+// exactly mirroring the C++ patterns' convertType success on ops whose ODS
+// operands are otherwise unconstrained.
+Constraint SupportedEmitRustType(type: Type) [{
+  return ::mlir::success(::mlir::emitrust::isSupportedEmitRustType(type));
+}];
+
+// Returns the unsigned integer type of the same width as the integer
+// `type` (e.g. i32 -> ui32, rendered `u32`).
+Rewrite UnsignedTypeOfSameWidth(type: Type) -> Type [{
+  auto intType = ::llvm::cast<::mlir::IntegerType>(type);
+  return ::mlir::IntegerType::get(rewriter.getContext(), intType.getWidth(),
+                                  ::mlir::IntegerType::Unsigned);
+}];
+
+// Returns the integer attribute `2 : type`.
+Rewrite TwoAttrOf(type: Type) -> Attr [{
+  return rewriter.getIntegerAttr(type, 2);
+}];
+
+// Returns the integer attribute `0 : type`.
+Rewrite ZeroAttrOf(type: Type) -> Attr [{
+  return rewriter.getIntegerAttr(type, 0);
+}];
+
+// The EmitRust comparison-predicate attributes are built by native rewrites
+// because mlir-pdll cannot parse `#emitrust<cmp_predicate ...>` literals:
+// the EmitRust dialect is not linked into the tool.
+
+// Returns the `#emitrust<cmp_predicate eq>` attribute.
+Rewrite CmpEqAttr() -> Attr [{
+  return ::mlir::emitrust::CmpPredicateAttr::get(
+      rewriter.getContext(), ::mlir::emitrust::CmpPredicate::eq);
+}];
+
+// Returns the `#emitrust<cmp_predicate ne>` attribute.
+Rewrite CmpNeAttr() -> Attr [{
+  return ::mlir::emitrust::CmpPredicateAttr::get(
+      rewriter.getContext(), ::mlir::emitrust::CmpPredicate::ne);
+}];
+
+// Returns the `#emitrust<cmp_predicate lt>` attribute.
+Rewrite CmpLtAttr() -> Attr [{
+  return ::mlir::emitrust::CmpPredicateAttr::get(
+      rewriter.getContext(), ::mlir::emitrust::CmpPredicate::lt);
+}];
+
+// Returns the `#emitrust<cmp_predicate le>` attribute.
+Rewrite CmpLeAttr() -> Attr [{
+  return ::mlir::emitrust::CmpPredicateAttr::get(
+      rewriter.getContext(), ::mlir::emitrust::CmpPredicate::le);
+}];
+
+// Returns the `#emitrust<cmp_predicate gt>` attribute.
+Rewrite CmpGtAttr() -> Attr [{
+  return ::mlir::emitrust::CmpPredicateAttr::get(
+      rewriter.getContext(), ::mlir::emitrust::CmpPredicate::gt);
+}];
+
+// Returns the `#emitrust<cmp_predicate ge>` attribute.
+Rewrite CmpGeAttr() -> Attr [{
+  return ::mlir::emitrust::CmpPredicateAttr::get(
+      rewriter.getContext(), ::mlir::emitrust::CmpPredicate::ge);
+}];
+
+//===----------------------------------------------------------------------===//
+// Constants
+//===----------------------------------------------------------------------===//
+
+// Replaces a scalar integer or float `arith.constant` with
+// `emitrust.constant` carrying the same typed attribute.
+Pattern ArithConstantToEmitRustConstant with benefit(2) {
+  let value: Attr;
+  let root = op<arith.constant> {value = value} -> (resultType: Type);
+  ScalarConstantValue(value);
+  replace root with op<emitrust.constant> {value = value} -> (resultType);
+}
+
+//===----------------------------------------------------------------------===//
+// Binary operations
+//===----------------------------------------------------------------------===//
+
 // Replaces `arith.addi` with `emitrust.add` of the same operands and type.
-Pattern ArithAddIToEmitRustAdd {
+Pattern ArithAddIToEmitRustAdd with benefit(2) {
   let root = op<arith.addi>(lhs: Value, rhs: Value) -> (resultType: Type);
   replace root with op<emitrust.add>(lhs, rhs) -> (resultType);
 }
 
 // Replaces `arith.subi` with `emitrust.sub` of the same operands and type.
-Pattern ArithSubIToEmitRustSub {
+Pattern ArithSubIToEmitRustSub with benefit(2) {
   let root = op<arith.subi>(lhs: Value, rhs: Value) -> (resultType: Type);
   replace root with op<emitrust.sub>(lhs, rhs) -> (resultType);
 }
 
 // Replaces `arith.muli` with `emitrust.mul` of the same operands and type.
-Pattern ArithMulIToEmitRustMul {
+Pattern ArithMulIToEmitRustMul with benefit(2) {
   let root = op<arith.muli>(lhs: Value, rhs: Value) -> (resultType: Type);
   replace root with op<emitrust.mul>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.divsi` with `emitrust.div` of the same operands and type.
+Pattern ArithDivSIToEmitRustDiv with benefit(2) {
+  let root = op<arith.divsi>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.div>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.remsi` with `emitrust.rem` of the same operands and type.
+Pattern ArithRemSIToEmitRustRem with benefit(2) {
+  let root = op<arith.remsi>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.rem>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.andi` with `emitrust.and` of the same operands and type.
+// Rust's `&` is the bitwise AND on every integer type, so no guard is
+// needed.
+Pattern ArithAndIToEmitRustAnd with benefit(2) {
+  let root = op<arith.andi>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.and>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.ori` with `emitrust.or` of the same operands and type.
+// Rust's `|` is the bitwise inclusive OR on every integer type, so no
+// guard is needed.
+Pattern ArithOrIToEmitRustOr with benefit(2) {
+  let root = op<arith.ori>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.or>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.xori` with `emitrust.xor` of the same operands and type.
+// Rust's `^` is the bitwise exclusive OR on every integer type, so no
+// guard is needed.
+Pattern ArithXOrIToEmitRustXor with benefit(2) {
+  let root = op<arith.xori>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.xor>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.shli` with `emitrust.shl` of the same operands and type.
+// Rust's `<<` shifts in zero bits on every integer type, so no guard is
+// needed.
+Pattern ArithShLIToEmitRustShl with benefit(2) {
+  let root = op<arith.shli>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.shl>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.shrsi` with `emitrust.shr` ONLY for a signless or signed
+// integer type: Rust's `>>` on the rendering iN is the arithmetic
+// (sign-extending) shift, exactly shrsi. Unsigned types and index stay
+// illegal — their `>>` is logical, which would miscompile negative left
+// operands.
+Pattern ArithShRSIToEmitRustShr with benefit(2) {
+  let root = op<arith.shrsi>(lhs: Value, rhs: Value) -> (resultType: Type);
+  SignlessOrSignedIntegerType(resultType);
+  replace root with op<emitrust.shr>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.shrui` with `emitrust.shr` ONLY for an unsigned integer
+// type: Rust's `>>` on the rendering uN is the logical (zero-extending)
+// shift, exactly shrui. Signless types stay illegal — their `>>` is
+// arithmetic, which would miscompile left operands with the sign bit set.
+Pattern ArithShRUIToEmitRustShr with benefit(2) {
+  let root = op<arith.shrui>(lhs: Value, rhs: Value) -> (resultType: Type);
+  UnsignedIntegerType(resultType);
+  replace root with op<emitrust.shr>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.divui` with `emitrust.div` ONLY for an unsigned integer
+// type: Rust's `/` on the rendering uN is the unsigned division. Signless
+// types stay illegal — their `/` is the signed division.
+Pattern ArithDivUIToEmitRustDiv with benefit(2) {
+  let root = op<arith.divui>(lhs: Value, rhs: Value) -> (resultType: Type);
+  UnsignedIntegerType(resultType);
+  replace root with op<emitrust.div>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.remui` with `emitrust.rem` ONLY for an unsigned integer
+// type: Rust's `%` on the rendering uN is the unsigned remainder. Signless
+// types stay illegal — their `%` is the signed remainder.
+Pattern ArithRemUIToEmitRustRem with benefit(2) {
+  let root = op<arith.remui>(lhs: Value, rhs: Value) -> (resultType: Type);
+  UnsignedIntegerType(resultType);
+  replace root with op<emitrust.rem>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.addf` with `emitrust.add` of the same operands and type.
+Pattern ArithAddFToEmitRustAdd with benefit(2) {
+  let root = op<arith.addf>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.add>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.subf` with `emitrust.sub` of the same operands and type.
+Pattern ArithSubFToEmitRustSub with benefit(2) {
+  let root = op<arith.subf>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.sub>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.mulf` with `emitrust.mul` of the same operands and type.
+Pattern ArithMulFToEmitRustMul with benefit(2) {
+  let root = op<arith.mulf>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.mul>(lhs, rhs) -> (resultType);
+}
+
+// Replaces `arith.divf` with `emitrust.div` of the same operands and type.
+Pattern ArithDivFToEmitRustDiv with benefit(2) {
+  let root = op<arith.divf>(lhs: Value, rhs: Value) -> (resultType: Type);
+  replace root with op<emitrust.div>(lhs, rhs) -> (resultType);
+}
+
+//===----------------------------------------------------------------------===//
+// Integer comparisons (signed predicates only)
+//===----------------------------------------------------------------------===//
+//
+// arith.cmpi encodes its predicate as a plain i64: eq = 0, ne = 1, slt = 2,
+// sle = 3, sgt = 4, sge = 5. One pattern per supported predicate maps it
+// onto the EmitRust predicate mnemonic; the unsigned predicates (6..9) have
+// no pattern and stay illegal.
+
+// Replaces `arith.cmpi eq` with `emitrust.cmp eq`.
+Pattern ArithCmpIEqToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpi>(lhs: Value, rhs: Value)
+      {predicate = attr<"0 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpEqAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpi ne` with `emitrust.cmp ne`.
+Pattern ArithCmpINeToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpi>(lhs: Value, rhs: Value)
+      {predicate = attr<"1 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpNeAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpi slt` with `emitrust.cmp lt`.
+Pattern ArithCmpISltToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpi>(lhs: Value, rhs: Value)
+      {predicate = attr<"2 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpLtAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpi sle` with `emitrust.cmp le`.
+Pattern ArithCmpISleToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpi>(lhs: Value, rhs: Value)
+      {predicate = attr<"3 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpLeAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpi sgt` with `emitrust.cmp gt`.
+Pattern ArithCmpISgtToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpi>(lhs: Value, rhs: Value)
+      {predicate = attr<"4 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpGtAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpi sge` with `emitrust.cmp ge`.
+Pattern ArithCmpISgeToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpi>(lhs: Value, rhs: Value)
+      {predicate = attr<"5 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpGeAttr()} -> (resultType);
+}
+
+//===----------------------------------------------------------------------===//
+// Integer comparisons (unsigned predicates, unsigned operand types only)
+//===----------------------------------------------------------------------===//
+//
+// The unsigned predicates ult = 6, ule = 7, ugt = 8, uge = 9 map onto the
+// EmitRust lt/le/gt/ge mnemonics ONLY when the operand type is an unsigned
+// IntegerType: Rust's comparison operators on the rendering uN are the
+// unsigned comparisons. On a signless type (rendered iN) the same
+// operators would compare SIGNED — a silent miscompile — so signless
+// operands with unsigned predicates have no pattern and stay illegal,
+// exactly as in the C++ CmpIOpConversion guard.
+
+// Replaces `arith.cmpi ult` on unsigned operands with `emitrust.cmp lt`.
+Pattern ArithCmpIUltToEmitRustCmp with benefit(2) {
+  let lhsType: Type;
+  let lhs: Value<lhsType>;
+  let root = op<arith.cmpi>(lhs, rhs: Value)
+      {predicate = attr<"6 : i64">} -> (resultType: Type);
+  UnsignedIntegerType(lhsType);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpLtAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpi ule` on unsigned operands with `emitrust.cmp le`.
+Pattern ArithCmpIUleToEmitRustCmp with benefit(2) {
+  let lhsType: Type;
+  let lhs: Value<lhsType>;
+  let root = op<arith.cmpi>(lhs, rhs: Value)
+      {predicate = attr<"7 : i64">} -> (resultType: Type);
+  UnsignedIntegerType(lhsType);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpLeAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpi ugt` on unsigned operands with `emitrust.cmp gt`.
+Pattern ArithCmpIUgtToEmitRustCmp with benefit(2) {
+  let lhsType: Type;
+  let lhs: Value<lhsType>;
+  let root = op<arith.cmpi>(lhs, rhs: Value)
+      {predicate = attr<"8 : i64">} -> (resultType: Type);
+  UnsignedIntegerType(lhsType);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpGtAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpi uge` on unsigned operands with `emitrust.cmp ge`.
+Pattern ArithCmpIUgeToEmitRustCmp with benefit(2) {
+  let lhsType: Type;
+  let lhs: Value<lhsType>;
+  let root = op<arith.cmpi>(lhs, rhs: Value)
+      {predicate = attr<"9 : i64">} -> (resultType: Type);
+  UnsignedIntegerType(lhsType);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpGeAttr()} -> (resultType);
+}
+
+//===----------------------------------------------------------------------===//
+// Float comparisons (predicates with an exact Rust operator only)
+//===----------------------------------------------------------------------===//
+//
+// arith.cmpf encodes its predicate as a plain i64: oeq = 1, ogt = 2,
+// oge = 3, olt = 4, ole = 5, one = 6, ..., une = 13. One pattern per
+// predicate with an exact Rust operator (the ordered oeq/ogt/oge/olt/ole
+// and the unordered une); every other predicate has no pattern and stays
+// illegal.
+
+// Replaces `arith.cmpf oeq` with `emitrust.cmp eq`.
+Pattern ArithCmpFOeqToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpf>(lhs: Value, rhs: Value)
+      {predicate = attr<"1 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpEqAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpf ogt` with `emitrust.cmp gt`.
+Pattern ArithCmpFOgtToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpf>(lhs: Value, rhs: Value)
+      {predicate = attr<"2 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpGtAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpf oge` with `emitrust.cmp ge`.
+Pattern ArithCmpFOgeToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpf>(lhs: Value, rhs: Value)
+      {predicate = attr<"3 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpGeAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpf olt` with `emitrust.cmp lt`.
+Pattern ArithCmpFOltToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpf>(lhs: Value, rhs: Value)
+      {predicate = attr<"4 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpLtAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpf ole` with `emitrust.cmp le`.
+Pattern ArithCmpFOleToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpf>(lhs: Value, rhs: Value)
+      {predicate = attr<"5 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpLeAttr()} -> (resultType);
+}
+
+// Replaces `arith.cmpf une` (raw predicate encoding 13 in ArithBase.td)
+// with `emitrust.cmp ne`: Rust's float `!=` is IEEE unordered-or-unequal,
+// exactly une, and it is what the C importer emits for `!=` and float
+// truthiness. `one` (encoding 6) deliberately has no pattern: rendering it
+// as `!=` would be wrong for NaN inputs (one is false, `!=` is true), and
+// nothing in the pipeline produces it.
+Pattern ArithCmpFUneToEmitRustCmp with benefit(2) {
+  let root = op<arith.cmpf>(lhs: Value, rhs: Value)
+      {predicate = attr<"13 : i64">} -> (resultType: Type);
+  replace root with op<emitrust.cmp>(lhs, rhs)
+      {predicate = CmpNeAttr()} -> (resultType);
+}
+
+//===----------------------------------------------------------------------===//
+// Casts
+//===----------------------------------------------------------------------===//
+
+// Replaces `arith.extsi` (non-i1 result) with `emitrust.cast`.
+Pattern ArithExtSIToEmitRustCast with benefit(2) {
+  let root = op<arith.extsi>(in: Value) -> (resultType: Type);
+  NotBoolType(resultType);
+  replace root with op<emitrust.cast>(in) -> (resultType);
+}
+
+// Replaces `arith.trunci` with a non-i1 result with `emitrust.cast`; the
+// i1 result is handled by ArithTruncIToBoolCmp below.
+Pattern ArithTruncIToEmitRustCast with benefit(2) {
+  let root = op<arith.trunci>(in: Value) -> (resultType: Type);
+  NotBoolType(resultType);
+  replace root with op<emitrust.cast>(in) -> (resultType);
+}
+
+// Replaces `arith.sitofp` with `emitrust.cast`.
+Pattern ArithSIToFPToEmitRustCast with benefit(2) {
+  let root = op<arith.sitofp>(in: Value) -> (resultType: Type);
+  NotBoolType(resultType);
+  replace root with op<emitrust.cast>(in) -> (resultType);
+}
+
+// Replaces `arith.fptosi` (non-i1 result) with `emitrust.cast`.
+Pattern ArithFPToSIToEmitRustCast with benefit(2) {
+  let root = op<arith.fptosi>(in: Value) -> (resultType: Type);
+  NotBoolType(resultType);
+  replace root with op<emitrust.cast>(in) -> (resultType);
+}
+
+// Replaces `arith.index_cast` (non-i1 result) with `emitrust.cast`.
+Pattern ArithIndexCastToEmitRustCast with benefit(2) {
+  let root = op<arith.index_cast>(in: Value) -> (resultType: Type);
+  NotBoolType(resultType);
+  replace root with op<emitrust.cast>(in) -> (resultType);
+}
+
+// Replaces `arith.index_castui` with an iN source (N in 8/16/32/64) with
+// two `emitrust.cast` ops hopping through the unsigned type of the same
+// width: a single Rust `as usize` cast SIGN-extends a signed source where
+// index_castui zero-extends, so the rendering `v as uN as usize`
+// reproduces the zero-extension exactly. The control-flow lifting pass
+// feeds user switch scrutinees through this cast while zero-extending the
+// case values, so negative runtime values do occur.
+Pattern ArithIndexCastUIWideToEmitRustCasts with benefit(2) {
+  let inType: Type;
+  let in: Value<inType>;
+  let root = op<arith.index_castui>(in) -> (resultType: Type);
+  RustSizedIntegerType(inType);
+  rewrite root with {
+    let unsignedType = UnsignedTypeOfSameWidth(inType);
+    let toUnsigned = op<emitrust.cast>(in) -> (unsignedType);
+    replace root with op<emitrust.cast>(toUnsigned) -> (resultType);
+  };
+}
+
+// Replaces `arith.index_castui` with an `i1` or `index` source with a
+// single `emitrust.cast`: Rust `bool as usize` is exactly 0 or 1, and a
+// `usize as iN` truncation is bit-exact regardless of extension. Other
+// source widths have no pattern and stay illegal.
+Pattern ArithIndexCastUINarrowToEmitRustCast with benefit(2) {
+  let inType: Type;
+  let in: Value<inType>;
+  let root = op<arith.index_castui>(in) -> (resultType: Type);
+  BoolOrIndexType(inType);
+  replace root with op<emitrust.cast>(in) -> (resultType);
+}
+
+// Replaces `arith.extui` with an `i1` source with `emitrust.cast`: Rust's
+// `bool as iN` yields exactly 0 or 1, matching the zero-extension. Wider
+// unsigned extensions have no pattern and stay illegal (MVP boundary).
+Pattern ArithExtUIBoolToEmitRustCast with benefit(2) {
+  let inType: Type;
+  let in: Value<inType>;
+  let root = op<arith.extui>(in) -> (resultType: Type);
+  BoolType(inType);
+  replace root with op<emitrust.cast>(in) -> (resultType);
+}
+
+//===----------------------------------------------------------------------===//
+// Select
+//===----------------------------------------------------------------------===//
+
+// Replaces a scalar `arith.select` (an `i1` condition and a
+// converter-supported result type) with `emitrust.select`, rendered as a
+// Rust `if cond { a } else { b }` expression. Shaped selects match neither
+// constraint and stay illegal, as in the C++ pattern.
+Pattern ArithSelectToEmitRustSelect with benefit(2) {
+  let condType: Type;
+  let cond: Value<condType>;
+  let root = op<arith.select>(cond, trueValue: Value, falseValue: Value)
+      -> (resultType: Type);
+  BoolType(condType);
+  SupportedEmitRustType(resultType);
+  replace root with op<emitrust.select>(cond, trueValue, falseValue)
+      -> (resultType);
+}
+
+// Replaces `arith.trunci` with an `i1` result with `(v % 2) != 0`, which
+// selects exactly the low bit in two's complement (also for negative odd
+// values, whose Rust remainder is -1).
+Pattern ArithTruncIToBoolCmp with benefit(2) {
+  let inType: Type;
+  let in: Value<inType>;
+  let root = op<arith.trunci>(in) -> (resultType: Type);
+  BoolType(resultType);
+  rewrite root with {
+    let two = op<emitrust.constant> {value = TwoAttrOf(inType)} -> (inType);
+    let lowBit = op<emitrust.rem>(in, two) -> (inType);
+    let zero = op<emitrust.constant> {value = ZeroAttrOf(inType)} -> (inType);
+    replace root with op<emitrust.cmp>(lowBit, zero)
+        {predicate = CmpNeAttr()} -> (resultType);
+  };
 }

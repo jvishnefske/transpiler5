@@ -66,6 +66,36 @@ emitrust.func @binops(%arg0: i32, %arg1: i32) {
   emitrust.return
 }
 
+// CHECK-LABEL: emitrust.func @bitops
+emitrust.func @bitops(%arg0: i32, %arg1: i32) {
+  // CHECK: emitrust.and %{{.*}}, %{{.*}} : i32
+  %0 = emitrust.and %arg0, %arg1 : i32
+  // CHECK: emitrust.or %{{.*}}, %{{.*}} : i32
+  %1 = emitrust.or %arg0, %arg1 : i32
+  // CHECK: emitrust.xor %{{.*}}, %{{.*}} : i32
+  %2 = emitrust.xor %arg0, %arg1 : i32
+  // CHECK: emitrust.shl %{{.*}}, %{{.*}} : i32
+  %3 = emitrust.shl %arg0, %arg1 : i32
+  // CHECK: emitrust.shr %{{.*}}, %{{.*}} : i32
+  %4 = emitrust.shr %arg0, %arg1 : i32
+  emitrust.return
+}
+
+// The binary operations round-trip on unsigned integer types as well; the
+// emitter renders these as u8..u64 with C's wrap-around semantics.
+// CHECK-LABEL: emitrust.func @unsigned_binops
+emitrust.func @unsigned_binops(%arg0: ui32, %arg1: ui32) {
+  // CHECK: emitrust.add %{{.*}}, %{{.*}} : ui32
+  %0 = emitrust.add %arg0, %arg1 : ui32
+  // CHECK: emitrust.div %{{.*}}, %{{.*}} : ui32
+  %1 = emitrust.div %arg0, %arg1 : ui32
+  // CHECK: emitrust.shr %{{.*}}, %{{.*}} : ui32
+  %2 = emitrust.shr %arg0, %arg1 : ui32
+  // CHECK: emitrust.cmp lt, %{{.*}}, %{{.*}} : (ui32, ui32) -> i1
+  %3 = emitrust.cmp lt, %arg0, %arg1 : (ui32, ui32) -> i1
+  emitrust.return
+}
+
 // CHECK-LABEL: emitrust.func @compares
 emitrust.func @compares(%arg0: i32, %arg1: i32) {
   // CHECK: emitrust.cmp eq, %{{.*}}, %{{.*}} : (i32, i32) -> i1
@@ -87,6 +117,28 @@ emitrust.func @compares(%arg0: i32, %arg1: i32) {
 emitrust.func @casts(%arg0: i32) {
   // CHECK: emitrust.cast %{{.*}} : i32 to i64
   %0 = emitrust.cast %arg0 : i32 to i64
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @selects
+emitrust.func @selects(%arg0: i1, %arg1: i32, %arg2: i32, %arg3: f64,
+                       %arg4: f64) {
+  // CHECK: emitrust.select %{{.*}}, %{{.*}}, %{{.*}} : i32
+  %0 = emitrust.select %arg0, %arg1, %arg2 : i32
+  // CHECK: emitrust.select %{{.*}}, %{{.*}}, %{{.*}} : f64
+  %1 = emitrust.select %arg0, %arg3, %arg4 : f64
+  // A select of selects: the result feeds another select's value operand.
+  // CHECK: emitrust.select %{{.*}}, %{{.*}}, %{{.*}} : i32
+  %2 = emitrust.select %arg0, %0, %arg1 : i32
+  emitrust.return
+}
+
+// Dialect-typed select values round-trip with the fully qualified type.
+// CHECK-LABEL: emitrust.func @select_opaque
+emitrust.func @select_opaque(%arg0: i1, %arg1: !emitrust.opaque<"Wrapping<i32>">,
+                             %arg2: !emitrust.opaque<"Wrapping<i32>">) {
+  // CHECK: emitrust.select %{{.*}}, %{{.*}}, %{{.*}} : !emitrust.opaque<"Wrapping<i32>">
+  %0 = emitrust.select %arg0, %arg1, %arg2 : !emitrust.opaque<"Wrapping<i32>">
   emitrust.return
 }
 
@@ -187,5 +239,108 @@ emitrust.func @places(%arg0: !emitrust.mut_ref<i32>, %arg1: index, %arg2: i32) {
 emitrust.func @call_args(%arg0: i32) {
   // CHECK: emitrust.call_opaque "print!"(%{{.*}}) {args = ["x={}\0A", 0 : index]} : (i32) -> ()
   emitrust.call_opaque "print!"(%arg0) {args = ["x={}\0A", 0 : index]} : (i32) -> ()
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @switches
+emitrust.func @switches(%arg0: i32, %arg1: index) {
+  // CHECK:      emitrust.switch %{{.*}} : i32
+  // CHECK-NEXT: case 0 {
+  // CHECK:      case -4 {
+  // CHECK:      default {
+  emitrust.switch %arg0 : i32
+  case 0 {
+    %0 = emitrust.constant <1 : i32> : i32
+  }
+  case -4 {
+    %1 = emitrust.constant <2 : i32> : i32
+  }
+  default {
+  }
+  // The single-case form produced for lifted loop-exit dispatch.
+  // CHECK:      emitrust.switch %{{.*}} : index
+  // CHECK-NEXT: case 1 {
+  // CHECK:      default {
+  emitrust.switch %arg1 : index
+  case 1 {
+  }
+  default {
+  }
+  emitrust.return
+}
+
+// A break/continue under a switch under a loop is legal: the switch is
+// transparent for the loop-jump verifier walk.
+// CHECK-LABEL: emitrust.func @switch_in_loop
+emitrust.func @switch_in_loop(%arg0: i32) {
+  // CHECK: emitrust.loop {
+  emitrust.loop {
+    // CHECK: emitrust.switch %{{.*}} : i32
+    emitrust.switch %arg0 : i32
+    case 0 {
+      // CHECK: emitrust.break
+      emitrust.break
+    }
+    default {
+      // CHECK: emitrust.continue
+      emitrust.continue
+    }
+  }
+  emitrust.return
+}
+
+// CHECK: emitrust.enum_def @Color ["Red", "Green", "Blue"] [0, 1, 2]
+emitrust.enum_def @Color ["Red", "Green", "Blue"] [0, 1, 2]
+
+// CHECK-LABEL: emitrust.func @enums
+emitrust.func @enums(%arg0: !emitrust.enum<"Color">, %arg1: !emitrust.enum<"Color">) {
+  // CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>
+  // CHECK: emitrust.constant <#emitrust.opaque<"Color::Red">> : !emitrust.enum<"Color">
+  %1 = emitrust.constant <#emitrust.opaque<"Color::Red">> : !emitrust.enum<"Color">
+  // CHECK: emitrust.cmp eq, %{{.*}}, %{{.*}} : (!emitrust.enum<"Color">, !emitrust.enum<"Color">) -> i1
+  %2 = emitrust.cmp eq, %arg0, %arg1 : (!emitrust.enum<"Color">, !emitrust.enum<"Color">) -> i1
+  // CHECK: emitrust.cmp ne, %{{.*}}, %{{.*}} : (!emitrust.enum<"Color">, !emitrust.enum<"Color">) -> i1
+  %3 = emitrust.cmp ne, %arg0, %arg1 : (!emitrust.enum<"Color">, !emitrust.enum<"Color">) -> i1
+  // CHECK: emitrust.cast %{{.*}} : !emitrust.enum<"Color"> to i32
+  %4 = emitrust.cast %arg0 : !emitrust.enum<"Color"> to i32
+  // CHECK: emitrust.select %{{.*}}, %{{.*}}, %{{.*}} : !emitrust.enum<"Color">
+  %5 = emitrust.select %2, %arg0, %arg1 : !emitrust.enum<"Color">
+  emitrust.return
+}
+
+// CHECK: emitrust.global @counter <0 : i32> : i32
+emitrust.global @counter <0 : i32> : i32
+
+// CHECK: emitrust.global const @limit <100 : i32> : i32
+emitrust.global const @limit <100 : i32> : i32
+
+// CHECK: emitrust.global @ratio <2.5{{[0-9e+.]*}} : f64> : f64
+emitrust.global @ratio <2.5 : f64> : f64
+
+// CHECK: emitrust.global @flag <true> : i1
+emitrust.global @flag <true> : i1
+
+// CHECK: emitrust.global @table : !emitrust.array<4xi32>
+emitrust.global @table : !emitrust.array<4xi32>
+
+// CHECK: emitrust.global const @fixed : !emitrust.array<2xf64>
+emitrust.global const @fixed : !emitrust.array<2xf64>
+
+// CHECK: emitrust.global @origin : !emitrust.struct<"Point">
+emitrust.global @origin : !emitrust.struct<"Point">
+
+// CHECK-LABEL: emitrust.func @global_access
+emitrust.func @global_access() {
+  // CHECK: emitrust.global_load @counter : i32
+  %0 = emitrust.global_load @counter : i32
+  // CHECK: emitrust.global_store %{{.*}}, @counter : i32
+  emitrust.global_store %0, @counter : i32
+  // CHECK: emitrust.global_load @limit : i32
+  %1 = emitrust.global_load @limit : i32
+  // CHECK: emitrust.global_load @table : !emitrust.array<4xi32>
+  %2 = emitrust.global_load @table : !emitrust.array<4xi32>
+  // CHECK: emitrust.global_store %{{.*}}, @table : !emitrust.array<4xi32>
+  emitrust.global_store %2, @table : !emitrust.array<4xi32>
   emitrust.return
 }

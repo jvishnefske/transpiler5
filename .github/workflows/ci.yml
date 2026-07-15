@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Build and regression suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      # third_party/c-testsuite is a submodule and is required by the
+      # conformance ledger step below.
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+
+      # The dev shell pins LLVM/MLIR/Clang 21.1.8 and the Rust toolchain.
+      # LLVM_EXTERNAL_LIT is required because the nixpkgs LLVM ships no
+      # llvm-lit; lit comes from the shell's python environment.
+      - name: Configure
+        run: |
+          nix develop -c bash -c 'cmake -G Ninja -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_EXTERNAL_LIT="$(which lit)"'
+
+      - name: Build
+        run: nix develop -c ninja -C build
+
+      # Full lit suite: dialect round-trips, conversions, importer,
+      # driver, differential end-to-end tests, and the c-testsuite
+      # ledger driver (test/CTestSuite/c-testsuite.c).
+      - name: Regression suite (check-emitrust)
+        run: nix develop -c ninja -C build check-emitrust
+
+      # Explicit conformance gate against the required-pass list.  Every
+      # test named in test/CTestSuite/expected-pass.txt must transpile,
+      # build with cargo, and produce byte-identical stdout and a zero
+      # exit against the recorded expected output.  The manifest ratchets
+      # in both directions: a regression of a listed test fails, and a
+      # newly passing unlisted test also fails until the list is
+      # regenerated with --update.  Any MISCOMPILE is fatal unless
+      # quarantined in known-miscompiles.txt.
+      - name: c-testsuite required-pass ledger
+        run: |
+          nix develop -c python3 test/CTestSuite/run_c_testsuite.py \
+            --emitrust-cc build/bin/emitrust-cc \
+            --suite third_party/c-testsuite \
+            --manifest test/CTestSuite/expected-pass.txt \
+            --known-miscompiles test/CTestSuite/known-miscompiles.txt \
+            --workdir "$RUNNER_TEMP/ctestsuite"

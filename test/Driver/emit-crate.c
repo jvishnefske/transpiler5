@@ -15,7 +15,7 @@ int main(void) { return add(20, 22) - 42; }
 // TOML-NEXT: version = "0.1.0"
 // TOML-NEXT: edition = "2021"
 
-// MAIN: #![allow(unused_variables, unused_assignments, unused_mut, unused_parens, dead_code)]
+// MAIN: #![allow(unused_variables, unused_assignments, unused_mut, unused_parens, dead_code, non_upper_case_globals)]
 // MAIN: fn add(v0: i32, v1: i32) -> i32 {
 // MAIN: fn c_main() -> i32 {
 // MAIN: fn main() { std::process::exit(c_main()); }

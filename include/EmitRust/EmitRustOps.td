@@ -15,6 +15,7 @@
 include "EmitRust/EmitRustAttributes.td"
 include "EmitRust/EmitRustTypes.td"
 
+include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/CallInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
@@ -32,6 +33,18 @@ def EmitRust_ArithmeticType
 
 // Types usable as loop bounds: any integer or index.
 def EmitRust_IntegerOrIndexType : AnyTypeOf<[AnyInteger, Index]>;
+
+// Types usable as comparison operands: any arithmetic type or an EmitRust
+// enum type. Enum operands are restricted to the eq/ne predicates by the
+// CmpOp verifier.
+def EmitRust_CmpOperandType
+    : AnyTypeOf<[EmitRust_ArithmeticType, EmitRust_EnumType]>;
+
+// Types usable as select values: any arithmetic type (including bool) or
+// an EmitRust struct, enum, or array type (no lvalues or references).
+def EmitRust_SelectValueType
+    : AnyTypeOf<[EmitRust_ArithmeticType, EmitRust_StructType,
+                 EmitRust_EnumType, EmitRust_ArrayType]>;
 
 //===----------------------------------------------------------------------===//
 // UseOp
@@ -370,9 +383,9 @@ def EmitRust_StructDefOp : EmitRust_Op<"struct_def", [
     module level. The field names and field types are given as two arrays of
     the same non-zero length; names must be non-empty and unique, and every
     field type must be a scalar (integer, index, or float), an
-    `!emitrust.array`, or an `!emitrust.struct` (no lvalues or references).
-    Values of the struct are referenced through the `!emitrust.struct` type
-    carrying the same name.
+    `!emitrust.array`, an `!emitrust.struct`, or an `!emitrust.enum` (no
+    lvalues or references). Values of the struct are referenced through the
+    `!emitrust.struct` type carrying the same name.
 
     The struct is emitted with `#[derive(Clone, Copy, Default)]`. This is an
     MVP guarantee: all permitted field types are `Copy + Default`, and
@@ -401,6 +414,176 @@ def EmitRust_StructDefOp : EmitRust_Op<"struct_def", [
 
   let assemblyFormat = "$sym_name $field_names $field_types attr-dict";
   let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// EnumDefOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_EnumDefOp : EmitRust_Op<"enum_def", [
+    HasParent<"::mlir::ModuleOp">, Symbol]> {
+  let summary = "Enum definition operation";
+  let description = [{
+    The `emitrust.enum_def` operation defines a named Rust enum at module
+    level. The variant names and variant values are given as two arrays of
+    the same non-zero length; names must be non-empty and unique and are
+    emitted verbatim (the importer supplies valid Rust identifiers), values
+    must be unique and within the `i32` range. Values of the enum are
+    referenced through the `!emitrust.enum` type carrying the same name.
+
+    The enum is emitted with `#[repr(i32)]` and
+    `#[derive(Clone, Copy, PartialEq, Default)]`; the first variant carries
+    the `#[default]` attribute so that the derived `Default` implementation
+    is available.
+
+    Example:
+
+    ```mlir
+    emitrust.enum_def @Color ["Red", "Green", "Blue"] [0, 1, 2]
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    #[repr(i32)]
+    #[derive(Clone, Copy, PartialEq, Default)]
+    enum Color {
+        #[default]
+        Red = 0,
+        Green = 1,
+        Blue = 2,
+    }
+    ```
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       StrArrayAttr:$variant_names,
+                       DenseI64ArrayAttr:$variant_values);
+  let results = (outs);
+
+  let assemblyFormat = "$sym_name $variant_names $variant_values attr-dict";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// GlobalOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_GlobalOp : EmitRust_Op<"global", [
+    HasParent<"::mlir::ModuleOp">, Symbol]> {
+  let summary = "Global variable definition operation";
+  let description = [{
+    The `emitrust.global` operation defines a named module-level variable
+    with static storage duration. The value type must be a scalar (integer,
+    index, or float), an `!emitrust.array`, or an `!emitrust.struct`. The
+    optional initializer must be a typed attribute whose type equals the
+    value type; initializers are only supported for scalar value types.
+    Without an initializer the global starts at the type's default value
+    (`0`, `0.0`, `false`, `Name::default()`, or `[<element-default>; N]`),
+    which models C's zero-initialization of static storage.
+
+    A global carrying the `const` marker is never written; it is emitted as
+    a plain Rust `static` item read directly. Because a plain `static`
+    requires a const-evaluable initializer, the `const` marker is limited to
+    scalar and array value types (a struct's `default()` is not const).
+    A global without the marker is mutable; to stay free of `unsafe` it is
+    emitted as a `thread_local!` `std::cell::Cell` accessed through
+    `emitrust.global_load` and `emitrust.global_store`. The emitted code is
+    exact for single-threaded programs (the imported C subset has no
+    threads).
+
+    Example:
+
+    ```mlir
+    emitrust.global @counter <0 : i32> : i32
+    emitrust.global const @limit <100 : i32> : i32
+    emitrust.global @table : !emitrust.array<4xi32>
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    thread_local! {
+        static counter: std::cell::Cell<i32> = std::cell::Cell::new(0);
+    }
+    static limit: i32 = 100;
+    thread_local! {
+        static table: std::cell::Cell<[i32; 4]> = std::cell::Cell::new([0; 4]);
+    }
+    ```
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       TypeAttrOf<AnyType>:$type,
+                       OptionalAttr<EmitRust_OpaqueOrTypedAttr>:$init,
+                       UnitAttr:$is_const);
+  let results = (outs);
+
+  let assemblyFormat =
+      "(`const` $is_const^)? $sym_name (` ` `<` $init^ `>`)? attr-dict `:` $type";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// GlobalLoadOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_GlobalLoadOp : EmitRust_Op<"global_load",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Global variable read operation";
+  let description = [{
+    The `emitrust.global_load` operation reads the current whole value of an
+    `emitrust.global`. The symbol must reference a global in the enclosing
+    module and the result type must equal the global's value type. A load
+    from a `const` global is emitted as a direct read of the static item;
+    a load from a mutable global is emitted as a `Cell` read through the
+    thread-local's `with` accessor.
+
+    Example:
+
+    ```mlir
+    %v = emitrust.global_load @counter : i32
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v0: i32 = counter.with(|c| c.get());
+    ```
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$global);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$global attr-dict `:` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
+// GlobalStoreOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_GlobalStoreOp : EmitRust_Op<"global_store",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Global variable write operation";
+  let description = [{
+    The `emitrust.global_store` operation replaces the whole value of an
+    `emitrust.global`. The symbol must reference a non-`const` global in the
+    enclosing module and the value type must equal the global's value type;
+    stores to `const` globals are rejected by the verifier. The operation is
+    emitted as a `Cell` write through the thread-local's `with` accessor.
+    Partial updates (an element of a global array or a field of a global
+    struct) are modeled as load-modify-store of the whole value, which is
+    exact for single-threaded programs.
+
+    Example:
+
+    ```mlir
+    emitrust.global_store %v, @counter : i32
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    counter.with(|c| c.set(v0));
+    ```
+  }];
+
+  let arguments = (ins AnyType:$value, FlatSymbolRefAttr:$global);
+  let results = (outs);
+
+  let assemblyFormat = "$value `,` $global attr-dict `:` type($value)";
 }
 
 //===----------------------------------------------------------------------===//
@@ -641,11 +824,21 @@ def EmitRust_AddOp : EmitRust_BinaryOp<"add"> {
   let summary = "Addition operation";
   let description = [{
     The `emitrust.add` operation is emitted as the infix binary `+` operator.
+    When the result type is an unsigned integer it is emitted as the
+    `wrapping_add` method call instead: C defines unsigned overflow as
+    wrap-around, whereas Rust's infix `+` panics on overflow in debug
+    builds.
 
     Example:
 
     ```mlir
     %r = emitrust.add %a, %b : i32
+    %u = emitrust.add %c, %d : ui32
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    let v3 = v1 + v2;
+    let v6: u32 = v4.wrapping_add(v5);
     ```
   }];
 }
@@ -654,6 +847,10 @@ def EmitRust_SubOp : EmitRust_BinaryOp<"sub"> {
   let summary = "Subtraction operation";
   let description = [{
     The `emitrust.sub` operation is emitted as the infix binary `-` operator.
+    When the result type is an unsigned integer it is emitted as the
+    `wrapping_sub` method call instead: C defines unsigned overflow as
+    wrap-around, whereas Rust's infix `-` panics on overflow in debug
+    builds.
 
     Example:
 
@@ -667,6 +864,10 @@ def EmitRust_MulOp : EmitRust_BinaryOp<"mul"> {
   let summary = "Multiplication operation";
   let description = [{
     The `emitrust.mul` operation is emitted as the infix binary `*` operator.
+    When the result type is an unsigned integer it is emitted as the
+    `wrapping_mul` method call instead: C defines unsigned overflow as
+    wrap-around, whereas Rust's infix `*` panics on overflow in debug
+    builds.
 
     Example:
 
@@ -702,6 +903,88 @@ def EmitRust_RemOp : EmitRust_BinaryOp<"rem"> {
   }];
 }
 
+def EmitRust_AndOp : EmitRust_BinaryOp<"and"> {
+  let summary = "Bitwise AND operation";
+  let description = [{
+    The `emitrust.and` operation is emitted as the infix binary `&` operator.
+    Rust's `&` is the bitwise AND on every integer type, an exact match for
+    C's `&` on matching widths.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.and %a, %b : i32
+    ```
+  }];
+}
+
+def EmitRust_OrOp : EmitRust_BinaryOp<"or"> {
+  let summary = "Bitwise OR operation";
+  let description = [{
+    The `emitrust.or` operation is emitted as the infix binary `|` operator.
+    Rust's `|` is the bitwise inclusive OR on every integer type, an exact
+    match for C's `|` on matching widths.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.or %a, %b : i32
+    ```
+  }];
+}
+
+def EmitRust_XorOp : EmitRust_BinaryOp<"xor"> {
+  let summary = "Bitwise XOR operation";
+  let description = [{
+    The `emitrust.xor` operation is emitted as the infix binary `^` operator.
+    Rust's `^` is the bitwise exclusive OR on every integer type, an exact
+    match for C's `^` on matching widths. C's bitwise complement `~x`
+    imports as `x ^ -1`, which this operation renders exactly.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.xor %a, %b : i32
+    ```
+  }];
+}
+
+def EmitRust_ShlOp : EmitRust_BinaryOp<"shl"> {
+  let summary = "Left shift operation";
+  let description = [{
+    The `emitrust.shl` operation is emitted as the infix binary `<<`
+    operator. Rust's `<<` shifts in zero bits on every integer type;
+    shifting by the type's width or more panics in debug builds, which is
+    undefined behavior in C, so no defined C program observes a divergence.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.shl %a, %b : i32
+    ```
+  }];
+}
+
+def EmitRust_ShrOp : EmitRust_BinaryOp<"shr"> {
+  let summary = "Right shift operation";
+  let description = [{
+    The `emitrust.shr` operation is emitted as the infix binary `>>`
+    operator. The operand type selects the semantics exactly as in Rust:
+    `>>` on a signed `iN` is an arithmetic (sign-extending) shift, and `>>`
+    on an unsigned `uN` is a logical (zero-extending) shift. Producers must
+    therefore pick the operand type matching the intended C semantics; the
+    Arith conversion guards enforce this (shrsi only lowers on
+    signless/signed types, shrui only on unsigned types).
+
+    Example:
+
+    ```mlir
+    %r = emitrust.shr %a, %b : i32
+    %u = emitrust.shr %c, %d : ui32
+    ```
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // CmpOp
 //===----------------------------------------------------------------------===//
@@ -719,24 +1002,32 @@ def EmitRust_CmpOp : EmitRust_Op<"cmp", [SameTypeOperands]> {
     - greater than             (mnemonic: `gt`; integer value: `4`)
     - greater than or equal to (mnemonic: `ge`; integer value: `5`)
 
+    Operands of `!emitrust.enum` type are supported with the `eq` and `ne`
+    predicates only; enums derive `PartialEq` but not `PartialOrd`, so the
+    verifier rejects ordered predicates on enum operands.
+
     Example:
 
     ```mlir
     %r = emitrust.cmp lt, %a, %b : (i32, i32) -> i1
+    %s = emitrust.cmp eq, %c, %d
+        : (!emitrust.enum<"Color">, !emitrust.enum<"Color">) -> i1
     ```
     ```rust
-    // Code emitted for the operation above.
+    // Code emitted for the operations above.
     let v3 = v1 < v2;
+    let v6 = v4 == v5;
     ```
   }];
 
   let arguments = (ins EmitRust_CmpPredicateAttr:$predicate,
-                       EmitRust_ArithmeticType:$lhs,
-                       EmitRust_ArithmeticType:$rhs);
+                       EmitRust_CmpOperandType:$lhs,
+                       EmitRust_CmpOperandType:$rhs);
   let results = (outs I1:$result);
 
   let assemblyFormat =
       "$predicate `,` operands attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -749,14 +1040,22 @@ def EmitRust_CastOp : EmitRust_Op<"cast"> {
     The `emitrust.cast` operation performs an explicit type conversion and
     is emitted as a Rust `as` cast expression.
 
+    An `!emitrust.enum` source is allowed (an enum-to-integer cast renders
+    e.g. `as i32`), but the verifier rejects `!emitrust.enum` result types:
+    Rust has no integer-to-enum `as` cast. Boolean (`i1`) result types are
+    rejected by the emitter for the same reason (`as bool` does not exist);
+    such conversions must be modeled as comparisons.
+
     Example:
 
     ```mlir
     %r = emitrust.cast %v : i32 to i64
+    %s = emitrust.cast %c : !emitrust.enum<"Color"> to i32
     ```
     ```rust
-    // Code emitted for the operation above.
+    // Code emitted for the operations above.
     let v2 = v1 as i64;
+    let v4 = v3 as i32;
     ```
   }];
 
@@ -764,6 +1063,42 @@ def EmitRust_CastOp : EmitRust_Op<"cast"> {
   let results = (outs AnyType:$result);
 
   let assemblyFormat = "$source attr-dict `:` type($source) `to` type($result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// SelectOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_SelectOp : EmitRust_Op<"select",
+    [AllTypesMatch<["trueValue", "falseValue", "result"]>]> {
+  let summary = "Select operation emitted as a Rust if expression";
+  let description = [{
+    The `emitrust.select` operation chooses between two values of the same
+    type based on a boolean condition, without any short-circuiting: it is
+    the EmitRust counterpart of `arith.select`, which the canonicalizer
+    synthesizes from folded conditional chains. It is emitted as a `let`
+    binding of a Rust `if` expression.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.select %cond, %a, %b : i32
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v3: i32 = if v0 { v1 } else { v2 };
+    ```
+  }];
+
+  let arguments = (ins I1:$condition,
+                       EmitRust_SelectValueType:$trueValue,
+                       EmitRust_SelectValueType:$falseValue);
+  let results = (outs EmitRust_SelectValueType:$result);
+
+  let assemblyFormat = [{
+    $condition `,` $trueValue `,` $falseValue attr-dict `:` type($result)
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -890,6 +1225,72 @@ def EmitRust_LoopOp : EmitRust_Op<"loop", [
 }
 
 //===----------------------------------------------------------------------===//
+// SwitchOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_SwitchOp : EmitRust_Op<"switch", [
+    SingleBlockImplicitTerminator<"emitrust::YieldOp">, NoRegionArguments]> {
+  let summary = "Switch operation emitted as a Rust match";
+  let description = [{
+    The `emitrust.switch` operation dispatches on an integer or index
+    discriminator, emitted as a Rust `match` statement. It carries one case
+    region per entry of its `cases` attribute plus a mandatory default
+    region; case values must be unique. All regions have a single block
+    without arguments, terminated with `emitrust.yield`, which may be left
+    out and inserted implicitly. The operation produces no results.
+
+    Each case renders as a literal integer arm (no type suffix) whose
+    pattern is the stored 64-bit case value interpreted in the
+    discriminator's Rust type, so the literal compares equal at runtime:
+    unsigned decimal of the low bits for a `usize` (index) or unsigned
+    discriminator, the sign-interpreted value of the discriminator's width
+    for a signed one. The default region renders as the `_ =>` arm, making
+    the match exhaustive. An `emitrust.break` or `emitrust.continue`
+    inside a case is transparent with respect to an enclosing loop, exactly
+    as under an `emitrust.if`.
+
+    Example:
+
+    ```mlir
+    emitrust.switch %d : i32
+    case 0 {
+      emitrust.call_opaque "zero"() : () -> ()
+    }
+    case 4 {
+      emitrust.call_opaque "four"() : () -> ()
+    }
+    default {
+    }
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    match v0 {
+        0 => {
+            zero();
+        }
+        4 => {
+            four();
+        }
+        _ => {
+        }
+    }
+    ```
+  }];
+
+  let arguments = (ins AnyTypeOf<[AnyInteger, Index]>:$discriminator,
+                       DenseI64ArrayAttr:$cases);
+  let results = (outs);
+  // ODS requires the variadic region to be declared last, so the default
+  // region is stored first (mirroring upstream scf.index_switch); the
+  // textual assembly nevertheless prints the case regions first.
+  let regions = (region SizedRegion<1>:$defaultRegion,
+                        VariadicRegion<SizedRegion<1>>:$caseRegions);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // BreakOp
 //===----------------------------------------------------------------------===//
 
@@ -898,8 +1299,9 @@ def EmitRust_BreakOp : EmitRust_Op<"break"> {
   let description = [{
     The `emitrust.break` operation exits the innermost enclosing
     `emitrust.loop` or `emitrust.for`. It may appear anywhere inside the
-    loop body, including nested `emitrust.if` regions, but the search for
-    the enclosing loop stops at function boundaries. The operation takes no
+    loop body, including nested `emitrust.if` and `emitrust.switch`
+    regions, but the search for the enclosing loop stops at function
+    boundaries. The operation takes no
     operands, produces no results, and carries no traits so that it is never
     eliminated as dead code.
 
@@ -931,8 +1333,9 @@ def EmitRust_ContinueOp : EmitRust_Op<"continue"> {
   let description = [{
     The `emitrust.continue` operation skips to the next iteration of the
     innermost enclosing `emitrust.loop` or `emitrust.for`. It may appear
-    anywhere inside the loop body, including nested `emitrust.if` regions,
-    but the search for the enclosing loop stops at function boundaries. The
+    anywhere inside the loop body, including nested `emitrust.if` and
+    `emitrust.switch` regions, but the search for the enclosing loop stops
+    at function boundaries. The
     operation takes no operands, produces no results, and carries no traits
     so that it is never eliminated as dead code.
 
@@ -960,14 +1363,14 @@ def EmitRust_ContinueOp : EmitRust_Op<"continue"> {
 //===----------------------------------------------------------------------===//
 
 def EmitRust_YieldOp : EmitRust_Op<"yield",
-    [Pure, Terminator, ParentOneOf<["IfOp", "ForOp", "LoopOp"]>]> {
+    [Pure, Terminator, ParentOneOf<["IfOp", "ForOp", "LoopOp", "SwitchOp"]>]> {
   let summary = "Block termination operation";
   let description = [{
     The `emitrust.yield` operation terminates the regions of `emitrust.if`,
-    `emitrust.for`, and `emitrust.loop`. It takes no operands, produces no
-    results, and emits no Rust code; it exists purely to satisfy MLIR's
-    structural requirement that blocks end with a terminator, and may be
-    omitted in the custom syntax.
+    `emitrust.for`, `emitrust.loop`, and `emitrust.switch`. It takes no
+    operands, produces no results, and emits no Rust code; it exists purely
+    to satisfy MLIR's structural requirement that blocks end with a
+    terminator, and may be omitted in the custom syntax.
   }];
 
   let assemblyFormat = "attr-dict";

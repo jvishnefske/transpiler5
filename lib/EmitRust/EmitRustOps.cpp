@@ -6,12 +6,14 @@
 //
 /// \file
 /// Implements the EmitRust dialect operations: the custom parsers and
-/// printers of `emitrust.func`, `emitrust.for`, and `emitrust.assign`, and
-/// the verifiers that enforce the dialect's invariants (mutability
-/// discipline of assignments, lvalue placement rules, at most one function
-/// result, matching return types, non-empty callee and literal strings,
-/// loop-jump nesting, struct-definition well-formedness, and
-/// induction-variable typing).
+/// printers of `emitrust.func`, `emitrust.for`, `emitrust.assign`, and
+/// `emitrust.switch`, and the verifiers that enforce the dialect's
+/// invariants (mutability discipline of assignments, lvalue placement
+/// rules, at most one function result, matching return types, non-empty
+/// callee and literal strings, loop-jump nesting, struct-, enum-, and
+/// global-definition well-formedness, symbol-checked global loads and
+/// stores, switch case/region agreement, the enum comparison and cast
+/// restrictions, and induction-variable typing).
 //
 //===----------------------------------------------------------------------===//
 
@@ -20,7 +22,9 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/MathExtras.h"
 
 using namespace mlir;
 using namespace mlir::emitrust;
@@ -238,14 +242,16 @@ LogicalResult AssignOp::verify() {
 //===----------------------------------------------------------------------===//
 
 /// Returns whether `type` may be used as a struct field type: a scalar
-/// (integer, index, or float), an EmitRust array, or an EmitRust struct.
+/// (integer, index, or float), an EmitRust array, an EmitRust struct, or an
+/// EmitRust enum.
 static bool isValidStructFieldType(Type type) {
-  return isa<IntegerType, IndexType, FloatType, ArrayType, StructType>(type);
+  return isa<IntegerType, IndexType, FloatType, ArrayType, StructType,
+             EnumType>(type);
 }
 
 /// Verifies that the field name and type arrays have the same non-zero
 /// length, that field names are non-empty and unique, and that every field
-/// type is a scalar, array, or struct type.
+/// type is a scalar, array, struct, or enum type.
 LogicalResult StructDefOp::verify() {
   ArrayAttr names = getFieldNames();
   ArrayAttr types = getFieldTypes();
@@ -271,14 +277,130 @@ LogicalResult StructDefOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
-// VariableOp
+// EnumDefOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the variant name and value arrays have the same non-zero
+/// length, that variant names are non-empty and unique, and that variant
+/// values are unique and within the i32 range.
+LogicalResult EnumDefOp::verify() {
+  ArrayAttr names = getVariantNames();
+  ArrayRef<int64_t> values = getVariantValues();
+  if (names.size() != values.size())
+    return emitOpError("has ")
+           << names.size() << " variant names but " << values.size()
+           << " variant values";
+  if (names.empty())
+    return emitOpError("must have at least one variant");
+
+  llvm::StringSet<> seenNames;
+  llvm::DenseSet<int64_t> seenValues;
+  for (auto [nameAttr, value] : llvm::zip_equal(names, values)) {
+    StringRef name = cast<StringAttr>(nameAttr).getValue();
+    if (name.empty())
+      return emitOpError("variant names must not be empty");
+    if (!seenNames.insert(name).second)
+      return emitOpError("duplicate variant name \"") << name << "\"";
+    if (!seenValues.insert(value).second)
+      return emitOpError("duplicate variant value ") << value;
+    if (!llvm::isInt<32>(value))
+      return emitOpError("variant value ")
+             << value << " is out of the i32 range";
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// GlobalOp
 //===----------------------------------------------------------------------===//
 
 /// Returns whether `type` is a scalar value type (integer, index, or float)
-/// for the purpose of variable initializers.
+/// for the purpose of variable and global initializers.
 static bool isScalarValueType(Type type) {
   return isa<IntegerType, IndexType, FloatType>(type);
 }
+
+/// Verifies that the global's value type is a scalar, array, or struct,
+/// that the `const` marker is only used with const-initializable (scalar or
+/// array) value types, and that a present initializer is a typed attribute
+/// of the value type on a scalar global.
+LogicalResult GlobalOp::verify() {
+  Type type = getType();
+  if (!isScalarValueType(type) && !isa<ArrayType, StructType>(type))
+    return emitOpError("invalid global value type ") << type;
+  if (getIsConst() && isa<StructType>(type))
+    return emitOpError(
+               "const marker requires a scalar or array value type, but got ")
+           << type;
+
+  Attribute init = getInitAttr();
+  if (!init)
+    return success();
+  auto typedInit = dyn_cast<TypedAttr>(init);
+  if (!typedInit)
+    return emitOpError("init must be a typed attribute");
+  if (!isScalarValueType(type))
+    return emitOpError("init is only supported for scalar value types");
+  if (typedInit.getType() != type)
+    return emitOpError("init type ")
+           << typedInit.getType() << " does not match the global value type "
+           << type;
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// GlobalLoadOp / GlobalStoreOp
+//===----------------------------------------------------------------------===//
+
+/// Resolves the referenced global of a load or store, or emits an error on
+/// `op` when the symbol does not name an `emitrust.global`.
+static FailureOr<GlobalOp> resolveGlobal(Operation *op,
+                                         SymbolTableCollection &symbolTable,
+                                         FlatSymbolRefAttr symbol) {
+  auto global =
+      symbolTable.lookupNearestSymbolFrom<GlobalOp>(op, symbol.getAttr());
+  if (!global)
+    return op->emitOpError("'")
+           << symbol.getValue()
+           << "' does not reference a valid emitrust.global";
+  return global;
+}
+
+/// Verifies that the load references an `emitrust.global` whose value type
+/// equals the result type.
+LogicalResult
+GlobalLoadOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  FailureOr<GlobalOp> global =
+      resolveGlobal(getOperation(), symbolTable, getGlobalAttr());
+  if (failed(global))
+    return failure();
+  if (getResult().getType() != global->getType())
+    return emitOpError("result type ")
+           << getResult().getType() << " does not match the value type "
+           << global->getType() << " of the global @" << getGlobal();
+  return success();
+}
+
+/// Verifies that the store references a non-`const` `emitrust.global` whose
+/// value type equals the stored value's type.
+LogicalResult
+GlobalStoreOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  FailureOr<GlobalOp> global =
+      resolveGlobal(getOperation(), symbolTable, getGlobalAttr());
+  if (failed(global))
+    return failure();
+  if (global->getIsConst())
+    return emitOpError("cannot store to the immutable global @") << getGlobal();
+  if (getValue().getType() != global->getType())
+    return emitOpError("value type ")
+           << getValue().getType() << " does not match the value type "
+           << global->getType() << " of the global @" << getGlobal();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// VariableOp
+//===----------------------------------------------------------------------===//
 
 /// Verifies that a present initializer is a typed attribute whose type
 /// equals the lvalue's wrapped value type, and that initializers are only
@@ -397,6 +519,34 @@ LogicalResult AddrOfOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// CmpOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that enum operands are only compared with the eq and ne
+/// predicates: enums derive PartialEq but not PartialOrd.
+LogicalResult CmpOp::verify() {
+  if (!isa<EnumType>(getLhs().getType()))
+    return success();
+  CmpPredicate predicate = getPredicate();
+  if (predicate != CmpPredicate::eq && predicate != CmpPredicate::ne)
+    return emitOpError(
+        "enum operands only support the eq and ne predicates");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// CastOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the result is not an enum type: Rust has no
+/// integer-to-enum `as` cast.
+LogicalResult CastOp::verify() {
+  if (isa<EnumType>(getResult().getType()))
+    return emitOpError("cannot cast to an enum type");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // BreakOp / ContinueOp
 //===----------------------------------------------------------------------===//
 
@@ -496,6 +646,88 @@ LogicalResult ForOp::verify() {
     return emitOpError("expected induction variable to be of type ")
            << getLowerBound().getType() << ", but got "
            << body->getArgument(0).getType();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// SwitchOp
+//===----------------------------------------------------------------------===//
+
+/// Parses a switch in the form
+/// `emitrust.switch %d : type` followed by zero or more `case N { ... }`
+/// groups, a mandatory `default { ... }` region, and an optional attribute
+/// dictionary (mirroring upstream scf.index_switch). Missing
+/// `emitrust.yield` terminators are inserted implicitly.
+ParseResult SwitchOp::parse(OpAsmParser &parser, OperationState &result) {
+  Builder &builder = parser.getBuilder();
+
+  OpAsmParser::UnresolvedOperand discriminator;
+  Type type;
+  if (parser.parseOperand(discriminator) || parser.parseColonType(type) ||
+      parser.resolveOperand(discriminator, type, result.operands))
+    return failure();
+
+  // The default region is stored first to satisfy the ODS requirement that
+  // the variadic case-region list comes last.
+  Region *defaultRegion = result.addRegion();
+
+  SmallVector<int64_t> caseValues;
+  while (succeeded(parser.parseOptionalKeyword("case"))) {
+    int64_t value = 0;
+    if (parser.parseInteger(value))
+      return failure();
+    caseValues.push_back(value);
+    Region *caseRegion = result.addRegion();
+    if (parser.parseRegion(*caseRegion))
+      return failure();
+    SwitchOp::ensureTerminator(*caseRegion, builder, result.location);
+  }
+  result.addAttribute(getCasesAttrName(result.name),
+                      builder.getDenseI64ArrayAttr(caseValues));
+
+  if (parser.parseKeyword("default") || parser.parseRegion(*defaultRegion))
+    return failure();
+  SwitchOp::ensureTerminator(*defaultRegion, builder, result.location);
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+  return success();
+}
+
+/// Prints the switch: the discriminator with its type, one `case N` group
+/// per case region, the `default` region, and the remaining attributes.
+void SwitchOp::print(OpAsmPrinter &p) {
+  p << ' ' << getDiscriminator() << " : " << getDiscriminator().getType();
+  for (auto [value, region] : llvm::zip(getCases(), getCaseRegions())) {
+    p.printNewline();
+    p << "case " << value << ' ';
+    p.printRegion(region,
+                  /*printEntryBlockArgs=*/false,
+                  /*printBlockTerminators=*/false);
+  }
+  p.printNewline();
+  p << "default ";
+  p.printRegion(getDefaultRegion(),
+                /*printEntryBlockArgs=*/false,
+                /*printBlockTerminators=*/false);
+  p.printOptionalAttrDict((*this)->getAttrs(),
+                          /*elidedAttrs=*/{getCasesAttrName()});
+}
+
+/// Verifies that the switch has exactly one case region per case value and
+/// that the case values are unique.
+LogicalResult SwitchOp::verify() {
+  ArrayRef<int64_t> caseValues = getCases();
+  if (getCaseRegions().size() != caseValues.size())
+    return emitOpError("has ")
+           << getCaseRegions().size() << " case regions but "
+           << caseValues.size() << " case values";
+
+  llvm::DenseSet<int64_t> seen;
+  for (int64_t value : caseValues) {
+    if (!seen.insert(value).second)
+      return emitOpError("has duplicate case value ") << value;
+  }
   return success();
 }
 

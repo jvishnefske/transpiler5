@@ -6,7 +6,7 @@
 //
 // Defines the MLIR EmitRust types: opaque Rust type strings, shared /
 // mutable references, assignable lvalues, one-dimensional arrays, and named
-// struct references.
+// struct and enum references.
 //
 //===----------------------------------------------------------------------===//
 
@@ -177,6 +177,36 @@ def EmitRust_StructType : EmitRust_Type<"Struct", "struct"> {
   }];
 
   let parameters = (ins StringRefParameter<"struct name">:$name);
+  let assemblyFormat = "`<` $name `>`";
+  let genVerifyDecl = 1;
+}
+
+def EmitRust_EnumType : EmitRust_Type<"Enum", "enum"> {
+  let summary = "EmitRust enum type";
+
+  let description = [{
+    A named reference to a module-level `emitrust.enum_def`. The type is
+    emitted as the bare enum name, e.g. `Color`. The name must be non-empty;
+    no cross-checking against the referenced symbol is performed.
+
+    Enum values may be used as variable/lvalue value types, function
+    parameter and result types, `emitrust.struct_def` field types,
+    `emitrust.constant` results (with an opaque attribute such as
+    `Color::Red`), `emitrust.cmp` operands (with the `eq` and `ne`
+    predicates only), and `emitrust.cast` sources (rendering e.g. `as i32`).
+    They must not appear as `emitrust.cast` result types (Rust has no
+    integer-to-enum cast) or as arithmetic binary operands. A default-
+    initialized variable of enum type renders `Name::default()`.
+
+    Example:
+
+    ```mlir
+    // Enum type emitted as `Color`
+    !emitrust.enum<"Color">
+    ```
+  }];
+
+  let parameters = (ins StringRefParameter<"enum name">:$name);
   let assemblyFormat = "`<` $name `>`";
   let genVerifyDecl = 1;
 }

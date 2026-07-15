@@ -1,5 +1,6 @@
 // FR-6: Mutability discipline: let renders as immutable let, mut let as let mut, assign as plain assignment.
-// Also covers call_opaque statement/let/tuple forms and verbatim lines.
+// Also covers call_opaque statement/let/tuple forms, select if-expression
+// bindings, and verbatim lines.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
 // CHECK: // module-level marker
@@ -29,6 +30,18 @@ emitrust.func @calls(%arg0: i32, %arg1: i32) {
   %0 = emitrust.call_opaque "produce"(%arg0, %arg1) : (i32, i32) -> i32
   %1:2 = emitrust.call_opaque "pair"(%arg0) : (i32) -> (i32, i64)
   emitrust.return
+}
+
+// A select renders as a let binding of a Rust if expression.
+// CHECK-LABEL: fn selects(v0: bool, v1: i32, v2: i32) -> i32 {
+// CHECK-NEXT:    let v3: i32 = if v0 { v1 } else { v2 };
+// CHECK-NEXT:    let v4: i32 = if v0 { v3 } else { v1 };
+// CHECK-NEXT:    return v4;
+// CHECK-NEXT:  }
+emitrust.func @selects(%arg0: i1, %arg1: i32, %arg2: i32) -> i32 {
+  %0 = emitrust.select %arg0, %arg1, %arg2 : i32
+  %1 = emitrust.select %arg0, %0, %arg1 : i32
+  emitrust.return %1 : i32
 }
 
 // CHECK-LABEL: fn raw_statement() {

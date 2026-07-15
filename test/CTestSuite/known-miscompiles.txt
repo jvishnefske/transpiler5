@@ -1,0 +1,10 @@
+# Quarantine list for known miscompiles in the c-testsuite conformance run.
+# Each entry is a test filename (e.g. 00042.c) that emitrust-cc transpiles
+# and builds successfully but whose binary misbehaves at runtime (wrong
+# output, wrong exit code, crash, or timeout).  Every entry MUST carry a
+# comment explaining the symptom and, ideally, a tracking reference.
+# Quarantined tests keep the suite green while the bug stays visible; the
+# runner still prints each one loudly on every run.
+#
+# Currently empty: the validation run against the current build/bin
+# emitrust-cc produced zero MISCOMPILEs.

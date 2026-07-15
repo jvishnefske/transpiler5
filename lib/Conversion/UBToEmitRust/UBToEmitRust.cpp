@@ -20,6 +20,12 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
+#ifdef EMITRUST_ENABLE_PDLL
+#include "mlir/Dialect/PDL/IR/PDL.h"
+#include "mlir/Dialect/PDLInterp/IR/PDLInterp.h"
+#include "mlir/Parser/Parser.h"
+#endif // EMITRUST_ENABLE_PDLL
+
 namespace mlir {
 namespace emitrust {
 #define GEN_PASS_DEF_CONVERTUBTOEMITRUST
@@ -29,6 +35,10 @@ namespace emitrust {
 
 using namespace mlir;
 using namespace mlir::emitrust;
+
+#ifdef EMITRUST_ENABLE_PDLL
+#include "UBToEmitRustPDLLPatterns.h.inc"
+#endif // EMITRUST_ENABLE_PDLL
 
 //===----------------------------------------------------------------------===//
 // Conversion patterns
@@ -78,9 +88,20 @@ void mlir::emitrust::populateUBToEmitRustPatterns(TypeConverter &typeConverter,
 namespace {
 
 /// The convert-ub-to-emitrust pass: applies the UB-to-EmitRust patterns
-/// under a partial conversion in which the UB dialect is illegal.
+/// under a partial conversion in which the UB dialect is illegal. When
+/// built with EMITRUST_ENABLE_PDLL, the PDLL patterns are registered
+/// alongside the C++ ones.
 struct ConvertUBToEmitRust
     : public emitrust::impl::ConvertUBToEmitRustBase<ConvertUBToEmitRust> {
+#ifdef EMITRUST_ENABLE_PDLL
+  /// Additionally loads the PDL dialects the compiled PDLL patterns are
+  /// interpreted through.
+  void getDependentDialects(DialectRegistry &registry) const override {
+    Base::getDependentDialects(registry);
+    registry.insert<pdl::PDLDialect, pdl_interp::PDLInterpDialect>();
+  }
+#endif // EMITRUST_ENABLE_PDLL
+
   /// Runs the partial conversion and fails the pass on leftover UB ops.
   void runOnOperation() override {
     ConversionTarget target(getContext());
@@ -92,6 +113,10 @@ struct ConvertUBToEmitRust
 
     RewritePatternSet patterns(&getContext());
     populateUBToEmitRustPatterns(typeConverter, patterns);
+#ifdef EMITRUST_ENABLE_PDLL
+    populateGeneratedPDLLPatterns(patterns,
+                                  PDLConversionConfig(&typeConverter));
+#endif // EMITRUST_ENABLE_PDLL
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))

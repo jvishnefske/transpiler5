@@ -7,8 +7,8 @@
 /// \file
 /// Implements the EmitRust dialect types: the opaque type's verifier, the
 /// lvalue nesting rule, the one-dimensional array type with its custom
-/// `NxT` parser/printer and element-type verifier, the named struct
-/// reference type, and the generated type parser/printer definitions.
+/// `NxT` parser/printer and element-type verifier, the named struct and
+/// enum reference types, and the generated type parser/printer definitions.
 //
 //===----------------------------------------------------------------------===//
 
@@ -132,5 +132,17 @@ LogicalResult emitrust::StructType::verify(
     llvm::function_ref<InFlightDiagnostic()> emitError, llvm::StringRef name) {
   if (name.empty())
     return emitError() << "expected non empty name in !emitrust.struct type";
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// EnumType
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the enum reference carries a non-empty name.
+LogicalResult emitrust::EnumType::verify(
+    llvm::function_ref<InFlightDiagnostic()> emitError, llvm::StringRef name) {
+  if (name.empty())
+    return emitError() << "expected non empty name in !emitrust.enum type";
   return success();
 }

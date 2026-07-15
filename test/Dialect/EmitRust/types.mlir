@@ -76,3 +76,20 @@ emitrust.func @lvalue_types() {
   %3 = emitrust.variable : !emitrust.lvalue<!emitrust.array<2x!emitrust.struct<"Point">>>
   emitrust.return
 }
+
+// CHECK-LABEL: emitrust.func @enum_param(
+// CHECK-SAME: !emitrust.enum<"Color">
+// CHECK-SAME: -> !emitrust.enum<"Color">
+emitrust.func @enum_param(%arg0: !emitrust.enum<"Color">) -> !emitrust.enum<"Color"> {
+  emitrust.return %arg0 : !emitrust.enum<"Color">
+}
+
+// CHECK: emitrust.struct_def @Pixel ["pos", "color"] [i32, !emitrust.enum<"Color">]
+emitrust.struct_def @Pixel ["pos", "color"] [i32, !emitrust.enum<"Color">]
+
+// CHECK-LABEL: emitrust.func @enum_lvalue
+emitrust.func @enum_lvalue() {
+  // CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>
+  emitrust.return
+}

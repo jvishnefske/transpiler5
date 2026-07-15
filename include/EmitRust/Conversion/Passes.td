@@ -105,9 +105,10 @@ def ConvertSCFToEmitRust : Pass<"convert-scf-to-emitrust"> {
     - `scf.for` becomes mutable let bindings for the iteration arguments
       and an `emitrust.for` whose body assigns the bindings at `scf.yield`.
     - `scf.index_switch` becomes default-initialized mutable let bindings
-      and a nested `emitrust.if`/else chain comparing the discriminator
-      against each case value, with the default region as the final else;
-      the regions assign the bindings at their `scf.yield`.
+      and an `emitrust.switch` over the same discriminator and case
+      values, with the case and default regions inlined into the
+      corresponding switch regions; the regions assign the bindings at
+      their `scf.yield`.
   }];
   let dependentDialects = ["::mlir::emitrust::EmitRustDialect"];
 }

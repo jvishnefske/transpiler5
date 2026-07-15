@@ -21,10 +21,10 @@
 ///   its `scf.yield`.
 /// - `scf.for` becomes mutable lets for the iteration arguments and an
 ///   `emitrust.for` whose body assigns the lets at `scf.yield`.
-/// - `scf.index_switch` becomes default-initialized mutable lets and a
-///   nested `emitrust.if`/else chain comparing the discriminator against
-///   each case value; the case and default regions assign the lets at
-///   their `scf.yield`.
+/// - `scf.index_switch` becomes default-initialized mutable lets and an
+///   `emitrust.switch` over the same discriminator; the case and default
+///   regions are inlined into the corresponding switch regions and assign
+///   the lets at their `scf.yield`.
 //
 //===----------------------------------------------------------------------===//
 
@@ -324,12 +324,11 @@ struct WhileLowering : public OpConversionPattern<scf::WhileOp> {
   }
 };
 
-/// Converts `scf.index_switch` into a nested `emitrust.if`/else chain. Each
-/// case becomes an `emitrust.if` whose condition compares the discriminator
-/// against the case value; its else region holds the next case (or the
-/// default region after the last case). Result values are modeled as
-/// default-initialized mutable `emitrust.let` bindings assigned at each
-/// region's `scf.yield`, mirroring the `scf.if` lowering.
+/// Converts `scf.index_switch` into `emitrust.switch` over the same
+/// discriminator and case values. Every case region and the default region
+/// is inlined into the corresponding switch region. Result values are
+/// modeled as default-initialized mutable `emitrust.let` bindings assigned
+/// at each region's `scf.yield`, mirroring the `scf.if` lowering.
 struct IndexSwitchLowering : public OpConversionPattern<scf::IndexSwitchOp> {
   using OpConversionPattern<scf::IndexSwitchOp>::OpConversionPattern;
 
@@ -345,8 +344,14 @@ struct IndexSwitchLowering : public OpConversionPattern<scf::IndexSwitchOp> {
                                             rewriter, resultLets)))
       return failure();
 
-    // Inlines one scf region into an emitrust.if region and rewrites its
-    // scf.yield into assignments plus emitrust.yield.
+    // The discriminator keeps its converted type (index renders as usize);
+    // the case values carry over verbatim.
+    auto loweredSwitch = rewriter.create<emitrust::SwitchOp>(
+        loc, adaptor.getArg(), switchOp.getCasesAttr(),
+        switchOp.getCases().size());
+
+    // Inlines one scf region into an emitrust.switch region and rewrites
+    // its scf.yield into assignments plus emitrust.yield.
     auto lowerRegion = [&resultLets, &rewriter,
                         &switchOp](Region &region,
                                    Region &loweredRegion) -> LogicalResult {
@@ -356,63 +361,14 @@ struct IndexSwitchLowering : public OpConversionPattern<scf::IndexSwitchOp> {
                         cast<scf::YieldOp>(terminator));
     };
 
-    ArrayRef<int64_t> caseValues = switchOp.getCases();
-
-    // Degenerate switch without cases: the default region runs
-    // unconditionally, so splice its body right before the op.
-    if (caseValues.empty()) {
-      Block *defaultBlock = &adaptor.getDefaultRegion().front();
-      auto yield = cast<scf::YieldOp>(defaultBlock->getTerminator());
-      SmallVector<Value> yieldOperands;
-      if (failed(rewriter.getRemappedValues(yield.getOperands(),
-                                            yieldOperands)))
-        return rewriter.notifyMatchFailure(switchOp,
-                                           "failed to remap yield operands");
-      rewriter.inlineBlockBefore(defaultBlock, switchOp);
-      {
-        OpBuilder::InsertionGuard guard(rewriter);
-        rewriter.setInsertionPoint(yield);
-        assignValues(yieldOperands, resultLets, rewriter, loc);
-      }
-      rewriter.eraseOp(yield);
-      rewriter.replaceOp(switchOp, resultLets);
-      return success();
+    for (auto [caseRegion, loweredRegion] :
+         llvm::zip(adaptor.getCaseRegions(), loweredSwitch.getCaseRegions())) {
+      if (failed(lowerRegion(*caseRegion, loweredRegion)))
+        return failure();
     }
-
-    // Build the if/else chain. After the first iteration the insertion
-    // point sits inside the previous case's else block, right before its
-    // emitrust.yield terminator.
-    Type discriminatorType = adaptor.getArg().getType();
-    Type i1Type = rewriter.getI1Type();
-    {
-      OpBuilder::InsertionGuard guard(rewriter);
-      for (auto [index, caseValue] : llvm::enumerate(caseValues)) {
-        Value caseConstant = rewriter.create<emitrust::ConstantOp>(
-            loc, discriminatorType,
-            IntegerAttr::get(discriminatorType, caseValue));
-        Value isCase = rewriter.create<emitrust::CmpOp>(
-            loc, i1Type, emitrust::CmpPredicate::eq, adaptor.getArg(),
-            caseConstant);
-        auto caseIf = rewriter.create<emitrust::IfOp>(loc, isCase);
-
-        if (failed(lowerRegion(*adaptor.getCaseRegions()[index],
-                               caseIf.getThenRegion())))
-          return failure();
-
-        if (index + 1 == caseValues.size()) {
-          // Last case: the default region becomes the final else.
-          if (failed(lowerRegion(adaptor.getDefaultRegion(),
-                                 caseIf.getElseRegion())))
-            return failure();
-        } else {
-          // Chain the next case inside this else block; the next iteration
-          // inserts right before the terminator created here.
-          rewriter.createBlock(&caseIf.getElseRegion());
-          Operation *elseYield = rewriter.create<emitrust::YieldOp>(loc);
-          rewriter.setInsertionPoint(elseYield);
-        }
-      }
-    }
+    if (failed(lowerRegion(adaptor.getDefaultRegion(),
+                           loweredSwitch.getDefaultRegion())))
+      return failure();
 
     rewriter.replaceOp(switchOp, resultLets);
     return success();
