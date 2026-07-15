@@ -1895,6 +1895,11 @@ LogicalResult CImporter::emitExprStmt(const clang::Expr *expr) {
 }
 
 LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
+  return success(succeeded(emitAssignToPlace(op)));
+}
+
+FailureOr<Value>
+CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
   // Whole-value store to a global in statement position: a direct
   // emitrust.global_store, no staging copy needed. Value-position uses go
@@ -1933,6 +1938,11 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
 
 LogicalResult
 CImporter::emitCompoundAssign(const clang::CompoundAssignOperator *op) {
+  return success(succeeded(emitCompoundAssignToPlace(op)));
+}
+
+FailureOr<Value>
+CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
   // Compound assignment to a whole global in statement position:
   // load-modify-store through the global access ops, no staging copy
