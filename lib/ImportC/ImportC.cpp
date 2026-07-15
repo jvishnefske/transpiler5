@@ -435,6 +435,33 @@ private:
   /// values print with C's spellings), and %%; anything else is rejected.
   LogicalResult emitPrintf(const clang::CallExpr *call);
 
+  /// Maps one parsed printf conversion (anything but `%%`) onto the Rust
+  /// format language, consuming `argIndex` and appending the placeholder
+  /// text to `rustFormat`:
+  ///  - %d/%i and %u/%x/%X/%o print with `{}`/`{:x}`-style placeholders;
+  ///    `-`, `0`, `+` (signed only), and the field width translate to
+  ///    their exact Rust equivalents. The argument must arrive as the
+  ///    C-varargs-promoted type (i32/i64 signed, u32/u64 unsigned; the
+  ///    `h`/`hh` forms take the promoted i32 and restore C's conversion
+  ///    to the short type with a Rust `as` cast, exactly).
+  ///  - %c takes the promoted i32, converts with `as u8` (C's unsigned
+  ///    char conversion), and prints through `__emitrust_fmt_c`, which
+  ///    accepts ASCII and panics loudly on 0x80..=0xFF (a Rust `char`
+  ///    would re-encode those as two UTF-8 bytes where C writes one).
+  ///  - %s accepts only string-literal arguments; precision (byte cutoff)
+  ///    and width/`-` (space padding) are applied at compile time and the
+  ///    text is inlined into the format string.
+  ///  - %f/%F/%e/%E/%g/%G route through the `__emitrust_fmt_f64` helper,
+  ///    which reproduces glibc's fixed/scientific/general formatting
+  ///    (including non-finite spellings, `#`, and sign/zero padding).
+  ///  - %p and %n and everything unmappable (runtime `*` width/precision,
+  ///    `#` on integers, precision on integers, the ` ` flag, `j`/`z`/
+  ///    `t`/`L` lengths) are rejected with named diagnostics.
+  LogicalResult emitPrintfDirective(const clang::CallExpr *call, Location loc,
+                                    const PrintfSpec &spec, unsigned &argIndex,
+                                    std::string &rustFormat,
+                                    SmallVectorImpl<Value> &operands);
+
   //===--------------------------------------------------------------------===//
   // Expressions
   //===--------------------------------------------------------------------===//
@@ -490,6 +517,8 @@ private:
 
   /// Emits a call expression; returns a null `Value` for void results.
   /// printf reaching this path (i.e. with its result used) is rejected.
+  /// Calls to the curated libc names without a program-provided definition
+  /// dispatch to `emitLibcBuiltin`.
   FailureOr<Value> emitCall(const clang::CallExpr *call);
 
   /// Emits a reference to an enumerator: for a complete named enum, an
@@ -1197,6 +1226,12 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     // calls to them are handled specially or rejected at the call site.
     return success();
   }
+  // Body-less declarations of the curated libc names (hand-written or from
+  // a system header) are skipped the same way: calls dispatch by name in
+  // `emitCall`, and importing the declaration would leave a definition-less
+  // extern function that the Rust translator cannot emit.
+  if (!func->hasBody() && lookupLibcBuiltin(cName))
+    return success();
 
   bool isDefinition = func->isThisDeclarationADefinition();
   // C `main` is renamed so the driver can emit its own Rust `main` wrapper;
@@ -1319,6 +1354,13 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   const clang::TranslationUnitDecl *unit = astContext().getTranslationUnitDecl();
   for (const clang::Decl *decl : unit->decls()) {
     if (decl->isImplicit())
+      continue;
+    // Declarations pulled in from system headers (#include <stdio.h> and
+    // friends) are tolerated but not imported: printf and the curated libc
+    // set dispatch on the callee name at each call site, and a call to any
+    // other system-declared function is rejected there by the ordinary
+    // unimported-function diagnostic.
+    if (sourceManager.isInSystemHeader(decl->getLocation()))
       continue;
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
       if (failed(importFunction(func)))
@@ -1895,6 +1937,11 @@ LogicalResult CImporter::emitExprStmt(const clang::Expr *expr) {
 }
 
 LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
+  return success(succeeded(emitAssignToPlace(op)));
+}
+
+FailureOr<Value>
+CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
   // Whole-value store to a global in statement position: a direct
   // emitrust.global_store, no staging copy needed. Value-position uses go
@@ -1933,6 +1980,11 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
 
 LogicalResult
 CImporter::emitCompoundAssign(const clang::CompoundAssignOperator *op) {
+  return success(succeeded(emitCompoundAssignToPlace(op)));
+}
+
+FailureOr<Value>
+CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
   // Compound assignment to a whole global in statement position:
   // load-modify-store through the global access ops, no staging copy
@@ -2087,7 +2139,11 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
   // Translate the C format string into a Rust format string. The literal's
   // bytes already have C escapes decoded (a "\n" is a real newline byte);
   // the StringAttr printer re-escapes them for the textual assembly.
+  // Bytes that cannot round-trip exactly are rejected up front.
   llvm::StringRef format = literal->getString();
+  if (const char *badByte = checkPrintableAscii(format))
+    return emitError(loc)
+           << "unsupported: " << badByte << " in printf format";
   std::string rustFormat;
   rustFormat.reserve(format.size());
   SmallVector<Value> operands;
@@ -2117,10 +2173,20 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
       rustFormat += c;
       continue;
     }
-    if (++i >= n)
+    if (i + 1 >= n)
       return emitError(loc) << "unsupported: trailing '%' in printf format";
-    char spec = format[i];
-    if (spec == '%') {
+    ++i;
+    PrintfSpec spec;
+    if (std::optional<std::string> error = parsePrintfSpec(format, i, spec))
+      return emitError(loc) << *error;
+    if (spec.conversion == '%') {
+      // C99 7.19.6.1: the complete `%%` specification admits no flags,
+      // width, precision, or length modifier.
+      if (spec.minus || spec.zero || spec.plus || spec.space || spec.alt ||
+          spec.width > 0 || spec.precision >= 0 ||
+          spec.length != PrintfSpec::Length::None)
+        return emitError(loc) << "unsupported: flags, width, precision, or "
+                                 "length modifier on '%%'";
       rustFormat += '%';
       continue;
     }
@@ -2180,6 +2246,228 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
   builder.create<emitrust::CallOpaqueOp>(
       loc, TypeRange(), builder.getStringAttr("print!"),
       builder.getArrayAttr(callArguments), operands);
+  return success();
+}
+
+LogicalResult CImporter::emitPrintfDirective(const clang::CallExpr *call,
+                                             Location loc,
+                                             const PrintfSpec &spec,
+                                             unsigned &argIndex,
+                                             std::string &rustFormat,
+                                             SmallVectorImpl<Value> &operands) {
+  using Length = PrintfSpec::Length;
+  char conv = spec.conversion;
+
+  if (conv == 'p')
+    return emitError(loc) << "unsupported printf conversion '%p' (the "
+                             "generated Rust has no pointer representation)";
+  if (conv == 'n')
+    return emitError(loc) << "unsupported printf conversion '%n' (writes "
+                             "through a pointer argument)";
+
+  bool isSigned = conv == 'd' || conv == 'i';
+  bool isUnsigned = conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o';
+  bool isFloat = conv == 'f' || conv == 'F' || conv == 'e' || conv == 'E' ||
+                 conv == 'g' || conv == 'G';
+  if (!isSigned && !isUnsigned && !isFloat && conv != 'c' && conv != 's')
+    return emitError(loc) << "unsupported printf format specifier '%"
+                          << llvm::Twine(std::string(1, conv)) << "'";
+
+  if (argIndex >= call->getNumArgs())
+    return emitError(loc) << "unsupported: too few arguments to printf";
+  const clang::Expr *argExpr = call->getArg(argIndex);
+
+  // %s: the text is a compile-time constant (only string literals are
+  // supported), so C's precision (a byte cutoff) and width (space padding)
+  // are applied here and the result is inlined into the format string.
+  if (conv == 's') {
+    if (spec.length != Length::None)
+      return emitError(loc) << "unsupported: length modifier on '%s'";
+    if (spec.zero || spec.plus || spec.space || spec.alt)
+      return emitError(loc) << "unsupported: only '-', width, and precision "
+                               "are supported on '%s'";
+    const auto *text = llvm::dyn_cast<clang::StringLiteral>(
+        argExpr->IgnoreParenImpCasts());
+    if (!text || !text->isOrdinary())
+      return emitError(loc) << "unsupported: '%s' argument must be a string "
+                               "literal (char* values are not supported yet)";
+    std::string bytes = text->getString().str();
+    if (const char *badByte = checkPrintableAscii(bytes))
+      return emitError(loc)
+             << "unsupported: " << badByte << " in '%s' argument";
+    if (spec.precision >= 0 &&
+        bytes.size() > static_cast<size_t>(spec.precision))
+      bytes.resize(spec.precision);
+    std::string padding;
+    if (bytes.size() < static_cast<size_t>(spec.width))
+      padding.assign(spec.width - bytes.size(), ' ');
+    if (!spec.minus)
+      appendEscapedForRustFormat(rustFormat, padding);
+    appendEscapedForRustFormat(rustFormat, bytes);
+    if (spec.minus)
+      appendEscapedForRustFormat(rustFormat, padding);
+    ++argIndex;
+    return success();
+  }
+
+  // Determine the exact MLIR type the C varargs promotions deliver, and
+  // the Rust-side `as` conversion (if any) that restores C's printf
+  // semantics for the sub-int lengths.
+  Type expected;
+  Type castTo;
+  llvm::StringRef radix;
+  if (isSigned) {
+    if (spec.space)
+      return emitError(loc)
+             << "unsupported: ' ' flag in printf format (no Rust equivalent)";
+    if (spec.alt)
+      return emitError(loc) << "unsupported: '#' flag on '%" << conv << "'";
+    if (spec.precision >= 0)
+      return emitError(loc) << "unsupported: precision on integer printf "
+                               "conversion '%" << conv << "'";
+    switch (spec.length) {
+    case Length::None:
+      expected = builder.getI32Type();
+      break;
+    case Length::H:
+      // The vararg arrives int-promoted; C converts it back to short
+      // before printing, and Rust's `as i16` is that exact conversion.
+      expected = builder.getI32Type();
+      castTo = builder.getIntegerType(16);
+      break;
+    case Length::HH:
+      expected = builder.getI32Type();
+      castTo = builder.getIntegerType(8);
+      break;
+    case Length::L:
+    case Length::LL:
+      expected = builder.getIntegerType(64);
+      break;
+    }
+  } else if (isUnsigned) {
+    if (spec.space)
+      return emitError(loc)
+             << "unsupported: ' ' flag in printf format (no Rust equivalent)";
+    if (spec.plus)
+      return emitError(loc)
+             << "unsupported: '+' flag on unsigned printf conversion '%"
+             << conv << "'";
+    if (spec.alt)
+      // Rust's `{:#x}` prints the 0x prefix for zero values too, where
+      // C's `%#x` prints it only for nonzero values; rejected rather
+      // than approximated.
+      return emitError(loc) << "unsupported: '#' flag on '%" << conv << "'";
+    if (spec.precision >= 0)
+      return emitError(loc) << "unsupported: precision on integer printf "
+                               "conversion '%" << conv << "'";
+    if (conv == 'x')
+      radix = "x";
+    else if (conv == 'X')
+      radix = "X";
+    else if (conv == 'o')
+      radix = "o";
+    switch (spec.length) {
+    case Length::None:
+      expected = IntegerType::get(builder.getContext(), 32,
+                                  IntegerType::Unsigned);
+      break;
+    case Length::H:
+      // unsigned short promotes to (signed) int in a vararg position;
+      // `as u16` restores C's conversion back to unsigned short.
+      expected = builder.getI32Type();
+      castTo = IntegerType::get(builder.getContext(), 16,
+                                IntegerType::Unsigned);
+      break;
+    case Length::HH:
+      expected = builder.getI32Type();
+      castTo =
+          IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+      break;
+    case Length::L:
+    case Length::LL:
+      expected = IntegerType::get(builder.getContext(), 64,
+                                  IntegerType::Unsigned);
+      break;
+    }
+  } else if (conv == 'c') {
+    if (spec.length != Length::None)
+      return emitError(loc) << "unsupported: length modifier on '%c'";
+    if (spec.zero || spec.plus || spec.space || spec.alt ||
+        spec.precision >= 0)
+      return emitError(loc)
+             << "unsupported: only '-' and width are supported on '%c'";
+    expected = builder.getI32Type();
+    castTo =
+        IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  } else {
+    // %f/%F/%e/%E/%g/%G. C99 allows `l` as a no-op on the floating
+    // conversions; the sub-int lengths do not apply.
+    if (spec.length != Length::None && spec.length != Length::L)
+      return emitError(loc)
+             << "unsupported: length modifier on floating printf "
+                "conversion '%" << conv << "'";
+    expected = builder.getF64Type();
+  }
+
+  FailureOr<Value> argument = emitRValue(argExpr);
+  if (failed(argument))
+    return failure();
+  if ((*argument).getType() != expected)
+    return emitError(loc) << "unsupported: printf argument " << argIndex
+                          << " does not match its format specifier";
+  ++argIndex;
+
+  Value value = *argument;
+  if (castTo)
+    value = builder.create<emitrust::CastOp>(loc, castTo, value).getResult();
+
+  std::string placeholder;
+  if (isFloat) {
+    // Everything glibc-divergent about Rust float formatting (nan/inf
+    // spellings, %e's exponent shape, %g's trimming rules, '#', and
+    // sign-aware padding) lives in the __emitrust_fmt_f64 helper, which
+    // receives the parsed specification as compile-time constants and
+    // returns the finished field as a String.
+    needsFloatFormatHelper = true;
+    unsigned flags = (spec.minus ? 1u : 0u) | (spec.zero ? 2u : 0u) |
+                     (spec.plus ? 4u : 0u) | (spec.space ? 8u : 0u) |
+                     (spec.alt ? 16u : 0u);
+    int precision = spec.precision < 0 ? 6 : spec.precision;
+    auto stringType =
+        emitrust::OpaqueType::get(builder.getContext(), "String");
+    std::string convLiteral = std::string("b'") + conv + "'";
+    SmallVector<Attribute> helperArgs{
+        builder.getIndexAttr(0),
+        emitrust::OpaqueAttr::get(builder.getContext(), convLiteral),
+        builder.getI32IntegerAttr(flags),
+        builder.getI32IntegerAttr(spec.width),
+        builder.getI32IntegerAttr(precision)};
+    value = builder
+                .create<emitrust::CallOpaqueOp>(
+                    loc, TypeRange{stringType},
+                    builder.getStringAttr("__emitrust_fmt_f64"),
+                    builder.getArrayAttr(helperArgs), ValueRange{value})
+                .getResult(0);
+    placeholder = "{}";
+  } else if (conv == 'c') {
+    // `as u8` above is C's conversion to unsigned char; the helper turns
+    // the byte into a Rust char for printing and panics loudly on
+    // 0x80..=0xFF, where a char would re-encode as two UTF-8 bytes while
+    // C writes one.
+    needsCharFormatHelper = true;
+    auto charType = emitrust::OpaqueType::get(builder.getContext(), "char");
+    value = builder
+                .create<emitrust::CallOpaqueOp>(
+                    loc, TypeRange{charType},
+                    builder.getStringAttr("__emitrust_fmt_c"),
+                    /*args=*/ArrayAttr(), ValueRange{value})
+                .getResult(0);
+    placeholder = buildRustPlaceholder(spec, "", /*forceRightAlign=*/true);
+  } else {
+    placeholder = buildRustPlaceholder(spec, radix, /*forceRightAlign=*/false);
+  }
+  operands.push_back(value);
+  rustFormat += placeholder;
   return success();
 }
 
@@ -3053,6 +3341,12 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
 
   std::string name = mlirFuncName(callee);
   func::FuncOp target = functions.lookup(name);
+  // Curated libc calls dispatch by name when the program does not provide
+  // its own definition (a body-less declaration, whether hand-written or
+  // from a system header, does not count as one).
+  if (!target || target.isExternal())
+    if (std::optional<LibcBuiltin> builtin = lookupLibcBuiltin(name))
+      return emitLibcBuiltin(call, *builtin, loc);
   if (!target)
     return emitError(loc) << "unsupported: call to unimported function '"
                           << name << "'";
