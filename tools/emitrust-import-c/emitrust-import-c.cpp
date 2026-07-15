@@ -22,6 +22,7 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Support/FileUtilities.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/ToolOutputFile.h"
@@ -29,14 +30,53 @@
 
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
-static llvm::cl::opt<std::string>
-    inputFilename(llvm::cl::Positional, llvm::cl::desc("<input C file>"),
-                  llvm::cl::Required);
+static llvm::cl::list<std::string>
+    inputFilenames(llvm::cl::Positional, llvm::cl::desc("<input C files>"),
+                   llvm::cl::OneOrMore);
 
 static llvm::cl::opt<std::string>
     outputFilename("o", llvm::cl::desc("Output filename"),
                    llvm::cl::value_desc("filename"), llvm::cl::init("-"));
+
+static llvm::cl::list<std::string>
+    includeDirs("I", llvm::cl::Prefix,
+                llvm::cl::desc("Add a directory to the include search path"),
+                llvm::cl::value_desc("dir"));
+
+static llvm::cl::list<std::string> systemIncludeDirs(
+    "isystem",
+    llvm::cl::desc("Add a directory to the system include search path"),
+    llvm::cl::value_desc("dir"));
+
+static llvm::cl::list<std::string>
+    extraArgs("extra-arg",
+              llvm::cl::desc("Additional clang argument, passed verbatim "
+                             "(repeatable)"),
+              llvm::cl::value_desc("arg"));
+
+/// Collects the `-I`, `-isystem`, and `--extra-arg` options into one clang
+/// argument list, interleaved by command-line position so the include search
+/// order matches what the user wrote.
+static std::vector<std::string> collectExtraClangArgs() {
+  std::vector<std::pair<unsigned, std::vector<std::string>>> items;
+  for (unsigned i = 0, e = includeDirs.size(); i != e; ++i)
+    items.push_back({includeDirs.getPosition(i), {"-I" + includeDirs[i]}});
+  for (unsigned i = 0, e = systemIncludeDirs.size(); i != e; ++i)
+    items.push_back(
+        {systemIncludeDirs.getPosition(i), {"-isystem", systemIncludeDirs[i]}});
+  for (unsigned i = 0, e = extraArgs.size(); i != e; ++i)
+    items.push_back({extraArgs.getPosition(i), {extraArgs[i]}});
+  llvm::stable_sort(items, [](const auto &a, const auto &b) {
+    return a.first < b.first;
+  });
+  std::vector<std::string> args;
+  for (const auto &item : items)
+    args.insert(args.end(), item.second.begin(), item.second.end());
+  return args;
+}
 
 /// Prints one diagnostic (and its notes) to stderr as
 /// `file:line:col: severity: message`, matching the format the lit tests
@@ -79,8 +119,15 @@ int main(int argc, char **argv) {
   context.getDiagEngine().registerHandler(
       [](mlir::Diagnostic &diag) { printDiagnostic(diag); });
 
+  std::vector<std::string> extra = collectExtraClangArgs();
+  std::vector<std::string> inputs(inputFilenames.begin(),
+                                  inputFilenames.end());
+  // A single input keeps the historical single-TU behavior (bare names); two
+  // or more inputs are merged as a project with cross-TU linkage.
   mlir::OwningOpRef<mlir::ModuleOp> module =
-      mlir::emitrust::importC(inputFilename, context);
+      inputs.size() == 1
+          ? mlir::emitrust::importC(inputs.front(), extra, context)
+          : mlir::emitrust::importCProject(inputs, extra, context);
   if (!module)
     return 1;
 

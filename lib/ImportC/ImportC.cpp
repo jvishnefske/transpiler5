@@ -91,6 +91,7 @@
 #include "llvm/ADT/Twine.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string>
@@ -175,15 +176,32 @@ static bool isRustKeyword(llvm::StringRef name) {
 /// the module passed in by the caller.
 class CImporter {
 public:
-  /// Creates an importer that appends to `module`.
-  CImporter(clang::ASTContext &astContext, ModuleOp module)
-      : astContext(astContext), module(module), builder(module.getContext()) {}
+  /// Creates an importer that appends to `module`. The translation-unit
+  /// specific context is supplied per call to `importTranslationUnit`, so one
+  /// importer can merge several ASTs (cross-TU dedup state persists).
+  explicit CImporter(ModuleOp module)
+      : module(module), builder(module.getContext()) {}
 
-  /// Imports every supported top-level declaration of the translation unit:
-  /// complete named struct definitions, function declarations or
-  /// definitions, and file-scope variables (as module-level
+  /// Imports every supported top-level declaration of `context`'s translation
+  /// unit into the module: complete named struct definitions, function
+  /// declarations or definitions, and file-scope variables (as module-level
   /// `emitrust.global`s). Other declarations are rejected.
-  LogicalResult importTranslationUnit();
+  ///
+  /// `tuTag` is prepended to internal-linkage (`static`) symbol names so that
+  /// identically named file-statics in different translation units stay
+  /// distinct; it is empty for a single-TU import (bare names, historical
+  /// behavior). `deferExtern` controls whether an `extern`-only global with no
+  /// definition in this TU is an immediate error (single-file) or deferred for
+  /// cross-TU resolution (project). Repeated calls accumulate into one module.
+  LogicalResult importTranslationUnit(clang::ASTContext &context,
+                                      llvm::StringRef tuTag, bool deferExtern);
+
+  /// After every translation unit has been imported, checks that no external
+  /// symbol was left unresolved: every deferred `extern` global must have a
+  /// definition, and no non-variadic external function may remain body-less
+  /// (the Rust emitter cannot emit a body-less function). Emits located
+  /// diagnostics otherwise.
+  LogicalResult finalizeProject();
 
 private:
   //===--------------------------------------------------------------------===//
@@ -257,6 +275,14 @@ private:
   LogicalResult createGlobal(const clang::VarDecl *key,
                              const clang::VarDecl *decl,
                              llvm::StringRef symbolName, Location loc);
+
+  /// Registers an `extern`-only global reference (project import) without
+  /// creating an `emitrust.global`: records the mapping so uses in this TU
+  /// resolve and remembers `symbolName` for the post-merge check that some TU
+  /// really defines it. Rejects pointer-typed and unmappable globals.
+  LogicalResult deferExternGlobal(const clang::VarDecl *key,
+                                  llvm::StringRef symbolName,
+                                  clang::QualType qualType, Location loc);
 
   /// Evaluates `decl`'s initializer as a constant (clang APValue
   /// evaluation) and converts it to a typed attribute of `type`. Supports
@@ -525,8 +551,32 @@ private:
   // State
   //===--------------------------------------------------------------------===//
 
-  /// The clang AST being translated (borrowed, read-only).
-  clang::ASTContext &astContext;
+  /// Computes the MLIR symbol name of a function: `c_main` for C `main`, the
+  /// per-TU-mangled `<tag><name>` for internal-linkage (`static`) functions,
+  /// and the bare C name for external-linkage functions.
+  std::string mlirFuncName(const clang::FunctionDecl *func) const;
+
+  /// The clang AST currently being translated (borrowed, read-only). Rebound
+  /// by each `importTranslationUnit` call so one importer can span TUs.
+  clang::ASTContext *astContextPtr = nullptr;
+  /// Accessor giving the reference-style spelling used throughout.
+  clang::ASTContext &astContext() const { return *astContextPtr; }
+  /// Prefix prepended to internal-linkage symbol names in the current TU
+  /// (empty for single-TU imports).
+  std::string currentTuTag;
+  /// When true (project import), an `extern`-only global with no definition in
+  /// this TU is deferred to `finalizeProject` instead of being an error.
+  bool deferExternGlobals = false;
+  /// Deferred `extern` global references awaiting a cross-TU definition,
+  /// keyed by MLIR symbol name; the location is the first reference for the
+  /// diagnostic if no TU defines it.
+  llvm::StringMap<Location> pendingExternGlobals;
+  /// Shape of every imported struct, keyed by symbol name, for cross-TU
+  /// deduplication and mismatch detection.
+  llvm::StringMap<std::string> importedRecordShapes;
+  /// Shape of every imported enum, keyed by symbol name, for cross-TU
+  /// deduplication and mismatch detection.
+  llvm::StringMap<std::string> importedEnumShapes;
   /// The module receiving struct definitions and functions.
   ModuleOp module;
   /// Builder positioned inside the function body under construction.
@@ -562,6 +612,9 @@ private:
   /// one-per-module emission of the `__emitrust_fmt_f64` helper that
   /// matches C's non-finite `%f` spellings (`nan`/`-nan`).
   bool needsFloatFormatHelper = false;
+  /// True once the `__emitrust_fmt_f64` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool floatFormatHelperEmitted = false;
 };
 
 } // namespace
@@ -569,30 +622,6 @@ private:
 //===----------------------------------------------------------------------===//
 // AST helpers
 //===----------------------------------------------------------------------===//
-
-/// Returns true if `name` spells a Rust keyword. C identifiers (enumerator,
-/// struct, field, and function spellings) are emitted verbatim as Rust
-/// identifiers, so any spelling that Rust reserves (the complete Rust 2021
-/// strict and reserved keyword sets, including path keywords) must be
-/// rejected. Spellings that are also C keywords can never reach the importer
-/// but are listed anyway so the table matches the Rust reference verbatim.
-static bool isRustKeyword(llvm::StringRef name) {
-  return llvm::StringSwitch<bool>(name)
-      // Strict keywords.
-      .Cases("as", "break", "const", "continue", "crate", "dyn", "else",
-             "enum", true)
-      .Cases("extern", "false", "fn", "for", "if", "impl", "in", "let", true)
-      .Cases("loop", "match", "mod", "move", "mut", "pub", "ref", "return",
-             true)
-      .Cases("self", "Self", "static", "struct", "super", "trait", "true",
-             "type", true)
-      .Cases("unsafe", "use", "where", "while", "async", "await", true)
-      // Reserved keywords.
-      .Cases("abstract", "become", "box", "do", "final", "macro", "override",
-             "priv", true)
-      .Cases("typeof", "unsized", "virtual", "yield", "try", true)
-      .Default(false);
-}
 
 /// Strips parentheses and `ConstantExpr` wrappers (clang wraps constant
 /// contexts such as case values in `ConstantExpr`) without touching casts.
@@ -684,7 +713,7 @@ Location CImporter::translateLoc(clang::SourceLocation sourceLoc) {
   MLIRContext *context = builder.getContext();
   if (sourceLoc.isInvalid())
     return UnknownLoc::get(context);
-  const clang::SourceManager &sourceManager = astContext.getSourceManager();
+  const clang::SourceManager &sourceManager = astContext().getSourceManager();
   clang::PresumedLoc presumed = sourceManager.getPresumedLoc(sourceLoc);
   if (presumed.isInvalid())
     return UnknownLoc::get(context);
@@ -755,7 +784,7 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
   }
 
   if (const clang::ConstantArrayType *array =
-          astContext.getAsConstantArrayType(canonical)) {
+          astContext().getAsConstantArrayType(canonical)) {
     FailureOr<Type> element = mapType(array->getElementType(), loc);
     if (failed(element))
       return failure();
@@ -846,6 +875,26 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   if (fieldNames.empty())
     return emitError(defLoc) << "unsupported: struct with no members";
 
+  // Cross-TU deduplication: the same struct reached through a shared header
+  // has distinct decls in each TU. Dedup by symbol name; an identical shape is
+  // skipped, a name reused with a different field shape is a diagnostic.
+  std::string shape;
+  {
+    llvm::raw_string_ostream os(shape);
+    for (auto [fieldName, fieldType] : llvm::zip(fieldNames, fieldTypes))
+      os << fieldName << ':' << fieldType << ';';
+  }
+  auto existingShape = importedRecordShapes.find(definition->getName());
+  if (existingShape != importedRecordShapes.end()) {
+    if (existingShape->second != shape)
+      return emitError(defLoc)
+             << "unsupported: conflicting definition of struct '"
+             << definition->getName()
+             << "' with a different shape in another translation unit";
+    return success();
+  }
+  importedRecordShapes[definition->getName()] = shape;
+
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
   moduleBuilder.create<emitrust::StructDefOp>(
       defLoc, moduleBuilder.getStringAttr(definition->getName()),
@@ -895,6 +944,26 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
   if (variantNames.empty())
     return emitError(defLoc) << "unsupported: enum with no enumerators";
 
+  // Cross-TU deduplication by symbol name (see importRecord): identical shape
+  // is skipped, a name reused with a different variant shape is a diagnostic.
+  std::string shape;
+  {
+    llvm::raw_string_ostream os(shape);
+    for (auto [variantName, variantValue] :
+         llvm::zip(variantNames, variantValues))
+      os << variantName << '=' << variantValue << ';';
+  }
+  auto existingShape = importedEnumShapes.find(definition->getName());
+  if (existingShape != importedEnumShapes.end()) {
+    if (existingShape->second != shape)
+      return emitError(defLoc)
+             << "unsupported: conflicting definition of enum '"
+             << definition->getName()
+             << "' with a different shape in another translation unit";
+    return success();
+  }
+  importedEnumShapes[definition->getName()] = shape;
+
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
   moduleBuilder.create<emitrust::EnumDefOp>(
       defLoc, moduleBuilder.getStringAttr(definition->getName()),
@@ -925,12 +994,25 @@ LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   if (var->getTLSKind() != clang::VarDecl::TLS_None)
     return emitError(loc) << "unsupported: thread-local global variable";
 
+  // Internal-linkage (`static`) globals are mangled with the per-TU tag so
+  // identically named file-statics in different TUs stay distinct; external
+  // globals keep their bare C name and unify across TUs. The tag is empty for
+  // a single-TU import, preserving the historical bare name.
+  bool internal = !var->isExternallyVisible();
+  std::string symbolName =
+      internal ? currentTuTag + var->getName().str() : var->getName().str();
+
   // C reconciliation of redeclarations: a variable that is only ever
   // `extern`-declared has no storage in this translation unit; a tentative
   // definition (`int g;`) behaves as a zero-initialized definition.
-  if (var->hasDefinition() == clang::VarDecl::DeclarationOnly)
-    return emitError(loc) << "unsupported: extern global variable without a "
-                             "definition in this translation unit";
+  if (var->hasDefinition() == clang::VarDecl::DeclarationOnly) {
+    if (!deferExternGlobals)
+      return emitError(loc) << "unsupported: extern global variable without a "
+                               "definition in this translation unit";
+    // Project import: another TU may define this external symbol. Defer the
+    // existence check to `finalizeProject` after every TU is merged.
+    return deferExternGlobal(canonical, symbolName, var->getType(), loc);
+  }
 
   // The declaration carrying the initializer (if any) supplies the type;
   // otherwise the most recent declaration does, whose type is the merged
@@ -939,7 +1021,21 @@ LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   const clang::Expr *init = canonical->getAnyInitializer(initDecl);
   const clang::VarDecl *typeDecl =
       init ? initDecl : canonical->getMostRecentDecl();
-  return createGlobal(canonical, typeDecl, canonical->getName(), loc);
+  return createGlobal(canonical, typeDecl, symbolName, loc);
+}
+
+LogicalResult CImporter::deferExternGlobal(const clang::VarDecl *key,
+                                           llvm::StringRef symbolName,
+                                           clang::QualType qualType,
+                                           Location loc) {
+  if (qualType.getCanonicalType()->isPointerType())
+    return emitError(loc) << "unsupported: pointer-typed global variable";
+  FailureOr<Type> mlirType = mapType(qualType, loc);
+  if (failed(mlirType))
+    return failure();
+  globals[key] = GlobalInfo{symbolName.str(), *mlirType};
+  pendingExternGlobals.try_emplace(symbolName, loc);
+  return success();
 }
 
 LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
@@ -951,9 +1047,26 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
   if (isRustKeyword(symbolName))
     return emitError(loc) << "unsupported: global variable name '"
                           << symbolName << "' is a Rust keyword";
-  if (SymbolTable::lookupSymbolIn(module, symbolName))
-    return emitError(loc) << "unsupported: global variable '" << symbolName
-                          << "' collides with an existing symbol";
+  if (Operation *existing = SymbolTable::lookupSymbolIn(module, symbolName)) {
+    auto existingGlobal = llvm::dyn_cast<emitrust::GlobalOp>(existing);
+    if (!deferExternGlobals || !existingGlobal)
+      return emitError(loc) << "unsupported: global variable '" << symbolName
+                            << "' collides with an existing symbol";
+    // Project import: a second file-scope definition of the same external
+    // global. A tentative definition (no initializer) yields to a real one;
+    // two real definitions are a duplicate-definition error.
+    bool incomingHasInit = decl->getInit() != nullptr;
+    if (!incomingHasInit) {
+      globals[key] = GlobalInfo{symbolName.str(), existingGlobal.getType()};
+      return success();
+    }
+    if (existingGlobal.getInitAttr())
+      return emitError(loc)
+             << "unsupported: conflicting definition of global variable '"
+             << symbolName
+             << "' (already defined in another translation unit)";
+    existingGlobal.erase(); // Upgrade the tentative definition to this one.
+  }
 
   clang::QualType qualType = decl->getType();
   if (qualType.getCanonicalType()->isPointerType())
@@ -1061,6 +1174,18 @@ void CImporter::flushGlobalWriteback(Location loc,
                                           globalSymbol(writeback.symbol));
 }
 
+std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
+  llvm::StringRef cName = func->getName();
+  if (cName == "main")
+    return "c_main";
+  // Internal-linkage (`static`) functions are mangled with the per-TU tag so
+  // identically named file-statics in different TUs never collide. The tag is
+  // empty for a single-TU import, preserving the historical bare name.
+  if (func->getStorageClass() == clang::SC_Static)
+    return currentTuTag + cName.str();
+  return cName.str();
+}
+
 LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   Location loc = translateLoc(func->getLocation());
   llvm::StringRef cName = func->getName();
@@ -1086,8 +1211,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   if (isRustKeyword(cName))
     return emitError(loc) << "unsupported: function name '" << cName
                           << "' is a Rust keyword";
-  llvm::StringRef name =
-      cName == "main" ? llvm::StringRef("c_main") : cName;
+  std::string name = mlirFuncName(func);
 
   // Build the signature.
   SmallVector<Type> inputTypes;
@@ -1108,10 +1232,18 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   }
   FunctionType functionType = builder.getFunctionType(inputTypes, resultTypes);
 
-  // Reconcile with an earlier import of the same symbol.
+  // Reconcile with an earlier import of the same symbol. Across TUs an
+  // external prototype in one file is satisfied by the definition in another;
+  // a second definition of the same external symbol is a duplicate. (Internal
+  // statics are mangled per-TU, so any collision here is a genuine external
+  // clash — for a valid single TU clang has already merged redeclarations.)
   if (func::FuncOp existing = functions.lookup(name)) {
-    if (!isDefinition || !existing.isExternal())
-      return success(); // Redundant declaration (or already defined).
+    if (!isDefinition)
+      return success(); // Redundant declaration.
+    if (!existing.isExternal())
+      return emitError(loc)
+             << "unsupported: conflicting definition of '" << name
+             << "' (already defined in another translation unit)";
     if (existing.getFunctionType() != functionType)
       return emitError(loc) << "unsupported: conflicting redeclaration of '"
                             << name << "'";
@@ -1134,7 +1266,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   addressTaken.clear();
   loopStack.clear();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
-  currentFuncName = name.str();
+  currentFuncName = name;
   currentIsMain = name == "c_main";
   bodyRegion = &funcOp.getBody();
   entryBlock = funcOp.addEntryBlock();
@@ -1178,8 +1310,13 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   return finalizeFunction(funcOp, loc);
 }
 
-LogicalResult CImporter::importTranslationUnit() {
-  const clang::TranslationUnitDecl *unit = astContext.getTranslationUnitDecl();
+LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
+                                               llvm::StringRef tuTag,
+                                               bool deferExtern) {
+  astContextPtr = &context;
+  currentTuTag = tuTag.str();
+  deferExternGlobals = deferExtern;
+  const clang::TranslationUnitDecl *unit = astContext().getTranslationUnitDecl();
   for (const clang::Decl *decl : unit->decls()) {
     if (decl->isImplicit())
       continue;
@@ -1208,7 +1345,8 @@ LogicalResult CImporter::importTranslationUnit() {
     return emitError(translateLoc(decl->getBeginLoc()))
            << "unsupported top-level declaration";
   }
-  if (needsFloatFormatHelper) {
+  if (needsFloatFormatHelper && !floatFormatHelperEmitted) {
+    floatFormatHelperEmitted = true;
     // C-compatible `%f` rendering: `{:.6}` matches C for finite values and
     // infinities, but Rust spells NaN as "NaN" where C prints "nan" with a
     // leading '-' when the sign bit is set. Emitted once per module, after
@@ -1655,7 +1793,7 @@ LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
           if (caseStmt->getRHS())
             return emitError(labelLoc) << "unsupported: GNU case range";
           llvm::APSInt value =
-              caseStmt->getLHS()->EvaluateKnownConstInt(astContext);
+              caseStmt->getLHS()->EvaluateKnownConstInt(astContext());
           caseValues.push_back(value.extOrTrunc(flagType.getWidth()));
           caseBlocks.push_back(sections.back().block);
         } else {
@@ -1800,7 +1938,7 @@ CImporter::emitCompoundAssign(const clang::CompoundAssignOperator *op) {
   // load-modify-store through the global access ops, no staging copy
   // needed. Value-position uses go through emitCompoundAssignToPlace.
   if (const clang::VarDecl *var = asDirectGlobalRef(op->getLHS())) {
-    if (!astContext.hasSameUnqualifiedType(op->getComputationLHSType(),
+    if (!astContext().hasSameUnqualifiedType(op->getComputationLHSType(),
                                            op->getLHS()->getType()))
       return emitError(loc)
              << "unsupported: compound assignment with operand promotion";
@@ -1838,7 +1976,7 @@ CImporter::emitCompoundAssign(const clang::CompoundAssignOperator *op) {
 FailureOr<Value>
 CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
-  if (!astContext.hasSameUnqualifiedType(op->getComputationLHSType(),
+  if (!astContext().hasSameUnqualifiedType(op->getComputationLHSType(),
                                          op->getLHS()->getType()))
     return emitError(loc)
            << "unsupported: compound assignment with operand promotion";
@@ -2176,7 +2314,7 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     if (llvm::isa<emitrust::EnumType>((*value).getType())) {
       if (!cast->getType().getCanonicalType()->isIntegerType())
         return emitError(loc) << "unsupported integral cast";
-      unsigned width = astContext.getIntWidth(cast->getType());
+      unsigned width = astContext().getIntWidth(cast->getType());
       return builder
           .create<emitrust::CastOp>(loc, builder.getIntegerType(width),
                                     *value)
@@ -2890,8 +3028,8 @@ CImporter::emitSizeofAlignof(const clang::UnaryExprOrTypeTraitExpr *expr) {
            << "unsupported: sizeof/alignof of an incomplete or function type";
   int64_t value =
       kind == clang::UETT_SizeOf
-          ? astContext.getTypeSizeInChars(operand).getQuantity()
-          : astContext.getTypeAlignInChars(operand).getQuantity();
+          ? astContext().getTypeSizeInChars(operand).getQuantity()
+          : astContext().getTypeAlignInChars(operand).getQuantity();
   // The result's C type is size_t (unsigned long here); the fold uses
   // clang's target layout, so the value always matches a native build of
   // the same translation unit.
@@ -2913,9 +3051,7 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   if (callee->isVariadic())
     return emitError(loc) << "unsupported: call to a variadic function";
 
-  llvm::StringRef name = callee->getName() == "main"
-                             ? llvm::StringRef("c_main")
-                             : callee->getName();
+  std::string name = mlirFuncName(callee);
   func::FuncOp target = functions.lookup(name);
   if (!target)
     return emitError(loc) << "unsupported: call to unimported function '"
@@ -3152,19 +3288,74 @@ FailureOr<Value> CImporter::extendBool(Location loc, Value flag,
   return builder.create<arith::ExtUIOp>(loc, *target, flag).getResult();
 }
 
+LogicalResult CImporter::finalizeProject() {
+  // Every deferred `extern` global reference must have a real definition in
+  // some translation unit; the Rust program otherwise reads an undefined
+  // symbol.
+  for (const auto &entry : pendingExternGlobals)
+    if (!SymbolTable::lookupSymbolIn(module, entry.getKey()))
+      return emitError(entry.getValue())
+             << "unsupported: extern global variable '" << entry.getKey()
+             << "' is referenced but not defined in any translation unit";
+
+  // No non-variadic external function may remain body-less: the Rust emitter
+  // cannot emit a body-less function. (Variadic prototypes such as printf were
+  // never added to the module, so any external func here is a genuine
+  // undefined reference.)
+  for (func::FuncOp func : module.getOps<func::FuncOp>())
+    if (func.isExternal())
+      return emitError(func.getLoc())
+             << "unsupported: function '" << func.getSymName()
+             << "' is referenced but not defined in any translation unit";
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
-// Entry point
+// Entry points
 //===----------------------------------------------------------------------===//
 
-OwningOpRef<ModuleOp> mlir::emitrust::importC(llvm::StringRef path,
-                                              MLIRContext &context) {
+namespace {
+
+/// Loads the dialects the importer produces into `context`.
+void loadImportDialects(MLIRContext &context) {
   context.loadDialect<emitrust::EmitRustDialect, func::FuncDialect,
                       arith::ArithDialect, memref::MemRefDialect,
                       cf::ControlFlowDialect>();
+}
+
+/// Assembles the clang command line shared by every import path: `-std=c11`,
+/// then clang's builtin `-resource-dir` (needed for system headers such as
+/// `<stdint.h>`) taken from the `EMITRUST_RESOURCE_DIR` environment variable
+/// or, failing that, the compile-time `EMITRUST_CLANG_RESOURCE_DIR` macro when
+/// defined, and finally the caller's extra arguments in order.
+std::vector<std::string>
+buildCommandLine(llvm::ArrayRef<std::string> extraClangArgs) {
+  std::vector<std::string> commandLine{"-std=c11"};
+  std::string resourceDir;
+  if (const char *env = std::getenv("EMITRUST_RESOURCE_DIR"))
+    resourceDir = env;
+#ifdef EMITRUST_CLANG_RESOURCE_DIR
+  if (resourceDir.empty())
+    resourceDir = EMITRUST_CLANG_RESOURCE_DIR;
+#endif
+  if (!resourceDir.empty())
+    commandLine.push_back("-resource-dir=" + resourceDir);
+  commandLine.insert(commandLine.end(), extraClangArgs.begin(),
+                     extraClangArgs.end());
+  return commandLine;
+}
+
+} // namespace
+
+OwningOpRef<ModuleOp>
+mlir::emitrust::importC(llvm::StringRef path,
+                        llvm::ArrayRef<std::string> extraClangArgs,
+                        MLIRContext &context) {
+  loadImportDialects(context);
 
   // Imperative shell: parse the file with clang. Parse diagnostics are
   // printed to stderr by clang's own diagnostic machinery.
-  std::vector<std::string> commandLine{"-std=c11"};
+  std::vector<std::string> commandLine = buildCommandLine(extraClangArgs);
   clang::tooling::FixedCompilationDatabase compilations(".", commandLine);
   std::vector<std::string> sources{path.str()};
   clang::tooling::ClangTool tool(compilations, sources);
@@ -3184,12 +3375,69 @@ OwningOpRef<ModuleOp> mlir::emitrust::importC(llvm::StringRef path,
       FileLineColLoc::get(StringAttr::get(&context, path), /*line=*/1,
                           /*column=*/1);
   OwningOpRef<ModuleOp> module(ModuleOp::create(moduleLoc));
-  CImporter importer(ast.getASTContext(), *module);
-  if (failed(importer.importTranslationUnit()))
+  CImporter importer(*module);
+  if (failed(importer.importTranslationUnit(ast.getASTContext(),
+                                            /*tuTag=*/"",
+                                            /*deferExtern=*/false)))
     return nullptr;
 
   // A verifier failure indicates an importer bug; it is still an import
   // failure and must never yield unverified IR.
+  if (failed(verify(*module)))
+    return nullptr;
+  return module;
+}
+
+OwningOpRef<ModuleOp> mlir::emitrust::importC(llvm::StringRef path,
+                                              MLIRContext &context) {
+  return importC(path, /*extraClangArgs=*/{}, context);
+}
+
+OwningOpRef<ModuleOp>
+mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
+                               llvm::ArrayRef<std::string> extraClangArgs,
+                               MLIRContext &context) {
+  loadImportDialects(context);
+  if (paths.empty()) {
+    emitError(UnknownLoc::get(&context)) << "no C input files given";
+    return nullptr;
+  }
+
+  // Imperative shell: parse every source as an independent translation unit.
+  std::vector<std::string> commandLine = buildCommandLine(extraClangArgs);
+  clang::tooling::FixedCompilationDatabase compilations(".", commandLine);
+  std::vector<std::string> sources(paths.begin(), paths.end());
+  clang::tooling::ClangTool tool(compilations, sources);
+  std::vector<std::unique_ptr<clang::ASTUnit>> asts;
+  int status = tool.buildASTs(asts);
+  if (asts.size() != paths.size()) {
+    emitError(UnknownLoc::get(&context))
+        << "failed to parse one or more C inputs";
+    return nullptr;
+  }
+  for (const std::unique_ptr<clang::ASTUnit> &ast : asts)
+    if (!ast || ast->getDiagnostics().hasErrorOccurred())
+      return nullptr;
+  if (status != 0)
+    return nullptr;
+
+  // Functional core: merge every AST into one module with shared cross-TU
+  // dedup and extern-resolution state. All ASTs stay alive for the whole
+  // import so their decl pointers remain valid.
+  Location moduleLoc =
+      FileLineColLoc::get(StringAttr::get(&context, paths.front()),
+                          /*line=*/1, /*column=*/1);
+  OwningOpRef<ModuleOp> module(ModuleOp::create(moduleLoc));
+  CImporter importer(*module);
+  for (auto [index, ast] : llvm::enumerate(asts)) {
+    std::string tuTag = ("tu" + llvm::Twine(index) + "_").str();
+    if (failed(importer.importTranslationUnit(ast->getASTContext(), tuTag,
+                                              /*deferExtern=*/true)))
+      return nullptr;
+  }
+  if (failed(importer.finalizeProject()))
+    return nullptr;
+
   if (failed(verify(*module)))
     return nullptr;
   return module;

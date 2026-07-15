@@ -42,6 +42,7 @@
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/CommandLine.h"
@@ -58,6 +59,8 @@
 #include <optional>
 #include <string>
 #include <system_error>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -66,9 +69,32 @@ enum class EmitKind { Import, MLIR, Rust, Crate };
 
 } // namespace
 
-static llvm::cl::opt<std::string>
-    inputFilename(llvm::cl::Positional, llvm::cl::desc("<input C file>"),
-                  llvm::cl::Required);
+static llvm::cl::list<std::string>
+    inputFilenames(llvm::cl::Positional, llvm::cl::desc("<input C files>"),
+                   llvm::cl::OneOrMore);
+
+static llvm::cl::list<std::string>
+    includeDirs("I", llvm::cl::Prefix,
+                llvm::cl::desc("Add a directory to the include search path"),
+                llvm::cl::value_desc("dir"));
+
+static llvm::cl::list<std::string> systemIncludeDirs(
+    "isystem",
+    llvm::cl::desc("Add a directory to the system include search path"),
+    llvm::cl::value_desc("dir"));
+
+static llvm::cl::list<std::string>
+    extraArgs("extra-arg",
+              llvm::cl::desc("Additional clang argument, passed verbatim "
+                             "(repeatable)"),
+              llvm::cl::value_desc("arg"));
+
+static llvm::cl::opt<std::string> crateNameOpt(
+    "crate-name",
+    llvm::cl::desc("Name of the emitted cargo crate (defaults to the single "
+                   "input's stem, or the -o directory stem for several "
+                   "inputs)"),
+    llvm::cl::value_desc("name"), llvm::cl::init(""));
 
 static llvm::cl::opt<EmitKind> emitKind(
     "emit", llvm::cl::desc("Output kind"),
@@ -257,7 +283,28 @@ static mlir::LogicalResult buildCrate(llvm::StringRef outDir) {
   return mlir::success();
 }
 
-/// Tool entry point: validates the option combination, imports the C input,
+/// Collects the `-I`, `-isystem`, and `--extra-arg` options into one clang
+/// argument list, interleaved by command-line position so the include search
+/// order matches what the user wrote.
+static std::vector<std::string> collectExtraClangArgs() {
+  std::vector<std::pair<unsigned, std::vector<std::string>>> items;
+  for (unsigned i = 0, e = includeDirs.size(); i != e; ++i)
+    items.push_back({includeDirs.getPosition(i), {"-I" + includeDirs[i]}});
+  for (unsigned i = 0, e = systemIncludeDirs.size(); i != e; ++i)
+    items.push_back(
+        {systemIncludeDirs.getPosition(i), {"-isystem", systemIncludeDirs[i]}});
+  for (unsigned i = 0, e = extraArgs.size(); i != e; ++i)
+    items.push_back({extraArgs.getPosition(i), {extraArgs[i]}});
+  llvm::stable_sort(items, [](const auto &a, const auto &b) {
+    return a.first < b.first;
+  });
+  std::vector<std::string> args;
+  for (const auto &item : items)
+    args.insert(args.end(), item.second.begin(), item.second.end());
+  return args;
+}
+
+/// Tool entry point: validates the option combination, imports the C inputs,
 /// runs the lowering pipeline, and produces the selected output. Returns
 /// nonzero on any error; diagnostics have already been printed.
 int main(int argc, char **argv) {
@@ -282,8 +329,11 @@ int main(int argc, char **argv) {
   // context never depends on pass-internal registration details.
   context.loadDialect<mlir::scf::SCFDialect, mlir::ub::UBDialect>();
 
+  std::vector<std::string> inputs(inputFilenames.begin(),
+                                  inputFilenames.end());
+  std::vector<std::string> extra = collectExtraClangArgs();
   mlir::OwningOpRef<mlir::ModuleOp> module =
-      mlir::emitrust::importC(inputFilename, context);
+      mlir::emitrust::importCProject(inputs, extra, context);
   if (!module)
     return 1;
 
@@ -312,8 +362,15 @@ int main(int argc, char **argv) {
              "function (imported as 'c_main')";
       return 1;
     }
-    std::string crateName = emitrustcc::sanitizeCrateName(
-        llvm::sys::path::stem(inputFilename.getValue()));
+    // The crate name comes from --crate-name when given; otherwise, for a
+    // single input its stem (historical behavior), and for several inputs the
+    // -o crate-directory stem (the input stems are ambiguous).
+    llvm::StringRef crateStem = !crateNameOpt.empty()
+                                    ? llvm::StringRef(crateNameOpt)
+                                : inputs.size() == 1
+                                    ? llvm::sys::path::stem(inputs.front())
+                                    : llvm::sys::path::stem(outputPath);
+    std::string crateName = emitrustcc::sanitizeCrateName(crateStem);
     if (mlir::failed(emitCrate(*module, outputPath, crateName)))
       return 1;
     if (buildFlag && mlir::failed(buildCrate(outputPath)))

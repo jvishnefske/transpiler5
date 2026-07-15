@@ -42,7 +42,7 @@ syntax-directed translation with no cleverness.
 | emitrust-opt | tools/emitrust-opt | Standard opt tool with the dialect and conversion passes registered |
 | emitrust-translate | tools/emitrust-translate | mlir-translate-style tool exposing --mlir-to-rust |
 | emitrust-import-c | tools/emitrust-import-c | CLI shell over the importer library, printing the imported module |
-| emitrust-cc | tools/emitrust-cc | End-to-end driver: import, pass pipeline, Rust emission, cargo crate layout, optional cargo build |
+| emitrust-cc | tools/emitrust-cc | End-to-end driver: import (one or more C files, with -I/-isystem/--extra-arg), pass pipeline, Rust emission, cargo crate layout, optional cargo build |
 | Regression tests | test | lit + FileCheck suites for round-trip, diagnostics, emission, conversion, import, driver, and differential execution |
 
 ### Pipeline
@@ -237,9 +237,10 @@ lists the lit test file(s) that validate it.
   output; any mismatch is a fatal MISCOMPILE unless explicitly quarantined
   in known-miscompiles.txt, and the expected-pass.txt manifest ratchets in
   both directions (regressions and unrecorded passes both fail). Current
-  ledger: 220 total, 58 transpiled, 58 passed, 0 miscompiled,
-  162 unsupported (the remaining tests need globals, unions, pointer
-  locals, aggregate initializers, or system headers). (test/CTestSuite/)
+  ledger: 220 total, 75 transpiled, 75 passed, 0 miscompiled,
+  145 unsupported (the remaining tests need unions, pointer locals,
+  aggregate initializers, string literals, or system-header contents
+  outside the C subset). (test/CTestSuite/)
 - [x] FR-25 Generality beyond test vectors: an adversarial audit plus
   differential stress run over shapes absent from the original tests
   (negative/sparse/INT_MAX-adjacent case labels, nested switch, default
@@ -259,6 +260,26 @@ lists the lit test file(s) that validate it.
   test/Import/C/keywords-invalid.c, printf-invalid.c, printf.c,
   test/Conversion/ArithToEmitRust/arith-to-emitrust.mlir,
   unsigned-invalid.mlir, test/Target/Rust/match.mlir)
+- [x] FR-26 Multiple translation units: emitrust-cc accepts several C files
+  and merges them into one flat crate. External functions and globals are
+  unified across translation units (a prototype in one file resolves to a
+  definition in another; a second external definition of the same symbol,
+  including two mains, is a located diagnostic); file-`static` (internal
+  linkage) functions and globals are mangled per translation unit so equal
+  spellings in different files stay distinct; an extern object or function
+  referenced but defined in no unit is rejected with a located diagnostic
+  (variadic prototypes such as printf remain skipped); a struct or enum
+  redefined identically via a shared header is deduplicated, while the same
+  name with a different shape is a diagnostic. The merged crate is
+  differentially identical to the clang-linked native binary and contains no
+  unsafe. (test/Import/C/multi-tu.c, multi-tu-undefined-extern.c,
+  test/EndToEnd/multi-tu.c)
+- [x] FR-27 Include paths: emitrust-cc and emitrust-import-c accept -I,
+  -isystem, and --extra-arg and pass them to clang, and clang's builtin
+  resource directory is wired in at configure time (with an
+  EMITRUST_RESOURCE_DIR environment override), so sources that #include a
+  project-local header resolve. (test/Import/C/include-path.c with
+  Inputs/helper.h)
 
 ## C99 Support Roadmap
 
@@ -469,14 +490,22 @@ rule.
 - [ ] C99-37 Variadic function definitions and va_list (design decision
   needed; Rust has no stable varargs — likely a permanent documented
   rejection, with printf-style call sites special-cased as today).
-- [ ] C99-38 Multiple translation units: imports of several .c files
-  linked into one crate, extern object and function resolution, and
-  internal (static) linkage mapped to non-pub items.
-- [ ] C99-39 Preprocessor-heavy sources: #include of project and system
-  headers (requires wiring clang's builtin resource and system include
-  directories into the tool), macros, conditional compilation, and
-  variadic macros — all free from clang once include paths resolve, but
-  currently untested beyond header-free inputs.
+- [x] C99-38 Multiple translation units: several .c files are imported and
+  merged into one flat crate with extern object and function resolution
+  across units, and internal (static) linkage kept distinct by per-unit
+  symbol mangling (a single flat module needs no pub/non-pub visibility).
+  Undefined externs and conflicting external definitions are rejected with
+  located diagnostics. (test/EndToEnd/multi-tu.c, test/Import/C/multi-tu.c,
+  multi-tu-undefined-extern.c) See FR-26.
+- [x] C99-39 Preprocessor-heavy sources: #include of project and system
+  headers resolves — clang's builtin resource directory is wired in at
+  configure time and -I/-isystem/--extra-arg are passed through, so macros,
+  conditional compilation, and variadic macros are handled by clang once
+  include paths resolve. Project-local headers are regression-tested;
+  system headers whose contents fall outside the importer's C subset (e.g.
+  glibc's anonymous structs pulled in by <stdint.h>) are still rejected by
+  the importer, not the preprocessor. (test/Import/C/include-path.c) See
+  FR-27.
 
 ### Aggregates and memory
 
@@ -527,7 +556,7 @@ matching beyond literal match arms, data-carrying enums (C-like unit-variant
 enums are supported), error-handling sugar, and expression trees (every
 value is a named let binding; no inlining of subexpressions). On the C side
 the importer rejects, with located diagnostics: goto, unions, bitfields,
-int-to-enum conversions, globals, pointer arithmetic and pointer locals,
+int-to-enum conversions, pointer arithmetic and pointer locals,
 multi-dimensional arrays, aggregate initializers, sizeof/_Alignof of
 variable-length-array/incomplete/function operands, conditional operators
 with non-scalar results, unary minus on unsigned operands (pending a
