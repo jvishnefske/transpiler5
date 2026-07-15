@@ -549,6 +549,44 @@ regression test, exactly like the current subset boundary (FR-19). The
 Non-Goals section below describes what the MVP rejects today; items listed
 there move out of it as their roadmap boxes are ticked.
 
+## C99 Feature Coverage (in progress)
+
+Same checkbox discipline as the MVP requirements: tick only when the
+referenced regression tests pass under ninja check-emitrust.
+
+- [x] C99-14 File-scope objects: global variables with constant
+  initializers, tentative definitions, extern declarations across
+  translation units (single-TU first), and static file-scope objects
+  (Rust mapping: static items; mutable globals are a design decision —
+  no unsafe rules out static mut, pointing at interior-mutability
+  wrappers or parameter threading).
+  Implemented single-TU via module-level `emitrust.global` with
+  `emitrust.global_load`/`emitrust.global_store` access ops. Never-written
+  const-qualified globals emit plain `static NAME: T = INIT;` read
+  directly; every other global emits a `thread_local!`
+  `std::cell::Cell<T>` (all imported types are Copy) accessed with
+  `.with(|c| c.get()/c.set(v))` — no `unsafe`, no `static mut`, exact for
+  the single-threaded subset. No initializer means the type's default
+  (C zero-initialization); scalar initializers are clang
+  constant-evaluated; element/field access to global aggregates is
+  load-modify-store of the whole value. Rejected with located
+  diagnostics: taking a global's address, Rust-keyword names, pointer
+  types, aggregate initializer lists (deferred to C99-11),
+  `_Thread_local`, extern-only declarations, and block-scope extern.
+  (test/Dialect/EmitRust/ops.mlir, invalid.mlir,
+  test/Target/Rust/globals.mlir, test/Import/C/globals.c,
+  globals-invalid.c, globals-keyword.c, globals-extern-only.c,
+  globals-aggregate-init.c, globals-thread-local.c, globals-pointer.c,
+  globals-extern-local.c, test/EndToEnd/globals.c)
+- [x] C99-15 Static local variables preserving state across calls
+  (design decision needed for a no-unsafe mapping).
+  Implemented with the same `emitrust.global` machinery: a function-local
+  static becomes a module-level global mangled `<function>_<name>`
+  (collision with any existing module symbol is rejected), constant
+  initializer required (C11 6.7.9p4, clang-enforced), initialized once at
+  program start. (test/Import/C/globals.c,
+  globals-static-collision.c, test/EndToEnd/globals.c)
+
 ## Non-Goals for the MVP
 
 Generics, lifetimes beyond simple references, traits and impls, pattern
