@@ -656,6 +656,17 @@ private:
   /// moving the insertion point.
   Block *createBlock();
 
+  /// Returns the block that `label` starts, creating it on first mention
+  /// (either the `goto` or the label itself may be seen first).
+  Block *getLabelBlock(const clang::LabelDecl *label);
+
+  /// Creates an `emitrust.variable` place of `type`. In a function that
+  /// contains labels the op is hoisted to the start of the entry block so
+  /// that a `goto` jumping over the declaration cannot leave a later use
+  /// undominated by the definition; otherwise it is created at the current
+  /// insertion point.
+  Value createVariablePlace(Location loc, Type type);
+
   /// Returns true if `block` already ends with a terminator operation.
   static bool isTerminated(Block *block);
 
@@ -684,7 +695,9 @@ private:
 
   /// Emits one statement at the current insertion point; dispatches over
   /// the supported statement kinds and rejects the rest with a located
-  /// diagnostic.
+  /// diagnostic. C labels start their mapped block (see `getLabelBlock`)
+  /// and `goto` emits a `cf.br` to it followed by a fresh block for any
+  /// trailing code; computed goto is rejected.
   LogicalResult emitStmt(const clang::Stmt *stmt);
 
   /// Emits a local variable declaration. Signed scalars become entry-block
@@ -1052,6 +1065,14 @@ private:
   llvm::DenseMap<const clang::VarDecl *, GlobalInfo> globals;
   /// Stack of break/continue targets for nested loops and switches.
   SmallVector<LoopTargets> loopStack;
+  /// Blocks started by C labels in the function under construction, keyed
+  /// by label declaration; created lazily on first mention so forward and
+  /// backward `goto`s share one map.
+  llvm::DenseMap<const clang::LabelDecl *, Block *> labelBlocks;
+  /// True when the function under construction contains any C label;
+  /// `emitrust.variable` places are then hoisted to the entry block (see
+  /// `createVariablePlace`).
+  bool currentHasLabels = false;
   /// Entry block of the function under construction (owns the allocas).
   Block *entryBlock = nullptr;
   /// Body region of the function under construction.
@@ -1077,6 +1098,22 @@ private:
 //===----------------------------------------------------------------------===//
 // AST helpers
 //===----------------------------------------------------------------------===//
+
+/// Returns true if the statement tree rooted at `stmt` contains any C label
+/// (`LabelStmt`). Iterative worklist traversal over the AST.
+static bool containsLabelStmt(const clang::Stmt *stmt) {
+  SmallVector<const clang::Stmt *> worklist{stmt};
+  while (!worklist.empty()) {
+    const clang::Stmt *current = worklist.pop_back_val();
+    if (!current)
+      continue;
+    if (llvm::isa<clang::LabelStmt>(current))
+      return true;
+    for (const clang::Stmt *child : current->children())
+      worklist.push_back(child);
+  }
+  return false;
+}
 
 /// Strips parentheses and `ConstantExpr` wrappers (clang wraps constant
 /// contexts such as case values in `ConstantExpr`) without touching casts.
@@ -2617,6 +2654,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   pointerLocals.clear();
   ownerStructPlaces.clear();
   loopStack.clear();
+  labelBlocks.clear();
+  currentHasLabels = containsLabelStmt(func->getBody());
   currentReceiverPlace = Value();
   currentMethodOwner = nullptr;
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
@@ -2817,6 +2856,22 @@ Block *CImporter::createBlock() {
   return builder.createBlock(bodyRegion, bodyRegion->end());
 }
 
+Block *CImporter::getLabelBlock(const clang::LabelDecl *label) {
+  Block *&block = labelBlocks[label];
+  if (!block)
+    block = createBlock();
+  return block;
+}
+
+Value CImporter::createVariablePlace(Location loc, Type type) {
+  OpBuilder::InsertionGuard guard(builder);
+  if (currentHasLabels)
+    builder.setInsertionPointToStart(entryBlock);
+  return builder
+      .create<emitrust::VariableOp>(loc, emitrust::LValueType::get(type))
+      .getResult();
+}
+
 bool CImporter::isTerminated(Block *block) {
   return !block->empty() && block->back().hasTrait<OpTrait::IsTerminator>();
 }
@@ -2959,9 +3014,21 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
   }
   if (const auto *doStmt = llvm::dyn_cast<clang::DoStmt>(stmt))
     return emitDoStmt(doStmt);
-  if (llvm::isa<clang::GotoStmt>(stmt) || llvm::isa<clang::LabelStmt>(stmt) ||
-      llvm::isa<clang::IndirectGotoStmt>(stmt))
-    return emitError(loc) << "unsupported: goto statement";
+  if (llvm::isa<clang::IndirectGotoStmt>(stmt))
+    return emitError(loc) << "unsupported: computed goto";
+  if (const auto *gotoStmt = llvm::dyn_cast<clang::GotoStmt>(stmt)) {
+    builder.create<cf::BranchOp>(loc, getLabelBlock(gotoStmt->getLabel()));
+    // Continue in a fresh block; if it stays unreachable it is erased later.
+    builder.setInsertionPointToEnd(createBlock());
+    return success();
+  }
+  if (const auto *labelStmt = llvm::dyn_cast<clang::LabelStmt>(stmt)) {
+    Block *block = getLabelBlock(labelStmt->getDecl());
+    if (!isTerminated(builder.getInsertionBlock()))
+      builder.create<cf::BranchOp>(loc, block); // Fall into the label.
+    builder.setInsertionPointToEnd(block);
+    return emitStmt(labelStmt->getSubStmt());
+  }
   if (const auto *expr = llvm::dyn_cast<clang::Expr>(stmt))
     return emitExprStmt(expr);
   return emitError(loc) << "unsupported statement: "
@@ -3005,10 +3072,7 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
       llvm::isa<emitrust::EnumType, emitrust::FnPtrType>(*mlirType);
   if (isAggregate || isPlaceOnly || isUnsignedInt(*mlirType) ||
       addressTaken.contains(var)) {
-    Value place = builder
-                      .create<emitrust::VariableOp>(
-                          loc, emitrust::LValueType::get(*mlirType))
-                      .getResult();
+    Value place = createVariablePlace(loc, *mlirType);
     symbols[var] = place;
     if (const clang::Expr *init = var->getInit()) {
       if (isAggregate)
@@ -3057,11 +3121,7 @@ LogicalResult CImporter::emitOwnerLocal(const clang::VarDecl *var,
 
   auto ownerStructType =
       emitrust::StructType::get(builder.getContext(), plan.structName);
-  Value ownerPlace =
-      builder
-          .create<emitrust::VariableOp>(
-              loc, emitrust::LValueType::get(ownerStructType))
-          .getResult();
+  Value ownerPlace = createVariablePlace(loc, ownerStructType);
   ownerStructPlaces[var] = ownerPlace;
   // Every direct access to the array — and every decomposed pointer whose
   // region base it is — routes through the data member place registered
