@@ -1,6 +1,7 @@
 // REQUIRES: cargo
 // Differential regression test for unsigned integer support: unsigned
-// arithmetic with wrap-around, unsigned division/remainder/comparisons
+// arithmetic with wrap-around (unary negation included, at 0/1/UINT_MAX
+// and the INT_MIN bit pattern), unsigned division/remainder/comparisons
 // (which differ from their signed counterparts on high-bit values),
 // unsigned bitwise and logical-vs-arithmetic right shifts, conversions
 // between sign domains and widths, float conversions, unsigned literals,
@@ -123,7 +124,40 @@ int uupdates(unsigned int u) {
   return (int)(u % 1000000) + (int)(pre % 1000) + (int)(post % 1000);
 }
 
+long uneg(unsigned int a) {
+  // C's unary '-' on unsigned wraps modulo 2^32; the Rust side lowers to
+  // wrapping_sub and must agree for 0, 1, UINT_MAX, and the INT_MIN
+  // bit pattern.
+  unsigned int r = -a;
+  return (long)r;
+}
+
+long uneg64(unsigned long a) {
+  unsigned long r = -a;
+  return (long)r;
+}
+
+long uneg_expr(unsigned int a, unsigned int b) {
+  // Negation inside larger expressions, assignments, and comparisons.
+  unsigned int c = -a + b * 2u;
+  unsigned int d = a - -b;
+  int e = -a < b;
+  int f = -a == 4294967295u;
+  unsigned int g;
+  g = -c;
+  g = -g;
+  return (long)(c % 1000000u) + (long)(d % 1000u) + e * 10 + f * 20 +
+         (long)(g % 100u);
+}
+
 int main(void) {
+  printf("uneg=%ld %ld %ld %ld\n", uneg(0u), uneg(1u), uneg(4294967295u),
+         uneg(2147483648u));
+  printf("uneg64=%ld %ld %ld %ld\n", uneg64(0ul), uneg64(1ul),
+         uneg64(18446744073709551615ul), uneg64(9223372036854775808ul));
+  printf("uneg_expr=%ld %ld\n", uneg_expr(1u, 4294967295u),
+         uneg_expr(4294967295u, 0u));
+  printf("uneg_lit=%ld\n", (long)(-1u));
   printf("wrap_add=%ld\n", wrap_add(4294967295u, 2u));
   printf("wrap_mul=%ld\n", wrap_mul(3000000000u, 3u));
   printf("wrap_sub=%ld\n", wrap_sub(1u, 3u));

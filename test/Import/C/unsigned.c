@@ -159,3 +159,65 @@ unsigned int literals(void) {
 // CHECK: emitrust.constant <42 : ui32> : ui32
 // CHECK: emitrust.constant <255 : ui32> : ui32
 // CHECK: emitrust.constant <4294967296 : ui64> : ui64
+
+unsigned int negate(unsigned int u) {
+  // C negates an unsigned value modulo 2^N; unary '-' lowers to
+  // `0 - x` through emitrust.sub, whose unsigned form renders as Rust's
+  // wrapping_sub (the infix `-` would panic on debug overflow).
+  return -u;
+}
+
+// CHECK-LABEL: func.func @negate
+// CHECK: emitrust.constant <0 : ui32> : ui32
+// CHECK: emitrust.sub %{{.*}}, %{{.*}} : ui32
+// CHECK-NOT: arith.subi
+// SCF-LABEL: func.func @negate
+
+unsigned long negate_long(unsigned long u) {
+  return -u;
+}
+
+// CHECK-LABEL: func.func @negate_long
+// CHECK: emitrust.constant <0 : ui64> : ui64
+// CHECK: emitrust.sub %{{.*}}, %{{.*}} : ui64
+// SCF-LABEL: func.func @negate_long
+
+unsigned int negate_expr(unsigned int a, unsigned int b) {
+  // Negation composes with the other unsigned arithmetic ops.
+  return -a + b * -2u;
+}
+
+// CHECK-LABEL: func.func @negate_expr
+// CHECK: emitrust.constant <0 : ui32> : ui32
+// CHECK: emitrust.sub %{{.*}}, %{{.*}} : ui32
+// CHECK: emitrust.constant <2 : ui32> : ui32
+// CHECK: emitrust.constant <0 : ui32> : ui32
+// CHECK: emitrust.sub %{{.*}}, %{{.*}} : ui32
+// CHECK: emitrust.mul %{{.*}}, %{{.*}} : ui32
+// CHECK: emitrust.add %{{.*}}, %{{.*}} : ui32
+
+int negate_compare(unsigned int a, unsigned int b) {
+  // A negated unsigned operand keeps the unsigned comparison lowering.
+  return -a < b;
+}
+
+// CHECK-LABEL: func.func @negate_compare
+// CHECK: emitrust.constant <0 : ui32> : ui32
+// CHECK: emitrust.sub %{{.*}}, %{{.*}} : ui32
+// CHECK: emitrust.cmp lt, %{{.*}}, %{{.*}} : (ui32, ui32) -> i1
+
+unsigned int negate_assign(unsigned int a) {
+  // Negation in assignment position stores through the lvalue cell.
+  unsigned int r;
+  r = -a;
+  r = -r;
+  return r;
+}
+
+// CHECK-LABEL: func.func @negate_assign
+// CHECK: emitrust.constant <0 : ui32> : ui32
+// CHECK: emitrust.sub %{{.*}}, %{{.*}} : ui32
+// CHECK: emitrust.assign
+// CHECK: emitrust.constant <0 : ui32> : ui32
+// CHECK: emitrust.sub %{{.*}}, %{{.*}} : ui32
+// CHECK: emitrust.assign
