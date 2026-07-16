@@ -456,10 +456,42 @@ rule.
 
 - [x] C99-10 Block-scoped declarations anywhere in a block and
   declarations in the for-init clause. (test/Import/C/scalars.c)
-- [ ] C99-11 Aggregate initializer lists for arrays and structs,
+- [x] C99-11 Aggregate initializer lists for arrays and structs,
   including nested and partially explicit initializers with implicit
   zeroing.
-- [ ] C99-12 Designated initializers for array indices and struct fields.
+  Implemented at both scopes. Block scope: the variable keeps its
+  default-initialized `emitrust.variable` place (C99 zero-fill), then one
+  `emitrust.assign` per explicitly initialized element through a
+  constant-index `emitrust.subscript` (arrays) or `emitrust.member`
+  (struct fields), recursing for nested lists — this uniformly covers
+  partial initialization, designators, and non-constant elements, and
+  also applies to owner-promoted arrays. File scope: clang's constant
+  evaluator produces the complete APValue (designators resolved, holes
+  zero-filled from the array filler), converted to a typed ArrayAttr
+  element list on `emitrust.global` (nested ArrayAttr for aggregate
+  elements); the GlobalOp verifier checks element count against the array
+  size / struct_def field count and per-element types. Const arrays stay
+  plain `static NAME: [T; N] = [e0, ...];`; mutable aggregate globals
+  keep the `thread_local!` Cell path with `[e0, ...]` / `Name { f: e, ...
+  }` literals. Accepted trade-off: a partially initialized large global
+  renders its full element list (the 32-element `Default` derive cap only
+  constrains struct fields of array type, which use literal lists here
+  anyway). Rejected with located diagnostics: non-list aggregate
+  initializers (string literals, whole-struct copies, compound literals
+  — C99-13 stays open) and enum-typed global elements; multi-dimensional
+  arrays are rejected by the type mapper before initializer handling.
+  (test/Import/C/aggregate-init.c, aggregate-init-invalid.c,
+  test/Dialect/EmitRust/ops.mlir, invalid.mlir,
+  test/Target/Rust/globals.mlir, test/EndToEnd/aggregate-init.c,
+  c-testsuite 00048/00090/00092/00093/00115/00117/00146/00147/00148)
+- [x] C99-12 Designated initializers for array indices and struct fields.
+  Implemented with C99-11: the importer works on clang's semantic
+  initializer-list form, where `[i] =` and `.field =` designators are
+  already resolved to positional elements with implicit-value holes, so
+  designated, partial, and overwriting-positional cases all reduce to the
+  same per-element handling at block scope and the same APValue
+  conversion at file scope. (test/Import/C/aggregate-init.c,
+  test/EndToEnd/aggregate-init.c)
 - [ ] C99-13 Compound literals in expression position.
 - [x] C99-14 File-scope objects: global variables with constant
   initializers, tentative definitions, extern declarations across
@@ -475,15 +507,16 @@ rule.
   `.with(|c| c.get()/c.set(v))` — no `unsafe`, no `static mut`, exact for
   the single-threaded subset. No initializer means the type's default
   (C zero-initialization); scalar initializers are clang
-  constant-evaluated; element/field access to global aggregates is
+  constant-evaluated; aggregate initializer lists are typed ArrayAttr
+  element lists (C99-11); element/field access to global aggregates is
   load-modify-store of the whole value. Rejected with located
   diagnostics: taking a global's address, Rust-keyword names, pointer
-  types, aggregate initializer lists (deferred to C99-11),
-  `_Thread_local`, extern-only declarations, and block-scope extern.
+  types, `_Thread_local`, extern-only declarations, and block-scope
+  extern.
   (test/Dialect/EmitRust/ops.mlir, invalid.mlir,
   test/Target/Rust/globals.mlir, test/Import/C/globals.c,
   globals-invalid.c, globals-keyword.c, globals-extern-only.c,
-  globals-aggregate-init.c, globals-thread-local.c, globals-pointer.c,
+  aggregate-init.c, globals-thread-local.c, globals-pointer.c,
   globals-extern-local.c, test/EndToEnd/globals.c)
 - [x] C99-15 Static local variables preserving state across calls
   (design decision needed for a no-unsafe mapping).
@@ -690,6 +723,22 @@ there move out of it as their roadmap boxes are ticked.
 Same checkbox discipline as the MVP requirements: tick only when the
 referenced regression tests pass under ninja check-emitrust.
 
+- [x] C99-11 Aggregate initializer lists for arrays and structs,
+  including nested and partially explicit initializers with implicit
+  zeroing. Block scope: default-initialized place plus one
+  `emitrust.assign` per explicit element (constant-index
+  `emitrust.subscript` / `emitrust.member`), recursing for nested lists;
+  file scope: clang-constant-evaluated APValue converted to a typed
+  ArrayAttr element list on `emitrust.global`, verifier-checked against
+  the array size / struct_def field count. See the full entry in
+  "Declarations and initializers" above.
+  (test/Import/C/aggregate-init.c, aggregate-init-invalid.c,
+  test/Dialect/EmitRust/ops.mlir, invalid.mlir,
+  test/Target/Rust/globals.mlir, test/EndToEnd/aggregate-init.c)
+- [x] C99-12 Designated initializers for array indices and struct fields.
+  Implemented with C99-11 via clang's semantic initializer-list form
+  (designators pre-resolved to positional elements with implicit-value
+  holes). (test/Import/C/aggregate-init.c, test/EndToEnd/aggregate-init.c)
 - [x] C99-14 File-scope objects: global variables with constant
   initializers, tentative definitions, extern declarations across
   translation units (single-TU first), and static file-scope objects
@@ -704,15 +753,16 @@ referenced regression tests pass under ninja check-emitrust.
   `.with(|c| c.get()/c.set(v))` — no `unsafe`, no `static mut`, exact for
   the single-threaded subset. No initializer means the type's default
   (C zero-initialization); scalar initializers are clang
-  constant-evaluated; element/field access to global aggregates is
+  constant-evaluated; aggregate initializer lists are typed ArrayAttr
+  element lists (C99-11); element/field access to global aggregates is
   load-modify-store of the whole value. Rejected with located
   diagnostics: taking a global's address, Rust-keyword names, pointer
-  types, aggregate initializer lists (deferred to C99-11),
-  `_Thread_local`, extern-only declarations, and block-scope extern.
+  types, `_Thread_local`, extern-only declarations, and block-scope
+  extern.
   (test/Dialect/EmitRust/ops.mlir, invalid.mlir,
   test/Target/Rust/globals.mlir, test/Import/C/globals.c,
   globals-invalid.c, globals-keyword.c, globals-extern-only.c,
-  globals-aggregate-init.c, globals-thread-local.c, globals-pointer.c,
+  aggregate-init.c, globals-thread-local.c, globals-pointer.c,
   globals-extern-local.c, test/EndToEnd/globals.c)
 - [x] C99-15 Static local variables preserving state across calls
   (design decision needed for a no-unsafe mapping).
