@@ -3,11 +3,10 @@
 // RUN: not emitrust-cc --emit=rust %s -o - 2>&1 | FileCheck %s
 
 int f(void) {
-  int x = 0;
-  goto end;
+  goto *&&end; /* computed goto (GNU extension) is outside the subset */
 end:
-  return x;
+  return 0;
 }
 
-// The diagnostic carries the file:line:col location of the goto.
-// CHECK: reject.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: goto statement
+// The diagnostic carries the file:line:col location of the rejected goto.
+// CHECK: reject.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: computed goto
