@@ -401,11 +401,14 @@ rule.
   truth-test, ++/--, and compound-assignment forms lower to the emitrust
   ops; switch on an unsigned scrutinee reinterprets it to signless i64
   bit-exactly (case labels above i64::MAX included). Unary minus on an
-  unsigned operand is rejected with a located diagnostic until a wrapping
-  negation lowering exists.
+  unsigned operand is C's modular negation (C99 6.2.5p9) and lowers to
+  `0 - x` through the unsigned emitrust.sub, which renders as Rust's
+  wrapping_sub on every width (u8/u16/u32/u64) — matching C at 0, 1,
+  UINT_MAX, and the INT_MIN bit pattern instead of panicking on debug
+  overflow.
   (test/Target/Rust/arith.mlir, test/Dialect/EmitRust/ops.mlir,
   test/Conversion/ArithToEmitRust/unsigned-invalid.mlir,
-  test/Import/C/unsigned.c, unsigned-invalid.c, switch-unsigned.c,
+  test/Import/C/unsigned.c, switch-unsigned.c,
   switch-unsigned64.c, test/EndToEnd/unsigned.c)
 - [x] C99-3 Integer promotions and the usual arithmetic conversions for
   mixed signed/unsigned and mixed-rank expressions: clang Sema supplies the
@@ -414,6 +417,11 @@ rule.
   semantics (truncation, zero-extension from unsigned, sign-extension from
   signed, same-width reinterpretation) match C's conversions exactly;
   signless-to-signless casts keep the existing arith ext/trunc fast path.
+  Unary '-' interacts correctly with the promotions: on an operand that
+  stays unsigned after promotion it lowers to the wrapping `0 - x` (see
+  C99-2), while an unsigned char/short operand is promoted to signed int
+  first (per C) and takes the signed negation path, converting back on
+  any narrowing store.
   (test/Import/C/unsigned.c, test/EndToEnd/unsigned.c)
 - [ ] C99-4 Plain char signedness policy, character constants, and
   escape sequences.
@@ -487,8 +495,13 @@ rule.
 
 - [x] C99-19 Arithmetic, comparison, logical and/or/not with
   short-circuit evaluation, assignment, compound assignment, and
-  statement-position increment/decrement on signed scalars.
-  (test/Import/C/scalars.c, test/EndToEnd/loops.c)
+  statement-position increment/decrement on signed scalars. Unary '-'
+  covers unsigned operands too: it lowers to `0 - x` via the unsigned
+  emitrust.sub (Rust wrapping_sub), so negation in expressions,
+  assignments, and comparisons matches C's modular semantics on all
+  supported widths.
+  (test/Import/C/scalars.c, test/Import/C/unsigned.c,
+  test/EndToEnd/loops.c, test/EndToEnd/unsigned.c)
 - [x] C99-20 Bitwise and, or, xor, complement, and shift operators.
   Dialect/emission layer: emitrust.and/or/xor/shl/shr render the Rust
   `&`/`|`/`^`/`<<`/`>>` operators (complement imports as xor with all-ones),
@@ -702,8 +715,7 @@ and pointer globals, NULL data pointers, void* casts, malloc and friends
 supported through the FR-28 decomposition),
 multi-dimensional arrays, aggregate initializers, sizeof/_Alignof of
 variable-length-array/incomplete/function operands, conditional operators
-with non-scalar results, unary minus on unsigned operands (pending a
-wrapping negation lowering), variadic definitions, and string literals
+with non-scalar results, variadic definitions, and string literals
 outside printf. These are natural follow-ons; the emitter's
 statement-per-op model is chosen precisely so expression inlining can be
 layered in later, as EmitC did.

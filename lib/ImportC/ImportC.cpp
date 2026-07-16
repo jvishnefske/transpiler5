@@ -4268,11 +4268,16 @@ FailureOr<Value> CImporter::emitUnaryRValue(const clang::UnaryOperator *op) {
       return failure();
     if (llvm::isa<FloatType>((*value).getType()))
       return builder.create<arith::NegFOp>(loc, *value).getResult();
-    // C negates an unsigned value modulo 2^N, but the Rust `0 - x` this
-    // would lower to panics on overflow in debug builds; rejected until a
-    // wrapping negation lowering exists.
-    if (isUnsignedInt((*value).getType()))
-      return emitError(loc) << "unsupported: unary '-' on an unsigned operand";
+    // C negates an unsigned value modulo 2^N (C99 6.2.5p9); lower it as
+    // `0 - x` through the unsigned emitrust.sub, which translates to Rust's
+    // `wrapping_sub` and so matches C's modular semantics on every width
+    // instead of panicking on overflow in debug builds.
+    if (isUnsignedInt((*value).getType())) {
+      Value zero = createScalarIntConstant(loc, (*value).getType(), 0);
+      return builder
+          .create<emitrust::SubOp>(loc, (*value).getType(), zero, *value)
+          .getResult();
+    }
     if (llvm::isa<IntegerType>((*value).getType())) {
       Value zero = createIntConstant(loc, (*value).getType(), 0);
       return builder.create<arith::SubIOp>(loc, zero, *value).getResult();
