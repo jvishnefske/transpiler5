@@ -93,3 +93,71 @@ emitrust.func @enum_lvalue() {
   %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>
   emitrust.return
 }
+
+// CHECK-LABEL: emitrust.func @slice_param(
+// CHECK-SAME: !emitrust.mut_ref<!emitrust.slice<i32>>
+emitrust.func @slice_param(%arg0: !emitrust.mut_ref<!emitrust.slice<i32>>) {
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @slice_of_struct_param(
+// CHECK-SAME: !emitrust.ref<!emitrust.slice<!emitrust.struct<"Point">>>
+emitrust.func @slice_of_struct_param(%arg0: !emitrust.ref<!emitrust.slice<!emitrust.struct<"Point">>>) {
+  emitrust.return
+}
+
+// A slice may be the value type of an lvalue (behind a deref).
+// CHECK-LABEL: emitrust.func @slice_lvalue(
+emitrust.func @slice_lvalue(%arg0: !emitrust.mut_ref<!emitrust.slice<f64>>) {
+  // CHECK: emitrust.deref %{{.*}} : (!emitrust.mut_ref<!emitrust.slice<f64>>) -> !emitrust.lvalue<!emitrust.slice<f64>>
+  %0 = emitrust.deref %arg0 : (!emitrust.mut_ref<!emitrust.slice<f64>>) -> !emitrust.lvalue<!emitrust.slice<f64>>
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @fn_ptr_full(
+// CHECK-SAME: !emitrust.fn_ptr<(i32, i32) -> i32>
+emitrust.func @fn_ptr_full(%arg0: !emitrust.fn_ptr<(i32, i32) -> i32>) {
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @fn_ptr_zero_arg(
+// CHECK-SAME: !emitrust.fn_ptr<() -> i32>
+emitrust.func @fn_ptr_zero_arg(%arg0: !emitrust.fn_ptr<() -> i32>) {
+  emitrust.return
+}
+
+// The void-result spelling omits the `->` clause entirely.
+// CHECK-LABEL: emitrust.func @fn_ptr_void_result(
+// CHECK-SAME: !emitrust.fn_ptr<(i32)>
+emitrust.func @fn_ptr_void_result(%arg0: !emitrust.fn_ptr<(i32)>) {
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @fn_ptr_zero_arg_void(
+// CHECK-SAME: !emitrust.fn_ptr<()>
+emitrust.func @fn_ptr_zero_arg_void(%arg0: !emitrust.fn_ptr<()>) {
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @fn_ptr_mixed_components(
+// CHECK-SAME: !emitrust.fn_ptr<(i1, ui64, index, f64, !emitrust.struct<"Point">, !emitrust.enum<"Color">) -> ui32>
+emitrust.func @fn_ptr_mixed_components(
+    %arg0: !emitrust.fn_ptr<(i1, ui64, index, f64, !emitrust.struct<"Point">,
+                             !emitrust.enum<"Color">) -> ui32>) {
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @fn_ptr_nested(
+// CHECK-SAME: !emitrust.fn_ptr<(!emitrust.fn_ptr<(i32) -> i32>) -> !emitrust.fn_ptr<() -> i32>>
+emitrust.func @fn_ptr_nested(
+    %arg0: !emitrust.fn_ptr<(!emitrust.fn_ptr<(i32) -> i32>)
+                            -> !emitrust.fn_ptr<() -> i32>>) {
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @fn_ptr_lvalue
+emitrust.func @fn_ptr_lvalue() {
+  // CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
+  emitrust.return
+}

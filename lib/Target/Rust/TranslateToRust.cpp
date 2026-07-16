@@ -114,7 +114,8 @@ private:
 
   /// Emits the default value of `type`: `0` for integers and index, `0.0`
   /// for floats, `false` for `i1`, `Name::default()` for structs and
-  /// enums, and `[<element-default>; N]` for arrays.
+  /// enums, `None` for function pointers, and `[<element-default>; N]` for
+  /// arrays.
   LogicalResult emitDefaultValue(Location loc, Type type);
 
   /// Emits `value` as a quoted Rust string literal, escaping backslashes,
@@ -132,9 +133,17 @@ private:
   // Per-operation emitters
   //===--------------------------------------------------------------------===//
 
-  /// Emits the children of a module in order; only use, verbatim, and func
-  /// operations are allowed at module level.
+  /// Emits the children of a module in order; only use, verbatim, func,
+  /// impl, struct/enum definition, and global operations are allowed at
+  /// module level.
   LogicalResult emitModule(ModuleOp moduleOp);
+  /// Emits `impl <name> { ... }` with the contained functions rendered as
+  /// `&mut self` methods one indentation level deeper.
+  LogicalResult emitImpl(emitrust::ImplOp implOp);
+  /// Emits `<place>.<method>(args);`, bound with a `let` when the call
+  /// produces a result. Rust's auto-ref scopes the `&mut` borrow of the
+  /// receiver place to the call expression.
+  LogicalResult emitMethodCall(emitrust::MethodCallOp callOp);
   /// Emits `use <path>;`.
   LogicalResult emitUse(emitrust::UseOp useOp);
   /// Emits the verbatim string on its own line(s).
@@ -149,6 +158,10 @@ private:
   /// integer attributes reference operands, string attributes render as
   /// escaped Rust string literals, and other attributes render as constants.
   LogicalResult emitCallOpaque(emitrust::CallOpaqueOp callOp);
+  /// Emits an indirect call through a function pointer as
+  /// `vF.expect("null function pointer")(vA, vB)`, bound with a `let` when
+  /// the call produces a result and as a bare statement otherwise.
+  LogicalResult emitCallIndirect(emitrust::CallIndirectOp callOp);
   /// Emits `let vN: T = <constant>;`.
   LogicalResult emitConstant(emitrust::ConstantOp constantOp);
   /// Emits `let vN: T = <verbatim expression>;`.
@@ -204,6 +217,10 @@ private:
   LogicalResult emitLoad(emitrust::LoadOp loadOp);
   /// Emits `let vN: &T = &<place>;` or `let vN: &mut T = &mut <place>;`.
   LogicalResult emitAddrOf(emitrust::AddrOfOp addrOfOp);
+  /// Emits `let vN: &[T] = &<place>[idx as usize..];` or the `&mut` form
+  /// with the `mut` marker; the `as usize` cast is omitted for an
+  /// index-typed index.
+  LogicalResult emitSliceOf(emitrust::SliceOfOp sliceOfOp);
 
   /// Output stream tracking the current indentation.
   raw_indented_ostream os;
@@ -289,12 +306,42 @@ LogicalResult RustEmitter::emitType(Location loc, Type type) {
     os << "; " << arrayType.getSize() << "]";
     return success();
   }
+  if (auto sliceType = dyn_cast<emitrust::SliceType>(type)) {
+    // Unsized; reaches the output only behind a reference (`&mut [T]`).
+    os << "[";
+    if (failed(emitType(loc, sliceType.getElementType())))
+      return failure();
+    os << "]";
+    return success();
+  }
   if (auto structType = dyn_cast<emitrust::StructType>(type)) {
     os << structType.getName();
     return success();
   }
   if (auto enumType = dyn_cast<emitrust::EnumType>(type)) {
     os << enumType.getName();
+    return success();
+  }
+  if (auto fnPtrType = dyn_cast<emitrust::FnPtrType>(type)) {
+    // Nullable function pointer: the C null pointer is None, so no unsafe
+    // sentinel is ever needed. The `-> R` clause is omitted for a void
+    // result, matching Rust's `fn(...)` spelling.
+    os << "Option<fn(";
+    bool first = true;
+    for (Type input : fnPtrType.getInputs()) {
+      if (!first)
+        os << ", ";
+      first = false;
+      if (failed(emitType(loc, input)))
+        return failure();
+    }
+    os << ")";
+    if (!fnPtrType.getResults().empty()) {
+      os << " -> ";
+      if (failed(emitType(loc, fnPtrType.getResults().front())))
+        return failure();
+    }
+    os << ">";
     return success();
   }
   // Lvalue types are never rendered; they fall through to the error below.
@@ -412,6 +459,11 @@ LogicalResult RustEmitter::emitDefaultValue(Location loc, Type type) {
     os << enumType.getName() << "::default()";
     return success();
   }
+  if (isa<emitrust::FnPtrType>(type)) {
+    // A default-initialized function pointer is the C null pointer.
+    os << "None";
+    return success();
+  }
   if (auto arrayType = dyn_cast<emitrust::ArrayType>(type)) {
     os << "[";
     if (failed(emitDefaultValue(loc, arrayType.getElementType())))
@@ -482,12 +534,24 @@ LogicalResult RustEmitter::emitRegionBody(Operation *parent, Region &region) {
 LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   for (Operation &op : *moduleOp.getBody()) {
     if (!isa<emitrust::UseOp, emitrust::VerbatimOp, emitrust::FuncOp,
-             emitrust::StructDefOp, emitrust::EnumDefOp,
+             emitrust::ImplOp, emitrust::StructDefOp, emitrust::EnumDefOp,
              emitrust::GlobalOp>(&op))
       return op.emitOpError("unable to translate op");
     if (failed(emitOperation(op)))
       return failure();
   }
+  return success();
+}
+
+LogicalResult RustEmitter::emitImpl(emitrust::ImplOp implOp) {
+  os << "impl " << implOp.getStructName() << " {\n";
+  increaseIndent();
+  for (Operation &op : implOp.getBody().front()) {
+    if (failed(emitOperation(op)))
+      return failure();
+  }
+  decreaseIndent();
+  os << "}\n";
   return success();
 }
 
@@ -519,12 +583,22 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
         "cannot translate a function with more than one result");
 
   Block &entryBlock = body.front();
+  // A function directly inside an `emitrust.impl` is a method: its first
+  // argument is the receiver, named `self` and rendered as `&mut self` (the
+  // impl verifier guarantees the mut_ref<struct> shape). The existing deref
+  // place rendering then yields `(*self).field...` naturally.
+  bool isMethod = isa<emitrust::ImplOp>(op->getParentOp());
   os << "fn " << SymbolTable::getSymbolName(op).getValue() << "(";
   bool first = true;
   for (BlockArgument argument : entryBlock.getArguments()) {
     if (!first)
       os << ", ";
     first = false;
+    if (isMethod && argument.getArgNumber() == 0) {
+      valueNames[argument] = "self";
+      os << "&mut self";
+      continue;
+    }
     os << assignName(argument) << ": ";
     if (failed(emitType(argument.getLoc(), argument.getType())))
       return failure();
@@ -613,6 +687,50 @@ LogicalResult RustEmitter::emitCallOpaque(emitrust::CallOpaqueOp callOp) {
       if (failed(emitOperand(loc, operand)))
         return failure();
     }
+  }
+  os << ");\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitCallIndirect(emitrust::CallIndirectOp callOp) {
+  Operation *op = callOp.getOperation();
+  Location loc = op->getLoc();
+  if (op->getNumResults() == 1 &&
+      failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  // Calling a null C function pointer is undefined behavior; the expect
+  // refines it into a deterministic panic.
+  if (failed(emitOperand(loc, callOp.getCallee())))
+    return failure();
+  os << ".expect(\"null function pointer\")(";
+  bool first = true;
+  for (Value argument : callOp.getArgs()) {
+    if (!first)
+      os << ", ";
+    first = false;
+    if (failed(emitOperand(loc, argument)))
+      return failure();
+  }
+  os << ");\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitMethodCall(emitrust::MethodCallOp callOp) {
+  Operation *op = callOp.getOperation();
+  Location loc = op->getLoc();
+  if (op->getNumResults() == 1 &&
+      failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  if (failed(emitPlaceExpr(loc, callOp.getReceiver())))
+    return failure();
+  os << "." << callOp.getMethod() << "(";
+  bool first = true;
+  for (Value argument : callOp.getArgs()) {
+    if (!first)
+      os << ", ";
+    first = false;
+    if (failed(emitOperand(loc, argument)))
+      return failure();
   }
   os << ");\n";
   return success();
@@ -1029,6 +1147,22 @@ LogicalResult RustEmitter::emitAddrOf(emitrust::AddrOfOp addrOfOp) {
   return success();
 }
 
+LogicalResult RustEmitter::emitSliceOf(emitrust::SliceOfOp sliceOfOp) {
+  Operation *op = sliceOfOp.getOperation();
+  if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  os << (sliceOfOp.getIsMut() ? "&mut " : "&");
+  if (failed(emitPlaceExpr(op->getLoc(), sliceOfOp.getBase())))
+    return failure();
+  os << "[";
+  if (failed(emitOperand(op->getLoc(), sliceOfOp.getIndex())))
+    return failure();
+  if (!isa<IndexType>(sliceOfOp.getIndex().getType()))
+    os << " as usize";
+  os << "..];\n";
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Dispatch
 //===----------------------------------------------------------------------===//
@@ -1043,10 +1177,18 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
       })
       .Case<emitrust::FuncOp>(
           [&](emitrust::FuncOp funcOp) { return emitFunc(funcOp); })
+      .Case<emitrust::ImplOp>(
+          [&](emitrust::ImplOp implOp) { return emitImpl(implOp); })
+      .Case<emitrust::MethodCallOp>([&](emitrust::MethodCallOp callOp) {
+        return emitMethodCall(callOp);
+      })
       .Case<emitrust::ReturnOp>(
           [&](emitrust::ReturnOp returnOp) { return emitReturn(returnOp); })
       .Case<emitrust::CallOpaqueOp>([&](emitrust::CallOpaqueOp callOp) {
         return emitCallOpaque(callOp);
+      })
+      .Case<emitrust::CallIndirectOp>([&](emitrust::CallIndirectOp callOp) {
+        return emitCallIndirect(callOp);
       })
       .Case<emitrust::ConstantOp>([&](emitrust::ConstantOp constantOp) {
         return emitConstant(constantOp);
@@ -1141,6 +1283,9 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
           [&](emitrust::LoadOp loadOp) { return emitLoad(loadOp); })
       .Case<emitrust::AddrOfOp>([&](emitrust::AddrOfOp addrOfOp) {
         return emitAddrOf(addrOfOp);
+      })
+      .Case<emitrust::SliceOfOp>([&](emitrust::SliceOfOp sliceOfOp) {
+        return emitSliceOf(sliceOfOp);
       })
       .Case<emitrust::YieldOp>(
           [&](emitrust::YieldOp) { return success(); })

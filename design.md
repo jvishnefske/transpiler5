@@ -76,6 +76,7 @@ Dialect namespace: emitrust. C++ namespace: mlir::emitrust.
 | array | one-dimensional, size and element type | fixed-size array type, bracket T semicolon N |
 | struct | named reference to a module-level struct_def | the bare struct name |
 | enum | named reference to a module-level enum_def | the bare enum name |
+| fn_ptr | parenthesized parameter list plus optional arrow result; components restricted to emitter scalars, struct, enum, and nested fn_ptr | nullable function pointer, Option of fn; the C null pointer is None |
 
 Builtin types accepted by the emitter: i1 renders as bool; signless and
 signed 8/16/32/64-bit integers render as i8/i16/i32/i64; unsigned 8/16/32/64
@@ -97,12 +98,13 @@ and f64. Any other type is a translation error with a located diagnostic.
 | func | symbol + function type + single-region body, at most one result | fn item with typed parameters and return type |
 | return | terminator, optional single operand | return statement |
 | call_opaque | string callee + variadic operands + variadic results | function call; zero results a statement, one result a let, many results a tuple-destructuring let |
+| call_indirect | fn_ptr callee + variadic arguments + at most one result; verifier requires argument and result types equal the callee signature | call through the Option, expect("null function pointer") then the argument list; a let when a result exists, a statement otherwise |
 | constant | typed or opaque value attribute, one result | let binding initialized with the constant |
 | literal | string attribute, one result | let binding initialized with the verbatim expression |
 | let | one init operand, optional mut marker, one result of same type | let or let mut rebinding |
 | assign | destination + value, same types, no result | assignment statement; verifier requires destination be a mut let result |
 | add, sub, mul, div, rem | two operands, one result, all same type | infix binary expression |
-| cmp | predicate enum (eq, ne, lt, le, gt, ge) + two same-typed operands, i1 result; enum operands allow eq and ne only (Rust derives PartialEq but no ordering) | infix comparison |
+| cmp | predicate enum (eq, ne, lt, le, gt, ge) + two same-typed operands, i1 result; enum and fn_ptr operands allow eq and ne only (PartialEq but no ordering) | infix comparison |
 | cast | one operand, one result; enum and bool result types are rejected (no Rust as-cast produces them) | as-cast expression |
 | select | i1 condition + two same-typed value operands, one result (lvalues excluded) | let binding initialized with an if-else expression |
 | if | i1 condition + then region + optional else region, no results | if / if-else statement |
@@ -115,10 +117,13 @@ and f64. Any other type is a translation error with a located diagnostic.
 | enum_def | module-level symbol with variant names and i64 discriminant values | repr(i32) derive Clone, Copy, PartialEq, Default enum item; the first variant carries the default attribute |
 | variable | optional scalar init attribute, one lvalue result | mutable local declaration with explicit default |
 | member | struct lvalue + field name, lvalue result | place suffixed with dot-field |
-| subscript | array lvalue + integer index, lvalue result | place indexed with the value cast to usize |
+| subscript | array or slice lvalue + integer index, lvalue result | place indexed with the value cast to usize |
 | deref | ref or mut_ref operand, lvalue result | parenthesized pointer dereference place |
 | load | lvalue operand, value result | let binding initialized from the place expression |
 | addr_of | lvalue operand, optional mut marker, ref/mut_ref result | let binding of a shared or mutable borrow of the place |
+| slice_of | array or slice lvalue + integer index, optional mut marker, ref/mut_ref-of-slice result | let binding of a borrow of the place's tail range from the index (cast to usize) |
+| impl | module-level, struct-name attribute + single-region body holding only funcs whose first argument is mut_ref of the named struct | inherent impl block; contained functions render with the receiver named self and the signature spelled &mut self |
+| method_call | struct lvalue receiver + method-name attribute + variadic value arguments, at most one result; the method name is not cross-checked (member/struct precedent) | place.method(args) — auto-ref scopes the &mut borrow to the call expression; a let with a result, a statement otherwise |
 
 The assign operation additionally accepts any lvalue-typed destination, and
 call_opaque optionally carries an args attribute whose entries are either
@@ -237,10 +242,10 @@ lists the lit test file(s) that validate it.
   output; any mismatch is a fatal MISCOMPILE unless explicitly quarantined
   in known-miscompiles.txt, and the expected-pass.txt manifest ratchets in
   both directions (regressions and unrecorded passes both fail). Current
-  ledger: 220 total, 75 transpiled, 75 passed, 0 miscompiled,
-  145 unsupported (the remaining tests need unions, pointer locals,
-  aggregate initializers, string literals, or system-header contents
-  outside the C subset). (test/CTestSuite/)
+  ledger: 220 total, 85 transpiled, 85 passed, 0 miscompiled,
+  135 unsupported (the remaining tests need unions, pointer-to-pointer or
+  void* casts, pointer globals, aggregate initializers, string literals,
+  or system-header contents outside the C subset). (test/CTestSuite/)
 - [x] FR-25 Generality beyond test vectors: an adversarial audit plus
   differential stress run over shapes absent from the original tests
   (negative/sparse/INT_MAX-adjacent case labels, nested switch, default
@@ -280,6 +285,85 @@ lists the lit test file(s) that validate it.
   EMITRUST_RESOURCE_DIR environment override), so sources that #include a
   project-local header resolve. (test/Import/C/include-path.c with
   Inputs/helper.h)
+- [x] FR-28 Pointer decomposition and slice parameters: pointers never
+  enter MLIR. A union-find pre-pass (PointerRegionAnalysis) resolves each
+  local pointer to one base object plus an i64 element cursor in a
+  promotable memref cell; dereference and subscript become
+  emitrust.subscript(base, cursor), pointer arithmetic becomes cursor
+  arithmetic, and same-object difference/comparison become plain i64 arith
+  ops. Pointer parameters classify per definition: deref/arrow-only
+  parameters stay !emitrust.mut_ref<T>, while subscripted, walked,
+  compared, reassigned, or passed-on parameters become
+  !emitrust.mut_ref<!emitrust.slice<T>> (rendered &mut [T]) dereferenced
+  once into the region base of the same decomposition, so array arguments
+  decay to emitrust.slice_of borrows and no borrow is held across
+  statements. Call sites materialize all value arguments before any
+  borrow, and two borrows of one region base are a located rejection, as
+  are multi-base rebinding, escaping (&p), NULL constants, string-literal
+  and global targets, and cross-TU calls imported before a definition
+  refines a parameter to a slice. Zero unsafe in the emitted crates.
+  (test/Import/C/pointers-local.c, pointers-local-invalid.c,
+  pointers-param-slice.c, pointers-param-invalid.c,
+  test/Target/Rust/slice.mlir, test/EndToEnd/pointers-local.c,
+  pointer-params.c)
+- [x] FR-29 Function pointers: non-variadic C function pointers import as
+  the nullable !emitrust.fn_ptr type rendering Option of fn (Copy,
+  PartialEq, Default None, so it is a legal struct field, global,
+  local, parameter, and return type with NULL mapping to None and no
+  sentinel or unsafe). Function references (plain decay and address-of)
+  become opaque Some(name) constants after the referenced function's
+  imported signature is checked against the pointer type; indirect calls
+  (fp(...), (*fp)(...), v.op(...), and calls through returned pointers,
+  including 00124's nested fn-ptr-returning shape) become
+  emitrust.call_indirect with direct-call argument/result checking and a
+  rendering that refines the null-call UB into a deterministic panic;
+  truth tests and ==/!= against NULL or another pointer become
+  emitrust.cmp eq/ne against a None constant. Function pointers are
+  ordinary values that bypass the Phase-1a pointer decomposition.
+  Located rejections: variadic targets, signature mismatches (including
+  prototype-less K&R pointers bound to functions with parameters),
+  argument-carrying calls through prototype-less pointers, fn_ptr
+  component types outside the supported set (e.g. data-pointer
+  parameters), and arrays of function pointers. The differential test is
+  byte-identical to clang and the emitted crate contains no unsafe.
+  (test/Import/C/fn-pointers.c, fn-pointers-invalid.c,
+  test/Target/Rust/fn-pointers.mlir, test/Dialect/EmitRust/types.mlir,
+  ops.mlir, invalid.mlir, test/EndToEnd/fn-pointers.c; c-testsuite
+  00087, 00088, 00124)
+- [x] FR-30 Owner-struct actors: each qualifying pointer ownership region
+  becomes a Rust struct owning its array, and the C functions whose
+  pointers resolve into that region become &mut self methods on it — the
+  actor is an ownership boundary, not a thread. A pure-AST interprocedural
+  pre-pass (Pass A, planOwners, run per TU before any IR is built) unifies
+  each pointer call argument's root object with the callee definition's
+  parameter in a program-wide union-find; a class is promoted only when
+  ALL of: single non-escaping storage base; the base is a local array of
+  1..32 elements (the struct_def derive(Default) MVP limit) whose element
+  type matches every unified parameter's pointee; the region crosses at
+  least one function boundary; and every unified function is defined in
+  the TU, returns a plain value, resolves all of its own data-pointer
+  parameters into the same class, and has all call sites visible (external
+  linkage qualifies only in a whole-program single-TU import). The base
+  imports as emitrust.struct_def @Owner_<fn>_<base> ["data"] plus a
+  struct-typed variable whose accesses rewrite to member("data"); each
+  method imports as a func.func carrying emitrust.method_of, taking
+  mut_ref<struct> plus one i64 element index per pointer parameter
+  (decomposed against deref(arg0) -> member("data") with the FR-28 cursor
+  machinery); call sites lower pointer arguments to i64 cursors and borrow
+  the owner for one emitrust.method_call-tagged func.call.
+  convert-func-to-emitrust materializes the emitrust.impl surface and
+  rewrites tagged calls into emitrust.method_call place expressions
+  (erasing the borrow — no materialized borrow survives), including
+  sibling method-to-method calls through the dereferenced receiver
+  ((*self).m(...)). Every unmet condition (two bases, oversized arrays,
+  two-region functions, escaping regions, undefined callees) is a SILENT
+  fallback to the FR-28 slice lowering, never an error; owner-struct
+  symbol collisions are located rejections. The phase unlocks no new
+  c-testsuite tests by design and the ledger shows zero movement; the
+  differential test is byte-identical to clang with zero unsafe.
+  (test/Dialect/EmitRust/ops.mlir, invalid.mlir,
+  test/Conversion/FuncToEmitRust/impl.mlir, test/Target/Rust/impl.mlir,
+  test/Import/C/owners.c, owners-fallback.c, test/EndToEnd/owners.c)
 
 ## C99 Support Roadmap
 
@@ -446,12 +530,30 @@ rule.
   the operand stays unevaluated, and variable-length-array operands are
   rejected with a located diagnostic.
   (test/Import/C/sizeof.c, sizeof-invalid.c, test/EndToEnd/value-exprs.c)
-- [ ] C99-26 Pointer arithmetic, pointer subtraction, pointer
-  comparisons, and array-to-pointer decay (design decision needed: the
-  safe-Rust mapping is slices plus indices rather than raw offsets; this
-  is the largest single gap for idiomatic C).
-- [ ] C99-27 Function pointers and calls through them (Rust fn-pointer
-  values are a close match for non-variadic prototypes).
+- [x] C99-26 Pointer arithmetic, pointer subtraction, pointer
+  comparisons, and array-to-pointer decay: decomposed into (base object,
+  i64 cursor) pairs intra-function and slice parameters
+  (&mut [T]) across calls — the safe-Rust mapping is slices plus indices
+  rather than raw offsets. Multi-base rebinding, escaping pointers
+  (&p, pointer struct fields, pointer globals, pointer returns), NULL
+  data pointers, void* casts, and string-literal pointers stay located
+  rejections by design. See FR-28. Qualifying cross-function regions
+  additionally promote to owner structs with &mut self methods (FR-30).
+  (test/Import/C/pointers-local.c,
+  pointers-param-slice.c, test/EndToEnd/pointers-local.c,
+  pointer-params.c)
+- [x] C99-27 Function pointers and calls through them: function pointers
+  are ordinary Copy values of !emitrust.fn_ptr type rendered
+  Option of fn (NULL is None, no sentinel), legal as locals, globals,
+  struct fields, parameters, and results; function references become
+  signature-checked Some(name) constants, indirect calls become
+  emitrust.call_indirect with a deterministic panic refining the
+  null-call UB, and truth tests and equality compare against None.
+  Variadic pointers, void*/data-pointer components, arrays of function
+  pointers, and argument-carrying calls through prototype-less K&R
+  pointers are located rejections.
+  (test/Import/C/fn-pointers.c, fn-pointers-invalid.c,
+  test/EndToEnd/fn-pointers.c, test/Target/Rust/fn-pointers.mlir)
 - [ ] C99-28 String literals as char-array initializers and as pointer
   values, with the C escape set (beyond the current printf-format-only
   support).
@@ -594,7 +696,10 @@ matching beyond literal match arms, data-carrying enums (C-like unit-variant
 enums are supported), error-handling sugar, and expression trees (every
 value is a named let binding; no inlining of subexpressions). On the C side
 the importer rejects, with located diagnostics: goto, unions, bitfields,
-int-to-enum conversions, pointer arithmetic and pointer locals,
+int-to-enum conversions, pointer-to-pointer values, pointer struct fields
+and pointer globals, NULL data pointers, void* casts, malloc and friends
+(pointer arithmetic, pointer locals, and pointer/array parameters are now
+supported through the FR-28 decomposition),
 multi-dimensional arrays, aggregate initializers, sizeof/_Alignof of
 variable-length-array/incomplete/function operands, conditional operators
 with non-scalar results, unary minus on unsigned operands (pending a

@@ -34,17 +34,20 @@ def EmitRust_ArithmeticType
 // Types usable as loop bounds: any integer or index.
 def EmitRust_IntegerOrIndexType : AnyTypeOf<[AnyInteger, Index]>;
 
-// Types usable as comparison operands: any arithmetic type or an EmitRust
-// enum type. Enum operands are restricted to the eq/ne predicates by the
-// CmpOp verifier.
+// Types usable as comparison operands: any arithmetic type, an EmitRust
+// enum type, or an EmitRust fn_ptr type. Enum and fn_ptr operands are
+// restricted to the eq/ne predicates by the CmpOp verifier.
 def EmitRust_CmpOperandType
-    : AnyTypeOf<[EmitRust_ArithmeticType, EmitRust_EnumType]>;
+    : AnyTypeOf<[EmitRust_ArithmeticType, EmitRust_EnumType,
+                 EmitRust_FnPtrType]>;
 
 // Types usable as select values: any arithmetic type (including bool) or
-// an EmitRust struct, enum, or array type (no lvalues or references).
+// an EmitRust struct, enum, array, or fn_ptr type (no lvalues or
+// references).
 def EmitRust_SelectValueType
     : AnyTypeOf<[EmitRust_ArithmeticType, EmitRust_StructType,
-                 EmitRust_EnumType, EmitRust_ArrayType]>;
+                 EmitRust_EnumType, EmitRust_ArrayType,
+                 EmitRust_FnPtrType]>;
 
 //===----------------------------------------------------------------------===//
 // UseOp
@@ -168,6 +171,91 @@ def EmitRust_FuncOp : EmitRust_Op<"func", [
 }
 
 //===----------------------------------------------------------------------===//
+// ImplOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_ImplOp : EmitRust_Op<"impl", [
+    HasParent<"::mlir::ModuleOp">, SymbolTable, NoRegionArguments,
+    NoTerminator]> {
+  let summary = "Inherent impl block for an owner struct";
+  let description = [{
+    The `emitrust.impl` operation renders a Rust inherent `impl` block for
+    the named struct. Its single region holds only `emitrust.func`
+    operations, each of which must take the receiver as its first argument:
+    an `!emitrust.mut_ref` of the `!emitrust.struct` carrying the impl's
+    struct name. Inside the impl, the emitter names the receiver argument
+    `self` and renders the signature with `&mut self`, so the existing
+    dereference place rendering yields `(*self).field...` naturally. The
+    struct name is not cross-checked against an `emitrust.struct_def`
+    (mirroring `emitrust.member`).
+
+    Example:
+
+    ```mlir
+    emitrust.impl "Owner" {
+      emitrust.func @get(%self: !emitrust.mut_ref<!emitrust.struct<"Owner">>,
+                         %i: i64) -> i32 {
+        ...
+      }
+    }
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    impl Owner {
+        fn get(&mut self, v0: i64) -> i32 {
+            ...
+        }
+    }
+    ```
+  }];
+
+  let arguments = (ins StrAttr:$struct_name);
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = "$struct_name $body attr-dict";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// MethodCallOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_MethodCallOp : EmitRust_Op<"method_call"> {
+  let summary = "Method call on a struct place";
+  let description = [{
+    The `emitrust.method_call` operation calls the named method on the
+    receiver place, which must be an lvalue wrapping an `!emitrust.struct`.
+    It renders as `place.method(args)` — Rust's auto-ref takes the `&mut`
+    borrow of the place and scopes it to the call expression, so no borrow
+    is ever materialized as a binding. The operation produces at most one
+    result and is emitted as a `let` binding when it produces one and as a
+    bare statement otherwise. The method name is not cross-checked against
+    the corresponding `emitrust.impl` (mirroring `emitrust.member`).
+
+    Example:
+
+    ```mlir
+    %r = emitrust.method_call %owner["get"](%i)
+        : (!emitrust.lvalue<!emitrust.struct<"Owner">>, i64) -> i32
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v2: i32 = v0.get(v1);
+    ```
+  }];
+
+  let arguments = (ins EmitRust_LValueType:$receiver, StrAttr:$method,
+                       Variadic<AnyType>:$args);
+  let results = (outs Variadic<AnyType>);
+
+  let assemblyFormat = [{
+    $receiver `[` $method `]` `(` $args `)` attr-dict
+    `:` functional-type(operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // ReturnOp
 //===----------------------------------------------------------------------===//
 
@@ -238,6 +326,44 @@ def EmitRust_CallOpaqueOp : EmitRust_Op<"call_opaque"> {
 
   let assemblyFormat = [{
     $callee `(` $operands `)` attr-dict `:` functional-type($operands, results)
+  }];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// CallIndirectOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_CallIndirectOp : EmitRust_Op<"call_indirect"> {
+  let summary = "Indirect call through a function pointer";
+  let description = [{
+    The `emitrust.call_indirect` operation calls through an
+    `!emitrust.fn_ptr` value. The argument types must equal the callee's
+    parameter types and the result (at most one) must equal the callee's
+    result type; both are enforced by the verifier.
+
+    The operation is emitted as
+    `callee.expect("null function pointer")(args)`: calling a null C
+    function pointer is undefined behavior, which this rendering refines
+    into a deterministic panic.
+
+    Example:
+
+    ```mlir
+    %0 = emitrust.call_indirect %f(%a, %b)
+        : (!emitrust.fn_ptr<(i32, i32) -> i32>, i32, i32) -> i32
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v3: i32 = v0.expect("null function pointer")(v1, v2);
+    ```
+  }];
+
+  let arguments = (ins EmitRust_FnPtrType:$callee, Variadic<AnyType>:$args);
+  let results = (outs Variadic<AnyType>);
+
+  let assemblyFormat = [{
+    $callee `(` $args `)` attr-dict `:` functional-type(operands, results)
   }];
   let hasVerifier = 1;
 }
@@ -383,14 +509,15 @@ def EmitRust_StructDefOp : EmitRust_Op<"struct_def", [
     module level. The field names and field types are given as two arrays of
     the same non-zero length; names must be non-empty and unique, and every
     field type must be a scalar (integer, index, or float), an
-    `!emitrust.array`, an `!emitrust.struct`, or an `!emitrust.enum` (no
-    lvalues or references). Values of the struct are referenced through the
-    `!emitrust.struct` type carrying the same name.
+    `!emitrust.array`, an `!emitrust.struct`, an `!emitrust.enum`, or an
+    `!emitrust.fn_ptr` (no lvalues or references). Values of the struct are
+    referenced through the `!emitrust.struct` type carrying the same name.
 
     The struct is emitted with `#[derive(Clone, Copy, Default)]`. This is an
-    MVP guarantee: all permitted field types are `Copy + Default`, and
-    arrays are limited to at most 32 elements so that the derived `Default`
-    implementation is available on all supported Rust editions.
+    MVP guarantee: all permitted field types are `Copy + Default`
+    (`!emitrust.fn_ptr` renders `Option<fn(...)>`, whose default is `None`),
+    and arrays are limited to at most 32 elements so that the derived
+    `Default` implementation is available on all supported Rust editions.
 
     Example:
 
@@ -473,12 +600,14 @@ def EmitRust_GlobalOp : EmitRust_Op<"global", [
   let description = [{
     The `emitrust.global` operation defines a named module-level variable
     with static storage duration. The value type must be a scalar (integer,
-    index, or float), an `!emitrust.array`, or an `!emitrust.struct`. The
-    optional initializer must be a typed attribute whose type equals the
-    value type; initializers are only supported for scalar value types.
-    Without an initializer the global starts at the type's default value
-    (`0`, `0.0`, `false`, `Name::default()`, or `[<element-default>; N]`),
-    which models C's zero-initialization of static storage.
+    index, or float), an `!emitrust.array`, an `!emitrust.struct`, or an
+    `!emitrust.fn_ptr`. The optional initializer must be a typed attribute
+    whose type equals the value type; initializers are only supported for
+    scalar value types, except that an `!emitrust.fn_ptr` global takes an
+    opaque attribute (such as `Some(f)`) emitted verbatim. Without an
+    initializer the global starts at the type's default value (`0`, `0.0`,
+    `false`, `Name::default()`, `None`, or `[<element-default>; N]`), which
+    models C's zero-initialization of static storage.
 
     A global carrying the `const` marker is never written; it is emitted as
     a plain Rust `static` item read directly. Because a plain `static`
@@ -671,15 +800,16 @@ def EmitRust_MemberOp : EmitRust_Op<"member"> {
 //===----------------------------------------------------------------------===//
 
 def EmitRust_SubscriptOp : EmitRust_Op<"subscript"> {
-  let summary = "Array subscript place operation";
+  let summary = "Array or slice subscript place operation";
   let description = [{
-    The `emitrust.subscript` operation refines an array-typed lvalue into
-    the lvalue of one of its elements. The array operand's wrapped value
-    type must be an `!emitrust.array` whose element type equals the result
-    lvalue's wrapped value type. The operation emits no code at its program
-    point; it contributes `[index as usize]` to the place expression of any
-    load, assign, or borrow that consumes it (the `as usize` cast is omitted
-    when the index is of `index` type).
+    The `emitrust.subscript` operation refines an array- or slice-typed
+    lvalue into the lvalue of one of its elements. The operand's wrapped
+    value type must be an `!emitrust.array` or `!emitrust.slice` whose
+    element type equals the result lvalue's wrapped value type. The
+    operation emits no code at its program point; it contributes
+    `[index as usize]` to the place expression of any load, assign, or
+    borrow that consumes it (the `as usize` cast is omitted when the index
+    is of `index` type).
 
     Example:
 
@@ -800,6 +930,47 @@ def EmitRust_AddrOfOp : EmitRust_Op<"addr_of"> {
 
   let assemblyFormat =
       "(`mut` $is_mut^)? $operand attr-dict `:` functional-type($operand, $result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// SliceOfOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_SliceOfOp : EmitRust_Op<"slice_of"> {
+  let summary = "Slice borrow operation";
+  let description = [{
+    The `emitrust.slice_of` operation borrows the tail of an array- or
+    slice-typed lvalue starting at an element index, producing a shared
+    (`&place[index as usize..]`) or, with the `mut` marker, a mutable
+    (`&mut place[index as usize..]`) reference to a slice of the elements
+    (the `as usize` cast is omitted when the index is of `index` type).
+    The base lvalue's wrapped value type must be an `!emitrust.array` or
+    `!emitrust.slice` whose element type equals the result slice's element
+    type, and the `mut` marker must be present if and only if the result is
+    an `!emitrust.mut_ref` (mirroring `emitrust.addr_of`).
+
+    Example:
+
+    ```mlir
+    %s = emitrust.slice_of mut %arr[%i]
+        : (!emitrust.lvalue<!emitrust.array<4xi32>>, i64)
+          -> !emitrust.mut_ref<!emitrust.slice<i32>>
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v2: &mut [i32] = &mut v0[v1 as usize..];
+    ```
+  }];
+
+  let arguments = (ins EmitRust_LValueType:$base,
+                       AnyTypeOf<[AnyInteger, Index]>:$index,
+                       UnitAttr:$is_mut);
+  let results =
+      (outs AnyTypeOf<[EmitRust_RefType, EmitRust_MutRefType]>:$result);
+
+  let assemblyFormat =
+      "(`mut` $is_mut^)? $base `[` $index `]` attr-dict `:` functional-type(operands, results)";
   let hasVerifier = 1;
 }
 
@@ -1004,7 +1175,10 @@ def EmitRust_CmpOp : EmitRust_Op<"cmp", [SameTypeOperands]> {
 
     Operands of `!emitrust.enum` type are supported with the `eq` and `ne`
     predicates only; enums derive `PartialEq` but not `PartialOrd`, so the
-    verifier rejects ordered predicates on enum operands.
+    verifier rejects ordered predicates on enum operands. Operands of
+    `!emitrust.fn_ptr` type follow the same rule: `Option<fn(...)>` is
+    `PartialEq` (a null check compares against a `None` constant) but has
+    no meaningful ordering.
 
     Example:
 

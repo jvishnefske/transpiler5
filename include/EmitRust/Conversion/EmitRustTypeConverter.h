@@ -16,7 +16,9 @@
 #ifndef EMITRUST_CONVERSION_EMITRUSTTYPECONVERTER_H
 #define EMITRUST_CONVERSION_EMITRUSTTYPECONVERTER_H
 
+#include "EmitRust/EmitRustAttributes.h"
 #include "EmitRust/EmitRustDialect.h"
+#include "EmitRust/EmitRustTypes.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -47,14 +49,17 @@ inline void populateEmitRustTypeConverter(TypeConverter &typeConverter) {
   });
 }
 
-/// Returns the zero/default typed attribute for a scalar `type`: `0` for
-/// integer and index types (which renders as `false` for i1), `0.0` for
-/// floating-point types. Returns a null attribute for any other type.
-inline TypedAttr getDefaultValueAttr(Type type) {
+/// Returns the zero/default attribute for `type`: `0` for integer and index
+/// types (which renders as `false` for i1), `0.0` for floating-point types,
+/// and the opaque `None` expression for `!emitrust.fn_ptr` (the null
+/// function pointer). Returns a null attribute for any other type.
+inline Attribute getDefaultValueAttr(Type type) {
   if (isa<Float32Type, Float64Type>(type))
     return FloatAttr::get(type, 0.0);
   if (isa<IntegerType, IndexType>(type))
     return IntegerAttr::get(type, 0);
+  if (isa<FnPtrType>(type))
+    return OpaqueAttr::get(type.getContext(), "None");
   return nullptr;
 }
 

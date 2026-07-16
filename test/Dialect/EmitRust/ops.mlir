@@ -344,3 +344,87 @@ emitrust.func @global_access() {
   emitrust.global_store %2, @table : !emitrust.array<4xi32>
   emitrust.return
 }
+
+// CHECK-LABEL: emitrust.func @slice_places
+emitrust.func @slice_places(%arg0: !emitrust.mut_ref<!emitrust.slice<i32>>, %arg1: i64, %arg2: index) {
+  // CHECK: emitrust.deref %{{.*}} : (!emitrust.mut_ref<!emitrust.slice<i32>>) -> !emitrust.lvalue<!emitrust.slice<i32>>
+  %s = emitrust.deref %arg0 : (!emitrust.mut_ref<!emitrust.slice<i32>>) -> !emitrust.lvalue<!emitrust.slice<i32>>
+  // A subscript accepts a slice-typed lvalue base.
+  // CHECK: emitrust.subscript %{{.*}}[%{{.*}}] : (!emitrust.lvalue<!emitrust.slice<i32>>, i64) -> !emitrust.lvalue<i32>
+  %e = emitrust.subscript %s[%arg1] : (!emitrust.lvalue<!emitrust.slice<i32>>, i64) -> !emitrust.lvalue<i32>
+  %a = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+  // CHECK: emitrust.slice_of mut %{{.*}}[%{{.*}}] : (!emitrust.lvalue<!emitrust.array<4xi32>>, i64) -> !emitrust.mut_ref<!emitrust.slice<i32>>
+  %m = emitrust.slice_of mut %a[%arg1] : (!emitrust.lvalue<!emitrust.array<4xi32>>, i64) -> !emitrust.mut_ref<!emitrust.slice<i32>>
+  // CHECK: emitrust.slice_of %{{.*}}[%{{.*}}] : (!emitrust.lvalue<!emitrust.array<4xi32>>, index) -> !emitrust.ref<!emitrust.slice<i32>>
+  %r = emitrust.slice_of %a[%arg2] : (!emitrust.lvalue<!emitrust.array<4xi32>>, index) -> !emitrust.ref<!emitrust.slice<i32>>
+  // Reslicing a deref'd slice place composes.
+  // CHECK: emitrust.slice_of mut %{{.*}}[%{{.*}}] : (!emitrust.lvalue<!emitrust.slice<i32>>, i64) -> !emitrust.mut_ref<!emitrust.slice<i32>>
+  %t = emitrust.slice_of mut %s[%arg1] : (!emitrust.lvalue<!emitrust.slice<i32>>, i64) -> !emitrust.mut_ref<!emitrust.slice<i32>>
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @fn_ptr_ops(
+emitrust.func @fn_ptr_ops(%arg0: !emitrust.fn_ptr<(i32, i32) -> i32>,
+                          %arg1: !emitrust.fn_ptr<()>, %arg2: i32) {
+  // CHECK: emitrust.constant <#emitrust.opaque<"Some(add)">> : !emitrust.fn_ptr<(i32, i32) -> i32>
+  %0 = emitrust.constant <#emitrust.opaque<"Some(add)">> : !emitrust.fn_ptr<(i32, i32) -> i32>
+  // CHECK: emitrust.constant <#emitrust.opaque<"None">> : !emitrust.fn_ptr<(i32, i32) -> i32>
+  %1 = emitrust.constant <#emitrust.opaque<"None">> : !emitrust.fn_ptr<(i32, i32) -> i32>
+  // CHECK: emitrust.call_indirect %{{.*}}(%{{.*}}, %{{.*}}) : (!emitrust.fn_ptr<(i32, i32) -> i32>, i32, i32) -> i32
+  %2 = emitrust.call_indirect %arg0(%arg2, %arg2)
+      : (!emitrust.fn_ptr<(i32, i32) -> i32>, i32, i32) -> i32
+  // CHECK: emitrust.call_indirect %{{.*}}() : (!emitrust.fn_ptr<()>) -> ()
+  emitrust.call_indirect %arg1() : (!emitrust.fn_ptr<()>) -> ()
+  // CHECK: emitrust.cmp eq, %{{.*}}, %{{.*}} : (!emitrust.fn_ptr<(i32, i32) -> i32>, !emitrust.fn_ptr<(i32, i32) -> i32>) -> i1
+  %3 = emitrust.cmp eq, %arg0, %1
+      : (!emitrust.fn_ptr<(i32, i32) -> i32>, !emitrust.fn_ptr<(i32, i32) -> i32>) -> i1
+  // CHECK: emitrust.cmp ne, %{{.*}}, %{{.*}} : (!emitrust.fn_ptr<(i32, i32) -> i32>, !emitrust.fn_ptr<(i32, i32) -> i32>) -> i1
+  %4 = emitrust.cmp ne, %arg0, %0
+      : (!emitrust.fn_ptr<(i32, i32) -> i32>, !emitrust.fn_ptr<(i32, i32) -> i32>) -> i1
+  // CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32, i32) -> i32>>
+  %5 = emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32, i32) -> i32>>
+  // CHECK: emitrust.assign %{{.*}} = %{{.*}} : !emitrust.lvalue<!emitrust.fn_ptr<(i32, i32) -> i32>>
+  emitrust.assign %5 = %0 : !emitrust.lvalue<!emitrust.fn_ptr<(i32, i32) -> i32>>
+  emitrust.return
+}
+
+// CHECK: emitrust.struct_def @Dispatch ["op"] [!emitrust.fn_ptr<(i32, i32) -> i32>]
+emitrust.struct_def @Dispatch ["op"] [!emitrust.fn_ptr<(i32, i32) -> i32>]
+
+// CHECK: emitrust.global @handler : !emitrust.fn_ptr<(i32) -> i32>
+emitrust.global @handler : !emitrust.fn_ptr<(i32) -> i32>
+
+// CHECK: emitrust.global @bound <#emitrust.opaque<"Some(add)">> : !emitrust.fn_ptr<(i32, i32) -> i32>
+emitrust.global @bound <#emitrust.opaque<"Some(add)">> : !emitrust.fn_ptr<(i32, i32) -> i32>
+
+// CHECK: emitrust.struct_def @Owner_main_arr ["data"] [!emitrust.array<8xi32>]
+emitrust.struct_def @Owner_main_arr ["data"] [!emitrust.array<8xi32>]
+
+// CHECK: emitrust.impl "Owner_main_arr" {
+emitrust.impl "Owner_main_arr" {
+  // CHECK: emitrust.func @get(%{{.*}}: !emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>, %{{.*}}: i64) -> i32
+  emitrust.func @get(%arg0: !emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>, %arg1: i64) -> i32 {
+    %s = emitrust.deref %arg0 : (!emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>) -> !emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>
+    %d = emitrust.member %s["data"] : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>) -> !emitrust.lvalue<!emitrust.array<8xi32>>
+    %e = emitrust.subscript %d[%arg1] : (!emitrust.lvalue<!emitrust.array<8xi32>>, i64) -> !emitrust.lvalue<i32>
+    %v = emitrust.load %e : (!emitrust.lvalue<i32>) -> i32
+    // A sibling method call through the dereferenced receiver.
+    // CHECK: emitrust.method_call %{{.*}}["touch"] (%{{.*}}) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64) -> ()
+    emitrust.method_call %s["touch"] (%arg1) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64) -> ()
+    emitrust.return %v : i32
+  }
+  // CHECK: emitrust.func @touch(
+  emitrust.func @touch(%arg0: !emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>, %arg1: i64) {
+    emitrust.return
+  }
+}
+
+// CHECK-LABEL: emitrust.func @method_calls(
+emitrust.func @method_calls(%arg0: i64) -> i32 {
+  %o = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>
+  // CHECK: emitrust.method_call %{{.*}}["touch"] (%{{.*}}) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64) -> ()
+  emitrust.method_call %o["touch"] (%arg0) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64) -> ()
+  // CHECK: %{{.*}} = emitrust.method_call %{{.*}}["get"] (%{{.*}}) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64) -> i32
+  %r = emitrust.method_call %o["get"] (%arg0) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64) -> i32
+  emitrust.return %r : i32
+}

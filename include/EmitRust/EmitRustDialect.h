@@ -18,4 +18,25 @@
 
 #include "EmitRust/EmitRustOpsDialect.h.inc"
 
+namespace mlir {
+namespace emitrust {
+
+/// Name of the discardable `func.func` attribute the C importer attaches to
+/// a function that must become a `&mut self` method of an owner struct. Its
+/// `StringAttr` value is the owner struct's name; `convert-func-to-emitrust`
+/// materializes the function inside the matching `emitrust.impl` and strips
+/// the attribute.
+inline constexpr llvm::StringLiteral kMethodOfAttrName = "emitrust.method_of";
+
+/// Name of the discardable `func.call` unit attribute the C importer
+/// attaches to a call whose callee is a method-planned function. The call's
+/// first operand is an `emitrust.addr_of mut` of the owner place;
+/// `convert-func-to-emitrust` rewrites the call into an
+/// `emitrust.method_call` on that place and erases the dead borrow.
+inline constexpr llvm::StringLiteral kMethodCallAttrName =
+    "emitrust.method_call";
+
+} // namespace emitrust
+} // namespace mlir
+
 #endif // EMITRUST_EMITRUSTDIALECT_H

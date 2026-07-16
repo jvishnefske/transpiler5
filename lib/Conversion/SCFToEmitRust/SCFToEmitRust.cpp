@@ -71,7 +71,7 @@ createDefaultInitializedLets(OpTy op, const TypeConverter *typeConverter,
     Type resultType = typeConverter->convertType(result.getType());
     if (!resultType)
       return rewriter.notifyMatchFailure(op, "result type conversion failed");
-    TypedAttr defaultValue = getDefaultValueAttr(resultType);
+    Attribute defaultValue = getDefaultValueAttr(resultType);
     if (!defaultValue)
       return rewriter.notifyMatchFailure(
           op, "no default value for the result type");

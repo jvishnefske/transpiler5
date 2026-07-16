@@ -5,8 +5,9 @@
 //===----------------------------------------------------------------------===//
 //
 // Defines the MLIR EmitRust types: opaque Rust type strings, shared /
-// mutable references, assignable lvalues, one-dimensional arrays, and named
-// struct and enum references.
+// mutable references, assignable lvalues, one-dimensional arrays,
+// dynamically sized slices, nullable function pointers, and named struct
+// and enum references.
 //
 //===----------------------------------------------------------------------===//
 
@@ -154,6 +155,84 @@ def EmitRust_ArrayType : EmitRust_Type<"Array", "array"> {
     /// Returns whether `type` may be used as an array element type: a
     /// scalar (integer, index, f32, f64) or an EmitRust struct type.
     static bool isValidElementType(Type type);
+  }];
+
+  let genVerifyDecl = 1;
+  let hasCustomAssemblyFormat = 1;
+}
+
+def EmitRust_SliceType : EmitRust_Type<"Slice", "slice"> {
+  let summary = "EmitRust slice type";
+
+  let description = [{
+    A dynamically sized view of a run of elements, emitted as the Rust slice
+    type `[T]`. The element type follows the array element rules
+    (`ArrayType::isValidElementType`): a scalar (integer, index, or float)
+    or an `!emitrust.struct` type.
+
+    Because a slice is unsized, the type is only valid behind a reference
+    (`!emitrust.ref`/`!emitrust.mut_ref`, rendering `&[T]`/`&mut [T]`) or as
+    the value type of an `!emitrust.lvalue` (the place designated by
+    dereferencing such a reference). It must not appear as the value type of
+    an `emitrust.variable` or `emitrust.global`, as a struct field type, or
+    as an array element type.
+
+    Example:
+
+    ```mlir
+    // Parameter type emitted as `&mut [i32]`
+    !emitrust.mut_ref<!emitrust.slice<i32>>
+    ```
+  }];
+
+  let parameters = (ins "Type":$element_type);
+  let builders = [
+    TypeBuilderWithInferredContext<(ins "Type":$element_type), [{
+      return $_get(element_type.getContext(), element_type);
+    }]>
+  ];
+  let assemblyFormat = "`<` qualified($element_type) `>`";
+  let genVerifyDecl = 1;
+}
+
+def EmitRust_FnPtrType : EmitRust_Type<"FnPtr", "fn_ptr"> {
+  let summary = "EmitRust nullable function pointer type";
+
+  let description = [{
+    A nullable function pointer, emitted as the Rust type
+    `Option<fn(A, B) -> R>`. The C null pointer maps to `None` and a
+    function reference to `Some(name)`, so the type is `Copy`, `PartialEq`,
+    and `Default` (`None`), making it a legal struct field, global,
+    variable, parameter, and result without any sentinel value.
+
+    The assembly syntax always parenthesizes the parameter list; the
+    `-> R` result clause is present if and only if the function returns a
+    value (the void spelling omits it entirely):
+
+    ```mlir
+    !emitrust.fn_ptr<(i32, i32) -> i32>  // fn(i32, i32) -> i32
+    !emitrust.fn_ptr<() -> i32>          // zero parameters
+    !emitrust.fn_ptr<(i32)>              // void result
+    !emitrust.fn_ptr<()>                 // zero parameters, void result
+    ```
+
+    Component (parameter and result) types are restricted to the
+    emitter-supported scalars (i1, i8/i16/i32/i64, u8/u16/u32/u64, index,
+    f32, f64), `!emitrust.struct`, `!emitrust.enum`, and nested
+    `!emitrust.fn_ptr`; pointers, references, lvalues, and arrays are
+    rejected.
+  }];
+
+  let parameters = (ins ArrayRefParameter<"Type">:$inputs,
+                        ArrayRefParameter<"Type">:$results);
+
+  let extraClassDeclaration = [{
+    /// Returns whether `type` may be used as a fn_ptr parameter or result
+    /// type: an emitter-supported scalar (i1, i8/i16/i32/i64 signless,
+    /// u8/u16/u32/u64, index, f32, f64), an EmitRust struct or enum, or a
+    /// nested fn_ptr. References, lvalues, arrays, and opaque types are
+    /// rejected.
+    static bool isValidComponentType(Type type);
   }];
 
   let genVerifyDecl = 1;

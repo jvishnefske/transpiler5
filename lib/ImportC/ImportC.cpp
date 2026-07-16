@@ -25,6 +25,69 @@
 ///    such place use `emitrust.load`/`emitrust.assign`. A scalar local whose
 ///    address is taken is kept as an `emitrust.variable` so the reference
 ///    stays valid in the generated Rust.
+///  - Intra-function pointer locals never materialize as pointer values.
+///    A Steensgaard-style union-find pre-pass (`PointerRegionAnalysis`)
+///    resolves every local pointer variable to a single base object; the
+///    pointer decomposes into that base plus an i64 element cursor held in
+///    an ordinary rank-0 `memref<i64>` cell, which `--mem2reg` promotes
+///    exactly like an int local. Dereference and subscript become
+///    `emitrust.subscript(base, cursor)` (the address of a scalar has no
+///    cursor and resolves to the scalar's own place), pointer arithmetic
+///    becomes i64 cursor arithmetic, and same-object pointer difference and
+///    comparison become plain i64 `arith` ops (C's ptrdiff_t is `long` on
+///    the supported targets). Pointers whose address is taken, that rebind
+///    across distinct objects, hold a null constant, or point into globals
+///    or string literals are rejected with located diagnostics.
+///  - Pointer parameters are classified per definition (Phase 1b): a
+///    parameter that is only dereferenced or arrowed stays a scalar
+///    reference `!emitrust.mut_ref<T>`; a parameter that is subscripted,
+///    walked, compared, differenced, reassigned, or passed onward becomes a
+///    slice reference `!emitrust.mut_ref<!emitrust.slice<T>>`, dereferenced
+///    once in the entry block into the `!emitrust.lvalue<slice>` base place
+///    of an ordinary (base, cursor) decomposition. Array parameters decay
+///    to pointers in C and classify the same way. At call sites every value
+///    argument is materialized before any borrow-producing argument (C
+///    leaves the order unspecified; this keeps loads out of the borrow/call
+///    window), a slice argument reslices its region base with
+///    `emitrust.slice_of`, a scalar-reference argument borrows the
+///    designated element with `emitrust.addr_of`, and two borrow arguments
+///    resolving to the same region base are rejected (Rust aliasing).
+///  - Function pointers are ordinary `Copy` values of `!emitrust.fn_ptr`
+///    type (rendered `Option<fn(...)>`), never decomposed by the pointer
+///    region analysis: a function reference (`f`, `&f`) becomes an
+///    `emitrust.constant` with an opaque `Some(name)` payload after the
+///    referenced function's signature is checked against the pointer type,
+///    the null pointer constant becomes `None`, indirect calls become
+///    `emitrust.call_indirect` (argument/result types checked like direct
+///    calls), and truth tests and `==`/`!=` compare against a `None`
+///    constant with `emitrust.cmp`. Variadic targets, unimported targets,
+///    signature mismatches, argument-carrying calls through prototype-less
+///    pointers, and fn_ptr component types outside the verifier set are
+///    located rejections.
+///  - Owner structs / active objects (Phase 4): the per-TU import is
+///    two-pass. Pass A (`planOwners`) is a pure AST analysis run before any
+///    IR is built: per-function pointer regions are unified across call
+///    sites (each pointer argument's root object with the callee
+///    definition's parameter), and a class that resolves to exactly one
+///    non-escaping local array of at most 32 elements (the struct_def
+///    `Default` derive MVP limit), crosses at least one function boundary,
+///    and whose unified functions are all defined — with every call site
+///    visible — in this translation unit is promoted. The base variable
+///    becomes a module-level `emitrust.struct_def @Owner_<fn>_<base>
+///    ["data"]` owner struct, and each unified function becomes a method:
+///    its signature trades every pointer parameter for an i64 element index
+///    behind a leading `!emitrust.mut_ref<!emitrust.struct<...>>` receiver,
+///    its `func.func` carries the `emitrust.method_of` attribute, and its
+///    body decomposes each index parameter against the receiver's
+///    `deref(arg0) -> member("data")` place with the ordinary cursor
+///    machinery. Call sites lower pointer arguments to their i64 cursors
+///    and borrow the owner place for exactly one `emitrust.method_call`-
+///    tagged `func.call`, which `convert-func-to-emitrust` rewrites into an
+///    `emitrust.method_call` on the place (no borrow survives). Any failed
+///    promotion condition falls back silently to the Phase-1b slice
+///    lowering; interprocedural multi-base classes are not errors. Pass B
+///    is the historical import, consulting the plans in `importFunction`,
+///    `emitLocalVar`, and `emitCall`.
 ///  - Complete named enums become module-level `emitrust.enum_def`
 ///    definitions; enum-typed values are opaque `!emitrust.enum` values held
 ///    in `emitrust.variable` places, and enumerator references become
@@ -167,6 +230,165 @@ static bool isRustKeyword(llvm::StringRef name) {
   return keywords.contains(name);
 }
 
+/// A pointer expression decomposed into its statically resolved base object
+/// and an i64 element cursor value. `cursor` is null for a degenerate base
+/// (the address of a scalar or struct object taken with `&x`), which
+/// supports dereference but carries no element offset and hence no pointer
+/// arithmetic.
+struct PtrExprValue {
+  /// The object the pointer points into (a local scalar, struct, or array).
+  const clang::VarDecl *base;
+  /// The i64 element offset from the start of `base`; null when degenerate.
+  Value cursor;
+};
+
+/// Phase-1b classification of one pointer parameter, derived from the
+/// function definition's body. `ScalarRef` parameters are only dereferenced
+/// (`*p`) or arrowed (`p->f`), or are unused, and stay plain
+/// `!emitrust.mut_ref<T>` references (the historical behavior). `Slice`
+/// parameters are subscripted, walked, compared, differenced, reassigned,
+/// copied into a pointer local, or passed onward, and become
+/// `!emitrust.mut_ref<!emitrust.slice<T>>` region bases.
+enum class ParamKind { ScalarRef, Slice };
+
+/// The decomposition record of one accepted pointer local (or, in Phase 1b,
+/// one slice-classified pointer parameter): the single base object of its
+/// region and this pointer's rank-0 `memref<i64>` cursor cell.
+/// The cell is null when the base is degenerate (a scalar object with no
+/// element offset to track); such a pointer needs no runtime state at all.
+/// A slice parameter is its own base, with its cursor initialized to zero.
+struct PointerLocalInfo {
+  /// The object every value of this pointer points into.
+  const clang::VarDecl *base;
+  /// Entry-block `memref<i64>` cell holding the element cursor, or null.
+  Value cursorCell;
+};
+
+/// One base binding of a pointer region: the object some pointer in the
+/// region was made to point into, and the source location of the assignment
+/// (or initializer) that bound it. The multi-base diagnostic names the
+/// first two bindings.
+struct PointerBaseBinding {
+  /// The bound object.
+  const clang::VarDecl *base;
+  /// Where the binding was established.
+  clang::SourceLocation loc;
+};
+
+/// The Phase-4 owner-promotion plan of one local array base variable: the
+/// variable becomes a module-level owner struct holding the array in its
+/// single "data" field, and every function whose pointer parameters resolve
+/// into the variable's region becomes a `&mut self` method of that struct
+/// (recorded separately in the method-plan map).
+struct OwnerPlan {
+  /// The owner struct's module-level symbol name
+  /// (`Owner_<function>_<base>`, TU-tag-mangled for internal-linkage
+  /// owning functions so identically named statics in different TUs stay
+  /// distinct).
+  std::string structName;
+  /// Whether the module-level `emitrust.struct_def` has been created; it
+  /// is synthesized on first need, at the owning declaration.
+  bool structDefCreated = false;
+};
+
+/// The Phase-1a facts about one pointer ownership region: the distinct
+/// objects its pointers are bound to, whether any pointer arithmetic occurs
+/// (which a degenerate scalar base cannot support), and the first construct
+/// (if any) that puts the region outside the decomposition (escape, null
+/// constant, non-address source, global target, ...).
+struct PointerRegion {
+  /// Distinct base objects, each with its first binding location.
+  SmallVector<PointerBaseBinding, 2> bases;
+  /// True when any pointer in the region is walked (`p+n`, `++`, `+=`).
+  bool hasArithmetic = false;
+  /// First pointer-arithmetic site; meaningful only with `hasArithmetic`.
+  clang::SourceLocation arithmeticLoc;
+  /// First invalidating construct; meaningful only with `invalidReason`.
+  clang::SourceLocation invalidLoc;
+  /// Diagnostic text of the invalidating construct; empty when the region
+  /// is decomposable.
+  std::string invalidReason;
+};
+
+/// Steensgaard-style union-find pre-pass that groups the pointer locals of
+/// one function body into ownership regions (Phase 1a of pointer support).
+/// One AST walk (in the style of `collectAddressTaken`) unions pointers on
+/// assignment (`p = q`), binds base objects from `&x`, `&arr[i]`,
+/// array-to-pointer decay, and slice-classified pointer parameters (Phase
+/// 1b: `p = param` makes the parameter the region base), flags pointer
+/// arithmetic, and records the first construct that makes a region
+/// undecomposable (taking a pointer's address, null constants, non-address
+/// sources, global or string-literal targets). Base objects participate in
+/// the union-find alongside the pointers so that two pointers into the same
+/// object always share a region. The importer validates each pointer local
+/// against its region at the declaration; a region is consumable only when
+/// it is single-base and never invalidated. The per-region output is the
+/// deliberate seam for the later owner-struct codegen phases.
+class PointerRegionAnalysis {
+public:
+  /// Analyzes `body`, replacing any previous analysis state. `context` is
+  /// borrowed for the duration of the walk (null-constant classification).
+  void analyze(clang::ASTContext &astContext, const clang::Stmt *body);
+
+  /// Returns whether `var` is a pointer local tracked by this analysis.
+  bool tracks(const clang::VarDecl *var) const {
+    return pointerVars.contains(var);
+  }
+
+  /// Returns the region of the tracked pointer `var`, or null when the
+  /// pointer was never bound, unioned, or invalidated (an unused pointer).
+  const PointerRegion *regionOf(const clang::VarDecl *var);
+
+  /// Returns every pointer-typed local variable the analysis tracks; the
+  /// Phase-4 owner-planning pre-pass iterates these to project each
+  /// per-function region into the interprocedural union-find.
+  const llvm::SmallPtrSetImpl<const clang::VarDecl *> &trackedVars() const {
+    return pointerVars;
+  }
+
+private:
+  /// Recursive statement walk collecting pointer declarations, writes,
+  /// arithmetic, escapes, and call-argument uses.
+  void visit(const clang::Stmt *stmt);
+
+  /// Classifies the right-hand side `rhs` of `ptr = rhs` (or of `ptr`'s
+  /// initializer): unions pointer-to-pointer copies, binds bases from
+  /// address expressions, flags arithmetic on `p +- n` forms, and marks the
+  /// region invalid for everything else.
+  void recordPointerWrite(const clang::VarDecl *ptr, const clang::Expr *rhs);
+
+  /// Binds `base` into `ptr`'s region at `loc` (rejecting global-storage
+  /// bases) and unions the two declarations.
+  void addBase(const clang::VarDecl *ptr, const clang::VarDecl *base,
+               clang::SourceLocation loc);
+
+  /// Flags `ptr`'s region as performing pointer arithmetic at `loc`.
+  void recordArithmetic(const clang::VarDecl *ptr, clang::SourceLocation loc);
+
+  /// Marks `ptr`'s region undecomposable with diagnostic `reason` at `loc`;
+  /// only the first invalidation of a region is kept.
+  void markInvalid(const clang::VarDecl *ptr, clang::SourceLocation loc,
+                   llvm::StringRef reason);
+
+  /// Returns the union-find root of `decl`, inserting it on first use.
+  const clang::VarDecl *findRoot(const clang::VarDecl *decl);
+
+  /// Unions the regions of `a` and `b`, merging their recorded facts.
+  void unite(const clang::VarDecl *a, const clang::VarDecl *b);
+
+  /// Returns the (created on demand) region of `decl`'s current root.
+  PointerRegion &regionFor(const clang::VarDecl *decl);
+
+  /// The AST context of the function under analysis; borrowed.
+  clang::ASTContext *context = nullptr;
+  /// Union-find parent links over pointer and base declarations.
+  llvm::DenseMap<const clang::VarDecl *, const clang::VarDecl *> parent;
+  /// Region facts keyed by each set's current root.
+  llvm::DenseMap<const clang::VarDecl *, PointerRegion> regions;
+  /// Every pointer-typed local variable declared in the walked body.
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> pointerVars;
+};
+
 /// Translates the clang AST of one C translation unit into an MLIR module.
 ///
 /// The importer owns an `OpBuilder` positioned inside the function currently
@@ -192,9 +414,14 @@ public:
   /// distinct; it is empty for a single-TU import (bare names, historical
   /// behavior). `deferExtern` controls whether an `extern`-only global with no
   /// definition in this TU is an immediate error (single-file) or deferred for
-  /// cross-TU resolution (project). Repeated calls accumulate into one module.
+  /// cross-TU resolution (project). `soleTranslationUnit` states that this TU
+  /// is the whole program, which lets the Phase-4 owner planning promote
+  /// externally visible functions to methods (all their call sites are
+  /// provably in this TU); in a multi-TU project only internal-linkage
+  /// functions qualify. Repeated calls accumulate into one module.
   LogicalResult importTranslationUnit(clang::ASTContext &context,
-                                      llvm::StringRef tuTag, bool deferExtern);
+                                      llvm::StringRef tuTag, bool deferExtern,
+                                      bool soleTranslationUnit);
 
   /// After every translation unit has been imported, checks that no external
   /// symbol was left unresolved: every deferred `extern` global must have a
@@ -219,14 +446,63 @@ private:
   /// signless ones, so that they render as Rust `uN`), float->f32,
   /// double->f64, `struct S`->`!emitrust.struct<"S">`,
   /// `T[N]`->`!emitrust.array<NxT>`, complete named
-  /// `enum E`->`!emitrust.enum<"E">`. Typedefs resolve through the
-  /// canonical type. Pointers, unions, anonymous enums, and everything
-  /// else produce a located diagnostic.
+  /// `enum E`->`!emitrust.enum<"E">`, and function pointers
+  /// `R (*)(A, B)`->`!emitrust.fn_ptr<(A, B) -> R>` (prototype-less K&R
+  /// pointers map to the zero-parameter form). Typedefs resolve through the
+  /// canonical type. Data pointers, unions, anonymous enums, variadic
+  /// function pointers, fn_ptr component types outside the verifier set,
+  /// and everything else produce a located diagnostic.
   FailureOr<Type> mapType(clang::QualType type, Location loc);
 
-  /// Maps a C function-parameter type: pointer parameters `T*` become
-  /// `!emitrust.mut_ref<T>`, everything else maps like `mapType`.
-  FailureOr<Type> mapParamType(clang::QualType type, Location loc);
+  /// Maps a C function-parameter type: data-pointer parameters `T*` become
+  /// `!emitrust.mut_ref<T>` for `ParamKind::ScalarRef` and
+  /// `!emitrust.mut_ref<!emitrust.slice<T>>` for `ParamKind::Slice`
+  /// (array parameters have already decayed to pointers in clang);
+  /// function-pointer parameters stay by-value `!emitrust.fn_ptr` values;
+  /// everything else maps like `mapType` and ignores `kind`.
+  FailureOr<Type> mapParamType(clang::QualType type, Location loc,
+                               ParamKind kind);
+
+  /// Returns the Phase-1b classification of every parameter of `func`
+  /// (non-pointer parameters report `ScalarRef`, which is ignored). Kinds
+  /// derive from the definition's body via `collectSliceParams`; a function
+  /// with no definition in the merged ASTs classifies every pointer
+  /// parameter as `ScalarRef` (the cross-TU assumption checked at
+  /// definition-time signature refinement in `importFunction`). Results are
+  /// cached per canonical declaration.
+  ArrayRef<ParamKind> classifyPointerParams(const clang::FunctionDecl *func);
+
+  //===--------------------------------------------------------------------===//
+  // Owner planning (Phase-4 Pass A)
+  //===--------------------------------------------------------------------===//
+
+  /// Pure-AST interprocedural pre-pass over every function definition of
+  /// the translation unit (no IR is built). Runs the per-function
+  /// `PointerRegionAnalysis` on each body, unifies each pointer call
+  /// argument's root object with the callee definition's parameter in a
+  /// program-wide union-find, and promotes every class that satisfies ALL
+  /// of: single storage base; base is a local array of 1..32 elements whose
+  /// element type equals every unified parameter's pointee; at least one
+  /// unified parameter (the region crosses a function boundary); every
+  /// unified function is defined in this TU, has a value (non-pointer)
+  /// return type, is not the owner or C `main`, resolves ALL of its own
+  /// data-pointer parameters into this one class, and — unless this TU is
+  /// the whole program — has internal linkage (so no unseen TU can call
+  /// it). Qualified classes populate `ownerPlans` and `methodPlans`; every
+  /// disqualification is a silent fallback to the Phase-1b slice lowering.
+  /// Regions cannot cross translation units (the base is a local), so the
+  /// pass runs independently per TU in a project import.
+  void planOwners(const clang::TranslationUnitDecl *unit,
+                  bool soleTranslationUnit);
+
+  /// Side-effect-free AST mirror of `emitPointerRValue`'s base resolution:
+  /// returns the single object a pointer-typed call argument points into (a
+  /// local array or scalar, or a pointer parameter of the calling
+  /// function), or null when no single root is statically known. `regions`
+  /// is the calling function's per-body analysis, consulted for pointer
+  /// locals.
+  const clang::VarDecl *resolveArgRoot(PointerRegionAnalysis &regions,
+                                       const clang::Expr *expr) const;
 
   //===--------------------------------------------------------------------===//
   // Declarations
@@ -256,8 +532,42 @@ private:
 
   /// Records every local variable whose address is taken with `&x` inside
   /// `stmt`; such scalars become `emitrust.variable` places instead of
-  /// promotable memref cells.
+  /// promotable memref cells. This also covers the degenerate bases of the
+  /// pointer decomposition (`int *p = &x` marks `x`); array and struct
+  /// bases are `emitrust.variable` places regardless.
   void collectAddressTaken(const clang::Stmt *stmt);
+
+  /// Emits an owner-promoted local array (Phase 4): synthesizes the
+  /// module-level `emitrust.struct_def @Owner_... ["data"]` on first need
+  /// (a symbol collision is a located rejection, mirroring `createGlobal`),
+  /// declares the owner as an `emitrust.variable` of the struct type
+  /// (rendered `Owner::default()`), and registers the `member("data")`
+  /// place as the variable's symbol so that every direct access — and every
+  /// decomposed pointer whose region base it is — rewrites to the struct's
+  /// array field. The owner struct place itself is recorded separately for
+  /// method-call receivers and is never loaded whole.
+  LogicalResult emitOwnerLocal(const clang::VarDecl *var, Location loc);
+
+  /// Validates a pointer-typed local variable against its
+  /// `PointerRegionAnalysis` region and, when the region is decomposable
+  /// (single local base, no escapes, no arithmetic on a scalar base),
+  /// registers its decomposition: an entry-block `memref<i64>` cursor cell
+  /// for an array base, or no runtime state at all for a degenerate scalar
+  /// or struct base. Undecomposable regions produce located diagnostics at
+  /// the offending construct.
+  LogicalResult emitPointerLocal(const clang::VarDecl *var, Location loc);
+
+  /// Emits `ptr = rhs` for a decomposed pointer local by recomputing and
+  /// storing its cursor; a degenerate binding (`p = &x`) needs no code at
+  /// all because the target place is statically known.
+  LogicalResult storePointerAssign(Location loc, const clang::VarDecl *ptr,
+                                   const clang::Expr *rhs);
+
+  /// Emits `p += n` / `p -= n` on a decomposed pointer local as cursor
+  /// arithmetic: load the i64 cursor cell, add or subtract the widened
+  /// amount, and store the cursor back.
+  LogicalResult
+  emitPointerCompoundAssign(const clang::CompoundAssignOperator *op);
 
   /// Imports a file-scope variable as a module-level `emitrust.global`.
   /// Redeclarations are reconciled the way C does: the definition (or a
@@ -286,9 +596,10 @@ private:
 
   /// Evaluates `decl`'s initializer as a constant (clang APValue
   /// evaluation) and converts it to a typed attribute of `type`. Supports
-  /// integer (including `_Bool` and char) and floating-point constants;
-  /// aggregate initializer lists and non-constant expressions are rejected
-  /// with located diagnostics.
+  /// integer (including `_Bool` and char) and floating-point constants,
+  /// plus function-pointer initializers as opaque `None`/`Some(name)`
+  /// attributes; aggregate initializer lists and non-constant expressions
+  /// are rejected with located diagnostics.
   FailureOr<Attribute> convertGlobalInit(const clang::VarDecl *decl,
                                          Type type, Location loc);
 
@@ -359,8 +670,11 @@ private:
 
   /// Emits a local variable declaration. Signed scalars become entry-block
   /// memref cells (initializer stored at the declaration point);
-  /// aggregates, enums, unsigned scalars, and address-taken scalars become
-  /// `emitrust.variable` places. Function-local statics become module-level
+  /// aggregates, enums, function pointers, unsigned scalars, and
+  /// address-taken scalars become `emitrust.variable` places. Data-pointer
+  /// locals are decomposed through `emitPointerLocal`; function-pointer
+  /// locals are ordinary values and bypass the decomposition entirely.
+  /// Function-local statics become module-level
   /// `emitrust.global`s mangled as `<function>_<name>`; extern locals are
   /// rejected.
   LogicalResult emitLocalVar(const clang::VarDecl *var);
@@ -490,7 +804,76 @@ private:
 
   /// Emits a call expression; returns a null `Value` for void results.
   /// printf reaching this path (i.e. with its result used) is rejected.
+  /// Every value argument is materialized before any borrow-producing
+  /// argument (C's evaluation order is unspecified; this keeps loads out of
+  /// the borrow/call window), and two borrow arguments resolving to the
+  /// same region base are rejected as aliasing mutable borrows.
+  /// Calls without a direct callee are routed to `emitIndirectCall`.
   FailureOr<Value> emitCall(const clang::CallExpr *call);
+
+  /// Emits a call to a method-planned function (Phase 4). Every argument
+  /// is a plain value — a pointer argument lowers to its i64 element cursor
+  /// (a constant for `&arr[i]` and decayed arrays, the loaded cursor for
+  /// walking pointers) — so the receiver borrow (`addr_of mut` of the owner
+  /// place: the owner struct variable in the owning function, or the
+  /// dereferenced receiver in a sibling method) is the only reference and
+  /// is materialized last, immediately before the call. The `func.call` is
+  /// tagged `emitrust.method_call` for the conversion-layer rewrite into an
+  /// `emitrust.method_call` place expression.
+  FailureOr<Value> emitMethodCallSite(const clang::CallExpr *call,
+                                      func::FuncOp target,
+                                      const clang::VarDecl *ownerBase,
+                                      Location loc);
+
+  /// Lowers one borrow-producing call argument against the reference-typed
+  /// target parameter `paramType`. A slice parameter receives an
+  /// `emitrust.slice_of` of the argument's region base at the argument's
+  /// cursor (a decayed array passes cursor 0; reslicing through another
+  /// slice parameter composes); a scalar-reference parameter receives an
+  /// `emitrust.addr_of` of the designated element, or of the named place
+  /// for plain address-of arguments that involve no decomposed pointer.
+  /// `root` receives the argument's region base declaration when one is
+  /// statically known (feeding the aliasing rejection in `emitCall`).
+  FailureOr<Value> emitBorrowArgument(Location loc,
+                                      const clang::Expr *argument,
+                                      Type paramType,
+                                      const clang::VarDecl *&root);
+
+  /// Returns whether any declaration reference below `stmt` names a
+  /// decomposed pointer (a pointer local or slice parameter registered in
+  /// `pointerLocals`), in which case a borrow-producing call argument must
+  /// be lowered through the pointer decomposition.
+  bool involvesDecomposedPointer(const clang::Stmt *stmt) const;
+
+  /// Emits a call through a function pointer (`fp(...)`, `(*fp)(...)`,
+  /// `v.op(...)`) as an `emitrust.call_indirect`: the callee expression is
+  /// evaluated to its `!emitrust.fn_ptr` value (a deref of a function
+  /// pointer cancels against the implicit decay) and the argument and
+  /// result types are checked against the pointer's signature exactly like
+  /// a direct call. Calls with arguments through a prototype-less K&R
+  /// pointer are rejected: there is no signature to check them against.
+  FailureOr<Value> emitIndirectCall(const clang::CallExpr *call);
+
+  /// Resolves a function reference used as a function pointer value: the
+  /// expression must be a direct reference to an imported, non-variadic
+  /// function whose signature equals `fnPtrType` (functions with
+  /// data-pointer parameters can never match). Returns the function's MLIR
+  /// symbol name (`c_main` and per-TU static mangling included); every
+  /// violation is a located rejection.
+  FailureOr<std::string>
+  resolveFunctionPointerTarget(const clang::Expr *expr,
+                               emitrust::FnPtrType fnPtrType, Location loc);
+
+  /// Emits `f` (function-to-pointer decay) or `&f` as an
+  /// `emitrust.constant` with an opaque `Some(<symbol>)` payload of the
+  /// `!emitrust.fn_ptr` type mapped from the C pointer type `pointerType`.
+  FailureOr<Value> emitFunctionPointerConstant(const clang::Expr *fnExpr,
+                                               clang::QualType pointerType,
+                                               Location loc);
+
+  /// Creates an `emitrust.constant` with an opaque `None` payload of the
+  /// given `!emitrust.fn_ptr` type (the C null function pointer).
+  Value createFnPtrNone(Location loc, Type fnPtrType);
 
   /// Emits a reference to an enumerator: for a complete named enum, an
   /// `emitrust.constant` with an opaque `Name::Variant` payload typed
@@ -506,6 +889,32 @@ private:
   /// Builds an `emitrust.cast` from an `!emitrust.enum` value to i32 (the
   /// representation type of every imported enum).
   Value castEnumToI32(Location loc, Value value);
+
+  /// Emits a pointer-typed expression in the decomposed representation:
+  /// reads of pointer locals load their cursor cell, `&x` yields the
+  /// degenerate (cursor-less) form, `&arr[i]` and array decay yield the
+  /// base with an i64 cursor, `p +- n` is cursor arithmetic, and the
+  /// `++`/`--` value forms update the cursor cell and yield the pre- or
+  /// post-value per C semantics. Null pointer constants, string literals,
+  /// globals, and every other pointer source are located rejections.
+  FailureOr<PtrExprValue> emitPointerRValue(const clang::Expr *expr);
+
+  /// Materializes the place a decomposed pointer designates: the base
+  /// object's own place for a degenerate pointer, or
+  /// `emitrust.subscript(base, cursor)` for a pointer into an array.
+  FailureOr<Value> emitPointerPlace(Location loc,
+                                    const PtrExprValue &pointer);
+
+  /// Emits `p - q` on two decomposed pointers into the same object as the
+  /// plain i64 cursor difference (C's ptrdiff_t is `long`, i.e. i64, on
+  /// the supported targets); pointers into different objects are rejected.
+  FailureOr<Value> emitPointerDifference(const clang::BinaryOperator *op);
+
+  /// Returns whether the pointer-typed expression `expr` is handled by the
+  /// Phase-1a decomposition (pointer locals, address-of, decay, pointer
+  /// arithmetic) rather than by the untouched pointer-parameter reference
+  /// path (a direct read of a `mut_ref`/`ref`-typed parameter).
+  bool isDecomposedPointerExpr(const clang::Expr *expr) const;
 
   /// Emits an expression as an assignable place: either a rank-0 memref
   /// value (scalar locals) or an `!emitrust.lvalue` value (aggregates,
@@ -586,6 +995,33 @@ private:
   llvm::DenseMap<const clang::ValueDecl *, Value> symbols;
   /// Per-function set of locals whose address is taken.
   llvm::SmallPtrSet<const clang::VarDecl *, 8> addressTaken;
+  /// Per-function pointer region analysis (Phase-1a decomposition).
+  PointerRegionAnalysis pointerRegions;
+  /// Per-function decomposition of each accepted pointer local and each
+  /// slice-classified pointer parameter, keyed by its declaration.
+  llvm::DenseMap<const clang::VarDecl *, PointerLocalInfo> pointerLocals;
+  /// Cached Phase-1b parameter classifications, keyed by the function's
+  /// canonical declaration (persists across the whole import; each TU's
+  /// declarations are distinct clang decls, so entries never conflict).
+  llvm::DenseMap<const clang::FunctionDecl *, SmallVector<ParamKind, 4>>
+      paramKindsCache;
+  /// Phase-4 owner plans keyed by the promoted base variable declaration
+  /// (accumulates across TUs; each TU's declarations are distinct).
+  llvm::DenseMap<const clang::VarDecl *, OwnerPlan> ownerPlans;
+  /// Phase-4 method plans: the canonical declaration of every function that
+  /// becomes an owner method, mapped to its owner's base variable.
+  llvm::DenseMap<const clang::FunctionDecl *, const clang::VarDecl *>
+      methodPlans;
+  /// Per-function owner struct places (populated in the owning function
+  /// only), keyed by the promoted base variable; feeds method-call
+  /// receivers. The struct place is only ever borrowed, never loaded.
+  llvm::DenseMap<const clang::VarDecl *, Value> ownerStructPlaces;
+  /// The `deref(arg0)` receiver place while importing a method body; null
+  /// otherwise. Sibling method calls borrow it (rendering `(*self).m(...)`).
+  Value currentReceiverPlace;
+  /// The owner base variable of the method currently being imported; null
+  /// when the current function is not a method.
+  const clang::VarDecl *currentMethodOwner = nullptr;
   /// Struct definitions already imported (keyed on the defining decl).
   llvm::SmallPtrSet<const clang::RecordDecl *, 8> importedRecords;
   /// Enum definitions already imported (keyed on the defining decl).
@@ -705,6 +1141,393 @@ static bool isUnsignedInt(Type type) {
   return intType && intType.isUnsigned();
 }
 
+/// Returns whether the canonical type of `type` is a C pointer type.
+static bool isPointerType(clang::QualType type) {
+  return type.getCanonicalType()->isPointerType();
+}
+
+/// Returns whether the canonical type of `type` is a C function pointer.
+/// Function pointers are ordinary `!emitrust.fn_ptr` values and take none
+/// of the data-pointer (decomposition or reference-parameter) paths.
+static bool isFunctionPointer(clang::QualType type) {
+  return type.getCanonicalType()->isFunctionPointerType();
+}
+
+/// Returns the local, non-parameter variable a stripped declaration
+/// reference `expr` names, or null when `expr` is not such a reference.
+static const clang::VarDecl *asLocalVarRef(const clang::Expr *expr) {
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(expr));
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var || !var->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(var))
+    return nullptr;
+  return var;
+}
+
+/// Returns the local variable or parameter a stripped declaration
+/// reference `expr` names, or null when `expr` is not such a reference.
+/// Used by the pointer choke points that accept both decomposed pointer
+/// locals and slice-classified pointer parameters.
+static const clang::VarDecl *asVarRef(const clang::Expr *expr) {
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(expr));
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var || !var->hasLocalStorage())
+    return nullptr;
+  return var;
+}
+
+/// Returns the pointer-typed parameter a stripped (possibly
+/// lvalue-to-rvalue-wrapped) declaration reference `expr` names, or null
+/// when `expr` is not such a reference.
+static const clang::ParmVarDecl *asPointerParamRef(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_LValueToRValue ||
+        cast->getCastKind() == clang::CK_NoOp)
+      e = stripTrivia(cast->getSubExpr());
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  if (!ref)
+    return nullptr;
+  const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl());
+  if (!param || !isPointerType(param->getType()))
+    return nullptr;
+  return param;
+}
+
+/// Recursive walk of `classifyPointerParams`: collects every pointer
+/// parameter whose use demands the whole element run. A direct dereference
+/// (`*p`) or arrow (`p->f`) is benign and keeps the parameter a scalar
+/// reference; any other appearance of a pointer parameter (subscript,
+/// arithmetic, comparison, difference, reassignment, copy into a pointer
+/// local, address-of, call argument) inserts it into `sliceParams`.
+static void collectSliceParams(
+    const clang::Stmt *stmt,
+    llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &sliceParams) {
+  if (!stmt)
+    return;
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt))
+    if (unary->getOpcode() == clang::UO_Deref &&
+        asPointerParamRef(unary->getSubExpr()))
+      return; // Benign direct dereference; do not descend into the read.
+  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(stmt))
+    if (member->isArrow() && asPointerParamRef(member->getBase()))
+      return; // Benign arrow access; the base has no other children.
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (const auto *param =
+            llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()))
+      if (isPointerType(param->getType()))
+        sliceParams.insert(param);
+  for (const clang::Stmt *child : stmt->children())
+    collectSliceParams(child, sliceParams);
+}
+
+/// Returns the local variable at the root of an address-of call argument
+/// (`&x`, `&s.f`, `&arr[i]`), or null when no single local root is known.
+/// Feeds the same-base aliasing rejection of `emitCall`.
+static const clang::VarDecl *addressArgumentRoot(const clang::Expr *expr) {
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
+  if (!unary || unary->getOpcode() != clang::UO_AddrOf)
+    return nullptr;
+  const clang::Expr *place = stripTrivia(unary->getSubExpr());
+  while (true) {
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(place)) {
+      if (member->isArrow())
+        return nullptr;
+      place = stripTrivia(member->getBase());
+      continue;
+    }
+    if (const auto *subscript =
+            llvm::dyn_cast<clang::ArraySubscriptExpr>(place)) {
+      place = subscript->getBase()->IgnoreParenImpCasts();
+      continue;
+    }
+    break;
+  }
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(place))
+    return llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  return nullptr;
+}
+
+//===----------------------------------------------------------------------===//
+// PointerRegionAnalysis
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+void PointerRegionAnalysis::analyze(clang::ASTContext &astContext,
+                                    const clang::Stmt *body) {
+  context = &astContext;
+  parent.clear();
+  regions.clear();
+  pointerVars.clear();
+  visit(body);
+  context = nullptr;
+}
+
+const PointerRegion *PointerRegionAnalysis::regionOf(const clang::VarDecl *var) {
+  if (!pointerVars.contains(var))
+    return nullptr;
+  auto it = regions.find(findRoot(var));
+  return it == regions.end() ? nullptr : &it->second;
+}
+
+const clang::VarDecl *
+PointerRegionAnalysis::findRoot(const clang::VarDecl *decl) {
+  auto [it, inserted] = parent.try_emplace(decl, decl);
+  if (inserted)
+    return decl;
+  // Iterative find with full path compression. The chains are tiny (a
+  // handful of pointers per function), so this is bounded in practice.
+  const clang::VarDecl *root = decl;
+  while (parent[root] != root)
+    root = parent[root];
+  while (parent[decl] != root) {
+    const clang::VarDecl *next = parent[decl];
+    parent[decl] = root;
+    decl = next;
+  }
+  return root;
+}
+
+void PointerRegionAnalysis::unite(const clang::VarDecl *a,
+                                  const clang::VarDecl *b) {
+  const clang::VarDecl *rootA = findRoot(a);
+  const clang::VarDecl *rootB = findRoot(b);
+  if (rootA == rootB)
+    return;
+  parent[rootB] = rootA;
+  auto itB = regions.find(rootB);
+  if (itB == regions.end())
+    return;
+  // Merge the absorbed root's facts into the surviving root's region.
+  PointerRegion absorbed = std::move(itB->second);
+  regions.erase(itB);
+  PointerRegion &target = regions[rootA];
+  for (const PointerBaseBinding &binding : absorbed.bases) {
+    bool known = llvm::any_of(target.bases,
+                              [&](const PointerBaseBinding &existing) {
+                                return existing.base == binding.base;
+                              });
+    if (!known)
+      target.bases.push_back(binding);
+  }
+  if (absorbed.hasArithmetic && !target.hasArithmetic) {
+    target.hasArithmetic = true;
+    target.arithmeticLoc = absorbed.arithmeticLoc;
+  }
+  if (!absorbed.invalidReason.empty() && target.invalidReason.empty()) {
+    target.invalidReason = std::move(absorbed.invalidReason);
+    target.invalidLoc = absorbed.invalidLoc;
+  }
+}
+
+PointerRegion &PointerRegionAnalysis::regionFor(const clang::VarDecl *decl) {
+  return regions[findRoot(decl)];
+}
+
+void PointerRegionAnalysis::addBase(const clang::VarDecl *ptr,
+                                    const clang::VarDecl *base,
+                                    clang::SourceLocation loc) {
+  if (!base->hasLocalStorage())
+    return markInvalid(ptr, loc, "unsupported: pointer into a global variable");
+  unite(ptr, base);
+  PointerRegion &region = regionFor(ptr);
+  bool known = llvm::any_of(region.bases,
+                            [&](const PointerBaseBinding &existing) {
+                              return existing.base == base;
+                            });
+  if (!known)
+    region.bases.push_back(PointerBaseBinding{base, loc});
+}
+
+void PointerRegionAnalysis::recordArithmetic(const clang::VarDecl *ptr,
+                                             clang::SourceLocation loc) {
+  PointerRegion &region = regionFor(ptr);
+  if (!region.hasArithmetic) {
+    region.hasArithmetic = true;
+    region.arithmeticLoc = loc;
+  }
+}
+
+void PointerRegionAnalysis::markInvalid(const clang::VarDecl *ptr,
+                                        clang::SourceLocation loc,
+                                        llvm::StringRef reason) {
+  PointerRegion &region = regionFor(ptr);
+  if (region.invalidReason.empty()) {
+    region.invalidReason = reason.str();
+    region.invalidLoc = loc;
+  }
+}
+
+void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
+                                               const clang::Expr *rhs) {
+  const clang::Expr *e = stripTrivia(rhs);
+  clang::SourceLocation loc = e->getBeginLoc();
+
+  if (e->isNullPointerConstant(*context,
+                               clang::Expr::NPC_NeverValueDependent) !=
+      clang::Expr::NPCK_NotNull)
+    return markInvalid(
+        ptr, loc,
+        "unsupported: null pointer constant assigned to a pointer variable");
+
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    switch (cast->getCastKind()) {
+    case clang::CK_NoOp:
+      return recordPointerWrite(ptr, cast->getSubExpr());
+    case clang::CK_LValueToRValue: {
+      // `p = q`: copying a pointer joins the two into one region.
+      if (const clang::VarDecl *source = asLocalVarRef(cast->getSubExpr()))
+        if (tracks(source))
+          return unite(ptr, source);
+      // `p = param`: a pointer parameter (slice-classified by this very
+      // use) becomes the region base; the local walks the parameter's
+      // element run through its own cursor.
+      if (const clang::ParmVarDecl *param =
+              asPointerParamRef(cast->getSubExpr()))
+        return addBase(ptr, param, loc);
+      break;
+    }
+    case clang::CK_ArrayToPointerDecay: {
+      // `p = arr`: the decayed array is the region base.
+      const clang::Expr *sub = stripTrivia(cast->getSubExpr());
+      if (llvm::isa<clang::StringLiteral>(sub))
+        return markInvalid(ptr, loc,
+                           "unsupported: pointer to a string literal");
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub))
+        if (const auto *array =
+                llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+          return addBase(ptr, array, loc);
+      break;
+    }
+    default:
+      break;
+    }
+    return markInvalid(ptr, loc,
+                       "unsupported: pointer assigned a non-address value");
+  }
+
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e)) {
+    if (unary->getOpcode() == clang::UO_AddrOf) {
+      const clang::Expr *sub = stripTrivia(unary->getSubExpr());
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub)) {
+        if (const auto *target =
+                llvm::dyn_cast<clang::VarDecl>(ref->getDecl())) {
+          // `p = &x`: `x` becomes a (degenerate, for scalars) region base.
+          if (isPointerType(target->getType()))
+            return markInvalid(
+                ptr, loc,
+                "unsupported: taking the address of a pointer variable");
+          return addBase(ptr, target, loc);
+        }
+      }
+      if (const auto *subscript =
+              llvm::dyn_cast<clang::ArraySubscriptExpr>(sub)) {
+        // `p = &arr[i]` binds the array; `p = &q[i]` is `p = q + i`; and
+        // `p = &param[i]` binds a slice-classified pointer parameter.
+        const clang::Expr *base =
+            subscript->getBase()->IgnoreParenImpCasts();
+        if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(base))
+          if (const auto *var =
+                  llvm::dyn_cast<clang::VarDecl>(ref->getDecl())) {
+            if (tracks(var)) {
+              recordArithmetic(var, loc);
+              return unite(ptr, var);
+            }
+            if (llvm::isa<clang::ParmVarDecl>(var) &&
+                isPointerType(var->getType()))
+              return addBase(ptr, var, loc);
+            if (!isPointerType(var->getType()))
+              return addBase(ptr, var, loc);
+          }
+      }
+      return markInvalid(ptr, loc,
+                         "unsupported: pointer assigned a non-address value");
+    }
+    if (unary->isIncrementDecrementOp()) {
+      // `p = q++` and friends: cursor arithmetic on the copied pointer.
+      if (const clang::VarDecl *source = asLocalVarRef(unary->getSubExpr()))
+        if (tracks(source)) {
+          recordArithmetic(source, loc);
+          return unite(ptr, source);
+        }
+      return markInvalid(ptr, loc,
+                         "unsupported: pointer assigned a non-address value");
+    }
+  }
+
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e)) {
+    clang::BinaryOperatorKind opcode = binary->getOpcode();
+    if (opcode == clang::BO_Add || opcode == clang::BO_Sub) {
+      // `p = q + n` / `p = q - n`: arithmetic on the pointer operand.
+      const clang::Expr *pointerSide =
+          isPointerType(binary->getLHS()->getType()) ? binary->getLHS()
+                                                     : binary->getRHS();
+      recordArithmetic(ptr, loc);
+      return recordPointerWrite(ptr, pointerSide);
+    }
+  }
+
+  markInvalid(ptr, loc,
+              "unsupported: pointer assigned a non-address value");
+}
+
+void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
+  if (!stmt)
+    return;
+
+  if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt)) {
+    // Function pointers are ordinary Copy values, not decomposed pointers;
+    // the analysis never tracks them.
+    for (const clang::Decl *decl : declStmt->decls())
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+        if (var->hasLocalStorage() && !llvm::isa<clang::ParmVarDecl>(var) &&
+            isPointerType(var->getType()) &&
+            !isFunctionPointer(var->getType())) {
+          pointerVars.insert(var);
+          if (const clang::Expr *init = var->getInit())
+            recordPointerWrite(var, init);
+        }
+  } else if (const auto *compound =
+                 llvm::dyn_cast<clang::CompoundAssignOperator>(stmt)) {
+    // `p += n` / `p -= n` walk the pointer without rebinding it.
+    if (isPointerType(compound->getLHS()->getType()))
+      if (const clang::VarDecl *var = asLocalVarRef(compound->getLHS()))
+        if (tracks(var))
+          recordArithmetic(var, compound->getOperatorLoc());
+  } else if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt)) {
+    if (binary->getOpcode() == clang::BO_Assign &&
+        isPointerType(binary->getLHS()->getType()))
+      if (const clang::VarDecl *var = asLocalVarRef(binary->getLHS()))
+        if (tracks(var))
+          recordPointerWrite(var, binary->getRHS());
+  } else if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
+    if (unary->isIncrementDecrementOp() &&
+        isPointerType(unary->getSubExpr()->getType())) {
+      if (const clang::VarDecl *var = asLocalVarRef(unary->getSubExpr()))
+        if (tracks(var))
+          recordArithmetic(var, unary->getOperatorLoc());
+    } else if (unary->getOpcode() == clang::UO_AddrOf) {
+      // `&p` would let the pointer escape the decomposition.
+      if (const clang::VarDecl *var = asLocalVarRef(unary->getSubExpr()))
+        if (tracks(var))
+          markInvalid(var, unary->getOperatorLoc(),
+                      "unsupported: taking the address of a pointer variable");
+    }
+  }
+  // Pointer call arguments no longer invalidate the region (Phase 1b):
+  // `emitCall` reborrows the region base per target-parameter kind
+  // (emitrust.slice_of / emitrust.addr_of), so no raw pointer ever escapes.
+
+  for (const clang::Stmt *child : stmt->children())
+    visit(child);
+}
+
+} // namespace
+
 //===----------------------------------------------------------------------===//
 // Locations and types
 //===----------------------------------------------------------------------===//
@@ -790,6 +1613,11 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
       return failure();
     if (llvm::isa<emitrust::ArrayType>(*element))
       return emitError(loc) << "unsupported: multi-dimensional array";
+    // Arrays of function pointers are out of the v1 fn_ptr scope; reject
+    // loudly instead of building an !emitrust.array the dialect does not
+    // admit.
+    if (llvm::isa<emitrust::FnPtrType>(*element))
+      return emitError(loc) << "unsupported: array of function pointers";
     uint64_t size = array->getSize().getZExtValue();
     if (size == 0)
       return emitError(loc) << "unsupported: zero-length array";
@@ -809,6 +1637,43 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
         emitrust::EnumType::get(builder.getContext(), definition->getName()));
   }
 
+  // Function pointers are ordinary `!emitrust.fn_ptr` values (rendered
+  // `Option<fn(...)>`), legal as locals, globals, struct fields,
+  // parameters, and results alike; they must be recognized before the
+  // general pointer rejection below.
+  if (canonical->isFunctionPointerType()) {
+    const auto *fnType =
+        canonical->getPointeeType()->castAs<clang::FunctionType>();
+    SmallVector<Type> inputs;
+    if (const auto *proto = llvm::dyn_cast<clang::FunctionProtoType>(fnType)) {
+      if (proto->isVariadic())
+        return emitError(loc) << "unsupported: variadic function pointer type";
+      for (clang::QualType param : proto->getParamTypes()) {
+        FailureOr<Type> mapped = mapType(param, loc);
+        if (failed(mapped))
+          return failure();
+        if (!emitrust::FnPtrType::isValidComponentType(*mapped))
+          return emitError(loc)
+                 << "unsupported: function pointer parameter type";
+        inputs.push_back(*mapped);
+      }
+    }
+    // A prototype-less K&R `int (*f)()` maps to the zero-parameter form;
+    // calls with arguments through it are rejected at the call site.
+    SmallVector<Type> results;
+    clang::QualType returnType = fnType->getReturnType();
+    if (!returnType->isVoidType()) {
+      FailureOr<Type> mapped = mapType(returnType, loc);
+      if (failed(mapped))
+        return failure();
+      if (!emitrust::FnPtrType::isValidComponentType(*mapped))
+        return emitError(loc) << "unsupported: function pointer result type";
+      results.push_back(*mapped);
+    }
+    return Type(
+        emitrust::FnPtrType::get(builder.getContext(), inputs, results));
+  }
+
   if (canonical->isPointerType())
     return emitError(loc)
            << "unsupported: pointer type outside a parameter position";
@@ -818,8 +1683,13 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
                         << llvm::Twine(canonical.getAsString()) << "'";
 }
 
-FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc) {
+FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
+                                        ParamKind kind) {
   clang::QualType canonical = type.getCanonicalType();
+  // A function-pointer parameter is an ordinary Copy value, not a
+  // reference; it maps to `!emitrust.fn_ptr` like every other position.
+  if (canonical->isFunctionPointerType())
+    return mapType(type, loc);
   if (canonical->isPointerType()) {
     clang::QualType pointee = canonical->getPointeeType();
     if (pointee.getCanonicalType()->isPointerType())
@@ -827,9 +1697,337 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc) {
     FailureOr<Type> inner = mapType(pointee, loc);
     if (failed(inner))
       return failure();
+    if (kind == ParamKind::Slice) {
+      // A slice element must be sized and scalar/struct (the array element
+      // rules); a pointer to an array (`int (*)[N]`) has no slice shape.
+      if (!emitrust::ArrayType::isValidElementType(*inner))
+        return emitError(loc)
+               << "unsupported: slice parameter element type " << *inner;
+      return Type(
+          emitrust::MutRefType::get(emitrust::SliceType::get(*inner)));
+    }
     return Type(emitrust::MutRefType::get(*inner));
   }
   return mapType(type, loc);
+}
+
+ArrayRef<ParamKind>
+CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
+  const clang::FunctionDecl *canonical = func->getCanonicalDecl();
+  auto it = paramKindsCache.find(canonical);
+  if (it != paramKindsCache.end())
+    return it->second;
+  SmallVector<ParamKind, 4> kinds(func->getNumParams(), ParamKind::ScalarRef);
+  // The classification is a property of the definition's body; without a
+  // definition in the merged ASTs every pointer parameter stays a scalar
+  // reference (checked at definition-time signature refinement).
+  const clang::FunctionDecl *definition = func->getDefinition();
+  if (definition && definition->hasBody() &&
+      definition->getNumParams() == kinds.size()) {
+    llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> sliceParams;
+    collectSliceParams(definition->getBody(), sliceParams);
+    for (auto [index, param] : llvm::enumerate(definition->parameters()))
+      if (sliceParams.contains(param))
+        kinds[index] = ParamKind::Slice;
+  }
+  auto [entry, inserted] =
+      paramKindsCache.try_emplace(canonical, std::move(kinds));
+  (void)inserted;
+  return entry->second;
+}
+
+//===----------------------------------------------------------------------===//
+// Owner planning (Phase-4 Pass A)
+//===----------------------------------------------------------------------===//
+
+/// Collects every call expression below `stmt`, in source order.
+static void collectCallExprs(const clang::Stmt *stmt,
+                             SmallVectorImpl<const clang::CallExpr *> &calls) {
+  if (!stmt)
+    return;
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt))
+    calls.push_back(call);
+  for (const clang::Stmt *child : stmt->children())
+    collectCallExprs(child, calls);
+}
+
+const clang::VarDecl *
+CImporter::resolveArgRoot(PointerRegionAnalysis &regions,
+                          const clang::Expr *expr) const {
+  const clang::Expr *e = stripTrivia(expr);
+  if (e->isNullPointerConstant(astContext(),
+                               clang::Expr::NPC_NeverValueDependent) !=
+      clang::Expr::NPCK_NotNull)
+    return nullptr;
+
+  // A read (or ++/--) of a pointer variable: a parameter is its own root,
+  // and a pointer local resolves through its single-base region.
+  auto rootOfVarRef = [&](const clang::VarDecl *var) -> const clang::VarDecl * {
+    if (!var)
+      return nullptr;
+    if (llvm::isa<clang::ParmVarDecl>(var))
+      return isPointerType(var->getType()) ? var : nullptr;
+    if (regions.tracks(var)) {
+      const PointerRegion *region = regions.regionOf(var);
+      if (region && region->invalidReason.empty() &&
+          region->bases.size() == 1)
+        return region->bases.front().base;
+    }
+    return nullptr;
+  };
+
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    switch (cast->getCastKind()) {
+    case clang::CK_NoOp:
+      return resolveArgRoot(regions, cast->getSubExpr());
+    case clang::CK_LValueToRValue:
+      return rootOfVarRef(asVarRef(cast->getSubExpr()));
+    case clang::CK_ArrayToPointerDecay: {
+      const clang::Expr *sub = stripTrivia(cast->getSubExpr());
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub))
+        if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+          if (var->hasLocalStorage())
+            return var;
+      return nullptr;
+    }
+    default:
+      return nullptr;
+    }
+  }
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e)) {
+    if (unary->getOpcode() == clang::UO_AddrOf) {
+      const clang::Expr *sub = stripTrivia(unary->getSubExpr());
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub)) {
+        // `&x` roots at the (non-pointer) object itself.
+        const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+        if (var && var->hasLocalStorage() && !isPointerType(var->getType()))
+          return var;
+        return nullptr;
+      }
+      if (const auto *subscript =
+              llvm::dyn_cast<clang::ArraySubscriptExpr>(sub))
+        return resolveArgRoot(regions, subscript->getBase());
+      return nullptr;
+    }
+    if (unary->isIncrementDecrementOp())
+      return rootOfVarRef(asVarRef(unary->getSubExpr()));
+    return nullptr;
+  }
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e)) {
+    if (binary->getOpcode() == clang::BO_Add ||
+        binary->getOpcode() == clang::BO_Sub) {
+      const clang::Expr *pointerSide =
+          isPointerType(binary->getLHS()->getType()) ? binary->getLHS()
+                                                     : binary->getRHS();
+      return resolveArgRoot(regions, pointerSide);
+    }
+  }
+  return nullptr;
+}
+
+void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
+                           bool soleTranslationUnit) {
+  // Interprocedural union-find over storage bases (local arrays and
+  // scalars) and the data-pointer parameters of function definitions.
+  // Union-find transitively closes as edges are added, so one walk over
+  // every body reaches the fixpoint.
+  llvm::DenseMap<const clang::VarDecl *, const clang::VarDecl *> parent;
+  auto find = [&](const clang::VarDecl *decl) -> const clang::VarDecl * {
+    parent.try_emplace(decl, decl);
+    const clang::VarDecl *root = decl;
+    while (parent[root] != root)
+      root = parent[root];
+    while (parent[decl] != root) {
+      const clang::VarDecl *next = parent[decl];
+      parent[decl] = root;
+      decl = next;
+    }
+    return root;
+  };
+  auto unite = [&](const clang::VarDecl *a, const clang::VarDecl *b) {
+    parent[find(b)] = find(a);
+  };
+  // Declarations whose class must not be promoted: unresolvable pointer
+  // arguments, pointer-to-pointer parameters, invalidated (escaping)
+  // regions. Membership is checked per node during aggregation, so a
+  // poison mark survives later unions.
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> poisoned;
+
+  SmallVector<const clang::FunctionDecl *> definitions;
+  for (const clang::Decl *decl : unit->decls())
+    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl))
+      if (func->doesThisDeclarationHaveABody() && !func->isVariadic())
+        definitions.push_back(func);
+
+  for (const clang::FunctionDecl *func : definitions) {
+    PointerRegionAnalysis analysis;
+    analysis.analyze(astContext(), func->getBody());
+
+    // Data-pointer parameters are class nodes; a pointer-to-pointer
+    // parameter poisons its class (it has no i64-index representation).
+    for (const clang::ParmVarDecl *param : func->parameters()) {
+      if (!isPointerType(param->getType()) ||
+          isFunctionPointer(param->getType()))
+        continue;
+      (void)find(param);
+      if (param->getType()
+              .getCanonicalType()
+              ->getPointeeType()
+              .getCanonicalType()
+              ->isPointerType())
+        poisoned.insert(param);
+    }
+
+    // Project each per-function region into the global union-find: all
+    // bases of one region share a class, and an invalidated (escaping)
+    // region poisons them.
+    for (const clang::VarDecl *var : analysis.trackedVars()) {
+      const PointerRegion *region = analysis.regionOf(var);
+      if (!region)
+        continue;
+      const clang::VarDecl *first = nullptr;
+      for (const PointerBaseBinding &binding : region->bases) {
+        if (!first)
+          first = binding.base;
+        else
+          unite(first, binding.base);
+        if (!region->invalidReason.empty())
+          poisoned.insert(binding.base);
+      }
+    }
+
+    // Call edges: a pointer argument's root object unifies with the callee
+    // definition's parameter; an unresolvable root poisons the parameter's
+    // class. Callees without a definition in this TU add no edge — passing
+    // a region to them stays on the Phase-1b call lowering, which composes
+    // with a promoted base through its rewritten data place.
+    SmallVector<const clang::CallExpr *> calls;
+    collectCallExprs(func->getBody(), calls);
+    for (const clang::CallExpr *call : calls) {
+      const clang::FunctionDecl *callee = call->getDirectCallee();
+      if (!callee || callee->isVariadic())
+        continue;
+      const clang::FunctionDecl *definition = callee->getDefinition();
+      if (!definition || !definition->hasBody() ||
+          call->getNumArgs() != definition->getNumParams())
+        continue;
+      for (auto [index, argument] : llvm::enumerate(call->arguments())) {
+        const clang::ParmVarDecl *param = definition->getParamDecl(index);
+        if (!isPointerType(param->getType()) ||
+            isFunctionPointer(param->getType()))
+          continue;
+        if (const clang::VarDecl *root = resolveArgRoot(analysis, argument))
+          unite(root, param);
+        else
+          poisoned.insert(param);
+      }
+    }
+  }
+
+  // Aggregate the classes. `find` compresses paths in `parent`, so the
+  // node set is snapshotted before aggregation.
+  struct ClassInfo {
+    SmallVector<const clang::VarDecl *, 2> storageBases;
+    SmallVector<const clang::ParmVarDecl *, 4> params;
+    bool poisoned = false;
+  };
+  SmallVector<const clang::VarDecl *> nodes;
+  nodes.reserve(parent.size());
+  for (const auto &entry : parent)
+    nodes.push_back(entry.first);
+  llvm::DenseMap<const clang::VarDecl *, ClassInfo> classes;
+  for (const clang::VarDecl *node : nodes) {
+    ClassInfo &info = classes[find(node)];
+    if (poisoned.contains(node))
+      info.poisoned = true;
+    if (const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(node)) {
+      if (isPointerType(param->getType()) &&
+          !isFunctionPointer(param->getType()))
+        info.params.push_back(param);
+      continue;
+    }
+    if (!isPointerType(node->getType()) && node->hasLocalStorage())
+      info.storageBases.push_back(node);
+  }
+
+  // Promote every class that satisfies the full rule; anything else is a
+  // silent Phase-1b fallback.
+  for (const auto &entry : classes) {
+    const ClassInfo &info = entry.second;
+    if (info.poisoned || info.params.empty() ||
+        info.storageBases.size() != 1)
+      continue;
+    const clang::VarDecl *base = info.storageBases.front();
+    const auto *owner = llvm::dyn_cast_if_present<clang::FunctionDecl>(
+        base->getParentFunctionOrMethod());
+    if (!owner)
+      continue;
+    const clang::ConstantArrayType *arrayType =
+        astContext().getAsConstantArrayType(base->getType());
+    // Local array of 1..32 elements: the struct_def `Default` derive MVP
+    // limit. Scalar and oversized bases keep the Phase-1b lowering.
+    if (!arrayType || arrayType->getSize().getZExtValue() == 0 ||
+        arrayType->getSize().getZExtValue() > 32)
+      continue;
+    clang::QualType element = arrayType->getElementType();
+
+    // Every unified parameter must belong to a defined function and point
+    // at the base's element type.
+    llvm::SmallPtrSet<const clang::FunctionDecl *, 4> methodFns;
+    bool qualifies = true;
+    for (const clang::ParmVarDecl *param : info.params) {
+      const auto *fn =
+          llvm::dyn_cast<clang::FunctionDecl>(param->getDeclContext());
+      if (!fn || !fn->doesThisDeclarationHaveABody() ||
+          !astContext().hasSameUnqualifiedType(
+              element,
+              param->getType().getCanonicalType()->getPointeeType())) {
+        qualifies = false;
+        break;
+      }
+      methodFns.insert(fn);
+    }
+    if (!qualifies)
+      continue;
+    for (const clang::FunctionDecl *fn : methodFns) {
+      // All-or-nothing per function: every data-pointer parameter of the
+      // function must resolve into this one class, the return type must be
+      // a plain value, the function may not be the owner itself or C
+      // `main`, and all of its call sites must be visible — an externally
+      // visible function qualifies only when this TU is the whole program.
+      if (fn == owner || fn->getName() == "main" ||
+          (fn->isExternallyVisible() && !soleTranslationUnit) ||
+          (isPointerType(fn->getReturnType()) &&
+           !isFunctionPointer(fn->getReturnType()))) {
+        qualifies = false;
+        break;
+      }
+      for (const clang::ParmVarDecl *param : fn->parameters()) {
+        if (isPointerType(param->getType()) &&
+            !isFunctionPointer(param->getType()) &&
+            find(param) != entry.first) {
+          qualifies = false;
+          break;
+        }
+      }
+      if (!qualifies)
+        break;
+    }
+    if (!qualifies)
+      continue;
+
+    // The owner struct is named after the C spellings (`main`, not the
+    // renamed `c_main`); an internal-linkage owning function takes the
+    // per-TU tag so identically named statics never collide.
+    std::string structName =
+        (llvm::Twine("Owner_") +
+         (owner->isExternallyVisible() ? "" : currentTuTag.c_str()) +
+         owner->getName() + "_" + base->getName())
+            .str();
+    ownerPlans[base] = OwnerPlan{structName, /*structDefCreated=*/false};
+    for (const clang::FunctionDecl *fn : methodFns)
+      methodPlans[fn->getCanonicalDecl()] = base;
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -1028,7 +2226,8 @@ LogicalResult CImporter::deferExternGlobal(const clang::VarDecl *key,
                                            llvm::StringRef symbolName,
                                            clang::QualType qualType,
                                            Location loc) {
-  if (qualType.getCanonicalType()->isPointerType())
+  if (qualType.getCanonicalType()->isPointerType() &&
+      !qualType.getCanonicalType()->isFunctionPointerType())
     return emitError(loc) << "unsupported: pointer-typed global variable";
   FailureOr<Type> mlirType = mapType(qualType, loc);
   if (failed(mlirType))
@@ -1069,7 +2268,10 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
   }
 
   clang::QualType qualType = decl->getType();
-  if (qualType.getCanonicalType()->isPointerType())
+  // Function pointers map to `!emitrust.fn_ptr` and are legal globals;
+  // data pointers stay rejected.
+  if (qualType.getCanonicalType()->isPointerType() &&
+      !qualType.getCanonicalType()->isFunctionPointerType())
     return emitError(loc) << "unsupported: pointer-typed global variable";
   FailureOr<Type> mlirType = mapType(qualType, loc);
   if (failed(mlirType))
@@ -1084,11 +2286,12 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
   }
 
   // A const-qualified global is never written (clang rejects writes), so it
-  // becomes an immutable Rust static. Struct-typed const globals keep the
-  // mutable (Cell) representation because a struct's default value is not
-  // const-evaluable in Rust.
-  bool isConst = qualType.isConstQualified() &&
-                 !llvm::isa<emitrust::StructType>(*mlirType);
+  // becomes an immutable Rust static. Struct- and fn_ptr-typed const
+  // globals keep the mutable (Cell) representation: the GlobalOp `const`
+  // marker is limited to scalar and array value types.
+  bool isConst =
+      qualType.isConstQualified() &&
+      !llvm::isa<emitrust::StructType, emitrust::FnPtrType>(*mlirType);
 
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
   moduleBuilder.create<emitrust::GlobalOp>(
@@ -1102,6 +2305,41 @@ FailureOr<Attribute> CImporter::convertGlobalInit(const clang::VarDecl *decl,
                                                   Type type, Location loc) {
   const clang::Expr *init = decl->getInit();
   Location initLoc = init ? translateLoc(init->getBeginLoc()) : loc;
+  // A function-pointer global initializer is either the null constant
+  // (`None`) or a direct function reference (`Some(name)`, after the
+  // signature check); both are emitted as opaque attributes.
+  if (auto fnPtrType = llvm::dyn_cast<emitrust::FnPtrType>(type)) {
+    const clang::Expr *e = stripTrivia(init);
+    if (e->isNullPointerConstant(astContext(),
+                                 clang::Expr::NPC_NeverValueDependent) !=
+        clang::Expr::NPCK_NotNull)
+      return Attribute(
+          emitrust::OpaqueAttr::get(builder.getContext(), "None"));
+    // A fn-ptr-to-fn-ptr conversion (prototype-less pointer bound to a
+    // prototyped function) is transparent here; the signature check below
+    // runs against the global's own fn_ptr type.
+    if (const auto *bitcast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+      if (bitcast->getCastKind() == clang::CK_BitCast &&
+          isFunctionPointer(bitcast->getSubExpr()->getType()))
+        e = stripTrivia(bitcast->getSubExpr());
+    const clang::Expr *fnExpr = nullptr;
+    if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+      if (cast->getCastKind() == clang::CK_FunctionToPointerDecay)
+        fnExpr = cast->getSubExpr();
+    } else if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e)) {
+      if (unary->getOpcode() == clang::UO_AddrOf)
+        fnExpr = unary->getSubExpr();
+    }
+    if (!fnExpr)
+      return emitError(initLoc)
+             << "unsupported: global function pointer initializer";
+    FailureOr<std::string> name =
+        resolveFunctionPointerTarget(fnExpr, fnPtrType, initLoc);
+    if (failed(name))
+      return failure();
+    return Attribute(emitrust::OpaqueAttr::get(
+        builder.getContext(), (llvm::Twine("Some(") + *name + ")").str()));
+  }
   if (llvm::isa<emitrust::StructType, emitrust::ArrayType>(type))
     return emitError(initLoc)
            << "unsupported: aggregate initializer for a global variable";
@@ -1186,6 +2424,30 @@ std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
   return cName.str();
 }
 
+/// Returns whether `later` differs from `earlier` only by refining
+/// `!emitrust.mut_ref<T>` parameter positions into
+/// `!emitrust.mut_ref<!emitrust.slice<T>>` — the shape change a
+/// definition's pointer-parameter classification may introduce over a
+/// prototype-only import from another translation unit.
+static bool isSliceRefinementOf(FunctionType earlier, FunctionType later) {
+  if (earlier.getNumInputs() != later.getNumInputs() ||
+      earlier.getResults() != later.getResults())
+    return false;
+  for (auto [oldType, newType] :
+       llvm::zip_equal(earlier.getInputs(), later.getInputs())) {
+    if (oldType == newType)
+      continue;
+    auto oldRef = llvm::dyn_cast<emitrust::MutRefType>(oldType);
+    auto newRef = llvm::dyn_cast<emitrust::MutRefType>(newType);
+    if (!oldRef || !newRef)
+      return false;
+    auto newSlice = llvm::dyn_cast<emitrust::SliceType>(newRef.getPointee());
+    if (!newSlice || newSlice.getElementType() != oldRef.getPointee())
+      return false;
+  }
+  return true;
+}
+
 LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   Location loc = translateLoc(func->getLocation());
   llvm::StringRef cName = func->getName();
@@ -1213,11 +2475,32 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
                           << "' is a Rust keyword";
   std::string name = mlirFuncName(func);
 
-  // Build the signature.
+  // Build the signature. Pointer-parameter kinds derive from the
+  // definition's body (Phase 1b); a prototype whose definition appears
+  // later in the same TU classifies identically because
+  // `FunctionDecl::getDefinition` searches the whole redeclaration chain.
+  // A method-planned function (Phase 4; prototypes consult the same plan,
+  // keyed by the canonical declaration) instead trades every data-pointer
+  // parameter for an i64 element index behind a leading owner receiver.
+  const clang::VarDecl *methodOwner =
+      methodPlans.lookup(func->getCanonicalDecl());
+  emitrust::StructType ownerStructType;
+  ArrayRef<ParamKind> paramKinds = classifyPointerParams(func);
   SmallVector<Type> inputTypes;
-  for (const clang::ParmVarDecl *param : func->parameters()) {
+  if (methodOwner) {
+    ownerStructType = emitrust::StructType::get(
+        builder.getContext(), ownerPlans.find(methodOwner)->second.structName);
+    inputTypes.push_back(emitrust::MutRefType::get(ownerStructType));
+  }
+  for (auto [index, param] : llvm::enumerate(func->parameters())) {
+    if (methodOwner && isPointerType(param->getType()) &&
+        !isFunctionPointer(param->getType())) {
+      inputTypes.push_back(builder.getIntegerType(64));
+      continue;
+    }
     FailureOr<Type> paramType =
-        mapParamType(param->getType(), translateLoc(param->getLocation()));
+        mapParamType(param->getType(), translateLoc(param->getLocation()),
+                     paramKinds[index]);
     if (failed(paramType))
       return failure();
     inputTypes.push_back(*paramType);
@@ -1244,9 +2527,24 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
       return emitError(loc)
              << "unsupported: conflicting definition of '" << name
              << "' (already defined in another translation unit)";
-    if (existing.getFunctionType() != functionType)
-      return emitError(loc) << "unsupported: conflicting redeclaration of '"
-                            << name << "'";
+    if (existing.getFunctionType() != functionType) {
+      // A definition may refine a prototype-only import's pointer
+      // parameters from scalar references to slices (the prototype's TU
+      // could not see the body). The refinement is only sound while no
+      // call was imported against the scalar shape.
+      if (!isSliceRefinementOf(existing.getFunctionType(), functionType))
+        return emitError(loc)
+               << "unsupported: conflicting redeclaration of '" << name
+               << "'";
+      if (!SymbolTable::symbolKnownUseEmpty(existing.getOperation(),
+                                            module.getOperation()))
+        return emitError(loc)
+               << "unsupported: function '" << name << "' was called as "
+               << existing.getFunctionType()
+               << " before its definition refined the signature to "
+               << functionType
+               << " (cross-TU pointer-parameter classification)";
+    }
     existing.erase();
     functions.erase(name);
   }
@@ -1254,6 +2552,9 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointToEnd(module.getBody());
   auto funcOp = builder.create<func::FuncOp>(loc, name, functionType);
+  if (methodOwner)
+    funcOp->setAttr(emitrust::kMethodOfAttrName,
+                    builder.getStringAttr(ownerStructType.getName()));
   functions[name] = funcOp;
   if (!isDefinition) {
     funcOp.setPrivate();
@@ -1264,7 +2565,11 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   // parameter as a place appropriate to its kind.
   symbols.clear();
   addressTaken.clear();
+  pointerLocals.clear();
+  ownerStructPlaces.clear();
   loopStack.clear();
+  currentReceiverPlace = Value();
+  currentMethodOwner = nullptr;
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
   currentFuncName = name;
   currentIsMain = name == "c_main";
@@ -1272,23 +2577,88 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   entryBlock = funcOp.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
   collectAddressTaken(func->getBody());
+  pointerRegions.analyze(astContext(), func->getBody());
+
+  // Method prologue (Phase 4): the receiver dereferences once into the
+  // owner struct place, whose "data" member is the region base every
+  // pointer parameter (and every pointer local unified with one)
+  // decomposes against.
+  Value receiverDataPlace;
+  if (methodOwner) {
+    Value receiverArg = entryBlock->getArgument(0);
+    Value receiverPlace =
+        builder
+            .create<emitrust::DerefOp>(
+                loc, emitrust::LValueType::get(ownerStructType), receiverArg)
+            .getResult();
+    FailureOr<Type> ownedType = mapType(methodOwner->getType(), loc);
+    if (failed(ownedType))
+      return failure();
+    receiverDataPlace = builder
+                            .create<emitrust::MemberOp>(
+                                loc, emitrust::LValueType::get(*ownedType),
+                                receiverPlace, builder.getStringAttr("data"))
+                            .getResult();
+    currentReceiverPlace = receiverPlace;
+    currentMethodOwner = methodOwner;
+  }
 
   for (auto [index, param] : llvm::enumerate(func->parameters())) {
     Location paramLoc = translateLoc(param->getLocation());
-    Value blockArg = entryBlock->getArgument(index);
+    Value blockArg =
+        entryBlock->getArgument(methodOwner ? index + 1 : index);
     Type type = blockArg.getType();
+    if (methodOwner && isPointerType(param->getType()) &&
+        !isFunctionPointer(param->getType())) {
+      // Owner-region pointer parameter: an i64 element index into the
+      // receiver's array, decomposed exactly like a slice parameter with
+      // the receiver's data member as region base and the index argument
+      // as the initial cursor.
+      Value cursorCell =
+          createEntryAlloca(paramLoc, builder.getIntegerType(64));
+      builder.create<memref::StoreOp>(paramLoc, blockArg, cursorCell);
+      symbols[param] = receiverDataPlace;
+      pointerLocals[param] = PointerLocalInfo{param, cursorCell};
+      continue;
+    }
+    if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(type)) {
+      if (auto sliceType =
+              llvm::dyn_cast<emitrust::SliceType>(mutRef.getPointee())) {
+        // Slice parameter (Phase 1b): one entry-block dereference
+        // establishes the region base place, and the parameter itself
+        // decomposes into (base, i64 cursor = 0) exactly like a decayed
+        // local array; every element access renders `(*param)[i as usize]`
+        // so no borrow is ever held across statements.
+        Value basePlace =
+            builder
+                .create<emitrust::DerefOp>(
+                    paramLoc, emitrust::LValueType::get(sliceType), blockArg)
+                .getResult();
+        Value cursorCell =
+            createEntryAlloca(paramLoc, builder.getIntegerType(64));
+        Value zero =
+            createIntConstant(paramLoc, builder.getIntegerType(64), 0);
+        builder.create<memref::StoreOp>(paramLoc, zero, cursorCell);
+        symbols[param] = basePlace;
+        pointerLocals[param] = PointerLocalInfo{param, cursorCell};
+        continue;
+      }
+    }
     if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(type)) {
-      // Pointer parameter: used directly as a reference SSA value.
+      // Scalar-reference pointer parameter: used directly as a reference
+      // SSA value.
       symbols[param] = blockArg;
       continue;
     }
-    if (llvm::isa<emitrust::StructType, emitrust::EnumType>(type) ||
+    if (llvm::isa<emitrust::StructType, emitrust::EnumType,
+                  emitrust::FnPtrType>(type) ||
         isUnsignedInt(type) || addressTaken.contains(param)) {
-      // By-value struct, enum, or unsigned scalar, or an address-taken
-      // scalar: copy into a Rust variable (enums must not become memref
-      // cells — a memref of a dialect type is illegal — and unsigned cells
-      // must not either, because mem2reg materializes its default value as
-      // an `arith.constant`, which requires a signless type).
+      // By-value struct, enum, function pointer, or unsigned scalar, or an
+      // address-taken scalar: copy into a Rust variable (dialect-typed
+      // values must not become memref cells — a memref of a dialect type
+      // is illegal — and unsigned cells must not either, because mem2reg
+      // materializes its default value as an `arith.constant`, which
+      // requires a signless type).
       Value place = builder
                         .create<emitrust::VariableOp>(
                             paramLoc, emitrust::LValueType::get(type))
@@ -1312,11 +2682,15 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
 
 LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
                                                llvm::StringRef tuTag,
-                                               bool deferExtern) {
+                                               bool deferExtern,
+                                               bool soleTranslationUnit) {
   astContextPtr = &context;
   currentTuTag = tuTag.str();
   deferExternGlobals = deferExtern;
   const clang::TranslationUnitDecl *unit = astContext().getTranslationUnitDecl();
+  // Phase-4 Pass A: pure-AST owner planning over every function definition
+  // before any IR is built; Pass B below consults the plans.
+  planOwners(unit, soleTranslationUnit);
   for (const clang::Decl *decl : unit->decls()) {
     if (decl->isImplicit())
       continue;
@@ -1548,21 +2922,28 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
     }
     return emitError(loc) << "unsupported: extern local variable";
   }
+  // An owner-promoted array (Phase 4) declares the owner struct variable
+  // instead; every direct access rewrites to the struct's "data" member.
+  if (ownerPlans.contains(var))
+    return emitOwnerLocal(var, loc);
   clang::QualType type = var->getType().getCanonicalType();
-  if (type->isPointerType())
-    return emitError(loc) << "unsupported: pointer-typed local variable";
+  // Function pointers are ordinary `!emitrust.fn_ptr` values and take the
+  // plain variable path below, bypassing the pointer decomposition.
+  if (type->isPointerType() && !type->isFunctionPointerType())
+    return emitPointerLocal(var, loc);
   FailureOr<Type> mlirType = mapType(type, loc);
   if (failed(mlirType))
     return failure();
 
   bool isAggregate =
       llvm::isa<emitrust::StructType, emitrust::ArrayType>(*mlirType);
-  // Enums and unsigned scalars live in `emitrust.variable` places rather
-  // than memref cells: a memref of a dialect type is illegal, and mem2reg
-  // materializes an unsigned cell's default value as an `arith.constant`,
-  // which requires a signless type.
-  bool isEnum = llvm::isa<emitrust::EnumType>(*mlirType);
-  if (isAggregate || isEnum || isUnsignedInt(*mlirType) ||
+  // Enums, function pointers, and unsigned scalars live in
+  // `emitrust.variable` places rather than memref cells: a memref of a
+  // dialect type is illegal, and mem2reg materializes an unsigned cell's
+  // default value as an `arith.constant`, which requires a signless type.
+  bool isPlaceOnly =
+      llvm::isa<emitrust::EnumType, emitrust::FnPtrType>(*mlirType);
+  if (isAggregate || isPlaceOnly || isUnsignedInt(*mlirType) ||
       addressTaken.contains(var)) {
     Value place = builder
                       .create<emitrust::VariableOp>(
@@ -1588,6 +2969,188 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
       return failure();
     return storeToPlace(loc, cell, *value);
   }
+  return success();
+}
+
+LogicalResult CImporter::emitOwnerLocal(const clang::VarDecl *var,
+                                        Location loc) {
+  OwnerPlan &plan = ownerPlans.find(var)->second;
+  FailureOr<Type> ownedType = mapType(var->getType(), loc);
+  if (failed(ownedType))
+    return failure();
+
+  // Synthesize the module-level owner struct on first need; the name is
+  // derived from C spellings, so a collision with any existing module
+  // symbol is a located rejection (mirroring createGlobal).
+  if (!plan.structDefCreated) {
+    if (SymbolTable::lookupSymbolIn(module, plan.structName))
+      return emitError(loc)
+             << "unsupported: owner struct name '" << plan.structName
+             << "' collides with an existing symbol";
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::StructDefOp>(
+        loc, moduleBuilder.getStringAttr(plan.structName),
+        moduleBuilder.getStrArrayAttr(llvm::StringRef("data")),
+        moduleBuilder.getTypeArrayAttr(*ownedType));
+    plan.structDefCreated = true;
+  }
+
+  auto ownerStructType =
+      emitrust::StructType::get(builder.getContext(), plan.structName);
+  Value ownerPlace =
+      builder
+          .create<emitrust::VariableOp>(
+              loc, emitrust::LValueType::get(ownerStructType))
+          .getResult();
+  ownerStructPlaces[var] = ownerPlace;
+  // Every direct access to the array — and every decomposed pointer whose
+  // region base it is — routes through the data member place registered
+  // here. Nothing ever loads the owner struct whole: the struct place is
+  // only borrowed at method call sites (C arrays are not assignable, so no
+  // syntax reaches a whole-owner load).
+  Value dataPlace = builder
+                        .create<emitrust::MemberOp>(
+                            loc, emitrust::LValueType::get(*ownedType),
+                            ownerPlace, builder.getStringAttr("data"))
+                        .getResult();
+  symbols[var] = dataPlace;
+  if (var->getInit())
+    return emitError(loc) << "unsupported: aggregate initializer";
+  return success();
+}
+
+LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
+                                          Location loc) {
+  clang::QualType pointee =
+      var->getType().getCanonicalType()->getPointeeType();
+  if (pointee.getCanonicalType()->isPointerType())
+    return emitError(loc) << "unsupported: pointer-to-pointer variable";
+
+  const PointerRegion *region = pointerRegions.regionOf(var);
+  if (!region)
+    return success(); // Declared but never used as a pointer; no code.
+  if (!region->invalidReason.empty())
+    return emitError(translateLoc(region->invalidLoc))
+           << region->invalidReason;
+  if (region->bases.size() >= 2) {
+    // A pointer that is rebound across distinct objects cannot decompose
+    // into one (base, cursor) pair; name both objects and both bindings.
+    const PointerBaseBinding &first = region->bases[0];
+    const PointerBaseBinding &second = region->bases[1];
+    InFlightDiagnostic diag = emitError(loc);
+    diag << "unsupported: pointer '" << var->getName()
+         << "' would join objects '" << first.base->getName() << "' and '"
+         << second.base->getName() << "' into one region";
+    diag.attachNote(translateLoc(first.loc))
+        << "bound to '" << first.base->getName() << "' here";
+    diag.attachNote(translateLoc(second.loc))
+        << "bound to '" << second.base->getName() << "' here";
+    return diag;
+  }
+  if (region->bases.empty())
+    return success(); // Never bound; any dereference is rejected at its site.
+
+  const PointerBaseBinding &binding = region->bases.front();
+  const clang::VarDecl *base = binding.base;
+  Location bindLoc = translateLoc(binding.loc);
+  if (!base->hasLocalStorage()) // Defensive; the analysis flags this first.
+    return emitError(bindLoc) << "unsupported: pointer into a global variable";
+
+  Value cursorCell;
+  if (isPointerType(base->getType())) {
+    // The base is a slice-classified pointer parameter (the only pointer
+    // that can be a region base): the local walks the parameter's element
+    // run through its own cursor. The binding registered at the function
+    // prologue guarantees the base place is an lvalue<slice>.
+    auto baseInfo = pointerLocals.find(base);
+    if (baseInfo == pointerLocals.end() || !baseInfo->second.cursorCell)
+      return emitError(bindLoc)
+             << "unsupported: pointer variable bound to a non-slice "
+                "pointer parameter"; // Defensive; classification forbids it.
+    if (!astContext().hasSameUnqualifiedType(
+            pointee, base->getType().getCanonicalType()->getPointeeType()))
+      return emitError(bindLoc)
+             << "unsupported: pointer element type does not match its "
+                "target parameter";
+    cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
+  } else if (const clang::ConstantArrayType *array =
+                 astContext().getAsConstantArrayType(base->getType())) {
+    if (!astContext().hasSameUnqualifiedType(pointee,
+                                             array->getElementType()))
+      return emitError(bindLoc)
+             << "unsupported: pointer element type does not match its "
+                "target array";
+    cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
+  } else {
+    // Degenerate base: the pointer can only ever designate the whole
+    // scalar (or struct) object, so it carries no cursor and supports no
+    // arithmetic.
+    if (region->hasArithmetic)
+      return emitError(translateLoc(region->arithmeticLoc))
+             << "unsupported: arithmetic on the address of a scalar object";
+    if (!astContext().hasSameUnqualifiedType(pointee, base->getType()))
+      return emitError(bindLoc)
+             << "unsupported: pointer type does not match its target object";
+  }
+  pointerLocals[var] = PointerLocalInfo{base, cursorCell};
+  if (const clang::Expr *init = var->getInit())
+    return storePointerAssign(loc, var, init);
+  return success();
+}
+
+LogicalResult CImporter::storePointerAssign(Location loc,
+                                            const clang::VarDecl *ptr,
+                                            const clang::Expr *rhs) {
+  auto it = pointerLocals.find(ptr);
+  if (it == pointerLocals.end())
+    return emitError(loc) << "unsupported: assignment to pointer variable '"
+                          << ptr->getName() << "' with no known target object";
+  FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
+  if (failed(value))
+    return failure();
+  const PointerLocalInfo &info = it->second;
+  if (value->base != info.base) // Defensive; multi-base regions never get here.
+    return emitError(loc)
+           << "unsupported: pointer assignment would rebind to a different "
+              "object";
+  if (!info.cursorCell)
+    return success(); // Degenerate: the target place is statically known.
+  Value cursor = value->cursor
+                     ? value->cursor
+                     : createIntConstant(loc, builder.getIntegerType(64), 0);
+  builder.create<memref::StoreOp>(loc, cursor, info.cursorCell);
+  return success();
+}
+
+LogicalResult CImporter::emitPointerCompoundAssign(
+    const clang::CompoundAssignOperator *op) {
+  Location loc = translateLoc(op->getOperatorLoc());
+  clang::BinaryOperatorKind opcode =
+      clang::BinaryOperator::getOpForCompoundAssignment(op->getOpcode());
+  if (opcode != clang::BO_Add && opcode != clang::BO_Sub)
+    return emitError(loc) << "unsupported compound assignment on a pointer";
+  const clang::VarDecl *var = asVarRef(op->getLHS());
+  auto it = var ? pointerLocals.find(var) : pointerLocals.end();
+  if (it == pointerLocals.end())
+    return emitError(loc)
+           << "unsupported: compound assignment to this pointer expression";
+  const PointerLocalInfo &info = it->second;
+  if (!info.cursorCell) // Defensive; the analysis rejects this at the decl.
+    return emitError(loc)
+           << "unsupported: arithmetic on the address of a scalar object";
+  Value current = loadPlace(loc, info.cursorCell);
+  FailureOr<Value> amount = emitRValue(op->getRHS());
+  if (failed(amount))
+    return failure();
+  auto amountType = llvm::dyn_cast<IntegerType>((*amount).getType());
+  if (!amountType)
+    return emitError(loc) << "unsupported pointer offset type";
+  Value offset = castToIntType(loc, *amount, builder.getIntegerType(64));
+  Value next =
+      opcode == clang::BO_Add
+          ? builder.create<arith::AddIOp>(loc, current, offset).getResult()
+          : builder.create<arith::SubIOp>(loc, current, offset).getResult();
+  builder.create<memref::StoreOp>(loc, next, info.cursorCell);
   return success();
 }
 
@@ -1896,6 +3459,18 @@ LogicalResult CImporter::emitExprStmt(const clang::Expr *expr) {
 
 LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  // Rebinding a decomposed pointer local (or a slice-classified pointer
+  // parameter) recomputes its cursor; no pointer value is ever
+  // materialized. Function pointers are ordinary values and take the
+  // plain place-assignment (or global-store) path below.
+  if (isPointerType(op->getLHS()->getType()) &&
+      !isFunctionPointer(op->getLHS()->getType())) {
+    if (const clang::VarDecl *var = asVarRef(op->getLHS()))
+      if (pointerLocals.contains(var) || pointerRegions.tracks(var))
+        return storePointerAssign(loc, var, op->getRHS());
+    return emitError(loc)
+           << "unsupported: assignment to this pointer expression";
+  }
   // Whole-value store to a global in statement position: a direct
   // emitrust.global_store, no staging copy needed. Value-position uses go
   // through emitAssignToPlace, whose staged copy provides the place the
@@ -1918,6 +3493,12 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
 FailureOr<Value>
 CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  // A decomposed pointer has no place to re-load the assigned value from;
+  // a function pointer is an ordinary value with an ordinary place.
+  if (isPointerType(op->getLHS()->getType()) &&
+      !isFunctionPointer(op->getLHS()->getType()))
+    return emitError(loc)
+           << "unsupported: pointer assignment in value position";
   GlobalWriteback writeback;
   FailureOr<Value> place = emitLValue(op->getLHS(), &writeback);
   if (failed(place))
@@ -1934,6 +3515,9 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
 LogicalResult
 CImporter::emitCompoundAssign(const clang::CompoundAssignOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  // `p += n` / `p -= n` on a decomposed pointer local is cursor arithmetic.
+  if (isPointerType(op->getLHS()->getType()))
+    return emitPointerCompoundAssign(op);
   // Compound assignment to a whole global in statement position:
   // load-modify-store through the global access ops, no staging copy
   // needed. Value-position uses go through emitCompoundAssignToPlace.
@@ -1976,6 +3560,10 @@ CImporter::emitCompoundAssign(const clang::CompoundAssignOperator *op) {
 FailureOr<Value>
 CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  // A decomposed pointer has no place to re-load the assigned value from.
+  if (isPointerType(op->getLHS()->getType()))
+    return emitError(loc)
+           << "unsupported: pointer assignment in value position";
   if (!astContext().hasSameUnqualifiedType(op->getComputationLHSType(),
                                          op->getLHS()->getType()))
     return emitError(loc)
@@ -2012,11 +3600,19 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
 }
 
 LogicalResult CImporter::emitIncDec(const clang::UnaryOperator *op) {
+  // `p++` / `--p` on a decomposed pointer local walks its cursor; the
+  // pointer value form of the expression is discarded in statement position.
+  if (isPointerType(op->getSubExpr()->getType()))
+    return success(succeeded(emitPointerRValue(op)));
   return success(succeeded(emitIncDecValue(op)));
 }
 
 FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  // Pointer ++/-- value forms are consumed by `emitPointerRValue`; a
+  // pointer value reaching this scalar path has no representation.
+  if (isPointerType(op->getSubExpr()->getType()))
+    return emitError(loc) << "unsupported pointer expression in this context";
   // ++/-- on a whole global: load-modify-store through the global access
   // ops, no staging copy needed.
   if (const clang::VarDecl *var = asDirectGlobalRef(op->getSubExpr())) {
@@ -2065,12 +3661,12 @@ FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
 }
 
 LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
-  Location loc = translateLoc(call->getBeginLoc());
   const clang::FunctionDecl *callee = call->getDirectCallee();
-  if (!callee)
-    return emitError(loc) << "unsupported: indirect function call";
-  if (callee->getDeclName().isIdentifier() && callee->getName() == "printf")
+  if (callee && callee->getDeclName().isIdentifier() &&
+      callee->getName() == "printf")
     return emitPrintf(call);
+  // Calls without a direct callee (function pointers) are handled by the
+  // indirect path inside emitCall.
   return success(succeeded(emitCall(call)));
 }
 
@@ -2268,6 +3864,53 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
   switch (cast->getCastKind()) {
   case clang::CK_NoOp:
     return emitRValue(sub);
+  case clang::CK_FunctionToPointerDecay:
+    // A function used as a value decays to a `Some(name)` fn_ptr constant.
+    return emitFunctionPointerConstant(sub, cast->getType(), loc);
+  case clang::CK_NullToPointer: {
+    // The null constant of a function pointer is `None`; data pointers
+    // have no null representation and keep their located rejections.
+    if (isFunctionPointer(cast->getType())) {
+      FailureOr<Type> mapped = mapType(cast->getType(), loc);
+      if (failed(mapped))
+        return failure();
+      return createFnPtrNone(loc, *mapped);
+    }
+    return emitError(loc) << "unsupported cast ("
+                          << cast->getCastKindName() << ")";
+  }
+  case clang::CK_BitCast: {
+    // A conversion between function pointer types, e.g. binding a
+    // prototyped function to a prototype-less `int (*)()` pointer. A
+    // direct function reference re-resolves against the destination type;
+    // any other value is legal only when both sides map to the identical
+    // fn_ptr signature (Rust has no function pointer reinterpretation).
+    if (isFunctionPointer(cast->getType()) &&
+        isFunctionPointer(sub->getType())) {
+      const clang::Expr *stripped = stripTrivia(sub);
+      if (const auto *decay =
+              llvm::dyn_cast<clang::ImplicitCastExpr>(stripped))
+        if (decay->getCastKind() == clang::CK_FunctionToPointerDecay)
+          return emitFunctionPointerConstant(decay->getSubExpr(),
+                                             cast->getType(), loc);
+      if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripped))
+        if (unary->getOpcode() == clang::UO_AddrOf)
+          return emitFunctionPointerConstant(unary->getSubExpr(),
+                                             cast->getType(), loc);
+      FailureOr<Value> value = emitRValue(sub);
+      if (failed(value))
+        return failure();
+      FailureOr<Type> mapped = mapType(cast->getType(), loc);
+      if (failed(mapped))
+        return failure();
+      if ((*value).getType() != *mapped)
+        return emitError(loc) << "unsupported: function pointer conversion "
+                                 "changes the signature";
+      return value;
+    }
+    return emitError(loc) << "unsupported cast ("
+                          << cast->getCastKindName() << ")";
+  }
   case clang::CK_LValueToRValue: {
     if (const auto *ref =
             llvm::dyn_cast<clang::DeclRefExpr>(sub->IgnoreParens())) {
@@ -2464,6 +4107,17 @@ FailureOr<Value> CImporter::emitBinaryRValue(const clang::BinaryOperator *op) {
       return failure();
     return emitRValue(op->getRHS());
   }
+  // `p - q` on two pointers into the same object is the plain i64 cursor
+  // difference (C's ptrdiff_t is `long`, i.e. i64, on the supported
+  // targets); the operands never materialize as pointer values.
+  if (opcode == clang::BO_Sub && isPointerType(op->getLHS()->getType()) &&
+      isPointerType(op->getRHS()->getType()))
+    return emitPointerDifference(op);
+  // Any other pointer-valued binary result (`p + 1` in value position) is
+  // consumed by `emitPointerRValue` from its dereference or assignment
+  // context; a bare one has no scalar representation.
+  if (isPointerType(op->getType()))
+    return emitError(loc) << "unsupported pointer expression in this context";
   if (op->isComparisonOp()) {
     FailureOr<Value> flag = emitComparison(op);
     if (failed(flag))
@@ -2635,6 +4289,11 @@ FailureOr<Value> CImporter::emitUnaryRValue(const clang::UnaryOperator *op) {
     return extendBool(loc, inverted, op->getType());
   }
   case clang::UO_AddrOf: {
+    // `&f` on a function yields the same `Some(f)` constant as the
+    // implicit function-to-pointer decay.
+    if (isFunctionPointer(op->getType()))
+      return emitFunctionPointerConstant(op->getSubExpr(), op->getType(),
+                                         loc);
     // A pointer into a global would dangle from the staged local copy the
     // access model uses, so it is rejected until globals get a pointer
     // model.
@@ -2692,6 +4351,81 @@ FailureOr<Value> CImporter::emitUnaryRValue(const clang::UnaryOperator *op) {
 
 FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+
+  // Function pointers are ordinary Option<fn> values; C only defines
+  // equality on distinct function pointers, which maps to `emitrust.cmp`
+  // on the fn_ptr type (`Option<fn>` derives PartialEq; the null constant
+  // arrives as a `None` constant through CK_NullToPointer).
+  if (isFunctionPointer(op->getLHS()->getType()) ||
+      isFunctionPointer(op->getRHS()->getType())) {
+    if (op->getOpcode() != clang::BO_EQ && op->getOpcode() != clang::BO_NE)
+      return emitError(loc)
+             << "unsupported: ordered comparison of function pointers";
+    FailureOr<Value> lhs = emitRValue(op->getLHS());
+    if (failed(lhs))
+      return failure();
+    FailureOr<Value> rhs = emitRValue(op->getRHS());
+    if (failed(rhs))
+      return failure();
+    if ((*lhs).getType() != (*rhs).getType())
+      return emitError(loc)
+             << "unsupported: comparison operand type mismatch";
+    emitrust::CmpPredicate predicate = op->getOpcode() == clang::BO_EQ
+                                           ? emitrust::CmpPredicate::eq
+                                           : emitrust::CmpPredicate::ne;
+    return builder
+        .create<emitrust::CmpOp>(loc, builder.getI1Type(), predicate, *lhs,
+                                 *rhs)
+        .getResult();
+  }
+
+  // Pointer comparisons decompose both sides into (base, cursor) pairs;
+  // only pointers into the same object have a defined C ordering, and the
+  // i64 cursors compare signed. A degenerate side (the address of a
+  // scalar) is cursor 0 of its object. Null pointer constants are rejected
+  // inside `emitPointerRValue`.
+  if (isPointerType(op->getLHS()->getType()) ||
+      isPointerType(op->getRHS()->getType())) {
+    FailureOr<PtrExprValue> lhs = emitPointerRValue(op->getLHS());
+    if (failed(lhs))
+      return failure();
+    FailureOr<PtrExprValue> rhs = emitPointerRValue(op->getRHS());
+    if (failed(rhs))
+      return failure();
+    if (lhs->base != rhs->base)
+      return emitError(loc)
+             << "unsupported: comparison of pointers into different objects";
+    Type cursorType = builder.getIntegerType(64);
+    Value left =
+        lhs->cursor ? lhs->cursor : createIntConstant(loc, cursorType, 0);
+    Value right =
+        rhs->cursor ? rhs->cursor : createIntConstant(loc, cursorType, 0);
+    arith::CmpIPredicate predicate;
+    switch (op->getOpcode()) {
+    case clang::BO_LT:
+      predicate = arith::CmpIPredicate::slt;
+      break;
+    case clang::BO_LE:
+      predicate = arith::CmpIPredicate::sle;
+      break;
+    case clang::BO_GT:
+      predicate = arith::CmpIPredicate::sgt;
+      break;
+    case clang::BO_GE:
+      predicate = arith::CmpIPredicate::sge;
+      break;
+    case clang::BO_EQ:
+      predicate = arith::CmpIPredicate::eq;
+      break;
+    case clang::BO_NE:
+      predicate = arith::CmpIPredicate::ne;
+      break;
+    default:
+      return emitError(loc) << "unsupported comparison";
+    }
+    return builder.create<arith::CmpIOp>(loc, predicate, left, right)
+        .getResult();
+  }
 
   // Enum comparisons: Sema promotes enum operands to the (possibly
   // unsigned) underlying type, so the enum values are recovered from behind
@@ -2870,6 +4604,27 @@ FailureOr<Value> CImporter::emitCondition(const clang::Expr *expr) {
       Value truth = createBoolConstant(loc, true);
       return builder.create<arith::XOrIOp>(loc, *inner, truth).getResult();
     }
+  // A function pointer tested for truth (`if (fp)`, `!fp`) is a null
+  // check: load the Option<fn> value and compare it against a `None`
+  // constant. Clang leaves the condition fn-ptr-typed (no boolean cast).
+  if (isFunctionPointer(e->getType())) {
+    FailureOr<Value> value = emitRValue(e);
+    if (failed(value))
+      return failure();
+    Value none = createFnPtrNone(loc, (*value).getType());
+    return builder
+        .create<emitrust::CmpOp>(loc, builder.getI1Type(),
+                                 emitrust::CmpPredicate::ne, *value, none)
+        .getResult();
+  }
+  // A data pointer tested for truth is a null check; decomposed pointers
+  // have no null value (null pointer constants are rejected), so their
+  // truth values are rejected rather than silently mistranslated.
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_PointerToBoolean)
+      return emitError(loc) << "unsupported: pointer used as a truth value";
+  if (isPointerType(e->getType()))
+    return emitError(loc) << "unsupported: pointer used as a truth value";
   // Strip explicit truthiness casts so `_Bool` conversions don't double up.
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
     if (cast->getCastKind() == clang::CK_IntegralToBoolean ||
@@ -3043,7 +4798,7 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
   const clang::FunctionDecl *callee = call->getDirectCallee();
   if (!callee)
-    return emitError(loc) << "unsupported: indirect function call";
+    return emitIndirectCall(call);
   if (!callee->getDeclName().isIdentifier())
     return emitError(loc) << "unsupported callee";
   if (callee->getName() == "printf")
@@ -3057,16 +4812,58 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     return emitError(loc) << "unsupported: call to unimported function '"
                           << name << "'";
 
-  SmallVector<Value> arguments;
-  for (const clang::Expr *argument : call->arguments()) {
+  // A method-planned callee (Phase 4) takes the owner receiver plus i64
+  // element cursors in place of its pointer arguments.
+  if (const clang::VarDecl *ownerBase =
+          methodPlans.lookup(callee->getCanonicalDecl()))
+    return emitMethodCallSite(call, target, ownerBase, loc);
+
+  FunctionType targetType = target.getFunctionType();
+  if (call->getNumArgs() != targetType.getNumInputs())
+    return emitError(loc) << "unsupported: call argument count mismatch";
+
+  // C leaves the argument evaluation order unspecified; materialize every
+  // value argument before any borrow-producing argument so that no load is
+  // emitted between a `&mut` borrow and the call consuming it (rustc
+  // rejects an intervening use of the borrowed place).
+  SmallVector<Value> arguments(call->getNumArgs(), Value());
+  struct PendingBorrow {
+    unsigned index;
+    const clang::Expr *expr;
+  };
+  SmallVector<PendingBorrow, 4> borrows;
+  for (auto [index, argument] : llvm::enumerate(call->arguments())) {
+    if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(
+            targetType.getInput(index))) {
+      borrows.push_back({static_cast<unsigned>(index), argument});
+      continue;
+    }
     FailureOr<Value> value = emitRValue(argument);
     if (failed(value))
       return failure();
-    arguments.push_back(*value);
+    arguments[index] = *value;
   }
-  FunctionType targetType = target.getFunctionType();
-  if (arguments.size() != targetType.getNumInputs())
-    return emitError(loc) << "unsupported: call argument count mismatch";
+
+  // Borrow-producing arguments: each resolves to a fresh borrow of its
+  // region base. Two borrows of the same base would alias mutably in Rust;
+  // they are rejected rather than emitted.
+  SmallVector<const clang::VarDecl *, 4> borrowRoots;
+  for (const PendingBorrow &borrow : borrows) {
+    const clang::VarDecl *root = nullptr;
+    FailureOr<Value> reference = emitBorrowArgument(
+        loc, borrow.expr, targetType.getInput(borrow.index), root);
+    if (failed(reference))
+      return failure();
+    if (root && llvm::is_contained(borrowRoots, root))
+      return emitError(loc)
+             << "unsupported: aliasing mutable pointer arguments (two "
+                "arguments borrow object '"
+             << root->getName() << "')";
+    if (root)
+      borrowRoots.push_back(root);
+    arguments[borrow.index] = *reference;
+  }
+
   for (auto [index, value] : llvm::enumerate(arguments))
     if (value.getType() != targetType.getInput(index))
       return emitError(loc) << "unsupported: call argument type mismatch";
@@ -3075,6 +4872,289 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   if (callOp->getNumResults() == 0)
     return Value();
   return callOp->getResult(0);
+}
+
+FailureOr<Value> CImporter::emitMethodCallSite(const clang::CallExpr *call,
+                                               func::FuncOp target,
+                                               const clang::VarDecl *ownerBase,
+                                               Location loc) {
+  FunctionType targetType = target.getFunctionType();
+  if (call->getNumArgs() + 1 != targetType.getNumInputs())
+    return emitError(loc) << "unsupported: call argument count mismatch";
+
+  // The owner place in the current context: the dereferenced receiver in a
+  // sibling method (rendering `(*self).m(...)` after conversion), or the
+  // owner struct variable in the owning function.
+  Value ownerPlace = currentMethodOwner == ownerBase
+                         ? currentReceiverPlace
+                         : ownerStructPlaces.lookup(ownerBase);
+  if (!ownerPlace) // Defensive; the owner plan covers every call site.
+    return emitError(loc) << "unsupported: call to owner method '"
+                          << target.getSymName()
+                          << "' outside its owner's scope";
+
+  // Every argument is a plain value — pointer arguments lower to their i64
+  // element cursors — so the receiver borrow below is the only reference
+  // and is materialized last, immediately before the call (one-statement
+  // borrow; no load intervenes).
+  SmallVector<Value> arguments(targetType.getNumInputs(), Value());
+  for (auto [index, argument] : llvm::enumerate(call->arguments())) {
+    if (isPointerType(argument->getType()) &&
+        !isFunctionPointer(argument->getType())) {
+      FailureOr<PtrExprValue> pointer = emitPointerRValue(argument);
+      if (failed(pointer))
+        return failure();
+      // Defensive: the interprocedural plan guarantees the argument points
+      // into the owner's region — directly at the owner base in the owning
+      // function, or through the current method's own decomposed pointer
+      // parameters in a sibling method.
+      bool rootedAtOwner = pointer->base == ownerBase ||
+                           (currentMethodOwner == ownerBase &&
+                            isPointerType(pointer->base->getType()));
+      if (!rootedAtOwner)
+        return emitError(loc)
+               << "unsupported: pointer argument does not point into owner "
+                  "object '"
+               << ownerBase->getName() << "'";
+      if (!pointer->cursor) // Defensive; an array base always has a cursor.
+        return emitError(loc) << "unsupported: the address of a scalar "
+                                 "object cannot index an owner method";
+      arguments[index + 1] = pointer->cursor;
+      continue;
+    }
+    FailureOr<Value> value = emitRValue(argument);
+    if (failed(value))
+      return failure();
+    arguments[index + 1] = *value;
+  }
+  arguments[0] = builder
+                     .create<emitrust::AddrOfOp>(loc, targetType.getInput(0),
+                                                 ownerPlace, /*is_mut=*/true)
+                     .getResult();
+
+  for (auto [index, value] : llvm::enumerate(arguments))
+    if (value.getType() != targetType.getInput(index))
+      return emitError(loc) << "unsupported: call argument type mismatch";
+
+  auto callOp = builder.create<func::CallOp>(loc, target, arguments);
+  callOp->setAttr(emitrust::kMethodCallAttrName, builder.getUnitAttr());
+  if (callOp->getNumResults() == 0)
+    return Value();
+  return callOp->getResult(0);
+}
+
+bool CImporter::involvesDecomposedPointer(const clang::Stmt *stmt) const {
+  if (!stmt)
+    return false;
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+      if (pointerLocals.contains(var))
+        return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (involvesDecomposedPointer(child))
+      return true;
+  return false;
+}
+
+FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
+                                               const clang::Expr *argument,
+                                               Type paramType,
+                                               const clang::VarDecl *&root) {
+  root = nullptr;
+  auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(paramType);
+  if (!mutRef) // Parameters are always mut_ref today; ref is defensive.
+    return emitError(loc) << "unsupported reference parameter type";
+  Type pointee = mutRef.getPointee();
+
+  if (auto sliceType = llvm::dyn_cast<emitrust::SliceType>(pointee)) {
+    // Slice parameter: reslice the argument's region base from its cursor.
+    // A decayed array decomposes to cursor 0, `&arr[i]` to cursor i, a
+    // walking pointer to its current cursor, and a slice parameter's own
+    // read composes through the deref'd base place.
+    FailureOr<PtrExprValue> pointer = emitPointerRValue(argument);
+    if (failed(pointer))
+      return failure();
+    root = pointer->base;
+    if (!pointer->cursor)
+      return emitError(loc) << "unsupported: the address of a scalar object "
+                               "cannot be passed as a slice parameter";
+    auto it = symbols.find(pointer->base);
+    if (it == symbols.end())
+      return emitError(loc) << "unsupported: pointer target '"
+                            << pointer->base->getName()
+                            << "' is not an importable place";
+    Value basePlace = it->second;
+    auto lvalueType =
+        llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
+    Type elementType;
+    if (lvalueType) {
+      if (auto arrayType =
+              llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType()))
+        elementType = arrayType.getElementType();
+      else if (auto baseSlice = llvm::dyn_cast<emitrust::SliceType>(
+                   lvalueType.getValueType()))
+        elementType = baseSlice.getElementType();
+    }
+    if (!elementType)
+      return emitError(loc) << "unsupported pointer target place";
+    if (elementType != sliceType.getElementType())
+      return emitError(loc) << "unsupported: argument element type does not "
+                               "match the slice parameter";
+    return builder
+        .create<emitrust::SliceOfOp>(loc, paramType, basePlace,
+                                     pointer->cursor, /*is_mut=*/true)
+        .getResult();
+  }
+
+  // Scalar-reference parameter. Arguments involving a decomposed pointer
+  // (or any non-address-of pointer expression, e.g. a decayed array) borrow
+  // the designated element through the decomposition; plain address-of
+  // arguments (`&x`, `&s.f`, `&arr[i]`) keep the historical
+  // emitLValue+addr_of path.
+  const clang::Expr *stripped = stripTrivia(argument);
+  const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(stripped);
+  bool isAddressOf = addrOf && addrOf->getOpcode() == clang::UO_AddrOf;
+  if (!isAddressOf || involvesDecomposedPointer(argument)) {
+    FailureOr<PtrExprValue> pointer = emitPointerRValue(argument);
+    if (failed(pointer))
+      return failure();
+    root = pointer->base;
+    FailureOr<Value> place = emitPointerPlace(loc, *pointer);
+    if (failed(place))
+      return failure();
+    auto lvalueType = llvm::cast<emitrust::LValueType>((*place).getType());
+    if (lvalueType.getValueType() != pointee)
+      return emitError(loc) << "unsupported: argument type does not match "
+                               "the pointer parameter";
+    return builder
+        .create<emitrust::AddrOfOp>(loc, paramType, *place, /*is_mut=*/true)
+        .getResult();
+  }
+  root = addressArgumentRoot(argument);
+  FailureOr<Value> value = emitRValue(argument);
+  if (failed(value))
+    return failure();
+  return *value;
+}
+
+
+FailureOr<Value> CImporter::emitIndirectCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  const clang::Expr *calleeExpr = call->getCallee()->IgnoreParens();
+  // `(*fp)(...)`: the dereference of a function pointer designates the
+  // function, which immediately decays back to the pointer value, so the
+  // decay/deref pair cancels out and the pointer itself is evaluated.
+  if (const auto *decay = llvm::dyn_cast<clang::ImplicitCastExpr>(calleeExpr))
+    if (decay->getCastKind() == clang::CK_FunctionToPointerDecay) {
+      const auto *deref = llvm::dyn_cast<clang::UnaryOperator>(
+          decay->getSubExpr()->IgnoreParens());
+      if (deref && deref->getOpcode() == clang::UO_Deref &&
+          isFunctionPointer(deref->getSubExpr()->getType()))
+        calleeExpr = deref->getSubExpr()->IgnoreParens();
+    }
+  if (!isFunctionPointer(calleeExpr->getType()))
+    return emitError(loc) << "unsupported: indirect function call";
+
+  // A call through a prototype-less K&R pointer (`int (*f)()`) has no
+  // signature to check its arguments against; the zero-argument form is
+  // the only one that can be verified.
+  const clang::Type *pointee = calleeExpr->getType()
+                                   .getCanonicalType()
+                                   ->getPointeeType()
+                                   .getTypePtr();
+  if (llvm::isa<clang::FunctionNoProtoType>(pointee) && call->getNumArgs() > 0)
+    return emitError(loc)
+           << "unsupported: call with arguments through a function pointer "
+              "without a prototype";
+
+  FailureOr<Value> fnValue = emitRValue(calleeExpr);
+  if (failed(fnValue))
+    return failure();
+  auto fnPtrType = llvm::dyn_cast<emitrust::FnPtrType>((*fnValue).getType());
+  if (!fnPtrType)
+    return emitError(loc) << "unsupported: indirect function call";
+
+  // Argument checking mirrors the direct-call path.
+  SmallVector<Value> arguments;
+  for (const clang::Expr *argument : call->arguments()) {
+    FailureOr<Value> value = emitRValue(argument);
+    if (failed(value))
+      return failure();
+    arguments.push_back(*value);
+  }
+  ArrayRef<Type> inputs = fnPtrType.getInputs();
+  if (arguments.size() != inputs.size())
+    return emitError(loc) << "unsupported: call argument count mismatch";
+  for (auto [index, value] : llvm::enumerate(arguments))
+    if (value.getType() != inputs[index])
+      return emitError(loc) << "unsupported: call argument type mismatch";
+
+  auto callOp = builder.create<emitrust::CallIndirectOp>(
+      loc, fnPtrType.getResults(), *fnValue, arguments);
+  if (callOp->getNumResults() == 0)
+    return Value();
+  return callOp->getResult(0);
+}
+
+FailureOr<std::string>
+CImporter::resolveFunctionPointerTarget(const clang::Expr *expr,
+                                        emitrust::FnPtrType fnPtrType,
+                                        Location loc) {
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(expr));
+  const auto *callee =
+      ref ? llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl()) : nullptr;
+  if (!callee)
+    return emitError(loc) << "unsupported: function pointer target is not a "
+                             "direct function reference";
+  // Variadic declarations (printf) are never imported, and a Rust `fn`
+  // item cannot be variadic either.
+  if (callee->isVariadic())
+    return emitError(loc)
+           << "unsupported: taking the address of a variadic function";
+  std::string name = mlirFuncName(callee);
+  func::FuncOp target = functions.lookup(name);
+  if (!target)
+    return emitError(loc)
+           << "unsupported: taking the address of unimported function '"
+           << name << "'";
+  // The imported function's MLIR signature must equal the fn_ptr's
+  // component types exactly. This rejects prototype mismatches (including
+  // a prototype-less `int (*)()` pointer bound to a function with
+  // parameters) and functions whose data-pointer parameters import as
+  // references, which no fn_ptr can carry.
+  FunctionType targetType = target.getFunctionType();
+  if (targetType.getInputs() != fnPtrType.getInputs() ||
+      targetType.getResults() != fnPtrType.getResults())
+    return emitError(loc)
+           << "unsupported: function '" << name
+           << "' does not match the function pointer signature";
+  return name;
+}
+
+FailureOr<Value>
+CImporter::emitFunctionPointerConstant(const clang::Expr *fnExpr,
+                                       clang::QualType pointerType,
+                                       Location loc) {
+  FailureOr<Type> mapped = mapType(pointerType, loc);
+  if (failed(mapped))
+    return failure();
+  auto fnPtrType = llvm::dyn_cast<emitrust::FnPtrType>(*mapped);
+  if (!fnPtrType)
+    return emitError(loc) << "unsupported function pointer type";
+  FailureOr<std::string> name =
+      resolveFunctionPointerTarget(fnExpr, fnPtrType, loc);
+  if (failed(name))
+    return failure();
+  auto some = emitrust::OpaqueAttr::get(
+      builder.getContext(), (llvm::Twine("Some(") + *name + ")").str());
+  return builder.create<emitrust::ConstantOp>(loc, fnPtrType, some)
+      .getResult();
+}
+
+Value CImporter::createFnPtrNone(Location loc, Type fnPtrType) {
+  auto none = emitrust::OpaqueAttr::get(builder.getContext(), "None");
+  return builder.create<emitrust::ConstantOp>(loc, fnPtrType, none)
+      .getResult();
 }
 
 FailureOr<Value> CImporter::emitEnumConstant(
@@ -3121,6 +5201,253 @@ Value CImporter::castEnumToI32(Location loc, Value value) {
       .getResult();
 }
 
+bool CImporter::isDecomposedPointerExpr(const clang::Expr *expr) const {
+  const clang::Expr *e = stripTrivia(expr);
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_LValueToRValue)
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+              stripTrivia(cast->getSubExpr()))) {
+        auto it = symbols.find(ref->getDecl());
+        if (it != symbols.end() &&
+            llvm::isa<emitrust::MutRefType, emitrust::RefType>(
+                it->second.getType()))
+          return false; // Pointer parameter: existing reference path.
+      }
+  // Every other pointer rvalue shape belongs to the decomposition, which
+  // rejects the unsupported ones with located diagnostics.
+  return true;
+}
+
+FailureOr<PtrExprValue>
+CImporter::emitPointerRValue(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  Location loc = translateLoc(e->getBeginLoc());
+  IntegerType cursorType = builder.getIntegerType(64);
+
+  // Decomposed pointers have no null value; C code guarding on NULL cannot
+  // be translated faithfully and is rejected instead.
+  if (e->isNullPointerConstant(astContext(),
+                               clang::Expr::NPC_NeverValueDependent) !=
+      clang::Expr::NPCK_NotNull)
+    return emitError(loc)
+           << "unsupported: null pointer constant in a pointer expression";
+
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    switch (cast->getCastKind()) {
+    case clang::CK_NoOp:
+      return emitPointerRValue(cast->getSubExpr());
+    case clang::CK_LValueToRValue: {
+      // A read of a pointer local: its base is static, its cursor is the
+      // current value of the cursor cell (none for a degenerate base).
+      const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+          stripTrivia(cast->getSubExpr()));
+      const auto *var =
+          ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+      if (!var)
+        break;
+      auto it = pointerLocals.find(var);
+      if (it != pointerLocals.end()) {
+        const PointerLocalInfo &info = it->second;
+        Value cursor;
+        if (info.cursorCell)
+          cursor = loadPlace(loc, info.cursorCell);
+        return PtrExprValue{info.base, cursor};
+      }
+      if (llvm::isa<clang::ParmVarDecl>(var))
+        return emitError(loc) << "unsupported: pointer parameter used "
+                                 "outside a direct dereference";
+      return emitError(loc) << "unsupported: pointer variable '"
+                            << var->getName()
+                            << "' has no known target object";
+    }
+    case clang::CK_ArrayToPointerDecay: {
+      // A decayed array is its own base at cursor 0.
+      const clang::Expr *sub = stripTrivia(cast->getSubExpr());
+      if (llvm::isa<clang::StringLiteral>(sub))
+        return emitError(loc) << "unsupported: pointer to a string literal";
+      const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub);
+      const auto *var =
+          ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+      if (!var)
+        break;
+      if (!var->hasLocalStorage())
+        return emitError(loc) << "unsupported: pointer into a global "
+                                 "variable";
+      return PtrExprValue{var, createIntConstant(loc, cursorType, 0)};
+    }
+    default:
+      break;
+    }
+    return emitError(loc) << "unsupported pointer cast ("
+                          << cast->getCastKindName() << ")";
+  }
+
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e)) {
+    if (unary->getOpcode() == clang::UO_AddrOf) {
+      const clang::Expr *sub = stripTrivia(unary->getSubExpr());
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub)) {
+        const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+        if (!var)
+          return emitError(loc) << "unsupported pointer target";
+        if (isPointerType(var->getType()))
+          return emitError(loc)
+                 << "unsupported: taking the address of a pointer variable";
+        if (!var->hasLocalStorage())
+          return emitError(loc)
+                 << "unsupported: pointer into a global variable";
+        // `&x`: the degenerate (cursor-less) form of the scalar or struct
+        // object itself.
+        return PtrExprValue{var, Value()};
+      }
+      if (const auto *subscript =
+              llvm::dyn_cast<clang::ArraySubscriptExpr>(sub)) {
+        // `&arr[i]` (via the decay of `arr`) and `&q[i]` (i.e. `q + i`)
+        // both decompose the subscript base and offset it by the index.
+        FailureOr<PtrExprValue> pointer =
+            emitPointerRValue(subscript->getBase());
+        if (failed(pointer))
+          return failure();
+        if (!pointer->cursor) {
+          // The address of a scalar admits only the constant-zero index.
+          clang::Expr::EvalResult indexValue;
+          if (subscript->getIdx()->EvaluateAsInt(indexValue, astContext()) &&
+              indexValue.Val.getInt() == 0)
+            return PtrExprValue{pointer->base, Value()};
+          return emitError(loc) << "unsupported: arithmetic on the address "
+                                   "of a scalar object";
+        }
+        FailureOr<Value> index = emitRValue(subscript->getIdx());
+        if (failed(index))
+          return failure();
+        if (!llvm::isa<IntegerType>((*index).getType()))
+          return emitError(loc) << "unsupported subscript index type";
+        Value offset = castToIntType(loc, *index, cursorType);
+        Value cursor =
+            builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
+                .getResult();
+        return PtrExprValue{pointer->base, cursor};
+      }
+      return emitError(loc) << "unsupported pointer target expression";
+    }
+    if (unary->isIncrementDecrementOp()) {
+      // `p++` / `--p` in pointer-value position: update the cursor cell and
+      // yield the pre-value (postfix) or post-value (prefix) per C. Both
+      // pointer locals and slice parameters carry cursor cells.
+      const clang::VarDecl *var = asVarRef(unary->getSubExpr());
+      auto it = var ? pointerLocals.find(var) : pointerLocals.end();
+      if (it == pointerLocals.end())
+        return emitError(loc)
+               << "unsupported: ++/-- on this pointer expression";
+      const PointerLocalInfo &info = it->second;
+      if (!info.cursorCell) // Defensive; rejected at the declaration.
+        return emitError(loc)
+               << "unsupported: arithmetic on the address of a scalar object";
+      Value current = loadPlace(loc, info.cursorCell);
+      Value one = createIntConstant(loc, cursorType, 1);
+      Value next =
+          unary->isIncrementOp()
+              ? builder.create<arith::AddIOp>(loc, current, one).getResult()
+              : builder.create<arith::SubIOp>(loc, current, one).getResult();
+      builder.create<memref::StoreOp>(loc, next, info.cursorCell);
+      return PtrExprValue{info.base, unary->isPostfix() ? current : next};
+    }
+    return emitError(loc) << "unsupported pointer expression";
+  }
+
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e)) {
+    clang::BinaryOperatorKind opcode = binary->getOpcode();
+    if (opcode == clang::BO_Add || opcode == clang::BO_Sub) {
+      // `p + n` / `p - n` / `n + p`: cursor arithmetic. The operands are
+      // emitted in source order (C leaves the order unspecified).
+      bool lhsIsPointer = isPointerType(binary->getLHS()->getType());
+      FailureOr<PtrExprValue> pointer;
+      FailureOr<Value> amount;
+      if (lhsIsPointer) {
+        pointer = emitPointerRValue(binary->getLHS());
+        if (failed(pointer))
+          return failure();
+        amount = emitRValue(binary->getRHS());
+      } else {
+        amount = emitRValue(binary->getLHS());
+        if (failed(amount))
+          return failure();
+        pointer = emitPointerRValue(binary->getRHS());
+        if (failed(pointer))
+          return failure();
+      }
+      if (failed(amount))
+        return failure();
+      if (!llvm::isa<IntegerType>((*amount).getType()))
+        return emitError(loc) << "unsupported pointer offset type";
+      if (!pointer->cursor)
+        return emitError(loc)
+               << "unsupported: arithmetic on the address of a scalar object";
+      Value offset = castToIntType(loc, *amount, cursorType);
+      Value cursor =
+          opcode == clang::BO_Add
+              ? builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
+                    .getResult()
+              : builder.create<arith::SubIOp>(loc, pointer->cursor, offset)
+                    .getResult();
+      return PtrExprValue{pointer->base, cursor};
+    }
+  }
+
+  return emitError(loc) << "unsupported pointer expression: "
+                        << e->getStmtClassName();
+}
+
+FailureOr<Value> CImporter::emitPointerPlace(Location loc,
+                                             const PtrExprValue &pointer) {
+  auto it = symbols.find(pointer.base);
+  if (it == symbols.end())
+    return emitError(loc) << "unsupported: pointer target '"
+                          << pointer.base->getName()
+                          << "' is not an importable place";
+  Value basePlace = it->second;
+  if (!pointer.cursor)
+    return basePlace; // Degenerate: the pointer designates the whole object.
+  auto lvalueType = llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
+  if (!lvalueType)
+    return emitError(loc) << "unsupported pointer target place";
+  // The base place wraps an array (local array base) or a slice (deref'd
+  // slice parameter base); both subscript by the cursor.
+  Type elementType;
+  if (auto arrayType =
+          llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType()))
+    elementType = arrayType.getElementType();
+  else if (auto sliceType =
+               llvm::dyn_cast<emitrust::SliceType>(lvalueType.getValueType()))
+    elementType = sliceType.getElementType();
+  else
+    return emitError(loc) << "unsupported pointer target place";
+  return builder
+      .create<emitrust::SubscriptOp>(
+          loc, emitrust::LValueType::get(elementType), basePlace,
+          pointer.cursor)
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitPointerDifference(const clang::BinaryOperator *op) {
+  Location loc = translateLoc(op->getOperatorLoc());
+  FailureOr<PtrExprValue> lhs = emitPointerRValue(op->getLHS());
+  if (failed(lhs))
+    return failure();
+  FailureOr<PtrExprValue> rhs = emitPointerRValue(op->getRHS());
+  if (failed(rhs))
+    return failure();
+  if (lhs->base != rhs->base)
+    return emitError(loc)
+           << "unsupported: difference of pointers into different objects";
+  Type cursorType = builder.getIntegerType(64);
+  Value left =
+      lhs->cursor ? lhs->cursor : createIntConstant(loc, cursorType, 0);
+  Value right =
+      rhs->cursor ? rhs->cursor : createIntConstant(loc, cursorType, 0);
+  return builder.create<arith::SubIOp>(loc, left, right).getResult();
+}
+
 FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
                                        GlobalWriteback *writeback) {
   const clang::Expr *e = expr->IgnoreParens();
@@ -3150,12 +5477,28 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
           *writeback = GlobalWriteback{place, global->symbol};
         return place;
       }
+      // Decomposed pointer locals have no place of their own; every
+      // supported use is routed through the pointer paths before this one.
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+        if (pointerRegions.tracks(var))
+          return emitError(loc) << "unsupported use of pointer variable '"
+                                << var->getName() << "'";
       return emitError(loc) << "unsupported: reference to an unknown variable";
     }
     Value place = it->second;
     if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(place.getType()))
       return emitError(loc)
              << "unsupported: pointer variable used as an assignable place";
+    // A slice parameter's place designates its element run, not the C
+    // pointer variable; every supported use is routed through the pointer
+    // paths (deref, subscript, cursor updates) before this one. Function
+    // pointers are ordinary by-value parameters and keep their place.
+    if (const auto *param =
+            llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()))
+      if (isPointerType(param->getType()) &&
+          !isFunctionPointer(param->getType()))
+        return emitError(loc) << "unsupported use of pointer parameter '"
+                              << param->getName() << "'";
     return place;
   }
 
@@ -3165,7 +5508,18 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
     if (!field)
       return emitError(loc) << "unsupported member access";
     Value basePlace;
-    if (member->isArrow()) {
+    if (member->isArrow() && isDecomposedPointerExpr(member->getBase())) {
+      // `p->f` through a decomposed pointer: resolve the pointer to its
+      // place (the base object itself, or an element of the base array)
+      // and refine it with the member access below.
+      FailureOr<PtrExprValue> pointer = emitPointerRValue(member->getBase());
+      if (failed(pointer))
+        return failure();
+      FailureOr<Value> place = emitPointerPlace(loc, *pointer);
+      if (failed(place))
+        return failure();
+      basePlace = *place;
+    } else if (member->isArrow()) {
       FailureOr<Value> base = emitRValue(member->getBase());
       if (failed(base))
         return failure();
@@ -3204,9 +5558,41 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
 
   if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(e)) {
     const clang::Expr *base = subscript->getBase()->IgnoreParenImpCasts();
-    if (!base->getType().getCanonicalType()->isArrayType())
-      return emitError(loc)
-             << "unsupported: subscript on a pointer (pointer arithmetic)";
+    if (!base->getType().getCanonicalType()->isArrayType()) {
+      // Subscript through a pointer: decompose it into (base, cursor) and
+      // subscript the base object at cursor+index. A subscripted pointer
+      // parameter classifies as a slice and decomposes like a local; the
+      // rejection below is a defensive guard for scalar-reference
+      // parameters, which classification keeps out of subscript contexts.
+      if (!isDecomposedPointerExpr(subscript->getBase()))
+        return emitError(loc) << "unsupported: subscript on a pointer "
+                                 "parameter";
+      FailureOr<PtrExprValue> pointer =
+          emitPointerRValue(subscript->getBase());
+      if (failed(pointer))
+        return failure();
+      if (!pointer->cursor) {
+        // Degenerate base (the address of a scalar): only the constant-zero
+        // subscript designates the object (`p[0]` on `p = &x`).
+        clang::Expr::EvalResult indexValue;
+        if (!subscript->getIdx()->EvaluateAsInt(indexValue, astContext()) ||
+            indexValue.Val.getInt() != 0)
+          return emitError(loc) << "unsupported: nonzero subscript on the "
+                                   "address of a scalar object";
+        return emitPointerPlace(loc, *pointer);
+      }
+      FailureOr<Value> index = emitRValue(subscript->getIdx());
+      if (failed(index))
+        return failure();
+      if (!llvm::isa<IntegerType>((*index).getType()))
+        return emitError(loc) << "unsupported subscript index type";
+      Value offset =
+          castToIntType(loc, *index, builder.getIntegerType(64));
+      Value cursor =
+          builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
+              .getResult();
+      return emitPointerPlace(loc, PtrExprValue{pointer->base, cursor});
+    }
     FailureOr<Value> basePlace = emitLValue(base, writeback);
     if (failed(basePlace))
       return failure();
@@ -3230,6 +5616,15 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
 
   if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
     if (unary->getOpcode() == clang::UO_Deref) {
+      // A dereference of a decomposed pointer resolves to a place on its
+      // base object; the pointer-parameter reference path is unchanged.
+      if (isDecomposedPointerExpr(unary->getSubExpr())) {
+        FailureOr<PtrExprValue> decomposed =
+            emitPointerRValue(unary->getSubExpr());
+        if (failed(decomposed))
+          return failure();
+        return emitPointerPlace(loc, *decomposed);
+      }
       FailureOr<Value> pointer = emitRValue(unary->getSubExpr());
       if (failed(pointer))
         return failure();
@@ -3378,7 +5773,8 @@ mlir::emitrust::importC(llvm::StringRef path,
   CImporter importer(*module);
   if (failed(importer.importTranslationUnit(ast.getASTContext(),
                                             /*tuTag=*/"",
-                                            /*deferExtern=*/false)))
+                                            /*deferExtern=*/false,
+                                            /*soleTranslationUnit=*/true)))
     return nullptr;
 
   // A verifier failure indicates an importer bug; it is still an import
@@ -3431,8 +5827,10 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
   CImporter importer(*module);
   for (auto [index, ast] : llvm::enumerate(asts)) {
     std::string tuTag = ("tu" + llvm::Twine(index) + "_").str();
-    if (failed(importer.importTranslationUnit(ast->getASTContext(), tuTag,
-                                              /*deferExtern=*/true)))
+    if (failed(importer.importTranslationUnit(
+            ast->getASTContext(), tuTag,
+            /*deferExtern=*/true,
+            /*soleTranslationUnit=*/asts.size() == 1)))
       return nullptr;
   }
   if (failed(importer.finalizeProject()))
