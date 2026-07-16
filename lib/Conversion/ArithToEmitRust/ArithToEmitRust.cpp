@@ -290,7 +290,8 @@ struct CmpFOpConversion : public OpConversionPattern<arith::CmpFOp> {
 };
 
 /// Converts an Arith cast-like operation (extsi, trunci, sitofp, fptosi,
-/// index_cast) into an `emitrust.cast` rendered as a Rust `as` expression.
+/// extf, truncf, index_cast) into an `emitrust.cast` rendered as a Rust
+/// `as` expression.
 template <typename ArithOp>
 struct CastOpConversion : public OpConversionPattern<ArithOp> {
   using OpConversionPattern<ArithOp>::OpConversionPattern;
@@ -462,6 +463,8 @@ void mlir::emitrust::populateArithToEmitRustPatterns(
                CastOpConversion<arith::TruncIOp>,
                CastOpConversion<arith::SIToFPOp>,
                CastOpConversion<arith::FPToSIOp>,
+               CastOpConversion<arith::ExtFOp>,
+               CastOpConversion<arith::TruncFOp>,
                CastOpConversion<arith::IndexCastOp>,
                IndexCastUIOpConversion>(typeConverter, context);
 }

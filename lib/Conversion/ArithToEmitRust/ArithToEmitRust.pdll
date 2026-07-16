@@ -517,6 +517,20 @@ Pattern ArithFPToSIToEmitRustCast with benefit(2) {
   replace root with op<emitrust.cast>(in) -> (resultType);
 }
 
+// Replaces `arith.extf` (f32 -> f64, exact in Rust `as`) with
+// `emitrust.cast`.
+Pattern ArithExtFToEmitRustCast with benefit(2) {
+  let root = op<arith.extf>(in: Value) -> (resultType: Type);
+  replace root with op<emitrust.cast>(in) -> (resultType);
+}
+
+// Replaces `arith.truncf` (f64 -> f32; Rust `as` rounds to nearest, ties
+// to even, matching C's default conversion) with `emitrust.cast`.
+Pattern ArithTruncFToEmitRustCast with benefit(2) {
+  let root = op<arith.truncf>(in: Value) -> (resultType: Type);
+  replace root with op<emitrust.cast>(in) -> (resultType);
+}
+
 // Replaces `arith.index_cast` (non-i1 result) with `emitrust.cast`.
 Pattern ArithIndexCastToEmitRustCast with benefit(2) {
   let root = op<arith.index_cast>(in: Value) -> (resultType: Type);
