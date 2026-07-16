@@ -136,9 +136,12 @@ func.func @float_cmps(%a: f32, %b: f32) -> (i1, i1, i1, i1, i1, i1) {
 // CHECK:         emitrust.cast %arg3 : f64 to i32
 // CHECK:         emitrust.cast %arg4 : index to i64
 // CHECK:         emitrust.cast %arg5 : i1 to i32
+// CHECK:         emitrust.cast %arg6 : f32 to f64
+// CHECK:         emitrust.cast %arg3 : f64 to f32
 // CHECK-NOT:     arith.
-func.func @casts(%a: i16, %b: i64, %c: i32, %d: f64, %e: index, %f: i1)
-    -> (i32, i32, f64, i32, i64, i32) {
+func.func @casts(%a: i16, %b: i64, %c: i32, %d: f64, %e: index, %f: i1,
+                 %g: f32)
+    -> (i32, i32, f64, i32, i64, i32, f64, f32) {
   %0 = arith.extsi %a : i16 to i32
   %1 = arith.trunci %b : i64 to i32
   %2 = arith.sitofp %c : i32 to f64
@@ -147,7 +150,13 @@ func.func @casts(%a: i16, %b: i64, %c: i32, %d: f64, %e: index, %f: i1)
   // extui is legal only from i1 (Rust bool-as-int); wider sources stay
   // illegal, covered by unsigned-invalid.mlir.
   %5 = arith.extui %f : i1 to i32
-  return %0, %1, %2, %3, %4, %5 : i32, i32, f64, i32, i64, i32
+  // extf is exact in Rust `as`; truncf rounds to nearest (ties to even),
+  // matching C's double-to-float conversion. Both feed the C float
+  // promotions around printf %f (f32 arguments) and float locals.
+  %6 = arith.extf %g : f32 to f64
+  %7 = arith.truncf %d : f64 to f32
+  return %0, %1, %2, %3, %4, %5, %6, %7
+      : i32, i32, f64, i32, i64, i32, f64, f32
 }
 
 // index_castui zero-extends. A single Rust `as usize` would SIGN-extend a
