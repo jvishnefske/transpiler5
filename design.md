@@ -607,11 +607,21 @@ rule.
   headers resolves — clang's builtin resource directory is wired in at
   configure time and -I/-isystem/--extra-arg are passed through, so macros,
   conditional compilation, and variadic macros are handled by clang once
-  include paths resolve. Project-local headers are regression-tested;
-  system headers whose contents fall outside the importer's C subset (e.g.
-  glibc's anonymous structs pulled in by <stdint.h>) are still rejected by
-  the importer, not the preprocessor. (test/Import/C/include-path.c) See
-  FR-27.
+  include paths resolve. Project-local headers (-I) are imported eagerly
+  and whole-file validated, and are regression-tested. System-header
+  declarations (angle-bracket includes / -isystem, gated solely on clang's
+  isInSystemHeader at the declaration's expansion location) are skipped at
+  the top level instead of imported, so including a real <stdio.h>
+  succeeds even though its contents (glibc's anonymous structs in
+  bits/types.h, variadic prototypes, FILE) fall outside the supported
+  subset. A main-file use of a skipped declaration is rejected at the use
+  site with a located diagnostic naming the symbol ("declared in a system
+  header; not part of the supported C subset"); types are still imported
+  on demand through mapType, and printf keeps its by-name lowering. The
+  skip is per-TU and emits no symbols, so multi-TU mangling and cross-TU
+  struct dedup are unaffected. (test/Import/C/include-path.c,
+  system-headers.c, system-headers-invalid.c, system-headers-multi-tu.c,
+  test/EndToEnd/stdio-include.c) See FR-27.
 
 ### Aggregates and memory
 
