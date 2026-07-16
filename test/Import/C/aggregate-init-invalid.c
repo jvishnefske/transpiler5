@@ -27,13 +27,15 @@ int main(void) {
 }
 // COMPOUND: compound-literal.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: aggregate initializer
 
-// A string literal initializing a char array is not a brace list.
+// `char s[] = "..."` is supported (see strings.c), but only for plain and
+// signed char arrays: an unsigned char array maps to u8 elements, which
+// the string-init lowering does not cover.
 //--- string-init.c
 int main(void) {
-  char s[4] = "abc";
+  unsigned char s[4] = "abc";
   return s[0];
 }
-// STRING: string-init.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: aggregate initializer
+// STRING: string-init.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: string literal initializer for this type
 
 // An enum-typed global element has no typed-attribute representation.
 //--- enum-global.c

@@ -730,6 +730,15 @@ private:
   LogicalResult emitInitListElement(Value place, Type type,
                                     const clang::Expr *element);
 
+  /// Emits a block-scope `char s[N] = "..."` initializer as per-element
+  /// byte assigns including the trailing NUL (when it fits, per C99
+  /// 6.7.8p14); elements beyond the literal keep the place's default zero
+  /// value. Only signless-i8 (plain/signed char) arrays are supported, and
+  /// non-ASCII bytes are rejected with located diagnostics so the array's
+  /// contents stay printable through the ASCII-only `%s`/`%c` helpers.
+  LogicalResult emitStringArrayInit(Value place, Type type,
+                                    const clang::StringLiteral *literal);
+
   /// Emits `if`/`else` as a cf diamond: cond_br into then/else blocks that
   /// fall through to a continuation block.
   LogicalResult emitIfStmt(const clang::IfStmt *stmt);
@@ -789,16 +798,55 @@ private:
   /// the postfix forms, the post-value for the prefix forms.
   FailureOr<Value> emitIncDecValue(const clang::UnaryOperator *op);
 
-  /// Emits a call statement, dispatching printf to `emitPrintf` and
+  /// Emits a call statement, dispatching printf to `emitPrintf` (and
+  /// definition-less puts/putchar to `emitPuts`/`emitPutchar`) and
   /// discarding the result of ordinary calls.
   LogicalResult emitCallStmt(const clang::CallExpr *call);
 
   /// Lowers a printf call with a literal format string to
   /// `emitrust.call_opaque "print!"` with a translated Rust format string
-  /// in the `args` attribute. Supports %d (i32), %ld (i64), %f (f64,
-  /// routed through the `__emitrust_fmt_f64` helper so that non-finite
-  /// values print with C's spellings), and %%; anything else is rejected.
+  /// in the `args` attribute. The supported directive grammar is
+  /// `%[flags][width][length]conv` with flags `-`/`0`, a decimal width,
+  /// length `l`, and conversions d/i (i32, or i64 with `l`), u/x/X/o
+  /// (unsigned; the argument is `as`-cast to u32/u64 so negative signed
+  /// arguments print their two's-complement bit pattern exactly like C),
+  /// c (byte, via `__emitrust_fmt_c`), s (string literal or char-array
+  /// lvalue, see `emitPrintfStringArg`), f (f64, via `__emitrust_fmt_f64`
+  /// so non-finite values print with C's spellings; no flags/width), and
+  /// %%. Precision, other lengths (`ll`, `h`, ...), and every other
+  /// conversion keep located rejections. Integer arguments of a different
+  /// width or signedness than the conversion expects are `as`-cast, which
+  /// truncates to the low bits exactly like the x86-64 varargs read that C
+  /// performs.
   LogicalResult emitPrintf(const clang::CallExpr *call);
+
+  /// Lowers a `%s` printf argument. Two shapes are supported: a string
+  /// literal (after array-to-pointer decay), lowered to an
+  /// `emitrust.literal` holding a `&'static str` (printable-ASCII bytes
+  /// plus \n/\t/\r only; embedded NUL and non-ASCII bytes are rejected);
+  /// and a char-array lvalue, lowered to an `emitrust.slice_of` of the
+  /// whole array passed through the `__emitrust_cstr` helper, which stops
+  /// at the first NUL like C. A `char *` variable bound to a literal stays
+  /// rejected.
+  FailureOr<Value> emitPrintfStringArg(const clang::Expr *expr);
+
+  /// Wraps an integer value for a `%c` directive: casts it to i32 and
+  /// routes it through the `__emitrust_fmt_c` helper (C converts the
+  /// argument to unsigned char and prints that byte; the helper matches C
+  /// byte-for-byte for ASCII values, see design.md C99-48).
+  Value wrapCharFormat(Location loc, Value value);
+
+  /// Lowers a statement-position `puts(s)` call to
+  /// `emitrust.call_opaque "println!"` using the `%s` machinery
+  /// (`emitPrintfStringArg`). Only called when `puts` has no user
+  /// definition.
+  LogicalResult emitPuts(const clang::CallExpr *call);
+
+  /// Lowers a statement-position `putchar(c)` call to
+  /// `emitrust.call_opaque "print!"` of the argument routed through
+  /// `__emitrust_fmt_c`. Only called when `putchar` has no user
+  /// definition.
+  LogicalResult emitPutchar(const clang::CallExpr *call);
 
   //===--------------------------------------------------------------------===//
   // Expressions
@@ -1102,6 +1150,21 @@ private:
   /// True once the `__emitrust_fmt_f64` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool floatFormatHelperEmitted = false;
+  /// True once a `%c` printf directive (or a putchar call) has been
+  /// imported; triggers the one-per-module emission of the
+  /// `__emitrust_fmt_c` helper that renders the argument as C does
+  /// (converted to unsigned char; ASCII-only, see design.md C99-48).
+  bool needsCharFormatHelper = false;
+  /// True once the `__emitrust_fmt_c` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool charFormatHelperEmitted = false;
+  /// True once a `%s` char-array argument has been imported; triggers the
+  /// one-per-module emission of the `__emitrust_cstr` helper that renders
+  /// a char array up to its first NUL, matching C's `%s`.
+  bool needsCStrHelper = false;
+  /// True once the `__emitrust_cstr` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool cStrHelperEmitted = false;
 };
 
 } // namespace
@@ -2386,6 +2449,20 @@ FailureOr<Attribute> CImporter::convertGlobalInit(const clang::VarDecl *decl,
                                                   Type type, Location loc) {
   const clang::Expr *init = decl->getInit();
   Location initLoc = init ? translateLoc(init->getBeginLoc()) : loc;
+  // A file-scope `char s[] = "..."` folds to a plain i8 element list
+  // through the APValue path below, but non-ASCII bytes are rejected up
+  // front (mirroring the block-scope string initializer) so the array's
+  // contents stay exact through the ASCII-only `%s`/`%c` printing helpers.
+  if (init) {
+    if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+            init->IgnoreParenImpCasts())) {
+      for (unsigned i = 0, n = literal->getLength(); i != n; ++i)
+        if (literal->getCodeUnit(i) > 127)
+          return emitError(initLoc)
+                 << "unsupported: non-ASCII byte in string literal "
+                    "initializer";
+    }
+  }
   // A function-pointer global initializer is either the null constant
   // (`None`) or a direct function reference (`Some(name)`, after the
   // signature check); both are emitted as opaque attributes.
@@ -2597,6 +2674,12 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     // calls to them are handled specially or rejected at the call site.
     return success();
   }
+  // Body-less puts/putchar declarations are skipped like printf's: their
+  // statement-position calls are lowered by name (`emitPuts`/`emitPutchar`)
+  // and never reference the symbol, and a body-less function would
+  // otherwise be rejected by `finalizeProject`.
+  if ((cName == "puts" || cName == "putchar") && !func->getDefinition())
+    return success();
 
   bool isDefinition = func->isThisDeclarationADefinition();
   // C `main` is renamed so the driver can emit its own Rust `main` wrapper;
@@ -2608,6 +2691,12 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   if (cName == "__emitrust_fmt_f64")
     return emitError(loc) << "unsupported: function name '__emitrust_fmt_f64' "
                              "is reserved for the printf %f helper";
+  if (cName == "__emitrust_fmt_c")
+    return emitError(loc) << "unsupported: function name '__emitrust_fmt_c' "
+                             "is reserved for the printf %c helper";
+  if (cName == "__emitrust_cstr")
+    return emitError(loc) << "unsupported: function name '__emitrust_cstr' "
+                             "is reserved for the printf %s helper";
   if (isRustKeyword(cName))
     return emitError(loc) << "unsupported: function name '" << cName
                           << "' is a Rust keyword";
@@ -2887,6 +2976,37 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "    }\n"
             "}"));
   }
+  if (needsCharFormatHelper && !charFormatHelperEmitted) {
+    charFormatHelperEmitted = true;
+    // C-compatible `%c`/putchar rendering: C converts the int argument to
+    // unsigned char and writes that byte; `(x as u8) as char` emits the
+    // identical byte for every ASCII value (0..=127). Values 128..=255
+    // would render as two-byte UTF-8 and are documented as out of scope
+    // (design.md C99-48). Emitted once per module, after all imported
+    // items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr("fn __emitrust_fmt_c(x: i32) -> char {\n"
+                                    "    (x as u8) as char\n"
+                                    "}"));
+  }
+  if (needsCStrHelper && !cStrHelperEmitted) {
+    cStrHelperEmitted = true;
+    // C-compatible `%s` rendering of a char array: C prints bytes up to
+    // (not including) the first NUL, which `take_while` mirrors; the
+    // per-byte `u8 as char` conversion is exact for ASCII contents (the
+    // importer rejects non-ASCII string data, design.md C99-47). Emitted
+    // once per module, after all imported items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_cstr(s: &[i8]) -> String {\n"
+            "    s.iter().take_while(|&&b| b != 0).map(|&b| (b as u8) as "
+            "char).collect()\n"
+            "}"));
+  }
   return success();
 }
 
@@ -3101,8 +3221,11 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
     symbols[var] = place;
     if (const clang::Expr *init = var->getInit()) {
       if (isAggregate) {
-        // Only `= {...}` lists are supported; a string literal or a
-        // whole-aggregate copy initializer stays rejected.
+        // `= {...}` lists and `char s[] = "..."` string initializers are
+        // supported; a whole-aggregate copy initializer stays rejected.
+        if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+                init->IgnoreParenImpCasts()))
+          return emitStringArrayInit(place, *mlirType, literal);
         const auto *list = llvm::dyn_cast<clang::InitListExpr>(init);
         if (!list)
           return emitError(loc) << "unsupported: aggregate initializer";
@@ -3170,8 +3293,12 @@ LogicalResult CImporter::emitOwnerLocal(const clang::VarDecl *var,
                         .getResult();
   symbols[var] = dataPlace;
   if (const clang::Expr *init = var->getInit()) {
-    // The owned array's initializer list assigns through the data member
-    // place, exactly like a plain local array's.
+    // The owned array's initializer (a list or a `char s[] = "..."`
+    // string) assigns through the data member place, exactly like a plain
+    // local array's.
+    if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+            init->IgnoreParenImpCasts()))
+      return emitStringArrayInit(dataPlace, *ownedType, literal);
     const auto *list = llvm::dyn_cast<clang::InitListExpr>(init);
     if (!list)
       return emitError(loc) << "unsupported: aggregate initializer";
@@ -3255,6 +3382,48 @@ LogicalResult CImporter::emitInitListElement(Value place, Type type,
   if (failed(value))
     return failure();
   return storeToPlace(loc, place, *value);
+}
+
+LogicalResult
+CImporter::emitStringArrayInit(Value place, Type type,
+                               const clang::StringLiteral *literal) {
+  Location loc = translateLoc(literal->getBeginLoc());
+  auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(type);
+  if (!arrayType || arrayType.getElementType() != builder.getIntegerType(8))
+    return emitError(loc)
+           << "unsupported: string literal initializer for this type";
+  if (!literal->isOrdinary())
+    return emitError(loc) << "unsupported: non-ordinary string literal "
+                             "initializer";
+  // C99 6.7.8p14: successive bytes of the literal (including the
+  // terminating NUL if there is room) initialize the elements; Sema
+  // guarantees the literal fits. Elements past the literal keep the
+  // place's default zero value (matching C's zero fill), so only the
+  // literal's bytes plus the NUL are assigned.
+  uint64_t length = literal->getLength();
+  uint64_t count = std::min<uint64_t>(length + 1, arrayType.getSize());
+  for (uint64_t i = 0; i != count; ++i) {
+    uint32_t byte = i < length ? literal->getCodeUnit(i) : 0;
+    // Non-ASCII bytes are rejected so the array's contents stay exact
+    // through the ASCII-only `%s`/`%c` printing helpers.
+    if (byte > 127)
+      return emitError(loc)
+             << "unsupported: non-ASCII byte in string literal initializer";
+    Value index =
+        createIntConstant(loc, builder.getIntegerType(64),
+                          static_cast<int64_t>(i));
+    Value elementPlace =
+        builder
+            .create<emitrust::SubscriptOp>(
+                loc, emitrust::LValueType::get(arrayType.getElementType()),
+                place, index)
+            .getResult();
+    Value value = createIntConstant(loc, arrayType.getElementType(),
+                                    static_cast<int64_t>(byte));
+    if (failed(storeToPlace(loc, elementPlace, value)))
+      return failure();
+  }
+  return success();
 }
 
 LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
@@ -3900,9 +4069,18 @@ FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
 
 LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
   const clang::FunctionDecl *callee = call->getDirectCallee();
-  if (callee && callee->getDeclName().isIdentifier() &&
-      callee->getName() == "printf")
-    return emitPrintf(call);
+  if (callee && callee->getDeclName().isIdentifier()) {
+    llvm::StringRef name = callee->getName();
+    if (name == "printf")
+      return emitPrintf(call);
+    // puts/putchar are intercepted by name only when the project supplies
+    // no definition of its own (mirroring the printf by-name lowering); a
+    // user-defined puts/putchar is an ordinary call.
+    if (name == "puts" && !callee->getDefinition())
+      return emitPuts(call);
+    if (name == "putchar" && !callee->getDefinition())
+      return emitPutchar(call);
+  }
   // Calls without a direct callee (function pointers) are handled by the
   // indirect path inside emitCall.
   return success(succeeded(emitCall(call)));
@@ -3953,44 +4131,108 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
     }
     if (++i >= n)
       return emitError(loc) << "unsupported: trailing '%' in printf format";
-    char spec = format[i];
-    if (spec == '%') {
+    if (format[i] == '%') {
       rustFormat += '%';
       continue;
     }
-    Type expected;
-    llvm::StringRef placeholder;
-    if (spec == 'd') {
-      expected = builder.getI32Type();
-      placeholder = "{}";
-    } else if (spec == 'l' && i + 1 < n && format[i + 1] == 'd') {
+    // Parse `%[flags][width][.precision][length]conv` (C99 7.19.6.1).
+    // Supported flags are '-' (left align) and '0' (zero pad); width is a
+    // decimal number; precision stays rejected; the only supported length
+    // is a single 'l'.
+    bool leftAlign = false;
+    bool zeroPad = false;
+    while (i < n && (format[i] == '-' || format[i] == '0')) {
+      if (format[i] == '-')
+        leftAlign = true;
+      else
+        zeroPad = true;
       ++i;
-      expected = builder.getIntegerType(64);
-      placeholder = "{}";
-    } else if (spec == 'f') {
+    }
+    std::string width;
+    while (i < n && format[i] >= '0' && format[i] <= '9')
+      width += format[i++];
+    if (i < n && format[i] == '.')
+      return emitError(loc)
+             << "unsupported: precision in printf format specifier";
+    bool isLong = false;
+    if (i < n && format[i] == 'l') {
+      isLong = true;
+      ++i;
+      if (i < n && format[i] == 'l')
+        return emitError(loc) << "unsupported printf length modifier 'll'";
+    } else if (i < n && (format[i] == 'h' || format[i] == 'L' ||
+                         format[i] == 'j' || format[i] == 'z' ||
+                         format[i] == 't')) {
+      return emitError(loc) << "unsupported printf length modifier '"
+                            << llvm::Twine(std::string(1, format[i])) << "'";
+    }
+    if (i >= n)
+      return emitError(loc) << "unsupported: trailing '%' in printf format";
+    char spec = format[i];
+    // Validate the conversion before consuming an argument so an unknown
+    // conversion is always the diagnostic, even when arguments are short.
+    if (spec != 'd' && spec != 'i' && spec != 'u' && spec != 'x' &&
+        spec != 'X' && spec != 'o' && spec != 'c' && spec != 's' &&
+        spec != 'f')
+      return emitError(loc) << "unsupported printf format specifier '%"
+                            << llvm::Twine(std::string(1, spec)) << "'";
+    bool hasAdjustment = leftAlign || zeroPad || !width.empty();
+    // Renders the Rust format placeholder for a numeric directive: the C
+    // width maps 1:1 ("%5d" -> "{:5}"), '-' to left alignment ("%-5d" ->
+    // "{:<5}"), '0' to Rust's sign-aware zero pad ("%05d" -> "{:05}"),
+    // and x/X/o append their radix marker ("%04X" -> "{:04X}"). A flag
+    // without a width is a no-op in C and is dropped. C ignores '0' when
+    // '-' is present, so left alignment wins.
+    auto placeholderFor = [&](llvm::StringRef radix) {
+      if (width.empty() && radix.empty())
+        return std::string("{}");
+      std::string text = "{:";
+      if (!width.empty()) {
+        if (leftAlign)
+          text += '<';
+        else if (zeroPad)
+          text += '0';
+        text += width;
+      }
+      text += radix.str();
+      text += '}';
+      return text;
+    };
+    if (argIndex >= call->getNumArgs())
+      return emitError(loc) << "unsupported: too few arguments to printf";
+    const clang::Expr *argExpr = call->getArg(argIndex);
+    unsigned argNumber = argIndex++;
+
+    if (spec == 's') {
+      if (hasAdjustment || isLong)
+        return emitError(loc)
+               << "unsupported: flags, width, or length on printf '%s'";
+      FailureOr<Value> text = emitPrintfStringArg(argExpr);
+      if (failed(text))
+        return failure();
+      operands.push_back(*text);
+      rustFormat += "{}";
+      continue;
+    }
+
+    FailureOr<Value> argument = emitRValue(argExpr);
+    if (failed(argument))
+      return failure();
+    Type argType = (*argument).getType();
+
+    if (spec == 'f') {
       // C's %f prints six decimals; Rust's {:.6} matches it for every
       // finite value and for infinities, but spells NaN as "NaN" where C
       // prints "nan"/"-nan". The argument is therefore routed through the
       // module-level `__emitrust_fmt_f64` helper (emitted once, on demand)
-      // and printed with a plain `{}`.
-      expected = builder.getF64Type();
-      placeholder = "{}";
-    } else {
-      return emitError(loc) << "unsupported printf format specifier '%"
-                            << llvm::Twine(std::string(1, spec)) << "'";
-    }
-    if (argIndex >= call->getNumArgs())
-      return emitError(loc) << "unsupported: too few arguments to printf";
-    FailureOr<Value> argument = emitRValue(call->getArg(argIndex));
-    if (failed(argument))
-      return failure();
-    if ((*argument).getType() != expected)
-      return emitError(loc) << "unsupported: printf argument " << argIndex
-                            << " does not match its format specifier";
-    ++argIndex;
-    if (spec == 'f') {
-      // Wrap the f64 in the C-compatible formatting helper; the resulting
-      // String is what the print! placeholder consumes.
+      // and printed with a plain `{}`. (`%lf` is identical to `%f` in
+      // C99; flags and width on the String-typed helper result would not
+      // match C's numeric padding and stay rejected.)
+      if (hasAdjustment)
+        return emitError(loc) << "unsupported: flags or width on printf '%f'";
+      if (!llvm::isa<Float64Type>(argType))
+        return emitError(loc) << "unsupported: printf argument " << argNumber
+                              << " does not match its format specifier";
       needsFloatFormatHelper = true;
       auto stringType =
           emitrust::OpaqueType::get(builder.getContext(), "String");
@@ -4000,9 +4242,71 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
                           builder.getStringAttr("__emitrust_fmt_f64"),
                           /*args=*/ArrayAttr(), ValueRange{*argument})
                       .getResult(0);
+      operands.push_back(*argument);
+      rustFormat += "{}";
+      continue;
     }
-    operands.push_back(*argument);
-    rustFormat += placeholder;
+
+    auto argIntType = llvm::dyn_cast<IntegerType>(argType);
+    bool isIntArgument = argIntType && argIntType.getWidth() > 1;
+
+    if (spec == 'c') {
+      // C converts the argument to unsigned char and prints that byte;
+      // the i32 argument (chars arrive int-promoted) goes through the
+      // `__emitrust_fmt_c` helper (ASCII-only, see design.md C99-48).
+      if (hasAdjustment || isLong)
+        return emitError(loc)
+               << "unsupported: flags, width, or length on printf '%c'";
+      if (!isIntArgument)
+        return emitError(loc) << "unsupported: printf argument " << argNumber
+                              << " does not match its format specifier";
+      operands.push_back(wrapCharFormat(loc, *argument));
+      rustFormat += "{}";
+      continue;
+    }
+
+    // Integer conversions. d/i print signed; u/x/X/o print the value as
+    // unsigned, so the argument is `as`-cast to the unsigned type of the
+    // directive's width — a negative signed argument then prints its
+    // two's-complement bit pattern ("%x" of -1 is ffffffff), exactly like
+    // C. An argument of a different width is `as`-cast as well, which
+    // truncates to the low bits just like C's varargs read on x86-64
+    // (printf("%d", sizeof(x)) prints the low 32 bits of the size_t).
+    llvm::StringRef radix;
+    bool isSigned;
+    switch (spec) {
+    case 'd':
+    case 'i':
+      isSigned = true;
+      break;
+    case 'u':
+      isSigned = false;
+      break;
+    case 'x':
+      isSigned = false;
+      radix = "x";
+      break;
+    case 'X':
+      isSigned = false;
+      radix = "X";
+      break;
+    case 'o':
+      isSigned = false;
+      radix = "o";
+      break;
+    default: // Defensive; the conversion was validated above.
+      return emitError(loc) << "unsupported printf format specifier '%"
+                            << llvm::Twine(std::string(1, spec)) << "'";
+    }
+    if (!isIntArgument)
+      return emitError(loc) << "unsupported: printf argument " << argNumber
+                            << " does not match its format specifier";
+    IntegerType target =
+        isSigned ? builder.getIntegerType(isLong ? 64 : 32)
+                 : IntegerType::get(builder.getContext(), isLong ? 64 : 32,
+                                    IntegerType::Unsigned);
+    operands.push_back(castToIntType(loc, *argument, target));
+    rustFormat += placeholderFor(radix);
   }
   if (argIndex != call->getNumArgs())
     return emitError(loc) << "unsupported: too many arguments to printf";
@@ -4014,6 +4318,144 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
   builder.create<emitrust::CallOpaqueOp>(
       loc, TypeRange(), builder.getStringAttr("print!"),
       builder.getArrayAttr(callArguments), operands);
+  return success();
+}
+
+FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
+  // The array-to-pointer decay wrapping both supported shapes is implicit;
+  // strip it (and parentheses) to see the underlying literal or lvalue.
+  const clang::Expr *arg = expr->IgnoreParenImpCasts();
+  Location loc = translateLoc(arg->getBeginLoc());
+  if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(arg)) {
+    if (!literal->isOrdinary())
+      return emitError(loc)
+             << "unsupported: non-ordinary string literal in printf '%s'";
+    // The literal's decoded bytes become a Rust string literal emitted
+    // verbatim into the generated source: an embedded NUL would diverge
+    // from C (which stops printing there) and a non-ASCII byte would fail
+    // rustc's UTF-8 check, so both are rejected; quote, backslash, and the
+    // whitespace escapes are re-escaped for the Rust spelling.
+    std::string text = "\"";
+    for (char c : literal->getString()) {
+      if (c == '\0')
+        return emitError(loc)
+               << "unsupported: NUL byte in printf '%s' string literal";
+      if ((c < 0x20 || c > 0x7e) && c != '\n' && c != '\t' && c != '\r')
+        return emitError(loc) << "unsupported: non-printable or non-ASCII "
+                                 "byte in printf '%s' string literal";
+      switch (c) {
+      case '\n':
+        text += "\\n";
+        break;
+      case '\t':
+        text += "\\t";
+        break;
+      case '\r':
+        text += "\\r";
+        break;
+      case '"':
+        text += "\\\"";
+        break;
+      case '\\':
+        text += "\\\\";
+        break;
+      default:
+        text += c;
+      }
+    }
+    text += '"';
+    auto strType =
+        emitrust::OpaqueType::get(builder.getContext(), "&'static str");
+    return builder
+        .create<emitrust::LiteralOp>(loc, strType, builder.getStringAttr(text))
+        .getResult();
+  }
+  // A char-array lvalue is borrowed whole (`emitrust.slice_of` at index 0)
+  // and rendered by the `__emitrust_cstr` helper, which — like C's %s —
+  // stops at the first NUL. A `char *` variable bound to a literal is not
+  // an array lvalue and stays rejected here.
+  if (astContext().getAsConstantArrayType(arg->getType()) &&
+      arg->isLValue()) {
+    FailureOr<Value> place = emitLValue(arg);
+    if (failed(place))
+      return failure();
+    auto lvalueType = llvm::cast<emitrust::LValueType>((*place).getType());
+    auto arrayType =
+        llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType());
+    if (!arrayType || arrayType.getElementType() != builder.getIntegerType(8))
+      return emitError(loc)
+             << "unsupported: printf '%s' argument must be a string literal "
+                "or a char array";
+    Value zero = createIntConstant(loc, builder.getIntegerType(64), 0);
+    auto sliceRefType = emitrust::RefType::get(
+        emitrust::SliceType::get(arrayType.getElementType()));
+    Value slice = builder
+                      .create<emitrust::SliceOfOp>(loc, sliceRefType, *place,
+                                                   zero, /*is_mut=*/false)
+                      .getResult();
+    needsCStrHelper = true;
+    auto stringType =
+        emitrust::OpaqueType::get(builder.getContext(), "String");
+    return builder
+        .create<emitrust::CallOpaqueOp>(
+            loc, TypeRange{stringType},
+            builder.getStringAttr("__emitrust_cstr"),
+            /*args=*/ArrayAttr(), ValueRange{slice})
+        .getResult(0);
+  }
+  return emitError(loc) << "unsupported: printf '%s' argument must be a "
+                           "string literal or a char array";
+}
+
+Value CImporter::wrapCharFormat(Location loc, Value value) {
+  needsCharFormatHelper = true;
+  Value promoted = castToIntType(loc, value, builder.getI32Type());
+  auto charType = emitrust::OpaqueType::get(builder.getContext(), "char");
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{charType}, builder.getStringAttr("__emitrust_fmt_c"),
+          /*args=*/ArrayAttr(), ValueRange{promoted})
+      .getResult(0);
+}
+
+LogicalResult CImporter::emitPuts(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc) << "unsupported: puts requires exactly one argument";
+  // C's puts writes the string then a newline; println! of the %s-shaped
+  // value matches byte-for-byte (both supported shapes reject the bytes
+  // Rust could not reproduce).
+  FailureOr<Value> text = emitPrintfStringArg(call->getArg(0));
+  if (failed(text))
+    return failure();
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("println!"),
+      builder.getArrayAttr(
+          {builder.getStringAttr("{}"), builder.getIndexAttr(0)}),
+      ValueRange{*text});
+  return success();
+}
+
+LogicalResult CImporter::emitPutchar(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: putchar requires exactly one argument";
+  FailureOr<Value> value = emitRValue(call->getArg(0));
+  if (failed(value))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>((*value).getType());
+  if (!intType || intType.getWidth() == 1)
+    return emitError(loc) << "unsupported: putchar argument must be an "
+                             "integer";
+  // C's putchar writes the argument converted to unsigned char; the
+  // `__emitrust_fmt_c` helper performs that conversion (ASCII-only, see
+  // design.md C99-48).
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("print!"),
+      builder.getArrayAttr(
+          {builder.getStringAttr("{}"), builder.getIndexAttr(0)}),
+      ValueRange{wrapCharFormat(loc, *value)});
   return success();
 }
 
@@ -5052,6 +5494,13 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     return emitError(loc) << "unsupported callee";
   if (callee->getName() == "printf")
     return emitError(loc) << "unsupported: printf return value must be unused";
+  // Statement-position puts/putchar are lowered by name (emitCallStmt);
+  // their int result has no representation there, so a value use of a
+  // definition-less puts/putchar is rejected.
+  if ((callee->getName() == "puts" || callee->getName() == "putchar") &&
+      !callee->getDefinition())
+    return emitError(loc) << "unsupported: " << callee->getName()
+                          << " return value must be unused";
   if (callee->isVariadic())
     return emitError(loc) << "unsupported: call to a variadic function";
 

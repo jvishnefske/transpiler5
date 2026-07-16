@@ -242,10 +242,11 @@ lists the lit test file(s) that validate it.
   output; any mismatch is a fatal MISCOMPILE unless explicitly quarantined
   in known-miscompiles.txt, and the expected-pass.txt manifest ratchets in
   both directions (regressions and unrecorded passes both fail). Current
-  ledger: 220 total, 85 transpiled, 85 passed, 0 miscompiled,
-  135 unsupported (the remaining tests need unions, pointer-to-pointer or
-  void* casts, pointer globals, aggregate initializers, string literals,
-  or system-header contents outside the C subset). (test/CTestSuite/)
+  ledger: 220 total, 147 transpiled, 147 passed, 0 miscompiled,
+  73 unsupported (the remaining tests need unions, pointer-to-pointer or
+  void* casts, pointer globals, `char *` bindings to string literals,
+  goto, wide strings, or system-header contents outside the C subset).
+  (test/CTestSuite/)
 - [x] FR-25 Generality beyond test vectors: an adversarial audit plus
   differential stress run over shapes absent from the original tests
   (negative/sparse/INT_MAX-adjacent case labels, nested switch, default
@@ -477,9 +478,10 @@ rule.
   renders its full element list (the 32-element `Default` derive cap only
   constrains struct fields of array type, which use literal lists here
   anyway). Rejected with located diagnostics: non-list aggregate
-  initializers (string literals, whole-struct copies, compound literals
-  — C99-13 stays open) and enum-typed global elements; multi-dimensional
-  arrays are rejected by the type mapper before initializer handling.
+  initializers (whole-struct copies, compound literals — C99-13 stays
+  open; string literals on char arrays are supported per C99-28) and
+  enum-typed global elements; multi-dimensional arrays are rejected by
+  the type mapper before initializer handling.
   (test/Import/C/aggregate-init.c, aggregate-init-invalid.c,
   test/Dialect/EmitRust/ops.mlir, invalid.mlir,
   test/Target/Rust/globals.mlir, test/EndToEnd/aggregate-init.c,
@@ -613,7 +615,19 @@ rule.
   test/EndToEnd/fn-pointers.c, test/Target/Rust/fn-pointers.mlir)
 - [ ] C99-28 String literals as char-array initializers and as pointer
   values, with the C escape set (beyond the current printf-format-only
-  support).
+  support). PARTIAL: `char s[N] = "..."` / `char s[] = "..."` is
+  supported for plain/signed char arrays. Block scope lowers to
+  per-element byte assigns over the default-zero place — the literal's
+  bytes plus the terminating NUL when it fits (C99 6.7.8p14), remaining
+  elements keeping the zero fill; file scope folds through the
+  C99-11/14 APValue path to a typed i8 ArrayAttr on `emitrust.global`.
+  Embedded NULs in the literal are ordinary data. Located rejections:
+  non-ASCII bytes (both scopes, keeping array contents exact through the
+  ASCII-only %s/%c helpers), wide/unsigned-char element types, and —
+  unchanged — `char *p = "..."` pointer bindings (a literal is no place
+  a decomposed pointer region could own).
+  (test/Import/C/strings.c, strings-invalid.c,
+  aggregate-init-invalid.c, test/EndToEnd/strings.c)
 - [ ] C99-29 Float literal forms including hexadecimal float constants,
   and __func__.
 
@@ -704,12 +718,47 @@ rule.
 
 - [ ] C99-47 The full printf format language: %s, %c, %u, %x, %o, %e,
   %g, %p, field width, precision, flags, and length modifiers, mapped
-  onto Rust format specifications (the current subset is %d, %ld, %f,
-  and %%).
+  onto Rust format specifications. PARTIAL — the supported directive
+  grammar is `%[flags][width][length]conv` with flags `-` (left align)
+  and `0` (zero pad, ignored next to `-` as in C), a decimal width,
+  length `l`, and conversions d/i (i32; i64 with `l`), u (u32/u64),
+  x/X/o (u32/u64 rendered `{:x}`/`{:X}`/`{:o}`), c, s, f, and %%.
+  Width/flags map 1:1 onto Rust specs (`%5d`→`{:5}`, `%-5d`→`{:<5}`,
+  `%05d`→`{:05}`, `%04X`→`{:04X}`; Rust's zero pad is sign-aware like
+  C's). u/x/X/o `as`-cast the argument to the directive's unsigned
+  type, so a negative signed argument prints its two's-complement bit
+  pattern exactly like C (`%x` of -1 is ffffffff); an integer argument
+  of a different width is `as`-cast likewise, truncating to the low
+  bits exactly like C's varargs read on x86-64 (`%d` of a size_t).
+  %c routes the int-promoted argument through the on-demand
+  `__emitrust_fmt_c` helper; %s accepts exactly two shapes — a string
+  literal (lowered to an `emitrust.literal` `&'static str`; embedded
+  NUL and non-ASCII bytes rejected) and a char-array lvalue (lowered to
+  `emitrust.slice_of` of the whole array through the on-demand
+  `__emitrust_cstr` helper, which stops at the first NUL like C); %f is
+  unchanged (f64 through `__emitrust_fmt_f64`, `%lf` accepted as its C
+  synonym). Located rejections: precision (`%.3s`, `%.2f`), lengths
+  `ll`/`h`/`L`/`j`/`z`/`t` (`%llx`, `%10Ld`), conversions outside the
+  set (%p, %n, %e, %g), flags/width on %c/%s/%f, and argument type
+  mismatches.
+  (test/Import/C/printf.c, printf-extended.c, printf-extended-invalid.c,
+  strings.c, strings-invalid.c, test/EndToEnd/printf-formats.c,
+  test/EndToEnd/strings.c)
 - [ ] C99-48 A curated stdio/stdlib/string/math subset mapped to Rust
   equivalents (putchar, puts, abs, string functions over the C99-28
   representation, math intrinsics onto f64 methods), each function
-  individually tested differentially.
+  individually tested differentially. PARTIAL: statement-position
+  `puts(s)` and `putchar(c)` are lowered by name when the project
+  supplies no definition of its own (a user-defined puts/putchar stays
+  an ordinary call): puts to `println!` through the %s machinery (both
+  %s shapes), putchar to `print!` of the argument through
+  `__emitrust_fmt_c`, matching C's conversion to unsigned char. The
+  char helpers are ASCII-only by design: C writes the raw byte where
+  Rust would encode code points 128..=255 as two UTF-8 bytes, so
+  non-ASCII string data is rejected at import (see C99-28/47) and the
+  helpers are exact for everything that gets through. Value uses of the
+  puts/putchar result keep located rejections.
+  (test/Import/C/strings.c, strings-invalid.c, test/EndToEnd/strings.c)
 
 Where an item above concludes in a documented rejection (varargs
 definitions, irreducible goto, _Complex, and similar), that rejection with
@@ -784,10 +833,12 @@ int-to-enum conversions, pointer-to-pointer values, pointer struct fields
 and pointer globals, NULL data pointers, void* casts, malloc and friends
 (pointer arithmetic, pointer locals, and pointer/array parameters are now
 supported through the FR-28 decomposition),
-multi-dimensional arrays, aggregate initializers, sizeof/_Alignof of
+multi-dimensional arrays, sizeof/_Alignof of
 variable-length-array/incomplete/function operands, conditional operators
-with non-scalar results, variadic definitions, and string literals
-outside printf. These are natural follow-ons; the emitter's
+with non-scalar results, variadic definitions, and `char *` variables
+bound to string literals (aggregate initializer lists are supported per
+C99-11/12, `char s[] = "..."` and the printf/puts %s shapes per
+C99-28/47). These are natural follow-ons; the emitter's
 statement-per-op model is chosen precisely so expression inlining can be
 layered in later, as EmitC did.
 
