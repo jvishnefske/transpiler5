@@ -595,13 +595,25 @@ private:
                                   clang::QualType qualType, Location loc);
 
   /// Evaluates `decl`'s initializer as a constant (clang APValue
-  /// evaluation) and converts it to a typed attribute of `type`. Supports
+  /// evaluation) and converts it to an attribute of `type`. Supports
   /// integer (including `_Bool` and char) and floating-point constants,
-  /// plus function-pointer initializers as opaque `None`/`Some(name)`
-  /// attributes; aggregate initializer lists and non-constant expressions
-  /// are rejected with located diagnostics.
+  /// function-pointer initializers as opaque `None`/`Some(name)`
+  /// attributes, and array/struct aggregates as ArrayAttr element lists
+  /// (via `convertAPValueInit`); non-constant expressions are rejected
+  /// with located diagnostics.
   FailureOr<Attribute> convertGlobalInit(const clang::VarDecl *decl,
                                          Type type, Location loc);
+
+  /// Converts a constant-evaluated `clang::APValue` to the initializer
+  /// attribute for a global of value type `type`: IntegerAttr/BoolAttr for
+  /// integers, FloatAttr for floats, and a (possibly nested) ArrayAttr with
+  /// one entry per array element or struct field for aggregates. Array
+  /// holes left by partial or designated initialization take the array
+  /// filler (C99 zero-fill); struct field types resolve through the
+  /// module-level `emitrust.struct_def`. Anything else (enum-typed
+  /// elements, pointers) is rejected with a located diagnostic.
+  FailureOr<Attribute> convertAPValueInit(const clang::APValue &value,
+                                          Type type, Location loc);
 
   /// Returns the imported global for `decl`, or null when `decl` is not an
   /// imported variable with static storage duration.
@@ -678,6 +690,26 @@ private:
   /// `emitrust.global`s mangled as `<function>_<name>`; extern locals are
   /// rejected.
   LogicalResult emitLocalVar(const clang::VarDecl *var);
+
+  /// Emits a block-scope aggregate initializer list into the
+  /// default-initialized place `place` of array or struct value type
+  /// `type`: one `emitrust.assign` per explicitly initialized element
+  /// (constant-index `emitrust.subscript` for array elements,
+  /// `emitrust.member` for struct fields), recursing for nested lists.
+  /// Elements left implicit (partial or designated initialization) keep
+  /// the place's default value, which models C99 zero-fill. Works on the
+  /// semantic form of the list, so designators are already resolved to
+  /// positions. Aggregate-typed elements that are not initializer lists
+  /// (string literals, struct copies) are rejected with located
+  /// diagnostics.
+  LogicalResult emitAggregateInitList(Value place, Type type,
+                                      const clang::InitListExpr *list);
+
+  /// Emits one element of an aggregate initializer list into `place` of
+  /// value type `type`: recurses for a nested list, otherwise stores the
+  /// element rvalue.
+  LogicalResult emitInitListElement(Value place, Type type,
+                                    const clang::Expr *element);
 
   /// Emits `if`/`else` as a cf diamond: cond_br into then/else blocks that
   /// fall through to a continuation block.
@@ -2340,31 +2372,88 @@ FailureOr<Attribute> CImporter::convertGlobalInit(const clang::VarDecl *decl,
     return Attribute(emitrust::OpaqueAttr::get(
         builder.getContext(), (llvm::Twine("Some(") + *name + ")").str()));
   }
-  if (llvm::isa<emitrust::StructType, emitrust::ArrayType>(type))
-    return emitError(initLoc)
-           << "unsupported: aggregate initializer for a global variable";
   // Static storage duration requires a constant initializer (C11 6.7.9p4);
-  // clang's constant evaluator produces the folded value.
+  // clang's constant evaluator produces the folded value. For aggregates
+  // it also resolves designators and zero-fills the uninitialized holes,
+  // so the APValue is the complete element-by-element picture.
   clang::APValue *value = decl->evaluateValue();
   if (!value)
     return emitError(initLoc) << "unsupported: non-constant global initializer";
+  return convertAPValueInit(*value, type, initLoc);
+}
+
+FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
+                                                   Type type, Location loc) {
   if (auto intType = llvm::dyn_cast<IntegerType>(type)) {
-    if (!value->isInt())
-      return emitError(initLoc)
+    if (!value.isInt())
+      return emitError(loc)
              << "unsupported: global initializer does not match its type";
     if (intType.getWidth() == 1)
-      return Attribute(builder.getBoolAttr(value->getInt().getBoolValue()));
+      return Attribute(builder.getBoolAttr(value.getInt().getBoolValue()));
     return Attribute(IntegerAttr::get(
-        intType, value->getInt().extOrTrunc(intType.getWidth())));
+        intType, value.getInt().extOrTrunc(intType.getWidth())));
   }
   if (auto floatType = llvm::dyn_cast<FloatType>(type)) {
-    if (!value->isFloat())
-      return emitError(initLoc)
+    if (!value.isFloat())
+      return emitError(loc)
              << "unsupported: global initializer does not match its type";
-    return Attribute(FloatAttr::get(floatType, value->getFloat()));
+    return Attribute(FloatAttr::get(floatType, value.getFloat()));
   }
-  return emitError(initLoc)
-         << "unsupported: global initializer for this type";
+  if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(type)) {
+    if (!value.isArray() || value.getArraySize() != arrayType.getSize())
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
+    Type elementType = arrayType.getElementType();
+    SmallVector<Attribute> elements;
+    elements.reserve(arrayType.getSize());
+    for (unsigned i = 0, n = value.getArrayInitializedElts(); i != n; ++i) {
+      FailureOr<Attribute> element =
+          convertAPValueInit(value.getArrayInitializedElt(i), elementType,
+                             loc);
+      if (failed(element))
+        return failure();
+      elements.push_back(*element);
+    }
+    // Elements beyond the explicitly initialized prefix share the filler
+    // value (C99 zero-fill of partial and designated initialization).
+    if (elements.size() < arrayType.getSize()) {
+      if (!value.hasArrayFiller())
+        return emitError(loc)
+               << "unsupported: global initializer does not match its type";
+      FailureOr<Attribute> filler =
+          convertAPValueInit(value.getArrayFiller(), elementType, loc);
+      if (failed(filler))
+        return failure();
+      elements.append(arrayType.getSize() - elements.size(), *filler);
+    }
+    return Attribute(builder.getArrayAttr(elements));
+  }
+  if (auto structType = llvm::dyn_cast<emitrust::StructType>(type)) {
+    if (!value.isStruct())
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
+    auto structDef = llvm::dyn_cast_or_null<emitrust::StructDefOp>(
+        SymbolTable::lookupSymbolIn(module, structType.getName()));
+    if (!structDef)
+      return emitError(loc)
+             << "unsupported: global initializer for this type";
+    ArrayAttr fieldTypes = structDef.getFieldTypes();
+    if (value.getStructNumFields() != fieldTypes.size())
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
+    SmallVector<Attribute> fields;
+    fields.reserve(fieldTypes.size());
+    for (auto [i, fieldType] : llvm::enumerate(fieldTypes)) {
+      FailureOr<Attribute> field = convertAPValueInit(
+          value.getStructField(i),
+          llvm::cast<TypeAttr>(fieldType).getValue(), loc);
+      if (failed(field))
+        return failure();
+      fields.push_back(*field);
+    }
+    return Attribute(builder.getArrayAttr(fields));
+  }
+  return emitError(loc) << "unsupported: global initializer for this type";
 }
 
 const GlobalInfo *CImporter::lookupGlobal(const clang::ValueDecl *decl) const {
@@ -2951,8 +3040,14 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
                       .getResult();
     symbols[var] = place;
     if (const clang::Expr *init = var->getInit()) {
-      if (isAggregate)
-        return emitError(loc) << "unsupported: aggregate initializer";
+      if (isAggregate) {
+        // Only `= {...}` lists are supported; a string literal or a
+        // whole-aggregate copy initializer stays rejected.
+        const auto *list = llvm::dyn_cast<clang::InitListExpr>(init);
+        if (!list)
+          return emitError(loc) << "unsupported: aggregate initializer";
+        return emitAggregateInitList(place, *mlirType, list);
+      }
       FailureOr<Value> value = emitRValue(init);
       if (failed(value))
         return failure();
@@ -3014,9 +3109,92 @@ LogicalResult CImporter::emitOwnerLocal(const clang::VarDecl *var,
                             ownerPlace, builder.getStringAttr("data"))
                         .getResult();
   symbols[var] = dataPlace;
-  if (var->getInit())
-    return emitError(loc) << "unsupported: aggregate initializer";
+  if (const clang::Expr *init = var->getInit()) {
+    // The owned array's initializer list assigns through the data member
+    // place, exactly like a plain local array's.
+    const auto *list = llvm::dyn_cast<clang::InitListExpr>(init);
+    if (!list)
+      return emitError(loc) << "unsupported: aggregate initializer";
+    return emitAggregateInitList(dataPlace, *ownedType, list);
+  }
   return success();
+}
+
+LogicalResult
+CImporter::emitAggregateInitList(Value place, Type type,
+                                 const clang::InitListExpr *list) {
+  // Sema's semantic form has designators resolved to positional elements
+  // and ImplicitValueInitExpr holes for everything left implicit.
+  if (const clang::InitListExpr *semantic = list->getSemanticForm())
+    list = semantic;
+  Location loc = translateLoc(list->getBeginLoc());
+  if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(type)) {
+    if (list->getNumInits() > arrayType.getSize()) // Defensive; Sema rejects.
+      return emitError(loc)
+             << "unsupported: excess elements in aggregate initializer";
+    for (unsigned i = 0, n = list->getNumInits(); i != n; ++i) {
+      const clang::Expr *element = list->getInit(i);
+      // A hole keeps the place's default element value (C99 zero-fill).
+      if (llvm::isa<clang::ImplicitValueInitExpr>(element))
+        continue;
+      Location elementLoc = translateLoc(element->getBeginLoc());
+      Value index = createIntConstant(elementLoc, builder.getIntegerType(64),
+                                      static_cast<int64_t>(i));
+      Value elementPlace =
+          builder
+              .create<emitrust::SubscriptOp>(
+                  elementLoc,
+                  emitrust::LValueType::get(arrayType.getElementType()),
+                  place, index)
+              .getResult();
+      if (failed(emitInitListElement(elementPlace,
+                                     arrayType.getElementType(), element)))
+        return failure();
+    }
+    return success();
+  }
+  if (llvm::isa<emitrust::StructType>(type)) {
+    const clang::RecordDecl *record = list->getType()->getAsRecordDecl();
+    if (!record) // Defensive; a struct-typed list always has a record.
+      return emitError(loc) << "unsupported: aggregate initializer";
+    unsigned index = 0;
+    for (const clang::FieldDecl *field : record->fields()) {
+      if (index >= list->getNumInits())
+        break; // Remaining fields keep their default (zero) value.
+      const clang::Expr *element = list->getInit(index++);
+      if (llvm::isa<clang::ImplicitValueInitExpr>(element))
+        continue;
+      Location elementLoc = translateLoc(element->getBeginLoc());
+      FailureOr<Type> fieldType = mapType(field->getType(), elementLoc);
+      if (failed(fieldType))
+        return failure();
+      Value fieldPlace = builder
+                             .create<emitrust::MemberOp>(
+                                 elementLoc,
+                                 emitrust::LValueType::get(*fieldType), place,
+                                 builder.getStringAttr(field->getName()))
+                             .getResult();
+      if (failed(emitInitListElement(fieldPlace, *fieldType, element)))
+        return failure();
+    }
+    return success();
+  }
+  return emitError(loc) << "unsupported: aggregate initializer";
+}
+
+LogicalResult CImporter::emitInitListElement(Value place, Type type,
+                                             const clang::Expr *element) {
+  if (const auto *nested = llvm::dyn_cast<clang::InitListExpr>(element))
+    return emitAggregateInitList(place, type, nested);
+  Location loc = translateLoc(element->getBeginLoc());
+  // A non-list initializer for an aggregate element (a string literal for
+  // a char-array field, a whole-struct copy) is out of scope.
+  if (llvm::isa<emitrust::ArrayType, emitrust::StructType>(type))
+    return emitError(loc) << "unsupported: aggregate initializer element";
+  FailureOr<Value> value = emitRValue(element);
+  if (failed(value))
+    return failure();
+  return storeToPlace(loc, place, *value);
 }
 
 LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
