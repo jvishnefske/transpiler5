@@ -10,10 +10,12 @@
 /// `emitrust.switch`, and the verifiers that enforce the dialect's
 /// invariants (mutability discipline of assignments, lvalue placement
 /// rules, at most one function result, matching return types, non-empty
-/// callee and literal strings, loop-jump nesting, struct-, enum-, and
-/// global-definition well-formedness, symbol-checked global loads and
-/// stores, switch case/region agreement, the enum comparison and cast
-/// restrictions, and induction-variable typing).
+/// callee and literal strings, indirect-call signature agreement with the
+/// callee fn_ptr, loop-jump nesting, struct-, enum-, and global-definition
+/// well-formedness, symbol-checked global loads and stores, switch
+/// case/region agreement, the enum and fn_ptr comparison and cast
+/// restrictions, induction-variable typing, and the impl/method_call
+/// receiver shape).
 //
 //===----------------------------------------------------------------------===//
 
@@ -115,6 +117,58 @@ LogicalResult FuncOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// ImplOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the impl body holds only `emitrust.func` operations whose
+/// first argument is an `!emitrust.mut_ref` of the `!emitrust.struct`
+/// carrying the impl's struct name (the `&mut self` receiver).
+LogicalResult ImplOp::verify() {
+  if (getStructName().empty())
+    return emitOpError("struct name must not be empty");
+  for (Operation &op : getBody().front()) {
+    auto funcOp = dyn_cast<FuncOp>(op);
+    if (!funcOp)
+      return emitOpError("body may only hold emitrust.func operations, but "
+                         "found '")
+             << op.getName() << "'";
+    FunctionType functionType = funcOp.getFunctionType();
+    if (functionType.getNumInputs() == 0)
+      return funcOp.emitOpError(
+          "method must take the receiver as its first argument");
+    auto mutRef = dyn_cast<MutRefType>(functionType.getInput(0));
+    auto structType =
+        mutRef ? dyn_cast<StructType>(mutRef.getPointee()) : StructType();
+    if (!structType || structType.getName() != getStructName())
+      return funcOp.emitOpError("receiver must be a !emitrust.mut_ref of "
+                                "!emitrust.struct<\"")
+             << getStructName() << "\">, but got "
+             << functionType.getInput(0);
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// MethodCallOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the receiver is an lvalue wrapping a struct type, that the
+/// method name is non-empty, and that the call produces at most one result.
+LogicalResult MethodCallOp::verify() {
+  if (getMethod().empty())
+    return emitOpError("method name must not be empty");
+  Type valueType = cast<LValueType>(getReceiver().getType()).getValueType();
+  if (!isa<StructType>(valueType))
+    return emitOpError(
+               "receiver must be an lvalue of !emitrust.struct type, but got ")
+           << getReceiver().getType();
+  if (getNumResults() > 1)
+    return emitOpError("requires zero or exactly one result, but has ")
+           << getNumResults();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // ReturnOp
 //===----------------------------------------------------------------------===//
 
@@ -162,6 +216,38 @@ LogicalResult CallOpaqueOp::verify() {
         return emitOpError("args index ") << index << " is out of range";
     }
   }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// CallIndirectOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the argument and result types equal the callee fn_ptr's
+/// parameter and result types.
+LogicalResult CallIndirectOp::verify() {
+  auto fnPtrType = cast<FnPtrType>(getCallee().getType());
+  ArrayRef<Type> inputs = fnPtrType.getInputs();
+  if (getArgs().size() != inputs.size())
+    return emitOpError("has ")
+           << getArgs().size() << " arguments, but the callee expects "
+           << inputs.size();
+  for (auto [index, argument] : llvm::enumerate(getArgs()))
+    if (argument.getType() != inputs[index])
+      return emitOpError("argument #")
+             << index << " type " << argument.getType()
+             << " does not match the callee parameter type " << inputs[index];
+
+  ArrayRef<Type> results = fnPtrType.getResults();
+  if (getNumResults() != results.size())
+    return emitOpError("has ")
+           << getNumResults() << " results, but the callee produces "
+           << results.size();
+  for (auto [index, result] : llvm::enumerate(getResults()))
+    if (result.getType() != results[index])
+      return emitOpError("result type ")
+             << result.getType() << " does not match the callee result type "
+             << results[index];
   return success();
 }
 
@@ -242,11 +328,12 @@ LogicalResult AssignOp::verify() {
 //===----------------------------------------------------------------------===//
 
 /// Returns whether `type` may be used as a struct field type: a scalar
-/// (integer, index, or float), an EmitRust array, an EmitRust struct, or an
-/// EmitRust enum.
+/// (integer, index, or float), an EmitRust array, an EmitRust struct, an
+/// EmitRust enum, or an EmitRust fn_ptr (`Option<fn(...)>` is
+/// `Copy + PartialEq + Default`, so every struct derive guarantee holds).
 static bool isValidStructFieldType(Type type) {
   return isa<IntegerType, IndexType, FloatType, ArrayType, StructType,
-             EnumType>(type);
+             EnumType, FnPtrType>(type);
 }
 
 /// Verifies that the field name and type arrays have the same non-zero
@@ -320,15 +407,17 @@ static bool isScalarValueType(Type type) {
   return isa<IntegerType, IndexType, FloatType>(type);
 }
 
-/// Verifies that the global's value type is a scalar, array, or struct,
-/// that the `const` marker is only used with const-initializable (scalar or
-/// array) value types, and that a present initializer is a typed attribute
-/// of the value type on a scalar global.
+/// Verifies that the global's value type is a scalar, array, struct, or
+/// fn_ptr, that the `const` marker is only used with const-initializable
+/// (scalar or array) value types, and that a present initializer is a typed
+/// attribute of the value type on a scalar global or an opaque attribute on
+/// a fn_ptr global.
 LogicalResult GlobalOp::verify() {
   Type type = getType();
-  if (!isScalarValueType(type) && !isa<ArrayType, StructType>(type))
+  if (!isScalarValueType(type) &&
+      !isa<ArrayType, StructType, FnPtrType>(type))
     return emitOpError("invalid global value type ") << type;
-  if (getIsConst() && isa<StructType>(type))
+  if (getIsConst() && isa<StructType, FnPtrType>(type))
     return emitOpError(
                "const marker requires a scalar or array value type, but got ")
            << type;
@@ -336,6 +425,13 @@ LogicalResult GlobalOp::verify() {
   Attribute init = getInitAttr();
   if (!init)
     return success();
+  // A fn_ptr initializer is an opaque expression (`Some(f)` / `None`)
+  // emitted verbatim; there is no typed attribute for function references.
+  if (isa<FnPtrType>(type)) {
+    if (!isa<OpaqueAttr>(init))
+      return emitOpError("fn_ptr init must be an opaque attribute");
+    return success();
+  }
   auto typedInit = dyn_cast<TypedAttr>(init);
   if (!typedInit)
     return emitOpError("init must be a typed attribute");
@@ -402,15 +498,21 @@ GlobalStoreOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 // VariableOp
 //===----------------------------------------------------------------------===//
 
-/// Verifies that a present initializer is a typed attribute whose type
-/// equals the lvalue's wrapped value type, and that initializers are only
-/// used with scalar value types.
+/// Verifies that the variable's value type is sized (a bare slice cannot
+/// be a local variable) and that a present initializer is a typed attribute
+/// whose type equals the lvalue's wrapped value type, with initializers
+/// only used with scalar value types.
 LogicalResult VariableOp::verify() {
+  Type valueType = cast<LValueType>(getResult().getType()).getValueType();
+  if (isa<SliceType>(valueType))
+    return emitOpError(
+               "variable value type must be sized, but got the slice type ")
+           << valueType;
+
   Attribute init = getInitAttr();
   if (!init)
     return success();
 
-  Type valueType = cast<LValueType>(getResult().getType()).getValueType();
   auto typedInit = dyn_cast<TypedAttr>(init);
   if (!typedInit)
     return emitOpError("init must be a typed attribute");
@@ -441,20 +543,31 @@ LogicalResult MemberOp::verify() {
 // SubscriptOp
 //===----------------------------------------------------------------------===//
 
-/// Verifies that the array operand is an lvalue wrapping an array type
+/// Returns the element type when `type` is an EmitRust array or slice
+/// type, or a null type otherwise. Subscript and slice_of accept both base
+/// shapes with identical element rules.
+static Type indexableElementType(Type type) {
+  if (auto arrayType = dyn_cast<ArrayType>(type))
+    return arrayType.getElementType();
+  if (auto sliceType = dyn_cast<SliceType>(type))
+    return sliceType.getElementType();
+  return Type();
+}
+
+/// Verifies that the operand is an lvalue wrapping an array or slice type
 /// whose element type equals the result lvalue's wrapped value type.
 LogicalResult SubscriptOp::verify() {
   Type valueType = cast<LValueType>(getArray().getType()).getValueType();
-  auto arrayType = dyn_cast<ArrayType>(valueType);
-  if (!arrayType)
-    return emitOpError(
-               "operand must be an lvalue of !emitrust.array type, but got ")
+  Type elementType = indexableElementType(valueType);
+  if (!elementType)
+    return emitOpError("operand must be an lvalue of !emitrust.array or "
+                       "!emitrust.slice type, but got ")
            << getArray().getType();
   Type resultValueType = cast<LValueType>(getResult().getType()).getValueType();
-  if (arrayType.getElementType() != resultValueType)
+  if (elementType != resultValueType)
     return emitOpError("result value type ")
-           << resultValueType << " does not match the array element type "
-           << arrayType.getElementType();
+           << resultValueType << " does not match the element type "
+           << elementType;
   return success();
 }
 
@@ -519,18 +632,63 @@ LogicalResult AddrOfOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// SliceOfOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the base is an lvalue wrapping an array or slice type,
+/// that the result is a reference to a slice of the same element type, and
+/// that the `mut` marker is present exactly when the result is a mutable
+/// reference (mirroring AddrOfOp).
+LogicalResult SliceOfOp::verify() {
+  Type baseValueType = cast<LValueType>(getBase().getType()).getValueType();
+  Type elementType = indexableElementType(baseValueType);
+  if (!elementType)
+    return emitOpError("base must be an lvalue of !emitrust.array or "
+                       "!emitrust.slice type, but got ")
+           << getBase().getType();
+
+  Type pointee;
+  if (auto mutRefType = dyn_cast<MutRefType>(getResult().getType())) {
+    if (!getIsMut())
+      return emitOpError(
+          "result is a !emitrust.mut_ref but the mut marker is absent");
+    pointee = mutRefType.getPointee();
+  } else {
+    if (getIsMut())
+      return emitOpError(
+          "mut marker requires a !emitrust.mut_ref result type");
+    pointee = cast<RefType>(getResult().getType()).getPointee();
+  }
+  auto resultSlice = dyn_cast<SliceType>(pointee);
+  if (!resultSlice)
+    return emitOpError("result pointee must be an !emitrust.slice, but got ")
+           << pointee;
+  if (resultSlice.getElementType() != elementType)
+    return emitOpError("result slice element type ")
+           << resultSlice.getElementType()
+           << " does not match the base element type " << elementType;
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // CmpOp
 //===----------------------------------------------------------------------===//
 
-/// Verifies that enum operands are only compared with the eq and ne
-/// predicates: enums derive PartialEq but not PartialOrd.
+/// Verifies that enum and fn_ptr operands are only compared with the eq and
+/// ne predicates: enums derive PartialEq but not PartialOrd, and
+/// `Option<fn(...)>` has no meaningful ordering.
 LogicalResult CmpOp::verify() {
-  if (!isa<EnumType>(getLhs().getType()))
+  Type operandType = getLhs().getType();
+  if (!isa<EnumType, FnPtrType>(operandType))
     return success();
   CmpPredicate predicate = getPredicate();
-  if (predicate != CmpPredicate::eq && predicate != CmpPredicate::ne)
+  if (predicate != CmpPredicate::eq && predicate != CmpPredicate::ne) {
+    if (isa<FnPtrType>(operandType))
+      return emitOpError(
+          "fn_ptr operands only support the eq and ne predicates");
     return emitOpError(
         "enum operands only support the eq and ne predicates");
+  }
   return success();
 }
 
@@ -538,11 +696,15 @@ LogicalResult CmpOp::verify() {
 // CastOp
 //===----------------------------------------------------------------------===//
 
-/// Verifies that the result is not an enum type: Rust has no
-/// integer-to-enum `as` cast.
+/// Verifies that the result is not an enum type (Rust has no
+/// integer-to-enum `as` cast) and that neither side is a fn_ptr type
+/// (`Option<fn(...)>` supports no `as` conversion at all).
 LogicalResult CastOp::verify() {
   if (isa<EnumType>(getResult().getType()))
     return emitOpError("cannot cast to an enum type");
+  if (isa<FnPtrType>(getSource().getType()) ||
+      isa<FnPtrType>(getResult().getType()))
+    return emitOpError("cannot cast a fn_ptr type");
   return success();
 }
 

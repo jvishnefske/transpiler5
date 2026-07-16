@@ -31,3 +31,11 @@ emitrust.func @nested_ref(%arg0: !emitrust.ref<!emitrust.opaque<"Vec<i32>">>) {
   %0 = emitrust.let %arg0 : !emitrust.ref<!emitrust.opaque<"Vec<i32>">>
   emitrust.return
 }
+
+// CHECK-LABEL: fn slice_params(v0: &mut [i32], v1: &[f64]) {
+emitrust.func @slice_params(%arg0: !emitrust.mut_ref<!emitrust.slice<i32>>,
+                            %arg1: !emitrust.ref<!emitrust.slice<f64>>) {
+  // CHECK: let v2: &mut [i32] = v0;
+  %0 = emitrust.let %arg0 : !emitrust.mut_ref<!emitrust.slice<i32>>
+  emitrust.return
+}
