@@ -419,9 +419,16 @@ rule.
   escape sequences.
 - [x] C99-5 Enumerations: enum definitions, enumerator constants in
   expressions and case labels, mapped to real Rust enums rather than bare
-  integer constants; int-to-enum conversions remain rejected by design
-  (safe Rust has no fallible discriminant cast in the subset).
-  (test/Import/C/enums.c, enums-invalid.c, test/EndToEnd/switch-enum.c)
+  integer constants; enum-to-int conversions (implicit promotions in mixed
+  enum/int comparisons and arithmetic, and explicit casts) lower to
+  `emitrust.cast` on the mapped destination type — signless i32 for signed
+  underlying types, ui32 for unsigned ones, so C's unsigned comparison
+  against negative ints is preserved — rendered as safe Rust `as` casts of
+  the `#[repr(i32)]` enum; int-to-enum conversions remain rejected by
+  design (safe Rust has no fallible discriminant cast in the subset), as
+  are comparisons between distinct enum types.
+  (test/Import/C/enums.c, enum-int.c, enums-invalid.c,
+  test/EndToEnd/switch-enum.c, test/EndToEnd/enum-int.c)
 - [x] C99-6 Typedefs of every supported type shape, including typedefs of
   pointers, arrays, and struct types, resolved through canonical types; a
   typedef naming an anonymous struct (`typedef struct { ... } T;`) gives

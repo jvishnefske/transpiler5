@@ -4011,16 +4011,21 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     if (failed(value))
       return failure();
     // Enum-to-integer (Sema's integral promotion, an arithmetic use, or an
-    // explicit cast): an `emitrust.cast` to the destination width. The
-    // destination is signless like every imported integer; enum values are
-    // verified to fit in i32, so the width alone is sufficient.
+    // explicit cast): an `emitrust.cast` to the mapped destination type
+    // (Rust's `as` casts a fieldless `#[repr(i32)]` enum to any integer
+    // type via its discriminant, matching C's conversion). Mapping the
+    // destination keeps unsigned promotions unsigned, so an enum with an
+    // unsigned underlying type meets its comparison or arithmetic partner
+    // at the same type and unsigned C semantics are preserved.
     if (llvm::isa<emitrust::EnumType>((*value).getType())) {
       if (!cast->getType().getCanonicalType()->isIntegerType())
         return emitError(loc) << "unsupported integral cast";
-      unsigned width = astContext().getIntWidth(cast->getType());
-      return builder
-          .create<emitrust::CastOp>(loc, builder.getIntegerType(width),
-                                    *value)
+      FailureOr<Type> mapped = mapType(cast->getType(), loc);
+      if (failed(mapped))
+        return failure();
+      if (!llvm::isa<IntegerType>(*mapped))
+        return emitError(loc) << "unsupported integral cast";
+      return builder.create<emitrust::CastOp>(loc, *mapped, *value)
           .getResult();
     }
     FailureOr<Type> mapped = mapType(cast->getType(), loc);
@@ -4491,13 +4496,14 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
   // unsigned) underlying type, so the enum values are recovered from behind
   // the promotion casts. Equality maps to `emitrust.cmp` on the enum type
   // (Rust derives PartialEq); relational comparison has no derived Rust
-  // ordering and compares the i32 discriminants instead.
+  // ordering and compares the i32 discriminants instead. A comparison
+  // between an enum and a non-enum integer takes the generic integer path
+  // below: `emitRValue` renders the enum side as its `#[repr(i32)]`
+  // discriminant via `emitrust.cast` (Rust `as i32`), matching C's
+  // conversion of the enum operand to the common integer type.
   std::optional<EnumOperand> lhsEnum = classifyEnumOperand(op->getLHS());
   std::optional<EnumOperand> rhsEnum = classifyEnumOperand(op->getRHS());
-  if (lhsEnum || rhsEnum) {
-    if (!lhsEnum || !rhsEnum)
-      return emitError(loc)
-             << "unsupported: comparison between an enum and a non-enum value";
+  if (lhsEnum && rhsEnum) {
     if (lhsEnum->decl != rhsEnum->decl)
       return emitError(loc)
              << "unsupported: comparison between distinct enum types";
