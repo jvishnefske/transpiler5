@@ -829,13 +829,185 @@ referenced regression tests pass under ninja check-emitrust.
   program start. (test/Import/C/globals.c,
   globals-static-collision.c, test/EndToEnd/globals.c)
 
+## c-testsuite Remaining-Failure Checklist
+
+Ledger as of 2026-07-16 (commit a091423): 220 total / 150 passed /
+0 miscompiled / 70 unsupported. Every one of the 70 is a located
+build-time rejection (or a rustc build failure — never wrong output).
+This checklist partitions all 70 by sole blocker: each item lists the
+exact tests it unlocks, so the sum of all items is exactly 70. Same
+checkbox discipline as above — tick only when the referenced tests pass
+under ninja check-emitrust and the ledger ratchets with zero new
+miscompiles. Counts are first-blocker attributions; unlocking one item
+can surface a second blocker in the same test (the interaction effect
+observed when C99-33 + C99-47 together unlocked 00215).
+
+### Quick wins (7 tests, no design decisions needed)
+
+- [ ] CTS-E1 (3) Thread-local closure binder shadows a mutable global
+  named `c`: TranslateToRust.cpp hardcodes `.with(|c| c.get())` /
+  `.with(|c| c.set(v))`, so a C global literally named `c` makes rustc
+  resolve the closure pattern against the thread-local key and fail with
+  E0308. Rename the binder to a reserved identifier (e.g. `__tl`).
+  These are the only three tests that transpile but fail rustc.
+  (00127.c, 00128.c, 00142.c)
+- [ ] CTS-F2 (3) Unreferenced main-file declarations must not demand
+  definitions: `extern int x;` or a repeated prototype `int foo(void);`
+  that is never referenced currently rejects with "referenced but not
+  defined in any translation unit" even though nothing references it.
+  Apply the C99-39 referenced-only policy to main-file prototypes and
+  extern objects: skip if unreferenced, reject at the use site otherwise.
+  (00094.c, 00108.c, 00162.c)
+- [ ] CTS-S3 (1) Block-scope function prototypes (`int f1(char *);`
+  inside a function body): hoist the declaration to module scope and
+  continue; currently "unsupported declaration inside a function body".
+  (00078.c)
+
+### Pointer model extensions (30 tests, builds on FR-28/C99-26)
+
+- [ ] CTS-P1 (7) `char *` bound to string literals: a read-only
+  string-region class in PointerRegionAnalysis whose base is the literal
+  (`&'static [u8]`/`&'static str`) and whose cursor indexes it; feeds the
+  existing %s printf shapes (C99-28/47). Watch embedded-NUL and
+  non-ASCII policy already set by C99-28.
+  (00025.c, 00026.c, 00058.c, 00112.c, 00137.c, 00138.c, 00173.c)
+- [ ] CTS-P2 (7) Pointer types outside the parameter/local-cursor
+  positions FR-28 classifies: pointer returns, pointer struct members
+  (C99-43), pointers in casts and mixed expressions. Requires extending
+  the region analysis beyond (base, cursor) pairs rooted in one
+  function's locals.
+  (00019.c, 00049.c, 00095.c, 00140.c, 00150.c, 00208.c, 00214.c)
+- [ ] CTS-P3 (5) Pointers assigned non-address values (integer↔pointer
+  round-trips, arithmetic results stored back into pointers): needs a
+  design decision — either a tagged cursor representation or a
+  permanent by-design rejection documented per test.
+  (00039.c, 00103.c, 00144.c, 00163.c, 00187.c)
+- [ ] CTS-P4 (4) Pointer-typed global variables: global region bases.
+  Hard interaction with the thread_local!+Cell global model (a borrow
+  cannot escape `.with`); likely wants globals-as-slices with index
+  cursors, or owner-struct promotion to module scope. C99-14 currently
+  rejects these by design.
+  (00040.c, 00045.c, 00149.c, 00209.c)
+- [ ] CTS-P5 (2) Pointer-to-pointer values (`&p`, `**p`): second-order
+  cursors over a region whose elements are themselves (base, cursor)
+  pairs (C99-43).
+  (00005.c, 00020.c)
+- [ ] CTS-P6 (2) Pointers into global aggregates: same borrow-escape
+  problem as CTS-P4; a global array base must be readable/writable
+  through an index cursor without holding a borrow across statements.
+  (00181.c, 00217.c)
+- [ ] CTS-P7 (2) One pointer ranging over several objects (`p = &x;
+  ... p = &y;`): PointerRegionAnalysis unions the objects into one
+  region today and rejects; needs either region materialization (copy
+  both objects into one backing array) or an enum-of-bases cursor.
+  (00077.c, 00172.c)
+- [ ] CTS-P8 (1) NULL data-pointer constants: an Option-of-cursor model
+  mirroring the fn_ptr None mapping; interacts with CTS-P3.
+  (00171.c)
+
+### Records and symbol namespaces (16 tests)
+
+- [ ] CTS-R1 (5) Bare anonymous struct types (no tag, no typedef name):
+  synthesize a stable name (e.g. `Anon<n>` keyed by shape) and reuse the
+  C99-6 dedup machinery; today only typedef'd anonymous structs import.
+  (00017.c, 00043.c, 00047.c, 00118.c, 00120.c)
+- [ ] CTS-R2 (2) Unnamed struct members (anonymous member injection —
+  C11 6.7.2.1p13 anonymous struct/union members whose fields join the
+  parent's namespace): flatten fields into the parent struct_def with
+  mangled names, or reject-by-design with a note.
+  (00046.c, 00050.c)
+- [ ] CTS-R3 (3) Unions (C99-44): design decision required — safe Rust
+  has no untagged unions without unsafe; candidates are a data-carrying
+  enum when all accesses are type-consistent, or byte-array storage with
+  typed accessor helpers for real type punning.
+  (00042.c, 00210.c, 00218.c)
+- [ ] CTS-R4 (2) Block-scope struct declarations shadowing an outer tag
+  (same tag `T`, different shape, inner scope): the importer's per-name
+  shape dedup misreads this as a cross-TU conflict; record keys need
+  scope depth, and the inner type needs a distinct Rust name.
+  (00044.c, 00053.c)
+- [ ] CTS-R5 (3) C's separate tag/ordinary namespaces (`struct a` and a
+  global `a` coexisting, or a static local colliding with the mangled
+  `<fn>_<name>` scheme): Rust has one namespace per kind but the emitter
+  uses one symbol table; mangle tags (e.g. `Struct_a`) or detect-and-
+  rename on collision.
+  (00129.c, 00204.c, 00219.c)
+- [ ] CTS-R6 (1) Empty structs (`struct T {};` — a GNU/C2x shape clang
+  accepts): emit a unit-like Rust struct; today "struct with no
+  members" rejects.
+  (00216.c)
+
+### Statements and expressions (10 tests)
+
+- [ ] CTS-S1 (2) Compound assignment with operand promotion
+  (`char/short x; x += wider;`): lower as load, widen-cast, operate,
+  narrow-cast, store. Must respect the zero-vs-sign-extension trap
+  documented for the pipeline (adversarial negative/width-extreme
+  differential tests required).
+  (00111.c, 00174.c)
+- [ ] CTS-S2 (2) Switch bodies that are not plain compound statements
+  and case labels nested inside inner statements (Duff-adjacent,
+  C99-32 note): requires emitting switch dispatch as cf-level branches
+  into arbitrary statement positions rather than the structured match
+  lowering; goto's labelBlocks machinery (C99-33) is the likely vehicle.
+  (00051.c, 00143.c)
+- [ ] CTS-S4 (2) Multi-dimensional arrays (C99-41): nested
+  `emitrust.array` types, nested ArrayAttr initializers (the C99-11
+  file-scope machinery already recurses), and row-major subscript
+  lowering; mapType currently rejects the type before anything else
+  runs.
+  (00130.c, 00151.c)
+- [ ] CTS-S5 (1) Variable-length arrays: conflicts with the
+  deterministic/bounded design philosophy; recommend documenting as a
+  permanent by-design rejection rather than implementing.
+  (00207.c)
+- [ ] CTS-S6 (1) Integer-to-enum conversion (the reverse of C99-5):
+  needs a design decision — `#[repr(i32)]` enums admit no safe `from`
+  without a match table; generate a `fn <Enum>_from_i32` exhaustive
+  match helper, or keep rejecting.
+  (00170.c)
+- [ ] CTS-S7 (2) `(void)` casts and void-typed contexts (evaluate and
+  discard, `void` in a statement-expression position): map to an
+  expression statement / `let _ =` discard; today "unsupported cast
+  (ToVoid)" / "unsupported builtin type 'void'".
+  (00212.c, 00213.c)
+
+### Functions and linkage (2 tests)
+
+- [ ] CTS-F1 (2) Variadic calls and variadic function-pointer types
+  beyond the printf/puts intrinsics (C99-37): design decision needed
+  (safe Rust has no C-style varargs; candidates are arity-specialized
+  monomorphization at call sites, or rejection).
+  (00186.c, 00189.c)
+
+### Hosted library surface (5 tests)
+
+- [ ] CTS-L1 (2) string.h subset — at least `strcpy` into a char array
+  (C99-48): safe helper over `&mut [i8]` mirroring `__emitrust_cstr`;
+  bounds are compile-time known array sizes, so no unsafe needed.
+  (00179.c, 00180.c)
+- [ ] CTS-L2 (1) printf %s of a `char *` function parameter: extend the
+  C99-28 %s shapes to accept the FR-28 `mut_ref<slice<i8>>` parameter
+  class (slice + `__emitrust_cstr`).
+  (00200.c)
+- [ ] CTS-L3 (2) String-literal and other initializers for
+  pointer-typed objects (`char *s = "…"` at file scope, struct fields):
+  blocked on CTS-P1/CTS-P4; listed separately because the diagnostic
+  fires in convertGlobalInit rather than the pointer analysis.
+  (00089.c, 00220.c)
+Not itemized above: printf precision (`%.3s`) and long-long length
+specifiers (`%llx`, `%10Ld`) remain outside the C99-47 grammar, but no
+test is sole-blocked on them today (00204.c hits CTS-R5 first, 00182.c
+already passes) — they surface as second blockers once CTS-R5 lands.
+
 ## Non-Goals for the MVP
 
 Generics, lifetimes beyond simple references, traits and impls, pattern
 matching beyond literal match arms, data-carrying enums (C-like unit-variant
 enums are supported), error-handling sugar, and expression trees (every
 value is a named let binding; no inlining of subexpressions). On the C side
-the importer rejects, with located diagnostics: goto, unions, bitfields,
+the importer rejects, with located diagnostics: computed goto (plain
+goto/labels are supported per C99-33), unions, bitfields,
 int-to-enum conversions, pointer-to-pointer values, pointer struct fields
 and pointer globals, NULL data pointers, void* casts, malloc and friends
 (pointer arithmetic, pointer locals, and pointer/array parameters are now
