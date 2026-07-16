@@ -259,6 +259,32 @@ emitrust.global @aggregate_init <42 : i32> : !emitrust.array<4xi32>
 
 // -----
 
+// expected-error @+1 {{aggregate init has 2 elements, but the array type '!emitrust.array<4xi32>' has 4}}
+emitrust.global @short_list <[1 : i32, 2 : i32]> : !emitrust.array<4xi32>
+
+// -----
+
+// expected-error @+1 {{aggregate init element type 'i64' does not match the expected type 'i32'}}
+emitrust.global @element_mismatch <[1 : i32, 2 : i64]> : !emitrust.array<2xi32>
+
+// -----
+
+// expected-error @+1 {{list init is only supported for array and struct value types, but got 'i32'}}
+emitrust.global @list_on_scalar <[1 : i32]> : i32
+
+// -----
+
+// expected-error @+1 {{aggregate init for struct type '!emitrust.struct<"Ghost">' requires a visible emitrust.struct_def}}
+emitrust.global @no_struct_def <[1 : i32]> : !emitrust.struct<"Ghost">
+
+// -----
+
+emitrust.struct_def @Pair ["a", "b"] [i32, i32]
+// expected-error @+1 {{aggregate init has 1 elements, but struct 'Pair' has 2 fields}}
+emitrust.global @field_count <[1 : i32]> : !emitrust.struct<"Pair">
+
+// -----
+
 emitrust.func @load_unknown_symbol() {
   // expected-error @+1 {{'missing' does not reference a valid emitrust.global}}
   %0 = emitrust.global_load @missing : i32

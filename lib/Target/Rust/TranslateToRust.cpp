@@ -118,6 +118,15 @@ private:
   /// arrays.
   LogicalResult emitDefaultValue(Location loc, Type type);
 
+  /// Emits the Rust expression for a global initializer of value type
+  /// `type`: an ArrayAttr renders as an array literal `[e0, e1, ...]` for
+  /// an array type or a struct literal `Name { f0: e0, ... }` for a struct
+  /// type (fields resolved from the `emitrust.struct_def` visible from
+  /// `op`, in declaration order); any other attribute renders through
+  /// emitAttribute. Nested aggregate elements recurse.
+  LogicalResult emitAggregateInit(Operation *op, Location loc, Attribute init,
+                                  Type type);
+
   /// Emits `value` as a quoted Rust string literal, escaping backslashes,
   /// quotes, newlines, tabs, and carriage returns.
   void emitEscapedStringLiteral(StringRef value);
@@ -1018,16 +1027,60 @@ LogicalResult RustEmitter::emitEnumDef(emitrust::EnumDefOp enumDefOp) {
   return success();
 }
 
+LogicalResult RustEmitter::emitAggregateInit(Operation *op, Location loc,
+                                             Attribute init, Type type) {
+  auto elements = dyn_cast<ArrayAttr>(init);
+  if (!elements)
+    return emitAttribute(loc, init);
+  if (auto arrayType = dyn_cast<emitrust::ArrayType>(type)) {
+    os << "[";
+    bool first = true;
+    for (Attribute element : elements) {
+      if (!first)
+        os << ", ";
+      first = false;
+      if (failed(emitAggregateInit(op, loc, element,
+                                   arrayType.getElementType())))
+        return failure();
+    }
+    os << "]";
+    return success();
+  }
+  if (auto structType = dyn_cast<emitrust::StructType>(type)) {
+    auto structDef = SymbolTable::lookupNearestSymbolFrom<
+        emitrust::StructDefOp>(op, StringAttr::get(op->getContext(),
+                                                   structType.getName()));
+    if (!structDef)
+      return op->emitOpError("aggregate init for struct type ")
+             << type << " requires a visible emitrust.struct_def";
+    os << structType.getName() << " { ";
+    for (auto [element, name, fieldType] :
+         llvm::zip_equal(elements, structDef.getFieldNames(),
+                         structDef.getFieldTypes())) {
+      os << cast<StringAttr>(name).getValue() << ": ";
+      if (failed(emitAggregateInit(op, loc, element,
+                                   cast<TypeAttr>(fieldType).getValue())))
+        return failure();
+      os << ", ";
+    }
+    os << "}";
+    return success();
+  }
+  // The GlobalOp verifier rejects list initializers on non-aggregate types.
+  return emitError(loc) << "cannot translate list initializer for type "
+                        << type;
+}
+
 LogicalResult RustEmitter::emitGlobal(emitrust::GlobalOp globalOp) {
   Location loc = globalOp.getLoc();
   Type type = globalOp.getType();
 
-  // Emits the initializer expression: the typed init attribute when
-  // present, the type's default value otherwise (C zero-initialization of
-  // static storage).
+  // Emits the initializer expression: the (possibly aggregate) init
+  // attribute when present, the type's default value otherwise (C
+  // zero-initialization of static storage).
   auto emitInit = [&]() -> LogicalResult {
     if (Attribute init = globalOp.getInitAttr())
-      return emitAttribute(loc, init);
+      return emitAggregateInit(globalOp.getOperation(), loc, init, type);
     return emitDefaultValue(loc, type);
   };
 

@@ -407,11 +407,67 @@ static bool isScalarValueType(Type type) {
   return isa<IntegerType, IndexType, FloatType>(type);
 }
 
+/// Verifies that `init` structurally matches the aggregate value type
+/// `type`: an array type requires exactly one entry per element, a struct
+/// type requires exactly one entry per field of the referenced
+/// `emitrust.struct_def` (in declaration order). Leaf entries must be typed
+/// attributes of the leaf type; aggregate entries recurse.
+static LogicalResult verifyAggregateInit(Operation *op, Attribute init,
+                                         Type type) {
+  auto elements = dyn_cast<ArrayAttr>(init);
+  if (!elements) {
+    auto typedInit = dyn_cast<TypedAttr>(init);
+    if (!typedInit)
+      return op->emitOpError(
+          "aggregate init element must be a typed attribute or a nested "
+          "list, but got ")
+             << init;
+    if (typedInit.getType() != type)
+      return op->emitOpError("aggregate init element type ")
+             << typedInit.getType() << " does not match the expected type "
+             << type;
+    return success();
+  }
+  if (auto arrayType = dyn_cast<ArrayType>(type)) {
+    if (elements.size() != arrayType.getSize())
+      return op->emitOpError("aggregate init has ")
+             << elements.size() << " elements, but the array type " << type
+             << " has " << arrayType.getSize();
+    for (Attribute element : elements)
+      if (failed(verifyAggregateInit(op, element, arrayType.getElementType())))
+        return failure();
+    return success();
+  }
+  if (auto structType = dyn_cast<StructType>(type)) {
+    auto structDef = SymbolTable::lookupNearestSymbolFrom<StructDefOp>(
+        op, StringAttr::get(op->getContext(), structType.getName()));
+    if (!structDef)
+      return op->emitOpError("aggregate init for struct type ")
+             << type << " requires a visible emitrust.struct_def";
+    ArrayAttr fieldTypes = structDef.getFieldTypes();
+    if (elements.size() != fieldTypes.size())
+      return op->emitOpError("aggregate init has ")
+             << elements.size() << " elements, but struct '"
+             << structType.getName() << "' has " << fieldTypes.size()
+             << " fields";
+    for (auto [element, fieldType] : llvm::zip_equal(elements, fieldTypes))
+      if (failed(verifyAggregateInit(
+              op, element, cast<TypeAttr>(fieldType).getValue())))
+        return failure();
+    return success();
+  }
+  return op->emitOpError(
+             "list init is only supported for array and struct value "
+             "types, but got ")
+         << type;
+}
+
 /// Verifies that the global's value type is a scalar, array, struct, or
 /// fn_ptr, that the `const` marker is only used with const-initializable
 /// (scalar or array) value types, and that a present initializer is a typed
-/// attribute of the value type on a scalar global or an opaque attribute on
-/// a fn_ptr global.
+/// attribute of the value type on a scalar global, an opaque attribute on a
+/// fn_ptr global, or a structurally matching element list (ArrayAttr) on an
+/// array or struct global.
 LogicalResult GlobalOp::verify() {
   Type type = getType();
   if (!isScalarValueType(type) &&
@@ -432,6 +488,9 @@ LogicalResult GlobalOp::verify() {
       return emitOpError("fn_ptr init must be an opaque attribute");
     return success();
   }
+  // An aggregate (array or struct) global takes a list initializer.
+  if (isa<ArrayAttr>(init))
+    return verifyAggregateInit(getOperation(), init, type);
   auto typedInit = dyn_cast<TypedAttr>(init);
   if (!typedInit)
     return emitOpError("init must be a typed attribute");

@@ -47,6 +47,23 @@ emitrust.struct_def @Point ["x", "y"] [i32, i32]
 // CHECK-NEXT: }
 emitrust.global @origin : !emitrust.struct<"Point">
 
+// An aggregate-initialized const array renders as an array literal.
+// CHECK-NEXT: static pair: [i32; 2] = [1, -2];
+emitrust.global const @pair <[1 : i32, -2 : i32]> : !emitrust.array<2xi32>
+
+// A struct initializer renders as a struct literal with named fields.
+// CHECK-NEXT: thread_local! {
+// CHECK-NEXT:     static unit: std::cell::Cell<Point> = std::cell::Cell::new(Point { x: 3, y: -4, });
+// CHECK-NEXT: }
+emitrust.global @unit <[3 : i32, -4 : i32]> : !emitrust.struct<"Point">
+
+// Nested aggregates recurse: array-of-struct as struct literals inside an
+// array literal.
+// CHECK-NEXT: thread_local! {
+// CHECK-NEXT:     static corners: std::cell::Cell<[Point; 2]> = std::cell::Cell::new([Point { x: 1, y: 2, }, Point { x: 0, y: 0, }]);
+// CHECK-NEXT: }
+emitrust.global @corners <[[1 : i32, 2 : i32], [0 : i32, 0 : i32]]> : !emitrust.array<2x!emitrust.struct<"Point">>
+
 // CHECK-NEXT: fn access() -> i32 {
 emitrust.func @access() -> i32 {
   // A load from a mutable global goes through the Cell.

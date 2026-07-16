@@ -51,6 +51,14 @@ def EmitRust_OpaqueAttr : EmitRust_Attr<"Opaque", "opaque"> {
 def EmitRust_OpaqueOrTypedAttr
     : AnyAttrOf<[EmitRust_OpaqueAttr, TypedAttrInterface]>;
 
+// Attribute constraint for global initializers: everything
+// EmitRust_OpaqueOrTypedAttr admits, plus an ArrayAttr of element
+// initializers for aggregate (array or struct) globals. The GlobalOp
+// verifier checks that an ArrayAttr initializer structurally matches the
+// global's value type (element count and per-element types).
+def EmitRust_InitAttr
+    : AnyAttrOf<[EmitRust_OpaqueAttr, TypedAttrInterface, ArrayAttr]>;
+
 //===----------------------------------------------------------------------===//
 // Comparison predicate enum
 //===----------------------------------------------------------------------===//

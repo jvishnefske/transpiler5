@@ -330,6 +330,18 @@ emitrust.global const @fixed : !emitrust.array<2xf64>
 // CHECK: emitrust.global @origin : !emitrust.struct<"Point">
 emitrust.global @origin : !emitrust.struct<"Point">
 
+// An aggregate initializer is an ArrayAttr with one entry per element.
+// CHECK: emitrust.global const @pair <[1 : i32, -2 : i32]> : !emitrust.array<2xi32>
+emitrust.global const @pair <[1 : i32, -2 : i32]> : !emitrust.array<2xi32>
+
+// A struct initializer lists one entry per field, in declaration order.
+// CHECK: emitrust.global @unit <[3 : i32, -4 : i32]> : !emitrust.struct<"Point">
+emitrust.global @unit <[3 : i32, -4 : i32]> : !emitrust.struct<"Point">
+
+// Aggregate elements nest: an array of structs takes nested lists.
+// CHECK: emitrust.global @corners <{{\[}}[1 : i32, 2 : i32], [3 : i32, 4 : i32]]> : !emitrust.array<2x!emitrust.struct<"Point">>
+emitrust.global @corners <[[1 : i32, 2 : i32], [3 : i32, 4 : i32]]> : !emitrust.array<2x!emitrust.struct<"Point">>
+
 // CHECK-LABEL: emitrust.func @global_access
 emitrust.func @global_access() {
   // CHECK: emitrust.global_load @counter : i32

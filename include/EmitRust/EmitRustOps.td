@@ -601,10 +601,13 @@ def EmitRust_GlobalOp : EmitRust_Op<"global", [
     The `emitrust.global` operation defines a named module-level variable
     with static storage duration. The value type must be a scalar (integer,
     index, or float), an `!emitrust.array`, an `!emitrust.struct`, or an
-    `!emitrust.fn_ptr`. The optional initializer must be a typed attribute
-    whose type equals the value type; initializers are only supported for
-    scalar value types, except that an `!emitrust.fn_ptr` global takes an
-    opaque attribute (such as `Some(f)`) emitted verbatim. Without an
+    `!emitrust.fn_ptr`. A scalar global's optional initializer must be a
+    typed attribute whose type equals the value type; an `!emitrust.fn_ptr`
+    global takes an opaque attribute (such as `Some(f)`) emitted verbatim;
+    an array or struct global takes an ArrayAttr with exactly one entry per
+    array element (rendered `[e0, e1, ...]`) or per struct field in
+    declaration order (rendered `Name { f0: e0, ... }`), recursively
+    admitting nested ArrayAttr entries for aggregate elements. Without an
     initializer the global starts at the type's default value (`0`, `0.0`,
     `false`, `Name::default()`, `None`, or `[<element-default>; N]`), which
     models C's zero-initialization of static storage.
@@ -625,6 +628,7 @@ def EmitRust_GlobalOp : EmitRust_Op<"global", [
     emitrust.global @counter <0 : i32> : i32
     emitrust.global const @limit <100 : i32> : i32
     emitrust.global @table : !emitrust.array<4xi32>
+    emitrust.global const @pair <[1 : i32, 2 : i32]> : !emitrust.array<2xi32>
     ```
     ```rust
     // Code emitted for the operations above.
@@ -635,12 +639,13 @@ def EmitRust_GlobalOp : EmitRust_Op<"global", [
     thread_local! {
         static table: std::cell::Cell<[i32; 4]> = std::cell::Cell::new([0; 4]);
     }
+    static pair: [i32; 2] = [1, 2];
     ```
   }];
 
   let arguments = (ins SymbolNameAttr:$sym_name,
                        TypeAttrOf<AnyType>:$type,
-                       OptionalAttr<EmitRust_OpaqueOrTypedAttr>:$init,
+                       OptionalAttr<EmitRust_InitAttr>:$init,
                        UnitAttr:$is_const);
   let results = (outs);
 
