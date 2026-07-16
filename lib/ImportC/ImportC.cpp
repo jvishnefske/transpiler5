@@ -407,7 +407,10 @@ public:
   /// Imports every supported top-level declaration of `context`'s translation
   /// unit into the module: complete named struct definitions, function
   /// declarations or definitions, and file-scope variables (as module-level
-  /// `emitrust.global`s). Other declarations are rejected.
+  /// `emitrust.global`s). Other declarations are rejected, with one
+  /// exception: declarations whose expansion location lies in a system
+  /// header are skipped entirely (never imported, never rejected here);
+  /// any main-file use of one is rejected at the use site instead.
   ///
   /// `tuTag` is prepended to internal-linkage (`static`) symbol names so that
   /// identically named file-statics in different translation units stay
@@ -438,6 +441,21 @@ private:
   /// Converts a clang source location to an MLIR `FileLineColLoc` using the
   /// presumed (user-visible) location; unknown on invalid input.
   Location translateLoc(clang::SourceLocation sourceLoc);
+
+  /// True when `decl`'s expansion location lies in a system header (an
+  /// angle-bracket include or an `-isystem` search path). Such declarations
+  /// are skipped by `importTranslationUnit` instead of being imported
+  /// eagerly; a main-file use of one is rejected at the use site via
+  /// `rejectSystemHeaderUse`. Project headers included via `-I` are not
+  /// system headers and keep the eager fail-fast import.
+  bool isSystemHeaderDecl(const clang::Decl *decl) const;
+
+  /// Located rejection for a main-file use of a declaration that
+  /// `importTranslationUnit` skipped because it lives in a system header.
+  /// `what` describes the use ("call to", "reference to", ...); `name` is
+  /// the used symbol's spelling.
+  LogicalResult rejectSystemHeaderUse(Location loc, llvm::StringRef what,
+                                      llvm::StringRef name);
 
   /// Maps a C value type to its MLIR type: `_Bool`->i1, char->i8,
   /// short->i16, int->i32, long/long long->i64, unsigned char->ui8,
@@ -477,7 +495,8 @@ private:
   //===--------------------------------------------------------------------===//
 
   /// Pure-AST interprocedural pre-pass over every function definition of
-  /// the translation unit (no IR is built). Runs the per-function
+  /// the translation unit (no IR is built). System-header definitions are
+  /// excluded — they are never imported, so they can never be methods. Runs the per-function
   /// `PointerRegionAnalysis` on each body, unifies each pointer call
   /// argument's root object with the callee definition's parameter in a
   /// program-wide union-find, and promotes every class that satisfies ALL
@@ -1544,6 +1563,21 @@ Location CImporter::translateLoc(clang::SourceLocation sourceLoc) {
                              presumed.getLine(), presumed.getColumn());
 }
 
+bool CImporter::isSystemHeaderDecl(const clang::Decl *decl) const {
+  const clang::SourceManager &sourceManager = astContext().getSourceManager();
+  clang::SourceLocation loc =
+      sourceManager.getExpansionLoc(decl->getLocation());
+  return loc.isValid() && sourceManager.isInSystemHeader(loc);
+}
+
+LogicalResult CImporter::rejectSystemHeaderUse(Location loc,
+                                               llvm::StringRef what,
+                                               llvm::StringRef name) {
+  return emitError(loc) << "unsupported: " << what << " '" << name
+                        << "' declared in a system header; not part of the "
+                           "supported C subset";
+}
+
 FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
   clang::QualType canonical = type.getCanonicalType();
 
@@ -1856,7 +1890,8 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
   SmallVector<const clang::FunctionDecl *> definitions;
   for (const clang::Decl *decl : unit->decls())
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl))
-      if (func->doesThisDeclarationHaveABody() && !func->isVariadic())
+      if (func->doesThisDeclarationHaveABody() && !func->isVariadic() &&
+          !isSystemHeaderDecl(func))
         definitions.push_back(func);
 
   for (const clang::FunctionDecl *func : definitions) {
@@ -2693,6 +2728,17 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   planOwners(unit, soleTranslationUnit);
   for (const clang::Decl *decl : unit->decls()) {
     if (decl->isImplicit())
+      continue;
+    // System-header declarations (angle-bracket includes, `-isystem`) are
+    // skipped instead of imported eagerly: real libc headers are full of
+    // constructs outside the supported subset (anonymous structs in
+    // bits/types.h, variadic prototypes, ...), and a program that never
+    // touches them must not be rejected for their sake. A main-file use of
+    // a skipped declaration is rejected at the use site (see
+    // `rejectSystemHeaderUse`); types are still imported on demand through
+    // `mapType`. Project headers included via `-I` are not system headers
+    // and keep the whole-file fail-fast import.
+    if (isSystemHeaderDecl(decl))
       continue;
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
       if (failed(importFunction(func)))
@@ -4808,9 +4854,12 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
 
   std::string name = mlirFuncName(callee);
   func::FuncOp target = functions.lookup(name);
-  if (!target)
+  if (!target) {
+    if (isSystemHeaderDecl(callee))
+      return rejectSystemHeaderUse(loc, "call to", callee->getName());
     return emitError(loc) << "unsupported: call to unimported function '"
                           << name << "'";
+  }
 
   // A method-planned callee (Phase 4) takes the owner receiver plus i64
   // element cursors in place of its pointer arguments.
@@ -5113,10 +5162,14 @@ CImporter::resolveFunctionPointerTarget(const clang::Expr *expr,
            << "unsupported: taking the address of a variadic function";
   std::string name = mlirFuncName(callee);
   func::FuncOp target = functions.lookup(name);
-  if (!target)
+  if (!target) {
+    if (isSystemHeaderDecl(callee))
+      return rejectSystemHeaderUse(loc, "taking the address of",
+                                   callee->getName());
     return emitError(loc)
            << "unsupported: taking the address of unimported function '"
            << name << "'";
+  }
   // The imported function's MLIR signature must equal the fn_ptr's
   // component types exactly. This rejects prototype mismatches (including
   // a prototype-less `int (*)()` pointer bound to a function with
@@ -5483,6 +5536,14 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
         if (pointerRegions.tracks(var))
           return emitError(loc) << "unsupported use of pointer variable '"
                                 << var->getName() << "'";
+      // A named declaration skipped at import time because it lives in a
+      // system header (stdin, errno-style globals, ...) gets the dedicated
+      // use-site rejection; every other miss keeps the generic message.
+      if (const auto *named =
+              llvm::dyn_cast<clang::NamedDecl>(ref->getDecl()))
+        if (named->getDeclName().isIdentifier() && isSystemHeaderDecl(named))
+          return rejectSystemHeaderUse(loc, "reference to",
+                                       named->getName());
       return emitError(loc) << "unsupported: reference to an unknown variable";
     }
     Value place = it->second;
