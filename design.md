@@ -422,9 +422,13 @@ rule.
   integer constants; int-to-enum conversions remain rejected by design
   (safe Rust has no fallible discriminant cast in the subset).
   (test/Import/C/enums.c, enums-invalid.c, test/EndToEnd/switch-enum.c)
-- [ ] C99-6 Typedefs of every supported type shape, including typedefs of
-  pointers, arrays, and struct types (currently resolved through canonical
-  types but not regression-tested as a feature).
+- [x] C99-6 Typedefs of every supported type shape, including typedefs of
+  pointers, arrays, and struct types, resolved through canonical types; a
+  typedef naming an anonymous struct (`typedef struct { ... } T;`) gives
+  the record its typedef name for import, mangling, and cross-TU shape
+  dedup, while a bare anonymous struct stays rejected with a located
+  diagnostic. (test/Import/C/typedefs.c, structs-anon-typedef.c,
+  test/EndToEnd/fn-pointers.c)
 - [ ] C99-7 Type qualifiers: const (shared reference or immutable let
   mapping), volatile (likely rejected with a diagnostic by policy),
   restrict (accepted and ignored).

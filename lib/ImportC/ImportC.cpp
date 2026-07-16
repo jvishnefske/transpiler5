@@ -1141,6 +1141,21 @@ static bool isUnsignedInt(Type type) {
   return intType && intType.isUnsigned();
 }
 
+/// Returns the Rust-facing name of a record: its tag name, or, for a tagless
+/// record declared through `typedef struct { ... } T;`, the typedef name.
+/// Returns an empty StringRef for a bare anonymous struct, which stays
+/// rejected. The typedef name is the record's name for all mangling and
+/// cross-TU shape-dedup purposes, exactly like a tagged struct.
+static llvm::StringRef recordRustName(const clang::RecordDecl *record) {
+  llvm::StringRef name = record->getName();
+  if (!name.empty())
+    return name;
+  if (const clang::TypedefNameDecl *typedefName =
+          record->getTypedefNameForAnonDecl())
+    return typedefName->getName();
+  return {};
+}
+
 /// Returns whether the canonical type of `type` is a C pointer type.
 static bool isPointerType(clang::QualType type) {
   return type.getCanonicalType()->isPointerType();
@@ -1598,12 +1613,12 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     const clang::RecordDecl *definition = decl->getDefinition();
     if (!definition)
       return emitError(loc) << "unsupported: incomplete struct type";
-    if (definition->getName().empty())
+    llvm::StringRef structName = recordRustName(definition);
+    if (structName.empty())
       return emitError(loc) << "unsupported: anonymous struct type";
     if (failed(importRecord(definition, loc)))
       return failure();
-    return Type(
-        emitrust::StructType::get(builder.getContext(), definition->getName()));
+    return Type(emitrust::StructType::get(builder.getContext(), structName));
   }
 
   if (const clang::ConstantArrayType *array =
@@ -2046,11 +2061,11 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
     return emitError(defLoc) << "unsupported record declaration";
   if (!importedRecords.insert(definition).second)
     return success();
-  if (definition->getName().empty())
+  llvm::StringRef structName = recordRustName(definition);
+  if (structName.empty())
     return emitError(defLoc) << "unsupported: anonymous struct type";
-  if (isRustKeyword(definition->getName()))
-    return emitError(defLoc) << "unsupported: struct name '"
-                             << definition->getName()
+  if (isRustKeyword(structName))
+    return emitError(defLoc) << "unsupported: struct name '" << structName
                              << "' is a Rust keyword";
 
   SmallVector<llvm::StringRef> fieldNames;
@@ -2082,20 +2097,19 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
     for (auto [fieldName, fieldType] : llvm::zip(fieldNames, fieldTypes))
       os << fieldName << ':' << fieldType << ';';
   }
-  auto existingShape = importedRecordShapes.find(definition->getName());
+  auto existingShape = importedRecordShapes.find(structName);
   if (existingShape != importedRecordShapes.end()) {
     if (existingShape->second != shape)
       return emitError(defLoc)
-             << "unsupported: conflicting definition of struct '"
-             << definition->getName()
+             << "unsupported: conflicting definition of struct '" << structName
              << "' with a different shape in another translation unit";
     return success();
   }
-  importedRecordShapes[definition->getName()] = shape;
+  importedRecordShapes[structName] = shape;
 
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
   moduleBuilder.create<emitrust::StructDefOp>(
-      defLoc, moduleBuilder.getStringAttr(definition->getName()),
+      defLoc, moduleBuilder.getStringAttr(structName),
       moduleBuilder.getStrArrayAttr(fieldNames),
       moduleBuilder.getTypeArrayAttr(fieldTypes));
   return success();

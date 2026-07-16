@@ -1,0 +1,88 @@
+// C99-6: `typedef struct { ... } T;` gives the tagless record its typedef
+// name; the struct imports, and its fields read/write and pass to functions
+// exactly like a tagged struct. Across translation units the typedef name is
+// the dedup key: an identical shape imports once, and a bare anonymous
+// struct with no typedef name stays rejected with a located diagnostic.
+// RUN: split-file %s %t
+// RUN: emitrust-import-c %t/valid.c | FileCheck %s
+// RUN: emitrust-import-c %t/tu-a.c %t/tu-b.c | FileCheck %s --check-prefix=DEDUP
+// RUN: not emitrust-import-c %t/bare.c 2>&1 | FileCheck %s --check-prefix=BARE
+
+//--- valid.c
+typedef struct {
+  int x;
+  int y;
+} Point;
+
+void set_origin(Point *p) {
+  p->x = 0;
+  p->y = 0;
+}
+
+int manhattan(Point q) { return q.x + q.y; }
+
+int use_point(void) {
+  Point pt;
+  pt.x = 3;
+  pt.y = 4;
+  set_origin(&pt);
+  return manhattan(pt) + pt.x;
+}
+
+// The typedef name is the struct's name, same as a tagged struct.
+// CHECK: emitrust.struct_def @Point ["x", "y"] [i32, i32]
+
+// Struct pointer parameter: deref + member + assign through the typedef name.
+// CHECK-LABEL: func.func @set_origin
+// CHECK-SAME: (%[[P:.*]]: !emitrust.mut_ref<!emitrust.struct<"Point">>)
+// CHECK: %[[PL:.*]] = emitrust.deref %[[P]] : (!emitrust.mut_ref<!emitrust.struct<"Point">>) -> !emitrust.lvalue<!emitrust.struct<"Point">>
+// CHECK: emitrust.member %[[PL]]["x"]
+// CHECK: emitrust.assign
+
+// By-value struct parameter, field reads.
+// CHECK-LABEL: func.func @manhattan
+// CHECK-SAME: (%{{.*}}: !emitrust.struct<"Point">) -> i32
+// CHECK: emitrust.member %{{.*}}["x"]
+// CHECK: emitrust.load
+// CHECK: arith.addi
+
+// Local, field writes, address-of argument, by-value argument.
+// CHECK-LABEL: func.func @use_point
+// CHECK: %[[PT:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Point">>
+// CHECK: emitrust.member %[[PT]]["x"]
+// CHECK: emitrust.assign
+// CHECK: emitrust.addr_of mut %[[PT]]
+// CHECK: call @set_origin
+// CHECK: call @manhattan
+
+//--- tu-a.c
+typedef struct {
+  int lo;
+  int hi;
+} Range;
+
+int width(Range r) { return r.hi - r.lo; }
+
+//--- tu-b.c
+typedef struct {
+  int lo;
+  int hi;
+} Range;
+
+int width(Range r);
+
+int mid(Range r) { return r.lo + width(r) / 2; }
+
+// The identical shape reached through the same typedef name in two TUs
+// imports exactly once.
+// DEDUP: emitrust.struct_def @Range ["lo", "hi"] [i32, i32]
+// DEDUP-NOT: emitrust.struct_def @Range
+// DEDUP-DAG: func.func @width
+// DEDUP-DAG: func.func @mid
+
+//--- bare.c
+struct {
+  int x;
+} g;
+
+// BARE: bare.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: anonymous struct type
