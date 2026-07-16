@@ -633,9 +633,16 @@ rule.
   statements) and GNU case ranges are rejected with located diagnostics.
   (test/Import/C/switch.c, switch-invalid.c, test/EndToEnd/switch-enum.c,
   test/EndToEnd/switch-general.c)
-- [ ] C99-33 goto and labels (design decision needed: only reducible
-  patterns can be recovered by lift-cf-to-scf; irreducible control flow
-  has no direct safe-Rust mapping and may remain a documented rejection).
+- [x] C99-33 goto and labels: each label maps to a dedicated block
+  (created at first mention, so forward and backward gotos both resolve)
+  and a goto is a plain cf.br; lift-cf-to-scf structures the resulting
+  CFG, including irreducible shapes (a goto into a loop body lowers
+  through the transformCFGToSCF multiplexer) and backward gotos that form
+  loops. In a function containing labels, emitrust.variable places are
+  hoisted to the entry block so a goto that jumps over a declaration
+  cannot leave a later use undominated. Computed goto (GNU `goto *expr`)
+  is rejected with a located diagnostic.
+  (test/Import/C/goto.c, goto-invalid.c, test/EndToEnd/goto.c)
 
 ### Functions and program structure
 
