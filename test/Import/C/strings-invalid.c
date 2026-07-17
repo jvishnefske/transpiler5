@@ -7,6 +7,7 @@
 // RUN: not emitrust-import-c %t/percent-s-scalar.c 2>&1 | FileCheck %s --check-prefix=SCALARS
 // RUN: not emitrust-import-c %t/puts-value.c 2>&1 | FileCheck %s --check-prefix=PUTSVALUE
 // RUN: not emitrust-import-c %t/putchar-value.c 2>&1 | FileCheck %s --check-prefix=PUTCHARVALUE
+// RUN: not emitrust-import-c %t/utf8-literal.c 2>&1 | FileCheck %s --check-prefix=UTF8LIT
 
 // C99-47/28 boundaries: string shapes outside the supported subset keep
 // located rejections.
@@ -82,3 +83,12 @@ int main(void) {
   return putchar(65);
 }
 // PUTCHARVALUE: putchar-value.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: putchar return value must be unused
+
+// Block-scope array initializers accept ordinary (i8) and wide (i32,
+// CTS-L3) literals; the u8/u/U kinds stay rejected.
+//--- utf8-literal.c
+int main(void) {
+  char s[4] = u8"ab";
+  return s[0];
+}
+// UTF8LIT: utf8-literal.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-ordinary string literal initializer
