@@ -11,16 +11,15 @@
 // C99-47/28 boundaries: string shapes outside the supported subset keep
 // located rejections.
 
-// A `char *` local bound to a string literal stays rejected (the literal
-// has no place a decomposed pointer region could own).
+// A `char *` bound to a string literal is supported (CTS-P1), but the
+// literal's backing keeps the C99-28 ASCII policy: a non-ASCII byte in a
+// literal bound to a pointer is rejected.
 //--- char-ptr-literal.c
-int printf(const char *fmt, ...);
 int main(void) {
-  char *p = "hello";
-  printf("%s\n", p);
-  return 0;
+  char *p = "caf\xff";
+  return p[0];
 }
-// CHARPTR: char-ptr-literal.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer to a string literal
+// CHARPTR: char-ptr-literal.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-ASCII byte in string literal bound to a pointer
 
 // Non-ASCII bytes in a block-scope string initializer are rejected so the
 // array's contents stay exact through the ASCII-only printing helpers.
