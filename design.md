@@ -863,10 +863,13 @@ observed when C99-33 + C99-47 together unlocked 00215).
   Apply the C99-39 referenced-only policy to main-file prototypes and
   extern objects: skip if unreferenced, reject at the use site otherwise.
   (00094.c, 00108.c, 00162.c)
-- [ ] CTS-S3 (1) Block-scope function prototypes (`int f1(char *);`
+- [x] CTS-S3 (1) Block-scope function prototypes (`int f1(char *);`
   inside a function body): hoist the declaration to module scope and
   continue; currently "unsupported declaration inside a function body".
-  (00078.c)
+  (00078.c) Done: `emitStmt` routes a `FunctionDecl` in a `DeclStmt`
+  through `importFunction`, the same path as a file-scope prototype
+  (external linkage per C11 6.2.2p5); other in-body declarations still
+  reject. (test/Import/C/fn-prototypes-local.c; 00078.c in the ledger)
 
 ### Pointer model extensions (30 tests, builds on FR-28/C99-26)
 
