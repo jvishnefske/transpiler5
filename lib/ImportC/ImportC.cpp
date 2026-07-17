@@ -45,9 +45,20 @@
 ///    rejected. A `char *` bound to a string literal is a cursor into a
 ///    read-only region backed by an immutable local byte array holding the
 ///    literal's bytes plus the terminating NUL; writes through such a
-///    region are rejected (writing a C string literal is UB). Pointers
-///    whose address is taken, that rebind across distinct objects, hold a
-///    null constant, or point into globals are rejected with located
+///    region are rejected (writing a C string literal is UB). A region
+///    that sees a null pointer constant is nullable (CTS-P8): each of its
+///    pointers models an Option of its cursor, with the discriminant in a
+///    promotable i1 "non-null" flag cell — `p = NULL` stores false, an
+///    address binding stores true, and a null-check (`p == NULL`,
+///    `if (p)`) reads the flag (statically non-null pointers fold their
+///    null-checks to constants). Dereferencing a possibly-null pointer
+///    emits `assert!(flag, "null pointer dereference")` first — C
+///    dereferencing null is UB, so the deterministic panic is a legal
+///    refinement, mirroring the fn_ptr `expect`. Passing, differencing,
+///    or ordering possibly-null pointers stays rejected, as does the
+///    general integer-to-pointer traffic around the idiom (CTS-P3).
+///    Pointers whose address is taken, that rebind across distinct
+///    objects, or point into globals are rejected with located
 ///    diagnostics.
 ///  - Pointer parameters are classified per definition (Phase 1b): a
 ///    parameter that is only dereferenced or arrowed stays a scalar
@@ -255,7 +266,9 @@ static bool isRustKeyword(llvm::StringRef name) {
 /// cursor is always present.
 struct PtrExprValue {
   /// The object the pointer points into (a local scalar, struct, or
-  /// array); null for a pointer into a string literal.
+  /// array); null for a pointer into a string literal and for a pointer
+  /// of a nullable region that was never bound to any object (a pointer
+  /// that only ever holds the null constant).
   const clang::VarDecl *base;
   /// The i64 element offset from the start of the region; null when
   /// degenerate.
@@ -263,6 +276,12 @@ struct PtrExprValue {
   /// The read-only backing array place of a string-literal region; null
   /// for object-based pointers.
   Value literalBacking;
+  /// The Option-of-cursor discriminant of a pointer in a nullable region:
+  /// an i1 that is true when the pointer currently holds an address and
+  /// false when it holds the null constant (CTS-P8). Null when the
+  /// pointer is statically non-null (its region never sees NULL), which
+  /// lets null-checks fold to constants.
+  Value nonNull;
 };
 
 /// Phase-1b classification of one pointer parameter, derived from the
@@ -290,6 +309,11 @@ struct PointerLocalInfo {
   /// (`!emitrust.lvalue<!emitrust.array<Nxi8>>`, holding the literal's
   /// bytes plus the terminating NUL); null for object-based pointers.
   Value literalBacking;
+  /// Entry-block `memref<i1>` cell holding the Option-of-cursor
+  /// discriminant of a pointer in a nullable region (true = holds an
+  /// address, false = holds the null constant); null for pointers whose
+  /// region never sees a null constant (CTS-P8).
+  Value nonNullCell;
 };
 
 /// One base binding of a pointer region: the object some pointer in the
@@ -324,9 +348,10 @@ struct OwnerPlan {
 /// region's read-only base), whether any pointer arithmetic occurs (which a
 /// degenerate scalar base cannot support), whether anything is written
 /// through the region's pointers (which a read-only string-literal region
-/// cannot support), and the first construct (if any) that puts the region
-/// outside the decomposition (escape, null constant, non-address source,
-/// global target, ...).
+/// cannot support), whether any pointer of the region holds the null
+/// pointer constant (which makes the region an Option of its cursor,
+/// CTS-P8), and the first construct (if any) that puts the region outside
+/// the decomposition (escape, non-address source, global target, ...).
 struct PointerRegion {
   /// Distinct base objects, each with its first binding location.
   SmallVector<PointerBaseBinding, 2> bases;
@@ -347,6 +372,13 @@ struct PointerRegion {
   bool hasWriteThrough = false;
   /// First write-through site; meaningful only with `hasWriteThrough`.
   clang::SourceLocation writeThroughLoc;
+  /// True when a null pointer constant is assigned to (or initializes) any
+  /// pointer of the region. Such a region is nullable: each of its
+  /// pointers models the Option-of-cursor discriminant in a runtime i1
+  /// "non-null" flag cell, mirroring the fn_ptr `None` mapping (CTS-P8).
+  bool nullable = false;
+  /// First null-constant binding site; meaningful only with `nullable`.
+  clang::SourceLocation nullableLoc;
   /// First invalidating construct; meaningful only with `invalidReason`.
   clang::SourceLocation invalidLoc;
   /// Diagnostic text of the invalidating construct; empty when the region
@@ -361,10 +393,12 @@ struct PointerRegion {
 /// array-to-pointer decay, and slice-classified pointer parameters (Phase
 /// 1b: `p = param` makes the parameter the region base), binds string
 /// literals from their decay (`p = "..."` makes the literal the base of a
-/// read-only region), flags pointer arithmetic and writes through the
-/// region's pointers, and records the first construct that makes a region
-/// undecomposable (taking a pointer's address, null constants, non-address
-/// sources, global targets). Base objects participate in the union-find
+/// read-only region), flags pointer arithmetic, writes through the
+/// region's pointers, and null-constant bindings (`p = NULL` marks the
+/// region nullable instead of invalidating it, CTS-P8), and records the
+/// first construct that makes a region undecomposable (taking a pointer's
+/// address, non-address sources, global targets). Base objects participate
+/// in the union-find
 /// alongside the pointers so that two pointers into the same object always
 /// share a region. The importer validates each pointer local against its
 /// region at the declaration; a region is consumable only when it is
@@ -420,6 +454,10 @@ private:
 
   /// Flags `ptr`'s region as performing pointer arithmetic at `loc`.
   void recordArithmetic(const clang::VarDecl *ptr, clang::SourceLocation loc);
+
+  /// Flags `ptr`'s region as nullable at `loc` (a null pointer constant
+  /// was assigned to one of its pointers); only the first site is kept.
+  void recordNullable(const clang::VarDecl *ptr, clang::SourceLocation loc);
 
   /// Flags `ptr`'s region as written through (`*p = v`, `p[i] = v`, ...)
   /// at `loc`; a string-literal region rejects at this location.
@@ -709,13 +747,22 @@ private:
   /// or struct base. A string-literal region registers a cursor cell plus
   /// the literal's read-only backing array (see
   /// `getOrCreateLiteralBacking`) and rejects regions that are written
-  /// through or that join a literal with an object. Undecomposable regions
+  /// through or that join a literal with an object. A nullable region
+  /// (one that sees a null pointer constant, CTS-P8) additionally
+  /// registers an entry-block `memref<i1>` "non-null" flag cell per
+  /// pointer — the Option-of-cursor discriminant — including for a
+  /// nullable region with no base at all (a pointer that only ever holds
+  /// null, which supports null-checks but rejects dereference); a
+  /// nullable string-literal region is rejected. Undecomposable regions
   /// produce located diagnostics at the offending construct.
   LogicalResult emitPointerLocal(const clang::VarDecl *var, Location loc);
 
   /// Emits `ptr = rhs` for a decomposed pointer local by recomputing and
-  /// storing its cursor; a degenerate binding (`p = &x`) needs no code at
-  /// all because the target place is statically known.
+  /// storing its cursor; a degenerate binding (`p = &x`) needs no cursor
+  /// code at all because the target place is statically known. For a
+  /// pointer of a nullable region the assignment also stores the
+  /// Option-of-cursor discriminant: false for `ptr = NULL`, true for an
+  /// address binding, and the source pointer's own flag for `ptr = q`.
   LogicalResult storePointerAssign(Location loc, const clang::VarDecl *ptr,
                                    const clang::Expr *rhs);
 
@@ -1234,10 +1281,23 @@ private:
   /// pre- or post-value per C semantics. A cursor into a multi-dimensional
   /// array counts innermost (scalar or struct) elements in row-major
   /// order, so `&arr[i][j]` on `T arr[M][N]` yields the flat cursor
-  /// `i*N + j`. Null pointer constants, globals, arithmetic on pointers
-  /// to arrays (rows), and every other pointer source are located
-  /// rejections.
+  /// `i*N + j`. A pointer of a nullable region carries its
+  /// Option-of-cursor discriminant (the loaded i1 flag) in the result's
+  /// `nonNull` field. Null pointer constants (whose modeled consumers —
+  /// pointer assignment, null comparison, truth test — intercept them
+  /// before this point), globals, arithmetic on pointers to arrays
+  /// (rows), and every other pointer source are located rejections.
   FailureOr<PtrExprValue> emitPointerRValue(const clang::Expr *expr);
+
+  /// Returns whether `expr` is a C null pointer constant (`NULL`, `0`,
+  /// `(void*)0` in a pointer context).
+  bool isNullPointerConstantExpr(const clang::Expr *expr) const;
+
+  /// Emits the truth value of a data-pointer expression (`if (p)`, `!p`):
+  /// the Option-of-cursor discriminant of a pointer in a nullable region,
+  /// or constant true for a statically non-null pointer (every address a
+  /// decomposed region holds designates a live object).
+  FailureOr<Value> emitPointerTruth(const clang::Expr *expr);
 
   /// Emits the (base, flat cursor) decomposition of one array subscript
   /// level `base[idx]` whose base is itself a decomposed pointer
@@ -1255,13 +1315,19 @@ private:
   /// must wrap; a flat cursor into a multi-dimensional array peels one
   /// array level per subscript, dividing the cursor by the level's flat
   /// element count and continuing with the remainder (row-major order).
+  /// A possibly-null pointer (`pointer.nonNull` set) first emits a
+  /// deterministic panic guard, `assert!(flag, "null pointer
+  /// dereference")`: C dereferencing null is undefined behavior, so the
+  /// panic is a legal refinement (the fn_ptr `expect` precedent). A
+  /// pointer with no base at all (only ever null) is a located rejection.
   FailureOr<Value> emitPointerPlace(Location loc,
                                     const PtrExprValue &pointer,
                                     Type pointeeType);
 
   /// Emits `p - q` on two decomposed pointers into the same object as the
   /// plain i64 cursor difference (C's ptrdiff_t is `long`, i.e. i64, on
-  /// the supported targets); pointers into different objects are rejected.
+  /// the supported targets); pointers into different objects and
+  /// possibly-null pointers are rejected.
   FailureOr<Value> emitPointerDifference(const clang::BinaryOperator *op);
 
   /// Returns whether the pointer-typed expression `expr` is handled by the
@@ -1824,6 +1890,10 @@ void PointerRegionAnalysis::unite(const clang::VarDecl *a,
     target.hasWriteThrough = true;
     target.writeThroughLoc = absorbed.writeThroughLoc;
   }
+  if (absorbed.nullable && !target.nullable) {
+    target.nullable = true;
+    target.nullableLoc = absorbed.nullableLoc;
+  }
   if (!absorbed.invalidReason.empty() && target.invalidReason.empty()) {
     target.invalidReason = std::move(absorbed.invalidReason);
     target.invalidLoc = absorbed.invalidLoc;
@@ -1869,6 +1939,15 @@ void PointerRegionAnalysis::recordArithmetic(const clang::VarDecl *ptr,
   if (!region.hasArithmetic) {
     region.hasArithmetic = true;
     region.arithmeticLoc = loc;
+  }
+}
+
+void PointerRegionAnalysis::recordNullable(const clang::VarDecl *ptr,
+                                           clang::SourceLocation loc) {
+  PointerRegion &region = regionFor(ptr);
+  if (!region.nullable) {
+    region.nullable = true;
+    region.nullableLoc = loc;
   }
 }
 
@@ -1945,12 +2024,13 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
   const clang::Expr *e = stripTrivia(rhs);
   clang::SourceLocation loc = e->getBeginLoc();
 
+  // A null pointer constant does not invalidate the region: it marks the
+  // region nullable, and the pointer's Option-of-cursor discriminant (an
+  // i1 "non-null" flag cell) records the binding at emission (CTS-P8).
   if (e->isNullPointerConstant(*context,
                                clang::Expr::NPC_NeverValueDependent) !=
       clang::Expr::NPCK_NotNull)
-    return markInvalid(
-        ptr, loc,
-        "unsupported: null pointer constant assigned to a pointer variable");
+    return recordNullable(ptr, loc);
 
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
     switch (cast->getCastKind()) {
@@ -2402,8 +2482,12 @@ CImporter::resolveArgRoot(PointerRegionAnalysis &regions,
       return isPointerType(var->getType()) ? var : nullptr;
     if (regions.tracks(var)) {
       const PointerRegion *region = regions.regionOf(var);
+      // Nullable regions are excluded: owner methods pass bare i64
+      // cursors, which cannot carry the Option-of-cursor discriminant, so
+      // such regions keep the Phase-1b lowering (where a possibly-null
+      // argument is a located rejection).
       if (region && region->invalidReason.empty() &&
-          region->bases.size() == 1)
+          region->bases.size() == 1 && !region->nullable)
         return region->bases.front().base;
     }
     return nullptr;
@@ -4233,7 +4317,12 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
   if (region->literalBase) {
     // Read-only string-literal region: the pointer is a cursor into the
     // literal's `'static` byte run, backed by an immutable local byte
-    // array (bytes plus the terminating NUL).
+    // array (bytes plus the terminating NUL). Nullable literal regions
+    // are outside the CTS-P8 scope.
+    if (region->nullable)
+      return emitError(translateLoc(region->nullableLoc))
+             << "unsupported: null pointer constant assigned to a pointer "
+                "into a string literal";
     if (!region->bases.empty()) {
       const PointerBaseBinding &object = region->bases.front();
       InFlightDiagnostic diag = emitError(loc);
@@ -4283,8 +4372,20 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
         << "bound to '" << second.base->getName() << "' here";
     return diag;
   }
-  if (region->bases.empty())
-    return success(); // Never bound; any dereference is rejected at its site.
+  if (region->bases.empty()) {
+    // Never bound to any object. A nullable region still needs its
+    // Option-of-cursor discriminant so null-checks (`p == NULL`, `if (p)`)
+    // read the flag; the pointer has no base, so any dereference is
+    // rejected at its site. A non-nullable unbound pointer needs no code.
+    if (region->nullable) {
+      Value nonNullCell = createEntryAlloca(loc, builder.getI1Type());
+      pointerLocals[var] =
+          PointerLocalInfo{nullptr, Value(), Value(), nonNullCell};
+      if (const clang::Expr *init = var->getInit())
+        return storePointerAssign(loc, var, init);
+    }
+    return success();
+  }
 
   const PointerBaseBinding &binding = region->bases.front();
   const clang::VarDecl *base = binding.base;
@@ -4342,7 +4443,13 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
       return emitError(bindLoc)
              << "unsupported: pointer type does not match its target object";
   }
-  pointerLocals[var] = PointerLocalInfo{base, cursorCell};
+  // A nullable region carries the Option-of-cursor discriminant in a
+  // promotable i1 cell per pointer: address bindings store true, null
+  // bindings store false, and null-checks load it (CTS-P8).
+  Value nonNullCell;
+  if (region->nullable)
+    nonNullCell = createEntryAlloca(loc, builder.getI1Type());
+  pointerLocals[var] = PointerLocalInfo{base, cursorCell, Value(), nonNullCell};
   if (const clang::Expr *init = var->getInit())
     return storePointerAssign(loc, var, init);
   return success();
@@ -4355,16 +4462,36 @@ LogicalResult CImporter::storePointerAssign(Location loc,
   if (it == pointerLocals.end())
     return emitError(loc) << "unsupported: assignment to pointer variable '"
                           << ptr->getName() << "' with no known target object";
+  const PointerLocalInfo &info = it->second;
+  // `p = NULL` selects the None side of the Option-of-cursor model: only
+  // the discriminant cell changes (the stale cursor is dead while the
+  // flag is false). A pointer without a flag cell cannot represent null;
+  // the analysis marks every null-receiving local region nullable, so
+  // this rejection covers only non-region pointers (e.g. parameters).
+  if (isNullPointerConstantExpr(rhs)) {
+    if (!info.nonNullCell)
+      return emitError(loc) << "unsupported: null pointer constant assigned "
+                               "to this pointer";
+    Value none = createBoolConstant(loc, false);
+    builder.create<memref::StoreOp>(loc, none, info.nonNullCell);
+    return success();
+  }
   FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
   if (failed(value))
     return failure();
-  const PointerLocalInfo &info = it->second;
   if (value->base != info.base ||
       value->literalBacking !=
           info.literalBacking) // Defensive; multi-base regions never get here.
     return emitError(loc)
            << "unsupported: pointer assignment would rebind to a different "
               "object";
+  // An address binding selects the Some side: the discriminant becomes
+  // true (or copies the source pointer's flag on `p = q`).
+  if (info.nonNullCell) {
+    Value nonNull =
+        value->nonNull ? value->nonNull : createBoolConstant(loc, true);
+    builder.create<memref::StoreOp>(loc, nonNull, info.nonNullCell);
+  }
   if (!info.cursorCell)
     return success(); // Degenerate: the target place is statically known.
   Value cursor = value->cursor
@@ -5593,8 +5720,11 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     // A function used as a value decays to a `Some(name)` fn_ptr constant.
     return emitFunctionPointerConstant(sub, cast->getType(), loc);
   case clang::CK_NullToPointer: {
-    // The null constant of a function pointer is `None`; data pointers
-    // have no null representation and keep their located rejections.
+    // The null constant of a function pointer is `None`. A data-pointer
+    // null constant is modeled at its consuming sites (assignment,
+    // equality comparison, truth test — the Option-of-cursor model,
+    // CTS-P8); one reaching this generic value path has no modeled
+    // consumer and keeps its located rejection.
     if (isFunctionPointer(cast->getType())) {
       FailureOr<Type> mapped = mapType(cast->getType(), loc);
       if (failed(mapped))
@@ -6117,29 +6247,58 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
   // Pointer comparisons decompose both sides into (base, cursor) pairs;
   // only pointers into the same object have a defined C ordering, and the
   // i64 cursors compare signed. A degenerate side (the address of a
-  // scalar) is cursor 0 of its object. One special case folds: a string
-  // literal compared against a null pointer constant is never equal (a C
-  // string literal designates an object, whose address is non-null), so
-  // `"..." == NULL` is constant false and `!=` constant true. Other null
-  // pointer constants are rejected inside `emitPointerRValue`.
+  // scalar) is cursor 0 of its object. Comparisons against a null pointer
+  // constant are the Option-of-cursor discrimination (CTS-P8): a string
+  // literal or a statically non-null pointer folds (every held address
+  // designates a live object, whose address is non-null), and a pointer
+  // of a nullable region tests its i1 discriminant.
   if (isPointerType(op->getLHS()->getType()) ||
       isPointerType(op->getRHS()->getType())) {
-    auto isNullConstant = [&](const clang::Expr *expr) {
-      return expr->isNullPointerConstant(
-                 astContext(), clang::Expr::NPC_NeverValueDependent) !=
-             clang::Expr::NPCK_NotNull;
-    };
+    bool lhsNull = isNullPointerConstantExpr(op->getLHS());
+    bool rhsNull = isNullPointerConstantExpr(op->getRHS());
     auto isLiteralPointer = [](const clang::Expr *expr) {
       return llvm::isa<clang::StringLiteral>(expr->IgnoreParenCasts());
     };
-    if ((isLiteralPointer(op->getLHS()) && isNullConstant(op->getRHS())) ||
-        (isNullConstant(op->getLHS()) && isLiteralPointer(op->getRHS()))) {
+    if ((isLiteralPointer(op->getLHS()) && rhsNull) ||
+        (lhsNull && isLiteralPointer(op->getRHS()))) {
       if (op->getOpcode() == clang::BO_EQ)
         return createBoolConstant(loc, false);
       if (op->getOpcode() == clang::BO_NE)
         return createBoolConstant(loc, true);
       return emitError(loc) << "unsupported: ordered comparison of a string "
                                "literal against a null pointer";
+    }
+    if (lhsNull || rhsNull) {
+      if (op->getOpcode() != clang::BO_EQ &&
+          op->getOpcode() != clang::BO_NE)
+        return emitError(loc)
+               << "unsupported: ordered comparison against a null pointer";
+      bool isEq = op->getOpcode() == clang::BO_EQ;
+      if (lhsNull && rhsNull) // `NULL == NULL` is defined and constant.
+        return createBoolConstant(loc, isEq);
+      // Clang converts the pointer operand to `void *` when the null
+      // constant is `(void*)0`; the conversion does not change the
+      // decomposition and is peeled here.
+      const clang::Expr *pointerSide =
+          stripTrivia(lhsNull ? op->getRHS() : op->getLHS());
+      while (const auto *cast =
+                 llvm::dyn_cast<clang::ImplicitCastExpr>(pointerSide)) {
+        if (cast->getCastKind() != clang::CK_BitCast ||
+            !isPointerType(cast->getSubExpr()->getType()))
+          break;
+        pointerSide = stripTrivia(cast->getSubExpr());
+      }
+      FailureOr<PtrExprValue> pointer = emitPointerRValue(pointerSide);
+      if (failed(pointer))
+        return failure();
+      if (!pointer->nonNull) // Statically non-null: the check folds.
+        return createBoolConstant(loc, !isEq);
+      if (isEq) {
+        Value truth = createBoolConstant(loc, true);
+        return builder.create<arith::XOrIOp>(loc, pointer->nonNull, truth)
+            .getResult();
+      }
+      return pointer->nonNull;
     }
     FailureOr<PtrExprValue> lhs = emitPointerRValue(op->getLHS());
     if (failed(lhs))
@@ -6150,6 +6309,12 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
     if (lhs->base != rhs->base || lhs->literalBacking != rhs->literalBacking)
       return emitError(loc)
              << "unsupported: comparison of pointers into different objects";
+    // `p == q` where either side may be null is defined in C (a null and a
+    // non-null pointer compare unequal), but the cursor comparison cannot
+    // express it; the mixed-state comparison stays rejected.
+    if (lhs->nonNull || rhs->nonNull)
+      return emitError(loc)
+             << "unsupported: comparison of possibly-null pointers";
     Type cursorType = builder.getIntegerType(64);
     Value left =
         lhs->cursor ? lhs->cursor : createIntConstant(loc, cursorType, 0);
@@ -6373,14 +6538,13 @@ FailureOr<Value> CImporter::emitCondition(const clang::Expr *expr) {
                                  emitrust::CmpPredicate::ne, *value, none)
         .getResult();
   }
-  // A data pointer tested for truth is a null check; decomposed pointers
-  // have no null value (null pointer constants are rejected), so their
-  // truth values are rejected rather than silently mistranslated.
+  // A data pointer tested for truth (`if (p)`, `!p`) is a null check: the
+  // Option-of-cursor discrimination of the decomposed pointer (CTS-P8).
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
     if (cast->getCastKind() == clang::CK_PointerToBoolean)
-      return emitError(loc) << "unsupported: pointer used as a truth value";
+      return emitPointerTruth(cast->getSubExpr());
   if (isPointerType(e->getType()))
-    return emitError(loc) << "unsupported: pointer used as a truth value";
+    return emitPointerTruth(e);
   // Strip explicit truthiness casts so `_Bool` conversions don't double up.
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
     if (cast->getCastKind() == clang::CK_IntegralToBoolean ||
@@ -6704,6 +6868,11 @@ FailureOr<Value> CImporter::emitMethodCallSite(const clang::CallExpr *call,
                << "unsupported: pointer argument does not point into owner "
                   "object '"
                << ownerBase->getName() << "'";
+      // Defensive: owner planning excludes nullable regions, so no
+      // discriminant should survive to a method-call cursor argument.
+      if (pointer->nonNull)
+        return emitError(loc) << "unsupported: possibly-null pointer passed "
+                                 "as a function argument";
       if (!pointer->cursor) // Defensive; an array base always has a cursor.
         return emitError(loc) << "unsupported: the address of a scalar "
                                  "object cannot index an owner method";
@@ -6763,6 +6932,12 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
     if (failed(pointer))
       return failure();
     root = pointer->base;
+    // Parameters have no null representation; passing a possibly-null
+    // pointer would erase its discriminant (and the callee may be a
+    // defined C program that null-checks it).
+    if (pointer->nonNull)
+      return emitError(loc) << "unsupported: possibly-null pointer passed "
+                               "as a function argument";
     if (!pointer->cursor)
       return emitError(loc) << "unsupported: the address of a scalar object "
                                "cannot be passed as a slice parameter";
@@ -6807,6 +6982,10 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
     if (failed(pointer))
       return failure();
     root = pointer->base;
+    // Parameters have no null representation; see the slice path above.
+    if (pointer->nonNull)
+      return emitError(loc) << "unsupported: possibly-null pointer passed "
+                               "as a function argument";
     FailureOr<Value> place = emitPointerPlace(loc, *pointer, pointee);
     if (failed(place))
       return failure();
@@ -7010,17 +7189,39 @@ bool CImporter::isDecomposedPointerExpr(const clang::Expr *expr) const {
   return true;
 }
 
+bool CImporter::isNullPointerConstantExpr(const clang::Expr *expr) const {
+  return expr->isNullPointerConstant(astContext(),
+                                     clang::Expr::NPC_NeverValueDependent) !=
+         clang::Expr::NPCK_NotNull;
+}
+
+FailureOr<Value> CImporter::emitPointerTruth(const clang::Expr *expr) {
+  Location loc = translateLoc(expr->getBeginLoc());
+  if (isNullPointerConstantExpr(expr)) // `if (NULL)` is constant false.
+    return createBoolConstant(loc, false);
+  FailureOr<PtrExprValue> pointer = emitPointerRValue(expr);
+  if (failed(pointer))
+    return failure();
+  // A pointer of a nullable region tests its Option-of-cursor
+  // discriminant; a statically non-null pointer folds to true (every
+  // address a decomposed region holds designates a live object).
+  if (pointer->nonNull)
+    return pointer->nonNull;
+  return createBoolConstant(loc, true);
+}
+
 FailureOr<PtrExprValue>
 CImporter::emitPointerRValue(const clang::Expr *expr) {
   const clang::Expr *e = stripTrivia(expr);
   Location loc = translateLoc(e->getBeginLoc());
   IntegerType cursorType = builder.getIntegerType(64);
 
-  // Decomposed pointers have no null value; C code guarding on NULL cannot
-  // be translated faithfully and is rejected instead.
-  if (e->isNullPointerConstant(astContext(),
-                               clang::Expr::NPC_NeverValueDependent) !=
-      clang::Expr::NPCK_NotNull)
+  // A null pointer constant has no (base, cursor) decomposition. Its
+  // modeled consumers — pointer assignment (None side of the
+  // Option-of-cursor model), equality comparison, and truth test —
+  // intercept it before this point; any other context (call arguments,
+  // pointer arithmetic, ...) stays a located rejection (CTS-P8 scope).
+  if (isNullPointerConstantExpr(e))
     return emitError(loc)
            << "unsupported: null pointer constant in a pointer expression";
 
@@ -7043,7 +7244,10 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         Value cursor;
         if (info.cursorCell)
           cursor = loadPlace(loc, info.cursorCell);
-        return PtrExprValue{info.base, cursor, info.literalBacking};
+        Value nonNull;
+        if (info.nonNullCell)
+          nonNull = loadPlace(loc, info.nonNullCell);
+        return PtrExprValue{info.base, cursor, info.literalBacking, nonNull};
       }
       if (llvm::isa<clang::ParmVarDecl>(var))
         return emitError(loc) << "unsupported: pointer parameter used "
@@ -7138,8 +7342,11 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
               ? builder.create<arith::AddIOp>(loc, current, one).getResult()
               : builder.create<arith::SubIOp>(loc, current, one).getResult();
       builder.create<memref::StoreOp>(loc, next, info.cursorCell);
+      Value nonNull;
+      if (info.nonNullCell)
+        nonNull = loadPlace(loc, info.nonNullCell);
       return PtrExprValue{info.base, unary->isPostfix() ? current : next,
-                          info.literalBacking};
+                          info.literalBacking, nonNull};
     }
     return emitError(loc) << "unsupported pointer expression";
   }
@@ -7186,7 +7393,8 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
                     .getResult()
               : builder.create<arith::SubIOp>(loc, pointer->cursor, offset)
                     .getResult();
-      return PtrExprValue{pointer->base, cursor, pointer->literalBacking};
+      return PtrExprValue{pointer->base, cursor, pointer->literalBacking,
+                          pointer->nonNull};
     }
   }
 
@@ -7206,7 +7414,8 @@ CImporter::emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript) {
     clang::Expr::EvalResult indexValue;
     if (subscript->getIdx()->EvaluateAsInt(indexValue, astContext()) &&
         indexValue.Val.getInt() == 0)
-      return PtrExprValue{pointer->base, Value(), pointer->literalBacking};
+      return PtrExprValue{pointer->base, Value(), pointer->literalBacking,
+                          pointer->nonNull};
     return emitError(loc) << "unsupported: arithmetic on the address "
                              "of a scalar object";
   }
@@ -7228,7 +7437,8 @@ CImporter::emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript) {
   }
   Value cursor = builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
                      .getResult();
-  return PtrExprValue{pointer->base, cursor, pointer->literalBacking};
+  return PtrExprValue{pointer->base, cursor, pointer->literalBacking,
+                      pointer->nonNull};
 }
 
 /// Returns the number of innermost (non-array) elements one value of the
@@ -7248,6 +7458,22 @@ static uint64_t flatElementCount(Type type) {
 FailureOr<Value> CImporter::emitPointerPlace(Location loc,
                                              const PtrExprValue &pointer,
                                              Type pointeeType) {
+  // A pointer of a nullable region that was never bound to any object can
+  // only ever hold the null constant; it has no place to designate.
+  if (!pointer.base && !pointer.literalBacking)
+    return emitError(loc)
+           << "unsupported: dereference of a pointer that is only ever null";
+  // Dereferencing a possibly-null pointer guards on the Option-of-cursor
+  // discriminant with a deterministic panic: C dereferencing null is
+  // undefined behavior, so the panic is a legal refinement (the fn_ptr
+  // `expect` precedent; transformation-theory section 6).
+  if (pointer.nonNull)
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(), builder.getStringAttr("assert!"),
+        builder.getArrayAttr(
+            {builder.getIndexAttr(0),
+             builder.getStringAttr("null pointer dereference")}),
+        ValueRange{pointer.nonNull});
   if (pointer.literalBacking) {
     // A string-literal cursor subscripts the literal's read-only backing
     // byte array (a flat [N x i8], so no level peeling arises). Writes
@@ -7334,6 +7560,12 @@ CImporter::emitPointerDifference(const clang::BinaryOperator *op) {
   if (lhs->base != rhs->base || lhs->literalBacking != rhs->literalBacking)
     return emitError(loc)
            << "unsupported: difference of pointers into different objects";
+  // C defines pointer difference only for pointers into the same array; a
+  // possibly-null operand has no defined difference, and erasing its
+  // discriminant would translate a null operand silently.
+  if (lhs->nonNull || rhs->nonNull)
+    return emitError(loc)
+           << "unsupported: difference of possibly-null pointers";
   Type cursorType = builder.getIntegerType(64);
   Value left =
       lhs->cursor ? lhs->cursor : createIntConstant(loc, cursorType, 0);

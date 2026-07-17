@@ -860,10 +860,10 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 178 passed / 0 miscompiled /
-42 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-17: 220 total / 179 passed / 0 miscompiled /
+41 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5 partials, and
-CTS-S1/S4/P1/R1/R4 landed since). Every one of the 42 is a located
+CTS-S1/S4/P1/R1/R4/P8 landed since). Every one of the 41 is a located
 build-time rejection — never wrong output.
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
@@ -950,7 +950,10 @@ observed when C99-33 + C99-47 together unlocked 00215).
 - [ ] CTS-P3 (5) Pointers assigned non-address values (integer↔pointer
   round-trips, arithmetic results stored back into pointers): needs a
   design decision — either a tagged cursor representation or a
-  permanent by-design rejection documented per test.
+  permanent by-design rejection documented per test. The one carve-out
+  is the null pointer constant, which CTS-P8 now models as the None side
+  of an Option-of-cursor; every other non-address value (including
+  nonzero integers cast to pointers) stays rejected.
   (00039.c, 00103.c, 00144.c, 00163.c, 00187.c)
 - [ ] CTS-P4 (4) Pointer-typed global variables: global region bases.
   Hard interaction with the thread_local!+Cell global model (a borrow
@@ -971,9 +974,28 @@ observed when C99-33 + C99-47 together unlocked 00215).
   region today and rejects; needs either region materialization (copy
   both objects into one backing array) or an enum-of-bases cursor.
   (00077.c, 00172.c)
-- [ ] CTS-P8 (1) NULL data-pointer constants: an Option-of-cursor model
+- [x] CTS-P8 (1) NULL data-pointer constants: an Option-of-cursor model
   mirroring the fn_ptr None mapping; interacts with CTS-P3.
   (00171.c)
+  (Done: a region that sees a null pointer constant is nullable instead
+  of invalidated; each of its pointers carries the Option discriminant in
+  a promotable memref<i1> "non-null" flag cell — NULL assignment stores
+  false, an address binding stores true, `p = q` copies the source flag,
+  and null-checks (`if (p)`, `p == 0`, `p != NULL`) read it, folding to
+  constants for statically non-null pointers. A dereference of a
+  possibly-null pointer is guarded by assert!(flag, "null pointer
+  dereference") — C null-deref is UB, so the deterministic panic is a
+  legal refinement per the fn_ptr expect precedent. CTS-P3 interaction:
+  only the null-constant idiom itself is modeled; general
+  integer-to-pointer traffic stays rejected, as do passing, ordering,
+  differencing, and same-region comparison of possibly-null pointers,
+  nullable string-literal regions, and dereference of a pointer that is
+  only ever null; nullable regions are excluded from Phase-4 owner
+  promotion (bare i64 cursor arguments cannot carry the discriminant).
+  Import shapes in test/Import/C/pointers-null.c, rejections in
+  test/Import/C/pointers-null-invalid.c, rustc-level differential with a
+  data-dependent null path in test/EndToEnd/pointers-null.c, ledger
+  00171.c.)
 
 ### Records and symbol namespaces (16 tests)
 
