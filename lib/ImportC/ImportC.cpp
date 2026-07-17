@@ -395,7 +395,7 @@ struct OwnerPlan {
 /// cannot support), whether any pointer of the region holds the null
 /// pointer constant (which makes the region an Option of its cursor,
 /// CTS-P8), and the first construct (if any) that puts the region outside
-/// the decomposition (escape, non-address source, global target, ...).
+/// the decomposition (escape, non-address source, ...).
 struct PointerRegion {
   /// Distinct base objects, each with its first binding location.
   SmallVector<PointerBaseBinding, 2> bases;
@@ -453,7 +453,7 @@ struct PointerRegion {
 /// region's pointers, and null-constant bindings (`p = NULL` marks the
 /// region nullable instead of invalidating it, CTS-P8), and records the
 /// first construct that makes a region undecomposable (taking a pointer's
-/// address, non-address sources, global targets). Base objects participate
+/// address, non-address sources). Base objects participate
 /// in the union-find
 /// alongside the pointers so that two pointers into the same object always
 /// share a region. The importer validates each pointer local against its
@@ -2228,12 +2228,13 @@ void PointerRegionAnalysis::addBase(const clang::VarDecl *ptr,
                                     clang::SourceLocation loc) {
   bool ptrIsGlobal = !ptr->hasLocalStorage();
   bool baseIsGlobal = !base->hasLocalStorage();
-  // A local pointer into a global object would dangle from the staged-copy
-  // global access model (CTS-P6 scope); a global pointer bound to a local
-  // object is a borrow escaping the object's scope — the exact program
-  // rustc would refuse — rejected here, at the binding site (CTS-P4).
-  if (!ptrIsGlobal && baseIsGlobal)
-    return markInvalid(ptr, loc, "unsupported: pointer into a global variable");
+  // A local pointer into a global object is a valid region base (CTS-P6):
+  // its cursor is a plain Copy i64 and every element access stages the
+  // global's whole value exactly like a direct global element access, so
+  // no borrow is ever held across statements. A global pointer bound to a
+  // local object is a borrow escaping the object's scope — the exact
+  // program rustc would refuse — rejected here, at the binding site
+  // (CTS-P4).
   if (ptrIsGlobal && !baseIsGlobal)
     return markInvalid(
         ptr, loc,
@@ -5288,10 +5289,14 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
   }
 
   const PointerBaseBinding &binding = region->bases.front();
+  // A global (or static-local) base is accepted (CTS-P6): every element
+  // access through the pointer stages the global's whole value and writes
+  // store the staged copy back, exactly like a direct global element
+  // access, so the cursor cell below is the pointer's only runtime state
+  // and no borrow of the global is ever held. The base's element/pointee
+  // validation reads only the declared type and applies unchanged.
   const clang::VarDecl *base = binding.base;
   Location bindLoc = translateLoc(binding.loc);
-  if (!base->hasLocalStorage()) // Defensive; the analysis flags this first.
-    return emitError(bindLoc) << "unsupported: pointer into a global variable";
 
   Value cursorCell;
   if (isPointerType(base->getType())) {
@@ -8894,11 +8899,11 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
           ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
       if (!var)
         break;
-      // A decayed global array is a global region base (CTS-P4); its
+      // A decayed global array is a global region base (CTS-P4/P6); its
       // element accesses stage the global like any direct element access.
-      // Local-pointer regions never reach here with a global base (the
-      // analysis rejects them at the binding), so this only feeds global
-      // pointer assignments and direct dereference forms.
+      // The canonical declaration keys every consumer (pointer-local
+      // bindings, global pointer assignments, and direct dereference
+      // forms), matching the analysis's canonicalized base records.
       if (!var->hasLocalStorage())
         var = var->getCanonicalDecl();
       return PtrExprValue{var, createIntConstant(loc, cursorType, 0)};
