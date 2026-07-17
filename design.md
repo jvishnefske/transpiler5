@@ -843,11 +843,11 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 160 passed / 0 miscompiled /
-60 unsupported (was 150/70 at commit a091423, when this checklist was
-drawn up; the quick wins, CTS-S7 partials, and CTS-S1 landed since).
-Every one of the 60 is a located build-time rejection — never wrong
-output.
+Ledger as of 2026-07-17: 220 total / 167 passed / 0 miscompiled /
+53 unsupported (was 150/70 at commit a091423, when this checklist was
+drawn up; the quick wins, the CTS-S7 partial, and CTS-S1/R1/R4 landed
+since). Every one of the 53 is a located build-time rejection — never
+wrong output.
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
 checkbox discipline as above — tick only when the referenced tests pass
@@ -939,10 +939,23 @@ observed when C99-33 + C99-47 together unlocked 00215).
 
 ### Records and symbol namespaces (16 tests)
 
-- [ ] CTS-R1 (5) Bare anonymous struct types (no tag, no typedef name):
+- [x] CTS-R1 (5) Bare anonymous struct types (no tag, no typedef name):
   synthesize a stable name (e.g. `Anon<n>` keyed by shape) and reuse the
   C99-6 dedup machinery; today only typedef'd anonymous structs import.
   (00017.c, 00043.c, 00047.c, 00118.c, 00120.c)
+  (Done: `importRecord` assigns `Anon<n>` names keyed by the C99-6
+  field-shape serialization — the counter only orders first encounters,
+  so the same anonymous shape in any TU maps to one Rust type and
+  distinct shapes never collide; the key map is consulted only for
+  anonymous records, so an anonymous struct matching a named struct's
+  shape keeps its own type (C type identity is by declaration). A value
+  of anonymous enum type maps to plain `i32`, unlocking 00120's
+  anonymous-enum member. All five tests pass and are in the manifest —
+  ledger 164 passed / 56 unsupported / 0 miscompiled. Pinned by
+  test/Import/C/structs-anon-bare.c (distinct shapes get distinct names,
+  repeated shape shares one struct_def, named-vs-anonymous shape match
+  stays two types, cross-TU dedup, anonymous-enum member) and
+  test/EndToEnd/structs-anon.c (differential member reads/writes).)
 - [ ] CTS-R2 (2) Unnamed struct members (anonymous member injection —
   C11 6.7.2.1p13 anonymous struct/union members whose fields join the
   parent's namespace): flatten fields into the parent struct_def with
