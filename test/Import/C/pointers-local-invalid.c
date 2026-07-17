@@ -3,12 +3,11 @@
 // RUN: not emitrust-import-c %t/addr-of-ptr.c 2>&1 | FileCheck %s --check-prefix=ADDRPTR
 // RUN: not emitrust-import-c %t/ptr-to-ptr.c 2>&1 | FileCheck %s --check-prefix=PTRPTR
 // RUN: not emitrust-import-c %t/into-global.c 2>&1 | FileCheck %s --check-prefix=GLOBAL
-// RUN: not emitrust-import-c %t/null-init.c 2>&1 | FileCheck %s --check-prefix=NULLP
+// RUN: not emitrust-import-c %t/null-arg.c 2>&1 | FileCheck %s --check-prefix=NULLP
 // RUN: not emitrust-import-c %t/non-address.c 2>&1 | FileCheck %s --check-prefix=NONADDR
 // RUN: not emitrust-import-c %t/scalar-arith.c 2>&1 | FileCheck %s --check-prefix=SCALARARITH
 // RUN: not emitrust-import-c %t/cross-diff.c 2>&1 | FileCheck %s --check-prefix=CROSSDIFF
 // RUN: not emitrust-import-c %t/cross-compare.c 2>&1 | FileCheck %s --check-prefix=CROSSCMP
-// RUN: not emitrust-import-c %t/truth-value.c 2>&1 | FileCheck %s --check-prefix=TRUTH
 // RUN: not emitrust-import-c %t/row-walk.c 2>&1 | FileCheck %s --check-prefix=ROWWALK
 // RUN: not emitrust-import-c %t/row-diff.c 2>&1 | FileCheck %s --check-prefix=ROWDIFF
 // RUN: not emitrust-import-c %t/string-literal-write.c 2>&1 | FileCheck %s --check-prefix=STRWRITE
@@ -71,13 +70,17 @@ int main(void) {
   return p[0];
 }
 
-// Decomposed pointers have no null value.
-// NULLP: null-init.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: null pointer constant assigned to a pointer variable
+// A null pointer constant is modeled only where the CTS-P8
+// Option-of-cursor discrimination applies (pointer assignment, equality
+// comparison, truth test; see pointers-null.c and
+// pointers-null-invalid.c); one used as a call argument has no modeled
+// consumer and stays rejected.
+// NULLP: null-arg.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: null pointer constant in a pointer expression
 
-//--- null-init.c
+//--- null-arg.c
+int f(int *p) { return p[0]; }
 int main(void) {
-  int *p = 0;
-  return 0;
+  return f(0);
 }
 
 // A pointer conjured from a non-address value has no base object.
@@ -123,20 +126,6 @@ int main(void) {
   int *q = a;
   int *r = b;
   if (q < r) {
-    return 1;
-  }
-  return 0;
-}
-
-// A pointer truth test is a null check, and decomposed pointers are never
-// null.
-// TRUTH: truth-value.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer used as a truth value
-
-//--- truth-value.c
-int main(void) {
-  int x = 1;
-  int *p = &x;
-  if (p) {
     return 1;
   }
   return 0;

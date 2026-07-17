@@ -29,8 +29,10 @@ int main(void) {
   return 0;
 }
 // A FILE* use trips the pointer-expression rejections before the name
-// lookup; the diagnostic is still located at the use site.
-// STDIN: stdin-ref.c:3:7: error: unsupported: pointer used as a truth value
+// lookup; the diagnostic is still located at the use site (the truth test
+// of a data pointer is now the CTS-P8 null check, so the rejection names
+// the unresolvable target instead).
+// STDIN: stdin-ref.c:3:7: error: unsupported: pointer variable 'stdin' has no known target object
 
 //--- addr-of.c
 #include <stdlib.h>
