@@ -993,6 +993,13 @@ LogicalResult RustEmitter::emitSwitch(emitrust::SwitchOp switchOp) {
 LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   Location loc = structDefOp.getLoc();
   os << "#[derive(Clone, Copy, Default)]\n";
+  // A field-less struct_def (C's `struct T {};`) prints unit-like with an
+  // empty brace body; the derives keep declaration, copy, and default
+  // construction working exactly as for the non-empty shape.
+  if (structDefOp.getFieldNames().empty()) {
+    os << "struct " << structDefOp.getSymName() << " {}\n";
+    return success();
+  }
   os << "struct " << structDefOp.getSymName() << " {\n";
   increaseIndent();
   for (auto [nameAttr, typeAttr] :

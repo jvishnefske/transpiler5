@@ -336,9 +336,10 @@ static bool isValidStructFieldType(Type type) {
              EnumType, FnPtrType>(type);
 }
 
-/// Verifies that the field name and type arrays have the same non-zero
-/// length, that field names are non-empty and unique, and that every field
-/// type is a scalar, array, struct, or enum type.
+/// Verifies that the field name and type arrays have the same length
+/// (possibly zero: a field-less struct_def models C's empty struct and is
+/// emitted unit-like), that field names are non-empty and unique, and that
+/// every field type is a scalar, array, struct, or enum type.
 LogicalResult StructDefOp::verify() {
   ArrayAttr names = getFieldNames();
   ArrayAttr types = getFieldTypes();
@@ -346,8 +347,6 @@ LogicalResult StructDefOp::verify() {
     return emitOpError("has ")
            << names.size() << " field names but " << types.size()
            << " field types";
-  if (names.empty())
-    return emitOpError("must have at least one field");
 
   llvm::StringSet<> seen;
   for (auto [nameAttr, typeAttr] : llvm::zip_equal(names, types)) {
