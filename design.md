@@ -247,8 +247,8 @@ lists the lit test file(s) that validate it.
   output; any mismatch is a fatal MISCOMPILE unless explicitly quarantined
   in known-miscompiles.txt, and the expected-pass.txt manifest ratchets in
   both directions (regressions and unrecorded passes both fail). Current
-  ledger: 220 total, 166 transpiled, 166 passed, 0 miscompiled,
-  54 unsupported (the remaining tests need unions, pointer-to-pointer or
+  ledger: 220 total, 179 transpiled, 179 passed, 0 miscompiled,
+  41 unsupported (the remaining tests need unions, pointer-to-pointer or
   void* casts, pointer globals, anonymous structs, wide strings, or
   system-header contents outside the C subset; see the c-testsuite
   checklist below).
@@ -860,10 +860,10 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 178 passed / 0 miscompiled /
-42 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-17: 220 total / 179 passed / 0 miscompiled /
+41 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5 partials, and
-CTS-S1/S4/P1/R1/R4 landed since). Every one of the 42 is a located
+CTS-S1/S4/P1/R1/R4/L2 landed since). Every one of the 41 is a located
 build-time rejection — never wrong output.
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
@@ -1141,10 +1141,16 @@ observed when C99-33 + C99-47 together unlocked 00215).
   (C99-48): safe helper over `&mut [i8]` mirroring `__emitrust_cstr`;
   bounds are compile-time known array sizes, so no unsafe needed.
   (00179.c, 00180.c)
-- [ ] CTS-L2 (1) printf %s of a `char *` function parameter: extend the
+- [x] CTS-L2 (1) printf %s of a `char *` function parameter: extend the
   C99-28 %s shapes to accept the FR-28 `mut_ref<slice<i8>>` parameter
-  class (slice + `__emitrust_cstr`).
-  (00200.c)
+  class (slice + `__emitrust_cstr`). Landed with two enabling pieces the
+  test also needed: a string-literal argument to a slice parameter
+  (fresh mutable per-call backing; copies are unobservable because
+  writing a literal is UB), and C main's (int argc, char **argv) form —
+  argc imports as i32 (the crate wrapper passes the process argument
+  count via args_os), argv is dropped with a located rejection on any
+  use. (00200.c; test/Import/C/printf-slice-param.c, main-args.c,
+  test/EndToEnd/percent-s-param.c)
 - [ ] CTS-L3 (2) String-literal and other initializers for
   pointer-typed objects (`char *s = "…"` at file scope, struct fields):
   blocked on CTS-P1/CTS-P4; listed separately because the diagnostic

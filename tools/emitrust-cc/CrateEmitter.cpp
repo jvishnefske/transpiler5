@@ -43,6 +43,14 @@ static constexpr llvm::StringLiteral kAllowHeader =
 static constexpr llvm::StringLiteral kMainWrapper =
     "fn main() { std::process::exit(c_main()); }\n";
 
+/// Wrapper for a C `main(int argc, char **argv)` imported with its `argv`
+/// dropped: the process argument count (program name included, matching
+/// C's argc) is passed as the sole parameter. `args_os` is used so an
+/// argument that is not valid Unicode still counts (`args` would panic).
+static constexpr llvm::StringLiteral kMainArgcWrapper =
+    "fn main() { std::process::exit(c_main(std::env::args_os().len() as "
+    "i32)); }\n";
+
 std::string sanitizeCrateName(llvm::StringRef stem) {
   std::string name;
   name.reserve(stem.size());
@@ -67,6 +75,15 @@ bool hasCMain(mlir::ModuleOp module) {
   return symbol != nullptr && llvm::isa<mlir::emitrust::FuncOp>(symbol);
 }
 
+/// Returns whether the module's `c_main` takes the imported argc
+/// parameter (a C `main(int argc, char **argv)`; `argv` is dropped at
+/// import). Callers have already established `hasCMain`.
+static bool cMainTakesArgc(mlir::ModuleOp module) {
+  auto funcOp = llvm::dyn_cast_if_present<mlir::emitrust::FuncOp>(
+      mlir::SymbolTable::lookupSymbolIn(module, "c_main"));
+  return funcOp && funcOp.getFunctionType().getNumInputs() == 1;
+}
+
 std::string renderCargoToml(llvm::StringRef crateName) {
   std::string toml;
   llvm::raw_string_ostream os(toml);
@@ -86,7 +103,7 @@ mlir::FailureOr<std::string> renderRustSource(mlir::ModuleOp module) {
   if (mlir::failed(mlir::emitrust::translateToRust(module, os)))
     return mlir::failure();
   if (wrapMain)
-    os << "\n" << kMainWrapper;
+    os << "\n" << (cMainTakesArgc(module) ? kMainArgcWrapper : kMainWrapper);
   return source;
 }
 
