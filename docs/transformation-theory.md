@@ -461,7 +461,13 @@ is the region variable, inferred by rustc.
   needs anyway. The emitter then chooses a per-region cursor where the
   points-to set is a singleton at each use, or a closed enum-of-cursors
   otherwise — both preserve the disjoint-region invariant. Highest payoff of
-  the cluster. **Adapt.**
+  the cluster. **Adapt.** (Implemented in its enum-of-cursors form: the
+  region keeps the flow-insensitive union-find, and each pointer carries a
+  promotable base-discriminant cell — a tagged (base-index, cursor) pair,
+  following the CTS-P8 flag-cell precedent — with every dereference
+  dispatching over the closed set of same-kind local bases. The
+  SSA-inclusion refinement that would recover singleton uses without a
+  runtime tag remains open.)
 - **CTS-P8** (NULL constants): Option-of-cursor — the sum-type answer to the
   null reference Hoare later called his billion-dollar mistake [Hoa09]. An
   option of a small integer
