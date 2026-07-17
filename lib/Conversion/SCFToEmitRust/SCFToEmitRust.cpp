@@ -25,6 +25,12 @@
 ///   `emitrust.switch` over the same discriminator; the case and default
 ///   regions are inlined into the corresponding switch regions and assign
 ///   the lets at their `scf.yield`.
+///
+/// All yield lowerings preserve the parallel-assignment semantics of MLIR
+/// block-argument rebinding: when a yielded source aliases a carried let
+/// that an earlier assignment in the sequence would clobber (the lost-copy
+/// problem), the sources are staged into fresh immutable temporaries before
+/// any carried let is written.
 //
 //===----------------------------------------------------------------------===//
 
@@ -84,12 +90,50 @@ createDefaultInitializedLets(OpTy op, const TypeConverter *typeConverter,
   return success();
 }
 
-/// Creates one `emitrust.assign` per value/let pair at the current
-/// insertion point of `rewriter`.
+/// Returns true when emitting the assignments `lets[i] = values[i]` in
+/// sequence could read an already-clobbered source, i.e. when some source
+/// is a destination let that an earlier assignment in the sequence writes
+/// (there exist indices i < j with lets[i] == values[j]). Every source
+/// that is not itself one of the destination lets is an SSA value already
+/// materialized into its own binding before the assignment sequence, so
+/// only destination lets appearing as later sources can observe an
+/// earlier write.
+static bool sequentialAssignmentClobbersSource(ValueRange values,
+                                               ValueRange lets) {
+  for (auto [j, value] : llvm::enumerate(values))
+    for (auto [i, let] : llvm::enumerate(lets)) {
+      if (i >= j)
+        break;
+      if (let == value)
+        return true;
+    }
+  return false;
+}
+
+/// Creates the assignments `lets[i] = values[i]` at the current insertion
+/// point of `rewriter` with parallel-assignment semantics: every source is
+/// read before any destination is written. MLIR region yields and loop
+/// back-edges rebind all block arguments simultaneously, so naive
+/// sequential assignments exhibit the classic lost-copy problem of SSA
+/// destruction: a loop-carried rotation such as `a, b = b, a + b` emitted
+/// sequentially reads the freshly clobbered `a`. When no source aliases an
+/// earlier destination (see `sequentialAssignmentClobbersSource`) the
+/// assignments are emitted directly; otherwise every source is first
+/// captured into a fresh immutable temporary let and the destinations are
+/// then assigned from those temporaries.
 static void assignValues(ValueRange values, ValueRange lets,
                          ConversionPatternRewriter &rewriter, Location loc) {
-  for (auto [value, let] : llvm::zip(values, lets))
-    rewriter.create<emitrust::AssignOp>(loc, let, value);
+  if (!sequentialAssignmentClobbersSource(values, lets)) {
+    for (auto [value, let] : llvm::zip(values, lets))
+      rewriter.create<emitrust::AssignOp>(loc, let, value);
+    return;
+  }
+  SmallVector<Value> temporaries;
+  for (Value value : values)
+    temporaries.push_back(rewriter.create<emitrust::LetOp>(
+        loc, value.getType(), value, /*is_mut=*/false));
+  for (auto [temporary, let] : llvm::zip(temporaries, lets))
+    rewriter.create<emitrust::AssignOp>(loc, let, temporary);
 }
 
 /// Replaces the `scf.yield` terminator `yield` with assignments of its
