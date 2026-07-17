@@ -216,9 +216,12 @@ private:
   /// globals, and a `thread_local!` `std::cell::Cell` item otherwise.
   LogicalResult emitGlobal(emitrust::GlobalOp globalOp);
   /// Emits `let vN: T = NAME;` (const global) or
-  /// `let vN: T = NAME.with(|c| c.get());` (mutable global).
+  /// `let vN: T = NAME.with(|__emitrust_tl| __emitrust_tl.get());`
+  /// (mutable global). The binder name is reserved by the importer:
+  /// identifier patterns cannot shadow statics, so a translated C global
+  /// spelled like the binder would break every accessor.
   LogicalResult emitGlobalLoad(emitrust::GlobalLoadOp loadOp);
-  /// Emits `NAME.with(|c| c.set(vX));`.
+  /// Emits `NAME.with(|__emitrust_tl| __emitrust_tl.set(vX));`.
   LogicalResult emitGlobalStore(emitrust::GlobalStoreOp storeOp);
   /// Emits `let mut vN: T = <init-or-default>;` for a local variable.
   LogicalResult emitVariable(emitrust::VariableOp variableOp);
@@ -1139,7 +1142,7 @@ LogicalResult RustEmitter::emitGlobalLoad(emitrust::GlobalLoadOp loadOp) {
     return failure();
   os << global->getSymName();
   if (!global->getIsConst())
-    os << ".with(|c| c.get())";
+    os << ".with(|__emitrust_tl| __emitrust_tl.get())";
   os << ";\n";
   return success();
 }
@@ -1153,7 +1156,7 @@ LogicalResult RustEmitter::emitGlobalStore(emitrust::GlobalStoreOp storeOp) {
   if (global->getIsConst())
     return op->emitOpError("cannot store to the immutable global @")
            << storeOp.getGlobal();
-  os << global->getSymName() << ".with(|c| c.set(";
+  os << global->getSymName() << ".with(|__emitrust_tl| __emitrust_tl.set(";
   if (failed(emitOperand(op->getLoc(), storeOp.getValue())))
     return failure();
   os << "));\n";

@@ -849,13 +849,20 @@ observed when C99-33 + C99-47 together unlocked 00215).
 
 ### Quick wins (7 tests, no design decisions needed)
 
-- [ ] CTS-E1 (3) Thread-local closure binder shadows a mutable global
+- [x] CTS-E1 (3) Thread-local closure binder shadows a mutable global
   named `c`: TranslateToRust.cpp hardcodes `.with(|c| c.get())` /
   `.with(|c| c.set(v))`, so a C global literally named `c` makes rustc
   resolve the closure pattern against the thread-local key and fail with
   E0308. Rename the binder to a reserved identifier (e.g. `__tl`).
   These are the only three tests that transpile but fail rustc.
   (00127.c, 00128.c, 00142.c)
+  (Done: the binder is `__emitrust_tl`, following the `__emitrust_`
+  reserved-prefix convention; the importer rejects a C global spelled
+  `__emitrust_tl` like the other reserved helper names. 00127.c, 00128.c,
+  00142.c now pass and are in the manifest — ledger 153 passed / 67
+  unsupported / 0 miscompiled. Pinned by test/Target/Rust/globals.mlir
+  (global named `c`), test/EndToEnd/globals.c (rustc-level), and
+  test/Import/C/keywords-invalid.c (reserved-name rejection).)
 - [ ] CTS-F2 (3) Unreferenced main-file declarations must not demand
   definitions: `extern int x;` or a repeated prototype `int foo(void);`
   that is never referenced currently rejects with "referenced but not

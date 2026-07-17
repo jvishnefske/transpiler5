@@ -598,6 +598,7 @@ private:
   /// Creates the `emitrust.global` named `symbolName` for the declaration
   /// `decl` (which supplies the type and initializer) and registers it
   /// under the canonical declaration `key`. Rejects Rust-keyword names,
+  /// the reserved `__emitrust_tl` accessor-binder name,
   /// module symbol collisions, pointer types, and non-constant or aggregate
   /// initializers. `const`-qualified variables become immutable globals
   /// unless struct-typed (a struct default is not const-evaluable in Rust).
@@ -2427,6 +2428,13 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
   if (isRustKeyword(symbolName))
     return emitError(loc) << "unsupported: global variable name '"
                           << symbolName << "' is a Rust keyword";
+  // Globals are emitted as `static` items (thread-local or plain), and Rust
+  // identifier patterns cannot shadow statics, so a global spelled like the
+  // thread-local accessor binder would break every mutable-global access.
+  if (symbolName == "__emitrust_tl")
+    return emitError(loc) << "unsupported: global variable name "
+                             "'__emitrust_tl' is reserved for the "
+                             "thread-local accessor binder";
   if (Operation *existing = SymbolTable::lookupSymbolIn(module, symbolName)) {
     auto existingGlobal = llvm::dyn_cast<emitrust::GlobalOp>(existing);
     if (!deferExternGlobals || !existingGlobal)

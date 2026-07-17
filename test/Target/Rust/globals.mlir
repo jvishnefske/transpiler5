@@ -64,22 +64,36 @@ emitrust.global @unit <[3 : i32, -4 : i32]> : !emitrust.struct<"Point">
 // CHECK-NEXT: }
 emitrust.global @corners <[[1 : i32, 2 : i32], [0 : i32, 0 : i32]]> : !emitrust.array<2x!emitrust.struct<"Point">>
 
+// CTS-E1: a mutable global named `c` must not collide with the accessor
+// closure binder; the reserved `__emitrust_tl` spelling keeps the pattern
+// from resolving against (and being rejected for shadowing) the
+// thread-local key.
+// CHECK-NEXT: thread_local! {
+// CHECK-NEXT:     static c: std::cell::Cell<i32> = std::cell::Cell::new(0);
+// CHECK-NEXT: }
+emitrust.global @c <0 : i32> : i32
+
 // CHECK-NEXT: fn access() -> i32 {
 emitrust.func @access() -> i32 {
   // A load from a mutable global goes through the Cell.
-  // CHECK-NEXT:     let v0: i32 = counter.with(|c| c.get());
+  // CHECK-NEXT:     let v0: i32 = counter.with(|__emitrust_tl| __emitrust_tl.get());
   %0 = emitrust.global_load @counter : i32
   // A store to a mutable global goes through the Cell.
-  // CHECK-NEXT:     counter.with(|c| c.set(v0));
+  // CHECK-NEXT:     counter.with(|__emitrust_tl| __emitrust_tl.set(v0));
   emitrust.global_store %0, @counter : i32
   // A load from a const global is a direct read of the static item.
   // CHECK-NEXT:     let v1: i32 = limit;
   %1 = emitrust.global_load @limit : i32
   // Whole-aggregate loads and stores move the array value through the Cell.
-  // CHECK-NEXT:     let v2: [i32; 4] = table.with(|c| c.get());
+  // CHECK-NEXT:     let v2: [i32; 4] = table.with(|__emitrust_tl| __emitrust_tl.get());
   %2 = emitrust.global_load @table : !emitrust.array<4xi32>
-  // CHECK-NEXT:     table.with(|c| c.set(v2));
+  // CHECK-NEXT:     table.with(|__emitrust_tl| __emitrust_tl.set(v2));
   emitrust.global_store %2, @table : !emitrust.array<4xi32>
+  // The `c` global's accessors bind `__emitrust_tl`, never `c` itself.
+  // CHECK-NEXT:     let v3: i32 = c.with(|__emitrust_tl| __emitrust_tl.get());
+  %3 = emitrust.global_load @c : i32
+  // CHECK-NEXT:     c.with(|__emitrust_tl| __emitrust_tl.set(v3));
+  emitrust.global_store %3, @c : i32
   // CHECK-NEXT:     return v1;
   emitrust.return %1 : i32
 }
