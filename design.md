@@ -769,8 +769,15 @@ rule.
   Rust would encode code points 128..=255 as two UTF-8 bytes, so
   non-ASCII string data is rejected at import (see C99-28/47) and the
   helpers are exact for everything that gets through. Value uses of the
-  puts/putchar result keep located rejections.
-  (test/Import/C/strings.c, strings-invalid.c, test/EndToEnd/strings.c)
+  puts/putchar result keep located rejections. Math intrinsics: a
+  definition-less call to `sin` with its standard double(double)
+  prototype lowers to `emitrust.call_opaque "f64::sin"` (both resolve to
+  the platform libm, verified differentially); a user-defined `sin`
+  stays an ordinary call, and every other math function keeps the
+  system-header rejection with a located diagnostic (the natural
+  extension point is the `hostedMathCallee` table in ImportC.cpp).
+  (test/Import/C/strings.c, strings-invalid.c, math.c,
+  test/EndToEnd/strings.c, math-sin.c)
 
 Where an item above concludes in a documented rejection (varargs
 definitions, irreducible goto, _Complex, and similar), that rejection with
@@ -836,10 +843,11 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 159 passed / 0 miscompiled /
-61 unsupported (was 150/70 at commit a091423, when this checklist was
-drawn up; the quick wins plus CTS-S1/S7 partials landed since). Every
-one of the 61 is a located build-time rejection — never wrong output.
+Ledger as of 2026-07-17: 220 total / 160 passed / 0 miscompiled /
+60 unsupported (was 150/70 at commit a091423, when this checklist was
+drawn up; the quick wins, CTS-S7 partials, and CTS-S1 landed since).
+Every one of the 60 is a located build-time rejection — never wrong
+output.
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
 checkbox discipline as above — tick only when the referenced tests pass
@@ -970,7 +978,7 @@ observed when C99-33 + C99-47 together unlocked 00215).
 
 ### Statements and expressions (10 tests)
 
-- [ ] CTS-S1 (2) Compound assignment with operand promotion
+- [x] CTS-S1 (2) Compound assignment with operand promotion
   (`char/short x; x += wider;`): lower as load, widen-cast, operate,
   narrow-cast, store. Must respect the zero-vs-sign-extension trap
   documented for the pipeline (adversarial negative/width-extreme
@@ -989,11 +997,11 @@ observed when C99-33 + C99-47 together unlocked 00215).
   `+=`/`-=`/`*=`/`<<=` overflowing the narrow type in both directions
   (wrap-on-narrow), short -= long (the 00111.c shape), int accumulator
   with long long RHS and long long shift amount, float += double (the
-  00174.c shape), and int *=/= double truncation toward zero. 00111.c
-  passes and is in the ratchet manifest; 00174.c remains blocked on its
-  second unsupported construct: "00174.c:45:19: error: unsupported: call
-  to 'sin' declared in a system header; not part of the supported C
-  subset" — box stays unticked until math-library calls land.
+  00174.c shape), and int *=/= double truncation toward zero. Both tests
+  pass and are in the ratchet manifest: 00174.c's former second blocker
+  ("00174.c:45:19: error: unsupported: call to 'sin' declared in a
+  system header") was cleared by the hosted `sin` -> `f64::sin` mapping
+  (C99-48).
   (00111.c, 00174.c)
 - [ ] CTS-S2 (2) Switch bodies that are not plain compound statements
   and case labels nested inside inner statements (Duff-adjacent,
