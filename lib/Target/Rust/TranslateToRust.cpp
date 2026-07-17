@@ -108,7 +108,7 @@ private:
   LogicalResult emitFloatValue(Location loc, double value, bool isF32);
 
   /// Emits the Rust place expression denoted by the lvalue-typed `value` by
-  /// recursing through its chain of variable/member/subscript/deref
+  /// recursing through its chain of variable/member/subscript/deref/enum_raw
   /// producers. Any other producer (or a block argument) is an error.
   LogicalResult emitPlaceExpr(Location loc, Value value);
 
@@ -209,8 +209,11 @@ private:
   LogicalResult emitSwitch(emitrust::SwitchOp switchOp);
   /// Emits a `#[derive(Clone, Copy, Default)]` struct item with its fields.
   LogicalResult emitStructDef(emitrust::StructDefOp structDefOp);
-  /// Emits a `#[repr(i32)]` enum item with its variants; the first variant
-  /// carries the `#[default]` attribute.
+  /// Emits a C enum as a value-preserving open enum: a
+  /// `#[repr(transparent)]` tuple struct over the storage integer (`i32`,
+  /// or `u32` with the `unsigned_underlying` marker), one associated
+  /// constant per variant, and a `Default` impl returning the first
+  /// variant.
   LogicalResult emitEnumDef(emitrust::EnumDefOp enumDefOp);
   /// Emits a global: `static NAME: T = <init-or-default>;` for `const`
   /// globals, and a `thread_local!` `std::cell::Cell` item otherwise.
@@ -441,9 +444,16 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value) {
         os << ")";
         return success();
       })
+      .Case<emitrust::EnumRawOp>([&](emitrust::EnumRawOp enumRawOp) {
+        if (failed(emitPlaceExpr(loc, enumRawOp.getOperand())))
+          return failure();
+        os << ".0";
+        return success();
+      })
       .Default([&](Operation *) -> LogicalResult {
         return emitError(loc) << "expected a place-producing operation "
-                                 "(variable, member, subscript, or deref)";
+                                 "(variable, member, subscript, deref, or "
+                                 "enum_raw)";
       });
 }
 
@@ -858,14 +868,32 @@ LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
   // as a comparison instead of a cast.
   if (op->getResult(0).getType().isInteger(1))
     return op->emitOpError("cannot translate a cast to bool");
-  // Rust has no integer-to-enum `as` cast; the verifier already rejects
-  // enum results, mirrored here for defense in depth.
-  if (isa<emitrust::EnumType>(op->getResult(0).getType()))
-    return op->emitOpError("cannot translate a cast to an enum type");
+  // Integer-to-enum: the open-enum tuple struct is constructed around the
+  // source converted to the enum's storage type, preserving the value
+  // exactly as C's conversion to the underlying type does.
+  if (auto enumType = dyn_cast<emitrust::EnumType>(op->getResult(0).getType())) {
+    auto enumDef = SymbolTable::lookupNearestSymbolFrom<emitrust::EnumDefOp>(
+        op, StringAttr::get(op->getContext(), enumType.getName()));
+    if (!enumDef)
+      return op->emitOpError("cast to enum type ")
+             << enumType << " requires a visible emitrust.enum_def";
+    if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+      return failure();
+    os << enumType.getName() << "(";
+    if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+      return failure();
+    os << " as " << (enumDef.getUnsignedUnderlying() ? "u32" : "i32")
+       << ");\n";
+    return success();
+  }
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
   if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
     return failure();
+  // Enum-to-integer: the raw value is read out of the tuple struct's only
+  // field before the `as` conversion.
+  if (isa<emitrust::EnumType>(op->getOperand(0).getType()))
+    os << ".0";
   os << " as ";
   if (failed(emitType(op->getLoc(), op->getResult(0).getType())))
     return failure();
@@ -1019,19 +1047,25 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
 }
 
 LogicalResult RustEmitter::emitEnumDef(emitrust::EnumDefOp enumDefOp) {
-  os << "#[repr(i32)]\n";
-  os << "#[derive(Clone, Copy, PartialEq, Default)]\n";
-  os << "enum " << enumDefOp.getSymName() << " {\n";
+  StringRef name = enumDefOp.getSymName();
+  StringRef storage = enumDefOp.getUnsignedUnderlying() ? "u32" : "i32";
+  os << "#[repr(transparent)]\n";
+  os << "#[derive(Clone, Copy, PartialEq)]\n";
+  os << "struct " << name << "(" << storage << ");\n";
+  os << "impl " << name << " {\n";
   increaseIndent();
-  bool first = true;
   for (auto [nameAttr, value] : llvm::zip_equal(enumDefOp.getVariantNames(),
-                                                enumDefOp.getVariantValues())) {
-    if (first) {
-      os << "#[default]\n";
-      first = false;
-    }
-    os << cast<StringAttr>(nameAttr).getValue() << " = " << value << ",\n";
-  }
+                                                enumDefOp.getVariantValues()))
+    os << "const " << cast<StringAttr>(nameAttr).getValue() << ": " << name
+       << " = " << name << "(" << value << ");\n";
+  decreaseIndent();
+  os << "}\n";
+  StringRef firstVariant =
+      cast<StringAttr>(enumDefOp.getVariantNames()[0]).getValue();
+  os << "impl Default for " << name << " {\n";
+  increaseIndent();
+  os << "fn default() -> " << name << " { " << name << "::" << firstVariant
+     << " }\n";
   decreaseIndent();
   os << "}\n";
   return success();
@@ -1344,8 +1378,8 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
       })
       // Place-refining operations emit nothing at their program point; the
       // place expressions they denote are rendered by their consumers.
-      .Case<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp>(
-          [&](auto) { return success(); })
+      .Case<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
+            emitrust::EnumRawOp>([&](auto) { return success(); })
       .Case<emitrust::LoadOp>(
           [&](emitrust::LoadOp loadOp) { return emitLoad(loadOp); })
       .Case<emitrust::AddrOfOp>([&](emitrust::AddrOfOp addrOfOp) {

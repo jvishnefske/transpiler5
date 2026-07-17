@@ -313,6 +313,22 @@ emitrust.func @enums(%arg0: !emitrust.enum<"Color">, %arg1: !emitrust.enum<"Colo
   emitrust.return
 }
 
+// CHECK: emitrust.enum_def @Mode ["Off", "On"] [0, 1] {unsigned_underlying}
+emitrust.enum_def @Mode ["Off", "On"] [0, 1] {unsigned_underlying}
+
+// CHECK-LABEL: emitrust.func @enum_open
+emitrust.func @enum_open(%arg0: i32) {
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Mode">>
+  // CHECK: emitrust.cast %{{.*}} : i32 to !emitrust.enum<"Mode">
+  %1 = emitrust.cast %arg0 : i32 to !emitrust.enum<"Mode">
+  emitrust.assign %0 = %1 : !emitrust.lvalue<!emitrust.enum<"Mode">>
+  // CHECK: emitrust.enum_raw %{{.*}} : (!emitrust.lvalue<!emitrust.enum<"Mode">>) -> !emitrust.lvalue<ui32>
+  %2 = emitrust.enum_raw %0 : (!emitrust.lvalue<!emitrust.enum<"Mode">>) -> !emitrust.lvalue<ui32>
+  // CHECK: emitrust.addr_of mut %{{.*}} : (!emitrust.lvalue<ui32>) -> !emitrust.mut_ref<ui32>
+  %3 = emitrust.addr_of mut %2 : (!emitrust.lvalue<ui32>) -> !emitrust.mut_ref<ui32>
+  emitrust.return
+}
+
 // CHECK: emitrust.global @counter <0 : i32> : i32
 emitrust.global @counter <0 : i32> : i32
 

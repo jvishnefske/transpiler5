@@ -2954,8 +2954,17 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
   if (variantNames.empty())
     return emitError(defLoc) << "unsupported: enum with no enumerators";
 
+  // The storage of the emitted open enum follows clang's underlying type
+  // choice (unsigned when every enumerator is non-negative), so that the
+  // raw-representation place (`emitrust.enum_raw`) and enum/integer
+  // conversions meet C's unsigned semantics at the right type.
+  bool unsignedUnderlying =
+      definition->getIntegerType()->isUnsignedIntegerType();
+
   // Cross-TU deduplication by symbol name (see importRecord): identical shape
   // is skipped, a name reused with a different variant shape is a diagnostic.
+  // The underlying signedness is derived from the values, so the value list
+  // determines it and the shape key needs no extra component.
   std::string shape;
   {
     llvm::raw_string_ostream os(shape);
@@ -2978,7 +2987,7 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
   moduleBuilder.create<emitrust::EnumDefOp>(
       defLoc, moduleBuilder.getStringAttr(definition->getName()),
       moduleBuilder.getStrArrayAttr(variantNames),
-      moduleBuilder.getDenseI64ArrayAttr(variantValues));
+      moduleBuilder.getDenseI64ArrayAttr(variantValues), unsignedUnderlying);
   return success();
 }
 
@@ -5658,10 +5667,14 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     return loadPlace(loc, *place);
   }
   case clang::CK_IntegralCast: {
-    // Integer-to-enum: Rust has no such cast, so the only conversion with
-    // an enum destination the importer accepts is a reference to an
-    // enumerator of that same enum (in C the enumerator itself has type
-    // `int`, so even `enum Color c = Red;` arrives as this cast).
+    // Integer-to-enum: a reference to an enumerator of the destination
+    // enum keeps the direct constant fast path (in C the enumerator itself
+    // has type `int`, so even `enum Color c = Red;` arrives as this cast);
+    // any other integer value converts through an `emitrust.cast` to the
+    // enum type, rendered as the open enum's value-preserving tuple-struct
+    // constructor — C preserves values outside the declared enumerators
+    // (C99 6.7.2.2, the object holds any value of the underlying type),
+    // and so does the emitted Rust.
     if (const clang::EnumDecl *target = namedEnumDeclOf(cast->getType())) {
       if (const auto *ref =
               llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(sub)))
@@ -5670,7 +5683,17 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
           if (llvm::cast<clang::EnumDecl>(enumerator->getDeclContext())
                   ->getDefinition() == target)
             return emitEnumConstant(enumerator, loc);
-      return emitError(loc) << "unsupported: integer to enum conversion";
+      FailureOr<Value> value = emitRValue(sub);
+      if (failed(value))
+        return failure();
+      auto sourceType = llvm::dyn_cast<IntegerType>((*value).getType());
+      if (!sourceType || sourceType.getWidth() == 1)
+        return emitError(loc) << "unsupported: integer to enum conversion";
+      FailureOr<Type> mapped = mapType(cast->getType(), loc);
+      if (failed(mapped))
+        return failure();
+      return builder.create<emitrust::CastOp>(loc, *mapped, *value)
+          .getResult();
     }
     FailureOr<Value> value = emitRValue(sub);
     if (failed(value))
@@ -5738,6 +5761,11 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     return builder.create<arith::SIToFPOp>(loc, *mapped, *value).getResult();
   }
   case clang::CK_FloatingToIntegral: {
+    // A floating value converted directly to an enum destination has no
+    // integer intermediary in the AST; the emitrust.cast enum path
+    // requires an integer source, so the shape stays rejected.
+    if (namedEnumDeclOf(cast->getType()))
+      return emitError(loc) << "unsupported: floating to enum conversion";
     FailureOr<Value> value = emitRValue(sub);
     if (failed(value))
       return failure();
@@ -6792,6 +6820,56 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
         .create<emitrust::SliceOfOp>(loc, paramType, basePlace,
                                      pointer->cursor, /*is_mut=*/true)
         .getResult();
+  }
+
+  // C's enum/underlying-type pointer compatibility (C99 6.7.2.2p4): the
+  // address of an enum object passed as a pointer to the enum's underlying
+  // integer type arrives as an implicit BitCast around the address-of.
+  // The borrow resolves to the enum place's raw-representation lvalue
+  // (`emitrust.enum_raw`, rendered `.0` on the open-enum tuple struct),
+  // whose value type is the enum's storage integer. Any other pointer
+  // BitCast keeps its located rejection through emitPointerRValue below.
+  if (const auto *bitcast =
+          llvm::dyn_cast<clang::ImplicitCastExpr>(stripTrivia(argument));
+      bitcast && bitcast->getCastKind() == clang::CK_BitCast) {
+    const auto *innerAddrOf = llvm::dyn_cast<clang::UnaryOperator>(
+        stripTrivia(bitcast->getSubExpr()));
+    const auto *ref =
+        innerAddrOf && innerAddrOf->getOpcode() == clang::UO_AddrOf
+            ? llvm::dyn_cast<clang::DeclRefExpr>(
+                  stripTrivia(innerAddrOf->getSubExpr()))
+            : nullptr;
+    const auto *var =
+        ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+    const clang::EnumDecl *enumDecl =
+        var ? namedEnumDeclOf(var->getType()) : nullptr;
+    if (enumDecl && bitcast->getType()->isPointerType() &&
+        astContext().hasSameUnqualifiedType(
+            bitcast->getType()->getPointeeType(),
+            enumDecl->getIntegerType())) {
+      auto it = symbols.find(var);
+      if (it == symbols.end() ||
+          !llvm::isa<emitrust::LValueType>(it->second.getType()))
+        return emitError(loc) << "unsupported: enum object '"
+                              << var->getName()
+                              << "' is not an addressable place";
+      FailureOr<Type> rawType = mapType(enumDecl->getIntegerType(), loc);
+      if (failed(rawType))
+        return failure();
+      if (*rawType != pointee)
+        return emitError(loc) << "unsupported: argument type does not match "
+                                 "the pointer parameter";
+      root = var;
+      Value rawPlace = builder
+                           .create<emitrust::EnumRawOp>(
+                               loc, emitrust::LValueType::get(*rawType),
+                               it->second)
+                           .getResult();
+      return builder
+          .create<emitrust::AddrOfOp>(loc, paramType, rawPlace,
+                                      /*is_mut=*/true)
+          .getResult();
+    }
   }
 
   // Scalar-reference parameter. Arguments involving a decomposed pointer

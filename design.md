@@ -433,15 +433,20 @@ rule.
 - [ ] C99-4 Plain char signedness policy, character constants, and
   escape sequences.
 - [x] C99-5 Enumerations: enum definitions, enumerator constants in
-  expressions and case labels, mapped to real Rust enums rather than bare
-  integer constants; enum-to-int conversions (implicit promotions in mixed
-  enum/int comparisons and arithmetic, and explicit casts) lower to
-  `emitrust.cast` on the mapped destination type — signless i32 for signed
-  underlying types, ui32 for unsigned ones, so C's unsigned comparison
-  against negative ints is preserved — rendered as safe Rust `as` casts of
-  the `#[repr(i32)]` enum; int-to-enum conversions remain rejected by
-  design (safe Rust has no fallible discriminant cast in the subset), as
-  are comparisons between distinct enum types.
+  expressions and case labels, mapped to a distinct nominal Rust type per
+  enum rather than bare integer constants; enum-to-int conversions
+  (implicit promotions in mixed enum/int comparisons and arithmetic, and
+  explicit casts) lower to `emitrust.cast` on the mapped destination type
+  — signless i32 for signed underlying types, ui32 for unsigned ones, so
+  C's unsigned comparison against negative ints is preserved — rendered as
+  safe Rust `as` casts of the raw value; comparisons between distinct enum
+  types stay rejected. Revised under CTS-S6: the emitted representation is
+  a value-preserving open enum (a `#[repr(transparent)]` tuple struct over
+  the storage integer with one associated constant per enumerator and a
+  Default impl returning the first variant) rather than a fieldless
+  `#[repr(i32)]` enum, because C enum objects hold any value of the
+  underlying type; int-to-enum conversions are therefore supported and
+  value-preserving (see CTS-S6).
   (test/Import/C/enums.c, enum-int.c, enums-invalid.c,
   test/EndToEnd/switch-enum.c, test/EndToEnd/enum-int.c)
 - [x] C99-6 Typedefs of every supported type shape, including typedefs of
@@ -860,10 +865,10 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 178 passed / 0 miscompiled /
-42 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-17: 220 total / 179 passed / 0 miscompiled /
+41 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5 partials, and
-CTS-S1/S4/P1/R1/R4 landed since). Every one of the 42 is a located
+CTS-S1/S4/S6/P1/R1/R4 landed since). Every one of the 41 is a located
 build-time rejection — never wrong output.
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
@@ -1110,10 +1115,32 @@ observed when C99-33 + C99-47 together unlocked 00215).
   deterministic/bounded design philosophy; recommend documenting as a
   permanent by-design rejection rather than implementing.
   (00207.c)
-- [ ] CTS-S6 (1) Integer-to-enum conversion (the reverse of C99-5):
-  needs a design decision — `#[repr(i32)]` enums admit no safe `from`
-  without a match table; generate a `fn <Enum>_from_i32` exhaustive
-  match helper, or keep rejecting.
+- [x] CTS-S6 (1) Integer-to-enum conversion (the reverse of C99-5):
+  needed a design decision — `#[repr(i32)]` enums admit no safe `from`
+  without a match table; candidates were a `fn <Enum>_from_i32`
+  exhaustive-match helper, or rejection.
+  Landed with the **preserved-value policy**, not the panic-refinement
+  helper: 00170.c stores 12 into `enum fred` (matching no declared
+  enumerator, values {0..3, 54, 73..75}) and prints it, which C defines as
+  value-preserving (C99 6.7.2.2: the object holds any value of the
+  underlying type), so an exhaustive match over declared discriminants
+  cannot represent the result and a panic arm would abort a defined C
+  program. The representation was therefore changed to a value-preserving
+  open enum: `emitrust.enum_def` (now carrying an `unsigned_underlying`
+  marker mirroring clang's underlying-type choice) emits a
+  `#[repr(transparent)]` tuple struct over the storage integer (`i32` or
+  `u32`) with one associated constant per enumerator and a Default impl
+  returning the first variant; nominal typing, enumerator paths
+  (`Fred::C`), `==`/`!=`, and `Name::default()` are unchanged.
+  Int-to-enum lowers to `emitrust.cast` to the enum type (total,
+  rendered `Fred(v as u32)`), enum-to-int renders `.0 as`, and the new
+  `emitrust.enum_raw` place op supports 00170.c's other blocker, C's
+  enum/underlying-type pointer compatibility (`deref(&e)` with a
+  `unsigned int *` parameter borrows `&mut e.0`). Float-to-enum stays a
+  located rejection.
+  (test/Import/C/enum-from-int.c, enums-invalid.c,
+  test/Target/Rust/match.mlir, test/Dialect/EmitRust/ops.mlir,
+  invalid.mlir, test/EndToEnd/enum-from-int.c)
   (00170.c)
 - [ ] CTS-S7 (2) `(void)` casts and void-typed contexts (evaluate and
   discard, `void` in a statement-expression position): map to an

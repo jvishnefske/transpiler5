@@ -312,8 +312,8 @@ exactly as the expressiveness limit predicts
 CTS implementation lands as new conversion patterns, so the discipline applies
 across the board — most directly to the pattern-heavy items CTS-S4
 (multi-dimensional arrays: recursive type/initializer lowering), CTS-S7
-(void-cast discard shapes), and CTS-S6 (the generated exhaustive-match
-helper). The verified machinery supplies four project rules: greedy
+(void-cast discard shapes), and CTS-S6 (the value-preserving open-enum
+lowering). The verified machinery supplies four project rules: greedy
 canonicalization is never load-bearing for legality (only the conversion
 target is); every pattern set carries a stated termination measure (the
 dialect-rank precedence — core dialects above EmitRust — is the RPO-style
@@ -574,7 +574,14 @@ evaluate-and-discard expression both map to Rust's canonical unit shapes.
 CTS-S6 (integer-to-enum) is sum-type totality: safe Rust admits no unchecked
 construction of a fielded enum from a discriminant, so the choices are the
 checklist's generated exhaustive-match helper (making partiality explicit and
-checked) or rejection. CTS-S4 (multi-dimensional arrays) is recursive
+checked), rejection, or widening the codomain until the map is total.
+Resolved by the third route: 00170.c stores an integer matching no declared
+enumerator into an enum object — defined, value-preserving behavior in C
+(C99 6.7.2.2) that no exhaustive match over declared discriminants can
+represent — so the emitted representation became a value-preserving open
+enum (a transparent newtype over the storage integer with associated
+constants for the declared enumerators), making the conversion total by
+construction instead of partial-but-checked. CTS-S4 (multi-dimensional arrays) is recursive
 structural typing — nested array types, nested initializer attributes, and
 row-major index synthesis are one structural recursion in the type mapper,
 the initializer converter, and the subscript lowerer. CTS-E1 (the
@@ -768,7 +775,7 @@ the fit verdict of the applicable technique:
 | CTS-S3 | 5 | Environment hoisting to module scope — adopt |
 | CTS-S4 | 3, 5 | Recursive structural typing + conversion patterns — adopt |
 | CTS-S5 | 2 | VLA violates the static-shape promotable-slot condition and bounded design — reject-by-design (permanent, documented) |
-| CTS-S6 | 5 | Sum-type totality: generated exhaustive-match helper or rejection — adapt |
+| CTS-S6 | 5 | Sum-type totality: resolved by codomain widening — a value-preserving open enum (transparent newtype + associated constants), total by construction — landed |
 | CTS-S7 | 5 | Unit type; evaluate-and-discard — adopt |
 | CTS-P1 | 4 | Read-only ('static) region kind — adopt |
 | CTS-P2 | 4, 5 | Out-param-to-return rewrite + principal cursor kinds via unification — adopt rewrite, adapt typed regions |
