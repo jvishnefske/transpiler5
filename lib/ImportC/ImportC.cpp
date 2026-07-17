@@ -162,6 +162,28 @@
 ///    variable, passing one to a function (the callee would see a borrow
 ///    of the staged copy), multiple bases, string-literal bases, null
 ///    constants, and external linkage in a multi-file project.
+///  - Pointer struct members, pointer returns, and pointer casts
+///    (CTS-P2): a data-pointer struct member is stored as a plain i64
+///    cursor field (a cursor is a borrow-free Copy integer, so a struct
+///    can hold one), and the analysis resolves each member to one
+///    statically known target object — or one write-only string literal —
+///    per struct instance, gathered program-wide from every body in Pass A
+///    plus the constant-initializer walk of global objects. Supported
+///    bindings are degenerate (the member designates one whole object), so
+///    the stored i64 stays 0: member writes emit nothing and member reads
+///    resolve to the bound object's place with no runtime state (a
+///    `s.p->p->x` chain folds hop by hop). Conflicting bindings reject
+///    naming both sites; writes through aliases, escaping member
+///    addresses, and whole-struct overwrites poison the field program-wide
+///    (every read rejects, located at the unresolvable site). A
+///    data-pointer *return type* classifies by its return sites
+///    (principal-kind inference): the supported kind is a returned
+///    function address behind a `void *` return, emitted as the plain
+///    `!emitrust.fn_ptr` result; returning a cursor into a callee-local
+///    region stays rejected at the return site (it would dangle).
+///    Qualification-preserving explicit casts (same unqualified pointee)
+///    peel transparently in analysis and emission; reinterpreting casts
+///    stay rejected.
 ///
 /// The importer is a functional core (the `CImporter` class below, which
 /// owns the builder and per-function symbol table) driven by the imperative
@@ -419,6 +441,46 @@ struct PointerGlobalInfo {
   std::string cursorSymbol;
 };
 
+/// The statically resolved binding of one pointer-typed struct member of
+/// one struct instance (CTS-P2 / C99-43). A data-pointer member is stored
+/// as a plain i64 cursor field — a cursor is a borrow-free Copy integer
+/// (docs/transformation-theory.md section 4), so storing one in a struct
+/// never fights the borrow checker — and the analysis resolves the member
+/// to at most one statically known target object (or string literal) per
+/// struct instance. Every supported binding in the current model is
+/// degenerate (the member designates one whole scalar/struct object), so
+/// the stored i64 carries no runtime information and stays 0; member reads
+/// resolve to the bound object's place with no runtime state at all.
+/// Conflicting bindings, non-address sources, and array-run bindings make
+/// the member unresolvable, recorded as a located rejection naming both
+/// sites when two bindings clash.
+struct MemberPointerFacts {
+  /// The single object this instance's member points into; null for a
+  /// literal binding or an invalid one.
+  const clang::VarDecl *base = nullptr;
+  /// The string literal bound to the member (write-only support: reads of
+  /// a literal-bound member stay rejected); null for object bindings.
+  const clang::StringLiteral *literal = nullptr;
+  /// Where the binding was established (first site).
+  clang::SourceLocation loc;
+  /// The conflicting second binding site; meaningful only with a
+  /// non-empty `invalidReason` produced by a binding clash.
+  clang::SourceLocation secondLoc;
+  /// Diagnostic text of the construct that made the member unresolvable;
+  /// empty when the binding is consumable.
+  std::string invalidReason;
+  /// Location of the invalidating construct; meaningful only with
+  /// `invalidReason`.
+  clang::SourceLocation invalidLoc;
+};
+
+/// The program-wide key of one member-pointer binding: the struct instance
+/// (a local or global variable — for a pointer global with a synthesized
+/// backing, the pointer's own declaration stands for the backing) and the
+/// pointer-typed field.
+using MemberPointerKey =
+    std::pair<const clang::VarDecl *, const clang::FieldDecl *>;
+
 /// One base binding of a pointer region: the object some pointer in the
 /// region was made to point into, and the source location of the assignment
 /// (or initializer) that bound it. The multi-base diagnostic names the
@@ -586,6 +648,22 @@ public:
     return pointerVars;
   }
 
+  /// The member-pointer bindings this body established, keyed by (struct
+  /// instance, field); `planOwners` merges them into the program-wide map.
+  const llvm::DenseMap<MemberPointerKey, MemberPointerFacts> &
+  memberBindings() const {
+    return memberFacts;
+  }
+
+  /// Data-pointer fields this body used in a shape the per-instance model
+  /// cannot resolve (a write through an alias or unresolved place, an
+  /// escaping member address, a whole-struct overwrite), with the first
+  /// such site. A poisoned field rejects every read program-wide.
+  const llvm::DenseMap<const clang::FieldDecl *, clang::SourceLocation> &
+  poisonedMemberFields() const {
+    return poisonedFields;
+  }
+
 private:
   /// Recursive statement walk collecting pointer declarations, writes,
   /// arithmetic, escapes, and call-argument uses.
@@ -663,6 +741,50 @@ private:
   /// reject it.
   const clang::VarDecl *trackedWritePlaceRoot(const clang::Expr *place);
 
+  /// Classifies the right-hand side of a data-pointer member write
+  /// (`s.f = rhs` on a `var.field` place rooted at `instance`): `&obj`
+  /// binds the object degenerately, a decayed string literal binds the
+  /// literal (write-only), and every other source records a located
+  /// invalid-binding fact. A second binding to a different target records
+  /// the clash with both sites.
+  void recordMemberPointerWrite(const clang::VarDecl *instance,
+                                const clang::FieldDecl *field,
+                                const clang::Expr *rhs);
+
+  /// Records one resolved member binding fact (object or literal) for
+  /// `(instance, field)` at `loc`, merging with any existing fact.
+  void bindMemberPointer(const clang::VarDecl *instance,
+                         const clang::FieldDecl *field,
+                         const clang::VarDecl *base,
+                         const clang::StringLiteral *literal,
+                         clang::SourceLocation loc);
+
+  /// Marks the member binding of `(instance, field)` unresolvable with
+  /// diagnostic `reason` at `loc`; only the first invalidation is kept.
+  void markMemberInvalid(const clang::VarDecl *instance,
+                         const clang::FieldDecl *field,
+                         clang::SourceLocation loc, llvm::StringRef reason);
+
+  /// Poisons `field` program-wide at `loc`: some use of the field in this
+  /// body is outside the per-instance model (aliased write, escaping
+  /// member address, whole-struct overwrite), so no read of the field can
+  /// trust a static binding.
+  void poisonMemberField(const clang::FieldDecl *field,
+                         clang::SourceLocation loc);
+
+  /// Walks the (semantic-form) initializer list of the struct local
+  /// `instance`, recording bindings for its directly initialized
+  /// data-pointer fields and poisoning data-pointer fields buried in
+  /// nested aggregates (their instance path is outside the model).
+  void collectStructInitBindings(const clang::VarDecl *instance,
+                                 const clang::InitListExpr *list);
+
+  /// Poisons every data-pointer field reachable from `record` (through
+  /// nested struct and array-of-struct fields): a whole-value overwrite of
+  /// an object of this type invalidates any static member binding.
+  void poisonRecordPointerFields(const clang::RecordDecl *record,
+                                 clang::SourceLocation loc);
+
   /// Marks `ptr`'s region undecomposable with diagnostic `reason` at `loc`;
   /// only the first invalidation of a region is kept.
   void markInvalid(const clang::VarDecl *ptr, clang::SourceLocation loc,
@@ -694,6 +816,11 @@ private:
   /// `&p` expressions consumed as second-order bindings (`pp = &p`); the
   /// generic address-taken escape check skips exactly these.
   llvm::SmallPtrSet<const clang::Expr *, 4> consumedAddrOf;
+  /// Member-pointer bindings established by this body (CTS-P2).
+  llvm::DenseMap<MemberPointerKey, MemberPointerFacts> memberFacts;
+  /// Data-pointer fields used outside the per-instance member model.
+  llvm::DenseMap<const clang::FieldDecl *, clang::SourceLocation>
+      poisonedFields;
 };
 
 /// Translates the clang AST of one C translation unit into an MLIR module.
@@ -808,6 +935,20 @@ private:
   /// cached per canonical declaration.
   ArrayRef<ParamKind> classifyPointerParams(const clang::FunctionDecl *func);
 
+  /// Principal-kind classification of a data-pointer return type (CTS-P2):
+  /// each `return` site contributes one located constraint, and the
+  /// function's return kind is the one consistent with all of them. The
+  /// single supported kind today is a returned function address (`return
+  /// &f;` / `return f;` behind a `void *` return type), which returns the
+  /// plain `!emitrust.fn_ptr` value — every return site must name a
+  /// function of the same mapped signature. Returning any other pointer
+  /// value — in particular a cursor into a callee-local region, which
+  /// would dangle — is a located rejection at the offending return.
+  /// Requires the definition's body (a declaration classifies through
+  /// `getDefinition`); results are cached per canonical declaration.
+  FailureOr<Type> classifyPointerReturn(const clang::FunctionDecl *func,
+                                        Location loc);
+
   //===--------------------------------------------------------------------===//
   // Owner planning (Phase-4 Pass A)
   //===--------------------------------------------------------------------===//
@@ -840,6 +981,50 @@ private:
   /// locals.
   const clang::VarDecl *resolveArgRoot(PointerRegionAnalysis &regions,
                                        const clang::Expr *expr) const;
+
+  //===--------------------------------------------------------------------===//
+  // Pointer struct members (CTS-P2)
+  //===--------------------------------------------------------------------===//
+
+  /// Merges one member-pointer binding fact into the program-wide map:
+  /// first binding wins the slot, an identical rebinding is idempotent, a
+  /// differing target records the clash with both sites, and an invalid
+  /// fact propagates first-wins.
+  void mergeMemberPointerFacts(const MemberPointerKey &key,
+                               const MemberPointerFacts &incoming);
+
+  /// Walks the constant-evaluated initializer `value` of the global struct
+  /// object keyed `instance` (in parallel with its C type), recording a
+  /// member binding for every data-pointer field: an address-of-object
+  /// lvalue at offset 0 binds the object degenerately, a string-literal
+  /// lvalue binds the literal (write-only), a null pointer leaves the
+  /// member unbound, and anything else records an invalid binding. Arrays
+  /// recurse per element (two elements binding different targets clash
+  /// into an invalid fact, and reads through subscripted instances are
+  /// unresolvable anyway — sound either way).
+  void collectGlobalMemberBindings(const clang::VarDecl *instance,
+                                   const clang::APValue &value,
+                                   clang::QualType type,
+                                   clang::SourceLocation loc);
+
+  /// Resolves the member-pointer binding a read or write of `member` (a
+  /// data-pointer field access) consults: the instance is the directly
+  /// named base variable (`s.f`) or the degenerate single object behind a
+  /// decomposed arrow base (`p->f`, `s->f` through a pointer global).
+  /// Rejects — with the located first/second sites — poisoned fields,
+  /// unknown instances, unbound members, invalid bindings, bindings to
+  /// locals of other functions, and (in a multi-file project) members of
+  /// externally visible global instances.
+  FailureOr<const MemberPointerFacts *>
+  resolveMemberPointerBinding(const clang::MemberExpr *member, Location loc);
+
+  /// Emits `s.f = rhs` on a data-pointer member: the analysis pinned the
+  /// member's static binding, so a right-hand side that decomposes to the
+  /// bound target emits no runtime code at all (the stored i64 stays 0 and
+  /// carries no information); any other right-hand side is a located
+  /// rejection.
+  LogicalResult emitMemberPointerAssign(const clang::MemberExpr *member,
+                                        const clang::Expr *rhs, Location loc);
 
   //===--------------------------------------------------------------------===//
   // Declarations
@@ -1128,10 +1313,23 @@ private:
   /// initialization take the array filler (C99 zero-fill); struct field
   /// types resolve through the module-level `emitrust.struct_def`, and a
   /// struct with flattened anonymous members converts along the C field
-  /// structure via `convertRecordAPValue`. Anything else (enum-typed
-  /// elements, pointers) is rejected with a located diagnostic.
+  /// structure via `convertRecordAPValue`. `cType` is the C type walked
+  /// in parallel: a data-pointer field (stored as an i64 cursor member,
+  /// CTS-P2) converts to 0 — its lvalue APValue carries no stored
+  /// representation; the member's binding is recorded separately by
+  /// `collectGlobalMemberBindings`. Anything else (enum-typed elements,
+  /// non-member pointers) is rejected with a located diagnostic.
   FailureOr<Attribute> convertAPValueInit(const clang::APValue &value,
-                                          Type type, Location loc);
+                                          Type type, clang::QualType cType,
+                                          Location loc);
+
+  /// Maps the C type of one struct field: a data-pointer field is stored
+  /// as a plain i64 cursor member (CTS-P2 — a cursor is a borrow-free Copy
+  /// integer, so a struct can hold one; the member's target object is
+  /// resolved statically per instance and the stored value carries no
+  /// information in the degenerate model); every other type maps through
+  /// `mapType`.
+  FailureOr<Type> mapStructFieldType(clang::QualType type, Location loc);
 
   /// Converts the struct `APValue` of `record` to one attribute per
   /// flattened struct_def field, appended to `fields`. `fieldTypes` is
@@ -1291,9 +1489,16 @@ private:
   /// semantic form of the list, so designators are already resolved to
   /// positions. Aggregate-typed elements that are not initializer lists
   /// (string literals, struct copies) are rejected with located
-  /// diagnostics.
+  /// diagnostics. `instance` names the declared variable when the list
+  /// initializes a struct local directly: a data-pointer field's
+  /// initializer then validates against the member binding the analysis
+  /// recorded and emits nothing (the stored i64 stays 0, CTS-P2); with a
+  /// null `instance` a non-implicit data-pointer field initializer is
+  /// rejected (its instance path is outside the member model).
   LogicalResult emitAggregateInitList(Value place, Type type,
-                                      const clang::InitListExpr *list);
+                                      const clang::InitListExpr *list,
+                                      const clang::VarDecl *instance =
+                                          nullptr);
 
   /// Emits a (semantic-form) initializer list for the C record `record`
   /// into the parent struct place `place`, resolving flattened anonymous
@@ -1305,14 +1510,16 @@ private:
   /// with `record->isUnion()` only for such flattened anonymous members.
   LogicalResult emitRecordInitFields(Value place,
                                      const clang::RecordDecl *record,
-                                     const clang::InitListExpr *list);
+                                     const clang::InitListExpr *list,
+                                     const clang::VarDecl *instance = nullptr);
 
   /// Emits the initializer `element` for `field` of a flattened record
   /// into the parent struct place `place`: an anonymous member requires a
   /// nested list and recurses via `emitRecordInitFields`; a plain field
   /// assigns through `emitrust.member` under its flattened name.
   LogicalResult emitRecordInitField(Value place, const clang::FieldDecl *field,
-                                    const clang::Expr *element);
+                                    const clang::Expr *element,
+                                    const clang::VarDecl *instance = nullptr);
 
   /// Emits one element of an aggregate initializer list into `place` of
   /// value type `type`: recurses for a nested list, otherwise stores the
@@ -1996,6 +2203,11 @@ private:
   /// declarations are distinct clang decls, so entries never conflict).
   llvm::DenseMap<const clang::FunctionDecl *, SmallVector<ParamKind, 4>>
       paramKindsCache;
+  /// Cached pointer-return kinds (CTS-P2), keyed by the function's
+  /// canonical declaration: the mapped `!emitrust.fn_ptr` result type of a
+  /// function whose data-pointer return classifies as a returned function
+  /// address.
+  llvm::DenseMap<const clang::FunctionDecl *, Type> pointerReturnKinds;
   /// Phase-4 owner plans keyed by the promoted base variable declaration
   /// (accumulates across TUs; each TU's declarations are distinct).
   llvm::DenseMap<const clang::VarDecl *, OwnerPlan> ownerPlans;
@@ -2032,6 +2244,18 @@ private:
   /// function body's region view, and `importPointerGlobal` (Pass B)
   /// validates the union against the file-scope initializer.
   llvm::DenseMap<const clang::VarDecl *, PointerRegion> globalPtrFacts;
+  /// Program-wide member-pointer bindings (CTS-P2), keyed by (struct
+  /// instance, data-pointer field): `planOwners` merges every function
+  /// body's bindings, and the constant-initializer walk
+  /// (`collectGlobalMemberBindings`) merges the bindings of global struct
+  /// objects. Reads and writes of data-pointer members resolve against
+  /// this map at their use sites.
+  llvm::DenseMap<MemberPointerKey, MemberPointerFacts> memberPtrBindings;
+  /// Data-pointer fields used somewhere in the program in a shape the
+  /// per-instance member model cannot resolve, with the first such site;
+  /// every read of a poisoned field is a located rejection.
+  llvm::DenseMap<const clang::FieldDecl *, clang::SourceLocation>
+      poisonedPtrFields;
   /// Whether the TU currently being imported is the whole program (see
   /// `importTranslationUnit`); pointer-typed globals with external linkage
   /// are rejected in multi-file projects because a later TU's bindings
@@ -2259,6 +2483,123 @@ static bool isFunctionPointer(clang::QualType type) {
   return type.getCanonicalType()->isFunctionPointerType();
 }
 
+/// Returns whether `type` is a data pointer: a C pointer that is not a
+/// function pointer. Data pointers decompose into (base, cursor) pairs;
+/// function pointers are ordinary Copy values.
+static bool isDataPointer(clang::QualType type) {
+  return isPointerType(type) && !isFunctionPointer(type);
+}
+
+/// Returns the data-pointer field a member expression designates, or null
+/// when `expr` is not a member access or its field is not a data pointer.
+static const clang::FieldDecl *dataPointerFieldOf(const clang::Expr *expr) {
+  const auto *member = llvm::dyn_cast<clang::MemberExpr>(stripTrivia(expr));
+  if (!member)
+    return nullptr;
+  const auto *field =
+      llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+  if (!field || !isDataPointer(field->getType()))
+    return nullptr;
+  return field;
+}
+
+/// Returns the operand of an explicit pointer cast that does not change
+/// what the value decomposes into — a C-style cast between data-pointer
+/// types with the same unqualified pointee (`(int *)p`, `(const char *)s`,
+/// a qualification adjustment) — or null for every other cast. A cast that
+/// genuinely reinterprets the pointee (`(char *)&x`, `(int *)voidp`,
+/// integer-to-pointer) is never peeled: the decomposition's element unit
+/// would change, so those shapes keep their located rejections.
+static const clang::Expr *
+peeledQualificationCast(clang::ASTContext &context, const clang::Expr *expr) {
+  const auto *cast = llvm::dyn_cast<clang::CStyleCastExpr>(expr);
+  if (!cast)
+    return nullptr;
+  if (cast->getCastKind() != clang::CK_NoOp &&
+      cast->getCastKind() != clang::CK_BitCast)
+    return nullptr;
+  clang::QualType from = cast->getSubExpr()->getType().getCanonicalType();
+  clang::QualType to = cast->getType().getCanonicalType();
+  if (!isDataPointer(from) || !isDataPointer(to))
+    return nullptr;
+  if (!context.hasSameUnqualifiedType(from->getPointeeType(),
+                                      to->getPointeeType()))
+    return nullptr;
+  return cast->getSubExpr();
+}
+
+/// Peels the casts a returned function address wears (the implicit or
+/// C-style bitcast to a `void *`/data-pointer return type, no-op casts,
+/// parens) and returns the underlying function reference expression (a
+/// `DeclRefExpr` naming a `FunctionDecl`, reached through `&f` or the
+/// function-to-pointer decay), or null when the expression is anything
+/// else. Only qualification-preserving peeling: no cast that changes what
+/// the value decomposes into is looked through.
+static const clang::Expr *returnedFunctionExpr(const clang::Expr *expr) {
+  const clang::Expr *e = expr->IgnoreParens();
+  while (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e)) {
+    clang::CastKind kind = cast->getCastKind();
+    if (kind != clang::CK_BitCast && kind != clang::CK_NoOp &&
+        kind != clang::CK_FunctionToPointerDecay)
+      return nullptr;
+    if (kind == clang::CK_FunctionToPointerDecay) {
+      e = cast->getSubExpr()->IgnoreParens();
+      break;
+    }
+    e = cast->getSubExpr()->IgnoreParens();
+  }
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    if (unary->getOpcode() == clang::UO_AddrOf)
+      e = unary->getSubExpr()->IgnoreParens();
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e))
+    if (llvm::isa<clang::FunctionDecl>(ref->getDecl()))
+      return ref;
+  return nullptr;
+}
+
+/// Collects every `return` statement of `stmt`'s subtree into `returns`.
+static void collectReturnStmts(
+    const clang::Stmt *stmt,
+    SmallVectorImpl<const clang::ReturnStmt *> &returns) {
+  if (!stmt)
+    return;
+  if (const auto *ret = llvm::dyn_cast<clang::ReturnStmt>(stmt))
+    returns.push_back(ret);
+  for (const clang::Stmt *child : stmt->children())
+    collectReturnStmts(child, returns);
+}
+
+/// Returns the record declaration of `type` when it (canonically) is a
+/// complete struct type; null otherwise.
+static const clang::RecordDecl *recordOfType(clang::QualType type) {
+  const auto *recordType =
+      type.getCanonicalType()->getAs<clang::RecordType>();
+  if (!recordType)
+    return nullptr;
+  const clang::RecordDecl *record = recordType->getDecl();
+  return record->getDefinition();
+}
+
+/// Returns whether `record` (transitively, through nested struct and
+/// array-of-struct fields) contains a data-pointer field. Cycles cannot
+/// arise: recursion only follows by-value struct fields, and a struct
+/// cannot contain itself by value.
+static bool recordHasDataPointerField(const clang::RecordDecl *record) {
+  if (!record)
+    return false;
+  for (const clang::FieldDecl *field : record->fields()) {
+    clang::QualType fieldType = field->getType();
+    while (const auto *array = llvm::dyn_cast<clang::ArrayType>(
+               fieldType.getCanonicalType().getTypePtr()))
+      fieldType = array->getElementType();
+    if (isDataPointer(fieldType))
+      return true;
+    if (recordHasDataPointerField(recordOfType(fieldType)))
+      return true;
+  }
+  return false;
+}
+
 /// Returns the number of innermost (non-array) elements one value of
 /// `type` spans: the product of all constant array extents, or 1 for a
 /// non-array type. This is the scale factor of the flat row-major cursor
@@ -2458,6 +2799,8 @@ void PointerRegionAnalysis::analyze(clang::ASTContext &astContext,
   secondOrderVars.clear();
   secondOrderRegions.clear();
   consumedAddrOf.clear();
+  memberFacts.clear();
+  poisonedFields.clear();
   visit(body);
   context = nullptr;
 }
@@ -2843,6 +3186,152 @@ void PointerRegionAnalysis::recordSecondOrderWrite(const clang::VarDecl *ptr,
                          "variable");
 }
 
+void PointerRegionAnalysis::poisonMemberField(const clang::FieldDecl *field,
+                                              clang::SourceLocation loc) {
+  poisonedFields.try_emplace(field, loc);
+}
+
+void PointerRegionAnalysis::markMemberInvalid(const clang::VarDecl *instance,
+                                              const clang::FieldDecl *field,
+                                              clang::SourceLocation loc,
+                                              llvm::StringRef reason) {
+  MemberPointerFacts &facts =
+      memberFacts[{instance->getCanonicalDecl(), field}];
+  if (facts.invalidReason.empty()) {
+    facts.invalidReason = reason.str();
+    facts.invalidLoc = loc;
+  }
+}
+
+void PointerRegionAnalysis::bindMemberPointer(
+    const clang::VarDecl *instance, const clang::FieldDecl *field,
+    const clang::VarDecl *base, const clang::StringLiteral *literal,
+    clang::SourceLocation loc) {
+  if (base)
+    base = base->getCanonicalDecl();
+  MemberPointerFacts &facts =
+      memberFacts[{instance->getCanonicalDecl(), field}];
+  if (!facts.base && !facts.literal) {
+    facts.base = base;
+    facts.literal = literal;
+    facts.loc = loc;
+    return;
+  }
+  if (facts.base == base && facts.literal == literal)
+    return; // Idempotent rebinding to the same target.
+  if (facts.invalidReason.empty()) {
+    facts.invalidReason =
+        ("unsupported: pointer struct member '" + field->getName() +
+         "' bound to two different targets")
+            .str();
+    facts.invalidLoc = loc;
+    facts.secondLoc = loc;
+  }
+}
+
+void PointerRegionAnalysis::recordMemberPointerWrite(
+    const clang::VarDecl *instance, const clang::FieldDecl *field,
+    const clang::Expr *rhs) {
+  const clang::Expr *e = stripTrivia(rhs);
+  clang::SourceLocation loc = e->getBeginLoc();
+  // The null pointer constant establishes no target; a member that only
+  // ever holds null has no binding, and its reads (a null dereference in
+  // C, undefined behavior) reject at the read site.
+  if (e->isNullPointerConstant(*context,
+                               clang::Expr::NPC_NeverValueDependent) !=
+      clang::Expr::NPCK_NotNull)
+    return markMemberInvalid(instance, field, loc,
+                             "unsupported: null pointer constant assigned "
+                             "to a pointer struct member");
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e)) {
+    if (unary->getOpcode() == clang::UO_AddrOf) {
+      const clang::Expr *sub = stripTrivia(unary->getSubExpr());
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub))
+        if (const auto *target =
+                llvm::dyn_cast<clang::VarDecl>(ref->getDecl())) {
+          if (isPointerType(target->getType()))
+            return markMemberInvalid(
+                instance, field, loc,
+                "unsupported: taking the address of a pointer variable");
+          // `s.f = &x`: a degenerate whole-object binding; the pointee
+          // must be the object's own type (no element runs, no offsets).
+          if (!context->hasSameUnqualifiedType(
+                  field->getType().getCanonicalType()->getPointeeType(),
+                  target->getType()))
+            return markMemberInvalid(instance, field, loc,
+                                     "unsupported: pointer struct member "
+                                     "type does not match its target "
+                                     "object");
+          return bindMemberPointer(instance, field, target, nullptr, loc);
+        }
+      return markMemberInvalid(instance, field, loc,
+                               "unsupported: pointer struct member bound "
+                               "to this address expression");
+    }
+  }
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_ArrayToPointerDecay) {
+      const clang::Expr *sub = stripTrivia(cast->getSubExpr());
+      // `s.f = "..."`: a write-only literal binding (reads stay rejected;
+      // nothing in the supported subset can observe the member).
+      if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(sub))
+        return bindMemberPointer(instance, field, nullptr, literal, loc);
+      return markMemberInvalid(instance, field, loc,
+                               "unsupported: pointer struct member bound "
+                               "to an array");
+    }
+  markMemberInvalid(instance, field, loc,
+                    "unsupported: pointer struct member assigned a "
+                    "non-address value");
+}
+
+void PointerRegionAnalysis::collectStructInitBindings(
+    const clang::VarDecl *instance, const clang::InitListExpr *list) {
+  if (const clang::InitListExpr *semantic = list->getSemanticForm())
+    list = semantic;
+  const clang::RecordDecl *record = recordOfType(list->getType());
+  if (!record)
+    return;
+  unsigned index = 0;
+  for (const clang::FieldDecl *field : record->fields()) {
+    if (index >= list->getNumInits())
+      break;
+    const clang::Expr *element = list->getInit(index++);
+    if (llvm::isa<clang::ImplicitValueInitExpr>(element))
+      continue; // Zero fill: a data-pointer member stays unbound (null).
+    if (isDataPointer(field->getType())) {
+      recordMemberPointerWrite(instance, field, element);
+      continue;
+    }
+    // A data-pointer field inside a nested aggregate has an instance path
+    // the per-instance model does not key; a non-implicit initializer for
+    // one poisons the field.
+    if (const auto *nested = llvm::dyn_cast<clang::InitListExpr>(element)) {
+      const clang::RecordDecl *nestedRecord =
+          recordOfType(nested->getType());
+      if (nestedRecord && recordHasDataPointerField(nestedRecord))
+        poisonRecordPointerFields(nestedRecord, element->getBeginLoc());
+    }
+  }
+}
+
+void PointerRegionAnalysis::poisonRecordPointerFields(
+    const clang::RecordDecl *record, clang::SourceLocation loc) {
+  if (!record)
+    return;
+  for (const clang::FieldDecl *field : record->fields()) {
+    clang::QualType fieldType = field->getType();
+    while (const auto *array = llvm::dyn_cast<clang::ArrayType>(
+               fieldType.getCanonicalType().getTypePtr()))
+      fieldType = array->getElementType();
+    if (isDataPointer(fieldType)) {
+      poisonMemberField(field, loc);
+      continue;
+    }
+    poisonRecordPointerFields(recordOfType(fieldType), loc);
+  }
+}
+
 void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
                                                const clang::Expr *rhs) {
   const clang::Expr *e = stripTrivia(rhs);
@@ -2863,6 +3352,12 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
   if (!ptr->hasLocalStorage())
     if (const clang::CallExpr *alloc = asAllocCall(e))
       return recordAllocBase(ptr, alloc, loc);
+
+  // A qualification-preserving explicit cast is transparent to the region
+  // facts (the emission peels it identically); reinterpreting casts fall
+  // through to the non-address rejection.
+  if (const clang::Expr *peeled = peeledQualificationCast(*context, e))
+    return recordPointerWrite(ptr, peeled);
 
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
     switch (cast->getCastKind()) {
@@ -2996,7 +3491,7 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
     // the analysis never tracks them. Second-order pointers (`T **pp`)
     // track separately: their targets are cursor cells, not objects.
     for (const clang::Decl *decl : declStmt->decls())
-      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
         if (var->hasLocalStorage() && !llvm::isa<clang::ParmVarDecl>(var) &&
             isPointerType(var->getType()) &&
             !isFunctionPointer(var->getType())) {
@@ -3010,6 +3505,16 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
           if (const clang::Expr *init = var->getInit())
             recordPointerWrite(var, init);
         }
+        // A struct local whose initializer list covers data-pointer
+        // fields establishes their per-instance member bindings here
+        // (static locals bind through the constant-initializer walk at
+        // their global import instead).
+        if (var->hasLocalStorage() && !llvm::isa<clang::ParmVarDecl>(var))
+          if (const auto *list = llvm::dyn_cast_if_present<
+                  clang::InitListExpr>(var->getInit()))
+            if (recordOfType(var->getType()))
+              collectStructInitBindings(var, list);
+      }
   } else if (const auto *compound =
                  llvm::dyn_cast<clang::CompoundAssignOperator>(stmt)) {
     // `p += n` / `p -= n` walk the pointer without rebinding it;
@@ -3023,6 +3528,11 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
                      asGlobalDataPointerRef(compound->getLHS())) {
         pointerVars.insert(global);
         recordArithmetic(global, compound->getOperatorLoc());
+      } else if (const clang::FieldDecl *field =
+                     dataPointerFieldOf(compound->getLHS())) {
+        // `s.f += n`: a walked member needs runtime cursor state, which
+        // the degenerate member model does not carry.
+        poisonMemberField(field, compound->getOperatorLoc());
       }
     } else if (const clang::VarDecl *var =
                    trackedWritePlaceRoot(compound->getLHS())) {
@@ -3053,11 +3563,34 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
                                    "unsupported: dereference of a "
                                    "pointer-to-pointer variable before it "
                                    "is bound");
+        } else if (const clang::FieldDecl *field =
+                       dataPointerFieldOf(binary->getLHS())) {
+          // `s.f = rhs` on a directly named instance binds the member;
+          // a write through any other place (an arrow, a subscripted
+          // element, a nested member) has an instance path outside the
+          // model and poisons the field program-wide.
+          const auto *member = llvm::cast<clang::MemberExpr>(
+              stripTrivia(binary->getLHS()));
+          const clang::VarDecl *instance = nullptr;
+          if (!member->isArrow())
+            if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+                    stripTrivia(member->getBase())))
+              instance = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+          if (instance)
+            recordMemberPointerWrite(instance, field, binary->getRHS());
+          else
+            poisonMemberField(field, binary->getOperatorLoc());
         }
       } else if (const clang::VarDecl *var =
                      trackedWritePlaceRoot(binary->getLHS())) {
         // `*p = v` / `p[i] = v`: a write through the region's pointers.
         recordWriteThrough(var, binary->getOperatorLoc());
+      } else if (const clang::RecordDecl *record =
+                     recordOfType(binary->getLHS()->getType())) {
+        // A whole-struct overwrite replaces any data-pointer members
+        // wholesale; no static per-instance binding survives it.
+        if (recordHasDataPointerField(record))
+          poisonRecordPointerFields(record, binary->getOperatorLoc());
       }
     }
   } else if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
@@ -3070,6 +3603,10 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
                      asGlobalDataPointerRef(unary->getSubExpr())) {
         pointerVars.insert(global);
         recordArithmetic(global, unary->getOperatorLoc());
+      } else if (const clang::FieldDecl *field =
+                     dataPointerFieldOf(unary->getSubExpr())) {
+        // `s.f++`: a walked member needs runtime cursor state.
+        poisonMemberField(field, unary->getOperatorLoc());
       }
     } else if (unary->isIncrementDecrementOp()) {
       // `(*p)++` / `--p[i]`: a write through the region's pointers.
@@ -3093,6 +3630,10 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
         pointerVars.insert(global);
         markInvalid(global, unary->getOperatorLoc(),
                     "unsupported: taking the address of a pointer variable");
+      } else if (const clang::FieldDecl *field =
+                     dataPointerFieldOf(unary->getSubExpr())) {
+        // `&s.f` lets the member escape the static-binding model.
+        poisonMemberField(field, unary->getOperatorLoc());
       }
     }
   }
@@ -3317,6 +3858,13 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
   return mapType(type, loc);
 }
 
+FailureOr<Type> CImporter::mapStructFieldType(clang::QualType type,
+                                              Location loc) {
+  if (isDataPointer(type))
+    return Type(builder.getIntegerType(64));
+  return mapType(type, loc);
+}
+
 ArrayRef<ParamKind>
 CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
   const clang::FunctionDecl *canonical = func->getCanonicalDecl();
@@ -3340,6 +3888,45 @@ CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
       paramKindsCache.try_emplace(canonical, std::move(kinds));
   (void)inserted;
   return entry->second;
+}
+
+FailureOr<Type> CImporter::classifyPointerReturn(
+    const clang::FunctionDecl *func, Location loc) {
+  const clang::FunctionDecl *canonical = func->getCanonicalDecl();
+  auto it = pointerReturnKinds.find(canonical);
+  if (it != pointerReturnKinds.end())
+    return it->second;
+  const clang::FunctionDecl *definition = func->getDefinition();
+  if (!definition || !definition->hasBody())
+    return emitError(loc) << "unsupported: pointer return type";
+  SmallVector<const clang::ReturnStmt *> returns;
+  collectReturnStmts(definition->getBody(), returns);
+  Type kind;
+  for (const clang::ReturnStmt *ret : returns) {
+    Location retLoc = translateLoc(ret->getReturnLoc());
+    const clang::Expr *value = ret->getRetValue();
+    const clang::Expr *fnExpr = value ? returnedFunctionExpr(value) : nullptr;
+    if (!fnExpr)
+      return emitError(retLoc)
+             << "unsupported: returned pointer value (only a returned "
+                "function address has a representation; a cursor into a "
+                "callee-local region would dangle)";
+    const auto *fn = llvm::cast<clang::FunctionDecl>(
+        llvm::cast<clang::DeclRefExpr>(fnExpr)->getDecl());
+    FailureOr<Type> mapped =
+        mapType(astContext().getPointerType(fn->getType()), retLoc);
+    if (failed(mapped))
+      return failure();
+    if (kind && kind != *mapped)
+      return emitError(retLoc)
+             << "unsupported: return sites disagree on the returned "
+                "function pointer signature";
+    kind = *mapped;
+  }
+  if (!kind)
+    return emitError(loc) << "unsupported: pointer return type";
+  pointerReturnKinds.try_emplace(canonical, kind);
+  return kind;
 }
 
 //===----------------------------------------------------------------------===//
@@ -3435,6 +4022,210 @@ CImporter::resolveArgRoot(PointerRegionAnalysis &regions,
   return nullptr;
 }
 
+void CImporter::mergeMemberPointerFacts(const MemberPointerKey &key,
+                                        const MemberPointerFacts &incoming) {
+  MemberPointerFacts &target = memberPtrBindings[key];
+  if (!target.invalidReason.empty())
+    return; // First invalidation wins.
+  if (!incoming.invalidReason.empty()) {
+    target.invalidReason = incoming.invalidReason;
+    target.invalidLoc = incoming.invalidLoc;
+    target.secondLoc = incoming.secondLoc;
+    if (target.loc.isInvalid())
+      target.loc = incoming.loc;
+    return;
+  }
+  if (!incoming.base && !incoming.literal)
+    return;
+  if (!target.base && !target.literal) {
+    target.base = incoming.base;
+    target.literal = incoming.literal;
+    target.loc = incoming.loc;
+    return;
+  }
+  if (target.base == incoming.base && target.literal == incoming.literal)
+    return; // Idempotent: the same target bound from two sites.
+  target.invalidReason =
+      ("unsupported: pointer struct member '" + key.second->getName() +
+       "' bound to two different targets")
+          .str();
+  target.invalidLoc = incoming.loc;
+  target.secondLoc = incoming.loc;
+}
+
+void CImporter::collectGlobalMemberBindings(const clang::VarDecl *instance,
+                                            const clang::APValue &value,
+                                            clang::QualType type,
+                                            clang::SourceLocation loc) {
+  if (isDataPointer(type)) {
+    // The instance walk only reaches this case for struct fields (the
+    // top-level object of a data-pointer type imports through
+    // `importPointerGlobal` instead), but the recursion itself is
+    // type-directed and total.
+    return;
+  }
+  if (const clang::ArrayType *array = astContext().getAsArrayType(type)) {
+    if (!value.isArray())
+      return;
+    for (unsigned i = 0, n = value.getArrayInitializedElts(); i != n; ++i)
+      collectGlobalMemberBindings(instance, value.getArrayInitializedElt(i),
+                                  array->getElementType(), loc);
+    if (value.hasArrayFiller())
+      collectGlobalMemberBindings(instance, value.getArrayFiller(),
+                                  array->getElementType(), loc);
+    return;
+  }
+  const clang::RecordDecl *record = recordOfType(type);
+  if (!record || !value.isStruct())
+    return;
+  unsigned index = 0;
+  for (const clang::FieldDecl *field : record->fields()) {
+    if (index >= value.getStructNumFields())
+      break;
+    const clang::APValue &fieldValue = value.getStructField(index++);
+    if (!isDataPointer(field->getType())) {
+      collectGlobalMemberBindings(instance, fieldValue, field->getType(),
+                                  loc);
+      continue;
+    }
+    MemberPointerFacts incoming;
+    incoming.loc = loc;
+    if (fieldValue.isNullPointer() || !fieldValue.isLValue())
+      continue; // Null (or absent): the member stays unbound.
+    clang::APValue::LValueBase lvalueBase = fieldValue.getLValueBase();
+    const auto *baseVar = llvm::dyn_cast_if_present<clang::VarDecl>(
+        lvalueBase.dyn_cast<const clang::ValueDecl *>());
+    const auto *literal = llvm::dyn_cast_if_present<clang::StringLiteral>(
+        lvalueBase.dyn_cast<const clang::Expr *>());
+    bool atStart = fieldValue.getLValueOffset().isZero();
+    clang::QualType pointee =
+        field->getType().getCanonicalType()->getPointeeType();
+    if (baseVar && !baseVar->hasLocalStorage() && atStart &&
+        astContext().hasSameUnqualifiedType(pointee, baseVar->getType())) {
+      incoming.base = baseVar->getCanonicalDecl();
+    } else if (literal && atStart) {
+      incoming.literal = literal;
+    } else {
+      incoming.invalidReason =
+          ("unsupported: pointer struct member '" + field->getName() +
+           "' initializer")
+              .str();
+      incoming.invalidLoc = loc;
+    }
+    mergeMemberPointerFacts({instance->getCanonicalDecl(), field}, incoming);
+  }
+}
+
+FailureOr<const MemberPointerFacts *>
+CImporter::resolveMemberPointerBinding(const clang::MemberExpr *member,
+                                       Location loc) {
+  const auto *field =
+      llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+  if (!field) // Defensive; callers pre-check the field.
+    return emitError(loc) << "unsupported member access";
+  auto poisoned = poisonedPtrFields.find(field);
+  if (poisoned != poisonedPtrFields.end()) {
+    InFlightDiagnostic diag =
+        emitError(loc) << "unsupported: pointer struct member '"
+                       << field->getName()
+                       << "' is used outside the static-binding model";
+    diag.attachNote(translateLoc(poisoned->second))
+        << "first unresolvable use is here";
+    return diag;
+  }
+  // Resolve the struct instance: the directly named base variable of a
+  // dot access, or the single degenerate object behind a decomposed
+  // arrow base (a `&s`-bound pointer, a whole-object pointer global).
+  const clang::VarDecl *instance = nullptr;
+  if (!member->isArrow()) {
+    if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+            stripTrivia(member->getBase())))
+      instance = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  } else {
+    FailureOr<PtrExprValue> pointer = emitPointerRValue(member->getBase());
+    if (failed(pointer))
+      return failure();
+    if (pointer->nonNull)
+      // Mirror `emitPointerPlace`'s null guard: dereferencing null is UB
+      // in C, so the deterministic panic is a legal refinement.
+      builder.create<emitrust::CallOpaqueOp>(
+          loc, TypeRange(), builder.getStringAttr("assert!"),
+          builder.getArrayAttr(
+              {builder.getIndexAttr(0),
+               builder.getStringAttr("null pointer dereference")}),
+          ValueRange{pointer->nonNull});
+    if (pointer->base && !pointer->cursor && !pointer->literalBacking)
+      instance = pointer->base;
+  }
+  if (!instance)
+    return emitError(loc)
+           << "unsupported: pointer struct member '" << field->getName()
+           << "' of an unresolvable struct instance";
+  if (!instance->hasLocalStorage()) {
+    instance = instance->getCanonicalDecl();
+    // In a multi-file project another TU could rebind the member of an
+    // externally visible global instance behind this TU's facts.
+    if (!currentSoleTU && instance->isExternallyVisible())
+      return emitError(loc)
+             << "unsupported: pointer struct member of an externally "
+                "visible global in a multi-file project";
+  }
+  auto it = memberPtrBindings.find({instance, field});
+  if (it == memberPtrBindings.end() ||
+      (it->second.invalidReason.empty() && !it->second.base &&
+       !it->second.literal))
+    return emitError(loc)
+           << "unsupported: pointer struct member '" << field->getName()
+           << "' has no known target object";
+  const MemberPointerFacts &facts = it->second;
+  if (!facts.invalidReason.empty()) {
+    InFlightDiagnostic diag = emitError(loc) << facts.invalidReason;
+    if (facts.loc.isValid())
+      diag.attachNote(translateLoc(facts.loc)) << "first bound here";
+    if (facts.secondLoc.isValid())
+      diag.attachNote(translateLoc(facts.secondLoc))
+          << "conflicting binding here";
+    else if (facts.invalidLoc.isValid())
+      diag.attachNote(translateLoc(facts.invalidLoc))
+          << "unsupported construct here";
+    return diag;
+  }
+  if (facts.base && facts.base->hasLocalStorage() &&
+      !symbols.contains(facts.base))
+    return emitError(loc)
+           << "unsupported: pointer struct member '" << field->getName()
+           << "' bound to a local object of another function";
+  return &facts;
+}
+
+LogicalResult CImporter::emitMemberPointerAssign(
+    const clang::MemberExpr *member, const clang::Expr *rhs, Location loc) {
+  FailureOr<const MemberPointerFacts *> binding =
+      resolveMemberPointerBinding(member, loc);
+  if (failed(binding))
+    return failure();
+  const MemberPointerFacts &facts = **binding;
+  if (facts.literal) {
+    // A literal rebinding is idempotent by the analysis (a second literal
+    // clashes into an invalid fact), and a literal decay has no side
+    // effects: nothing to emit.
+    if (llvm::isa<clang::StringLiteral>(
+            stripTrivia(rhs)->IgnoreParenImpCasts()))
+      return success();
+    return emitError(loc)
+           << "unsupported: pointer struct member assigned this value";
+  }
+  FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
+  if (failed(value))
+    return failure();
+  if (value->base != facts.base || value->cursor || value->literalBacking)
+    return emitError(loc) // Defensive; the analysis pins the binding.
+           << "unsupported: pointer struct member assigned this value";
+  // The degenerate binding is static: the stored i64 member stays 0 and
+  // the write needs no runtime code.
+  return success();
+}
+
 void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
                            bool soleTranslationUnit) {
   // Interprocedural union-find over storage bases (local arrays and
@@ -3515,6 +4306,14 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
       if (!var->hasLocalStorage())
         if (const PointerRegion *region = analysis.regionOf(var))
           mergeRegionFacts(globalPtrFacts[var->getCanonicalDecl()], *region);
+
+    // Program-wide member-pointer facts (CTS-P2): every body's bindings
+    // and unresolvable field uses merge here; reads and writes of
+    // data-pointer members consult the union at their use sites.
+    for (const auto &entry : analysis.memberBindings())
+      mergeMemberPointerFacts(entry.first, entry.second);
+    for (const auto &entry : analysis.poisonedMemberFields())
+      poisonedPtrFields.try_emplace(entry.first, entry.second);
 
     // Call edges: a pointer argument's root object unifies with the callee
     // definition's parameter; an unresolvable root poisons the parameter's
@@ -3939,7 +4738,7 @@ LogicalResult CImporter::collectRecordFields(
     if (isRustKeyword(field->getName()))
       return emitError(fieldLoc) << "unsupported: struct member '"
                                  << field->getName() << "' is a Rust keyword";
-    FailureOr<Type> fieldType = mapType(field->getType(), fieldLoc);
+    FailureOr<Type> fieldType = mapStructFieldType(field->getType(), fieldLoc);
     if (failed(fieldType))
       return failure();
     fieldNames.push_back(field->getName());
@@ -4312,9 +5111,15 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
       return emitError(initLoc)
              << "unsupported: non-constant global initializer";
     FailureOr<Attribute> init =
-        convertAPValueInit(literalValue.Val, *backingType, initLoc);
+        convertAPValueInit(literalValue.Val, *backingType, literalType,
+                           initLoc);
     if (failed(init))
       return failure();
+    // Data-pointer members of the backing bind through the pointer
+    // global's own key (the backing is 1:1 with the pointer), so
+    // `s->f`-style member reads resolve statically (CTS-P2).
+    collectGlobalMemberBindings(key, literalValue.Val, literalType,
+                                literalInit->getBeginLoc());
     std::string backingName = (symbolName + "_backing").str();
     if (failed(checkFreshSymbol(backingName)))
       return failure();
@@ -4530,6 +5335,12 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
     if (failed(converted))
       return failure();
     initAttr = *converted;
+    // Record the static member bindings of any data-pointer fields the
+    // initialized aggregate carries (CTS-P2); the stored i64 members
+    // themselves converted to 0 above.
+    if (const clang::APValue *value = decl->evaluateValue())
+      collectGlobalMemberBindings(key, *value, decl->getType(),
+                                  decl->getInit()->getBeginLoc());
   }
 
   // A const-qualified global is never written (clang rejects writes), so it
@@ -4612,11 +5423,25 @@ FailureOr<Attribute> CImporter::convertGlobalInit(const clang::VarDecl *decl,
   clang::APValue *value = decl->evaluateValue();
   if (!value)
     return emitError(initLoc) << "unsupported: non-constant global initializer";
-  return convertAPValueInit(*value, type, initLoc);
+  return convertAPValueInit(*value, type, decl->getType(), initLoc);
 }
 
 FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
-                                                   Type type, Location loc) {
+                                                   Type type,
+                                                   clang::QualType cType,
+                                                   Location loc) {
+  // A data-pointer struct member is stored as a plain i64 cursor field
+  // whose degenerate binding carries no runtime information: the constant
+  // initializer's lvalue (or null) converts to 0, and the binding itself
+  // is recorded by `collectGlobalMemberBindings` at the object's import.
+  if (!cType.isNull() && isDataPointer(cType)) {
+    auto intType = llvm::dyn_cast<IntegerType>(type);
+    if (!intType || intType.getWidth() != 64 ||
+        (!value.isLValue() && !value.isNullPointer()))
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
+    return Attribute(IntegerAttr::get(intType, 0));
+  }
   if (auto intType = llvm::dyn_cast<IntegerType>(type)) {
     if (!value.isInt())
       return emitError(loc)
@@ -4636,13 +5461,16 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
     if (!value.isArray() || value.getArraySize() != arrayType.getSize())
       return emitError(loc)
              << "unsupported: global initializer does not match its type";
+    const clang::ArrayType *cArray =
+        cType.isNull() ? nullptr : astContext().getAsArrayType(cType);
+    clang::QualType cElement =
+        cArray ? cArray->getElementType() : clang::QualType();
     Type elementType = arrayType.getElementType();
     SmallVector<Attribute> elements;
     elements.reserve(arrayType.getSize());
     for (unsigned i = 0, n = value.getArrayInitializedElts(); i != n; ++i) {
-      FailureOr<Attribute> element =
-          convertAPValueInit(value.getArrayInitializedElt(i), elementType,
-                             loc);
+      FailureOr<Attribute> element = convertAPValueInit(
+          value.getArrayInitializedElt(i), elementType, cElement, loc);
       if (failed(element))
         return failure();
       elements.push_back(*element);
@@ -4653,8 +5481,8 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
       if (!value.hasArrayFiller())
         return emitError(loc)
                << "unsupported: global initializer does not match its type";
-      FailureOr<Attribute> filler =
-          convertAPValueInit(value.getArrayFiller(), elementType, loc);
+      FailureOr<Attribute> filler = convertAPValueInit(
+          value.getArrayFiller(), elementType, cElement, loc);
       if (failed(filler))
         return failure();
       elements.append(arrayType.getSize() - elements.size(), *filler);
@@ -4670,6 +5498,12 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
     if (!structDef)
       return emitError(loc)
              << "unsupported: global initializer for this type";
+    const clang::RecordDecl *record =
+        cType.isNull() ? nullptr : recordOfType(cType);
+    SmallVector<clang::QualType> cFields;
+    if (record)
+      for (const clang::FieldDecl *field : record->fields())
+        cFields.push_back(field->getType());
     ArrayAttr fieldTypes = structDef.getFieldTypes();
     SmallVector<Attribute> fields;
     fields.reserve(fieldTypes.size());
@@ -4695,7 +5529,8 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
     for (auto [i, fieldType] : llvm::enumerate(fieldTypes)) {
       FailureOr<Attribute> field = convertAPValueInit(
           value.getStructField(i),
-          llvm::cast<TypeAttr>(fieldType).getValue(), loc);
+          llvm::cast<TypeAttr>(fieldType).getValue(),
+          i < cFields.size() ? cFields[i] : clang::QualType(), loc);
       if (failed(field))
         return failure();
       fields.push_back(*field);
@@ -4767,7 +5602,7 @@ LogicalResult CImporter::convertRecordAPValue(
              << "unsupported: global initializer does not match its type";
     Type fieldType = llvm::cast<TypeAttr>(fieldTypes[typeIndex++]).getValue();
     FailureOr<Attribute> attr =
-        convertAPValueInit(fieldValue, fieldType, loc);
+        convertAPValueInit(fieldValue, fieldType, field->getType(), loc);
     if (failed(attr))
       return failure();
     fields.push_back(*attr);
@@ -4798,7 +5633,8 @@ CImporter::convertAnonymousSlotInit(const clang::APValue &value,
           value.getUnionValue(),
           active->getType()->getAsRecordDecl()->getDefinition(), slotType,
           loc);
-    return convertAPValueInit(value.getUnionValue(), slotType, loc);
+    return convertAPValueInit(value.getUnionValue(), slotType,
+                              active->getType(), loc);
   }
   // A nested anonymous struct on the slot path has exactly one field
   // (`anonymousUnionArmLeaf` admitted the arm); descend into it.
@@ -4811,7 +5647,7 @@ CImporter::convertAnonymousSlotInit(const clang::APValue &value,
     return convertAnonymousSlotInit(
         fieldValue, only->getType()->getAsRecordDecl()->getDefinition(),
         slotType, loc);
-  return convertAPValueInit(fieldValue, slotType, loc);
+  return convertAPValueInit(fieldValue, slotType, only->getType(), loc);
 }
 
 const GlobalInfo *CImporter::lookupGlobal(const clang::ValueDecl *decl) const {
@@ -5032,10 +5868,19 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   SmallVector<Type> resultTypes;
   clang::QualType returnType = func->getReturnType();
   if (!returnType->isVoidType()) {
-    FailureOr<Type> mapped = mapType(returnType, loc);
-    if (failed(mapped))
-      return failure();
-    resultTypes.push_back(*mapped);
+    if (isDataPointer(returnType)) {
+      // A data-pointer return classifies by its return sites (CTS-P2):
+      // the fn-address kind returns the plain fn_ptr value.
+      FailureOr<Type> kind = classifyPointerReturn(func, loc);
+      if (failed(kind))
+        return failure();
+      resultTypes.push_back(*kind);
+    } else {
+      FailureOr<Type> mapped = mapType(returnType, loc);
+      if (failed(mapped))
+        return failure();
+      resultTypes.push_back(*mapped);
+    }
   }
   FunctionType functionType = builder.getFunctionType(inputTypes, resultTypes);
 
@@ -5739,7 +6584,7 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
         const auto *list = llvm::dyn_cast<clang::InitListExpr>(init);
         if (!list)
           return emitError(loc) << "unsupported: aggregate initializer";
-        return emitAggregateInitList(place, *mlirType, list);
+        return emitAggregateInitList(place, *mlirType, list, var);
       }
       FailureOr<Value> value = emitRValue(init);
       if (failed(value))
@@ -5815,7 +6660,8 @@ LogicalResult CImporter::emitOwnerLocal(const clang::VarDecl *var,
 
 LogicalResult
 CImporter::emitAggregateInitList(Value place, Type type,
-                                 const clang::InitListExpr *list) {
+                                 const clang::InitListExpr *list,
+                                 const clang::VarDecl *instance) {
   // Sema's semantic form has designators resolved to positional elements
   // and ImplicitValueInitExpr holes for everything left implicit.
   if (const clang::InitListExpr *semantic = list->getSemanticForm())
@@ -5850,14 +6696,15 @@ CImporter::emitAggregateInitList(Value place, Type type,
     const clang::RecordDecl *record = list->getType()->getAsRecordDecl();
     if (!record) // Defensive; a struct-typed list always has a record.
       return emitError(loc) << "unsupported: aggregate initializer";
-    return emitRecordInitFields(place, record, list);
+return emitRecordInitFields(place, record, list, instance);
   }
   return emitError(loc) << "unsupported: aggregate initializer";
 }
 
 LogicalResult
 CImporter::emitRecordInitFields(Value place, const clang::RecordDecl *record,
-                                const clang::InitListExpr *list) {
+                                const clang::InitListExpr *list,
+                                const clang::VarDecl *instance) {
   // Nested lists reached through anonymous members arrive directly (not
   // via emitAggregateInitList), so normalize to the semantic form here
   // too; it is a no-op for a list that already is one.
@@ -5870,7 +6717,7 @@ CImporter::emitRecordInitFields(Value place, const clang::RecordDecl *record,
     const clang::FieldDecl *active = list->getInitializedFieldInUnion();
     if (!active || list->getNumInits() == 0)
       return success();
-    return emitRecordInitField(place, active, list->getInit(0));
+    return emitRecordInitField(place, active, list->getInit(0), instance);
   }
   unsigned index = 0;
   for (const clang::FieldDecl *field : record->fields()) {
@@ -5879,7 +6726,7 @@ CImporter::emitRecordInitFields(Value place, const clang::RecordDecl *record,
     const clang::Expr *element = list->getInit(index++);
     if (llvm::isa<clang::ImplicitValueInitExpr>(element))
       continue;
-    if (failed(emitRecordInitField(place, field, element)))
+    if (failed(emitRecordInitField(place, field, element, instance)))
       return failure();
   }
   return success();
@@ -5887,8 +6734,33 @@ CImporter::emitRecordInitFields(Value place, const clang::RecordDecl *record,
 
 LogicalResult CImporter::emitRecordInitField(Value place,
                                              const clang::FieldDecl *field,
-                                             const clang::Expr *element) {
+                                             const clang::Expr *element,
+                                             const clang::VarDecl *instance) {
   Location elementLoc = translateLoc(element->getBeginLoc());
+  if (isDataPointer(field->getType())) {
+    // A data-pointer field's binding was recorded by the analysis walk of
+    // this declaration; the stored i64 member keeps its default 0 (the
+    // degenerate binding carries no runtime information), so a supported
+    // initializer emits nothing (CTS-P2).
+    if (!instance)
+      return emitError(elementLoc)
+             << "unsupported: pointer struct member initializer in a "
+                "nested aggregate";
+    MemberPointerKey key{instance->getCanonicalDecl(), field};
+    auto it = memberPtrBindings.find(key);
+    if (it == memberPtrBindings.end())
+      return emitError(elementLoc)
+             << "unsupported: pointer struct member initializer";
+    if (!it->second.invalidReason.empty()) {
+      InFlightDiagnostic diag =
+          emitError(elementLoc) << it->second.invalidReason;
+      if (it->second.secondLoc.isValid())
+        diag.attachNote(translateLoc(it->second.secondLoc))
+            << "conflicting binding here";
+      return diag;
+    }
+    return success();
+  }
   if (field->isAnonymousStructOrUnion()) {
     // The anonymous member's fields live inline in the parent place; its
     // nested list (the semantic form always materializes one) recurses
@@ -5898,7 +6770,8 @@ LogicalResult CImporter::emitRecordInitField(Value place,
       return emitError(elementLoc)
              << "unsupported: aggregate initializer element";
     return emitRecordInitFields(
-        place, field->getType()->getAsRecordDecl()->getDefinition(), nested);
+        place, field->getType()->getAsRecordDecl()->getDefinition(), nested,
+        instance);
   }
   FailureOr<Type> fieldType = mapType(field->getType(), elementLoc);
   if (failed(fieldType))
@@ -6819,7 +7692,21 @@ LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
     if (!currentReturnType)
       return emitError(loc)
              << "unsupported: return with a value in a void function";
-    FailureOr<Value> value = emitRValue(retValue);
+    FailureOr<Value> value = failure();
+    if (isDataPointer(retValue->getType()) &&
+        llvm::isa<emitrust::FnPtrType>(currentReturnType)) {
+      // A classified fn-address pointer return (CTS-P2): peel the
+      // `void *` cast and emit the fn_ptr constant directly.
+      const clang::Expr *fnExpr = returnedFunctionExpr(retValue);
+      if (!fnExpr) // Defensive; classification pinned every return site.
+        return emitError(loc) << "unsupported: returned pointer value";
+      const auto *fn = llvm::cast<clang::FunctionDecl>(
+          llvm::cast<clang::DeclRefExpr>(fnExpr)->getDecl());
+      value = emitFunctionPointerConstant(
+          fnExpr, astContext().getPointerType(fn->getType()), loc);
+    } else {
+      value = emitRValue(retValue);
+    }
     if (failed(value))
       return failure();
     if ((*value).getType() != currentReturnType)
@@ -6935,6 +7822,12 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
                               << "' has no bound pointer variable";
       return storePointerAssign(loc, it->second, op->getRHS());
     }
+    // A data-pointer struct member holds a statically resolved degenerate
+    // binding; the write validates against it and emits nothing (CTS-P2).
+    if (dataPointerFieldOf(op->getLHS()))
+      return emitMemberPointerAssign(
+          llvm::cast<clang::MemberExpr>(stripTrivia(op->getLHS())),
+          op->getRHS(), loc);
     return emitError(loc)
            << "unsupported: assignment to this pointer expression";
   }
@@ -9933,11 +10826,36 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
     return emitError(loc)
            << "unsupported: null pointer constant in a pointer expression";
 
+  // A qualification-preserving explicit cast (`(int *)p` on an `int *`
+  // decomposition) changes nothing the decomposition tracks; peel it.
+  // Reinterpreting casts fall through to the located rejection below.
+  if (const clang::Expr *peeled = peeledQualificationCast(astContext(), e))
+    return emitPointerRValue(peeled);
+
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
     switch (cast->getCastKind()) {
     case clang::CK_NoOp:
       return emitPointerRValue(cast->getSubExpr());
     case clang::CK_LValueToRValue: {
+      // A read of a data-pointer struct member resolves through its
+      // static per-instance binding (CTS-P2): the member designates one
+      // whole object, so the value is the degenerate (cursor-less) form
+      // of that object — no runtime state is read at all. A
+      // literal-bound member stays write-only.
+      if (const clang::FieldDecl *field =
+              dataPointerFieldOf(cast->getSubExpr())) {
+        const auto *member =
+            llvm::cast<clang::MemberExpr>(stripTrivia(cast->getSubExpr()));
+        FailureOr<const MemberPointerFacts *> binding =
+            resolveMemberPointerBinding(member, loc);
+        if (failed(binding))
+          return failure();
+        if ((*binding)->literal)
+          return emitError(loc)
+                 << "unsupported: pointer struct member '"
+                 << field->getName() << "' bound to a string literal";
+        return PtrExprValue{(*binding)->base, Value()};
+      }
       // A read of a pointer local: its base is static, its cursor is the
       // current value of the cursor cell (none for a degenerate base).
       const clang::Expr *sub = stripTrivia(cast->getSubExpr());
@@ -10536,6 +11454,12 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
         llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
     if (!field)
       return emitError(loc) << "unsupported member access";
+    // A data-pointer member has no place of its own (its stored i64
+    // carries no information); reads resolve through the static binding
+    // in `emitPointerRValue` and writes through `emitMemberPointerAssign`.
+    if (isDataPointer(field->getType()))
+      return emitError(loc) << "unsupported use of pointer struct member '"
+                            << field->getName() << "'";
     Value basePlace;
     if (member->isArrow() && isDecomposedPointerExpr(member->getBase())) {
       // `p->f` through a decomposed pointer: resolve the pointer to its

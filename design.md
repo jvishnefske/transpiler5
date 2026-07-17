@@ -896,11 +896,11 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 195 passed / 0 miscompiled /
-25 unsupported (was 150/70 at commit a091423, when this checklist was
-drawn up; the quick wins, the CTS-S7/R5/P4/P6 partials, and
+Ledger as of 2026-07-17: 220 total / 200 passed / 0 miscompiled /
+20 unsupported (was 150/70 at commit a091423, when this checklist was
+drawn up; the quick wins, the CTS-S7/R5/P2/P4/P6 partials, and
 CTS-S1/S2/S4/S6/P1/P5/P7/P8/R1/R2/R4/L1/L2 landed since). Every one of
-the 25 is a located build-time rejection — never wrong output.
+the 20 is a located build-time rejection — never wrong output.
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
 checkbox discipline as above — tick only when the referenced tests pass
@@ -987,6 +987,45 @@ observed when C99-33 + C99-47 together unlocked 00215).
   position" (a data-pointer return).
   (00019.c, 00049.c, 00089.c, 00095.c, 00140.c, 00150.c, 00208.c,
   00214.c)
+  (Partial, 5 of 7 — 00019, 00049, 00095, 00150, 00208 pass. Three
+  sub-features landed, each the principal-kind inference of
+  docs/transformation-theory.md sections 4-5 on the existing analysis.
+  Pointer STRUCT MEMBERS: a data-pointer member is a stored i64 cursor
+  field (a cursor is a borrow-free Copy integer, so a struct can hold
+  one); the analysis resolves each member to one statically known target
+  object — or one write-only string literal — per struct instance,
+  program-wide (every body in Pass A plus the constant-initializer walk
+  of globals, including a pointer global's compound-literal backing).
+  Supported bindings are degenerate, so the stored i64 stays 0: member
+  writes emit nothing, member reads resolve to the bound object's place
+  with zero runtime state, and a self-referential chain folds hop by
+  hop. Conflicting bindings are a located rejection naming both sites;
+  aliased writes, escaping member addresses, and whole-struct overwrites
+  poison the field program-wide. Pointer RETURNS: a data-pointer return
+  type classifies by its return sites; the landed kind is a returned
+  function address behind a void pointer (00095), emitted as the plain
+  fn_ptr result — returning a cursor into a callee-local region stays
+  rejected at the return site (the dangling case), and the caller-owned
+  cursor-return kind (returning p+i over a slice parameter as a plain
+  i64 the caller re-associates) is designed but not yet needed by any
+  manifest test. CASTS: qualification-preserving explicit casts (same
+  unqualified pointee) peel transparently in analysis and emission;
+  reinterpreting casts stay rejected. Remaining two tests block on
+  non-pointer features: 00140 at "00140.c:8:1: error: unsupported:
+  variadic function definition" (CTS-F1 — the pointer member and
+  struct-by-value shapes in it now import); 00214 at "00214.c:22:6:
+  error: unsupported: returned pointer value (only a returned function
+  address has a representation; a cursor into a callee-local region
+  would dangle)" — its return value is an integer-to-pointer round-trip
+  ((void *)_brk_end), rejected by design per CTS-P3, with further
+  blockers behind it: "error: unsupported: call to unimported function
+  '__builtin_expect'" and "error: unsupported expression: StmtExpr".
+  Ledger 188 -> 193, zero miscompiles.
+  (test/Import/C/pointers-member.c; test/Import/C/pointers-cast.c;
+  member conflict/poison/literal-read/cross-function/dangling-return
+  rejections in test/Import/C/pointers-member-invalid.c and
+  test/Import/C/pointers-return.c; rustc-level differential
+  test/EndToEnd/pointers-member.c)
 - [ ] CTS-P3 (5) Pointers assigned non-address values (integer↔pointer
   round-trips, arithmetic results stored back into pointers): needs a
   design decision — either a tagged cursor representation or a
