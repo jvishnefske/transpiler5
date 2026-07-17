@@ -1,12 +1,13 @@
 // C99-6: `typedef struct { ... } T;` gives the tagless record its typedef
 // name; the struct imports, and its fields read/write and pass to functions
 // exactly like a tagged struct. Across translation units the typedef name is
-// the dedup key: an identical shape imports once, and a bare anonymous
-// struct with no typedef name stays rejected with a located diagnostic.
+// the dedup key: an identical shape imports once. A bare anonymous struct
+// with no typedef name gets a synthesized shape-keyed `Anon<n>` name instead
+// (CTS-R1; see structs-anon-bare.c).
 // RUN: split-file %s %t
 // RUN: emitrust-import-c %t/valid.c | FileCheck %s
 // RUN: emitrust-import-c %t/tu-a.c %t/tu-b.c | FileCheck %s --check-prefix=DEDUP
-// RUN: not emitrust-import-c %t/bare.c 2>&1 | FileCheck %s --check-prefix=BARE
+// RUN: emitrust-import-c %t/bare.c | FileCheck %s --check-prefix=BARE
 
 //--- valid.c
 typedef struct {
@@ -85,4 +86,5 @@ struct {
   int x;
 } g;
 
-// BARE: bare.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: anonymous struct type
+// A bare anonymous struct imports under a synthesized shape-keyed name.
+// BARE: emitrust.struct_def @Anon0 ["x"] [i32]
