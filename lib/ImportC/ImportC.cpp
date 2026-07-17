@@ -538,10 +538,20 @@ private:
 
   /// Imports a complete named struct definition as a module-level
   /// `emitrust.struct_def`. Forward declarations are ignored; repeated
-  /// imports of the same definition are deduplicated. An empty member list
-  /// (`struct T {};`) imports as a field-less struct_def. Unions, anonymous
-  /// structs, bit-fields, and unsupported field types are rejected.
+  /// imports of the same definition are deduplicated. A file-scope record
+  /// is emitted under its tag (or anonymous-typedef) name with cross-TU
+  /// name/shape deduplication; a block-scope record is its own type per
+  /// defining decl and is emitted under a mangled name (see
+  /// `localRecordNames`). An empty member list (`struct T {};`) imports as
+  /// a field-less struct_def. Unions, anonymous structs, bit-fields, and
+  /// unsupported field types are rejected.
   LogicalResult importRecord(const clang::RecordDecl *record, Location loc);
+
+  /// Returns the Rust type name `definition` was imported under: the
+  /// mangled block-scope name recorded by `importRecord`, or the tag (or
+  /// anonymous-typedef) name for a file-scope record (empty for a bare
+  /// anonymous struct, which callers reject).
+  std::string emittedRecordName(const clang::RecordDecl *definition) const;
 
   /// Imports a complete named enum definition as a module-level
   /// `emitrust.enum_def`. Incomplete and anonymous enums are silently
@@ -1153,9 +1163,23 @@ private:
   /// keyed by MLIR symbol name; the location is the first reference for the
   /// diagnostic if no TU defines it.
   llvm::StringMap<Location> pendingExternGlobals;
-  /// Shape of every imported struct, keyed by symbol name, for cross-TU
-  /// deduplication and mismatch detection.
+  /// Shape of every imported file-scope struct, keyed by symbol name, for
+  /// cross-TU deduplication and mismatch detection. Block-scope records are
+  /// never entered here: their identity is the defining decl (see
+  /// `localRecordNames`), not the tag name.
   llvm::StringMap<std::string> importedRecordShapes;
+  /// Emitted Rust type name of every block-scope struct definition, keyed by
+  /// the defining decl. C tag identity is per declaration (C99 6.2.1: an
+  /// inner-scope `struct T` shadowing an outer `T` is a new type even when
+  /// the shapes match), so each block-scope definition gets its own
+  /// struct_def under a `<function>_<tag>` name following the
+  /// function-local-static mangling convention, `_<n>`-suffixed when that
+  /// name is already taken.
+  llvm::DenseMap<const clang::RecordDecl *, std::string> localRecordNames;
+  /// Every struct_def symbol name emitted so far (file-scope tags and
+  /// mangled block-scope names alike), consulted so block-scope mangling
+  /// never reuses an existing type name.
+  llvm::StringSet<> emittedStructNames;
   /// Shape of every imported enum, keyed by symbol name, for cross-TU
   /// deduplication and mismatch detection.
   llvm::StringMap<std::string> importedEnumShapes;
@@ -1840,11 +1864,14 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     const clang::RecordDecl *definition = decl->getDefinition();
     if (!definition)
       return emitError(loc) << "unsupported: incomplete struct type";
-    llvm::StringRef structName = recordRustName(definition);
-    if (structName.empty())
-      return emitError(loc) << "unsupported: anonymous struct type";
     if (failed(importRecord(definition, loc)))
       return failure();
+    // The type name is resolved after the import so a block-scope record
+    // maps to its mangled per-declaration name (see localRecordNames), not
+    // to the bare tag it may share with a shadowed outer declaration.
+    std::string structName = emittedRecordName(definition);
+    if (structName.empty())
+      return emitError(loc) << "unsupported: anonymous struct type";
     return Type(emitrust::StructType::get(builder.getContext(), structName));
   }
 
@@ -2316,9 +2343,48 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   // An empty member list (`struct T {};`, a GNU/C2x shape clang accepts) is
   // permitted and becomes a unit-like Rust struct.
 
-  // Cross-TU deduplication: the same struct reached through a shared header
-  // has distinct decls in each TU. Dedup by symbol name; an identical shape is
-  // skipped, a name reused with a different field shape is a diagnostic.
+  // C tag identity is (tag name, scope), and every block-scope declaration
+  // of a tag introduces a new type (C99 6.2.1) — a `struct T` inside a
+  // block may shadow a file-scope `struct T` with a different shape, and
+  // even a same-shaped redeclaration is a distinct type. clang has already
+  // resolved the scoping, so the defining decl is the identity; only the
+  // emitted Rust name needs disambiguation. Block-scope records take the
+  // function-local-static mangling convention `<function>_<tag>`
+  // (`_<n>`-suffixed if that name is taken) and skip the name-keyed
+  // cross-TU dedup below, which exists solely to merge the same file-scope
+  // definition reached through a shared header in several TUs.
+  if (!definition->getDeclContext()->getRedeclContext()->isFileContext()) {
+    const clang::FunctionDecl *enclosing = nullptr;
+    for (const clang::DeclContext *ctx = definition->getDeclContext();
+         ctx && !enclosing; ctx = ctx->getParent())
+      enclosing = llvm::dyn_cast<clang::FunctionDecl>(ctx);
+    if (!enclosing)
+      return emitError(defLoc)
+             << "unsupported: struct definition outside file or function "
+                "scope";
+    std::string mangledBase =
+        (llvm::Twine(mlirFuncName(enclosing)) + "_" + structName).str();
+    std::string mangled = mangledBase;
+    // Each probe below tries a fresh suffix, so the loop takes at most one
+    // step per already-emitted struct name — bounded and deterministic.
+    for (unsigned suffix = 2; emittedStructNames.contains(mangled); ++suffix)
+      mangled = (llvm::Twine(mangledBase) + "_" + llvm::Twine(suffix)).str();
+    emittedStructNames.insert(mangled);
+    llvm::StringRef mangledRef =
+        localRecordNames.try_emplace(definition, std::move(mangled))
+            .first->second;
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::StructDefOp>(
+        defLoc, moduleBuilder.getStringAttr(mangledRef),
+        moduleBuilder.getStrArrayAttr(fieldNames),
+        moduleBuilder.getTypeArrayAttr(fieldTypes));
+    return success();
+  }
+
+  // Cross-TU deduplication (file-scope records only): the same struct
+  // reached through a shared header has distinct decls in each TU. Dedup by
+  // symbol name; an identical shape is skipped, a name reused with a
+  // different field shape is a diagnostic.
   std::string shape;
   {
     llvm::raw_string_ostream os(shape);
@@ -2333,7 +2399,16 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
              << "' with a different shape in another translation unit";
     return success();
   }
+  // A file-scope tag that lands on a name already claimed by a mangled
+  // block-scope record cannot be merged (they are different C types) and
+  // cannot share the symbol; reject with a located diagnostic, mirroring
+  // createGlobal's collision policy for mangled local statics.
+  if (emittedStructNames.contains(structName))
+    return emitError(defLoc)
+           << "unsupported: struct name '" << structName
+           << "' collides with the mangled name of a block-scope struct";
   importedRecordShapes[structName] = shape;
+  emittedStructNames.insert(structName);
 
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
   moduleBuilder.create<emitrust::StructDefOp>(
@@ -2341,6 +2416,14 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
       moduleBuilder.getStrArrayAttr(fieldNames),
       moduleBuilder.getTypeArrayAttr(fieldTypes));
   return success();
+}
+
+std::string
+CImporter::emittedRecordName(const clang::RecordDecl *definition) const {
+  auto local = localRecordNames.find(definition);
+  if (local != localRecordNames.end())
+    return local->second;
+  return recordRustName(definition).str();
 }
 
 LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,

@@ -945,10 +945,22 @@ observed when C99-33 + C99-47 together unlocked 00215).
   enum when all accesses are type-consistent, or byte-array storage with
   typed accessor helpers for real type punning.
   (00042.c, 00210.c, 00218.c)
-- [ ] CTS-R4 (2) Block-scope struct declarations shadowing an outer tag
+- [x] CTS-R4 (2) Block-scope struct declarations shadowing an outer tag
   (same tag `T`, different shape, inner scope): the importer's per-name
   shape dedup misreads this as a cross-TU conflict; record keys need
   scope depth, and the inner type needs a distinct Rust name.
+  Landed: record identity is the defining `RecordDecl` (clang has already
+  resolved tag scoping), so the name-keyed cross-TU shape dedup now
+  applies to file-scope records only; each block-scope definition — even
+  a same-shaped one, per C99 6.2.1 — emits its own struct_def under the
+  function-local-static mangling convention `<function>_<tag>`
+  (`_<n>`-suffixed when taken). Traceability: importer
+  `lib/ImportC/ImportC.cpp` (`importRecord`, `emittedRecordName`,
+  `localRecordNames`); tests test/Import/C/structs-shadow.c (shadowing,
+  same-shape, double-shadow, tag-only), test/Import/C/
+  multi-tu-struct-conflict.c (genuine file-scope cross-TU conflict keeps
+  its diagnostic), test/EndToEnd/structs-shadow.c (differential);
+  manifest ratcheted 159 -> 161.
   (00044.c, 00053.c)
 - [ ] CTS-R5 (3) C's separate tag/ordinary namespaces (`struct a` and a
   global `a` coexisting, or a static local colliding with the mangled
