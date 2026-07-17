@@ -918,14 +918,85 @@ private:
   getOrCreateLiteralBacking(const clang::StringLiteral *literal,
                             Location loc);
 
-  /// Lowers a value-position call to a definition-less `strlen` whose
-  /// argument is a pointer into a string-literal region: an
-  /// `emitrust.slice_of` of the backing from the argument's cursor passed
-  /// through the `__emitrust_strlen` helper (which counts bytes up to the
-  /// first NUL, exactly C's strlen), cast to the call's declared result
-  /// type. Arguments outside a string-literal region are rejected with a
-  /// located diagnostic.
+  /// Lowers a value-position call to a definition-less `strlen`: the
+  /// argument's char region (a string-literal backing, a char array, or a
+  /// pointer into either — see `emitCharRegionArg`) is borrowed as a byte
+  /// slice from its cursor and passed through the `__emitrust_strlen`
+  /// helper (which counts bytes up to the first NUL, exactly C's strlen),
+  /// cast to the call's declared result type. Arguments outside a char
+  /// region are rejected with a located diagnostic.
   FailureOr<Value> emitStrlenCall(const clang::CallExpr *call);
+
+  /// Resolves a hosted `<string.h>` argument to the (base, cursor, backing)
+  /// decomposition of the char region it designates. Three shapes are
+  /// accepted: a decayed string literal (its read-only backing is created
+  /// on first need, cursor 0), any pointer expression the decomposition
+  /// already handles (a decayed char array at cursor 0, `&arr[i]` at
+  /// cursor i, a walking pointer at its current cursor), and either shape
+  /// under the implicit pointer bitcasts that `void *` parameters
+  /// (memset/memcpy/memcmp) introduce, which are stripped. The address of
+  /// a scalar object (no cursor) is rejected with a located diagnostic.
+  FailureOr<PtrExprValue> emitCharRegionArg(const clang::Expr *expr);
+
+  /// Borrows the char region of a decomposed pointer as a byte slice from
+  /// its cursor: `emitrust.slice_of` of the region's place — the literal
+  /// backing, or the base object's own place — typed
+  /// `!emitrust.ref<!emitrust.slice<i8>>` (or `mut_ref` when `isMut`).
+  /// Rejects a mutable borrow of a read-only literal region and any base
+  /// whose place is not a char array (both located diagnostics); the
+  /// array's compile-time-known size is what makes every helper access
+  /// bounds-checked safe Rust.
+  FailureOr<Value> emitCharRegionSlice(Location loc,
+                                       const PtrExprValue &pointer,
+                                       bool isMut);
+
+  /// Records that the hosted `<string.h>` helper `name` must be emitted at
+  /// the end of the module (see `stringHelperSource`).
+  void requestStringHelper(llvm::StringRef name);
+
+  /// Lowers a statement-position `strcpy`/`strncpy`/`strcat` call (C name
+  /// in `name`; `hasCount` for strncpy) to the matching one-per-module
+  /// safe helper over `(&mut [i8], &[i8][, i64])`: destination and source
+  /// resolve through `emitCharRegionArg`/`emitCharRegionSlice`, and a
+  /// source region sharing the destination's base object would alias a
+  /// mutable borrow and is rejected. The helper copies bytes exactly as C
+  /// does (strcpy/strcat through the source NUL, strncpy NUL-padded to n).
+  LogicalResult emitStringCopyCall(const clang::CallExpr *call,
+                                   llvm::StringRef name, bool hasCount);
+
+  /// Lowers a statement-position `memset(s, c, n)` call to the
+  /// `__emitrust_memset` helper: the destination region as a mutable byte
+  /// slice from its cursor, the fill byte as i32, the count as i64.
+  LogicalResult emitMemsetCall(const clang::CallExpr *call);
+
+  /// Lowers a statement-position `memcpy(dst, src, n)` call. Distinct base
+  /// objects (or a literal source) borrow two slices for the
+  /// `__emitrust_memcpy` helper; both arguments rooted in the same base
+  /// object would alias a mutable borrow, so that shape takes one mutable
+  /// borrow of the whole array plus both cursors through the
+  /// `__emitrust_memcpy_within` helper (`copy_within`, whose memmove
+  /// semantics refine C's undefined overlapping memcpy).
+  LogicalResult emitMemcpyCall(const clang::CallExpr *call);
+
+  /// Lowers a value-position `strcmp`/`strncmp`/`memcmp` call (C name in
+  /// `name`; `hasCount` for the n-limited forms) to the matching helper
+  /// over two shared byte slices, returning C's int result (the helpers
+  /// compare as unsigned char and return a sign-correct difference).
+  FailureOr<Value> emitStringCompareCall(const clang::CallExpr *call,
+                                         llvm::StringRef name, bool hasCount);
+
+  /// Returns the argument as a definition-less `strchr`/`strrchr` call
+  /// (setting `reverse` for strrchr), or null for every other expression.
+  const clang::CallExpr *asHostedStrchrCall(const clang::Expr *expr,
+                                            bool &reverse) const;
+
+  /// Lowers a `strchr`/`strrchr` call to its found byte index: the
+  /// searched region (returned through `region`) is borrowed as a shared
+  /// slice from its cursor and passed to the `__emitrust_strchr` /
+  /// `__emitrust_strrchr` helper, whose i64 result is the index relative
+  /// to that cursor, or -1 when the byte does not occur (C's NULL result).
+  FailureOr<Value> emitStrchrIndex(const clang::CallExpr *call, bool reverse,
+                                   PtrExprValue &region);
 
   /// Emits `if`/`else` as a cf diamond: cond_br into then/else blocks that
   /// fall through to a continuation block.
@@ -1516,6 +1587,12 @@ private:
   /// True once the `__emitrust_strlen` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool strlenHelperEmitted = false;
+  /// Hosted `<string.h>` helpers requested by lowered calls
+  /// (`requestStringHelper`); each is emitted once per module, in the
+  /// fixed order of the `kStringHelpers` table.
+  llvm::StringSet<> neededStringHelpers;
+  /// Helpers already emitted, so a multi-TU import never emits one twice.
+  llvm::StringSet<> emittedStringHelpers;
 };
 
 } // namespace
@@ -3450,6 +3527,10 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   if (cName == "__emitrust_strlen")
     return emitError(loc) << "unsupported: function name '__emitrust_strlen' "
                              "is reserved for the strlen helper";
+  if (cName.starts_with("__emitrust_"))
+    return emitError(loc) << "unsupported: function name '" << cName
+                          << "' is in the reserved '__emitrust_' helper "
+                             "namespace";
   if (isRustKeyword(cName))
     return emitError(loc) << "unsupported: function name '" << cName
                           << "' is a Rust keyword";
@@ -3803,6 +3884,137 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "    s.iter().take_while(|&&b| b != 0).map(|&b| (b as u8) as "
             "char).collect()\n"
             "}"));
+  }
+  // Hosted <string.h> helpers (design.md C99-48, CTS-L1): each requested
+  // helper is emitted once per module, in this fixed order, as safe Rust
+  // over i8 slices. Every access is a bounds-checked slice index — the
+  // borrowed regions are compile-time-sized char arrays (or literal
+  // backings, which always end in a NUL) — so a C program whose behavior
+  // is undefined (a missing terminator, an out-of-range count) panics
+  // instead of reading out of bounds. Comparisons compare as unsigned
+  // char, exactly C's rule.
+  static const struct {
+    llvm::StringRef name;
+    llvm::StringRef source;
+  } kStringHelpers[] = {
+      {"__emitrust_strcpy",
+       "fn __emitrust_strcpy(dst: &mut [i8], src: &[i8]) {\n"
+       "    let mut i = 0usize;\n"
+       "    loop {\n"
+       "        let b = src[i];\n"
+       "        dst[i] = b;\n"
+       "        if b == 0 { break; }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_strncpy",
+       "fn __emitrust_strncpy(dst: &mut [i8], src: &[i8], n: i64) {\n"
+       "    let mut ended = false;\n"
+       "    let mut i = 0usize;\n"
+       "    while (i as i64) < n {\n"
+       "        let b = if ended { 0 } else { src[i] };\n"
+       "        if b == 0 { ended = true; }\n"
+       "        dst[i] = b;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_strcat",
+       "fn __emitrust_strcat(dst: &mut [i8], src: &[i8]) {\n"
+       "    let mut d = 0usize;\n"
+       "    while dst[d] != 0 { d += 1; }\n"
+       "    let mut i = 0usize;\n"
+       "    loop {\n"
+       "        let b = src[i];\n"
+       "        dst[d + i] = b;\n"
+       "        if b == 0 { break; }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_strcmp",
+       "fn __emitrust_strcmp(a: &[i8], b: &[i8]) -> i32 {\n"
+       "    let mut i = 0usize;\n"
+       "    loop {\n"
+       "        let x = a[i] as u8;\n"
+       "        let y = b[i] as u8;\n"
+       "        if x != y || x == 0 { return (x as i32) - (y as i32); }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_strncmp",
+       "fn __emitrust_strncmp(a: &[i8], b: &[i8], n: i64) -> i32 {\n"
+       "    let mut i = 0usize;\n"
+       "    while (i as i64) < n {\n"
+       "        let x = a[i] as u8;\n"
+       "        let y = b[i] as u8;\n"
+       "        if x != y || x == 0 { return (x as i32) - (y as i32); }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    0\n"
+       "}"},
+      {"__emitrust_strchr",
+       "fn __emitrust_strchr(s: &[i8], c: i32) -> i64 {\n"
+       "    let c = c as u8 as i8;\n"
+       "    let mut i = 0usize;\n"
+       "    loop {\n"
+       "        if s[i] == c { return i as i64; }\n"
+       "        if s[i] == 0 { return -1; }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_strrchr",
+       "fn __emitrust_strrchr(s: &[i8], c: i32) -> i64 {\n"
+       "    let c = c as u8 as i8;\n"
+       "    let mut last: i64 = -1;\n"
+       "    let mut i = 0usize;\n"
+       "    loop {\n"
+       "        if s[i] == c { last = i as i64; }\n"
+       "        if s[i] == 0 { return last; }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_memset",
+       "fn __emitrust_memset(s: &mut [i8], c: i32, n: i64) {\n"
+       "    let b = c as u8 as i8;\n"
+       "    let mut i = 0usize;\n"
+       "    while (i as i64) < n {\n"
+       "        s[i] = b;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_memcpy",
+       "fn __emitrust_memcpy(dst: &mut [i8], src: &[i8], n: i64) {\n"
+       "    let mut i = 0usize;\n"
+       "    while (i as i64) < n {\n"
+       "        dst[i] = src[i];\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_memcpy_within",
+       "fn __emitrust_memcpy_within(s: &mut [i8], dst: i64, src: i64, n: "
+       "i64) {\n"
+       "    s.copy_within(src as usize..(src + n) as usize, dst as usize);\n"
+       "}"},
+      {"__emitrust_memcmp",
+       "fn __emitrust_memcmp(a: &[i8], b: &[i8], n: i64) -> i32 {\n"
+       "    let mut i = 0usize;\n"
+       "    while (i as i64) < n {\n"
+       "        let x = a[i] as u8;\n"
+       "        let y = b[i] as u8;\n"
+       "        if x != y { return (x as i32) - (y as i32); }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    0\n"
+       "}"},
+  };
+  for (const auto &helper : kStringHelpers) {
+    if (!neededStringHelpers.contains(helper.name) ||
+        emittedStringHelpers.contains(helper.name))
+      continue;
+    emittedStringHelpers.insert(helper.name);
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(helper.source));
   }
   if (needsStrlenHelper && !strlenHelperEmitted) {
     strlenHelperEmitted = true;
@@ -5200,6 +5412,23 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
       return emitPuts(call);
     if (name == "putchar" && !callee->getDefinition())
       return emitPutchar(call);
+    // Hosted <string.h> copy/fill functions (design.md C99-48, CTS-L1) are
+    // lowered by name in statement position when the project supplies no
+    // definition of its own; C's pointer result (the destination) has no
+    // decomposed representation, so value uses keep located rejections in
+    // emitCall.
+    if (!callee->getDefinition()) {
+      if (name == "strcpy")
+        return emitStringCopyCall(call, "strcpy", /*hasCount=*/false);
+      if (name == "strncpy")
+        return emitStringCopyCall(call, "strncpy", /*hasCount=*/true);
+      if (name == "strcat")
+        return emitStringCopyCall(call, "strcat", /*hasCount=*/false);
+      if (name == "memset")
+        return emitMemsetCall(call);
+      if (name == "memcpy")
+        return emitMemcpyCall(call);
+    }
   }
   // Calls without a direct callee (function pointers) are handled by the
   // indirect path inside emitCall.
@@ -5522,6 +5751,59 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
             /*args=*/ArrayAttr(), ValueRange{slice})
         .getResult(0);
   }
+  // A strchr/strrchr result prints the searched region's byte run from
+  // the found index: the helper's i64 index (relative to the argument's
+  // cursor) offsets the cursor, and the region is re-sliced there for
+  // `__emitrust_cstr`. A not-found result is C's NULL, whose %s print is
+  // undefined in C; the -1 index makes the slice borrow panic instead of
+  // reading out of bounds.
+  bool reverse = false;
+  if (const clang::CallExpr *search = asHostedStrchrCall(arg, reverse)) {
+    PtrExprValue region;
+    FailureOr<Value> index = emitStrchrIndex(search, reverse, region);
+    if (failed(index))
+      return failure();
+    Value found =
+        builder.create<arith::AddIOp>(loc, region.cursor, *index)
+            .getResult();
+    PtrExprValue at{region.base, found, region.literalBacking};
+    FailureOr<Value> slice = emitCharRegionSlice(loc, at, /*isMut=*/false);
+    if (failed(slice))
+      return failure();
+    needsCStrHelper = true;
+    auto stringType =
+        emitrust::OpaqueType::get(builder.getContext(), "String");
+    return builder
+        .create<emitrust::CallOpaqueOp>(
+            loc, TypeRange{stringType},
+            builder.getStringAttr("__emitrust_cstr"),
+            /*args=*/ArrayAttr(), ValueRange{*slice})
+        .getResult(0);
+  }
+  // `&arr[i]` (or `&p[i]` over a decomposed pointer) prints the region's
+  // byte run from element i, through the same slice + `__emitrust_cstr`
+  // lowering as the whole-array shape (CTS-L1; 00180.c prints &a[1]).
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(arg))
+    if (unary->getOpcode() == clang::UO_AddrOf &&
+        llvm::isa<clang::ArraySubscriptExpr>(
+            stripTrivia(unary->getSubExpr()))) {
+      FailureOr<PtrExprValue> pointer = emitCharRegionArg(arg);
+      if (failed(pointer))
+        return failure();
+      FailureOr<Value> slice =
+          emitCharRegionSlice(loc, *pointer, /*isMut=*/false);
+      if (failed(slice))
+        return failure();
+      needsCStrHelper = true;
+      auto stringType =
+          emitrust::OpaqueType::get(builder.getContext(), "String");
+      return builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{stringType},
+              builder.getStringAttr("__emitrust_cstr"),
+              /*args=*/ArrayAttr(), ValueRange{*slice})
+          .getResult(0);
+    }
   // A decomposed `char *` prints the backing byte run from its cursor:
   // `emitrust.slice_of` of the region place at the cursor, rendered by
   // the same `__emitrust_cstr` helper as char arrays (both stop at the
@@ -5624,32 +5906,20 @@ FailureOr<Value> CImporter::emitStrlenCall(const clang::CallExpr *call) {
   if (call->getNumArgs() != 1)
     return emitError(loc)
            << "unsupported: strlen requires exactly one argument";
-  FailureOr<PtrExprValue> pointer = emitPointerRValue(call->getArg(0));
+  FailureOr<PtrExprValue> pointer = emitCharRegionArg(call->getArg(0));
   if (failed(pointer))
     return failure();
-  if (!pointer->literalBacking)
-    return emitError(loc) << "unsupported: strlen argument must be a "
-                             "pointer into a string literal";
-  Value cursor = pointer->cursor
-                     ? pointer->cursor
-                     : createIntConstant(loc, builder.getIntegerType(64), 0);
-  auto lvalueType =
-      llvm::cast<emitrust::LValueType>(pointer->literalBacking.getType());
-  auto arrayType = llvm::cast<emitrust::ArrayType>(lvalueType.getValueType());
-  auto sliceRefType = emitrust::RefType::get(
-      emitrust::SliceType::get(arrayType.getElementType()));
-  Value slice = builder
-                    .create<emitrust::SliceOfOp>(loc, sliceRefType,
-                                                 pointer->literalBacking,
-                                                 cursor, /*is_mut=*/false)
-                    .getResult();
+  FailureOr<Value> slice =
+      emitCharRegionSlice(loc, *pointer, /*isMut=*/false);
+  if (failed(slice))
+    return failure();
   needsStrlenHelper = true;
   Value count =
       builder
           .create<emitrust::CallOpaqueOp>(
               loc, TypeRange{builder.getIntegerType(64)},
               builder.getStringAttr("__emitrust_strlen"),
-              /*args=*/ArrayAttr(), ValueRange{slice})
+              /*args=*/ArrayAttr(), ValueRange{*slice})
           .getResult(0);
   // Convert the i64 count to the call's declared result type (`int` in the
   // K&R-style `int strlen(char *)` prototype, size_t otherwise), matching
@@ -5661,6 +5931,316 @@ FailureOr<Value> CImporter::emitStrlenCall(const clang::CallExpr *call) {
   if (!intType)
     return emitError(loc) << "unsupported: strlen result type";
   return castToIntType(loc, count, intType);
+}
+
+FailureOr<PtrExprValue>
+CImporter::emitCharRegionArg(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  Location loc = translateLoc(e->getBeginLoc());
+  // The void* parameters of memset/memcpy/memcmp wrap their arguments in
+  // implicit pointer bitcasts, and const-qualified parameters (strcpy's
+  // source, ...) in no-op qualification casts; the region underneath is
+  // byte-typed either way, so both cast kinds are stripped.
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    if ((cast->getCastKind() != clang::CK_BitCast &&
+         cast->getCastKind() != clang::CK_NoOp) ||
+        !isPointerType(cast->getType()))
+      break;
+    e = stripTrivia(cast->getSubExpr());
+  }
+  // A decayed string literal argument creates (or reuses) the literal's
+  // read-only backing; unlike a literal bound to a pointer variable, this
+  // shape may appear with no pointer region referring to the literal.
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_ArrayToPointerDecay)
+      if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+              stripTrivia(cast->getSubExpr()))) {
+        FailureOr<Value> backing = getOrCreateLiteralBacking(literal, loc);
+        if (failed(backing))
+          return failure();
+        return PtrExprValue{
+            nullptr, createIntConstant(loc, builder.getIntegerType(64), 0),
+            *backing};
+      }
+  FailureOr<PtrExprValue> pointer = emitPointerRValue(e);
+  if (failed(pointer))
+    return failure();
+  if (!pointer->cursor)
+    return emitError(loc) << "unsupported: the address of a scalar object "
+                             "is not a string region";
+  return *pointer;
+}
+
+FailureOr<Value> CImporter::emitCharRegionSlice(Location loc,
+                                                const PtrExprValue &pointer,
+                                                bool isMut) {
+  Value place = pointer.literalBacking;
+  if (place && isMut)
+    return emitError(loc) << "unsupported: a string literal region cannot "
+                             "be a mutable string argument";
+  if (!place) {
+    auto it = symbols.find(pointer.base);
+    if (it == symbols.end())
+      return emitError(loc)
+             << "unsupported: pointer target '" << pointer.base->getName()
+             << "' is not an importable place";
+    place = it->second;
+  }
+  auto lvalueType = llvm::dyn_cast<emitrust::LValueType>(place.getType());
+  emitrust::ArrayType arrayType =
+      lvalueType
+          ? llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType())
+          : emitrust::ArrayType();
+  if (!arrayType || arrayType.getElementType() != builder.getIntegerType(8))
+    return emitError(loc) << "unsupported: string function argument must "
+                             "designate a char array";
+  auto sliceType = emitrust::SliceType::get(arrayType.getElementType());
+  Type refType = isMut ? Type(emitrust::MutRefType::get(sliceType))
+                       : Type(emitrust::RefType::get(sliceType));
+  return builder
+      .create<emitrust::SliceOfOp>(loc, refType, place, pointer.cursor,
+                                   isMut)
+      .getResult();
+}
+
+void CImporter::requestStringHelper(llvm::StringRef name) {
+  neededStringHelpers.insert(name);
+}
+
+LogicalResult CImporter::emitStringCopyCall(const clang::CallExpr *call,
+                                            llvm::StringRef name,
+                                            bool hasCount) {
+  Location loc = translateLoc(call->getBeginLoc());
+  unsigned expected = hasCount ? 3 : 2;
+  if (call->getNumArgs() != expected)
+    return emitError(loc) << "unsupported: " << name << " requires exactly "
+                          << expected << " arguments";
+  FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
+  if (failed(dst))
+    return failure();
+  FailureOr<PtrExprValue> src = emitCharRegionArg(call->getArg(1));
+  if (failed(src))
+    return failure();
+  if (dst->base && dst->base == src->base)
+    return emitError(loc)
+           << "unsupported: " << name
+           << " source and destination point into the same object '"
+           << dst->base->getName() << "'";
+  Value count;
+  if (hasCount) {
+    FailureOr<Value> n = emitRValue(call->getArg(2));
+    if (failed(n))
+      return failure();
+    if (!llvm::isa<IntegerType>((*n).getType()))
+      return emitError(loc) << "unsupported: " << name << " count type";
+    count = castToIntType(loc, *n, builder.getIntegerType(64));
+  }
+  // The mutable destination borrow and the shared source borrow are
+  // created back to back, immediately before the call: no load of either
+  // base intervenes, so rustc accepts the pair.
+  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true);
+  if (failed(dstSlice))
+    return failure();
+  FailureOr<Value> srcSlice =
+      emitCharRegionSlice(loc, *src, /*isMut=*/false);
+  if (failed(srcSlice))
+    return failure();
+  SmallVector<Value> operands{*dstSlice, *srcSlice};
+  if (count)
+    operands.push_back(count);
+  requestStringHelper(("__emitrust_" + name).str());
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(),
+      builder.getStringAttr(("__emitrust_" + name).str()),
+      /*args=*/ArrayAttr(), operands);
+  return success();
+}
+
+LogicalResult CImporter::emitMemsetCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 3)
+    return emitError(loc)
+           << "unsupported: memset requires exactly 3 arguments";
+  FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
+  if (failed(dst))
+    return failure();
+  FailureOr<Value> byte = emitRValue(call->getArg(1));
+  if (failed(byte))
+    return failure();
+  FailureOr<Value> n = emitRValue(call->getArg(2));
+  if (failed(n))
+    return failure();
+  if (!llvm::isa<IntegerType>((*byte).getType()) ||
+      !llvm::isa<IntegerType>((*n).getType()))
+    return emitError(loc) << "unsupported: memset argument type";
+  Value fill = castToIntType(loc, *byte, builder.getI32Type());
+  Value count = castToIntType(loc, *n, builder.getIntegerType(64));
+  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true);
+  if (failed(dstSlice))
+    return failure();
+  requestStringHelper("__emitrust_memset");
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("__emitrust_memset"),
+      /*args=*/ArrayAttr(), ValueRange{*dstSlice, fill, count});
+  return success();
+}
+
+LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 3)
+    return emitError(loc)
+           << "unsupported: memcpy requires exactly 3 arguments";
+  FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
+  if (failed(dst))
+    return failure();
+  FailureOr<PtrExprValue> src = emitCharRegionArg(call->getArg(1));
+  if (failed(src))
+    return failure();
+  FailureOr<Value> n = emitRValue(call->getArg(2));
+  if (failed(n))
+    return failure();
+  if (!llvm::isa<IntegerType>((*n).getType()))
+    return emitError(loc) << "unsupported: memcpy count type";
+  Value count = castToIntType(loc, *n, builder.getIntegerType(64));
+  if (dst->base && dst->base == src->base) {
+    // Both arguments point into the same object: two slice borrows would
+    // alias a mutable borrow, so the whole array is borrowed mutably once
+    // and the helper receives both element cursors (`copy_within`; its
+    // memmove semantics refine C's undefined overlapping memcpy).
+    PtrExprValue whole{dst->base,
+                       createIntConstant(loc, builder.getIntegerType(64), 0),
+                       Value()};
+    FailureOr<Value> slice = emitCharRegionSlice(loc, whole, /*isMut=*/true);
+    if (failed(slice))
+      return failure();
+    requestStringHelper("__emitrust_memcpy_within");
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(),
+        builder.getStringAttr("__emitrust_memcpy_within"),
+        /*args=*/ArrayAttr(),
+        ValueRange{*slice, dst->cursor, src->cursor, count});
+    return success();
+  }
+  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true);
+  if (failed(dstSlice))
+    return failure();
+  FailureOr<Value> srcSlice =
+      emitCharRegionSlice(loc, *src, /*isMut=*/false);
+  if (failed(srcSlice))
+    return failure();
+  requestStringHelper("__emitrust_memcpy");
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("__emitrust_memcpy"),
+      /*args=*/ArrayAttr(), ValueRange{*dstSlice, *srcSlice, count});
+  return success();
+}
+
+FailureOr<Value>
+CImporter::emitStringCompareCall(const clang::CallExpr *call,
+                                 llvm::StringRef name, bool hasCount) {
+  Location loc = translateLoc(call->getBeginLoc());
+  unsigned expected = hasCount ? 3 : 2;
+  if (call->getNumArgs() != expected)
+    return emitError(loc) << "unsupported: " << name << " requires exactly "
+                          << expected << " arguments";
+  FailureOr<PtrExprValue> lhs = emitCharRegionArg(call->getArg(0));
+  if (failed(lhs))
+    return failure();
+  FailureOr<PtrExprValue> rhs = emitCharRegionArg(call->getArg(1));
+  if (failed(rhs))
+    return failure();
+  Value count;
+  if (hasCount) {
+    FailureOr<Value> n = emitRValue(call->getArg(2));
+    if (failed(n))
+      return failure();
+    if (!llvm::isa<IntegerType>((*n).getType()))
+      return emitError(loc) << "unsupported: " << name << " count type";
+    count = castToIntType(loc, *n, builder.getIntegerType(64));
+  }
+  // Both borrows are shared, so even two arguments into the same object
+  // coexist.
+  FailureOr<Value> lhsSlice =
+      emitCharRegionSlice(loc, *lhs, /*isMut=*/false);
+  if (failed(lhsSlice))
+    return failure();
+  FailureOr<Value> rhsSlice =
+      emitCharRegionSlice(loc, *rhs, /*isMut=*/false);
+  if (failed(rhsSlice))
+    return failure();
+  SmallVector<Value> operands{*lhsSlice, *rhsSlice};
+  if (count)
+    operands.push_back(count);
+  requestStringHelper(("__emitrust_" + name).str());
+  Value result = builder
+                     .create<emitrust::CallOpaqueOp>(
+                         loc, TypeRange{builder.getI32Type()},
+                         builder.getStringAttr(("__emitrust_" + name).str()),
+                         /*args=*/ArrayAttr(), operands)
+                     .getResult(0);
+  // The declared result type is C's int (i32) for the standard
+  // prototypes; convert defensively for K&R-style declarations.
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+  if (!intType)
+    return emitError(loc) << "unsupported: " << name << " result type";
+  return castToIntType(loc, result, intType);
+}
+
+const clang::CallExpr *
+CImporter::asHostedStrchrCall(const clang::Expr *expr, bool &reverse) const {
+  const auto *call =
+      llvm::dyn_cast<clang::CallExpr>(expr->IgnoreParenImpCasts());
+  if (!call)
+    return nullptr;
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  if (!callee || !callee->getDeclName().isIdentifier() ||
+      callee->getDefinition())
+    return nullptr;
+  if (callee->getName() == "strchr") {
+    reverse = false;
+    return call;
+  }
+  if (callee->getName() == "strrchr") {
+    reverse = true;
+    return call;
+  }
+  return nullptr;
+}
+
+FailureOr<Value> CImporter::emitStrchrIndex(const clang::CallExpr *call,
+                                            bool reverse,
+                                            PtrExprValue &region) {
+  Location loc = translateLoc(call->getBeginLoc());
+  llvm::StringRef name = reverse ? "strrchr" : "strchr";
+  if (call->getNumArgs() != 2)
+    return emitError(loc) << "unsupported: " << name
+                          << " requires exactly 2 arguments";
+  FailureOr<PtrExprValue> pointer = emitCharRegionArg(call->getArg(0));
+  if (failed(pointer))
+    return failure();
+  region = *pointer;
+  FailureOr<Value> needle = emitRValue(call->getArg(1));
+  if (failed(needle))
+    return failure();
+  if (!llvm::isa<IntegerType>((*needle).getType()))
+    return emitError(loc) << "unsupported: " << name << " character type";
+  Value byte = castToIntType(loc, *needle, builder.getI32Type());
+  FailureOr<Value> slice =
+      emitCharRegionSlice(loc, region, /*isMut=*/false);
+  if (failed(slice))
+    return failure();
+  llvm::StringRef helper =
+      reverse ? "__emitrust_strrchr" : "__emitrust_strchr";
+  requestStringHelper(helper);
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getIntegerType(64)},
+          builder.getStringAttr(helper),
+          /*args=*/ArrayAttr(), ValueRange{*slice, byte})
+      .getResult(0);
 }
 
 LogicalResult CImporter::emitPutchar(const clang::CallExpr *call) {
@@ -6350,6 +6930,37 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
       return emitError(loc) << "unsupported: ordered comparison of a string "
                                "literal against a null pointer";
     }
+    // A strchr/strrchr result compared against a null pointer constant
+    // asks "was the byte found": the helpers return the found index or -1
+    // for C's NULL result, so the comparison folds to an index test
+    // (CTS-L1; 00179.c tests `strrchr(a, 'x') == NULL`).
+    bool reverse = false;
+    const clang::CallExpr *search =
+        asHostedStrchrCall(op->getLHS(), reverse);
+    const clang::Expr *nullSide = op->getRHS();
+    if (!search) {
+      search = asHostedStrchrCall(op->getRHS(), reverse);
+      nullSide = op->getLHS();
+    }
+    if (search && isNullConstant(nullSide)) {
+      if (op->getOpcode() != clang::BO_EQ && op->getOpcode() != clang::BO_NE)
+        return emitError(loc)
+               << "unsupported: ordered comparison of a "
+               << (reverse ? "strrchr" : "strchr")
+               << " result against a null pointer";
+      PtrExprValue region;
+      FailureOr<Value> index = emitStrchrIndex(search, reverse, region);
+      if (failed(index))
+        return failure();
+      Value notFound =
+          createIntConstant(loc, builder.getIntegerType(64), -1);
+      arith::CmpIPredicate predicate = op->getOpcode() == clang::BO_EQ
+                                           ? arith::CmpIPredicate::eq
+                                           : arith::CmpIPredicate::ne;
+      return builder
+          .create<arith::CmpIOp>(loc, predicate, *index, notFound)
+          .getResult();
+    }
     FailureOr<PtrExprValue> lhs = emitPointerRValue(op->getLHS());
     if (failed(lhs))
       return failure();
@@ -6781,6 +7392,30 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   // is an ordinary call.
   if (callee->getName() == "strlen" && !callee->getDefinition())
     return emitStrlenCall(call);
+  // Hosted <string.h> comparisons (design.md C99-48, CTS-L1) are lowered
+  // by name, like strlen; their int result is an ordinary value. The
+  // copy/fill functions of the same surface are statement-position only
+  // (their char* result has no decomposed representation), and a
+  // strchr/strrchr result is consumed by the printf %s and null-comparison
+  // interceptions before reaching this point.
+  if (!callee->getDefinition()) {
+    llvm::StringRef name = callee->getName();
+    if (name == "strcmp")
+      return emitStringCompareCall(call, "strcmp", /*hasCount=*/false);
+    if (name == "strncmp")
+      return emitStringCompareCall(call, "strncmp", /*hasCount=*/true);
+    if (name == "memcmp")
+      return emitStringCompareCall(call, "memcmp", /*hasCount=*/true);
+    if (name == "strcpy" || name == "strncpy" || name == "strcat" ||
+        name == "memset" || name == "memcpy")
+      return emitError(loc) << "unsupported: " << name
+                            << " return value must be unused";
+    if (name == "strchr" || name == "strrchr")
+      return emitError(loc)
+             << "unsupported: a " << name
+             << " result must feed a printf '%s' argument or a "
+                "comparison against a null pointer";
+  }
   if (callee->isVariadic())
     return emitError(loc) << "unsupported: call to a variadic function";
 
