@@ -109,3 +109,26 @@ int compare_fn_ptr(void) {
 // CHECK-LABEL: func.func @compare_fn_ptr
 // CHECK: emitrust.cmp eq, %{{.*}}, %{{.*}} : (!emitrust.fn_ptr<(i32, i32) -> i32>, !emitrust.fn_ptr<(i32, i32) -> i32>) -> i1
 // CHECK: emitrust.cmp ne, %{{.*}}, %{{.*}} : (!emitrust.fn_ptr<(i32, i32) -> i32>, !emitrust.fn_ptr<(i32, i32) -> i32>) -> i1
+
+// A fn_ptr struct field in a file-scope initializer (CTS-L3, the 00089
+// shape): the constant evaluator yields the target declaration (or the
+// null constant), carried as the same opaque `Some(name)` / `None` forms
+// a top-level fn_ptr global uses — signature-checked identically. The
+// zero-filled tail of `= { add }` defaults the second field to `None`.
+struct Ops {
+  int (*bin)(int, int);
+  int (*nil)(void);
+  int tag;
+};
+struct Ops ops = {add, 0, 5};
+struct Ops zeroed = {add};
+// CHECK: emitrust.global @ops <[#emitrust.opaque<"Some(add)">, #emitrust.opaque<"None">, 5 : i32]> : !emitrust.struct<"Ops">
+// CHECK: emitrust.global @zeroed <[#emitrust.opaque<"Some(add)">, #emitrust.opaque<"None">, 0 : i32]> : !emitrust.struct<"Ops">
+
+// Calling through the field loads the staged struct copy and
+// call_indirects its member.
+// CHECK-LABEL: func.func @call_field
+// CHECK: emitrust.global_load @ops : !emitrust.struct<"Ops">
+// CHECK: emitrust.member {{.*}}["bin"]
+// CHECK: emitrust.call_indirect %{{.*}}(%{{.*}}, %{{.*}}) : (!emitrust.fn_ptr<(i32, i32) -> i32>, i32, i32) -> i32
+int call_field(void) { return ops.bin(2, 3); }

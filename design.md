@@ -981,8 +981,12 @@ observed when C99-33 + C99-47 together unlocked 00215).
   positions FR-28 classifies: pointer returns, pointer struct members
   (C99-43), pointers in casts and mixed expressions. Requires extending
   the region analysis beyond (base, cursor) pairs rooted in one
-  function's locals.
-  (00019.c, 00049.c, 00095.c, 00140.c, 00150.c, 00208.c, 00214.c)
+  function's locals. 00089 joined this set after CTS-L3 landed its
+  fn_ptr-struct-field initializer: it now rejects on `struct S *anon()`
+  at "00089.c:13:1: error: unsupported: pointer type outside a parameter
+  position" (a data-pointer return).
+  (00019.c, 00049.c, 00089.c, 00095.c, 00140.c, 00150.c, 00208.c,
+  00214.c)
 - [ ] CTS-P3 (5) Pointers assigned non-address values (integer↔pointer
   round-trips, arithmetic results stored back into pointers): needs a
   design decision — either a tagged cursor representation or a
@@ -1300,16 +1304,30 @@ observed when C99-33 + C99-47 together unlocked 00215).
   test/EndToEnd/percent-s-param.c)
 - [ ] CTS-L3 (2) String-literal and other initializers for
   pointer-typed objects (`char *s = "…"` at file scope, struct fields):
-  a string-literal region base for a *global* pointer needs a module-level
-  read-only backing (the CTS-P1 backing is function-local), which CTS-P4
-  deliberately left rejected. Post-CTS-P4 diagnostics: 00089 rejects at
-  "00089.c:10:7: error: unsupported: global initializer for this type"
-  (pointer struct field, CTS-P2 adjacency) and 00220 at "00220.c:7:19:
-  error: unsupported: string literal initializer for this type"; a bare
-  `char *s = "…"` at file scope rejects in importPointerGlobal, and a
-  body binding as "global pointer bound to a string literal"
-  (globals-pointer-invalid.c).
-  (00089.c, 00220.c)
+  PARTIAL — the initializer shapes landed, 00220 passes, 00089 stays
+  blocked on CTS-P2. Landed: (1) a file-scope `char *s = "…"` imports in
+  importPointerGlobal as the CTS-P1 read-only backing lifted to module
+  scope — a const `<name>_backing` byte-array global (bytes plus NUL,
+  ASCII-only per C99-28) plus the CTS-P4 stored i64 cursor global,
+  offset-initialized; write-through, null, wide/u8 literals, non-ASCII
+  bytes, literal/object joins, and body literal bindings keep located
+  rejections (write-through detection now tracks a global pointer whose
+  only body mention is the write); (2) wide-literal array initializers
+  (`wchar_t s[] = L"…"`, block and file scope) fill i32 arrays with the
+  literal's code units, no ASCII limit (a wide array never feeds the
+  byte-string `%s`/`%c` helpers), which is all 00220 needs — it passes
+  end-to-end (ledger 188 -> 189); (3) fn_ptr struct fields in file-scope
+  initializers (the 00089 line-10 shape) fold to the opaque
+  `Some(name)`/`None` forms via the constant evaluator, verifier and
+  emitter accept them as aggregate leaves. 00089 still rejects at
+  "00089.c:13:1: error: unsupported: pointer type outside a parameter
+  position" — `struct S *anon()` returns a data pointer, CTS-P2 scope
+  (pointer returns), not an initializer shape.
+  (test/Import/C/globals-pointer-string.c, strings-wide.c,
+  fn-pointers.c; rejections in globals-pointer-invalid.c,
+  strings-invalid.c; rustc-level differential
+  test/EndToEnd/globals-string.c)
+  (00089.c blocked on CTS-P2, 00220.c passes)
 Not itemized above: printf precision (`%.3s`) and long-long length
 specifiers (`%llx`, `%10Ld`) remain outside the C99-47 grammar, but no
 test is sole-blocked on them today (00182.c already passes; with CTS-R5's
