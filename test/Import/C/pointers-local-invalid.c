@@ -1,7 +1,10 @@
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/multibase.c 2>&1 | FileCheck %s --check-prefix=MULTI
 // RUN: not emitrust-import-c %t/addr-of-ptr.c 2>&1 | FileCheck %s --check-prefix=ADDRPTR
-// RUN: not emitrust-import-c %t/ptr-to-ptr.c 2>&1 | FileCheck %s --check-prefix=PTRPTR
+// RUN: not emitrust-import-c %t/ptr-to-ptr-to-ptr.c 2>&1 | FileCheck %s --check-prefix=PTRPPP
+// RUN: not emitrust-import-c %t/ptr-to-ptr-multi.c 2>&1 | FileCheck %s --check-prefix=PTRPTRMULTI
+// RUN: not emitrust-import-c %t/ptr-to-ptr-copy.c 2>&1 | FileCheck %s --check-prefix=PTRPTRCOPY
+// RUN: not emitrust-import-c %t/ptr-to-ptr-null.c 2>&1 | FileCheck %s --check-prefix=PTRPTRNULL
 // RUN: not emitrust-import-c %t/into-global.c 2>&1 | FileCheck %s --check-prefix=GLOBAL
 // RUN: not emitrust-import-c %t/null-arg.c 2>&1 | FileCheck %s --check-prefix=NULLP
 // RUN: not emitrust-import-c %t/non-address.c 2>&1 | FileCheck %s --check-prefix=NONADDR
@@ -38,23 +41,67 @@ int main(void) {
   return p[0];
 }
 
-// `&p` would let the pointer itself escape the decomposition.
+// `&p` outside a second-order binding (`pp = &p` is the consumed CTS-P5
+// form; see pointers-ptr-to-ptr.c) would let the pointer itself escape the
+// decomposition.
 // ADDRPTR: addr-of-ptr.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: taking the address of a pointer variable
 
 //--- addr-of-ptr.c
 int main(void) {
   int x = 1;
   int *p = &x;
+  long a = (long)&p;
+  return (int)a;
+}
+
+// A third-order pointer would need a region of second-order selections;
+// only the degenerate one-cell second-order shape is modeled (CTS-P5).
+// PTRPPP: ptr-to-ptr-to-ptr.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer-to-pointer-to-pointer variable
+
+//--- ptr-to-ptr-to-ptr.c
+int main(void) {
+  int ***ppp;
+  return 0;
+}
+
+// A second-order pointer rebound across two distinct pointer variables
+// would need a real region of cursor cells with a runtime second-order
+// cursor; the degenerate one-cell shape names both bindings and rejects.
+// PTRPTRMULTI: ptr-to-ptr-multi.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer-to-pointer 'pp' would select between pointer variables 'p' and 'q'
+// PTRPTRMULTI: ptr-to-ptr-multi.c:{{[0-9]+}}:{{[0-9]+}}: note: bound to 'p' here
+// PTRPTRMULTI: ptr-to-ptr-multi.c:{{[0-9]+}}:{{[0-9]+}}: note: bound to 'q' here
+
+//--- ptr-to-ptr-multi.c
+int main(void) {
+  int x = 1;
+  int y = 2;
+  int *p = &x;
+  int *q = &y;
   int **pp = &p;
+  pp = &q;
   return **pp;
 }
 
-// A pointer-to-pointer local has no decomposed representation at all.
-// PTRPTR: ptr-to-ptr.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer-to-pointer variable
+// Copying a second-order pointer would alias two selections of cursor
+// cells; the degenerate shape keeps each selection static.
+// PTRPTRCOPY: ptr-to-ptr-copy.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: copying a pointer-to-pointer variable
 
-//--- ptr-to-ptr.c
+//--- ptr-to-ptr-copy.c
 int main(void) {
-  int **pp;
+  int x = 1;
+  int *p = &x;
+  int **pp = &p;
+  int **qq = pp;
+  return **qq;
+}
+
+// A nullable selection would need an Option over the cursor-cell region
+// (the CTS-P8 discriminant one order up); outside the degenerate scope.
+// PTRPTRNULL: ptr-to-ptr-null.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: null pointer constant assigned to a pointer-to-pointer variable
+
+//--- ptr-to-ptr-null.c
+int main(void) {
+  int **pp = 0;
   return 0;
 }
 

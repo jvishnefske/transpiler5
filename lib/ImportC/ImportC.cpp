@@ -57,9 +57,18 @@
 ///    refinement, mirroring the fn_ptr `expect`. Passing, differencing,
 ///    or ordering possibly-null pointers stays rejected, as does the
 ///    general integer-to-pointer traffic around the idiom (CTS-P3).
-///    Pointers whose address is taken, that rebind across distinct
-///    objects, or point into globals are rejected with located
-///    diagnostics.
+///    A second-order pointer (`T **pp`, CTS-P5) is a cursor into a region
+///    of cursor cells — an index selecting WHICH first-order pointer to
+///    operate on; the implemented shape is the degenerate one-cell region,
+///    where `pp` is only ever bound to the address of one first-order
+///    pointer local, so the selection is static, `pp` needs no runtime
+///    state, `*pp` reads/rebinds the selected pointer's decomposition, and
+///    `**pp` dereferences it (no reference-to-reference ever arises in the
+///    emitted Rust). Pointers whose address escapes outside such a
+///    consumed second-order binding, that rebind across distinct objects,
+///    or point into globals are rejected with located diagnostics, as are
+///    third-order pointers, multi-target selections, second-order copies,
+///    and null second-order bindings.
 ///  - Pointer parameters are classified per definition (Phase 1b): a
 ///    parameter that is only dereferenced or arrowed stays a scalar
 ///    reference `!emitrust.mut_ref<T>`; a parameter that is subscripted,
@@ -442,6 +451,35 @@ struct PointerRegion {
   std::string invalidReason;
 };
 
+/// The Phase-1a facts about one second-order pointer local (`T **pp`,
+/// CTS-P5). Under the decomposition a first-order pointer is a plain Copy
+/// i64 cursor into its region, so a pointer-to-pointer is a cursor into a
+/// region of cursor cells — an index selecting WHICH first-order pointer to
+/// operate on (transformation-theory sections 4 and 6). The implemented
+/// shape is the degenerate one-cell region: `pp` is only ever bound to the
+/// address of a single first-order pointer local, so the selection is
+/// static, `pp` needs no runtime state, and no reference-to-reference ever
+/// arises in the emitted Rust (the cursor-cell region and the pointee
+/// region stay distinct separation-logic conjuncts). A second binding to a
+/// distinct pointer variable records `secondTarget` for the located
+/// multi-target rejection; every other construct records `invalidReason`.
+struct SecondOrderRegion {
+  /// The single first-order pointer local `pp` selects, from `pp = &p`.
+  const clang::VarDecl *target = nullptr;
+  /// Where the target binding was established.
+  clang::SourceLocation targetLoc;
+  /// A second, distinct bound pointer variable (would need a real region
+  /// of cursor cells); null while the region stays single-target.
+  const clang::VarDecl *secondTarget = nullptr;
+  /// Where the second binding was established.
+  clang::SourceLocation secondTargetLoc;
+  /// First invalidating construct; meaningful only with `invalidReason`.
+  clang::SourceLocation invalidLoc;
+  /// Diagnostic text of the invalidating construct; empty when the
+  /// degenerate second-order decomposition applies.
+  std::string invalidReason;
+};
+
 /// Steensgaard-style union-find pre-pass that groups the pointer locals of
 /// one function body into ownership regions (Phase 1a of pointer support).
 /// One AST walk (in the style of `collectAddressTaken`) unions pointers on
@@ -476,6 +514,20 @@ public:
   /// Returns the region of the tracked pointer `var`, or null when the
   /// pointer was never bound, unioned, or invalidated (an unused pointer).
   const PointerRegion *regionOf(const clang::VarDecl *var);
+
+  /// Returns whether `var` is a second-order pointer local (`T **pp`)
+  /// tracked by this analysis (CTS-P5).
+  bool tracksSecondOrder(const clang::VarDecl *var) const {
+    return secondOrderVars.contains(var);
+  }
+
+  /// Returns the second-order record of the tracked pointer-to-pointer
+  /// `var`, or null when it was never bound or invalidated (unused).
+  const SecondOrderRegion *
+  secondOrderRegionOf(const clang::VarDecl *var) const {
+    auto it = secondOrderRegions.find(var);
+    return it == secondOrderRegions.end() ? nullptr : &it->second;
+  }
 
   /// Returns every pointer-typed local variable the analysis tracks; the
   /// Phase-4 owner-planning pre-pass iterates these to project each
@@ -530,9 +582,30 @@ private:
   void recordAllocBase(const clang::VarDecl *ptr, const clang::CallExpr *call,
                        clang::SourceLocation loc);
 
+  /// Classifies the right-hand side `rhs` of `pp = rhs` for a second-order
+  /// pointer (CTS-P5): `pp = &p` on a tracked first-order pointer local
+  /// binds `p` as the (degenerate) selection target and marks the `&p`
+  /// expression consumed so the escape check skips it; a second distinct
+  /// target records the multi-target rejection; every other source
+  /// (null constants, copies, non-address values) invalidates `pp`.
+  void recordSecondOrderWrite(const clang::VarDecl *ptr,
+                              const clang::Expr *rhs);
+
+  /// Marks the second-order pointer `ptr` undecomposable with diagnostic
+  /// `reason` at `loc`; only the first invalidation is kept.
+  void markSecondOrderInvalid(const clang::VarDecl *ptr,
+                              clang::SourceLocation loc,
+                              llvm::StringRef reason);
+
+  /// Returns the tracked second-order pointer `pp` of a stripped `*pp`
+  /// dereference expression, or null when `expr` is not one.
+  const clang::VarDecl *asSecondOrderDeref(const clang::Expr *expr) const;
+
   /// Returns the tracked pointer local at the root of a written place
   /// expression (`*p`, `p[i]`, `*p++`, ...), or null when the place is not
-  /// a dereference or subscript through a tracked pointer.
+  /// a dereference or subscript through a tracked pointer. A place through
+  /// a second-order dereference (`**pp`, `(*pp)[i]`) roots at the bound
+  /// selection target, so the write lands on the target's region.
   const clang::VarDecl *trackedWritePlaceRoot(const clang::Expr *place);
 
   /// Marks `ptr`'s region undecomposable with diagnostic `reason` at `loc`;
@@ -557,6 +630,15 @@ private:
   llvm::DenseMap<const clang::VarDecl *, PointerRegion> regions;
   /// Every pointer-typed local variable declared in the walked body.
   llvm::SmallPtrSet<const clang::VarDecl *, 8> pointerVars;
+  /// Every second-order pointer local (`T **pp`) declared in the walked
+  /// body (CTS-P5); disjoint from `pointerVars`.
+  llvm::SmallPtrSet<const clang::VarDecl *, 4> secondOrderVars;
+  /// Second-order facts keyed by the pointer-to-pointer declaration (no
+  /// union-find: second-order copies are not decomposable).
+  llvm::DenseMap<const clang::VarDecl *, SecondOrderRegion> secondOrderRegions;
+  /// `&p` expressions consumed as second-order bindings (`pp = &p`); the
+  /// generic address-taken escape check skips exactly these.
+  llvm::SmallPtrSet<const clang::Expr *, 4> consumedAddrOf;
 };
 
 /// Translates the clang AST of one C translation unit into an MLIR module.
@@ -822,6 +904,30 @@ private:
   /// nullable string-literal region is rejected. Undecomposable regions
   /// produce located diagnostics at the offending construct.
   LogicalResult emitPointerLocal(const clang::VarDecl *var, Location loc);
+
+  /// Emits the declaration of a second-order pointer local (`T **pp`,
+  /// CTS-P5). The accepted shape is the degenerate one-cell region of
+  /// cursor cells: `pp` statically selects a single first-order pointer
+  /// local, recorded in `pointerPointerLocals`, and needs no runtime state
+  /// of its own — `*pp` designates the target's (base, cursor)
+  /// decomposition and `**pp` is an indirect use of it, so no
+  /// reference-to-reference ever arises in the emitted Rust. Third-order
+  /// pointers, pointers to function pointers, multi-target selections, and
+  /// every invalidated shape are located rejections.
+  LogicalResult emitPointerPointerLocal(const clang::VarDecl *var,
+                                        Location loc);
+
+  /// Returns the tracked second-order pointer `pp` of a stripped `*pp`
+  /// dereference expression, or null when `expr` is not one.
+  const clang::VarDecl *secondOrderDerefVar(const clang::Expr *expr) const;
+
+  /// Emits the read of the decomposed pointer local (or slice-classified
+  /// parameter) `var`: its static base plus the current value of its
+  /// cursor cell and, in a nullable region, its non-null flag cell.
+  /// Shared by the direct read (`p` in pointer-value position) and the
+  /// second-order dereference (`*pp`, which reads the selected pointer).
+  FailureOr<PtrExprValue> emitPointerLocalRead(Location loc,
+                                               const clang::VarDecl *var);
 
   /// Emits `ptr = rhs` for a decomposed pointer local by recomputing and
   /// storing its cursor; a degenerate binding (`p = &x`) needs no cursor
@@ -1671,6 +1777,12 @@ private:
   /// Per-function decomposition of each accepted pointer local and each
   /// slice-classified pointer parameter, keyed by its declaration.
   llvm::DenseMap<const clang::VarDecl *, PointerLocalInfo> pointerLocals;
+  /// Per-function second-order pointer locals (CTS-P5), each mapped to the
+  /// single first-order pointer local it statically selects (the
+  /// degenerate one-cell region of cursor cells); a second-order pointer
+  /// carries no runtime state of its own.
+  llvm::DenseMap<const clang::VarDecl *, const clang::VarDecl *>
+      pointerPointerLocals;
   /// Per-function read-only backing byte arrays of string-literal pointer
   /// regions, keyed by the bound literal; created once per literal at the
   /// declaration of the first pointer bound to it.
@@ -1981,6 +2093,28 @@ static const clang::VarDecl *asLocalVarRef(const clang::Expr *expr) {
   return var;
 }
 
+/// Returns the local, non-parameter variable behind a (possibly
+/// lvalue-to-rvalue-wrapped) declaration reference `expr`, or null when
+/// `expr` is not such a reference. The dereference forms of a second-order
+/// pointer (`*pp`, `**pp`) read the pointer through a load, so their
+/// resolvers strip the load wrapper first (CTS-P5).
+static const clang::VarDecl *asLoadedLocalVarRef(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_LValueToRValue ||
+        cast->getCastKind() == clang::CK_NoOp)
+      e = cast->getSubExpr();
+  return asLocalVarRef(e);
+}
+
+/// Returns whether `type` is a second-order data pointer: a pointer whose
+/// pointee is itself a pointer (`T **`, including a pointer to a function
+/// pointer, which the importer rejects at the declaration).
+static bool isSecondOrderPointerType(clang::QualType type) {
+  return isPointerType(type) &&
+         isPointerType(type.getCanonicalType()->getPointeeType());
+}
+
 /// Returns the local variable or parameter a stripped declaration
 /// reference `expr` names, or null when `expr` is not such a reference.
 /// Used by the pointer choke points that accept both decomposed pointer
@@ -2117,6 +2251,9 @@ void PointerRegionAnalysis::analyze(clang::ASTContext &astContext,
   parent.clear();
   regions.clear();
   pointerVars.clear();
+  secondOrderVars.clear();
+  secondOrderRegions.clear();
+  consumedAddrOf.clear();
   visit(body);
   context = nullptr;
 }
@@ -2378,6 +2515,17 @@ PointerRegionAnalysis::trackedWritePlaceRoot(const clang::Expr *place) {
         cursor = stripTrivia(unary->getSubExpr());
         continue;
       }
+      if (unary->getOpcode() == clang::UO_Deref) {
+        // `**pp` / `(*pp)[i]`: the written region is the one of the
+        // first-order pointer the second-order pointer selects.
+        if (const clang::VarDecl *pp = asSecondOrderDeref(unary)) {
+          auto it = secondOrderRegions.find(pp);
+          if (it != secondOrderRegions.end() && it->second.target &&
+              tracks(it->second.target))
+            return it->second.target;
+        }
+        return nullptr;
+      }
       return nullptr;
     }
     if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(cursor)) {
@@ -2407,6 +2555,79 @@ void PointerRegionAnalysis::markInvalid(const clang::VarDecl *ptr,
     region.invalidReason = reason.str();
     region.invalidLoc = loc;
   }
+}
+
+void PointerRegionAnalysis::markSecondOrderInvalid(const clang::VarDecl *ptr,
+                                                   clang::SourceLocation loc,
+                                                   llvm::StringRef reason) {
+  SecondOrderRegion &region = secondOrderRegions[ptr];
+  if (region.invalidReason.empty()) {
+    region.invalidReason = reason.str();
+    region.invalidLoc = loc;
+  }
+}
+
+const clang::VarDecl *
+PointerRegionAnalysis::asSecondOrderDeref(const clang::Expr *expr) const {
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
+  if (!unary || unary->getOpcode() != clang::UO_Deref)
+    return nullptr;
+  const clang::VarDecl *var = asLoadedLocalVarRef(unary->getSubExpr());
+  return var && secondOrderVars.contains(var) ? var : nullptr;
+}
+
+void PointerRegionAnalysis::recordSecondOrderWrite(const clang::VarDecl *ptr,
+                                                   const clang::Expr *rhs) {
+  const clang::Expr *e = stripTrivia(rhs);
+  clang::SourceLocation loc = e->getBeginLoc();
+
+  // A nullable selection would need an Option over the cursor-cell region
+  // (the CTS-P8 discriminant one order up); outside the degenerate scope.
+  if (e->isNullPointerConstant(*context,
+                               clang::Expr::NPC_NeverValueDependent) !=
+      clang::Expr::NPCK_NotNull)
+    return markSecondOrderInvalid(ptr, loc,
+                                  "unsupported: null pointer constant "
+                                  "assigned to a pointer-to-pointer variable");
+
+  // `pp = &p`: the address of a tracked first-order pointer local binds
+  // `p` as the selection target. The `&p` expression is consumed here, so
+  // the generic escape check does not invalidate `p`'s region — the
+  // pointer's cursor never escapes; `pp` merely selects its cells.
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    if (unary->getOpcode() == clang::UO_AddrOf)
+      if (const clang::VarDecl *target =
+              asLocalVarRef(unary->getSubExpr()))
+        if (tracks(target)) {
+          consumedAddrOf.insert(unary);
+          SecondOrderRegion &region = secondOrderRegions[ptr];
+          if (!region.invalidReason.empty())
+            return;
+          if (!region.target || region.target == target) {
+            if (!region.target) {
+              region.target = target;
+              region.targetLoc = loc;
+            }
+            return;
+          }
+          if (!region.secondTarget) {
+            region.secondTarget = target;
+            region.secondTargetLoc = loc;
+          }
+          return;
+        }
+
+  // `pp = pp2` would alias two selections of cursor cells; a general
+  // region of indices (CTS-P5 beyond the degenerate cell) is not modeled.
+  if (const clang::VarDecl *source = asLoadedLocalVarRef(e))
+    if (secondOrderVars.contains(source))
+      return markSecondOrderInvalid(
+          ptr, loc, "unsupported: copying a pointer-to-pointer variable");
+
+  markSecondOrderInvalid(ptr, loc,
+                         "unsupported: pointer-to-pointer variable assigned "
+                         "a value that is not the address of a local pointer "
+                         "variable");
 }
 
 void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
@@ -2559,12 +2780,19 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
 
   if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt)) {
     // Function pointers are ordinary Copy values, not decomposed pointers;
-    // the analysis never tracks them.
+    // the analysis never tracks them. Second-order pointers (`T **pp`)
+    // track separately: their targets are cursor cells, not objects.
     for (const clang::Decl *decl : declStmt->decls())
       if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
         if (var->hasLocalStorage() && !llvm::isa<clang::ParmVarDecl>(var) &&
             isPointerType(var->getType()) &&
             !isFunctionPointer(var->getType())) {
+          if (isSecondOrderPointerType(var->getType())) {
+            secondOrderVars.insert(var);
+            if (const clang::Expr *init = var->getInit())
+              recordSecondOrderWrite(var, init);
+            continue;
+          }
           pointerVars.insert(var);
           if (const clang::Expr *init = var->getInit())
             recordPointerWrite(var, init);
@@ -2593,10 +2821,25 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
         if (const clang::VarDecl *var = asLocalVarRef(binary->getLHS())) {
           if (tracks(var))
             recordPointerWrite(var, binary->getRHS());
+          else if (secondOrderVars.contains(var))
+            recordSecondOrderWrite(var, binary->getRHS());
         } else if (const clang::VarDecl *global =
                        asGlobalDataPointerRef(binary->getLHS())) {
           pointerVars.insert(global);
           recordPointerWrite(global, binary->getRHS());
+        } else if (const clang::VarDecl *pp =
+                       asSecondOrderDeref(binary->getLHS())) {
+          // `*pp = rhs` re-points the selected first-order pointer: the
+          // write lands on the target's region (CTS-P5). A dereference
+          // before any binding has no target to forward to.
+          auto it = secondOrderRegions.find(pp);
+          if (it != secondOrderRegions.end() && it->second.target)
+            recordPointerWrite(it->second.target, binary->getRHS());
+          else
+            markSecondOrderInvalid(pp, binary->getOperatorLoc(),
+                                   "unsupported: dereference of a "
+                                   "pointer-to-pointer variable before it "
+                                   "is bound");
         }
       } else if (const clang::VarDecl *var =
                      trackedWritePlaceRoot(binary->getLHS())) {
@@ -2621,12 +2864,17 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
               trackedWritePlaceRoot(unary->getSubExpr()))
         recordWriteThrough(var, unary->getOperatorLoc());
     } else if (unary->getOpcode() == clang::UO_AddrOf) {
-      // `&p` would let the pointer escape the decomposition; a global
+      // `&p` outside a second-order binding (`pp = &p` consumes its
+      // operand) would let the pointer escape the decomposition; a global
       // pointer's address escaping is the same shape.
       if (const clang::VarDecl *var = asLocalVarRef(unary->getSubExpr())) {
-        if (tracks(var))
+        if (tracks(var) && !consumedAddrOf.contains(unary))
           markInvalid(var, unary->getOperatorLoc(),
                       "unsupported: taking the address of a pointer variable");
+        else if (secondOrderVars.contains(var))
+          markSecondOrderInvalid(var, unary->getOperatorLoc(),
+                                 "unsupported: taking the address of a "
+                                 "pointer-to-pointer variable");
       } else if (const clang::VarDecl *global =
                      asGlobalDataPointerRef(unary->getSubExpr())) {
         pointerVars.insert(global);
@@ -4308,6 +4556,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   symbols.clear();
   addressTaken.clear();
   pointerLocals.clear();
+  pointerPointerLocals.clear();
   literalBackings.clear();
   ownerStructPlaces.clear();
   loopStack.clear();
@@ -5206,7 +5455,7 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
   clang::QualType pointee =
       var->getType().getCanonicalType()->getPointeeType();
   if (pointee.getCanonicalType()->isPointerType())
-    return emitError(loc) << "unsupported: pointer-to-pointer variable";
+    return emitPointerPointerLocal(var, loc);
 
   const PointerRegion *region = pointerRegions.regionOf(var);
   if (!region)
@@ -5355,6 +5604,49 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
   return success();
 }
 
+LogicalResult CImporter::emitPointerPointerLocal(const clang::VarDecl *var,
+                                                 Location loc) {
+  clang::QualType pointee =
+      var->getType().getCanonicalType()->getPointeeType();
+  // The selected cell must hold a first-order object pointer: a function
+  // pointer is an ordinary Copy value with no cursor cell to select, and a
+  // third-order pointer would need a region of second-order selections.
+  if (pointee.getCanonicalType()->isFunctionPointerType())
+    return emitError(loc)
+           << "unsupported: pointer to a function pointer variable";
+  if (pointee.getCanonicalType()->getPointeeType()->isPointerType())
+    return emitError(loc)
+           << "unsupported: pointer-to-pointer-to-pointer variable";
+
+  const SecondOrderRegion *region = pointerRegions.secondOrderRegionOf(var);
+  if (!region)
+    return success(); // Declared but never used as a pointer; no code.
+  if (!region->invalidReason.empty())
+    return emitError(translateLoc(region->invalidLoc))
+           << region->invalidReason;
+  if (region->secondTarget) {
+    // A selection over two distinct pointer variables would need a real
+    // region of cursor cells with a runtime second-order cursor; the
+    // degenerate one-cell shape names both bindings and rejects.
+    InFlightDiagnostic diag = emitError(loc);
+    diag << "unsupported: pointer-to-pointer '" << var->getName()
+         << "' would select between pointer variables '"
+         << region->target->getName() << "' and '"
+         << region->secondTarget->getName() << "'";
+    diag.attachNote(translateLoc(region->targetLoc))
+        << "bound to '" << region->target->getName() << "' here";
+    diag.attachNote(translateLoc(region->secondTargetLoc))
+        << "bound to '" << region->secondTarget->getName() << "' here";
+    return diag;
+  }
+  if (!region->target)
+    return success(); // Never bound; any dereference rejects at its site.
+  // The degenerate one-cell region: the selection is static, so the
+  // binding (and every later `pp = &p` of the same target) emits no code.
+  pointerPointerLocals[var] = region->target;
+  return success();
+}
+
 LogicalResult CImporter::storePointerAssign(Location loc,
                                             const clang::VarDecl *ptr,
                                             const clang::Expr *rhs) {
@@ -5363,6 +5655,23 @@ LogicalResult CImporter::storePointerAssign(Location loc,
     auto globalIt = pointerGlobals.find(ptr->getCanonicalDecl());
     if (globalIt != pointerGlobals.end())
       return storeGlobalPointerAssign(loc, ptr, globalIt->second, rhs);
+    auto secondIt = pointerPointerLocals.find(ptr);
+    if (secondIt != pointerPointerLocals.end()) {
+      // `pp = &p`: the second-order selection is static (the analysis
+      // accepted exactly one target), so the rebinding emits no code.
+      // Defensively verify the operand is that target's address.
+      const auto *unary =
+          llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(rhs));
+      const clang::VarDecl *target =
+          unary && unary->getOpcode() == clang::UO_AddrOf
+              ? asLocalVarRef(unary->getSubExpr())
+              : nullptr;
+      if (target != secondIt->second)
+        return emitError(loc) // Defensive; the analysis forbids it.
+               << "unsupported: pointer-to-pointer assignment would rebind "
+                  "to a different pointer variable";
+      return success();
+    }
     return emitError(loc) << "unsupported: assignment to pointer variable '"
                           << ptr->getName() << "' with no known target object";
   }
@@ -5930,12 +6239,24 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
   if (isPointerType(op->getLHS()->getType()) &&
       !isFunctionPointer(op->getLHS()->getType())) {
     if (const clang::VarDecl *var = asVarRef(op->getLHS()))
-      if (pointerLocals.contains(var) || pointerRegions.tracks(var))
+      if (pointerLocals.contains(var) || pointerRegions.tracks(var) ||
+          pointerPointerLocals.contains(var) ||
+          pointerRegions.tracksSecondOrder(var))
         return storePointerAssign(loc, var, op->getRHS());
     // A pointer-typed global rebinds by storing its global cursor.
     if (const clang::VarDecl *global = asGlobalDataPointerRef(op->getLHS()))
       if (pointerGlobals.contains(global->getCanonicalDecl()))
         return storePointerAssign(loc, global, op->getRHS());
+    // `*pp = rhs`: re-pointing through a second-order pointer is exactly
+    // an assignment to the first-order pointer it selects (CTS-P5).
+    if (const clang::VarDecl *pp = secondOrderDerefVar(op->getLHS())) {
+      auto it = pointerPointerLocals.find(pp);
+      if (it == pointerPointerLocals.end())
+        return emitError(loc) << "unsupported: pointer-to-pointer variable '"
+                              << pp->getName()
+                              << "' has no bound pointer variable";
+      return storePointerAssign(loc, it->second, op->getRHS());
+    }
     return emitError(loc)
            << "unsupported: assignment to this pointer expression";
   }
@@ -8811,6 +9132,32 @@ FailureOr<Value> CImporter::emitPointerTruth(const clang::Expr *expr) {
   return createBoolConstant(loc, true);
 }
 
+const clang::VarDecl *
+CImporter::secondOrderDerefVar(const clang::Expr *expr) const {
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
+  if (!unary || unary->getOpcode() != clang::UO_Deref)
+    return nullptr;
+  const clang::VarDecl *var = asLoadedLocalVarRef(unary->getSubExpr());
+  return var && pointerRegions.tracksSecondOrder(var) ? var : nullptr;
+}
+
+FailureOr<PtrExprValue>
+CImporter::emitPointerLocalRead(Location loc, const clang::VarDecl *var) {
+  auto it = pointerLocals.find(var);
+  if (it == pointerLocals.end())
+    return emitError(loc) << "unsupported: pointer variable '"
+                          << var->getName()
+                          << "' has no known target object";
+  const PointerLocalInfo &info = it->second;
+  Value cursor;
+  if (info.cursorCell)
+    cursor = loadPlace(loc, info.cursorCell);
+  Value nonNull;
+  if (info.nonNullCell)
+    nonNull = loadPlace(loc, info.nonNullCell);
+  return PtrExprValue{info.base, cursor, info.literalBacking, nonNull};
+}
+
 FailureOr<PtrExprValue>
 CImporter::emitPointerRValue(const clang::Expr *expr) {
   const clang::Expr *e = stripTrivia(expr);
@@ -8833,23 +9180,33 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
     case clang::CK_LValueToRValue: {
       // A read of a pointer local: its base is static, its cursor is the
       // current value of the cursor cell (none for a degenerate base).
-      const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
-          stripTrivia(cast->getSubExpr()));
+      const clang::Expr *sub = stripTrivia(cast->getSubExpr());
+      const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub);
       const auto *var =
           ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
-      if (!var)
+      if (!var) {
+        // `*pp`: reading the first-order pointer a second-order pointer
+        // selects is exactly a read of that pointer — the selection is
+        // static under the degenerate one-cell region (CTS-P5).
+        if (const clang::VarDecl *pp = secondOrderDerefVar(sub)) {
+          auto target = pointerPointerLocals.find(pp);
+          if (target == pointerPointerLocals.end())
+            return emitError(loc)
+                   << "unsupported: pointer-to-pointer variable '"
+                   << pp->getName() << "' has no bound pointer variable";
+          return emitPointerLocalRead(loc, target->second);
+        }
         break;
-      auto it = pointerLocals.find(var);
-      if (it != pointerLocals.end()) {
-        const PointerLocalInfo &info = it->second;
-        Value cursor;
-        if (info.cursorCell)
-          cursor = loadPlace(loc, info.cursorCell);
-        Value nonNull;
-        if (info.nonNullCell)
-          nonNull = loadPlace(loc, info.nonNullCell);
-        return PtrExprValue{info.base, cursor, info.literalBacking, nonNull};
       }
+      // A second-order pointer has no first-order decomposition; its only
+      // modeled uses are its (static) rebinding and its dereferences.
+      if (pointerPointerLocals.contains(var) ||
+          pointerRegions.tracksSecondOrder(var))
+        return emitError(loc)
+               << "unsupported use of pointer-to-pointer variable '"
+               << var->getName() << "'";
+      if (pointerLocals.contains(var))
+        return emitPointerLocalRead(loc, var);
       // A read of a pointer-typed global (CTS-P4): its base is static and
       // its cursor is the current value of the cursor global (none for a
       // degenerate base).
