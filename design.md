@@ -975,6 +975,12 @@ observed when C99-33 + C99-47 together unlocked 00215).
   discard, `void` in a statement-expression position): map to an
   expression statement / `let _ =` discard; today "unsupported cast
   (ToVoid)" / "unsupported builtin type 'void'".
+  Partial: ToVoid casts now evaluate the operand as an expression
+  statement (a side-effect-free operand emits nothing) and void-typed
+  conditionals in statement position lower as if/else diamonds, which
+  unlocks 00212.c; 00213.c clears its void blockers but hits a second
+  blocker, GNU statement expressions ("unsupported expression:
+  StmtExpr"), plus goto-into-dead-code shapes (CTS-S2 territory).
   (00212.c, 00213.c)
 
 ### Functions and linkage (2 tests)
