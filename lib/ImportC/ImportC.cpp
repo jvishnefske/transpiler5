@@ -92,7 +92,8 @@
 ///    definitions; enum-typed values are opaque `!emitrust.enum` values held
 ///    in `emitrust.variable` places, and enumerator references become
 ///    `emitrust.constant` ops with an opaque `Name::Variant` payload.
-///    Anonymous enums contribute plain `i32` constants only.
+///    Anonymous enums contribute plain `i32` constants only, and a value
+///    of anonymous enum type is a plain `i32`.
 ///  - Variables with static storage duration (file-scope variables and
 ///    function-local statics, the latter mangled `<function>_<name>`)
 ///    become module-level `emitrust.global`s with constant-evaluated
@@ -405,7 +406,8 @@ public:
       : module(module), builder(module.getContext()) {}
 
   /// Imports every supported top-level declaration of `context`'s translation
-  /// unit into the module: complete named struct definitions, function
+  /// unit into the module: complete struct definitions (bare anonymous
+  /// structs under synthesized shape-keyed `Anon<n>` names), function
   /// declarations or definitions, and file-scope variables (as module-level
   /// `emitrust.global`s). Other declarations are rejected, with one
   /// exception: declarations whose expansion location lies in a system
@@ -471,14 +473,15 @@ private:
   /// unsigned short->ui16, unsigned int->ui32, unsigned long/long
   /// long->ui64 (unsigned types map to MLIR *unsigned* integer types, not
   /// signless ones, so that they render as Rust `uN`), float->f32,
-  /// double->f64, `struct S`->`!emitrust.struct<"S">`,
-  /// `T[N]`->`!emitrust.array<NxT>`, complete named
-  /// `enum E`->`!emitrust.enum<"E">`, and function pointers
-  /// `R (*)(A, B)`->`!emitrust.fn_ptr<(A, B) -> R>` (prototype-less K&R
-  /// pointers map to the zero-parameter form). Typedefs resolve through the
-  /// canonical type. Data pointers, unions, anonymous enums, variadic
-  /// function pointers, fn_ptr component types outside the verifier set,
-  /// and everything else produce a located diagnostic.
+  /// double->f64, `struct S`->`!emitrust.struct<"S">` (a bare anonymous
+  /// struct under its synthesized shape-keyed name, importing the
+  /// definition on the way), `T[N]`->`!emitrust.array<NxT>`, complete named
+  /// `enum E`->`!emitrust.enum<"E">`, anonymous enums->`i32`, and function
+  /// pointers `R (*)(A, B)`->`!emitrust.fn_ptr<(A, B) -> R>` (prototype-less
+  /// K&R pointers map to the zero-parameter form). Typedefs resolve through
+  /// the canonical type. Data pointers, unions, variadic function pointers,
+  /// fn_ptr component types outside the verifier set, and everything else
+  /// produce a located diagnostic.
   FailureOr<Type> mapType(clang::QualType type, Location loc);
 
   /// Maps a C function-parameter type: data-pointer parameters `T*` become
@@ -536,12 +539,22 @@ private:
   // Declarations
   //===--------------------------------------------------------------------===//
 
-  /// Imports a complete named struct definition as a module-level
+  /// Imports a complete struct definition as a module-level
   /// `emitrust.struct_def`. Forward declarations are ignored; repeated
   /// imports of the same definition are deduplicated. An empty member list
-  /// (`struct T {};`) imports as a field-less struct_def. Unions, anonymous
-  /// structs, bit-fields, and unsupported field types are rejected.
+  /// (`struct T {};`) imports as a field-less struct_def. A bare anonymous
+  /// struct (no tag, no typedef name) receives a synthesized `Anon<n>` name
+  /// keyed by its field shape (see `anonRecordShapeNames`); repeated
+  /// occurrences of the same anonymous shape share one struct_def. Unions,
+  /// bit-fields, and unsupported field types are rejected.
   LogicalResult importRecord(const clang::RecordDecl *record, Location loc);
+
+  /// Returns the Rust name of an imported struct definition: its tag or
+  /// typedef name, or, for a bare anonymous struct, the synthesized name
+  /// assigned by `importRecord` (which must have succeeded for `definition`
+  /// first). Returns an empty StringRef only for an anonymous struct that
+  /// was never imported.
+  llvm::StringRef structRustName(const clang::RecordDecl *definition) const;
 
   /// Imports a complete named enum definition as a module-level
   /// `emitrust.enum_def`. Incomplete and anonymous enums are silently
@@ -1156,6 +1169,22 @@ private:
   /// Shape of every imported struct, keyed by symbol name, for cross-TU
   /// deduplication and mismatch detection.
   llvm::StringMap<std::string> importedRecordShapes;
+  /// Synthesized Rust names for bare anonymous structs (no tag, no typedef
+  /// name), keyed by the same field-shape serialization used for cross-TU
+  /// dedup. Living in its own map (never keyed by a user-written name) is
+  /// the anonymity marker: an anonymous struct whose shape matches a named
+  /// struct's still gets its own Rust type, because C type identity is by
+  /// declaration, not by shape. The name is a deterministic function of the
+  /// shape, so the same anonymous shape in two translation units maps to
+  /// one Rust type and two different shapes never collide.
+  llvm::StringMap<std::string> anonRecordShapeNames;
+  /// Synthesized name of every imported bare anonymous struct, keyed by its
+  /// defining declaration; populated by `importRecord` and consulted by
+  /// `structRustName`.
+  llvm::DenseMap<const clang::RecordDecl *, std::string> anonRecordNames;
+  /// Next `Anon<n>` suffix to try when a new anonymous shape needs a name;
+  /// names are assigned in first-encounter order per import.
+  unsigned anonStructCounter = 0;
   /// Shape of every imported enum, keyed by symbol name, for cross-TU
   /// deduplication and mismatch detection.
   llvm::StringMap<std::string> importedEnumShapes;
@@ -1353,11 +1382,13 @@ static bool isUnsignedInt(Type type) {
   return intType && intType.isUnsigned();
 }
 
-/// Returns the Rust-facing name of a record: its tag name, or, for a tagless
-/// record declared through `typedef struct { ... } T;`, the typedef name.
-/// Returns an empty StringRef for a bare anonymous struct, which stays
-/// rejected. The typedef name is the record's name for all mangling and
-/// cross-TU shape-dedup purposes, exactly like a tagged struct.
+/// Returns the C-declared Rust-facing name of a record: its tag name, or,
+/// for a tagless record declared through `typedef struct { ... } T;`, the
+/// typedef name. Returns an empty StringRef for a bare anonymous struct,
+/// for which `importRecord` synthesizes a shape-keyed `Anon<n>` name
+/// (retrieved through `CImporter::structRustName`). The typedef name is
+/// the record's name for all mangling and cross-TU shape-dedup purposes,
+/// exactly like a tagged struct.
 static llvm::StringRef recordRustName(const clang::RecordDecl *record) {
   llvm::StringRef name = record->getName();
   if (!name.empty())
@@ -1840,11 +1871,13 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     const clang::RecordDecl *definition = decl->getDefinition();
     if (!definition)
       return emitError(loc) << "unsupported: incomplete struct type";
-    llvm::StringRef structName = recordRustName(definition);
-    if (structName.empty())
-      return emitError(loc) << "unsupported: anonymous struct type";
+    // Import first: a bare anonymous struct receives its synthesized name
+    // during `importRecord`, so the name lookup must follow the import.
     if (failed(importRecord(definition, loc)))
       return failure();
+    llvm::StringRef structName = structRustName(definition);
+    if (structName.empty())
+      return emitError(loc) << "unsupported: anonymous struct type";
     return Type(emitrust::StructType::get(builder.getContext(), structName));
   }
 
@@ -1871,8 +1904,11 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     const clang::EnumDecl *definition = enumType->getDecl()->getDefinition();
     if (!definition)
       return emitError(loc) << "unsupported: incomplete enum type";
+    // Anonymous enums are plain `int` everywhere else in the importer
+    // (enumerator references become `i32` constants at their use sites), so
+    // a value of anonymous enum type is a plain `i32`.
     if (definition->getName().empty())
-      return emitError(loc) << "unsupported: anonymous enum type";
+      return Type(builder.getIntegerType(32));
     if (failed(importEnum(definition, loc)))
       return failure();
     return Type(
@@ -2277,6 +2313,17 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
 // Declarations
 //===----------------------------------------------------------------------===//
 
+llvm::StringRef
+CImporter::structRustName(const clang::RecordDecl *definition) const {
+  llvm::StringRef name = recordRustName(definition);
+  if (!name.empty())
+    return name;
+  auto it = anonRecordNames.find(definition);
+  if (it == anonRecordNames.end())
+    return {};
+  return it->second;
+}
+
 LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
                                       Location loc) {
   const clang::RecordDecl *definition = record->getDefinition();
@@ -2290,9 +2337,7 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   if (!importedRecords.insert(definition).second)
     return success();
   llvm::StringRef structName = recordRustName(definition);
-  if (structName.empty())
-    return emitError(defLoc) << "unsupported: anonymous struct type";
-  if (isRustKeyword(structName))
+  if (!structName.empty() && isRustKeyword(structName))
     return emitError(defLoc) << "unsupported: struct name '" << structName
                              << "' is a Rust keyword";
 
@@ -2325,6 +2370,32 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
     for (auto [fieldName, fieldType] : llvm::zip(fieldNames, fieldTypes))
       os << fieldName << ':' << fieldType << ';';
   }
+
+  // A bare anonymous struct (no tag, no typedef name) gets a synthesized
+  // `Anon<n>` name that is a deterministic function of its field shape:
+  // the shape is the key, so the same anonymous shape anywhere in the
+  // project reuses one name (and, through the shape dedup below, one
+  // struct_def), while distinct shapes always get distinct names. The
+  // counter only orders first encounters; it never influences which name a
+  // given shape maps to within an import. `anonRecordShapeNames` is
+  // consulted only for anonymous structs, so a named struct with the same
+  // shape keeps its own Rust type.
+  if (structName.empty()) {
+    auto known = anonRecordShapeNames.find(shape);
+    if (known != anonRecordShapeNames.end()) {
+      structName = known->second;
+    } else {
+      std::string synthesized;
+      do {
+        synthesized = ("Anon" + llvm::Twine(anonStructCounter++)).str();
+      } while (importedRecordShapes.contains(synthesized) ||
+               importedEnumShapes.contains(synthesized));
+      structName =
+          anonRecordShapeNames.try_emplace(shape, synthesized).first->second;
+    }
+    anonRecordNames.try_emplace(definition, structName.str());
+  }
+
   auto existingShape = importedRecordShapes.find(structName);
   if (existingShape != importedRecordShapes.end()) {
     if (existingShape->second != shape)
