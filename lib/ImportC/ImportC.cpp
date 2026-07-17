@@ -543,6 +543,41 @@ private:
   /// structs, bit-fields, and unsupported field types are rejected.
   LogicalResult importRecord(const clang::RecordDecl *record, Location loc);
 
+  /// Returns the MLIR/Rust symbol name assigned to a struct definition,
+  /// modeling C's separate tag and ordinary identifier namespaces (C99
+  /// 6.2.3): `struct a` and a global or function `a` may coexist in C, but
+  /// the module has a single symbol table, so the tag is deterministically
+  /// renamed to `Struct_<tag>` when — and only when — the ordinary
+  /// namespace also claims the name. The common, collision-free case keeps
+  /// the readable tag spelling. The decision is cached per defining
+  /// declaration so every mention of the type agrees. Returns an empty
+  /// string for an anonymous struct (callers reject with their own
+  /// located message) and failure when even the renamed spelling is
+  /// claimed by an ordinary identifier.
+  FailureOr<std::string> structSymbolName(const clang::RecordDecl *definition,
+                                          Location loc);
+
+  /// Whether `name` is claimed by C's ordinary identifier namespace: either
+  /// the current TU's pre-scanned ordinary names (functions, file-scope
+  /// variables, mangled function-local statics) or an already-imported
+  /// module symbol other than a struct definition (a global or function
+  /// from a previously imported TU).
+  bool ordinaryNameTaken(llvm::StringRef name) const;
+
+  /// Pre-scans a translation unit and records in `ordinaryTuNames` every
+  /// module-symbol name its ordinary identifier namespace will claim:
+  /// function names (after `main` -> `c_main` and internal-linkage TU-tag
+  /// mangling), file-scope variable names (with the same internal-linkage
+  /// mangling), and function-local statics under their `<function>_<name>`
+  /// mangle. Runs before any struct type is imported so tag renaming
+  /// (`structSymbolName`) is independent of declaration order.
+  void collectOrdinaryNames(const clang::TranslationUnitDecl *unit);
+
+  /// Walks a function body and records the `<function>_<name>` mangled
+  /// spelling of every function-local static in `ordinaryTuNames`.
+  void collectStaticLocalNames(const clang::Stmt *stmt,
+                               llvm::StringRef funcName);
+
   /// Imports a complete named enum definition as a module-level
   /// `emitrust.enum_def`. Incomplete and anonymous enums are silently
   /// skipped (anonymous enumerators are imported as plain `i32` constants
@@ -1156,6 +1191,17 @@ private:
   /// Shape of every imported struct, keyed by symbol name, for cross-TU
   /// deduplication and mismatch detection.
   llvm::StringMap<std::string> importedRecordShapes;
+  /// Module-symbol names the current TU's ordinary identifier namespace
+  /// claims (functions, file-scope variables, mangled function-local
+  /// statics), pre-scanned by `collectOrdinaryNames`; struct tags colliding
+  /// with these are renamed (see `structSymbolName`).
+  llvm::StringSet<> ordinaryTuNames;
+  /// Symbol name assigned to each struct definition by `structSymbolName`,
+  /// keyed on the defining declaration (per-TU decls are distinct; cross-TU
+  /// unification still happens by final name through
+  /// `importedRecordShapes`, so the rename decision must be reproducible
+  /// from each TU's own ordinary names).
+  llvm::DenseMap<const clang::RecordDecl *, std::string> assignedStructNames;
   /// Shape of every imported enum, keyed by symbol name, for cross-TU
   /// deduplication and mismatch detection.
   llvm::StringMap<std::string> importedEnumShapes;
@@ -1357,7 +1403,10 @@ static bool isUnsignedInt(Type type) {
 /// record declared through `typedef struct { ... } T;`, the typedef name.
 /// Returns an empty StringRef for a bare anonymous struct, which stays
 /// rejected. The typedef name is the record's name for all mangling and
-/// cross-TU shape-dedup purposes, exactly like a tagged struct.
+/// cross-TU shape-dedup purposes, exactly like a tagged struct. This is the
+/// base spelling only: `CImporter::structSymbolName` layers the tag-versus-
+/// ordinary-namespace collision renaming on top and is what every symbol
+/// and type mention must go through.
 static llvm::StringRef recordRustName(const clang::RecordDecl *record) {
   llvm::StringRef name = record->getName();
   if (!name.empty())
@@ -1840,12 +1889,14 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     const clang::RecordDecl *definition = decl->getDefinition();
     if (!definition)
       return emitError(loc) << "unsupported: incomplete struct type";
-    llvm::StringRef structName = recordRustName(definition);
-    if (structName.empty())
+    FailureOr<std::string> structName = structSymbolName(definition, loc);
+    if (failed(structName))
+      return failure();
+    if (structName->empty())
       return emitError(loc) << "unsupported: anonymous struct type";
     if (failed(importRecord(definition, loc)))
       return failure();
-    return Type(emitrust::StructType::get(builder.getContext(), structName));
+    return Type(emitrust::StructType::get(builder.getContext(), *structName));
   }
 
   if (const clang::ConstantArrayType *array =
@@ -2277,6 +2328,75 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
 // Declarations
 //===----------------------------------------------------------------------===//
 
+bool CImporter::ordinaryNameTaken(llvm::StringRef name) const {
+  if (ordinaryTuNames.contains(name))
+    return true;
+  Operation *existing = SymbolTable::lookupSymbolIn(module, name);
+  return existing && !llvm::isa<emitrust::StructDefOp>(existing);
+}
+
+void CImporter::collectStaticLocalNames(const clang::Stmt *stmt,
+                                        llvm::StringRef funcName) {
+  if (!stmt)
+    return;
+  if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt))
+    for (const clang::Decl *decl : declStmt->decls())
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+        if (var->isStaticLocal())
+          ordinaryTuNames.insert(
+              (llvm::Twine(funcName) + "_" + var->getName()).str());
+  for (const clang::Stmt *child : stmt->children())
+    collectStaticLocalNames(child, funcName);
+}
+
+void CImporter::collectOrdinaryNames(const clang::TranslationUnitDecl *unit) {
+  ordinaryTuNames.clear();
+  for (const clang::Decl *decl : unit->decls()) {
+    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+      continue;
+    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+      std::string funcName = mlirFuncName(func);
+      ordinaryTuNames.insert(funcName);
+      // Function-local statics surface at module level under their
+      // `<function>_<name>` mangle (see emitLocalVar), claiming that
+      // spelling in the ordinary namespace.
+      if (func->hasBody())
+        collectStaticLocalNames(func->getBody(), funcName);
+      continue;
+    }
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
+      bool internal = !var->isExternallyVisible();
+      ordinaryTuNames.insert(internal ? currentTuTag + var->getName().str()
+                                      : var->getName().str());
+    }
+  }
+}
+
+FailureOr<std::string>
+CImporter::structSymbolName(const clang::RecordDecl *definition,
+                            Location loc) {
+  auto cached = assignedStructNames.find(definition);
+  if (cached != assignedStructNames.end())
+    return cached->second;
+  llvm::StringRef base = recordRustName(definition);
+  if (base.empty())
+    return std::string(); // Anonymous struct; callers reject it.
+  std::string assigned = base.str();
+  if (ordinaryNameTaken(assigned)) {
+    // C's tag namespace is separate from the ordinary one (C99 6.2.3);
+    // the module symbol table is not, so the tag yields deterministically.
+    assigned = ("Struct_" + base).str();
+    if (ordinaryNameTaken(assigned))
+      return emitError(loc)
+             << "unsupported: struct '" << base
+             << "' collides with an ordinary identifier, and so does its "
+                "renamed spelling '"
+             << assigned << "'";
+  }
+  assignedStructNames[definition] = assigned;
+  return assigned;
+}
+
 LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
                                       Location loc) {
   const clang::RecordDecl *definition = record->getDefinition();
@@ -2289,7 +2409,10 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
     return emitError(defLoc) << "unsupported record declaration";
   if (!importedRecords.insert(definition).second)
     return success();
-  llvm::StringRef structName = recordRustName(definition);
+  FailureOr<std::string> assignedName = structSymbolName(definition, defLoc);
+  if (failed(assignedName))
+    return failure();
+  llvm::StringRef structName = *assignedName;
   if (structName.empty())
     return emitError(defLoc) << "unsupported: anonymous struct type";
   if (isRustKeyword(structName))
@@ -3038,6 +3161,10 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   currentTuTag = tuTag.str();
   deferExternGlobals = deferExtern;
   const clang::TranslationUnitDecl *unit = astContext().getTranslationUnitDecl();
+  // Namespace pre-pass: record every module-symbol name this TU's ordinary
+  // identifier namespace will claim, so struct tag naming
+  // (`structSymbolName`) is independent of declaration order.
+  collectOrdinaryNames(unit);
   // Phase-4 Pass A: pure-AST owner planning over every function definition
   // before any IR is built; Pass B below consults the plans.
   planOwners(unit, soleTranslationUnit);

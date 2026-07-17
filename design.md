@@ -955,6 +955,20 @@ observed when C99-33 + C99-47 together unlocked 00215).
   `<fn>_<name>` scheme): Rust has one namespace per kind but the emitter
   uses one symbol table; mangle tags (e.g. `Struct_a`) or detect-and-
   rename on collision.
+  Detect-and-rename landed in the importer: a per-TU pre-pass
+  (`collectOrdinaryNames`) records every name the ordinary namespace will
+  claim (functions after `main`/TU-tag mangling, file-scope variables,
+  function-local statics under their `<fn>_<name>` mangle), and
+  `structSymbolName` keeps the readable tag when free, renaming
+  deterministically to `Struct_<tag>` only on actual collision — order
+  independent, cached per definition. If the renamed spelling is also
+  claimed, the import is a located rejection
+  (test/Import/C/structs-tag-namespace.c, -invalid.c; differential
+  test/EndToEnd/struct-tag-namespace.c). 00129.c and 00219.c pass and are
+  in the ratchet manifest; 00204.c clears its namespace blocker but hits
+  a second unsupported construct before the predicted printf shapes:
+  "00204.c:36:28: error: unsupported builtin type 'long double'" —
+  box stays unticked until long double (and then `%.Ns`/`%llx`) land.
   (00129.c, 00204.c, 00219.c)
 - [ ] CTS-R6 (1) Empty structs (`struct T {};` — a GNU/C2x shape clang
   accepts): emit a unit-like Rust struct; today "struct with no
@@ -1053,8 +1067,9 @@ observed when C99-33 + C99-47 together unlocked 00215).
   (00089.c, 00220.c)
 Not itemized above: printf precision (`%.3s`) and long-long length
 specifiers (`%llx`, `%10Ld`) remain outside the C99-47 grammar, but no
-test is sole-blocked on them today (00204.c hits CTS-R5 first, 00182.c
-already passes) — they surface as second blockers once CTS-R5 lands.
+test is sole-blocked on them today (00182.c already passes; with CTS-R5's
+rename landed, 00204.c now rejects on `long double` at 00204.c:36:28
+before reaching printf) — they surface behind long double on 00204.c.
 
 ## Non-Goals for the MVP
 
