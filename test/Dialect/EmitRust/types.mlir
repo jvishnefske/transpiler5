@@ -161,3 +161,31 @@ emitrust.func @fn_ptr_lvalue() {
   %0 = emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
   emitrust.return
 }
+
+// CHECK-LABEL: emitrust.func @nested_array_param(
+// CHECK-SAME: !emitrust.array<2x!emitrust.array<4xi8>>
+emitrust.func @nested_array_param(%arg0: !emitrust.array<2x!emitrust.array<4xi8>>) {
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @nested_array_three_levels(
+// CHECK-SAME: !emitrust.array<2x!emitrust.array<3x!emitrust.array<5xi32>>>
+emitrust.func @nested_array_three_levels(
+    %arg0: !emitrust.array<2x!emitrust.array<3x!emitrust.array<5xi32>>>) {
+  emitrust.return
+}
+
+// CHECK-LABEL: emitrust.func @nested_array_places
+emitrust.func @nested_array_places(%arg0: index) {
+  // CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<2x!emitrust.array<4xi8>>>
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.array<2x!emitrust.array<4xi8>>>
+  // Each subscript peels one array level.
+  // CHECK: emitrust.subscript %{{.*}}[%{{.*}}] : (!emitrust.lvalue<!emitrust.array<2x!emitrust.array<4xi8>>>, index) -> !emitrust.lvalue<!emitrust.array<4xi8>>
+  %1 = emitrust.subscript %0[%arg0] : (!emitrust.lvalue<!emitrust.array<2x!emitrust.array<4xi8>>>, index) -> !emitrust.lvalue<!emitrust.array<4xi8>>
+  // CHECK: emitrust.subscript %{{.*}}[%{{.*}}] : (!emitrust.lvalue<!emitrust.array<4xi8>>, index) -> !emitrust.lvalue<i8>
+  %2 = emitrust.subscript %1[%arg0] : (!emitrust.lvalue<!emitrust.array<4xi8>>, index) -> !emitrust.lvalue<i8>
+  emitrust.return
+}
+
+// CHECK: emitrust.global @grid <{{\[}}[0 : i8, 1 : i8], [2 : i8, 3 : i8], [4 : i8, 5 : i8]]> : !emitrust.array<3x!emitrust.array<2xi8>>
+emitrust.global @grid <[[0 : i8, 1 : i8], [2 : i8, 3 : i8], [4 : i8, 5 : i8]]> : !emitrust.array<3x!emitrust.array<2xi8>>

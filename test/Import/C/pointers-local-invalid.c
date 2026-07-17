@@ -10,6 +10,8 @@
 // RUN: not emitrust-import-c %t/cross-compare.c 2>&1 | FileCheck %s --check-prefix=CROSSCMP
 // RUN: not emitrust-import-c %t/truth-value.c 2>&1 | FileCheck %s --check-prefix=TRUTH
 // RUN: not emitrust-import-c %t/string-literal.c 2>&1 | FileCheck %s --check-prefix=STRLIT
+// RUN: not emitrust-import-c %t/row-walk.c 2>&1 | FileCheck %s --check-prefix=ROWWALK
+// RUN: not emitrust-import-c %t/row-diff.c 2>&1 | FileCheck %s --check-prefix=ROWDIFF
 
 // Phase-1a pointer decomposition boundaries: every pointer local must
 // resolve to exactly one non-escaping local object. Each file below
@@ -144,4 +146,34 @@ int main(void) {
 int main(void) {
   char *s = "hi";
   return s[0];
+}
+
+// Walking a row pointer (`char (*)[4]`) would need a row-scaled cursor
+// step; the flat row-major cursor only implements the subscript and
+// address-of forms (CTS-P scope).
+// ROWWALK: row-walk.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: arithmetic on a pointer to an array
+
+//--- row-walk.c
+int main(void) {
+  char arr[2][4];
+  char (*p)[4];
+  p = arr;
+  arr[0][0] = 1;
+  p++;
+  return p[0][0];
+}
+
+// A difference of row pointers would need a row-scaled division of the
+// flat cursors (CTS-P scope).
+// ROWDIFF: row-diff.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: arithmetic on a pointer to an array
+
+//--- row-diff.c
+int main(void) {
+  char arr[2][4];
+  char (*p)[4];
+  char (*r)[4];
+  p = arr;
+  r = arr;
+  arr[0][0] = 1;
+  return (int)(p - r);
 }
