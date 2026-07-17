@@ -922,6 +922,23 @@ private:
   /// definition.
   LogicalResult emitPutchar(const clang::CallExpr *call);
 
+  /// Maps a hosted `<math.h>` function name to the safe Rust callable it
+  /// lowers to (design.md C99-48; currently exactly `sin` -> `f64::sin`).
+  /// Returns std::nullopt for every other name, which keeps the
+  /// system-header rejection in `emitCall`.
+  static std::optional<llvm::StringRef>
+  hostedMathCallee(llvm::StringRef name);
+
+  /// Lowers a call to a definition-less hosted `<math.h>` function with
+  /// C's standard `double f(double)` prototype to
+  /// `emitrust.call_opaque "<rustCallee>"` of the f64 argument (e.g.
+  /// `sin(x)` -> `f64::sin(vX)`). Only called when `hostedMathCallee`
+  /// recognized the name and the prototype matched; clang has already
+  /// inserted the usual argument conversion to double, so the operand is
+  /// f64 by construction (checked defensively).
+  FailureOr<Value> emitHostedMathCall(const clang::CallExpr *call,
+                                      llvm::StringRef rustCallee);
+
   //===--------------------------------------------------------------------===//
   // Expressions
   //===--------------------------------------------------------------------===//
@@ -4700,6 +4717,33 @@ LogicalResult CImporter::emitPutchar(const clang::CallExpr *call) {
   return success();
 }
 
+std::optional<llvm::StringRef>
+CImporter::hostedMathCallee(llvm::StringRef name) {
+  return llvm::StringSwitch<std::optional<llvm::StringRef>>(name)
+      .Case("sin", "f64::sin")
+      .Default(std::nullopt);
+}
+
+FailureOr<Value> CImporter::emitHostedMathCall(const clang::CallExpr *call,
+                                               llvm::StringRef rustCallee) {
+  Location loc = translateLoc(call->getBeginLoc());
+  FailureOr<Value> argument = emitRValue(call->getArg(0));
+  if (failed(argument))
+    return failure();
+  // The callee's prototype is `double f(double)` (checked at the call
+  // site), so clang has already converted the argument to double; anything
+  // else indicates an importer bug rather than an unsupported program.
+  if (!llvm::isa<Float64Type>((*argument).getType()))
+    return emitError(loc) << "unsupported: " << rustCallee
+                          << " argument is not a double";
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getF64Type()},
+          builder.getStringAttr(rustCallee),
+          /*args=*/ArrayAttr(), ValueRange{*argument})
+      .getResult(0);
+}
+
 //===----------------------------------------------------------------------===//
 // Expressions
 //===----------------------------------------------------------------------===//
@@ -5744,6 +5788,22 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
                           << " return value must be unused";
   if (callee->isVariadic())
     return emitError(loc) << "unsupported: call to a variadic function";
+
+  // Hosted <math.h> surface (design.md C99-48): a definition-less call to
+  // a recognized math function with its standard `double f(double)`
+  // prototype lowers to the equivalent safe Rust f64 function. A
+  // user-defined function of the same name stays an ordinary call
+  // (mirroring the puts/putchar policy), and every other system-header
+  // call keeps the rejection below.
+  if (!callee->getDefinition() && callee->getNumParams() == 1 &&
+      astContext().hasSameUnqualifiedType(callee->getReturnType(),
+                                          astContext().DoubleTy) &&
+      astContext().hasSameUnqualifiedType(callee->getParamDecl(0)->getType(),
+                                          astContext().DoubleTy)) {
+    if (std::optional<llvm::StringRef> rustCallee =
+            hostedMathCallee(callee->getName()))
+      return emitHostedMathCall(call, *rustCallee);
+  }
 
   std::string name = mlirFuncName(callee);
   func::FuncOp target = functions.lookup(name);
