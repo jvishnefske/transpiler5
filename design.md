@@ -1083,11 +1083,43 @@ observed when C99-33 + C99-47 together unlocked 00215).
   repeated shape shares one struct_def, named-vs-anonymous shape match
   stays two types, cross-TU dedup, anonymous-enum member) and
   test/EndToEnd/structs-anon.c (differential member reads/writes).)
-- [ ] CTS-R2 (2) Unnamed struct members (anonymous member injection —
+- [x] CTS-R2 (2) Unnamed struct members (anonymous member injection —
   C11 6.7.2.1p13 anonymous struct/union members whose fields join the
   parent's namespace): flatten fields into the parent struct_def with
   mangled names, or reject-by-design with a note.
   (00046.c, 00050.c)
+  (Done: an anonymous struct member's fields are injected into the
+  parent struct_def under their own spellings — no mangling is needed
+  because C11 puts them in the parent's member namespace, so Sema has
+  already enforced uniqueness (a collision is a located clang error).
+  Both target tests also contain anonymous UNION members; the exactly
+  representable subset is implemented: an anonymous union member whose
+  arms each flatten to one leaf of one identical type becomes a single
+  storage slot named after the first leaf, every arm's spelling
+  aliasing it — exact because reading any union member with the type of
+  the last store yields that stored value (C99 6.5.2.3). Every other
+  union — mixed-type arms, an arm wider than one slot, and all named or
+  bare union types — keeps the located union-type rejection (CTS-R3).
+  Member access skips Sema's implicit intermediate anonymous access and
+  selects the flattened (alias-resolved) leaf on the parent place;
+  block-scope initializer lists recurse onto the parent place with a
+  union's nested list landing on its active arm's slot; constant global
+  initializers convert along the C field structure so brace-elided
+  values, zero-filled tails, and union slots produce the flattened
+  attribute list. Distinct from CTS-R1's bare anonymous struct
+  declarations, whose shape-keyed Anon naming is untouched.
+  Traceability: importer lib/ImportC/ImportC.cpp (collectRecordFields,
+  anonymousUnionArmLeaf, flattenedFieldName, unionSlotStorage,
+  structDefRecords, emitRecordInitFields, emitRecordInitField,
+  convertRecordAPValue, convertAnonymousSlotInit, and the anonymous
+  skip in the member-access lvalue path); tests
+  test/Import/C/structs-anon-member.c (two-level flattening, union slot
+  aliasing, global/local initializer shapes),
+  test/Import/C/structs-anon-member-invalid.c (mixed-type arms, wide
+  arm, named union, parent-vs-member spelling collision — all located),
+  test/EndToEnd/structs-anon-member.c (differential). Both tests pass
+  and are in the manifest — ledger 190 passed / 30 unsupported /
+  0 miscompiled.)
 - [ ] CTS-R3 (3) Unions (C99-44): design decision required — safe Rust
   has no untagged unions without unsafe; candidates are a data-carrying
   enum when all accesses are type-consistent, or byte-array storage with
