@@ -718,9 +718,45 @@ private:
   /// name) receives a synthesized `Anon<n>` name keyed by its field shape
   /// (see `anonRecordShapeNames`); repeated occurrences of the same
   /// anonymous shape share one struct_def. An empty member list
-  /// (`struct T {};`) imports as a field-less struct_def. Unions,
+  /// (`struct T {};`) imports as a field-less struct_def. The field list
+  /// is flattened through `collectRecordFields`, which resolves C11
+  /// 6.7.2.1p13 anonymous struct/union members. Union types,
   /// bit-fields, and unsupported field types are rejected.
   LogicalResult importRecord(const clang::RecordDecl *record, Location loc);
+
+  /// Appends the flattened field list of `record` to
+  /// `fieldNames`/`fieldTypes`, resolving C11 6.7.2.1p13 anonymous
+  /// members (an unnamed member whose type is an anonymous struct or
+  /// union, `FieldDecl::isAnonymousStructOrUnion`): an anonymous struct
+  /// member's fields join the parent's member namespace, so they are
+  /// injected in place under their own spellings (Sema has already
+  /// enforced their uniqueness there); an anonymous union member is
+  /// representable without a union type exactly when every arm flattens
+  /// to a single leaf field and all leaves map to one identical type —
+  /// the arms then alias a single storage slot named after the first
+  /// leaf (recorded in `unionSlotStorage`), which is exact because
+  /// reading any union member with the type of the last store yields
+  /// that stored value. Any other anonymous union rejects exactly as
+  /// union types do elsewhere ("unsupported: union type", CTS-R3); other
+  /// unnamed members, bit-fields, and Rust-keyword spellings are
+  /// rejected with the field's location.
+  LogicalResult
+  collectRecordFields(const clang::RecordDecl *record,
+                      SmallVectorImpl<llvm::StringRef> &fieldNames,
+                      SmallVectorImpl<Type> &fieldTypes);
+
+  /// Resolves one arm of an anonymous union member to its single
+  /// flattened leaf field, descending through nested anonymous struct
+  /// members. Fails — with the union-type rejection at `unionLoc` — when
+  /// the arm flattens to zero or several fields, which the single-slot
+  /// aliasing of `collectRecordFields` cannot model.
+  FailureOr<const clang::FieldDecl *>
+  anonymousUnionArmLeaf(const clang::FieldDecl *arm, Location unionLoc);
+
+  /// Returns the spelling `field` carries in its flattened parent
+  /// struct_def: its own name or, for an anonymous-union arm aliased by
+  /// `collectRecordFields`, the storage slot's name.
+  llvm::StringRef flattenedFieldName(const clang::FieldDecl *field) const;
 
   /// Returns the Rust type name `definition` was imported under: the
   /// mangled block-scope name recorded by `importRecord`, the
@@ -916,13 +952,38 @@ private:
   /// Converts a constant-evaluated `clang::APValue` to the initializer
   /// attribute for a global of value type `type`: IntegerAttr/BoolAttr for
   /// integers, FloatAttr for floats, and a (possibly nested) ArrayAttr with
-  /// one entry per array element or struct field for aggregates. Array
-  /// holes left by partial or designated initialization take the array
-  /// filler (C99 zero-fill); struct field types resolve through the
-  /// module-level `emitrust.struct_def`. Anything else (enum-typed
+  /// one entry per array element or flattened struct field for
+  /// aggregates. Array holes left by partial or designated
+  /// initialization take the array filler (C99 zero-fill); struct field
+  /// types resolve through the module-level `emitrust.struct_def`, and a
+  /// struct with flattened anonymous members converts along the C field
+  /// structure via `convertRecordAPValue`. Anything else (enum-typed
   /// elements, pointers) is rejected with a located diagnostic.
   FailureOr<Attribute> convertAPValueInit(const clang::APValue &value,
                                           Type type, Location loc);
+
+  /// Converts the struct `APValue` of `record` to one attribute per
+  /// flattened struct_def field, appended to `fields`. `fieldTypes` is
+  /// the struct_def's flattened type list and `typeIndex` the cursor into
+  /// it, advanced per emitted field: a plain field converts positionally,
+  /// an anonymous struct member recurses into its struct value, and an
+  /// anonymous union member converts its single aliased storage slot via
+  /// `convertAnonymousSlotInit`.
+  LogicalResult convertRecordAPValue(const clang::APValue &value,
+                                     const clang::RecordDecl *record,
+                                     ArrayAttr fieldTypes, unsigned &typeIndex,
+                                     SmallVectorImpl<Attribute> &fields,
+                                     Location loc);
+
+  /// Converts the constant value of a flattened anonymous union member to
+  /// the attribute of its single storage slot of type `slotType`: the
+  /// union's active arm descends through nested anonymous members to the
+  /// slot's scalar value; a union with no active arm takes the slot's
+  /// zero value (C99 zero-fill).
+  FailureOr<Attribute>
+  convertAnonymousSlotInit(const clang::APValue &value,
+                           const clang::RecordDecl *record, Type slotType,
+                           Location loc);
 
   /// Returns the imported global for `decl`, or null when `decl` is not an
   /// imported variable with static storage duration.
@@ -1029,6 +1090,25 @@ private:
   /// diagnostics.
   LogicalResult emitAggregateInitList(Value place, Type type,
                                       const clang::InitListExpr *list);
+
+  /// Emits a (semantic-form) initializer list for the C record `record`
+  /// into the parent struct place `place`, resolving flattened anonymous
+  /// members: a plain field initializes through `emitrust.member` under
+  /// its flattened name; an anonymous struct member's nested list
+  /// recurses onto the same parent place; an anonymous union member's
+  /// nested list initializes only its active arm (Sema records it on the
+  /// semantic form), which lands on the arm's aliased storage slot. Called
+  /// with `record->isUnion()` only for such flattened anonymous members.
+  LogicalResult emitRecordInitFields(Value place,
+                                     const clang::RecordDecl *record,
+                                     const clang::InitListExpr *list);
+
+  /// Emits the initializer `element` for `field` of a flattened record
+  /// into the parent struct place `place`: an anonymous member requires a
+  /// nested list and recurses via `emitRecordInitFields`; a plain field
+  /// assigns through `emitrust.member` under its flattened name.
+  LogicalResult emitRecordInitField(Value place, const clang::FieldDecl *field,
+                                    const clang::Expr *element);
 
   /// Emits one element of an aggregate initializer list into `place` of
   /// value type `type`: recurses for a nested list, otherwise stores the
@@ -1643,6 +1723,18 @@ private:
   /// Next `Anon<n>` suffix to try when a new anonymous shape needs a name;
   /// names are assigned in first-encounter order per import.
   unsigned anonStructCounter = 0;
+  /// Anonymous-union arm -> the first arm's leaf field, whose spelling
+  /// names the single flattened storage slot every arm aliases; populated
+  /// by `collectRecordFields` (the storage leaf itself has no entry) and
+  /// consulted by `flattenedFieldName`.
+  llvm::DenseMap<const clang::FieldDecl *, const clang::FieldDecl *>
+      unionSlotStorage;
+  /// The defining C record behind each emitted struct_def symbol, recorded
+  /// by `importRecord` so record-aware consumers (global initializer
+  /// conversion) can walk the C field structure of a flattened struct.
+  /// Synthesized struct_defs (Phase-4 owner structs) have no entry and
+  /// keep the positional field conversion.
+  llvm::StringMap<const clang::RecordDecl *> structDefRecords;
   /// Module-symbol names the current TU's ordinary identifier namespace
   /// claims (functions, file-scope variables, mangled function-local
   /// statics), pre-scanned by `collectOrdinaryNames`; struct tags colliding
@@ -3282,21 +3374,8 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
 
   SmallVector<llvm::StringRef> fieldNames;
   SmallVector<Type> fieldTypes;
-  for (const clang::FieldDecl *field : definition->fields()) {
-    Location fieldLoc = translateLoc(field->getLocation());
-    if (field->isBitField())
-      return emitError(fieldLoc) << "unsupported: bit-field struct member";
-    if (field->getName().empty())
-      return emitError(fieldLoc) << "unsupported: unnamed struct member";
-    if (isRustKeyword(field->getName()))
-      return emitError(fieldLoc) << "unsupported: struct member '"
-                                 << field->getName() << "' is a Rust keyword";
-    FailureOr<Type> fieldType = mapType(field->getType(), fieldLoc);
-    if (failed(fieldType))
-      return failure();
-    fieldNames.push_back(field->getName());
-    fieldTypes.push_back(*fieldType);
-  }
+  if (failed(collectRecordFields(definition, fieldNames, fieldTypes)))
+    return failure();
   // An empty member list (`struct T {};`, a GNU/C2x shape clang accepts) is
   // permitted and becomes a unit-like Rust struct.
 
@@ -3334,6 +3413,7 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
     llvm::StringRef mangledRef =
         localRecordNames.try_emplace(definition, std::move(mangled))
             .first->second;
+    structDefRecords[mangledRef] = definition;
     OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
     moduleBuilder.create<emitrust::StructDefOp>(
         defLoc, moduleBuilder.getStringAttr(mangledRef),
@@ -3413,6 +3493,7 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
            << "' collides with the mangled name of a block-scope struct";
   importedRecordShapes[structName] = shape;
   emittedStructNames.insert(structName);
+  structDefRecords[structName] = definition;
 
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
   moduleBuilder.create<emitrust::StructDefOp>(
@@ -3420,6 +3501,122 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
       moduleBuilder.getStrArrayAttr(fieldNames),
       moduleBuilder.getTypeArrayAttr(fieldTypes));
   return success();
+}
+
+LogicalResult CImporter::collectRecordFields(
+    const clang::RecordDecl *record,
+    SmallVectorImpl<llvm::StringRef> &fieldNames,
+    SmallVectorImpl<Type> &fieldTypes) {
+  for (const clang::FieldDecl *field : record->fields()) {
+    Location fieldLoc = translateLoc(field->getLocation());
+    if (field->isBitField())
+      return emitError(fieldLoc) << "unsupported: bit-field struct member";
+    if (field->isAnonymousStructOrUnion()) {
+      // C11 6.7.2.1p13: the members of an anonymous struct/union member
+      // are considered members of the containing structure. Recursion
+      // depth is the member nesting depth of the source, so it is bounded
+      // by the program text.
+      const clang::RecordDecl *member =
+          field->getType()->getAsRecordDecl()->getDefinition();
+      if (member->isStruct()) {
+        // Sema has already enforced that the injected spellings are
+        // unique in the parent's member namespace (a collision is a
+        // clang "member of anonymous struct redeclares" error), so the
+        // fields keep their own names.
+        if (failed(collectRecordFields(member, fieldNames, fieldTypes)))
+          return failure();
+        continue;
+      }
+      // Anonymous union member: modeled without a union type exactly
+      // when every arm flattens to a single leaf field and all leaves
+      // map to one identical type. The arms then alias one storage slot
+      // named after the first leaf, which is exact — reading any union
+      // member with the type of the last store yields that stored value
+      // (same object representation, same type). Any other shape stays
+      // in CTS-R3 territory and rejects exactly as union types do
+      // elsewhere.
+      Location unionLoc = translateLoc(member->getBeginLoc());
+      const clang::FieldDecl *storage = nullptr;
+      Type slotType;
+      for (const clang::FieldDecl *arm : member->fields()) {
+        FailureOr<const clang::FieldDecl *> leaf =
+            anonymousUnionArmLeaf(arm, unionLoc);
+        if (failed(leaf))
+          return failure();
+        Location leafLoc = translateLoc((*leaf)->getLocation());
+        FailureOr<Type> leafType = mapType((*leaf)->getType(), leafLoc);
+        if (failed(leafType))
+          return failure();
+        if (!storage) {
+          if (isRustKeyword((*leaf)->getName()))
+            return emitError(leafLoc)
+                   << "unsupported: struct member '" << (*leaf)->getName()
+                   << "' is a Rust keyword";
+          storage = *leaf;
+          slotType = *leafType;
+          fieldNames.push_back(storage->getName());
+          fieldTypes.push_back(slotType);
+          continue;
+        }
+        if (*leafType != slotType)
+          return emitError(unionLoc) << "unsupported: union type";
+        unionSlotStorage[*leaf] = storage;
+      }
+      if (!storage) // An empty anonymous union has no representable slot.
+        return emitError(unionLoc) << "unsupported: union type";
+      continue;
+    }
+    if (field->getName().empty())
+      return emitError(fieldLoc) << "unsupported: unnamed struct member";
+    if (isRustKeyword(field->getName()))
+      return emitError(fieldLoc) << "unsupported: struct member '"
+                                 << field->getName() << "' is a Rust keyword";
+    FailureOr<Type> fieldType = mapType(field->getType(), fieldLoc);
+    if (failed(fieldType))
+      return failure();
+    fieldNames.push_back(field->getName());
+    fieldTypes.push_back(*fieldType);
+  }
+  return success();
+}
+
+FailureOr<const clang::FieldDecl *>
+CImporter::anonymousUnionArmLeaf(const clang::FieldDecl *arm,
+                                 Location unionLoc) {
+  Location armLoc = translateLoc(arm->getLocation());
+  if (arm->isBitField())
+    return emitError(armLoc) << "unsupported: bit-field struct member";
+  if (!arm->isAnonymousStructOrUnion()) {
+    if (arm->getName().empty())
+      return emitError(armLoc) << "unsupported: unnamed struct member";
+    return arm;
+  }
+  // A nested anonymous struct arm contributes exactly its own flattened
+  // fields; single-slot aliasing admits it only when that is one leaf.
+  // (A nested anonymous union arm with several arms of its own is
+  // conservatively rejected the same way.)
+  const clang::RecordDecl *record =
+      arm->getType()->getAsRecordDecl()->getDefinition();
+  const clang::FieldDecl *leaf = nullptr;
+  for (const clang::FieldDecl *inner : record->fields()) {
+    if (leaf) // A second field: the arm is wider than one slot.
+      return emitError(unionLoc) << "unsupported: union type";
+    FailureOr<const clang::FieldDecl *> innerLeaf =
+        anonymousUnionArmLeaf(inner, unionLoc);
+    if (failed(innerLeaf))
+      return failure();
+    leaf = *innerLeaf;
+  }
+  if (!leaf) // An empty arm has no slot to alias.
+    return emitError(unionLoc) << "unsupported: union type";
+  return leaf;
+}
+
+llvm::StringRef
+CImporter::flattenedFieldName(const clang::FieldDecl *field) const {
+  auto storage = unionSlotStorage.find(field);
+  return storage == unionSlotStorage.end() ? field->getName()
+                                           : storage->second->getName();
 }
 
 std::string
@@ -4032,11 +4229,27 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
       return emitError(loc)
              << "unsupported: global initializer for this type";
     ArrayAttr fieldTypes = structDef.getFieldTypes();
+    SmallVector<Attribute> fields;
+    fields.reserve(fieldTypes.size());
+    // An imported record converts field by field along the C structure,
+    // which resolves flattened anonymous members; the struct_def's
+    // flattened type list is consumed in step. Synthesized struct_defs
+    // (owner structs, which never carry a C initializer in practice)
+    // have no record and keep the positional conversion.
+    if (const clang::RecordDecl *record =
+            structDefRecords.lookup(structType.getName())) {
+      unsigned typeIndex = 0;
+      if (failed(convertRecordAPValue(value, record, fieldTypes, typeIndex,
+                                      fields, loc)))
+        return failure();
+      if (typeIndex != fieldTypes.size() || fields.size() != fieldTypes.size())
+        return emitError(loc)
+               << "unsupported: global initializer does not match its type";
+      return Attribute(builder.getArrayAttr(fields));
+    }
     if (value.getStructNumFields() != fieldTypes.size())
       return emitError(loc)
              << "unsupported: global initializer does not match its type";
-    SmallVector<Attribute> fields;
-    fields.reserve(fieldTypes.size());
     for (auto [i, fieldType] : llvm::enumerate(fieldTypes)) {
       FailureOr<Attribute> field = convertAPValueInit(
           value.getStructField(i),
@@ -4048,6 +4261,92 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
     return Attribute(builder.getArrayAttr(fields));
   }
   return emitError(loc) << "unsupported: global initializer for this type";
+}
+
+LogicalResult CImporter::convertRecordAPValue(
+    const clang::APValue &value, const clang::RecordDecl *record,
+    ArrayAttr fieldTypes, unsigned &typeIndex,
+    SmallVectorImpl<Attribute> &fields, Location loc) {
+  if (!value.isStruct())
+    return emitError(loc)
+           << "unsupported: global initializer does not match its type";
+  unsigned valueIndex = 0;
+  for (const clang::FieldDecl *field : record->fields()) {
+    if (valueIndex >= value.getStructNumFields())
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
+    const clang::APValue &fieldValue = value.getStructField(valueIndex++);
+    if (field->isAnonymousStructOrUnion()) {
+      const clang::RecordDecl *member =
+          field->getType()->getAsRecordDecl()->getDefinition();
+      if (member->isUnion()) {
+        if (typeIndex >= fieldTypes.size())
+          return emitError(loc)
+                 << "unsupported: global initializer does not match its type";
+        Type slotType =
+            llvm::cast<TypeAttr>(fieldTypes[typeIndex++]).getValue();
+        FailureOr<Attribute> slot =
+            convertAnonymousSlotInit(fieldValue, member, slotType, loc);
+        if (failed(slot))
+          return failure();
+        fields.push_back(*slot);
+        continue;
+      }
+      if (failed(convertRecordAPValue(fieldValue, member, fieldTypes,
+                                      typeIndex, fields, loc)))
+        return failure();
+      continue;
+    }
+    if (typeIndex >= fieldTypes.size())
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
+    Type fieldType = llvm::cast<TypeAttr>(fieldTypes[typeIndex++]).getValue();
+    FailureOr<Attribute> attr =
+        convertAPValueInit(fieldValue, fieldType, loc);
+    if (failed(attr))
+      return failure();
+    fields.push_back(*attr);
+  }
+  return success();
+}
+
+FailureOr<Attribute>
+CImporter::convertAnonymousSlotInit(const clang::APValue &value,
+                                    const clang::RecordDecl *record,
+                                    Type slotType, Location loc) {
+  if (record->isUnion()) {
+    if (!value.isUnion())
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
+    const clang::FieldDecl *active = value.getUnionField();
+    if (!active) {
+      // No arm was initialized: the slot takes its zero value, matching
+      // C's zero-fill of static storage.
+      Attribute zero = builder.getZeroAttr(slotType);
+      if (!zero)
+        return emitError(loc)
+               << "unsupported: global initializer does not match its type";
+      return zero;
+    }
+    if (active->isAnonymousStructOrUnion())
+      return convertAnonymousSlotInit(
+          value.getUnionValue(),
+          active->getType()->getAsRecordDecl()->getDefinition(), slotType,
+          loc);
+    return convertAPValueInit(value.getUnionValue(), slotType, loc);
+  }
+  // A nested anonymous struct on the slot path has exactly one field
+  // (`anonymousUnionArmLeaf` admitted the arm); descend into it.
+  if (!value.isStruct() || value.getStructNumFields() == 0)
+    return emitError(loc)
+           << "unsupported: global initializer does not match its type";
+  const clang::FieldDecl *only = *record->field_begin();
+  const clang::APValue &fieldValue = value.getStructField(0);
+  if (only->isAnonymousStructOrUnion())
+    return convertAnonymousSlotInit(
+        fieldValue, only->getType()->getAsRecordDecl()->getDefinition(),
+        slotType, loc);
+  return convertAPValueInit(fieldValue, slotType, loc);
 }
 
 const GlobalInfo *CImporter::lookupGlobal(const clang::ValueDecl *decl) const {
@@ -5068,29 +5367,66 @@ CImporter::emitAggregateInitList(Value place, Type type,
     const clang::RecordDecl *record = list->getType()->getAsRecordDecl();
     if (!record) // Defensive; a struct-typed list always has a record.
       return emitError(loc) << "unsupported: aggregate initializer";
-    unsigned index = 0;
-    for (const clang::FieldDecl *field : record->fields()) {
-      if (index >= list->getNumInits())
-        break; // Remaining fields keep their default (zero) value.
-      const clang::Expr *element = list->getInit(index++);
-      if (llvm::isa<clang::ImplicitValueInitExpr>(element))
-        continue;
-      Location elementLoc = translateLoc(element->getBeginLoc());
-      FailureOr<Type> fieldType = mapType(field->getType(), elementLoc);
-      if (failed(fieldType))
-        return failure();
-      Value fieldPlace = builder
-                             .create<emitrust::MemberOp>(
-                                 elementLoc,
-                                 emitrust::LValueType::get(*fieldType), place,
-                                 builder.getStringAttr(field->getName()))
-                             .getResult();
-      if (failed(emitInitListElement(fieldPlace, *fieldType, element)))
-        return failure();
-    }
-    return success();
+    return emitRecordInitFields(place, record, list);
   }
   return emitError(loc) << "unsupported: aggregate initializer";
+}
+
+LogicalResult
+CImporter::emitRecordInitFields(Value place, const clang::RecordDecl *record,
+                                const clang::InitListExpr *list) {
+  // Nested lists reached through anonymous members arrive directly (not
+  // via emitAggregateInitList), so normalize to the semantic form here
+  // too; it is a no-op for a list that already is one.
+  if (const clang::InitListExpr *semantic = list->getSemanticForm())
+    list = semantic;
+  if (record->isUnion()) {
+    // A flattened anonymous union member: Sema records the single arm the
+    // list initializes; its value lands on the aliased storage slot. A
+    // list initializing no arm leaves the slot's default (zero) value.
+    const clang::FieldDecl *active = list->getInitializedFieldInUnion();
+    if (!active || list->getNumInits() == 0)
+      return success();
+    return emitRecordInitField(place, active, list->getInit(0));
+  }
+  unsigned index = 0;
+  for (const clang::FieldDecl *field : record->fields()) {
+    if (index >= list->getNumInits())
+      break; // Remaining fields keep their default (zero) value.
+    const clang::Expr *element = list->getInit(index++);
+    if (llvm::isa<clang::ImplicitValueInitExpr>(element))
+      continue;
+    if (failed(emitRecordInitField(place, field, element)))
+      return failure();
+  }
+  return success();
+}
+
+LogicalResult CImporter::emitRecordInitField(Value place,
+                                             const clang::FieldDecl *field,
+                                             const clang::Expr *element) {
+  Location elementLoc = translateLoc(element->getBeginLoc());
+  if (field->isAnonymousStructOrUnion()) {
+    // The anonymous member's fields live inline in the parent place; its
+    // nested list (the semantic form always materializes one) recurses
+    // onto that same place.
+    const auto *nested = llvm::dyn_cast<clang::InitListExpr>(element);
+    if (!nested)
+      return emitError(elementLoc)
+             << "unsupported: aggregate initializer element";
+    return emitRecordInitFields(
+        place, field->getType()->getAsRecordDecl()->getDefinition(), nested);
+  }
+  FailureOr<Type> fieldType = mapType(field->getType(), elementLoc);
+  if (failed(fieldType))
+    return failure();
+  Value fieldPlace = builder
+                         .create<emitrust::MemberOp>(
+                             elementLoc, emitrust::LValueType::get(*fieldType),
+                             place,
+                             builder.getStringAttr(flattenedFieldName(field)))
+                         .getResult();
+  return emitInitListElement(fieldPlace, *fieldType, element);
 }
 
 LogicalResult CImporter::emitInitListElement(Value place, Type type,
@@ -9372,13 +9708,20 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
     auto baseType = llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
     if (!baseType || !llvm::isa<emitrust::StructType>(baseType.getValueType()))
       return emitError(loc) << "unsupported member access base";
+    // C11 6.7.2.1p13: an anonymous member's fields were flattened into
+    // the parent struct_def (see `collectRecordFields`), so the implicit
+    // intermediate access Sema synthesizes for `parent.leaf` designates
+    // the parent place itself; the leaf below then selects its flattened
+    // (possibly union-slot-aliased) name on that place.
+    if (field->isAnonymousStructOrUnion())
+      return basePlace;
     FailureOr<Type> fieldType = mapType(field->getType(), loc);
     if (failed(fieldType))
       return failure();
     return builder
-        .create<emitrust::MemberOp>(loc, emitrust::LValueType::get(*fieldType),
-                                    basePlace,
-                                    builder.getStringAttr(field->getName()))
+        .create<emitrust::MemberOp>(
+            loc, emitrust::LValueType::get(*fieldType), basePlace,
+            builder.getStringAttr(flattenedFieldName(field)))
         .getResult();
   }
 
