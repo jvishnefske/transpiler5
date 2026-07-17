@@ -415,9 +415,10 @@ public:
   /// `tuTag` is prepended to internal-linkage (`static`) symbol names so that
   /// identically named file-statics in different translation units stay
   /// distinct; it is empty for a single-TU import (bare names, historical
-  /// behavior). `deferExtern` controls whether an `extern`-only global with no
-  /// definition in this TU is an immediate error (single-file) or deferred for
-  /// cross-TU resolution (project). `soleTranslationUnit` states that this TU
+  /// behavior). `deferExtern` controls whether a referenced `extern`-only
+  /// global with no definition in this TU is an immediate error (single-file)
+  /// or deferred for cross-TU resolution (project); unreferenced ones are
+  /// skipped either way. `soleTranslationUnit` states that this TU
   /// is the whole program, which lets the Phase-4 owner planning promote
   /// externally visible functions to methods (all their call sites are
   /// provably in this TU); in a multi-TU project only internal-linkage
@@ -428,9 +429,11 @@ public:
 
   /// After every translation unit has been imported, checks that no external
   /// symbol was left unresolved: every deferred `extern` global must have a
-  /// definition, and no non-variadic external function may remain body-less
-  /// (the Rust emitter cannot emit a body-less function). Emits located
-  /// diagnostics otherwise.
+  /// definition, and no referenced non-variadic external function may remain
+  /// body-less (the Rust emitter cannot emit a body-less function); external
+  /// functions whose symbol has no uses are erased instead of rejected.
+  /// Rejections are located at the symbol's first use site (falling back to
+  /// its declaration).
   LogicalResult finalizeProject();
 
 private:
@@ -441,6 +444,12 @@ private:
   /// Converts a clang source location to an MLIR `FileLineColLoc` using the
   /// presumed (user-visible) location; unknown on invalid input.
   Location translateLoc(clang::SourceLocation sourceLoc);
+
+  /// The location of the first IR use of `symbol` anywhere in the module,
+  /// or `fallback` when the symbol has no uses. Locates the
+  /// referenced-but-undefined rejections of `finalizeProject` at the use
+  /// site rather than at the declaration.
+  Location firstSymbolUseLoc(llvm::StringRef symbol, Location fallback);
 
   /// True when `decl`'s expansion location lies in a system header (an
   /// angle-bracket include or an `-isystem` search path). Such declarations
@@ -545,7 +554,9 @@ private:
 
   /// Imports a function declaration or definition as a `func.func`. C
   /// `main` is renamed to `c_main`. Body-less variadic declarations (such
-  /// as printf's) are skipped; variadic definitions are rejected. A body
+  /// as printf's) are skipped; variadic definitions are rejected. A
+  /// body-less prototype with no definition in this TU is skipped when
+  /// nothing in this TU references it (referenced-only policy). A body
   /// replaces a previously imported body-less declaration of the same name.
   LogicalResult importFunction(const clang::FunctionDecl *func);
 
@@ -591,8 +602,11 @@ private:
   /// Imports a file-scope variable as a module-level `emitrust.global`.
   /// Redeclarations are reconciled the way C does: the definition (or a
   /// tentative definition) provides the type and, through
-  /// `getAnyInitializer`, the initializer; a variable that is only ever
-  /// `extern`-declared in this TU is rejected. Thread-locals are rejected.
+  /// `getAnyInitializer`, the initializer. A variable that is only ever
+  /// `extern`-declared in this TU is skipped when nothing references it
+  /// (referenced-only policy); when referenced it is deferred for cross-TU
+  /// resolution (project import) or rejected (single-file import).
+  /// Thread-locals are rejected.
   LogicalResult importGlobalVar(const clang::VarDecl *var);
 
   /// Creates the `emitrust.global` named `symbolName` for the declaration
@@ -2385,6 +2399,12 @@ LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   // `extern`-declared has no storage in this translation unit; a tentative
   // definition (`int g;`) behaves as a zero-initialized definition.
   if (var->hasDefinition() == clang::VarDecl::DeclarationOnly) {
+    // Referenced-only import of main-file extern declarations (the same
+    // policy system-header declarations follow, C99-39): an extern object
+    // that nothing in this TU references demands no storage anywhere and
+    // imports nothing.
+    if (!var->isReferenced())
+      return success();
     if (!deferExternGlobals)
       return emitError(loc) << "unsupported: extern global variable without a "
                                "definition in this translation unit";
@@ -2716,6 +2736,16 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   // and never reference the symbol, and a body-less function would
   // otherwise be rejected by `finalizeProject`.
   if ((cName == "puts" || cName == "putchar") && !func->getDefinition())
+    return success();
+
+  // Referenced-only import of main-file prototypes (the same policy
+  // system-header declarations follow, C99-39): a body-less prototype with
+  // no definition in this TU that nothing in this TU references demands no
+  // definition and imports nothing — not even its signature types. A
+  // referenced prototype is still imported, and `finalizeProject` rejects
+  // it at the use site if no translation unit supplies the body.
+  if (!func->isThisDeclarationADefinition() && !func->getDefinition() &&
+      !func->isReferenced())
     return success();
 
   bool isDefinition = func->isThisDeclarationADefinition();
@@ -6456,25 +6486,46 @@ FailureOr<Value> CImporter::extendBool(Location loc, Value flag,
   return builder.create<arith::ExtUIOp>(loc, *target, flag).getResult();
 }
 
+Location CImporter::firstSymbolUseLoc(llvm::StringRef symbol,
+                                      Location fallback) {
+  std::optional<SymbolTable::UseRange> uses = SymbolTable::getSymbolUses(
+      StringAttr::get(module.getContext(), symbol), module.getOperation());
+  if (uses)
+    for (SymbolTable::SymbolUse use : *uses)
+      return use.getUser()->getLoc();
+  return fallback;
+}
+
 LogicalResult CImporter::finalizeProject() {
-  // Every deferred `extern` global reference must have a real definition in
-  // some translation unit; the Rust program otherwise reads an undefined
-  // symbol.
+  // Every deferred `extern` global that was referenced must have a real
+  // definition in some translation unit; the Rust program otherwise reads
+  // an undefined symbol. Unreferenced extern declarations were skipped at
+  // import (referenced-only policy), so a pending entry without a
+  // definition is rejected at its first use site (falling back to the
+  // declaration when no IR use survives).
   for (const auto &entry : pendingExternGlobals)
     if (!SymbolTable::lookupSymbolIn(module, entry.getKey()))
-      return emitError(entry.getValue())
+      return emitError(firstSymbolUseLoc(entry.getKey(), entry.getValue()))
              << "unsupported: extern global variable '" << entry.getKey()
              << "' is referenced but not defined in any translation unit";
 
-  // No non-variadic external function may remain body-less: the Rust emitter
-  // cannot emit a body-less function. (Variadic prototypes such as printf were
-  // never added to the module, so any external func here is a genuine
-  // undefined reference.)
-  for (func::FuncOp func : module.getOps<func::FuncOp>())
-    if (func.isExternal())
-      return emitError(func.getLoc())
+  // No referenced non-variadic external function may remain body-less: the
+  // Rust emitter cannot emit a body-less function. (Variadic prototypes such
+  // as printf were never added to the module.) An external func whose symbol
+  // ended up with no uses (e.g. a prototype referenced only in an
+  // unevaluated context) demands no definition and is erased instead.
+  for (func::FuncOp func :
+       llvm::make_early_inc_range(module.getOps<func::FuncOp>()))
+    if (func.isExternal()) {
+      if (SymbolTable::symbolKnownUseEmpty(func.getOperation(),
+                                           module.getOperation())) {
+        func.erase();
+        continue;
+      }
+      return emitError(firstSymbolUseLoc(func.getSymName(), func.getLoc()))
              << "unsupported: function '" << func.getSymName()
              << "' is referenced but not defined in any translation unit";
+    }
   return success();
 }
 

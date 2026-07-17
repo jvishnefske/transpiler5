@@ -856,13 +856,21 @@ observed when C99-33 + C99-47 together unlocked 00215).
   E0308. Rename the binder to a reserved identifier (e.g. `__tl`).
   These are the only three tests that transpile but fail rustc.
   (00127.c, 00128.c, 00142.c)
-- [ ] CTS-F2 (3) Unreferenced main-file declarations must not demand
+- [x] CTS-F2 (3) Unreferenced main-file declarations must not demand
   definitions: `extern int x;` or a repeated prototype `int foo(void);`
   that is never referenced currently rejects with "referenced but not
   defined in any translation unit" even though nothing references it.
   Apply the C99-39 referenced-only policy to main-file prototypes and
   extern objects: skip if unreferenced, reject at the use site otherwise.
   (00094.c, 00108.c, 00162.c)
+  Done: importFunction/importGlobalVar skip a body-less prototype or
+  extern-only object whose redeclaration chain is unreferenced (before
+  signature mapping, so unsupported shapes in dead prototypes cannot
+  reject either); finalizeProject erases use-free external funcs and
+  locates the referenced-but-undefined rejection at the first use site.
+  Ledger 150 -> 153, zero miscompiles.
+  (test/Import/C/unreferenced-extern-global.c, unreferenced-prototype.c,
+  multi-tu-undefined-extern-global.c)
 - [ ] CTS-S3 (1) Block-scope function prototypes (`int f1(char *);`
   inside a function body): hoist the declaration to module scope and
   continue; currently "unsupported declaration inside a function body".
