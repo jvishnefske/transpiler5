@@ -793,8 +793,25 @@ rule.
   stays an ordinary call, and every other math function keeps the
   system-header rejection with a located diagnostic (the natural
   extension point is the `hostedMathCallee` table in ImportC.cpp).
-  (test/Import/C/strings.c, strings-invalid.c, math.c,
-  test/EndToEnd/strings.c, math-sin.c)
+  string.h (CTS-L1): definition-less strcpy/strncpy/strcat/memset/memcpy
+  lower by name in statement position, strcmp/strncmp/memcmp and strlen
+  in value position, and strchr/strrchr where a printf %s argument or a
+  null-pointer comparison consumes the result — each to a one-per-module
+  safe Rust helper over `&[i8]`/`&mut [i8]` slices of the argument's
+  char region (a char array, a string-literal backing, or a pointer into
+  either), so every access is a bounds-checked slice index with no
+  unsafe. Comparison helpers compare as unsigned char per C;
+  strchr/strrchr return the found index or -1 (C's NULL), which %s
+  offsets into the region and null comparisons test directly;
+  same-object memcpy borrows the array mutably once and passes both
+  cursors (`copy_within`, refining C's undefined overlap). Copy results
+  are statement-position only, a copy source sharing the destination's
+  object, literal-region destinations, and uncurated functions (strstr,
+  strtok, ...) keep located rejections; the helper namespace
+  `__emitrust_*` is reserved.
+  (test/Import/C/strings.c, strings-invalid.c, strings-hosted.c,
+  strings-hosted-invalid.c, math.c, test/EndToEnd/strings.c,
+  strings-hosted.c, math-sin.c)
 
 Where an item above concludes in a documented rejection (varargs
 definitions, irreducible goto, _Complex, and similar), that rejection with
@@ -860,8 +877,8 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 178 passed / 0 miscompiled /
-42 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-17: 220 total / 180 passed / 0 miscompiled /
+40 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5 partials, and
 CTS-S1/S4/P1/R1/R4 landed since). Every one of the 42 is a located
 build-time rejection — never wrong output.
@@ -1137,9 +1154,22 @@ observed when C99-33 + C99-47 together unlocked 00215).
 
 ### Hosted library surface (5 tests)
 
-- [ ] CTS-L1 (2) string.h subset — at least `strcpy` into a char array
+- [x] CTS-L1 (2) string.h subset — at least `strcpy` into a char array
   (C99-48): safe helper over `&mut [i8]` mirroring `__emitrust_cstr`;
   bounds are compile-time known array sizes, so no unsafe needed.
+  DONE: definition-less strcpy/strncpy/strcat/memset/memcpy (statement
+  position), strcmp/strncmp/memcmp (value position), strlen widened to
+  char arrays, and strchr/strrchr (feeding printf %s and null
+  comparisons via a found-index-or-minus-1 lowering) all lower by name
+  to one-per-module safe helpers over `&[i8]`/`&mut [i8]` slices of the
+  argument regions; same-object memcpy takes one mutable borrow plus two
+  cursors (`copy_within`), and same-object copy sources, literal-region
+  destinations, copy-result value uses, and uncurated <string.h>
+  functions (strstr, ...) keep located rejections. printf %s also gained
+  the `&arr[i]` element-pointer shape (00180.c). Both tests pass and are
+  in the ratchet manifest.
+  (test/Import/C/strings-hosted.c, strings-hosted-invalid.c,
+  test/EndToEnd/strings-hosted.c)
   (00179.c, 00180.c)
 - [ ] CTS-L2 (1) printf %s of a `char *` function parameter: extend the
   C99-28 %s shapes to accept the FR-28 `mut_ref<slice<i8>>` parameter
