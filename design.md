@@ -1036,6 +1036,35 @@ observed when C99-33 + C99-47 together unlocked 00215).
   problem as CTS-P4; a global array base must be readable/writable
   through an index cursor without holding a borrow across statements.
   (00181.c, 00217.c)
+  (Partial: a LOCAL pointer bound into a global aggregate (decay,
+  `&garr[i]`, or `&gx`) now decomposes exactly like any Phase-1a local —
+  its cursor stays a local i64 cell, so no borrow of the global is ever
+  stored — and every element access through it goes through the CTS-P4
+  staged-copy machinery: reads stage the global's whole value and
+  subscript the copy; write contexts thread `GlobalWriteback` through
+  `emitPointerPlace` and store the modified copy back, so a write
+  through the pointer is visible to the next direct global access and
+  vice versa (exact for the single-threaded subset, same one-statement
+  last-writer-wins corner as direct global element writes). Static-local
+  bases get the same treatment (they share the globals map). Passing
+  such a pointer to a function stays rejected at the call site — the
+  argument would borrow the staged copy, not the global (the CTS-P4
+  staged-copy coherence hazard) — as do escapes. Neither suite test
+  passes yet, each on an out-of-scope shape: 00181.c rejects at
+  "00181.c:117:4: error: unsupported: passing a pointer into a global
+  variable to a function" (`Hanoi(N,A,B,C)` passes the global arrays
+  into functions whose parameters also range over B and C — the staged-
+  copy argument hazard plus CTS-P7 multi-object parameter regions);
+  00217.c rejects at "00217.c:11:6: error: unsupported pointer
+  expression: CStyleCastExpr" (`*(unsigned*)(data + r)` type-puns four
+  chars of the global as an unsigned — a reinterpreting pointer cast,
+  outside any CTS-P item). Ledger unchanged at 188 passed /
+  32 unsupported / 0 miscompiled.
+  (test/Import/C/pointers-into-global.c; staged-copy coherence-hazard
+  rejection pinned in pointers-local-invalid.c GLOBAL case;
+  rustc-level differential test/EndToEnd/pointers-into-global.c
+  interleaving pointer writes with direct global reads, direct writes
+  with pointer reads, and callee global writes between pointer uses)
 - [ ] CTS-P7 (2) One pointer ranging over several objects (`p = &x;
   ... p = &y;`): PointerRegionAnalysis unions the objects into one
   region today and rejects; needs either region materialization (copy

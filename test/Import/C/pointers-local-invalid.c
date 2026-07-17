@@ -58,16 +58,22 @@ int main(void) {
   return 0;
 }
 
-// A pointer into a global would dangle from the staged-copy global access
-// model.
-// GLOBAL: into-global.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer into a global variable
+// A local pointer into a global aggregate is supported (CTS-P6) for
+// direct reads and writes through the staged-copy model, but passing it
+// to a function stays rejected: the argument would borrow the staged
+// local copy, not the global itself, so a callee that also touches the
+// global would observe (or lose) the wrong values — the staged-copy
+// coherence hazard.
+// GLOBAL: into-global.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: passing a pointer into a global variable to a function
 
 //--- into-global.c
 static int garr[4];
 
+static int first(int *p) { return p[0]; }
+
 int main(void) {
   int *p = garr;
-  return p[0];
+  return first(p);
 }
 
 // A null pointer constant is modeled only where the CTS-P8
