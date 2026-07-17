@@ -31,3 +31,25 @@ func.func @iter_args_loop(%lb: index, %ub: index, %step: index,
   }
   return %0 : i32
 }
+
+// A swapping iter_args back-edge is a copy cycle: the yield sources are
+// staged into immutable temporaries before any iteration let is assigned
+// (the lost-copy problem of sequential rebinding).
+// CHECK-LABEL: func.func @swap_iter_args
+// CHECK:         %[[A:.*]] = emitrust.let mut %arg3 : i32
+// CHECK:         %[[B:.*]] = emitrust.let mut %arg4 : i32
+// CHECK:         emitrust.for %{{.*}} = %arg0 to %arg1 step %arg2 {
+// CHECK-NEXT:      %[[TA:.*]] = emitrust.let %[[B]] : i32
+// CHECK-NEXT:      %[[TB:.*]] = emitrust.let %[[A]] : i32
+// CHECK-NEXT:      emitrust.assign %[[A]] = %[[TA]] : i32
+// CHECK-NEXT:      emitrust.assign %[[B]] = %[[TB]] : i32
+// CHECK:         }
+// CHECK:         return %[[A]], %[[B]] : i32, i32
+func.func @swap_iter_args(%lb: index, %ub: index, %step: index,
+                          %ia: i32, %ib: i32) -> (i32, i32) {
+  %0:2 = scf.for %i = %lb to %ub step %step
+      iter_args(%a = %ia, %b = %ib) -> (i32, i32) {
+    scf.yield %b, %a : i32, i32
+  }
+  return %0#0, %0#1 : i32, i32
+}

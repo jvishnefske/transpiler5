@@ -275,6 +275,25 @@ lists the lit test file(s) that validate it.
   test/Import/C/keywords-invalid.c, printf-invalid.c, printf.c,
   test/Conversion/ArithToEmitRust/arith-to-emitrust.mlir,
   unsigned-invalid.mlir, test/Target/Rust/match.mlir)
+  A later real-world probe over TheAlgorithms/C found a fifth silent
+  miscompile class that had survived all 200 ledger vectors: the lost-copy
+  problem of SSA destruction. Loop back-edges rebind all scf block
+  arguments in parallel, but the SCF-to-EmitRust yield lowering emitted
+  the rebinding as sequential Rust assignments, so a loop-carried copy
+  cycle (the Fibonacci rotation in searching/fibonacci_search.c, and any
+  swap) read a freshly clobbered carried variable. Fixed in the shared
+  assignment helper of the SCF conversion: when any yielded source aliases
+  a carried let written earlier in the sequence, every source is staged
+  into a fresh immutable temporary before any carried let is assigned
+  (parallel-assignment semantics); hazard-free back-edges keep the direct
+  form. New adversarial rotation vectors cover the 2-cycle swap, the
+  3-variable Fibonacci rotation, a partial cycle among non-cycling
+  updates, a rotation mixed with independent accumulators, nested loops
+  rotating at both levels, and a rotation feeding a data-dependent branch;
+  each differentially fails against the pre-fix compiler.
+  (test/EndToEnd/lostcopy-min.c, lostcopy-rotations.c,
+  lostcopy-nested-branch.c, test/Conversion/SCFToEmitRust/while.mlir,
+  for.mlir, test/Target/Rust/loop.mlir)
 - [x] FR-26 Multiple translation units: emitrust-cc accepts several C files
   and merges them into one flat crate. External functions and globals are
   unified across translation units (a prototype in one file resolves to a
