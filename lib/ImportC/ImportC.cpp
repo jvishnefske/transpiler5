@@ -547,6 +547,10 @@ private:
   /// `main` is renamed to `c_main`. Body-less variadic declarations (such
   /// as printf's) are skipped; variadic definitions are rejected. A body
   /// replaces a previously imported body-less declaration of the same name.
+  /// Block-scope prototypes (which C gives external linkage) are imported
+  /// through this same path by `emitStmt`; the module-scope insertion point
+  /// is guarded, so a mid-body call leaves the caller's insertion point
+  /// untouched.
   LogicalResult importFunction(const clang::FunctionDecl *func);
 
   /// Records every local variable whose address is taken with `&x` inside
@@ -710,7 +714,10 @@ private:
   /// the supported statement kinds and rejects the rest with a located
   /// diagnostic. C labels start their mapped block (see `getLabelBlock`)
   /// and `goto` emits a `cf.br` to it followed by a fresh block for any
-  /// trailing code; computed goto is rejected.
+  /// trailing code; computed goto is rejected. Block-scope function
+  /// prototypes have external linkage and are hoisted to module scope
+  /// through `importFunction`; other unsupported block-scope declarations
+  /// are rejected.
   LogicalResult emitStmt(const clang::Stmt *stmt);
 
   /// Emits a local variable declaration. Signed scalars become entry-block
@@ -3192,6 +3199,18 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
       if (const auto *enumDecl = llvm::dyn_cast<clang::EnumDecl>(decl)) {
         if (failed(
                 importEnum(enumDecl, translateLoc(enumDecl->getBeginLoc()))))
+          return failure();
+        continue;
+      }
+      if (const auto *funcDecl = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+        // A block-scope function declaration has external linkage
+        // (C11 6.2.2p5), so it is hoisted to module scope and imported
+        // through the same path as a file-scope prototype (including the
+        // body-less-function check in `finalizeProject`). It is always a
+        // prototype: clang rejects nested function definitions before the
+        // importer runs. `importFunction` guards the builder's insertion
+        // point, so emission resumes in the current block afterwards.
+        if (failed(importFunction(funcDecl)))
           return failure();
         continue;
       }
