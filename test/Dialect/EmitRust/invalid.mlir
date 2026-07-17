@@ -512,3 +512,20 @@ emitrust.func @impl_not_at_module_level() {
   }
   emitrust.return
 }
+
+// -----
+
+// A slice never views runs of rows: nested arrays are valid array elements
+// but invalid slice elements.
+emitrust.func @slice_of_array_element(
+    // expected-error @+2 {{invalid slice element type '!emitrust.array<4xi8>'}}
+    // expected-error @+1 {{failed to parse EmitRust_MutRefType parameter 'pointee'}}
+    %arg0: !emitrust.mut_ref<!emitrust.slice<!emitrust.array<4xi8>>>) {
+  emitrust.return
+}
+
+// -----
+
+// A nested aggregate initializer must match every level's extent.
+// expected-error @+1 {{aggregate init has 3 elements, but the array type '!emitrust.array<4xi8>' has 4}}
+emitrust.global @ragged <[[0 : i8, 1 : i8, 2 : i8], [3 : i8, 4 : i8, 5 : i8]]> : !emitrust.array<2x!emitrust.array<4xi8>>

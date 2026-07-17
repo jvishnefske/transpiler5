@@ -6,12 +6,13 @@
 //
 /// \file
 /// Implements the EmitRust dialect types: the opaque type's verifier, the
-/// lvalue nesting rule, the one-dimensional array type with its custom
-/// `NxT` parser/printer and element-type verifier, the dynamically sized
-/// slice type (sharing the array element rules), the nullable function
-/// pointer type with its custom `(A, B) -> R` parser/printer and
-/// component-type verifier, the named struct and enum reference types, and
-/// the generated type parser/printer definitions.
+/// lvalue nesting rule, the fixed-size array type (nesting for C
+/// multi-dimensional arrays) with its custom `NxT` parser/printer and
+/// element-type verifier, the dynamically sized slice type (scalar or
+/// struct elements only), the nullable function pointer type with its
+/// custom `(A, B) -> R` parser/printer and component-type verifier, the
+/// named struct and enum reference types, and the generated type
+/// parser/printer definitions.
 //
 //===----------------------------------------------------------------------===//
 
@@ -69,14 +70,16 @@ LogicalResult emitrust::LValueType::verify(
 //===----------------------------------------------------------------------===//
 
 /// Returns whether `type` may be used as an array element type: a scalar
-/// (integer, index, f32, f64) or an EmitRust struct type. Nested arrays,
-/// lvalues, references, and opaque types are rejected.
+/// (integer, index, f32, f64), an EmitRust struct type, or a nested
+/// EmitRust array type (a C multi-dimensional array is an array of
+/// arrays). Lvalues, slices, references, and opaque types are rejected.
 bool emitrust::ArrayType::isValidElementType(Type type) {
   return llvm::isa<IntegerType, IndexType, Float32Type, Float64Type,
-                   emitrust::StructType>(type);
+                   emitrust::StructType, emitrust::ArrayType>(type);
 }
 
-/// Parses the one-dimensional array syntax `!emitrust.array<NxT>`.
+/// Parses the array syntax `!emitrust.array<NxT>`, where `T` may itself be
+/// a nested `!emitrust.array` type.
 Type emitrust::ArrayType::parse(AsmParser &parser) {
   if (parser.parseLess())
     return Type();
@@ -107,7 +110,8 @@ Type emitrust::ArrayType::parse(AsmParser &parser) {
                                       elementType);
 }
 
-/// Prints the one-dimensional array syntax `!emitrust.array<NxT>`.
+/// Prints the array syntax `!emitrust.array<NxT>`; a nested array element
+/// prints as a full `!emitrust.array<...>` type.
 void emitrust::ArrayType::print(AsmPrinter &printer) const {
   printer << "<" << getSize() << 'x';
   printer.printType(getElementType());
@@ -115,7 +119,8 @@ void emitrust::ArrayType::print(AsmPrinter &printer) const {
 }
 
 /// Verifies that the array has at least one element and a valid element
-/// type (scalar or struct; no nested arrays, lvalues, or references).
+/// type (scalar, struct, or nested array; no lvalues, slices, or
+/// references).
 LogicalResult emitrust::ArrayType::verify(
     llvm::function_ref<InFlightDiagnostic()> emitError, uint64_t size,
     Type elementType) {
@@ -130,12 +135,20 @@ LogicalResult emitrust::ArrayType::verify(
 // SliceType
 //===----------------------------------------------------------------------===//
 
-/// Verifies that the slice element type is valid: the element rules are
-/// shared with `ArrayType` (scalar or struct; no nested arrays, slices,
-/// lvalues, or references).
+/// Returns whether `type` may be used as a slice element type: a scalar
+/// (integer, index, f32, f64) or an EmitRust struct type. Unlike array
+/// elements, nested arrays are rejected: slices only ever view runs of
+/// scalar or struct elements.
+bool emitrust::SliceType::isValidElementType(Type type) {
+  return llvm::isa<IntegerType, IndexType, Float32Type, Float64Type,
+                   emitrust::StructType>(type);
+}
+
+/// Verifies that the slice element type is valid (scalar or struct; no
+/// arrays, slices, lvalues, or references).
 LogicalResult emitrust::SliceType::verify(
     llvm::function_ref<InFlightDiagnostic()> emitError, Type elementType) {
-  if (!elementType || !ArrayType::isValidElementType(elementType))
+  if (!elementType || !isValidElementType(elementType))
     return emitError() << "invalid slice element type " << elementType;
   return success();
 }

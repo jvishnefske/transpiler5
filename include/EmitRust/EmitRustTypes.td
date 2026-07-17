@@ -5,9 +5,9 @@
 //===----------------------------------------------------------------------===//
 //
 // Defines the MLIR EmitRust types: opaque Rust type strings, shared /
-// mutable references, assignable lvalues, one-dimensional arrays,
-// dynamically sized slices, nullable function pointers, and named struct
-// and enum references.
+// mutable references, assignable lvalues, fixed-size (possibly nested)
+// arrays, dynamically sized slices, nullable function pointers, and named
+// struct and enum references.
 //
 //===----------------------------------------------------------------------===//
 
@@ -134,10 +134,12 @@ def EmitRust_ArrayType : EmitRust_Type<"Array", "array"> {
   let summary = "EmitRust array type";
 
   let description = [{
-    A one-dimensional array type with a compile-time size of at least one
-    element. The element type must be a scalar (integer, index, or float) or
-    an `!emitrust.struct` type; nested arrays, lvalues, and references are
-    rejected. The type is emitted as the Rust array type `[T; N]`.
+    An array type with a compile-time size of at least one element. The
+    element type must be a scalar (integer, index, or float), an
+    `!emitrust.struct` type, or a nested `!emitrust.array` type (a C
+    multi-dimensional array is an array of arrays); lvalues, slices, and
+    references are rejected. The type is emitted as the Rust array type
+    `[T; N]`, nesting as `[[T; N]; M]`.
 
     Example:
 
@@ -146,6 +148,8 @@ def EmitRust_ArrayType : EmitRust_Type<"Array", "array"> {
     !emitrust.array<4xi32>
     // Array emitted as `[Point; 2]`
     !emitrust.array<2x!emitrust.struct<"Point">>
+    // Two-dimensional array emitted as `[[i8; 4]; 2]`
+    !emitrust.array<2x!emitrust.array<4xi8>>
     ```
   }];
 
@@ -153,7 +157,8 @@ def EmitRust_ArrayType : EmitRust_Type<"Array", "array"> {
 
   let extraClassDeclaration = [{
     /// Returns whether `type` may be used as an array element type: a
-    /// scalar (integer, index, f32, f64) or an EmitRust struct type.
+    /// scalar (integer, index, f32, f64), an EmitRust struct type, or a
+    /// nested EmitRust array type.
     static bool isValidElementType(Type type);
   }];
 
@@ -166,9 +171,10 @@ def EmitRust_SliceType : EmitRust_Type<"Slice", "slice"> {
 
   let description = [{
     A dynamically sized view of a run of elements, emitted as the Rust slice
-    type `[T]`. The element type follows the array element rules
-    (`ArrayType::isValidElementType`): a scalar (integer, index, or float)
-    or an `!emitrust.struct` type.
+    type `[T]`. The element type must be a scalar (integer, index, or
+    float) or an `!emitrust.struct` type; unlike array elements, nested
+    arrays are rejected (slices only ever view runs of scalar or struct
+    elements).
 
     Because a slice is unsized, the type is only valid behind a reference
     (`!emitrust.ref`/`!emitrust.mut_ref`, rendering `&[T]`/`&mut [T]`) or as
@@ -191,6 +197,14 @@ def EmitRust_SliceType : EmitRust_Type<"Slice", "slice"> {
       return $_get(element_type.getContext(), element_type);
     }]>
   ];
+
+  let extraClassDeclaration = [{
+    /// Returns whether `type` may be used as a slice element type: a
+    /// scalar (integer, index, f32, f64) or an EmitRust struct type.
+    /// Nested arrays are rejected.
+    static bool isValidElementType(Type type);
+  }];
+
   let assemblyFormat = "`<` qualified($element_type) `>`";
   let genVerifyDecl = 1;
 }
