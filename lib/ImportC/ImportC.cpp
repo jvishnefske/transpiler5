@@ -35,9 +35,13 @@
 ///    cursor and resolves to the scalar's own place), pointer arithmetic
 ///    becomes i64 cursor arithmetic, and same-object pointer difference and
 ///    comparison become plain i64 `arith` ops (C's ptrdiff_t is `long` on
-///    the supported targets). Pointers whose address is taken, that rebind
-///    across distinct objects, hold a null constant, or point into globals
-///    or string literals are rejected with located diagnostics.
+///    the supported targets). A `char *` bound to a string literal is a
+///    cursor into a read-only region backed by an immutable local byte
+///    array holding the literal's bytes plus the terminating NUL; writes
+///    through such a region are rejected (writing a C string literal is
+///    UB). Pointers whose address is taken, that rebind across distinct
+///    objects, hold a null constant, or point into globals are rejected
+///    with located diagnostics.
 ///  - Pointer parameters are classified per definition (Phase 1b): a
 ///    parameter that is only dereferenced or arrowed stays a scalar
 ///    reference `!emitrust.mut_ref<T>`; a parameter that is subscripted,
@@ -234,12 +238,20 @@ static bool isRustKeyword(llvm::StringRef name) {
 /// and an i64 element cursor value. `cursor` is null for a degenerate base
 /// (the address of a scalar or struct object taken with `&x`), which
 /// supports dereference but carries no element offset and hence no pointer
-/// arithmetic.
+/// arithmetic. A pointer into a string literal has no base declaration;
+/// its region is the literal's read-only backing byte array
+/// (`literalBacking`, an `!emitrust.lvalue<!emitrust.array<Nxi8>>`) and its
+/// cursor is always present.
 struct PtrExprValue {
-  /// The object the pointer points into (a local scalar, struct, or array).
+  /// The object the pointer points into (a local scalar, struct, or
+  /// array); null for a pointer into a string literal.
   const clang::VarDecl *base;
-  /// The i64 element offset from the start of `base`; null when degenerate.
+  /// The i64 element offset from the start of the region; null when
+  /// degenerate.
   Value cursor;
+  /// The read-only backing array place of a string-literal region; null
+  /// for object-based pointers.
+  Value literalBacking;
 };
 
 /// Phase-1b classification of one pointer parameter, derived from the
@@ -258,10 +270,15 @@ enum class ParamKind { ScalarRef, Slice };
 /// element offset to track); such a pointer needs no runtime state at all.
 /// A slice parameter is its own base, with its cursor initialized to zero.
 struct PointerLocalInfo {
-  /// The object every value of this pointer points into.
+  /// The object every value of this pointer points into; null for a
+  /// pointer whose region is a string literal.
   const clang::VarDecl *base;
   /// Entry-block `memref<i64>` cell holding the element cursor, or null.
   Value cursorCell;
+  /// The read-only backing array place of a string-literal region
+  /// (`!emitrust.lvalue<!emitrust.array<Nxi8>>`, holding the literal's
+  /// bytes plus the terminating NUL); null for object-based pointers.
+  Value literalBacking;
 };
 
 /// One base binding of a pointer region: the object some pointer in the
@@ -292,17 +309,33 @@ struct OwnerPlan {
 };
 
 /// The Phase-1a facts about one pointer ownership region: the distinct
-/// objects its pointers are bound to, whether any pointer arithmetic occurs
-/// (which a degenerate scalar base cannot support), and the first construct
-/// (if any) that puts the region outside the decomposition (escape, null
-/// constant, non-address source, global target, ...).
+/// objects its pointers are bound to (or the string literal that is the
+/// region's read-only base), whether any pointer arithmetic occurs (which a
+/// degenerate scalar base cannot support), whether anything is written
+/// through the region's pointers (which a read-only string-literal region
+/// cannot support), and the first construct (if any) that puts the region
+/// outside the decomposition (escape, null constant, non-address source,
+/// global target, ...).
 struct PointerRegion {
   /// Distinct base objects, each with its first binding location.
   SmallVector<PointerBaseBinding, 2> bases;
+  /// The string literal the region's pointers are bound to, making the
+  /// region a read-only `'static` byte run; null for object-based regions.
+  /// Mutually exclusive with `bases` for a consumable region.
+  const clang::StringLiteral *literalBase = nullptr;
+  /// Where the literal binding was established; meaningful only with
+  /// `literalBase`.
+  clang::SourceLocation literalLoc;
   /// True when any pointer in the region is walked (`p+n`, `++`, `+=`).
   bool hasArithmetic = false;
   /// First pointer-arithmetic site; meaningful only with `hasArithmetic`.
   clang::SourceLocation arithmeticLoc;
+  /// True when anything is written through a pointer of the region
+  /// (`*p = v`, `p[i] = v`, `*p += v`, `(*p)++`); a string-literal region
+  /// rejects at this location (writing a C string literal is UB).
+  bool hasWriteThrough = false;
+  /// First write-through site; meaningful only with `hasWriteThrough`.
+  clang::SourceLocation writeThroughLoc;
   /// First invalidating construct; meaningful only with `invalidReason`.
   clang::SourceLocation invalidLoc;
   /// Diagnostic text of the invalidating construct; empty when the region
@@ -315,15 +348,19 @@ struct PointerRegion {
 /// One AST walk (in the style of `collectAddressTaken`) unions pointers on
 /// assignment (`p = q`), binds base objects from `&x`, `&arr[i]`,
 /// array-to-pointer decay, and slice-classified pointer parameters (Phase
-/// 1b: `p = param` makes the parameter the region base), flags pointer
-/// arithmetic, and records the first construct that makes a region
+/// 1b: `p = param` makes the parameter the region base), binds string
+/// literals from their decay (`p = "..."` makes the literal the base of a
+/// read-only region), flags pointer arithmetic and writes through the
+/// region's pointers, and records the first construct that makes a region
 /// undecomposable (taking a pointer's address, null constants, non-address
-/// sources, global or string-literal targets). Base objects participate in
-/// the union-find alongside the pointers so that two pointers into the same
-/// object always share a region. The importer validates each pointer local
-/// against its region at the declaration; a region is consumable only when
-/// it is single-base and never invalidated. The per-region output is the
-/// deliberate seam for the later owner-struct codegen phases.
+/// sources, global targets). Base objects participate in the union-find
+/// alongside the pointers so that two pointers into the same object always
+/// share a region. The importer validates each pointer local against its
+/// region at the declaration; a region is consumable only when it is
+/// single-base — one object, or one string literal (whose read-only region
+/// additionally rejects write-throughs) — and never invalidated. The
+/// per-region output is the deliberate seam for the later owner-struct
+/// codegen phases.
 class PointerRegionAnalysis {
 public:
   /// Analyzes `body`, replacing any previous analysis state. `context` is
@@ -353,8 +390,9 @@ private:
 
   /// Classifies the right-hand side `rhs` of `ptr = rhs` (or of `ptr`'s
   /// initializer): unions pointer-to-pointer copies, binds bases from
-  /// address expressions, flags arithmetic on `p +- n` forms, and marks the
-  /// region invalid for everything else.
+  /// address expressions and string literals from their decay, flags
+  /// arithmetic on `p +- n` forms, and marks the region invalid for
+  /// everything else.
   void recordPointerWrite(const clang::VarDecl *ptr, const clang::Expr *rhs);
 
   /// Binds `base` into `ptr`'s region at `loc` (rejecting global-storage
@@ -362,8 +400,25 @@ private:
   void addBase(const clang::VarDecl *ptr, const clang::VarDecl *base,
                clang::SourceLocation loc);
 
+  /// Binds the string literal `literal` as the read-only base of `ptr`'s
+  /// region at `loc`; a region bound to two distinct literals is marked
+  /// invalid (rebinding across literals is out of the decomposition).
+  void addLiteralBase(const clang::VarDecl *ptr,
+                      const clang::StringLiteral *literal,
+                      clang::SourceLocation loc);
+
   /// Flags `ptr`'s region as performing pointer arithmetic at `loc`.
   void recordArithmetic(const clang::VarDecl *ptr, clang::SourceLocation loc);
+
+  /// Flags `ptr`'s region as written through (`*p = v`, `p[i] = v`, ...)
+  /// at `loc`; a string-literal region rejects at this location.
+  void recordWriteThrough(const clang::VarDecl *ptr,
+                          clang::SourceLocation loc);
+
+  /// Returns the tracked pointer local at the root of a written place
+  /// expression (`*p`, `p[i]`, `*p++`, ...), or null when the place is not
+  /// a dereference or subscript through a tracked pointer.
+  const clang::VarDecl *trackedWritePlaceRoot(const clang::Expr *place);
 
   /// Marks `ptr`'s region undecomposable with diagnostic `reason` at `loc`;
   /// only the first invalidation of a region is kept.
@@ -588,8 +643,11 @@ private:
   /// (single local base, no escapes, no arithmetic on a scalar base),
   /// registers its decomposition: an entry-block `memref<i64>` cursor cell
   /// for an array base, or no runtime state at all for a degenerate scalar
-  /// or struct base. Undecomposable regions produce located diagnostics at
-  /// the offending construct.
+  /// or struct base. A string-literal region registers a cursor cell plus
+  /// the literal's read-only backing array (see
+  /// `getOrCreateLiteralBacking`) and rejects regions that are written
+  /// through or that join a literal with an object. Undecomposable regions
+  /// produce located diagnostics at the offending construct.
   LogicalResult emitPointerLocal(const clang::VarDecl *var, Location loc);
 
   /// Emits `ptr = rhs` for a decomposed pointer local by recomputing and
@@ -775,6 +833,29 @@ private:
   LogicalResult emitStringArrayInit(Value place, Type type,
                                     const clang::StringLiteral *literal);
 
+  /// Returns the read-only backing byte array place of the string-literal
+  /// pointer region bound to `literal`, creating it on first need: an
+  /// immutable (`const`-marked) `emitrust.variable` of
+  /// `!emitrust.array<(len+1)xi8>` initialized with the literal's bytes
+  /// plus the terminating NUL (C string literals always carry one, which
+  /// is what terminates strlen-style walks). Only ordinary literals whose
+  /// bytes are ASCII are supported, the same policy as
+  /// `emitStringArrayInit` (design.md C99-28). The created variable is
+  /// cached per literal for the current function, so every pointer of the
+  /// region shares one backing.
+  FailureOr<Value>
+  getOrCreateLiteralBacking(const clang::StringLiteral *literal,
+                            Location loc);
+
+  /// Lowers a value-position call to a definition-less `strlen` whose
+  /// argument is a pointer into a string-literal region: an
+  /// `emitrust.slice_of` of the backing from the argument's cursor passed
+  /// through the `__emitrust_strlen` helper (which counts bytes up to the
+  /// first NUL, exactly C's strlen), cast to the call's declared result
+  /// type. Arguments outside a string-literal region are rejected with a
+  /// located diagnostic.
+  FailureOr<Value> emitStrlenCall(const clang::CallExpr *call);
+
   /// Emits `if`/`else` as a cf diamond: cond_br into then/else blocks that
   /// fall through to a continuation block.
   LogicalResult emitIfStmt(const clang::IfStmt *stmt);
@@ -894,14 +975,15 @@ private:
   /// performs.
   LogicalResult emitPrintf(const clang::CallExpr *call);
 
-  /// Lowers a `%s` printf argument. Two shapes are supported: a string
+  /// Lowers a `%s` printf argument. Three shapes are supported: a string
   /// literal (after array-to-pointer decay), lowered to an
   /// `emitrust.literal` holding a `&'static str` (printable-ASCII bytes
   /// plus \n/\t/\r only; embedded NUL and non-ASCII bytes are rejected);
-  /// and a char-array lvalue, lowered to an `emitrust.slice_of` of the
+  /// a char-array lvalue, lowered to an `emitrust.slice_of` of the
   /// whole array passed through the `__emitrust_cstr` helper, which stops
-  /// at the first NUL like C. A `char *` variable bound to a literal stays
-  /// rejected.
+  /// at the first NUL like C; and a `char *` pointer into a string-literal
+  /// region, lowered to an `emitrust.slice_of` of the region's read-only
+  /// backing from the pointer's cursor through the same helper.
   FailureOr<Value> emitPrintfStringArg(const clang::Expr *expr);
 
   /// Wraps an integer value for a `%c` directive: casts it to i32 and
@@ -1066,10 +1148,11 @@ private:
   /// Emits a pointer-typed expression in the decomposed representation:
   /// reads of pointer locals load their cursor cell, `&x` yields the
   /// degenerate (cursor-less) form, `&arr[i]` and array decay yield the
-  /// base with an i64 cursor, `p +- n` is cursor arithmetic, and the
-  /// `++`/`--` value forms update the cursor cell and yield the pre- or
-  /// post-value per C semantics. Null pointer constants, string literals,
-  /// globals, and every other pointer source are located rejections.
+  /// base with an i64 cursor, a decayed string literal yields its
+  /// read-only backing array at cursor 0, `p +- n` is cursor arithmetic,
+  /// and the `++`/`--` value forms update the cursor cell and yield the
+  /// pre- or post-value per C semantics. Null pointer constants, globals,
+  /// and every other pointer source are located rejections.
   FailureOr<PtrExprValue> emitPointerRValue(const clang::Expr *expr);
 
   /// Materializes the place a decomposed pointer designates: the base
@@ -1173,6 +1256,10 @@ private:
   /// Per-function decomposition of each accepted pointer local and each
   /// slice-classified pointer parameter, keyed by its declaration.
   llvm::DenseMap<const clang::VarDecl *, PointerLocalInfo> pointerLocals;
+  /// Per-function read-only backing byte arrays of string-literal pointer
+  /// regions, keyed by the bound literal; created once per literal at the
+  /// declaration of the first pointer bound to it.
+  llvm::DenseMap<const clang::StringLiteral *, Value> literalBackings;
   /// Cached Phase-1b parameter classifications, keyed by the function's
   /// canonical declaration (persists across the whole import; each TU's
   /// declarations are distinct clang decls, so entries never conflict).
@@ -1247,6 +1334,13 @@ private:
   /// True once the `__emitrust_cstr` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool cStrHelperEmitted = false;
+  /// True once a definition-less `strlen` call has been imported; triggers
+  /// the one-per-module emission of the `__emitrust_strlen` helper that
+  /// counts bytes up to the first NUL, matching C's strlen.
+  bool needsStrlenHelper = false;
+  /// True once the `__emitrust_strlen` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool strlenHelperEmitted = false;
 };
 
 } // namespace
@@ -1541,9 +1635,24 @@ void PointerRegionAnalysis::unite(const clang::VarDecl *a,
     if (!known)
       target.bases.push_back(binding);
   }
+  if (absorbed.literalBase) {
+    if (!target.literalBase) {
+      target.literalBase = absorbed.literalBase;
+      target.literalLoc = absorbed.literalLoc;
+    } else if (target.literalBase != absorbed.literalBase &&
+               target.invalidReason.empty()) {
+      target.invalidReason =
+          "unsupported: pointer bound to multiple string literals";
+      target.invalidLoc = absorbed.literalLoc;
+    }
+  }
   if (absorbed.hasArithmetic && !target.hasArithmetic) {
     target.hasArithmetic = true;
     target.arithmeticLoc = absorbed.arithmeticLoc;
+  }
+  if (absorbed.hasWriteThrough && !target.hasWriteThrough) {
+    target.hasWriteThrough = true;
+    target.writeThroughLoc = absorbed.writeThroughLoc;
   }
   if (!absorbed.invalidReason.empty() && target.invalidReason.empty()) {
     target.invalidReason = std::move(absorbed.invalidReason);
@@ -1570,6 +1679,20 @@ void PointerRegionAnalysis::addBase(const clang::VarDecl *ptr,
     region.bases.push_back(PointerBaseBinding{base, loc});
 }
 
+void PointerRegionAnalysis::addLiteralBase(const clang::VarDecl *ptr,
+                                           const clang::StringLiteral *literal,
+                                           clang::SourceLocation loc) {
+  PointerRegion &region = regionFor(ptr);
+  if (!region.literalBase) {
+    region.literalBase = literal;
+    region.literalLoc = loc;
+    return;
+  }
+  if (region.literalBase != literal)
+    markInvalid(ptr, loc,
+                "unsupported: pointer bound to multiple string literals");
+}
+
 void PointerRegionAnalysis::recordArithmetic(const clang::VarDecl *ptr,
                                              clang::SourceLocation loc) {
   PointerRegion &region = regionFor(ptr);
@@ -1577,6 +1700,64 @@ void PointerRegionAnalysis::recordArithmetic(const clang::VarDecl *ptr,
     region.hasArithmetic = true;
     region.arithmeticLoc = loc;
   }
+}
+
+void PointerRegionAnalysis::recordWriteThrough(const clang::VarDecl *ptr,
+                                               clang::SourceLocation loc) {
+  PointerRegion &region = regionFor(ptr);
+  if (!region.hasWriteThrough) {
+    region.hasWriteThrough = true;
+    region.writeThroughLoc = loc;
+  }
+}
+
+const clang::VarDecl *
+PointerRegionAnalysis::trackedWritePlaceRoot(const clang::Expr *place) {
+  // Peel the dereference or subscript that designates the written element.
+  const clang::Expr *pointerExpr = nullptr;
+  const clang::Expr *e = stripTrivia(place);
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e)) {
+    if (unary->getOpcode() == clang::UO_Deref)
+      pointerExpr = unary->getSubExpr();
+  } else if (const auto *subscript =
+                 llvm::dyn_cast<clang::ArraySubscriptExpr>(e)) {
+    if (isPointerType(subscript->getBase()->getType()))
+      pointerExpr = subscript->getBase();
+  }
+  if (!pointerExpr)
+    return nullptr;
+  // Walk the pointer expression down to the tracked pointer local it reads
+  // (through casts, ++/--, and +/- offset forms).
+  const clang::Expr *cursor = stripTrivia(pointerExpr);
+  while (true) {
+    if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(cursor)) {
+      cursor = stripTrivia(cast->getSubExpr());
+      continue;
+    }
+    if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(cursor)) {
+      if (unary->isIncrementDecrementOp()) {
+        cursor = stripTrivia(unary->getSubExpr());
+        continue;
+      }
+      return nullptr;
+    }
+    if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(cursor)) {
+      if (binary->getOpcode() == clang::BO_Add ||
+          binary->getOpcode() == clang::BO_Sub) {
+        cursor = stripTrivia(isPointerType(binary->getLHS()->getType())
+                                 ? binary->getLHS()
+                                 : binary->getRHS());
+        continue;
+      }
+      return nullptr;
+    }
+    break;
+  }
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(cursor))
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+      if (tracks(var))
+        return var;
+  return nullptr;
 }
 
 void PointerRegionAnalysis::markInvalid(const clang::VarDecl *ptr,
@@ -1619,11 +1800,11 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
       break;
     }
     case clang::CK_ArrayToPointerDecay: {
-      // `p = arr`: the decayed array is the region base.
+      // `p = arr`: the decayed array is the region base. `p = "..."`
+      // binds the literal as the region's read-only base.
       const clang::Expr *sub = stripTrivia(cast->getSubExpr());
-      if (llvm::isa<clang::StringLiteral>(sub))
-        return markInvalid(ptr, loc,
-                           "unsupported: pointer to a string literal");
+      if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(sub))
+        return addLiteralBase(ptr, literal, loc);
       if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub))
         if (const auto *array =
                 llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
@@ -1720,23 +1901,39 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
         }
   } else if (const auto *compound =
                  llvm::dyn_cast<clang::CompoundAssignOperator>(stmt)) {
-    // `p += n` / `p -= n` walk the pointer without rebinding it.
-    if (isPointerType(compound->getLHS()->getType()))
+    // `p += n` / `p -= n` walk the pointer without rebinding it;
+    // `*p += n` / `p[i] -= n` write through the pointer.
+    if (isPointerType(compound->getLHS()->getType())) {
       if (const clang::VarDecl *var = asLocalVarRef(compound->getLHS()))
         if (tracks(var))
           recordArithmetic(var, compound->getOperatorLoc());
+    } else if (const clang::VarDecl *var =
+                   trackedWritePlaceRoot(compound->getLHS())) {
+      recordWriteThrough(var, compound->getOperatorLoc());
+    }
   } else if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt)) {
-    if (binary->getOpcode() == clang::BO_Assign &&
-        isPointerType(binary->getLHS()->getType()))
-      if (const clang::VarDecl *var = asLocalVarRef(binary->getLHS()))
-        if (tracks(var))
-          recordPointerWrite(var, binary->getRHS());
+    if (binary->getOpcode() == clang::BO_Assign) {
+      if (isPointerType(binary->getLHS()->getType())) {
+        if (const clang::VarDecl *var = asLocalVarRef(binary->getLHS()))
+          if (tracks(var))
+            recordPointerWrite(var, binary->getRHS());
+      } else if (const clang::VarDecl *var =
+                     trackedWritePlaceRoot(binary->getLHS())) {
+        // `*p = v` / `p[i] = v`: a write through the region's pointers.
+        recordWriteThrough(var, binary->getOperatorLoc());
+      }
+    }
   } else if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
     if (unary->isIncrementDecrementOp() &&
         isPointerType(unary->getSubExpr()->getType())) {
       if (const clang::VarDecl *var = asLocalVarRef(unary->getSubExpr()))
         if (tracks(var))
           recordArithmetic(var, unary->getOperatorLoc());
+    } else if (unary->isIncrementDecrementOp()) {
+      // `(*p)++` / `--p[i]`: a write through the region's pointers.
+      if (const clang::VarDecl *var =
+              trackedWritePlaceRoot(unary->getSubExpr()))
+        recordWriteThrough(var, unary->getOperatorLoc());
     } else if (unary->getOpcode() == clang::UO_AddrOf) {
       // `&p` would let the pointer escape the decomposition.
       if (const clang::VarDecl *var = asLocalVarRef(unary->getSubExpr()))
@@ -2818,6 +3015,9 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   if (cName == "__emitrust_cstr")
     return emitError(loc) << "unsupported: function name '__emitrust_cstr' "
                              "is reserved for the printf %s helper";
+  if (cName == "__emitrust_strlen")
+    return emitError(loc) << "unsupported: function name '__emitrust_strlen' "
+                             "is reserved for the strlen helper";
   if (isRustKeyword(cName))
     return emitError(loc) << "unsupported: function name '" << cName
                           << "' is a Rust keyword";
@@ -2914,6 +3114,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   symbols.clear();
   addressTaken.clear();
   pointerLocals.clear();
+  literalBackings.clear();
   ownerStructPlaces.clear();
   loopStack.clear();
   labelBlocks.clear();
@@ -3128,6 +3329,21 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "fn __emitrust_cstr(s: &[i8]) -> String {\n"
             "    s.iter().take_while(|&&b| b != 0).map(|&b| (b as u8) as "
             "char).collect()\n"
+            "}"));
+  }
+  if (needsStrlenHelper && !strlenHelperEmitted) {
+    strlenHelperEmitted = true;
+    // C-compatible strlen over a string-literal region: counts bytes up to
+    // (not including) the first NUL. The backing of every string-literal
+    // region includes the terminating NUL, so `position` always finds one;
+    // the `unwrap_or` fallback merely keeps the helper total. Emitted once
+    // per module, after all imported items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_strlen(s: &[i8]) -> i64 {\n"
+            "    s.iter().position(|&b| b == 0).unwrap_or(s.len()) as i64\n"
             "}"));
   }
   return success();
@@ -3582,6 +3798,48 @@ CImporter::emitStringArrayInit(Value place, Type type,
   return success();
 }
 
+FailureOr<Value>
+CImporter::getOrCreateLiteralBacking(const clang::StringLiteral *literal,
+                                     Location loc) {
+  if (Value existing = literalBackings.lookup(literal))
+    return existing;
+  if (!literal->isOrdinary())
+    return emitError(loc) << "unsupported: non-ordinary string literal "
+                             "bound to a pointer";
+  // The backing holds the literal's bytes plus the terminating NUL, so a
+  // strlen-style walk terminates inside the array. Non-ASCII bytes are
+  // rejected so the region's contents stay exact through the ASCII-only
+  // `%s`/`%c` printing helpers (the emitStringArrayInit policy, C99-28).
+  uint64_t length = literal->getLength();
+  Type byteType = builder.getIntegerType(8);
+  SmallVector<Attribute> bytes;
+  bytes.reserve(length + 1);
+  for (uint64_t i = 0; i != length; ++i) {
+    uint32_t byte = literal->getCodeUnit(i);
+    if (byte > 127)
+      return emitError(loc) << "unsupported: non-ASCII byte in string "
+                               "literal bound to a pointer";
+    bytes.push_back(
+        IntegerAttr::get(byteType, static_cast<int64_t>(byte)));
+  }
+  bytes.push_back(IntegerAttr::get(byteType, 0));
+  auto arrayType = emitrust::ArrayType::get(builder.getContext(), length + 1,
+                                            byteType);
+  // Like createVariablePlace, hoist to the entry block when the function
+  // contains labels so a goto jumping over the declaration cannot leave a
+  // later use undominated.
+  OpBuilder::InsertionGuard guard(builder);
+  if (currentHasLabels)
+    builder.setInsertionPointToStart(entryBlock);
+  Value backing = builder
+                      .create<emitrust::VariableOp>(
+                          loc, emitrust::LValueType::get(arrayType),
+                          builder.getArrayAttr(bytes), /*isConst=*/true)
+                      .getResult();
+  literalBackings[literal] = backing;
+  return backing;
+}
+
 LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
                                           Location loc) {
   clang::QualType pointee =
@@ -3595,6 +3853,44 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
   if (!region->invalidReason.empty())
     return emitError(translateLoc(region->invalidLoc))
            << region->invalidReason;
+  if (region->literalBase) {
+    // Read-only string-literal region: the pointer is a cursor into the
+    // literal's `'static` byte run, backed by an immutable local byte
+    // array (bytes plus the terminating NUL).
+    if (!region->bases.empty()) {
+      const PointerBaseBinding &object = region->bases.front();
+      InFlightDiagnostic diag = emitError(loc);
+      diag << "unsupported: pointer '" << var->getName()
+           << "' would join a string literal and object '"
+           << object.base->getName() << "' into one region";
+      diag.attachNote(translateLoc(region->literalLoc))
+          << "bound to a string literal here";
+      diag.attachNote(translateLoc(object.loc))
+          << "bound to '" << object.base->getName() << "' here";
+      return diag;
+    }
+    if (region->hasWriteThrough)
+      return emitError(translateLoc(region->writeThroughLoc))
+             << "unsupported: write through a pointer to a string literal "
+                "(the literal is read-only)";
+    Location bindLoc = translateLoc(region->literalLoc);
+    FailureOr<Type> elementType = mapType(pointee, bindLoc);
+    if (failed(elementType))
+      return failure();
+    if (*elementType != builder.getIntegerType(8))
+      return emitError(bindLoc)
+             << "unsupported: pointer element type does not match its "
+                "string literal";
+    FailureOr<Value> backing =
+        getOrCreateLiteralBacking(region->literalBase, bindLoc);
+    if (failed(backing))
+      return failure();
+    Value cell = createEntryAlloca(loc, builder.getIntegerType(64));
+    pointerLocals[var] = PointerLocalInfo{nullptr, cell, *backing};
+    if (const clang::Expr *init = var->getInit())
+      return storePointerAssign(loc, var, init);
+    return success();
+  }
   if (region->bases.size() >= 2) {
     // A pointer that is rebound across distinct objects cannot decompose
     // into one (base, cursor) pair; name both objects and both bindings.
@@ -3672,7 +3968,9 @@ LogicalResult CImporter::storePointerAssign(Location loc,
   if (failed(value))
     return failure();
   const PointerLocalInfo &info = it->second;
-  if (value->base != info.base) // Defensive; multi-base regions never get here.
+  if (value->base != info.base ||
+      value->literalBacking !=
+          info.literalBacking) // Defensive; multi-base regions never get here.
     return emitError(loc)
            << "unsupported: pointer assignment would rebind to a different "
               "object";
@@ -4613,8 +4911,7 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
   }
   // A char-array lvalue is borrowed whole (`emitrust.slice_of` at index 0)
   // and rendered by the `__emitrust_cstr` helper, which — like C's %s —
-  // stops at the first NUL. A `char *` variable bound to a literal is not
-  // an array lvalue and stays rejected here.
+  // stops at the first NUL.
   if (astContext().getAsConstantArrayType(arg->getType()) &&
       arg->isLValue()) {
     FailureOr<Value> place = emitLValue(arg);
@@ -4633,6 +4930,46 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
     Value slice = builder
                       .create<emitrust::SliceOfOp>(loc, sliceRefType, *place,
                                                    zero, /*is_mut=*/false)
+                      .getResult();
+    needsCStrHelper = true;
+    auto stringType =
+        emitrust::OpaqueType::get(builder.getContext(), "String");
+    return builder
+        .create<emitrust::CallOpaqueOp>(
+            loc, TypeRange{stringType},
+            builder.getStringAttr("__emitrust_cstr"),
+            /*args=*/ArrayAttr(), ValueRange{slice})
+        .getResult(0);
+  }
+  // A pointer into a string-literal region prints the backing byte run
+  // from its cursor: `emitrust.slice_of` of the read-only backing at the
+  // cursor, rendered by the same `__emitrust_cstr` helper as char arrays
+  // (both stop at the first NUL, like C's %s). The decomposed-pointer gate
+  // keeps pointer-shaped arguments without a decomposed pointer (casts of
+  // scalar addresses, ...) on the generic rejection below.
+  if (isPointerType(expr->getType()) && involvesDecomposedPointer(expr) &&
+      isDecomposedPointerExpr(expr)) {
+    FailureOr<PtrExprValue> pointer = emitPointerRValue(expr);
+    if (failed(pointer))
+      return failure();
+    if (!pointer->literalBacking)
+      return emitError(loc)
+             << "unsupported: printf '%s' argument must be a string literal, "
+                "a char array, or a pointer into a string literal";
+    Value cursor =
+        pointer->cursor
+            ? pointer->cursor
+            : createIntConstant(loc, builder.getIntegerType(64), 0);
+    auto lvalueType =
+        llvm::cast<emitrust::LValueType>(pointer->literalBacking.getType());
+    auto backingType =
+        llvm::cast<emitrust::ArrayType>(lvalueType.getValueType());
+    auto sliceRefType = emitrust::RefType::get(
+        emitrust::SliceType::get(backingType.getElementType()));
+    Value slice = builder
+                      .create<emitrust::SliceOfOp>(loc, sliceRefType,
+                                                   pointer->literalBacking,
+                                                   cursor, /*is_mut=*/false)
                       .getResult();
     needsCStrHelper = true;
     auto stringType =
@@ -4675,6 +5012,50 @@ LogicalResult CImporter::emitPuts(const clang::CallExpr *call) {
           {builder.getStringAttr("{}"), builder.getIndexAttr(0)}),
       ValueRange{*text});
   return success();
+}
+
+FailureOr<Value> CImporter::emitStrlenCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: strlen requires exactly one argument";
+  FailureOr<PtrExprValue> pointer = emitPointerRValue(call->getArg(0));
+  if (failed(pointer))
+    return failure();
+  if (!pointer->literalBacking)
+    return emitError(loc) << "unsupported: strlen argument must be a "
+                             "pointer into a string literal";
+  Value cursor = pointer->cursor
+                     ? pointer->cursor
+                     : createIntConstant(loc, builder.getIntegerType(64), 0);
+  auto lvalueType =
+      llvm::cast<emitrust::LValueType>(pointer->literalBacking.getType());
+  auto arrayType = llvm::cast<emitrust::ArrayType>(lvalueType.getValueType());
+  auto sliceRefType = emitrust::RefType::get(
+      emitrust::SliceType::get(arrayType.getElementType()));
+  Value slice = builder
+                    .create<emitrust::SliceOfOp>(loc, sliceRefType,
+                                                 pointer->literalBacking,
+                                                 cursor, /*is_mut=*/false)
+                    .getResult();
+  needsStrlenHelper = true;
+  Value count =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{builder.getIntegerType(64)},
+              builder.getStringAttr("__emitrust_strlen"),
+              /*args=*/ArrayAttr(), ValueRange{slice})
+          .getResult(0);
+  // Convert the i64 count to the call's declared result type (`int` in the
+  // K&R-style `int strlen(char *)` prototype, size_t otherwise), matching
+  // C's conversion of the returned value.
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+  if (!intType)
+    return emitError(loc) << "unsupported: strlen result type";
+  return castToIntType(loc, count, intType);
 }
 
 LogicalResult CImporter::emitPutchar(const clang::CallExpr *call) {
@@ -5313,17 +5694,37 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
   // Pointer comparisons decompose both sides into (base, cursor) pairs;
   // only pointers into the same object have a defined C ordering, and the
   // i64 cursors compare signed. A degenerate side (the address of a
-  // scalar) is cursor 0 of its object. Null pointer constants are rejected
-  // inside `emitPointerRValue`.
+  // scalar) is cursor 0 of its object. One special case folds: a string
+  // literal compared against a null pointer constant is never equal (a C
+  // string literal designates an object, whose address is non-null), so
+  // `"..." == NULL` is constant false and `!=` constant true. Other null
+  // pointer constants are rejected inside `emitPointerRValue`.
   if (isPointerType(op->getLHS()->getType()) ||
       isPointerType(op->getRHS()->getType())) {
+    auto isNullConstant = [&](const clang::Expr *expr) {
+      return expr->isNullPointerConstant(
+                 astContext(), clang::Expr::NPC_NeverValueDependent) !=
+             clang::Expr::NPCK_NotNull;
+    };
+    auto isLiteralPointer = [](const clang::Expr *expr) {
+      return llvm::isa<clang::StringLiteral>(expr->IgnoreParenCasts());
+    };
+    if ((isLiteralPointer(op->getLHS()) && isNullConstant(op->getRHS())) ||
+        (isNullConstant(op->getLHS()) && isLiteralPointer(op->getRHS()))) {
+      if (op->getOpcode() == clang::BO_EQ)
+        return createBoolConstant(loc, false);
+      if (op->getOpcode() == clang::BO_NE)
+        return createBoolConstant(loc, true);
+      return emitError(loc) << "unsupported: ordered comparison of a string "
+                               "literal against a null pointer";
+    }
     FailureOr<PtrExprValue> lhs = emitPointerRValue(op->getLHS());
     if (failed(lhs))
       return failure();
     FailureOr<PtrExprValue> rhs = emitPointerRValue(op->getRHS());
     if (failed(rhs))
       return failure();
-    if (lhs->base != rhs->base)
+    if (lhs->base != rhs->base || lhs->literalBacking != rhs->literalBacking)
       return emitError(loc)
              << "unsupported: comparison of pointers into different objects";
     Type cursorType = builder.getIntegerType(64);
@@ -5742,6 +6143,12 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       !callee->getDefinition())
     return emitError(loc) << "unsupported: " << callee->getName()
                           << " return value must be unused";
+  // A definition-less strlen is lowered by name like printf/puts: its
+  // supported argument shape is a pointer into a string-literal region,
+  // rendered through the `__emitrust_strlen` helper. A user-defined strlen
+  // is an ordinary call.
+  if (callee->getName() == "strlen" && !callee->getDefinition())
+    return emitStrlenCall(call);
   if (callee->isVariadic())
     return emitError(loc) << "unsupported: call to a variadic function";
 
@@ -6197,7 +6604,7 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         Value cursor;
         if (info.cursorCell)
           cursor = loadPlace(loc, info.cursorCell);
-        return PtrExprValue{info.base, cursor};
+        return PtrExprValue{info.base, cursor, info.literalBacking};
       }
       if (llvm::isa<clang::ParmVarDecl>(var))
         return emitError(loc) << "unsupported: pointer parameter used "
@@ -6207,10 +6614,17 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
                             << "' has no known target object";
     }
     case clang::CK_ArrayToPointerDecay: {
-      // A decayed array is its own base at cursor 0.
+      // A decayed array is its own base at cursor 0; a decayed string
+      // literal is its read-only backing array at cursor 0 (the backing
+      // was created at the declaration of the pointer bound to it).
       const clang::Expr *sub = stripTrivia(cast->getSubExpr());
-      if (llvm::isa<clang::StringLiteral>(sub))
-        return emitError(loc) << "unsupported: pointer to a string literal";
+      if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(sub)) {
+        Value backing = literalBackings.lookup(literal);
+        if (!backing)
+          return emitError(loc) << "unsupported: pointer to a string literal";
+        return PtrExprValue{nullptr, createIntConstant(loc, cursorType, 0),
+                            backing};
+      }
       const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub);
       const auto *var =
           ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
@@ -6271,7 +6685,7 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         Value cursor =
             builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
                 .getResult();
-        return PtrExprValue{pointer->base, cursor};
+        return PtrExprValue{pointer->base, cursor, pointer->literalBacking};
       }
       return emitError(loc) << "unsupported pointer target expression";
     }
@@ -6295,7 +6709,8 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
               ? builder.create<arith::AddIOp>(loc, current, one).getResult()
               : builder.create<arith::SubIOp>(loc, current, one).getResult();
       builder.create<memref::StoreOp>(loc, next, info.cursorCell);
-      return PtrExprValue{info.base, unary->isPostfix() ? current : next};
+      return PtrExprValue{info.base, unary->isPostfix() ? current : next,
+                          info.literalBacking};
     }
     return emitError(loc) << "unsupported pointer expression";
   }
@@ -6335,7 +6750,7 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
                     .getResult()
               : builder.create<arith::SubIOp>(loc, pointer->cursor, offset)
                     .getResult();
-      return PtrExprValue{pointer->base, cursor};
+      return PtrExprValue{pointer->base, cursor, pointer->literalBacking};
     }
   }
 
@@ -6345,6 +6760,23 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
 
 FailureOr<Value> CImporter::emitPointerPlace(Location loc,
                                              const PtrExprValue &pointer) {
+  if (pointer.literalBacking) {
+    // A string-literal cursor subscripts the literal's read-only backing
+    // byte array. Writes never reach this place: the region analysis
+    // rejects any write through a string-literal region at the pointer's
+    // declaration.
+    if (!pointer.cursor) // Defensive; literal pointers always carry cursors.
+      return emitError(loc) << "unsupported string-literal pointer shape";
+    auto lvalueType =
+        llvm::cast<emitrust::LValueType>(pointer.literalBacking.getType());
+    auto arrayType =
+        llvm::cast<emitrust::ArrayType>(lvalueType.getValueType());
+    return builder
+        .create<emitrust::SubscriptOp>(
+            loc, emitrust::LValueType::get(arrayType.getElementType()),
+            pointer.literalBacking, pointer.cursor)
+        .getResult();
+  }
   auto it = symbols.find(pointer.base);
   if (it == symbols.end())
     return emitError(loc) << "unsupported: pointer target '"
@@ -6383,7 +6815,7 @@ CImporter::emitPointerDifference(const clang::BinaryOperator *op) {
   FailureOr<PtrExprValue> rhs = emitPointerRValue(op->getRHS());
   if (failed(rhs))
     return failure();
-  if (lhs->base != rhs->base)
+  if (lhs->base != rhs->base || lhs->literalBacking != rhs->literalBacking)
     return emitError(loc)
            << "unsupported: difference of pointers into different objects";
   Type cursorType = builder.getIntegerType(64);
@@ -6545,7 +6977,8 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
       Value cursor =
           builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
               .getResult();
-      return emitPointerPlace(loc, PtrExprValue{pointer->base, cursor});
+      return emitPointerPlace(
+          loc, PtrExprValue{pointer->base, cursor, pointer->literalBacking});
     }
     FailureOr<Value> basePlace = emitLValue(base, writeback);
     if (failed(basePlace))

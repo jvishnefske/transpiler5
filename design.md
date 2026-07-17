@@ -247,10 +247,11 @@ lists the lit test file(s) that validate it.
   output; any mismatch is a fatal MISCOMPILE unless explicitly quarantined
   in known-miscompiles.txt, and the expected-pass.txt manifest ratchets in
   both directions (regressions and unrecorded passes both fail). Current
-  ledger: 220 total, 147 transpiled, 147 passed, 0 miscompiled,
-  73 unsupported (the remaining tests need unions, pointer-to-pointer or
-  void* casts, pointer globals, `char *` bindings to string literals,
-  goto, wide strings, or system-header contents outside the C subset).
+  ledger: 220 total, 166 transpiled, 166 passed, 0 miscompiled,
+  54 unsupported (the remaining tests need unions, pointer-to-pointer or
+  void* casts, pointer globals, anonymous structs, wide strings, or
+  system-header contents outside the C subset; see the c-testsuite
+  checklist below).
   (test/CTestSuite/)
 - [x] FR-25 Generality beyond test vectors: an adversarial audit plus
   differential stress run over shapes absent from the original tests
@@ -626,13 +627,17 @@ rule.
   bytes plus the terminating NUL when it fits (C99 6.7.8p14), remaining
   elements keeping the zero fill; file scope folds through the
   C99-11/14 APValue path to a typed i8 ArrayAttr on `emitrust.global`.
-  Embedded NULs in the literal are ordinary data. Located rejections:
-  non-ASCII bytes (both scopes, keeping array contents exact through the
-  ASCII-only %s/%c helpers), wide/unsigned-char element types, and —
-  unchanged — `char *p = "..."` pointer bindings (a literal is no place
-  a decomposed pointer region could own).
+  Embedded NULs in the literal are ordinary data. `char *p = "..."`
+  pointer bindings are supported as read-only string-literal regions
+  (CTS-P1): the pointer is an i64 cursor into an immutable backing byte
+  array holding the literal's bytes plus the terminating NUL, with the
+  same ASCII policy on the backing bytes. Located rejections: non-ASCII
+  bytes (all scopes, keeping the printed contents exact through the
+  ASCII-only %s/%c helpers), wide/unsigned-char element types, and
+  writes through a literal-bound pointer (the region is read-only).
   (test/Import/C/strings.c, strings-invalid.c,
-  aggregate-init-invalid.c, test/EndToEnd/strings.c)
+  aggregate-init-invalid.c, pointers-string-literal.c,
+  test/EndToEnd/strings.c, string-cursor.c)
 - [ ] C99-29 Float literal forms including hexadecimal float constants,
   and __func__.
 
@@ -836,10 +841,11 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 159 passed / 0 miscompiled /
-61 unsupported (was 150/70 at commit a091423, when this checklist was
-drawn up; the quick wins plus CTS-S1/S7 partials landed since). Every
-one of the 61 is a located build-time rejection — never wrong output.
+Ledger as of 2026-07-17: 220 total / 166 passed / 0 miscompiled /
+54 unsupported (was 150/70 at commit a091423, when this checklist was
+drawn up; the quick wins, CTS-S1/S7 partials, and CTS-P1 landed since).
+Every one of the 54 is a located build-time rejection — never wrong
+output.
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
 checkbox discipline as above — tick only when the referenced tests pass
@@ -889,12 +895,33 @@ observed when C99-33 + C99-47 together unlocked 00215).
 
 ### Pointer model extensions (30 tests, builds on FR-28/C99-26)
 
-- [ ] CTS-P1 (7) `char *` bound to string literals: a read-only
+- [x] CTS-P1 (7) `char *` bound to string literals: a read-only
   string-region class in PointerRegionAnalysis whose base is the literal
   (`&'static [u8]`/`&'static str`) and whose cursor indexes it; feeds the
   existing %s printf shapes (C99-28/47). Watch embedded-NUL and
   non-ASCII policy already set by C99-28.
   (00025.c, 00026.c, 00058.c, 00112.c, 00137.c, 00138.c, 00173.c)
+  Done: PointerRegion carries an optional string-literal base
+  (`literalBase`, data on the region, alongside the object bases) plus a
+  write-through fact; a literal-based region is a cursor into a read-only
+  run backed by an immutable `const`-marked `emitrust.variable` byte
+  array (`let lit: [i8; N+1] = [...]`, literal bytes plus the terminating
+  NUL so strlen-style walks terminate), created once per literal and
+  shared by every pointer of the region. Dereference/subscript read bytes
+  via `emitrust.subscript(backing, cursor)`; arithmetic is the usual i64
+  cursor arithmetic; any write through the region (`*p = c`, `p[i] = c`,
+  `(*p)++`) is a located rejection at the write site (writing a C string
+  literal is UB; the region is read-only), as are rebinding across two
+  literals and joining a literal with an object. `%s` of a literal-bound
+  pointer slices the backing from the cursor through `__emitrust_cstr`
+  (C99-28 ASCII policy applies to the backing bytes); a definition-less
+  `strlen` lowers by name to the new `__emitrust_strlen` helper over the
+  same slice; `"..." == NULL` folds to false (a literal's address is
+  never null). Ledger 159 -> 166, zero miscompiles, all seven tests in
+  the manifest. (test/Import/C/pointers-string-literal.c; write-through,
+  multi-literal, and literal/object-join rejections in
+  test/Import/C/pointers-local-invalid.c; rustc-level differential
+  test/EndToEnd/string-cursor.c)
 - [ ] CTS-P2 (7) Pointer types outside the parameter/local-cursor
   positions FR-28 classifies: pointer returns, pointer struct members
   (C99-43), pointers in casts and mixed expressions. Requires extending
