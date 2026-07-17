@@ -950,6 +950,13 @@ observed when C99-33 + C99-47 together unlocked 00215).
 - [ ] CTS-R6 (1) Empty structs (`struct T {};` — a GNU/C2x shape clang
   accepts): emit a unit-like Rust struct; today "struct with no
   members" rejects.
+  Empty-struct support landed: the importer accepts a field-less
+  record, struct_def permits empty field arrays, and the emitter prints
+  `struct T {}` (declaration/copy/default via the usual derives;
+  test/Import/C/structs-empty.c, Dialect ops.mlir, Target memory.mlir).
+  00216.c stays blocked on its next feature — the flexible array member
+  `struct S s[];` rejects with "unsupported: non-constant array size"
+  (00216.c:46) — so it remains off the manifest.
   (00216.c)
 
 ### Statements and expressions (10 tests)

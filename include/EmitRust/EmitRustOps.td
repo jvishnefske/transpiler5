@@ -507,7 +507,10 @@ def EmitRust_StructDefOp : EmitRust_Op<"struct_def", [
   let description = [{
     The `emitrust.struct_def` operation defines a named Rust struct at
     module level. The field names and field types are given as two arrays of
-    the same non-zero length; names must be non-empty and unique, and every
+    the same length; the arrays may be empty (C's `struct T {};`), in which
+    case the struct is emitted with an empty brace body (`struct T {}`), a
+    zero-sized type in Rust just as GCC gives the empty C struct size zero.
+    Names must be non-empty and unique, and every
     field type must be a scalar (integer, index, or float), an
     `!emitrust.array`, an `!emitrust.struct`, an `!emitrust.enum`, or an
     `!emitrust.fn_ptr` (no lvalues or references). Values of the struct are

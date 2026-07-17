@@ -10,6 +10,27 @@
 // CHECK-NEXT: }
 emitrust.struct_def @Point ["x", "y"] [i32, i32]
 
+// A field-less struct_def (C's `struct T {};`) prints unit-like with an
+// empty brace body; declaration and copy still work through the derives.
+// CHECK:      #[derive(Clone, Copy, Default)]
+// CHECK-NEXT: struct Empty {}
+emitrust.struct_def @Empty [] []
+
+// CHECK-LABEL: fn empty_struct_value() {
+// CHECK-NEXT:    let mut v0: Empty = Empty::default();
+// CHECK-NEXT:    let v1: Empty = v0;
+// CHECK-NEXT:    let mut v2: Empty = Empty::default();
+// CHECK-NEXT:    v2 = v1;
+// CHECK-NEXT:    return;
+// CHECK-NEXT:  }
+emitrust.func @empty_struct_value() {
+  %a = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Empty">>
+  %v = emitrust.load %a : (!emitrust.lvalue<!emitrust.struct<"Empty">>) -> !emitrust.struct<"Empty">
+  %b = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Empty">>
+  emitrust.assign %b = %v : !emitrust.lvalue<!emitrust.struct<"Empty">>
+  emitrust.return
+}
+
 // CHECK-LABEL: fn defaults() {
 // CHECK-NEXT:    let mut v0: i32 = 42;
 // CHECK-NEXT:    let mut v1: i32 = 0;
