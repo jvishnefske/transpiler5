@@ -805,8 +805,18 @@ private:
   LogicalResult emitReturnStmt(const clang::ReturnStmt *stmt);
 
   /// Emits an expression evaluated for its side effects only: assignments,
-  /// compound assignments, ++/--, and calls (including printf).
+  /// compound assignments, ++/--, calls (including printf), casts to void
+  /// (the operand's side effects run, the value is discarded, and a
+  /// side-effect-free operand emits nothing), and void-typed conditional
+  /// operators (see `emitVoidConditionalStmt`).
   LogicalResult emitExprStmt(const clang::Expr *expr);
+
+  /// Emits a void-typed conditional operator in statement position as an
+  /// if/else: the condition selects which arm's side effects run, and no
+  /// value is materialized (there is none to materialize — `void` is not a
+  /// value type in the dialect).
+  LogicalResult
+  emitVoidConditionalStmt(const clang::ConditionalOperator *op);
 
   /// Emits a simple assignment `lhs = rhs` to a memref cell or EmitRust
   /// place.
@@ -4006,8 +4016,56 @@ LogicalResult CImporter::emitExprStmt(const clang::Expr *expr) {
       return emitIncDec(unary);
   if (const auto *call = llvm::dyn_cast<clang::CallExpr>(e))
     return emitCallStmt(call);
+  // A cast to void evaluates its operand for its side effects and discards
+  // the value (C11 6.3.2.2). A side-effect-free operand needs no code at
+  // all; anything else is re-entered as an expression statement, so calls,
+  // assignments, and ++/-- keep their statement-position lowerings. This
+  // also covers implicit ToVoid casts, e.g. the non-void arm of a
+  // void-typed conditional.
+  if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
+    if (cast->getCastKind() == clang::CK_ToVoid) {
+      if (!cast->getSubExpr()->HasSideEffects(astContext()))
+        return success();
+      return emitExprStmt(cast->getSubExpr());
+    }
+  // A void-typed conditional operator (a GNU shape: at least one arm has
+  // void type) has no value to materialize, so emitConditionalOperator
+  // cannot lower it; in statement position both arms are evaluated for
+  // their side effects only, which is exactly an if/else.
+  if (const auto *conditional = llvm::dyn_cast<clang::ConditionalOperator>(e))
+    if (conditional->getType()->isVoidType())
+      return emitVoidConditionalStmt(conditional);
   // Any other expression statement is evaluated and its value discarded.
   return success(succeeded(emitRValue(e)));
+}
+
+LogicalResult
+CImporter::emitVoidConditionalStmt(const clang::ConditionalOperator *op) {
+  Location loc = translateLoc(op->getQuestionLoc());
+  FailureOr<Value> condition = emitCondition(op->getCond());
+  if (failed(condition))
+    return failure();
+
+  Block *thenBlock = createBlock();
+  Block *elseBlock = createBlock();
+  Block *contBlock = createBlock();
+  builder.create<cf::CondBranchOp>(loc, *condition, thenBlock, ValueRange(),
+                                   elseBlock, ValueRange());
+
+  builder.setInsertionPointToEnd(thenBlock);
+  if (failed(emitExprStmt(op->getTrueExpr())))
+    return failure();
+  if (!isTerminated(builder.getInsertionBlock()))
+    builder.create<cf::BranchOp>(loc, contBlock);
+
+  builder.setInsertionPointToEnd(elseBlock);
+  if (failed(emitExprStmt(op->getFalseExpr())))
+    return failure();
+  if (!isTerminated(builder.getInsertionBlock()))
+    builder.create<cf::BranchOp>(loc, contBlock);
+
+  builder.setInsertionPointToEnd(contBlock);
+  return success();
 }
 
 LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
