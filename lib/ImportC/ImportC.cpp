@@ -935,14 +935,34 @@ private:
   /// the exit; `break` targets the exit and `continue` the condition block.
   LogicalResult emitDoStmt(const clang::DoStmt *stmt);
 
-  /// Emits `switch` as a `cf.switch` over one block per top-level label
-  /// position of the compound body plus an exit block. Consecutive labels
-  /// share a block; a label section that does not end in a terminator falls
-  /// through to the next section with a `cf.br`; `break` targets the exit
-  /// block while `continue` still targets the enclosing loop. Labels nested
-  /// inside sub-statements (Duff's device), GNU case ranges, non-compound
-  /// bodies, and statements before the first label are rejected.
+  /// Emits `switch`. A plain compound body (every case/default label at the
+  /// top level, nothing before the first label) takes the structured path:
+  /// a `cf.switch` over one block per top-level label position plus an exit
+  /// block, where consecutive labels share a block and a label section that
+  /// does not end in a terminator falls through to the next section with a
+  /// `cf.br`. Any other body shape (non-compound bodies, statements before
+  /// the first label, labels nested inside inner statements — Duff's
+  /// device) is delegated to `emitDispatchSwitch`. In both paths `break`
+  /// targets the exit block while `continue` still targets the enclosing
+  /// loop, and GNU case ranges are rejected.
   LogicalResult emitSwitchStmt(const clang::SwitchStmt *stmt);
+
+  /// Fallback `switch` lowering for bodies the structured path cannot
+  /// shape: every case/default label of this switch (found via clang's
+  /// `SwitchStmt::getSwitchCaseList`, which covers labels buried inside
+  /// inner statements but not those of nested switches) becomes an
+  /// ordinary block, registered in `switchCaseBlocks`; the dispatch is one
+  /// `cf.switch` from the current block to those targets; and the body is
+  /// then emitted in source order starting in a fresh dead block, with the
+  /// `SwitchCase` case of `emitStmt` redirecting emission into each
+  /// label's block as the walk reaches it, so fall-through (including into
+  /// and around loop bodies, as in Duff's device) is plain block
+  /// fall-into. The possibly irreducible result is absorbed downstream by
+  /// lift-cf-to-scf, exactly like goto. Variable places emitted below the
+  /// dispatch are hoisted to the entry block (the dispatch may jump over
+  /// their declarations, exactly like goto over a declaration).
+  LogicalResult emitDispatchSwitch(const clang::SwitchStmt *stmt, Value flag,
+                                   IntegerType flagType, Location loc);
 
   /// Emits `return`, then continues in a fresh (dead) block so trailing
   /// statements still have an insertion point.
@@ -1436,6 +1456,11 @@ private:
   /// by label declaration; created lazily on first mention so forward and
   /// backward `goto`s share one map.
   llvm::DenseMap<const clang::LabelDecl *, Block *> labelBlocks;
+  /// Dispatch target blocks for the case/default labels of every
+  /// dispatch-lowered switch in the function under construction (see
+  /// `emitDispatchSwitch`), keyed by the label statement. Structured
+  /// switches never register their labels here.
+  llvm::DenseMap<const clang::SwitchCase *, Block *> switchCaseBlocks;
   /// True when the function under construction contains any C label;
   /// `emitrust.variable` places are then hoisted to the entry block (see
   /// `createVariablePlace`).
@@ -1563,8 +1588,9 @@ classifyEnumOperand(const clang::Expr *expr) {
 /// are handled when the recursive statement importer reaches them). The root
 /// itself may be a nested switch: a case arm whose sub-statement is another
 /// switch is legal, so the check applies to the root as well as to children.
-/// Used to reject Duff's-device-style switches whose labels are not at the
-/// top level of the switch body.
+/// Used to route Duff's-device-style switches whose labels are not at the
+/// top level of the switch body to the dispatch lowering
+/// (`emitDispatchSwitch`) instead of the structured one.
 static const clang::Stmt *findNestedSwitchLabel(const clang::Stmt *stmt) {
   if (!stmt || llvm::isa<clang::SwitchStmt>(stmt))
     return nullptr;
@@ -1577,6 +1603,28 @@ static const clang::Stmt *findNestedSwitchLabel(const clang::Stmt *stmt) {
       return found;
   }
   return nullptr;
+}
+
+/// Returns true if `body` has the plain shape the structured switch
+/// lowering handles: the first top-level statement starts a case/default
+/// label chain (so nothing precedes the first label) and no case/default
+/// label of this switch is nested inside an inner statement. Any other
+/// shape is lowered by `emitDispatchSwitch`.
+static bool isPlainSwitchBody(const clang::CompoundStmt *body) {
+  bool seenLabel = false;
+  for (const clang::Stmt *child : body->body()) {
+    const clang::Stmt *statement = child;
+    if (llvm::isa<clang::SwitchCase>(child)) {
+      seenLabel = true;
+      while (const auto *label = llvm::dyn_cast<clang::SwitchCase>(statement))
+        statement = label->getSubStmt();
+    } else if (!seenLabel) {
+      return false;
+    }
+    if (findNestedSwitchLabel(statement))
+      return false;
+  }
+  return true;
 }
 
 /// Returns true if `type` is an MLIR unsigned integer type (the mapping of
@@ -3491,6 +3539,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   ownerStructPlaces.clear();
   loopStack.clear();
   labelBlocks.clear();
+  switchCaseBlocks.clear();
   currentHasLabels = containsLabelStmt(func->getBody());
   currentReceiverPlace = Value();
   currentMethodOwner = nullptr;
@@ -3926,6 +3975,21 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
       builder.create<cf::BranchOp>(loc, block); // Fall into the label.
     builder.setInsertionPointToEnd(block);
     return emitStmt(labelStmt->getSubStmt());
+  }
+  if (const auto *switchCase = llvm::dyn_cast<clang::SwitchCase>(stmt)) {
+    // Reached only under a dispatch-lowered switch (`emitDispatchSwitch`
+    // pre-registers every label of the switch before walking its body; the
+    // structured lowering peels its labels itself and never routes them
+    // here). The label is an ordinary block boundary: fall into its
+    // pre-created dispatch target, exactly like a C label.
+    Block *block = switchCaseBlocks.lookup(switchCase);
+    if (!block)
+      return emitError(loc)
+             << "unsupported: case label outside of an enclosing switch";
+    if (!isTerminated(builder.getInsertionBlock()))
+      builder.create<cf::BranchOp>(loc, block); // Fall into the label.
+    builder.setInsertionPointToEnd(block);
+    return emitStmt(switchCase->getSubStmt());
   }
   if (const auto *expr = llvm::dyn_cast<clang::Expr>(stmt))
     return emitExprStmt(expr);
@@ -4587,9 +4651,8 @@ LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
 
   const auto *body = llvm::dyn_cast_if_present<clang::CompoundStmt>(
       stmt->getBody());
-  if (!body)
-    return emitError(loc)
-           << "unsupported: switch body must be a compound statement";
+  if (!body || !isPlainSwitchBody(body))
+    return emitDispatchSwitch(stmt, flag, flagType, loc);
 
   // Partition the body into label sections: every top-level label chain
   // (consecutive case/default labels share one target) starts a section
@@ -4621,14 +4684,10 @@ LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
         }
         statement = label->getSubStmt();
       }
-    } else if (sections.empty()) {
-      return emitError(translateLoc(child->getBeginLoc()))
-             << "unsupported: statement before the first case label of a "
-                "switch";
     }
-    if (const clang::Stmt *nested = findNestedSwitchLabel(statement))
-      return emitError(translateLoc(nested->getBeginLoc()))
-             << "unsupported: case label nested inside another statement";
+    // `isPlainSwitchBody` guaranteed the first child starts a label chain,
+    // so `sections` is never empty here, and no label of this switch hides
+    // inside `statement`.
     sections.back().stmts.push_back(statement);
   }
 
@@ -4663,6 +4722,75 @@ LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
   }
   loopStack.pop_back();
 
+  builder.setInsertionPointToEnd(exitBlock);
+  return success();
+}
+
+LogicalResult CImporter::emitDispatchSwitch(const clang::SwitchStmt *stmt,
+                                            Value flag, IntegerType flagType,
+                                            Location loc) {
+  // Register one block per case/default label of this switch. Clang chains
+  // a switch's own labels (wherever they nest inside the body) off
+  // `getSwitchCaseList` in reverse source order; labels of nested switches
+  // hang off their own SwitchStmt and never appear here. The list is
+  // reversed so blocks and `cf.switch` case operands come out in source
+  // order deterministically.
+  SmallVector<const clang::SwitchCase *> labels;
+  for (const clang::SwitchCase *label = stmt->getSwitchCaseList(); label;
+       label = label->getNextSwitchCase())
+    labels.push_back(label);
+  std::reverse(labels.begin(), labels.end());
+
+  SmallVector<llvm::APInt> caseValues;
+  SmallVector<Block *> caseBlocks;
+  Block *defaultBlock = nullptr;
+  for (const clang::SwitchCase *label : labels) {
+    Location labelLoc = translateLoc(label->getKeywordLoc());
+    Block *block = createBlock();
+    switchCaseBlocks[label] = block;
+    if (const auto *caseStmt = llvm::dyn_cast<clang::CaseStmt>(label)) {
+      if (caseStmt->getRHS())
+        return emitError(labelLoc) << "unsupported: GNU case range";
+      llvm::APSInt value =
+          caseStmt->getLHS()->EvaluateKnownConstInt(astContext());
+      caseValues.push_back(value.extOrTrunc(flagType.getWidth()));
+      caseBlocks.push_back(block);
+    } else {
+      defaultBlock = block;
+    }
+  }
+
+  Block *exitBlock = createBlock();
+  SmallVector<ValueRange> caseOperands(caseBlocks.size(), ValueRange());
+  builder.create<cf::SwitchOp>(
+      loc, flag, defaultBlock ? defaultBlock : exitBlock, ValueRange(),
+      llvm::ArrayRef<llvm::APInt>(caseValues), BlockRange(caseBlocks),
+      llvm::ArrayRef<ValueRange>(caseOperands));
+
+  // The body is emitted in source order, starting in a fresh block that is
+  // reachable only if something branches into it (control enters the body
+  // through the dispatch above, or through a goto). Each case/default
+  // label reached during the walk redirects emission into its pre-created
+  // block (the SwitchCase case of `emitStmt`), so fall-through between
+  // labels — including into and out of loop bodies — is the ordinary
+  // fall-into branch of an unterminated block. `break` targets the exit
+  // block; `continue` keeps targeting the latch of the enclosing loop.
+  // Variable places are hoisted to the entry block while the body is
+  // emitted (`createVariablePlace`): the dispatch may jump over a
+  // declaration, leaving the variable alive but uninitialized, exactly
+  // like goto over a declaration (C11 6.2.4p6).
+  builder.setInsertionPointToEnd(createBlock());
+  loopStack.push_back(
+      {exitBlock, loopStack.empty() ? nullptr : loopStack.back().continueDest});
+  bool savedHasLabels = currentHasLabels;
+  currentHasLabels = true;
+  LogicalResult bodyResult = emitStmt(stmt->getBody());
+  currentHasLabels = savedHasLabels;
+  loopStack.pop_back();
+  if (failed(bodyResult))
+    return failure();
+  if (!isTerminated(builder.getInsertionBlock()))
+    builder.create<cf::BranchOp>(loc, exitBlock);
   builder.setInsertionPointToEnd(exitBlock);
   return success();
 }

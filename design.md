@@ -227,11 +227,14 @@ lists the lit test file(s) that validate it.
   zero-extended usize scrutinee matches its zero-extended arms) imports as
   cf.switch, lift-cf-to-scf recovers scf.index_switch, the conversion
   lowers it to emitrust.switch, and the emitter renders a Rust match with
-  literal arms and an underscore default arm; Duff's device and GNU case
-  ranges are rejected with located diagnostics. (test/Import/C/switch.c,
+  literal arms and an underscore default arm; bodies the structured
+  lowering cannot shape (non-compound bodies, statements before the first
+  label, case labels nested inside inner statements — Duff's device) take
+  the CTS-S2 dispatch fallback instead, and GNU case ranges are rejected
+  with located diagnostics. (test/Import/C/switch.c, switch-dispatch.c,
   switch-invalid.c, test/Conversion/SCFToEmitRust/index-switch.mlir,
   test/Target/Rust/match.mlir, test/EndToEnd/switch-enum.c,
-  test/EndToEnd/switch-general.c)
+  test/EndToEnd/switch-general.c, test/EndToEnd/switch-dispatch.c)
 - [x] FR-23 C enums: complete named enums become emitrust.enum_def and
   render as repr(i32) Rust enums deriving Clone, Copy, PartialEq, Default;
   enumerator constants render as Name::Variant; enum equality compares the
@@ -654,9 +657,11 @@ rule.
   labels, nested switches, and negative/sparse/64-bit case values, mapped
   through cf.switch and scf.index_switch onto a Rust match; Duff's device
   (case labels of an outer switch nested inside inner non-switch
-  statements) and GNU case ranges are rejected with located diagnostics.
-  (test/Import/C/switch.c, switch-invalid.c, test/EndToEnd/switch-enum.c,
-  test/EndToEnd/switch-general.c)
+  statements) and other non-plain bodies take the CTS-S2 dispatch
+  fallback, and GNU case ranges are rejected with located diagnostics.
+  (test/Import/C/switch.c, switch-dispatch.c, switch-invalid.c,
+  test/EndToEnd/switch-enum.c, test/EndToEnd/switch-general.c,
+  test/EndToEnd/switch-dispatch.c)
 - [x] C99-33 goto and labels: each label maps to a dedicated block
   (created at first mention, so forward and backward gotos both resolve)
   and a goto is a plain cf.br; lift-cf-to-scf structures the resulting
@@ -860,8 +865,8 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 178 passed / 0 miscompiled /
-42 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-17: 220 total / 180 passed / 0 miscompiled /
+40 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5 partials, and
 CTS-S1/S4/P1/R1/R4 landed since). Every one of the 42 is a located
 build-time rejection — never wrong output.
@@ -1080,11 +1085,34 @@ observed when C99-33 + C99-47 together unlocked 00215).
   system header") was cleared by the hosted `sin` -> `f64::sin` mapping
   (C99-48).
   (00111.c, 00174.c)
-- [ ] CTS-S2 (2) Switch bodies that are not plain compound statements
+- [x] CTS-S2 (2) Switch bodies that are not plain compound statements
   and case labels nested inside inner statements (Duff-adjacent,
   C99-32 note): requires emitting switch dispatch as cf-level branches
   into arbitrary statement positions rather than the structured match
   lowering; goto's labelBlocks machinery (C99-33) is the likely vehicle.
+  Landed: a dispatch fallback lowering (`emitDispatchSwitch`) used when
+  the body is not the plain shape (non-compound body, statement before
+  the first label, or a case/default label nested inside an inner
+  statement): every label of the switch (clang's
+  `SwitchStmt::getSwitchCaseList`, which covers buried labels but not
+  those of nested switches) becomes an ordinary block registered up
+  front — the goto labelBlocks pattern, keyed by the label statement —
+  the dispatch is one `cf.switch` to those targets, and the body is
+  emitted in source order with each label redirecting emission into its
+  block, so fall-through into and out of loop bodies (Duff's device) is
+  plain block fall-into; lift-cf-to-scf absorbs the possibly
+  irreducible result exactly like goto into a loop. Variable places
+  under the dispatch are hoisted to the entry block (the dispatch may
+  jump over declarations, like goto). The structured lowering stays the
+  default for plain bodies, and GNU case ranges stay rejected with a
+  located diagnostic in both paths. Differential coverage sweeps Duff's
+  device over every entry residue and data-dependent trip counts, case
+  labels in both arms of an if, INT_MIN/INT_MAX and negative case
+  values with no-match values on both sides (FR-25), and a for-loop
+  break under a case entered mid-loop. Both tests pass and are in the
+  ratchet manifest.
+  (test/Import/C/switch-dispatch.c, switch-invalid.c,
+  test/EndToEnd/switch-dispatch.c)
   (00051.c, 00143.c)
 - [x] CTS-S4 (2) Multi-dimensional arrays (C99-41): nested
   `emitrust.array` types, nested ArrayAttr initializers (the C99-11
