@@ -2,7 +2,10 @@
 // C99-14/C99-15: differential end-to-end test: a mutable global counter
 // mutated across calls, a function-local static accumulator, a const
 // global, a zero-initialized global array read and written element-wise, a
-// global double, and tentative/extern reconciliation. main returns 0 and
+// global double, tentative/extern reconciliation, and a mutable global
+// named `c` (CTS-E1: the accessor closure binder is `__emitrust_tl`, so
+// the emitted pattern must not resolve against the `c` thread-local key
+// and fail rustc). main returns 0 and
 // reports everything via printf, so lit's per-command exit-code checking
 // covers both runs and diff covers the observable behavior.
 // --release is load-bearing: debug Rust panics on integer overflow where C
@@ -24,6 +27,7 @@ int limit = 50;
 const int scale = 3;     /* immutable global */
 double ratio = 2.5;
 int table[4];            /* zero-initialized global array */
+int c;                   /* CTS-E1: name must not shadow the accessor binder */
 
 int bump(void) {
   counter += scale;
@@ -66,7 +70,9 @@ int main(void) {
   counter = counter + table[2];
   limit = limit + counter;
   ratio = ratio * 2.0;
-  printf("counter=%d limit=%d sum=%d ratio=%f\n", counter, limit,
-         table_sum(), ratio);
+  c = counter - limit;
+  c = c + table[0];
+  printf("counter=%d limit=%d sum=%d ratio=%f c=%d\n", counter, limit,
+         table_sum(), ratio, c);
   return 0;
 }
