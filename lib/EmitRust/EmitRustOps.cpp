@@ -415,11 +415,20 @@ static bool isScalarValueType(Type type) {
 /// `type`: an array type requires exactly one entry per element, a struct
 /// type requires exactly one entry per field of the referenced
 /// `emitrust.struct_def` (in declaration order). Leaf entries must be typed
-/// attributes of the leaf type; aggregate entries recurse.
+/// attributes of the leaf type — except fn_ptr leaves, which carry opaque
+/// expressions (`Some(f)` / `None`) exactly like a top-level fn_ptr
+/// initializer; aggregate entries recurse.
 static LogicalResult verifyAggregateInit(Operation *op, Attribute init,
                                          Type type) {
   auto elements = dyn_cast<ArrayAttr>(init);
   if (!elements) {
+    // A function-pointer leaf (a fn_ptr struct field): an opaque
+    // expression, mirroring the top-level fn_ptr initializer form.
+    if (isa<FnPtrType>(type)) {
+      if (!isa<emitrust::OpaqueAttr>(init))
+        return op->emitOpError("fn_ptr init must be an opaque attribute");
+      return success();
+    }
     auto typedInit = dyn_cast<TypedAttr>(init);
     if (!typedInit)
       return op->emitOpError(

@@ -655,7 +655,12 @@ private:
   /// expression (`*p`, `p[i]`, `*p++`, ...), or null when the place is not
   /// a dereference or subscript through a tracked pointer. A place through
   /// a second-order dereference (`**pp`, `(*pp)[i]`) roots at the bound
-  /// selection target, so the write lands on the target's region.
+  /// selection target, so the write lands on the target's region. A global
+  /// data pointer at the root is tracked on first sight (like the
+  /// arithmetic and rebinding forms), so a body whose only mention of the
+  /// global is a write through it still contributes the write to the
+  /// program-wide facts — a read-only literal-backed global region must
+  /// reject it.
   const clang::VarDecl *trackedWritePlaceRoot(const clang::Expr *place);
 
   /// Marks `ptr`'s region undecomposable with diagnostic `reason` at `loc`;
@@ -1057,14 +1062,19 @@ private:
   ///    pointer, initialized to the initializer's element offset (or 0);
   ///  - a file-scope compound literal (`&(struct S){1, 2}`): a synthesized
   ///    constant-initialized backing global named `<name>_backing`;
+  ///  - a file-scope string-literal initializer (`char *s = "...";`,
+  ///    CTS-L3): a synthesized immutable `<name>_backing` byte-array
+  ///    global (the literal's ASCII bytes plus the terminating NUL, the
+  ///    CTS-P1 read-only backing lifted to module scope) plus a cursor
+  ///    global; writes through the region are rejected up front;
   ///  - a single constant-size `calloc`/`malloc` site: a synthesized
   ///    zero-initialized backing array global plus a cursor global.
   /// An unreferenced pointer global imports nothing (referenced-only
   /// policy, matching extern declarations). Located rejections: a binding
   /// to a local object (the borrow would outlive the object — the exact
-  /// program rustc refuses), multiple bases, string-literal bases,
-  /// copying a global pointer, address-of, null constants, external
-  /// linkage in a multi-file project, and type/base mismatches.
+  /// program rustc refuses), multiple bases, body bindings to string
+  /// literals, copying a global pointer, address-of, null constants,
+  /// external linkage in a multi-file project, and type/base mismatches.
   LogicalResult importPointerGlobal(const clang::VarDecl *key,
                                     const clang::VarDecl *decl,
                                     llvm::StringRef symbolName, Location loc);
@@ -1310,12 +1320,16 @@ private:
   LogicalResult emitInitListElement(Value place, Type type,
                                     const clang::Expr *element);
 
-  /// Emits a block-scope `char s[N] = "..."` initializer as per-element
-  /// byte assigns including the trailing NUL (when it fits, per C99
-  /// 6.7.8p14); elements beyond the literal keep the place's default zero
-  /// value. Only signless-i8 (plain/signed char) arrays are supported, and
-  /// non-ASCII bytes are rejected with located diagnostics so the array's
-  /// contents stay printable through the ASCII-only `%s`/`%c` helpers.
+  /// Emits a block-scope `char s[N] = "..."` (or `wchar_t s[N] = L"..."`)
+  /// initializer as per-element assigns including the trailing NUL (when
+  /// it fits, per C99 6.7.8p14); elements beyond the literal keep the
+  /// place's default zero value. An ordinary literal requires a
+  /// signless-i8 (plain/signed char) array and rejects non-ASCII bytes
+  /// with located diagnostics so the array's contents stay printable
+  /// through the ASCII-only `%s`/`%c` helpers; a wide literal requires an
+  /// i32 (`wchar_t`) array and carries its code units verbatim (a wide
+  /// array never feeds those byte-string helpers, so no ASCII limit
+  /// applies). u8/u/U literals stay rejected.
   LogicalResult emitStringArrayInit(Value place, Type type,
                                     const clang::StringLiteral *literal);
 
@@ -1723,6 +1737,16 @@ private:
   FailureOr<std::string>
   resolveFunctionPointerTarget(const clang::Expr *expr,
                                emitrust::FnPtrType fnPtrType, Location loc);
+
+  /// The declaration-level half of `resolveFunctionPointerTarget`: checks
+  /// that `callee` is an imported, non-variadic function whose MLIR
+  /// signature equals `fnPtrType` and returns its MLIR symbol name. Used
+  /// directly by the constant-initializer path (`convertAPValueInit`),
+  /// where clang's evaluator yields the target declaration rather than an
+  /// expression.
+  FailureOr<std::string>
+  resolveFunctionPointerDecl(const clang::FunctionDecl *callee,
+                             emitrust::FnPtrType fnPtrType, Location loc);
 
   /// Emits `f` (function-to-pointer decay) or `&f` as an
   /// `emitrust.constant` with an opaque `Some(<symbol>)` payload of the
@@ -2725,6 +2749,14 @@ PointerRegionAnalysis::trackedWritePlaceRoot(const clang::Expr *place) {
     if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
       if (tracks(var))
         return var;
+  // A global data pointer at the root joins the analysis on first sight
+  // (mirroring the arithmetic and rebinding forms), so the write-through
+  // fact reaches the program-wide merge even when the write is the body's
+  // only mention of the global.
+  if (const clang::VarDecl *global = asGlobalDataPointerRef(cursor)) {
+    pointerVars.insert(global);
+    return global;
+  }
   return nullptr;
 }
 
@@ -4150,6 +4182,7 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
   // compound literal) plus a byte offset.
   PointerRegion facts = globalPtrFacts.lookup(key);
   const clang::CompoundLiteralExpr *literalInit = nullptr;
+  const clang::StringLiteral *stringInit = nullptr;
   int64_t initByteOffset = 0;
   Location initLoc = loc;
   // Converts the initializer's byte offset into the flat cursor unit: the
@@ -4188,7 +4221,8 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
     } else if (const auto *baseExpr =
                    lvalueBase.dyn_cast<const clang::Expr *>()) {
       literalInit = llvm::dyn_cast<clang::CompoundLiteralExpr>(baseExpr);
-      if (!literalInit)
+      stringInit = llvm::dyn_cast<clang::StringLiteral>(baseExpr);
+      if (!literalInit && !stringInit)
         return emitError(initLoc)
                << "unsupported: global pointer initializer";
     } else {
@@ -4205,7 +4239,8 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
     return emitError(translateLoc(facts.literalLoc))
            << "unsupported: global pointer bound to a string literal";
   unsigned baseKinds = (facts.bases.empty() ? 0 : 1) +
-                       (facts.allocSite ? 1 : 0) + (literalInit ? 1 : 0);
+                       (facts.allocSite ? 1 : 0) + (literalInit ? 1 : 0) +
+                       (stringInit ? 1 : 0);
   if (baseKinds > 1 || facts.bases.size() >= 2) {
     if (facts.bases.size() >= 2) {
       const PointerBaseBinding &first = facts.bases[0];
@@ -4306,6 +4341,73 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
              << "unsupported: pointer type does not match its target object";
     pointerGlobals[key] =
         PointerGlobalInfo{key, backingName, *backingType, std::string()};
+    return success();
+  }
+
+  // Shape 2b: a file-scope string-literal initializer (`char *s = "...";`,
+  // CTS-L3) — the CTS-P1 read-only literal backing lifted to module scope.
+  // The literal's bytes plus the terminating NUL become an immutable
+  // `<name>_backing` byte-array global (never written: any write through
+  // the region is rejected below, since writing a C string literal is UB),
+  // and the pointer becomes a stored i64 cursor global into it.
+  if (stringInit) {
+    Location bindLoc = translateLoc(stringInit->getBeginLoc());
+    if (facts.hasWriteThrough)
+      return emitError(translateLoc(facts.writeThroughLoc))
+             << "unsupported: write through a pointer to a string literal "
+                "(the literal is read-only)";
+    // Nullable literal regions are outside the CTS-P8 scope, matching the
+    // function-local literal-region policy.
+    if (facts.nullable)
+      return emitError(translateLoc(facts.nullableLoc))
+             << "unsupported: null pointer constant assigned to a pointer "
+                "into a string literal";
+    if (!stringInit->isOrdinary())
+      return emitError(bindLoc) << "unsupported: non-ordinary string "
+                                   "literal bound to a pointer";
+    FailureOr<Type> elementType = mapType(pointee, bindLoc);
+    if (failed(elementType))
+      return failure();
+    Type byteType = builder.getIntegerType(8);
+    if (*elementType != byteType)
+      return emitError(bindLoc)
+             << "unsupported: pointer element type does not match its "
+                "string literal";
+    // The backing holds the bytes plus the terminating NUL, so a
+    // strlen-style walk terminates inside the array. Non-ASCII bytes are
+    // rejected so the region's contents stay exact through the ASCII-only
+    // `%s`/`%c` printing helpers (the CTS-P1/C99-28 policy).
+    uint64_t length = stringInit->getLength();
+    SmallVector<Attribute> bytes;
+    bytes.reserve(length + 1);
+    for (uint64_t i = 0; i != length; ++i) {
+      uint32_t byte = stringInit->getCodeUnit(i);
+      if (byte > 127)
+        return emitError(bindLoc) << "unsupported: non-ASCII byte in "
+                                     "string literal bound to a pointer";
+      bytes.push_back(
+          IntegerAttr::get(byteType, static_cast<int64_t>(byte)));
+    }
+    bytes.push_back(IntegerAttr::get(byteType, 0));
+    // The initializer's byte offset is the flat cursor directly (i8
+    // elements); anything past one-past-the-end is not a constant C
+    // pointer value, so the bound is defensive.
+    if (initByteOffset < 0 ||
+        static_cast<uint64_t>(initByteOffset) > length + 1)
+      return emitError(initLoc) << "unsupported: global pointer initializer";
+    auto backingType = emitrust::ArrayType::get(builder.getContext(),
+                                                length + 1, byteType);
+    std::string backingName = (symbolName + "_backing").str();
+    if (failed(checkFreshSymbol(backingName)))
+      return failure();
+    moduleBuilder.create<emitrust::GlobalOp>(
+        loc, moduleBuilder.getStringAttr(backingName),
+        TypeAttr::get(backingType), builder.getArrayAttr(bytes),
+        moduleBuilder.getUnitAttr());
+    if (failed(createCursorGlobal(symbolName, initByteOffset)))
+      return failure();
+    pointerGlobals[key] =
+        PointerGlobalInfo{key, backingName, backingType, symbolName.str()};
     return success();
   }
 
@@ -4454,14 +4556,18 @@ FailureOr<Attribute> CImporter::convertGlobalInit(const clang::VarDecl *decl,
   // through the APValue path below, but non-ASCII bytes are rejected up
   // front (mirroring the block-scope string initializer) so the array's
   // contents stay exact through the ASCII-only `%s`/`%c` printing helpers.
+  // A wide literal's code units fold to i32 elements that never feed those
+  // byte-string helpers, so they carry no ASCII limit (matching the
+  // block-scope `emitStringArrayInit` policy).
   if (init) {
     if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
             init->IgnoreParenImpCasts())) {
-      for (unsigned i = 0, n = literal->getLength(); i != n; ++i)
-        if (literal->getCodeUnit(i) > 127)
-          return emitError(initLoc)
-                 << "unsupported: non-ASCII byte in string literal "
-                    "initializer";
+      if (!literal->isWide())
+        for (unsigned i = 0, n = literal->getLength(); i != n; ++i)
+          if (literal->getCodeUnit(i) > 127)
+            return emitError(initLoc)
+                   << "unsupported: non-ASCII byte in string literal "
+                      "initializer";
     }
   }
   // A function-pointer global initializer is either the null constant
@@ -4595,6 +4701,29 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
       fields.push_back(*field);
     }
     return Attribute(builder.getArrayAttr(fields));
+  }
+  // A function-pointer element (a fn_ptr struct field, CTS-L3): the
+  // evaluator yields an lvalue whose base is the target function
+  // declaration (or the null constant, `None`). The signature check is the
+  // same one every fn_ptr constant goes through.
+  if (auto fnPtrType = llvm::dyn_cast<emitrust::FnPtrType>(type)) {
+    if (!value.isLValue())
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
+    if (value.isNullPointer())
+      return Attribute(
+          emitrust::OpaqueAttr::get(builder.getContext(), "None"));
+    const auto *callee = llvm::dyn_cast_or_null<clang::FunctionDecl>(
+        value.getLValueBase().dyn_cast<const clang::ValueDecl *>());
+    if (!callee || !value.getLValueOffset().isZero())
+      return emitError(loc)
+             << "unsupported: global function pointer initializer";
+    FailureOr<std::string> name =
+        resolveFunctionPointerDecl(callee, fnPtrType, loc);
+    if (failed(name))
+      return failure();
+    return Attribute(emitrust::OpaqueAttr::get(
+        builder.getContext(), (llvm::Twine("Some(") + *name + ")").str()));
   }
   return emitError(loc) << "unsupported: global initializer for this type";
 }
@@ -5803,24 +5932,30 @@ CImporter::emitStringArrayInit(Value place, Type type,
                                const clang::StringLiteral *literal) {
   Location loc = translateLoc(literal->getBeginLoc());
   auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(type);
-  if (!arrayType || arrayType.getElementType() != builder.getIntegerType(8))
-    return emitError(loc)
-           << "unsupported: string literal initializer for this type";
-  if (!literal->isOrdinary())
+  // An ordinary literal fills a byte (i8) array; a wide literal fills a
+  // `wchar_t` (i32 on the supported targets) array, one code unit per
+  // element. u8/u/U literals have no mapped element representation.
+  if (!literal->isOrdinary() && !literal->isWide())
     return emitError(loc) << "unsupported: non-ordinary string literal "
                              "initializer";
-  // C99 6.7.8p14: successive bytes of the literal (including the
+  Type expectedElement =
+      builder.getIntegerType(literal->isOrdinary() ? 8 : 32);
+  if (!arrayType || arrayType.getElementType() != expectedElement)
+    return emitError(loc)
+           << "unsupported: string literal initializer for this type";
+  // C99 6.7.8p14: successive code units of the literal (including the
   // terminating NUL if there is room) initialize the elements; Sema
   // guarantees the literal fits. Elements past the literal keep the
   // place's default zero value (matching C's zero fill), so only the
-  // literal's bytes plus the NUL are assigned.
+  // literal's code units plus the NUL are assigned.
   uint64_t length = literal->getLength();
   uint64_t count = std::min<uint64_t>(length + 1, arrayType.getSize());
   for (uint64_t i = 0; i != count; ++i) {
     uint32_t byte = i < length ? literal->getCodeUnit(i) : 0;
-    // Non-ASCII bytes are rejected so the array's contents stay exact
-    // through the ASCII-only `%s`/`%c` printing helpers.
-    if (byte > 127)
+    // Non-ASCII bytes of an ordinary literal are rejected so the array's
+    // contents stay exact through the ASCII-only `%s`/`%c` printing
+    // helpers; a wide array never feeds those helpers.
+    if (literal->isOrdinary() && byte > 127)
       return emitError(loc)
              << "unsupported: non-ASCII byte in string literal initializer";
     Value index =
@@ -9607,6 +9742,13 @@ CImporter::resolveFunctionPointerTarget(const clang::Expr *expr,
   if (!callee)
     return emitError(loc) << "unsupported: function pointer target is not a "
                              "direct function reference";
+  return resolveFunctionPointerDecl(callee, fnPtrType, loc);
+}
+
+FailureOr<std::string>
+CImporter::resolveFunctionPointerDecl(const clang::FunctionDecl *callee,
+                                      emitrust::FnPtrType fnPtrType,
+                                      Location loc) {
   // Variadic declarations (printf) are never imported, and a Rust `fn`
   // item cannot be variadic either.
   if (callee->isVariadic())
