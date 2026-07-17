@@ -518,13 +518,17 @@ rule.
   constant-evaluated; aggregate initializer lists are typed ArrayAttr
   element lists (C99-11); element/field access to global aggregates is
   load-modify-store of the whole value. Rejected with located
-  diagnostics: taking a global's address, Rust-keyword names, pointer
-  types, `_Thread_local`, extern-only declarations, and block-scope
-  extern.
+  diagnostics: taking a global's address in value position, Rust-keyword
+  names, `_Thread_local`, extern-only declarations, and block-scope
+  extern. Pointer-typed file-scope variables import through the CTS-P4
+  global region model (single global base plus a stored i64 cursor
+  global; see the c-testsuite checklist); pointer-typed function-local
+  statics stay rejected.
   (test/Dialect/EmitRust/ops.mlir, invalid.mlir,
   test/Target/Rust/globals.mlir, test/Import/C/globals.c,
   globals-invalid.c, globals-keyword.c, globals-extern-only.c,
   aggregate-init.c, globals-thread-local.c, globals-pointer.c,
+  globals-pointer-invalid.c,
   globals-extern-local.c, test/EndToEnd/globals.c)
 - [x] C99-15 Static local variables preserving state across calls
   (design decision needed for a no-unsafe mapping).
@@ -600,9 +604,10 @@ rule.
   i64 cursor) pairs intra-function and slice parameters
   (&mut [T]) across calls — the safe-Rust mapping is slices plus indices
   rather than raw offsets. Multi-base rebinding, escaping pointers
-  (&p, pointer struct fields, pointer globals, pointer returns), NULL
+  (&p, pointer struct fields, pointer returns), NULL
   data pointers, void* casts, and string-literal pointers stay located
-  rejections by design. See FR-28. Qualifying cross-function regions
+  rejections by design (pointer globals are now the CTS-P4 global
+  region model). See FR-28. Qualifying cross-function regions
   additionally promote to owner structs with &mut self methods (FR-30).
   (test/Import/C/pointers-local.c,
   pointers-param-slice.c, test/EndToEnd/pointers-local.c,
@@ -841,13 +846,17 @@ referenced regression tests pass under ninja check-emitrust.
   constant-evaluated; aggregate initializer lists are typed ArrayAttr
   element lists (C99-11); element/field access to global aggregates is
   load-modify-store of the whole value. Rejected with located
-  diagnostics: taking a global's address, Rust-keyword names, pointer
-  types, `_Thread_local`, extern-only declarations, and block-scope
-  extern.
+  diagnostics: taking a global's address in value position, Rust-keyword
+  names, `_Thread_local`, extern-only declarations, and block-scope
+  extern. Pointer-typed file-scope variables import through the CTS-P4
+  global region model (single global base plus a stored i64 cursor
+  global; see the c-testsuite checklist); pointer-typed function-local
+  statics stay rejected.
   (test/Dialect/EmitRust/ops.mlir, invalid.mlir,
   test/Target/Rust/globals.mlir, test/Import/C/globals.c,
   globals-invalid.c, globals-keyword.c, globals-extern-only.c,
   aggregate-init.c, globals-thread-local.c, globals-pointer.c,
+  globals-pointer-invalid.c,
   globals-extern-local.c, test/EndToEnd/globals.c)
 - [x] C99-15 Static local variables preserving state across calls
   (design decision needed for a no-unsafe mapping).
@@ -958,6 +967,37 @@ observed when C99-33 + C99-47 together unlocked 00215).
   cursors, or owner-struct promotion to module scope. C99-14 currently
   rejects these by design.
   (00040.c, 00045.c, 00149.c, 00209.c)
+  (Partial, 3 of 4: a pointer-typed global decomposes against a single
+  *global* region base; its cursor is a stored i64 `emitrust.global`
+  under the pointer's C name — a cursor is a borrow-free Copy integer,
+  so storing it globally never fights the thread_local!+Cell model, per
+  docs/transformation-theory.md section 4. Supported base shapes: a
+  global scalar/struct (`int *p = &x;`, degenerate — no runtime state),
+  a global array (cursor + the existing staged-copy element access), a
+  file-scope compound literal (synthesized `<name>_backing` global,
+  00149), and a single constant-size calloc/malloc site promoted to a
+  synthesized zero-initialized backing array whose assignment re-zeroes
+  it — exact calloc semantics on every execution (00040, whose recursion
+  and write-throughs all pass). Unreferenced pointer globals import
+  nothing (covers 00209's six incomplete-pointee declarations). Located
+  rejections pinned by test: binding a global pointer to a local object
+  — the borrow-escape rustc would refuse, rejected at the binding site —
+  plus multi-object regions, copying a global pointer, passing one to a
+  function (the callee would see the staged copy), address-of, string
+  literals, null constants, multiple allocation sites, and external
+  linkage in a multi-TU project. 00040 and 00045 and 00149 pass and are
+  in the manifest — ledger 178 -> 181 passed / 39 unsupported /
+  0 miscompiled. 00209 remains blocked, no longer on its pointer
+  globals: after the pointer-to-fn-ptr parameter and fn_ptr slice
+  extensions landed here (pointers-fnptr-slice.c), it now rejects at
+  "00209.c:24:10: error: unsupported: call with arguments through a
+  function pointer without a prototype" — f1 calls through the K&R
+  `int (*)()` typedef `fptr1`, a documented fn-pointer by-design
+  rejection (C99-46 scope, not CTS-P4).
+  (test/Import/C/globals-pointer.c, globals-pointer-invalid.c,
+  pointers-fnptr-slice.c; rustc-level differential
+  test/EndToEnd/pointers-global.c with data-dependent cursor updates
+  across calls)
 - [ ] CTS-P5 (2) Pointer-to-pointer values (`&p`, `**p`): second-order
   cursors over a region whose elements are themselves (base, cursor)
   pairs (C99-43).
@@ -1147,8 +1187,15 @@ observed when C99-33 + C99-47 together unlocked 00215).
   (00200.c)
 - [ ] CTS-L3 (2) String-literal and other initializers for
   pointer-typed objects (`char *s = "…"` at file scope, struct fields):
-  blocked on CTS-P1/CTS-P4; listed separately because the diagnostic
-  fires in convertGlobalInit rather than the pointer analysis.
+  a string-literal region base for a *global* pointer needs a module-level
+  read-only backing (the CTS-P1 backing is function-local), which CTS-P4
+  deliberately left rejected. Post-CTS-P4 diagnostics: 00089 rejects at
+  "00089.c:10:7: error: unsupported: global initializer for this type"
+  (pointer struct field, CTS-P2 adjacency) and 00220 at "00220.c:7:19:
+  error: unsupported: string literal initializer for this type"; a bare
+  `char *s = "…"` at file scope rejects in importPointerGlobal, and a
+  body binding as "global pointer bound to a string literal"
+  (globals-pointer-invalid.c).
   (00089.c, 00220.c)
 Not itemized above: printf precision (`%.3s`) and long-long length
 specifiers (`%llx`, `%10Ld`) remain outside the C99-47 grammar, but no
@@ -1164,10 +1211,13 @@ enums are supported), error-handling sugar, and expression trees (every
 value is a named let binding; no inlining of subexpressions). On the C side
 the importer rejects, with located diagnostics: computed goto (plain
 goto/labels are supported per C99-33), unions, bitfields,
-int-to-enum conversions, pointer-to-pointer values, pointer struct fields
-and pointer globals, NULL data pointers, void* casts, malloc and friends
+int-to-enum conversions, pointer-to-pointer values, pointer struct fields,
+NULL data pointers, void* casts, malloc and friends
 (pointer arithmetic, pointer locals, and pointer/array parameters are now
-supported through the FR-28 decomposition),
+supported through the FR-28 decomposition; pointer-typed globals with one
+global region base are supported per CTS-P4, including its carve-out
+promoting a single constant-size calloc/malloc site bound to a global
+pointer into a static backing array),
 multi-dimensional arrays, sizeof/_Alignof of
 variable-length-array/incomplete/function operands, conditional operators
 with non-scalar results, variadic definitions, and `char *` variables

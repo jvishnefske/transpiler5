@@ -112,8 +112,26 @@
 ///    `emitrust.global_load`/`emitrust.global_store`; element and field
 ///    accesses stage the whole value in a local copy and store it back
 ///    after a mutation, which is exact for the single-threaded subset.
-///    Taking the address of a global is rejected until globals get a
-///    pointer model.
+///    Taking the address of a global in value position stays rejected.
+///  - Pointer-typed globals (CTS-P4) decompose like pointer locals, but
+///    against a *global* region base: the pointer's cursor is a stored
+///    i64 `emitrust.global` under the pointer's C name (a cursor is a
+///    plain Copy integer, so storing it globally carries no borrow —
+///    which is what the `thread_local!`+Cell global model requires). The
+///    base is exactly one of: a global scalar/struct object (degenerate,
+///    no runtime state at all), a global array (cursor + staged element
+///    access), a file-scope compound literal (synthesized
+///    `<name>_backing` global), or a single constant-size
+///    `calloc`/`malloc` site (synthesized zero-initialized backing
+///    array; the assignment re-zeroes it, which is exact for calloc and
+///    a legal refinement of malloc's indeterminate contents). Program-wide
+///    facts are gathered by running the region analysis over every body in
+///    Pass A. Located rejections: binding a global pointer to a local
+///    object (the borrow would outlive the object — the exact program
+///    rustc refuses), copying a global pointer into another pointer
+///    variable, passing one to a function (the callee would see a borrow
+///    of the staged copy), multiple bases, string-literal bases, null
+///    constants, and external linkage in a multi-file project.
 ///
 /// The importer is a functional core (the `CImporter` class below, which
 /// owns the builder and per-function symbol table) driven by the imperative
@@ -292,6 +310,32 @@ struct PointerLocalInfo {
   Value literalBacking;
 };
 
+/// The imported model of one pointer-typed global variable (CTS-P4): the
+/// pointer decomposes into a statically known *global* region base plus,
+/// for array-shaped regions, a stored i64 element cursor that is itself a
+/// module-level `emitrust.global` under the pointer's own C name. Cursors
+/// are plain Copy integers, so a stored global cursor carries no borrow —
+/// which is what makes a pointer-typed global representable at all under
+/// the `thread_local!`+Cell global model (a borrow could never escape
+/// `.with`). A degenerate pointer (bound to one global scalar or struct
+/// object) needs no runtime state at all and creates no module ops.
+struct PointerGlobalInfo {
+  /// The global base object's declaration (canonical). For a synthesized
+  /// backing — a promoted `calloc`/`malloc` allocation or a file-scope
+  /// compound literal — this is the pointer's own declaration and
+  /// `backingSymbol` names the backing global.
+  const clang::VarDecl *base;
+  /// Module symbol of the synthesized backing `emitrust.global`; empty
+  /// when `base` is a real global object (resolved through the ordinary
+  /// globals map at each access).
+  std::string backingSymbol;
+  /// Mapped value type of the synthesized backing; null with real bases.
+  Type backingType;
+  /// Module symbol of the pointer's i64 cursor `emitrust.global`; empty
+  /// for a degenerate (whole-object) pointer, which has no runtime state.
+  std::string cursorSymbol;
+};
+
 /// One base binding of a pointer region: the object some pointer in the
 /// region was made to point into, and the source location of the assignment
 /// (or initializer) that bound it. The multi-base diagnostic names the
@@ -347,6 +391,18 @@ struct PointerRegion {
   bool hasWriteThrough = false;
   /// First write-through site; meaningful only with `hasWriteThrough`.
   clang::SourceLocation writeThroughLoc;
+  /// The single recognized allocation call (`calloc`/`malloc` with
+  /// compile-time-constant sizes) bound to a global pointer of the region;
+  /// the allocation is promoted to a synthesized zero-initialized global
+  /// backing array (see `importPointerGlobal`). Null when no allocation is
+  /// bound. Mutually exclusive with `bases` for a consumable region.
+  const clang::Expr *allocSite = nullptr;
+  /// Where the allocation binding was established; meaningful only with
+  /// `allocSite`.
+  clang::SourceLocation allocLoc;
+  /// Number of pointee elements the allocation covers; meaningful only
+  /// with `allocSite`.
+  uint64_t allocCount = 0;
   /// First invalidating construct; meaningful only with `invalidReason`.
   clang::SourceLocation invalidLoc;
   /// Diagnostic text of the invalidating construct; empty when the region
@@ -425,6 +481,16 @@ private:
   /// at `loc`; a string-literal region rejects at this location.
   void recordWriteThrough(const clang::VarDecl *ptr,
                           clang::SourceLocation loc);
+
+  /// Binds a `calloc(n, size)` / `malloc(bytes)` call with compile-time
+  /// constant arguments as the allocation base of the global pointer
+  /// `ptr`'s region (the allocation is later promoted to a synthesized
+  /// zero-initialized global backing array of the pointer's element
+  /// type). The byte total must be a positive constant multiple of the
+  /// element size; violations and a second distinct allocation site mark
+  /// the region invalid.
+  void recordAllocBase(const clang::VarDecl *ptr, const clang::CallExpr *call,
+                       clang::SourceLocation loc);
 
   /// Returns the tracked pointer local at the root of a written place
   /// expression (`*p`, `p[i]`, `*p++`, ...), or null when the place is not
@@ -732,8 +798,44 @@ private:
   /// `extern`-declared in this TU is skipped when nothing references it
   /// (referenced-only policy); when referenced it is deferred for cross-TU
   /// resolution (project import) or rejected (single-file import).
+  /// Data-pointer-typed variables route to `importPointerGlobal`.
   /// Thread-locals are rejected.
   LogicalResult importGlobalVar(const clang::VarDecl *var);
+
+  /// Imports a pointer-typed file-scope variable under the CTS-P4 global
+  /// region model. The program-wide facts merged by `planOwners` combine
+  /// with the file-scope initializer's constant-evaluated binding (clang
+  /// APValue lvalue: base declaration plus byte offset); the pointer must
+  /// resolve to exactly one region base, which is one of:
+  ///  - a global scalar or struct object (`int *p = &x;`): degenerate, no
+  ///    runtime state, every access resolves statically to the base;
+  ///  - a global array: an i64 cursor `emitrust.global` named after the
+  ///    pointer, initialized to the initializer's element offset (or 0);
+  ///  - a file-scope compound literal (`&(struct S){1, 2}`): a synthesized
+  ///    constant-initialized backing global named `<name>_backing`;
+  ///  - a single constant-size `calloc`/`malloc` site: a synthesized
+  ///    zero-initialized backing array global plus a cursor global.
+  /// An unreferenced pointer global imports nothing (referenced-only
+  /// policy, matching extern declarations). Located rejections: a binding
+  /// to a local object (the borrow would outlive the object — the exact
+  /// program rustc refuses), multiple bases, string-literal bases,
+  /// copying a global pointer, address-of, null constants, external
+  /// linkage in a multi-file project, and type/base mismatches.
+  LogicalResult importPointerGlobal(const clang::VarDecl *key,
+                                    const clang::VarDecl *decl,
+                                    llvm::StringRef symbolName, Location loc);
+
+  /// Emits `g = rhs` for an imported pointer-typed global: a recognized
+  /// allocation call re-zeroes the synthesized backing (exact calloc
+  /// semantics; malloc's contents are indeterminate, so zero-filling is a
+  /// legal refinement) and resets the cursor; any other right-hand side
+  /// decomposes and must resolve into the pointer's region, storing its
+  /// cursor with `emitrust.global_store` (nothing for degenerate bases,
+  /// whose target place is statically known).
+  LogicalResult storeGlobalPointerAssign(Location loc,
+                                         const clang::VarDecl *ptr,
+                                         const PointerGlobalInfo &info,
+                                         const clang::Expr *rhs);
 
   /// Creates the `emitrust.global` named `symbolName` for the declaration
   /// `decl` (which supplies the type and initializer) and registers it
@@ -1255,9 +1357,15 @@ private:
   /// must wrap; a flat cursor into a multi-dimensional array peels one
   /// array level per subscript, dividing the cursor by the level's flat
   /// element count and continuing with the remainder (row-major order).
+  /// A global region base (a global object, or a pointer global's
+  /// synthesized backing) stages the global's whole value in a local
+  /// copy exactly like a direct global element access; a write context
+  /// passes `writeback` to capture the pending store-back, which the
+  /// caller must flush with `flushGlobalWriteback` after the mutation.
   FailureOr<Value> emitPointerPlace(Location loc,
                                     const PtrExprValue &pointer,
-                                    Type pointeeType);
+                                    Type pointeeType,
+                                    GlobalWriteback *writeback = nullptr);
 
   /// Emits `p - q` on two decomposed pointers into the same object as the
   /// plain i64 cursor difference (C's ptrdiff_t is `long`, i.e. i64, on
@@ -1430,6 +1538,21 @@ private:
   /// Imported globals (file-scope variables and function-local statics),
   /// keyed by canonical clang declaration.
   llvm::DenseMap<const clang::VarDecl *, GlobalInfo> globals;
+  /// Imported pointer-typed globals (CTS-P4), keyed by canonical
+  /// declaration; disjoint from `globals` (a pointer global has no
+  /// whole-value representation of its own, only a region base and an
+  /// optional cursor global).
+  llvm::DenseMap<const clang::VarDecl *, PointerGlobalInfo> pointerGlobals;
+  /// Program-wide pointer-region facts of every global pointer variable,
+  /// keyed by canonical declaration: `planOwners` (Pass A) merges each
+  /// function body's region view, and `importPointerGlobal` (Pass B)
+  /// validates the union against the file-scope initializer.
+  llvm::DenseMap<const clang::VarDecl *, PointerRegion> globalPtrFacts;
+  /// Whether the TU currently being imported is the whole program (see
+  /// `importTranslationUnit`); pointer-typed globals with external linkage
+  /// are rejected in multi-file projects because a later TU's bindings
+  /// could invalidate facts this TU has already consumed.
+  bool currentSoleTU = false;
   /// Stack of break/continue targets for nested loops and switches.
   SmallVector<LoopTargets> loopStack;
   /// Blocks started by C labels in the function under construction, keyed
@@ -1670,6 +1793,44 @@ static const clang::VarDecl *asVarRef(const clang::Expr *expr) {
   return var;
 }
 
+/// Returns the static-storage (file-scope or static-local) data-pointer
+/// variable a stripped declaration reference `expr` names, canonicalized,
+/// or null when `expr` is not such a reference. Global pointers
+/// participate in the region analysis so that `planOwners` can merge
+/// their per-function facts program-wide and `importPointerGlobal` can
+/// validate the union (CTS-P4).
+static const clang::VarDecl *asGlobalDataPointerRef(const clang::Expr *expr) {
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(expr));
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var || var->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(var))
+    return nullptr;
+  if (!isPointerType(var->getType()) || isFunctionPointer(var->getType()))
+    return nullptr;
+  return var->getCanonicalDecl();
+}
+
+/// Returns the `calloc`/`malloc` call at the root of `expr` (looking
+/// through casts, e.g. the implicit `void *` conversion), or null. Only
+/// definition-less declarations qualify: a user-defined function of the
+/// same name is an ordinary call, never a promotable allocation.
+static const clang::CallExpr *asAllocCall(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
+    e = stripTrivia(cast->getSubExpr());
+  const auto *call = llvm::dyn_cast<clang::CallExpr>(e);
+  if (!call)
+    return nullptr;
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  if (!callee || callee->hasBody() || !callee->getIdentifier())
+    return nullptr;
+  llvm::StringRef name = callee->getName();
+  if (name != "calloc" && name != "malloc")
+    return nullptr;
+  return call;
+}
+
 /// Returns the pointer-typed parameter a stripped (possibly
 /// lvalue-to-rvalue-wrapped) declaration reference `expr` names, or null
 /// when `expr` is not such a reference.
@@ -1783,20 +1944,14 @@ PointerRegionAnalysis::findRoot(const clang::VarDecl *decl) {
   return root;
 }
 
-void PointerRegionAnalysis::unite(const clang::VarDecl *a,
-                                  const clang::VarDecl *b) {
-  const clang::VarDecl *rootA = findRoot(a);
-  const clang::VarDecl *rootB = findRoot(b);
-  if (rootA == rootB)
-    return;
-  parent[rootB] = rootA;
-  auto itB = regions.find(rootB);
-  if (itB == regions.end())
-    return;
-  // Merge the absorbed root's facts into the surviving root's region.
-  PointerRegion absorbed = std::move(itB->second);
-  regions.erase(itB);
-  PointerRegion &target = regions[rootA];
+/// Merges the facts of `absorbed` into `target`: bases are deduplicated by
+/// declaration, literal and allocation bases conflict when they differ (a
+/// pointer cannot range over two of them), flag/location pairs keep the
+/// first recorded site, and only the first invalidation is kept. Used both
+/// by the per-function union-find (`unite`) and by the program-wide
+/// aggregation of a global pointer's per-function regions (`planOwners`).
+static void mergeRegionFacts(PointerRegion &target,
+                             const PointerRegion &absorbed) {
   for (const PointerBaseBinding &binding : absorbed.bases) {
     bool known = llvm::any_of(target.bases,
                               [&](const PointerBaseBinding &existing) {
@@ -1816,6 +1971,18 @@ void PointerRegionAnalysis::unite(const clang::VarDecl *a,
       target.invalidLoc = absorbed.literalLoc;
     }
   }
+  if (absorbed.allocSite) {
+    if (!target.allocSite) {
+      target.allocSite = absorbed.allocSite;
+      target.allocLoc = absorbed.allocLoc;
+      target.allocCount = absorbed.allocCount;
+    } else if (target.allocSite != absorbed.allocSite &&
+               target.invalidReason.empty()) {
+      target.invalidReason =
+          "unsupported: global pointer bound to multiple allocations";
+      target.invalidLoc = absorbed.allocLoc;
+    }
+  }
   if (absorbed.hasArithmetic && !target.hasArithmetic) {
     target.hasArithmetic = true;
     target.arithmeticLoc = absorbed.arithmeticLoc;
@@ -1825,9 +1992,25 @@ void PointerRegionAnalysis::unite(const clang::VarDecl *a,
     target.writeThroughLoc = absorbed.writeThroughLoc;
   }
   if (!absorbed.invalidReason.empty() && target.invalidReason.empty()) {
-    target.invalidReason = std::move(absorbed.invalidReason);
+    target.invalidReason = absorbed.invalidReason;
     target.invalidLoc = absorbed.invalidLoc;
   }
+}
+
+void PointerRegionAnalysis::unite(const clang::VarDecl *a,
+                                  const clang::VarDecl *b) {
+  const clang::VarDecl *rootA = findRoot(a);
+  const clang::VarDecl *rootB = findRoot(b);
+  if (rootA == rootB)
+    return;
+  parent[rootB] = rootA;
+  auto itB = regions.find(rootB);
+  if (itB == regions.end())
+    return;
+  // Merge the absorbed root's facts into the surviving root's region.
+  PointerRegion absorbed = std::move(itB->second);
+  regions.erase(itB);
+  mergeRegionFacts(regions[rootA], absorbed);
 }
 
 PointerRegion &PointerRegionAnalysis::regionFor(const clang::VarDecl *decl) {
@@ -1837,8 +2020,22 @@ PointerRegion &PointerRegionAnalysis::regionFor(const clang::VarDecl *decl) {
 void PointerRegionAnalysis::addBase(const clang::VarDecl *ptr,
                                     const clang::VarDecl *base,
                                     clang::SourceLocation loc) {
-  if (!base->hasLocalStorage())
+  bool ptrIsGlobal = !ptr->hasLocalStorage();
+  bool baseIsGlobal = !base->hasLocalStorage();
+  // A local pointer into a global object would dangle from the staged-copy
+  // global access model (CTS-P6 scope); a global pointer bound to a local
+  // object is a borrow escaping the object's scope — the exact program
+  // rustc would refuse — rejected here, at the binding site (CTS-P4).
+  if (!ptrIsGlobal && baseIsGlobal)
     return markInvalid(ptr, loc, "unsupported: pointer into a global variable");
+  if (ptrIsGlobal && !baseIsGlobal)
+    return markInvalid(
+        ptr, loc,
+        ("unsupported: global pointer bound to local object '" +
+         base->getName() + "' (the borrow would outlive the object)")
+            .str());
+  if (baseIsGlobal)
+    base = base->getCanonicalDecl();
   unite(ptr, base);
   PointerRegion &region = regionFor(ptr);
   bool known = llvm::any_of(region.bases,
@@ -1879,6 +2076,63 @@ void PointerRegionAnalysis::recordWriteThrough(const clang::VarDecl *ptr,
     region.hasWriteThrough = true;
     region.writeThroughLoc = loc;
   }
+}
+
+void PointerRegionAnalysis::recordAllocBase(const clang::VarDecl *ptr,
+                                            const clang::CallExpr *call,
+                                            clang::SourceLocation loc) {
+  clang::QualType pointee =
+      ptr->getType().getCanonicalType()->getPointeeType();
+  if (pointee->isIncompleteType() || pointee->isFunctionType())
+    return markInvalid(ptr, loc,
+                       "unsupported: allocation bound to a pointer with an "
+                       "unsized element type");
+  uint64_t elementBytes =
+      context->getTypeSizeInChars(pointee).getQuantity();
+  auto evalConstant = [&](const clang::Expr *arg, uint64_t &out) {
+    clang::Expr::EvalResult result;
+    if (!arg->EvaluateAsInt(result, *context) ||
+        result.Val.getInt().isNegative())
+      return false;
+    out = result.Val.getInt().getZExtValue();
+    return true;
+  };
+  llvm::StringRef callee = call->getDirectCallee()->getName();
+  uint64_t totalBytes = 0;
+  if (callee == "calloc") {
+    uint64_t count = 0;
+    uint64_t size = 0;
+    if (call->getNumArgs() != 2 ||
+        !evalConstant(call->getArg(0), count) ||
+        !evalConstant(call->getArg(1), size))
+      return markInvalid(ptr, loc,
+                         "unsupported: allocation size is not a "
+                         "compile-time constant");
+    totalBytes = count * size;
+  } else {
+    if (call->getNumArgs() != 1 ||
+        !evalConstant(call->getArg(0), totalBytes))
+      return markInvalid(ptr, loc,
+                         "unsupported: allocation size is not a "
+                         "compile-time constant");
+  }
+  // The synthesized backing is a fixed-size Rust array; cap it so the
+  // generated code stays reasonable (matching no real program in the
+  // suite is expected to exceed this).
+  if (elementBytes == 0 || totalBytes == 0 ||
+      totalBytes % elementBytes != 0 ||
+      totalBytes / elementBytes > 65536)
+    return markInvalid(ptr, loc,
+                       "unsupported: allocation size does not fit the "
+                       "pointer's element type");
+  PointerRegion &region = regionFor(ptr);
+  if (region.allocSite && region.allocSite != call)
+    return markInvalid(ptr, loc,
+                       "unsupported: global pointer bound to multiple "
+                       "allocations");
+  region.allocSite = call;
+  region.allocLoc = loc;
+  region.allocCount = totalBytes / elementBytes;
 }
 
 const clang::VarDecl *
@@ -1952,6 +2206,14 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
         ptr, loc,
         "unsupported: null pointer constant assigned to a pointer variable");
 
+  // `g = calloc(n, sizeof(T))` / `g = malloc(bytes)` on a global pointer:
+  // a constant-size allocation binding, promoted to a synthesized global
+  // backing array. Allocations bound to local pointers keep the historical
+  // non-address rejection below.
+  if (!ptr->hasLocalStorage())
+    if (const clang::CallExpr *alloc = asAllocCall(e))
+      return recordAllocBase(ptr, alloc, loc);
+
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
     switch (cast->getCastKind()) {
     case clang::CK_NoOp:
@@ -1961,6 +2223,12 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
       if (const clang::VarDecl *source = asLocalVarRef(cast->getSubExpr()))
         if (tracks(source))
           return unite(ptr, source);
+      // Copying a global pointer (in either direction) would couple a
+      // local cursor cell to the global's stored cursor; the shape is
+      // outside the CTS-P4 model.
+      if (asGlobalDataPointerRef(cast->getSubExpr()))
+        return markInvalid(ptr, loc,
+                           "unsupported: copying a global pointer variable");
       // `p = param`: a pointer parameter (slice-classified by this very
       // use) becomes the region base; the local walks the parameter's
       // element run through its own cursor.
@@ -2088,11 +2356,17 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
   } else if (const auto *compound =
                  llvm::dyn_cast<clang::CompoundAssignOperator>(stmt)) {
     // `p += n` / `p -= n` walk the pointer without rebinding it;
-    // `*p += n` / `p[i] -= n` write through the pointer.
+    // `*p += n` / `p[i] -= n` write through the pointer. A global pointer
+    // (tracked on first mention) walks its stored global cursor.
     if (isPointerType(compound->getLHS()->getType())) {
-      if (const clang::VarDecl *var = asLocalVarRef(compound->getLHS()))
+      if (const clang::VarDecl *var = asLocalVarRef(compound->getLHS())) {
         if (tracks(var))
           recordArithmetic(var, compound->getOperatorLoc());
+      } else if (const clang::VarDecl *global =
+                     asGlobalDataPointerRef(compound->getLHS())) {
+        pointerVars.insert(global);
+        recordArithmetic(global, compound->getOperatorLoc());
+      }
     } else if (const clang::VarDecl *var =
                    trackedWritePlaceRoot(compound->getLHS())) {
       recordWriteThrough(var, compound->getOperatorLoc());
@@ -2100,9 +2374,14 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
   } else if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt)) {
     if (binary->getOpcode() == clang::BO_Assign) {
       if (isPointerType(binary->getLHS()->getType())) {
-        if (const clang::VarDecl *var = asLocalVarRef(binary->getLHS()))
+        if (const clang::VarDecl *var = asLocalVarRef(binary->getLHS())) {
           if (tracks(var))
             recordPointerWrite(var, binary->getRHS());
+        } else if (const clang::VarDecl *global =
+                       asGlobalDataPointerRef(binary->getLHS())) {
+          pointerVars.insert(global);
+          recordPointerWrite(global, binary->getRHS());
+        }
       } else if (const clang::VarDecl *var =
                      trackedWritePlaceRoot(binary->getLHS())) {
         // `*p = v` / `p[i] = v`: a write through the region's pointers.
@@ -2112,20 +2391,32 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
   } else if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
     if (unary->isIncrementDecrementOp() &&
         isPointerType(unary->getSubExpr()->getType())) {
-      if (const clang::VarDecl *var = asLocalVarRef(unary->getSubExpr()))
+      if (const clang::VarDecl *var = asLocalVarRef(unary->getSubExpr())) {
         if (tracks(var))
           recordArithmetic(var, unary->getOperatorLoc());
+      } else if (const clang::VarDecl *global =
+                     asGlobalDataPointerRef(unary->getSubExpr())) {
+        pointerVars.insert(global);
+        recordArithmetic(global, unary->getOperatorLoc());
+      }
     } else if (unary->isIncrementDecrementOp()) {
       // `(*p)++` / `--p[i]`: a write through the region's pointers.
       if (const clang::VarDecl *var =
               trackedWritePlaceRoot(unary->getSubExpr()))
         recordWriteThrough(var, unary->getOperatorLoc());
     } else if (unary->getOpcode() == clang::UO_AddrOf) {
-      // `&p` would let the pointer escape the decomposition.
-      if (const clang::VarDecl *var = asLocalVarRef(unary->getSubExpr()))
+      // `&p` would let the pointer escape the decomposition; a global
+      // pointer's address escaping is the same shape.
+      if (const clang::VarDecl *var = asLocalVarRef(unary->getSubExpr())) {
         if (tracks(var))
           markInvalid(var, unary->getOperatorLoc(),
                       "unsupported: taking the address of a pointer variable");
+      } else if (const clang::VarDecl *global =
+                     asGlobalDataPointerRef(unary->getSubExpr())) {
+        pointerVars.insert(global);
+        markInvalid(global, unary->getOperatorLoc(),
+                    "unsupported: taking the address of a pointer variable");
+      }
     }
   }
   // Pointer call arguments no longer invalidate the region (Phase 1b):
@@ -2325,7 +2616,12 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     return mapType(type, loc);
   if (canonical->isPointerType()) {
     clang::QualType pointee = canonical->getPointeeType();
-    if (pointee.getCanonicalType()->isPointerType())
+    // A pointee that is itself a *data* pointer has no representation
+    // (CTS-P5); a function-pointer pointee is an ordinary Copy value
+    // (`!emitrust.fn_ptr`) and slices/references over it are fine — the
+    // shape a decayed array-of-function-pointers parameter produces.
+    if (pointee.getCanonicalType()->isPointerType() &&
+        !pointee.getCanonicalType()->isFunctionPointerType())
       return emitError(loc) << "unsupported: pointer-to-pointer parameter";
     FailureOr<Type> inner = mapType(pointee, loc);
     if (failed(inner))
@@ -2529,6 +2825,15 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
           poisoned.insert(binding.base);
       }
     }
+
+    // Program-wide facts of pointer-typed globals (CTS-P4): merge this
+    // body's region view of every tracked global pointer;
+    // `importPointerGlobal` validates the union when the global itself is
+    // imported (Pass B).
+    for (const clang::VarDecl *var : analysis.trackedVars())
+      if (!var->hasLocalStorage())
+        if (const PointerRegion *region = analysis.regionOf(var))
+          mergeRegionFacts(globalPtrFacts[var->getCanonicalDecl()], *region);
 
     // Call edges: a pointer argument's root object unifies with the callee
     // definition's parameter; an unresolvable root poisons the parameter's
@@ -3037,7 +3342,259 @@ LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   const clang::Expr *init = canonical->getAnyInitializer(initDecl);
   const clang::VarDecl *typeDecl =
       init ? initDecl : canonical->getMostRecentDecl();
+  clang::QualType varType = typeDecl->getType().getCanonicalType();
+  if (varType->isPointerType() && !varType->isFunctionPointerType())
+    return importPointerGlobal(canonical, typeDecl, symbolName, loc);
   return createGlobal(canonical, typeDecl, symbolName, loc);
+}
+
+LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
+                                             const clang::VarDecl *decl,
+                                             llvm::StringRef symbolName,
+                                             Location loc) {
+  // Referenced-only import: an unreferenced pointer global demands no
+  // storage anywhere in the supported subset (nothing can observe it), so
+  // declarations like `struct S *s;` — even with incomplete pointee
+  // types — import nothing.
+  if (!key->isReferenced())
+    return success();
+  // Program-wide facts are merged per TU by `planOwners`; an externally
+  // visible pointer global in a multi-file project could be rebound by a
+  // TU whose facts are not visible when this one imports.
+  if (!currentSoleTU && key->isExternallyVisible())
+    return emitError(loc) << "unsupported: pointer-typed global variable "
+                             "with external linkage in a multi-file project";
+  if (isRustKeyword(symbolName))
+    return emitError(loc) << "unsupported: global variable name '"
+                          << symbolName << "' is a Rust keyword";
+  if (symbolName == "__emitrust_tl")
+    return emitError(loc) << "unsupported: global variable name "
+                             "'__emitrust_tl' is reserved for the "
+                             "thread-local accessor binder";
+  auto checkFreshSymbol = [&](llvm::StringRef name) -> LogicalResult {
+    if (SymbolTable::lookupSymbolIn(module, name))
+      return emitError(loc) << "unsupported: global variable '" << name
+                            << "' collides with an existing symbol";
+    return success();
+  };
+
+  clang::QualType pointee =
+      decl->getType().getCanonicalType()->getPointeeType();
+
+  // Start from the program-wide body facts and merge the file-scope
+  // initializer's binding: static storage requires a constant initializer,
+  // so clang's evaluator yields an lvalue APValue — a base (declaration or
+  // compound literal) plus a byte offset.
+  PointerRegion facts = globalPtrFacts.lookup(key);
+  const clang::CompoundLiteralExpr *literalInit = nullptr;
+  int64_t initByteOffset = 0;
+  Location initLoc = loc;
+  // Converts the initializer's byte offset into the flat cursor unit: the
+  // number of innermost (non-array) elements of `objectType` it spans.
+  // Fails (nullopt) when the offset does not land on an element boundary.
+  auto flatCursorOffset =
+      [&](clang::QualType objectType) -> std::optional<int64_t> {
+    clang::QualType innermost = astContext().getBaseElementType(objectType);
+    int64_t innerBytes =
+        astContext().getTypeSizeInChars(innermost).getQuantity();
+    if (innerBytes <= 0 || initByteOffset < 0 ||
+        initByteOffset % innerBytes != 0)
+      return std::nullopt;
+    return initByteOffset / innerBytes;
+  };
+  if (const clang::Expr *init = decl->getInit()) {
+    initLoc = translateLoc(init->getBeginLoc());
+    const clang::APValue *value = decl->evaluateValue();
+    if (!value || !value->isLValue())
+      return emitError(initLoc) << "unsupported: global pointer initializer";
+    if (value->isNullPointer())
+      return emitError(initLoc) << "unsupported: null pointer constant "
+                                   "assigned to a pointer variable";
+    initByteOffset = value->getLValueOffset().getQuantity();
+    clang::APValue::LValueBase lvalueBase = value->getLValueBase();
+    if (const auto *baseDecl =
+            lvalueBase.dyn_cast<const clang::ValueDecl *>()) {
+      const auto *baseVar = llvm::dyn_cast<clang::VarDecl>(baseDecl);
+      if (!baseVar || baseVar->hasLocalStorage())
+        return emitError(initLoc)
+               << "unsupported: global pointer initializer";
+      PointerRegion initBinding;
+      initBinding.bases.push_back(PointerBaseBinding{
+          baseVar->getCanonicalDecl(), init->getBeginLoc()});
+      mergeRegionFacts(facts, initBinding);
+    } else if (const auto *baseExpr =
+                   lvalueBase.dyn_cast<const clang::Expr *>()) {
+      literalInit = llvm::dyn_cast<clang::CompoundLiteralExpr>(baseExpr);
+      if (!literalInit)
+        return emitError(initLoc)
+               << "unsupported: global pointer initializer";
+    } else {
+      return emitError(initLoc) << "unsupported: global pointer initializer";
+    }
+  }
+
+  // Region validation, mirroring `emitPointerLocal`: the first
+  // invalidating construct (a binding to a local object, a copied global
+  // pointer, an escaping address, ...) rejects at its own site.
+  if (!facts.invalidReason.empty())
+    return emitError(translateLoc(facts.invalidLoc)) << facts.invalidReason;
+  if (facts.literalBase)
+    return emitError(translateLoc(facts.literalLoc))
+           << "unsupported: global pointer bound to a string literal";
+  unsigned baseKinds = (facts.bases.empty() ? 0 : 1) +
+                       (facts.allocSite ? 1 : 0) + (literalInit ? 1 : 0);
+  if (baseKinds > 1 || facts.bases.size() >= 2) {
+    if (facts.bases.size() >= 2) {
+      const PointerBaseBinding &first = facts.bases[0];
+      const PointerBaseBinding &second = facts.bases[1];
+      InFlightDiagnostic diag = emitError(loc);
+      diag << "unsupported: global pointer '" << symbolName
+           << "' would join objects '" << first.base->getName() << "' and '"
+           << second.base->getName() << "' into one region";
+      diag.attachNote(translateLoc(first.loc))
+          << "bound to '" << first.base->getName() << "' here";
+      diag.attachNote(translateLoc(second.loc))
+          << "bound to '" << second.base->getName() << "' here";
+      return diag;
+    }
+    return emitError(loc) << "unsupported: global pointer '" << symbolName
+                          << "' bound to multiple objects";
+  }
+  if (baseKinds == 0)
+    return emitError(loc) << "unsupported: global pointer variable '"
+                          << symbolName << "' has no known target object";
+
+  OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+  IntegerType i64Type = builder.getIntegerType(64);
+  auto createCursorGlobal = [&](llvm::StringRef name,
+                                int64_t start) -> LogicalResult {
+    if (failed(checkFreshSymbol(name)))
+      return failure();
+    moduleBuilder.create<emitrust::GlobalOp>(
+        loc, moduleBuilder.getStringAttr(name), TypeAttr::get(i64Type),
+        moduleBuilder.getIntegerAttr(i64Type, start), UnitAttr());
+    return success();
+  };
+
+  // Shape 1: a promoted constant-size allocation — a zero-initialized
+  // backing array global plus the cursor global.
+  if (facts.allocSite) {
+    Location allocLoc = translateLoc(facts.allocLoc);
+    FailureOr<Type> elementType = mapType(pointee, allocLoc);
+    if (failed(elementType))
+      return failure();
+    Type backingType = emitrust::ArrayType::get(
+        builder.getContext(), facts.allocCount, *elementType);
+    std::string backingName = (symbolName + "_backing").str();
+    if (failed(checkFreshSymbol(backingName)))
+      return failure();
+    moduleBuilder.create<emitrust::GlobalOp>(
+        loc, moduleBuilder.getStringAttr(backingName),
+        TypeAttr::get(backingType), Attribute(), UnitAttr());
+    if (failed(createCursorGlobal(symbolName, 0)))
+      return failure();
+    pointerGlobals[key] =
+        PointerGlobalInfo{key, backingName, backingType, symbolName.str()};
+    return success();
+  }
+
+  // Shape 2: a file-scope compound literal — a synthesized
+  // constant-initialized backing global; degenerate for scalar/struct
+  // literals, cursor-carrying for array literals.
+  if (literalInit) {
+    Location initLoc = translateLoc(literalInit->getBeginLoc());
+    clang::QualType literalType = literalInit->getType();
+    FailureOr<Type> backingType = mapType(literalType, initLoc);
+    if (failed(backingType))
+      return failure();
+    clang::Expr::EvalResult literalValue;
+    if (!literalInit->getInitializer()->EvaluateAsRValue(literalValue,
+                                                         astContext()) ||
+        literalValue.HasSideEffects)
+      return emitError(initLoc)
+             << "unsupported: non-constant global initializer";
+    FailureOr<Attribute> init =
+        convertAPValueInit(literalValue.Val, *backingType, initLoc);
+    if (failed(init))
+      return failure();
+    std::string backingName = (symbolName + "_backing").str();
+    if (failed(checkFreshSymbol(backingName)))
+      return failure();
+    moduleBuilder.create<emitrust::GlobalOp>(
+        loc, moduleBuilder.getStringAttr(backingName),
+        TypeAttr::get(*backingType), *init, UnitAttr());
+    if (astContext().getAsConstantArrayType(literalType)) {
+      std::optional<int64_t> start = flatCursorOffset(literalType);
+      if (!start)
+        return emitError(initLoc)
+               << "unsupported: global pointer initializer";
+      if (failed(createCursorGlobal(symbolName, *start)))
+        return failure();
+      pointerGlobals[key] = PointerGlobalInfo{key, backingName, *backingType,
+                                              symbolName.str()};
+      return success();
+    }
+    if (facts.hasArithmetic)
+      return emitError(translateLoc(facts.arithmeticLoc))
+             << "unsupported: arithmetic on the address of a scalar object";
+    if (initByteOffset != 0 ||
+        !astContext().hasSameUnqualifiedType(pointee, literalType))
+      return emitError(initLoc)
+             << "unsupported: pointer type does not match its target object";
+    pointerGlobals[key] =
+        PointerGlobalInfo{key, backingName, *backingType, std::string()};
+    return success();
+  }
+
+  // Shape 3: a real global object base. The base's own `emitrust.global`
+  // is resolved at each access (it may be declared later in the TU); the
+  // type compatibility check runs on the C types, mirroring
+  // `emitPointerLocal`.
+  const PointerBaseBinding &binding = facts.bases.front();
+  const clang::VarDecl *base = binding.base;
+  Location bindLoc = translateLoc(binding.loc);
+  if (base->hasLocalStorage()) // Defensive; `addBase` rejects this first.
+    return emitError(bindLoc)
+           << "unsupported: global pointer bound to local object '"
+           << base->getName() << "' (the borrow would outlive the object)";
+  if (const clang::ConstantArrayType *array =
+          astContext().getAsConstantArrayType(base->getType())) {
+    bool matchesLevel = false;
+    for (const clang::ConstantArrayType *level = array; level;
+         level = astContext().getAsConstantArrayType(
+             level->getElementType())) {
+      if (astContext().hasSameUnqualifiedType(pointee,
+                                              level->getElementType())) {
+        matchesLevel = true;
+        break;
+      }
+    }
+    if (!matchesLevel)
+      return emitError(bindLoc)
+             << "unsupported: pointer element type does not match its "
+                "target array";
+    std::optional<int64_t> start = flatCursorOffset(base->getType());
+    if (!start)
+      return emitError(initLoc) << "unsupported: global pointer initializer";
+    if (failed(createCursorGlobal(symbolName, *start)))
+      return failure();
+    pointerGlobals[key] =
+        PointerGlobalInfo{base, std::string(), Type(), symbolName.str()};
+    return success();
+  }
+  if (isPointerType(base->getType())) // Defensive; `addBase` forbids it.
+    return emitError(bindLoc)
+           << "unsupported: global pointer bound to a pointer object";
+  if (facts.hasArithmetic)
+    return emitError(translateLoc(facts.arithmeticLoc))
+           << "unsupported: arithmetic on the address of a scalar object";
+  if (initByteOffset != 0 ||
+      !astContext().hasSameUnqualifiedType(pointee, base->getType()))
+    return emitError(bindLoc)
+           << "unsupported: pointer type does not match its target object";
+  pointerGlobals[key] =
+      PointerGlobalInfo{base, std::string(), Type(), std::string()};
+  return success();
 }
 
 LogicalResult CImporter::deferExternGlobal(const clang::VarDecl *key,
@@ -3611,6 +4168,7 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   astContextPtr = &context;
   currentTuTag = tuTag.str();
   deferExternGlobals = deferExtern;
+  currentSoleTU = soleTranslationUnit;
   const clang::TranslationUnitDecl *unit = astContext().getTranslationUnitDecl();
   // Namespace pre-pass: record every module-symbol name this TU's ordinary
   // identifier namespace will claim, so struct tag naming
@@ -4352,9 +4910,13 @@ LogicalResult CImporter::storePointerAssign(Location loc,
                                             const clang::VarDecl *ptr,
                                             const clang::Expr *rhs) {
   auto it = pointerLocals.find(ptr);
-  if (it == pointerLocals.end())
+  if (it == pointerLocals.end()) {
+    auto globalIt = pointerGlobals.find(ptr->getCanonicalDecl());
+    if (globalIt != pointerGlobals.end())
+      return storeGlobalPointerAssign(loc, ptr, globalIt->second, rhs);
     return emitError(loc) << "unsupported: assignment to pointer variable '"
                           << ptr->getName() << "' with no known target object";
+  }
   FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
   if (failed(value))
     return failure();
@@ -4374,6 +4936,49 @@ LogicalResult CImporter::storePointerAssign(Location loc,
   return success();
 }
 
+LogicalResult
+CImporter::storeGlobalPointerAssign(Location loc, const clang::VarDecl *ptr,
+                                    const PointerGlobalInfo &info,
+                                    const clang::Expr *rhs) {
+  IntegerType i64Type = builder.getIntegerType(64);
+  // `g = calloc(...)` / `g = malloc(...)`: the region validation accepted
+  // exactly one allocation site, so any allocation call reaching an
+  // assignment to `g` is that site. Re-zero the synthesized backing by
+  // storing a fresh default-initialized value (exact calloc semantics on
+  // every execution of the statement; malloc's contents are indeterminate,
+  // so zero-filling is a legal refinement) and reset the cursor.
+  if (asAllocCall(rhs)) {
+    if (info.backingSymbol.empty() || info.cursorSymbol.empty())
+      return emitError(loc) // Defensive; the region validation forbids it.
+             << "unsupported: allocation assigned to this pointer variable";
+    Value fresh = createVariablePlace(loc, info.backingType);
+    Value zeroed = builder
+                       .create<emitrust::LoadOp>(loc, info.backingType, fresh)
+                       .getResult();
+    builder.create<emitrust::GlobalStoreOp>(loc, zeroed,
+                                            globalSymbol(info.backingSymbol));
+    builder.create<emitrust::GlobalStoreOp>(loc,
+                                            createIntConstant(loc, i64Type, 0),
+                                            globalSymbol(info.cursorSymbol));
+    return success();
+  }
+  FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
+  if (failed(value))
+    return failure();
+  if (value->base != info.base ||
+      value->literalBacking) // Defensive; multi-base regions never get here.
+    return emitError(loc)
+           << "unsupported: pointer assignment would rebind to a different "
+              "object";
+  if (info.cursorSymbol.empty())
+    return success(); // Degenerate: the target place is statically known.
+  Value cursor =
+      value->cursor ? value->cursor : createIntConstant(loc, i64Type, 0);
+  builder.create<emitrust::GlobalStoreOp>(loc, cursor,
+                                          globalSymbol(info.cursorSymbol));
+  return success();
+}
+
 LogicalResult CImporter::emitPointerCompoundAssign(
     const clang::CompoundAssignOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
@@ -4387,27 +4992,48 @@ LogicalResult CImporter::emitPointerCompoundAssign(
     return emitError(loc)
            << "unsupported: arithmetic on a pointer to an array";
   const clang::VarDecl *var = asVarRef(op->getLHS());
+  const PointerGlobalInfo *globalInfo = nullptr;
+  if (!var)
+    if (const clang::VarDecl *global = asGlobalDataPointerRef(op->getLHS())) {
+      auto globalIt = pointerGlobals.find(global->getCanonicalDecl());
+      if (globalIt != pointerGlobals.end())
+        globalInfo = &globalIt->second;
+    }
   auto it = var ? pointerLocals.find(var) : pointerLocals.end();
-  if (it == pointerLocals.end())
+  if (it == pointerLocals.end() && !globalInfo)
     return emitError(loc)
            << "unsupported: compound assignment to this pointer expression";
-  const PointerLocalInfo &info = it->second;
-  if (!info.cursorCell) // Defensive; the analysis rejects this at the decl.
+  if (!globalInfo && !it->second.cursorCell)
+    // Defensive; the analysis rejects this at the decl.
     return emitError(loc)
            << "unsupported: arithmetic on the address of a scalar object";
-  Value current = loadPlace(loc, info.cursorCell);
+  if (globalInfo && globalInfo->cursorSymbol.empty())
+    return emitError(loc)
+           << "unsupported: arithmetic on the address of a scalar object";
+  IntegerType i64Type = builder.getIntegerType(64);
+  Value current =
+      globalInfo
+          ? builder
+                .create<emitrust::GlobalLoadOp>(
+                    loc, i64Type, globalSymbol(globalInfo->cursorSymbol))
+                .getResult()
+          : loadPlace(loc, it->second.cursorCell);
   FailureOr<Value> amount = emitRValue(op->getRHS());
   if (failed(amount))
     return failure();
   auto amountType = llvm::dyn_cast<IntegerType>((*amount).getType());
   if (!amountType)
     return emitError(loc) << "unsupported pointer offset type";
-  Value offset = castToIntType(loc, *amount, builder.getIntegerType(64));
+  Value offset = castToIntType(loc, *amount, i64Type);
   Value next =
       opcode == clang::BO_Add
           ? builder.create<arith::AddIOp>(loc, current, offset).getResult()
           : builder.create<arith::SubIOp>(loc, current, offset).getResult();
-  builder.create<memref::StoreOp>(loc, next, info.cursorCell);
+  if (globalInfo)
+    builder.create<emitrust::GlobalStoreOp>(
+        loc, next, globalSymbol(globalInfo->cursorSymbol));
+  else
+    builder.create<memref::StoreOp>(loc, next, it->second.cursorCell);
   return success();
 }
 
@@ -4773,6 +5399,10 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
     if (const clang::VarDecl *var = asVarRef(op->getLHS()))
       if (pointerLocals.contains(var) || pointerRegions.tracks(var))
         return storePointerAssign(loc, var, op->getRHS());
+    // A pointer-typed global rebinds by storing its global cursor.
+    if (const clang::VarDecl *global = asGlobalDataPointerRef(op->getLHS()))
+      if (pointerGlobals.contains(global->getCanonicalDecl()))
+        return storePointerAssign(loc, global, op->getRHS());
     return emitError(loc)
            << "unsupported: assignment to this pointer expression";
   }
@@ -6696,9 +7326,10 @@ FailureOr<Value> CImporter::emitMethodCallSite(const clang::CallExpr *call,
       // into the owner's region — directly at the owner base in the owning
       // function, or through the current method's own decomposed pointer
       // parameters in a sibling method.
-      bool rootedAtOwner = pointer->base == ownerBase ||
-                           (currentMethodOwner == ownerBase &&
-                            isPointerType(pointer->base->getType()));
+      bool rootedAtOwner =
+          pointer->base == ownerBase ||
+          (currentMethodOwner == ownerBase &&
+           llvm::isa_and_nonnull<clang::ParmVarDecl>(pointer->base));
       if (!rootedAtOwner)
         return emitError(loc)
                << "unsupported: pointer argument does not point into owner "
@@ -6763,6 +7394,12 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
     if (failed(pointer))
       return failure();
     root = pointer->base;
+    // A global region base would pass a borrow of the staged local copy,
+    // not of the global itself: a callee that also touches the global
+    // would see (or lose) the wrong values, so the shape is rejected.
+    if (pointer->base && !pointer->base->hasLocalStorage())
+      return emitError(loc) << "unsupported: passing a pointer into a "
+                               "global variable to a function";
     if (!pointer->cursor)
       return emitError(loc) << "unsupported: the address of a scalar object "
                                "cannot be passed as a slice parameter";
@@ -6807,6 +7444,12 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
     if (failed(pointer))
       return failure();
     root = pointer->base;
+    // A global region base would pass a borrow of the staged local copy
+    // (writes through it would be lost); mirror the historical
+    // address-of-a-global rejection.
+    if (pointer->base && !pointer->base->hasLocalStorage())
+      return emitError(loc) << "unsupported: passing a pointer into a "
+                               "global variable to a function";
     FailureOr<Value> place = emitPointerPlace(loc, *pointer, pointee);
     if (failed(place))
       return failure();
@@ -7045,6 +7688,20 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
           cursor = loadPlace(loc, info.cursorCell);
         return PtrExprValue{info.base, cursor, info.literalBacking};
       }
+      // A read of a pointer-typed global (CTS-P4): its base is static and
+      // its cursor is the current value of the cursor global (none for a
+      // degenerate base).
+      auto globalIt = pointerGlobals.find(var->getCanonicalDecl());
+      if (globalIt != pointerGlobals.end()) {
+        const PointerGlobalInfo &info = globalIt->second;
+        Value cursor;
+        if (!info.cursorSymbol.empty())
+          cursor = builder
+                       .create<emitrust::GlobalLoadOp>(
+                           loc, cursorType, globalSymbol(info.cursorSymbol))
+                       .getResult();
+        return PtrExprValue{info.base, cursor};
+      }
       if (llvm::isa<clang::ParmVarDecl>(var))
         return emitError(loc) << "unsupported: pointer parameter used "
                                  "outside a direct dereference";
@@ -7075,9 +7732,13 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
           ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
       if (!var)
         break;
+      // A decayed global array is a global region base (CTS-P4); its
+      // element accesses stage the global like any direct element access.
+      // Local-pointer regions never reach here with a global base (the
+      // analysis rejects them at the binding), so this only feeds global
+      // pointer assignments and direct dereference forms.
       if (!var->hasLocalStorage())
-        return emitError(loc) << "unsupported: pointer into a global "
-                                 "variable";
+        var = var->getCanonicalDecl();
       return PtrExprValue{var, createIntConstant(loc, cursorType, 0)};
     }
     default:
@@ -7097,11 +7758,11 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         if (isPointerType(var->getType()))
           return emitError(loc)
                  << "unsupported: taking the address of a pointer variable";
-        if (!var->hasLocalStorage())
-          return emitError(loc)
-                 << "unsupported: pointer into a global variable";
         // `&x`: the degenerate (cursor-less) form of the scalar or struct
-        // object itself.
+        // object itself. A global object is a global region base
+        // (CTS-P4), staged at each access.
+        if (!var->hasLocalStorage())
+          var = var->getCanonicalDecl();
         return PtrExprValue{var, Value()};
       }
       if (const auto *subscript =
@@ -7123,10 +7784,36 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         return emitError(loc)
                << "unsupported: arithmetic on a pointer to an array";
       const clang::VarDecl *var = asVarRef(unary->getSubExpr());
+      if (!var)
+        var = asGlobalDataPointerRef(unary->getSubExpr());
       auto it = var ? pointerLocals.find(var) : pointerLocals.end();
-      if (it == pointerLocals.end())
-        return emitError(loc)
-               << "unsupported: ++/-- on this pointer expression";
+      if (it == pointerLocals.end()) {
+        // `g++` on a pointer-typed global walks its stored i64 cursor
+        // global (CTS-P4).
+        auto globalIt = var ? pointerGlobals.find(var->getCanonicalDecl())
+                            : pointerGlobals.end();
+        if (globalIt == pointerGlobals.end())
+          return emitError(loc)
+                 << "unsupported: ++/-- on this pointer expression";
+        const PointerGlobalInfo &info = globalIt->second;
+        if (info.cursorSymbol.empty())
+          return emitError(loc) << "unsupported: arithmetic on the address "
+                                   "of a scalar object";
+        Value current = builder
+                            .create<emitrust::GlobalLoadOp>(
+                                loc, cursorType,
+                                globalSymbol(info.cursorSymbol))
+                            .getResult();
+        Value one = createIntConstant(loc, cursorType, 1);
+        Value next =
+            unary->isIncrementOp()
+                ? builder.create<arith::AddIOp>(loc, current, one).getResult()
+                : builder.create<arith::SubIOp>(loc, current, one)
+                      .getResult();
+        builder.create<emitrust::GlobalStoreOp>(
+            loc, next, globalSymbol(info.cursorSymbol));
+        return PtrExprValue{info.base, unary->isPostfix() ? current : next};
+      }
       const PointerLocalInfo &info = it->second;
       if (!info.cursorCell) // Defensive; rejected at the declaration.
         return emitError(loc)
@@ -7247,7 +7934,8 @@ static uint64_t flatElementCount(Type type) {
 
 FailureOr<Value> CImporter::emitPointerPlace(Location loc,
                                              const PtrExprValue &pointer,
-                                             Type pointeeType) {
+                                             Type pointeeType,
+                                             GlobalWriteback *writeback) {
   if (pointer.literalBacking) {
     // A string-literal cursor subscripts the literal's read-only backing
     // byte array (a flat [N x i8], so no level peeling arises). Writes
@@ -7266,11 +7954,46 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
         .getResult();
   }
   auto it = symbols.find(pointer.base);
-  if (it == symbols.end())
-    return emitError(loc) << "unsupported: pointer target '"
-                          << pointer.base->getName()
-                          << "' is not an importable place";
-  Value basePlace = it->second;
+  Value basePlace;
+  if (it != symbols.end()) {
+    basePlace = it->second;
+  } else {
+    // A global region base (CTS-P4): a real global object, or a pointer
+    // global's synthesized backing. Stage the global's whole value in a
+    // local copy — exactly the staged-copy model of direct global element
+    // accesses; a write context passes `writeback` and stores the copy
+    // back afterwards.
+    std::string symbol;
+    Type stagedType;
+    if (const GlobalInfo *global =
+            pointer.base ? lookupGlobal(pointer.base) : nullptr) {
+      symbol = global->symbol;
+      stagedType = global->type;
+    } else {
+      auto globalIt = pointer.base
+                          ? pointerGlobals.find(pointer.base->getCanonicalDecl())
+                          : pointerGlobals.end();
+      if (globalIt == pointerGlobals.end() ||
+          globalIt->second.backingSymbol.empty())
+        return emitError(loc) << "unsupported: pointer target '"
+                              << pointer.base->getName()
+                              << "' is not an importable place";
+      symbol = globalIt->second.backingSymbol;
+      stagedType = globalIt->second.backingType;
+    }
+    Value staged = builder
+                       .create<emitrust::VariableOp>(
+                           loc, emitrust::LValueType::get(stagedType))
+                       .getResult();
+    Value current = builder
+                        .create<emitrust::GlobalLoadOp>(loc, stagedType,
+                                                        globalSymbol(symbol))
+                        .getResult();
+    builder.create<emitrust::AssignOp>(loc, staged, current);
+    if (writeback)
+      *writeback = GlobalWriteback{staged, symbol};
+    basePlace = staged;
+  }
   if (!pointer.cursor)
     return basePlace; // Degenerate: the pointer designates the whole object.
   auto lvalueType = llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
@@ -7422,7 +8145,8 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
           loc);
       if (failed(pointeeType))
         return failure();
-      FailureOr<Value> place = emitPointerPlace(loc, *pointer, *pointeeType);
+      FailureOr<Value> place =
+          emitPointerPlace(loc, *pointer, *pointeeType, writeback);
       if (failed(place))
         return failure();
       basePlace = *place;
@@ -7483,7 +8207,7 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
       FailureOr<Type> pointeeType = mapType(subscript->getType(), loc);
       if (failed(pointeeType))
         return failure();
-      return emitPointerPlace(loc, *pointer, *pointeeType);
+      return emitPointerPlace(loc, *pointer, *pointeeType, writeback);
     }
     FailureOr<Value> basePlace = emitLValue(base, writeback);
     if (failed(basePlace))
@@ -7518,7 +8242,7 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
         FailureOr<Type> pointeeType = mapType(unary->getType(), loc);
         if (failed(pointeeType))
           return failure();
-        return emitPointerPlace(loc, *decomposed, *pointeeType);
+        return emitPointerPlace(loc, *decomposed, *pointeeType, writeback);
       }
       FailureOr<Value> pointer = emitRValue(unary->getSubExpr());
       if (failed(pointer))
