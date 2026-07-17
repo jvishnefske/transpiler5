@@ -529,7 +529,8 @@ private:
 
   /// Imports a complete named struct definition as a module-level
   /// `emitrust.struct_def`. Forward declarations are ignored; repeated
-  /// imports of the same definition are deduplicated. Unions, anonymous
+  /// imports of the same definition are deduplicated. An empty member list
+  /// (`struct T {};`) imports as a field-less struct_def. Unions, anonymous
   /// structs, bit-fields, and unsupported field types are rejected.
   LogicalResult importRecord(const clang::RecordDecl *record, Location loc);
 
@@ -2260,8 +2261,8 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
     fieldNames.push_back(field->getName());
     fieldTypes.push_back(*fieldType);
   }
-  if (fieldNames.empty())
-    return emitError(defLoc) << "unsupported: struct with no members";
+  // An empty member list (`struct T {};`, a GNU/C2x shape clang accepts) is
+  // permitted and becomes a unit-like Rust struct.
 
   // Cross-TU deduplication: the same struct reached through a shared header
   // has distinct decls in each TU. Dedup by symbol name; an identical shape is

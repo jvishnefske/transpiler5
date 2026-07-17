@@ -205,6 +205,10 @@ emitrust.func @loop_jumps(%arg0: i1) {
 // CHECK: emitrust.struct_def @Point ["x", "y"] [i32, i32]
 emitrust.struct_def @Point ["x", "y"] [i32, i32]
 
+// A field-less struct_def (C's `struct T {};`) round-trips with empty arrays.
+// CHECK: emitrust.struct_def @Empty [] []
+emitrust.struct_def @Empty [] []
+
 // CHECK-LABEL: emitrust.func @variables
 emitrust.func @variables() {
   // CHECK: emitrust.variable <42 : i32> : !emitrust.lvalue<i32>
