@@ -794,13 +794,41 @@ private:
   /// value (C's value of an assignment is the post-assignment value).
   FailureOr<Value> emitAssignToPlace(const clang::BinaryOperator *op);
 
-  /// Emits a compound assignment (`+=` etc.) as load, arithmetic, store.
+  /// Emits a compound assignment (`+=` etc.) as load, widen to the
+  /// computation type, arithmetic, narrow back, store (the widen/narrow
+  /// pair is a no-op when no operand promotion applies; see
+  /// `buildCompoundAssignValue`).
   LogicalResult emitCompoundAssign(const clang::CompoundAssignOperator *op);
 
   /// Emits a compound assignment and returns the assigned-to place, for
   /// value-position uses (see `emitAssignToPlace`).
   FailureOr<Value>
   emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op);
+
+  /// Computes the value a compound assignment stores: widens the loaded
+  /// LHS `current` to Sema's computation type
+  /// (`CompoundAssignOperator::getComputationLHSType`), applies the
+  /// operator against the RHS (which Sema already converted to the
+  /// computation type, except shift amounts, which are normalized to the
+  /// shifted operand's width), and narrows the result back to the LHS's
+  /// storage type. Both conversions go through `convertScalarValue`, so
+  /// `char c; c += wider;` widens and narrows by C's conversion rules
+  /// (zero-extension from unsigned, sign-extension from signed, low-bits
+  /// truncation on narrowing).
+  FailureOr<Value>
+  buildCompoundAssignValue(Location loc,
+                           const clang::CompoundAssignOperator *op,
+                           Value current);
+
+  /// Converts a scalar `value` to `target` following C's conversion
+  /// rules: integer-to-integer via `castToIntType`, `arith`
+  /// extension/truncation between float widths, and integer/float
+  /// conversions that route through `emitrust.cast` whenever the integer
+  /// side is unsigned (mirroring the `CK_IntegralToFloating` and
+  /// `CK_FloatingToIntegral` lowerings). `_Bool` (`i1`) endpoints are
+  /// rejected: C converts to `_Bool` by comparison against zero, which
+  /// truncation would lower incorrectly.
+  FailureOr<Value> convertScalarValue(Location loc, Value value, Type target);
 
   /// Emits statement-level `++x`/`x--` as load, add/sub 1, store; only
   /// integer operands are supported.
@@ -3989,32 +4017,12 @@ CImporter::emitCompoundAssign(const clang::CompoundAssignOperator *op) {
   // load-modify-store through the global access ops, no staging copy
   // needed. Value-position uses go through emitCompoundAssignToPlace.
   if (const clang::VarDecl *var = asDirectGlobalRef(op->getLHS())) {
-    if (!astContext().hasSameUnqualifiedType(op->getComputationLHSType(),
-                                           op->getLHS()->getType()))
-      return emitError(loc)
-             << "unsupported: compound assignment with operand promotion";
     const GlobalInfo &global = globals.find(var)->second;
     Value current = builder
                         .create<emitrust::GlobalLoadOp>(
                             loc, global.type, globalSymbol(global.symbol))
                         .getResult();
-    FailureOr<Value> rhs = emitRValue(op->getRHS());
-    if (failed(rhs))
-      return failure();
-    clang::BinaryOperatorKind opcode =
-        clang::BinaryOperator::getOpForCompoundAssignment(op->getOpcode());
-    Value rhsValue = *rhs;
-    // `<<=`/`>>=` normalize the shift amount to the shifted operand's
-    // width, mirroring emitCompoundAssignToPlace.
-    auto currentInt = llvm::dyn_cast<IntegerType>(current.getType());
-    auto rhsInt = llvm::dyn_cast<IntegerType>(rhsValue.getType());
-    if ((opcode == clang::BO_Shl || opcode == clang::BO_Shr) && currentInt &&
-        rhsInt)
-      rhsValue = castToIntType(loc, rhsValue, currentInt);
-    if (current.getType() != rhsValue.getType())
-      return emitError(loc)
-             << "unsupported: compound assignment operand type mismatch";
-    FailureOr<Value> result = buildBinaryArith(loc, opcode, current, rhsValue);
+    FailureOr<Value> result = buildCompoundAssignValue(loc, op, current);
     if (failed(result))
       return failure();
     builder.create<emitrust::GlobalStoreOp>(loc, *result,
@@ -4031,15 +4039,32 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   if (isPointerType(op->getLHS()->getType()))
     return emitError(loc)
            << "unsupported: pointer assignment in value position";
-  if (!astContext().hasSameUnqualifiedType(op->getComputationLHSType(),
-                                         op->getLHS()->getType()))
-    return emitError(loc)
-           << "unsupported: compound assignment with operand promotion";
   GlobalWriteback writeback;
   FailureOr<Value> place = emitLValue(op->getLHS(), &writeback);
   if (failed(place))
     return failure();
   Value current = loadPlace(loc, *place);
+  FailureOr<Value> result = buildCompoundAssignValue(loc, op, current);
+  if (failed(result))
+    return failure();
+  if (failed(storeToPlace(loc, *place, *result)))
+    return failure();
+  flushGlobalWriteback(loc, writeback);
+  return place;
+}
+
+FailureOr<Value> CImporter::buildCompoundAssignValue(
+    Location loc, const clang::CompoundAssignOperator *op, Value current) {
+  Type storedType = current.getType();
+  FailureOr<Type> computeType = mapType(op->getComputationLHSType(), loc);
+  if (failed(computeType))
+    return failure();
+  // `char/short x; x += wider;`: Sema records the promoted type the
+  // operation happens at; widen the loaded LHS to it (a no-op when no
+  // promotion applies).
+  FailureOr<Value> widened = convertScalarValue(loc, current, *computeType);
+  if (failed(widened))
+    return failure();
   FailureOr<Value> rhs = emitRValue(op->getRHS());
   if (failed(rhs))
     return failure();
@@ -4047,23 +4072,63 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
       clang::BinaryOperator::getOpForCompoundAssignment(op->getOpcode());
   Value rhsValue = *rhs;
   // The shift amount's C type is independent of the shifted operand's, so
-  // `<<=`/`>>=` normalize the right operand to the left operand's width;
-  // every other compound assignment requires matching operand types.
-  auto currentInt = llvm::dyn_cast<IntegerType>(current.getType());
+  // `<<=`/`>>=` normalize the right operand to the (widened) left
+  // operand's width; every other compound assignment meets its RHS at the
+  // computation type Sema already converted it to.
+  auto lhsInt = llvm::dyn_cast<IntegerType>((*widened).getType());
   auto rhsInt = llvm::dyn_cast<IntegerType>(rhsValue.getType());
-  if ((opcode == clang::BO_Shl || opcode == clang::BO_Shr) && currentInt &&
-      rhsInt)
-    rhsValue = castToIntType(loc, rhsValue, currentInt);
-  if (current.getType() != rhsValue.getType())
+  if ((opcode == clang::BO_Shl || opcode == clang::BO_Shr) && lhsInt && rhsInt)
+    rhsValue = castToIntType(loc, rhsValue, lhsInt);
+  if ((*widened).getType() != rhsValue.getType())
     return emitError(loc)
            << "unsupported: compound assignment operand type mismatch";
-  FailureOr<Value> result = buildBinaryArith(loc, opcode, current, rhsValue);
+  FailureOr<Value> result = buildBinaryArith(loc, opcode, *widened, rhsValue);
   if (failed(result))
     return failure();
-  if (failed(storeToPlace(loc, *place, *result)))
-    return failure();
-  flushGlobalWriteback(loc, writeback);
-  return place;
+  // C converts the computed value back to the LHS type before storing
+  // (C99 6.5.16.2p3 via 6.5.16.1p2).
+  return convertScalarValue(loc, *result, storedType);
+}
+
+FailureOr<Value> CImporter::convertScalarValue(Location loc, Value value,
+                                               Type target) {
+  Type source = value.getType();
+  if (source == target)
+    return value;
+  auto sourceInt = llvm::dyn_cast<IntegerType>(source);
+  auto targetInt = llvm::dyn_cast<IntegerType>(target);
+  // C converts to `_Bool` by comparison against zero, not by truncation;
+  // reject rather than lower it wrong.
+  if ((sourceInt && sourceInt.getWidth() == 1) ||
+      (targetInt && targetInt.getWidth() == 1))
+    return emitError(loc) << "unsupported: _Bool conversion";
+  if (sourceInt && targetInt)
+    return castToIntType(loc, value, targetInt);
+  auto sourceFloat = llvm::dyn_cast<FloatType>(source);
+  auto targetFloat = llvm::dyn_cast<FloatType>(target);
+  if (sourceFloat && targetFloat) {
+    if (sourceFloat.getWidth() < targetFloat.getWidth())
+      return builder.create<arith::ExtFOp>(loc, targetFloat, value)
+          .getResult();
+    return builder.create<arith::TruncFOp>(loc, targetFloat, value)
+        .getResult();
+  }
+  if (sourceInt && targetFloat) {
+    // Unsigned to float is an `emitrust.cast`: Rust's `u* as f*` performs
+    // the same round-to-nearest conversion as C.
+    if (sourceInt.isUnsigned())
+      return builder.create<emitrust::CastOp>(loc, target, value).getResult();
+    return builder.create<arith::SIToFPOp>(loc, target, value).getResult();
+  }
+  if (sourceFloat && targetInt) {
+    // Float to unsigned is an `emitrust.cast`; Rust's `as` saturates where
+    // C is undefined, an acceptable defined refinement (matching the
+    // `CK_FloatingToIntegral` lowering).
+    if (targetInt.isUnsigned())
+      return builder.create<emitrust::CastOp>(loc, target, value).getResult();
+    return builder.create<arith::FPToSIOp>(loc, target, value).getResult();
+  }
+  return emitError(loc) << "unsupported scalar conversion";
 }
 
 LogicalResult CImporter::emitIncDec(const clang::UnaryOperator *op) {

@@ -949,6 +949,25 @@ observed when C99-33 + C99-47 together unlocked 00215).
   narrow-cast, store. Must respect the zero-vs-sign-extension trap
   documented for the pipeline (adversarial negative/width-extreme
   differential tests required).
+  Lowering implemented: `buildCompoundAssignValue` widens the loaded LHS
+  to Sema's `getComputationLHSType`, operates, and narrows the result
+  back to the LHS storage type, with both casts routed through the C99-3
+  conversion machinery (`emitrust.cast` when either side is unsigned,
+  arith ext/trunc between signless types, extf/truncf between float
+  widths, sitofp/fptosi for the int-accumulator-with-float-RHS shape;
+  `_Bool` endpoints stay rejected with a located diagnostic). Covers
+  locals, the direct-global fast path, and value-position uses.
+  Adversarial differential tests in test/EndToEnd/compound-promote.c:
+  signed/unsigned char and short `/=`, `%=`, `>>=` on top-bit-set values
+  (each prints differently if the widen picks the wrong extension),
+  `+=`/`-=`/`*=`/`<<=` overflowing the narrow type in both directions
+  (wrap-on-narrow), short -= long (the 00111.c shape), int accumulator
+  with long long RHS and long long shift amount, float += double (the
+  00174.c shape), and int *=/= double truncation toward zero. 00111.c
+  passes and is in the ratchet manifest; 00174.c remains blocked on its
+  second unsupported construct: "00174.c:45:19: error: unsupported: call
+  to 'sin' declared in a system header; not part of the supported C
+  subset" — box stays unticked until math-library calls land.
   (00111.c, 00174.c)
 - [ ] CTS-S2 (2) Switch bodies that are not plain compound statements
   and case labels nested inside inner statements (Duff-adjacent,
