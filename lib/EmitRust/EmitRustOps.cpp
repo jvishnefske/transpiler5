@@ -367,8 +367,9 @@ LogicalResult StructDefOp::verify() {
 //===----------------------------------------------------------------------===//
 
 /// Verifies that the variant name and value arrays have the same non-zero
-/// length, that variant names are non-empty and unique, and that variant
-/// values are unique and within the i32 range.
+/// length, that variant names are non-empty and unique, that variant
+/// values are unique and within the i32 range, and that an enum with the
+/// `unsigned_underlying` marker (u32 storage) has no negative value.
 LogicalResult EnumDefOp::verify() {
   ArrayAttr names = getVariantNames();
   ArrayRef<int64_t> values = getVariantValues();
@@ -392,6 +393,10 @@ LogicalResult EnumDefOp::verify() {
     if (!llvm::isInt<32>(value))
       return emitOpError("variant value ")
              << value << " is out of the i32 range";
+    if (getUnsignedUnderlying() && value < 0)
+      return emitOpError("variant value ")
+             << value
+             << " is negative but the enum has an unsigned underlying type";
   }
   return success();
 }
@@ -602,6 +607,27 @@ LogicalResult MemberOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// EnumRawOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the operand is an lvalue wrapping an enum type and the
+/// result an lvalue wrapping a 32-bit integer (the enum's storage type).
+LogicalResult EnumRawOp::verify() {
+  Type valueType = cast<LValueType>(getOperand().getType()).getValueType();
+  if (!isa<EnumType>(valueType))
+    return emitOpError(
+               "operand must be an lvalue of !emitrust.enum type, but got ")
+           << getOperand().getType();
+  auto resultType = dyn_cast<IntegerType>(
+      cast<LValueType>(getResult().getType()).getValueType());
+  if (!resultType || resultType.getWidth() != 32)
+    return emitOpError("result must be an lvalue of a 32-bit integer type, "
+                       "but got ")
+           << getResult().getType();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // SubscriptOp
 //===----------------------------------------------------------------------===//
 
@@ -758,12 +784,17 @@ LogicalResult CmpOp::verify() {
 // CastOp
 //===----------------------------------------------------------------------===//
 
-/// Verifies that the result is not an enum type (Rust has no
-/// integer-to-enum `as` cast) and that neither side is a fn_ptr type
+/// Verifies that an enum result (an integer-to-enum conversion, rendered
+/// as the enum's value-preserving tuple-struct constructor) has a non-`i1`
+/// integer source, and that neither side is a fn_ptr type
 /// (`Option<fn(...)>` supports no `as` conversion at all).
 LogicalResult CastOp::verify() {
-  if (isa<EnumType>(getResult().getType()))
-    return emitOpError("cannot cast to an enum type");
+  if (isa<EnumType>(getResult().getType())) {
+    auto sourceType = dyn_cast<IntegerType>(getSource().getType());
+    if (!sourceType || sourceType.getWidth() == 1)
+      return emitOpError(
+          "a cast to an enum type requires a non-i1 integer source");
+  }
   if (isa<FnPtrType>(getSource().getType()) ||
       isa<FnPtrType>(getResult().getType()))
     return emitOpError("cannot cast a fn_ptr type");

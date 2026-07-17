@@ -176,9 +176,40 @@ emitrust.func @enum_ordered_cmp(%arg0: !emitrust.enum<"Color">, %arg1: !emitrust
 
 // -----
 
-emitrust.func @cast_to_enum(%arg0: i32) {
-  // expected-error @+1 {{cannot cast to an enum type}}
-  %0 = emitrust.cast %arg0 : i32 to !emitrust.enum<"Color">
+emitrust.func @cast_to_enum_from_float(%arg0: f64) {
+  // expected-error @+1 {{a cast to an enum type requires a non-i1 integer source}}
+  %0 = emitrust.cast %arg0 : f64 to !emitrust.enum<"Color">
+  emitrust.return
+}
+
+// -----
+
+emitrust.func @cast_to_enum_from_bool(%arg0: i1) {
+  // expected-error @+1 {{a cast to an enum type requires a non-i1 integer source}}
+  %0 = emitrust.cast %arg0 : i1 to !emitrust.enum<"Color">
+  emitrust.return
+}
+
+// -----
+
+// expected-error @+1 {{variant value -1 is negative but the enum has an unsigned underlying type}}
+emitrust.enum_def @Neg ["A"] [-1] {unsigned_underlying}
+
+// -----
+
+emitrust.func @enum_raw_not_enum(%arg0: i32) {
+  %0 = emitrust.variable : !emitrust.lvalue<i32>
+  // expected-error @+1 {{operand must be an lvalue of !emitrust.enum type}}
+  %1 = emitrust.enum_raw %0 : (!emitrust.lvalue<i32>) -> !emitrust.lvalue<i32>
+  emitrust.return
+}
+
+// -----
+
+emitrust.func @enum_raw_bad_result() {
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>
+  // expected-error @+1 {{result must be an lvalue of a 32-bit integer type}}
+  %1 = emitrust.enum_raw %0 : (!emitrust.lvalue<!emitrust.enum<"Color">>) -> !emitrust.lvalue<i64>
   emitrust.return
 }
 

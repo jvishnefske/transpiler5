@@ -554,39 +554,50 @@ def EmitRust_EnumDefOp : EmitRust_Op<"enum_def", [
     HasParent<"::mlir::ModuleOp">, Symbol]> {
   let summary = "Enum definition operation";
   let description = [{
-    The `emitrust.enum_def` operation defines a named Rust enum at module
+    The `emitrust.enum_def` operation defines a named C enum at module
     level. The variant names and variant values are given as two arrays of
     the same non-zero length; names must be non-empty and unique and are
     emitted verbatim (the importer supplies valid Rust identifiers), values
     must be unique and within the `i32` range. Values of the enum are
     referenced through the `!emitrust.enum` type carrying the same name.
 
-    The enum is emitted with `#[repr(i32)]` and
-    `#[derive(Clone, Copy, PartialEq, Default)]`; the first variant carries
-    the `#[default]` attribute so that the derived `Default` implementation
-    is available.
+    A C enum object holds any value of its underlying integer type, not
+    just the declared enumerators (C99 6.7.2.2), so the definition is
+    emitted as a value-preserving open enum: a `#[repr(transparent)]`
+    tuple struct wrapping the storage integer, with one associated
+    constant per declared enumerator and an explicit `Default`
+    implementation returning the first variant (mirroring the previous
+    fieldless-enum default). The storage type is `i32`, or `u32` with the
+    `unsigned_underlying` marker (set by the importer when clang assigns
+    the C enum an unsigned underlying type, which requires every variant
+    value to be non-negative).
 
     Example:
 
     ```mlir
     emitrust.enum_def @Color ["Red", "Green", "Blue"] [0, 1, 2]
+        {unsigned_underlying}
     ```
     ```rust
     // Code emitted for the operation above.
-    #[repr(i32)]
-    #[derive(Clone, Copy, PartialEq, Default)]
-    enum Color {
-        #[default]
-        Red = 0,
-        Green = 1,
-        Blue = 2,
+    #[repr(transparent)]
+    #[derive(Clone, Copy, PartialEq)]
+    struct Color(u32);
+    impl Color {
+        const Red: Color = Color(0);
+        const Green: Color = Color(1);
+        const Blue: Color = Color(2);
+    }
+    impl Default for Color {
+        fn default() -> Color { Color::Red }
     }
     ```
   }];
 
   let arguments = (ins SymbolNameAttr:$sym_name,
                        StrArrayAttr:$variant_names,
-                       DenseI64ArrayAttr:$variant_values);
+                       DenseI64ArrayAttr:$variant_values,
+                       UnitAttr:$unsigned_underlying);
   let results = (outs);
 
   let assemblyFormat = "$sym_name $variant_names $variant_values attr-dict";
@@ -816,6 +827,45 @@ def EmitRust_MemberOp : EmitRust_Op<"member"> {
 
   let assemblyFormat =
       "$operand `[` $member `]` attr-dict `:` functional-type($operand, $result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// EnumRawOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_EnumRawOp : EmitRust_Op<"enum_raw"> {
+  let summary = "Enum raw-representation place operation";
+  let description = [{
+    The `emitrust.enum_raw` operation refines an enum-typed lvalue into the
+    lvalue of its raw integer representation. The operand's wrapped value
+    type must be an `!emitrust.enum` and the result's wrapped value type a
+    32-bit integer (the enum's storage type, `i32` or `ui32`). Because the
+    emitted enum is a `#[repr(transparent)]` tuple struct over its storage
+    integer, the operation emits no code at its program point; it
+    contributes `.0` to the place expression of any load, assign, or borrow
+    that consumes it. The importer uses it for C's enum/underlying-type
+    pointer compatibility (`unsigned int *p = &e;`-shaped call arguments).
+
+    Example:
+
+    ```mlir
+    %raw = emitrust.enum_raw %e
+        : (!emitrust.lvalue<!emitrust.enum<"Color">>) -> !emitrust.lvalue<ui32>
+    %r = emitrust.addr_of mut %raw
+        : (!emitrust.lvalue<ui32>) -> !emitrust.mut_ref<ui32>
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    let v1: &mut u32 = &mut v0.0;
+    ```
+  }];
+
+  let arguments = (ins EmitRust_LValueType:$operand);
+  let results = (outs EmitRust_LValueType:$result);
+
+  let assemblyFormat =
+      "$operand attr-dict `:` functional-type($operand, $result)";
   let hasVerifier = 1;
 }
 
@@ -1238,22 +1288,29 @@ def EmitRust_CastOp : EmitRust_Op<"cast"> {
     The `emitrust.cast` operation performs an explicit type conversion and
     is emitted as a Rust `as` cast expression.
 
-    An `!emitrust.enum` source is allowed (an enum-to-integer cast renders
-    e.g. `as i32`), but the verifier rejects `!emitrust.enum` result types:
-    Rust has no integer-to-enum `as` cast. Boolean (`i1`) result types are
-    rejected by the emitter for the same reason (`as bool` does not exist);
-    such conversions must be modeled as comparisons.
+    An `!emitrust.enum` source with an integer result is an enum-to-integer
+    conversion: the enum's open-enum tuple-struct representation exposes
+    its raw value through field `0`, so the cast renders e.g. `.0 as i32`.
+    An `!emitrust.enum` result is an integer-to-enum conversion; the
+    verifier requires an integer source that is not `i1`, and the emitter
+    renders the tuple-struct constructor around an `as` cast to the enum's
+    storage type (value-preserving, matching C's conversion to the enum's
+    underlying type). Boolean (`i1`) result types are rejected by the
+    emitter (`as bool` does not exist); such conversions must be modeled
+    as comparisons.
 
     Example:
 
     ```mlir
     %r = emitrust.cast %v : i32 to i64
     %s = emitrust.cast %c : !emitrust.enum<"Color"> to i32
+    %t = emitrust.cast %v : i32 to !emitrust.enum<"Color">
     ```
     ```rust
     // Code emitted for the operations above.
     let v2 = v1 as i64;
-    let v4 = v3 as i32;
+    let v4 = v3.0 as i32;
+    let v5 = Color(v1 as u32);
     ```
   }];
 
