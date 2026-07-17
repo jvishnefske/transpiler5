@@ -896,10 +896,10 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 188 passed / 0 miscompiled /
-32 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-17: 220 total / 190 passed / 0 miscompiled /
+30 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5/P4 partials, and
-CTS-S1/S2/S4/S6/P1/P8/R1/R4/L1/L2 landed since). Every one of the 32
+CTS-S1/S2/S4/S6/P1/P5/P8/R1/R4/L1/L2 landed since). Every one of the 30
 is a located build-time rejection — never wrong output.
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
@@ -1028,10 +1028,25 @@ observed when C99-33 + C99-47 together unlocked 00215).
   pointers-fnptr-slice.c; rustc-level differential
   test/EndToEnd/pointers-global.c with data-dependent cursor updates
   across calls)
-- [ ] CTS-P5 (2) Pointer-to-pointer values (`&p`, `**p`): second-order
+- [x] CTS-P5 (2) Pointer-to-pointer values (`&p`, `**p`): second-order
   cursors over a region whose elements are themselves (base, cursor)
-  pairs (C99-43).
-  (00005.c, 00020.c)
+  pairs (C99-43). Implemented as the degenerate one-cell region of
+  cursor cells: a `T **pp` bound (possibly repeatedly) to the address
+  of exactly one first-order pointer local selects it statically, so
+  `pp` carries no runtime state, `*pp` reads/rebinds the selected
+  pointer's (base, cursor) decomposition (including its CTS-P8
+  non-null flag), and `**pp` dereferences it — no
+  reference-to-reference ever arises in the emitted Rust. Still
+  rejected with located diagnostics: third-order pointers, pointers to
+  function pointers, multi-target selections (would need a runtime
+  second-order cursor), second-order copies, null second-order
+  bindings, `&p` escaping outside a consumed `pp = &p` binding, and
+  pointer-to-pointer parameters. 00005 and 00020 pass and are in the
+  manifest — ledger 188 -> 190 passed / 30 unsupported /
+  0 miscompiled.
+  (test/Import/C/pointers-ptr-to-ptr.c, pointers-local-invalid.c;
+  rustc-level differential test/EndToEnd/pointers-ptr-to-ptr.c with
+  data-dependent re-pointing through `*pp`)
 - [ ] CTS-P6 (2) Pointers into global aggregates: same borrow-escape
   problem as CTS-P4; a global array base must be readable/writable
   through an index cursor without holding a borrow across statements.
