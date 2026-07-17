@@ -896,14 +896,22 @@ private:
   LogicalResult emitStringArrayInit(Value place, Type type,
                                     const clang::StringLiteral *literal);
 
+  /// Creates a backing byte array place for `literal`: an
+  /// `emitrust.variable` of `!emitrust.array<(len+1)xi8>` initialized with
+  /// the literal's bytes plus the terminating NUL (C string literals
+  /// always carry one, which is what terminates strlen-style walks).
+  /// Only ordinary literals whose bytes are ASCII are supported, the same
+  /// policy as `emitStringArrayInit` (design.md C99-28). A `const`-marked
+  /// backing (immutable `let`) is hoisted to the entry block when the
+  /// function contains labels; a mutable backing (`isConst` false, used
+  /// for per-call-site copies passed to slice parameters) is created at
+  /// the current insertion point, immediately before its single use.
+  FailureOr<Value> createLiteralBacking(const clang::StringLiteral *literal,
+                                        Location loc, bool isConst);
+
   /// Returns the read-only backing byte array place of the string-literal
-  /// pointer region bound to `literal`, creating it on first need: an
-  /// immutable (`const`-marked) `emitrust.variable` of
-  /// `!emitrust.array<(len+1)xi8>` initialized with the literal's bytes
-  /// plus the terminating NUL (C string literals always carry one, which
-  /// is what terminates strlen-style walks). Only ordinary literals whose
-  /// bytes are ASCII are supported, the same policy as
-  /// `emitStringArrayInit` (design.md C99-28). The created variable is
+  /// pointer region bound to `literal`, creating it on first need via
+  /// `createLiteralBacking` (immutable form). The created variable is
   /// cached per literal for the current function, so every pointer of the
   /// region shares one backing.
   FailureOr<Value>
@@ -1058,15 +1066,18 @@ private:
   /// performs.
   LogicalResult emitPrintf(const clang::CallExpr *call);
 
-  /// Lowers a `%s` printf argument. Three shapes are supported: a string
+  /// Lowers a `%s` printf argument. Four shapes are supported: a string
   /// literal (after array-to-pointer decay), lowered to an
   /// `emitrust.literal` holding a `&'static str` (printable-ASCII bytes
   /// plus \n/\t/\r only; embedded NUL and non-ASCII bytes are rejected);
   /// a char-array lvalue, lowered to an `emitrust.slice_of` of the
   /// whole array passed through the `__emitrust_cstr` helper, which stops
-  /// at the first NUL like C; and a `char *` pointer into a string-literal
+  /// at the first NUL like C; a `char *` pointer into a string-literal
   /// region, lowered to an `emitrust.slice_of` of the region's read-only
-  /// backing from the pointer's cursor through the same helper.
+  /// backing from the pointer's cursor through the same helper; and a
+  /// slice-classified `char *` parameter (FR-28, CTS-L2), lowered to an
+  /// `emitrust.slice_of` of the parameter's deref'd slice base place from
+  /// its cursor through the same helper.
   FailureOr<Value> emitPrintfStringArg(const clang::Expr *expr);
 
   /// Wraps an integer value for a `%c` directive: casts it to i32 and
@@ -3461,18 +3472,49 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
         builder.getContext(), ownerPlans.find(methodOwner)->second.structName);
     inputTypes.push_back(emitrust::MutRefType::get(ownerStructType));
   }
-  for (auto [index, param] : llvm::enumerate(func->parameters())) {
-    if (methodOwner && isPointerType(param->getType()) &&
-        !isFunctionPointer(param->getType())) {
-      inputTypes.push_back(builder.getIntegerType(64));
-      continue;
+  if (name == "c_main" && func->getNumParams() != 0) {
+    // C `main`'s standard two-parameter form (C99 5.1.2.2.1): `argc`
+    // imports as a plain i32 — the crate's `fn main` wrapper passes the
+    // process argument count — and `argv`, whose `char **` shape has no
+    // safe decomposition, is dropped from the imported signature. A body
+    // that reads `argv` is rejected here with a located diagnostic, so
+    // the dropped parameter can never be observed.
+    if (func->getNumParams() != 2 ||
+        !astContext().hasSameUnqualifiedType(
+            func->getParamDecl(0)->getType().getCanonicalType(),
+            astContext().IntTy))
+      return emitError(loc) << "unsupported: main must take zero or two "
+                               "(int, char **) parameters";
+    const clang::ParmVarDecl *argvParam = func->getParamDecl(1);
+    clang::QualType argvType = argvParam->getType().getCanonicalType();
+    const auto *outer = argvType->getAs<clang::PointerType>();
+    const auto *inner =
+        outer ? outer->getPointeeType().getCanonicalType()
+                    ->getAs<clang::PointerType>()
+              : nullptr;
+    if (!inner || !astContext().hasSameUnqualifiedType(
+                      inner->getPointeeType(), astContext().CharTy))
+      return emitError(loc) << "unsupported: main must take zero or two "
+                               "(int, char **) parameters";
+    if (argvParam->isReferenced() || argvParam->isUsed())
+      return emitError(translateLoc(argvParam->getLocation()))
+             << "unsupported: use of main's argv parameter (command-line "
+                "argument values are not modeled)";
+    inputTypes.push_back(builder.getIntegerType(32));
+  } else {
+    for (auto [index, param] : llvm::enumerate(func->parameters())) {
+      if (methodOwner && isPointerType(param->getType()) &&
+          !isFunctionPointer(param->getType())) {
+        inputTypes.push_back(builder.getIntegerType(64));
+        continue;
+      }
+      FailureOr<Type> paramType =
+          mapParamType(param->getType(), translateLoc(param->getLocation()),
+                       paramKinds[index]);
+      if (failed(paramType))
+        return failure();
+      inputTypes.push_back(*paramType);
     }
-    FailureOr<Type> paramType =
-        mapParamType(param->getType(), translateLoc(param->getLocation()),
-                     paramKinds[index]);
-    if (failed(paramType))
-      return failure();
-    inputTypes.push_back(*paramType);
   }
   SmallVector<Type> resultTypes;
   clang::QualType returnType = func->getReturnType();
@@ -3577,6 +3619,11 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   }
 
   for (auto [index, param] : llvm::enumerate(func->parameters())) {
+    // main's `argv` was dropped from the imported signature (it has no
+    // entry-block argument); its uses were rejected at signature time, so
+    // no binding is needed.
+    if (currentIsMain && isPointerType(param->getType()))
+      continue;
     Location paramLoc = translateLoc(param->getLocation());
     Value blockArg =
         entryBlock->getArgument(methodOwner ? index + 1 : index);
@@ -4240,10 +4287,8 @@ CImporter::emitStringArrayInit(Value place, Type type,
 }
 
 FailureOr<Value>
-CImporter::getOrCreateLiteralBacking(const clang::StringLiteral *literal,
-                                     Location loc) {
-  if (Value existing = literalBackings.lookup(literal))
-    return existing;
+CImporter::createLiteralBacking(const clang::StringLiteral *literal,
+                                Location loc, bool isConst) {
   if (!literal->isOrdinary())
     return emitError(loc) << "unsupported: non-ordinary string literal "
                              "bound to a pointer";
@@ -4266,19 +4311,31 @@ CImporter::getOrCreateLiteralBacking(const clang::StringLiteral *literal,
   bytes.push_back(IntegerAttr::get(byteType, 0));
   auto arrayType = emitrust::ArrayType::get(builder.getContext(), length + 1,
                                             byteType);
-  // Like createVariablePlace, hoist to the entry block when the function
-  // contains labels so a goto jumping over the declaration cannot leave a
-  // later use undominated.
+  // Like createVariablePlace, hoist a cached (const) backing to the entry
+  // block when the function contains labels so a goto jumping over the
+  // declaration cannot leave a later use undominated. A mutable per-call
+  // copy is used immediately in the same statement group, so it stays at
+  // the current insertion point.
   OpBuilder::InsertionGuard guard(builder);
-  if (currentHasLabels)
+  if (isConst && currentHasLabels)
     builder.setInsertionPointToStart(entryBlock);
-  Value backing = builder
-                      .create<emitrust::VariableOp>(
-                          loc, emitrust::LValueType::get(arrayType),
-                          builder.getArrayAttr(bytes), /*isConst=*/true)
-                      .getResult();
-  literalBackings[literal] = backing;
-  return backing;
+  return builder
+      .create<emitrust::VariableOp>(loc, emitrust::LValueType::get(arrayType),
+                                    builder.getArrayAttr(bytes), isConst)
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::getOrCreateLiteralBacking(const clang::StringLiteral *literal,
+                                     Location loc) {
+  if (Value existing = literalBackings.lookup(literal))
+    return existing;
+  FailureOr<Value> backing =
+      createLiteralBacking(literal, loc, /*isConst=*/true);
+  if (failed(backing))
+    return failure();
+  literalBackings[literal] = *backing;
+  return *backing;
 }
 
 LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
@@ -5465,35 +5522,59 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
             /*args=*/ArrayAttr(), ValueRange{slice})
         .getResult(0);
   }
-  // A pointer into a string-literal region prints the backing byte run
-  // from its cursor: `emitrust.slice_of` of the read-only backing at the
-  // cursor, rendered by the same `__emitrust_cstr` helper as char arrays
-  // (both stop at the first NUL, like C's %s). The decomposed-pointer gate
-  // keeps pointer-shaped arguments without a decomposed pointer (casts of
-  // scalar addresses, ...) on the generic rejection below.
+  // A decomposed `char *` prints the backing byte run from its cursor:
+  // `emitrust.slice_of` of the region place at the cursor, rendered by
+  // the same `__emitrust_cstr` helper as char arrays (both stop at the
+  // first NUL, like C's %s). Two region shapes qualify: a pointer into a
+  // string-literal region (its read-only backing array, CTS-P1) and the
+  // FR-28 slice-parameter class (a slice-classified `char *` parameter,
+  // whose base place is the deref'd `!emitrust.lvalue<!emitrust.slice<i8>>`,
+  // CTS-L2). The decomposed-pointer gate keeps pointer-shaped arguments
+  // without a decomposed pointer (casts of scalar addresses, ...) on the
+  // generic rejection below.
   if (isPointerType(expr->getType()) && involvesDecomposedPointer(expr) &&
       isDecomposedPointerExpr(expr)) {
     FailureOr<PtrExprValue> pointer = emitPointerRValue(expr);
     if (failed(pointer))
       return failure();
-    if (!pointer->literalBacking)
+    Value backingPlace = pointer->literalBacking;
+    Type elementType;
+    if (backingPlace) {
+      auto lvalueType =
+          llvm::cast<emitrust::LValueType>(backingPlace.getType());
+      elementType = llvm::cast<emitrust::ArrayType>(lvalueType.getValueType())
+                        .getElementType();
+    } else if (pointer->base) {
+      auto it = symbols.find(pointer->base);
+      if (it != symbols.end()) {
+        auto lvalueType =
+            llvm::dyn_cast<emitrust::LValueType>(it->second.getType());
+        auto sliceType =
+            lvalueType ? llvm::dyn_cast<emitrust::SliceType>(
+                             lvalueType.getValueType())
+                       : emitrust::SliceType();
+        if (sliceType &&
+            sliceType.getElementType() == builder.getIntegerType(8)) {
+          backingPlace = it->second;
+          elementType = sliceType.getElementType();
+        }
+      }
+    }
+    if (!backingPlace)
       return emitError(loc)
              << "unsupported: printf '%s' argument must be a string literal, "
-                "a char array, or a pointer into a string literal";
+                "a char array, a char slice parameter, or a pointer into a "
+                "string literal";
     Value cursor =
         pointer->cursor
             ? pointer->cursor
             : createIntConstant(loc, builder.getIntegerType(64), 0);
-    auto lvalueType =
-        llvm::cast<emitrust::LValueType>(pointer->literalBacking.getType());
-    auto backingType =
-        llvm::cast<emitrust::ArrayType>(lvalueType.getValueType());
-    auto sliceRefType = emitrust::RefType::get(
-        emitrust::SliceType::get(backingType.getElementType()));
+    auto sliceRefType =
+        emitrust::RefType::get(emitrust::SliceType::get(elementType));
     Value slice = builder
                       .create<emitrust::SliceOfOp>(loc, sliceRefType,
-                                                   pointer->literalBacking,
-                                                   cursor, /*is_mut=*/false)
+                                                   backingPlace, cursor,
+                                                   /*is_mut=*/false)
                       .getResult();
     needsCStrHelper = true;
     auto stringType =
@@ -6883,6 +6964,40 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
   Type pointee = mutRef.getPointee();
 
   if (auto sliceType = llvm::dyn_cast<emitrust::SliceType>(pointee)) {
+    // A string-literal argument (`f("abc")`) materializes a fresh mutable
+    // backing byte array (bytes plus the terminating NUL) at the call
+    // site and passes a whole-array slice of it. Per-call copies are
+    // unobservable in defined C programs: identical literals may share
+    // storage in C, but writing through a pointer to a string literal is
+    // undefined behavior, so no defined program can distinguish a copy
+    // from C's shared read-only storage.
+    const clang::Expr *strippedArg = stripTrivia(argument);
+    while (const auto *noop =
+               llvm::dyn_cast<clang::ImplicitCastExpr>(strippedArg)) {
+      if (noop->getCastKind() != clang::CK_NoOp)
+        break;
+      strippedArg = stripTrivia(noop->getSubExpr());
+    }
+    if (const auto *decay =
+            llvm::dyn_cast<clang::ImplicitCastExpr>(strippedArg))
+      if (decay->getCastKind() == clang::CK_ArrayToPointerDecay)
+        if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+                stripTrivia(decay->getSubExpr()))) {
+          if (sliceType.getElementType() != builder.getIntegerType(8))
+            return emitError(loc)
+                   << "unsupported: argument element type does not "
+                      "match the slice parameter";
+          FailureOr<Value> backing =
+              createLiteralBacking(literal, loc, /*isConst=*/false);
+          if (failed(backing))
+            return failure();
+          Value zero =
+              createIntConstant(loc, builder.getIntegerType(64), 0);
+          return builder
+              .create<emitrust::SliceOfOp>(loc, paramType, *backing, zero,
+                                           /*is_mut=*/true)
+              .getResult();
+        }
     // Slice parameter: reslice the argument's region base from its cursor.
     // A decayed array decomposes to cursor 0, `&arr[i]` to cursor i, a
     // walking pointer to its current cursor, and a slice parameter's own
