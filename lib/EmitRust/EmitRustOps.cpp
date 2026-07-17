@@ -558,8 +558,9 @@ GlobalStoreOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 
 /// Verifies that the variable's value type is sized (a bare slice cannot
 /// be a local variable) and that a present initializer is a typed attribute
-/// whose type equals the lvalue's wrapped value type, with initializers
-/// only used with scalar value types.
+/// whose type equals the lvalue's wrapped value type on a scalar variable,
+/// or a structurally matching element list (ArrayAttr) on an aggregate
+/// variable.
 LogicalResult VariableOp::verify() {
   Type valueType = cast<LValueType>(getResult().getType()).getValueType();
   if (isa<SliceType>(valueType))
@@ -571,6 +572,9 @@ LogicalResult VariableOp::verify() {
   if (!init)
     return success();
 
+  // An aggregate (array or struct) variable takes a list initializer.
+  if (isa<ArrayAttr>(init))
+    return verifyAggregateInit(getOperation(), init, valueType);
   auto typedInit = dyn_cast<TypedAttr>(init);
   if (!typedInit)
     return emitOpError("init must be a typed attribute");

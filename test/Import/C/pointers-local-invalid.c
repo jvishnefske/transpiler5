@@ -9,9 +9,12 @@
 // RUN: not emitrust-import-c %t/cross-diff.c 2>&1 | FileCheck %s --check-prefix=CROSSDIFF
 // RUN: not emitrust-import-c %t/cross-compare.c 2>&1 | FileCheck %s --check-prefix=CROSSCMP
 // RUN: not emitrust-import-c %t/truth-value.c 2>&1 | FileCheck %s --check-prefix=TRUTH
-// RUN: not emitrust-import-c %t/string-literal.c 2>&1 | FileCheck %s --check-prefix=STRLIT
 // RUN: not emitrust-import-c %t/row-walk.c 2>&1 | FileCheck %s --check-prefix=ROWWALK
 // RUN: not emitrust-import-c %t/row-diff.c 2>&1 | FileCheck %s --check-prefix=ROWDIFF
+// RUN: not emitrust-import-c %t/string-literal-write.c 2>&1 | FileCheck %s --check-prefix=STRWRITE
+// RUN: not emitrust-import-c %t/string-literal-write-deref.c 2>&1 | FileCheck %s --check-prefix=STRWRITEDEREF
+// RUN: not emitrust-import-c %t/string-literal-multi.c 2>&1 | FileCheck %s --check-prefix=STRMULTI
+// RUN: not emitrust-import-c %t/string-literal-join.c 2>&1 | FileCheck %s --check-prefix=STRJOIN
 
 // Phase-1a pointer decomposition boundaries: every pointer local must
 // resolve to exactly one non-escaping local object. Each file below
@@ -139,12 +142,51 @@ int main(void) {
   return 0;
 }
 
-// String literals live in static storage the decomposition cannot own.
-// STRLIT: string-literal.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer to a string literal
+// A string-literal region is read-only (writing a C string literal is
+// UB); any write through its pointers is rejected at the write site.
+// STRWRITE: string-literal-write.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: write through a pointer to a string literal (the literal is read-only)
 
-//--- string-literal.c
+//--- string-literal-write.c
 int main(void) {
   char *s = "hi";
+  s[0] = 'H';
+  return s[0];
+}
+
+// The same rejection covers a write through a copied cursor (`*q = ...`
+// after `q = s`), which shares the literal's region.
+// STRWRITEDEREF: string-literal-write-deref.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: write through a pointer to a string literal (the literal is read-only)
+
+//--- string-literal-write-deref.c
+int main(void) {
+  char *s = "hi";
+  char *q = s;
+  *q++ = 'H';
+  return s[0];
+}
+
+// Rebinding one pointer across two distinct literals would need a
+// multi-base region (CTS-P7 territory) and stays rejected.
+// STRMULTI: string-literal-multi.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer bound to multiple string literals
+
+//--- string-literal-multi.c
+int main(void) {
+  char *s = "hi";
+  s = "bye";
+  return s[0];
+}
+
+// A pointer cannot range over both a string literal and an object; the
+// diagnostic names both bindings.
+// STRJOIN: string-literal-join.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer 's' would join a string literal and object 'buf' into one region
+// STRJOIN: string-literal-join.c:{{[0-9]+}}:{{[0-9]+}}: note: bound to a string literal here
+// STRJOIN: string-literal-join.c:{{[0-9]+}}:{{[0-9]+}}: note: bound to 'buf' here
+
+//--- string-literal-join.c
+int main(void) {
+  char buf[4];
+  char *s = "hi";
+  s = buf;
   return s[0];
 }
 

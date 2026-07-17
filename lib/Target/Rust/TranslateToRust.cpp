@@ -1175,12 +1175,16 @@ LogicalResult RustEmitter::emitVariable(emitrust::VariableOp variableOp) {
   Location loc = variableOp.getLoc();
   Type valueType =
       cast<emitrust::LValueType>(result.getType()).getValueType();
-  os << "let mut " << assignName(result) << ": ";
+  // A `const`-marked variable is never written after its initializer and
+  // becomes an immutable `let` binding.
+  os << (variableOp.getIsConst() ? "let " : "let mut ") << assignName(result)
+     << ": ";
   if (failed(emitType(loc, valueType)))
     return failure();
   os << " = ";
   if (Attribute init = variableOp.getInitAttr()) {
-    if (failed(emitAttribute(loc, init)))
+    if (failed(emitAggregateInit(variableOp.getOperation(), loc, init,
+                                 valueType)))
       return failure();
   } else if (failed(emitDefaultValue(loc, valueType))) {
     return failure();

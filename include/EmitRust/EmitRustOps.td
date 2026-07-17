@@ -730,41 +730,57 @@ def EmitRust_GlobalStoreOp : EmitRust_Op<"global_store",
 def EmitRust_VariableOp : EmitRust_Op<"variable"> {
   let summary = "Local variable declaration operation";
   let description = [{
-    The `emitrust.variable` operation declares a mutable local variable and
-    produces the lvalue naming its storage. The optional initializer must be
-    a typed attribute whose type equals the lvalue's wrapped value type;
-    initializers are only supported for scalar value types. Without an
-    initializer, the variable is emitted with the type's default value:
-    `0` for integers and index, `0.0` for floats, `false` for `i1`,
-    `Name::default()` for structs, and `[<element-default>; N]` for arrays.
+    The `emitrust.variable` operation declares a local variable and produces
+    the lvalue naming its storage. A scalar variable's optional initializer
+    must be a typed attribute whose type equals the lvalue's wrapped value
+    type; an array variable additionally takes an ArrayAttr with exactly one
+    entry per element (rendered `[e0, e1, ...]`, recursively admitting
+    nested ArrayAttr entries). Without an initializer, the variable is
+    emitted with the type's default value: `0` for integers and index, `0.0`
+    for floats, `false` for `i1`, `Name::default()` for structs, and
+    `[<element-default>; N]` for arrays.
+
+    A variable carrying the `const` marker is never written after its
+    initializer; it is emitted as an immutable `let` binding (the backing
+    of a C string literal, for example). A variable without the marker is
+    the ordinary mutable `let mut` binding.
 
     Example:
 
     ```mlir
     %0 = emitrust.variable <42 : i32> : !emitrust.lvalue<i32>
     %1 = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+    %2 = emitrust.variable const <[104 : i8, 0 : i8]>
+        : !emitrust.lvalue<!emitrust.array<2xi8>>
     ```
     ```rust
     // Code emitted for the operations above.
     let mut v0: i32 = 42;
     let mut v1: [i32; 4] = [0; 4];
+    let v2: [i8; 2] = [104, 0];
     ```
   }];
 
-  let arguments = (ins OptionalAttr<EmitRust_OpaqueOrTypedAttr>:$init);
+  let arguments = (ins OptionalAttr<EmitRust_InitAttr>:$init,
+                       UnitAttr:$is_const);
   let results = (outs EmitRust_LValueType:$result);
 
   let builders = [
-    OpBuilder<(ins "Type":$resultType, CArg<"Attribute", "{}">:$init), [{
+    OpBuilder<(ins "Type":$resultType, CArg<"Attribute", "{}">:$init,
+                   CArg<"bool", "false">:$isConst), [{
       if (init)
         $_state.addAttribute(getInitAttrName($_state.name), init);
+      if (isConst)
+        $_state.addAttribute(getIsConstAttrName($_state.name),
+                             $_builder.getUnitAttr());
       $_state.addTypes(resultType);
     }]>
   ];
   let skipDefaultBuilders = 1;
 
   let assemblyFormat =
-      "(` ` `<` $init^ `>`)? attr-dict `:` qualified(type($result))";
+      "(`const` $is_const^)? (` ` `<` $init^ `>`)? attr-dict `:` "
+      "qualified(type($result))";
   let hasVerifier = 1;
 }
 
