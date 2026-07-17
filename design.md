@@ -708,9 +708,21 @@ rule.
   by-value struct copies, address-of on locals and aggregates, and 1-D
   fixed-size arrays with integer indexing.
   (test/Import/C/structs.c, arrays.c, pointers.c, test/EndToEnd/structs.c)
-- [ ] C99-41 Multi-dimensional arrays and arrays of structs, with full
+- [x] C99-41 Multi-dimensional arrays and arrays of structs, with full
   place-chain access (the dialect's array and member ops already compose;
   the importer must emit the chains and tests must cover them).
+  `!emitrust.array` elements nest (emitted `[[T; N]; M]`), `mapType`
+  recurses, nested initializer lists (file-scope with designators and
+  zero fill, and block-scope) recurse level by level, `a[i][j]` emits one
+  `emitrust.subscript` per dimension, subscript chains compose with
+  `emitrust.member` on arrays of structs, and the pointer decomposition
+  reaches into multi-dimensional bases with a flat row-major cursor
+  (`&arr[i][j]`, row-pointer subscripts, scalar dereference via div/rem
+  peeling). Row-pointer walking arithmetic and slices of rows stay
+  located rejections (CTS-P scope). See CTS-S4.
+  (test/Dialect/EmitRust/types.mlir, invalid.mlir,
+  test/Import/C/arrays-multidim.c, pointers-local-invalid.c,
+  test/EndToEnd/arrays-multidim.c)
 - [ ] C99-42 Nested struct types and struct assignment as a whole.
 - [ ] C99-43 Pointers to pointers and pointer members inside structs
   (design decision needed alongside C99-26: reference-typed struct fields
@@ -836,9 +848,9 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 159 passed / 0 miscompiled /
-61 unsupported (was 150/70 at commit a091423, when this checklist was
-drawn up; the quick wins plus CTS-S1/S7 partials landed since). Every
+Ledger as of 2026-07-17: 220 total / 161 passed / 0 miscompiled /
+59 unsupported (was 150/70 at commit a091423, when this checklist was
+drawn up; the quick wins, CTS-S1/S7 partials, and CTS-S4 landed since). Every
 one of the 61 is a located build-time rejection — never wrong output.
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
@@ -1001,11 +1013,25 @@ observed when C99-33 + C99-47 together unlocked 00215).
   into arbitrary statement positions rather than the structured match
   lowering; goto's labelBlocks machinery (C99-33) is the likely vehicle.
   (00051.c, 00143.c)
-- [ ] CTS-S4 (2) Multi-dimensional arrays (C99-41): nested
+- [x] CTS-S4 (2) Multi-dimensional arrays (C99-41): nested
   `emitrust.array` types, nested ArrayAttr initializers (the C99-11
   file-scope machinery already recurses), and row-major subscript
   lowering; mapType currently rejects the type before anything else
   runs.
+  Landed: `!emitrust.array` elements may nest (emitted `[[T; N]; M]`),
+  mapType recurses, the APValue global-initializer converter and the
+  local init-list walker already recursed once the type mapper let them,
+  and direct `a[i][j]` chains one `emitrust.subscript` per level. The
+  pointer decomposition gained a flat row-major cursor into
+  multi-dimensional bases: `&arr[i][j]` folds to `i*N + j`, a row
+  pointer's subscript scales by the row span, and place materialization
+  peels one array level per subscript by div/rem on the cursor. Walking
+  arithmetic on row pointers (`++`, `+ n`, `+=`, difference) stays a
+  located rejection (CTS-P scope), as do slices of rows. Both tests pass
+  and are in the ratchet manifest.
+  (test/Dialect/EmitRust/types.mlir, invalid.mlir,
+  test/Import/C/arrays-multidim.c, pointers-local-invalid.c,
+  test/EndToEnd/arrays-multidim.c)
   (00130.c, 00151.c)
 - [ ] CTS-S5 (1) Variable-length arrays: conflicts with the
   deterministic/bounded design philosophy; recommend documenting as a

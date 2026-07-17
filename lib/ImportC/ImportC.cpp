@@ -35,9 +35,16 @@
 ///    cursor and resolves to the scalar's own place), pointer arithmetic
 ///    becomes i64 cursor arithmetic, and same-object pointer difference and
 ///    comparison become plain i64 `arith` ops (C's ptrdiff_t is `long` on
-///    the supported targets). Pointers whose address is taken, that rebind
-///    across distinct objects, hold a null constant, or point into globals
-///    or string literals are rejected with located diagnostics.
+///    the supported targets). Into a multi-dimensional array the cursor is
+///    flat and row-major (it counts innermost elements, so `&arr[i][j]` on
+///    `T arr[M][N]` is the cursor `i*N + j`), an index over a row scales by
+///    the row's flat element count, and materializing the place peels one
+///    `emitrust.subscript` per array level by dividing the cursor by the
+///    level's span and continuing with the remainder; the walking
+///    arithmetic forms on row pointers (`++`, `+ n`, `+=`, difference) are
+///    rejected. Pointers whose address is taken, that rebind across
+///    distinct objects, hold a null constant, or point into globals or
+///    string literals are rejected with located diagnostics.
 ///  - Pointer parameters are classified per definition (Phase 1b): a
 ///    parameter that is only dereferenced or arrowed stays a scalar
 ///    reference `!emitrust.mut_ref<T>`; a parameter that is subscripted,
@@ -234,7 +241,10 @@ static bool isRustKeyword(llvm::StringRef name) {
 /// and an i64 element cursor value. `cursor` is null for a degenerate base
 /// (the address of a scalar or struct object taken with `&x`), which
 /// supports dereference but carries no element offset and hence no pointer
-/// arithmetic.
+/// arithmetic. Into a multi-dimensional array the cursor is flat and
+/// row-major: it counts innermost (scalar or struct) elements from the
+/// start of `base`, regardless of whether the pointer designates a scalar
+/// or a whole row.
 struct PtrExprValue {
   /// The object the pointer points into (a local scalar, struct, or array).
   const clang::VarDecl *base;
@@ -1068,15 +1078,33 @@ private:
   /// degenerate (cursor-less) form, `&arr[i]` and array decay yield the
   /// base with an i64 cursor, `p +- n` is cursor arithmetic, and the
   /// `++`/`--` value forms update the cursor cell and yield the pre- or
-  /// post-value per C semantics. Null pointer constants, string literals,
-  /// globals, and every other pointer source are located rejections.
+  /// post-value per C semantics. A cursor into a multi-dimensional array
+  /// counts innermost (scalar or struct) elements in row-major order, so
+  /// `&arr[i][j]` on `T arr[M][N]` yields the flat cursor `i*N + j`.
+  /// Null pointer constants, string literals, globals, arithmetic on
+  /// pointers to arrays (rows), and every other pointer source are
+  /// located rejections.
   FailureOr<PtrExprValue> emitPointerRValue(const clang::Expr *expr);
 
+  /// Emits the (base, flat cursor) decomposition of one array subscript
+  /// level `base[idx]` whose base is itself a decomposed pointer
+  /// expression (a pointer read, an array decay, or a decayed inner
+  /// subscript). The index is scaled by the flat element count of the
+  /// subscript's result type, so subscripting a row of a
+  /// multi-dimensional array advances the cursor by whole rows.
+  FailureOr<PtrExprValue>
+  emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript);
+
   /// Materializes the place a decomposed pointer designates: the base
-  /// object's own place for a degenerate pointer, or
-  /// `emitrust.subscript(base, cursor)` for a pointer into an array.
+  /// object's own place for a degenerate pointer, or a chain of
+  /// `emitrust.subscript(base, cursor)` refinements for a pointer into an
+  /// array. `pointeeType` is the mapped value type the resulting place
+  /// must wrap; a flat cursor into a multi-dimensional array peels one
+  /// array level per subscript, dividing the cursor by the level's flat
+  /// element count and continuing with the remainder (row-major order).
   FailureOr<Value> emitPointerPlace(Location loc,
-                                    const PtrExprValue &pointer);
+                                    const PtrExprValue &pointer,
+                                    Type pointeeType);
 
   /// Emits `p - q` on two decomposed pointers into the same object as the
   /// plain i64 cursor difference (C's ptrdiff_t is `long`, i.e. i64, on
@@ -1380,6 +1408,32 @@ static bool isFunctionPointer(clang::QualType type) {
   return type.getCanonicalType()->isFunctionPointerType();
 }
 
+/// Returns the number of innermost (non-array) elements one value of
+/// `type` spans: the product of all constant array extents, or 1 for a
+/// non-array type. This is the scale factor of the flat row-major cursor
+/// scheme: a decomposed pointer's i64 cursor counts innermost elements of
+/// its base object, so an index over a row of a multi-dimensional array
+/// advances the cursor by the row's flat element count.
+static uint64_t flatElementCount(clang::ASTContext &context,
+                                 clang::QualType type) {
+  uint64_t count = 1;
+  const clang::ConstantArrayType *array = context.getAsConstantArrayType(type);
+  while (array) {
+    count *= array->getSize().getZExtValue();
+    array = context.getAsConstantArrayType(array->getElementType());
+  }
+  return count;
+}
+
+/// Returns whether the pointer-typed expression type `type` points to a
+/// whole array (a row of a multi-dimensional array, e.g. `char (*)[4]`).
+/// Arithmetic on such pointers moves the cursor by whole rows, which the
+/// flat cursor scheme only implements for the subscript and address-of
+/// forms; the walking forms (`++`, `+ n`, `+=`, difference) are rejected.
+static bool pointsToArray(clang::QualType type) {
+  return type.getCanonicalType()->getPointeeType()->isArrayType();
+}
+
 /// Returns the local, non-parameter variable a stripped declaration
 /// reference `expr` names, or null when `expr` is not such a reference.
 static const clang::VarDecl *asLocalVarRef(const clang::Expr *expr) {
@@ -1619,15 +1673,27 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
       break;
     }
     case clang::CK_ArrayToPointerDecay: {
-      // `p = arr`: the decayed array is the region base.
+      // `p = arr`: the decayed array is the region base. A decayed row of
+      // a multi-dimensional array (`q = arr[i]`) peels the subscripts to
+      // the same root.
       const clang::Expr *sub = stripTrivia(cast->getSubExpr());
       if (llvm::isa<clang::StringLiteral>(sub))
         return markInvalid(ptr, loc,
                            "unsupported: pointer to a string literal");
+      while (const auto *inner =
+                 llvm::dyn_cast<clang::ArraySubscriptExpr>(sub))
+        sub = inner->getBase()->IgnoreParenImpCasts();
       if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub))
         if (const auto *array =
-                llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+                llvm::dyn_cast<clang::VarDecl>(ref->getDecl())) {
+          if (tracks(array)) {
+            // A row of the base a tracked pointer walks (`q = p[i]`)
+            // joins the two pointers and moves the cursor.
+            recordArithmetic(array, loc);
+            return unite(ptr, array);
+          }
           return addBase(ptr, array, loc);
+        }
       break;
     }
     default:
@@ -1655,8 +1721,12 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
               llvm::dyn_cast<clang::ArraySubscriptExpr>(sub)) {
         // `p = &arr[i]` binds the array; `p = &q[i]` is `p = q + i`; and
         // `p = &param[i]` binds a slice-classified pointer parameter.
+        // Nested subscripts (`p = &arr[i][j]`) peel to the same root.
         const clang::Expr *base =
             subscript->getBase()->IgnoreParenImpCasts();
+        while (const auto *inner =
+                   llvm::dyn_cast<clang::ArraySubscriptExpr>(base))
+          base = inner->getBase()->IgnoreParenImpCasts();
         if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(base))
           if (const auto *var =
                   llvm::dyn_cast<clang::VarDecl>(ref->getDecl())) {
@@ -1853,11 +1923,11 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     FailureOr<Type> element = mapType(array->getElementType(), loc);
     if (failed(element))
       return failure();
-    if (llvm::isa<emitrust::ArrayType>(*element))
-      return emitError(loc) << "unsupported: multi-dimensional array";
-    // Arrays of function pointers are out of the v1 fn_ptr scope; reject
-    // loudly instead of building an !emitrust.array the dialect does not
-    // admit.
+    // A multi-dimensional array recurses naturally: the element of the
+    // outer dimension is itself an `!emitrust.array` (rendered as the
+    // nested Rust array `[[T; N]; M]`). Arrays of function pointers are
+    // out of the v1 fn_ptr scope; reject loudly instead of building an
+    // !emitrust.array the dialect does not admit.
     if (llvm::isa<emitrust::FnPtrType>(*element))
       return emitError(loc) << "unsupported: array of function pointers";
     uint64_t size = array->getSize().getZExtValue();
@@ -1940,9 +2010,9 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     if (failed(inner))
       return failure();
     if (kind == ParamKind::Slice) {
-      // A slice element must be sized and scalar/struct (the array element
-      // rules); a pointer to an array (`int (*)[N]`) has no slice shape.
-      if (!emitrust::ArrayType::isValidElementType(*inner))
+      // A slice element must be sized and scalar/struct; a pointer to an
+      // array (`int (*)[N]`) has no slice shape.
+      if (!emitrust::SliceType::isValidElementType(*inner))
         return emitError(loc)
                << "unsupported: slice parameter element type " << *inner;
       return Type(
@@ -3638,8 +3708,22 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
     cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
   } else if (const clang::ConstantArrayType *array =
                  astContext().getAsConstantArrayType(base->getType())) {
-    if (!astContext().hasSameUnqualifiedType(pointee,
-                                             array->getElementType()))
+    // The pointee must be the element type of the base at some array
+    // nesting depth: a row pointer (`char (*)[4]` into `char[2][4]`)
+    // matches at the first level, a scalar pointer (`char *`) at the
+    // innermost. Either way the cursor counts innermost elements in
+    // row-major order.
+    bool matchesLevel = false;
+    for (const clang::ConstantArrayType *level = array; level;
+         level = astContext().getAsConstantArrayType(
+             level->getElementType())) {
+      if (astContext().hasSameUnqualifiedType(pointee,
+                                              level->getElementType())) {
+        matchesLevel = true;
+        break;
+      }
+    }
+    if (!matchesLevel)
       return emitError(bindLoc)
              << "unsupported: pointer element type does not match its "
                 "target array";
@@ -3692,6 +3776,11 @@ LogicalResult CImporter::emitPointerCompoundAssign(
       clang::BinaryOperator::getOpForCompoundAssignment(op->getOpcode());
   if (opcode != clang::BO_Add && opcode != clang::BO_Sub)
     return emitError(loc) << "unsupported compound assignment on a pointer";
+  // Walking a pointer to a whole row would need a row-scaled step (CTS-P
+  // scope).
+  if (pointsToArray(op->getLHS()->getType()))
+    return emitError(loc)
+           << "unsupported: arithmetic on a pointer to an array";
   const clang::VarDecl *var = asVarRef(op->getLHS());
   auto it = var ? pointerLocals.find(var) : pointerLocals.end();
   if (it == pointerLocals.end())
@@ -5961,7 +6050,7 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
     if (failed(pointer))
       return failure();
     root = pointer->base;
-    FailureOr<Value> place = emitPointerPlace(loc, *pointer);
+    FailureOr<Value> place = emitPointerPlace(loc, *pointer, pointee);
     if (failed(place))
       return failure();
     auto lvalueType = llvm::cast<emitrust::LValueType>((*place).getType());
@@ -6207,10 +6296,15 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
                             << "' has no known target object";
     }
     case clang::CK_ArrayToPointerDecay: {
-      // A decayed array is its own base at cursor 0.
+      // A decayed array is its own base at cursor 0; a decayed row of a
+      // multi-dimensional array (`arr[i]` in `arr[i][j]` or `q = arr[i]`)
+      // decomposes the subscript into the base's flat cursor.
       const clang::Expr *sub = stripTrivia(cast->getSubExpr());
       if (llvm::isa<clang::StringLiteral>(sub))
         return emitError(loc) << "unsupported: pointer to a string literal";
+      if (const auto *subscript =
+              llvm::dyn_cast<clang::ArraySubscriptExpr>(sub))
+        return emitSubscriptPointer(subscript);
       const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub);
       const auto *var =
           ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
@@ -6247,38 +6341,21 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       }
       if (const auto *subscript =
               llvm::dyn_cast<clang::ArraySubscriptExpr>(sub)) {
-        // `&arr[i]` (via the decay of `arr`) and `&q[i]` (i.e. `q + i`)
-        // both decompose the subscript base and offset it by the index.
-        FailureOr<PtrExprValue> pointer =
-            emitPointerRValue(subscript->getBase());
-        if (failed(pointer))
-          return failure();
-        if (!pointer->cursor) {
-          // The address of a scalar admits only the constant-zero index.
-          clang::Expr::EvalResult indexValue;
-          if (subscript->getIdx()->EvaluateAsInt(indexValue, astContext()) &&
-              indexValue.Val.getInt() == 0)
-            return PtrExprValue{pointer->base, Value()};
-          return emitError(loc) << "unsupported: arithmetic on the address "
-                                   "of a scalar object";
-        }
-        FailureOr<Value> index = emitRValue(subscript->getIdx());
-        if (failed(index))
-          return failure();
-        if (!llvm::isa<IntegerType>((*index).getType()))
-          return emitError(loc) << "unsupported subscript index type";
-        Value offset = castToIntType(loc, *index, cursorType);
-        Value cursor =
-            builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
-                .getResult();
-        return PtrExprValue{pointer->base, cursor};
+        // `&arr[i]` (via the decay of `arr`), `&q[i]` (i.e. `q + i`), and
+        // nested `&arr[i][j]` all decompose the subscript base and offset
+        // it by the (row-scaled) index.
+        return emitSubscriptPointer(subscript);
       }
       return emitError(loc) << "unsupported pointer target expression";
     }
     if (unary->isIncrementDecrementOp()) {
       // `p++` / `--p` in pointer-value position: update the cursor cell and
       // yield the pre-value (postfix) or post-value (prefix) per C. Both
-      // pointer locals and slice parameters carry cursor cells.
+      // pointer locals and slice parameters carry cursor cells. Walking a
+      // pointer to a whole row would need a row-scaled step (CTS-P scope).
+      if (pointsToArray(unary->getSubExpr()->getType()))
+        return emitError(loc)
+               << "unsupported: arithmetic on a pointer to an array";
       const clang::VarDecl *var = asVarRef(unary->getSubExpr());
       auto it = var ? pointerLocals.find(var) : pointerLocals.end();
       if (it == pointerLocals.end())
@@ -6304,8 +6381,15 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
     clang::BinaryOperatorKind opcode = binary->getOpcode();
     if (opcode == clang::BO_Add || opcode == clang::BO_Sub) {
       // `p + n` / `p - n` / `n + p`: cursor arithmetic. The operands are
-      // emitted in source order (C leaves the order unspecified).
+      // emitted in source order (C leaves the order unspecified). Walking
+      // a pointer to a whole row would need a row-scaled step (CTS-P
+      // scope).
       bool lhsIsPointer = isPointerType(binary->getLHS()->getType());
+      const clang::Expr *pointerSide =
+          lhsIsPointer ? binary->getLHS() : binary->getRHS();
+      if (pointsToArray(pointerSide->getType()))
+        return emitError(loc)
+               << "unsupported: arithmetic on a pointer to an array";
       FailureOr<PtrExprValue> pointer;
       FailureOr<Value> amount;
       if (lhsIsPointer) {
@@ -6343,8 +6427,60 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
                         << e->getStmtClassName();
 }
 
+FailureOr<PtrExprValue>
+CImporter::emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript) {
+  Location loc = translateLoc(subscript->getBeginLoc());
+  IntegerType cursorType = builder.getIntegerType(64);
+  FailureOr<PtrExprValue> pointer = emitPointerRValue(subscript->getBase());
+  if (failed(pointer))
+    return failure();
+  if (!pointer->cursor) {
+    // The address of a scalar admits only the constant-zero index.
+    clang::Expr::EvalResult indexValue;
+    if (subscript->getIdx()->EvaluateAsInt(indexValue, astContext()) &&
+        indexValue.Val.getInt() == 0)
+      return PtrExprValue{pointer->base, Value()};
+    return emitError(loc) << "unsupported: arithmetic on the address "
+                             "of a scalar object";
+  }
+  FailureOr<Value> index = emitRValue(subscript->getIdx());
+  if (failed(index))
+    return failure();
+  if (!llvm::isa<IntegerType>((*index).getType()))
+    return emitError(loc) << "unsupported subscript index type";
+  Value offset = castToIntType(loc, *index, cursorType);
+  // One index step over a row of a multi-dimensional array advances the
+  // flat cursor by the row's whole element count (row-major layout); a
+  // scalar or struct element keeps the historical unscaled offset.
+  uint64_t span = flatElementCount(astContext(), subscript->getType());
+  if (span != 1) {
+    Value spanValue =
+        createIntConstant(loc, cursorType, static_cast<int64_t>(span));
+    offset =
+        builder.create<arith::MulIOp>(loc, offset, spanValue).getResult();
+  }
+  Value cursor = builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
+                     .getResult();
+  return PtrExprValue{pointer->base, cursor};
+}
+
+/// Returns the number of innermost (non-array) elements one value of the
+/// mapped `type` spans: the product of all `!emitrust.array` extents, or 1
+/// for a non-array type. The MLIR-side counterpart of the clang-side
+/// `flatElementCount`, used to peel a flat row-major cursor one array
+/// level at a time.
+static uint64_t flatElementCount(Type type) {
+  uint64_t count = 1;
+  while (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(type)) {
+    count *= arrayType.getSize();
+    type = arrayType.getElementType();
+  }
+  return count;
+}
+
 FailureOr<Value> CImporter::emitPointerPlace(Location loc,
-                                             const PtrExprValue &pointer) {
+                                             const PtrExprValue &pointer,
+                                             Type pointeeType) {
   auto it = symbols.find(pointer.base);
   if (it == symbols.end())
     return emitError(loc) << "unsupported: pointer target '"
@@ -6357,26 +6493,54 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
   if (!lvalueType)
     return emitError(loc) << "unsupported pointer target place";
   // The base place wraps an array (local array base) or a slice (deref'd
-  // slice parameter base); both subscript by the cursor.
-  Type elementType;
-  if (auto arrayType =
-          llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType()))
-    elementType = arrayType.getElementType();
-  else if (auto sliceType =
-               llvm::dyn_cast<emitrust::SliceType>(lvalueType.getValueType()))
-    elementType = sliceType.getElementType();
-  else
+  // slice parameter base); both subscript by the cursor. A nested array
+  // peels one level per subscript until the pointee type is reached: the
+  // flat row-major cursor divides by the level's element span for the
+  // index and continues into the level with the remainder.
+  Value place = basePlace;
+  Value cursor = pointer.cursor;
+  Type valueType = lvalueType.getValueType();
+  while (valueType != pointeeType) {
+    Type elementType;
+    if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(valueType))
+      elementType = arrayType.getElementType();
+    else if (auto sliceType = llvm::dyn_cast<emitrust::SliceType>(valueType))
+      elementType = sliceType.getElementType();
+    else
+      return emitError(loc) << "unsupported pointer target place";
+    uint64_t span = flatElementCount(elementType);
+    Value index = cursor;
+    if (span != 1) {
+      Value spanValue = createIntConstant(loc, builder.getIntegerType(64),
+                                          static_cast<int64_t>(span));
+      index =
+          builder.create<arith::DivSIOp>(loc, cursor, spanValue).getResult();
+      // The remainder feeds the next level's subscript; when the pointee
+      // is this level's element (a row pointer) the peel stops here and
+      // the remainder is not needed.
+      if (elementType != pointeeType)
+        cursor = builder.create<arith::RemSIOp>(loc, cursor, spanValue)
+                     .getResult();
+    }
+    place = builder
+                .create<emitrust::SubscriptOp>(
+                    loc, emitrust::LValueType::get(elementType), place, index)
+                .getResult();
+    valueType = elementType;
+  }
+  if (place == basePlace)
     return emitError(loc) << "unsupported pointer target place";
-  return builder
-      .create<emitrust::SubscriptOp>(
-          loc, emitrust::LValueType::get(elementType), basePlace,
-          pointer.cursor)
-      .getResult();
+  return place;
 }
 
 FailureOr<Value>
 CImporter::emitPointerDifference(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  // The flat cursor difference counts innermost elements; a difference of
+  // row pointers would need a row-scaled division (CTS-P scope).
+  if (pointsToArray(op->getLHS()->getType()))
+    return emitError(loc)
+           << "unsupported: arithmetic on a pointer to an array";
   FailureOr<PtrExprValue> lhs = emitPointerRValue(op->getLHS());
   if (failed(lhs))
     return failure();
@@ -6469,7 +6633,12 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
       FailureOr<PtrExprValue> pointer = emitPointerRValue(member->getBase());
       if (failed(pointer))
         return failure();
-      FailureOr<Value> place = emitPointerPlace(loc, *pointer);
+      FailureOr<Type> pointeeType = mapType(
+          member->getBase()->getType().getCanonicalType()->getPointeeType(),
+          loc);
+      if (failed(pointeeType))
+        return failure();
+      FailureOr<Value> place = emitPointerPlace(loc, *pointer, *pointeeType);
       if (failed(place))
         return failure();
       basePlace = *place;
@@ -6521,31 +6690,16 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
       if (!isDecomposedPointerExpr(subscript->getBase()))
         return emitError(loc) << "unsupported: subscript on a pointer "
                                  "parameter";
-      FailureOr<PtrExprValue> pointer =
-          emitPointerRValue(subscript->getBase());
+      // `emitSubscriptPointer` folds the (row-scaled) index into the flat
+      // cursor; a degenerate base (the address of a scalar) admits only
+      // the constant-zero subscript and resolves to the object itself.
+      FailureOr<PtrExprValue> pointer = emitSubscriptPointer(subscript);
       if (failed(pointer))
         return failure();
-      if (!pointer->cursor) {
-        // Degenerate base (the address of a scalar): only the constant-zero
-        // subscript designates the object (`p[0]` on `p = &x`).
-        clang::Expr::EvalResult indexValue;
-        if (!subscript->getIdx()->EvaluateAsInt(indexValue, astContext()) ||
-            indexValue.Val.getInt() != 0)
-          return emitError(loc) << "unsupported: nonzero subscript on the "
-                                   "address of a scalar object";
-        return emitPointerPlace(loc, *pointer);
-      }
-      FailureOr<Value> index = emitRValue(subscript->getIdx());
-      if (failed(index))
+      FailureOr<Type> pointeeType = mapType(subscript->getType(), loc);
+      if (failed(pointeeType))
         return failure();
-      if (!llvm::isa<IntegerType>((*index).getType()))
-        return emitError(loc) << "unsupported subscript index type";
-      Value offset =
-          castToIntType(loc, *index, builder.getIntegerType(64));
-      Value cursor =
-          builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
-              .getResult();
-      return emitPointerPlace(loc, PtrExprValue{pointer->base, cursor});
+      return emitPointerPlace(loc, *pointer, *pointeeType);
     }
     FailureOr<Value> basePlace = emitLValue(base, writeback);
     if (failed(basePlace))
@@ -6577,7 +6731,10 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
             emitPointerRValue(unary->getSubExpr());
         if (failed(decomposed))
           return failure();
-        return emitPointerPlace(loc, *decomposed);
+        FailureOr<Type> pointeeType = mapType(unary->getType(), loc);
+        if (failed(pointeeType))
+          return failure();
+        return emitPointerPlace(loc, *decomposed, *pointeeType);
       }
       FailureOr<Value> pointer = emitRValue(unary->getSubExpr());
       if (failed(pointer))
