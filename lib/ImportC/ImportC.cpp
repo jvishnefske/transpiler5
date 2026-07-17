@@ -57,9 +57,19 @@
 ///    refinement, mirroring the fn_ptr `expect`. Passing, differencing,
 ///    or ordering possibly-null pointers stays rejected, as does the
 ///    general integer-to-pointer traffic around the idiom (CTS-P3).
-///    Pointers whose address is taken, that rebind across distinct
-///    objects, or point into globals are rejected with located
-///    diagnostics.
+///    A pointer that rebinds across several distinct same-kind local
+///    objects of one element type keeps one region under the
+///    enum-of-bases model (CTS-P7): each pointer of the region adds a
+///    promotable i32 base-discriminant cell naming its active base
+///    (address bindings store the bound base's index, `p = q` copies the
+///    discriminant), every dereference dispatches on the discriminant —
+///    a match over the closed set of bases that stages the active
+///    element and, for writes, dispatches the mutated value back — and
+///    same-region equality compares (discriminant, cursor) pairs.
+///    Difference, ordering, and passing multi-base pointers onward stay
+///    rejected, as do regions mixing base kinds or element types.
+///    Pointers whose address is taken or that point into globals are
+///    rejected with located diagnostics.
 ///  - Pointer parameters are classified per definition (Phase 1b): a
 ///    parameter that is only dereferenced or arrowed stays a scalar
 ///    reference `!emitrust.mut_ref<T>`; a parameter that is subscripted,
@@ -243,10 +253,26 @@ struct GlobalInfo {
 /// contexts store the modified copy back into the global afterwards
 /// (load-modify-store, exact for the single-threaded C subset).
 struct GlobalWriteback {
-  /// The staging place holding the copy; null when no global was staged.
+  /// The staging place holding the copy; null when no global was staged
+  /// and no multi-base element was staged.
   Value place;
-  /// The symbol of the global to store the copy back into.
+  /// The symbol of the global to store the copy back into; empty for a
+  /// multi-base staging (which writes back through `multiBases`).
   std::string symbol;
+  /// Multi-base dispatch store-back (CTS-P7): when non-empty, `place`
+  /// stages one element of the base selected by `multiBaseIndex`, and the
+  /// flush dispatches the staged value back into that base at
+  /// `multiCursor` (a match over the closed set of bases).
+  SmallVector<const clang::VarDecl *, 2> multiBases;
+  /// The i32 enum-of-bases discriminant selecting the active base;
+  /// meaningful only with a non-empty `multiBases`.
+  Value multiBaseIndex;
+  /// The i64 element cursor of the staged element; null when every base
+  /// is a degenerate scalar object.
+  Value multiCursor;
+  /// The mapped pointee value type of the staged element; meaningful only
+  /// with a non-empty `multiBases`.
+  Type multiPointeeType;
 };
 
 /// Returns whether `name` is a Rust keyword (strict or reserved, editions
@@ -284,10 +310,12 @@ static bool isRustKeyword(llvm::StringRef name) {
 /// cursor is always present.
 struct PtrExprValue {
   /// The object the pointer points into (a local scalar, struct, or
-  /// array); null for a pointer into a string literal and for a pointer
+  /// array); null for a pointer into a string literal, for a pointer
   /// of a nullable region that was never bound to any object (a pointer
-  /// that only ever holds the null constant).
-  const clang::VarDecl *base;
+  /// that only ever holds the null constant), and for a pointer of a
+  /// multi-base region (whose active base is the runtime `baseIndex`
+  /// discriminant, CTS-P7).
+  const clang::VarDecl *base = nullptr;
   /// The i64 element offset from the start of the region; null when
   /// degenerate.
   Value cursor;
@@ -300,6 +328,14 @@ struct PtrExprValue {
   /// pointer is statically non-null (its region never sees NULL), which
   /// lets null-checks fold to constants.
   Value nonNull;
+  /// The enum-of-bases discriminant of a pointer in a multi-base region
+  /// (CTS-P7): an i32 index into `multiBases` naming the object the
+  /// pointer currently points into. Null for single-base pointers.
+  Value baseIndex;
+  /// The ordered disjoint base objects of a multi-base region, indexed by
+  /// `baseIndex`; empty for single-base pointers. Copied out of the
+  /// pointer's `PointerLocalInfo` so the value stays self-contained.
+  SmallVector<const clang::VarDecl *, 2> multiBases;
 };
 
 /// Phase-1b classification of one pointer parameter, derived from the
@@ -319,8 +355,9 @@ enum class ParamKind { ScalarRef, Slice };
 /// A slice parameter is its own base, with its cursor initialized to zero.
 struct PointerLocalInfo {
   /// The object every value of this pointer points into; null for a
-  /// pointer whose region is a string literal.
-  const clang::VarDecl *base;
+  /// pointer whose region is a string literal and for a pointer of a
+  /// multi-base region (CTS-P7, see `multiBases`).
+  const clang::VarDecl *base = nullptr;
   /// Entry-block `memref<i64>` cell holding the element cursor, or null.
   Value cursorCell;
   /// The read-only backing array place of a string-literal region
@@ -332,6 +369,19 @@ struct PointerLocalInfo {
   /// address, false = holds the null constant); null for pointers whose
   /// region never sees a null constant (CTS-P8).
   Value nonNullCell;
+  /// Entry-block `memref<i32>` cell holding the enum-of-bases
+  /// discriminant of a pointer in a multi-base region (CTS-P7): the index
+  /// into `multiBases` of the object the pointer currently points into.
+  /// An address binding stores the bound object's index, `p = q` copies
+  /// the source pointer's discriminant, and every dereference dispatches
+  /// on it (a match over the closed set of bases). Null for single-base
+  /// pointers, whose base is statically known.
+  Value baseIndexCell;
+  /// The ordered disjoint base objects of a multi-base region, indexed by
+  /// the discriminant; empty for single-base pointers. Every pointer of
+  /// one region carries the same order (the region's binding order), so
+  /// discriminants copy soundly across `p = q`.
+  SmallVector<const clang::VarDecl *, 2> multiBases;
 };
 
 /// The imported model of one pointer-typed global variable (CTS-P4): the
@@ -807,10 +857,15 @@ private:
 
   /// Validates a pointer-typed local variable against its
   /// `PointerRegionAnalysis` region and, when the region is decomposable
-  /// (single local base, no escapes, no arithmetic on a scalar base),
+  /// (local bases, no escapes, no arithmetic on a scalar base),
   /// registers its decomposition: an entry-block `memref<i64>` cursor cell
   /// for an array base, or no runtime state at all for a degenerate scalar
-  /// or struct base. A string-literal region registers a cursor cell plus
+  /// or struct base. A multi-base region (CTS-P7) additionally registers
+  /// an entry-block `memref<i32>` enum-of-bases discriminant cell per
+  /// pointer when every base is local and of one uniform kind (all
+  /// element runs of the pointee's element type, or all degenerate
+  /// scalars of the pointee type); other multi-base shapes keep the
+  /// located join rejection naming the first two objects and bindings. A string-literal region registers a cursor cell plus
   /// the literal's read-only backing array (see
   /// `getOrCreateLiteralBacking`) and rejects regions that are written
   /// through or that join a literal with an object. A nullable region
@@ -937,9 +992,42 @@ private:
   /// used to reject taking the address of a global.
   bool rootsAtGlobal(const clang::Expr *expr) const;
 
-  /// Stores a staged global copy back into its global, if `writeback`
-  /// captured one; no-op otherwise.
-  void flushGlobalWriteback(Location loc, const GlobalWriteback &writeback);
+  /// Stores a staged copy back where it came from, if `writeback` captured
+  /// one; no-op otherwise. A staged global copy stores back into its
+  /// global; a staged multi-base element (CTS-P7) dispatches on the
+  /// discriminant and stores into the selected base at the staged cursor.
+  LogicalResult flushGlobalWriteback(Location loc,
+                                     const GlobalWriteback &writeback);
+
+  /// Emits one dispatch over the closed set of `bases` of a multi-base
+  /// region (CTS-P7): a chain of `baseIndex == i` conditional branches
+  /// with one arm block per base (the last base is the final else — the
+  /// discriminant can only ever hold a bound index), each arm populated
+  /// by `emitArm`, all joining in a fresh continuation block where the
+  /// insertion point is left.
+  LogicalResult emitMultiBaseDispatch(
+      Location loc, ArrayRef<const clang::VarDecl *> bases, Value baseIndex,
+      llvm::function_ref<LogicalResult(const clang::VarDecl *)> emitArm);
+
+  /// Materializes the element place of the local base object `base` at
+  /// `cursor` (null for a degenerate scalar base, which resolves to the
+  /// object's own place): the base's registered place refined through
+  /// `refineElementPlace`. Used per dispatch arm of a multi-base pointer,
+  /// whose bases are always local (the region validation rejects global
+  /// bases).
+  FailureOr<Value> materializeLocalElementPlace(Location loc,
+                                                const clang::VarDecl *base,
+                                                Value cursor,
+                                                Type pointeeType);
+
+  /// Refines the array-or-slice place `basePlace` down to the element the
+  /// flat row-major `cursor` designates, peeling one `emitrust.subscript`
+  /// per array level (dividing the cursor by the level's flat element
+  /// span and continuing with the remainder) until the wrapped value type
+  /// is `pointeeType`; returns `basePlace` unchanged when `cursor` is
+  /// null (a degenerate whole-object pointer).
+  FailureOr<Value> refineElementPlace(Location loc, Value basePlace,
+                                      Value cursor, Type pointeeType);
 
   /// Builds the symbol reference attribute for `symbol`.
   FlatSymbolRefAttr globalSymbol(llvm::StringRef symbol) {
@@ -4080,10 +4168,26 @@ bool CImporter::rootsAtGlobal(const clang::Expr *expr) const {
   return false;
 }
 
-void CImporter::flushGlobalWriteback(Location loc,
-                                     const GlobalWriteback &writeback) {
+LogicalResult
+CImporter::flushGlobalWriteback(Location loc,
+                                const GlobalWriteback &writeback) {
   if (!writeback.place)
-    return;
+    return success();
+  if (!writeback.multiBases.empty()) {
+    // A staged multi-base element (CTS-P7): dispatch on the staged
+    // discriminant and store the mutated element back into the active
+    // base at the staged cursor.
+    Value value = loadPlace(loc, writeback.place);
+    return emitMultiBaseDispatch(
+        loc, writeback.multiBases, writeback.multiBaseIndex,
+        [&](const clang::VarDecl *base) -> LogicalResult {
+          FailureOr<Value> element = materializeLocalElementPlace(
+              loc, base, writeback.multiCursor, writeback.multiPointeeType);
+          if (failed(element))
+            return failure();
+          return storeToPlace(loc, *element, value);
+        });
+  }
   auto lvalueType =
       llvm::cast<emitrust::LValueType>(writeback.place.getType());
   Value full = builder
@@ -4092,6 +4196,7 @@ void CImporter::flushGlobalWriteback(Location loc,
                    .getResult();
   builder.create<emitrust::GlobalStoreOp>(loc, full,
                                           globalSymbol(writeback.symbol));
+  return success();
 }
 
 std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
@@ -5258,19 +5363,85 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
     return success();
   }
   if (region->bases.size() >= 2) {
-    // A pointer that is rebound across distinct objects cannot decompose
-    // into one (base, cursor) pair; name both objects and both bindings.
-    const PointerBaseBinding &first = region->bases[0];
-    const PointerBaseBinding &second = region->bases[1];
-    InFlightDiagnostic diag = emitError(loc);
-    diag << "unsupported: pointer '" << var->getName()
-         << "' would join objects '" << first.base->getName() << "' and '"
-         << second.base->getName() << "' into one region";
-    diag.attachNote(translateLoc(first.loc))
-        << "bound to '" << first.base->getName() << "' here";
-    diag.attachNote(translateLoc(second.loc))
-        << "bound to '" << second.base->getName() << "' here";
-    return diag;
+    // A pointer rebound across distinct objects keeps one region under the
+    // enum-of-bases model (CTS-P7): each pointer of the region carries a
+    // promotable i32 discriminant cell naming its active base, and every
+    // dereference dispatches on it — each variant of the closed enum names
+    // a disjoint region, so the disjoint-region invariant is preserved
+    // while the objects stay independently addressable. The model requires
+    // every base to be local and of one uniform kind — all element runs
+    // (arrays or slice parameters) whose element type is the pointee, or
+    // all degenerate scalar objects of the pointee type. Anything else
+    // (mixed kinds, mismatched element types, global bases, a nullable
+    // region) keeps the historical join rejection naming both objects and
+    // both binding sites.
+    auto joinReject = [&]() -> LogicalResult {
+      const PointerBaseBinding &first = region->bases[0];
+      const PointerBaseBinding &second = region->bases[1];
+      InFlightDiagnostic diag = emitError(loc);
+      diag << "unsupported: pointer '" << var->getName()
+           << "' would join objects '" << first.base->getName() << "' and '"
+           << second.base->getName() << "' into one region";
+      diag.attachNote(translateLoc(first.loc))
+          << "bound to '" << first.base->getName() << "' here";
+      diag.attachNote(translateLoc(second.loc))
+          << "bound to '" << second.base->getName() << "' here";
+      return diag;
+    };
+    if (region->nullable)
+      return joinReject();
+    bool anyCursored = false;
+    bool anyDegenerate = false;
+    for (const PointerBaseBinding &binding : region->bases) {
+      const clang::VarDecl *base = binding.base;
+      if (!base->hasLocalStorage())
+        return joinReject();
+      if (isPointerType(base->getType())) {
+        // A slice-classified pointer parameter base: its deref'd slice
+        // place was registered in the prologue with a cursor cell.
+        auto baseInfo = pointerLocals.find(base);
+        if (baseInfo == pointerLocals.end() ||
+            !baseInfo->second.cursorCell ||
+            !astContext().hasSameUnqualifiedType(
+                pointee,
+                base->getType().getCanonicalType()->getPointeeType()))
+          return joinReject();
+        anyCursored = true;
+      } else if (const clang::ConstantArrayType *array =
+                     astContext().getAsConstantArrayType(base->getType())) {
+        bool matchesLevel = false;
+        for (const clang::ConstantArrayType *level = array; level;
+             level = astContext().getAsConstantArrayType(
+                 level->getElementType()))
+          if (astContext().hasSameUnqualifiedType(pointee,
+                                                  level->getElementType())) {
+            matchesLevel = true;
+            break;
+          }
+        if (!matchesLevel)
+          return joinReject();
+        anyCursored = true;
+      } else {
+        if (!astContext().hasSameUnqualifiedType(pointee, base->getType()))
+          return joinReject();
+        anyDegenerate = true;
+      }
+    }
+    if (anyCursored && anyDegenerate)
+      return joinReject();
+    if (anyDegenerate && region->hasArithmetic)
+      return emitError(translateLoc(region->arithmeticLoc))
+             << "unsupported: arithmetic on the address of a scalar object";
+    PointerLocalInfo info;
+    if (anyCursored)
+      info.cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
+    info.baseIndexCell = createEntryAlloca(loc, builder.getIntegerType(32));
+    for (const PointerBaseBinding &binding : region->bases)
+      info.multiBases.push_back(binding.base);
+    pointerLocals[var] = info;
+    if (const clang::Expr *init = var->getInit())
+      return storePointerAssign(loc, var, init);
+    return success();
   }
   if (region->bases.empty()) {
     // Never bound to any object. A nullable region still needs its
@@ -5383,9 +5554,40 @@ LogicalResult CImporter::storePointerAssign(Location loc,
   FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
   if (failed(value))
     return failure();
+  if (!info.multiBases.empty()) {
+    // Multi-base region (CTS-P7): the assignment stores the enum-of-bases
+    // discriminant alongside the cursor — the bound object's index for an
+    // address binding, or the source pointer's own discriminant for
+    // `p = q` (every pointer of the region shares the base order).
+    Value index;
+    if (value->baseIndex) {
+      if (value->multiBases != info.multiBases) // Defensive; one region.
+        return emitError(loc)
+               << "unsupported: pointer assignment would rebind to a "
+                  "different object";
+      index = value->baseIndex;
+    } else {
+      const auto *found = llvm::find(info.multiBases, value->base);
+      if (!value->base || found == info.multiBases.end()) // Defensive.
+        return emitError(loc)
+               << "unsupported: pointer assignment would rebind to a "
+                  "different object";
+      index = createIntConstant(loc, builder.getIntegerType(32),
+                                found - info.multiBases.begin());
+    }
+    builder.create<memref::StoreOp>(loc, index, info.baseIndexCell);
+    if (!info.cursorCell)
+      return success(); // All-degenerate bases: no element offset to track.
+    Value multiCursor =
+        value->cursor ? value->cursor
+                      : createIntConstant(loc, builder.getIntegerType(64), 0);
+    builder.create<memref::StoreOp>(loc, multiCursor, info.cursorCell);
+    return success();
+  }
   if (value->base != info.base ||
-      value->literalBacking !=
-          info.literalBacking) // Defensive; multi-base regions never get here.
+      value->literalBacking != info.literalBacking ||
+      value->baseIndex) // A multi-base source cannot rebind a single-base
+                        // pointer (defensive; regions would have unioned).
     return emitError(loc)
            << "unsupported: pointer assignment would rebind to a different "
               "object";
@@ -5434,8 +5636,8 @@ CImporter::storeGlobalPointerAssign(Location loc, const clang::VarDecl *ptr,
   FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
   if (failed(value))
     return failure();
-  if (value->base != info.base ||
-      value->literalBacking) // Defensive; multi-base regions never get here.
+  if (value->base != info.base || value->literalBacking ||
+      value->baseIndex) // Defensive; global regions are single-base.
     return emitError(loc)
            << "unsupported: pointer assignment would rebind to a different "
               "object";
@@ -5976,7 +6178,8 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
     return failure();
   if (failed(storeToPlace(loc, *place, *value)))
     return failure();
-  flushGlobalWriteback(loc, writeback);
+  if (failed(flushGlobalWriteback(loc, writeback)))
+    return failure();
   return place;
 }
 
@@ -6022,7 +6225,8 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
     return failure();
   if (failed(storeToPlace(loc, *place, *result)))
     return failure();
-  flushGlobalWriteback(loc, writeback);
+  if (failed(flushGlobalWriteback(loc, writeback)))
+    return failure();
   return place;
 }
 
@@ -6159,7 +6363,8 @@ FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
     return failure();
   if (failed(storeToPlace(loc, *place, *next)))
     return failure();
-  flushGlobalWriteback(loc, writeback);
+  if (failed(flushGlobalWriteback(loc, writeback)))
+    return failure();
   // C evaluates postfix forms to the original value and prefix forms to
   // the updated one.
   return op->isPostfix() ? current : *next;
@@ -6731,6 +6936,11 @@ CImporter::emitCharRegionArg(const clang::Expr *expr) {
   FailureOr<PtrExprValue> pointer = emitPointerRValue(e);
   if (failed(pointer))
     return failure();
+  // A multi-base pointer has no single char region to borrow (CTS-P7
+  // scope).
+  if (pointer->baseIndex)
+    return emitError(loc) << "unsupported: passing a pointer bound to "
+                             "multiple objects to a string function";
   if (!pointer->cursor)
     return emitError(loc) << "unsupported: the address of a scalar object "
                              "is not a string region";
@@ -7786,15 +7996,70 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
     FailureOr<PtrExprValue> rhs = emitPointerRValue(op->getRHS());
     if (failed(rhs))
       return failure();
-    if (lhs->base != rhs->base || lhs->literalBacking != rhs->literalBacking)
-      return emitError(loc)
-             << "unsupported: comparison of pointers into different objects";
     // `p == q` where either side may be null is defined in C (a null and a
     // non-null pointer compare unequal), but the cursor comparison cannot
     // express it; the mixed-state comparison stays rejected.
     if (lhs->nonNull || rhs->nonNull)
       return emitError(loc)
              << "unsupported: comparison of possibly-null pointers";
+    if (lhs->baseIndex || rhs->baseIndex) {
+      // A multi-base side compares by (discriminant, cursor) pair: C
+      // defines equality across distinct objects (unequal) and within one
+      // object (cursor equality), which is exactly the pairwise test.
+      // Ordered comparison is only defined within one object, which the
+      // static region cannot guarantee here, so it stays rejected.
+      if (op->getOpcode() != clang::BO_EQ && op->getOpcode() != clang::BO_NE)
+        return emitError(loc) << "unsupported: ordered comparison of "
+                                 "pointers bound to multiple objects";
+      // Resolve each side to a discriminant value: its own loaded
+      // discriminant, or — for a single-base side naming one of the other
+      // side's bases (`p == x`) — that base's constant index.
+      auto indexOf = [&](const PtrExprValue &side,
+                         const PtrExprValue &other) -> Value {
+        if (side.baseIndex)
+          return side.baseIndex;
+        const auto *found = llvm::find(other.multiBases, side.base);
+        if (!side.base || found == other.multiBases.end())
+          return Value();
+        return createIntConstant(loc, builder.getIntegerType(32),
+                                 found - other.multiBases.begin());
+      };
+      Value leftIndex = indexOf(*lhs, *rhs);
+      Value rightIndex = indexOf(*rhs, *lhs);
+      if (!leftIndex || !rightIndex ||
+          (lhs->baseIndex && rhs->baseIndex &&
+           lhs->multiBases != rhs->multiBases))
+        return emitError(loc)
+               << "unsupported: comparison of pointers into different "
+                  "objects";
+      Type indexCursorType = builder.getIntegerType(64);
+      Value sameBase = builder
+                           .create<arith::CmpIOp>(loc,
+                                                  arith::CmpIPredicate::eq,
+                                                  leftIndex, rightIndex)
+                           .getResult();
+      Value leftCursor = lhs->cursor
+                             ? lhs->cursor
+                             : createIntConstant(loc, indexCursorType, 0);
+      Value rightCursor = rhs->cursor
+                              ? rhs->cursor
+                              : createIntConstant(loc, indexCursorType, 0);
+      Value sameCursor = builder
+                             .create<arith::CmpIOp>(
+                                 loc, arith::CmpIPredicate::eq, leftCursor,
+                                 rightCursor)
+                             .getResult();
+      Value equal =
+          builder.create<arith::AndIOp>(loc, sameBase, sameCursor)
+              .getResult();
+      if (op->getOpcode() == clang::BO_EQ)
+        return equal;
+      Value truth = createBoolConstant(loc, true);
+      return builder.create<arith::XOrIOp>(loc, equal, truth).getResult();
+    }
+    if (lhs->base != rhs->base || lhs->literalBacking != rhs->literalBacking)
+      return emitError(loc)
+             << "unsupported: comparison of pointers into different objects";
     Type cursorType = builder.getIntegerType(64);
     Value left =
         lhs->cursor ? lhs->cursor : createIntConstant(loc, cursorType, 0);
@@ -8471,6 +8736,12 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
     if (failed(pointer))
       return failure();
     root = pointer->base;
+    // A multi-base pointer has no single region base to reslice; the
+    // callee would need the enum-of-bases discriminant, which a slice
+    // parameter cannot carry (CTS-P7 scope).
+    if (pointer->baseIndex)
+      return emitError(loc) << "unsupported: passing a pointer bound to "
+                               "multiple objects to a function";
     // Parameters have no null representation; passing a possibly-null
     // pointer would erase its discriminant (and the callee may be a
     // defined C program that null-checks it).
@@ -8848,7 +9119,13 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         Value nonNull;
         if (info.nonNullCell)
           nonNull = loadPlace(loc, info.nonNullCell);
-        return PtrExprValue{info.base, cursor, info.literalBacking, nonNull};
+        // A multi-base pointer additionally carries its enum-of-bases
+        // discriminant (CTS-P7).
+        Value baseIndex;
+        if (info.baseIndexCell)
+          baseIndex = loadPlace(loc, info.baseIndexCell);
+        return PtrExprValue{info.base, cursor, info.literalBacking, nonNull,
+                            baseIndex, info.multiBases};
       }
       // A read of a pointer-typed global (CTS-P4): its base is static and
       // its cursor is the current value of the cursor global (none for a
@@ -8990,8 +9267,12 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       Value nonNull;
       if (info.nonNullCell)
         nonNull = loadPlace(loc, info.nonNullCell);
+      Value baseIndex;
+      if (info.baseIndexCell)
+        baseIndex = loadPlace(loc, info.baseIndexCell);
       return PtrExprValue{info.base, unary->isPostfix() ? current : next,
-                          info.literalBacking, nonNull};
+                          info.literalBacking, nonNull, baseIndex,
+                          info.multiBases};
     }
     return emitError(loc) << "unsupported pointer expression";
   }
@@ -9039,7 +9320,8 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
               : builder.create<arith::SubIOp>(loc, pointer->cursor, offset)
                     .getResult();
       return PtrExprValue{pointer->base, cursor, pointer->literalBacking,
-                          pointer->nonNull};
+                          pointer->nonNull, pointer->baseIndex,
+                          pointer->multiBases};
     }
   }
 
@@ -9060,7 +9342,8 @@ CImporter::emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript) {
     if (subscript->getIdx()->EvaluateAsInt(indexValue, astContext()) &&
         indexValue.Val.getInt() == 0)
       return PtrExprValue{pointer->base, Value(), pointer->literalBacking,
-                          pointer->nonNull};
+                          pointer->nonNull, pointer->baseIndex,
+                          pointer->multiBases};
     return emitError(loc) << "unsupported: arithmetic on the address "
                              "of a scalar object";
   }
@@ -9083,7 +9366,8 @@ CImporter::emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript) {
   Value cursor = builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
                      .getResult();
   return PtrExprValue{pointer->base, cursor, pointer->literalBacking,
-                      pointer->nonNull};
+                      pointer->nonNull, pointer->baseIndex,
+                      pointer->multiBases};
 }
 
 /// Returns the number of innermost (non-array) elements one value of the
@@ -9106,7 +9390,7 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
                                              GlobalWriteback *writeback) {
   // A pointer of a nullable region that was never bound to any object can
   // only ever hold the null constant; it has no place to designate.
-  if (!pointer.base && !pointer.literalBacking)
+  if (!pointer.base && !pointer.literalBacking && !pointer.baseIndex)
     return emitError(loc)
            << "unsupported: dereference of a pointer that is only ever null";
   // Dereferencing a possibly-null pointer guards on the Option-of-cursor
@@ -9136,6 +9420,40 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
             loc, emitrust::LValueType::get(arrayType.getElementType()),
             pointer.literalBacking, pointer.cursor)
         .getResult();
+  }
+  if (pointer.baseIndex) {
+    // Multi-base pointer (CTS-P7): no single place exists, so the deref
+    // dispatches on the enum-of-bases discriminant — a match over the
+    // closed set of bases — and stages the active base's element in a
+    // local cell (only the active base is ever touched, so an inactive
+    // base's bounds are never consulted). A write context records a
+    // writeback that dispatches the staged value back into the active
+    // base after the mutation, mirroring the staged-global model.
+    if (!llvm::isa<IntegerType, FloatType>(pointeeType))
+      return emitError(loc)
+             << "unsupported: dereference of a pointer bound to multiple "
+                "objects with a non-scalar element type";
+    Value staged = isUnsignedInt(pointeeType)
+                       ? createVariablePlace(loc, pointeeType)
+                       : createEntryAlloca(loc, pointeeType);
+    if (failed(emitMultiBaseDispatch(
+            loc, pointer.multiBases, pointer.baseIndex,
+            [&](const clang::VarDecl *base) -> LogicalResult {
+              FailureOr<Value> element = materializeLocalElementPlace(
+                  loc, base, pointer.cursor, pointeeType);
+              if (failed(element))
+                return failure();
+              return storeToPlace(loc, staged, loadPlace(loc, *element));
+            })))
+      return failure();
+    if (writeback) {
+      writeback->place = staged;
+      writeback->multiBases = pointer.multiBases;
+      writeback->multiBaseIndex = pointer.baseIndex;
+      writeback->multiCursor = pointer.cursor;
+      writeback->multiPointeeType = pointeeType;
+    }
+    return staged;
   }
   auto it = symbols.find(pointer.base);
   Value basePlace;
@@ -9178,7 +9496,13 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
       *writeback = GlobalWriteback{staged, symbol};
     basePlace = staged;
   }
-  if (!pointer.cursor)
+  return refineElementPlace(loc, basePlace, pointer.cursor, pointeeType);
+}
+
+FailureOr<Value> CImporter::refineElementPlace(Location loc, Value basePlace,
+                                               Value cursor,
+                                               Type pointeeType) {
+  if (!cursor)
     return basePlace; // Degenerate: the pointer designates the whole object.
   auto lvalueType = llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
   if (!lvalueType)
@@ -9189,7 +9513,6 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
   // flat row-major cursor divides by the level's element span for the
   // index and continues into the level with the remainder.
   Value place = basePlace;
-  Value cursor = pointer.cursor;
   Type valueType = lvalueType.getValueType();
   while (valueType != pointeeType) {
     Type elementType;
@@ -9225,6 +9548,51 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
 }
 
 FailureOr<Value>
+CImporter::materializeLocalElementPlace(Location loc,
+                                        const clang::VarDecl *base,
+                                        Value cursor, Type pointeeType) {
+  auto it = symbols.find(base);
+  if (it == symbols.end())
+    return emitError(loc) << "unsupported: pointer target '"
+                          << base->getName()
+                          << "' is not an importable place";
+  return refineElementPlace(loc, it->second, cursor, pointeeType);
+}
+
+LogicalResult CImporter::emitMultiBaseDispatch(
+    Location loc, ArrayRef<const clang::VarDecl *> bases, Value baseIndex,
+    llvm::function_ref<LogicalResult(const clang::VarDecl *)> emitArm) {
+  Block *mergeBlock = createBlock();
+  for (auto [index, base] : llvm::enumerate(bases)) {
+    Block *nextBlock = nullptr;
+    if (index + 1 < bases.size()) {
+      // Test this variant; a miss falls through to the next base's test.
+      Block *armBlock = createBlock();
+      nextBlock = createBlock();
+      Value expected = createIntConstant(loc, builder.getIntegerType(32),
+                                         static_cast<int64_t>(index));
+      Value hit = builder
+                      .create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                             baseIndex, expected)
+                      .getResult();
+      builder.create<cf::CondBranchOp>(loc, hit, armBlock, ValueRange(),
+                                       nextBlock, ValueRange());
+      builder.setInsertionPointToEnd(armBlock);
+    }
+    // The last base needs no test: the discriminant only ever holds a
+    // bound index, so it is the final else of the match over the closed
+    // set of bases.
+    if (failed(emitArm(base)))
+      return failure();
+    builder.create<cf::BranchOp>(loc, mergeBlock);
+    if (nextBlock)
+      builder.setInsertionPointToEnd(nextBlock);
+  }
+  builder.setInsertionPointToEnd(mergeBlock);
+  return success();
+}
+
+FailureOr<Value>
 CImporter::emitPointerDifference(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
   // The flat cursor difference counts innermost elements; a difference of
@@ -9238,6 +9606,12 @@ CImporter::emitPointerDifference(const clang::BinaryOperator *op) {
   FailureOr<PtrExprValue> rhs = emitPointerRValue(op->getRHS());
   if (failed(rhs))
     return failure();
+  // A multi-base side may designate different objects at runtime, so no
+  // static cursor difference exists (C defines the difference only within
+  // one object).
+  if (lhs->baseIndex || rhs->baseIndex)
+    return emitError(loc)
+           << "unsupported: difference of pointers bound to multiple objects";
   if (lhs->base != rhs->base || lhs->literalBacking != rhs->literalBacking)
     return emitError(loc)
            << "unsupported: difference of pointers into different objects";

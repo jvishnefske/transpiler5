@@ -896,10 +896,10 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 188 passed / 0 miscompiled /
-32 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-17: 220 total / 190 passed / 0 miscompiled /
+30 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5/P4 partials, and
-CTS-S1/S2/S4/S6/P1/P8/R1/R4/L1/L2 landed since). Every one of the 32
+CTS-S1/S2/S4/S6/P1/P7/P8/R1/R4/L1/L2 landed since). Every one of the 30
 is a located build-time rejection — never wrong output.
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
@@ -1036,11 +1036,38 @@ observed when C99-33 + C99-47 together unlocked 00215).
   problem as CTS-P4; a global array base must be readable/writable
   through an index cursor without holding a borrow across statements.
   (00181.c, 00217.c)
-- [ ] CTS-P7 (2) One pointer ranging over several objects (`p = &x;
+- [x] CTS-P7 (2) One pointer ranging over several objects (`p = &x;
   ... p = &y;`): PointerRegionAnalysis unions the objects into one
   region today and rejects; needs either region materialization (copy
   both objects into one backing array) or an enum-of-bases cursor.
   (00077.c, 00172.c)
+  (Done: the enum-of-bases cursor. A multi-base region is accepted when
+  every base is local and of one uniform kind — all element runs (arrays
+  or slice parameters) of the pointee's element type, or all degenerate
+  scalars of the pointee type. Each pointer of the region carries a
+  promotable rank-0 memref<i32> base-discriminant cell alongside its i64
+  cursor cell (the tagged (base-index, cursor) pair; each variant of the
+  closed enum names a disjoint region, so the disjoint-region invariant
+  is preserved and the objects stay independently addressable —
+  transformation-theory section 4, following the CTS-P8 flag-cell
+  precedent). An address binding stores the bound base's index, `p = q`
+  copies the source discriminant, cursor arithmetic is unchanged, and
+  every dereference dispatches on the discriminant: a cf-level match
+  over the closed set of bases whose arms touch exactly one base,
+  staging the active element for reads and dispatching the mutated value
+  back for writes (the staged-global writeback mechanism, generalized).
+  Same-region equality compares (discriminant, cursor) pairs — exactly
+  C's defined equality across distinct objects. Still rejected with
+  located diagnostics: mixed base kinds and element types (the retained
+  multibase.c negative), nullable multi-base regions, ordering and
+  difference of multi-base pointers, passing one to a function or string
+  helper, and non-scalar-element dereference. 00077 (param slice base +
+  local array, sizeof forms) and 00172 (two scalars, equality before and
+  after a discriminant copy) both pass; zero unsafe in the emitted Rust.
+  test/Import/C/pointers-multi-base.c, the multi-* negatives in
+  pointers-local-invalid.c; rustc-level differential
+  test/EndToEnd/pointers-multi-base.c where the active base is
+  data-dependent at runtime, including a loop-carried discriminant.)
 - [x] CTS-P8 (1) NULL data-pointer constants: an Option-of-cursor model
   mirroring the fn_ptr None mapping; interacts with CTS-P3.
   (00171.c)

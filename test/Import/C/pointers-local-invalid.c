@@ -14,26 +14,31 @@
 // RUN: not emitrust-import-c %t/string-literal-write-deref.c 2>&1 | FileCheck %s --check-prefix=STRWRITEDEREF
 // RUN: not emitrust-import-c %t/string-literal-multi.c 2>&1 | FileCheck %s --check-prefix=STRMULTI
 // RUN: not emitrust-import-c %t/string-literal-join.c 2>&1 | FileCheck %s --check-prefix=STRJOIN
+// RUN: not emitrust-import-c %t/multi-diff.c 2>&1 | FileCheck %s --check-prefix=MULTIDIFF
+// RUN: not emitrust-import-c %t/multi-ordered.c 2>&1 | FileCheck %s --check-prefix=MULTIORD
+// RUN: not emitrust-import-c %t/multi-arg.c 2>&1 | FileCheck %s --check-prefix=MULTIARG
 
 // Phase-1a pointer decomposition boundaries: every pointer local must
-// resolve to exactly one non-escaping local object. Each file below
+// resolve to a region of non-escaping local objects. Each file below
 // exercises one located rejection.
 
-// A pointer rebound across two distinct objects (the 00077 shape) cannot
-// decompose into a single (base, cursor) pair; the diagnostic names both
-// objects and both binding sites.
+// The enum-of-bases model (CTS-P7) accepts a pointer rebound across
+// several same-kind objects (see pointers-multi-base.c), but a region
+// mixing base kinds — here a scalar and an array, whose degenerate and
+// cursored decompositions cannot share one (discriminant, cursor) pair —
+// keeps the join rejection naming both objects and both binding sites.
 // MULTI: multibase.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer 'p' would join objects 'x' and 'y' into one region
 // MULTI: multibase.c:{{[0-9]+}}:{{[0-9]+}}: note: bound to 'x' here
 // MULTI: multibase.c:{{[0-9]+}}:{{[0-9]+}}: note: bound to 'y' here
 
 //--- multibase.c
 int main(void) {
-  int x[4];
+  int x;
   int y[4];
   int *p;
-  x[0] = 1;
+  x = 1;
   y[0] = 2;
-  p = x;
+  p = &x;
   p = y;
   return p[0];
 }
@@ -207,4 +212,62 @@ int main(void) {
   r = arr;
   arr[0][0] = 1;
   return (int)(p - r);
+}
+
+// A multi-base pointer (CTS-P7) may designate different objects at
+// runtime, so no static cursor difference exists (C defines pointer
+// difference only within one object).
+// MULTIDIFF: multi-diff.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: difference of pointers bound to multiple objects
+
+//--- multi-diff.c
+int main(void) {
+  int a[2];
+  int b[2];
+  int *p;
+  int *q;
+  a[0] = 1;
+  b[0] = 2;
+  p = a;
+  q = b;
+  p = q;
+  return (int)(q - p);
+}
+
+// Same-region equality on multi-base pointers compares (discriminant,
+// cursor) pairs, but ordering is only defined within one object and
+// stays rejected.
+// MULTIORD: multi-ordered.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: ordered comparison of pointers bound to multiple objects
+
+//--- multi-ordered.c
+int main(void) {
+  int a[2];
+  int b[2];
+  int *p;
+  int *q;
+  a[0] = 1;
+  b[0] = 2;
+  p = a;
+  q = b;
+  p = q;
+  if (p < q) {
+    return 1;
+  }
+  return 0;
+}
+
+// A slice parameter carries no enum-of-bases discriminant, so passing a
+// multi-base pointer onward would erase which object it designates.
+// MULTIARG: multi-arg.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: passing a pointer bound to multiple objects to a function
+
+//--- multi-arg.c
+int first(int *s) { return s[0]; }
+int main(void) {
+  int a[2];
+  int b[2];
+  int *p;
+  a[0] = 1;
+  b[0] = 2;
+  p = a;
+  p = b;
+  return first(p);
 }
