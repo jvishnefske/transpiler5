@@ -2,9 +2,9 @@
 
 // C99-5: mixed enum/int comparisons and conversions. C converts the enum
 // operand to the common integer type; the importer renders that conversion
-// as an `emitrust.cast` from the enum to the mapped integer type (Rust `as`
-// casts a fieldless #[repr(i32)] enum to any integer type through its
-// discriminant). Color has no negative enumerator, so clang gives it an
+// as an `emitrust.cast` from the enum to the mapped integer type (the
+// open-enum tuple struct exposes its raw value through field `0`, rendered
+// `.0 as`). Color has no negative enumerator, so clang gives it an
 // unsigned underlying type and mixed comparisons happen at ui32 through
 // the type-directed `emitrust.cmp`; Temp's negative enumerator forces a
 // signed underlying type and mixed comparisons happen at signless i32

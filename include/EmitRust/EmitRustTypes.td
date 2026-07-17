@@ -286,10 +286,13 @@ def EmitRust_EnumType : EmitRust_Type<"Enum", "enum"> {
     parameter and result types, `emitrust.struct_def` field types,
     `emitrust.constant` results (with an opaque attribute such as
     `Color::Red`), `emitrust.cmp` operands (with the `eq` and `ne`
-    predicates only), and `emitrust.cast` sources (rendering e.g. `as i32`).
-    They must not appear as `emitrust.cast` result types (Rust has no
-    integer-to-enum cast) or as arithmetic binary operands. A default-
-    initialized variable of enum type renders `Name::default()`.
+    predicates only), `emitrust.cast` sources (rendering `.0 as i32` on
+    the open-enum tuple-struct representation), and `emitrust.cast`
+    results with a non-`i1` integer source (an integer-to-enum conversion,
+    rendering the value-preserving tuple-struct constructor). They must
+    not appear as arithmetic binary operands. A default-initialized
+    variable of enum type renders `Name::default()`, and `emitrust.enum_raw`
+    projects an enum lvalue to the lvalue of its raw storage integer.
 
     Example:
 

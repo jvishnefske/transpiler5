@@ -38,8 +38,9 @@ enum Color pick(enum Color a, enum Color b) {
 
 // The complete named enum becomes a module-level definition with the C
 // enumerator spellings and their (explicit and implicit) values; the
-// anonymous enum contributes no definition.
-// CHECK: emitrust.enum_def @Color ["Red", "Green", "Blue"] [0, 5, 6]
+// anonymous enum contributes no definition. All enumerators are
+// non-negative, so clang's unsigned underlying-type choice is recorded.
+// CHECK: emitrust.enum_def @Color ["Red", "Green", "Blue"] [0, 5, 6] {unsigned_underlying}
 // CHECK-NOT: emitrust.enum_def @
 
 // Enum-typed parameters and locals are opaque enum values held in variable
