@@ -45,6 +45,11 @@ syntax-directed translation with no cleverness.
 | emitrust-cc | tools/emitrust-cc | End-to-end driver: import (one or more C files, with -I/-isystem/--extra-arg), pass pipeline, Rust emission, cargo crate layout, optional cargo build |
 | Regression tests | test | lit + FileCheck suites for round-trip, diagnostics, emission, conversion, import, driver, and differential execution |
 
+The theory behind each pipeline stage — the data structures, algorithms, and
+theorems it relies on, the guarantee each stage hands the next, and the
+technique-to-CTS-item fit assessment — is surveyed with citations in
+[docs/transformation-theory.md](docs/transformation-theory.md).
+
 ### Pipeline
 
 The end-to-end flow is: parse C with clang LibTooling into a hybrid module
