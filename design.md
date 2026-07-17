@@ -836,10 +836,11 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-16 (commit a091423): 220 total / 150 passed /
-0 miscompiled / 70 unsupported. Every one of the 70 is a located
-build-time rejection (or a rustc build failure — never wrong output).
-This checklist partitions all 70 by sole blocker: each item lists the
+Ledger as of 2026-07-17: 220 total / 159 passed / 0 miscompiled /
+61 unsupported (was 150/70 at commit a091423, when this checklist was
+drawn up; the quick wins plus CTS-S1/S7 partials landed since). Every
+one of the 61 is a located build-time rejection — never wrong output.
+This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
 checkbox discipline as above — tick only when the referenced tests pass
 under ninja check-emitrust and the ledger ratchets with zero new

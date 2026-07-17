@@ -127,7 +127,7 @@ absorbed goto-into-loop. The entire CTS-S2 risk therefore lives in the
 importer's AST-to-cf lowering: every case label must become a real branch
 target, and any shape the AST walk cannot faithfully flatten must be rejected
 there with its location. This matches the checklist's own plan of reusing the
-goto labelBlocks machinery (design.md:957). PKT's theorems also say the
+goto labelBlocks machinery (design.md:1002). PKT's theorems also say the
 resulting Rust cannot in general be a nested match/loop without duplication or
 a dispatch value — so dispatch-shaped output for these tests is theoretically
 mandated, not a quality regression.
@@ -214,13 +214,13 @@ mem2reg, the load/widen/operate/narrow/store sequence collapses to a pure SSA
 value chain, so correctness reduces entirely to the importer emitting the
 right cast ops — mem2reg cannot introduce a width or ordering bug because it
 only forwards stored values that dominate their loads. The residual risk is
-exactly the zero-vs-sign-extension trap design.md:949 already flags, which is
+exactly the zero-vs-sign-extension trap design.md:975 already flags, which is
 a frontend cast-semantics question (design.md:423 documents the adopted `as`
 semantics) covered by section 6's mutation-adequacy argument. CTS-S5
 (variable-length arrays) is settled by the verified memref promotability
 condition: a VLA is a non-static-shape alloca, which mem2reg refuses and the
 fixed-size backing-array model cannot represent — confirming the checklist's
-recommendation (design.md:965) to document VLAs as a permanent by-design
+recommendation (design.md:1010) to document VLAs as a permanent by-design
 rejection. CTS-F2 (unreferenced declarations must not demand definitions) is
 plain dependency-graph reachability — the same worklist-reachability
 vocabulary as `finalizeFunction`'s sweep, applied at the declaration level; no
@@ -420,7 +420,7 @@ function-frame granularity: the owner's frame is the letregion scope, callee
 borrows are region-polymorphic access, and the emitted Rust lifetime parameter
 is the region variable, inferred by rustc.
 
-**CTS mapping** (the 30-test cluster; design.md:871).
+**CTS mapping** (the 30-test cluster; design.md:890).
 
 - **CTS-P1** (string literals): a read-only region kind whose base is the
   literal — in Rust, a `'static` shared borrow, the one lifetime that never
@@ -472,7 +472,7 @@ is the region variable, inferred by rustc.
 
 The same machinery covers the blocked library items: CTS-L3 (initializers for
 pointer-typed objects) is downstream of P1/P4 by the checklist's own analysis
-(design.md:998), and CTS-L1/L2 (`strcpy`, `%s` of a char-pointer parameter)
+(design.md:1049), and CTS-L1/L2 (`strcpy`, `%s` of a char-pointer parameter)
 are safe wrappers over exactly the slice/cursor parameter classes FR-28
 already defines — the composition-with-rustc argument above is what makes
 "safe helper over a mutable byte slice, bounds known at compile time" sound.
@@ -559,7 +559,7 @@ minus everything that makes it subtle (no let-generalization; every pointer is
 a monomorphic unknown), so the occur-check is vacuous and the whole pass stays
 near-linear. CTS-R1 (bare anonymous structs) is canonical naming of
 structurally equal tree types — the shape-keyed synthesis the checklist
-proposes (design.md:915) is a Myhill–Nerode-style canonical form, and reusing
+proposes (design.md:934) is a Myhill–Nerode-style canonical form, and reusing
 the existing shape-dedup machinery is the right instinct. CTS-R4 and CTS-R5
 (block-scope tag shadowing; C's separate tag/ordinary namespaces) are
 attribute-grammar problems: a symbol table is an inherited environment
@@ -590,7 +590,7 @@ safe-Rust-compatible general technique*: C-style varargs have no safe Rust
 counterpart, so the options are arity-specialized monomorphization per call
 site (a whole-program specialization, sound but of limited generality) or
 continued rejection — a genuine design decision, exactly as the checklist
-says (design.md:982).
+says (design.md:1033).
 
 **Verdict.** **Adopt** the L-attributed/bidirectional discipline for the
 emitter (it formalizes the existing design at zero cost and pinpoints where a
@@ -680,7 +680,7 @@ native runs.
 
 **Where the pipeline uses it.** The reject-with-location policy is enforced
 end to end: importer rejections carry clang source locations, conversion
-rejections carry op locations (section 3), and the ledger records that all 70
+rejections carry op locations (section 3), and the ledger records that all
 remaining failures are located build-time rejections with zero miscompiles
 (design.md:839). The per-pass composition license — each stage's obligations
 stated over defined intermediate semantics — is exactly what sections 1–3
@@ -692,10 +692,10 @@ for CompCert's per-pass simulation obligations.
 
 **CTS mapping.** This section is methodological rather than item-specific,
 but it binds two items directly: CTS-S1's checklist entry already demands
-adversarial negative/width-extreme differential tests (design.md:949) — that
+adversarial negative/width-extreme differential tests (design.md:975) — that
 requirement *is* the mutation-adequacy criterion, now with its citation — and
 every CTS item's acceptance criterion ("ledger ratchets with zero new
-miscompiles", design.md:845) inherits the epistemics stated above.
+miscompiles", design.md:846) inherits the epistemics stated above.
 
 **Verdict.** **Adopt** the framing wholesale: it is the theory of what the
 project already does, and naming it (empirical translation validation;
