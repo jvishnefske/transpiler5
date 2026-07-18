@@ -1053,6 +1053,33 @@ observed when C99-33 + C99-47 together unlocked 00215).
   of an Option-of-cursor; every other non-address value (including
   nonzero integers cast to pointers) stays rejected.
   (00039.c, 00103.c, 00144.c, 00163.c, 00187.c)
+  (Partial, 4 of 5 — the CTS-P9 provenance core. `void *` is a
+  pointee-wildcard cursor: it carries no element unit of its own, so
+  casts to and from a `void` pointee peel transparently in analysis and
+  emission at any matching pointer depth (`(void *)&x`, `(int *)voidp`,
+  the second-order `(int **)voidpp` of 00103), the (base, cursor)
+  decomposition is unchanged, and a `void *` never materializes a
+  pointer value. A reinterpret-back site `*(T *)p` type-checks T against
+  the region's base element type: an exact match lowers exactly like a
+  direct pointer (00039's scalar round-trip, 00103's double indirection),
+  a same-width int<->int mismatch becomes an `emitrust.cast` bitcast
+  view on the load and store (the unsigned view over int storage —
+  Rust's same-width cross-sign `as` reinterprets the bit pattern, which
+  is C's compatible-effective-type read), and every other
+  reinterpretation stays a located rejection: "pointer cast reinterprets
+  the pointee ('short' over 'int' storage)" / "('float' over 'int'
+  storage)", plus "void pointer parameter" at the signature and
+  "dereference of a 'void *' pointer" for an uncast deref. Null-only
+  ternary chains (00144) fold statically — see the CTS-P8 note; the
+  `&struct.member` bases of 00163 are the CTS-P7 note. 00039, 00103,
+  00144, 00163 pass — ledger 200 -> 204 passed / 16 unsupported /
+  0 miscompiled. 00187 (genuine integer<->pointer traffic) remains
+  rejected by design. Wide views over `char` storage
+  (`*(unsigned *)charp`, from_ne_bytes territory) remain rejected —
+  the next phase's item.
+  (test/Import/C/pointers-void.c, pointers-void-invalid.c;
+  rustc-level differential test/EndToEnd/pointers-void.c with
+  loop-carried values through the reinterpreted accesses))
 - [ ] CTS-P4 (4) Pointer-typed global variables: global region bases.
   Hard interaction with the thread_local!+Cell global model (a borrow
   cannot escape `.with`); likely wants globals-as-slices with index
@@ -1142,6 +1169,24 @@ observed when C99-33 + C99-47 together unlocked 00215).
   rustc-level differential test/EndToEnd/pointers-into-global.c
   interleaving pointer writes with direct global reads, direct writes
   with pointer reads, and callee global writes between pointer uses)
+  (CTS-P9 extension: `&global.member` is now a region base. The
+  PointerBaseBinding carries an optional member path, and every access
+  through such a pointer reuses this staged-copy machinery with a member
+  projection — stage the whole global (`emitrust.global_load`), project
+  the member (`emitrust.member`), and store the whole value back after a
+  write (`emitrust.global_store`) — so no borrow of the global ever
+  survives a statement. A member of a LOCAL struct resolves to the
+  member's own `emitrust.member` place with no runtime state at all.
+  Boundaries pinned by test: pointer arithmetic on a member base walks
+  into sibling storage ("pointer arithmetic on the address of a struct
+  member"), union storage has no unaliased member place ("taking the
+  address of a union member"), and a member base on a pointer-typed
+  GLOBAL stays rejected (the stored-cursor scheme has no member
+  projection). 00163's `b = &(bolshevic.b)` exercises the global-member
+  arm; test/Import/C/pointers-member-base.c and
+  pointers-member-base-invalid.c pin the shapes, and the rustc-level
+  differential test/EndToEnd/pointers-member-base.c rebinds the pointer
+  at a data-dependent loop iteration.)
 - [x] CTS-P7 (2) One pointer ranging over several objects (`p = &x;
   ... p = &y;`): PointerRegionAnalysis unions the objects into one
   region today and rejects; needs either region materialization (copy
@@ -1174,6 +1219,17 @@ observed when C99-33 + C99-47 together unlocked 00215).
   pointers-local-invalid.c; rustc-level differential
   test/EndToEnd/pointers-multi-base.c where the active base is
   data-dependent at runtime, including a loop-carried discriminant.)
+  (CTS-P9 extension: the closed set of bases may now mix degenerate
+  scalar locals with `&struct.member` bases, including members of
+  GLOBAL structs (the 00163 shape, `b = &a; ... b = &bolshevic.b`).
+  Member bases are degenerate one-element runs; a local-member arm of
+  the dispatch touches the member's own place, and a global-member arm
+  goes through the CTS-P6 staged copy with the member projection —
+  stage the whole struct, project the member, store the whole value
+  back on the write flush. Dispatch arms are ordered by base index
+  (binding order) and the discriminant stays the promotable memref<i32>
+  cell storing 0/1. test/Import/C/pointers-member-base.c @mixed_base;
+  differential test/EndToEnd/pointers-member-base.c.)
 - [x] CTS-P8 (1) NULL data-pointer constants: an Option-of-cursor model
   mirroring the fn_ptr None mapping; interacts with CTS-P3.
   (00171.c)
@@ -1196,6 +1252,25 @@ observed when C99-33 + C99-47 together unlocked 00215).
   test/Import/C/pointers-null-invalid.c, rustc-level differential with a
   data-dependent null path in test/EndToEnd/pointers-null.c, ledger
   00171.c.)
+  (CTS-P9 extension: a pointer-typed ConditionalOperator is now a
+  pointer source — no new representation. Classifying `q = c ? A : B`
+  classifies both arms into one united region (a null-constant arm,
+  including the qualified `(const void *)0` spelling and the
+  integer-conditional `q = i ? 0 : 0` shape, marks it nullable), and
+  the emission assigns each arm in its own block so the null/address
+  state merges through the pointer's own flag/discriminant/cursor cells
+  (test/Import/C/pointers-null-ternary.c @ternary_real_base and the
+  swapped-arm variant; differential test/EndToEnd/pointers-null-ternary.c
+  with a loop-flipping condition). A base-less nullable region with a
+  conditional source is STATICALLY NULL and carries zero runtime state:
+  no flag cell is materialized, `if (q)` folds to a constant-false
+  branch, `q == 0` folds true, `(int) q` folds to the integer 0 (the
+  00144 ending), and dereference keeps the "only ever null" rejection
+  (pointers-null-ternary-invalid.c; a pointer-to-int cast of a pointer
+  with a real base keeps "unsupported cast (PointerToIntegral)"). A
+  base-less region built only from DIRECT null bindings keeps the
+  historical flag cell above — the pointers-null.c @null_only contract.
+  00144 passes on this folding.)
 
 ### Records and symbol namespaces (16 tests)
 

@@ -51,7 +51,12 @@
 ///    promotable i1 "non-null" flag cell — `p = NULL` stores false, an
 ///    address binding stores true, and a null-check (`p == NULL`,
 ///    `if (p)`) reads the flag (statically non-null pointers fold their
-///    null-checks to constants). Dereferencing a possibly-null pointer
+///    null-checks to constants). A pointer-typed conditional operator is
+///    a pointer source (CTS-P9): both arms classify into one region, the
+///    emission assigns each arm in its own block, and a base-less
+///    nullable region with a conditional source is STATICALLY NULL —
+///    zero runtime state, folded null tests, `(int) p` folds to 0, and
+///    dereference stays rejected. Dereferencing a possibly-null pointer
 ///    emits `assert!(flag, "null pointer dereference")` first — C
 ///    dereferencing null is UB, so the deterministic panic is a legal
 ///    refinement, mirroring the fn_ptr `expect`. Passing, differencing,
@@ -182,8 +187,18 @@
 ///    `!emitrust.fn_ptr` result; returning a cursor into a callee-local
 ///    region stays rejected at the return site (it would dangle).
 ///    Qualification-preserving explicit casts (same unqualified pointee)
-///    peel transparently in analysis and emission; reinterpreting casts
-///    stay rejected.
+///    peel transparently in analysis and emission. A `void *` is a
+///    pointee-wildcard cursor (CTS-P9): casts to and from a `void`
+///    pointee peel transparently at any matching pointer depth, a
+///    `&struct.member` of a directly named local or global struct roots
+///    a region at that scalar member (resolved through `emitrust.member`
+///    on the object's place or its staged global copy; union members and
+///    member-base arithmetic are rejected), and a reinterpret-back site
+///    `*(T *)p` type-checks T against the region's base element type —
+///    exact matches lower directly, same-width int<->int views wrap the
+///    load/store in an `emitrust.cast` bitcast, and every other
+///    reinterpretation (including `void *` parameters and uncast `void *`
+///    dereference) stays rejected.
 ///
 /// The importer is a functional core (the `CImporter` class below, which
 /// owns the builder and per-function symbol table) driven by the imperative
@@ -279,6 +294,25 @@ struct GlobalInfo {
   Type type;
 };
 
+/// The emission-side identity of one pointer-region base: the bound object
+/// and, for a `&struct.member` base (CTS-P9), the scalar member the region
+/// roots at. Two bases are the same exactly when both components agree, so
+/// `&s` and `&s.b` stay distinct bases of distinct regions.
+struct PointerBaseKey {
+  /// The bound object's declaration (canonical for globals).
+  const clang::VarDecl *var = nullptr;
+  /// The member the region roots at (`p = &s.b`); null for whole-object
+  /// bases.
+  const clang::FieldDecl *member = nullptr;
+
+  bool operator==(const PointerBaseKey &other) const {
+    return var == other.var && member == other.member;
+  }
+  bool operator!=(const PointerBaseKey &other) const {
+    return !(*this == other);
+  }
+};
+
 /// A pending store-back of a staged global copy. Element and field accesses
 /// of a global stage its whole value in a local `emitrust.variable`; write
 /// contexts store the modified copy back into the global afterwards
@@ -293,8 +327,10 @@ struct GlobalWriteback {
   /// Multi-base dispatch store-back (CTS-P7): when non-empty, `place`
   /// stages one element of the base selected by `multiBaseIndex`, and the
   /// flush dispatches the staged value back into that base at
-  /// `multiCursor` (a match over the closed set of bases).
-  SmallVector<const clang::VarDecl *, 2> multiBases;
+  /// `multiCursor` (a match over the closed set of bases). A global-member
+  /// base's arm stages the global's whole value afresh, assigns the
+  /// projected member, and stores the whole value back (CTS-P9).
+  SmallVector<PointerBaseKey, 2> multiBases;
   /// The i32 enum-of-bases discriminant selecting the active base;
   /// meaningful only with a non-empty `multiBases`.
   Value multiBaseIndex;
@@ -363,10 +399,15 @@ struct PtrExprValue {
   /// (CTS-P7): an i32 index into `multiBases` naming the object the
   /// pointer currently points into. Null for single-base pointers.
   Value baseIndex;
-  /// The ordered disjoint base objects of a multi-base region, indexed by
+  /// The ordered disjoint bases of a multi-base region, indexed by
   /// `baseIndex`; empty for single-base pointers. Copied out of the
   /// pointer's `PointerLocalInfo` so the value stays self-contained.
-  SmallVector<const clang::VarDecl *, 2> multiBases;
+  SmallVector<PointerBaseKey, 2> multiBases;
+  /// The struct member a `&struct.member` base roots at (CTS-P9): the
+  /// pointer designates exactly that member of `base`, so every place it
+  /// resolves to is the member's projection on the base's place (or on
+  /// the base's staged global copy). Null for whole-object bases.
+  const clang::FieldDecl *member = nullptr;
 };
 
 /// Phase-1b classification of one pointer parameter, derived from the
@@ -408,11 +449,15 @@ struct PointerLocalInfo {
   /// on it (a match over the closed set of bases). Null for single-base
   /// pointers, whose base is statically known.
   Value baseIndexCell;
-  /// The ordered disjoint base objects of a multi-base region, indexed by
-  /// the discriminant; empty for single-base pointers. Every pointer of
-  /// one region carries the same order (the region's binding order), so
+  /// The ordered disjoint bases of a multi-base region, indexed by the
+  /// discriminant; empty for single-base pointers. Every pointer of one
+  /// region carries the same order (the region's binding order), so
   /// discriminants copy soundly across `p = q`.
-  SmallVector<const clang::VarDecl *, 2> multiBases;
+  SmallVector<PointerBaseKey, 2> multiBases;
+  /// The struct member a single `&struct.member` base roots at (CTS-P9);
+  /// null for whole-object bases. A member base is a degenerate
+  /// one-element run: no cursor, no arithmetic.
+  const clang::FieldDecl *member = nullptr;
 };
 
 /// The imported model of one pointer-typed global variable (CTS-P4): the
@@ -484,12 +529,17 @@ using MemberPointerKey =
 /// One base binding of a pointer region: the object some pointer in the
 /// region was made to point into, and the source location of the assignment
 /// (or initializer) that bound it. The multi-base diagnostic names the
-/// first two bindings.
+/// first two bindings. A `&struct.member` binding (CTS-P9) additionally
+/// carries the scalar member the region roots at; bindings to distinct
+/// members of one object are distinct bases.
 struct PointerBaseBinding {
   /// The bound object.
   const clang::VarDecl *base;
   /// Where the binding was established.
   clang::SourceLocation loc;
+  /// The member the binding roots at (`p = &s.b`); null for whole-object
+  /// bindings.
+  const clang::FieldDecl *member = nullptr;
 };
 
 /// The Phase-4 owner-promotion plan of one local array base variable: the
@@ -544,6 +594,14 @@ struct PointerRegion {
   bool nullable = false;
   /// First null-constant binding site; meaningful only with `nullable`.
   clang::SourceLocation nullableLoc;
+  /// True when a pointer-typed conditional operator classified into the
+  /// region (CTS-P9): its arms united here, so the region's null state
+  /// merges through conditional control flow. A base-less nullable region
+  /// with a conditional source is STATICALLY NULL — it carries zero
+  /// runtime state and its null tests fold (see `isStaticallyNullRegion`);
+  /// a base-less region built only from direct null bindings keeps the
+  /// historical CTS-P8 flag cell.
+  bool hasConditionalSource = false;
   /// The single recognized allocation call (`calloc`/`malloc` with
   /// compile-time-constant sizes) bound to a global pointer of the region;
   /// the allocation is promoted to a synthesized zero-initialized global
@@ -676,10 +734,16 @@ private:
   /// everything else.
   void recordPointerWrite(const clang::VarDecl *ptr, const clang::Expr *rhs);
 
-  /// Binds `base` into `ptr`'s region at `loc` (rejecting global-storage
-  /// bases) and unions the two declarations.
+  /// Binds `base` into `ptr`'s region at `loc` (rejecting local bases of
+  /// global pointers) and unions the two declarations. A non-null `member`
+  /// roots the binding at `&base.member` (CTS-P9); member bindings do not
+  /// join the base object into the union-find — every access resolves
+  /// through the object's own place (or its staged global copy) directly,
+  /// so no cursor state is ever shared with pointers into the whole
+  /// object.
   void addBase(const clang::VarDecl *ptr, const clang::VarDecl *base,
-               clang::SourceLocation loc);
+               clang::SourceLocation loc,
+               const clang::FieldDecl *member = nullptr);
 
   /// Binds the string literal `literal` as the read-only base of `ptr`'s
   /// region at `loc`; a region bound to two distinct literals is marked
@@ -1381,19 +1445,34 @@ private:
   /// by `emitArm`, all joining in a fresh continuation block where the
   /// insertion point is left.
   LogicalResult emitMultiBaseDispatch(
-      Location loc, ArrayRef<const clang::VarDecl *> bases, Value baseIndex,
-      llvm::function_ref<LogicalResult(const clang::VarDecl *)> emitArm);
+      Location loc, ArrayRef<PointerBaseKey> bases, Value baseIndex,
+      llvm::function_ref<LogicalResult(const PointerBaseKey &)> emitArm);
 
-  /// Materializes the element place of the local base object `base` at
-  /// `cursor` (null for a degenerate scalar base, which resolves to the
-  /// object's own place): the base's registered place refined through
-  /// `refineElementPlace`. Used per dispatch arm of a multi-base pointer,
-  /// whose bases are always local (the region validation rejects global
-  /// bases).
+  /// Materializes the element place of the local base `base` at `cursor`
+  /// (null for a degenerate scalar or member base, which resolves to the
+  /// object's — or member's — own place): the base's registered place,
+  /// projected through the member for a `&struct.member` base (CTS-P9)
+  /// and refined through `refineElementPlace`. Used per dispatch arm of a
+  /// multi-base pointer; global-member arms stage the global instead (see
+  /// `stageGlobalCopy`).
   FailureOr<Value> materializeLocalElementPlace(Location loc,
-                                                const clang::VarDecl *base,
+                                                const PointerBaseKey &base,
                                                 Value cursor,
                                                 Type pointeeType);
+
+  /// Stages the whole value of the global region base `base` (a real
+  /// global object, or a pointer global's synthesized backing) in a fresh
+  /// local `emitrust.variable` copy — the staged-copy model of direct
+  /// global element accesses — returning the staging place and the global
+  /// symbol a write context must store the copy back into.
+  FailureOr<std::pair<Value, std::string>>
+  stageGlobalCopy(Location loc, const clang::VarDecl *base);
+
+  /// Projects the member place `field` designates on the struct place
+  /// `basePlace` (an `emitrust.member` with the flattened field name),
+  /// used to resolve a `&struct.member` region base (CTS-P9).
+  FailureOr<Value> projectMemberPlace(Location loc, Value basePlace,
+                                      const clang::FieldDecl *field);
 
   /// Refines the array-or-slice place `basePlace` down to the element the
   /// flat row-major `cursor` designates, peeling one `emitrust.subscript`
@@ -2051,6 +2130,33 @@ private:
   /// path (a direct read of a `mut_ref`/`ref`-typed parameter).
   bool isDecomposedPointerExpr(const clang::Expr *expr) const;
 
+  /// Returns whether `expr` (through decomposition-transparent cast peels)
+  /// reads a pointer local whose region is statically null (CTS-P9): a
+  /// base-less nullable region — one that only ever unites null constants
+  /// and other null-only pointers. Such a pointer carries zero runtime
+  /// state; its truth tests and null comparisons fold to constants and a
+  /// pointer-to-int cast of it folds to 0.
+  bool isStaticallyNullPointerExpr(const clang::Expr *expr);
+
+  /// Returns whether `expr` is a dereference of a decomposed pointer that
+  /// peels through a pointee-changing cast (`*(T *)p` on a `void *`
+  /// cursor, CTS-P9). The deref emission resolves such a place at the
+  /// region's base element type; when the viewed type is a same-width
+  /// integer view over that element, the load and store sites wrap the
+  /// accessed value in an `emitrust.cast` bitcast (see `emitCast`'s
+  /// `CK_LValueToRValue` case and `emitAssignToPlace`).
+  bool isReinterpretedViewDeref(const clang::Expr *expr);
+
+  /// Returns the C element type at the bottom of `pointer`'s region: the
+  /// member's declared type for a `&struct.member` base, the pointee for a
+  /// slice-parameter base, the array level matching `viewed` (falling back
+  /// to the innermost element) for an array base, `char` for a
+  /// string-literal region, and nothing for a base-less (statically null)
+  /// region. Used to type-check a reinterpret-back site `*(T *)p` against
+  /// the region (CTS-P9).
+  std::optional<clang::QualType>
+  regionElementType(const PtrExprValue &pointer, clang::QualType viewed);
+
   /// Emits an expression as an assignable place: either a rank-0 memref
   /// value (scalar locals) or an `!emitrust.lvalue` value (aggregates,
   /// dereferences, fields, elements). A reference to an imported global
@@ -2198,6 +2304,12 @@ private:
   /// regions, keyed by the bound literal; created once per literal at the
   /// declaration of the first pointer bound to it.
   llvm::DenseMap<const clang::StringLiteral *, Value> literalBackings;
+  /// Per-function prologue cells of by-value scalar parameters.
+  /// `finalizeFunction` sweeps any such cell whose every remaining use is
+  /// a store (the parameter is never read on any surviving path — e.g.
+  /// its uses folded away with a statically-null pointer, CTS-P9), so a
+  /// fully folded function carries no runtime state at all.
+  SmallVector<Value, 8> paramCells;
   /// Cached Phase-1b parameter classifications, keyed by the function's
   /// canonical declaration (persists across the whole import; each TU's
   /// declarations are distinct clang decls, so entries never conflict).
@@ -2503,17 +2615,25 @@ static const clang::FieldDecl *dataPointerFieldOf(const clang::Expr *expr) {
   return field;
 }
 
-/// Returns the operand of an explicit pointer cast that does not change
-/// what the value decomposes into — a C-style cast between data-pointer
-/// types with the same unqualified pointee (`(int *)p`, `(const char *)s`,
-/// a qualification adjustment) — or null for every other cast. A cast that
-/// genuinely reinterprets the pointee (`(char *)&x`, `(int *)voidp`,
-/// integer-to-pointer) is never peeled: the decomposition's element unit
-/// would change, so those shapes keep their located rejections.
-static const clang::Expr *
-peeledQualificationCast(clang::ASTContext &context, const clang::Expr *expr) {
-  const auto *cast = llvm::dyn_cast<clang::CStyleCastExpr>(expr);
-  if (!cast)
+/// Returns the operand of a pointer cast (explicit C-style, or the
+/// implicit bitcast Sema inserts for `void *` conversions) that is
+/// transparent to the (base, cursor) decomposition, or null for every
+/// other cast. Transparent casts are qualification adjustments (`(int *)p`
+/// on an `int *`, `(const char *)s`) and — the pointee-wildcard rule,
+/// CTS-P9 — casts to or from a `void` pointee at any matching pointer
+/// depth: `(void *)&x`, `(int *)voidp`, and the second-order
+/// `(int **)voidpp` all peel, because a `void *` carries no element unit
+/// of its own. A reinterpret-back site `*(T *)p` therefore reaches the
+/// deref emission, which type-checks `T` against the region's base
+/// element type. Casts between distinct non-void pointees
+/// (`(char *)&x`) and integer-to-pointer casts are never peeled: the
+/// decomposition's element unit would change, so those shapes keep their
+/// located rejections.
+static const clang::Expr *peelPointerCast(clang::ASTContext &context,
+                                          const clang::Expr *expr) {
+  const auto *cast = llvm::dyn_cast<clang::CastExpr>(expr);
+  if (!cast || (!llvm::isa<clang::CStyleCastExpr>(cast) &&
+                !llvm::isa<clang::ImplicitCastExpr>(cast)))
     return nullptr;
   if (cast->getCastKind() != clang::CK_NoOp &&
       cast->getCastKind() != clang::CK_BitCast)
@@ -2522,10 +2642,111 @@ peeledQualificationCast(clang::ASTContext &context, const clang::Expr *expr) {
   clang::QualType to = cast->getType().getCanonicalType();
   if (!isDataPointer(from) || !isDataPointer(to))
     return nullptr;
-  if (!context.hasSameUnqualifiedType(from->getPointeeType(),
-                                      to->getPointeeType()))
+  while (true) {
+    clang::QualType fromPointee =
+        from->getPointeeType().getCanonicalType();
+    clang::QualType toPointee = to->getPointeeType().getCanonicalType();
+    if (context.hasSameUnqualifiedType(fromPointee, toPointee))
+      return cast->getSubExpr();
+    if (fromPointee->isVoidType() || toPointee->isVoidType())
+      return cast->getSubExpr();
+    if (fromPointee->isPointerType() && toPointee->isPointerType()) {
+      from = fromPointee;
+      to = toPointee;
+      continue;
+    }
     return nullptr;
-  return cast->getSubExpr();
+  }
+}
+
+/// Returns whether decomposing `expr` peels through a pointee-changing
+/// pointer cast — a `void *`-mediated reinterpret-back site such as
+/// `*(T *)p` on a `void *` cursor (CTS-P9). The deref emission consults
+/// this to type-check the viewed type against the region's base element
+/// type; expressions whose peels all preserve the pointee (qualification
+/// adjustments) keep the historical unchecked path.
+static bool peelsReinterpretingPointerCast(clang::ASTContext &context,
+                                           const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  bool changed = false;
+  while (const clang::Expr *sub = peelPointerCast(context, e)) {
+    if (!context.hasSameUnqualifiedType(
+            e->getType().getCanonicalType()->getPointeeType(),
+            sub->getType().getCanonicalType()->getPointeeType()))
+      changed = true;
+    e = stripTrivia(sub);
+  }
+  return changed;
+}
+
+/// Returns whether `region` is statically null (CTS-P9): a consumable
+/// base-less nullable region with a conditional (ternary) source — one
+/// that only ever united null constants and other null-only pointers
+/// through a pointer-typed conditional. Such a region carries zero
+/// runtime state: no flag cell is materialized, null tests fold to
+/// constants, a pointer-to-int cast folds to 0, and dereferences are
+/// located rejections. A base-less nullable region built only from
+/// direct null bindings keeps the historical CTS-P8 flag cell (the
+/// pointers-null.c contract).
+static bool isStaticallyNullRegion(const PointerRegion *region) {
+  return region && region->invalidReason.empty() && region->bases.empty() &&
+         !region->literalBase && !region->allocSite && region->nullable &&
+         region->hasConditionalSource;
+}
+
+/// The statically resolved target of a `&root.member` address expression
+/// (CTS-P9): the root object and the (possibly anonymous-chain-flattened)
+/// leaf field. `touchesUnion` reports union storage anywhere on the path,
+/// which has no unaliased member place to root a region at.
+struct MemberAddressTarget {
+  /// The root variable the member chain is rooted at; null when the shape
+  /// is outside the single-object member-path model (arrow bases, nested
+  /// named members, bitfields).
+  const clang::VarDecl *root = nullptr;
+  /// The leaf field whose address is taken.
+  const clang::FieldDecl *field = nullptr;
+  /// True when the leaf or any implicit anonymous hop lives in union
+  /// storage.
+  bool touchesUnion = false;
+};
+
+/// Classifies the operand of `&member-expr`: accepts a non-arrow member
+/// of a directly named (local or global) struct variable, walking implicit
+/// anonymous-aggregate hops (whose fields are flattened into the parent
+/// struct_def, so a single `emitrust.member` projection reaches the leaf).
+/// Reports union storage on the path via `touchesUnion`; every other shape
+/// leaves `root` null.
+static MemberAddressTarget
+classifyMemberAddress(const clang::MemberExpr *memberExpr) {
+  MemberAddressTarget target;
+  const auto *field =
+      llvm::dyn_cast<clang::FieldDecl>(memberExpr->getMemberDecl());
+  if (!field)
+    return target;
+  target.field = field;
+  target.touchesUnion = field->getParent()->isUnion();
+  if (memberExpr->isArrow() || field->isBitField())
+    return target;
+  const clang::Expr *base = stripTrivia(memberExpr->getBase());
+  while (const auto *inner = llvm::dyn_cast<clang::MemberExpr>(base)) {
+    const auto *innerField =
+        llvm::dyn_cast<clang::FieldDecl>(inner->getMemberDecl());
+    if (!innerField || inner->isArrow())
+      return target;
+    if (innerField->getParent()->isUnion())
+      target.touchesUnion = true;
+    // Only implicit anonymous-aggregate hops keep the leaf reachable with
+    // one flattened-name projection; a named intermediate member is a
+    // nested path outside the model.
+    if (!innerField->isAnonymousStructOrUnion())
+      return target;
+    base = stripTrivia(inner->getBase());
+  }
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(base))
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+      if (!isPointerType(var->getType()))
+        target.root = var;
+  return target;
 }
 
 /// Peels the casts a returned function address wears (the implicit or
@@ -2841,7 +3062,8 @@ static void mergeRegionFacts(PointerRegion &target,
   for (const PointerBaseBinding &binding : absorbed.bases) {
     bool known = llvm::any_of(target.bases,
                               [&](const PointerBaseBinding &existing) {
-                                return existing.base == binding.base;
+                                return existing.base == binding.base &&
+                                       existing.member == binding.member;
                               });
     if (!known)
       target.bases.push_back(binding);
@@ -2881,6 +3103,7 @@ static void mergeRegionFacts(PointerRegion &target,
     target.nullable = true;
     target.nullableLoc = absorbed.nullableLoc;
   }
+  target.hasConditionalSource |= absorbed.hasConditionalSource;
   if (!absorbed.invalidReason.empty() && target.invalidReason.empty()) {
     target.invalidReason = absorbed.invalidReason;
     target.invalidLoc = absorbed.invalidLoc;
@@ -2909,7 +3132,8 @@ PointerRegion &PointerRegionAnalysis::regionFor(const clang::VarDecl *decl) {
 
 void PointerRegionAnalysis::addBase(const clang::VarDecl *ptr,
                                     const clang::VarDecl *base,
-                                    clang::SourceLocation loc) {
+                                    clang::SourceLocation loc,
+                                    const clang::FieldDecl *member) {
   bool ptrIsGlobal = !ptr->hasLocalStorage();
   bool baseIsGlobal = !base->hasLocalStorage();
   // A local pointer into a global object is a valid region base (CTS-P6):
@@ -2927,14 +3151,20 @@ void PointerRegionAnalysis::addBase(const clang::VarDecl *ptr,
             .str());
   if (baseIsGlobal)
     base = base->getCanonicalDecl();
-  unite(ptr, base);
+  // A member binding roots at the member's own place and never shares
+  // cursor state with pointers into the whole object, so the base object
+  // stays out of the union-find (CTS-P9); a whole-object binding joins it
+  // so that two pointers into one object always share a region.
+  if (!member)
+    unite(ptr, base);
   PointerRegion &region = regionFor(ptr);
   bool known = llvm::any_of(region.bases,
                             [&](const PointerBaseBinding &existing) {
-                              return existing.base == base;
+                              return existing.base == base &&
+                                     existing.member == member;
                             });
   if (!known)
-    region.bases.push_back(PointerBaseBinding{base, loc});
+    region.bases.push_back(PointerBaseBinding{base, loc, member});
 }
 
 void PointerRegionAnalysis::addLiteralBase(const clang::VarDecl *ptr,
@@ -3054,6 +3284,12 @@ PointerRegionAnalysis::trackedWritePlaceRoot(const clang::Expr *place) {
   // (through casts, ++/--, and +/- offset forms).
   const clang::Expr *cursor = stripTrivia(pointerExpr);
   while (true) {
+    // Explicit decomposition-transparent casts (`*(int *)p = v` through a
+    // `void *`, CTS-P9) peel exactly like the emission's peel.
+    if (const clang::Expr *peeled = peelPointerCast(*context, cursor)) {
+      cursor = stripTrivia(peeled);
+      continue;
+    }
     if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(cursor)) {
       cursor = stripTrivia(cast->getSubExpr());
       continue;
@@ -3128,7 +3364,12 @@ PointerRegionAnalysis::asSecondOrderDeref(const clang::Expr *expr) const {
   const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
   if (!unary || unary->getOpcode() != clang::UO_Deref)
     return nullptr;
-  const clang::VarDecl *var = asLoadedLocalVarRef(unary->getSubExpr());
+  // `*(int **)pp` on a `void **` peels the reinterpret-back cast exactly
+  // like the emission (the pointee-wildcard rule, CTS-P9).
+  const clang::Expr *sub = stripTrivia(unary->getSubExpr());
+  while (const clang::Expr *peeled = peelPointerCast(*context, sub))
+    sub = stripTrivia(peeled);
+  const clang::VarDecl *var = asLoadedLocalVarRef(sub);
   return var && secondOrderVars.contains(var) ? var : nullptr;
 }
 
@@ -3344,6 +3585,12 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
                                clang::Expr::NPC_NeverValueDependent) !=
       clang::Expr::NPCK_NotNull)
     return recordNullable(ptr, loc);
+  // `(const void *) 0`: only the UNQUALIFIED `void *` cast is a formal
+  // null pointer constant (C11 6.3.2.3p3), but the qualified cast still
+  // yields the null pointer value; clang models both as CK_NullToPointer.
+  if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
+    if (cast->getCastKind() == clang::CK_NullToPointer)
+      return recordNullable(ptr, loc);
 
   // `g = calloc(n, sizeof(T))` / `g = malloc(bytes)` on a global pointer:
   // a constant-size allocation binding, promoted to a synthesized global
@@ -3353,16 +3600,40 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
     if (const clang::CallExpr *alloc = asAllocCall(e))
       return recordAllocBase(ptr, alloc, loc);
 
-  // A qualification-preserving explicit cast is transparent to the region
-  // facts (the emission peels it identically); reinterpreting casts fall
-  // through to the non-address rejection.
-  if (const clang::Expr *peeled = peeledQualificationCast(*context, e))
+  // A decomposition-transparent pointer cast — a qualification adjustment
+  // or a `void *`-mediated cast (the pointee-wildcard rule, CTS-P9) — is
+  // transparent to the region facts (the emission peels it identically);
+  // genuinely reinterpreting casts fall through to the non-address
+  // rejection.
+  if (const clang::Expr *peeled = peelPointerCast(*context, e))
     return recordPointerWrite(ptr, peeled);
+
+  // A pointer-typed conditional is a pointer source (CTS-P9): both arms
+  // classify into the region, uniting whatever they bind; a null-constant
+  // arm marks the region nullable through the ordinary null-binding path
+  // above.
+  if (const auto *conditional = llvm::dyn_cast<clang::ConditionalOperator>(e)) {
+    regionFor(ptr).hasConditionalSource = true;
+    recordPointerWrite(ptr, conditional->getTrueExpr());
+    recordPointerWrite(ptr, conditional->getFalseExpr());
+    return;
+  }
 
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
     switch (cast->getCastKind()) {
     case clang::CK_NoOp:
       return recordPointerWrite(ptr, cast->getSubExpr());
+    case clang::CK_IntegralToPointer: {
+      // `q = i ? 0 : 0`: an integer conditional converted to a pointer;
+      // each arm classifies on its own (a 0 arm is a null pointer
+      // constant, so an all-null-arm conditional just marks the region
+      // nullable). Any other integer-to-pointer traffic keeps the
+      // non-address rejection below.
+      const clang::Expr *sub = stripTrivia(cast->getSubExpr());
+      if (llvm::isa<clang::ConditionalOperator>(sub))
+        return recordPointerWrite(ptr, sub);
+      break;
+    }
     case clang::CK_LValueToRValue: {
       // `p = q`: copying a pointer joins the two into one region.
       if (const clang::VarDecl *source = asLocalVarRef(cast->getSubExpr()))
@@ -3426,6 +3697,21 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
                 "unsupported: taking the address of a pointer variable");
           return addBase(ptr, target, loc);
         }
+      }
+      if (const auto *memberExpr = llvm::dyn_cast<clang::MemberExpr>(sub)) {
+        // `p = &s.b` / `p = &g.b`: the address of a member of a directly
+        // named local or global struct roots the region at that member
+        // (CTS-P9). Union storage aliases its arms in one slot, so a
+        // member-path base rooted there could not keep the aliased names
+        // coherent; taking the address of a union member stays rejected.
+        MemberAddressTarget target = classifyMemberAddress(memberExpr);
+        if (target.touchesUnion)
+          return markInvalid(
+              ptr, loc, "unsupported: taking the address of a union member");
+        if (target.root)
+          return addBase(ptr, target.root, loc, target.field);
+        return markInvalid(
+            ptr, loc, "unsupported: pointer assigned a non-address value");
       }
       if (const auto *subscript =
               llvm::dyn_cast<clang::ArraySubscriptExpr>(sub)) {
@@ -3834,6 +4120,10 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     return mapType(type, loc);
   if (canonical->isPointerType()) {
     clang::QualType pointee = canonical->getPointeeType();
+    // A `void *` parameter has no element type to classify against and no
+    // region to join at the call boundary (CTS-P9).
+    if (pointee.getCanonicalType()->isVoidType())
+      return emitError(loc) << "unsupported: void pointer parameter";
     // A pointee that is itself a *data* pointer has no representation
     // (CTS-P5); a function-pointer pointee is an ordinary Copy value
     // (`!emitrust.fn_ptr`) and slices/references over it are fine — the
@@ -4218,7 +4508,8 @@ LogicalResult CImporter::emitMemberPointerAssign(
   FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
   if (failed(value))
     return failure();
-  if (value->base != facts.base || value->cursor || value->literalBacking)
+  if (value->base != facts.base || value->member || value->cursor ||
+      value->literalBacking)
     return emitError(loc) // Defensive; the analysis pins the binding.
            << "unsupported: pointer struct member assigned this value";
   // The degenerate binding is static: the stored i64 member stays 0 and
@@ -5060,6 +5351,11 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
   if (baseKinds == 0)
     return emitError(loc) << "unsupported: global pointer variable '"
                           << symbolName << "' has no known target object";
+  // Member-rooted bases (CTS-P9) are a pointer-local shape: the stored
+  // global cursor scheme has no member projection to store.
+  if (!facts.bases.empty() && facts.bases.front().member)
+    return emitError(translateLoc(facts.bases.front().loc))
+           << "unsupported: global pointer bound to a struct member";
 
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
   IntegerType i64Type = builder.getIntegerType(64);
@@ -5689,16 +5985,48 @@ CImporter::flushGlobalWriteback(Location loc,
   if (!writeback.multiBases.empty()) {
     // A staged multi-base element (CTS-P7): dispatch on the staged
     // discriminant and store the mutated element back into the active
-    // base at the staged cursor.
+    // base at the staged cursor. A global-member base's arm (CTS-P9)
+    // stages the global's whole value afresh, assigns the projected
+    // member, and stores the whole value back.
     Value value = loadPlace(loc, writeback.place);
     return emitMultiBaseDispatch(
         loc, writeback.multiBases, writeback.multiBaseIndex,
-        [&](const clang::VarDecl *base) -> LogicalResult {
-          FailureOr<Value> element = materializeLocalElementPlace(
-              loc, base, writeback.multiCursor, writeback.multiPointeeType);
+        [&](const PointerBaseKey &base) -> LogicalResult {
+          if (base.var->hasLocalStorage()) {
+            FailureOr<Value> element = materializeLocalElementPlace(
+                loc, base, writeback.multiCursor,
+                writeback.multiPointeeType);
+            if (failed(element))
+              return failure();
+            return storeToPlace(loc, *element, value);
+          }
+          FailureOr<std::pair<Value, std::string>> staged =
+              stageGlobalCopy(loc, base.var);
+          if (failed(staged))
+            return failure();
+          Value place = staged->first;
+          if (base.member) {
+            FailureOr<Value> memberPlace =
+                projectMemberPlace(loc, place, base.member);
+            if (failed(memberPlace))
+              return failure();
+            place = *memberPlace;
+          }
+          FailureOr<Value> element = refineElementPlace(
+              loc, place, writeback.multiCursor, writeback.multiPointeeType);
           if (failed(element))
             return failure();
-          return storeToPlace(loc, *element, value);
+          if (failed(storeToPlace(loc, *element, value)))
+            return failure();
+          auto lvalueType =
+              llvm::cast<emitrust::LValueType>(staged->first.getType());
+          Value full = builder
+                           .create<emitrust::LoadOp>(
+                               loc, lvalueType.getValueType(), staged->first)
+                           .getResult();
+          builder.create<emitrust::GlobalStoreOp>(
+              loc, full, globalSymbol(staged->second));
+          return success();
         });
   }
   auto lvalueType =
@@ -5937,6 +6265,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   pointerLocals.clear();
   pointerPointerLocals.clear();
   literalBackings.clear();
+  paramCells.clear();
   ownerStructPlaces.clear();
   loopStack.clear();
   labelBlocks.clear();
@@ -6048,10 +6377,12 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     }
     if (llvm::isa<emitrust::ArrayType>(type))
       return emitError(paramLoc) << "unsupported: array parameter";
-    // Plain scalar: promotable rank-0 memref cell.
+    // Plain scalar: promotable rank-0 memref cell (swept by
+    // `finalizeFunction` when the parameter is never read).
     Value cell = createEntryAlloca(paramLoc, type);
     builder.create<memref::StoreOp>(paramLoc, blockArg, cell);
     symbols[param] = cell;
+    paramCells.push_back(cell);
   }
 
   if (failed(emitStmt(func->getBody())))
@@ -6395,6 +6726,27 @@ LogicalResult CImporter::finalizeFunction(func::FuncOp funcOp, Location loc) {
   for (Block &block : llvm::make_early_inc_range(region))
     if (!reachable.contains(&block))
       block.erase();
+
+  // Sweep write-only parameter cells: a prologue cell whose every
+  // remaining use is a store belongs to a parameter that is never read on
+  // any surviving path (e.g. its only uses folded away with a statically
+  // null pointer, CTS-P9). Dropping the stores and the cell is exact —
+  // the stored values' computations stay behind as pure ops — and keeps
+  // fully folded functions free of runtime state.
+  for (Value cell : paramCells) {
+    Operation *alloca = cell.getDefiningOp();
+    if (!alloca)
+      continue;
+    SmallVector<Operation *> users(cell.getUsers().begin(),
+                                   cell.getUsers().end());
+    if (!llvm::all_of(users, [](Operation *user) {
+          return llvm::isa<memref::StoreOp>(user);
+        }))
+      continue;
+    for (Operation *user : users)
+      user->erase();
+    alloca->erase();
+  }
 
   // Terminate the fall-through block, if any.
   for (Block &block : region) {
@@ -6986,8 +7338,24 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
       return joinReject();
     bool anyCursored = false;
     bool anyDegenerate = false;
+    bool anyMember = false;
+    // A `void *` pointee is a pointee-wildcard cursor (CTS-P9): it carries
+    // no element unit of its own, so the per-base element checks below do
+    // not apply; each reinterpret-back deref site type-checks instead.
+    bool wildcard = pointee.getCanonicalType()->isVoidType();
     for (const PointerBaseBinding &binding : region->bases) {
       const clang::VarDecl *base = binding.base;
+      if (binding.member) {
+        // A member base (CTS-P9) is a degenerate one-element run rooted
+        // at the member's own place; a global root reuses the staged-copy
+        // machinery per dispatch arm.
+        if (!wildcard && !astContext().hasSameUnqualifiedType(
+                             pointee, binding.member->getType()))
+          return joinReject();
+        anyDegenerate = true;
+        anyMember = true;
+        continue;
+      }
       if (!base->hasLocalStorage())
         return joinReject();
       if (isPointerType(base->getType())) {
@@ -6996,27 +7364,28 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
         auto baseInfo = pointerLocals.find(base);
         if (baseInfo == pointerLocals.end() ||
             !baseInfo->second.cursorCell ||
-            !astContext().hasSameUnqualifiedType(
-                pointee,
-                base->getType().getCanonicalType()->getPointeeType()))
+            (!wildcard &&
+             !astContext().hasSameUnqualifiedType(
+                 pointee,
+                 base->getType().getCanonicalType()->getPointeeType())))
           return joinReject();
         anyCursored = true;
       } else if (const clang::ConstantArrayType *array =
                      astContext().getAsConstantArrayType(base->getType())) {
-        bool matchesLevel = false;
-        for (const clang::ConstantArrayType *level = array; level;
+        bool matchesLevel = wildcard;
+        for (const clang::ConstantArrayType *level = array;
+             level && !matchesLevel;
              level = astContext().getAsConstantArrayType(
                  level->getElementType()))
           if (astContext().hasSameUnqualifiedType(pointee,
-                                                  level->getElementType())) {
+                                                  level->getElementType()))
             matchesLevel = true;
-            break;
-          }
         if (!matchesLevel)
           return joinReject();
         anyCursored = true;
       } else {
-        if (!astContext().hasSameUnqualifiedType(pointee, base->getType()))
+        if (!wildcard &&
+            !astContext().hasSameUnqualifiedType(pointee, base->getType()))
           return joinReject();
         anyDegenerate = true;
       }
@@ -7025,24 +7394,32 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
       return joinReject();
     if (anyDegenerate && region->hasArithmetic)
       return emitError(translateLoc(region->arithmeticLoc))
-             << "unsupported: arithmetic on the address of a scalar object";
+             << (anyMember ? "unsupported: pointer arithmetic on the "
+                             "address of a struct member"
+                           : "unsupported: arithmetic on the address of a "
+                             "scalar object");
     PointerLocalInfo info;
     if (anyCursored)
       info.cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
     info.baseIndexCell = createEntryAlloca(loc, builder.getIntegerType(32));
     for (const PointerBaseBinding &binding : region->bases)
-      info.multiBases.push_back(binding.base);
+      info.multiBases.push_back(PointerBaseKey{binding.base, binding.member});
     pointerLocals[var] = info;
     if (const clang::Expr *init = var->getInit())
       return storePointerAssign(loc, var, init);
     return success();
   }
   if (region->bases.empty()) {
-    // Never bound to any object. A nullable region still needs its
-    // Option-of-cursor discriminant so null-checks (`p == NULL`, `if (p)`)
-    // read the flag; the pointer has no base, so any dereference is
-    // rejected at its site. A non-nullable unbound pointer needs no code.
-    if (region->nullable) {
+    // Never bound to any object. A base-less nullable region with a
+    // conditional source is STATICALLY NULL (CTS-P9): it only ever unites
+    // null constants and other null-only pointers, so it carries zero
+    // runtime state — no flag cell is materialized, null tests fold to
+    // constants, `(int) p` folds to 0, assignments are no-ops (see
+    // `storePointerAssign`), and any dereference is rejected at its site.
+    // A base-less nullable region built only from direct null bindings
+    // keeps its CTS-P8 Option-of-cursor discriminant so null-checks read
+    // the flag. A non-nullable unbound pointer needs no code.
+    if (region->nullable && !isStaticallyNullRegion(region)) {
       Value nonNullCell = createEntryAlloca(loc, builder.getI1Type());
       pointerLocals[var] =
           PointerLocalInfo{nullptr, Value(), Value(), nonNullCell};
@@ -7061,9 +7438,28 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
   // validation reads only the declared type and applies unchanged.
   const clang::VarDecl *base = binding.base;
   Location bindLoc = translateLoc(binding.loc);
+  // A `void *` pointee is a pointee-wildcard cursor (CTS-P9): it names no
+  // element unit, so the element checks below do not apply; each
+  // reinterpret-back deref site (`*(T *)p`) type-checks `T` against the
+  // base element type instead.
+  bool wildcard = pointee.getCanonicalType()->isVoidType();
 
   Value cursorCell;
-  if (isPointerType(base->getType())) {
+  if (binding.member) {
+    // A `&struct.member` base (CTS-P9) is a degenerate one-element run
+    // rooted at the member's own place: no cursor, and any pointer
+    // arithmetic would walk past the member into sibling storage, which
+    // the member-path binding cannot represent.
+    if (region->hasArithmetic)
+      return emitError(translateLoc(region->arithmeticLoc))
+             << "unsupported: pointer arithmetic on the address of a "
+                "struct member";
+    if (!wildcard && !astContext().hasSameUnqualifiedType(
+                         pointee, binding.member->getType()))
+      return emitError(bindLoc)
+             << "unsupported: pointer type does not match its target "
+                "member";
+  } else if (isPointerType(base->getType())) {
     // The base is a slice-classified pointer parameter (the only pointer
     // that can be a region base): the local walks the parameter's element
     // run through its own cursor. The binding registered at the function
@@ -7073,7 +7469,8 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
       return emitError(bindLoc)
              << "unsupported: pointer variable bound to a non-slice "
                 "pointer parameter"; // Defensive; classification forbids it.
-    if (!astContext().hasSameUnqualifiedType(
+    if (!wildcard &&
+        !astContext().hasSameUnqualifiedType(
             pointee, base->getType().getCanonicalType()->getPointeeType()))
       return emitError(bindLoc)
              << "unsupported: pointer element type does not match its "
@@ -7086,15 +7483,14 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
     // matches at the first level, a scalar pointer (`char *`) at the
     // innermost. Either way the cursor counts innermost elements in
     // row-major order.
-    bool matchesLevel = false;
-    for (const clang::ConstantArrayType *level = array; level;
+    bool matchesLevel = wildcard;
+    for (const clang::ConstantArrayType *level = array;
+         level && !matchesLevel;
          level = astContext().getAsConstantArrayType(
              level->getElementType())) {
       if (astContext().hasSameUnqualifiedType(pointee,
-                                              level->getElementType())) {
+                                              level->getElementType()))
         matchesLevel = true;
-        break;
-      }
     }
     if (!matchesLevel)
       return emitError(bindLoc)
@@ -7108,7 +7504,8 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
     if (region->hasArithmetic)
       return emitError(translateLoc(region->arithmeticLoc))
              << "unsupported: arithmetic on the address of a scalar object";
-    if (!astContext().hasSameUnqualifiedType(pointee, base->getType()))
+    if (!wildcard &&
+        !astContext().hasSameUnqualifiedType(pointee, base->getType()))
       return emitError(bindLoc)
              << "unsupported: pointer type does not match its target object";
   }
@@ -7118,7 +7515,9 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
   Value nonNullCell;
   if (region->nullable)
     nonNullCell = createEntryAlloca(loc, builder.getI1Type());
-  pointerLocals[var] = PointerLocalInfo{base, cursorCell, Value(), nonNullCell};
+  PointerLocalInfo info{base, cursorCell, Value(), nonNullCell};
+  info.member = binding.member;
+  pointerLocals[var] = info;
   if (const clang::Expr *init = var->getInit())
     return storePointerAssign(loc, var, init);
   return success();
@@ -7192,8 +7591,46 @@ LogicalResult CImporter::storePointerAssign(Location loc,
                   "to a different pointer variable";
       return success();
     }
+    // A statically-null pointer (a base-less nullable region, CTS-P9)
+    // carries zero runtime state: every source the analysis admitted into
+    // its region is a null constant or another statically-null pointer,
+    // so the assignment is a no-op.
+    if (ptr->hasLocalStorage() &&
+        isStaticallyNullRegion(pointerRegions.regionOf(ptr)))
+      return success();
     return emitError(loc) << "unsupported: assignment to pointer variable '"
                           << ptr->getName() << "' with no known target object";
+  }
+  // A pointer-typed conditional is a pointer source (CTS-P9): each arm
+  // assigns in its own block, so the null/address state merges through the
+  // pointer's own flag, discriminant, and cursor cells — no new
+  // representation. The implicit `void *` bitcast Sema wraps a mixed-arm
+  // conditional in peels first.
+  {
+    const clang::Expr *peeled = stripTrivia(rhs);
+    while (const clang::Expr *sub = peelPointerCast(astContext(), peeled))
+      peeled = stripTrivia(sub);
+    if (const auto *conditional =
+            llvm::dyn_cast<clang::ConditionalOperator>(peeled)) {
+      FailureOr<Value> condition = emitCondition(conditional->getCond());
+      if (failed(condition))
+        return failure();
+      Block *trueBlock = createBlock();
+      Block *falseBlock = createBlock();
+      Block *endBlock = createBlock();
+      builder.create<cf::CondBranchOp>(loc, *condition, trueBlock,
+                                       ValueRange(), falseBlock, ValueRange());
+      builder.setInsertionPointToEnd(trueBlock);
+      if (failed(storePointerAssign(loc, ptr, conditional->getTrueExpr())))
+        return failure();
+      builder.create<cf::BranchOp>(loc, endBlock);
+      builder.setInsertionPointToEnd(falseBlock);
+      if (failed(storePointerAssign(loc, ptr, conditional->getFalseExpr())))
+        return failure();
+      builder.create<cf::BranchOp>(loc, endBlock);
+      builder.setInsertionPointToEnd(endBlock);
+      return success();
+    }
   }
   const PointerLocalInfo &info = it->second;
   // `p = NULL` selects the None side of the Option-of-cursor model: only
@@ -7225,7 +7662,8 @@ LogicalResult CImporter::storePointerAssign(Location loc,
                   "different object";
       index = value->baseIndex;
     } else {
-      const auto *found = llvm::find(info.multiBases, value->base);
+      const auto *found = llvm::find(
+          info.multiBases, PointerBaseKey{value->base, value->member});
       if (!value->base || found == info.multiBases.end()) // Defensive.
         return emitError(loc)
                << "unsupported: pointer assignment would rebind to a "
@@ -7242,7 +7680,7 @@ LogicalResult CImporter::storePointerAssign(Location loc,
     builder.create<memref::StoreOp>(loc, multiCursor, info.cursorCell);
     return success();
   }
-  if (value->base != info.base ||
+  if (value->base != info.base || value->member != info.member ||
       value->literalBacking != info.literalBacking ||
       value->baseIndex) // A multi-base source cannot rebind a single-base
                         // pointer (defensive; regions would have unioned).
@@ -7866,6 +8304,17 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
   FailureOr<Value> value = emitRValue(op->getRHS());
   if (failed(value))
     return failure();
+  // A store through a same-width integer view (`*(unsigned int *)p = u`
+  // over an int base, CTS-P9) casts the value back to the base element
+  // type before assigning: the place is the base element's own place.
+  if (isReinterpretedViewDeref(op->getLHS()))
+    if (auto lvalueType =
+            llvm::dyn_cast<emitrust::LValueType>((*place).getType()))
+      if (lvalueType.getValueType() != (*value).getType())
+        value = builder
+                    .create<emitrust::CastOp>(loc, lvalueType.getValueType(),
+                                              *value)
+                    .getResult();
   if (failed(storeToPlace(loc, *place, *value)))
     return failure();
   if (failed(flushGlobalWriteback(loc, writeback)))
@@ -9113,7 +9562,37 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     FailureOr<Value> place = emitLValue(sub);
     if (failed(place))
       return failure();
-    return loadPlace(loc, *place);
+    Value loaded = loadPlace(loc, *place);
+    // A same-width integer view through a reinterpret-back site
+    // (`u = *(unsigned int *)p` over an int base, CTS-P9) loads the base
+    // element and bitcasts it to the viewed type: Rust's same-width
+    // cross-sign `as` reinterprets the bit pattern, exactly C's
+    // effective-type-compatible read.
+    if (isReinterpretedViewDeref(sub)) {
+      FailureOr<Type> viewed = mapType(cast->getType(), loc);
+      if (failed(viewed))
+        return failure();
+      if (*viewed != loaded.getType())
+        loaded = builder.create<emitrust::CastOp>(loc, *viewed, loaded)
+                     .getResult();
+    }
+    return loaded;
+  }
+  case clang::CK_PointerToIntegral: {
+    // `(int) q` of a STATICALLY NULL pointer (a base-less nullable
+    // region, CTS-P9) is the integer 0 — no address value ever exists to
+    // materialize. Every other pointer-to-int cast keeps its located
+    // rejection: a pointer with a real base object would need a genuine
+    // address value.
+    if (isDataPointer(sub->getType()) && isStaticallyNullPointerExpr(sub)) {
+      FailureOr<Type> mapped = mapType(cast->getType(), loc);
+      if (failed(mapped))
+        return failure();
+      if (llvm::isa<IntegerType>(*mapped))
+        return createScalarIntConstant(loc, *mapped, 0);
+    }
+    return emitError(loc) << "unsupported cast ("
+                          << cast->getCastKindName() << ")";
   }
   case clang::CK_IntegralCast: {
     // Integer-to-enum: a reference to an enumerator of the destination
@@ -9555,6 +10034,13 @@ FailureOr<Value> CImporter::emitUnaryRValue(const clang::UnaryOperator *op) {
     return builder.create<arith::XOrIOp>(loc, *value, allOnes).getResult();
   }
   case clang::UO_Deref:
+    // A statement-position dereference of an uncast `void *` (a GNU
+    // extension in C) never names an element type at all (CTS-P9); it is
+    // rejected rather than silently discarded.
+    if (op->getType().getCanonicalType()->isVoidType() &&
+        isPointerType(op->getSubExpr()->getType()))
+      return emitError(loc) << "unsupported: dereference of a 'void *' "
+                               "pointer";
     return emitError(loc) << "unsupported dereference in this context";
   default:
     return emitError(loc) << "unsupported unary operator";
@@ -9671,6 +10157,12 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
       FailureOr<PtrExprValue> pointer = emitPointerRValue(pointerSide);
       if (failed(pointer))
         return failure();
+      // A statically-null pointer (base-less nullable region, CTS-P9)
+      // decomposes to nothing at all; its null test folds to the constant
+      // truth of `null == null`.
+      if (!pointer->base && !pointer->literalBacking && !pointer->baseIndex &&
+          !pointer->nonNull)
+        return createBoolConstant(loc, isEq);
       if (!pointer->nonNull) // Statically non-null: the check folds.
         return createBoolConstant(loc, !isEq);
       if (isEq) {
@@ -9708,7 +10200,8 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
                          const PtrExprValue &other) -> Value {
         if (side.baseIndex)
           return side.baseIndex;
-        const auto *found = llvm::find(other.multiBases, side.base);
+        const auto *found = llvm::find(other.multiBases,
+                                       PointerBaseKey{side.base, side.member});
         if (!side.base || found == other.multiBases.end())
           return Value();
         return createIntConstant(loc, builder.getIntegerType(32),
@@ -9747,7 +10240,8 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
       Value truth = createBoolConstant(loc, true);
       return builder.create<arith::XOrIOp>(loc, equal, truth).getResult();
     }
-    if (lhs->base != rhs->base || lhs->literalBacking != rhs->literalBacking)
+    if (lhs->base != rhs->base || lhs->member != rhs->member ||
+        lhs->literalBacking != rhs->literalBacking)
       return emitError(loc)
              << "unsupported: comparison of pointers into different objects";
     Type cursorType = builder.getIntegerType(64);
@@ -10759,9 +11253,66 @@ bool CImporter::isDecomposedPointerExpr(const clang::Expr *expr) const {
 }
 
 bool CImporter::isNullPointerConstantExpr(const clang::Expr *expr) const {
-  return expr->isNullPointerConstant(astContext(),
-                                     clang::Expr::NPC_NeverValueDependent) !=
-         clang::Expr::NPCK_NotNull;
+  if (expr->isNullPointerConstant(astContext(),
+                                  clang::Expr::NPC_NeverValueDependent) !=
+      clang::Expr::NPCK_NotNull)
+    return true;
+  // `(const void *) 0`: only the UNQUALIFIED `void *` cast is a formal
+  // null pointer constant (C11 6.3.2.3p3), but the qualified cast still
+  // yields the null pointer value; clang models both as CK_NullToPointer.
+  const auto *cast = llvm::dyn_cast<clang::CastExpr>(stripTrivia(expr));
+  return cast && cast->getCastKind() == clang::CK_NullToPointer;
+}
+
+bool CImporter::isStaticallyNullPointerExpr(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const clang::Expr *sub = peelPointerCast(astContext(), e))
+    e = stripTrivia(sub);
+  const clang::VarDecl *var = asLoadedLocalVarRef(e);
+  if (!var || !pointerRegions.tracks(var))
+    return false;
+  return isStaticallyNullRegion(pointerRegions.regionOf(var));
+}
+
+bool CImporter::isReinterpretedViewDeref(const clang::Expr *expr) {
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
+  if (!unary || unary->getOpcode() != clang::UO_Deref)
+    return false;
+  return isDecomposedPointerExpr(unary->getSubExpr()) &&
+         peelsReinterpretingPointerCast(astContext(), unary->getSubExpr());
+}
+
+std::optional<clang::QualType>
+CImporter::regionElementType(const PtrExprValue &pointer,
+                             clang::QualType viewed) {
+  const clang::VarDecl *var = pointer.base;
+  const clang::FieldDecl *member = pointer.member;
+  if (!var && !pointer.multiBases.empty()) {
+    // The multi-base validation admits one uniform element type across
+    // the closed set of bases, so the first base is representative.
+    var = pointer.multiBases.front().var;
+    member = pointer.multiBases.front().member;
+  }
+  if (member)
+    return member->getType();
+  if (var) {
+    clang::QualType baseType = var->getType();
+    if (isPointerType(baseType)) // Slice-classified parameter base.
+      return baseType.getCanonicalType()->getPointeeType();
+    // Prefer the array level matching the viewed type (a row pointer);
+    // otherwise the innermost element is the region's element unit.
+    clang::QualType element = baseType;
+    while (const clang::ConstantArrayType *level =
+               astContext().getAsConstantArrayType(element)) {
+      element = level->getElementType();
+      if (astContext().hasSameUnqualifiedType(viewed, element))
+        return element;
+    }
+    return element;
+  }
+  if (pointer.literalBacking) // String-literal regions are byte runs.
+    return astContext().CharTy;
+  return std::nullopt; // Base-less: the deref rejects downstream.
 }
 
 FailureOr<Value> CImporter::emitPointerTruth(const clang::Expr *expr) {
@@ -10773,9 +11324,13 @@ FailureOr<Value> CImporter::emitPointerTruth(const clang::Expr *expr) {
     return failure();
   // A pointer of a nullable region tests its Option-of-cursor
   // discriminant; a statically non-null pointer folds to true (every
-  // address a decomposed region holds designates a live object).
+  // address a decomposed region holds designates a live object), and a
+  // statically-null pointer (base-less nullable region, CTS-P9 — the
+  // empty decomposition) folds to false.
   if (pointer->nonNull)
     return pointer->nonNull;
+  if (!pointer->base && !pointer->literalBacking && !pointer->baseIndex)
+    return createBoolConstant(loc, false);
   return createBoolConstant(loc, true);
 }
 
@@ -10784,17 +11339,32 @@ CImporter::secondOrderDerefVar(const clang::Expr *expr) const {
   const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
   if (!unary || unary->getOpcode() != clang::UO_Deref)
     return nullptr;
-  const clang::VarDecl *var = asLoadedLocalVarRef(unary->getSubExpr());
+  // `*(int **)pp` on a `void **` peels the reinterpret-back cast: the
+  // pointee-wildcard rule applies at any pointer depth (CTS-P9), and the
+  // selected first-order pointer's own region carries the element type
+  // the final dereference checks against.
+  const clang::Expr *sub = stripTrivia(unary->getSubExpr());
+  while (const clang::Expr *peeled = peelPointerCast(astContext(), sub))
+    sub = stripTrivia(peeled);
+  const clang::VarDecl *var = asLoadedLocalVarRef(sub);
   return var && pointerRegions.tracksSecondOrder(var) ? var : nullptr;
 }
 
 FailureOr<PtrExprValue>
 CImporter::emitPointerLocalRead(Location loc, const clang::VarDecl *var) {
   auto it = pointerLocals.find(var);
-  if (it == pointerLocals.end())
+  if (it == pointerLocals.end()) {
+    // A statically-null pointer (base-less nullable region, CTS-P9)
+    // carries zero runtime state; its value is the empty decomposition,
+    // which truth tests, null comparisons, and pointer-to-int casts fold
+    // and which any dereference rejects as only-ever-null.
+    if (var->hasLocalStorage() &&
+        isStaticallyNullRegion(pointerRegions.regionOf(var)))
+      return PtrExprValue{};
     return emitError(loc) << "unsupported: pointer variable '"
                           << var->getName()
                           << "' has no known target object";
+  }
   const PointerLocalInfo &info = it->second;
   Value cursor;
   if (info.cursorCell)
@@ -10807,8 +11377,10 @@ CImporter::emitPointerLocalRead(Location loc, const clang::VarDecl *var) {
   Value baseIndex;
   if (info.baseIndexCell)
     baseIndex = loadPlace(loc, info.baseIndexCell);
-  return PtrExprValue{info.base,   cursor,    info.literalBacking,
-                      nonNull,     baseIndex, info.multiBases};
+  PtrExprValue value{info.base,   cursor,    info.literalBacking,
+                     nonNull,     baseIndex, info.multiBases};
+  value.member = info.member;
+  return value;
 }
 
 FailureOr<PtrExprValue>
@@ -10826,10 +11398,14 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
     return emitError(loc)
            << "unsupported: null pointer constant in a pointer expression";
 
-  // A qualification-preserving explicit cast (`(int *)p` on an `int *`
-  // decomposition) changes nothing the decomposition tracks; peel it.
-  // Reinterpreting casts fall through to the located rejection below.
-  if (const clang::Expr *peeled = peeledQualificationCast(astContext(), e))
+  // A decomposition-transparent pointer cast — a qualification adjustment
+  // (`(int *)p` on an `int *` decomposition) or a `void *`-mediated cast
+  // (the pointee-wildcard rule, CTS-P9) — changes nothing the
+  // decomposition tracks; peel it. Whether a reinterpret-back site
+  // `*(T *)p` type-checks against the region's base element type is the
+  // deref emission's job. Genuinely reinterpreting casts fall through to
+  // the located rejection below.
+  if (const clang::Expr *peeled = peelPointerCast(astContext(), e))
     return emitPointerRValue(peeled);
 
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
@@ -10883,7 +11459,10 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         return emitError(loc)
                << "unsupported use of pointer-to-pointer variable '"
                << var->getName() << "'";
-      if (pointerLocals.contains(var))
+      // A statically-null pointer (CTS-P9) has no pointerLocals entry at
+      // all; emitPointerLocalRead folds it to the empty decomposition.
+      if (pointerLocals.contains(var) ||
+          (var->hasLocalStorage() && pointerRegions.tracks(var)))
         return emitPointerLocalRead(loc, var);
       // A read of a pointer-typed global (CTS-P4): its base is static and
       // its cursor is the current value of the cursor global (none for a
@@ -10969,6 +11548,23 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         // it by the (row-scaled) index; a literal-backed base keeps its
         // read-only backing through the decomposition.
         return emitSubscriptPointer(subscript);
+      }
+      if (const auto *memberExpr = llvm::dyn_cast<clang::MemberExpr>(sub)) {
+        // `&s.b` / `&g.b`: the degenerate (cursor-less) member-rooted form
+        // of the struct object (CTS-P9). Union storage has no unaliased
+        // member place to root a region at.
+        MemberAddressTarget target = classifyMemberAddress(memberExpr);
+        if (target.touchesUnion)
+          return emitError(loc)
+                 << "unsupported: taking the address of a union member";
+        if (target.root) {
+          const clang::VarDecl *root = target.root;
+          if (!root->hasLocalStorage())
+            root = root->getCanonicalDecl();
+          PtrExprValue value{root, Value()};
+          value.member = target.field;
+          return value;
+        }
       }
       return emitError(loc) << "unsupported pointer target expression";
     }
@@ -11098,10 +11694,13 @@ CImporter::emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript) {
     // The address of a scalar admits only the constant-zero index.
     clang::Expr::EvalResult indexValue;
     if (subscript->getIdx()->EvaluateAsInt(indexValue, astContext()) &&
-        indexValue.Val.getInt() == 0)
-      return PtrExprValue{pointer->base, Value(), pointer->literalBacking,
-                          pointer->nonNull, pointer->baseIndex,
-                          pointer->multiBases};
+        indexValue.Val.getInt() == 0) {
+      PtrExprValue degenerate{pointer->base, Value(),
+                              pointer->literalBacking, pointer->nonNull,
+                              pointer->baseIndex, pointer->multiBases};
+      degenerate.member = pointer->member;
+      return degenerate;
+    }
     return emitError(loc) << "unsupported: arithmetic on the address "
                              "of a scalar object";
   }
@@ -11196,9 +11795,32 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
                        : createEntryAlloca(loc, pointeeType);
     if (failed(emitMultiBaseDispatch(
             loc, pointer.multiBases, pointer.baseIndex,
-            [&](const clang::VarDecl *base) -> LogicalResult {
-              FailureOr<Value> element = materializeLocalElementPlace(
-                  loc, base, pointer.cursor, pointeeType);
+            [&](const PointerBaseKey &base) -> LogicalResult {
+              // A local base resolves to its own (member-projected)
+              // element place; a global-member base (CTS-P9) stages the
+              // global's whole value afresh and projects the member — the
+              // read-side half of the staged-copy model (the write flush
+              // dispatches the store-back, see `flushGlobalWriteback`).
+              FailureOr<Value> element;
+              if (base.var->hasLocalStorage()) {
+                element = materializeLocalElementPlace(
+                    loc, base, pointer.cursor, pointeeType);
+              } else {
+                FailureOr<std::pair<Value, std::string>> stagedGlobal =
+                    stageGlobalCopy(loc, base.var);
+                if (failed(stagedGlobal))
+                  return failure();
+                Value place = stagedGlobal->first;
+                if (base.member) {
+                  FailureOr<Value> memberPlace =
+                      projectMemberPlace(loc, place, base.member);
+                  if (failed(memberPlace))
+                    return failure();
+                  place = *memberPlace;
+                }
+                element = refineElementPlace(loc, place, pointer.cursor,
+                                             pointeeType);
+              }
               if (failed(element))
                 return failure();
               return storeToPlace(loc, staged, loadPlace(loc, *element));
@@ -11223,38 +11845,71 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
     // local copy — exactly the staged-copy model of direct global element
     // accesses; a write context passes `writeback` and stores the copy
     // back afterwards.
-    std::string symbol;
-    Type stagedType;
-    if (const GlobalInfo *global =
-            pointer.base ? lookupGlobal(pointer.base) : nullptr) {
-      symbol = global->symbol;
-      stagedType = global->type;
-    } else {
-      auto globalIt = pointer.base
-                          ? pointerGlobals.find(pointer.base->getCanonicalDecl())
-                          : pointerGlobals.end();
-      if (globalIt == pointerGlobals.end() ||
-          globalIt->second.backingSymbol.empty())
-        return emitError(loc) << "unsupported: pointer target '"
-                              << pointer.base->getName()
-                              << "' is not an importable place";
-      symbol = globalIt->second.backingSymbol;
-      stagedType = globalIt->second.backingType;
-    }
-    Value staged = builder
-                       .create<emitrust::VariableOp>(
-                           loc, emitrust::LValueType::get(stagedType))
-                       .getResult();
-    Value current = builder
-                        .create<emitrust::GlobalLoadOp>(loc, stagedType,
-                                                        globalSymbol(symbol))
-                        .getResult();
-    builder.create<emitrust::AssignOp>(loc, staged, current);
+    FailureOr<std::pair<Value, std::string>> staged =
+        stageGlobalCopy(loc, pointer.base);
+    if (failed(staged))
+      return failure();
     if (writeback)
-      *writeback = GlobalWriteback{staged, symbol};
-    basePlace = staged;
+      *writeback = GlobalWriteback{staged->first, staged->second};
+    basePlace = staged->first;
+  }
+  // A `&struct.member` base (CTS-P9) resolves to the member's projection
+  // on the object's place (or on its staged copy, whose whole value the
+  // writeback stores back).
+  if (pointer.member) {
+    FailureOr<Value> memberPlace =
+        projectMemberPlace(loc, basePlace, pointer.member);
+    if (failed(memberPlace))
+      return failure();
+    basePlace = *memberPlace;
   }
   return refineElementPlace(loc, basePlace, pointer.cursor, pointeeType);
+}
+
+FailureOr<std::pair<Value, std::string>>
+CImporter::stageGlobalCopy(Location loc, const clang::VarDecl *base) {
+  std::string symbol;
+  Type stagedType;
+  if (const GlobalInfo *global = base ? lookupGlobal(base) : nullptr) {
+    symbol = global->symbol;
+    stagedType = global->type;
+  } else {
+    auto globalIt = base ? pointerGlobals.find(base->getCanonicalDecl())
+                         : pointerGlobals.end();
+    if (globalIt == pointerGlobals.end() ||
+        globalIt->second.backingSymbol.empty())
+      return emitError(loc) << "unsupported: pointer target '"
+                            << (base ? base->getName() : llvm::StringRef())
+                            << "' is not an importable place";
+    symbol = globalIt->second.backingSymbol;
+    stagedType = globalIt->second.backingType;
+  }
+  Value staged = builder
+                     .create<emitrust::VariableOp>(
+                         loc, emitrust::LValueType::get(stagedType))
+                     .getResult();
+  Value current = builder
+                      .create<emitrust::GlobalLoadOp>(loc, stagedType,
+                                                      globalSymbol(symbol))
+                      .getResult();
+  builder.create<emitrust::AssignOp>(loc, staged, current);
+  return std::make_pair(staged, symbol);
+}
+
+FailureOr<Value>
+CImporter::projectMemberPlace(Location loc, Value basePlace,
+                              const clang::FieldDecl *field) {
+  auto baseType = llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
+  if (!baseType || !llvm::isa<emitrust::StructType>(baseType.getValueType()))
+    return emitError(loc) << "unsupported member access base";
+  FailureOr<Type> fieldType = mapType(field->getType(), loc);
+  if (failed(fieldType))
+    return failure();
+  return builder
+      .create<emitrust::MemberOp>(
+          loc, emitrust::LValueType::get(*fieldType), basePlace,
+          builder.getStringAttr(flattenedFieldName(field)))
+      .getResult();
 }
 
 FailureOr<Value> CImporter::refineElementPlace(Location loc, Value basePlace,
@@ -11307,20 +11962,31 @@ FailureOr<Value> CImporter::refineElementPlace(Location loc, Value basePlace,
 
 FailureOr<Value>
 CImporter::materializeLocalElementPlace(Location loc,
-                                        const clang::VarDecl *base,
+                                        const PointerBaseKey &base,
                                         Value cursor, Type pointeeType) {
-  auto it = symbols.find(base);
+  auto it = symbols.find(base.var);
   if (it == symbols.end())
     return emitError(loc) << "unsupported: pointer target '"
-                          << base->getName()
+                          << base.var->getName()
                           << "' is not an importable place";
-  return refineElementPlace(loc, it->second, cursor, pointeeType);
+  Value place = it->second;
+  if (base.member) {
+    FailureOr<Value> memberPlace = projectMemberPlace(loc, place, base.member);
+    if (failed(memberPlace))
+      return failure();
+    place = *memberPlace;
+  }
+  return refineElementPlace(loc, place, cursor, pointeeType);
 }
 
 LogicalResult CImporter::emitMultiBaseDispatch(
-    Location loc, ArrayRef<const clang::VarDecl *> bases, Value baseIndex,
-    llvm::function_ref<LogicalResult(const clang::VarDecl *)> emitArm) {
-  Block *mergeBlock = createBlock();
+    Location loc, ArrayRef<PointerBaseKey> bases, Value baseIndex,
+    llvm::function_ref<LogicalResult(const PointerBaseKey &)> emitArm) {
+  // Blocks are created in flow order — arm 0, the next test, ..., with
+  // the continuation block last — so the printed block order matches the
+  // dispatch order. The branches into the continuation are added after
+  // every arm is emitted (the block does not exist earlier).
+  SmallVector<Block *, 4> exits;
   for (auto [index, base] : llvm::enumerate(bases)) {
     Block *nextBlock = nullptr;
     if (index + 1 < bases.size()) {
@@ -11342,9 +12008,14 @@ LogicalResult CImporter::emitMultiBaseDispatch(
     // set of bases.
     if (failed(emitArm(base)))
       return failure();
-    builder.create<cf::BranchOp>(loc, mergeBlock);
+    exits.push_back(builder.getInsertionBlock());
     if (nextBlock)
       builder.setInsertionPointToEnd(nextBlock);
+  }
+  Block *mergeBlock = createBlock();
+  for (Block *exit : exits) {
+    builder.setInsertionPointToEnd(exit);
+    builder.create<cf::BranchOp>(loc, mergeBlock);
   }
   builder.setInsertionPointToEnd(mergeBlock);
   return success();
@@ -11370,7 +12041,8 @@ CImporter::emitPointerDifference(const clang::BinaryOperator *op) {
   if (lhs->baseIndex || rhs->baseIndex)
     return emitError(loc)
            << "unsupported: difference of pointers bound to multiple objects";
-  if (lhs->base != rhs->base || lhs->literalBacking != rhs->literalBacking)
+  if (lhs->base != rhs->base || lhs->member != rhs->member ||
+      lhs->literalBacking != rhs->literalBacking)
     return emitError(loc)
            << "unsupported: difference of pointers into different objects";
   // C defines pointer difference only for pointers into the same array; a
@@ -11567,6 +12239,12 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
 
   if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
     if (unary->getOpcode() == clang::UO_Deref) {
+      // Dereferencing a `void *` without a reinterpret-back cast (a GNU
+      // extension) never names an element type at all (CTS-P9).
+      if (unary->getType().getCanonicalType()->isVoidType() &&
+          isPointerType(unary->getSubExpr()->getType()))
+        return emitError(loc)
+               << "unsupported: dereference of a 'void *' pointer";
       // A dereference of a decomposed pointer resolves to a place on its
       // base object; the pointer-parameter reference path is unchanged.
       if (isDecomposedPointerExpr(unary->getSubExpr())) {
@@ -11574,7 +12252,41 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
             emitPointerRValue(unary->getSubExpr());
         if (failed(decomposed))
           return failure();
-        FailureOr<Type> pointeeType = mapType(unary->getType(), loc);
+        // A reinterpret-back site `*(T *)p` (the pointer expression peeled
+        // through a pointee-changing cast, CTS-P9) type-checks T against
+        // the region's base element type: an exact match lowers like a
+        // direct pointer, a same-width integer view resolves the place at
+        // the base element type (the load/store sites wrap the value in an
+        // `emitrust.cast` bitcast), and everything else is rejected.
+        clang::QualType accessType = unary->getType();
+        if (peelsReinterpretingPointerCast(astContext(),
+                                           unary->getSubExpr())) {
+          std::optional<clang::QualType> element =
+              regionElementType(*decomposed, accessType);
+          if (element && !astContext().hasSameUnqualifiedType(accessType,
+                                                              *element)) {
+            bool sameWidthIntView =
+                accessType->isIntegerType() && (*element)->isIntegerType() &&
+                !accessType->isBooleanType() &&
+                !(*element)->isBooleanType() &&
+                astContext().getTypeSize(accessType) ==
+                    astContext().getTypeSize(*element);
+            if (!sameWidthIntView)
+              return emitError(loc)
+                     << "unsupported: pointer cast reinterprets the pointee "
+                        "('"
+                     << accessType.getCanonicalType()
+                            .getUnqualifiedType()
+                            .getAsString()
+                     << "' over '"
+                     << element->getCanonicalType()
+                            .getUnqualifiedType()
+                            .getAsString()
+                     << "' storage)";
+            accessType = *element;
+          }
+        }
+        FailureOr<Type> pointeeType = mapType(accessType, loc);
         if (failed(pointeeType))
           return failure();
         return emitPointerPlace(loc, *decomposed, *pointeeType, writeback);
@@ -11700,7 +12412,13 @@ void loadImportDialects(MLIRContext &context) {
 /// defined, and finally the caller's extra arguments in order.
 std::vector<std::string>
 buildCommandLine(llvm::ArrayRef<std::string> extraClangArgs) {
-  std::vector<std::string> commandLine{"-std=c11"};
+  // C89-era programs (the c-testsuite corpus, e.g. 00144's
+  // `q = i ? 0 : 0`) assign integer expressions to pointers, which clang
+  // >= 15 hard-errors by default; demote it back to the historical
+  // warning — the importer itself classifies integer-to-pointer traffic
+  // and rejects the unsupported shapes with located diagnostics.
+  std::vector<std::string> commandLine{"-std=c11",
+                                       "-Wno-error=int-conversion"};
   std::string resourceDir;
   if (const char *env = std::getenv("EMITRUST_RESOURCE_DIR"))
     resourceDir = env;
