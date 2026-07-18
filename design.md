@@ -265,19 +265,45 @@ lists the lit test file(s) that validate it.
   ordering (RHS/index calls mutating a distinct subobject of the
   assigned global), each modeled on a test/EndToEnd differential test — into UB-free C11 programs whose
   indices and branch conditions are runtime-computed, with printf digests
-  at multiple points and a computed exit code in 0..250. differ.py runs
-  each program through clang and emitrust-cc --emit=crate --build and
-  compares exit code plus stdout bytes: PASS / UNSUPPORTED (rejection is
-  never a failure) / MISCOMPILE (always fatal under --fail-on-miscompile)
-  / HARNESS_BUG (native leg broke: generator defect, always fatal).
-  Determinism contract: a program is a pure function of (seed,
+  at multiple points and a computed exit code in 0..250. The comparison
+  is three-way: genprog carries an exact per-template Python evaluator
+  (explicit wrapping arithmetic — 32-bit two's-complement int/unsigned,
+  64-bit unsigned long, little-endian byte puns asserted at import), so
+  every seed also has a generator-predicted (stdout, exit) pair; no
+  template is oracle-exempt. differ.py runs each program through clang
+  and emitrust-cc --emit=crate --build and classifies: PASS (oracle ==
+  native == transpiled) / UNSUPPORTED (rejection is
+  never a failure) / MISCOMPILE (transpiled diverges while native
+  matches the oracle — always fatal under --fail-on-miscompile)
+  / GENERATOR_ORACLE_BUG (native disagrees with the generator's own
+  expected output: generator UB or evaluator drift, always fatal like
+  HARNESS_BUG) / HARNESS_BUG (native leg broke: generator defect,
+  always fatal).
+  Determinism contract: a program AND its expected-output artifact are a
+  pure function of (seed,
   GENERATOR_VERSION); same seed, same bytes — every finding reproduces
   from its seed number. Triage protocol: shrink with minimize.py
-  (delta-debug over template instances, then value-pool choices), pin the
+  (delta-debug over template instances, then value-pool choices,
+  three-way at every step), pin the
   minimized program as test/EndToEnd/<feature>-fuzz-<seed>.c, fix the
   compiler, re-run the seed range. fuzz-smoke.c (seeds 1-16, REQUIRES:
   cargo) keeps the harness green inside check-emitrust; big campaigns run
   via fuzz_differential.py (see test/Fuzz/README.md).
+
+  Pipeline-level differential abstract interpretation (future work): a
+  deferred complement to seed sampling — run MLIR's integer-range
+  dataflow analysis over the imported IR and run it again after
+  lift-cf-to-scf and the conversion passes, then check refinement at the
+  observation points (printf operands, return values): every post-pass
+  range must be contained in the corresponding pre-pass range, which
+  would catch pass-introduced miscompiles for ALL values rather than
+  for sampled seeds. Honest cost note: emitrust dialect ops currently
+  implement no integer-range transfer functions, so today both sides of
+  that comparison immediately widen to top and the containment check is
+  vacuous (top-vs-top); the idea only pays for itself after investing
+  in per-op transfer functions and range-annotation plumbing at the
+  observation points, which is why it is recorded here as future work
+  rather than folded into this pass.
 - [x] FR-25 Generality beyond test vectors: an adversarial audit plus
   differential stress run over shapes absent from the original tests
   (negative/sparse/INT_MAX-adjacent case labels, nested switch, default

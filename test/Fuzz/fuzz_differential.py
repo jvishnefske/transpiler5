@@ -2,14 +2,17 @@
 """Adversarial differential fuzzing driver for emitrust-cc.
 
 Generates one deterministic C program per seed (genprog.py), runs each
-through the native-vs-transpiled differ (differ.py) on a thread pool,
-and reports PASS / UNSUPPORTED / MISCOMPILE counts plus per-template
-accept-rate statistics.  A template whose PASS+MISCOMPILE rate is ~0%%
+through the three-way differ (differ.py) on a thread pool -- generator
+oracle vs native clang vs transpiled crate -- and reports PASS /
+UNSUPPORTED / MISCOMPILE counts, oracle-agreement statistics, and
+per-template accept-rate statistics.  A template whose PASS+MISCOMPILE rate is ~0%%
 is testing nothing (everything it touches gets rejected) and is
 surfaced in the report.
 
-Any HARNESS_BUG (native leg failed to compile or run) is a generator
-defect and fails the run loudly regardless of flags.  MISCOMPILEs save
+Any HARNESS_BUG (native leg failed to compile or run) or
+GENERATOR_ORACLE_BUG (native leg disagrees with the generator's own
+expected output) is a generator defect and fails the run loudly
+regardless of flags.  MISCOMPILEs save
 artifacts (seed, prog.c, both rc/stdout pairs, crate-dir pointer) under
 --artifacts and fail the run when --fail-on-miscompile is given.
 
@@ -128,7 +131,10 @@ def run_seed(emitrust_cc, clang, seed, seeds_dir, cross_fraction, keep_work):
     source_path = os.path.join(seed_dir, "fuzz_%d.c" % seed)
     with open(source_path, "w", encoding="utf-8") as handle:
         handle.write(program.source)
-    result = differ.run_pair(emitrust_cc, clang, source_path, seed_dir)
+    result = differ.run_pair(
+        emitrust_cc, clang, source_path, seed_dir,
+        expected=(program.expected_exit, program.expected_stdout),
+    )
     if result.status != differ.MISCOMPILE and not keep_work:
         # Drop the bulky build products; keep the source for reference.
         for name in ("native", "crate"):
@@ -161,6 +167,8 @@ def save_artifacts(artifacts_dir, seed, program, result, source_path):
         handle.write(result.native_out)
     with open(os.path.join(bundle, "rust.out"), "wb") as handle:
         handle.write(result.rust_out)
+    with open(os.path.join(bundle, "expected.out"), "wb") as handle:
+        handle.write(program.expected_stdout)
     return bundle
 
 
@@ -192,10 +200,17 @@ def main(argv):
             )
         )
 
-    counts = {differ.PASS: 0, differ.UNSUPPORTED: 0, differ.MISCOMPILE: 0, differ.HARNESS_BUG: 0}
+    counts = {
+        differ.PASS: 0,
+        differ.UNSUPPORTED: 0,
+        differ.MISCOMPILE: 0,
+        differ.GENERATOR_ORACLE_BUG: 0,
+        differ.HARNESS_BUG: 0,
+    }
     template_stats = {spec.name: {"seeds": 0, "exercised": 0} for spec in genprog.TEMPLATES}
     miscompiles = []
     harness_bugs = []
+    oracle_bugs = []
     for seed, program, result, source_path in results:
         counts[result.status] += 1
         for name in set(program.template_names):
@@ -206,9 +221,17 @@ def main(argv):
             miscompiles.append((seed, program, result, source_path))
         elif result.status == differ.HARNESS_BUG:
             harness_bugs.append((seed, result))
+        elif result.status == differ.GENERATOR_ORACLE_BUG:
+            oracle_bugs.append((seed, program, result))
 
     for seed, result in harness_bugs:
         print("HARNESS_BUG seed=%d: %s" % (seed, result.detail))
+    for seed, program, result in oracle_bugs:
+        print(
+            "GENERATOR_ORACLE_BUG seed=%d templates=%s"
+            % (seed, ",".join(program.template_names))
+        )
+        print("  " + result.detail.replace("\n", "\n  "))
     for seed, program, result, _source in miscompiles:
         print("MISCOMPILE seed=%d templates=%s" % (seed, ",".join(program.template_names)))
         print("  " + result.detail.replace("\n", "\n  "))
@@ -233,22 +256,39 @@ def main(argv):
             % ", ".join(dead_templates)
         )
 
+    # Oracle agreement: every seed whose native leg ran was checked against
+    # the generator oracle; PASS and MISCOMPILE both mean the native leg
+    # agreed with it.
+    oracle_checked = counts[differ.PASS] + counts[differ.MISCOMPILE] + counts[
+        differ.GENERATOR_ORACLE_BUG
+    ]
+    oracle_agreed = counts[differ.PASS] + counts[differ.MISCOMPILE]
+    if oracle_checked:
+        print(
+            "oracle agreement: %d/%d native runs matched the generator oracle (%.1f%%)"
+            % (oracle_agreed, oracle_checked, 100.0 * oracle_agreed / oracle_checked)
+        )
+
     print(
-        "\nsummary: seeds=%d pass=%d unsupported=%d miscompile=%d harness_bug=%d"
-        " (generator v%s, cross-fraction %.2f)"
+        "\nsummary: seeds=%d pass=%d unsupported=%d miscompile=%d"
+        " oracle_bug=%d harness_bug=%d (generator v%s, cross-fraction %.2f)"
         % (
             len(seeds),
             counts[differ.PASS],
             counts[differ.UNSUPPORTED],
             counts[differ.MISCOMPILE],
+            counts[differ.GENERATOR_ORACLE_BUG],
             counts[differ.HARNESS_BUG],
             genprog.GENERATOR_VERSION,
             args.cross_fraction,
         )
     )
 
-    if harness_bugs:
-        print("FAIL: %d HARNESS_BUG(s) -- generator defect, fix genprog.py" % len(harness_bugs))
+    if harness_bugs or oracle_bugs:
+        print(
+            "FAIL: %d HARNESS_BUG(s), %d GENERATOR_ORACLE_BUG(s) -- generator"
+            " defect, fix genprog.py" % (len(harness_bugs), len(oracle_bugs))
+        )
         return 2
     if miscompiles and args.fail_on_miscompile:
         print(

@@ -70,9 +70,17 @@ class Shrinker:
         source_path = os.path.join(step_dir, "fuzz_%d.c" % self.seed)
         with open(source_path, "w", encoding="utf-8") as handle:
             handle.write(genprog.render_plan(plan))
-        result = differ.run_pair(self.emitrust_cc, self.clang, source_path, step_dir)
-        if result.status == differ.HARNESS_BUG:
-            raise SystemExit("error: HARNESS_BUG while shrinking: %s" % result.detail)
+        # Three-way even while shrinking: every candidate must diverge from
+        # a native leg that the generator oracle itself vouches for.
+        expected_stdout, expected_exit = genprog.evaluate_plan(plan)
+        result = differ.run_pair(
+            self.emitrust_cc, self.clang, source_path, step_dir,
+            expected=(expected_exit, expected_stdout),
+        )
+        if result.status in (differ.HARNESS_BUG, differ.GENERATOR_ORACLE_BUG):
+            raise SystemExit(
+                "error: %s while shrinking: %s" % (result.status, result.detail)
+            )
         return result.status == differ.MISCOMPILE
 
 
