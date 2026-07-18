@@ -441,6 +441,8 @@ lists the lit test file(s) that validate it.
   (test/Dialect/EmitRust/ops.mlir, invalid.mlir,
   test/Conversion/FuncToEmitRust/impl.mlir, test/Target/Rust/impl.mlir,
   test/Import/C/owners.c, owners-fallback.c, test/EndToEnd/owners.c)
+  S1b traversal fusion deferred: changes inter-analysis ordering (the
+  Pass-A planners share their scaffold but keep separate TU walks).
 
 ## C99 Support Roadmap
 
