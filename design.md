@@ -1141,6 +1141,13 @@ observed when C99-33 + C99-47 together unlocked 00215).
   pointers-fnptr-slice.c; rustc-level differential
   test/EndToEnd/pointers-global.c with data-dependent cursor updates
   across calls)
+  (CTS-P10 interaction: the "passing a pointer into a global variable to
+  a function" rejection is retired ONLY for the all-global cell-slice
+  parameter class (see CTS-P6 below) — an argument mediated by a
+  pointer-typed global (globals-pointer-invalid.c PASSFN) or by a local
+  pointer into a global (pointers-local-invalid.c GLOBAL) keeps the
+  staged-copy rejection verbatim, because those flows are outside the
+  direct-decay/parameter-forwarding shapes the cell-slice class admits.)
 - [x] CTS-P5 (2) Pointer-to-pointer values (`&p`, `**p`): second-order
   cursors over a region whose elements are themselves (base, cursor)
   pairs (C99-43). Implemented as the degenerate one-cell region of
@@ -1160,10 +1167,13 @@ observed when C99-33 + C99-47 together unlocked 00215).
   (test/Import/C/pointers-ptr-to-ptr.c, pointers-local-invalid.c;
   rustc-level differential test/EndToEnd/pointers-ptr-to-ptr.c with
   data-dependent re-pointing through `*pp`)
-- [ ] CTS-P6 (2) Pointers into global aggregates: same borrow-escape
+- [x] CTS-P6 (2) Pointers into global aggregates: same borrow-escape
   problem as CTS-P4; a global array base must be readable/writable
   through an index cursor without holding a borrow across statements.
   (00181.c, 00217.c)
+  (Completed by the CTS-P10 cell-slice class and the CTS-P11 byte puns —
+  see the resolution note after the CTS-P9 extension below. Ledger
+  204 -> 206 passed / 14 unsupported / 0 miscompiled.)
   (Partial: a LOCAL pointer bound into a global aggregate (decay,
   `&garr[i]`, or `&gx`) now decomposes exactly like any Phase-1a local —
   its cursor stays a local i64 cell, so no borrow of the global is ever
@@ -1211,6 +1221,67 @@ observed when C99-33 + C99-47 together unlocked 00215).
   pointers-member-base-invalid.c pin the shapes, and the rustc-level
   differential test/EndToEnd/pointers-member-base.c rebinds the pointer
   at a data-dependent loop iteration.)
+  (CTS-P10 resolution — cell-slice parameters, flips 00181: a pointer
+  parameter whose interprocedural class is backed ONLY by mutable global
+  arrays of one scalar element type now lowers to the shared
+  `!emitrust.ref<!emitrust.cell_slice<T>>`, rendered
+  `&[std::cell::Cell<T>]`. This is the coherence-sound choice the staged
+  copy cannot make: 00181's Move mutates through its parameters and then
+  calls PrintAll, which reads the SAME globals directly mid-call —
+  `emitrust.cell_get`/`cell_set` and `global_load`/`global_store` hit
+  the same thread-local Cell, so every write is observed. Pass A
+  (`planCellSlices`) classifies via a union-find over exactly two
+  argument shapes (direct global-array decay, parameter forwarding —
+  which is what makes Hanoi's PERMUTED recursion classify: shared
+  references are freely duplicable, no reborrow discipline). Call sites
+  nest one `emitrust.global_cells` region per distinct global argument
+  (leftmost outermost), rendered as nested thread-local `.with`
+  accessors flattening through `as_slice_of_cells`, with a scalar result
+  flowing out through a staging variable; element accesses in the callee
+  are cell_get/cell_set on the reference itself (no lvalue staging, no
+  cursor cell); forward prototypes classify through the definition
+  exactly like Phase 1b. The historical "passing a pointer into a
+  global variable to a function" rejection is retired for THIS class
+  only; the pinned boundaries are located rejections with class-precise
+  wordings: "pointer parameter would join global 'G' and local object
+  'larr' into one region" (mixed classes stay out — one type cannot be
+  both `&mut [T]` and `&[Cell<T>]`) and "nullable pointer parameter
+  backed by a global variable" (Option wrapping and the global_cells
+  borrow discipline do not compose in v1).
+  Tests: test/Dialect/EmitRust/cell-slice.mlir (round-trip),
+  test/Target/Rust/cell-slice.mlir (rendering),
+  test/Import/C/pointers-global-args.c and
+  pointers-global-args-invalid.c, and the rustc-level differential
+  test/EndToEnd/pointers-global-args.c (mini-Hanoi: permuted recursive
+  forwarding, direct global reads inside Move while cell borrows are
+  live, a data-dependent disc count, and a Move return value flowing
+  out of the .with nesting; greps pin as_slice_of_cells,
+  &[std::cell::Cell<i32>], .with(, and the absence of unsafe).)
+  (CTS-P11 resolution — byte puns over i8 regions, flips 00217: a
+  wider-than-element reinterpreting deref `*(T *)p` over a region whose
+  base element is a byte (a C char array) widens to a sizeof(T)-byte
+  access at the runtime cursor: loads gather the bytes and combine with
+  `T::from_ne_bytes`, stores split with `T::to_ne_bytes` and scatter
+  back, and compound assignments read-modify-write the same window
+  (00217's `*(unsigned*)(data + r) += a - b` with its wrapping u32
+  delta). The direct pun cast `(unsigned *)(char *)...` is stripped only
+  at dereference sites (`stripObjectPointerCasts`); the general
+  decomposition still refuses to bind pointers through it. Global char
+  arrays ride the ordinary staged-copy + writeback model, so a `%s`
+  print of the global (extended to pointers into global char arrays)
+  sees every punned byte. Boundaries pinned by test: a
+  compile-time-constant offset whose window overruns the array rejects
+  with "4-byte access at offset 5 runs past the end of 'buf' (8
+  bytes)", and wide views over non-byte bases keep the existing
+  "pointer cast reinterprets the pointee ('long long' over 'int'
+  storage)" family (the deref type-check now also covers direct,
+  non-void-mediated pun casts).
+  Tests: test/Import/C/pointers-reinterpret.c and
+  pointers-reinterpret-invalid.c, and the rustc-level differential
+  test/EndToEnd/pointers-reinterpret.c (runtime offsets, partially
+  overlapping wide stores, per-element/wide-view mixing, and the exact
+  00217 shape over a global char array through a char* local; greps pin
+  u32::from_ne_bytes, to_ne_bytes, and the absence of unsafe).)
 - [x] CTS-P7 (2) One pointer ranging over several objects (`p = &x;
   ... p = &y;`): PointerRegionAnalysis unions the objects into one
   region today and rejects; needs either region materialization (copy

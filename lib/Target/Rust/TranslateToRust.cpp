@@ -226,6 +226,18 @@ private:
   LogicalResult emitGlobalLoad(emitrust::GlobalLoadOp loadOp);
   /// Emits `NAME.with(|__emitrust_tl| __emitrust_tl.set(vX));`.
   LogicalResult emitGlobalStore(emitrust::GlobalStoreOp storeOp);
+  /// Emits `let vN: T = vS[vI as usize].get();`.
+  LogicalResult emitCellGet(emitrust::CellGetOp getOp);
+  /// Emits `vS[vI as usize].set(vV);`.
+  LogicalResult emitCellSet(emitrust::CellSetOp setOp);
+  /// Emits the global's `with` accessor wrapping the region body:
+  /// `NAME.with(|__emitrust_tl| {`, an unsizing coercion of the binder to
+  /// `&std::cell::Cell<[T]>`, the region argument's
+  /// `let vN: &[std::cell::Cell<T>] = __emitrust_tl.as_slice_of_cells();`
+  /// binding, the region's statements, and the closing `});`. Nested
+  /// `emitrust.global_cells` render as nested `with` closures, so no
+  /// borrow ever escapes its accessor.
+  LogicalResult emitGlobalCells(emitrust::GlobalCellsOp cellsOp);
   /// Emits `let mut vN: T = <init-or-default>;` for a local variable.
   LogicalResult emitVariable(emitrust::VariableOp variableOp);
   /// Emits `let vN: T = <place-expr>;`.
@@ -327,6 +339,15 @@ LogicalResult RustEmitter::emitType(Location loc, Type type) {
     if (failed(emitType(loc, sliceType.getElementType())))
       return failure();
     os << "]";
+    return success();
+  }
+  if (auto cellSliceType = dyn_cast<emitrust::CellSliceType>(type)) {
+    // Unsized; reaches the output only behind the shared reference
+    // (`&[std::cell::Cell<T>]`, always fully qualified).
+    os << "[std::cell::Cell<";
+    if (failed(emitType(loc, cellSliceType.getElementType())))
+      return failure();
+    os << ">]";
     return success();
   }
   if (auto structType = dyn_cast<emitrust::StructType>(type)) {
@@ -1213,6 +1234,71 @@ LogicalResult RustEmitter::emitGlobalStore(emitrust::GlobalStoreOp storeOp) {
   return success();
 }
 
+LogicalResult RustEmitter::emitCellGet(emitrust::CellGetOp getOp) {
+  Operation *op = getOp.getOperation();
+  Location loc = op->getLoc();
+  if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  if (failed(emitOperand(loc, getOp.getSlice())))
+    return failure();
+  os << "[";
+  if (failed(emitOperand(loc, getOp.getIndex())))
+    return failure();
+  os << " as usize].get();\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitCellSet(emitrust::CellSetOp setOp) {
+  Operation *op = setOp.getOperation();
+  Location loc = op->getLoc();
+  if (failed(emitOperand(loc, setOp.getSlice())))
+    return failure();
+  os << "[";
+  if (failed(emitOperand(loc, setOp.getIndex())))
+    return failure();
+  os << " as usize].set(";
+  if (failed(emitOperand(loc, setOp.getValue())))
+    return failure();
+  os << ");\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitGlobalCells(emitrust::GlobalCellsOp cellsOp) {
+  Operation *op = cellsOp.getOperation();
+  Location loc = op->getLoc();
+  FailureOr<emitrust::GlobalOp> global =
+      lookupGlobal(op, cellsOp.getGlobalAttr());
+  if (failed(global))
+    return failure();
+  Block &body = cellsOp.getBody().front();
+  BlockArgument cells = body.getArgument(0);
+  auto refType = cast<emitrust::RefType>(cells.getType());
+  Type elementType =
+      cast<emitrust::CellSliceType>(refType.getPointee()).getElementType();
+
+  os << global->getSymName() << ".with(|__emitrust_tl| {\n";
+  increaseIndent();
+  // Rust resolves `as_slice_of_cells` on `Cell<[T]>` only, and method
+  // lookup performs no unsizing on the wrapped array, so the binder is
+  // coerced to the unsized `&Cell<[T]>` first (the documented
+  // `as_slice_of_cells` idiom).
+  os << "let __emitrust_tl: &std::cell::Cell<[";
+  if (failed(emitType(loc, elementType)))
+    return failure();
+  os << "]> = __emitrust_tl;\n";
+  os << "let " << assignName(cells) << ": ";
+  if (failed(emitType(loc, cells.getType())))
+    return failure();
+  os << " = __emitrust_tl.as_slice_of_cells();\n";
+  for (Operation &child : body) {
+    if (failed(emitOperation(child)))
+      return failure();
+  }
+  decreaseIndent();
+  os << "});\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitVariable(emitrust::VariableOp variableOp) {
   Value result = variableOp.getResult();
   Location loc = variableOp.getLoc();
@@ -1381,6 +1467,13 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
       })
       .Case<emitrust::GlobalStoreOp>([&](emitrust::GlobalStoreOp storeOp) {
         return emitGlobalStore(storeOp);
+      })
+      .Case<emitrust::CellGetOp>(
+          [&](emitrust::CellGetOp getOp) { return emitCellGet(getOp); })
+      .Case<emitrust::CellSetOp>(
+          [&](emitrust::CellSetOp setOp) { return emitCellSet(setOp); })
+      .Case<emitrust::GlobalCellsOp>([&](emitrust::GlobalCellsOp cellsOp) {
+        return emitGlobalCells(cellsOp);
       })
       .Case<emitrust::VariableOp>([&](emitrust::VariableOp variableOp) {
         return emitVariable(variableOp);
