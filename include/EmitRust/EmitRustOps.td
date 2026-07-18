@@ -748,8 +748,9 @@ def EmitRust_VariableOp : EmitRust_Op<"variable"> {
     entry per element (rendered `[e0, e1, ...]`, recursively admitting
     nested ArrayAttr entries). Without an initializer, the variable is
     emitted with the type's default value: `0` for integers and index, `0.0`
-    for floats, `false` for `i1`, `Name::default()` for structs, and
-    `[<element-default>; N]` for arrays.
+    for floats, `false` for `i1`, `Name::default()` for structs,
+    `[<element-default>; N]` for arrays, and `String::new()` for the opaque
+    `String` type (the staging binding of the sprintf lowering).
 
     A variable carrying the `const` marker is never written after its
     initializer; it is emitted as an immutable `let` binding (the backing

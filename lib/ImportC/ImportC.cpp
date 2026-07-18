@@ -219,6 +219,7 @@
 #include "clang/AST/OperationKinds.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/Type.h"
+#include "clang/Basic/Builtins.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Frontend/ASTUnit.h"
 #include "clang/Tooling/CompilationDatabase.h"
@@ -1178,7 +1179,11 @@ private:
 
   /// Imports a function declaration or definition as a `func.func`. C
   /// `main` is renamed to `c_main`. Body-less variadic declarations (such
-  /// as printf's) are skipped; variadic definitions are rejected. A
+  /// as printf's) are skipped; a variadic definition whose body never
+  /// touches va_list imports as its fixed prototype — the named
+  /// parameters only, with call sites dropping effect-free trailing
+  /// extras in `emitCall` (CTS-P9) — while a definition that does use
+  /// va_list is rejected. A
   /// body-less prototype with no definition in this TU is skipped when
   /// nothing in this TU references it (referenced-only policy). A body
   /// replaces a previously imported body-less declaration of the same name.
@@ -1826,6 +1831,34 @@ private:
   /// performs.
   LogicalResult emitPrintf(const clang::CallExpr *call);
 
+  /// Translates the C printf-family format string `literal` into a Rust
+  /// format string, consuming the directive arguments of `call` starting
+  /// at `firstArgIndex` and appending their lowered SSA values to
+  /// `operands` (one per Rust `{}` placeholder, in order). This is the
+  /// shared directive grammar of `emitPrintf` and `emitSprintf` (see
+  /// `emitPrintf` for the supported set); precision, the unsupported
+  /// length modifiers, and unknown conversions keep their located
+  /// rejections here so every caller enforces the same subset. Fails if
+  /// `call` supplies too few or too many arguments for the directives.
+  FailureOr<std::string>
+  translatePrintfFormat(Location loc, const clang::CallExpr *call,
+                        const clang::StringLiteral *literal,
+                        unsigned firstArgIndex,
+                        SmallVectorImpl<Value> &operands);
+
+  /// Lowers a definition-less `sprintf(dest, fmt, ...)` call (CTS-P9,
+  /// 00186). The format must be an ordinary string literal and translates
+  /// through `translatePrintfFormat` into an
+  /// `emitrust.call_opaque "format!"` producing a String; the destination
+  /// is a char region borrowed mutably from its cursor (exactly like the
+  /// <string.h> copy helpers, so a string-literal-backed destination is
+  /// rejected), and both feed the one-per-module `__emitrust_sprintf`
+  /// helper, whose i32 result — the written length, excluding the NUL —
+  /// is C's sprintf return value. A destination too small for the bytes
+  /// plus the NUL terminator panics in the helper (C leaves the overflow
+  /// undefined; the deterministic panic is a legal refinement).
+  FailureOr<Value> emitSprintf(const clang::CallExpr *call);
+
   /// Lowers a `%s` printf argument. Four shapes are supported: a string
   /// literal (after array-to-pointer decay), lowered to an
   /// `emitrust.literal` holding a `&'static str` (printable-ASCII bytes
@@ -1929,7 +1962,12 @@ private:
   FailureOr<Value> emitShortCircuit(const clang::BinaryOperator *op);
 
   /// Emits a call expression; returns a null `Value` for void results.
-  /// printf reaching this path (i.e. with its result used) is rejected.
+  /// printf reaching this path (i.e. with its result used) is rejected;
+  /// a definition-less sprintf routes to `emitSprintf`. A call to a
+  /// fixed-prototype variadic definition (va_list-free body, CTS-P9)
+  /// passes only the named arguments: the trailing extras are dropped
+  /// without being imported (no loads, no borrows), and an extra whose
+  /// evaluation has side effects is rejected rather than silently lost.
   /// Every value argument is materialized before any borrow-producing
   /// argument (C's evaluation order is unspecified; this keeps loads out of
   /// the borrow/call window), and two borrow arguments resolving to the
@@ -2356,6 +2394,14 @@ private:
   /// True once the `__emitrust_cstr` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool cStrHelperEmitted = false;
+  /// True once a definition-less `sprintf` call has been imported;
+  /// triggers the one-per-module emission of the `__emitrust_sprintf`
+  /// helper that copies the formatted bytes plus a NUL terminator into
+  /// the destination slice and returns the written length.
+  bool needsSprintfHelper = false;
+  /// True once the `__emitrust_sprintf` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool sprintfHelperEmitted = false;
   /// True once a definition-less `strlen` call has been imported; triggers
   /// the one-per-module emission of the `__emitrust_strlen` helper that
   /// counts bytes up to the first NUL, matching C's strlen.
@@ -2387,6 +2433,55 @@ static bool containsLabelStmt(const clang::Stmt *stmt) {
       continue;
     if (llvm::isa<clang::LabelStmt>(current))
       return true;
+    for (const clang::Stmt *child : current->children())
+      worklist.push_back(child);
+  }
+  return false;
+}
+
+/// Returns true when the statement tree rooted at `body` touches C's
+/// va_list machinery: a `va_arg` read (`VAArgExpr`), a call to any of the
+/// va_start/va_end/va_copy builtins, or a declaration of a variable of the
+/// target's `va_list` (`__builtin_va_list`) type. A variadic definition
+/// whose body is va_list-free by this scan never observes its trailing
+/// arguments, so it imports as its fixed prototype (CTS-P9); a body this
+/// scan flags keeps the variadic-definition rejection. Iterative worklist
+/// traversal over the AST.
+static bool bodyUsesVaList(const clang::ASTContext &context,
+                           const clang::Stmt *body) {
+  clang::QualType vaListType =
+      context.getBuiltinVaListType().getCanonicalType();
+  SmallVector<const clang::Stmt *> worklist{body};
+  while (!worklist.empty()) {
+    const clang::Stmt *current = worklist.pop_back_val();
+    if (!current)
+      continue;
+    if (llvm::isa<clang::VAArgExpr>(current))
+      return true;
+    if (const auto *call = llvm::dyn_cast<clang::CallExpr>(current)) {
+      switch (call->getBuiltinCallee()) {
+      case clang::Builtin::BI__builtin_va_start:
+      case clang::Builtin::BI__builtin_c23_va_start:
+      case clang::Builtin::BI__builtin_va_end:
+      case clang::Builtin::BI__builtin_va_copy:
+      case clang::Builtin::BI__builtin_ms_va_start:
+      case clang::Builtin::BI__builtin_ms_va_end:
+      case clang::Builtin::BI__builtin_ms_va_copy:
+      case clang::Builtin::BI__va_start:
+      case clang::Builtin::BIva_start:
+      case clang::Builtin::BIva_end:
+      case clang::Builtin::BIva_copy:
+        return true;
+      default:
+        break;
+      }
+    }
+    if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(current))
+      for (const clang::Decl *decl : declStmt->decls())
+        if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+          if (context.hasSameType(var->getType().getCanonicalType(),
+                                  vaListType))
+            return true;
     for (const clang::Stmt *child : current->children())
       worklist.push_back(child);
   }
@@ -5926,11 +6021,23 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   llvm::StringRef cName = func->getName();
 
   if (func->isVariadic()) {
-    if (func->hasBody())
-      return emitError(loc) << "unsupported: variadic function definition";
-    // Body-less variadic declarations (printf in particular) are skipped;
-    // calls to them are handled specially or rejected at the call site.
-    return success();
+    const clang::FunctionDecl *definition = func->getDefinition();
+    if (definition && definition->hasBody()) {
+      // A variadic definition whose body never touches va_list (no
+      // va_start/va_arg/va_copy, no va_list declarations) can never
+      // observe its trailing arguments, so it imports as its fixed
+      // prototype — the named parameters only (CTS-P9). Call sites drop
+      // effect-free trailing extras in `emitCall`. A body that does use
+      // va_list keeps the rejection: the trailing arguments have no
+      // decomposed representation.
+      if (bodyUsesVaList(astContext(), definition->getBody()))
+        return emitError(loc) << "unsupported: variadic function definition";
+    } else {
+      // Body-less variadic declarations (printf in particular) are
+      // skipped; calls to them are handled specially or rejected at the
+      // call site.
+      return success();
+    }
   }
   // Body-less puts/putchar declarations are skipped like printf's: their
   // statement-position calls are lowered by name (`emitPuts`/`emitPutchar`)
@@ -6335,6 +6442,28 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "fn __emitrust_cstr(s: &[i8]) -> String {\n"
             "    s.iter().take_while(|&&b| b != 0).map(|&b| (b as u8) as "
             "char).collect()\n"
+            "}"));
+  }
+  if (needsSprintfHelper && !sprintfHelperEmitted) {
+    sprintfHelperEmitted = true;
+    // C-compatible sprintf tail: copies the formatted ASCII bytes plus the
+    // terminating NUL into the destination char region and returns the
+    // written length (excluding the NUL), C's sprintf result. Every write
+    // is a bounds-checked slice index, so a destination too small for the
+    // bytes plus the NUL panics — C leaves that overflow undefined, and
+    // the deterministic panic is a legal refinement. Emitted once per
+    // module, after all imported items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_sprintf(dest: &mut [i8], s: &str) -> i32 {\n"
+            "    let bytes = s.as_bytes();\n"
+            "    for (i, &b) in bytes.iter().enumerate() {\n"
+            "        dest[i] = b as i8;\n"
+            "    }\n"
+            "    dest[bytes.len()] = 0;\n"
+            "    bytes.len() as i32\n"
             "}"));
   }
   // Hosted <string.h> helpers (design.md C99-48, CTS-L1): each requested
@@ -8285,14 +8414,33 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
     return emitError(loc)
            << "unsupported: printf format must be an ordinary string literal";
 
+  SmallVector<Value> operands;
+  FailureOr<std::string> rustFormat = translatePrintfFormat(
+      loc, call, literal, /*firstArgIndex=*/1, operands);
+  if (failed(rustFormat))
+    return failure();
+
+  SmallVector<Attribute> callArguments;
+  callArguments.push_back(builder.getStringAttr(*rustFormat));
+  for (unsigned i = 0, e = operands.size(); i < e; ++i)
+    callArguments.push_back(builder.getIndexAttr(i));
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("print!"),
+      builder.getArrayAttr(callArguments), operands);
+  return success();
+}
+
+FailureOr<std::string> CImporter::translatePrintfFormat(
+    Location loc, const clang::CallExpr *call,
+    const clang::StringLiteral *literal, unsigned firstArgIndex,
+    SmallVectorImpl<Value> &operands) {
   // Translate the C format string into a Rust format string. The literal's
   // bytes already have C escapes decoded (a "\n" is a real newline byte);
   // the StringAttr printer re-escapes them for the textual assembly.
   llvm::StringRef format = literal->getString();
   std::string rustFormat;
   rustFormat.reserve(format.size());
-  SmallVector<Value> operands;
-  unsigned argIndex = 1;
+  unsigned argIndex = firstArgIndex;
   for (size_t i = 0, n = format.size(); i < n; ++i) {
     char c = format[i];
     // C printf stops at an embedded NUL while Rust's print! would emit the
@@ -8499,15 +8647,73 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
   }
   if (argIndex != call->getNumArgs())
     return emitError(loc) << "unsupported: too many arguments to printf";
+  return rustFormat;
+}
 
+FailureOr<Value> CImporter::emitSprintf(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() < 2)
+    return emitError(loc) << "unsupported: sprintf requires a destination "
+                             "and a format string";
+  const clang::Expr *formatExpr = call->getArg(1)->IgnoreParenImpCasts();
+  const auto *literal = llvm::dyn_cast<clang::StringLiteral>(formatExpr);
+  if (!literal || !literal->isOrdinary())
+    return emitError(loc)
+           << "unsupported: sprintf format must be an ordinary string literal";
+  FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
+  if (failed(dst))
+    return failure();
+
+  // The format arguments materialize first (through the printf-shared
+  // directive grammar) and collapse into a String, so no load intervenes
+  // between the mutable destination borrow below and the helper call
+  // consuming it.
+  SmallVector<Value> operands;
+  FailureOr<std::string> rustFormat = translatePrintfFormat(
+      loc, call, literal, /*firstArgIndex=*/2, operands);
+  if (failed(rustFormat))
+    return failure();
   SmallVector<Attribute> callArguments;
-  callArguments.push_back(builder.getStringAttr(rustFormat));
+  callArguments.push_back(builder.getStringAttr(*rustFormat));
   for (unsigned i = 0, e = operands.size(); i < e; ++i)
     callArguments.push_back(builder.getIndexAttr(i));
-  builder.create<emitrust::CallOpaqueOp>(
-      loc, TypeRange(), builder.getStringAttr("print!"),
-      builder.getArrayAttr(callArguments), operands);
-  return success();
+  auto stringType = emitrust::OpaqueType::get(builder.getContext(), "String");
+  Value text = builder
+                   .create<emitrust::CallOpaqueOp>(
+                       loc, TypeRange{stringType},
+                       builder.getStringAttr("format!"),
+                       builder.getArrayAttr(callArguments), operands)
+                   .getResult(0);
+
+  // The helper's pinned `s: &str` parameter is fed a `&String` borrow
+  // (deref coercion applies at the argument position): the String value
+  // has no place of its own, so it is staged through a String variable
+  // whose shared borrow is taken before the destination's mutable borrow
+  // below (distinct objects, so the borrows coexist).
+  Value stringPlace =
+      builder
+          .create<emitrust::VariableOp>(loc,
+                                        emitrust::LValueType::get(stringType))
+          .getResult();
+  builder.create<emitrust::AssignOp>(loc, stringPlace, text);
+  Value textRef = builder
+                      .create<emitrust::AddrOfOp>(
+                          loc, emitrust::RefType::get(stringType), stringPlace,
+                          /*isMut=*/false)
+                      .getResult();
+
+  // The destination borrows mutably from its cursor, exactly like the
+  // <string.h> copy helpers (a string-literal region rejects here).
+  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true);
+  if (failed(dstSlice))
+    return failure();
+  needsSprintfHelper = true;
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getI32Type()},
+          builder.getStringAttr("__emitrust_sprintf"),
+          /*args=*/ArrayAttr(), ValueRange{*dstSlice, textRef})
+      .getResult(0);
 }
 
 FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
@@ -10360,6 +10566,14 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   // interceptions before reaching this point.
   if (!callee->getDefinition()) {
     llvm::StringRef name = callee->getName();
+    // A definition-less sprintf is lowered by name (design.md CTS-P9,
+    // 00186): the literal format translates through the shared printf
+    // grammar into a `format!` String and the `__emitrust_sprintf`
+    // helper writes it into the destination char region, returning the
+    // length. Statement-position calls arrive here through emitCallStmt's
+    // emitCall fallthrough and simply discard the value.
+    if (name == "sprintf")
+      return emitSprintf(call);
     if (name == "strcmp")
       return emitStringCompareCall(call, "strcmp", /*hasCount=*/false);
     if (name == "strncmp")
@@ -10376,8 +10590,16 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
              << " result must feed a printf '%s' argument or a "
                 "comparison against a null pointer";
   }
-  if (callee->isVariadic())
-    return emitError(loc) << "unsupported: call to a variadic function";
+  // A variadic callee is only supported when its definition imports as
+  // its fixed prototype (a va_list-free body, see `importFunction`); the
+  // call then drops its trailing extras below. Every other variadic call
+  // keeps the rejection.
+  if (callee->isVariadic()) {
+    const clang::FunctionDecl *definition = callee->getDefinition();
+    if (!definition || !definition->hasBody() ||
+        bodyUsesVaList(astContext(), definition->getBody()))
+      return emitError(loc) << "unsupported: call to a variadic function";
+  }
 
   // Hosted <math.h> surface (design.md C99-48): a definition-less call to
   // a recognized math function with its standard `double f(double)`
@@ -10411,23 +10633,40 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     return emitMethodCallSite(call, target, ownerBase, loc);
 
   FunctionType targetType = target.getFunctionType();
-  if (call->getNumArgs() != targetType.getNumInputs())
+  unsigned namedArgCount = call->getNumArgs();
+  if (callee->isVariadic()) {
+    // A fixed-prototype variadic callee (va_list-free body, checked
+    // above) takes only its named parameters; the trailing extras are
+    // dropped from the call. A dropped extra is never imported — it must
+    // not load a by-value struct or borrow an `&s` operand — so an extra
+    // whose evaluation has side effects would silently lose them and is
+    // rejected instead.
+    if (call->getNumArgs() < targetType.getNumInputs())
+      return emitError(loc) << "unsupported: call argument count mismatch";
+    namedArgCount = targetType.getNumInputs();
+    for (unsigned index = namedArgCount; index < call->getNumArgs(); ++index)
+      if (call->getArg(index)->HasSideEffects(astContext()))
+        return emitError(loc) << "unsupported: extra argument to a variadic "
+                                 "call has side effects";
+  } else if (call->getNumArgs() != targetType.getNumInputs()) {
     return emitError(loc) << "unsupported: call argument count mismatch";
+  }
 
   // C leaves the argument evaluation order unspecified; materialize every
   // value argument before any borrow-producing argument so that no load is
   // emitted between a `&mut` borrow and the call consuming it (rustc
   // rejects an intervening use of the borrowed place).
-  SmallVector<Value> arguments(call->getNumArgs(), Value());
+  SmallVector<Value> arguments(namedArgCount, Value());
   struct PendingBorrow {
     unsigned index;
     const clang::Expr *expr;
   };
   SmallVector<PendingBorrow, 4> borrows;
-  for (auto [index, argument] : llvm::enumerate(call->arguments())) {
+  for (unsigned index = 0; index < namedArgCount; ++index) {
+    const clang::Expr *argument = call->getArg(index);
     if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(
             targetType.getInput(index))) {
-      borrows.push_back({static_cast<unsigned>(index), argument});
+      borrows.push_back({index, argument});
       continue;
     }
     FailureOr<Value> value = emitRValue(argument);
