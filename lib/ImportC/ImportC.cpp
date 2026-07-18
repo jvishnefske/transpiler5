@@ -1238,6 +1238,15 @@ private:
   const clang::VarDecl *resolveArgRoot(PointerRegionAnalysis &regions,
                                        const clang::Expr *expr) const;
 
+  /// Collects the function definitions the Pass-A planners analyze: every
+  /// function of `unit` whose body is defined here, is not variadic, and
+  /// lives outside a system header — the shared traversal seed of
+  /// `planOwners` and `planCellSlices`, which stay separately invoked
+  /// passes in a fixed order (fusing their TU traversals would change the
+  /// inter-analysis evaluation order and is deferred).
+  SmallVector<const clang::FunctionDecl *>
+  collectPassAFunctionDefinitions(const clang::TranslationUnitDecl *unit) const;
+
   //===--------------------------------------------------------------------===//
   // Cell-slice planning (CTS-P10 Pass A)
   //===--------------------------------------------------------------------===//
@@ -5581,14 +5590,19 @@ LogicalResult CImporter::emitMemberPointerAssign(
   return success();
 }
 
-void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
-                           bool soleTranslationUnit) {
-  // Interprocedural union-find over storage bases (local arrays and
-  // scalars) and the data-pointer parameters of function definitions.
-  // Union-find transitively closes as edges are added, so one walk over
-  // every body reaches the fixpoint.
-  llvm::DenseMap<const clang::VarDecl *, const clang::VarDecl *> parent;
-  auto find = [&](const clang::VarDecl *decl) -> const clang::VarDecl * {
+namespace {
+/// Union-find over storage/parameter declarations, the shared
+/// interprocedural machinery of the Pass-A planners (`planOwners`,
+/// `planCellSlices`): nodes register on first touch, `find` compresses
+/// paths, and `unite` links roots. Union-find transitively closes as
+/// edges are added, so one walk over every body reaches the fixpoint.
+/// `nodes` snapshots the touched set for an aggregation that keeps
+/// calling `find` (which compresses the underlying map).
+class VarDeclUnionFind {
+public:
+  /// Returns `decl`'s class root, registering an unseen node as its own
+  /// root and compressing the path walked.
+  const clang::VarDecl *find(const clang::VarDecl *decl) {
     parent.try_emplace(decl, decl);
     const clang::VarDecl *root = decl;
     while (parent[root] != root)
@@ -5599,24 +5613,84 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
       decl = next;
     }
     return root;
-  };
-  auto unite = [&](const clang::VarDecl *a, const clang::VarDecl *b) {
-    parent[find(b)] = find(a);
-  };
-  // Declarations whose class must not be promoted: unresolvable pointer
-  // arguments, pointer-to-pointer parameters, invalidated (escaping)
-  // regions. Membership is checked per node during aggregation, so a
-  // poison mark survives later unions.
-  llvm::SmallPtrSet<const clang::VarDecl *, 8> poisoned;
+  }
 
+  /// Unites `b`'s class into `a`'s.
+  void unite(const clang::VarDecl *a, const clang::VarDecl *b) {
+    const clang::VarDecl *rootB = find(b);
+    const clang::VarDecl *rootA = find(a);
+    parent[rootB] = rootA;
+  }
+
+  /// Snapshots every node ever touched.
+  SmallVector<const clang::VarDecl *> nodes() const {
+    SmallVector<const clang::VarDecl *> result;
+    result.reserve(parent.size());
+    for (const auto &entry : parent)
+      result.push_back(entry.first);
+    return result;
+  }
+
+private:
+  llvm::DenseMap<const clang::VarDecl *, const clang::VarDecl *> parent;
+};
+} // namespace
+
+/// Walks every call in `body` whose callee resolves to a non-variadic
+/// definition of matching arity and invokes `visit` once per data-pointer
+/// (non-function-pointer) callee parameter with the argument bound to it —
+/// the shared call-edge scaffold of the Pass-A planners. Callees without
+/// a definition in this TU add no edge: passing a region to them stays on
+/// the Phase-1b call lowering.
+static void forEachDataPointerCallArg(
+    const clang::Stmt *body,
+    llvm::function_ref<void(const clang::ParmVarDecl *, const clang::Expr *)>
+        visit) {
+  SmallVector<const clang::CallExpr *> calls;
+  collectCallExprs(body, calls);
+  for (const clang::CallExpr *call : calls) {
+    const clang::FunctionDecl *callee = call->getDirectCallee();
+    if (!callee || callee->isVariadic())
+      continue;
+    const clang::FunctionDecl *definition = callee->getDefinition();
+    if (!definition || !definition->hasBody() ||
+        call->getNumArgs() != definition->getNumParams())
+      continue;
+    for (auto [index, argument] : llvm::enumerate(call->arguments())) {
+      const clang::ParmVarDecl *param = definition->getParamDecl(index);
+      if (!isPointerType(param->getType()) ||
+          isFunctionPointer(param->getType()))
+        continue;
+      visit(param, argument);
+    }
+  }
+}
+
+SmallVector<const clang::FunctionDecl *>
+CImporter::collectPassAFunctionDefinitions(
+    const clang::TranslationUnitDecl *unit) const {
   SmallVector<const clang::FunctionDecl *> definitions;
   for (const clang::Decl *decl : unit->decls())
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl))
       if (func->doesThisDeclarationHaveABody() && !func->isVariadic() &&
           !isSystemHeaderDecl(func))
         definitions.push_back(func);
+  return definitions;
+}
 
-  for (const clang::FunctionDecl *func : definitions) {
+void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
+                           bool soleTranslationUnit) {
+  // Interprocedural union-find over storage bases (local arrays and
+  // scalars) and the data-pointer parameters of function definitions.
+  VarDeclUnionFind unionFind;
+  // Declarations whose class must not be promoted: unresolvable pointer
+  // arguments, pointer-to-pointer parameters, invalidated (escaping)
+  // regions. Membership is checked per node during aggregation, so a
+  // poison mark survives later unions.
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> poisoned;
+
+  for (const clang::FunctionDecl *func :
+       collectPassAFunctionDefinitions(unit)) {
     PointerRegionAnalysis analysis;
     analysis.analyze(astContext(), func->getBody());
 
@@ -5626,7 +5700,7 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
       if (!isPointerType(param->getType()) ||
           isFunctionPointer(param->getType()))
         continue;
-      (void)find(param);
+      (void)unionFind.find(param);
       if (param->getType()
               .getCanonicalType()
               ->getPointeeType()
@@ -5647,7 +5721,7 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
         if (!first)
           first = binding.base;
         else
-          unite(first, binding.base);
+          unionFind.unite(first, binding.base);
         if (!region->invalidReason.empty())
           poisoned.insert(binding.base);
       }
@@ -5675,43 +5749,26 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
     // class. Callees without a definition in this TU add no edge — passing
     // a region to them stays on the Phase-1b call lowering, which composes
     // with a promoted base through its rewritten data place.
-    SmallVector<const clang::CallExpr *> calls;
-    collectCallExprs(func->getBody(), calls);
-    for (const clang::CallExpr *call : calls) {
-      const clang::FunctionDecl *callee = call->getDirectCallee();
-      if (!callee || callee->isVariadic())
-        continue;
-      const clang::FunctionDecl *definition = callee->getDefinition();
-      if (!definition || !definition->hasBody() ||
-          call->getNumArgs() != definition->getNumParams())
-        continue;
-      for (auto [index, argument] : llvm::enumerate(call->arguments())) {
-        const clang::ParmVarDecl *param = definition->getParamDecl(index);
-        if (!isPointerType(param->getType()) ||
-            isFunctionPointer(param->getType()))
-          continue;
-        if (const clang::VarDecl *root = resolveArgRoot(analysis, argument))
-          unite(root, param);
-        else
-          poisoned.insert(param);
-      }
-    }
+    forEachDataPointerCallArg(
+        func->getBody(),
+        [&](const clang::ParmVarDecl *param, const clang::Expr *argument) {
+          if (const clang::VarDecl *root = resolveArgRoot(analysis, argument))
+            unionFind.unite(root, param);
+          else
+            poisoned.insert(param);
+        });
   }
 
-  // Aggregate the classes. `find` compresses paths in `parent`, so the
-  // node set is snapshotted before aggregation.
+  // Aggregate the classes. `find` compresses paths, so the node set is
+  // snapshotted before aggregation.
   struct ClassInfo {
     SmallVector<const clang::VarDecl *, 2> storageBases;
     SmallVector<const clang::ParmVarDecl *, 4> params;
     bool poisoned = false;
   };
-  SmallVector<const clang::VarDecl *> nodes;
-  nodes.reserve(parent.size());
-  for (const auto &entry : parent)
-    nodes.push_back(entry.first);
   llvm::DenseMap<const clang::VarDecl *, ClassInfo> classes;
-  for (const clang::VarDecl *node : nodes) {
-    ClassInfo &info = classes[find(node)];
+  for (const clang::VarDecl *node : unionFind.nodes()) {
+    ClassInfo &info = classes[unionFind.find(node)];
     if (poisoned.contains(node))
       info.poisoned = true;
     if (const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(node)) {
@@ -5779,7 +5836,7 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
       for (const clang::ParmVarDecl *param : fn->parameters()) {
         if (isPointerType(param->getType()) &&
             !isFunctionPointer(param->getType()) &&
-            find(param) != entry.first) {
+            unionFind.find(param) != entry.first) {
           qualifies = false;
           break;
         }
@@ -6021,24 +6078,9 @@ CImporter::asPointerParamRead(const clang::Expr *expr) const {
 void CImporter::planCellSlices(const clang::TranslationUnitDecl *unit,
                                bool soleTranslationUnit) {
   // Union-find over data-pointer parameters and global array bases,
-  // mirroring `planOwners`' machinery (see there for the fixpoint
-  // argument).
-  llvm::DenseMap<const clang::VarDecl *, const clang::VarDecl *> parent;
-  auto find = [&](const clang::VarDecl *decl) -> const clang::VarDecl * {
-    parent.try_emplace(decl, decl);
-    const clang::VarDecl *root = decl;
-    while (parent[root] != root)
-      root = parent[root];
-    while (parent[decl] != root) {
-      const clang::VarDecl *next = parent[decl];
-      parent[decl] = root;
-      decl = next;
-    }
-    return root;
-  };
-  auto unite = [&](const clang::VarDecl *a, const clang::VarDecl *b) {
-    parent[find(b)] = find(a);
-  };
+  // mirroring `planOwners`' machinery (see `VarDeclUnionFind` for the
+  // fixpoint argument).
+  VarDeclUnionFind unionFind;
 
   llvm::SmallPtrSet<const clang::VarDecl *, 8> poisoned;
   llvm::SmallPtrSet<const clang::ParmVarDecl *, 8> nullChecked;
@@ -6046,14 +6088,8 @@ void CImporter::planCellSlices(const clang::TranslationUnitDecl *unit,
   // boundary), keyed by the callee parameter that received it.
   llvm::DenseMap<const clang::VarDecl *, std::string> localJoins;
 
-  SmallVector<const clang::FunctionDecl *> definitions;
-  for (const clang::Decl *decl : unit->decls())
-    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl))
-      if (func->doesThisDeclarationHaveABody() && !func->isVariadic() &&
-          !isSystemHeaderDecl(func))
-        definitions.push_back(func);
-
-  for (const clang::FunctionDecl *func : definitions) {
+  for (const clang::FunctionDecl *func :
+       collectPassAFunctionDefinitions(unit)) {
     // Body facts: null checks and escaping uses of this definition's own
     // data-pointer parameters.
     llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> bodyNullChecked;
@@ -6089,63 +6125,50 @@ void CImporter::planCellSlices(const clang::TranslationUnitDecl *unit,
     // direct decay of a global array and the forwarding of another
     // data-pointer parameter. A local array decay records the Mixed
     // boundary fact; everything else poisons the callee parameter.
-    SmallVector<const clang::CallExpr *> calls;
-    collectCallExprs(func->getBody(), calls);
-    for (const clang::CallExpr *call : calls) {
-      const clang::FunctionDecl *callee = call->getDirectCallee();
-      if (!callee || callee->isVariadic())
-        continue;
-      const clang::FunctionDecl *definition = callee->getDefinition();
-      if (!definition || !definition->hasBody() ||
-          call->getNumArgs() != definition->getNumParams())
-        continue;
-      for (auto [index, argument] : llvm::enumerate(call->arguments())) {
-        const clang::ParmVarDecl *calleeParam =
-            definition->getParamDecl(index);
-        if (!isPointerType(calleeParam->getType()) ||
-            isFunctionPointer(calleeParam->getType()))
-          continue;
-        (void)find(calleeParam);
-        if (calleeParam->getType()
-                .getCanonicalType()
-                ->getPointeeType()
-                .getCanonicalType()
-                ->isPointerType()) {
+    forEachDataPointerCallArg(
+        func->getBody(), [&](const clang::ParmVarDecl *calleeParam,
+                             const clang::Expr *argument) {
+          (void)unionFind.find(calleeParam);
+          if (calleeParam->getType()
+                  .getCanonicalType()
+                  ->getPointeeType()
+                  .getCanonicalType()
+                  ->isPointerType()) {
+            poisoned.insert(calleeParam);
+            return;
+          }
+          if (const clang::VarDecl *global =
+                  asDecayedGlobalArrayArg(argument)) {
+            unionFind.unite(calleeParam, global);
+            return;
+          }
+          if (const clang::ParmVarDecl *forwarded =
+                  asPointerParamRead(argument)) {
+            unionFind.unite(calleeParam, forwarded);
+            return;
+          }
+          // A directly decayed local array is the ordinary Phase-1b slice
+          // argument; record it as the Mixed boundary witness in case the
+          // class also picks up a global base.
+          const clang::Expr *e = stripTrivia(argument);
+          const auto *decay = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+          const auto *ref =
+              decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay
+                  ? llvm::dyn_cast<clang::DeclRefExpr>(
+                        stripTrivia(decay->getSubExpr()))
+                  : nullptr;
+          const auto *localVar =
+              ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+          if (localVar && localVar->hasLocalStorage()) {
+            localJoins.try_emplace(calleeParam, localVar->getName().str());
+            return;
+          }
           poisoned.insert(calleeParam);
-          continue;
-        }
-        if (const clang::VarDecl *global = asDecayedGlobalArrayArg(argument)) {
-          unite(calleeParam, global);
-          continue;
-        }
-        if (const clang::ParmVarDecl *forwarded =
-                asPointerParamRead(argument)) {
-          unite(calleeParam, forwarded);
-          continue;
-        }
-        // A directly decayed local array is the ordinary Phase-1b slice
-        // argument; record it as the Mixed boundary witness in case the
-        // class also picks up a global base.
-        const clang::Expr *e = stripTrivia(argument);
-        const auto *decay = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
-        const auto *ref =
-            decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay
-                ? llvm::dyn_cast<clang::DeclRefExpr>(
-                      stripTrivia(decay->getSubExpr()))
-                : nullptr;
-        const auto *localVar =
-            ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
-        if (localVar && localVar->hasLocalStorage()) {
-          localJoins.try_emplace(calleeParam, localVar->getName().str());
-          continue;
-        }
-        poisoned.insert(calleeParam);
-      }
-    }
+        });
   }
 
   // Aggregate the classes (snapshotting the nodes: `find` compresses
-  // paths in `parent`).
+  // paths).
   struct ClassInfo {
     SmallVector<const clang::VarDecl *, 2> globals;
     SmallVector<const clang::ParmVarDecl *, 4> params;
@@ -6153,13 +6176,9 @@ void CImporter::planCellSlices(const clang::TranslationUnitDecl *unit,
     bool poisoned = false;
     bool nullChecked = false;
   };
-  SmallVector<const clang::VarDecl *> nodes;
-  nodes.reserve(parent.size());
-  for (const auto &entry : parent)
-    nodes.push_back(entry.first);
   llvm::DenseMap<const clang::VarDecl *, ClassInfo> classes;
-  for (const clang::VarDecl *node : nodes) {
-    ClassInfo &info = classes[find(node)];
+  for (const clang::VarDecl *node : unionFind.nodes()) {
+    ClassInfo &info = classes[unionFind.find(node)];
     if (poisoned.contains(node))
       info.poisoned = true;
     if (const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(node)) {
