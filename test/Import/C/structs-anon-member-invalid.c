@@ -3,7 +3,8 @@
 // whose arms differ in type — or whose arm is wider than one flattened
 // field — stays rejected with the same located "union type" diagnostic
 // union types get everywhere (CTS-R3 territory); a named union member
-// keeps that rejection too. A spelling collision between the parent and
+// whose arms fall outside the one-slot model (e.g. a float arm) keeps
+// that rejection too. A spelling collision between the parent and
 // an anonymous member's field is a clang error before import (C11
 // 6.7.2.1p13 puts both in one member namespace), also with a location.
 // RUN: split-file %s %t
@@ -45,10 +46,11 @@ struct s {
 struct s g;
 
 //--- named-union.c
-// Named union members are untouched by anonymous-member flattening.
+// A named union member with a non-integer arm stays outside the
+// one-slot aliasing model even after CTS-R3 named-union support.
 union u {
   int a;
-  int b;
+  float b;
 };
 
 struct s {
