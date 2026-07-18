@@ -109,7 +109,15 @@
 ///    constant with `emitrust.cmp`. Variadic targets, unimported targets,
 ///    signature mismatches, argument-carrying calls through prototype-less
 ///    pointers, and fn_ptr component types outside the verifier set are
-///    located rejections.
+///    located rejections. A file-scope function pointer initialized to a
+///    known function and never reassigned (nor address-taken) anywhere in
+///    the TU is statically devirtualized (CTS-S, 00189): it becomes an
+///    import-time alias with no global of its own, calls through it lower
+///    as direct calls to the target, and value uses read as the
+///    `Some(target)` constant. A variadic target aliases only when it is
+///    the hosted definition-less printf/fprintf, whose calls route
+///    through the printf machinery — the fprintf shape swallows its
+///    leading `stdout` argument (the only position accepting a FILE*).
 ///  - Owner structs / active objects (Phase 4): the per-TU import is
 ///    two-pass. Pass A (`planOwners`) is a pure AST analysis run before any
 ///    IR is built: per-function pointer regions are unified across call
@@ -182,9 +190,19 @@
 ///    addresses, and whole-struct overwrites poison the field program-wide
 ///    (every read rejects, located at the unresolvable site). A
 ///    data-pointer *return type* classifies by its return sites
-///    (principal-kind inference): the supported kind is a returned
+///    (principal-kind inference): the supported kinds are a returned
 ///    function address behind a `void *` return, emitted as the plain
-///    `!emitrust.fn_ptr` result; returning a cursor into a callee-local
+///    `!emitrust.fn_ptr` result, and the single-global-base return
+///    (CTS-S, 00089) — every site returns the address of ONE mutable
+///    whole global, so the pointer result is ERASED from the signature
+///    (the call is retained for its side effects) and callers route
+///    `f()->member` accesses to the global through the staged-copy +
+///    writeback machinery with zero runtime pointer state; the erasure
+///    also applies to a fn-ptr signature returning a data pointer when
+///    every address-taken function of that return type erases to the
+///    same base, so indirect calls route identically. Nullable returns,
+///    disagreeing bases, and member-address sites are located
+///    rejections; returning a cursor into a callee-local
 ///    region stays rejected at the return site (it would dangle).
 ///    Qualification-preserving explicit casts (same unqualified pointee)
 ///    peel transparently in analysis and emission. A `void *` is a
@@ -452,8 +470,12 @@ struct PtrExprValue {
 /// ALL mutable global arrays of one element type; they become shared
 /// `!emitrust.ref<!emitrust.cell_slice<T>>` references, which stay
 /// coherent with direct global reads mid-call because both hit the same
-/// thread-local `Cell` (a staged copy would be unsound here).
-enum class ParamKind { ScalarRef, Slice, CellSlice };
+/// thread-local `Cell` (a staged copy would be unsound here). `Carrier`
+/// parameters (CTS-P3) are `void *` parameters of a defined function whose
+/// body only ever truth-tests them: they carry an integer in pointer
+/// clothing and become plain i64 values (call sites pass carrier values,
+/// with null as the i64 zero).
+enum class ParamKind { ScalarRef, Slice, CellSlice, Carrier };
 
 /// Why a pointer-parameter class with global bases does NOT lower to a
 /// cell-slice (CTS-P10 boundaries), keyed by the global base so the
@@ -666,6 +688,16 @@ struct PointerRegion {
   /// a base-less region built only from direct null bindings keeps the
   /// historical CTS-P8 flag cell.
   bool hasConditionalSource = false;
+  /// True when an integer value rides into the region in pointer clothing
+  /// (CTS-P3): an integer-to-pointer cast, or a call to a function whose
+  /// pointer return classifies as an integer carrier. A region whose ONLY
+  /// sources are such carriers and null constants never addresses a
+  /// modeled object and lowers as a plain i64 value (see
+  /// `isCarrierRegion`); a region that also binds a real address base is
+  /// invalidated with the historical non-address rejection.
+  bool hasCarrierSource = false;
+  /// First carrier-source site; meaningful only with `hasCarrierSource`.
+  clang::SourceLocation carrierLoc;
   /// The single recognized allocation call (`calloc`/`malloc` with
   /// compile-time-constant sizes) bound to a global pointer of the region;
   /// the allocation is promoted to a synthesized zero-initialized global
@@ -739,6 +771,14 @@ public:
   /// Analyzes `body`, replacing any previous analysis state. `context` is
   /// borrowed for the duration of the walk (null-constant classification).
   void analyze(clang::ASTContext &astContext, const clang::Stmt *body);
+
+  /// Optional query telling the walk whether a direct call to `callee`
+  /// returns an integer-carrier pointer (CTS-P3): such a call is a carrier
+  /// source of the assigned pointer's region rather than a non-address
+  /// invalidation. Left unset (the pure-AST planning passes), every call
+  /// source keeps the historical non-address rejection, which is
+  /// conservative — planning never consumes carrier regions.
+  std::function<bool(const clang::FunctionDecl *)> carrierReturnQuery;
 
   /// Returns whether `var` is a pointer local tracked by this analysis.
   bool tracks(const clang::VarDecl *var) const {
@@ -822,6 +862,15 @@ private:
   /// Flags `ptr`'s region as nullable at `loc` (a null pointer constant
   /// was assigned to one of its pointers); only the first site is kept.
   void recordNullable(const clang::VarDecl *ptr, clang::SourceLocation loc);
+
+  /// Flags `ptr`'s region as fed by an integer carrier at `loc` (CTS-P3):
+  /// an integer-to-pointer cast or a call returning a carrier. Only local
+  /// pointers may carry integers (globals keep the historical non-address
+  /// rejection), and a region that already binds an address base, string
+  /// literal, or allocation is invalidated instead — the two models cannot
+  /// mix.
+  void recordCarrierSource(const clang::VarDecl *ptr,
+                           clang::SourceLocation loc);
 
   /// Flags `ptr`'s region as written through (`*p = v`, `p[i] = v`, ...)
   /// at `loc`; a string-literal region rejects at this location.
@@ -1076,6 +1125,85 @@ private:
   /// `getDefinition`); results are cached per canonical declaration.
   FailureOr<Type> classifyPointerReturn(const clang::FunctionDecl *func,
                                         Location loc);
+
+  /// Classifies the data-pointer RESULT of a function-pointer type (CTS-S,
+  /// 00089): the result is representable exactly when at least one function
+  /// of the TU has its address taken with the same (canonical, unqualified)
+  /// data-pointer return type and EVERY such candidate classifies to the
+  /// erased single-global-base return kind with one common base — then any
+  /// value of the fn-ptr type can only designate a function returning that
+  /// global's address, so the pointer result erases from the fn_ptr
+  /// signature and indirect calls route to the base like direct calls.
+  /// Restricted to single-TU imports (the candidate set must be
+  /// whole-program). Memoized per canonical pointee type; failures are
+  /// located rejections.
+  FailureOr<const clang::VarDecl *>
+  classifyFnPtrPointerResult(const clang::FunctionType *fnType, Location loc);
+
+  /// Returns the single-global-base routed to by an erased-pointer-return
+  /// call (CTS-S, 00089), or null: `expr` (stripped of trivia) must be a
+  /// call whose direct callee classified to the erased global-return kind,
+  /// or an indirect call through a fn-ptr type whose data-pointer result
+  /// classified the same way. On success `*callOut` receives the call.
+  const clang::VarDecl *
+  erasedGlobalReturnCallBase(const clang::Expr *expr,
+                             const clang::CallExpr **callOut) const;
+
+  /// Pass-A scan for the fn-ptr facts of one TU (CTS-S, 00189/00089):
+  /// records which file-scope function-pointer variables are assigned or
+  /// address-taken in any body (`fnPtrGlobalsWritten`), which functions
+  /// have their address taken outside a direct-call callee position
+  /// (`addressTakenFunctions`), and then plans the devirtualization
+  /// aliases (`fnPtrAliases`): a file-scope function pointer initialized
+  /// to a known function, never written, and — unless internally linked —
+  /// imported as the sole TU, aliases its target. A variadic target
+  /// aliases only when it is the hosted definition-less `printf`/`fprintf`
+  /// (calls route through the printf machinery); any other shape keeps the
+  /// ordinary import path and its located rejections.
+  void planFnPtrAliases(const clang::TranslationUnitDecl *unit);
+
+  /// Returns the devirtualization target when `call`'s callee (through
+  /// parens, the decay/deref cancellation, and implicit casts) names an
+  /// aliased global function pointer (CTS-S, 00189); null otherwise. On
+  /// success `*aliasVar` (when supplied) receives the alias variable.
+  const clang::FunctionDecl *
+  devirtualizedCallee(const clang::CallExpr *call,
+                      const clang::VarDecl **aliasVar = nullptr) const;
+
+  /// Emits a statement-position call through a devirtualized alias of the
+  /// hosted variadic `fprintf`/`printf` (CTS-S, 00189) via the printf
+  /// machinery. For `fprintf` the leading stream argument must be the
+  /// literal `stdout` and is swallowed with the fprintf->printf routing —
+  /// the ONLY position where a FILE* value is accepted; the format string
+  /// and conversions then translate exactly like a direct printf call.
+  LogicalResult emitAliasedPrintf(const clang::CallExpr *call,
+                                  const clang::FunctionDecl *target);
+
+  /// Emits a call through a devirtualized non-variadic alias (CTS-S,
+  /// 00189) as a DIRECT `func.call` to the target: the alias variable's
+  /// fn-ptr type maps and signature-checks against the imported target
+  /// exactly like a fn-ptr constant would, but no fn_ptr value and no
+  /// call_indirect is created. A variadic (printf-routed) alias reaching
+  /// this value-position path is rejected: its result must be unused.
+  FailureOr<Value> emitDevirtualizedCall(const clang::CallExpr *call,
+                                         const clang::VarDecl *var,
+                                         const clang::FunctionDecl *target,
+                                         Location loc);
+
+  /// Returns whether `func`'s data-pointer return classifies as an
+  /// integer carrier (CTS-P3): the definition exists and EVERY return site
+  /// yields a carrier value — a null pointer constant, an
+  /// integer-to-pointer cast, a read of a carrier-region local, or a call
+  /// to another carrier-returning function. Such a function returns a
+  /// plain i64 (null is the i64 zero). Memoized per canonical declaration;
+  /// recursion cycles classify pessimistically as non-carrier.
+  bool isCarrierReturnFunction(const clang::FunctionDecl *func);
+
+  /// Returns whether one return-site expression yields an integer-carrier
+  /// value, consulting `regions` (the definition body's own analysis) for
+  /// reads of carrier-region locals.
+  bool isCarrierReturnExpr(PointerRegionAnalysis &regions,
+                           const clang::Expr *expr);
 
   //===--------------------------------------------------------------------===//
   // Owner planning (Phase-4 Pass A)
@@ -2149,6 +2277,19 @@ private:
   /// rejection (design.md CTS-S).
   FailureOr<Value> emitStmtExpr(const clang::StmtExpr *expr);
 
+  /// Emits an rvalue of an integer-carrier pointer expression (CTS-P3) as
+  /// its plain i64 value: a null constant is the i64 zero, an
+  /// integer-to-pointer cast converts its integer operand to i64, a read
+  /// of a carrier local/parameter loads its cell, and a call to a
+  /// carrier-returning function yields its i64 result directly. Any other
+  /// shape is a located rejection.
+  FailureOr<Value> emitCarrierValue(const clang::Expr *expr);
+
+  /// Returns the i64 cell of the integer-carrier pointer local or
+  /// parameter a (possibly lvalue-to-rvalue-wrapped) reference `expr`
+  /// names, or a null Value when `expr` is not such a reference.
+  Value lookupCarrierCell(const clang::Expr *expr);
+
   /// Constant-folds `sizeof`/`_Alignof` (on a type or an expression) into
   /// an integer constant of the mapped `size_t` type using clang's target
   /// layout. The operand of `sizeof` is unevaluated in C (side effects do
@@ -2598,6 +2739,64 @@ private:
   /// function whose data-pointer return classifies as a returned function
   /// address.
   llvm::DenseMap<const clang::FunctionDecl *, Type> pointerReturnKinds;
+  /// Erased single-global-base pointer returns (CTS-S, 00089), keyed by the
+  /// function's canonical declaration: a function whose every return site
+  /// yields the address of this ONE mutable whole global classifies to an
+  /// ERASED pointer result (its `pointerReturnKinds` entry is the null
+  /// `Type`), and callers route accesses through the returned pointer to
+  /// the recorded global directly.
+  llvm::DenseMap<const clang::FunctionDecl *, const clang::VarDecl *>
+      globalReturnBases;
+  /// Erased single-global-base results of function POINTER types (CTS-S,
+  /// 00089), keyed by the canonical clang function type of the pointee: a
+  /// fn-ptr signature returning a data pointer is representable exactly
+  /// when every address-taken function of that return type erases to the
+  /// same global base (see `classifyFnPtrPointerResult`); indirect calls
+  /// through such a pointer route to the recorded global like direct calls.
+  llvm::DenseMap<const clang::Type *, const clang::VarDecl *>
+      fnPtrReturnBases;
+  /// Function-pointer pointee types whose data-pointer-result
+  /// classification is currently being computed; a re-entry (a recursion
+  /// cycle through a candidate's own return classification) rejects.
+  llvm::SmallPtrSet<const clang::Type *, 4> fnPtrReturnInProgress;
+  /// Devirtualized global function pointers (CTS-S, 00189), keyed by the
+  /// variable's canonical declaration: a file-scope function pointer
+  /// initialized to a known function and never reassigned (nor
+  /// address-taken) anywhere in the TU is an import-time alias of its
+  /// target. No `emitrust.global` is materialized; calls through the alias
+  /// lower as direct calls (a hosted variadic target routes through the
+  /// printf machinery), and value uses lower to the `Some(target)`
+  /// constant. Populated per TU by `planFnPtrAliases`.
+  llvm::DenseMap<const clang::VarDecl *, const clang::FunctionDecl *>
+      fnPtrAliases;
+  /// File-scope function-pointer variables the current TU assigns to (or
+  /// takes the address of) somewhere in a function body; such a variable
+  /// is never an alias. Rebuilt per TU by `planFnPtrAliases`.
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> fnPtrGlobalsWritten;
+  /// Functions of the current TU whose address is taken anywhere outside a
+  /// direct-call callee position (function bodies and file-scope
+  /// initializers alike); the candidate set of every fn-ptr value flow,
+  /// consulted by `classifyFnPtrPointerResult`. Rebuilt per TU by
+  /// `planFnPtrAliases`.
+  llvm::SmallVector<const clang::FunctionDecl *, 8> addressTakenFunctions;
+  /// The single-global-base of the function currently being imported when
+  /// its pointer return was erased (CTS-S, 00089); null otherwise. Return
+  /// sites emit a bare `return` (the address carries no runtime state).
+  const clang::VarDecl *currentErasedReturnBase = nullptr;
+  /// Cached integer-carrier return classifications (CTS-P3), keyed by the
+  /// function's canonical declaration (see `isCarrierReturnFunction`).
+  llvm::DenseMap<const clang::FunctionDecl *, bool> carrierReturnCache;
+  /// Functions whose carrier-return classification is currently being
+  /// computed; a re-entry (a recursion cycle) classifies pessimistically.
+  llvm::SmallPtrSet<const clang::FunctionDecl *, 4> carrierReturnInProgress;
+  /// Per-function i64 cells of integer-carrier pointer locals (CTS-P3),
+  /// keyed by declaration: the pointer's entire runtime state is one plain
+  /// i64 (null is 0); no base, cursor, or flag cell exists.
+  llvm::DenseMap<const clang::VarDecl *, Value> carrierLocals;
+  /// Per-function integer-carrier `void *` parameters (CTS-P3): their
+  /// prologue cells live in `symbols` like any scalar parameter, and this
+  /// set routes their truth tests and carrier reads.
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> carrierParams;
   /// Parameters whose interprocedural class qualified for the cell-slice
   /// lowering (CTS-P10), keyed by the definition's parameter declaration;
   /// populated by `planCellSlices` and consulted by
@@ -3069,6 +3268,20 @@ static bool isStaticallyNullRegion(const PointerRegion *region) {
          region->hasConditionalSource;
 }
 
+/// Returns whether `region` is an integer-carrier region (CTS-P3): a
+/// consumable region whose only sources are integer-to-pointer casts,
+/// calls returning carriers, and null pointer constants. Such a region
+/// never addresses a modeled object — it is an integer riding in pointer
+/// clothing — so each of its pointers lowers as a plain i64 value (null is
+/// the i64 zero) with no base, cursor, or flag cell. Dereference and
+/// pointer arithmetic have nothing to resolve against and stay located
+/// rejections at emission.
+static bool isCarrierRegion(const PointerRegion *region) {
+  return region && region->invalidReason.empty() &&
+         region->hasCarrierSource && region->bases.empty() &&
+         !region->literalBase && !region->allocSite;
+}
+
 /// The statically resolved target of a `&root.member` address expression
 /// (CTS-P9): the root object and the (possibly anonymous-chain-flattened)
 /// leaf field. `touchesUnion` reports union storage anywhere on the path,
@@ -3151,6 +3364,50 @@ static const clang::Expr *returnedFunctionExpr(const clang::Expr *expr) {
     if (llvm::isa<clang::FunctionDecl>(ref->getDecl()))
       return ref;
   return nullptr;
+}
+
+/// The base object of one returned global address site (CTS-S, 00089): a
+/// return-site expression of the form `&g` (whole object, cursor 0) sets
+/// `base` to the global `g` with `wholeObject` true; `&g.member...` (a
+/// member address rooted at a global through non-arrow, non-bitfield hops)
+/// sets `base` with `wholeObject` false. Anything else leaves `base` null.
+struct ReturnedGlobalAddress {
+  const clang::VarDecl *base = nullptr;
+  bool wholeObject = false;
+};
+
+/// Classifies a return-site expression as a returned global address (see
+/// `ReturnedGlobalAddress`). Only qualification-preserving casts (no-op or
+/// bit casts, parens) are peeled — mirroring `returnedFunctionExpr` — so
+/// no cast that changes what the value decomposes into is looked through.
+static ReturnedGlobalAddress returnedGlobalAddress(const clang::Expr *expr) {
+  ReturnedGlobalAddress result;
+  const clang::Expr *e = expr->IgnoreParens();
+  while (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e)) {
+    clang::CastKind kind = cast->getCastKind();
+    if (kind != clang::CK_BitCast && kind != clang::CK_NoOp)
+      return result;
+    e = cast->getSubExpr()->IgnoreParens();
+  }
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e);
+  if (!unary || unary->getOpcode() != clang::UO_AddrOf)
+    return result;
+  e = stripTrivia(unary->getSubExpr());
+  bool whole = true;
+  while (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e)) {
+    if (member->isArrow())
+      return result;
+    whole = false;
+    e = stripTrivia(member->getBase());
+  }
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  const auto *var = ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl())
+                        : nullptr;
+  if (!var || !var->hasGlobalStorage() || isPointerType(var->getType()))
+    return result;
+  result.base = llvm::cast<clang::VarDecl>(var->getCanonicalDecl());
+  result.wholeObject = whole;
+  return result;
 }
 
 /// Collects every `return` statement of `stmt`'s subtree into `returns`.
@@ -3353,6 +3610,77 @@ static void collectSliceParams(
     collectSliceParams(child, sliceParams);
 }
 
+static bool voidParamOnlyTruthTested(const clang::Stmt *stmt,
+                                     const clang::ParmVarDecl *param);
+
+/// Scans a condition expression for the integer-carrier classification of
+/// `void *` parameters (CTS-P3): bare loads of `param` are consumed as
+/// truth tests, looking through parens, `PointerToBoolean` conversions,
+/// `!`, and the `&&`/`||` connectives; any other subexpression is walked
+/// generally (so a use of `param` inside it disqualifies).
+static bool voidParamCondOk(const clang::Expr *cond,
+                            const clang::ParmVarDecl *param) {
+  const clang::Expr *e = stripTrivia(cond);
+  if (asPointerParamRef(e) == param)
+    return true;
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_PointerToBoolean)
+      return voidParamCondOk(cast->getSubExpr(), param);
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    if (unary->getOpcode() == clang::UO_LNot)
+      return voidParamCondOk(unary->getSubExpr(), param);
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e))
+    if (binary->getOpcode() == clang::BO_LAnd ||
+        binary->getOpcode() == clang::BO_LOr)
+      return voidParamCondOk(binary->getLHS(), param) &&
+             voidParamCondOk(binary->getRHS(), param);
+  return voidParamOnlyTruthTested(e, param);
+}
+
+/// Returns whether every use of the `void *` parameter `param` below
+/// `stmt` is a truth test: the condition position of if/while/do/for and
+/// of the conditional operator, or a `!` in any expression position. Such
+/// a parameter never acts as a pointer at all, so it classifies as an
+/// integer carrier (`ParamKind::Carrier`, CTS-P3); any other appearance
+/// keeps the historical void-pointer-parameter rejection.
+static bool voidParamOnlyTruthTested(const clang::Stmt *stmt,
+                                     const clang::ParmVarDecl *param) {
+  if (!stmt)
+    return true;
+  if (const auto *ifStmt = llvm::dyn_cast<clang::IfStmt>(stmt))
+    return voidParamCondOk(ifStmt->getCond(), param) &&
+           voidParamOnlyTruthTested(ifStmt->getInit(), param) &&
+           voidParamOnlyTruthTested(ifStmt->getThen(), param) &&
+           voidParamOnlyTruthTested(ifStmt->getElse(), param);
+  if (const auto *whileStmt = llvm::dyn_cast<clang::WhileStmt>(stmt))
+    return voidParamCondOk(whileStmt->getCond(), param) &&
+           voidParamOnlyTruthTested(whileStmt->getBody(), param);
+  if (const auto *doStmt = llvm::dyn_cast<clang::DoStmt>(stmt))
+    return voidParamCondOk(doStmt->getCond(), param) &&
+           voidParamOnlyTruthTested(doStmt->getBody(), param);
+  if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt))
+    return (!forStmt->getCond() ||
+            voidParamCondOk(forStmt->getCond(), param)) &&
+           voidParamOnlyTruthTested(forStmt->getInit(), param) &&
+           voidParamOnlyTruthTested(forStmt->getInc(), param) &&
+           voidParamOnlyTruthTested(forStmt->getBody(), param);
+  if (const auto *conditional =
+          llvm::dyn_cast<clang::ConditionalOperator>(stmt))
+    return voidParamCondOk(conditional->getCond(), param) &&
+           voidParamOnlyTruthTested(conditional->getTrueExpr(), param) &&
+           voidParamOnlyTruthTested(conditional->getFalseExpr(), param);
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt))
+    if (unary->getOpcode() == clang::UO_LNot)
+      return voidParamCondOk(unary, param);
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (ref->getDecl() == param)
+      return false; // A use that no truth-test context consumed.
+  for (const clang::Stmt *child : stmt->children())
+    if (!voidParamOnlyTruthTested(child, param))
+      return false;
+  return true;
+}
+
 /// Returns the local variable at the root of an address-of call argument
 /// (`&x`, `&s.f`, `&arr[i]`), or null when no single local root is known.
 /// Feeds the same-base aliasing rejection of `emitCall`.
@@ -3479,9 +3807,22 @@ static void mergeRegionFacts(PointerRegion &target,
     target.nullableLoc = absorbed.nullableLoc;
   }
   target.hasConditionalSource |= absorbed.hasConditionalSource;
+  if (absorbed.hasCarrierSource && !target.hasCarrierSource) {
+    target.hasCarrierSource = true;
+    target.carrierLoc = absorbed.carrierLoc;
+  }
   if (!absorbed.invalidReason.empty() && target.invalidReason.empty()) {
     target.invalidReason = absorbed.invalidReason;
     target.invalidLoc = absorbed.invalidLoc;
+  }
+  // A union that joins an integer-carrier source with a real address base
+  // (or literal/allocation) straddles the two pointer models (CTS-P3); it
+  // keeps the historical non-address rejection at the carrier site.
+  if (target.hasCarrierSource &&
+      (!target.bases.empty() || target.literalBase || target.allocSite) &&
+      target.invalidReason.empty()) {
+    target.invalidReason = "unsupported: pointer assigned a non-address value";
+    target.invalidLoc = target.carrierLoc;
   }
 }
 
@@ -3533,6 +3874,12 @@ void PointerRegionAnalysis::addBase(const clang::VarDecl *ptr,
   if (!member)
     unite(ptr, base);
   PointerRegion &region = regionFor(ptr);
+  // An address binding into a region already fed by an integer carrier
+  // straddles the two pointer models (CTS-P3); the region keeps the
+  // historical non-address rejection at the carrier site.
+  if (region.hasCarrierSource)
+    return markInvalid(ptr, region.carrierLoc,
+                       "unsupported: pointer assigned a non-address value");
   bool known = llvm::any_of(region.bases,
                             [&](const PointerBaseBinding &existing) {
                               return existing.base == base &&
@@ -3546,6 +3893,10 @@ void PointerRegionAnalysis::addLiteralBase(const clang::VarDecl *ptr,
                                            const clang::StringLiteral *literal,
                                            clang::SourceLocation loc) {
   PointerRegion &region = regionFor(ptr);
+  // A literal binding cannot join an integer-carrier region (CTS-P3).
+  if (region.hasCarrierSource)
+    return markInvalid(ptr, region.carrierLoc,
+                       "unsupported: pointer assigned a non-address value");
   if (!region.literalBase) {
     region.literalBase = literal;
     region.literalLoc = loc;
@@ -3571,6 +3922,26 @@ void PointerRegionAnalysis::recordNullable(const clang::VarDecl *ptr,
   if (!region.nullable) {
     region.nullable = true;
     region.nullableLoc = loc;
+  }
+}
+
+void PointerRegionAnalysis::recordCarrierSource(const clang::VarDecl *ptr,
+                                                clang::SourceLocation loc) {
+  // A global pointer never carries integers: its program-wide facts feed
+  // the CTS-P4/P6 global machinery, which has no carrier lowering; the
+  // historical rejection is kept unchanged.
+  if (!ptr->hasLocalStorage())
+    return markInvalid(ptr, loc,
+                       "unsupported: pointer assigned a non-address value");
+  PointerRegion &region = regionFor(ptr);
+  // A carrier source into a region that already binds a real address
+  // base, string literal, or allocation straddles the two models.
+  if (!region.bases.empty() || region.literalBase || region.allocSite)
+    return markInvalid(ptr, loc,
+                       "unsupported: pointer assigned a non-address value");
+  if (!region.hasCarrierSource) {
+    region.hasCarrierSource = true;
+    region.carrierLoc = loc;
   }
 }
 
@@ -3994,21 +4365,37 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
     return;
   }
 
+  // Integer-to-pointer traffic (explicit `(void *)v` casts and the
+  // implicit conversions C89-era code relies on): an integer conditional
+  // classifies each arm on its own (a 0 arm is a null pointer constant, so
+  // an all-null-arm conditional just marks the region nullable, the 00144
+  // shape); a POINTER-WIDTH integer source marks the region an integer
+  // carrier (CTS-P3) — the pointer is just an i64 in pointer clothing —
+  // and a narrower source (a truncated address can never round-trip)
+  // keeps the historical non-address rejection below.
+  if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
+    if (cast->getCastKind() == clang::CK_IntegralToPointer) {
+      const clang::Expr *sub = stripTrivia(cast->getSubExpr());
+      if (llvm::isa<clang::ConditionalOperator>(sub))
+        return recordPointerWrite(ptr, sub);
+      if (context->getTypeSize(cast->getSubExpr()->getType()) == 64)
+        return recordCarrierSource(ptr, loc);
+      return markInvalid(ptr, loc,
+                         "unsupported: pointer assigned a non-address value");
+    }
+
+  // `p = f(...)` on a callee whose pointer return classifies as an
+  // integer carrier (CTS-P3) propagates carrier-ness into `p`'s region;
+  // any other returned pointer keeps the non-address rejection below.
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(e))
+    if (const clang::FunctionDecl *callee = call->getDirectCallee())
+      if (carrierReturnQuery && carrierReturnQuery(callee))
+        return recordCarrierSource(ptr, loc);
+
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
     switch (cast->getCastKind()) {
     case clang::CK_NoOp:
       return recordPointerWrite(ptr, cast->getSubExpr());
-    case clang::CK_IntegralToPointer: {
-      // `q = i ? 0 : 0`: an integer conditional converted to a pointer;
-      // each arm classifies on its own (a 0 arm is a null pointer
-      // constant, so an all-null-arm conditional just marks the region
-      // nullable). Any other integer-to-pointer traffic keeps the
-      // non-address rejection below.
-      const clang::Expr *sub = stripTrivia(cast->getSubExpr());
-      if (llvm::isa<clang::ConditionalOperator>(sub))
-        return recordPointerWrite(ptr, sub);
-      break;
-    }
     case clang::CK_LValueToRValue: {
       // `p = q`: copying a pointer joins the two into one region.
       if (const clang::VarDecl *source = asLocalVarRef(cast->getSubExpr()))
@@ -4467,12 +4854,22 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     SmallVector<Type> results;
     clang::QualType returnType = fnType->getReturnType();
     if (!returnType->isVoidType()) {
-      FailureOr<Type> mapped = mapType(returnType, loc);
-      if (failed(mapped))
-        return failure();
-      if (!emitrust::FnPtrType::isValidComponentType(*mapped))
-        return emitError(loc) << "unsupported: function pointer result type";
-      results.push_back(*mapped);
+      if (isDataPointer(returnType)) {
+        // A data-pointer fn-ptr result (CTS-S, 00089) is representable
+        // only when every possible target erases it to one global base;
+        // the result then erases from the fn_ptr signature too, and
+        // indirect calls route to the base (`erasedGlobalReturnCallBase`).
+        if (failed(classifyFnPtrPointerResult(fnType, loc)))
+          return failure();
+      } else {
+        FailureOr<Type> mapped = mapType(returnType, loc);
+        if (failed(mapped))
+          return failure();
+        if (!emitrust::FnPtrType::isValidComponentType(*mapped))
+          return emitError(loc)
+                 << "unsupported: function pointer result type";
+        results.push_back(*mapped);
+      }
     }
     return Type(
         emitrust::FnPtrType::get(builder.getContext(), inputs, results));
@@ -4496,6 +4893,10 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     return mapType(type, loc);
   if (canonical->isPointerType()) {
     clang::QualType pointee = canonical->getPointeeType();
+    // An integer-carrier `void *` parameter (CTS-P3) is a plain i64: the
+    // callee only ever truth-tests it, so the value never needs a region.
+    if (kind == ParamKind::Carrier)
+      return Type(builder.getIntegerType(64));
     // A `void *` parameter has no element type to classify against and no
     // region to join at the call boundary (CTS-P9).
     if (pointee.getCanonicalType()->isVoidType())
@@ -4562,6 +4963,18 @@ CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
       // overrides the per-body slice classification.
       if (cellSliceParams.contains(param))
         kinds[index] = ParamKind::CellSlice;
+      // A `void *` parameter that the body only ever truth-tests is an
+      // integer carrier (CTS-P3): it lowers as a plain i64 and call sites
+      // pass carrier values. Any other `void *` parameter keeps the
+      // historical rejection in `mapParamType`.
+      if (isDataPointer(param->getType()) &&
+          param->getType()
+              .getCanonicalType()
+              ->getPointeeType()
+              .getCanonicalType()
+              ->isVoidType() &&
+          voidParamOnlyTruthTested(definition->getBody(), param))
+        kinds[index] = ParamKind::Carrier;
     }
   }
   auto [entry, inserted] =
@@ -4581,6 +4994,81 @@ FailureOr<Type> CImporter::classifyPointerReturn(
     return emitError(loc) << "unsupported: pointer return type";
   SmallVector<const clang::ReturnStmt *> returns;
   collectReturnStmts(definition->getBody(), returns);
+  if (returns.empty())
+    return emitError(loc) << "unsupported: pointer return type";
+  // The integer-carrier kind (CTS-P3): every return site yields an
+  // integer riding in pointer clothing (a null constant, an
+  // integer-to-pointer cast, a carrier-region local, or a call to another
+  // carrier-returning function), so the function returns a plain i64.
+  if (llvm::any_of(returns,
+                   [](const clang::ReturnStmt *ret) {
+                     return !ret->getRetValue() ||
+                            !returnedFunctionExpr(ret->getRetValue());
+                   }) &&
+      isCarrierReturnFunction(func)) {
+    Type kind = builder.getIntegerType(64);
+    pointerReturnKinds.try_emplace(canonical, kind);
+    return kind;
+  }
+  // The single-global-base RETURN region kind (CTS-S, 00089): one return
+  // site yielding the address of a global claims the kind for the whole
+  // function — every site must then return the SAME whole mutable global
+  // (cursor 0) and no site may return NULL. The pointer result ERASES from
+  // the signature (the classification is the null `Type`): no runtime
+  // pointer state travels, the call is retained for its side effects, and
+  // callers route accesses through the returned pointer to the global
+  // directly (see `erasedGlobalReturnCallBase`).
+  if (llvm::any_of(returns, [](const clang::ReturnStmt *ret) {
+        return ret->getRetValue() &&
+               returnedGlobalAddress(ret->getRetValue()).base;
+      })) {
+    const clang::VarDecl *commonBase = nullptr;
+    Location memberSiteLoc = loc;
+    bool sawMemberSite = false;
+    for (const clang::ReturnStmt *ret : returns) {
+      Location retLoc = translateLoc(ret->getReturnLoc());
+      const clang::Expr *value = ret->getRetValue();
+      if (!value)
+        return emitError(retLoc) << "unsupported: returned pointer value "
+                                    "(a bare return cannot carry the "
+                                    "global address)";
+      if (isNullPointerConstantExpr(value))
+        return emitError(retLoc)
+               << "unsupported: return sites mix a global address and NULL";
+      ReturnedGlobalAddress site = returnedGlobalAddress(value);
+      if (!site.base)
+        return emitError(retLoc)
+               << "unsupported: returned pointer value (only a returned "
+                  "whole-global or function address has a representation)";
+      if (commonBase && site.base != commonBase)
+        return emitError(retLoc) << "unsupported: return sites disagree on "
+                                    "the returned global base";
+      commonBase = site.base;
+      if (!site.wholeObject) {
+        sawMemberSite = true;
+        memberSiteLoc = retLoc;
+      }
+    }
+    if (sawMemberSite)
+      return emitError(memberSiteLoc)
+             << "unsupported: returned pointer value (a member address is "
+                "not a whole-global base)";
+    if (commonBase->getType().isConstQualified())
+      return emitError(loc)
+             << "unsupported: returned address of a const global";
+    // The erased routing stages and stores the base back at its own type,
+    // so the returned pointee must be exactly the whole global's type.
+    clang::QualType pointee = definition->getReturnType()
+                                  .getCanonicalType()
+                                  ->getPointeeType();
+    if (!astContext().hasSameUnqualifiedType(pointee, commonBase->getType()))
+      return emitError(loc) << "unsupported: returned pointer value (the "
+                               "returned global does not match the "
+                               "pointee type)";
+    globalReturnBases[canonical] = commonBase;
+    pointerReturnKinds.try_emplace(canonical, Type());
+    return Type();
+  }
   Type kind;
   for (const clang::ReturnStmt *ret : returns) {
     Location retLoc = translateLoc(ret->getReturnLoc());
@@ -4607,6 +5095,137 @@ FailureOr<Type> CImporter::classifyPointerReturn(
     return emitError(loc) << "unsupported: pointer return type";
   pointerReturnKinds.try_emplace(canonical, kind);
   return kind;
+}
+
+FailureOr<const clang::VarDecl *>
+CImporter::classifyFnPtrPointerResult(const clang::FunctionType *fnType,
+                                      Location loc) {
+  const clang::Type *key = astContext()
+                               .getCanonicalType(clang::QualType(fnType, 0))
+                               .getTypePtr();
+  if (const clang::VarDecl *cached = fnPtrReturnBases.lookup(key))
+    return cached;
+  // The candidate set must be whole-program: in a multi-TU project another
+  // TU could take a diverging function's address after this TU classified.
+  if (!currentSoleTU)
+    return emitError(loc) << "unsupported: function pointer result type";
+  if (!fnPtrReturnInProgress.insert(key).second)
+    return emitError(loc) << "unsupported: function pointer result type";
+  auto eraseInProgress = [&]() { fnPtrReturnInProgress.erase(key); };
+  clang::QualType returnType = fnType->getReturnType().getCanonicalType();
+  SmallVector<const clang::FunctionDecl *, 4> candidates;
+  for (const clang::FunctionDecl *fn : addressTakenFunctions)
+    if (astContext().hasSameUnqualifiedType(
+            fn->getReturnType().getCanonicalType(), returnType))
+      candidates.push_back(fn);
+  if (candidates.empty()) {
+    eraseInProgress();
+    return emitError(loc) << "unsupported: function pointer result type";
+  }
+  const clang::VarDecl *common = nullptr;
+  for (const clang::FunctionDecl *fn : candidates) {
+    FailureOr<Type> kind = classifyPointerReturn(fn, loc);
+    if (failed(kind)) {
+      eraseInProgress();
+      return failure();
+    }
+    const clang::VarDecl *base =
+        globalReturnBases.lookup(fn->getCanonicalDecl());
+    if (*kind || !base) {
+      eraseInProgress();
+      return emitError(loc) << "unsupported: function pointer result type";
+    }
+    if (common && base != common) {
+      eraseInProgress();
+      return emitError(loc) << "unsupported: return sites disagree on the "
+                               "returned global base";
+    }
+    common = base;
+  }
+  eraseInProgress();
+  fnPtrReturnBases[key] = common;
+  return common;
+}
+
+const clang::VarDecl *
+CImporter::erasedGlobalReturnCallBase(const clang::Expr *expr,
+                                      const clang::CallExpr **callOut) const {
+  const auto *call = llvm::dyn_cast<clang::CallExpr>(stripTrivia(expr));
+  if (!call)
+    return nullptr;
+  if (callOut)
+    *callOut = call;
+  if (const clang::FunctionDecl *callee = call->getDirectCallee())
+    return globalReturnBases.lookup(callee->getCanonicalDecl());
+  const clang::Expr *calleeExpr = call->getCallee()->IgnoreParenImpCasts();
+  clang::QualType calleeType = calleeExpr->getType().getCanonicalType();
+  if (!calleeType->isFunctionPointerType())
+    return nullptr;
+  return fnPtrReturnBases.lookup(
+      calleeType->getPointeeType().getCanonicalType().getTypePtr());
+}
+
+bool CImporter::isCarrierReturnFunction(const clang::FunctionDecl *func) {
+  const clang::FunctionDecl *canonical = func->getCanonicalDecl();
+  auto it = carrierReturnCache.find(canonical);
+  if (it != carrierReturnCache.end())
+    return it->second;
+  if (!isDataPointer(func->getReturnType())) {
+    carrierReturnCache.try_emplace(canonical, false);
+    return false;
+  }
+  const clang::FunctionDecl *definition = func->getDefinition();
+  if (!definition || !definition->hasBody()) {
+    carrierReturnCache.try_emplace(canonical, false);
+    return false;
+  }
+  // Break recursion cycles pessimistically (a self-recursive carrier
+  // return would need a fixpoint; none of the supported programs do).
+  if (!carrierReturnInProgress.insert(canonical).second)
+    return false;
+  PointerRegionAnalysis regions;
+  regions.carrierReturnQuery = [this](const clang::FunctionDecl *callee) {
+    return isCarrierReturnFunction(callee);
+  };
+  regions.analyze(astContext(), definition->getBody());
+  SmallVector<const clang::ReturnStmt *> returns;
+  collectReturnStmts(definition->getBody(), returns);
+  bool carrier = !returns.empty();
+  for (const clang::ReturnStmt *ret : returns)
+    if (!ret->getRetValue() ||
+        !isCarrierReturnExpr(regions, ret->getRetValue())) {
+      carrier = false;
+      break;
+    }
+  carrierReturnInProgress.erase(canonical);
+  carrierReturnCache.try_emplace(canonical, carrier);
+  return carrier;
+}
+
+bool CImporter::isCarrierReturnExpr(PointerRegionAnalysis &regions,
+                                    const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  if (e->isNullPointerConstant(astContext(),
+                               clang::Expr::NPC_NeverValueDependent) !=
+      clang::Expr::NPCK_NotNull)
+    return true;
+  if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e)) {
+    if (cast->getCastKind() == clang::CK_NullToPointer)
+      return true;
+    // Only a pointer-width integer rides as a carrier (mirroring
+    // `recordPointerWrite`'s classification gate).
+    if (cast->getCastKind() == clang::CK_IntegralToPointer)
+      return astContext().getTypeSize(cast->getSubExpr()->getType()) == 64;
+    if (cast->getCastKind() == clang::CK_NoOp)
+      return isCarrierReturnExpr(regions, cast->getSubExpr());
+  }
+  if (const clang::VarDecl *var = asLoadedLocalVarRef(e))
+    if (regions.tracks(var) && isCarrierRegion(regions.regionOf(var)))
+      return true;
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(e))
+    if (const clang::FunctionDecl *callee = call->getDirectCallee())
+      return isCarrierReturnFunction(callee);
+  return false;
 }
 
 //===----------------------------------------------------------------------===//
@@ -6126,11 +6745,125 @@ void CImporter::collectAddressTaken(const clang::Stmt *stmt) {
     collectAddressTaken(child);
 }
 
+void CImporter::planFnPtrAliases(const clang::TranslationUnitDecl *unit) {
+  fnPtrGlobalsWritten.clear();
+  addressTakenFunctions.clear();
+
+  // Records a write (assignment, increment) or escape (address-of) of a
+  // file-scope function-pointer variable: such a variable never aliases.
+  auto markWritten = [&](const clang::Expr *expr) {
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(expr));
+    if (!ref)
+      return;
+    const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+    if (!var || !var->hasGlobalStorage() ||
+        !var->getType().getCanonicalType()->isFunctionPointerType())
+      return;
+    fnPtrGlobalsWritten.insert(
+        llvm::cast<clang::VarDecl>(var->getCanonicalDecl()));
+  };
+
+  // Walks one statement/expression subtree. A `DeclRefExpr` naming a
+  // function ANYWHERE outside the callee position of a direct call is an
+  // address-taking use (the C decay model: the reference becomes a
+  // function pointer value), so it joins the candidate set consulted by
+  // `classifyFnPtrPointerResult`.
+  auto scanStmt = [&](auto &&self, const clang::Stmt *stmt) -> void {
+    if (!stmt)
+      return;
+    if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
+      // The callee of a direct call is not a value use of the function;
+      // a function-pointer callee expression is scanned like any value.
+      if (!call->getDirectCallee())
+        self(self, call->getCallee());
+      for (const clang::Expr *argument : call->arguments())
+        self(self, argument);
+      return;
+    }
+    if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt)) {
+      for (const clang::Decl *decl : declStmt->decls())
+        if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+          self(self, var->getInit());
+      return;
+    }
+    if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt)) {
+      if (const auto *fn =
+              llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl())) {
+        const auto *canonical =
+            llvm::cast<clang::FunctionDecl>(fn->getCanonicalDecl());
+        if (!llvm::is_contained(addressTakenFunctions, canonical))
+          addressTakenFunctions.push_back(canonical);
+      }
+      return;
+    }
+    if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt))
+      if (binary->isAssignmentOp())
+        markWritten(binary->getLHS());
+    if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt))
+      if (unary->getOpcode() == clang::UO_AddrOf ||
+          unary->isIncrementDecrementOp())
+        markWritten(unary->getSubExpr());
+    for (const clang::Stmt *child : stmt->children())
+      self(self, child);
+  };
+
+  for (const clang::Decl *decl : unit->decls()) {
+    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+      continue;
+    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+      if (func->hasBody() && func->getDefinition() == func)
+        scanStmt(scanStmt, func->getBody());
+      continue;
+    }
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+      if (const clang::Expr *init = var->getInit())
+        scanStmt(scanStmt, init);
+  }
+
+  // Alias planning: a file-scope function pointer initialized to a known
+  // function and never written anywhere in the TU. An externally visible
+  // variable only aliases in a sole-TU import (another TU could rebind
+  // it); a variadic target only when it is the hosted definition-less
+  // printf/fprintf, whose calls route through the printf machinery.
+  for (const clang::Decl *decl : unit->decls()) {
+    const auto *var = llvm::dyn_cast<clang::VarDecl>(decl);
+    if (!var || var->isImplicit() || isSystemHeaderDecl(var))
+      continue;
+    if (!var->getType().getCanonicalType()->isFunctionPointerType())
+      continue;
+    const auto *canonical =
+        llvm::cast<clang::VarDecl>(var->getCanonicalDecl());
+    if (fnPtrAliases.contains(canonical) ||
+        fnPtrGlobalsWritten.contains(canonical))
+      continue;
+    if (!currentSoleTU && var->isExternallyVisible())
+      continue;
+    const clang::Expr *init = canonical->getAnyInitializer();
+    const clang::Expr *fnExpr = init ? returnedFunctionExpr(init) : nullptr;
+    if (!fnExpr)
+      continue;
+    const auto *target = llvm::cast<clang::FunctionDecl>(
+        llvm::cast<clang::DeclRefExpr>(fnExpr)->getDecl());
+    if (target->isVariadic()) {
+      if (target->getDefinition() || !target->getDeclName().isIdentifier())
+        continue;
+      llvm::StringRef name = target->getName();
+      if (name != "printf" && name != "fprintf")
+        continue;
+    }
+    fnPtrAliases[canonical] = target;
+  }
+}
+
 LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   Location loc = translateLoc(var->getLocation());
   const clang::VarDecl *canonical = var->getCanonicalDecl();
   if (globals.contains(canonical))
     return success(); // Redeclaration of an already imported global.
+  // A devirtualized function-pointer alias (CTS-S, 00189) materializes no
+  // global at all; every use lowers against its target.
+  if (fnPtrAliases.contains(canonical))
+    return success();
 
   if (var->getTLSKind() != clang::VarDecl::TLS_None)
     return emitError(loc) << "unsupported: thread-local global variable";
@@ -7169,11 +7902,15 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   if (!returnType->isVoidType()) {
     if (isDataPointer(returnType)) {
       // A data-pointer return classifies by its return sites (CTS-P2):
-      // the fn-address kind returns the plain fn_ptr value.
+      // the fn-address kind returns the plain fn_ptr value, and the
+      // single-global-base kind (CTS-S, 00089) ERASES the result — the
+      // classification is the null `Type` and the function imports
+      // without one.
       FailureOr<Type> kind = classifyPointerReturn(func, loc);
       if (failed(kind))
         return failure();
-      resultTypes.push_back(*kind);
+      if (*kind)
+        resultTypes.push_back(*kind);
     } else {
       FailureOr<Type> mapped = mapType(returnType, loc);
       if (failed(mapped))
@@ -7235,6 +7972,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   addressTaken.clear();
   pointerLocals.clear();
   pointerPointerLocals.clear();
+  carrierLocals.clear();
+  carrierParams.clear();
   literalBackings.clear();
   paramCells.clear();
   ownerStructPlaces.clear();
@@ -7245,12 +7984,22 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   currentReceiverPlace = Value();
   currentMethodOwner = nullptr;
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
+  // An erased single-global-base pointer return (CTS-S, 00089): return
+  // sites emit a bare `return` instead of the classified `&global`.
+  currentErasedReturnBase =
+      globalReturnBases.lookup(func->getCanonicalDecl());
   currentFuncName = name;
   currentIsMain = name == "c_main";
   bodyRegion = &funcOp.getBody();
   entryBlock = funcOp.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
   collectAddressTaken(func->getBody());
+  // Calls to carrier-returning functions are carrier sources of the
+  // assigned pointer's region (CTS-P3).
+  pointerRegions.carrierReturnQuery =
+      [this](const clang::FunctionDecl *callee) {
+        return isCarrierReturnFunction(callee);
+      };
   pointerRegions.analyze(astContext(), func->getBody());
 
   // Method prologue (Phase 4): the receiver dereferences once into the
@@ -7287,6 +8036,12 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     Value blockArg =
         entryBlock->getArgument(methodOwner ? index + 1 : index);
     Type type = blockArg.getType();
+    // An integer-carrier `void *` parameter (CTS-P3) is a plain i64
+    // scalar; remember it so truth tests and carrier reads route to its
+    // prologue cell (bound through the ordinary scalar path below).
+    if (!methodOwner && isDataPointer(param->getType()) &&
+        type == builder.getIntegerType(64))
+      carrierParams.insert(param);
     if (methodOwner && isPointerType(param->getType()) &&
         !isFunctionPointer(param->getType())) {
       // Owner-region pointer parameter: an i64 element index into the
@@ -7380,6 +8135,10 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // CTS-P10 Pass A: cell-slice classification of pointer-parameter
   // classes whose bases are all mutable global arrays.
   planCellSlices(unit, soleTranslationUnit);
+  // CTS-S Pass A: per-TU fn-ptr facts (written globals, address-taken
+  // functions) and the devirtualization aliases of never-reassigned
+  // global function pointers.
+  planFnPtrAliases(unit);
   for (const clang::Decl *decl : unit->decls()) {
     if (decl->isImplicit())
       continue;
@@ -8420,6 +9179,26 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
     return success();
   }
   if (region->bases.empty()) {
+    // An integer-carrier region (CTS-P3): the pointer never addresses a
+    // modeled object — its only sources are integer-to-pointer casts,
+    // carrier-returning calls, and null constants — so its entire runtime
+    // state is one plain i64 cell (null is 0). Walking or dereferencing a
+    // carrier has nothing to resolve against and rejects here, at the
+    // first offending site the analysis recorded.
+    if (region->hasCarrierSource) {
+      if (region->hasArithmetic)
+        return emitError(translateLoc(region->arithmeticLoc))
+               << "unsupported: pointer arithmetic on an integer-carrier "
+                  "pointer";
+      if (region->hasWriteThrough)
+        return emitError(translateLoc(region->writeThroughLoc))
+               << "unsupported: dereference of an integer-carrier pointer";
+      Value cell = createEntryAlloca(loc, builder.getIntegerType(64));
+      carrierLocals[var] = cell;
+      if (const clang::Expr *init = var->getInit())
+        return storePointerAssign(loc, var, init);
+      return success();
+    }
     // Never bound to any object. A base-less nullable region with a
     // conditional source is STATICALLY NULL (CTS-P9): it only ever unites
     // null constants and other null-only pointers, so it carries zero
@@ -8579,6 +9358,15 @@ LogicalResult CImporter::emitPointerPointerLocal(const clang::VarDecl *var,
 LogicalResult CImporter::storePointerAssign(Location loc,
                                             const clang::VarDecl *ptr,
                                             const clang::Expr *rhs) {
+  // An integer-carrier pointer local (CTS-P3) rebinds by storing the
+  // carrier's plain i64 value into its cell; no pointer state exists.
+  if (Value cell = carrierLocals.lookup(ptr)) {
+    FailureOr<Value> value = emitCarrierValue(rhs);
+    if (failed(value))
+      return failure();
+    builder.create<memref::StoreOp>(loc, *value, cell);
+    return success();
+  }
   auto it = pointerLocals.find(ptr);
   if (it == pointerLocals.end()) {
     auto globalIt = pointerGlobals.find(ptr->getCanonicalDecl());
@@ -9160,12 +9948,28 @@ LogicalResult CImporter::emitDispatchSwitch(const clang::SwitchStmt *stmt,
 LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
   Location loc = translateLoc(stmt->getReturnLoc());
   if (const clang::Expr *retValue = stmt->getRetValue()) {
-    if (!currentReturnType)
+    if (!currentReturnType) {
+      if (currentErasedReturnBase) {
+        // A classified single-global-base pointer return (CTS-S, 00089):
+        // the result was erased from the signature, and the classification
+        // pinned every site to `&base` (side-effect free), so the site
+        // emits a bare return — no address value, no runtime state.
+        builder.create<func::ReturnOp>(loc);
+        builder.setInsertionPointToEnd(createBlock());
+        return success();
+      }
       return emitError(loc)
              << "unsupported: return with a value in a void function";
+    }
     FailureOr<Value> value = failure();
     if (isDataPointer(retValue->getType()) &&
-        llvm::isa<emitrust::FnPtrType>(currentReturnType)) {
+        currentReturnType == builder.getIntegerType(64)) {
+      // An integer-carrier pointer return (CTS-P3): the function's return
+      // type classified to a plain i64, and every return site yields a
+      // carrier value.
+      value = emitCarrierValue(retValue);
+    } else if (isDataPointer(retValue->getType()) &&
+               llvm::isa<emitrust::FnPtrType>(currentReturnType)) {
       // A classified fn-address pointer return (CTS-P2): peel the
       // `void *` cast and emit the fn_ptr constant directly.
       const clang::Expr *fnExpr = returnedFunctionExpr(retValue);
@@ -9679,9 +10483,66 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
         return emitMemcpyCall(call);
     }
   }
+  // A statement-position call through a devirtualized alias of a hosted
+  // variadic (CTS-S, 00189) routes through the printf machinery — the
+  // fprintf shape swallows its leading `stdout` argument. Non-variadic
+  // aliases fall through to emitCall's direct-call devirtualization.
+  if (const clang::FunctionDecl *target = devirtualizedCallee(call))
+    if (target->isVariadic())
+      return emitAliasedPrintf(call, target);
   // Calls without a direct callee (function pointers) are handled by the
   // indirect path inside emitCall.
   return success(succeeded(emitCall(call)));
+}
+
+LogicalResult
+CImporter::emitAliasedPrintf(const clang::CallExpr *call,
+                             const clang::FunctionDecl *target) {
+  Location loc = translateLoc(call->getBeginLoc());
+  unsigned formatIndex = 0;
+  if (target->getDeclName().isIdentifier() &&
+      target->getName() == "fprintf") {
+    if (call->getNumArgs() == 0)
+      return emitError(loc) << "unsupported: fprintf without a stream "
+                               "argument";
+    // The swallowed stream slot (the fprintf->printf routing): the ONLY
+    // position where a FILE* value is accepted, and only as the literal
+    // `stdout`. Every other FILE* use keeps its located rejection.
+    const auto *stream = llvm::dyn_cast<clang::DeclRefExpr>(
+        call->getArg(0)->IgnoreParenImpCasts());
+    const clang::NamedDecl *streamDecl =
+        stream ? llvm::dyn_cast<clang::NamedDecl>(stream->getDecl())
+               : nullptr;
+    if (!streamDecl || !streamDecl->getDeclName().isIdentifier() ||
+        streamDecl->getName() != "stdout")
+      return emitError(translateLoc(call->getArg(0)->getBeginLoc()))
+             << "unsupported: a devirtualized fprintf call requires the "
+                "literal 'stdout' stream argument";
+    formatIndex = 1;
+  }
+  if (call->getNumArgs() <= formatIndex)
+    return emitError(loc) << "unsupported: printf without a format string";
+  const clang::Expr *formatExpr =
+      call->getArg(formatIndex)->IgnoreParenImpCasts();
+  const auto *literal = llvm::dyn_cast<clang::StringLiteral>(formatExpr);
+  if (!literal || !literal->isOrdinary())
+    return emitError(loc)
+           << "unsupported: printf format must be an ordinary string literal";
+
+  SmallVector<Value> operands;
+  FailureOr<std::string> rustFormat = translatePrintfFormat(
+      loc, call, literal, /*firstArgIndex=*/formatIndex + 1, operands);
+  if (failed(rustFormat))
+    return failure();
+
+  SmallVector<Attribute> callArguments;
+  callArguments.push_back(builder.getStringAttr(*rustFormat));
+  for (unsigned i = 0, e = operands.size(); i < e; ++i)
+    callArguments.push_back(builder.getIndexAttr(i));
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("print!"),
+      builder.getArrayAttr(callArguments), operands);
+  return success();
 }
 
 LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
@@ -12185,6 +13046,18 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       borrows.push_back({index, argument});
       continue;
     }
+    // An integer-carrier parameter (CTS-P3) takes a plain i64; the
+    // pointer-typed argument must itself be a carrier value (a carrier
+    // local/parameter read, a null constant, an integer-to-pointer cast,
+    // or a carrier-returning call).
+    if (isDataPointer(argument->getType()) &&
+        input == builder.getIntegerType(64)) {
+      FailureOr<Value> carrier = emitCarrierValue(argument);
+      if (failed(carrier))
+        return failure();
+      arguments[index] = *carrier;
+      continue;
+    }
     FailureOr<Value> value = emitRValue(argument);
     if (failed(value))
       return failure();
@@ -12577,6 +13450,13 @@ FailureOr<Value> CImporter::emitIndirectCall(const clang::CallExpr *call) {
            << "unsupported: call with arguments through a function pointer "
               "without a prototype";
 
+  // A call through a devirtualized alias (CTS-S, 00189) lowers as a
+  // DIRECT call to the target: no fn_ptr value and no call_indirect.
+  const clang::VarDecl *aliasVar = nullptr;
+  if (const clang::FunctionDecl *target =
+          devirtualizedCallee(call, &aliasVar))
+    return emitDevirtualizedCall(call, aliasVar, target, loc);
+
   FailureOr<Value> fnValue = emitRValue(calleeExpr);
   if (failed(fnValue))
     return failure();
@@ -12601,6 +13481,77 @@ FailureOr<Value> CImporter::emitIndirectCall(const clang::CallExpr *call) {
 
   auto callOp = builder.create<emitrust::CallIndirectOp>(
       loc, fnPtrType.getResults(), *fnValue, arguments);
+  if (callOp->getNumResults() == 0)
+    return Value();
+  return callOp->getResult(0);
+}
+
+const clang::FunctionDecl *
+CImporter::devirtualizedCallee(const clang::CallExpr *call,
+                               const clang::VarDecl **aliasVar) const {
+  const clang::Expr *calleeExpr = call->getCallee()->IgnoreParens();
+  // `(*fp)(...)`: the decay/deref pair cancels out (see emitIndirectCall).
+  if (const auto *decay = llvm::dyn_cast<clang::ImplicitCastExpr>(calleeExpr))
+    if (decay->getCastKind() == clang::CK_FunctionToPointerDecay) {
+      const auto *deref = llvm::dyn_cast<clang::UnaryOperator>(
+          decay->getSubExpr()->IgnoreParens());
+      if (deref && deref->getOpcode() == clang::UO_Deref &&
+          isFunctionPointer(deref->getSubExpr()->getType()))
+        calleeExpr = deref->getSubExpr()->IgnoreParens();
+    }
+  const auto *ref =
+      llvm::dyn_cast<clang::DeclRefExpr>(calleeExpr->IgnoreParenImpCasts());
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var)
+    return nullptr;
+  const clang::FunctionDecl *target = fnPtrAliases.lookup(
+      llvm::cast<clang::VarDecl>(var->getCanonicalDecl()));
+  if (target && aliasVar)
+    *aliasVar = var;
+  return target;
+}
+
+FailureOr<Value>
+CImporter::emitDevirtualizedCall(const clang::CallExpr *call,
+                                 const clang::VarDecl *var,
+                                 const clang::FunctionDecl *target,
+                                 Location loc) {
+  // A hosted-variadic alias is statement-position only (the printf
+  // machinery has no result); reaching this value path is a rejection.
+  if (target->isVariadic())
+    return emitError(loc) << "unsupported: " << target->getName()
+                          << " return value must be unused";
+  FailureOr<Type> mapped = mapType(var->getType(), loc);
+  if (failed(mapped))
+    return failure();
+  auto fnPtrType = llvm::dyn_cast<emitrust::FnPtrType>(*mapped);
+  if (!fnPtrType)
+    return emitError(loc) << "unsupported function pointer type";
+  // The same import + signature check a `Some(target)` constant runs.
+  FailureOr<std::string> name =
+      resolveFunctionPointerDecl(target, fnPtrType, loc);
+  if (failed(name))
+    return failure();
+  func::FuncOp targetOp = functions.lookup(*name);
+
+  // Argument checking mirrors the indirect-call path.
+  SmallVector<Value> arguments;
+  for (const clang::Expr *argument : call->arguments()) {
+    FailureOr<Value> value = emitRValue(argument);
+    if (failed(value))
+      return failure();
+    arguments.push_back(*value);
+  }
+  ArrayRef<Type> inputs = fnPtrType.getInputs();
+  if (arguments.size() != inputs.size())
+    return emitError(loc) << "unsupported: call argument count mismatch";
+  for (auto [index, value] : llvm::enumerate(arguments))
+    if (value.getType() != inputs[index])
+      return emitError(loc) << "unsupported: call argument type mismatch";
+
+  auto callOp = builder.create<func::CallOp>(loc, targetOp, arguments);
   if (callOp->getNumResults() == 0)
     return Value();
   return callOp->getResult(0);
@@ -13237,10 +14188,82 @@ CImporter::regionElementType(const PtrExprValue &pointer,
   return std::nullopt; // Base-less: the deref rejects downstream.
 }
 
+Value CImporter::lookupCarrierCell(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    if (cast->getCastKind() != clang::CK_LValueToRValue &&
+        cast->getCastKind() != clang::CK_NoOp)
+      break;
+    e = stripTrivia(cast->getSubExpr());
+  }
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  if (!ref)
+    return Value();
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var)
+    return Value();
+  if (Value cell = carrierLocals.lookup(var))
+    return cell;
+  if (const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(var))
+    if (carrierParams.contains(param))
+      return symbols.lookup(param);
+  return Value();
+}
+
+FailureOr<Value> CImporter::emitCarrierValue(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  Location loc = translateLoc(e->getBeginLoc());
+  IntegerType carrierType = builder.getIntegerType(64);
+  // The null pointer constant is the carrier zero.
+  if (isNullPointerConstantExpr(e))
+    return createIntConstant(loc, carrierType, 0);
+  if (Value cell = lookupCarrierCell(e))
+    return loadPlace(loc, cell);
+  if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e)) {
+    if (cast->getCastKind() == clang::CK_NoOp)
+      return emitCarrierValue(cast->getSubExpr());
+    if (cast->getCastKind() == clang::CK_IntegralToPointer) {
+      // `(void *)v`: the integer rides along unchanged, converted to the
+      // i64 carrier width (an `emitrust.cast` for unsigned sources). Only
+      // pointer-width sources classify as carriers (a truncated address
+      // could never round-trip), mirroring the region analysis gate.
+      if (astContext().getTypeSize(cast->getSubExpr()->getType()) != 64)
+        return emitError(loc)
+               << "unsupported: pointer assigned a non-address value";
+      FailureOr<Value> value = emitRValue(cast->getSubExpr());
+      if (failed(value))
+        return failure();
+      if (!llvm::isa<IntegerType>((*value).getType()))
+        return emitError(loc)
+               << "unsupported: pointer assigned a non-address value";
+      return castToIntType(loc, *value, carrierType);
+    }
+  }
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(e)) {
+    FailureOr<Value> result = emitCall(call);
+    if (failed(result))
+      return failure();
+    if (*result && (*result).getType() == carrierType)
+      return result;
+    return emitError(loc)
+           << "unsupported: pointer assigned a non-address value";
+  }
+  return emitError(loc) << "unsupported: pointer assigned a non-address value";
+}
+
 FailureOr<Value> CImporter::emitPointerTruth(const clang::Expr *expr) {
   Location loc = translateLoc(expr->getBeginLoc());
   if (isNullPointerConstantExpr(expr)) // `if (NULL)` is constant false.
     return createBoolConstant(loc, false);
+  // An integer-carrier pointer (CTS-P3) is a plain i64; its truth test is
+  // an integer comparison against zero.
+  if (Value cell = lookupCarrierCell(expr)) {
+    Value value = loadPlace(loc, cell);
+    Value zero = createIntConstant(loc, builder.getIntegerType(64), 0);
+    return builder
+        .create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, value, zero)
+        .getResult();
+  }
   FailureOr<PtrExprValue> pointer = emitPointerRValue(expr);
   if (failed(pointer))
     return failure();
@@ -13276,6 +14299,16 @@ FailureOr<PtrExprValue>
 CImporter::emitPointerLocalRead(Location loc, const clang::VarDecl *var) {
   auto it = pointerLocals.find(var);
   if (it == pointerLocals.end()) {
+    // An integer-carrier pointer (CTS-P3) has no (base, cursor)
+    // decomposition at all: it is an integer in pointer clothing. Its
+    // modeled consumers (truth tests, carrier assignments, returns, and
+    // carrier call arguments) intercept it before this point, so reaching
+    // here means the carrier is used AS a pointer — a dereference, which
+    // would read from a fabricated address.
+    if (var->hasLocalStorage() &&
+        isCarrierRegion(pointerRegions.regionOf(var)))
+      return emitError(loc)
+             << "unsupported: dereference of an integer-carrier pointer";
     // A statically-null pointer (base-less nullable region, CTS-P9)
     // carries zero runtime state; its value is the empty decomposition,
     // which truth tests, null comparisons, and pointer-to-int casts fold
@@ -14010,6 +15043,41 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
           *writeback = GlobalWriteback{place, global->symbol};
         return place;
       }
+      // A devirtualized global function pointer (CTS-S, 00189) has no
+      // global of its own; a value use reads as the `Some(target)`
+      // constant (writes were excluded by the never-reassigned
+      // criterion). A variadic (printf-routed) alias has no fn_ptr value
+      // at all and keeps the type-level rejection at the use site.
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl())) {
+        if (const clang::FunctionDecl *target =
+                fnPtrAliases.lookup(var->getCanonicalDecl())) {
+          if (target->isVariadic())
+            return emitError(loc)
+                   << "unsupported: variadic function pointer type";
+          FailureOr<Type> mapped = mapType(var->getType(), loc);
+          if (failed(mapped))
+            return failure();
+          auto fnPtrType = llvm::dyn_cast<emitrust::FnPtrType>(*mapped);
+          if (!fnPtrType)
+            return emitError(loc) << "unsupported function pointer type";
+          FailureOr<std::string> name =
+              resolveFunctionPointerDecl(target, fnPtrType, loc);
+          if (failed(name))
+            return failure();
+          Value place = builder
+                            .create<emitrust::VariableOp>(
+                                loc, emitrust::LValueType::get(fnPtrType))
+                            .getResult();
+          auto some = emitrust::OpaqueAttr::get(
+              builder.getContext(),
+              (llvm::Twine("Some(") + *name + ")").str());
+          Value constant =
+              builder.create<emitrust::ConstantOp>(loc, fnPtrType, some)
+                  .getResult();
+          builder.create<emitrust::AssignOp>(loc, place, constant);
+          return place;
+        }
+      }
       // Decomposed pointer locals have no place of their own; every
       // supported use is routed through the pointer paths before this one.
       if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
@@ -14055,7 +15123,39 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
       return emitError(loc) << "unsupported use of pointer struct member '"
                             << field->getName() << "'";
     Value basePlace;
-    if (member->isArrow() && isDecomposedPointerExpr(member->getBase())) {
+    const clang::CallExpr *erasedCall = nullptr;
+    const clang::VarDecl *erasedBase =
+        member->isArrow()
+            ? erasedGlobalReturnCallBase(member->getBase(), &erasedCall)
+            : nullptr;
+    if (erasedBase) {
+      // `f()->m` through an erased single-global-base pointer return
+      // (CTS-S, 00089): the call is retained for its side effects (it
+      // yields no value), and the access routes to the base global
+      // through the ordinary staged-copy + writeback machinery — no
+      // runtime pointer state exists in the caller.
+      FailureOr<Value> effects = emitCall(erasedCall);
+      if (failed(effects))
+        return failure();
+      const GlobalInfo *global = lookupGlobal(erasedBase);
+      if (!global)
+        return emitError(loc)
+               << "unsupported: global '" << erasedBase->getName()
+               << "' backing an erased pointer return was not imported";
+      Value place = builder
+                        .create<emitrust::VariableOp>(
+                            loc, emitrust::LValueType::get(global->type))
+                        .getResult();
+      Value current = builder
+                          .create<emitrust::GlobalLoadOp>(
+                              loc, global->type, globalSymbol(global->symbol))
+                          .getResult();
+      builder.create<emitrust::AssignOp>(loc, place, current);
+      if (writeback)
+        *writeback = GlobalWriteback{place, global->symbol};
+      basePlace = place;
+    } else if (member->isArrow() &&
+               isDecomposedPointerExpr(member->getBase())) {
       // `p->f` through a decomposed pointer: resolve the pointer to its
       // place (the base object itself, or an element of the base array)
       // and refine it with the member access below.
