@@ -209,6 +209,55 @@ def EmitRust_SliceType : EmitRust_Type<"Slice", "slice"> {
   let genVerifyDecl = 1;
 }
 
+def EmitRust_CellSliceType : EmitRust_Type<"CellSlice", "cell_slice"> {
+  let summary = "EmitRust cell-slice type";
+
+  let description = [{
+    A dynamically sized run of `Cell` elements, emitted as the Rust slice
+    type `[std::cell::Cell<T>]`. The element type must be a scalar
+    (integer, index, or float). The type models the interprocedural
+    pointer-parameter class whose bases are all mutable globals (CTS-P10):
+    a callee may mutate elements through the parameter while other code
+    reads the same globals directly, and both sides observe every write
+    because `emitrust.cell_get`/`emitrust.cell_set` and
+    `emitrust.global_load`/`emitrust.global_store` hit the same
+    thread-local `Cell` storage.
+
+    Because a cell-slice is unsized, the type is only valid behind the
+    shared `!emitrust.ref` reference (rendering `&[std::cell::Cell<T>]`).
+    Cells provide interior mutability, so no `!emitrust.mut_ref` form
+    exists; the shared reference is freely duplicable, which is what lets
+    permuted recursive forwarding pass the same parameters along without
+    any reborrow discipline. It must not appear as the value type of an
+    `emitrust.variable` or `emitrust.global`, as a struct field type, or
+    as an array or slice element type.
+
+    Example:
+
+    ```mlir
+    // Parameter type emitted as `&[std::cell::Cell<i32>]`
+    !emitrust.ref<!emitrust.cell_slice<i32>>
+    ```
+  }];
+
+  let parameters = (ins "Type":$element_type);
+  let builders = [
+    TypeBuilderWithInferredContext<(ins "Type":$element_type), [{
+      return $_get(element_type.getContext(), element_type);
+    }]>
+  ];
+
+  let extraClassDeclaration = [{
+    /// Returns whether `type` may be used as a cell-slice element type: a
+    /// scalar (integer, index, f32, f64). Aggregates, references, lvalues,
+    /// and dialect types are rejected.
+    static bool isValidElementType(Type type);
+  }];
+
+  let assemblyFormat = "`<` qualified($element_type) `>`";
+  let genVerifyDecl = 1;
+}
+
 def EmitRust_FnPtrType : EmitRust_Type<"FnPtr", "fn_ptr"> {
   let summary = "EmitRust nullable function pointer type";
 

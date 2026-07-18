@@ -735,6 +735,124 @@ def EmitRust_GlobalStoreOp : EmitRust_Op<"global_store",
 }
 
 //===----------------------------------------------------------------------===//
+// CellGetOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_CellGetOp : EmitRust_Op<"cell_get"> {
+  let summary = "Cell-slice element read operation";
+  let description = [{
+    The `emitrust.cell_get` operation reads one element of a cell-slice
+    reference at an i64 index. The operand is the
+    `!emitrust.ref<!emitrust.cell_slice<T>>` reference itself — no
+    dereference or lvalue staging is involved — and the result type must
+    equal the cell-slice element type. The operation is emitted as a
+    `Cell::get` call on the indexed element.
+
+    Example:
+
+    ```mlir
+    %v = emitrust.cell_get %s[%i]
+        : (!emitrust.ref<!emitrust.cell_slice<i32>>, i64) -> i32
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v2: i32 = v0[v1 as usize].get();
+    ```
+  }];
+
+  let arguments = (ins EmitRust_RefType:$slice, I64:$index);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat =
+      "$slice `[` $index `]` attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// CellSetOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_CellSetOp : EmitRust_Op<"cell_set"> {
+  let summary = "Cell-slice element write operation";
+  let description = [{
+    The `emitrust.cell_set` operation replaces one element of a cell-slice
+    reference at an i64 index. The operand is the shared
+    `!emitrust.ref<!emitrust.cell_slice<T>>` reference itself (Cells give
+    interior mutability, so a shared reference suffices) and the value type
+    must equal the cell-slice element type. The operation is emitted as a
+    `Cell::set` call on the indexed element; the write is immediately
+    visible to `emitrust.global_load` of the backing global because both
+    touch the same thread-local `Cell` storage.
+
+    Example:
+
+    ```mlir
+    emitrust.cell_set %s[%i], %v
+        : (!emitrust.ref<!emitrust.cell_slice<i32>>, i64, i32) -> ()
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    v0[v1 as usize].set(v2);
+    ```
+  }];
+
+  let arguments = (ins EmitRust_RefType:$slice, I64:$index, AnyType:$value);
+  let results = (outs);
+
+  let assemblyFormat = "$slice `[` $index `]` `,` $value attr-dict `:` "
+                       "functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// GlobalCellsOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_GlobalCellsOp : EmitRust_Op<"global_cells",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Global cell-slice borrow region operation";
+  let description = [{
+    The `emitrust.global_cells` operation borrows a mutable
+    `emitrust.global` of array type as a cell-slice for the extent of its
+    single-block region. The region's entry block takes one argument, the
+    borrowed `!emitrust.ref<!emitrust.cell_slice<T>>` whose element type
+    `T` equals the global's array element type, and terminates with
+    `emitrust.yield`. The operation is a statement: it takes no operands
+    and produces no results, so no borrow ever escapes its accessor. Call
+    sites taking several distinct global arguments nest one region per
+    global, leftmost argument outermost.
+
+    The operation is emitted as the thread-local global's `with` accessor:
+    the closure binds the `&Cell<[T; N]>`, coerces it to the unsized
+    `&Cell<[T]>`, and flattens it with `as_slice_of_cells` into the
+    region argument's `&[std::cell::Cell<T>]` value.
+
+    Example:
+
+    ```mlir
+    emitrust.global_cells @g {
+    ^bb0(%cells: !emitrust.ref<!emitrust.cell_slice<i32>>):
+      emitrust.yield
+    }
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    g.with(|__emitrust_tl| {
+        let __emitrust_tl: &std::cell::Cell<[i32]> = __emitrust_tl;
+        let v0: &[std::cell::Cell<i32>] = __emitrust_tl.as_slice_of_cells();
+    });
+    ```
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$global);
+  let results = (outs);
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = "$global attr-dict-with-keyword $body";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // VariableOp
 //===----------------------------------------------------------------------===//
 
@@ -1618,14 +1736,16 @@ def EmitRust_ContinueOp : EmitRust_Op<"continue"> {
 //===----------------------------------------------------------------------===//
 
 def EmitRust_YieldOp : EmitRust_Op<"yield",
-    [Pure, Terminator, ParentOneOf<["IfOp", "ForOp", "LoopOp", "SwitchOp"]>]> {
+    [Pure, Terminator,
+     ParentOneOf<["IfOp", "ForOp", "LoopOp", "SwitchOp", "GlobalCellsOp"]>]> {
   let summary = "Block termination operation";
   let description = [{
     The `emitrust.yield` operation terminates the regions of `emitrust.if`,
-    `emitrust.for`, `emitrust.loop`, and `emitrust.switch`. It takes no
-    operands, produces no results, and emits no Rust code; it exists purely
-    to satisfy MLIR's structural requirement that blocks end with a
-    terminator, and may be omitted in the custom syntax.
+    `emitrust.for`, `emitrust.loop`, `emitrust.switch`, and
+    `emitrust.global_cells`. It takes no operands, produces no results, and
+    emits no Rust code; it exists purely to satisfy MLIR's structural
+    requirement that blocks end with a terminator, and may be omitted in
+    the custom syntax.
   }];
 
   let assemblyFormat = "attr-dict";

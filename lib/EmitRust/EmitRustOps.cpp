@@ -567,6 +567,94 @@ GlobalStoreOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 }
 
 //===----------------------------------------------------------------------===//
+// CellGetOp / CellSetOp
+//===----------------------------------------------------------------------===//
+
+/// Returns the cell-slice element type behind the shared reference
+/// `sliceType`, or null when the reference does not wrap a cell-slice.
+static Type cellSliceElementType(Type sliceType) {
+  auto refType = dyn_cast<RefType>(sliceType);
+  auto cellSlice =
+      refType ? dyn_cast<CellSliceType>(refType.getPointee()) : CellSliceType();
+  return cellSlice ? cellSlice.getElementType() : Type();
+}
+
+/// Verifies that the operand is a shared reference to a cell-slice whose
+/// element type equals the result type.
+LogicalResult CellGetOp::verify() {
+  Type elementType = cellSliceElementType(getSlice().getType());
+  if (!elementType)
+    return emitOpError("operand must be a !emitrust.ref of "
+                       "!emitrust.cell_slice type, but got ")
+           << getSlice().getType();
+  if (getResult().getType() != elementType)
+    return emitOpError("result type ")
+           << getResult().getType()
+           << " does not match the cell-slice element type " << elementType;
+  return success();
+}
+
+/// Verifies that the operand is a shared reference to a cell-slice whose
+/// element type equals the stored value's type.
+LogicalResult CellSetOp::verify() {
+  Type elementType = cellSliceElementType(getSlice().getType());
+  if (!elementType)
+    return emitOpError("operand must be a !emitrust.ref of "
+                       "!emitrust.cell_slice type, but got ")
+           << getSlice().getType();
+  if (getValue().getType() != elementType)
+    return emitOpError("value type ")
+           << getValue().getType()
+           << " does not match the cell-slice element type " << elementType;
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// GlobalCellsOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies the region shape: a single block taking exactly one argument,
+/// the borrowed `!emitrust.ref<!emitrust.cell_slice<T>>`.
+LogicalResult GlobalCellsOp::verify() {
+  Block &block = getBody().front();
+  if (block.getNumArguments() != 1)
+    return emitOpError("region entry block must take exactly one argument "
+                       "(the borrowed cell-slice), but has ")
+           << block.getNumArguments();
+  if (!cellSliceElementType(block.getArgument(0).getType()))
+    return emitOpError("region argument must be a !emitrust.ref of "
+                       "!emitrust.cell_slice type, but got ")
+           << block.getArgument(0).getType();
+  return success();
+}
+
+/// Verifies that the borrowed symbol is a mutable `emitrust.global` of
+/// array type whose element type equals the region argument's cell-slice
+/// element type.
+LogicalResult
+GlobalCellsOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  FailureOr<GlobalOp> global =
+      resolveGlobal(getOperation(), symbolTable, getGlobalAttr());
+  if (failed(global))
+    return failure();
+  if (global->getIsConst())
+    return emitOpError("cannot borrow the immutable global @")
+           << getGlobal() << " as a cell-slice";
+  auto arrayType = dyn_cast<ArrayType>(global->getType());
+  if (!arrayType)
+    return emitOpError("global @")
+           << getGlobal() << " must have an array value type, but has "
+           << global->getType();
+  Type elementType =
+      cellSliceElementType(getBody().front().getArgument(0).getType());
+  if (elementType != arrayType.getElementType())
+    return emitOpError("region cell-slice element type ")
+           << elementType << " does not match the element type "
+           << arrayType.getElementType() << " of the global @" << getGlobal();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // VariableOp
 //===----------------------------------------------------------------------===//
 

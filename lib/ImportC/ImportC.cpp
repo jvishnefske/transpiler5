@@ -199,6 +199,35 @@
 ///    load/store in an `emitrust.cast` bitcast, and every other
 ///    reinterpretation (including `void *` parameters and uncast `void *`
 ///    dereference) stays rejected.
+///  - Cell-slice parameters (CTS-P10): a pointer-parameter class whose
+///    interprocedural bases are ALL mutable global arrays of one scalar
+///    element type lowers to the shared `!emitrust.ref<!emitrust.cell_slice
+///    <T>>` (`&[std::cell::Cell<T>]`) — the coherence-sound choice, since a
+///    callee may mutate through the parameter while other code reads the
+///    globals directly mid-call (a staged copy would be unsound; both
+///    sides hit the same thread-local Cell). Pass A (`planCellSlices`)
+///    classifies via a union-find over exactly two argument shapes —
+///    direct global-array decay and parameter forwarding — element reads
+///    and writes are `emitrust.cell_get`/`emitrust.cell_set` on the
+///    reference itself (no lvalue staging, no cursor cell), unwalked
+///    parameters forward as the same SSA value (permuted recursion
+///    included), and call sites nest one `emitrust.global_cells` region
+///    per distinct global argument (leftmost outermost) with a scalar
+///    result flowing out through a staging variable. Mixing a global base
+///    with a local object and null-checked global-backed parameters stay
+///    located rejections with class-precise wordings.
+///  - Byte puns over i8 regions (CTS-P11): a wider-than-element
+///    reinterpreting deref `*(T *)p` is accepted when the region's base
+///    element is a byte (a C char array) and sizeof(T) is 2/4/8 — the
+///    access widens to sizeof(T) consecutive bytes at the runtime cursor,
+///    loading via `T::from_ne_bytes` and storing via `T::to_ne_bytes`
+///    (compound assignments read-modify-write the same window). Works
+///    over local AND global char arrays (global regions ride the ordinary
+///    staged-copy + writeback model, so a following direct or `%s` read
+///    of the global sees the punned bytes). A compile-time-constant
+///    offset whose window overruns the array is a located rejection, and
+///    wide views over non-byte bases keep the reinterpret rejection
+///    family.
 ///
 /// The importer is a functional core (the `CImporter` class below, which
 /// owns the builder and per-function symbol table) driven by the imperative
@@ -225,6 +254,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Location.h"
+#include "mlir/IR/Matchers.h"
 #include "mlir/IR/Verifier.h"
 
 #include "clang/AST/APValue.h"
@@ -416,8 +446,41 @@ struct PtrExprValue {
 /// `!emitrust.mut_ref<T>` references (the historical behavior). `Slice`
 /// parameters are subscripted, walked, compared, differenced, reassigned,
 /// copied into a pointer local, or passed onward, and become
-/// `!emitrust.mut_ref<!emitrust.slice<T>>` region bases.
-enum class ParamKind { ScalarRef, Slice };
+/// `!emitrust.mut_ref<!emitrust.slice<T>>` region bases. `CellSlice`
+/// parameters (CTS-P10) belong to an interprocedural class whose bases are
+/// ALL mutable global arrays of one element type; they become shared
+/// `!emitrust.ref<!emitrust.cell_slice<T>>` references, which stay
+/// coherent with direct global reads mid-call because both hit the same
+/// thread-local `Cell` (a staged copy would be unsound here).
+enum class ParamKind { ScalarRef, Slice, CellSlice };
+
+/// Why a pointer-parameter class with global bases does NOT lower to a
+/// cell-slice (CTS-P10 boundaries), keyed by the global base so the
+/// call-site rejection can name the precise reason.
+struct CellSliceReject {
+  /// The boundary that was hit.
+  enum class Kind {
+    /// The class joins a global base with a local object: one parameter
+    /// type would have to be both `&mut [T]` and `&[Cell<T>]`.
+    Mixed,
+    /// A parameter of the class is null-checked; Option wrapping and the
+    /// global_cells borrow discipline do not compose in v1.
+    NullableGlobal,
+  };
+  Kind kind;
+  /// The global base's C name (for the Mixed wording).
+  std::string globalName;
+  /// The first local object joined into the class (Mixed only).
+  std::string localName;
+};
+
+/// One cell-slice access expression in a callee body: a subscript `p[i]`
+/// or dereference `*p` of a `!emitrust.ref<!emitrust.cell_slice<T>>`
+/// parameter. `index` is null for the dereference form (element 0).
+struct CellSliceAccess {
+  const clang::ParmVarDecl *param;
+  const clang::Expr *index;
+};
 
 /// The decomposition record of one accepted pointer local (or, in Phase 1b,
 /// one slice-classified pointer parameter): the single base object of its
@@ -1045,6 +1108,64 @@ private:
   /// locals.
   const clang::VarDecl *resolveArgRoot(PointerRegionAnalysis &regions,
                                        const clang::Expr *expr) const;
+
+  //===--------------------------------------------------------------------===//
+  // Cell-slice planning (CTS-P10 Pass A)
+  //===--------------------------------------------------------------------===//
+
+  /// Pure-AST interprocedural pre-pass over every function definition of
+  /// the translation unit, run alongside `planOwners`. It builds a
+  /// union-find over data-pointer parameters and mutable global array
+  /// bases from exactly two argument shapes — the direct decay of a global
+  /// array (`f(G)`) and the forwarding of another cell-slice-candidate
+  /// parameter (`f(p)`, which is what makes Hanoi's permuted recursion
+  /// classify) — and qualifies every class ALL of whose storage bases are
+  /// mutable, internal-or-sole-TU global arrays of one supported scalar
+  /// element type, whose parameters are never walked, reassigned,
+  /// null-checked, escaped, or joined by a pointer local, and whose
+  /// functions are defined here (and internal unless this TU is the whole
+  /// program). Qualified parameters populate `cellSliceParams`
+  /// (`classifyPointerParams` reports them as `ParamKind::CellSlice`); a
+  /// class with global bases that hits the Mixed or NullableGlobal
+  /// boundary records a `CellSliceReject` per global base, which the
+  /// call-site rejection consults for its precise wording. Every other
+  /// disqualification silently keeps the historical staged-copy rejection.
+  void planCellSlices(const clang::TranslationUnitDecl *unit,
+                      bool soleTranslationUnit);
+
+  /// Returns the global array variable a call argument decays directly
+  /// (`f(G)` with no offset), or null: the only global argument shape the
+  /// cell-slice class admits.
+  const clang::VarDecl *
+  asDecayedGlobalArrayArg(const clang::Expr *expr) const;
+
+  /// Returns the pointer parameter a call argument reads directly
+  /// (`f(p)`), or null.
+  const clang::ParmVarDecl *asPointerParamRead(const clang::Expr *expr) const;
+
+  /// Returns the cell-slice access `expr` denotes — a subscript `p[i]` or
+  /// dereference `*p` whose base reads a parameter bound to a
+  /// `!emitrust.ref<!emitrust.cell_slice<T>>` value — or nothing.
+  std::optional<CellSliceAccess>
+  matchCellSliceAccess(const clang::Expr *expr) const;
+
+  /// Emits `emitrust.cell_get` for the access: the parameter's reference
+  /// SSA value indexed at the i64-converted index (0 for a dereference).
+  FailureOr<Value> emitCellSliceGet(const CellSliceAccess &access,
+                                    Location loc);
+
+  /// Emits `rhs` and stores it with `emitrust.cell_set` (converting the
+  /// value to the element type as C assignment does).
+  LogicalResult emitCellSliceAssign(const CellSliceAccess &access,
+                                    const clang::Expr *rhs, Location loc);
+
+  /// Emits the located rejection for passing a pointer into the global
+  /// `base` to a function: the precise cell-slice boundary wording when
+  /// Pass A recorded one (mixed local+global class, nullable
+  /// global-backed parameter), the historical staged-copy wording
+  /// otherwise.
+  LogicalResult rejectGlobalPointerArgument(Location loc,
+                                            const clang::VarDecl *base);
 
   //===--------------------------------------------------------------------===//
   // Pointer struct members (CTS-P2)
@@ -2157,6 +2278,63 @@ private:
   std::optional<clang::QualType>
   regionElementType(const PtrExprValue &pointer, clang::QualType viewed);
 
+  //===--------------------------------------------------------------------===//
+  // Byte puns over i8 regions (CTS-P11)
+  //===--------------------------------------------------------------------===//
+
+  /// Returns the dereference `*(T *)p` when `expr` is a reinterpreting
+  /// view over a byte region with a WIDER integer view (sizeof(T) in
+  /// {2, 4, 8}): the byte-pun shape, which widens to a
+  /// `T::from_ne_bytes`/`to_ne_bytes` access over sizeof(T) consecutive
+  /// bytes instead of taking the same-width reinterpret path. Returns
+  /// null for every other expression (in particular for wider views over
+  /// non-byte bases, which keep the reinterpret rejection family).
+  const clang::UnaryOperator *
+  matchWideByteViewDeref(const clang::Expr *expr);
+
+  /// Statically resolves the region element C type of a pointer
+  /// expression from the AST alone (decayed arrays, tracked pointer
+  /// locals, global data pointers, and +/- arithmetic peel through), or
+  /// nothing when no single element type is known. Side-effect-free
+  /// companion of `regionElementType` for use before any emission.
+  std::optional<clang::QualType>
+  pointerElementTypeFromAST(const clang::Expr *expr) const;
+
+  /// The resolved target of one wide byte access: the byte-array place
+  /// (a local array, a string-literal backing, or a staged global copy),
+  /// the i64 byte cursor, and the access width.
+  struct WideByteAccess {
+    /// The `!emitrust.lvalue<!emitrust.array<Nxi8>>` byte-run place.
+    Value basePlace;
+    /// The i64 cursor of the access's first byte.
+    Value cursor;
+    /// The mapped integer type of the viewed access (e.g. ui32).
+    IntegerType valueType;
+    /// sizeof(T) of the viewed type, in bytes.
+    unsigned byteWidth;
+  };
+
+  /// Resolves the wide byte access `deref` designates: decomposes the
+  /// pointer, resolves its byte-array base place (staging a global base's
+  /// whole value like every other global element access; a write context
+  /// passes `writeback` for the store-back), and rejects — with the
+  /// located `runs past the end` diagnostic — a compile-time-constant
+  /// offset whose widened window overruns the array.
+  FailureOr<WideByteAccess>
+  resolveWideByteAccess(const clang::UnaryOperator *deref, Location loc,
+                        GlobalWriteback *writeback);
+
+  /// Emits the widened load: the `byteWidth` bytes at the cursor are
+  /// gathered (as u8) into a byte-array temporary and combined with
+  /// `T::from_ne_bytes`.
+  FailureOr<Value> emitWideByteLoad(const WideByteAccess &access,
+                                    Location loc);
+
+  /// Emits the widened store: `value` is split with `T::to_ne_bytes` and
+  /// the bytes are stored back (as i8) at the cursor.
+  LogicalResult emitWideByteStore(const WideByteAccess &access, Value value,
+                                  Location loc);
+
   /// Emits an expression as an assignable place: either a rank-0 memref
   /// value (scalar locals) or an `!emitrust.lvalue` value (aggregates,
   /// dereferences, fields, elements). A reference to an imported global
@@ -2320,6 +2498,16 @@ private:
   /// function whose data-pointer return classifies as a returned function
   /// address.
   llvm::DenseMap<const clang::FunctionDecl *, Type> pointerReturnKinds;
+  /// Parameters whose interprocedural class qualified for the cell-slice
+  /// lowering (CTS-P10), keyed by the definition's parameter declaration;
+  /// populated by `planCellSlices` and consulted by
+  /// `classifyPointerParams` (accumulates across TUs).
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 16> cellSliceParams;
+  /// Located boundary verdicts for classes with global bases that did NOT
+  /// qualify (mixed local+global, nullable global-backed), keyed by the
+  /// canonical global base declaration; the call-site rejection consults
+  /// this map for its precise wording.
+  llvm::DenseMap<const clang::VarDecl *, CellSliceReject> cellSliceRejects;
   /// Phase-4 owner plans keyed by the promoted base variable declaration
   /// (accumulates across TUs; each TU's declarations are distinct).
   llvm::DenseMap<const clang::VarDecl *, OwnerPlan> ownerPlans;
@@ -2659,24 +2847,54 @@ static const clang::Expr *peelPointerCast(clang::ASTContext &context,
   }
 }
 
-/// Returns whether decomposing `expr` peels through a pointee-changing
-/// pointer cast — a `void *`-mediated reinterpret-back site such as
-/// `*(T *)p` on a `void *` cursor (CTS-P9). The deref emission consults
-/// this to type-check the viewed type against the region's base element
-/// type; expressions whose peels all preserve the pointee (qualification
-/// adjustments) keep the historical unchecked path.
-static bool peelsReinterpretingPointerCast(clang::ASTContext &context,
-                                           const clang::Expr *expr) {
+/// Strips the leading pointer casts a *dereference* site sees through:
+/// first the decomposition-transparent peels (`peelPointerCast` —
+/// qualification adjustments and the `void *` wildcard), then direct
+/// explicit bitcasts between distinct non-void single-level object
+/// pointees (`(unsigned *)(char *)...`, the classic type-pun spelling,
+/// CTS-P11). The latter are NOT transparent to the general decomposition
+/// (binding a pointer through one still rejects); only the deref
+/// emission strips them, and it then type-checks the viewed type against
+/// the region's element type — exact matches lower directly, same-width
+/// integer views bitcast, wider views over byte regions widen to
+/// ne_bytes accesses, and everything else keeps the located
+/// `reinterprets the pointee` rejection.
+static const clang::Expr *stripObjectPointerCasts(clang::ASTContext &context,
+                                                  const clang::Expr *expr) {
   const clang::Expr *e = stripTrivia(expr);
-  bool changed = false;
-  while (const clang::Expr *sub = peelPointerCast(context, e)) {
-    if (!context.hasSameUnqualifiedType(
-            e->getType().getCanonicalType()->getPointeeType(),
-            sub->getType().getCanonicalType()->getPointeeType()))
-      changed = true;
-    e = stripTrivia(sub);
+  while (true) {
+    if (const clang::Expr *sub = peelPointerCast(context, e)) {
+      e = stripTrivia(sub);
+      continue;
+    }
+    const auto *cast = llvm::dyn_cast<clang::CastExpr>(e);
+    if (!cast || (!llvm::isa<clang::CStyleCastExpr>(cast) &&
+                  !llvm::isa<clang::ImplicitCastExpr>(cast)) ||
+        cast->getCastKind() != clang::CK_BitCast)
+      return e;
+    clang::QualType from = cast->getSubExpr()->getType();
+    clang::QualType to = cast->getType();
+    if (!isDataPointer(from) || !isDataPointer(to))
+      return e;
+    // Pointer-to-pointer reinterprets stay out (CTS-P5 scope).
+    if (from.getCanonicalType()->getPointeeType()->isPointerType() ||
+        to.getCanonicalType()->getPointeeType()->isPointerType())
+      return e;
+    e = stripTrivia(cast->getSubExpr());
   }
-  return changed;
+}
+
+/// Returns whether the dereference of `expr` views the region through a
+/// changed pointee: the fully cast-stripped pointer's pointee differs
+/// from `expr`'s own pointee (covers both the `void *`-mediated
+/// reinterpret-back sites of CTS-P9 and the direct pun casts of
+/// CTS-P11). Qualification-only peels report false.
+static bool viewsChangedPointee(clang::ASTContext &context,
+                                const clang::Expr *expr) {
+  const clang::Expr *stripped = stripObjectPointerCasts(context, expr);
+  return !context.hasSameUnqualifiedType(
+      expr->getType().getCanonicalType()->getPointeeType(),
+      stripped->getType().getCanonicalType()->getPointeeType());
 }
 
 /// Returns whether `region` is statically null (CTS-P9): a consumable
@@ -4134,6 +4352,15 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     FailureOr<Type> inner = mapType(pointee, loc);
     if (failed(inner))
       return failure();
+    if (kind == ParamKind::CellSlice) {
+      // A cell-slice class parameter (CTS-P10): a shared reference to a
+      // run of Cells over one of the class's mutable global array bases.
+      if (!emitrust::CellSliceType::isValidElementType(*inner))
+        return emitError(loc)
+               << "unsupported: cell-slice parameter element type " << *inner;
+      return Type(
+          emitrust::RefType::get(emitrust::CellSliceType::get(*inner)));
+    }
     if (kind == ParamKind::Slice) {
       // A slice element must be sized and scalar/struct; a pointer to an
       // array (`int (*)[N]`) has no slice shape.
@@ -4170,9 +4397,14 @@ CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
       definition->getNumParams() == kinds.size()) {
     llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> sliceParams;
     collectSliceParams(definition->getBody(), sliceParams);
-    for (auto [index, param] : llvm::enumerate(definition->parameters()))
+    for (auto [index, param] : llvm::enumerate(definition->parameters())) {
       if (sliceParams.contains(param))
         kinds[index] = ParamKind::Slice;
+      // The interprocedural cell-slice class (CTS-P10, planned in Pass A)
+      // overrides the per-body slice classification.
+      if (cellSliceParams.contains(param))
+        kinds[index] = ParamKind::CellSlice;
+    }
   }
   auto [entry, inserted] =
       paramKindsCache.try_emplace(canonical, std::move(kinds));
@@ -4737,6 +4969,450 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
     ownerPlans[base] = OwnerPlan{structName, /*structDefCreated=*/false};
     for (const clang::FunctionDecl *fn : methodFns)
       methodPlans[fn->getCanonicalDecl()] = base;
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Cell-slice planning (CTS-P10 Pass A)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Recursive body walk collecting the per-parameter facts the cell-slice
+/// qualification needs: which data-pointer parameters are null-checked
+/// (compared against a null pointer constant, logically negated, or truth
+/// tested as a statement condition) and which are used in any shape other
+/// than a subscript base, a dereference base, a null check, or an argument
+/// to a defined non-variadic callee (such "escaping" uses poison the
+/// parameter's class — the cell-slice emission only models the whitelisted
+/// shapes). The walk is top-down: a consuming context skips the consumed
+/// parameter read, so any parameter read reached raw is an escape.
+class CellSliceBodyScan {
+public:
+  CellSliceBodyScan(
+      clang::ASTContext &context,
+      llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &nullChecked,
+      llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &poisoned)
+      : context(context), nullChecked(nullChecked), poisoned(poisoned) {}
+
+  /// Walks `stmt` and its children.
+  void visit(const clang::Stmt *stmt) {
+    if (!stmt)
+      return;
+
+    // Statement conditions truth-test a directly named pointer parameter
+    // (`if (p)`, `while (p)`): a null check.
+    if (const auto *ifStmt = llvm::dyn_cast<clang::IfStmt>(stmt))
+      markConditionNullCheck(ifStmt->getCond());
+    else if (const auto *whileStmt = llvm::dyn_cast<clang::WhileStmt>(stmt))
+      markConditionNullCheck(whileStmt->getCond());
+    else if (const auto *doStmt = llvm::dyn_cast<clang::DoStmt>(stmt))
+      markConditionNullCheck(doStmt->getCond());
+    else if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt))
+      markConditionNullCheck(forStmt->getCond());
+
+    if (const auto *expr = llvm::dyn_cast<clang::Expr>(stmt)) {
+      visitExpr(expr);
+      return;
+    }
+    for (const clang::Stmt *child : stmt->children())
+      visit(child);
+  }
+
+private:
+  /// Returns the data-pointer parameter `expr` reads, or null.
+  const clang::ParmVarDecl *asParamRead(const clang::Expr *expr) const {
+    if (!expr)
+      return nullptr;
+    const clang::Expr *e = stripTrivia(expr);
+    while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+      if (cast->getCastKind() != clang::CK_LValueToRValue &&
+          cast->getCastKind() != clang::CK_NoOp)
+        break;
+      e = stripTrivia(cast->getSubExpr());
+    }
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+    const auto *param =
+        ref ? llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()) : nullptr;
+    if (param && isPointerType(param->getType()) &&
+        !isFunctionPointer(param->getType()))
+      return param;
+    return nullptr;
+  }
+
+  /// Returns whether `expr` is a null pointer constant.
+  bool isNullConstant(const clang::Expr *expr) const {
+    return expr->isNullPointerConstant(
+               context, clang::Expr::NPC_NeverValueDependent) !=
+           clang::Expr::NPCK_NotNull;
+  }
+
+  /// Marks a statement condition that is a bare parameter read (a truth
+  /// test) as a null check and lets the regular walk handle the rest.
+  void markConditionNullCheck(const clang::Expr *cond) {
+    if (const clang::ParmVarDecl *param = asParamRead(cond)) {
+      nullChecked.insert(param);
+      conditionTested.insert(param);
+    }
+  }
+
+  /// Expression walk with consuming-context dispatch.
+  void visitExpr(const clang::Expr *expr) {
+    const clang::Expr *e = stripTrivia(expr);
+    // A subscript through a parameter consumes the base read.
+    if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(e)) {
+      if (asParamRead(subscript->getBase())) {
+        visitExpr(subscript->getIdx());
+        return;
+      }
+    }
+    // A dereference of a parameter consumes the read; `!p` is a null
+    // check.
+    if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e)) {
+      const clang::ParmVarDecl *param = asParamRead(unary->getSubExpr());
+      if (param && unary->getOpcode() == clang::UO_Deref)
+        return;
+      if (param && unary->getOpcode() == clang::UO_LNot) {
+        nullChecked.insert(param);
+        return;
+      }
+    }
+    // `p == NULL` / `p != NULL` is a null check; comparisons against
+    // anything else fall through to the raw-read poison below.
+    if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e)) {
+      if (binary->getOpcode() == clang::BO_EQ ||
+          binary->getOpcode() == clang::BO_NE) {
+        const clang::ParmVarDecl *lhsParam = asParamRead(binary->getLHS());
+        const clang::ParmVarDecl *rhsParam = asParamRead(binary->getRHS());
+        if (lhsParam && isNullConstant(binary->getRHS())) {
+          nullChecked.insert(lhsParam);
+          return;
+        }
+        if (rhsParam && isNullConstant(binary->getLHS())) {
+          nullChecked.insert(rhsParam);
+          return;
+        }
+      }
+    }
+    // A defined non-variadic direct callee consumes its parameter-read
+    // arguments (the call-edge scan classifies them); any other call
+    // escapes them.
+    if (const auto *call = llvm::dyn_cast<clang::CallExpr>(e)) {
+      const clang::FunctionDecl *callee = call->getDirectCallee();
+      const clang::FunctionDecl *definition =
+          callee ? callee->getDefinition() : nullptr;
+      bool visible = callee && !callee->isVariadic() && definition &&
+                     definition->hasBody() &&
+                     call->getNumArgs() == definition->getNumParams();
+      for (const clang::Expr *argument : call->arguments()) {
+        if (const clang::ParmVarDecl *param = asParamRead(argument)) {
+          if (!visible)
+            poisoned.insert(param);
+          continue;
+        }
+        visitExpr(argument);
+      }
+      return;
+    }
+    // A raw parameter read outside every whitelisted context escapes the
+    // class (walks, reassignments, copies, differences, address-taking,
+    // returns, ...). A bare read already recorded as a statement-condition
+    // truth test is consumed.
+    if (const clang::ParmVarDecl *param = asParamRead(e)) {
+      if (!conditionTested.contains(param))
+        poisoned.insert(param);
+      return;
+    }
+    // The address-of or ++/-- of a parameter never reads it
+    // (no LValueToRValue), so catch the raw DeclRefExpr too.
+    if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e)) {
+      if (const auto *param =
+              llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()))
+        if (isPointerType(param->getType()) &&
+            !isFunctionPointer(param->getType()))
+          poisoned.insert(param);
+      return;
+    }
+    for (const clang::Stmt *child : e->children())
+      visit(child);
+  }
+
+  clang::ASTContext &context;
+  llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &nullChecked;
+  llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &poisoned;
+  /// Parameters truth-tested as a whole statement condition: their bare
+  /// read is consumed, not an escape.
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> conditionTested;
+};
+
+} // namespace
+
+const clang::VarDecl *
+CImporter::asDecayedGlobalArrayArg(const clang::Expr *expr) const {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *noop = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    if (noop->getCastKind() != clang::CK_NoOp)
+      break;
+    e = stripTrivia(noop->getSubExpr());
+  }
+  const auto *decay = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+  if (!decay || decay->getCastKind() != clang::CK_ArrayToPointerDecay)
+    return nullptr;
+  const auto *ref =
+      llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(decay->getSubExpr()));
+  const auto *var = ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl())
+                        : nullptr;
+  if (!var || var->hasLocalStorage() ||
+      !astContext().getAsConstantArrayType(var->getType()))
+    return nullptr;
+  return var->getCanonicalDecl();
+}
+
+const clang::ParmVarDecl *
+CImporter::asPointerParamRead(const clang::Expr *expr) const {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    if (cast->getCastKind() != clang::CK_LValueToRValue &&
+        cast->getCastKind() != clang::CK_NoOp)
+      break;
+    e = stripTrivia(cast->getSubExpr());
+  }
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  const auto *param =
+      ref ? llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()) : nullptr;
+  if (param && isPointerType(param->getType()) &&
+      !isFunctionPointer(param->getType()))
+    return param;
+  return nullptr;
+}
+
+void CImporter::planCellSlices(const clang::TranslationUnitDecl *unit,
+                               bool soleTranslationUnit) {
+  // Union-find over data-pointer parameters and global array bases,
+  // mirroring `planOwners`' machinery (see there for the fixpoint
+  // argument).
+  llvm::DenseMap<const clang::VarDecl *, const clang::VarDecl *> parent;
+  auto find = [&](const clang::VarDecl *decl) -> const clang::VarDecl * {
+    parent.try_emplace(decl, decl);
+    const clang::VarDecl *root = decl;
+    while (parent[root] != root)
+      root = parent[root];
+    while (parent[decl] != root) {
+      const clang::VarDecl *next = parent[decl];
+      parent[decl] = root;
+      decl = next;
+    }
+    return root;
+  };
+  auto unite = [&](const clang::VarDecl *a, const clang::VarDecl *b) {
+    parent[find(b)] = find(a);
+  };
+
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> poisoned;
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 8> nullChecked;
+  // The first local object a class's parameter also received (the Mixed
+  // boundary), keyed by the callee parameter that received it.
+  llvm::DenseMap<const clang::VarDecl *, std::string> localJoins;
+
+  SmallVector<const clang::FunctionDecl *> definitions;
+  for (const clang::Decl *decl : unit->decls())
+    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl))
+      if (func->doesThisDeclarationHaveABody() && !func->isVariadic() &&
+          !isSystemHeaderDecl(func))
+        definitions.push_back(func);
+
+  for (const clang::FunctionDecl *func : definitions) {
+    // Body facts: null checks and escaping uses of this definition's own
+    // data-pointer parameters.
+    llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> bodyNullChecked;
+    llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> bodyPoisoned;
+    CellSliceBodyScan scan(astContext(), bodyNullChecked, bodyPoisoned);
+    scan.visit(func->getBody());
+    nullChecked.insert(bodyNullChecked.begin(), bodyNullChecked.end());
+    for (const clang::ParmVarDecl *param : bodyPoisoned)
+      poisoned.insert(param);
+
+    // A pointer local bound to a parameter joins its region (Phase 1a
+    // records the parameter as a base); the cell-slice emission has no
+    // local-pointer form, so such a parameter's class stays on the
+    // historical lowering.
+    PointerRegionAnalysis analysis;
+    analysis.analyze(astContext(), func->getBody());
+    for (const clang::VarDecl *var : analysis.trackedVars())
+      if (const PointerRegion *region = analysis.regionOf(var))
+        for (const PointerBaseBinding &binding : region->bases)
+          if (llvm::isa<clang::ParmVarDecl>(binding.base))
+            poisoned.insert(binding.base);
+
+    // In a project import an externally visible function may be called
+    // from an unseen TU with a local argument; its class must not turn
+    // its parameters into cell-slices.
+    if (!soleTranslationUnit && func->isExternallyVisible())
+      for (const clang::ParmVarDecl *param : func->parameters())
+        if (isPointerType(param->getType()) &&
+            !isFunctionPointer(param->getType()))
+          poisoned.insert(param);
+
+    // Call edges: exactly two argument shapes bind into the class — the
+    // direct decay of a global array and the forwarding of another
+    // data-pointer parameter. A local array decay records the Mixed
+    // boundary fact; everything else poisons the callee parameter.
+    SmallVector<const clang::CallExpr *> calls;
+    collectCallExprs(func->getBody(), calls);
+    for (const clang::CallExpr *call : calls) {
+      const clang::FunctionDecl *callee = call->getDirectCallee();
+      if (!callee || callee->isVariadic())
+        continue;
+      const clang::FunctionDecl *definition = callee->getDefinition();
+      if (!definition || !definition->hasBody() ||
+          call->getNumArgs() != definition->getNumParams())
+        continue;
+      for (auto [index, argument] : llvm::enumerate(call->arguments())) {
+        const clang::ParmVarDecl *calleeParam =
+            definition->getParamDecl(index);
+        if (!isPointerType(calleeParam->getType()) ||
+            isFunctionPointer(calleeParam->getType()))
+          continue;
+        (void)find(calleeParam);
+        if (calleeParam->getType()
+                .getCanonicalType()
+                ->getPointeeType()
+                .getCanonicalType()
+                ->isPointerType()) {
+          poisoned.insert(calleeParam);
+          continue;
+        }
+        if (const clang::VarDecl *global = asDecayedGlobalArrayArg(argument)) {
+          unite(calleeParam, global);
+          continue;
+        }
+        if (const clang::ParmVarDecl *forwarded =
+                asPointerParamRead(argument)) {
+          unite(calleeParam, forwarded);
+          continue;
+        }
+        // A directly decayed local array is the ordinary Phase-1b slice
+        // argument; record it as the Mixed boundary witness in case the
+        // class also picks up a global base.
+        const clang::Expr *e = stripTrivia(argument);
+        const auto *decay = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+        const auto *ref =
+            decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay
+                ? llvm::dyn_cast<clang::DeclRefExpr>(
+                      stripTrivia(decay->getSubExpr()))
+                : nullptr;
+        const auto *localVar =
+            ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+        if (localVar && localVar->hasLocalStorage()) {
+          localJoins.try_emplace(calleeParam, localVar->getName().str());
+          continue;
+        }
+        poisoned.insert(calleeParam);
+      }
+    }
+  }
+
+  // Aggregate the classes (snapshotting the nodes: `find` compresses
+  // paths in `parent`).
+  struct ClassInfo {
+    SmallVector<const clang::VarDecl *, 2> globals;
+    SmallVector<const clang::ParmVarDecl *, 4> params;
+    std::string localName;
+    bool poisoned = false;
+    bool nullChecked = false;
+  };
+  SmallVector<const clang::VarDecl *> nodes;
+  nodes.reserve(parent.size());
+  for (const auto &entry : parent)
+    nodes.push_back(entry.first);
+  llvm::DenseMap<const clang::VarDecl *, ClassInfo> classes;
+  for (const clang::VarDecl *node : nodes) {
+    ClassInfo &info = classes[find(node)];
+    if (poisoned.contains(node))
+      info.poisoned = true;
+    if (const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(node)) {
+      info.params.push_back(param);
+      if (nullChecked.contains(param))
+        info.nullChecked = true;
+      auto joined = localJoins.find(param);
+      if (joined != localJoins.end() && info.localName.empty())
+        info.localName = joined->second;
+      continue;
+    }
+    if (!node->hasLocalStorage() && !isPointerType(node->getType()))
+      info.globals.push_back(node);
+  }
+
+  // Qualify or record the located boundary per class. Classes without a
+  // global base are ordinary Phase-1b classes; classes with one that hit
+  // any other snag silently keep the historical staged-copy rejection.
+  for (const auto &entry : classes) {
+    const ClassInfo &info = entry.second;
+    if (info.params.empty() || info.globals.empty() || info.poisoned)
+      continue;
+    if (!info.localName.empty()) {
+      for (const clang::VarDecl *global : info.globals)
+        cellSliceRejects.try_emplace(
+            global, CellSliceReject{CellSliceReject::Kind::Mixed,
+                                    global->getName().str(), info.localName});
+      continue;
+    }
+    if (info.nullChecked) {
+      for (const clang::VarDecl *global : info.globals)
+        cellSliceRejects.try_emplace(
+            global, CellSliceReject{CellSliceReject::Kind::NullableGlobal,
+                                    global->getName().str(), std::string()});
+      continue;
+    }
+    // Every base must be a mutable (non-const, and internal unless this
+    // TU is the whole program) one-dimensional global array of one shared
+    // supported scalar element type.
+    bool qualifies = true;
+    clang::QualType element;
+    for (const clang::VarDecl *global : info.globals) {
+      const clang::ConstantArrayType *arrayType =
+          astContext().getAsConstantArrayType(global->getType());
+      if (!arrayType || global->getType().isConstQualified() ||
+          (!soleTranslationUnit && global->isExternallyVisible())) {
+        qualifies = false;
+        break;
+      }
+      clang::QualType elem = arrayType->getElementType();
+      bool scalarElem =
+          elem->isRealFloatingType() ||
+          (elem->isIntegerType() && !elem->isEnumeralType() &&
+           !elem->isBooleanType());
+      if (elem.isConstQualified() || astContext().getAsArrayType(elem) ||
+          !scalarElem) {
+        qualifies = false;
+        break;
+      }
+      if (element.isNull())
+        element = elem;
+      else if (!astContext().hasSameUnqualifiedType(element, elem))
+        qualifies = false;
+      if (!qualifies)
+        break;
+    }
+    // Every parameter must belong to a defined (and internal, unless sole
+    // TU) function and point at the shared element type.
+    for (const clang::ParmVarDecl *param : info.params) {
+      if (!qualifies)
+        break;
+      const auto *fn =
+          llvm::dyn_cast<clang::FunctionDecl>(param->getDeclContext());
+      if (!fn || !fn->doesThisDeclarationHaveABody() ||
+          fn->getName() == "main" ||
+          (!soleTranslationUnit && fn->isExternallyVisible()) ||
+          !astContext().hasSameUnqualifiedType(
+              element,
+              param->getType().getCanonicalType()->getPointeeType()))
+        qualifies = false;
+    }
+    if (!qualifies)
+      continue;
+    for (const clang::ParmVarDecl *param : info.params)
+      cellSliceParams.insert(param);
   }
 }
 
@@ -6406,6 +7082,9 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // Phase-4 Pass A: pure-AST owner planning over every function definition
   // before any IR is built; Pass B below consults the plans.
   planOwners(unit, soleTranslationUnit);
+  // CTS-P10 Pass A: cell-slice classification of pointer-parameter
+  // classes whose bases are all mutable global arrays.
+  planCellSlices(unit, soleTranslationUnit);
   for (const clang::Decl *decl : unit->decls()) {
     if (decl->isImplicit())
       continue;
@@ -8285,6 +8964,12 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
                                             globalSymbol(global.symbol));
     return success();
   }
+  // An element write through a cell-slice parameter (CTS-P10) is an
+  // `emitrust.cell_set` on the reference itself; value-position uses keep
+  // a located rejection in emitAssignToPlace.
+  if (std::optional<CellSliceAccess> access =
+          matchCellSliceAccess(op->getLHS()))
+    return emitCellSliceAssign(*access, op->getRHS(), loc);
   return success(succeeded(emitAssignToPlace(op)));
 }
 
@@ -8297,6 +8982,38 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
       !isFunctionPointer(op->getLHS()->getType()))
     return emitError(loc)
            << "unsupported: pointer assignment in value position";
+  if (matchCellSliceAccess(op->getLHS()))
+    return emitError(loc) << "unsupported: assignment through a cell-slice "
+                             "parameter in value position";
+  // A store through a wider-than-element view over a byte region
+  // (CTS-P11) widens to a `to_ne_bytes` store over sizeof(T) consecutive
+  // bytes; the assignment's value is staged in a temporary so a value
+  // position can re-load it.
+  if (const clang::UnaryOperator *wide = matchWideByteViewDeref(op->getLHS())) {
+    GlobalWriteback writeback;
+    FailureOr<WideByteAccess> access =
+        resolveWideByteAccess(wide, loc, &writeback);
+    if (failed(access))
+      return failure();
+    FailureOr<Value> value = emitRValue(op->getRHS());
+    if (failed(value))
+      return failure();
+    Value stored = *value;
+    if (stored.getType() != access->valueType) {
+      FailureOr<Value> converted =
+          convertScalarValue(loc, stored, access->valueType);
+      if (failed(converted))
+        return failure();
+      stored = *converted;
+    }
+    if (failed(emitWideByteStore(*access, stored, loc)))
+      return failure();
+    if (failed(flushGlobalWriteback(loc, writeback)))
+      return failure();
+    Value staged = createVariablePlace(loc, access->valueType);
+    builder.create<emitrust::AssignOp>(loc, staged, stored);
+    return staged;
+  }
   GlobalWriteback writeback;
   FailureOr<Value> place = emitLValue(op->getLHS(), &writeback);
   if (failed(place))
@@ -8354,6 +9071,33 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   if (isPointerType(op->getLHS()->getType()))
     return emitError(loc)
            << "unsupported: pointer assignment in value position";
+  if (matchCellSliceAccess(op->getLHS()))
+    return emitError(loc) << "unsupported: compound assignment through a "
+                             "cell-slice parameter";
+  // A compound assignment through a wide byte view (CTS-P11) is a
+  // read-modify-write over the same sizeof(T)-byte window: from_ne_bytes
+  // load, computation, to_ne_bytes store (and, over a global byte region,
+  // the staged copy's writeback).
+  if (const clang::UnaryOperator *wide = matchWideByteViewDeref(op->getLHS())) {
+    GlobalWriteback writeback;
+    FailureOr<WideByteAccess> access =
+        resolveWideByteAccess(wide, loc, &writeback);
+    if (failed(access))
+      return failure();
+    FailureOr<Value> current = emitWideByteLoad(*access, loc);
+    if (failed(current))
+      return failure();
+    FailureOr<Value> result = buildCompoundAssignValue(loc, op, *current);
+    if (failed(result))
+      return failure();
+    if (failed(emitWideByteStore(*access, *result, loc)))
+      return failure();
+    if (failed(flushGlobalWriteback(loc, writeback)))
+      return failure();
+    Value staged = createVariablePlace(loc, access->valueType);
+    builder.create<emitrust::AssignOp>(loc, staged, *result);
+    return staged;
+  }
   GlobalWriteback writeback;
   FailureOr<Value> place = emitLValue(op->getLHS(), &writeback);
   if (failed(place))
@@ -8949,6 +9693,24 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
             sliceType.getElementType() == builder.getIntegerType(8)) {
           backingPlace = it->second;
           elementType = sliceType.getElementType();
+        }
+      } else if (!pointer->base->hasLocalStorage()) {
+        // A pointer into a global char array (the 00217 shape) prints the
+        // staged copy's byte run: the copy is taken fresh at the print,
+        // so every earlier write — element, wide-byte, or cell — is
+        // visible in it (CTS-P11).
+        FailureOr<std::pair<Value, std::string>> staged =
+            stageGlobalCopy(loc, pointer->base);
+        if (failed(staged))
+          return failure();
+        auto lvalueType =
+            llvm::cast<emitrust::LValueType>(staged->first.getType());
+        auto arrayType =
+            llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType());
+        if (arrayType &&
+            arrayType.getElementType() == builder.getIntegerType(8)) {
+          backingPlace = staged->first;
+          elementType = arrayType.getElementType();
         }
       }
     }
@@ -9558,6 +10320,19 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
             .create<emitrust::GlobalLoadOp>(loc, global->type,
                                             globalSymbol(global->symbol))
             .getResult();
+    }
+    // An element read through a cell-slice parameter (CTS-P10) is an
+    // `emitrust.cell_get` on the reference itself — no place is staged.
+    if (std::optional<CellSliceAccess> access = matchCellSliceAccess(sub))
+      return emitCellSliceGet(*access, loc);
+    // A wider-than-element view over a byte region (CTS-P11) widens to a
+    // `from_ne_bytes` load over sizeof(T) consecutive bytes.
+    if (const clang::UnaryOperator *wide = matchWideByteViewDeref(sub)) {
+      FailureOr<WideByteAccess> access =
+          resolveWideByteAccess(wide, loc, /*writeback=*/nullptr);
+      if (failed(access))
+        return failure();
+      return emitWideByteLoad(*access, loc);
     }
     FailureOr<Value> place = emitLValue(sub);
     if (failed(place))
@@ -10737,9 +11512,39 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     const clang::Expr *expr;
   };
   SmallVector<PendingBorrow, 4> borrows;
+  // Cell-slice arguments backed by globals (CTS-P10): the call nests
+  // inside one `emitrust.global_cells` region per distinct global,
+  // leftmost argument outermost.
+  struct PendingCellGlobal {
+    unsigned index;
+    const clang::VarDecl *global;
+  };
+  SmallVector<PendingCellGlobal, 3> cellGlobals;
   for (auto [index, argument] : llvm::enumerate(call->arguments())) {
-    if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(
-            targetType.getInput(index))) {
+    Type input = targetType.getInput(index);
+    if (auto refType = llvm::dyn_cast<emitrust::RefType>(input);
+        refType && llvm::isa<emitrust::CellSliceType>(refType.getPointee())) {
+      // A forwarded cell-slice parameter passes as the same SSA value:
+      // shared references are freely duplicable, so permuted recursive
+      // forwarding needs no reborrow discipline.
+      if (const clang::ParmVarDecl *param = asPointerParamRead(argument)) {
+        auto it = symbols.find(param);
+        if (it != symbols.end() && it->second.getType() == input) {
+          arguments[index] = it->second;
+          continue;
+        }
+      }
+      // A directly decayed global array borrows its cell-slice for the
+      // extent of the call (Pass A pinned exactly these two shapes).
+      if (const clang::VarDecl *global = asDecayedGlobalArrayArg(argument)) {
+        cellGlobals.push_back({static_cast<unsigned>(index), global});
+        continue;
+      }
+      return emitError(loc)
+             << "unsupported: argument to a cell-slice parameter must be a "
+                "whole global array or a forwarded cell-slice parameter";
+    }
+    if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(input)) {
       borrows.push_back({static_cast<unsigned>(index), argument});
       continue;
     }
@@ -10769,11 +11574,54 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     arguments[borrow.index] = *reference;
   }
 
+  // Open one global_cells region per distinct global cell-slice argument
+  // (argument order, leftmost outermost); the call is created inside the
+  // innermost region and a scalar result flows out through a staging
+  // variable declared before the outermost region.
+  Value cellResultStaging;
+  SmallVector<emitrust::GlobalCellsOp, 3> openedCellRegions;
+  if (!cellGlobals.empty()) {
+    if (targetType.getNumResults() == 1)
+      cellResultStaging = createVariablePlace(loc, targetType.getResult(0));
+    llvm::SmallDenseMap<const clang::VarDecl *, Value, 4> borrowedCells;
+    for (const PendingCellGlobal &entry : cellGlobals) {
+      if (Value existing = borrowedCells.lookup(entry.global)) {
+        arguments[entry.index] = existing;
+        continue;
+      }
+      const GlobalInfo *global = lookupGlobal(entry.global);
+      if (!global)
+        return emitError(loc) << "unsupported: global '"
+                              << entry.global->getName()
+                              << "' is not an importable cell-slice base";
+      auto cellsOp = builder.create<emitrust::GlobalCellsOp>(
+          loc, globalSymbol(global->symbol));
+      Block *body = builder.createBlock(
+          &cellsOp.getBody(), cellsOp.getBody().end(),
+          TypeRange{targetType.getInput(entry.index)}, {loc});
+      arguments[entry.index] = body->getArgument(0);
+      borrowedCells[entry.global] = body->getArgument(0);
+      openedCellRegions.push_back(cellsOp);
+    }
+  }
+
   for (auto [index, value] : llvm::enumerate(arguments))
     if (value.getType() != targetType.getInput(index))
       return emitError(loc) << "unsupported: call argument type mismatch";
 
   auto callOp = builder.create<func::CallOp>(loc, target, arguments);
+  if (!openedCellRegions.empty()) {
+    if (cellResultStaging && callOp->getNumResults() == 1)
+      builder.create<emitrust::AssignOp>(loc, cellResultStaging,
+                                         callOp->getResult(0));
+    for (emitrust::GlobalCellsOp cellsOp : llvm::reverse(openedCellRegions)) {
+      builder.create<emitrust::YieldOp>(loc);
+      builder.setInsertionPointAfter(cellsOp);
+    }
+    if (callOp->getNumResults() == 0)
+      return Value();
+    return loadPlace(loc, cellResultStaging);
+  }
   if (callOp->getNumResults() == 0)
     return Value();
   return callOp->getResult(0);
@@ -10934,10 +11782,12 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
                                "as a function argument";
     // A global region base would pass a borrow of the staged local copy,
     // not of the global itself: a callee that also touches the global
-    // would see (or lose) the wrong values, so the shape is rejected.
+    // would see (or lose) the wrong values, so the shape is rejected
+    // (with the cell-slice boundary wording when Pass A pinned one; the
+    // all-global class itself lowers to a cell-slice and never gets
+    // here).
     if (pointer->base && !pointer->base->hasLocalStorage())
-      return emitError(loc) << "unsupported: passing a pointer into a "
-                               "global variable to a function";
+      return rejectGlobalPointerArgument(loc, pointer->base);
     if (!pointer->cursor)
       return emitError(loc) << "unsupported: the address of a scalar object "
                                "cannot be passed as a slice parameter";
@@ -11038,10 +11888,10 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
                                "as a function argument";
     // A global region base would pass a borrow of the staged local copy
     // (writes through it would be lost); mirror the historical
-    // address-of-a-global rejection.
+    // address-of-a-global rejection (with the cell-slice boundary
+    // wording when Pass A pinned one).
     if (pointer->base && !pointer->base->hasLocalStorage())
-      return emitError(loc) << "unsupported: passing a pointer into a "
-                               "global variable to a function";
+      return rejectGlobalPointerArgument(loc, pointer->base);
     FailureOr<Value> place = emitPointerPlace(loc, *pointer, pointee);
     if (failed(place))
       return failure();
@@ -11278,8 +12128,443 @@ bool CImporter::isReinterpretedViewDeref(const clang::Expr *expr) {
   const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
   if (!unary || unary->getOpcode() != clang::UO_Deref)
     return false;
-  return isDecomposedPointerExpr(unary->getSubExpr()) &&
-         peelsReinterpretingPointerCast(astContext(), unary->getSubExpr());
+  const clang::Expr *stripped =
+      stripObjectPointerCasts(astContext(), unary->getSubExpr());
+  return isDecomposedPointerExpr(stripped) &&
+         viewsChangedPointee(astContext(), unary->getSubExpr());
+}
+
+//===----------------------------------------------------------------------===//
+// Cell-slice accesses (CTS-P10)
+//===----------------------------------------------------------------------===//
+
+std::optional<CellSliceAccess>
+CImporter::matchCellSliceAccess(const clang::Expr *expr) const {
+  const clang::Expr *e = stripTrivia(expr);
+  // Returns the parameter when `base` reads one bound to a
+  // `!emitrust.ref<!emitrust.cell_slice<T>>` value.
+  auto cellParamOf = [&](const clang::Expr *base) -> const clang::ParmVarDecl * {
+    const clang::ParmVarDecl *param = asPointerParamRead(base);
+    if (!param)
+      return nullptr;
+    auto it = symbols.find(param);
+    if (it == symbols.end())
+      return nullptr;
+    auto refType = llvm::dyn_cast<emitrust::RefType>(it->second.getType());
+    if (!refType || !llvm::isa<emitrust::CellSliceType>(refType.getPointee()))
+      return nullptr;
+    return param;
+  };
+  if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(e))
+    if (const clang::ParmVarDecl *param = cellParamOf(subscript->getBase()))
+      return CellSliceAccess{param, subscript->getIdx()};
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    if (unary->getOpcode() == clang::UO_Deref)
+      if (const clang::ParmVarDecl *param = cellParamOf(unary->getSubExpr()))
+        return CellSliceAccess{param, nullptr};
+  return std::nullopt;
+}
+
+FailureOr<Value> CImporter::emitCellSliceGet(const CellSliceAccess &access,
+                                             Location loc) {
+  Value ref = symbols.lookup(access.param);
+  auto refType = llvm::cast<emitrust::RefType>(ref.getType());
+  Type elementType =
+      llvm::cast<emitrust::CellSliceType>(refType.getPointee())
+          .getElementType();
+  IntegerType cursorType = builder.getIntegerType(64);
+  Value index;
+  if (access.index) {
+    FailureOr<Value> raw = emitRValue(access.index);
+    if (failed(raw))
+      return failure();
+    auto indexType = llvm::dyn_cast<IntegerType>((*raw).getType());
+    if (!indexType)
+      return emitError(loc) << "unsupported subscript index type";
+    index = castToIntType(loc, *raw, cursorType);
+  } else {
+    index = createIntConstant(loc, cursorType, 0);
+  }
+  return builder.create<emitrust::CellGetOp>(loc, elementType, ref, index)
+      .getResult();
+}
+
+LogicalResult CImporter::emitCellSliceAssign(const CellSliceAccess &access,
+                                             const clang::Expr *rhs,
+                                             Location loc) {
+  Value ref = symbols.lookup(access.param);
+  auto refType = llvm::cast<emitrust::RefType>(ref.getType());
+  Type elementType =
+      llvm::cast<emitrust::CellSliceType>(refType.getPointee())
+          .getElementType();
+  IntegerType cursorType = builder.getIntegerType(64);
+  Value index;
+  if (access.index) {
+    FailureOr<Value> raw = emitRValue(access.index);
+    if (failed(raw))
+      return failure();
+    auto indexType = llvm::dyn_cast<IntegerType>((*raw).getType());
+    if (!indexType)
+      return emitError(loc) << "unsupported subscript index type";
+    index = castToIntType(loc, *raw, cursorType);
+  } else {
+    index = createIntConstant(loc, cursorType, 0);
+  }
+  FailureOr<Value> value = emitRValue(rhs);
+  if (failed(value))
+    return failure();
+  Value stored = *value;
+  if (stored.getType() != elementType) {
+    // C converts the assigned value to the element type (C99 6.5.16.1p2).
+    FailureOr<Value> converted = convertScalarValue(loc, stored, elementType);
+    if (failed(converted))
+      return failure();
+    stored = *converted;
+  }
+  builder.create<emitrust::CellSetOp>(loc, ref, index, stored);
+  return success();
+}
+
+LogicalResult
+CImporter::rejectGlobalPointerArgument(Location loc,
+                                       const clang::VarDecl *base) {
+  auto it = cellSliceRejects.find(base->getCanonicalDecl());
+  if (it != cellSliceRejects.end()) {
+    const CellSliceReject &reject = it->second;
+    if (reject.kind == CellSliceReject::Kind::Mixed)
+      return emitError(loc)
+             << "unsupported: pointer parameter would join global '"
+             << reject.globalName << "' and local object '"
+             << reject.localName << "' into one region";
+    return emitError(loc) << "unsupported: nullable pointer parameter "
+                             "backed by a global variable";
+  }
+  return emitError(loc)
+         << "unsupported: passing a pointer into a global variable to a "
+            "function";
+}
+
+//===----------------------------------------------------------------------===//
+// Byte puns over i8 regions (CTS-P11)
+//===----------------------------------------------------------------------===//
+
+std::optional<clang::QualType>
+CImporter::pointerElementTypeFromAST(const clang::Expr *expr) const {
+  const clang::Expr *e = stripObjectPointerCasts(astContext(), expr);
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e)) {
+    if (binary->getOpcode() != clang::BO_Add &&
+        binary->getOpcode() != clang::BO_Sub)
+      return std::nullopt;
+    const clang::Expr *pointerSide =
+        isPointerType(binary->getLHS()->getType()) ? binary->getLHS()
+                                                   : binary->getRHS();
+    return pointerElementTypeFromAST(pointerSide);
+  }
+  const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+  if (!cast)
+    return std::nullopt;
+  if (cast->getCastKind() == clang::CK_ArrayToPointerDecay) {
+    // A decayed (local or global) array: the innermost element is the
+    // region's unit.
+    clang::QualType arrayType = stripTrivia(cast->getSubExpr())->getType();
+    if (!astContext().getAsConstantArrayType(arrayType))
+      return std::nullopt;
+    clang::QualType element = arrayType;
+    while (const clang::ConstantArrayType *level =
+               astContext().getAsConstantArrayType(element))
+      element = level->getElementType();
+    return element;
+  }
+  if (cast->getCastKind() != clang::CK_LValueToRValue)
+    return std::nullopt;
+  const auto *ref =
+      llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(cast->getSubExpr()));
+  const auto *var =
+      ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+  if (!var)
+    return std::nullopt;
+  // A tracked pointer local (or slice-classified parameter) resolves
+  // through its decomposition record; a data-pointer global through its
+  // imported model.
+  const clang::VarDecl *base = nullptr;
+  auto localIt = pointerLocals.find(var);
+  if (localIt != pointerLocals.end()) {
+    if (localIt->second.literalBacking)
+      return astContext().CharTy;
+    base = localIt->second.base;
+  } else {
+    auto globalIt = pointerGlobals.find(var->getCanonicalDecl());
+    if (globalIt != pointerGlobals.end())
+      base = globalIt->second.base;
+  }
+  if (!base)
+    return std::nullopt;
+  if (isPointerType(base->getType()))
+    return base->getType().getCanonicalType()->getPointeeType();
+  clang::QualType element = base->getType();
+  bool sawArray = false;
+  while (const clang::ConstantArrayType *level =
+             astContext().getAsConstantArrayType(element)) {
+    element = level->getElementType();
+    sawArray = true;
+  }
+  return sawArray ? std::optional<clang::QualType>(element) : std::nullopt;
+}
+
+const clang::UnaryOperator *
+CImporter::matchWideByteViewDeref(const clang::Expr *expr) {
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
+  if (!unary || unary->getOpcode() != clang::UO_Deref)
+    return nullptr;
+  const clang::Expr *stripped =
+      stripObjectPointerCasts(astContext(), unary->getSubExpr());
+  if (!isDecomposedPointerExpr(stripped) ||
+      !viewsChangedPointee(astContext(), unary->getSubExpr()))
+    return nullptr;
+  clang::QualType viewed = unary->getType();
+  if (!viewed->isIntegerType() || viewed->isBooleanType() ||
+      viewed->isEnumeralType())
+    return nullptr;
+  uint64_t viewedBits = astContext().getTypeSize(viewed);
+  if (viewedBits != 16 && viewedBits != 32 && viewedBits != 64)
+    return nullptr;
+  std::optional<clang::QualType> element =
+      pointerElementTypeFromAST(unary->getSubExpr());
+  if (!element || astContext().getTypeSize(*element) != 8 ||
+      !(*element)->isIntegerType() || (*element)->isBooleanType() ||
+      (*element)->isEnumeralType())
+    return nullptr;
+  return unary;
+}
+
+/// Best-effort compile-time evaluation of an i64 cursor value: constants,
+/// sums, differences, products, and sign/zero extensions fold; anything
+/// else (a runtime offset) reports nothing, which skips the static bounds
+/// check (an out-of-bounds runtime access panics in the generated Rust —
+/// a legal refinement of C's undefined behavior).
+static std::optional<int64_t> staticCursorValue(Value value) {
+  llvm::APInt bits;
+  if (matchPattern(value, m_ConstantInt(&bits)))
+    return bits.getSExtValue();
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return std::nullopt;
+  if (auto add = llvm::dyn_cast<arith::AddIOp>(def)) {
+    std::optional<int64_t> lhs = staticCursorValue(add.getLhs());
+    std::optional<int64_t> rhs = staticCursorValue(add.getRhs());
+    if (lhs && rhs)
+      return *lhs + *rhs;
+    return std::nullopt;
+  }
+  if (auto sub = llvm::dyn_cast<arith::SubIOp>(def)) {
+    std::optional<int64_t> lhs = staticCursorValue(sub.getLhs());
+    std::optional<int64_t> rhs = staticCursorValue(sub.getRhs());
+    if (lhs && rhs)
+      return *lhs - *rhs;
+    return std::nullopt;
+  }
+  if (auto mul = llvm::dyn_cast<arith::MulIOp>(def)) {
+    std::optional<int64_t> lhs = staticCursorValue(mul.getLhs());
+    std::optional<int64_t> rhs = staticCursorValue(mul.getRhs());
+    if (lhs && rhs)
+      return *lhs * *rhs;
+    return std::nullopt;
+  }
+  if (llvm::isa<arith::ExtSIOp, arith::ExtUIOp>(def))
+    return staticCursorValue(def->getOperand(0));
+  return std::nullopt;
+}
+
+FailureOr<CImporter::WideByteAccess>
+CImporter::resolveWideByteAccess(const clang::UnaryOperator *deref,
+                                 Location loc, GlobalWriteback *writeback) {
+  // The reinterpreting casts are stripped up front: the decomposition
+  // itself only peels the qualification and void-wildcard forms.
+  FailureOr<PtrExprValue> pointer = emitPointerRValue(
+      stripObjectPointerCasts(astContext(), deref->getSubExpr()));
+  if (failed(pointer))
+    return failure();
+  if (pointer->baseIndex || pointer->member)
+    return emitError(loc)
+           << "unsupported: wide byte access through this pointer";
+  if (pointer->nonNull)
+    return emitError(loc)
+           << "unsupported: wide byte access through a possibly-null pointer";
+  FailureOr<Type> viewedType = mapType(deref->getType(), loc);
+  if (failed(viewedType))
+    return failure();
+  auto valueType = llvm::dyn_cast<IntegerType>(*viewedType);
+  if (!valueType)
+    return emitError(loc) << "unsupported: wide byte access value type";
+  unsigned byteWidth = valueType.getWidth() / 8;
+
+  Value basePlace;
+  if (pointer->literalBacking) {
+    if (writeback) // Defensive; the region analysis rejects literal writes.
+      return emitError(loc)
+             << "unsupported: write through a string-literal region";
+    basePlace = pointer->literalBacking;
+  } else if (pointer->base) {
+    auto it = symbols.find(pointer->base);
+    if (it != symbols.end()) {
+      basePlace = it->second;
+    } else {
+      // A global byte region rides the ordinary staged-copy model: the
+      // whole value is staged, punned, and (for writes) stored back.
+      FailureOr<std::pair<Value, std::string>> staged =
+          stageGlobalCopy(loc, pointer->base);
+      if (failed(staged))
+        return failure();
+      if (writeback)
+        *writeback = GlobalWriteback{staged->first, staged->second};
+      basePlace = staged->first;
+    }
+  } else {
+    return emitError(loc)
+           << "unsupported: wide byte access through this pointer";
+  }
+
+  auto lvalueType = llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
+  if (!lvalueType)
+    return emitError(loc) << "unsupported: wide byte access base";
+  Type byteType = builder.getIntegerType(8);
+  uint64_t arrayBytes = 0;
+  bool hasStaticSize = false;
+  if (auto arrayType =
+          llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType())) {
+    if (arrayType.getElementType() != byteType)
+      return emitError(loc) << "unsupported: wide byte access base";
+    arrayBytes = arrayType.getSize();
+    hasStaticSize = true;
+  } else if (auto sliceType = llvm::dyn_cast<emitrust::SliceType>(
+                 lvalueType.getValueType())) {
+    if (sliceType.getElementType() != byteType)
+      return emitError(loc) << "unsupported: wide byte access base";
+  } else {
+    return emitError(loc) << "unsupported: wide byte access base";
+  }
+
+  Value cursor =
+      pointer->cursor ? pointer->cursor
+                      : createIntConstant(loc, builder.getIntegerType(64), 0);
+  // A compile-time-constant offset whose widened window overruns the
+  // array is rejected here; runtime offsets are checked by the generated
+  // Rust's slice bounds (a panic refines C's undefined behavior).
+  if (hasStaticSize) {
+    if (std::optional<int64_t> offset = staticCursorValue(cursor)) {
+      if (*offset < 0 ||
+          static_cast<uint64_t>(*offset) + byteWidth > arrayBytes)
+        return emitError(loc)
+               << "unsupported: " << byteWidth << "-byte access at offset "
+               << *offset << " runs past the end of '"
+               << pointer->base->getName() << "' (" << arrayBytes
+               << " bytes)";
+    }
+  }
+  return WideByteAccess{basePlace, cursor, valueType, byteWidth};
+}
+
+/// Returns the Rust integer type name (`u32`, `i64`, ...) the ne_bytes
+/// helper is called on for `type`.
+static std::string neBytesTypeName(IntegerType type) {
+  return ((type.isUnsigned() ? llvm::Twine("u") : llvm::Twine("i")) +
+          llvm::Twine(type.getWidth()))
+      .str();
+}
+
+FailureOr<Value> CImporter::emitWideByteLoad(const WideByteAccess &access,
+                                             Location loc) {
+  auto u8Type = IntegerType::get(builder.getContext(), 8,
+                                 IntegerType::Unsigned);
+  IntegerType byteType = builder.getIntegerType(8);
+  IntegerType cursorType = builder.getIntegerType(64);
+  auto bytesType = emitrust::ArrayType::get(builder.getContext(),
+                                            access.byteWidth, u8Type);
+  // Gather the window's bytes (as u8) into a byte-array temporary...
+  Value bytesVar =
+      builder
+          .create<emitrust::VariableOp>(loc,
+                                        emitrust::LValueType::get(bytesType))
+          .getResult();
+  for (unsigned k = 0; k != access.byteWidth; ++k) {
+    Value kValue = createIntConstant(loc, cursorType, k);
+    Value sourceIndex =
+        k == 0 ? access.cursor
+               : builder.create<arith::AddIOp>(loc, access.cursor, kValue)
+                     .getResult();
+    Value element = builder
+                        .create<emitrust::SubscriptOp>(
+                            loc, emitrust::LValueType::get(byteType),
+                            access.basePlace, sourceIndex)
+                        .getResult();
+    Value byte =
+        builder.create<emitrust::LoadOp>(loc, byteType, element).getResult();
+    Value unsignedByte =
+        builder.create<emitrust::CastOp>(loc, u8Type, byte).getResult();
+    Value slot = builder
+                     .create<emitrust::SubscriptOp>(
+                         loc, emitrust::LValueType::get(u8Type), bytesVar,
+                         kValue)
+                     .getResult();
+    builder.create<emitrust::AssignOp>(loc, slot, unsignedByte);
+  }
+  // ... and combine them with T::from_ne_bytes.
+  Value bytes =
+      builder.create<emitrust::LoadOp>(loc, bytesType, bytesVar).getResult();
+  std::string callee = neBytesTypeName(access.valueType) + "::from_ne_bytes";
+  return builder
+      .create<emitrust::CallOpaqueOp>(loc, TypeRange{access.valueType},
+                                      builder.getStringAttr(callee),
+                                      /*args=*/ArrayAttr(), ValueRange{bytes})
+      .getResult(0);
+}
+
+LogicalResult CImporter::emitWideByteStore(const WideByteAccess &access,
+                                           Value value, Location loc) {
+  auto u8Type = IntegerType::get(builder.getContext(), 8,
+                                 IntegerType::Unsigned);
+  IntegerType byteType = builder.getIntegerType(8);
+  IntegerType cursorType = builder.getIntegerType(64);
+  auto bytesType = emitrust::ArrayType::get(builder.getContext(),
+                                            access.byteWidth, u8Type);
+  // Split the value with T::to_ne_bytes...
+  std::string callee = neBytesTypeName(access.valueType) + "::to_ne_bytes";
+  Value bytes = builder
+                    .create<emitrust::CallOpaqueOp>(
+                        loc, TypeRange{bytesType},
+                        builder.getStringAttr(callee),
+                        /*args=*/ArrayAttr(), ValueRange{value})
+                    .getResult(0);
+  Value bytesVar =
+      builder
+          .create<emitrust::VariableOp>(loc,
+                                        emitrust::LValueType::get(bytesType))
+          .getResult();
+  builder.create<emitrust::AssignOp>(loc, bytesVar, bytes);
+  // ... and scatter them (as i8) back over the window.
+  for (unsigned k = 0; k != access.byteWidth; ++k) {
+    Value kValue = createIntConstant(loc, cursorType, k);
+    Value slot = builder
+                     .create<emitrust::SubscriptOp>(
+                         loc, emitrust::LValueType::get(u8Type), bytesVar,
+                         kValue)
+                     .getResult();
+    Value byte =
+        builder.create<emitrust::LoadOp>(loc, u8Type, slot).getResult();
+    Value signedByte =
+        builder.create<emitrust::CastOp>(loc, byteType, byte).getResult();
+    Value targetIndex =
+        k == 0 ? access.cursor
+               : builder.create<arith::AddIOp>(loc, access.cursor, kValue)
+                     .getResult();
+    Value element = builder
+                        .create<emitrust::SubscriptOp>(
+                            loc, emitrust::LValueType::get(byteType),
+                            access.basePlace, targetIndex)
+                        .getResult();
+    builder.create<emitrust::AssignOp>(loc, element, signedByte);
+  }
+  return success();
 }
 
 std::optional<clang::QualType>
@@ -12247,20 +13532,24 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
                << "unsupported: dereference of a 'void *' pointer";
       // A dereference of a decomposed pointer resolves to a place on its
       // base object; the pointer-parameter reference path is unchanged.
-      if (isDecomposedPointerExpr(unary->getSubExpr())) {
-        FailureOr<PtrExprValue> decomposed =
-            emitPointerRValue(unary->getSubExpr());
+      // Direct pun casts (`*(T *)(char *)...`, CTS-P11) are stripped for
+      // the decomposition and folded into the reinterpret type check.
+      const clang::Expr *pointerExpr =
+          stripObjectPointerCasts(astContext(), unary->getSubExpr());
+      if (isDecomposedPointerExpr(pointerExpr)) {
+        FailureOr<PtrExprValue> decomposed = emitPointerRValue(pointerExpr);
         if (failed(decomposed))
           return failure();
         // A reinterpret-back site `*(T *)p` (the pointer expression peeled
-        // through a pointee-changing cast, CTS-P9) type-checks T against
-        // the region's base element type: an exact match lowers like a
-        // direct pointer, a same-width integer view resolves the place at
-        // the base element type (the load/store sites wrap the value in an
-        // `emitrust.cast` bitcast), and everything else is rejected.
+        // through a pointee-changing cast, CTS-P9/P11) type-checks T
+        // against the region's base element type: an exact match lowers
+        // like a direct pointer, a same-width integer view resolves the
+        // place at the base element type (the load/store sites wrap the
+        // value in an `emitrust.cast` bitcast), a wider view over a byte
+        // region is intercepted upstream as a ne_bytes pun, and
+        // everything else is rejected.
         clang::QualType accessType = unary->getType();
-        if (peelsReinterpretingPointerCast(astContext(),
-                                           unary->getSubExpr())) {
+        if (viewsChangedPointee(astContext(), unary->getSubExpr())) {
           std::optional<clang::QualType> element =
               regionElementType(*decomposed, accessType);
           if (element && !astContext().hasSameUnqualifiedType(accessType,
