@@ -707,8 +707,10 @@ rule.
 - [x] C99-34 Function definitions and prototypes with scalar, struct
   by-value, and pointer parameters; forward declarations; main with
   implicit return. (test/Import/C/structs.c, pointers.c, scalars.c)
-- [ ] C99-35 Recursive and mutually recursive functions (expected to work
-  today; needs a regression test with differential execution).
+- [x] C99-35 Recursive and mutually recursive functions: pinned by a
+  differential regression test — direct recursion at data-dependent
+  depth plus a mutually recursive is_even/is_odd pair.
+  (test/EndToEnd/recursion.c)
 - [ ] C99-36 Array parameters with decay semantics, including the C99
   static and qualifier forms inside the brackets.
 - [ ] C99-37 Variadic function definitions and va_list (design decision
@@ -762,7 +764,11 @@ rule.
   (test/Dialect/EmitRust/types.mlir, invalid.mlir,
   test/Import/C/arrays-multidim.c, pointers-local-invalid.c,
   test/EndToEnd/arrays-multidim.c)
-- [ ] C99-42 Nested struct types and struct assignment as a whole.
+- [x] C99-42 Nested struct types and struct assignment as a whole:
+  pinned — nested member types, whole-struct assignment (value/Copy
+  semantics), member-of-nested writes, and assignment through a pointer
+  deref, import-level and differential. (test/Import/C/structs-nested.c,
+  test/EndToEnd/structs-nested.c)
 - [ ] C99-43 Pointers to pointers and pointer members inside structs
   (design decision needed alongside C99-26: reference-typed struct fields
   require Rust lifetimes, which the dialect deliberately does not model;
@@ -1474,9 +1480,8 @@ observed when C99-33 + C99-47 together unlocked 00215).
   "00204.c:36:28: error: unsupported builtin type 'long double'" —
   box stays unticked until long double (and then `%.Ns`/`%llx`) land.
   (00129.c, 00204.c, 00219.c)
-- [ ] CTS-R6 (1) Empty structs (`struct T {};` — a GNU/C2x shape clang
-  accepts): emit a unit-like Rust struct; today "struct with no
-  members" rejects.
+- [x] CTS-R6 (1) Empty structs (`struct T {};` — a GNU/C2x shape clang
+  accepts): emit a unit-like Rust struct.
   Empty-struct support landed: the importer accepts a field-less
   record, struct_def permits empty field arrays, and the emitter prints
   `struct T {}` (declaration/copy/default via the usual derives;
