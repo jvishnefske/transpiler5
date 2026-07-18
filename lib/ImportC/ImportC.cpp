@@ -1797,6 +1797,16 @@ private:
   FailureOr<std::pair<Value, std::string>>
   stageGlobalCopy(Location loc, const clang::VarDecl *base);
 
+  /// Stages `base`'s whole global value through `stageGlobalCopy` and,
+  /// when the caller passes a write context, records the staging place
+  /// and symbol in `*writeback` so the mutation flushes through
+  /// `commitGlobalWriteback`. Returns the staging place the access
+  /// refines — the one staged-copy read-side idiom shared by every
+  /// global region access site.
+  FailureOr<Value> stageGlobalCopyAndRecord(Location loc,
+                                            const clang::VarDecl *base,
+                                            GlobalWriteback *writeback);
+
   /// Projects the member place `field` designates on the struct place
   /// `basePlace` (an `emitrust.member` with the flattened field name),
   /// used to resolve a `&struct.member` region base (CTS-P9).
@@ -14067,13 +14077,11 @@ CImporter::resolveWideByteAccess(const clang::UnaryOperator *deref,
     } else {
       // A global byte region rides the ordinary staged-copy model: the
       // whole value is staged, punned, and (for writes) stored back.
-      FailureOr<std::pair<Value, std::string>> staged =
-          stageGlobalCopy(loc, pointer->base);
+      FailureOr<Value> staged =
+          stageGlobalCopyAndRecord(loc, pointer->base, writeback);
       if (failed(staged))
         return failure();
-      if (writeback)
-        *writeback = GlobalWriteback{staged->first, staged->second};
-      basePlace = staged->first;
+      basePlace = *staged;
     }
   } else {
     return emitError(loc)
@@ -14868,13 +14876,11 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
     // local copy — exactly the staged-copy model of direct global element
     // accesses; a write context passes `writeback` and stores the copy
     // back afterwards.
-    FailureOr<std::pair<Value, std::string>> staged =
-        stageGlobalCopy(loc, pointer.base);
+    FailureOr<Value> staged =
+        stageGlobalCopyAndRecord(loc, pointer.base, writeback);
     if (failed(staged))
       return failure();
-    if (writeback)
-      *writeback = GlobalWriteback{staged->first, staged->second};
-    basePlace = staged->first;
+    basePlace = *staged;
   }
   // A `&struct.member` base (CTS-P9) resolves to the member's projection
   // on the object's place (or on its staged copy, whose whole value the
@@ -14917,6 +14923,17 @@ CImporter::stageGlobalCopy(Location loc, const clang::VarDecl *base) {
                       .getResult();
   builder.create<emitrust::AssignOp>(loc, staged, current);
   return std::make_pair(staged, symbol);
+}
+
+FailureOr<Value>
+CImporter::stageGlobalCopyAndRecord(Location loc, const clang::VarDecl *base,
+                                    GlobalWriteback *writeback) {
+  FailureOr<std::pair<Value, std::string>> staged = stageGlobalCopy(loc, base);
+  if (failed(staged))
+    return failure();
+  if (writeback)
+    *writeback = GlobalWriteback{staged->first, staged->second};
+  return staged->first;
 }
 
 FailureOr<Value>
@@ -15090,7 +15107,7 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
   if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e)) {
     auto it = symbols.find(ref->getDecl());
     if (it == symbols.end()) {
-      if (const GlobalInfo *global = lookupGlobal(ref->getDecl())) {
+      if (lookupGlobal(ref->getDecl())) {
         // Stage the global's whole value in a local copy. Refined element
         // and field accesses read and write the copy; a write context
         // passes `writeback` and stores the copy back afterwards
@@ -15098,18 +15115,8 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
         // function called from the same statement's index or right-hand
         // side that writes the same global is preserved by the pre-store
         // refresh in `commitGlobalWriteback`.
-        Value place = builder
-                          .create<emitrust::VariableOp>(
-                              loc, emitrust::LValueType::get(global->type))
-                          .getResult();
-        Value current = builder
-                            .create<emitrust::GlobalLoadOp>(
-                                loc, global->type, globalSymbol(global->symbol))
-                            .getResult();
-        builder.create<emitrust::AssignOp>(loc, place, current);
-        if (writeback)
-          *writeback = GlobalWriteback{place, global->symbol};
-        return place;
+        return stageGlobalCopyAndRecord(
+            loc, llvm::cast<clang::VarDecl>(ref->getDecl()), writeback);
       }
       // A devirtualized global function pointer (CTS-S, 00189) has no
       // global of its own; a value use reads as the `Some(target)`
@@ -15205,23 +15212,15 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
       FailureOr<Value> effects = emitCall(erasedCall);
       if (failed(effects))
         return failure();
-      const GlobalInfo *global = lookupGlobal(erasedBase);
-      if (!global)
+      if (!lookupGlobal(erasedBase))
         return emitError(loc)
                << "unsupported: global '" << erasedBase->getName()
                << "' backing an erased pointer return was not imported";
-      Value place = builder
-                        .create<emitrust::VariableOp>(
-                            loc, emitrust::LValueType::get(global->type))
-                        .getResult();
-      Value current = builder
-                          .create<emitrust::GlobalLoadOp>(
-                              loc, global->type, globalSymbol(global->symbol))
-                          .getResult();
-      builder.create<emitrust::AssignOp>(loc, place, current);
-      if (writeback)
-        *writeback = GlobalWriteback{place, global->symbol};
-      basePlace = place;
+      FailureOr<Value> staged =
+          stageGlobalCopyAndRecord(loc, erasedBase, writeback);
+      if (failed(staged))
+        return failure();
+      basePlace = *staged;
     } else if (member->isArrow() &&
                isDecomposedPointerExpr(member->getBase())) {
       // `p->f` through a decomposed pointer: resolve the pointer to its
