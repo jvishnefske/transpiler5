@@ -2539,14 +2539,37 @@ private:
   /// pointer-to-int cast of it folds to 0.
   bool isStaticallyNullPointerExpr(const clang::Expr *expr);
 
-  /// Returns whether `expr` is a dereference of a decomposed pointer that
-  /// peels through a pointee-changing cast (`*(T *)p` on a `void *`
-  /// cursor, CTS-P9). The deref emission resolves such a place at the
-  /// region's base element type; when the viewed type is a same-width
-  /// integer view over that element, the load and store sites wrap the
-  /// accessed value in an `emitrust.cast` bitcast (see `emitCast`'s
-  /// `CK_LValueToRValue` case and `emitAssignToPlace`).
-  bool isReinterpretedViewDeref(const clang::Expr *expr);
+  /// One classification of `expr` as a dereference view over a decomposed
+  /// pointer, computed with a single reinterpreting-cast peel
+  /// (`stripObjectPointerCasts`) shared by every consumer. `deref` is null
+  /// when `expr` is not a dereference of a decomposed pointer at all.
+  /// `reinterpreted` reports a pointee-changing peel (`*(T *)p` on a
+  /// `void *` cursor, CTS-P9, or a direct pun cast, CTS-P11): the deref
+  /// emission resolves such a place at the region's base element type,
+  /// and when the viewed type is a same-width integer view over that
+  /// element the load and store sites wrap the accessed value in an
+  /// `emitrust.cast` bitcast (see `emitCast`'s `CK_LValueToRValue` case
+  /// and `emitAssignToPlace`). `wideByte` additionally reports the
+  /// byte-pun shape — a WIDER integer view (sizeof(T) in {2, 4, 8}) over
+  /// a byte region — which widens to a `T::from_ne_bytes`/`to_ne_bytes`
+  /// access instead of the same-width reinterpret path (wider views over
+  /// non-byte bases keep the reinterpret rejection family).
+  struct ByteViewDeref {
+    /// The dereference `*p`; null when `expr` matches no decomposed
+    /// pointer deref (every flag is then false).
+    const clang::UnaryOperator *deref = nullptr;
+    /// The pointer expression with the reinterpreting casts peeled once.
+    const clang::Expr *strippedPointer = nullptr;
+    /// The peel changed the pointee: a reinterpreted view (CTS-P9/P11).
+    bool reinterpreted = false;
+    /// The wider-integer-view-over-a-byte-region pun shape (CTS-P11).
+    bool wideByte = false;
+  };
+
+  /// Classifies `expr` (see `ByteViewDeref`): the one entry point for
+  /// reinterpreted-view and wide-byte-view dispatch, peeling the
+  /// reinterpreting casts exactly once per query.
+  ByteViewDeref classifyByteViewDeref(const clang::Expr *expr);
 
   /// Returns the C element type at the bottom of `pointer`'s region: the
   /// member's declared type for a `&struct.member` base, the pointee for a
@@ -2561,16 +2584,6 @@ private:
   //===--------------------------------------------------------------------===//
   // Byte puns over i8 regions (CTS-P11)
   //===--------------------------------------------------------------------===//
-
-  /// Returns the dereference `*(T *)p` when `expr` is a reinterpreting
-  /// view over a byte region with a WIDER integer view (sizeof(T) in
-  /// {2, 4, 8}): the byte-pun shape, which widens to a
-  /// `T::from_ne_bytes`/`to_ne_bytes` access over sizeof(T) consecutive
-  /// bytes instead of taking the same-width reinterpret path. Returns
-  /// null for every other expression (in particular for wider views over
-  /// non-byte bases, which keep the reinterpret rejection family).
-  const clang::UnaryOperator *
-  matchWideByteViewDeref(const clang::Expr *expr);
 
   /// Statically resolves the region element C type of a pointer
   /// expression from the AST alone (decayed arrays, tracked pointer
@@ -2594,15 +2607,16 @@ private:
     unsigned byteWidth;
   };
 
-  /// Resolves the wide byte access `deref` designates: decomposes the
-  /// pointer, resolves its byte-array base place (staging a global base's
-  /// whole value like every other global element access; a write context
-  /// passes `writeback` for the store-back), and rejects — with the
-  /// located `runs past the end` diagnostic — a compile-time-constant
-  /// offset whose widened window overruns the array.
-  FailureOr<WideByteAccess>
-  resolveWideByteAccess(const clang::UnaryOperator *deref, Location loc,
-                        GlobalWriteback *writeback);
+  /// Resolves the wide byte access a `wideByte` classification `view`
+  /// designates: decomposes the (already peeled) pointer, resolves its
+  /// byte-array base place (staging a global base's whole value like
+  /// every other global element access; a write context passes
+  /// `writeback` for the store-back), and rejects — with the located
+  /// `runs past the end` diagnostic — a compile-time-constant offset
+  /// whose widened window overruns the array.
+  FailureOr<WideByteAccess> resolveWideByteAccess(const ByteViewDeref &view,
+                                                  Location loc,
+                                                  GlobalWriteback *writeback);
 
   /// Emits the widened load: the `byteWidth` bytes at the cursor are
   /// gathered (as u8) into a byte-array temporary and combined with
@@ -10250,7 +10264,8 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
   // (CTS-P11) widens to a `to_ne_bytes` store over sizeof(T) consecutive
   // bytes; the assignment's value is staged in a temporary so a value
   // position can re-load it.
-  if (const clang::UnaryOperator *wide = matchWideByteViewDeref(op->getLHS())) {
+  if (ByteViewDeref wide = classifyByteViewDeref(op->getLHS());
+      wide.wideByte) {
     GlobalWriteback writeback;
     FailureOr<WideByteAccess> access =
         resolveWideByteAccess(wide, loc, &writeback);
@@ -10293,7 +10308,7 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
   // A store through a same-width integer view (`*(unsigned int *)p = u`
   // over an int base, CTS-P9) casts the value back to the base element
   // type before assigning: the place is the base element's own place.
-  if (isReinterpretedViewDeref(op->getLHS()))
+  if (classifyByteViewDeref(op->getLHS()).reinterpreted)
     if (auto lvalueType =
             llvm::dyn_cast<emitrust::LValueType>((*place).getType()))
       if (lvalueType.getValueType() != toStore.getType())
@@ -10347,7 +10362,8 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   // read-modify-write over the same sizeof(T)-byte window: from_ne_bytes
   // load, computation, to_ne_bytes store (and, over a global byte region,
   // the staged copy's writeback).
-  if (const clang::UnaryOperator *wide = matchWideByteViewDeref(op->getLHS())) {
+  if (ByteViewDeref wide = classifyByteViewDeref(op->getLHS());
+      wide.wideByte) {
     GlobalWriteback writeback;
     FailureOr<WideByteAccess> access =
         resolveWideByteAccess(wide, loc, &writeback);
@@ -11737,7 +11753,7 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
       return emitCellSliceGet(*access, loc);
     // A wider-than-element view over a byte region (CTS-P11) widens to a
     // `from_ne_bytes` load over sizeof(T) consecutive bytes.
-    if (const clang::UnaryOperator *wide = matchWideByteViewDeref(sub)) {
+    if (ByteViewDeref wide = classifyByteViewDeref(sub); wide.wideByte) {
       FailureOr<WideByteAccess> access =
           resolveWideByteAccess(wide, loc, /*writeback=*/nullptr);
       if (failed(access))
@@ -11753,7 +11769,7 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     // element and bitcasts it to the viewed type: Rust's same-width
     // cross-sign `as` reinterprets the bit pattern, exactly C's
     // effective-type-compatible read.
-    if (isReinterpretedViewDeref(sub)) {
+    if (classifyByteViewDeref(sub).reinterpreted) {
       FailureOr<Type> viewed = mapType(cast->getType(), loc);
       if (failed(viewed))
         return failure();
@@ -13790,16 +13806,6 @@ bool CImporter::isStaticallyNullPointerExpr(const clang::Expr *expr) {
   return isStaticallyNullRegion(pointerRegions.regionOf(var));
 }
 
-bool CImporter::isReinterpretedViewDeref(const clang::Expr *expr) {
-  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
-  if (!unary || unary->getOpcode() != clang::UO_Deref)
-    return false;
-  const clang::Expr *stripped =
-      stripObjectPointerCasts(astContext(), unary->getSubExpr());
-  return isDecomposedPointerExpr(stripped) &&
-         viewsChangedPointee(astContext(), unary->getSubExpr());
-}
-
 //===----------------------------------------------------------------------===//
 // Cell-slice accesses (CTS-P10)
 //===----------------------------------------------------------------------===//
@@ -13977,30 +13983,40 @@ CImporter::pointerElementTypeFromAST(const clang::Expr *expr) const {
   return sawArray ? std::optional<clang::QualType>(element) : std::nullopt;
 }
 
-const clang::UnaryOperator *
-CImporter::matchWideByteViewDeref(const clang::Expr *expr) {
+CImporter::ByteViewDeref
+CImporter::classifyByteViewDeref(const clang::Expr *expr) {
+  ByteViewDeref view;
   const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
   if (!unary || unary->getOpcode() != clang::UO_Deref)
-    return nullptr;
+    return view;
   const clang::Expr *stripped =
       stripObjectPointerCasts(astContext(), unary->getSubExpr());
-  if (!isDecomposedPointerExpr(stripped) ||
-      !viewsChangedPointee(astContext(), unary->getSubExpr()))
-    return nullptr;
+  if (!isDecomposedPointerExpr(stripped))
+    return view;
+  view.deref = unary;
+  view.strippedPointer = stripped;
+  // The single peel serves the changed-pointee test directly (the
+  // historical `viewsChangedPointee` on the un-peeled sub-expression).
+  view.reinterpreted = !astContext().hasSameUnqualifiedType(
+      unary->getSubExpr()->getType().getCanonicalType()->getPointeeType(),
+      stripped->getType().getCanonicalType()->getPointeeType());
+  if (!view.reinterpreted)
+    return view;
   clang::QualType viewed = unary->getType();
   if (!viewed->isIntegerType() || viewed->isBooleanType() ||
       viewed->isEnumeralType())
-    return nullptr;
+    return view;
   uint64_t viewedBits = astContext().getTypeSize(viewed);
   if (viewedBits != 16 && viewedBits != 32 && viewedBits != 64)
-    return nullptr;
+    return view;
   std::optional<clang::QualType> element =
-      pointerElementTypeFromAST(unary->getSubExpr());
+      pointerElementTypeFromAST(stripped);
   if (!element || astContext().getTypeSize(*element) != 8 ||
       !(*element)->isIntegerType() || (*element)->isBooleanType() ||
       (*element)->isEnumeralType())
-    return nullptr;
-  return unary;
+    return view;
+  view.wideByte = true;
+  return view;
 }
 
 /// Best-effort compile-time evaluation of an i64 cursor value: constants,
@@ -14042,12 +14058,12 @@ static std::optional<int64_t> staticCursorValue(Value value) {
 }
 
 FailureOr<CImporter::WideByteAccess>
-CImporter::resolveWideByteAccess(const clang::UnaryOperator *deref,
-                                 Location loc, GlobalWriteback *writeback) {
-  // The reinterpreting casts are stripped up front: the decomposition
-  // itself only peels the qualification and void-wildcard forms.
-  FailureOr<PtrExprValue> pointer = emitPointerRValue(
-      stripObjectPointerCasts(astContext(), deref->getSubExpr()));
+CImporter::resolveWideByteAccess(const ByteViewDeref &view, Location loc,
+                                 GlobalWriteback *writeback) {
+  // The classification already peeled the reinterpreting casts once: the
+  // decomposition itself only peels the qualification and void-wildcard
+  // forms.
+  FailureOr<PtrExprValue> pointer = emitPointerRValue(view.strippedPointer);
   if (failed(pointer))
     return failure();
   if (pointer->baseIndex || pointer->member)
@@ -14056,7 +14072,7 @@ CImporter::resolveWideByteAccess(const clang::UnaryOperator *deref,
   if (pointer->nonNull)
     return emitError(loc)
            << "unsupported: wide byte access through a possibly-null pointer";
-  FailureOr<Type> viewedType = mapType(deref->getType(), loc);
+  FailureOr<Type> viewedType = mapType(view.deref->getType(), loc);
   if (failed(viewedType))
     return failure();
   auto valueType = llvm::dyn_cast<IntegerType>(*viewedType);
