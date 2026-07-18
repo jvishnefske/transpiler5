@@ -3,7 +3,31 @@
 Adversarial, deterministic differential fuzzing for emitrust-cc: every
 seed becomes a UB-free C11 program in the supported subset, compiled
 both natively (clang) and through `emitrust-cc --emit=crate --build`,
-with exit codes and stdout bytes compared byte-for-byte.
+with exit codes and stdout bytes compared byte-for-byte — **three
+ways**: the generator's own expected-output oracle vs the native binary
+vs the transpiled binary.
+
+## Three-way oracle
+
+genprog.py knows each program's semantics, so every template has an
+exact Python evaluator (`evaluate_plan`) that reproduces the program's
+stdout bytes and exit code with explicit wrapping arithmetic: 32-bit
+two's-complement int/unsigned, 64-bit for the carrier's `unsigned
+long`, little-endian byte puns (asserted at import — both legs run on
+the same little-endian host). Classification:
+
+- `PASS` — oracle == native == transpiled.
+- `MISCOMPILE` — transpiled differs while native matches the oracle,
+  so the verdict rests on two independent witnesses.
+- `GENERATOR_ORACLE_BUG` — native disagrees with the oracle: the
+  generator emitted UB, the evaluator drifted from the renderer, or
+  clang surprised us. Hard-fails the run like HARNESS_BUG.
+- `UNSUPPORTED` — unchanged (emitrust-cc rejected the program).
+
+**Oracle exemptions: none.** All ten templates are deterministic
+integer/byte/string arithmetic and are simulated exactly, including the
+sprintf format matrix (%d/%u/%x/%c/%s with widths and zero-pad, which
+Python's %-formatting reproduces for these argument ranges).
 
 ## Files
 
@@ -64,6 +88,9 @@ whenever the seed→program mapping changes.
 4. **Re-run** the seed range that found it, plus the smoke test, to
    confirm the fix and catch neighbors.
 
-`HARNESS_BUG` means the native leg failed to compile or run: that is a
-generator defect (UB or unsupported-by-clang output) and must be fixed
-in genprog.py before its seed range is trusted.
+`HARNESS_BUG` means the native leg failed to compile or run;
+`GENERATOR_ORACLE_BUG` means the native leg ran but disagreed with the
+generator's own expected output. Both are generator defects (UB,
+evaluator drift, or unsupported-by-clang output) and must be fixed in
+genprog.py before their seed range is trusted — never paper over an
+oracle disagreement by exempting a template.

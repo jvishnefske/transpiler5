@@ -3,14 +3,22 @@
 
 ``run_pair`` compiles one generated C program twice -- natively with
 clang and through ``emitrust-cc --emit=crate --build`` -- runs both
-binaries, and compares (exit code, stdout bytes).  Classification:
+binaries, and compares (exit code, stdout bytes).  When the caller
+supplies the generator oracle's ``expected`` tuple the comparison is
+THREE-way: generator-predicted vs native vs transpiled.  Classification:
 
-* PASS        -- both legs ran and the (rc, stdout) tuples match.
+* PASS        -- all legs ran and the (rc, stdout) tuples match (with an
+  oracle: expected == native == transpiled).
 * UNSUPPORTED -- emitrust-cc rejected the program or timed out; counted,
   never a failure (the generator intentionally brushes subset edges).
 * MISCOMPILE  -- emitrust-cc accepted and built, but the transpiled
   binary is missing, crashed, timed out, or its (rc, stdout) tuple
-  differs from the native one.  Always a compiler bug to triage.
+  differs from the native one while native matches the oracle.  Always a
+  compiler bug to triage.
+* GENERATOR_ORACLE_BUG -- the NATIVE leg disagrees with the generator's
+  own expected output: the generator emitted UB, its evaluator drifted
+  from its renderer, or clang surprised us.  Any of those invalidates
+  the run; drivers must hard-fail exactly like HARNESS_BUG.
 * HARNESS_BUG -- the NATIVE leg failed to compile or run (crash or
   timeout).  That is a generator defect; drivers must fail loudly.
 
@@ -45,6 +53,7 @@ from run_c_testsuite import (  # noqa: E402
 PASS = "PASS"
 UNSUPPORTED = "UNSUPPORTED"
 MISCOMPILE = "MISCOMPILE"
+GENERATOR_ORACLE_BUG = "GENERATOR_ORACLE_BUG"
 HARNESS_BUG = "HARNESS_BUG"
 
 PairResult = namedtuple(
@@ -69,12 +78,16 @@ def _run_binary(binary):
     return rc, stdout, timed_out
 
 
-def compare_runs(native_binary, rust_binary):
+def compare_runs(native_binary, rust_binary, expected=None):
     """Run both binaries and classify the (rc, stdout) comparison.
 
-    The native leg is trusted ground truth: a crash or timeout there is a
-    HARNESS_BUG.  Any divergence on the rust leg is a MISCOMPILE.  This is
-    the single comparison path used by both run_pair and --self-test.
+    The native leg is ground truth for the transpiled leg: a crash or
+    timeout there is a HARNESS_BUG, and any rust-leg divergence from it
+    is a MISCOMPILE.  When ``expected`` -- the generator oracle's
+    ``(exit_code, stdout_bytes)`` -- is given, the native leg must first
+    agree with it or the whole run is a GENERATOR_ORACLE_BUG, so a
+    MISCOMPILE verdict always rests on two independent witnesses.  This
+    is the single comparison path used by both run_pair and --self-test.
     """
     native_rc, native_out, timed_out = _run_binary(native_binary)
     if timed_out:
@@ -84,6 +97,18 @@ def compare_runs(native_binary, rust_binary):
             HARNESS_BUG, "native binary crashed with signal %d" % -native_rc,
             native_rc, native_out, None, b"", None,
         )
+
+    if expected is not None:
+        expected_rc, expected_out = expected
+        if (native_rc, native_out) != (expected_rc, expected_out):
+            detail = "native disagrees with generator oracle: rc native=%s expected=%s" % (
+                native_rc, expected_rc,
+            )
+            if native_out != expected_out:
+                detail += "; stdout mismatch:\n" + output_diff_snippet(expected_out, native_out)
+            return PairResult(
+                GENERATOR_ORACLE_BUG, detail, native_rc, native_out, None, b"", None
+            )
 
     rust_rc, rust_out, timed_out = _run_binary(rust_binary)
     if timed_out:
@@ -99,11 +124,13 @@ def compare_runs(native_binary, rust_binary):
     return PairResult(PASS, "", native_rc, native_out, rust_rc, rust_out, None)
 
 
-def run_pair(emitrust_cc, clang, source_path, workdir):
+def run_pair(emitrust_cc, clang, source_path, workdir, expected=None):
     """Run one source file through both legs and classify the outcome.
 
     ``workdir`` is a per-seed scratch directory; the crate name is derived
     from the source file stem (``fuzz_<seed>.c`` -> ``fuzz_<seed>``).
+    ``expected`` is the optional generator-oracle ``(exit_code,
+    stdout_bytes)`` tuple enabling the three-way comparison.
     """
     os.makedirs(workdir, exist_ok=True)
     stem = os.path.splitext(os.path.basename(source_path))[0]
@@ -153,7 +180,7 @@ def run_pair(emitrust_cc, clang, source_path, workdir):
             None, b"", None, b"", crate_dir,
         )
 
-    result = compare_runs(native_binary, rust_binary)
+    result = compare_runs(native_binary, rust_binary, expected)
     return result._replace(crate_dir=crate_dir)
 
 
@@ -186,9 +213,24 @@ def _self_test(clang, workdir):
 
     divergent = compare_runs(binaries["sa"], binaries["sb"])
     identical = compare_runs(binaries["sa"], binaries["sa"])
-    ok = divergent.status == MISCOMPILE and identical.status == PASS
+    # Three-way oracle checks: sa prints "alpha\n" and exits 3.  A correct
+    # expectation must PASS; a planted wrong expectation must be pinned on
+    # the generator, not the compiler.
+    oracle_good = compare_runs(binaries["sa"], binaries["sa"], expected=(3, b"alpha\n"))
+    oracle_bad = compare_runs(binaries["sa"], binaries["sa"], expected=(3, b"planted\n"))
+    ok = (
+        divergent.status == MISCOMPILE
+        and identical.status == PASS
+        and oracle_good.status == PASS
+        and oracle_bad.status == GENERATOR_ORACLE_BUG
+    )
     print("self-test divergent pair -> %s (expected MISCOMPILE)" % divergent.status)
     print("self-test identical pair -> %s (expected PASS)" % identical.status)
+    print("self-test correct oracle -> %s (expected PASS)" % oracle_good.status)
+    print(
+        "self-test planted wrong oracle -> %s (expected GENERATOR_ORACLE_BUG)"
+        % oracle_bad.status
+    )
     print("self-test %s" % ("OK" if ok else "FAIL"))
     return 0 if ok else 1
 

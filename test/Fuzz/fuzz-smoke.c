@@ -6,8 +6,10 @@
 // contains no C code.  The real work is fuzz_differential.py, which
 // generates 16 deterministic programs (genprog.py, seeds 1..16), runs each
 // through both clang and emitrust-cc --emit=crate --build (differ.py), and
-// compares exit codes and stdout bytes.  Any MISCOMPILE or HARNESS_BUG
-// fails the test; UNSUPPORTED seeds are counted but fine.
+// compares exit codes and stdout bytes THREE ways: the generator's own
+// expected-output oracle vs the native binary vs the transpiled binary.
+// Any MISCOMPILE, GENERATOR_ORACLE_BUG, or HARNESS_BUG fails the test;
+// UNSUPPORTED seeds are counted but fine.
 //
 // Tool resolution: lit's ToolSubst rewrites the bare token `emitrust-cc`
 // after --emitrust-cc to the built tool's absolute path, exactly as in

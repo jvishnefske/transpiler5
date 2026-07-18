@@ -14,6 +14,11 @@ branch conditions are runtime values that constant folding cannot cheat
 on.  Programs print running printf digests at multiple points and return
 a computed value in 0..250 (``acc % 251``).
 
+``generate_program`` also returns the program's EXPECTED stdout bytes
+and exit code, computed by an exact per-template Python evaluator
+(``evaluate_plan``) with explicit wrapping arithmetic -- the third leg
+of differ.py's three-way comparison.  No template is oracle-exempt.
+
 Templates mirror the executable spec in test/EndToEnd/*.c: union puns
 (unions.c), byte reinterprets over char arrays (pointers-reinterpret.c),
 cell-slice globals with permuted recursion (pointers-global-args.c),
@@ -45,8 +50,19 @@ from collections import namedtuple
 # Bump when the seed->program mapping changes; a campaign result is only
 # reproducible against the same generator version.
 # Version history: 1 = initial nine templates; 2 = writeback_order added
-# (RHS/index calls mutating a distinct subobject of the assigned global).
-GENERATOR_VERSION = "2"
+# (RHS/index calls mutating a distinct subobject of the assigned global);
+# 3 = three-way expected-output oracle (same seed->program mapping as 2,
+# but the Program artifact now includes evaluator-computed expectations).
+GENERATOR_VERSION = "3"
+
+# The expected-output oracle simulates the byte puns with native (host)
+# endianness; both differential legs run on the same host, and that host
+# is assumed little-endian.  Fail loudly otherwise.
+if sys.byteorder != "little":
+    raise RuntimeError(
+        "genprog's expected-output oracle assumes a little-endian host;"
+        " sys.byteorder=%r" % sys.byteorder
+    )
 
 # Fraction of seeds forced to combine >= 2 pointer-provenance templates.
 CROSS_FRACTION = 0.5
@@ -59,7 +75,10 @@ POOL_MASK = [0x55AA55AA, 0xAA55AA55, 0x01010101, 0x7FFFFFFF, 0x00FF00FF]
 
 Instance = namedtuple("Instance", ["uid", "name", "params"])
 Plan = namedtuple("Plan", ["seed", "warm", "seed_mix", "instances"])
-Program = namedtuple("Program", ["source", "template_names", "plan"])
+Program = namedtuple(
+    "Program",
+    ["source", "template_names", "plan", "expected_stdout", "expected_exit"],
+)
 
 
 def _int_lit(value):
@@ -747,6 +766,343 @@ PROVENANCE_TEMPLATES = [
 _FN_PREFIX = {spec.name: spec.fn_prefix for spec in TEMPLATES}
 
 
+# ---------------------------------------------------------------------------
+# Expected-output oracle: an exact Python evaluator per template.  Each
+# evaluator mirrors its renderer statement by statement with explicit
+# wrapping arithmetic (32-bit two's-complement int/unsigned, 64-bit for the
+# carrier's unsigned long, little-endian byte puns per the module-level
+# byteorder assertion) and appends the same printf lines the C program
+# emits.  evaluate_plan() returns the exact (stdout bytes, exit code) both
+# compiled legs must reproduce; any native divergence from it is a
+# GENERATOR_ORACLE_BUG in differ.py.  No template is oracle-exempt.
+# ---------------------------------------------------------------------------
+
+_M32 = 0xFFFFFFFF
+_M64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _u32(value):
+    """Wrap to C unsigned int (32-bit)."""
+    return value & _M32
+
+
+def _i32(value):
+    """Reinterpret the low 32 bits as C int (two's complement)."""
+    value &= _M32
+    return value - 0x100000000 if value & 0x80000000 else value
+
+
+def _u64(value):
+    """Wrap to C unsigned long (64-bit on the LP64 host)."""
+    return value & _M64
+
+
+def _ld32(buf, off):
+    """Little-endian u32 load from a bytearray (the *(unsigned *) view)."""
+    return buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)
+
+
+def _st32(buf, off, value):
+    """Little-endian u32 store into a bytearray (the *(unsigned *) view)."""
+    value = _u32(value)
+    buf[off] = value & 0xFF
+    buf[off + 1] = (value >> 8) & 0xFF
+    buf[off + 2] = (value >> 16) & 0xFF
+    buf[off + 3] = (value >> 24) & 0xFF
+
+
+def _eval_union_pun(uid, p, salt, out):
+    u = "u%d" % uid
+    acc = salt
+    for j in range(p["iters"]):
+        vu = _u32(acc ^ p["mask"])
+        out.append("%s.a=%d\n" % (u, _i32(vu)))
+        vu = _u32(p["pool_a"]) ^ (salt % 13)
+        acc = _u32(acc + vu + j)
+        out.append("%s.b=%d acc=%d\n" % (u, _i32(vu), acc % 100000))
+    vu = _u32(-(salt % 100) - p["negoff"])
+    out.append("%s.n=%d\n" % (u, vu))
+    acc = _u32(acc + vu)
+    tag = salt % 17
+    hpu = _u32(p["pool_b"]) ^ (salt % 9)
+    out.append("%s.h=%d %d %d\n" % (u, tag, _i32(hpu), hpu))
+    return _u32(acc + hpu + tag)
+
+
+def _eval_byte_pun(uid, p, salt, out):
+    u = "u%d" % uid
+    length = p["length"]
+    acc = salt
+    arr = bytearray(length)
+    for j in range(length):
+        arr[j] = ord("A") + (j + salt % 7) % 26
+    out.append("%s.i j=%d\n" % (u, salt % 7))
+    for j in range(3):
+        off = (j * (length - 4)) // 2
+        w = _ld32(arr, off)
+        acc = _u32(acc * 31 + (w % 65536))
+        _st32(arr, off, w ^ p["mask"])
+        out.append("%s.w j=%d off=%d w=%d\n" % (u, j, off, w % 100000))
+    off = salt % (length - 3)
+    _st32(arr, off, _ld32(arr, off) + _u32(p["delta"] ^ (salt | 1)))
+    w = _ld32(arr, off)
+    out.append("%s.c off=%d w=%d\n" % (u, off, w % 100000))
+    acc = _u32(acc + w)
+    for j in range(length - 1):
+        arr[j] = ord("a") + arr[j] % 26
+    out.append("%s.s=%s\n" % (u, arr[: length - 1].decode("ascii")))
+    return acc
+
+
+def _eval_cell_slice(uid, p, salt, out):
+    u = "u%d" % uid
+    arr_a = [j + 1 + salt % 3 for j in range(4)]
+    arr_b = [0] * 4
+    arr_c = [0] * 4
+
+    def cpr():
+        out.append(
+            "%s.st%s |%s |%s\n"
+            % (
+                u,
+                "".join(" %d" % v for v in arr_a),
+                "".join(" %d" % v for v in arr_b),
+                "".join(" %d" % v for v in arr_c),
+            )
+        )
+
+    def cmv(s, d):
+        i = 0
+        while i < 4 and s[i] == 0:
+            i += 1
+        j = 0
+        while j < 4 and d[j] == 0:
+            j += 1
+        if i >= 4 or j <= 0:
+            out.append("%s.skip\n" % u)
+            return 0
+        d[j - 1] = s[i]
+        s[i] = 0
+        cpr()
+        return d[j - 1]
+
+    perm1, perm2 = _CELL_PERMS[p["perm"]]
+
+    def chn(n, s, d, sp):
+        if n <= 1:
+            cmv(s, d)
+            return
+        env = {"s": s, "d": d, "sp": sp}
+        chn(n - 1, *[env[t.strip()] for t in perm1.split(",")])
+        cmv(s, d)
+        chn(n - 1, *[env[t.strip()] for t in perm2.split(",")])
+
+    n = arr_a[1] - arr_a[0] + p["extra"]
+    out.append("%s.n=%d\n" % (u, n))
+    cpr()
+    m = cmv(arr_a, arr_c)
+    out.append("%s.m=%d\n" % (u, m))
+    m += cmv(arr_c, arr_a)
+    chn(n, arr_a, arr_b, arr_c)
+    cpr()
+    return _u32(salt * 3 + (arr_a[0] + arr_b[3] + arr_c[3] + m + 64))
+
+
+def _eval_ptr_mix(uid, p, salt, out):
+    u = "u%d" % uid
+    acc = salt
+    x = salt % 100 + p["base"]
+    y = salt % 30 + 1
+    for i in range(p["iters"]):
+        x += i
+        acc = _u32(acc + _u32(x))
+        if acc % 2 == 0:
+            x += 1
+            out.append("%s.q=%d\n" % (u, x))
+        else:
+            out.append("%s.null i=%d\n" % (u, i))
+    x += acc % 50
+    out.append("%s.x=%d\n" % (u, x))
+    a = salt % 40
+    b = p["pool_small"]
+    if a > p["thresh"]:
+        b += a
+    else:
+        y += a
+    out.append("%s.mb=%d %d %d y=%d\n" % (u, a, b, 3, y))
+    acc = _u32(acc + _u32(y))
+    uu = _u32(_u32(x) * 2654435761)
+    acc = _u32(acc + uu)
+    out.append("%s.u=%d\n" % (u, uu % 100000))
+    return _u32(acc + _u32(b))
+
+
+def _sprintf_piece(index, uid_tag, lit, salt):
+    """Format one _FMT_MATRIX slot exactly as C sprintf would."""
+    if index == 0:
+        return "[%d]" % _i32(_u32(lit) ^ (salt % 31))
+    if index == 1:
+        return "[%5d]" % (-(salt % 90) - 7)
+    if index == 2:
+        return "[%-6d]" % (salt % 1000 - 500)
+    if index == 3:
+        return "[%05d]" % (-(salt % 500))
+    if index == 4:
+        return "[%d]" % _u32(_u32(lit) + salt % 65536)
+    if index == 5:
+        return "[%x]" % (_u32(lit) | (salt % 255))
+    if index == 6:
+        return "[%08x]" % _u32(_u32(lit) ^ (salt % 4096))
+    if index == 7:
+        return "[%02d]" % (salt % 7)
+    if index == 8:
+        return "[%c]" % chr(ord("a") + salt % 26)
+    return "[s%s]" % uid_tag
+
+
+def _eval_va_sprintf(uid, p, salt, out):
+    u = "u%d" % uid
+    acc = salt
+    buf = "".join(
+        _sprintf_piece(p[slot], u, p["val_" + slot[-1]], salt)
+        for slot in ("fmt_a", "fmt_b", "fmt_c")
+    )
+    n = len(buf)
+    out.append("%s.f=%s|%d\n" % (u, buf, n))
+    acc = _u32(acc + n)
+    a = salt % 50
+    m = a - n if a > n else n - a + 1
+    out.append("%s.v=%d\n" % (u, m))
+    buf2 = "%02d:%d" % (salt % 60, m)
+    n2 = len(buf2)
+    out.append("%s.g=%s|%d\n" % (u, buf2, n2))
+    return _u32(acc + _u32(m + n2))
+
+
+def _eval_stmt_expr(uid, p, salt, out):
+    u = "u%d" % uid
+    x = salt % 9 + p["xa"]
+    y = salt % 7 + p["ya"]
+    for j in range(p["iters"]):
+        x += max(j * 3 % 7, j)
+        y += y // 2 + 1
+        out.append("%s.j=%d x=%d y=%d\n" % (u, j, x, y))
+    z = max(min(x - y, p["hi"]), p["lo"])
+    out.append("%s.z=%d min=%d\n" % (u, z, min(x, y)))
+    n0 = salt % 4 + 2
+    out.append("%s.l=%d\n" % (u, n0 * (n0 + 1) // 2))
+    return _u32(salt + _u32(z + x + y + 40))
+
+
+def _eval_devirt(uid, p, salt, out):
+    u = "u%d" % uid
+    a = 0
+    for j in range(p["iters"]):
+        a += (j + salt % 5) * p["mult"] + 1
+        out.append("%s.j=%d a=%d\n" % (u, j, a))
+    out.append("%s.t=%d %d\n" % (u, a, (a % 100) * p["mult"] + 1))
+    return _u32(salt + a)
+
+
+def _eval_greturn(uid, p, salt, out):
+    u = "u%d" % uid
+    n = p["n0"]
+    m = salt % 90 + 1
+    gcl = 1
+    out.append("%s.m=%d c=%d\n" % (u, m, gcl))
+    m += p["step"]
+    gcl += 2
+    out.append("%s.m2=%d c=%d\n" % (u, m, gcl))
+    n = m + n % 100
+    out.append("%s.n=%d\n" % (u, n))
+    m = p["pool_small"]
+    gcl += 1  # ggo() inside the .r printf line.
+    out.append("%s.r=%d %d\n" % (u, m, n))
+    return _u32(salt + _u32(gcl * 3 + n % 50 + 128))
+
+
+def _eval_carrier(uid, p, salt, out):
+    u = "u%d" % uid
+    # bk starts 0, so the first ext() returns NULL: isn() prints 1.
+    out.append("%s.a=%d\n" % (u, 1))
+    mask = p["align"] - 1
+    bk = (salt % 512) + p["base"]
+    bk = _u64((bk + mask) & ~mask)
+    # r = bk (nonzero since base >= 8); then bk advances by size2.
+    bk = _u64(bk + p["size2"])
+    out.append("%s.b=ok\n" % u)
+    out.append("%s.c=%d bk=%d\n" % (u, 0, bk))
+    out.append("%s.d=%d %d\n" % (u, 1 if salt % 2 != 0 else 2, 1))
+    return _u32(salt + bk % 1000)
+
+
+def _eval_writeback(uid, p, salt, out):
+    u = "u%d" % uid
+    acc = salt
+    woff = salt % p["off_mod"]
+    gwb = bytearray(range(1, 9))
+    gwb[6] = 40 + salt % 40  # wpk()'s disjoint byte write.
+    _st32(gwb, woff, p["mask"] ^ (salt % 251))
+    out.append("%s.a w=%d b6=%d\n" % (u, _ld32(gwb, woff) % 100000, gwb[6]))
+    gwb[7] = 30 + salt % 50  # wbp()'s disjoint byte write.
+    _st32(gwb, woff, _ld32(gwb, woff) + _u32(p["delta"] + salt % 16))
+    out.append(
+        "%s.b w=%d b6=%d b7=%d\n" % (u, _ld32(gwb, woff) % 100000, gwb[6], gwb[7])
+    )
+    acc = _u32(acc * 31 + _ld32(gwb, woff))
+    b = 70 + salt % 20
+    a = p["rv1"] + salt % 7
+    out.append("%s.c a=%d b=%d\n" % (u, a, b))
+    b = 90 + salt % 9
+    a += p["rv2"]
+    out.append("%s.d a=%d b=%d\n" % (u, a, b))
+    y = 80 + salt % 15
+    x = p["rv3"] + salt % 5
+    out.append("%s.e x=%d y=%d\n" % (u, x, y))
+    gwa = [j * 2 + salt % 5 for j in range(4)]
+    gwa[2] = 33 + salt % 7  # wi2()'s element write, then the ++ writeback.
+    gwa[salt % 2] += 1
+    out.append("%s.f1 %d %d %d %d\n" % (u, gwa[0], gwa[1], gwa[2], gwa[3]))
+    gwa[3] = 44 + salt % 5  # wi3()'s element write, then the += writeback.
+    gwa[(salt // 3) % 2] += p["plus"]
+    out.append("%s.f2 %d %d %d %d\n" % (u, gwa[0], gwa[1], gwa[2], gwa[3]))
+    acc = _u32(acc + _u32(a + b + x + y))
+    return _u32(acc + _u32(sum(gwa)))
+
+
+_EVALUATORS = {
+    "union_pun": _eval_union_pun,
+    "byte_pun": _eval_byte_pun,
+    "cell_slice": _eval_cell_slice,
+    "ptr_mix": _eval_ptr_mix,
+    "va_sprintf": _eval_va_sprintf,
+    "stmt_expr": _eval_stmt_expr,
+    "devirt": _eval_devirt,
+    "greturn": _eval_greturn,
+    "carrier": _eval_carrier,
+    "writeback_order": _eval_writeback,
+}
+
+
+def evaluate_plan(plan):
+    """Exact expected behavior of a plan's program.
+
+    Returns ``(stdout_bytes, exit_code)``: the same digest lines and the
+    same final ``acc % 251`` the rendered C program produces on both
+    differential legs.  Pure function of the plan; consumes no randomness.
+    """
+    out = []
+    acc = plan.seed % 65536
+    for gi in range(plan.warm):
+        acc = _u32(acc * 1103515245 + gi + plan.seed_mix)
+    out.append("boot=%d\n" % (acc % 99991))
+    for inst in plan.instances:
+        acc = _EVALUATORS[inst.name](inst.uid, inst.params, acc, out)
+        out.append("dg%d=%d\n" % (inst.uid, acc % 65521))
+    out.append("final=%d\n" % (acc % 100000))
+    return "".join(out).encode("ascii"), acc % 251
+
+
 def plan_program(seed, cross_fraction=CROSS_FRACTION):
     """Build the deterministic Plan for ``seed``.
 
@@ -811,12 +1167,19 @@ def render_plan(plan):
 
 
 def generate_program(seed, cross_fraction=CROSS_FRACTION):
-    """Generate the C program for ``seed``; returns a Program namedtuple."""
+    """Generate the C program for ``seed``; returns a Program namedtuple.
+
+    ``expected_stdout``/``expected_exit`` come from the exact evaluator
+    (evaluate_plan) and are what BOTH compiled legs must reproduce.
+    """
     plan = plan_program(seed, cross_fraction)
+    expected_stdout, expected_exit = evaluate_plan(plan)
     return Program(
         source=render_plan(plan),
         template_names=[inst.name for inst in plan.instances],
         plan=plan,
+        expected_stdout=expected_stdout,
+        expected_exit=expected_exit,
     )
 
 
@@ -836,10 +1199,20 @@ def main(argv):
         action="store_true",
         help="Print the template names for the seed on stderr.",
     )
+    parser.add_argument(
+        "--expected",
+        default=None,
+        help="Also write the oracle's expected stdout bytes to this path"
+        " (the expected exit code is printed on stderr).",
+    )
     args = parser.parse_args(argv)
     program = generate_program(args.seed, args.cross_fraction)
     if args.print_templates:
         sys.stderr.write(" ".join(program.template_names) + "\n")
+    if args.expected:
+        with open(args.expected, "wb") as handle:
+            handle.write(program.expected_stdout)
+        sys.stderr.write("expected-exit %d\n" % program.expected_exit)
     if args.output:
         with open(args.output, "w", encoding="utf-8") as handle:
             handle.write(program.source)
