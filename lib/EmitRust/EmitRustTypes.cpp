@@ -156,6 +156,26 @@ LogicalResult emitrust::SliceType::verify(
 }
 
 //===----------------------------------------------------------------------===//
+// CellSliceType
+//===----------------------------------------------------------------------===//
+
+/// Returns whether `type` may be used as a cell-slice element type: a
+/// scalar (integer, index, f32, f64). Aggregates, references, lvalues, and
+/// dialect types are rejected — a cell-slice views a run of scalar `Cell`s
+/// flattened out of one global array.
+bool emitrust::CellSliceType::isValidElementType(Type type) {
+  return llvm::isa<IntegerType, IndexType, Float32Type, Float64Type>(type);
+}
+
+/// Verifies that the cell-slice element type is a scalar.
+LogicalResult emitrust::CellSliceType::verify(
+    llvm::function_ref<InFlightDiagnostic()> emitError, Type elementType) {
+  if (!elementType || !isValidElementType(elementType))
+    return emitError() << "invalid cell-slice element type " << elementType;
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // FnPtrType
 //===----------------------------------------------------------------------===//
 
