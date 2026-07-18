@@ -23,7 +23,10 @@ extra-dropping + sprintf formats (varargs-def.c, sprintf.c), statement
 expressions (stmt-expr.c), fn-ptr devirtualization (fnptr-devirt.c),
 global-return chains (pointers-return-global.c), and int-carrier +
 __builtin_expect + missing-return combos
-(missing-return-expect-carrier.c).  A configurable fraction of seeds
+(missing-return-expect-carrier.c), and writeback ordering -- stores into
+a global whose RHS or index expression calls a helper mutating a
+DISTINCT subobject of that same global (globals-writeback-order.c).  A
+configurable fraction of seeds
 (CROSS_FRACTION) is forced to combine at least two pointer-provenance
 templates.
 
@@ -41,7 +44,9 @@ from collections import namedtuple
 
 # Bump when the seed->program mapping changes; a campaign result is only
 # reproducible against the same generator version.
-GENERATOR_VERSION = "1"
+# Version history: 1 = initial nine templates; 2 = writeback_order added
+# (RHS/index calls mutating a distinct subobject of the assigned global).
+GENERATOR_VERSION = "2"
 
 # Fraction of seeds forced to combine >= 2 pointer-provenance templates.
 CROSS_FRACTION = 0.5
@@ -502,6 +507,109 @@ static unsigned tmpl_cr_%(u)s(unsigned salt) {
     }
 
 
+def _render_writeback(uid, p):
+    """Writeback-order shapes (ref: test/EndToEnd/globals-writeback-order.c).
+
+    Every LHS store targets a global subobject while the RHS (or index
+    expression) calls a helper that writes a provably DISJOINT subobject
+    of the same global: the wide-byte window stays within [woff, woff+4)
+    with woff <= 2 while the helpers write bytes 6 and 7; the struct
+    helpers write the OTHER member; the index helpers return 0/1 while
+    writing elements 2/3.  Function calls are indeterminately sequenced
+    with the lvalue evaluation, so disjointness keeps every shape UB-free
+    (C11 6.5.16p3).  Digests of BOTH subobjects print after each shape.
+    """
+    u = "u%d" % uid
+    return """char gwb_%(u)s[8];
+struct WS_%(u)s { int a; int b; };
+struct WS_%(u)s gws_%(u)s;
+struct WT_%(u)s { int x; int y; };
+struct WT_%(u)s gwt_%(u)s;
+int gwa_%(u)s[4];
+unsigned wsl_%(u)s;
+
+static unsigned wpk_%(u)s(void) {
+  gwb_%(u)s[6] = (char)(40 + (int)(wsl_%(u)s %% 40u));
+  return %(mask)s ^ (wsl_%(u)s %% 251u);
+}
+
+static unsigned wbp_%(u)s(void) {
+  gwb_%(u)s[7] = (char)(30 + (int)(wsl_%(u)s %% 50u));
+  return %(delta)s + (wsl_%(u)s %% 16u);
+}
+
+static int wtb_%(u)s(void) {
+  gws_%(u)s.b = 70 + (int)(wsl_%(u)s %% 20u);
+  return %(rv1)d + (int)(wsl_%(u)s %% 7u);
+}
+
+static int wtb2_%(u)s(void) {
+  gws_%(u)s.b = 90 + (int)(wsl_%(u)s %% 9u);
+  return %(rv2)s;
+}
+
+static struct WT_%(u)s *wgt_%(u)s(void) { return &gwt_%(u)s; }
+
+static int wpy_%(u)s(void) {
+  gwt_%(u)s.y = 80 + (int)(wsl_%(u)s %% 15u);
+  return %(rv3)d + (int)(wsl_%(u)s %% 5u);
+}
+
+static int wi2_%(u)s(void) {
+  gwa_%(u)s[2] = 33 + (int)(wsl_%(u)s %% 7u);
+  return (int)(wsl_%(u)s %% 2u);
+}
+
+static int wi3_%(u)s(void) {
+  gwa_%(u)s[3] = 44 + (int)(wsl_%(u)s %% 5u);
+  return (int)((wsl_%(u)s / 3u) %% 2u);
+}
+
+static unsigned tmpl_wb_%(u)s(unsigned salt) {
+  unsigned acc = salt;
+  unsigned woff;
+  int j;
+  wsl_%(u)s = salt;
+  woff = salt %% %(off_mod)du;
+  for (j = 0; j < 8; j++)
+    gwb_%(u)s[j] = (char)(j + 1);
+  *(unsigned *)(gwb_%(u)s + woff) = wpk_%(u)s();
+  printf("%(u)s.a w=%%u b6=%%u\\n", *(unsigned *)(gwb_%(u)s + woff) %% 100000u,
+         (unsigned)gwb_%(u)s[6]);
+  *(unsigned *)(gwb_%(u)s + woff) += wbp_%(u)s();
+  printf("%(u)s.b w=%%u b6=%%u b7=%%u\\n", *(unsigned *)(gwb_%(u)s + woff) %% 100000u,
+         (unsigned)gwb_%(u)s[6], (unsigned)gwb_%(u)s[7]);
+  acc = acc * 31u + *(unsigned *)(gwb_%(u)s + woff);
+  gws_%(u)s.a = wtb_%(u)s();
+  printf("%(u)s.c a=%%d b=%%d\\n", gws_%(u)s.a, gws_%(u)s.b);
+  gws_%(u)s.a += wtb2_%(u)s();
+  printf("%(u)s.d a=%%d b=%%d\\n", gws_%(u)s.a, gws_%(u)s.b);
+  wgt_%(u)s()->x = wpy_%(u)s();
+  printf("%(u)s.e x=%%d y=%%d\\n", gwt_%(u)s.x, gwt_%(u)s.y);
+  for (j = 0; j < 4; j++)
+    gwa_%(u)s[j] = j * 2 + (int)(salt %% 5u);
+  gwa_%(u)s[wi2_%(u)s()]++;
+  printf("%(u)s.f1 %%d %%d %%d %%d\\n", gwa_%(u)s[0], gwa_%(u)s[1],
+         gwa_%(u)s[2], gwa_%(u)s[3]);
+  gwa_%(u)s[wi3_%(u)s()] += %(plus)d;
+  printf("%(u)s.f2 %%d %%d %%d %%d\\n", gwa_%(u)s[0], gwa_%(u)s[1],
+         gwa_%(u)s[2], gwa_%(u)s[3]);
+  acc = acc + (unsigned)(gws_%(u)s.a + gws_%(u)s.b + gwt_%(u)s.x + gwt_%(u)s.y);
+  acc = acc + (unsigned)(gwa_%(u)s[0] + gwa_%(u)s[1] + gwa_%(u)s[2] + gwa_%(u)s[3]);
+  return acc;
+}
+""" % {
+        "u": u,
+        "mask": _uns_lit(p["mask"]),
+        "delta": _uns_lit(p["delta"]),
+        "rv1": p["rv1"],
+        "rv2": _int_lit(p["rv2"]),
+        "rv3": p["rv3"],
+        "off_mod": p["off_mod"],
+        "plus": p["plus"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Template registry: name -> (parameter domains, renderer).  Domains are
 # ordered lists; minimize.py shrinks toward the front of each list, and
@@ -605,6 +713,20 @@ TEMPLATES = [
         _render_carrier,
         "tmpl_cr",
     ),
+    TemplateSpec(
+        "writeback_order",
+        {
+            "off_mod": [1, 2, 3],
+            "mask": POOL_MASK,
+            "delta": [1, 0x10, 0x55AA, 0x7FFFFFFF],
+            "rv1": [5, 1, 9],
+            "rv2": [9, 2, -3],
+            "rv3": [13, 1, 7],
+            "plus": [5, 1, 3],
+        },
+        _render_writeback,
+        "tmpl_wb",
+    ),
 ]
 
 _TEMPLATES_BY_NAME = {spec.name: spec for spec in TEMPLATES}
@@ -618,6 +740,7 @@ PROVENANCE_TEMPLATES = [
     "devirt",
     "greturn",
     "carrier",
+    "writeback_order",
 ]
 
 # The tmpl_* call target per template, used by main rendering.

@@ -261,8 +261,9 @@ lists the lit test file(s) that validate it.
   composes 2-5 feature templates per program — union puns, byte
   reinterprets, cell-slice globals, void*/member-base/null-ternary
   pointers, variadic + sprintf, StmtExprs, fn-ptr devirtualization,
-  global-return chains, int-carrier/expect/missing-return, each modeled
-  on a test/EndToEnd differential test — into UB-free C11 programs whose
+  global-return chains, int-carrier/expect/missing-return, writeback
+  ordering (RHS/index calls mutating a distinct subobject of the
+  assigned global), each modeled on a test/EndToEnd differential test — into UB-free C11 programs whose
   indices and branch conditions are runtime-computed, with printf digests
   at multiple points and a computed exit code in 0..250. differ.py runs
   each program through clang and emitrust-cc --emit=crate --build and
