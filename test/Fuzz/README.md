@@ -11,8 +11,9 @@ with exit codes and stdout bytes compared byte-for-byte.
   templates (union puns, byte reinterprets, cell-slice globals, void*/
   member-base/null-ternary pointers, variadic + sprintf, StmtExprs,
   fn-ptr devirtualization, global-return chains, int-carrier/expect/
-  missing-return) modeled directly on the test/EndToEnd/*.c executable
-  spec. A configurable fraction of seeds (`--cross-fraction`, default
+  missing-return, writeback ordering with RHS/index calls mutating a
+  distinct subobject of the assigned global) modeled directly on the
+  test/EndToEnd/*.c executable spec. A configurable fraction of seeds (`--cross-fraction`, default
   0.5) is forced to combine ≥2 pointer-provenance templates.
 - `differ.py` — one-iteration runner: `run_pair()` classifies PASS /
   UNSUPPORTED / MISCOMPILE / HARNESS_BUG. `--self-test` pushes a
