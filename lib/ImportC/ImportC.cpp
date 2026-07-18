@@ -1042,8 +1042,10 @@ private:
   /// anonymous shape share one struct_def. An empty member list
   /// (`struct T {};`) imports as a field-less struct_def. The field list
   /// is flattened through `collectRecordFields`, which resolves C11
-  /// 6.7.2.1p13 anonymous struct/union members. Union types,
-  /// bit-fields, and unsupported field types are rejected.
+  /// 6.7.2.1p13 anonymous struct/union members. A union definition
+  /// imports as a ONE-FIELD struct through `collectUnionSlot` (its
+  /// storage field is the first arm's leaf); union shapes outside that
+  /// model, bit-fields, and unsupported field types are rejected.
   LogicalResult importRecord(const clang::RecordDecl *record, Location loc);
 
   /// Appends the flattened field list of `record` to
@@ -1075,9 +1077,50 @@ private:
   FailureOr<const clang::FieldDecl *>
   anonymousUnionArmLeaf(const clang::FieldDecl *arm, Location unionLoc);
 
+  /// Appends the single storage slot of a union definition to
+  /// `fieldNames`/`fieldTypes`: a union imports as a ONE-FIELD struct
+  /// whose storage field carries the first arm's name and mapped type,
+  /// generalizing the anonymous-union slot aliasing of
+  /// `collectRecordFields` (CTS-R2) to named and untagged union types.
+  /// Every non-first arm is recorded in `unionSlotStorage` as an alias
+  /// of that slot. An arm is admitted when it maps to the identical type
+  /// (exact: reading any union member with the type of the last store
+  /// yields that stored value) or when both arms are integers of the
+  /// same width differing only in signedness — accesses through such an
+  /// arm reinterpret the slot bit-exactly via `emitrust.cast` (two's
+  /// complement, C99 6.5.2.3). Bit-field arms, unnamed/anonymous arms,
+  /// pointer arms, integer arms of differing sizes, mixed non-integer
+  /// arms, and empty unions are rejected with located
+  /// `unsupported: union ...` diagnostics at the union definition.
+  LogicalResult collectUnionSlot(const clang::RecordDecl *definition,
+                                 SmallVectorImpl<llvm::StringRef> &fieldNames,
+                                 SmallVectorImpl<Type> &fieldTypes);
+
+  /// Returns the field that provides `field`'s storage in its flattened
+  /// parent struct_def: the aliased first-arm slot for a union arm
+  /// recorded by `collectUnionSlot`/`collectRecordFields`, or `field`
+  /// itself.
+  const clang::FieldDecl *
+  flattenedFieldStorage(const clang::FieldDecl *field) const;
+
+  /// If `expr` (modulo parens and implicit trivia) reads a union arm
+  /// whose mapped type differs from its storage slot's — a signedness
+  /// pun admitted by `collectUnionSlot` — reinterprets `value` (the
+  /// loaded slot value) as the arm's own mapped type with a bit-exact
+  /// `emitrust.cast`; otherwise returns `value` unchanged.
+  FailureOr<Value> reinterpretUnionArmRead(const clang::Expr *expr,
+                                           Value value, Location loc);
+
+  /// If the assignment target `expr` is a union arm whose mapped type
+  /// differs from its storage slot's, casts `value` (the assigned value,
+  /// of the arm's type) to the slot's type so the store lands bit-exactly
+  /// on the slot; otherwise returns `value` unchanged.
+  FailureOr<Value> reinterpretUnionArmWrite(const clang::Expr *expr,
+                                            Value value, Location loc);
+
   /// Returns the spelling `field` carries in its flattened parent
-  /// struct_def: its own name or, for an anonymous-union arm aliased by
-  /// `collectRecordFields`, the storage slot's name.
+  /// struct_def: its own name or, for a union arm aliased by
+  /// `collectUnionSlot`/`collectRecordFields`, the storage slot's name.
   llvm::StringRef flattenedFieldName(const clang::FieldDecl *field) const;
 
   /// Returns the Rust type name `definition` was imported under: the
@@ -1344,11 +1387,13 @@ private:
                                      SmallVectorImpl<Attribute> &fields,
                                      Location loc);
 
-  /// Converts the constant value of a flattened anonymous union member to
-  /// the attribute of its single storage slot of type `slotType`: the
-  /// union's active arm descends through nested anonymous members to the
-  /// slot's scalar value; a union with no active arm takes the slot's
-  /// zero value (C99 zero-fill).
+  /// Converts the constant value of a union — a flattened anonymous
+  /// union member, or a named/untagged union type imported as a
+  /// one-field struct by `collectUnionSlot` — to the attribute of its
+  /// single storage slot of type `slotType`: the union's active arm
+  /// descends through nested anonymous members to the slot's scalar
+  /// value; a union with no active arm takes the slot's zero value (C99
+  /// zero-fill).
   FailureOr<Attribute>
   convertAnonymousSlotInit(const clang::APValue &value,
                            const clang::RecordDecl *record, Type slotType,
@@ -2148,10 +2193,12 @@ private:
   /// Next `Anon<n>` suffix to try when a new anonymous shape needs a name;
   /// names are assigned in first-encounter order per import.
   unsigned anonStructCounter = 0;
-  /// Anonymous-union arm -> the first arm's leaf field, whose spelling
-  /// names the single flattened storage slot every arm aliases; populated
-  /// by `collectRecordFields` (the storage leaf itself has no entry) and
-  /// consulted by `flattenedFieldName`.
+  /// Union arm -> the first arm's leaf field, whose spelling names the
+  /// single flattened storage slot every arm aliases; populated by
+  /// `collectRecordFields` (anonymous union members) and
+  /// `collectUnionSlot` (named/untagged union types; the storage leaf
+  /// itself has no entry) and consulted by `flattenedFieldName` and
+  /// `flattenedFieldStorage`.
   llvm::DenseMap<const clang::FieldDecl *, const clang::FieldDecl *>
       unionSlotStorage;
   /// The defining C record behind each emitted struct_def symbol, recorded
@@ -3727,8 +3774,9 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
   if (const auto *record =
           llvm::dyn_cast<clang::RecordType>(canonical.getTypePtr())) {
     const clang::RecordDecl *decl = record->getDecl();
-    if (decl->isUnion())
-      return emitError(loc) << "unsupported: union type";
+    // A union imports as a one-field struct (see `collectUnionSlot`), so
+    // it maps to the same `!emitrust.struct` any record does; shapes the
+    // one-slot model cannot represent are rejected by the import below.
     const clang::RecordDecl *definition = decl->getDefinition();
     if (!definition)
       return emitError(loc) << "unsupported: incomplete struct type";
@@ -4528,9 +4576,7 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   if (!definition)
     return success(); // Forward declaration; imported once completed or used.
   Location defLoc = translateLoc(definition->getBeginLoc());
-  if (definition->isUnion())
-    return emitError(defLoc) << "unsupported: union type";
-  if (!definition->isStruct())
+  if (!definition->isStruct() && !definition->isUnion())
     return emitError(defLoc) << "unsupported record declaration";
   if (!importedRecords.insert(definition).second)
     return success();
@@ -4541,8 +4587,14 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
 
   SmallVector<llvm::StringRef> fieldNames;
   SmallVector<Type> fieldTypes;
-  if (failed(collectRecordFields(definition, fieldNames, fieldTypes)))
+  // A union flattens to its single storage slot; every other record keeps
+  // the anonymous-member-resolving field walk.
+  if (definition->isUnion()) {
+    if (failed(collectUnionSlot(definition, fieldNames, fieldTypes)))
+      return failure();
+  } else if (failed(collectRecordFields(definition, fieldNames, fieldTypes))) {
     return failure();
+  }
   // An empty member list (`struct T {};`, a GNU/C2x shape clang accepts) is
   // permitted and becomes a unit-like Rust struct.
 
@@ -4779,11 +4831,114 @@ CImporter::anonymousUnionArmLeaf(const clang::FieldDecl *arm,
   return leaf;
 }
 
+LogicalResult CImporter::collectUnionSlot(
+    const clang::RecordDecl *definition,
+    SmallVectorImpl<llvm::StringRef> &fieldNames,
+    SmallVectorImpl<Type> &fieldTypes) {
+  Location unionLoc = translateLoc(definition->getBeginLoc());
+  const clang::FieldDecl *storage = nullptr;
+  Type slotType;
+  for (const clang::FieldDecl *arm : definition->fields()) {
+    // A bit-field arm is not addressable storage the slot can alias.
+    if (arm->isBitField())
+      return emitError(unionLoc) << "unsupported: union with a bit-field arm";
+    if (arm->isAnonymousStructOrUnion() || arm->getName().empty())
+      return emitError(unionLoc) << "unsupported: union with an unnamed arm";
+    // A pointer arm never aliases another slot under the decomposed
+    // pointer model, whatever its width; checked before `mapType` so the
+    // rejection is the union's, not the pointer's.
+    if (isPointerType(arm->getType()))
+      return emitError(unionLoc) << "unsupported: union with a pointer arm";
+    Location armLoc = translateLoc(arm->getLocation());
+    FailureOr<Type> armType = mapType(arm->getType(), armLoc);
+    if (failed(armType))
+      return failure();
+    if (!storage) {
+      if (isRustKeyword(arm->getName()))
+        return emitError(armLoc) << "unsupported: struct member '"
+                                 << arm->getName() << "' is a Rust keyword";
+      storage = arm;
+      slotType = *armType;
+      fieldNames.push_back(storage->getName());
+      fieldTypes.push_back(slotType);
+      continue;
+    }
+    // An identical mapped type aliases the slot exactly: reading any
+    // union member with the type of the last store yields that value.
+    if (*armType == slotType) {
+      unionSlotStorage[arm] = storage;
+      continue;
+    }
+    auto slotInt = llvm::dyn_cast<IntegerType>(slotType);
+    auto armInt = llvm::dyn_cast<IntegerType>(*armType);
+    // Same-width integers differing only in signedness alias bit-exactly
+    // on two's complement (C99 6.5.2.3 union punning); accesses through
+    // this arm wrap an `emitrust.cast` reinterpretation.
+    if (slotInt && armInt && slotInt.getWidth() == armInt.getWidth()) {
+      unionSlotStorage[arm] = storage;
+      continue;
+    }
+    if (slotInt && armInt)
+      return emitError(unionLoc)
+             << "unsupported: union arms of differing sizes";
+    return emitError(unionLoc)
+           << "unsupported: union type mixing non-integer arms";
+  }
+  // An empty union (a GNU extension clang accepts in C) has no first arm
+  // and therefore no representable slot.
+  if (!storage)
+    return emitError(unionLoc) << "unsupported: union with no members";
+  return success();
+}
+
+const clang::FieldDecl *
+CImporter::flattenedFieldStorage(const clang::FieldDecl *field) const {
+  auto storage = unionSlotStorage.find(field);
+  return storage == unionSlotStorage.end() ? field : storage->second;
+}
+
 llvm::StringRef
 CImporter::flattenedFieldName(const clang::FieldDecl *field) const {
-  auto storage = unionSlotStorage.find(field);
-  return storage == unionSlotStorage.end() ? field->getName()
-                                           : storage->second->getName();
+  return flattenedFieldStorage(field)->getName();
+}
+
+FailureOr<Value> CImporter::reinterpretUnionArmRead(const clang::Expr *expr,
+                                                    Value value,
+                                                    Location loc) {
+  const auto *member = llvm::dyn_cast<clang::MemberExpr>(stripTrivia(expr));
+  if (!member)
+    return value;
+  const auto *field =
+      llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+  if (!field || flattenedFieldStorage(field) == field)
+    return value;
+  FailureOr<Type> armType = mapType(field->getType(), loc);
+  if (failed(armType))
+    return failure();
+  if (*armType == value.getType())
+    return value;
+  return builder.create<emitrust::CastOp>(loc, *armType, value).getResult();
+}
+
+FailureOr<Value> CImporter::reinterpretUnionArmWrite(const clang::Expr *expr,
+                                                     Value value,
+                                                     Location loc) {
+  const auto *member = llvm::dyn_cast<clang::MemberExpr>(stripTrivia(expr));
+  if (!member)
+    return value;
+  const auto *field =
+      llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+  if (!field)
+    return value;
+  const clang::FieldDecl *storage = flattenedFieldStorage(field);
+  if (storage == field)
+    return value;
+  FailureOr<Type> slotType = mapType(storage->getType(), loc);
+  if (failed(slotType))
+    return failure();
+  if (*slotType == value.getType())
+    return value;
+  return builder.create<emitrust::CastOp>(loc, *slotType, value).getResult();
 }
 
 std::string
@@ -5490,14 +5645,32 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
     return Attribute(builder.getArrayAttr(elements));
   }
   if (auto structType = llvm::dyn_cast<emitrust::StructType>(type)) {
-    if (!value.isStruct())
-      return emitError(loc)
-             << "unsupported: global initializer does not match its type";
     auto structDef = llvm::dyn_cast_or_null<emitrust::StructDefOp>(
         SymbolTable::lookupSymbolIn(module, structType.getName()));
     if (!structDef)
       return emitError(loc)
              << "unsupported: global initializer for this type";
+    // A union global carries a Union APValue, not a Struct one; it
+    // initializes its single storage slot (the union imports as a
+    // one-field struct, see `collectUnionSlot`) exactly like an
+    // anonymous union member's slot, bit-exact across a signedness pun.
+    if (const clang::RecordDecl *unionRecord =
+            structDefRecords.lookup(structType.getName());
+        unionRecord && unionRecord->isUnion()) {
+      ArrayAttr slotTypes = structDef.getFieldTypes();
+      if (slotTypes.size() != 1)
+        return emitError(loc)
+               << "unsupported: global initializer does not match its type";
+      Type slotType = llvm::cast<TypeAttr>(slotTypes[0]).getValue();
+      FailureOr<Attribute> slot =
+          convertAnonymousSlotInit(value, unionRecord, slotType, loc);
+      if (failed(slot))
+        return failure();
+      return Attribute(builder.getArrayAttr({*slot}));
+    }
+    if (!value.isStruct())
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
     const clang::RecordDecl *record =
         cType.isNull() ? nullptr : recordOfType(cType);
     SmallVector<clang::QualType> cFields;
@@ -7866,7 +8039,13 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
   FailureOr<Value> value = emitRValue(op->getRHS());
   if (failed(value))
     return failure();
-  if (failed(storeToPlace(loc, *place, *value)))
+  // A store through a union pun arm lands the bit-exactly reinterpreted
+  // (slot-typed) value on the slot.
+  FailureOr<Value> stored =
+      reinterpretUnionArmWrite(op->getLHS(), *value, loc);
+  if (failed(stored))
+    return failure();
+  if (failed(storeToPlace(loc, *place, *stored)))
     return failure();
   if (failed(flushGlobalWriteback(loc, writeback)))
     return failure();
@@ -9113,7 +9292,9 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     FailureOr<Value> place = emitLValue(sub);
     if (failed(place))
       return failure();
-    return loadPlace(loc, *place);
+    // A union pun arm reads the slot and reinterprets the loaded value
+    // as its own (differently-signed) type.
+    return reinterpretUnionArmRead(sub, loadPlace(loc, *place), loc);
   }
   case clang::CK_IntegralCast: {
     // Integer-to-enum: a reference to an enumerator of the destination
@@ -11512,7 +11693,12 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
     // (possibly union-slot-aliased) name on that place.
     if (field->isAnonymousStructOrUnion())
       return basePlace;
-    FailureOr<Type> fieldType = mapType(field->getType(), loc);
+    // A union arm designates its storage slot: the member selects the
+    // slot's name at the slot's type. A differently-signed arm's
+    // bit-exact reinterpretation happens at the load or store site (see
+    // `reinterpretUnionArmRead`/`reinterpretUnionArmWrite`).
+    FailureOr<Type> fieldType =
+        mapType(flattenedFieldStorage(field)->getType(), loc);
     if (failed(fieldType))
       return failure();
     return builder
