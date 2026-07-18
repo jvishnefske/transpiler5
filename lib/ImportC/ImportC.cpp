@@ -2130,9 +2130,24 @@ private:
   /// flows through a rank-0 memref cell (promoted later by `--mem2reg`)
   /// for memref-legal scalar types and through an `emitrust.variable`
   /// place for unsigned integers; both arms must map to the same scalar
-  /// type or the operator is rejected.
+  /// type or the operator is rejected. A compile-time-constant,
+  /// side-effect-free condition elides the dead arm BEFORE lowering (so a
+  /// dead arm may contain otherwise-unimportable constructs); a
+  /// goto-targeted label or a case/default label in the dead arm keeps
+  /// the full lowering instead — the constant branch leaves the arm
+  /// dynamically dead while its labels stay registered.
   FailureOr<Value>
   emitConditionalOperator(const clang::ConditionalOperator *op);
+
+  /// Emits a GNU statement expression `({ ... })` in value position: the
+  /// body statements lower FLATTENED into the enclosing function (never as
+  /// a region op, so labels inside register with the ordinary
+  /// labelBlocks/goto dispatch), and the final expression statement's
+  /// value transits a synthesized temp cell that the surrounding
+  /// expression reads. A `goto` targeting a label outside the statement
+  /// expression would abandon the value mid-evaluation and is a located
+  /// rejection (design.md CTS-S).
+  FailureOr<Value> emitStmtExpr(const clang::StmtExpr *expr);
 
   /// Constant-folds `sizeof`/`_Alignof` (on a type or an expression) into
   /// an integer constant of the mapped `size_t` type using clang's target
@@ -7738,12 +7753,26 @@ LogicalResult CImporter::finalizeFunction(func::FuncOp funcOp, Location loc) {
       builder.create<func::ReturnOp>(loc);
       continue;
     }
-    if (currentIsMain) {
-      // C11 5.1.2.2.3: falling off the end of main returns 0.
-      Value zero = createIntConstant(loc, currentReturnType, 0);
+    // C11 5.1.2.2.3: falling off the end of main returns 0. For any other
+    // non-void function, C11 6.9.1p12 leaves the behavior defined as long
+    // as the caller never uses the missing value; the importer synthesizes
+    // a `return 0` of the function's return type (Rust has no
+    // fall-off-the-end for value-returning functions, and the zero is only
+    // observable on executions that were undefined reads in C anyway).
+    if (llvm::isa<IntegerType>(currentReturnType)) {
+      Value zero = createScalarIntConstant(loc, currentReturnType, 0);
       builder.create<func::ReturnOp>(loc, zero);
       continue;
     }
+    if (auto floatType = llvm::dyn_cast<FloatType>(currentReturnType)) {
+      Value zero = builder
+                       .create<arith::ConstantOp>(
+                           loc, FloatAttr::get(floatType, 0.0))
+                       .getResult();
+      builder.create<func::ReturnOp>(loc, zero);
+      continue;
+    }
+    // Aggregate, enum, and fn_ptr returns have no meaningful zero.
     return emitError(loc)
            << "unsupported: control reaches the end of non-void function '"
            << funcOp.getSymName() << "'";
@@ -8789,6 +8818,29 @@ LogicalResult CImporter::emitIfStmt(const clang::IfStmt *stmt) {
   Location loc = translateLoc(stmt->getIfLoc());
   if (stmt->getConditionVariable() || stmt->getInit())
     return emitError(loc) << "unsupported: declaration in if condition";
+  // A compile-time-constant, side-effect-free condition (a literal, a
+  // folded `__builtin_expect(!!(0), 0)`, ...) elides the dead arm BEFORE
+  // lowering, so a dead arm may contain constructs that could never lower
+  // (an unimportable call, a `_Bool` conversion, a declaration). The
+  // elision is gated on a live-label check: a goto-targeted label in the
+  // dead arm keeps the arm reachable, and a case/default label of an
+  // enclosing switch must not be dropped either — both shapes keep the
+  // full lowering below (`containsLabelStmt` scans all descendants;
+  // `findNestedSwitchLabel` skips nested switches, whose labels are their
+  // own and are elided soundly with them).
+  clang::Expr::EvalResult conditionValue;
+  if (stmt->getCond()->EvaluateAsInt(conditionValue, astContext())) {
+    bool truth = conditionValue.Val.getInt() != 0;
+    const clang::Stmt *live = truth ? stmt->getThen() : stmt->getElse();
+    const clang::Stmt *dead = truth ? stmt->getElse() : stmt->getThen();
+    if (!dead || (!containsLabelStmt(dead) &&
+                  !llvm::isa<clang::SwitchCase>(dead) &&
+                  !findNestedSwitchLabel(dead))) {
+      if (live)
+        return emitStmt(live);
+      return success();
+    }
+  }
   FailureOr<Value> condition = emitCondition(stmt->getCond());
   if (failed(condition))
     return failure();
@@ -9181,6 +9233,25 @@ LogicalResult CImporter::emitExprStmt(const clang::Expr *expr) {
   if (const auto *conditional = llvm::dyn_cast<clang::ConditionalOperator>(e))
     if (conditional->getType()->isVoidType())
       return emitVoidConditionalStmt(conditional);
+  // A GNU statement expression in statement position (the 00214 `bla`
+  // shape): the body statements run inline in the enclosing function and
+  // the final expression's value is discarded — a side-effect-free final
+  // expression needs no code at all, exactly like a cast to void.
+  if (const auto *stmtExpr = llvm::dyn_cast<clang::StmtExpr>(e)) {
+    const clang::CompoundStmt *body = stmtExpr->getSubStmt();
+    const clang::Stmt *last = body->body_empty() ? nullptr : body->body_back();
+    for (const clang::Stmt *child : body->body()) {
+      if (child == last)
+        if (const auto *lastExpr = llvm::dyn_cast<clang::Expr>(child)) {
+          if (!lastExpr->HasSideEffects(astContext()))
+            return success();
+          return emitExprStmt(lastExpr);
+        }
+      if (failed(emitStmt(child)))
+        return failure();
+    }
+    return success();
+  }
   // Any other expression statement is evaluated and its value discarded.
   return success(succeeded(emitRValue(e)));
 }
@@ -9188,6 +9259,21 @@ LogicalResult CImporter::emitExprStmt(const clang::Expr *expr) {
 LogicalResult
 CImporter::emitVoidConditionalStmt(const clang::ConditionalOperator *op) {
   Location loc = translateLoc(op->getQuestionLoc());
+  // The constant-condition rule of `emitConditionalOperator` applies to
+  // the void (statement-position) form identically: a label-free dead
+  // arm is elided before lowering, while a goto-targeted label in the
+  // dead arm (the 00213 kb_wait_1 shape) or a case/default label of an
+  // enclosing switch keeps the FULL if/else lowering below — the
+  // constant branch leaves the arm dynamically dead while its labels
+  // register with the ordinary goto dispatch.
+  clang::Expr::EvalResult conditionValue;
+  if (op->getCond()->EvaluateAsInt(conditionValue, astContext())) {
+    bool truth = conditionValue.Val.getInt() != 0;
+    const clang::Expr *live = truth ? op->getTrueExpr() : op->getFalseExpr();
+    const clang::Expr *dead = truth ? op->getFalseExpr() : op->getTrueExpr();
+    if (!containsLabelStmt(dead) && !findNestedSwitchLabel(dead))
+      return emitExprStmt(live);
+  }
   FailureOr<Value> condition = emitCondition(op->getCond());
   if (failed(condition))
     return failure();
@@ -10626,6 +10712,8 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   }
   if (const auto *conditional = llvm::dyn_cast<clang::ConditionalOperator>(e))
     return emitConditionalOperator(conditional);
+  if (const auto *stmtExpr = llvm::dyn_cast<clang::StmtExpr>(e))
+    return emitStmtExpr(stmtExpr);
   if (const auto *trait = llvm::dyn_cast<clang::UnaryExprOrTypeTraitExpr>(e))
     return emitSizeofAlignof(trait);
   if (llvm::isa<clang::StringLiteral>(e))
@@ -11720,6 +11808,25 @@ FailureOr<Value> CImporter::emitShortCircuit(const clang::BinaryOperator *op) {
 FailureOr<Value>
 CImporter::emitConditionalOperator(const clang::ConditionalOperator *op) {
   Location loc = translateLoc(op->getQuestionLoc());
+  // A compile-time-constant, side-effect-free condition elides the dead
+  // arm BEFORE lowering (mirroring `emitIfStmt`), so a dead arm may
+  // contain otherwise-unimportable constructs. The elision is gated on
+  // the same live-label check as the if form: a goto-targeted label in
+  // the dead arm (necessarily inside a statement expression, and
+  // necessarily targeted from within the arm itself — clang rejects
+  // jumps into a statement expression from outside) keeps the arm's code
+  // reachable, and a case/default label of an enclosing switch must not
+  // be dropped either — both shapes keep the FULL lowering below, whose
+  // constant branch leaves the arm dynamically dead while its labels
+  // register with the ordinary dispatch (the 00213 kb_wait_1 shape).
+  clang::Expr::EvalResult conditionValue;
+  if (op->getCond()->EvaluateAsInt(conditionValue, astContext())) {
+    bool truth = conditionValue.Val.getInt() != 0;
+    const clang::Expr *live = truth ? op->getTrueExpr() : op->getFalseExpr();
+    const clang::Expr *dead = truth ? op->getFalseExpr() : op->getTrueExpr();
+    if (!containsLabelStmt(dead) && !findNestedSwitchLabel(dead))
+      return emitRValue(live);
+  }
   FailureOr<Type> mapped = mapType(op->getType(), loc);
   if (failed(mapped))
     return failure();
@@ -11775,6 +11882,100 @@ CImporter::emitConditionalOperator(const clang::ConditionalOperator *op) {
   return loadPlace(loc, cell);
 }
 
+/// Finds a `goto` below `expr`'s body whose target label is NOT declared
+/// inside the same statement expression, or null when every goto stays
+/// internal. Labels of nested statement expressions count as internal:
+/// clang itself rejects any jump INTO a statement expression, so a goto
+/// this scan accepts always lands on a label the flattened body registers.
+static const clang::GotoStmt *
+findGotoOutOfStmtExpr(const clang::StmtExpr *expr) {
+  llvm::SmallPtrSet<const clang::LabelDecl *, 8> internalLabels;
+  SmallVector<const clang::Stmt *> worklist{expr->getSubStmt()};
+  while (!worklist.empty()) {
+    const clang::Stmt *current = worklist.pop_back_val();
+    if (!current)
+      continue;
+    if (const auto *label = llvm::dyn_cast<clang::LabelStmt>(current))
+      internalLabels.insert(label->getDecl());
+    for (const clang::Stmt *child : current->children())
+      worklist.push_back(child);
+  }
+  worklist.push_back(expr->getSubStmt());
+  while (!worklist.empty()) {
+    const clang::Stmt *current = worklist.pop_back_val();
+    if (!current)
+      continue;
+    if (const auto *gotoStmt = llvm::dyn_cast<clang::GotoStmt>(current))
+      if (!internalLabels.contains(gotoStmt->getLabel()))
+        return gotoStmt;
+    for (const clang::Stmt *child : current->children())
+      worklist.push_back(child);
+  }
+  return nullptr;
+}
+
+FailureOr<Value> CImporter::emitStmtExpr(const clang::StmtExpr *expr) {
+  Location loc = translateLoc(expr->getBeginLoc());
+  // A goto that leaves a value-position statement expression abandons the
+  // expression mid-evaluation: the synthesized value temp would never be
+  // written and the consumer would read garbage.
+  if (const clang::GotoStmt *escape = findGotoOutOfStmtExpr(expr))
+    return emitError(translateLoc(escape->getGotoLoc()))
+           << "unsupported: goto out of a statement expression in value "
+              "position";
+  FailureOr<Type> mapped = mapType(expr->getType(), loc);
+  if (failed(mapped))
+    return failure();
+  if (!llvm::isa<IntegerType, FloatType>(*mapped))
+    return emitError(loc)
+           << "unsupported: statement expression of a non-scalar type";
+  const clang::CompoundStmt *body = expr->getSubStmt();
+  const clang::Expr *valueExpr =
+      body->body_empty() ? nullptr
+                         : llvm::dyn_cast<clang::Expr>(body->body_back());
+  if (!valueExpr) // Defensive: clang typed this StmtExpr non-void.
+    return emitError(loc) << "unsupported: statement expression without a "
+                             "final expression statement";
+  // The value transits a synthesized temp cell so that the body statements
+  // — which lower FLATTENED into the enclosing function and may open
+  // further blocks (labels, loops, nested conditionals) — never wall the
+  // value off in a region: an `emitrust.variable` place for unsigned
+  // integers, a promotable rank-0 memref cell otherwise (mirroring
+  // `emitConditionalOperator`).
+  Value cell = isUnsignedInt(*mapped)
+                   ? builder
+                         .create<emitrust::VariableOp>(
+                             loc, emitrust::LValueType::get(*mapped))
+                         .getResult()
+                   : createEntryAlloca(loc, *mapped);
+  for (const clang::Stmt *child : body->body()) {
+    if (child == body->body_back())
+      break;
+    if (failed(emitStmt(child)))
+      return failure();
+  }
+  // C applies the lvalue conversion to the final expression statement;
+  // clang usually materializes it, but a bare lvalue is loaded here so
+  // both AST shapes land the same value in the temp.
+  FailureOr<Value> value = failure();
+  if (valueExpr->isGLValue()) {
+    FailureOr<Value> place = emitLValue(valueExpr);
+    if (failed(place))
+      return failure();
+    value = loadPlace(loc, *place);
+  } else {
+    value = emitRValue(valueExpr);
+  }
+  if (failed(value))
+    return failure();
+  if ((*value).getType() != *mapped)
+    return emitError(translateLoc(valueExpr->getBeginLoc()))
+           << "unsupported: statement expression value type mismatch";
+  if (failed(storeToPlace(loc, cell, *value)))
+    return failure();
+  return loadPlace(loc, cell);
+}
+
 FailureOr<Value>
 CImporter::emitSizeofAlignof(const clang::UnaryExprOrTypeTraitExpr *expr) {
   Location loc = translateLoc(expr->getBeginLoc());
@@ -11811,6 +12012,20 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   const clang::FunctionDecl *callee = call->getDirectCallee();
   if (!callee)
     return emitIndirectCall(call);
+  // `__builtin_expect(e, c)` is a pure branch-prediction hint: it folds to
+  // its first argument during import, in every position (condition or
+  // value), so no call op or `__builtin_expect` symbol ever reaches the
+  // IR. A constant argument (`!!(0)`) then composes with the
+  // constant-condition dead-arm elision of `emitIfStmt` and
+  // `emitConditionalOperator` through clang's constant evaluator, which
+  // folds the intact call the same way.
+  switch (callee->getBuiltinID()) {
+  case clang::Builtin::BI__builtin_expect:
+  case clang::Builtin::BI__builtin_expect_with_probability:
+    return emitRValue(call->getArg(0));
+  default:
+    break;
+  }
   if (!callee->getDeclName().isIdentifier())
     return emitError(loc) << "unsupported callee";
   if (callee->getName() == "printf")
