@@ -1029,7 +1029,7 @@ observed when C99-33 + C99-47 together unlocked 00215).
   position" (a data-pointer return).
   (00019.c, 00049.c, 00089.c, 00095.c, 00140.c, 00150.c, 00208.c,
   00214.c)
-  (Partial, 5 of 7 — 00019, 00049, 00095, 00150, 00208 pass. Three
+  (Partial, 6 of 7 — 00019, 00049, 00095, 00140, 00150, 00208 pass. Three
   sub-features landed, each the principal-kind inference of
   docs/transformation-theory.md sections 4-5 on the existing analysis.
   Pointer STRUCT MEMBERS: a data-pointer member is a stored i64 cursor
@@ -1052,10 +1052,11 @@ observed when C99-33 + C99-47 together unlocked 00215).
   i64 the caller re-associates) is designed but not yet needed by any
   manifest test. CASTS: qualification-preserving explicit casts (same
   unqualified pointee) peel transparently in analysis and emission;
-  reinterpreting casts stay rejected. Remaining two tests block on
-  non-pointer features: 00140 at "00140.c:8:1: error: unsupported:
-  variadic function definition" (CTS-F1 — the pointer member and
-  struct-by-value shapes in it now import); 00214 at "00214.c:22:6:
+  reinterpreting casts stay rejected. 00140 passed once CTS-F1's
+  fixed-prototype variadic definitions landed (its body never touches
+  va_list; the pointer member and struct-by-value shapes already
+  imported). The remaining test blocks on
+  non-pointer features: 00214 at "00214.c:22:6:
   error: unsupported: returned pointer value (only a returned function
   address has a representation; a cursor into a callee-local region
   would dangle)" — its return value is an integer-to-pointer round-trip
@@ -1465,6 +1466,34 @@ observed when C99-33 + C99-47 together unlocked 00215).
   (safe Rust has no C-style varargs; candidates are arity-specialized
   monomorphization at call sites, or rejection).
   (00186.c, 00189.c)
+  (Partial, 1 of 2 — 00186 passes. Two sub-features landed. VARIADIC
+  DEFINITIONS whose bodies never touch va_list (no va_start/va_arg/
+  va_copy calls, no va_list declarations) import as their FIXED
+  prototype — the named parameters only, the trailing `...` dropped
+  from the type; call sites drop trailing extras when every dropped
+  extra is side-effect-free (the dropped extras are never imported:
+  no loads of by-value struct extras, no borrows for dropped `&s`,
+  no pointer regions). Pinned OUT: a definition whose body uses
+  va_list keeps "unsupported: variadic function definition", and a
+  dropped extra with side effects rejects with "unsupported: extra
+  argument to a variadic call has side effects" at the call site;
+  variadic function-pointer types (00189's fprintf pointer) stay
+  rejected. This also unblocked 00140 (see CTS-P2). SPRINTF with a
+  literal format (00186) lowers through the printf-shared directive
+  translator into a `format!` String plus the one-per-module safe
+  `__emitrust_sprintf(dest: &mut [i8], s: &str) -> i32` helper
+  (bytes + NUL copied via bounds-checked indexing — a too-small
+  destination panics, a legal refinement of C's UB — returning the
+  length), with the destination borrowed mutably from its cursor like
+  the <string.h> helpers. Pinned OUT: non-literal formats
+  ("unsupported: sprintf format must be an ordinary string literal"),
+  precision (shared translator's "unsupported: precision in printf
+  format specifier"), and string-literal destinations ("unsupported: a
+  string literal region cannot be a mutable string argument").
+  Ledger 201 -> 203 (+00140 +00186), zero miscompiles.
+  (test/Import/C/varargs-def.c, varargs-def-invalid.c, sprintf.c,
+  sprintf-invalid.c; rustc-level differentials
+  test/EndToEnd/varargs-def.c, test/EndToEnd/sprintf.c))
 
 ### Hosted library surface (5 tests)
 
@@ -1544,7 +1573,10 @@ promoting a single constant-size calloc/malloc site bound to a global
 pointer into a static backing array),
 multi-dimensional arrays, sizeof/_Alignof of
 variable-length-array/incomplete/function operands, conditional operators
-with non-scalar results, variadic definitions, and `char *` variables
+with non-scalar results, va_list-using variadic definitions (a variadic
+definition whose body never touches va_list imports as its fixed
+prototype per CTS-F1, with effect-free trailing extras dropped at call
+sites), and `char *` variables
 bound to string literals (aggregate initializer lists are supported per
 C99-11/12, `char s[] = "..."` and the printf/puts %s shapes per
 C99-28/47). These are natural follow-ons; the emitter's

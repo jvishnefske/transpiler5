@@ -493,6 +493,15 @@ LogicalResult RustEmitter::emitDefaultValue(Location loc, Type type) {
     os << "; " << arrayType.getSize() << "]";
     return success();
   }
+  if (auto opaqueType = dyn_cast<emitrust::OpaqueType>(type)) {
+    // The only opaque type a variable is declared with is the String
+    // staging binding of the sprintf lowering; its default is the empty
+    // string.
+    if (opaqueType.getValue() == "String") {
+      os << "String::new()";
+      return success();
+    }
+  }
   return emitError(loc) << "no default value for type " << type;
 }
 
