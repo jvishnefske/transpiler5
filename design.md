@@ -944,11 +944,24 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-17: 220 total / 200 passed / 0 miscompiled /
-20 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-18: 220 total / 213 passed / 0 miscompiled /
+7 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5/P2/P4/P6 partials, and
-CTS-S1/S2/S4/S6/P1/P5/P7/P8/R1/R2/R4/L1/L2 landed since). Every one of
-the 20 is a located build-time rejection — never wrong output.
+CTS-S1/S2/S4/S6/P1/P5/P7/P8/R1/R2/R4/L1/L2 landed since, and the
+2026-07-18 TDD wave took 200 -> 213: unions as one-slot structs
+[+00042], void*-wildcard/member-base/null-ternary provenance [+00039
++00103 +00144 +00163], cell-slice global params + byte puns [+00181
++00217], fixed-prototype variadics + sprintf [+00140 +00186], the
+StmtExpr pack [+00213 +00214], and fn-ptr devirtualization +
+global-pointer returns [+00089 +00189]). Every one of
+the 7 is a located build-time rejection — never wrong output.
+The 7 remaining are deliberately OUT of scope for that wave, each with
+a recorded reason: 00187 (FILE*/stdio streams — C99-48 scope), 00204
+(long double ABI), 00207 (VLA interacting with goto), 00209 (K&R
+unprototyped fn-ptr call — a by-design rejection), 00210
+(packed/stdcall attribute casts), 00216 (VLA + flexible array members +
+range designators), 00218 (enum-typed bit-fields — C99-45's own wave;
+its union piece landed with CTS-R3).
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
 checkbox discipline as above — tick only when the referenced tests pass
@@ -1025,7 +1038,7 @@ observed when C99-33 + C99-47 together unlocked 00215).
   multi-literal, and literal/object-join rejections in
   test/Import/C/pointers-local-invalid.c; rustc-level differential
   test/EndToEnd/string-cursor.c)
-- [ ] CTS-P2 (7) Pointer types outside the parameter/local-cursor
+- [x] CTS-P2 (7) Pointer types outside the parameter/local-cursor
   positions FR-28 classifies: pointer returns, pointer struct members
   (C99-43), pointers in casts and mixed expressions. Requires extending
   the region analysis beyond (base, cursor) pairs rooted in one
@@ -1035,7 +1048,36 @@ observed when C99-33 + C99-47 together unlocked 00215).
   position" (a data-pointer return).
   (00019.c, 00049.c, 00089.c, 00095.c, 00140.c, 00150.c, 00208.c,
   00214.c)
-  (Partial, 6 of 7 — 00019, 00049, 00095, 00140, 00150, 00208 pass. Three
+  (COMPLETE, 7 of 7 — 00089 landed last via the GLOBAL-RETURN kind
+  (CTS-S stretch): a data-pointer-returning function whose every return
+  site yields the address of ONE mutable whole global (cursor 0, never
+  NULL) classifies as a single-global-base pointer RETURN region. The
+  pointer result is ERASED from the imported signature — the function
+  imports with no result and its return sites emit a bare `return` —
+  the call is retained at each site for its side effects, and every
+  caller `f()->member` access routes to the global directly through the
+  ordinary staged-copy + writeback machinery: zero runtime pointer
+  state (no cell, no flag, no address value) in callers. The erasure
+  also flows through INDIRECT calls: a fn-ptr signature returning a
+  data pointer is representable exactly when every address-taken
+  function of that (canonical, unqualified) return type in the sole-TU
+  program classifies to the erased kind with one common base
+  (`classifyFnPtrPointerResult`), which covers 00089's
+  `go()()->zerofunc()` chain — `go` returns `&anon` (the CTS-P2
+  fn-address kind), `anon()` erases to global `s`, and the fn_ptr
+  member call finishes through the CTS-L3 field machinery. Pinned OUT,
+  located rejections: a NULL return site mixed with a global address
+  ("return sites mix a global address and NULL"), disagreeing bases —
+  including member-address sites rooted in different globals ("return
+  sites disagree on the returned global base"), and callee-local
+  returns keep the historical "unsupported: returned pointer value"
+  dangling rejection.
+  (test/Import/C/pointers-return-global.c,
+  pointers-return-global-invalid.c; rustc-level differential
+  test/EndToEnd/pointers-return-global.c; 00089.c in the ratchet
+  manifest.)
+  (Earlier partial state, 6 of 7 — 00019, 00049, 00095, 00140, 00150,
+  00208 pass. Three
   sub-features landed, each the principal-kind inference of
   docs/transformation-theory.md sections 4-5 on the existing analysis.
   Pointer STRUCT MEMBERS: a data-pointer member is a stored i64 cursor
@@ -1061,14 +1103,13 @@ observed when C99-33 + C99-47 together unlocked 00215).
   reinterpreting casts stay rejected. 00140 passed once CTS-F1's
   fixed-prototype variadic definitions landed (its body never touches
   va_list; the pointer member and struct-by-value shapes already
-  imported). The remaining test blocks on
-  non-pointer features: 00214 at "00214.c:22:6:
-  error: unsupported: returned pointer value (only a returned function
-  address has a representation; a cursor into a callee-local region
-  would dangle)" — its return value is an integer-to-pointer round-trip
-  ((void *)_brk_end), rejected by design per CTS-P3, with further
-  blockers behind it: "error: unsupported: call to unimported function
-  '__builtin_expect'" and "error: unsupported expression: StmtExpr".
+  imported). 00214 passed once the CTS-P3 integer-carrier relaxation
+  landed a second pointer-return kind: a function whose every return
+  site yields a carrier value (a null constant, a pointer-width
+  integer-to-pointer cast, a carrier-region local, or a call to another
+  carrier-returning function) returns a plain i64 (see the CTS-P3 note),
+  alongside its other blockers (__builtin_expect and StmtExpr, see
+  CTS-S8). 00089 landed with the global-return kind above.
   Ledger 188 -> 193, zero miscompiles.
   (test/Import/C/pointers-member.c; test/Import/C/pointers-cast.c;
   member conflict/poison/literal-read/cross-function/dangling-return
@@ -1098,18 +1139,44 @@ observed when C99-33 + C99-47 together unlocked 00215).
   is C's compatible-effective-type read), and every other
   reinterpretation stays a located rejection: "pointer cast reinterprets
   the pointee ('short' over 'int' storage)" / "('float' over 'int'
-  storage)", plus "void pointer parameter" at the signature and
-  "dereference of a 'void *' pointer" for an uncast deref. Null-only
+  storage)", plus "dereference of a 'void *' pointer" for an uncast
+  deref. Null-only
   ternary chains (00144) fold statically — see the CTS-P8 note; the
   `&struct.member` bases of 00163 are the CTS-P7 note. 00039, 00103,
   00144, 00163 pass — ledger 200 -> 204 passed / 16 unsupported /
-  0 miscompiled. 00187 (genuine integer<->pointer traffic) remains
-  rejected by design. Wide views over `char` storage
-  (`*(unsigned *)charp`, from_ne_bytes territory) remain rejected —
-  the next phase's item.
-  (test/Import/C/pointers-void.c, pointers-void-invalid.c;
+  0 miscompiled. 00187 (genuine integer<->pointer traffic: stored
+  pointer arithmetic) remains rejected by design. Wide views over `char`
+  storage (`*(unsigned *)charp`, from_ne_bytes territory) landed as
+  CTS-P11.
+  INTEGER-CARRIER REGIONS (the 00214 `extend_brk` brk-cursor shape)
+  landed as a second relaxation: a local pointer whose ONLY sources are
+  POINTER-WIDTH integer-to-pointer casts, calls returning carriers, and
+  null pointer constants never addresses a modeled object — it is an
+  integer riding in pointer clothing — and lowers as one plain i64
+  value per pointer (null is the i64 zero; no base, cursor, or flag
+  cell). A null test is an `arith.cmpi ne` against 0. The carrier
+  crosses function boundaries in both directions: a pointer-returning
+  function whose every return site yields a carrier returns a plain
+  i64 (`classifyPointerReturn`'s second kind, memoized per canonical
+  declaration with call-graph propagation), and a `void *` parameter of
+  a defined function whose body only ever truth-tests it classifies as
+  `ParamKind::Carrier` and imports as an i64 parameter (call sites pass
+  carrier values). Pinned OUT, each a located rejection: "dereference
+  of an integer-carrier pointer" (no object to read), "pointer
+  arithmetic on an integer-carrier pointer" (no element run to walk),
+  the historical "pointer assigned a non-address value" both for a
+  carrier mixed with a real address base and for a sub-pointer-width
+  integer cast (a truncated address can never round-trip — 00187's
+  int-typed traffic keeps rejecting), and "void pointer parameter" for
+  a `void *` parameter the body uses as anything but a truth test.
+  Global pointers never carry integers (their facts feed the CTS-P4/P6
+  machinery unchanged).
+  (test/Import/C/pointers-void.c, pointers-void-invalid.c,
+  pointers-int-carrier.c, pointers-int-carrier-invalid.c;
   rustc-level differential test/EndToEnd/pointers-void.c with
-  loop-carried values through the reinterpreted accesses))
+  loop-carried values through the reinterpreted accesses and
+  test/EndToEnd/missing-return-expect-carrier.c; 00214.c in the
+  ledger))
 - [ ] CTS-P4 (4) Pointer-typed global variables: global region bases.
   Hard interaction with the thread_local!+Cell global model (a borrow
   cannot escape `.with`); likely wants globals-as-slices with index
@@ -1598,26 +1665,109 @@ observed when C99-33 + C99-47 together unlocked 00215).
   test/Target/Rust/match.mlir, test/Dialect/EmitRust/ops.mlir,
   invalid.mlir, test/EndToEnd/enum-from-int.c)
   (00170.c)
-- [ ] CTS-S7 (2) `(void)` casts and void-typed contexts (evaluate and
+- [x] CTS-S7 (2) `(void)` casts and void-typed contexts (evaluate and
   discard, `void` in a statement-expression position): map to an
   expression statement / `let _ =` discard; today "unsupported cast
   (ToVoid)" / "unsupported builtin type 'void'".
-  Partial: ToVoid casts now evaluate the operand as an expression
-  statement (a side-effect-free operand emits nothing) and void-typed
-  conditionals in statement position lower as if/else diamonds, which
-  unlocks 00212.c; 00213.c clears its void blockers but hits a second
-  blocker, GNU statement expressions ("unsupported expression:
-  StmtExpr"), plus goto-into-dead-code shapes (CTS-S2 territory).
+  Done for the manifest tests: ToVoid casts evaluate the operand as an
+  expression statement (a side-effect-free operand emits nothing) and
+  void-typed conditionals in statement position lower as if/else
+  diamonds, which unlocked 00212.c; 00213.c passed once the CTS-S8
+  StmtExpr pack landed (its label-containing constant-conditional arms
+  keep full lowering — see the 00213 note under CTS-S8).
   (00212.c, 00213.c)
+- [x] CTS-S8 (2) The StmtExpr pack (the 00213/00214 shapes): GNU
+  statement expressions, `__builtin_expect`, constant-condition dead-arm
+  elision, and fall-off-the-end return synthesis.
+  STATEMENT EXPRESSIONS `({ ... })` lower as FLATTENED statements in the
+  enclosing function — never as a walled-off region op (an
+  `scf.execute_region` would hide internal labels from the
+  labelBlocks/goto dispatch) — with the final expression statement's
+  value transiting a synthesized temp cell (memref for signless scalars,
+  `emitrust.variable` for unsigned) that the surrounding expression
+  reads; nested StmtExprs flatten recursively, labels inside register
+  with the ordinary goto machinery (the within-StmtExpr backward-goto
+  loop lifts to `scf.while`), and a statement-position StmtExpr
+  discards its value (a side-effect-free final expression emits
+  nothing). Pinned OUT: "goto out of a statement expression in value
+  position" (the value temp would never be written); a StmtExpr whose
+  last statement is not an expression is ill-formed C in value position
+  and clang itself rejects it.
+  __BUILTIN_EXPECT (and the _with_probability form) is a pure
+  branch-prediction hint: it folds to its first argument at the emitCall
+  seam in every position, so no call op or `__builtin_expect` symbol
+  survives into the IR, and a constant argument composes with dead-arm
+  elision through clang's constant evaluator.
+  CONSTANT-CONDITION DEAD-ARM ELISION: an `if`, value ternary, or void
+  ternary whose condition constant-folds (side-effect-free) elides the
+  dead arm BEFORE lowering — before any unimported-call or conversion
+  check, so a dead arm may contain otherwise-unimportable constructs
+  (00214's `if (__builtin_expect(!!(0), 0))` arms and `_Bool chk`).
+  Gated on a live-label check applied uniformly to the if, value
+  ternary, and void ternary forms: a dead arm holding a goto-targeted
+  label keeps FULL lowering — the constant branch leaves the arm
+  dynamically dead while its labels register with the ordinary goto
+  dispatch, so code entered through the label runs exactly as C
+  requires (the 00213 `if (0) { lab: ... }` and kb_wait_1 shapes). This
+  is sound for ternary arms too: a label there can only live inside a
+  statement expression, clang rejects any jump INTO a statement
+  expression from outside, and the flattened StmtExpr lowering (CTS-S8
+  above) registers internal labels like any others, so full lowering
+  needs no jump-around suppression. An arm holding a case/default label
+  of an enclosing switch is likewise never elided (full lowering
+  through the existing dispatch-switch machinery — silently dropping it
+  would miscompile).
+  MISSING-RETURN SYNTHESIS: a non-void function whose control falls off
+  the end (C11 6.9.1p12 — defined while the caller never uses the
+  value) synthesizes `return 0` of the function's return type at
+  finalization, for every integer width including `_Bool`/i1 and for
+  floats; aggregate/enum/fn_ptr returns keep the located rejection.
+  00213 CAPTURED: its kb_wait_1 constant void-ternary holds a
+  goto-targeted label inside the DEAD StmtExpr arm, targeted from
+  within that same arm — exactly the full-lowering-instead-of-elision
+  case above. The label-containing arm lowers fully behind the constant
+  branch, the internal backward goto resolves through labelBlocks, and
+  no code suppression is needed, so the composed lowering is exact and
+  00213 joins the manifest alongside 00214.
+  (test/Import/C/stmt-expr.c, stmt-expr-invalid.c, builtin-expect.c,
+  missing-return.c; rustc-level differential
+  test/EndToEnd/stmt-expr.c and
+  test/EndToEnd/missing-return-expect-carrier.c; 00213.c and 00214.c
+  in the ledger)
 
 ### Functions and linkage (2 tests)
 
-- [ ] CTS-F1 (2) Variadic calls and variadic function-pointer types
+- [x] CTS-F1 (2) Variadic calls and variadic function-pointer types
   beyond the printf/puts intrinsics (C99-37): design decision needed
   (safe Rust has no C-style varargs; candidates are arity-specialized
   monomorphization at call sites, or rejection).
   (00186.c, 00189.c)
-  (Partial, 1 of 2 — 00186 passes. Two sub-features landed. VARIADIC
+  (COMPLETE, 2 of 2 — 00189 landed last via STATIC DEVIRTUALIZATION
+  (CTS-S stretch): a file-scope function pointer initialized to a known
+  function and NEVER REASSIGNED (nor address-taken) anywhere in the TU
+  — the criterion is never-reassigned, not const-qualified; an
+  externally visible variable only qualifies in a sole-TU import — is
+  an import-time ALIAS of its target. No `emitrust.global` is
+  materialized for it, calls through the alias (both `p(...)` and
+  `(*p)(...)`) lower as DIRECT calls to the target after the same
+  signature check a `Some(target)` constant runs (no fn_ptr value, no
+  call_indirect), and a value use reads as the `Some(target)` constant.
+  A variadic target aliases only when it is the hosted definition-less
+  printf/fprintf: calls route through the printf machinery, and the
+  fprintf shape swallows its leading `stdout` argument with the
+  fprintf->printf routing — the swallowed first-arg slot is the ONLY
+  place a FILE* value is accepted (00189's
+  `fprintfptr(stdout, "%d\n", (*f)(24))` composition). Pinned OUT,
+  located rejections: a reassigned global fn-ptr and a never-reassigned
+  pointer to a NON-hosted external variadic keep the ordinary import
+  path's "unsupported: variadic function pointer type" at the decl;
+  `stdout` outside the swallowed slot keeps "unsupported: pointer
+  variable 'stdout' has no known target object" at the use; storing
+  `stdout` keeps "unsupported: copying a global pointer variable".
+  (test/Import/C/fnptr-devirt.c, fnptr-devirt-invalid.c; rustc-level
+  differential test/EndToEnd/fnptr-devirt.c; 00189.c in the ratchet
+  manifest.)
+  (Earlier partial state, 1 of 2 — 00186 passes. Two sub-features landed. VARIADIC
   DEFINITIONS whose bodies never touch va_list (no va_start/va_arg/
   va_copy calls, no va_list declarations) import as their FIXED
   prototype — the named parameters only, the trailing `...` dropped
@@ -1628,8 +1778,10 @@ observed when C99-33 + C99-47 together unlocked 00215).
   va_list keeps "unsupported: variadic function definition", and a
   dropped extra with side effects rejects with "unsupported: extra
   argument to a variadic call has side effects" at the call site;
-  variadic function-pointer types (00189's fprintf pointer) stay
-  rejected. This also unblocked 00140 (see CTS-P2). SPRINTF with a
+  variadic function-pointer TYPES stay rejected — 00189's fprintf
+  pointer later became representable without the type, via the
+  devirtualization alias above. This also unblocked 00140 (see
+  CTS-P2). SPRINTF with a
   literal format (00186) lowers through the printf-shared directive
   translator into a `format!` String plus the one-per-module safe
   `__emitrust_sprintf(dest: &mut [i8], s: &str) -> i32` helper
@@ -1675,10 +1827,12 @@ observed when C99-33 + C99-47 together unlocked 00215).
   count via args_os), argv is dropped with a located rejection on any
   use. (00200.c; test/Import/C/printf-slice-param.c, main-args.c,
   test/EndToEnd/percent-s-param.c)
-- [ ] CTS-L3 (2) String-literal and other initializers for
+- [x] CTS-L3 (2) String-literal and other initializers for
   pointer-typed objects (`char *s = "…"` at file scope, struct fields):
-  PARTIAL — the initializer shapes landed, 00220 passes, 00089 stays
-  blocked on CTS-P2. Landed: (1) a file-scope `char *s = "…"` imports in
+  COMPLETE — the initializer shapes landed, 00220 passes, and 00089
+  passes since CTS-P2's global-return kind landed (its own blocker; the
+  initializer shape it needed is item (3) below). Landed: (1) a
+  file-scope `char *s = "…"` imports in
   importPointerGlobal as the CTS-P1 read-only backing lifted to module
   scope — a const `<name>_backing` byte-array global (bytes plus NUL,
   ASCII-only per C99-28) plus the CTS-P4 stored i64 cursor global,
@@ -1692,15 +1846,14 @@ observed when C99-33 + C99-47 together unlocked 00215).
   end-to-end (ledger 188 -> 189); (3) fn_ptr struct fields in file-scope
   initializers (the 00089 line-10 shape) fold to the opaque
   `Some(name)`/`None` forms via the constant evaluator, verifier and
-  emitter accept them as aggregate leaves. 00089 still rejects at
-  "00089.c:13:1: error: unsupported: pointer type outside a parameter
-  position" — `struct S *anon()` returns a data pointer, CTS-P2 scope
-  (pointer returns), not an initializer shape.
+  emitter accept them as aggregate leaves. 00089's last blocker —
+  `struct S *anon()` returns a data pointer — landed as CTS-P2's
+  global-return kind, and 00089 now passes end-to-end.
   (test/Import/C/globals-pointer-string.c, strings-wide.c,
   fn-pointers.c; rejections in globals-pointer-invalid.c,
   strings-invalid.c; rustc-level differential
   test/EndToEnd/globals-string.c)
-  (00089.c blocked on CTS-P2, 00220.c passes)
+  (00089.c and 00220.c pass)
 Not itemized above: printf precision (`%.3s`) and long-long length
 specifiers (`%llx`, `%10Ld`) remain outside the C99-47 grammar, but no
 test is sole-blocked on them today (00182.c already passes; with CTS-R5's
