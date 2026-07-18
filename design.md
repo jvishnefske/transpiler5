@@ -256,6 +256,27 @@ lists the lit test file(s) that validate it.
   system-header contents outside the C subset; see the c-testsuite
   checklist below).
   (test/CTestSuite/)
+
+  Differential fuzzing (test/Fuzz/): a seeded generator (genprog.py)
+  composes 2-5 feature templates per program — union puns, byte
+  reinterprets, cell-slice globals, void*/member-base/null-ternary
+  pointers, variadic + sprintf, StmtExprs, fn-ptr devirtualization,
+  global-return chains, int-carrier/expect/missing-return, each modeled
+  on a test/EndToEnd differential test — into UB-free C11 programs whose
+  indices and branch conditions are runtime-computed, with printf digests
+  at multiple points and a computed exit code in 0..250. differ.py runs
+  each program through clang and emitrust-cc --emit=crate --build and
+  compares exit code plus stdout bytes: PASS / UNSUPPORTED (rejection is
+  never a failure) / MISCOMPILE (always fatal under --fail-on-miscompile)
+  / HARNESS_BUG (native leg broke: generator defect, always fatal).
+  Determinism contract: a program is a pure function of (seed,
+  GENERATOR_VERSION); same seed, same bytes — every finding reproduces
+  from its seed number. Triage protocol: shrink with minimize.py
+  (delta-debug over template instances, then value-pool choices), pin the
+  minimized program as test/EndToEnd/<feature>-fuzz-<seed>.c, fix the
+  compiler, re-run the seed range. fuzz-smoke.c (seeds 1-16, REQUIRES:
+  cargo) keeps the harness green inside check-emitrust; big campaigns run
+  via fuzz_differential.py (see test/Fuzz/README.md).
 - [x] FR-25 Generality beyond test vectors: an adversarial audit plus
   differential stress run over shapes absent from the original tests
   (negative/sparse/INT_MAX-adjacent case labels, nested switch, default
