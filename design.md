@@ -854,9 +854,22 @@ rule.
   `ll`/`h`/`L`/`j`/`z`/`t` (`%llx`, `%10Ld`), conversions outside the
   set (%p, %n, %e, %g), flags/width on %c/%s/%f, and argument type
   mismatches.
+  Definition guard: the whole by-name printf lowering applies ONLY when
+  the project supplies no printf definition of its own — the same
+  `!callee->getDefinition()` guard puts/putchar, the string.h surface,
+  and the fn-pointer alias planner already carry. A project-supplied
+  printf (any signature; <stdio.h> is never imported) imports and is
+  called like any user function in BOTH statement and value positions;
+  a variadic va_list-free user printf flows through the fixed-prototype
+  variadic machinery (C99-37/varargs-def), dropping effect-free
+  call-site extras its body cannot observe. The "printf return value
+  must be unused" rejection now applies only to the hosted
+  (definition-less) lowering.
   (test/Import/C/printf.c, printf-extended.c, printf-extended-invalid.c,
-  strings.c, strings-invalid.c, test/EndToEnd/printf-formats.c,
-  test/EndToEnd/strings.c)
+  strings.c, strings-invalid.c, test/Import/C/printf-user-defined.c,
+  test/EndToEnd/printf-formats.c, test/EndToEnd/strings.c,
+  test/EndToEnd/printf-user-defined.c,
+  test/EndToEnd/printf-user-defined-nonvariadic.c)
 - [ ] C99-48 A curated stdio/stdlib/string/math subset mapped to Rust
   equivalents (putchar, puts, abs, string functions over the C99-28
   representation, math intrinsics onto f64 methods), each function
@@ -1276,8 +1289,9 @@ observed when C99-33 + C99-47 together unlocked 00215).
   subscript the copy; write contexts thread `GlobalWriteback` through
   `emitPointerPlace` and store the modified copy back, so a write
   through the pointer is visible to the next direct global access and
-  vice versa (exact for the single-threaded subset, same one-statement
-  last-writer-wins corner as direct global element writes). Static-local
+  vice versa (exact for the single-threaded subset; the historical
+  one-statement last-writer-wins corner is closed by the writeback
+  ordering rule below). Static-local
   bases get the same treatment (they share the globals map). Passing
   such a pointer to a function stays rejected at the call site — the
   argument would borrow the staged copy, not the global (the CTS-P4
@@ -1297,6 +1311,24 @@ observed when C99-33 + C99-47 together unlocked 00215).
   rustc-level differential test/EndToEnd/pointers-into-global.c
   interleaving pointer writes with direct global reads, direct writes
   with pointer reads, and callee global writes between pointer uses)
+  (Writeback ordering rule: the staged copy must be FRESH at store time.
+  C11 6.5.16p3 sequences the RHS's side effects before the assignment's
+  store, and the store writes only the designated subobject — so a
+  whole-global snapshot loaded when the LHS place was formed must not be
+  stored back after an intervening call wrote another subobject of the
+  same global (the lost-update miscompile family). Every staged-global
+  write path — simple and compound assignment, the CTS-P11 wide-byte
+  stores, and ++/-- (including subscript-index calls, `g[f()]++`) —
+  commits its mutation through the single `commitGlobalWriteback` seam
+  in ImportC.cpp: when the statement evaluated any side-effecting
+  subexpression after the staging load, the staged copy is rebound to a
+  fresh `emitrust.global_load` snapshot immediately before the mutation,
+  then flushed; pure statements emit the historical IR unchanged.
+  Multi-base writebacks already re-stage afresh per dispatch arm inside
+  the flush and need no refresh. User-visible evaluation order is
+  untouched: every subexpression value is materialized before the
+  refresh. Pinned differentially across all the write paths by
+  test/EndToEnd/globals-writeback-order.c.)
   (CTS-P9 extension: `&global.member` is now a region base. The
   PointerBaseBinding carries an optional member path, and every access
   through such a pointer reuses this staged-copy machinery with a member

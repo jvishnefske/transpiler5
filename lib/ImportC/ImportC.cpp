@@ -1737,6 +1737,36 @@ private:
   LogicalResult flushGlobalWriteback(Location loc,
                                      const GlobalWriteback &writeback);
 
+  /// Commits a mutation of a place rooted at a staged global copy: applies
+  /// `mutate` (the caller's store into the staged place) and flushes
+  /// `writeback`. When `refreshStaged` is set — the statement evaluated a
+  /// side-effecting subexpression (an RHS call, a subscript-index call)
+  /// AFTER the staging load — the staged whole-value copy is first rebound
+  /// to a fresh snapshot of the global, so the flush's whole-value
+  /// store-back cannot revert a write that intervening code made to
+  /// another subobject of the same global (C11 6.5.16p3: the RHS's side
+  /// effects are sequenced before the assignment's store, and the store
+  /// writes only the designated subobject). Multi-base writebacks need no
+  /// refresh: their flush re-stages the active base afresh and merges only
+  /// the staged element (see `flushGlobalWriteback`). Every staged-global
+  /// write path (assignment, compound assignment, wide-byte stores,
+  /// ++/--) must route its mutation through this seam.
+  LogicalResult
+  commitGlobalWriteback(Location loc, const GlobalWriteback &writeback,
+                        bool refreshStaged,
+                        llvm::function_ref<LogicalResult()> mutate);
+
+  /// Returns whether either operand of the (compound) assignment `op`
+  /// contains a side-effecting subexpression — the conservative trigger
+  /// for `commitGlobalWriteback`'s staged-copy refresh: only such a
+  /// subexpression (an RHS call, a subscript-index call in the LHS) can
+  /// have written the staged global after the staging load. Pure
+  /// statements skip the refresh and emit exactly the historical IR.
+  bool assignStalenessRisk(const clang::BinaryOperator *op) const {
+    return op->getLHS()->HasSideEffects(astContext()) ||
+           op->getRHS()->HasSideEffects(astContext());
+  }
+
   /// Emits one dispatch over the closed set of `bases` of a multi-base
   /// region (CTS-P7): a chain of `baseIndex == i` conditional branches
   /// with one arm block per base (the last base is the final else — the
@@ -2472,7 +2502,8 @@ private:
   /// synthesized backing) stages the global's whole value in a local
   /// copy exactly like a direct global element access; a write context
   /// passes `writeback` to capture the pending store-back, which the
-  /// caller must flush with `flushGlobalWriteback` after the mutation.
+  /// caller must commit through `commitGlobalWriteback` (refresh, mutate,
+  /// flush) after evaluating the rest of the statement.
   FailureOr<Value> emitPointerPlace(Location loc,
                                     const PtrExprValue &pointer,
                                     Type pointeeType,
@@ -2579,8 +2610,8 @@ private:
   /// dereferences, fields, elements). A reference to an imported global
   /// stages the global's whole value in a local copy; when `writeback` is
   /// non-null (write context) it captures the pending store-back of that
-  /// copy, which the caller must flush with `flushGlobalWriteback` after
-  /// the mutation.
+  /// copy, which the caller must commit through `commitGlobalWriteback`
+  /// (refresh, mutate, flush) after evaluating the rest of the statement.
   FailureOr<Value> emitLValue(const clang::Expr *expr,
                               GlobalWriteback *writeback = nullptr);
 
@@ -7732,6 +7763,34 @@ CImporter::flushGlobalWriteback(Location loc,
   return success();
 }
 
+LogicalResult CImporter::commitGlobalWriteback(
+    Location loc, const GlobalWriteback &writeback, bool refreshStaged,
+    llvm::function_ref<LogicalResult()> mutate) {
+  // Refresh a stale single-base staged copy: the staging load ran when
+  // the LHS place was formed, and any global write emitted since (an RHS
+  // call mutating another subobject of the same global) would be
+  // reverted by flushing that stale whole-value snapshot. Rebinding the
+  // staged place to a fresh snapshot immediately before the mutation
+  // keeps the user-visible evaluation order identical — every
+  // subexpression value was already materialized — while making the
+  // store-back exact. Statements without side-effecting subexpressions
+  // skip the refresh: nothing can have written the global since staging.
+  if (refreshStaged && writeback.place && writeback.multiBases.empty() &&
+      !writeback.symbol.empty()) {
+    auto lvalueType =
+        llvm::cast<emitrust::LValueType>(writeback.place.getType());
+    Value fresh = builder
+                      .create<emitrust::GlobalLoadOp>(
+                          loc, lvalueType.getValueType(),
+                          globalSymbol(writeback.symbol))
+                      .getResult();
+    builder.create<emitrust::AssignOp>(loc, writeback.place, fresh);
+  }
+  if (failed(mutate()))
+    return failure();
+  return flushGlobalWriteback(loc, writeback);
+}
+
 std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
   llvm::StringRef cName = func->getName();
   if (cName == "main")
@@ -10198,9 +10257,10 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
         return failure();
       stored = *converted;
     }
-    if (failed(emitWideByteStore(*access, stored, loc)))
-      return failure();
-    if (failed(flushGlobalWriteback(loc, writeback)))
+    if (failed(commitGlobalWriteback(
+            loc, writeback, assignStalenessRisk(op), [&]() {
+              return emitWideByteStore(*access, stored, loc);
+            })))
       return failure();
     Value staged = createVariablePlace(loc, access->valueType);
     builder.create<emitrust::AssignOp>(loc, staged, stored);
@@ -10231,9 +10291,9 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
                       .create<emitrust::CastOp>(loc, lvalueType.getValueType(),
                                                 toStore)
                       .getResult();
-  if (failed(storeToPlace(loc, *place, toStore)))
-    return failure();
-  if (failed(flushGlobalWriteback(loc, writeback)))
+  if (failed(commitGlobalWriteback(
+          loc, writeback, assignStalenessRisk(op),
+          [&]() { return storeToPlace(loc, *place, toStore); })))
     return failure();
   return place;
 }
@@ -10289,9 +10349,10 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
     FailureOr<Value> result = buildCompoundAssignValue(loc, op, *current);
     if (failed(result))
       return failure();
-    if (failed(emitWideByteStore(*access, *result, loc)))
-      return failure();
-    if (failed(flushGlobalWriteback(loc, writeback)))
+    if (failed(commitGlobalWriteback(
+            loc, writeback, assignStalenessRisk(op), [&]() {
+              return emitWideByteStore(*access, *result, loc);
+            })))
       return failure();
     Value staged = createVariablePlace(loc, access->valueType);
     builder.create<emitrust::AssignOp>(loc, staged, *result);
@@ -10305,9 +10366,9 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   FailureOr<Value> result = buildCompoundAssignValue(loc, op, current);
   if (failed(result))
     return failure();
-  if (failed(storeToPlace(loc, *place, *result)))
-    return failure();
-  if (failed(flushGlobalWriteback(loc, writeback)))
+  if (failed(commitGlobalWriteback(
+          loc, writeback, assignStalenessRisk(op),
+          [&]() { return storeToPlace(loc, *place, *result); })))
     return failure();
   return place;
 }
@@ -10443,9 +10504,12 @@ FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
   FailureOr<Value> next = buildBinaryArith(loc, opcode, current, one);
   if (failed(next))
     return failure();
-  if (failed(storeToPlace(loc, *place, *next)))
-    return failure();
-  if (failed(flushGlobalWriteback(loc, writeback)))
+  // The subexpression's own side effects (a subscript-index call,
+  // `g[f()]++`) run after the staging load and force the pre-store
+  // refresh of the staged copy.
+  if (failed(commitGlobalWriteback(
+          loc, writeback, op->getSubExpr()->HasSideEffects(astContext()),
+          [&]() { return storeToPlace(loc, *place, *next); })))
     return failure();
   // C evaluates postfix forms to the original value and prefix forms to
   // the updated one.
@@ -10456,11 +10520,12 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
   const clang::FunctionDecl *callee = call->getDirectCallee();
   if (callee && callee->getDeclName().isIdentifier()) {
     llvm::StringRef name = callee->getName();
-    if (name == "printf")
+    // printf/puts/putchar are intercepted by name only when the project
+    // supplies no definition of its own; a user-defined printf (any
+    // signature — <stdio.h> is not imported) or puts/putchar is an
+    // ordinary call to the imported definition.
+    if (name == "printf" && !callee->getDefinition())
       return emitPrintf(call);
-    // puts/putchar are intercepted by name only when the project supplies
-    // no definition of its own (mirroring the printf by-name lowering); a
-    // user-defined puts/putchar is an ordinary call.
     if (name == "puts" && !callee->getDefinition())
       return emitPuts(call);
     if (name == "putchar" && !callee->getDefinition())
@@ -12889,7 +12954,10 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   }
   if (!callee->getDeclName().isIdentifier())
     return emitError(loc) << "unsupported callee";
-  if (callee->getName() == "printf")
+  // The hosted (definition-less) printf lowering is statement-position
+  // only; a project-supplied printf definition is an ordinary imported
+  // function whose result is an ordinary value in every position.
+  if (callee->getName() == "printf" && !callee->getDefinition())
     return emitError(loc) << "unsupported: printf return value must be unused";
   // Statement-position puts/putchar are lowered by name (emitCallStmt);
   // their int result has no representation there, so a value use of a
@@ -15026,10 +15094,10 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
         // Stage the global's whole value in a local copy. Refined element
         // and field accesses read and write the copy; a write context
         // passes `writeback` and stores the copy back afterwards
-        // (load-modify-store). Exact for the single-threaded C subset up
-        // to one corner: a function called from the same statement's index
-        // or right-hand side that writes the same global is overwritten by
-        // the store-back (last writer wins).
+        // (load-modify-store). Exact for the single-threaded C subset: a
+        // function called from the same statement's index or right-hand
+        // side that writes the same global is preserved by the pre-store
+        // refresh in `commitGlobalWriteback`.
         Value place = builder
                           .create<emitrust::VariableOp>(
                               loc, emitrust::LValueType::get(global->type))
