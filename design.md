@@ -770,6 +770,29 @@ rule.
 - [ ] C99-44 Unions (design decision needed: safe Rust has no untagged
   unions; candidate mappings are enums where usage is disciplined, or
   documented rejection).
+  Partially landed (wave5 B1, one-slot struct model): a named or
+  untagged union RecordDecl imports as a ONE-FIELD struct whose storage
+  field is the first arm's leaf (name and type), generalizing the
+  CTS-R2 anonymous-union slot machinery — every arm's spelling aliases
+  that slot, so no non-first arm name reaches the IR. In scope: arms
+  that all map to one identical type (exact by C11 6.5.2.3), same-width
+  integer arms differing only in signedness (accesses through the
+  differently-signed arm wrap a bit-exact `emitrust.cast` reinterpret,
+  reads slot->arm and stores arm->slot), single-arm unions, unions as
+  struct members, and union globals with constant initializers (the
+  initializer lands on the slot like a one-field struct's). Pinned OUT
+  of scope with located `unsupported: union ...` rejections: bit-field
+  arms, pointer arms, integer arms of differing sizes, mixed
+  non-integer (float/pointer/aggregate) multi-arm unions, and empty
+  unions. Traceability: importer `lib/ImportC/ImportC.cpp`
+  (`collectUnionSlot`, `flattenedFieldStorage`,
+  `reinterpretUnionArmRead`/`reinterpretUnionArmWrite`, union routing
+  in `mapType`/`importRecord`/`convertAPValueInit`); tests
+  test/Import/C/unions.c (alias, single-arm, struct member, global
+  initializer, signedness pun, untagged local),
+  test/Import/C/unions-invalid.c (float arm, size mismatch, pointer
+  arm, bit-field arm, empty union — all located),
+  test/EndToEnd/unions.c (differential), c-testsuite 00042.c.
 - [ ] C99-45 Bit-fields (design decision needed: mask-and-shift accessor
   synthesis, or documented rejection).
 - [ ] C99-46 Dynamic memory: malloc, calloc, realloc, free (design
@@ -1258,6 +1281,15 @@ observed when C99-33 + C99-47 together unlocked 00215).
   enum when all accesses are type-consistent, or byte-array storage with
   typed accessor helpers for real type punning.
   (00042.c, 00210.c, 00218.c)
+  Partially landed (wave5 B1): the one-slot struct model (see C99-44)
+  admits unions whose arms alias one leaf — identical mapped types or
+  same-width integers differing only in signedness (bit-exact
+  `emitrust.cast` reinterpretation at the accesses) — flipping 00042.c
+  (untagged local two-int-arm union) to PASS in the manifest. 00210.c
+  (packed/aligned char-array puns) and 00218.c (self-referential
+  pointer-arm union) stay out of scope behind located
+  `unsupported: union ...` rejections (test/Import/C/unions-invalid.c);
+  positive pins in test/Import/C/unions.c and test/EndToEnd/unions.c.
 - [x] CTS-R4 (2) Block-scope struct declarations shadowing an outer tag
   (same tag `T`, different shape, inner scope): the importer's per-name
   shape dedup misreads this as a cross-TU conflict; record keys need
