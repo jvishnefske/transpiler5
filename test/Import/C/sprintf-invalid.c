@@ -17,16 +17,16 @@ int main(void) {
 }
 // NONLITERAL: nonliteral.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: sprintf format must be an ordinary string literal
 
-// Precision stays outside the shared C99-47 directive grammar, so the
-// shared translator keeps its located rejection for sprintf too.
+// A '*' precision stays outside the shared C99-47 directive grammar, so
+// the shared translator keeps its located rejection for sprintf too.
 //--- precision.c
 int sprintf(char *s, const char *fmt, ...);
 int main(void) {
   char buf[8];
-  sprintf(buf, "%.3d", 5);
+  sprintf(buf, "%.*d", 3, 5);
   return 0;
 }
-// PRECISION: precision.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: precision in printf format specifier
+// PRECISION: precision.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: '*' precision in printf format
 
 // A string-literal-backed region is read-only and cannot be the sprintf
 // destination (same policy as the <string.h> copy helpers).

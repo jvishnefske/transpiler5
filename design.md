@@ -1307,31 +1307,66 @@ rule.
 
 ### Hosted library surface (beyond the language)
 
-- [ ] C99-47 The full printf format language: %s, %c, %u, %x, %o, %e,
+- [x] C99-47 The full printf format language: %s, %c, %u, %x, %o, %e,
   %g, %p, field width, precision, flags, and length modifiers, mapped
-  onto Rust format specifications. PARTIAL — the supported directive
-  grammar is `%[flags][width][length]conv` with flags `-` (left align)
-  and `0` (zero pad, ignored next to `-` as in C), a decimal width,
-  length `l`, and conversions d/i (i32; i64 with `l`), u (u32/u64),
-  x/X/o (u32/u64 rendered `{:x}`/`{:X}`/`{:o}`), c, s, f, and %%.
-  Width/flags map 1:1 onto Rust specs (`%5d`→`{:5}`, `%-5d`→`{:<5}`,
-  `%05d`→`{:05}`, `%04X`→`{:04X}`; Rust's zero pad is sign-aware like
-  C's). u/x/X/o `as`-cast the argument to the directive's unsigned
-  type, so a negative signed argument prints its two's-complement bit
-  pattern exactly like C (`%x` of -1 is ffffffff); an integer argument
-  of a different width is `as`-cast likewise, truncating to the low
-  bits exactly like C's varargs read on x86-64 (`%d` of a size_t).
-  %c routes the int-promoted argument through the on-demand
-  `__emitrust_fmt_c` helper; %s accepts exactly two shapes — a string
-  literal (lowered to an `emitrust.literal` `&'static str`; embedded
-  NUL and non-ASCII bytes rejected) and a char-array lvalue (lowered to
-  `emitrust.slice_of` of the whole array through the on-demand
-  `__emitrust_cstr` helper, which stops at the first NUL like C); %f is
-  unchanged (f64 through `__emitrust_fmt_f64`, `%lf` accepted as its C
-  synonym). Located rejections: precision (`%.3s`, `%.2f`), lengths
-  `ll`/`h`/`L`/`j`/`z`/`t` (`%llx`, `%10Ld`), conversions outside the
-  set (%p, %n, %e, %g), flags/width on %c/%s/%f, and argument type
-  mismatches.
+  onto Rust format specifications. CLOSED as supported-subset plus
+  documented rejections: every form below is either byte-exact against
+  glibc or carries a located rejection pinned by a negative test —
+  silent divergence is structurally excluded. The supported grammar is
+  `%[flags][width][.precision][length]conv` with all five C99 flags
+  (`-`, `0`, `+`, ` `, `#`), decimal width and precision (a bare `.`
+  is precision 0), lengths `l`/`ll` (i64/u64) and `h`/`hh` (the
+  promoted argument reduced to short/char range by an `as`-cast, C99
+  7.19.6.1p7 masking semantics), and conversions d/i, u, x/X, o, c, s,
+  f/F/e/E/g/G, and %%.
+  Directives that map 1:1 onto Rust format specs keep the direct
+  mapping (`%5d`→`{:5}`, `%-5d`→`{:<5}`, `%05d`→`{:05}`,
+  `%04X`→`{:04X}`; Rust's zero pad is sign-aware like C's; on %c/%s a
+  width is explicit alignment, `{:>5}`/`{:<5}`, because C right-aligns
+  text where Rust's string formatting left-aligns). Everything beyond
+  that subset routes through on-demand module-level helpers
+  implementing the C99 rendering rules exactly, validated byte-exactly
+  against glibc printf on a structured battery plus fuzzed batteries of
+  4000 random f64 bit patterns and 4000 random integers across the
+  flags/width/precision matrix (zero diffs): `__emitrust_fmt_int` (+
+  `__emitrust_fmt_i64`/`__emitrust_fmt_u64` wrappers) renders integer
+  precision (digits zero-padded after the sign; value 0 with precision
+  0 prints nothing; `0` ignored next to a precision or `-`), the
+  `+`/` ` sign slots, and `#` alternate forms (octal leading zero only
+  when needed, 0x/0X on nonzero values, prefixes inside the `0` width
+  padding); `__emitrust_fmt_float` (+ `__emitrust_fmt_edigits`/
+  `__emitrust_fmt_exp`) renders f/e/g on Rust's exact correctly-rounded
+  decimal conversion (`{:.*}`/`{:.*e}` round half-to-even on the exact
+  binary value, matching glibc): %e with sign-always two-digit
+  exponents, %g with the C99 f/e style switch on the post-rounding
+  exponent, trailing-zero trimming, and glibc's `%#g` rounding-carry
+  quirk (a carry landing exactly on the 10^P decade drops the mantissa
+  fraction — `%#g` of 999999.5 is `1.e+06` — while an exact power of
+  ten keeps it, `1.000e+04`; detected via the shortest-round-trip
+  pre-rounding exponent); non-finite values print C's spellings
+  (`inf`/`nan`, uppercase under F/E/G, `-nan` when the sign bit is
+  set) and pad with spaces even under `0`, as glibc does. Bare
+  %f/%lf keeps the `__emitrust_fmt_f64` fast path. %s gained precision
+  (`%.Ns`): a string literal truncates at import time (only the
+  retained prefix is validated), the slice shapes route through
+  `__emitrust_cstr_n`, which stops at N bytes or the first NUL,
+  whichever comes first (C99 7.19.6.1p8: no terminator needed when the
+  precision bounds the read). u/x/X/o still `as`-cast the argument to
+  the directive's unsigned type (`%x` of -1 is ffffffff) and
+  mismatched integer widths truncate like C's x86-64 varargs read.
+  Rejected by policy, each with a located diagnostic and a pinned
+  negative test: %p (pointer provenance is compiled away by the FR-28
+  decomposition, so no address exists to print), %n (writes through a
+  pointer), %a/%A (hex float), `*` width/precision (runtime-supplied),
+  lengths `L` (no long double representation) and `j`/`z`/`t`,
+  undefined-by-C99 flag combinations rejected rather than silently
+  dropped (`%#d`, `%+u`, `%0c`, `%010s`, `%.3c`), wide %lc/%ls,
+  h/hh/ll on floating conversions, widths/precisions over nine digits,
+  NaN floating-point *constants* at the Rust-emission boundary (Rust
+  does not guarantee its NAN constant's sign/payload; infinity
+  constants are emitted as `f64::INFINITY`/`f64::NEG_INFINITY`), and
+  argument type mismatches. The char-path helpers stay ASCII-only by
+  design (C99-48).
   Definition guard: the whole by-name printf lowering applies ONLY when
   the project supplies no printf definition of its own — the same
   `!callee->getDefinition()` guard puts/putchar, the string.h surface,
@@ -1343,10 +1378,12 @@ rule.
   call-site extras its body cannot observe. The "printf return value
   must be unused" rejection now applies only to the hosted
   (definition-less) lowering.
-  (test/Import/C/printf.c, printf-extended.c, printf-extended-invalid.c,
+  (test/Import/C/printf.c, printf-extended.c, printf-precision.c,
+  printf-float-forms.c, printf-extended-invalid.c, sprintf-invalid.c,
   strings.c, strings-invalid.c, test/Import/C/printf-user-defined.c,
-  test/EndToEnd/printf-formats.c, test/EndToEnd/strings.c,
-  test/EndToEnd/printf-user-defined.c,
+  test/EndToEnd/printf-formats.c — differential against the clang-built
+  native binary over every supported form with boundary values —
+  test/EndToEnd/strings.c, test/EndToEnd/printf-user-defined.c,
   test/EndToEnd/printf-user-defined-nonvariadic.c)
 - [x] C99-48 A curated stdio/stdlib/string/math subset mapped to Rust
   equivalents (putchar, puts, abs, string functions over the C99-28
@@ -2551,11 +2588,11 @@ observed when C99-33 + C99-47 together unlocked 00215).
   strings-invalid.c; rustc-level differential
   test/EndToEnd/globals-string.c)
   (00089.c and 00220.c pass)
-Not itemized above: printf precision (`%.3s`) and long-long length
-specifiers (`%llx`, `%10Ld`) remain outside the C99-47 grammar, but no
-test is sole-blocked on them today (00182.c already passes; with CTS-R5's
-rename landed, 00204.c now rejects on `long double` at 00204.c:36:28
-before reaching printf) — they surface behind long double on 00204.c.
+Not itemized above: printf precision (`%.3s`) and the ll/h/hh length
+specifiers are now inside the C99-47 grammar; `%10Ld` (long double) stays
+rejected. No test is sole-blocked on printf forms today (00182.c already
+passes; with CTS-R5's rename landed, 00204.c now rejects on `long double`
+at 00204.c:36:28 before reaching printf).
 
 ## Non-Goals for the MVP
 

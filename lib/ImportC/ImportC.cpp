@@ -2509,16 +2509,24 @@ private:
   /// Lowers a printf call with a literal format string to
   /// `emitrust.call_opaque "print!"` with a translated Rust format string
   /// in the `args` attribute. The supported directive grammar is
-  /// `%[flags][width][length]conv` with flags `-`/`0`, a decimal width,
-  /// length `l`, and conversions d/i (i32, or i64 with `l`), u/x/X/o
-  /// (unsigned; the argument is `as`-cast to u32/u64 so negative signed
-  /// arguments print their two's-complement bit pattern exactly like C),
-  /// c (byte, via `__emitrust_fmt_c`), s (string literal or char-array
-  /// lvalue, see `emitPrintfStringArg`), f (f64, via `__emitrust_fmt_f64`
-  /// so non-finite values print with C's spellings; no flags/width), and
-  /// %%. Precision, other lengths (`ll`, `h`, ...), and every other
-  /// conversion keep located rejections. Integer arguments of a different
-  /// width or signedness than the conversion expects are `as`-cast, which
+  /// `%[flags][width][.precision][length]conv` with all five C99 flags
+  /// (`-`, `0`, `+`, ` `, `#`), decimal width and precision, lengths
+  /// `l`/`ll` (i64/u64) and `h`/`hh` (the promoted argument reduced to
+  /// short/char range by an `as`-cast), and conversions d/i, u, x/X, o,
+  /// c (byte, via `__emitrust_fmt_c`), s (see `emitPrintfStringArg`),
+  /// f/F/e/E/g/G (f64), and %%. Directives that map 1:1 onto Rust format
+  /// specs use them (width/`-`/`0` on integers, width/`-` on c/s); every
+  /// other supported form routes through the on-demand `__emitrust_fmt_*`
+  /// helpers, which implement the C99 rendering rules exactly (integer
+  /// precision and sign/prefix placement, the f/e/g floating algorithms
+  /// including glibc's `%#g` rounding-carry quirk, space-padded
+  /// non-finite values) — all validated byte-exactly against glibc.
+  /// Undefined-by-C99 flag combinations (`%#d`, `%+u`, `%0c`, ...),
+  /// `*` width/precision, lengths `L`/`j`/`z`/`t`, and the conversions
+  /// a/A (hex float) and n keep located rejections. %p stays rejected by
+  /// design: pointer provenance is compiled away by the decomposition, so
+  /// no address exists to print. Integer arguments of a different width
+  /// or signedness than the conversion expects are `as`-cast, which
   /// truncates to the low bits exactly like the x86-64 varargs read that C
   /// performs.
   LogicalResult emitPrintf(const clang::CallExpr *call);
@@ -2528,10 +2536,11 @@ private:
   /// at `firstArgIndex` and appending their lowered SSA values to
   /// `operands` (one per Rust `{}` placeholder, in order). This is the
   /// shared directive grammar of `emitPrintf` and `emitSprintf` (see
-  /// `emitPrintf` for the supported set); precision, the unsupported
-  /// length modifiers, and unknown conversions keep their located
-  /// rejections here so every caller enforces the same subset. Fails if
-  /// `call` supplies too few or too many arguments for the directives.
+  /// `emitPrintf` for the supported set); `*` width/precision, the
+  /// unsupported length modifiers, undefined flag combinations, and
+  /// unknown conversions keep their located rejections here so every
+  /// caller enforces the same subset. Fails if `call` supplies too few or
+  /// too many arguments for the directives.
   FailureOr<std::string>
   translatePrintfFormat(Location loc, const clang::CallExpr *call,
                         const clang::StringLiteral *literal,
@@ -2562,8 +2571,14 @@ private:
   /// backing from the pointer's cursor through the same helper; and a
   /// slice-classified `char *` parameter (FR-28, CTS-L2), lowered to an
   /// `emitrust.slice_of` of the parameter's deref'd slice base place from
-  /// its cursor through the same helper.
-  FailureOr<Value> emitPrintfStringArg(const clang::Expr *expr);
+  /// its cursor through the same helper. A `%.Ns` precision caps the
+  /// printed bytes at N like C: a literal is truncated at import time
+  /// (only the retained prefix is validated), the slice shapes route
+  /// through `__emitrust_cstr_n`, which stops at N bytes or the first
+  /// NUL, whichever comes first.
+  FailureOr<Value>
+  emitPrintfStringArg(const clang::Expr *expr,
+                      std::optional<unsigned> precision = std::nullopt);
 
   /// Wraps an integer value for a `%c` directive: casts it to i32 and
   /// routes it through the `__emitrust_fmt_c` helper (C converts the
@@ -3502,6 +3517,40 @@ private:
   /// True once the `__emitrust_cstr` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool cStrHelperEmitted = false;
+  /// True once a `%.Ns` (precision-bounded) `%s` slice argument has been
+  /// imported; triggers the one-per-module emission of the
+  /// `__emitrust_cstr_n` helper (stops at N bytes or the first NUL,
+  /// whichever comes first, matching C's %s precision).
+  bool needsCStrNHelper = false;
+  /// True once the `__emitrust_cstr_n` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool cStrNHelperEmitted = false;
+  /// True once a signed integer printf directive outside the 1:1 Rust
+  /// format-spec subset (precision or '+'/' ' flags) has been imported;
+  /// triggers emission of the `__emitrust_fmt_i64` wrapper (plus the
+  /// shared `__emitrust_fmt_int` core).
+  bool needsIntFormatSignedHelper = false;
+  /// True once the `__emitrust_fmt_i64` wrapper has been emitted.
+  bool intFormatSignedHelperEmitted = false;
+  /// True once an unsigned integer printf directive outside the 1:1 Rust
+  /// format-spec subset (precision or the '#' flag) has been imported;
+  /// triggers emission of the `__emitrust_fmt_u64` wrapper (plus the
+  /// shared `__emitrust_fmt_int` core).
+  bool needsIntFormatUnsignedHelper = false;
+  /// True once the `__emitrust_fmt_u64` wrapper has been emitted.
+  bool intFormatUnsignedHelperEmitted = false;
+  /// True once the shared `__emitrust_fmt_int` core (C99 7.19.6.1 integer
+  /// directive rendering: precision, sign/prefix, width padding) has been
+  /// emitted, so a multi-TU import never emits it twice.
+  bool intFormatCoreHelperEmitted = false;
+  /// True once a floating printf directive outside the bare-%f subset
+  /// (%e/%E/%g/%G/%F, or %f with flags/width/precision) has been
+  /// imported; triggers emission of the `__emitrust_fmt_float` helper
+  /// family (exact C99 f/e/g rendering incl. the glibc %#g carry quirk).
+  bool needsFloatFormatExtHelper = false;
+  /// True once the `__emitrust_fmt_float` helper family has been emitted,
+  /// so a multi-TU import never emits it twice.
+  bool floatFormatExtHelperEmitted = false;
   /// True once a definition-less `sprintf` call has been imported;
   /// triggers the one-per-module emission of the `__emitrust_sprintf`
   /// helper that copies the formatted bytes plus a NUL terminator into
@@ -9281,6 +9330,254 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "char).collect()\n"
             "}"));
   }
+  if (needsCStrNHelper && !cStrNHelperEmitted) {
+    cStrNHelperEmitted = true;
+    // C-compatible `%.Ns` rendering of a char region: C writes at most N
+    // bytes and stops earlier at a NUL; under a bounding precision the
+    // region may legally lack a terminator (C99 7.19.6.1p8), which
+    // `take(n)` mirrors by stopping at the slice end. ASCII-only like
+    // `__emitrust_cstr`. Emitted once per module, after all imported
+    // items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_cstr_n(s: &[i8], n: i64) -> String {\n"
+            "    s.iter().take(n as usize).take_while(|&&b| b != 0)"
+            ".map(|&b| (b as u8) as char).collect()\n"
+            "}"));
+  }
+  if ((needsIntFormatSignedHelper || needsIntFormatUnsignedHelper) &&
+      !intFormatCoreHelperEmitted) {
+    intFormatCoreHelperEmitted = true;
+    // C99 7.19.6.1 integer directive rendering, shared by the signed and
+    // unsigned wrappers: precision zero-pads the digits (and a zero value
+    // with precision zero prints nothing), '#' forces the leading octal
+    // zero or the 0x/0X prefix, the sign/prefix sit inside the '0' width
+    // padding, '0' is ignored next to '-' or a precision — all exactly
+    // C's rules (validated byte-exactly against glibc). Flag bits:
+    // '-'=1, '0'=2, '+'=4, ' '=8, '#'=16, uppercase=32.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_fmt_int(neg: bool, mag: u64, base: i32, "
+            "prec: i32,\n"
+            "                      width: i32, flags: i32) -> String {\n"
+            "    let minus = flags & 1 != 0;\n"
+            "    let zero = flags & 2 != 0 && prec < 0 && !minus;\n"
+            "    let plus = flags & 4 != 0;\n"
+            "    let space = flags & 8 != 0;\n"
+            "    let alt = flags & 16 != 0;\n"
+            "    let upper = flags & 32 != 0;\n"
+            "    let mut digits = if mag == 0 && prec == 0 {\n"
+            "        String::new()\n"
+            "    } else if base == 8 {\n"
+            "        format!(\"{:o}\", mag)\n"
+            "    } else if base == 16 && upper {\n"
+            "        format!(\"{:X}\", mag)\n"
+            "    } else if base == 16 {\n"
+            "        format!(\"{:x}\", mag)\n"
+            "    } else {\n"
+            "        format!(\"{}\", mag)\n"
+            "    };\n"
+            "    if prec > digits.len() as i32 {\n"
+            "        digits = \"0\".repeat(prec as usize - digits.len()) "
+            "+ &digits;\n"
+            "    }\n"
+            "    if alt && base == 8 && !digits.starts_with('0') {\n"
+            "        digits.insert(0, '0');\n"
+            "    }\n"
+            "    let prefix = if alt && base == 16 && mag != 0 {\n"
+            "        if upper { \"0X\" } else { \"0x\" }\n"
+            "    } else {\n"
+            "        \"\"\n"
+            "    };\n"
+            "    let sign = if neg { \"-\" } else if plus { \"+\" }\n"
+            "               else if space { \" \" } else { \"\" };\n"
+            "    let used = sign.len() + prefix.len() + digits.len();\n"
+            "    let pad = if width > used as i32 { width as usize - used "
+            "} else { 0 };\n"
+            "    if minus {\n"
+            "        format!(\"{}{}{}{}\", sign, prefix, digits, "
+            "\" \".repeat(pad))\n"
+            "    } else if zero {\n"
+            "        format!(\"{}{}{}{}\", sign, prefix, "
+            "\"0\".repeat(pad), digits)\n"
+            "    } else {\n"
+            "        format!(\"{}{}{}{}\", \" \".repeat(pad), sign, "
+            "prefix, digits)\n"
+            "    }\n"
+            "}"));
+  }
+  if (needsIntFormatSignedHelper && !intFormatSignedHelperEmitted) {
+    intFormatSignedHelperEmitted = true;
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_fmt_i64(x: i64, prec: i32, width: i32, "
+            "flags: i32) -> String {\n"
+            "    __emitrust_fmt_int(x < 0, x.unsigned_abs(), 10, prec, "
+            "width, flags)\n"
+            "}"));
+  }
+  if (needsIntFormatUnsignedHelper && !intFormatUnsignedHelperEmitted) {
+    intFormatUnsignedHelperEmitted = true;
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_fmt_u64(x: u64, base: i32, prec: i32, "
+            "width: i32,\n"
+            "                      flags: i32) -> String {\n"
+            "    __emitrust_fmt_int(false, x, base, prec, width, flags)\n"
+            "}"));
+  }
+  if (needsFloatFormatExtHelper && !floatFormatExtHelperEmitted) {
+    floatFormatExtHelperEmitted = true;
+    // Exact C99 f/e/g floating rendering over Rust's correctly-rounded
+    // decimal conversion ({:.*} and {:.*e} are exact for every finite
+    // f64, and round half-to-even on the exact value like glibc).
+    // `__emitrust_fmt_edigits` extracts correctly-rounded e-style digits
+    // and reports whether rounding carried into the next decade (glibc's
+    // %#g drops the mantissa fraction exactly when that carry lands on
+    // ev == P; an exact power of ten keeps it). Non-finite values pad
+    // with spaces even under '0', as glibc does. Validated byte-exactly
+    // against glibc across structured and fuzzed batteries. Flag bits as
+    // in `__emitrust_fmt_int`; conv: 0=f, 1=e, 2=g.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_fmt_exp(m: &str, ev: i32, alt: bool, "
+            "upper: bool) -> String {\n"
+            "    let mut m = String::from(m);\n"
+            "    if alt && !m.contains('.') {\n"
+            "        m.push('.');\n"
+            "    }\n"
+            "    format!(\"{}{}{}{:02}\", m, if upper { 'E' } else "
+            "{ 'e' },\n"
+            "            if ev < 0 { '-' } else { '+' }, ev.abs())\n"
+            "}\n"
+            "\n"
+            "fn __emitrust_fmt_edigits(mag: f64, prec: usize) -> "
+            "(String, i32, bool) {\n"
+            "    let s = format!(\"{:.*e}\", prec, mag);\n"
+            "    let (m, e) = match s.split_once('e') {\n"
+            "        Some(t) => t,\n"
+            "        None => (s.as_str(), \"0\"),\n"
+            "    };\n"
+            "    let ev: i32 = match e.parse() {\n"
+            "        Ok(v) => v,\n"
+            "        Err(_) => 0,\n"
+            "    };\n"
+            "    let pre: i32 = {\n"
+            "        let t = format!(\"{:e}\", mag);\n"
+            "        match t.split_once('e') {\n"
+            "            Some((_, te)) => te.parse().unwrap_or(0),\n"
+            "            None => 0,\n"
+            "        }\n"
+            "    };\n"
+            "    let int_len = m.find('.').unwrap_or(m.len());\n"
+            "    if int_len == 1 {\n"
+            "        return (String::from(m), ev, ev != pre);\n"
+            "    }\n"
+            "    let mut out = String::from(\"1\");\n"
+            "    if prec > 0 {\n"
+            "        out.push('.');\n"
+            "        out.push_str(&\"0\".repeat(prec));\n"
+            "    }\n"
+            "    (out, ev + 1, true)\n"
+            "}\n"
+            "\n"
+            "fn __emitrust_fmt_float(x: f64, conv: i32, prec: i32, "
+            "width: i32,\n"
+            "                        flags: i32) -> String {\n"
+            "    let minus = flags & 1 != 0;\n"
+            "    let zero = flags & 2 != 0 && !minus;\n"
+            "    let plus = flags & 4 != 0;\n"
+            "    let space = flags & 8 != 0;\n"
+            "    let alt = flags & 16 != 0;\n"
+            "    let upper = flags & 32 != 0;\n"
+            "    let p = if prec < 0 { 6usize } else { prec as usize };\n"
+            "    let sign = if x.is_sign_negative() { \"-\" } else if "
+            "plus { \"+\" }\n"
+            "               else if space { \" \" } else { \"\" };\n"
+            "    let (body, numeric) = if x.is_nan() {\n"
+            "        (String::from(if upper { \"NAN\" } else { \"nan\" })"
+            ", false)\n"
+            "    } else if x.is_infinite() {\n"
+            "        (String::from(if upper { \"INF\" } else { \"inf\" })"
+            ", false)\n"
+            "    } else {\n"
+            "        let mag = x.abs();\n"
+            "        let text = if conv == 0 {\n"
+            "            let mut t = format!(\"{:.*}\", p, mag);\n"
+            "            if alt && p == 0 {\n"
+            "                t.push('.');\n"
+            "            }\n"
+            "            t\n"
+            "        } else if conv == 1 {\n"
+            "            let (m, ev, _) = __emitrust_fmt_edigits(mag, p);\n"
+            "            __emitrust_fmt_exp(&m, ev, alt, upper)\n"
+            "        } else {\n"
+            "            let pp = if p == 0 { 1 } else { p };\n"
+            "            let (m, ev, carried) = "
+            "__emitrust_fmt_edigits(mag, pp - 1);\n"
+            "            if ev < -4 || ev >= pp as i32 {\n"
+            "                let mut m = if carried && ev == pp as i32 {\n"
+            "                    String::from(\"1\")\n"
+            "                } else {\n"
+            "                    m\n"
+            "                };\n"
+            "                if !alt && m.contains('.') {\n"
+            "                    m = String::from(\n"
+            "                        m.trim_end_matches('0')"
+            ".trim_end_matches('.'));\n"
+            "                }\n"
+            "                __emitrust_fmt_exp(&m, ev, alt, upper)\n"
+            "            } else {\n"
+            "                let digits: String =\n"
+            "                    m.chars().filter(|c| *c != '.')"
+            ".collect();\n"
+            "                let mut t = if ev >= 0 {\n"
+            "                    let ip = ev as usize + 1;\n"
+            "                    if digits.len() > ip {\n"
+            "                        format!(\"{}.{}\", &digits[..ip], "
+            "&digits[ip..])\n"
+            "                    } else {\n"
+            "                        String::from(&digits[..ip])\n"
+            "                    }\n"
+            "                } else {\n"
+            "                    format!(\"0.{}{}\", "
+            "\"0\".repeat((-ev - 1) as usize), digits)\n"
+            "                };\n"
+            "                if !alt && t.contains('.') {\n"
+            "                    t = String::from(\n"
+            "                        t.trim_end_matches('0')"
+            ".trim_end_matches('.'));\n"
+            "                }\n"
+            "                if alt && !t.contains('.') {\n"
+            "                    t.push('.');\n"
+            "                }\n"
+            "                t\n"
+            "            }\n"
+            "        };\n"
+            "        (text, true)\n"
+            "    };\n"
+            "    let used = sign.len() + body.len();\n"
+            "    let pad = if width > used as i32 { width as usize - used "
+            "} else { 0 };\n"
+            "    if minus {\n"
+            "        format!(\"{}{}{}\", sign, body, \" \".repeat(pad))\n"
+            "    } else if zero && numeric {\n"
+            "        format!(\"{}{}{}\", sign, \"0\".repeat(pad), body)\n"
+            "    } else {\n"
+            "        format!(\"{}{}{}\", \" \".repeat(pad), sign, body)\n"
+            "    }\n"
+            "}"));
+  }
   if (needsSprintfHelper && !sprintfHelperEmitted) {
     sprintfHelperEmitted = true;
     // C-compatible sprintf tail: copies the formatted ASCII bytes plus the
@@ -12230,48 +12527,123 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       rustFormat += '%';
       continue;
     }
-    // Parse `%[flags][width][.precision][length]conv` (C99 7.19.6.1).
-    // Supported flags are '-' (left align) and '0' (zero pad); width is a
-    // decimal number; precision stays rejected; the only supported length
-    // is a single 'l'.
+    // Parse `%[flags][width][.precision][length]conv` (C99 7.19.6.1). All
+    // five C99 flags are recognized; width and precision are decimal
+    // numbers ('*' forms consume a runtime argument and stay rejected);
+    // lengths l/ll (64-bit) and h/hh (short/char range) are supported,
+    // L/j/z/t stay rejected.
     bool leftAlign = false;
     bool zeroPad = false;
-    while (i < n && (format[i] == '-' || format[i] == '0')) {
-      if (format[i] == '-')
+    bool plusSign = false;
+    bool spaceSign = false;
+    bool altForm = false;
+    while (i < n) {
+      char flag = format[i];
+      if (flag == '-')
         leftAlign = true;
-      else
+      else if (flag == '0')
         zeroPad = true;
+      else if (flag == '+')
+        plusSign = true;
+      else if (flag == ' ')
+        spaceSign = true;
+      else if (flag == '#')
+        altForm = true;
+      else
+        break;
       ++i;
     }
+    if (i < n && format[i] == '*')
+      return emitError(loc)
+             << "unsupported: '*' field width in printf format";
     std::string width;
     while (i < n && format[i] >= '0' && format[i] <= '9')
       width += format[i++];
-    if (i < n && format[i] == '.')
-      return emitError(loc)
-             << "unsupported: precision in printf format specifier";
-    bool isLong = false;
-    if (i < n && format[i] == 'l') {
-      isLong = true;
+    if (width.size() > 9)
+      return emitError(loc) << "unsupported: printf field width too large";
+    int precision = -1;
+    if (i < n && format[i] == '.') {
       ++i;
-      if (i < n && format[i] == 'l')
-        return emitError(loc) << "unsupported printf length modifier 'll'";
-    } else if (i < n && (format[i] == 'h' || format[i] == 'L' ||
-                         format[i] == 'j' || format[i] == 'z' ||
-                         format[i] == 't')) {
+      if (i < n && format[i] == '*')
+        return emitError(loc)
+               << "unsupported: '*' precision in printf format";
+      std::string precisionDigits;
+      while (i < n && format[i] >= '0' && format[i] <= '9')
+        precisionDigits += format[i++];
+      if (precisionDigits.size() > 9)
+        return emitError(loc) << "unsupported: printf precision too large";
+      // A '.' with no digits is precision zero (C99 7.19.6.1p4).
+      precision = precisionDigits.empty() ? 0 : std::stoi(precisionDigits);
+    }
+    enum class Length { None, Long, LongLong, Short, Char };
+    Length lengthMod = Length::None;
+    if (i < n && format[i] == 'l') {
+      lengthMod = Length::Long;
+      ++i;
+      if (i < n && format[i] == 'l') {
+        lengthMod = Length::LongLong;
+        ++i;
+      }
+    } else if (i < n && format[i] == 'h') {
+      lengthMod = Length::Short;
+      ++i;
+      if (i < n && format[i] == 'h') {
+        lengthMod = Length::Char;
+        ++i;
+      }
+    } else if (i < n && (format[i] == 'L' || format[i] == 'j' ||
+                         format[i] == 'z' || format[i] == 't')) {
       return emitError(loc) << "unsupported printf length modifier '"
                             << llvm::Twine(std::string(1, format[i])) << "'";
     }
     if (i >= n)
       return emitError(loc) << "unsupported: trailing '%' in printf format";
     char spec = format[i];
+    std::string specName(1, spec);
     // Validate the conversion before consuming an argument so an unknown
     // conversion is always the diagnostic, even when arguments are short.
-    if (spec != 'd' && spec != 'i' && spec != 'u' && spec != 'x' &&
-        spec != 'X' && spec != 'o' && spec != 'c' && spec != 's' &&
-        spec != 'f')
-      return emitError(loc) << "unsupported printf format specifier '%"
-                            << llvm::Twine(std::string(1, spec)) << "'";
-    bool hasAdjustment = leftAlign || zeroPad || !width.empty();
+    // %p stays rejected by design: pointer provenance is compiled away by
+    // the pointer decomposition, so no address exists to print.
+    bool isSignedConv = spec == 'd' || spec == 'i';
+    bool isUnsignedConv =
+        spec == 'u' || spec == 'x' || spec == 'X' || spec == 'o';
+    bool isFloatConv = spec == 'f' || spec == 'F' || spec == 'e' ||
+                       spec == 'E' || spec == 'g' || spec == 'G';
+    if (!isSignedConv && !isUnsignedConv && !isFloatConv && spec != 'c' &&
+        spec != 's')
+      return emitError(loc)
+             << "unsupported printf format specifier '%" << specName << "'";
+    // Flag and length validity (C99 7.19.6.1p6-7): '+'/' ' are defined
+    // only for the signed and floating conversions, '#' only for x/X/o
+    // and the floating conversions; both are undefined elsewhere and are
+    // rejected rather than silently dropped. h/hh apply only to the
+    // integer conversions; ll does not apply to the floating ones (l on a
+    // floating conversion has no effect and is accepted, C99 7.19.6.1p7).
+    if ((plusSign || spaceSign) && !isSignedConv && !isFloatConv)
+      return emitError(loc) << "unsupported: '+' or ' ' flag on printf '%"
+                            << specName << "'";
+    if (altForm && !isFloatConv && spec != 'x' && spec != 'X' && spec != 'o')
+      return emitError(loc)
+             << "unsupported: '#' flag on printf '%" << specName << "'";
+    if ((lengthMod == Length::Short || lengthMod == Length::Char) &&
+        !isSignedConv && !isUnsignedConv)
+      return emitError(loc)
+             << "unsupported: length modifier 'h' on printf '%" << specName
+             << "'";
+    if (lengthMod == Length::LongLong && isFloatConv)
+      return emitError(loc)
+             << "unsupported: length modifier 'll' on printf '%" << specName
+             << "'";
+    if (lengthMod != Length::None && (spec == 'c' || spec == 's'))
+      return emitError(loc) << "unsupported: length modifier on printf '%"
+                            << specName << "'";
+    if (zeroPad && (spec == 'c' || spec == 's'))
+      return emitError(loc)
+             << "unsupported: '0' flag on printf '%" << specName << "'";
+    if (precision >= 0 && spec == 'c')
+      return emitError(loc) << "unsupported: precision on printf '%c'";
+    bool isLong =
+        lengthMod == Length::Long || lengthMod == Length::LongLong;
     // Renders the Rust format placeholder for a numeric directive: the C
     // width maps 1:1 ("%5d" -> "{:5}"), '-' to left alignment ("%-5d" ->
     // "{:<5}"), '0' to Rust's sign-aware zero pad ("%05d" -> "{:05}"),
@@ -12293,20 +12665,42 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       text += '}';
       return text;
     };
+    // Renders the placeholder for a %c/%s directive with a width: C
+    // right-aligns text to the field by default where Rust's string
+    // formatting left-aligns, so the alignment is always explicit.
+    auto textPlaceholder = [&]() {
+      if (width.empty())
+        return std::string("{}");
+      std::string text = "{:";
+      text += leftAlign ? '<' : '>';
+      text += width;
+      text += '}';
+      return text;
+    };
+    // The C99-flag bitmask shared by the `__emitrust_fmt_*` helpers
+    // (kept in sync with the emitted helper sources): '-'=1, '0'=2,
+    // '+'=4, ' '=8, '#'=16, uppercase conversion=32.
+    int flagsMask = (leftAlign ? 1 : 0) | (zeroPad ? 2 : 0) |
+                    (plusSign ? 4 : 0) | (spaceSign ? 8 : 0) |
+                    (altForm ? 16 : 0);
+    int widthValue = width.empty() ? 0 : std::stoi(width);
+    auto i32Type = builder.getIntegerType(32);
+    auto stringType =
+        emitrust::OpaqueType::get(builder.getContext(), "String");
     if (argIndex >= call->getNumArgs())
       return emitError(loc) << "unsupported: too few arguments to printf";
     const clang::Expr *argExpr = call->getArg(argIndex);
     unsigned argNumber = argIndex++;
 
     if (spec == 's') {
-      if (hasAdjustment || isLong)
-        return emitError(loc)
-               << "unsupported: flags, width, or length on printf '%s'";
-      FailureOr<Value> text = emitPrintfStringArg(argExpr);
+      std::optional<unsigned> stringPrecision;
+      if (precision >= 0)
+        stringPrecision = static_cast<unsigned>(precision);
+      FailureOr<Value> text = emitPrintfStringArg(argExpr, stringPrecision);
       if (failed(text))
         return failure();
       operands.push_back(*text);
-      rustFormat += "{}";
+      rustFormat += textPlaceholder();
       continue;
     }
 
@@ -12315,29 +12709,56 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       return failure();
     Type argType = (*argument).getType();
 
-    if (spec == 'f') {
-      // C's %f prints six decimals; Rust's {:.6} matches it for every
-      // finite value and for infinities, but spells NaN as "NaN" where C
-      // prints "nan"/"-nan". The argument is therefore routed through the
-      // module-level `__emitrust_fmt_f64` helper (emitted once, on demand)
-      // and printed with a plain `{}`. (`%lf` is identical to `%f` in
-      // C99; flags and width on the String-typed helper result would not
-      // match C's numeric padding and stay rejected.)
-      if (hasAdjustment)
-        return emitError(loc) << "unsupported: flags or width on printf '%f'";
+    if (isFloatConv) {
       if (!llvm::isa<Float64Type>(argType))
         return emitError(loc) << "unsupported: printf argument " << argNumber
                               << " does not match its format specifier";
-      needsFloatFormatHelper = true;
-      auto stringType =
-          emitrust::OpaqueType::get(builder.getContext(), "String");
-      *argument = builder
-                      .create<emitrust::CallOpaqueOp>(
-                          loc, TypeRange{stringType},
-                          builder.getStringAttr("__emitrust_fmt_f64"),
-                          /*args=*/ArrayAttr(), ValueRange{*argument})
-                      .getResult(0);
-      operands.push_back(*argument);
+      bool plainF = spec == 'f' && precision < 0 && width.empty() &&
+                    !leftAlign && !zeroPad && !plusSign && !spaceSign &&
+                    !altForm;
+      if (plainF) {
+        // C's %f prints six decimals; Rust's {:.6} matches it for every
+        // finite value and for infinities, but spells NaN as "NaN" where
+        // C prints "nan"/"-nan". The argument is therefore routed through
+        // the module-level `__emitrust_fmt_f64` helper (emitted once, on
+        // demand) and printed with a plain `{}`. (`%lf` is identical to
+        // `%f` in C99.)
+        needsFloatFormatHelper = true;
+        *argument = builder
+                        .create<emitrust::CallOpaqueOp>(
+                            loc, TypeRange{stringType},
+                            builder.getStringAttr("__emitrust_fmt_f64"),
+                            /*args=*/ArrayAttr(), ValueRange{*argument})
+                        .getResult(0);
+        operands.push_back(*argument);
+        rustFormat += "{}";
+        continue;
+      }
+      // Every other floating directive goes through the module-level
+      // `__emitrust_fmt_float` helper, which implements the C99 f/e/g
+      // algorithms (including the glibc %#g rounding-carry quirk) over
+      // Rust's exact correctly-rounded decimal conversion; the directive's
+      // compile-time parameters travel as i32 constants.
+      int convCode = (spec == 'e' || spec == 'E') ? 1
+                     : (spec == 'g' || spec == 'G') ? 2
+                                                    : 0;
+      if (spec == 'F' || spec == 'E' || spec == 'G')
+        flagsMask |= 32;
+      needsFloatFormatExtHelper = true;
+      Value convValue = createIntConstant(loc, i32Type, convCode);
+      Value precisionValue = createIntConstant(loc, i32Type, precision);
+      Value widthConst = createIntConstant(loc, i32Type, widthValue);
+      Value flagsValue = createIntConstant(loc, i32Type, flagsMask);
+      Value formatted =
+          builder
+              .create<emitrust::CallOpaqueOp>(
+                  loc, TypeRange{stringType},
+                  builder.getStringAttr("__emitrust_fmt_float"),
+                  /*args=*/ArrayAttr(),
+                  ValueRange{*argument, convValue, precisionValue,
+                             widthConst, flagsValue})
+              .getResult(0);
+      operands.push_back(formatted);
       rustFormat += "{}";
       continue;
     }
@@ -12349,14 +12770,11 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       // C converts the argument to unsigned char and prints that byte;
       // the i32 argument (chars arrive int-promoted) goes through the
       // `__emitrust_fmt_c` helper (ASCII-only, see design.md C99-48).
-      if (hasAdjustment || isLong)
-        return emitError(loc)
-               << "unsupported: flags, width, or length on printf '%c'";
       if (!isIntArgument)
         return emitError(loc) << "unsupported: printf argument " << argNumber
                               << " does not match its format specifier";
       operands.push_back(wrapCharFormat(loc, *argument));
-      rustFormat += "{}";
+      rustFormat += textPlaceholder();
       continue;
     }
 
@@ -12366,42 +12784,79 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
     // two's-complement bit pattern ("%x" of -1 is ffffffff), exactly like
     // C. An argument of a different width is `as`-cast as well, which
     // truncates to the low bits just like C's varargs read on x86-64
-    // (printf("%d", sizeof(x)) prints the low 32 bits of the size_t).
+    // (printf("%d", sizeof(x)) prints the low 32 bits of the size_t); the
+    // h/hh lengths reuse the same cast to reduce the int-promoted
+    // argument to short/char range (C99 7.19.6.1p7).
     llvm::StringRef radix;
-    bool isSigned;
     switch (spec) {
-    case 'd':
-    case 'i':
-      isSigned = true;
-      break;
-    case 'u':
-      isSigned = false;
-      break;
     case 'x':
-      isSigned = false;
       radix = "x";
       break;
     case 'X':
-      isSigned = false;
       radix = "X";
       break;
     case 'o':
-      isSigned = false;
       radix = "o";
       break;
-    default: // Defensive; the conversion was validated above.
-      return emitError(loc) << "unsupported printf format specifier '%"
-                            << llvm::Twine(std::string(1, spec)) << "'";
+    default:
+      break;
     }
     if (!isIntArgument)
       return emitError(loc) << "unsupported: printf argument " << argNumber
                             << " does not match its format specifier";
+    unsigned bits = isLong                      ? 64
+                    : lengthMod == Length::Short ? 16
+                    : lengthMod == Length::Char  ? 8
+                                                 : 32;
     IntegerType target =
-        isSigned ? builder.getIntegerType(isLong ? 64 : 32)
-                 : IntegerType::get(builder.getContext(), isLong ? 64 : 32,
-                                    IntegerType::Unsigned);
-    operands.push_back(castToIntType(loc, *argument, target));
-    rustFormat += placeholderFor(radix);
+        isSignedConv
+            ? builder.getIntegerType(bits)
+            : IntegerType::get(builder.getContext(), bits,
+                               IntegerType::Unsigned);
+    Value narrowed = castToIntType(loc, *argument, target);
+    if (precision < 0 && !plusSign && !spaceSign && !altForm) {
+      // Flags/width-only directives map 1:1 onto Rust format specs.
+      operands.push_back(narrowed);
+      rustFormat += placeholderFor(radix);
+      continue;
+    }
+    // Precision or the '+'/' '/'#' flags have no Rust format equivalent
+    // with C semantics ('0' is ignored next to a precision, the sign and
+    // 0x/0 prefixes sit inside the zero padding, ...); the directive goes
+    // through the module-level `__emitrust_fmt_i64`/`__emitrust_fmt_u64`
+    // helpers, which implement the C99 rules exactly over the value
+    // widened to 64 bits (sign- or zero-extended per the conversion).
+    if (spec == 'X')
+      flagsMask |= 32;
+    Value widened = castToIntType(
+        loc, narrowed,
+        isSignedConv ? builder.getIntegerType(64)
+                     : IntegerType::get(builder.getContext(), 64,
+                                        IntegerType::Unsigned));
+    Value precisionValue = createIntConstant(loc, i32Type, precision);
+    Value widthConst = createIntConstant(loc, i32Type, widthValue);
+    Value flagsValue = createIntConstant(loc, i32Type, flagsMask);
+    SmallVector<Value> helperArgs{widened};
+    llvm::StringRef helperName = "__emitrust_fmt_i64";
+    if (!isSignedConv) {
+      helperName = "__emitrust_fmt_u64";
+      int base = spec == 'o' ? 8 : spec == 'u' ? 10 : 16;
+      helperArgs.push_back(createIntConstant(loc, i32Type, base));
+      needsIntFormatUnsignedHelper = true;
+    } else {
+      needsIntFormatSignedHelper = true;
+    }
+    helperArgs.push_back(precisionValue);
+    helperArgs.push_back(widthConst);
+    helperArgs.push_back(flagsValue);
+    Value formatted = builder
+                          .create<emitrust::CallOpaqueOp>(
+                              loc, TypeRange{stringType},
+                              builder.getStringAttr(helperName),
+                              /*args=*/ArrayAttr(), helperArgs)
+                          .getResult(0);
+    operands.push_back(formatted);
+    rustFormat += "{}";
   }
   if (argIndex != call->getNumArgs())
     return emitError(loc) << "unsupported: too many arguments to printf";
@@ -12474,7 +12929,9 @@ FailureOr<Value> CImporter::emitSprintf(const clang::CallExpr *call) {
       .getResult(0);
 }
 
-FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
+FailureOr<Value>
+CImporter::emitPrintfStringArg(const clang::Expr *expr,
+                               std::optional<unsigned> precision) {
   // The array-to-pointer decay wrapping both supported shapes is implicit;
   // strip it (and parentheses) to see the underlying literal or lvalue.
   // A `__func__`-family predefined identifier prints its function-name
@@ -12492,8 +12949,13 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
     // from C (which stops printing there) and a non-ASCII byte would fail
     // rustc's UTF-8 check, so both are rejected; quote, backslash, and the
     // whitespace escapes are re-escaped for the Rust spelling.
+    // A %.Ns precision truncates at import time: C never reads past the
+    // Nth byte, so only the retained prefix is validated below.
+    llvm::StringRef data = literal->getString();
+    if (precision && *precision < data.size())
+      data = data.take_front(*precision);
     std::string text = "\"";
-    for (char c : literal->getString()) {
+    for (char c : data) {
       if (c == '\0')
         return emitError(loc)
                << "unsupported: NUL byte in printf '%s' string literal";
@@ -12527,6 +12989,33 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
         .create<emitrust::LiteralOp>(loc, strType, builder.getStringAttr(text))
         .getResult();
   }
+  // Renders a borrowed i8 slice through the on-demand `__emitrust_cstr`
+  // helper (stops at the first NUL, like C's %s) or, under a %.Ns
+  // precision, through `__emitrust_cstr_n` (stops at N bytes or the first
+  // NUL, whichever comes first; C99 7.19.6.1p8 allows the array to lack a
+  // terminator when the precision bounds the read).
+  auto wrapCStr = [&](Location loc, Value slice) -> Value {
+    auto stringType =
+        emitrust::OpaqueType::get(builder.getContext(), "String");
+    if (precision) {
+      needsCStrNHelper = true;
+      Value count = createIntConstant(loc, builder.getIntegerType(64),
+                                      static_cast<int64_t>(*precision));
+      return builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{stringType},
+              builder.getStringAttr("__emitrust_cstr_n"),
+              /*args=*/ArrayAttr(), ValueRange{slice, count})
+          .getResult(0);
+    }
+    needsCStrHelper = true;
+    return builder
+        .create<emitrust::CallOpaqueOp>(loc, TypeRange{stringType},
+                                        builder.getStringAttr("__emitrust_cstr"),
+                                        /*args=*/ArrayAttr(),
+                                        ValueRange{slice})
+        .getResult(0);
+  };
   // A char-array lvalue is borrowed whole (`emitrust.slice_of` at index 0)
   // and rendered by the `__emitrust_cstr` helper, which — like C's %s —
   // stops at the first NUL.
@@ -12549,15 +13038,7 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
                       .create<emitrust::SliceOfOp>(loc, sliceRefType, *place,
                                                    zero, /*is_mut=*/false)
                       .getResult();
-    needsCStrHelper = true;
-    auto stringType =
-        emitrust::OpaqueType::get(builder.getContext(), "String");
-    return builder
-        .create<emitrust::CallOpaqueOp>(
-            loc, TypeRange{stringType},
-            builder.getStringAttr("__emitrust_cstr"),
-            /*args=*/ArrayAttr(), ValueRange{slice})
-        .getResult(0);
+    return wrapCStr(loc, slice);
   }
   // A strchr/strrchr result prints the searched region's byte run from
   // the found index: the helper's i64 index (relative to the argument's
@@ -12578,15 +13059,7 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
     FailureOr<Value> slice = emitCharRegionSlice(loc, at, /*isMut=*/false);
     if (failed(slice))
       return failure();
-    needsCStrHelper = true;
-    auto stringType =
-        emitrust::OpaqueType::get(builder.getContext(), "String");
-    return builder
-        .create<emitrust::CallOpaqueOp>(
-            loc, TypeRange{stringType},
-            builder.getStringAttr("__emitrust_cstr"),
-            /*args=*/ArrayAttr(), ValueRange{*slice})
-        .getResult(0);
+    return wrapCStr(loc, *slice);
   }
   // `&arr[i]` (or `&p[i]` over a decomposed pointer) prints the region's
   // byte run from element i, through the same slice + `__emitrust_cstr`
@@ -12602,15 +13075,7 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
           emitCharRegionSlice(loc, *pointer, /*isMut=*/false);
       if (failed(slice))
         return failure();
-      needsCStrHelper = true;
-      auto stringType =
-          emitrust::OpaqueType::get(builder.getContext(), "String");
-      return builder
-          .create<emitrust::CallOpaqueOp>(
-              loc, TypeRange{stringType},
-              builder.getStringAttr("__emitrust_cstr"),
-              /*args=*/ArrayAttr(), ValueRange{*slice})
-          .getResult(0);
+      return wrapCStr(loc, *slice);
     }
   // A decomposed `char *` prints the backing byte run from its cursor:
   // `emitrust.slice_of` of the region place at the cursor, rendered by
@@ -12684,15 +13149,7 @@ FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
                                                    backingPlace, cursor,
                                                    /*is_mut=*/false)
                       .getResult();
-    needsCStrHelper = true;
-    auto stringType =
-        emitrust::OpaqueType::get(builder.getContext(), "String");
-    return builder
-        .create<emitrust::CallOpaqueOp>(
-            loc, TypeRange{stringType},
-            builder.getStringAttr("__emitrust_cstr"),
-            /*args=*/ArrayAttr(), ValueRange{slice})
-        .getResult(0);
+    return wrapCStr(loc, slice);
   }
   return emitError(loc) << "unsupported: printf '%s' argument must be a "
                            "string literal or a char array";
