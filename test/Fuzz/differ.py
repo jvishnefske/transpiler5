@@ -83,13 +83,21 @@ def _binary_candidates(crate_dir, crate_name):
     return candidates
 
 
-def _run_binary(binary):
-    """Run one produced binary; returns (rc, stdout, timed_out)."""
-    rc, stdout, _stderr, timed_out = run_command([binary], RUN_TIMEOUT)
+def _run_binary(binary, cwd=None):
+    """Run one produced binary; returns (rc, stdout, timed_out).
+
+    ``cwd`` isolates programs that touch the filesystem (the file_io
+    template's scratch files): both legs run in the caller's per-seed
+    directory, so relative paths never escape it or collide across
+    parallel seeds.
+    """
+    rc, stdout, _stderr, timed_out = run_command(
+        [os.path.abspath(binary)], RUN_TIMEOUT, cwd=cwd
+    )
     return rc, stdout, timed_out
 
 
-def compare_runs(native_binary, rust_binary, expected=None):
+def compare_runs(native_binary, rust_binary, expected=None, cwd=None):
     """Run both binaries and classify the (rc, stdout) comparison.
 
     The native leg is ground truth for the transpiled leg: a crash or
@@ -100,7 +108,7 @@ def compare_runs(native_binary, rust_binary, expected=None):
     MISCOMPILE verdict always rests on two independent witnesses.  This
     is the single comparison path used by both run_pair and --self-test.
     """
-    native_rc, native_out, timed_out = _run_binary(native_binary)
+    native_rc, native_out, timed_out = _run_binary(native_binary, cwd)
     if timed_out:
         return PairResult(HARNESS_BUG, "native binary timed out", None, b"", None, b"", None)
     if native_rc < 0:
@@ -121,7 +129,7 @@ def compare_runs(native_binary, rust_binary, expected=None):
                 GENERATOR_ORACLE_BUG, detail, native_rc, native_out, None, b"", None
             )
 
-    rust_rc, rust_out, timed_out = _run_binary(rust_binary)
+    rust_rc, rust_out, timed_out = _run_binary(rust_binary, cwd)
     if timed_out:
         return PairResult(
             MISCOMPILE, "transpiled binary timed out after %ss" % RUN_TIMEOUT,
@@ -209,7 +217,7 @@ def run_pair(emitrust_cc, clang, source_path, workdir, expected=None, range_chec
             None, b"", None, b"", crate_dir,
         )
 
-    result = compare_runs(native_binary, rust_binary, expected)
+    result = compare_runs(native_binary, rust_binary, expected, cwd=os.path.abspath(workdir))
     return result._replace(crate_dir=crate_dir)
 
 
@@ -240,13 +248,18 @@ def _self_test(clang, workdir):
             return 1
         binaries[name] = binary
 
-    divergent = compare_runs(binaries["sa"], binaries["sb"])
-    identical = compare_runs(binaries["sa"], binaries["sa"])
+    cwd = os.path.abspath(workdir)
+    divergent = compare_runs(binaries["sa"], binaries["sb"], cwd=cwd)
+    identical = compare_runs(binaries["sa"], binaries["sa"], cwd=cwd)
     # Three-way oracle checks: sa prints "alpha\n" and exits 3.  A correct
     # expectation must PASS; a planted wrong expectation must be pinned on
     # the generator, not the compiler.
-    oracle_good = compare_runs(binaries["sa"], binaries["sa"], expected=(3, b"alpha\n"))
-    oracle_bad = compare_runs(binaries["sa"], binaries["sa"], expected=(3, b"planted\n"))
+    oracle_good = compare_runs(
+        binaries["sa"], binaries["sa"], expected=(3, b"alpha\n"), cwd=cwd
+    )
+    oracle_bad = compare_runs(
+        binaries["sa"], binaries["sa"], expected=(3, b"planted\n"), cwd=cwd
+    )
     ok = (
         divergent.status == MISCOMPILE
         and identical.status == PASS
