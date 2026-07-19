@@ -19,6 +19,7 @@ include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/CallInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/Interfaces/InferIntRangeInterface.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
@@ -372,12 +373,18 @@ def EmitRust_CallIndirectOp : EmitRust_Op<"call_indirect"> {
 // ConstantOp
 //===----------------------------------------------------------------------===//
 
-def EmitRust_ConstantOp : EmitRust_Op<"constant"> {
+def EmitRust_ConstantOp : EmitRust_Op<"constant",
+    [DeclareOpInterfaceMethods<InferIntRangeInterface,
+                               ["inferResultRanges"]>]> {
   let summary = "Constant operation";
   let description = [{
     The `emitrust.constant` operation produces an SSA value equal to some
     constant specified by an attribute. The attribute is either a typed
     attribute or an EmitRust opaque attribute whose value is emitted as is.
+
+    The operation implements `InferIntRangeInterface`: an integer-typed
+    constant infers the exact singleton range of its value; an opaque or
+    non-integer constant stays at the full range of its type.
 
     Example:
 
@@ -397,12 +404,18 @@ def EmitRust_ConstantOp : EmitRust_Op<"constant"> {
 // LiteralOp
 //===----------------------------------------------------------------------===//
 
-def EmitRust_LiteralOp : EmitRust_Op<"literal", [Pure]> {
+def EmitRust_LiteralOp : EmitRust_Op<"literal",
+    [Pure, DeclareOpInterfaceMethods<InferIntRangeInterface,
+                                     ["inferResultRanges"]>]> {
   let summary = "Literal operation";
   let description = [{
     The `emitrust.literal` operation produces an SSA value whose textual
     representation is the given non-empty string, emitted verbatim as a Rust
     expression.
+
+    The operation implements `InferIntRangeInterface` conservatively: the
+    literal text is opaque, so an integer-typed result is pinned to the
+    full range of its type.
 
     Example:
 
@@ -953,7 +966,9 @@ def EmitRust_MemberOp : EmitRust_Op<"member"> {
 // EnumRawOp
 //===----------------------------------------------------------------------===//
 
-def EmitRust_EnumRawOp : EmitRust_Op<"enum_raw"> {
+def EmitRust_EnumRawOp : EmitRust_Op<"enum_raw",
+    [DeclareOpInterfaceMethods<InferIntRangeInterface,
+                               ["inferResultRanges"]>]> {
   let summary = "Enum raw-representation place operation";
   let description = [{
     The `emitrust.enum_raw` operation refines an enum-typed lvalue into the
@@ -965,6 +980,9 @@ def EmitRust_EnumRawOp : EmitRust_Op<"enum_raw"> {
     contributes `.0` to the place expression of any load, assign, or borrow
     that consumes it. The importer uses it for C's enum/underlying-type
     pointer compatibility (`unsigned int *p = &e;`-shaped call arguments).
+
+    The operation implements `InferIntRangeInterface` conservatively: its
+    result is an lvalue, not an integer SSA value, so no range is inferred.
 
     Example:
 
@@ -1174,9 +1192,17 @@ def EmitRust_SliceOfOp : EmitRust_Op<"slice_of"> {
 // Base class for EmitRust binary arithmetic operations. Both operands and
 // the result share one type, which must be an integer, index, float, or
 // opaque type.
+// All binary arithmetic operations implement `InferIntRangeInterface` with
+// WRAP (two's-complement) transfer functions: unsigned EmitRust arithmetic
+// is emitted as Rust `wrapping_*` calls, so overflow is a defined
+// wrap-around, never poison. Signedness-dependent operations (div, rem,
+// shr) select the unsigned transfer function when the operand type is an
+// unsigned (`ui<N>`) integer and the signed one otherwise.
 class EmitRust_BinaryOp<string mnemonic, list<Trait> traits = []>
     : EmitRust_Op<mnemonic,
-                  !listconcat(traits, [SameOperandsAndResultType])> {
+                  !listconcat(traits, [SameOperandsAndResultType,
+                       DeclareOpInterfaceMethods<InferIntRangeInterface,
+                                                 ["inferResultRanges"]>])> {
   let arguments = (ins EmitRust_ArithmeticType:$lhs,
                        EmitRust_ArithmeticType:$rhs);
   let results = (outs EmitRust_ArithmeticType:$result);
@@ -1353,7 +1379,10 @@ def EmitRust_ShrOp : EmitRust_BinaryOp<"shr"> {
 // CmpOp
 //===----------------------------------------------------------------------===//
 
-def EmitRust_CmpOp : EmitRust_Op<"cmp", [SameTypeOperands]> {
+def EmitRust_CmpOp : EmitRust_Op<"cmp",
+    [SameTypeOperands,
+     DeclareOpInterfaceMethods<InferIntRangeInterface,
+                               ["inferResultRanges"]>]> {
   let summary = "Comparison operation";
   let description = [{
     The `emitrust.cmp` operation is emitted as an infix Rust comparison.
@@ -1372,6 +1401,13 @@ def EmitRust_CmpOp : EmitRust_Op<"cmp", [SameTypeOperands]> {
     `!emitrust.fn_ptr` type follow the same rule: `Option<fn(...)>` is
     `PartialEq` (a null check compares against a `None` constant) but has
     no meaningful ordering.
+
+    The operation implements `InferIntRangeInterface`: the `i1` result is
+    `[0, 1]`, refined to a constant when the operand ranges statically
+    decide the predicate. Ordered predicates compare unsigned when the
+    operand type is an unsigned (`ui<N>`) integer — Rust's `<` on `uN` is
+    the unsigned comparison — and signed otherwise. Non-integer operands
+    leave the result at `[0, 1]`.
 
     Example:
 
@@ -1401,11 +1437,20 @@ def EmitRust_CmpOp : EmitRust_Op<"cmp", [SameTypeOperands]> {
 // CastOp
 //===----------------------------------------------------------------------===//
 
-def EmitRust_CastOp : EmitRust_Op<"cast"> {
+def EmitRust_CastOp : EmitRust_Op<"cast",
+    [DeclareOpInterfaceMethods<InferIntRangeInterface,
+                               ["inferResultRanges"]>]> {
   let summary = "Cast operation";
   let description = [{
     The `emitrust.cast` operation performs an explicit type conversion and
     is emitted as a Rust `as` cast expression.
+
+    The operation implements `InferIntRangeInterface` following Rust `as`
+    semantics for integer-to-integer casts: same-width casts preserve the
+    bit pattern, narrowing casts truncate, and widening casts zero-extend
+    from an unsigned (`ui<N>`) or boolean (`i1`) source and sign-extend
+    from a signless/signed source (signless `i<N>` renders as Rust's signed
+    `iN`). Casts involving non-integer types infer the full result range.
 
     An `!emitrust.enum` source with an integer result is an enum-to-integer
     conversion: the enum's open-enum tuple-struct representation exposes
@@ -1445,7 +1490,9 @@ def EmitRust_CastOp : EmitRust_Op<"cast"> {
 //===----------------------------------------------------------------------===//
 
 def EmitRust_SelectOp : EmitRust_Op<"select",
-    [AllTypesMatch<["trueValue", "falseValue", "result"]>]> {
+    [AllTypesMatch<["trueValue", "falseValue", "result"]>,
+     DeclareOpInterfaceMethods<InferIntRangeInterface,
+                               ["inferResultRangesFromOptional"]>]> {
   let summary = "Select operation emitted as a Rust if expression";
   let description = [{
     The `emitrust.select` operation chooses between two values of the same
@@ -1453,6 +1500,11 @@ def EmitRust_SelectOp : EmitRust_Op<"select",
     the EmitRust counterpart of `arith.select`, which the canonicalizer
     synthesizes from folded conditional chains. It is emitted as a `let`
     binding of a Rust `if` expression.
+
+    The operation implements `InferIntRangeInterface` through
+    `inferResultRangesFromOptional` (mirroring `arith.select`): a
+    statically known condition forwards the matching branch's lattice
+    value, otherwise the result is the union of both branch ranges.
 
     Example:
 

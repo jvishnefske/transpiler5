@@ -130,4 +130,75 @@ def ConvertToEmitRust : Pass<"convert-to-emitrust", "ModuleOp"> {
   let dependentDialects = ["::mlir::emitrust::EmitRustDialect"];
 }
 
+//===----------------------------------------------------------------------===//
+// EmitRustRangeRefinementCheck
+//===----------------------------------------------------------------------===//
+
+// Note: this is a verification (analysis-only) pass, not a conversion, but
+// it lives in the conversion pass registry because it internally drives the
+// convert-to-emitrust pipeline and this is the project's only pass TableGen
+// file.
+def EmitRustRangeRefinementCheck
+    : Pass<"emitrust-range-refinement-check", "ModuleOp"> {
+  let summary = "Differential integer-range check across convert-to-emitrust";
+  let description = [{
+    Re-derives integer value ranges (`IntegerRangeAnalysis` over
+    `InferIntRangeInterface`) before and after the convert-to-emitrust
+    pipeline and reports a hard error when the two ranges of one observable
+    value cannot describe any common value.
+
+    Input modes:
+
+    - Primary: a plain module. The pass analyzes it, clones it, runs
+      convert-to-emitrust on the clone in a nested pass manager, analyzes
+      the clone, and compares.
+    - Secondary: a module holding exactly two nested `builtin.module` ops
+      tagged `emitrust.stage = "before"` and `emitrust.stage = "after"`.
+      The pass skips its internal conversion and compares the pair
+      directly.
+
+    Observation points are matched by (enclosing function symbol,
+    per-function occurrence index, operand index): the operands of
+    `emitrust.call_opaque "print!"` calls and the operands of function
+    return terminators (`func.return` / `emitrust.return`).
+
+    Verdict semantics: only an EMPTY INTERSECTION is an error. The
+    intersection is taken with `ConstantIntRanges`' paired unsigned
+    (umin/umax) and signed (smin/smax) bounds, and a violation is reported
+    only when it is empty under BOTH the unsigned and the signed
+    interpretation. This is the deliberately conservative choice: each
+    interpretation's bounds are sound individually, but a range constructed
+    from only one interpretation carries an artificially widened complement
+    (`fromSigned`/`fromUnsigned`), so requiring both intersections to be
+    empty is immune to one-sided widening and can never flag a pair of
+    sound ranges that share a value. A post-conversion range that merely
+    fails containment in the pre-conversion range (e.g. a memory load that
+    is TOP after conversion) is counted in a statistic but stays silent.
+    An uninitialized or absent lattice value is treated as TOP (any value),
+    which never intersects to empty.
+
+    All EmitRust transfer functions model WRAP (two's-complement) overflow
+    — unsigned arithmetic lowers to Rust `wrapping_*` — so defined
+    wrap-around in either stage never produces a false positive.
+
+    Diagnostic contract:
+
+    ```
+    error: range refinement violation: '<fn>' print operand <k> has
+    pre-conversion range [..] disjoint from post-conversion range [..]
+    error: range refinement violation: '<fn>' return value <k> has
+    pre-conversion range [..] disjoint from post-conversion range [..]
+    ```
+
+    The pass never modifies the IR; on success the module round-trips
+    unchanged.
+  }];
+  let dependentDialects = ["::mlir::emitrust::EmitRustDialect"];
+  let statistics = [
+    Statistic<"numContainmentFailures", "containment-failures",
+              "Observation points whose post-conversion range is not "
+              "contained in the pre-conversion range (not an error)">
+  ];
+}
+
 #endif // EMITRUST_CONVERSION_PASSES
