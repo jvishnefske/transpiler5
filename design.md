@@ -1007,8 +1007,8 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-18: 220 total / 213 passed / 0 miscompiled /
-7 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-18: 220 total / 215 passed / 0 miscompiled /
+5 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5/P2/P4/P6 partials, and
 CTS-S1/S2/S4/S6/P1/P5/P7/P8/R1/R2/R4/L1/L2 landed since, and the
 2026-07-18 TDD wave took 200 -> 213: unions as one-slot structs
@@ -1016,13 +1016,15 @@ CTS-S1/S2/S4/S6/P1/P5/P7/P8/R1/R2/R4/L1/L2 landed since, and the
 +00103 +00144 +00163], cell-slice global params + byte puns [+00181
 +00217], fixed-prototype variadics + sprintf [+00140 +00186], the
 StmtExpr pack [+00213 +00214], and fn-ptr devirtualization +
-global-pointer returns [+00089 +00189]). Every one of
-the 7 is a located build-time rejection — never wrong output.
-The 7 remaining are deliberately OUT of scope for that wave, each with
-a recorded reason: 00187 (FILE*/stdio streams — C99-48 scope), 00204
-(long double ABI), 00207 (VLA interacting with goto), 00209 (K&R
-unprototyped fn-ptr call — a by-design rejection), 00210
-(packed/stdcall attribute casts), 00216 (VLA + flexible array members +
+global-pointer returns [+00089 +00189]; the T1.1 ledger wave took
+213 -> 215: dead-VLA elision + constant-LHS short-circuit folding,
+byte-array union arms, and the local void* fn-ptr holder [+00207
++00210]). Every one of
+the 5 is a located build-time rejection — never wrong output.
+The 5 remaining are deliberately OUT of scope for those waves, each
+with a recorded reason: 00187 (FILE*/stdio streams — C99-48 scope),
+00204 (long double ABI), 00209 (K&R unprototyped fn-ptr call — a
+by-design rejection), 00216 (VLA + flexible array members +
 range designators), 00218 (enum-typed bit-fields — C99-45's own wave;
 its union piece landed with CTS-R3).
 This checklist partitions the original 70 by sole blocker: each item lists the
@@ -1592,6 +1594,24 @@ observed when C99-33 + C99-47 together unlocked 00215).
   pointer-arm union) stay out of scope behind located
   `unsupported: union ...` rejections (test/Import/C/unions-invalid.c);
   positive pins in test/Import/C/unions.c and test/EndToEnd/unions.c.
+  T1.1: the byte-array arm (00210's `uint16_t u; uint8_t b[2];`,
+  packed attributes in either typedef position tolerated and discarded)
+  now ADMITS at the TYPE level: the slot is the INTEGER arm regardless
+  of declaration order, the array spelling never reaches the IR, and
+  any access through the array arm is a located
+  `unsupported: union byte-array arm access` at the ACCESS site;
+  unequal-total-width array arms keep the union family rejection at the
+  union decl. Together with the local void* fn-ptr holder (a
+  never-reassigned local `void *` initialized from one known
+  non-variadic function whose every value use is an explicit cast to
+  exactly the target's signature in callee position imports as an
+  ordinary `!emitrust.fn_ptr` local — fn-address `Some(target)`
+  constant + `emitrust.call_indirect`, the cast fully peeled;
+  out-of-shape holders keep `unsupported: pointer assigned a
+  non-address value`), 00210.c flipped to PASS in the manifest.
+  (test/Import/C/union-bytearray-arm.c, union-bytearray-arm-invalid.c,
+  fnptr-void-local.c, fnptr-void-local-invalid.c,
+  test/EndToEnd/fnptr-void-local.c) 00218.c stays out of scope.
 - [x] CTS-R4 (2) Block-scope struct declarations shadowing an outer tag
   (same tag `T`, different shape, inner scope): the importer's per-name
   shape dedup misreads this as a cross-TU conflict; record keys need
@@ -1716,9 +1736,21 @@ observed when C99-33 + C99-47 together unlocked 00215).
   test/Import/C/arrays-multidim.c, pointers-local-invalid.c,
   test/EndToEnd/arrays-multidim.c)
   (00130.c, 00151.c)
-- [ ] CTS-S5 (1) Variable-length arrays: conflicts with the
+- [x] CTS-S5 (1) Variable-length arrays: conflicts with the
   deterministic/bounded design philosophy; recommend documenting as a
   permanent by-design rejection rather than implementing.
+  Landed (T1.1) as DEAD-VLA ELISION, not VLA support: an UNREFERENCED
+  local VLA whose size expression is side-effect-free is elided at
+  import — no IR, no diagnostic; the object never materializes (the
+  00207 f1 shape). Referenced VLAs, and dead VLAs whose size expression
+  has side effects (eliding would silently drop the call), keep the
+  verbatim `unsupported: non-constant array size` rejection. The same
+  wave folds a compile-time-constant short-circuit LHS before lowering
+  (`0 && printf(...)` / `1 || printf(...)` value shapes, mirroring the
+  constant-condition ternary elision — the 00207 f3 shape), flipping
+  00207.c to PASS in the manifest. General (referenced) VLAs remain a
+  permanent by-design rejection.
+  (test/Import/C/vla-dead-elision.c, vla-dead-elision-invalid.c)
   (00207.c)
 - [x] CTS-S6 (1) Integer-to-enum conversion (the reverse of C99-5):
   needed a design decision — `#[repr(i32)]` enums admit no safe `from`
