@@ -1,22 +1,13 @@
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/string-init.c 2>&1 | FileCheck %s --check-prefix=STRING
 // RUN: not emitrust-import-c %t/enum-global.c 2>&1 | FileCheck %s --check-prefix=ENUMGLOBAL
 // RUN: not emitrust-import-c %t/non-constant.c 2>&1 | FileCheck %s --check-prefix=NONCONST
 
 // C99-11 boundaries: each file below exercises one located rejection around
 // aggregate initializer lists. (Multi-dimensional arrays are supported
 // since CTS-S4; see arrays-multidim.c. Compound-literal initializers are
-// supported since C99-13; see compound-literals.c.)
-
-// `char s[] = "..."` is supported (see strings.c), but only for plain and
-// signed char arrays: an unsigned char array maps to u8 elements, which
-// the string-init lowering does not cover.
-//--- string-init.c
-int main(void) {
-  unsigned char s[4] = "abc";
-  return s[0];
-}
-// STRING: string-init.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: string literal initializer for this type
+// supported since C99-13; see compound-literals.c. String initializers on
+// plain/signed/unsigned char arrays are all supported since C99-28; see
+// strings.c and strings-invalid.c for the remaining literal rejections.)
 
 // An enum-typed global element has no typed-attribute representation.
 //--- enum-global.c

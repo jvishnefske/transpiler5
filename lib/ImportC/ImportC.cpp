@@ -65,8 +65,12 @@
 ///    arithmetic forms on row pointers (`++`, `+ n`, `+=`, difference) are
 ///    rejected. A `char *` bound to a string literal is a cursor into a
 ///    read-only region backed by an immutable local byte array holding the
-///    literal's bytes plus the terminating NUL; writes through such a
-///    region are rejected (writing a C string literal is UB). The
+///    literal's bytes plus the terminating NUL; the same backing serves
+///    literals in expression position (C99-28) — `"abc"[i]` and
+///    `*("abc" + n)` create it on demand and read through it — and every
+///    write into a literal (plain or compound assignment, ++/--, the
+///    deref spelling) is rejected by one guard on the const-marked
+///    backing (writing a C string literal is UB). The
 ///    `__func__`-family predefined identifiers (C99 6.4.2.2) carry their
 ///    function-name `StringLiteral` and take the same literal paths —
 ///    printf/puts `%s` arguments, char-pointer bindings, and string-helper
@@ -10211,15 +10215,24 @@ CImporter::emitStringArrayInit(Value place, Type type,
                                const clang::StringLiteral *literal) {
   Location loc = translateLoc(literal->getBeginLoc());
   auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(type);
-  // An ordinary literal fills a byte (i8) array; a wide literal fills a
-  // `wchar_t` (i32 on the supported targets) array, one code unit per
-  // element. u8/u/U literals have no mapped element representation.
+  // An ordinary literal fills a byte array — signless i8 for plain/signed
+  // char elements, unsigned ui8 for unsigned char elements (C99 6.7.8p14
+  // admits all three; the bytes are identical since the ASCII policy
+  // below keeps every value in 0..=127). A wide literal fills a `wchar_t`
+  // (i32 on the supported targets) array, one code unit per element.
+  // u8/u/U literals have no mapped element representation.
   if (!literal->isOrdinary() && !literal->isWide())
     return emitError(loc) << "unsupported: non-ordinary string literal "
                              "initializer";
-  Type expectedElement =
-      builder.getIntegerType(literal->isOrdinary() ? 8 : 32);
-  if (!arrayType || arrayType.getElementType() != expectedElement)
+  auto elementType =
+      arrayType ? llvm::dyn_cast<IntegerType>(arrayType.getElementType())
+                : IntegerType();
+  bool elementMatches =
+      elementType &&
+      (literal->isOrdinary()
+           ? elementType.getWidth() == 8 && !elementType.isSigned()
+           : elementType.getWidth() == 32 && elementType.isSignless());
+  if (!elementMatches)
     return emitError(loc)
            << "unsupported: string literal initializer for this type";
   // C99 6.7.8p14: successive code units of the literal (including the
@@ -10246,8 +10259,10 @@ CImporter::emitStringArrayInit(Value place, Type type,
                 loc, emitrust::LValueType::get(arrayType.getElementType()),
                 place, index)
             .getResult();
-    Value value = createIntConstant(loc, arrayType.getElementType(),
-                                    static_cast<int64_t>(byte));
+    // createScalarIntConstant covers both the signless (arith) and
+    // unsigned (emitrust.constant) element domains.
+    Value value = createScalarIntConstant(loc, arrayType.getElementType(),
+                                          static_cast<int64_t>(byte));
     if (failed(storeToPlace(loc, elementPlace, value)))
       return failure();
   }
@@ -16394,11 +16409,15 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       // base's flat cursor.
       const clang::Expr *sub = stripTrivia(cast->getSubExpr());
       if (const clang::StringLiteral *literal = underlyingStringLiteral(sub)) {
-        Value backing = literalBackings.lookup(literal);
-        if (!backing)
-          return emitError(loc) << "unsupported: pointer to a string literal";
+        // The backing is created on demand (C99-28): an anonymous decayed
+        // literal (`*("abc" + i)`, `&"abc"[i]`) is the same read-only
+        // region shape as a literal bound to a pointer variable, whose
+        // declaration created the backing ahead of this walk.
+        FailureOr<Value> backing = getOrCreateLiteralBacking(literal, loc);
+        if (failed(backing))
+          return failure();
         return PtrExprValue{nullptr, createIntConstant(loc, cursorType, 0),
-                            backing};
+                            *backing};
       }
       // A decayed block-scope compound literal (C99-13) materializes its
       // anonymous temp here — the evaluation point, which is where C
@@ -17433,7 +17452,21 @@ CImporter::emitSubscriptLValue(const clang::ArraySubscriptExpr *subscript,
       return failure();
     return emitPointerPlace(loc, *pointer, *pointeeType, writeback);
   }
-  FailureOr<Value> basePlace = emitLValue(base, writeback);
+  // A subscript directly on a string literal (`"abc"[i]`, C99-28) reads
+  // through the literal's read-only backing array — the same cached const
+  // backing a `char *` binding to the literal uses (CTS-P1), so a bound
+  // pointer and a direct subscript over one literal share storage. Writes
+  // into the backing are rejected in `storeToPlace` (writing a C string
+  // literal is UB). `__func__` element access stays rejected (C99-29).
+  FailureOr<Value> basePlace = failure();
+  if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(base)) {
+    if (!literal->isOrdinary())
+      return emitError(loc)
+             << "unsupported: subscript of a non-ordinary string literal";
+    basePlace = getOrCreateLiteralBacking(literal, loc);
+  } else {
+    basePlace = emitLValue(base, writeback);
+  }
   if (failed(basePlace))
     return failure();
   auto baseType = llvm::dyn_cast<emitrust::LValueType>((*basePlace).getType());
@@ -17537,6 +17570,18 @@ Value CImporter::loadPlace(Location loc, Value place) {
 }
 
 LogicalResult CImporter::storeToPlace(Location loc, Value place, Value value) {
+  // A place rooted (through any subscript chain) at a `const`-marked
+  // variable is a string-literal backing — the only const-marked
+  // variables the importer creates (C99-28/CTS-P1). Writing a C string
+  // literal is undefined behavior, and the backing renders as an
+  // immutable Rust binding, so every write path (assignment, compound
+  // assignment, ++/--) keeps a located rejection here.
+  Value root = place;
+  while (auto subscript = root.getDefiningOp<emitrust::SubscriptOp>())
+    root = subscript.getOperand(0);
+  if (auto variable = root.getDefiningOp<emitrust::VariableOp>())
+    if (variable.getIsConst())
+      return emitError(loc) << "unsupported: write into a string literal";
   if (auto memrefType = llvm::dyn_cast<MemRefType>(place.getType())) {
     if (value.getType() != memrefType.getElementType())
       return emitError(loc)
