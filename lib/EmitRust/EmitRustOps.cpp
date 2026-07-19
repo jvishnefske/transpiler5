@@ -899,6 +899,33 @@ LogicalResult CastOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// BitcastOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies the float/integer bit reinterpretation shape: exactly one
+/// side is a float type (f32 or f64, the widths `to_bits`/`from_bits`
+/// exist for) and the other an integer of the same bit width.
+LogicalResult BitcastOp::verify() {
+  Type source = getSource().getType();
+  Type result = getResult().getType();
+  auto floatSide = dyn_cast<FloatType>(source);
+  auto intSide = dyn_cast<IntegerType>(result);
+  if (!floatSide) {
+    floatSide = dyn_cast<FloatType>(result);
+    intSide = dyn_cast<IntegerType>(source);
+  }
+  if (!floatSide || !intSide)
+    return emitOpError(
+        "requires one float operand or result and one integer of the "
+        "same width");
+  if (!floatSide.isF32() && !floatSide.isF64())
+    return emitOpError("float side must be f32 or f64");
+  if (floatSide.getWidth() != intSide.getWidth())
+    return emitOpError("float and integer sides must have the same width");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // BreakOp / ContinueOp
 //===----------------------------------------------------------------------===//
 

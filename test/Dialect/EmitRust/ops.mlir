@@ -120,6 +120,17 @@ emitrust.func @casts(%arg0: i32) {
   emitrust.return
 }
 
+// CHECK-LABEL: emitrust.func @bitcasts
+emitrust.func @bitcasts(%arg0: f32, %arg1: ui64) {
+  // CHECK: emitrust.bitcast %{{.*}} : f32 to ui32
+  %0 = emitrust.bitcast %arg0 : f32 to ui32
+  // CHECK: emitrust.bitcast %{{.*}} : f32 to i32
+  %1 = emitrust.bitcast %arg0 : f32 to i32
+  // CHECK: emitrust.bitcast %{{.*}} : ui64 to f64
+  %2 = emitrust.bitcast %arg1 : ui64 to f64
+  emitrust.return
+}
+
 // CHECK-LABEL: emitrust.func @selects
 emitrust.func @selects(%arg0: i1, %arg1: i32, %arg2: i32, %arg3: f64,
                        %arg4: f64) {

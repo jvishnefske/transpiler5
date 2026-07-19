@@ -194,6 +194,12 @@ private:
   LogicalResult emitCmp(emitrust::CmpOp cmpOp);
   /// Emits `let vN: T = vA as T;`.
   LogicalResult emitCast(emitrust::CastOp castOp);
+  /// Emits the bit-exact float/integer reinterpretation:
+  /// `let vN: fW = fW::from_bits(vA);` for an integer-to-float bitcast,
+  /// `let vN: TInt = vA.to_bits();` for a float-to-integer one. A
+  /// signless integer side wraps the same-width (bit-preserving) `as`
+  /// conversion `from_bits`/`to_bits`'s `uW` requires.
+  LogicalResult emitBitcast(emitrust::BitcastOp bitcastOp);
   /// Emits `let vN: T = if vCond { vA } else { vB };`.
   LogicalResult emitSelect(emitrust::SelectOp selectOp);
   /// Emits an `if` statement, with `} else {` when the else region is
@@ -935,6 +941,36 @@ LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
   return success();
 }
 
+LogicalResult RustEmitter::emitBitcast(emitrust::BitcastOp bitcastOp) {
+  Operation *op = bitcastOp.getOperation();
+  Location loc = op->getLoc();
+  Type resultType = op->getResult(0).getType();
+  if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  if (auto floatType = dyn_cast<FloatType>(resultType)) {
+    // Integer-to-float: `fW::from_bits` takes `uW`, so a signless source
+    // first converts (same-width `as`, bit-preserving) to unsigned.
+    auto intType = cast<IntegerType>(op->getOperand(0).getType());
+    os << (floatType.isF32() ? "f32" : "f64") << "::from_bits(";
+    if (failed(emitOperand(loc, op->getOperand(0))))
+      return failure();
+    if (!intType.isUnsigned())
+      os << " as u" << intType.getWidth();
+    os << ");\n";
+    return success();
+  }
+  // Float-to-integer: `to_bits` yields `uW`; a signless result converts
+  // from it (same-width `as`, bit-preserving).
+  auto intType = cast<IntegerType>(resultType);
+  if (failed(emitOperand(loc, op->getOperand(0))))
+    return failure();
+  os << ".to_bits()";
+  if (!intType.isUnsigned())
+    os << " as i" << intType.getWidth();
+  os << ";\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitSelect(emitrust::SelectOp selectOp) {
   Operation *op = selectOp.getOperation();
   Location loc = op->getLoc();
@@ -1438,6 +1474,9 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
           [&](emitrust::CmpOp cmpOp) { return emitCmp(cmpOp); })
       .Case<emitrust::CastOp>(
           [&](emitrust::CastOp castOp) { return emitCast(castOp); })
+      .Case<emitrust::BitcastOp>([&](emitrust::BitcastOp bitcastOp) {
+        return emitBitcast(bitcastOp);
+      })
       .Case<emitrust::SelectOp>([&](emitrust::SelectOp selectOp) {
         return emitSelect(selectOp);
       })
