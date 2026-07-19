@@ -47,3 +47,13 @@ build-pdll/
 # Claude Code session worktrees and editor swap files
 .claude/worktrees/
 .*.swp
+
+# Nix build output symlink
+result
+
+# IDE state
+.idea/
+
+# Python bytecode from the test harnesses
+__pycache__/
+*.pyc
