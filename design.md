@@ -1305,10 +1305,18 @@ rule.
   test/EndToEnd/printf-formats.c, test/EndToEnd/strings.c,
   test/EndToEnd/printf-user-defined.c,
   test/EndToEnd/printf-user-defined-nonvariadic.c)
-- [ ] C99-48 A curated stdio/stdlib/string/math subset mapped to Rust
+- [x] C99-48 A curated stdio/stdlib/string/math subset mapped to Rust
   equivalents (putchar, puts, abs, string functions over the C99-28
   representation, math intrinsics onto f64 methods), each function
-  individually tested differentially. PARTIAL: statement-position
+  individually tested differentially. Curation complete: every function
+  below is either mapped to safe Rust over the decomposed representation
+  (no libc linkage, no unsafe) or rejected with a located diagnostic and
+  a recorded rationale; every intercept carries the `!getDefinition()`
+  guard (a project-supplied function of a curated name imports as an
+  ordinary call), and every UNCURATED libc function keeps the
+  system-header use-site rejection ("declared in a system header; not
+  part of the supported C subset"), pinned by negative tests (rand,
+  strtok, strstr, tgamma). stdio: statement-position
   `puts(s)` and `putchar(c)` are lowered by name when the project
   supplies no definition of its own (a user-defined puts/putchar stays
   an ordinary call): puts to `println!` through the %s machinery (both
@@ -1318,25 +1326,61 @@ rule.
   Rust would encode code points 128..=255 as two UTF-8 bytes, so
   non-ASCII string data is rejected at import (see C99-28/47) and the
   helpers are exact for everything that gets through. Value uses of the
-  puts/putchar result keep located rejections. Math intrinsics: a
-  definition-less call to `sin` with its standard double(double)
-  prototype lowers to `emitrust.call_opaque "f64::sin"` (both resolve to
-  the platform libm, verified differentially); a user-defined `sin`
-  stays an ordinary call, and every other math function keeps the
-  system-header rejection with a located diagnostic (the natural
-  extension point is the `hostedMathCallee` table in ImportC.cpp).
-  string.h (CTS-L1): definition-less strcpy/strncpy/strcat/memset/memcpy
-  lower by name in statement position, strcmp/strncmp/memcmp and strlen
-  in value position, and strchr/strrchr where a printf %s argument or a
-  null-pointer comparison consumes the result — each to a one-per-module
-  safe Rust helper over `&[i8]`/`&mut [i8]` slices of the argument's
-  char region (a char array, a string-literal backing, or a pointer into
-  either), so every access is a bounds-checked slice index with no
-  unsafe. Comparison helpers compare as unsigned char per C;
-  strchr/strrchr return the found index or -1 (C's NULL), which %s
+  puts/putchar result keep located rejections.
+  math.h (doubles are f64): definition-less fabs/sqrt/floor/ceil with
+  the standard double(double) prototype lower to the matching f64
+  methods (`f64::abs`/`f64::sqrt`/`f64::floor`/`f64::ceil`) — these are
+  IEEE-754-exact operations (fabs/floor/ceil exact, sqrt correctly
+  rounded), so every conforming implementation agrees bit for bit and
+  the mapping needs no libm argument at all. `sin` lowers to `f64::sin`
+  on the weaker "both sides resolve to the platform libm" argument,
+  verified differentially. exp/log/pow are REJECTED by policy with the
+  located "has no bit-exact Rust mapping" diagnostic — the recorded
+  rationale: C imposes no accuracy requirement on them (C99 F.9 makes
+  no correctness guarantee), libm implementations disagree in the last
+  bits, and rustc may constant-fold a constant argument through a
+  different libm than the differential oracle's glibc, so no
+  bit-exactness argument can be made; widening the pinned sin exception
+  was considered and declined. Every other math function keeps the
+  system-header rejection (the `hostedMathCallee` table in ImportC.cpp
+  is the extension point).
+  stdlib.h: definition-less abs/labs lower to
+  `i32::wrapping_abs`/`i64::wrapping_abs` — abs(INT_MIN)/labs(LONG_MIN)
+  is C UB (7.20.6.1p2), refined to the deterministic two's-complement
+  wrap the oracle's platform also produces (Rust's plain `abs` panics
+  only in debug profiles and was rejected as profile-dependent). atoi
+  parses its argument's char region (the strlen shapes: a char array, a
+  literal backing, or a pointer into either) through the one-per-module
+  `__emitrust_atoi` helper with C's exact 7.20.1.2 semantics: skip
+  isspace bytes, one optional sign, decimal digits to the first
+  non-digit, 0 when no digits exist (leading junk included); values out
+  of range are C UB (7.20.1p1) refined to deterministic i32 wrapping,
+  and a region ending before any terminator stops at the region end
+  (reading past the array is C UB, refined — every helper access stays
+  a bounds-checked slice index). Statement-position `exit(status)`
+  lowers to `std::process::exit(status as i32)`, matching C's
+  termination and exit-status semantics (both report the low byte on
+  this target, pinned by the exit-status differential); exit returns
+  void in C, so no value position exists. Every other stdlib function
+  (rand, strtol, qsort, general malloc/free beyond the CTS-P4
+  single-constant-size calloc/malloc carve-out, ...) keeps the
+  system-header rejection.
+  string.h (CTS-L1): definition-less strcpy/strncpy/strcat/memset/
+  memcpy/memmove lower by name in statement position, strcmp/strncmp/
+  memcmp and strlen in value position, and strchr/strrchr where a printf
+  %s argument or a null-pointer comparison consumes the result — each to
+  a one-per-module safe Rust helper over `&[i8]`/`&mut [i8]` slices of
+  the argument's char region (a char array, a string-literal backing, or
+  a pointer into either), so every access is a bounds-checked slice
+  index with no unsafe. Comparison helpers compare as unsigned char per
+  C; strchr/strrchr return the found index or -1 (C's NULL), which %s
   offsets into the region and null comparisons test directly;
   same-object memcpy borrows the array mutably once and passes both
-  cursors (`copy_within`, refining C's undefined overlap). Copy results
+  cursors (`copy_within`, refining C's undefined overlap). memmove
+  shares memcpy's lowering EXACTLY, and the mapping is exact rather than
+  a refinement: distinct char regions are distinct array objects and can
+  never overlap, and the same-object shape is `copy_within`, which IS
+  memmove's overlap-correct copy — no temporary needed. Copy results
   are statement-position only, a copy source sharing the destination's
   object, literal-region destinations, and uncurated functions (strstr,
   strtok, ...) keep located rejections; the helper namespace
@@ -1384,8 +1428,9 @@ rule.
   (test/Import/C/stdio-file.c, stdio-file-invalid.c,
   test/EndToEnd/stdio-file-roundtrip.c, 00187.c in the ledger)
   (test/Import/C/strings.c, strings-invalid.c, strings-hosted.c,
-  strings-hosted-invalid.c, math.c, test/EndToEnd/strings.c,
-  strings-hosted.c, math-sin.c)
+  strings-hosted-invalid.c, math.c, libc-subset.c,
+  libc-subset-invalid.c, test/EndToEnd/strings.c, strings-hosted.c,
+  math-sin.c, libc-subset.c)
 
 Where an item above concludes in a documented rejection (varargs
 definitions, irreducible goto, _Complex, and similar), that rejection with
