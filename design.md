@@ -875,8 +875,27 @@ rule.
   (test/Import/C/strings.c, strings-invalid.c,
   aggregate-init-invalid.c, pointers-string-literal.c,
   test/EndToEnd/strings.c, string-cursor.c)
-- [ ] C99-29 Float literal forms including hexadecimal float constants,
-  and __func__.
+- [x] C99-29 Float literal forms including hexadecimal float constants,
+  and __func__. Every float literal spelling — decimal, leading/trailing
+  dot, exponent, hexadecimal (C99 6.4.4.2), and the f/F suffixes —
+  arrives as clang's evaluated APFloat, so only the value and type
+  survive: float literals are f32 constants, double literals f64, and
+  the file-scope APValue fold (C99-11/14) is spelling-blind too. Long
+  double keeps its located builtin-type rejection under every spelling
+  (decimal or hex L suffix), rejected at the literal before any
+  narrowing cast. The `__func__`-family predefined identifiers
+  (C99 6.4.2.2, plus __FUNCTION__ and __PRETTY_FUNCTION__) carry their
+  function-name StringLiteral inside the PredefinedExpr and take the
+  C99-28 literal paths unchanged: printf/puts %s arguments lower to the
+  `emitrust.literal` string, a char-pointer binding is a read-only
+  string-literal region over the name's bytes plus the NUL, and
+  string-helper arguments (strlen, ...) slice the same backing. Located
+  rejections: any use outside those positions (element access, plain
+  value use) names the identifier, and the printf format position keeps
+  the spelled-literal requirement.
+  (test/Import/C/float-literals.c, float-literals-invalid.c,
+  func-name.c, func-name-invalid.c, test/EndToEnd/float-literals.c,
+  test/EndToEnd/func-name.c)
 
 ### Statements
 

@@ -45,7 +45,11 @@
 ///    rejected. A `char *` bound to a string literal is a cursor into a
 ///    read-only region backed by an immutable local byte array holding the
 ///    literal's bytes plus the terminating NUL; writes through such a
-///    region are rejected (writing a C string literal is UB). A region
+///    region are rejected (writing a C string literal is UB). The
+///    `__func__`-family predefined identifiers (C99 6.4.2.2) carry their
+///    function-name `StringLiteral` and take the same literal paths —
+///    printf/puts `%s` arguments, char-pointer bindings, and string-helper
+///    arguments — while any other value use is rejected. A region
 ///    that sees a null pointer constant is nullable (CTS-P8): each of its
 ///    pointers models an Option of its cursor, with the discriminant in a
 ///    promotable i1 "non-null" flag cell — `p = NULL` stores false, an
@@ -3397,6 +3401,23 @@ static const clang::Expr *stripTrivia(const clang::Expr *expr) {
   }
 }
 
+/// Returns the string literal an expression carries in a literal position:
+/// the literal itself, or the function-name literal of a `__func__`-family
+/// predefined identifier (C99 6.4.2.2 defines `__func__` as if a
+/// `static const char` array holding the function name existed; clang
+/// materializes exactly that array's contents as a `StringLiteral` inside
+/// the `PredefinedExpr`, so every literal consumer — printf `%s`, the
+/// read-only literal-region machinery — treats the two identically).
+/// Returns null for any other expression.
+static const clang::StringLiteral *
+underlyingStringLiteral(const clang::Expr *expr) {
+  if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(expr))
+    return literal;
+  if (const auto *predefined = llvm::dyn_cast<clang::PredefinedExpr>(expr))
+    return predefined->getFunctionName();
+  return nullptr;
+}
+
 /// Returns the defining declaration of `type`'s complete named enum, or
 /// null when `type` is not an enum, incomplete, or anonymous.
 static const clang::EnumDecl *namedEnumDeclOf(clang::QualType type) {
@@ -4839,11 +4860,13 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
     }
     case clang::CK_ArrayToPointerDecay: {
       // `p = arr`: the decayed array is the region base. `p = "..."`
-      // binds the literal as the region's read-only base. A decayed row
-      // of a multi-dimensional array (`q = arr[i]`) peels the subscripts
-      // to the same root.
+      // binds the literal as the region's read-only base, and
+      // `p = __func__` binds the predefined identifier's function-name
+      // literal the same way (C99-29). A decayed row of a
+      // multi-dimensional array (`q = arr[i]`) peels the subscripts to
+      // the same root.
       const clang::Expr *sub = stripTrivia(cast->getSubExpr());
-      if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(sub))
+      if (const clang::StringLiteral *literal = underlyingStringLiteral(sub))
         return addLiteralBase(ptr, literal, loc);
       while (const auto *inner =
                  llvm::dyn_cast<clang::ArraySubscriptExpr>(sub))
@@ -11853,9 +11876,13 @@ FailureOr<Value> CImporter::emitSprintf(const clang::CallExpr *call) {
 FailureOr<Value> CImporter::emitPrintfStringArg(const clang::Expr *expr) {
   // The array-to-pointer decay wrapping both supported shapes is implicit;
   // strip it (and parentheses) to see the underlying literal or lvalue.
+  // A `__func__`-family predefined identifier prints its function-name
+  // literal through the same literal path (C99-29); the check runs before
+  // the char-array branch below, which would otherwise claim the
+  // predefined identifier's `const char[N]` lvalue type.
   const clang::Expr *arg = expr->IgnoreParenImpCasts();
   Location loc = translateLoc(arg->getBeginLoc());
-  if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(arg)) {
+  if (const clang::StringLiteral *literal = underlyingStringLiteral(arg)) {
     if (!literal->isOrdinary())
       return emitError(loc)
              << "unsupported: non-ordinary string literal in printf '%s'";
@@ -12414,13 +12441,15 @@ CImporter::emitCharRegionArg(const clang::Expr *expr) {
       break;
     e = stripTrivia(cast->getSubExpr());
   }
-  // A decayed string literal argument creates (or reuses) the literal's
-  // read-only backing; unlike a literal bound to a pointer variable, this
-  // shape may appear with no pointer region referring to the literal.
+  // A decayed string literal argument — or `__func__`, whose
+  // function-name literal is the same shape (C99-29) — creates (or
+  // reuses) the literal's read-only backing; unlike a literal bound to a
+  // pointer variable, this shape may appear with no pointer region
+  // referring to the literal.
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
     if (cast->getCastKind() == clang::CK_ArrayToPointerDecay)
-      if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
-              stripTrivia(cast->getSubExpr()))) {
+      if (const clang::StringLiteral *literal =
+              underlyingStringLiteral(stripTrivia(cast->getSubExpr()))) {
         FailureOr<Value> backing = getOrCreateLiteralBacking(literal, loc);
         if (failed(backing))
           return failure();
@@ -12841,6 +12870,14 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   if (llvm::isa<clang::StringLiteral>(e))
     return emitError(loc)
            << "unsupported: string literal outside a printf format";
+  // `__func__` (and __FUNCTION__/__PRETTY_FUNCTION__) is modeled only in
+  // the string-literal positions — printf/puts '%s' arguments,
+  // char-pointer bindings, and string-helper arguments (C99-29); any
+  // other value use keeps a located rejection naming the identifier.
+  if (const auto *predefined = llvm::dyn_cast<clang::PredefinedExpr>(e))
+    return emitError(loc) << "unsupported use of '"
+                          << predefined->getIdentKindName()
+                          << "' outside a string literal position";
   return emitError(loc) << "unsupported expression: " << e->getStmtClassName();
 }
 
@@ -15915,13 +15952,14 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
     }
     case clang::CK_ArrayToPointerDecay: {
       // A decayed array is its own base at cursor 0; a decayed string
-      // literal is its read-only backing array at cursor 0 (the backing
-      // was created at the declaration of the pointer bound to it); a
-      // decayed row of a multi-dimensional array (`arr[i]` in `arr[i][j]`
-      // or `q = arr[i]`) decomposes the subscript into the base's flat
-      // cursor.
+      // literal — or `__func__`, whose function-name literal is the same
+      // shape (C99-29) — is its read-only backing array at cursor 0 (the
+      // backing was created at the declaration of the pointer bound to
+      // it); a decayed row of a multi-dimensional array (`arr[i]` in
+      // `arr[i][j]` or `q = arr[i]`) decomposes the subscript into the
+      // base's flat cursor.
       const clang::Expr *sub = stripTrivia(cast->getSubExpr());
-      if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(sub)) {
+      if (const clang::StringLiteral *literal = underlyingStringLiteral(sub)) {
         Value backing = literalBackings.lookup(literal);
         if (!backing)
           return emitError(loc) << "unsupported: pointer to a string literal";
@@ -16511,6 +16549,13 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
     if (unary->getOpcode() == clang::UO_Deref)
       return emitDerefLValue(unary, loc, writeback);
 
+  // A `__func__`-family identifier is modeled only in the string-literal
+  // positions (C99-29); an element access or other place use of the name
+  // array keeps a located rejection naming the identifier.
+  if (const auto *predefined = llvm::dyn_cast<clang::PredefinedExpr>(e))
+    return emitError(loc) << "unsupported use of '"
+                          << predefined->getIdentKindName()
+                          << "' outside a string literal position";
   return emitError(loc) << "unsupported assignable expression: "
                         << e->getStmtClassName();
 }
