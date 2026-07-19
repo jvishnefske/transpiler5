@@ -6999,6 +6999,14 @@ LogicalResult CImporter::collectRecordFields(
     }
     if (field->getName().empty())
       return emitError(fieldLoc) << "unsupported: unnamed struct member";
+    // A flexible array member (C99 6.7.2.1p16, `T tail[];`) gives the
+    // struct an allocation-time size; the fixed-shape value model has no
+    // counterpart, so it is a documented rejection (C99-17, 00216). The
+    // dedicated wording replaces the misleading generic array fallback
+    // (`unsupported: non-constant array size`) the incomplete array type
+    // would otherwise hit in mapType.
+    if (field->getType()->isIncompleteArrayType())
+      return emitError(fieldLoc) << "unsupported: flexible array member";
     // A FILE* member of a MAIN-FILE record would store an owned handle
     // inside an aggregate, which the function-local handle model does not
     // cover (C99-48); the check must precede the data-pointer cursor

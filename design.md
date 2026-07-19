@@ -686,10 +686,20 @@ rule.
 - [ ] C99-7 Type qualifiers: const (shared reference or immutable let
   mapping), volatile (likely rejected with a diagnostic by policy),
   restrict (accepted and ignored).
-- [ ] C99-8 long double (design decision needed: Rust has no extended
-  float; document a double mapping or reject).
-- [ ] C99-9 _Complex and _Imaginary (design decision needed: no native
-  Rust counterpart; likely a documented rejection).
+- [x] C99-8 long double: PERMANENT documented rejection. Rust has no
+  extended-precision float; a silent double mapping would change numeric
+  results and break the byte-exact differential oracle for printf %Lf
+  (the 00204 shape). The importer rejects with the located diagnostic
+  "unsupported builtin type 'long double'" at the first use of the type.
+  (test/Import/C/long-double-invalid.c; see also the 00204
+  PERMANENT-OUT disposition below.)
+- [x] C99-9 _Complex and _Imaginary: documented rejection — no Rust
+  counterpart. _Complex reaches the importer's type mapper and rejects
+  with the located diagnostic "unsupported type '_Complex double'";
+  _Imaginary (optional C99 Annex G, never implemented by clang) is a
+  located clang frontend rejection ("imaginary types are not supported")
+  before import begins. Both are pinned build-time errors, never silent
+  acceptance. (test/Import/C/complex-invalid.c)
 
 ### Declarations and initializers
 
@@ -770,12 +780,25 @@ rule.
   initializer required (C11 6.7.9p4, clang-enforced), initialized once at
   program start. (test/Import/C/globals.c,
   globals-static-collision.c, test/EndToEnd/globals.c)
-- [ ] C99-16 Variable-length arrays and variably modified types (design
-  decision needed: no fixed-size Rust counterpart; either a documented
-  rejection — VLAs are conditionally supported in later standards — or a
-  Vec-backed mapping).
-- [ ] C99-17 Flexible array members (design decision needed; likely
-  rejection).
+- [x] C99-16 Variable-length arrays and variably modified types:
+  documented rejection for LIVE VLAs — no fixed-size Rust counterpart,
+  and VLAs are only conditionally supported in later C standards. A
+  referenced VLA, or one whose size expression has side effects, rejects
+  with the located diagnostic "unsupported: non-constant array size" at
+  the declared variable. The sole carve-out is dead-VLA elision (landed
+  2026-07-19 for 00207): an unreferenced VLA whose size expression is
+  side-effect-free is elided at import and the rest of the function
+  imports untouched. Both sides are pinned.
+  (test/Import/C/vla-dead-elision-invalid.c rejection,
+  vla-dead-elision.c acceptance)
+- [x] C99-17 Flexible array members: documented rejection. A FAM
+  (C99 6.7.2.1p16) gives the struct an allocation-time size the
+  fixed-shape value model cannot represent (00216's first blocker). The
+  importer rejects with the dedicated located diagnostic "unsupported:
+  flexible array member" at the member — previously the shape fell
+  through to the generic "unsupported: non-constant array size" array
+  fallback. (test/Import/C/flexible-array-invalid.c; see also the 00216
+  PERMANENT-OUT disposition below.)
 - [ ] C99-18 inline functions and the C99 inline linkage rules (semantic
   no-op for the transpiler; accept and ignore).
 
@@ -1283,7 +1306,9 @@ T1.1-T1.3 machinery), not by backlog. Per-test dispositions:
   for a test whose main is `{return 0;}` and whose fn-ptr callers are
   never executed — near-zero value, declined.
 - 00216 PERMANENT-OUT: beyond its first blocker (flexible array
-  member, "00216.c:46: unsupported: non-constant array size") it
+  member, "00216.c:46:12: error: unsupported: flexible array member" —
+  the C99-17 dedicated wording that replaced the generic
+  "non-constant array size" fallback) it
   requires byte-exact struct layout INCLUDING padding (a print macro
   walks `(u8*)&x` over sizeof(x)), GCC range designators, and
   compound literals with relocations — byte-exact ABI layout is
@@ -1910,7 +1935,9 @@ observed when C99-33 + C99-47 together unlocked 00215).
   in the ratchet manifest; 00204.c clears its namespace blocker but hits
   a second unsupported construct before the predicted printf shapes:
   "00204.c:36:28: error: unsupported builtin type 'long double'" —
-  box stays unticked until long double (and then `%.Ns`/`%llx`) land.
+  and long double is now a PERMANENT documented rejection (C99-8;
+  00204 is PERMANENT-OUT per the disposition list above), so the box
+  stays unticked by final decision, not backlog.
   (00129.c, 00204.c, 00219.c)
 - [x] CTS-R6 (1) Empty structs (`struct T {};` — a GNU/C2x shape clang
   accepts): emit a unit-like Rust struct.
@@ -1919,8 +1946,9 @@ observed when C99-33 + C99-47 together unlocked 00215).
   `struct T {}` (declaration/copy/default via the usual derives;
   test/Import/C/structs-empty.c, Dialect ops.mlir, Target memory.mlir).
   00216.c stays blocked on its next feature — the flexible array member
-  `struct S s[];` rejects with "unsupported: non-constant array size"
-  (00216.c:46) — so it remains off the manifest.
+  `struct S s[];` rejects with "unsupported: flexible array member"
+  (00216.c:46:12, the C99-17 dedicated wording) — so it remains off the
+  manifest.
   (00216.c)
 
 ### Statements and expressions (10 tests)
