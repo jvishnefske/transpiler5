@@ -657,8 +657,29 @@ rule.
   first (per C) and takes the signed negation path, converting back on
   any narrowing store.
   (test/Import/C/unsigned.c, test/EndToEnd/unsigned.c)
-- [ ] C99-4 Plain char signedness policy, character constants, and
-  escape sequences.
+- [x] C99-4 Plain char signedness policy, character constants, and
+  escape sequences. POLICY: plain `char` is signed — the x86-64 Linux /
+  clang default the differential oracle uses — so Char_S maps to
+  signless i8 exactly like `signed char` (Char_U/UChar map to ui8).
+  Character constants have C type int and import as the i32 constant
+  clang evaluated: simple escapes (\n \t \0 \\ \' \"), octal (\012) and
+  hex (\x41) forms, and — under the signed-char policy — sign-extended
+  high bytes ('\xff' is -1, '\x80' stored to a char reloads as -128).
+  They work in expressions, comparisons, switch case labels (via
+  clang's constant evaluator), array subscripts, and global
+  initializers (via APValue). Wide constants (L'') are accepted as
+  their code-point value — wchar_t is int on this target, matching the
+  wide-string verbatim-code-unit policy and c-testsuite 00098 — while
+  Unicode constants (u8''/u''/U'', charN_t types outside the model) and
+  multi-character constants ('ab', implementation-defined value) are
+  rejected with located diagnostics; a multibyte source character
+  ('é') never reaches the importer — clang rejects it first. String
+  literal escapes ride the existing C99-28 per-byte machinery (clang
+  decodes them before import): all standard escapes including \a \b \f
+  \v \r round-trip byte-identically; embedded NUL and the ASCII-only
+  rejection of non-ASCII bytes are unchanged.
+  (test/Import/C/char-constants.c, char-constants-invalid.c,
+  test/EndToEnd/char-constants.c)
 - [x] C99-5 Enumerations: enum definitions, enumerator constants in
   expressions and case labels, mapped to a distinct nominal Rust type per
   enum rather than bare integer constants; enum-to-int conversions

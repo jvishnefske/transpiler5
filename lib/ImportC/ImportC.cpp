@@ -17,6 +17,13 @@
 ///    `cf.cond_br`, and `switch` becomes a `cf.switch` over one block per
 ///    label position, so that `--mem2reg --lift-cf-to-scf` downstream
 ///    recovers clean structured IR.
+///  - Plain `char` is signed (the x86-64 Linux / clang default the
+///    differential oracle uses) and maps to signless i8 exactly like
+///    `signed char` (C99-4). Ordinary and wide character constants are
+///    int-typed rvalues importing as the value clang evaluated —
+///    escapes included, with high bytes sign-extended ('\xff' is -1) —
+///    while Unicode (u8''/u''/U'') and multi-character constants are
+///    rejected with located diagnostics.
 ///  - Aggregates and pointers use EmitRust place operations, which are
 ///    opaque to upstream passes: struct and array locals are
 ///    `emitrust.variable`, field access is `emitrust.member`, indexing is
@@ -12831,11 +12838,37 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
         .getResult();
   }
   if (const auto *literal = llvm::dyn_cast<clang::CharacterLiteral>(e)) {
+    // C99-4 plain-char policy: ordinary character constants have C type
+    // int and import as the value clang evaluated; because plain char is
+    // signed on the x86-64 Linux target the differential oracle uses, a
+    // high-byte constant ('\xff') is stored sign-extended (0xFFFFFFFF,
+    // i.e. -1). A wide constant (L'') is also just an int-typed rvalue —
+    // wchar_t is int on this target — and imports as its code-point
+    // value, matching the wide-string policy of carrying code units
+    // verbatim. Unicode constants (u8''/u''/U'') carry charN_t types
+    // outside the model and stay rejected.
+    clang::CharacterLiteralKind kind = literal->getKind();
+    if (kind != clang::CharacterLiteralKind::Ascii &&
+        kind != clang::CharacterLiteralKind::Wide)
+      return emitError(loc)
+             << "unsupported: Unicode character constant (u8'', u'', U'')";
+    uint32_t raw = literal->getValue();
+    if (kind == clang::CharacterLiteralKind::Ascii) {
+      // An ordinary constant must be a single byte: a value in [0,255]
+      // or a sign-extended high byte. Anything else is a
+      // multi-character constant ('ab'), whose value is
+      // implementation-defined and rejected rather than pinned.
+      bool singleByte = raw <= 0xFF || (raw & 0xFFFFFF00u) == 0xFFFFFF00u;
+      if (!singleByte)
+        return emitError(loc) << "unsupported: multi-character constant";
+    }
     FailureOr<Type> type = mapType(e->getType(), loc);
     if (failed(type))
       return failure();
+    // Materialize the (possibly negative) int-typed value, sign-extended
+    // from the stored 32-bit pattern.
     return createIntConstant(loc, *type,
-                             static_cast<int64_t>(literal->getValue()));
+                             static_cast<int64_t>(static_cast<int32_t>(raw)));
   }
   if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
     return emitCast(cast);
