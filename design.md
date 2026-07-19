@@ -1112,10 +1112,28 @@ over backing runs + keyword-member mangling [+00218]; the T1.3 wave
 took 216 -> 217: FILE* as an owned std::fs handle — fopen/fread/
 fwrite/fgetc/fgets/fclose, the C99-48 stdio slice [+00187]). Every one
 of the 3 is a located build-time rejection — never wrong output.
-The 3 remaining are deliberately OUT of scope for those waves, each
-with a recorded reason: 00204 (long double ABI), 00209 (K&R
-unprototyped fn-ptr call — a by-design rejection), 00216 (VLA +
-flexible array members + range designators).
+The 3 remaining are FINAL: 217/220 is this project's ceiling by
+explicit decision (2026-07-18 survey, re-verified against the landed
+T1.1-T1.3 machinery), not by backlog. Per-test dispositions:
+- 00204 PERMANENT-OUT: the long-double diagnostic
+  ("00204.c:36:28: error: unsupported builtin type 'long double'") is
+  only the surface blocker — the fatal construct is a hand-rolled
+  variadic reading `va_arg(ap, struct s7)` / `va_arg(ap, struct hfa34)`
+  (struct-typed varargs / HFA calling convention), fundamentally
+  outside the fixed-prototype variadic model and safe-Rust emission.
+- 00209 UPHELD by-design rejection ("00209.c:24:10: error:
+  unsupported: call with arguments through a function pointer without
+  a prototype"): the K&R `int (*)()` call is ABI-unverifiable at
+  import; overturning it would require callsite-prototype inference
+  for a test whose main is `{return 0;}` and whose fn-ptr callers are
+  never executed — near-zero value, declined.
+- 00216 PERMANENT-OUT: beyond its first blocker (flexible array
+  member, "00216.c:46: unsupported: non-constant array size") it
+  requires byte-exact struct layout INCLUDING padding (a print macro
+  walks `(u8*)&x` over sizeof(x)), GCC range designators, and
+  compound literals with relocations — byte-exact ABI layout is
+  antithetical to the project's safe-Rust value model (the same reason
+  bit-field layout is deliberately non-ABI, see C99-45).
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
 checkbox discipline as above — tick only when the referenced tests pass
