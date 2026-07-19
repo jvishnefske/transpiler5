@@ -397,6 +397,68 @@ lists the lit test file(s) that validate it.
   fuzz-smoke.c carries a second RUN line (seeds 1-6, --range-check)
   guarding the wiring inside check-emitrust.
 
+  Pipeline-level differential CONCRETE interpretation (landed): the
+  emitrust-value-identity-check pass is the value-identity sibling of the
+  range checker, sharing its two-stage input scaffold (primary mode:
+  interpret the input module, clone it, run convert-to-emitrust on the
+  clone in a nested pass manager, interpret the clone; secondary mode:
+  two nested builtin.module ops tagged emitrust.stage = "before"/"after"
+  compared directly — the mode detection and clone-and-convert step are
+  factored into DifferentialStages.h so the two checkers cannot drift).
+  Entry points are the parameterless functions of the pre-conversion
+  stage (in practice c_main and parameterless helpers); each is
+  interpreted independently by a bounded environment-based evaluator
+  (integers as APInt keyed by SSA value; emitrust.let and scalar
+  emitrust.variable results are mutable slots that later reads observe;
+  fresh frame per func.call / resolved call_opaque, call depth capped).
+  Observations — every emitrust.call_opaque "print!" operand and every
+  executed return operand, callees included — are recorded in execution
+  order and compared pairwise; the first divergence per entry point is a
+  located hard error with values in signed decimal: "value identity
+  violation: '<fn>' print operand <k> (or return value <k>) at
+  occurrence <n> observed <a> pre-conversion but <b> post-conversion".
+
+  Coverage/skip semantics: the interpreted op set is deliberately
+  bounded — arith integer ops, scf.if/while/for/index_switch with
+  yields, cf.br/cond_br, emitrust
+  constant/cast/cmp/binaries/select/let/assign/load + scalar variables,
+  emitrust if/loop/for/switch/break/continue, calls into module
+  functions (a post-conversion call_opaque callee is resolved against
+  the module symbol table FIRST; only an unresolvable non-"print!"
+  callee is unsupported). Reaching anything else — subscripts, members,
+  cells, globals, floats, opaque constants, FILE helpers, an exhausted
+  step budget (10M steps; a 4096-iteration loop verifies comfortably,
+  test/Conversion/value-identity/positive-loop-budget.mlir) — SOFT-SKIPS
+  that entry point silently: no diagnostic, the pass succeeds, only the
+  skipped-entry-points statistic counts it (compiled out of release
+  builds like all llvm::Statistic). Poison policy: ub.poison
+  materializes a poison marker that may flow through rebindings and
+  stores, but an entry point that actually EVALUATES poison (arithmetic,
+  comparison, branching, or an observation) is soft-skipped —
+  interpreting poison as the zero the conversion folds it to would
+  vacuously "verify" programs whose pre-conversion behavior is
+  undefined.
+
+  Honest complementarity statement: this mode executes one concrete run
+  per entry point, so unlike the range checker it proves nothing about
+  other inputs — but parameterless entry points have exactly one run,
+  and over that run it compares exact VALUES, which the range checker
+  structurally cannot. It therefore DOES catch the lost-copy class the
+  range checker is blind to: two values with identical (TOP) ranges
+  where conversion observes the wrong one — the yield-rebinding swap
+  shape of the project's worst historical miscompile
+  (test/Conversion/value-identity/negative-value-swap.mlir pins the
+  swapped-print shape, negative-return.mlir the intersecting-range
+  wrong-return shape that the range checker provably ignores;
+  positive-identical.mlir, positive-skip.mlir, positive-loop-budget.mlir
+  pin the pass/skip semantics). Coverage probe over real post-lift
+  modules (emitrust-import-c + mem2reg/canonicalize/lift-cf-to-scf/
+  canonicalize on EndToEnd sources): loops, lostcopy-min,
+  lostcopy-rotations, recursion — 8 of 8 entry points verified (up to
+  111 observation events each); value-exprs — both entry points
+  soft-skipped (array subscript places are outside the scalar-slot
+  coverage), exactly the honesty the skip statistic is for.
+
 - [x] FR-25 Generality beyond test vectors: an adversarial audit plus
   differential stress run over shapes absent from the original tests
   (negative/sparse/INT_MAX-adjacent case labels, nested switch, default

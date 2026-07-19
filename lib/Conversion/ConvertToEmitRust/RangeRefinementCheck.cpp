@@ -22,6 +22,7 @@
 
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 
+#include "DifferentialStages.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/EmitRustOps.h"
 #include "mlir/Analysis/DataFlow/IntegerRangeAnalysis.h"
@@ -153,43 +154,26 @@ struct EmitRustRangeRefinementCheck
 
     // Secondary mode: exactly two nested modules tagged with
     // emitrust.stage = "before" / "after".
-    ModuleOp before;
-    ModuleOp after;
-    unsigned stagedCount = 0;
-    for (Operation &op : module.getBody()->getOperations()) {
-      auto nested = dyn_cast<ModuleOp>(op);
-      if (!nested)
-        continue;
-      auto stage = nested->getAttrOfType<StringAttr>("emitrust.stage");
-      if (!stage)
-        continue;
-      ++stagedCount;
-      if (stage.getValue() == "before")
-        before = nested;
-      else if (stage.getValue() == "after")
-        after = nested;
-    }
+    std::optional<StagedModulePair> staged = detectStagedModulePair(module);
 
     ObservationMap preObservations;
     ObservationMap postObservations;
-    if (stagedCount == 2 && before && after) {
-      if (failed(analyzeStage(before, preObservations)) ||
-          failed(analyzeStage(after, postObservations)))
+    if (staged) {
+      if (failed(analyzeStage(staged->before, preObservations)) ||
+          failed(analyzeStage(staged->after, postObservations)))
         return signalPassFailure();
     } else {
       // Primary mode: analyze the input, then convert a clone and analyze
       // the result.
       if (failed(analyzeStage(module, preObservations)))
         return signalPassFailure();
-      OwningOpRef<ModuleOp> converted(module.clone());
-      PassManager pipeline(&getContext(), ModuleOp::getOperationName());
-      pipeline.addPass(createConvertToEmitRust());
-      if (failed(pipeline.run(*converted))) {
+      FailureOr<OwningOpRef<ModuleOp>> converted = cloneAndConvert(module);
+      if (failed(converted)) {
         module.emitError("range refinement check: internal "
                          "convert-to-emitrust pipeline failed");
         return signalPassFailure();
       }
-      if (failed(analyzeStage(*converted, postObservations)))
+      if (failed(analyzeStage(**converted, postObservations)))
         return signalPassFailure();
     }
 
