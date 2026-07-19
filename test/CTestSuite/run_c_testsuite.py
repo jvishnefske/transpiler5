@@ -229,7 +229,12 @@ def run_single_test(tool, source_path, workdir):
         with open(expected_path, "rb") as handle:
             expected = handle.read()
 
-    rc, stdout, stderr, timed_out = run_command([binary], RUN_TIMEOUT)
+    # Run inside the per-test crate directory so tests that create scratch
+    # files (e.g. 00187.c's fred.txt) stay hermetic instead of writing into
+    # the invoker's working directory. The binary path must be absolute
+    # because the child's working directory is no longer the invoker's.
+    rc, stdout, stderr, timed_out = run_command([os.path.abspath(binary)],
+                                                RUN_TIMEOUT, cwd=crate_dir)
     if timed_out:
         return name, MISCOMPILE, "binary timed out after %ss" % RUN_TIMEOUT
     if rc != 0:
