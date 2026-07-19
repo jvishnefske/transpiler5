@@ -683,9 +683,39 @@ rule.
   dedup, while a bare anonymous struct stays rejected with a located
   diagnostic. (test/Import/C/typedefs.c, structs-anon-typedef.c,
   test/EndToEnd/fn-pointers.c)
-- [ ] C99-7 Type qualifiers: const (shared reference or immutable let
-  mapping), volatile (likely rejected with a diagnostic by policy),
-  restrict (accepted and ignored).
+- [x] C99-7 Type qualifiers. const maps positionally: a never-written
+  const global (scalar or array) imports as a const-marked
+  emitrust.global (an immutable Rust static; `static const` locals join
+  via their mangled module global), string-literal backings are
+  const-marked variables (immutable lets), const-qualified locals keep
+  the ordinary variable/alloca lowering (writing through a const lvalue
+  is already a clang frontend error, and mem2reg renders scalar SSA
+  forms as immutable lets), a const value parameter is an ordinary
+  by-value scalar, a const pointee (`const int *p`) classifies exactly
+  like its unqualified spelling (mut_ref, slice, or cell-slice per the
+  region analysis), and qualification-only pointer casts that add or
+  drop const stay transparent (CTS-P2 peeling). volatile is rejected by
+  policy with a located "unsupported: volatile-qualified type" wherever
+  a declared type carries it at any level — locals, globals, parameter
+  pointee chains, struct fields, return types (deep scan
+  `hasVolatileQualifier`, plus checks in mapType, mapParamType,
+  mapStructFieldType, emitLocalVar, and createGlobal) — and a cast that
+  introduces a volatile pointee refuses the qualification peel so the
+  site keeps a located rejection. Exception (c-testsuite 00162):
+  qualifiers on a parameter OBJECT itself (`volatile int v`,
+  `int x[volatile 5]`, which adjusts to `int * volatile x`) are
+  body-local, never part of the function type, and accepted-and-ignored.
+  restrict is accepted and ignored everywhere (a pure aliasing hint; the
+  pointer region analysis is stricter than restrict), so
+  restrict-qualified parameters import identically to unqualified ones.
+  _Atomic is rejected with a located
+  "unsupported: _Atomic-qualified type". Pre-existing const limits
+  unchanged: struct- and fn_ptr-typed const globals keep the Cell
+  representation (the GlobalOp const marker is scalar/array only), and a
+  const global array argument to a pointer parameter keeps the CTS-P10
+  located rejection (cell-slice classes require mutable global bases).
+  (test/Import/C/qualifiers.c, qualifiers-invalid.c,
+  test/EndToEnd/qualifiers.c)
 - [ ] C99-8 long double (design decision needed: Rust has no extended
   float; document a double mapping or reject).
 - [ ] C99-9 _Complex and _Imaginary (design decision needed: no native
