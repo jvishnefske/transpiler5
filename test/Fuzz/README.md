@@ -39,9 +39,29 @@ Python's %-formatting reproduces for these argument ranges).
   local void* holder with cast-calls, global-return chains,
   int-carrier/expect/missing-return, writeback ordering with RHS/index
   calls mutating a distinct subobject of the assigned global, C99-45
-  bit-fields with mixed runs and sign/zero extension, and C99-48 FILE*
-  round-trip I/O) modeled directly on the test/EndToEnd/*.c executable
-  spec. Three templates also sprinkle dead, unreferenced VLA
+  bit-fields with mixed runs and sign/zero extension, C99-48 FILE*
+  round-trip I/O, C99-13 compound literals in expression position with
+  the loop re-zero rule, C99-4/28 signed plain-char semantics with the
+  full escape set and string-literal expression reads, the C99-48
+  curated libc subset (string.h/memory ops, abs, atoi, IEEE-exact math
+  observed via %f on exactly-representable values; exit() is omitted so
+  the digest chain never truncates), and C99-44 float puns observed
+  exclusively through their BITS via integer arms — never %f — with all
+  values in the normal range, so struct.pack keeps the evaluator exact
+  and no x87 excess-precision concern arises on the SSE native leg)
+  modeled directly on the test/EndToEnd/*.c executable spec.
+
+  printf format coverage: the sprintf matrix includes the C99-47
+  grammar growth (`%+d`, `% d`, `%#x`, `%#o`, precision `%.5d`/`%.0d`,
+  `h`/`hh`/`ll` lengths, runtime `%.Ns`) with hand-rolled exact
+  evaluator arms where Python %-formatting diverges from glibc (`%#o`,
+  `%#x` of 0, `%.0d` of 0). `%e`/`%g` ARE generated, but only over a
+  curated double pool (2.5, -0.75, 144.0, 0.03125) that was verified
+  byte-identical between Python and glibc during v5 bring-up; broader
+  float formatting (arbitrary values, `%f`/`%E`/`%G` width games) stays
+  deferred to the test/EndToEnd/printf-formats.c parity pins. The
+  0-flag+precision combo (e.g. `%010.5d`) is deliberately not generated:
+  Python pads it differently than glibc. Three templates also sprinkle dead, unreferenced VLA
   declarations with side-effect-free sizes: the importer must elide
   them, and any effect on output is a bug the differ catches.
 

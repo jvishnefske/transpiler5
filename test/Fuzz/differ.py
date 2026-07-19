@@ -169,8 +169,11 @@ def run_pair(emitrust_cc, clang, source_path, workdir, expected=None, range_chec
     crate_name = sanitize_crate_binary_name(stem)
 
     native_binary = os.path.join(workdir, "native")
+    # -lm is load-bearing for the libc_subset template's sqrt/floor/ceil
+    # calls (whether clang folds them varies with the environment) and
+    # harmless otherwise.
     rc, _stdout, stderr, timed_out = run_command(
-        [clang, "-std=c11", "-w", source_path, "-o", native_binary],
+        [clang, "-std=c11", "-w", source_path, "-o", native_binary, "-lm"],
         TRANSPILE_BUILD_TIMEOUT,
     )
     if timed_out or rc != 0:
