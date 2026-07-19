@@ -301,6 +301,27 @@
 ///    ignored everywhere (an aliasing hint; the region analysis is
 ///    stricter). _Atomic is rejected with a located
 ///    "unsupported: _Atomic-qualified type".
+///  - Hosted libc subset (C99-48): a curated set of definition-less libc
+///    calls lowers by name to safe Rust — never to libc linkage — and
+///    every intercept carries a `!getDefinition()` guard, so a
+///    user-defined function of the same name imports as an ordinary
+///    call. stdio: printf/puts/putchar/sprintf through the shared format
+///    grammar, plus the owned FILE* slice (fopen/fgetc/fread/fwrite/
+///    fgets/fclose). string.h: strlen/strcmp/strncmp/memcmp/strchr/
+///    strrchr in value position and strcpy/strncpy/strcat/memset/memcpy/
+///    memmove in statement position, each a one-per-module
+///    `__emitrust_*` helper over bounds-checked i8 slices of the
+///    argument's char region (memmove shares memcpy's lowering: distinct
+///    regions never overlap and the same-object shape is `copy_within`,
+///    which IS memmove). stdlib.h: abs/labs onto `wrapping_abs` (the
+///    INT_MIN wrap deterministically refines C UB), atoi as an exact C
+///    parse over a char region (`__emitrust_atoi`), and
+///    statement-position exit onto `std::process::exit`. math.h: the
+///    IEEE-exact fabs/sqrt/floor/ceil onto the matching f64 methods,
+///    plus the differentially pinned sin; exp/log/pow are rejected by
+///    policy with a located diagnostic (no accuracy mandate in C, libm
+///    implementations disagree). Every uncurated libc function keeps the
+///    system-header use-site rejection.
 ///
 /// The importer is a functional core (the `CImporter` class below, which
 /// owns the builder and per-function symbol table) driven by the imperative
@@ -2279,14 +2300,41 @@ private:
   /// slice from its cursor, the fill byte as i32, the count as i64.
   LogicalResult emitMemsetCall(const clang::CallExpr *call);
 
-  /// Lowers a statement-position `memcpy(dst, src, n)` call. Distinct base
-  /// objects (or a literal source) borrow two slices for the
-  /// `__emitrust_memcpy` helper; both arguments rooted in the same base
-  /// object would alias a mutable borrow, so that shape takes one mutable
-  /// borrow of the whole array plus both cursors through the
-  /// `__emitrust_memcpy_within` helper (`copy_within`, whose memmove
-  /// semantics refine C's undefined overlapping memcpy).
-  LogicalResult emitMemcpyCall(const clang::CallExpr *call);
+  /// Lowers a statement-position `memcpy(dst, src, n)` or
+  /// `memmove(dst, src, n)` call (C name in `name`, diagnostics only —
+  /// the lowering is shared and exact for both). Distinct base objects
+  /// (or a literal source) borrow two slices for the `__emitrust_memcpy`
+  /// helper — distinct char regions never overlap, so memmove's
+  /// overlap-safety is vacuous there; both arguments rooted in the same
+  /// base object would alias a mutable borrow, so that shape takes one
+  /// mutable borrow of the whole array plus both cursors through the
+  /// `__emitrust_memcpy_within` helper (`copy_within`, exactly memmove's
+  /// overlap-correct semantics, which also refine C's undefined
+  /// overlapping memcpy).
+  LogicalResult emitMemcpyCall(const clang::CallExpr *call,
+                               llvm::StringRef name);
+
+  /// Lowers a value-position call to a definition-less `atoi`: the
+  /// argument's char region is borrowed as a shared byte slice from its
+  /// cursor and parsed by the `__emitrust_atoi` helper with C's exact
+  /// semantics (skip isspace, one optional sign, decimal digits to the
+  /// first non-digit; no digits yields 0). Out-of-range values are C UB
+  /// (7.20.1p1), refined to deterministic i32 wrapping.
+  FailureOr<Value> emitAtoiCall(const clang::CallExpr *call);
+
+  /// Lowers a value-position call to a definition-less `abs` (i32) or
+  /// `labs` (i64, `isLong`) to `iN::wrapping_abs`. C leaves
+  /// abs(INT_MIN)/labs(LONG_MIN) undefined (7.20.6.1p2); wrapping_abs
+  /// refines that to the deterministic two's-complement result the
+  /// differential oracle's platform also produces.
+  FailureOr<Value> emitAbsCall(const clang::CallExpr *call, bool isLong);
+
+  /// Lowers a statement-position `exit(status)` call to
+  /// `std::process::exit(status as i32)`, matching C's process
+  /// termination and exit-status semantics (both truncate to the OS's
+  /// low byte on this target). Statement position only: exit returns
+  /// void in C, so no value use exists to represent.
+  LogicalResult emitExitCall(const clang::CallExpr *call);
 
   /// Lowers a value-position `strcmp`/`strncmp`/`memcmp` call (C name in
   /// `name`; `hasCount` for the n-limited forms) to the matching helper
@@ -2508,9 +2556,12 @@ private:
   LogicalResult emitPutchar(const clang::CallExpr *call);
 
   /// Maps a hosted `<math.h>` function name to the safe Rust callable it
-  /// lowers to (design.md C99-48; currently exactly `sin` -> `f64::sin`).
-  /// Returns std::nullopt for every other name, which keeps the
-  /// system-header rejection in `emitCall`.
+  /// lowers to (design.md C99-48): the IEEE-exact fabs/sqrt/floor/ceil
+  /// onto the matching f64 methods, plus the differentially pinned
+  /// `sin` -> `f64::sin`. Returns std::nullopt for every other name,
+  /// which keeps the located rejections in `emitCall` (a curated
+  /// non-bit-exact diagnostic for exp/log/pow, the system-header
+  /// rejection otherwise).
   static std::optional<llvm::StringRef>
   hostedMathCallee(llvm::StringRef name);
 
@@ -9272,6 +9323,39 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "i64) {\n"
        "    s.copy_within(src as usize..(src + n) as usize, dst as usize);\n"
        "}"},
+      {"__emitrust_atoi",
+       // C's atoi (7.20.1.2): skip isspace bytes (space and 0x09..0x0D),
+       // one optional sign, then decimal digits to the first non-digit;
+       // no digits yields 0. The accumulator counts downward so INT_MIN
+       // parses exactly, and out-of-range values — C UB (7.20.1p1) — are
+       // refined to deterministic i32 wrapping. A region with neither a
+       // NUL nor a non-digit before its end simply stops at the end
+       // (reading past the array is C UB, refined).
+       "fn __emitrust_atoi(s: &[i8]) -> i32 {\n"
+       "    let mut i = 0usize;\n"
+       "    while i < s.len() {\n"
+       "        let b = s[i] as u8;\n"
+       "        if b != b' ' && (b < 9 || b > 13) { break; }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    let mut neg = false;\n"
+       "    if i < s.len() {\n"
+       "        let b = s[i] as u8;\n"
+       "        if b == b'+' || b == b'-' {\n"
+       "            neg = b == b'-';\n"
+       "            i += 1;\n"
+       "        }\n"
+       "    }\n"
+       "    let mut acc: i32 = 0;\n"
+       "    while i < s.len() {\n"
+       "        let b = s[i] as u8;\n"
+       "        if b < b'0' || b > b'9' { break; }\n"
+       "        acc = acc.wrapping_mul(10).wrapping_sub((b - b'0') as "
+       "i32);\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    if neg { acc } else { acc.wrapping_neg() }\n"
+       "}"},
       {"__emitrust_memcmp",
        "fn __emitrust_memcmp(a: &[i8], b: &[i8], n: i64) -> i32 {\n"
        "    let mut i = 0usize;\n"
@@ -11868,7 +11952,16 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
       if (name == "memset")
         return emitMemsetCall(call);
       if (name == "memcpy")
-        return emitMemcpyCall(call);
+        return emitMemcpyCall(call, "memcpy");
+      // memmove shares memcpy's lowering exactly: distinct char regions
+      // never overlap, and the same-object shape already goes through
+      // `copy_within`, which is memmove's overlap-correct copy.
+      if (name == "memmove")
+        return emitMemcpyCall(call, "memmove");
+      // A statement-position `exit(status)` terminates the process with
+      // C's exit-status semantics (design.md C99-48).
+      if (name == "exit")
+        return emitExitCall(call);
     }
   }
   // A statement-position call through a devirtualized alias of a hosted
@@ -12957,11 +13050,12 @@ LogicalResult CImporter::emitMemsetCall(const clang::CallExpr *call) {
   return success();
 }
 
-LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call) {
+LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
+                                        llvm::StringRef name) {
   Location loc = translateLoc(call->getBeginLoc());
   if (call->getNumArgs() != 3)
     return emitError(loc)
-           << "unsupported: memcpy requires exactly 3 arguments";
+           << "unsupported: " << name << " requires exactly 3 arguments";
   FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
   if (failed(dst))
     return failure();
@@ -12972,7 +13066,7 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call) {
   if (failed(n))
     return failure();
   if (!llvm::isa<IntegerType>((*n).getType()))
-    return emitError(loc) << "unsupported: memcpy count type";
+    return emitError(loc) << "unsupported: " << name << " count type";
   Value count = castToIntType(loc, *n, builder.getIntegerType(64));
   if (dst->base && dst->base == src->base) {
     // Both arguments point into the same object: two slice borrows would
@@ -13140,8 +13234,19 @@ LogicalResult CImporter::emitPutchar(const clang::CallExpr *call) {
 
 std::optional<llvm::StringRef>
 CImporter::hostedMathCallee(llvm::StringRef name) {
+  // fabs/sqrt/floor/ceil are IEEE-754-exact (fabs/floor/ceil are exact
+  // operations, sqrt is correctly rounded), so every conforming
+  // implementation — glibc, Rust's f64 methods, LLVM's constant folder —
+  // agrees bit for bit. sin carries no such mandate; it is accepted on
+  // the weaker "both sides resolve to the platform libm" argument,
+  // pinned differentially (design.md C99-48). exp/log/pow stay rejected
+  // (see emitCall) rather than widening that exception.
   return llvm::StringSwitch<std::optional<llvm::StringRef>>(name)
       .Case("sin", "f64::sin")
+      .Case("fabs", "f64::abs")
+      .Case("sqrt", "f64::sqrt")
+      .Case("floor", "f64::floor")
+      .Case("ceil", "f64::ceil")
       .Default(std::nullopt);
 }
 
@@ -13163,6 +13268,88 @@ FailureOr<Value> CImporter::emitHostedMathCall(const clang::CallExpr *call,
           builder.getStringAttr(rustCallee),
           /*args=*/ArrayAttr(), ValueRange{*argument})
       .getResult(0);
+}
+
+FailureOr<Value> CImporter::emitAbsCall(const clang::CallExpr *call,
+                                        bool isLong) {
+  Location loc = translateLoc(call->getBeginLoc());
+  llvm::StringRef name = isLong ? "labs" : "abs";
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: " << name << " requires exactly one argument";
+  FailureOr<Value> value = emitRValue(call->getArg(0));
+  if (failed(value))
+    return failure();
+  if (!llvm::isa<IntegerType>((*value).getType()))
+    return emitError(loc)
+           << "unsupported: " << name << " argument must be an integer";
+  // The prototype has already converted the argument to int/long;
+  // normalize the width anyway (a K&R-style declaration may differ).
+  IntegerType intType = builder.getIntegerType(isLong ? 64 : 32);
+  Value argument = castToIntType(loc, *value, intType);
+  // wrapping_abs: abs(INT_MIN)/labs(LONG_MIN) is C UB (7.20.6.1p2),
+  // refined to the deterministic two's-complement wrap the differential
+  // oracle's platform also produces; Rust's plain `abs` would panic only
+  // in debug builds and is rejected as non-deterministic across profiles.
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{intType},
+          builder.getStringAttr(isLong ? "i64::wrapping_abs"
+                                       : "i32::wrapping_abs"),
+          /*args=*/ArrayAttr(), ValueRange{argument})
+      .getResult(0);
+}
+
+FailureOr<Value> CImporter::emitAtoiCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: atoi requires exactly one argument";
+  FailureOr<PtrExprValue> pointer = emitCharRegionArg(call->getArg(0));
+  if (failed(pointer))
+    return failure();
+  FailureOr<Value> slice =
+      emitCharRegionSlice(loc, *pointer, /*isMut=*/false);
+  if (failed(slice))
+    return failure();
+  requestStringHelper("__emitrust_atoi");
+  Value parsed =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{builder.getI32Type()},
+              builder.getStringAttr("__emitrust_atoi"),
+              /*args=*/ArrayAttr(), ValueRange{*slice})
+          .getResult(0);
+  // atoi returns int; convert to the call's declared result type in case
+  // a K&R-style declaration says otherwise (matching emitStrlenCall).
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+  if (!intType)
+    return emitError(loc) << "unsupported: atoi result type";
+  return castToIntType(loc, parsed, intType);
+}
+
+LogicalResult CImporter::emitExitCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: exit requires exactly one argument";
+  FailureOr<Value> status = emitRValue(call->getArg(0));
+  if (failed(status))
+    return failure();
+  if (!llvm::isa<IntegerType>((*status).getType()))
+    return emitError(loc)
+           << "unsupported: exit status must be an integer";
+  Value code = castToIntType(loc, *status, builder.getI32Type());
+  // `std::process::exit` terminates with the given status like C's exit;
+  // both report the low byte to the OS on this target. Its `!` result
+  // needs no representation — the call is statement-position only.
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("std::process::exit"),
+      /*args=*/ArrayAttr(), ValueRange{code});
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -14792,9 +14979,30 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     if (name == "memcmp")
       return emitStringCompareCall(call, "memcmp", /*hasCount=*/true);
     if (name == "strcpy" || name == "strncpy" || name == "strcat" ||
-        name == "memset" || name == "memcpy")
+        name == "memset" || name == "memcpy" || name == "memmove")
       return emitError(loc) << "unsupported: " << name
                             << " return value must be unused";
+    // Hosted <stdlib.h> value-position surface (design.md C99-48):
+    // abs/labs onto wrapping_abs, atoi as an exact C parse over the
+    // argument's char region. A user-defined function of any of these
+    // names is an ordinary call (the getDefinition guard above).
+    if (name == "abs")
+      return emitAbsCall(call, /*isLong=*/false);
+    if (name == "labs")
+      return emitAbsCall(call, /*isLong=*/true);
+    if (name == "atoi")
+      return emitAtoiCall(call);
+    // Curated <math.h> rejections (design.md C99-48): C imposes no
+    // accuracy requirement on these, implementations disagree in the
+    // last bits, and rustc may constant-fold them through a libm other
+    // than the differential oracle's — no bit-exact safe-Rust mapping
+    // can be argued, so they stay out of the curated subset by policy
+    // (a sharper diagnostic than the generic system-header rejection).
+    if (name == "pow" || name == "exp" || name == "log")
+      return emitError(loc)
+             << "unsupported: '" << name
+             << "' has no bit-exact Rust mapping (C imposes no accuracy "
+                "requirement and libm implementations disagree)";
     if (name == "strchr" || name == "strrchr")
       return emitError(loc)
              << "unsupported: a " << name
