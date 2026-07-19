@@ -981,6 +981,48 @@ rule.
   object, literal-region destinations, and uncurated functions (strstr,
   strtok, ...) keep located rejections; the helper namespace
   `__emitrust_*` is reserved.
+  stdio FILE* streams (CTS-T1.3, 00187): a `FILE *` local declared
+  uninitialized or fopen-initialized is an OWNED handle over std::fs —
+  an `emitrust.variable` of the opaque `__EmitrustFile` type, a
+  one-per-module enum over Null / Read(std::fs::File) /
+  Write(std::fs::File) — and every stream operation borrows it `&mut`
+  through a one-per-module `__emitrust_f*` safe-Rust helper (the
+  sprintf/cstr helper convention; zero unsafe, every buffer access a
+  bounds-checked slice index). Supported surface, sequential byte-wise
+  I/O only: fopen(literal-path, "r"/"w") — literal-only paths, v1 —
+  where "w" creates/truncates and a failed open is
+  `__EmitrustFile::Null`, C's NULL, so `if (!f)` and null comparisons
+  work through `__emitrust_file_ok`; fgetc/getc as an i32 byte with EOF
+  the plain `arith.constant -1 : i32` met by `arith.cmpi` (an equality
+  comparison folds a negated signed integer literal — EOF's `(-1)` — to
+  a single negative constant; relational shapes keep the historical
+  `0 - x` lowering pinned in enum-int.c); byte-wise
+  fread/fwrite(ptr, 1, n, f) over char-region slices returning the
+  size_t count through the strlen-style i64 helper + cast convention;
+  fgets(buf, size, f) reading at most size-1 bytes, stopping after
+  '\n', NUL-terminating, whose helper returns -1 for C's NULL so the
+  pinned `while (fgets(...) != NULL)` and bare truth tests fold to an
+  index comparison (the strchr convention); and fclose, which resets
+  the handle to Null so the SAME variable is reassignable by a later
+  fopen (00187's serial open/close cycles). UB-refinement stance: fopen
+  failure takes C's NULL path; reading/writing a Null or
+  wrong-direction handle, I/O errors beyond EOF, and out-of-range
+  counts are C undefined behavior refined into deterministic panics.
+  Located rejections pin the slice boundary: file positioning
+  fseek/ftell/rewind (streams are sequential-only), fopen modes other
+  than "r"/"w", fprintf to a real FILE* stream (only the devirtualized
+  stdout form), fread/fwrite element sizes other than 1 (byte-wise
+  only), FILE* crossing a user-defined function boundary (parameter or
+  return — fired at the callee's first stream use, so a
+  never-streaming FILE* parameter keeps its historical call-site
+  rejection, pinned in fnptr-devirt-invalid.c), and FILE* anywhere but
+  a function-local variable (struct member of a main-file record,
+  global, array element). Non-handle FILE* shapes — `stdin`/`stdout`
+  references, `FILE *g = stdout;` — keep the historical pointer
+  machinery and its pinned wordings, and a bare `fopen(...)` statement
+  keeps the system-header rejection.
+  (test/Import/C/stdio-file.c, stdio-file-invalid.c,
+  test/EndToEnd/stdio-file-roundtrip.c, 00187.c in the ledger)
   (test/Import/C/strings.c, strings-invalid.c, strings-hosted.c,
   strings-hosted-invalid.c, math.c, test/EndToEnd/strings.c,
   strings-hosted.c, math-sin.c)
@@ -1053,8 +1095,8 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-18: 220 total / 216 passed / 0 miscompiled /
-4 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-18: 220 total / 217 passed / 0 miscompiled /
+3 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5/P2/P4/P6 partials, and
 CTS-S1/S2/S4/S6/P1/P5/P7/P8/R1/R2/R4/L1/L2 landed since, and the
 2026-07-18 TDD wave took 200 -> 213: unions as one-slot structs
@@ -1066,13 +1108,14 @@ global-pointer returns [+00089 +00189]; the T1.1 ledger wave took
 213 -> 215: dead-VLA elision + constant-LHS short-circuit folding,
 byte-array union arms, and the local void* fn-ptr holder [+00207
 +00210]; the T1.2 wave took 215 -> 216: C99-45 bit-field accessors
-over backing runs + keyword-member mangling [+00218]). Every one of
-the 4 is a located build-time rejection — never wrong output.
-The 4 remaining are deliberately OUT of scope for those waves, each
-with a recorded reason: 00187 (FILE*/stdio streams — C99-48 scope),
-00204 (long double ABI), 00209 (K&R unprototyped fn-ptr call — a
-by-design rejection), 00216 (VLA + flexible array members +
-range designators).
+over backing runs + keyword-member mangling [+00218]; the T1.3 wave
+took 216 -> 217: FILE* as an owned std::fs handle — fopen/fread/
+fwrite/fgetc/fgets/fclose, the C99-48 stdio slice [+00187]). Every one
+of the 3 is a located build-time rejection — never wrong output.
+The 3 remaining are deliberately OUT of scope for those waves, each
+with a recorded reason: 00204 (long double ABI), 00209 (K&R
+unprototyped fn-ptr call — a by-design rejection), 00216 (VLA +
+flexible array members + range designators).
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
 checkbox discipline as above — tick only when the referenced tests pass
@@ -1255,8 +1298,9 @@ observed when C99-33 + C99-47 together unlocked 00215).
   ternary chains (00144) fold statically — see the CTS-P8 note; the
   `&struct.member` bases of 00163 are the CTS-P7 note. 00039, 00103,
   00144, 00163 pass — ledger 200 -> 204 passed / 16 unsupported /
-  0 miscompiled. 00187 (genuine integer<->pointer traffic: stored
-  pointer arithmetic) remains rejected by design. Wide views over `char`
+  0 miscompiled. 00187's actual blocker was FILE* streams, which
+  landed as the C99-48 stdio slice (T1.3) — its handles never enter
+  the pointer decomposition at all. Wide views over `char`
   storage (`*(unsigned *)charp`, from_ne_bytes territory) landed as
   CTS-P11.
   INTEGER-CARRIER REGIONS (the 00214 `extend_brk` brk-cursor shape)
@@ -1277,9 +1321,9 @@ observed when C99-33 + C99-47 together unlocked 00215).
   arithmetic on an integer-carrier pointer" (no element run to walk),
   the historical "pointer assigned a non-address value" both for a
   carrier mixed with a real address base and for a sub-pointer-width
-  integer cast (a truncated address can never round-trip — 00187's
-  int-typed traffic keeps rejecting), and "void pointer parameter" for
-  a `void *` parameter the body uses as anything but a truth test.
+  integer cast (a truncated address can never round-trip), and "void
+  pointer parameter" for a `void *` parameter the body uses as
+  anything but a truth test.
   Global pointers never carry integers (their facts feed the CTS-P4/P6
   machinery unchanged).
   (test/Import/C/pointers-void.c, pointers-void-invalid.c,

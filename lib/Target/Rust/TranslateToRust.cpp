@@ -515,11 +515,15 @@ LogicalResult RustEmitter::emitDefaultValue(Location loc, Type type) {
     return success();
   }
   if (auto opaqueType = dyn_cast<emitrust::OpaqueType>(type)) {
-    // The only opaque type a variable is declared with is the String
-    // staging binding of the sprintf lowering; its default is the empty
-    // string.
+    // The opaque types a variable is declared with are the String staging
+    // binding of the sprintf lowering (default: the empty string) and the
+    // owned FILE* handle of the stdio lowering (default: C's NULL).
     if (opaqueType.getValue() == "String") {
       os << "String::new()";
+      return success();
+    }
+    if (opaqueType.getValue() == "__EmitrustFile") {
+      os << "__EmitrustFile::Null";
       return success();
     }
   }

@@ -2386,6 +2386,85 @@ private:
                                       llvm::StringRef rustCallee);
 
   //===--------------------------------------------------------------------===//
+  // Hosted <stdio.h> FILE* streams (design.md C99-48, CTS-T1.3, 00187)
+  //===--------------------------------------------------------------------===//
+  //
+  // A `FILE *` local is an OWNED handle over std::fs, held in an
+  // `emitrust.variable` of the opaque `__EmitrustFile` type (an enum over
+  // Null / Read(File) / Write(File), emitted once per module). fopen with
+  // a literal path and mode "r"/"w" produces the handle, every stream
+  // operation borrows it `&mut` through a `__emitrust_f*` helper call, and
+  // fclose resets it to Null so the same variable can be reopened (the
+  // serial-reuse shape of 00187). The supported surface is sequential
+  // byte-wise I/O only: fgetc/getc (i32 byte or -1), byte-wise
+  // fread/fwrite (element size 1), fgets, and the NULL truth test of a
+  // handle. File positioning, other fopen modes, fprintf to a real
+  // stream, wide fread/fwrite elements, and any FILE* escaping its
+  // function (parameter, return, struct member, global, array) keep
+  // located rejections. fopen failure takes C's NULL path; read/write
+  // errors beyond EOF panic in the helpers (C UB, refined
+  // deterministically).
+
+  /// Returns the opaque `__EmitrustFile` handle type.
+  emitrust::OpaqueType fileHandleType();
+
+  /// Requests the one-per-module emission of a `kFileHelpers` entry (and
+  /// the `__EmitrustFile` enum definition every helper needs; fread and
+  /// fgets additionally pull in the fgetc primitive they call).
+  void requestFileHelper(llvm::StringRef name);
+
+  /// Emits a `FILE *` local as an owned-handle `emitrust.variable` place
+  /// (registered in `fileLocals`), lowering an `= fopen(...)` initializer
+  /// through `emitFileOpenInto`.
+  LogicalResult emitFileLocal(const clang::VarDecl *var, Location loc);
+
+  /// Lowers `place = fopen(path, mode)`: the path must be an ordinary
+  /// ASCII string literal (literal-only, v1) and the mode literal must be
+  /// exactly "r" or "w"; the matching `__emitrust_fopen_r`/`_w` helper
+  /// call produces the handle assigned into `place` (Null on failure —
+  /// C's NULL path). Any other right-hand side is rejected.
+  LogicalResult emitFileOpenInto(Value place, const clang::Expr *init);
+
+  /// Borrows the FILE* handle argument `expr` (a function-local handle
+  /// variable) as `&mut __EmitrustFile` (or `&` when `isMut` is false)
+  /// for a helper call; anything but a tracked handle local is rejected.
+  FailureOr<Value> emitFileHandleArg(const clang::Expr *expr, bool isMut);
+
+  /// Lowers `fgetc(f)` / `getc(f)` to `__emitrust_fgetc(&mut f)`: the
+  /// byte as i32, or -1 — C's EOF, which the surrounding `!= EOF`
+  /// comparison meets as an ordinary `arith.constant -1 : i32`.
+  FailureOr<Value> emitFileGetc(const clang::CallExpr *call);
+
+  /// Lowers byte-wise `fread(ptr, 1, n, f)` / `fwrite(ptr, 1, n, f)` to
+  /// the matching helper over a char-region slice of `ptr` and an i64
+  /// count; the helper's i64 result (the byte count) is converted to the
+  /// call's C size_t result type like `emitStrlenCall`. An element size
+  /// other than the constant 1 is a located rejection (byte-wise only).
+  FailureOr<Value> emitFileReadWrite(const clang::CallExpr *call,
+                                     bool isWrite);
+
+  /// Lowers `fgets(buf, size, f)` to `__emitrust_fgets`, whose i64 result
+  /// is -1 for C's NULL return (end of file with nothing read) and the
+  /// stored byte count otherwise. `emitComparison`/`emitCondition`
+  /// consume the result as `!= -1` (the strchr convention), so the
+  /// pinned `while (fgets(...) != NULL)` shape and the bare truth test
+  /// both work; any other use of the char* result is rejected.
+  FailureOr<Value> emitFileGetsIndex(const clang::CallExpr *call);
+
+  /// Returns `expr` as a definition-less hosted `fgets` call, or null.
+  const clang::CallExpr *asHostedFgetsCall(const clang::Expr *expr) const;
+
+  /// Lowers a statement-position `fclose(f)` to `__emitrust_fclose(&mut
+  /// f)`, which drops the handle (closing the file) and leaves the
+  /// variable Null for serial reopening.
+  LogicalResult emitFileClose(const clang::CallExpr *call);
+
+  /// Emits the truth value of a FILE*-typed expression: a handle
+  /// variable's NULL test routes through `__emitrust_file_ok(&f)` (the
+  /// `if (!f)` shape), and an fgets call tests its index against -1.
+  FailureOr<Value> emitFileTruth(const clang::Expr *expr);
+
+  //===--------------------------------------------------------------------===//
   // Expressions
   //===--------------------------------------------------------------------===//
 
@@ -3221,6 +3300,17 @@ private:
   llvm::StringSet<> neededStringHelpers;
   /// Helpers already emitted, so a multi-TU import never emits one twice.
   llvm::StringSet<> emittedStringHelpers;
+  /// FILE* handle locals of the current function (C99-48): each maps to
+  /// its owned `emitrust.variable` place of the opaque `__EmitrustFile`
+  /// type. Reset per function like `symbols`.
+  llvm::DenseMap<const clang::VarDecl *, Value> fileLocals;
+  /// Hosted FILE* helpers requested by lowered stdio calls
+  /// (`requestFileHelper`); each is emitted once per module, in the fixed
+  /// order of the `kFileHelpers` table (the `__EmitrustFile` enum first).
+  llvm::StringSet<> neededFileHelpers;
+  /// FILE* helpers already emitted, so a multi-TU import never emits one
+  /// twice.
+  llvm::StringSet<> emittedFileHelpers;
 };
 
 } // namespace
@@ -3436,6 +3526,46 @@ static bool isFunctionPointer(clang::QualType type) {
 /// function pointers are ordinary Copy values.
 static bool isDataPointer(clang::QualType type) {
   return isPointerType(type) && !isFunctionPointer(type);
+}
+
+/// Returns whether the canonical type of `type` is C's `FILE *` stream
+/// handle (a pointer to the stdio stream record: glibc and musl spell it
+/// `struct _IO_FILE`, BSD/macOS `struct __sFILE`, MSVC `struct _iobuf`,
+/// and a freestanding header may leave the tag `FILE` itself). FILE*
+/// values take the C99-48 owned-handle lowering — never the (base,
+/// cursor) pointer decomposition — and are only supported as
+/// function-local variables opened by fopen.
+static bool isFilePtrType(clang::QualType type) {
+  clang::QualType canonical = type.getCanonicalType();
+  if (!canonical->isPointerType())
+    return false;
+  const auto *record =
+      canonical->getPointeeType().getCanonicalType()->getAs<clang::RecordType>();
+  if (!record)
+    return false;
+  llvm::StringRef name = record->getDecl()->getName();
+  return name == "FILE" || name == "_IO_FILE" || name == "__sFILE" ||
+         name == "_iobuf";
+}
+
+/// Returns whether a FILE*-typed local variable takes the owned-handle
+/// lowering (C99-48): declared with no initializer, or initialized
+/// directly by a definition-less fopen call. Any other initializer
+/// (stdout, another FILE* value, ...) falls back to the historical
+/// pointer machinery and its located rejections, which older tests pin
+/// (`FILE *g = stdout;` stays "copying a global pointer variable").
+static bool isFileHandleLocal(const clang::VarDecl *var) {
+  if (!var->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(var) ||
+      !isFilePtrType(var->getType()))
+    return false;
+  const clang::Expr *init = var->getInit();
+  if (!init)
+    return true;
+  const auto *call =
+      llvm::dyn_cast<clang::CallExpr>(init->IgnoreParenImpCasts());
+  const clang::FunctionDecl *callee = call ? call->getDirectCallee() : nullptr;
+  return callee && callee->getDeclName().isIdentifier() &&
+         callee->getName() == "fopen" && !callee->getDefinition();
 }
 
 /// Returns the data-pointer field a member expression designates, or null
@@ -4839,6 +4969,12 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
           // an ordinary fn_ptr local; the decomposition never tracks it.
           if (fnHolderQuery && fnHolderQuery(var))
             continue;
+          // A FILE* handle local is an owned stream handle (C99-48), not
+          // a decomposed pointer; the emission intercepts every use.
+          // Non-handle FILE* locals (`FILE *g = stdout;`) keep the
+          // historical tracking and its rejections.
+          if (isFileHandleLocal(var))
+            continue;
           if (isSecondOrderPointerType(var->getType())) {
             secondOrderVars.insert(var);
             if (const clang::Expr *init = var->getInit())
@@ -5171,6 +5307,13 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
         emitrust::FnPtrType::get(builder.getContext(), inputs, results));
   }
 
+  // A FILE* is an owned function-local stream handle (C99-48); any other
+  // position (array element, return type, ...) that maps its type keeps
+  // this located rejection.
+  if (isFilePtrType(canonical))
+    return emitError(loc)
+           << "unsupported: FILE* is only supported as a function-local "
+              "variable";
   if (canonical->isPointerType())
     return emitError(loc)
            << "unsupported: pointer type outside a parameter position";
@@ -6856,6 +6999,16 @@ LogicalResult CImporter::collectRecordFields(
     }
     if (field->getName().empty())
       return emitError(fieldLoc) << "unsupported: unnamed struct member";
+    // A FILE* member of a MAIN-FILE record would store an owned handle
+    // inside an aggregate, which the function-local handle model does not
+    // cover (C99-48); the check must precede the data-pointer cursor
+    // mapping in mapStructFieldType. System-header records (the stdio
+    // stream record's own FILE*-typed links) keep the historical cursor
+    // field so their import stays inert.
+    if (isFilePtrType(field->getType()) && !isSystemHeaderDecl(field))
+      return emitError(fieldLoc)
+             << "unsupported: FILE* is only supported as a function-local "
+                "variable";
     FailureOr<Type> fieldType = mapStructFieldType(field->getType(), fieldLoc);
     if (failed(fieldType))
       return failure();
@@ -7315,6 +7468,12 @@ LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   const clang::VarDecl *typeDecl =
       init ? initDecl : canonical->getMostRecentDecl();
   clang::QualType varType = typeDecl->getType().getCanonicalType();
+  // An owned stream handle has no global model (C99-48): the check must
+  // precede the pointer-global cursor decomposition below.
+  if (isFilePtrType(varType))
+    return emitError(loc)
+           << "unsupported: FILE* is only supported as a function-local "
+              "variable";
   if (varType->isPointerType() && !varType->isFunctionPointerType())
     return importPointerGlobal(canonical, typeDecl, symbolName, loc);
   return createGlobal(canonical, typeDecl, symbolName, loc);
@@ -8348,6 +8507,13 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   SmallVector<Type> resultTypes;
   clang::QualType returnType = func->getReturnType();
   if (!returnType->isVoidType()) {
+    // Returning an owned stream handle would let it escape its function
+    // (C99-48 v1: no escapes); checked before the data-pointer return
+    // classification below.
+    if (isFilePtrType(returnType))
+      return emitError(loc)
+             << "unsupported: FILE* cannot cross a user-defined function "
+                "boundary";
     if (isDataPointer(returnType)) {
       // A data-pointer return classifies by its return sites (CTS-P2):
       // the fn-address kind returns the plain fn_ptr value, and the
@@ -8418,6 +8584,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   // parameter as a place appropriate to its kind.
   symbols.clear();
   addressTaken.clear();
+  fileLocals.clear();
   pointerLocals.clear();
   pointerPointerLocals.clear();
   carrierLocals.clear();
@@ -8851,6 +9018,157 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "    s.iter().position(|&b| b == 0).unwrap_or(s.len()) as i64\n"
             "}"));
   }
+  // Hosted <stdio.h> FILE* helpers (design.md C99-48, CTS-T1.3): the
+  // owned-handle enum plus one safe-Rust helper per lowered stream
+  // operation, each requested by `requestFileHelper` and emitted once per
+  // module in this fixed order (the enum first; fread/fgets pull in the
+  // fgetc primitive they call). fopen failure is C's NULL path
+  // (`__EmitrustFile::Null`); every use of a Null or wrong-direction
+  // handle, an I/O error beyond end-of-file, and an out-of-range count
+  // is C undefined behavior refined into a deterministic panic (the
+  // slice indexing is bounds-checked).
+  static const struct {
+    llvm::StringRef name;
+    llvm::StringRef source;
+  } kFileHelpers[] = {
+      {"__EmitrustFile",
+       "/// An owned C `FILE*` stream handle over std::fs (design.md\n"
+       "/// C99-48). `Null` is C's NULL: a failed fopen, or the state\n"
+       "/// fclose leaves so the same variable can be reopened. Streams\n"
+       "/// are sequential-only and byte-wise; using a Null or\n"
+       "/// wrong-direction handle is C UB, refined into a deterministic\n"
+       "/// panic by the helpers below.\n"
+       "enum __EmitrustFile {\n"
+       "    Null,\n"
+       "    Read(std::fs::File),\n"
+       "    Write(std::fs::File),\n"
+       "}"},
+      {"__emitrust_fopen_r",
+       "/// `fopen(path, \"r\")`: opens an existing file for sequential\n"
+       "/// reading; `Null` is C's NULL result when the open fails.\n"
+       "fn __emitrust_fopen_r(path: &str) -> __EmitrustFile {\n"
+       "    match std::fs::File::open(path) {\n"
+       "        Ok(f) => __EmitrustFile::Read(f),\n"
+       "        Err(_) => __EmitrustFile::Null,\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_fopen_w",
+       "/// `fopen(path, \"w\")`: creates or truncates a file for\n"
+       "/// sequential writing; `Null` is C's NULL result when the open\n"
+       "/// fails.\n"
+       "fn __emitrust_fopen_w(path: &str) -> __EmitrustFile {\n"
+       "    match std::fs::File::create(path) {\n"
+       "        Ok(f) => __EmitrustFile::Write(f),\n"
+       "        Err(_) => __EmitrustFile::Null,\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_file_ok",
+       "/// The truth of a C `FILE*` handle: false exactly when it is\n"
+       "/// NULL (the `if (!f)` check after fopen).\n"
+       "fn __emitrust_file_ok(f: &__EmitrustFile) -> bool {\n"
+       "    !matches!(f, __EmitrustFile::Null)\n"
+       "}"},
+      {"__emitrust_fgetc",
+       "/// `fgetc`/`getc`: one byte as 0..=255, or -1 (C's EOF) at end\n"
+       "/// of file. Reading a NULL or write-mode stream is C UB, and an\n"
+       "/// I/O error beyond end-of-file has no C-visible result either;\n"
+       "/// both panic deterministically.\n"
+       "fn __emitrust_fgetc(f: &mut __EmitrustFile) -> i32 {\n"
+       "    match f {\n"
+       "        __EmitrustFile::Read(file) => {\n"
+       "            let mut byte = [0u8; 1];\n"
+       "            match std::io::Read::read(file, &mut byte) {\n"
+       "                Ok(0) => -1,\n"
+       "                Ok(_) => byte[0] as i32,\n"
+       "                Err(e) => panic!(\"fgetc: {}\", e),\n"
+       "            }\n"
+       "        }\n"
+       "        _ => panic!(\"fgetc on a stream not open for reading\"),\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_fread",
+       "/// Byte-wise `fread(ptr, 1, n, f)`: reads up to `n` bytes into\n"
+       "/// the destination's prefix and returns the count actually read\n"
+       "/// (short at end of file). A count exceeding the destination\n"
+       "/// panics on the bounds-checked index (C UB, refined).\n"
+       "fn __emitrust_fread(f: &mut __EmitrustFile, buf: &mut [i8], n: i64) "
+       "-> i64 {\n"
+       "    let mut count = 0i64;\n"
+       "    while count < n {\n"
+       "        let c = __emitrust_fgetc(f);\n"
+       "        if c < 0 {\n"
+       "            break;\n"
+       "        }\n"
+       "        buf[count as usize] = c as i8;\n"
+       "        count += 1;\n"
+       "    }\n"
+       "    count\n"
+       "}"},
+      {"__emitrust_fwrite",
+       "/// Byte-wise `fwrite(ptr, 1, n, f)`: writes the source's first\n"
+       "/// `n` bytes and returns `n`, C's full-success result. A write\n"
+       "/// error, a stream not open for writing, and a count exceeding\n"
+       "/// the source all panic deterministically (C UB, refined).\n"
+       "fn __emitrust_fwrite(f: &mut __EmitrustFile, buf: &[i8], n: i64) "
+       "-> i64 {\n"
+       "    match f {\n"
+       "        __EmitrustFile::Write(file) => {\n"
+       "            let bytes: Vec<u8> =\n"
+       "                buf[..n as usize].iter().map(|&b| b as u8).collect();\n"
+       "            std::io::Write::write_all(file, &bytes)\n"
+       "                .expect(\"fwrite failed\");\n"
+       "            n\n"
+       "        }\n"
+       "        _ => panic!(\"fwrite on a stream not open for writing\"),\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_fgets",
+       "/// `fgets(buf, size, f)`: reads at most `size - 1` bytes,\n"
+       "/// stopping after a newline, and NUL-terminates what was read.\n"
+       "/// Returns -1 for C's NULL result (end of file with nothing\n"
+       "/// read), else the count of bytes stored before the NUL.\n"
+       "fn __emitrust_fgets(f: &mut __EmitrustFile, buf: &mut [i8], n: i64) "
+       "-> i64 {\n"
+       "    if n < 1 {\n"
+       "        return -1;\n"
+       "    }\n"
+       "    let mut i = 0i64;\n"
+       "    while i + 1 < n {\n"
+       "        let c = __emitrust_fgetc(f);\n"
+       "        if c < 0 {\n"
+       "            break;\n"
+       "        }\n"
+       "        buf[i as usize] = c as i8;\n"
+       "        i += 1;\n"
+       "        if c == 10 {\n"
+       "            break;\n"
+       "        }\n"
+       "    }\n"
+       "    if i == 0 && n > 1 {\n"
+       "        return -1;\n"
+       "    }\n"
+       "    buf[i as usize] = 0;\n"
+       "    i\n"
+       "}"},
+      {"__emitrust_fclose",
+       "/// `fclose(f)`: drops the handle (closing the file) and leaves\n"
+       "/// the variable NULL, so the same C variable can be reopened by\n"
+       "/// a later fopen (the 00187 serial-reuse shape). Closing NULL is\n"
+       "/// C UB; leaving it NULL is a benign refinement.\n"
+       "fn __emitrust_fclose(f: &mut __EmitrustFile) {\n"
+       "    *f = __EmitrustFile::Null;\n"
+       "}"},
+  };
+  for (const auto &helper : kFileHelpers) {
+    if (!neededFileHelpers.contains(helper.name) ||
+        emittedFileHelpers.contains(helper.name))
+      continue;
+    emittedFileHelpers.insert(helper.name);
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(helper.source));
+  }
   return success();
 }
 
@@ -9177,6 +9495,12 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   if (const clang::FunctionDecl *target = voidFnPtrHolders.lookup(var))
     return emitFnHolderLocal(var, target, loc);
   clang::QualType type = var->getType().getCanonicalType();
+  // A FILE* handle local (uninitialized or fopen-initialized) is an owned
+  // stream handle over std::fs (C99-48), never a decomposed pointer;
+  // other FILE* initializers (stdout, ...) keep the historical pointer
+  // path and its located rejections.
+  if (isFileHandleLocal(var))
+    return emitFileLocal(var, loc);
   // Function pointers are ordinary `!emitrust.fn_ptr` values and take the
   // plain variable path below, bypassing the pointer decomposition.
   if (type->isPointerType() && !type->isFunctionPointerType())
@@ -10734,6 +11058,14 @@ CImporter::emitVoidConditionalStmt(const clang::ConditionalOperator *op) {
 
 LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  // Reassigning a FILE* handle local (`f = fopen(...)` after fclose, the
+  // serial-reuse shape of 00187) stores a fresh handle into its owned
+  // place. Non-handle FILE* destinations fall through to the historical
+  // pointer paths and their located rejections.
+  if (isFilePtrType(op->getLHS()->getType()))
+    if (const clang::VarDecl *var = asVarRef(op->getLHS()))
+      if (Value place = fileLocals.lookup(var))
+        return emitFileOpenInto(place, op->getRHS());
   // Rebinding a decomposed pointer local (or a slice-classified pointer
   // parameter) recomputes its cursor; no pointer value is ever
   // materialized. Function pointers are ordinary values and take the
@@ -11127,6 +11459,11 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
     // decomposed representation, so value uses keep located rejections in
     // emitCall.
     if (!callee->getDefinition()) {
+      // A statement-position `fclose(f)` drops the owned handle (C99-48);
+      // its int result has no representation, so value uses keep a
+      // located rejection in emitCall.
+      if (name == "fclose")
+        return emitFileClose(call);
       if (name == "strcpy")
         return emitStringCopyCall(call, "strcpy", /*hasCount=*/false);
       if (name == "strncpy")
@@ -11792,6 +12129,274 @@ FailureOr<Value> CImporter::emitStrlenCall(const clang::CallExpr *call) {
   if (!intType)
     return emitError(loc) << "unsupported: strlen result type";
   return castToIntType(loc, count, intType);
+}
+
+//===----------------------------------------------------------------------===//
+// Hosted <stdio.h> FILE* streams (design.md C99-48, CTS-T1.3, 00187)
+//===----------------------------------------------------------------------===//
+
+emitrust::OpaqueType CImporter::fileHandleType() {
+  return emitrust::OpaqueType::get(builder.getContext(), "__EmitrustFile");
+}
+
+void CImporter::requestFileHelper(llvm::StringRef name) {
+  // Every helper mentions the handle enum, and the byte-loop helpers call
+  // the fgetc primitive.
+  neededFileHelpers.insert("__EmitrustFile");
+  if (name == "__emitrust_fread" || name == "__emitrust_fgets")
+    neededFileHelpers.insert("__emitrust_fgetc");
+  neededFileHelpers.insert(name);
+}
+
+LogicalResult CImporter::emitFileLocal(const clang::VarDecl *var,
+                                       Location loc) {
+  // The owned handle lives in an `emitrust.variable` place; without an
+  // initializer it renders as `__EmitrustFile::Null` (C's NULL), so the
+  // enum definition is needed as soon as a handle local exists.
+  requestFileHelper("__EmitrustFile");
+  Value place = createVariablePlace(loc, fileHandleType());
+  fileLocals[var] = place;
+  if (const clang::Expr *init = var->getInit())
+    return emitFileOpenInto(place, init);
+  return success();
+}
+
+LogicalResult CImporter::emitFileOpenInto(Value place,
+                                          const clang::Expr *init) {
+  const clang::Expr *e = init->IgnoreParenImpCasts();
+  Location loc = translateLoc(e->getBeginLoc());
+  const auto *call = llvm::dyn_cast<clang::CallExpr>(e);
+  const clang::FunctionDecl *callee =
+      call ? call->getDirectCallee() : nullptr;
+  if (!callee || !callee->getDeclName().isIdentifier() ||
+      callee->getName() != "fopen" || callee->getDefinition())
+    return emitError(loc) << "unsupported: a FILE* local may only be "
+                             "initialized or assigned by fopen";
+  if (call->getNumArgs() != 2)
+    return emitError(loc)
+           << "unsupported: fopen requires a path and a mode";
+  // The mode selects the helper. Exactly "r" and "w" are in the slice:
+  // append/update modes and the (POSIX no-op) binary suffix stay out.
+  const auto *modeLiteral = llvm::dyn_cast<clang::StringLiteral>(
+      call->getArg(1)->IgnoreParenImpCasts());
+  if (!modeLiteral || !modeLiteral->isOrdinary())
+    return emitError(translateLoc(call->getArg(1)->getBeginLoc()))
+           << "unsupported: fopen mode must be a string literal";
+  llvm::StringRef mode = modeLiteral->getString();
+  if (mode != "r" && mode != "w")
+    return emitError(translateLoc(call->getArg(1)->getBeginLoc()))
+           << "unsupported: fopen mode \"" << mode
+           << "\" (only \"r\" and \"w\" are supported)";
+  // Literal-only paths (v1): the decoded bytes are re-emitted as a Rust
+  // string literal, so they must be printable ASCII (an embedded NUL
+  // would also diverge from C's NUL-terminated path).
+  const auto *pathLiteral = llvm::dyn_cast<clang::StringLiteral>(
+      call->getArg(0)->IgnoreParenImpCasts());
+  Location pathLoc = translateLoc(call->getArg(0)->getBeginLoc());
+  if (!pathLiteral || !pathLiteral->isOrdinary())
+    return emitError(pathLoc)
+           << "unsupported: fopen path must be an ordinary string literal";
+  llvm::StringRef path = pathLiteral->getString();
+  for (char c : path)
+    if (c < 0x20 || c > 0x7e)
+      return emitError(pathLoc) << "unsupported: non-printable or "
+                                   "non-ASCII byte in fopen path";
+  llvm::StringRef helper =
+      mode == "r" ? "__emitrust_fopen_r" : "__emitrust_fopen_w";
+  requestFileHelper(helper);
+  Value handle =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{fileHandleType()}, builder.getStringAttr(helper),
+              builder.getArrayAttr({builder.getStringAttr(path)}),
+              ValueRange{})
+          .getResult(0);
+  builder.create<emitrust::AssignOp>(loc, place, handle);
+  return success();
+}
+
+FailureOr<Value> CImporter::emitFileHandleArg(const clang::Expr *expr,
+                                              bool isMut) {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  Location loc = translateLoc(e->getBeginLoc());
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  const auto *var =
+      ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+  // A FILE* parameter means the stream crossed into this function — the
+  // v1 no-escape rule, pinned by the escape rejection case.
+  if (var && llvm::isa<clang::ParmVarDecl>(var) &&
+      isFilePtrType(var->getType()))
+    return emitError(loc) << "unsupported: FILE* cannot cross a "
+                             "user-defined function boundary";
+  Value place = var ? fileLocals.lookup(var) : Value();
+  if (!place)
+    return emitError(loc) << "unsupported: a FILE* stream argument must be "
+                             "a function-local FILE* variable";
+  Type refType = isMut ? Type(emitrust::MutRefType::get(fileHandleType()))
+                       : Type(emitrust::RefType::get(fileHandleType()));
+  return builder.create<emitrust::AddrOfOp>(loc, refType, place, isMut)
+      .getResult();
+}
+
+FailureOr<Value> CImporter::emitFileGetc(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: fgetc requires exactly one argument";
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(0), /*isMut=*/true);
+  if (failed(handle))
+    return failure();
+  requestFileHelper("__emitrust_fgetc");
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getI32Type()},
+          builder.getStringAttr("__emitrust_fgetc"), /*args=*/ArrayAttr(),
+          ValueRange{*handle})
+      .getResult(0);
+}
+
+FailureOr<Value> CImporter::emitFileReadWrite(const clang::CallExpr *call,
+                                              bool isWrite) {
+  llvm::StringRef name = isWrite ? "fwrite" : "fread";
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 4)
+    return emitError(loc) << "unsupported: " << name
+                          << " requires four arguments";
+  // Byte-wise only: the element size must be the integer constant 1. The
+  // check precedes the buffer lowering so a wide element over a non-char
+  // buffer still reports the pinned byte-wise wording.
+  clang::Expr::EvalResult size;
+  if (!call->getArg(1)->EvaluateAsInt(size, astContext()) ||
+      size.Val.getInt() != 1)
+    return emitError(loc)
+           << "unsupported: " << name
+           << " element size other than 1 (FILE* I/O is byte-wise)";
+  // The count value materializes before the borrows below, so no load
+  // intervenes between a borrow and the helper call consuming it.
+  FailureOr<Value> count = emitRValue(call->getArg(2));
+  if (failed(count))
+    return failure();
+  if (!llvm::isa<IntegerType>((*count).getType()))
+    return emitError(loc) << "unsupported: " << name << " count type";
+  Value countI64 = castToIntType(loc, *count, builder.getIntegerType(64));
+  FailureOr<PtrExprValue> region = emitCharRegionArg(call->getArg(0));
+  if (failed(region))
+    return failure();
+  // fread fills the destination (mutable borrow); fwrite only reads its
+  // source, so a string-literal region is fine there.
+  FailureOr<Value> slice = emitCharRegionSlice(loc, *region,
+                                               /*isMut=*/!isWrite);
+  if (failed(slice))
+    return failure();
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(3), /*isMut=*/true);
+  if (failed(handle))
+    return failure();
+  llvm::StringRef helper =
+      isWrite ? "__emitrust_fwrite" : "__emitrust_fread";
+  requestFileHelper(helper);
+  Value bytes = builder
+                    .create<emitrust::CallOpaqueOp>(
+                        loc, TypeRange{builder.getIntegerType(64)},
+                        builder.getStringAttr(helper), /*args=*/ArrayAttr(),
+                        ValueRange{*handle, *slice, countI64})
+                    .getResult(0);
+  // Convert the i64 byte count to the call's declared C result type
+  // (size_t), matching emitStrlenCall's convention.
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+  if (!intType)
+    return emitError(loc) << "unsupported: " << name << " result type";
+  return castToIntType(loc, bytes, intType);
+}
+
+FailureOr<Value> CImporter::emitFileGetsIndex(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 3)
+    return emitError(loc) << "unsupported: fgets requires three arguments";
+  // The size value materializes before the borrows (same discipline as
+  // fread/fwrite).
+  FailureOr<Value> sizeValue = emitRValue(call->getArg(1));
+  if (failed(sizeValue))
+    return failure();
+  if (!llvm::isa<IntegerType>((*sizeValue).getType()))
+    return emitError(loc) << "unsupported: fgets size type";
+  Value sizeI64 =
+      castToIntType(loc, *sizeValue, builder.getIntegerType(64));
+  FailureOr<PtrExprValue> region = emitCharRegionArg(call->getArg(0));
+  if (failed(region))
+    return failure();
+  FailureOr<Value> slice = emitCharRegionSlice(loc, *region, /*isMut=*/true);
+  if (failed(slice))
+    return failure();
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(2), /*isMut=*/true);
+  if (failed(handle))
+    return failure();
+  requestFileHelper("__emitrust_fgets");
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getIntegerType(64)},
+          builder.getStringAttr("__emitrust_fgets"), /*args=*/ArrayAttr(),
+          ValueRange{*handle, *slice, sizeI64})
+      .getResult(0);
+}
+
+const clang::CallExpr *
+CImporter::asHostedFgetsCall(const clang::Expr *expr) const {
+  const auto *call =
+      llvm::dyn_cast<clang::CallExpr>(expr->IgnoreParenImpCasts());
+  const clang::FunctionDecl *callee =
+      call ? call->getDirectCallee() : nullptr;
+  if (!callee || !callee->getDeclName().isIdentifier() ||
+      callee->getName() != "fgets" || callee->getDefinition())
+    return nullptr;
+  return call;
+}
+
+LogicalResult CImporter::emitFileClose(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: fclose requires exactly one argument";
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(0), /*isMut=*/true);
+  if (failed(handle))
+    return failure();
+  requestFileHelper("__emitrust_fclose");
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("__emitrust_fclose"),
+      /*args=*/ArrayAttr(), ValueRange{*handle});
+  return success();
+}
+
+FailureOr<Value> CImporter::emitFileTruth(const clang::Expr *expr) {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  Location loc = translateLoc(e->getBeginLoc());
+  // A truth-tested fgets result asks "did a line arrive": the helper's
+  // -1 is C's NULL, so the test is an index comparison (the strchr
+  // convention).
+  if (const clang::CallExpr *gets = asHostedFgetsCall(e)) {
+    FailureOr<Value> index = emitFileGetsIndex(gets);
+    if (failed(index))
+      return failure();
+    Value nullIndex =
+        createIntConstant(loc, builder.getIntegerType(64), -1);
+    return builder
+        .create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, *index,
+                               nullIndex)
+        .getResult();
+  }
+  // A handle's truth is its NULL check, read through a shared borrow.
+  FailureOr<Value> handle = emitFileHandleArg(e, /*isMut=*/false);
+  if (failed(handle))
+    return failure();
+  requestFileHelper("__emitrust_file_ok");
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getI1Type()},
+          builder.getStringAttr("__emitrust_file_ok"), /*args=*/ArrayAttr(),
+          ValueRange{*handle})
+      .getResult(0);
 }
 
 FailureOr<PtrExprValue>
@@ -12863,6 +13468,70 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
   // of a nullable region tests its i1 discriminant.
   if (isPointerType(op->getLHS()->getType()) ||
       isPointerType(op->getRHS()->getType())) {
+    // An fgets result compared against a null pointer constant is the
+    // end-of-file test of the pinned `while (fgets(...) != NULL)` shape
+    // (C99-48): the helper returns -1 for C's NULL result, so the
+    // comparison folds to an index test exactly like strchr's below.
+    {
+      const clang::CallExpr *gets = asHostedFgetsCall(op->getLHS());
+      const clang::Expr *nullSide = op->getRHS();
+      if (!gets) {
+        gets = asHostedFgetsCall(op->getRHS());
+        nullSide = op->getLHS();
+      }
+      if (gets && isNullPointerConstantExpr(nullSide)) {
+        if (op->getOpcode() != clang::BO_EQ &&
+            op->getOpcode() != clang::BO_NE)
+          return emitError(loc) << "unsupported: ordered comparison of an "
+                                   "fgets result against a null pointer";
+        FailureOr<Value> index = emitFileGetsIndex(gets);
+        if (failed(index))
+          return failure();
+        Value nullIndex =
+            createIntConstant(loc, builder.getIntegerType(64), -1);
+        arith::CmpIPredicate predicate = op->getOpcode() == clang::BO_EQ
+                                             ? arith::CmpIPredicate::eq
+                                             : arith::CmpIPredicate::ne;
+        return builder
+            .create<arith::CmpIOp>(loc, predicate, *index, nullIndex)
+            .getResult();
+      }
+    }
+    // A FILE* handle local compared against a null pointer constant is
+    // the fopen NULL check (C99-48); `__emitrust_file_ok` is the negation
+    // of C's `f == NULL`. Non-handle FILE* comparisons keep the
+    // historical pointer machinery and its located rejections.
+    {
+      auto asHandleRef = [&](const clang::Expr *expr) -> const clang::Expr * {
+        if (!isFilePtrType(expr->getType()))
+          return nullptr;
+        const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+            expr->IgnoreParenImpCasts());
+        const auto *var =
+            ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+        return var && fileLocals.count(var) ? expr : nullptr;
+      };
+      const clang::Expr *handleSide = asHandleRef(op->getLHS());
+      const clang::Expr *nullSide = op->getRHS();
+      if (!handleSide) {
+        handleSide = asHandleRef(op->getRHS());
+        nullSide = op->getLHS();
+      }
+      if (handleSide && isNullPointerConstantExpr(nullSide)) {
+        if (op->getOpcode() != clang::BO_EQ &&
+            op->getOpcode() != clang::BO_NE)
+          return emitError(loc) << "unsupported: ordered comparison of a "
+                                   "FILE* stream against a null pointer";
+        FailureOr<Value> truth = emitFileTruth(handleSide);
+        if (failed(truth))
+          return failure();
+        if (op->getOpcode() == clang::BO_NE)
+          return truth;
+        Value trueValue = createBoolConstant(loc, true);
+        return builder.create<arith::XOrIOp>(loc, *truth, trueValue)
+            .getResult();
+      }
+    }
     bool lhsNull = isNullPointerConstantExpr(op->getLHS());
     bool rhsNull = isNullPointerConstantExpr(op->getRHS());
     auto isLiteralPointer = [](const clang::Expr *expr) {
@@ -13113,10 +13782,41 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
     }
   }
 
-  FailureOr<Value> lhs = emitRValue(op->getLHS());
+  // An equality comparison against a negated signed integer literal —
+  // `!= EOF` with EOF's `(-1)` expansion in particular — folds the
+  // literal to a single negative constant, the pinned C99-48 EOF shape
+  // (`arith.constant -1 : i32` met by `arith.cmpi`). Only parens are
+  // looked through (an implicit conversion would change the constant's
+  // type), and relational comparisons keep the historical `0 - x`
+  // negation lowering (pinned in enum-int.c).
+  auto emitComparisonOperand =
+      [&](const clang::Expr *expr) -> FailureOr<Value> {
+    if (op->getOpcode() != clang::BO_EQ && op->getOpcode() != clang::BO_NE)
+      return emitRValue(expr);
+    const auto *minus =
+        llvm::dyn_cast<clang::UnaryOperator>(expr->IgnoreParens());
+    if (!minus || minus->getOpcode() != clang::UO_Minus)
+      return emitRValue(expr);
+    const auto *literal = llvm::dyn_cast<clang::IntegerLiteral>(
+        minus->getSubExpr()->IgnoreParens());
+    if (!literal)
+      return emitRValue(expr);
+    Location litLoc = translateLoc(minus->getOperatorLoc());
+    FailureOr<Type> mapped = mapType(minus->getType(), litLoc);
+    if (failed(mapped))
+      return failure();
+    auto intType = llvm::dyn_cast<IntegerType>(*mapped);
+    if (!intType || !intType.isSignless())
+      return emitRValue(expr);
+    // The negation wraps in the literal's own width, matching C's
+    // int-typed negation of a representable literal.
+    llvm::APInt negated = -literal->getValue().sextOrTrunc(intType.getWidth());
+    return createIntConstant(litLoc, intType, negated.getSExtValue());
+  };
+  FailureOr<Value> lhs = emitComparisonOperand(op->getLHS());
   if (failed(lhs))
     return failure();
-  FailureOr<Value> rhs = emitRValue(op->getRHS());
+  FailureOr<Value> rhs = emitComparisonOperand(op->getRHS());
   if (failed(rhs))
     return failure();
   if ((*lhs).getType() != (*rhs).getType())
@@ -13243,6 +13943,28 @@ FailureOr<Value> CImporter::emitCondition(const clang::Expr *expr) {
                                  emitrust::CmpPredicate::ne, *value, none)
         .getResult();
   }
+  // A FILE* handle local tested for truth (`if (!f)` after fopen —
+  // C99-48) is its NULL check, and a truth-tested fgets result is its
+  // end-of-file test; both must run before the decomposed-pointer truth
+  // paths below, which cannot represent a stream. Non-handle FILE*
+  // expressions (`if (stdin)`) keep the historical paths and their
+  // located rejections.
+  auto isFileTruthExpr = [&](const clang::Expr *expr) {
+    if (asHostedFgetsCall(expr))
+      return true;
+    const auto *ref =
+        llvm::dyn_cast<clang::DeclRefExpr>(expr->IgnoreParenImpCasts());
+    const auto *var =
+        ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+    return var && fileLocals.count(var);
+  };
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_PointerToBoolean &&
+        isFileTruthExpr(cast->getSubExpr()))
+      return emitFileTruth(cast->getSubExpr());
+  if (isFileTruthExpr(e) &&
+      (isFilePtrType(e->getType()) || asHostedFgetsCall(e)))
+    return emitFileTruth(e);
   // A data pointer tested for truth (`if (p)`, `!p`) is a null check: the
   // Option-of-cursor discrimination of the decomposed pointer (CTS-P8).
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
@@ -13628,6 +14350,51 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
              << "unsupported: a " << name
              << " result must feed a printf '%s' argument or a "
                 "comparison against a null pointer";
+    // Hosted <stdio.h> FILE* streams (design.md C99-48, CTS-T1.3):
+    // sequential byte-wise I/O on an owned function-local handle. File
+    // positioning contradicts the sequential-only model and stays a
+    // located rejection.
+    if (name == "fseek" || name == "ftell" || name == "rewind")
+      return emitError(loc) << "unsupported: file positioning '" << name
+                            << "' (FILE* streams are sequential-only)";
+    // fprintf to a real stream variable would need a formatted writer
+    // over the handle; only the devirtualized stdout-swallow form (see
+    // emitAliasedPrintf) is accepted. The literal `stdout` argument
+    // falls through to the historical variadic-call rejection.
+    if (name == "fprintf" && call->getNumArgs() >= 1) {
+      const auto *stream = llvm::dyn_cast<clang::DeclRefExpr>(
+          call->getArg(0)->IgnoreParenImpCasts());
+      const clang::NamedDecl *streamDecl =
+          stream ? llvm::dyn_cast<clang::NamedDecl>(stream->getDecl())
+                 : nullptr;
+      if (!streamDecl || !streamDecl->getDeclName().isIdentifier() ||
+          streamDecl->getName() != "stdout")
+        return emitError(translateLoc(call->getArg(0)->getBeginLoc()))
+               << "unsupported: fprintf to a FILE* stream (only the "
+                  "devirtualized stdout form is supported)";
+    }
+    // A fopen result in any position but a FILE* handle local's
+    // initializer or assignment (consumed by emitFileLocal /
+    // emitFileOpenInto before this point) falls through to the
+    // system-header rejection below, keeping the historical wording.
+    if (name == "fgetc" || name == "getc")
+      return emitFileGetc(call);
+    if (name == "fread")
+      return emitFileReadWrite(call, /*isWrite=*/false);
+    if (name == "fwrite")
+      return emitFileReadWrite(call, /*isWrite=*/true);
+    // An fgets result is consumed by the null-comparison and truth-test
+    // interceptions (emitComparison / emitCondition); its char* value
+    // has no representation anywhere else.
+    if (name == "fgets")
+      return emitError(loc)
+             << "unsupported: an fgets result must be compared against a "
+                "null pointer or tested for truth";
+    // Statement-position fclose is lowered by emitCallStmt; C's int
+    // result has no representation here.
+    if (name == "fclose")
+      return emitError(loc)
+             << "unsupported: fclose return value must be unused";
   }
   // A variadic callee is only supported when its definition imports as
   // its fixed prototype (a va_list-free body, see `importFunction`); the
