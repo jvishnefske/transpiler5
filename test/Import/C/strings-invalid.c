@@ -8,6 +8,11 @@
 // RUN: not emitrust-import-c %t/puts-value.c 2>&1 | FileCheck %s --check-prefix=PUTSVALUE
 // RUN: not emitrust-import-c %t/putchar-value.c 2>&1 | FileCheck %s --check-prefix=PUTCHARVALUE
 // RUN: not emitrust-import-c %t/utf8-literal.c 2>&1 | FileCheck %s --check-prefix=UTF8LIT
+// RUN: not emitrust-import-c %t/literal-write.c 2>&1 | FileCheck %s --check-prefix=LITWRITE
+// RUN: not emitrust-import-c %t/literal-incdec.c 2>&1 | FileCheck %s --check-prefix=LITINCDEC
+// RUN: not emitrust-import-c %t/literal-deref-write.c 2>&1 | FileCheck %s --check-prefix=LITDEREFWRITE
+// RUN: not emitrust-import-c %t/wide-subscript.c 2>&1 | FileCheck %s --check-prefix=WIDESUB
+// RUN: not emitrust-import-c %t/literal-identity.c 2>&1 | FileCheck %s --check-prefix=LITIDENT
 
 // C99-47/28 boundaries: string shapes outside the supported subset keep
 // located rejections.
@@ -92,3 +97,46 @@ int main(void) {
   return s[0];
 }
 // UTF8LIT: utf8-literal.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-ordinary string literal initializer
+
+// Element reads of a literal are supported (C99-28, strings-exprs.c), but
+// every write into the literal's read-only backing is UB in C and keeps a
+// located rejection: plain and compound assignment, ++/--, and the
+// deref-of-arithmetic spelling all funnel through the same store guard.
+//--- literal-write.c
+int main(void) {
+  "abc"[0] = 'x';
+  return 0;
+}
+// LITWRITE: literal-write.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: write into a string literal
+
+//--- literal-incdec.c
+int main(void) {
+  ++"abc"[1];
+  return 0;
+}
+// LITINCDEC: literal-incdec.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: write into a string literal
+
+//--- literal-deref-write.c
+int main(void) {
+  *("abc" + 2) = 'x';
+  return 0;
+}
+// LITDEREFWRITE: literal-deref-write.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: write into a string literal
+
+// Literal element access covers ordinary literals only; a wide literal
+// has no byte backing.
+//--- wide-subscript.c
+int main(void) {
+  return L"abc"[1];
+}
+// WIDESUB: wide-subscript.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: subscript of a non-ordinary string literal
+
+// Comparing two string literals with == is pointer identity, which C
+// leaves unspecified (two "abc" literals may or may not share storage);
+// each literal is its own backing, so the same-object comparison rule
+// rejects the pair.
+//--- literal-identity.c
+int main(void) {
+  return "abc" == "abc";
+}
+// LITIDENT: literal-identity.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: comparison of pointers into different objects

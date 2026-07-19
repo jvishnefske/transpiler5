@@ -973,25 +973,53 @@ rule.
   pointers are located rejections.
   (test/Import/C/fn-pointers.c, fn-pointers-invalid.c,
   test/EndToEnd/fn-pointers.c, test/Target/Rust/fn-pointers.mlir)
-- [ ] C99-28 String literals as char-array initializers and as pointer
-  values, with the C escape set (beyond the current printf-format-only
-  support). PARTIAL: `char s[N] = "..."` / `char s[] = "..."` is
-  supported for plain/signed char arrays. Block scope lowers to
-  per-element byte assigns over the default-zero place — the literal's
-  bytes plus the terminating NUL when it fits (C99 6.7.8p14), remaining
-  elements keeping the zero fill; file scope folds through the
-  C99-11/14 APValue path to a typed i8 ArrayAttr on `emitrust.global`.
-  Embedded NULs in the literal are ordinary data. `char *p = "..."`
-  pointer bindings are supported as read-only string-literal regions
-  (CTS-P1): the pointer is an i64 cursor into an immutable backing byte
-  array holding the literal's bytes plus the terminating NUL, with the
-  same ASCII policy on the backing bytes. Located rejections: non-ASCII
-  bytes (all scopes, keeping the printed contents exact through the
-  ASCII-only %s/%c helpers), wide/unsigned-char element types, and
-  writes through a literal-bound pointer (the region is read-only).
-  (test/Import/C/strings.c, strings-invalid.c,
-  aggregate-init-invalid.c, pointers-string-literal.c,
-  test/EndToEnd/strings.c, string-cursor.c)
+- [x] C99-28 String literals as char-array initializers and as pointer
+  values, with the C escape set (beyond the original printf-format-only
+  support). Array initializers: `char s[N] = "..."` / `char s[] = "..."`
+  for plain, signed, and unsigned char arrays at both scopes (bytes are
+  bytes; the unsigned elements live in the ui8 domain). Block scope
+  lowers to per-element byte assigns over the default-zero place — the
+  literal's bytes plus the terminating NUL when it fits (C99 6.7.8p14),
+  remaining elements keeping the zero fill; file scope folds through the
+  C99-11/14 APValue path to a typed i8/ui8 ArrayAttr on
+  `emitrust.global`. Embedded NULs in the literal are ordinary data;
+  wide (`L"..."`) literals fill wchar_t (i32) arrays one code unit per
+  element (CTS-L3). Pointer values: `char *p = "..."` (and const char *)
+  binds a read-only string-literal region (CTS-P1) — an i64 cursor into
+  an immutable const-marked backing byte array holding the bytes plus
+  the terminating NUL. Expression positions complete the entry: a
+  subscript directly on a literal (`"abc"[i]`, constant or variable
+  index) and the deref-of-arithmetic spelling (`*("abc" + n)`) read
+  through the same cached backing, created on demand for anonymous
+  decayed literals; `sizeof("...")` folds to length + 1 through clang's
+  layout query (adjacent-literal operands included); a literal passed to
+  a user-defined function's char-pointer (slice) parameter materializes
+  a fresh mutable backing per call (FR-28, writes being UB makes the
+  copy unobservable); string-helper arguments (strlen, ...) slice the
+  backing; printf/puts %s shapes are unchanged; a literal compared
+  against a null pointer constant folds to false. Adjacent string
+  literals concatenate before import (clang folds translation phase 6),
+  so every position above accepts the joined form. The full C escape
+  set — simple escapes including \a \b \f \v \r \?, octal, and hex —
+  arrives from clang already decoded to bytes, so every path above is
+  spelling-blind (character constants share this machinery, C99-4).
+  Located rejections, each pinned: non-ASCII bytes in any literal path
+  (the ASCII-only policy keeping printed contents exact through the
+  %s/%c helpers — unchanged and deliberate); u8/u/U literal kinds
+  everywhere and wide literals outside the array-initializer position
+  (a wide subscript has no byte backing); every write into a literal —
+  plain and compound assignment, ++/--, and the deref spelling all
+  funnel through one store guard on the const-marked backing (writing a
+  C string literal is UB); literal-to-literal == (pointer identity is
+  unspecified in C; each literal is its own backing, so the
+  same-object comparison rule rejects the pair); %s literal arguments
+  with embedded NUL or non-printable bytes; a literal bound through an
+  unsigned-char pointer cast (CTS-P3 cast traffic); and `__func__`
+  element access (C99-29).
+  (test/Import/C/strings.c, strings-exprs.c, strings-invalid.c,
+  pointers-string-literal.c, globals-pointer-string.c, strings-wide.c,
+  printf-slice-param.c, char-constants.c, test/EndToEnd/strings.c,
+  strings-exprs.c, string-cursor.c, char-constants.c)
 - [x] C99-29 Float literal forms including hexadecimal float constants,
   and __func__. Every float literal spelling — decimal, leading/trailing
   dot, exponent, hexadecimal (C99 6.4.4.2), and the f/F suffixes —
