@@ -2,6 +2,7 @@
 // RUN: not emitrust-import-c %t/deref.c 2>&1 | FileCheck %s --check-prefix=DEREF
 // RUN: not emitrust-import-c %t/arith.c 2>&1 | FileCheck %s --check-prefix=ARITH
 // RUN: not emitrust-import-c %t/mixed.c 2>&1 | FileCheck %s --check-prefix=MIXED
+// RUN: not emitrust-import-c %t/narrow.c 2>&1 | FileCheck %s --check-prefix=NARROW
 
 // Int-carrier boundaries (see pointers-int-carrier.c). A carrier is an
 // integer in pointer clothing: it has no base object, so using it AS a
@@ -43,4 +44,16 @@ int mixed(size_t v) {
   int *p = &x;
   p = (int *)v;
   return x;
+}
+
+// Only a pointer-width (64-bit) integer rides as a carrier: a
+// sub-pointer-width cast could only hold a truncated address, which can
+// never round-trip, so it keeps the historical non-address rejection
+// even when the pointer is only ever truth-tested.
+// NARROW: narrow.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer assigned a non-address value
+
+//--- narrow.c
+int narrow(int v) {
+  int *p = (int *)v;
+  return p != 0;
 }

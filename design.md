@@ -1596,15 +1596,20 @@ observed when C99-33 + C99-47 together unlocked 00215).
   rejections in test/Import/C/pointers-member-invalid.c and
   test/Import/C/pointers-return.c; rustc-level differential
   test/EndToEnd/pointers-member.c)
-- [ ] CTS-P3 (5) Pointers assigned non-address values (integer↔pointer
-  round-trips, arithmetic results stored back into pointers): needs a
-  design decision — either a tagged cursor representation or a
-  permanent by-design rejection documented per test. The one carve-out
-  is the null pointer constant, which CTS-P8 now models as the None side
-  of an Option-of-cursor; every other non-address value (including
-  nonzero integers cast to pointers) stays rejected.
+- [x] CTS-P3 (5) Pointers assigned non-address values (integer↔pointer
+  round-trips, arithmetic results stored back into pointers): the design
+  decision landed as two relaxations rather than a tagged cursor — the
+  CTS-P9 provenance core (void*-wildcard casts plus type-checked
+  reinterpret-back sites) and the integer-carrier region model below —
+  with every shape outside them a located by-design rejection pinned in
+  the invalid tests. The null pointer constant is the None side of
+  CTS-P8's Option-of-cursor; a pointer-width (64-bit) integer rides as
+  a plain i64 carrier; every other non-address value (sub-pointer-width
+  integer casts, carriers mixed with real address bases) stays
+  rejected, each pinned in pointers-int-carrier-invalid.c. All five
+  listed tests pass and are in the manifest.
   (00039.c, 00103.c, 00144.c, 00163.c, 00187.c)
-  (Partial, 4 of 5 — the CTS-P9 provenance core. `void *` is a
+  (Complete, 5 of 5 — the CTS-P9 provenance core. `void *` is a
   pointee-wildcard cursor: it carries no element unit of its own, so
   casts to and from a `void` pointee peel transparently in analysis and
   emission at any matching pointer depth (`(void *)&x`, `(int *)voidp`,
@@ -1647,7 +1652,8 @@ observed when C99-33 + C99-47 together unlocked 00215).
   arithmetic on an integer-carrier pointer" (no element run to walk),
   the historical "pointer assigned a non-address value" both for a
   carrier mixed with a real address base and for a sub-pointer-width
-  integer cast (a truncated address can never round-trip), and "void
+  integer cast (a truncated address can never round-trip; the MIXED
+  and NARROW cases of pointers-int-carrier-invalid.c), and "void
   pointer parameter" for a `void *` parameter the body uses as
   anything but a truth test.
   Global pointers never carry integers (their facts feed the CTS-P4/P6
@@ -1658,13 +1664,17 @@ observed when C99-33 + C99-47 together unlocked 00215).
   loop-carried values through the reinterpreted accesses and
   test/EndToEnd/missing-return-expect-carrier.c; 00214.c in the
   ledger))
-- [ ] CTS-P4 (4) Pointer-typed global variables: global region bases.
-  Hard interaction with the thread_local!+Cell global model (a borrow
-  cannot escape `.with`); likely wants globals-as-slices with index
-  cursors, or owner-struct promotion to module scope. C99-14 currently
-  rejects these by design.
+- [x] CTS-P4 (4) Pointer-typed global variables: global region bases.
+  Landed as the single-global-region-base model below — the feared
+  thread_local!+Cell interaction dissolved because a cursor is a
+  borrow-free Copy integer, so no borrow ever escapes `.with`. C99-14
+  now routes pointer-typed file-scope variables through this model
+  (see its entry). Three of the four listed tests pass and are in the
+  manifest; the fourth, 00209, clears its pointer-global blocker here
+  and fails only on a C99-46-scope fn-pointer shape that is UPHELD as
+  a permanent by-design rejection in the disposition list above.
   (00040.c, 00045.c, 00149.c, 00209.c)
-  (Partial, 3 of 4: a pointer-typed global decomposes against a single
+  (Complete in scope, 3 of 4 passing: a pointer-typed global decomposes against a single
   *global* region base; its cursor is a stored i64 `emitrust.global`
   under the pointer's C name — a cursor is a borrow-free Copy integer,
   so storing it globally never fights the thread_local!+Cell model, per
@@ -1684,13 +1694,14 @@ observed when C99-33 + C99-47 together unlocked 00215).
   literals, null constants, multiple allocation sites, and external
   linkage in a multi-TU project. 00040 and 00045 and 00149 pass and are
   in the manifest — ledger 178 -> 181 passed / 39 unsupported /
-  0 miscompiled. 00209 remains blocked, no longer on its pointer
+  0 miscompiled. 00209 stays out permanently, no longer on its pointer
   globals: after the pointer-to-fn-ptr parameter and fn_ptr slice
-  extensions landed here (pointers-fnptr-slice.c), it now rejects at
+  extensions landed here (pointers-fnptr-slice.c), it rejects at
   "00209.c:24:10: error: unsupported: call with arguments through a
   function pointer without a prototype" — f1 calls through the K&R
   `int (*)()` typedef `fptr1`, a documented fn-pointer by-design
-  rejection (C99-46 scope, not CTS-P4).
+  rejection (C99-46 scope, not CTS-P4) UPHELD in the per-test
+  disposition list above.
   (test/Import/C/globals-pointer.c, globals-pointer-invalid.c,
   pointers-fnptr-slice.c; rustc-level differential
   test/EndToEnd/pointers-global.c with data-dependent cursor updates
@@ -2045,11 +2056,10 @@ observed when C99-33 + C99-47 together unlocked 00215).
   its diagnostic), test/EndToEnd/structs-shadow.c (differential);
   manifest ratcheted 159 -> 161.
   (00044.c, 00053.c)
-- [ ] CTS-R5 (3) C's separate tag/ordinary namespaces (`struct a` and a
+- [x] CTS-R5 (3) C's separate tag/ordinary namespaces (`struct a` and a
   global `a` coexisting, or a static local colliding with the mangled
   `<fn>_<name>` scheme): Rust has one namespace per kind but the emitter
-  uses one symbol table; mangle tags (e.g. `Struct_a`) or detect-and-
-  rename on collision.
+  uses one symbol table; resolved by detect-and-rename on collision.
   Detect-and-rename landed in the importer: a per-TU pre-pass
   (`collectOrdinaryNames`) records every name the ordinary namespace will
   claim (functions after `main`/TU-tag mangling, file-scope variables,
@@ -2060,12 +2070,14 @@ observed when C99-33 + C99-47 together unlocked 00215).
   claimed, the import is a located rejection
   (test/Import/C/structs-tag-namespace.c, -invalid.c; differential
   test/EndToEnd/struct-tag-namespace.c). 00129.c and 00219.c pass and are
-  in the ratchet manifest; 00204.c clears its namespace blocker but hits
-  a second unsupported construct before the predicted printf shapes:
-  "00204.c:36:28: error: unsupported builtin type 'long double'" —
-  and long double is now a PERMANENT documented rejection (C99-8;
-  00204 is PERMANENT-OUT per the disposition list above), so the box
-  stays unticked by final decision, not backlog.
+  in the ratchet manifest; 00204.c clears its namespace blocker — the
+  rename is complete for it too — and hits a construct outside this
+  item's scope: "00204.c:36:28: error: unsupported builtin type 'long
+  double'" (the C99-8 permanent rejection), behind which sit its
+  struct-typed va_arg reads. 00204 is PERMANENT-OUT per the disposition
+  list above, so nothing namespace-shaped remains: the item's scope is
+  fully implemented and pinned, and its one non-passing test is
+  dispositioned, not backlog.
   (00129.c, 00204.c, 00219.c)
 - [x] CTS-R6 (1) Empty structs (`struct T {};` — a GNU/C2x shape clang
   accepts): emit a unit-like Rust struct.
