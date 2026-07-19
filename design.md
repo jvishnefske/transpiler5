@@ -776,8 +776,19 @@ rule.
   Vec-backed mapping).
 - [ ] C99-17 Flexible array members (design decision needed; likely
   rejection).
-- [ ] C99-18 inline functions and the C99 inline linkage rules (semantic
-  no-op for the transpiler; accept and ignore).
+- [x] C99-18 inline functions and the C99 inline linkage rules: a
+  semantic no-op for the transpiler — the specifier is accepted and
+  ignored, and every inline definition imports as an ordinary function
+  with its body. The tricky C99 linkage case, a plain inline definition
+  without extern (C99 6.7.4p7: an inline definition that provides no
+  external definition), still hands clang's AST the full body, and in
+  the merged whole-program module the single ordinary definition is the
+  right shape; extern inline (the spelling that does provide the
+  external definition) imports identically. static inline rides the
+  ordinary internal-linkage path: bare name in a single-TU import,
+  per-TU mangled in a multi-TU import so identically named static
+  inline helpers in two units stay distinct (C99-38/FR-26).
+  (test/Import/C/inline.c, inline-multi-tu.c, test/EndToEnd/inline.c)
 
 ### Expressions and operators
 
@@ -916,8 +927,23 @@ rule.
   differential regression test — direct recursion at data-dependent
   depth plus a mutually recursive is_even/is_odd pair.
   (test/EndToEnd/recursion.c)
-- [ ] C99-36 Array parameters with decay semantics, including the C99
-  static and qualifier forms inside the brackets.
+- [x] C99-36 Array parameters with decay semantics, including the C99
+  static and qualifier forms inside the brackets. Every bracketed form —
+  unsized, sized, the C99 minimum-length static form, and the const /
+  volatile qualifier forms — adjusts to a pointer parameter in clang's
+  AST (C99 6.7.5.3p7), so each rides the ordinary Phase-1b
+  pointer-parameter classification: subscripted use classifies as a
+  slice reference, deref-only use as a scalar reference. The bracket
+  qualifiers qualify the decayed POINTER object itself, not the pointee,
+  and the decomposition erases that object, so const and volatile inside
+  the brackets are accepted and ignored — this leaves C99-7's policy on
+  volatile OBJECTS untouched, since no volatile access ever survives to
+  the emitted Rust. Exclusions keep their located pointer-parameter
+  diagnostics: a multidimensional array parameter decays to a
+  pointer-to-array with no slice shape, and an array-of-pointers
+  parameter decays to a rejected pointer-to-pointer (CTS-P5).
+  (test/Import/C/array-params.c, array-params-invalid.c,
+  test/EndToEnd/array-params.c)
 - [ ] C99-37 Variadic function definitions and va_list (design decision
   needed; Rust has no stable varargs — likely a permanent documented
   rejection, with printf-style call sites special-cased as today).
