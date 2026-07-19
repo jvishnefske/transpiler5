@@ -290,20 +290,78 @@ lists the lit test file(s) that validate it.
   cargo) keeps the harness green inside check-emitrust; big campaigns run
   via fuzz_differential.py (see test/Fuzz/README.md).
 
-  Pipeline-level differential abstract interpretation (future work): a
-  deferred complement to seed sampling — run MLIR's integer-range
-  dataflow analysis over the imported IR and run it again after
-  lift-cf-to-scf and the conversion passes, then check refinement at the
-  observation points (printf operands, return values): every post-pass
-  range must be contained in the corresponding pre-pass range, which
-  would catch pass-introduced miscompiles for ALL values rather than
-  for sampled seeds. Honest cost note: emitrust dialect ops currently
-  implement no integer-range transfer functions, so today both sides of
-  that comparison immediately widen to top and the containment check is
-  vacuous (top-vs-top); the idea only pays for itself after investing
-  in per-op transfer functions and range-annotation plumbing at the
-  observation points, which is why it is recorded here as future work
-  rather than folded into this pass.
+  Pipeline-level differential abstract interpretation (landed): the
+  emitrust-range-refinement-check pass runs MLIR's integer-range dataflow
+  analysis (IntegerRangeAnalysis over InferIntRangeInterface) before and
+  after convert-to-emitrust and compares the derived ranges at the
+  observation points. Two input modes: primary (a plain post-mem2reg
+  module — the pass analyzes it, clones it, runs convert-to-emitrust on
+  the clone in a nested pass manager, and re-analyzes) and secondary (a
+  module holding exactly two nested builtin.module ops tagged
+  emitrust.stage = "before"/"after", compared directly with no internal
+  conversion). Matching convention: observation points are keyed by
+  (enclosing function symbol, per-function occurrence index of the
+  emitrust.call_opaque "print!" call or of the return terminator, operand
+  index); occurrence indices restart per function, so the comparison is
+  positional per function, not global.
+
+  Per-op transfer-function coverage, three classes:
+  - Trivial with interface (exact or refining): emitrust.constant
+    (singleton), emitrust.cmp (result in 0..1, refined to a constant when
+    the operand ranges decide the predicate; ordered predicates compare
+    unsigned exactly when the operand type is ui<N>), emitrust.cast
+    (int-to-int: same width preserves the bit pattern, narrowing
+    truncates, widening zero-extends from ui<N>/i1 and sign-extends from
+    signless i<N> — the ui/i signedness mapping that makes the checker
+    target sign-extension bugs), emitrust.select (branch union, or the
+    taken branch when the condition is statically known), and the binary
+    ops add, sub, mul, div, rem, and, or, xor, shl, shr (signedness
+    selected by type for div/rem/shr).
+  - Lossy top (interface present, deliberately unconstrained):
+    emitrust.literal (opaque text) pins its integer result to the full
+    type range; emitrust.enum_raw constrains nothing (its result is a
+    place, not an integer).
+  - Opaque (no interface, top by framework default or by absence):
+    emitrust.load and all other memory/place ops, call_opaque results,
+    global_load, method_call, and values inside emitrust region ops whose
+    lattices stay uninitialized — all read as TOP at observation points.
+
+  Wrap semantics: every transfer function delegates to the
+  mlir::intrange::infer* helpers with OverflowFlags::None — never
+  nsw/nuw — because unsigned emitrust arithmetic is emitted as Rust
+  wrapping_* calls and signless arithmetic mirrors two's-complement
+  machine arithmetic; defined wrap-around on either side of the
+  comparison therefore never manufactures a false positive
+  (test/Conversion/range-refinement/positive-wrap.mlir pins this).
+
+  Verdict semantics: EMPTY INTERSECTION ONLY. A hard, located error —
+  "range refinement violation: '<fn>' print operand <k> (or return value
+  <k>) has pre-conversion range [..] disjoint from post-conversion range
+  [..]" — is emitted only when the pre and post ranges are disjoint under
+  BOTH the unsigned (umin/umax) and the signed (smin/smax) interpretation
+  of ConstantIntRanges' paired-bounds intersection. This is the
+  deliberately conservative lattice choice: each interpretation's bounds
+  are individually sound, but ranges built from a single interpretation
+  carry an artificially widened complement, so requiring both empty is
+  immune to one-sided widening and cannot flag two sound ranges that
+  share a value. Mere containment failure (post not within pre, e.g. a
+  memory load that reads TOP after conversion) is silent, tracked only by
+  the containment-failures pass statistic; uninitialized or absent
+  lattice values are TOP.
+
+  Honest coverage statement: the checker proves range consistency, not
+  value identity. It targets the sign-extension/zero-extension and
+  constant-folding miscompile class (a ui<N> value re-interpreted signed,
+  a wrong folded constant — anything that moves an observation point's
+  range off the original), and it covers ALL values of those ranges, not
+  sampled seeds. It does NOT catch value-identity bugs whose wrong value
+  still lies inside the pre-conversion range — in particular the
+  lost-copy/swap class of SSA-destruction bugs (both swapped values
+  inhabit the same range), which remains the province of the differential
+  fuzzer and the pinned EndToEnd lost-copy tests.
+  (test/Conversion/range-refinement/positive-refine.mlir,
+  positive-wrap.mlir, positive-memory-top.mlir, negative-pair.mlir,
+  negative-return.mlir)
 - [x] FR-25 Generality beyond test vectors: an adversarial audit plus
   differential stress run over shapes absent from the original tests
   (negative/sparse/INT_MAX-adjacent case labels, nested switch, default
