@@ -849,8 +849,54 @@ rule.
   test/Import/C/unions-invalid.c (float arm, size mismatch, pointer
   arm, bit-field arm, empty union — all located),
   test/EndToEnd/unions.c (differential), c-testsuite 00042.c.
-- [ ] C99-45 Bit-fields (design decision needed: mask-and-shift accessor
-  synthesis, or documented rejection).
+- [x] C99-45 Bit-fields. DECIDED: mask-and-shift accessor synthesis over
+  per-run backing integers (not a documented rejection). PARTIAL —
+  landed with c-testsuite 00218 (T1.2). Layout: each maximal run of
+  consecutively declared bit-field members packs LSB-first in
+  declaration order into a synthesized backing field `__bits<n>` (n
+  counts runs from 0 across the flattened record) of the smallest
+  unsigned type (ui8/ui16/ui32/ui64) holding the run's total bits; runs
+  split at any non-bit-field member, and the bit-field members' own
+  names never appear in the struct_def. This layout is the project's
+  OWN and deliberately NOT ABI-compatible with the C compiler's
+  bit-field layout — which is why `sizeof`/`_Alignof` of any type
+  containing a bit-field record is a located rejection
+  (`unsupported: sizeof of a struct with bit-fields`): the C layout
+  number would promise an ABI the emitted Rust does not keep. Reads
+  load the backing field, `emitrust.shr` by the bit offset (always
+  emitted, offset 0 included), `emitrust.and` with the width mask, then
+  convert: unsigned/_Bool/enum-typed fields ZERO-extend from the
+  unsigned backing (the 00218 core: an `enum : 8` field holding 152
+  reads back 152, never -104, regardless of the enum's own underlying
+  signedness), plain-int signed fields sign-extend from their declared
+  width via `arith.shli`/`arith.shrsi` by (type width - field width).
+  Writes are read-modify-writes: load, clear the window with the
+  complement mask, cast the RHS to the backing type (from the enum type
+  for enum RHS), truncate with the width mask (always a separate step),
+  `emitrust.shl` by the offset (always emitted), `emitrust.or`, assign
+  the backing field; a value-position assignment stages the truncated
+  post-store field value (converted like a read). Alongside: struct
+  MEMBER names that are Rust keywords now mangle with a trailing
+  underscore (`type` -> `type_`, 00218 declares a member named `type`)
+  instead of rejecting — members only; struct/enum/function/global
+  keyword names keep their rejections — and a mangle collision (`type`
+  next to `type_`) is a located rejection. Out of scope, all located
+  rejections: zero-width and anonymous bit-fields, runs wider than 64
+  bits, bit-field arms in unions (unchanged wording), compound
+  assignment / increment on bit-fields, aggregate and global-constant
+  initializers touching bit-field members. Traceability: importer
+  `lib/ImportC/ImportC.cpp` (`collectRecordFields` run packing,
+  `bitFieldAccessInfo`, `emitBitFieldRead`, `emitBitFieldAssign`,
+  `convertBitFieldFieldValue`, `createBitFieldMask`,
+  `emitMemberBasePlace`, `mangleMemberName`/`flattenedFieldName`,
+  `typeContainsBitField` in `emitSizeofAlignof`); tests
+  test/Import/C/bitfields.c (packing, read/write accessor shapes,
+  signed extension, run splitting), bitfields-invalid.c (union arm,
+  sizeof), struct-member-keyword.c (mangle end-to-end),
+  keywords-invalid.c (non-member keyword rejections stay),
+  test/EndToEnd/bitfields-zeroextend.c (00218 core, differential),
+  test/EndToEnd/bitfields-flags.c (mixed runs, RMW isolation,
+  signed truncation), c-testsuite 00218.c.
 - [ ] C99-46 Dynamic memory: malloc, calloc, realloc, free (design
   decision needed under the no-unsafe rule: Box/Vec-based ownership
   reconstruction works only for disciplined allocation patterns; an
@@ -1007,8 +1053,8 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-18: 220 total / 215 passed / 0 miscompiled /
-5 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-18: 220 total / 216 passed / 0 miscompiled /
+4 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5/P2/P4/P6 partials, and
 CTS-S1/S2/S4/S6/P1/P5/P7/P8/R1/R2/R4/L1/L2 landed since, and the
 2026-07-18 TDD wave took 200 -> 213: unions as one-slot structs
@@ -1019,14 +1065,14 @@ StmtExpr pack [+00213 +00214], and fn-ptr devirtualization +
 global-pointer returns [+00089 +00189]; the T1.1 ledger wave took
 213 -> 215: dead-VLA elision + constant-LHS short-circuit folding,
 byte-array union arms, and the local void* fn-ptr holder [+00207
-+00210]). Every one of
-the 5 is a located build-time rejection — never wrong output.
-The 5 remaining are deliberately OUT of scope for those waves, each
++00210]; the T1.2 wave took 215 -> 216: C99-45 bit-field accessors
+over backing runs + keyword-member mangling [+00218]). Every one of
+the 4 is a located build-time rejection — never wrong output.
+The 4 remaining are deliberately OUT of scope for those waves, each
 with a recorded reason: 00187 (FILE*/stdio streams — C99-48 scope),
 00204 (long double ABI), 00209 (K&R unprototyped fn-ptr call — a
 by-design rejection), 00216 (VLA + flexible array members +
-range designators), 00218 (enum-typed bit-fields — C99-45's own wave;
-its union piece landed with CTS-R3).
+range designators).
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
 checkbox discipline as above — tick only when the referenced tests pass
@@ -1981,7 +2027,9 @@ matching beyond literal match arms, data-carrying enums (C-like unit-variant
 enums are supported), error-handling sugar, and expression trees (every
 value is a named let binding; no inlining of subexpressions). On the C side
 the importer rejects, with located diagnostics: computed goto (plain
-goto/labels are supported per C99-33), unions, bitfields,
+goto/labels are supported per C99-33), unions outside the one-slot
+model (CTS-R3), bit-fields outside the C99-45 backing-run accessor
+model,
 int-to-enum conversions, pointer-to-pointer values, pointer struct fields,
 NULL data pointers, void* casts, malloc and friends
 (pointer arithmetic, pointer locals, and pointer/array parameters are now

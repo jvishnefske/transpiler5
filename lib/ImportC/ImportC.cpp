@@ -301,6 +301,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <string>
@@ -411,6 +412,48 @@ static bool isRustKeyword(llvm::StringRef name) {
       // Contextual keyword that still reads confusingly as an item name.
       "union"};
   return keywords.contains(name);
+}
+
+/// Returns the Rust spelling of a struct/union MEMBER name: a spelling that
+/// is a Rust keyword mangles deterministically by appending a single
+/// underscore (`type` -> `type_`, `match` -> `match_`); every other
+/// spelling is kept verbatim. Member names are the one identifier class
+/// that mangles instead of rejecting (C99-45: c-testsuite 00218 declares a
+/// member named `type`): the mangled spelling never leaves the emitted
+/// struct's own field namespace, so no cross-symbol collision policy is
+/// disturbed. Struct/enum/function/global names keep their rejections. A
+/// collision the mangle introduces (a struct declaring both `type` and
+/// `type_`) is rejected where the fields are collected.
+static std::string mangleMemberName(llvm::StringRef name) {
+  if (isRustKeyword(name))
+    return (name + "_").str();
+  return name.str();
+}
+
+/// Returns whether `type` is, or contains (through record fields and array
+/// elements, never through pointers), a record with a bit-field member.
+/// Used to refuse `sizeof`/`_Alignof` folds over bit-field records: the
+/// C99-45 backing-run layout is deliberately not ABI-compatible, so the C
+/// layout numbers would promise a layout the emitted Rust does not keep.
+/// Recursion depth is bounded by the source's type nesting (pointers are
+/// not followed, so self-referencing records terminate).
+static bool typeContainsBitField(clang::QualType type) {
+  const clang::Type *canonical = type.getCanonicalType().getTypePtr();
+  while (const auto *array = llvm::dyn_cast<clang::ArrayType>(canonical))
+    canonical = array->getElementType().getCanonicalType().getTypePtr();
+  const clang::RecordDecl *record = canonical->getAsRecordDecl();
+  if (!record)
+    return false;
+  record = record->getDefinition();
+  if (!record)
+    return false;
+  for (const clang::FieldDecl *field : record->fields()) {
+    if (field->isBitField())
+      return true;
+    if (typeContainsBitField(field->getType()))
+      return true;
+  }
+  return false;
 }
 
 /// A pointer expression decomposed into its statically resolved base object
@@ -1372,10 +1415,12 @@ private:
   /// anonymous shape share one struct_def. An empty member list
   /// (`struct T {};`) imports as a field-less struct_def. The field list
   /// is flattened through `collectRecordFields`, which resolves C11
-  /// 6.7.2.1p13 anonymous struct/union members. A union definition
-  /// imports as a ONE-FIELD struct through `collectUnionSlot` (its
-  /// storage field is the first arm's leaf); union shapes outside that
-  /// model, bit-fields, and unsupported field types are rejected.
+  /// 6.7.2.1p13 anonymous struct/union members, packs bit-field runs
+  /// into `__bits<n>` backing fields (C99-45), and mangles Rust-keyword
+  /// member spellings. A union definition imports as a ONE-FIELD struct
+  /// through `collectUnionSlot` (its storage field is the first arm's
+  /// leaf); union shapes outside that model (including bit-field arms)
+  /// and unsupported field types are rejected.
   LogicalResult importRecord(const clang::RecordDecl *record, Location loc);
 
   /// Appends the flattened field list of `record` to
@@ -1392,12 +1437,24 @@ private:
   /// reading any union member with the type of the last store yields
   /// that stored value. Any other anonymous union rejects exactly as
   /// union types do elsewhere ("unsupported: union type", CTS-R3); other
-  /// unnamed members, bit-fields, and Rust-keyword spellings are
-  /// rejected with the field's location.
+  /// unnamed members are rejected with the field's location. Member
+  /// names that are Rust keywords mangle with a trailing underscore
+  /// (`mangleMemberName`); a final spelling that collides with another
+  /// member's is a located rejection. Bit-field members pack per run
+  /// (C99-45): each maximal run of consecutively declared bit-field
+  /// members packs LSB-first in declaration order into one synthesized
+  /// backing field `__bits<n>` (`n` counts runs from 0 across the whole
+  /// flattened record, threaded through `bitFieldRuns`) of the smallest
+  /// unsigned type (ui8/ui16/ui32/ui64) holding the run's total bits;
+  /// runs split at any non-bit-field member. The bit-field members' own
+  /// names never appear in the struct_def; their accessors are recorded
+  /// in `bitFieldAccessInfo`. Zero-width and anonymous bit-fields, and
+  /// runs wider than 64 bits, are located rejections.
   LogicalResult
   collectRecordFields(const clang::RecordDecl *record,
                       SmallVectorImpl<llvm::StringRef> &fieldNames,
-                      SmallVectorImpl<Type> &fieldTypes);
+                      SmallVectorImpl<Type> &fieldTypes,
+                      unsigned &bitFieldRuns);
 
   /// Resolves one arm of an anonymous union member to its single
   /// flattened leaf field, descending through nested anonymous struct
@@ -1458,8 +1515,10 @@ private:
 
   /// Returns the spelling `field` carries in its flattened parent
   /// struct_def: its own name or, for a union arm aliased by
-  /// `collectUnionSlot`/`collectRecordFields`, the storage slot's name.
-  llvm::StringRef flattenedFieldName(const clang::FieldDecl *field) const;
+  /// `collectUnionSlot`/`collectRecordFields`, the storage slot's name —
+  /// mangled through `mangleMemberName` when the C spelling is a Rust
+  /// keyword, matching the spelling `collectRecordFields` emitted.
+  std::string flattenedFieldName(const clang::FieldDecl *field) const;
 
   /// Returns the Rust type name `definition` was imported under: the
   /// mangled block-scope name recorded by `importRecord`, the
@@ -2700,9 +2759,66 @@ private:
   /// `emitLValue`'s member-access branch: resolves the base place (an
   /// erased global-return call, a decomposed `p->f`, a reference-typed
   /// `->`, or a recursive lvalue) and selects the flattened field on it
-  /// (anonymous members designate the parent place itself).
+  /// (anonymous members designate the parent place itself). Bit-field
+  /// members have no place of their own (their storage is a window of a
+  /// synthesized backing field) and are rejected here; supported
+  /// bit-field traffic routes through `emitBitFieldRead` and
+  /// `emitBitFieldAssign` before any lvalue is formed.
   FailureOr<Value> emitMemberLValue(const clang::MemberExpr *member,
                                     Location loc, GlobalWriteback *writeback);
+
+  /// Resolves the place of `member`'s base aggregate — the shared front
+  /// half of `emitMemberLValue`, also used by the bit-field accessors:
+  /// an erased global-return call base, a decomposed `p->f`, a
+  /// reference-typed `->` (dereferenced once), or a recursive lvalue.
+  /// The result is an `!emitrust.lvalue` of a struct type.
+  FailureOr<Value> emitMemberBasePlace(const clang::MemberExpr *member,
+                                       Location loc,
+                                       GlobalWriteback *writeback);
+
+  /// Emits the C99-45 bit-field READ accessor for `member` (whose field
+  /// must have an entry in `bitFieldAccessInfo`): load the backing
+  /// field, `emitrust.shr` by the field's bit offset (always emitted,
+  /// offset 0 included), `emitrust.and` with the width mask, then
+  /// convert the masked backing-typed value to the member's mapped type
+  /// via `convertBitFieldFieldValue`.
+  FailureOr<Value> emitBitFieldRead(const clang::MemberExpr *member,
+                                    Location loc);
+
+  /// Emits the C99-45 bit-field WRITE accessor `member = rhs` as a
+  /// read-modify-write on the backing field: load, `emitrust.and` with
+  /// the complement mask (clearing the field's window), cast the RHS to
+  /// the backing type (from an enum type when the RHS is enum-typed),
+  /// `emitrust.and` with the width mask (the truncation is always its
+  /// own step), `emitrust.shl` by the bit offset (always emitted),
+  /// `emitrust.or` into the cleared word, `emitrust.assign` the backing
+  /// field. A global base commits through the ordinary staged-copy
+  /// writeback (`refreshStaged` mirrors `assignStalenessRisk`). With
+  /// `wantValue` the truncated field value converts to the member's
+  /// mapped type (C's value of an assignment is the post-store field
+  /// value) and is staged in a fresh place, which is returned; otherwise
+  /// the returned value is null.
+  FailureOr<Value> emitBitFieldAssign(const clang::MemberExpr *member,
+                                      const clang::Expr *rhs, Location loc,
+                                      bool refreshStaged, bool wantValue);
+
+  /// Converts `masked` — a bit-field's value bits, right-aligned in its
+  /// unsigned backing type — to the member's mapped type: enum-typed
+  /// fields cast (zero-extending from the unsigned source) to the enum
+  /// type, `_Bool` fields compare against zero, unsigned fields
+  /// zero-extend with `emitrust.cast`, and plain-int signed fields cast
+  /// to the mapped signed type and sign-extend from their declared width
+  /// via `arith.shli`/`arith.shrsi` by (type width - field width).
+  FailureOr<Value> convertBitFieldFieldValue(Location loc, Value masked,
+                                             const clang::FieldDecl *field);
+
+  /// Builds the unsigned mask constant of a bit-field window, typed as
+  /// the backing type: the width mask (`width` low bits set, used after
+  /// the read shift and for the write truncation) or, with `complement`,
+  /// its inverse shifted onto the window (`~(widthMask << offset)`, used
+  /// to clear the window in the write's read-modify-write).
+  Value createBitFieldMask(Location loc, IntegerType backingType,
+                           unsigned width, unsigned offset, bool complement);
 
   /// `emitLValue`'s subscript branch: an array base subscripts its
   /// element place; a pointer base decomposes into (base, cursor) and
@@ -2819,6 +2935,30 @@ private:
   /// no access through the arm is representable on that slot;
   /// `emitMemberLValue` rejects each such access at its own site.
   llvm::SmallPtrSet<const clang::FieldDecl *, 4> unionByteArrayArms;
+  /// The C99-45 accessor geometry of one bit-field member: the window
+  /// `[offset, offset + width)` of the synthesized unsigned backing field
+  /// `backingName` (of type `backingType`) in its flattened parent
+  /// struct_def. Recorded by `collectRecordFields` when the member's run
+  /// packs; consulted by `emitBitFieldRead`/`emitBitFieldAssign`.
+  struct BitFieldAccess {
+    /// The backing field's spelling (`__bits<n>`); owned by
+    /// `memberNameArena`.
+    llvm::StringRef backingName;
+    /// The smallest unsigned integer type (ui8/ui16/ui32/ui64) holding
+    /// the run's total bits.
+    IntegerType backingType;
+    /// The field's bit offset from bit 0 (LSB) of the backing field.
+    unsigned offset = 0;
+    /// The field's declared width in bits.
+    unsigned width = 0;
+  };
+  /// Bit-field member -> its accessor geometry (see `BitFieldAccess`).
+  llvm::DenseMap<const clang::FieldDecl *, BitFieldAccess> bitFieldAccessInfo;
+  /// Stable backing storage for member spellings synthesized at import
+  /// (`__bits<n>` backing names, keyword-mangled member names): the
+  /// StringRefs handed to struct_def field lists point in here, and a
+  /// deque never relocates its elements.
+  std::deque<std::string> memberNameArena;
   /// The defining C record behind each emitted struct_def symbol, recorded
   /// by `importRecord` so record-aware consumers (global initializer
   /// conversion) can walk the C field structure of a flattened struct.
@@ -6454,7 +6594,8 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   if (definition->isUnion()) {
     if (failed(collectUnionSlot(definition, fieldNames, fieldTypes)))
       return failure();
-  } else if (failed(collectRecordFields(definition, fieldNames, fieldTypes))) {
+  } else if (unsigned bitFieldRuns = 0; failed(collectRecordFields(
+                 definition, fieldNames, fieldTypes, bitFieldRuns))) {
     return failure();
   }
   // An empty member list (`struct T {};`, a GNU/C2x shape clang accepts) is
@@ -6587,11 +6728,77 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
 LogicalResult CImporter::collectRecordFields(
     const clang::RecordDecl *record,
     SmallVectorImpl<llvm::StringRef> &fieldNames,
-    SmallVectorImpl<Type> &fieldTypes) {
-  for (const clang::FieldDecl *field : record->fields()) {
+    SmallVectorImpl<Type> &fieldTypes, unsigned &bitFieldRuns) {
+  // Interns a synthesized or mangled member spelling in the arena so the
+  // StringRef stored in the field list (and in `bitFieldAccessInfo`)
+  // stays valid for the import's lifetime.
+  auto internName = [&](std::string name) -> llvm::StringRef {
+    return memberNameArena.emplace_back(std::move(name));
+  };
+  // Appends one field under the collision guard: C member names are
+  // unique within a record, so a duplicate FINAL spelling can only come
+  // from keyword mangling (`type` next to `type_`) or from a member
+  // spelled like a synthesized `__bits<n>` backing field.
+  auto appendField = [&](llvm::StringRef finalName, Type type, Location loc,
+                         llvm::StringRef original) -> LogicalResult {
+    if (llvm::is_contained(fieldNames, finalName))
+      return emitError(loc)
+             << "unsupported: struct member '" << original
+             << "' maps to the Rust field name '" << finalName
+             << "', which collides with another member";
+    fieldNames.push_back(finalName);
+    fieldTypes.push_back(type);
+    return success();
+  };
+  SmallVector<const clang::FieldDecl *> fields;
+  for (const clang::FieldDecl *field : record->fields())
+    fields.push_back(field);
+  for (unsigned index = 0, count = fields.size(); index != count; ++index) {
+    const clang::FieldDecl *field = fields[index];
     Location fieldLoc = translateLoc(field->getLocation());
-    if (field->isBitField())
-      return emitError(fieldLoc) << "unsupported: bit-field struct member";
+    if (field->isBitField()) {
+      // C99-45: pack the maximal run of consecutively declared bit-field
+      // members, LSB-first in declaration order, into one backing field.
+      uint64_t totalBits = 0;
+      unsigned runEnd = index;
+      for (; runEnd != count && fields[runEnd]->isBitField(); ++runEnd) {
+        const clang::FieldDecl *bitField = fields[runEnd];
+        Location bitFieldLoc = translateLoc(bitField->getLocation());
+        // A zero-width bit-field is a pure ABI padding directive; the
+        // backing-run layout is deliberately NOT ABI-compatible, so
+        // honoring it would promise a layout this model does not keep.
+        if (bitField->isZeroLengthBitField())
+          return emitError(bitFieldLoc)
+                 << "unsupported: zero-width bit-field member";
+        // An anonymous bit-field is likewise padding-only.
+        if (bitField->isUnnamedBitField() || bitField->getName().empty())
+          return emitError(bitFieldLoc)
+                 << "unsupported: anonymous bit-field member";
+        totalBits += bitField->getBitWidthValue();
+      }
+      if (totalBits > 64)
+        return emitError(fieldLoc)
+               << "unsupported: bit-field run wider than 64 bits";
+      unsigned backingWidth =
+          totalBits <= 8 ? 8 : totalBits <= 16 ? 16 : totalBits <= 32 ? 32
+                                                                      : 64;
+      auto backingType = IntegerType::get(builder.getContext(), backingWidth,
+                                          IntegerType::Unsigned);
+      llvm::StringRef backingName =
+          internName(("__bits" + llvm::Twine(bitFieldRuns++)).str());
+      unsigned offset = 0;
+      for (unsigned i = index; i != runEnd; ++i) {
+        const clang::FieldDecl *bitField = fields[i];
+        bitFieldAccessInfo[bitField] =
+            BitFieldAccess{backingName, backingType, offset,
+                           bitField->getBitWidthValue()};
+        offset += bitField->getBitWidthValue();
+      }
+      if (failed(appendField(backingName, backingType, fieldLoc, backingName)))
+        return failure();
+      index = runEnd - 1; // The loop increment lands on the run's end.
+      continue;
+    }
     if (field->isAnonymousStructOrUnion()) {
       // C11 6.7.2.1p13: the members of an anonymous struct/union member
       // are considered members of the containing structure. Recursion
@@ -6603,8 +6810,10 @@ LogicalResult CImporter::collectRecordFields(
         // Sema has already enforced that the injected spellings are
         // unique in the parent's member namespace (a collision is a
         // clang "member of anonymous struct redeclares" error), so the
-        // fields keep their own names.
-        if (failed(collectRecordFields(member, fieldNames, fieldTypes)))
+        // fields keep their own names. The run counter threads through so
+        // backing names stay unique across the whole flattened record.
+        if (failed(collectRecordFields(member, fieldNames, fieldTypes,
+                                       bitFieldRuns)))
           return failure();
         continue;
       }
@@ -6629,14 +6838,12 @@ LogicalResult CImporter::collectRecordFields(
         if (failed(leafType))
           return failure();
         if (!storage) {
-          if (isRustKeyword((*leaf)->getName()))
-            return emitError(leafLoc)
-                   << "unsupported: struct member '" << (*leaf)->getName()
-                   << "' is a Rust keyword";
           storage = *leaf;
           slotType = *leafType;
-          fieldNames.push_back(storage->getName());
-          fieldTypes.push_back(slotType);
+          if (failed(appendField(
+                  internName(mangleMemberName(storage->getName())), slotType,
+                  leafLoc, storage->getName())))
+            return failure();
           continue;
         }
         if (*leafType != slotType)
@@ -6649,14 +6856,12 @@ LogicalResult CImporter::collectRecordFields(
     }
     if (field->getName().empty())
       return emitError(fieldLoc) << "unsupported: unnamed struct member";
-    if (isRustKeyword(field->getName()))
-      return emitError(fieldLoc) << "unsupported: struct member '"
-                                 << field->getName() << "' is a Rust keyword";
     FailureOr<Type> fieldType = mapStructFieldType(field->getType(), fieldLoc);
     if (failed(fieldType))
       return failure();
-    fieldNames.push_back(field->getName());
-    fieldTypes.push_back(*fieldType);
+    if (failed(appendField(internName(mangleMemberName(field->getName())),
+                           *fieldType, fieldLoc, field->getName())))
+      return failure();
   }
   return success();
 }
@@ -6665,8 +6870,10 @@ FailureOr<const clang::FieldDecl *>
 CImporter::anonymousUnionArmLeaf(const clang::FieldDecl *arm,
                                  Location unionLoc) {
   Location armLoc = translateLoc(arm->getLocation());
+  // A bit-field arm is not addressable storage the one-slot aliasing can
+  // model; same policy (and wording) as `collectUnionSlot`'s.
   if (arm->isBitField())
-    return emitError(armLoc) << "unsupported: bit-field struct member";
+    return emitError(armLoc) << "unsupported: union with a bit-field arm";
   if (!arm->isAnonymousStructOrUnion()) {
     if (arm->getName().empty())
       return emitError(armLoc) << "unsupported: unnamed struct member";
@@ -6740,14 +6947,15 @@ LogicalResult CImporter::collectUnionSlot(
     storage = firstNonArrayArm;
 
   Location slotLoc = translateLoc(storage->getLocation());
-  if (isRustKeyword(storage->getName()))
-    return emitError(slotLoc) << "unsupported: struct member '"
-                              << storage->getName() << "' is a Rust keyword";
   FailureOr<Type> slotMapped = mapType(storage->getType(), slotLoc);
   if (failed(slotMapped))
     return failure();
   Type slotType = *slotMapped;
-  fieldNames.push_back(storage->getName());
+  // A keyword-spelled slot name mangles exactly like a struct member's
+  // (`mangleMemberName`); the arena keeps the spelling alive for the
+  // struct_def attribute below.
+  fieldNames.push_back(
+      memberNameArena.emplace_back(mangleMemberName(storage->getName())));
   fieldTypes.push_back(slotType);
 
   auto slotInt = llvm::dyn_cast<IntegerType>(slotType);
@@ -6798,9 +7006,9 @@ CImporter::flattenedFieldStorage(const clang::FieldDecl *field) const {
   return storage == unionSlotStorage.end() ? field : storage->second;
 }
 
-llvm::StringRef
+std::string
 CImporter::flattenedFieldName(const clang::FieldDecl *field) const {
-  return flattenedFieldStorage(field)->getName();
+  return mangleMemberName(flattenedFieldStorage(field)->getName());
 }
 
 FailureOr<Value> CImporter::reinterpretUnionArmRead(const clang::Expr *expr,
@@ -7765,6 +7973,13 @@ LogicalResult CImporter::convertRecordAPValue(
            << "unsupported: global initializer does not match its type";
   unsigned valueIndex = 0;
   for (const clang::FieldDecl *field : record->fields()) {
+    // A bit-field member has no field of its own in the flattened
+    // struct_def; constant initialization of one is out of the C99-45
+    // scope (packing the APValue bits is unimplemented).
+    if (field->isBitField())
+      return emitError(loc)
+             << "unsupported: global initializer for a struct with "
+                "bit-fields";
     if (valueIndex >= value.getStructNumFields())
       return emitError(loc)
              << "unsupported: global initializer does not match its type";
@@ -9265,6 +9480,12 @@ LogicalResult CImporter::emitRecordInitField(Value place,
                                              const clang::Expr *element,
                                              const clang::VarDecl *instance) {
   Location elementLoc = translateLoc(element->getBeginLoc());
+  // A bit-field member has no field of its own in the flattened
+  // struct_def (its storage is a window of a `__bits<n>` backing field);
+  // aggregate initialization of one stays out of the C99-45 scope.
+  if (field->isBitField())
+    return emitError(elementLoc)
+           << "unsupported: aggregate initializer for a bit-field member";
   if (isDataPointer(field->getType())) {
     // A data-pointer field's binding was recorded by the analysis walk of
     // this declaration; the stored i64 member keeps its default 0 (the
@@ -10569,6 +10790,16 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
   if (std::optional<CellSliceAccess> access =
           matchCellSliceAccess(op->getLHS()))
     return emitCellSliceAssign(*access, op->getRHS(), loc);
+  // A simple store to a bit-field member is the C99-45 read-modify-write
+  // accessor; statement position discards the field value.
+  if (const auto *memberExpr =
+          llvm::dyn_cast<clang::MemberExpr>(stripTrivia(op->getLHS())))
+    if (const auto *field =
+            llvm::dyn_cast<clang::FieldDecl>(memberExpr->getMemberDecl()))
+      if (field->isBitField())
+        return success(succeeded(emitBitFieldAssign(
+            memberExpr, op->getRHS(), loc, assignStalenessRisk(op),
+            /*wantValue=*/false)));
   return success(succeeded(emitAssignToPlace(op)));
 }
 
@@ -10584,6 +10815,16 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
   if (matchCellSliceAccess(op->getLHS()))
     return emitError(loc) << "unsupported: assignment through a cell-slice "
                              "parameter in value position";
+  // A value-position store to a bit-field member: the C99-45
+  // read-modify-write accessor also stages the truncated post-store field
+  // value (C's value of an assignment), returned as a re-loadable place.
+  if (const auto *memberExpr =
+          llvm::dyn_cast<clang::MemberExpr>(stripTrivia(op->getLHS())))
+    if (const auto *field =
+            llvm::dyn_cast<clang::FieldDecl>(memberExpr->getMemberDecl()))
+      if (field->isBitField())
+        return emitBitFieldAssign(memberExpr, op->getRHS(), loc,
+                                  assignStalenessRisk(op), /*wantValue=*/true);
   // A store through a wider-than-element view over a byte region
   // (CTS-P11) widens to a `to_ne_bytes` store over sizeof(T) consecutive
   // bytes; the assignment's value is staged in a temporary so a value
@@ -12084,6 +12325,14 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
         return failure();
       return emitWideByteLoad(*access, loc);
     }
+    // A bit-field member read is the synthesized mask-and-shift accessor
+    // over its backing field (C99-45); no lvalue of the member exists.
+    if (const auto *memberExpr =
+            llvm::dyn_cast<clang::MemberExpr>(stripTrivia(sub)))
+      if (const auto *field =
+              llvm::dyn_cast<clang::FieldDecl>(memberExpr->getMemberDecl()))
+        if (field->isBitField())
+          return emitBitFieldRead(memberExpr, loc);
     FailureOr<Value> place = emitLValue(sub);
     if (failed(place))
       return failure();
@@ -13287,6 +13536,15 @@ CImporter::emitSizeofAlignof(const clang::UnaryExprOrTypeTraitExpr *expr) {
   if (operand->isIncompleteType() || operand->isFunctionType())
     return emitError(loc)
            << "unsupported: sizeof/alignof of an incomplete or function type";
+  // C99-45: the backing-run model gives a bit-field struct a well-defined
+  // Rust size, but that size need not match the C ABI layout this fold
+  // would promise, so the importer refuses rather than asserting
+  // ABI-exact layout.
+  if (typeContainsBitField(operand))
+    return emitError(loc)
+           << (kind == clang::UETT_SizeOf
+                   ? "unsupported: sizeof of a struct with bit-fields"
+                   : "unsupported: alignof of a struct with bit-fields");
   int64_t value =
       kind == clang::UETT_SizeOf
           ? astContext().getTypeSizeInChars(operand).getQuantity()
@@ -15586,6 +15844,43 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   if (isDataPointer(field->getType()))
     return emitError(loc) << "unsupported use of pointer struct member '"
                           << field->getName() << "'";
+  // A bit-field member's storage is a window of a synthesized backing
+  // field, not a place: supported reads and simple assignments were
+  // intercepted before any lvalue was requested (`emitBitFieldRead`,
+  // `emitBitFieldAssign`); anything else reaching here (compound
+  // assignment, increment/decrement, ...) is out of the C99-45 scope.
+  if (field->isBitField())
+    return emitError(loc) << "unsupported: bit-field member '"
+                          << field->getName() << "' in this context";
+  FailureOr<Value> base = emitMemberBasePlace(member, loc, writeback);
+  if (failed(base))
+    return failure();
+  Value basePlace = *base;
+  // C11 6.7.2.1p13: an anonymous member's fields were flattened into
+  // the parent struct_def (see `collectRecordFields`), so the implicit
+  // intermediate access Sema synthesizes for `parent.leaf` designates
+  // the parent place itself; the leaf below then selects its flattened
+  // (possibly union-slot-aliased) name on that place.
+  if (field->isAnonymousStructOrUnion())
+    return basePlace;
+  // A union arm designates its storage slot: the member selects the
+  // slot's name at the slot's type. A differently-signed arm's
+  // bit-exact reinterpretation happens at the load or store site (see
+  // `reinterpretUnionArmRead`/`reinterpretUnionArmWrite`).
+  FailureOr<Type> fieldType =
+      mapType(flattenedFieldStorage(field)->getType(), loc);
+  if (failed(fieldType))
+    return failure();
+  return builder
+      .create<emitrust::MemberOp>(
+          loc, emitrust::LValueType::get(*fieldType), basePlace,
+          builder.getStringAttr(flattenedFieldName(field)))
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
+                               GlobalWriteback *writeback) {
   Value basePlace;
   const clang::CallExpr *erasedCall = nullptr;
   const clang::VarDecl *erasedBase =
@@ -15652,26 +15947,188 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   auto baseType = llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
   if (!baseType || !llvm::isa<emitrust::StructType>(baseType.getValueType()))
     return emitError(loc) << "unsupported member access base";
-  // C11 6.7.2.1p13: an anonymous member's fields were flattened into
-  // the parent struct_def (see `collectRecordFields`), so the implicit
-  // intermediate access Sema synthesizes for `parent.leaf` designates
-  // the parent place itself; the leaf below then selects its flattened
-  // (possibly union-slot-aliased) name on that place.
-  if (field->isAnonymousStructOrUnion())
-    return basePlace;
-  // A union arm designates its storage slot: the member selects the
-  // slot's name at the slot's type. A differently-signed arm's
-  // bit-exact reinterpretation happens at the load or store site (see
-  // `reinterpretUnionArmRead`/`reinterpretUnionArmWrite`).
-  FailureOr<Type> fieldType =
-      mapType(flattenedFieldStorage(field)->getType(), loc);
-  if (failed(fieldType))
-    return failure();
+  return basePlace;
+}
+
+Value CImporter::createBitFieldMask(Location loc, IntegerType backingType,
+                                    unsigned width, unsigned offset,
+                                    bool complement) {
+  llvm::APInt mask =
+      llvm::APInt::getLowBitsSet(backingType.getWidth(), width);
+  if (complement)
+    mask = ~mask.shl(offset);
   return builder
-      .create<emitrust::MemberOp>(
-          loc, emitrust::LValueType::get(*fieldType), basePlace,
-          builder.getStringAttr(flattenedFieldName(field)))
+      .create<emitrust::ConstantOp>(loc, backingType,
+                                    IntegerAttr::get(backingType, mask))
       .getResult();
+}
+
+FailureOr<Value> CImporter::emitBitFieldRead(const clang::MemberExpr *member,
+                                             Location loc) {
+  const auto *field = llvm::cast<clang::FieldDecl>(member->getMemberDecl());
+  auto info = bitFieldAccessInfo.find(field);
+  // Defensive: every imported struct recorded its bit-field runs, so a
+  // missing entry means the parent record never imported successfully.
+  if (info == bitFieldAccessInfo.end())
+    return emitError(loc) << "unsupported: bit-field member '"
+                          << field->getName() << "' has no accessor";
+  const BitFieldAccess access = info->second;
+  FailureOr<Value> base = emitMemberBasePlace(member, loc, /*writeback=*/
+                                              nullptr);
+  if (failed(base))
+    return failure();
+  Value backingPlace =
+      builder
+          .create<emitrust::MemberOp>(
+              loc, emitrust::LValueType::get(access.backingType), *base,
+              builder.getStringAttr(access.backingName))
+          .getResult();
+  Value word =
+      builder.create<emitrust::LoadOp>(loc, access.backingType, backingPlace)
+          .getResult();
+  // The offset shift is ALWAYS emitted, offset 0 included: the accessor's
+  // shape is uniform (pinned by bitfields.c), and the folder may tidy it.
+  Value shiftAmount =
+      createScalarIntConstant(loc, access.backingType, access.offset);
+  Value shifted =
+      builder
+          .create<emitrust::ShrOp>(loc, access.backingType, word, shiftAmount)
+          .getResult();
+  Value widthMask = createBitFieldMask(loc, access.backingType, access.width,
+                                       access.offset, /*complement=*/false);
+  Value masked =
+      builder
+          .create<emitrust::AndOp>(loc, access.backingType, shifted, widthMask)
+          .getResult();
+  return convertBitFieldFieldValue(loc, masked, field);
+}
+
+FailureOr<Value> CImporter::convertBitFieldFieldValue(
+    Location loc, Value masked, const clang::FieldDecl *field) {
+  const BitFieldAccess &access = bitFieldAccessInfo.find(field)->second;
+  FailureOr<Type> mapped = mapType(field->getType(), loc);
+  if (failed(mapped))
+    return failure();
+  // An enum-typed field converts straight from the unsigned backing type,
+  // so the conversion ZERO-extends regardless of the enum's own underlying
+  // signedness (pinned: an `enum : 8` field holding 152 reads back 152,
+  // never -104 — the pin is on the FIELD being enum-typed).
+  if (llvm::isa<emitrust::EnumType>(*mapped))
+    return builder.create<emitrust::CastOp>(loc, *mapped, masked).getResult();
+  auto intType = llvm::dyn_cast<IntegerType>(*mapped);
+  if (!intType)
+    return emitError(loc) << "unsupported: bit-field member type";
+  // A _Bool field: Rust has no `as bool`, so the (zero-extended) masked
+  // value compares against zero — exact for a value already confined to
+  // the field's width.
+  if (intType.getWidth() == 1) {
+    Value zero = createScalarIntConstant(loc, access.backingType, 0);
+    return builder
+        .create<emitrust::CmpOp>(loc, builder.getI1Type(),
+                                 emitrust::CmpPredicate::ne, masked, zero)
+        .getResult();
+  }
+  // Unsigned fields zero-extend into their mapped type.
+  if (intType.isUnsigned()) {
+    if (intType == masked.getType())
+      return masked;
+    return builder.create<emitrust::CastOp>(loc, intType, masked).getResult();
+  }
+  // Plain-int signed fields sign-extend from their declared width in the
+  // mapped signed type: shl then shrsi by (type width - field width), a
+  // shift pair the Rust emitter renders on the signed type (`>>` on iN is
+  // arithmetic). For `int s : 4` the amount is the pinned 28.
+  Value value =
+      builder.create<emitrust::CastOp>(loc, intType, masked).getResult();
+  Value amount = createIntConstant(
+      loc, intType, static_cast<int64_t>(intType.getWidth() - access.width));
+  Value extended =
+      builder.create<arith::ShLIOp>(loc, value, amount).getResult();
+  return builder.create<arith::ShRSIOp>(loc, extended, amount).getResult();
+}
+
+FailureOr<Value> CImporter::emitBitFieldAssign(const clang::MemberExpr *member,
+                                               const clang::Expr *rhs,
+                                               Location loc,
+                                               bool refreshStaged,
+                                               bool wantValue) {
+  const auto *field = llvm::cast<clang::FieldDecl>(member->getMemberDecl());
+  auto info = bitFieldAccessInfo.find(field);
+  if (info == bitFieldAccessInfo.end())
+    return emitError(loc) << "unsupported: bit-field member '"
+                          << field->getName() << "' has no accessor";
+  const BitFieldAccess access = info->second;
+  GlobalWriteback writeback;
+  FailureOr<Value> base = emitMemberBasePlace(member, loc, &writeback);
+  if (failed(base))
+    return failure();
+  Value backingPlace =
+      builder
+          .create<emitrust::MemberOp>(
+              loc, emitrust::LValueType::get(access.backingType), *base,
+              builder.getStringAttr(access.backingName))
+          .getResult();
+  FailureOr<Value> value = emitRValue(rhs);
+  if (failed(value))
+    return failure();
+  Value fieldValue;
+  auto mutate = [&]() -> LogicalResult {
+    Value word =
+        builder.create<emitrust::LoadOp>(loc, access.backingType, backingPlace)
+            .getResult();
+    // Clear the field's window with the complement mask.
+    Value clearMask = createBitFieldMask(loc, access.backingType, access.width,
+                                         access.offset, /*complement=*/true);
+    Value cleared =
+        builder
+            .create<emitrust::AndOp>(loc, access.backingType, word, clearMask)
+            .getResult();
+    // Convert the assigned value to the backing type (from the enum type
+    // for an enum-typed RHS; Rust `as` wraps, matching C's conversion to
+    // the unsigned backing).
+    Value raw = *value;
+    if (raw.getType() != access.backingType)
+      raw = builder.create<emitrust::CastOp>(loc, access.backingType, raw)
+                .getResult();
+    // Truncate to the declared width — ALWAYS a separate `and`, even for
+    // statically in-range values (pinned by bitfields.c; the folder may
+    // tidy it).
+    Value widthMask = createBitFieldMask(loc, access.backingType, access.width,
+                                         access.offset, /*complement=*/false);
+    Value truncated =
+        builder
+            .create<emitrust::AndOp>(loc, access.backingType, raw, widthMask)
+            .getResult();
+    // Shift onto the window — ALWAYS emitted, offset 0 included.
+    Value shiftAmount =
+        createScalarIntConstant(loc, access.backingType, access.offset);
+    Value shifted = builder
+                        .create<emitrust::ShlOp>(loc, access.backingType,
+                                                 truncated, shiftAmount)
+                        .getResult();
+    Value merged =
+        builder
+            .create<emitrust::OrOp>(loc, access.backingType, cleared, shifted)
+            .getResult();
+    builder.create<emitrust::AssignOp>(loc, backingPlace, merged);
+    if (!wantValue)
+      return success();
+    // C's value of the assignment is the post-store FIELD value: the
+    // truncated bits convert exactly like a read at offset 0.
+    FailureOr<Value> converted =
+        convertBitFieldFieldValue(loc, truncated, field);
+    if (failed(converted))
+      return failure();
+    fieldValue = *converted;
+    return success();
+  };
+  if (failed(commitGlobalWriteback(loc, writeback, refreshStaged, mutate)))
+    return failure();
+  if (!wantValue)
+    return Value();
+  Value staged = createVariablePlace(loc, fieldValue.getType());
+  builder.create<emitrust::AssignOp>(loc, staged, fieldValue);
+  return staged;
 }
 
 FailureOr<Value>
