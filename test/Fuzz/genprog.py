@@ -54,6 +54,7 @@ test/EndToEnd differential test.
 
 import argparse
 import random
+import struct
 import sys
 from collections import namedtuple
 
@@ -65,8 +66,11 @@ from collections import namedtuple
 # but the Program artifact now includes evaluator-computed expectations);
 # 4 = bitfields + file_io templates (C99-45/C99-48), byte-array union
 # arms (integer-arm access only), dead-VLA noise in three templates, and
-# the local-void*-holder shape in devirt.
-GENERATOR_VERSION = "4"
+# the local-void*-holder shape in devirt; 5 = Wave 6+7 surfaces:
+# compound_literals, chars_strings, libc_subset, float_puns templates,
+# printf format-language matrix growth (+%.Ns), and inline/array-param/
+# const noise.
+GENERATOR_VERSION = "5"
 
 # The expected-output oracle simulates the byte puns with native (host)
 # endianness; both differential legs run on the same host, and that host
@@ -85,6 +89,11 @@ CROSS_FRACTION = 0.5
 POOL_INT = [-1, 0, 1, -2147483647, 2147483647, 0x55AA, 0xAA55, -21847]
 POOL_SMALL = [-1, 0, 1, 7, 42, -9]
 POOL_MASK = [0x55AA55AA, 0xAA55AA55, 0x01010101, 0x7FFFFFFF, 0x00FF00FF]
+
+# Curated doubles for float printf entries: exactly representable, and
+# Python %-formatting was verified byte-identical to glibc for e/g/E/G
+# over this pool during v5 bring-up.
+POOL_DOUBLE = ["2.5", "-0.75", "144.0", "0.03125"]
 
 Instance = namedtuple("Instance", ["uid", "name", "params"])
 Plan = namedtuple("Plan", ["seed", "warm", "seed_mix", "instances"])
@@ -250,7 +259,7 @@ static void cpr_%(u)s(void) {
   printf("\\n");
 }
 
-static int cmv_%(u)s(int *s, int *d) {
+static int cmv_%(u)s(%(cmv_sig)s) {
   int i = 0;
   int j = 0;
   while (i < 4 && s[i] == 0)
@@ -301,6 +310,12 @@ static unsigned tmpl_cells_%(u)s(unsigned salt) {
         "perm1": perm1,
         "perm2": perm2,
         "extra": p["extra"],
+        # Behavior-neutral array-parameter bracket forms (C99-36 noise).
+        "cmv_sig": [
+            "int *s, int *d",
+            "int s[static 4], int d[static 4]",
+            "int s[const], int d[const]",
+        ][p["brack"]],
     }
 
 
@@ -320,7 +335,7 @@ static unsigned tmpl_ptrs_%(u)s(unsigned salt) {
   int i;
   unsigned acc = salt;
   unsigned uu;
-%(vla)s  x = (int)(salt %% 100u) + %(base)d;
+%(vla)s%(constq)s  x = (int)(salt %% 100u) + %(basex)s;
   y = (int)(salt %% 30u) + 1;
   pp = &x;
   for (i = 0; i < %(iters)d; i++) {
@@ -360,6 +375,10 @@ static unsigned tmpl_ptrs_%(u)s(unsigned salt) {
         "pool_small": _int_lit(p["pool_small"]),
         "thresh": p["thresh"],
         "vla": _vla_decl(uid, p),
+        # Behavior-neutral const-qualified local (C99-7 noise): the base
+        # constant threads through a const int instead of a literal.
+        "constq": "  const int cb = %d;\n" % p["base"] if p["constq"] else "",
+        "basex": "cb" if p["constq"] else "%d" % p["base"],
     }
 
 
@@ -376,6 +395,22 @@ _FMT_MATRIX = [
     ("[%02u]", "salt %% 7u"),
     ("[%c]", "(char)('a' + (int)(salt %% 26u))"),
     ("[%s]", None),  # string literal, filled per-instance
+    # C99-47 format-language growth (indexes 10+). Every entry has a
+    # hand-rolled exact evaluator arm in _sprintf_piece; combos that
+    # Python %-formatting gets wrong vs glibc (e.g. 0-flag + precision)
+    # are deliberately absent.
+    ("[%+d]", "(int)((unsigned)%(lit)s ^ (salt %% 63u))"),
+    ("[% d]", "(int)(salt %% 97u)"),
+    ("[%#x]", "(unsigned)%(lit)s | (salt %% 4096u)"),
+    ("[%#o]", "salt %% 512u"),
+    ("[%.5d]", "-(int)(salt %% 999u)"),
+    ("[%.0d]", "(int)(salt %% 2u)"),
+    ("[%hd]", "(int)((unsigned)%(lit)s + salt)"),
+    ("[%hhu]", "(int)(salt %% 1000u)"),
+    ("[%lld]", "(long long)(int)((unsigned)%(lit)s ^ salt) * 1000003LL"),
+    ("[%llx]", "((unsigned long long)(unsigned)%(lit)s << 16) + salt"),
+    ("[%e]", "%(dlit)s"),
+    ("[%g]", "%(dlit)s"),
 ]
 
 
@@ -386,10 +421,14 @@ def _render_va_sprintf(uid, p):
     for slot in ("fmt_a", "fmt_b", "fmt_c"):
         fmt, expr = _FMT_MATRIX[p[slot]]
         pieces.append(fmt)
+        lit = p["val_" + slot[-1]]
         if expr is None:
             args.append('"s%s"' % u)
         else:
-            args.append(expr % {"lit": _int_lit(p["val_" + slot[-1]])})
+            args.append(expr % {
+                "lit": _int_lit(lit),
+                "dlit": POOL_DOUBLE[abs(lit) % len(POOL_DOUBLE)],
+            })
     return """static int vf_%(u)s(int a, int b, ...) {
   if (a > b)
     return a - b;
@@ -408,6 +447,7 @@ static unsigned tmpl_va_%(u)s(unsigned salt) {
   printf("%(u)s.v=%%d\\n", m);
   n = sprintf(buf, "%%02d:%%d", (int)(salt %% 60u), m);
   printf("%(u)s.g=%%s|%%d\\n", buf, n);
+  printf("%(u)s.p=%%.%(prec)ds|\\n", buf);
   vf_%(u)s(n, m, 9, buf);
   return acc + (unsigned)(m + n);
 }
@@ -415,6 +455,7 @@ static unsigned tmpl_va_%(u)s(unsigned salt) {
         "u": u,
         "fmt": "".join(pieces),
         "args": ", ".join(args),
+        "prec": p["prec"],
     }
 
 
@@ -846,6 +887,220 @@ def _render_file_io(uid, p):
     }
 
 
+def _render_compound_literals(uid, p):
+    """C99-13 compound literals (ref: test/EndToEnd/compound-literals.c).
+
+    Self-referencing swap through the temp, member/subscript directly on
+    literals, by-value argument and returned-literal struct, a walked
+    pointer into an array literal with a write-back, a degenerate
+    struct-literal base mutated through the pointer, and the loop
+    re-zero rule pinned with an iteration-varying digest (a hole is
+    dirtied each iteration; the next evaluation must restore the zero
+    fill).  The helper is optionally declared inline (C99-18 noise).
+    """
+    u = "u%d" % uid
+    return r"""struct CS_%(u)s { int a; int b; };
+
+static%(inl)s int csum_%(u)s(struct CS_%(u)s s) { return s.a * 100 + s.b; }
+static%(inl)s struct CS_%(u)s cmk_%(u)s(int k) { return (struct CS_%(u)s){k, -k}; }
+
+static unsigned tmpl_cl_%(u)s(unsigned salt) {
+  struct CS_%(u)s s = (struct CS_%(u)s){(int)(salt %% 50u) + %(p1)d, (int)(salt %% 7u)};
+  unsigned acc = salt;
+  int i;
+  int total = 0;
+  int *p;
+  printf("%(u)s.i=%%d %%d\n", s.a, s.b);
+  s = (struct CS_%(u)s){s.b, s.a};
+  printf("%(u)s.s=%%d %%d\n", s.a, s.b);
+  printf("%(u)s.m=%%d\n", (struct CS_%(u)s){5, (int)(salt %% 9u)}.b);
+  i = (int)(salt %% 3u);
+  printf("%(u)s.x=%%d\n", (int[]){%(p2)s, 8, -9}[i]);
+  printf("%(u)s.a=%%d\n", csum_%(u)s((struct CS_%(u)s){3, (int)(salt %% 4u)}));
+  s = cmk_%(u)s((int)(salt %% 21u));
+  printf("%(u)s.r=%%d %%d\n", s.a, s.b);
+  p = (int[]){10, (int)(salt %% 30u), 30};
+  p++;
+  printf("%(u)s.w=%%d %%d\n", *p, p[1]);
+  p[-1] = (int)(salt %% 77u);
+  printf("%(u)s.wb=%%d\n", p[-1]);
+  for (i = 0; i < %(loopn)d; i++) {
+    int *lp = (int[3]){i + 1 + (int)(salt %% 5u)};
+    total += lp[0] * 100 + lp[1] + lp[2];
+    lp[1] = 55;
+  }
+  printf("%(u)s.l=%%d\n", total);
+  {
+    struct CS_%(u)s *q = &(struct CS_%(u)s){%(p3)d, -(int)(salt %% 13u)};
+    q->a += 2;
+    printf("%(u)s.q=%%d %%d\n", q->a, q->b);
+    acc = acc + (unsigned)(q->a + 60);
+  }
+  return acc + (unsigned)(total + s.a + s.b + 200);
+}
+""" % {
+        "u": u,
+        "inl": " inline" if p["inline_h"] else "",
+        "p1": p["p1"],
+        "p2": _int_lit(p["p2"]),
+        "p3": p["p3"],
+        "loopn": p["loopn"],
+    }
+
+
+def _render_chars_strings(uid, p):
+    r"""C99-4/28 chars and string literals (refs: char-constants.c,
+    strings-exprs.c).
+
+    Signed plain-char semantics ('\xff' object prints -1), the escape
+    set in char constants and a char-array initializer, literal
+    subscripts with a runtime index, deref-of-arithmetic, sizeof on a
+    literal and on an adjacent-literal concatenation, and zero fill past
+    the joined bytes.
+    """
+    u = "u%d" % uid
+    extra = ""
+    if p["extra"]:
+        extra = (
+            "  {\n"
+            "    unsigned char ug[4] = \"ab\";\n"
+            "    printf(\"%(u)s.u=%%d %%d\\n\", ug[0], ug[3]);\n"
+            "  }\n" % {"u": u}
+        )
+    return r"""static int cfy_%(u)s(char c) {
+  switch (c) {
+  case 'a':
+    return 1;
+  case '\n':
+    return 2;
+  case '\0':
+    return 3;
+  case '\x7f':
+    return 4;
+  default:
+    return 0;
+  }
+}
+
+static unsigned tmpl_ch_%(u)s(unsigned salt) {
+  char hi = '\xff';
+  char wrap = '\x80';
+  char e[12] = "a\a\b\f\v\r\?\x41\101z";
+  char cat[8] = "ab" "cd";
+  char c;
+  int j;
+  unsigned acc = salt;
+  printf("%(u)s.k=%%d %%d %%d %%d %%d\n", 'a', '\n', '\\', '\012', '\x41');
+  printf("%(u)s.n=%%d %%d %%d\n", hi, hi < 0, wrap);
+  c = (char)('a' + (int)(salt %% 26u));
+  printf("%(u)s.c=%%d %%d %%d\n", c == 'q', 'z' - 'a', c + 1);
+  printf("%(u)s.f=%%d %%d %%d\n", cfy_%(u)s(c), cfy_%(u)s('\n'), cfy_%(u)s('\x7f'));
+  for (j = 0; j < 12; j++) {
+    printf("%%d ", e[j]);
+    acc = acc + (unsigned)(e[j] + 300);
+  }
+  printf("\n");
+  j = (int)(salt %% 3u);
+  printf("%(u)s.s=%%d %%d %%d\n", "abc"[j], *("qr" + 1), "xy"[0]);
+  printf("%(u)s.z=%%d %%d\n", (int)sizeof("abc"), (int)sizeof("ab" "cd"));
+  printf("%(u)s.t=%%d %%d %%d\n", cat[3], cat[4], cat[7]);
+%(extra)s  return acc + (unsigned)(c + cfy_%(u)s(c));
+}
+""" % {"u": u, "extra": extra}
+
+
+def _render_libc_subset(uid, p):
+    """C99-48 curated libc subset (ref: test/EndToEnd/libc-subset.c).
+
+    string.h calls over char regions with runtime contents, sign-
+    normalized strcmp/strncmp, memset with a computed fill, overlapping
+    memmove, atoi over a generated whitespace+sign digit string, abs,
+    and the IEEE-exact math four on exactly-representable values printed
+    via %f (Python reproduces those exactly).  exit() is deliberately
+    absent: it would truncate the multi-template digest chain and is
+    already pinned end-to-end.
+    """
+    u = "u%d" % uid
+    return r"""static unsigned tmpl_lc_%(u)s(unsigned salt) {
+  char b1[20];
+  char b2[20];
+  char num[12];
+  int j;
+  int n;
+  unsigned acc = salt;
+  for (j = 0; j < 7; j++)
+    b1[j] = (char)('a' + (j + (int)(salt %% 5u)) %% 26);
+  b1[7] = 0;
+  strcpy(b2, b1);
+  strcat(b2, "xy");
+  printf("%(u)s.s=%%s %%d\n", b2, (int)strlen(b2));
+  n = strcmp(b1, b2);
+  printf("%(u)s.c=%%d %%d\n", (n > 0) - (n < 0), strncmp(b1, b2, 7));
+  memset(b1, 'z' - (int)(salt %% 3u), 4);
+  printf("%(u)s.m=%%s\n", b1);
+  memcpy(num, b2, 5);
+  num[5] = 0;
+  printf("%(u)s.y=%%s %%d\n", num, memcmp(num, b2, 5) == 0);
+  memmove(&b2[2], b2, 3);
+  printf("%(u)s.v=%%s\n", b2);
+  printf("%(u)s.h=%%s %%d\n", strchr(b2, b2[salt %% 9u]), strchr(b2, '#') == 0);
+  num[0] = ' ';
+  num[1] = '\t';
+  num[2] = '%(sign)s';
+  num[3] = (char)('0' + (int)(salt %% 10u));
+  num[4] = (char)('0' + (int)((salt / 10u) %% 10u));
+  num[5] = 'x';
+  num[6] = 0;
+  printf("%(u)s.a=%%d %%d %%d\n", atoi(num), atoi("  +42"), atoi("x9"));
+  n = abs(-(int)(salt %% 90u) - 3);
+  printf("%(u)s.b=%%d %%d\n", n, abs(0));
+  printf("%(u)s.f=%%f %%f %%f %%f\n", fabs(-2.5), sqrt(%(psq)s), floor(3.7), ceil(-1.5));
+  acc = acc + (unsigned)(n + (int)strlen(b2) + atoi(num) + 300);
+  return acc;
+}
+""" % {"u": u, "sign": p["sign"], "psq": p["psq"]}
+
+
+def _render_float_puns(uid, p):
+    """C99-44 float puns via emitrust.bitcast (ref: test/EndToEnd/unions.c).
+
+    Floats are observed exclusively through their BITS (integer arms
+    printed as %u/%x/%ld), never via %f, so the evaluator stays exact
+    with struct.pack.  All values are in the normal range (no denormals)
+    and exactly representable, and x86-64 uses SSE for float arithmetic,
+    so no x87 excess-precision concern arises on the native leg.  Both
+    directions covered: float-arm write -> int-arm read, and
+    int-bits -> float domain (+1.0f, exact) -> bits round-trip.
+    """
+    u = "u%d" % uid
+    return r"""union FP_%(u)s { float f; unsigned u; };
+union DP_%(u)s { double d; long b; };
+
+static unsigned tmpl_fp_%(u)s(unsigned salt) {
+  union FP_%(u)s f;
+  union DP_%(u)s d;
+  float t;
+  unsigned acc = salt;
+  int k = (int)(salt %% 4u);
+  f.f = (float)(k + %(p0)d) + 0.5f;
+  printf("%(u)s.a=%%u %%x\n", f.u, f.u);
+  acc = acc + f.u;
+  f.u = %(bits)s + (salt %% 4u) * 8388608u;
+  t = f.f + 1.0f;
+  f.f = t;
+  printf("%(u)s.b=%%u\n", f.u);
+  acc = acc + (f.u %% 65536u);
+  d.d = 0.0 - (double)(k + 2) * 0.25;
+  printf("%(u)s.c=%%d %%ld\n", d.b < 0, d.b);
+  return acc + (unsigned)(d.b %% 100L);
+}
+""" % {
+        "u": u,
+        "p0": p["p0"],
+        "bits": _uns_lit(p["bits"]),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Template registry: name -> (parameter domains, renderer).  Domains are
 # ordered lists; minimize.py shrinks toward the front of each list, and
@@ -883,7 +1138,7 @@ TEMPLATES = [
     ),
     TemplateSpec(
         "cell_slice",
-        {"perm": [0, 1, 2], "extra": [1, 2, 3]},
+        {"perm": [0, 1, 2], "extra": [1, 2, 3], "brack": [0, 1, 2]},
         _render_cell_slice,
         "tmpl_cells",
     ),
@@ -895,6 +1150,7 @@ TEMPLATES = [
             "pool_small": POOL_SMALL,
             "thresh": [0, 10, 39],
             "vla": [0, 1],
+            "constq": [0, 1],
         },
         _render_ptr_mix,
         "tmpl_ptrs",
@@ -908,6 +1164,7 @@ TEMPLATES = [
             "val_a": POOL_INT,
             "val_b": POOL_INT,
             "val_c": POOL_INT,
+            "prec": [3, 5, 9],
         },
         _render_va_sprintf,
         "tmpl_va",
@@ -971,6 +1228,36 @@ TEMPLATES = [
         "tmpl_fio",
     ),
     TemplateSpec(
+        "compound_literals",
+        {
+            "p1": [0, 5, 40],
+            "p2": [7, -12, 61],
+            "p3": [1, 40, 9],
+            "loopn": [2, 3, 4],
+            "inline_h": [0, 1],
+        },
+        _render_compound_literals,
+        "tmpl_cl",
+    ),
+    TemplateSpec(
+        "chars_strings",
+        {"extra": [0, 1]},
+        _render_chars_strings,
+        "tmpl_ch",
+    ),
+    TemplateSpec(
+        "libc_subset",
+        {"sign": ["-", "+"], "psq": ["144.0", "4.0", "1024.0"]},
+        _render_libc_subset,
+        "tmpl_lc",
+    ),
+    TemplateSpec(
+        "float_puns",
+        {"p0": [1, 3, 100], "bits": [0x3FC00000, 0x40200000, 0x41000000]},
+        _render_float_puns,
+        "tmpl_fp",
+    ),
+    TemplateSpec(
         "writeback_order",
         {
             "off_mod": [1, 2, 3],
@@ -998,6 +1285,8 @@ PROVENANCE_TEMPLATES = [
     "greturn",
     "carrier",
     "writeback_order",
+    "compound_literals",
+    "libc_subset",
 ]
 
 # The tmpl_* call target per template, used by main rendering.
@@ -1200,7 +1489,38 @@ def _sprintf_piece(index, uid_tag, lit, salt):
         return "[%02d]" % (salt % 7)
     if index == 8:
         return "[%c]" % chr(ord("a") + salt % 26)
-    return "[s%s]" % uid_tag
+    if index == 9:
+        return "[s%s]" % uid_tag
+    if index == 10:
+        return "[%+d]" % _i32(_u32(lit) ^ (salt % 63))
+    if index == 11:
+        return "[% d]" % (salt % 97)
+    if index == 12:
+        v = _u32(lit) | (salt % 4096)
+        return "[%s]" % (("%#x" % v) if v else "0")
+    if index == 13:
+        v = salt % 512
+        return "[%s]" % (("0%o" % v) if v else "0")
+    if index == 14:
+        return "[%.5d]" % (-(salt % 999))
+    if index == 15:
+        v = salt % 2
+        return "[%s]" % ("" if v == 0 else "%.0d" % v)
+    if index == 16:
+        v = _u32(_u32(lit) + salt) & 0xFFFF
+        return "[%d]" % (v - 0x10000 if v & 0x8000 else v)
+    if index == 17:
+        return "[%d]" % ((salt % 1000) & 0xFF)
+    if index == 18:
+        prod = _i32(_u32(lit) ^ salt) * 1000003
+        prod &= _M64
+        return "[%d]" % (prod - (1 << 64) if prod & (1 << 63) else prod)
+    if index == 19:
+        return "[%x]" % (((_u32(lit) << 16) + salt) & _M64)
+    value = float(POOL_DOUBLE[abs(lit) % len(POOL_DOUBLE)])
+    if index == 20:
+        return "[%e]" % value
+    return "[%g]" % value
 
 
 def _eval_va_sprintf(uid, p, salt, out):
@@ -1219,6 +1539,7 @@ def _eval_va_sprintf(uid, p, salt, out):
     buf2 = "%02d:%d" % (salt % 60, m)
     n2 = len(buf2)
     out.append("%s.g=%s|%d\n" % (u, buf2, n2))
+    out.append("%s.p=%s|\n" % (u, buf2[: p["prec"]]))
     return _u32(acc + _u32(m + n2))
 
 
@@ -1376,6 +1697,128 @@ def _eval_file_io(uid, p, salt, out):
     return _u32(acc + headn)
 
 
+def _f32_bits(value):
+    """IEEE-754 single bits of ``value`` (little-endian host, asserted)."""
+    return struct.unpack("<I", struct.pack("<f", value))[0]
+
+
+def _f64_bits_i64(value):
+    """IEEE-754 double bits of ``value`` as the i64 a long arm reads."""
+    return struct.unpack("<q", struct.pack("<d", value))[0]
+
+
+def _c_rem(value, div):
+    """C's % (truncating remainder, sign of the dividend)."""
+    rem = abs(value) % div
+    return -rem if value < 0 else rem
+
+
+def _eval_compound_literals(uid, p, salt, out):
+    u = "u%d" % uid
+    acc = salt
+    a = salt % 50 + p["p1"]
+    b = salt % 7
+    out.append("%s.i=%d %d\n" % (u, a, b))
+    a, b = b, a
+    out.append("%s.s=%d %d\n" % (u, a, b))
+    out.append("%s.m=%d\n" % (u, salt % 9))
+    arr = [p["p2"], 8, -9]
+    out.append("%s.x=%d\n" % (u, arr[salt % 3]))
+    out.append("%s.a=%d\n" % (u, 3 * 100 + salt % 4))
+    k = salt % 21
+    a, b = k, -k
+    out.append("%s.r=%d %d\n" % (u, a, b))
+    lit = [10, salt % 30, 30]
+    out.append("%s.w=%d %d\n" % (u, lit[1], lit[2]))
+    lit[0] = salt % 77
+    out.append("%s.wb=%d\n" % (u, lit[0]))
+    total = 0
+    for i in range(p["loopn"]):
+        total += (i + 1 + salt % 5) * 100  # holes re-zeroed each iteration
+    out.append("%s.l=%d\n" % (u, total))
+    qa = p["p3"] + 2
+    qb = -(salt % 13)
+    out.append("%s.q=%d %d\n" % (u, qa, qb))
+    acc = _u32(acc + _u32(qa + 60))
+    return _u32(acc + _u32(total + a + b + 200))
+
+
+# char e[12] = "a\a\b\f\v\r\?\x41\101z" as signed-int byte values,
+# zero-filled to 12.
+_CH_E_BYTES = [97, 7, 8, 12, 11, 13, 63, 65, 65, 122, 0, 0]
+
+
+def _eval_chars_strings(uid, p, salt, out):
+    u = "u%d" % uid
+    acc = salt
+    out.append("%s.k=%d %d %d %d %d\n" % (u, 97, 10, 92, 10, 65))
+    out.append("%s.n=%d %d %d\n" % (u, -1, 1, -128))
+    c = ord("a") + salt % 26
+    out.append("%s.c=%d %d %d\n" % (u, 1 if c == ord("q") else 0, 25, c + 1))
+    cfy_c = 1 if c == ord("a") else 0
+    out.append("%s.f=%d %d %d\n" % (u, cfy_c, 2, 4))
+    for byte in _CH_E_BYTES:
+        out.append("%d " % byte)
+        acc = _u32(acc + _u32(byte + 300))
+    out.append("\n")
+    out.append("%s.s=%d %d %d\n" % (u, [97, 98, 99][salt % 3], 114, 120))
+    out.append("%s.z=%d %d\n" % (u, 4, 5))
+    out.append("%s.t=%d %d %d\n" % (u, 100, 0, 0))
+    if p["extra"]:
+        out.append("%s.u=%d %d\n" % (u, 97, 0))
+    return _u32(acc + _u32(c + cfy_c))
+
+
+def _eval_libc_subset(uid, p, salt, out):
+    u = "u%d" % uid
+    acc = salt
+    b1 = bytes(ord("a") + (j + salt % 5) % 26 for j in range(7))
+    b2 = b1 + b"xy"
+    out.append("%s.s=%s %d\n" % (u, b2.decode("ascii"), len(b2)))
+    out.append("%s.c=%d %d\n" % (u, -1, 0))
+    fill = ord("z") - salt % 3
+    b1 = bytes([fill] * 4) + b1[4:]
+    out.append("%s.m=%s\n" % (u, b1.decode("ascii")))
+    num5 = b2[:5]
+    out.append("%s.y=%s %d\n" % (u, num5.decode("ascii"), 1))
+    b2 = b2[:2] + b2[0:3] + b2[5:]
+    out.append("%s.v=%s\n" % (u, b2.decode("ascii")))
+    ch = b2[salt % 9]
+    suffix = b2[b2.find(bytes([ch])):].decode("ascii")
+    out.append("%s.h=%s %d\n" % (u, suffix, 1))
+    d1 = salt % 10
+    d2 = (salt // 10) % 10
+    val = d1 * 10 + d2
+    parsed = -val if p["sign"] == "-" else val
+    out.append("%s.a=%d %d %d\n" % (u, parsed, 42, 0))
+    n = abs(-(salt % 90) - 3)
+    out.append("%s.b=%d %d\n" % (u, n, 0))
+    import math as _math
+
+    out.append(
+        "%s.f=%f %f %f %f\n"
+        % (u, 2.5, _math.sqrt(float(p["psq"])), 3.0, -1.0)
+    )
+    return _u32(acc + _u32(n + len(b2) + parsed + 300))
+
+
+def _eval_float_puns(uid, p, salt, out):
+    u = "u%d" % uid
+    acc = salt
+    k = salt % 4
+    bits = _f32_bits(float(k + p["p0"]) + 0.5)
+    out.append("%s.a=%d %x\n" % (u, bits, bits))
+    acc = _u32(acc + bits)
+    bits = _u32(p["bits"] + (salt % 4) * 8388608)
+    fval = struct.unpack("<f", struct.pack("<I", bits))[0]
+    bits = _f32_bits(fval + 1.0)
+    out.append("%s.b=%d\n" % (u, bits))
+    acc = _u32(acc + bits % 65536)
+    dbits = _f64_bits_i64(-(float(k + 2)) * 0.25)
+    out.append("%s.c=%d %d\n" % (u, 1 if dbits < 0 else 0, dbits))
+    return _u32(acc + _u32(_c_rem(dbits, 100)))
+
+
 _EVALUATORS = {
     "union_pun": _eval_union_pun,
     "byte_pun": _eval_byte_pun,
@@ -1389,6 +1832,10 @@ _EVALUATORS = {
     "writeback_order": _eval_writeback,
     "bitfields": _eval_bitfields,
     "file_io": _eval_file_io,
+    "compound_literals": _eval_compound_literals,
+    "chars_strings": _eval_chars_strings,
+    "libc_subset": _eval_libc_subset,
+    "float_puns": _eval_float_puns,
 }
 
 
@@ -1455,13 +1902,20 @@ def render_plan(plan):
         tops.append(spec.render(inst.uid, inst.params))
         calls.append("  acc = %s_u%d(acc);" % (spec.fn_prefix, inst.uid))
         calls.append('  printf("dg%d=%%u\\n", acc %% 65521u);' % inst.uid)
+    includes = "#include <stdio.h>\n"
+    if any(inst.name == "libc_subset" for inst in plan.instances):
+        includes = (
+            "#include <math.h>\n#include <stdio.h>\n"
+            "#include <stdlib.h>\n#include <string.h>\n"
+        )
     header = (
         "/* Generated by test/Fuzz/genprog.py version %s, seed %d.\n"
         "   Templates: %s. Deterministic: same seed -> identical bytes. */\n"
-        "#include <stdio.h>\n\n" % (
+        "%s\n" % (
             GENERATOR_VERSION,
             plan.seed,
             ", ".join(i.name for i in plan.instances),
+            includes,
         )
     )
     main_fn = (

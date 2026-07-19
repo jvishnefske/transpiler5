@@ -267,8 +267,13 @@ lists the lit test file(s) that validate it.
   assigned global), C99-45 bit-fields (mixed runs, sign/zero extension,
   RMW flags, value-position assignment), C99-48 FILE* round-trip I/O
   over per-seed scratch files run in per-seed cwds, byte-array union
-  arms accessed only through the integer arm, and dead-VLA elision
-  noise, each modeled on a test/EndToEnd differential test — into UB-free C11 programs whose
+  arms accessed only through the integer arm, dead-VLA elision
+  noise, C99-13 compound literals (loop re-zero rule pinned), C99-4/28
+  signed-char/escape/string-literal-expression semantics, the C99-48
+  curated libc subset, C99-44 float puns observed via bits only, the
+  C99-47 printf format-language growth (float formats only over a
+  Python-glibc byte-verified curated pool), and inline/array-param/const
+  qualifier noise, each modeled on a test/EndToEnd differential test — into UB-free C11 programs whose
   indices and branch conditions are runtime-computed, with printf digests
   at multiple points and a computed exit code in 0..250. The comparison
   is three-way: genprog carries an exact per-template Python evaluator
