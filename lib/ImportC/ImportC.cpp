@@ -91,7 +91,11 @@
 ///    slice reference `!emitrust.mut_ref<!emitrust.slice<T>>`, dereferenced
 ///    once in the entry block into the `!emitrust.lvalue<slice>` base place
 ///    of an ordinary (base, cursor) decomposition. Array parameters decay
-///    to pointers in C and classify the same way. At call sites every value
+///    to pointers in C and classify the same way (C99-36) — including the
+///    C99 bracket forms `a[static N]`, `a[const]`, and `a[volatile]`,
+///    whose static length is a caller-side guarantee and whose qualifiers
+///    land on the decayed POINTER object itself, which the decomposition
+///    erases, so they are accepted and ignored. At call sites every value
 ///    argument is materialized before any borrow-producing argument (C
 ///    leaves the order unspecified; this keeps loads out of the borrow/call
 ///    window), a slice argument reslices its region base with
@@ -246,6 +250,13 @@
 ///    offset whose window overruns the array is a located rejection, and
 ///    wide views over non-byte bases keep the reinterpret rejection
 ///    family.
+///  - The `inline` specifier is a semantic no-op (C99-18): every inline
+///    definition — plain C99 `inline` without extern (whose body clang
+///    still supplies even though C99 6.7.4p7 makes it no external
+///    definition), `extern inline`, and `static inline` — imports as an
+///    ordinary function definition; in the merged whole-program module
+///    one ordinary definition per external name is the right shape, and
+///    `static inline` keeps the per-TU mangling of any other file-static.
 ///
 /// The importer is a functional core (the `CImporter` class below, which
 /// owns the builder and per-function symbol table) driven by the imperative
