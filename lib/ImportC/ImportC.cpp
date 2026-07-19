@@ -46,6 +46,18 @@
 ///    the Phase-1b lowering (never owner-promoted), scalar compound
 ///    literals are rejected, and a global pointer bound to one keeps the
 ///    borrow-would-outlive-the-object rejection.
+///  - Unions import on the one-slot struct model (C99-44/CTS-R3): a
+///    union type is a ONE-FIELD struct_def whose storage field is the
+///    slot arm's leaf, every arm's spelling aliasing it. Identical-type
+///    arms alias exactly; same-width scalar puns (int signedness via
+///    `emitrust.cast`, float/int via `emitrust.bitcast`, i.e. Rust
+///    to_bits/from_bits) reinterpret bit-exactly at every access site,
+///    including compound assignment, ++/--, value-position assignment,
+///    and designated initializers; constant initializers through a
+///    float-pun arm cross the domain at compile time. Everything else —
+///    bit-field/pointer/unnamed arms, differing-size scalars, aggregate
+///    arms, empty unions, byte-array arm ACCESS, address-of any union
+///    member — is a located rejection (see `collectUnionSlot`).
 ///  - Intra-function pointer locals never materialize as pointer values.
 ///    A Steensgaard-style union-find pre-pass (`PointerRegionAnalysis`)
 ///    resolves every local pointer variable to a single base object; the
@@ -1613,17 +1625,19 @@ private:
   /// `unionSlotStorage` as an alias of that slot. An arm is admitted
   /// when it maps to the identical type (exact: reading any union member
   /// with the type of the last store yields that stored value), when
-  /// both arms are integers of the same width differing only in
-  /// signedness — accesses through such an arm reinterpret the slot
-  /// bit-exactly via `emitrust.cast` (two's complement, C99 6.5.2.3) —
-  /// or when the arm is a constant integer ARRAY whose total width
-  /// equals the integer slot's (CTS-F, 00210): such a byte-array arm is
-  /// a TYPE-level concession recorded in `unionByteArrayArms`, and every
+  /// both arms are same-width scalars — integers differing only in
+  /// signedness reinterpret the slot bit-exactly via `emitrust.cast`
+  /// (two's complement, C99 6.5.2.3), and a float paired with a
+  /// same-width integer (float/32-bit int, double/64-bit int)
+  /// reinterprets via `emitrust.bitcast` (`to_bits`/`from_bits`) — or
+  /// when the arm is a constant integer ARRAY whose total width equals
+  /// the integer slot's (CTS-F, 00210): such a byte-array arm is a
+  /// TYPE-level concession recorded in `unionByteArrayArms`, and every
   /// access through it rejects at the access site. Bit-field arms,
-  /// unnamed/anonymous arms, pointer arms, integer arms of differing
-  /// sizes, mixed non-integer arms, and empty unions are rejected with
-  /// located `unsupported: union ...` diagnostics at the union
-  /// definition.
+  /// unnamed/anonymous arms, pointer arms, scalar arms of differing
+  /// sizes, aggregate/enum arms that do not match the slot's type
+  /// exactly, and empty unions are rejected with located
+  /// `unsupported: union ...` diagnostics at the union definition.
   LogicalResult collectUnionSlot(const clang::RecordDecl *definition,
                                  SmallVectorImpl<llvm::StringRef> &fieldNames,
                                  SmallVectorImpl<Type> &fieldTypes);
@@ -1635,18 +1649,26 @@ private:
   const clang::FieldDecl *
   flattenedFieldStorage(const clang::FieldDecl *field) const;
 
+  /// Reinterprets `value` bit-exactly as `target`: a no-op when the
+  /// types already match, an `emitrust.bitcast` (`to_bits`/`from_bits`)
+  /// when either side is a float type, and a same-width `emitrust.cast`
+  /// (bit-exact on two's complement) otherwise. The union pun helpers
+  /// below and the pun-arm initializer path share this as the single
+  /// slot<->arm reinterpretation primitive.
+  Value reinterpretScalarBits(Location loc, Value value, Type target);
+
   /// If `expr` (modulo parens and implicit trivia) reads a union arm
-  /// whose mapped type differs from its storage slot's — a signedness
-  /// pun admitted by `collectUnionSlot` — reinterprets `value` (the
-  /// loaded slot value) as the arm's own mapped type with a bit-exact
-  /// `emitrust.cast`; otherwise returns `value` unchanged.
+  /// whose mapped type differs from its storage slot's — a signedness or
+  /// float pun admitted by `collectUnionSlot` — reinterprets `value`
+  /// (the loaded slot value) bit-exactly as the arm's own mapped type
+  /// (`reinterpretScalarBits`); otherwise returns `value` unchanged.
   FailureOr<Value> reinterpretUnionArmRead(const clang::Expr *expr,
                                            Value value, Location loc);
 
   /// If the assignment target `expr` is a union arm whose mapped type
-  /// differs from its storage slot's, casts `value` (the assigned value,
-  /// of the arm's type) to the slot's type so the store lands bit-exactly
-  /// on the slot; otherwise returns `value` unchanged.
+  /// differs from its storage slot's, reinterprets `value` (the assigned
+  /// value, of the arm's type) bit-exactly to the slot's type so the
+  /// store lands on the slot; otherwise returns `value` unchanged.
   FailureOr<Value> reinterpretUnionArmWrite(const clang::Expr *expr,
                                             Value value, Location loc);
 
@@ -7473,6 +7495,15 @@ LogicalResult CImporter::collectUnionSlot(
   fieldTypes.push_back(slotType);
 
   auto slotInt = llvm::dyn_cast<IntegerType>(slotType);
+  // The bit width of a scalar (integer or float) mapped type; 0 for
+  // aggregates, enums, and every other non-scalar type.
+  auto scalarWidth = [](Type type) -> unsigned {
+    if (auto intType = llvm::dyn_cast<IntegerType>(type))
+      return intType.getWidth();
+    if (auto floatType = llvm::dyn_cast<FloatType>(type))
+      return floatType.getWidth();
+    return 0;
+  };
   for (const clang::FieldDecl *arm : definition->fields()) {
     if (arm == storage)
       continue;
@@ -7480,8 +7511,8 @@ LogicalResult CImporter::collectUnionSlot(
     // slot's admits as a TYPE-level alias (CTS-F, 00210): its spelling
     // never reaches the IR, and any access through it rejects at the
     // access site (`unsupported: union byte-array arm access`). An
-    // unequal-total-width array arm falls through to the family
-    // rejections below.
+    // unequal-total-width array arm — or one over a float slot — falls
+    // through to the family rejections below.
     if (integerArrayArm(arm) && slotInt &&
         astContext().getTypeSize(arm->getType()) == slotInt.getWidth()) {
       unionByteArrayArms.insert(arm);
@@ -7497,19 +7528,23 @@ LogicalResult CImporter::collectUnionSlot(
       unionSlotStorage[arm] = storage;
       continue;
     }
-    auto armInt = llvm::dyn_cast<IntegerType>(*armType);
-    // Same-width integers differing only in signedness alias bit-exactly
-    // on two's complement (C99 6.5.2.3 union punning); accesses through
-    // this arm wrap an `emitrust.cast` reinterpretation.
-    if (slotInt && armInt && slotInt.getWidth() == armInt.getWidth()) {
+    unsigned slotWidth = scalarWidth(slotType);
+    unsigned armWidth = scalarWidth(*armType);
+    // Same-width scalars alias the slot bit-exactly (C99 6.5.2.3 union
+    // punning over one object representation): integers differing only
+    // in signedness reinterpret through a same-width `emitrust.cast`
+    // (two's complement), and a float paired with a same-width integer
+    // through an `emitrust.bitcast` (`to_bits`/`from_bits`) — both at
+    // the access sites (`reinterpretUnionArmRead`/`Write`).
+    if (slotWidth != 0 && slotWidth == armWidth) {
       unionSlotStorage[arm] = storage;
       continue;
     }
-    if (slotInt && armInt)
+    if (slotWidth != 0 && armWidth != 0)
       return emitError(unionLoc)
              << "unsupported: union arms of differing sizes";
     return emitError(unionLoc)
-           << "unsupported: union type mixing non-integer arms";
+           << "unsupported: union arm cannot alias the storage slot";
   }
   return success();
 }
@@ -7525,6 +7560,16 @@ CImporter::flattenedFieldName(const clang::FieldDecl *field) const {
   return mangleMemberName(flattenedFieldStorage(field)->getName());
 }
 
+Value CImporter::reinterpretScalarBits(Location loc, Value value,
+                                       Type target) {
+  if (value.getType() == target)
+    return value;
+  if (llvm::isa<FloatType>(value.getType()) || llvm::isa<FloatType>(target))
+    return builder.create<emitrust::BitcastOp>(loc, target, value)
+        .getResult();
+  return builder.create<emitrust::CastOp>(loc, target, value).getResult();
+}
+
 FailureOr<Value> CImporter::reinterpretUnionArmRead(const clang::Expr *expr,
                                                     Value value,
                                                     Location loc) {
@@ -7538,9 +7583,7 @@ FailureOr<Value> CImporter::reinterpretUnionArmRead(const clang::Expr *expr,
   FailureOr<Type> armType = mapType(field->getType(), loc);
   if (failed(armType))
     return failure();
-  if (*armType == value.getType())
-    return value;
-  return builder.create<emitrust::CastOp>(loc, *armType, value).getResult();
+  return reinterpretScalarBits(loc, value, *armType);
 }
 
 FailureOr<Value> CImporter::reinterpretUnionArmWrite(const clang::Expr *expr,
@@ -7559,9 +7602,7 @@ FailureOr<Value> CImporter::reinterpretUnionArmWrite(const clang::Expr *expr,
   FailureOr<Type> slotType = mapType(storage->getType(), loc);
   if (failed(slotType))
     return failure();
-  if (*slotType == value.getType())
-    return value;
-  return builder.create<emitrust::CastOp>(loc, *slotType, value).getResult();
+  return reinterpretScalarBits(loc, value, *slotType);
 }
 
 std::string
@@ -8406,7 +8447,8 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
     // A union global carries a Union APValue, not a Struct one; it
     // initializes its single storage slot (the union imports as a
     // one-field struct, see `collectUnionSlot`) exactly like an
-    // anonymous union member's slot, bit-exact across a signedness pun.
+    // anonymous union member's slot, bit-exact across a signedness or
+    // float pun.
     if (const clang::RecordDecl *unionRecord =
             structDefRecords.lookup(structType.getName());
         unionRecord && unionRecord->isUnion()) {
@@ -8566,8 +8608,30 @@ CImporter::convertAnonymousSlotInit(const clang::APValue &value,
           value.getUnionValue(),
           active->getType()->getAsRecordDecl()->getDefinition(), slotType,
           loc);
-    return convertAPValueInit(value.getUnionValue(), slotType,
-                              active->getType(), loc);
+    // A float-pun arm's constant crosses the domain at compile time: the
+    // active arm's value lands on the slot as its exact bit pattern (the
+    // constant counterpart of the `emitrust.bitcast` at access sites).
+    // Same-width int arms need no special case — the IntegerAttr path of
+    // `convertAPValueInit` is already bit-exact (extOrTrunc).
+    const clang::APValue &armValue = value.getUnionValue();
+    if (auto slotInt = llvm::dyn_cast<IntegerType>(slotType);
+        slotInt && armValue.isFloat()) {
+      llvm::APInt bits = armValue.getFloat().bitcastToAPInt();
+      if (bits.getBitWidth() != slotInt.getWidth())
+        return emitError(loc)
+               << "unsupported: global initializer does not match its type";
+      return Attribute(IntegerAttr::get(slotInt, bits));
+    }
+    if (auto slotFloat = llvm::dyn_cast<FloatType>(slotType);
+        slotFloat && armValue.isInt()) {
+      if (armValue.getInt().getBitWidth() != slotFloat.getWidth())
+        return emitError(loc)
+               << "unsupported: global initializer does not match its type";
+      return Attribute(FloatAttr::get(
+          slotFloat, llvm::APFloat(slotFloat.getFloatSemantics(),
+                                   armValue.getInt())));
+    }
+    return convertAPValueInit(armValue, slotType, active->getType(), loc);
   }
   // A nested anonymous struct on the slot path has exactly one field
   // (`anonymousUnionArmLeaf` admitted the arm); descend into it.
@@ -10258,7 +10322,12 @@ LogicalResult CImporter::emitRecordInitField(Value place,
         place, field->getType()->getAsRecordDecl()->getDefinition(), nested,
         instance);
   }
-  FailureOr<Type> fieldType = mapType(field->getType(), elementLoc);
+  // A union pun arm stores into its slot's field: the member place takes
+  // the SLOT's type and name, and the arm-typed initializer value
+  // reinterprets bit-exactly onto it (the local-init counterpart of
+  // `reinterpretUnionArmWrite`).
+  const clang::FieldDecl *storage = flattenedFieldStorage(field);
+  FailureOr<Type> fieldType = mapType(storage->getType(), elementLoc);
   if (failed(fieldType))
     return failure();
   Value fieldPlace = builder
@@ -10267,7 +10336,13 @@ LogicalResult CImporter::emitRecordInitField(Value place,
                              place,
                              builder.getStringAttr(flattenedFieldName(field)))
                          .getResult();
-  return emitInitListElement(fieldPlace, *fieldType, element);
+  if (storage == field)
+    return emitInitListElement(fieldPlace, *fieldType, element);
+  FailureOr<Value> value = emitRValue(element);
+  if (failed(value))
+    return failure();
+  return storeToPlace(elementLoc, fieldPlace,
+                      reinterpretScalarBits(elementLoc, *value, *fieldType));
 }
 
 LogicalResult CImporter::emitInitListElement(Value place, Type type,
@@ -11801,12 +11876,23 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   if (failed(place))
     return failure();
   Value current = loadPlace(loc, *place);
-  FailureOr<Value> result = buildCompoundAssignValue(loc, op, current);
+  // A union pun arm's place is its slot's: the computation happens on the
+  // arm's own type, so the loaded slot value reinterprets to the arm
+  // (bit-exact) and the computed result reinterprets back before the
+  // store — without this a float arm over an integer slot would
+  // VALUE-convert through `convertScalarValue` instead.
+  FailureOr<Value> loaded = reinterpretUnionArmRead(op->getLHS(), current, loc);
+  if (failed(loaded))
+    return failure();
+  FailureOr<Value> result = buildCompoundAssignValue(loc, op, *loaded);
   if (failed(result))
+    return failure();
+  FailureOr<Value> stored = reinterpretUnionArmWrite(op->getLHS(), *result, loc);
+  if (failed(stored))
     return failure();
   if (failed(commitGlobalWriteback(
           loc, writeback, assignStalenessRisk(op),
-          [&]() { return storeToPlace(loc, *place, *result); })))
+          [&]() { return storeToPlace(loc, *place, *stored); })))
     return failure();
   return place;
 }
@@ -11933,6 +12019,16 @@ FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
   if (failed(place))
     return failure();
   Value current = loadPlace(loc, *place);
+  // A union pun arm's place is its slot's: reinterpret the loaded slot
+  // value to the arm's own type first, so ++/-- on a float arm over an
+  // integer slot is the (already rejected) non-integer case rather than
+  // raw arithmetic on the bit pattern; an integer pun arm computes at
+  // its own signedness and reinterprets back before the store.
+  FailureOr<Value> loaded =
+      reinterpretUnionArmRead(op->getSubExpr(), current, loc);
+  if (failed(loaded))
+    return failure();
+  current = *loaded;
   auto intType = llvm::dyn_cast<IntegerType>(current.getType());
   if (!intType)
     return emitError(loc) << "unsupported: ++/-- on a non-integer operand";
@@ -11942,12 +12038,16 @@ FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
   FailureOr<Value> next = buildBinaryArith(loc, opcode, current, one);
   if (failed(next))
     return failure();
+  FailureOr<Value> stored =
+      reinterpretUnionArmWrite(op->getSubExpr(), *next, loc);
+  if (failed(stored))
+    return failure();
   // The subexpression's own side effects (a subscript-index call,
   // `g[f()]++`) run after the staging load and force the pre-store
   // refresh of the staged copy.
   if (failed(commitGlobalWriteback(
           loc, writeback, op->getSubExpr()->HasSideEffects(astContext()),
-          [&]() { return storeToPlace(loc, *place, *next); })))
+          [&]() { return storeToPlace(loc, *place, *stored); })))
     return failure();
   // C evaluates postfix forms to the original value and prefix forms to
   // the updated one.
@@ -13832,13 +13932,15 @@ FailureOr<Value> CImporter::emitBinaryRValue(const clang::BinaryOperator *op) {
     FailureOr<Value> place = emitCompoundAssignToPlace(compound);
     if (failed(place))
       return failure();
-    return loadPlace(loc, *place);
+    // A union pun arm's re-loaded slot value reinterprets to the arm's
+    // own type, the C type of the assignment expression.
+    return reinterpretUnionArmRead(op->getLHS(), loadPlace(loc, *place), loc);
   }
   if (opcode == clang::BO_Assign) {
     FailureOr<Value> place = emitAssignToPlace(op);
     if (failed(place))
       return failure();
-    return loadPlace(loc, *place);
+    return reinterpretUnionArmRead(op->getLHS(), loadPlace(loc, *place), loc);
   }
   // The comma operator evaluates the left operand for its side effects
   // only and yields the right operand's value.
@@ -17369,8 +17471,9 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   if (field->isAnonymousStructOrUnion())
     return basePlace;
   // A union arm designates its storage slot: the member selects the
-  // slot's name at the slot's type. A differently-signed arm's
-  // bit-exact reinterpretation happens at the load or store site (see
+  // slot's name at the slot's type. A pun arm's (differently-signed
+  // integer, or float over an integer slot and vice versa) bit-exact
+  // reinterpretation happens at the load or store site (see
   // `reinterpretUnionArmRead`/`reinterpretUnionArmWrite`).
   FailureOr<Type> fieldType =
       mapType(flattenedFieldStorage(field)->getType(), loc);

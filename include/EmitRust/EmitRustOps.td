@@ -1486,6 +1486,47 @@ def EmitRust_CastOp : EmitRust_Op<"cast",
 }
 
 //===----------------------------------------------------------------------===//
+// BitcastOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_BitcastOp : EmitRust_Op<"bitcast"> {
+  let summary = "Bit-exact float/integer reinterpretation";
+  let description = [{
+    The `emitrust.bitcast` operation reinterprets the bit pattern of a
+    floating-point value as a same-width integer, or vice versa, without
+    any value conversion — the exact semantics of Rust's
+    `f32::to_bits`/`f32::from_bits` (and the `f64` pair), which is what
+    the emitter renders. This is deliberately distinct from
+    `emitrust.cast`, whose `as` rendering value-converts between the
+    float and integer domains.
+
+    The verifier requires exactly one float side (`f32` or `f64`) and one
+    integer side of the same bit width; the integer may be signless
+    (Rust's signed `iN`) or unsigned (`uiN`). `to_bits`/`from_bits` speak
+    `u32`/`u64`, so a signless integer side additionally wraps a
+    same-width `as` conversion, which is itself bit-preserving.
+
+    Example:
+
+    ```mlir
+    %f = emitrust.bitcast %bits : ui32 to f32
+    %i = emitrust.bitcast %v : f32 to i32
+    ```
+    ```rust
+    // Code emitted for the operations above.
+    let v2 = f32::from_bits(v1);
+    let v4 = v3.to_bits() as i32;
+    ```
+  }];
+
+  let arguments = (ins AnyType:$source);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$source attr-dict `:` type($source) `to` type($result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // SelectOp
 //===----------------------------------------------------------------------===//
 
