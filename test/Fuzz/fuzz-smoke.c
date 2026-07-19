@@ -1,5 +1,6 @@
 // REQUIRES: cargo
 // RUN: %python %S/fuzz_differential.py --emitrust-cc emitrust-cc --start 1 --count 16 --jobs 4 --fail-on-miscompile --workdir %t
+// RUN: %python %S/fuzz_differential.py --emitrust-cc emitrust-cc --start 1 --count 6 --jobs 4 --fail-on-miscompile --range-check --workdir %t.rc
 //
 // Differential fuzzing smoke test.  This file has a .c suffix only so lit
 // discovers it (test/lit.cfg.py sets config.suffixes = [".mlir", ".c"]); it
@@ -16,6 +17,13 @@
 // test/CTestSuite/c-testsuite.c; the script falls back to PATH lookup for
 // manual runs.  clang comes from the dev shell's PATH.
 //
-// The seed range is pinned so the smoke stays deterministic and under a
-// minute: same seeds -> byte-identical programs -> stable wall time.  For
-// real campaigns see test/Fuzz/README.md.
+// The second RUN line re-runs seeds 1..6 with --range-check, which adds
+// --check-range-refinement to every emitrust-cc invocation: any compile
+// failure mentioning 'range refinement violation' classifies as the
+// hard-fail class RANGE_VIOLATION (a checker false positive on these
+// correct-by-construction programs), so the smoke also guards the checker
+// against regressions that would flag sound programs.
+//
+// The seed ranges are pinned so the smoke stays deterministic and cheap:
+// same seeds -> byte-identical programs -> stable wall time.  For real
+// campaigns see test/Fuzz/README.md.

@@ -62,6 +62,20 @@ The driver probes once whether emitrust-cc's cargo child inherits
 `CARGO_TARGET_DIR` and shares one target dir when it does; otherwise it
 falls back to per-crate target dirs automatically.
 
+## Range-refinement checking mode
+
+`--range-check` adds `--check-range-refinement` to every emitrust-cc
+invocation, turning on the differential integer-range checker
+(`emitrust-range-refinement-check`) inside the compile. A compile
+failure whose stderr contains `range refinement violation` becomes the
+hard-fail class `RANGE_VIOLATION` — reported like MISCOMPILE with
+artifacts saved, and failing the run under `--fail-on-miscompile`;
+every generated program is correct by construction, so any
+RANGE_VIOLATION is a checker false positive (a checker bug, never a
+generator or program bug). All other compile failures still classify
+UNSUPPORTED. The mode does not touch the generator: GENERATOR_VERSION
+and the seed→program mapping are byte-identical with and without it.
+
 ## Determinism contract
 
 A program is a pure function of `(seed, GENERATOR_VERSION)`: genprog

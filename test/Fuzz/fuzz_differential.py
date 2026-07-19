@@ -16,6 +16,15 @@ regardless of flags.  MISCOMPILEs save
 artifacts (seed, prog.c, both rc/stdout pairs, crate-dir pointer) under
 --artifacts and fail the run when --fail-on-miscompile is given.
 
+--range-check adds --check-range-refinement to every emitrust-cc
+invocation; a compile failure whose stderr carries 'range refinement
+violation' becomes the hard-fail class RANGE_VIOLATION (reported like
+MISCOMPILE, artifacts saved).  Because every generated program is
+correct by construction, any RANGE_VIOLATION is a checker false
+positive, i.e. a checker bug.  The generator itself is untouched:
+GENERATOR_VERSION and the seed->program mapping are identical with and
+without --range-check.
+
 Cargo target-dir strategy: the driver probes once whether emitrust-cc's
 cargo child inherits CARGO_TARGET_DIR (binary lands at
 ``$CARGO_TARGET_DIR/release/<crate>``).  If so, all builds share one
@@ -54,7 +63,17 @@ def parse_args(argv):
     parser.add_argument(
         "--fail-on-miscompile",
         action="store_true",
-        help="Exit nonzero if any seed classifies MISCOMPILE.",
+        help="Exit nonzero if any seed classifies MISCOMPILE or RANGE_VIOLATION.",
+    )
+    parser.add_argument(
+        "--range-check",
+        action="store_true",
+        help="Add --check-range-refinement to every emitrust-cc invocation."
+        " A compile failure mentioning 'range refinement violation' becomes"
+        " the hard-fail class RANGE_VIOLATION (reported like MISCOMPILE,"
+        " artifacts saved); on generated correct-by-construction programs"
+        " that is always a checker false positive. Other compile failures"
+        " stay UNSUPPORTED.",
     )
     parser.add_argument(
         "--workdir",
@@ -119,11 +138,13 @@ def probe_cargo_target_dir(emitrust_cc, workdir):
     return True
 
 
-def run_seed(emitrust_cc, clang, seed, seeds_dir, cross_fraction, keep_work):
+def run_seed(emitrust_cc, clang, seed, seeds_dir, cross_fraction, keep_work,
+             range_check=False):
     """Generate, differentially run, and classify one seed.
 
     Returns (seed, program, PairResult, source_path).  Work products of
-    non-MISCOMPILE seeds are cleaned up unless ``keep_work``.
+    seeds that are neither MISCOMPILE nor RANGE_VIOLATION are cleaned up
+    unless ``keep_work``.
     """
     program = genprog.generate_program(seed, cross_fraction)
     seed_dir = os.path.join(seeds_dir, "fuzz_%d" % seed)
@@ -134,8 +155,9 @@ def run_seed(emitrust_cc, clang, seed, seeds_dir, cross_fraction, keep_work):
     result = differ.run_pair(
         emitrust_cc, clang, source_path, seed_dir,
         expected=(program.expected_exit, program.expected_stdout),
+        range_check=range_check,
     )
-    if result.status != differ.MISCOMPILE and not keep_work:
+    if result.status not in (differ.MISCOMPILE, differ.RANGE_VIOLATION) and not keep_work:
         # Drop the bulky build products; keep the source for reference.
         for name in ("native", "crate"):
             path = os.path.join(seed_dir, name)
@@ -194,7 +216,8 @@ def main(argv):
         results = list(
             pool.map(
                 lambda seed: run_seed(
-                    emitrust_cc, clang, seed, seeds_dir, args.cross_fraction, args.keep_work
+                    emitrust_cc, clang, seed, seeds_dir, args.cross_fraction,
+                    args.keep_work, args.range_check
                 ),
                 seeds,
             )
@@ -204,11 +227,13 @@ def main(argv):
         differ.PASS: 0,
         differ.UNSUPPORTED: 0,
         differ.MISCOMPILE: 0,
+        differ.RANGE_VIOLATION: 0,
         differ.GENERATOR_ORACLE_BUG: 0,
         differ.HARNESS_BUG: 0,
     }
     template_stats = {spec.name: {"seeds": 0, "exercised": 0} for spec in genprog.TEMPLATES}
     miscompiles = []
+    range_violations = []
     harness_bugs = []
     oracle_bugs = []
     for seed, program, result, source_path in results:
@@ -219,6 +244,8 @@ def main(argv):
                 template_stats[name]["exercised"] += 1
         if result.status == differ.MISCOMPILE:
             miscompiles.append((seed, program, result, source_path))
+        elif result.status == differ.RANGE_VIOLATION:
+            range_violations.append((seed, program, result, source_path))
         elif result.status == differ.HARNESS_BUG:
             harness_bugs.append((seed, result))
         elif result.status == differ.GENERATOR_ORACLE_BUG:
@@ -234,6 +261,16 @@ def main(argv):
         print("  " + result.detail.replace("\n", "\n  "))
     for seed, program, result, _source in miscompiles:
         print("MISCOMPILE seed=%d templates=%s" % (seed, ",".join(program.template_names)))
+        print("  " + result.detail.replace("\n", "\n  "))
+        if args.artifacts:
+            bundle = save_artifacts(args.artifacts, seed, program, result, _source)
+            print("  artifacts: %s" % bundle)
+    for seed, program, result, _source in range_violations:
+        print(
+            "RANGE_VIOLATION seed=%d templates=%s (checker false positive on a"
+            " correct-by-construction program)"
+            % (seed, ",".join(program.template_names))
+        )
         print("  " + result.detail.replace("\n", "\n  "))
         if args.artifacts:
             bundle = save_artifacts(args.artifacts, seed, program, result, _source)
@@ -271,16 +308,19 @@ def main(argv):
 
     print(
         "\nsummary: seeds=%d pass=%d unsupported=%d miscompile=%d"
-        " oracle_bug=%d harness_bug=%d (generator v%s, cross-fraction %.2f)"
+        " range_violation=%d oracle_bug=%d harness_bug=%d"
+        " (generator v%s, cross-fraction %.2f, range-check %s)"
         % (
             len(seeds),
             counts[differ.PASS],
             counts[differ.UNSUPPORTED],
             counts[differ.MISCOMPILE],
+            counts[differ.RANGE_VIOLATION],
             counts[differ.GENERATOR_ORACLE_BUG],
             counts[differ.HARNESS_BUG],
             genprog.GENERATOR_VERSION,
             args.cross_fraction,
+            "on" if args.range_check else "off",
         )
     )
 
@@ -290,13 +330,15 @@ def main(argv):
             " defect, fix genprog.py" % (len(harness_bugs), len(oracle_bugs))
         )
         return 2
-    if miscompiles and args.fail_on_miscompile:
+    hard_fails = miscompiles + range_violations
+    if hard_fails and args.fail_on_miscompile:
         print(
-            "FAIL: %d MISCOMPILE(s); minimize with:"
-            " python3 test/Fuzz/minimize.py --seed <seed> ..." % len(miscompiles)
+            "FAIL: %d MISCOMPILE(s), %d RANGE_VIOLATION(s); minimize with:"
+            " python3 test/Fuzz/minimize.py --seed <seed> ..."
+            % (len(miscompiles), len(range_violations))
         )
         return 1
-    if not args.workdir and not args.keep_work and not miscompiles:
+    if not args.workdir and not args.keep_work and not hard_fails:
         shutil.rmtree(workdir, ignore_errors=True)
     return 0
 

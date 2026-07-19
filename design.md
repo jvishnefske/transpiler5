@@ -362,6 +362,36 @@ lists the lit test file(s) that validate it.
   (test/Conversion/range-refinement/positive-refine.mlir,
   positive-wrap.mlir, positive-memory-top.mlir, negative-pair.mlir,
   negative-return.mlir)
+
+  Wiring (landed): emitrust-cc gains --check-range-refinement (off by
+  default), which inserts the checker into the pinned pipeline
+  immediately before convert-to-emitrust — i.e. after lift-cf-to-scf and
+  its canonicalize, on the conversion's exact input. That placement, not
+  the post-mem2reg point, is load-bearing: the pass's primary-mode
+  internal clone pipeline runs only convert-to-emitrust, which marks cf
+  illegal but cannot lift it, so unlifted cf.br/cf.cond_br in pre-lift
+  IR fail the internal pipeline on every branching program (observed:
+  100% spurious compile failures when wired pre-lift). The pass is
+  observational — it clones and converts internally — so the main
+  pipeline continues unchanged after it; a violation fails the compile
+  with the pass's located "range refinement violation" diagnostic.
+  Fuzz-harness mode: fuzz_differential.py/differ.py --range-check adds
+  the flag to every emitrust-cc invocation and classifies a compile
+  failure whose stderr carries "range refinement violation" as the
+  hard-fail class RANGE_VIOLATION (reported like MISCOMPILE, artifacts
+  saved, fatal under --fail-on-miscompile); all other compile failures
+  stay UNSUPPORTED, and the generator is untouched (GENERATOR_VERSION
+  unchanged). Because every generated program is correct by
+  construction, any RANGE_VIOLATION is a checker false positive.
+  Shakedown: a 500-seed checker-on campaign (seeds 5000-5499, jobs 8)
+  came back seeds=500 pass=500 unsupported=0 miscompile=0
+  range_violation=0 oracle_bug=0 harness_bug=0, oracle agreement
+  500/500. Measured overhead: a 100-seed run (seeds 5000-5099, jobs 8)
+  took 81.9s plain vs 81.6s checker-on — the checker's compile-time
+  cost is below run-to-run noise (cargo build dominates each seed).
+  fuzz-smoke.c carries a second RUN line (seeds 1-6, --range-check)
+  guarding the wiring inside check-emitrust.
+
 - [x] FR-25 Generality beyond test vectors: an adversarial audit plus
   differential stress run over shapes absent from the original tests
   (negative/sparse/INT_MAX-adjacent case labels, nested switch, default

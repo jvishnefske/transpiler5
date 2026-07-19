@@ -10,7 +10,9 @@
 /// transpiler driver. It parses the command line, imports the C input with
 /// the ImportC library, runs the pinned pass pipeline
 /// (mem2reg, canonicalize, lift-cf-to-scf, canonicalize,
-/// convert-to-emitrust), and emits one of:
+/// convert-to-emitrust; --check-range-refinement additionally runs the
+/// observational emitrust-range-refinement-check pass on the
+/// pre-conversion stage), and emits one of:
 ///   --emit=import  the raw imported MLIR module, before any pass;
 ///   --emit=mlir    the MLIR module after the full pass pipeline;
 ///   --emit=rust    Rust source text (identical to the crate's src/main.rs
@@ -28,6 +30,7 @@
 #include "CrateEmitter.h"
 
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
+#include "EmitRust/Conversion/RangeRefinementCheck.h"
 #include "EmitRust/ImportC.h"
 
 #include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
@@ -127,6 +130,19 @@ static llvm::cl::opt<bool> buildFlag(
                    "--offline' on it (only valid with --emit=crate)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> checkRangeRefinement(
+    "check-range-refinement",
+    llvm::cl::desc(
+        "Run the emitrust-range-refinement-check verification pass on the "
+        "pre-conversion stage of the pipeline (after lift-cf-to-scf and its "
+        "canonicalize, i.e. on the exact input of convert-to-emitrust, the "
+        "stage the checker analyzes by design): it clones that stage, "
+        "converts the clone internally, and fails the compile with a "
+        "located 'range refinement violation' diagnostic if any observable "
+        "value's pre- and post-conversion integer ranges are disjoint (off "
+        "by default)"),
+    llvm::cl::init(false));
+
 /// Prints one diagnostic (and its notes) to stderr as
 /// `file:line:col: severity: message`, matching the format the lit tests
 /// assert on. Diagnostics without a file location omit the prefix.
@@ -163,6 +179,16 @@ static void printDiagnostic(mlir::Diagnostic &diag) {
 /// convert-to-emitrust. Pass verification catches any invalid intermediate
 /// state; failures carry located diagnostics through the context.
 ///
+/// With --check-range-refinement, the emitrust-range-refinement-check pass
+/// is inserted right after the second canonicalize, i.e. immediately
+/// before convert-to-emitrust — the exact "before" stage the checker's
+/// primary mode is designed for (its internal clone pipeline runs only
+/// convert-to-emitrust, so it must see post-lift IR: unlifted cf ops
+/// cannot be legalized by the conversion alone). The pass is purely
+/// observational — it clones the module and runs the conversion on the
+/// clone internally — so the main pipeline continues unchanged after it;
+/// a violation fails the compile with the pass's located diagnostic.
+///
 /// \param module the imported module to lower in place.
 /// \returns success if every pass succeeded.
 static mlir::LogicalResult runPipeline(mlir::ModuleOp module) {
@@ -172,6 +198,8 @@ static mlir::LogicalResult runPipeline(mlir::ModuleOp module) {
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createLiftControlFlowToSCFPass());
   pm.addPass(mlir::createCanonicalizerPass());
+  if (checkRangeRefinement)
+    pm.addPass(mlir::emitrust::createEmitRustRangeRefinementCheck());
   pm.addPass(mlir::emitrust::createConvertToEmitRust());
   return pm.run(module);
 }
