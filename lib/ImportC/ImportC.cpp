@@ -1250,8 +1250,10 @@ private:
   /// pointers `R (*)(A, B)`->`!emitrust.fn_ptr<(A, B) -> R>` (prototype-less
   /// K&R pointers map to the zero-parameter form). Typedefs resolve through
   /// the canonical type. Data pointers, unions, variadic function pointers,
-  /// fn_ptr component types outside the verifier set, and everything else
-  /// produce a located diagnostic.
+  /// va_list (the target's `__builtin_va_list` and its `__va_list_tag`
+  /// record, rejected in any position per C99-37 — Rust has no stable
+  /// varargs), fn_ptr component types outside the verifier set, and
+  /// everything else produce a located diagnostic.
   FailureOr<Type> mapType(clang::QualType type, Location loc);
 
   /// Maps a C function-parameter type: data-pointer parameters `T*` become
@@ -5411,6 +5413,25 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     return emitError(loc) << "unsupported: volatile-qualified type";
   if (canonical->isAtomicType())
     return emitError(loc) << "unsupported: _Atomic-qualified type";
+
+  // C99-37: va_list is a PERMANENT rejection — Rust has no stable
+  // variadic-argument access, so the target's `__builtin_va_list` (and
+  // its underlying `__va_list_tag` record) has no meaningful
+  // representation in any position: local, parameter, field, or global.
+  // A va_list touched inside a variadic DEFINITION is caught earlier by
+  // the variadic-definition rejection (`bodyUsesVaList`); this check
+  // catches the type escaping into non-variadic contexts, which would
+  // otherwise import as a garbage register-save-area struct.
+  {
+    clang::ASTContext &context = astContext();
+    if (context.hasSameType(canonical,
+                            context.getBuiltinVaListType().getCanonicalType()))
+      return emitError(loc) << "unsupported: va_list type";
+    if (const auto *record = canonical->getAs<clang::RecordType>())
+      if (const clang::Decl *tag = context.getVaListTagDecl())
+        if (record->getDecl()->getCanonicalDecl() == tag->getCanonicalDecl())
+          return emitError(loc) << "unsupported: va_list type";
+  }
 
   if (const auto *builtin =
           llvm::dyn_cast<clang::BuiltinType>(canonical.getTypePtr())) {

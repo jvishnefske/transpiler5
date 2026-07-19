@@ -1069,9 +1069,35 @@ rule.
   parameter decays to a rejected pointer-to-pointer (CTS-P5).
   (test/Import/C/array-params.c, array-params-invalid.c,
   test/EndToEnd/array-params.c)
-- [ ] C99-37 Variadic function definitions and va_list (design decision
-  needed; Rust has no stable varargs — likely a permanent documented
-  rejection, with printf-style call sites special-cased as today).
+- [x] C99-37 Variadic function definitions and va_list: PERMANENT
+  documented rejection for anything that touches va_list. Rust has no
+  stable variadic ABI or safe varargs access, so a variadic DEFINITION
+  whose body uses the va_list machinery (va_start/va_arg/va_copy or a
+  va_list variable declaration, detected by the `bodyUsesVaList` scan)
+  keeps the located rejection "unsupported: variadic function
+  definition", and the va_list TYPE itself (the target's
+  `__builtin_va_list` and its underlying `__va_list_tag` record) is
+  rejected by the type mapper in every position — local, parameter,
+  field, global — with the located "unsupported: va_list type", so a
+  hand-rolled vprintf-style helper or a stray va_list local in a
+  non-variadic function can never import as the target's
+  register-save-area struct. That decl-site rejection makes the
+  v*printf family unreachable by construction (every call needs a
+  va_list argument); a v*printf call reached without one keeps the
+  C99-39 system-header use rejection. Two deliberate carve-outs stand:
+  (1) the CTS-F1/CTS-P9 fixed-prototype import — a variadic definition
+  whose body is va_list-free can never observe its trailing arguments,
+  so it imports as its named parameters only and call sites drop
+  effect-free extras (an extra with side effects is rejected); (2)
+  printf-family CALL SITES route through the hosted printf/puts
+  machinery (C99-47/48) when the project supplies no definition. The
+  recorded permanent-out example is 00204: behind its long-double
+  surface blocker sits `va_arg(ap, struct s7)` — struct-typed varargs /
+  HFA calling convention, fundamentally outside safe-Rust emission (see
+  the 00204 PERMANENT-OUT disposition). (test/Import/C/varargs-def.c,
+  varargs-def-invalid.c — va_list-using definition, va_list local in a
+  non-variadic function, va_list parameter, vprintf call, side-effecting
+  dropped extras; test/EndToEnd/varargs-def.c)
 - [x] C99-38 Multiple translation units: several .c files are imported and
   merged into one flat crate with extern object and function resolution
   across units, and internal (static) linkage kept distinct by per-unit
