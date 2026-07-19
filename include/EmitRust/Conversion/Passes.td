@@ -201,4 +201,71 @@ def EmitRustRangeRefinementCheck
   ];
 }
 
+//===----------------------------------------------------------------------===//
+// EmitRustValueIdentityCheck
+//===----------------------------------------------------------------------===//
+
+// Note: like emitrust-range-refinement-check above, this is a verification
+// (analysis-only) pass that lives in the conversion pass registry because
+// it internally drives the convert-to-emitrust pipeline.
+def EmitRustValueIdentityCheck
+    : Pass<"emitrust-value-identity-check", "ModuleOp"> {
+  let summary = "Differential concrete interpretation across "
+                "convert-to-emitrust";
+  let description = [{
+    Concretely interprets every parameterless function before and after the
+    convert-to-emitrust pipeline and reports a hard error when the two runs
+    observe different values in execution order. This complements
+    emitrust-range-refinement-check: the range checker proves range
+    consistency but is blind to value-identity bugs whose wrong value still
+    lies inside the pre-conversion range — in particular the lost-copy/swap
+    class of SSA-destruction bugs, which this pass does catch.
+
+    Input modes (shared scaffold with the range checker):
+
+    - Primary: a plain module. The pass interprets it, clones it, runs
+      convert-to-emitrust on the clone in a nested pass manager, and
+      interprets the clone identically.
+    - Secondary: a module holding exactly two nested `builtin.module` ops
+      tagged `emitrust.stage = "before"` and `emitrust.stage = "after"`,
+      compared directly with no internal conversion.
+
+    Entry points are the functions that take no arguments; each is
+    interpreted independently with a fresh environment and a generous
+    per-entry-point step budget. Observation points, recorded in execution
+    order across the whole run (callees included), are the operands of
+    `emitrust.call_opaque "print!"` calls and the operands of function
+    return terminators. The first divergence per entry point is reported as
+    a located hard error (values in signed decimal):
+
+    ```
+    error: value identity violation: '<fn>' print operand <k> at
+    occurrence <n> observed <a> pre-conversion but <b> post-conversion
+    error: value identity violation: '<fn>' return value <k> at
+    occurrence <n> observed <a> pre-conversion but <b> post-conversion
+    ```
+
+    Unsupported coverage is a SOFT SKIP, never an error: when either run
+    of an entry point reaches anything outside the interpreted op set (an
+    `emitrust.call_opaque` whose callee neither resolves to an interpreted
+    module function nor is "print!", memory/place ops beyond scalar
+    `emitrust.variable`/`assign`/`load`, cell/global/struct/float ops, an
+    exhausted step budget, ...), that entry point is skipped silently and
+    counted in the skipped-entry-points statistic. Poison policy: a
+    `ub.poison` value is materialized as a poison marker that may flow
+    through rebindings and stores, but any entry point that actually
+    EVALUATES it — arithmetic, comparison, branching, or an observation —
+    is soft-skipped; interpreting poison as the constant the conversion
+    folds it to would be unsound in general.
+
+    The pass never modifies the IR; on success the module round-trips
+    unchanged.
+  }];
+  let dependentDialects = ["::mlir::emitrust::EmitRustDialect"];
+  let statistics = [
+    Statistic<"numSkippedEntryPoints", "skipped-entry-points",
+              "Entry points skipped as unsupported coverage (not an error)">
+  ];
+}
+
 #endif // EMITRUST_CONVERSION_PASSES
