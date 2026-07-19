@@ -777,8 +777,8 @@ rule.
   renders its full element list (the 32-element `Default` derive cap only
   constrains struct fields of array type, which use literal lists here
   anyway). Rejected with located diagnostics: non-list aggregate
-  initializers (whole-struct copies, compound literals — C99-13 stays
-  open; string literals on char arrays are supported per C99-28) and
+  initializers (whole-struct copies; compound literals are supported per
+  C99-13; string literals on char arrays are supported per C99-28) and
   enum-typed global elements; multi-dimensional arrays are rejected by
   the type mapper before initializer handling.
   (test/Import/C/aggregate-init.c, aggregate-init-invalid.c,
@@ -793,7 +793,39 @@ rule.
   same per-element handling at block scope and the same APValue
   conversion at file scope. (test/Import/C/aggregate-init.c,
   test/EndToEnd/aggregate-init.c)
-- [ ] C99-13 Compound literals in expression position.
+- [x] C99-13 Compound literals in expression position.
+  Implemented for block-scope struct/union/array literals: the literal
+  materializes as a fresh anonymous `emitrust.variable`
+  (default-initialized — C99 zero fill — then the C99-11 per-element
+  assigns; `(char[N]){"..."}` fills like a string-initialized array per
+  C99-28) and from there behaves as an ordinary lvalue of that temp.
+  Value uses load it whole (assignment right-hand side — including the
+  self-referencing `s = (struct S){s.b, s.a}` swap, which reads the old
+  values through the temp — by-value argument, return); member and
+  subscript accesses resolve on the temp's place; a variable initializer
+  or aggregate-element position initializes the target place directly
+  through the literal's list (the copy source is immediately dead). A
+  decayed or address-taken literal binds a synthesized backing
+  declaration (one per literal, shared between the planning and emission
+  analyses) as a pointer-region base like any named local: cursor walks,
+  writes through the pointer, slice arguments, multi-base rebinding
+  (CTS-P7), and the degenerate struct base all compose unchanged. A
+  region-base temp is hoisted to the entry block (dereferences anywhere
+  in the body must be dominated) and each evaluation first restores the
+  type's pristine default value, so a literal bound inside a loop
+  re-zeroes its holes exactly like C's fresh object per evaluation.
+  Full expressions containing literals arrive wrapped in
+  ExprWithCleanups, peeled as trivia (the "cleanup" is the temp's end of
+  life). Owner promotion never keys on a literal base (no declaration
+  statement to anchor the owner struct); such regions stay on the
+  Phase-1b lowering. Rejected with located diagnostics: scalar compound
+  literals, binding a global pointer to a literal (the borrow would
+  outlive the block), returning a pointer into one (dangling); a
+  block-scope `static` pointer initializer is rejected by clang's own
+  constant-initializer check. File-scope literals keep their CTS-P4
+  `<name>_backing` global path.
+  (test/Import/C/compound-literals.c, compound-literals-invalid.c,
+  test/EndToEnd/compound-literals.c)
 - [x] C99-14 File-scope objects: global variables with constant
   initializers, tentative definitions, extern declarations across
   translation units (single-TU first), and static file-scope objects

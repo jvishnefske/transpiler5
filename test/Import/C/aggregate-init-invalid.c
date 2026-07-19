@@ -1,24 +1,12 @@
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/compound-literal.c 2>&1 | FileCheck %s --check-prefix=COMPOUND
 // RUN: not emitrust-import-c %t/string-init.c 2>&1 | FileCheck %s --check-prefix=STRING
 // RUN: not emitrust-import-c %t/enum-global.c 2>&1 | FileCheck %s --check-prefix=ENUMGLOBAL
 // RUN: not emitrust-import-c %t/non-constant.c 2>&1 | FileCheck %s --check-prefix=NONCONST
 
 // C99-11 boundaries: each file below exercises one located rejection around
 // aggregate initializer lists. (Multi-dimensional arrays are supported
-// since CTS-S4; see arrays-multidim.c.)
-
-// A compound literal initializer is not a brace list (C99-13 stays open).
-//--- compound-literal.c
-struct S {
-  int a;
-  int b;
-};
-int main(void) {
-  struct S s = (struct S){1, 2};
-  return s.a;
-}
-// COMPOUND: compound-literal.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: aggregate initializer
+// since CTS-S4; see arrays-multidim.c. Compound-literal initializers are
+// supported since C99-13; see compound-literals.c.)
 
 // `char s[] = "..."` is supported (see strings.c), but only for plain and
 // signed char arrays: an unsigned char array maps to u8 elements, which

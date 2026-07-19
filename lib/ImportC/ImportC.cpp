@@ -31,7 +31,21 @@
 ///    arguments dereferenced with `emitrust.deref`, and reads/writes of any
 ///    such place use `emitrust.load`/`emitrust.assign`. A scalar local whose
 ///    address is taken is kept as an `emitrust.variable` so the reference
-///    stays valid in the generated Rust.
+///    stays valid in the generated Rust. A block-scope compound literal in
+///    expression position (C99-13) materializes as a fresh anonymous
+///    `emitrust.variable` at its evaluation point — default-initialized
+///    (C99 zero fill), then per-element assigns of its initializer list,
+///    the same lowering as a `= {...}` declaration — and behaves as an
+///    ordinary lvalue of that temp: `(struct S){...}` loads whole for
+///    value uses (assignment, by-value argument, return, and
+///    `struct S s = (struct S){...}`, which initializes `s` directly),
+///    member/subscript accesses resolve on the temp's place, and a
+///    decayed or address-taken literal binds a synthesized backing
+///    declaration (`CompoundLiteralTemps`) as a pointer-region base like
+///    any named local object. Regions based on a compound literal stay on
+///    the Phase-1b lowering (never owner-promoted), scalar compound
+///    literals are rejected, and a global pointer bound to one keeps the
+///    borrow-would-outlive-the-object rejection.
 ///  - Intra-function pointer locals never materialize as pointer values.
 ///    A Steensgaard-style union-find pre-pass (`PointerRegionAnalysis`)
 ///    resolves every local pointer variable to a single base object; the
@@ -696,6 +710,53 @@ struct MemberPointerFacts {
 using MemberPointerKey =
     std::pair<const clang::VarDecl *, const clang::FieldDecl *>;
 
+/// Registry of the synthesized backing declarations for block-scope
+/// compound literals used as pointer-region bases (C99-13). A compound
+/// literal in expression position is a fresh anonymous object with the
+/// storage duration of the enclosing block; modeling it as an implicit
+/// local variable lets the existing region machinery (bases, cursors,
+/// slices, degenerate scalar-object bindings) consume it unchanged. The
+/// registry is owned by the importer and shared with every
+/// `PointerRegionAnalysis` instance (planning and emission passes alike),
+/// so all passes agree on the identity of each literal's backing
+/// declaration. The synthesized declaration is parented to the
+/// translation unit but carries `SC_Auto` storage, so `hasLocalStorage()`
+/// classifies it as a local object; it is never added to any lookup scope.
+class CompoundLiteralTemps {
+public:
+  /// Returns the backing declaration of `literal`, synthesizing it on
+  /// first request. All temps share the diagnostic-only name
+  /// "compound literal" (their emitted places are anonymous).
+  const clang::VarDecl *getOrCreate(clang::ASTContext &context,
+                                    const clang::CompoundLiteralExpr *literal) {
+    const clang::VarDecl *&slot = decls[literal];
+    if (!slot) {
+      clang::VarDecl *decl = clang::VarDecl::Create(
+          context, context.getTranslationUnitDecl(), literal->getBeginLoc(),
+          literal->getBeginLoc(), &context.Idents.get("compound literal"),
+          literal->getType(),
+          context.getTrivialTypeSourceInfo(literal->getType()),
+          clang::SC_Auto);
+      decl->setImplicit();
+      slot = decl;
+      temps.insert(decl);
+    }
+    return slot;
+  }
+
+  /// Returns whether `decl` is a synthesized compound-literal backing.
+  bool isTemp(const clang::VarDecl *decl) const {
+    return temps.contains(decl);
+  }
+
+private:
+  /// One backing declaration per compound literal expression.
+  llvm::DenseMap<const clang::CompoundLiteralExpr *, const clang::VarDecl *>
+      decls;
+  /// The synthesized declarations, for the reverse membership test.
+  llvm::SmallPtrSet<const clang::VarDecl *, 4> temps;
+};
+
 /// One base binding of a pointer region: the object some pointer in the
 /// region was made to point into, and the source location of the assignment
 /// (or initializer) that bound it. The multi-base diagnostic names the
@@ -870,6 +931,14 @@ public:
   /// tracks it. Left unset (the pure-AST planning passes), the holder is
   /// tracked and conservatively invalid, which planning never consumes.
   std::function<bool(const clang::VarDecl *)> fnHolderQuery;
+
+  /// The importer-owned registry of synthesized compound-literal backing
+  /// declarations (C99-13): a decayed or address-taken block-scope
+  /// compound literal binds its backing declaration as an ordinary local
+  /// region base. Shared across every analysis instance so planning and
+  /// emission agree on each literal's backing identity. Left unset, such
+  /// bindings keep the historical non-address rejection.
+  CompoundLiteralTemps *literalTemps = nullptr;
 
   /// Returns whether `var` is a pointer local tracked by this analysis.
   bool tracks(const clang::VarDecl *var) const {
@@ -2108,6 +2177,35 @@ private:
   LogicalResult emitStringArrayInit(Value place, Type type,
                                     const clang::StringLiteral *literal);
 
+  /// Materializes a block-scope compound literal in expression position
+  /// (C99-13) as a fresh anonymous place: a default-initialized
+  /// `emitrust.variable` of the literal's aggregate type followed by the
+  /// per-element assigns of its initializer list (the C99-11 machinery;
+  /// holes keep the C99 zero fill), or the string-array fill for
+  /// `(char[N]){"..."}`. With `hoistForRegion` false (direct lvalue and
+  /// value uses, whose consumers sit in the same statement) the place is
+  /// created at the current insertion point. With `hoistForRegion` true
+  /// (the literal becomes a pointer-region base, so dereferences anywhere
+  /// in the function resolve against the place) the place is hoisted to
+  /// the entry block for SSA dominance, and each evaluation first
+  /// re-assigns the type's pristine default value — captured by a load
+  /// right after the hoisted creation — so re-executions (a literal
+  /// bound inside a loop) restore the C99 zero fill of the holes exactly.
+  /// Scalar compound literals and file-scope literals reaching an
+  /// expression context are located rejections.
+  FailureOr<Value>
+  emitCompoundLiteralPlace(const clang::CompoundLiteralExpr *literal,
+                           bool hoistForRegion = false);
+
+  /// Materializes `literal` (see `emitCompoundLiteralPlace`) and registers
+  /// the place under the literal's synthesized backing declaration — the
+  /// region base the analysis recorded for its decay or address-of — so
+  /// every downstream consumer (dereference, subscript, slice argument)
+  /// resolves the base like any named local object. Returns the backing
+  /// declaration.
+  FailureOr<const clang::VarDecl *>
+  materializeCompoundLiteralBase(const clang::CompoundLiteralExpr *literal);
+
   /// Creates a backing byte array place for `literal`: an
   /// `emitrust.variable` of `!emitrust.array<(len+1)xi8>` initialized with
   /// the literal's bytes plus the terminating NUL (C string literals
@@ -3122,6 +3220,11 @@ private:
   llvm::SmallPtrSet<const clang::VarDecl *, 8> addressTaken;
   /// Per-function pointer region analysis (Phase-1a decomposition).
   PointerRegionAnalysis pointerRegions;
+  /// Program-wide registry of synthesized compound-literal backing
+  /// declarations (C99-13), shared with every analysis instance (the
+  /// planning passes and the per-function emission analysis) so all
+  /// passes agree on each literal's backing identity.
+  CompoundLiteralTemps literalTemps;
   /// Per-function decomposition of each accepted pointer local and each
   /// slice-classified pointer parameter, keyed by its declaration.
   llvm::DenseMap<const clang::VarDecl *, PointerLocalInfo> pointerLocals;
@@ -3425,13 +3528,21 @@ static bool bodyUsesVaList(const clang::ASTContext &context,
   return false;
 }
 
-/// Strips parentheses and `ConstantExpr` wrappers (clang wraps constant
-/// contexts such as case values in `ConstantExpr`) without touching casts.
+/// Strips parentheses, `ConstantExpr` wrappers (clang wraps constant
+/// contexts such as case values in `ConstantExpr`), and `ExprWithCleanups`
+/// wrappers (clang marks full expressions containing block-scope compound
+/// literals, whose "cleanup" is the end of the object's lifetime — nothing
+/// to emit, the temp's place is ordinary SSA) without touching casts.
 static const clang::Expr *stripTrivia(const clang::Expr *expr) {
   while (true) {
     expr = expr->IgnoreParens();
     if (const auto *constant = llvm::dyn_cast<clang::ConstantExpr>(expr)) {
       expr = constant->getSubExpr();
+      continue;
+    }
+    if (const auto *cleanups =
+            llvm::dyn_cast<clang::ExprWithCleanups>(expr)) {
+      expr = cleanups->getSubExpr();
       continue;
     }
     return expr;
@@ -4944,6 +5055,18 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
       const clang::Expr *sub = stripTrivia(cast->getSubExpr());
       if (const clang::StringLiteral *literal = underlyingStringLiteral(sub))
         return addLiteralBase(ptr, literal, loc);
+      // `p = (int[]){...}` (C99-13): the decayed block-scope compound
+      // literal is a fresh anonymous local object; its synthesized
+      // backing declaration is the region base, exactly like a decayed
+      // named array.
+      if (const auto *compound =
+              llvm::dyn_cast<clang::CompoundLiteralExpr>(sub)) {
+        if (literalTemps && !compound->isFileScope())
+          return addBase(ptr, literalTemps->getOrCreate(*context, compound),
+                         loc);
+        return markInvalid(
+            ptr, loc, "unsupported: pointer assigned a non-address value");
+      }
       while (const auto *inner =
                  llvm::dyn_cast<clang::ArraySubscriptExpr>(sub))
         sub = inner->getBase()->IgnoreParenImpCasts();
@@ -5020,6 +5143,14 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
               return addBase(ptr, var, loc);
           }
       }
+      // `p = &(struct S){...}` (C99-13): the address of a block-scope
+      // compound literal binds its synthesized backing declaration as a
+      // (degenerate, for struct/scalar types) local region base.
+      if (const auto *compound =
+              llvm::dyn_cast<clang::CompoundLiteralExpr>(sub))
+        if (literalTemps && !compound->isFileScope())
+          return addBase(ptr, literalTemps->getOrCreate(*context, compound),
+                         loc);
       return markInvalid(ptr, loc,
                          "unsupported: pointer assigned a non-address value");
     }
@@ -5087,12 +5218,20 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
         // A struct local whose initializer list covers data-pointer
         // fields establishes their per-instance member bindings here
         // (static locals bind through the constant-initializer walk at
-        // their global import instead).
-        if (var->hasLocalStorage() && !llvm::isa<clang::ParmVarDecl>(var))
-          if (const auto *list = llvm::dyn_cast_if_present<
-                  clang::InitListExpr>(var->getInit()))
+        // their global import instead). A compound-literal initializer
+        // (`struct S s = (struct S){...}`, C99-13) initializes the
+        // variable directly, so its list binds the same way.
+        if (var->hasLocalStorage() && !llvm::isa<clang::ParmVarDecl>(var)) {
+          const clang::Expr *init = var->getInit();
+          if (init)
+            if (const auto *compound = llvm::dyn_cast<
+                    clang::CompoundLiteralExpr>(init->IgnoreParenImpCasts()))
+              init = compound->getInitializer();
+          if (const auto *list =
+                  llvm::dyn_cast_if_present<clang::InitListExpr>(init))
             if (recordOfType(var->getType()))
               collectStructInitBindings(var, list);
+        }
       }
   } else if (const auto *compound =
                  llvm::dyn_cast<clang::CompoundAssignOperator>(stmt)) {
@@ -5756,6 +5895,7 @@ bool CImporter::isCarrierReturnFunction(const clang::FunctionDecl *func) {
   regions.carrierReturnQuery = [this](const clang::FunctionDecl *callee) {
     return isCarrierReturnFunction(callee);
   };
+  regions.literalTemps = &literalTemps;
   regions.analyze(astContext(), definition->getBody());
   SmallVector<const clang::ReturnStmt *> returns;
   collectReturnStmts(definition->getBody(), returns);
@@ -6197,6 +6337,7 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
   for (const clang::FunctionDecl *func :
        collectPassAFunctionDefinitions(unit)) {
     PointerRegionAnalysis analysis;
+    analysis.literalTemps = &literalTemps;
     analysis.analyze(astContext(), func->getBody());
 
     // Data-pointer parameters are class nodes; a pointer-to-pointer
@@ -6228,6 +6369,11 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
         else
           unionFind.unite(first, binding.base);
         if (!region->invalidReason.empty())
+          poisoned.insert(binding.base);
+        // A compound-literal backing (C99-13) has no declaration
+        // statement to anchor an owner struct at; any class containing
+        // one stays on the Phase-1b slice lowering.
+        if (literalTemps.isTemp(binding.base))
           poisoned.insert(binding.base);
       }
     }
@@ -6610,6 +6756,7 @@ void CImporter::planCellSlices(const clang::TranslationUnitDecl *unit,
     // local-pointer form, so such a parameter's class stays on the
     // historical lowering.
     PointerRegionAnalysis analysis;
+    analysis.literalTemps = &literalTemps;
     analysis.analyze(astContext(), func->getBody());
     for (const clang::VarDecl *var : analysis.trackedVars())
       if (const PointerRegion *region = analysis.regionOf(var))
@@ -8765,6 +8912,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   pointerRegions.fnHolderQuery = [this](const clang::VarDecl *var) {
     return voidFnPtrHolders.contains(var);
   };
+  pointerRegions.literalTemps = &literalTemps;
   pointerRegions.analyze(astContext(), func->getBody());
 
   // Method prologue (Phase 4): the receiver dereferences once into the
@@ -9673,10 +9821,17 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
       if (isAggregate) {
         // `= {...}` lists and `char s[] = "..."` string initializers are
         // supported; a whole-aggregate copy initializer stays rejected.
-        if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
-                init->IgnoreParenImpCasts()))
+        // A compound-literal initializer (`struct S s = (struct S){...}`,
+        // C99-13) copies a temp that is immediately dead, so it
+        // initializes the variable directly through its own list.
+        const clang::Expr *unwrapped = init->IgnoreParenImpCasts();
+        if (const auto *compound =
+                llvm::dyn_cast<clang::CompoundLiteralExpr>(unwrapped))
+          unwrapped = compound->getInitializer()->IgnoreParenImpCasts();
+        if (const auto *literal =
+                llvm::dyn_cast<clang::StringLiteral>(unwrapped))
           return emitStringArrayInit(place, *mlirType, literal);
-        const auto *list = llvm::dyn_cast<clang::InitListExpr>(init);
+        const auto *list = llvm::dyn_cast<clang::InitListExpr>(unwrapped);
         if (!list)
           return emitError(loc) << "unsupported: aggregate initializer";
         return emitAggregateInitList(place, *mlirType, list, var);
@@ -10010,6 +10165,15 @@ LogicalResult CImporter::emitInitListElement(Value place, Type type,
                                              const clang::Expr *element) {
   if (const auto *nested = llvm::dyn_cast<clang::InitListExpr>(element))
     return emitAggregateInitList(place, type, nested);
+  // A compound-literal element (`{(struct S){1, 2}, ...}`, C99-13) copies
+  // a temp that is immediately dead; its list initializes the element
+  // place directly, like a nested brace list.
+  if (llvm::isa<emitrust::ArrayType, emitrust::StructType>(type))
+    if (const auto *compound = llvm::dyn_cast<clang::CompoundLiteralExpr>(
+            element->IgnoreParenImpCasts()))
+      if (const auto *list = llvm::dyn_cast<clang::InitListExpr>(
+              compound->getInitializer()->IgnoreParenImpCasts()))
+        return emitAggregateInitList(place, type, list);
   Location loc = translateLoc(element->getBeginLoc());
   // A non-list initializer for an aggregate element (a string literal for
   // a char-array field, a whole-struct copy) is out of scope.
@@ -10067,6 +10231,89 @@ CImporter::emitStringArrayInit(Value place, Type type,
       return failure();
   }
   return success();
+}
+
+FailureOr<Value> CImporter::emitCompoundLiteralPlace(
+    const clang::CompoundLiteralExpr *literal, bool hoistForRegion) {
+  Location loc = translateLoc(literal->getBeginLoc());
+  // A file-scope compound literal in a global initializer imports through
+  // the constant-evaluator paths (CTS-P4); one reaching an expression
+  // context here is defensive.
+  if (literal->isFileScope())
+    return emitError(loc)
+           << "unsupported: file-scope compound literal in expression "
+              "position";
+  FailureOr<Type> type = mapType(literal->getType(), loc);
+  if (failed(type))
+    return failure();
+  // The C99-13 subset covers aggregate (struct/union/array) literals; a
+  // scalar compound literal has no aggregate-init lowering here.
+  if (!llvm::isa<emitrust::StructType, emitrust::ArrayType>(*type))
+    return emitError(loc)
+           << "unsupported: compound literal of non-aggregate type";
+  Value place;
+  if (hoistForRegion) {
+    // A region-base temp is dereferenced wherever the region's pointers
+    // are used, so its place must dominate the whole body: create it in
+    // the entry block and capture the pristine default value there, then
+    // restore that default at each evaluation of the literal so re-runs
+    // (a binding inside a loop) re-zero the holes exactly like C's fresh
+    // object per evaluation.
+    Value defaultValue;
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPointToStart(entryBlock);
+      place = builder
+                  .create<emitrust::VariableOp>(
+                      loc, emitrust::LValueType::get(*type))
+                  .getResult();
+      defaultValue =
+          builder.create<emitrust::LoadOp>(loc, *type, place).getResult();
+    }
+    if (failed(storeToPlace(loc, place, defaultValue)))
+      return failure();
+  } else {
+    place = createVariablePlace(loc, *type);
+  }
+  const clang::Expr *init = literal->getInitializer()->IgnoreParenImpCasts();
+  if (const auto *string = llvm::dyn_cast<clang::StringLiteral>(init)) {
+    if (failed(emitStringArrayInit(place, *type, string)))
+      return failure();
+    return place;
+  }
+  const auto *list = llvm::dyn_cast<clang::InitListExpr>(init);
+  if (!list)
+    return emitError(loc) << "unsupported: aggregate initializer";
+  // `(char[]){"hi"}`: the braces hold the string as the list's sole
+  // element (there is no bare-string spelling for a compound literal);
+  // it fills the array like a `char s[] = "..."` declaration.
+  if (const clang::InitListExpr *semantic = list->getSemanticForm())
+    list = semantic;
+  if (llvm::isa<emitrust::ArrayType>(*type) && list->getNumInits() == 1)
+    if (const auto *string = llvm::dyn_cast<clang::StringLiteral>(
+            list->getInit(0)->IgnoreParenImpCasts())) {
+      if (failed(emitStringArrayInit(place, *type, string)))
+        return failure();
+      return place;
+    }
+  if (failed(emitAggregateInitList(place, *type, list)))
+    return failure();
+  return place;
+}
+
+FailureOr<const clang::VarDecl *> CImporter::materializeCompoundLiteralBase(
+    const clang::CompoundLiteralExpr *literal) {
+  const clang::VarDecl *backing =
+      literalTemps.getOrCreate(astContext(), literal);
+  FailureOr<Value> place =
+      emitCompoundLiteralPlace(literal, /*hoistForRegion=*/true);
+  if (failed(place))
+    return failure();
+  // Re-executing the binding (a loop around it) rebinds the backing to the
+  // freshly initialized place of that evaluation, matching C's per-block
+  // storage duration.
+  symbols[backing] = *place;
+  return backing;
 }
 
 FailureOr<Value>
@@ -12927,9 +13174,14 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   Location loc = translateLoc(e->getBeginLoc());
 
   // Constant contexts (case values, enumerator initializers) are wrapped in
-  // ConstantExpr; translate the wrapped expression.
+  // ConstantExpr; translate the wrapped expression. Full expressions
+  // containing block-scope compound literals are wrapped in
+  // ExprWithCleanups (C99-13); the "cleanup" is the end of the temp's
+  // lifetime, which needs no code.
   if (const auto *constant = llvm::dyn_cast<clang::ConstantExpr>(e))
     return emitRValue(constant->getSubExpr());
+  if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e))
+    return emitRValue(cleanups->getSubExpr());
   // An enumerator used as a plain expression has type `int` in C: a named
   // enum's constant is rendered as its Rust variant cast to i32, while an
   // anonymous enum's constant is a plain i32 value.
@@ -13029,6 +13281,16 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
     return emitError(loc) << "unsupported use of '"
                           << predefined->getIdentKindName()
                           << "' outside a string literal position";
+  // A struct compound literal in value position (assignment right-hand
+  // side, by-value argument, return value — contexts where clang does not
+  // wrap the aggregate in an lvalue-to-rvalue cast) materializes its
+  // anonymous temp and loads it whole (C99-13).
+  if (const auto *literal = llvm::dyn_cast<clang::CompoundLiteralExpr>(e)) {
+    FailureOr<Value> place = emitCompoundLiteralPlace(literal);
+    if (failed(place))
+      return failure();
+    return loadPlace(loc, *place);
+  }
   return emitError(loc) << "unsupported expression: " << e->getStmtClassName();
 }
 
@@ -16117,6 +16379,18 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         return PtrExprValue{nullptr, createIntConstant(loc, cursorType, 0),
                             backing};
       }
+      // A decayed block-scope compound literal (C99-13) materializes its
+      // anonymous temp here — the evaluation point, which is where C
+      // starts the object's lifetime — and decomposes to (backing,
+      // cursor 0) like a decayed named array.
+      if (const auto *compound =
+              llvm::dyn_cast<clang::CompoundLiteralExpr>(sub)) {
+        FailureOr<const clang::VarDecl *> backing =
+            materializeCompoundLiteralBase(compound);
+        if (failed(backing))
+          return failure();
+        return PtrExprValue{*backing, createIntConstant(loc, cursorType, 0)};
+      }
       if (const auto *subscript =
               llvm::dyn_cast<clang::ArraySubscriptExpr>(sub))
         return emitSubscriptPointer(subscript);
@@ -16182,6 +16456,16 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
           value.member = target.field;
           return value;
         }
+      }
+      // `&(struct S){...}` (C99-13): the degenerate (cursor-less) form of
+      // the literal's freshly materialized anonymous temp.
+      if (const auto *compound =
+              llvm::dyn_cast<clang::CompoundLiteralExpr>(sub)) {
+        FailureOr<const clang::VarDecl *> backing =
+            materializeCompoundLiteralBase(compound);
+        if (failed(backing))
+          return failure();
+        return PtrExprValue{*backing, Value()};
       }
       return emitError(loc) << "unsupported pointer target expression";
     }
@@ -16690,6 +16974,10 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
   const clang::Expr *e = expr->IgnoreParens();
   Location loc = translateLoc(e->getBeginLoc());
 
+  // A full expression containing a block-scope compound literal is wrapped
+  // in ExprWithCleanups (C99-13); nothing to emit for the "cleanup".
+  if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e))
+    return emitLValue(cleanups->getSubExpr(), writeback);
   if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e))
     return emitDeclRefLValue(ref, loc, writeback);
   if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e))
@@ -16699,6 +16987,12 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
   if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
     if (unary->getOpcode() == clang::UO_Deref)
       return emitDerefLValue(unary, loc, writeback);
+  // A compound literal is an lvalue in C99 (C99-13): its place is the
+  // freshly materialized anonymous temp, so `(struct S){...}.a`,
+  // `(int[]){...}[i]`, and whole-value loads all resolve on it like on a
+  // named local.
+  if (const auto *literal = llvm::dyn_cast<clang::CompoundLiteralExpr>(e))
+    return emitCompoundLiteralPlace(literal);
 
   // A `__func__`-family identifier is modeled only in the string-literal
   // positions (C99-29); an element access or other place use of the name
