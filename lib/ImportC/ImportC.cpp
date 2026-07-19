@@ -268,6 +268,25 @@
 ///    ordinary function definition; in the merged whole-program module
 ///    one ordinary definition per external name is the right shape, and
 ///    `static inline` keeps the per-TU mangling of any other file-static.
+///  - Type qualifiers (C99-7): const maps positionally — a never-written
+///    const global (scalar or array) is a `const`-marked emitrust.global
+///    (an immutable Rust static, `static const` locals included via their
+///    mangled module global), string-literal backings are `const`-marked
+///    variables, const locals keep the ordinary lowering (clang already
+///    rejects writes through const lvalues; mem2reg renders scalar SSA as
+///    immutable lets), and a const pointee classifies exactly like its
+///    unqualified spelling. volatile is rejected by policy with a located
+///    "unsupported: volatile-qualified type" wherever a declared type
+///    carries it at any level (locals, globals, parameters' pointee
+///    chains, struct fields, return types — `hasVolatileQualifier`), and
+///    a cast that introduces volatile refuses the qualification peel; the
+///    lone exception is a qualifier on a parameter OBJECT itself
+///    (`volatile int v`, `int x[volatile 5]` adjusting to
+///    `int * volatile x`), which is body-local, never part of the
+///    function type, and accepted-and-ignored. restrict is accepted and
+///    ignored everywhere (an aliasing hint; the region analysis is
+///    stricter). _Atomic is rejected with a located
+///    "unsupported: _Atomic-qualified type".
 ///
 /// The importer is a functional core (the `CImporter` class below, which
 /// owns the builder and per-function symbol table) driven by the imperative
@@ -3567,6 +3586,39 @@ static bool isDataPointer(clang::QualType type) {
   return isPointerType(type) && !isFunctionPointer(type);
 }
 
+/// C99-7 volatile policy: returns whether any level of `type` — the type
+/// itself, an array element, or a pointee at any pointer depth — is
+/// volatile-qualified. A volatile access has no counterpart in the
+/// emitted single-threaded Rust model (no MMIO, no signal handlers, no
+/// setjmp), so every declaration position rejects it with a located
+/// diagnostic instead of silently dropping the qualifier; an
+/// expression-level cast that introduces volatile refuses to peel
+/// instead (see `peelPointerCast`). One exception: a qualifier on a
+/// parameter OBJECT itself is body-local and never part of the function
+/// type, so `mapParamType` strips the top level before scanning
+/// (`int x[volatile 5]`, which adjusts to `int * volatile x`, imports
+/// like the unqualified spelling). const and restrict are unaffected:
+/// const maps positionally (immutable statics, const-marked variables,
+/// SSA lets), and restrict is a pure optimization hint the region
+/// analysis is already stricter than, so it is accepted and ignored.
+static bool hasVolatileQualifier(clang::ASTContext &context,
+                                 clang::QualType type) {
+  clang::QualType current = type.getCanonicalType();
+  while (true) {
+    if (current.isVolatileQualified())
+      return true;
+    if (const clang::ArrayType *array = context.getAsArrayType(current)) {
+      current = array->getElementType().getCanonicalType();
+      continue;
+    }
+    if (current->isPointerType() && !current->isFunctionPointerType()) {
+      current = current->getPointeeType().getCanonicalType();
+      continue;
+    }
+    return false;
+  }
+}
+
 /// Returns whether the canonical type of `type` is C's `FILE *` stream
 /// handle (a pointer to the stdio stream record: glibc and musl spell it
 /// `struct _IO_FILE`, BSD/macOS `struct __sFILE`, MSVC `struct _iobuf`,
@@ -3651,6 +3703,12 @@ static const clang::Expr *peelPointerCast(clang::ASTContext &context,
     clang::QualType fromPointee =
         from->getPointeeType().getCanonicalType();
     clang::QualType toPointee = to->getPointeeType().getCanonicalType();
+    // C99-7: a cast that introduces (or carries) a volatile-qualified
+    // pointee is never transparent — volatile is rejected by policy, so
+    // the site keeps a located rejection instead of silently dropping
+    // the qualifier. const/restrict adjustments keep peeling.
+    if (fromPointee.isVolatileQualified() || toPointee.isVolatileQualified())
+      return nullptr;
     if (context.hasSameUnqualifiedType(fromPointee, toPointee))
       return cast->getSubExpr();
     if (fromPointee->isVoidType() || toPointee->isVoidType())
@@ -5202,6 +5260,19 @@ LogicalResult CImporter::rejectSystemHeaderUse(Location loc,
 FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
   clang::QualType canonical = type.getCanonicalType();
 
+  // C99-7 qualifier policy. volatile: located rejection (no Rust
+  // counterpart in the emitted model). _Atomic: located rejection (no
+  // atomics in the single-threaded model; checked here for a precise
+  // message instead of the generic tail rejection). const: no effect on
+  // the value type — the const mapping is positional (immutable statics
+  // for never-written globals, const-marked variables for literal
+  // backings, plain SSA lets after mem2reg). restrict: accepted and
+  // ignored (an aliasing hint; the pointer region analysis is stricter).
+  if (canonical.isVolatileQualified())
+    return emitError(loc) << "unsupported: volatile-qualified type";
+  if (canonical->isAtomicType())
+    return emitError(loc) << "unsupported: _Atomic-qualified type";
+
   if (const auto *builtin =
           llvm::dyn_cast<clang::BuiltinType>(canonical.getTypePtr())) {
     switch (builtin->getKind()) {
@@ -5366,11 +5437,23 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
 
 FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
                                         ParamKind kind) {
-  clang::QualType canonical = type.getCanonicalType();
+  // C99-7: qualifiers on the parameter OBJECT itself are body-local and
+  // never part of the function type (C11 6.7.6.3p15 composite rules;
+  // `int x[volatile 5]` adjusts to `int * volatile x`, c-testsuite
+  // 00162), so a top-level volatile is accepted and ignored exactly like
+  // const and restrict. volatile anywhere deeper — the pointee chain,
+  // which names caller-owned storage — keeps the located rejection; the
+  // deep scan also covers the Carrier shape that bypasses `mapType`.
+  clang::QualType canonical = type.getCanonicalType().getUnqualifiedType();
+  if (canonical->isPointerType() && !canonical->isFunctionPointerType() &&
+      hasVolatileQualifier(astContext(), canonical->getPointeeType()))
+    return emitError(loc) << "unsupported: volatile-qualified type";
   // A function-pointer parameter is an ordinary Copy value, not a
-  // reference; it maps to `!emitrust.fn_ptr` like every other position.
+  // reference; it maps to `!emitrust.fn_ptr` like every other position
+  // (through the stripped canonical, so a qualifier on the parameter
+  // object itself stays ignored).
   if (canonical->isFunctionPointerType())
-    return mapType(type, loc);
+    return mapType(canonical, loc);
   if (canonical->isPointerType()) {
     clang::QualType pointee = canonical->getPointeeType();
     // An integer-carrier `void *` parameter (CTS-P3) is a plain i64: the
@@ -5411,11 +5494,17 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     }
     return Type(emitrust::MutRefType::get(*inner));
   }
-  return mapType(type, loc);
+  // The stripped canonical keeps a top-level-volatile value parameter
+  // (`volatile int x`, a body-local copy) out of `mapType`'s rejection.
+  return mapType(canonical, loc);
 }
 
 FailureOr<Type> CImporter::mapStructFieldType(clang::QualType type,
                                               Location loc) {
+  // C99-7: a data-pointer field stores as a plain i64 without mapping its
+  // pointee, so the volatile scan must run before that shortcut.
+  if (hasVolatileQualifier(astContext(), type))
+    return emitError(loc) << "unsupported: volatile-qualified type";
   if (isDataPointer(type))
     return Type(builder.getIntegerType(64));
   return mapType(type, loc);
@@ -7911,6 +8000,11 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
   }
 
   clang::QualType qualType = decl->getType();
+  // C99-7: scan the whole global's type (pointer globals bypass
+  // `mapType`, and `int * volatile g` carries the qualifier on the
+  // pointer itself).
+  if (hasVolatileQualifier(astContext(), qualType))
+    return emitError(loc) << "unsupported: volatile-qualified type";
   // Function pointers map to `!emitrust.fn_ptr` and are legal globals;
   // data pointers stay rejected.
   if (qualType.getCanonicalType()->isPointerType() &&
@@ -9498,6 +9592,11 @@ static bool referencesVar(const clang::Stmt *stmt,
 
 LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   Location loc = translateLoc(var->getLocation());
+  // C99-7: pointer locals divert into the decomposition before `mapType`
+  // runs, so the volatile scan happens up front for every local shape
+  // (including the pointer's own qualifier, `int * volatile p`).
+  if (hasVolatileQualifier(astContext(), var->getType()))
+    return emitError(loc) << "unsupported: volatile-qualified type";
   if (!var->hasLocalStorage()) {
     if (var->isStaticLocal()) {
       // A function-local static is module-level state initialized once at
