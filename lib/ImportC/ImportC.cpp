@@ -780,6 +780,13 @@ public:
   /// conservative — planning never consumes carrier regions.
   std::function<bool(const clang::FunctionDecl *)> carrierReturnQuery;
 
+  /// Optional query telling the walk whether a local `void *` declaration
+  /// is an admitted fn-ptr holder (CTS-F, 00210): such a local imports as
+  /// an ordinary `!emitrust.fn_ptr` variable, so the decomposition never
+  /// tracks it. Left unset (the pure-AST planning passes), the holder is
+  /// tracked and conservatively invalid, which planning never consumes.
+  std::function<bool(const clang::VarDecl *)> fnHolderQuery;
+
   /// Returns whether `var` is a pointer local tracked by this analysis.
   bool tracks(const clang::VarDecl *var) const {
     return pointerVars.contains(var);
@@ -1402,19 +1409,27 @@ private:
 
   /// Appends the single storage slot of a union definition to
   /// `fieldNames`/`fieldTypes`: a union imports as a ONE-FIELD struct
-  /// whose storage field carries the first arm's name and mapped type,
+  /// whose storage field carries the slot arm's name and mapped type,
   /// generalizing the anonymous-union slot aliasing of
   /// `collectRecordFields` (CTS-R2) to named and untagged union types.
-  /// Every non-first arm is recorded in `unionSlotStorage` as an alias
-  /// of that slot. An arm is admitted when it maps to the identical type
-  /// (exact: reading any union member with the type of the last store
-  /// yields that stored value) or when both arms are integers of the
-  /// same width differing only in signedness — accesses through such an
-  /// arm reinterpret the slot bit-exactly via `emitrust.cast` (two's
-  /// complement, C99 6.5.2.3). Bit-field arms, unnamed/anonymous arms,
-  /// pointer arms, integer arms of differing sizes, mixed non-integer
-  /// arms, and empty unions are rejected with located
-  /// `unsupported: union ...` diagnostics at the union definition.
+  /// The slot is the first arm, EXCEPT in the byte-array mix (CTS-F,
+  /// 00210): a union pairing a non-array arm with constant integer-array
+  /// arms takes the first NON-ARRAY arm as its slot regardless of
+  /// declaration order. Every non-slot arm is recorded in
+  /// `unionSlotStorage` as an alias of that slot. An arm is admitted
+  /// when it maps to the identical type (exact: reading any union member
+  /// with the type of the last store yields that stored value), when
+  /// both arms are integers of the same width differing only in
+  /// signedness — accesses through such an arm reinterpret the slot
+  /// bit-exactly via `emitrust.cast` (two's complement, C99 6.5.2.3) —
+  /// or when the arm is a constant integer ARRAY whose total width
+  /// equals the integer slot's (CTS-F, 00210): such a byte-array arm is
+  /// a TYPE-level concession recorded in `unionByteArrayArms`, and every
+  /// access through it rejects at the access site. Bit-field arms,
+  /// unnamed/anonymous arms, pointer arms, integer arms of differing
+  /// sizes, mixed non-integer arms, and empty unions are rejected with
+  /// located `unsupported: union ...` diagnostics at the union
+  /// definition.
   LogicalResult collectUnionSlot(const clang::RecordDecl *definition,
                                  SmallVectorImpl<llvm::StringRef> &fieldNames,
                                  SmallVectorImpl<Type> &fieldTypes);
@@ -1903,8 +1918,34 @@ private:
   /// locals are ordinary values and bypass the decomposition entirely.
   /// Function-local statics become module-level
   /// `emitrust.global`s mangled as `<function>_<name>`; extern locals are
-  /// rejected.
+  /// rejected. An UNREFERENCED local VLA whose size expression is
+  /// side-effect-free is elided entirely (CTS-F, 00207): no IR and no
+  /// diagnostic — the object never materializes and dropping the size
+  /// expression loses nothing. Referenced VLAs and dead VLAs with a
+  /// side-effecting size expression keep the non-constant-array-size
+  /// rejection.
   LogicalResult emitLocalVar(const clang::VarDecl *var);
+
+  /// Populates `voidFnPtrHolders` with the admitted local `void *`
+  /// fn-ptr holders of `body` (CTS-F, 00210): a local `void *` whose
+  /// initializer is (an implicit cast of) `&f` or the decayed `f` for a
+  /// known non-variadic function (a prototype-less K&R `f` maps to the
+  /// zero-parameter form), never reassigned, and whose EVERY value use
+  /// is an explicit cast to exactly `f`'s signature (C type
+  /// compatibility, C11 6.2.7) in callee position
+  /// (`((T (*)(...))fp)(...)`). Any other mention of the holder — a
+  /// reassignment, an escaping argument, a mismatched cast —
+  /// disqualifies it, keeping the existing pointer-region rejection.
+  void collectVoidFnPtrHolders(const clang::Stmt *body);
+
+  /// Emits the admitted holder local `var` (CTS-F, 00210) exactly like a
+  /// directly-typed local fn-ptr: an `emitrust.variable` of the target's
+  /// `!emitrust.fn_ptr` signature assigned the opaque `Some(target)`
+  /// constant (the FR-29 model). The spelled `void *` type never reaches
+  /// the IR.
+  LogicalResult emitFnHolderLocal(const clang::VarDecl *var,
+                                  const clang::FunctionDecl *target,
+                                  Location loc);
 
   /// Emits a block-scope aggregate initializer list into the
   /// default-initialized place `place` of array or struct value type
@@ -2772,6 +2813,12 @@ private:
   /// `flattenedFieldStorage`.
   llvm::DenseMap<const clang::FieldDecl *, const clang::FieldDecl *>
       unionSlotStorage;
+  /// Byte-array union arms admitted at the TYPE level by
+  /// `collectUnionSlot` (CTS-F, 00210): the arm's total width equals the
+  /// integer slot's, so the union type imports on the one-slot model, but
+  /// no access through the arm is representable on that slot;
+  /// `emitMemberLValue` rejects each such access at its own site.
+  llvm::SmallPtrSet<const clang::FieldDecl *, 4> unionByteArrayArms;
   /// The defining C record behind each emitted struct_def symbol, recorded
   /// by `importRecord` so record-aware consumers (global initializer
   /// conversion) can walk the C field structure of a flattened struct.
@@ -2799,6 +2846,18 @@ private:
   /// Per-function map from clang declarations to their MLIR place or, for
   /// pointer parameters, their reference SSA value.
   llvm::DenseMap<const clang::ValueDecl *, Value> symbols;
+  /// Per-function admitted local `void *` fn-ptr holders (CTS-F, 00210),
+  /// each mapped to the one known non-variadic function whose address it
+  /// holds; populated by `collectVoidFnPtrHolders` before the pointer
+  /// region analysis (which skips them via `fnHolderQuery`). An admitted
+  /// holder imports as an ordinary local `!emitrust.fn_ptr` variable and
+  /// its cast-calls peel to plain `emitrust.call_indirect`.
+  llvm::DenseMap<const clang::VarDecl *, const clang::FunctionDecl *>
+      voidFnPtrHolders;
+  /// The clang body of the function under import; consulted by dead-VLA
+  /// elision (CTS-F, 00207) to decide whether a local is referenced
+  /// anywhere in the body.
+  const clang::Stmt *currentFunctionBody = nullptr;
   /// Per-function set of locals whose address is taken.
   llvm::SmallPtrSet<const clang::VarDecl *, 8> addressTaken;
   /// Per-function pointer region analysis (Phase-1a decomposition).
@@ -4636,6 +4695,10 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
         if (var->hasLocalStorage() && !llvm::isa<clang::ParmVarDecl>(var) &&
             isPointerType(var->getType()) &&
             !isFunctionPointer(var->getType())) {
+          // An admitted `void *` fn-ptr holder (CTS-F, 00210) imports as
+          // an ordinary fn_ptr local; the decomposition never tracks it.
+          if (fnHolderQuery && fnHolderQuery(var))
+            continue;
           if (isSecondOrderPointerType(var->getType())) {
             secondOrderVars.insert(var);
             if (const clang::Expr *init = var->getInit())
@@ -6635,8 +6698,22 @@ LogicalResult CImporter::collectUnionSlot(
     SmallVectorImpl<llvm::StringRef> &fieldNames,
     SmallVectorImpl<Type> &fieldTypes) {
   Location unionLoc = translateLoc(definition->getBeginLoc());
+  // Structural arm checks, and slot selection: the slot is the first arm,
+  // EXCEPT in the byte-array mix (CTS-F, 00210) — a union pairing a
+  // non-array arm with constant integer-array arms takes the first
+  // NON-ARRAY arm as its slot regardless of declaration order (the array
+  // arms are width-checked type-level aliases whose accesses reject at
+  // the access site).
+  auto integerArrayArm =
+      [&](const clang::FieldDecl *arm) -> const clang::ConstantArrayType * {
+    const clang::ConstantArrayType *array =
+        astContext().getAsConstantArrayType(arm->getType());
+    return array && array->getElementType()->isIntegerType() ? array
+                                                             : nullptr;
+  };
   const clang::FieldDecl *storage = nullptr;
-  Type slotType;
+  bool hasIntegerArrayArm = false;
+  const clang::FieldDecl *firstNonArrayArm = nullptr;
   for (const clang::FieldDecl *arm : definition->fields()) {
     // A bit-field arm is not addressable storage the slot can alias.
     if (arm->isBitField())
@@ -6648,27 +6725,56 @@ LogicalResult CImporter::collectUnionSlot(
     // rejection is the union's, not the pointer's.
     if (isPointerType(arm->getType()))
       return emitError(unionLoc) << "unsupported: union with a pointer arm";
+    if (!storage)
+      storage = arm; // Declaration order: the first arm.
+    if (integerArrayArm(arm))
+      hasIntegerArrayArm = true;
+    else if (!firstNonArrayArm)
+      firstNonArrayArm = arm;
+  }
+  // An empty union (a GNU extension clang accepts in C) has no first arm
+  // and therefore no representable slot.
+  if (!storage)
+    return emitError(unionLoc) << "unsupported: union with no members";
+  if (hasIntegerArrayArm && firstNonArrayArm)
+    storage = firstNonArrayArm;
+
+  Location slotLoc = translateLoc(storage->getLocation());
+  if (isRustKeyword(storage->getName()))
+    return emitError(slotLoc) << "unsupported: struct member '"
+                              << storage->getName() << "' is a Rust keyword";
+  FailureOr<Type> slotMapped = mapType(storage->getType(), slotLoc);
+  if (failed(slotMapped))
+    return failure();
+  Type slotType = *slotMapped;
+  fieldNames.push_back(storage->getName());
+  fieldTypes.push_back(slotType);
+
+  auto slotInt = llvm::dyn_cast<IntegerType>(slotType);
+  for (const clang::FieldDecl *arm : definition->fields()) {
+    if (arm == storage)
+      continue;
+    // A constant integer-array arm whose total width equals the integer
+    // slot's admits as a TYPE-level alias (CTS-F, 00210): its spelling
+    // never reaches the IR, and any access through it rejects at the
+    // access site (`unsupported: union byte-array arm access`). An
+    // unequal-total-width array arm falls through to the family
+    // rejections below.
+    if (integerArrayArm(arm) && slotInt &&
+        astContext().getTypeSize(arm->getType()) == slotInt.getWidth()) {
+      unionByteArrayArms.insert(arm);
+      continue;
+    }
     Location armLoc = translateLoc(arm->getLocation());
     FailureOr<Type> armType = mapType(arm->getType(), armLoc);
     if (failed(armType))
       return failure();
-    if (!storage) {
-      if (isRustKeyword(arm->getName()))
-        return emitError(armLoc) << "unsupported: struct member '"
-                                 << arm->getName() << "' is a Rust keyword";
-      storage = arm;
-      slotType = *armType;
-      fieldNames.push_back(storage->getName());
-      fieldTypes.push_back(slotType);
-      continue;
-    }
     // An identical mapped type aliases the slot exactly: reading any
     // union member with the type of the last store yields that value.
     if (*armType == slotType) {
       unionSlotStorage[arm] = storage;
       continue;
     }
-    auto slotInt = llvm::dyn_cast<IntegerType>(slotType);
     auto armInt = llvm::dyn_cast<IntegerType>(*armType);
     // Same-width integers differing only in signedness alias bit-exactly
     // on two's complement (C99 6.5.2.3 union punning); accesses through
@@ -6683,10 +6789,6 @@ LogicalResult CImporter::collectUnionSlot(
     return emitError(unionLoc)
            << "unsupported: union type mixing non-integer arms";
   }
-  // An empty union (a GNU extension clang accepts in C) has no first arm
-  // and therefore no representable slot.
-  if (!storage)
-    return emitError(unionLoc) << "unsupported: union with no members";
   return success();
 }
 
@@ -8112,6 +8214,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   labelBlocks.clear();
   switchCaseBlocks.clear();
   currentHasLabels = containsLabelStmt(func->getBody());
+  currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
   currentMethodOwner = nullptr;
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
@@ -8131,6 +8234,12 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
       [this](const clang::FunctionDecl *callee) {
         return isCarrierReturnFunction(callee);
       };
+  // Admitted local `void *` fn-ptr holders (CTS-F, 00210) import as
+  // ordinary fn_ptr locals; the pointer decomposition never tracks them.
+  collectVoidFnPtrHolders(func->getBody());
+  pointerRegions.fnHolderQuery = [this](const clang::VarDecl *var) {
+    return voidFnPtrHolders.contains(var);
+  };
   pointerRegions.analyze(astContext(), func->getBody());
 
   // Method prologue (Phase 4): the receiver dereferences once into the
@@ -8787,6 +8896,24 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
                         << stmt->getStmtClassName();
 }
 
+/// Returns whether any `DeclRefExpr` under `stmt` references `var`.
+/// Drives dead-VLA elision (CTS-F, 00207): "unreferenced" means no use
+/// anywhere in the function body, including unevaluated contexts such as
+/// `sizeof` (whose operand is a child of the trait expression), so any
+/// mention at all keeps the existing rejection.
+static bool referencesVar(const clang::Stmt *stmt,
+                          const clang::VarDecl *var) {
+  if (!stmt)
+    return false;
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (ref->getDecl()->getCanonicalDecl() == var->getCanonicalDecl())
+      return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (referencesVar(child, var))
+      return true;
+  return false;
+}
+
 LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   Location loc = translateLoc(var->getLocation());
   if (!var->hasLocalStorage()) {
@@ -8805,6 +8932,35 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   // instead; every direct access rewrites to the struct's "data" member.
   if (ownerPlans.contains(var))
     return emitOwnerLocal(var, loc);
+  // Dead-VLA elision (CTS-F, 00207): an UNREFERENCED local VLA whose
+  // size expression is side-effect-free is elided entirely — no IR, no
+  // diagnostic. The object never materializes, and dropping the (pure)
+  // size expression loses nothing. A referenced VLA — and a dead one
+  // whose size expression has side effects (eliding it would silently
+  // lose the effect) — keeps the `unsupported: non-constant array size`
+  // rejection `mapType` emits below.
+  {
+    clang::QualType probe = var->getType();
+    bool isVla = false;
+    bool sizeSideEffectFree = true;
+    while (const clang::ArrayType *array = astContext().getAsArrayType(probe)) {
+      if (const auto *vla = llvm::dyn_cast<clang::VariableArrayType>(array)) {
+        isVla = true;
+        if (vla->getSizeExpr() &&
+            vla->getSizeExpr()->HasSideEffects(astContext()))
+          sizeSideEffectFree = false;
+      }
+      probe = array->getElementType();
+    }
+    if (isVla && sizeSideEffectFree &&
+        !referencesVar(currentFunctionBody, var))
+      return success();
+  }
+  // An admitted local `void *` fn-ptr holder (CTS-F, 00210) imports
+  // exactly like a directly-typed local fn-ptr; the pointer
+  // decomposition never sees it (`fnHolderQuery`).
+  if (const clang::FunctionDecl *target = voidFnPtrHolders.lookup(var))
+    return emitFnHolderLocal(var, target, loc);
   clang::QualType type = var->getType().getCanonicalType();
   // Function pointers are ordinary `!emitrust.fn_ptr` values and take the
   // plain variable path below, bypassing the pointer decomposition.
@@ -8855,6 +9011,126 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
     return storeToPlace(loc, cell, *value);
   }
   return success();
+}
+
+void CImporter::collectVoidFnPtrHolders(const clang::Stmt *body) {
+  voidFnPtrHolders.clear();
+  if (!body)
+    return;
+
+  // Candidate pass: a local `void *` initialized with (an implicit cast
+  // of) `&f` or the decayed `f` for a known non-variadic function.
+  llvm::DenseMap<const clang::VarDecl *, const clang::FunctionDecl *>
+      candidates;
+  auto collectCandidates = [&](auto &&self, const clang::Stmt *stmt) -> void {
+    if (!stmt)
+      return;
+    if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt))
+      for (const clang::Decl *decl : declStmt->decls())
+        if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
+          clang::QualType type = var->getType().getCanonicalType();
+          if (!var->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(var) ||
+              !type->isPointerType() ||
+              !type->getPointeeType()->isVoidType() || !var->getInit())
+            continue;
+          const clang::Expr *init = var->getInit()->IgnoreParenImpCasts();
+          if (const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(init))
+            if (addrOf->getOpcode() == clang::UO_AddrOf)
+              init = addrOf->getSubExpr()->IgnoreParenImpCasts();
+          const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(init);
+          const auto *target =
+              ref ? llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl())
+                  : nullptr;
+          // A prototype-less K&R target (the 00210 `int f()` shape) is
+          // admitted like a directly-typed K&R fn-ptr local: it maps to
+          // the zero-parameter form, and the emission's signature check
+          // (`resolveFunctionPointerDecl`) still guards the binding.
+          if (target && !target->isVariadic())
+            candidates[var] = target;
+        }
+    for (const clang::Stmt *child : stmt->children())
+      self(self, child);
+  };
+  collectCandidates(collectCandidates, body);
+  if (candidates.empty())
+    return;
+
+  // Consumption pass: mark every holder read that is an explicit cast to
+  // EXACTLY the target's signature in callee position. Attributes inside
+  // the cast type were already discarded by clang, so the canonical-type
+  // comparison sees the plain signature.
+  llvm::SmallPtrSet<const clang::DeclRefExpr *, 8> consumed;
+  auto consumeCastCalls = [&](auto &&self, const clang::Stmt *stmt) -> void {
+    if (!stmt)
+      return;
+    if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt))
+      if (const auto *cast = llvm::dyn_cast<clang::ExplicitCastExpr>(
+              call->getCallee()->IgnoreParens())) {
+        const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+            cast->getSubExpr()->IgnoreParenImpCasts());
+        const auto *var =
+            ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+        auto candidate = var ? candidates.find(var) : candidates.end();
+        if (candidate != candidates.end()) {
+          clang::QualType castType = cast->getType().getCanonicalType();
+          // "Exactly f's signature" is C type compatibility (C11
+          // 6.2.7): it equates the cast's prototype with a
+          // prototype-less target declaration (the 00210 shape) while
+          // rejecting any diverging parameter or result spelling.
+          if (castType->isFunctionPointerType() &&
+              astContext().typesAreCompatible(
+                  castType->getPointeeType(),
+                  candidate->second->getType()))
+            consumed.insert(ref);
+        }
+      }
+    for (const clang::Stmt *child : stmt->children())
+      self(self, child);
+  };
+  consumeCastCalls(consumeCastCalls, body);
+
+  // Disqualification pass: any other mention of the holder — a
+  // reassignment's left-hand side, an escaping argument, a mismatched
+  // cast, its address taken — keeps the existing pointer-region
+  // rejection.
+  auto disqualify = [&](auto &&self, const clang::Stmt *stmt) -> void {
+    if (!stmt)
+      return;
+    if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+      if (!consumed.contains(ref))
+        if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+          candidates.erase(var);
+    for (const clang::Stmt *child : stmt->children())
+      self(self, child);
+  };
+  disqualify(disqualify, body);
+
+  for (const auto &[var, target] : candidates)
+    voidFnPtrHolders.try_emplace(var, target);
+}
+
+LogicalResult CImporter::emitFnHolderLocal(const clang::VarDecl *var,
+                                           const clang::FunctionDecl *target,
+                                           Location loc) {
+  FailureOr<Type> mapped =
+      mapType(astContext().getPointerType(target->getType()), loc);
+  if (failed(mapped))
+    return failure();
+  auto fnPtrType = llvm::dyn_cast<emitrust::FnPtrType>(*mapped);
+  if (!fnPtrType)
+    return emitError(loc) << "unsupported function pointer type";
+  // The same import + signature check a `Some(target)` constant runs.
+  FailureOr<std::string> name =
+      resolveFunctionPointerDecl(target, fnPtrType, loc);
+  if (failed(name))
+    return failure();
+  Value place = createVariablePlace(loc, fnPtrType);
+  symbols[var] = place;
+  auto some = emitrust::OpaqueAttr::get(
+      builder.getContext(), (llvm::Twine("Some(") + *name + ")").str());
+  Value constant =
+      builder.create<emitrust::ConstantOp>(loc, fnPtrType, some).getResult();
+  return storeToPlace(loc, place, constant);
 }
 
 LogicalResult CImporter::emitOwnerLocal(const clang::VarDecl *var,
@@ -12777,6 +13053,23 @@ FailureOr<Value> CImporter::emitShortCircuit(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
   bool isAnd = op->getOpcode() == clang::BO_LAnd;
 
+  // A compile-time-constant left operand decides the circuit BEFORE
+  // lowering (mirroring `emitConditionalOperator`): when it
+  // short-circuits, C guarantees the right operand never evaluates, so a
+  // dead RHS may contain otherwise-unimportable constructs (the 00207
+  // `0 && printf(...)` value shape); when it does not, the RHS alone
+  // decides the truth value. A live label in the dead operand keeps the
+  // full lowering below (see `emitConditionalOperator`).
+  clang::Expr::EvalResult lhsValue;
+  if (op->getLHS()->EvaluateAsInt(lhsValue, astContext())) {
+    bool truth = lhsValue.Val.getInt() != 0;
+    if (truth == isAnd) // `1 && rhs` / `0 || rhs`: the RHS decides.
+      return emitCondition(op->getRHS());
+    if (!containsLabelStmt(op->getRHS()) &&
+        !findNestedSwitchLabel(op->getRHS()))
+      return createIntConstant(loc, builder.getI1Type(), truth ? 1 : 0);
+  }
+
   // The result lives in a promotable rank-0 i1 cell: the left value covers
   // the short-circuit path, the right value overwrites it otherwise.
   Value flag = createEntryAlloca(loc, builder.getI1Type());
@@ -13599,7 +13892,22 @@ FailureOr<Value> CImporter::emitIndirectCall(const clang::CallExpr *call) {
           devirtualizedCallee(call, &aliasVar))
     return emitDevirtualizedCall(call, aliasVar, target, loc);
 
-  FailureOr<Value> fnValue = emitRValue(calleeExpr);
+  // A cast-call through an admitted local `void *` fn-ptr holder
+  // (CTS-F, 00210) peels the cast entirely (clang already discarded any
+  // attributes inside the spelled type): the holder's place carries the
+  // target-signature fn_ptr value, so the callee is a plain load and no
+  // cast op reaches the IR.
+  Value holderValue;
+  if (const auto *cast = llvm::dyn_cast<clang::ExplicitCastExpr>(calleeExpr)) {
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+        cast->getSubExpr()->IgnoreParenImpCasts());
+    const auto *var =
+        ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+    if (var && voidFnPtrHolders.contains(var))
+      holderValue = loadPlace(loc, symbols.lookup(var));
+  }
+  FailureOr<Value> fnValue =
+      holderValue ? FailureOr<Value>(holderValue) : emitRValue(calleeExpr);
   if (failed(fnValue))
     return failure();
   auto fnPtrType = llvm::dyn_cast<emitrust::FnPtrType>((*fnValue).getType());
@@ -15267,6 +15575,11 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   const auto *field = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
   if (!field)
     return emitError(loc) << "unsupported member access";
+  // A byte-array union arm (CTS-F, 00210) exists only at the type level:
+  // the union admitted on its integer slot, but no access through the
+  // array arm can be modeled on that one slot.
+  if (unionByteArrayArms.contains(field))
+    return emitError(loc) << "unsupported: union byte-array arm access";
   // A data-pointer member has no place of its own (its stored i64
   // carries no information); reads resolve through the static binding
   // in `emitPointerRValue` and writes through `emitMemberPointerAssign`.
