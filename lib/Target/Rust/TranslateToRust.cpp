@@ -399,6 +399,16 @@ LogicalResult RustEmitter::emitAttribute(Location loc, Attribute attr) {
     return success();
   }
   if (auto floatAttr = dyn_cast<FloatAttr>(attr)) {
+    // A fold of `1.0 / 0.0` produces an infinity constant; Rust spells it
+    // deterministically. NaN constants stay rejected: Rust does not
+    // guarantee the sign/payload of its NAN constant, so a byte pattern
+    // could silently diverge from C's.
+    if (floatAttr.getValue().isInfinity()) {
+      os << (floatAttr.getType().isF32() ? "f32" : "f64")
+         << (floatAttr.getValue().isNegative() ? "::NEG_INFINITY"
+                                               : "::INFINITY");
+      return success();
+    }
     if (!floatAttr.getValue().isFinite())
       return emitError(loc)
              << "cannot translate non-finite floating-point constant";
