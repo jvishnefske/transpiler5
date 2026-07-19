@@ -32,12 +32,30 @@ Python's %-formatting reproduces for these argument ranges).
 ## Files
 
 - `genprog.py` — pure seed → C program generator. Composes 2–5 feature
-  templates (union puns, byte reinterprets, cell-slice globals, void*/
-  member-base/null-ternary pointers, variadic + sprintf, StmtExprs,
-  fn-ptr devirtualization, global-return chains, int-carrier/expect/
-  missing-return, writeback ordering with RHS/index calls mutating a
-  distinct subobject of the assigned global) modeled directly on the
-  test/EndToEnd/*.c executable spec. A configurable fraction of seeds (`--cross-fraction`, default
+  templates (union puns — optionally declaring an equal-width byte-array
+  arm accessed only through the integer arm, byte reinterprets,
+  cell-slice globals, void*/member-base/null-ternary pointers, variadic
+  + sprintf, StmtExprs, fn-ptr devirtualization — optionally through a
+  local void* holder with cast-calls, global-return chains,
+  int-carrier/expect/missing-return, writeback ordering with RHS/index
+  calls mutating a distinct subobject of the assigned global, C99-45
+  bit-fields with mixed runs and sign/zero extension, and C99-48 FILE*
+  round-trip I/O) modeled directly on the test/EndToEnd/*.c executable
+  spec. Three templates also sprinkle dead, unreferenced VLA
+  declarations with side-effect-free sizes: the importer must elide
+  them, and any effect on output is a bug the differ catches.
+
+  Scratch-file hermeticity: the file_io template's filenames embed the
+  seed and instance uid, and differ.py runs BOTH binaries with the
+  per-seed workdir as their cwd, so parallel jobs can never collide and
+  nothing is written outside the harness scratch tree. The never-created
+  name for the fopen NULL branch is likewise per-seed. file_io does not
+  need special cross-composer handling: templates are sampled without
+  replacement, so a program can never contain two file_io instances —
+  one scratch file per program by construction. (bitfields and file_io
+  are not pointer-provenance features, so neither joins the
+  cross-composer's forced-pair set; they still mix freely with every
+  other template through normal sampling.) A configurable fraction of seeds (`--cross-fraction`, default
   0.5) is forced to combine ≥2 pointer-provenance templates.
 - `differ.py` — one-iteration runner: `run_pair()` classifies PASS /
   UNSUPPORTED / MISCOMPILE / HARNESS_BUG. `--self-test` pushes a

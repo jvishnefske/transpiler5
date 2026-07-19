@@ -260,10 +260,15 @@ lists the lit test file(s) that validate it.
   Differential fuzzing (test/Fuzz/): a seeded generator (genprog.py)
   composes 2-5 feature templates per program — union puns, byte
   reinterprets, cell-slice globals, void*/member-base/null-ternary
-  pointers, variadic + sprintf, StmtExprs, fn-ptr devirtualization,
-  global-return chains, int-carrier/expect/missing-return, writeback
+  pointers, variadic + sprintf, StmtExprs, fn-ptr devirtualization
+  (including local void* fn-holders with cast-calls), global-return
+  chains, int-carrier/expect/missing-return, writeback
   ordering (RHS/index calls mutating a distinct subobject of the
-  assigned global), each modeled on a test/EndToEnd differential test — into UB-free C11 programs whose
+  assigned global), C99-45 bit-fields (mixed runs, sign/zero extension,
+  RMW flags, value-position assignment), C99-48 FILE* round-trip I/O
+  over per-seed scratch files run in per-seed cwds, byte-array union
+  arms accessed only through the integer arm, and dead-VLA elision
+  noise, each modeled on a test/EndToEnd differential test — into UB-free C11 programs whose
   indices and branch conditions are runtime-computed, with printf digests
   at multiple points and a computed exit code in 0..250. The comparison
   is three-way: genprog carries an exact per-template Python evaluator

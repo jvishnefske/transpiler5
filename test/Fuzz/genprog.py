@@ -28,10 +28,20 @@ extra-dropping + sprintf formats (varargs-def.c, sprintf.c), statement
 expressions (stmt-expr.c), fn-ptr devirtualization (fnptr-devirt.c),
 global-return chains (pointers-return-global.c), and int-carrier +
 __builtin_expect + missing-return combos
-(missing-return-expect-carrier.c), and writeback ordering -- stores into
+(missing-return-expect-carrier.c), writeback ordering -- stores into
 a global whose RHS or index expression calls a helper mutating a
-DISTINCT subobject of that same global (globals-writeback-order.c).  A
-configurable fraction of seeds
+DISTINCT subobject of that same global (globals-writeback-order.c),
+bit-fields with mixed runs, sign/zero extension, RMW flag traffic, and
+value-position assignment (bitfields-flags.c, bitfields-zeroextend.c),
+and FILE* round-trip I/O over a per-seed scratch file (fopen w/r,
+fwrite/fread size-1, fgetc/getc EOF loops, fgets, fclose, handle
+reassignment, and a NULL fopen of a never-created path;
+stdio-file-roundtrip.c).  The union template may also declare an
+equal-width byte-array arm accessed only through the integer arm
+(union-bytearray-arm.c), three templates sprinkle dead
+side-effect-free-sized VLA declarations that must be elided, and the
+devirt template can hold a function address in a local void* called
+through casts (fnptr-void-local.c).  A configurable fraction of seeds
 (CROSS_FRACTION) is forced to combine at least two pointer-provenance
 templates.
 
@@ -52,8 +62,11 @@ from collections import namedtuple
 # Version history: 1 = initial nine templates; 2 = writeback_order added
 # (RHS/index calls mutating a distinct subobject of the assigned global);
 # 3 = three-way expected-output oracle (same seed->program mapping as 2,
-# but the Program artifact now includes evaluator-computed expectations).
-GENERATOR_VERSION = "3"
+# but the Program artifact now includes evaluator-computed expectations);
+# 4 = bitfields + file_io templates (C99-45/C99-48), byte-array union
+# arms (integer-arm access only), dead-VLA noise in three templates, and
+# the local-void*-holder shape in devirt.
+GENERATOR_VERSION = "4"
 
 # The expected-output oracle simulates the byte puns with native (host)
 # endianness; both differential legs run on the same host, and that host
@@ -102,13 +115,33 @@ def _uns_lit(value):
 
 def _render_union_pun(uid, p):
     u = "u%d" % uid
+    # bytearm: 0 = classic shape only; 1/2 = also declare a union mixing an
+    # unsigned arm with an equal-width byte-array arm (integer arm first /
+    # byte-array arm first), accessed ONLY through the integer arm -- the
+    # byte-array arm admits at type level but access through it is
+    # rejected (test/Import/C/union-bytearray-arm.c).
+    if p["bytearm"] == 1:
+        pb_def = "union PB_%(u)s { unsigned u; unsigned char b[4]; };\n" % {"u": u}
+    elif p["bytearm"] == 2:
+        pb_def = "union PB_%(u)s { unsigned char b[4]; unsigned u; };\n" % {"u": u}
+    else:
+        pb_def = ""
+    pb_decl = "  union PB_%(u)s w;\n" % {"u": u} if p["bytearm"] else ""
+    pb_use = (
+        "  w.u = acc ^ %(mask)s;\n"
+        "  acc = acc + (w.u %% 100000u);\n"
+        '  printf("%(u)s.p=%%u\\n", w.u %% 100000u);\n'
+        % {"u": u, "mask": _uns_lit(p["mask"])}
+        if p["bytearm"]
+        else ""
+    )
     return """union Pun_%(u)s { int i; unsigned u; };
-struct Hold_%(u)s { int tag; union Pun_%(u)s p; };
+%(pb_def)sstruct Hold_%(u)s { int tag; union Pun_%(u)s p; };
 
 static unsigned tmpl_union_%(u)s(unsigned salt) {
   union Pun_%(u)s v;
   struct Hold_%(u)s h;
-  unsigned acc = salt;
+%(pb_decl)s  unsigned acc = salt;
   int j;
   for (j = 0; j < %(iters)d; j++) {
     v.u = acc ^ %(mask)s;
@@ -124,7 +157,7 @@ static unsigned tmpl_union_%(u)s(unsigned salt) {
   h.p.u = (unsigned)%(pool_b)s ^ (salt %% 9u);
   printf("%(u)s.h=%%d %%d %%u\\n", h.tag, h.p.i, h.p.u);
   acc = acc + h.p.u + (unsigned)h.tag;
-  return acc;
+%(pb_use)s  return acc;
 }
 """ % {
         "u": u,
@@ -133,7 +166,19 @@ static unsigned tmpl_union_%(u)s(unsigned salt) {
         "pool_a": _int_lit(p["pool_a"]),
         "pool_b": _int_lit(p["pool_b"]),
         "negoff": p["negoff"],
+        "pb_def": pb_def,
+        "pb_decl": pb_decl,
+        "pb_use": pb_use,
     }
+
+
+def _vla_decl(uid, p):
+    """Dead-VLA noise: an unreferenced VLA with a side-effect-free positive
+    size (2..6).  The importer must elide it; any effect on output is a
+    bug the differential legs will catch."""
+    if not p.get("vla"):
+        return ""
+    return "  int vla_u%d[(int)(salt %% 5u) + 2];\n" % uid
 
 
 def _render_byte_pun(uid, p):
@@ -147,7 +192,7 @@ def _render_byte_pun(uid, p):
   unsigned off;
   unsigned w;
   unsigned acc = salt;
-  for (j = 0; j < %(length)d; j++)
+%(vla)s  for (j = 0; j < %(length)d; j++)
     %(arr)s[j] = (char)('A' + (j + (int)(salt %% 7u)) %% 26);
   printf("%(u)s.i j=%%d\\n", (int)(salt %% 7u));
   for (j = 0; j < 3; j++) {
@@ -177,6 +222,7 @@ def _render_byte_pun(uid, p):
         "modspan": length - 3,
         "mask": _uns_lit(p["mask"]),
         "delta": _uns_lit(p["delta"]),
+        "vla": _vla_decl(uid, p),
     }
 
 
@@ -274,7 +320,7 @@ static unsigned tmpl_ptrs_%(u)s(unsigned salt) {
   int i;
   unsigned acc = salt;
   unsigned uu;
-  x = (int)(salt %% 100u) + %(base)d;
+%(vla)s  x = (int)(salt %% 100u) + %(base)d;
   y = (int)(salt %% 30u) + 1;
   pp = &x;
   for (i = 0; i < %(iters)d; i++) {
@@ -313,6 +359,7 @@ static unsigned tmpl_ptrs_%(u)s(unsigned salt) {
         "base": p["base"],
         "pool_small": _int_lit(p["pool_small"]),
         "thresh": p["thresh"],
+        "vla": _vla_decl(uid, p),
     }
 
 
@@ -396,7 +443,7 @@ static unsigned tmpl_se_%(u)s(unsigned salt) {
   int y = (int)(salt %% 7u) + %(ya)d;
   int z;
   int j;
-  for (j = 0; j < %(iters)d; j++) {
+%(vla)s  for (j = 0; j < %(iters)d; j++) {
     x = x + MAXV_%(u)s(j * 3 %% 7, j);
     STEP_%(u)s(y);
     printf("%(u)s.j=%%d x=%%d y=%%d\\n", j, x, y);
@@ -413,30 +460,67 @@ static unsigned tmpl_se_%(u)s(unsigned salt) {
         "ya": p["ya"],
         "lo": p["lo"],
         "hi": p["hi"],
+        "vla": _vla_decl(uid, p),
     }
 
 
 def _render_devirt(uid, p):
     u = "u%d" % uid
+    # vholder: the 00210 shape -- a local void* holds a function address
+    # (address-of and decayed spellings) called through explicit casts to
+    # the exact signature, with a global reseeded between the calls
+    # (ref: test/EndToEnd/fnptr-void-local.c).
+    if p["vholder"]:
+        vh_top = (
+            "int dgs_%(u)s;\n\n"
+            "static int dv7_%(u)s(void) { return dgs_%(u)s * 7 + 1; }\n\n" % {"u": u}
+        )
+        # Address-of and decayed spellings both as INITIALIZERS -- the
+        # reference shape; assigning a function address to an existing
+        # void* local is rejected ("pointer assigned a non-address value").
+        vh_decl = (
+            "  void *vp = &dv7_%(u)s;\n"
+            "  void *vp2 = dv7_%(u)s;\n"
+            "  int va;\n"
+            "  int vb;\n" % {"u": u}
+        )
+        vh_use = (
+            "  dgs_%(u)s = (int)(salt %% 9u) + 1;\n"
+            "  va = ((int (*)(void))vp)();\n"
+            '  printf("%(u)s.va=%%d\\n", va);\n'
+            "  dgs_%(u)s = va %% 50;\n"
+            "  vb = ((int (*)(void))vp2)();\n"
+            '  printf("%(u)s.vb=%%d\\n", vb);\n' % {"u": u}
+        )
+        vh_ret = " + va + vb"
+    else:
+        vh_top = ""
+        vh_decl = ""
+        vh_use = ""
+        vh_ret = ""
     return """static int dsc_%(u)s(int x) { return x * %(mult)d + 1; }
 
-int (*const dptr_%(u)s)(int) = &dsc_%(u)s;
+%(vh_top)sint (*const dptr_%(u)s)(int) = &dsc_%(u)s;
 int (*dfp_%(u)s)(FILE *, const char *, ...) = &fprintf;
 
 static unsigned tmpl_devirt_%(u)s(unsigned salt) {
   int j;
   int a = 0;
-  for (j = 0; j < %(iters)d; j++) {
+%(vh_decl)s  for (j = 0; j < %(iters)d; j++) {
     a = a + dptr_%(u)s(j + (int)(salt %% 5u));
     dfp_%(u)s(stdout, "%(u)s.j=%%d a=%%d\\n", j, a);
   }
   dfp_%(u)s(stdout, "%(u)s.t=%%d %%d\\n", a, (*dptr_%(u)s)(a %% 100));
-  return salt + (unsigned)a;
+%(vh_use)s  return salt + (unsigned)(a%(vh_ret)s);
 }
 """ % {
         "u": u,
         "mult": p["mult"],
         "iters": p["iters"],
+        "vh_top": vh_top,
+        "vh_decl": vh_decl,
+        "vh_use": vh_use,
+        "vh_ret": vh_ret,
     }
 
 
@@ -629,6 +713,139 @@ static unsigned tmpl_wb_%(u)s(unsigned salt) {
     }
 
 
+def _render_bitfields(uid, p):
+    """C99-45 bit-fields (refs: bitfields-flags.c, bitfields-zeroextend.c).
+
+    Mixed runs (an 8-bit enum field plus two 1-bit flags and a 3-bit pad,
+    split by a plain int), zero-extending enum reads (enumerators with
+    bit 7 set), a sign-extending 4-bit int field including the pinned
+    overflow store (8 wraps to -8, clang's behavior on both sides), RMW
+    flag traffic that must not disturb neighbors, and a value-position
+    assignment.  All stored values are runtime-selected enumerators or
+    masked into field range.
+    """
+    u = "u%d" % uid
+    return """enum BG_%(u)s { BGA_%(u)s = 3, BGB_%(u)s = %(gb)d, BGC_%(u)s = 200 };
+
+struct BF_%(u)s {
+  enum BG_%(u)s g : 8;
+  unsigned hot : 1;
+  unsigned dirty : 1;
+  int mid;
+  int s : 4;
+  unsigned pad : 3;
+};
+
+static unsigned tmpl_bf_%(u)s(unsigned salt) {
+  struct BF_%(u)s c;
+  unsigned acc = salt;
+  int pick;
+  int j;
+  c.mid = %(mid_base)d + (int)(salt %% 50u);
+  pick = (int)(salt %% 3u);
+  if (pick == 0)
+    c.g = BGA_%(u)s;
+  else if (pick == 1)
+    c.g = BGB_%(u)s;
+  else
+    c.g = BGC_%(u)s;
+  c.hot = salt & 1u;
+  c.dirty = 0;
+  c.pad = salt %% 8u;
+  printf("%(u)s.g=%%d hot=%%u\\n", (int)c.g, c.hot);
+  c.dirty = c.hot;
+  c.s = -(int)(salt %% 8u);
+  printf("%(u)s.s=%%d\\n", c.s);
+  c.s = 7 + (int)(salt %% 2u);
+  printf("%(u)s.s2=%%d\\n", c.s);
+  c.hot = 0;
+  j = (c.s = (int)(salt %% 5u));
+  printf("%(u)s.v=%%d %%d\\n", j, c.s);
+  printf("%(u)s.g2=%%d hot=%%u dirty=%%u pad=%%u mid=%%d\\n",
+         (int)c.g, c.hot, c.dirty, c.pad, c.mid);
+  acc = acc + (unsigned)(int)c.g + c.hot + c.dirty + (unsigned)(c.s + 16)
+        + (unsigned)c.mid;
+  return acc;
+}
+""" % {
+        "u": u,
+        "gb": p["gb"],
+        "mid_base": p["mid_base"],
+    }
+
+
+def _render_file_io(uid, p):
+    """C99-48 FILE* round-trip (ref: test/EndToEnd/stdio-file-roundtrip.c).
+
+    fopen("w") + fwrite of a computed payload, fclose, then serial handle
+    reassignment across fopen("r") passes: a size-1 fread head read, an
+    fgetc/getc EOF loop, and an fgets line loop; finally a NULL-branch
+    fopen("r") of a per-seed name that is never created.  The scratch
+    filename embeds the seed (``seed_tag``, injected by plan_program) and
+    the instance uid, and differ.py runs both binaries with the per-seed
+    workdir as cwd, so parallel jobs can never collide and fopen("w")
+    truncates any stale file within one seed's own directory.
+    """
+    u = "u%d" % uid
+    return """static unsigned tmpl_fio_%(u)s(unsigned salt) {
+  FILE *f;
+  char buf[%(plen)d];
+  char line[8];
+  int n;
+  int ch;
+  int j;
+  unsigned acc = salt;
+  for (j = 0; j < %(plen)d; j++)
+    buf[j] = (char)('a' + (j * 2 + (int)(salt %% 9u)) %% 26);
+  for (j = 3; j < %(plen)d; j += 4)
+    buf[j] = '\\n';
+  f = fopen("%(fname)s", "w");
+  if (!f) {
+    printf("%(u)s.wfail\\n");
+    return acc;
+  }
+  n = (int)fwrite(buf, 1, %(plen)d, f);
+  printf("%(u)s.w=%%d\\n", n);
+  fclose(f);
+  f = fopen("%(fname)s", "r");
+  if (!f) {
+    printf("%(u)s.rfail\\n");
+    return acc;
+  }
+  n = (int)fread(line, 1, %(headn)d, f);
+  line[n] = 0;
+  printf("%(u)s.h=%%d %%s\\n", n, line);
+  fclose(f);
+  f = fopen("%(fname)s", "r");
+  while ((ch = %(getfn)s(f)) != EOF) {
+    acc = acc * 3u + (unsigned)ch;
+    printf("%(u)s.c=%%d\\n", ch);
+  }
+  fclose(f);
+  f = fopen("%(fname)s", "r");
+  while (fgets(line, %(gets_n)d, f) != NULL)
+    printf("%(u)s.x=%%s", line);
+  fclose(f);
+  f = fopen("%(mname)s", "r");
+  if (!f) {
+    printf("%(u)s.miss=1\\n");
+  } else {
+    printf("%(u)s.miss=0\\n");
+    fclose(f);
+  }
+  return acc + (unsigned)n;
+}
+""" % {
+        "u": u,
+        "plen": p["plen"],
+        "headn": p["headn"],
+        "getfn": ["fgetc", "getc"][p["use_getc"]],
+        "gets_n": p["gets_n"],
+        "fname": "fz_%d_%s.txt" % (p["seed_tag"], u),
+        "mname": "fzm_%d_%s.txt" % (p["seed_tag"], u),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Template registry: name -> (parameter domains, renderer).  Domains are
 # ordered lists; minimize.py shrinks toward the front of each list, and
@@ -647,6 +864,7 @@ TEMPLATES = [
             "pool_a": POOL_INT,
             "pool_b": POOL_INT,
             "negoff": [1, 7, 100],
+            "bytearm": [0, 1, 2],
         },
         _render_union_pun,
         "tmpl_union",
@@ -658,6 +876,7 @@ TEMPLATES = [
             "use_global": [0, 1],
             "mask": POOL_MASK,
             "delta": [1, 0x55AA, 0xAA55, 0x7FFFFFFF],
+            "vla": [0, 1],
         },
         _render_byte_pun,
         "tmpl_bytes",
@@ -675,6 +894,7 @@ TEMPLATES = [
             "base": [0, 5, 17, 64],
             "pool_small": POOL_SMALL,
             "thresh": [0, 10, 39],
+            "vla": [0, 1],
         },
         _render_ptr_mix,
         "tmpl_ptrs",
@@ -700,13 +920,14 @@ TEMPLATES = [
             "ya": [1, 3, 9],
             "lo": [0, 3, -5],
             "hi": [20, 50, 9],
+            "vla": [0, 1],
         },
         _render_stmt_expr,
         "tmpl_se",
     ),
     TemplateSpec(
         "devirt",
-        {"iters": [1, 3, 5, 6], "mult": [2, 3, 5]},
+        {"iters": [1, 3, 5, 6], "mult": [2, 3, 5], "vholder": [0, 1]},
         _render_devirt,
         "tmpl_devirt",
     ),
@@ -731,6 +952,23 @@ TEMPLATES = [
         },
         _render_carrier,
         "tmpl_cr",
+    ),
+    TemplateSpec(
+        "bitfields",
+        {"gb": [152, 129, 255], "mid_base": [100, 7, 1000]},
+        _render_bitfields,
+        "tmpl_bf",
+    ),
+    TemplateSpec(
+        "file_io",
+        {
+            "plen": [8, 12],
+            "headn": [4, 6],
+            "use_getc": [0, 1],
+            "gets_n": [8, 5],
+        },
+        _render_file_io,
+        "tmpl_fio",
     ),
     TemplateSpec(
         "writeback_order",
@@ -826,7 +1064,12 @@ def _eval_union_pun(uid, p, salt, out):
     tag = salt % 17
     hpu = _u32(p["pool_b"]) ^ (salt % 9)
     out.append("%s.h=%d %d %d\n" % (u, tag, _i32(hpu), hpu))
-    return _u32(acc + hpu + tag)
+    acc = _u32(acc + hpu + tag)
+    if p["bytearm"]:
+        wu = _u32(acc ^ p["mask"])
+        acc = _u32(acc + wu % 100000)
+        out.append("%s.p=%d\n" % (u, wu % 100000))
+    return acc
 
 
 def _eval_byte_pun(uid, p, salt, out):
@@ -1001,6 +1244,13 @@ def _eval_devirt(uid, p, salt, out):
         a += (j + salt % 5) * p["mult"] + 1
         out.append("%s.j=%d a=%d\n" % (u, j, a))
     out.append("%s.t=%d %d\n" % (u, a, (a % 100) * p["mult"] + 1))
+    if p["vholder"]:
+        dgs = salt % 9 + 1
+        va = dgs * 7 + 1
+        out.append("%s.va=%d\n" % (u, va))
+        vb = (va % 50) * 7 + 1
+        out.append("%s.vb=%d\n" % (u, vb))
+        return _u32(salt + _u32(a + va + vb))
     return _u32(salt + a)
 
 
@@ -1070,6 +1320,62 @@ def _eval_writeback(uid, p, salt, out):
     return _u32(acc + _u32(sum(gwa)))
 
 
+def _sext4(value):
+    """Truncate to a 4-bit field and sign-extend (int s : 4 semantics)."""
+    value &= 0xF
+    return value - 16 if value & 0x8 else value
+
+
+def _eval_bitfields(uid, p, salt, out):
+    u = "u%d" % uid
+    acc = salt
+    mid = p["mid_base"] + salt % 50
+    g = [3, p["gb"], 200][salt % 3]
+    hot = salt & 1
+    pad = salt % 8
+    out.append("%s.g=%d hot=%d\n" % (u, g, hot))
+    dirty = hot
+    s = _sext4(-(salt % 8))
+    out.append("%s.s=%d\n" % (u, s))
+    s = _sext4(7 + salt % 2)
+    out.append("%s.s2=%d\n" % (u, s))
+    hot = 0
+    s = _sext4(salt % 5)
+    out.append("%s.v=%d %d\n" % (u, s, s))
+    out.append(
+        "%s.g2=%d hot=%d dirty=%d pad=%d mid=%d\n" % (u, g, hot, dirty, pad, mid)
+    )
+    return _u32(acc + g + hot + dirty + _u32(s + 16) + _u32(mid))
+
+
+def _eval_file_io(uid, p, salt, out):
+    u = "u%d" % uid
+    acc = salt
+    plen = p["plen"]
+    data = bytearray(
+        ord("a") + (j * 2 + salt % 9) % 26 for j in range(plen)
+    )
+    for j in range(3, plen, 4):
+        data[j] = ord("\n")
+    out.append("%s.w=%d\n" % (u, plen))
+    headn = p["headn"]
+    out.append("%s.h=%d %s\n" % (u, headn, data[:headn].decode("ascii")))
+    for ch in data:
+        acc = _u32(acc * 3 + ch)
+        out.append("%s.c=%d\n" % (u, ch))
+    pos = 0
+    while pos < plen:
+        chunk = bytearray()
+        while len(chunk) < p["gets_n"] - 1 and pos < plen:
+            chunk.append(data[pos])
+            pos += 1
+            if chunk[-1] == ord("\n"):
+                break
+        out.append("%s.x=%s" % (u, chunk.decode("ascii")))
+    out.append("%s.miss=1\n" % u)
+    return _u32(acc + headn)
+
+
 _EVALUATORS = {
     "union_pun": _eval_union_pun,
     "byte_pun": _eval_byte_pun,
@@ -1081,6 +1387,8 @@ _EVALUATORS = {
     "greturn": _eval_greturn,
     "carrier": _eval_carrier,
     "writeback_order": _eval_writeback,
+    "bitfields": _eval_bitfields,
+    "file_io": _eval_file_io,
 }
 
 
@@ -1127,6 +1435,11 @@ def plan_program(seed, cross_fraction=CROSS_FRACTION):
         params = {}
         for key in sorted(spec.domains):
             params[key] = rng.choice(spec.domains[key])
+        if name == "file_io":
+            # Bake the seed into the scratch filenames so parallel seeds
+            # can never collide even in a shared cwd.  Not a domain key,
+            # so minimize.py never shrinks it and rng draws are unaffected.
+            params["seed_tag"] = seed
         instances.append(Instance(uid=uid, name=name, params=params))
     warm = rng.choice([3, 4, 5, 6, 7])
     seed_mix = rng.randrange(0, 1 << 31)
