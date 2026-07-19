@@ -97,6 +97,24 @@ emitrust.func @casts(%arg0: i32) {
   emitrust.return
 }
 
+// Bit-exact float/integer reinterpretation: unsigned sides speak
+// to_bits/from_bits directly; signless sides wrap the same-width
+// (bit-preserving) `as` conversion the u32/u64 bits type requires.
+// CHECK-LABEL: fn bitcasts(v0: f32, v1: u32, v2: i64, v3: f64) {
+// CHECK-NEXT:    let v4: u32 = v0.to_bits();
+// CHECK-NEXT:    let v5: i32 = v0.to_bits() as i32;
+// CHECK-NEXT:    let v6: f32 = f32::from_bits(v1);
+// CHECK-NEXT:    let v7: f64 = f64::from_bits(v2 as u64);
+// CHECK-NEXT:    let v8: u64 = v3.to_bits();
+emitrust.func @bitcasts(%arg0: f32, %arg1: ui32, %arg2: i64, %arg3: f64) {
+  %0 = emitrust.bitcast %arg0 : f32 to ui32
+  %1 = emitrust.bitcast %arg0 : f32 to i32
+  %2 = emitrust.bitcast %arg1 : ui32 to f32
+  %3 = emitrust.bitcast %arg2 : i64 to f64
+  %4 = emitrust.bitcast %arg3 : f64 to ui64
+  emitrust.return
+}
+
 // CHECK-LABEL: fn constants() {
 // CHECK-NEXT:    let v0: i32 = 42;
 // CHECK-NEXT:    let v1: f64 = 4.2;

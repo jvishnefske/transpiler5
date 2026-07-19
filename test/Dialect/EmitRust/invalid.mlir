@@ -192,6 +192,30 @@ emitrust.func @cast_to_enum_from_bool(%arg0: i1) {
 
 // -----
 
+emitrust.func @bitcast_int_to_int(%arg0: i32) {
+  // expected-error @+1 {{requires one float operand or result and one integer of the same width}}
+  %0 = emitrust.bitcast %arg0 : i32 to ui32
+  emitrust.return
+}
+
+// -----
+
+emitrust.func @bitcast_float_to_float(%arg0: f32) {
+  // expected-error @+1 {{requires one float operand or result and one integer of the same width}}
+  %0 = emitrust.bitcast %arg0 : f32 to f64
+  emitrust.return
+}
+
+// -----
+
+emitrust.func @bitcast_width_mismatch(%arg0: f32) {
+  // expected-error @+1 {{float and integer sides must have the same width}}
+  %0 = emitrust.bitcast %arg0 : f32 to ui64
+  emitrust.return
+}
+
+// -----
+
 // expected-error @+1 {{variant value -1 is negative but the enum has an unsigned underlying type}}
 emitrust.enum_def @Neg ["A"] [-1] {unsigned_underlying}
 

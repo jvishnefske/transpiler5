@@ -3,8 +3,8 @@
 // whose arms differ in type — or whose arm is wider than one flattened
 // field — stays rejected with the same located "union type" diagnostic
 // union types get everywhere (CTS-R3 territory); a named union member
-// whose arms fall outside the one-slot model (e.g. a float arm) keeps
-// that rejection too. A spelling collision between the parent and
+// whose arms fall outside the one-slot model (a float arm of a width no
+// integer arm shares) keeps that rejection too. A spelling collision between the parent and
 // an anonymous member's field is a clang error before import (C11
 // 6.7.2.1p13 puts both in one member namespace), also with a location.
 // RUN: split-file %s %t
@@ -15,7 +15,7 @@
 
 // MIXED: mixed-arms.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: union type
 // WIDE: wide-arm.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: union type
-// NAMED: named-union.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: union type
+// NAMED: named-union.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: union
 // COLLIDE: collision.c:{{[0-9]+}}:{{[0-9]+}}: error: member of anonymous struct redeclares 'x'
 
 //--- mixed-arms.c
@@ -46,10 +46,11 @@ struct s {
 struct s g;
 
 //--- named-union.c
-// A named union member with a non-integer arm stays outside the
-// one-slot aliasing model even after CTS-R3 named-union support.
+// A named union member whose arms fall outside the one-slot model (a
+// float arm against a WIDER integer arm; same-width pairs are admitted
+// as puns) stays rejected even after CTS-R3 named-union support.
 union u {
-  int a;
+  long a;
   float b;
 };
 

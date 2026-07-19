@@ -328,8 +328,10 @@ lists the lit test file(s) that validate it.
     place, not an integer).
   - Opaque (no interface, top by framework default or by absence):
     emitrust.load and all other memory/place ops, call_opaque results,
-    global_load, method_call, and values inside emitrust region ops whose
-    lattices stay uninitialized — all read as TOP at observation points.
+    global_load, method_call, emitrust.bitcast (a float bit pattern is
+    honestly the full integer range), and values inside emitrust region
+    ops whose lattices stay uninitialized — all read as TOP at
+    observation points.
 
   Wrap semantics: every transfer function delegates to the
   mlir::intrange::infer* helpers with OverflowFlags::None — never
@@ -1129,32 +1131,73 @@ rule.
   (design decision needed alongside C99-26: reference-typed struct fields
   require Rust lifetimes, which the dialect deliberately does not model;
   candidate mappings are index-based handles or ownership restructuring).
-- [ ] C99-44 Unions (design decision needed: safe Rust has no untagged
-  unions; candidate mappings are enums where usage is disciplined, or
-  documented rejection).
-  Partially landed (wave5 B1, one-slot struct model): a named or
-  untagged union RecordDecl imports as a ONE-FIELD struct whose storage
-  field is the first arm's leaf (name and type), generalizing the
-  CTS-R2 anonymous-union slot machinery — every arm's spelling aliases
-  that slot, so no non-first arm name reaches the IR. In scope: arms
-  that all map to one identical type (exact by C11 6.5.2.3), same-width
-  integer arms differing only in signedness (accesses through the
-  differently-signed arm wrap a bit-exact `emitrust.cast` reinterpret,
-  reads slot->arm and stores arm->slot), single-arm unions, unions as
-  struct members, and union globals with constant initializers (the
-  initializer lands on the slot like a one-field struct's). Pinned OUT
-  of scope with located `unsupported: union ...` rejections: bit-field
-  arms, pointer arms, integer arms of differing sizes, mixed
-  non-integer (float/pointer/aggregate) multi-arm unions, and empty
-  unions. Traceability: importer `lib/ImportC/ImportC.cpp`
-  (`collectUnionSlot`, `flattenedFieldStorage`,
-  `reinterpretUnionArmRead`/`reinterpretUnionArmWrite`, union routing
-  in `mapType`/`importRecord`/`convertAPValueInit`); tests
-  test/Import/C/unions.c (alias, single-arm, struct member, global
-  initializer, signedness pun, untagged local),
-  test/Import/C/unions-invalid.c (float arm, size mismatch, pointer
-  arm, bit-field arm, empty union — all located),
-  test/EndToEnd/unions.c (differential), c-testsuite 00042.c.
+- [x] C99-44 Unions. DECIDED and SHIPPED: the one-slot struct model —
+  a supported subset with documented located rejections, not an enum
+  mapping and not a blanket rejection. A named or untagged union
+  RecordDecl imports as a ONE-FIELD struct whose storage field is the
+  slot arm's leaf (name and type), generalizing the CTS-R2
+  anonymous-union slot machinery — every arm's spelling aliases that
+  slot, so no non-slot arm name reaches the IR. The slot is the FIRST
+  arm, except in the byte-array mix (CTS-R3 T1.1) where it is the first
+  non-array arm. SUPPORTED ARM MATRIX: arms that all map to one
+  identical type (exact by C11 6.5.2.3); same-width integer arms
+  differing only in signedness (accesses through the differently-signed
+  arm wrap a bit-exact `emitrust.cast` reinterpret, reads slot->arm and
+  stores arm->slot); a float arm paired with a same-width integer —
+  float/32-bit and double/64-bit — whose accesses wrap an
+  `emitrust.bitcast` (a dedicated dialect op rendered as Rust
+  to_bits/from_bits, bit-exact by definition, deliberately distinct
+  from the value-converting `as` of `emitrust.cast`); equal-total-width
+  constant integer-array arms over an integer slot (type-level
+  admission only, every access through the array arm rejects at the
+  access site); single-arm unions; unions as struct members; union
+  globals with constant initializers (the initializer lands on the
+  slot; a float-pun arm's constant crosses the domain at compile time
+  as its exact bit pattern); designated local initializers through pun
+  arms (place takes the slot's type, value reinterprets onto it);
+  compound assignment, increment/decrement, and value-position
+  assignment through pun arms (load reinterprets slot->arm, the
+  computation runs at the arm's type, the store reinterprets back).
+  REJECTION MATRIX, all located: bit-field arms, unnamed/anonymous
+  arms, and pointer arms (`unsupported: union with a ... arm`); empty
+  unions (`unsupported: union with no members`); scalar arms of
+  differing sizes — int/int, float/int, double/float
+  (`unsupported: union arms of differing sizes`); aggregate or enum
+  arms not identical to the slot's type
+  (`unsupported: union arm cannot alias the storage slot`); access
+  through a byte-array arm
+  (`unsupported: union byte-array arm access`); taking the address of
+  any union member (`unsupported: taking the address of a union
+  member`); ++/-- through a float pun arm (the general non-integer
+  ++/-- rejection, reached because the load reinterprets to the arm
+  type first). Anonymous union MEMBERS (CTS-R2) keep the stricter
+  identical-leaf-only admission — no puns through anonymous arms.
+  Traceability: dialect `include/EmitRust/EmitRustOps.td` +
+  `lib/EmitRust/EmitRustOps.cpp` (`emitrust.bitcast`, verifier:
+  exactly one f32/f64 side and one same-width integer side) and
+  `lib/Target/Rust/TranslateToRust.cpp` (`emitBitcast`); importer
+  `lib/ImportC/ImportC.cpp` (`collectUnionSlot`,
+  `flattenedFieldStorage`, `reinterpretScalarBits`,
+  `reinterpretUnionArmRead`/`reinterpretUnionArmWrite`, pun hooks in
+  `emitRecordInitField`, `emitCompoundAssignToPlace`,
+  `emitIncDecValue`, `emitBinaryRValue`, cross-domain constants in
+  `convertAnonymousSlotInit`, union routing in
+  `mapType`/`importRecord`/`convertAPValueInit`); tests
+  test/Dialect/EmitRust/ops.mlir + invalid.mlir (bitcast roundtrip and
+  verifier pins), test/Target/Rust/arith.mlir (to_bits/from_bits
+  rendering incl. signless `as` wrapping), test/Import/C/unions.c
+  (alias, single-arm, struct member, global initializer, signedness
+  pun, untagged local, float pun both slot orders, double pun,
+  designated pun-arm local init — the last also pins the fixed
+  arm-typed-store-into-slot-field defect),
+  test/Import/C/unions-invalid.c (int size mismatch, float/long,
+  double/float, aggregate arm, pointer arm, bit-field arm, empty
+  union, float-arm ++ — all located; supersedes the deleted
+  test/Import/C/union.c whose int/float rejection pin the float pun
+  made stale), test/Import/C/union-bytearray-arm.c + -invalid.c,
+  test/EndToEnd/unions.c (differential: both pun families in both
+  directions, globals, designated inits, compound assign/++/value
+  position), c-testsuite 00042.c, 00210.c, 00218.c (see CTS-R3).
 - [x] C99-45 Bit-fields. DECIDED: mask-and-shift accessor synthesis over
   per-run backing integers (not a documented rejection). PARTIAL —
   landed with c-testsuite 00218 (T1.2). Layout: each maximal run of
@@ -1974,8 +2017,11 @@ observed when C99-33 + C99-47 together unlocked 00215).
   storage slot named after the first leaf, every arm's spelling
   aliasing it — exact because reading any union member with the type of
   the last store yields that stored value (C99 6.5.2.3). Every other
-  union — mixed-type arms, an arm wider than one slot, and all named or
-  bare union types — keeps the located union-type rejection (CTS-R3).
+  ANONYMOUS union member — mixed-type arms, an arm wider than one
+  slot — keeps the located union-type rejection; named and bare union
+  TYPES were later admitted by the C99-44/CTS-R3 one-slot model, whose
+  wider pun matrix does NOT extend to anonymous members (identical
+  leaves only here).
   Member access skips Sema's implicit intermediate anonymous access and
   selects the flattened (alias-resolved) leaf on the parent place;
   block-scope initializer lists recurse onto the parent place with a
@@ -1996,25 +2042,24 @@ observed when C99-33 + C99-47 together unlocked 00215).
   test/EndToEnd/structs-anon-member.c (differential). Both tests pass
   and are in the manifest — ledger 190 passed / 30 unsupported /
   0 miscompiled.)
-- [ ] CTS-R3 (3) Unions (C99-44): design decision required — safe Rust
-  has no untagged unions without unsafe; candidates are a data-carrying
-  enum when all accesses are type-consistent, or byte-array storage with
-  typed accessor helpers for real type punning.
-  (00042.c, 00210.c, 00218.c)
-  Partially landed (wave5 B1): the one-slot struct model (see C99-44)
-  admits unions whose arms alias one leaf — identical mapped types or
+- [x] CTS-R3 (3) Unions (C99-44): CLOSED — all three target tests PASS
+  in the manifest, and the design decision is the C99-44 one-slot
+  struct model (a supported subset with documented located rejections;
+  neither of the original candidates — data-carrying enum, byte-array
+  storage with accessor helpers — was taken).
+  (00042.c, 00210.c, 00218.c — all PASS)
+  Wave5 B1: the one-slot struct model (full matrix under C99-44)
+  admits unions whose arms alias one leaf — identical mapped types,
   same-width integers differing only in signedness (bit-exact
-  `emitrust.cast` reinterpretation at the accesses) — flipping 00042.c
-  (untagged local two-int-arm union) to PASS in the manifest. 00210.c
-  (packed/aligned char-array puns) and 00218.c (self-referential
-  pointer-arm union) stay out of scope behind located
-  `unsupported: union ...` rejections (test/Import/C/unions-invalid.c);
-  positive pins in test/Import/C/unions.c and test/EndToEnd/unions.c.
+  `emitrust.cast` reinterpretation at the accesses), and, since the
+  float-pun extension, a float arm against a same-width integer
+  (bit-exact `emitrust.bitcast`, Rust to_bits/from_bits) — flipping
+  00042.c (untagged local two-int-arm union) to PASS.
   T1.1: the byte-array arm (00210's `uint16_t u; uint8_t b[2];`,
   packed attributes in either typedef position tolerated and discarded)
-  now ADMITS at the TYPE level: the slot is the INTEGER arm regardless
-  of declaration order, the array spelling never reaches the IR, and
-  any access through the array arm is a located
+  ADMITS at the TYPE level: the slot is the INTEGER arm regardless of
+  declaration order, the array spelling never reaches the IR, and any
+  access through the array arm is a located
   `unsupported: union byte-array arm access` at the ACCESS site;
   unequal-total-width array arms keep the union family rejection at the
   union decl. Together with the local void* fn-ptr holder (a
@@ -2024,10 +2069,18 @@ observed when C99-33 + C99-47 together unlocked 00215).
   ordinary `!emitrust.fn_ptr` local — fn-address `Some(target)`
   constant + `emitrust.call_indirect`, the cast fully peeled;
   out-of-shape holders keep `unsupported: pointer assigned a
-  non-address value`), 00210.c flipped to PASS in the manifest.
-  (test/Import/C/union-bytearray-arm.c, union-bytearray-arm-invalid.c,
-  fnptr-void-local.c, fnptr-void-local-invalid.c,
-  test/EndToEnd/fnptr-void-local.c) 00218.c stays out of scope.
+  non-address value`), 00210.c flipped to PASS.
+  00218.c (a SINGLE-ARM union of a struct with pointer members and an
+  enum bit-field — not a multi-arm pun) passes through the one-slot
+  single-arm admission combined with the C99-45 enum-bit-field
+  zero-extend accessors and the CTS-P2 pointer-struct-member work; the
+  earlier note here calling it out of scope was stale.
+  Union shapes outside the model stay behind located
+  `unsupported: union ...` rejections (test/Import/C/unions-invalid.c,
+  union-bytearray-arm-invalid.c); positive pins in
+  test/Import/C/unions.c, union-bytearray-arm.c, fnptr-void-local.c
+  (+ -invalid), test/EndToEnd/unions.c, fnptr-void-local.c.
+  Ledger: 217 passed / 3 unsupported / 0 miscompiled of 220.
 - [x] CTS-R4 (2) Block-scope struct declarations shadowing an outer tag
   (same tag `T`, different shape, inner scope): the importer's per-name
   shape dedup misreads this as a cross-TU conflict; record keys need
