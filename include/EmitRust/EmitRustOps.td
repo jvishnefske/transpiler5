@@ -222,12 +222,17 @@ def EmitRust_ImplOp : EmitRust_Op<"impl", [
 //===----------------------------------------------------------------------===//
 
 def EmitRust_MethodCallOp : EmitRust_Op<"method_call"> {
-  let summary = "Method call on a struct place";
+  let summary = "Method call on a struct or opaque place";
   let description = [{
     The `emitrust.method_call` operation calls the named method on the
-    receiver place, which must be an lvalue wrapping an `!emitrust.struct`.
-    It renders as `place.method(args)` — Rust's auto-ref takes the `&mut`
-    borrow of the place and scopes it to the call expression, so no borrow
+    receiver place, which must be an lvalue wrapping an `!emitrust.struct`
+    OR an `!emitrust.opaque` type (W2.3: the STL recognition surface —
+    `Vec<T>`/`String` inherent methods like `push`/`len`/`is_empty`/`clear`/
+    `push_str` — reuses this op unchanged rather than adding a parallel
+    mechanism; the opaque case is intentionally NOT cross-checked against
+    any real Rust method table, mirroring `emitrust.call_opaque`'s trust
+    model).  It renders as `place.method(args)` — Rust's auto-ref takes the
+    `&mut` borrow of the place and scopes it to the call expression, so no borrow
     is ever materialized as a binding. The operation produces at most one
     result and is emitted as a `let` binding when it produces one and as a
     bare statement otherwise. The method name is not cross-checked against
@@ -1021,6 +1026,16 @@ def EmitRust_SubscriptOp : EmitRust_Op<"subscript"> {
     `[index as usize]` to the place expression of any load, assign, or
     borrow that consumes it (the `as usize` cast is omitted when the index
     is of `index` type).
+
+    W2.3: the operand's wrapped value type may also be an `!emitrust.opaque`
+    type (the `std::vector<T>` recognition surface, rendered `Vec<T>` —
+    `operator[]`/`at()` both map to this same bracket-indexing place, the
+    UB-refinement stance being that both panic on out-of-bounds exactly
+    like Rust's `Index`/`IndexMut`). The opaque case is NOT structurally
+    cross-checked against a decomposable element type (there is none to
+    derive from an opaque string) — the caller is trusted to supply a
+    result value type consistent with the opaque's element, mirroring
+    `emitrust.call_opaque`'s trust model for opaque interop.
 
     Example:
 

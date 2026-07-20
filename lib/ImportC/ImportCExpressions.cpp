@@ -40,6 +40,14 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
     return emitRValue(constant->getSubExpr());
   if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e))
     return emitRValue(cleanups->getSubExpr());
+  // W2.3: a prvalue bound to a by-value/rvalue-reference parameter (e.g.
+  // `v.push_back(1)` binding the literal to `push_back(T&&)`) is wrapped in
+  // a `MaterializeTemporaryExpr` marking where its temporary materializes;
+  // the value underneath imports exactly like the unwrapped expression (no
+  // C construct ever produces this node, so the C path is unaffected).
+  if (const auto *materialize =
+          llvm::dyn_cast<clang::MaterializeTemporaryExpr>(e))
+    return emitRValue(materialize->getSubExpr());
   // An enumerator used as a plain expression has type `int` in C: a named
   // enum's constant is rendered as its Rust variant cast to i32, while an
   // anonymous enum's constant is a plain i32 value.
@@ -52,6 +60,21 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
       if (llvm::isa<emitrust::EnumType>((*constant).getType()))
         return castEnumToI32(loc, *constant);
       return constant;
+    }
+  // W2.3: an lvalue bound to a C++ reference parameter (e.g. `const T&`)
+  // is left as a bare `DeclRefExpr` with NO `CK_LValueToRValue` wrapper —
+  // binding a reference does not "read" the value, it aliases existing
+  // storage — unlike C, where every scalar value use is wrapped in that
+  // cast (this branch is unreachable, and so safe, for the C path). A
+  // by-value STL method parameter Rust models as an owned value (e.g.
+  // `Vec::push`'s `T`) still needs the loaded value, exactly like the
+  // `CK_LValueToRValue` case below.
+  if (const auto *scalarRef = llvm::dyn_cast<clang::DeclRefExpr>(e))
+    if (llvm::isa<clang::VarDecl>(scalarRef->getDecl())) {
+      FailureOr<Value> place = emitLValue(scalarRef);
+      if (failed(place))
+        return failure();
+      return loadPlace(loc, *place);
     }
 
   if (const auto *literal = llvm::dyn_cast<clang::IntegerLiteral>(e)) {
@@ -1682,6 +1705,18 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   // otherwise reach.
   if (const auto *memberCall = llvm::dyn_cast<clang::CXXMemberCallExpr>(call))
     return emitCXXMemberCall(memberCall);
+  // W2.3: `v[i]` / `s1 += s2` / `s += 'c'` over a recognized STL receiver
+  // resolve to an overloaded operator call (`CXXOperatorCallExpr`, itself a
+  // `CallExpr` but NOT a `CXXMemberCallExpr` — clang represents even a
+  // MEMBER `operator[]`/`operator+=` this way for the operator syntax) —
+  // intercepted before the ordinary free-function dispatch below, which
+  // would otherwise reject it as a call to an unimported function.
+  if (const auto *opCall = llvm::dyn_cast<clang::CXXOperatorCallExpr>(call)) {
+    const auto *opMethod = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(
+        opCall->getDirectCallee());
+    if (opMethod && opMethod->getParent()->isInStdNamespace())
+      return emitStlOperatorCall(opCall);
+  }
   const clang::FunctionDecl *callee = call->getDirectCallee();
   if (!callee)
     return emitIndirectCall(call);
@@ -2106,6 +2141,13 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   const clang::CXXMethodDecl *method = call->getMethodDecl();
   if (!method || method->isVirtual())
     return emitError(loc) << "unsupported: virtual or unresolved member call";
+  // W2.3: a method declared in namespace `std` (`std::vector<T>`'s /
+  // `std::string`'s own inherent methods) never has an imported func — no
+  // libstdc++ method is ever imported — so it is intercepted here, before
+  // the generic imported-method lookup below would reject it as "call to
+  // unimported method".
+  if (method->getParent()->isInStdNamespace())
+    return emitStlMemberCall(call);
   std::string name = cxxMethodMangledName(method);
   func::FuncOp target = functions.lookup(name);
   if (!target)
@@ -2153,6 +2195,248 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   if (callOp->getNumResults() == 0)
     return Value();
   return callOp->getResult(0);
+}
+
+FailureOr<Value>
+CImporter::emitStlVectorIndexPlace(Value receiver,
+                                   emitrust::OpaqueType vectorType,
+                                   const clang::Expr *idxExpr, Location loc,
+                                   llvm::StringRef opName) {
+  llvm::StringRef spelling = vectorType.getValue();
+  // Strip the "Vec<" prefix and trailing ">".
+  llvm::StringRef inner = spelling.substr(4, spelling.size() - 5);
+  Type elementType = parseStlElementType(inner);
+  if (!elementType)
+    return emitError(loc) << "unsupported: " << opName << " element type";
+  FailureOr<Value> index = emitRValue(idxExpr);
+  if (failed(index))
+    return failure();
+  if (!llvm::isa<IntegerType>((*index).getType()))
+    return emitError(loc) << "unsupported: " << opName
+                          << " index must be an integer";
+  return builder
+      .create<emitrust::SubscriptOp>(
+          loc, emitrust::LValueType::get(elementType), receiver, *index)
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  const clang::CXXMethodDecl *method = call->getMethodDecl();
+  std::string methodName = method->getDeclName().isIdentifier()
+                                ? method->getName().str()
+                                : std::string();
+  // The implicit object argument may be wrapped in an implicit
+  // qualification-adjustment cast (const-method binding), mirroring
+  // `emitCXXMemberCall`.
+  FailureOr<Value> receiver = emitLValue(
+      call->getImplicitObjectArgument()->IgnoreParenImpCasts());
+  if (failed(receiver))
+    return failure();
+  auto receiverLValueType =
+      llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+  auto opaque = receiverLValueType ? llvm::dyn_cast<emitrust::OpaqueType>(
+                                         receiverLValueType.getValueType())
+                                   : emitrust::OpaqueType();
+  if (!opaque || !isStlOpaqueType(opaque))
+    return emitError(loc)
+           << "unsupported: member call receiver is not a recognized STL "
+              "type";
+  llvm::StringRef typeSpelling = opaque.getValue();
+  bool isVector = typeSpelling.starts_with("Vec<");
+
+  // size()/length(): C's declared result type is int/size_t; the real
+  // `.len()` returns `usize` (`index`), so the result is cast to whatever
+  // the call expression's own static type maps to (mirroring
+  // `emitAtoiCall`/`emitFileReadWrite`'s "cast to the C declared type"
+  // convention).
+  auto emitLenCall = [&]() -> FailureOr<Value> {
+    if (call->getNumArgs() != 0)
+      return emitError(loc) << "unsupported: " << methodName
+                            << " takes no arguments";
+    Value len = builder
+                    .create<emitrust::MethodCallOp>(
+                        loc, TypeRange{builder.getIndexType()}, *receiver,
+                        builder.getStringAttr("len"), ValueRange{})
+                    .getResult(0);
+    FailureOr<Type> resultType = mapType(call->getType(), loc);
+    if (failed(resultType))
+      return failure();
+    auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+    if (!intType)
+      return emitError(loc) << "unsupported: " << methodName << " result type";
+    return builder.create<emitrust::CastOp>(loc, intType, len).getResult();
+  };
+  auto emitEmptyCall = [&]() -> FailureOr<Value> {
+    if (call->getNumArgs() != 0)
+      return emitError(loc) << "unsupported: empty takes no arguments";
+    return builder
+        .create<emitrust::MethodCallOp>(loc, TypeRange{builder.getI1Type()},
+                                        *receiver,
+                                        builder.getStringAttr("is_empty"),
+                                        ValueRange{})
+        .getResult(0);
+  };
+
+  if (isVector) {
+    if (methodName == "push_back") {
+      if (call->getNumArgs() != 1)
+        return emitError(loc)
+               << "unsupported: push_back requires exactly one argument";
+      FailureOr<Value> argument = emitRValue(call->getArg(0));
+      if (failed(argument))
+        return failure();
+      builder.create<emitrust::MethodCallOp>(
+          loc, TypeRange(), *receiver, builder.getStringAttr("push"),
+          ValueRange{*argument});
+      return Value();
+    }
+    if (methodName == "size")
+      return emitLenCall();
+    if (methodName == "empty")
+      return emitEmptyCall();
+    if (methodName == "clear") {
+      if (call->getNumArgs() != 0)
+        return emitError(loc) << "unsupported: clear takes no arguments";
+      builder.create<emitrust::MethodCallOp>(loc, TypeRange(), *receiver,
+                                             builder.getStringAttr("clear"),
+                                             ValueRange{});
+      return Value();
+    }
+    if (methodName == "at") {
+      if (call->getNumArgs() != 1)
+        return emitError(loc)
+               << "unsupported: at requires exactly one argument";
+      FailureOr<Value> place = emitStlVectorIndexPlace(
+          *receiver, opaque, call->getArg(0), loc, "at");
+      if (failed(place))
+        return failure();
+      return loadPlace(loc, *place);
+    }
+    return emitError(loc) << "unsupported: std::vector::" << methodName
+                          << " is not a recognized STL method";
+  }
+  // std::string.
+  if (methodName == "size" || methodName == "length")
+    return emitLenCall();
+  if (methodName == "empty")
+    return emitEmptyCall();
+  if (methodName == "c_str")
+    return emitError(loc)
+           << "unsupported: std::string::c_str() is only recognized as a "
+              "printf '%s' argument";
+  return emitError(loc) << "unsupported: std::string::" << methodName
+                        << " is not a recognized STL method";
+}
+
+FailureOr<Value>
+CImporter::emitStlOperatorCall(const clang::CXXOperatorCallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  FailureOr<Value> receiver =
+      emitLValue(call->getArg(0)->IgnoreParenImpCasts());
+  if (failed(receiver))
+    return failure();
+  auto receiverLValueType =
+      llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+  auto opaque = receiverLValueType ? llvm::dyn_cast<emitrust::OpaqueType>(
+                                         receiverLValueType.getValueType())
+                                   : emitrust::OpaqueType();
+  if (!opaque || !isStlOpaqueType(opaque))
+    return emitError(loc)
+           << "unsupported: operator call receiver is not a recognized STL "
+              "type";
+  bool isVector = opaque.getValue().starts_with("Vec<");
+
+  switch (call->getOperator()) {
+  case clang::OO_Subscript: {
+    if (!isVector)
+      return emitError(loc)
+             << "unsupported: std::string::operator[] is not a recognized "
+                "STL method (bytes indexing is not supported this wave)";
+    if (call->getNumArgs() != 2)
+      return emitError(loc)
+             << "unsupported: operator[] requires exactly one index "
+                "argument";
+    FailureOr<Value> place = emitStlVectorIndexPlace(
+        *receiver, opaque, call->getArg(1), loc, "operator[]");
+    if (failed(place))
+      return failure();
+    return loadPlace(loc, *place);
+  }
+  case clang::OO_PlusEqual: {
+    if (isVector)
+      return emitError(loc)
+             << "unsupported: std::vector::operator+= is not a recognized "
+                "STL method";
+    if (call->getNumArgs() != 2)
+      return emitError(loc)
+             << "unsupported: operator+= requires exactly one argument";
+    const clang::Expr *rhs = call->getArg(1);
+    clang::QualType rhsType = rhs->getType().getCanonicalType();
+    // `s += "literal"`: `push_str("literal")` — the ordinary string
+    // literal is emitted verbatim and needs no borrow (unlike the
+    // std::string-operand shape below), mirroring printf `%s`'s literal
+    // shape.
+    if (const clang::StringLiteral *literal =
+            underlyingStringLiteral(rhs->IgnoreParenImpCasts())) {
+      if (!literal->isOrdinary())
+        return emitError(loc) << "unsupported: non-ordinary string literal "
+                                 "in std::string::operator+=";
+      FailureOr<Value> text = emitRustStrLiteral(
+          loc, literal->getString(), "std::string::operator+=");
+      if (failed(text))
+        return failure();
+      builder.create<emitrust::MethodCallOp>(
+          loc, TypeRange(), *receiver, builder.getStringAttr("push_str"),
+          ValueRange{*text});
+      return Value();
+    }
+    if (const auto *rhsRecord = rhsType->getAs<clang::RecordType>();
+        rhsRecord && rhsRecord->getDecl()->isInStdNamespace()) {
+      // `s1 += s2`: `push_str(&s2)` — deref coercion `&String` -> `&str`
+      // applies at the argument position (mirroring `c_str()`'s printf
+      // borrow and `__emitrust_sprintf`'s staged String borrow).
+      FailureOr<Value> rhsPlace = emitLValue(rhs->IgnoreParenImpCasts());
+      if (failed(rhsPlace))
+        return failure();
+      auto rhsLValueType =
+          llvm::dyn_cast<emitrust::LValueType>((*rhsPlace).getType());
+      if (!rhsLValueType || !isStlOpaqueType(rhsLValueType.getValueType()) ||
+          llvm::cast<emitrust::OpaqueType>(rhsLValueType.getValueType())
+                  .getValue() != "String")
+        return emitError(loc) << "unsupported: operator+= right-hand side "
+                                 "is not a recognized std::string";
+      Value rhsRef =
+          builder
+              .create<emitrust::AddrOfOp>(
+                  loc, emitrust::RefType::get(rhsLValueType.getValueType()),
+                  *rhsPlace, /*is_mut=*/false)
+              .getResult();
+      builder.create<emitrust::MethodCallOp>(
+          loc, TypeRange(), *receiver, builder.getStringAttr("push_str"),
+          ValueRange{rhsRef});
+      return Value();
+    }
+    if (rhsType->isIntegerType()) {
+      // `s += 'c'`: `push(c as char)`, reusing the printf '%c' char
+      // conversion (`wrapCharFormat`) — the same ASCII-only policy.
+      FailureOr<Value> rhsValue = emitRValue(rhs);
+      if (failed(rhsValue))
+        return failure();
+      Value character = wrapCharFormat(loc, *rhsValue);
+      builder.create<emitrust::MethodCallOp>(loc, TypeRange(), *receiver,
+                                             builder.getStringAttr("push"),
+                                             ValueRange{character});
+      return Value();
+    }
+    return emitError(loc)
+           << "unsupported: std::string::operator+= right-hand side type";
+  }
+  default:
+    return emitError(loc) << "unsupported: this STL operator is not a "
+                             "recognized STL method";
+  }
 }
 
 FailureOr<Value> CImporter::emitMethodCallSite(const clang::CallExpr *call,

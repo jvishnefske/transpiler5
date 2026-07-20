@@ -167,15 +167,17 @@ LogicalResult ImplOp::verify() {
 // MethodCallOp
 //===----------------------------------------------------------------------===//
 
-/// Verifies that the receiver is an lvalue wrapping a struct type, that the
-/// method name is non-empty, and that the call produces at most one result.
+/// Verifies that the receiver is an lvalue wrapping a struct or opaque type
+/// (W2.3: the opaque case is the `Vec<T>`/`String` STL method-call surface),
+/// that the method name is non-empty, and that the call produces at most one
+/// result.
 LogicalResult MethodCallOp::verify() {
   if (getMethod().empty())
     return emitOpError("method name must not be empty");
   Type valueType = cast<LValueType>(getReceiver().getType()).getValueType();
-  if (!isa<StructType>(valueType))
-    return emitOpError(
-               "receiver must be an lvalue of !emitrust.struct type, but got ")
+  if (!isa<StructType, OpaqueType>(valueType))
+    return emitOpError("receiver must be an lvalue of !emitrust.struct or "
+                       "!emitrust.opaque type, but got ")
            << getReceiver().getType();
   if (getNumResults() > 1)
     return emitOpError("requires zero or exactly one result, but has ")
@@ -755,13 +757,20 @@ static Type indexableElementType(Type type) {
 }
 
 /// Verifies that the operand is an lvalue wrapping an array or slice type
-/// whose element type equals the result lvalue's wrapped value type.
+/// whose element type equals the result lvalue's wrapped value type. W2.3:
+/// an `!emitrust.opaque` operand (the `std::vector<T>` recognition surface,
+/// `Vec<T>`) is also accepted, but — since an opaque string does not
+/// structurally decompose into an element type — the result value type is
+/// trusted rather than cross-checked, mirroring `emitrust.call_opaque`'s
+/// trust model for opaque interop.
 LogicalResult SubscriptOp::verify() {
   Type valueType = cast<LValueType>(getArray().getType()).getValueType();
+  if (isa<OpaqueType>(valueType))
+    return success();
   Type elementType = indexableElementType(valueType);
   if (!elementType)
-    return emitOpError("operand must be an lvalue of !emitrust.array or "
-                       "!emitrust.slice type, but got ")
+    return emitOpError("operand must be an lvalue of !emitrust.array, "
+                       "!emitrust.slice, or !emitrust.opaque type, but got ")
            << getArray().getType();
   Type resultValueType = cast<LValueType>(getResult().getType()).getValueType();
   if (elementType != resultValueType)

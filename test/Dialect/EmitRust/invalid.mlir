@@ -87,7 +87,7 @@ emitrust.func @member_on_non_struct() {
 
 emitrust.func @subscript_on_non_array(%arg0: index) {
   %0 = emitrust.variable : !emitrust.lvalue<i32>
-  // expected-error @+1 {{operand must be an lvalue of !emitrust.array or !emitrust.slice type}}
+  // expected-error @+1 {{operand must be an lvalue of !emitrust.array, !emitrust.slice, or !emitrust.opaque type}}
   %1 = emitrust.subscript %0[%arg0] : (!emitrust.lvalue<i32>, index) -> !emitrust.lvalue<i32>
   emitrust.return
 }
@@ -524,7 +524,7 @@ emitrust.global const @const_fn_ptr : !emitrust.fn_ptr<() -> i32>
 
 emitrust.func @method_call_non_struct(%arg0: i64) {
   %v = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
-  // expected-error @+1 {{receiver must be an lvalue of !emitrust.struct type}}
+  // expected-error @+1 {{receiver must be an lvalue of !emitrust.struct or !emitrust.opaque type}}
   emitrust.method_call %v["get"] (%arg0) : (!emitrust.lvalue<!emitrust.array<4xi32>>, i64) -> ()
   emitrust.return
 }
