@@ -5,7 +5,9 @@
 // every dropped extra is side-effect-free; the dropped extras are never
 // imported, so a dropped `&s` must not create a pointer region or borrow
 // and a dropped by-value struct must not be loaded. Definitions that DO
-// use va_list keep the existing rejection (see varargs-def-invalid.c).
+// use va_list monomorphize per call site when the body stays in the
+// bounded shape (varargs-monomorph.c) and keep located rejections
+// otherwise (varargs-monomorph-invalid.c, varargs-def-invalid.c).
 // RUN: emitrust-import-c %s | FileCheck %s
 
 struct S {
