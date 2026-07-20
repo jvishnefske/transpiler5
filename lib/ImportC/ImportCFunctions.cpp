@@ -51,6 +51,67 @@ std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
   return base;
 }
 
+/// W2.2: `method`'s un-suffixed mangled base name — the fixed spelling
+/// "new" for a constructor (whose `DeclarationName` is the special
+/// `CXXConstructorName` kind and has no ordinary identifier), or its C++
+/// spelling passed through the same keyword-escape a struct field name
+/// uses (`mangleMemberName`).
+static std::string cxxMethodBaseName(const clang::CXXMethodDecl *method) {
+  if (llvm::isa<clang::CXXConstructorDecl>(method))
+    return "new";
+  return mangleMemberName(method->getName());
+}
+
+/// W2.2 per-overload parameter type code: `i` for a canonical `int`, `b`
+/// for `bool` — the two builtin types this wave's overloaded fixture
+/// classes (test/Import/Cpp/methods.cpp, cpp-methods-overload.cpp) actually
+/// overload on. Deterministic and extendable: a future wave adds table
+/// entries as new overloaded parameter types are admitted; any type this
+/// table does not yet distinguish falls back to a fixed placeholder code,
+/// which cannot itself disambiguate a same-shaped fallback overload set,
+/// but that shape is out of this wave's tested scope.
+static std::string cxxOverloadParamCode(clang::QualType type) {
+  clang::QualType canonical = type.getCanonicalType();
+  if (canonical->isBooleanType())
+    return "b";
+  if (canonical->isIntegerType())
+    return "i";
+  return "x";
+}
+
+std::string
+CImporter::cxxMethodMangledName(const clang::CXXMethodDecl *method) const {
+  const clang::CXXRecordDecl *record = method->getParent();
+  llvm::StringRef structName = assignedStructNames.lookup(record);
+  std::string baseName = cxxMethodBaseName(method);
+  // The overload suffix is present only when the class declares MORE THAN
+  // ONE method (or constructor) sharing this base name (a genuine C++
+  // overload set) — counted fresh here rather than cached, since it is a
+  // pure function of the (already-fully-declared, by the time any method
+  // imports) class AST.
+  unsigned sharingCount = 0;
+  for (const clang::CXXMethodDecl *candidate : record->methods()) {
+    if (candidate->isImplicit() || candidate->isDeleted() ||
+        llvm::isa<clang::CXXDestructorDecl>(candidate))
+      continue;
+    if (cxxMethodBaseName(candidate) == baseName)
+      ++sharingCount;
+  }
+  std::string mangled = (structName + "_" + llvm::StringRef(baseName)).str();
+  if (sharingCount > 1) {
+    std::string codes;
+    for (const clang::ParmVarDecl *param : method->parameters())
+      codes += cxxOverloadParamCode(param->getType());
+    // A zero-parameter overload contributes an empty code string, which
+    // keeps the bare `<StructName>_<methodBaseName>` spelling with no
+    // trailing suffix (methods.cpp's binding worked example: `Counter_get`
+    // for the 0-arg overload, `Counter_get_i` for the 1-arg one).
+    if (!codes.empty())
+      mangled += ("_" + codes);
+  }
+  return mangled;
+}
+
 /// Returns whether `later` differs from `earlier` only by refining
 /// `!emitrust.mut_ref<T>` parameter positions into
 /// `!emitrust.mut_ref<!emitrust.slice<T>>` — the shape change a
@@ -77,7 +138,16 @@ static bool isSliceRefinementOf(FunctionType earlier, FunctionType later) {
 
 LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   Location loc = translateLoc(func->getLocation());
-  llvm::StringRef cName = func->getName();
+  // W2.2: a constructor's `DeclarationName` has no ordinary identifier
+  // spelling (`CXXConstructorName` is a distinct `DeclarationName::NameKind`),
+  // so `getName()` cannot be called on one directly; every OTHER
+  // `CXXMethodDecl` this function ever sees has an ordinary identifier
+  // (destructors, virtual methods, and operator overloads are rejected in
+  // `collectRecordFields`, before any method of the class imports).
+  const auto *cxxMethod = llvm::dyn_cast<clang::CXXMethodDecl>(func);
+  bool cxxIsCtor =
+      cxxMethod && llvm::isa<clang::CXXConstructorDecl>(cxxMethod);
+  llvm::StringRef cName = cxxIsCtor ? llvm::StringRef() : func->getName();
 
   if (func->isVariadic()) {
     const clang::FunctionDecl *definition = func->getDefinition();
@@ -156,7 +226,14 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     return emitError(loc) << "unsupported: function name '" << cName
                           << "' mangles to '" << cName
                           << "_', which collides with an existing symbol";
-  std::string name = mlirFuncName(func);
+  // W2.2: a genuine C++ method or constructor takes its own naming path
+  // (`cxxMethodMangledName`), decoupled from `mlirFuncName`'s per-TU
+  // static-storage-class tag — a C++ method and a C file-static function
+  // both report `clang::SC_Static` for unrelated reasons (C++ class-scope
+  // linkage vs. C internal linkage), and only the free-function path may
+  // pick up that tag.
+  std::string name =
+      cxxMethod ? cxxMethodMangledName(cxxMethod) : mlirFuncName(func);
 
   // K&R callsite-prototype inference (FR-29, CTS 00209): the definition's
   // body refines argument-called prototype-less fn-ptr decls to their
@@ -188,6 +265,26 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     ownerStructType = emitrust::StructType::get(
         builder.getContext(), ownerPlans.find(methodOwner)->second.structName);
     inputTypes.push_back(emitrust::MutRefType::get(ownerStructType));
+  }
+  // W2.2: a genuine C++ instance method (mutually exclusive with
+  // `methodOwner`, the unrelated Phase-4 owner-promotion mechanism) takes
+  // its receiver as a leading `!emitrust.mut_ref<struct>` (mutating method
+  // or constructor) or `!emitrust.ref<struct>` (const method) argument; a
+  // static method takes none.
+  bool cxxHasReceiver = cxxMethod && !cxxMethod->isStatic();
+  emitrust::StructType cxxOwnerStructType;
+  if (cxxMethod) {
+    llvm::StringRef ownerName =
+        assignedStructNames.lookup(cxxMethod->getParent());
+    if (ownerName.empty()) // Defensive; the class was already imported.
+      return emitError(loc) << "unsupported: method of an unimported class";
+    cxxOwnerStructType =
+        emitrust::StructType::get(builder.getContext(), ownerName);
+    if (cxxHasReceiver)
+      inputTypes.push_back(cxxMethod->isConst()
+                                ? Type(emitrust::RefType::get(cxxOwnerStructType))
+                                : Type(emitrust::MutRefType::get(
+                                      cxxOwnerStructType)));
   }
   if (name == "c_main" && func->getNumParams() != 0) {
     // C `main`'s standard two-parameter form (C99 5.1.2.2.1): `argc`
@@ -257,7 +354,11 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   }
   SmallVector<Type> resultTypes;
   clang::QualType returnType = func->getReturnType();
-  if (!returnType->isVoidType()) {
+  // W2.2: a constructor is rendered as a void `&mut self` method
+  // (`fn new(&mut self, ...)`) that initializes the fields in place; it has
+  // no C++ return type to map (clang already reports void for one), but
+  // the check is made explicit here rather than relying on that AST fact.
+  if (!cxxIsCtor && !returnType->isVoidType()) {
     // Returning an owned stream handle would let it escape its function
     // (C99-48 v1: no escapes); checked before the data-pointer return
     // classification below.
@@ -325,6 +426,16 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   if (methodOwner)
     funcOp->setAttr(emitrust::kMethodOfAttrName,
                     builder.getStringAttr(ownerStructType.getName()));
+  // W2.2: a genuine C++ method places into its class's impl exactly like a
+  // Phase-4 owner method; a static method additionally carries the
+  // `static_method` marker so `emitrust.impl`'s verifier and the Rust
+  // emitter know not to expect (and not to render) a receiver argument.
+  if (cxxMethod) {
+    funcOp->setAttr(emitrust::kMethodOfAttrName,
+                    builder.getStringAttr(cxxOwnerStructType.getName()));
+    if (!cxxHasReceiver)
+      funcOp->setAttr(emitrust::kStaticMethodAttrName, builder.getUnitAttr());
+  }
   functions[name] = funcOp;
   if (!isDefinition) {
     funcOp.setPrivate();
@@ -355,6 +466,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
   currentMethodOwner = nullptr;
+  currentCxxThisRef = Value();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
   // An erased single-global-base pointer return (CTS-S, 00089): return
   // sites emit a bare `return` instead of the classified `&global`.
@@ -417,8 +529,15 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     currentReceiverPlace = receiverPlace;
     currentMethodOwner = methodOwner;
   }
+  // W2.2: a genuine C++ instance method's receiver stays an undereferenced
+  // ref/mut_ref value — `CXXThisExpr` resolves directly to it, and the
+  // existing `->`-base rvalue path (`emitMemberBasePlace`) derefs it lazily
+  // at each member access, exactly like any other pointer-typed base
+  // expression.
+  if (cxxHasReceiver)
+    currentCxxThisRef = entryBlock->getArgument(0);
 
-  unsigned entryArgIndex = methodOwner ? 1 : 0;
+  unsigned entryArgIndex = (methodOwner || cxxHasReceiver) ? 1 : 0;
   for (const clang::ParmVarDecl *param : func->parameters()) {
     // main's `argv` was dropped from the imported signature (it has no
     // entry-block argument); its uses were rejected at signature time, so
@@ -458,6 +577,65 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     }
     if (failed(bindOrdinaryParam(param, blockArg, paramLoc)))
       return failure();
+  }
+
+  // W2.2: a constructor's member-initializer list (`CXXCtorInitializer`s,
+  // which live OUTSIDE `getBody()`) lowers to ordinary member assignments
+  // against the (always-mutable) receiver, in declaration order, AHEAD OF
+  // the constructor's own compound-statement body: `deref(self)`,
+  // `member(field)`, `assign`. No implicit zero-fill precedes it (this
+  // wave's classes never mix a member-initializer list with fields it
+  // omits).
+  if (cxxIsCtor) {
+    const auto *ctorDecl = llvm::cast<clang::CXXConstructorDecl>(func);
+    // A member-initializer that reads one of the constructor's OWN
+    // parameters binds the incoming parameter directly — the raw
+    // entry-block argument — rather than the memref cell
+    // `bindOrdinaryParam` spilled it into for the (unrelated) body below;
+    // constructor parameters are always plain scalars (never a cursor or
+    // owner-region pointer parameter), so they sit at a fixed one-to-one
+    // offset from the receiver argument.
+    llvm::DenseMap<const clang::ParmVarDecl *, Value> rawCtorParamArgs;
+    for (auto [index, param] : llvm::enumerate(func->parameters()))
+      rawCtorParamArgs[param] = entryBlock->getArgument(1 + index);
+    for (const clang::CXXCtorInitializer *init : ctorDecl->inits()) {
+      if (!init->isMemberInitializer())
+        return emitError(loc)
+               << "unsupported: non-member constructor initializer";
+      const clang::FieldDecl *field = init->getMember();
+      Location initLoc = translateLoc(init->getSourceLocation());
+      Value selfPlace =
+          builder
+              .create<emitrust::DerefOp>(
+                  initLoc, emitrust::LValueType::get(cxxOwnerStructType),
+                  currentCxxThisRef)
+              .getResult();
+      FailureOr<Type> fieldType =
+          mapType(flattenedFieldStorage(field)->getType(), initLoc);
+      if (failed(fieldType))
+        return failure();
+      Value fieldPlace = builder
+                             .create<emitrust::MemberOp>(
+                                 initLoc, emitrust::LValueType::get(*fieldType),
+                                 selfPlace,
+                                 builder.getStringAttr(flattenedFieldName(field)))
+                             .getResult();
+      const clang::Expr *initExpr = init->getInit()->IgnoreParenImpCasts();
+      Value rawParamArg;
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(initExpr))
+        if (const auto *param =
+                llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()))
+          rawParamArg = rawCtorParamArgs.lookup(param);
+      FailureOr<Value> initValue =
+          rawParamArg ? FailureOr<Value>(rawParamArg)
+                      : emitRValue(init->getInit());
+      if (failed(initValue))
+        return failure();
+      if ((*initValue).getType() != *fieldType)
+        return emitError(initLoc)
+               << "unsupported: constructor initializer type mismatch";
+      builder.create<emitrust::AssignOp>(initLoc, fieldPlace, *initValue);
+    }
   }
 
   if (failed(emitStmt(func->getBody())))
@@ -649,6 +827,7 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
   currentMethodOwner = nullptr;
+  currentCxxThisRef = Value();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
   currentErasedReturnBase = nullptr;
   currentFuncName = clone.name;

@@ -1529,6 +1529,55 @@ private:
   /// untouched.
   LogicalResult importFunction(const clang::FunctionDecl *func);
 
+  /// W2.2: imports every user-declared, non-virtual, non-deleted method of
+  /// `record` — plain methods, const methods, static methods, and
+  /// non-delegating, non-copy/move constructors — onto the
+  /// `emitrust.impl`/`emitrust.method_of` surface via `importFunction`.
+  /// Implicitly-defined special members (default ctor/dtor/copy/move the
+  /// class did not declare) are skipped. A destructor, virtual method, or
+  /// overloaded operator is rejected earlier, in `collectRecordFields`
+  /// (before any field — or method — of the class imports), so none of
+  /// those three shapes ever reaches this walk.
+  LogicalResult importCXXMethods(const clang::CXXRecordDecl *record);
+
+  /// W2.2: the per-(class, overload-signature) mangled `func.func`/
+  /// `emitrust.impl` symbol name for `method`:
+  /// `<StructName>_<methodBaseName>[_<overloadSuffix>]`. `<StructName>` is
+  /// the class's already-assigned emitrust struct name (`assignedStructNames`,
+  /// set by `structSymbolName` before any of its methods import).
+  /// `<methodBaseName>` is `"new"` for a constructor (whose
+  /// `DeclarationName` has no ordinary identifier spelling) or the method's
+  /// C++ name mangled through `mangleMemberName`, exactly like a struct
+  /// field. `<overloadSuffix>` is present only when the class declares more
+  /// than one method (or constructor) sharing the same base name: it is the
+  /// declaration-order concatenation of each parameter's overload type code
+  /// (`cxxOverloadParamCode`) — empty for a zero-parameter member of an
+  /// overload set, which then keeps the bare `<StructName>_<methodBaseName>`
+  /// spelling. This is the SAME name used for the imported `func.func`
+  /// symbol, every `method_call`/`call_opaque` call-site reference to it,
+  /// and constructor lookup, so all three always agree by construction
+  /// (deliberately decoupled from `mlirFuncName`'s per-TU static-storage-
+  /// class tag, which C++ methods must never pick up: a method and a C
+  /// file-static function share `clang::SC_Static` for unrelated reasons).
+  std::string cxxMethodMangledName(const clang::CXXMethodDecl *method) const;
+
+  /// W2.2: imports a `CXXMemberCallExpr` (`obj.method(args)` /
+  /// `obj->method(args)`) as an `emitrust.method_call` on the (possibly
+  /// const) receiver place, mirroring the Phase-4 method-call lowering
+  /// (`emitMethodCallSite`) but for a genuine object expression rather than
+  /// a promoted owner place.
+  FailureOr<Value> emitCXXMemberCall(const clang::CXXMemberCallExpr *call);
+
+  /// W2.2: lowers `place`'s initialization from a non-trivial
+  /// `CXXConstructExpr` by invoking the matching constructor method
+  /// (imported as an ordinary `&mut self` method by `importCXXMethods`,
+  /// named via `cxxMethodMangledName`) on `&mut place`, discarding its
+  /// (void) result. `place` is already default-constructed (an
+  /// `emitrust.variable` of the struct type) by the caller.
+  LogicalResult emitCXXConstructInit(Value place,
+                                     const clang::CXXConstructExpr *construct,
+                                     Location loc);
+
   /// CTS 00204 Pass A: plans the per-call-site monomorphization of every
   /// variadic definition whose body uses va_list. Scope checks reject
   /// va_copy, a va_list object escaping its definition (passed to any
@@ -3556,6 +3605,14 @@ private:
   /// The owner base variable of the method currently being imported; null
   /// when the current function is not a method.
   const clang::VarDecl *currentMethodOwner = nullptr;
+  /// W2.2: the raw entry-block receiver argument (an
+  /// `!emitrust.mut_ref<!emitrust.struct<...>>` or
+  /// `!emitrust.ref<!emitrust.struct<...>>`) while importing a genuine C++
+  /// non-static member function body; null otherwise. `CXXThisExpr`
+  /// resolves directly to this value (undereferenced), which lets the
+  /// existing `->`-base rvalue path in `emitMemberBasePlace` deref it like
+  /// any other pointer-typed base.
+  Value currentCxxThisRef;
   /// Struct definitions already imported (keyed on the defining decl).
   llvm::SmallPtrSet<const clang::RecordDecl *, 8> importedRecords;
   /// Enum definitions already imported (keyed on the defining decl).

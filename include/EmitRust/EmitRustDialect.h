@@ -36,6 +36,15 @@ inline constexpr llvm::StringLiteral kMethodOfAttrName = "emitrust.method_of";
 inline constexpr llvm::StringLiteral kMethodCallAttrName =
     "emitrust.method_call";
 
+/// W2.2: name of the discardable `func.func`/`emitrust.func` unit attribute
+/// marking a method-of-tagged function that takes NO receiver (a
+/// static/associated function, e.g. a C++ `static` member function).
+/// `emitrust.impl`'s verifier skips the receiver-shape check on a so-marked
+/// function, and the Rust emitter renders its full parameter list instead of
+/// consuming argument 0 as `self`.
+inline constexpr llvm::StringLiteral kStaticMethodAttrName =
+    "emitrust.static_method";
+
 } // namespace emitrust
 } // namespace mlir
 

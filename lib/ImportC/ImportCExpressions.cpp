@@ -118,6 +118,17 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   // equivalent C `_Bool` literal would.
   if (const auto *boolLiteral = llvm::dyn_cast<clang::CXXBoolLiteralExpr>(e))
     return createBoolConstant(loc, boolLiteral->getValue());
+  // W2.2: `this` resolves to the raw (undereferenced) receiver argument;
+  // every consumer (the `->`-base rvalue path in `emitMemberBasePlace`, in
+  // particular) already handles a ref/mut_ref-typed value generically by
+  // deref'ing it at the point of use, exactly like any other pointer-typed
+  // base expression.
+  if (llvm::isa<clang::CXXThisExpr>(e)) {
+    if (!currentCxxThisRef)
+      return emitError(loc)
+             << "unsupported: 'this' outside a non-static member function";
+    return currentCxxThisRef;
+  }
   if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
     return emitCast(cast);
   if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e))
@@ -1664,6 +1675,13 @@ CImporter::emitSizeofAlignof(const clang::UnaryExprOrTypeTraitExpr *expr) {
 
 FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
+  // W2.2: a genuine C++ instance-method call (`obj.method(args)` or
+  // `obj->method(args)`) lowers to `emitrust.method_call` on the (possibly
+  // const) receiver place — intercepted before the ordinary free-function
+  // dispatch below, which a `CXXMemberCallExpr` (itself a `CallExpr`) would
+  // otherwise reach.
+  if (const auto *memberCall = llvm::dyn_cast<clang::CXXMemberCallExpr>(call))
+    return emitCXXMemberCall(memberCall);
   const clang::FunctionDecl *callee = call->getDirectCallee();
   if (!callee)
     return emitIndirectCall(call);
@@ -1839,7 +1857,16 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       return emitHostedMathCall(call, *rustCallee);
   }
 
-  std::string name = vaClone ? vaClone->name : mlirFuncName(callee);
+  // W2.2: the only `CXXMethodDecl` an ordinary (non-member) `CallExpr` ever
+  // names is a static method reached through its qualified call
+  // (`Counter::origin()`) — every non-static method call is a
+  // `CXXMemberCallExpr`, intercepted above before reaching this dispatch.
+  // Its symbol was mangled at import time via `cxxMethodMangledName`,
+  // decoupled from `mlirFuncName`'s per-TU static-storage-class tag.
+  const auto *staticMethod = llvm::dyn_cast<clang::CXXMethodDecl>(callee);
+  std::string name = staticMethod ? cxxMethodMangledName(staticMethod)
+                     : vaClone     ? vaClone->name
+                                   : mlirFuncName(callee);
   func::FuncOp target = functions.lookup(name);
   if (!target) {
     if (isSystemHeaderDecl(callee))
@@ -2013,6 +2040,35 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     if (value.getType() != targetType.getInput(index))
       return emitError(loc) << "unsupported: call argument type mismatch";
 
+  // W2.2: a static method has no receiver to dispatch through, so it never
+  // goes through `emitrust.method_call`; but it also is NOT a free
+  // function at the top level of the emitted crate — it lives inside
+  // `impl Struct { ... }` (placed there by its `method_of` tag) and is
+  // therefore only reachable through its qualified path `Struct::name`.
+  // The plain-symbol call this generic path would otherwise build (the
+  // target's mangled name alone, e.g. "Counter_origin") is unresolvable at
+  // that call site once the target is materialized inside the impl block,
+  // so the call is instead emitted directly as `emitrust.call_opaque` with
+  // the qualified name — reusing the already-mangled MLIR symbol on BOTH
+  // sides of the `::` (the RED-pinned scheme), so the qualified string is
+  // always self-consistent with whatever the Rust emitter later prints for
+  // that same function inside its `impl` block.
+  if (staticMethod) {
+    llvm::StringRef structName =
+        assignedStructNames.lookup(staticMethod->getParent());
+    if (structName.empty()) // Defensive; the class was already imported.
+      return emitError(loc)
+             << "unsupported: static call on an unimported class";
+    std::string qualified =
+        (llvm::Twine(structName) + "::" + target.getName()).str();
+    auto opaqueCall = builder.create<emitrust::CallOpaqueOp>(
+        loc, targetType.getResults(), builder.getStringAttr(qualified),
+        ArrayAttr(), arguments);
+    if (opaqueCall->getNumResults() == 0)
+      return Value();
+    return opaqueCall->getResult(0);
+  }
+
   auto callOp = builder.create<func::CallOp>(loc, target, arguments);
   // CTS-BR (00216): staged byte-region-global slice arguments store their
   // (possibly mutated) images back immediately after the call — the
@@ -2039,6 +2095,61 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       return Value();
     return loadPlace(loc, cellResultStaging);
   }
+  if (callOp->getNumResults() == 0)
+    return Value();
+  return callOp->getResult(0);
+}
+
+FailureOr<Value>
+CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  const clang::CXXMethodDecl *method = call->getMethodDecl();
+  if (!method || method->isVirtual())
+    return emitError(loc) << "unsupported: virtual or unresolved member call";
+  std::string name = cxxMethodMangledName(method);
+  func::FuncOp target = functions.lookup(name);
+  if (!target)
+    return emitError(loc) << "unsupported: call to unimported method '"
+                          << name << "'";
+  FunctionType targetType = target.getFunctionType();
+  if (call->getNumArgs() + 1 != targetType.getNumInputs())
+    return emitError(loc) << "unsupported: call argument count mismatch";
+
+  // The implicit object argument may be wrapped in an implicit
+  // qualification-adjustment cast (e.g. adding `const` to bind a non-const
+  // object to a const method's implicit `const Counter&` parameter); the
+  // place-yielding expression underneath is unaffected by qualifiers.
+  FailureOr<Value> receiver = emitLValue(
+      call->getImplicitObjectArgument()->IgnoreParenImpCasts());
+  if (failed(receiver))
+    return failure();
+  auto receiverLValueType =
+      llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+  if (!receiverLValueType ||
+      !llvm::isa<emitrust::StructType>(receiverLValueType.getValueType()))
+    return emitError(loc)
+           << "unsupported: member call receiver is not a struct place";
+
+  Value addrOf = builder
+                     .create<emitrust::AddrOfOp>(loc, targetType.getInput(0),
+                                                 *receiver,
+                                                 /*is_mut=*/!method->isConst())
+                     .getResult();
+
+  SmallVector<Value> arguments(targetType.getNumInputs(), Value());
+  arguments[0] = addrOf;
+  for (auto [index, argExpr] : llvm::enumerate(call->arguments())) {
+    FailureOr<Value> value = emitRValue(argExpr);
+    if (failed(value))
+      return failure();
+    arguments[index + 1] = *value;
+  }
+  for (auto [index, value] : llvm::enumerate(arguments))
+    if (value.getType() != targetType.getInput(index))
+      return emitError(loc) << "unsupported: call argument type mismatch";
+
+  auto callOp = builder.create<func::CallOp>(loc, target, arguments);
+  callOp->setAttr(emitrust::kMethodCallAttrName, builder.getUnitAttr());
   if (callOp->getNumResults() == 0)
     return Value();
   return callOp->getResult(0);
@@ -2827,6 +2938,12 @@ Value CImporter::castEnumToI32(Location loc, Value value) {
 
 bool CImporter::isDecomposedPointerExpr(const clang::Expr *expr) const {
   const clang::Expr *e = stripTrivia(expr);
+  // W2.2: `this` is never a decomposed C pointer — it is the method's own
+  // reference-typed receiver, handled by the plain `emitRValue`-then-deref
+  // path exactly like a pointer parameter's reference SSA value (the
+  // DeclRefExpr case immediately below).
+  if (llvm::isa<clang::CXXThisExpr>(e))
+    return false;
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
     if (cast->getCastKind() == clang::CK_LValueToRValue)
       if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(

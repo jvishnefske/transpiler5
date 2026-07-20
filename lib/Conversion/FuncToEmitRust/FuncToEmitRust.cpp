@@ -87,6 +87,11 @@ private:
   /// (a sibling method calling through its own `self`), which renders as
   /// `(*self).method(...)`. Any other first-operand shape is a match
   /// failure, which fails the pass loudly on the leftover `func.call`.
+  /// W2.2: the borrow may be mutable OR shared (`emitrust.addr_of` without
+  /// `mut`) — a call to a const (`&self`) method borrows the receiver
+  /// immutably; `emitrust.method_call` itself is receiver-mutability-
+  /// agnostic (Rust's auto-ref infers `&`/`&mut` from the resolved method's
+  /// own signature), so only this pattern's shape check needs relaxing.
   LogicalResult rewriteMethodCall(func::CallOp callOp, OpAdaptor adaptor,
                                   ArrayRef<Type> resultTypes,
                                   ConversionPatternRewriter &rewriter) const {
@@ -96,10 +101,10 @@ private:
     auto addrOf = adaptor.getOperands()
                       .front()
                       .getDefiningOp<emitrust::AddrOfOp>();
-    if (!addrOf || !addrOf.getIsMut())
+    if (!addrOf)
       return rewriter.notifyMatchFailure(
           callOp,
-          "method call receiver must be produced by emitrust.addr_of mut");
+          "method call receiver must be produced by emitrust.addr_of");
     if (!addrOf->hasOneUse())
       return rewriter.notifyMatchFailure(
           callOp, "method call receiver borrow must have a single use");
