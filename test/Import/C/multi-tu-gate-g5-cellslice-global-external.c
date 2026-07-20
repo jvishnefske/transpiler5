@@ -1,27 +1,34 @@
-// W3.1 multi-TU gate oracle (G5) — predicted failure #5 (external-linkage
-// region APIs): planCellSlices (CTS-P10) requires every global base of a
-// cell-slice class to be internal-linkage unless this TU is the whole
-// program (ImportC.cpp:2387) — another TU's writeback through the same
-// externally visible array could observe or defeat the Cell-coherence
-// invariant cell-slices depend on (design.md's "coherence trap": direct
-// global reads and Cell get/set must hit the same storage). `region` here
-// is a realistic exported region-API shape (a global buffer plus an
-// externally visible function operating on it, called from `main` in
-// this TU AND from the companion TU) — exactly CTS-P6/CTS-P10's target
-// shape, but with external linkage on both the array and the function.
+// W3.3 multi-TU gate oracle (G5 — FLIPPED to cell-slice): planCellSlices
+// (CTS-P10) used to require every global base of a cell-slice class to be
+// internal-linkage unless this TU was the whole program
+// (ImportCPlanning.cpp). `region` here is a realistic exported region-API
+// shape (a global buffer plus an externally visible function operating on
+// it, called from `main` in this TU AND from the companion TU on the SAME
+// external `region`). Like G4 (and unlike G3's owners), this was a real
+// correctness-visible rejection: `region_fill(region, 8)` hit the
+// pre-CTS-P10 "passing a pointer into a global variable to a function"
+// rejection.
 //
-// Like G4 (and unlike G3's owners), this is a real correctness-visible
-// rejection, not a silent optimization loss: without a cell-slice class,
-// `region_fill(region, 8)` hits the pre-CTS-P10 "passing a pointer into a
-// global variable to a function" rejection.
+// W3.3 G5 lifts it with the W3.2 whole-program cell-slice merge: the ONE
+// external global `region` backs `region_fill`'s parameter across the
+// whole project (a single external base — no multi-base divergence), so
+// both become cell-slices. The two-different-external-globals
+// counterexample stays rejected: see
+// multi-tu-gate-g5-cellslice-global-negative.c.
 //
-// W3.2 will flip the `not` RUN line below to `emitrust-import-c ... |
-// FileCheck` (asserting `!emitrust.ref<!emitrust.cell_slice<i32>>` and
-// `emitrust.global_cells @region`) once planCellSlices' global-base
-// internal-linkage check is relaxed by a whole-program merge.
+// ORDERING LIMITATION (sound): the cell-slice promotion needs the callee's
+// cell-slice SIGNATURE established when a call site is emitted, which today
+// happens where the DEFINITION is imported. Main-first (definition before
+// the companion's external call) promotes; companion-first — the external
+// call ahead of the definition — conservatively falls back to the
+// historical rejection (a missed optimization, never a miscompile; the
+// REVERSED line pins it). Order-independent cell-slice signatures are a
+// documented follow-up (design.md).
 //
-// RUN: not emitrust-import-c %s %S/Inputs/multi-tu-gate-g5-cellslice-global-external-other.c 2>&1 | FileCheck %s --check-prefix=FIRST
-// RUN: not emitrust-import-c %S/Inputs/multi-tu-gate-g5-cellslice-global-external-other.c %s 2>&1 | FileCheck %s --check-prefix=SECOND
+// RUN: emitrust-import-c %s %S/Inputs/multi-tu-gate-g5-cellslice-global-external-other.c | FileCheck %s
+// RUN: not emitrust-import-c %S/Inputs/multi-tu-gate-g5-cellslice-global-external-other.c %s 2>&1 | FileCheck %s --check-prefix=REVERSED
+
+// REVERSED: multi-tu-gate-g5-cellslice-global-external-other.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: passing a pointer into a global variable to a function
 
 int region[8];
 
@@ -36,7 +43,11 @@ int main(void) {
   return region[3];
 }
 
-// Whichever TU is imported first hits its own call site's rejection
-// first; each order pins a different located diagnostic.
-// FIRST: multi-tu-gate-g5-cellslice-global-external.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: passing a pointer into a global variable to a function
-// SECOND: multi-tu-gate-g5-cellslice-global-external-other.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: passing a pointer into a global variable to a function
+// `region` stays one shared global; `region_fill` takes a generic
+// cell-slice and writes through it; every call site (both TUs) binds
+// `region` via a global_cells region.
+// CHECK-DAG: emitrust.global @region : !emitrust.array<8xi32>
+// CHECK: func.func @region_fill(%{{.*}}: !emitrust.ref<!emitrust.cell_slice<i32>>, %{{.*}}: i32)
+// CHECK: emitrust.cell_set %{{.*}} : (!emitrust.ref<!emitrust.cell_slice<i32>>, i64, i32) -> ()
+// CHECK: emitrust.global_cells @region {
+// CHECK: func.call @region_fill(%{{.*}}, %{{.*}}) : (!emitrust.ref<!emitrust.cell_slice<i32>>, i32) -> ()

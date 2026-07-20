@@ -5276,7 +5276,11 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
     importer.collectCrossTuVaListVariadics(ast->getASTContext());
     importer.collectWholeProgramInfo(ast->getASTContext(),
                                      static_cast<unsigned>(index));
+    importer.collectCellSliceCallFacts(ast->getASTContext());
   }
+  // Reduce the accumulated whole-program cell-slice call facts to their final
+  // eligibility sets before any TU's planCellSlices consults them (W3.3).
+  importer.finalizeCellSliceWholeProgram();
   for (auto [index, ast] : llvm::enumerate(asts)) {
     std::string tuTag = ("tu" + llvm::Twine(index) + "_").str();
     if (failed(importer.importTranslationUnit(
