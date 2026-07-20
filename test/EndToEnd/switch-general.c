@@ -2,6 +2,8 @@
 // Differential regression test for the generality fixes beyond the original
 // switch/enum test vectors: negative and sparse case labels (previously the
 // sign-extending scrutinee cast made them silently take the default arm),
+// INT_MIN and large-magnitude negative labels (incl. a negative 64-bit
+// label below INT32_MIN, pinning the in-memory zero-extension path),
 // 64-bit switch with negative case labels, nested switch, enums with
 // negative discriminants, float != (arith.cmpf une), and early-return
 // chains that canonicalize to arith.select. Byte-identical stdout and exit
@@ -18,6 +20,8 @@ enum Temp { Cold = -5, Mild, Hot = 100 };
 
 int sparse(int v) {
   switch (v) {
+  case (-2147483647 - 1):
+    return 7;
   case -2147483647:
     return 1;
   case -7:
@@ -41,6 +45,8 @@ int wide(long v) {
     return 1;
   case 4294967296:
     return 2;
+  case -4294967296:
+    return 3;
   default:
     return 0;
   }
@@ -93,7 +99,7 @@ int describe(enum Temp t) {
 }
 
 int main(void) {
-  int vals[8];
+  int vals[9];
   vals[0] = -2147483647;
   vals[1] = -7;
   vals[2] = -1;
@@ -102,7 +108,8 @@ int main(void) {
   vals[5] = 2147483647;
   vals[6] = 5;
   vals[7] = -100;
-  for (int i = 0; i < 8; ++i) {
+  vals[8] = -2147483647 - 1;
+  for (int i = 0; i < 9; ++i) {
     printf("sparse(%d)=%d\n", vals[i], sparse(vals[i]));
   }
   long wvals[4];

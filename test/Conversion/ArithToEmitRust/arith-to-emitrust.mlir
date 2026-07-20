@@ -89,6 +89,22 @@ func.func @float_binops(%a: f64, %b: f64) -> (f64, f64, f64, f64) {
   return %0, %1, %2, %3 : f64, f64, f64, f64
 }
 
+// C unary minus on a float operand imports as arith.negf; EmitRust has no
+// unary negation op, so it lowers as `0.0 - x` — an emitrust.sub against a
+// zero constant of the operand type — mirroring the integer negation
+// spelling `0 - x` the importer uses for signless integers.
+// CHECK-LABEL: func.func @float_neg
+// CHECK:         %[[Z64:.*]] = emitrust.constant <0.000000e+00 : f64> : f64
+// CHECK:         emitrust.sub %[[Z64]], %arg0 : f64
+// CHECK:         %[[Z32:.*]] = emitrust.constant <0.000000e+00 : f32> : f32
+// CHECK:         emitrust.sub %[[Z32]], %arg1 : f32
+// CHECK-NOT:     arith.negf
+func.func @float_neg(%a: f64, %b: f32) -> (f64, f32) {
+  %0 = arith.negf %a : f64
+  %1 = arith.negf %b : f32
+  return %0, %1 : f64, f32
+}
+
 // CHECK-LABEL: func.func @int_cmps
 // CHECK:         emitrust.cmp eq, %arg0, %arg1 : (i32, i32) -> i1
 // CHECK:         emitrust.cmp ne, %arg0, %arg1 : (i32, i32) -> i1
