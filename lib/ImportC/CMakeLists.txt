@@ -5,6 +5,7 @@
 add_mlir_library(MLIREmitRustImportC
   ImportC.cpp
   ImportCTypes.cpp
+  ImportCAggregates.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/EmitRust
