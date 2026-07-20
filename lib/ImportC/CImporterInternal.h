@@ -154,6 +154,18 @@ struct WholeProgramInfo {
   /// materialized in the DEFINING TU (W3.5), which no single TU's AST can
   /// enumerate; this is that whole-program call-site set.
   llvm::StringMap<llvm::SmallVector<unsigned, 2>> calleeToCallerTus;
+  /// Externally visible function symbol name → the indices of the TUs that
+  /// take its address (any `DeclRefExpr` to it outside a direct-call callee
+  /// position — passed as an argument, assigned to a function pointer, etc.).
+  /// Combined with `calleeToCallerTus`, this is the whole-program "which TUs
+  /// reference this function" view the G3 owner-promotion relaxation reads: an
+  /// externally visible function is safe to promote in a multi-TU project
+  /// exactly when at most ONE TU references it (necessarily its own definer),
+  /// so this TU's `planOwners` then has the sole-TU-equivalent call-site
+  /// visibility the all-or-nothing promotion rule requires. Address-taking
+  /// matters because an indirectly called function could be reached from
+  /// another TU with an argument this TU's analysis never sees.
+  llvm::StringMap<llvm::SmallVector<unsigned, 2>> fnAddressTakenTus;
   /// Externally visible pointer-global symbol name → the set of base-object
   /// symbol names it is bound to across the whole program (from its
   /// file-scope initializer and every `g = &base…` assignment in any body).
@@ -163,6 +175,52 @@ struct WholeProgramInfo {
   /// rejecting (the whole-program analogue of the in-TU multi-object-regions
   /// rejection).
   llvm::StringMap<llvm::StringSet<>> pointerGlobalBases;
+  /// Externally visible pointer-global symbol name → the SOLE project-wide
+  /// binding's base object, canonical `VarDecl*` in its OWN defining TU's
+  /// `ASTContext` (valid for the whole `importCProject` call: every parsed
+  /// AST stays alive until every TU has imported). Populated ONLY for a
+  /// symbol whose `pointerGlobalBases` entry has EXACTLY one base and whose
+  /// binding came from a plain file-scope initializer with no other
+  /// project-wide rebinding evidence (`pointerGlobalHasBodyRebind` is
+  /// false) — the narrow "shared header pointer global" shape W3.2 COMMIT B
+  /// reconstructs cross-TU (deferExternGlobal): the consuming TU eagerly
+  /// re-imports this Decl (idempotent, `importGlobalVar` already tolerates
+  /// re-entry) so `globals`/`pointerGlobals` resolve regardless of which TU
+  /// is processed first, then synthesizes its own cursor global by name.
+  /// Anything else (a synthesized backing, a body-level rebind anywhere, a
+  /// member-rooted or arithmetic-derived base) is left unpopulated here and
+  /// `deferExternGlobal` keeps the historical unconditional rejection.
+  llvm::StringMap<const clang::VarDecl *> pointerGlobalSoleFileScopeBase;
+  /// Externally visible pointer-global symbol name → whether ANY function
+  /// body anywhere in the project reassigns it (`g = &x;`), as opposed to
+  /// only its file-scope initializer. Guards
+  /// `pointerGlobalSoleFileScopeBase`: a dynamically reassigned global
+  /// pointer's cursor is a runtime value with no compile-time offset, so
+  /// such a symbol is never eligible for the static cross-TU
+  /// reconstruction even when every rebinding happens to target the same
+  /// base object.
+  llvm::StringSet<> pointerGlobalHasBodyRebind;
+  /// Externally visible pointer-global symbol name → the flat i64 cursor
+  /// start of its SOLE file-scope binding (meaningful only alongside
+  /// `pointerGlobalSoleFileScopeBase`), computed in the DEFINING TU's own
+  /// `ASTContext` while it was the active pre-scan AST. Zero (and unused)
+  /// for a degenerate whole-object binding, where the pointer needs no
+  /// runtime cursor at all.
+  llvm::StringMap<int64_t> pointerGlobalCursorStart;
+  /// Externally visible global symbol name → its COMPLETE MLIR type,
+  /// resolved from whichever TU defines it with a bounded array type
+  /// (`int a[4] = {...};`), mapped while that TU's `ASTContext` was active.
+  /// Populated ONLY when the type is a bounded array (never overwritten by
+  /// a later TU's incomplete declaration of the same symbol, since the
+  /// pre-pass only records here on a COMPLETE sighting) — the substrate for
+  /// the extern-array composite-merge fix (W3.2 COMMIT B,
+  /// `deferExternGlobal`): C99 6.2.7 lets `extern int a[];` in one TU be
+  /// completed by another TU's sized definition, but each TU parses as an
+  /// independent `clang::ASTUnit` with no cross-TU type composition step of
+  /// its own, so the incomplete declaration's OWN (incomplete) type can
+  /// never be mapped — this whole-program fact, gathered before any TU
+  /// imports, supplies the composite type instead.
+  llvm::StringMap<Type> completeArrayGlobalTypes;
 };
 
 /// The emission-side identity of one pointer-region base: the bound object
