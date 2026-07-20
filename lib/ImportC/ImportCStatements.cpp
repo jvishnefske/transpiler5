@@ -255,7 +255,7 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
       addressTaken.contains(var)) {
     Value place = createVariablePlace(loc, *mlirType);
     symbols[var] = place;
-    if (const clang::Expr *init = var->getInit()) {
+    if (const clang::Expr *init = significantInit(var)) {
       if (isAggregate) {
         // CTS-BR (00216): byte-region locals initialize per byte —
         // folded constants at their layout offsets, embedded region
@@ -304,7 +304,7 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
 
   Value cell = createEntryAlloca(loc, *mlirType);
   symbols[var] = cell;
-  if (const clang::Expr *init = var->getInit()) {
+  if (const clang::Expr *init = significantInit(var)) {
     FailureOr<Value> value = emitRValue(init);
     if (failed(value))
       return failure();

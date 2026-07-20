@@ -47,7 +47,9 @@
 #include "clang/AST/APValue.h"
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
+#include "clang/AST/DeclCXX.h"
 #include "clang/AST/Expr.h"
+#include "clang/AST/ExprCXX.h"
 #include "clang/AST/OperationKinds.h"
 #include "clang/AST/RecordLayout.h"
 #include "clang/AST/Stmt.h"
@@ -1026,6 +1028,19 @@ private:
   /// system headers and keep the eager fail-fast import.
   bool isSystemHeaderDecl(const clang::Decl *decl) const;
 
+  /// Imports every supported declaration directly in `context` — a
+  /// translation unit, a `namespace { ... }` body, or an `extern "C" {
+  /// ... }` body — recursing into a nested `NamespaceDecl` or
+  /// `LinkageSpecDecl` member as if it were declared at this level (W2.0
+  /// C++ AST tolerance). This is the single per-decl dispatch shared by
+  /// the top-level walk and the recursion: a plain C program never
+  /// contains either nested-decl-context kind, so its behavior is
+  /// unchanged. Member functions/fields of a `CXXRecordDecl` are never
+  /// reached this way (they live in the record's own `DeclContext`, never
+  /// a sibling of the record in `context->decls()`), which is exactly how
+  /// W2.0 leaves method import untouched.
+  LogicalResult importDeclsIn(const clang::DeclContext *context);
+
   /// Located rejection for a main-file use of a declaration that
   /// `importTranslationUnit` skipped because it lives in a system header.
   /// `what` describes the use ("call to", "reference to", ...); `name` is
@@ -1474,6 +1489,13 @@ private:
   /// mangle. Runs before any struct type is imported so tag renaming
   /// (`structSymbolName`) is independent of declaration order.
   void collectOrdinaryNames(const clang::TranslationUnitDecl *unit);
+
+  /// Recursive walk `collectOrdinaryNames` delegates to: scans every
+  /// declaration directly in `context`, recursing into a nested
+  /// `NamespaceDecl` or `LinkageSpecDecl` (`extern "C" { ... }`) exactly as
+  /// `importDeclsIn` does for the real import, so the pre-scanned name set
+  /// matches what will actually be emitted (W2.0).
+  void collectOrdinaryNamesFrom(const clang::DeclContext *context);
 
   /// Walks a function body and records the `<function>_<name>` mangled
   /// spelling of every function-local static in `ordinaryTuNames`.
@@ -3242,8 +3264,19 @@ private:
 
   /// Computes the MLIR symbol name of a function: `c_main` for C `main`, the
   /// per-TU-mangled `<tag><name>` for internal-linkage (`static`) functions,
-  /// and the bare C name for external-linkage functions.
+  /// and the bare C name for external-linkage functions. The name is
+  /// additionally namespace-flattened (W2.0, see `namespacePrefix`) when
+  /// `func` is declared inside a C++ `namespace`; `extern "C"` never
+  /// contributes a prefix.
   std::string mlirFuncName(const clang::FunctionDecl *func) const;
+
+  /// Computes the MLIR symbol name of a file-scope variable, mirroring
+  /// `mlirFuncName`: internal linkage gets the per-TU tag, and any
+  /// enclosing C++ namespace chain contributes its flattening prefix
+  /// (W2.0, see `namespacePrefix`). `importGlobalVar` and
+  /// `collectOrdinaryNames`'s pre-scan both call this so the two always
+  /// agree.
+  std::string globalVarSymbolName(const clang::VarDecl *var) const;
 
   /// The clang AST currently being translated (borrowed, read-only). Rebound
   /// by each `importTranslationUnit` call so one importer can span TUs.
@@ -4005,6 +4038,71 @@ static inline llvm::StringRef recordRustName(const clang::RecordDecl *record) {
           record->getTypedefNameForAnonDecl())
     return typedefName->getName();
   return {};
+}
+
+/// W2.0 C++ input tolerance: whether `init` is exactly the implicit,
+/// no-op default-construction C++ wraps a class-typed declaration with
+/// NO explicit initializer in. `struct Point p;` has no initializer
+/// expression at all in C, but in C++ the same declaration's `VarDecl`
+/// carries a `CXXConstructExpr` calling `Point`'s default constructor
+/// (`callinit`) even though nothing changes at runtime — plain data
+/// members are left uninitialized exactly like C. True only when the
+/// constructed class's default constructor is TRIVIAL (C++11
+/// [class.default.ctor]: has no effect) and the call carries no
+/// arguments; a class with a NON-trivial default constructor (one this
+/// wave never imports, since methods are not visited) keeps producing a
+/// real `CXXConstructExpr` here, which is intentionally left for the
+/// generic aggregate-initializer rejection below to catch — silently
+/// skipping real constructor side effects would be a miscompile, not a
+/// merely unsupported construct.
+static inline bool isVacuousDefaultConstruct(const clang::Expr *init) {
+  const auto *construct = llvm::dyn_cast<clang::CXXConstructExpr>(init);
+  if (!construct || construct->getNumArgs() != 0)
+    return false;
+  const clang::CXXConstructorDecl *ctor = construct->getConstructor();
+  return ctor && ctor->getParent()->hasTrivialDefaultConstructor();
+}
+
+/// The initializer expression import should see for `var`: its clang
+/// initializer, or null if `var` has none — INCLUDING the case where
+/// C++ synthesized a vacuous default-construction wrapper a C
+/// declaration would never carry (W2.0, see `isVacuousDefaultConstruct`).
+/// Plain C input is unaffected: `getInit()` is already null there
+/// whenever this returns null.
+static inline const clang::Expr *
+significantInit(const clang::VarDecl *var) {
+  const clang::Expr *init = var->getInit();
+  if (init && isVacuousDefaultConstruct(init))
+    return nullptr;
+  return init;
+}
+
+/// W2.0 C++ input tolerance: the `ns_<name>_`-per-level prefix reflecting
+/// `context`'s enclosing namespace chain, applied to a declaration's
+/// emitted module symbol name (`mlirFuncName`, the global-variable naming
+/// in `importGlobalVar`/`collectOrdinaryNames`) so `ns::foo` never
+/// collides with a top-level `foo`. Built outermost-to-innermost; nested
+/// namespaces compose (`a::b::foo` -> `ns_a_ns_b_foo`). An anonymous
+/// namespace — one synthesized internal-linkage entity per translation
+/// unit, however many `namespace { ... }` blocks reopen it — contributes
+/// the fixed tag `ns_anon_`. `extern "C" { ... }` (`LinkageSpecDecl`) is
+/// transparent: it is not a `NamespaceDecl`, so it is skipped while
+/// walking up and contributes nothing, matching C linkage's unchanged-name
+/// contract. Returns the empty string for plain C input, where no
+/// `NamespaceDecl` ever appears in a `DeclContext` chain.
+static inline std::string namespacePrefix(const clang::DeclContext *context) {
+  llvm::SmallVector<const clang::NamespaceDecl *, 4> chain;
+  for (; context && !context->isTranslationUnit();
+       context = context->getParent())
+    if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(context))
+      chain.push_back(ns);
+  std::string prefix;
+  for (const clang::NamespaceDecl *ns : llvm::reverse(chain)) {
+    prefix += "ns_";
+    prefix += ns->isAnonymousNamespace() ? "anon" : ns->getName().str();
+    prefix += "_";
+  }
+  return prefix;
 }
 
 /// Returns whether the canonical type of `type` is a C pointer type.
