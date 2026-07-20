@@ -2751,6 +2751,121 @@ __emitrust_fmt_float), while `%Ld` (L on an integer conversion) stays
 rejected. No test is sole-blocked on printf forms today (00182.c and,
 since the 00204 wave, 00204.c pass).
 
+## C++ input (subset)
+
+- [x] W2.0 Per-input C++ frontend selection, `namespace`/`extern "C"`
+  AST tolerance, and a `class`-as-`struct` data-only import, opening a
+  narrow C++ INPUT subset without touching member functions (deferred
+  to a later, spike-gated wave). Motivation: `buildCommandLine` hardcoded
+  `-std=c11`, so the clang driver rejected every `.cpp` input outright
+  before any AST visiting could happen; the translation-unit decl loop
+  dispatched only `FunctionDecl`/`RecordDecl`/`EnumDecl`/`TypedefDecl`/
+  `VarDecl` and silently skipped anything else, so `NamespaceDecl` and
+  `LinkageSpecDecl` (`extern "C"`) members never got visited at all; and
+  `collectRecordFields` walked `fields()` only, silently dropping any
+  base class's data — a real data-loss hazard once `CXXRecordDecl`
+  reached `importRecord`.
+  Landed: (1) **Frontend selection** — `buildCommandLine` takes an
+  `isCxx` flag and emits `-x c++ -std=c++17` (dropping `-std=c11`
+  entirely, since clang hard-errors on the two together) for a source
+  whose extension marks it C++ (`.cpp`/`.cc`/`.cxx`/`.C`/`.c++`/`.hpp`,
+  `isCxxSourcePath`); a new `PerFileCompilationDatabase` picks the C or
+  C++ `FixedCompilationDatabase` per input file, so `importCProject`'s
+  multi-file `ClangTool` can compile each input in its own language
+  (mixing them into one linked program stays out of scope). (2) **TU-loop
+  tolerance** — the per-decl dispatch that used to be inline in
+  `importTranslationUnit`'s loop is factored into `importDeclsIn`, which
+  recurses into a nested `NamespaceDecl` or `LinkageSpecDecl` exactly as
+  if its members were declared at the enclosing level (both are
+  `DeclContext`s, so the same function recurses on either); a plain C
+  program never contains either decl kind, so its behavior is
+  unchanged. Namespace membership flattens into the emitted symbol
+  name (`namespacePrefix`: `ns_<name>_` per level, outer-to-inner,
+  composing for nested namespaces; `ns_anon_` for an anonymous
+  namespace); `extern "C"` contributes no prefix (unchanged C linkage
+  name). `mlirFuncName` and the new `globalVarSymbolName` (factored out
+  of `importGlobalVar` so `collectOrdinaryNames`'s pre-scan — itself
+  given the matching recursive walk, `collectOrdinaryNamesFrom` — always
+  agrees) both apply the prefix; call sites and variable reads already
+  resolved symbols by decl identity (a `DenseMap`/`mlirFuncName`
+  recomputation), not by the call's source spelling, so a
+  namespace-qualified call (`shapes::detail::helper(4)`) needed no
+  separate handling. (3) **`class`-as-`struct`** — `importRecord`
+  accepts `isClass()` alongside `isStruct()`/`isUnion()` (the keyword
+  only changes the default member access, which the importer already
+  ignores: it walks `fields()`, which never yields an `AccessSpecDecl`
+  or a `CXXMethodDecl`). `collectRecordFields` rejects a `CXXRecordDecl`
+  with any base class with a located `"unsupported: base classes are not
+  supported"` instead of silently dropping the inherited data. Methods
+  (virtual or not) on a class with no base classes are silently absent
+  from the import rather than rejected — they are never visited at all,
+  since a `CXXRecordDecl`'s methods live in the record's own
+  `DeclContext`, never as siblings of the record in the enclosing scope
+  the TU-loop walk visits. KNOWN GAP, explicitly accepted this wave: a
+  class with virtual methods and no base classes still imports as a
+  plain field-only struct, with no vtable-pointer slot — silently wrong
+  against the real Itanium C++ ABI layout, but harmless for THIS
+  transpiler's own semantics (it never executes a virtual call or
+  compares `sizeof` against a foreign compiler's layout; the whole
+  program is reinterpreted through its own struct definition
+  consistently everywhere). Full method import (including rejecting or
+  supporting virtual dispatch) is W2.2's job. (4) **References** reject
+  with a dedicated `"unsupported: reference types are not yet
+  supported"` in `mapType` (checked as its own case, ahead of the
+  generic tail rejection a `T&`/`T&&` would otherwise fall into) —
+  `mapParamType` already delegates a non-pointer parameter type to
+  `mapType`, so a reference parameter picks this up with no separate
+  change. (5) **Two AST-tolerance fixes the positive test itself
+  surfaced**, both outside the original survey: C++'s `true`/`false`
+  keywords produce a `CXXBoolLiteralExpr` (unlike C's `stdbool.h`
+  macros, which expand to a plain `IntegerLiteral`); `emitRValue` gained
+  a case folding it to the same i1 constant a `_Bool` literal would. And
+  a class/struct-typed local or global declared with NO explicit
+  initializer carries an implicit `CXXConstructExpr` calling the
+  (possibly trivial) default constructor in C++, where C has no
+  initializer expression at all for the same declaration; a new
+  `significantInit(var)` helper strips this wrapper back to "no
+  initializer" ONLY when the constructor is trivial
+  (`CXXRecordDecl::hasTrivialDefaultConstructor()`) and takes no
+  arguments — a class with a genuinely non-trivial default constructor
+  (user-provided, or a non-trivial member) still carries a real
+  `CXXConstructExpr` after this check and correctly falls through to the
+  existing generic aggregate-initializer rejection, since silently
+  skipping real constructor side effects would be a miscompile, not a
+  merely unsupported construct. Every other C++-only construct
+  (templates, virtual dispatch, multiple/virtual inheritance, operator
+  overloading, exceptions, `if`/`switch` init-statements, lambdas, ...)
+  is untouched and falls through to whatever generic rejection already
+  existed (`"unsupported top-level declaration"` for a
+  `FunctionTemplateDecl`, `"unsupported statement: CXXTryStmt"` for
+  `try`/`catch`); pinning those baseline wordings is deliberate so a
+  later wave that DOES implement one of them has a documented starting
+  point instead of discovering the message fresh.
+  Gates: warning-free build; `check-emitrust` 290/290 (287 pre-existing +
+  3 new: `test/Import/Cpp/cpp-basics.cpp`, `cpp-basics-invalid.cpp`,
+  `test/EndToEnd/cpp-basics.cpp`, the last using `clang++` as the native
+  differential leg — `test/lit.cfg.py` gained the `.cpp` suffix so lit
+  discovers them); c-testsuite ledger unchanged at exactly 220/220/0/0;
+  a byte-identical `--emit=rust` snapshot over every pre-existing
+  `test/EndToEnd/*.c` file (the C path is untouched by construction: none
+  of the new code paths — `PerFileCompilationDatabase`'s C branch is the
+  same flags as before, `importDeclsIn`'s recursion is dead code for any
+  decl kind C can produce, `namespacePrefix` is empty whenever no
+  `NamespaceDecl` exists, `significantInit` only ever strips a
+  `CXXConstructExpr` C never produces — can change a C program's
+  import); a 150-seed differential fuzz campaign (seeds 9850-9999,
+  `--range-check`), 150/150 passed, 0 miscompiled, 0 range violations,
+  oracle agreement 150/150 (the fuzz generator has no C++ templates, so
+  this campaign is a pure C-path regression check, not new C++ coverage).
+  OUT of scope for this wave, staying rejected or silently absent
+  (tracked for later waves): member functions/constructors/destructors
+  (W2.2, spike-gated), base classes, references, templates, virtual
+  dispatch and multiple/virtual inheritance, operator overloading,
+  exceptions, lambdas, `if`/`switch` init-statements, and mixing C and
+  C++ inputs into one linked program.
+  (test/Import/Cpp/cpp-basics.cpp, cpp-basics-invalid.cpp;
+  test/EndToEnd/cpp-basics.cpp)
+
 ## Non-Goals for the MVP
 
 Generics, lifetimes beyond simple references, traits and impls, pattern

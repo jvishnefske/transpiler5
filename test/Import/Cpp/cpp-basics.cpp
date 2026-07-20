@@ -80,22 +80,27 @@ int use_pair(void) {
   return p.a;
 }
 
+// Declaration order in the module mirrors source order (types/globals
+// import lazily, at first use, so the two struct_defs land after every
+// function that never touches them and right before `is_positive`, the
+// first one that does). Namespace flattening: `ns_<name>_` per level,
+// outer-to-inner, composed for nested namespaces.
+// CHECK-LABEL: func.func @ns_shapes_square
+
+// CHECK: emitrust.global @ns_shapes_base_area
+
+// CHECK-LABEL: func.func @ns_shapes_ns_detail_helper
+
+// `extern "C"` preserves the plain C name: no namespace prefix, no
+// mangling.
+// CHECK-LABEL: func.func @c_linked_add
+
 // A plain `struct` and a `class` with access specifiers both import as an
 // ordinary field-only struct_def: access specifiers are ignored (the
 // field walk only visits FieldDecl entries) and there are no base
 // classes or methods here to reject or skip.
 // CHECK: emitrust.struct_def @Point ["x", "y"] [i32, i32]
 // CHECK: emitrust.struct_def @Pair ["a", "b"] [i32, i32]
-
-// Namespace flattening: `ns_<name>_` per level, outer-to-inner, composed
-// for nested namespaces.
-// CHECK-LABEL: func.func @ns_shapes_square
-// CHECK-LABEL: func.func @ns_shapes_ns_detail_helper
-// CHECK: emitrust.global @ns_shapes_base_area
-
-// `extern "C"` preserves the plain C name: no namespace prefix, no
-// mangling.
-// CHECK-LABEL: func.func @c_linked_add
 
 // `bool` maps to i1 regardless of language; C++'s `true`/`false`
 // keywords (a distinct CXXBoolLiteralExpr AST node, unlike C's
@@ -105,9 +110,9 @@ int use_pair(void) {
 // CHECK-SAME: -> i1
 // CHECK: arith.cmpi sgt
 // CHECK-LABEL: func.func @always_true
-// CHECK: %[[T:.*]] = arith.constant true
+// CHECK: arith.constant true
 // CHECK-LABEL: func.func @always_false
-// CHECK: %[[F:.*]] = arith.constant false
+// CHECK: arith.constant false
 
 // A call through a namespace-qualified name resolves to the same
 // flattened symbol its definition used.
@@ -119,9 +124,16 @@ int use_pair(void) {
 // CHECK-LABEL: func.func @use_extern_c
 // CHECK: call @c_linked_add
 
+// A local of struct/class type with no explicit initializer is plain
+// uninitialized storage, exactly like C: the field writes below are the
+// only assignments, with no synthesized zero-fill from the implicit C++
+// default constructor (W2.0's `significantInit` strips that vacuous
+// `CXXConstructExpr` before it can be mistaken for a real initializer).
 // CHECK-LABEL: func.func @use_point
+// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Point">>
 // CHECK: emitrust.member %{{.*}}["x"]
 // CHECK: emitrust.member %{{.*}}["y"]
 
 // CHECK-LABEL: func.func @use_pair
+// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Pair">>
 // CHECK: emitrust.member %{{.*}}["a"]

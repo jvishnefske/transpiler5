@@ -8,8 +8,11 @@
 /// \file
 /// CImporter's aggregate-type import: importRecord/collectRecordFields/
 /// collectUnionSlot (struct and union layout, including bit-field and
-/// anonymous-union-arm flattening) and importEnum, plus the small ordinary-
-/// name-collision and struct-symbol-naming helpers they share. Split out of
+/// anonymous-union-arm flattening, a C++ `class`'s data members treated
+/// like a `struct`'s, and a located rejection for base classes, W2.0) and
+/// importEnum, plus the small ordinary-name-collision and
+/// struct-symbol-naming helpers they share (collectOrdinaryNames'
+/// recursive `namespace`/`extern "C"` walk is also W2.0). Split out of
 /// ImportC.cpp by pure code motion (W1.7); see CImporterInternal.h for the
 /// CImporter class declaration this file implements.
 //
@@ -43,9 +46,24 @@ void CImporter::collectStaticLocalNames(const clang::Stmt *stmt,
 void CImporter::collectOrdinaryNames(const clang::TranslationUnitDecl *unit) {
   ordinaryTuNames.clear();
   ordinaryRawTuNames.clear();
-  for (const clang::Decl *decl : unit->decls()) {
+  collectOrdinaryNamesFrom(unit);
+}
+
+void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
+  for (const clang::Decl *decl : context->decls()) {
     if (decl->isImplicit() || isSystemHeaderDecl(decl))
       continue;
+    // W2.0: mirror importDeclsIn's recursion into `namespace`/`extern "C"`
+    // bodies so the pre-scanned name set matches what will actually be
+    // emitted (namespace-flattened function/variable names included).
+    if (const auto *linkageSpec = llvm::dyn_cast<clang::LinkageSpecDecl>(decl)) {
+      collectOrdinaryNamesFrom(linkageSpec);
+      continue;
+    }
+    if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(decl)) {
+      collectOrdinaryNamesFrom(ns);
+      continue;
+    }
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
       std::string funcName = mlirFuncName(func);
       ordinaryTuNames.insert(funcName);
@@ -58,9 +76,7 @@ void CImporter::collectOrdinaryNames(const clang::TranslationUnitDecl *unit) {
       continue;
     }
     if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
-      bool internal = !var->isExternallyVisible();
-      ordinaryTuNames.insert(internal ? currentTuTag + var->getName().str()
-                                      : var->getName().str());
+      ordinaryTuNames.insert(globalVarSymbolName(var));
       ordinaryRawTuNames.insert(var->getName());
     }
   }
@@ -97,7 +113,14 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   if (!definition)
     return success(); // Forward declaration; imported once completed or used.
   Location defLoc = translateLoc(definition->getBeginLoc());
-  if (!definition->isStruct() && !definition->isUnion())
+  // W2.0: a C++ `class` (TTK_Class) imports exactly like a `struct` — the
+  // keyword only changes the DEFAULT member access, which the importer
+  // ignores anyway (it walks `fields()`, skipping AccessSpecDecl entries
+  // and any CXXMethodDecl, since neither is a FieldDecl). Base classes are
+  // rejected separately, in `collectRecordFields`, before any field is
+  // collected.
+  if (!definition->isStruct() && !definition->isUnion() &&
+      !definition->isClass())
     return emitError(defLoc) << "unsupported record declaration";
   // CTS-BR (00216): a byte-region record never emits a struct_def — its
   // objects are plain byte arrays (`mapType` maps the record type
@@ -253,6 +276,20 @@ LogicalResult CImporter::collectRecordFields(
     const clang::RecordDecl *record,
     SmallVectorImpl<llvm::StringRef> &fieldNames,
     SmallVectorImpl<Type> &fieldTypes, unsigned &bitFieldRuns) {
+  // W2.0: a class/struct with base classes is rejected instead of
+  // silently dropping them — importing only the derived class's own
+  // fields would produce a struct with the wrong layout and no
+  // inherited data at all, a data-loss hazard rather than a merely
+  // unsupported construct. Checked before any field is collected, and
+  // ahead of the (unrelated) anonymous-struct-member recursion below, so
+  // every entry point into this function (top-level and recursive) sees
+  // it. A record with no base classes reaches this function whether it
+  // is a C `struct`, a bare C++ `class`, or a `struct`/`class` that
+  // simply lists none, and imports exactly like a C struct either way.
+  if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(record))
+    if (cxxRecord->getNumBases() > 0)
+      return emitError(translateLoc(cxxRecord->bases_begin()->getBeginLoc()))
+             << "unsupported: base classes are not supported";
   // Interns a synthesized or mangled member spelling in the arena so the
   // StringRef stored in the field list (and in `bitFieldAccessInfo`)
   // stays valid for the import's lifetime.

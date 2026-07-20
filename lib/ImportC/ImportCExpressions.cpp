@@ -11,9 +11,11 @@
 /// emitUnaryRValue, emitComparison, emitCondition/emitShortCircuit,
 /// emitStmtExpr, emitCall and the indirect/cursor-param/method call-site
 /// families, emitEnumConstant/emitEnumOperand/castEnumToI32, and the
-/// decomposed/null-pointer-constant classification predicates). Split out
-/// of ImportC.cpp by pure code motion (W1.12); see CImporterInternal.h for
-/// the CImporter class declaration this file implements.
+/// decomposed/null-pointer-constant classification predicates), plus a
+/// CXXBoolLiteralExpr literal case for C++'s `true`/`false` keywords
+/// (W2.0). Split out of ImportC.cpp by pure code motion (W1.12); see
+/// CImporterInternal.h for the CImporter class declaration this file
+/// implements.
 //
 //===----------------------------------------------------------------------===//
 
@@ -110,6 +112,12 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
     return createIntConstant(loc, *type,
                              static_cast<int64_t>(static_cast<int32_t>(raw)));
   }
+  // W2.0: C++'s `true`/`false` are keywords producing a distinct AST node
+  // (CXXBoolLiteralExpr), unlike C's stdbool.h macros (`true`/`false` ->
+  // plain `1`/`0` IntegerLiteral). Maps to the same i1 constant an
+  // equivalent C `_Bool` literal would.
+  if (const auto *boolLiteral = llvm::dyn_cast<clang::CXXBoolLiteralExpr>(e))
+    return createBoolConstant(loc, boolLiteral->getValue());
   if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
     return emitCast(cast);
   if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e))

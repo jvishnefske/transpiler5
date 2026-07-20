@@ -9,7 +9,9 @@
 /// CImporter's function import: mlirFuncName/importFunction, the
 /// bindOrdinaryParam/bindCursorParam parameter-binding family,
 /// emitCursorWritebacks, emitVaClones/emitVaClone/emitVaArg,
-/// importTranslationUnit, and the low-level function-body-plumbing helpers
+/// importTranslationUnit/importDeclsIn (the latter is the recursive
+/// per-decl dispatch shared with `namespace`/`extern "C"` bodies, W2.0),
+/// and the low-level function-body-plumbing helpers
 /// (createEntryAlloca/createBlock/getLabelBlock/createVariablePlace/
 /// isTerminated/createIntConstant/createBoolConstant/
 /// createScalarIntConstant/finalizeFunction). Split out of ImportC.cpp by
@@ -34,7 +36,13 @@ std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
   // The mangled spelling is the symbol's identity everywhere (definition
   // and call sites resolve through this same function); a collision with
   // an existing `match_` is rejected in `importFunction`.
-  std::string base = mangleMemberName(cName);
+  // W2.0: a C++ namespace chain contributes its flattening prefix ahead of
+  // the mangled base name (`namespacePrefix` is empty for plain C input,
+  // where a FunctionDecl's DeclContext is never a NamespaceDecl); `extern
+  // "C"` contributes nothing, preserving C linkage's unchanged-name
+  // contract.
+  std::string base =
+      namespacePrefix(func->getDeclContext()) + mangleMemberName(cName);
   // Internal-linkage (`static`) functions are mangled with the per-TU tag so
   // identically named file-statics in different TUs never collide. The tag is
   // empty for a single-TU import, preserving the historical bare name.
@@ -764,6 +772,73 @@ FailureOr<Value> CImporter::emitVaArg(const clang::VAArgExpr *expr) {
   return loadPlace(loc, result);
 }
 
+LogicalResult CImporter::importDeclsIn(const clang::DeclContext *context) {
+  for (const clang::Decl *decl : context->decls()) {
+    if (decl->isImplicit())
+      continue;
+    // System-header declarations (angle-bracket includes, `-isystem`) are
+    // skipped instead of imported eagerly: real libc headers are full of
+    // constructs outside the supported subset (anonymous structs in
+    // bits/types.h, variadic prototypes, ...), and a program that never
+    // touches them must not be rejected for their sake. A main-file use of
+    // a skipped declaration is rejected at the use site (see
+    // `rejectSystemHeaderUse`); types are still imported on demand through
+    // `mapType`. Project headers included via `-I` are not system headers
+    // and keep the whole-file fail-fast import.
+    if (isSystemHeaderDecl(decl))
+      continue;
+    // W2.0 C++ AST tolerance: `extern "C" { ... }` and `namespace { ... }`
+    // are transparent containers for this dispatch — their nested members
+    // import exactly as if written at this level (namespace members pick
+    // up the flattening prefix through `namespacePrefix`, driven off each
+    // declaration's own `DeclContext` rather than off this recursion, so
+    // it composes automatically for nested namespaces).
+    if (const auto *linkageSpec = llvm::dyn_cast<clang::LinkageSpecDecl>(decl)) {
+      if (failed(importDeclsIn(linkageSpec)))
+        return failure();
+      continue;
+    }
+    if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(decl)) {
+      if (failed(importDeclsIn(ns)))
+        return failure();
+      continue;
+    }
+    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+      if (failed(importFunction(func)))
+        return failure();
+      continue;
+    }
+    if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
+      // An EMPTY struct that no declaration type mentions is skipped: it
+      // may only ever appear as a zero-byte member of a byte-region
+      // aggregate (CTS-BR, 00216), which never materializes the record
+      // type at all. One that IS declared with keeps the eager import.
+      if (const clang::RecordDecl *definition = record->getDefinition();
+          definition && definition->isStruct() && definition->field_empty() &&
+          !declTypeUsedRecords.contains(definition))
+        continue;
+      if (failed(importRecord(record, translateLoc(record->getBeginLoc()))))
+        return failure();
+      continue;
+    }
+    if (const auto *enumDecl = llvm::dyn_cast<clang::EnumDecl>(decl)) {
+      if (failed(importEnum(enumDecl, translateLoc(enumDecl->getBeginLoc()))))
+        return failure();
+      continue;
+    }
+    if (llvm::isa<clang::TypedefDecl>(decl) || llvm::isa<clang::EmptyDecl>(decl))
+      continue;
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
+      if (failed(importGlobalVar(var)))
+        return failure();
+      continue;
+    }
+    return emitError(translateLoc(decl->getBeginLoc()))
+           << "unsupported top-level declaration";
+  }
+  return success();
+}
+
 LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
                                                llvm::StringRef tuTag,
                                                bool deferExtern,
@@ -801,53 +876,8 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // of empty structs.
   planFnPtrMembers(unit);
   collectDeclTypeRecords(unit);
-  for (const clang::Decl *decl : unit->decls()) {
-    if (decl->isImplicit())
-      continue;
-    // System-header declarations (angle-bracket includes, `-isystem`) are
-    // skipped instead of imported eagerly: real libc headers are full of
-    // constructs outside the supported subset (anonymous structs in
-    // bits/types.h, variadic prototypes, ...), and a program that never
-    // touches them must not be rejected for their sake. A main-file use of
-    // a skipped declaration is rejected at the use site (see
-    // `rejectSystemHeaderUse`); types are still imported on demand through
-    // `mapType`. Project headers included via `-I` are not system headers
-    // and keep the whole-file fail-fast import.
-    if (isSystemHeaderDecl(decl))
-      continue;
-    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
-      if (failed(importFunction(func)))
-        return failure();
-      continue;
-    }
-    if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
-      // An EMPTY struct that no declaration type mentions is skipped: it
-      // may only ever appear as a zero-byte member of a byte-region
-      // aggregate (CTS-BR, 00216), which never materializes the record
-      // type at all. One that IS declared with keeps the eager import.
-      if (const clang::RecordDecl *definition = record->getDefinition();
-          definition && definition->isStruct() && definition->field_empty() &&
-          !declTypeUsedRecords.contains(definition))
-        continue;
-      if (failed(importRecord(record, translateLoc(record->getBeginLoc()))))
-        return failure();
-      continue;
-    }
-    if (const auto *enumDecl = llvm::dyn_cast<clang::EnumDecl>(decl)) {
-      if (failed(importEnum(enumDecl, translateLoc(enumDecl->getBeginLoc()))))
-        return failure();
-      continue;
-    }
-    if (llvm::isa<clang::TypedefDecl>(decl) || llvm::isa<clang::EmptyDecl>(decl))
-      continue;
-    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
-      if (failed(importGlobalVar(var)))
-        return failure();
-      continue;
-    }
-    return emitError(translateLoc(decl->getBeginLoc()))
-           << "unsupported top-level declaration";
-  }
+  if (failed(importDeclsIn(unit)))
+    return failure();
   if (needsFloatFormatHelper && !floatFormatHelperEmitted) {
     floatFormatHelperEmitted = true;
     // C-compatible `%f` rendering: `{:.6}` matches C for finite values and

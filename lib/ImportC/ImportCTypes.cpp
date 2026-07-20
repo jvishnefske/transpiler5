@@ -65,6 +65,16 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     return emitError(loc) << "unsupported: volatile-qualified type";
   if (canonical->isAtomicType())
     return emitError(loc) << "unsupported: _Atomic-qualified type";
+  // W2.0: a C++ reference (lvalue `T&` or rvalue `T&&`) has no
+  // representation in this model — checked with a sharpened, dedicated
+  // message ahead of the generic tail rejection so a reference parameter
+  // (the shape `mapParamType` falls through to this function for, since a
+  // reference is not a pointer type) gets a clear diagnostic instead of
+  // the generic "unsupported type '...'" spelling. References themselves
+  // are out of scope for every wave through W2.0; only the located
+  // rejection is pinned.
+  if (canonical->isReferenceType())
+    return emitError(loc) << "unsupported: reference types are not yet supported";
 
   // C99-37: va_list is a PERMANENT rejection — Rust has no stable
   // variadic-argument access, so the target's `__builtin_va_list` (and

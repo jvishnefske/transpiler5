@@ -6,7 +6,8 @@
 //===----------------------------------------------------------------------===//
 //
 /// \file
-/// CImporter's file-scope global import: importGlobalVar/importPointerGlobal/
+/// CImporter's file-scope global import: globalVarSymbolName/
+/// importGlobalVar/importPointerGlobal/
 /// deferExternGlobal/createGlobal, the convertGlobalInit/convertAPValueInit/
 /// convertRecordAPValue/convertAnonymousSlotInit constant-initializer
 /// conversion family, and the global-writeback bookkeeping
@@ -20,6 +21,12 @@
 #include "CImporterInternal.h"
 
 using namespace mlir;
+
+std::string CImporter::globalVarSymbolName(const clang::VarDecl *var) const {
+  bool internal = !var->isExternallyVisible();
+  return (internal ? currentTuTag : std::string()) +
+        namespacePrefix(var->getDeclContext()) + var->getName().str();
+}
 
 LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   Location loc = translateLoc(var->getLocation());
@@ -37,10 +44,10 @@ LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   // Internal-linkage (`static`) globals are mangled with the per-TU tag so
   // identically named file-statics in different TUs stay distinct; external
   // globals keep their bare C name and unify across TUs. The tag is empty for
-  // a single-TU import, preserving the historical bare name.
-  bool internal = !var->isExternallyVisible();
-  std::string symbolName =
-      internal ? currentTuTag + var->getName().str() : var->getName().str();
+  // a single-TU import, preserving the historical bare name. A C++
+  // namespace chain contributes its flattening prefix too (W2.0); see
+  // `globalVarSymbolName`.
+  std::string symbolName = globalVarSymbolName(var);
 
   // C reconciliation of redeclarations: a variable that is only ever
   // `extern`-declared has no storage in this translation unit; a tentative
@@ -448,7 +455,7 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
     // Project import: a second file-scope definition of the same external
     // global. A tentative definition (no initializer) yields to a real one;
     // two real definitions are a duplicate-definition error.
-    bool incomingHasInit = decl->getInit() != nullptr;
+    bool incomingHasInit = significantInit(decl) != nullptr;
     if (!incomingHasInit) {
       globals[key] = GlobalInfo{symbolName.str(), existingGlobal.getType()};
       return success();
@@ -482,7 +489,7 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
     return failure();
 
   Attribute initAttr;
-  if (decl->getInit()) {
+  if (significantInit(decl)) {
     FailureOr<Attribute> converted = convertGlobalInit(decl, *mlirType, loc);
     if (failed(converted))
       return failure();
@@ -492,7 +499,7 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
     // themselves converted to 0 above.
     if (const clang::APValue *value = decl->evaluateValue())
       collectGlobalMemberBindings(key, *value, decl->getType(),
-                                  decl->getInit()->getBeginLoc());
+                                  significantInit(decl)->getBeginLoc());
   }
 
   // A const-qualified global is never written (clang rejects writes), so it
@@ -513,7 +520,7 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
 
 FailureOr<Attribute> CImporter::convertGlobalInit(const clang::VarDecl *decl,
                                                   Type type, Location loc) {
-  const clang::Expr *init = decl->getInit();
+  const clang::Expr *init = significantInit(decl);
   Location initLoc = init ? translateLoc(init->getBeginLoc()) : loc;
   // A file-scope `char s[] = "..."` folds to a plain i8 element list
   // through the APValue path below, but non-ASCII bytes are rejected up
