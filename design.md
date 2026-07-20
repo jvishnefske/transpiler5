@@ -881,14 +881,21 @@ rule.
   imports untouched. Both sides are pinned.
   (test/Import/C/vla-dead-elision-invalid.c rejection,
   vla-dead-elision.c acceptance)
-- [x] C99-17 Flexible array members: documented rejection. A FAM
-  (C99 6.7.2.1p16) gives the struct an allocation-time size the
-  fixed-shape value model cannot represent (00216's first blocker). The
-  importer rejects with the dedicated located diagnostic "unsupported:
-  flexible array member" at the member — previously the shape fell
-  through to the generic "unsupported: non-constant array size" array
-  fallback. (test/Import/C/flexible-array-invalid.c; see also the 00216
-  PERMANENT-OUT disposition below.)
+- [x] C99-17 Flexible array members, AMENDED by CTS-BR (00216): a FAM
+  (C99 6.7.2.1p16, `T tail[];`) is tolerated at the DECLARATION — the
+  record imports with sizeof excluding the FAM, exactly C's sizeof. On
+  a byte-region record a static FAM-tail initializer additionally
+  folds into an EXTENDED byte image past sizeof; on a typed record the
+  field is dropped (a non-empty typed FAM-tail constant stays
+  rejected). GNU zero-length array members (`T r[0];`) get the same
+  zero-size, field-less treatment. What remains rejected, with
+  dedicated located wordings that never degrade to the generic
+  "unsupported: non-constant array size" fallback, is RUNTIME access
+  to the tail: "unsupported: flexible array member access" and
+  "unsupported: zero-length array member access" at the access site.
+  (test/Import/C/flexible-array-invalid.c; positive declaration-side
+  pins in test/Import/C/byte-region-aggregates.c, typedfam and params
+  splits; see the 00216 disposition below.)
 - [x] C99-18 inline functions and the C99 inline linkage rules: a
   semantic no-op for the transpiler — the specifier is accepted and
   ignored, and every inline definition imports as an ordinary function
@@ -1604,7 +1611,12 @@ fwrite/fgetc/fgets/fclose, the C99-48 stdio slice [+00187]). Every one
 of the 3 is a located build-time rejection — never wrong output.
 The 3 remaining are FINAL: 217/220 is this project's ceiling by
 explicit decision (2026-07-18 survey, re-verified against the landed
-T1.1-T1.3 machinery), not by backlog. Per-test dispositions:
+T1.1-T1.3 machinery), not by backlog.
+Additive update, CTS-BR wave (2026-07-20): the 00216 disposition below
+was OVERTURNED by the u8-only byte-region aggregate model — the wave
+took 217 -> 218 [+00216], leaving 2 unsupported (00204, 00209), both
+located build-time rejections; the ceiling revises to 218/220.
+Per-test dispositions:
 - 00204 PERMANENT-OUT: the long-double diagnostic
   ("00204.c:36:28: error: unsupported builtin type 'long double'") is
   only the surface blocker — the fatal construct is a hand-rolled
@@ -1617,15 +1629,56 @@ T1.1-T1.3 machinery), not by backlog. Per-test dispositions:
   import; overturning it would require callsite-prototype inference
   for a test whose main is `{return 0;}` and whose fn-ptr callers are
   never executed — near-zero value, declined.
-- 00216 PERMANENT-OUT: beyond its first blocker (flexible array
-  member, "00216.c:46:12: error: unsupported: flexible array member" —
-  the C99-17 dedicated wording that replaced the generic
-  "non-constant array size" fallback) it
-  requires byte-exact struct layout INCLUDING padding (a print macro
-  walks `(u8*)&x` over sizeof(x)), GCC range designators, and
-  compound literals with relocations — byte-exact ABI layout is
-  antithetical to the project's safe-Rust value model (the same reason
-  bit-field layout is deliberately non-ABI, see C99-45).
+- 00216 LANDED (CTS-BR, the u8-only byte-region aggregate model): the
+  former PERMANENT-OUT reasoning ("byte-exact layout is antithetical
+  to the safe-Rust value model") only holds for aggregates with
+  padding or mixed-width leaves. An aggregate whose scalar leaves are
+  ALL `unsigned char` — u8 members, u8 arrays, nested such structs,
+  u8-only unions including unnamed arms, empty structs contributing
+  zero bytes, GNU zero-length arrays contributing zero, and a flexible
+  array member contributing zero to sizeof — is padding-free BY
+  CONSTRUCTION, so its object representation is exactly its value
+  representation and safe Rust can model it byte-exactly.
+  Classification: such a record is a BYTE REGION; a union arm with
+  non-u8 leaves is tolerated type-level only as a constant array whose
+  size equals the union's (the in6_addr u16[8]-over-u8[16] alias);
+  mixed-size non-u8 arms keep the "unsupported: union ..." rejection;
+  any non-u8 leaf keeps the aggregate on the typed struct_def path.
+  Representation: byte-region objects are plain `!emitrust.array
+  <Nxui8>` (N == sizeof; arrays of byte-region records flatten to one
+  n*sizeof region); global initializers fold to complete zero-filled
+  byte images from the APValue against the target layout, with a
+  static FAM-tail initializer folding into an EXTENDED image while
+  sizeof stays FAM-free (gw: 22-byte sizeof, 30-byte image); locals
+  are bare zero-defaulted `emitrust.variable` regions initialized per
+  byte (folded ui8 constants, embedded per-byte region copies for
+  struct-value elements, runtime scalars through their AST casts);
+  member access is `emitrust.subscript` at the member's constant byte
+  offset; `(u8 *)&x` is the region base (a byte view of a NON-u8
+  aggregate rejects at the cast: "unsupported: byte view of an
+  aggregate with non-byte members"); `&x.member` is base + offset;
+  struct copy/assign/init-from-deref are per-byte region copies.
+  Pointers to byte-region records are `!emitrust.slice<ui8>`
+  parameters (shared `&[u8]` for const pointees) riding the slice
+  decomposition with byte-granular cursors; byte-region GLOBALS passed
+  by address stage a whole-image copy, with mutable parameters storing
+  the image back after the call. FAM/zero-length RUNTIME accesses
+  reject per the amended C99-17. The remaining 00216 constructs also
+  landed: GCC range designators arrive pre-expanded in clang's
+  semantic form; fn-ptr TABLES (`T (*t[N])(...)`) import as
+  `array<Nx!emitrust.fn_ptr<...>>` globals with folded Some(target)
+  elements, `t[i]()` is subscript + call_indirect, and a runtime store
+  to a slot rejects ("unsupported: assignment to a function-pointer
+  array element"); a `void *` struct member whose every stored value
+  is the address of one signature's function (the T1.1 holder bound
+  extended to members) retypes to a fn_ptr member, readable under a
+  cast to that signature. Byte-exact layout INCLUDING padding remains
+  out for non-u8 aggregates (the same reason bit-field layout is
+  deliberately non-ABI, see C99-45).
+  (test/Import/C/byte-region-aggregates.c, byte-region-init.c,
+  byte-region-aggregates-invalid.c, fnptr-table.c,
+  fnptr-table-invalid.c, flexible-array-invalid.c,
+  test/EndToEnd/byte-region-walk.c differential; ledger +00216.)
 This checklist partitions the original 70 by sole blocker: each item lists the
 exact tests it unlocks, so the sum of all items is exactly 70. Same
 checkbox discipline as above — tick only when the referenced tests pass
@@ -2279,10 +2332,12 @@ observed when C99-33 + C99-47 together unlocked 00215).
   record, struct_def permits empty field arrays, and the emitter prints
   `struct T {}` (declaration/copy/default via the usual derives;
   test/Import/C/structs-empty.c, Dialect ops.mlir, Target memory.mlir).
-  00216.c stays blocked on its next feature — the flexible array member
-  `struct S s[];` rejects with "unsupported: flexible array member"
-  (00216.c:46:12, the C99-17 dedicated wording) — so it remains off the
-  manifest.
+  The eager file-scope emission defers for an empty struct no
+  declaration type mentions (CTS-BR: one that only ever appears as a
+  zero-byte member of a byte-region aggregate never emits a
+  struct_def). 00216.c itself landed via the CTS-BR byte-region wave —
+  the FAM declaration is tolerated per the amended C99-17 and the
+  whole test is on the manifest.
   (00216.c)
 
 ### Statements and expressions (10 tests)
