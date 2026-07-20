@@ -2628,6 +2628,138 @@ void CImporter::collectCrossTuVaListVariadics(clang::ASTContext &context) {
   }
 }
 
+void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
+                                        unsigned tuIndex) {
+  // Pre-scan (W3.2): set the AST context so `mlirFuncName`,
+  // `globalVarSymbolName`, and `isSystemHeaderDecl` resolve against THIS TU
+  // (`importTranslationUnit` sets it again to the same value for its own real
+  // pass over this AST). Only externally visible symbols are recorded, whose
+  // names are tag-free, so no per-TU tag is needed here.
+  astContextPtr = &context;
+  const clang::TranslationUnitDecl *unit = context.getTranslationUnitDecl();
+
+  // The externally visible global object an address expression binds to, as a
+  // module symbol name, or empty: peels a leading address-of and any
+  // element/member selections down to the object root, then requires an
+  // externally visible global. Handles `&g`, `&g[i]`, `&g.m`, and a bare
+  // global lvalue (an array-decay operand). Internal-linkage globals and
+  // locals return empty (they cannot cross a TU boundary).
+  auto addressBoundGlobal = [&](const clang::Expr *expr) -> std::string {
+    const clang::Expr *cur = expr ? expr->IgnoreParenImpCasts() : nullptr;
+    if (const auto *unary = llvm::dyn_cast_or_null<clang::UnaryOperator>(cur))
+      if (unary->getOpcode() == clang::UO_AddrOf)
+        cur = unary->getSubExpr()->IgnoreParenImpCasts();
+    for (;;) {
+      if (const auto *sub =
+              llvm::dyn_cast_or_null<clang::ArraySubscriptExpr>(cur)) {
+        cur = sub->getBase()->IgnoreParenImpCasts();
+        continue;
+      }
+      if (const auto *mem = llvm::dyn_cast_or_null<clang::MemberExpr>(cur)) {
+        cur = mem->getBase()->IgnoreParenImpCasts();
+        continue;
+      }
+      break;
+    }
+    const auto *ref = llvm::dyn_cast_or_null<clang::DeclRefExpr>(cur);
+    if (!ref)
+      return {};
+    const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+    if (!var || !var->hasGlobalStorage() || !var->isExternallyVisible())
+      return {};
+    return globalVarSymbolName(var);
+  };
+
+  // Records a write (assignment, increment) or escape (address-of) of an
+  // externally visible function-pointer global into `fnPtrGlobalsWritten`.
+  auto markFnPtrWrite = [&](const clang::Expr *expr) {
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(expr));
+    if (!ref)
+      return;
+    const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+    if (var && var->hasGlobalStorage() && var->isExternallyVisible() &&
+        var->getType().getCanonicalType()->isFunctionPointerType())
+      wholeProgram.fnPtrGlobalsWritten.insert(globalVarSymbolName(var));
+  };
+
+  // Records a data-pointer global's binding base (`g = &base…`) into
+  // `pointerGlobalBases`, given an assignment's LHS and RHS.
+  auto recordPointerGlobalBinding = [&](const clang::Expr *lhs,
+                                        const clang::Expr *rhs) {
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(lhs));
+    if (!ref)
+      return;
+    const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+    if (!var || !var->hasGlobalStorage() || !var->isExternallyVisible())
+      return;
+    clang::QualType type = var->getType().getCanonicalType();
+    if (!type->isPointerType() || type->isFunctionPointerType())
+      return;
+    std::string base = addressBoundGlobal(rhs);
+    if (!base.empty())
+      wholeProgram.pointerGlobalBases[globalVarSymbolName(var)].insert(base);
+  };
+
+  // One statement/expression subtree: enumerates direct external calls,
+  // explicit address-of of externally visible globals, fn-ptr global
+  // writes/escapes, and data-pointer-global rebindings.
+  auto scan = [&](auto &&self, const clang::Stmt *stmt) -> void {
+    if (!stmt)
+      return;
+    if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt))
+      if (const auto *callee = call->getDirectCallee())
+        if (callee->isExternallyVisible() && !isSystemHeaderDecl(callee)) {
+          auto &tus = wholeProgram.calleeToCallerTus[mlirFuncName(callee)];
+          if (!llvm::is_contained(tus, tuIndex))
+            tus.push_back(tuIndex);
+        }
+    if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
+      if (unary->getOpcode() == clang::UO_AddrOf) {
+        std::string taken = addressBoundGlobal(unary);
+        if (!taken.empty())
+          wholeProgram.addressTakenGlobals.insert(taken);
+        markFnPtrWrite(unary->getSubExpr());
+      }
+      if (unary->isIncrementDecrementOp())
+        markFnPtrWrite(unary->getSubExpr());
+    }
+    if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt))
+      if (binary->isAssignmentOp()) {
+        markFnPtrWrite(binary->getLHS());
+        recordPointerGlobalBinding(binary->getLHS(), binary->getRHS());
+      }
+    for (const clang::Stmt *child : stmt->children())
+      self(self, child);
+  };
+
+  for (const clang::Decl *decl : unit->decls()) {
+    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+      continue;
+    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+      if (func->hasBody() && func->getDefinition() == func)
+        scan(scan, func->getBody());
+      continue;
+    }
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
+      // A data-pointer global's file-scope initializer is a binding too
+      // (`int *g = &arr[0];`); the initializer scan below also records the
+      // `&arr` address-taken fact.
+      if (var->hasGlobalStorage() && var->isExternallyVisible()) {
+        clang::QualType type = var->getType().getCanonicalType();
+        if (type->isPointerType() && !type->isFunctionPointerType())
+          if (const clang::Expr *init = var->getAnyInitializer()) {
+            std::string base = addressBoundGlobal(init);
+            if (!base.empty())
+              wholeProgram.pointerGlobalBases[globalVarSymbolName(var)].insert(
+                  base);
+          }
+      }
+      if (const clang::Expr *init = var->getInit())
+        scan(scan, init);
+    }
+  }
+}
+
 LogicalResult
 CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
   // Gather this TU's va_list-using variadic definitions.
@@ -6231,8 +6363,14 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
   // processed first (`importTranslationUnit` below runs the TUs in path
   // order, but the cross-TU call-site check needs the full-project answer
   // from the start).
-  for (const std::unique_ptr<clang::ASTUnit> &ast : asts)
+  // W3.2 rides the same pre-import pass: whole-program facts must also be
+  // complete before the first TU imports, and for the same order-independence
+  // reason (a defining TU may be processed before or after a caller's TU).
+  for (auto [index, ast] : llvm::enumerate(asts)) {
     importer.collectCrossTuVaListVariadics(ast->getASTContext());
+    importer.collectWholeProgramInfo(ast->getASTContext(),
+                                     static_cast<unsigned>(index));
+  }
   for (auto [index, ast] : llvm::enumerate(asts)) {
     std::string tuTag = ("tu" + llvm::Twine(index) + "_").str();
     if (failed(importer.importTranslationUnit(

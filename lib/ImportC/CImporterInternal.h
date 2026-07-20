@@ -115,6 +115,56 @@ struct GlobalInfo {
   Type type;
 };
 
+/// Whole-program facts gathered by a pre-import pass over EVERY translation
+/// unit of a multi-file project (`collectWholeProgramInfo`), BEFORE any TU is
+/// imported. The `planOwners`/`planCellSlices`/`planFnPtrAliases` planners do
+/// ZERO cross-TU merging today — each runs per TU over fresh, `Decl*`-keyed
+/// state — so a project's whole-program view cannot be assembled from their
+/// results: a raw `clang::Decl*` from one TU's `ASTContext` is meaningless in
+/// another (a project's per-file `ClangTool` parses each input as an
+/// independent `ASTUnit`). This structure is therefore keyed by MLIR SYMBOL
+/// NAME, the one identity that bridges the independent contexts — the same
+/// bridge `crossTuVaListVariadicNames` already uses (W3.0).
+///
+/// W3.2 only BUILDS this substrate; nothing consumes it yet, so populating it
+/// must leave every import byte-identical. The multi-TU gate relaxations
+/// (W3.3/W3.4) and cross-TU va_list monomorphization (W3.5) are its intended
+/// consumers, each documented on the field it reads. Every fact concerns only
+/// EXTERNALLY VISIBLE symbols — the sole entities that can cross a TU
+/// boundary — so the symbol names are tag-free (`mlirFuncName` /
+/// `globalVarSymbolName` add the per-TU tag to internal-linkage names only).
+struct WholeProgramInfo {
+  /// Symbol names of externally visible globals whose address is taken (`&g`,
+  /// `&g[i]`, `&g.m`, or an array-to-pointer decay) in ANY TU's function body
+  /// or file-scope initializer. The whole-program analogue of the per-TU
+  /// `addressTaken` set; the intended consumer is G1 (whole-program
+  /// address-taken → pointer-result erasure), which may erase a global's
+  /// pointer result only once it is proven the address is taken nowhere the
+  /// project cannot see.
+  llvm::StringSet<> addressTakenGlobals;
+  /// Symbol names of externally visible function-pointer globals written
+  /// (assigned, incremented/decremented) or escaped (address-of) in ANY TU.
+  /// The whole-program analogue of the per-TU `fnPtrGlobalsWritten`; the
+  /// intended consumer is G7 (a fn-ptr global provably never written across
+  /// the WHOLE program may back a cross-TU dispatch table).
+  llvm::StringSet<> fnPtrGlobalsWritten;
+  /// Cross-TU call enumeration: each externally visible callee's symbol name
+  /// mapped to the indices of the TUs that call it directly. A function
+  /// called from a TU other than its definer needs its variadic clones
+  /// materialized in the DEFINING TU (W3.5), which no single TU's AST can
+  /// enumerate; this is that whole-program call-site set.
+  llvm::StringMap<llvm::SmallVector<unsigned, 2>> calleeToCallerTus;
+  /// Externally visible pointer-global symbol name → the set of base-object
+  /// symbol names it is bound to across the whole program (from its
+  /// file-scope initializer and every `g = &base…` assignment in any body).
+  /// Exactly one base project-wide is the sound single-region shape the G8
+  /// relaxation admits; two or more distinct bases is a divergent cross-TU
+  /// rebinding the single-base cursor model cannot represent and must keep
+  /// rejecting (the whole-program analogue of the in-TU multi-object-regions
+  /// rejection).
+  llvm::StringMap<llvm::StringSet<>> pointerGlobalBases;
+};
+
 /// The emission-side identity of one pointer-region base: the bound object
 /// and, for a `&struct.member` base (CTS-P9), the scalar member the region
 /// roots at. Two bases are the same exactly when both components agree, so
@@ -1008,6 +1058,17 @@ public:
   /// another translation unit in valid C, and `mlirFuncName`'s per-TU tag
   /// would make its recorded name ambiguous across TUs anyway.
   void collectCrossTuVaListVariadics(clang::ASTContext &context);
+
+  /// W3.2: gathers whole-program facts from `context`'s translation unit
+  /// (identified by `tuIndex`, its position in `importCProject`'s path list)
+  /// into `wholeProgram`. Like `collectCrossTuVaListVariadics`, this runs in
+  /// `importCProject`'s pre-import pass over every AST, so `wholeProgram` is
+  /// complete before the first TU imports and reflects the whole project
+  /// regardless of processing order. Records only externally visible symbols
+  /// (the only cross-TU entities); their `mlirFuncName`/`globalVarSymbolName`
+  /// spellings are tag-free, so the pre-scan needs no per-TU tag. Purely
+  /// additive: nothing reads `wholeProgram` yet, so it perturbs no import.
+  void collectWholeProgramInfo(clang::ASTContext &context, unsigned tuIndex);
 
   /// After every translation unit has been imported, checks that no external
   /// symbol was left unresolved: every deferred `extern` global must have a
@@ -3646,6 +3707,11 @@ private:
   /// only when a call's callee has no definition visible in the CURRENT
   /// TU — the same-TU case is already resolved through `vaMonomorphPlans`.
   llvm::StringSet<> crossTuVaListVariadicNames;
+  /// W3.2: whole-program facts, keyed by MLIR symbol name, gathered by
+  /// `collectWholeProgramInfo` over every TU before any import. Empty for a
+  /// single-file import. Nothing consumes it yet (built as staged substrate
+  /// for the multi-TU gate relaxations); see `WholeProgramInfo`.
+  WholeProgramInfo wholeProgram;
   /// Planned string-cursor parameters (CTS 00204): the `const char **`
   /// parameters of definitions whose bodies stay inside the bounded
   /// read-and-advance shape. Keyed by the DEFINITION's parameter decls.
