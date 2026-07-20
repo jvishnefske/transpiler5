@@ -37,12 +37,17 @@ int main(void) {
 // CASTMISMATCH: error: unsupported: function 'add' does not match the function pointer signature
 
 //--- noproto-args.c
+// Callsite-prototype inference (00209 wave) derives (int, int) -> int
+// from the call, so the failure is now the incompatible BINDING of
+// `zero` at the initializer, not the call itself. The blanket
+// no-prototype-call rejection survives for non-decl-traceable callees
+// (pinned in fnptr-noproto-infer-invalid.c's member case).
 int zero(void) { return 0; }
 int main(void) {
   int (*np)() = zero;
   return np(1, 2);
 }
-// NOPROTO: error: unsupported: call with arguments through a function pointer without a prototype
+// NOPROTO: error: unsupported: function 'zero' does not match the function pointer signature
 
 //--- pointer-component.c
 void writer(int *out) { *out = 1; }
