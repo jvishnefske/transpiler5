@@ -2156,6 +2156,36 @@ private:
   /// disqualifies it, keeping the existing pointer-region rejection.
   void collectVoidFnPtrHolders(const clang::Stmt *body);
 
+  /// K&R callsite-prototype inference (FR-29, CTS 00209): walks the
+  /// DEFINITION's body for calls with arguments whose callee, after the
+  /// `(*fp)` deref-peel, is a `DeclRefExpr` to a local-storage
+  /// `ParmVarDecl`/`VarDecl` of pointer-to-`FunctionNoProtoType`, and
+  /// records decl -> `!emitrust.fn_ptr<promoted... -> ret>` in `inferred`
+  /// — the argument types verbatim (clang already applied the default
+  /// argument promotions at the call) plus the declared return type.
+  /// Multiple call sites for one decl must agree on the signature; a
+  /// disagreeing site is a located rejection at that (second) site.
+  /// Zero-argument calls infer nothing (a never-argument-called pointer
+  /// keeps the unrefined zero-parameter mapping), and non-decl callees
+  /// (members, array elements, call results) are skipped — their
+  /// argument-carrying calls keep the existing no-prototype rejection in
+  /// `emitIndirectCall`.
+  LogicalResult inferNoProtoCallSignatures(
+      const clang::FunctionDecl *definition,
+      llvm::DenseMap<const clang::VarDecl *, emitrust::FnPtrType> &inferred);
+
+  /// Emits `expr` destined for a position of type `expected`. When
+  /// `expected` is a `!emitrust.fn_ptr` signature and `expr` is (a cast
+  /// chain over) a direct function reference of prototype-less
+  /// pointer-to-function type, the `Some(target)` constant resolves
+  /// against `expected` — the shape a refined (callsite-inferred, FR-29 /
+  /// CTS 00209) destination requires, and identical to the ordinary
+  /// mapping when the destination is unrefined. A prototype-less null
+  /// pointer constant likewise takes `expected`'s `None`. Every other
+  /// shape (including all prototyped sources) is a plain `emitRValue`.
+  FailureOr<Value> emitPositionedRValue(Type expected,
+                                        const clang::Expr *expr);
+
   /// Emits the admitted holder local `var` (CTS-F, 00210) exactly like a
   /// directly-typed local fn-ptr: an `emitrust.variable` of the target's
   /// `!emitrust.fn_ptr` signature assigned the opaque `Some(target)`
@@ -2862,6 +2892,16 @@ private:
                                                clang::QualType pointerType,
                                                Location loc);
 
+  /// Decl-level overload for an already-known MLIR signature: emits the
+  /// opaque `Some(<symbol>)` constant at exactly `fnPtrType` after the
+  /// `resolveFunctionPointerDecl` signature check. Used by
+  /// `emitPositionedRValue`, where the destination's (possibly
+  /// callsite-inferred, FR-29 / CTS 00209) fn_ptr type — not the source
+  /// expression's spelled C type — is the binding contract.
+  FailureOr<Value>
+  emitFunctionPointerConstant(const clang::FunctionDecl *target,
+                              emitrust::FnPtrType fnPtrType, Location loc);
+
   /// Creates an `emitrust.constant` with an opaque `None` payload of the
   /// given `!emitrust.fn_ptr` type (the C null function pointer).
   Value createFnPtrNone(Location loc, Type fnPtrType);
@@ -3306,6 +3346,17 @@ private:
   /// its cast-calls peel to plain `emitrust.call_indirect`.
   llvm::DenseMap<const clang::VarDecl *, const clang::FunctionDecl *>
       voidFnPtrHolders;
+  /// Per-function callsite-inferred prototypes (FR-29, CTS 00209) for
+  /// prototype-less K&R fn-ptr parameters and locals, keyed by the
+  /// definition's decls; populated by `inferNoProtoCallSignatures` at
+  /// signature-building time and installed here for the body emission.
+  /// An inferred decl declares (parameter and local place alike) at its
+  /// refined `!emitrust.fn_ptr` signature, its argument-carrying calls
+  /// bypass the no-prototype rejection onto the ordinary typed
+  /// `emitrust.call_indirect` path, and bindings of real functions to it
+  /// resolve against the refined signature.
+  llvm::DenseMap<const clang::VarDecl *, emitrust::FnPtrType>
+      inferredFnPtrSigs;
   /// The clang body of the function under import; consulted by dead-VLA
   /// elision (CTS-F, 00207) to decide whether a local is referenced
   /// anywhere in the body.
@@ -5679,8 +5730,12 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
         inputs.push_back(*mapped);
       }
     }
-    // A prototype-less K&R `int (*f)()` maps to the zero-parameter form;
-    // calls with arguments through it are rejected at the call site.
+    // A prototype-less K&R `int (*f)()` maps to the zero-parameter form.
+    // A local-storage decl whose call sites carry arguments is refined to
+    // its callsite-inferred signature at declaration/parameter mapping
+    // (FR-29, CTS 00209) and never consults this default; any remaining
+    // argument-carrying call through an UNREFINED no-proto value is
+    // rejected at the call site.
     SmallVector<Type> results;
     clang::QualType returnType = fnType->getReturnType();
     if (!returnType->isVoidType()) {
@@ -8922,6 +8977,20 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
                           << "' is a Rust keyword";
   std::string name = mlirFuncName(func);
 
+  // K&R callsite-prototype inference (FR-29, CTS 00209): the definition's
+  // body refines argument-called prototype-less fn-ptr decls to their
+  // callsite signatures BEFORE the signature is built, so a prototype
+  // visited ahead of its later definition maps the identical refined
+  // parameter types (the reconciliation below sees no conflict). The
+  // result is staged locally and installed into `inferredFnPtrSigs` only
+  // in the definition's own prologue: a block-scope prototype imported
+  // MID-BODY must not clobber the enclosing function's live map.
+  const clang::FunctionDecl *definition = func->getDefinition();
+  llvm::DenseMap<const clang::VarDecl *, emitrust::FnPtrType> inferredSigs;
+  if (definition && definition->doesThisDeclarationHaveABody() &&
+      failed(inferNoProtoCallSignatures(definition, inferredSigs)))
+    return failure();
+
   // Build the signature. Pointer-parameter kinds derive from the
   // definition's body (Phase 1b); a prototype whose definition appears
   // later in the same TU classifies identically because
@@ -8975,6 +9044,16 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
         inputTypes.push_back(builder.getIntegerType(64));
         continue;
       }
+      // A callsite-inferred prototype-less fn-ptr parameter (FR-29, CTS
+      // 00209) refines to the inferred signature instead of the
+      // zero-parameter no-proto mapping; keyed by the DEFINITION's decl
+      // so a prototype visit maps identically.
+      if (definition && index < definition->getNumParams())
+        if (emitrust::FnPtrType refined =
+                inferredSigs.lookup(definition->getParamDecl(index))) {
+          inputTypes.push_back(refined);
+          continue;
+        }
       FailureOr<Type> paramType =
           mapParamType(param->getType(), translateLoc(param->getLocation()),
                        paramKinds[index]);
@@ -9074,6 +9153,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   loopStack.clear();
   labelBlocks.clear();
   switchCaseBlocks.clear();
+  inferredFnPtrSigs = std::move(inferredSigs);
   currentHasLabels = containsLabelStmt(func->getBody());
   currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
@@ -10274,6 +10354,11 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   FailureOr<Type> mlirType = mapType(type, loc);
   if (failed(mlirType))
     return failure();
+  // A callsite-inferred prototype-less fn-ptr local (FR-29, CTS 00209)
+  // declares at its refined signature instead of the zero-parameter
+  // no-proto mapping; its initializer binds against the refinement below.
+  if (emitrust::FnPtrType refined = inferredFnPtrSigs.lookup(var))
+    mlirType = Type(refined);
 
   bool isAggregate =
       llvm::isa<emitrust::StructType, emitrust::ArrayType>(*mlirType);
@@ -10306,7 +10391,7 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
           return emitError(loc) << "unsupported: aggregate initializer";
         return emitAggregateInitList(place, *mlirType, list, var);
       }
-      FailureOr<Value> value = emitRValue(init);
+      FailureOr<Value> value = emitPositionedRValue(*mlirType, init);
       if (failed(value))
         return failure();
       return storeToPlace(loc, place, *value);
@@ -10419,6 +10504,87 @@ void CImporter::collectVoidFnPtrHolders(const clang::Stmt *body) {
 
   for (const auto &[var, target] : candidates)
     voidFnPtrHolders.try_emplace(var, target);
+}
+
+LogicalResult CImporter::inferNoProtoCallSignatures(
+    const clang::FunctionDecl *definition,
+    llvm::DenseMap<const clang::VarDecl *, emitrust::FnPtrType> &inferred) {
+  auto walk = [&](auto &&self, const clang::Stmt *stmt) -> LogicalResult {
+    if (!stmt)
+      return success();
+    if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
+      const clang::Expr *calleeExpr = call->getCallee()->IgnoreParens();
+      // `(*fp)(...)`: the decay/deref pair cancels out (see
+      // emitIndirectCall).
+      if (const auto *decay =
+              llvm::dyn_cast<clang::ImplicitCastExpr>(calleeExpr))
+        if (decay->getCastKind() == clang::CK_FunctionToPointerDecay) {
+          const auto *deref = llvm::dyn_cast<clang::UnaryOperator>(
+              decay->getSubExpr()->IgnoreParens());
+          if (deref && deref->getOpcode() == clang::UO_Deref &&
+              isFunctionPointer(deref->getSubExpr()->getType()))
+            calleeExpr = deref->getSubExpr()->IgnoreParens();
+        }
+      const clang::FunctionNoProtoType *noProto = nullptr;
+      const clang::VarDecl *var = nullptr;
+      if (call->getNumArgs() > 0 && isFunctionPointer(calleeExpr->getType())) {
+        noProto = llvm::dyn_cast<clang::FunctionNoProtoType>(
+            calleeExpr->getType()
+                .getCanonicalType()
+                ->getPointeeType()
+                .getTypePtr());
+        const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+            calleeExpr->IgnoreParenImpCasts());
+        const auto *decl =
+            ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+        // Only local-storage decls (parameters and locals): a refined
+        // type is a per-function fact, and a global's module-level type
+        // must not depend on one body's call sites.
+        if (decl && decl->hasLocalStorage())
+          var = decl;
+      }
+      if (noProto && var) {
+        Location loc = translateLoc(call->getBeginLoc());
+        // Clang already applied the default argument promotions to the
+        // arguments of a call through a no-proto type (C11 6.5.2.2p6),
+        // so the promoted argument types are used verbatim.
+        SmallVector<Type> inputs;
+        for (const clang::Expr *argument : call->arguments()) {
+          FailureOr<Type> mapped = mapType(argument->getType(), loc);
+          if (failed(mapped))
+            return failure();
+          if (!emitrust::FnPtrType::isValidComponentType(*mapped))
+            return emitError(loc)
+                   << "unsupported: function pointer parameter type";
+          inputs.push_back(*mapped);
+        }
+        SmallVector<Type> results;
+        clang::QualType returnType = noProto->getReturnType();
+        if (!returnType->isVoidType()) {
+          FailureOr<Type> mapped = mapType(returnType, loc);
+          if (failed(mapped))
+            return failure();
+          if (!emitrust::FnPtrType::isValidComponentType(*mapped))
+            return emitError(loc)
+                   << "unsupported: function pointer result type";
+          results.push_back(*mapped);
+        }
+        auto signature =
+            emitrust::FnPtrType::get(builder.getContext(), inputs, results);
+        auto [existing, isNew] = inferred.try_emplace(var, signature);
+        if (!isNew && existing->second != signature)
+          return emitError(loc)
+                 << "unsupported: conflicting inferred prototypes for "
+                    "function pointer '"
+                 << var->getName() << "'";
+      }
+    }
+    for (const clang::Stmt *child : stmt->children())
+      if (failed(self(self, child)))
+        return failure();
+    return success();
+  };
+  return walk(walk, definition->getBody());
 }
 
 LogicalResult CImporter::emitFnHolderLocal(const clang::VarDecl *var,
@@ -12079,7 +12245,15 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
   FailureOr<Value> place = emitLValue(op->getLHS(), &writeback);
   if (failed(place))
     return failure();
-  FailureOr<Value> value = emitRValue(op->getRHS());
+  // The destination's value type positions the right-hand side: a
+  // refined (callsite-inferred, FR-29 / CTS 00209) fn-ptr place rebinds
+  // function references against its refined signature; every other
+  // destination takes the ordinary rvalue path unchanged.
+  Type assignedType;
+  if (auto lvalueType =
+          llvm::dyn_cast<emitrust::LValueType>((*place).getType()))
+    assignedType = lvalueType.getValueType();
+  FailureOr<Value> value = emitPositionedRValue(assignedType, op->getRHS());
   if (failed(value))
     return failure();
   // A store through a union pun arm lands the bit-exactly reinterpreted
@@ -15771,7 +15945,10 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       arguments[index] = *carrier;
       continue;
     }
-    FailureOr<Value> value = emitRValue(argument);
+    // Positioned against the callee's input: a refined
+    // (callsite-inferred, FR-29 / CTS 00209) fn-ptr parameter binds a
+    // directly-referenced function at the refined signature.
+    FailureOr<Value> value = emitPositionedRValue(input, argument);
     if (failed(value))
       return failure();
     arguments[index] = *value;
@@ -16151,17 +16328,29 @@ FailureOr<Value> CImporter::emitIndirectCall(const clang::CallExpr *call) {
   if (!isFunctionPointer(calleeExpr->getType()))
     return emitError(loc) << "unsupported: indirect function call";
 
-  // A call through a prototype-less K&R pointer (`int (*f)()`) has no
-  // signature to check its arguments against; the zero-argument form is
-  // the only one that can be verified.
+  // A call with arguments through a prototype-less K&R pointer
+  // (`int (*f)()`): a callee traceable to a callsite-inferred decl
+  // (FR-29, CTS 00209) proceeds on the ordinary typed path below — the
+  // decl's refined fn_ptr value type carries the inferred signature the
+  // arguments are checked against. Any other callee (member, array
+  // element, call result, uninferred decl) has no signature to check its
+  // arguments against; the zero-argument form is the only one that can
+  // be verified.
   const clang::Type *pointee = calleeExpr->getType()
                                    .getCanonicalType()
                                    ->getPointeeType()
                                    .getTypePtr();
-  if (llvm::isa<clang::FunctionNoProtoType>(pointee) && call->getNumArgs() > 0)
-    return emitError(loc)
-           << "unsupported: call with arguments through a function pointer "
-              "without a prototype";
+  if (llvm::isa<clang::FunctionNoProtoType>(pointee) &&
+      call->getNumArgs() > 0) {
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+        calleeExpr->IgnoreParenImpCasts());
+    const auto *var =
+        ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+    if (!var || !inferredFnPtrSigs.contains(var))
+      return emitError(loc)
+             << "unsupported: call with arguments through a function "
+                "pointer without a prototype";
+  }
 
   // A call through a devirtualized alias (CTS-S, 00189) lowers as a
   // DIRECT call to the target: no fn_ptr value and no call_indirect.
@@ -16192,15 +16381,17 @@ FailureOr<Value> CImporter::emitIndirectCall(const clang::CallExpr *call) {
   if (!fnPtrType)
     return emitError(loc) << "unsupported: indirect function call";
 
-  // Argument checking mirrors the direct-call path.
+  // Argument checking mirrors the direct-call path, each argument
+  // positioned against the fn_ptr's input (see emitPositionedRValue).
+  ArrayRef<Type> inputs = fnPtrType.getInputs();
   SmallVector<Value> arguments;
-  for (const clang::Expr *argument : call->arguments()) {
-    FailureOr<Value> value = emitRValue(argument);
+  for (auto [index, argument] : llvm::enumerate(call->arguments())) {
+    FailureOr<Value> value = emitPositionedRValue(
+        index < inputs.size() ? inputs[index] : Type(), argument);
     if (failed(value))
       return failure();
     arguments.push_back(*value);
   }
-  ArrayRef<Type> inputs = fnPtrType.getInputs();
   if (arguments.size() != inputs.size())
     return emitError(loc) << "unsupported: call argument count mismatch";
   for (auto [index, value] : llvm::enumerate(arguments))
@@ -16349,6 +16540,49 @@ CImporter::emitFunctionPointerConstant(const clang::Expr *fnExpr,
       builder.getContext(), (llvm::Twine("Some(") + *name + ")").str());
   return builder.create<emitrust::ConstantOp>(loc, fnPtrType, some)
       .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitFunctionPointerConstant(const clang::FunctionDecl *target,
+                                       emitrust::FnPtrType fnPtrType,
+                                       Location loc) {
+  FailureOr<std::string> name =
+      resolveFunctionPointerDecl(target, fnPtrType, loc);
+  if (failed(name))
+    return failure();
+  auto some = emitrust::OpaqueAttr::get(
+      builder.getContext(), (llvm::Twine("Some(") + *name + ")").str());
+  return builder.create<emitrust::ConstantOp>(loc, fnPtrType, some)
+      .getResult();
+}
+
+FailureOr<Value> CImporter::emitPositionedRValue(Type expected,
+                                                 const clang::Expr *expr) {
+  auto fnPtrType = llvm::dyn_cast_if_present<emitrust::FnPtrType>(expected);
+  if (!fnPtrType)
+    return emitRValue(expr);
+  clang::QualType type = expr->getType().getCanonicalType();
+  if (!isFunctionPointer(type) ||
+      !llvm::isa<clang::FunctionNoProtoType>(
+          type->getPointeeType().getTypePtr()))
+    return emitRValue(expr);
+  // A prototype-less source binding into a known fn_ptr position: a
+  // direct function reference resolves against the position's signature
+  // (the refined type when the destination was callsite-inferred, FR-29 /
+  // CTS 00209; the identical mapping otherwise), and a null constant is
+  // the position's `None`. Anything else — a loaded fn-ptr VALUE keeps
+  // its own (possibly unrefined) type, surfacing any mismatch at the
+  // consuming check.
+  Location loc = translateLoc(expr->getBeginLoc());
+  if (const clang::Expr *fnExpr = returnedFunctionExpr(expr)) {
+    const auto *target = llvm::cast<clang::FunctionDecl>(
+        llvm::cast<clang::DeclRefExpr>(fnExpr)->getDecl());
+    return emitFunctionPointerConstant(target, fnPtrType, loc);
+  }
+  if (expr->isNullPointerConstant(astContext(),
+                                  clang::Expr::NPC_ValueDependentIsNull))
+    return createFnPtrNone(loc, fnPtrType);
+  return emitRValue(expr);
 }
 
 Value CImporter::createFnPtrNone(Location loc, Type fnPtrType) {

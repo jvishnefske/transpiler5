@@ -559,16 +559,26 @@ lists the lit test file(s) that validate it.
   truth tests and ==/!= against NULL or another pointer become
   emitrust.cmp eq/ne against a None constant. Function pointers are
   ordinary values that bypass the Phase-1a pointer decomposition.
+  K&R callsite-prototype inference (CTS 00209): an argument-carrying
+  call whose callee traces (after the `(*fp)` deref-peel) to a
+  local-storage parameter/local of prototype-less pointer type refines
+  that decl to `fn_ptr<promoted... -> ret>` inferred from the call's
+  default-promoted argument types; agreeing sites share the refinement,
+  a disagreeing site is a located conflict rejection, and never-argument-
+  called no-proto decls keep the unrefined zero-parameter mapping.
   Located rejections: variadic targets, signature mismatches (including
-  prototype-less K&R pointers bound to functions with parameters),
-  argument-carrying calls through prototype-less pointers, fn_ptr
+  prototype-less K&R pointers bound to functions incompatible with the
+  inferred or zero-parameter signature),
+  argument-carrying calls through prototype-less values NOT traceable
+  to an inferred decl (members, array elements, call results), fn_ptr
   component types outside the supported set (e.g. data-pointer
   parameters), and arrays of function pointers. The differential test is
   byte-identical to clang and the emitted crate contains no unsafe.
   (test/Import/C/fn-pointers.c, fn-pointers-invalid.c,
+  fnptr-noproto-infer.c, fnptr-noproto-infer-invalid.c,
   test/Target/Rust/fn-pointers.mlir, test/Dialect/EmitRust/types.mlir,
-  ops.mlir, invalid.mlir, test/EndToEnd/fn-pointers.c; c-testsuite
-  00087, 00088, 00124)
+  ops.mlir, invalid.mlir, test/EndToEnd/fn-pointers.c,
+  fnptr-noproto-infer.c; c-testsuite 00087, 00088, 00124, 00209)
 - [x] FR-30 Owner-struct actors: each qualifying pointer ownership region
   becomes a Rust struct owning its array, and the C functions whose
   pointers resolve into that region become &mut self methods on it — the
@@ -975,11 +985,16 @@ rule.
   signature-checked Some(name) constants, indirect calls become
   emitrust.call_indirect with a deterministic panic refining the
   null-call UB, and truth tests and equality compare against None.
-  Variadic pointers, void*/data-pointer components, arrays of function
-  pointers, and argument-carrying calls through prototype-less K&R
-  pointers are located rejections.
+  Variadic pointers, void*/data-pointer components, and arrays of
+  function pointers are located rejections. Argument-carrying calls
+  through prototype-less K&R pointers refine the callee decl via
+  callsite-prototype inference when it traces to a local-storage
+  parameter/local (FR-29, CTS 00209); non-decl-traceable callees keep
+  the located no-prototype rejection.
   (test/Import/C/fn-pointers.c, fn-pointers-invalid.c,
-  test/EndToEnd/fn-pointers.c, test/Target/Rust/fn-pointers.mlir)
+  fnptr-noproto-infer.c, fnptr-noproto-infer-invalid.c,
+  test/EndToEnd/fn-pointers.c, fnptr-noproto-infer.c,
+  test/Target/Rust/fn-pointers.mlir)
 - [x] C99-28 String literals as char-array initializers and as pointer
   values, with the C escape set (beyond the original printf-format-only
   support). Array initializers: `char s[N] = "..."` / `char s[] = "..."`
@@ -1585,8 +1600,8 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-18: 220 total / 217 passed / 0 miscompiled /
-3 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-19: 220 total / 218 passed / 0 miscompiled /
+2 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5/P2/P4/P6 partials, and
 CTS-S1/S2/S4/S6/P1/P5/P7/P8/R1/R2/R4/L1/L2 landed since, and the
 2026-07-18 TDD wave took 200 -> 213: unions as one-slot structs
@@ -1600,24 +1615,54 @@ byte-array union arms, and the local void* fn-ptr holder [+00207
 +00210]; the T1.2 wave took 215 -> 216: C99-45 bit-field accessors
 over backing runs + keyword-member mangling [+00218]; the T1.3 wave
 took 216 -> 217: FILE* as an owned std::fs handle — fopen/fread/
-fwrite/fgetc/fgets/fclose, the C99-48 stdio slice [+00187]). Every one
-of the 3 is a located build-time rejection — never wrong output.
-The 3 remaining are FINAL: 217/220 is this project's ceiling by
-explicit decision (2026-07-18 survey, re-verified against the landed
-T1.1-T1.3 machinery), not by backlog. Per-test dispositions:
-- 00204 PERMANENT-OUT: the long-double diagnostic
+fwrite/fgetc/fgets/fclose, the C99-48 stdio slice [+00187]; the 00209
+wave took 217 -> 218: K&R callsite-prototype inference, FR-29, see the
+00209 disposition below). Every one
+of the 2 still out is a located build-time rejection — never wrong
+output. Both remaining dispositions (00204, 00216) have dedicated
+waves in flight re-examining the 2026-07-18 survey's permanent-out
+calls; the entries below record that survey's reasoning until those
+waves land. Per-test dispositions:
+- 00204 PERMANENT-OUT (wave in flight): the long-double diagnostic
   ("00204.c:36:28: error: unsupported builtin type 'long double'") is
   only the surface blocker — the fatal construct is a hand-rolled
   variadic reading `va_arg(ap, struct s7)` / `va_arg(ap, struct hfa34)`
   (struct-typed varargs / HFA calling convention), fundamentally
   outside the fixed-prototype variadic model and safe-Rust emission.
-- 00209 UPHELD by-design rejection ("00209.c:24:10: error:
-  unsupported: call with arguments through a function pointer without
-  a prototype"): the K&R `int (*)()` call is ABI-unverifiable at
-  import; overturning it would require callsite-prototype inference
-  for a test whose main is `{return 0;}` and whose fn-ptr callers are
-  never executed — near-zero value, declined.
-- 00216 PERMANENT-OUT: beyond its first blocker (flexible array
+- 00209 LANDED (2026-07-19, overturning the earlier upheld rejection):
+  K&R callsite-prototype inference (FR-29). Rule: a call with
+  arguments whose callee, after the `(*fp)` deref-peel, is a
+  `DeclRefExpr` to a local-storage ParmVarDecl/VarDecl of
+  pointer-to-`FunctionNoProtoType` infers that decl's prototype from
+  the call's argument types — clang has already applied the default
+  argument promotions at a no-proto call (C11 6.5.2.2p6), so the
+  promoted types are used verbatim (char -> i32 via `arith.extsi`,
+  float -> f64 via `arith.extf`, the casts the ordinary typed-call
+  conversion emits) — plus the declared return type. The decl then
+  DECLARES at the refined `!emitrust.fn_ptr<promoted... -> ret>`
+  (parameter and local place alike), its argument-carrying calls lower
+  through the ordinary typed `emitrust.call_indirect` path, and
+  binding a real function to it resolves against the refined
+  signature. Multiple call sites for one decl must agree. Located
+  rejections: a second disagreeing site is the NEW
+  "unsupported: conflicting inferred prototypes for function pointer
+  '<name>'" at that site; non-decl-traceable callees (struct members,
+  array elements, call results) RETAIN "unsupported: call with
+  arguments through a function pointer without a prototype"; an
+  incompatible function bound to an inferred decl keeps
+  "unsupported: function '<name>' does not match the function pointer
+  signature" (resolveFunctionPointerDecl exact equality); and an
+  unrefined no-proto VALUE passed into a refined position keeps
+  "unsupported: call argument type mismatch" at the passing call site.
+  A no-proto pointer never called with arguments stays at the
+  unrefined `fn_ptr<() -> T>` mapping — inference is per-decl, not
+  per-typedef (00209's f5 `fptr1` argument is untouched by f1's
+  refinement of the same spelling).
+  (test/Import/C/fnptr-noproto-infer.c, fnptr-noproto-infer-invalid.c,
+  fn-pointers-invalid.c noproto-args; differential
+  test/EndToEnd/fnptr-noproto-infer.c with executed inferred calls;
+  c-testsuite 00209 — ledger 217 -> 218 passed / 0 miscompiled)
+- 00216 PERMANENT-OUT (wave in flight): beyond its first blocker (flexible array
   member, "00216.c:46:12: error: unsupported: flexible array member" —
   the C99-17 dedicated wording that replaced the generic
   "non-constant array size" fallback) it
@@ -1853,11 +1898,11 @@ observed when C99-33 + C99-47 together unlocked 00215).
   thread_local!+Cell interaction dissolved because a cursor is a
   borrow-free Copy integer, so no borrow ever escapes `.with`. C99-14
   now routes pointer-typed file-scope variables through this model
-  (see its entry). Three of the four listed tests pass and are in the
-  manifest; the fourth, 00209, clears its pointer-global blocker here
-  and fails only on a C99-46-scope fn-pointer shape that is UPHELD as
-  a permanent by-design rejection in the disposition list above.
-  (00040.c, 00045.c, 00149.c, 00209.c)
+  (see its entry). Three of the four listed tests passed here first;
+  the fourth, 00209, cleared its pointer-global blocker here and later
+  flipped to PASS when the K&R callsite-prototype inference wave
+  (FR-29, 2026-07-19) landed — see the 00209 disposition above.
+  (00040.c, 00045.c, 00149.c, 00209.c — all PASS)
   (Complete in scope, 3 of 4 passing: a pointer-typed global decomposes against a single
   *global* region base; its cursor is a stored i64 `emitrust.global`
   under the pointer's C name — a cursor is a borrow-free Copy integer,
@@ -1878,14 +1923,13 @@ observed when C99-33 + C99-47 together unlocked 00215).
   literals, null constants, multiple allocation sites, and external
   linkage in a multi-TU project. 00040 and 00045 and 00149 pass and are
   in the manifest — ledger 178 -> 181 passed / 39 unsupported /
-  0 miscompiled. 00209 stays out permanently, no longer on its pointer
-  globals: after the pointer-to-fn-ptr parameter and fn_ptr slice
-  extensions landed here (pointers-fnptr-slice.c), it rejects at
-  "00209.c:24:10: error: unsupported: call with arguments through a
-  function pointer without a prototype" — f1 calls through the K&R
-  `int (*)()` typedef `fptr1`, a documented fn-pointer by-design
-  rejection (C99-46 scope, not CTS-P4) UPHELD in the per-test
-  disposition list above.
+  0 miscompiled. 00209 left CTS-P4 scope here: after the
+  pointer-to-fn-ptr parameter and fn_ptr slice extensions landed
+  (pointers-fnptr-slice.c), its sole remaining blocker was the
+  argument-carrying K&R `int (*)()` call in f1 (C99-46 scope, not
+  CTS-P4), at the time upheld as a by-design rejection and since
+  overturned by the FR-29 callsite-prototype inference wave
+  (2026-07-19) — 00209 now passes; see its disposition above.
   (test/Import/C/globals-pointer.c, globals-pointer-invalid.c,
   pointers-fnptr-slice.c; rustc-level differential
   test/EndToEnd/pointers-global.c with data-dependent cursor updates
@@ -2232,7 +2276,9 @@ observed when C99-33 + C99-47 together unlocked 00215).
   union-bytearray-arm-invalid.c); positive pins in
   test/Import/C/unions.c, union-bytearray-arm.c, fnptr-void-local.c
   (+ -invalid), test/EndToEnd/unions.c, fnptr-void-local.c.
-  Ledger: 217 passed / 3 unsupported / 0 miscompiled of 220.
+  Ledger at this entry's closure (T1.3 era): 217 passed /
+  3 unsupported / 0 miscompiled of 220; superseded — see the ledger
+  header above (218 as of 2026-07-19).
 - [x] CTS-R4 (2) Block-scope struct declarations shadowing an outer tag
   (same tag `T`, different shape, inner scope): the importer's per-name
   shape dedup misreads this as a cross-TU conflict; record keys need
