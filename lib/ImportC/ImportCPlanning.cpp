@@ -568,6 +568,106 @@ CImporter::asPointerParamRead(const clang::Expr *expr) const {
   return nullptr;
 }
 
+void CImporter::collectCellSliceCallFacts(clang::ASTContext &context) {
+  astContextPtr = &context;
+  const clang::TranslationUnitDecl *unit = context.getTranslationUnitDecl();
+  for (const clang::FunctionDecl *caller :
+       collectPassAFunctionDefinitions(unit)) {
+    SmallVector<const clang::CallExpr *> calls;
+    collectCallExprs(caller->getBody(), calls);
+    for (const clang::CallExpr *call : calls) {
+      const clang::FunctionDecl *callee = call->getDirectCallee();
+      // Only externally visible callees need whole-program facts: an
+      // internal-linkage function is only callable within its own TU, so its
+      // per-TU cell-slice analysis already sees all its call sites.
+      if (!callee || callee->isVariadic() || isSystemHeaderDecl(callee) ||
+          !callee->isExternallyVisible())
+        continue;
+      unsigned numParams = callee->getNumParams();
+      for (auto [index, argExpr] : llvm::enumerate(call->arguments())) {
+        if (index >= numParams)
+          break; // A variadic tail (excluded above) has no matching param.
+        const clang::ParmVarDecl *param = callee->getParamDecl(index);
+        if (!isPointerType(param->getType()) ||
+            isFunctionPointer(param->getType()))
+          continue;
+        std::string key = (mlirFuncName(callee) + "#" + llvm::Twine(index)).str();
+        // Ensure the key exists even if its only bindings are internal
+        // globals (so a never-externally-based parameter is still a known,
+        // eligible key).
+        (void)wholeProgram.cellSliceParamExtGlobals[key];
+        // A pointer-to-pointer parameter has no cell-slice representation.
+        if (param->getType()
+                .getCanonicalType()
+                ->getPointeeType()
+                .getCanonicalType()
+                ->isPointerType()) {
+          wholeProgram.cellSliceParamPoisoned.insert(key);
+          continue;
+        }
+        const clang::Expr *arg = argExpr;
+        if (const clang::VarDecl *global = asDecayedGlobalArrayArg(arg)) {
+          // An externally visible global is a shared whole-program base; an
+          // internal one stays per-TU (recorded only implicitly via the key's
+          // existence above), so the generic parameter can back a different
+          // internal global in each TU.
+          if (global->isExternallyVisible())
+            wholeProgram.cellSliceParamExtGlobals[key].insert(
+                globalVarSymbolName(global));
+          continue;
+        }
+        // A directly forwarded pointer parameter (`f(p)`): conservatively
+        // poison — resolving the forwarded parameter's own bases across TUs
+        // is beyond this wave, and this shape has no cross-TU test; poisoning
+        // preserves the historical rejection rather than risk unsoundness.
+        // Everything else (a local-array decay, an interior pointer, an
+        // arbitrary expression) is a Cell-less argument that poisons the key.
+        wholeProgram.cellSliceParamPoisoned.insert(key);
+      }
+    }
+  }
+}
+
+void CImporter::finalizeCellSliceWholeProgram() {
+  // A parameter key is eligible when it is not poisoned and is backed by at
+  // most one externally visible global (the whole-program multi-base guard).
+  // A global is eligible when it appears as a cell-slice base AND every
+  // parameter it binds to is itself clean (non-poisoned, single external
+  // base) — a global reached through any multi-base or poisoned parameter is
+  // contaminated.
+  llvm::StringSet<> contaminatedGlobals;
+  llvm::StringSet<> candidateGlobals;
+  for (const auto &entry : wholeProgram.cellSliceParamExtGlobals) {
+    llvm::StringRef key = entry.first();
+    const llvm::StringSet<> &globals = entry.second;
+    bool clean =
+        !wholeProgram.cellSliceParamPoisoned.contains(key) && globals.size() <= 1;
+    if (clean)
+      wholeProgram.cellSliceEligibleParamKeys.insert(key);
+    for (const auto &g : globals) {
+      if (clean)
+        candidateGlobals.insert(g.first());
+      else
+        contaminatedGlobals.insert(g.first());
+    }
+  }
+  for (const auto &g : candidateGlobals)
+    if (!contaminatedGlobals.contains(g.first()))
+      wholeProgram.cellSliceEligibleGlobals.insert(g.first());
+}
+
+bool CImporter::cellSliceParamEligibleWholeProgram(
+    const clang::FunctionDecl *fn, unsigned paramIndex) const {
+  std::string key =
+      (mlirFuncName(fn) + "#" + llvm::Twine(paramIndex)).str();
+  return wholeProgram.cellSliceEligibleParamKeys.contains(key);
+}
+
+bool CImporter::cellSliceGlobalEligibleWholeProgram(
+    llvm::StringRef symbol) const {
+  return wholeProgram.cellSliceEligibleGlobals.contains(symbol);
+}
+
 void CImporter::planCellSlices(const clang::TranslationUnitDecl *unit,
                                bool soleTranslationUnit) {
   // Union-find over data-pointer parameters and global array bases,
@@ -606,13 +706,18 @@ void CImporter::planCellSlices(const clang::TranslationUnitDecl *unit,
           if (llvm::isa<clang::ParmVarDecl>(binding.base))
             poisoned.insert(binding.base);
 
-    // In a project import an externally visible function may be called
-    // from an unseen TU with a local argument; its class must not turn
-    // its parameters into cell-slices.
+    // In a project import an externally visible function may be called from
+    // an unseen TU with a local argument; its class must not turn its
+    // parameters into cell-slices. W3.3 G4/G5/G6: the whole-program call
+    // facts lift this per-parameter — a parameter whose every project-wide
+    // call argument is a qualifying global (single external base, no local)
+    // is safe. The per-TU checks below (body escape, null-check, type
+    // validity, the global/owner gates) still all fire.
     if (!soleTranslationUnit && func->isExternallyVisible())
-      for (const clang::ParmVarDecl *param : func->parameters())
+      for (auto [index, param] : llvm::enumerate(func->parameters()))
         if (isPointerType(param->getType()) &&
-            !isFunctionPointer(param->getType()))
+            !isFunctionPointer(param->getType()) &&
+            !cellSliceParamEligibleWholeProgram(func, index))
           poisoned.insert(param);
 
     // Call edges: exactly two argument shapes bind into the class — the
@@ -718,7 +823,8 @@ void CImporter::planCellSlices(const clang::TranslationUnitDecl *unit,
       const clang::ConstantArrayType *arrayType =
           astContext().getAsConstantArrayType(global->getType());
       if (!arrayType || global->getType().isConstQualified() ||
-          (!soleTranslationUnit && global->isExternallyVisible())) {
+          (!soleTranslationUnit && global->isExternallyVisible() &&
+           !cellSliceGlobalEligibleWholeProgram(globalVarSymbolName(global)))) {
         qualifies = false;
         break;
       }
@@ -748,7 +854,9 @@ void CImporter::planCellSlices(const clang::TranslationUnitDecl *unit,
           llvm::dyn_cast<clang::FunctionDecl>(param->getDeclContext());
       if (!fn || !fn->doesThisDeclarationHaveABody() ||
           fn->getName() == "main" ||
-          (!soleTranslationUnit && fn->isExternallyVisible()) ||
+          (!soleTranslationUnit && fn->isExternallyVisible() &&
+           !cellSliceParamEligibleWholeProgram(
+               fn, param->getFunctionScopeIndex())) ||
           !astContext().hasSameUnqualifiedType(
               element,
               param->getType().getCanonicalType()->getPointeeType()))

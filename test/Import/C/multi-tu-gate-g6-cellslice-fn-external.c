@@ -1,25 +1,21 @@
-// W3.1 multi-TU gate oracle (G6): planCellSlices (CTS-P10) requires the
-// OWNING FUNCTION of every cell-slice parameter to be internal linkage
-// unless this TU is the whole program (ImportC.cpp:2417) — an externally
-// visible function's parameter could be called from an unseen TU with a
-// non-global argument, same underlying concern as G4's poison but
-// checked again per-class here. Isolated from G5: `A` (the global base)
-// is INTERNAL linkage in this file, only `sum4` (the owning function) is
-// externally visible and called from the companion TU too — on the
-// companion's OWN internal-linkage global, so once a whole-program merge
-// exists this is a genuinely sound shape to promote (contrast with
-// multi-tu-gate-g6-cellslice-fn-negative.c, whose companion passes a
-// LOCAL array instead).
+// W3.3 multi-TU gate oracle (G6 — FLIPPED to cell-slice): planCellSlices
+// (CTS-P10) used to require the OWNING FUNCTION of every cell-slice
+// parameter to be internal linkage unless this TU was the whole program
+// (ImportCPlanning.cpp). Isolated from G5: `A` (the global base) is
+// INTERNAL here; only `sum4` (the owning function) is externally visible,
+// called from the companion TU too — on the companion's OWN internal
+// global `B`. Real correctness-visible rejection: without a cell-slice
+// class, `sum4(A)` hit the pre-CTS-P10 "passing a pointer into a global
+// variable to a function" rejection.
 //
-// Real correctness-visible rejection (not a silent fallback): without a
-// cell-slice class, `sum4(A)` hits the pre-CTS-P10 "passing a pointer
-// into a global variable to a function" rejection.
+// W3.3 G6 lifts it with the W3.2 whole-program cell-slice merge: `sum4` is
+// only ever passed qualifying globals project-wide (A here, B in the
+// companion — both INTERNAL, so they never merge into a multi-base class),
+// so the generic `&[Cell<i32>]` parameter backs a DIFFERENT internal
+// global per TU. The local-argument counterexample stays rejected: see
+// multi-tu-gate-g6-cellslice-fn-negative.c.
 //
-// W3.2 will flip the `not` RUN line below to `emitrust-import-c ... |
-// FileCheck` once the owning-function internal-linkage check is relaxed
-// by a whole-program merge of call-site facts.
-//
-// RUN: not emitrust-import-c %s %S/Inputs/multi-tu-gate-g6-cellslice-fn-external-other.c 2>&1 | FileCheck %s
+// RUN: emitrust-import-c %s %S/Inputs/multi-tu-gate-g6-cellslice-fn-external-other.c | FileCheck %s
 
 static int A[4];
 
@@ -38,4 +34,11 @@ int main(void) {
   return sum4(A);
 }
 
-// CHECK: multi-tu-gate-g6-cellslice-fn-external.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: passing a pointer into a global variable to a function
+// One generic cell-slice `sum4`, driven from two TUs with two DIFFERENT
+// per-TU-tagged internal globals via distinct global_cells regions.
+// CHECK: func.func @sum4(%{{.*}}: !emitrust.ref<!emitrust.cell_slice<i32>>) -> i32
+// CHECK: emitrust.cell_get %{{.*}} : (!emitrust.ref<!emitrust.cell_slice<i32>>, i64) -> i32
+// CHECK: emitrust.global_cells @tu0_A {
+// CHECK: func.call @sum4(%{{.*}}) : (!emitrust.ref<!emitrust.cell_slice<i32>>) -> i32
+// CHECK: emitrust.global_cells @tu1_B {
+// CHECK: func.call @sum4(%{{.*}}) : (!emitrust.ref<!emitrust.cell_slice<i32>>) -> i32

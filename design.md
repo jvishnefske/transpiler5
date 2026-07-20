@@ -710,6 +710,55 @@ lists the lit test file(s) that validate it.
   rejected), multi-tu-extern-array-composite-merge-probe.c;
   test/EndToEnd/multi-tu-gate-g8-shared-header.c)
 
+- [x] FR-32 Cross-TU cell-slice region APIs (W3.3 G4/G5/G6). `planCellSlices`
+  (CTS-P10) ran per TU and blanket-excluded every externally visible
+  function parameter (a preemptive poison), global-array base, and owning
+  function from the cell-slice path, because an unseen TU could call the
+  function with a Cell-less local argument. The EMISSION model is already
+  generic — a cell-slice parameter is `&[Cell<T>]` with the concrete global
+  bound per call site via `emitrust.global_cells`, so the same function can
+  back a different global at each call site — so lifting these gates is
+  confined to planning, needing no IR change. A whole-program pre-pass
+  (`collectCellSliceCallFacts` per TU + `finalizeCellSliceWholeProgram`,
+  riding the same pre-import loop as `collectWholeProgramInfo`) records, for
+  each externally visible function's data-pointer parameter (keyed
+  `"<fnSymbol>#<index>"`), the externally visible globals passed to it
+  project-wide and whether any call passes a Cell-less argument (a local
+  decay, an interior pointer, a pointer-to-pointer parameter, or a forwarded
+  parameter — the last conservatively poisoned, an untested cross-TU shape).
+  A parameter is cell-slice-eligible when it is not poisoned AND backed by at
+  most ONE externally visible global — the whole-program form of the
+  single-TU multi-base disqualification (two distinct external globals
+  through one parameter is unrepresentable in the single-base cursor model,
+  g5 negative). INTERNAL globals are never merged across TUs, so one external
+  function may back a different internal global in each TU (g6: `sum4(A)` in
+  one TU, `sum4(B)` in another, each via its own `global_cells` region).
+  `planCellSlices` consults these eligibility sets to lift its three
+  external-linkage exclusions per parameter/global; every other per-TU check
+  (body escape, null-check, element type, mutable array) still fires, so
+  eligibility only ever ADDS the "not the historical blanket external
+  reject" permission — it never forces a shape the per-TU analysis rejects.
+  ORDERING LIMITATION (sound, documented): the promotion needs the callee's
+  cell-slice signature established when a call site is emitted, which happens
+  where the DEFINITION is imported; a call site in a TU processed BEFORE the
+  defining TU conservatively falls back to the historical rejection (a missed
+  optimization, never a miscompile). Order-independent cell-slice signatures
+  (driving the signature from the whole-program eligibility) are a future
+  refinement, gated on the pre-pass also replicating the definition-side
+  body/type checks so an eligible signature always implies a cell-slice-able
+  definition. Legitimate only under the same CLOSED-PROGRAM ASSUMPTION as
+  FR-31 (`importCProject` sees every TU). Byte-identical crate-vs-native
+  differentials; the three negatives (local argument, multi-base external
+  globals) stay rejected.
+  (test/Import/C/multi-tu-gate-g4-cellslice-poison.c,
+  multi-tu-gate-g4-cellslice-local-arg.c (negative),
+  multi-tu-gate-g5-cellslice-global-external.c,
+  multi-tu-gate-g5-cellslice-global-negative.c (negative),
+  multi-tu-gate-g6-cellslice-fn-external.c,
+  multi-tu-gate-g6-cellslice-fn-negative.c (negative);
+  test/EndToEnd/multi-tu-gate-g5-region-api.c,
+  multi-tu-gate-g6-cellslice-fn-external.c)
+
 ## C99 Support Roadmap
 
 Everything the importer must handle before it can claim full C99 language

@@ -221,6 +221,44 @@ struct WholeProgramInfo {
   /// never be mapped — this whole-program fact, gathered before any TU
   /// imports, supplies the composite type instead.
   llvm::StringMap<Type> completeArrayGlobalTypes;
+
+  //=== W3.3 G4/G5/G6: whole-program cell-slice (CTS-P10) merge ============
+  // `planCellSlices` runs per TU and blanket-excludes every externally
+  // visible function parameter (:612 poison) and every externally visible
+  // global/owning function (:724/:751) from the cell-slice path, because an
+  // unseen TU could call the function with a Cell-less local argument. The
+  // emission model is already generic (`&[Cell<T>]` parameters, the concrete
+  // global bound per call site via `emitrust.global_cells`), so the only
+  // barrier is these per-TU gates. These fields carry the whole-program
+  // call-argument facts that lift them soundly. Built by
+  // `collectCellSliceCallFacts` (per TU) and `finalizeCellSliceWholeProgram`.
+
+  /// Raw fact: cell-slice parameter key `"<fnSymbol>#<index>"` (for an
+  /// externally visible callee's data-pointer parameter) → the set of
+  /// externally visible global-array symbols passed to it as a directly
+  /// decayed argument anywhere in the project. Internal-linkage globals are
+  /// NOT recorded (they stay per-TU, so the same external function may back
+  /// a different internal global in each TU — g6 — which the generic
+  /// `&[Cell<T>]` parameter represents without merging).
+  llvm::StringMap<llvm::StringSet<>> cellSliceParamExtGlobals;
+  /// Raw fact: parameter keys poisoned by a Cell-less cross-TU argument
+  /// anywhere — a local-array decay, a pointer-to-pointer parameter, or a
+  /// forwarded parameter (conservatively poisoned: the untested cross-TU
+  /// forward-to-external shape keeps the historical rejection).
+  llvm::StringSet<> cellSliceParamPoisoned;
+  /// FINAL (`finalizeCellSliceWholeProgram`): the `"<fnSymbol>#<index>"`
+  /// keys whose whole-program cell-slice class is eligible — not poisoned
+  /// and backed by AT MOST ONE externally visible global (the multi-base
+  /// guard: two distinct external globals through one parameter is the
+  /// single-TU multi-base disqualification, made whole-program — g5
+  /// negative). `planCellSlices` consults this to lift its :612 and :751
+  /// external-visibility exclusions.
+  llvm::StringSet<> cellSliceEligibleParamKeys;
+  /// FINAL: externally visible global-array symbols whose every cell-slice
+  /// binding is to a clean (non-poisoned, single-external-base) parameter —
+  /// the globals `planCellSlices` may keep on the cell-slice path despite
+  /// their external linkage (:724 lift).
+  llvm::StringSet<> cellSliceEligibleGlobals;
 };
 
 /// The emission-side identity of one pointer-region base: the bound object
@@ -1128,6 +1166,21 @@ public:
   /// additive: nothing reads `wholeProgram` yet, so it perturbs no import.
   void collectWholeProgramInfo(clang::ASTContext &context, unsigned tuIndex);
 
+  /// W3.3 G4/G5/G6 pre-pass: scans one TU's function bodies for every direct
+  /// call to an externally visible function, recording each data-pointer
+  /// argument's shape into `WholeProgramInfo::cellSliceParamExtGlobals` /
+  /// `cellSliceParamPoisoned` (keyed by callee symbol + parameter index).
+  /// Runs in `importCProject`'s pre-import pass over every AST (like
+  /// `collectWholeProgramInfo`), so the facts are complete and
+  /// order-independent before any TU imports.
+  void collectCellSliceCallFacts(clang::ASTContext &context);
+
+  /// W3.3 G4/G5/G6: reduces the raw call-argument facts to the two final
+  /// eligibility sets (`cellSliceEligibleParamKeys` /
+  /// `cellSliceEligibleGlobals`) once every TU has been scanned. Called once,
+  /// after the pre-pass loop and before any TU imports.
+  void finalizeCellSliceWholeProgram();
+
   /// After every translation unit has been imported, checks that no external
   /// symbol was left unresolved: every deferred `extern` global must have a
   /// definition, and no referenced non-variadic external function may remain
@@ -1398,6 +1451,19 @@ private:
   /// disqualification silently keeps the historical staged-copy rejection.
   void planCellSlices(const clang::TranslationUnitDecl *unit,
                       bool soleTranslationUnit);
+
+  /// True when the whole-program facts prove function `fn`'s data-pointer
+  /// parameter `paramIndex` may join a cell-slice class despite `fn`'s
+  /// external linkage (consulted by `planCellSlices` to lift its :612/:751
+  /// gates). Meaningful only in a multi-file import; `wholeProgram` is empty
+  /// otherwise.
+  bool cellSliceParamEligibleWholeProgram(const clang::FunctionDecl *fn,
+                                          unsigned paramIndex) const;
+
+  /// True when the externally visible global `symbol` may stay on the
+  /// cell-slice path despite its external linkage (consulted by
+  /// `planCellSlices` to lift its :724 gate).
+  bool cellSliceGlobalEligibleWholeProgram(llvm::StringRef symbol) const;
 
   /// Returns the global array variable a call argument decays directly
   /// (`f(G)` with no offset), or null: the only global argument shape the
