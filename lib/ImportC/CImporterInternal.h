@@ -996,6 +996,19 @@ public:
                                       llvm::StringRef tuTag, bool deferExtern,
                                       bool soleTranslationUnit);
 
+  /// W3.0: records the `mlirFuncName` of every externally visible,
+  /// va_list-using variadic DEFINITION in `context`'s translation unit into
+  /// `crossTuVaListVariadicNames`. `importCProject` calls this for every
+  /// parsed AST BEFORE importing any of them (order-independent), so a call
+  /// site in a TU processed before its callee's defining TU still
+  /// recognizes the callee as "monomorphized elsewhere" and raises the
+  /// located cross-TU rejection (`emitCall`) instead of the generic
+  /// "call to a variadic function" message. Internal-linkage (`static`)
+  /// definitions are excluded: a `static` function cannot be called from
+  /// another translation unit in valid C, and `mlirFuncName`'s per-TU tag
+  /// would make its recorded name ambiguous across TUs anyway.
+  void collectCrossTuVaListVariadics(clang::ASTContext &context);
+
   /// After every translation unit has been imported, checks that no external
   /// symbol was left unresolved: every deferred `extern` global must have a
   /// definition, and no referenced non-variadic external function may remain
@@ -3626,6 +3639,13 @@ private:
   /// The clone index (into its plan's `clones`) of every direct call to a
   /// monomorphized variadic definition.
   llvm::DenseMap<const clang::CallExpr *, unsigned> vaCallSiteClones;
+  /// W3.0: `mlirFuncName`s of externally visible va_list-using variadic
+  /// definitions, gathered across every TU of a multi-TU project before any
+  /// of them import (`collectCrossTuVaListVariadics`). Empty for a
+  /// single-file import, where no cross-TU call site can exist. Consulted
+  /// only when a call's callee has no definition visible in the CURRENT
+  /// TU — the same-TU case is already resolved through `vaMonomorphPlans`.
+  llvm::StringSet<> crossTuVaListVariadicNames;
   /// Planned string-cursor parameters (CTS 00204): the `const char **`
   /// parameters of definitions whose bodies stay inside the bounded
   /// read-and-advance shape. Keyed by the DEFINITION's parameter decls.

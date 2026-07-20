@@ -1870,6 +1870,24 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
                                             // enumerated every site.
         return emitError(loc) << "unsupported: call to a variadic function";
       vaClone = &planIt->second.clones[siteIt->second];
+    } else if (!definition &&
+               crossTuVaListVariadicNames.contains(mlirFuncName(callee))) {
+      // W3.0: no definition is visible in THIS TU, but the project-wide
+      // pre-scan (`collectCrossTuVaListVariadics`) found a va_list-using
+      // definition of this same symbol in another TU. `planVaMonomorph`
+      // only enumerates call sites within a single TU, so this site was
+      // never assigned a clone and the definition's own TU never emits an
+      // ordinary symbol for it either (a va_list-monomorphized definition
+      // is ALWAYS replaced by its per-site clones, never kept as a plain
+      // function) — without this check the call would reference a symbol
+      // that exists nowhere in the module, an unresolved cross-TU call
+      // escaping with no diagnostic. Real cross-TU monomorphization
+      // support is future work (W3.5); for now this is a located
+      // rejection instead.
+      return emitError(loc)
+             << "unsupported: call to a variadic function '"
+             << callee->getName()
+             << "' defined in another translation unit";
     } else if (!definition || !definition->hasBody() ||
                bodyUsesVaList(astContext(), definition->getBody())) {
       return emitError(loc) << "unsupported: call to a variadic function";
