@@ -145,19 +145,28 @@ def load_name_list(path, required):
     return names
 
 
-def run_command(cmd, timeout, cwd=None):
+def run_command(cmd, timeout, cwd=None, env=None):
     """Run ``cmd`` with a hard timeout, returning (rc, stdout, stderr, timed_out).
 
     Uses a fresh process group and SIGKILLs the whole group on timeout so
     that lingering grandchildren (e.g. rustc under cargo) cannot keep the
     output pipes open and hang the runner.
+
+    ``env`` is an optional dict of extra environment variables merged over
+    the inherited ``os.environ`` (e.g. ``CARGO_TARGET_DIR`` for the cargo
+    child spawned by emitrust-cc).
     """
+    full_env = None
+    if env:
+        full_env = dict(os.environ)
+        full_env.update(env)
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=cwd,
+        env=full_env,
         start_new_session=True,
     )
     try:
@@ -197,6 +206,16 @@ def output_diff_snippet(expected, actual, limit=12):
 
 def run_single_test(tool, source_path, workdir):
     """Transpile, build, and run one suite test.
+
+    Each test builds into its own crate-local ``target`` directory.  A
+    shared ``CARGO_TARGET_DIR`` (as test/Fuzz uses for its sequential
+    builds) was measured and rejected for this runner: the 8 concurrent
+    cargo builds serialize on cargo's target-dir flock, and the full
+    220-test ledger went from a 19.9s median (3 runs: 19.9/19.6/19.9) to a
+    109.8s median (3 runs: 109.8/109.8/109.7) -- identical total CPU, 5.5x
+    the wall clock.  Per-crate target dirs keep the pool actually parallel.
+    (Crate names would not have collided: the sanitized NNNNN stems are
+    unique; the flock alone kills the idea.)
 
     Returns ``(name, status, detail)`` where ``name`` is the test filename
     (e.g. ``00001.c``), ``status`` is PASS/MISCOMPILE/UNSUPPORTED, and
