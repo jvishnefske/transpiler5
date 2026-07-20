@@ -754,13 +754,35 @@ rule.
   located rejection (cell-slice classes require mutable global bases).
   (test/Import/C/qualifiers.c, qualifiers-invalid.c,
   test/EndToEnd/qualifiers.c)
-- [x] C99-8 long double: PERMANENT documented rejection. Rust has no
-  extended-precision float; a silent double mapping would change numeric
-  results and break the byte-exact differential oracle for printf %Lf
-  (the 00204 shape). The importer rejects with the located diagnostic
-  "unsupported builtin type 'long double'" at the first use of the type.
-  (test/Import/C/long-double-invalid.c; see also the 00204
-  PERMANENT-OUT disposition below.)
+- [x] C99-8 long double: maps to f64 — the same type as double — as a
+  UB-refinement (REVISED for CTS 00204; the former PERMANENT rejection
+  is withdrawn). Rationale: C requires long double to be at least as
+  wide as double, every f64-exact value round-trips the substitution
+  unchanged, and the supported shapes (L-suffixed literals, copies,
+  parameters/returns/struct members, printf %Lf-family output of
+  f64-exact values) perform no extended-precision arithmetic whose
+  extra bits a defined program could rely on — the substitution only
+  narrows evaluation precision, latitude C's FLT_EVAL_METHOD model
+  already grants in the other direction, and the 00204 differential
+  oracle is byte-exact under it. Consequences: double <-> long double
+  conversions are identities (no arith.extf/arith.truncf); L-suffixed
+  literals (decimal and hex) convert their x87 APFloat to IEEE double
+  at import, correctly rounded; printf's L length modifier is accepted
+  on the floating conversions exactly like the unmodified twins (bare
+  %Lf keeps the __emitrust_fmt_f64 fast path, adjusted forms route
+  through __emitrust_fmt_float) and stays a located rejection on the
+  integer conversions ("unsupported: length modifier 'L' on printf
+  '%d'"). Constructs that would OBSERVE the substitution stay
+  rejected: sizeof/_Alignof over long double ("unsupported:
+  sizeof/alignof of long double" — the C fold would promise the
+  16-byte x86-64 ABI slot the emitted 8-byte f64 never keeps, the same
+  reasoning as the bit-field sizeof rejection) and the %La/%LA
+  hex-float conversions ("unsupported printf format specifier '%La'" —
+  hex-float output renders the BITS, and an x87 80-bit value and the
+  substituted f64 print different mantissas even when f64-exact).
+  (test/Import/C/long-double-f64.c, long-double-f64-invalid.c,
+  printf-extended-invalid.c; exercised end-to-end by c-testsuite 00204
+  and test/EndToEnd/varargs-monomorph.c)
 - [x] C99-9 _Complex and _Imaginary: documented rejection — no Rust
   counterpart. _Complex reaches the importer's type mapper and rejects
   with the located diagnostic "unsupported type '_Complex double'";
@@ -1119,35 +1141,49 @@ rule.
   parameter decays to a rejected pointer-to-pointer (CTS-P5).
   (test/Import/C/array-params.c, array-params-invalid.c,
   test/EndToEnd/array-params.c)
-- [x] C99-37 Variadic function definitions and va_list: PERMANENT
-  documented rejection for anything that touches va_list. Rust has no
-  stable variadic ABI or safe varargs access, so a variadic DEFINITION
-  whose body uses the va_list machinery (va_start/va_arg/va_copy or a
-  va_list variable declaration, detected by the `bodyUsesVaList` scan)
-  keeps the located rejection "unsupported: variadic function
-  definition", and the va_list TYPE itself (the target's
-  `__builtin_va_list` and its underlying `__va_list_tag` record) is
-  rejected by the type mapper in every position — local, parameter,
-  field, global — with the located "unsupported: va_list type", so a
-  hand-rolled vprintf-style helper or a stray va_list local in a
-  non-variadic function can never import as the target's
-  register-save-area struct. That decl-site rejection makes the
-  v*printf family unreachable by construction (every call needs a
-  va_list argument); a v*printf call reached without one keeps the
-  C99-39 system-header use rejection. Two deliberate carve-outs stand:
-  (1) the CTS-F1/CTS-P9 fixed-prototype import — a variadic definition
-  whose body is va_list-free can never observe its trailing arguments,
-  so it imports as its named parameters only and call sites drop
-  effect-free extras (an extra with side effects is rejected); (2)
-  printf-family CALL SITES route through the hosted printf/puts
-  machinery (C99-47/48) when the project supplies no definition. The
-  recorded permanent-out example is 00204: behind its long-double
-  surface blocker sits `va_arg(ap, struct s7)` — struct-typed varargs /
-  HFA calling convention, fundamentally outside safe-Rust emission (see
-  the 00204 PERMANENT-OUT disposition). (test/Import/C/varargs-def.c,
-  varargs-def-invalid.c — va_list-using definition, va_list local in a
-  non-variadic function, va_list parameter, vprintf call, side-effecting
-  dropped extras; test/EndToEnd/varargs-def.c)
+- [x] C99-37 Variadic function definitions and va_list: bounded va_list
+  bodies MONOMORPHIZE per call site (REVISED for CTS 00204); everything
+  the monomorphizer cannot see stays a located rejection. Rust has no
+  stable variadic ABI or safe varargs access, so no va_list object ever
+  survives into the emitted Rust; instead, a Pass-A planner
+  (`planVaMonomorph`, before any declaration imports) claims every
+  variadic DEFINITION whose body uses va_list and, when the body stays
+  in the bounded shape, synthesizes one clone per distinct
+  extras-signature over its direct call sites. Clone parameters are
+  exactly (named parameters, that site's extra arguments BY VALUE in
+  declared order) — no synthetic trailing parameter; the consumption
+  cursor is an internal i64 local. Inside a clone va_start resets the
+  cursor, va_end is a no-op, and each va_arg(ap, T) becomes a dispatch
+  over the cursor selecting among the extras whose static type is T
+  (the cursor increments per read); a cursor position with no matching
+  extra — UB in the C call — is a deterministic panic. Struct-typed
+  va_arg reads (the 00204 HFA shapes) fall out for free: extras are
+  ordinary Copy values, so no calling-convention modeling is needed.
+  Call sites rewrite to their clone; the original variadic symbol is
+  never emitted, and an in-scope definition with zero call sites drops
+  entirely. The bounded-shape scope checks are located rejections,
+  raised BEFORE any callee prototype imports: "unsupported: va_copy"
+  (a cloned cursor's lifetime is out of scope), "unsupported: va_list
+  escapes variadic definition" (ap passed to ANY callee — the callee
+  would consume varargs the monomorphizer cannot see; this beats the
+  callee's own va_list-parameter type rejection), and "unsupported:
+  address of variadic definition" (an escaping function address makes
+  the call-site set non-enumerable). Outside variadic definitions the
+  va_list TYPE keeps its rejection in every position — local,
+  parameter, field, global — with the located "unsupported: va_list
+  type", so a hand-rolled vprintf-style helper can never import as the
+  target's register-save-area struct, and the v*printf family stays
+  unreachable by construction. The older carve-outs stand unchanged:
+  (1) the CTS-F1/CTS-P9 fixed-prototype import — a va_list-FREE
+  variadic definition imports as its named parameters only and call
+  sites drop effect-free extras (an extra with side effects is
+  rejected); (2) printf-family CALL SITES route through the hosted
+  printf/puts machinery (C99-47/48) when the project supplies no
+  definition. (test/Import/C/varargs-monomorph.c,
+  varargs-monomorph-invalid.c, varargs-def.c, varargs-def-invalid.c;
+  differential test/EndToEnd/varargs-monomorph.c, varargs-def.c;
+  exercised at scale by c-testsuite 00204 — 35 call sites, 33 distinct
+  clone signatures, 14 struct-typed va_arg sites)
 - [x] C99-38 Multiple translation units: several .c files are imported and
   merged into one flat crate with extern object and function resolution
   across units, and internal (static) linkage kept distinct by per-unit
@@ -1600,8 +1636,8 @@ referenced regression tests pass under ninja check-emitrust.
 
 ## c-testsuite Remaining-Failure Checklist
 
-Ledger as of 2026-07-19: 220 total / 218 passed / 0 miscompiled /
-2 unsupported (was 150/70 at commit a091423, when this checklist was
+Ledger as of 2026-07-20: 220 total / 219 passed / 0 miscompiled /
+1 unsupported (was 150/70 at commit a091423, when this checklist was
 drawn up; the quick wins, the CTS-S7/R5/P2/P4/P6 partials, and
 CTS-S1/S2/S4/S6/P1/P5/P7/P8/R1/R2/R4/L1/L2 landed since, and the
 2026-07-18 TDD wave took 200 -> 213: unions as one-slot structs
@@ -1617,18 +1653,29 @@ over backing runs + keyword-member mangling [+00218]; the T1.3 wave
 took 216 -> 217: FILE* as an owned std::fs handle — fopen/fread/
 fwrite/fgetc/fgets/fclose, the C99-48 stdio slice [+00187]; the 00209
 wave took 217 -> 218: K&R callsite-prototype inference, FR-29, see the
-00209 disposition below). Every one
-of the 2 still out is a located build-time rejection — never wrong
-output. Both remaining dispositions (00204, 00216) have dedicated
-waves in flight re-examining the 2026-07-18 survey's permanent-out
-calls; the entries below record that survey's reasoning until those
-waves land. Per-test dispositions:
-- 00204 PERMANENT-OUT (wave in flight): the long-double diagnostic
-  ("00204.c:36:28: error: unsupported builtin type 'long double'") is
-  only the surface blocker — the fatal construct is a hand-rolled
-  variadic reading `va_arg(ap, struct s7)` / `va_arg(ap, struct hfa34)`
-  (struct-typed varargs / HFA calling convention), fundamentally
-  outside the fixed-prototype variadic model and safe-Rust emission.
+00209 disposition below; the CTS 00204 wave took 218 -> 219:
+long-double-as-f64 (C99-8 revision) + va_list monomorphization (C99-37
+revision) + `const char **` string-cursor parameters +
+keyword-function mangling + call-result temporaries [+00204]). Every
+remaining non-pass is a located build-time rejection — never wrong
+output. The single remaining disposition (00216) has a dedicated wave
+in flight re-examining the 2026-07-18 survey's permanent-out call; the
+entry below records that survey's reasoning until it lands.
+Per-test dispositions:
+- 00204 PASSES (disposition OVERTURNED 2026-07-19; formerly
+  PERMANENT-OUT on "struct-typed varargs / HFA calling convention,
+  fundamentally outside safe-Rust emission"). What changed: the HFA
+  calling convention never needed modeling — per-call-site
+  monomorphization (C99-37 revision) turns each `va_arg(ap, struct
+  hfa34)` into a dispatch over ordinary by-value Copy parameters, and
+  the long-double blocker dissolved into the f64 substitution (C99-8
+  revision), sound here because every 00204 value is f64-exact at one
+  printed decimal. The remaining companions (the keyword-named `match`
+  helper with its advancing `const char **` cursor, `fr_hfa12().a`
+  call-result member reads, `struct s1 t1 = fr_s1()` initializers)
+  landed alongside. Byte-exact against the native oracle: 35 myprintf
+  call sites, 33 distinct clone signatures, 14 struct-typed va_arg
+  sites, %.1Lf output.
 - 00209 LANDED (2026-07-19, overturning the earlier upheld rejection):
   K&R callsite-prototype inference (FR-29). Rule: a call with
   arguments whose callee, after the `(*fp)` deref-peel, is a
@@ -2311,13 +2358,9 @@ observed when C99-33 + C99-47 together unlocked 00215).
   (test/Import/C/structs-tag-namespace.c, -invalid.c; differential
   test/EndToEnd/struct-tag-namespace.c). 00129.c and 00219.c pass and are
   in the ratchet manifest; 00204.c clears its namespace blocker — the
-  rename is complete for it too — and hits a construct outside this
-  item's scope: "00204.c:36:28: error: unsupported builtin type 'long
-  double'" (the C99-8 permanent rejection), behind which sit its
-  struct-typed va_arg reads. 00204 is PERMANENT-OUT per the disposition
-  list above, so nothing namespace-shaped remains: the item's scope is
-  fully implemented and pinned, and its one non-passing test is
-  dispositioned, not backlog.
+  rename is complete for it too — and, since the 2026-07-19 CTS 00204
+  wave (long-double-as-f64 + va_list monomorphization; see the
+  disposition list above), passes end-to-end as well.
   (00129.c, 00204.c, 00219.c)
 - [x] CTS-R6 (1) Empty structs (`struct T {};` — a GNU/C2x shape clang
   accepts): emit a unit-like Rust struct.
@@ -2640,10 +2683,13 @@ observed when C99-33 + C99-47 together unlocked 00215).
   test/EndToEnd/globals-string.c)
   (00089.c and 00220.c pass)
 Not itemized above: printf precision (`%.3s`) and the ll/h/hh length
-specifiers are now inside the C99-47 grammar; `%10Ld` (long double) stays
-rejected. No test is sole-blocked on printf forms today (00182.c already
-passes; with CTS-R5's rename landed, 00204.c now rejects on `long double`
-at 00204.c:36:28 before reaching printf).
+specifiers are now inside the C99-47 grammar; the L length modifier on
+the floating conversions joined it with the CTS 00204
+long-double-as-f64 policy (C99-8 revision — bare %Lf keeps the
+__emitrust_fmt_f64 fast path, adjusted forms route through
+__emitrust_fmt_float), while `%Ld` (L on an integer conversion) stays
+rejected. No test is sole-blocked on printf forms today (00182.c and,
+since the 00204 wave, 00204.c pass).
 
 ## Non-Goals for the MVP
 

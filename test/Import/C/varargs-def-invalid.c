@@ -1,30 +1,23 @@
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/valist-def.c 2>&1 | FileCheck %s --check-prefix=VALIST
 // RUN: not emitrust-import-c %t/side-effect.c 2>&1 | FileCheck %s --check-prefix=SIDEEFFECT
-// RUN: not emitrust-import-c %t/varargs-read.c 2>&1 | FileCheck %s --check-prefix=VAREAD
 // RUN: not emitrust-import-c %t/valist-local.c 2>&1 | FileCheck %s --check-prefix=VALOCAL
 // RUN: not emitrust-import-c %t/valist-param.c 2>&1 | FileCheck %s --check-prefix=VAPARAM
 // RUN: not emitrust-import-c %t/vprintf-call.c 2>&1 | FileCheck %s --check-prefix=VPRINTF
 
-// CTS-P9 boundaries: only va_list-free variadic definitions import as
-// their fixed prototype, and call sites may only drop effect-free extras.
-// C99-37 permanent rejection: the va_list type itself has no Rust
-// representation in ANY position — Rust has no stable varargs — so a
-// va_list object outside a variadic definition (local, parameter) is a
-// located type rejection rather than a silent import of the target's
+// CTS-P9 boundaries: va_list-free variadic definitions import as their
+// fixed prototype, and call sites may only drop effect-free extras.
+// CTS 00204 REVISION: a definition whose body uses va_list in the
+// bounded monomorphizable shape (ap never escapes, no va_copy, every
+// call direct) is no longer rejected — it clones per call site
+// (varargs-monomorph.c); the out-of-scope va_list body shapes carry
+// their own located rejections (varargs-monomorph-invalid.c), and the
+// blanket "variadic function definition" rejection remains for any
+// other va_list-using body.
+// C99-37 rejection: the va_list type itself has no Rust representation
+// outside a variadic definition — Rust has no stable varargs — so a
+// va_list object elsewhere (local, parameter) is a located type
+// rejection rather than a silent import of the target's
 // register-save-area struct.
-
-// A definition whose body touches va_list (va_start/va_arg) keeps today's
-// located rejection at the definition.
-//--- valist-def.c
-int sum(int count, ...) {
-  __builtin_va_list ap;
-  __builtin_va_start(ap, count);
-  int x = __builtin_va_arg(ap, int);
-  __builtin_va_end(ap);
-  return x;
-}
-// VALIST: valist-def.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: variadic function definition
 
 // A dropped extra argument with side effects would silently lose the
 // effect, so the call is rejected with a located diagnostic.
@@ -44,22 +37,6 @@ int main(void) {
   return f(1, bump());
 }
 // SIDEEFFECT: side-effect.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: extra argument to a variadic call has side effects
-
-// A call to a variadic whose body reads its varargs is still rejected:
-// the va_list-using definition itself keeps the rejection, calls or not.
-//--- varargs-read.c
-int sum(int count, ...) {
-  __builtin_va_list ap;
-  __builtin_va_start(ap, count);
-  int total = __builtin_va_arg(ap, int);
-  __builtin_va_end(ap);
-  return total;
-}
-
-int main(void) {
-  return sum(1, 41);
-}
-// VAREAD: varargs-read.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: variadic function definition
 
 // A va_list local in a NON-variadic function (outside the reach of the
 // variadic-definition rejection) is rejected at the declaration: the
