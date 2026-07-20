@@ -1,0 +1,753 @@
+//===- ImportCHosted.cpp - hosted libc call emission ------------*- C++ -*-===//
+//
+// Part of the EmitRust project.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+/// \file
+/// CImporter's hosted-libc call emission: the <stdio.h> FILE* stream family
+/// (fileHandleType/requestFileHelper/emitFileLocal/emitFileOpenInto/
+/// emitFileHandleArg/emitFileGetc/emitFileReadWrite/emitFileGetsIndex/
+/// emitFileClose/emitFileTruth), the string.h family
+/// (emitCharRegionSlice/requestStringHelper/emitStringCopyCall/
+/// emitMemsetCall/emitMemcpyCall/emitStrchrIndex), and the small
+/// stdlib.h/math.h/putchar family (emitPutchar/emitHostedMathCall/
+/// emitAbsCall/emitAtoiCall/emitExitCall). Split out of ImportC.cpp by pure
+/// code motion (W1.11); see CImporterInternal.h for the CImporter class
+/// declaration this file implements.
+//
+//===----------------------------------------------------------------------===//
+
+#include "CImporterInternal.h"
+
+using namespace mlir;
+
+//===----------------------------------------------------------------------===//
+// Hosted <stdio.h> FILE* streams (design.md C99-48, CTS-T1.3, 00187)
+//===----------------------------------------------------------------------===//
+
+emitrust::OpaqueType CImporter::fileHandleType() {
+  return emitrust::OpaqueType::get(builder.getContext(), "__EmitrustFile");
+}
+
+void CImporter::requestFileHelper(llvm::StringRef name) {
+  // Every helper mentions the handle enum, and the byte-loop helpers call
+  // the fgetc primitive.
+  neededFileHelpers.insert("__EmitrustFile");
+  if (name == "__emitrust_fread" || name == "__emitrust_fgets")
+    neededFileHelpers.insert("__emitrust_fgetc");
+  neededFileHelpers.insert(name);
+}
+
+LogicalResult CImporter::emitFileLocal(const clang::VarDecl *var,
+                                       Location loc) {
+  // The owned handle lives in an `emitrust.variable` place; without an
+  // initializer it renders as `__EmitrustFile::Null` (C's NULL), so the
+  // enum definition is needed as soon as a handle local exists.
+  requestFileHelper("__EmitrustFile");
+  Value place = createVariablePlace(loc, fileHandleType());
+  fileLocals[var] = place;
+  if (const clang::Expr *init = var->getInit())
+    return emitFileOpenInto(place, init);
+  return success();
+}
+
+LogicalResult CImporter::emitFileOpenInto(Value place,
+                                          const clang::Expr *init) {
+  const clang::Expr *e = init->IgnoreParenImpCasts();
+  Location loc = translateLoc(e->getBeginLoc());
+  const auto *call = llvm::dyn_cast<clang::CallExpr>(e);
+  const clang::FunctionDecl *callee =
+      call ? call->getDirectCallee() : nullptr;
+  if (!callee || !callee->getDeclName().isIdentifier() ||
+      callee->getName() != "fopen" || callee->getDefinition())
+    return emitError(loc) << "unsupported: a FILE* local may only be "
+                             "initialized or assigned by fopen";
+  if (call->getNumArgs() != 2)
+    return emitError(loc)
+           << "unsupported: fopen requires a path and a mode";
+  // The mode selects the helper. Exactly "r" and "w" are in the slice:
+  // append/update modes and the (POSIX no-op) binary suffix stay out.
+  const auto *modeLiteral = llvm::dyn_cast<clang::StringLiteral>(
+      call->getArg(1)->IgnoreParenImpCasts());
+  if (!modeLiteral || !modeLiteral->isOrdinary())
+    return emitError(translateLoc(call->getArg(1)->getBeginLoc()))
+           << "unsupported: fopen mode must be a string literal";
+  llvm::StringRef mode = modeLiteral->getString();
+  if (mode != "r" && mode != "w")
+    return emitError(translateLoc(call->getArg(1)->getBeginLoc()))
+           << "unsupported: fopen mode \"" << mode
+           << "\" (only \"r\" and \"w\" are supported)";
+  // Literal-only paths (v1): the decoded bytes are re-emitted as a Rust
+  // string literal, so they must be printable ASCII (an embedded NUL
+  // would also diverge from C's NUL-terminated path).
+  const auto *pathLiteral = llvm::dyn_cast<clang::StringLiteral>(
+      call->getArg(0)->IgnoreParenImpCasts());
+  Location pathLoc = translateLoc(call->getArg(0)->getBeginLoc());
+  if (!pathLiteral || !pathLiteral->isOrdinary())
+    return emitError(pathLoc)
+           << "unsupported: fopen path must be an ordinary string literal";
+  llvm::StringRef path = pathLiteral->getString();
+  for (char c : path)
+    if (c < 0x20 || c > 0x7e)
+      return emitError(pathLoc) << "unsupported: non-printable or "
+                                   "non-ASCII byte in fopen path";
+  llvm::StringRef helper =
+      mode == "r" ? "__emitrust_fopen_r" : "__emitrust_fopen_w";
+  requestFileHelper(helper);
+  Value handle =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{fileHandleType()}, builder.getStringAttr(helper),
+              builder.getArrayAttr({builder.getStringAttr(path)}),
+              ValueRange{})
+          .getResult(0);
+  builder.create<emitrust::AssignOp>(loc, place, handle);
+  return success();
+}
+
+FailureOr<Value> CImporter::emitFileHandleArg(const clang::Expr *expr,
+                                              bool isMut) {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  Location loc = translateLoc(e->getBeginLoc());
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  const auto *var =
+      ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+  // A FILE* parameter means the stream crossed into this function — the
+  // v1 no-escape rule, pinned by the escape rejection case.
+  if (var && llvm::isa<clang::ParmVarDecl>(var) &&
+      isFilePtrType(var->getType()))
+    return emitError(loc) << "unsupported: FILE* cannot cross a "
+                             "user-defined function boundary";
+  Value place = var ? fileLocals.lookup(var) : Value();
+  if (!place)
+    return emitError(loc) << "unsupported: a FILE* stream argument must be "
+                             "a function-local FILE* variable";
+  Type refType = isMut ? Type(emitrust::MutRefType::get(fileHandleType()))
+                       : Type(emitrust::RefType::get(fileHandleType()));
+  return builder.create<emitrust::AddrOfOp>(loc, refType, place, isMut)
+      .getResult();
+}
+
+FailureOr<Value> CImporter::emitFileGetc(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: fgetc requires exactly one argument";
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(0), /*isMut=*/true);
+  if (failed(handle))
+    return failure();
+  requestFileHelper("__emitrust_fgetc");
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getI32Type()},
+          builder.getStringAttr("__emitrust_fgetc"), /*args=*/ArrayAttr(),
+          ValueRange{*handle})
+      .getResult(0);
+}
+
+FailureOr<Value> CImporter::emitFileReadWrite(const clang::CallExpr *call,
+                                              bool isWrite) {
+  llvm::StringRef name = isWrite ? "fwrite" : "fread";
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 4)
+    return emitError(loc) << "unsupported: " << name
+                          << " requires four arguments";
+  // Byte-wise only: the element size must be the integer constant 1. The
+  // check precedes the buffer lowering so a wide element over a non-char
+  // buffer still reports the pinned byte-wise wording.
+  clang::Expr::EvalResult size;
+  if (!call->getArg(1)->EvaluateAsInt(size, astContext()) ||
+      size.Val.getInt() != 1)
+    return emitError(loc)
+           << "unsupported: " << name
+           << " element size other than 1 (FILE* I/O is byte-wise)";
+  // The count value materializes before the borrows below, so no load
+  // intervenes between a borrow and the helper call consuming it.
+  FailureOr<Value> count = emitRValue(call->getArg(2));
+  if (failed(count))
+    return failure();
+  if (!llvm::isa<IntegerType>((*count).getType()))
+    return emitError(loc) << "unsupported: " << name << " count type";
+  Value countI64 = castToIntType(loc, *count, builder.getIntegerType(64));
+  FailureOr<PtrExprValue> region = emitCharRegionArg(call->getArg(0));
+  if (failed(region))
+    return failure();
+  // fread fills the destination (mutable borrow); fwrite only reads its
+  // source, so a string-literal region is fine there.
+  FailureOr<Value> slice = emitCharRegionSlice(loc, *region,
+                                               /*isMut=*/!isWrite);
+  if (failed(slice))
+    return failure();
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(3), /*isMut=*/true);
+  if (failed(handle))
+    return failure();
+  llvm::StringRef helper =
+      isWrite ? "__emitrust_fwrite" : "__emitrust_fread";
+  requestFileHelper(helper);
+  Value bytes = builder
+                    .create<emitrust::CallOpaqueOp>(
+                        loc, TypeRange{builder.getIntegerType(64)},
+                        builder.getStringAttr(helper), /*args=*/ArrayAttr(),
+                        ValueRange{*handle, *slice, countI64})
+                    .getResult(0);
+  // Convert the i64 byte count to the call's declared C result type
+  // (size_t), matching emitStrlenCall's convention.
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+  if (!intType)
+    return emitError(loc) << "unsupported: " << name << " result type";
+  return castToIntType(loc, bytes, intType);
+}
+
+FailureOr<Value> CImporter::emitFileGetsIndex(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 3)
+    return emitError(loc) << "unsupported: fgets requires three arguments";
+  // The size value materializes before the borrows (same discipline as
+  // fread/fwrite).
+  FailureOr<Value> sizeValue = emitRValue(call->getArg(1));
+  if (failed(sizeValue))
+    return failure();
+  if (!llvm::isa<IntegerType>((*sizeValue).getType()))
+    return emitError(loc) << "unsupported: fgets size type";
+  Value sizeI64 =
+      castToIntType(loc, *sizeValue, builder.getIntegerType(64));
+  FailureOr<PtrExprValue> region = emitCharRegionArg(call->getArg(0));
+  if (failed(region))
+    return failure();
+  FailureOr<Value> slice = emitCharRegionSlice(loc, *region, /*isMut=*/true);
+  if (failed(slice))
+    return failure();
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(2), /*isMut=*/true);
+  if (failed(handle))
+    return failure();
+  requestFileHelper("__emitrust_fgets");
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getIntegerType(64)},
+          builder.getStringAttr("__emitrust_fgets"), /*args=*/ArrayAttr(),
+          ValueRange{*handle, *slice, sizeI64})
+      .getResult(0);
+}
+
+const clang::CallExpr *
+CImporter::asHostedFgetsCall(const clang::Expr *expr) const {
+  const auto *call =
+      llvm::dyn_cast<clang::CallExpr>(expr->IgnoreParenImpCasts());
+  const clang::FunctionDecl *callee =
+      call ? call->getDirectCallee() : nullptr;
+  if (!callee || !callee->getDeclName().isIdentifier() ||
+      callee->getName() != "fgets" || callee->getDefinition())
+    return nullptr;
+  return call;
+}
+
+LogicalResult CImporter::emitFileClose(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: fclose requires exactly one argument";
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(0), /*isMut=*/true);
+  if (failed(handle))
+    return failure();
+  requestFileHelper("__emitrust_fclose");
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("__emitrust_fclose"),
+      /*args=*/ArrayAttr(), ValueRange{*handle});
+  return success();
+}
+
+FailureOr<Value> CImporter::emitFileTruth(const clang::Expr *expr) {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  Location loc = translateLoc(e->getBeginLoc());
+  // A truth-tested fgets result asks "did a line arrive": the helper's
+  // -1 is C's NULL, so the test is an index comparison (the strchr
+  // convention).
+  if (const clang::CallExpr *gets = asHostedFgetsCall(e)) {
+    FailureOr<Value> index = emitFileGetsIndex(gets);
+    if (failed(index))
+      return failure();
+    Value nullIndex =
+        createIntConstant(loc, builder.getIntegerType(64), -1);
+    return builder
+        .create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, *index,
+                               nullIndex)
+        .getResult();
+  }
+  // A handle's truth is its NULL check, read through a shared borrow.
+  FailureOr<Value> handle = emitFileHandleArg(e, /*isMut=*/false);
+  if (failed(handle))
+    return failure();
+  requestFileHelper("__emitrust_file_ok");
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getI1Type()},
+          builder.getStringAttr("__emitrust_file_ok"), /*args=*/ArrayAttr(),
+          ValueRange{*handle})
+      .getResult(0);
+}
+
+FailureOr<PtrExprValue>
+CImporter::emitCharRegionArg(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  Location loc = translateLoc(e->getBeginLoc());
+  // The void* parameters of memset/memcpy/memcmp wrap their arguments in
+  // implicit pointer bitcasts, and const-qualified parameters (strcpy's
+  // source, ...) in no-op qualification casts; the region underneath is
+  // byte-typed either way, so both cast kinds are stripped.
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    if ((cast->getCastKind() != clang::CK_BitCast &&
+         cast->getCastKind() != clang::CK_NoOp) ||
+        !isPointerType(cast->getType()))
+      break;
+    e = stripTrivia(cast->getSubExpr());
+  }
+  // A decayed string literal argument — or `__func__`, whose
+  // function-name literal is the same shape (C99-29) — creates (or
+  // reuses) the literal's read-only backing; unlike a literal bound to a
+  // pointer variable, this shape may appear with no pointer region
+  // referring to the literal.
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_ArrayToPointerDecay)
+      if (const clang::StringLiteral *literal =
+              underlyingStringLiteral(stripTrivia(cast->getSubExpr()))) {
+        FailureOr<Value> backing = getOrCreateLiteralBacking(literal, loc);
+        if (failed(backing))
+          return failure();
+        return PtrExprValue{
+            nullptr, createIntConstant(loc, builder.getIntegerType(64), 0),
+            *backing};
+      }
+  FailureOr<PtrExprValue> pointer = emitPointerRValue(e);
+  if (failed(pointer))
+    return failure();
+  // A multi-base pointer has no single char region to borrow (CTS-P7
+  // scope).
+  if (pointer->baseIndex)
+    return emitError(loc) << "unsupported: passing a pointer bound to "
+                             "multiple objects to a string function";
+  if (!pointer->cursor)
+    return emitError(loc) << "unsupported: the address of a scalar object "
+                             "is not a string region";
+  return *pointer;
+}
+
+FailureOr<Value> CImporter::emitCharRegionSlice(Location loc,
+                                                const PtrExprValue &pointer,
+                                                bool isMut) {
+  Value place = pointer.literalBacking;
+  if (place && isMut)
+    return emitError(loc) << "unsupported: a string literal region cannot "
+                             "be a mutable string argument";
+  if (!place) {
+    auto it = symbols.find(pointer.base);
+    if (it == symbols.end())
+      return emitError(loc)
+             << "unsupported: pointer target '" << pointer.base->getName()
+             << "' is not an importable place";
+    place = it->second;
+  }
+  auto lvalueType = llvm::dyn_cast<emitrust::LValueType>(place.getType());
+  emitrust::ArrayType arrayType =
+      lvalueType
+          ? llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType())
+          : emitrust::ArrayType();
+  if (!arrayType || arrayType.getElementType() != builder.getIntegerType(8))
+    return emitError(loc) << "unsupported: string function argument must "
+                             "designate a char array";
+  auto sliceType = emitrust::SliceType::get(arrayType.getElementType());
+  Type refType = isMut ? Type(emitrust::MutRefType::get(sliceType))
+                       : Type(emitrust::RefType::get(sliceType));
+  return builder
+      .create<emitrust::SliceOfOp>(loc, refType, place, pointer.cursor,
+                                   isMut)
+      .getResult();
+}
+
+void CImporter::requestStringHelper(llvm::StringRef name) {
+  neededStringHelpers.insert(name);
+}
+
+LogicalResult CImporter::emitStringCopyCall(const clang::CallExpr *call,
+                                            llvm::StringRef name,
+                                            bool hasCount) {
+  Location loc = translateLoc(call->getBeginLoc());
+  unsigned expected = hasCount ? 3 : 2;
+  if (call->getNumArgs() != expected)
+    return emitError(loc) << "unsupported: " << name << " requires exactly "
+                          << expected << " arguments";
+  FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
+  if (failed(dst))
+    return failure();
+  FailureOr<PtrExprValue> src = emitCharRegionArg(call->getArg(1));
+  if (failed(src))
+    return failure();
+  if (dst->base && dst->base == src->base)
+    return emitError(loc)
+           << "unsupported: " << name
+           << " source and destination point into the same object '"
+           << dst->base->getName() << "'";
+  Value count;
+  if (hasCount) {
+    FailureOr<Value> n = emitRValue(call->getArg(2));
+    if (failed(n))
+      return failure();
+    if (!llvm::isa<IntegerType>((*n).getType()))
+      return emitError(loc) << "unsupported: " << name << " count type";
+    count = castToIntType(loc, *n, builder.getIntegerType(64));
+  }
+  // The mutable destination borrow and the shared source borrow are
+  // created back to back, immediately before the call: no load of either
+  // base intervenes, so rustc accepts the pair.
+  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true);
+  if (failed(dstSlice))
+    return failure();
+  FailureOr<Value> srcSlice =
+      emitCharRegionSlice(loc, *src, /*isMut=*/false);
+  if (failed(srcSlice))
+    return failure();
+  SmallVector<Value> operands{*dstSlice, *srcSlice};
+  if (count)
+    operands.push_back(count);
+  requestStringHelper(("__emitrust_" + name).str());
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(),
+      builder.getStringAttr(("__emitrust_" + name).str()),
+      /*args=*/ArrayAttr(), operands);
+  return success();
+}
+
+LogicalResult CImporter::emitMemsetCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 3)
+    return emitError(loc)
+           << "unsupported: memset requires exactly 3 arguments";
+  FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
+  if (failed(dst))
+    return failure();
+  FailureOr<Value> byte = emitRValue(call->getArg(1));
+  if (failed(byte))
+    return failure();
+  FailureOr<Value> n = emitRValue(call->getArg(2));
+  if (failed(n))
+    return failure();
+  if (!llvm::isa<IntegerType>((*byte).getType()) ||
+      !llvm::isa<IntegerType>((*n).getType()))
+    return emitError(loc) << "unsupported: memset argument type";
+  Value fill = castToIntType(loc, *byte, builder.getI32Type());
+  Value count = castToIntType(loc, *n, builder.getIntegerType(64));
+  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true);
+  if (failed(dstSlice))
+    return failure();
+  requestStringHelper("__emitrust_memset");
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("__emitrust_memset"),
+      /*args=*/ArrayAttr(), ValueRange{*dstSlice, fill, count});
+  return success();
+}
+
+LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
+                                        llvm::StringRef name) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 3)
+    return emitError(loc)
+           << "unsupported: " << name << " requires exactly 3 arguments";
+  FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
+  if (failed(dst))
+    return failure();
+  FailureOr<PtrExprValue> src = emitCharRegionArg(call->getArg(1));
+  if (failed(src))
+    return failure();
+  FailureOr<Value> n = emitRValue(call->getArg(2));
+  if (failed(n))
+    return failure();
+  if (!llvm::isa<IntegerType>((*n).getType()))
+    return emitError(loc) << "unsupported: " << name << " count type";
+  Value count = castToIntType(loc, *n, builder.getIntegerType(64));
+  if (dst->base && dst->base == src->base) {
+    // Both arguments point into the same object: two slice borrows would
+    // alias a mutable borrow, so the whole array is borrowed mutably once
+    // and the helper receives both element cursors (`copy_within`; its
+    // memmove semantics refine C's undefined overlapping memcpy).
+    PtrExprValue whole{dst->base,
+                       createIntConstant(loc, builder.getIntegerType(64), 0),
+                       Value()};
+    FailureOr<Value> slice = emitCharRegionSlice(loc, whole, /*isMut=*/true);
+    if (failed(slice))
+      return failure();
+    requestStringHelper("__emitrust_memcpy_within");
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(),
+        builder.getStringAttr("__emitrust_memcpy_within"),
+        /*args=*/ArrayAttr(),
+        ValueRange{*slice, dst->cursor, src->cursor, count});
+    return success();
+  }
+  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true);
+  if (failed(dstSlice))
+    return failure();
+  FailureOr<Value> srcSlice =
+      emitCharRegionSlice(loc, *src, /*isMut=*/false);
+  if (failed(srcSlice))
+    return failure();
+  requestStringHelper("__emitrust_memcpy");
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("__emitrust_memcpy"),
+      /*args=*/ArrayAttr(), ValueRange{*dstSlice, *srcSlice, count});
+  return success();
+}
+
+FailureOr<Value>
+CImporter::emitStringCompareCall(const clang::CallExpr *call,
+                                 llvm::StringRef name, bool hasCount) {
+  Location loc = translateLoc(call->getBeginLoc());
+  unsigned expected = hasCount ? 3 : 2;
+  if (call->getNumArgs() != expected)
+    return emitError(loc) << "unsupported: " << name << " requires exactly "
+                          << expected << " arguments";
+  FailureOr<PtrExprValue> lhs = emitCharRegionArg(call->getArg(0));
+  if (failed(lhs))
+    return failure();
+  FailureOr<PtrExprValue> rhs = emitCharRegionArg(call->getArg(1));
+  if (failed(rhs))
+    return failure();
+  Value count;
+  if (hasCount) {
+    FailureOr<Value> n = emitRValue(call->getArg(2));
+    if (failed(n))
+      return failure();
+    if (!llvm::isa<IntegerType>((*n).getType()))
+      return emitError(loc) << "unsupported: " << name << " count type";
+    count = castToIntType(loc, *n, builder.getIntegerType(64));
+  }
+  // Both borrows are shared, so even two arguments into the same object
+  // coexist.
+  FailureOr<Value> lhsSlice =
+      emitCharRegionSlice(loc, *lhs, /*isMut=*/false);
+  if (failed(lhsSlice))
+    return failure();
+  FailureOr<Value> rhsSlice =
+      emitCharRegionSlice(loc, *rhs, /*isMut=*/false);
+  if (failed(rhsSlice))
+    return failure();
+  SmallVector<Value> operands{*lhsSlice, *rhsSlice};
+  if (count)
+    operands.push_back(count);
+  requestStringHelper(("__emitrust_" + name).str());
+  Value result = builder
+                     .create<emitrust::CallOpaqueOp>(
+                         loc, TypeRange{builder.getI32Type()},
+                         builder.getStringAttr(("__emitrust_" + name).str()),
+                         /*args=*/ArrayAttr(), operands)
+                     .getResult(0);
+  // The declared result type is C's int (i32) for the standard
+  // prototypes; convert defensively for K&R-style declarations.
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+  if (!intType)
+    return emitError(loc) << "unsupported: " << name << " result type";
+  return castToIntType(loc, result, intType);
+}
+
+const clang::CallExpr *
+CImporter::asHostedStrchrCall(const clang::Expr *expr, bool &reverse) const {
+  const auto *call =
+      llvm::dyn_cast<clang::CallExpr>(expr->IgnoreParenImpCasts());
+  if (!call)
+    return nullptr;
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  if (!callee || !callee->getDeclName().isIdentifier() ||
+      callee->getDefinition())
+    return nullptr;
+  if (callee->getName() == "strchr") {
+    reverse = false;
+    return call;
+  }
+  if (callee->getName() == "strrchr") {
+    reverse = true;
+    return call;
+  }
+  return nullptr;
+}
+
+FailureOr<Value> CImporter::emitStrchrIndex(const clang::CallExpr *call,
+                                            bool reverse,
+                                            PtrExprValue &region) {
+  Location loc = translateLoc(call->getBeginLoc());
+  llvm::StringRef name = reverse ? "strrchr" : "strchr";
+  if (call->getNumArgs() != 2)
+    return emitError(loc) << "unsupported: " << name
+                          << " requires exactly 2 arguments";
+  FailureOr<PtrExprValue> pointer = emitCharRegionArg(call->getArg(0));
+  if (failed(pointer))
+    return failure();
+  region = *pointer;
+  FailureOr<Value> needle = emitRValue(call->getArg(1));
+  if (failed(needle))
+    return failure();
+  if (!llvm::isa<IntegerType>((*needle).getType()))
+    return emitError(loc) << "unsupported: " << name << " character type";
+  Value byte = castToIntType(loc, *needle, builder.getI32Type());
+  FailureOr<Value> slice =
+      emitCharRegionSlice(loc, region, /*isMut=*/false);
+  if (failed(slice))
+    return failure();
+  llvm::StringRef helper =
+      reverse ? "__emitrust_strrchr" : "__emitrust_strchr";
+  requestStringHelper(helper);
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getIntegerType(64)},
+          builder.getStringAttr(helper),
+          /*args=*/ArrayAttr(), ValueRange{*slice, byte})
+      .getResult(0);
+}
+
+LogicalResult CImporter::emitPutchar(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: putchar requires exactly one argument";
+  FailureOr<Value> value = emitRValue(call->getArg(0));
+  if (failed(value))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>((*value).getType());
+  if (!intType || intType.getWidth() == 1)
+    return emitError(loc) << "unsupported: putchar argument must be an "
+                             "integer";
+  // C's putchar writes the argument converted to unsigned char; the
+  // `__emitrust_fmt_c` helper performs that conversion (ASCII-only, see
+  // design.md C99-48).
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("print!"),
+      builder.getArrayAttr(
+          {builder.getStringAttr("{}"), builder.getIndexAttr(0)}),
+      ValueRange{wrapCharFormat(loc, *value)});
+  return success();
+}
+
+std::optional<llvm::StringRef>
+CImporter::hostedMathCallee(llvm::StringRef name) {
+  // fabs/sqrt/floor/ceil are IEEE-754-exact (fabs/floor/ceil are exact
+  // operations, sqrt is correctly rounded), so every conforming
+  // implementation — glibc, Rust's f64 methods, LLVM's constant folder —
+  // agrees bit for bit. sin carries no such mandate; it is accepted on
+  // the weaker "both sides resolve to the platform libm" argument,
+  // pinned differentially (design.md C99-48). exp/log/pow stay rejected
+  // (see emitCall) rather than widening that exception.
+  return llvm::StringSwitch<std::optional<llvm::StringRef>>(name)
+      .Case("sin", "f64::sin")
+      .Case("fabs", "f64::abs")
+      .Case("sqrt", "f64::sqrt")
+      .Case("floor", "f64::floor")
+      .Case("ceil", "f64::ceil")
+      .Default(std::nullopt);
+}
+
+FailureOr<Value> CImporter::emitHostedMathCall(const clang::CallExpr *call,
+                                               llvm::StringRef rustCallee) {
+  Location loc = translateLoc(call->getBeginLoc());
+  FailureOr<Value> argument = emitRValue(call->getArg(0));
+  if (failed(argument))
+    return failure();
+  // The callee's prototype is `double f(double)` (checked at the call
+  // site), so clang has already converted the argument to double; anything
+  // else indicates an importer bug rather than an unsupported program.
+  if (!llvm::isa<Float64Type>((*argument).getType()))
+    return emitError(loc) << "unsupported: " << rustCallee
+                          << " argument is not a double";
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getF64Type()},
+          builder.getStringAttr(rustCallee),
+          /*args=*/ArrayAttr(), ValueRange{*argument})
+      .getResult(0);
+}
+
+FailureOr<Value> CImporter::emitAbsCall(const clang::CallExpr *call,
+                                        bool isLong) {
+  Location loc = translateLoc(call->getBeginLoc());
+  llvm::StringRef name = isLong ? "labs" : "abs";
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: " << name << " requires exactly one argument";
+  FailureOr<Value> value = emitRValue(call->getArg(0));
+  if (failed(value))
+    return failure();
+  if (!llvm::isa<IntegerType>((*value).getType()))
+    return emitError(loc)
+           << "unsupported: " << name << " argument must be an integer";
+  // The prototype has already converted the argument to int/long;
+  // normalize the width anyway (a K&R-style declaration may differ).
+  IntegerType intType = builder.getIntegerType(isLong ? 64 : 32);
+  Value argument = castToIntType(loc, *value, intType);
+  // wrapping_abs: abs(INT_MIN)/labs(LONG_MIN) is C UB (7.20.6.1p2),
+  // refined to the deterministic two's-complement wrap the differential
+  // oracle's platform also produces; Rust's plain `abs` would panic only
+  // in debug builds and is rejected as non-deterministic across profiles.
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{intType},
+          builder.getStringAttr(isLong ? "i64::wrapping_abs"
+                                       : "i32::wrapping_abs"),
+          /*args=*/ArrayAttr(), ValueRange{argument})
+      .getResult(0);
+}
+
+FailureOr<Value> CImporter::emitAtoiCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: atoi requires exactly one argument";
+  FailureOr<PtrExprValue> pointer = emitCharRegionArg(call->getArg(0));
+  if (failed(pointer))
+    return failure();
+  FailureOr<Value> slice =
+      emitCharRegionSlice(loc, *pointer, /*isMut=*/false);
+  if (failed(slice))
+    return failure();
+  requestStringHelper("__emitrust_atoi");
+  Value parsed =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{builder.getI32Type()},
+              builder.getStringAttr("__emitrust_atoi"),
+              /*args=*/ArrayAttr(), ValueRange{*slice})
+          .getResult(0);
+  // atoi returns int; convert to the call's declared result type in case
+  // a K&R-style declaration says otherwise (matching emitStrlenCall).
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (failed(resultType))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+  if (!intType)
+    return emitError(loc) << "unsupported: atoi result type";
+  return castToIntType(loc, parsed, intType);
+}
+
+LogicalResult CImporter::emitExitCall(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 1)
+    return emitError(loc)
+           << "unsupported: exit requires exactly one argument";
+  FailureOr<Value> status = emitRValue(call->getArg(0));
+  if (failed(status))
+    return failure();
+  if (!llvm::isa<IntegerType>((*status).getType()))
+    return emitError(loc)
+           << "unsupported: exit status must be an integer";
+  Value code = castToIntType(loc, *status, builder.getI32Type());
+  // `std::process::exit` terminates with the given status like C's exit;
+  // both report the low byte to the OS on this target. Its `!` result
+  // needs no representation — the call is statement-position only.
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr("std::process::exit"),
+      /*args=*/ArrayAttr(), ValueRange{code});
+  return success();
+}

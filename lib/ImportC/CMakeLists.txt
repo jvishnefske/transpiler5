@@ -9,6 +9,7 @@ add_mlir_library(MLIREmitRustImportC
   ImportCGlobals.cpp
   ImportCFunctions.cpp
   ImportCStatements.cpp
+  ImportCHosted.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/EmitRust
