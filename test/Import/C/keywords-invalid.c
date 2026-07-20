@@ -1,15 +1,15 @@
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/struct-name.c 2>&1 | FileCheck %s --check-prefix=STRUCT
 // RUN: not emitrust-import-c %t/enum-name.c 2>&1 | FileCheck %s --check-prefix=ENUM
-// RUN: not emitrust-import-c %t/fn-name.c 2>&1 | FileCheck %s --check-prefix=FN
 // RUN: not emitrust-import-c %t/c-main.c 2>&1 | FileCheck %s --check-prefix=CMAIN
 // RUN: not emitrust-import-c %t/global-binder.c 2>&1 | FileCheck %s --check-prefix=BINDER
 
 // C identifiers are emitted verbatim as Rust identifiers, so a spelling
 // that Rust reserves is rejected wherever it would surface in the output:
-// struct type names, enum type names, and function names. (Struct MEMBER
-// names are the one exception: they mangle deterministically with a
-// trailing underscore instead — see struct-member-keyword.c.)
+// struct type names, enum type names, enumerators, and global names.
+// (Struct MEMBER names and — since CTS 00204 — FUNCTION names are the
+// exceptions: they mangle deterministically with a trailing underscore
+// instead; see struct-member-keyword.c and keyword-fn-and-cursor.c.)
 // `c_main` is additionally reserved because C `main` is renamed to
 // it for the driver's Rust `main` wrapper, and `__emitrust_tl` because it
 // is the closure binder in mutable-global accessors (identifier patterns
@@ -19,7 +19,6 @@
 
 // STRUCT: struct-name.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: struct name 'type' is a Rust keyword
 // ENUM: enum-name.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: enum name 'match' is a Rust keyword
-// FN: fn-name.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: function name 'loop' is a Rust keyword
 // CMAIN: c-main.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: function name 'c_main' is reserved for the imported C main
 // BINDER: global-binder.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: global variable name '__emitrust_tl' is reserved for the thread-local accessor binder
 
@@ -34,9 +33,6 @@ int use_it(struct type t) { return t.a; }
 enum match { A, B };
 
 int pick(enum match m) { return m == A; }
-
-//--- fn-name.c
-int loop(int x) { return x + 1; }
 
 //--- c-main.c
 int c_main(void) { return 1; }

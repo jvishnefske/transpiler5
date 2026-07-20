@@ -39,15 +39,17 @@ int main(void) {
 }
 // STARP: star-precision.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: '*' precision in printf format
 
-// The 'L' (long double) length modifier stays rejected: long double has
-// no Rust representation in the subset.
+// The 'L' (long double) length modifier is accepted on the floating
+// conversions since the CTS 00204 long-double-as-f64 policy (see
+// long-double-f64.c); on the integer conversions it is undefined in C99
+// and stays a located rejection.
 //--- long-double.c
 int printf(const char *fmt, ...);
 int main(void) {
-  printf("%Lf\n", 1.5L);
+  printf("%Ld\n", 42);
   return 0;
 }
-// LONGDOUBLE: long-double.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported printf length modifier 'L'
+// LONGDOUBLE: long-double.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: length modifier 'L' on printf '%d'
 
 // The 'z' (size_t) length modifier stays rejected (as do 'j' and 't').
 //--- size-t-length.c

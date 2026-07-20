@@ -6,9 +6,9 @@
 // mangles the member name deterministically by appending a single
 // underscore (`type` -> `type_`, `match` -> `match_`). The mangled
 // spelling is the member's identity everywhere: struct_def field lists,
-// member accesses, and the emitted Rust field. Only member names mangle;
-// struct, enum, function, and global names that are Rust keywords stay
-// rejected (keywords-invalid.c).
+// member accesses, and the emitted Rust field. Function names mangle the
+// same way since CTS 00204 (keyword-fn-and-cursor.c); struct, enum, and
+// global names that are Rust keywords stay rejected (keywords-invalid.c).
 
 struct node {
   int type;

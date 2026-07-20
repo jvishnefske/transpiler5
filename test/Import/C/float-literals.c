@@ -4,8 +4,9 @@
 // exponent, hexadecimal (C99 6.4.4.2 hex floats), and the f/F suffixes —
 // reaches the importer as clang's already-evaluated APFloat, so the
 // spelling never survives into the IR: only the value and the type
-// (float -> f32, double -> f64) do. Long double stays rejected (see
-// float-literals-invalid.c).
+// (float -> f32, double -> f64) do. Long double maps to f64 under the
+// CTS 00204 policy, L-suffixed literals included (see long-double-f64.c
+// and long-double-f64-invalid.c for the remaining boundaries).
 
 // Hexadecimal double literals: 0x1.8p3 = 1.5 * 8 = 12.0, 0x1p-2 = 0.25,
 // 0xA.8p0 = 10.5. All are exact binary values.
