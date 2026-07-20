@@ -548,6 +548,43 @@ static bool typeContainsBitField(clang::QualType type) {
   return false;
 }
 
+/// Returns whether `type` is, or contains (through record fields and array
+/// elements, never through pointers), the `long double` builtin. Used to
+/// refuse `sizeof`/`_Alignof` folds over long double: the type imports as
+/// f64 (CTS 00204), so the C ABI size (16 on x86-64) would promise a
+/// layout the emitted Rust never keeps.
+static bool typeContainsLongDouble(clang::QualType type) {
+  const clang::Type *canonical = type.getCanonicalType().getTypePtr();
+  while (const auto *array = llvm::dyn_cast<clang::ArrayType>(canonical))
+    canonical = array->getElementType().getCanonicalType().getTypePtr();
+  if (const auto *builtin = llvm::dyn_cast<clang::BuiltinType>(canonical))
+    return builtin->getKind() == clang::BuiltinType::LongDouble;
+  const clang::RecordDecl *record = canonical->getAsRecordDecl();
+  if (!record)
+    return false;
+  record = record->getDefinition();
+  if (!record)
+    return false;
+  for (const clang::FieldDecl *field : record->fields())
+    if (typeContainsLongDouble(field->getType()))
+      return true;
+  return false;
+}
+
+/// Builds a FloatAttr of `type` from `value`, converting the APFloat to
+/// the type's semantics when they differ. The only differing source is a
+/// `long double` constant (x87 80-bit extended on the x86-64 target),
+/// whose value narrows to the f64 the type policy substitutes for it
+/// (CTS 00204; correctly rounded, exact for every f64-exact source).
+static FloatAttr floatAttrFor(FloatType type, llvm::APFloat value) {
+  if (&value.getSemantics() != &type.getFloatSemantics()) {
+    bool losesInfo = false;
+    (void)value.convert(type.getFloatSemantics(),
+                        llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+  }
+  return FloatAttr::get(type, value);
+}
+
 /// A pointer expression decomposed into its statically resolved base object
 /// and an i64 element cursor value. `cursor` is null for a degenerate base
 /// (the address of a scalar or struct object taken with `&x`), which
@@ -977,6 +1014,21 @@ public:
   /// bindings keep the historical non-address rejection.
   CompoundLiteralTemps *literalTemps = nullptr;
 
+  /// Optional query telling the walk whether a pointer-to-pointer
+  /// parameter of the CURRENT function is a planned string-cursor
+  /// parameter (CTS 00204). When set, `p = *s` binds the parameter as
+  /// the region base (like a slice parameter) and `*s = expr` joins the
+  /// parameter itself into the region as a rebindable pointer. Left
+  /// unset, both shapes keep their historical rejections.
+  std::function<bool(const clang::ParmVarDecl *)> cursorParamQuery;
+
+  /// Optional query telling the walk whether argument `index` of a direct
+  /// call to `callee` feeds a planned string-cursor parameter (CTS
+  /// 00204). When set, a `&p` argument in such a position is consumed by
+  /// the call lowering (region + in-out cursor) instead of invalidating
+  /// `p`'s region; the callee's advancement is ordinary arithmetic.
+  std::function<bool(const clang::FunctionDecl *, unsigned)> cursorArgQuery;
+
   /// Returns whether `var` is a pointer local tracked by this analysis.
   bool tracks(const clang::VarDecl *var) const {
     return pointerVars.contains(var);
@@ -1204,6 +1256,21 @@ private:
 /// their MLIR "place" values, and the loop stack for break/continue. All
 /// state is confined to this object; ownership of the produced IR stays with
 /// the module passed in by the caller.
+/// One monomorphized clone of a bounded va_list-using variadic definition
+/// (CTS 00204): the synthesized symbol plus the MLIR types of the extra
+/// arguments the clone's call sites pass (in declared order, by value).
+struct VaClonePlan {
+  std::string name;
+  SmallVector<Type, 4> extraTypes;
+};
+
+/// The per-definition monomorphization plan: one clone per distinct extras
+/// signature over the definition's direct call sites. A plan with zero
+/// clones drops the definition entirely (no symbol).
+struct VaMonomorphPlan {
+  SmallVector<VaClonePlan, 4> clones;
+};
+
 class CImporter {
 public:
   /// Creates an importer that appends to `module`. The translation-unit
@@ -1737,8 +1804,9 @@ private:
   /// as printf's) are skipped; a variadic definition whose body never
   /// touches va_list imports as its fixed prototype — the named
   /// parameters only, with call sites dropping effect-free trailing
-  /// extras in `emitCall` (CTS-P9) — while a definition that does use
-  /// va_list is rejected. A
+  /// extras in `emitCall` (CTS-P9) — while a va_list-using definition
+  /// emits its planned monomorphization clones (CTS 00204,
+  /// `emitVaClones`) or, without a plan, is rejected. A
   /// body-less prototype with no definition in this TU is skipped when
   /// nothing in this TU references it (referenced-only policy). A body
   /// replaces a previously imported body-less declaration of the same name.
@@ -1747,6 +1815,68 @@ private:
   /// is guarded, so a mid-body call leaves the caller's insertion point
   /// untouched.
   LogicalResult importFunction(const clang::FunctionDecl *func);
+
+  /// CTS 00204 Pass A: plans the per-call-site monomorphization of every
+  /// variadic definition whose body uses va_list. Scope checks reject
+  /// va_copy, a va_list object escaping its definition (passed to any
+  /// callee — checked BEFORE the callee imports its va_list parameter
+  /// rejection), and taking the address of such a definition; the plan
+  /// then enumerates every direct call site and assigns one clone per
+  /// distinct extras signature. Runs before any declaration imports.
+  LogicalResult planVaMonomorph(const clang::TranslationUnitDecl *unit);
+
+  /// CTS 00204 Pass A: plans the `const char **` string-cursor parameters
+  /// of this TU. A pointer-to-pointer parameter of a definition qualifies
+  /// when the body only ever reads through `*s` and advances it with
+  /// `*s = <pointer expr>`; every other use (the parameter escaping into
+  /// a global, another call, deeper writes) is a located rejection.
+  LogicalResult planCursorParams(const clang::TranslationUnitDecl *unit);
+
+  /// Emits every planned clone of the monomorphized variadic definition
+  /// `func` (CTS 00204); a plan with zero clones emits nothing.
+  LogicalResult emitVaClones(const clang::FunctionDecl *func,
+                             const VaMonomorphPlan &plan);
+
+  /// Emits one monomorphized clone: the named parameters keep their
+  /// classified shapes, the site's extras append as by-value parameters,
+  /// and the body imports with the va_start/va_arg/va_end lowerings
+  /// active (an internal i64 consumption cursor; no synthetic parameter).
+  LogicalResult emitVaClone(const clang::FunctionDecl *func,
+                            const VaClonePlan &clone);
+
+  /// Lowers `va_arg(ap, T)` inside a clone: a dispatch over the
+  /// consumption cursor selecting among the clone's extras of static
+  /// type T (the cursor increments per read); a cursor position with no
+  /// matching extra is a deterministic panic (the C call would be UB).
+  FailureOr<Value> emitVaArg(const clang::VAArgExpr *expr);
+
+  /// Binds one ordinary (non-method, non-main, non-cursor) parameter to
+  /// its place: slice parameters deref into a region base plus cursor
+  /// cell, references bind directly, by-value dialect-typed and unsigned
+  /// values copy into `emitrust.variable` places, and plain scalars get
+  /// promotable prologue cells. Shared by `importFunction` and
+  /// `emitVaClone`.
+  LogicalResult bindOrdinaryParam(const clang::ParmVarDecl *param,
+                                  Value blockArg, Location paramLoc);
+
+  /// Binds a planned string-cursor parameter (CTS 00204): the shared
+  /// byte-slice argument derefs into the region base place, the in-out
+  /// cursor copies into a local i64 cell at entry, and every return site
+  /// copies it back (`cursorWritebacks`).
+  LogicalResult bindCursorParam(const clang::ParmVarDecl *param,
+                                Value baseArg, Value cursorArg,
+                                Location paramLoc);
+
+  /// Emits the pending string-cursor writebacks (local cell -> deref'd
+  /// in-out parameter place) ahead of a return.
+  void emitCursorWritebacks(Location loc);
+
+  /// Emits a call to a callee with planned string-cursor parameters: a
+  /// `&p` argument in a cursor position expands to (shared region slice,
+  /// `&mut` staged cursor temp), and the temp stores back into `p`'s
+  /// cursor cell after the call — the caller-visible advancement.
+  FailureOr<Value> emitCursorParamCall(const clang::CallExpr *call,
+                                       func::FuncOp target, Location loc);
 
   /// Records every local variable whose address is taken with `&x` inside
   /// `stmt`; such scalars become `emitrust.variable` places instead of
@@ -3282,6 +3412,13 @@ private:
   /// statics), pre-scanned by `collectOrdinaryNames`; struct tags colliding
   /// with these are renamed (see `structSymbolName`).
   llvm::StringSet<> ordinaryTuNames;
+
+  /// The RAW C spellings the current TU's ordinary identifier namespace
+  /// declares (functions and file-scope variables, no mangling applied).
+  /// Backs the keyword-function collision check (CTS 00204): `match`
+  /// mangles to `match_`, which must not silently merge with a source
+  /// declaration already spelled `match_`.
+  llvm::StringSet<> ordinaryRawTuNames;
   /// Symbol name assigned to each struct definition by `structSymbolName`,
   /// keyed on the defining declaration (per-TU decls are distinct; cross-TU
   /// unification still happens by final name through
@@ -3343,6 +3480,18 @@ private:
   /// declarations are distinct clang decls, so entries never conflict).
   llvm::DenseMap<const clang::FunctionDecl *, SmallVector<ParamKind, 4>>
       paramKindsCache;
+  /// CTS 00204 va_list monomorphization plans, keyed by the variadic
+  /// definition's canonical declaration (per-AST decls; entries from
+  /// different TUs never conflict).
+  llvm::DenseMap<const clang::FunctionDecl *, VaMonomorphPlan>
+      vaMonomorphPlans;
+  /// The clone index (into its plan's `clones`) of every direct call to a
+  /// monomorphized variadic definition.
+  llvm::DenseMap<const clang::CallExpr *, unsigned> vaCallSiteClones;
+  /// Planned string-cursor parameters (CTS 00204): the `const char **`
+  /// parameters of definitions whose bodies stay inside the bounded
+  /// read-and-advance shape. Keyed by the DEFINITION's parameter decls.
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> cursorParams;
   /// Cached pointer-return kinds (CTS-P2), keyed by the function's
   /// canonical declaration: the mapped `!emitrust.fn_ptr` result type of a
   /// function whose data-pointer return classifies as a returned function
@@ -3495,6 +3644,21 @@ private:
   std::string currentFuncName;
   /// True while translating C `main` (enables the implicit `return 0`).
   bool currentIsMain = false;
+  /// True while emitting the body of a va_list monomorphization clone
+  /// (CTS 00204): enables the va_start/va_end/va_arg lowerings and the
+  /// elision of `va_list` locals.
+  bool currentVaCloneActive = false;
+  /// The clone's extra-argument block values, in declared order; the
+  /// va_arg dispatch selects among them by static type.
+  SmallVector<Value, 8> currentVaExtras;
+  /// Entry-block `memref<i64>` cell holding the clone's va_arg
+  /// consumption cursor; va_start resets it to zero.
+  Value currentVaCursorCell;
+  /// String-cursor parameter writebacks of the function under
+  /// construction (CTS 00204): (local i64 cursor cell, deref'd
+  /// `!emitrust.lvalue<i64>` place of the in-out cursor parameter) pairs,
+  /// copied out at every return site.
+  SmallVector<std::pair<Value, Value>, 2> cursorWritebacks;
   /// True once a `%f` printf directive has been imported; triggers the
   /// one-per-module emission of the `__emitrust_fmt_f64` helper that
   /// matches C's non-finite `%f` spellings (`nan`/`-nan`).
@@ -3654,6 +3818,103 @@ static bool bodyUsesVaList(const clang::ASTContext &context,
       worklist.push_back(child);
   }
   return false;
+}
+
+static const clang::Expr *stripTrivia(const clang::Expr *expr);
+static bool isPointerType(clang::QualType type);
+static bool isFunctionPointer(clang::QualType type);
+
+/// Returns the expression under `expr`'s implicit casts and trivia — the
+/// DeclRefExpr node itself for the `ap` operand of va_start/va_end/va_arg
+/// (CTS 00204 scope checks key consumed references by node identity).
+static const clang::Expr *strippedImplicitRef(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    e = stripTrivia(cast->getSubExpr());
+  return e;
+}
+
+/// Returns whether `place` writes through MORE than the single cursor
+/// dereference of the string-cursor parameter `param` (CTS 00204):
+/// `**s = c` or `(*s)[k] = c` write region content, which the shared
+/// slice lowering cannot accept; `*s = p` (depth one) is the legal
+/// advancement.
+static bool writesThroughCursorParam(const clang::Expr *place,
+                                     const clang::ParmVarDecl *param) {
+  unsigned depth = 0;
+  const clang::Expr *e = stripTrivia(place);
+  while (true) {
+    if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e);
+        unary && unary->getOpcode() == clang::UO_Deref) {
+      ++depth;
+      e = stripTrivia(unary->getSubExpr());
+      continue;
+    }
+    if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(e)) {
+      ++depth;
+      e = stripTrivia(subscript->getBase());
+      continue;
+    }
+    if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+      e = stripTrivia(cast->getSubExpr());
+      continue;
+    }
+    break;
+  }
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  return ref && ref->getDecl() == param && depth >= 2;
+}
+
+/// Recursively scans `stmt` for a use of the candidate string-cursor
+/// parameter `param` outside the bounded shape (CTS 00204). Legal uses
+/// read through `*param` or advance it with `*param = <expr>`; the bare
+/// parameter as a value (stored into a global, passed to another call),
+/// its address, and writes deeper than the cursor dereference all escape.
+/// Returns the offending expression, or null when the shape holds.
+static const clang::Expr *
+findCursorParamEscape(const clang::Stmt *stmt,
+                      const clang::ParmVarDecl *param) {
+  if (!stmt)
+    return nullptr;
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt);
+      binary && binary->isAssignmentOp() &&
+      writesThroughCursorParam(binary->getLHS(), param))
+    return binary->getLHS();
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
+    if (unary->isIncrementDecrementOp() &&
+        writesThroughCursorParam(unary->getSubExpr(), param))
+      return unary->getSubExpr();
+    if (unary->getOpcode() == clang::UO_Deref)
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+              strippedImplicitRef(unary->getSubExpr()));
+          ref && ref->getDecl() == param)
+        return nullptr; // `*param`: the bounded read/advance shape.
+  }
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt);
+      ref && ref->getDecl() == param)
+    return ref; // The bare parameter escapes.
+  for (const clang::Stmt *child : stmt->children())
+    if (const clang::Expr *hit = findCursorParamEscape(child, param))
+      return hit;
+  return nullptr;
+}
+
+/// Collects every pointer-typed local variable declared inside `stmt`
+/// (data pointers only; function pointers are ordinary values). Used by
+/// the string-cursor planning pass to interrogate their regions.
+static void collectLocalPointerDecls(
+    const clang::Stmt *stmt,
+    SmallVectorImpl<const clang::VarDecl *> &locals) {
+  if (!stmt)
+    return;
+  if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt))
+    for (const clang::Decl *decl : declStmt->decls())
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+        if (var->hasLocalStorage() && isPointerType(var->getType()) &&
+            !isFunctionPointer(var->getType()))
+          locals.push_back(var);
+  for (const clang::Stmt *child : stmt->children())
+    collectLocalPointerDecls(child, locals);
 }
 
 /// Strips parentheses, `ConstantExpr` wrappers (clang wraps constant
@@ -4269,6 +4530,41 @@ static const clang::VarDecl *asLoadedLocalVarRef(const clang::Expr *expr) {
 static bool isSecondOrderPointerType(clang::QualType type) {
   return isPointerType(type) &&
          isPointerType(type.getCanonicalType()->getPointeeType());
+}
+
+/// Returns whether `type` is a pointer to a pointer to char — the
+/// `const char **` string-cursor parameter shape (CTS 00204). Deeper
+/// pointer nesting and non-char pointees keep the historical
+/// pointer-to-pointer parameter rejection.
+static bool isCharPointerPointerType(clang::QualType type) {
+  clang::QualType canonical = type.getCanonicalType();
+  const auto *outer = canonical->getAs<clang::PointerType>();
+  if (!outer)
+    return false;
+  const auto *inner =
+      outer->getPointeeType().getCanonicalType()->getAs<clang::PointerType>();
+  if (!inner)
+    return false;
+  return inner->getPointeeType().getCanonicalType()->isCharType();
+}
+
+/// Matches `*s` where `s` is a pointer-to-pointer PARAMETER read through
+/// the usual lvalue-to-rvalue load: the shape every use of a string-cursor
+/// parameter reduces to (CTS 00204). Returns the parameter or null.
+static const clang::ParmVarDecl *
+asPointerPointerParamDeref(const clang::Expr *expr) {
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
+  if (!unary || unary->getOpcode() != clang::UO_Deref)
+    return nullptr;
+  const clang::Expr *sub = stripTrivia(unary->getSubExpr());
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(sub))
+    sub = stripTrivia(cast->getSubExpr());
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub);
+  const auto *param =
+      ref ? llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()) : nullptr;
+  if (!param || !isSecondOrderPointerType(param->getType()))
+    return nullptr;
+  return param;
 }
 
 /// Returns the local variable or parameter a stripped declaration
@@ -5171,6 +5467,14 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
       if (const clang::ParmVarDecl *param =
               asPointerParamRef(cast->getSubExpr()))
         return addBase(ptr, param, loc);
+      // `p = *s` on a planned string-cursor parameter (CTS 00204): the
+      // parameter is the region base — the local walks the cursor
+      // parameter's byte run exactly like a slice parameter's.
+      if (cursorParamQuery)
+        if (const clang::ParmVarDecl *cursorParam =
+                asPointerPointerParamDeref(cast->getSubExpr()))
+          if (cursorParamQuery(cursorParam))
+            return addBase(ptr, cursorParam, loc);
       break;
     }
     case clang::CK_ArrayToPointerDecay: {
@@ -5409,6 +5713,17 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
                                    "unsupported: dereference of a "
                                    "pointer-to-pointer variable before it "
                                    "is bound");
+        } else if (const clang::ParmVarDecl *cursorParam =
+                       cursorParamQuery
+                           ? asPointerPointerParamDeref(binary->getLHS())
+                           : nullptr;
+                   cursorParam && cursorParamQuery(cursorParam)) {
+          // `*s = rhs` advances a planned string-cursor parameter (CTS
+          // 00204): the parameter joins the analysis as a pointer of the
+          // region it also bases, so the right-hand side's facts (its
+          // arithmetic, its source pointer) land on that region.
+          pointerVars.insert(cursorParam);
+          recordPointerWrite(cursorParam, binary->getRHS());
         } else if (const clang::FieldDecl *field =
                        dataPointerFieldOf(binary->getLHS())) {
           // `s.f = rhs` on a directly named instance binds the member;
@@ -5480,6 +5795,32 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
                      dataPointerFieldOf(unary->getSubExpr())) {
         // `&s.f` lets the member escape the static-binding model.
         poisonMemberField(field, unary->getOperatorLoc());
+      }
+    }
+  } else if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
+    // A `&p` argument feeding a planned string-cursor parameter (CTS
+    // 00204) is consumed by the call lowering — the callee receives the
+    // region and an in-out cursor — so it must not invalidate `p`'s
+    // region through the generic address-of handler below; the callee's
+    // advancement of the cursor is ordinary pointer arithmetic.
+    const clang::FunctionDecl *callee = call->getDirectCallee();
+    if (callee && cursorArgQuery) {
+      for (unsigned index = 0, count = call->getNumArgs(); index < count;
+           ++index) {
+        if (!cursorArgQuery(callee, index))
+          continue;
+        const clang::Expr *argument = stripTrivia(call->getArg(index));
+        while (const auto *cast =
+                   llvm::dyn_cast<clang::ImplicitCastExpr>(argument))
+          argument = stripTrivia(cast->getSubExpr());
+        const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(argument);
+        if (!addrOf || addrOf->getOpcode() != clang::UO_AddrOf)
+          continue;
+        const clang::VarDecl *pointer = asLocalVarRef(addrOf->getSubExpr());
+        if (!pointer || !tracks(pointer))
+          continue;
+        consumedAddrOf.insert(addrOf);
+        recordArithmetic(pointer, addrOf->getOperatorLoc());
       }
     }
   }
@@ -5577,6 +5918,17 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     case clang::BuiltinType::Float:
       return Type(builder.getF32Type());
     case clang::BuiltinType::Double:
+      return Type(builder.getF64Type());
+    // CTS 00204 / C99-8 policy: `long double` maps to f64, the same type
+    // as `double` (a UB refinement: C requires long double to be at least
+    // as wide as double, every f64-exact value round-trips, and the
+    // supported shapes perform no long-double-only arithmetic). The
+    // conversions double <-> long double become identities, L-suffixed
+    // literals convert their x87 APFloat to IEEE double at import, and
+    // constructs that would observe the substitution stay rejected:
+    // sizeof/alignof of long double (emitSizeofAlignof) and the printf
+    // %La/%LA hex-float forms (translatePrintfFormat).
+    case clang::BuiltinType::LongDouble:
       return Type(builder.getF64Type());
     // Unsigned types map to MLIR unsigned (not signless) integers so the
     // Rust emitter renders them as `uN`; arith ops require signless
@@ -7093,12 +7445,14 @@ void CImporter::collectStaticLocalNames(const clang::Stmt *stmt,
 
 void CImporter::collectOrdinaryNames(const clang::TranslationUnitDecl *unit) {
   ordinaryTuNames.clear();
+  ordinaryRawTuNames.clear();
   for (const clang::Decl *decl : unit->decls()) {
     if (decl->isImplicit() || isSystemHeaderDecl(decl))
       continue;
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
       std::string funcName = mlirFuncName(func);
       ordinaryTuNames.insert(funcName);
+      ordinaryRawTuNames.insert(func->getName());
       // Function-local statics surface at module level under their
       // `<function>_<name>` mangle (see emitLocalVar), claiming that
       // spelling in the ordinary namespace.
@@ -7110,6 +7464,7 @@ void CImporter::collectOrdinaryNames(const clang::TranslationUnitDecl *unit) {
       bool internal = !var->isExternallyVisible();
       ordinaryTuNames.insert(internal ? currentTuTag + var->getName().str()
                                       : var->getName().str());
+      ordinaryRawTuNames.insert(var->getName());
     }
   }
 }
@@ -8453,7 +8808,9 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
     if (!value.isFloat())
       return emitError(loc)
              << "unsupported: global initializer does not match its type";
-    return Attribute(FloatAttr::get(floatType, value.getFloat()));
+    // A long double initializer arrives as an x87 APFloat; floatAttrFor
+    // narrows it to the f64 the type policy substitutes (CTS 00204).
+    return Attribute(floatAttrFor(floatType, value.getFloat()));
   }
   if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(type)) {
     if (!value.isArray() || value.getArraySize() != arrayType.getSize())
@@ -8822,12 +9179,18 @@ std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
   llvm::StringRef cName = func->getName();
   if (cName == "main")
     return "c_main";
+  // A function whose C spelling is a Rust keyword mangles like a struct
+  // member — one trailing underscore (`match` -> `match_`, CTS 00204).
+  // The mangled spelling is the symbol's identity everywhere (definition
+  // and call sites resolve through this same function); a collision with
+  // an existing `match_` is rejected in `importFunction`.
+  std::string base = mangleMemberName(cName);
   // Internal-linkage (`static`) functions are mangled with the per-TU tag so
   // identically named file-statics in different TUs never collide. The tag is
   // empty for a single-TU import, preserving the historical bare name.
   if (func->getStorageClass() == clang::SC_Static)
-    return currentTuTag + cName.str();
-  return cName.str();
+    return currentTuTag + base;
+  return base;
 }
 
 /// Returns whether `later` differs from `earlier` only by refining
@@ -8865,11 +9228,19 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
       // va_start/va_arg/va_copy, no va_list declarations) can never
       // observe its trailing arguments, so it imports as its fixed
       // prototype — the named parameters only (CTS-P9). Call sites drop
-      // effect-free trailing extras in `emitCall`. A body that does use
-      // va_list keeps the rejection: the trailing arguments have no
-      // decomposed representation.
-      if (bodyUsesVaList(astContext(), definition->getBody()))
-        return emitError(loc) << "unsupported: variadic function definition";
+      // effect-free trailing extras in `emitCall`. A body that uses
+      // va_list in the bounded shape monomorphizes per call site
+      // (CTS 00204, planVaMonomorph); any other va_list-using body
+      // keeps the blanket rejection.
+      if (bodyUsesVaList(astContext(), definition->getBody())) {
+        auto planIt = vaMonomorphPlans.find(definition->getCanonicalDecl());
+        if (planIt == vaMonomorphPlans.end())
+          return emitError(loc)
+                 << "unsupported: variadic function definition";
+        if (!func->isThisDeclarationADefinition())
+          return success(); // Clones are emitted at the definition.
+        return emitVaClones(definition, planIt->second);
+      }
     } else {
       // Body-less variadic declarations (printf in particular) are
       // skipped; calls to them are handled specially or rejected at the
@@ -8917,9 +9288,16 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     return emitError(loc) << "unsupported: function name '" << cName
                           << "' is in the reserved '__emitrust_' helper "
                              "namespace";
-  if (isRustKeyword(cName))
+  // A function whose C spelling is a Rust keyword mangles with a trailing
+  // underscore (mlirFuncName, CTS 00204) instead of rejecting. The mangle
+  // must not silently merge two C symbols: a source declaration already
+  // spelled with the mangled name rejects the keyword function where it
+  // is declared.
+  if (isRustKeyword(cName) &&
+      ordinaryRawTuNames.contains((cName + "_").str()))
     return emitError(loc) << "unsupported: function name '" << cName
-                          << "' is a Rust keyword";
+                          << "' mangles to '" << cName
+                          << "_', which collides with an existing symbol";
   std::string name = mlirFuncName(func);
 
   // Build the signature. Pointer-parameter kinds derive from the
@@ -8973,6 +9351,17 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
       if (methodOwner && isPointerType(param->getType()) &&
           !isFunctionPointer(param->getType())) {
         inputTypes.push_back(builder.getIntegerType(64));
+        continue;
+      }
+      // A planned string-cursor parameter (CTS 00204) lowers to TWO
+      // inputs: a shared byte-slice over the region and an in-out i64
+      // cursor. The advancement `*s = p` becomes a cursor write the
+      // caller observes through the reference.
+      if (cursorParams.contains(param)) {
+        inputTypes.push_back(emitrust::RefType::get(
+            emitrust::SliceType::get(builder.getIntegerType(8))));
+        inputTypes.push_back(
+            emitrust::MutRefType::get(builder.getIntegerType(64)));
         continue;
       }
       FailureOr<Type> paramType =
@@ -9074,6 +9463,10 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   loopStack.clear();
   labelBlocks.clear();
   switchCaseBlocks.clear();
+  cursorWritebacks.clear();
+  currentVaCloneActive = false;
+  currentVaExtras.clear();
+  currentVaCursorCell = Value();
   currentHasLabels = containsLabelStmt(func->getBody());
   currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
@@ -9102,6 +9495,19 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     return voidFnPtrHolders.contains(var);
   };
   pointerRegions.literalTemps = &literalTemps;
+  // String-cursor parameters (CTS 00204): the walk binds `p = *s` to the
+  // parameter's region and lets `&p` arguments to cursor positions pass
+  // without invalidation.
+  pointerRegions.cursorParamQuery = [this](const clang::ParmVarDecl *param) {
+    return cursorParams.contains(param);
+  };
+  pointerRegions.cursorArgQuery = [this](const clang::FunctionDecl *callee,
+                                         unsigned index) {
+    const clang::FunctionDecl *definition = callee->getDefinition();
+    if (!definition || index >= definition->getNumParams())
+      return false;
+    return cursorParams.contains(definition->getParamDecl(index));
+  };
   pointerRegions.analyze(astContext(), func->getBody());
 
   // Method prologue (Phase 4): the receiver dereferences once into the
@@ -9128,21 +9534,30 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     currentMethodOwner = methodOwner;
   }
 
-  for (auto [index, param] : llvm::enumerate(func->parameters())) {
+  unsigned entryArgIndex = methodOwner ? 1 : 0;
+  for (const clang::ParmVarDecl *param : func->parameters()) {
     // main's `argv` was dropped from the imported signature (it has no
     // entry-block argument); its uses were rejected at signature time, so
     // no binding is needed.
     if (currentIsMain && isPointerType(param->getType()))
       continue;
     Location paramLoc = translateLoc(param->getLocation());
-    Value blockArg =
-        entryBlock->getArgument(methodOwner ? index + 1 : index);
-    Type type = blockArg.getType();
+    // A string-cursor parameter (CTS 00204) owns TWO entry-block
+    // arguments: the shared region slice and the in-out cursor.
+    if (cursorParams.contains(param)) {
+      Value baseArg = entryBlock->getArgument(entryArgIndex);
+      Value cursorArg = entryBlock->getArgument(entryArgIndex + 1);
+      entryArgIndex += 2;
+      if (failed(bindCursorParam(param, baseArg, cursorArg, paramLoc)))
+        return failure();
+      continue;
+    }
+    Value blockArg = entryBlock->getArgument(entryArgIndex++);
     // An integer-carrier `void *` parameter (CTS-P3) is a plain i64
     // scalar; remember it so truth tests and carrier reads route to its
     // prologue cell (bound through the ordinary scalar path below).
     if (!methodOwner && isDataPointer(param->getType()) &&
-        type == builder.getIntegerType(64))
+        blockArg.getType() == builder.getIntegerType(64))
       carrierParams.insert(param);
     if (methodOwner && isPointerType(param->getType()) &&
         !isFunctionPointer(param->getType())) {
@@ -9157,65 +9572,546 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
       pointerLocals[param] = PointerLocalInfo{param, cursorCell};
       continue;
     }
-    if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(type)) {
-      if (auto sliceType =
-              llvm::dyn_cast<emitrust::SliceType>(mutRef.getPointee())) {
-        // Slice parameter (Phase 1b): one entry-block dereference
-        // establishes the region base place, and the parameter itself
-        // decomposes into (base, i64 cursor = 0) exactly like a decayed
-        // local array; every element access renders `(*param)[i as usize]`
-        // so no borrow is ever held across statements.
-        Value basePlace =
-            builder
-                .create<emitrust::DerefOp>(
-                    paramLoc, emitrust::LValueType::get(sliceType), blockArg)
-                .getResult();
-        Value cursorCell =
-            createEntryAlloca(paramLoc, builder.getIntegerType(64));
-        Value zero =
-            createIntConstant(paramLoc, builder.getIntegerType(64), 0);
-        builder.create<memref::StoreOp>(paramLoc, zero, cursorCell);
-        symbols[param] = basePlace;
-        pointerLocals[param] = PointerLocalInfo{param, cursorCell};
-        continue;
-      }
-    }
-    if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(type)) {
-      // Scalar-reference pointer parameter: used directly as a reference
-      // SSA value.
-      symbols[param] = blockArg;
-      continue;
-    }
-    if (llvm::isa<emitrust::StructType, emitrust::EnumType,
-                  emitrust::FnPtrType>(type) ||
-        isUnsignedInt(type) || addressTaken.contains(param)) {
-      // By-value struct, enum, function pointer, or unsigned scalar, or an
-      // address-taken scalar: copy into a Rust variable (dialect-typed
-      // values must not become memref cells — a memref of a dialect type
-      // is illegal — and unsigned cells must not either, because mem2reg
-      // materializes its default value as an `arith.constant`, which
-      // requires a signless type).
-      Value place = builder
-                        .create<emitrust::VariableOp>(
-                            paramLoc, emitrust::LValueType::get(type))
-                        .getResult();
-      builder.create<emitrust::AssignOp>(paramLoc, place, blockArg);
-      symbols[param] = place;
-      continue;
-    }
-    if (llvm::isa<emitrust::ArrayType>(type))
-      return emitError(paramLoc) << "unsupported: array parameter";
-    // Plain scalar: promotable rank-0 memref cell (swept by
-    // `finalizeFunction` when the parameter is never read).
-    Value cell = createEntryAlloca(paramLoc, type);
-    builder.create<memref::StoreOp>(paramLoc, blockArg, cell);
-    symbols[param] = cell;
-    paramCells.push_back(cell);
+    if (failed(bindOrdinaryParam(param, blockArg, paramLoc)))
+      return failure();
   }
 
   if (failed(emitStmt(func->getBody())))
     return failure();
   return finalizeFunction(funcOp, loc);
+}
+
+LogicalResult CImporter::bindOrdinaryParam(const clang::ParmVarDecl *param,
+                                           Value blockArg, Location paramLoc) {
+  Type type = blockArg.getType();
+  if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(type)) {
+    if (auto sliceType =
+            llvm::dyn_cast<emitrust::SliceType>(mutRef.getPointee())) {
+      // Slice parameter (Phase 1b): one entry-block dereference
+      // establishes the region base place, and the parameter itself
+      // decomposes into (base, i64 cursor = 0) exactly like a decayed
+      // local array; every element access renders `(*param)[i as usize]`
+      // so no borrow is ever held across statements.
+      Value basePlace =
+          builder
+              .create<emitrust::DerefOp>(
+                  paramLoc, emitrust::LValueType::get(sliceType), blockArg)
+              .getResult();
+      Value cursorCell =
+          createEntryAlloca(paramLoc, builder.getIntegerType(64));
+      Value zero = createIntConstant(paramLoc, builder.getIntegerType(64), 0);
+      builder.create<memref::StoreOp>(paramLoc, zero, cursorCell);
+      symbols[param] = basePlace;
+      pointerLocals[param] = PointerLocalInfo{param, cursorCell};
+      return success();
+    }
+  }
+  if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(type)) {
+    // Scalar-reference pointer parameter: used directly as a reference
+    // SSA value.
+    symbols[param] = blockArg;
+    return success();
+  }
+  if (llvm::isa<emitrust::StructType, emitrust::EnumType,
+                emitrust::FnPtrType>(type) ||
+      isUnsignedInt(type) || addressTaken.contains(param)) {
+    // By-value struct, enum, function pointer, or unsigned scalar, or an
+    // address-taken scalar: copy into a Rust variable (dialect-typed
+    // values must not become memref cells — a memref of a dialect type
+    // is illegal — and unsigned cells must not either, because mem2reg
+    // materializes its default value as an `arith.constant`, which
+    // requires a signless type).
+    Value place = builder
+                      .create<emitrust::VariableOp>(
+                          paramLoc, emitrust::LValueType::get(type))
+                      .getResult();
+    builder.create<emitrust::AssignOp>(paramLoc, place, blockArg);
+    symbols[param] = place;
+    return success();
+  }
+  if (llvm::isa<emitrust::ArrayType>(type))
+    return emitError(paramLoc) << "unsupported: array parameter";
+  // Plain scalar: promotable rank-0 memref cell (swept by
+  // `finalizeFunction` when the parameter is never read).
+  Value cell = createEntryAlloca(paramLoc, type);
+  builder.create<memref::StoreOp>(paramLoc, blockArg, cell);
+  symbols[param] = cell;
+  paramCells.push_back(cell);
+  return success();
+}
+
+LogicalResult CImporter::bindCursorParam(const clang::ParmVarDecl *param,
+                                         Value baseArg, Value cursorArg,
+                                         Location paramLoc) {
+  // The shared byte-slice argument derefs once into the region base
+  // place, exactly like a slice parameter's; reads render
+  // `(*base)[i as usize]` and never hold a borrow across statements.
+  auto sliceType = emitrust::SliceType::get(builder.getIntegerType(8));
+  Value basePlace =
+      builder
+          .create<emitrust::DerefOp>(
+              paramLoc, emitrust::LValueType::get(sliceType), baseArg)
+          .getResult();
+  // The in-out cursor copies into a local i64 cell at entry; `*s` reads
+  // and `*s = p` writes go through the cell, and every return site
+  // copies it back through the reference (emitCursorWritebacks).
+  IntegerType i64Type = builder.getIntegerType(64);
+  Value cursorPlace =
+      builder
+          .create<emitrust::DerefOp>(
+              paramLoc, emitrust::LValueType::get(i64Type), cursorArg)
+          .getResult();
+  Value initial =
+      builder.create<emitrust::LoadOp>(paramLoc, i64Type, cursorPlace)
+          .getResult();
+  Value cell = createEntryAlloca(paramLoc, i64Type);
+  builder.create<memref::StoreOp>(paramLoc, initial, cell);
+  symbols[param] = basePlace;
+  pointerLocals[param] = PointerLocalInfo{param, cell};
+  cursorWritebacks.push_back({cell, cursorPlace});
+  return success();
+}
+
+void CImporter::emitCursorWritebacks(Location loc) {
+  for (auto &[cell, place] : cursorWritebacks) {
+    Value value = loadPlace(loc, cell);
+    builder.create<emitrust::AssignOp>(loc, place, value);
+  }
+}
+
+LogicalResult CImporter::emitVaClones(const clang::FunctionDecl *func,
+                                      const VaMonomorphPlan &plan) {
+  for (const VaClonePlan &clone : plan.clones)
+    if (failed(emitVaClone(func, clone)))
+      return failure();
+  return success();
+}
+
+LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
+                                     const VaClonePlan &clone) {
+  Location loc = translateLoc(func->getLocation());
+
+  // Signature: the named parameters keep their classified shapes, the
+  // site's extras append as by-value parameters — no synthetic cursor
+  // parameter; the consumption cursor is an internal local.
+  ArrayRef<ParamKind> paramKinds = classifyPointerParams(func);
+  SmallVector<Type> inputTypes;
+  for (auto [index, param] : llvm::enumerate(func->parameters())) {
+    if (cursorParams.contains(param)) {
+      inputTypes.push_back(emitrust::RefType::get(
+          emitrust::SliceType::get(builder.getIntegerType(8))));
+      inputTypes.push_back(
+          emitrust::MutRefType::get(builder.getIntegerType(64)));
+      continue;
+    }
+    FailureOr<Type> paramType =
+        mapParamType(param->getType(), translateLoc(param->getLocation()),
+                     paramKinds[index]);
+    if (failed(paramType))
+      return failure();
+    inputTypes.push_back(*paramType);
+  }
+  unsigned namedInputCount = inputTypes.size();
+  for (Type extraType : clone.extraTypes)
+    inputTypes.push_back(extraType);
+  SmallVector<Type> resultTypes;
+  clang::QualType returnType = func->getReturnType();
+  if (!returnType->isVoidType()) {
+    if (isDataPointer(returnType) || isFilePtrType(returnType))
+      return emitError(loc)
+             << "unsupported: pointer return from a variadic definition";
+    FailureOr<Type> mapped = mapType(returnType, loc);
+    if (failed(mapped))
+      return failure();
+    resultTypes.push_back(*mapped);
+  }
+  FunctionType functionType = builder.getFunctionType(inputTypes, resultTypes);
+  if (functions.lookup(clone.name))
+    return emitError(loc) // Defensive; the planner reserved the name.
+           << "unsupported: monomorphization clone name '" << clone.name
+           << "' collides with an existing symbol";
+
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto funcOp = builder.create<func::FuncOp>(loc, clone.name, functionType);
+  functions[clone.name] = funcOp;
+
+  // Function prologue: the same per-clone state reset importFunction
+  // performs, with the va_start/va_arg/va_end lowerings armed.
+  symbols.clear();
+  addressTaken.clear();
+  fileLocals.clear();
+  pointerLocals.clear();
+  pointerPointerLocals.clear();
+  carrierLocals.clear();
+  carrierParams.clear();
+  literalBackings.clear();
+  paramCells.clear();
+  ownerStructPlaces.clear();
+  loopStack.clear();
+  labelBlocks.clear();
+  switchCaseBlocks.clear();
+  cursorWritebacks.clear();
+  currentVaCloneActive = true;
+  currentVaExtras.clear();
+  currentHasLabels = containsLabelStmt(func->getBody());
+  currentFunctionBody = func->getBody();
+  currentReceiverPlace = Value();
+  currentMethodOwner = nullptr;
+  currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
+  currentErasedReturnBase = nullptr;
+  currentFuncName = clone.name;
+  currentIsMain = false;
+  bodyRegion = &funcOp.getBody();
+  entryBlock = funcOp.addEntryBlock();
+  builder.setInsertionPointToStart(entryBlock);
+  collectAddressTaken(func->getBody());
+  pointerRegions.carrierReturnQuery =
+      [this](const clang::FunctionDecl *callee) {
+        return isCarrierReturnFunction(callee);
+      };
+  collectVoidFnPtrHolders(func->getBody());
+  pointerRegions.fnHolderQuery = [this](const clang::VarDecl *var) {
+    return voidFnPtrHolders.contains(var);
+  };
+  pointerRegions.literalTemps = &literalTemps;
+  pointerRegions.cursorParamQuery = [this](const clang::ParmVarDecl *param) {
+    return cursorParams.contains(param);
+  };
+  pointerRegions.cursorArgQuery = [this](const clang::FunctionDecl *callee,
+                                         unsigned index) {
+    const clang::FunctionDecl *definition = callee->getDefinition();
+    if (!definition || index >= definition->getNumParams())
+      return false;
+    return cursorParams.contains(definition->getParamDecl(index));
+  };
+  pointerRegions.analyze(astContext(), func->getBody());
+
+  // Named parameter binding, then the extras: the extra block arguments
+  // stay raw SSA values (structs are Copy) selected by the va_arg
+  // dispatch; the consumption cursor is an entry-block i64 cell.
+  unsigned entryArgIndex = 0;
+  for (const clang::ParmVarDecl *param : func->parameters()) {
+    Location paramLoc = translateLoc(param->getLocation());
+    if (cursorParams.contains(param)) {
+      Value baseArg = entryBlock->getArgument(entryArgIndex);
+      Value cursorArg = entryBlock->getArgument(entryArgIndex + 1);
+      entryArgIndex += 2;
+      if (failed(bindCursorParam(param, baseArg, cursorArg, paramLoc)))
+        return failure();
+      continue;
+    }
+    Value blockArg = entryBlock->getArgument(entryArgIndex++);
+    if (isDataPointer(param->getType()) &&
+        blockArg.getType() == builder.getIntegerType(64))
+      carrierParams.insert(param);
+    if (failed(bindOrdinaryParam(param, blockArg, paramLoc)))
+      return failure();
+  }
+  for (unsigned index = namedInputCount; index < inputTypes.size(); ++index)
+    currentVaExtras.push_back(entryBlock->getArgument(index));
+  currentVaCursorCell =
+      createEntryAlloca(loc, builder.getIntegerType(64));
+
+  if (failed(emitStmt(func->getBody())))
+    return failure();
+  return finalizeFunction(funcOp, loc);
+}
+
+FailureOr<Value> CImporter::emitVaArg(const clang::VAArgExpr *expr) {
+  Location loc = translateLoc(expr->getBeginLoc());
+  if (!currentVaCloneActive)
+    return emitError(loc)
+           << "unsupported: va_arg outside a variadic definition";
+  FailureOr<Type> mapped = mapType(expr->getType(), loc);
+  if (failed(mapped))
+    return failure();
+  Type type = *mapped;
+  IntegerType i64Type = builder.getIntegerType(64);
+
+  // Consume one position: read the cursor, then bump it.
+  Value cursor = loadPlace(loc, currentVaCursorCell);
+  Value one = createIntConstant(loc, i64Type, 1);
+  Value next = builder.create<arith::AddIOp>(loc, cursor, one).getResult();
+  builder.create<memref::StoreOp>(loc, next, currentVaCursorCell);
+
+  // The dispatch selects among the extras whose static type is T. A
+  // cursor position with no matching extra would be UB in the C call
+  // (va_arg with the wrong type), so a deterministic panic is a legal
+  // refinement.
+  Value result = createVariablePlace(loc, type);
+  SmallVector<unsigned, 4> candidates;
+  for (auto [index, extra] : llvm::enumerate(currentVaExtras))
+    if (extra.getType() == type)
+      candidates.push_back(static_cast<unsigned>(index));
+  auto emitPanic = [&]() {
+    Attribute message = builder.getStringAttr(
+        "va_arg: no fixed argument of the requested type");
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(), builder.getStringAttr("panic!"),
+        builder.getArrayAttr({message}), ValueRange());
+  };
+  if (candidates.empty()) {
+    // No extra of this type exists in the clone at all (e.g. a
+    // struct-typed va_arg inside a clone whose site passed only ints):
+    // reaching this read at runtime is unconditionally UB in C.
+    emitPanic();
+    return loadPlace(loc, result);
+  }
+  Block *contBlock = createBlock();
+  for (unsigned candidate : candidates) {
+    Value expected = createIntConstant(loc, i64Type, candidate);
+    Value matches = builder
+                        .create<arith::CmpIOp>(loc, arith::CmpIPredicate::eq,
+                                               cursor, expected)
+                        .getResult();
+    Block *matchBlock = createBlock();
+    Block *nextBlock = createBlock();
+    builder.create<cf::CondBranchOp>(loc, matches, matchBlock, ValueRange(),
+                                     nextBlock, ValueRange());
+    builder.setInsertionPointToEnd(matchBlock);
+    builder.create<emitrust::AssignOp>(loc, result,
+                                       currentVaExtras[candidate]);
+    builder.create<cf::BranchOp>(loc, contBlock);
+    builder.setInsertionPointToEnd(nextBlock);
+  }
+  emitPanic();
+  builder.create<cf::BranchOp>(loc, contBlock);
+  builder.setInsertionPointToEnd(contBlock);
+  return loadPlace(loc, result);
+}
+
+LogicalResult
+CImporter::planCursorParams(const clang::TranslationUnitDecl *unit) {
+  for (const clang::Decl *decl : unit->decls()) {
+    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+      continue;
+    const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl);
+    if (!func || !func->isThisDeclarationADefinition() || !func->hasBody())
+      continue;
+    // C main's `char **argv` has its own policy (dropped from the
+    // imported signature; uses rejected) — never a string cursor.
+    if (func->isMain())
+      continue;
+    SmallVector<const clang::ParmVarDecl *, 2> eligible;
+    for (const clang::ParmVarDecl *param : func->parameters())
+      if (isCharPointerPointerType(param->getType()))
+        eligible.push_back(param);
+    if (eligible.empty())
+      continue;
+    // The bounded shape: the parameter appears only under its own
+    // dereference — reads and the `*s = p` advancement. Everything else
+    // (stored, passed on, address-taken, content writes) escapes.
+    for (const clang::ParmVarDecl *param : eligible)
+      if (const clang::Expr *escape =
+              findCursorParamEscape(func->getBody(), param))
+        return emitError(translateLoc(escape->getBeginLoc()))
+               << "unsupported: pointer-to-pointer parameter escapes the "
+                  "string-cursor shape";
+    // Region check: a write through a pointer DERIVED from the cursor
+    // parameter (`p = *s; *p = c;`) writes region content the shared
+    // slice lowering cannot accept.
+    llvm::SmallPtrSet<const clang::ParmVarDecl *, 2> candidates(
+        eligible.begin(), eligible.end());
+    PointerRegionAnalysis analysis;
+    analysis.cursorParamQuery = [&](const clang::ParmVarDecl *param) {
+      return candidates.contains(param);
+    };
+    analysis.analyze(astContext(), func->getBody());
+    SmallVector<const clang::VarDecl *, 8> locals;
+    collectLocalPointerDecls(func->getBody(), locals);
+    for (const clang::VarDecl *var : locals) {
+      const PointerRegion *region = analysis.regionOf(var);
+      if (!region || !region->hasWriteThrough)
+        continue;
+      for (const PointerBaseBinding &binding : region->bases)
+        if (const auto *param =
+                llvm::dyn_cast_if_present<clang::ParmVarDecl>(binding.base);
+            param && candidates.contains(param))
+          return emitError(translateLoc(region->writeThroughLoc))
+                 << "unsupported: write through a string-cursor parameter";
+    }
+    for (const clang::ParmVarDecl *param : eligible)
+      cursorParams.insert(param);
+  }
+  return success();
+}
+
+LogicalResult
+CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
+  // Gather this TU's va_list-using variadic definitions.
+  SmallVector<const clang::FunctionDecl *, 4> targets;
+  for (const clang::Decl *decl : unit->decls()) {
+    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+      continue;
+    const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl);
+    if (!func || !func->isThisDeclarationADefinition() || !func->hasBody() ||
+        !func->isVariadic())
+      continue;
+    if (bodyUsesVaList(astContext(), func->getBody()))
+      targets.push_back(func);
+  }
+  if (targets.empty())
+    return success();
+
+  // Scope checks per definition: no va_copy, and the va_list objects may
+  // only ever feed va_start/va_end/va_arg — a va_list passed to any
+  // callee escapes the definition (the callee would consume varargs the
+  // monomorphizer cannot see). Checked BEFORE any declaration imports,
+  // so this diagnostic beats the callee's va_list-parameter rejection.
+  clang::QualType vaListType =
+      astContext().getBuiltinVaListType().getCanonicalType();
+  for (const clang::FunctionDecl *func : targets) {
+    llvm::SmallPtrSet<const clang::Expr *, 8> consumed;
+    SmallVector<const clang::Stmt *> worklist{func->getBody()};
+    while (!worklist.empty()) {
+      const clang::Stmt *current = worklist.pop_back_val();
+      if (!current)
+        continue;
+      if (const auto *call = llvm::dyn_cast<clang::CallExpr>(current)) {
+        switch (call->getBuiltinCallee()) {
+        case clang::Builtin::BI__builtin_va_copy:
+        case clang::Builtin::BI__builtin_ms_va_copy:
+        case clang::Builtin::BIva_copy:
+          return emitError(translateLoc(call->getBeginLoc()))
+                 << "unsupported: va_copy";
+        case clang::Builtin::BI__builtin_va_start:
+        case clang::Builtin::BI__builtin_c23_va_start:
+        case clang::Builtin::BI__builtin_ms_va_start:
+        case clang::Builtin::BI__va_start:
+        case clang::Builtin::BIva_start:
+        case clang::Builtin::BI__builtin_va_end:
+        case clang::Builtin::BI__builtin_ms_va_end:
+        case clang::Builtin::BIva_end:
+          if (call->getNumArgs() >= 1)
+            consumed.insert(strippedImplicitRef(call->getArg(0)));
+          break;
+        default:
+          break;
+        }
+      }
+      if (const auto *vaArg = llvm::dyn_cast<clang::VAArgExpr>(current))
+        consumed.insert(strippedImplicitRef(vaArg->getSubExpr()));
+      for (const clang::Stmt *child : current->children())
+        worklist.push_back(child);
+    }
+    worklist.push_back(func->getBody());
+    while (!worklist.empty()) {
+      const clang::Stmt *current = worklist.pop_back_val();
+      if (!current)
+        continue;
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(current)) {
+        const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+        if (var &&
+            astContext().hasSameType(var->getType().getCanonicalType(),
+                                     vaListType) &&
+            !consumed.contains(ref))
+          return emitError(translateLoc(ref->getBeginLoc()))
+                 << "unsupported: va_list escapes variadic definition";
+      }
+      for (const clang::Stmt *child : current->children())
+        worklist.push_back(child);
+    }
+  }
+
+  // Address-of scan and call-site enumeration over the whole TU, in
+  // declaration order (pre-order within each body), so clone numbering is
+  // deterministic. A reference to a monomorphized definition outside a
+  // direct-callee position makes its call sites non-enumerable.
+  llvm::DenseMap<const clang::FunctionDecl *, const clang::FunctionDecl *>
+      canonicalTargets;
+  for (const clang::FunctionDecl *func : targets)
+    canonicalTargets[func->getCanonicalDecl()] = func;
+  struct SiteRecord {
+    const clang::CallExpr *call;
+    const clang::FunctionDecl *target;
+  };
+  SmallVector<SiteRecord, 8> sites;
+  llvm::SmallPtrSet<const clang::Expr *, 16> calleeRefs;
+  std::function<LogicalResult(const clang::Stmt *)> scan =
+      [&](const clang::Stmt *stmt) -> LogicalResult {
+    if (!stmt)
+      return success();
+    if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
+      const clang::FunctionDecl *callee = call->getDirectCallee();
+      const clang::FunctionDecl *target =
+          callee ? canonicalTargets.lookup(callee->getCanonicalDecl())
+                 : nullptr;
+      if (target) {
+        sites.push_back({call, target});
+        calleeRefs.insert(strippedImplicitRef(call->getCallee()));
+      }
+    }
+    if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+      if (const auto *fn = llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl()))
+        if (canonicalTargets.count(fn->getCanonicalDecl()) &&
+            !calleeRefs.contains(ref))
+          return emitError(translateLoc(ref->getBeginLoc()))
+                 << "unsupported: address of variadic definition";
+    for (const clang::Stmt *child : stmt->children())
+      if (failed(scan(child)))
+        return failure();
+    return success();
+  };
+  for (const clang::Decl *decl : unit->decls()) {
+    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+      continue;
+    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+      if (func->isThisDeclarationADefinition() && func->hasBody() &&
+          failed(scan(func->getBody())))
+        return failure();
+      continue;
+    }
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+      if (var->hasInit() && failed(scan(var->getInit())))
+        return failure();
+  }
+
+  // One clone per distinct extras signature; call sites record their
+  // clone index. Every target gets a plan entry — a site-less definition
+  // plans zero clones and drops entirely at import.
+  for (const clang::FunctionDecl *func : targets)
+    (void)vaMonomorphPlans[func->getCanonicalDecl()];
+  for (const SiteRecord &site : sites) {
+    VaMonomorphPlan &plan =
+        vaMonomorphPlans[site.target->getCanonicalDecl()];
+    unsigned named = site.target->getNumParams();
+    if (site.call->getNumArgs() < named)
+      return emitError(translateLoc(site.call->getBeginLoc()))
+             << "unsupported: call argument count mismatch";
+    SmallVector<Type, 4> extraTypes;
+    for (unsigned index = named; index < site.call->getNumArgs(); ++index) {
+      const clang::Expr *argument = site.call->getArg(index);
+      Location argLoc = translateLoc(argument->getBeginLoc());
+      // Extras pass BY VALUE (clang has already applied the default
+      // argument promotions); a data-pointer extra has no by-value
+      // representation under the decomposition.
+      if (isDataPointer(argument->getType()))
+        return emitError(argLoc)
+               << "unsupported: pointer argument to a variadic call";
+      FailureOr<Type> mapped = mapType(argument->getType(), argLoc);
+      if (failed(mapped))
+        return failure();
+      extraTypes.push_back(*mapped);
+    }
+    unsigned cloneIndex = plan.clones.size();
+    for (auto [index, clone] : llvm::enumerate(plan.clones))
+      if (clone.extraTypes == extraTypes) {
+        cloneIndex = static_cast<unsigned>(index);
+        break;
+      }
+    if (cloneIndex == plan.clones.size()) {
+      // Clone names carry the original symbol plus a per-signature
+      // suffix; the original bare symbol is never emitted.
+      std::string name = mlirFuncName(site.target) + "__" +
+                         std::to_string(plan.clones.size() + 1);
+      while (ordinaryNameTaken(name) || functions.lookup(name))
+        name += "_";
+      plan.clones.push_back(VaClonePlan{name, extraTypes});
+    }
+    vaCallSiteClones[site.call] = cloneIndex;
+  }
+  return success();
 }
 
 LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
@@ -9241,6 +10137,14 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // functions) and the devirtualization aliases of never-reassigned
   // global function pointers.
   planFnPtrAliases(unit);
+  // CTS 00204 Pass A: string-cursor parameter plans and va_list
+  // monomorphization plans. Both run BEFORE any declaration imports so
+  // their located rejections (escape shapes, va_copy, address-of) beat
+  // the type rejections importing a callee prototype would raise.
+  if (failed(planCursorParams(unit)))
+    return failure();
+  if (failed(planVaMonomorph(unit)))
+    return failure();
   for (const clang::Decl *decl : unit->decls()) {
     if (decl->isImplicit())
       continue;
@@ -10043,6 +10947,7 @@ LogicalResult CImporter::finalizeFunction(func::FuncOp funcOp, Location loc) {
       continue;
     builder.setInsertionPointToEnd(&block);
     if (!currentReturnType) {
+      emitCursorWritebacks(loc);
       builder.create<func::ReturnOp>(loc);
       continue;
     }
@@ -10054,6 +10959,7 @@ LogicalResult CImporter::finalizeFunction(func::FuncOp funcOp, Location loc) {
     // observable on executions that were undefined reads in C anyway).
     if (llvm::isa<IntegerType>(currentReturnType)) {
       Value zero = createScalarIntConstant(loc, currentReturnType, 0);
+      emitCursorWritebacks(loc);
       builder.create<func::ReturnOp>(loc, zero);
       continue;
     }
@@ -10062,6 +10968,7 @@ LogicalResult CImporter::finalizeFunction(func::FuncOp funcOp, Location loc) {
                        .create<arith::ConstantOp>(
                            loc, FloatAttr::get(floatType, 0.0))
                        .getResult();
+      emitCursorWritebacks(loc);
       builder.create<func::ReturnOp>(loc, zero);
       continue;
     }
@@ -10210,6 +11117,16 @@ static bool referencesVar(const clang::Stmt *stmt,
 
 LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   Location loc = translateLoc(var->getLocation());
+  // A `va_list` local inside a monomorphization clone (CTS 00204) has no
+  // storage of its own: the consumption cursor is the clone's internal
+  // cell, and every reference to the object is consumed by the
+  // va_start/va_arg/va_end lowerings (the planner verified this).
+  // Outside a clone the type keeps its C99-37 rejection via mapType.
+  if (currentVaCloneActive &&
+      astContext().hasSameType(
+          var->getType().getCanonicalType(),
+          astContext().getBuiltinVaListType().getCanonicalType()))
+    return success();
   // C99-7: pointer locals divert into the decomposition before `mapType`
   // runs, so the volatile scan happens up front for every local shape
   // (including the pointer's own qualifier, `int * volatile p`).
@@ -10301,6 +11218,20 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
         if (const auto *literal =
                 llvm::dyn_cast<clang::StringLiteral>(unwrapped))
           return emitStringArrayInit(place, *mlirType, literal);
+        // `struct T x = f();` initializes from the call's struct value
+        // exactly like the assignment form `x = f();` (CTS 00204), and
+        // `struct T x = va_arg(ap, struct T)` from the monomorphized
+        // va_arg dispatch the same way.
+        if (llvm::isa<clang::CallExpr, clang::VAArgExpr>(unwrapped)) {
+          FailureOr<Value> value = emitRValue(unwrapped);
+          if (failed(value))
+            return failure();
+          if ((*value).getType() != *mlirType)
+            return emitError(loc)
+                   << "unsupported: initializer type does not match the "
+                      "variable";
+          return storeToPlace(loc, place, *value);
+        }
         const auto *list = llvm::dyn_cast<clang::InitListExpr>(unwrapped);
         if (!list)
           return emitError(loc) << "unsupported: aggregate initializer";
@@ -11097,9 +12028,15 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
       return emitError(bindLoc)
              << "unsupported: pointer variable bound to a non-slice "
                 "pointer parameter"; // Defensive; classification forbids it.
-    if (!wildcard &&
-        !astContext().hasSameUnqualifiedType(
-            pointee, base->getType().getCanonicalType()->getPointeeType()))
+    clang::QualType baseElement =
+        base->getType().getCanonicalType()->getPointeeType();
+    // A string-cursor parameter's element run is the pointee of its
+    // POINTEE: `const char **s` walks the byte region `*s` points into
+    // (CTS 00204).
+    if (const auto *baseParam = llvm::dyn_cast<clang::ParmVarDecl>(base);
+        baseParam && cursorParams.contains(baseParam))
+      baseElement = baseElement.getCanonicalType()->getPointeeType();
+    if (!wildcard && !astContext().hasSameUnqualifiedType(pointee, baseElement))
       return emitError(bindLoc)
              << "unsupported: pointer element type does not match its "
                 "target parameter";
@@ -11825,11 +12762,13 @@ LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
       return failure();
     if ((*value).getType() != currentReturnType)
       return emitError(loc) << "unsupported: return value type mismatch";
+    emitCursorWritebacks(loc);
     builder.create<func::ReturnOp>(loc, *value);
   } else {
     if (currentReturnType)
       return emitError(loc)
              << "unsupported: return without a value in a non-void function";
+    emitCursorWritebacks(loc);
     builder.create<func::ReturnOp>(loc);
   }
   // Continue in a fresh block; if it stays unreachable it is erased later.
@@ -11839,6 +12778,13 @@ LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
 
 LogicalResult CImporter::emitExprStmt(const clang::Expr *expr) {
   const clang::Expr *e = expr->IgnoreParens();
+  // A full expression containing a materialized temporary (e.g. the
+  // `printf("%d\n", f().m)` shape, CTS 00204) is wrapped in
+  // ExprWithCleanups; the "cleanup" is the end of the temp's lifetime,
+  // which needs no code — unwrap so statement-position calls keep their
+  // statement lowerings (the by-name printf intercept in particular).
+  if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e))
+    return emitExprStmt(cleanups->getSubExpr());
   if (const auto *compound = llvm::dyn_cast<clang::CompoundAssignOperator>(e))
     return emitCompoundAssign(compound);
   if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e)) {
@@ -11978,6 +12924,13 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
                               << "' has no bound pointer variable";
       return storePointerAssign(loc, it->second, op->getRHS());
     }
+    // `*s = rhs` on a string-cursor parameter (CTS 00204): the
+    // advancement writes the parameter's cursor cell; the return-site
+    // writebacks make it visible to the caller.
+    if (const clang::ParmVarDecl *cursorParam =
+            asPointerPointerParamDeref(op->getLHS());
+        cursorParam && pointerLocals.contains(cursorParam))
+      return storePointerAssign(loc, cursorParam, op->getRHS());
     // A data-pointer struct member holds a statically resolved degenerate
     // binding; the write validates against it and emits nothing (CTS-P2).
     if (dataPointerFieldOf(op->getLHS()))
@@ -12353,6 +13306,36 @@ FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
 
 LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
   const clang::FunctionDecl *callee = call->getDirectCallee();
+  // va_start/va_end inside a monomorphization clone (CTS 00204):
+  // va_start resets the internal consumption cursor; va_end is a no-op.
+  // Outside a clone both are unreachable (clang only admits them in
+  // variadic definitions, and every va_list-using definition either
+  // monomorphizes or rejects), so the guard is defensive.
+  if (callee) {
+    switch (callee->getBuiltinID()) {
+    case clang::Builtin::BI__builtin_va_start:
+    case clang::Builtin::BI__builtin_c23_va_start:
+    case clang::Builtin::BI__va_start:
+    case clang::Builtin::BIva_start: {
+      Location loc = translateLoc(call->getBeginLoc());
+      if (!currentVaCloneActive)
+        return emitError(loc)
+               << "unsupported: va_start outside a variadic definition";
+      Value zero =
+          createIntConstant(loc, builder.getIntegerType(64), 0);
+      builder.create<memref::StoreOp>(loc, zero, currentVaCursorCell);
+      return success();
+    }
+    case clang::Builtin::BI__builtin_va_end:
+    case clang::Builtin::BIva_end:
+      if (!currentVaCloneActive)
+        return emitError(translateLoc(call->getBeginLoc()))
+               << "unsupported: va_end outside a variadic definition";
+      return success();
+    default:
+      break;
+    }
+  }
   if (callee && callee->getDeclName().isIdentifier()) {
     llvm::StringRef name = callee->getName();
     // printf/puts/putchar are intercepted by name only when the project
@@ -12530,8 +13513,9 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
     // Parse `%[flags][width][.precision][length]conv` (C99 7.19.6.1). All
     // five C99 flags are recognized; width and precision are decimal
     // numbers ('*' forms consume a runtime argument and stay rejected);
-    // lengths l/ll (64-bit) and h/hh (short/char range) are supported,
-    // L/j/z/t stay rejected.
+    // lengths l/ll (64-bit) and h/hh (short/char range) are supported, L
+    // is accepted on the floating conversions (long-double-as-f64, CTS
+    // 00204), and j/z/t stay rejected.
     bool leftAlign = false;
     bool zeroPad = false;
     bool plusSign = false;
@@ -12575,7 +13559,7 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       // A '.' with no digits is precision zero (C99 7.19.6.1p4).
       precision = precisionDigits.empty() ? 0 : std::stoi(precisionDigits);
     }
-    enum class Length { None, Long, LongLong, Short, Char };
+    enum class Length { None, Long, LongLong, Short, Char, LongDouble };
     Length lengthMod = Length::None;
     if (i < n && format[i] == 'l') {
       lengthMod = Length::Long;
@@ -12591,8 +13575,15 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
         lengthMod = Length::Char;
         ++i;
       }
-    } else if (i < n && (format[i] == 'L' || format[i] == 'j' ||
-                         format[i] == 'z' || format[i] == 't')) {
+    } else if (i < n && format[i] == 'L') {
+      // The long double length modifier (CTS 00204): accepted on the
+      // floating conversions, where the long-double-as-f64 policy makes
+      // it behave exactly like the unmodified twin; rejected on the
+      // integer conversions (undefined in C99 7.19.6.1p7) below.
+      lengthMod = Length::LongDouble;
+      ++i;
+    } else if (i < n && (format[i] == 'j' || format[i] == 'z' ||
+                         format[i] == 't')) {
       return emitError(loc) << "unsupported printf length modifier '"
                             << llvm::Twine(std::string(1, format[i])) << "'";
     }
@@ -12600,6 +13591,11 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       return emitError(loc) << "unsupported: trailing '%' in printf format";
     char spec = format[i];
     std::string specName(1, spec);
+    // The unknown-conversion diagnostic names the directive as spelled:
+    // %La (the long-double hex-float form, whose output would render the
+    // bits of the native 80-bit value) reports '%La', not '%a'.
+    std::string directiveName =
+        (lengthMod == Length::LongDouble ? "L" : "") + specName;
     // Validate the conversion before consuming an argument so an unknown
     // conversion is always the diagnostic, even when arguments are short.
     // %p stays rejected by design: pointer provenance is compiled away by
@@ -12611,8 +13607,14 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
                        spec == 'E' || spec == 'g' || spec == 'G';
     if (!isSignedConv && !isUnsignedConv && !isFloatConv && spec != 'c' &&
         spec != 's')
+      return emitError(loc) << "unsupported printf format specifier '%"
+                            << directiveName << "'";
+    // 'L' applies only to the floating conversions; on the integer ones
+    // it is undefined in C99 and stays a located rejection (CTS 00204).
+    if (lengthMod == Length::LongDouble && (isSignedConv || isUnsignedConv))
       return emitError(loc)
-             << "unsupported printf format specifier '%" << specName << "'";
+             << "unsupported: length modifier 'L' on printf '%" << specName
+             << "'";
     // Flag and length validity (C99 7.19.6.1p6-7): '+'/' ' are defined
     // only for the signed and floating conversions, '#' only for x/X/o
     // and the floating conversions; both are undefined elsewhere and are
@@ -13992,9 +14994,13 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
     FailureOr<Type> type = mapType(e->getType(), loc);
     if (failed(type))
       return failure();
+    // An L-suffixed literal's APFloat carries x87 extended semantics;
+    // floatAttrFor narrows it to the f64 the long-double-as-f64 policy
+    // substitutes (CTS 00204).
     return builder
-        .create<arith::ConstantOp>(loc,
-                                   FloatAttr::get(*type, literal->getValue()))
+        .create<arith::ConstantOp>(
+            loc, floatAttrFor(llvm::cast<FloatType>(*type),
+                              literal->getValue()))
         .getResult();
   }
   if (const auto *literal = llvm::dyn_cast<clang::CharacterLiteral>(e)) {
@@ -14048,6 +15054,11 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
     return emitConditionalOperator(conditional);
   if (const auto *stmtExpr = llvm::dyn_cast<clang::StmtExpr>(e))
     return emitStmtExpr(stmtExpr);
+  // `va_arg(ap, T)` inside a monomorphization clone (CTS 00204): a
+  // dispatch over the consumption cursor selecting among the clone's
+  // extras of static type T.
+  if (const auto *vaArg = llvm::dyn_cast<clang::VAArgExpr>(e))
+    return emitVaArg(vaArg);
   if (const auto *trait = llvm::dyn_cast<clang::UnaryExprOrTypeTraitExpr>(e))
     return emitSizeofAlignof(trait);
   if (llvm::isa<clang::StringLiteral>(e))
@@ -15499,6 +16510,11 @@ CImporter::emitSizeofAlignof(const clang::UnaryExprOrTypeTraitExpr *expr) {
            << (kind == clang::UETT_SizeOf
                    ? "unsupported: sizeof of a struct with bit-fields"
                    : "unsupported: alignof of a struct with bit-fields");
+  // CTS 00204: long double imports as an 8-byte f64, but the C fold would
+  // yield the 16-byte x86-64 ABI size — a layout the emitted Rust never
+  // keeps (the same reasoning as the bit-field rejection above).
+  if (typeContainsLongDouble(operand))
+    return emitError(loc) << "unsupported: sizeof/alignof of long double";
   int64_t value =
       kind == clang::UETT_SizeOf
           ? astContext().getTypeSizeInChars(operand).getQuantity()
@@ -15649,15 +16665,28 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       return emitError(loc)
              << "unsupported: fclose return value must be unused";
   }
-  // A variadic callee is only supported when its definition imports as
-  // its fixed prototype (a va_list-free body, see `importFunction`); the
-  // call then drops its trailing extras below. Every other variadic call
-  // keeps the rejection.
+  // A variadic callee is supported when its definition imports as its
+  // fixed prototype (a va_list-free body, see `importFunction`; the call
+  // drops its trailing extras below) or when it monomorphizes per call
+  // site (a bounded va_list-using body, CTS 00204; the call rewrites to
+  // this site's clone with the extras as ordinary fixed arguments).
+  // Every other variadic call keeps the rejection.
+  const VaClonePlan *vaClone = nullptr;
   if (callee->isVariadic()) {
     const clang::FunctionDecl *definition = callee->getDefinition();
-    if (!definition || !definition->hasBody() ||
-        bodyUsesVaList(astContext(), definition->getBody()))
+    auto planIt = definition
+                      ? vaMonomorphPlans.find(definition->getCanonicalDecl())
+                      : vaMonomorphPlans.end();
+    if (planIt != vaMonomorphPlans.end()) {
+      auto siteIt = vaCallSiteClones.find(call);
+      if (siteIt == vaCallSiteClones.end()) // Defensive; the planner
+                                            // enumerated every site.
+        return emitError(loc) << "unsupported: call to a variadic function";
+      vaClone = &planIt->second.clones[siteIt->second];
+    } else if (!definition || !definition->hasBody() ||
+               bodyUsesVaList(astContext(), definition->getBody())) {
       return emitError(loc) << "unsupported: call to a variadic function";
+    }
   }
 
   // Hosted <math.h> surface (design.md C99-48): a definition-less call to
@@ -15676,7 +16705,7 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       return emitHostedMathCall(call, *rustCallee);
   }
 
-  std::string name = mlirFuncName(callee);
+  std::string name = vaClone ? vaClone->name : mlirFuncName(callee);
   func::FuncOp target = functions.lookup(name);
   if (!target) {
     if (isSystemHeaderDecl(callee))
@@ -15691,9 +16720,24 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
           methodPlans.lookup(callee->getCanonicalDecl()))
     return emitMethodCallSite(call, target, ownerBase, loc);
 
+  // A callee with planned string-cursor parameters (CTS 00204) expands
+  // each `&p` cursor argument into (shared region slice, in-out cursor)
+  // and stores the advanced cursor back after the call.
+  if (const clang::FunctionDecl *definition = callee->getDefinition();
+      definition && llvm::any_of(definition->parameters(),
+                                 [&](const clang::ParmVarDecl *param) {
+                                   return cursorParams.contains(param);
+                                 }))
+    return emitCursorParamCall(call, target, loc);
+
   FunctionType targetType = target.getFunctionType();
   unsigned namedArgCount = call->getNumArgs();
-  if (callee->isVariadic()) {
+  if (vaClone) {
+    // A monomorphized call passes every argument — named parameters and
+    // this site's extras — as ordinary fixed arguments to the clone.
+    if (call->getNumArgs() != targetType.getNumInputs())
+      return emitError(loc) << "unsupported: call argument count mismatch";
+  } else if (callee->isVariadic()) {
     // A fixed-prototype variadic callee (va_list-free body, checked
     // above) takes only its named parameters; the trailing extras are
     // dropped from the call. A dropped extra is never imported — it must
@@ -15936,6 +16980,152 @@ bool CImporter::involvesDecomposedPointer(const clang::Stmt *stmt) const {
     if (involvesDecomposedPointer(child))
       return true;
   return false;
+}
+
+FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
+                                                func::FuncOp target,
+                                                Location loc) {
+  const clang::FunctionDecl *definition =
+      call->getDirectCallee()->getDefinition();
+  FunctionType targetType = target.getFunctionType();
+  if (call->getNumArgs() != definition->getNumParams())
+    return emitError(loc) << "unsupported: call argument count mismatch";
+  // Formal-to-input slot mapping: a cursor parameter owns two inputs
+  // (shared region slice, in-out i64 cursor).
+  unsigned numParams = definition->getNumParams();
+  SmallVector<unsigned, 4> slots(numParams, 0);
+  unsigned slot = 0;
+  for (unsigned index = 0; index < numParams; ++index) {
+    slots[index] = slot;
+    slot += cursorParams.contains(definition->getParamDecl(index)) ? 2 : 1;
+  }
+  if (slot != targetType.getNumInputs())
+    return emitError(loc) << "unsupported: call argument count mismatch";
+
+  SmallVector<Value> arguments(targetType.getNumInputs(), Value());
+  struct PendingCursor {
+    unsigned index;
+    const clang::VarDecl *pointer;
+  };
+  struct PendingBorrow {
+    unsigned index;
+    const clang::Expr *expr;
+  };
+  SmallVector<PendingCursor, 2> cursorArgs;
+  SmallVector<PendingBorrow, 4> borrows;
+  // Value arguments materialize first (C leaves evaluation order
+  // unspecified); every borrow-producing argument follows, immediately
+  // ahead of the call.
+  for (unsigned index = 0; index < numParams; ++index) {
+    const clang::Expr *argument = call->getArg(index);
+    if (cursorParams.contains(definition->getParamDecl(index))) {
+      // The argument must be `&p` over a decomposed pointer local — the
+      // caller-side string cursor whose advancement the callee writes.
+      const clang::Expr *stripped = stripTrivia(argument);
+      while (const auto *cast =
+                 llvm::dyn_cast<clang::ImplicitCastExpr>(stripped))
+        stripped = stripTrivia(cast->getSubExpr());
+      const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(stripped);
+      const clang::VarDecl *pointer =
+          addrOf && addrOf->getOpcode() == clang::UO_AddrOf
+              ? asLocalVarRef(addrOf->getSubExpr())
+              : nullptr;
+      if (!pointer || !pointerLocals.contains(pointer))
+        return emitError(loc)
+               << "unsupported: a string-cursor argument must be the "
+                  "address of a decomposed pointer local";
+      cursorArgs.push_back({index, pointer});
+      continue;
+    }
+    Type input = targetType.getInput(slots[index]);
+    if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(input)) {
+      borrows.push_back({index, argument});
+      continue;
+    }
+    FailureOr<Value> value = emitRValue(argument);
+    if (failed(value))
+      return failure();
+    arguments[slots[index]] = *value;
+  }
+  for (const PendingBorrow &borrow : borrows) {
+    const clang::VarDecl *root = nullptr;
+    FailureOr<Value> reference = emitBorrowArgument(
+        loc, borrow.expr, targetType.getInput(slots[borrow.index]), root);
+    if (failed(reference))
+      return failure();
+    arguments[slots[borrow.index]] = *reference;
+  }
+  struct StagedCursor {
+    Value tmpPlace;
+    Value cell;
+  };
+  SmallVector<StagedCursor, 2> stagedCursors;
+  IntegerType i64Type = builder.getIntegerType(64);
+  for (const PendingCursor &cursorArg : cursorArgs) {
+    const PointerLocalInfo &info =
+        pointerLocals.find(cursorArg.pointer)->second;
+    if (!info.cursorCell || info.nonNullCell || info.baseIndexCell ||
+        info.member)
+      return emitError(loc)
+             << "unsupported: a string-cursor argument must walk a single "
+                "byte region";
+    Value basePlace = info.literalBacking;
+    if (!basePlace) {
+      auto it = symbols.find(info.base);
+      if (it == symbols.end())
+        return emitError(loc)
+               << "unsupported: pointer target '" << info.base->getName()
+               << "' is not an importable place";
+      basePlace = it->second;
+    }
+    auto lvalueType =
+        llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
+    Type elementType;
+    if (lvalueType) {
+      if (auto arrayType =
+              llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType()))
+        elementType = arrayType.getElementType();
+      else if (auto sliceType = llvm::dyn_cast<emitrust::SliceType>(
+                   lvalueType.getValueType()))
+        elementType = sliceType.getElementType();
+    }
+    if (elementType != builder.getIntegerType(8))
+      return emitError(loc) << "unsupported: a string-cursor argument must "
+                               "walk a byte region";
+    unsigned slotIndex = slots[cursorArg.index];
+    // Shared whole-region slice: the callee only reads bytes; the cursor
+    // travels separately, so the slice starts at element zero and both
+    // sides speak absolute positions.
+    Value zero = createIntConstant(loc, i64Type, 0);
+    arguments[slotIndex] =
+        builder
+            .create<emitrust::SliceOfOp>(loc, targetType.getInput(slotIndex),
+                                         basePlace, zero, /*is_mut=*/false)
+            .getResult();
+    // The in-out cursor stages through a temp the callee writes; the
+    // caller's cursor cell takes the advanced value back after the call.
+    Value tmpPlace = createVariablePlace(loc, i64Type);
+    Value current = loadPlace(loc, info.cursorCell);
+    builder.create<emitrust::AssignOp>(loc, tmpPlace, current);
+    arguments[slotIndex + 1] =
+        builder
+            .create<emitrust::AddrOfOp>(loc,
+                                        targetType.getInput(slotIndex + 1),
+                                        tmpPlace, /*is_mut=*/true)
+            .getResult();
+    stagedCursors.push_back({tmpPlace, info.cursorCell});
+  }
+  for (auto [index, value] : llvm::enumerate(arguments))
+    if (!value || value.getType() != targetType.getInput(index))
+      return emitError(loc) << "unsupported: call argument type mismatch";
+  auto callOp = builder.create<func::CallOp>(loc, target, arguments);
+  for (const StagedCursor &staged : stagedCursors) {
+    Value advanced = loadPlace(loc, staged.tmpPlace);
+    builder.create<memref::StoreOp>(loc, advanced, staged.cell);
+  }
+  if (callOp->getNumResults() == 0)
+    return Value();
+  return callOp->getResult(0);
 }
 
 FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
@@ -17120,6 +18310,13 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       const auto *var =
           ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
       if (!var) {
+        // `*s` on a string-cursor parameter (CTS 00204): the read is the
+        // (region base, current cursor) decomposition the prologue bound
+        // for the parameter.
+        if (const clang::ParmVarDecl *cursorParam =
+                asPointerPointerParamDeref(sub);
+            cursorParam && pointerLocals.contains(cursorParam))
+          return emitPointerLocalRead(loc, cursorParam);
         // `*pp`: reading the first-order pointer a second-order pointer
         // selects is exactly a read of that pointer — the selection is
         // static under the degenerate one-cell region (CTS-P5).
@@ -18003,6 +19200,27 @@ CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
                     .create<emitrust::DerefOp>(
                         loc, emitrust::LValueType::get(pointee), *base)
                     .getResult();
+  } else if (const clang::CallExpr *call = [&]() -> const clang::CallExpr * {
+               // `f().m`: clang wraps the struct-returning call's result
+               // in a MaterializeTemporaryExpr; peel it to the call.
+               const clang::Expr *base = stripTrivia(member->getBase());
+               if (const auto *materialize =
+                       llvm::dyn_cast<clang::MaterializeTemporaryExpr>(base))
+                 base = stripTrivia(materialize->getSubExpr());
+               return llvm::dyn_cast<clang::CallExpr>(base);
+             }()) {
+    // A member access on a struct-returning call's result (CTS 00204).
+    // The call value has no place of its own, so it materializes into a
+    // temporary variable whose member is then read like any other place.
+    FailureOr<Value> value = emitCall(call);
+    if (failed(value))
+      return failure();
+    if (!*value || !llvm::isa<emitrust::StructType>((*value).getType()))
+      return emitError(loc)
+             << "unsupported: member access on a non-struct call result";
+    Value temp = createVariablePlace(loc, (*value).getType());
+    builder.create<emitrust::AssignOp>(loc, temp, *value);
+    basePlace = temp;
   } else {
     FailureOr<Value> base = emitLValue(member->getBase(), writeback);
     if (failed(base))
