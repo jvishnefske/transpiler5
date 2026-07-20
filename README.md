@@ -73,19 +73,55 @@ wraps, and the test programs avoid undefined behavior by construction.
 C `main` is imported as `c_main`; crate emission adds a `main` wrapper that exits with its
 result. The supported subset covers scalar and unsigned types, bitwise and shift
 operators, all the loop forms, `switch` (including fall-through, shared labels, nesting,
-and negative or 64-bit case values), C enums, the conditional and comma operators,
-`sizeof`, value-position assignment and increment/decrement, file-scope globals, static
-locals, structs, arrays, and a `printf` subset.
+and negative or 64-bit case values), C enums including int-to-enum conversions, the
+conditional and comma operators, `sizeof`, value-position assignment and
+increment/decrement, file-scope globals, static locals, structs (nested structs and
+whole-struct assignment included), arrays (multi-dimensional arrays and arrays of structs
+included), aggregate and designated initializers, pointer arithmetic, pointer locals, and
+pointer/array slice parameters, function pointers with call-site devirtualization,
+fixed-prototype variadic definitions, GNU statement expressions and `__builtin_expect`,
+`long double` mapped to `f64`, unions as a one-slot struct model, bit-fields via
+mask-and-shift accessors over packed backing integers, the full `printf` format language
+(`%s`, `%c`, `%u`, `%x`, `%o`, `%e`, `%g`, and friends), a curated
+`string.h`/`stdlib.h`/`math.h` libc subset, and `FILE*` I/O
+(`fopen`/`fread`/`fwrite`/`fgetc`/`fgets`/`fclose`).
 
-Rejected with located diagnostics — not miscompiled: `goto`, unions, bitfields,
-int-to-enum conversions, pointer arithmetic and pointer locals, multi-dimensional arrays,
-aggregate initializers, variadic definitions, and string literals outside `printf`. The
-current c-testsuite ledger stands at 220 tests: 75 transpiled, 75 passed, 0 miscompiled,
-145 unsupported.
+Rejected with located diagnostics — not miscompiled: computed goto (plain `goto` and
+labels are supported); general pointer-to-pointer beyond a single bounded `T **` local
+that statically selects one first-order pointer — third-order pointers,
+pointer-to-pointer parameters and struct fields, and multi-target or copied second-order
+pointers; general dynamic memory (`malloc`/`calloc`/`realloc`/`free`) beyond the one
+constant-size-allocation-to-static-array carve-out; `char *` variables bound directly to
+a string literal (as opposed to `char s[] = "..."` and the printf/puts `%s` shapes, which
+are supported); row-pointer walking arithmetic and slices of rows into multi-dimensional
+arrays; union arms that are bit-fields, unnamed/anonymous, pointers, of differing sizes,
+or non-identical aggregates/enums, plus taking the address of a union member and `++`/`--`
+through a float-pun arm; bit-fields that are zero-width or anonymous, runs wider than 64
+bits, bit-field arms inside unions, compound assignment or increment on a bit-field, and
+`sizeof`/`_Alignof` of a struct containing one; and, on the Rust-output side, generics,
+lifetimes beyond simple references, traits and impls, pattern matching beyond literal
+match arms, data-carrying enums, and expression inlining (every value is a named `let`
+binding). The c-testsuite ledger is complete: 220 total, 220 passed, 0 miscompiled, 0
+unsupported.
 
-One documented divergence remains: the *sign* of a NaN produced by `0.0/0.0`, which C
-leaves unspecified (Annex F) and which observably differs between gcc and clang on
-identical source, so it cannot be diffed against any single reference.
+### Known issues
+
+- The *sign* of a NaN produced by `0.0/0.0` is a documented divergence: C leaves it
+  unspecified (Annex F), and it observably differs between gcc and clang on identical
+  source, so it cannot be diffed against any single reference.
+- Piping the raw `--emit=import` dump (or `emitrust-import-c`'s output) back into
+  `emitrust-opt` can fail with `integer value too large` on a `switch` with a negative or
+  above-`i64::MAX` 64-bit case label: upstream MLIR's `cf.switch` printer renders such
+  values in unsigned decimal (a `-1` label prints as `18446744073709551615`), but its
+  parser only accepts signed `i64` literals. This is not currently reproducible anywhere
+  past that one raw debug-dump stage: by the `--emit=mlir` stage the switch has already
+  lowered into EmitRust's own `emitrust.switch`, whose case values print and parse
+  symmetrically, and the differential end-to-end tests (including
+  test/EndToEnd/switch-general.c, which pins `INT_MIN` and sub-`INT32_MIN` labels through
+  the full pipeline) pass byte-identical regardless. If it resurfaces outside the raw
+  import dump, treat it as an upstream MLIR `cf.switch` serialization asymmetry, not an
+  EmitRust importer bug — see test/Import/C/switch-unsigned64.c, which documents the same
+  asymmetry and deliberately skips the reparse pipe.
 
 ## Building and testing
 
