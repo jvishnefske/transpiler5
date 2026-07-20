@@ -1,50 +1,48 @@
-// W3.1 EXTERN-ARRAY COMPOSITE-MERGE PROBE — a LOUD finding for W3.2.
+// W3.1 EXTERN-ARRAY COMPOSITE-MERGE PROBE — FLIPPED GREEN by W3.2 COMMIT B.
 //
 // C99 6.2.7 lets an incomplete-size `extern int a[];` in one translation
 // unit be completed by the array's real definition (`int a[4] = ...;`)
 // in another: the linker/compiler produces one COMPOSITE type. This is
 // NOT a pointer-parameter shape at all, so it is untouched by the eight
-// G1-G8 gates surveyed above — but the importer has NO cross-TU type
-// composition step whatsoever: each translation unit is parsed as an
+// G1-G8 gates surveyed above — but each translation unit parses as an
 // independent `clang::ASTUnit` (see importCProject's per-file
-// `ClangTool`), and `createGlobal`/`deferExternGlobal` map a global's
-// type from THIS TU's OWN most-recent declaration
-// (ImportCGlobals.cpp:71-77's "most recent decl ... merged composite of
-// all redeclarations" comment is true only WITHIN one ASTContext — it
-// cannot see another TU's redeclaration at all).
+// `ClangTool`), and W3.1 found the importer had NO cross-TU type
+// composition step at all: a TU whose ONLY declaration of `a` is the
+// incomplete `extern int a[];` mapped that declaration's own (incomplete)
+// array type when `a` was used, hitting mapType's "non-constant array
+// size" rejection at the extern declaration itself, independent of
+// processing order or whether the completing definition existed at all.
 //
-// Result (verified verbatim against the build in this wave): a TU whose
-// ONLY declaration of `a` is the incomplete `extern int a[];` maps that
-// declaration's own (incomplete) array type when `a` is used, and hits
-// mapType's "non-constant array size" rejection at the EXTERN
-// DECLARATION ITSELF — REGARDLESS of which TU is processed first, and
-// regardless of whether the complete definition exists in the other TU
-// at all. This is a REAL GAP, not merely a conservative gate: the
-// BOUNDED baseline below shows the ordinary case (extern with an
-// explicit, matching bound, `extern int a[4];`) already works fine
-// today; only the incomplete-bound spelling is broken.
-//
-// W3.2 must give the importer some cross-TU composite-type step (at
-// minimum: when a global is deferred as extern with an incomplete array
-// type, defer its OWN type mapping to `finalizeProject` too, the same
-// way its existence check is already deferred) before this probe can
-// pass as a genuine differential.
+// W3.2 COMMIT B's fix: the whole-program pre-scan
+// (`collectWholeProgramInfo`) records, for every externally visible
+// bounded-array DEFINITION in any TU, its complete element type (mapped
+// with a small memoization-free scalar mapper deliberately narrower than
+// the real `mapType`, so this speculative pre-scan never touches
+// `mapType`'s Pass-A-dependent byte-region-aggregate caches before this
+// TU's own Pass-A has run). `deferExternGlobal` resolves an
+// incomplete-array extern's type from this whole-program fact instead of
+// its own (incomplete) declaration when a completing definition exists
+// project-wide -- mirroring how the EXISTENCE check is already deferred
+// via `pendingExternGlobals`. The BOUNDED baseline below shows the
+// already-supported case (an extern with an explicit, matching bound)
+// is unaffected.
 //
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/incomplete-use.c %t/def.c 2>&1 | FileCheck %s --check-prefix=INCOMPLETE
-// RUN: not emitrust-import-c %t/def.c %t/incomplete-use.c 2>&1 | FileCheck %s --check-prefix=INCOMPLETE
+// RUN: emitrust-import-c %t/incomplete-use.c %t/def.c | FileCheck %s --check-prefix=INCOMPLETE
+// RUN: emitrust-import-c %t/def.c %t/incomplete-use.c | FileCheck %s --check-prefix=INCOMPLETE
 // RUN: emitrust-import-c %t/bounded-use.c %t/def.c | FileCheck %s --check-prefix=BOUNDED
 
 //--- incomplete-use.c
 // The incomplete-bound extern: C legally defers `a`'s size to the other
-// TU's definition. The importer cannot see across TUs and maps THIS
-// declaration's own (incomplete) type — a hard, verbatim-located
-// rejection, independent of processing order.
+// TU's definition. The whole-program pre-scan resolves the composite
+// type from `def.c`'s complete definition regardless of processing order.
 extern int a[];
 int read_a(int i) { return a[i]; }
 int main(void) { return read_a(2); }
 
-// INCOMPLETE: incomplete-use.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-constant array size
+// INCOMPLETE-DAG: emitrust.global @a <[10 : i32, 20 : i32, 30 : i32, 40 : i32]> : !emitrust.array<4xi32>
+// INCOMPLETE-DAG: func.func @read_a(%{{.*}}: i32) -> i32
+// INCOMPLETE-DAG: func.func @c_main() -> i32
 
 //--- def.c
 int a[4] = {10, 20, 30, 40};

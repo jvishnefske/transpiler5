@@ -1750,6 +1750,74 @@ void CImporter::collectCrossTuVaListVariadics(clang::ASTContext &context) {
   }
 }
 
+namespace {
+/// A minimal, memoization-free scalar type mapper for the whole-program
+/// array-completion pre-scan (`collectWholeProgramInfo`): mirrors
+/// `mapType`'s plain `clang::BuiltinType` switch exactly (same widths,
+/// same signedness-to-MLIR-unsigned mapping), returning a null `Type` for
+/// anything else. Deliberately narrower than `mapType`: it must never
+/// touch `isByteRegionRecord`/`isByteRegionAggregate` (whose memoized
+/// classification is only sound once this TU's own Pass-A has run) or
+/// emit a diagnostic (this is a speculative fact-gathering probe, not a
+/// real import step).
+Type mapSpeculativeScalarType(OpBuilder &builder, clang::QualType type) {
+  const auto *builtin = llvm::dyn_cast<clang::BuiltinType>(type.getTypePtr());
+  if (!builtin)
+    return Type();
+  switch (builtin->getKind()) {
+  case clang::BuiltinType::Bool:
+    return builder.getI1Type();
+  case clang::BuiltinType::Char_S:
+  case clang::BuiltinType::SChar:
+    return builder.getIntegerType(8);
+  case clang::BuiltinType::Short:
+    return builder.getIntegerType(16);
+  case clang::BuiltinType::Int:
+    return builder.getIntegerType(32);
+  case clang::BuiltinType::Long:
+  case clang::BuiltinType::LongLong:
+    return builder.getIntegerType(64);
+  case clang::BuiltinType::Float:
+    return builder.getF32Type();
+  case clang::BuiltinType::Double:
+  case clang::BuiltinType::LongDouble:
+    return builder.getF64Type();
+  case clang::BuiltinType::Char_U:
+  case clang::BuiltinType::UChar:
+    return IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  case clang::BuiltinType::UShort:
+    return IntegerType::get(builder.getContext(), 16, IntegerType::Unsigned);
+  case clang::BuiltinType::UInt:
+    return IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
+  case clang::BuiltinType::ULong:
+  case clang::BuiltinType::ULongLong:
+    return IntegerType::get(builder.getContext(), 64, IntegerType::Unsigned);
+  default:
+    return Type();
+  }
+}
+
+/// Recursively maps a (possibly multi-dimensional) constant-size array of
+/// `mapSpeculativeScalarType`-eligible scalars to `!emitrust.array`,
+/// bottoming out at the innermost scalar element; returns null for
+/// anything else (an array of records, pointers, enums, byte-region
+/// aggregates, ...), which is exactly the "not speculatively safe to map"
+/// signal `collectWholeProgramInfo` needs.
+Type mapSpeculativeArrayType(OpBuilder &builder, clang::ASTContext &context,
+                             clang::QualType type) {
+  if (const clang::ConstantArrayType *array =
+          context.getAsConstantArrayType(type)) {
+    Type element =
+        mapSpeculativeArrayType(builder, context, array->getElementType());
+    if (!element)
+      return Type();
+    return emitrust::ArrayType::get(
+        builder.getContext(), array->getSize().getZExtValue(), element);
+  }
+  return mapSpeculativeScalarType(builder, type);
+}
+} // namespace
+
 void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
                                         unsigned tuIndex) {
   // Pre-scan (W3.2): set the AST context so `mlirFuncName`,
@@ -1805,7 +1873,13 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
   };
 
   // Records a data-pointer global's binding base (`g = &base…`) into
-  // `pointerGlobalBases`, given an assignment's LHS and RHS.
+  // `pointerGlobalBases`, given an assignment's LHS and RHS. Every call site
+  // of this lambda is a BODY-level reassignment (the file-scope initializer
+  // is handled separately below), so it also flags
+  // `pointerGlobalHasBodyRebind`: a global pointer reassigned anywhere in
+  // the project has a runtime, not compile-time, cursor, which rules it out
+  // of the static cross-TU reconstruction below regardless of how many
+  // distinct bases it ends up bound to.
   auto recordPointerGlobalBinding = [&](const clang::Expr *lhs,
                                         const clang::Expr *rhs) {
     const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(lhs));
@@ -1817,9 +1891,70 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
     clang::QualType type = var->getType().getCanonicalType();
     if (!type->isPointerType() || type->isFunctionPointerType())
       return;
+    std::string symbol = globalVarSymbolName(var);
+    wholeProgram.pointerGlobalHasBodyRebind.insert(symbol);
     std::string base = addressBoundGlobal(rhs);
     if (!base.empty())
-      wholeProgram.pointerGlobalBases[globalVarSymbolName(var)].insert(base);
+      wholeProgram.pointerGlobalBases[symbol].insert(base);
+  };
+
+  // Records the flat i64 cursor start of `var`'s file-scope initializer
+  // into `pointerGlobalSoleFileScopeBase`/`pointerGlobalCursorStart`, when
+  // it is the single supported "real global object base" shape (CTS-P4
+  // shape 3: `T *g = &base[i];` or `T *g = &base;`, no member projection,
+  // an element-boundary offset) -- the narrow cross-TU reconstruction fact
+  // `deferExternGlobal` (W3.2 COMMIT B) consumes for the shared pointer
+  // global fix. Anything else (a literal/allocation-backed shape, a
+  // member-rooted binding, a non-element-boundary offset, or a mismatched
+  // pointee type) records nothing, so `deferExternGlobal` keeps the
+  // historical unconditional rejection for those shapes.
+  auto recordPointerGlobalFileScopeDetail = [&](const clang::VarDecl *var) {
+    const clang::APValue *value = var->evaluateValue();
+    if (!value || !value->isLValue() || value->isNullPointer())
+      return;
+    const auto *baseDecl =
+        value->getLValueBase().dyn_cast<const clang::ValueDecl *>();
+    const auto *baseVar =
+        baseDecl ? llvm::dyn_cast<clang::VarDecl>(baseDecl) : nullptr;
+    // Only an externally visible base is eagerly re-importable by its bare
+    // symbol name in `deferExternPointerGlobal` (W3.2 COMMIT B): an
+    // internal-linkage base would need the DEFINING TU's own per-TU
+    // mangling tag, which this whole-program, tag-free fact set does not
+    // track.
+    if (!baseVar || baseVar->hasLocalStorage() ||
+        !baseVar->isExternallyVisible())
+      return;
+    clang::QualType pointee =
+        var->getType().getCanonicalType()->getPointeeType();
+    clang::QualType baseType = baseVar->getType().getCanonicalType();
+    int64_t byteOffset = value->getLValueOffset().getQuantity();
+    int64_t cursorStart = 0;
+    if (const clang::ConstantArrayType *array =
+            context.getAsConstantArrayType(baseType)) {
+      bool matchesLevel = false;
+      for (const clang::ConstantArrayType *level = array; level;
+           level = context.getAsConstantArrayType(level->getElementType())) {
+        if (context.hasSameUnqualifiedType(pointee, level->getElementType())) {
+          matchesLevel = true;
+          break;
+        }
+      }
+      if (!matchesLevel)
+        return;
+      clang::QualType innermost = context.getBaseElementType(baseType);
+      int64_t innerBytes = context.getTypeSizeInChars(innermost).getQuantity();
+      if (innerBytes <= 0 || byteOffset < 0 || byteOffset % innerBytes != 0)
+        return;
+      cursorStart = byteOffset / innerBytes;
+    } else {
+      if (byteOffset != 0 ||
+          !context.hasSameUnqualifiedType(pointee, baseType))
+        return;
+    }
+    std::string symbol = globalVarSymbolName(var);
+    wholeProgram.pointerGlobalSoleFileScopeBase[symbol] =
+        baseVar->getCanonicalDecl();
+    wholeProgram.pointerGlobalCursorStart[symbol] = cursorStart;
   };
 
   // Records `tuIndex` into a per-symbol TU list, deduplicated.
@@ -1894,7 +2029,30 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
             if (!base.empty())
               wholeProgram.pointerGlobalBases[globalVarSymbolName(var)].insert(
                   base);
+            recordPointerGlobalFileScopeDetail(var);
           }
+        // Extern-array composite merge (W3.2 COMMIT B): record this TU's
+        // COMPLETE mapped type for a bounded array definition, so
+        // `deferExternGlobal` can resolve another TU's `extern int a[];`
+        // (whose own type is incomplete and unmappable) against it. Only a
+        // COMPLETE array records here (never overwriting with an
+        // incomplete sighting). This deliberately does NOT call the real
+        // `mapType`: `mapType`'s array case consults
+        // `isByteRegionAggregate`/`isByteRegionRecord`, whose memoized
+        // classification is only sound once THIS TU's own Pass-A
+        // (`collectDeclTypeRecords`/`planFnPtrMembers`) has run -- calling
+        // it speculatively here, before any TU's Pass-A runs, poisons that
+        // cache for the real import that follows (observed: a spurious
+        // 00216.c ledger regression, a `void*` struct member classified
+        // inconsistently). `mapSpeculativeArrayType` instead mirrors only
+        // `mapType`'s plain-scalar builtin cases, touching no cache; any
+        // other element type (records, enums, pointers, byte-region
+        // aggregates, ...) leaves this symbol unrecorded, and
+        // `deferExternGlobal` keeps the historical rejection for it.
+        if (context.getAsConstantArrayType(type))
+          if (Type mapped = mapSpeculativeArrayType(builder, context, type))
+            wholeProgram.completeArrayGlobalTypes[globalVarSymbolName(var)] =
+                mapped;
       }
       if (const clang::Expr *init = var->getInit())
         scan(scan, init);

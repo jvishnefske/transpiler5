@@ -2015,10 +2015,25 @@ private:
   /// Registers an `extern`-only global reference (project import) without
   /// creating an `emitrust.global`: records the mapping so uses in this TU
   /// resolve and remembers `symbolName` for the post-merge check that some TU
-  /// really defines it. Rejects pointer-typed and unmappable globals.
+  /// really defines it. Rejects unmappable non-pointer globals (an
+  /// incomplete-array extern resolves its bound from
+  /// `WholeProgramInfo::completeArrayGlobalTypes` when some TU completes it,
+  /// W3.2 COMMIT B) and delegates every pointer-typed extern to
+  /// `deferExternPointerGlobal`.
   LogicalResult deferExternGlobal(const clang::VarDecl *key,
                                   llvm::StringRef symbolName,
                                   clang::QualType qualType, Location loc);
+
+  /// Handles a pointer-typed `extern`-only global reference (project
+  /// import): a global historically rejected unconditionally, now resolved
+  /// against `WholeProgramInfo`'s narrow "shared header pointer global"
+  /// reconstruction (W3.2 COMMIT B) when the whole project shows exactly
+  /// one, never-reassigned, file-scope binding; every other shape keeps the
+  /// historical rejection.
+  LogicalResult deferExternPointerGlobal(const clang::VarDecl *key,
+                                         llvm::StringRef symbolName,
+                                         clang::QualType qualType,
+                                         Location loc);
 
   /// Evaluates `decl`'s initializer as a constant (clang APValue
   /// evaluation) and converts it to an attribute of `type`. Supports

@@ -416,17 +416,119 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
   return success();
 }
 
+LogicalResult CImporter::deferExternPointerGlobal(const clang::VarDecl *key,
+                                                  llvm::StringRef symbolName,
+                                                  clang::QualType qualType,
+                                                  Location loc) {
+  // The narrow, sound cross-TU reconstruction (W3.2 COMMIT B, the "shared
+  // header pointer global" fix): a SOLE project-wide binding via a plain
+  // file-scope initializer, never reassigned anywhere in the project.
+  // Anything else -- no whole-program definition at all, a divergent
+  // multi-base rebinding, a synthesized (literal/allocation) backing, a
+  // member-rooted binding, or a body-level rebind even to the same base --
+  // keeps the historical unconditional rejection: each check below is a
+  // strict subset test against facts `collectWholeProgramInfo` already
+  // computed with the whole project visible.
+  if (isRustKeyword(symbolName))
+    return emitError(loc) << "unsupported: global variable name '"
+                          << symbolName << "' is a Rust keyword";
+  auto basesIt = wholeProgram.pointerGlobalBases.find(symbolName);
+  auto baseDeclIt =
+      wholeProgram.pointerGlobalSoleFileScopeBase.find(symbolName);
+  if (basesIt == wholeProgram.pointerGlobalBases.end() ||
+      basesIt->second.size() != 1 ||
+      baseDeclIt == wholeProgram.pointerGlobalSoleFileScopeBase.end() ||
+      wholeProgram.pointerGlobalHasBodyRebind.contains(symbolName))
+    return emitError(loc) << "unsupported: pointer-typed global variable";
+
+  const clang::VarDecl *base = baseDeclIt->second;
+  int64_t cursorStart = wholeProgram.pointerGlobalCursorStart.lookup(symbolName);
+  clang::QualType pointee = qualType->getPointeeType();
+
+  // Import the base object now, from its OWN TU's AST context, so
+  // `globals`/`pointerGlobals` resolve it regardless of which TU is
+  // processed first -- the closed-program assumption: `importCProject`
+  // keeps every parsed AST alive for the whole call, so a foreign-TU
+  // `Decl*` stays a valid, stable identity to import eagerly.
+  // `importGlobalVar` is idempotent (`globals.contains` guard first), so
+  // re-importing an already-imported base is a no-op; `base` is always
+  // externally visible (recorded only for such bases), so no per-TU
+  // mangling tag is needed for its own symbol name.
+  clang::ASTContext *savedContext = astContextPtr;
+  astContextPtr = &base->getASTContext();
+  LogicalResult baseImported = importGlobalVar(base);
+  bool baseIsArray = astContext().getAsConstantArrayType(
+                         base->getType().getCanonicalType()) != nullptr;
+  clang::QualType baseElementOrWhole =
+      baseIsArray ? astContext().getBaseElementType(base->getType())
+                  : base->getType().getCanonicalType();
+  FailureOr<Type> baseElementMlirType =
+      failed(baseImported)
+          ? FailureOr<Type>(failure())
+          : mapType(baseElementOrWhole, translateLoc(base->getLocation()));
+  astContextPtr = savedContext;
+  if (failed(baseImported) || failed(baseElementMlirType))
+    return failure();
+
+  // MLIR `Type`/`Attribute` objects are owned by the shared `MLIRContext`
+  // (not by either TU's `clang::ASTContext`), so comparing a type mapped
+  // from the base's own context against one mapped from this TU's context
+  // is sound -- unlike comparing the underlying `clang::QualType`s
+  // directly, which would spuriously disagree (each AST interns its own
+  // canonical types).
+  FailureOr<Type> pointeeMlirType = mapType(pointee, loc);
+  if (failed(pointeeMlirType))
+    return failure();
+  if (*pointeeMlirType != *baseElementMlirType)
+    return emitError(loc) << "unsupported: pointer-typed global variable";
+
+  if (baseIsArray) {
+    std::string cursorSymbol = symbolName.str();
+    if (!SymbolTable::lookupSymbolIn(module, cursorSymbol)) {
+      OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+      IntegerType i64Type = builder.getIntegerType(64);
+      moduleBuilder.create<emitrust::GlobalOp>(
+          loc, moduleBuilder.getStringAttr(cursorSymbol),
+          TypeAttr::get(i64Type),
+          moduleBuilder.getIntegerAttr(i64Type, cursorStart), UnitAttr());
+    }
+    pointerGlobals[key] =
+        PointerGlobalInfo{base, std::string(), Type(), cursorSymbol};
+  } else {
+    pointerGlobals[key] =
+        PointerGlobalInfo{base, std::string(), Type(), std::string()};
+  }
+  return success();
+}
+
 LogicalResult CImporter::deferExternGlobal(const clang::VarDecl *key,
                                            llvm::StringRef symbolName,
                                            clang::QualType qualType,
                                            Location loc) {
-  if (qualType.getCanonicalType()->isPointerType() &&
-      !qualType.getCanonicalType()->isFunctionPointerType())
-    return emitError(loc) << "unsupported: pointer-typed global variable";
-  FailureOr<Type> mlirType = mapType(qualType, loc);
-  if (failed(mlirType))
-    return failure();
-  globals[key] = GlobalInfo{symbolName.str(), *mlirType};
+  clang::QualType canonical = qualType.getCanonicalType();
+  if (canonical->isPointerType() && !canonical->isFunctionPointerType())
+    return deferExternPointerGlobal(key, symbolName, canonical, loc);
+  Type mlirType;
+  // An incomplete-array extern (`extern int a[];`) defers its bound to
+  // whichever TU completes it (C99 6.2.7); `mapType` cannot map an
+  // incomplete array at all, and this declaration's own type is exactly
+  // the incomplete one, so resolve the composite type from the
+  // whole-program pre-scan (`collectWholeProgramInfo`, which already saw
+  // every TU's complete array definitions before this one imported)
+  // instead. Mirrors how the EXISTENCE check just below is already
+  // deferred via `pendingExternGlobals`.
+  if (astContext().getAsIncompleteArrayType(canonical)) {
+    auto it = wholeProgram.completeArrayGlobalTypes.find(symbolName);
+    if (it != wholeProgram.completeArrayGlobalTypes.end())
+      mlirType = it->second;
+  }
+  if (!mlirType) {
+    FailureOr<Type> mapped = mapType(canonical, loc);
+    if (failed(mapped))
+      return failure();
+    mlirType = *mapped;
+  }
+  globals[key] = GlobalInfo{symbolName.str(), mlirType};
   pendingExternGlobals.try_emplace(symbolName, loc);
   return success();
 }

@@ -615,6 +615,100 @@ lists the lit test file(s) that validate it.
   test/Import/C/owners.c, owners-fallback.c, test/EndToEnd/owners.c)
   S1b traversal fusion deferred: changes inter-analysis ordering (the
   Pass-A planners share their scaffold but keep separate TU walks).
+- [x] FR-31 Whole-program cross-TU analysis substrate, and two closed-
+  program correctness fixes (W3.2). `planOwners`/`planCellSlices`/
+  `planFnPtrAliases` (FR-30/FR-28's Pass A) do ZERO cross-TU merging: each
+  runs per TU over fresh state keyed by `clang::Decl*`, which has no
+  identity across the independent `clang::ASTContext` instances
+  `importCProject`'s per-file `ClangTool` parses (W2.0). `WholeProgramInfo`
+  (CImporterInternal.h) is a symbol-name-keyed whole-program fact base —
+  MLIR symbol name is the one identity that bridges the independent
+  ASTContexts, the same bridge W3.0's `crossTuVaListVariadicNames` already
+  uses — populated by `collectWholeProgramInfo`, a pre-import pass run
+  over EVERY parsed AST (swapping `astContextPtr` per AST, mirroring
+  `collectCrossTuVaListVariadics`) BEFORE `importCProject`'s per-TU import
+  loop begins, so every fact is complete regardless of which TU is
+  processed first. This relies on the CLOSED-PROGRAM ASSUMPTION already
+  implicit in `importCProject`'s contract: it receives every translation
+  unit of the project up front and keeps every parsed `ASTUnit` alive for
+  the whole call, so a `clang::Decl*`/`ASTContext&` from any TU stays a
+  valid, comparable identity for the entire import, even one from a TU
+  that has not been (or will never be) the "current" one. Landing this
+  substrate alone changed nothing (verified byte-identical importer output
+  over the whole Import/EndToEnd corpus): nothing consumed it yet. Two
+  fixes now consume it, both scoped to the narrow, verifiably sound shape
+  each needs and falling back to the historical rejection for every other
+  shape:
+  - Shared pointer global: `extern int *g;` in one TU, `int *g = &arr[0];`
+    defined in another (the natural header-shared pointer-global idiom).
+    This is NOT the `importPointerGlobal` external-linkage gate (which
+    only fires when a TU both defines AND locally uses its own pointer
+    global) — the defining TU here never locally references `g` (only
+    initializes it), so `importPointerGlobal`'s referenced-only skip fires
+    and that gate never runs; the actual rejection was a separate,
+    unconditional check in `deferExternGlobal` refusing every pointer-typed
+    extern outright. The whole-program pre-scan evaluates every file-scope
+    pointer global's initializer AND every function-body reassignment
+    project-wide (the same `PointerRegionAnalysis`/`mergeRegionFacts`
+    machinery `planOwners` uses, merged by symbol name instead of per-TU
+    `Decl*`), recording a symbol as reconstructible only when the whole
+    project shows EXACTLY one base, bound by a plain file-scope
+    initializer, with NO reassignment anywhere (a dynamically reassigned
+    pointer's cursor is a runtime value with no compile-time offset — out
+    of scope here, and still rejected). For such a symbol,
+    `deferExternGlobal` delegates to `deferExternPointerGlobal`, which
+    EAGERLY re-imports the base object from its OWN TU's `ASTContext`
+    (idempotent — `importGlobalVar` already guards re-entry — and order-
+    independent, since the base's `Decl*` and its owning `ASTContext`
+    remain valid for the whole `importCProject` call) and synthesizes the
+    extern's own `i64` cursor global, comparing the base's element type
+    against the pointee by their MAPPED MLIR types (not the raw clang
+    `QualType`s, which are interned per-`ASTContext` and would spuriously
+    disagree across TUs even for identical C types). A divergent rebinding
+    (the same externally visible pointer bound to two different bases
+    across TUs) keeps rejecting: the single-base cursor model has no
+    representation for "the base depends on which TU last ran."
+  - Incomplete-extern-array composite merge: `extern int a[];` in one TU,
+    completed by `int a[4] = {...};` in another (C99 6.2.7). Each TU parses
+    as an independent `ASTUnit` with no cross-TU type composition step, so
+    the incomplete declaration's OWN (incomplete) type could never map —
+    a real gap, not a conservative gate (the bounded case, `extern int
+    a[4];`, already worked). The whole-program pre-scan records, for every
+    externally visible bounded-array DEFINITION in any TU, its complete
+    element type — mapped with `mapSpeculativeArrayType`, a small
+    memoization-free mirror of `mapType`'s plain-scalar-builtin cases ONLY.
+    This deliberately narrower mapper is required, not a shortcut: `mapType`
+    itself consults `isByteRegionRecord`/`isByteRegionAggregate`, whose
+    memoized classification is sound only once THIS TU's own Pass-A
+    (`collectDeclTypeRecords`/`planFnPtrMembers`) has run; calling the real
+    `mapType` speculatively, before any TU's Pass-A runs, was tried first
+    and poisoned that cache for the real import that followed (caught as a
+    c-testsuite ledger regression on 00216, a `void*` fn-ptr struct member
+    classified inconsistently — a reminder that even a "purely additive,
+    nothing consumes it" fact-gathering pass can still corrupt a later
+    pass through shared mutable memoization state, independent of whether
+    its own diagnostics are suppressed). `deferExternGlobal` resolves an
+    incomplete-array extern's type from this whole-program fact when a
+    completing definition exists project-wide, exactly mirroring how the
+    EXISTENCE check is already deferred via `pendingExternGlobals`; absent
+    a completing definition, or for any element type the narrow mapper
+    does not handle, it keeps the historical "non-constant array size"
+    rejection.
+  Both fixes are order-independent (verified with the TU list given in
+  both orders) and produce byte-identical crate output vs the clang-linked
+  native binary. Pass-A planners (`planOwners`, `planCellSlices`,
+  `planFnPtrAliases`, `planCursorParams`, `planVaMonomorph`,
+  `collectDeclTypeRecords`, `planFnPtrMembers`) moved from ImportC.cpp to
+  ImportC/ImportCPlanning.cpp by pure code motion in the same wave (they
+  were deliberately left behind during the W1.8-W1.12 file split for
+  exactly this purpose); `collectWholeProgramInfo` and
+  `collectCrossTuVaListVariadics` (W3.0) stay in ImportC.cpp since they are
+  whole-program passes, not per-TU planners.
+  (test/Import/C/multi-tu-gate-g8-ptr-global-shared-header.c,
+  multi-tu-gate-g8-ptr-global-negative.c (must stay rejected),
+  multi-tu-gate-g8-ptr-global-external.c (G8 itself, untouched, must stay
+  rejected), multi-tu-extern-array-composite-merge-probe.c;
+  test/EndToEnd/multi-tu-gate-g8-shared-header.c)
 
 ## C99 Support Roadmap
 
