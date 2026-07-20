@@ -427,6 +427,28 @@ struct SelectOpConversion : public OpConversionPattern<arith::SelectOp> {
   }
 };
 
+/// Converts `arith.negf` (C unary minus on a floating operand) into
+/// `emitrust.sub` against a zero constant of the operand type — the `0.0 - x`
+/// spelling, mirroring the `0 - x` lowering the importer uses for signless
+/// integer negation. EmitRust has no unary negation op of its own.
+struct NegFOpConversion : public OpConversionPattern<arith::NegFOp> {
+  using OpConversionPattern<arith::NegFOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::NegFOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Type resultType = getTypeConverter()->convertType(op.getType());
+    auto floatType = dyn_cast_or_null<FloatType>(resultType);
+    if (!floatType)
+      return rewriter.notifyMatchFailure(op, "negf result is not a float type");
+    Value zero = rewriter.create<emitrust::ConstantOp>(
+        op.getLoc(), floatType, rewriter.getFloatAttr(floatType, 0.0));
+    rewriter.replaceOpWithNewOp<emitrust::SubOp>(op, resultType, zero,
+                                                 adaptor.getOperand());
+    return success();
+  }
+};
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -449,6 +471,7 @@ void mlir::emitrust::populateArithToEmitRustPatterns(
                BinaryOpConversion<arith::SubFOp, emitrust::SubOp>,
                BinaryOpConversion<arith::MulFOp, emitrust::MulOp>,
                BinaryOpConversion<arith::DivFOp, emitrust::DivOp>,
+               NegFOpConversion,
                BinaryOpConversion<arith::AndIOp, emitrust::AndOp>,
                BinaryOpConversion<arith::OrIOp, emitrust::OrOp>,
                BinaryOpConversion<arith::XOrIOp, emitrust::XorOp>,
