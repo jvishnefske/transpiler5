@@ -372,6 +372,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/OperationKinds.h"
+#include "clang/AST/RecordLayout.h"
 #include "clang/AST/Stmt.h"
 #include "clang/AST/Type.h"
 #include "clang/Basic/Builtins.h"
@@ -2178,6 +2179,205 @@ private:
   FailureOr<Value> stageGlobalCopyAndRecord(Location loc,
                                             const clang::VarDecl *base,
                                             GlobalWriteback *writeback);
+
+  //===--------------------------------------------------------------------===//
+  // CTS-BR (00216): the u8-only byte-region aggregate model.
+  //
+  // An aggregate whose scalar leaves are ALL `unsigned char` is
+  // padding-free by construction and imports as a plain byte region: the
+  // object is an `!emitrust.array<Nxui8>` (N == sizeof), no struct_def is
+  // emitted for the record, constant initializers fold to complete byte
+  // images (globals) or per-byte stores (locals), member access is an
+  // `emitrust.subscript` at the member's constant byte offset, and
+  // `(u8 *)&x` is the region base. Pointers to byte-region records are
+  // `!emitrust.slice<ui8>` parameters riding the existing slice-parameter
+  // decomposition, with byte-granular cursors.
+  //===--------------------------------------------------------------------===//
+
+  /// Returns whether `type` is exactly C's `unsigned char` (the one leaf
+  /// scalar the byte-region model admits).
+  bool isU8ScalarType(clang::QualType type) const;
+
+  /// Returns whether `record` classifies as a byte-region record: every
+  /// struct leaf is `unsigned char` (directly, through nested byte-region
+  /// records, through constant arrays of either, with empty structs,
+  /// GNU zero-length arrays, and a trailing flexible array member
+  /// contributing zero bytes), and every union arm is either u8-only or a
+  /// constant array of non-u8 scalars whose total size equals the
+  /// union's (the in6_addr `unsigned short u6_addr16[8]` type-level
+  /// alias). A zero-size record (empty struct) stays on the typed path —
+  /// the dialect has no zero-length array — and unions must keep at
+  /// least one u8-only arm so scalar-pun unions never reclassify.
+  bool isByteRegionRecord(const clang::RecordDecl *record);
+
+  /// Returns whether `type` is a byte-region aggregate: a byte-region
+  /// record, or a constant array (of arrays) of byte-region records —
+  /// which flattens to ONE region of n*sizeof bytes. Plain `unsigned
+  /// char` arrays are NOT byte-region aggregates; they keep the native
+  /// array path.
+  bool isByteRegionAggregate(clang::QualType type);
+
+  /// Whether the (possibly nested) member/subscript/deref expression
+  /// `expr` designates storage inside a byte-region aggregate, i.e. must
+  /// route through the byte-region place resolution instead of the typed
+  /// member/subscript emission.
+  bool exprRootsInByteRegion(const clang::Expr *expr);
+
+  /// A resolved byte-region designator: a base region place (an
+  /// `!emitrust.lvalue` of `!emitrust.array<Nxui8>` or
+  /// `!emitrust.slice<ui8>`) plus the byte offset of the designated
+  /// storage, split into a folded constant part and an optional runtime
+  /// i64 part (subscripts with runtime indices, walking pointer cursors).
+  struct ByteRegionRef {
+    Value place;
+    int64_t constOff = 0;
+    Value dynOff;
+  };
+
+  /// Resolves the lvalue-shaped expression `expr` (declaration
+  /// references, dot and arrow member chains, subscripts, dereferences,
+  /// compound literals, and identity/qualification casts over any of
+  /// them) to its byte-region designator. Global bases stage a whole
+  /// region copy (recording `writeback` in write contexts); flexible
+  /// array member and zero-length array member accesses are located
+  /// rejections.
+  FailureOr<ByteRegionRef> resolveByteRegionRef(const clang::Expr *expr,
+                                                GlobalWriteback *writeback);
+
+  /// Resolves the data-pointer expression `ptrExpr` (whose pointee is a
+  /// byte-region aggregate) to the designated region: the decomposed
+  /// pointer's base place at its current byte cursor.
+  FailureOr<ByteRegionRef>
+  resolveByteRegionPointer(const clang::Expr *ptrExpr,
+                           GlobalWriteback *writeback);
+
+  /// Materializes the i64 byte-offset value `constOff + dynOff` of a
+  /// resolved designator.
+  Value byteRegionOffset(Location loc, const ByteRegionRef &ref);
+
+  /// Emits the `!emitrust.lvalue<ui8>` place of the single byte `ref`
+  /// designates offset by `extra` bytes.
+  Value byteRegionBytePlace(Location loc, const ByteRegionRef &ref,
+                            int64_t extra = 0);
+
+  /// Emits the scalar-leaf place of the byte-region member or subscript
+  /// expression `expr`: an `emitrust.subscript` of the region base at the
+  /// accumulated byte offset. Only `unsigned char` leaves have a place; a
+  /// non-u8 leaf (an equal-size union arm's scalar) is a located
+  /// rejection.
+  FailureOr<Value> emitByteRegionLeafLValue(const clang::Expr *expr,
+                                            Location loc,
+                                            GlobalWriteback *writeback);
+
+  /// Copies `size` bytes from the resolved source region `src` into the
+  /// destination region `dst` (unrolled per-byte subscript loads and
+  /// stores; region sizes are small compile-time constants).
+  LogicalResult emitByteRegionCopy(Location loc, const ByteRegionRef &dst,
+                                   const ByteRegionRef &src, uint64_t size);
+
+  /// Initializes the byte-region storage at byte `offset` of `place`
+  /// (an `!emitrust.lvalue<!emitrust.array<Nxui8>>`, default-zeroed by
+  /// the bare `emitrust.variable`) from the initializer `init` of C type
+  /// `type`: brace lists and compound literals recurse per field/element
+  /// at their layout offsets, string literals store their bytes, constant
+  /// scalars fold to `emitrust.constant` ui8 stores, runtime scalars flow
+  /// through their AST conversion casts, and whole-aggregate values
+  /// (named objects, dereferences, members, identity casts) copy their
+  /// source region per byte. Holes keep the C99 zero fill.
+  LogicalResult emitByteRegionInit(Value place, int64_t offset,
+                                   clang::QualType type,
+                                   const clang::Expr *init);
+
+  /// Whole-aggregate assignment over byte-region records (`a = b`, `a.s =
+  /// b`, statement position): per-byte region copy with the LHS's global
+  /// writeback flushed afterwards.
+  LogicalResult emitByteRegionAggregateAssign(const clang::BinaryOperator *op);
+
+  /// Creates the byte-region global for `decl` (called from
+  /// `createGlobal` once the type classified): the global's type is
+  /// `!emitrust.array<Nxui8>` where N is sizeof — EXTENDED past sizeof by
+  /// a static flexible-array-member tail initializer — and the
+  /// initializer folds to a complete zero-filled byte image computed from
+  /// the APValue against the target record layout.
+  LogicalResult createByteRegionGlobal(const clang::VarDecl *key,
+                                       const clang::VarDecl *decl,
+                                       llvm::StringRef symbolName,
+                                       Location loc);
+
+  /// Serializes the constant `value` of C type `type` into `image`
+  /// starting at byte `offset`, following the target record layout
+  /// (little-endian for the multi-byte scalars an equal-size union arm
+  /// may alias over the region).
+  LogicalResult serializeAPValueBytes(const clang::APValue &value,
+                                      clang::QualType type, uint64_t offset,
+                                      SmallVectorImpl<uint8_t> &image,
+                                      Location loc);
+
+  /// Syntactic counterpart of `serializeAPValueBytes` for the one shape
+  /// clang's constant evaluator refuses: a record initializer with a
+  /// flexible-array-member tail. Walks the SEMANTIC initializer form,
+  /// folding constant scalar leaves, string literals, and nested lists
+  /// into the image at their layout offsets.
+  LogicalResult serializeInitExprBytes(const clang::Expr *init,
+                                       clang::QualType type, uint64_t offset,
+                                       SmallVectorImpl<uint8_t> &image,
+                                       Location loc);
+
+  /// If `field` is a flexible array member or a GNU zero-length array
+  /// member, emits the dedicated located access rejection; such members
+  /// are tolerated at the declaration (zero size, no storage) but have no
+  /// runtime-accessible elements.
+  LogicalResult checkSpecialArrayMemberAccess(const clang::FieldDecl *field,
+                                              Location loc);
+
+  /// Returns whether `type` is a GNU zero-length array (`T r[0]`).
+  bool isZeroLengthArrayType(clang::QualType type) const;
+
+  /// Whether `expr` is a designator shape `resolveByteRegionRef` handles
+  /// (a declaration reference, member chain, subscript, dereference, or
+  /// compound literal, under identity casts) — used to gate the per-byte
+  /// aggregate-assignment path.
+  bool isByteRegionDesignator(const clang::Expr *expr) const;
+
+  /// The u8-only classification cache (`isByteRegionRecord` is consulted
+  /// for every record type mapping and member access).
+  llvm::DenseMap<const clang::RecordDecl *, bool> byteRegionRecords;
+
+  //===--------------------------------------------------------------------===//
+  // CTS-BR (00216): `void *` fn-ptr struct members (the T1.1 holder bound
+  // extended to members). A struct member declared `void *` whose every
+  // stored value across the TU is the address of a function of ONE
+  // signature — stores happen only in aggregate initializers, never by
+  // assignment — imports as an `!emitrust.fn_ptr` member; reads under a
+  // cast to that one signature load the member place directly.
+  //===--------------------------------------------------------------------===//
+
+  /// TU pre-pass populating `fnPtrMemberTypes`: candidates are `void *`
+  /// fields whose every aggregate-initializer value is the address of a
+  /// function of one common signature and whose only other mentions are
+  /// reads under a cast to that signature.
+  void planFnPtrMembers(const clang::TranslationUnitDecl *unit);
+
+  /// Record definitions mentioned by any DECLARATION type in the TU
+  /// (globals, parameters, returns, fields, block-scope locals) —
+  /// stripped of typedefs, arrays, and pointers. An EMPTY struct is
+  /// eagerly imported only when this set names it; one that only ever
+  /// appears inside byte-region initializer expressions (CTS-BR, 00216)
+  /// never emits a struct_def.
+  llvm::DenseSet<const clang::RecordDecl *> declTypeUsedRecords;
+
+  /// Populates `declTypeUsedRecords` for this TU.
+  void collectDeclTypeRecords(const clang::TranslationUnitDecl *unit);
+
+  /// The admitted `void *` fn-ptr members, mapped to the function-pointer
+  /// C type they retype to (`T (*)(...)` of the common target signature).
+  llvm::DenseMap<const clang::FieldDecl *, clang::QualType> fnPtrMemberTypes;
+
+  /// Byte-region-global slice arguments staged by `emitBorrowArgument`
+  /// for the call being emitted: each (staged place, global symbol) pair
+  /// stores the image back right after the call op (drained per call
+  /// site, so nested calls consume their own entries first).
+  SmallVector<std::pair<Value, std::string>, 2> pendingStagedGlobalStores;
 
   /// Projects the member place `field` designates on the struct place
   /// `basePlace` (an `emitrust.member` with the flattened field name),
@@ -6014,6 +6214,17 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     const clang::RecordDecl *definition = decl->getDefinition();
     if (!definition)
       return emitError(loc) << "unsupported: incomplete struct type";
+    // CTS-BR (00216): a u8-only aggregate is padding-free by construction
+    // and imports as a BYTE REGION — a plain `!emitrust.array<Nxui8>`
+    // where N == sizeof (a flexible array member contributes zero) — and
+    // NO struct_def is ever emitted for the record.
+    if (isByteRegionRecord(definition)) {
+      uint64_t bytes =
+          astContext().getTypeSizeInChars(canonical).getQuantity();
+      return Type(emitrust::ArrayType::get(
+          builder.getContext(), bytes,
+          IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned)));
+    }
     if (failed(importRecord(definition, loc)))
       return failure();
     // The type name is resolved after the import: a block-scope record
@@ -6029,19 +6240,30 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
 
   if (const clang::ConstantArrayType *array =
           astContext().getAsConstantArrayType(canonical)) {
+    // CTS-BR (00216): an array of byte-region records flattens to ONE
+    // region of n*sizeof bytes — elements are consecutive padding-free
+    // byte runs, so the flat region preserves every offset.
+    if (isByteRegionAggregate(canonical)) {
+      uint64_t bytes =
+          astContext().getTypeSizeInChars(canonical).getQuantity();
+      if (bytes > 0)
+        return Type(emitrust::ArrayType::get(
+            builder.getContext(), bytes,
+            IntegerType::get(builder.getContext(), 8,
+                             IntegerType::Unsigned)));
+    }
     FailureOr<Type> element = mapType(array->getElementType(), loc);
     if (failed(element))
       return failure();
-    // A multi-dimensional array recurses naturally: the element of the
-    // outer dimension is itself an `!emitrust.array` (rendered as the
-    // nested Rust array `[[T; N]; M]`). Arrays of function pointers are
-    // out of the v1 fn_ptr scope; reject loudly instead of building an
-    // !emitrust.array the dialect does not admit.
-    if (llvm::isa<emitrust::FnPtrType>(*element))
-      return emitError(loc) << "unsupported: array of function pointers";
     uint64_t size = array->getSize().getZExtValue();
     if (size == 0)
       return emitError(loc) << "unsupported: zero-length array";
+    // A multi-dimensional array recurses naturally: the element of the
+    // outer dimension is itself an `!emitrust.array` (rendered as the
+    // nested Rust array `[[T; N]; M]`). An array of function pointers is
+    // a fn-ptr TABLE (CTS-BR, 00216): its never-reassigned global form
+    // folds to a Some(target) element list, and runtime stores into a
+    // slot are rejected at the assignment.
     return Type(emitrust::ArrayType::get(builder.getContext(), size, *element));
   }
 
@@ -6164,6 +6386,17 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     if (pointee.getCanonicalType()->isPointerType() &&
         !pointee.getCanonicalType()->isFunctionPointerType())
       return emitError(loc) << "unsupported: pointer-to-pointer parameter";
+    // CTS-BR (00216): a pointer to a byte-region aggregate is a byte
+    // slice parameter regardless of the body-usage classification —
+    // member reads through it are region reads at constant byte offsets
+    // over the slice base. A const pointee borrows shared.
+    if (kind != ParamKind::CellSlice && isByteRegionAggregate(pointee)) {
+      auto slice = emitrust::SliceType::get(IntegerType::get(
+          builder.getContext(), 8, IntegerType::Unsigned));
+      if (pointee.isConstQualified())
+        return Type(emitrust::RefType::get(slice));
+      return Type(emitrust::MutRefType::get(slice));
+    }
     FailureOr<Type> inner = mapType(pointee, loc);
     if (failed(inner))
       return failure();
@@ -6182,6 +6415,12 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
       if (!emitrust::SliceType::isValidElementType(*inner))
         return emitError(loc)
                << "unsupported: slice parameter element type " << *inner;
+      // CTS-BR (00216): a walked `const unsigned char *` is a SHARED
+      // byte slice (`&[u8]`), the borrow shape the byte-region walkers
+      // pass region views through.
+      if (pointee.isConstQualified() && isU8ScalarType(pointee))
+        return Type(
+            emitrust::RefType::get(emitrust::SliceType::get(*inner)));
       return Type(
           emitrust::MutRefType::get(emitrust::SliceType::get(*inner)));
     }
@@ -7557,6 +7796,11 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   Location defLoc = translateLoc(definition->getBeginLoc());
   if (!definition->isStruct() && !definition->isUnion())
     return emitError(defLoc) << "unsupported record declaration";
+  // CTS-BR (00216): a byte-region record never emits a struct_def — its
+  // objects are plain byte arrays (`mapType` maps the record type
+  // directly), so the eager file-scope record import is a no-op.
+  if (isByteRegionRecord(definition))
+    return success();
   if (!importedRecords.insert(definition).second)
     return success();
   llvm::StringRef structName = recordRustName(definition);
@@ -7833,14 +8077,19 @@ LogicalResult CImporter::collectRecordFields(
     }
     if (field->getName().empty())
       return emitError(fieldLoc) << "unsupported: unnamed struct member";
-    // A flexible array member (C99 6.7.2.1p16, `T tail[];`) gives the
-    // struct an allocation-time size; the fixed-shape value model has no
-    // counterpart, so it is a documented rejection (C99-17, 00216). The
-    // dedicated wording replaces the misleading generic array fallback
-    // (`unsupported: non-constant array size`) the incomplete array type
-    // would otherwise hit in mapType.
+    // C99-17, AMENDED by CTS-BR (00216): a flexible array member
+    // (C99 6.7.2.1p16, `T tail[];`) is TOLERATED at the declaration — it
+    // contributes no field and no size, matching C's sizeof — and only
+    // RUNTIME accesses to the tail reject, with a dedicated located
+    // wording (see `checkSpecialArrayMemberAccess`). GNU zero-length
+    // array members (`T r[0];`) get the same zero-size, field-less
+    // treatment.
     if (field->getType()->isIncompleteArrayType())
-      return emitError(fieldLoc) << "unsupported: flexible array member";
+      continue;
+    if (const clang::ConstantArrayType *zeroLength =
+            astContext().getAsConstantArrayType(field->getType());
+        zeroLength && zeroLength->getSize().isZero())
+      continue;
     // A FILE* member of a MAIN-FILE record would store an owned handle
     // inside an aggregate, which the function-local handle model does not
     // cover (C99-48); the check must precede the data-pointer cursor
@@ -7851,7 +8100,13 @@ LogicalResult CImporter::collectRecordFields(
       return emitError(fieldLoc)
              << "unsupported: FILE* is only supported as a function-local "
                 "variable";
-    FailureOr<Type> fieldType = mapStructFieldType(field->getType(), fieldLoc);
+    // An admitted `void *` fn-ptr member (CTS-BR, 00216) retypes to its
+    // one target signature's fn_ptr.
+    clang::QualType declaredType = field->getType();
+    if (clang::QualType retyped = fnPtrMemberTypes.lookup(field);
+        !retyped.isNull())
+      declaredType = retyped;
+    FailureOr<Type> fieldType = mapStructFieldType(declaredType, fieldLoc);
     if (failed(fieldType))
       return failure();
     if (failed(appendField(internName(mangleMemberName(field->getName())),
@@ -8733,6 +8988,11 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
   if (qualType.getCanonicalType()->isPointerType() &&
       !qualType.getCanonicalType()->isFunctionPointerType())
     return emitError(loc) << "unsupported: pointer-typed global variable";
+  // CTS-BR (00216): a byte-region aggregate global is a byte-image
+  // global — computed against the target layout, zero-filled, and
+  // extended past sizeof by a static flexible-array-member tail.
+  if (isByteRegionAggregate(qualType))
+    return createByteRegionGlobal(key, decl, symbolName, loc);
   FailureOr<Type> mlirType = mapType(qualType, loc);
   if (failed(mlirType))
     return failure();
@@ -8842,7 +9102,11 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
   // whose degenerate binding carries no runtime information: the constant
   // initializer's lvalue (or null) converts to 0, and the binding itself
   // is recorded by `collectGlobalMemberBindings` at the object's import.
-  if (!cType.isNull() && isDataPointer(cType)) {
+  // An admitted `void *` fn-ptr member (CTS-BR, 00216) folds like a
+  // genuinely fn-ptr-typed field: its converted type is already the
+  // fn_ptr, so it must not fall into the data-pointer i64 shortcut.
+  if (!cType.isNull() && isDataPointer(cType) &&
+      !llvm::isa<emitrust::FnPtrType>(type)) {
     auto intType = llvm::dyn_cast<IntegerType>(type);
     if (!intType || intType.getWidth() != 64 ||
         (!value.isLValue() && !value.isNullPointer()))
@@ -9011,6 +9275,19 @@ LogicalResult CImporter::convertRecordAPValue(
     if (valueIndex >= value.getStructNumFields())
       return emitError(loc)
              << "unsupported: global initializer does not match its type";
+    // A flexible array member or GNU zero-length array member has no
+    // field in the struct_def (CTS-BR, 00216); its APValue slot is
+    // consumed without emitting anything. A non-empty FAM-tail constant
+    // on a TYPED record would silently vanish, so it stays rejected.
+    if (field->getType()->isIncompleteArrayType() ||
+        isZeroLengthArrayType(field->getType())) {
+      const clang::APValue &dropped = value.getStructField(valueIndex++);
+      if (field->getType()->isIncompleteArrayType() && dropped.isArray() &&
+          dropped.getArraySize() > 0)
+        return emitError(loc)
+               << "unsupported: flexible array member initializer";
+      continue;
+    }
     const clang::APValue &fieldValue = value.getStructField(valueIndex++);
     if (field->isAnonymousStructOrUnion()) {
       const clang::RecordDecl *member =
@@ -9665,14 +9942,21 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
 LogicalResult CImporter::bindOrdinaryParam(const clang::ParmVarDecl *param,
                                            Value blockArg, Location paramLoc) {
   Type type = blockArg.getType();
-  if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(type)) {
+  {
+    Type refPointee;
+    if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(type))
+      refPointee = mutRef.getPointee();
+    else if (auto sharedRef = llvm::dyn_cast<emitrust::RefType>(type))
+      refPointee = sharedRef.getPointee();
     if (auto sliceType =
-            llvm::dyn_cast<emitrust::SliceType>(mutRef.getPointee())) {
+            llvm::dyn_cast_or_null<emitrust::SliceType>(refPointee)) {
       // Slice parameter (Phase 1b): one entry-block dereference
       // establishes the region base place, and the parameter itself
       // decomposes into (base, i64 cursor = 0) exactly like a decayed
       // local array; every element access renders `(*param)[i as usize]`
-      // so no borrow is ever held across statements.
+      // so no borrow is ever held across statements. A shared slice
+      // (`&[u8]`, the const byte-region walkers) decomposes the same
+      // way; writes through it were excluded by the const pointee.
       Value basePlace =
           builder
               .create<emitrust::DerefOp>(
@@ -10226,6 +10510,12 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
     return failure();
   if (failed(planVaMonomorph(unit)))
     return failure();
+  // CTS-BR (00216) Pass A: `void *` struct members whose every stored
+  // value is the address of a function of one signature retype to
+  // fn_ptr members; declaration-type record uses gate the eager import
+  // of empty structs.
+  planFnPtrMembers(unit);
+  collectDeclTypeRecords(unit);
   for (const clang::Decl *decl : unit->decls()) {
     if (decl->isImplicit())
       continue;
@@ -10246,6 +10536,14 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
       continue;
     }
     if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
+      // An EMPTY struct that no declaration type mentions is skipped: it
+      // may only ever appear as a zero-byte member of a byte-region
+      // aggregate (CTS-BR, 00216), which never materializes the record
+      // type at all. One that IS declared with keeps the eager import.
+      if (const clang::RecordDecl *definition = record->getDefinition();
+          definition && definition->isStruct() && definition->field_empty() &&
+          !declTypeUsedRecords.contains(definition))
+        continue;
       if (failed(importRecord(record, translateLoc(record->getBeginLoc()))))
         return failure();
       continue;
@@ -11292,6 +11590,12 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
     symbols[var] = place;
     if (const clang::Expr *init = var->getInit()) {
       if (isAggregate) {
+        // CTS-BR (00216): byte-region locals initialize per byte —
+        // folded constants at their layout offsets, embedded region
+        // copies for struct-value elements and whole-copy initializers,
+        // runtime scalars through their AST conversion casts.
+        if (isByteRegionAggregate(var->getType()))
+          return emitByteRegionInit(place, 0, var->getType(), init);
         // `= {...}` lists and `char s[] = "..."` string initializers are
         // supported; a whole-aggregate copy initializer stays rejected.
         // A compound-literal initializer (`struct S s = (struct S){...}`,
@@ -11662,7 +11966,8 @@ CImporter::emitRecordInitFields(Value place, const clang::RecordDecl *record,
     if (index >= list->getNumInits())
       break; // Remaining fields keep their default (zero) value.
     const clang::Expr *element = list->getInit(index++);
-    if (llvm::isa<clang::ImplicitValueInitExpr>(element))
+    if (!element || llvm::isa<clang::ImplicitValueInitExpr>(element) ||
+        llvm::isa<clang::NoInitExpr>(element))
       continue;
     if (failed(emitRecordInitField(place, field, element, instance)))
       return failure();
@@ -11681,6 +11986,67 @@ LogicalResult CImporter::emitRecordInitField(Value place,
   if (field->isBitField())
     return emitError(elementLoc)
            << "unsupported: aggregate initializer for a bit-field member";
+  // A flexible array member has no storage behind sizeof on a local
+  // object; a GNU zero-length member has no elements, so its (empty)
+  // brace initializer emits nothing (CTS-BR, 00216).
+  if (field->getType()->isIncompleteArrayType())
+    return emitError(elementLoc) << "unsupported: flexible array member access";
+  if (isZeroLengthArrayType(field->getType()))
+    return success();
+  // An admitted `void *` fn-ptr member (CTS-BR, 00216) initializes from
+  // the address of a function of its one signature: the member place is
+  // the retyped fn_ptr field, the value the folded Some(target) (or None
+  // for the null constant).
+  if (clang::QualType retyped = fnPtrMemberTypes.lookup(field);
+      !retyped.isNull()) {
+    FailureOr<Type> fieldType = mapType(retyped, elementLoc);
+    if (failed(fieldType))
+      return failure();
+    auto fnPtrType = llvm::dyn_cast<emitrust::FnPtrType>(*fieldType);
+    if (!fnPtrType)
+      return emitError(elementLoc) << "unsupported function pointer type";
+    Value fieldPlace =
+        builder
+            .create<emitrust::MemberOp>(
+                elementLoc, emitrust::LValueType::get(fnPtrType), place,
+                builder.getStringAttr(flattenedFieldName(field)))
+            .getResult();
+    if (element->isNullPointerConstant(astContext(),
+                                       clang::Expr::NPC_NeverValueDependent) !=
+        clang::Expr::NPCK_NotNull) {
+      Value none = builder
+                       .create<emitrust::ConstantOp>(
+                           elementLoc, fnPtrType,
+                           emitrust::OpaqueAttr::get(builder.getContext(),
+                                                     "None"))
+                       .getResult();
+      builder.create<emitrust::AssignOp>(elementLoc, fieldPlace, none);
+      return success();
+    }
+    const clang::Expr *target = element->IgnoreParenCasts();
+    if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(target))
+      if (unary->getOpcode() == clang::UO_AddrOf)
+        target = unary->getSubExpr()->IgnoreParenCasts();
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(target);
+    const auto *callee =
+        ref ? llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl()) : nullptr;
+    if (!callee)
+      return emitError(elementLoc)
+             << "unsupported: pointer struct member initializer";
+    FailureOr<std::string> name =
+        resolveFunctionPointerDecl(callee, fnPtrType, elementLoc);
+    if (failed(name))
+      return failure();
+    Value some = builder
+                     .create<emitrust::ConstantOp>(
+                         elementLoc, fnPtrType,
+                         emitrust::OpaqueAttr::get(
+                             builder.getContext(),
+                             (llvm::Twine("Some(") + *name + ")").str()))
+                     .getResult();
+    builder.create<emitrust::AssignOp>(elementLoc, fieldPlace, some);
+    return success();
+  }
   if (isDataPointer(field->getType())) {
     // A data-pointer field's binding was recorded by the analysis walk of
     // this declaration; the stored i64 member keeps its default 0 (the
@@ -13107,6 +13473,27 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
     return emitError(loc)
            << "unsupported: assignment to this pointer expression";
   }
+  // CTS-BR (00216): fn-ptr TABLE slots are never reassigned after their
+  // initializer — the folded Some(target) element list is a static fact.
+  if (isFunctionPointer(op->getLHS()->getType()))
+    if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(
+            stripTrivia(op->getLHS())))
+      if (subscript->getBase()
+              ->IgnoreParenImpCasts()
+              ->getType()
+              .getCanonicalType()
+              ->isArrayType())
+        return emitError(loc)
+               << "unsupported: assignment to a function-pointer array "
+                  "element";
+  // CTS-BR (00216): whole-aggregate assignment over byte-region records
+  // is a per-byte region copy when both sides are designators; other
+  // right-hand sides (calls) keep the whole-value paths below.
+  if (op->getLHS()->getType().getCanonicalType()->isRecordType() &&
+      isByteRegionAggregate(op->getLHS()->getType()) &&
+      isByteRegionDesignator(op->getLHS()) &&
+      isByteRegionDesignator(op->getRHS()))
+    return emitByteRegionAggregateAssign(op);
   // Whole-value store to a global in statement position: a direct
   // emitrust.global_store, no staging copy needed. Value-position uses go
   // through emitAssignToPlace, whose staged copy provides the place the
@@ -15314,6 +15701,30 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
                                  "changes the signature";
       return value;
     }
+    // CTS-BR (00216): a read of an admitted `void *` fn-ptr member under
+    // a cast to its one signature loads the retyped member place — no
+    // cast op reaches the IR.
+    if (isFunctionPointer(cast->getType())) {
+      const auto *memberExpr = llvm::dyn_cast<clang::MemberExpr>(
+          sub->IgnoreParenImpCasts());
+      const auto *field =
+          memberExpr
+              ? llvm::dyn_cast<clang::FieldDecl>(memberExpr->getMemberDecl())
+              : nullptr;
+      if (field && fnPtrMemberTypes.count(field)) {
+        FailureOr<Value> place = emitLValue(memberExpr, nullptr);
+        if (failed(place))
+          return failure();
+        Value value = loadPlace(loc, *place);
+        FailureOr<Type> mapped = mapType(cast->getType(), loc);
+        if (failed(mapped))
+          return failure();
+        if (value.getType() != *mapped)
+          return emitError(loc) << "unsupported: function pointer "
+                                   "conversion changes the signature";
+        return value;
+      }
+    }
     return emitError(loc) << "unsupported cast ("
                           << cast->getCastKindName() << ")";
   }
@@ -15392,6 +15803,34 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
                           << cast->getCastKindName() << ")";
   }
   case clang::CK_IntegralCast: {
+    // A `sizeof` over a BYTE-REGION aggregate converted to a signed
+    // 64-bit context (the `long size` walker parameter) folds directly
+    // to the signless constant — the region size is the model's own
+    // static fact, and `sizeof(struct W)` stays the FAM-free size
+    // (CTS-BR, 00216). Other sizeof shapes keep the historical
+    // ui64-constant-plus-cast pair.
+    if (const auto *trait = llvm::dyn_cast<clang::UnaryExprOrTypeTraitExpr>(
+            sub->IgnoreParenImpCasts());
+        trait && trait->getKind() == clang::UETT_SizeOf &&
+        !trait->getTypeOfArgument()->isVariablyModifiedType() &&
+        isByteRegionAggregate(trait->getTypeOfArgument())) {
+      clang::Expr::EvalResult eval;
+      Type destType;
+      if (FailureOr<Type> mapped = mapType(cast->getType(), loc);
+          succeeded(mapped))
+        destType = *mapped;
+      auto destInt = llvm::dyn_cast_or_null<IntegerType>(destType);
+      if (destInt && destInt.isSignless() && destInt.getWidth() == 64 &&
+          trait->EvaluateAsInt(eval, astContext()) && !eval.HasSideEffects) {
+        // Materialize in the entry block: the region size is a
+        // function-wide static fact, and the hoisted constant dominates
+        // every use.
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPointToStart(entryBlock);
+        return createIntConstant(loc, destInt,
+                                 eval.Val.getInt().getSExtValue());
+      }
+    }
     // Integer-to-enum: a reference to an enumerator of the destination
     // enum keeps the direct constant fast path (in C the enumerator itself
     // has type `int`, so even `enum Color c = Red;` arrives as this cast);
@@ -17055,6 +17494,19 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       return emitError(loc) << "unsupported: call argument type mismatch";
 
   auto callOp = builder.create<func::CallOp>(loc, target, arguments);
+  // CTS-BR (00216): staged byte-region-global slice arguments store their
+  // (possibly mutated) images back immediately after the call — the
+  // load-modify-store shape of every staged global access.
+  if (!pendingStagedGlobalStores.empty()) {
+    SmallVector<std::pair<Value, std::string>, 2> stores =
+        std::move(pendingStagedGlobalStores);
+    pendingStagedGlobalStores.clear();
+    for (auto &[place, symbol] : stores) {
+      Value value = loadPlace(loc, place);
+      builder.create<emitrust::GlobalStoreOp>(loc, value,
+                                              globalSymbol(symbol));
+    }
+  }
   if (!openedCellRegions.empty()) {
     if (cellResultStaging && callOp->getNumResults() == 1)
       builder.create<emitrust::AssignOp>(loc, cellResultStaging,
@@ -17311,10 +17763,18 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
                                                Type paramType,
                                                const clang::VarDecl *&root) {
   root = nullptr;
-  auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(paramType);
-  if (!mutRef) // Parameters are always mut_ref today; ref is defensive.
+  Type pointee;
+  bool isMutParam = false;
+  if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(paramType)) {
+    pointee = mutRef.getPointee();
+    isMutParam = true;
+  } else if (auto sharedRef = llvm::dyn_cast<emitrust::RefType>(paramType)) {
+    // Shared byte-slice parameters (`const unsigned char *`, CTS-BR
+    // 00216) borrow their region base immutably.
+    pointee = sharedRef.getPointee();
+  } else {
     return emitError(loc) << "unsupported reference parameter type";
-  Type pointee = mutRef.getPointee();
+  }
 
   if (auto sliceType = llvm::dyn_cast<emitrust::SliceType>(pointee)) {
     // A string-literal argument (`f("abc")`) materializes a fresh mutable
@@ -17348,7 +17808,7 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
               createIntConstant(loc, builder.getIntegerType(64), 0);
           return builder
               .create<emitrust::SliceOfOp>(loc, paramType, *backing, zero,
-                                           /*is_mut=*/true)
+                                           /*is_mut=*/isMutParam)
               .getResult();
         }
     // Slice parameter: reslice the argument's region base from its cursor.
@@ -17376,9 +17836,28 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
     // would see (or lose) the wrong values, so the shape is rejected
     // (with the cell-slice boundary wording when Pass A pinned one; the
     // all-global class itself lowers to a cell-slice and never gets
-    // here).
-    if (pointer->base && !pointer->base->hasLocalStorage())
-      return rejectGlobalPointerArgument(loc, pointer->base);
+    // here). EXCEPT a byte-region aggregate global (CTS-BR, 00216),
+    // which rides the ordinary staged-copy model: the borrow is of a
+    // whole staged byte image, and a mutable parameter stores the image
+    // back immediately after the call.
+    if (pointer->base && !pointer->base->hasLocalStorage()) {
+      if (!isByteRegionAggregate(pointer->base->getType()))
+        return rejectGlobalPointerArgument(loc, pointer->base);
+      FailureOr<std::pair<Value, std::string>> staged =
+          stageGlobalCopy(loc, pointer->base);
+      if (failed(staged))
+        return failure();
+      if (isMutParam)
+        pendingStagedGlobalStores.push_back(*staged);
+      Value cursor =
+          pointer->cursor
+              ? pointer->cursor
+              : createIntConstant(loc, builder.getIntegerType(64), 0);
+      return builder
+          .create<emitrust::SliceOfOp>(loc, paramType, staged->first,
+                                       cursor, isMutParam)
+          .getResult();
+    }
     if (!pointer->cursor)
       return emitError(loc) << "unsupported: the address of a scalar object "
                                "cannot be passed as a slice parameter";
@@ -17406,7 +17885,7 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
                                "match the slice parameter";
     return builder
         .create<emitrust::SliceOfOp>(loc, paramType, basePlace,
-                                     pointer->cursor, /*is_mut=*/true)
+                                     pointer->cursor, /*is_mut=*/isMutParam)
         .getResult();
   }
 
@@ -18654,6 +19133,29 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
                           << cast->getCastKindName() << ")";
   }
 
+  // CTS-BR (00216): `(u8 *)&x` / `(u8 *)p` over a byte-region aggregate
+  // is the region base itself — a byte view of a padding-free all-u8
+  // object is the object. A byte view of any OTHER aggregate would
+  // expose object representation the typed model never materializes;
+  // that cast is the located rejection authored by the byte-region
+  // contract.
+  if (const auto *cstyle = llvm::dyn_cast<clang::CStyleCastExpr>(e)) {
+    clang::QualType destType = cstyle->getType().getCanonicalType();
+    if (destType->isPointerType() &&
+        isU8ScalarType(destType->getPointeeType())) {
+      clang::QualType srcType =
+          cstyle->getSubExpr()->getType().getCanonicalType();
+      if (srcType->isPointerType()) {
+        clang::QualType pointee = srcType->getPointeeType();
+        if (isByteRegionAggregate(pointee))
+          return emitPointerRValue(cstyle->getSubExpr());
+        if (pointee.getCanonicalType()->getAsRecordDecl())
+          return emitError(loc) << "unsupported: byte view of an aggregate "
+                                   "with non-byte members";
+      }
+    }
+  }
+
   if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e)) {
     if (unary->getOpcode() == clang::UO_AddrOf) {
       const clang::Expr *sub = stripTrivia(unary->getSubExpr());
@@ -18664,6 +19166,14 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         if (isPointerType(var->getType()))
           return emitError(loc)
                  << "unsupported: taking the address of a pointer variable";
+        // CTS-BR (00216): the whole-object address of a byte-region
+        // aggregate is the region base at byte cursor 0, sliceable like
+        // a decayed byte array.
+        if (isByteRegionAggregate(var->getType())) {
+          if (!var->hasLocalStorage())
+            var = var->getCanonicalDecl();
+          return PtrExprValue{var, createIntConstant(loc, cursorType, 0)};
+        }
         // `&x`: the degenerate (cursor-less) form of the scalar or struct
         // object itself. A global object is a global region base
         // (CTS-P4), staged at each access.
@@ -18680,6 +19190,44 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         return emitSubscriptPointer(subscript);
       }
       if (const auto *memberExpr = llvm::dyn_cast<clang::MemberExpr>(sub)) {
+        // CTS-BR (00216): `&x.member` inside a byte-region aggregate is
+        // the region base at the member's constant byte offset — union
+        // arms included (every arm is a view of the one region).
+        if (const auto *field = llvm::dyn_cast<clang::FieldDecl>(
+                memberExpr->getMemberDecl());
+            field && isByteRegionRecord(field->getParent())) {
+          int64_t offset = 0;
+          const clang::Expr *baseExpr = memberExpr;
+          bool supported = true;
+          while (const auto *m = llvm::dyn_cast<clang::MemberExpr>(baseExpr)) {
+            const auto *walkField =
+                llvm::dyn_cast<clang::FieldDecl>(m->getMemberDecl());
+            if (!walkField || m->isArrow()) {
+              supported = false;
+              break;
+            }
+            if (failed(checkSpecialArrayMemberAccess(walkField, loc)))
+              return failure();
+            offset += static_cast<int64_t>(
+                astContext()
+                    .getASTRecordLayout(walkField->getParent())
+                    .getFieldOffset(walkField->getFieldIndex()) /
+                8);
+            baseExpr = m->getBase()->IgnoreParenImpCasts();
+          }
+          const auto *rootRef =
+              supported ? llvm::dyn_cast<clang::DeclRefExpr>(baseExpr)
+                        : nullptr;
+          const auto *rootVar =
+              rootRef ? llvm::dyn_cast<clang::VarDecl>(rootRef->getDecl())
+                      : nullptr;
+          if (rootVar && isByteRegionAggregate(rootVar->getType())) {
+            if (!rootVar->hasLocalStorage())
+              rootVar = rootVar->getCanonicalDecl();
+            return PtrExprValue{rootVar,
+                                createIntConstant(loc, cursorType, offset)};
+          }
+        }
         // `&s.b` / `&g.b`: the degenerate (cursor-less) member-rooted form
         // of the struct object (CTS-P9). Union storage has no unaliased
         // member place to root a region at.
@@ -19045,6 +19593,1078 @@ CImporter::stageGlobalCopyAndRecord(Location loc, const clang::VarDecl *base,
   return staged->first;
 }
 
+//===----------------------------------------------------------------------===//
+// CTS-BR (00216): the u8-only byte-region aggregate model.
+//===----------------------------------------------------------------------===//
+
+bool CImporter::isU8ScalarType(clang::QualType type) const {
+  const auto *builtin = llvm::dyn_cast<clang::BuiltinType>(
+      type.getCanonicalType().getTypePtr());
+  return builtin && (builtin->getKind() == clang::BuiltinType::UChar ||
+                     builtin->getKind() == clang::BuiltinType::Char_U);
+}
+
+bool CImporter::isZeroLengthArrayType(clang::QualType type) const {
+  const clang::ConstantArrayType *array =
+      astContext().getAsConstantArrayType(type);
+  return array && array->getSize().isZero();
+}
+
+bool CImporter::isByteRegionRecord(const clang::RecordDecl *record) {
+  if (!record)
+    return false;
+  const clang::RecordDecl *definition = record->getDefinition();
+  if (!definition)
+    return false;
+  auto it = byteRegionRecords.find(definition);
+  if (it != byteRegionRecords.end())
+    return it->second;
+  // Seed false first: C records cannot recurse by value, but the guard
+  // keeps a malformed AST from looping.
+  byteRegionRecords[definition] = false;
+  clang::ASTContext &context = astContext();
+
+  // Whether every scalar leaf of `type` is `unsigned char` (through
+  // constant arrays and nested byte-region records).
+  auto isU8Only = [&](auto &&self, clang::QualType type) -> bool {
+    clang::QualType canonical = type.getCanonicalType();
+    if (isU8ScalarType(canonical))
+      return true;
+    if (const clang::ConstantArrayType *array =
+            context.getAsConstantArrayType(canonical))
+      return self(self, array->getElementType());
+    if (const auto *nested = canonical->getAsRecordDecl())
+      return isByteRegionRecord(nested);
+    return false;
+  };
+
+  bool result = [&]() -> bool {
+    if (definition->isInvalidDecl())
+      return false;
+    uint64_t recordSize =
+        context.getTypeSizeInChars(context.getRecordType(definition))
+            .getQuantity();
+    // A zero-size record (empty struct) has no dialect byte-array
+    // counterpart; it stays typed. As a MEMBER of a byte-region record
+    // it still contributes zero bytes (the parent's field walk below).
+    if (recordSize == 0)
+      return false;
+    if (definition->isUnion()) {
+      bool anyU8Arm = false;
+      for (const clang::FieldDecl *arm : definition->fields()) {
+        if (arm->isBitField())
+          return false;
+        clang::QualType armType = arm->getType();
+        if (hasVolatileQualifier(context, armType))
+          return false;
+        if (armType->isIncompleteArrayType())
+          return false;
+        if (isU8Only(isU8Only, armType)) {
+          anyU8Arm = true;
+          continue;
+        }
+        // A non-u8 arm is tolerated TYPE-level only as a constant array
+        // of arithmetic scalars whose total size equals the union's (the
+        // in6_addr `unsigned short u6_addr16[8]` over `u8 u6_addr8[16]`
+        // shape); accesses through it stay out of the contract. A
+        // non-array arm (a scalar-pun union) keeps the typed one-slot
+        // model.
+        const clang::ConstantArrayType *array =
+            context.getAsConstantArrayType(armType);
+        if (array &&
+            array->getElementType().getCanonicalType()->isArithmeticType() &&
+            static_cast<uint64_t>(
+                context.getTypeSizeInChars(armType).getQuantity()) ==
+                recordSize)
+          continue;
+        return false;
+      }
+      return anyU8Arm;
+    }
+    for (const clang::FieldDecl *field : definition->fields()) {
+      if (field->isBitField())
+        return false;
+      clang::QualType fieldType = field->getType();
+      if (hasVolatileQualifier(context, fieldType))
+        return false;
+      // A trailing flexible array member contributes zero bytes to
+      // sizeof; its element must itself be byte-region material so a
+      // static tail image can fold.
+      if (fieldType->isIncompleteArrayType()) {
+        const clang::ArrayType *fam = context.getAsArrayType(fieldType);
+        if (!fam || !isU8Only(isU8Only, fam->getElementType()))
+          return false;
+        continue;
+      }
+      // A GNU zero-length array contributes zero bytes regardless of its
+      // element type (it has no leaves).
+      if (isZeroLengthArrayType(fieldType))
+        continue;
+      // An empty struct member contributes zero bytes.
+      if (const auto *nested =
+              fieldType.getCanonicalType()->getAsRecordDecl()) {
+        const clang::RecordDecl *nestedDefinition = nested->getDefinition();
+        if (nestedDefinition && !nestedDefinition->isUnion() &&
+            nestedDefinition->field_empty())
+          continue;
+      }
+      if (!isU8Only(isU8Only, fieldType))
+        return false;
+    }
+    return true;
+  }();
+  byteRegionRecords[definition] = result;
+  return result;
+}
+
+bool CImporter::isByteRegionAggregate(clang::QualType type) {
+  clang::QualType canonical = type.getCanonicalType();
+  while (const clang::ConstantArrayType *array =
+             astContext().getAsConstantArrayType(canonical))
+    canonical = array->getElementType().getCanonicalType();
+  const auto *record = canonical->getAsRecordDecl();
+  return record && isByteRegionRecord(record);
+}
+
+bool CImporter::exprRootsInByteRegion(const clang::Expr *expr) {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e)) {
+    const auto *field =
+        llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+    return field && isByteRegionRecord(field->getParent());
+  }
+  if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(e))
+    return exprRootsInByteRegion(subscript->getBase());
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    if (unary->getOpcode() == clang::UO_Deref) {
+      clang::QualType pointerType = unary->getSubExpr()->getType();
+      return isPointerType(pointerType) &&
+             isByteRegionAggregate(
+                 pointerType.getCanonicalType()->getPointeeType());
+    }
+  return false;
+}
+
+bool CImporter::isByteRegionDesignator(const clang::Expr *expr) const {
+  const clang::Expr *e = expr->IgnoreParens();
+  while (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e)) {
+    if (cast->getCastKind() != clang::CK_NoOp &&
+        cast->getCastKind() != clang::CK_LValueToRValue)
+      break;
+    e = cast->getSubExpr()->IgnoreParens();
+  }
+  if (llvm::isa<clang::DeclRefExpr, clang::MemberExpr,
+                clang::ArraySubscriptExpr, clang::CompoundLiteralExpr>(e))
+    return true;
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    return unary->getOpcode() == clang::UO_Deref;
+  return false;
+}
+
+LogicalResult
+CImporter::checkSpecialArrayMemberAccess(const clang::FieldDecl *field,
+                                         Location loc) {
+  if (field->getType()->isIncompleteArrayType())
+    return emitError(loc) << "unsupported: flexible array member access";
+  if (isZeroLengthArrayType(field->getType()))
+    return emitError(loc) << "unsupported: zero-length array member access";
+  return success();
+}
+
+FailureOr<CImporter::ByteRegionRef>
+CImporter::resolveByteRegionRef(const clang::Expr *expr,
+                                GlobalWriteback *writeback) {
+  const clang::Expr *e = expr->IgnoreParens();
+  while (true) {
+    if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e)) {
+      e = cleanups->getSubExpr()->IgnoreParens();
+      continue;
+    }
+    if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e)) {
+      // Loads and identity/qualification casts of the aggregate value
+      // are transparent for region resolution.
+      if (cast->getCastKind() == clang::CK_NoOp ||
+          cast->getCastKind() == clang::CK_LValueToRValue) {
+        e = cast->getSubExpr()->IgnoreParens();
+        continue;
+      }
+    }
+    break;
+  }
+  Location loc = translateLoc(e->getBeginLoc());
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e)) {
+    const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+    if (!var)
+      return emitError(loc) << "unsupported byte-region base";
+    if (auto it = symbols.find(var); it != symbols.end())
+      return ByteRegionRef{it->second, 0, Value()};
+    if (lookupGlobal(var)) {
+      FailureOr<Value> staged = stageGlobalCopyAndRecord(loc, var, writeback);
+      if (failed(staged))
+        return failure();
+      return ByteRegionRef{*staged, 0, Value()};
+    }
+    return emitError(loc) << "unsupported byte-region base '"
+                          << var->getName() << "'";
+  }
+  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e)) {
+    const auto *field =
+        llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+    if (!field)
+      return emitError(loc) << "unsupported member access";
+    if (failed(checkSpecialArrayMemberAccess(field, loc)))
+      return failure();
+    if (!isByteRegionRecord(field->getParent())) {
+      // A byte-region record embedded in a TYPED aggregate: the member
+      // itself is the region root (its mapped field type is already the
+      // byte array).
+      FailureOr<Value> place = emitLValue(member, writeback);
+      if (failed(place))
+        return failure();
+      return ByteRegionRef{*place, 0, Value()};
+    }
+    FailureOr<ByteRegionRef> base =
+        member->isArrow()
+            ? resolveByteRegionPointer(member->getBase(), writeback)
+            : resolveByteRegionRef(member->getBase(), writeback);
+    if (failed(base))
+      return failure();
+    base->constOff += static_cast<int64_t>(
+        astContext()
+            .getASTRecordLayout(field->getParent())
+            .getFieldOffset(field->getFieldIndex()) /
+        8);
+    return base;
+  }
+  if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(e)) {
+    const clang::Expr *baseExpr = subscript->getBase()->IgnoreParenImpCasts();
+    FailureOr<ByteRegionRef> base =
+        baseExpr->getType().getCanonicalType()->isArrayType()
+            ? resolveByteRegionRef(baseExpr, writeback)
+            : resolveByteRegionPointer(subscript->getBase(), writeback);
+    if (failed(base))
+      return failure();
+    uint64_t elementSize =
+        astContext().getTypeSizeInChars(subscript->getType()).getQuantity();
+    clang::Expr::EvalResult eval;
+    if (subscript->getIdx()->EvaluateAsInt(eval, astContext()) &&
+        !eval.HasSideEffects) {
+      base->constOff += eval.Val.getInt().getSExtValue() *
+                        static_cast<int64_t>(elementSize);
+      return base;
+    }
+    FailureOr<Value> index = emitRValue(subscript->getIdx());
+    if (failed(index))
+      return failure();
+    Value index64 = castToIntType(loc, *index, builder.getIntegerType(64));
+    if (elementSize != 1) {
+      Value scale = createIntConstant(loc, builder.getIntegerType(64),
+                                      static_cast<int64_t>(elementSize));
+      index64 = builder.create<arith::MulIOp>(loc, index64, scale).getResult();
+    }
+    base->dynOff =
+        base->dynOff
+            ? builder.create<arith::AddIOp>(loc, base->dynOff, index64)
+                  .getResult()
+            : index64;
+    return base;
+  }
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    if (unary->getOpcode() == clang::UO_Deref)
+      return resolveByteRegionPointer(unary->getSubExpr(), writeback);
+  if (const auto *compound = llvm::dyn_cast<clang::CompoundLiteralExpr>(e)) {
+    clang::QualType type = compound->getType();
+    FailureOr<Type> mlirType = mapType(type, loc);
+    if (failed(mlirType))
+      return failure();
+    Value place = createVariablePlace(loc, *mlirType);
+    if (failed(emitByteRegionInit(place, 0, type, compound->getInitializer())))
+      return failure();
+    return ByteRegionRef{place, 0, Value()};
+  }
+  return emitError(loc) << "unsupported byte-region expression: "
+                        << e->getStmtClassName();
+}
+
+FailureOr<CImporter::ByteRegionRef>
+CImporter::resolveByteRegionPointer(const clang::Expr *ptrExpr,
+                                    GlobalWriteback *writeback) {
+  Location loc = translateLoc(ptrExpr->getBeginLoc());
+  FailureOr<PtrExprValue> pointer = emitPointerRValue(ptrExpr);
+  if (failed(pointer))
+    return failure();
+  if (pointer->literalBacking || pointer->baseIndex || pointer->nonNull ||
+      pointer->member || !pointer->base)
+    return emitError(loc)
+           << "unsupported: pointer into a byte-region aggregate";
+  Value place;
+  if (auto it = symbols.find(pointer->base); it != symbols.end()) {
+    place = it->second;
+  } else if (lookupGlobal(pointer->base)) {
+    FailureOr<Value> staged =
+        stageGlobalCopyAndRecord(loc, pointer->base, writeback);
+    if (failed(staged))
+      return failure();
+    place = *staged;
+  } else {
+    return emitError(loc) << "unsupported byte-region base '"
+                          << pointer->base->getName() << "'";
+  }
+  return ByteRegionRef{place, 0, pointer->cursor};
+}
+
+Value CImporter::byteRegionOffset(Location loc, const ByteRegionRef &ref) {
+  if (ref.dynOff && ref.constOff == 0)
+    return ref.dynOff;
+  Value offset =
+      createIntConstant(loc, builder.getIntegerType(64), ref.constOff);
+  if (ref.dynOff)
+    offset = builder.create<arith::AddIOp>(loc, offset, ref.dynOff).getResult();
+  return offset;
+}
+
+Value CImporter::byteRegionBytePlace(Location loc, const ByteRegionRef &ref,
+                                     int64_t extra) {
+  ByteRegionRef adjusted = ref;
+  adjusted.constOff += extra;
+  Value offset = byteRegionOffset(loc, adjusted);
+  Type ui8 = IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  return builder
+      .create<emitrust::SubscriptOp>(loc, emitrust::LValueType::get(ui8),
+                                     ref.place, offset)
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitByteRegionLeafLValue(const clang::Expr *expr, Location loc,
+                                    GlobalWriteback *writeback) {
+  // Only `unsigned char` leaves have a byte place; a non-u8 leaf (an
+  // equal-size union arm's scalar) never joined the region contract.
+  if (!isU8ScalarType(expr->getType()))
+    return emitError(loc)
+           << "unsupported: non-byte member access in a byte-region "
+              "aggregate";
+  FailureOr<ByteRegionRef> ref = resolveByteRegionRef(expr, writeback);
+  if (failed(ref))
+    return failure();
+  return byteRegionBytePlace(loc, *ref);
+}
+
+LogicalResult CImporter::emitByteRegionCopy(Location loc,
+                                            const ByteRegionRef &dst,
+                                            const ByteRegionRef &src,
+                                            uint64_t size) {
+  for (uint64_t i = 0; i != size; ++i) {
+    Value from = byteRegionBytePlace(loc, src, static_cast<int64_t>(i));
+    Value byte = loadPlace(loc, from);
+    Value to = byteRegionBytePlace(loc, dst, static_cast<int64_t>(i));
+    builder.create<emitrust::AssignOp>(loc, to, byte);
+  }
+  return success();
+}
+
+LogicalResult CImporter::emitByteRegionInit(Value place, int64_t offset,
+                                            clang::QualType type,
+                                            const clang::Expr *init) {
+  clang::ASTContext &context = astContext();
+  const clang::Expr *e = init->IgnoreParens();
+  while (true) {
+    if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e)) {
+      e = cleanups->getSubExpr()->IgnoreParens();
+      continue;
+    }
+    if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e)) {
+      // Identity/qualification casts of aggregate values are transparent
+      // here; scalar conversions are NOT stripped (the leaf emission
+      // relies on the AST's own casts).
+      if (cast->getCastKind() == clang::CK_NoOp) {
+        e = cast->getSubExpr()->IgnoreParens();
+        continue;
+      }
+    }
+    break;
+  }
+  Location loc = translateLoc(e->getBeginLoc());
+  // A hole keeps the region's default zero value (C99 zero fill).
+  if (llvm::isa<clang::ImplicitValueInitExpr>(e) ||
+      llvm::isa<clang::NoInitExpr>(e))
+    return success();
+  if (const auto *compound = llvm::dyn_cast<clang::CompoundLiteralExpr>(e))
+    return emitByteRegionInit(place, offset, type, compound->getInitializer());
+  clang::QualType canonical = type.getCanonicalType();
+  Type ui8 = IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  // The `unsigned char` scalar leaf: constants fold to ui8 stores,
+  // runtime values flow through their AST conversion casts.
+  if (isU8ScalarType(canonical)) {
+    Value index = createIntConstant(loc, builder.getIntegerType(64), offset);
+    Value leaf = builder
+                     .create<emitrust::SubscriptOp>(
+                         loc, emitrust::LValueType::get(ui8), place, index)
+                     .getResult();
+    clang::Expr::EvalResult eval;
+    if (e->EvaluateAsInt(eval, context) && !eval.HasSideEffects) {
+      uint64_t byte = eval.Val.getInt().getZExtValue() & 0xff;
+      Value constant =
+          builder
+              .create<emitrust::ConstantOp>(loc, ui8, IntegerAttr::get(ui8, byte))
+              .getResult();
+      builder.create<emitrust::AssignOp>(loc, leaf, constant);
+      return success();
+    }
+    FailureOr<Value> value = emitRValue(e);
+    if (failed(value))
+      return failure();
+    Value byte = *value;
+    if (byte.getType() != ui8)
+      byte = builder.create<emitrust::CastOp>(loc, ui8, byte).getResult();
+    builder.create<emitrust::AssignOp>(loc, leaf, byte);
+    return success();
+  }
+  if (const clang::ConstantArrayType *array =
+          context.getAsConstantArrayType(canonical)) {
+    uint64_t elementSize =
+        context.getTypeSizeInChars(array->getElementType()).getQuantity();
+    uint64_t arraySize = array->getSize().getZExtValue();
+    // A string-literal member initializer contributes its bytes; the
+    // rest of the array member keeps the zero fill.
+    if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(e)) {
+      if (!literal->isOrdinary())
+        return emitError(loc)
+               << "unsupported: non-ordinary string literal initializer";
+      uint64_t count = std::min<uint64_t>(literal->getLength(), arraySize);
+      for (uint64_t i = 0; i != count; ++i) {
+        uint32_t byte = literal->getCodeUnit(i);
+        if (byte > 127)
+          return emitError(loc)
+                 << "unsupported: non-ASCII byte in string literal "
+                    "initializer";
+        if (byte == 0)
+          continue; // Embedded NULs keep the zero fill.
+        Value index = createIntConstant(loc, builder.getIntegerType(64),
+                                        offset + static_cast<int64_t>(i));
+        Value leaf = builder
+                         .create<emitrust::SubscriptOp>(
+                             loc, emitrust::LValueType::get(ui8), place, index)
+                         .getResult();
+        Value constant = builder
+                             .create<emitrust::ConstantOp>(
+                                 loc, ui8, IntegerAttr::get(ui8, byte))
+                             .getResult();
+        builder.create<emitrust::AssignOp>(loc, leaf, constant);
+      }
+      return success();
+    }
+    if (const auto *list = llvm::dyn_cast<clang::InitListExpr>(e)) {
+      if (const clang::InitListExpr *semantic = list->getSemanticForm())
+        list = semantic;
+      // `{"hello"}`: braces around a string literal initializer.
+      if (list->getNumInits() == 1)
+        if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+                list->getInit(0)->IgnoreParens()))
+          return emitByteRegionInit(place, offset, type, literal);
+      uint64_t count = std::min<uint64_t>(list->getNumInits(), arraySize);
+      for (uint64_t i = 0; i != count; ++i)
+        if (failed(emitByteRegionInit(
+                place, offset + static_cast<int64_t>(i * elementSize),
+                array->getElementType(), list->getInit(i))))
+          return failure();
+      if (list->hasArrayFiller())
+        if (const clang::Expr *filler = list->getArrayFiller();
+            filler && !llvm::isa<clang::ImplicitValueInitExpr>(filler))
+          for (uint64_t i = count; i < arraySize; ++i)
+            if (failed(emitByteRegionInit(
+                    place, offset + static_cast<int64_t>(i * elementSize),
+                    array->getElementType(), filler)))
+              return failure();
+      return success();
+    }
+    // Fall through: a whole-array value copies its source region.
+  }
+  if (const auto *record = canonical->getAsRecordDecl()) {
+    if (const auto *list = llvm::dyn_cast<clang::InitListExpr>(e)) {
+      if (const clang::InitListExpr *semantic = list->getSemanticForm())
+        list = semantic;
+      const clang::RecordDecl *definition = record->getDefinition();
+      if (!definition)
+        return emitError(loc) << "unsupported: incomplete struct type";
+      if (definition->isUnion()) {
+        // Sema records the single arm the list initializes; every arm
+        // is a view at offset 0 of the region, and the bytes past the
+        // initialized arm keep the zero fill.
+        const clang::FieldDecl *active = list->getInitializedFieldInUnion();
+        if (!active || list->getNumInits() == 0)
+          return success();
+        return emitByteRegionInit(place, offset, active->getType(),
+                                  list->getInit(0));
+      }
+      const clang::ASTRecordLayout &layout =
+          context.getASTRecordLayout(definition);
+      unsigned index = 0;
+      for (const clang::FieldDecl *field : definition->fields()) {
+        if (index >= list->getNumInits())
+          break; // Remaining fields keep the zero fill.
+        const clang::Expr *element = list->getInit(index++);
+        if (!element || llvm::isa<clang::ImplicitValueInitExpr>(element) ||
+            llvm::isa<clang::NoInitExpr>(element))
+          continue;
+        // A LOCAL flexible-array tail has no storage behind sizeof.
+        if (field->getType()->isIncompleteArrayType())
+          return emitError(translateLoc(element->getBeginLoc()))
+                 << "unsupported: flexible array member access";
+        if (isZeroLengthArrayType(field->getType()))
+          continue;
+        if (failed(emitByteRegionInit(
+                place,
+                offset + static_cast<int64_t>(
+                             layout.getFieldOffset(field->getFieldIndex()) /
+                             8),
+                field->getType(), element)))
+          return failure();
+      }
+      return success();
+    }
+    // Fall through: a whole-record value copies its source region.
+  }
+  if (canonical->isRecordType() || canonical->isArrayType()) {
+    FailureOr<ByteRegionRef> src = resolveByteRegionRef(e, nullptr);
+    if (failed(src))
+      return failure();
+    ByteRegionRef dst{place, offset, Value()};
+    return emitByteRegionCopy(
+        loc, dst, *src, context.getTypeSizeInChars(canonical).getQuantity());
+  }
+  return emitError(loc)
+         << "unsupported: non-byte member in a byte-region initializer";
+}
+
+LogicalResult
+CImporter::emitByteRegionAggregateAssign(const clang::BinaryOperator *op) {
+  Location loc = translateLoc(op->getOperatorLoc());
+  GlobalWriteback writeback;
+  FailureOr<ByteRegionRef> dst = resolveByteRegionRef(op->getLHS(), &writeback);
+  if (failed(dst))
+    return failure();
+  FailureOr<ByteRegionRef> src = resolveByteRegionRef(op->getRHS(), nullptr);
+  if (failed(src))
+    return failure();
+  uint64_t size = astContext()
+                      .getTypeSizeInChars(op->getLHS()->getType())
+                      .getQuantity();
+  if (failed(emitByteRegionCopy(loc, *dst, *src, size)))
+    return failure();
+  if (writeback.place) {
+    Value value = loadPlace(loc, writeback.place);
+    builder.create<emitrust::GlobalStoreOp>(loc, value,
+                                            globalSymbol(writeback.symbol));
+  }
+  return success();
+}
+
+LogicalResult CImporter::createByteRegionGlobal(const clang::VarDecl *key,
+                                                const clang::VarDecl *decl,
+                                                llvm::StringRef symbolName,
+                                                Location loc) {
+  clang::ASTContext &context = astContext();
+  clang::QualType type = decl->getType();
+  uint64_t imageSize = context.getTypeSizeInChars(type).getQuantity();
+  Type ui8 = IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  Attribute initAttr;
+  if (decl->getInit()) {
+    Location initLoc = translateLoc(decl->getInit()->getBeginLoc());
+    clang::APValue *value = decl->evaluateValue();
+    SmallVector<uint8_t> image;
+    if (value) {
+      // A static flexible-array-member tail initializer folds into an
+      // EXTENDED image past sizeof (00216's `struct W gw`); sizeof
+      // itself stays FAM-free.
+      if (const auto *record = type.getCanonicalType()->getAsRecordDecl()) {
+        const clang::RecordDecl *definition = record->getDefinition();
+        if (definition && definition->hasFlexibleArrayMember() &&
+            value->isStruct()) {
+          const clang::FieldDecl *fam = nullptr;
+          for (const clang::FieldDecl *field : definition->fields())
+            if (field->getType()->isIncompleteArrayType())
+              fam = field;
+          if (fam && fam->getFieldIndex() < value->getStructNumFields()) {
+            const clang::APValue &tail =
+                value->getStructField(fam->getFieldIndex());
+            if (tail.isArray() && tail.getArraySize() > 0) {
+              const clang::ArrayType *famType =
+                  context.getAsArrayType(fam->getType());
+              imageSize +=
+                  tail.getArraySize() *
+                  context.getTypeSizeInChars(famType->getElementType())
+                      .getQuantity();
+            }
+          }
+        }
+      }
+      image.assign(imageSize, 0);
+      if (failed(serializeAPValueBytes(*value, type, 0, image, initLoc)))
+        return failure();
+    } else {
+      // clang's constant evaluator refuses flexible-array-member tail
+      // initializers; fold the SEMANTIC initializer form syntactically.
+      // The FAM init's semantic type is the deduced constant array, so
+      // its size extends the image.
+      const clang::Expr *init = decl->getInit()->IgnoreParens();
+      if (const auto *list = llvm::dyn_cast<clang::InitListExpr>(init)) {
+        const clang::InitListExpr *semantic =
+            list->getSemanticForm() ? list->getSemanticForm() : list;
+        if (const auto *record = type.getCanonicalType()->getAsRecordDecl();
+            record && record->getDefinition() &&
+            record->getDefinition()->hasFlexibleArrayMember()) {
+          unsigned index = 0;
+          for (const clang::FieldDecl *field :
+               record->getDefinition()->fields()) {
+            if (index >= semantic->getNumInits())
+              break;
+            const clang::Expr *element = semantic->getInit(index++);
+            if (field->getType()->isIncompleteArrayType() && element &&
+                !llvm::isa<clang::ImplicitValueInitExpr>(element) &&
+                context.getAsConstantArrayType(element->getType()))
+              imageSize +=
+                  context.getTypeSizeInChars(element->getType()).getQuantity();
+          }
+        }
+      }
+      image.assign(imageSize, 0);
+      if (failed(serializeInitExprBytes(decl->getInit(), type, 0, image,
+                                        initLoc)))
+        return failure();
+    }
+    SmallVector<Attribute> bytes;
+    bytes.reserve(image.size());
+    for (uint8_t byte : image)
+      bytes.push_back(IntegerAttr::get(ui8, byte));
+    initAttr = builder.getArrayAttr(bytes);
+  }
+  if (imageSize == 0)
+    return emitError(loc) << "unsupported: zero-size byte-region global";
+  Type regionType =
+      emitrust::ArrayType::get(builder.getContext(), imageSize, ui8);
+  bool isConst = type.isConstQualified();
+  OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+  moduleBuilder.create<emitrust::GlobalOp>(
+      loc, moduleBuilder.getStringAttr(symbolName), TypeAttr::get(regionType),
+      initAttr, isConst ? moduleBuilder.getUnitAttr() : UnitAttr());
+  globals[key] = GlobalInfo{symbolName.str(), regionType};
+  return success();
+}
+
+LogicalResult CImporter::serializeAPValueBytes(const clang::APValue &value,
+                                               clang::QualType type,
+                                               uint64_t offset,
+                                               SmallVectorImpl<uint8_t> &image,
+                                               Location loc) {
+  clang::ASTContext &context = astContext();
+  clang::QualType canonical = type.getCanonicalType();
+  if (value.isAbsent() || value.isIndeterminate())
+    return success(); // Zero fill.
+  if (value.isInt()) {
+    uint64_t width = context.getTypeSizeInChars(canonical).getQuantity();
+    uint64_t raw = value.getInt().extOrTrunc(64).getZExtValue();
+    for (uint64_t i = 0; i != width; ++i) {
+      if (offset + i >= image.size())
+        return emitError(loc)
+               << "unsupported: global initializer exceeds the byte image";
+      image[offset + i] = (raw >> (8 * i)) & 0xff;
+    }
+    return success();
+  }
+  if (value.isArray()) {
+    const clang::ArrayType *array = context.getAsArrayType(canonical);
+    if (!array)
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
+    clang::QualType element = array->getElementType();
+    uint64_t elementSize = context.getTypeSizeInChars(element).getQuantity();
+    unsigned initialized = value.getArrayInitializedElts();
+    for (unsigned i = 0; i != initialized; ++i)
+      if (failed(serializeAPValueBytes(value.getArrayInitializedElt(i),
+                                       element, offset + i * elementSize,
+                                       image, loc)))
+        return failure();
+    if (value.hasArrayFiller())
+      for (unsigned i = initialized, n = value.getArraySize(); i != n; ++i)
+        if (failed(serializeAPValueBytes(value.getArrayFiller(), element,
+                                         offset + i * elementSize, image,
+                                         loc)))
+          return failure();
+    return success();
+  }
+  if (value.isUnion()) {
+    const clang::FieldDecl *active = value.getUnionField();
+    if (!active)
+      return success(); // Zero fill.
+    return serializeAPValueBytes(value.getUnionValue(), active->getType(),
+                                 offset, image, loc);
+  }
+  if (value.isStruct()) {
+    const auto *record = canonical->getAsRecordDecl();
+    const clang::RecordDecl *definition =
+        record ? record->getDefinition() : nullptr;
+    if (!definition)
+      return emitError(loc)
+             << "unsupported: global initializer does not match its type";
+    const clang::ASTRecordLayout &layout =
+        context.getASTRecordLayout(definition);
+    unsigned index = 0;
+    for (const clang::FieldDecl *field : definition->fields()) {
+      if (index >= value.getStructNumFields())
+        break;
+      const clang::APValue &fieldValue = value.getStructField(index);
+      uint64_t fieldOffset = layout.getFieldOffset(index) / 8;
+      ++index;
+      if (failed(serializeAPValueBytes(fieldValue, field->getType(),
+                                       offset + fieldOffset, image, loc)))
+        return failure();
+    }
+    return success();
+  }
+  return emitError(loc)
+         << "unsupported: non-byte constant in a byte-region initializer";
+}
+
+LogicalResult
+CImporter::serializeInitExprBytes(const clang::Expr *init,
+                                  clang::QualType type, uint64_t offset,
+                                  SmallVectorImpl<uint8_t> &image,
+                                  Location loc) {
+  clang::ASTContext &context = astContext();
+  const clang::Expr *e = init->IgnoreParens();
+  while (true) {
+    if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e)) {
+      e = cleanups->getSubExpr()->IgnoreParens();
+      continue;
+    }
+    if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e)) {
+      if (cast->getCastKind() == clang::CK_NoOp ||
+          cast->getCastKind() == clang::CK_LValueToRValue) {
+        e = cast->getSubExpr()->IgnoreParens();
+        continue;
+      }
+    }
+    break;
+  }
+  if (llvm::isa<clang::ImplicitValueInitExpr>(e) ||
+      llvm::isa<clang::NoInitExpr>(e))
+    return success(); // Zero fill.
+  if (const auto *compound = llvm::dyn_cast<clang::CompoundLiteralExpr>(e))
+    return serializeInitExprBytes(compound->getInitializer(), type, offset,
+                                  image, loc);
+  clang::QualType canonical = type.getCanonicalType();
+  if (canonical->isArithmeticType() || canonical->isEnumeralType()) {
+    clang::Expr::EvalResult eval;
+    if (!e->EvaluateAsInt(eval, context) || eval.HasSideEffects)
+      return emitError(loc) << "unsupported: non-constant global initializer";
+    uint64_t width = context.getTypeSizeInChars(canonical).getQuantity();
+    uint64_t raw = eval.Val.getInt().extOrTrunc(64).getZExtValue();
+    for (uint64_t i = 0; i != width; ++i) {
+      if (offset + i >= image.size())
+        return emitError(loc)
+               << "unsupported: global initializer exceeds the byte image";
+      image[offset + i] = (raw >> (8 * i)) & 0xff;
+    }
+    return success();
+  }
+  if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(e)) {
+    if (!literal->isOrdinary())
+      return emitError(loc)
+             << "unsupported: non-ordinary string literal initializer";
+    for (unsigned i = 0, n = literal->getLength(); i != n; ++i) {
+      uint32_t byte = literal->getCodeUnit(i);
+      if (byte > 127)
+        return emitError(loc)
+               << "unsupported: non-ASCII byte in string literal initializer";
+      if (offset + i >= image.size())
+        break; // The unsized-array literal drops the excess NUL.
+      image[offset + i] = byte & 0xff;
+    }
+    return success();
+  }
+  const auto *list = llvm::dyn_cast<clang::InitListExpr>(e);
+  if (!list)
+    return emitError(loc) << "unsupported: non-constant global initializer";
+  if (const clang::InitListExpr *semantic = list->getSemanticForm())
+    list = semantic;
+  // The FAM tail's semantic list carries its own deduced constant array
+  // type; prefer it over the declared (incomplete) member type.
+  if (canonical->isIncompleteArrayType())
+    if (const clang::ConstantArrayType *deduced =
+            context.getAsConstantArrayType(list->getType()))
+      canonical = clang::QualType(deduced, 0);
+  if (const clang::ConstantArrayType *array =
+          context.getAsConstantArrayType(canonical)) {
+    clang::QualType element = array->getElementType();
+    uint64_t elementSize = context.getTypeSizeInChars(element).getQuantity();
+    uint64_t arraySize = array->getSize().getZExtValue();
+    if (list->getNumInits() == 1)
+      if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+              list->getInit(0)->IgnoreParens()))
+        return serializeInitExprBytes(literal, canonical, offset, image, loc);
+    uint64_t count = std::min<uint64_t>(list->getNumInits(), arraySize);
+    for (uint64_t i = 0; i != count; ++i)
+      if (failed(serializeInitExprBytes(list->getInit(i), element,
+                                        offset + i * elementSize, image,
+                                        loc)))
+        return failure();
+    if (list->hasArrayFiller())
+      if (const clang::Expr *filler = list->getArrayFiller();
+          filler && !llvm::isa<clang::ImplicitValueInitExpr>(filler))
+        for (uint64_t i = count; i < arraySize; ++i)
+          if (failed(serializeInitExprBytes(filler, element,
+                                            offset + i * elementSize, image,
+                                            loc)))
+            return failure();
+    return success();
+  }
+  const auto *record = canonical->getAsRecordDecl();
+  const clang::RecordDecl *definition =
+      record ? record->getDefinition() : nullptr;
+  if (!definition)
+    return emitError(loc) << "unsupported: non-constant global initializer";
+  if (definition->isUnion()) {
+    const clang::FieldDecl *active = list->getInitializedFieldInUnion();
+    if (!active || list->getNumInits() == 0)
+      return success();
+    return serializeInitExprBytes(list->getInit(0), active->getType(), offset,
+                                  image, loc);
+  }
+  const clang::ASTRecordLayout &layout = context.getASTRecordLayout(definition);
+  unsigned index = 0;
+  for (const clang::FieldDecl *field : definition->fields()) {
+    if (index >= list->getNumInits())
+      break;
+    const clang::Expr *element = list->getInit(index++);
+    if (!element)
+      continue;
+    if (failed(serializeInitExprBytes(
+            element, field->getType(),
+            offset + layout.getFieldOffset(field->getFieldIndex()) / 8, image,
+            loc)))
+      return failure();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// CTS-BR (00216): `void *` fn-ptr struct members.
+//===----------------------------------------------------------------------===//
+
+void CImporter::collectDeclTypeRecords(const clang::TranslationUnitDecl *unit) {
+  declTypeUsedRecords.clear();
+  clang::ASTContext &context = astContext();
+  auto noteType = [&](clang::QualType type) {
+    clang::QualType t = type.getCanonicalType();
+    while (true) {
+      if (const clang::ArrayType *array = context.getAsArrayType(t)) {
+        t = array->getElementType().getCanonicalType();
+        continue;
+      }
+      if (t->isPointerType()) {
+        t = t->getPointeeType().getCanonicalType();
+        continue;
+      }
+      break;
+    }
+    if (const auto *record = t->getAsRecordDecl())
+      if (const clang::RecordDecl *definition = record->getDefinition())
+        declTypeUsedRecords.insert(definition);
+  };
+  auto scanStmt = [&](auto &&self, const clang::Stmt *stmt) -> void {
+    if (!stmt)
+      return;
+    if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt))
+      for (const clang::Decl *decl : declStmt->decls())
+        if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+          noteType(var->getType());
+    for (const clang::Stmt *child : stmt->children())
+      self(self, child);
+  };
+  for (const clang::Decl *decl : unit->decls()) {
+    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+      continue;
+    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+      noteType(func->getReturnType());
+      for (const clang::ParmVarDecl *param : func->parameters())
+        noteType(param->getType());
+      if (func->hasBody() && func->getDefinition() == func)
+        scanStmt(scanStmt, func->getBody());
+      continue;
+    }
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
+      noteType(var->getType());
+      continue;
+    }
+    if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl))
+      if (const clang::RecordDecl *definition = record->getDefinition())
+        // A byte-region record never materializes its members as typed
+        // fields, so its field types are not declaration-type uses.
+        if (!isByteRegionRecord(definition))
+          for (const clang::FieldDecl *field : definition->fields())
+            noteType(field->getType());
+  }
+}
+
+void CImporter::planFnPtrMembers(const clang::TranslationUnitDecl *unit) {
+  clang::ASTContext &context = astContext();
+  llvm::DenseMap<const clang::FieldDecl *, const clang::FunctionDecl *>
+      targets;
+  llvm::DenseSet<const clang::FieldDecl *> disqualified;
+  llvm::SmallVector<std::pair<const clang::FieldDecl *, clang::QualType>, 4>
+      readerCasts;
+
+  auto isCandidateField = [&](const clang::FieldDecl *field) -> bool {
+    if (!field)
+      return false;
+    clang::QualType type = field->getType().getCanonicalType();
+    return type->isPointerType() && type->getPointeeType()->isVoidType();
+  };
+
+  // Strips the value trivia around a stored function address: implicit
+  // and explicit casts (function-to-pointer decay, the void* conversion)
+  // and the optional address-of.
+  auto functionTarget =
+      [&](const clang::Expr *expr) -> const clang::FunctionDecl * {
+    const clang::Expr *e = expr->IgnoreParenCasts();
+    if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+      if (unary->getOpcode() == clang::UO_AddrOf)
+        e = unary->getSubExpr()->IgnoreParenCasts();
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+    return ref ? llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl()) : nullptr;
+  };
+
+  // Walks an aggregate initializer, recording (or disqualifying) every
+  // value stored into a candidate member.
+  auto walkInit = [&](auto &&self, clang::QualType type,
+                      const clang::Expr *init) -> void {
+    if (!init)
+      return;
+    const clang::Expr *e = init->IgnoreParenImpCasts();
+    if (const auto *compound = llvm::dyn_cast<clang::CompoundLiteralExpr>(e)) {
+      self(self, compound->getType(), compound->getInitializer());
+      return;
+    }
+    const auto *list = llvm::dyn_cast<clang::InitListExpr>(e);
+    if (!list)
+      return;
+    if (const clang::InitListExpr *semantic = list->getSemanticForm())
+      list = semantic;
+    clang::QualType canonical = type.getCanonicalType();
+    if (const clang::ConstantArrayType *array =
+            context.getAsConstantArrayType(canonical)) {
+      for (unsigned i = 0, n = list->getNumInits(); i != n; ++i)
+        self(self, array->getElementType(), list->getInit(i));
+      if (list->hasArrayFiller())
+        self(self, array->getElementType(), list->getArrayFiller());
+      return;
+    }
+    const auto *record = canonical->getAsRecordDecl();
+    const clang::RecordDecl *definition =
+        record ? record->getDefinition() : nullptr;
+    if (!definition)
+      return;
+    if (definition->isUnion()) {
+      if (const clang::FieldDecl *active = list->getInitializedFieldInUnion();
+          active && list->getNumInits())
+        self(self, active->getType(), list->getInit(0));
+      return;
+    }
+    unsigned index = 0;
+    for (const clang::FieldDecl *field : definition->fields()) {
+      if (index >= list->getNumInits())
+        break;
+      const clang::Expr *element = list->getInit(index++);
+      if (!element)
+        continue;
+      if (!isCandidateField(field)) {
+        self(self, field->getType(), element);
+        continue;
+      }
+      if (llvm::isa<clang::ImplicitValueInitExpr>(element) ||
+          element->isNullPointerConstant(
+              context, clang::Expr::NPC_NeverValueDependent) !=
+              clang::Expr::NPCK_NotNull)
+        continue; // The null constant folds to None.
+      const clang::FunctionDecl *target = functionTarget(element);
+      if (!target || target->isVariadic() ||
+          !target->getType()->getAs<clang::FunctionProtoType>()) {
+        disqualified.insert(field);
+        continue;
+      }
+      auto [it, inserted] = targets.try_emplace(field, target);
+      if (!inserted &&
+          !context.hasSameType(it->second->getType(), target->getType()))
+        disqualified.insert(field);
+    }
+  };
+
+  // Walks a function body: a candidate-member read under a cast to a
+  // function-pointer type is the one admitted use; any other mention
+  // disqualifies.
+  auto scanStmt = [&](auto &&self, const clang::Stmt *stmt) -> void {
+    if (!stmt)
+      return;
+    if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(stmt)) {
+      if (isFunctionPointer(cast->getType())) {
+        const clang::Expr *sub = cast->getSubExpr()->IgnoreParenImpCasts();
+        if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(sub)) {
+          if (const auto *field = llvm::dyn_cast<clang::FieldDecl>(
+                  member->getMemberDecl());
+              field && isCandidateField(field)) {
+            readerCasts.push_back({field, cast->getType()});
+            self(self, member->getBase());
+            return;
+          }
+        }
+      }
+    }
+    if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt)) {
+      for (const clang::Decl *decl : declStmt->decls())
+        if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+          walkInit(walkInit, var->getType(), var->getInit());
+      // Fall through: the generic child scan below revisits the
+      // initializer expressions, which mention no candidate members in
+      // admitted programs (a mention there disqualifies, as intended).
+    }
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(stmt))
+      if (const auto *field =
+              llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+          field && isCandidateField(field))
+        disqualified.insert(field);
+    for (const clang::Stmt *child : stmt->children())
+      self(self, child);
+  };
+
+  for (const clang::Decl *decl : unit->decls()) {
+    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+      continue;
+    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+      if (func->hasBody() && func->getDefinition() == func)
+        scanStmt(scanStmt, func->getBody());
+      continue;
+    }
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+      walkInit(walkInit, var->getType(), var->getInit());
+  }
+
+  for (auto &[field, target] : targets) {
+    if (disqualified.contains(field))
+      continue;
+    bool compatible = true;
+    for (auto &[readField, castType] : readerCasts)
+      if (readField == field &&
+          !context.typesAreCompatible(
+              castType.getCanonicalType()->getPointeeType(),
+              target->getType()))
+        compatible = false;
+    if (!compatible)
+      continue;
+    fnPtrMemberTypes[field] = context.getPointerType(target->getType());
+  }
+}
+
 FailureOr<Value>
 CImporter::projectMemberPlace(Location loc, Value basePlace,
                               const clang::FieldDecl *field) {
@@ -19329,6 +20949,15 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   const auto *field = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
   if (!field)
     return emitError(loc) << "unsupported member access";
+  // A flexible array member tail and a GNU zero-length array member have
+  // no storage behind sizeof; runtime access is a located rejection
+  // (CTS-BR, 00216).
+  if (failed(checkSpecialArrayMemberAccess(field, loc)))
+    return failure();
+  // CTS-BR (00216): a member of a byte-region record is a subscript of
+  // the region base at the member's constant byte offset.
+  if (isByteRegionRecord(field->getParent()))
+    return emitByteRegionLeafLValue(member, loc, writeback);
   // A byte-array union arm (CTS-F, 00210) exists only at the type level:
   // the union admitted on its integer slot, but no access through the
   // array arm can be modeled on that one slot.
@@ -19336,8 +20965,10 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
     return emitError(loc) << "unsupported: union byte-array arm access";
   // A data-pointer member has no place of its own (its stored i64
   // carries no information); reads resolve through the static binding
-  // in `emitPointerRValue` and writes through `emitMemberPointerAssign`.
-  if (isDataPointer(field->getType()))
+  // in `emitPointerRValue` and writes through `emitMemberPointerAssign` —
+  // except an admitted `void *` fn-ptr member (CTS-BR, 00216), whose
+  // place is the retyped fn_ptr field.
+  if (isDataPointer(field->getType()) && !fnPtrMemberTypes.count(field))
     return emitError(loc) << "unsupported use of pointer struct member '"
                           << field->getName() << "'";
   // A bit-field member's storage is a window of a synthesized backing
@@ -19363,9 +20994,13 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   // slot's name at the slot's type. A pun arm's (differently-signed
   // integer, or float over an integer slot and vice versa) bit-exact
   // reinterpretation happens at the load or store site (see
-  // `reinterpretUnionArmRead`/`reinterpretUnionArmWrite`).
-  FailureOr<Type> fieldType =
-      mapType(flattenedFieldStorage(field)->getType(), loc);
+  // `reinterpretUnionArmRead`/`reinterpretUnionArmWrite`). An admitted
+  // `void *` fn-ptr member reads and writes at its retyped fn_ptr type.
+  clang::QualType storageType = flattenedFieldStorage(field)->getType();
+  if (clang::QualType retyped = fnPtrMemberTypes.lookup(field);
+      !retyped.isNull())
+    storageType = retyped;
+  FailureOr<Type> fieldType = mapType(storageType, loc);
   if (failed(fieldType))
     return failure();
   return builder
@@ -19652,6 +21287,10 @@ FailureOr<Value> CImporter::emitBitFieldAssign(const clang::MemberExpr *member,
 FailureOr<Value>
 CImporter::emitSubscriptLValue(const clang::ArraySubscriptExpr *subscript,
                                Location loc, GlobalWriteback *writeback) {
+  // CTS-BR (00216): a subscript rooted in a byte-region aggregate is a
+  // subscript of the region base at the accumulated byte offset.
+  if (exprRootsInByteRegion(subscript))
+    return emitByteRegionLeafLValue(subscript, loc, writeback);
   const clang::Expr *base = subscript->getBase()->IgnoreParenImpCasts();
   if (!base->getType().getCanonicalType()->isArrayType()) {
     // Subscript through a pointer: decompose it into (base, cursor) and

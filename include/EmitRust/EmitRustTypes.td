@@ -136,10 +136,12 @@ def EmitRust_ArrayType : EmitRust_Type<"Array", "array"> {
   let description = [{
     An array type with a compile-time size of at least one element. The
     element type must be a scalar (integer, index, or float), an
-    `!emitrust.struct` type, or a nested `!emitrust.array` type (a C
-    multi-dimensional array is an array of arrays); lvalues, slices, and
-    references are rejected. The type is emitted as the Rust array type
-    `[T; N]`, nesting as `[[T; N]; M]`.
+    `!emitrust.struct` type, an `!emitrust.fn_ptr` type (a C
+    function-pointer table, emitted as `[Option<fn(...)>; N]`), or a
+    nested `!emitrust.array` type (a C multi-dimensional array is an
+    array of arrays); lvalues, slices, and references are rejected. The
+    type is emitted as the Rust array type `[T; N]`, nesting as
+    `[[T; N]; M]`.
 
     Example:
 
@@ -157,8 +159,8 @@ def EmitRust_ArrayType : EmitRust_Type<"Array", "array"> {
 
   let extraClassDeclaration = [{
     /// Returns whether `type` may be used as an array element type: a
-    /// scalar (integer, index, f32, f64), an EmitRust struct type, or a
-    /// nested EmitRust array type.
+    /// scalar (integer, index, f32, f64), an EmitRust struct type, a
+    /// function pointer, or a nested EmitRust array type.
     static bool isValidElementType(Type type);
   }];
 
