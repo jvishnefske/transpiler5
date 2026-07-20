@@ -662,6 +662,20 @@ struct SecondOrderRegion {
 /// additionally rejects write-throughs) — and never invalidated. The
 /// per-region output is the deliberate seam for the later owner-struct
 /// codegen phases.
+/// Merges the facts of `absorbed` into `target`: bases are deduplicated by
+/// declaration, literal and allocation bases conflict when they differ (a
+/// pointer cannot range over two of them), flag/location pairs keep the
+/// first recorded site, and only the first invalidation is kept. Used by
+/// the per-function union-find (`PointerRegionAnalysis::unite`), by the
+/// program-wide aggregation of a global pointer's per-function regions
+/// (`CImporter::planOwners`, in ImportC.cpp), and by
+/// `CImporter::importPointerGlobal` (in ImportCGlobals.cpp) — so unlike the
+/// AST-helpers section above, this one needs a single definition (kept in
+/// ImportC.cpp, next to `PointerRegionAnalysis`'s other out-of-line methods)
+/// shared via an ordinary declaration rather than a `static inline` copy per
+/// translation unit.
+void mergeRegionFacts(PointerRegion &target, const PointerRegion &absorbed);
+
 class PointerRegionAnalysis {
 public:
   /// Analyzes `body`, replacing any previous analysis state. `context` is
