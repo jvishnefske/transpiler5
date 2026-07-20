@@ -1,0 +1,3680 @@
+//===- CImporterInternal.h - CImporter class + private helpers -*- C++ -*-===//
+//
+// Part of the EmitRust project.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+/// \file
+/// Private implementation header for the C importer: the `CImporter` class
+/// (the functional core of `importC`/`importCProject`, declared in the public
+/// `EmitRust/ImportC.h`) plus the helper structs and small analyses its
+/// methods share. Included only by the `ImportC*.cpp` translation units that
+/// implement `CImporter`'s methods; never installed or exposed publicly.
+///
+/// `CImporter` and its helper types are declared here at ordinary (non
+/// anonymous-namespace) scope so that identical copies of this header,
+/// included by several `.cpp` files, name the *same* class: out-of-line
+/// member definitions such as `CImporter::importFunction` in one translation
+/// unit must refer to the identical type used by callers compiled in another
+/// translation unit. Wrapping them in an anonymous namespace, as the
+/// single-file version of this code did, would give each translation unit
+/// its own distinct type and break linkage across the split files.
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef EMITRUST_IMPORTC_CIMPORTERINTERNAL_H
+#define EMITRUST_IMPORTC_CIMPORTERINTERNAL_H
+
+#include "EmitRust/EmitRustDialect.h"
+#include "EmitRust/EmitRustOps.h"
+#include "EmitRust/EmitRustTypes.h"
+
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/Location.h"
+#include "mlir/IR/Matchers.h"
+#include "mlir/IR/Verifier.h"
+
+#include "clang/AST/APValue.h"
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/Decl.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/OperationKinds.h"
+#include "clang/AST/RecordLayout.h"
+#include "clang/AST/Stmt.h"
+#include "clang/AST/Type.h"
+#include "clang/Basic/Builtins.h"
+#include "clang/Basic/SourceManager.h"
+#include "clang/Frontend/ASTUnit.h"
+#include "clang/Tooling/CompilationDatabase.h"
+#include "clang/Tooling/Tooling.h"
+
+#include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSwitch.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/Twine.h"
+
+#include <cstdint>
+#include <cstdlib>
+#include <deque>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+using namespace mlir;
+
+
+/// Break/continue branch targets for the innermost enclosing loop or switch.
+struct LoopTargets {
+  /// Block a `break` statement branches to (the loop or switch exit block).
+  Block *breakDest;
+  /// Block a `continue` statement branches to (the condition or increment
+  /// block of the enclosing loop). Inside a `switch`, this is inherited from
+  /// the enclosing loop and is null when the switch is not inside a loop.
+  Block *continueDest;
+};
+
+/// A comparison or switch operand that denotes a value of a complete named
+/// C enum, as recognized by `classifyEnumOperand`. Exactly one of `value`
+/// (an enum-typed expression) and `constant` (an enumerator reference,
+/// which has type `int` in C) is non-null.
+struct EnumOperand {
+  /// The enum's defining declaration.
+  const clang::EnumDecl *decl;
+  /// The enum-typed expression, or null for an enumerator reference.
+  const clang::Expr *value;
+  /// The referenced enumerator, or null for an enum-typed expression.
+  const clang::EnumConstantDecl *constant;
+};
+
+/// An imported variable with static storage duration (a file-scope variable
+/// or a function-local static), keyed by its canonical clang declaration.
+struct GlobalInfo {
+  /// The module-level `emitrust.global` symbol name (for statics, the
+  /// mangled `<function>_<name>`).
+  std::string symbol;
+  /// The mapped MLIR value type of the global.
+  Type type;
+};
+
+/// The emission-side identity of one pointer-region base: the bound object
+/// and, for a `&struct.member` base (CTS-P9), the scalar member the region
+/// roots at. Two bases are the same exactly when both components agree, so
+/// `&s` and `&s.b` stay distinct bases of distinct regions.
+struct PointerBaseKey {
+  /// The bound object's declaration (canonical for globals).
+  const clang::VarDecl *var = nullptr;
+  /// The member the region roots at (`p = &s.b`); null for whole-object
+  /// bases.
+  const clang::FieldDecl *member = nullptr;
+
+  bool operator==(const PointerBaseKey &other) const {
+    return var == other.var && member == other.member;
+  }
+  bool operator!=(const PointerBaseKey &other) const {
+    return !(*this == other);
+  }
+};
+
+/// A pending store-back of a staged global copy. Element and field accesses
+/// of a global stage its whole value in a local `emitrust.variable`; write
+/// contexts store the modified copy back into the global afterwards
+/// (load-modify-store, exact for the single-threaded C subset).
+struct GlobalWriteback {
+  /// The staging place holding the copy; null when no global was staged
+  /// and no multi-base element was staged.
+  Value place;
+  /// The symbol of the global to store the copy back into; empty for a
+  /// multi-base staging (which writes back through `multiBases`).
+  std::string symbol;
+  /// Multi-base dispatch store-back (CTS-P7): when non-empty, `place`
+  /// stages one element of the base selected by `multiBaseIndex`, and the
+  /// flush dispatches the staged value back into that base at
+  /// `multiCursor` (a match over the closed set of bases). A global-member
+  /// base's arm stages the global's whole value afresh, assigns the
+  /// projected member, and stores the whole value back (CTS-P9).
+  SmallVector<PointerBaseKey, 2> multiBases;
+  /// The i32 enum-of-bases discriminant selecting the active base;
+  /// meaningful only with a non-empty `multiBases`.
+  Value multiBaseIndex;
+  /// The i64 element cursor of the staged element; null when every base
+  /// is a degenerate scalar object.
+  Value multiCursor;
+  /// The mapped pointee value type of the staged element; meaningful only
+  /// with a non-empty `multiBases`.
+  Type multiPointeeType;
+};
+
+/// Returns whether `name` is a Rust keyword (strict or reserved, editions
+/// 2015-2021, plus the contextual `union`) and thus unusable as a Rust item
+/// name. Global variables keep their C spelling verbatim, so colliding
+/// names are rejected instead of being mangled.
+static bool isRustKeyword(llvm::StringRef name) {
+  static const llvm::StringSet<> keywords = {
+      // Strict keywords (2015).
+      "as", "break", "const", "continue", "crate", "else", "enum", "extern",
+      "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
+      "move", "mut", "pub", "ref", "return", "self", "Self", "static",
+      "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
+      "while",
+      // Strict keywords (2018).
+      "async", "await", "dyn",
+      // Reserved keywords.
+      "abstract", "become", "box", "do", "final", "macro", "override", "priv",
+      "try", "typeof", "unsized", "virtual", "yield",
+      // Contextual keyword that still reads confusingly as an item name.
+      "union"};
+  return keywords.contains(name);
+}
+
+/// Returns the Rust spelling of a struct/union MEMBER name: a spelling that
+/// is a Rust keyword mangles deterministically by appending a single
+/// underscore (`type` -> `type_`, `match` -> `match_`); every other
+/// spelling is kept verbatim. Member names are the one identifier class
+/// that mangles instead of rejecting (C99-45: c-testsuite 00218 declares a
+/// member named `type`): the mangled spelling never leaves the emitted
+/// struct's own field namespace, so no cross-symbol collision policy is
+/// disturbed. Struct/enum/function/global names keep their rejections. A
+/// collision the mangle introduces (a struct declaring both `type` and
+/// `type_`) is rejected where the fields are collected.
+static std::string mangleMemberName(llvm::StringRef name) {
+  if (isRustKeyword(name))
+    return (name + "_").str();
+  return name.str();
+}
+
+/// Returns whether `type` is, or contains (through record fields and array
+/// elements, never through pointers), a record with a bit-field member.
+/// Used to refuse `sizeof`/`_Alignof` folds over bit-field records: the
+/// C99-45 backing-run layout is deliberately not ABI-compatible, so the C
+/// layout numbers would promise a layout the emitted Rust does not keep.
+/// Recursion depth is bounded by the source's type nesting (pointers are
+/// not followed, so self-referencing records terminate).
+static bool typeContainsBitField(clang::QualType type) {
+  const clang::Type *canonical = type.getCanonicalType().getTypePtr();
+  while (const auto *array = llvm::dyn_cast<clang::ArrayType>(canonical))
+    canonical = array->getElementType().getCanonicalType().getTypePtr();
+  const clang::RecordDecl *record = canonical->getAsRecordDecl();
+  if (!record)
+    return false;
+  record = record->getDefinition();
+  if (!record)
+    return false;
+  for (const clang::FieldDecl *field : record->fields()) {
+    if (field->isBitField())
+      return true;
+    if (typeContainsBitField(field->getType()))
+      return true;
+  }
+  return false;
+}
+
+/// Returns whether `type` is, or contains (through record fields and array
+/// elements, never through pointers), the `long double` builtin. Used to
+/// refuse `sizeof`/`_Alignof` folds over long double: the type imports as
+/// f64 (CTS 00204), so the C ABI size (16 on x86-64) would promise a
+/// layout the emitted Rust never keeps.
+static bool typeContainsLongDouble(clang::QualType type) {
+  const clang::Type *canonical = type.getCanonicalType().getTypePtr();
+  while (const auto *array = llvm::dyn_cast<clang::ArrayType>(canonical))
+    canonical = array->getElementType().getCanonicalType().getTypePtr();
+  if (const auto *builtin = llvm::dyn_cast<clang::BuiltinType>(canonical))
+    return builtin->getKind() == clang::BuiltinType::LongDouble;
+  const clang::RecordDecl *record = canonical->getAsRecordDecl();
+  if (!record)
+    return false;
+  record = record->getDefinition();
+  if (!record)
+    return false;
+  for (const clang::FieldDecl *field : record->fields())
+    if (typeContainsLongDouble(field->getType()))
+      return true;
+  return false;
+}
+
+/// Builds a FloatAttr of `type` from `value`, converting the APFloat to
+/// the type's semantics when they differ. The only differing source is a
+/// `long double` constant (x87 80-bit extended on the x86-64 target),
+/// whose value narrows to the f64 the type policy substitutes for it
+/// (CTS 00204; correctly rounded, exact for every f64-exact source).
+static FloatAttr floatAttrFor(FloatType type, llvm::APFloat value) {
+  if (&value.getSemantics() != &type.getFloatSemantics()) {
+    bool losesInfo = false;
+    (void)value.convert(type.getFloatSemantics(),
+                        llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+  }
+  return FloatAttr::get(type, value);
+}
+
+/// A pointer expression decomposed into its statically resolved base object
+/// and an i64 element cursor value. `cursor` is null for a degenerate base
+/// (the address of a scalar or struct object taken with `&x`), which
+/// supports dereference but carries no element offset and hence no pointer
+/// arithmetic. Into a multi-dimensional array the cursor is flat and
+/// row-major: it counts innermost (scalar or struct) elements from the
+/// start of `base`, regardless of whether the pointer designates a scalar
+/// or a whole row. A pointer into a string literal has no base
+/// declaration; its region is the literal's read-only backing byte array
+/// (`literalBacking`, an `!emitrust.lvalue<!emitrust.array<Nxi8>>`) and its
+/// cursor is always present.
+struct PtrExprValue {
+  /// The object the pointer points into (a local scalar, struct, or
+  /// array); null for a pointer into a string literal, for a pointer
+  /// of a nullable region that was never bound to any object (a pointer
+  /// that only ever holds the null constant), and for a pointer of a
+  /// multi-base region (whose active base is the runtime `baseIndex`
+  /// discriminant, CTS-P7).
+  const clang::VarDecl *base = nullptr;
+  /// The i64 element offset from the start of the region; null when
+  /// degenerate.
+  Value cursor;
+  /// The read-only backing array place of a string-literal region; null
+  /// for object-based pointers.
+  Value literalBacking;
+  /// The Option-of-cursor discriminant of a pointer in a nullable region:
+  /// an i1 that is true when the pointer currently holds an address and
+  /// false when it holds the null constant (CTS-P8). Null when the
+  /// pointer is statically non-null (its region never sees NULL), which
+  /// lets null-checks fold to constants.
+  Value nonNull;
+  /// The enum-of-bases discriminant of a pointer in a multi-base region
+  /// (CTS-P7): an i32 index into `multiBases` naming the object the
+  /// pointer currently points into. Null for single-base pointers.
+  Value baseIndex;
+  /// The ordered disjoint bases of a multi-base region, indexed by
+  /// `baseIndex`; empty for single-base pointers. Copied out of the
+  /// pointer's `PointerLocalInfo` so the value stays self-contained.
+  SmallVector<PointerBaseKey, 2> multiBases;
+  /// The struct member a `&struct.member` base roots at (CTS-P9): the
+  /// pointer designates exactly that member of `base`, so every place it
+  /// resolves to is the member's projection on the base's place (or on
+  /// the base's staged global copy). Null for whole-object bases.
+  const clang::FieldDecl *member = nullptr;
+};
+
+/// Phase-1b classification of one pointer parameter, derived from the
+/// function definition's body. `ScalarRef` parameters are only dereferenced
+/// (`*p`) or arrowed (`p->f`), or are unused, and stay plain
+/// `!emitrust.mut_ref<T>` references (the historical behavior). `Slice`
+/// parameters are subscripted, walked, compared, differenced, reassigned,
+/// copied into a pointer local, or passed onward, and become
+/// `!emitrust.mut_ref<!emitrust.slice<T>>` region bases. `CellSlice`
+/// parameters (CTS-P10) belong to an interprocedural class whose bases are
+/// ALL mutable global arrays of one element type; they become shared
+/// `!emitrust.ref<!emitrust.cell_slice<T>>` references, which stay
+/// coherent with direct global reads mid-call because both hit the same
+/// thread-local `Cell` (a staged copy would be unsound here). `Carrier`
+/// parameters (CTS-P3) are `void *` parameters of a defined function whose
+/// body only ever truth-tests them: they carry an integer in pointer
+/// clothing and become plain i64 values (call sites pass carrier values,
+/// with null as the i64 zero).
+enum class ParamKind { ScalarRef, Slice, CellSlice, Carrier };
+
+/// Why a pointer-parameter class with global bases does NOT lower to a
+/// cell-slice (CTS-P10 boundaries), keyed by the global base so the
+/// call-site rejection can name the precise reason.
+struct CellSliceReject {
+  /// The boundary that was hit.
+  enum class Kind {
+    /// The class joins a global base with a local object: one parameter
+    /// type would have to be both `&mut [T]` and `&[Cell<T>]`.
+    Mixed,
+    /// A parameter of the class is null-checked; Option wrapping and the
+    /// global_cells borrow discipline do not compose in v1.
+    NullableGlobal,
+  };
+  Kind kind;
+  /// The global base's C name (for the Mixed wording).
+  std::string globalName;
+  /// The first local object joined into the class (Mixed only).
+  std::string localName;
+};
+
+/// One cell-slice access expression in a callee body: a subscript `p[i]`
+/// or dereference `*p` of a `!emitrust.ref<!emitrust.cell_slice<T>>`
+/// parameter. `index` is null for the dereference form (element 0).
+struct CellSliceAccess {
+  const clang::ParmVarDecl *param;
+  const clang::Expr *index;
+};
+
+/// The decomposition record of one accepted pointer local (or, in Phase 1b,
+/// one slice-classified pointer parameter): the single base object of its
+/// region and this pointer's rank-0 `memref<i64>` cursor cell.
+/// The cell is null when the base is degenerate (a scalar object with no
+/// element offset to track); such a pointer needs no runtime state at all.
+/// A slice parameter is its own base, with its cursor initialized to zero.
+struct PointerLocalInfo {
+  /// The object every value of this pointer points into; null for a
+  /// pointer whose region is a string literal and for a pointer of a
+  /// multi-base region (CTS-P7, see `multiBases`).
+  const clang::VarDecl *base = nullptr;
+  /// Entry-block `memref<i64>` cell holding the element cursor, or null.
+  Value cursorCell;
+  /// The read-only backing array place of a string-literal region
+  /// (`!emitrust.lvalue<!emitrust.array<Nxi8>>`, holding the literal's
+  /// bytes plus the terminating NUL); null for object-based pointers.
+  Value literalBacking;
+  /// Entry-block `memref<i1>` cell holding the Option-of-cursor
+  /// discriminant of a pointer in a nullable region (true = holds an
+  /// address, false = holds the null constant); null for pointers whose
+  /// region never sees a null constant (CTS-P8).
+  Value nonNullCell;
+  /// Entry-block `memref<i32>` cell holding the enum-of-bases
+  /// discriminant of a pointer in a multi-base region (CTS-P7): the index
+  /// into `multiBases` of the object the pointer currently points into.
+  /// An address binding stores the bound object's index, `p = q` copies
+  /// the source pointer's discriminant, and every dereference dispatches
+  /// on it (a match over the closed set of bases). Null for single-base
+  /// pointers, whose base is statically known.
+  Value baseIndexCell;
+  /// The ordered disjoint bases of a multi-base region, indexed by the
+  /// discriminant; empty for single-base pointers. Every pointer of one
+  /// region carries the same order (the region's binding order), so
+  /// discriminants copy soundly across `p = q`.
+  SmallVector<PointerBaseKey, 2> multiBases;
+  /// The struct member a single `&struct.member` base roots at (CTS-P9);
+  /// null for whole-object bases. A member base is a degenerate
+  /// one-element run: no cursor, no arithmetic.
+  const clang::FieldDecl *member = nullptr;
+};
+
+/// The imported model of one pointer-typed global variable (CTS-P4): the
+/// pointer decomposes into a statically known *global* region base plus,
+/// for array-shaped regions, a stored i64 element cursor that is itself a
+/// module-level `emitrust.global` under the pointer's own C name. Cursors
+/// are plain Copy integers, so a stored global cursor carries no borrow —
+/// which is what makes a pointer-typed global representable at all under
+/// the `thread_local!`+Cell global model (a borrow could never escape
+/// `.with`). A degenerate pointer (bound to one global scalar or struct
+/// object) needs no runtime state at all and creates no module ops.
+struct PointerGlobalInfo {
+  /// The global base object's declaration (canonical). For a synthesized
+  /// backing — a promoted `calloc`/`malloc` allocation or a file-scope
+  /// compound literal — this is the pointer's own declaration and
+  /// `backingSymbol` names the backing global.
+  const clang::VarDecl *base;
+  /// Module symbol of the synthesized backing `emitrust.global`; empty
+  /// when `base` is a real global object (resolved through the ordinary
+  /// globals map at each access).
+  std::string backingSymbol;
+  /// Mapped value type of the synthesized backing; null with real bases.
+  Type backingType;
+  /// Module symbol of the pointer's i64 cursor `emitrust.global`; empty
+  /// for a degenerate (whole-object) pointer, which has no runtime state.
+  std::string cursorSymbol;
+};
+
+/// The statically resolved binding of one pointer-typed struct member of
+/// one struct instance (CTS-P2 / C99-43). A data-pointer member is stored
+/// as a plain i64 cursor field — a cursor is a borrow-free Copy integer
+/// (docs/transformation-theory.md section 4), so storing one in a struct
+/// never fights the borrow checker — and the analysis resolves the member
+/// to at most one statically known target object (or string literal) per
+/// struct instance. Every supported binding in the current model is
+/// degenerate (the member designates one whole scalar/struct object), so
+/// the stored i64 carries no runtime information and stays 0; member reads
+/// resolve to the bound object's place with no runtime state at all.
+/// Conflicting bindings, non-address sources, and array-run bindings make
+/// the member unresolvable, recorded as a located rejection naming both
+/// sites when two bindings clash.
+struct MemberPointerFacts {
+  /// The single object this instance's member points into; null for a
+  /// literal binding or an invalid one.
+  const clang::VarDecl *base = nullptr;
+  /// The string literal bound to the member (write-only support: reads of
+  /// a literal-bound member stay rejected); null for object bindings.
+  const clang::StringLiteral *literal = nullptr;
+  /// Where the binding was established (first site).
+  clang::SourceLocation loc;
+  /// The conflicting second binding site; meaningful only with a
+  /// non-empty `invalidReason` produced by a binding clash.
+  clang::SourceLocation secondLoc;
+  /// Diagnostic text of the construct that made the member unresolvable;
+  /// empty when the binding is consumable.
+  std::string invalidReason;
+  /// Location of the invalidating construct; meaningful only with
+  /// `invalidReason`.
+  clang::SourceLocation invalidLoc;
+};
+
+/// The program-wide key of one member-pointer binding: the struct instance
+/// (a local or global variable — for a pointer global with a synthesized
+/// backing, the pointer's own declaration stands for the backing) and the
+/// pointer-typed field.
+using MemberPointerKey =
+    std::pair<const clang::VarDecl *, const clang::FieldDecl *>;
+
+/// Registry of the synthesized backing declarations for block-scope
+/// compound literals used as pointer-region bases (C99-13). A compound
+/// literal in expression position is a fresh anonymous object with the
+/// storage duration of the enclosing block; modeling it as an implicit
+/// local variable lets the existing region machinery (bases, cursors,
+/// slices, degenerate scalar-object bindings) consume it unchanged. The
+/// registry is owned by the importer and shared with every
+/// `PointerRegionAnalysis` instance (planning and emission passes alike),
+/// so all passes agree on the identity of each literal's backing
+/// declaration. The synthesized declaration is parented to the
+/// translation unit but carries `SC_Auto` storage, so `hasLocalStorage()`
+/// classifies it as a local object; it is never added to any lookup scope.
+class CompoundLiteralTemps {
+public:
+  /// Returns the backing declaration of `literal`, synthesizing it on
+  /// first request. All temps share the diagnostic-only name
+  /// "compound literal" (their emitted places are anonymous).
+  const clang::VarDecl *getOrCreate(clang::ASTContext &context,
+                                    const clang::CompoundLiteralExpr *literal) {
+    const clang::VarDecl *&slot = decls[literal];
+    if (!slot) {
+      clang::VarDecl *decl = clang::VarDecl::Create(
+          context, context.getTranslationUnitDecl(), literal->getBeginLoc(),
+          literal->getBeginLoc(), &context.Idents.get("compound literal"),
+          literal->getType(),
+          context.getTrivialTypeSourceInfo(literal->getType()),
+          clang::SC_Auto);
+      decl->setImplicit();
+      slot = decl;
+      temps.insert(decl);
+    }
+    return slot;
+  }
+
+  /// Returns whether `decl` is a synthesized compound-literal backing.
+  bool isTemp(const clang::VarDecl *decl) const {
+    return temps.contains(decl);
+  }
+
+private:
+  /// One backing declaration per compound literal expression.
+  llvm::DenseMap<const clang::CompoundLiteralExpr *, const clang::VarDecl *>
+      decls;
+  /// The synthesized declarations, for the reverse membership test.
+  llvm::SmallPtrSet<const clang::VarDecl *, 4> temps;
+};
+
+/// One base binding of a pointer region: the object some pointer in the
+/// region was made to point into, and the source location of the assignment
+/// (or initializer) that bound it. The multi-base diagnostic names the
+/// first two bindings. A `&struct.member` binding (CTS-P9) additionally
+/// carries the scalar member the region roots at; bindings to distinct
+/// members of one object are distinct bases.
+struct PointerBaseBinding {
+  /// The bound object.
+  const clang::VarDecl *base;
+  /// Where the binding was established.
+  clang::SourceLocation loc;
+  /// The member the binding roots at (`p = &s.b`); null for whole-object
+  /// bindings.
+  const clang::FieldDecl *member = nullptr;
+};
+
+/// The Phase-4 owner-promotion plan of one local array base variable: the
+/// variable becomes a module-level owner struct holding the array in its
+/// single "data" field, and every function whose pointer parameters resolve
+/// into the variable's region becomes a `&mut self` method of that struct
+/// (recorded separately in the method-plan map).
+struct OwnerPlan {
+  /// The owner struct's module-level symbol name
+  /// (`Owner_<function>_<base>`, TU-tag-mangled for internal-linkage
+  /// owning functions so identically named statics in different TUs stay
+  /// distinct).
+  std::string structName;
+  /// Whether the module-level `emitrust.struct_def` has been created; it
+  /// is synthesized on first need, at the owning declaration.
+  bool structDefCreated = false;
+};
+
+/// The Phase-1a facts about one pointer ownership region: the distinct
+/// objects its pointers are bound to (or the string literal that is the
+/// region's read-only base), whether any pointer arithmetic occurs (which a
+/// degenerate scalar base cannot support), whether anything is written
+/// through the region's pointers (which a read-only string-literal region
+/// cannot support), whether any pointer of the region holds the null
+/// pointer constant (which makes the region an Option of its cursor,
+/// CTS-P8), and the first construct (if any) that puts the region outside
+/// the decomposition (escape, non-address source, ...).
+struct PointerRegion {
+  /// Distinct base objects, each with its first binding location.
+  SmallVector<PointerBaseBinding, 2> bases;
+  /// The string literal the region's pointers are bound to, making the
+  /// region a read-only `'static` byte run; null for object-based regions.
+  /// Mutually exclusive with `bases` for a consumable region.
+  const clang::StringLiteral *literalBase = nullptr;
+  /// Where the literal binding was established; meaningful only with
+  /// `literalBase`.
+  clang::SourceLocation literalLoc;
+  /// True when any pointer in the region is walked (`p+n`, `++`, `+=`).
+  bool hasArithmetic = false;
+  /// First pointer-arithmetic site; meaningful only with `hasArithmetic`.
+  clang::SourceLocation arithmeticLoc;
+  /// True when anything is written through a pointer of the region
+  /// (`*p = v`, `p[i] = v`, `*p += v`, `(*p)++`); a string-literal region
+  /// rejects at this location (writing a C string literal is UB).
+  bool hasWriteThrough = false;
+  /// First write-through site; meaningful only with `hasWriteThrough`.
+  clang::SourceLocation writeThroughLoc;
+  /// True when a null pointer constant is assigned to (or initializes) any
+  /// pointer of the region. Such a region is nullable: each of its
+  /// pointers models the Option-of-cursor discriminant in a runtime i1
+  /// "non-null" flag cell, mirroring the fn_ptr `None` mapping (CTS-P8).
+  bool nullable = false;
+  /// First null-constant binding site; meaningful only with `nullable`.
+  clang::SourceLocation nullableLoc;
+  /// True when a pointer-typed conditional operator classified into the
+  /// region (CTS-P9): its arms united here, so the region's null state
+  /// merges through conditional control flow. A base-less nullable region
+  /// with a conditional source is STATICALLY NULL — it carries zero
+  /// runtime state and its null tests fold (see `isStaticallyNullRegion`);
+  /// a base-less region built only from direct null bindings keeps the
+  /// historical CTS-P8 flag cell.
+  bool hasConditionalSource = false;
+  /// True when an integer value rides into the region in pointer clothing
+  /// (CTS-P3): an integer-to-pointer cast, or a call to a function whose
+  /// pointer return classifies as an integer carrier. A region whose ONLY
+  /// sources are such carriers and null constants never addresses a
+  /// modeled object and lowers as a plain i64 value (see
+  /// `isCarrierRegion`); a region that also binds a real address base is
+  /// invalidated with the historical non-address rejection.
+  bool hasCarrierSource = false;
+  /// First carrier-source site; meaningful only with `hasCarrierSource`.
+  clang::SourceLocation carrierLoc;
+  /// The single recognized allocation call (`calloc`/`malloc` with
+  /// compile-time-constant sizes) bound to a global pointer of the region;
+  /// the allocation is promoted to a synthesized zero-initialized global
+  /// backing array (see `importPointerGlobal`). Null when no allocation is
+  /// bound. Mutually exclusive with `bases` for a consumable region.
+  const clang::Expr *allocSite = nullptr;
+  /// Where the allocation binding was established; meaningful only with
+  /// `allocSite`.
+  clang::SourceLocation allocLoc;
+  /// Number of pointee elements the allocation covers; meaningful only
+  /// with `allocSite`.
+  uint64_t allocCount = 0;
+  /// First invalidating construct; meaningful only with `invalidReason`.
+  clang::SourceLocation invalidLoc;
+  /// Diagnostic text of the invalidating construct; empty when the region
+  /// is decomposable.
+  std::string invalidReason;
+};
+
+/// The Phase-1a facts about one second-order pointer local (`T **pp`,
+/// CTS-P5). Under the decomposition a first-order pointer is a plain Copy
+/// i64 cursor into its region, so a pointer-to-pointer is a cursor into a
+/// region of cursor cells — an index selecting WHICH first-order pointer to
+/// operate on (transformation-theory sections 4 and 6). The implemented
+/// shape is the degenerate one-cell region: `pp` is only ever bound to the
+/// address of a single first-order pointer local, so the selection is
+/// static, `pp` needs no runtime state, and no reference-to-reference ever
+/// arises in the emitted Rust (the cursor-cell region and the pointee
+/// region stay distinct separation-logic conjuncts). A second binding to a
+/// distinct pointer variable records `secondTarget` for the located
+/// multi-target rejection; every other construct records `invalidReason`.
+struct SecondOrderRegion {
+  /// The single first-order pointer local `pp` selects, from `pp = &p`.
+  const clang::VarDecl *target = nullptr;
+  /// Where the target binding was established.
+  clang::SourceLocation targetLoc;
+  /// A second, distinct bound pointer variable (would need a real region
+  /// of cursor cells); null while the region stays single-target.
+  const clang::VarDecl *secondTarget = nullptr;
+  /// Where the second binding was established.
+  clang::SourceLocation secondTargetLoc;
+  /// First invalidating construct; meaningful only with `invalidReason`.
+  clang::SourceLocation invalidLoc;
+  /// Diagnostic text of the invalidating construct; empty when the
+  /// degenerate second-order decomposition applies.
+  std::string invalidReason;
+};
+
+/// Steensgaard-style union-find pre-pass that groups the pointer locals of
+/// one function body into ownership regions (Phase 1a of pointer support).
+/// One AST walk (in the style of `collectAddressTaken`) unions pointers on
+/// assignment (`p = q`), binds base objects from `&x`, `&arr[i]`,
+/// array-to-pointer decay, and slice-classified pointer parameters (Phase
+/// 1b: `p = param` makes the parameter the region base), binds string
+/// literals from their decay (`p = "..."` makes the literal the base of a
+/// read-only region), flags pointer arithmetic, writes through the
+/// region's pointers, and null-constant bindings (`p = NULL` marks the
+/// region nullable instead of invalidating it, CTS-P8), and records the
+/// first construct that makes a region undecomposable (taking a pointer's
+/// address, non-address sources). Base objects participate
+/// in the union-find
+/// alongside the pointers so that two pointers into the same object always
+/// share a region. The importer validates each pointer local against its
+/// region at the declaration; a region is consumable only when it is
+/// single-base — one object, or one string literal (whose read-only region
+/// additionally rejects write-throughs) — and never invalidated. The
+/// per-region output is the deliberate seam for the later owner-struct
+/// codegen phases.
+class PointerRegionAnalysis {
+public:
+  /// Analyzes `body`, replacing any previous analysis state. `context` is
+  /// borrowed for the duration of the walk (null-constant classification).
+  void analyze(clang::ASTContext &astContext, const clang::Stmt *body);
+
+  /// Optional query telling the walk whether a direct call to `callee`
+  /// returns an integer-carrier pointer (CTS-P3): such a call is a carrier
+  /// source of the assigned pointer's region rather than a non-address
+  /// invalidation. Left unset (the pure-AST planning passes), every call
+  /// source keeps the historical non-address rejection, which is
+  /// conservative — planning never consumes carrier regions.
+  std::function<bool(const clang::FunctionDecl *)> carrierReturnQuery;
+
+  /// Optional query telling the walk whether a local `void *` declaration
+  /// is an admitted fn-ptr holder (CTS-F, 00210): such a local imports as
+  /// an ordinary `!emitrust.fn_ptr` variable, so the decomposition never
+  /// tracks it. Left unset (the pure-AST planning passes), the holder is
+  /// tracked and conservatively invalid, which planning never consumes.
+  std::function<bool(const clang::VarDecl *)> fnHolderQuery;
+
+  /// The importer-owned registry of synthesized compound-literal backing
+  /// declarations (C99-13): a decayed or address-taken block-scope
+  /// compound literal binds its backing declaration as an ordinary local
+  /// region base. Shared across every analysis instance so planning and
+  /// emission agree on each literal's backing identity. Left unset, such
+  /// bindings keep the historical non-address rejection.
+  CompoundLiteralTemps *literalTemps = nullptr;
+
+  /// Optional query telling the walk whether a pointer-to-pointer
+  /// parameter of the CURRENT function is a planned string-cursor
+  /// parameter (CTS 00204). When set, `p = *s` binds the parameter as
+  /// the region base (like a slice parameter) and `*s = expr` joins the
+  /// parameter itself into the region as a rebindable pointer. Left
+  /// unset, both shapes keep their historical rejections.
+  std::function<bool(const clang::ParmVarDecl *)> cursorParamQuery;
+
+  /// Optional query telling the walk whether argument `index` of a direct
+  /// call to `callee` feeds a planned string-cursor parameter (CTS
+  /// 00204). When set, a `&p` argument in such a position is consumed by
+  /// the call lowering (region + in-out cursor) instead of invalidating
+  /// `p`'s region; the callee's advancement is ordinary arithmetic.
+  std::function<bool(const clang::FunctionDecl *, unsigned)> cursorArgQuery;
+
+  /// Returns whether `var` is a pointer local tracked by this analysis.
+  bool tracks(const clang::VarDecl *var) const {
+    return pointerVars.contains(var);
+  }
+
+  /// Returns the region of the tracked pointer `var`, or null when the
+  /// pointer was never bound, unioned, or invalidated (an unused pointer).
+  const PointerRegion *regionOf(const clang::VarDecl *var);
+
+  /// Returns whether `var` is a second-order pointer local (`T **pp`)
+  /// tracked by this analysis (CTS-P5).
+  bool tracksSecondOrder(const clang::VarDecl *var) const {
+    return secondOrderVars.contains(var);
+  }
+
+  /// Returns the second-order record of the tracked pointer-to-pointer
+  /// `var`, or null when it was never bound or invalidated (unused).
+  const SecondOrderRegion *
+  secondOrderRegionOf(const clang::VarDecl *var) const {
+    auto it = secondOrderRegions.find(var);
+    return it == secondOrderRegions.end() ? nullptr : &it->second;
+  }
+
+  /// Returns every pointer-typed local variable the analysis tracks; the
+  /// Phase-4 owner-planning pre-pass iterates these to project each
+  /// per-function region into the interprocedural union-find.
+  const llvm::SmallPtrSetImpl<const clang::VarDecl *> &trackedVars() const {
+    return pointerVars;
+  }
+
+  /// The member-pointer bindings this body established, keyed by (struct
+  /// instance, field); `planOwners` merges them into the program-wide map.
+  const llvm::DenseMap<MemberPointerKey, MemberPointerFacts> &
+  memberBindings() const {
+    return memberFacts;
+  }
+
+  /// Data-pointer fields this body used in a shape the per-instance model
+  /// cannot resolve (a write through an alias or unresolved place, an
+  /// escaping member address, a whole-struct overwrite), with the first
+  /// such site. A poisoned field rejects every read program-wide.
+  const llvm::DenseMap<const clang::FieldDecl *, clang::SourceLocation> &
+  poisonedMemberFields() const {
+    return poisonedFields;
+  }
+
+private:
+  /// Recursive statement walk collecting pointer declarations, writes,
+  /// arithmetic, escapes, and call-argument uses.
+  void visit(const clang::Stmt *stmt);
+
+  /// Classifies the right-hand side `rhs` of `ptr = rhs` (or of `ptr`'s
+  /// initializer): unions pointer-to-pointer copies, binds bases from
+  /// address expressions and string literals from their decay, flags
+  /// arithmetic on `p +- n` forms, and marks the region invalid for
+  /// everything else.
+  void recordPointerWrite(const clang::VarDecl *ptr, const clang::Expr *rhs);
+
+  /// Binds `base` into `ptr`'s region at `loc` (rejecting local bases of
+  /// global pointers) and unions the two declarations. A non-null `member`
+  /// roots the binding at `&base.member` (CTS-P9); member bindings do not
+  /// join the base object into the union-find — every access resolves
+  /// through the object's own place (or its staged global copy) directly,
+  /// so no cursor state is ever shared with pointers into the whole
+  /// object.
+  void addBase(const clang::VarDecl *ptr, const clang::VarDecl *base,
+               clang::SourceLocation loc,
+               const clang::FieldDecl *member = nullptr);
+
+  /// Binds the string literal `literal` as the read-only base of `ptr`'s
+  /// region at `loc`; a region bound to two distinct literals is marked
+  /// invalid (rebinding across literals is out of the decomposition).
+  void addLiteralBase(const clang::VarDecl *ptr,
+                      const clang::StringLiteral *literal,
+                      clang::SourceLocation loc);
+
+  /// Flags `ptr`'s region as performing pointer arithmetic at `loc`.
+  void recordArithmetic(const clang::VarDecl *ptr, clang::SourceLocation loc);
+
+  /// Flags `ptr`'s region as nullable at `loc` (a null pointer constant
+  /// was assigned to one of its pointers); only the first site is kept.
+  void recordNullable(const clang::VarDecl *ptr, clang::SourceLocation loc);
+
+  /// Flags `ptr`'s region as fed by an integer carrier at `loc` (CTS-P3):
+  /// an integer-to-pointer cast or a call returning a carrier. Only local
+  /// pointers may carry integers (globals keep the historical non-address
+  /// rejection), and a region that already binds an address base, string
+  /// literal, or allocation is invalidated instead — the two models cannot
+  /// mix.
+  void recordCarrierSource(const clang::VarDecl *ptr,
+                           clang::SourceLocation loc);
+
+  /// Flags `ptr`'s region as written through (`*p = v`, `p[i] = v`, ...)
+  /// at `loc`; a string-literal region rejects at this location.
+  void recordWriteThrough(const clang::VarDecl *ptr,
+                          clang::SourceLocation loc);
+
+  /// Binds a `calloc(n, size)` / `malloc(bytes)` call with compile-time
+  /// constant arguments as the allocation base of the global pointer
+  /// `ptr`'s region (the allocation is later promoted to a synthesized
+  /// zero-initialized global backing array of the pointer's element
+  /// type). The byte total must be a positive constant multiple of the
+  /// element size; violations and a second distinct allocation site mark
+  /// the region invalid.
+  void recordAllocBase(const clang::VarDecl *ptr, const clang::CallExpr *call,
+                       clang::SourceLocation loc);
+
+  /// Classifies the right-hand side `rhs` of `pp = rhs` for a second-order
+  /// pointer (CTS-P5): `pp = &p` on a tracked first-order pointer local
+  /// binds `p` as the (degenerate) selection target and marks the `&p`
+  /// expression consumed so the escape check skips it; a second distinct
+  /// target records the multi-target rejection; every other source
+  /// (null constants, copies, non-address values) invalidates `pp`.
+  void recordSecondOrderWrite(const clang::VarDecl *ptr,
+                              const clang::Expr *rhs);
+
+  /// Marks the second-order pointer `ptr` undecomposable with diagnostic
+  /// `reason` at `loc`; only the first invalidation is kept.
+  void markSecondOrderInvalid(const clang::VarDecl *ptr,
+                              clang::SourceLocation loc,
+                              llvm::StringRef reason);
+
+  /// Returns the tracked second-order pointer `pp` of a stripped `*pp`
+  /// dereference expression, or null when `expr` is not one.
+  const clang::VarDecl *asSecondOrderDeref(const clang::Expr *expr) const;
+
+  /// Returns the tracked pointer local at the root of a written place
+  /// expression (`*p`, `p[i]`, `*p++`, ...), or null when the place is not
+  /// a dereference or subscript through a tracked pointer. A place through
+  /// a second-order dereference (`**pp`, `(*pp)[i]`) roots at the bound
+  /// selection target, so the write lands on the target's region. A global
+  /// data pointer at the root is tracked on first sight (like the
+  /// arithmetic and rebinding forms), so a body whose only mention of the
+  /// global is a write through it still contributes the write to the
+  /// program-wide facts — a read-only literal-backed global region must
+  /// reject it.
+  const clang::VarDecl *trackedWritePlaceRoot(const clang::Expr *place);
+
+  /// Classifies the right-hand side of a data-pointer member write
+  /// (`s.f = rhs` on a `var.field` place rooted at `instance`): `&obj`
+  /// binds the object degenerately, a decayed string literal binds the
+  /// literal (write-only), and every other source records a located
+  /// invalid-binding fact. A second binding to a different target records
+  /// the clash with both sites.
+  void recordMemberPointerWrite(const clang::VarDecl *instance,
+                                const clang::FieldDecl *field,
+                                const clang::Expr *rhs);
+
+  /// Records one resolved member binding fact (object or literal) for
+  /// `(instance, field)` at `loc`, merging with any existing fact.
+  void bindMemberPointer(const clang::VarDecl *instance,
+                         const clang::FieldDecl *field,
+                         const clang::VarDecl *base,
+                         const clang::StringLiteral *literal,
+                         clang::SourceLocation loc);
+
+  /// Marks the member binding of `(instance, field)` unresolvable with
+  /// diagnostic `reason` at `loc`; only the first invalidation is kept.
+  void markMemberInvalid(const clang::VarDecl *instance,
+                         const clang::FieldDecl *field,
+                         clang::SourceLocation loc, llvm::StringRef reason);
+
+  /// Poisons `field` program-wide at `loc`: some use of the field in this
+  /// body is outside the per-instance model (aliased write, escaping
+  /// member address, whole-struct overwrite), so no read of the field can
+  /// trust a static binding.
+  void poisonMemberField(const clang::FieldDecl *field,
+                         clang::SourceLocation loc);
+
+  /// Walks the (semantic-form) initializer list of the struct local
+  /// `instance`, recording bindings for its directly initialized
+  /// data-pointer fields and poisoning data-pointer fields buried in
+  /// nested aggregates (their instance path is outside the model).
+  void collectStructInitBindings(const clang::VarDecl *instance,
+                                 const clang::InitListExpr *list);
+
+  /// Poisons every data-pointer field reachable from `record` (through
+  /// nested struct and array-of-struct fields): a whole-value overwrite of
+  /// an object of this type invalidates any static member binding.
+  void poisonRecordPointerFields(const clang::RecordDecl *record,
+                                 clang::SourceLocation loc);
+
+  /// Marks `ptr`'s region undecomposable with diagnostic `reason` at `loc`;
+  /// only the first invalidation of a region is kept.
+  void markInvalid(const clang::VarDecl *ptr, clang::SourceLocation loc,
+                   llvm::StringRef reason);
+
+  /// Returns the union-find root of `decl`, inserting it on first use.
+  const clang::VarDecl *findRoot(const clang::VarDecl *decl);
+
+  /// Unions the regions of `a` and `b`, merging their recorded facts.
+  void unite(const clang::VarDecl *a, const clang::VarDecl *b);
+
+  /// Returns the (created on demand) region of `decl`'s current root.
+  PointerRegion &regionFor(const clang::VarDecl *decl);
+
+  /// The AST context of the function under analysis; borrowed.
+  clang::ASTContext *context = nullptr;
+  /// Union-find parent links over pointer and base declarations.
+  llvm::DenseMap<const clang::VarDecl *, const clang::VarDecl *> parent;
+  /// Region facts keyed by each set's current root.
+  llvm::DenseMap<const clang::VarDecl *, PointerRegion> regions;
+  /// Every pointer-typed local variable declared in the walked body.
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> pointerVars;
+  /// Every second-order pointer local (`T **pp`) declared in the walked
+  /// body (CTS-P5); disjoint from `pointerVars`.
+  llvm::SmallPtrSet<const clang::VarDecl *, 4> secondOrderVars;
+  /// Second-order facts keyed by the pointer-to-pointer declaration (no
+  /// union-find: second-order copies are not decomposable).
+  llvm::DenseMap<const clang::VarDecl *, SecondOrderRegion> secondOrderRegions;
+  /// `&p` expressions consumed as second-order bindings (`pp = &p`); the
+  /// generic address-taken escape check skips exactly these.
+  llvm::SmallPtrSet<const clang::Expr *, 4> consumedAddrOf;
+  /// Member-pointer bindings established by this body (CTS-P2).
+  llvm::DenseMap<MemberPointerKey, MemberPointerFacts> memberFacts;
+  /// Data-pointer fields used outside the per-instance member model.
+  llvm::DenseMap<const clang::FieldDecl *, clang::SourceLocation>
+      poisonedFields;
+};
+
+/// Translates the clang AST of one C translation unit into an MLIR module.
+///
+/// The importer owns an `OpBuilder` positioned inside the function currently
+/// being translated, a per-function symbol table from clang declarations to
+/// their MLIR "place" values, and the loop stack for break/continue. All
+/// state is confined to this object; ownership of the produced IR stays with
+/// the module passed in by the caller.
+/// One monomorphized clone of a bounded va_list-using variadic definition
+/// (CTS 00204): the synthesized symbol plus the MLIR types of the extra
+/// arguments the clone's call sites pass (in declared order, by value).
+struct VaClonePlan {
+  std::string name;
+  SmallVector<Type, 4> extraTypes;
+};
+
+/// The per-definition monomorphization plan: one clone per distinct extras
+/// signature over the definition's direct call sites. A plan with zero
+/// clones drops the definition entirely (no symbol).
+struct VaMonomorphPlan {
+  SmallVector<VaClonePlan, 4> clones;
+};
+
+class CImporter {
+public:
+  /// Creates an importer that appends to `module`. The translation-unit
+  /// specific context is supplied per call to `importTranslationUnit`, so one
+  /// importer can merge several ASTs (cross-TU dedup state persists).
+  explicit CImporter(ModuleOp module)
+      : module(module), builder(module.getContext()) {}
+
+  /// Imports every supported top-level declaration of `context`'s translation
+  /// unit into the module: complete struct definitions (bare anonymous
+  /// structs under synthesized shape-keyed `Anon<n>` names), function
+  /// declarations or definitions, and file-scope variables (as module-level
+  /// `emitrust.global`s). Other declarations are rejected, with one
+  /// exception: declarations whose expansion location lies in a system
+  /// header are skipped entirely (never imported, never rejected here);
+  /// any main-file use of one is rejected at the use site instead.
+  ///
+  /// `tuTag` is prepended to internal-linkage (`static`) symbol names so that
+  /// identically named file-statics in different translation units stay
+  /// distinct; it is empty for a single-TU import (bare names, historical
+  /// behavior). `deferExtern` controls whether a referenced `extern`-only
+  /// global with no definition in this TU is an immediate error (single-file)
+  /// or deferred for cross-TU resolution (project); unreferenced ones are
+  /// skipped either way. `soleTranslationUnit` states that this TU
+  /// is the whole program, which lets the Phase-4 owner planning promote
+  /// externally visible functions to methods (all their call sites are
+  /// provably in this TU); in a multi-TU project only internal-linkage
+  /// functions qualify. Repeated calls accumulate into one module.
+  LogicalResult importTranslationUnit(clang::ASTContext &context,
+                                      llvm::StringRef tuTag, bool deferExtern,
+                                      bool soleTranslationUnit);
+
+  /// After every translation unit has been imported, checks that no external
+  /// symbol was left unresolved: every deferred `extern` global must have a
+  /// definition, and no referenced non-variadic external function may remain
+  /// body-less (the Rust emitter cannot emit a body-less function); external
+  /// functions whose symbol has no uses are erased instead of rejected.
+  /// Rejections are located at the symbol's first use site (falling back to
+  /// its declaration).
+  LogicalResult finalizeProject();
+
+private:
+  //===--------------------------------------------------------------------===//
+  // Locations and types
+  //===--------------------------------------------------------------------===//
+
+  /// Converts a clang source location to an MLIR `FileLineColLoc` using the
+  /// presumed (user-visible) location; unknown on invalid input.
+  Location translateLoc(clang::SourceLocation sourceLoc);
+
+  /// The location of the first IR use of `symbol` anywhere in the module,
+  /// or `fallback` when the symbol has no uses. Locates the
+  /// referenced-but-undefined rejections of `finalizeProject` at the use
+  /// site rather than at the declaration.
+  Location firstSymbolUseLoc(llvm::StringRef symbol, Location fallback);
+
+  /// True when `decl`'s expansion location lies in a system header (an
+  /// angle-bracket include or an `-isystem` search path). Such declarations
+  /// are skipped by `importTranslationUnit` instead of being imported
+  /// eagerly; a main-file use of one is rejected at the use site via
+  /// `rejectSystemHeaderUse`. Project headers included via `-I` are not
+  /// system headers and keep the eager fail-fast import.
+  bool isSystemHeaderDecl(const clang::Decl *decl) const;
+
+  /// Located rejection for a main-file use of a declaration that
+  /// `importTranslationUnit` skipped because it lives in a system header.
+  /// `what` describes the use ("call to", "reference to", ...); `name` is
+  /// the used symbol's spelling.
+  LogicalResult rejectSystemHeaderUse(Location loc, llvm::StringRef what,
+                                      llvm::StringRef name);
+
+  /// Maps a C value type to its MLIR type: `_Bool`->i1, char->i8,
+  /// short->i16, int->i32, long/long long->i64, unsigned char->ui8,
+  /// unsigned short->ui16, unsigned int->ui32, unsigned long/long
+  /// long->ui64 (unsigned types map to MLIR *unsigned* integer types, not
+  /// signless ones, so that they render as Rust `uN`), float->f32,
+  /// double->f64, `struct S`->`!emitrust.struct<"S">` (a bare anonymous
+  /// struct under its synthesized shape-keyed name, importing the
+  /// definition on the way), `T[N]`->`!emitrust.array<NxT>`, complete named
+  /// `enum E`->`!emitrust.enum<"E">`, anonymous enums->`i32`, and function
+  /// pointers `R (*)(A, B)`->`!emitrust.fn_ptr<(A, B) -> R>` (prototype-less
+  /// K&R pointers map to the zero-parameter form). Typedefs resolve through
+  /// the canonical type. Data pointers, unions, variadic function pointers,
+  /// va_list (the target's `__builtin_va_list` and its `__va_list_tag`
+  /// record, rejected in any position per C99-37 — Rust has no stable
+  /// varargs), fn_ptr component types outside the verifier set, and
+  /// everything else produce a located diagnostic.
+  FailureOr<Type> mapType(clang::QualType type, Location loc);
+
+  /// Maps a C function-parameter type: data-pointer parameters `T*` become
+  /// `!emitrust.mut_ref<T>` for `ParamKind::ScalarRef` and
+  /// `!emitrust.mut_ref<!emitrust.slice<T>>` for `ParamKind::Slice`
+  /// (array parameters have already decayed to pointers in clang);
+  /// function-pointer parameters stay by-value `!emitrust.fn_ptr` values;
+  /// everything else maps like `mapType` and ignores `kind`.
+  FailureOr<Type> mapParamType(clang::QualType type, Location loc,
+                               ParamKind kind);
+
+  /// Returns the Phase-1b classification of every parameter of `func`
+  /// (non-pointer parameters report `ScalarRef`, which is ignored). Kinds
+  /// derive from the definition's body via `collectSliceParams`; a function
+  /// with no definition in the merged ASTs classifies every pointer
+  /// parameter as `ScalarRef` (the cross-TU assumption checked at
+  /// definition-time signature refinement in `importFunction`). Results are
+  /// cached per canonical declaration.
+  ArrayRef<ParamKind> classifyPointerParams(const clang::FunctionDecl *func);
+
+  /// Principal-kind classification of a data-pointer return type (CTS-P2):
+  /// each `return` site contributes one located constraint, and the
+  /// function's return kind is the one consistent with all of them. The
+  /// single supported kind today is a returned function address (`return
+  /// &f;` / `return f;` behind a `void *` return type), which returns the
+  /// plain `!emitrust.fn_ptr` value — every return site must name a
+  /// function of the same mapped signature. Returning any other pointer
+  /// value — in particular a cursor into a callee-local region, which
+  /// would dangle — is a located rejection at the offending return.
+  /// Requires the definition's body (a declaration classifies through
+  /// `getDefinition`); results are cached per canonical declaration.
+  FailureOr<Type> classifyPointerReturn(const clang::FunctionDecl *func,
+                                        Location loc);
+
+  /// Classifies the data-pointer RESULT of a function-pointer type (CTS-S,
+  /// 00089): the result is representable exactly when at least one function
+  /// of the TU has its address taken with the same (canonical, unqualified)
+  /// data-pointer return type and EVERY such candidate classifies to the
+  /// erased single-global-base return kind with one common base — then any
+  /// value of the fn-ptr type can only designate a function returning that
+  /// global's address, so the pointer result erases from the fn_ptr
+  /// signature and indirect calls route to the base like direct calls.
+  /// Restricted to single-TU imports (the candidate set must be
+  /// whole-program). Memoized per canonical pointee type; failures are
+  /// located rejections.
+  FailureOr<const clang::VarDecl *>
+  classifyFnPtrPointerResult(const clang::FunctionType *fnType, Location loc);
+
+  /// Returns the single-global-base routed to by an erased-pointer-return
+  /// call (CTS-S, 00089), or null: `expr` (stripped of trivia) must be a
+  /// call whose direct callee classified to the erased global-return kind,
+  /// or an indirect call through a fn-ptr type whose data-pointer result
+  /// classified the same way. On success `*callOut` receives the call.
+  const clang::VarDecl *
+  erasedGlobalReturnCallBase(const clang::Expr *expr,
+                             const clang::CallExpr **callOut) const;
+
+  /// Pass-A scan for the fn-ptr facts of one TU (CTS-S, 00189/00089):
+  /// records which file-scope function-pointer variables are assigned or
+  /// address-taken in any body (`fnPtrGlobalsWritten`), which functions
+  /// have their address taken outside a direct-call callee position
+  /// (`addressTakenFunctions`), and then plans the devirtualization
+  /// aliases (`fnPtrAliases`): a file-scope function pointer initialized
+  /// to a known function, never written, and — unless internally linked —
+  /// imported as the sole TU, aliases its target. A variadic target
+  /// aliases only when it is the hosted definition-less `printf`/`fprintf`
+  /// (calls route through the printf machinery); any other shape keeps the
+  /// ordinary import path and its located rejections.
+  void planFnPtrAliases(const clang::TranslationUnitDecl *unit);
+
+  /// Returns the devirtualization target when `call`'s callee (through
+  /// parens, the decay/deref cancellation, and implicit casts) names an
+  /// aliased global function pointer (CTS-S, 00189); null otherwise. On
+  /// success `*aliasVar` (when supplied) receives the alias variable.
+  const clang::FunctionDecl *
+  devirtualizedCallee(const clang::CallExpr *call,
+                      const clang::VarDecl **aliasVar = nullptr) const;
+
+  /// Emits a statement-position call through a devirtualized alias of the
+  /// hosted variadic `fprintf`/`printf` (CTS-S, 00189) via the printf
+  /// machinery. For `fprintf` the leading stream argument must be the
+  /// literal `stdout` and is swallowed with the fprintf->printf routing —
+  /// the ONLY position where a FILE* value is accepted; the format string
+  /// and conversions then translate exactly like a direct printf call.
+  LogicalResult emitAliasedPrintf(const clang::CallExpr *call,
+                                  const clang::FunctionDecl *target);
+
+  /// Emits a call through a devirtualized non-variadic alias (CTS-S,
+  /// 00189) as a DIRECT `func.call` to the target: the alias variable's
+  /// fn-ptr type maps and signature-checks against the imported target
+  /// exactly like a fn-ptr constant would, but no fn_ptr value and no
+  /// call_indirect is created. A variadic (printf-routed) alias reaching
+  /// this value-position path is rejected: its result must be unused.
+  FailureOr<Value> emitDevirtualizedCall(const clang::CallExpr *call,
+                                         const clang::VarDecl *var,
+                                         const clang::FunctionDecl *target,
+                                         Location loc);
+
+  /// Returns whether `func`'s data-pointer return classifies as an
+  /// integer carrier (CTS-P3): the definition exists and EVERY return site
+  /// yields a carrier value — a null pointer constant, an
+  /// integer-to-pointer cast, a read of a carrier-region local, or a call
+  /// to another carrier-returning function. Such a function returns a
+  /// plain i64 (null is the i64 zero). Memoized per canonical declaration;
+  /// recursion cycles classify pessimistically as non-carrier.
+  bool isCarrierReturnFunction(const clang::FunctionDecl *func);
+
+  /// Returns whether one return-site expression yields an integer-carrier
+  /// value, consulting `regions` (the definition body's own analysis) for
+  /// reads of carrier-region locals.
+  bool isCarrierReturnExpr(PointerRegionAnalysis &regions,
+                           const clang::Expr *expr);
+
+  //===--------------------------------------------------------------------===//
+  // Owner planning (Phase-4 Pass A)
+  //===--------------------------------------------------------------------===//
+
+  /// Pure-AST interprocedural pre-pass over every function definition of
+  /// the translation unit (no IR is built). System-header definitions are
+  /// excluded — they are never imported, so they can never be methods. Runs the per-function
+  /// `PointerRegionAnalysis` on each body, unifies each pointer call
+  /// argument's root object with the callee definition's parameter in a
+  /// program-wide union-find, and promotes every class that satisfies ALL
+  /// of: single storage base; base is a local array of 1..32 elements whose
+  /// element type equals every unified parameter's pointee; at least one
+  /// unified parameter (the region crosses a function boundary); every
+  /// unified function is defined in this TU, has a value (non-pointer)
+  /// return type, is not the owner or C `main`, resolves ALL of its own
+  /// data-pointer parameters into this one class, and — unless this TU is
+  /// the whole program — has internal linkage (so no unseen TU can call
+  /// it). Qualified classes populate `ownerPlans` and `methodPlans`; every
+  /// disqualification is a silent fallback to the Phase-1b slice lowering.
+  /// Regions cannot cross translation units (the base is a local), so the
+  /// pass runs independently per TU in a project import.
+  void planOwners(const clang::TranslationUnitDecl *unit,
+                  bool soleTranslationUnit);
+
+  /// Side-effect-free AST mirror of `emitPointerRValue`'s base resolution:
+  /// returns the single object a pointer-typed call argument points into (a
+  /// local array or scalar, or a pointer parameter of the calling
+  /// function), or null when no single root is statically known. `regions`
+  /// is the calling function's per-body analysis, consulted for pointer
+  /// locals.
+  const clang::VarDecl *resolveArgRoot(PointerRegionAnalysis &regions,
+                                       const clang::Expr *expr) const;
+
+  /// Collects the function definitions the Pass-A planners analyze: every
+  /// function of `unit` whose body is defined here, is not variadic, and
+  /// lives outside a system header — the shared traversal seed of
+  /// `planOwners` and `planCellSlices`, which stay separately invoked
+  /// passes in a fixed order (fusing their TU traversals would change the
+  /// inter-analysis evaluation order and is deferred).
+  SmallVector<const clang::FunctionDecl *>
+  collectPassAFunctionDefinitions(const clang::TranslationUnitDecl *unit) const;
+
+  //===--------------------------------------------------------------------===//
+  // Cell-slice planning (CTS-P10 Pass A)
+  //===--------------------------------------------------------------------===//
+
+  /// Pure-AST interprocedural pre-pass over every function definition of
+  /// the translation unit, run alongside `planOwners`. It builds a
+  /// union-find over data-pointer parameters and mutable global array
+  /// bases from exactly two argument shapes — the direct decay of a global
+  /// array (`f(G)`) and the forwarding of another cell-slice-candidate
+  /// parameter (`f(p)`, which is what makes Hanoi's permuted recursion
+  /// classify) — and qualifies every class ALL of whose storage bases are
+  /// mutable, internal-or-sole-TU global arrays of one supported scalar
+  /// element type, whose parameters are never walked, reassigned,
+  /// null-checked, escaped, or joined by a pointer local, and whose
+  /// functions are defined here (and internal unless this TU is the whole
+  /// program). Qualified parameters populate `cellSliceParams`
+  /// (`classifyPointerParams` reports them as `ParamKind::CellSlice`); a
+  /// class with global bases that hits the Mixed or NullableGlobal
+  /// boundary records a `CellSliceReject` per global base, which the
+  /// call-site rejection consults for its precise wording. Every other
+  /// disqualification silently keeps the historical staged-copy rejection.
+  void planCellSlices(const clang::TranslationUnitDecl *unit,
+                      bool soleTranslationUnit);
+
+  /// Returns the global array variable a call argument decays directly
+  /// (`f(G)` with no offset), or null: the only global argument shape the
+  /// cell-slice class admits.
+  const clang::VarDecl *
+  asDecayedGlobalArrayArg(const clang::Expr *expr) const;
+
+  /// Returns the pointer parameter a call argument reads directly
+  /// (`f(p)`), or null.
+  const clang::ParmVarDecl *asPointerParamRead(const clang::Expr *expr) const;
+
+  /// Returns the cell-slice access `expr` denotes — a subscript `p[i]` or
+  /// dereference `*p` whose base reads a parameter bound to a
+  /// `!emitrust.ref<!emitrust.cell_slice<T>>` value — or nothing.
+  std::optional<CellSliceAccess>
+  matchCellSliceAccess(const clang::Expr *expr) const;
+
+  /// Emits `emitrust.cell_get` for the access: the parameter's reference
+  /// SSA value indexed at the i64-converted index (0 for a dereference).
+  FailureOr<Value> emitCellSliceGet(const CellSliceAccess &access,
+                                    Location loc);
+
+  /// Emits `rhs` and stores it with `emitrust.cell_set` (converting the
+  /// value to the element type as C assignment does).
+  LogicalResult emitCellSliceAssign(const CellSliceAccess &access,
+                                    const clang::Expr *rhs, Location loc);
+
+  /// Emits the located rejection for passing a pointer into the global
+  /// `base` to a function: the precise cell-slice boundary wording when
+  /// Pass A recorded one (mixed local+global class, nullable
+  /// global-backed parameter), the historical staged-copy wording
+  /// otherwise.
+  LogicalResult rejectGlobalPointerArgument(Location loc,
+                                            const clang::VarDecl *base);
+
+  //===--------------------------------------------------------------------===//
+  // Pointer struct members (CTS-P2)
+  //===--------------------------------------------------------------------===//
+
+  /// Merges one member-pointer binding fact into the program-wide map:
+  /// first binding wins the slot, an identical rebinding is idempotent, a
+  /// differing target records the clash with both sites, and an invalid
+  /// fact propagates first-wins.
+  void mergeMemberPointerFacts(const MemberPointerKey &key,
+                               const MemberPointerFacts &incoming);
+
+  /// Walks the constant-evaluated initializer `value` of the global struct
+  /// object keyed `instance` (in parallel with its C type), recording a
+  /// member binding for every data-pointer field: an address-of-object
+  /// lvalue at offset 0 binds the object degenerately, a string-literal
+  /// lvalue binds the literal (write-only), a null pointer leaves the
+  /// member unbound, and anything else records an invalid binding. Arrays
+  /// recurse per element (two elements binding different targets clash
+  /// into an invalid fact, and reads through subscripted instances are
+  /// unresolvable anyway — sound either way).
+  void collectGlobalMemberBindings(const clang::VarDecl *instance,
+                                   const clang::APValue &value,
+                                   clang::QualType type,
+                                   clang::SourceLocation loc);
+
+  /// Resolves the member-pointer binding a read or write of `member` (a
+  /// data-pointer field access) consults: the instance is the directly
+  /// named base variable (`s.f`) or the degenerate single object behind a
+  /// decomposed arrow base (`p->f`, `s->f` through a pointer global).
+  /// Rejects — with the located first/second sites — poisoned fields,
+  /// unknown instances, unbound members, invalid bindings, bindings to
+  /// locals of other functions, and (in a multi-file project) members of
+  /// externally visible global instances.
+  FailureOr<const MemberPointerFacts *>
+  resolveMemberPointerBinding(const clang::MemberExpr *member, Location loc);
+
+  /// Emits `s.f = rhs` on a data-pointer member: the analysis pinned the
+  /// member's static binding, so a right-hand side that decomposes to the
+  /// bound target emits no runtime code at all (the stored i64 stays 0 and
+  /// carries no information); any other right-hand side is a located
+  /// rejection.
+  LogicalResult emitMemberPointerAssign(const clang::MemberExpr *member,
+                                        const clang::Expr *rhs, Location loc);
+
+  //===--------------------------------------------------------------------===//
+  // Declarations
+  //===--------------------------------------------------------------------===//
+
+  /// Imports a complete struct definition as a module-level
+  /// `emitrust.struct_def`. Forward declarations are ignored; repeated
+  /// imports of the same definition are deduplicated. A file-scope record
+  /// is emitted under its tag (or anonymous-typedef) name with cross-TU
+  /// name/shape deduplication; a block-scope record is its own type per
+  /// defining decl and is emitted under a mangled name (see
+  /// `localRecordNames`). A bare anonymous struct (no tag, no typedef
+  /// name) receives a synthesized `Anon<n>` name keyed by its field shape
+  /// (see `anonRecordShapeNames`); repeated occurrences of the same
+  /// anonymous shape share one struct_def. An empty member list
+  /// (`struct T {};`) imports as a field-less struct_def. The field list
+  /// is flattened through `collectRecordFields`, which resolves C11
+  /// 6.7.2.1p13 anonymous struct/union members, packs bit-field runs
+  /// into `__bits<n>` backing fields (C99-45), and mangles Rust-keyword
+  /// member spellings. A union definition imports as a ONE-FIELD struct
+  /// through `collectUnionSlot` (its storage field is the first arm's
+  /// leaf); union shapes outside that model (including bit-field arms)
+  /// and unsupported field types are rejected.
+  LogicalResult importRecord(const clang::RecordDecl *record, Location loc);
+
+  /// Appends the flattened field list of `record` to
+  /// `fieldNames`/`fieldTypes`, resolving C11 6.7.2.1p13 anonymous
+  /// members (an unnamed member whose type is an anonymous struct or
+  /// union, `FieldDecl::isAnonymousStructOrUnion`): an anonymous struct
+  /// member's fields join the parent's member namespace, so they are
+  /// injected in place under their own spellings (Sema has already
+  /// enforced their uniqueness there); an anonymous union member is
+  /// representable without a union type exactly when every arm flattens
+  /// to a single leaf field and all leaves map to one identical type —
+  /// the arms then alias a single storage slot named after the first
+  /// leaf (recorded in `unionSlotStorage`), which is exact because
+  /// reading any union member with the type of the last store yields
+  /// that stored value. Any other anonymous union rejects exactly as
+  /// union types do elsewhere ("unsupported: union type", CTS-R3); other
+  /// unnamed members are rejected with the field's location. Member
+  /// names that are Rust keywords mangle with a trailing underscore
+  /// (`mangleMemberName`); a final spelling that collides with another
+  /// member's is a located rejection. Bit-field members pack per run
+  /// (C99-45): each maximal run of consecutively declared bit-field
+  /// members packs LSB-first in declaration order into one synthesized
+  /// backing field `__bits<n>` (`n` counts runs from 0 across the whole
+  /// flattened record, threaded through `bitFieldRuns`) of the smallest
+  /// unsigned type (ui8/ui16/ui32/ui64) holding the run's total bits;
+  /// runs split at any non-bit-field member. The bit-field members' own
+  /// names never appear in the struct_def; their accessors are recorded
+  /// in `bitFieldAccessInfo`. Zero-width and anonymous bit-fields, and
+  /// runs wider than 64 bits, are located rejections.
+  LogicalResult
+  collectRecordFields(const clang::RecordDecl *record,
+                      SmallVectorImpl<llvm::StringRef> &fieldNames,
+                      SmallVectorImpl<Type> &fieldTypes,
+                      unsigned &bitFieldRuns);
+
+  /// Resolves one arm of an anonymous union member to its single
+  /// flattened leaf field, descending through nested anonymous struct
+  /// members. Fails — with the union-type rejection at `unionLoc` — when
+  /// the arm flattens to zero or several fields, which the single-slot
+  /// aliasing of `collectRecordFields` cannot model.
+  FailureOr<const clang::FieldDecl *>
+  anonymousUnionArmLeaf(const clang::FieldDecl *arm, Location unionLoc);
+
+  /// Appends the single storage slot of a union definition to
+  /// `fieldNames`/`fieldTypes`: a union imports as a ONE-FIELD struct
+  /// whose storage field carries the slot arm's name and mapped type,
+  /// generalizing the anonymous-union slot aliasing of
+  /// `collectRecordFields` (CTS-R2) to named and untagged union types.
+  /// The slot is the first arm, EXCEPT in the byte-array mix (CTS-F,
+  /// 00210): a union pairing a non-array arm with constant integer-array
+  /// arms takes the first NON-ARRAY arm as its slot regardless of
+  /// declaration order. Every non-slot arm is recorded in
+  /// `unionSlotStorage` as an alias of that slot. An arm is admitted
+  /// when it maps to the identical type (exact: reading any union member
+  /// with the type of the last store yields that stored value), when
+  /// both arms are same-width scalars — integers differing only in
+  /// signedness reinterpret the slot bit-exactly via `emitrust.cast`
+  /// (two's complement, C99 6.5.2.3), and a float paired with a
+  /// same-width integer (float/32-bit int, double/64-bit int)
+  /// reinterprets via `emitrust.bitcast` (`to_bits`/`from_bits`) — or
+  /// when the arm is a constant integer ARRAY whose total width equals
+  /// the integer slot's (CTS-F, 00210): such a byte-array arm is a
+  /// TYPE-level concession recorded in `unionByteArrayArms`, and every
+  /// access through it rejects at the access site. Bit-field arms,
+  /// unnamed/anonymous arms, pointer arms, scalar arms of differing
+  /// sizes, aggregate/enum arms that do not match the slot's type
+  /// exactly, and empty unions are rejected with located
+  /// `unsupported: union ...` diagnostics at the union definition.
+  LogicalResult collectUnionSlot(const clang::RecordDecl *definition,
+                                 SmallVectorImpl<llvm::StringRef> &fieldNames,
+                                 SmallVectorImpl<Type> &fieldTypes);
+
+  /// Returns the field that provides `field`'s storage in its flattened
+  /// parent struct_def: the aliased first-arm slot for a union arm
+  /// recorded by `collectUnionSlot`/`collectRecordFields`, or `field`
+  /// itself.
+  const clang::FieldDecl *
+  flattenedFieldStorage(const clang::FieldDecl *field) const;
+
+  /// Reinterprets `value` bit-exactly as `target`: a no-op when the
+  /// types already match, an `emitrust.bitcast` (`to_bits`/`from_bits`)
+  /// when either side is a float type, and a same-width `emitrust.cast`
+  /// (bit-exact on two's complement) otherwise. The union pun helpers
+  /// below and the pun-arm initializer path share this as the single
+  /// slot<->arm reinterpretation primitive.
+  Value reinterpretScalarBits(Location loc, Value value, Type target);
+
+  /// If `expr` (modulo parens and implicit trivia) reads a union arm
+  /// whose mapped type differs from its storage slot's — a signedness or
+  /// float pun admitted by `collectUnionSlot` — reinterprets `value`
+  /// (the loaded slot value) bit-exactly as the arm's own mapped type
+  /// (`reinterpretScalarBits`); otherwise returns `value` unchanged.
+  FailureOr<Value> reinterpretUnionArmRead(const clang::Expr *expr,
+                                           Value value, Location loc);
+
+  /// If the assignment target `expr` is a union arm whose mapped type
+  /// differs from its storage slot's, reinterprets `value` (the assigned
+  /// value, of the arm's type) bit-exactly to the slot's type so the
+  /// store lands on the slot; otherwise returns `value` unchanged.
+  FailureOr<Value> reinterpretUnionArmWrite(const clang::Expr *expr,
+                                            Value value, Location loc);
+
+  /// Returns the spelling `field` carries in its flattened parent
+  /// struct_def: its own name or, for a union arm aliased by
+  /// `collectUnionSlot`/`collectRecordFields`, the storage slot's name —
+  /// mangled through `mangleMemberName` when the C spelling is a Rust
+  /// keyword, matching the spelling `collectRecordFields` emitted.
+  std::string flattenedFieldName(const clang::FieldDecl *field) const;
+
+  /// Returns the Rust type name `definition` was imported under: the
+  /// mangled block-scope name recorded by `importRecord`, the
+  /// collision-resolved name assigned by `structSymbolName` for a
+  /// file-scope record, the synthesized `Anon<n>` name for a bare
+  /// anonymous struct, or the tag (or anonymous-typedef) name as the
+  /// fallback. Empty only for an anonymous struct that was never imported.
+  std::string emittedRecordName(const clang::RecordDecl *definition) const;
+
+  /// Returns the MLIR/Rust symbol name assigned to a struct definition,
+  /// modeling C's separate tag and ordinary identifier namespaces (C99
+  /// 6.2.3): `struct a` and a global or function `a` may coexist in C, but
+  /// the module has a single symbol table, so the tag is deterministically
+  /// renamed to `Struct_<tag>` when — and only when — the ordinary
+  /// namespace also claims the name. The common, collision-free case keeps
+  /// the readable tag spelling. The decision is cached per defining
+  /// declaration so every mention of the type agrees. Returns an empty
+  /// string for an anonymous struct (callers reject with their own
+  /// located message) and failure when even the renamed spelling is
+  /// claimed by an ordinary identifier.
+  FailureOr<std::string> structSymbolName(const clang::RecordDecl *definition,
+                                          Location loc);
+
+  /// Whether `name` is claimed by C's ordinary identifier namespace: either
+  /// the current TU's pre-scanned ordinary names (functions, file-scope
+  /// variables, mangled function-local statics) or an already-imported
+  /// module symbol other than a struct definition (a global or function
+  /// from a previously imported TU).
+  bool ordinaryNameTaken(llvm::StringRef name) const;
+
+  /// Pre-scans a translation unit and records in `ordinaryTuNames` every
+  /// module-symbol name its ordinary identifier namespace will claim:
+  /// function names (after `main` -> `c_main` and internal-linkage TU-tag
+  /// mangling), file-scope variable names (with the same internal-linkage
+  /// mangling), and function-local statics under their `<function>_<name>`
+  /// mangle. Runs before any struct type is imported so tag renaming
+  /// (`structSymbolName`) is independent of declaration order.
+  void collectOrdinaryNames(const clang::TranslationUnitDecl *unit);
+
+  /// Walks a function body and records the `<function>_<name>` mangled
+  /// spelling of every function-local static in `ordinaryTuNames`.
+  void collectStaticLocalNames(const clang::Stmt *stmt,
+                               llvm::StringRef funcName);
+
+  /// Imports a complete named enum definition as a module-level
+  /// `emitrust.enum_def`. Incomplete and anonymous enums are silently
+  /// skipped (anonymous enumerators are imported as plain `i32` constants
+  /// at their use sites); repeated imports of the same definition are
+  /// deduplicated. Enumerator spellings become Rust variant names verbatim,
+  /// so spellings that are Rust keywords are rejected, as are values
+  /// outside the `i32` range and duplicate values (the generated Rust enum
+  /// needs one variant per discriminant).
+  LogicalResult importEnum(const clang::EnumDecl *enumDecl, Location loc);
+
+  /// Imports a function declaration or definition as a `func.func`. C
+  /// `main` is renamed to `c_main`. Body-less variadic declarations (such
+  /// as printf's) are skipped; a variadic definition whose body never
+  /// touches va_list imports as its fixed prototype — the named
+  /// parameters only, with call sites dropping effect-free trailing
+  /// extras in `emitCall` (CTS-P9) — while a va_list-using definition
+  /// emits its planned monomorphization clones (CTS 00204,
+  /// `emitVaClones`) or, without a plan, is rejected. A
+  /// body-less prototype with no definition in this TU is skipped when
+  /// nothing in this TU references it (referenced-only policy). A body
+  /// replaces a previously imported body-less declaration of the same name.
+  /// Block-scope prototypes (which C gives external linkage) are imported
+  /// through this same path by `emitStmt`; the module-scope insertion point
+  /// is guarded, so a mid-body call leaves the caller's insertion point
+  /// untouched.
+  LogicalResult importFunction(const clang::FunctionDecl *func);
+
+  /// CTS 00204 Pass A: plans the per-call-site monomorphization of every
+  /// variadic definition whose body uses va_list. Scope checks reject
+  /// va_copy, a va_list object escaping its definition (passed to any
+  /// callee — checked BEFORE the callee imports its va_list parameter
+  /// rejection), and taking the address of such a definition; the plan
+  /// then enumerates every direct call site and assigns one clone per
+  /// distinct extras signature. Runs before any declaration imports.
+  LogicalResult planVaMonomorph(const clang::TranslationUnitDecl *unit);
+
+  /// CTS 00204 Pass A: plans the `const char **` string-cursor parameters
+  /// of this TU. A pointer-to-pointer parameter of a definition qualifies
+  /// when the body only ever reads through `*s` and advances it with
+  /// `*s = <pointer expr>`; every other use (the parameter escaping into
+  /// a global, another call, deeper writes) is a located rejection.
+  LogicalResult planCursorParams(const clang::TranslationUnitDecl *unit);
+
+  /// Emits every planned clone of the monomorphized variadic definition
+  /// `func` (CTS 00204); a plan with zero clones emits nothing.
+  LogicalResult emitVaClones(const clang::FunctionDecl *func,
+                             const VaMonomorphPlan &plan);
+
+  /// Emits one monomorphized clone: the named parameters keep their
+  /// classified shapes, the site's extras append as by-value parameters,
+  /// and the body imports with the va_start/va_arg/va_end lowerings
+  /// active (an internal i64 consumption cursor; no synthetic parameter).
+  LogicalResult emitVaClone(const clang::FunctionDecl *func,
+                            const VaClonePlan &clone);
+
+  /// Lowers `va_arg(ap, T)` inside a clone: a dispatch over the
+  /// consumption cursor selecting among the clone's extras of static
+  /// type T (the cursor increments per read); a cursor position with no
+  /// matching extra is a deterministic panic (the C call would be UB).
+  FailureOr<Value> emitVaArg(const clang::VAArgExpr *expr);
+
+  /// Binds one ordinary (non-method, non-main, non-cursor) parameter to
+  /// its place: slice parameters deref into a region base plus cursor
+  /// cell, references bind directly, by-value dialect-typed and unsigned
+  /// values copy into `emitrust.variable` places, and plain scalars get
+  /// promotable prologue cells. Shared by `importFunction` and
+  /// `emitVaClone`.
+  LogicalResult bindOrdinaryParam(const clang::ParmVarDecl *param,
+                                  Value blockArg, Location paramLoc);
+
+  /// Binds a planned string-cursor parameter (CTS 00204): the shared
+  /// byte-slice argument derefs into the region base place, the in-out
+  /// cursor copies into a local i64 cell at entry, and every return site
+  /// copies it back (`cursorWritebacks`).
+  LogicalResult bindCursorParam(const clang::ParmVarDecl *param,
+                                Value baseArg, Value cursorArg,
+                                Location paramLoc);
+
+  /// Emits the pending string-cursor writebacks (local cell -> deref'd
+  /// in-out parameter place) ahead of a return.
+  void emitCursorWritebacks(Location loc);
+
+  /// Emits a call to a callee with planned string-cursor parameters: a
+  /// `&p` argument in a cursor position expands to (shared region slice,
+  /// `&mut` staged cursor temp), and the temp stores back into `p`'s
+  /// cursor cell after the call — the caller-visible advancement.
+  FailureOr<Value> emitCursorParamCall(const clang::CallExpr *call,
+                                       func::FuncOp target, Location loc);
+
+  /// Records every local variable whose address is taken with `&x` inside
+  /// `stmt`; such scalars become `emitrust.variable` places instead of
+  /// promotable memref cells. This also covers the degenerate bases of the
+  /// pointer decomposition (`int *p = &x` marks `x`); array and struct
+  /// bases are `emitrust.variable` places regardless.
+  void collectAddressTaken(const clang::Stmt *stmt);
+
+  /// Emits an owner-promoted local array (Phase 4): synthesizes the
+  /// module-level `emitrust.struct_def @Owner_... ["data"]` on first need
+  /// (a symbol collision is a located rejection, mirroring `createGlobal`),
+  /// declares the owner as an `emitrust.variable` of the struct type
+  /// (rendered `Owner::default()`), and registers the `member("data")`
+  /// place as the variable's symbol so that every direct access — and every
+  /// decomposed pointer whose region base it is — rewrites to the struct's
+  /// array field. The owner struct place itself is recorded separately for
+  /// method-call receivers and is never loaded whole.
+  LogicalResult emitOwnerLocal(const clang::VarDecl *var, Location loc);
+
+  /// Validates a pointer-typed local variable against its
+  /// `PointerRegionAnalysis` region and, when the region is decomposable
+  /// (local bases, no escapes, no arithmetic on a scalar base),
+  /// registers its decomposition: an entry-block `memref<i64>` cursor cell
+  /// for an array base, or no runtime state at all for a degenerate scalar
+  /// or struct base. A multi-base region (CTS-P7) additionally registers
+  /// an entry-block `memref<i32>` enum-of-bases discriminant cell per
+  /// pointer when every base is local and of one uniform kind (all
+  /// element runs of the pointee's element type, or all degenerate
+  /// scalars of the pointee type); other multi-base shapes keep the
+  /// located join rejection naming the first two objects and bindings. A string-literal region registers a cursor cell plus
+  /// the literal's read-only backing array (see
+  /// `getOrCreateLiteralBacking`) and rejects regions that are written
+  /// through or that join a literal with an object. A nullable region
+  /// (one that sees a null pointer constant, CTS-P8) additionally
+  /// registers an entry-block `memref<i1>` "non-null" flag cell per
+  /// pointer — the Option-of-cursor discriminant — including for a
+  /// nullable region with no base at all (a pointer that only ever holds
+  /// null, which supports null-checks but rejects dereference); a
+  /// nullable string-literal region is rejected. Undecomposable regions
+  /// produce located diagnostics at the offending construct.
+  LogicalResult emitPointerLocal(const clang::VarDecl *var, Location loc);
+
+  /// Emits the declaration of a second-order pointer local (`T **pp`,
+  /// CTS-P5). The accepted shape is the degenerate one-cell region of
+  /// cursor cells: `pp` statically selects a single first-order pointer
+  /// local, recorded in `pointerPointerLocals`, and needs no runtime state
+  /// of its own — `*pp` designates the target's (base, cursor)
+  /// decomposition and `**pp` is an indirect use of it, so no
+  /// reference-to-reference ever arises in the emitted Rust. Third-order
+  /// pointers, pointers to function pointers, multi-target selections, and
+  /// every invalidated shape are located rejections.
+  LogicalResult emitPointerPointerLocal(const clang::VarDecl *var,
+                                        Location loc);
+
+  /// Returns the tracked second-order pointer `pp` of a stripped `*pp`
+  /// dereference expression, or null when `expr` is not one.
+  const clang::VarDecl *secondOrderDerefVar(const clang::Expr *expr) const;
+
+  /// Emits the read of the decomposed pointer local (or slice-classified
+  /// parameter) `var`: its static base plus the current value of its
+  /// cursor cell and, in a nullable region, its non-null flag cell.
+  /// Shared by the direct read (`p` in pointer-value position) and the
+  /// second-order dereference (`*pp`, which reads the selected pointer).
+  FailureOr<PtrExprValue> emitPointerLocalRead(Location loc,
+                                               const clang::VarDecl *var);
+
+  /// Emits `ptr = rhs` for a decomposed pointer local by recomputing and
+  /// storing its cursor; a degenerate binding (`p = &x`) needs no cursor
+  /// code at all because the target place is statically known. For a
+  /// pointer of a nullable region the assignment also stores the
+  /// Option-of-cursor discriminant: false for `ptr = NULL`, true for an
+  /// address binding, and the source pointer's own flag for `ptr = q`.
+  LogicalResult storePointerAssign(Location loc, const clang::VarDecl *ptr,
+                                   const clang::Expr *rhs);
+
+  /// Emits `p += n` / `p -= n` on a decomposed pointer local as cursor
+  /// arithmetic: load the i64 cursor cell, add or subtract the widened
+  /// amount, and store the cursor back.
+  LogicalResult
+  emitPointerCompoundAssign(const clang::CompoundAssignOperator *op);
+
+  /// Imports a file-scope variable as a module-level `emitrust.global`.
+  /// Redeclarations are reconciled the way C does: the definition (or a
+  /// tentative definition) provides the type and, through
+  /// `getAnyInitializer`, the initializer. A variable that is only ever
+  /// `extern`-declared in this TU is skipped when nothing references it
+  /// (referenced-only policy); when referenced it is deferred for cross-TU
+  /// resolution (project import) or rejected (single-file import).
+  /// Data-pointer-typed variables route to `importPointerGlobal`.
+  /// Thread-locals are rejected.
+  LogicalResult importGlobalVar(const clang::VarDecl *var);
+
+  /// Imports a pointer-typed file-scope variable under the CTS-P4 global
+  /// region model. The program-wide facts merged by `planOwners` combine
+  /// with the file-scope initializer's constant-evaluated binding (clang
+  /// APValue lvalue: base declaration plus byte offset); the pointer must
+  /// resolve to exactly one region base, which is one of:
+  ///  - a global scalar or struct object (`int *p = &x;`): degenerate, no
+  ///    runtime state, every access resolves statically to the base;
+  ///  - a global array: an i64 cursor `emitrust.global` named after the
+  ///    pointer, initialized to the initializer's element offset (or 0);
+  ///  - a file-scope compound literal (`&(struct S){1, 2}`): a synthesized
+  ///    constant-initialized backing global named `<name>_backing`;
+  ///  - a file-scope string-literal initializer (`char *s = "...";`,
+  ///    CTS-L3): a synthesized immutable `<name>_backing` byte-array
+  ///    global (the literal's ASCII bytes plus the terminating NUL, the
+  ///    CTS-P1 read-only backing lifted to module scope) plus a cursor
+  ///    global; writes through the region are rejected up front;
+  ///  - a single constant-size `calloc`/`malloc` site: a synthesized
+  ///    zero-initialized backing array global plus a cursor global.
+  /// An unreferenced pointer global imports nothing (referenced-only
+  /// policy, matching extern declarations). Located rejections: a binding
+  /// to a local object (the borrow would outlive the object — the exact
+  /// program rustc refuses), multiple bases, body bindings to string
+  /// literals, copying a global pointer, address-of, null constants,
+  /// external linkage in a multi-file project, and type/base mismatches.
+  LogicalResult importPointerGlobal(const clang::VarDecl *key,
+                                    const clang::VarDecl *decl,
+                                    llvm::StringRef symbolName, Location loc);
+
+  /// Emits `g = rhs` for an imported pointer-typed global: a recognized
+  /// allocation call re-zeroes the synthesized backing (exact calloc
+  /// semantics; malloc's contents are indeterminate, so zero-filling is a
+  /// legal refinement) and resets the cursor; any other right-hand side
+  /// decomposes and must resolve into the pointer's region, storing its
+  /// cursor with `emitrust.global_store` (nothing for degenerate bases,
+  /// whose target place is statically known).
+  LogicalResult storeGlobalPointerAssign(Location loc,
+                                         const clang::VarDecl *ptr,
+                                         const PointerGlobalInfo &info,
+                                         const clang::Expr *rhs);
+
+  /// Creates the `emitrust.global` named `symbolName` for the declaration
+  /// `decl` (which supplies the type and initializer) and registers it
+  /// under the canonical declaration `key`. Rejects Rust-keyword names,
+  /// the reserved `__emitrust_tl` accessor-binder name,
+  /// module symbol collisions, pointer types, and non-constant or aggregate
+  /// initializers. `const`-qualified variables become immutable globals
+  /// unless struct-typed (a struct default is not const-evaluable in Rust).
+  LogicalResult createGlobal(const clang::VarDecl *key,
+                             const clang::VarDecl *decl,
+                             llvm::StringRef symbolName, Location loc);
+
+  /// Registers an `extern`-only global reference (project import) without
+  /// creating an `emitrust.global`: records the mapping so uses in this TU
+  /// resolve and remembers `symbolName` for the post-merge check that some TU
+  /// really defines it. Rejects pointer-typed and unmappable globals.
+  LogicalResult deferExternGlobal(const clang::VarDecl *key,
+                                  llvm::StringRef symbolName,
+                                  clang::QualType qualType, Location loc);
+
+  /// Evaluates `decl`'s initializer as a constant (clang APValue
+  /// evaluation) and converts it to an attribute of `type`. Supports
+  /// integer (including `_Bool` and char) and floating-point constants,
+  /// function-pointer initializers as opaque `None`/`Some(name)`
+  /// attributes, and array/struct aggregates as ArrayAttr element lists
+  /// (via `convertAPValueInit`); non-constant expressions are rejected
+  /// with located diagnostics.
+  FailureOr<Attribute> convertGlobalInit(const clang::VarDecl *decl,
+                                         Type type, Location loc);
+
+  /// Converts a constant-evaluated `clang::APValue` to the initializer
+  /// attribute for a global of value type `type`: IntegerAttr/BoolAttr for
+  /// integers, FloatAttr for floats, and a (possibly nested) ArrayAttr with
+  /// one entry per array element or flattened struct field for
+  /// aggregates. Array holes left by partial or designated
+  /// initialization take the array filler (C99 zero-fill); struct field
+  /// types resolve through the module-level `emitrust.struct_def`, and a
+  /// struct with flattened anonymous members converts along the C field
+  /// structure via `convertRecordAPValue`. `cType` is the C type walked
+  /// in parallel: a data-pointer field (stored as an i64 cursor member,
+  /// CTS-P2) converts to 0 — its lvalue APValue carries no stored
+  /// representation; the member's binding is recorded separately by
+  /// `collectGlobalMemberBindings`. Anything else (enum-typed elements,
+  /// non-member pointers) is rejected with a located diagnostic.
+  FailureOr<Attribute> convertAPValueInit(const clang::APValue &value,
+                                          Type type, clang::QualType cType,
+                                          Location loc);
+
+  /// Maps the C type of one struct field: a data-pointer field is stored
+  /// as a plain i64 cursor member (CTS-P2 — a cursor is a borrow-free Copy
+  /// integer, so a struct can hold one; the member's target object is
+  /// resolved statically per instance and the stored value carries no
+  /// information in the degenerate model); every other type maps through
+  /// `mapType`.
+  FailureOr<Type> mapStructFieldType(clang::QualType type, Location loc);
+
+  /// Converts the struct `APValue` of `record` to one attribute per
+  /// flattened struct_def field, appended to `fields`. `fieldTypes` is
+  /// the struct_def's flattened type list and `typeIndex` the cursor into
+  /// it, advanced per emitted field: a plain field converts positionally,
+  /// an anonymous struct member recurses into its struct value, and an
+  /// anonymous union member converts its single aliased storage slot via
+  /// `convertAnonymousSlotInit`.
+  LogicalResult convertRecordAPValue(const clang::APValue &value,
+                                     const clang::RecordDecl *record,
+                                     ArrayAttr fieldTypes, unsigned &typeIndex,
+                                     SmallVectorImpl<Attribute> &fields,
+                                     Location loc);
+
+  /// Converts the constant value of a union — a flattened anonymous
+  /// union member, or a named/untagged union type imported as a
+  /// one-field struct by `collectUnionSlot` — to the attribute of its
+  /// single storage slot of type `slotType`: the union's active arm
+  /// descends through nested anonymous members to the slot's scalar
+  /// value; a union with no active arm takes the slot's zero value (C99
+  /// zero-fill).
+  FailureOr<Attribute>
+  convertAnonymousSlotInit(const clang::APValue &value,
+                           const clang::RecordDecl *record, Type slotType,
+                           Location loc);
+
+  /// Returns the imported global for `decl`, or null when `decl` is not an
+  /// imported variable with static storage duration.
+  const GlobalInfo *lookupGlobal(const clang::ValueDecl *decl) const;
+
+  /// Returns the canonical declaration when `expr` (ignoring parens) is a
+  /// direct reference to an imported global, or null otherwise.
+  const clang::VarDecl *asDirectGlobalRef(const clang::Expr *expr) const;
+
+  /// Returns whether the place expression `expr` (a declaration reference,
+  /// or member/subscript chains over one) is rooted at an imported global;
+  /// used to reject taking the address of a global.
+  bool rootsAtGlobal(const clang::Expr *expr) const;
+
+  /// Stores a staged copy back where it came from, if `writeback` captured
+  /// one; no-op otherwise. A staged global copy stores back into its
+  /// global; a staged multi-base element (CTS-P7) dispatches on the
+  /// discriminant and stores into the selected base at the staged cursor.
+  LogicalResult flushGlobalWriteback(Location loc,
+                                     const GlobalWriteback &writeback);
+
+  /// Commits a mutation of a place rooted at a staged global copy: applies
+  /// `mutate` (the caller's store into the staged place) and flushes
+  /// `writeback`. When `refreshStaged` is set — the statement evaluated a
+  /// side-effecting subexpression (an RHS call, a subscript-index call)
+  /// AFTER the staging load — the staged whole-value copy is first rebound
+  /// to a fresh snapshot of the global, so the flush's whole-value
+  /// store-back cannot revert a write that intervening code made to
+  /// another subobject of the same global (C11 6.5.16p3: the RHS's side
+  /// effects are sequenced before the assignment's store, and the store
+  /// writes only the designated subobject). Multi-base writebacks need no
+  /// refresh: their flush re-stages the active base afresh and merges only
+  /// the staged element (see `flushGlobalWriteback`). Every staged-global
+  /// write path (assignment, compound assignment, wide-byte stores,
+  /// ++/--) must route its mutation through this seam.
+  LogicalResult
+  commitGlobalWriteback(Location loc, const GlobalWriteback &writeback,
+                        bool refreshStaged,
+                        llvm::function_ref<LogicalResult()> mutate);
+
+  /// Returns whether either operand of the (compound) assignment `op`
+  /// contains a side-effecting subexpression — the conservative trigger
+  /// for `commitGlobalWriteback`'s staged-copy refresh: only such a
+  /// subexpression (an RHS call, a subscript-index call in the LHS) can
+  /// have written the staged global after the staging load. Pure
+  /// statements skip the refresh and emit exactly the historical IR.
+  bool assignStalenessRisk(const clang::BinaryOperator *op) const {
+    return op->getLHS()->HasSideEffects(astContext()) ||
+           op->getRHS()->HasSideEffects(astContext());
+  }
+
+  /// Emits one dispatch over the closed set of `bases` of a multi-base
+  /// region (CTS-P7): a chain of `baseIndex == i` conditional branches
+  /// with one arm block per base (the last base is the final else — the
+  /// discriminant can only ever hold a bound index), each arm populated
+  /// by `emitArm`, all joining in a fresh continuation block where the
+  /// insertion point is left.
+  LogicalResult emitMultiBaseDispatch(
+      Location loc, ArrayRef<PointerBaseKey> bases, Value baseIndex,
+      llvm::function_ref<LogicalResult(const PointerBaseKey &)> emitArm);
+
+  /// Materializes the element place of the local base `base` at `cursor`
+  /// (null for a degenerate scalar or member base, which resolves to the
+  /// object's — or member's — own place): the base's registered place,
+  /// projected through the member for a `&struct.member` base (CTS-P9)
+  /// and refined through `refineElementPlace`. Used per dispatch arm of a
+  /// multi-base pointer; global-member arms stage the global instead (see
+  /// `stageGlobalCopy`).
+  FailureOr<Value> materializeLocalElementPlace(Location loc,
+                                                const PointerBaseKey &base,
+                                                Value cursor,
+                                                Type pointeeType);
+
+  /// Stages the whole value of the global region base `base` (a real
+  /// global object, or a pointer global's synthesized backing) in a fresh
+  /// local `emitrust.variable` copy — the staged-copy model of direct
+  /// global element accesses — returning the staging place and the global
+  /// symbol a write context must store the copy back into.
+  FailureOr<std::pair<Value, std::string>>
+  stageGlobalCopy(Location loc, const clang::VarDecl *base);
+
+  /// Stages `base`'s whole global value through `stageGlobalCopy` and,
+  /// when the caller passes a write context, records the staging place
+  /// and symbol in `*writeback` so the mutation flushes through
+  /// `commitGlobalWriteback`. Returns the staging place the access
+  /// refines — the one staged-copy read-side idiom shared by every
+  /// global region access site.
+  FailureOr<Value> stageGlobalCopyAndRecord(Location loc,
+                                            const clang::VarDecl *base,
+                                            GlobalWriteback *writeback);
+
+  //===--------------------------------------------------------------------===//
+  // CTS-BR (00216): the u8-only byte-region aggregate model.
+  //
+  // An aggregate whose scalar leaves are ALL `unsigned char` is
+  // padding-free by construction and imports as a plain byte region: the
+  // object is an `!emitrust.array<Nxui8>` (N == sizeof), no struct_def is
+  // emitted for the record, constant initializers fold to complete byte
+  // images (globals) or per-byte stores (locals), member access is an
+  // `emitrust.subscript` at the member's constant byte offset, and
+  // `(u8 *)&x` is the region base. Pointers to byte-region records are
+  // `!emitrust.slice<ui8>` parameters riding the existing slice-parameter
+  // decomposition, with byte-granular cursors.
+  //===--------------------------------------------------------------------===//
+
+  /// Returns whether `type` is exactly C's `unsigned char` (the one leaf
+  /// scalar the byte-region model admits).
+  bool isU8ScalarType(clang::QualType type) const;
+
+  /// Returns whether `record` classifies as a byte-region record: every
+  /// struct leaf is `unsigned char` (directly, through nested byte-region
+  /// records, through constant arrays of either, with empty structs,
+  /// GNU zero-length arrays, and a trailing flexible array member
+  /// contributing zero bytes), and every union arm is either u8-only or a
+  /// constant array of non-u8 scalars whose total size equals the
+  /// union's (the in6_addr `unsigned short u6_addr16[8]` type-level
+  /// alias). A zero-size record (empty struct) stays on the typed path —
+  /// the dialect has no zero-length array — and unions must keep at
+  /// least one u8-only arm so scalar-pun unions never reclassify.
+  bool isByteRegionRecord(const clang::RecordDecl *record);
+
+  /// Returns whether `type` is a byte-region aggregate: a byte-region
+  /// record, or a constant array (of arrays) of byte-region records —
+  /// which flattens to ONE region of n*sizeof bytes. Plain `unsigned
+  /// char` arrays are NOT byte-region aggregates; they keep the native
+  /// array path.
+  bool isByteRegionAggregate(clang::QualType type);
+
+  /// Whether the (possibly nested) member/subscript/deref expression
+  /// `expr` designates storage inside a byte-region aggregate, i.e. must
+  /// route through the byte-region place resolution instead of the typed
+  /// member/subscript emission.
+  bool exprRootsInByteRegion(const clang::Expr *expr);
+
+  /// A resolved byte-region designator: a base region place (an
+  /// `!emitrust.lvalue` of `!emitrust.array<Nxui8>` or
+  /// `!emitrust.slice<ui8>`) plus the byte offset of the designated
+  /// storage, split into a folded constant part and an optional runtime
+  /// i64 part (subscripts with runtime indices, walking pointer cursors).
+  struct ByteRegionRef {
+    Value place;
+    int64_t constOff = 0;
+    Value dynOff;
+  };
+
+  /// Resolves the lvalue-shaped expression `expr` (declaration
+  /// references, dot and arrow member chains, subscripts, dereferences,
+  /// compound literals, and identity/qualification casts over any of
+  /// them) to its byte-region designator. Global bases stage a whole
+  /// region copy (recording `writeback` in write contexts); flexible
+  /// array member and zero-length array member accesses are located
+  /// rejections.
+  FailureOr<ByteRegionRef> resolveByteRegionRef(const clang::Expr *expr,
+                                                GlobalWriteback *writeback);
+
+  /// Resolves the data-pointer expression `ptrExpr` (whose pointee is a
+  /// byte-region aggregate) to the designated region: the decomposed
+  /// pointer's base place at its current byte cursor.
+  FailureOr<ByteRegionRef>
+  resolveByteRegionPointer(const clang::Expr *ptrExpr,
+                           GlobalWriteback *writeback);
+
+  /// Materializes the i64 byte-offset value `constOff + dynOff` of a
+  /// resolved designator.
+  Value byteRegionOffset(Location loc, const ByteRegionRef &ref);
+
+  /// Emits the `!emitrust.lvalue<ui8>` place of the single byte `ref`
+  /// designates offset by `extra` bytes.
+  Value byteRegionBytePlace(Location loc, const ByteRegionRef &ref,
+                            int64_t extra = 0);
+
+  /// Emits the scalar-leaf place of the byte-region member or subscript
+  /// expression `expr`: an `emitrust.subscript` of the region base at the
+  /// accumulated byte offset. Only `unsigned char` leaves have a place; a
+  /// non-u8 leaf (an equal-size union arm's scalar) is a located
+  /// rejection.
+  FailureOr<Value> emitByteRegionLeafLValue(const clang::Expr *expr,
+                                            Location loc,
+                                            GlobalWriteback *writeback);
+
+  /// Copies `size` bytes from the resolved source region `src` into the
+  /// destination region `dst` (unrolled per-byte subscript loads and
+  /// stores; region sizes are small compile-time constants).
+  LogicalResult emitByteRegionCopy(Location loc, const ByteRegionRef &dst,
+                                   const ByteRegionRef &src, uint64_t size);
+
+  /// Initializes the byte-region storage at byte `offset` of `place`
+  /// (an `!emitrust.lvalue<!emitrust.array<Nxui8>>`, default-zeroed by
+  /// the bare `emitrust.variable`) from the initializer `init` of C type
+  /// `type`: brace lists and compound literals recurse per field/element
+  /// at their layout offsets, string literals store their bytes, constant
+  /// scalars fold to `emitrust.constant` ui8 stores, runtime scalars flow
+  /// through their AST conversion casts, and whole-aggregate values
+  /// (named objects, dereferences, members, identity casts) copy their
+  /// source region per byte. Holes keep the C99 zero fill.
+  LogicalResult emitByteRegionInit(Value place, int64_t offset,
+                                   clang::QualType type,
+                                   const clang::Expr *init);
+
+  /// Whole-aggregate assignment over byte-region records (`a = b`, `a.s =
+  /// b`, statement position): per-byte region copy with the LHS's global
+  /// writeback flushed afterwards.
+  LogicalResult emitByteRegionAggregateAssign(const clang::BinaryOperator *op);
+
+  /// Creates the byte-region global for `decl` (called from
+  /// `createGlobal` once the type classified): the global's type is
+  /// `!emitrust.array<Nxui8>` where N is sizeof — EXTENDED past sizeof by
+  /// a static flexible-array-member tail initializer — and the
+  /// initializer folds to a complete zero-filled byte image computed from
+  /// the APValue against the target record layout.
+  LogicalResult createByteRegionGlobal(const clang::VarDecl *key,
+                                       const clang::VarDecl *decl,
+                                       llvm::StringRef symbolName,
+                                       Location loc);
+
+  /// Serializes the constant `value` of C type `type` into `image`
+  /// starting at byte `offset`, following the target record layout
+  /// (little-endian for the multi-byte scalars an equal-size union arm
+  /// may alias over the region).
+  LogicalResult serializeAPValueBytes(const clang::APValue &value,
+                                      clang::QualType type, uint64_t offset,
+                                      SmallVectorImpl<uint8_t> &image,
+                                      Location loc);
+
+  /// Syntactic counterpart of `serializeAPValueBytes` for the one shape
+  /// clang's constant evaluator refuses: a record initializer with a
+  /// flexible-array-member tail. Walks the SEMANTIC initializer form,
+  /// folding constant scalar leaves, string literals, and nested lists
+  /// into the image at their layout offsets.
+  LogicalResult serializeInitExprBytes(const clang::Expr *init,
+                                       clang::QualType type, uint64_t offset,
+                                       SmallVectorImpl<uint8_t> &image,
+                                       Location loc);
+
+  /// If `field` is a flexible array member or a GNU zero-length array
+  /// member, emits the dedicated located access rejection; such members
+  /// are tolerated at the declaration (zero size, no storage) but have no
+  /// runtime-accessible elements.
+  LogicalResult checkSpecialArrayMemberAccess(const clang::FieldDecl *field,
+                                              Location loc);
+
+  /// Returns whether `type` is a GNU zero-length array (`T r[0]`).
+  bool isZeroLengthArrayType(clang::QualType type) const;
+
+  /// Whether `expr` is a designator shape `resolveByteRegionRef` handles
+  /// (a declaration reference, member chain, subscript, dereference, or
+  /// compound literal, under identity casts) — used to gate the per-byte
+  /// aggregate-assignment path.
+  bool isByteRegionDesignator(const clang::Expr *expr) const;
+
+  /// The u8-only classification cache (`isByteRegionRecord` is consulted
+  /// for every record type mapping and member access).
+  llvm::DenseMap<const clang::RecordDecl *, bool> byteRegionRecords;
+
+  //===--------------------------------------------------------------------===//
+  // CTS-BR (00216): `void *` fn-ptr struct members (the T1.1 holder bound
+  // extended to members). A struct member declared `void *` whose every
+  // stored value across the TU is the address of a function of ONE
+  // signature — stores happen only in aggregate initializers, never by
+  // assignment — imports as an `!emitrust.fn_ptr` member; reads under a
+  // cast to that one signature load the member place directly.
+  //===--------------------------------------------------------------------===//
+
+  /// TU pre-pass populating `fnPtrMemberTypes`: candidates are `void *`
+  /// fields whose every aggregate-initializer value is the address of a
+  /// function of one common signature and whose only other mentions are
+  /// reads under a cast to that signature.
+  void planFnPtrMembers(const clang::TranslationUnitDecl *unit);
+
+  /// Record definitions mentioned by any DECLARATION type in the TU
+  /// (globals, parameters, returns, fields, block-scope locals) —
+  /// stripped of typedefs, arrays, and pointers. An EMPTY struct is
+  /// eagerly imported only when this set names it; one that only ever
+  /// appears inside byte-region initializer expressions (CTS-BR, 00216)
+  /// never emits a struct_def.
+  llvm::DenseSet<const clang::RecordDecl *> declTypeUsedRecords;
+
+  /// Populates `declTypeUsedRecords` for this TU.
+  void collectDeclTypeRecords(const clang::TranslationUnitDecl *unit);
+
+  /// The admitted `void *` fn-ptr members, mapped to the function-pointer
+  /// C type they retype to (`T (*)(...)` of the common target signature).
+  llvm::DenseMap<const clang::FieldDecl *, clang::QualType> fnPtrMemberTypes;
+
+  /// Byte-region-global slice arguments staged by `emitBorrowArgument`
+  /// for the call being emitted: each (staged place, global symbol) pair
+  /// stores the image back right after the call op (drained per call
+  /// site, so nested calls consume their own entries first).
+  SmallVector<std::pair<Value, std::string>, 2> pendingStagedGlobalStores;
+
+  /// Projects the member place `field` designates on the struct place
+  /// `basePlace` (an `emitrust.member` with the flattened field name),
+  /// used to resolve a `&struct.member` region base (CTS-P9).
+  FailureOr<Value> projectMemberPlace(Location loc, Value basePlace,
+                                      const clang::FieldDecl *field);
+
+  /// Refines the array-or-slice place `basePlace` down to the element the
+  /// flat row-major `cursor` designates, peeling one `emitrust.subscript`
+  /// per array level (dividing the cursor by the level's flat element
+  /// span and continuing with the remainder) until the wrapped value type
+  /// is `pointeeType`; returns `basePlace` unchanged when `cursor` is
+  /// null (a degenerate whole-object pointer).
+  FailureOr<Value> refineElementPlace(Location loc, Value basePlace,
+                                      Value cursor, Type pointeeType);
+
+  /// Builds the symbol reference attribute for `symbol`.
+  FlatSymbolRefAttr globalSymbol(llvm::StringRef symbol) {
+    return FlatSymbolRefAttr::get(builder.getContext(), symbol);
+  }
+
+  //===--------------------------------------------------------------------===//
+  // Function-body plumbing
+  //===--------------------------------------------------------------------===//
+
+  /// Creates a rank-0 `memref.alloca` of `elementType` at the start of the
+  /// entry block, leaving the current insertion point untouched.
+  Value createEntryAlloca(Location loc, Type elementType);
+
+  /// Appends a fresh empty block to the current function body without
+  /// moving the insertion point.
+  Block *createBlock();
+
+  /// Returns the block that `label` starts, creating it on first mention
+  /// (either the `goto` or the label itself may be seen first).
+  Block *getLabelBlock(const clang::LabelDecl *label);
+
+  /// Creates an `emitrust.variable` place of `type`. In a function that
+  /// contains labels the op is hoisted to the start of the entry block so
+  /// that a `goto` jumping over the declaration cannot leave a later use
+  /// undominated by the definition; otherwise it is created at the current
+  /// insertion point.
+  Value createVariablePlace(Location loc, Type type);
+
+  /// Returns true if `block` already ends with a terminator operation.
+  static bool isTerminated(Block *block);
+
+  /// Creates an `arith.constant` of integer `type` with the given value.
+  /// The type must be signless (an arith invariant); use
+  /// `createScalarIntConstant` when the type may be unsigned.
+  Value createIntConstant(Location loc, Type type, int64_t value);
+
+  /// Creates an integer constant of any supported integer `type`: an
+  /// `arith.constant` for signless types and an `emitrust.constant` for
+  /// unsigned types (arith constants must be signless).
+  Value createScalarIntConstant(Location loc, Type type, int64_t value);
+
+  /// Creates an `arith.constant` of type i1 with the given truth value.
+  Value createBoolConstant(Location loc, bool value);
+
+  /// Erases blocks unreachable from the entry block, then terminates any
+  /// remaining unterminated block: void functions get a bare `func.return`,
+  /// `c_main` gets an implicit `return 0`, and any other non-void function
+  /// is rejected with a located diagnostic.
+  LogicalResult finalizeFunction(func::FuncOp funcOp, Location loc);
+
+  //===--------------------------------------------------------------------===//
+  // Statements
+  //===--------------------------------------------------------------------===//
+
+  /// Emits one statement at the current insertion point; dispatches over
+  /// the supported statement kinds and rejects the rest with a located
+  /// diagnostic. C labels start their mapped block (see `getLabelBlock`)
+  /// and `goto` emits a `cf.br` to it followed by a fresh block for any
+  /// trailing code; computed goto is rejected. Block-scope function
+  /// prototypes have external linkage and are hoisted to module scope
+  /// through `importFunction`; other unsupported block-scope declarations
+  /// are rejected.
+  LogicalResult emitStmt(const clang::Stmt *stmt);
+
+  /// Emits a local variable declaration. Signed scalars become entry-block
+  /// memref cells (initializer stored at the declaration point);
+  /// aggregates, enums, function pointers, unsigned scalars, and
+  /// address-taken scalars become `emitrust.variable` places. Data-pointer
+  /// locals are decomposed through `emitPointerLocal`; function-pointer
+  /// locals are ordinary values and bypass the decomposition entirely.
+  /// Function-local statics become module-level
+  /// `emitrust.global`s mangled as `<function>_<name>`; extern locals are
+  /// rejected. An UNREFERENCED local VLA whose size expression is
+  /// side-effect-free is elided entirely (CTS-F, 00207): no IR and no
+  /// diagnostic — the object never materializes and dropping the size
+  /// expression loses nothing. Referenced VLAs and dead VLAs with a
+  /// side-effecting size expression keep the non-constant-array-size
+  /// rejection.
+  LogicalResult emitLocalVar(const clang::VarDecl *var);
+
+  /// Populates `voidFnPtrHolders` with the admitted local `void *`
+  /// fn-ptr holders of `body` (CTS-F, 00210): a local `void *` whose
+  /// initializer is (an implicit cast of) `&f` or the decayed `f` for a
+  /// known non-variadic function (a prototype-less K&R `f` maps to the
+  /// zero-parameter form), never reassigned, and whose EVERY value use
+  /// is an explicit cast to exactly `f`'s signature (C type
+  /// compatibility, C11 6.2.7) in callee position
+  /// (`((T (*)(...))fp)(...)`). Any other mention of the holder — a
+  /// reassignment, an escaping argument, a mismatched cast —
+  /// disqualifies it, keeping the existing pointer-region rejection.
+  void collectVoidFnPtrHolders(const clang::Stmt *body);
+
+  /// K&R callsite-prototype inference (FR-29, CTS 00209): walks the
+  /// DEFINITION's body for calls with arguments whose callee, after the
+  /// `(*fp)` deref-peel, is a `DeclRefExpr` to a local-storage
+  /// `ParmVarDecl`/`VarDecl` of pointer-to-`FunctionNoProtoType`, and
+  /// records decl -> `!emitrust.fn_ptr<promoted... -> ret>` in `inferred`
+  /// — the argument types verbatim (clang already applied the default
+  /// argument promotions at the call) plus the declared return type.
+  /// Multiple call sites for one decl must agree on the signature; a
+  /// disagreeing site is a located rejection at that (second) site.
+  /// Zero-argument calls infer nothing (a never-argument-called pointer
+  /// keeps the unrefined zero-parameter mapping), and non-decl callees
+  /// (members, array elements, call results) are skipped — their
+  /// argument-carrying calls keep the existing no-prototype rejection in
+  /// `emitIndirectCall`.
+  LogicalResult inferNoProtoCallSignatures(
+      const clang::FunctionDecl *definition,
+      llvm::DenseMap<const clang::VarDecl *, emitrust::FnPtrType> &inferred);
+
+  /// Emits `expr` destined for a position of type `expected`. When
+  /// `expected` is a `!emitrust.fn_ptr` signature and `expr` is (a cast
+  /// chain over) a direct function reference of prototype-less
+  /// pointer-to-function type, the `Some(target)` constant resolves
+  /// against `expected` — the shape a refined (callsite-inferred, FR-29 /
+  /// CTS 00209) destination requires, and identical to the ordinary
+  /// mapping when the destination is unrefined. A prototype-less null
+  /// pointer constant likewise takes `expected`'s `None`. Every other
+  /// shape (including all prototyped sources) is a plain `emitRValue`.
+  FailureOr<Value> emitPositionedRValue(Type expected,
+                                        const clang::Expr *expr);
+
+  /// Emits the admitted holder local `var` (CTS-F, 00210) exactly like a
+  /// directly-typed local fn-ptr: an `emitrust.variable` of the target's
+  /// `!emitrust.fn_ptr` signature assigned the opaque `Some(target)`
+  /// constant (the FR-29 model). The spelled `void *` type never reaches
+  /// the IR.
+  LogicalResult emitFnHolderLocal(const clang::VarDecl *var,
+                                  const clang::FunctionDecl *target,
+                                  Location loc);
+
+  /// Emits a block-scope aggregate initializer list into the
+  /// default-initialized place `place` of array or struct value type
+  /// `type`: one `emitrust.assign` per explicitly initialized element
+  /// (constant-index `emitrust.subscript` for array elements,
+  /// `emitrust.member` for struct fields), recursing for nested lists.
+  /// Elements left implicit (partial or designated initialization) keep
+  /// the place's default value, which models C99 zero-fill. Works on the
+  /// semantic form of the list, so designators are already resolved to
+  /// positions. Aggregate-typed elements that are not initializer lists
+  /// (string literals, struct copies) are rejected with located
+  /// diagnostics. `instance` names the declared variable when the list
+  /// initializes a struct local directly: a data-pointer field's
+  /// initializer then validates against the member binding the analysis
+  /// recorded and emits nothing (the stored i64 stays 0, CTS-P2); with a
+  /// null `instance` a non-implicit data-pointer field initializer is
+  /// rejected (its instance path is outside the member model).
+  LogicalResult emitAggregateInitList(Value place, Type type,
+                                      const clang::InitListExpr *list,
+                                      const clang::VarDecl *instance =
+                                          nullptr);
+
+  /// Emits a (semantic-form) initializer list for the C record `record`
+  /// into the parent struct place `place`, resolving flattened anonymous
+  /// members: a plain field initializes through `emitrust.member` under
+  /// its flattened name; an anonymous struct member's nested list
+  /// recurses onto the same parent place; an anonymous union member's
+  /// nested list initializes only its active arm (Sema records it on the
+  /// semantic form), which lands on the arm's aliased storage slot. Called
+  /// with `record->isUnion()` only for such flattened anonymous members.
+  LogicalResult emitRecordInitFields(Value place,
+                                     const clang::RecordDecl *record,
+                                     const clang::InitListExpr *list,
+                                     const clang::VarDecl *instance = nullptr);
+
+  /// Emits the initializer `element` for `field` of a flattened record
+  /// into the parent struct place `place`: an anonymous member requires a
+  /// nested list and recurses via `emitRecordInitFields`; a plain field
+  /// assigns through `emitrust.member` under its flattened name.
+  LogicalResult emitRecordInitField(Value place, const clang::FieldDecl *field,
+                                    const clang::Expr *element,
+                                    const clang::VarDecl *instance = nullptr);
+
+  /// Emits one element of an aggregate initializer list into `place` of
+  /// value type `type`: recurses for a nested list, otherwise stores the
+  /// element rvalue.
+  LogicalResult emitInitListElement(Value place, Type type,
+                                    const clang::Expr *element);
+
+  /// Emits a block-scope `char s[N] = "..."` (or `wchar_t s[N] = L"..."`)
+  /// initializer as per-element assigns including the trailing NUL (when
+  /// it fits, per C99 6.7.8p14); elements beyond the literal keep the
+  /// place's default zero value. An ordinary literal requires a
+  /// signless-i8 (plain/signed char) array and rejects non-ASCII bytes
+  /// with located diagnostics so the array's contents stay printable
+  /// through the ASCII-only `%s`/`%c` helpers; a wide literal requires an
+  /// i32 (`wchar_t`) array and carries its code units verbatim (a wide
+  /// array never feeds those byte-string helpers, so no ASCII limit
+  /// applies). u8/u/U literals stay rejected.
+  LogicalResult emitStringArrayInit(Value place, Type type,
+                                    const clang::StringLiteral *literal);
+
+  /// Materializes a block-scope compound literal in expression position
+  /// (C99-13) as a fresh anonymous place: a default-initialized
+  /// `emitrust.variable` of the literal's aggregate type followed by the
+  /// per-element assigns of its initializer list (the C99-11 machinery;
+  /// holes keep the C99 zero fill), or the string-array fill for
+  /// `(char[N]){"..."}`. With `hoistForRegion` false (direct lvalue and
+  /// value uses, whose consumers sit in the same statement) the place is
+  /// created at the current insertion point. With `hoistForRegion` true
+  /// (the literal becomes a pointer-region base, so dereferences anywhere
+  /// in the function resolve against the place) the place is hoisted to
+  /// the entry block for SSA dominance, and each evaluation first
+  /// re-assigns the type's pristine default value — captured by a load
+  /// right after the hoisted creation — so re-executions (a literal
+  /// bound inside a loop) restore the C99 zero fill of the holes exactly.
+  /// Scalar compound literals and file-scope literals reaching an
+  /// expression context are located rejections.
+  FailureOr<Value>
+  emitCompoundLiteralPlace(const clang::CompoundLiteralExpr *literal,
+                           bool hoistForRegion = false);
+
+  /// Materializes `literal` (see `emitCompoundLiteralPlace`) and registers
+  /// the place under the literal's synthesized backing declaration — the
+  /// region base the analysis recorded for its decay or address-of — so
+  /// every downstream consumer (dereference, subscript, slice argument)
+  /// resolves the base like any named local object. Returns the backing
+  /// declaration.
+  FailureOr<const clang::VarDecl *>
+  materializeCompoundLiteralBase(const clang::CompoundLiteralExpr *literal);
+
+  /// Creates a backing byte array place for `literal`: an
+  /// `emitrust.variable` of `!emitrust.array<(len+1)xi8>` initialized with
+  /// the literal's bytes plus the terminating NUL (C string literals
+  /// always carry one, which is what terminates strlen-style walks).
+  /// Only ordinary literals whose bytes are ASCII are supported, the same
+  /// policy as `emitStringArrayInit` (design.md C99-28). A `const`-marked
+  /// backing (immutable `let`) is hoisted to the entry block when the
+  /// function contains labels; a mutable backing (`isConst` false, used
+  /// for per-call-site copies passed to slice parameters) is created at
+  /// the current insertion point, immediately before its single use.
+  FailureOr<Value> createLiteralBacking(const clang::StringLiteral *literal,
+                                        Location loc, bool isConst);
+
+  /// Returns the read-only backing byte array place of the string-literal
+  /// pointer region bound to `literal`, creating it on first need via
+  /// `createLiteralBacking` (immutable form). The created variable is
+  /// cached per literal for the current function, so every pointer of the
+  /// region shares one backing.
+  FailureOr<Value>
+  getOrCreateLiteralBacking(const clang::StringLiteral *literal,
+                            Location loc);
+
+  /// Lowers a value-position call to a definition-less `strlen`: the
+  /// argument's char region (a string-literal backing, a char array, or a
+  /// pointer into either — see `emitCharRegionArg`) is borrowed as a byte
+  /// slice from its cursor and passed through the `__emitrust_strlen`
+  /// helper (which counts bytes up to the first NUL, exactly C's strlen),
+  /// cast to the call's declared result type. Arguments outside a char
+  /// region are rejected with a located diagnostic.
+  FailureOr<Value> emitStrlenCall(const clang::CallExpr *call);
+
+  /// Resolves a hosted `<string.h>` argument to the (base, cursor, backing)
+  /// decomposition of the char region it designates. Three shapes are
+  /// accepted: a decayed string literal (its read-only backing is created
+  /// on first need, cursor 0), any pointer expression the decomposition
+  /// already handles (a decayed char array at cursor 0, `&arr[i]` at
+  /// cursor i, a walking pointer at its current cursor), and either shape
+  /// under the implicit pointer bitcasts that `void *` parameters
+  /// (memset/memcpy/memcmp) introduce, which are stripped. The address of
+  /// a scalar object (no cursor) is rejected with a located diagnostic.
+  FailureOr<PtrExprValue> emitCharRegionArg(const clang::Expr *expr);
+
+  /// Borrows the char region of a decomposed pointer as a byte slice from
+  /// its cursor: `emitrust.slice_of` of the region's place — the literal
+  /// backing, or the base object's own place — typed
+  /// `!emitrust.ref<!emitrust.slice<i8>>` (or `mut_ref` when `isMut`).
+  /// Rejects a mutable borrow of a read-only literal region and any base
+  /// whose place is not a char array (both located diagnostics); the
+  /// array's compile-time-known size is what makes every helper access
+  /// bounds-checked safe Rust.
+  FailureOr<Value> emitCharRegionSlice(Location loc,
+                                       const PtrExprValue &pointer,
+                                       bool isMut);
+
+  /// Records that the hosted `<string.h>` helper `name` must be emitted at
+  /// the end of the module (see `stringHelperSource`).
+  void requestStringHelper(llvm::StringRef name);
+
+  /// Lowers a statement-position `strcpy`/`strncpy`/`strcat` call (C name
+  /// in `name`; `hasCount` for strncpy) to the matching one-per-module
+  /// safe helper over `(&mut [i8], &[i8][, i64])`: destination and source
+  /// resolve through `emitCharRegionArg`/`emitCharRegionSlice`, and a
+  /// source region sharing the destination's base object would alias a
+  /// mutable borrow and is rejected. The helper copies bytes exactly as C
+  /// does (strcpy/strcat through the source NUL, strncpy NUL-padded to n).
+  LogicalResult emitStringCopyCall(const clang::CallExpr *call,
+                                   llvm::StringRef name, bool hasCount);
+
+  /// Lowers a statement-position `memset(s, c, n)` call to the
+  /// `__emitrust_memset` helper: the destination region as a mutable byte
+  /// slice from its cursor, the fill byte as i32, the count as i64.
+  LogicalResult emitMemsetCall(const clang::CallExpr *call);
+
+  /// Lowers a statement-position `memcpy(dst, src, n)` or
+  /// `memmove(dst, src, n)` call (C name in `name`, diagnostics only —
+  /// the lowering is shared and exact for both). Distinct base objects
+  /// (or a literal source) borrow two slices for the `__emitrust_memcpy`
+  /// helper — distinct char regions never overlap, so memmove's
+  /// overlap-safety is vacuous there; both arguments rooted in the same
+  /// base object would alias a mutable borrow, so that shape takes one
+  /// mutable borrow of the whole array plus both cursors through the
+  /// `__emitrust_memcpy_within` helper (`copy_within`, exactly memmove's
+  /// overlap-correct semantics, which also refine C's undefined
+  /// overlapping memcpy).
+  LogicalResult emitMemcpyCall(const clang::CallExpr *call,
+                               llvm::StringRef name);
+
+  /// Lowers a value-position call to a definition-less `atoi`: the
+  /// argument's char region is borrowed as a shared byte slice from its
+  /// cursor and parsed by the `__emitrust_atoi` helper with C's exact
+  /// semantics (skip isspace, one optional sign, decimal digits to the
+  /// first non-digit; no digits yields 0). Out-of-range values are C UB
+  /// (7.20.1p1), refined to deterministic i32 wrapping.
+  FailureOr<Value> emitAtoiCall(const clang::CallExpr *call);
+
+  /// Lowers a value-position call to a definition-less `abs` (i32) or
+  /// `labs` (i64, `isLong`) to `iN::wrapping_abs`. C leaves
+  /// abs(INT_MIN)/labs(LONG_MIN) undefined (7.20.6.1p2); wrapping_abs
+  /// refines that to the deterministic two's-complement result the
+  /// differential oracle's platform also produces.
+  FailureOr<Value> emitAbsCall(const clang::CallExpr *call, bool isLong);
+
+  /// Lowers a statement-position `exit(status)` call to
+  /// `std::process::exit(status as i32)`, matching C's process
+  /// termination and exit-status semantics (both truncate to the OS's
+  /// low byte on this target). Statement position only: exit returns
+  /// void in C, so no value use exists to represent.
+  LogicalResult emitExitCall(const clang::CallExpr *call);
+
+  /// Lowers a value-position `strcmp`/`strncmp`/`memcmp` call (C name in
+  /// `name`; `hasCount` for the n-limited forms) to the matching helper
+  /// over two shared byte slices, returning C's int result (the helpers
+  /// compare as unsigned char and return a sign-correct difference).
+  FailureOr<Value> emitStringCompareCall(const clang::CallExpr *call,
+                                         llvm::StringRef name, bool hasCount);
+
+  /// Returns the argument as a definition-less `strchr`/`strrchr` call
+  /// (setting `reverse` for strrchr), or null for every other expression.
+  const clang::CallExpr *asHostedStrchrCall(const clang::Expr *expr,
+                                            bool &reverse) const;
+
+  /// Lowers a `strchr`/`strrchr` call to its found byte index: the
+  /// searched region (returned through `region`) is borrowed as a shared
+  /// slice from its cursor and passed to the `__emitrust_strchr` /
+  /// `__emitrust_strrchr` helper, whose i64 result is the index relative
+  /// to that cursor, or -1 when the byte does not occur (C's NULL result).
+  FailureOr<Value> emitStrchrIndex(const clang::CallExpr *call, bool reverse,
+                                   PtrExprValue &region);
+
+  /// Emits `if`/`else` as a cf diamond: cond_br into then/else blocks that
+  /// fall through to a continuation block.
+  LogicalResult emitIfStmt(const clang::IfStmt *stmt);
+
+  /// Emits `while` as condition/body/exit blocks with a back edge.
+  LogicalResult emitWhileStmt(const clang::WhileStmt *stmt);
+
+  /// Emits `for` as init in the current block plus condition, body,
+  /// increment, and exit blocks; `continue` targets the increment block.
+  LogicalResult emitForStmt(const clang::ForStmt *stmt);
+
+  /// Emits `do`/`while` as body/condition/exit blocks: the body is entered
+  /// unconditionally, the condition block branches back to the body or to
+  /// the exit; `break` targets the exit and `continue` the condition block.
+  LogicalResult emitDoStmt(const clang::DoStmt *stmt);
+
+  /// Emits `switch`. A plain compound body (every case/default label at the
+  /// top level, nothing before the first label) takes the structured path:
+  /// a `cf.switch` over one block per top-level label position plus an exit
+  /// block, where consecutive labels share a block and a label section that
+  /// does not end in a terminator falls through to the next section with a
+  /// `cf.br`. Any other body shape (non-compound bodies, statements before
+  /// the first label, labels nested inside inner statements — Duff's
+  /// device) is delegated to `emitDispatchSwitch`. In both paths `break`
+  /// targets the exit block while `continue` still targets the enclosing
+  /// loop, and GNU case ranges are rejected.
+  LogicalResult emitSwitchStmt(const clang::SwitchStmt *stmt);
+
+  /// Fallback `switch` lowering for bodies the structured path cannot
+  /// shape: every case/default label of this switch (found via clang's
+  /// `SwitchStmt::getSwitchCaseList`, which covers labels buried inside
+  /// inner statements but not those of nested switches) becomes an
+  /// ordinary block, registered in `switchCaseBlocks`; the dispatch is one
+  /// `cf.switch` from the current block to those targets; and the body is
+  /// then emitted in source order starting in a fresh dead block, with the
+  /// `SwitchCase` case of `emitStmt` redirecting emission into each
+  /// label's block as the walk reaches it, so fall-through (including into
+  /// and around loop bodies, as in Duff's device) is plain block
+  /// fall-into. The possibly irreducible result is absorbed downstream by
+  /// lift-cf-to-scf, exactly like goto. Variable places emitted below the
+  /// dispatch are hoisted to the entry block (the dispatch may jump over
+  /// their declarations, exactly like goto over a declaration).
+  LogicalResult emitDispatchSwitch(const clang::SwitchStmt *stmt, Value flag,
+                                   IntegerType flagType, Location loc);
+
+  /// Emits `return`, then continues in a fresh (dead) block so trailing
+  /// statements still have an insertion point.
+  LogicalResult emitReturnStmt(const clang::ReturnStmt *stmt);
+
+  /// Emits an expression evaluated for its side effects only: assignments,
+  /// compound assignments, ++/--, calls (including printf), casts to void
+  /// (the operand's side effects run, the value is discarded, and a
+  /// side-effect-free operand emits nothing), and void-typed conditional
+  /// operators (see `emitVoidConditionalStmt`).
+  LogicalResult emitExprStmt(const clang::Expr *expr);
+
+  /// Emits a void-typed conditional operator in statement position as an
+  /// if/else: the condition selects which arm's side effects run, and no
+  /// value is materialized (there is none to materialize — `void` is not a
+  /// value type in the dialect).
+  LogicalResult
+  emitVoidConditionalStmt(const clang::ConditionalOperator *op);
+
+  /// Emits a simple assignment `lhs = rhs` to a memref cell or EmitRust
+  /// place.
+  LogicalResult emitAssign(const clang::BinaryOperator *op);
+
+  /// Emits a simple assignment and returns the assigned-to place, so that
+  /// value-position assignments (`y = (x = 1)`) can re-load the stored
+  /// value (C's value of an assignment is the post-assignment value).
+  FailureOr<Value> emitAssignToPlace(const clang::BinaryOperator *op);
+
+  /// Emits a compound assignment (`+=` etc.) as load, widen to the
+  /// computation type, arithmetic, narrow back, store (the widen/narrow
+  /// pair is a no-op when no operand promotion applies; see
+  /// `buildCompoundAssignValue`).
+  LogicalResult emitCompoundAssign(const clang::CompoundAssignOperator *op);
+
+  /// Emits a compound assignment and returns the assigned-to place, for
+  /// value-position uses (see `emitAssignToPlace`).
+  FailureOr<Value>
+  emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op);
+
+  /// Computes the value a compound assignment stores: widens the loaded
+  /// LHS `current` to Sema's computation type
+  /// (`CompoundAssignOperator::getComputationLHSType`), applies the
+  /// operator against the RHS (which Sema already converted to the
+  /// computation type, except shift amounts, which are normalized to the
+  /// shifted operand's width), and narrows the result back to the LHS's
+  /// storage type. Both conversions go through `convertScalarValue`, so
+  /// `char c; c += wider;` widens and narrows by C's conversion rules
+  /// (zero-extension from unsigned, sign-extension from signed, low-bits
+  /// truncation on narrowing).
+  FailureOr<Value>
+  buildCompoundAssignValue(Location loc,
+                           const clang::CompoundAssignOperator *op,
+                           Value current);
+
+  /// Converts a scalar `value` to `target` following C's conversion
+  /// rules: integer-to-integer via `castToIntType`, `arith`
+  /// extension/truncation between float widths, and integer/float
+  /// conversions that route through `emitrust.cast` whenever the integer
+  /// side is unsigned (mirroring the `CK_IntegralToFloating` and
+  /// `CK_FloatingToIntegral` lowerings). `_Bool` (`i1`) endpoints are
+  /// rejected: C converts to `_Bool` by comparison against zero, which
+  /// truncation would lower incorrectly.
+  FailureOr<Value> convertScalarValue(Location loc, Value value, Type target);
+
+  /// Emits statement-level `++x`/`x--` as load, add/sub 1, store; only
+  /// integer operands are supported.
+  LogicalResult emitIncDec(const clang::UnaryOperator *op);
+
+  /// Emits `++`/`--` in value position: performs the store like
+  /// `emitIncDec` and yields the expression's C value — the pre-value for
+  /// the postfix forms, the post-value for the prefix forms.
+  FailureOr<Value> emitIncDecValue(const clang::UnaryOperator *op);
+
+  /// Emits a call statement, dispatching printf to `emitPrintf` (and
+  /// definition-less puts/putchar to `emitPuts`/`emitPutchar`) and
+  /// discarding the result of ordinary calls.
+  LogicalResult emitCallStmt(const clang::CallExpr *call);
+
+  /// Lowers a printf call with a literal format string to
+  /// `emitrust.call_opaque "print!"` with a translated Rust format string
+  /// in the `args` attribute. The supported directive grammar is
+  /// `%[flags][width][.precision][length]conv` with all five C99 flags
+  /// (`-`, `0`, `+`, ` `, `#`), decimal width and precision, lengths
+  /// `l`/`ll` (i64/u64) and `h`/`hh` (the promoted argument reduced to
+  /// short/char range by an `as`-cast), and conversions d/i, u, x/X, o,
+  /// c (byte, via `__emitrust_fmt_c`), s (see `emitPrintfStringArg`),
+  /// f/F/e/E/g/G (f64), and %%. Directives that map 1:1 onto Rust format
+  /// specs use them (width/`-`/`0` on integers, width/`-` on c/s); every
+  /// other supported form routes through the on-demand `__emitrust_fmt_*`
+  /// helpers, which implement the C99 rendering rules exactly (integer
+  /// precision and sign/prefix placement, the f/e/g floating algorithms
+  /// including glibc's `%#g` rounding-carry quirk, space-padded
+  /// non-finite values) — all validated byte-exactly against glibc.
+  /// Undefined-by-C99 flag combinations (`%#d`, `%+u`, `%0c`, ...),
+  /// `*` width/precision, lengths `L`/`j`/`z`/`t`, and the conversions
+  /// a/A (hex float) and n keep located rejections. %p stays rejected by
+  /// design: pointer provenance is compiled away by the decomposition, so
+  /// no address exists to print. Integer arguments of a different width
+  /// or signedness than the conversion expects are `as`-cast, which
+  /// truncates to the low bits exactly like the x86-64 varargs read that C
+  /// performs.
+  LogicalResult emitPrintf(const clang::CallExpr *call);
+
+  /// Translates the C printf-family format string `literal` into a Rust
+  /// format string, consuming the directive arguments of `call` starting
+  /// at `firstArgIndex` and appending their lowered SSA values to
+  /// `operands` (one per Rust `{}` placeholder, in order). This is the
+  /// shared directive grammar of `emitPrintf` and `emitSprintf` (see
+  /// `emitPrintf` for the supported set); `*` width/precision, the
+  /// unsupported length modifiers, undefined flag combinations, and
+  /// unknown conversions keep their located rejections here so every
+  /// caller enforces the same subset. Fails if `call` supplies too few or
+  /// too many arguments for the directives.
+  FailureOr<std::string>
+  translatePrintfFormat(Location loc, const clang::CallExpr *call,
+                        const clang::StringLiteral *literal,
+                        unsigned firstArgIndex,
+                        SmallVectorImpl<Value> &operands);
+
+  /// Lowers a definition-less `sprintf(dest, fmt, ...)` call (CTS-P9,
+  /// 00186). The format must be an ordinary string literal and translates
+  /// through `translatePrintfFormat` into an
+  /// `emitrust.call_opaque "format!"` producing a String; the destination
+  /// is a char region borrowed mutably from its cursor (exactly like the
+  /// <string.h> copy helpers, so a string-literal-backed destination is
+  /// rejected), and both feed the one-per-module `__emitrust_sprintf`
+  /// helper, whose i32 result — the written length, excluding the NUL —
+  /// is C's sprintf return value. A destination too small for the bytes
+  /// plus the NUL terminator panics in the helper (C leaves the overflow
+  /// undefined; the deterministic panic is a legal refinement).
+  FailureOr<Value> emitSprintf(const clang::CallExpr *call);
+
+  /// Lowers a `%s` printf argument. Four shapes are supported: a string
+  /// literal (after array-to-pointer decay), lowered to an
+  /// `emitrust.literal` holding a `&'static str` (printable-ASCII bytes
+  /// plus \n/\t/\r only; embedded NUL and non-ASCII bytes are rejected);
+  /// a char-array lvalue, lowered to an `emitrust.slice_of` of the
+  /// whole array passed through the `__emitrust_cstr` helper, which stops
+  /// at the first NUL like C; a `char *` pointer into a string-literal
+  /// region, lowered to an `emitrust.slice_of` of the region's read-only
+  /// backing from the pointer's cursor through the same helper; and a
+  /// slice-classified `char *` parameter (FR-28, CTS-L2), lowered to an
+  /// `emitrust.slice_of` of the parameter's deref'd slice base place from
+  /// its cursor through the same helper. A `%.Ns` precision caps the
+  /// printed bytes at N like C: a literal is truncated at import time
+  /// (only the retained prefix is validated), the slice shapes route
+  /// through `__emitrust_cstr_n`, which stops at N bytes or the first
+  /// NUL, whichever comes first.
+  FailureOr<Value>
+  emitPrintfStringArg(const clang::Expr *expr,
+                      std::optional<unsigned> precision = std::nullopt);
+
+  /// Wraps an integer value for a `%c` directive: casts it to i32 and
+  /// routes it through the `__emitrust_fmt_c` helper (C converts the
+  /// argument to unsigned char and prints that byte; the helper matches C
+  /// byte-for-byte for ASCII values, see design.md C99-48).
+  Value wrapCharFormat(Location loc, Value value);
+
+  /// Lowers a statement-position `puts(s)` call to
+  /// `emitrust.call_opaque "println!"` using the `%s` machinery
+  /// (`emitPrintfStringArg`). Only called when `puts` has no user
+  /// definition.
+  LogicalResult emitPuts(const clang::CallExpr *call);
+
+  /// Lowers a statement-position `putchar(c)` call to
+  /// `emitrust.call_opaque "print!"` of the argument routed through
+  /// `__emitrust_fmt_c`. Only called when `putchar` has no user
+  /// definition.
+  LogicalResult emitPutchar(const clang::CallExpr *call);
+
+  /// Maps a hosted `<math.h>` function name to the safe Rust callable it
+  /// lowers to (design.md C99-48): the IEEE-exact fabs/sqrt/floor/ceil
+  /// onto the matching f64 methods, plus the differentially pinned
+  /// `sin` -> `f64::sin`. Returns std::nullopt for every other name,
+  /// which keeps the located rejections in `emitCall` (a curated
+  /// non-bit-exact diagnostic for exp/log/pow, the system-header
+  /// rejection otherwise).
+  static std::optional<llvm::StringRef>
+  hostedMathCallee(llvm::StringRef name);
+
+  /// Lowers a call to a definition-less hosted `<math.h>` function with
+  /// C's standard `double f(double)` prototype to
+  /// `emitrust.call_opaque "<rustCallee>"` of the f64 argument (e.g.
+  /// `sin(x)` -> `f64::sin(vX)`). Only called when `hostedMathCallee`
+  /// recognized the name and the prototype matched; clang has already
+  /// inserted the usual argument conversion to double, so the operand is
+  /// f64 by construction (checked defensively).
+  FailureOr<Value> emitHostedMathCall(const clang::CallExpr *call,
+                                      llvm::StringRef rustCallee);
+
+  //===--------------------------------------------------------------------===//
+  // Hosted <stdio.h> FILE* streams (design.md C99-48, CTS-T1.3, 00187)
+  //===--------------------------------------------------------------------===//
+  //
+  // A `FILE *` local is an OWNED handle over std::fs, held in an
+  // `emitrust.variable` of the opaque `__EmitrustFile` type (an enum over
+  // Null / Read(File) / Write(File), emitted once per module). fopen with
+  // a literal path and mode "r"/"w" produces the handle, every stream
+  // operation borrows it `&mut` through a `__emitrust_f*` helper call, and
+  // fclose resets it to Null so the same variable can be reopened (the
+  // serial-reuse shape of 00187). The supported surface is sequential
+  // byte-wise I/O only: fgetc/getc (i32 byte or -1), byte-wise
+  // fread/fwrite (element size 1), fgets, and the NULL truth test of a
+  // handle. File positioning, other fopen modes, fprintf to a real
+  // stream, wide fread/fwrite elements, and any FILE* escaping its
+  // function (parameter, return, struct member, global, array) keep
+  // located rejections. fopen failure takes C's NULL path; read/write
+  // errors beyond EOF panic in the helpers (C UB, refined
+  // deterministically).
+
+  /// Returns the opaque `__EmitrustFile` handle type.
+  emitrust::OpaqueType fileHandleType();
+
+  /// Requests the one-per-module emission of a `kFileHelpers` entry (and
+  /// the `__EmitrustFile` enum definition every helper needs; fread and
+  /// fgets additionally pull in the fgetc primitive they call).
+  void requestFileHelper(llvm::StringRef name);
+
+  /// Emits a `FILE *` local as an owned-handle `emitrust.variable` place
+  /// (registered in `fileLocals`), lowering an `= fopen(...)` initializer
+  /// through `emitFileOpenInto`.
+  LogicalResult emitFileLocal(const clang::VarDecl *var, Location loc);
+
+  /// Lowers `place = fopen(path, mode)`: the path must be an ordinary
+  /// ASCII string literal (literal-only, v1) and the mode literal must be
+  /// exactly "r" or "w"; the matching `__emitrust_fopen_r`/`_w` helper
+  /// call produces the handle assigned into `place` (Null on failure —
+  /// C's NULL path). Any other right-hand side is rejected.
+  LogicalResult emitFileOpenInto(Value place, const clang::Expr *init);
+
+  /// Borrows the FILE* handle argument `expr` (a function-local handle
+  /// variable) as `&mut __EmitrustFile` (or `&` when `isMut` is false)
+  /// for a helper call; anything but a tracked handle local is rejected.
+  FailureOr<Value> emitFileHandleArg(const clang::Expr *expr, bool isMut);
+
+  /// Lowers `fgetc(f)` / `getc(f)` to `__emitrust_fgetc(&mut f)`: the
+  /// byte as i32, or -1 — C's EOF, which the surrounding `!= EOF`
+  /// comparison meets as an ordinary `arith.constant -1 : i32`.
+  FailureOr<Value> emitFileGetc(const clang::CallExpr *call);
+
+  /// Lowers byte-wise `fread(ptr, 1, n, f)` / `fwrite(ptr, 1, n, f)` to
+  /// the matching helper over a char-region slice of `ptr` and an i64
+  /// count; the helper's i64 result (the byte count) is converted to the
+  /// call's C size_t result type like `emitStrlenCall`. An element size
+  /// other than the constant 1 is a located rejection (byte-wise only).
+  FailureOr<Value> emitFileReadWrite(const clang::CallExpr *call,
+                                     bool isWrite);
+
+  /// Lowers `fgets(buf, size, f)` to `__emitrust_fgets`, whose i64 result
+  /// is -1 for C's NULL return (end of file with nothing read) and the
+  /// stored byte count otherwise. `emitComparison`/`emitCondition`
+  /// consume the result as `!= -1` (the strchr convention), so the
+  /// pinned `while (fgets(...) != NULL)` shape and the bare truth test
+  /// both work; any other use of the char* result is rejected.
+  FailureOr<Value> emitFileGetsIndex(const clang::CallExpr *call);
+
+  /// Returns `expr` as a definition-less hosted `fgets` call, or null.
+  const clang::CallExpr *asHostedFgetsCall(const clang::Expr *expr) const;
+
+  /// Lowers a statement-position `fclose(f)` to `__emitrust_fclose(&mut
+  /// f)`, which drops the handle (closing the file) and leaves the
+  /// variable Null for serial reopening.
+  LogicalResult emitFileClose(const clang::CallExpr *call);
+
+  /// Emits the truth value of a FILE*-typed expression: a handle
+  /// variable's NULL test routes through `__emitrust_file_ok(&f)` (the
+  /// `if (!f)` shape), and an fgets call tests its index against -1.
+  FailureOr<Value> emitFileTruth(const clang::Expr *expr);
+
+  //===--------------------------------------------------------------------===//
+  // Expressions
+  //===--------------------------------------------------------------------===//
+
+  /// Emits an expression as an SSA value (an "rvalue"). Comparison and
+  /// logical results are widened from i1 to their C `int` type here;
+  /// `emitCondition` is the narrow-i1 entry point used by control flow.
+  FailureOr<Value> emitRValue(const clang::Expr *expr);
+
+  /// Emits an implicit or explicit cast; supports lvalue-to-rvalue loads
+  /// and the numeric conversion kinds of the subset.
+  FailureOr<Value> emitCast(const clang::CastExpr *cast);
+
+  /// Emits a binary operator as an rvalue, including value-position
+  /// assignments, compound assignments, and the comma operator.
+  FailureOr<Value> emitBinaryRValue(const clang::BinaryOperator *op);
+
+  /// Emits the conditional operator `cond ? a : b` with short-circuit
+  /// evaluation: only the selected arm's side effects run. The result
+  /// flows through a rank-0 memref cell (promoted later by `--mem2reg`)
+  /// for memref-legal scalar types and through an `emitrust.variable`
+  /// place for unsigned integers; both arms must map to the same scalar
+  /// type or the operator is rejected. A compile-time-constant,
+  /// side-effect-free condition elides the dead arm BEFORE lowering (so a
+  /// dead arm may contain otherwise-unimportable constructs); a
+  /// goto-targeted label or a case/default label in the dead arm keeps
+  /// the full lowering instead — the constant branch leaves the arm
+  /// dynamically dead while its labels stay registered.
+  FailureOr<Value>
+  emitConditionalOperator(const clang::ConditionalOperator *op);
+
+  /// Emits a GNU statement expression `({ ... })` in value position: the
+  /// body statements lower FLATTENED into the enclosing function (never as
+  /// a region op, so labels inside register with the ordinary
+  /// labelBlocks/goto dispatch), and the final expression statement's
+  /// value transits a synthesized temp cell that the surrounding
+  /// expression reads. A `goto` targeting a label outside the statement
+  /// expression would abandon the value mid-evaluation and is a located
+  /// rejection (design.md CTS-S).
+  FailureOr<Value> emitStmtExpr(const clang::StmtExpr *expr);
+
+  /// Emits an rvalue of an integer-carrier pointer expression (CTS-P3) as
+  /// its plain i64 value: a null constant is the i64 zero, an
+  /// integer-to-pointer cast converts its integer operand to i64, a read
+  /// of a carrier local/parameter loads its cell, and a call to a
+  /// carrier-returning function yields its i64 result directly. Any other
+  /// shape is a located rejection.
+  FailureOr<Value> emitCarrierValue(const clang::Expr *expr);
+
+  /// Returns the i64 cell of the integer-carrier pointer local or
+  /// parameter a (possibly lvalue-to-rvalue-wrapped) reference `expr`
+  /// names, or a null Value when `expr` is not such a reference.
+  Value lookupCarrierCell(const clang::Expr *expr);
+
+  /// Constant-folds `sizeof`/`_Alignof` (on a type or an expression) into
+  /// an integer constant of the mapped `size_t` type using clang's target
+  /// layout. The operand of `sizeof` is unevaluated in C (side effects do
+  /// not run), which the fold preserves; variable-length array operands,
+  /// whose size is not a constant, are rejected.
+  FailureOr<Value>
+  emitSizeofAlignof(const clang::UnaryExprOrTypeTraitExpr *expr);
+
+  /// Emits a unary operator (+, -, !, &, statement-level ++/-- excluded)
+  /// as an rvalue.
+  FailureOr<Value> emitUnaryRValue(const clang::UnaryOperator *op);
+
+  /// Emits a comparison as an i1 value: `arith.cmpi` (signed) on signless
+  /// integers, `emitrust.cmp` (type-directed in Rust, hence unsigned) on
+  /// unsigned integers, `arith.cmpf` (ordered, `une` for !=) on floats.
+  FailureOr<Value> emitComparison(const clang::BinaryOperator *op);
+
+  /// Emits an expression as an i1 truth value following C semantics:
+  /// comparisons directly, `&&`/`||` with short-circuit blocks, `!` by
+  /// inversion, and any integer/float value compared against zero.
+  FailureOr<Value> emitCondition(const clang::Expr *expr);
+
+  /// Emits `&&`/`||` with short-circuit evaluation through a rank-0 i1
+  /// memref cell and a conditional branch; `--mem2reg` later promotes the
+  /// cell.
+  FailureOr<Value> emitShortCircuit(const clang::BinaryOperator *op);
+
+  /// Emits a call expression; returns a null `Value` for void results.
+  /// printf reaching this path (i.e. with its result used) is rejected;
+  /// a definition-less sprintf routes to `emitSprintf`. A call to a
+  /// fixed-prototype variadic definition (va_list-free body, CTS-P9)
+  /// passes only the named arguments: the trailing extras are dropped
+  /// without being imported (no loads, no borrows), and an extra whose
+  /// evaluation has side effects is rejected rather than silently lost.
+  /// Every value argument is materialized before any borrow-producing
+  /// argument (C's evaluation order is unspecified; this keeps loads out of
+  /// the borrow/call window), and two borrow arguments resolving to the
+  /// same region base are rejected as aliasing mutable borrows.
+  /// Calls without a direct callee are routed to `emitIndirectCall`.
+  FailureOr<Value> emitCall(const clang::CallExpr *call);
+
+  /// Emits a call to a method-planned function (Phase 4). Every argument
+  /// is a plain value — a pointer argument lowers to its i64 element cursor
+  /// (a constant for `&arr[i]` and decayed arrays, the loaded cursor for
+  /// walking pointers) — so the receiver borrow (`addr_of mut` of the owner
+  /// place: the owner struct variable in the owning function, or the
+  /// dereferenced receiver in a sibling method) is the only reference and
+  /// is materialized last, immediately before the call. The `func.call` is
+  /// tagged `emitrust.method_call` for the conversion-layer rewrite into an
+  /// `emitrust.method_call` place expression.
+  FailureOr<Value> emitMethodCallSite(const clang::CallExpr *call,
+                                      func::FuncOp target,
+                                      const clang::VarDecl *ownerBase,
+                                      Location loc);
+
+  /// Lowers one borrow-producing call argument against the reference-typed
+  /// target parameter `paramType`. A slice parameter receives an
+  /// `emitrust.slice_of` of the argument's region base at the argument's
+  /// cursor (a decayed array passes cursor 0; reslicing through another
+  /// slice parameter composes); a scalar-reference parameter receives an
+  /// `emitrust.addr_of` of the designated element, or of the named place
+  /// for plain address-of arguments that involve no decomposed pointer.
+  /// `root` receives the argument's region base declaration when one is
+  /// statically known (feeding the aliasing rejection in `emitCall`).
+  FailureOr<Value> emitBorrowArgument(Location loc,
+                                      const clang::Expr *argument,
+                                      Type paramType,
+                                      const clang::VarDecl *&root);
+
+  /// Returns whether any declaration reference below `stmt` names a
+  /// decomposed pointer (a pointer local or slice parameter registered in
+  /// `pointerLocals`), in which case a borrow-producing call argument must
+  /// be lowered through the pointer decomposition.
+  bool involvesDecomposedPointer(const clang::Stmt *stmt) const;
+
+  /// Emits a call through a function pointer (`fp(...)`, `(*fp)(...)`,
+  /// `v.op(...)`) as an `emitrust.call_indirect`: the callee expression is
+  /// evaluated to its `!emitrust.fn_ptr` value (a deref of a function
+  /// pointer cancels against the implicit decay) and the argument and
+  /// result types are checked against the pointer's signature exactly like
+  /// a direct call. Calls with arguments through a prototype-less K&R
+  /// pointer are rejected: there is no signature to check them against.
+  FailureOr<Value> emitIndirectCall(const clang::CallExpr *call);
+
+  /// Resolves a function reference used as a function pointer value: the
+  /// expression must be a direct reference to an imported, non-variadic
+  /// function whose signature equals `fnPtrType` (functions with
+  /// data-pointer parameters can never match). Returns the function's MLIR
+  /// symbol name (`c_main` and per-TU static mangling included); every
+  /// violation is a located rejection.
+  FailureOr<std::string>
+  resolveFunctionPointerTarget(const clang::Expr *expr,
+                               emitrust::FnPtrType fnPtrType, Location loc);
+
+  /// The declaration-level half of `resolveFunctionPointerTarget`: checks
+  /// that `callee` is an imported, non-variadic function whose MLIR
+  /// signature equals `fnPtrType` and returns its MLIR symbol name. Used
+  /// directly by the constant-initializer path (`convertAPValueInit`),
+  /// where clang's evaluator yields the target declaration rather than an
+  /// expression.
+  FailureOr<std::string>
+  resolveFunctionPointerDecl(const clang::FunctionDecl *callee,
+                             emitrust::FnPtrType fnPtrType, Location loc);
+
+  /// Emits `f` (function-to-pointer decay) or `&f` as an
+  /// `emitrust.constant` with an opaque `Some(<symbol>)` payload of the
+  /// `!emitrust.fn_ptr` type mapped from the C pointer type `pointerType`.
+  FailureOr<Value> emitFunctionPointerConstant(const clang::Expr *fnExpr,
+                                               clang::QualType pointerType,
+                                               Location loc);
+
+  /// Decl-level overload for an already-known MLIR signature: emits the
+  /// opaque `Some(<symbol>)` constant at exactly `fnPtrType` after the
+  /// `resolveFunctionPointerDecl` signature check. Used by
+  /// `emitPositionedRValue`, where the destination's (possibly
+  /// callsite-inferred, FR-29 / CTS 00209) fn_ptr type — not the source
+  /// expression's spelled C type — is the binding contract.
+  FailureOr<Value>
+  emitFunctionPointerConstant(const clang::FunctionDecl *target,
+                              emitrust::FnPtrType fnPtrType, Location loc);
+
+  /// Creates an `emitrust.constant` with an opaque `None` payload of the
+  /// given `!emitrust.fn_ptr` type (the C null function pointer).
+  Value createFnPtrNone(Location loc, Type fnPtrType);
+
+  /// Emits a reference to an enumerator: for a complete named enum, an
+  /// `emitrust.constant` with an opaque `Name::Variant` payload typed
+  /// `!emitrust.enum<"Name">` (importing the enum definition on the way);
+  /// for an anonymous enum, a plain `i32` constant.
+  FailureOr<Value> emitEnumConstant(const clang::EnumConstantDecl *enumerator,
+                                    Location loc);
+
+  /// Emits an operand classified by `classifyEnumOperand` as an SSA value
+  /// of the `!emitrust.enum` type.
+  FailureOr<Value> emitEnumOperand(const EnumOperand &operand, Location loc);
+
+  /// Builds an `emitrust.cast` from an `!emitrust.enum` value to i32 (the
+  /// representation type of every imported enum).
+  Value castEnumToI32(Location loc, Value value);
+
+  /// Emits a pointer-typed expression in the decomposed representation:
+  /// reads of pointer locals load their cursor cell, `&x` yields the
+  /// degenerate (cursor-less) form, `&arr[i]` and array decay yield the
+  /// base with an i64 cursor, a decayed string literal yields its
+  /// read-only backing array at cursor 0, `p +- n` is cursor arithmetic,
+  /// and the `++`/`--` value forms update the cursor cell and yield the
+  /// pre- or post-value per C semantics. A cursor into a multi-dimensional
+  /// array counts innermost (scalar or struct) elements in row-major
+  /// order, so `&arr[i][j]` on `T arr[M][N]` yields the flat cursor
+  /// `i*N + j`. A pointer of a nullable region carries its
+  /// Option-of-cursor discriminant (the loaded i1 flag) in the result's
+  /// `nonNull` field. Null pointer constants (whose modeled consumers —
+  /// pointer assignment, null comparison, truth test — intercept them
+  /// before this point), globals, arithmetic on pointers to arrays
+  /// (rows), and every other pointer source are located rejections.
+  FailureOr<PtrExprValue> emitPointerRValue(const clang::Expr *expr);
+
+  /// Returns whether `expr` is a C null pointer constant (`NULL`, `0`,
+  /// `(void*)0` in a pointer context).
+  bool isNullPointerConstantExpr(const clang::Expr *expr) const;
+
+  /// Emits the truth value of a data-pointer expression (`if (p)`, `!p`):
+  /// the Option-of-cursor discriminant of a pointer in a nullable region,
+  /// or constant true for a statically non-null pointer (every address a
+  /// decomposed region holds designates a live object).
+  FailureOr<Value> emitPointerTruth(const clang::Expr *expr);
+
+  /// Emits the (base, flat cursor) decomposition of one array subscript
+  /// level `base[idx]` whose base is itself a decomposed pointer
+  /// expression (a pointer read, an array decay, or a decayed inner
+  /// subscript). The index is scaled by the flat element count of the
+  /// subscript's result type, so subscripting a row of a
+  /// multi-dimensional array advances the cursor by whole rows.
+  FailureOr<PtrExprValue>
+  emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript);
+
+  /// Materializes the place a decomposed pointer designates: the base
+  /// object's own place for a degenerate pointer, or a chain of
+  /// `emitrust.subscript(base, cursor)` refinements for a pointer into an
+  /// array. `pointeeType` is the mapped value type the resulting place
+  /// must wrap; a flat cursor into a multi-dimensional array peels one
+  /// array level per subscript, dividing the cursor by the level's flat
+  /// element count and continuing with the remainder (row-major order).
+  /// A possibly-null pointer (`pointer.nonNull` set) first emits a
+  /// deterministic panic guard, `assert!(flag, "null pointer
+  /// dereference")`: C dereferencing null is undefined behavior, so the
+  /// panic is a legal refinement (the fn_ptr `expect` precedent). A
+  /// pointer with no base at all (only ever null) is a located rejection.
+  /// A global region base (a global object, or a pointer global's
+  /// synthesized backing) stages the global's whole value in a local
+  /// copy exactly like a direct global element access; a write context
+  /// passes `writeback` to capture the pending store-back, which the
+  /// caller must commit through `commitGlobalWriteback` (refresh, mutate,
+  /// flush) after evaluating the rest of the statement.
+  FailureOr<Value> emitPointerPlace(Location loc,
+                                    const PtrExprValue &pointer,
+                                    Type pointeeType,
+                                    GlobalWriteback *writeback = nullptr);
+
+  /// Emits `p - q` on two decomposed pointers into the same object as the
+  /// plain i64 cursor difference (C's ptrdiff_t is `long`, i.e. i64, on
+  /// the supported targets); pointers into different objects and
+  /// possibly-null pointers are rejected.
+  FailureOr<Value> emitPointerDifference(const clang::BinaryOperator *op);
+
+  /// Returns whether the pointer-typed expression `expr` is handled by the
+  /// Phase-1a decomposition (pointer locals, address-of, decay, pointer
+  /// arithmetic) rather than by the untouched pointer-parameter reference
+  /// path (a direct read of a `mut_ref`/`ref`-typed parameter).
+  bool isDecomposedPointerExpr(const clang::Expr *expr) const;
+
+  /// Returns whether `expr` (through decomposition-transparent cast peels)
+  /// reads a pointer local whose region is statically null (CTS-P9): a
+  /// base-less nullable region — one that only ever unites null constants
+  /// and other null-only pointers. Such a pointer carries zero runtime
+  /// state; its truth tests and null comparisons fold to constants and a
+  /// pointer-to-int cast of it folds to 0.
+  bool isStaticallyNullPointerExpr(const clang::Expr *expr);
+
+  /// One classification of `expr` as a dereference view over a decomposed
+  /// pointer, computed with a single reinterpreting-cast peel
+  /// (`stripObjectPointerCasts`) shared by every consumer. `deref` is null
+  /// when `expr` is not a dereference of a decomposed pointer at all.
+  /// `reinterpreted` reports a pointee-changing peel (`*(T *)p` on a
+  /// `void *` cursor, CTS-P9, or a direct pun cast, CTS-P11): the deref
+  /// emission resolves such a place at the region's base element type,
+  /// and when the viewed type is a same-width integer view over that
+  /// element the load and store sites wrap the accessed value in an
+  /// `emitrust.cast` bitcast (see `emitCast`'s `CK_LValueToRValue` case
+  /// and `emitAssignToPlace`). `wideByte` additionally reports the
+  /// byte-pun shape — a WIDER integer view (sizeof(T) in {2, 4, 8}) over
+  /// a byte region — which widens to a `T::from_ne_bytes`/`to_ne_bytes`
+  /// access instead of the same-width reinterpret path (wider views over
+  /// non-byte bases keep the reinterpret rejection family).
+  struct ByteViewDeref {
+    /// The dereference `*p`; null when `expr` matches no decomposed
+    /// pointer deref (every flag is then false).
+    const clang::UnaryOperator *deref = nullptr;
+    /// The pointer expression with the reinterpreting casts peeled once.
+    const clang::Expr *strippedPointer = nullptr;
+    /// The peel changed the pointee: a reinterpreted view (CTS-P9/P11).
+    bool reinterpreted = false;
+    /// The wider-integer-view-over-a-byte-region pun shape (CTS-P11).
+    bool wideByte = false;
+  };
+
+  /// Classifies `expr` (see `ByteViewDeref`): the one entry point for
+  /// reinterpreted-view and wide-byte-view dispatch, peeling the
+  /// reinterpreting casts exactly once per query.
+  ByteViewDeref classifyByteViewDeref(const clang::Expr *expr);
+
+  /// Returns the C element type at the bottom of `pointer`'s region: the
+  /// member's declared type for a `&struct.member` base, the pointee for a
+  /// slice-parameter base, the array level matching `viewed` (falling back
+  /// to the innermost element) for an array base, `char` for a
+  /// string-literal region, and nothing for a base-less (statically null)
+  /// region. Used to type-check a reinterpret-back site `*(T *)p` against
+  /// the region (CTS-P9).
+  std::optional<clang::QualType>
+  regionElementType(const PtrExprValue &pointer, clang::QualType viewed);
+
+  //===--------------------------------------------------------------------===//
+  // Byte puns over i8 regions (CTS-P11)
+  //===--------------------------------------------------------------------===//
+
+  /// Statically resolves the region element C type of a pointer
+  /// expression from the AST alone (decayed arrays, tracked pointer
+  /// locals, global data pointers, and +/- arithmetic peel through), or
+  /// nothing when no single element type is known. Side-effect-free
+  /// companion of `regionElementType` for use before any emission.
+  std::optional<clang::QualType>
+  pointerElementTypeFromAST(const clang::Expr *expr) const;
+
+  /// The resolved target of one wide byte access: the byte-array place
+  /// (a local array, a string-literal backing, or a staged global copy),
+  /// the i64 byte cursor, and the access width.
+  struct WideByteAccess {
+    /// The `!emitrust.lvalue<!emitrust.array<Nxi8>>` byte-run place.
+    Value basePlace;
+    /// The i64 cursor of the access's first byte.
+    Value cursor;
+    /// The mapped integer type of the viewed access (e.g. ui32).
+    IntegerType valueType;
+    /// sizeof(T) of the viewed type, in bytes.
+    unsigned byteWidth;
+  };
+
+  /// Resolves the wide byte access a `wideByte` classification `view`
+  /// designates: decomposes the (already peeled) pointer, resolves its
+  /// byte-array base place (staging a global base's whole value like
+  /// every other global element access; a write context passes
+  /// `writeback` for the store-back), and rejects — with the located
+  /// `runs past the end` diagnostic — a compile-time-constant offset
+  /// whose widened window overruns the array.
+  FailureOr<WideByteAccess> resolveWideByteAccess(const ByteViewDeref &view,
+                                                  Location loc,
+                                                  GlobalWriteback *writeback);
+
+  /// Emits the widened load: the `byteWidth` bytes at the cursor are
+  /// gathered (as u8) into a byte-array temporary and combined with
+  /// `T::from_ne_bytes`.
+  FailureOr<Value> emitWideByteLoad(const WideByteAccess &access,
+                                    Location loc);
+
+  /// Emits the widened store: `value` is split with `T::to_ne_bytes` and
+  /// the bytes are stored back (as i8) at the cursor.
+  LogicalResult emitWideByteStore(const WideByteAccess &access, Value value,
+                                  Location loc);
+
+  /// Emits an expression as an assignable place: either a rank-0 memref
+  /// value (scalar locals) or an `!emitrust.lvalue` value (aggregates,
+  /// dereferences, fields, elements). A reference to an imported global
+  /// stages the global's whole value in a local copy; when `writeback` is
+  /// non-null (write context) it captures the pending store-back of that
+  /// copy, which the caller must commit through `commitGlobalWriteback`
+  /// (refresh, mutate, flush) after evaluating the rest of the statement.
+  FailureOr<Value> emitLValue(const clang::Expr *expr,
+                              GlobalWriteback *writeback = nullptr);
+
+  /// `emitLValue`'s declaration-reference branch: an imported global
+  /// stages its whole value (recording the store-back in `writeback`), a
+  /// devirtualized function-pointer alias materializes its `Some(target)`
+  /// constant, a registered declaration yields its place, and pointer
+  /// variables/parameters used as places keep their located rejections.
+  FailureOr<Value> emitDeclRefLValue(const clang::DeclRefExpr *ref,
+                                     Location loc, GlobalWriteback *writeback);
+
+  /// `emitLValue`'s member-access branch: resolves the base place (an
+  /// erased global-return call, a decomposed `p->f`, a reference-typed
+  /// `->`, or a recursive lvalue) and selects the flattened field on it
+  /// (anonymous members designate the parent place itself). Bit-field
+  /// members have no place of their own (their storage is a window of a
+  /// synthesized backing field) and are rejected here; supported
+  /// bit-field traffic routes through `emitBitFieldRead` and
+  /// `emitBitFieldAssign` before any lvalue is formed.
+  FailureOr<Value> emitMemberLValue(const clang::MemberExpr *member,
+                                    Location loc, GlobalWriteback *writeback);
+
+  /// Resolves the place of `member`'s base aggregate — the shared front
+  /// half of `emitMemberLValue`, also used by the bit-field accessors:
+  /// an erased global-return call base, a decomposed `p->f`, a
+  /// reference-typed `->` (dereferenced once), or a recursive lvalue.
+  /// The result is an `!emitrust.lvalue` of a struct type.
+  FailureOr<Value> emitMemberBasePlace(const clang::MemberExpr *member,
+                                       Location loc,
+                                       GlobalWriteback *writeback);
+
+  /// Emits the C99-45 bit-field READ accessor for `member` (whose field
+  /// must have an entry in `bitFieldAccessInfo`): load the backing
+  /// field, `emitrust.shr` by the field's bit offset (always emitted,
+  /// offset 0 included), `emitrust.and` with the width mask, then
+  /// convert the masked backing-typed value to the member's mapped type
+  /// via `convertBitFieldFieldValue`.
+  FailureOr<Value> emitBitFieldRead(const clang::MemberExpr *member,
+                                    Location loc);
+
+  /// Emits the C99-45 bit-field WRITE accessor `member = rhs` as a
+  /// read-modify-write on the backing field: load, `emitrust.and` with
+  /// the complement mask (clearing the field's window), cast the RHS to
+  /// the backing type (from an enum type when the RHS is enum-typed),
+  /// `emitrust.and` with the width mask (the truncation is always its
+  /// own step), `emitrust.shl` by the bit offset (always emitted),
+  /// `emitrust.or` into the cleared word, `emitrust.assign` the backing
+  /// field. A global base commits through the ordinary staged-copy
+  /// writeback (`refreshStaged` mirrors `assignStalenessRisk`). With
+  /// `wantValue` the truncated field value converts to the member's
+  /// mapped type (C's value of an assignment is the post-store field
+  /// value) and is staged in a fresh place, which is returned; otherwise
+  /// the returned value is null.
+  FailureOr<Value> emitBitFieldAssign(const clang::MemberExpr *member,
+                                      const clang::Expr *rhs, Location loc,
+                                      bool refreshStaged, bool wantValue);
+
+  /// Converts `masked` — a bit-field's value bits, right-aligned in its
+  /// unsigned backing type — to the member's mapped type: enum-typed
+  /// fields cast (zero-extending from the unsigned source) to the enum
+  /// type, `_Bool` fields compare against zero, unsigned fields
+  /// zero-extend with `emitrust.cast`, and plain-int signed fields cast
+  /// to the mapped signed type and sign-extend from their declared width
+  /// via `arith.shli`/`arith.shrsi` by (type width - field width).
+  FailureOr<Value> convertBitFieldFieldValue(Location loc, Value masked,
+                                             const clang::FieldDecl *field);
+
+  /// Builds the unsigned mask constant of a bit-field window, typed as
+  /// the backing type: the width mask (`width` low bits set, used after
+  /// the read shift and for the write truncation) or, with `complement`,
+  /// its inverse shifted onto the window (`~(widthMask << offset)`, used
+  /// to clear the window in the write's read-modify-write).
+  Value createBitFieldMask(Location loc, IntegerType backingType,
+                           unsigned width, unsigned offset, bool complement);
+
+  /// `emitLValue`'s subscript branch: an array base subscripts its
+  /// element place; a pointer base decomposes into (base, cursor) and
+  /// resolves through `emitPointerPlace`.
+  FailureOr<Value>
+  emitSubscriptLValue(const clang::ArraySubscriptExpr *subscript, Location loc,
+                      GlobalWriteback *writeback);
+
+  /// `emitLValue`'s dereference branch: a decomposed pointer resolves to
+  /// a place on its base object (type-checking a reinterpret-back view
+  /// against the region's element type), a reference-typed pointer
+  /// dereferences directly.
+  FailureOr<Value> emitDerefLValue(const clang::UnaryOperator *unary,
+                                   Location loc, GlobalWriteback *writeback);
+
+  /// Reads the current value of a place produced by `emitLValue`.
+  Value loadPlace(Location loc, Value place);
+
+  /// Writes `value` to a place produced by `emitLValue`; fails on type
+  /// mismatch.
+  LogicalResult storeToPlace(Location loc, Value place, Value value);
+
+  /// Widens an i1 truth value to the mapped MLIR type of the C expression
+  /// type `type` (typically `int`); returns the value unchanged when the C
+  /// type is `_Bool`.
+  FailureOr<Value> extendBool(Location loc, Value flag, clang::QualType type);
+
+  /// Builds the op for a C arithmetic, bitwise, or shift binary operator
+  /// on two values of the same integer or float type: arith ops for floats
+  /// and signless integers, `emitrust.add`/`sub`/`mul`/`div`/`rem` and
+  /// `emitrust.and`/`or`/`xor`/`shl`/`shr` for unsigned integers (arith
+  /// requires signless operands; the Rust infix operators are
+  /// type-directed and hence unsigned).
+  FailureOr<Value> buildBinaryArith(Location loc,
+                                    clang::BinaryOperatorKind opcode,
+                                    Value lhs, Value rhs);
+
+  /// Converts an integer `value` to integer type `target`: a no-op on
+  /// matching types, `arith` extension/truncation between signless types,
+  /// and an `emitrust.cast` (Rust `as`, which matches C's integer
+  /// conversion semantics) when either side is unsigned. Used to normalize
+  /// a shift amount to the width of the shifted operand.
+  Value castToIntType(Location loc, Value value, IntegerType target);
+
+
+  //===--------------------------------------------------------------------===//
+  // State
+  //===--------------------------------------------------------------------===//
+
+  /// Computes the MLIR symbol name of a function: `c_main` for C `main`, the
+  /// per-TU-mangled `<tag><name>` for internal-linkage (`static`) functions,
+  /// and the bare C name for external-linkage functions.
+  std::string mlirFuncName(const clang::FunctionDecl *func) const;
+
+  /// The clang AST currently being translated (borrowed, read-only). Rebound
+  /// by each `importTranslationUnit` call so one importer can span TUs.
+  clang::ASTContext *astContextPtr = nullptr;
+  /// Accessor giving the reference-style spelling used throughout.
+  clang::ASTContext &astContext() const { return *astContextPtr; }
+  /// Prefix prepended to internal-linkage symbol names in the current TU
+  /// (empty for single-TU imports).
+  std::string currentTuTag;
+  /// When true (project import), an `extern`-only global with no definition in
+  /// this TU is deferred to `finalizeProject` instead of being an error.
+  bool deferExternGlobals = false;
+  /// Deferred `extern` global references awaiting a cross-TU definition,
+  /// keyed by MLIR symbol name; the location is the first reference for the
+  /// diagnostic if no TU defines it.
+  llvm::StringMap<Location> pendingExternGlobals;
+  /// Shape of every imported file-scope struct, keyed by symbol name, for
+  /// cross-TU deduplication and mismatch detection. Block-scope records are
+  /// never entered here: their identity is the defining decl (see
+  /// `localRecordNames`), not the tag name.
+  llvm::StringMap<std::string> importedRecordShapes;
+  /// Emitted Rust type name of every block-scope struct definition, keyed by
+  /// the defining decl. C tag identity is per declaration (C99 6.2.1: an
+  /// inner-scope `struct T` shadowing an outer `T` is a new type even when
+  /// the shapes match), so each block-scope definition gets its own
+  /// struct_def under a `<function>_<tag>` name following the
+  /// function-local-static mangling convention, `_<n>`-suffixed when that
+  /// name is already taken.
+  llvm::DenseMap<const clang::RecordDecl *, std::string> localRecordNames;
+  /// Every struct_def symbol name emitted so far (file-scope tags and
+  /// mangled block-scope names alike), consulted so block-scope mangling
+  /// never reuses an existing type name.
+  llvm::StringSet<> emittedStructNames;
+  /// Synthesized Rust names for bare anonymous structs (no tag, no typedef
+  /// name), keyed by the same field-shape serialization used for cross-TU
+  /// dedup. Living in its own map (never keyed by a user-written name) is
+  /// the anonymity marker: an anonymous struct whose shape matches a named
+  /// struct's still gets its own Rust type, because C type identity is by
+  /// declaration, not by shape. The name is a deterministic function of the
+  /// shape, so the same anonymous shape in two translation units maps to
+  /// one Rust type and two different shapes never collide.
+  llvm::StringMap<std::string> anonRecordShapeNames;
+  /// Synthesized name of every imported bare anonymous struct, keyed by its
+  /// defining declaration; populated by `importRecord` and consulted by
+  /// `emittedRecordName`.
+  llvm::DenseMap<const clang::RecordDecl *, std::string> anonRecordNames;
+  /// Next `Anon<n>` suffix to try when a new anonymous shape needs a name;
+  /// names are assigned in first-encounter order per import.
+  unsigned anonStructCounter = 0;
+  /// Union arm -> the first arm's leaf field, whose spelling names the
+  /// single flattened storage slot every arm aliases; populated by
+  /// `collectRecordFields` (anonymous union members) and
+  /// `collectUnionSlot` (named/untagged union types; the storage leaf
+  /// itself has no entry) and consulted by `flattenedFieldName` and
+  /// `flattenedFieldStorage`.
+  llvm::DenseMap<const clang::FieldDecl *, const clang::FieldDecl *>
+      unionSlotStorage;
+  /// Byte-array union arms admitted at the TYPE level by
+  /// `collectUnionSlot` (CTS-F, 00210): the arm's total width equals the
+  /// integer slot's, so the union type imports on the one-slot model, but
+  /// no access through the arm is representable on that slot;
+  /// `emitMemberLValue` rejects each such access at its own site.
+  llvm::SmallPtrSet<const clang::FieldDecl *, 4> unionByteArrayArms;
+  /// The C99-45 accessor geometry of one bit-field member: the window
+  /// `[offset, offset + width)` of the synthesized unsigned backing field
+  /// `backingName` (of type `backingType`) in its flattened parent
+  /// struct_def. Recorded by `collectRecordFields` when the member's run
+  /// packs; consulted by `emitBitFieldRead`/`emitBitFieldAssign`.
+  struct BitFieldAccess {
+    /// The backing field's spelling (`__bits<n>`); owned by
+    /// `memberNameArena`.
+    llvm::StringRef backingName;
+    /// The smallest unsigned integer type (ui8/ui16/ui32/ui64) holding
+    /// the run's total bits.
+    IntegerType backingType;
+    /// The field's bit offset from bit 0 (LSB) of the backing field.
+    unsigned offset = 0;
+    /// The field's declared width in bits.
+    unsigned width = 0;
+  };
+  /// Bit-field member -> its accessor geometry (see `BitFieldAccess`).
+  llvm::DenseMap<const clang::FieldDecl *, BitFieldAccess> bitFieldAccessInfo;
+  /// Stable backing storage for member spellings synthesized at import
+  /// (`__bits<n>` backing names, keyword-mangled member names): the
+  /// StringRefs handed to struct_def field lists point in here, and a
+  /// deque never relocates its elements.
+  std::deque<std::string> memberNameArena;
+  /// The defining C record behind each emitted struct_def symbol, recorded
+  /// by `importRecord` so record-aware consumers (global initializer
+  /// conversion) can walk the C field structure of a flattened struct.
+  /// Synthesized struct_defs (Phase-4 owner structs) have no entry and
+  /// keep the positional field conversion.
+  llvm::StringMap<const clang::RecordDecl *> structDefRecords;
+  /// Module-symbol names the current TU's ordinary identifier namespace
+  /// claims (functions, file-scope variables, mangled function-local
+  /// statics), pre-scanned by `collectOrdinaryNames`; struct tags colliding
+  /// with these are renamed (see `structSymbolName`).
+  llvm::StringSet<> ordinaryTuNames;
+
+  /// The RAW C spellings the current TU's ordinary identifier namespace
+  /// declares (functions and file-scope variables, no mangling applied).
+  /// Backs the keyword-function collision check (CTS 00204): `match`
+  /// mangles to `match_`, which must not silently merge with a source
+  /// declaration already spelled `match_`.
+  llvm::StringSet<> ordinaryRawTuNames;
+  /// Symbol name assigned to each struct definition by `structSymbolName`,
+  /// keyed on the defining declaration (per-TU decls are distinct; cross-TU
+  /// unification still happens by final name through
+  /// `importedRecordShapes`, so the rename decision must be reproducible
+  /// from each TU's own ordinary names).
+  llvm::DenseMap<const clang::RecordDecl *, std::string> assignedStructNames;
+  /// Shape of every imported enum, keyed by symbol name, for cross-TU
+  /// deduplication and mismatch detection.
+  llvm::StringMap<std::string> importedEnumShapes;
+  /// The module receiving struct definitions and functions.
+  ModuleOp module;
+  /// Builder positioned inside the function body under construction.
+  OpBuilder builder;
+  /// Per-function map from clang declarations to their MLIR place or, for
+  /// pointer parameters, their reference SSA value.
+  llvm::DenseMap<const clang::ValueDecl *, Value> symbols;
+  /// Per-function admitted local `void *` fn-ptr holders (CTS-F, 00210),
+  /// each mapped to the one known non-variadic function whose address it
+  /// holds; populated by `collectVoidFnPtrHolders` before the pointer
+  /// region analysis (which skips them via `fnHolderQuery`). An admitted
+  /// holder imports as an ordinary local `!emitrust.fn_ptr` variable and
+  /// its cast-calls peel to plain `emitrust.call_indirect`.
+  llvm::DenseMap<const clang::VarDecl *, const clang::FunctionDecl *>
+      voidFnPtrHolders;
+  /// Per-function callsite-inferred prototypes (FR-29, CTS 00209) for
+  /// prototype-less K&R fn-ptr parameters and locals, keyed by the
+  /// definition's decls; populated by `inferNoProtoCallSignatures` at
+  /// signature-building time and installed here for the body emission.
+  /// An inferred decl declares (parameter and local place alike) at its
+  /// refined `!emitrust.fn_ptr` signature, its argument-carrying calls
+  /// bypass the no-prototype rejection onto the ordinary typed
+  /// `emitrust.call_indirect` path, and bindings of real functions to it
+  /// resolve against the refined signature.
+  llvm::DenseMap<const clang::VarDecl *, emitrust::FnPtrType>
+      inferredFnPtrSigs;
+  /// The clang body of the function under import; consulted by dead-VLA
+  /// elision (CTS-F, 00207) to decide whether a local is referenced
+  /// anywhere in the body.
+  const clang::Stmt *currentFunctionBody = nullptr;
+  /// Per-function set of locals whose address is taken.
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> addressTaken;
+  /// Per-function pointer region analysis (Phase-1a decomposition).
+  PointerRegionAnalysis pointerRegions;
+  /// Program-wide registry of synthesized compound-literal backing
+  /// declarations (C99-13), shared with every analysis instance (the
+  /// planning passes and the per-function emission analysis) so all
+  /// passes agree on each literal's backing identity.
+  CompoundLiteralTemps literalTemps;
+  /// Per-function decomposition of each accepted pointer local and each
+  /// slice-classified pointer parameter, keyed by its declaration.
+  llvm::DenseMap<const clang::VarDecl *, PointerLocalInfo> pointerLocals;
+  /// Per-function second-order pointer locals (CTS-P5), each mapped to the
+  /// single first-order pointer local it statically selects (the
+  /// degenerate one-cell region of cursor cells); a second-order pointer
+  /// carries no runtime state of its own.
+  llvm::DenseMap<const clang::VarDecl *, const clang::VarDecl *>
+      pointerPointerLocals;
+  /// Per-function read-only backing byte arrays of string-literal pointer
+  /// regions, keyed by the bound literal; created once per literal at the
+  /// declaration of the first pointer bound to it.
+  llvm::DenseMap<const clang::StringLiteral *, Value> literalBackings;
+  /// Per-function prologue cells of by-value scalar parameters.
+  /// `finalizeFunction` sweeps any such cell whose every remaining use is
+  /// a store (the parameter is never read on any surviving path — e.g.
+  /// its uses folded away with a statically-null pointer, CTS-P9), so a
+  /// fully folded function carries no runtime state at all.
+  SmallVector<Value, 8> paramCells;
+  /// Cached Phase-1b parameter classifications, keyed by the function's
+  /// canonical declaration (persists across the whole import; each TU's
+  /// declarations are distinct clang decls, so entries never conflict).
+  llvm::DenseMap<const clang::FunctionDecl *, SmallVector<ParamKind, 4>>
+      paramKindsCache;
+  /// CTS 00204 va_list monomorphization plans, keyed by the variadic
+  /// definition's canonical declaration (per-AST decls; entries from
+  /// different TUs never conflict).
+  llvm::DenseMap<const clang::FunctionDecl *, VaMonomorphPlan>
+      vaMonomorphPlans;
+  /// The clone index (into its plan's `clones`) of every direct call to a
+  /// monomorphized variadic definition.
+  llvm::DenseMap<const clang::CallExpr *, unsigned> vaCallSiteClones;
+  /// Planned string-cursor parameters (CTS 00204): the `const char **`
+  /// parameters of definitions whose bodies stay inside the bounded
+  /// read-and-advance shape. Keyed by the DEFINITION's parameter decls.
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> cursorParams;
+  /// Cached pointer-return kinds (CTS-P2), keyed by the function's
+  /// canonical declaration: the mapped `!emitrust.fn_ptr` result type of a
+  /// function whose data-pointer return classifies as a returned function
+  /// address.
+  llvm::DenseMap<const clang::FunctionDecl *, Type> pointerReturnKinds;
+  /// Erased single-global-base pointer returns (CTS-S, 00089), keyed by the
+  /// function's canonical declaration: a function whose every return site
+  /// yields the address of this ONE mutable whole global classifies to an
+  /// ERASED pointer result (its `pointerReturnKinds` entry is the null
+  /// `Type`), and callers route accesses through the returned pointer to
+  /// the recorded global directly.
+  llvm::DenseMap<const clang::FunctionDecl *, const clang::VarDecl *>
+      globalReturnBases;
+  /// Erased single-global-base results of function POINTER types (CTS-S,
+  /// 00089), keyed by the canonical clang function type of the pointee: a
+  /// fn-ptr signature returning a data pointer is representable exactly
+  /// when every address-taken function of that return type erases to the
+  /// same global base (see `classifyFnPtrPointerResult`); indirect calls
+  /// through such a pointer route to the recorded global like direct calls.
+  llvm::DenseMap<const clang::Type *, const clang::VarDecl *>
+      fnPtrReturnBases;
+  /// Function-pointer pointee types whose data-pointer-result
+  /// classification is currently being computed; a re-entry (a recursion
+  /// cycle through a candidate's own return classification) rejects.
+  llvm::SmallPtrSet<const clang::Type *, 4> fnPtrReturnInProgress;
+  /// Devirtualized global function pointers (CTS-S, 00189), keyed by the
+  /// variable's canonical declaration: a file-scope function pointer
+  /// initialized to a known function and never reassigned (nor
+  /// address-taken) anywhere in the TU is an import-time alias of its
+  /// target. No `emitrust.global` is materialized; calls through the alias
+  /// lower as direct calls (a hosted variadic target routes through the
+  /// printf machinery), and value uses lower to the `Some(target)`
+  /// constant. Populated per TU by `planFnPtrAliases`.
+  llvm::DenseMap<const clang::VarDecl *, const clang::FunctionDecl *>
+      fnPtrAliases;
+  /// File-scope function-pointer variables the current TU assigns to (or
+  /// takes the address of) somewhere in a function body; such a variable
+  /// is never an alias. Rebuilt per TU by `planFnPtrAliases`.
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> fnPtrGlobalsWritten;
+  /// Functions of the current TU whose address is taken anywhere outside a
+  /// direct-call callee position (function bodies and file-scope
+  /// initializers alike); the candidate set of every fn-ptr value flow,
+  /// consulted by `classifyFnPtrPointerResult`. Rebuilt per TU by
+  /// `planFnPtrAliases`.
+  llvm::SmallVector<const clang::FunctionDecl *, 8> addressTakenFunctions;
+  /// The single-global-base of the function currently being imported when
+  /// its pointer return was erased (CTS-S, 00089); null otherwise. Return
+  /// sites emit a bare `return` (the address carries no runtime state).
+  const clang::VarDecl *currentErasedReturnBase = nullptr;
+  /// Cached integer-carrier return classifications (CTS-P3), keyed by the
+  /// function's canonical declaration (see `isCarrierReturnFunction`).
+  llvm::DenseMap<const clang::FunctionDecl *, bool> carrierReturnCache;
+  /// Functions whose carrier-return classification is currently being
+  /// computed; a re-entry (a recursion cycle) classifies pessimistically.
+  llvm::SmallPtrSet<const clang::FunctionDecl *, 4> carrierReturnInProgress;
+  /// Per-function i64 cells of integer-carrier pointer locals (CTS-P3),
+  /// keyed by declaration: the pointer's entire runtime state is one plain
+  /// i64 (null is 0); no base, cursor, or flag cell exists.
+  llvm::DenseMap<const clang::VarDecl *, Value> carrierLocals;
+  /// Per-function integer-carrier `void *` parameters (CTS-P3): their
+  /// prologue cells live in `symbols` like any scalar parameter, and this
+  /// set routes their truth tests and carrier reads.
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> carrierParams;
+  /// Parameters whose interprocedural class qualified for the cell-slice
+  /// lowering (CTS-P10), keyed by the definition's parameter declaration;
+  /// populated by `planCellSlices` and consulted by
+  /// `classifyPointerParams` (accumulates across TUs).
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 16> cellSliceParams;
+  /// Located boundary verdicts for classes with global bases that did NOT
+  /// qualify (mixed local+global, nullable global-backed), keyed by the
+  /// canonical global base declaration; the call-site rejection consults
+  /// this map for its precise wording.
+  llvm::DenseMap<const clang::VarDecl *, CellSliceReject> cellSliceRejects;
+  /// Phase-4 owner plans keyed by the promoted base variable declaration
+  /// (accumulates across TUs; each TU's declarations are distinct).
+  llvm::DenseMap<const clang::VarDecl *, OwnerPlan> ownerPlans;
+  /// Phase-4 method plans: the canonical declaration of every function that
+  /// becomes an owner method, mapped to its owner's base variable.
+  llvm::DenseMap<const clang::FunctionDecl *, const clang::VarDecl *>
+      methodPlans;
+  /// Per-function owner struct places (populated in the owning function
+  /// only), keyed by the promoted base variable; feeds method-call
+  /// receivers. The struct place is only ever borrowed, never loaded.
+  llvm::DenseMap<const clang::VarDecl *, Value> ownerStructPlaces;
+  /// The `deref(arg0)` receiver place while importing a method body; null
+  /// otherwise. Sibling method calls borrow it (rendering `(*self).m(...)`).
+  Value currentReceiverPlace;
+  /// The owner base variable of the method currently being imported; null
+  /// when the current function is not a method.
+  const clang::VarDecl *currentMethodOwner = nullptr;
+  /// Struct definitions already imported (keyed on the defining decl).
+  llvm::SmallPtrSet<const clang::RecordDecl *, 8> importedRecords;
+  /// Enum definitions already imported (keyed on the defining decl).
+  llvm::SmallPtrSet<const clang::EnumDecl *, 8> importedEnums;
+  /// Imported functions by MLIR symbol name.
+  llvm::StringMap<func::FuncOp> functions;
+  /// Imported globals (file-scope variables and function-local statics),
+  /// keyed by canonical clang declaration.
+  llvm::DenseMap<const clang::VarDecl *, GlobalInfo> globals;
+  /// Imported pointer-typed globals (CTS-P4), keyed by canonical
+  /// declaration; disjoint from `globals` (a pointer global has no
+  /// whole-value representation of its own, only a region base and an
+  /// optional cursor global).
+  llvm::DenseMap<const clang::VarDecl *, PointerGlobalInfo> pointerGlobals;
+  /// Program-wide pointer-region facts of every global pointer variable,
+  /// keyed by canonical declaration: `planOwners` (Pass A) merges each
+  /// function body's region view, and `importPointerGlobal` (Pass B)
+  /// validates the union against the file-scope initializer.
+  llvm::DenseMap<const clang::VarDecl *, PointerRegion> globalPtrFacts;
+  /// Program-wide member-pointer bindings (CTS-P2), keyed by (struct
+  /// instance, data-pointer field): `planOwners` merges every function
+  /// body's bindings, and the constant-initializer walk
+  /// (`collectGlobalMemberBindings`) merges the bindings of global struct
+  /// objects. Reads and writes of data-pointer members resolve against
+  /// this map at their use sites.
+  llvm::DenseMap<MemberPointerKey, MemberPointerFacts> memberPtrBindings;
+  /// Data-pointer fields used somewhere in the program in a shape the
+  /// per-instance member model cannot resolve, with the first such site;
+  /// every read of a poisoned field is a located rejection.
+  llvm::DenseMap<const clang::FieldDecl *, clang::SourceLocation>
+      poisonedPtrFields;
+  /// Whether the TU currently being imported is the whole program (see
+  /// `importTranslationUnit`); pointer-typed globals with external linkage
+  /// are rejected in multi-file projects because a later TU's bindings
+  /// could invalidate facts this TU has already consumed.
+  bool currentSoleTU = false;
+  /// Stack of break/continue targets for nested loops and switches.
+  SmallVector<LoopTargets> loopStack;
+  /// Blocks started by C labels in the function under construction, keyed
+  /// by label declaration; created lazily on first mention so forward and
+  /// backward `goto`s share one map.
+  llvm::DenseMap<const clang::LabelDecl *, Block *> labelBlocks;
+  /// Dispatch target blocks for the case/default labels of every
+  /// dispatch-lowered switch in the function under construction (see
+  /// `emitDispatchSwitch`), keyed by the label statement. Structured
+  /// switches never register their labels here.
+  llvm::DenseMap<const clang::SwitchCase *, Block *> switchCaseBlocks;
+  /// True when the function under construction contains any C label;
+  /// `emitrust.variable` places are then hoisted to the entry block (see
+  /// `createVariablePlace`).
+  bool currentHasLabels = false;
+  /// Entry block of the function under construction (owns the allocas).
+  Block *entryBlock = nullptr;
+  /// Body region of the function under construction.
+  Region *bodyRegion = nullptr;
+  /// Mapped return type of the current function; null for void.
+  Type currentReturnType;
+  /// MLIR symbol name of the function under construction (used to mangle
+  /// function-local statics).
+  std::string currentFuncName;
+  /// True while translating C `main` (enables the implicit `return 0`).
+  bool currentIsMain = false;
+  /// True while emitting the body of a va_list monomorphization clone
+  /// (CTS 00204): enables the va_start/va_end/va_arg lowerings and the
+  /// elision of `va_list` locals.
+  bool currentVaCloneActive = false;
+  /// The clone's extra-argument block values, in declared order; the
+  /// va_arg dispatch selects among them by static type.
+  SmallVector<Value, 8> currentVaExtras;
+  /// Entry-block `memref<i64>` cell holding the clone's va_arg
+  /// consumption cursor; va_start resets it to zero.
+  Value currentVaCursorCell;
+  /// String-cursor parameter writebacks of the function under
+  /// construction (CTS 00204): (local i64 cursor cell, deref'd
+  /// `!emitrust.lvalue<i64>` place of the in-out cursor parameter) pairs,
+  /// copied out at every return site.
+  SmallVector<std::pair<Value, Value>, 2> cursorWritebacks;
+  /// True once a `%f` printf directive has been imported; triggers the
+  /// one-per-module emission of the `__emitrust_fmt_f64` helper that
+  /// matches C's non-finite `%f` spellings (`nan`/`-nan`).
+  bool needsFloatFormatHelper = false;
+  /// True once the `__emitrust_fmt_f64` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool floatFormatHelperEmitted = false;
+  /// True once a `%c` printf directive (or a putchar call) has been
+  /// imported; triggers the one-per-module emission of the
+  /// `__emitrust_fmt_c` helper that renders the argument as C does
+  /// (converted to unsigned char; ASCII-only, see design.md C99-48).
+  bool needsCharFormatHelper = false;
+  /// True once the `__emitrust_fmt_c` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool charFormatHelperEmitted = false;
+  /// True once a `%s` char-array argument has been imported; triggers the
+  /// one-per-module emission of the `__emitrust_cstr` helper that renders
+  /// a char array up to its first NUL, matching C's `%s`.
+  bool needsCStrHelper = false;
+  /// True once the `__emitrust_cstr` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool cStrHelperEmitted = false;
+  /// True once a `%.Ns` (precision-bounded) `%s` slice argument has been
+  /// imported; triggers the one-per-module emission of the
+  /// `__emitrust_cstr_n` helper (stops at N bytes or the first NUL,
+  /// whichever comes first, matching C's %s precision).
+  bool needsCStrNHelper = false;
+  /// True once the `__emitrust_cstr_n` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool cStrNHelperEmitted = false;
+  /// True once a signed integer printf directive outside the 1:1 Rust
+  /// format-spec subset (precision or '+'/' ' flags) has been imported;
+  /// triggers emission of the `__emitrust_fmt_i64` wrapper (plus the
+  /// shared `__emitrust_fmt_int` core).
+  bool needsIntFormatSignedHelper = false;
+  /// True once the `__emitrust_fmt_i64` wrapper has been emitted.
+  bool intFormatSignedHelperEmitted = false;
+  /// True once an unsigned integer printf directive outside the 1:1 Rust
+  /// format-spec subset (precision or the '#' flag) has been imported;
+  /// triggers emission of the `__emitrust_fmt_u64` wrapper (plus the
+  /// shared `__emitrust_fmt_int` core).
+  bool needsIntFormatUnsignedHelper = false;
+  /// True once the `__emitrust_fmt_u64` wrapper has been emitted.
+  bool intFormatUnsignedHelperEmitted = false;
+  /// True once the shared `__emitrust_fmt_int` core (C99 7.19.6.1 integer
+  /// directive rendering: precision, sign/prefix, width padding) has been
+  /// emitted, so a multi-TU import never emits it twice.
+  bool intFormatCoreHelperEmitted = false;
+  /// True once a floating printf directive outside the bare-%f subset
+  /// (%e/%E/%g/%G/%F, or %f with flags/width/precision) has been
+  /// imported; triggers emission of the `__emitrust_fmt_float` helper
+  /// family (exact C99 f/e/g rendering incl. the glibc %#g carry quirk).
+  bool needsFloatFormatExtHelper = false;
+  /// True once the `__emitrust_fmt_float` helper family has been emitted,
+  /// so a multi-TU import never emits it twice.
+  bool floatFormatExtHelperEmitted = false;
+  /// True once a definition-less `sprintf` call has been imported;
+  /// triggers the one-per-module emission of the `__emitrust_sprintf`
+  /// helper that copies the formatted bytes plus a NUL terminator into
+  /// the destination slice and returns the written length.
+  bool needsSprintfHelper = false;
+  /// True once the `__emitrust_sprintf` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool sprintfHelperEmitted = false;
+  /// True once a definition-less `strlen` call has been imported; triggers
+  /// the one-per-module emission of the `__emitrust_strlen` helper that
+  /// counts bytes up to the first NUL, matching C's strlen.
+  bool needsStrlenHelper = false;
+  /// True once the `__emitrust_strlen` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool strlenHelperEmitted = false;
+  /// Hosted `<string.h>` helpers requested by lowered calls
+  /// (`requestStringHelper`); each is emitted once per module, in the
+  /// fixed order of the `kStringHelpers` table.
+  llvm::StringSet<> neededStringHelpers;
+  /// Helpers already emitted, so a multi-TU import never emits one twice.
+  llvm::StringSet<> emittedStringHelpers;
+  /// FILE* handle locals of the current function (C99-48): each maps to
+  /// its owned `emitrust.variable` place of the opaque `__EmitrustFile`
+  /// type. Reset per function like `symbols`.
+  llvm::DenseMap<const clang::VarDecl *, Value> fileLocals;
+  /// Hosted FILE* helpers requested by lowered stdio calls
+  /// (`requestFileHelper`); each is emitted once per module, in the fixed
+  /// order of the `kFileHelpers` table (the `__EmitrustFile` enum first).
+  llvm::StringSet<> neededFileHelpers;
+  /// FILE* helpers already emitted, so a multi-TU import never emits one
+  /// twice.
+  llvm::StringSet<> emittedFileHelpers;
+};
+
+
+#endif // EMITRUST_IMPORTC_CIMPORTERINTERNAL_H
