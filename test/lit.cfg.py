@@ -16,7 +16,9 @@ config.name = "EMITRUST"
 config.test_format = lit.formats.ShTest(not llvm_config.use_lit_shell)
 
 # suffixes: A list of file extensions to treat as test files.
-config.suffixes = [".mlir", ".c"]
+# ".cpp" (W2.0) covers the C++-input subset tests under Import/Cpp and the
+# clang++-native-leg differential test in EndToEnd.
+config.suffixes = [".mlir", ".c", ".cpp"]
 
 # test_source_root: The root path where tests are located.
 config.test_source_root = os.path.dirname(__file__)
