@@ -5314,6 +5314,62 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
   if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
     if (unary->getOpcode() == clang::UO_Deref)
       return emitDerefLValue(unary, loc, writeback);
+  // W2.3: `v[i]` / `v.at(i)` over a recognized `std::vector<T>` receiver
+  // both return `T&` in real C++ — a genuine place — so a plain scalar VALUE
+  // read (`int x = v[i];`) wraps the call in an implicit `CK_LValueToRValue`
+  // cast whose `emitCast` case calls `emitLValue` on the call expression
+  // itself, reaching here (rather than `emitCall`, which only sees the
+  // no-load statement-discard shape). Both spellings pin the identical
+  // bracket-indexing place.
+  if (const auto *opCall = llvm::dyn_cast<clang::CXXOperatorCallExpr>(e);
+      opCall && opCall->getOperator() == clang::OO_Subscript) {
+    const auto *opMethod =
+        llvm::dyn_cast_or_null<clang::CXXMethodDecl>(opCall->getDirectCallee());
+    if (opMethod && opMethod->getParent()->isInStdNamespace()) {
+      if (opCall->getNumArgs() != 2)
+        return emitError(loc) << "unsupported: operator[] requires exactly "
+                                 "one index argument";
+      FailureOr<Value> receiver =
+          emitLValue(opCall->getArg(0)->IgnoreParenImpCasts());
+      if (failed(receiver))
+        return failure();
+      auto lvalueType = llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+      auto opaqueType = lvalueType ? llvm::dyn_cast<emitrust::OpaqueType>(
+                                         lvalueType.getValueType())
+                                   : emitrust::OpaqueType();
+      if (!opaqueType || !isStlOpaqueType(opaqueType) ||
+          !opaqueType.getValue().starts_with("Vec<"))
+        return emitError(loc)
+               << "unsupported: std::string::operator[] is not a recognized "
+                  "STL method (bytes indexing is not supported this wave)";
+      return emitStlVectorIndexPlace(*receiver, opaqueType,
+                                     opCall->getArg(1), loc, "operator[]");
+    }
+  }
+  if (const auto *memberCall = llvm::dyn_cast<clang::CXXMemberCallExpr>(e)) {
+    const clang::CXXMethodDecl *method = memberCall->getMethodDecl();
+    if (method && method->getParent()->isInStdNamespace() &&
+        method->getDeclName().isIdentifier() && method->getName() == "at") {
+      if (memberCall->getNumArgs() != 1)
+        return emitError(loc) << "unsupported: at requires exactly one "
+                                 "argument";
+      FailureOr<Value> receiver = emitLValue(
+          memberCall->getImplicitObjectArgument()->IgnoreParenImpCasts());
+      if (failed(receiver))
+        return failure();
+      auto lvalueType = llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+      auto opaqueType = lvalueType ? llvm::dyn_cast<emitrust::OpaqueType>(
+                                         lvalueType.getValueType())
+                                   : emitrust::OpaqueType();
+      if (!opaqueType || !isStlOpaqueType(opaqueType) ||
+          !opaqueType.getValue().starts_with("Vec<"))
+        return emitError(loc)
+               << "unsupported: member call receiver is not a recognized "
+                  "std::vector";
+      return emitStlVectorIndexPlace(*receiver, opaqueType,
+                                     memberCall->getArg(0), loc, "at");
+    }
+  }
   // A compound literal is an lvalue in C99 (C99-13): its place is the
   // freshly materialized anonymous temp, so `(struct S){...}.a`,
   // `(int[]){...}[i]`, and whole-value loads all resolve on it like on a

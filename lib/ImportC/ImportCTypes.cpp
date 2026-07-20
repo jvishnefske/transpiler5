@@ -152,6 +152,15 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
   if (const auto *record =
           llvm::dyn_cast<clang::RecordType>(canonical.getTypePtr())) {
     const clang::RecordDecl *decl = record->getDecl();
+    // W2.3 STL recognition: a record living in namespace `std` is diverted
+    // BEFORE the generic path below ever calls `importRecord` — the
+    // recursion into libstdc++ internals (private pointers, allocators,
+    // ...) the STL recognition wave exists specifically to avoid. A plain
+    // C program never has a `NamespaceDecl` in any `DeclContext` chain, so
+    // `isInStdNamespace()` is unconditionally false there: this check is a
+    // no-op on the C path.
+    if (decl->isInStdNamespace())
+      return mapStdLibraryType(decl, loc);
     // A union imports as a one-field struct (see `collectUnionSlot`), so
     // it maps to the same `!emitrust.struct` any record does; shapes the
     // one-slot model cannot represent are rejected by the import below.
@@ -292,6 +301,121 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     return emitError(loc) << "unsupported: non-constant array size";
   return emitError(loc) << "unsupported type '"
                         << llvm::Twine(canonical.getAsString()) << "'";
+}
+
+//===----------------------------------------------------------------------===//
+// W2.3: STL recognition (std::vector<T>, std::string)
+//===----------------------------------------------------------------------===//
+
+std::optional<std::string>
+CImporter::rustSpellingForElementType(Type type) {
+  if (auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type))
+    return opaque.getValue().str();
+  if (auto structType = llvm::dyn_cast<emitrust::StructType>(type))
+    return structType.getName().str();
+  if (llvm::isa<Float32Type>(type))
+    return std::string("f32");
+  if (llvm::isa<Float64Type>(type))
+    return std::string("f64");
+  if (auto intType = llvm::dyn_cast<IntegerType>(type)) {
+    if (intType.getWidth() == 1)
+      return std::string("bool");
+    bool isUnsigned = intType.isUnsigned();
+    switch (intType.getWidth()) {
+    case 8:
+      return isUnsigned ? std::string("u8") : std::string("i8");
+    case 16:
+      return isUnsigned ? std::string("u16") : std::string("i16");
+    case 32:
+      return isUnsigned ? std::string("u32") : std::string("i32");
+    case 64:
+      return isUnsigned ? std::string("u64") : std::string("i64");
+    default:
+      break;
+    }
+  }
+  return std::nullopt;
+}
+
+Type CImporter::parseStlElementType(llvm::StringRef spelling) {
+  MLIRContext *context = builder.getContext();
+  if (spelling == "String" || spelling.starts_with("Vec<"))
+    return emitrust::OpaqueType::get(context, spelling);
+  if (spelling == "bool")
+    return builder.getI1Type();
+  if (spelling == "f32")
+    return builder.getF32Type();
+  if (spelling == "f64")
+    return builder.getF64Type();
+  bool isUnsigned = spelling.starts_with("u");
+  unsigned width = 0;
+  if ((spelling.starts_with("i") || spelling.starts_with("u")) &&
+      !spelling.substr(1).getAsInteger(10, width)) {
+    switch (width) {
+    case 8:
+    case 16:
+    case 32:
+    case 64:
+      return isUnsigned
+                 ? IntegerType::get(context, width, IntegerType::Unsigned)
+                 : builder.getIntegerType(width);
+    default:
+      break;
+    }
+  }
+  // Anything else is trusted to be a struct name (StructType performs no
+  // cross-checking against its referenced symbol either, per its own
+  // documentation).
+  if (spelling.empty())
+    return Type();
+  return emitrust::StructType::get(context, spelling);
+}
+
+bool CImporter::isStlOpaqueType(Type type) {
+  auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
+  return opaque && (opaque.getValue() == "String" ||
+                    opaque.getValue().starts_with("Vec<"));
+}
+
+FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
+                                             Location loc) {
+  llvm::StringRef name = decl->getName();
+  const auto *spec =
+      llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(decl);
+  if (name == "vector" && spec) {
+    const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+    if (args.size() < 1 || args[0].getKind() != clang::TemplateArgument::Type)
+      return emitError(loc)
+             << "unsupported: std::vector element type could not be "
+                "determined";
+    clang::QualType elementType = args[0].getAsType();
+    FailureOr<Type> mappedElement = mapType(elementType, loc);
+    if (failed(mappedElement))
+      return failure();
+    std::optional<std::string> spelling =
+        rustSpellingForElementType(*mappedElement);
+    if (!spelling)
+      return emitError(loc)
+             << "unsupported: std::vector<" << elementType.getAsString()
+             << "> element type is not in the supported STL element set";
+    return Type(emitrust::OpaqueType::get(builder.getContext(),
+                                          "Vec<" + *spelling + ">"));
+  }
+  if (name == "basic_string") {
+    if (spec) {
+      const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+      if (args.size() >= 1 &&
+          args[0].getKind() == clang::TemplateArgument::Type &&
+          astContext().hasSameType(args[0].getAsType().getCanonicalType(),
+                                   astContext().CharTy))
+        return Type(emitrust::OpaqueType::get(builder.getContext(), "String"));
+    }
+    return emitError(loc)
+           << "unsupported: std::basic_string with a non-char character "
+              "type";
+  }
+  return emitError(loc) << "unsupported: std::" << name.str()
+                        << " is not a recognized STL type";
 }
 
 FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,

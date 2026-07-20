@@ -1066,6 +1066,30 @@ private:
   /// everything else produce a located diagnostic.
   FailureOr<Type> mapType(clang::QualType type, Location loc);
 
+  /// W2.3 STL recognition: maps a RecordType decl living in namespace
+  /// `std` (per `Decl::isInStdNamespace()`, which transparently unwraps
+  /// libstdc++'s `std::__cxx11` inline namespace) BEFORE `mapType`'s
+  /// generic RecordType path would recurse into `importRecord` and hit
+  /// libstdc++ internals. Recognizes exactly two shapes, without ever
+  /// importing a single libstdc++ field:
+  ///   * `std::vector<T>` (a `ClassTemplateSpecializationDecl` named
+  ///     "vector") -> `!emitrust.opaque<"Vec<<T>>">`, where `<T>` is `T`
+  ///     mapped recursively through `mapType` and re-spelled by
+  ///     `rustSpellingForElementType`. `T` must land in the supported
+  ///     scalar set, a supported struct, or another recognized STL opaque
+  ///     (nested containers compose for free); any other `T` is a located
+  ///     rejection (propagated from the recursive `mapType` failure, or a
+  ///     "not in the supported STL element set" diagnostic when `T` maps
+  ///     but has no Rust spelling this function knows).
+  ///   * `std::basic_string<char, ...>` (i.e. `std::string`) ->
+  ///     `!emitrust.opaque<"String">`. A `basic_string` over any other
+  ///     character type is a located rejection.
+  /// Every other `std::` entity (map, set, cout, ...) is a located
+  /// rejection naming the entity: "unsupported: std::<name> is not a
+  /// recognized STL type".
+  FailureOr<Type> mapStdLibraryType(const clang::RecordDecl *decl,
+                                    Location loc);
+
   /// Maps a C function-parameter type: data-pointer parameters `T*` become
   /// `!emitrust.mut_ref<T>` for `ParamKind::ScalarRef` and
   /// `!emitrust.mut_ref<!emitrust.slice<T>>` for `ParamKind::Slice`
@@ -1567,6 +1591,80 @@ private:
   /// (`emitMethodCallSite`) but for a genuine object expression rather than
   /// a promoted owner place.
   FailureOr<Value> emitCXXMemberCall(const clang::CXXMemberCallExpr *call);
+
+  /// W2.3 STL recognition: whether `type` is a recognized STL opaque type
+  /// (an `!emitrust.opaque` whose value is exactly "String" or begins with
+  /// "Vec<") — the set `mapStdLibraryType` ever produces.
+  static bool isStlOpaqueType(Type type);
+
+  /// W2.3: the Rust spelling of a MAPPED element type `T` for composing
+  /// `"Vec<" + spelling + ">"` — the inverse of `parseStlElementType`.
+  /// Handles exactly the supported vector-element set: signed/unsigned
+  /// integers of width 8/16/32/64, `i1`->"bool", f32, f64, an
+  /// `!emitrust.struct` by its bare name, and a nested recognized STL
+  /// opaque by its own spelling verbatim (so `Vec<Vec<i32>>`/`Vec<String>`
+  /// compose for free through the same recursive `mapType` call). Returns
+  /// `std::nullopt` for anything else (an enum, a pointer/fn_ptr/array —
+  /// none of which reach here anyway since `mapType` would have already
+  /// rejected them as `T` before this function runs).
+  static std::optional<std::string> rustSpellingForElementType(Type type);
+
+  /// W2.3: the inverse of `rustSpellingForElementType` — reconstructs the
+  /// MLIR element type from a `Vec<...>` opaque's inner spelling (needed at
+  /// `operator[]`/`at()` sites, which must produce a genuinely typed
+  /// element place — an `i32` lvalue, say — rather than another opaque
+  /// string). A closed, controlled round-trip: the only spellings ever
+  /// seen are ones `rustSpellingForElementType` itself produced. Returns a
+  /// null `Type` if `spelling` matches none of the known forms.
+  Type parseStlElementType(llvm::StringRef spelling);
+
+  /// W2.3: imports a `CXXMemberCallExpr` whose method is declared in
+  /// namespace `std` (i.e. `std::vector<T>`/`std::string`'s own inherent
+  /// methods) — intercepted at the top of `emitCXXMemberCall` before the
+  /// generic imported-method lookup, which would never find one (no
+  /// libstdc++ method is ever imported). Dispatches the PINNED method
+  /// table by receiver opaque spelling and method name (design.md's STL
+  /// section is the single source of truth for the table); anything else
+  /// is a located rejection naming the receiver type and method.
+  FailureOr<Value> emitStlMemberCall(const clang::CXXMemberCallExpr *call);
+
+  /// W2.3: imports a `CXXOperatorCallExpr` whose resolved operator method
+  /// is declared in namespace `std` — `v[i]` (`OO_Subscript`, read
+  /// position only) and `s1 += s2` / `s += 'c'` (`OO_PlusEqual`).
+  /// Intercepted in `emitCall` before the ordinary direct-callee dispatch,
+  /// which a `CXXOperatorCallExpr` (itself a `CallExpr`) would otherwise
+  /// reach and reject as a call to an unimported function.
+  FailureOr<Value> emitStlOperatorCall(const clang::CXXOperatorCallExpr *call);
+
+  /// W2.3: shared `operator[]`/`at()` PLACE implementation over a `Vec<T>`
+  /// receiver: reconstructs `T` from the opaque's spelling (via
+  /// `parseStlElementType`) and builds an `emitrust.subscript` place over
+  /// `receiver` at `idxExpr`'s value. Two call sites load this place into a
+  /// value (the `emitCall`-reached statement-discard shapes in
+  /// `emitStlMemberCall`/`emitStlOperatorCall`); a third, `emitLValue`'s own
+  /// `CXXOperatorCallExpr`/`CXXMemberCallExpr` cases (the path a scalar
+  /// VALUE read — `int x = v[i];` — actually takes, since `operator[]`/
+  /// `at()` return `T&`, always wrapped in an `CK_LValueToRValue` cast whose
+  /// `emitLValue(sub)` call reaches here directly), consumes the place
+  /// as-is. Read position only — there is no assignment-target
+  /// (`v[i] = x`) support this wave.
+  FailureOr<Value> emitStlVectorIndexPlace(Value receiver,
+                                           emitrust::OpaqueType vectorType,
+                                           const clang::Expr *idxExpr,
+                                           Location loc,
+                                           llvm::StringRef opName);
+
+  /// W2.3: imports the (possibly implicit) `CXXConstructExpr` initializing
+  /// a local of a recognized STL opaque type `stlType`. Supports exactly:
+  /// a zero-argument default construction (`Vec::new()` / `String::new()`)
+  /// and, for `String` only, a single ordinary-string-literal argument (the
+  /// `const char*` conversion constructor, `String::from("literal")`).
+  /// Copy/move construction, the sized/fill vector constructor
+  /// (`std::vector<T>(n)`), and initializer-list construction are located
+  /// rejections this wave (design.md's STL OUT list).
+  FailureOr<Value> emitStlConstruct(Type stlType,
+                                    const clang::CXXConstructExpr *construct,
+                                    Location loc);
 
   /// W2.2: lowers `place`'s initialization from a non-trivial
   /// `CXXConstructExpr` by invoking the matching constructor method
@@ -2681,7 +2779,18 @@ private:
   /// undefined; the deterministic panic is a legal refinement).
   FailureOr<Value> emitSprintf(const clang::CallExpr *call);
 
-  /// Lowers a `%s` printf argument. Four shapes are supported: a string
+  /// Escapes `data` (raw decoded string-literal bytes: printable ASCII plus
+  /// \n/\t/\r only; embedded NUL and any other non-ASCII byte are located
+  /// rejections, worded "... in <context>") into a quoted Rust string
+  /// literal and returns it as an `emitrust.literal` of `&'static str`
+  /// type. Shared by `emitPrintfStringArg`'s string-literal `%s` shape
+  /// (`context` = "printf '%s' string literal", the historical wording)
+  /// and W2.3's `std::string s = "literal";` construction / `s +=
+  /// "literal"` (`String::from(...)` / `.push_str(...)`).
+  FailureOr<Value> emitRustStrLiteral(Location loc, llvm::StringRef data,
+                                      llvm::StringRef context);
+
+  /// Lowers a `%s` printf argument. Five shapes are supported: a string
   /// literal (after array-to-pointer decay), lowered to an
   /// `emitrust.literal` holding a `&'static str` (printable-ASCII bytes
   /// plus \n/\t/\r only; embedded NUL and non-ASCII bytes are rejected);
@@ -2689,14 +2798,20 @@ private:
   /// whole array passed through the `__emitrust_cstr` helper, which stops
   /// at the first NUL like C; a `char *` pointer into a string-literal
   /// region, lowered to an `emitrust.slice_of` of the region's read-only
-  /// backing from the pointer's cursor through the same helper; and a
+  /// backing from the pointer's cursor through the same helper; a
   /// slice-classified `char *` parameter (FR-28, CTS-L2), lowered to an
   /// `emitrust.slice_of` of the parameter's deref'd slice base place from
-  /// its cursor through the same helper. A `%.Ns` precision caps the
-  /// printed bytes at N like C: a literal is truncated at import time
+  /// its cursor through the same helper; and (W2.3) a `std::string`
+  /// object's `.c_str()` call, lowered to a shared borrow of the String
+  /// place (deref coercion to `&str` applies at the format-argument
+  /// position, exactly like `__emitrust_sprintf`'s staged String borrow) —
+  /// the ONLY position `.c_str()` is recognized in. A `%.Ns` precision caps
+  /// the printed bytes at N like C: a literal is truncated at import time
   /// (only the retained prefix is validated), the slice shapes route
   /// through `__emitrust_cstr_n`, which stops at N bytes or the first
-  /// NUL, whichever comes first.
+  /// NUL, whichever comes first (a `.c_str()` argument does not support a
+  /// precision — a located rejection — since it has no fixed byte count
+  /// to bound at import time).
   FailureOr<Value>
   emitPrintfStringArg(const clang::Expr *expr,
                       std::optional<unsigned> precision = std::nullopt);

@@ -245,17 +245,37 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
 
   bool isAggregate =
       llvm::isa<emitrust::StructType, emitrust::ArrayType>(*mlirType);
+  // W2.3: a recognized STL opaque local (`std::vector<T>`/`std::string`)
+  // lives in an `emitrust.variable` place exactly like a struct local — a
+  // memref of a dialect type is illegal, same as the enum/fn_ptr reason
+  // below — and its (always-significant; the default ctor is never
+  // trivial) constructor initializer is handled by the dedicated
+  // `emitStlConstruct`, not the generic aggregate branch.
+  bool isStlOpaque = isStlOpaqueType(*mlirType);
   // Enums, function pointers, and unsigned scalars live in
   // `emitrust.variable` places rather than memref cells: a memref of a
   // dialect type is illegal, and mem2reg materializes an unsigned cell's
   // default value as an `arith.constant`, which requires a signless type.
   bool isPlaceOnly =
-      llvm::isa<emitrust::EnumType, emitrust::FnPtrType>(*mlirType);
+      llvm::isa<emitrust::EnumType, emitrust::FnPtrType>(*mlirType) ||
+      isStlOpaque;
   if (isAggregate || isPlaceOnly || isUnsignedInt(*mlirType) ||
       addressTaken.contains(var)) {
     Value place = createVariablePlace(loc, *mlirType);
     symbols[var] = place;
     if (const clang::Expr *init = significantInit(var)) {
+      if (isStlOpaque) {
+        const clang::Expr *unwrapped = init->IgnoreParenImpCasts();
+        const auto *construct =
+            llvm::dyn_cast<clang::CXXConstructExpr>(unwrapped);
+        if (!construct)
+          return emitError(loc)
+                 << "unsupported: std::vector/std::string initializer";
+        FailureOr<Value> value = emitStlConstruct(*mlirType, construct, loc);
+        if (failed(value))
+          return failure();
+        return storeToPlace(loc, place, *value);
+      }
       if (isAggregate) {
         // CTS-BR (00216): byte-region locals initialize per byte —
         // folded constants at their layout offsets, embedded region
@@ -359,6 +379,70 @@ CImporter::emitCXXConstructInit(Value place,
   auto callOp = builder.create<func::CallOp>(loc, target, arguments);
   callOp->setAttr(emitrust::kMethodCallAttrName, builder.getUnitAttr());
   return success();
+}
+
+FailureOr<Value>
+CImporter::emitStlConstruct(Type stlType,
+                            const clang::CXXConstructExpr *construct,
+                            Location loc) {
+  auto opaque = llvm::cast<emitrust::OpaqueType>(stlType);
+  const clang::CXXConstructorDecl *ctor = construct->getConstructor();
+  if (ctor && ctor->isCopyOrMoveConstructor())
+    return emitError(loc)
+           << "unsupported: std::vector/std::string copy/move construction";
+  // Zero-argument construction: `std::vector<T> v;` / `std::string s;` (an
+  // ALWAYS-significant initializer, unlike a POD struct's vacuous default
+  // ctor — see `isVacuousDefaultConstruct` — since neither's default ctor
+  // is trivial).
+  if (construct->getNumArgs() == 0) {
+    llvm::StringRef callee = opaque.getValue() == "String" ? "String::new"
+                                                           : "Vec::new";
+    return builder
+        .create<emitrust::CallOpaqueOp>(loc, TypeRange{stlType},
+                                        builder.getStringAttr(callee),
+                                        /*args=*/ArrayAttr(), ValueRange{})
+        .getResult(0);
+  }
+  // `std::string s = "literal";` — the single-argument `const char*`
+  // conversion constructor over an ordinary string literal (after its
+  // array-to-pointer decay). libstdc++'s converting constructor also
+  // declares a defaulted allocator parameter (`basic_string(const char*,
+  // const Allocator& = Allocator())`), which a `CXXConstructExpr` for an
+  // unwritten default argument always fills with a `CXXDefaultArgExpr` —
+  // present here even though the user wrote only one argument — so every
+  // argument PAST the first must be exactly that, not merely absent. Every
+  // other single- or multi-argument construction (the sized/fill vector
+  // constructor `std::vector<T>(n)`, an initializer-list constructor, a
+  // `std::string` from a `char*` variable, ...) is a located rejection
+  // this wave (design.md's STL OUT list).
+  bool restAreDefaulted =
+      llvm::all_of(llvm::drop_begin(construct->arguments()),
+                  [](const clang::Expr *arg) {
+                    return llvm::isa<clang::CXXDefaultArgExpr>(arg);
+                  });
+  if (opaque.getValue() == "String" && construct->getNumArgs() >= 1 &&
+      restAreDefaulted) {
+    const clang::Expr *arg = construct->getArg(0)->IgnoreParenImpCasts();
+    if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(arg)) {
+      if (!literal->isOrdinary())
+        return emitError(loc) << "unsupported: non-ordinary string literal "
+                                 "in std::string construction";
+      FailureOr<Value> text = emitRustStrLiteral(loc, literal->getString(),
+                                                 "std::string construction");
+      if (failed(text))
+        return failure();
+      return builder
+          .create<emitrust::CallOpaqueOp>(loc, TypeRange{stlType},
+                                          builder.getStringAttr("String::from"),
+                                          /*args=*/ArrayAttr(), ValueRange{*text})
+          .getResult(0);
+    }
+  }
+  return emitError(loc)
+         << "unsupported: this std::vector/std::string constructor shape "
+            "is not supported (only default construction and "
+            "std::string's string-literal conversion constructor are "
+            "recognized)";
 }
 
 void CImporter::collectVoidFnPtrHolders(const clang::Stmt *body) {
@@ -3208,6 +3292,64 @@ FailureOr<Value> CImporter::emitSprintf(const clang::CallExpr *call) {
       .getResult(0);
 }
 
+FailureOr<Value> CImporter::emitRustStrLiteral(Location loc,
+                                               llvm::StringRef data,
+                                               llvm::StringRef context) {
+  // The literal's decoded bytes become a Rust string literal emitted
+  // verbatim into the generated source: an embedded NUL would diverge
+  // from C (which stops printing there) and a non-ASCII byte would fail
+  // rustc's UTF-8 check, so both are rejected; quote, backslash, and the
+  // whitespace escapes are re-escaped for the Rust spelling.
+  std::string text = "\"";
+  for (char c : data) {
+    if (c == '\0')
+      return emitError(loc) << "unsupported: NUL byte in " << context;
+    if ((c < 0x20 || c > 0x7e) && c != '\n' && c != '\t' && c != '\r')
+      return emitError(loc)
+             << "unsupported: non-printable or non-ASCII byte in " << context;
+    switch (c) {
+    case '\n':
+      text += "\\n";
+      break;
+    case '\t':
+      text += "\\t";
+      break;
+    case '\r':
+      text += "\\r";
+      break;
+    case '"':
+      text += "\\\"";
+      break;
+    case '\\':
+      text += "\\\\";
+      break;
+    default:
+      text += c;
+    }
+  }
+  text += '"';
+  auto strType = emitrust::OpaqueType::get(builder.getContext(), "&'static str");
+  return builder
+      .create<emitrust::LiteralOp>(loc, strType, builder.getStringAttr(text))
+      .getResult();
+}
+
+/// W2.3: matches a `.c_str()` call on a recognized `std::string` object —
+/// `expr` after `IgnoreParenImpCasts` is a `CXXMemberCallExpr` naming a
+/// method `c_str` whose parent record is in namespace `std` — and returns
+/// the underlying implicit-object expression. Returns null for every other
+/// shape (the caller falls through to the ordinary printf '%s' shapes).
+static const clang::Expr *matchStlCStrCall(const clang::Expr *expr) {
+  const auto *call = llvm::dyn_cast<clang::CXXMemberCallExpr>(expr);
+  if (!call)
+    return nullptr;
+  const clang::CXXMethodDecl *method = call->getMethodDecl();
+  if (!method || method->getDeclName().getAsString() != "c_str" ||
+      !method->getParent()->isInStdNamespace())
+    return nullptr;
+  return call->getImplicitObjectArgument();
+}
+
 FailureOr<Value>
 CImporter::emitPrintfStringArg(const clang::Expr *expr,
                                std::optional<unsigned> precision) {
@@ -3219,54 +3361,44 @@ CImporter::emitPrintfStringArg(const clang::Expr *expr,
   // predefined identifier's `const char[N]` lvalue type.
   const clang::Expr *arg = expr->IgnoreParenImpCasts();
   Location loc = translateLoc(arg->getBeginLoc());
+  // W2.3: `printf("%s", s.c_str())` — the idiomatic C++ shape, since
+  // `std::string` has no implicit conversion to `const char*` — borrows
+  // the String place shared, exactly like `__emitrust_sprintf`'s staged
+  // String borrow; deref coercion `&String` -> `&str` applies at the
+  // format-argument position. This is the ONLY position `.c_str()` is
+  // recognized in (design.md's STL OUT list covers every other use).
+  if (const clang::Expr *receiverExpr = matchStlCStrCall(arg)) {
+    if (precision)
+      return emitError(loc)
+             << "unsupported: a precision on a '%s' argument fed by "
+                "std::string::c_str()";
+    FailureOr<Value> receiver =
+        emitLValue(receiverExpr->IgnoreParenImpCasts());
+    if (failed(receiver))
+      return failure();
+    auto lvalueType = llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+    if (!lvalueType || !isStlOpaqueType(lvalueType.getValueType()) ||
+        llvm::cast<emitrust::OpaqueType>(lvalueType.getValueType()).getValue() !=
+            "String")
+      return emitError(loc)
+             << "unsupported: c_str() receiver is not a recognized "
+                "std::string";
+    return builder
+        .create<emitrust::AddrOfOp>(
+            loc, emitrust::RefType::get(lvalueType.getValueType()), *receiver,
+            /*is_mut=*/false)
+        .getResult();
+  }
   if (const clang::StringLiteral *literal = underlyingStringLiteral(arg)) {
     if (!literal->isOrdinary())
       return emitError(loc)
              << "unsupported: non-ordinary string literal in printf '%s'";
-    // The literal's decoded bytes become a Rust string literal emitted
-    // verbatim into the generated source: an embedded NUL would diverge
-    // from C (which stops printing there) and a non-ASCII byte would fail
-    // rustc's UTF-8 check, so both are rejected; quote, backslash, and the
-    // whitespace escapes are re-escaped for the Rust spelling.
     // A %.Ns precision truncates at import time: C never reads past the
-    // Nth byte, so only the retained prefix is validated below.
+    // Nth byte, so only the retained prefix is validated/escaped below.
     llvm::StringRef data = literal->getString();
     if (precision && *precision < data.size())
       data = data.take_front(*precision);
-    std::string text = "\"";
-    for (char c : data) {
-      if (c == '\0')
-        return emitError(loc)
-               << "unsupported: NUL byte in printf '%s' string literal";
-      if ((c < 0x20 || c > 0x7e) && c != '\n' && c != '\t' && c != '\r')
-        return emitError(loc) << "unsupported: non-printable or non-ASCII "
-                                 "byte in printf '%s' string literal";
-      switch (c) {
-      case '\n':
-        text += "\\n";
-        break;
-      case '\t':
-        text += "\\t";
-        break;
-      case '\r':
-        text += "\\r";
-        break;
-      case '"':
-        text += "\\\"";
-        break;
-      case '\\':
-        text += "\\\\";
-        break;
-      default:
-        text += c;
-      }
-    }
-    text += '"';
-    auto strType =
-        emitrust::OpaqueType::get(builder.getContext(), "&'static str");
-    return builder
-        .create<emitrust::LiteralOp>(loc, strType, builder.getStringAttr(text))
-        .getResult();
+    return emitRustStrLiteral(loc, data, "printf '%s' string literal");
   }
   // Renders a borrowed i8 slice through the on-demand `__emitrust_cstr`
   // helper (stops at the first NUL, like C's %s) or, under a %.Ns
