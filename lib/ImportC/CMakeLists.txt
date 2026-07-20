@@ -4,6 +4,7 @@
 # them up transitively.
 add_mlir_library(MLIREmitRustImportC
   ImportC.cpp
+  ImportCTypes.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/EmitRust
