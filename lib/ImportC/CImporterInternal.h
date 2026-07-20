@@ -3677,4 +3677,1015 @@ private:
 };
 
 
+//===----------------------------------------------------------------------===//
+// AST helpers
+//===----------------------------------------------------------------------===//
+
+/// Returns true if the statement tree rooted at `stmt` contains any C label
+/// (`LabelStmt`). Iterative worklist traversal over the AST.
+static bool containsLabelStmt(const clang::Stmt *stmt) {
+  SmallVector<const clang::Stmt *> worklist{stmt};
+  while (!worklist.empty()) {
+    const clang::Stmt *current = worklist.pop_back_val();
+    if (!current)
+      continue;
+    if (llvm::isa<clang::LabelStmt>(current))
+      return true;
+    for (const clang::Stmt *child : current->children())
+      worklist.push_back(child);
+  }
+  return false;
+}
+
+/// Returns true when the statement tree rooted at `body` touches C's
+/// va_list machinery: a `va_arg` read (`VAArgExpr`), a call to any of the
+/// va_start/va_end/va_copy builtins, or a declaration of a variable of the
+/// target's `va_list` (`__builtin_va_list`) type. A variadic definition
+/// whose body is va_list-free by this scan never observes its trailing
+/// arguments, so it imports as its fixed prototype (CTS-P9); a body this
+/// scan flags keeps the variadic-definition rejection. Iterative worklist
+/// traversal over the AST.
+static bool bodyUsesVaList(const clang::ASTContext &context,
+                           const clang::Stmt *body) {
+  clang::QualType vaListType =
+      context.getBuiltinVaListType().getCanonicalType();
+  SmallVector<const clang::Stmt *> worklist{body};
+  while (!worklist.empty()) {
+    const clang::Stmt *current = worklist.pop_back_val();
+    if (!current)
+      continue;
+    if (llvm::isa<clang::VAArgExpr>(current))
+      return true;
+    if (const auto *call = llvm::dyn_cast<clang::CallExpr>(current)) {
+      switch (call->getBuiltinCallee()) {
+      case clang::Builtin::BI__builtin_va_start:
+      case clang::Builtin::BI__builtin_c23_va_start:
+      case clang::Builtin::BI__builtin_va_end:
+      case clang::Builtin::BI__builtin_va_copy:
+      case clang::Builtin::BI__builtin_ms_va_start:
+      case clang::Builtin::BI__builtin_ms_va_end:
+      case clang::Builtin::BI__builtin_ms_va_copy:
+      case clang::Builtin::BI__va_start:
+      case clang::Builtin::BIva_start:
+      case clang::Builtin::BIva_end:
+      case clang::Builtin::BIva_copy:
+        return true;
+      default:
+        break;
+      }
+    }
+    if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(current))
+      for (const clang::Decl *decl : declStmt->decls())
+        if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+          if (context.hasSameType(var->getType().getCanonicalType(),
+                                  vaListType))
+            return true;
+    for (const clang::Stmt *child : current->children())
+      worklist.push_back(child);
+  }
+  return false;
+}
+
+static const clang::Expr *stripTrivia(const clang::Expr *expr);
+static bool isPointerType(clang::QualType type);
+static bool isFunctionPointer(clang::QualType type);
+
+/// Returns the expression under `expr`'s implicit casts and trivia — the
+/// DeclRefExpr node itself for the `ap` operand of va_start/va_end/va_arg
+/// (CTS 00204 scope checks key consumed references by node identity).
+static const clang::Expr *strippedImplicitRef(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    e = stripTrivia(cast->getSubExpr());
+  return e;
+}
+
+/// Returns whether `place` writes through MORE than the single cursor
+/// dereference of the string-cursor parameter `param` (CTS 00204):
+/// `**s = c` or `(*s)[k] = c` write region content, which the shared
+/// slice lowering cannot accept; `*s = p` (depth one) is the legal
+/// advancement.
+static bool writesThroughCursorParam(const clang::Expr *place,
+                                     const clang::ParmVarDecl *param) {
+  unsigned depth = 0;
+  const clang::Expr *e = stripTrivia(place);
+  while (true) {
+    if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e);
+        unary && unary->getOpcode() == clang::UO_Deref) {
+      ++depth;
+      e = stripTrivia(unary->getSubExpr());
+      continue;
+    }
+    if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(e)) {
+      ++depth;
+      e = stripTrivia(subscript->getBase());
+      continue;
+    }
+    if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+      e = stripTrivia(cast->getSubExpr());
+      continue;
+    }
+    break;
+  }
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  return ref && ref->getDecl() == param && depth >= 2;
+}
+
+/// Recursively scans `stmt` for a use of the candidate string-cursor
+/// parameter `param` outside the bounded shape (CTS 00204). Legal uses
+/// read through `*param` or advance it with `*param = <expr>`; the bare
+/// parameter as a value (stored into a global, passed to another call),
+/// its address, and writes deeper than the cursor dereference all escape.
+/// Returns the offending expression, or null when the shape holds.
+static const clang::Expr *
+findCursorParamEscape(const clang::Stmt *stmt,
+                      const clang::ParmVarDecl *param) {
+  if (!stmt)
+    return nullptr;
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt);
+      binary && binary->isAssignmentOp() &&
+      writesThroughCursorParam(binary->getLHS(), param))
+    return binary->getLHS();
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
+    if (unary->isIncrementDecrementOp() &&
+        writesThroughCursorParam(unary->getSubExpr(), param))
+      return unary->getSubExpr();
+    if (unary->getOpcode() == clang::UO_Deref)
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+              strippedImplicitRef(unary->getSubExpr()));
+          ref && ref->getDecl() == param)
+        return nullptr; // `*param`: the bounded read/advance shape.
+  }
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt);
+      ref && ref->getDecl() == param)
+    return ref; // The bare parameter escapes.
+  for (const clang::Stmt *child : stmt->children())
+    if (const clang::Expr *hit = findCursorParamEscape(child, param))
+      return hit;
+  return nullptr;
+}
+
+/// Collects every pointer-typed local variable declared inside `stmt`
+/// (data pointers only; function pointers are ordinary values). Used by
+/// the string-cursor planning pass to interrogate their regions.
+static void collectLocalPointerDecls(
+    const clang::Stmt *stmt,
+    SmallVectorImpl<const clang::VarDecl *> &locals) {
+  if (!stmt)
+    return;
+  if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt))
+    for (const clang::Decl *decl : declStmt->decls())
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+        if (var->hasLocalStorage() && isPointerType(var->getType()) &&
+            !isFunctionPointer(var->getType()))
+          locals.push_back(var);
+  for (const clang::Stmt *child : stmt->children())
+    collectLocalPointerDecls(child, locals);
+}
+
+/// Strips parentheses, `ConstantExpr` wrappers (clang wraps constant
+/// contexts such as case values in `ConstantExpr`), and `ExprWithCleanups`
+/// wrappers (clang marks full expressions containing block-scope compound
+/// literals, whose "cleanup" is the end of the object's lifetime — nothing
+/// to emit, the temp's place is ordinary SSA) without touching casts.
+static const clang::Expr *stripTrivia(const clang::Expr *expr) {
+  while (true) {
+    expr = expr->IgnoreParens();
+    if (const auto *constant = llvm::dyn_cast<clang::ConstantExpr>(expr)) {
+      expr = constant->getSubExpr();
+      continue;
+    }
+    if (const auto *cleanups =
+            llvm::dyn_cast<clang::ExprWithCleanups>(expr)) {
+      expr = cleanups->getSubExpr();
+      continue;
+    }
+    return expr;
+  }
+}
+
+/// Returns the string literal an expression carries in a literal position:
+/// the literal itself, or the function-name literal of a `__func__`-family
+/// predefined identifier (C99 6.4.2.2 defines `__func__` as if a
+/// `static const char` array holding the function name existed; clang
+/// materializes exactly that array's contents as a `StringLiteral` inside
+/// the `PredefinedExpr`, so every literal consumer — printf `%s`, the
+/// read-only literal-region machinery — treats the two identically).
+/// Returns null for any other expression.
+static const clang::StringLiteral *
+underlyingStringLiteral(const clang::Expr *expr) {
+  if (const auto *literal = llvm::dyn_cast<clang::StringLiteral>(expr))
+    return literal;
+  if (const auto *predefined = llvm::dyn_cast<clang::PredefinedExpr>(expr))
+    return predefined->getFunctionName();
+  return nullptr;
+}
+
+/// Returns the defining declaration of `type`'s complete named enum, or
+/// null when `type` is not an enum, incomplete, or anonymous.
+static const clang::EnumDecl *namedEnumDeclOf(clang::QualType type) {
+  const auto *enumType = llvm::dyn_cast<clang::EnumType>(
+      type.getCanonicalType().getTypePtr());
+  if (!enumType)
+    return nullptr;
+  const clang::EnumDecl *definition = enumType->getDecl()->getDefinition();
+  if (!definition || definition->getName().empty())
+    return nullptr;
+  return definition;
+}
+
+/// Recognizes an operand that denotes a value of a complete named enum. In
+/// C, Sema promotes enum operands of comparisons and switch conditions to
+/// the enum's underlying integer type with an implicit `IntegralCast`, and
+/// enumerator references themselves have type `int`; this helper peels one
+/// such promotion cast and classifies what is underneath: an enum-typed
+/// expression or an enumerator reference. Anonymous enums are plain `int`
+/// values and yield `nullopt`.
+static std::optional<EnumOperand>
+classifyEnumOperand(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_IntegralCast)
+      e = stripTrivia(cast->getSubExpr());
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e))
+    if (const auto *enumerator =
+            llvm::dyn_cast<clang::EnumConstantDecl>(ref->getDecl())) {
+      const auto *parent =
+          llvm::cast<clang::EnumDecl>(enumerator->getDeclContext());
+      const clang::EnumDecl *definition = parent->getDefinition();
+      if (!definition || definition->getName().empty())
+        return std::nullopt;
+      return EnumOperand{definition, nullptr, enumerator};
+    }
+  if (const clang::EnumDecl *decl = namedEnumDeclOf(e->getType()))
+    return EnumOperand{decl, e, nullptr};
+  return std::nullopt;
+}
+
+/// Finds a case or default label nested anywhere below `stmt` without
+/// descending into nested switch statements (whose labels are their own and
+/// are handled when the recursive statement importer reaches them). The root
+/// itself may be a nested switch: a case arm whose sub-statement is another
+/// switch is legal, so the check applies to the root as well as to children.
+/// Used to route Duff's-device-style switches whose labels are not at the
+/// top level of the switch body to the dispatch lowering
+/// (`emitDispatchSwitch`) instead of the structured one.
+static const clang::Stmt *findNestedSwitchLabel(const clang::Stmt *stmt) {
+  if (!stmt || llvm::isa<clang::SwitchStmt>(stmt))
+    return nullptr;
+  for (const clang::Stmt *child : stmt->children()) {
+    if (!child)
+      continue;
+    if (llvm::isa<clang::SwitchCase>(child))
+      return child;
+    if (const clang::Stmt *found = findNestedSwitchLabel(child))
+      return found;
+  }
+  return nullptr;
+}
+
+/// Returns true if `body` has the plain shape the structured switch
+/// lowering handles: the first top-level statement starts a case/default
+/// label chain (so nothing precedes the first label) and no case/default
+/// label of this switch is nested inside an inner statement. Any other
+/// shape is lowered by `emitDispatchSwitch`.
+static bool isPlainSwitchBody(const clang::CompoundStmt *body) {
+  bool seenLabel = false;
+  for (const clang::Stmt *child : body->body()) {
+    const clang::Stmt *statement = child;
+    if (llvm::isa<clang::SwitchCase>(child)) {
+      seenLabel = true;
+      while (const auto *label = llvm::dyn_cast<clang::SwitchCase>(statement))
+        statement = label->getSubStmt();
+    } else if (!seenLabel) {
+      return false;
+    }
+    if (findNestedSwitchLabel(statement))
+      return false;
+  }
+  return true;
+}
+
+/// Returns true if `type` is an MLIR unsigned integer type (the mapping of
+/// the C unsigned integer types; signless types model the signed ones).
+static bool isUnsignedInt(Type type) {
+  auto intType = llvm::dyn_cast<IntegerType>(type);
+  return intType && intType.isUnsigned();
+}
+
+/// Returns the C-declared Rust-facing name of a record: its tag name, or,
+/// for a tagless record declared through `typedef struct { ... } T;`, the
+/// typedef name. Returns an empty StringRef for a bare anonymous struct,
+/// for which `importRecord` synthesizes a shape-keyed `Anon<n>` name
+/// (retrieved through `CImporter::emittedRecordName`). The typedef name is
+/// the record's name for all mangling and cross-TU shape-dedup purposes,
+/// exactly like a tagged struct. This is the base spelling only: for
+/// file-scope records `CImporter::structSymbolName` layers the tag-versus-
+/// ordinary-namespace collision renaming on top, and block-scope records
+/// take the `<function>_<tag>` mangle in `importRecord`.
+static llvm::StringRef recordRustName(const clang::RecordDecl *record) {
+  llvm::StringRef name = record->getName();
+  if (!name.empty())
+    return name;
+  if (const clang::TypedefNameDecl *typedefName =
+          record->getTypedefNameForAnonDecl())
+    return typedefName->getName();
+  return {};
+}
+
+/// Returns whether the canonical type of `type` is a C pointer type.
+static bool isPointerType(clang::QualType type) {
+  return type.getCanonicalType()->isPointerType();
+}
+
+/// Returns whether the canonical type of `type` is a C function pointer.
+/// Function pointers are ordinary `!emitrust.fn_ptr` values and take none
+/// of the data-pointer (decomposition or reference-parameter) paths.
+static bool isFunctionPointer(clang::QualType type) {
+  return type.getCanonicalType()->isFunctionPointerType();
+}
+
+/// Returns whether `type` is a data pointer: a C pointer that is not a
+/// function pointer. Data pointers decompose into (base, cursor) pairs;
+/// function pointers are ordinary Copy values.
+static bool isDataPointer(clang::QualType type) {
+  return isPointerType(type) && !isFunctionPointer(type);
+}
+
+/// C99-7 volatile policy: returns whether any level of `type` — the type
+/// itself, an array element, or a pointee at any pointer depth — is
+/// volatile-qualified. A volatile access has no counterpart in the
+/// emitted single-threaded Rust model (no MMIO, no signal handlers, no
+/// setjmp), so every declaration position rejects it with a located
+/// diagnostic instead of silently dropping the qualifier; an
+/// expression-level cast that introduces volatile refuses to peel
+/// instead (see `peelPointerCast`). One exception: a qualifier on a
+/// parameter OBJECT itself is body-local and never part of the function
+/// type, so `mapParamType` strips the top level before scanning
+/// (`int x[volatile 5]`, which adjusts to `int * volatile x`, imports
+/// like the unqualified spelling). const and restrict are unaffected:
+/// const maps positionally (immutable statics, const-marked variables,
+/// SSA lets), and restrict is a pure optimization hint the region
+/// analysis is already stricter than, so it is accepted and ignored.
+static bool hasVolatileQualifier(clang::ASTContext &context,
+                                 clang::QualType type) {
+  clang::QualType current = type.getCanonicalType();
+  while (true) {
+    if (current.isVolatileQualified())
+      return true;
+    if (const clang::ArrayType *array = context.getAsArrayType(current)) {
+      current = array->getElementType().getCanonicalType();
+      continue;
+    }
+    if (current->isPointerType() && !current->isFunctionPointerType()) {
+      current = current->getPointeeType().getCanonicalType();
+      continue;
+    }
+    return false;
+  }
+}
+
+/// Returns whether the canonical type of `type` is C's `FILE *` stream
+/// handle (a pointer to the stdio stream record: glibc and musl spell it
+/// `struct _IO_FILE`, BSD/macOS `struct __sFILE`, MSVC `struct _iobuf`,
+/// and a freestanding header may leave the tag `FILE` itself). FILE*
+/// values take the C99-48 owned-handle lowering — never the (base,
+/// cursor) pointer decomposition — and are only supported as
+/// function-local variables opened by fopen.
+static bool isFilePtrType(clang::QualType type) {
+  clang::QualType canonical = type.getCanonicalType();
+  if (!canonical->isPointerType())
+    return false;
+  const auto *record =
+      canonical->getPointeeType().getCanonicalType()->getAs<clang::RecordType>();
+  if (!record)
+    return false;
+  llvm::StringRef name = record->getDecl()->getName();
+  return name == "FILE" || name == "_IO_FILE" || name == "__sFILE" ||
+         name == "_iobuf";
+}
+
+/// Returns whether a FILE*-typed local variable takes the owned-handle
+/// lowering (C99-48): declared with no initializer, or initialized
+/// directly by a definition-less fopen call. Any other initializer
+/// (stdout, another FILE* value, ...) falls back to the historical
+/// pointer machinery and its located rejections, which older tests pin
+/// (`FILE *g = stdout;` stays "copying a global pointer variable").
+static bool isFileHandleLocal(const clang::VarDecl *var) {
+  if (!var->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(var) ||
+      !isFilePtrType(var->getType()))
+    return false;
+  const clang::Expr *init = var->getInit();
+  if (!init)
+    return true;
+  const auto *call =
+      llvm::dyn_cast<clang::CallExpr>(init->IgnoreParenImpCasts());
+  const clang::FunctionDecl *callee = call ? call->getDirectCallee() : nullptr;
+  return callee && callee->getDeclName().isIdentifier() &&
+         callee->getName() == "fopen" && !callee->getDefinition();
+}
+
+/// Returns the data-pointer field a member expression designates, or null
+/// when `expr` is not a member access or its field is not a data pointer.
+static const clang::FieldDecl *dataPointerFieldOf(const clang::Expr *expr) {
+  const auto *member = llvm::dyn_cast<clang::MemberExpr>(stripTrivia(expr));
+  if (!member)
+    return nullptr;
+  const auto *field =
+      llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+  if (!field || !isDataPointer(field->getType()))
+    return nullptr;
+  return field;
+}
+
+/// Returns the operand of a pointer cast (explicit C-style, or the
+/// implicit bitcast Sema inserts for `void *` conversions) that is
+/// transparent to the (base, cursor) decomposition, or null for every
+/// other cast. Transparent casts are qualification adjustments (`(int *)p`
+/// on an `int *`, `(const char *)s`) and — the pointee-wildcard rule,
+/// CTS-P9 — casts to or from a `void` pointee at any matching pointer
+/// depth: `(void *)&x`, `(int *)voidp`, and the second-order
+/// `(int **)voidpp` all peel, because a `void *` carries no element unit
+/// of its own. A reinterpret-back site `*(T *)p` therefore reaches the
+/// deref emission, which type-checks `T` against the region's base
+/// element type. Casts between distinct non-void pointees
+/// (`(char *)&x`) and integer-to-pointer casts are never peeled: the
+/// decomposition's element unit would change, so those shapes keep their
+/// located rejections.
+static const clang::Expr *peelPointerCast(clang::ASTContext &context,
+                                          const clang::Expr *expr) {
+  const auto *cast = llvm::dyn_cast<clang::CastExpr>(expr);
+  if (!cast || (!llvm::isa<clang::CStyleCastExpr>(cast) &&
+                !llvm::isa<clang::ImplicitCastExpr>(cast)))
+    return nullptr;
+  if (cast->getCastKind() != clang::CK_NoOp &&
+      cast->getCastKind() != clang::CK_BitCast)
+    return nullptr;
+  clang::QualType from = cast->getSubExpr()->getType().getCanonicalType();
+  clang::QualType to = cast->getType().getCanonicalType();
+  if (!isDataPointer(from) || !isDataPointer(to))
+    return nullptr;
+  while (true) {
+    clang::QualType fromPointee =
+        from->getPointeeType().getCanonicalType();
+    clang::QualType toPointee = to->getPointeeType().getCanonicalType();
+    // C99-7: a cast that introduces (or carries) a volatile-qualified
+    // pointee is never transparent — volatile is rejected by policy, so
+    // the site keeps a located rejection instead of silently dropping
+    // the qualifier. const/restrict adjustments keep peeling.
+    if (fromPointee.isVolatileQualified() || toPointee.isVolatileQualified())
+      return nullptr;
+    if (context.hasSameUnqualifiedType(fromPointee, toPointee))
+      return cast->getSubExpr();
+    if (fromPointee->isVoidType() || toPointee->isVoidType())
+      return cast->getSubExpr();
+    if (fromPointee->isPointerType() && toPointee->isPointerType()) {
+      from = fromPointee;
+      to = toPointee;
+      continue;
+    }
+    return nullptr;
+  }
+}
+
+/// Strips the leading pointer casts a *dereference* site sees through:
+/// first the decomposition-transparent peels (`peelPointerCast` —
+/// qualification adjustments and the `void *` wildcard), then direct
+/// explicit bitcasts between distinct non-void single-level object
+/// pointees (`(unsigned *)(char *)...`, the classic type-pun spelling,
+/// CTS-P11). The latter are NOT transparent to the general decomposition
+/// (binding a pointer through one still rejects); only the deref
+/// emission strips them, and it then type-checks the viewed type against
+/// the region's element type — exact matches lower directly, same-width
+/// integer views bitcast, wider views over byte regions widen to
+/// ne_bytes accesses, and everything else keeps the located
+/// `reinterprets the pointee` rejection.
+static const clang::Expr *stripObjectPointerCasts(clang::ASTContext &context,
+                                                  const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (true) {
+    if (const clang::Expr *sub = peelPointerCast(context, e)) {
+      e = stripTrivia(sub);
+      continue;
+    }
+    const auto *cast = llvm::dyn_cast<clang::CastExpr>(e);
+    if (!cast || (!llvm::isa<clang::CStyleCastExpr>(cast) &&
+                  !llvm::isa<clang::ImplicitCastExpr>(cast)) ||
+        cast->getCastKind() != clang::CK_BitCast)
+      return e;
+    clang::QualType from = cast->getSubExpr()->getType();
+    clang::QualType to = cast->getType();
+    if (!isDataPointer(from) || !isDataPointer(to))
+      return e;
+    // Pointer-to-pointer reinterprets stay out (CTS-P5 scope).
+    if (from.getCanonicalType()->getPointeeType()->isPointerType() ||
+        to.getCanonicalType()->getPointeeType()->isPointerType())
+      return e;
+    e = stripTrivia(cast->getSubExpr());
+  }
+}
+
+/// Returns whether the dereference of `expr` views the region through a
+/// changed pointee: the fully cast-stripped pointer's pointee differs
+/// from `expr`'s own pointee (covers both the `void *`-mediated
+/// reinterpret-back sites of CTS-P9 and the direct pun casts of
+/// CTS-P11). Qualification-only peels report false.
+static bool viewsChangedPointee(clang::ASTContext &context,
+                                const clang::Expr *expr) {
+  const clang::Expr *stripped = stripObjectPointerCasts(context, expr);
+  return !context.hasSameUnqualifiedType(
+      expr->getType().getCanonicalType()->getPointeeType(),
+      stripped->getType().getCanonicalType()->getPointeeType());
+}
+
+/// Returns whether `region` is statically null (CTS-P9): a consumable
+/// base-less nullable region with a conditional (ternary) source — one
+/// that only ever united null constants and other null-only pointers
+/// through a pointer-typed conditional. Such a region carries zero
+/// runtime state: no flag cell is materialized, null tests fold to
+/// constants, a pointer-to-int cast folds to 0, and dereferences are
+/// located rejections. A base-less nullable region built only from
+/// direct null bindings keeps the historical CTS-P8 flag cell (the
+/// pointers-null.c contract).
+static bool isStaticallyNullRegion(const PointerRegion *region) {
+  return region && region->invalidReason.empty() && region->bases.empty() &&
+         !region->literalBase && !region->allocSite && region->nullable &&
+         region->hasConditionalSource;
+}
+
+/// Returns whether `region` is an integer-carrier region (CTS-P3): a
+/// consumable region whose only sources are integer-to-pointer casts,
+/// calls returning carriers, and null pointer constants. Such a region
+/// never addresses a modeled object — it is an integer riding in pointer
+/// clothing — so each of its pointers lowers as a plain i64 value (null is
+/// the i64 zero) with no base, cursor, or flag cell. Dereference and
+/// pointer arithmetic have nothing to resolve against and stay located
+/// rejections at emission.
+static bool isCarrierRegion(const PointerRegion *region) {
+  return region && region->invalidReason.empty() &&
+         region->hasCarrierSource && region->bases.empty() &&
+         !region->literalBase && !region->allocSite;
+}
+
+/// The statically resolved target of a `&root.member` address expression
+/// (CTS-P9): the root object and the (possibly anonymous-chain-flattened)
+/// leaf field. `touchesUnion` reports union storage anywhere on the path,
+/// which has no unaliased member place to root a region at.
+struct MemberAddressTarget {
+  /// The root variable the member chain is rooted at; null when the shape
+  /// is outside the single-object member-path model (arrow bases, nested
+  /// named members, bitfields).
+  const clang::VarDecl *root = nullptr;
+  /// The leaf field whose address is taken.
+  const clang::FieldDecl *field = nullptr;
+  /// True when the leaf or any implicit anonymous hop lives in union
+  /// storage.
+  bool touchesUnion = false;
+};
+
+/// Classifies the operand of `&member-expr`: accepts a non-arrow member
+/// of a directly named (local or global) struct variable, walking implicit
+/// anonymous-aggregate hops (whose fields are flattened into the parent
+/// struct_def, so a single `emitrust.member` projection reaches the leaf).
+/// Reports union storage on the path via `touchesUnion`; every other shape
+/// leaves `root` null.
+static MemberAddressTarget
+classifyMemberAddress(const clang::MemberExpr *memberExpr) {
+  MemberAddressTarget target;
+  const auto *field =
+      llvm::dyn_cast<clang::FieldDecl>(memberExpr->getMemberDecl());
+  if (!field)
+    return target;
+  target.field = field;
+  target.touchesUnion = field->getParent()->isUnion();
+  if (memberExpr->isArrow() || field->isBitField())
+    return target;
+  const clang::Expr *base = stripTrivia(memberExpr->getBase());
+  while (const auto *inner = llvm::dyn_cast<clang::MemberExpr>(base)) {
+    const auto *innerField =
+        llvm::dyn_cast<clang::FieldDecl>(inner->getMemberDecl());
+    if (!innerField || inner->isArrow())
+      return target;
+    if (innerField->getParent()->isUnion())
+      target.touchesUnion = true;
+    // Only implicit anonymous-aggregate hops keep the leaf reachable with
+    // one flattened-name projection; a named intermediate member is a
+    // nested path outside the model.
+    if (!innerField->isAnonymousStructOrUnion())
+      return target;
+    base = stripTrivia(inner->getBase());
+  }
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(base))
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+      if (!isPointerType(var->getType()))
+        target.root = var;
+  return target;
+}
+
+/// Peels the casts a returned function address wears (the implicit or
+/// C-style bitcast to a `void *`/data-pointer return type, no-op casts,
+/// parens) and returns the underlying function reference expression (a
+/// `DeclRefExpr` naming a `FunctionDecl`, reached through `&f` or the
+/// function-to-pointer decay), or null when the expression is anything
+/// else. Only qualification-preserving peeling: no cast that changes what
+/// the value decomposes into is looked through.
+static const clang::Expr *returnedFunctionExpr(const clang::Expr *expr) {
+  const clang::Expr *e = expr->IgnoreParens();
+  while (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e)) {
+    clang::CastKind kind = cast->getCastKind();
+    if (kind != clang::CK_BitCast && kind != clang::CK_NoOp &&
+        kind != clang::CK_FunctionToPointerDecay)
+      return nullptr;
+    if (kind == clang::CK_FunctionToPointerDecay) {
+      e = cast->getSubExpr()->IgnoreParens();
+      break;
+    }
+    e = cast->getSubExpr()->IgnoreParens();
+  }
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    if (unary->getOpcode() == clang::UO_AddrOf)
+      e = unary->getSubExpr()->IgnoreParens();
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e))
+    if (llvm::isa<clang::FunctionDecl>(ref->getDecl()))
+      return ref;
+  return nullptr;
+}
+
+/// The base object of one returned global address site (CTS-S, 00089): a
+/// return-site expression of the form `&g` (whole object, cursor 0) sets
+/// `base` to the global `g` with `wholeObject` true; `&g.member...` (a
+/// member address rooted at a global through non-arrow, non-bitfield hops)
+/// sets `base` with `wholeObject` false. Anything else leaves `base` null.
+struct ReturnedGlobalAddress {
+  const clang::VarDecl *base = nullptr;
+  bool wholeObject = false;
+};
+
+/// Classifies a return-site expression as a returned global address (see
+/// `ReturnedGlobalAddress`). Only qualification-preserving casts (no-op or
+/// bit casts, parens) are peeled — mirroring `returnedFunctionExpr` — so
+/// no cast that changes what the value decomposes into is looked through.
+static ReturnedGlobalAddress returnedGlobalAddress(const clang::Expr *expr) {
+  ReturnedGlobalAddress result;
+  const clang::Expr *e = expr->IgnoreParens();
+  while (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e)) {
+    clang::CastKind kind = cast->getCastKind();
+    if (kind != clang::CK_BitCast && kind != clang::CK_NoOp)
+      return result;
+    e = cast->getSubExpr()->IgnoreParens();
+  }
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e);
+  if (!unary || unary->getOpcode() != clang::UO_AddrOf)
+    return result;
+  e = stripTrivia(unary->getSubExpr());
+  bool whole = true;
+  while (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e)) {
+    if (member->isArrow())
+      return result;
+    whole = false;
+    e = stripTrivia(member->getBase());
+  }
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  const auto *var = ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl())
+                        : nullptr;
+  if (!var || !var->hasGlobalStorage() || isPointerType(var->getType()))
+    return result;
+  result.base = llvm::cast<clang::VarDecl>(var->getCanonicalDecl());
+  result.wholeObject = whole;
+  return result;
+}
+
+/// Collects every `return` statement of `stmt`'s subtree into `returns`.
+static void collectReturnStmts(
+    const clang::Stmt *stmt,
+    SmallVectorImpl<const clang::ReturnStmt *> &returns) {
+  if (!stmt)
+    return;
+  if (const auto *ret = llvm::dyn_cast<clang::ReturnStmt>(stmt))
+    returns.push_back(ret);
+  for (const clang::Stmt *child : stmt->children())
+    collectReturnStmts(child, returns);
+}
+
+/// Returns the record declaration of `type` when it (canonically) is a
+/// complete struct type; null otherwise.
+static const clang::RecordDecl *recordOfType(clang::QualType type) {
+  const auto *recordType =
+      type.getCanonicalType()->getAs<clang::RecordType>();
+  if (!recordType)
+    return nullptr;
+  const clang::RecordDecl *record = recordType->getDecl();
+  return record->getDefinition();
+}
+
+/// Returns whether `record` (transitively, through nested struct and
+/// array-of-struct fields) contains a data-pointer field. Cycles cannot
+/// arise: recursion only follows by-value struct fields, and a struct
+/// cannot contain itself by value.
+static bool recordHasDataPointerField(const clang::RecordDecl *record) {
+  if (!record)
+    return false;
+  for (const clang::FieldDecl *field : record->fields()) {
+    clang::QualType fieldType = field->getType();
+    while (const auto *array = llvm::dyn_cast<clang::ArrayType>(
+               fieldType.getCanonicalType().getTypePtr()))
+      fieldType = array->getElementType();
+    if (isDataPointer(fieldType))
+      return true;
+    if (recordHasDataPointerField(recordOfType(fieldType)))
+      return true;
+  }
+  return false;
+}
+
+/// Returns the number of innermost (non-array) elements one value of
+/// `type` spans: the product of all constant array extents, or 1 for a
+/// non-array type. This is the scale factor of the flat row-major cursor
+/// scheme: a decomposed pointer's i64 cursor counts innermost elements of
+/// its base object, so an index over a row of a multi-dimensional array
+/// advances the cursor by the row's flat element count.
+static uint64_t flatElementCount(clang::ASTContext &context,
+                                 clang::QualType type) {
+  uint64_t count = 1;
+  const clang::ConstantArrayType *array = context.getAsConstantArrayType(type);
+  while (array) {
+    count *= array->getSize().getZExtValue();
+    array = context.getAsConstantArrayType(array->getElementType());
+  }
+  return count;
+}
+
+/// Returns whether the pointer-typed expression type `type` points to a
+/// whole array (a row of a multi-dimensional array, e.g. `char (*)[4]`).
+/// Arithmetic on such pointers moves the cursor by whole rows, which the
+/// flat cursor scheme only implements for the subscript and address-of
+/// forms; the walking forms (`++`, `+ n`, `+=`, difference) are rejected.
+static bool pointsToArray(clang::QualType type) {
+  return type.getCanonicalType()->getPointeeType()->isArrayType();
+}
+
+/// Returns the local, non-parameter variable a stripped declaration
+/// reference `expr` names, or null when `expr` is not such a reference.
+static const clang::VarDecl *asLocalVarRef(const clang::Expr *expr) {
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(expr));
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var || !var->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(var))
+    return nullptr;
+  return var;
+}
+
+/// Returns the local, non-parameter variable behind a (possibly
+/// lvalue-to-rvalue-wrapped) declaration reference `expr`, or null when
+/// `expr` is not such a reference. The dereference forms of a second-order
+/// pointer (`*pp`, `**pp`) read the pointer through a load, so their
+/// resolvers strip the load wrapper first (CTS-P5).
+static const clang::VarDecl *asLoadedLocalVarRef(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_LValueToRValue ||
+        cast->getCastKind() == clang::CK_NoOp)
+      e = cast->getSubExpr();
+  return asLocalVarRef(e);
+}
+
+/// Returns whether `type` is a second-order data pointer: a pointer whose
+/// pointee is itself a pointer (`T **`, including a pointer to a function
+/// pointer, which the importer rejects at the declaration).
+static bool isSecondOrderPointerType(clang::QualType type) {
+  return isPointerType(type) &&
+         isPointerType(type.getCanonicalType()->getPointeeType());
+}
+
+/// Returns whether `type` is a pointer to a pointer to char — the
+/// `const char **` string-cursor parameter shape (CTS 00204). Deeper
+/// pointer nesting and non-char pointees keep the historical
+/// pointer-to-pointer parameter rejection.
+static bool isCharPointerPointerType(clang::QualType type) {
+  clang::QualType canonical = type.getCanonicalType();
+  const auto *outer = canonical->getAs<clang::PointerType>();
+  if (!outer)
+    return false;
+  const auto *inner =
+      outer->getPointeeType().getCanonicalType()->getAs<clang::PointerType>();
+  if (!inner)
+    return false;
+  return inner->getPointeeType().getCanonicalType()->isCharType();
+}
+
+/// Matches `*s` where `s` is a pointer-to-pointer PARAMETER read through
+/// the usual lvalue-to-rvalue load: the shape every use of a string-cursor
+/// parameter reduces to (CTS 00204). Returns the parameter or null.
+static const clang::ParmVarDecl *
+asPointerPointerParamDeref(const clang::Expr *expr) {
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
+  if (!unary || unary->getOpcode() != clang::UO_Deref)
+    return nullptr;
+  const clang::Expr *sub = stripTrivia(unary->getSubExpr());
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(sub))
+    sub = stripTrivia(cast->getSubExpr());
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(sub);
+  const auto *param =
+      ref ? llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()) : nullptr;
+  if (!param || !isSecondOrderPointerType(param->getType()))
+    return nullptr;
+  return param;
+}
+
+/// Returns the local variable or parameter a stripped declaration
+/// reference `expr` names, or null when `expr` is not such a reference.
+/// Used by the pointer choke points that accept both decomposed pointer
+/// locals and slice-classified pointer parameters.
+static const clang::VarDecl *asVarRef(const clang::Expr *expr) {
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(expr));
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var || !var->hasLocalStorage())
+    return nullptr;
+  return var;
+}
+
+/// Returns the static-storage (file-scope or static-local) data-pointer
+/// variable a stripped declaration reference `expr` names, canonicalized,
+/// or null when `expr` is not such a reference. Global pointers
+/// participate in the region analysis so that `planOwners` can merge
+/// their per-function facts program-wide and `importPointerGlobal` can
+/// validate the union (CTS-P4).
+static const clang::VarDecl *asGlobalDataPointerRef(const clang::Expr *expr) {
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripTrivia(expr));
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var || var->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(var))
+    return nullptr;
+  if (!isPointerType(var->getType()) || isFunctionPointer(var->getType()))
+    return nullptr;
+  return var->getCanonicalDecl();
+}
+
+/// Returns the `calloc`/`malloc` call at the root of `expr` (looking
+/// through casts, e.g. the implicit `void *` conversion), or null. Only
+/// definition-less declarations qualify: a user-defined function of the
+/// same name is an ordinary call, never a promotable allocation.
+static const clang::CallExpr *asAllocCall(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
+    e = stripTrivia(cast->getSubExpr());
+  const auto *call = llvm::dyn_cast<clang::CallExpr>(e);
+  if (!call)
+    return nullptr;
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  if (!callee || callee->hasBody() || !callee->getIdentifier())
+    return nullptr;
+  llvm::StringRef name = callee->getName();
+  if (name != "calloc" && name != "malloc")
+    return nullptr;
+  return call;
+}
+
+/// Returns the pointer-typed parameter a stripped (possibly
+/// lvalue-to-rvalue-wrapped) declaration reference `expr` names, or null
+/// when `expr` is not such a reference.
+static const clang::ParmVarDecl *asPointerParamRef(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_LValueToRValue ||
+        cast->getCastKind() == clang::CK_NoOp)
+      e = stripTrivia(cast->getSubExpr());
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  if (!ref)
+    return nullptr;
+  const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl());
+  if (!param || !isPointerType(param->getType()))
+    return nullptr;
+  return param;
+}
+
+/// Recursive walk of `classifyPointerParams`: collects every pointer
+/// parameter whose use demands the whole element run. A direct dereference
+/// (`*p`) or arrow (`p->f`) is benign and keeps the parameter a scalar
+/// reference; any other appearance of a pointer parameter (subscript,
+/// arithmetic, comparison, difference, reassignment, copy into a pointer
+/// local, address-of, call argument) inserts it into `sliceParams`.
+static void collectSliceParams(
+    const clang::Stmt *stmt,
+    llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &sliceParams) {
+  if (!stmt)
+    return;
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt))
+    if (unary->getOpcode() == clang::UO_Deref &&
+        asPointerParamRef(unary->getSubExpr()))
+      return; // Benign direct dereference; do not descend into the read.
+  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(stmt))
+    if (member->isArrow() && asPointerParamRef(member->getBase()))
+      return; // Benign arrow access; the base has no other children.
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (const auto *param =
+            llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()))
+      if (isPointerType(param->getType()))
+        sliceParams.insert(param);
+  for (const clang::Stmt *child : stmt->children())
+    collectSliceParams(child, sliceParams);
+}
+
+static bool voidParamOnlyTruthTested(const clang::Stmt *stmt,
+                                     const clang::ParmVarDecl *param);
+
+/// Scans a condition expression for the integer-carrier classification of
+/// `void *` parameters (CTS-P3): bare loads of `param` are consumed as
+/// truth tests, looking through parens, `PointerToBoolean` conversions,
+/// `!`, and the `&&`/`||` connectives; any other subexpression is walked
+/// generally (so a use of `param` inside it disqualifies).
+static bool voidParamCondOk(const clang::Expr *cond,
+                            const clang::ParmVarDecl *param) {
+  const clang::Expr *e = stripTrivia(cond);
+  if (asPointerParamRef(e) == param)
+    return true;
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_PointerToBoolean)
+      return voidParamCondOk(cast->getSubExpr(), param);
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    if (unary->getOpcode() == clang::UO_LNot)
+      return voidParamCondOk(unary->getSubExpr(), param);
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e))
+    if (binary->getOpcode() == clang::BO_LAnd ||
+        binary->getOpcode() == clang::BO_LOr)
+      return voidParamCondOk(binary->getLHS(), param) &&
+             voidParamCondOk(binary->getRHS(), param);
+  return voidParamOnlyTruthTested(e, param);
+}
+
+/// Returns whether every use of the `void *` parameter `param` below
+/// `stmt` is a truth test: the condition position of if/while/do/for and
+/// of the conditional operator, or a `!` in any expression position. Such
+/// a parameter never acts as a pointer at all, so it classifies as an
+/// integer carrier (`ParamKind::Carrier`, CTS-P3); any other appearance
+/// keeps the historical void-pointer-parameter rejection.
+static bool voidParamOnlyTruthTested(const clang::Stmt *stmt,
+                                     const clang::ParmVarDecl *param) {
+  if (!stmt)
+    return true;
+  if (const auto *ifStmt = llvm::dyn_cast<clang::IfStmt>(stmt))
+    return voidParamCondOk(ifStmt->getCond(), param) &&
+           voidParamOnlyTruthTested(ifStmt->getInit(), param) &&
+           voidParamOnlyTruthTested(ifStmt->getThen(), param) &&
+           voidParamOnlyTruthTested(ifStmt->getElse(), param);
+  if (const auto *whileStmt = llvm::dyn_cast<clang::WhileStmt>(stmt))
+    return voidParamCondOk(whileStmt->getCond(), param) &&
+           voidParamOnlyTruthTested(whileStmt->getBody(), param);
+  if (const auto *doStmt = llvm::dyn_cast<clang::DoStmt>(stmt))
+    return voidParamCondOk(doStmt->getCond(), param) &&
+           voidParamOnlyTruthTested(doStmt->getBody(), param);
+  if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt))
+    return (!forStmt->getCond() ||
+            voidParamCondOk(forStmt->getCond(), param)) &&
+           voidParamOnlyTruthTested(forStmt->getInit(), param) &&
+           voidParamOnlyTruthTested(forStmt->getInc(), param) &&
+           voidParamOnlyTruthTested(forStmt->getBody(), param);
+  if (const auto *conditional =
+          llvm::dyn_cast<clang::ConditionalOperator>(stmt))
+    return voidParamCondOk(conditional->getCond(), param) &&
+           voidParamOnlyTruthTested(conditional->getTrueExpr(), param) &&
+           voidParamOnlyTruthTested(conditional->getFalseExpr(), param);
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt))
+    if (unary->getOpcode() == clang::UO_LNot)
+      return voidParamCondOk(unary, param);
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (ref->getDecl() == param)
+      return false; // A use that no truth-test context consumed.
+  for (const clang::Stmt *child : stmt->children())
+    if (!voidParamOnlyTruthTested(child, param))
+      return false;
+  return true;
+}
+
+/// Returns the local variable at the root of an address-of call argument
+/// (`&x`, `&s.f`, `&arr[i]`), or null when no single local root is known.
+/// Feeds the same-base aliasing rejection of `emitCall`.
+static const clang::VarDecl *addressArgumentRoot(const clang::Expr *expr) {
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
+  if (!unary || unary->getOpcode() != clang::UO_AddrOf)
+    return nullptr;
+  const clang::Expr *place = stripTrivia(unary->getSubExpr());
+  while (true) {
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(place)) {
+      if (member->isArrow())
+        return nullptr;
+      place = stripTrivia(member->getBase());
+      continue;
+    }
+    if (const auto *subscript =
+            llvm::dyn_cast<clang::ArraySubscriptExpr>(place)) {
+      place = subscript->getBase()->IgnoreParenImpCasts();
+      continue;
+    }
+    break;
+  }
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(place))
+    return llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  return nullptr;
+}
+
 #endif // EMITRUST_IMPORTC_CIMPORTERINTERNAL_H
