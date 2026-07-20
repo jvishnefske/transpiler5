@@ -1198,6 +1198,31 @@ rule.
   Undefined externs and conflicting external definitions are rejected with
   located diagnostics. (test/EndToEnd/multi-tu.c, test/Import/C/multi-tu.c,
   multi-tu-undefined-extern.c) See FR-26.
+  W3.0 revision: a va_list-using variadic (C99-37) DEFINED in one TU and
+  CALLED from another is a located rejection, not the silent breakage it
+  was before. `planVaMonomorph` enumerates a va_list variadic's call
+  sites WITHIN A SINGLE TU only (each TU is its own `clang::ASTContext`,
+  so a caller in another TU is invisible to it), and a va_list-monomorphized
+  definition is ALWAYS replaced by its per-site clones — it never keeps an
+  ordinary symbol of its own name. Left alone, a cross-TU call site would
+  reference a symbol that exists nowhere in the merged module: an
+  unresolved call escaping with no located diagnostic. `importCProject` now
+  pre-scans every parsed AST (`collectCrossTuVaListVariadics`, before any
+  TU imports, so the scan is independent of which TU — caller or definer —
+  appears first on the command line) for externally visible va_list-using
+  variadic definitions and records their symbol names; `emitCall` consults
+  this registry only when a variadic callee's definition is invisible in
+  the current TU, raising "unsupported: call to a variadic function
+  '<name>' defined in another translation unit". A NON-va_list
+  (fixed-prototype, CTS-P9) variadic called cross-TU is unaffected: it
+  keeps the historical generic "unsupported: call to a variadic function"
+  wording (it was already rejected before this revision — cross-TU
+  resolution for it is not yet attempted at all). A variadic defined AND
+  called within the SAME TU is unaffected and still monomorphizes. Real
+  cross-TU va_list monomorphization (synthesizing clones from a
+  definition in one TU for call sites enumerated in another) is out of
+  scope for this wave and is planned for W3.5. (test/Import/C/
+  multi-tu-varargs.c, Inputs/multi-tu-varargs-def.c)
 - [x] C99-39 Preprocessor-heavy sources: #include of project and system
   headers resolves — clang's builtin resource directory is wired in at
   configure time and -I/-isystem/--extra-arg are passed through, so macros,

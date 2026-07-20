@@ -2610,6 +2610,24 @@ CImporter::planCursorParams(const clang::TranslationUnitDecl *unit) {
   return success();
 }
 
+void CImporter::collectCrossTuVaListVariadics(clang::ASTContext &context) {
+  // Pre-scan (W3.0): set the AST context so `isSystemHeaderDecl` and
+  // `mlirFuncName` resolve against THIS TU; `importTranslationUnit` sets it
+  // again to the same value before its own real pass over this same AST.
+  astContextPtr = &context;
+  const clang::TranslationUnitDecl *unit = context.getTranslationUnitDecl();
+  for (const clang::Decl *decl : unit->decls()) {
+    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+      continue;
+    const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl);
+    if (!func || !func->isThisDeclarationADefinition() || !func->hasBody() ||
+        !func->isVariadic() || !func->isExternallyVisible())
+      continue;
+    if (bodyUsesVaList(context, func->getBody()))
+      crossTuVaListVariadicNames.insert(mlirFuncName(func));
+  }
+}
+
 LogicalResult
 CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
   // Gather this TU's va_list-using variadic definitions.
@@ -6207,6 +6225,14 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
                           /*line=*/1, /*column=*/1);
   OwningOpRef<ModuleOp> module(ModuleOp::create(moduleLoc));
   CImporter importer(*module);
+  // W3.0: scan every AST for externally visible va_list-using variadic
+  // definitions BEFORE importing any of them, so the registry is complete
+  // regardless of whether a caller's TU or its callee's defining TU is
+  // processed first (`importTranslationUnit` below runs the TUs in path
+  // order, but the cross-TU call-site check needs the full-project answer
+  // from the start).
+  for (const std::unique_ptr<clang::ASTUnit> &ast : asts)
+    importer.collectCrossTuVaListVariadics(ast->getASTContext());
   for (auto [index, ast] : llvm::enumerate(asts)) {
     std::string tuTag = ("tu" + llvm::Twine(index) + "_").str();
     if (failed(importer.importTranslationUnit(
