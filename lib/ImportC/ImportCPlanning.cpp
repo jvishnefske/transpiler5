@@ -239,6 +239,39 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
       info.storageBases.push_back(node);
   }
 
+  // W3.3 (G3): an externally visible function that is NOT the whole program
+  // can still be promoted when the whole-program facts prove this TU sees all
+  // its call sites — i.e. no TU other than this one references it (calls it or
+  // takes its address). Promotion requires a direct call in THIS TU to bind
+  // the base, so the one referencing TU is necessarily this one; if a second
+  // TU calls it or takes its address, an argument this TU never analyzed could
+  // reach the function and break the all-or-nothing per-function unification,
+  // so the class must stay on the Phase-1b slice fallback. `wholeProgram` is
+  // empty for a single-file import, where `soleTranslationUnit` is already
+  // true and this helper is never consulted.
+  auto externalFnFullyVisible = [&](const clang::FunctionDecl *fn) -> bool {
+    std::string sym = mlirFuncName(fn);
+    int seenTu = -1;
+    auto onlyOneTu = [&](const llvm::SmallVectorImpl<unsigned> &tus) -> bool {
+      for (unsigned tu : tus) {
+        if (seenTu < 0)
+          seenTu = static_cast<int>(tu);
+        else if (static_cast<int>(tu) != seenTu)
+          return false;
+      }
+      return true;
+    };
+    auto callIt = wholeProgram.calleeToCallerTus.find(sym);
+    if (callIt != wholeProgram.calleeToCallerTus.end() &&
+        !onlyOneTu(callIt->second))
+      return false;
+    auto addrIt = wholeProgram.fnAddressTakenTus.find(sym);
+    if (addrIt != wholeProgram.fnAddressTakenTus.end() &&
+        !onlyOneTu(addrIt->second))
+      return false;
+    return true;
+  };
+
   // Promote every class that satisfies the full rule; anything else is a
   // silent Phase-1b fallback.
   for (const auto &entry : classes) {
@@ -283,9 +316,11 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
       // function must resolve into this one class, the return type must be
       // a plain value, the function may not be the owner itself or C
       // `main`, and all of its call sites must be visible — an externally
-      // visible function qualifies only when this TU is the whole program.
+      // visible function qualifies when this TU is the whole program OR when
+      // the whole-program facts prove no other TU references it (W3.3 G3).
       if (fn == owner || fn->getName() == "main" ||
-          (fn->isExternallyVisible() && !soleTranslationUnit) ||
+          (fn->isExternallyVisible() && !soleTranslationUnit &&
+           !externalFnFullyVisible(fn)) ||
           (isPointerType(fn->getReturnType()) &&
            !isFunctionPointer(fn->getReturnType()))) {
         qualifies = false;
