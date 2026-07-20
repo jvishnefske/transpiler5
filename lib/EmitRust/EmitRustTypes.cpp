@@ -70,12 +70,15 @@ LogicalResult emitrust::LValueType::verify(
 //===----------------------------------------------------------------------===//
 
 /// Returns whether `type` may be used as an array element type: a scalar
-/// (integer, index, f32, f64), an EmitRust struct type, or a nested
-/// EmitRust array type (a C multi-dimensional array is an array of
-/// arrays). Lvalues, slices, references, and opaque types are rejected.
+/// (integer, index, f32, f64), an EmitRust struct type, a function
+/// pointer (a C `T (*table[N])(...)` function-pointer table, rendered
+/// `[Option<fn(...)>; N]`), or a nested EmitRust array type (a C
+/// multi-dimensional array is an array of arrays). Lvalues, slices,
+/// references, and opaque types are rejected.
 bool emitrust::ArrayType::isValidElementType(Type type) {
   return llvm::isa<IntegerType, IndexType, Float32Type, Float64Type,
-                   emitrust::StructType, emitrust::ArrayType>(type);
+                   emitrust::StructType, emitrust::FnPtrType,
+                   emitrust::ArrayType>(type);
 }
 
 /// Parses the array syntax `!emitrust.array<NxT>`, where `T` may itself be
