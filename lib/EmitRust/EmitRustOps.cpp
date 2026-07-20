@@ -122,7 +122,10 @@ LogicalResult FuncOp::verify() {
 
 /// Verifies that the impl body holds only `emitrust.func` operations whose
 /// first argument is an `!emitrust.mut_ref` of the `!emitrust.struct`
-/// carrying the impl's struct name (the `&mut self` receiver).
+/// carrying the impl's struct name (the `&mut self` receiver) — OR, W2.2, an
+/// `!emitrust.ref` of that same struct (a const `&self` receiver) — unless
+/// the function carries the `emitrust.static_method` marker (W2.2), in which
+/// case it takes no receiver at all (a static/associated function).
 LogicalResult ImplOp::verify() {
   if (getStructName().empty())
     return emitOpError("struct name must not be empty");
@@ -132,18 +135,30 @@ LogicalResult ImplOp::verify() {
       return emitOpError("body may only hold emitrust.func operations, but "
                          "found '")
              << op.getName() << "'";
+    if (funcOp->hasAttr(kStaticMethodAttrName))
+      continue; // Static/associated function: no receiver to check.
     FunctionType functionType = funcOp.getFunctionType();
     if (functionType.getNumInputs() == 0)
       return funcOp.emitOpError(
           "method must take the receiver as its first argument");
-    auto mutRef = dyn_cast<MutRefType>(functionType.getInput(0));
+    // The historical diagnostic wording below is pinned by
+    // test/Dialect/EmitRust/invalid.mlir's wrong_receiver case (a
+    // !emitrust.mut_ref of the wrong struct) and is kept verbatim for that
+    // shape; a !emitrust.ref receiver (const method, W2.2) of the right
+    // struct is separately accepted just above the wording check.
+    Type receiver = functionType.getInput(0);
+    if (auto sharedRef = dyn_cast<RefType>(receiver)) {
+      auto structType = dyn_cast<StructType>(sharedRef.getPointee());
+      if (structType && structType.getName() == getStructName())
+        continue;
+    }
+    auto mutRef = dyn_cast<MutRefType>(receiver);
     auto structType =
         mutRef ? dyn_cast<StructType>(mutRef.getPointee()) : StructType();
     if (!structType || structType.getName() != getStructName())
       return funcOp.emitOpError("receiver must be a !emitrust.mut_ref of "
                                 "!emitrust.struct<\"")
-             << getStructName() << "\">, but got "
-             << functionType.getInput(0);
+             << getStructName() << "\">, but got " << receiver;
   }
   return success();
 }

@@ -4084,6 +4084,31 @@ bool CImporter::isByteRegionRecord(const clang::RecordDecl *record) {
   bool result = [&]() -> bool {
     if (definition->isInvalidDecl())
       return false;
+    // W2.2: a C++ class with base classes, virtual methods, or ANY
+    // user-declared method (mutating, const, static, a constructor, ...)
+    // carries semantics — a vtable pointer, base subobjects, or genuine
+    // methods living on the `emitrust.impl` surface — this walk's plain
+    // `.fields()` scan never accounts for. A zero-OWN-field such class
+    // (e.g. `class Risky { int attempt(int x) {...} };`, or a polymorphic
+    // `class Base2 { virtual int f(); }`) would otherwise vacuously pass
+    // the all-fields-are-u8 walk below and get misclassified as a byte
+    // region, letting a value declaration or pointer parameter of its
+    // type (this function's own value-typed caller in `mapType`, or
+    // `mapParamType`'s pointer byte-region short-circuit) skip
+    // `importRecord` entirely — and so skip both the class's method
+    // import and its destructor/virtual/operator rejections. Never
+    // byte-region classify such a class; it always takes the normal
+    // `importRecord` path, where those rejections and imports are pinned
+    // to fire. A plain data-only class/struct (only compiler-synthesized
+    // special members, `isImplicit()`) is unaffected and keeps the
+    // existing byte-region classification.
+    if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(definition)) {
+      if (cxxRecord->getNumBases() > 0 || cxxRecord->isPolymorphic())
+        return false;
+      for (const clang::CXXMethodDecl *method : cxxRecord->methods())
+        if (!method->isImplicit())
+          return false;
+    }
     uint64_t recordSize =
         context.getTypeSizeInChars(context.getRecordType(definition))
             .getQuantity();

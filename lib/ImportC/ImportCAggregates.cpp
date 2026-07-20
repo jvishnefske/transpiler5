@@ -269,6 +269,39 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
       defLoc, moduleBuilder.getStringAttr(structName),
       moduleBuilder.getStrArrayAttr(fieldNames),
       moduleBuilder.getTypeArrayAttr(fieldTypes));
+  // W2.2: a genuine C++ class's non-static-data-member methods (mutating,
+  // const, static, and non-delegating constructors) import onto the
+  // `emitrust.impl`/`emitrust.method_of` surface right after the struct
+  // itself, so every method call site reached later in the same
+  // (single-pass, declaration-order) import sees an already-imported
+  // target — mirroring this file's struct-import-order pin
+  // (cpp-basics.cpp). Destructor/virtual/operator-overload rejections
+  // already ran above, in `collectRecordFields`, before any field of this
+  // struct was collected.
+  if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(definition))
+    if (failed(importCXXMethods(cxxRecord)))
+      return failure();
+  return success();
+}
+
+LogicalResult
+CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
+  for (const clang::CXXMethodDecl *method : record->methods()) {
+    if (method->isImplicit() || method->isDeleted())
+      continue; // Compiler-synthesized special members: out of scope.
+    // Destructors, virtual methods, and overloaded operators were already
+    // rejected in `collectRecordFields`, before this class's struct_def
+    // (and so before this walk) ever ran; a copy/move/delegating
+    // constructor is out of this wave's scope too (no value/aliasing
+    // semantics modeled for it) and is rejected here, the first point a
+    // constructor is inspected individually.
+    if (const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method))
+      if (ctor->isCopyOrMoveConstructor() || ctor->isDelegatingConstructor())
+        return emitError(translateLoc(ctor->getLocation()))
+               << "unsupported: copy/move/delegating constructor";
+    if (failed(importFunction(method)))
+      return failure();
+  }
   return success();
 }
 
@@ -286,10 +319,31 @@ LogicalResult CImporter::collectRecordFields(
   // it. A record with no base classes reaches this function whether it
   // is a C `struct`, a bare C++ `class`, or a `struct`/`class` that
   // simply lists none, and imports exactly like a C struct either way.
-  if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(record))
+  if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(record)) {
     if (cxxRecord->getNumBases() > 0)
       return emitError(translateLoc(cxxRecord->bases_begin()->getBeginLoc()))
              << "unsupported: base classes are not supported";
+    // W2.2: a user-declared destructor (no drop semantics modeled), a
+    // virtual method (no vtable/dynamic dispatch), or an overloaded
+    // operator (no operator-overload lowering) is rejected at the
+    // member's own declaration — checked here, before any field (or
+    // method) of the class imports, so a rejected class never
+    // half-imports (no struct_def, no methods). Compiler-synthesized
+    // special members the class did not itself declare are skipped: they
+    // carry none of these three shapes and never surface a diagnostic.
+    for (const clang::CXXMethodDecl *method : cxxRecord->methods()) {
+      if (method->isImplicit() || method->isDeleted())
+        continue;
+      Location methodLoc = translateLoc(method->getLocation());
+      if (llvm::isa<clang::CXXDestructorDecl>(method))
+        return emitError(methodLoc)
+               << "unsupported: user-declared destructor";
+      if (method->isVirtual())
+        return emitError(methodLoc) << "unsupported: virtual method";
+      if (method->isOverloadedOperator())
+        return emitError(methodLoc) << "unsupported: overloaded operator";
+    }
+  }
   // Interns a synthesized or mangled member spelling in the arena so the
   // StringRef stored in the field list (and in `bitFieldAccessInfo`)
   // stays valid for the import's lifetime.

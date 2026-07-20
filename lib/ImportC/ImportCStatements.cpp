@@ -275,6 +275,15 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
         if (const auto *literal =
                 llvm::dyn_cast<clang::StringLiteral>(unwrapped))
           return emitStringArrayInit(place, *mlirType, literal);
+        // W2.2: `Counter c(5);` / `Counter c2;` — a non-vacuous C++
+        // constructor call (a vacuous default-construct wrapper was
+        // already stripped by `significantInit`) — default-constructs the
+        // place (already done above, an `emitrust.variable`) and then
+        // runs the constructor's body as an ordinary `&mut self` method
+        // invoked on `&mut place`, discarding its (void) result.
+        if (const auto *construct =
+                llvm::dyn_cast<clang::CXXConstructExpr>(unwrapped))
+          return emitCXXConstructInit(place, construct, loc);
         // `struct T x = f();` initializes from the call's struct value
         // exactly like the assignment form `x = f();` (CTS 00204), and
         // `struct T x = va_arg(ap, struct T)` from the monomorphized
@@ -310,6 +319,45 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
       return failure();
     return storeToPlace(loc, cell, *value);
   }
+  return success();
+}
+
+LogicalResult
+CImporter::emitCXXConstructInit(Value place,
+                                const clang::CXXConstructExpr *construct,
+                                Location loc) {
+  const clang::CXXConstructorDecl *ctor = construct->getConstructor();
+  if (!ctor || ctor->isCopyOrMoveConstructor())
+    return emitError(loc) << "unsupported: copy/move construction";
+  std::string name = cxxMethodMangledName(ctor);
+  func::FuncOp target = functions.lookup(name);
+  if (!target)
+    return emitError(loc)
+           << "unsupported: call to an unimported constructor '" << name
+           << "'";
+  FunctionType targetType = target.getFunctionType();
+  if (construct->getNumArgs() + 1 != targetType.getNumInputs())
+    return emitError(loc)
+           << "unsupported: constructor argument count mismatch";
+
+  Value addrOf = builder
+                     .create<emitrust::AddrOfOp>(loc, targetType.getInput(0),
+                                                 place, /*is_mut=*/true)
+                     .getResult();
+  SmallVector<Value> arguments(targetType.getNumInputs(), Value());
+  arguments[0] = addrOf;
+  for (auto [index, argExpr] : llvm::enumerate(construct->arguments())) {
+    FailureOr<Value> value = emitRValue(argExpr);
+    if (failed(value))
+      return failure();
+    arguments[index + 1] = *value;
+  }
+  for (auto [index, value] : llvm::enumerate(arguments))
+    if (value.getType() != targetType.getInput(index))
+      return emitError(loc) << "unsupported: call argument type mismatch";
+
+  auto callOp = builder.create<func::CallOp>(loc, target, arguments);
+  callOp->setAttr(emitrust::kMethodCallAttrName, builder.getUnitAttr());
   return success();
 }
 

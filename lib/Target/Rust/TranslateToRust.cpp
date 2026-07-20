@@ -655,11 +655,18 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
         "cannot translate a function with more than one result");
 
   Block &entryBlock = body.front();
-  // A function directly inside an `emitrust.impl` is a method: its first
-  // argument is the receiver, named `self` and rendered as `&mut self` (the
-  // impl verifier guarantees the mut_ref<struct> shape). The existing deref
-  // place rendering then yields `(*self).field...` naturally.
-  bool isMethod = isa<emitrust::ImplOp>(op->getParentOp());
+  // A function directly inside an `emitrust.impl` is a method, UNLESS it
+  // carries the `static_method` marker (W2.2), in which case it is a
+  // receiverless associated function (`Struct::name(...)`) and every
+  // argument renders like an ordinary parameter. A genuine (receiver-
+  // having) method's first argument is the receiver, named `self` and
+  // rendered as `&mut self` or `&self` depending on whether the impl
+  // verifier-checked receiver type is `!emitrust.mut_ref` (mutating,
+  // historical behavior) or `!emitrust.ref` (const, W2.2). The existing
+  // deref place rendering then yields `(*self).field...` naturally either
+  // way.
+  bool isMethod = isa<emitrust::ImplOp>(op->getParentOp()) &&
+                  !op->hasAttr(emitrust::kStaticMethodAttrName);
   os << "fn " << SymbolTable::getSymbolName(op).getValue() << "(";
   bool first = true;
   for (BlockArgument argument : entryBlock.getArguments()) {
@@ -668,7 +675,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
     first = false;
     if (isMethod && argument.getArgNumber() == 0) {
       valueNames[argument] = "self";
-      os << "&mut self";
+      os << (isa<emitrust::RefType>(argument.getType()) ? "&self"
+                                                         : "&mut self");
       continue;
     }
     os << assignName(argument) << ": ";
