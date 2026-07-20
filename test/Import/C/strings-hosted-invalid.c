@@ -4,6 +4,7 @@
 // RUN: not emitrust-import-c %t/strcpy-alias.c 2>&1 | FileCheck %s --check-prefix=STRCPYALIAS
 // RUN: not emitrust-import-c %t/strcpy-into-literal.c 2>&1 | FileCheck %s --check-prefix=STRCPYLIT
 // RUN: not emitrust-import-c %t/strchr-value.c 2>&1 | FileCheck %s --check-prefix=STRCHRVALUE
+// RUN: not emitrust-import-c %t/strchr-bind.c 2>&1 | FileCheck %s --check-prefix=STRCHRBIND
 
 // C99-48 / CTS-L1 boundaries: <string.h> shapes outside the hosted subset
 // keep located rejections.
@@ -65,3 +66,19 @@ int main(void) {
   return 0;
 }
 // STRCHRVALUE: strchr-value.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: a strchr result must feed a printf '%s' argument or a comparison against a null pointer
+
+// Binding the strchr result to a pointer local is equally outside the
+// accepted consumption shapes (printf %s argument or null comparison).
+// The pointer-region analysis rejects the initializer before the
+// strchr-specific check is reached — a strchr call is not an address
+// expression a decomposed pointer can be assigned from — so this shape
+// pins the earlier diagnostic; the strchr-specific wording above stays
+// pinned by strchr-value.c.
+//--- strchr-bind.c
+#include <string.h>
+int main(void) {
+  char a[8] = "ab";
+  char *p = strchr(a, 'a');
+  return p == 0;
+}
+// STRCHRBIND: strchr-bind.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer assigned a non-address value
