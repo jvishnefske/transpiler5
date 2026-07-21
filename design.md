@@ -1469,10 +1469,35 @@ rule.
   keeps the historical generic "unsupported: call to a variadic function"
   wording (it was already rejected before this revision — cross-TU
   resolution for it is not yet attempted at all). A variadic defined AND
-  called within the SAME TU is unaffected and still monomorphizes. Real
-  cross-TU va_list monomorphization (synthesizing clones from a
-  definition in one TU for call sites enumerated in another) is out of
-  scope for this wave and is planned for W3.5. (test/Import/C/
+  called within the SAME TU is unaffected and still monomorphizes.
+
+  W3.5 (real cross-TU va_list monomorphization) DEFERRED — the located W3.0
+  rejection stands. A spike built the whole-program enumeration cleanly (a
+  pre-pass over every AST, after `crossTuVaListVariadicNames` is complete,
+  deduplicates each cross-TU all-scalar extras signature into a shared clone
+  plan named `<symbol>__ctN`, so the defining TU and every calling TU agree
+  on the clone name with no coordination) and definer-first import orders
+  worked end to end. It foundered on the caller-BEFORE-definer order, which
+  the differential requires (`emitrust-cc main.c def.c` imports the caller
+  first): a monomorphization clone is a SYNTHESIZED symbol with no C
+  prototype, so a caller TU imported before the definer has nothing to
+  forward-declare it from, and `emitCall` rejects the reference to the
+  not-yet-materialized `@<symbol>__ctN`. The three escape routes each cost
+  more than the feature is worth: (i) reordering the import loop so definers
+  precede callers perturbs the module's function EMISSION order (functions
+  emit in import order — verified: reversing an existing multi-TU pair
+  reorders the output), breaking every multi-TU byte-snapshot; (ii)
+  pre-declaring the clone in the caller is impossible because the clone's
+  signature (e.g. the `fmt` param's `&mut [i8]` cursor classification) is
+  derivable ONLY from the definition's body, which lives in another
+  `ASTContext` the caller cannot reach; (iii) an eager clone-materialization
+  pass before the main loop needs the defining TU's full Pass-A, which the
+  main loop then re-runs, risking double-planning on the completed 220/220 C
+  ledger. Thin demand (a cross-TU va_list variadic is rare) plus this
+  disproportionate, C-path-risking plumbing put it on the same
+  conservative-but-sound footing as the G2/G7 retentions; reopening it is a
+  dedicated future wave that would first refactor clone materialization to be
+  decoupled from the defining TU's live import state. (test/Import/C/
   multi-tu-varargs.c, Inputs/multi-tu-varargs-def.c)
 - [x] C99-39 Preprocessor-heavy sources: #include of project and system
   headers resolves — clang's builtin resource directory is wired in at
