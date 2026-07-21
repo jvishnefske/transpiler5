@@ -759,6 +759,47 @@ lists the lit test file(s) that validate it.
   test/EndToEnd/multi-tu-gate-g5-region-api.c,
   multi-tu-gate-g6-cellslice-fn-external.c)
 
+- [x] FR-33 Cross-TU pointer-global with local use (W3.4 G8), and the G7
+  retention. `importPointerGlobal` (CTS-P4) hard-rejected every REFERENCED
+  externally visible pointer-typed global in a project import, because
+  `globalPtrFacts` is merged per TU. G8 (this gate) fires only when the
+  DEFINING TU itself references the pointer global — the pure-definition,
+  used-elsewhere shared-header shape takes the referenced-only skip and is
+  handled by `deferExternPointerGlobal` (FR-31). W3.4 G8 relaxes it with the
+  SAME whole-program eligibility `deferExternPointerGlobal` uses: a single
+  file-scope base bound project-wide with NO reassignment anywhere
+  (`WholeProgramInfo::pointerGlobalBases` size 1 +
+  `pointerGlobalSoleFileScopeBase` + no `pointerGlobalHasBodyRebind`) is
+  reconstructible as the CTS-P4 single-base cursor global. A divergent
+  cross-TU rebinding (the same pointer global bound to two different bases,
+  or reassigned in a body) keeps rejecting — the single-base cursor model
+  has no representation for a target that depends on which TU last ran.
+  Legitimate under the closed-program assumption. Byte-identical crate-vs-
+  native differential.
+  (test/Import/C/multi-tu-gate-g8-ptr-global-external.c,
+  multi-tu-gate-g8-ptr-global-negative.c (negative);
+  test/EndToEnd/multi-tu-gate-g8-ptr-global-external.c)
+
+  G7 (cross-TU function-pointer devirtualization) is RETAINED (gate kept,
+  test pins the un-devirtualized shape). `planFnPtrAliases` devirtualizes a
+  never-reassigned file-scope function pointer to a direct call only in a
+  sole-TU import. The whole-program write set (`fnPtrGlobalsWritten`) already
+  proves a `const`/never-written target is safe, but devirtualization
+  REMOVES the `emitrust.global` — and a companion TU that only forward-
+  declares the pointer (`extern int (*const p)(int,int);`) has no way to
+  devirtualize its OWN call: it holds no initializer and no target
+  `FunctionDecl`, so its reference to the now-absent global fails to resolve
+  ("referenced but not defined in any translation unit"). Making it work
+  needs the alias target threaded by symbol into every referencing TU plus
+  direct-call emission without a `FunctionDecl` — disproportionate plumbing
+  for a purely optimizing gate whose un-devirtualized fn_ptr + call_indirect
+  is already correct and runs fine (a genuine optimization with thin demand;
+  design.md's own "conservative-but-sound, disables OPTIMIZATIONS not
+  correctness" framing). The G7 tests stay pinned at the sound
+  un-devirtualized shape.
+  (test/Import/C/multi-tu-gate-g7-fnptr-devirt-skip.c,
+  multi-tu-gate-g7-fnptr-devirt-negative.c)
+
 ## C99 Support Roadmap
 
 Everything the importer must handle before it can claim full C99 language
