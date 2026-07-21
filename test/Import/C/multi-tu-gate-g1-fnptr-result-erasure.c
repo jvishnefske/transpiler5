@@ -10,14 +10,18 @@
 // baseline below, which proves the identical shape erases cleanly when this
 // TU is the whole program).
 //
-// W3.2 (the whole-program address-taken hoist) will flip the two `not`
-// RUN lines below to `emitrust-import-c ... | FileCheck` once
-// `addressTakenFunctions` is collected across every AST before any TU is
-// classified (mirroring collectCrossTuVaListVariadics's W3.0 pre-pass).
+// W3.4 G1 flips this: the whole-program candidate-completeness fact
+// (`dataPtrReturnFnAddressTakenTus`, built by collectWholeProgramInfo before
+// any TU is classified) proves the sole candidate `go` returning `struct S *`
+// is address-taken in ONE TU only, so this TU's per-TU `addressTakenFunctions`
+// is the complete whole-program candidate set and the classifier runs — the
+// multi-TU import now erases identically to the sole-TU baseline, in either
+// TU order. (The divergent two-base shape stays rejected: see
+// multi-tu-gate-g1-fnptr-result-diverge.c.)
 //
 // RUN: emitrust-import-c %s | FileCheck %s --check-prefix=SAMETU
-// RUN: not emitrust-import-c %s %S/Inputs/multi-tu-gate-g1-fnptr-result-erasure-other.c 2>&1 | FileCheck %s
-// RUN: not emitrust-import-c %S/Inputs/multi-tu-gate-g1-fnptr-result-erasure-other.c %s 2>&1 | FileCheck %s
+// RUN: emitrust-import-c %s %S/Inputs/multi-tu-gate-g1-fnptr-result-erasure-other.c | FileCheck %s --check-prefix=SAMETU
+// RUN: emitrust-import-c %S/Inputs/multi-tu-gate-g1-fnptr-result-erasure-other.c %s | FileCheck %s --check-prefix=SAMETU
 
 struct S {
   int m;
@@ -35,12 +39,9 @@ void swap(void) { p = &go; }
 
 int main(void) { return p()->m; }
 
-// CHECK: multi-tu-gate-g1-fnptr-result-erasure.c:{{[0-9]+}}:13: error: unsupported: function pointer result type
-
-// SAMETU baseline (sole TU, no companion): the identical shape erases the
-// fn-ptr's result (no `-> ...` on the fn_ptr type) and routes `p()->m`
-// through the ordinary staged-copy global machinery — no runtime pointer
-// state, no rejection. This is the behavior W3.2 must reproduce for the
-// multi-TU case above.
+// The fn-ptr result is erased (no `-> ...` on the fn_ptr type) and `p()->m`
+// routes through the ordinary staged-copy global machinery — no runtime
+// pointer state, no rejection. This SAMETU shape is asserted for the sole-TU
+// baseline AND both multi-TU orderings above.
 // SAMETU: emitrust.global @p <#emitrust.opaque<"Some(go)">> : !emitrust.fn_ptr<()>
 // SAMETU-NOT: !emitrust.fn_ptr<() -> {{.*}}>

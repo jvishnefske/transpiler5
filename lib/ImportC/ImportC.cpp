@@ -1986,8 +1986,20 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
     }
     if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt)) {
       if (const auto *fn = llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl()))
-        if (fn->isExternallyVisible() && !isSystemHeaderDecl(fn))
+        if (fn->isExternallyVisible() && !isSystemHeaderDecl(fn)) {
           recordTu(wholeProgram.fnAddressTakenTus[mlirFuncName(fn)]);
+          // G1 candidate-completeness fact: when the address-taken function
+          // returns a data pointer, record its canonical return-type spelling
+          // → this TU, so `classifyFnPtrPointerResult` can tell whether its
+          // per-TU candidate set is the whole-program set. Spelling key only
+          // (no `mapType`) keeps this side-effect-free and cross-TU-stable.
+          clang::QualType returnType =
+              fn->getReturnType().getCanonicalType();
+          if (returnType->isPointerType() &&
+              !returnType->isFunctionPointerType())
+            recordTu(wholeProgram.dataPtrReturnFnAddressTakenTus
+                         [returnType.getAsString()]);
+        }
       return;
     }
     if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {

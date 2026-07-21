@@ -166,6 +166,23 @@ struct WholeProgramInfo {
   /// matters because an indirectly called function could be reached from
   /// another TU with an argument this TU's analysis never sees.
   llvm::StringMap<llvm::SmallVector<unsigned, 2>> fnAddressTakenTus;
+  /// Data-pointer return-type spelling (canonical `QualType::getAsString`) →
+  /// the deduped indices of the TUs that take the address of at least one
+  /// function returning a pointer of that type. The G1 candidate-completeness
+  /// oracle: `classifyFnPtrPointerResult` builds its erased-return candidate
+  /// set from THIS TU's per-TU `addressTakenFunctions` (refilled each TU by
+  /// `planFnPtrAliases`), so in a multi-TU project a diverging function whose
+  /// address is taken only in ANOTHER TU could be missed — an unsound
+  /// erasure. When this map reports at most ONE TU for the return-type
+  /// spelling, this TU's per-TU candidate set is provably the complete
+  /// whole-program set and the classifier may run; two or more TUs keep the
+  /// blanket rejection (the precise cross-TU disagreement wording needs the
+  /// full erased-base substrate, deferred — design.md FR-34). The key is a
+  /// deliberately narrow type SPELLING, not a `mapType` result: it is
+  /// side-effect-free (no memoization poisoning, per W3.2 COMMIT B's lesson)
+  /// and cross-TU-stable for named types (anonymous types cannot be shared
+  /// across a TU boundary anyway).
+  llvm::StringMap<llvm::SmallVector<unsigned, 2>> dataPtrReturnFnAddressTakenTus;
   /// Externally visible pointer-global symbol name → the set of base-object
   /// symbol names it is bound to across the whole program (from its
   /// file-scope initializer and every `g = &base…` assignment in any body).
@@ -1464,6 +1481,16 @@ private:
   /// cell-slice path despite its external linkage (consulted by
   /// `planCellSlices` to lift its :724 gate).
   bool cellSliceGlobalEligibleWholeProgram(llvm::StringRef symbol) const;
+
+  /// Number of distinct TUs across the whole program that take the address of
+  /// a function whose canonical return type is `returnType` (a data pointer).
+  /// The G1 gate uses this to decide whether this TU's per-TU
+  /// `addressTakenFunctions` candidate set is the complete whole-program set:
+  /// 0 or 1 means complete (run the classifier), ≥2 means a diverging
+  /// candidate may live in an unseen TU (keep the blanket rejection).
+  /// Reads `WholeProgramInfo::dataPtrReturnFnAddressTakenTus`; returns 0 for a
+  /// single-file import (`wholeProgram` is empty).
+  unsigned dataPtrReturnFnAddressTakenTuCount(clang::QualType returnType) const;
 
   /// Returns the global array variable a call argument decays directly
   /// (`f(G)` with no offset), or null: the only global argument shape the
