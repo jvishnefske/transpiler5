@@ -3,16 +3,18 @@
 // gate over-rejects today), this file's two translation units take the
 // address of TWO DIFFERENT functions returning TWO DIFFERENT global
 // bases (`get1`/&objA here, `get2`/&objB in the companion) through the
-// SAME externally visible fn-ptr-typed declaration `p`. Even after W3.2's
-// whole-program address-taken hoist, a real merge of both TUs' candidate
-// sets must still reject this — not with today's blanket "function
-// pointer result type" wording, but with the EXISTING disagreement
-// diagnostic classifyFnPtrPointerResult already raises for a single TU
-// with two divergent candidates (see pointers-return.c's MIXED case:
-// "return sites disagree on the returned global base" /
-// "...signature"). This test only pins TODAY's blanket rejection; W3.2
-// must re-point it at that disagreement wording instead of silently
-// accepting one of the two bases.
+// SAME externally visible fn-ptr-typed declaration `p`. A real merge of
+// both TUs' candidate sets must still reject this. W3.4 G1's whole-program
+// candidate-completeness fact reports TWO distinct TUs taking the address
+// of a function returning `struct S *` (`get1` here, `get2` in the
+// companion), so the gate keeps its blanket rejection — the SOUND outcome.
+// The PRECISE cross-TU disagreement wording (mirroring pointers-return.c's
+// MIXED "return sites disagree on the returned global base") is DEFERRED:
+// it needs the full erased-base substrate (each candidate's base symbol
+// resolved whole-program), whereas same-TU divergence still uses the
+// precise wording via the per-TU classifier. The blanket reject is sound
+// and honest for the cross-TU case (design.md FR-34). This test pins that
+// blanket rejection.
 // RUN: not emitrust-import-c %s %S/Inputs/multi-tu-gate-g1-fnptr-result-diverge-other.c 2>&1 | FileCheck %s
 
 struct S {

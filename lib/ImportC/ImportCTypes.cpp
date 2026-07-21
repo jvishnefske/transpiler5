@@ -666,6 +666,15 @@ FailureOr<Type> CImporter::classifyPointerReturn(
   return kind;
 }
 
+unsigned CImporter::dataPtrReturnFnAddressTakenTuCount(
+    clang::QualType returnType) const {
+  auto it = wholeProgram.dataPtrReturnFnAddressTakenTus.find(
+      returnType.getCanonicalType().getAsString());
+  if (it == wholeProgram.dataPtrReturnFnAddressTakenTus.end())
+    return 0;
+  return it->second.size();
+}
+
 FailureOr<const clang::VarDecl *>
 CImporter::classifyFnPtrPointerResult(const clang::FunctionType *fnType,
                                       Location loc) {
@@ -676,7 +685,14 @@ CImporter::classifyFnPtrPointerResult(const clang::FunctionType *fnType,
     return cached;
   // The candidate set must be whole-program: in a multi-TU project another
   // TU could take a diverging function's address after this TU classified.
-  if (!currentSoleTU)
+  // W3.4 G1 relaxes this using the whole-program candidate-completeness fact:
+  // when at most ONE TU takes the address of any function returning this data
+  // pointer type, this TU's per-TU `addressTakenFunctions` is the complete
+  // whole-program candidate set and the classifier below runs soundly. Two or
+  // more TUs keep the blanket rejection — a precise cross-TU disagreement
+  // diagnostic would need the full erased-base substrate (design.md FR-34).
+  if (!currentSoleTU &&
+      dataPtrReturnFnAddressTakenTuCount(fnType->getReturnType()) > 1)
     return emitError(loc) << "unsupported: function pointer result type";
   if (!fnPtrReturnInProgress.insert(key).second)
     return emitError(loc) << "unsupported: function pointer result type";
