@@ -97,9 +97,28 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
   if (!key->isReferenced())
     return success();
   // Program-wide facts are merged per TU by `planOwners`; an externally
-  // visible pointer global in a multi-file project could be rebound by a
-  // TU whose facts are not visible when this one imports.
-  if (!currentSoleTU && key->isExternallyVisible())
+  // visible pointer global in a multi-file project could be rebound by a TU
+  // whose facts are not visible when this one imports. W3.4 G8: the
+  // whole-program pointer-global facts (W3.2 COMMIT B) prove otherwise for a
+  // SINGLE file-scope base never reassigned anywhere — the same eligibility
+  // `deferExternPointerGlobal` uses for the extern-declaration side. This
+  // gate fires only when the DEFINING TU itself references the pointer
+  // global (the referenced-only skip above handles the pure-definition,
+  // used-elsewhere shared-header shape); a divergent multi-base rebinding
+  // keeps rejecting. Legitimate under the closed-program assumption
+  // (`importCProject` sees every TU).
+  bool wholeProgramReconstructible = false;
+  {
+    auto basesIt = wholeProgram.pointerGlobalBases.find(symbolName);
+    auto baseDeclIt = wholeProgram.pointerGlobalSoleFileScopeBase.find(symbolName);
+    wholeProgramReconstructible =
+        basesIt != wholeProgram.pointerGlobalBases.end() &&
+        basesIt->second.size() == 1 &&
+        baseDeclIt != wholeProgram.pointerGlobalSoleFileScopeBase.end() &&
+        !wholeProgram.pointerGlobalHasBodyRebind.contains(symbolName);
+  }
+  if (!currentSoleTU && key->isExternallyVisible() &&
+      !wholeProgramReconstructible)
     return emitError(loc) << "unsupported: pointer-typed global variable "
                              "with external linkage in a multi-file project";
   if (isRustKeyword(symbolName))
