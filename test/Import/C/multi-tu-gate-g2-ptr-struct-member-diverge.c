@@ -9,9 +9,10 @@
 // (instance, field)) has no representation for "the target depends on
 // which TU last ran" (C itself makes this well-defined only because the
 // LAST link-time store wins at runtime; the importer's static binding
-// model has no execution-order-sensitive facts). This test only pins
-// TODAY's blanket rejection, which happens to already be correct for
-// this shape; W3.2 must not accidentally start accepting it.
+// model has no execution-order-sensitive facts). This shape stays rejected
+// regardless of the G2 disposition (RETAINED — design.md FR-35): the
+// per-instance model cannot represent divergent cross-TU bindings even in
+// principle. This test pins that rejection.
 // RUN: not emitrust-import-c %s %S/Inputs/multi-tu-gate-g2-ptr-struct-member-diverge-other.c 2>&1 | FileCheck %s
 
 struct Node {
