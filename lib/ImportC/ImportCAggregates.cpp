@@ -500,7 +500,8 @@ LogicalResult CImporter::collectRecordFields(
     if (clang::QualType retyped = fnPtrMemberTypes.lookup(field);
         !retyped.isNull())
       declaredType = retyped;
-    FailureOr<Type> fieldType = mapStructFieldType(declaredType, fieldLoc);
+    FailureOr<Type> fieldType =
+        mapStructFieldType(declaredType, fieldLoc, field);
     if (failed(fieldType))
       return failure();
     if (failed(appendField(internName(mangleMemberName(field->getName())),

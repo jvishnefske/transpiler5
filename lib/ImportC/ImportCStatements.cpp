@@ -2070,7 +2070,31 @@ LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
              << "unsupported: return with a value in a void function";
     }
     FailureOr<Value> value = failure();
-    if (isDataPointer(retValue->getType()) &&
+    if (currentOwnerIndexReturn) {
+      // Stage 1 owner-index return: the returned pointer decomposes
+      // exactly like a method-call pointer argument (`emitMethodCallSite`)
+      // — its i64 cursor IS the return value. `planOwners` already proved
+      // every return site roots in this method's own owner class; the
+      // defensive checks below mirror `emitMethodCallSite`'s.
+      FailureOr<PtrExprValue> pointer = emitPointerRValue(retValue);
+      if (failed(pointer))
+        return failure();
+      bool rootedAtOwner =
+          pointer->base == currentMethodOwner ||
+          llvm::isa_and_nonnull<clang::ParmVarDecl>(pointer->base);
+      if (!rootedAtOwner) // Defensive; planOwners proved every site in-class.
+        return emitError(loc) << "unsupported: returned pointer value does "
+                                 "not root in the owner object";
+      if (pointer->nonNull) // Defensive; owner planning excludes nullable
+                            // regions (no i64-cursor representation).
+        return emitError(loc)
+               << "unsupported: possibly-null pointer returned from an "
+                  "owner-index method";
+      if (!pointer->cursor) // Defensive; an array base always has a cursor.
+        return emitError(loc) << "unsupported: the address of a scalar "
+                                 "object cannot be an owner-index return";
+      value = pointer->cursor;
+    } else if (isDataPointer(retValue->getType()) &&
         currentReturnType == builder.getIntegerType(64)) {
       // An integer-carrier pointer return (CTS-P3): the function's return
       // type classified to a plain i64, and every return site yields a

@@ -31,6 +31,14 @@
 
 using namespace mlir;
 
+/// The owner-struct MVP limit on a promoted local array's element count:
+/// the ceiling `struct_def`'s `Default` derive tolerates. Named so
+/// `planOwners` and `planArrayMemberPointers` (which reuses a class only
+/// `planOwners` already promoted, so this ceiling is inherited rather than
+/// re-checked in the common case) share one definition instead of two
+/// independent literal `32`s.
+static constexpr unsigned kMaxOwnerArrayElements = 32;
+
 /// Collects every call expression below `stmt`, in source order.
 static void collectCallExprs(const clang::Stmt *stmt,
                              SmallVectorImpl<const clang::CallExpr *> &calls) {
@@ -286,10 +294,11 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
       continue;
     const clang::ConstantArrayType *arrayType =
         astContext().getAsConstantArrayType(base->getType());
-    // Local array of 1..32 elements: the struct_def `Default` derive MVP
-    // limit. Scalar and oversized bases keep the Phase-1b lowering.
+    // Local array of 1..kMaxOwnerArrayElements elements: the struct_def
+    // `Default` derive MVP limit. Scalar and oversized bases keep the
+    // Phase-1b lowering.
     if (!arrayType || arrayType->getSize().getZExtValue() == 0 ||
-        arrayType->getSize().getZExtValue() > 32)
+        arrayType->getSize().getZExtValue() > kMaxOwnerArrayElements)
       continue;
     clang::QualType element = arrayType->getElementType();
 
@@ -311,18 +320,60 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
     }
     if (!qualifies)
       continue;
+    // Stage 1 (owner-index-return extension): pointer-returning methods
+    // whose every `return` operand is proven, below, to root in THIS class
+    // stage here instead of disqualifying; finalized into
+    // `ownerIndexReturns` only once `qualifies` survives every other check
+    // for the whole class (mirroring `methodFns`/`methodPlans` below).
+    llvm::SmallPtrSet<const clang::FunctionDecl *, 4> pendingIndexReturns;
     for (const clang::FunctionDecl *fn : methodFns) {
+      // A pointer return no longer unconditionally disqualifies the
+      // function: it qualifies as an owner-index return (a plain i64
+      // element-index result) when every return site's operand resolves,
+      // through the SAME interprocedural root resolution
+      // `forEachDataPointerCallArg` uses for call arguments, to this one
+      // class. Anything else (an unresolvable operand, a mixed-class
+      // return, a function pointer return, which stays the historical
+      // fn-address kind) keeps the historical disqualification.
+      bool disqualifyingReturn = false;
+      if (isPointerType(fn->getReturnType()) &&
+          !isFunctionPointer(fn->getReturnType())) {
+        const clang::FunctionDecl *definition = fn->getDefinition();
+        SmallVector<const clang::ReturnStmt *> returns;
+        PointerRegionAnalysis returnRegions;
+        returnRegions.literalTemps = &literalTemps;
+        if (definition && definition->hasBody()) {
+          collectReturnStmts(definition->getBody(), returns);
+          returnRegions.analyze(astContext(), definition->getBody());
+        }
+        if (returns.empty()) {
+          disqualifyingReturn = true;
+        } else {
+          for (const clang::ReturnStmt *ret : returns) {
+            const clang::VarDecl *root =
+                ret->getRetValue()
+                    ? resolveArgRoot(returnRegions, ret->getRetValue())
+                    : nullptr;
+            if (!root || unionFind.find(root) != entry.first) {
+              disqualifyingReturn = true;
+              break;
+            }
+          }
+        }
+        if (!disqualifyingReturn)
+          pendingIndexReturns.insert(fn);
+      }
       // All-or-nothing per function: every data-pointer parameter of the
       // function must resolve into this one class, the return type must be
-      // a plain value, the function may not be the owner itself or C
-      // `main`, and all of its call sites must be visible — an externally
-      // visible function qualifies when this TU is the whole program OR when
-      // the whole-program facts prove no other TU references it (W3.3 G3).
+      // a plain value or a proven owner-index return, the function may not
+      // be the owner itself or C `main`, and all of its call sites must be
+      // visible — an externally visible function qualifies when this TU is
+      // the whole program OR when the whole-program facts prove no other TU
+      // references it (W3.3 G3).
       if (fn == owner || fn->getName() == "main" ||
           (fn->isExternallyVisible() && !soleTranslationUnit &&
            !externalFnFullyVisible(fn)) ||
-          (isPointerType(fn->getReturnType()) &&
-           !isFunctionPointer(fn->getReturnType()))) {
+          disqualifyingReturn) {
         qualifies = false;
         break;
       }
@@ -351,6 +402,224 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
     ownerPlans[base] = OwnerPlan{structName, /*structDefCreated=*/false};
     for (const clang::FunctionDecl *fn : methodFns)
       methodPlans[fn->getCanonicalDecl()] = base;
+    for (const clang::FunctionDecl *fn : pendingIndexReturns)
+      ownerIndexReturns.insert(fn->getCanonicalDecl());
+  }
+}
+
+//===----------------------------------------------------------------------===//
+// Array-member-pointer planning (Stage 2 of the owner-struct
+// self-reference extension, design.md FR-30 follow-on)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Collects every `MemberExpr` below `stmt` that designates `field`
+/// (compared by canonical declaration), in source order.
+void collectFieldMemberExprs(
+    const clang::Stmt *stmt, const clang::FieldDecl *field,
+    SmallVectorImpl<const clang::MemberExpr *> &out) {
+  if (!stmt)
+    return;
+  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(stmt)) {
+    if (const auto *hit =
+            llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+        hit && hit->getCanonicalDecl() == field->getCanonicalDecl())
+      out.push_back(member);
+  }
+  for (const clang::Stmt *child : stmt->children())
+    collectFieldMemberExprs(child, field, out);
+}
+
+/// Maps every `MemberExpr` below `stmt` that designates `field` AND is the
+/// left-hand side of a simple (`=`) assignment to that assignment's
+/// right-hand side, in source order. A compound assignment
+/// (`x->field += y`) or any other mutating shape never populates this map
+/// — `planArrayMemberPointers` treats any `field` site absent here but
+/// present in `collectFieldMemberExprs`'s result as a plain read, which is
+/// correct: a compound assignment reads the field too (through the same
+/// arrow base), and its unmodeled STORE is caught by the fact that the
+/// statement itself is never specially recognized, so the field stays
+/// unpromoted only if some OTHER analysis needed to model the store — it
+/// doesn't here, because a compound assignment onto a pointer field is
+/// already rejected upstream of this pass (pointer fields do not admit
+/// arithmetic), so no such site can exist in an accepted program.
+void collectFieldAssignRhs(
+    const clang::Stmt *stmt, const clang::FieldDecl *field,
+    llvm::DenseMap<const clang::MemberExpr *, const clang::Expr *> &out) {
+  if (!stmt)
+    return;
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt);
+      binary && binary->getOpcode() == clang::BO_Assign) {
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(
+            binary->getLHS()->IgnoreParens())) {
+      if (const auto *hit =
+              llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+          hit && hit->getCanonicalDecl() == field->getCanonicalDecl())
+        out[member] = binary->getRHS();
+    }
+  }
+  for (const clang::Stmt *child : stmt->children())
+    collectFieldAssignRhs(child, field, out);
+}
+
+} // namespace
+
+void CImporter::planArrayMemberPointers(
+    const clang::TranslationUnitDecl *unit) {
+  // Every self-referential data-pointer field of a promoted owner class's
+  // element type is a candidate, keyed by field so a field claimed by two
+  // DIFFERENT owner classes (ambiguous — ownership isn't unique) is
+  // detected and excluded below.
+  llvm::DenseMap<const clang::FieldDecl *, const clang::VarDecl *>
+      candidateOwner;
+  llvm::DenseMap<const clang::FieldDecl *, unsigned> candidateElementCount;
+  llvm::SmallPtrSet<const clang::FieldDecl *, 8> ambiguousFields;
+
+  for (const auto &entry : ownerPlans) {
+    const clang::VarDecl *ownerArray = entry.first;
+    const clang::ConstantArrayType *arrayType =
+        astContext().getAsConstantArrayType(ownerArray->getType());
+    if (!arrayType) // Defensive; planOwners only promotes array bases.
+      continue;
+    uint64_t count64 = arrayType->getSize().getZExtValue();
+    // Defensive: planOwners's own gate already enforces
+    // 1..kMaxOwnerArrayElements before a class ever reaches `ownerPlans`,
+    // so this can only re-trigger if that invariant ever changes.
+    if (count64 == 0 || count64 > kMaxOwnerArrayElements)
+      continue;
+    unsigned elementCount = static_cast<unsigned>(count64);
+    clang::QualType element = arrayType->getElementType();
+    const clang::RecordDecl *record = recordOfType(element);
+    if (!record)
+      continue;
+    for (const clang::FieldDecl *field : record->fields()) {
+      if (!isDataPointer(field->getType()))
+        continue;
+      clang::QualType pointee =
+          field->getType().getCanonicalType()->getPointeeType();
+      if (!astContext().hasSameUnqualifiedType(pointee, element))
+        continue; // Not self-referential.
+      auto [it, inserted] = candidateOwner.try_emplace(field, ownerArray);
+      if (!inserted && it->second != ownerArray) {
+        ambiguousFields.insert(field);
+        continue;
+      }
+      candidateElementCount[field] = elementCount;
+    }
+  }
+  for (const clang::FieldDecl *field : ambiguousFields)
+    candidateOwner.erase(field);
+
+  for (const auto &candidate : candidateOwner) {
+    const clang::FieldDecl *field = candidate.first;
+    const clang::VarDecl *ownerArray = candidate.second;
+    bool usable = true;
+
+    for (const clang::FunctionDecl *func :
+         collectPassAFunctionDefinitions(unit)) {
+      if (!usable)
+        break;
+      SmallVector<const clang::MemberExpr *> sites;
+      collectFieldMemberExprs(func->getBody(), field, sites);
+      if (sites.empty())
+        continue;
+      llvm::DenseMap<const clang::MemberExpr *, const clang::Expr *>
+          assignRhs;
+      collectFieldAssignRhs(func->getBody(), field, assignRhs);
+
+      PointerRegionAnalysis regions;
+      regions.literalTemps = &literalTemps;
+      // Stage 4 (B3): a local assigned FROM an array-member field read
+      // (`parent = node->parent;`) needs `recordPointerWrite` to join the
+      // local into the arrow base's class instead of rejecting it as a
+      // non-address value — see `arrayMemberFieldQuery`'s doc. Pass A runs
+      // BEFORE any field is proven (this very loop is doing the proving),
+      // so the query answers structural candidacy (still-ambiguous fields
+      // were already erased from `candidateOwner` above) rather than full
+      // `arrayMemberPtrBindings` membership; the per-field `usable` result
+      // computed below is what actually gates the real, final binding.
+      regions.arrayMemberFieldQuery = [&](const clang::FieldDecl *f) {
+        return candidateOwner.contains(f);
+      };
+      // Stage 5: a local bound from an owner-index-returning call's result
+      // (`root1 = uf_find(node1);`) needs `recordPointerWrite` to
+      // re-classify it as rooting in the callee's class, exactly like the
+      // emission-time wiring (`ImportCFunctions.cpp`, both prologues). Pass
+      // A's own `PointerRegionAnalysis` instance never had this wired
+      // before Stage 5, so any local bound from such a call was invisible
+      // to `resolveArgRoot` here and every site of the field got poisoned
+      // program-wide before the real, emission-time proof was ever
+      // consulted. `planOwners` (which fully populates `ownerIndexReturns`)
+      // always runs before `planArrayMemberPointers`, so the set is
+      // complete by this point.
+      regions.ownerIndexReturnQuery =
+          [&](const clang::FunctionDecl *callee) {
+            return ownerIndexReturns.contains(callee->getCanonicalDecl());
+          };
+      regions.analyze(astContext(), func->getBody());
+
+      for (const clang::MemberExpr *member : sites) {
+        // A dot-form access (`s.field`) has no arrow base to root — Pass A
+        // only proves the arrow form usable.
+        if (!member->isArrow()) {
+          usable = false;
+          break;
+        }
+        const clang::VarDecl *root =
+            resolveArgRoot(regions, member->getBase());
+        if (!isArrayMemberOwnerRoot(root, ownerArray)) {
+          usable = false;
+          break;
+        }
+        auto rhsIt = assignRhs.find(member);
+        if (rhsIt == assignRhs.end())
+          continue; // A plain read: the arrow-base proof above suffices.
+        // A write needs the SAME proof of its right-hand side: either a
+        // value that itself roots in this class (the promoted cursor
+        // value itself, e.g. `x->self = x;`), or — Stage 4, B4 — the
+        // right-hand side is ITSELF an array-member field read whose own
+        // arrow base roots in this class (`node->parent = parent->parent;`).
+        // `resolveArgRoot` has no `MemberExpr` case (it only resolves
+        // variable/parameter-rooted pointer expressions), so the field-read
+        // shape is recognized directly here instead: it is exactly as
+        // legal a source as the cursor value itself, by the read-side
+        // proof this very pass runs for every site of a candidate field.
+        const clang::VarDecl *rhsRoot =
+            resolveArgRoot(regions, rhsIt->second);
+        if (isArrayMemberOwnerRoot(rhsRoot, ownerArray))
+          continue;
+        bool rhsIsFieldRead = false;
+        const clang::Expr *rhsStripped = stripTrivia(rhsIt->second);
+        if (const auto *rhsCast =
+                llvm::dyn_cast<clang::ImplicitCastExpr>(rhsStripped);
+            rhsCast && (rhsCast->getCastKind() == clang::CK_LValueToRValue ||
+                       rhsCast->getCastKind() == clang::CK_NoOp))
+          rhsStripped = stripTrivia(rhsCast->getSubExpr());
+        if (const auto *rhsMember =
+                llvm::dyn_cast<clang::MemberExpr>(rhsStripped);
+            rhsMember && rhsMember->isArrow()) {
+          if (const auto *rhsField = llvm::dyn_cast<clang::FieldDecl>(
+                  rhsMember->getMemberDecl());
+              rhsField && candidateOwner.lookup(rhsField) == ownerArray) {
+            const clang::VarDecl *rhsBaseRoot =
+                resolveArgRoot(regions, rhsMember->getBase());
+            rhsIsFieldRead = isArrayMemberOwnerRoot(rhsBaseRoot, ownerArray);
+          }
+        }
+        if (!rhsIsFieldRead) {
+          usable = false;
+          break;
+        }
+      }
+    }
+
+    if (usable) {
+      ArrayMemberPointerFacts facts;
+      facts.ownerArray = ownerArray;
+      facts.elementCount = candidateElementCount.lookup(field);
+      arrayMemberPtrBindings[field] = facts;
+    }
   }
 }
 

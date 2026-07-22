@@ -1096,8 +1096,44 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
       Value truth = createBoolConstant(loc, true);
       return builder.create<arith::XOrIOp>(loc, equal, truth).getResult();
     }
-    if (lhs->base != rhs->base || lhs->member != rhs->member ||
-        lhs->literalBacking != rhs->literalBacking)
+    // Stage 5 (B5, design.md FR-30 follow-on): two pointer locals
+    // independently traced back to data-pointer PARAMETERS of the SAME
+    // promoted owner method (e.g. `root1 = uf_find(node1); root2 =
+    // uf_find(node2);` inside `uf_union`, where `node1`/`node2` are two
+    // DIFFERENT parameters) get DIFFERENT `base` identities even though
+    // both parameters are, by `planOwners`'s all-or-nothing per-function
+    // qualification (every data-pointer parameter of one qualifying
+    // method shares one class), provably cursors into the SAME array
+    // class (`currentMethodOwner`). A `base` referenced from the body
+    // currently being emitted can only be a declaration visible to that
+    // body — a parameter of THIS function, a local of THIS function, the
+    // owner array itself, or another object — so a pointer parameter
+    // found here is, by construction, always a parameter of the current
+    // method, never of some other function; no additional
+    // cross-function bookkeeping is needed. Narrowly scoped to
+    // same-function-body equality/inequality only (never generalized to
+    // ordered comparisons or across functions, matching the multi-base
+    // carve-out above): when both sides root in the current method's own
+    // class this way, the base mismatch is ignored and only the cursor
+    // values are compared.
+    auto isOwnerClassBase = [&](const clang::VarDecl *base) {
+      if (!currentMethodOwner || !base)
+        return false;
+      if (base == currentMethodOwner)
+        return true;
+      const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(base);
+      return param != nullptr && isPointerType(param->getType()) &&
+             !isFunctionPointer(param->getType());
+    };
+    bool sameOwnerClass =
+        lhs->base != rhs->base && !lhs->member && !rhs->member &&
+        !lhs->literalBacking && !rhs->literalBacking &&
+        (op->getOpcode() == clang::BO_EQ ||
+         op->getOpcode() == clang::BO_NE) &&
+        isOwnerClassBase(lhs->base) && isOwnerClassBase(rhs->base);
+    if (!sameOwnerClass &&
+        (lhs->base != rhs->base || lhs->member != rhs->member ||
+         lhs->literalBacking != rhs->literalBacking))
       return emitError(loc)
              << "unsupported: comparison of pointers into different objects";
     Type cursorType = builder.getIntegerType(64);
@@ -2457,10 +2493,12 @@ CImporter::emitStlOperatorCall(const clang::CXXOperatorCallExpr *call) {
   }
 }
 
-FailureOr<Value> CImporter::emitMethodCallSite(const clang::CallExpr *call,
-                                               func::FuncOp target,
-                                               const clang::VarDecl *ownerBase,
-                                               Location loc) {
+FailureOr<Value> CImporter::emitMethodCallSite(
+    const clang::CallExpr *call, func::FuncOp target,
+    const clang::VarDecl *ownerBase, Location loc,
+    const clang::VarDecl **outFirstPointerArgBase) {
+  if (outFirstPointerArgBase)
+    *outFirstPointerArgBase = nullptr;
   FunctionType targetType = target.getFunctionType();
   if (call->getNumArgs() + 1 != targetType.getNumInputs())
     return emitError(loc) << "unsupported: call argument count mismatch";
@@ -2508,6 +2546,8 @@ FailureOr<Value> CImporter::emitMethodCallSite(const clang::CallExpr *call,
       if (!pointer->cursor) // Defensive; an array base always has a cursor.
         return emitError(loc) << "unsupported: the address of a scalar "
                                  "object cannot index an owner method";
+      if (outFirstPointerArgBase && !*outFirstPointerArgBase)
+        *outFirstPointerArgBase = pointer->base;
       arguments[index + 1] = pointer->cursor;
       continue;
     }

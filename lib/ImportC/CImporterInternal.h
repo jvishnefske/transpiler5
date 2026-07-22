@@ -626,6 +626,54 @@ struct MemberPointerFacts {
 using MemberPointerKey =
     std::pair<const clang::VarDecl *, const clang::FieldDecl *>;
 
+/// The proven facts of one self-referential array-member-pointer field
+/// (Stage 2 of the owner-struct self-reference extension, design.md FR-30
+/// follow-on): `planArrayMemberPointers` (Pass A, run after `planOwners`)
+/// proves that EVERY read or write of this field, anywhere in the
+/// program, is an arrow access (`x->field`) whose pointer root is
+/// provably an element of the SAME promoted owner array — the closed set
+/// of `elementCount` possible values a write can ever store. Unlike
+/// `MemberPointerFacts` (one binding per struct INSTANCE, tracking a
+/// single degenerate whole-object target), this fact is one binding per
+/// FIELD DECLARATION covering every instance at once, because the proof
+/// itself is program-wide: the field's synthesized `!emitrust.enum`
+/// storage type and its `emitrust.switch`-encoded writes are shared by
+/// every element of the array. A field absent from
+/// `arrayMemberPtrBindings` (or present with a non-empty
+/// `invalidReason`) falls through unchanged to the historical
+/// `memberPtrBindings`/`poisonedPtrFields` static-binding model — this
+/// analysis is strictly additive and never changes behavior for a field
+/// it cannot prove safe.
+struct ArrayMemberPointerFacts {
+  /// The promoted owner array (an `ownerPlans` key) every proven site of
+  /// this field roots into; null until populated.
+  const clang::VarDecl *ownerArray = nullptr;
+  /// The number of elements of `ownerArray` (1..32, the owner-struct MVP
+  /// limit `kMaxOwnerArrayElements` already enforced by `planOwners`) —
+  /// the field's enum variant count.
+  unsigned elementCount = 0;
+  /// The module symbol of the synthesized `emitrust.enum_def` backing
+  /// this field's storage type, assigned on first emission use
+  /// (`getOrCreateArrayMemberEnumType`); empty until then.
+  std::string enumSymbol;
+  /// Diagnostic text explaining why this field could not be proven safe;
+  /// empty when the field is populated and usable. A field this pass
+  /// cannot fully prove is simply left absent from
+  /// `arrayMemberPtrBindings` rather than recorded with a reason here, so
+  /// this member currently stays unused, kept for parity with
+  /// `MemberPointerFacts` and as a landing spot for a future pass that
+  /// wants a located "why not" diagnostic instead of a silent fallback.
+  std::string invalidReason;
+  /// Location of the invalidating construct; meaningful only with
+  /// `invalidReason`.
+  clang::SourceLocation invalidLoc;
+};
+
+/// The program-wide key of one array-member-pointer fact: the field
+/// declaration alone (see `ArrayMemberPointerFacts`'s doc for why this
+/// fact is per-field rather than per-instance).
+using ArrayMemberPointerKey = const clang::FieldDecl *;
+
 /// Registry of the synthesized backing declarations for block-scope
 /// compound literals used as pointer-region bases (C99-13). A compound
 /// literal in expression position is a fresh anonymous object with the
@@ -854,6 +902,34 @@ public:
   /// source keeps the historical non-address rejection, which is
   /// conservative — planning never consumes carrier regions.
   std::function<bool(const clang::FunctionDecl *)> carrierReturnQuery;
+
+  /// Optional query telling the walk whether a direct call to `callee` is a
+  /// promoted owner method proven to return an i64 element index into the
+  /// same owner region as its own pointer parameter(s) (Stage 1 of the
+  /// owner-index-return extension, design.md FR-30 follow-on). Such a call
+  /// is a region source exactly like a copy from one of the callee's own
+  /// pointer parameters: `recordPointerWrite` re-classifies the call's
+  /// first pointer argument instead of falling through to the non-address
+  /// rejection. Left unset (the pure-AST planning passes and any TU where
+  /// no function yet qualifies), every call source keeps the historical
+  /// rejection.
+  std::function<bool(const clang::FunctionDecl *)> ownerIndexReturnQuery;
+
+  /// Optional query telling the walk whether `field` is a (candidate or
+  /// proven) array-member self-referential pointer field (Stage 2/4 of the
+  /// owner-struct self-reference extension, design.md FR-30 follow-on):
+  /// `p = x->field` on such a field is a region source exactly like a copy
+  /// from `x` itself — the field always decodes to a cursor value inside
+  /// the SAME owner class `x` roots into (Pass A's own per-field proof),
+  /// so `recordPointerWrite` re-classifies the destination local through
+  /// the arrow base (`x`) instead of falling through to the non-address
+  /// rejection (Stage 4, B3). `planArrayMemberPointers` (Pass A) sets this
+  /// to structural candidacy (a field is still being proven, so no
+  /// `arrayMemberPtrBindings` entry exists yet) while emission sets it to
+  /// the fully proven `arrayMemberPtrBindings` membership. Left unset (the
+  /// other pure-AST planning passes), every such read keeps the historical
+  /// non-address rejection.
+  std::function<bool(const clang::FieldDecl *)> arrayMemberFieldQuery;
 
   /// Optional query telling the walk whether a local `void *` declaration
   /// is an admitted fn-ptr holder (CTS-F, 00210): such a local imports as
@@ -1427,6 +1503,27 @@ private:
   void planOwners(const clang::TranslationUnitDecl *unit,
                   bool soleTranslationUnit);
 
+  /// Stage 2 of the owner-struct self-reference extension (design.md
+  /// FR-30 follow-on): pure-AST pass, run immediately after `planOwners`
+  /// and consuming its `ownerPlans`/`methodPlans` output. For each
+  /// promoted owner class with element type `E`, considers every
+  /// self-referential data-pointer field of `E` (a field whose pointee is
+  /// `E` itself) as a candidate. A field claimed by more than one
+  /// promoted owner class is ambiguous and stays unpopulated. For every
+  /// remaining candidate, walks every function definition of the TU
+  /// (mirroring `planOwners`'s own traversal) collecting every
+  /// `MemberExpr` naming the field: a dot-form access, or an arrow access
+  /// whose base's root (via `resolveArgRoot`, exactly like `planOwners`'s
+  /// own call-edge unification and Stage 1's return-value analysis)
+  /// cannot be proven to belong to the class, disqualifies the field; an
+  /// assignment additionally requires the same proof of its right-hand
+  /// side. A field with every site so proven is populated into
+  /// `arrayMemberPtrBindings`; anything else is left absent, falling
+  /// through unchanged to the historical `memberPtrBindings`/
+  /// `poisonedPtrFields` model. This pass never emits a diagnostic and
+  /// never fails: it is strictly additive over `planOwners`'s output.
+  void planArrayMemberPointers(const clang::TranslationUnitDecl *unit);
+
   /// Side-effect-free AST mirror of `emitPointerRValue`'s base resolution:
   /// returns the single object a pointer-typed call argument points into (a
   /// local array or scalar, or a pointer parameter of the calling
@@ -1435,6 +1532,25 @@ private:
   /// locals.
   const clang::VarDecl *resolveArgRoot(PointerRegionAnalysis &regions,
                                        const clang::Expr *expr) const;
+
+  /// Returns whether `root` — a `resolveArgRoot` result at Pass-A planning
+  /// time, or a `PtrExprValue::base` at emission time (the same VarDecl
+  /// identity space: either is "the declaration a pointer decomposition's
+  /// region roots at") — is provably an element of `ownerArray`'s class:
+  /// either the array itself (reachable only from the owning function via
+  /// `&arr[i]`), or a pointer parameter of a function `planOwners` already
+  /// qualified as one of `ownerArray`'s methods — every data-pointer
+  /// parameter of such a function is, by `planOwners`'s own all-or-nothing
+  /// invariant, unified into that exact class. Shared by
+  /// `planArrayMemberPointers` (which proves every site ahead of time) and
+  /// `emitArrayMemberPointerAssign` (whose defensive re-check mirrors the
+  /// same class membership test the proof already ran, since a pointer
+  /// parameter's `PtrExprValue::base` is the PARAMETER declaration itself,
+  /// not the owner array's declaration — a bare pointer-equality check
+  /// against `ownerArray` would reject every method-parameter-rooted
+  /// value).
+  bool isArrayMemberOwnerRoot(const clang::VarDecl *root,
+                              const clang::VarDecl *ownerArray) const;
 
   /// Collects the function definitions the Pass-A planners analyze: every
   /// function of `unit` whose body is defined here, is not variadic, and
@@ -1569,6 +1685,53 @@ private:
   /// rejection.
   LogicalResult emitMemberPointerAssign(const clang::MemberExpr *member,
                                         const clang::Expr *rhs, Location loc);
+
+  //===--------------------------------------------------------------------===//
+  // Array-member pointers (Stage 2 of the owner-struct self-reference
+  // extension)
+  //===--------------------------------------------------------------------===//
+
+  /// Returns the `!emitrust.enum` type backing `field`'s storage,
+  /// synthesizing its module-level `emitrust.enum_def` (one variant `E0`
+  /// .. `E{elementCount-1}` per array index) on first need and memoizing
+  /// the symbol into `facts.enumSymbol`. The synthesized name
+  /// (`<Record>_<Field>_Bases`) is collision-checked against the module
+  /// symbol table, mirroring `emitOwnerLocal`'s synthesize-on-first-need
+  /// pattern.
+  FailureOr<Type>
+  getOrCreateArrayMemberEnumType(const clang::FieldDecl *field,
+                                 ArrayMemberPointerFacts &facts, Location loc);
+
+  /// Emits the READ decode of an array-member-pointer field already
+  /// proven usable (`arrayMemberPtrBindings` has a populated entry for
+  /// `field`): resolves `member`'s (arrow-only) base to the array
+  /// element's place, loads the field's enum value, and decodes it to an
+  /// i64 element index via `castEnumToI32` widened to i64 — the field's
+  /// enum storage IS the index by construction, so no branching is
+  /// needed. The result's `PtrExprValue::base` is the arrow base
+  /// expression's OWN resolved base (a method's own pointer parameter, not
+  /// `facts.ownerArray`), so it compares equal to a plain read of that
+  /// same base expression (see the implementation's doc comment).
+  FailureOr<PtrExprValue>
+  emitArrayMemberPointerRead(const clang::MemberExpr *member,
+                             const clang::FieldDecl *field,
+                             ArrayMemberPointerFacts &facts, Location loc);
+
+  /// Emits `x->field = rhs` on an array-member-pointer field already
+  /// proven usable: resolves `rhs` to its (base, cursor) decomposition
+  /// (proven by Pass A to root in the same owner array), then encodes the
+  /// i64 cursor into the field's enum storage through an `emitrust.switch`
+  /// over the cursor value (one case per array index assigning that
+  /// index's enum constant, plus a default region assigning `E0` that
+  /// Pass A's proof makes unreachable — mirroring `IndexSwitchLowering`'s
+  /// default-region convention) — a genuine Rust `match`, not a bare
+  /// transmute, so the enum's closed variant set stays visibly exhaustive
+  /// at every write site.
+  LogicalResult
+  emitArrayMemberPointerAssign(const clang::MemberExpr *member,
+                               const clang::FieldDecl *field,
+                               ArrayMemberPointerFacts &facts,
+                               const clang::Expr *rhs, Location loc);
 
   //===--------------------------------------------------------------------===//
   // Declarations
@@ -2161,8 +2324,15 @@ private:
   /// integer, so a struct can hold one; the member's target object is
   /// resolved statically per instance and the stored value carries no
   /// information in the degenerate model); every other type maps through
-  /// `mapType`.
-  FailureOr<Type> mapStructFieldType(clang::QualType type, Location loc);
+  /// `mapType`. `field`, when given and proven usable in
+  /// `arrayMemberPtrBindings` (Stage 2 of the owner-struct self-reference
+  /// extension), overrides the plain-i64 pointer mapping with the field's
+  /// synthesized `!emitrust.enum` storage type instead. Null (the
+  /// historical behavior) when the caller has no field to associate — the
+  /// data-pointer field's only caller (struct-def field emission)
+  /// supplies it.
+  FailureOr<Type> mapStructFieldType(clang::QualType type, Location loc,
+                                     const clang::FieldDecl *field = nullptr);
 
   /// Converts the struct `APValue` of `record` to one attribute per
   /// flattened struct_def field, appended to `fields`. `fieldTypes` is
@@ -3277,10 +3447,17 @@ private:
   /// is materialized last, immediately before the call. The `func.call` is
   /// tagged `emitrust.method_call` for the conversion-layer rewrite into an
   /// `emitrust.method_call` place expression.
-  FailureOr<Value> emitMethodCallSite(const clang::CallExpr *call,
-                                      func::FuncOp target,
-                                      const clang::VarDecl *ownerBase,
-                                      Location loc);
+  /// `outFirstPointerArgBase`, when non-null, receives the region base
+  /// (`PtrExprValue::base`) the call's FIRST data-pointer argument resolved
+  /// to, or null if the call has none. Stage 1's owner-index-return call
+  /// consumption (`emitPointerRValue`'s `CallExpr` case) reuses this single
+  /// argument-materialization pass to learn which region an
+  /// owner-index-returning callee's i64 result roots at, without
+  /// re-evaluating the argument a second time.
+  FailureOr<Value>
+  emitMethodCallSite(const clang::CallExpr *call, func::FuncOp target,
+                     const clang::VarDecl *ownerBase, Location loc,
+                     const clang::VarDecl **outFirstPointerArgBase = nullptr);
 
   /// Lowers one borrow-producing call argument against the reference-typed
   /// target parameter `paramType`. A slice parameter receives an
@@ -3962,6 +4139,18 @@ private:
   /// becomes an owner method, mapped to its owner's base variable.
   llvm::DenseMap<const clang::FunctionDecl *, const clang::VarDecl *>
       methodPlans;
+  /// Owner methods (Stage 1 of the owner-index-return extension) whose
+  /// pointer return type was proven, at `planOwners` time, to always root
+  /// in the SAME owner class as the method's own pointer parameter(s):
+  /// every `return` operand's `resolveArgRoot` resolves to the method's
+  /// class. Such a method's Rust result type is a plain i64 element index
+  /// instead of hitting `classifyPointerReturn`'s rejection (which has no
+  /// representation for a pointer into a callee-local/parameter region).
+  /// Keyed by canonical declaration; disjoint concern from
+  /// `pointerReturnKinds`/`globalReturnBases` (the CTS-P2/CTS-S pointer-
+  /// return classifications), which never apply to a method (methods never
+  /// reach `classifyPointerReturn`).
+  llvm::DenseSet<const clang::FunctionDecl *> ownerIndexReturns;
   /// Per-function owner struct places (populated in the owning function
   /// only), keyed by the promoted base variable; feeds method-call
   /// receivers. The struct place is only ever borrowed, never loaded.
@@ -3972,6 +4161,12 @@ private:
   /// The owner base variable of the method currently being imported; null
   /// when the current function is not a method.
   const clang::VarDecl *currentMethodOwner = nullptr;
+  /// Whether the method currently being imported is an owner-index-return
+  /// method (Stage 1): `emitReturnStmt` routes its return sites through the
+  /// `emitPointerRValue`/cursor path instead of the integer-carrier (CTS-P3)
+  /// path, even though both classify to a plain i64 result type. Always
+  /// false outside a method (`currentMethodOwner` null).
+  bool currentOwnerIndexReturn = false;
   /// W2.2: the raw entry-block receiver argument (an
   /// `!emitrust.mut_ref<!emitrust.struct<...>>` or
   /// `!emitrust.ref<!emitrust.struct<...>>`) while importing a genuine C++
@@ -4006,6 +4201,17 @@ private:
   /// objects. Reads and writes of data-pointer members resolve against
   /// this map at their use sites.
   llvm::DenseMap<MemberPointerKey, MemberPointerFacts> memberPtrBindings;
+  /// Program-wide array-member-pointer bindings (Stage 2 of the
+  /// owner-struct self-reference extension), keyed by field declaration:
+  /// `planArrayMemberPointers` (Pass A, run after `planOwners`) populates
+  /// an entry only for a field it proves every site of. Consulted FIRST —
+  /// before `memberPtrBindings`/`poisonedPtrFields` — by
+  /// `resolveMemberPointerBinding`'s callers (the member-pointer
+  /// assignment emission and `emitPointerRValue`'s member-read branch);
+  /// a field absent here falls through unchanged to that historical
+  /// model.
+  llvm::DenseMap<ArrayMemberPointerKey, ArrayMemberPointerFacts>
+      arrayMemberPtrBindings;
   /// Data-pointer fields used somewhere in the program in a shape the
   /// per-instance member model cannot resolve, with the first such site;
   /// every read of a poisoned field is a located rejection.

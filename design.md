@@ -866,6 +866,212 @@ lists the lit test file(s) that validate it.
   TU last stored at link time.
   (test/Import/C/multi-tu-gate-g2-ptr-struct-member.c,
   multi-tu-gate-g2-ptr-struct-member-diverge.c (negative))
+- [x] FR-36 Owner-index return, Stage 1 (FR-30 follow-on). `planOwners`
+  previously disqualified a candidate method unconditionally on any pointer
+  return type; it now proves, per candidate method AFTER the class's
+  parameter-based union-find settles (so the check is a pure post-hoc
+  refinement — zero behavior change for any program without this shape),
+  that every `return` operand's root (`resolveArgRoot`, the SAME
+  interprocedural resolution already used for call arguments) lands in the
+  method's own class. A method that qualifies is recorded in the new
+  `ownerIndexReturns` set (keyed by canonical declaration, disjoint from
+  `pointerReturnKinds`/`globalReturnBases`, which a method never reaches)
+  instead of being rejected; its Rust result type is a plain i64 element
+  index. `emitReturnStmt` decomposes such a return exactly like a
+  method-call pointer argument (`emitPointerRValue` plus the same
+  rooted-at-owner/non-null/degenerate-base defensive checks
+  `emitMethodCallSite` runs) and stores the cursor as the return value — a
+  new `currentOwnerIndexReturn` flag keeps this disjoint from the
+  pre-existing integer-carrier (CTS-P3) i64-return path, which classifies
+  unrelated `void *` shapes to the same MLIR result type. Call-site
+  consumption is symmetric: `PointerRegionAnalysis::recordPointerWrite`
+  gains an `ownerIndexReturnQuery` callback (mirroring the existing
+  `carrierReturnQuery` injection point) so `local = ownerIndexMethod(...)`
+  re-classifies the call's first pointer argument (every pointer parameter
+  of such a method shares one class, so any one determines the region) as
+  the local's region source instead of the historical non-address
+  rejection, and `emitPointerRValue` gained a matching `CallExpr` case that
+  reuses `emitMethodCallSite` (extended with an optional out-parameter
+  reporting the first pointer argument's resolved base) to materialize the
+  call exactly once and pair its i64 result with that base as the local's
+  (base, cursor) decomposition — so a local bound this way bins into its
+  owning function's prologue and ordinary pointer-local machinery
+  identically to one bound from an address form. Interprocedural
+  propagation beyond the binding function (uniting a THIRD function's
+  parameter class through a local itself bound from an owner-index-return
+  call result, and thereby promoting that third function to a method too)
+  is DEFERRED — no test in this stage exercises a call chain that deep, and
+  `planOwners`'s own per-class promotion decisions are otherwise frozen
+  before this refinement runs, so nothing regresses by leaving it for a
+  later stage if the demand signal calls for it. Member pointers, enum
+  synthesis, and the equality carve-out for owner-index-return results are
+  explicitly out of scope for this stage.
+  (test/EndToEnd/owner-index-return.c)
+- [x] FR-37 Self-referential array-member struct field as enum, Stage 2
+  (FR-30 follow-on), import-only. A new whole-program Pass-A pass,
+  `planArrayMemberPointers` (run immediately after `planOwners`,
+  consuming its `ownerPlans`/`methodPlans` output), proves for a
+  self-referential data-pointer field (a field whose pointee is its own
+  owning record type) of a promoted owner array's element type that
+  EVERY arrow-form read or write of the field, anywhere in the program,
+  roots — via the same `resolveArgRoot` interprocedural resolution
+  `planOwners` and FR-36 both reuse — in that ONE owner array's class,
+  and that every write's right-hand side is itself such a rooted value
+  (the promoted cursor value itself, e.g. `x->self = x;`). A field with
+  every site so proven is recorded in the new `arrayMemberPtrBindings`
+  map (keyed by field declaration, since the proof is program-wide, not
+  per struct instance like the pre-existing degenerate
+  `memberPtrBindings`/`poisonedPtrFields` model it sits ahead of and
+  falls through to unchanged when it cannot prove a field safe — this
+  pass is strictly additive and never emits a diagnostic). A proven
+  field's MLIR struct-field type becomes a synthesized
+  `emitrust.enum_def` (one variant per array index, synthesized once per
+  field on first use and memoized) instead of a plain i64 cursor; every
+  WRITE lowers to a genuine `emitrust.switch` match over the i64 index
+  being assigned (one case per element assigning that index's enum
+  constant, plus a default — provably unreachable by the proof — that
+  assigns the first variant, mirroring `IndexSwitchLowering`'s
+  default-region convention); every READ decodes with the existing
+  `castEnumToI32` helper widened to i64, with no branching, since the
+  enum's storage IS the index by construction. `mapStructFieldType`
+  gained an optional `FieldDecl*` parameter (its one caller, struct-def
+  field emission, already had the field in scope) to consult the new
+  map. Path compression / multi-step self-reference chains, the
+  cross-parameter equality carve-out, and the differential end-to-end
+  counterpart are explicitly deferred to later stages; this stage is
+  import-only/FileCheck, validated byte-identically against every
+  pre-existing member-pointer and owner-struct test
+  (test/Import/C/pointers-member.c, pointers-member-base.c, owners.c,
+  test/EndToEnd/owner-index-return.c, and the rest of check-emitrust).
+  (test/Import/C/array-self-ref-member.c)
+- [x] FR-37 Stage 3, differential end-to-end counterpart. Same
+  `struct node { struct node *self; int x; }` shape as Stage 2, made
+  runnable: `link_node` writes the enum-typed `self` field (the genuine
+  `match` synthesized by `planArrayMemberPointers`) and increments the
+  plain `x` field in the same method, proving the enum field and an
+  ordinary field coexist; `main` loops over a 3-element promoted owner
+  array, reading `self` back through `check_node`'s `p->self == p`
+  equality (branchless enum decode) and printing both the equality
+  result and `x` per element. Required zero `lib/` changes — the Stage 2
+  mechanism was already runtime-correct; this stage only adds the test.
+  Verified: native-vs-Rust stdout is byte-identical
+  (`i=0 same=1 x=11` / `i=1 same=1 x=21` / `i=2 same=1 x=31`); the
+  emitted crate contains both the `node_self_Bases` tuple-struct enum
+  and a literal `match v0 { ... }` block; zero `unsafe` in the generated
+  Rust. check-emitrust: 328/328 (up from 327/327).
+  (test/EndToEnd/array-self-ref-member.c)
+- [x] FR-37 Stage 4, path compression (chained self-reference). Extends
+  Stage 2/3 from the degenerate `x->self = x;` shape to the actual
+  `union-find.c` `uf_find` shape: `while (x->self != x) { parent =
+  x->self; x->self = parent->self; x = parent; }`. Two sub-blockers,
+  B3 and B4: B3 is `parent = x->self;`, a LOCAL bound FROM a field READ —
+  `PointerRegionAnalysis::recordPointerWrite` (`lib/ImportC/ImportC.cpp`)
+  gains a new case, gated by a new `arrayMemberFieldQuery` callback
+  (mirroring FR-36's `ownerIndexReturnQuery` injection point), that joins
+  the destination local into the arrow base's own class exactly like
+  copying from the base directly — a parameter arrow base becomes the
+  region base, a tracked local arrow base unions the two regions. B4 is
+  `x->self = parent->self;`, a WRITE whose right-hand side is ITSELF an
+  array-member field read rather than the cursor value itself (Stage 2's
+  only proven write shape) — fixed entirely in Pass A
+  (`planArrayMemberPointers`): a right-hand side that is an arrow read of
+  a (candidate) array-member field is now as legal a write source as the
+  cursor value itself, verified with the same read-side proof this pass
+  already runs for every site of the field. The write-side EMISSION
+  (`emitArrayMemberPointerAssign`) needed NO change: it already calls the
+  general `emitPointerRValue` on its right-hand side, which already
+  dispatches an array-member field read through
+  `emitArrayMemberPointerRead` (Stage 2) regardless of context — B4 was
+  purely a Pass-A proof gap, not an emission gap. The loop-comparison
+  shape (`while (x->self != x)`) needed NO dedicated special case either
+  (a structural deviation from the stage's plan, which anticipated one):
+  `emitArrayMemberPointerRead` already returns
+  `PtrExprValue{arrowBase->base, index}` (Stage 2), reusing the arrow
+  base's OWN resolved base identity — here literally `x` on both sides of
+  the comparison — so the general pointer-equality machinery's
+  `lhs->base == rhs->base` identity check already passes trivially and
+  the cursors compare correctly through the ordinary `arith.cmpi` path.
+  `arrayMemberFieldQuery` is wired three ways: Pass A's own
+  `PointerRegionAnalysis` (used while STILL proving the field, so it
+  answers structural candidacy, not final `arrayMemberPtrBindings`
+  membership) and both emission-time `PointerRegionAnalysis` instances
+  (the ordinary and va_list-clone prologues), which answer proven
+  membership. Explicitly out of scope and confirmed still rejected: the
+  cross-parameter equality carve-out (`root1 == root2` on two DIFFERENT
+  `find` results, `union-find.c`'s B5) and the full `union-find.c`
+  program, both deferred to Stage 5/6 — `uf_union`'s
+  `root1 == root2` / `root1->parent = root2;` shape still poisons Pass
+  A's proof for the field program-wide (verified directly: adding
+  `uf_union` to a minimal repro reproduces the exact pre-Stage-4 "used
+  outside the static-binding model" rejection), independent of and
+  unaffected by this stage's B3/B4/loop-comparison fixes. check-emitrust:
+  330/330 (up from 328/328); zero `unsafe` in the generated Rust; every
+  pre-existing member-pointer, owner-struct, and Stage 2/3 test
+  unchanged.
+  (test/Import/C/array-self-ref-member-chain.c,
+  test/EndToEnd/array-self-ref-member-chain.c)
+- [x] FR-38 Stage 5, cross-parameter pointer equality (B5). Fixes the two
+  compounding gaps Stage 4 identified and confirmed still-blocking:
+  (1) Pass A's OWN `PointerRegionAnalysis` instance
+  (`planArrayMemberPointers`, `lib/ImportC/ImportCPlanning.cpp`) never had
+  `ownerIndexReturnQuery` wired to it — only the emission-time instances
+  were (FR-36) — so a local bound from an owner-index-returning call
+  (`root1 = uf_find(node1);`) was invisible to Pass A's own root
+  resolution and poisoned the field program-wide before the real,
+  emission-time proof was ever reached; fixed by wiring the identical
+  callback Pass A already wires for `arrayMemberFieldQuery` (FR-37).
+  (2) Even once Pass A could resolve `root1`/`root2`, the general
+  pointer-equality comparator (`lib/ImportC/ImportCExpressions.cpp`)
+  rejected `root1 == root2` outright because each local's
+  `PtrExprValue::base` is the DIFFERENT pointer parameter it was bound
+  from (`node1` for `root1`, `node2` for `root2`) — genuinely different
+  `clang::VarDecl`s even though, by `planOwners`'s all-or-nothing
+  per-function qualification (every data-pointer parameter of one
+  qualifying method shares one class), both are provably cursors into the
+  SAME array class within that one function body. Fixed with a narrow
+  carve-out immediately before the base-identity rejection: when both
+  sides' bases are each either the current method's own owner array or a
+  data-pointer parameter of the CURRENT method (`currentMethodOwner`,
+  established once per function body — a base referenced from the body
+  being emitted can only be a declaration visible to it, so no
+  cross-function bookkeeping is needed), the base-identity mismatch is
+  ignored for equality/inequality only and just the cursor (i64 index)
+  values are compared — never generalized to ordered comparisons or
+  across functions. A structural surprise beyond the stage's brief: once
+  both fixes land, `test/RealWorld/Inputs/union-find.c` (the ultimate
+  target) does not merely get past the `uf_union` blocker — the ENTIRE
+  program now imports, converts, emits, builds, and differentially
+  matches a clang-native build byte-for-byte (`test/RealWorld/realworld.c`
+  ratchet updated forward to include `union-find`, the only manifest
+  change this stage makes). check-emitrust: 332/332 (up from 330/330);
+  zero `unsafe` in the generated Rust; every pre-existing member-pointer,
+  owner-struct, and Stage 2/3/4 test unchanged.
+  (test/Import/C/array-self-ref-member-cross-param.c,
+  test/EndToEnd/array-self-ref-member-cross-param.c)
+- [x] FR-38 Stage 6, `union-find.c` capstone differential test. Authors
+  `test/EndToEnd/union-find.c` (it did not exist before this stage —
+  only `test/RealWorld/Inputs/union-find.c` did) as a proper lit
+  differential test: the real `struct uf_node { struct uf_node *parent;
+  unsigned rank; }` program (`uf_node_init`, `uf_find` with path
+  compression, `uf_union` with union-by-rank via B5 cross-parameter
+  equality, `connected`) over an 8-element array, near-verbatim from the
+  RealWorld input, printing the full 8x8 connectivity matrix and final
+  ranks. Required zero `lib/` changes — Stages 2-5 already made the whole
+  program runtime-correct; this stage only adds the regression-guarding
+  test. Verified: native-vs-Rust stdout byte-identical; the emitted crate
+  contains the `uf_node_parent_Bases` tuple-struct enum (one variant per
+  array index) and multiple literal `match` blocks; zero `unsafe` in the
+  generated Rust. check-emitrust: 333/333 (up from 332/332); the RealWorld
+  ratchet (`test/RealWorld/expected-transpile.txt`, already updated by
+  Stage 5) reverified independently via `run_realworld.py`: `union-find`
+  TRANSPILED, zero regressions/improvements against the manifest, and the
+  `self-ref-pointer-member` blocker tag no longer appears on any rejected
+  corpus program. `test/RealWorld/Inputs/binary-tree.c` (separately
+  tagged `returned-pointer`) was re-checked directly and still rejects,
+  unchanged, at its `malloc`'d-node return site — confirmed a C99-46
+  (dynamic memory) blocker, not a member-pointer or owner-index-return
+  gap; left untouched, out of scope.
+  (test/EndToEnd/union-find.c)
 
 ## C99 Support Roadmap
 
@@ -1549,6 +1755,24 @@ rule.
   (design decision needed alongside C99-26: reference-typed struct fields
   require Rust lifetimes, which the dialect deliberately does not model;
   candidate mappings are index-based handles or ownership restructuring).
+  PARTIALLY RESOLVED for one closed subset: a self-referential pointer
+  member of a promoted owner-struct array (`struct uf_node *parent`
+  pointing at another element of the SAME array) is no longer a blanket
+  rejection — see FR-37/FR-38 (`planArrayMemberPointers`, an
+  `emitrust.enum_def` with one variant per array index, decoded/written
+  via a genuine `match`). This resolves the member-pointer half of the
+  shape; the RETURNED-pointer half is resolved only for the array-rooted
+  case, where every return site provably roots in the same owner class as
+  a data-pointer parameter of the same method (FR-36's owner-index
+  return, Stage 1) — general arbitrary pointer returns (a pointer into a
+  callee-local, non-array-backed object) remain rejected. Confirmed by
+  direct test: `test/RealWorld/Inputs/binary-tree.c`'s `insert`, which
+  returns a pointer to a freshly `malloc`'d node rather than a cursor into
+  a caller-visible array, still rejects with "unsupported: returned
+  pointer value (only a returned function address has a representation;
+  a cursor into a callee-local region would dangle)" — the blocker there
+  is dynamic memory (C99-46, out of scope for this plan), not the
+  member-pointer or owner-index-return mechanism, and is left untouched.
 - [x] C99-44 Unions. DECIDED and SHIPPED: the one-slot struct model —
   a supported subset with documented located rejections, not an enum
   mapping and not a blanket rejection. A named or untagged union
@@ -2543,6 +2767,40 @@ observed when C99-33 + C99-47 together unlocked 00215).
   (binding order) and the discriminant stays the promotable memref<i32>
   cell storing 0/1. test/Import/C/pointers-member-base.c @mixed_base;
   differential test/EndToEnd/pointers-member-base.c.)
+- [x] Array-member self-reference (FR-37/FR-38, `union-find.c`'s
+  `struct uf_node *parent` shape): `planArrayMemberPointers`
+  (`lib/ImportC/ImportCPlanning.cpp`) proves a struct pointer MEMBER
+  whose every read/write site provably roots in the SAME promoted
+  owner-struct array as the struct instance it lives in (never an
+  externally-named distinct object) and synthesizes an
+  `emitrust.enum_def` with one variant per array INDEX — not per
+  distinct base object — decoded/written via a genuine `match` on that
+  closed, array-sized set. Key architectural decision: this reuses and
+  extends the owner-struct-index model (`planOwners`, FR-30/FR-36)
+  rather than generalizing CTS-P7's enum-of-BASES multi-base cursor to
+  cover struct members. CTS-P7's mechanism is the right fit for a small,
+  statically enumerable set of genuinely DISTINCT named objects a single
+  local pointer variable ranges over (`p = &x; ... p = &y;`) — each
+  variant names one independent base. A self-referential array-member
+  pointer is a different shape: it ranges over elements of ONE already-
+  promoted array (potentially large, and sized by the array, not by a
+  fixed count of distinct locals), and it must interoperate with that
+  same array's pointer PARAMETERS, LOCALS bound from calls (FR-36's
+  owner-index return), and cross-parameter equality (FR-38's B5) — all
+  of which already speak the owner-struct i64-cursor representation.
+  Building the member pointer on owner-struct-index instead of a second,
+  CTS-P7-shaped discriminated union means every one of those
+  interactions (path compression's `parent = x->self;` field read
+  binding a local, `while (x->self != x)` comparing a decoded field
+  against a cursor, `root1 == root2` comparing two independently-traced
+  parameters) is the SAME representation on both sides with no bridging
+  conversion between two different pointer models. CTS-P7 stays scoped
+  to its original multi-object-local use case and is untouched by this
+  work (`pointers-multi-base.c` and its differential counterpart pass
+  unchanged). See FR-37/FR-38 above for the mechanism's staged
+  construction (enum synthesis, path compression, cross-parameter
+  equality) and `test/EndToEnd/union-find.c` for the full capstone
+  program this unlocks.
 - [x] CTS-P8 (1) NULL data-pointer constants: an Option-of-cursor model
   mirroring the fn_ptr None mapping; interacts with CTS-P3.
   (00171.c)
@@ -3570,6 +3828,26 @@ a robustness bug (the importer must emit a located rejection, never a segfault);
 it is pinned here as the highest-priority survey finding and mapped to a
 follow-up fix wave, not fixed in the test-only W4.0. W4.1 tabulates and ranks
 these to drive W4.2+ (the ranking overrides the plan's pre-baked ladder order).
+
+**W4.2 update: `union-find` cleared.** The owner-struct self-reference
+extension (FR-37/FR-38, six stages) resolved the `self-ref-pointer-member`
+blocker entirely: `union-find` now TRANSPILES and differentially matches a
+clang-native build byte-for-byte (`test/RealWorld/expected-transpile.txt`
+ratchet-updated forward; verified live via `run_realworld.py`:
+`total=13 transpiled=6 rejected=7 miscompiled=0`, zero regressions/
+improvements against the manifest). The `self-ref-pointer-member` tag is
+retired — no remaining rejected corpus program carries it. `binary-tree`
+(`returned-pointer`) was separately re-checked after this work landed and
+still rejects, unchanged, at the same `insert` call site: the returned
+pointer there roots in a `malloc`'d node (a callee-local, non-array-backed
+allocation), which the array-rooted owner-index-return mechanism (FR-36)
+does not and cannot cover — the blocker is dynamic memory (C99-46), not
+the returned-pointer machinery itself. Current tally: **6 transpiled, 7
+rejected, 0 miscompiled** — `dynamic-memory` ×2 (`linked-list`,
+`malloc-stack`), and one each of `returned-pointer` (`binary-tree`,
+now confirmed malloc-rooted), `strchr-result-bind` (`grep-lite`),
+`global-string-cursor` (`expr-eval`), `argv` (`argv-echo`), and `crash`
+(`crc32`, still unfixed, still the highest-priority robustness finding).
 
 **Csmith DEFERRED** (documented decline): the flake toolchain is off-limits
 this cycle, so no new generator dependency is added. The seeded differential
