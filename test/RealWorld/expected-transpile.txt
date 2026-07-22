@@ -3,6 +3,7 @@
 # One program name per line. Regenerated via: run_realworld.py ... --update
 base64
 calc
+crc32
 logger
 sieve
 union-find
