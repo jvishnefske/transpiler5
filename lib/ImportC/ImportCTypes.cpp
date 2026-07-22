@@ -500,13 +500,25 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
 }
 
 FailureOr<Type> CImporter::mapStructFieldType(clang::QualType type,
-                                              Location loc) {
+                                              Location loc,
+                                              const clang::FieldDecl *field) {
   // C99-7: a data-pointer field stores as a plain i64 without mapping its
   // pointee, so the volatile scan must run before that shortcut.
   if (hasVolatileQualifier(astContext(), type))
     return emitError(loc) << "unsupported: volatile-qualified type";
-  if (isDataPointer(type))
+  if (isDataPointer(type)) {
+    // Stage 2 of the owner-struct self-reference extension: a field Pass A
+    // proved always points into the same promoted owner array stores as
+    // that array's synthesized enum-of-indices type instead of a plain
+    // i64, so its writes can lower to a genuine `emitrust.switch` match.
+    if (field) {
+      auto arrayIt = arrayMemberPtrBindings.find(field);
+      if (arrayIt != arrayMemberPtrBindings.end() &&
+          arrayIt->second.invalidReason.empty())
+        return getOrCreateArrayMemberEnumType(field, arrayIt->second, loc);
+    }
     return Type(builder.getIntegerType(64));
+  }
   return mapType(type, loc);
 }
 

@@ -1055,9 +1055,32 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
   // integer carrier (CTS-P3) propagates carrier-ness into `p`'s region;
   // any other returned pointer keeps the non-address rejection below.
   if (const auto *call = llvm::dyn_cast<clang::CallExpr>(e))
-    if (const clang::FunctionDecl *callee = call->getDirectCallee())
+    if (const clang::FunctionDecl *callee = call->getDirectCallee()) {
       if (carrierReturnQuery && carrierReturnQuery(callee))
         return recordCarrierSource(ptr, loc);
+      // `p = f(...)` on a promoted owner method proven to return an
+      // i64 element index into the same class as its own pointer
+      // parameter(s) (Stage 1, design.md FR-30 follow-on): the call is a
+      // region source exactly like copying from one of the callee's own
+      // pointer parameters. Every data-pointer parameter of such a method
+      // shares one class (planOwners' all-or-nothing per-function rule),
+      // so the FIRST one re-classifies `p`'s region identically to
+      // whichever the callee's own return-site resolution used.
+      if (ownerIndexReturnQuery && ownerIndexReturnQuery(callee)) {
+        for (unsigned i = 0,
+                      n = std::min<unsigned>(callee->getNumParams(),
+                                             call->getNumArgs());
+             i != n; ++i) {
+          const clang::ParmVarDecl *param = callee->getParamDecl(i);
+          if (isPointerType(param->getType()) &&
+              !isFunctionPointer(param->getType()))
+            return recordPointerWrite(ptr, call->getArg(i));
+        }
+        return markInvalid(ptr, loc,
+                           "unsupported: owner-index-returning call has no "
+                           "pointer argument to root the result at");
+      }
+    }
 
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
     switch (cast->getCastKind()) {
@@ -1088,6 +1111,37 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
                 asPointerPointerParamDeref(cast->getSubExpr()))
           if (cursorParamQuery(cursorParam))
             return addBase(ptr, cursorParam, loc);
+      // `p = x->field` on an array-member self-referential pointer field
+      // (Stage 4 of the owner-struct self-reference extension, design.md
+      // FR-30 follow-on, B3 — e.g. `parent = node->parent;`): the field
+      // always decodes to a cursor value inside the SAME owner class `x`
+      // itself roots into (Pass A's own per-field proof, consulted here
+      // through `arrayMemberFieldQuery`), so `p` joins that class exactly
+      // like copying from `x` directly — a parameter arrow base becomes
+      // the region base (mirroring the `p = param` case above), a tracked
+      // local arrow base unions the two regions (mirroring the `p = q`
+      // case above). The actual field decode is deferred entirely to
+      // emission (`emitArrayMemberPointerRead`); this only has to get the
+      // destination's OWN region right. Any other arrow-base shape (a
+      // nested member access, an untracked local, ...) is Stage 4+ scope
+      // and falls through to the non-address rejection below.
+      if (arrayMemberFieldQuery) {
+        if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(
+                stripTrivia(cast->getSubExpr()));
+            member && member->isArrow()) {
+          if (const auto *field =
+                  llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+              field && arrayMemberFieldQuery(field)) {
+            if (const clang::ParmVarDecl *param =
+                    asPointerParamRef(member->getBase()))
+              return addBase(ptr, param, loc);
+            if (const clang::VarDecl *source =
+                    asLoadedLocalVarRef(member->getBase()))
+              if (tracks(source))
+                return unite(ptr, source);
+          }
+        }
+      }
       break;
     }
     case clang::CK_ArrayToPointerDecay: {
@@ -1527,6 +1581,23 @@ CImporter::resolveArgRoot(PointerRegionAnalysis &regions,
   return nullptr;
 }
 
+bool CImporter::isArrayMemberOwnerRoot(const clang::VarDecl *root,
+                                       const clang::VarDecl *ownerArray) const {
+  if (!root)
+    return false;
+  if (root == ownerArray)
+    return true;
+  const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(root);
+  if (!param)
+    return false;
+  const auto *owningFn =
+      llvm::dyn_cast_if_present<clang::FunctionDecl>(param->getDeclContext());
+  if (!owningFn)
+    return false;
+  auto methodIt = methodPlans.find(owningFn->getCanonicalDecl());
+  return methodIt != methodPlans.end() && methodIt->second == ownerArray;
+}
+
 void CImporter::mergeMemberPointerFacts(const MemberPointerKey &key,
                                         const MemberPointerFacts &incoming) {
   MemberPointerFacts &target = memberPtrBindings[key];
@@ -1705,6 +1776,19 @@ CImporter::resolveMemberPointerBinding(const clang::MemberExpr *member,
 
 LogicalResult CImporter::emitMemberPointerAssign(
     const clang::MemberExpr *member, const clang::Expr *rhs, Location loc) {
+  // Stage 2 of the owner-struct self-reference extension: a field Pass A
+  // (`planArrayMemberPointers`) proved usable is consulted BEFORE the
+  // historical per-instance static-binding model, so every existing test
+  // of a field it could not prove (absent here) sees byte-identical
+  // output.
+  if (const auto *field =
+          llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl())) {
+    auto arrayIt = arrayMemberPtrBindings.find(field);
+    if (arrayIt != arrayMemberPtrBindings.end() &&
+        arrayIt->second.invalidReason.empty())
+      return emitArrayMemberPointerAssign(member, field, arrayIt->second, rhs,
+                                          loc);
+  }
   FailureOr<const MemberPointerFacts *> binding =
       resolveMemberPointerBinding(member, loc);
   if (failed(binding))
@@ -1729,6 +1813,155 @@ LogicalResult CImporter::emitMemberPointerAssign(
            << "unsupported: pointer struct member assigned this value";
   // The degenerate binding is static: the stored i64 member stays 0 and
   // the write needs no runtime code.
+  return success();
+}
+
+FailureOr<Type> CImporter::getOrCreateArrayMemberEnumType(
+    const clang::FieldDecl *field, ArrayMemberPointerFacts &facts,
+    Location loc) {
+  if (facts.enumSymbol.empty()) {
+    std::string symbol = (llvm::Twine(field->getParent()->getName()) + "_" +
+                          field->getName() + "_Bases")
+                             .str();
+    if (SymbolTable::lookupSymbolIn(module, symbol))
+      return emitError(loc)
+             << "unsupported: array-member-pointer enum name '" << symbol
+             << "' collides with an existing symbol";
+    // One variant per array index: the field's storage IS the index by
+    // construction, so a read never needs to branch (`castEnumToI32`) and
+    // a write's `emitrust.switch` case regions assign these constants
+    // 1:1 with the case values.
+    llvm::SmallVector<std::string, 8> variantNameStorage;
+    llvm::SmallVector<int64_t, 8> variantValues;
+    variantNameStorage.reserve(facts.elementCount);
+    variantValues.reserve(facts.elementCount);
+    for (unsigned index = 0; index < facts.elementCount; ++index) {
+      variantNameStorage.push_back(("E" + llvm::Twine(index)).str());
+      variantValues.push_back(index);
+    }
+    llvm::SmallVector<llvm::StringRef, 8> variantNames;
+    for (const std::string &name : variantNameStorage)
+      variantNames.push_back(name);
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::EnumDefOp>(
+        loc, moduleBuilder.getStringAttr(symbol),
+        moduleBuilder.getStrArrayAttr(variantNames),
+        moduleBuilder.getDenseI64ArrayAttr(variantValues),
+        /*unsigned_underlying=*/true);
+    facts.enumSymbol = symbol;
+  }
+  return Type(emitrust::EnumType::get(builder.getContext(), facts.enumSymbol));
+}
+
+FailureOr<PtrExprValue> CImporter::emitArrayMemberPointerRead(
+    const clang::MemberExpr *member, const clang::FieldDecl *field,
+    ArrayMemberPointerFacts &facts, Location loc) {
+  if (!member->isArrow()) // Defensive; Pass A only proves arrow-form sites.
+    return emitError(loc) << "unsupported: pointer struct member '"
+                          << field->getName() << "' read in dot form";
+  // Resolved directly (mirroring `emitMemberBasePlace`'s decomposed-`->`
+  // branch) rather than through `emitMemberBasePlace` itself, because the
+  // arrow base's OWN resolved base — a method's own pointer parameter, not
+  // `facts.ownerArray` — is exactly the base identity a plain read of that
+  // same base expression already uses elsewhere in this function; reusing
+  // it (instead of the fixed `facts.ownerArray`) is what lets `p->self`
+  // and `p` compare equal (`emitComparison` requires `lhs->base ==
+  // rhs->base` by literal identity, and each owner method's parameter is
+  // registered as its own base — see `isArrayMemberOwnerRoot`'s doc).
+  FailureOr<PtrExprValue> arrowBase = emitPointerRValue(member->getBase());
+  if (failed(arrowBase))
+    return failure();
+  FailureOr<Type> pointeeType = mapType(
+      member->getBase()->getType().getCanonicalType()->getPointeeType(), loc);
+  if (failed(pointeeType))
+    return failure();
+  FailureOr<Value> basePlace =
+      emitPointerPlace(loc, *arrowBase, *pointeeType, /*writeback=*/nullptr);
+  if (failed(basePlace))
+    return failure();
+  FailureOr<Type> enumType = getOrCreateArrayMemberEnumType(field, facts, loc);
+  if (failed(enumType))
+    return failure();
+  Value fieldPlace = builder
+                          .create<emitrust::MemberOp>(
+                              loc, emitrust::LValueType::get(*enumType),
+                              *basePlace, builder.getStringAttr(
+                                              flattenedFieldName(field)))
+                          .getResult();
+  Value enumValue = loadPlace(loc, fieldPlace);
+  Value asI32 = castEnumToI32(loc, enumValue);
+  Value index = castToIntType(loc, asI32, builder.getIntegerType(64));
+  return PtrExprValue{arrowBase->base, index};
+}
+
+LogicalResult CImporter::emitArrayMemberPointerAssign(
+    const clang::MemberExpr *member, const clang::FieldDecl *field,
+    ArrayMemberPointerFacts &facts, const clang::Expr *rhs, Location loc) {
+  if (!member->isArrow()) // Defensive; Pass A only proves arrow-form sites.
+    return emitError(loc) << "unsupported: pointer struct member '"
+                          << field->getName() << "' assigned in dot form";
+  FailureOr<Value> basePlace =
+      emitMemberBasePlace(member, loc, /*writeback=*/nullptr);
+  if (failed(basePlace))
+    return failure();
+  FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
+  if (failed(value))
+    return failure();
+  // `value->base` is the DECLARATION a promoted pointer's decomposition
+  // roots at, which for a method's own pointer parameter is the parameter
+  // itself (see `importFunction`'s owner-region-pointer-parameter
+  // prologue, which registers `pointerLocals[param]` with the parameter
+  // as its own base), not the owner array — `isArrayMemberOwnerRoot` is
+  // the same class-membership test Pass A already ran on this exact
+  // right-hand side, so this is a defensive re-check, not new analysis.
+  if (!isArrayMemberOwnerRoot(value->base, facts.ownerArray) ||
+      !value->cursor || value->member || value->literalBacking)
+    return emitError(loc) // Defensive; Pass A pins the right-hand shape.
+           << "unsupported: pointer struct member assigned this value";
+  FailureOr<Type> enumType = getOrCreateArrayMemberEnumType(field, facts, loc);
+  if (failed(enumType))
+    return failure();
+  auto enumTypeValue = llvm::cast<emitrust::EnumType>(*enumType);
+  Value fieldPlace = builder
+                          .create<emitrust::MemberOp>(
+                              loc, emitrust::LValueType::get(*enumType),
+                              *basePlace, builder.getStringAttr(
+                                              flattenedFieldName(field)))
+                          .getResult();
+  // Encodes the i64 index as a genuine Rust `match` (one arm per array
+  // element, exhaustive) rather than a bare transmute, so the enum's
+  // closed variant set stays visibly exhaustive at every write site.
+  SmallVector<int64_t> caseValues;
+  caseValues.reserve(facts.elementCount);
+  for (unsigned index = 0; index < facts.elementCount; ++index)
+    caseValues.push_back(index);
+  auto switchOp = builder.create<emitrust::SwitchOp>(
+      loc, value->cursor, builder.getDenseI64ArrayAttr(caseValues),
+      facts.elementCount);
+  auto assignVariant = [&](unsigned index) {
+    std::string path =
+        (llvm::Twine(facts.enumSymbol) + "::E" + llvm::Twine(index)).str();
+    Value variant =
+        builder
+            .create<emitrust::ConstantOp>(
+                loc, enumTypeValue,
+                emitrust::OpaqueAttr::get(builder.getContext(), path))
+            .getResult();
+    builder.create<emitrust::AssignOp>(loc, fieldPlace, variant);
+    builder.create<emitrust::YieldOp>(loc);
+  };
+  for (unsigned index = 0; index < facts.elementCount; ++index) {
+    builder.createBlock(&switchOp.getCaseRegions()[index]);
+    assignVariant(index);
+  }
+  // The default region is provably unreachable — Pass A proved every
+  // write's index is one of `facts.elementCount` array elements — and
+  // assigns E0 to keep every region's block well-formed, mirroring
+  // `IndexSwitchLowering`'s default-region convention for a discriminator
+  // whose value set is closed by construction.
+  builder.createBlock(&switchOp.getDefaultRegion());
+  assignVariant(0);
+  builder.setInsertionPointAfter(switchOp);
   return success();
 }
 
@@ -2735,6 +2968,16 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
               dataPointerFieldOf(cast->getSubExpr())) {
         const auto *member =
             llvm::cast<clang::MemberExpr>(stripTrivia(cast->getSubExpr()));
+        // Stage 2 of the owner-struct self-reference extension: a field
+        // Pass A (`planArrayMemberPointers`) proved usable is consulted
+        // BEFORE the historical per-instance static-binding model below,
+        // so every existing test of a field it could not prove (absent
+        // here) sees byte-identical output.
+        auto arrayIt = arrayMemberPtrBindings.find(field);
+        if (arrayIt != arrayMemberPtrBindings.end() &&
+            arrayIt->second.invalidReason.empty())
+          return emitArrayMemberPointerRead(member, field, arrayIt->second,
+                                            loc);
         FailureOr<const MemberPointerFacts *> binding =
             resolveMemberPointerBinding(member, loc);
         if (failed(binding))
@@ -3092,6 +3335,36 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       return PtrExprValue{pointer->base, cursor, pointer->literalBacking,
                           pointer->nonNull, pointer->baseIndex,
                           pointer->multiBases};
+    }
+  }
+
+  // `f(...)` on a promoted owner method proven to return an i64 element
+  // index into the same class as its own pointer parameter(s) (Stage 1,
+  // design.md FR-30 follow-on): the call IS the pointer's (base, cursor)
+  // decomposition — its i64 result is the cursor, and its base is whichever
+  // region the SAME argument `recordPointerWrite` chose (mirrored here via
+  // `emitMethodCallSite`'s single argument-materialization pass, so the
+  // argument is evaluated exactly once).
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(e)) {
+    if (const clang::FunctionDecl *callee = call->getDirectCallee()) {
+      const clang::FunctionDecl *canonical = callee->getCanonicalDecl();
+      if (ownerIndexReturns.contains(canonical)) {
+        const clang::VarDecl *ownerBase = methodPlans.lookup(canonical);
+        func::FuncOp target = functions.lookup(mlirFuncName(callee));
+        if (!ownerBase || !target) // Defensive; every plan pairs the two.
+          return emitError(loc)
+                 << "unsupported: call to unimported owner-index method";
+        const clang::VarDecl *argBase = nullptr;
+        FailureOr<Value> result =
+            emitMethodCallSite(call, target, ownerBase, loc, &argBase);
+        if (failed(result))
+          return failure();
+        if (!argBase) // Defensive; planOwners requires >=1 pointer param.
+          return emitError(loc)
+                 << "unsupported: owner-index-returning call has no pointer "
+                    "argument to root the result at";
+        return PtrExprValue{argBase, *result};
+      }
     }
   }
 

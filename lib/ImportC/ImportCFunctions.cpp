@@ -366,7 +366,16 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
       return emitError(loc)
              << "unsupported: FILE* cannot cross a user-defined function "
                 "boundary";
-    if (isDataPointer(returnType)) {
+    if (isDataPointer(returnType) && methodOwner &&
+        ownerIndexReturns.contains(func->getCanonicalDecl())) {
+      // Stage 1 owner-index return: `planOwners` proved every return site
+      // roots in the same owner class as this method's own pointer
+      // parameter(s), so the result is a plain i64 element index — never
+      // routed through `classifyPointerReturn`, which has no
+      // representation for a pointer into a parameter/callee-local region
+      // (its own historical rejection for exactly this shape).
+      resultTypes.push_back(builder.getIntegerType(64));
+    } else if (isDataPointer(returnType)) {
       // A data-pointer return classifies by its return sites (CTS-P2):
       // the fn-address kind returns the plain fn_ptr value, and the
       // single-global-base kind (CTS-S, 00089) ERASES the result — the
@@ -466,6 +475,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
   currentMethodOwner = nullptr;
+  currentOwnerIndexReturn =
+      methodOwner && ownerIndexReturns.contains(func->getCanonicalDecl());
   currentCxxThisRef = Value();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
   // An erased single-global-base pointer return (CTS-S, 00089): return
@@ -483,6 +494,24 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   pointerRegions.carrierReturnQuery =
       [this](const clang::FunctionDecl *callee) {
         return isCarrierReturnFunction(callee);
+      };
+  // Calls to owner-index-returning methods (Stage 1) are region sources
+  // exactly like a copy from one of the callee's own pointer parameters:
+  // `recordPointerWrite` re-classifies the call's first pointer argument.
+  pointerRegions.ownerIndexReturnQuery =
+      [this](const clang::FunctionDecl *callee) {
+        return ownerIndexReturns.contains(callee->getCanonicalDecl());
+      };
+  // A local assigned from an array-member field read (Stage 4, B3, e.g.
+  // `parent = node->parent;`) joins the arrow base's owner class; by
+  // emission time every field's `arrayMemberPtrBindings` entry (if any)
+  // is fully proven, so the query is exact membership, not the structural
+  // candidacy Pass A itself used while still proving it.
+  pointerRegions.arrayMemberFieldQuery =
+      [this](const clang::FieldDecl *field) {
+        auto it = arrayMemberPtrBindings.find(field);
+        return it != arrayMemberPtrBindings.end() &&
+               it->second.invalidReason.empty();
       };
   // Admitted local `void *` fn-ptr holders (CTS-F, 00210) import as
   // ordinary fn_ptr locals; the pointer decomposition never tracks them.
@@ -827,6 +856,7 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
   currentMethodOwner = nullptr;
+  currentOwnerIndexReturn = false;
   currentCxxThisRef = Value();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
   currentErasedReturnBase = nullptr;
@@ -839,6 +869,18 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   pointerRegions.carrierReturnQuery =
       [this](const clang::FunctionDecl *callee) {
         return isCarrierReturnFunction(callee);
+      };
+  pointerRegions.ownerIndexReturnQuery =
+      [this](const clang::FunctionDecl *callee) {
+        return ownerIndexReturns.contains(callee->getCanonicalDecl());
+      };
+  // See the non-clone prologue above for why this mirrors
+  // `ownerIndexReturnQuery`'s clone-path duplication (Stage 4, B3).
+  pointerRegions.arrayMemberFieldQuery =
+      [this](const clang::FieldDecl *field) {
+        auto it = arrayMemberPtrBindings.find(field);
+        return it != arrayMemberPtrBindings.end() &&
+               it->second.invalidReason.empty();
       };
   collectVoidFnPtrHolders(func->getBody());
   pointerRegions.fnHolderQuery = [this](const clang::VarDecl *var) {
@@ -1034,6 +1076,9 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // Phase-4 Pass A: pure-AST owner planning over every function definition
   // before any IR is built; Pass B below consults the plans.
   planOwners(unit, soleTranslationUnit);
+  // Stage 2 of the owner-struct self-reference extension: pure-AST,
+  // consumes planOwners's output; strictly additive (see its doc comment).
+  planArrayMemberPointers(unit);
   // CTS-P10 Pass A: cell-slice classification of pointer-parameter
   // classes whose bases are all mutable global arrays.
   planCellSlices(unit, soleTranslationUnit);
