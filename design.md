@@ -3849,6 +3849,31 @@ now confirmed malloc-rooted), `strchr-result-bind` (`grep-lite`),
 `global-string-cursor` (`expr-eval`), `argv` (`argv-echo`), and `crash`
 (`crc32`, still unfixed, still the highest-priority robustness finding).
 
+**W4.1 ranked survey.** The corpus rejections, ranked by
+programs-unblocked-per-cost (RFC-gated features sink; a robustness crash
+floats to the top regardless of feature value). This ranking OVERRIDES the
+plan's pre-baked ladder order — the demand signal, not speculation, sequences
+the remaining deep designs. `self-ref-pointer-member` is retired (union-find
+transpiles); seven rejected programs remain.
+
+| Rank | Blocker | Programs | RFC? | Cost | Next wave |
+|--|--|--|--|--|--|
+| 1 | crash | 1 (`crc32`) | no | low | robustness null-deref — fix THIS session |
+| 2 | dynamic-memory | 2 (`linked-list`, `malloc-stack`) | no | med | W4.2 ladder a (local const-size malloc + free) |
+| 3 | strchr-result-bind | 1 (`grep-lite`) | no | med | bind a strchr result to a pointer local |
+| 4 | global-string-cursor | 1 (`expr-eval`) | no | med | global `char*` into a literal, walked as a cursor |
+| 5 | returned-pointer | 1 (`binary-tree`, ALSO dynamic-memory) | likely | high | pointer to a heap object |
+| 6 | argv | 1 (`argv-echo`) | — | high | W4.3 argv cursor table |
+
+Rationale: the `crc32` crash is a robustness override — a compiler must never
+segfault, and the fix is cheap and localized, so it precedes the entire feature
+ladder. `dynamic-memory` clears the most single-blocker programs (2) at moderate
+non-RFC cost, so it leads the ladder (W4.2). `binary-tree` is DOUBLE-blocked
+(returned-pointer AND dynamic-memory — its returned pointer roots in a
+`malloc`'d node, not an array), so it will not clear until both land; it sits at
+the RFC-likely tail. `argv` needs the second-order cursor-table generalization
+(W4.3). Ranks 2–6 are future waves; only rank 1 is actioned this session.
+
 **Csmith DEFERRED** (documented decline): the flake toolchain is off-limits
 this cycle, so no new generator dependency is added. The seeded differential
 fuzzer (`test/Fuzz`, generator v5) plus this hand-authored corpus are the
