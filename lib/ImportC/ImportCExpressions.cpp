@@ -2791,6 +2791,45 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
     FailureOr<PtrExprValue> pointer = emitPointerRValue(argument);
     if (failed(pointer))
       return failure();
+    // A `const char *` variable that points into a string literal resolves
+    // to a base-less region whose storage is the literal's read-only backing
+    // byte array (`literalBacking`, cursor always present). It has no VarDecl
+    // base, so it must be handled here before any of the base-keyed paths
+    // below dereference `pointer->base` (the historical null-base SIGSEGV).
+    // The reslice mirrors the direct-string-literal argument path above:
+    // a mutable slice parameter rematerializes a FRESH mutable backing so it
+    // never aliases the shared read-only literal storage (writing through a
+    // pointer to a string literal is undefined behavior, so the per-call copy
+    // is unobservable to any defined program), while a shared byte-slice
+    // parameter borrows the const backing read-only.
+    if (pointer->literalBacking) {
+      if (sliceType.getElementType() != builder.getIntegerType(8))
+        return emitError(loc)
+               << "unsupported: argument element type does not "
+                  "match the slice parameter";
+      Value backing = pointer->literalBacking;
+      if (isMutParam) {
+        auto sourceVar =
+            pointer->literalBacking.getDefiningOp<emitrust::VariableOp>();
+        if (!sourceVar)
+          return emitError(loc)
+                 << "unsupported: string-literal argument to a mutable slice "
+                    "parameter has no backing to copy";
+        backing = builder
+                      .create<emitrust::VariableOp>(
+                          loc, pointer->literalBacking.getType(),
+                          sourceVar.getInitAttr(), /*isConst=*/false)
+                      .getResult();
+      }
+      Value cursor =
+          pointer->cursor
+              ? pointer->cursor
+              : createIntConstant(loc, builder.getIntegerType(64), 0);
+      return builder
+          .create<emitrust::SliceOfOp>(loc, paramType, backing, cursor,
+                                       /*is_mut=*/isMutParam)
+          .getResult();
+    }
     root = pointer->base;
     // A multi-base pointer has no single region base to reslice; the
     // callee would need the enum-of-bases discriminant, which a slice

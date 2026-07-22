@@ -3822,8 +3822,13 @@ frequency: **`dynamic-memory` ×2** (`linked-list`, `malloc-stack` — local
 C99-43), `strchr-result-bind` (`grep-lite`), `self-ref-pointer-member`
 (`union-find`, C99-43), `global-string-cursor` (`expr-eval`), `argv`
 (`argv-echo`, C99-43 / argv-values-dropped), and **`crash` ×1** — `crc32`
-SEGFAULTS the importer on a `(unsigned char)s[i]` read through a const-`char*`
-slice parameter (bisected to the slice-param subscript-with-cast). The crash is
+SEGFAULTS the importer when a `const char *` VARIABLE pointing into a string
+literal is passed to a subscripted (slice) parameter: `emitBorrowArgument`
+resolved a base-less literal-backed pointer and fell through every base-keyed
+guard to a null-base error branch that dereferenced `pointer->base->getName()`
+(the `(unsigned char)` cast is a red herring — `crc32("literal", n)` and an
+array argument both already transpile; the trigger is the const-`char*`
+variable into a literal × slice parameter). The crash is
 a robustness bug (the importer must emit a located rejection, never a segfault);
 it is pinned here as the highest-priority survey finding and mapped to a
 follow-up fix wave, not fixed in the test-only W4.0. W4.1 tabulates and ranks
@@ -3858,7 +3863,7 @@ transpiles); seven rejected programs remain.
 
 | Rank | Blocker | Programs | RFC? | Cost | Next wave |
 |--|--|--|--|--|--|
-| 1 | crash | 1 (`crc32`) | no | low | robustness null-deref — fix THIS session |
+| 1 | crash | 1 (`crc32`) | no | low | **RESOLVED** — literal-backed slice-argument fix (W4.1 commit 2) |
 | 2 | dynamic-memory | 2 (`linked-list`, `malloc-stack`) | no | med | W4.2 ladder a (local const-size malloc + free) |
 | 3 | strchr-result-bind | 1 (`grep-lite`) | no | med | bind a strchr result to a pointer local |
 | 4 | global-string-cursor | 1 (`expr-eval`) | no | med | global `char*` into a literal, walked as a cursor |
@@ -3873,6 +3878,30 @@ non-RFC cost, so it leads the ladder (W4.2). `binary-tree` is DOUBLE-blocked
 `malloc`'d node, not an array), so it will not clear until both land; it sits at
 the RFC-likely tail. `argv` needs the second-order cursor-table generalization
 (W4.3). Ranks 2–6 are future waves; only rank 1 is actioned this session.
+
+**W4.1 update: `crc32` crash fixed.** `emitBorrowArgument` gained a
+`literalBacking` branch (right after `emitPointerRValue`, before any base-keyed
+path): a `const char *` variable pointing into a string literal passed to a
+subscripted slice parameter now reslices the literal's backing rather than
+crashing. A subscripted `const char *` parameter is a MUTABLE slice
+(`!emitrust.mut_ref<!emitrust.slice<i8>>`) — so the fix rematerializes a fresh
+mutable backing of the literal at the call site (mirroring the direct-literal
+argument path `f("abc", n)`; writing through a pointer to a string literal is
+UB, so the per-call copy is unobservable), while a shared byte-slice parameter
+borrows the const backing read-only. (This is a deliberate refinement of the
+W4.1 plan, which assumed the parameter was a shared const ref and would
+"reject if mutable"; the parameter is in fact mutable, and rejecting it would
+have kept `crc32` blocked, so the sound copy path is used instead.) `crc32`
+now TRANSPILES and matches a `clang -std=c11` native build byte-for-byte;
+the manifest ratcheted forward to include it. RED→GREEN pin:
+`test/Import/C/pointers-param-literal-slice.c`. The branch fires only for the
+previously-crashing literal-into-slice shape, so it perturbs no existing
+output. **Current tally: 7 transpiled, 6 rejected, 0 miscompiled** — transpiled
+add `crc32` to `base64`/`calc`/`logger`/`sieve`/`union-find`/`word-count`;
+rejected are `dynamic-memory` ×2 (`linked-list`, `malloc-stack`), and one each
+of `returned-pointer` (`binary-tree`), `strchr-result-bind` (`grep-lite`),
+`global-string-cursor` (`expr-eval`), and `argv` (`argv-echo`). The `crash`
+tag is retired.
 
 **Csmith DEFERRED** (documented decline): the flake toolchain is off-limits
 this cycle, so no new generator dependency is added. The seeded differential
