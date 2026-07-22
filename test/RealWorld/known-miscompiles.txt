@@ -1,0 +1,7 @@
+# Quarantine list for the RealWorld corpus (Track 4). Each entry is a program
+# name that emitrust-cc transpiles and builds but whose crate binary diverges
+# from the clang-native oracle (wrong output, crash, timeout). Every entry MUST
+# carry a comment with the symptom. Quarantined programs keep the gate green
+# while the bug stays visible; the runner still prints each one loudly.
+#
+# Currently empty: no transpiled corpus program miscompiles.

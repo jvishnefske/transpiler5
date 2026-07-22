@@ -3517,6 +3517,66 @@ since the 00204 wave, 00204.c pass).
   (test/Import/Cpp/stl-vector.cpp, stl-string.cpp, stl-invalid.cpp;
   test/EndToEnd/stl-vector.cpp, stl-string.cpp)
 
+## Track 4 RealWorld corpus (demand signal)
+
+`test/RealWorld/` is a corpus of small, realistic, deterministic C programs
+whose job is to GENERATE DEMAND — not to be a conformance target. The fixed
+c-testsuite (220/220) no longer forces new work, so the remaining deep designs
+(C99-43 ptr-to-ptr, C99-46 dynamic memory, and the pointer-model extensions)
+are ranked by how often real programs actually hit them, measured, rather than
+by speculation. The corpus need not be cleared; a program that stays rejected
+is a standing backlog item, and one that starts transpiling (after a deep-design
+wave) ratchets into the transpiled set as a regression guard and runtime perf
+workload.
+
+**Harness.** `test/RealWorld/run_realworld.py` (modeled on the c-testsuite
+ledger runner, `test/CTestSuite/run_c_testsuite.py`) drives each program
+through `emitrust-cc --emit=crate --build`. A program is a single top-level
+`Inputs/<name>.c` (one TU) or an `Inputs/<name>/` subdirectory whose `*.c`
+compile together (multi-TU). Outcomes: **REJECTED** (a located diagnostic, rc≠0
+— the demand signal, tagged by blocker category), **TRANSPILED** (the crate
+built and its stdout matched a `clang -std=c11` native build of the same
+sources — the differential oracle, the same philosophy as the EndToEnd
+differentials), or **MISCOMPILE** (built but crashed / exited non-zero /
+diverged from native — always fails, quarantine aside). A two-way ratchet
+against `expected-transpile.txt` (programs expected to transpile) plus an
+(empty) `known-miscompiles.txt` quarantine mirrors the ledger; the runner also
+prints a **blocker-tag tabulation** — the survey signal W4.1 reads. Gated in
+`ninja check-emitrust` via the `test/RealWorld/realworld.c` lit stub
+(`REQUIRES: cargo`); the corpus lives under `Inputs/` so it is excluded from
+lit discovery (`config.excludes = ["Inputs"]`) yet regression-protected through
+the stub. `argv` VALUES are dropped at import (the main wrapper passes only
+`argc`), so command-line-argument programs reject.
+
+**Blocker tags** are a heuristic over the first diagnostic line: the
+system-header symbol is parsed out (`free`/`realloc`/`malloc`/`calloc` →
+`dynamic-memory`, else `libc:<name>`); the shared "pointer assigned a
+non-address value" / "no known target object" wording is refined by reading the
+cited source line (an alloc call → `dynamic-memory`, `strchr`/`strrchr` →
+`strchr-result-bind`, else `pointer-local-nonaddress`); a compiler crash
+("PLEASE submit a bug report" / "Stack dump") tags `crash`.
+
+**W4.0 snapshot (13 programs): 5 transpiled, 8 rejected, 0 miscompiled.**
+Transpiled (pinned regression guards / perf workloads): `base64`, `calc`
+(two-TU), `logger` (two-TU), `sieve`, `word-count`. Rejected, by blocker
+frequency: **`dynamic-memory` ×2** (`linked-list`, `malloc-stack` — local
+`malloc` + `free`, C99-46), then one each of `returned-pointer` (`binary-tree`,
+C99-43), `strchr-result-bind` (`grep-lite`), `self-ref-pointer-member`
+(`union-find`, C99-43), `global-string-cursor` (`expr-eval`), `argv`
+(`argv-echo`, C99-43 / argv-values-dropped), and **`crash` ×1** — `crc32`
+SEGFAULTS the importer on a `(unsigned char)s[i]` read through a const-`char*`
+slice parameter (bisected to the slice-param subscript-with-cast). The crash is
+a robustness bug (the importer must emit a located rejection, never a segfault);
+it is pinned here as the highest-priority survey finding and mapped to a
+follow-up fix wave, not fixed in the test-only W4.0. W4.1 tabulates and ranks
+these to drive W4.2+ (the ranking overrides the plan's pre-baked ladder order).
+
+**Csmith DEFERRED** (documented decline): the flake toolchain is off-limits
+this cycle, so no new generator dependency is added. The seeded differential
+fuzzer (`test/Fuzz`, generator v5) plus this hand-authored corpus are the
+differential coverage; a Csmith leg — which would need a flake input — is
+future work if the fuzzer's coverage gaps demand it.
+
 ## Non-Goals for the MVP
 
 Generics, lifetimes beyond simple references, traits and impls, pattern
