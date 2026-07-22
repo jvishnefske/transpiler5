@@ -5,4 +5,5 @@ base64
 calc
 logger
 sieve
+union-find
 word-count
