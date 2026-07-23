@@ -474,6 +474,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
   currentHasLabels = containsLabelStmt(func->getBody());
   currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
+  currentPoolPlace = Value();
+  currentPoolCursorCell = Value();
   currentMethodOwner = nullptr;
   currentOwnerIndexReturn =
       methodOwner && ownerIndexReturns.contains(func->getCanonicalDecl());
@@ -667,6 +669,26 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
     }
   }
 
+  // W4.2e Part B (FR-39): a promoting function synthesizes its fixed
+  // `[T; cap]` node pool and an i64 free cursor (starting at 0) at entry;
+  // every handle's member projection subscripts this shared pool, and
+  // malloc appends a zeroed slot at the cursor.
+  if (auto poolIt = mallocPools.find(func->getCanonicalDecl());
+      poolIt != mallocPools.end()) {
+    const MallocPoolFacts &facts = poolIt->second;
+    FailureOr<Type> elementType =
+        mapType(astContext().getRecordType(facts.structDecl), loc);
+    if (failed(elementType))
+      return failure();
+    Type poolType =
+        emitrust::ArrayType::get(builder.getContext(), facts.cap, *elementType);
+    currentPoolPlace = createVariablePlace(loc, poolType);
+    currentPoolCursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
+    builder.create<memref::StoreOp>(
+        loc, createIntConstant(loc, builder.getIntegerType(64), 0),
+        currentPoolCursorCell);
+  }
+
   if (failed(emitStmt(func->getBody())))
     return failure();
   return finalizeFunction(funcOp, loc);
@@ -855,6 +877,8 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentHasLabels = containsLabelStmt(func->getBody());
   currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
+  currentPoolPlace = Value();
+  currentPoolCursorCell = Value();
   currentMethodOwner = nullptr;
   currentOwnerIndexReturn = false;
   currentCxxThisRef = Value();
@@ -1079,6 +1103,10 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // Stage 2 of the owner-struct self-reference extension: pure-AST,
   // consumes planOwners's output; strictly additive (see its doc comment).
   planArrayMemberPointers(unit);
+  // W4.2e Part B (FR-39): the RFC index-handle node pool; pure-AST,
+  // strictly additive, must run before `collectDeclTypeRecords` so a
+  // promoted self-ref field's `Option<usize>` type reaches record emission.
+  planMallocPool(unit);
   // CTS-P10 Pass A: cell-slice classification of pointer-parameter
   // classes whose bases are all mutable global arrays.
   planCellSlices(unit, soleTranslationUnit);
@@ -1751,6 +1779,30 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
     moduleBuilder.create<emitrust::VerbatimOp>(
         UnknownLoc::get(builder.getContext()),
         moduleBuilder.getStringAttr(helper.source));
+  }
+  // W4.2e Part B (FR-39): the Option<usize> pool-handle bridge helpers,
+  // emitted once when any node-pool field is promoted. `_opt` builds the
+  // nullable field value from a handle's (non-null, index) pair; `_unpack`
+  // destructures a field read back into that pair.
+  if (neededPoolHelpers && !poolHelpersEmitted) {
+    poolHelpersEmitted = true;
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "/// W4.2e Part B: build a node-pool index field (`Option<usize>`)\n"
+            "/// from a handle's non-null flag and i64 index (design.md FR-39).\n"
+            "fn __emitrust_pool_opt(some: bool, idx: i64) -> Option<usize> {\n"
+            "    if some { Some(idx as usize) } else { None }\n"
+            "}"));
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "/// W4.2e Part B: destructure a node-pool index field into a\n"
+            "/// handle's (non-null, index) pair (design.md FR-39).\n"
+            "fn __emitrust_pool_unpack(o: Option<usize>) -> (bool, i64) {\n"
+            "    match o { Some(x) => (true, x as i64), None => (false, 0) }\n"
+            "}"));
   }
   return success();
 }

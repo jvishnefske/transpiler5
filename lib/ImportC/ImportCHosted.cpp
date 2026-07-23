@@ -40,6 +40,8 @@ void CImporter::requestFileHelper(llvm::StringRef name) {
   neededFileHelpers.insert(name);
 }
 
+void CImporter::requestPoolHelpers() { neededPoolHelpers = true; }
+
 LogicalResult CImporter::emitFileLocal(const clang::VarDecl *var,
                                        Location loc) {
   // The owned handle lives in an `emitrust.variable` place; without an

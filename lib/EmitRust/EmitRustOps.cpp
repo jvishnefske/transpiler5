@@ -349,8 +349,13 @@ LogicalResult AssignOp::verify() {
 /// EmitRust enum, or an EmitRust fn_ptr (`Option<fn(...)>` is
 /// `Copy + PartialEq + Default`, so every struct derive guarantee holds).
 static bool isValidStructFieldType(Type type) {
+  // OpaqueType is permitted for the render-verbatim field types the trusted
+  // importer synthesizes (e.g. the node-pool nullable index `Option<usize>`,
+  // W4.2e Part B) -- the producer guarantees these are `Copy + Default`, the
+  // struct_def MVP invariant. A non-Copy opaque (e.g. `Vec<T>`) is never
+  // emitted as a field.
   return isa<IntegerType, IndexType, FloatType, ArrayType, StructType,
-             EnumType, FnPtrType>(type);
+             EnumType, FnPtrType, mlir::emitrust::OpaqueType>(type);
 }
 
 /// Verifies that the field name and type arrays have the same length

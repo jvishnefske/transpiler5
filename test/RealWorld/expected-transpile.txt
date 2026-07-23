@@ -4,6 +4,7 @@
 base64
 calc
 crc32
+linked-list
 logger
 malloc-stack
 sieve

@@ -1909,6 +1909,11 @@ LogicalResult CImporter::emitMemberPointerAssign(
         arrayIt->second.invalidReason.empty())
       return emitArrayMemberPointerAssign(member, field, arrayIt->second, rhs,
                                           loc);
+    // W4.2e Part B (FR-39): a node-pool self-ref field write builds the
+    // field's `Option<usize>` from the right-hand handle's (non-null, index)
+    // pair.
+    if (member->isArrow() && poolNextFields.contains(field->getCanonicalDecl()))
+      return emitPoolNextFieldAssign(member, rhs, loc);
   }
   FailureOr<const MemberPointerFacts *> binding =
       resolveMemberPointerBinding(member, loc);
