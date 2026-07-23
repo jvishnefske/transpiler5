@@ -1,0 +1,36 @@
+// RUN: emitrust-import-c %s | FileCheck %s
+
+// W4.2e Part B (FR-39): the RFC index-handle node pool. A singly-linked
+// list built from malloc'd nodes inside a foldable-trip-count loop, whose
+// self-referential `next` field never escapes and is only null-checked,
+// promotes to a fixed [Node; CAP] pool + free cursor. Each node pointer is
+// a nullable pool index handle (an i64 index cell + an i1 non-null cell);
+// the `next` field renders as `Option<usize>`, built and destructured
+// through the __emitrust_pool_* helpers.
+#include <stdlib.h>
+
+struct Node { int val; struct Node *next; };
+
+int sum_list(void) {
+  struct Node *head = NULL;
+  for (int i = 0; i < 5; i++) {
+    struct Node *n = malloc(sizeof(struct Node));
+    n->val = i;
+    n->next = head;
+    head = n;
+  }
+  int sum = 0;
+  for (struct Node *c = head; c; c = c->next)
+    sum += c->val;
+  return sum;
+}
+// The node record's self-ref field is the nullable pool index.
+// CHECK: emitrust.struct_def @Node ["val", "next"] [i32, !emitrust.opaque<"Option<usize>">]
+// CHECK-LABEL: func.func @sum_list
+// A fixed [Node; 5] pool (capacity folded from the loop trip count).
+// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<5x!emitrust.struct<"Node">>>
+// `n->next = head` builds the Option<usize> field from the handle pair.
+// CHECK: emitrust.call_opaque "__emitrust_pool_opt"(%{{.*}}, %{{.*}}) : (i1, i64) -> !emitrust.opaque<"Option<usize>">
+// CHECK: emitrust.assign %{{.*}} = %{{.*}} : !emitrust.lvalue<!emitrust.opaque<"Option<usize>">>
+// `c = c->next` destructures the field read back into (non-null, index).
+// CHECK: emitrust.call_opaque "__emitrust_pool_unpack"(%{{.*}}) : (!emitrust.opaque<"Option<usize>">) -> (i1, i64)

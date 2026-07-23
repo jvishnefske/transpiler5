@@ -1073,6 +1073,80 @@ lists the lit test file(s) that validate it.
   gap; left untouched, out of scope.
   (test/EndToEnd/union-find.c)
 
+- [x] FR-39 Dynamic memory / index-handle node pool (RFC, C99-46 Stage 1).
+  A two-part wave (W4.2e) that gives the importer its first heap-allocation
+  support under the no-`unsafe`, no-heap-in-the-model discipline. The RFC
+  record (user-approved, "full `Option<usize>`"): the C heap is never
+  reconstructed with `Box`/`Rc`; instead a disciplined allocation pattern
+  is proven statically and lowered to a fixed-size backing the ordinary
+  region machinery already models, so the emitted Rust stays pure safe
+  array indexing. The soundness of `free` as a no-op rests on a defined C
+  program never reading freed storage; the differential (native vs crate,
+  byte-identical) is the oracle for every capstone.
+  - **Part A -- local flat buffer (non-RFC).** `T *p = malloc(N*sizeof(T))`
+    bound to a LOCAL pointer, where `N` folds through a new foldable-local
+    resolver (`evalFoldableInt`: an automatic local never reassigned nor
+    address-taken folds to its initializer, so the `cap*sizeof(int)` idiom
+    resolves). Synthesizes a mutable entry-block `[T; CAP]` backing + an
+    i64 cursor -- the writable, function-scope analog of a string-literal
+    region; `p[i]` subscripts the backing directly. `malloc`'s
+    indeterminate contents are refined to zero (matching `calloc`).
+    Rejections (each pinned, located): non-constant size, a returned
+    pointer (the dangle reject), an escaping pointer, `realloc`, and `free`
+    of an unrecognized pointer. Capstone: `test/EndToEnd/malloc-stack.c`.
+  - **Part B -- index-handle node pool (RFC).** A `malloc(sizeof(struct T))`
+    inside a foldable-trip-count loop building a self-referential linked
+    structure, where `struct T` has exactly one self-ref pointer field,
+    every `struct T *` local roots in this one pool (bound to a malloc
+    result, another such local, a self-ref field read, or NULL), nothing
+    escapes, and `free` is applied only to such locals. A new Pass-A
+    `planMallocPool` proves this per function (conservatively -- an
+    unprovable function stays unpromoted and falls through to the existing
+    located rejection, never a miscompile) and records a VarDecl-less
+    `MallocPoolFacts`. The function synthesizes one shared `[T; CAP]` pool
+    (CAP = the loop trip count) + a free cursor; each node pointer becomes a
+    nullable pool-index HANDLE -- an i64 index cell + an i1 non-null cell
+    (the CTS-P8 shape) decomposed against the shared pool as its backing,
+    so `h->field` reuses the ordinary subscript+member projection with a
+    null-deref `assert!` guard. The self-ref field renders as
+    `Option<usize>`; the (non-null, index) handle pair is built into and
+    destructured out of that field through the one-per-module
+    `__emitrust_pool_opt`/`__emitrust_pool_unpack` helpers. `malloc`
+    appends a zeroed slot at the cursor; `free` is a no-op. NOT the
+    per-index enum of FR-37/38 (a pool null-checks but never compares
+    nodes, so no exhaustive match is needed) and NOT `Vec<T>` (the fixed
+    `[T; CAP]` needs a foldable capacity; `Vec` is the future
+    generalization when CAP is unfoldable). Rejections (pinned): an
+    unbounded/non-foldable capacity, a returned/escaping node (keeps
+    `binary-tree` out -- it is doubly blocked by returned-pointer), a
+    node-pointer used outside the null-check-only handle model, and a
+    second distinct pooled struct type. Capstone:
+    `test/EndToEnd/linked-list.c`.
+  - **Future direction (preferred target representations).** The roadmap
+    for the remaining dynamic-memory shapes maps allocation patterns onto
+    idiomatic, safe Rust standard collections rather than any custom
+    ownership machinery: a fixed foldable-capacity buffer stays a Rust
+    `array` (`[T; CAP]`, shipped here); an unfoldable/growing capacity
+    generalizes to `Vec<T>` (an index-handle arena over `Vec` -- same
+    nullable-`Option<usize>` handle, capacity checked at push instead of
+    folded); and a producer/consumer or FIFO allocation shape maps onto a
+    Rust queue -- `VecDeque<T>`, or `std::sync::mpsc` when the pattern
+    crosses a thread boundary. Each keeps the emitted Rust pure safe (no
+    `unsafe`, no raw pointers); the index-handle model generalizes across
+    all three because the handle is always a collection index, never an
+    address.
+  - The `Option<usize>` field required relaxing `emitrust.struct_def`'s
+    field-type verifier to admit `OpaqueType` (the importer guarantees any
+    such field is `Copy + Default`; a non-`Copy` opaque like `Vec<T>` is
+    never emitted as a field). RealWorld corpus after this wave: 9
+    transpiled (adds `malloc-stack`, `linked-list`), `binary-tree` still
+    rejected (returned-pointer). Gates: c-testsuite ledger 220/220
+    no-drift; 150-seed checker-on fuzz clean; CTS-P4 global-malloc and the
+    whole C EndToEnd corpus byte-identical (Part B is strictly additive --
+    only the new pool shape is promoted).
+  (test/Import/C/malloc-local-flat.c, test/Import/C/malloc-pool-list.c,
+  test/EndToEnd/malloc-stack.c, test/EndToEnd/linked-list.c)
+
 ## C99 Support Roadmap
 
 Everything the importer must handle before it can claim full C99 language
@@ -1888,10 +1962,20 @@ rule.
   test/EndToEnd/bitfields-zeroextend.c (00218 core, differential),
   test/EndToEnd/bitfields-flags.c (mixed runs, RMW isolation,
   signed truncation), c-testsuite 00218.c.
-- [ ] C99-46 Dynamic memory: malloc, calloc, realloc, free (design
-  decision needed under the no-unsafe rule: Box/Vec-based ownership
-  reconstruction works only for disciplined allocation patterns; an
-  arena-with-handles mapping is the likely general answer).
+- [~] C99-46 Dynamic memory: malloc, calloc, realloc, free. Stage 1
+  (W4.2e, FR-39): a LOCAL const-size flat buffer (`T *p =
+  malloc(cap*sizeof(T)); p[i] = ...; free(p);`) synthesizes a mutable
+  `[T; CAP]` backing + cursor (Part A); a fixed-CAP node pool with index
+  handles (`malloc(sizeof(struct T))` in a foldable-trip-count loop
+  building a self-referential linked structure) synthesizes a `[T; CAP]`
+  pool + nullable `Option<usize>` index handles (Part B). `free` of a
+  recognized allocation is a no-op (the backing/pool drops at scope end;
+  a defined program never reads freed storage). OUT (still rejected,
+  located): realloc (the fixed backing cannot resize); a RETURNED heap
+  pointer (a callee-local backing would dangle -- keeps binary-tree out);
+  an unbounded/non-foldable pool capacity; a heap allocation that escapes
+  (global store, address-of, non-`free` call). `Vec<T>` is the documented
+  future generalization for an unfoldable capacity.
 
 ### Hosted library surface (beyond the language)
 

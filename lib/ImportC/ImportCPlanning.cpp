@@ -624,6 +624,369 @@ void CImporter::planArrayMemberPointers(
 }
 
 //===----------------------------------------------------------------------===//
+// Malloc index-handle node-pool planning (W4.2e Part B, FR-39, Pass A)
+//===----------------------------------------------------------------------===//
+
+namespace {
+/// Returns whether `target` appears anywhere in `parent`'s subtree.
+bool stmtContains(const clang::Stmt *parent, const clang::Stmt *target) {
+  if (!parent)
+    return false;
+  if (parent == target)
+    return true;
+  for (const clang::Stmt *child : parent->children())
+    if (stmtContains(child, target))
+      return true;
+  return false;
+}
+
+/// The single self-referential data-pointer field of `record` (a pointer to
+/// `record` itself), or null when there is not exactly one.
+const clang::FieldDecl *soleSelfRefPointerField(clang::ASTContext &ctx,
+                                                const clang::RecordDecl *record) {
+  const clang::FieldDecl *found = nullptr;
+  for (const clang::FieldDecl *field : record->fields()) {
+    if (!isDataPointer(field->getType()))
+      continue;
+    clang::QualType pointee =
+        field->getType().getCanonicalType()->getPointeeType();
+    const clang::RecordDecl *pointeeRecord = recordOfType(pointee);
+    if (pointeeRecord &&
+        pointeeRecord->getCanonicalDecl() == record->getCanonicalDecl()) {
+      if (found)
+        return nullptr; // More than one self-ref field: not modeled.
+      found = field;
+      continue;
+    }
+    return nullptr; // A data-pointer field that is NOT self-ref: not modeled.
+  }
+  return found;
+}
+} // namespace
+
+bool CImporter::foldLoopTripCount(PointerRegionAnalysis &regions,
+                                  const clang::Stmt *stmt,
+                                  uint64_t &out) const {
+  // Only the canonical counted `for (i = A; i < B; i++)` loop (or its `<=`
+  // variant) folds; anything else leaves the pool capacity undeterminable.
+  const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt);
+  if (!forStmt || !forStmt->getInit() || !forStmt->getCond() ||
+      !forStmt->getInc())
+    return false;
+  // Increment must be a bare `++i`/`i++` on the induction variable.
+  const auto *inc =
+      llvm::dyn_cast<clang::UnaryOperator>(forStmt->getInc());
+  if (!inc || !inc->isIncrementOp())
+    return false;
+  const clang::VarDecl *iv = asLocalVarRef(inc->getSubExpr());
+  if (!iv)
+    return false;
+  // Init: `int i = A;` (a DeclStmt for iv) or `i = A;`.
+  uint64_t start = 0;
+  bool haveStart = false;
+  if (const auto *declStmt =
+          llvm::dyn_cast<clang::DeclStmt>(forStmt->getInit())) {
+    if (declStmt->isSingleDecl())
+      if (const auto *var =
+              llvm::dyn_cast<clang::VarDecl>(declStmt->getSingleDecl()))
+        if (var == iv && var->getInit() &&
+            regions.evalFoldableInt(var->getInit(), start))
+          haveStart = true;
+  } else if (const auto *assign =
+                 llvm::dyn_cast<clang::BinaryOperator>(forStmt->getInit())) {
+    if (assign->getOpcode() == clang::BO_Assign &&
+        asLocalVarRef(assign->getLHS()) == iv &&
+        regions.evalFoldableInt(assign->getRHS(), start))
+      haveStart = true;
+  }
+  if (!haveStart)
+    return false;
+  // Cond: `i < B` or `i <= B` against the induction variable.
+  const auto *cond =
+      llvm::dyn_cast<clang::BinaryOperator>(forStmt->getCond());
+  if (!cond)
+    return false;
+  clang::BinaryOperatorKind op = cond->getOpcode();
+  if (op != clang::BO_LT && op != clang::BO_LE)
+    return false;
+  if (asLoadedLocalVarRef(cond->getLHS()) != iv)
+    return false;
+  uint64_t bound = 0;
+  if (!regions.evalFoldableInt(cond->getRHS(), bound))
+    return false;
+  if (op == clang::BO_LE)
+    bound += 1;
+  if (bound <= start)
+    return false;
+  out = bound - start;
+  return true;
+}
+
+void CImporter::planMallocPool(const clang::TranslationUnitDecl *unit) {
+  for (const clang::FunctionDecl *func : collectPassAFunctionDefinitions(unit)) {
+    const clang::Stmt *body = func->getBody();
+    if (!body)
+      continue;
+
+    // 1. The pooled record type: every pointer-to-record local whose pointee
+    //    has a sole self-ref pointer field must name ONE record T.
+    const clang::RecordDecl *poolStruct = nullptr;
+    const clang::FieldDecl *nextField = nullptr;
+    SmallVector<const clang::VarDecl *, 8> handleVars;
+    bool multiType = false;
+    std::function<void(const clang::Stmt *)> collectHandles =
+        [&](const clang::Stmt *s) {
+          if (!s)
+            return;
+          if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(s))
+            for (const clang::Decl *decl : declStmt->decls())
+              if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+                if (var->hasLocalStorage() &&
+                    !llvm::isa<clang::ParmVarDecl>(var) &&
+                    isDataPointer(var->getType())) {
+                  clang::QualType pointee =
+                      var->getType().getCanonicalType()->getPointeeType();
+                  const clang::RecordDecl *record = recordOfType(pointee);
+                  if (!record)
+                    return;
+                  const clang::FieldDecl *self =
+                      soleSelfRefPointerField(astContext(), record);
+                  if (!self)
+                    return;
+                  const auto *canonical =
+                      llvm::cast<clang::RecordDecl>(record->getCanonicalDecl());
+                  if (!poolStruct) {
+                    poolStruct = canonical;
+                    nextField = self;
+                  } else if (poolStruct != canonical) {
+                    multiType = true;
+                  }
+                  handleVars.push_back(var);
+                }
+          for (const clang::Stmt *child : s->children())
+            collectHandles(child);
+        };
+    collectHandles(body);
+    if (!poolStruct || multiType || handleVars.empty())
+      continue;
+
+    // 2. Exactly one malloc(sizeof(struct T)) call site, inside a
+    //    foldable-trip-count loop -> capacity.
+    SmallVector<const clang::CallExpr *> calls;
+    collectCallExprs(body, calls);
+    const clang::CallExpr *allocSite = nullptr;
+    bool multiAlloc = false;
+    for (const clang::CallExpr *call : calls) {
+      const clang::CallExpr *alloc = asAllocCall(call);
+      if (!alloc || alloc->getDirectCallee()->getName() != "malloc")
+        continue;
+      if (allocSite) {
+        multiAlloc = true;
+        break;
+      }
+      allocSite = alloc;
+    }
+    if (!allocSite || multiAlloc)
+      continue;
+
+    // The malloc's enclosing (innermost) counted loop bounds the pool.
+    PointerRegionAnalysis regions;
+    regions.literalTemps = &literalTemps;
+    regions.analyze(astContext(), body);
+    regions.primeForFolding(astContext(), body);
+    uint64_t cap = 0;
+    {
+      // The malloc must be governed by EXACTLY ONE loop (of any kind), and
+      // that loop must be a foldable counted `for` -- so the pool capacity
+      // equals the total number of allocations. A malloc nested inside more
+      // than one loop would allocate trip-count-PRODUCT slots, overflowing a
+      // single-loop-sized pool at runtime; such a function stays unpromoted
+      // (sound: it falls through to the located region rejection). Every
+      // loop kind counts (for / while / do-while / ranged-for), not just
+      // `for`, so an inner `while` around the malloc is caught too.
+      const clang::ForStmt *enclosing = nullptr;
+      unsigned enclosingLoopCount = 0;
+      std::function<void(const clang::Stmt *)> findLoop =
+          [&](const clang::Stmt *s) {
+            if (!s)
+              return;
+            if (llvm::isa<clang::ForStmt, clang::WhileStmt, clang::DoStmt,
+                          clang::CXXForRangeStmt>(s) &&
+                s != allocSite && stmtContains(s, allocSite)) {
+              ++enclosingLoopCount;
+              if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(s))
+                enclosing = forStmt;
+            }
+            for (const clang::Stmt *child : s->children())
+              findLoop(child);
+          };
+      findLoop(body);
+      if (enclosingLoopCount != 1 || !enclosing ||
+          !foldLoopTripCount(regions, enclosing, cap))
+        continue;
+    }
+    if (cap == 0 || cap > 65536)
+      continue;
+
+    // 3. Validate every use of every handle local is pool-safe. Anything
+    //    outside the allowed set (member access, null-check, handle copy,
+    //    self-ref field read/write, free arg, the declaration itself)
+    //    leaves the function unpromoted -- sound: it falls through to the
+    //    existing region-driven rejection, never a miscompile.
+    llvm::SmallPtrSet<const clang::VarDecl *, 8> handleSet(handleVars.begin(),
+                                                           handleVars.end());
+    auto isHandleRef = [&](const clang::Expr *e) -> const clang::VarDecl * {
+      const clang::VarDecl *var = asLoadedLocalVarRef(e);
+      if (!var)
+        var = asLocalVarRef(e);
+      return var && handleSet.contains(var) ? var : nullptr;
+    };
+    // A self-ref `->next` arrow read whose base is a handle.
+    auto isNextRead = [&](const clang::Expr *e) -> bool {
+      const clang::Expr *s = stripTrivia(e);
+      while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(s)) {
+        if (cast->getCastKind() != clang::CK_LValueToRValue &&
+            cast->getCastKind() != clang::CK_NoOp)
+          break;
+        s = stripTrivia(cast->getSubExpr());
+      }
+      const auto *member = llvm::dyn_cast<clang::MemberExpr>(s);
+      if (!member || !member->isArrow())
+        return false;
+      const auto *field =
+          llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+      if (!field ||
+          field->getCanonicalDecl() != nextField->getCanonicalDecl())
+        return false;
+      return isHandleRef(member->getBase()) != nullptr;
+    };
+    bool valid = true;
+    std::function<bool(const clang::Expr *)> okBinding =
+        [&](const clang::Expr *rhs) -> bool {
+      // A handle binding source: malloc site, NULL, another handle, or a
+      // self-ref field read.
+      const clang::Expr *e = stripTrivia(rhs);
+      if (e->isNullPointerConstant(astContext(),
+                                   clang::Expr::NPC_NeverValueDependent) !=
+          clang::Expr::NPCK_NotNull)
+        return true;
+      if (asAllocCall(e) &&
+          asAllocCall(e)->getDirectCallee()->getName() == "malloc")
+        return true;
+      if (isHandleRef(e))
+        return true;
+      return isNextRead(e);
+    };
+    std::function<void(const clang::Stmt *)> validate =
+        [&](const clang::Stmt *s) {
+          if (!valid || !s)
+            return;
+          // Handle declarations: init must be a legal binding source.
+          if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(s)) {
+            for (const clang::Decl *decl : declStmt->decls())
+              if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+                if (handleSet.contains(var) && var->getInit() &&
+                    !okBinding(var->getInit()))
+                  valid = false;
+          }
+          // Handle assignments / self-ref field writes.
+          if (const auto *bin = llvm::dyn_cast<clang::BinaryOperator>(s);
+              bin && bin->getOpcode() == clang::BO_Assign) {
+            if (isHandleRef(bin->getLHS())) {
+              if (!okBinding(bin->getRHS()))
+                valid = false;
+            } else if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(
+                           bin->getLHS()->IgnoreParens());
+                       member && member->isArrow()) {
+              const auto *field = llvm::dyn_cast<clang::FieldDecl>(
+                  member->getMemberDecl());
+              bool isNextWrite =
+                  field &&
+                  field->getCanonicalDecl() == nextField->getCanonicalDecl() &&
+                  isHandleRef(member->getBase());
+              if (isNextWrite && !okBinding(bin->getRHS()))
+                valid = false;
+              // A non-next arrow write on a handle base (e.g. n->val = i) is
+              // an ordinary member write; its rhs is a scalar, always fine.
+            }
+          }
+          // `free(handle)` is allowed; any OTHER call taking a handle escapes.
+          if (const auto *call = llvm::dyn_cast<clang::CallExpr>(s)) {
+            const clang::FunctionDecl *callee = call->getDirectCallee();
+            bool isFree = asFreeCall(call) != nullptr;
+            for (const clang::Expr *arg : call->arguments())
+              if (isHandleRef(arg) && !isFree)
+                valid = false;
+            (void)callee;
+          }
+          // A return / address-of / subscript / non-null compare / pointer
+          // arithmetic on a handle escapes or is unmodeled.
+          if (const auto *ret = llvm::dyn_cast<clang::ReturnStmt>(s))
+            if (ret->getRetValue() && isHandleRef(ret->getRetValue()))
+              valid = false;
+          if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(s)) {
+            if (unary->getOpcode() == clang::UO_AddrOf &&
+                isHandleRef(unary->getSubExpr()))
+              valid = false;
+            if (unary->getOpcode() == clang::UO_Deref &&
+                isHandleRef(unary->getSubExpr()))
+              valid = false; // *handle (whole struct) is not modeled.
+          }
+          if (const auto *sub = llvm::dyn_cast<clang::ArraySubscriptExpr>(s))
+            if (isHandleRef(sub->getBase()))
+              valid = false;
+          if (const auto *cmp = llvm::dyn_cast<clang::BinaryOperator>(s)) {
+            clang::BinaryOperatorKind op = cmp->getOpcode();
+            bool isCmp = op == clang::BO_EQ || op == clang::BO_NE ||
+                         op == clang::BO_LT || op == clang::BO_GT ||
+                         op == clang::BO_LE || op == clang::BO_GE;
+            bool isArith = op == clang::BO_Add || op == clang::BO_Sub;
+            if (isCmp || isArith) {
+              auto handleNonNull = [&](const clang::Expr *e) {
+                if (!isHandleRef(e))
+                  return false;
+                return true;
+              };
+              // A comparison/arith with a handle operand is unmodeled UNLESS
+              // it is a null-check (handle vs a null constant).
+              const clang::Expr *l = cmp->getLHS(), *r = cmp->getRHS();
+              bool lHandle = handleNonNull(l), rHandle = handleNonNull(r);
+              bool otherNull =
+                  (lHandle && r->isNullPointerConstant(
+                                  astContext(),
+                                  clang::Expr::NPC_NeverValueDependent) !=
+                                  clang::Expr::NPCK_NotNull) ||
+                  (rHandle && l->isNullPointerConstant(
+                                  astContext(),
+                                  clang::Expr::NPC_NeverValueDependent) !=
+                                  clang::Expr::NPCK_NotNull);
+              if ((lHandle || rHandle) &&
+                  !(isCmp && (op == clang::BO_EQ || op == clang::BO_NE) &&
+                    otherNull))
+                valid = false;
+            }
+          }
+          for (const clang::Stmt *child : s->children())
+            validate(child);
+        };
+    validate(body);
+    if (!valid)
+      continue;
+
+    // Promote: record the pool and mark every handle + the next field.
+    MallocPoolFacts facts;
+    facts.structDecl = poolStruct;
+    facts.nextField = nextField;
+    facts.cap = static_cast<unsigned>(cap);
+    facts.allocSite = allocSite;
+    mallocPools[func->getCanonicalDecl()] = facts;
+    for (const clang::VarDecl *var : handleVars)
+      poolHandleVars[var] = func->getCanonicalDecl();
+    poolNextFields.insert(nextField->getCanonicalDecl());
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Cell-slice planning (CTS-P10 Pass A)
 //===----------------------------------------------------------------------===//
 

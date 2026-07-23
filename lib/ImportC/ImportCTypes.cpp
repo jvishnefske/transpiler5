@@ -516,6 +516,14 @@ FailureOr<Type> CImporter::mapStructFieldType(clang::QualType type,
       if (arrayIt != arrayMemberPtrBindings.end() &&
           arrayIt->second.invalidReason.empty())
         return getOrCreateArrayMemberEnumType(field, arrayIt->second, loc);
+      // W4.2e Part B (FR-39): a self-referential node-pool field renders as
+      // the nullable pool index `Option<usize>`; its reads/writes lower
+      // through the __emitrust_pool_* helpers.
+      if (poolNextFields.contains(field->getCanonicalDecl())) {
+        requestPoolHelpers();
+        return Type(
+            emitrust::OpaqueType::get(builder.getContext(), "Option<usize>"));
+      }
     }
     return Type(builder.getIntegerType(64));
   }

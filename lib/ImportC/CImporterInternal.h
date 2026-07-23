@@ -689,6 +689,33 @@ struct ArrayMemberPointerFacts {
 /// fact is per-field rather than per-instance).
 using ArrayMemberPointerKey = const clang::FieldDecl *;
 
+/// The RFC index-handle node-pool plan of one function (W4.2e Part B,
+/// C99-46 Stage 1; design.md FR-39). A function that builds a linked
+/// structure from `malloc(sizeof(struct T))` calls inside a
+/// foldable-trip-count loop -- where `struct T` has exactly one
+/// self-referential data-pointer field, every `struct T *` local roots in
+/// this one pool (bound to a malloc result, another such local, a
+/// self-ref field read, or NULL), nothing escapes, and `free` is applied
+/// only to such locals -- promotes to a fixed `[T; cap]` pool array plus a
+/// free cursor. Each node pointer becomes a nullable index HANDLE (an i64
+/// index cell + an i1 non-null cell, the CTS-P8 shape) rooted in the
+/// synthesized pool; the self-ref field renders as `Option<usize>`.
+/// Modeled on the owner-array self-ref member (`ArrayMemberPointerFacts`)
+/// but with NO declared array base and a NULL variant -- the pool owner is
+/// this function, not a `clang::VarDecl`.
+struct MallocPoolFacts {
+  /// The pooled node record (`struct T`); the `[T; cap]` element type.
+  const clang::RecordDecl *structDecl = nullptr;
+  /// The single self-referential data-pointer field (`next`) rendered as
+  /// the nullable pool index `Option<usize>`.
+  const clang::FieldDecl *nextField = nullptr;
+  /// The fixed pool capacity, folded from the malloc loop's trip count
+  /// times the mallocs per iteration (1..kMaxOwnerArrayElements-style cap).
+  unsigned cap = 0;
+  /// The single `malloc(sizeof(struct T))` call site that appends a slot.
+  const clang::CallExpr *allocSite = nullptr;
+};
+
 /// Registry of the synthesized backing declarations for block-scope
 /// compound literals used as pointer-region bases (C99-13). A compound
 /// literal in expression position is a fresh anonymous object with the
@@ -1095,6 +1122,16 @@ private:
   /// overflow-free failure; the arithmetic is unsigned and rejects a
   /// negative intermediate. Bounded: recursion follows a foldable local to
   /// its initializer, itself constant, so the depth is the expression's.
+  /// Public so Pass-A planners (`foldLoopTripCount`) can fold with it.
+public:
+  /// Re-establishes the borrowed context and body after `analyze` has
+  /// returned (which nulls them), so a planner can call `evalFoldableInt`
+  /// on an already-analyzed instance (W4.2e Part B).
+  void primeForFolding(clang::ASTContext &ctx, const clang::Stmt *body) {
+    context = &ctx;
+    analyzedBody = body;
+  }
+
   bool evalFoldableInt(const clang::Expr *expr, uint64_t &out) const;
 
   /// True when `var` is an automatic local with an integer-constant
@@ -1102,6 +1139,8 @@ private:
   /// `++`/`--`) nor address-taken anywhere in the analyzed body, so every
   /// read of it yields the initializer (W4.2e Part A, `evalFoldableInt`).
   bool isFoldableLocal(const clang::VarDecl *var) const;
+
+private:
 
   /// Classifies the right-hand side `rhs` of `pp = rhs` for a second-order
   /// pointer (CTS-P5): `pp = &p` on a tracked first-order pointer local
@@ -1562,6 +1601,59 @@ private:
   /// `poisonedPtrFields` model. This pass never emits a diagnostic and
   /// never fails: it is strictly additive over `planOwners`'s output.
   void planArrayMemberPointers(const clang::TranslationUnitDecl *unit);
+
+  /// W4.2e Part B (design.md FR-39): proves, per function, the RFC
+  /// index-handle node-pool pattern and records a `MallocPoolFacts` +
+  /// `poolHandleVars` entries. A function qualifies when it contains a
+  /// `malloc(sizeof(struct T))` inside a foldable-trip-count loop (→ cap),
+  /// `struct T` has exactly one self-referential data-pointer field, every
+  /// `struct T *` local roots in this one pool (bound to the malloc result,
+  /// another such local, a self-ref field read, or NULL), nothing escapes
+  /// (no node-pointer return, global store, or address-of), and `free` is
+  /// applied only to such locals. Runs after `planArrayMemberPointers` and
+  /// before record collection so the `next` field's `Option<usize>` type
+  /// reaches `mapStructFieldType`. Emits no diagnostic and never fails:
+  /// like the owner passes it is additive; an unprovable function is simply
+  /// left unpromoted (its node pointers keep the region-driven rejection).
+  void planMallocPool(const clang::TranslationUnitDecl *unit);
+
+  /// Folds the trip count of `stmt` when it is a `for`/`while` loop with a
+  /// foldable bound (`for (i = A; i < B; i++)`-style, or an equivalent
+  /// `while`) into `out`, using `regions.evalFoldableInt` (W4.2e Part B).
+  /// Returns false for any loop whose count is not a compile-time constant.
+  bool foldLoopTripCount(PointerRegionAnalysis &regions,
+                         const clang::Stmt *stmt, uint64_t &out) const;
+
+  /// Requests the one-per-module emission of the `Option<usize>` pool-handle
+  /// helper functions (`__emitrust_pool_opt`/`__emitrust_pool_unpack`,
+  /// W4.2e Part B); emitted via `emitFileHelpers`' verbatim mechanism.
+  void requestPoolHelpers();
+
+  /// Lowers a node-pool handle assignment `ptr = rhs` (W4.2e Part B): a
+  /// `malloc` append (index = free cursor, non-null = true, cursor++), a
+  /// NULL binding (non-null = false), a copy of another handle, or a
+  /// destructured self-referential field read (`c = c->next`).
+  LogicalResult storePoolHandleAssign(Location loc, const clang::VarDecl *ptr,
+                                      const PointerLocalInfo &info,
+                                      const clang::Expr *rhs);
+
+  /// Returns the `h->next` arrow member read `expr` names when `h` is a pool
+  /// handle and the field is its pool's self-ref field, else null (W4.2e
+  /// Part B).
+  const clang::MemberExpr *asPoolNextFieldRead(const clang::Expr *expr) const;
+
+  /// Loads the `Option<usize>` value of a pool handle's self-ref field
+  /// (`member` is `h->next`): subscripts the pool at the handle's index and
+  /// projects the field (W4.2e Part B).
+  FailureOr<Value> emitPoolNextFieldRead(const clang::MemberExpr *member,
+                                         Location loc);
+
+  /// Lowers `h->next = rhs` on a pool handle base (W4.2e Part B): builds the
+  /// field's `Option<usize>` from the right-hand handle's (non-null, index)
+  /// pair (via `__emitrust_pool_opt`) and assigns it. Returns success only
+  /// when it handled the assignment; the caller falls through otherwise.
+  LogicalResult emitPoolNextFieldAssign(const clang::MemberExpr *member,
+                                        const clang::Expr *rhs, Location loc);
 
   /// Side-effect-free AST mirror of `emitPointerRValue`'s base resolution:
   /// returns the single object a pointer-typed call argument points into (a
@@ -4194,6 +4286,25 @@ private:
   /// only), keyed by the promoted base variable; feeds method-call
   /// receivers. The struct place is only ever borrowed, never loaded.
   llvm::DenseMap<const clang::VarDecl *, Value> ownerStructPlaces;
+  /// W4.2e Part B (design.md FR-39): the index-handle node-pool plan of
+  /// each promoting function, keyed by canonical declaration.
+  llvm::DenseMap<const clang::FunctionDecl *, MallocPoolFacts> mallocPools;
+  /// Every `struct T *` local that is a handle into its function's node
+  /// pool (W4.2e Part B), mapped to the promoting function's canonical
+  /// declaration. Consulted at `emitPointerLocal` to build a pool handle
+  /// instead of the region-driven decomposition.
+  llvm::DenseMap<const clang::VarDecl *, const clang::FunctionDecl *>
+      poolHandleVars;
+  /// Self-referential node-pool fields (`next`) that render as the nullable
+  /// pool index `Option<usize>` (W4.2e Part B); the emission diverts their
+  /// struct-field type and read/write lowering.
+  llvm::SmallPtrSet<const clang::FieldDecl *, 4> poolNextFields;
+  /// The synthesized `[T; cap]` pool place and its i64 free-cursor cell of
+  /// the function currently being imported (W4.2e Part B); null outside a
+  /// pooling function. Set at function entry, consumed by malloc-append and
+  /// every handle's member projection.
+  Value currentPoolPlace;
+  Value currentPoolCursorCell;
   /// The `deref(arg0)` receiver place while importing a method body; null
   /// otherwise. Sibling method calls borrow it (rendering `(*self).m(...)`).
   Value currentReceiverPlace;
@@ -4383,6 +4494,10 @@ private:
   /// its owned `emitrust.variable` place of the opaque `__EmitrustFile`
   /// type. Reset per function like `symbols`.
   llvm::DenseMap<const clang::VarDecl *, Value> fileLocals;
+  /// W4.2e Part B (FR-39): true once any node-pool field is promoted, so
+  /// the `__emitrust_pool_*` Option<usize> helpers are emitted once.
+  bool neededPoolHelpers = false;
+  bool poolHelpersEmitted = false;
   /// Hosted FILE* helpers requested by lowered stdio calls
   /// (`requestFileHelper`); each is emitted once per module, in the fixed
   /// order of the `kFileHelpers` table (the `__EmitrustFile` enum first).

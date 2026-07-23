@@ -1130,6 +1130,30 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
   if (pointee.getCanonicalType()->isPointerType())
     return emitPointerPointerLocal(var, loc);
 
+  // W4.2e Part B (FR-39): a node-pool handle is a nullable pool index -- an
+  // i64 index cell plus an i1 non-null cell (the CTS-P8 shape) -- decomposed
+  // against the shared pool as its backing. `h->field` subscripts the pool
+  // at the index and projects the member; a null-check reads the flag. The
+  // handle bypasses the region-driven model entirely (its pointer never
+  // addresses a single object; it selects a pool slot).
+  if (poolHandleVars.contains(var)) {
+    Value idxCell = createEntryAlloca(loc, builder.getIntegerType(64));
+    Value nonNullCell = createEntryAlloca(loc, builder.getI1Type());
+    PointerLocalInfo info;
+    info.backing = currentPoolPlace;
+    info.cursorCell = idxCell;
+    info.nonNullCell = nonNullCell;
+    pointerLocals[var] = info;
+    // Default to None until bound (a handle read before binding is null).
+    builder.create<memref::StoreOp>(loc, createBoolConstant(loc, false),
+                                    nonNullCell);
+    builder.create<memref::StoreOp>(
+        loc, createIntConstant(loc, builder.getIntegerType(64), 0), idxCell);
+    if (const clang::Expr *init = var->getInit())
+      return storePointerAssign(loc, var, init);
+    return success();
+  }
+
   const PointerRegion *region = pointerRegions.regionOf(var);
   if (!region)
     return success(); // Declared but never used as a pointer; no code.
@@ -1569,6 +1593,10 @@ LogicalResult CImporter::storePointerAssign(Location loc,
     }
   }
   const PointerLocalInfo &info = it->second;
+  // W4.2e Part B (FR-39): a node-pool handle assignment (malloc append,
+  // NULL, handle copy, or a self-ref field read) has its own lowering.
+  if (poolHandleVars.contains(ptr))
+    return storePoolHandleAssign(loc, ptr, info, rhs);
   // `p = NULL` selects the None side of the Option-of-cursor model: only
   // the discriminant cell changes (the stale cursor is dead while the
   // flag is false). A pointer without a flag cell cannot represent null;
@@ -1654,6 +1682,156 @@ LogicalResult CImporter::storePointerAssign(Location loc,
                      ? value->cursor
                      : createIntConstant(loc, builder.getIntegerType(64), 0);
   builder.create<memref::StoreOp>(loc, cursor, info.cursorCell);
+  return success();
+}
+
+const clang::MemberExpr *
+CImporter::asPoolNextFieldRead(const clang::Expr *expr) const {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    if (cast->getCastKind() != clang::CK_LValueToRValue &&
+        cast->getCastKind() != clang::CK_NoOp)
+      break;
+    e = stripTrivia(cast->getSubExpr());
+  }
+  const auto *member = llvm::dyn_cast<clang::MemberExpr>(e);
+  if (!member || !member->isArrow())
+    return nullptr;
+  const auto *field = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+  if (!field || !poolNextFields.contains(field->getCanonicalDecl()))
+    return nullptr;
+  const clang::VarDecl *base = asLoadedLocalVarRef(member->getBase());
+  if (!base)
+    base = asLocalVarRef(member->getBase());
+  return base && poolHandleVars.contains(base) ? member : nullptr;
+}
+
+LogicalResult
+CImporter::storePoolHandleAssign(Location loc, const clang::VarDecl *ptr,
+                                 const PointerLocalInfo &info,
+                                 const clang::Expr *rhs) {
+  IntegerType i64Type = builder.getIntegerType(64);
+  // `n = malloc(sizeof(struct T))`: append a slot at the free cursor. The
+  // handle becomes (index = cursor, non-null = true) and the cursor
+  // advances. The pool array is zero-initialized, so the fresh slot needs
+  // no explicit clearing (malloc's indeterminate contents refined to zero).
+  if (asAllocCall(rhs)) {
+    Value cursor = loadPlace(loc, currentPoolCursorCell);
+    builder.create<memref::StoreOp>(loc, cursor, info.cursorCell);
+    builder.create<memref::StoreOp>(loc, createBoolConstant(loc, true),
+                                    info.nonNullCell);
+    Value next = builder
+                     .create<arith::AddIOp>(
+                         loc, cursor, createIntConstant(loc, i64Type, 1))
+                     .getResult();
+    builder.create<memref::StoreOp>(loc, next, currentPoolCursorCell);
+    return success();
+  }
+  // `n = NULL`: the None side; only the flag changes (the index is dead).
+  if (isNullPointerConstantExpr(rhs)) {
+    builder.create<memref::StoreOp>(loc, createBoolConstant(loc, false),
+                                    info.nonNullCell);
+    return success();
+  }
+  // `c = c->next` / `nx = c->next`: destructure the `Option<usize>` field
+  // read back into the handle's (non-null, index) pair.
+  if (const clang::MemberExpr *fieldRead = asPoolNextFieldRead(rhs)) {
+    FailureOr<Value> optValue = emitPoolNextFieldRead(fieldRead, loc);
+    if (failed(optValue))
+      return failure();
+    auto unpack = builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange{builder.getI1Type(), i64Type},
+        builder.getStringAttr("__emitrust_pool_unpack"), ArrayAttr(),
+        ValueRange{*optValue});
+    builder.create<memref::StoreOp>(loc, unpack.getResult(0), info.nonNullCell);
+    builder.create<memref::StoreOp>(loc, unpack.getResult(1), info.cursorCell);
+    return success();
+  }
+  // `head = n`: copy another handle's (index, non-null) pair.
+  FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
+  if (failed(value))
+    return failure();
+  if (!value->cursor)
+    return emitError(loc)
+           << "unsupported: node-pool handle assigned a non-handle value";
+  Value nonNull =
+      value->nonNull ? value->nonNull : createBoolConstant(loc, true);
+  builder.create<memref::StoreOp>(loc, nonNull, info.nonNullCell);
+  builder.create<memref::StoreOp>(loc, value->cursor, info.cursorCell);
+  return success();
+}
+
+FailureOr<Value>
+CImporter::emitPoolNextFieldRead(const clang::MemberExpr *member,
+                                Location loc) {
+  FailureOr<PtrExprValue> handle = emitPointerRValue(member->getBase());
+  if (failed(handle))
+    return failure();
+  FailureOr<Type> pointeeType = mapType(
+      member->getBase()->getType().getCanonicalType()->getPointeeType(), loc);
+  if (failed(pointeeType))
+    return failure();
+  FailureOr<Value> basePlace =
+      emitPointerPlace(loc, *handle, *pointeeType, /*writeback=*/nullptr);
+  if (failed(basePlace))
+    return failure();
+  const auto *field = llvm::cast<clang::FieldDecl>(member->getMemberDecl());
+  Type optType = emitrust::OpaqueType::get(builder.getContext(), "Option<usize>");
+  Value fieldPlace =
+      builder
+          .create<emitrust::MemberOp>(
+              loc, emitrust::LValueType::get(optType), *basePlace,
+              builder.getStringAttr(flattenedFieldName(field)))
+          .getResult();
+  return builder.create<emitrust::LoadOp>(loc, optType, fieldPlace).getResult();
+}
+
+LogicalResult
+CImporter::emitPoolNextFieldAssign(const clang::MemberExpr *member,
+                                   const clang::Expr *rhs, Location loc) {
+  FailureOr<PtrExprValue> handle = emitPointerRValue(member->getBase());
+  if (failed(handle))
+    return failure();
+  FailureOr<Type> pointeeType = mapType(
+      member->getBase()->getType().getCanonicalType()->getPointeeType(), loc);
+  if (failed(pointeeType))
+    return failure();
+  FailureOr<Value> basePlace =
+      emitPointerPlace(loc, *handle, *pointeeType, /*writeback=*/nullptr);
+  if (failed(basePlace))
+    return failure();
+  const auto *field = llvm::cast<clang::FieldDecl>(member->getMemberDecl());
+  Type optType = emitrust::OpaqueType::get(builder.getContext(), "Option<usize>");
+  Value fieldPlace =
+      builder
+          .create<emitrust::MemberOp>(
+              loc, emitrust::LValueType::get(optType), *basePlace,
+              builder.getStringAttr(flattenedFieldName(field)))
+          .getResult();
+  // Build the `Option<usize>` value from the right-hand handle's (non-null,
+  // index) pair: NULL is None; another handle is Some(index) when non-null.
+  IntegerType i64Type = builder.getIntegerType(64);
+  Value some, index;
+  if (isNullPointerConstantExpr(rhs)) {
+    some = createBoolConstant(loc, false);
+    index = createIntConstant(loc, i64Type, 0);
+  } else {
+    FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
+    if (failed(value))
+      return failure();
+    if (!value->cursor)
+      return emitError(loc) << "unsupported: node-pool field assigned a "
+                               "non-handle value";
+    some = value->nonNull ? value->nonNull : createBoolConstant(loc, true);
+    index = value->cursor;
+  }
+  Value opt = builder
+                  .create<emitrust::CallOpaqueOp>(
+                      loc, TypeRange{optType},
+                      builder.getStringAttr("__emitrust_pool_opt"),
+                      ArrayAttr(), ValueRange{some, index})
+                  .getResult(0);
+  builder.create<emitrust::AssignOp>(loc, fieldPlace, opt);
   return success();
 }
 
