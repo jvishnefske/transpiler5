@@ -471,6 +471,14 @@ struct PtrExprValue {
   /// resolves to is the member's projection on the base's place (or on
   /// the base's staged global copy). Null for whole-object bases.
   const clang::FieldDecl *member = nullptr;
+  /// The MUTABLE local backing array place of a heap-allocation region
+  /// (W4.2e Part A): a synthesized entry-block
+  /// `!emitrust.lvalue<!emitrust.array<CAP x T>>` a local `T *p =
+  /// malloc(...)` decomposes against, subscripted at `cursor`. Distinct
+  /// from `literalBacking`, which is the READ-ONLY backing of a string
+  /// literal; writes through this backing are allowed. Null for
+  /// object-based and string-literal pointers.
+  Value backing;
 };
 
 /// Phase-1b classification of one pointer parameter, derived from the
@@ -558,6 +566,13 @@ struct PointerLocalInfo {
   /// null for whole-object bases. A member base is a degenerate
   /// one-element run: no cursor, no arithmetic.
   const clang::FieldDecl *member = nullptr;
+  /// The synthesized MUTABLE entry-block backing array place of a local
+  /// heap-allocation region (W4.2e Part A): an
+  /// `!emitrust.lvalue<!emitrust.array<CAP x T>>` a local `T *p =
+  /// malloc(...)` decomposes against (`p[i]` subscripts it at `cursorCell`).
+  /// Null for every non-allocation local. Distinct from `literalBacking`
+  /// (read-only string-literal backing).
+  Value backing;
 };
 
 /// The imported model of one pointer-typed global variable (CTS-P4): the
@@ -1068,6 +1083,26 @@ private:
   void recordAllocBase(const clang::VarDecl *ptr, const clang::CallExpr *call,
                        clang::SourceLocation loc);
 
+  /// Evaluates `expr` to a non-negative constant `out`, folding references
+  /// to *foldable automatic locals* (W4.2e Part A) in addition to the
+  /// genuine integer-constant expressions `EvaluateAsInt` accepts. A
+  /// foldable local has an integer-constant initializer and is never
+  /// reassigned or address-taken in the analyzed body (`isFoldableLocal`),
+  /// so its value is its initializer everywhere — this lets
+  /// `malloc(cap * sizeof(int))` fold when `cap` is such a local (the
+  /// natural allocation-size idiom, which `EvaluateAsInt` alone rejects
+  /// because `cap` is not a C constant expression). Returns false on
+  /// overflow-free failure; the arithmetic is unsigned and rejects a
+  /// negative intermediate. Bounded: recursion follows a foldable local to
+  /// its initializer, itself constant, so the depth is the expression's.
+  bool evalFoldableInt(const clang::Expr *expr, uint64_t &out) const;
+
+  /// True when `var` is an automatic local with an integer-constant
+  /// initializer that is never reassigned (plain `=`, compound, or
+  /// `++`/`--`) nor address-taken anywhere in the analyzed body, so every
+  /// read of it yields the initializer (W4.2e Part A, `evalFoldableInt`).
+  bool isFoldableLocal(const clang::VarDecl *var) const;
+
   /// Classifies the right-hand side `rhs` of `pp = rhs` for a second-order
   /// pointer (CTS-P5): `pp = &p` on a tracked first-order pointer local
   /// binds `p` as the (degenerate) selection target and marks the `&p`
@@ -1159,6 +1194,10 @@ private:
 
   /// The AST context of the function under analysis; borrowed.
   clang::ASTContext *context = nullptr;
+  /// The body of the function under analysis (W4.2e Part A); borrowed, set
+  /// for the duration of `analyze`. `isFoldableLocal` scans it to prove a
+  /// local is never reassigned or address-taken.
+  const clang::Stmt *analyzedBody = nullptr;
   /// Union-find parent links over pointer and base declarations.
   llvm::DenseMap<const clang::VarDecl *, const clang::VarDecl *> parent;
   /// Region facts keyed by each set's current root.
@@ -5283,6 +5322,25 @@ static inline const clang::CallExpr *asAllocCall(const clang::Expr *expr) {
     return nullptr;
   llvm::StringRef name = callee->getName();
   if (name != "calloc" && name != "malloc")
+    return nullptr;
+  return call;
+}
+
+/// Returns the one-argument `free(p)` call `expr` names (after cast/paren
+/// stripping), or null when it is not a call to the definition-less libc
+/// `free` (W4.2e Part A). A project-supplied `free` definition keeps its
+/// ordinary-call lowering (the `hasBody` guard, mirroring `asAllocCall`).
+static inline const clang::CallExpr *asFreeCall(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::CastExpr>(e))
+    e = stripTrivia(cast->getSubExpr());
+  const auto *call = llvm::dyn_cast<clang::CallExpr>(e);
+  if (!call)
+    return nullptr;
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  if (!callee || callee->hasBody() || !callee->getIdentifier())
+    return nullptr;
+  if (callee->getName() != "free" || call->getNumArgs() != 1)
     return nullptr;
   return call;
 }

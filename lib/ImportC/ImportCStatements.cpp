@@ -1281,6 +1281,36 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
     return success();
   }
   if (region->bases.empty()) {
+    // A recognized constant-size heap allocation bound to a LOCAL pointer
+    // (W4.2e Part A): the pointer decomposes against a synthesized
+    // entry-block MUTABLE backing array of `allocCount` elements plus an
+    // i64 cursor cell — the writable, function-scope analog of the
+    // string-literal region. malloc's indeterminate contents are refined
+    // to zero (the backing `emitrust.variable` default-initializes),
+    // matching calloc exactly; the cursor starts at 0 (the base of a
+    // fresh allocation). Escapes (address-of the pointer, a store into a
+    // global, a returned pointer) set `invalidReason`/reject upstream, so
+    // a region that reaches here with `allocSite` is a genuine flat buffer.
+    if (region->allocSite) {
+      FailureOr<Type> elementType = mapType(pointee, loc);
+      if (failed(elementType))
+        return failure();
+      Type backingType = emitrust::ArrayType::get(
+          builder.getContext(), region->allocCount, *elementType);
+      Value backing = createVariablePlace(loc, backingType);
+      Value cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
+      PointerLocalInfo info;
+      info.cursorCell = cursorCell;
+      info.backing = backing;
+      pointerLocals[var] = info;
+      // The fresh backing is already zeroed, so the declaration binding
+      // only initializes the cursor to 0; a later `p = malloc(...)`
+      // re-zeroes the backing through `storePointerAssign`.
+      builder.create<memref::StoreOp>(
+          loc, createIntConstant(loc, builder.getIntegerType(64), 0),
+          cursorCell);
+      return success();
+    }
     // An integer-carrier region (CTS-P3): the pointer never addresses a
     // modeled object — its only sources are integer-to-pointer casts,
     // carrier-returning calls, and null constants — so its entire runtime
@@ -1550,6 +1580,24 @@ LogicalResult CImporter::storePointerAssign(Location loc,
                                "to this pointer";
     Value none = createBoolConstant(loc, false);
     builder.create<memref::StoreOp>(loc, none, info.nonNullCell);
+    return success();
+  }
+  // `p = malloc(...)` / `p = calloc(...)` on a local backing region (W4.2e
+  // Part A): re-zero the synthesized backing and reset the cursor to 0
+  // (exact calloc semantics; malloc's indeterminate contents are refined to
+  // zero). The region validation admitted exactly one allocation site, so
+  // any allocation call reaching this assignment is that site.
+  if (info.backing && asAllocCall(rhs)) {
+    auto arrayType = llvm::cast<emitrust::ArrayType>(
+        llvm::cast<emitrust::LValueType>(info.backing.getType())
+            .getValueType());
+    Value fresh = createVariablePlace(loc, arrayType);
+    Value zeroed =
+        builder.create<emitrust::LoadOp>(loc, arrayType, fresh).getResult();
+    builder.create<emitrust::AssignOp>(loc, info.backing, zeroed);
+    builder.create<memref::StoreOp>(
+        loc, createIntConstant(loc, builder.getIntegerType(64), 0),
+        info.cursorCell);
     return success();
   }
   FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
@@ -2763,6 +2811,27 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
       // C's exit-status semantics (design.md C99-48).
       if (name == "exit")
         return emitExitCall(call);
+      // A statement-position `free(p)` whose argument roots in a recognized
+      // local heap allocation (W4.2e Part A) is a no-op: the synthesized
+      // backing array drops at function scope end, and a defined program
+      // never reads freed storage (the differential is the oracle). `free`
+      // of any other pointer rejects located — the region model has no
+      // deallocation for it. A value use of `free`'s int result keeps its
+      // located rejection in emitCall (it is never intercepted there).
+      if (name == "free") {
+        Location freeLoc = translateLoc(call->getBeginLoc());
+        const clang::Expr *arg = stripTrivia(call->getArg(0));
+        while (const clang::Expr *peeled = peelPointerCast(astContext(), arg))
+          arg = stripTrivia(peeled);
+        if (const clang::VarDecl *root = asLoadedLocalVarRef(arg)) {
+          auto it = pointerLocals.find(root);
+          if (it != pointerLocals.end() && it->second.backing)
+            return success();
+        }
+        return emitError(freeLoc)
+               << "unsupported: free of a pointer not rooted in a "
+                  "recognized allocation";
+      }
     }
   }
   // A statement-position call through a devirtualized alias of a hosted

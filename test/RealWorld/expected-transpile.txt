@@ -5,6 +5,7 @@ base64
 calc
 crc32
 logger
+malloc-stack
 sieve
 union-find
 word-count
