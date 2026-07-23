@@ -384,6 +384,7 @@ using namespace mlir;
 void PointerRegionAnalysis::analyze(clang::ASTContext &astContext,
                                     const clang::Stmt *body) {
   context = &astContext;
+  analyzedBody = body;
   parent.clear();
   regions.clear();
   pointerVars.clear();
@@ -393,7 +394,96 @@ void PointerRegionAnalysis::analyze(clang::ASTContext &astContext,
   memberFacts.clear();
   poisonedFields.clear();
   visit(body);
+  analyzedBody = nullptr;
   context = nullptr;
+}
+
+// A local is foldable only if the analyzed body never mutates it (`=`,
+// compound assign, `++`/`--`) nor takes its address. The scan is a bounded
+// walk of the function body (W4.2e Part A).
+static bool bodyMutatesOrEscapes(const clang::Stmt *stmt,
+                                 const clang::VarDecl *var) {
+  if (!stmt)
+    return false;
+  if (const auto *bin = llvm::dyn_cast<clang::BinaryOperator>(stmt)) {
+    if (bin->isAssignmentOp())
+      if (const clang::VarDecl *lhs = asLocalVarRef(bin->getLHS()))
+        if (lhs == var)
+          return true;
+  } else if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
+    if (unary->isIncrementDecrementOp() || unary->getOpcode() == clang::UO_AddrOf)
+      if (const clang::VarDecl *sub = asLocalVarRef(unary->getSubExpr()))
+        if (sub == var)
+          return true;
+  }
+  for (const clang::Stmt *child : stmt->children())
+    if (bodyMutatesOrEscapes(child, var))
+      return true;
+  return false;
+}
+
+bool PointerRegionAnalysis::isFoldableLocal(const clang::VarDecl *var) const {
+  if (!var || !var->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(var) ||
+      !var->getInit())
+    return false;
+  clang::Expr::EvalResult result;
+  if (!var->getInit()->EvaluateAsInt(result, *context) ||
+      result.Val.getInt().isNegative())
+    return false;
+  return !bodyMutatesOrEscapes(analyzedBody, var);
+}
+
+bool PointerRegionAnalysis::evalFoldableInt(const clang::Expr *expr,
+                                            uint64_t &out) const {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    e = stripTrivia(cast->getSubExpr());
+  // A genuine integer-constant expression (literals, `sizeof`, const vars).
+  clang::Expr::EvalResult result;
+  if (e->EvaluateAsInt(result, *context)) {
+    if (result.Val.getInt().isNegative())
+      return false;
+    out = result.Val.getInt().getZExtValue();
+    return true;
+  }
+  // A reference to a foldable automatic local folds to its initializer.
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e))
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+      if (isFoldableLocal(var))
+        return evalFoldableInt(var->getInit(), out);
+  // Arithmetic over foldable operands (the `cap * sizeof(int)` idiom).
+  if (const auto *bin = llvm::dyn_cast<clang::BinaryOperator>(e)) {
+    uint64_t lhs = 0, rhs = 0;
+    if (!evalFoldableInt(bin->getLHS(), lhs) ||
+        !evalFoldableInt(bin->getRHS(), rhs))
+      return false;
+    switch (bin->getOpcode()) {
+    case clang::BO_Add:
+      out = lhs + rhs;
+      return true;
+    case clang::BO_Sub:
+      if (rhs > lhs)
+        return false;
+      out = lhs - rhs;
+      return true;
+    case clang::BO_Mul:
+      out = lhs * rhs;
+      return true;
+    case clang::BO_Div:
+      if (rhs == 0)
+        return false;
+      out = lhs / rhs;
+      return true;
+    case clang::BO_Rem:
+      if (rhs == 0)
+        return false;
+      out = lhs % rhs;
+      return true;
+    default:
+      return false;
+    }
+  }
+  return false;
 }
 
 const PointerRegion *PointerRegionAnalysis::regionOf(const clang::VarDecl *var) {
@@ -633,12 +723,10 @@ void PointerRegionAnalysis::recordAllocBase(const clang::VarDecl *ptr,
   uint64_t elementBytes =
       context->getTypeSizeInChars(pointee).getQuantity();
   auto evalConstant = [&](const clang::Expr *arg, uint64_t &out) {
-    clang::Expr::EvalResult result;
-    if (!arg->EvaluateAsInt(result, *context) ||
-        result.Val.getInt().isNegative())
-      return false;
-    out = result.Val.getInt().getZExtValue();
-    return true;
+    // Fold references to foldable automatic locals (W4.2e Part A) so the
+    // `malloc(cap * sizeof(int))` idiom resolves; `EvaluateAsInt` alone
+    // rejects it because `cap` is not a C constant expression.
+    return evalFoldableInt(arg, out);
   };
   llvm::StringRef callee = call->getDirectCallee()->getName();
   uint64_t totalBytes = 0;
@@ -669,10 +757,17 @@ void PointerRegionAnalysis::recordAllocBase(const clang::VarDecl *ptr,
                        "unsupported: allocation size does not fit the "
                        "pointer's element type");
   PointerRegion &region = regionFor(ptr);
+  // An allocation cannot join an object, string-literal, or carrier base
+  // into one region (W4.2e Part A): the region owns a synthesized backing
+  // exclusively (the reverse order is rejected in `recordPointerWrite`).
+  if (!region.bases.empty() || region.literalBase || region.hasCarrierSource)
+    return markInvalid(ptr, loc,
+                       "unsupported: allocation joined with an object, "
+                       "string-literal, or carrier base into one pointer "
+                       "region");
   if (region.allocSite && region.allocSite != call)
     return markInvalid(ptr, loc,
-                       "unsupported: global pointer bound to multiple "
-                       "allocations");
+                       "unsupported: pointer bound to multiple allocations");
   region.allocSite = call;
   region.allocLoc = loc;
   region.allocCount = totalBytes / elementBytes;
@@ -1005,13 +1100,39 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
     if (cast->getCastKind() == clang::CK_NullToPointer)
       return recordNullable(ptr, loc);
 
-  // `g = calloc(n, sizeof(T))` / `g = malloc(bytes)` on a global pointer:
-  // a constant-size allocation binding, promoted to a synthesized global
-  // backing array. Allocations bound to local pointers keep the historical
-  // non-address rejection below.
-  if (!ptr->hasLocalStorage())
-    if (const clang::CallExpr *alloc = asAllocCall(e))
-      return recordAllocBase(ptr, alloc, loc);
+  // `g = calloc(n, sizeof(T))` / `g = malloc(bytes)`: a constant-size
+  // allocation binding. A global pointer promotes to a synthesized global
+  // backing array (CTS-P4); a local pointer synthesizes an entry-block
+  // mutable backing array plus a cursor cell (W4.2e Part A).
+  // `recordAllocBase` enforces the flat-buffer predicate and rejects a
+  // straddle with an object/literal/carrier base.
+  if (const clang::CallExpr *alloc = asAllocCall(e))
+    return recordAllocBase(ptr, alloc, loc);
+  // `realloc` has no representation in the fixed-backing model: the
+  // synthesized backing array cannot resize (W4.2e Part A). Reject it with
+  // a dedicated located diagnostic rather than the generic straddle below.
+  {
+    const clang::Expr *callExpr = e;
+    while (const auto *cast = llvm::dyn_cast<clang::CastExpr>(callExpr))
+      callExpr = stripTrivia(cast->getSubExpr());
+    if (const auto *call = llvm::dyn_cast<clang::CallExpr>(callExpr))
+      if (const clang::FunctionDecl *callee = call->getDirectCallee())
+        if (!callee->hasBody() && callee->getIdentifier() &&
+            callee->getName() == "realloc")
+          return markInvalid(ptr, loc,
+                             "unsupported: realloc is not part of the "
+                             "supported allocation model (the fixed backing "
+                             "cannot resize)");
+  }
+  // A non-allocation address source after an allocation binding straddles
+  // the two models: the region already owns a synthesized backing, so it
+  // cannot also decompose against an object, literal, or carrier base
+  // (W4.2e Part A; the reverse order is rejected in `recordAllocBase`).
+  if (regionFor(ptr).allocSite)
+    return markInvalid(ptr, loc,
+                       "unsupported: allocation joined with an object, "
+                       "string-literal, or carrier base into one pointer "
+                       "region");
 
   // A decomposition-transparent pointer cast — a qualification adjustment
   // or a `void *`-mediated cast (the pointee-wildcard rule, CTS-P9) — is
@@ -2926,6 +3047,7 @@ CImporter::emitPointerLocalRead(Location loc, const clang::VarDecl *var) {
   PtrExprValue value{info.base,   cursor,    info.literalBacking,
                      nonNull,     baseIndex, info.multiBases};
   value.member = info.member;
+  value.backing = info.backing;
   return value;
 }
 
@@ -3283,9 +3405,11 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       Value baseIndex;
       if (info.baseIndexCell)
         baseIndex = loadPlace(loc, info.baseIndexCell);
-      return PtrExprValue{info.base, unary->isPostfix() ? current : next,
+      PtrExprValue result{info.base, unary->isPostfix() ? current : next,
                           info.literalBacking, nonNull, baseIndex,
                           info.multiBases};
+      result.backing = info.backing;
+      return result;
     }
     return emitError(loc) << "unsupported pointer expression";
   }
@@ -3332,9 +3456,11 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
                     .getResult()
               : builder.create<arith::SubIOp>(loc, pointer->cursor, offset)
                     .getResult();
-      return PtrExprValue{pointer->base, cursor, pointer->literalBacking,
+      PtrExprValue result{pointer->base, cursor, pointer->literalBacking,
                           pointer->nonNull, pointer->baseIndex,
                           pointer->multiBases};
+      result.backing = pointer->backing;
+      return result;
     }
   }
 
@@ -3388,6 +3514,7 @@ CImporter::emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript) {
                               pointer->literalBacking, pointer->nonNull,
                               pointer->baseIndex, pointer->multiBases};
       degenerate.member = pointer->member;
+      degenerate.backing = pointer->backing;
       return degenerate;
     }
     return emitError(loc) << "unsupported: arithmetic on the address "
@@ -3411,9 +3538,11 @@ CImporter::emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript) {
   }
   Value cursor = builder.create<arith::AddIOp>(loc, pointer->cursor, offset)
                      .getResult();
-  return PtrExprValue{pointer->base, cursor, pointer->literalBacking,
+  PtrExprValue result{pointer->base, cursor, pointer->literalBacking,
                       pointer->nonNull, pointer->baseIndex,
                       pointer->multiBases};
+  result.backing = pointer->backing;
+  return result;
 }
 
 /// Returns the number of innermost (non-array) elements one value of the
@@ -3436,7 +3565,8 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
                                              GlobalWriteback *writeback) {
   // A pointer of a nullable region that was never bound to any object can
   // only ever hold the null constant; it has no place to designate.
-  if (!pointer.base && !pointer.literalBacking && !pointer.baseIndex)
+  if (!pointer.base && !pointer.literalBacking && !pointer.baseIndex &&
+      !pointer.backing)
     return emitError(loc)
            << "unsupported: dereference of a pointer that is only ever null";
   // Dereferencing a possibly-null pointer guards on the Option-of-cursor
@@ -3450,6 +3580,23 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
             {builder.getIndexAttr(0),
              builder.getStringAttr("null pointer dereference")}),
         ValueRange{pointer.nonNull});
+  if (pointer.backing) {
+    // A local heap-allocation cursor subscripts the pointer's synthesized
+    // MUTABLE backing array (a flat [CAP x T], W4.2e Part A) at the loaded
+    // cursor. Unlike a string literal, writes ARE allowed: the place feeds
+    // both reads (`sum += stack[--top]`) and writes (`stack[top++] = v`).
+    if (!pointer.cursor) // Defensive; backing pointers always carry cursors.
+      return emitError(loc) << "unsupported heap-allocation pointer shape";
+    auto lvalueType =
+        llvm::cast<emitrust::LValueType>(pointer.backing.getType());
+    auto arrayType =
+        llvm::cast<emitrust::ArrayType>(lvalueType.getValueType());
+    return builder
+        .create<emitrust::SubscriptOp>(
+            loc, emitrust::LValueType::get(arrayType.getElementType()),
+            pointer.backing, pointer.cursor)
+        .getResult();
+  }
   if (pointer.literalBacking) {
     // A string-literal cursor subscripts the literal's read-only backing
     // byte array (a flat [N x i8], so no level peeling arises). Writes
