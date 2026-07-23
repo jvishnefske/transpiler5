@@ -3987,6 +3987,20 @@ of `returned-pointer` (`binary-tree`), `strchr-result-bind` (`grep-lite`),
 `global-string-cursor` (`expr-eval`), and `argv` (`argv-echo`). The `crash`
 tag is retired.
 
+**W4.2e update: `dynamic-memory` resolved (rank 2).** The two
+`dynamic-memory` programs both TRANSPILE now (FR-39, C99-46 Stage 1):
+`malloc-stack` via the Part A local flat buffer, `linked-list` via the
+Part B index-handle node pool. The `dynamic-memory` blocker tag is retired
+from the corpus — no remaining rejected program carries it. `binary-tree`
+stays rejected but as `returned-pointer` ONLY (a returned `malloc`'d node
+dangles; the pool model deliberately keeps it out — see FR-39). **Current
+tally: 9 transpiled, 4 rejected, 0 miscompiled** — transpiled add
+`malloc-stack` and `linked-list`; the four rejected are `returned-pointer`
+(`binary-tree`), `strchr-result-bind` (`grep-lite`), `global-string-cursor`
+(`expr-eval`), and `argv` (`argv-echo`). Remaining ranked demand (rank 3+):
+strchr-result-bind, global-string-cursor, returned-pointer (RFC-gated,
+W4.5), and argv (W4.3).
+
 **Csmith DEFERRED** (documented decline): the flake toolchain is off-limits
 this cycle, so no new generator dependency is added. The seeded differential
 fuzzer (`test/Fuzz`, generator v5) plus this hand-authored corpus are the
