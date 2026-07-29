@@ -1,0 +1,30 @@
+# EmitRust per-item porting ledger for RealWorld C++ project 'ringbuf-lib' (FR-44).
+#
+# One line per item of the project's FR-40 item graph, as
+# '<symbol> <kind> <status>', sorted by symbol. Status is one of
+# ported / stubbed / dropped / missing / declared; see
+# tools/emitrust-cc/ProgressReport.h. Measured by
+# 'emitrust-cc --emit=crate --incremental', whose crate is also
+# built on every run -- a partially ported project must still
+# COMPILE.
+#
+# Like the outcome manifest, this is an honest baseline and a
+# backlog, not a conformance target, and the ratchet is two-way:
+# an item that stops porting fails the gate as a regression, and
+# an item that starts porting fails until it is ratcheted
+# forward. A change between two NON-ported statuses (dropped
+# <-> stubbed) is reported as advisory drift.
+#
+# Regenerated via: run_realworld.py ... --manifest-format outcomes --update
+Ring record ported
+ns_checksum_fold function ported
+ns_checksum_of_ring function ported
+ns_frame_encode function ported
+ns_frame_is_full function ported
+ns_ring_capacity function ported
+ns_ring_push function ported
+ns_ring_recent function ported
+ns_ring_reset function ported
+ns_ring_size function ported
+ns_ring_sum function ported
+tu0_ns_checksum_scramble function ported
