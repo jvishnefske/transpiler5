@@ -38,7 +38,12 @@
 // change that lowers BOTH counts equally still shows up in the diff.
 //
 // CHECK: fixed-stats   no-search 11/11   --search 11/11   ok
-// CHECK: polygon       no-search 2/8   --search 2/8   ok
+// Ratcheted 2/8 -> 4/8 by FR-48 (C++ reference parameters), which landed
+// after this gate was written. The INVARIANT this file exists to protect is
+// the trailing `ok` on every row and the summary line below; the fractions
+// are pinned alongside it so a silent DROP is a failure too, and they move
+// only forward.
+// CHECK: polygon       no-search 4/8   --search 4/8   ok
 // CHECK: shapes        no-search 1/7   --search 1/7   ok
 // CHECK: tokenizer     no-search 5/5   --search 5/5   ok
 // CHECK: All 4 corpus projects: --search >= no-search.
