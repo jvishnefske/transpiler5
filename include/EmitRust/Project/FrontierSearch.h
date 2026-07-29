@@ -34,6 +34,61 @@
 ///
 /// The ROOT state admits every item FR-41 colored Green or Yellow.
 ///
+///===--------------------------------------------------------------------===//
+/// The safety net: the search may not lose to not searching
+///===--------------------------------------------------------------------===//
+///
+/// FR-50. The root state is derived from FR-41's coloring, and a coloring is
+/// an approximation. If it calls an importable item Red, that item is missing
+/// from the root state — and since every child of a state ADMITS STRICTLY
+/// LESS than its parent, no amount of searching can put it back. A single
+/// false Red therefore made `--search` produce a SMALLER crate than plain
+/// `--incremental`, which is the opposite of the feature's purpose.
+///
+/// The fix is not to trust the coloring more. It is to notice that the plain
+/// recovering import is ITSELF a state in this space — the one that admits
+/// EVERY item, whose `excludedItems` is empty — and that a search which
+/// evaluates that state and keeps the best result cannot come out behind it.
+/// So `frontierSearch` probes it, as node 1, immediately after the root:
+///
+///  - It is a MANDATORY probe, not a candidate that the frontier order might
+///    or might not get to. The budget is raised to at least 2 when the
+///    baseline differs from the root, because "never worse than not
+///    searching" is a guarantee and a guarantee cannot be subject to a knob.
+///    When the coloring rules NOTHING out the two states are identical, the
+///    baseline is memoized away, and the search costs exactly what it used to.
+///  - It is an ordinary state in every other respect. Its score is compared
+///    with the same lexicographic rule, its rejections teach the same way
+///    (and they teach the most, since it admitted everything), and its
+///    children are generated the same way. Nothing about it is special-cased
+///    downstream of its being probed.
+///
+/// That makes the property STRUCTURAL — `best` is a maximum over probed
+/// states, and the baseline is always one of them — rather than something a
+/// test has to keep watch over. `SearchResult::baselineScore` publishes the
+/// witness, `SearchResult::atLeastBaseline()` states the postcondition, and
+/// `frontierSearch` asserts it before returning and prints it on the trace's
+/// `summary` line as `>=baseline=<yes|no>`.
+///
+/// The assertion is the primary statement, not a fallback, and deliberately
+/// so: the fallback is already the MECHANISM — keeping the best of a set that
+/// contains the baseline — so a violation could only mean the score or the
+/// probe is not a function of the state, and papering over that would hide
+/// the real defect. But an assertion is compiled out of a release build,
+/// which is precisely where a user is relying on the guarantee, so
+/// tools/emitrust-cc checks `atLeastBaseline()` unconditionally as well: it
+/// prints a loud internal error and then falls back to the unrestricted
+/// import, the answer the user would have got without the flag. Loud first,
+/// harmless second.
+///
+/// The complementary half of this guarantee lives in the importer: a
+/// recovering import used to DROP a rejected record while still emitting
+/// every field, local and parameter that named it, so the baseline could
+/// score higher than the search with a crate that did not compile. It now
+/// rejects those dependents too (`CImporter::importRecord`), which is what
+/// makes "more items ported" mean the same thing on both sides of this
+/// comparison.
+///
 /// FR-43's own text says "the Green∪Yellow closure of the ROOTS — `main` plus
 /// every externally visible definition", and that is not what this does. The
 /// reason is FR-41's coloring rule, which is a GLOBAL least fixpoint rather
@@ -145,6 +200,7 @@
 /// \code
 /// search items=<n> roots=<n> max-nodes=<n>
 /// root <id> admitted=<n> excluded=<n>
+/// baseline <id> admitted=<n> excluded=<n>
 /// probe <id> outcome=<ok|failed> ported=<n> stubbed=<n> dropped=<n> \
 ///       rep-cost=<n>
 /// learn <id> rejected=<symbol> as=<stub|drop> tag=<tag> new=<yes|no>
@@ -155,12 +211,18 @@
 /// best <id> ported=<n> stubbed=<n> rep-cost=<n>
 /// admitted <symbol> rep=<name>
 /// excluded <symbol> why=<red|dropped|cascade>
-/// summary probes=<n> generated=<n> pruned=<n> improved=<yes|no>
+/// summary probes=<n> generated=<n> pruned=<n> improved=<yes|no> \
+///         >=baseline=<yes|no>
 /// \endcode
 ///
-/// (each real line is unwrapped.) `improved=yes` exactly when the best state
-/// is not the root state — i.e. when a probe after the first one won, which
-/// is the honest answer to "did the search earn its cost on this project?".
+/// (each real line is unwrapped.) The `baseline` line appears exactly when the
+/// admit-everything state differs from the root, i.e. when FR-41 ruled
+/// something out; it is node 1 whenever it appears. `improved=yes` exactly
+/// when the best state is not the root state — i.e. when a probe after the
+/// first one won, which is the honest answer to "did the search earn its cost
+/// on this project?". `>=baseline=yes` is the FR-50 postcondition, and it is
+/// `yes` on every run by construction; a `no` would be a bug loud enough to
+/// have already tripped the assertion in a debug build.
 /// The `learn` lines are the answer to "why did it stop there": they are the
 /// complete record of what each import attempt told the search, deduplicated
 /// and sorted on content (the FR-42 ledger records a header's item once per
@@ -283,6 +345,18 @@ std::map<std::string, unsigned> rootDistances(const ItemGraph &graph,
 /// \returns the root state.
 SearchState rootState(const ItemGraph &graph, const ItemColoring &coloring);
 
+/// The BASELINE state: every item of `graph`, at its default representation.
+///
+/// Probing it excludes nothing, so it is bit for bit the import a plain
+/// `--emit=crate --incremental` run performs — which is what makes it the
+/// witness for FR-50's "the search is never worse than not searching". It
+/// admits Red items on purpose: whether the coloring was right about them is
+/// precisely the question a probe answers better than an approximation does.
+///
+/// \param graph the project's item graph.
+/// \returns the baseline state.
+SearchState baselineState(const ItemGraph &graph);
+
 //===----------------------------------------------------------------------===//
 // Probes
 //===----------------------------------------------------------------------===//
@@ -366,7 +440,8 @@ struct SearchNode {
   /// The item dropped relative to `parent`; empty for the root.
   std::string drop;
   /// Whether `drop` came from a rejection the probe reported (`learned`) or
-  /// from blame attribution on a failed import (`blamed`); empty for the
+  /// from blame attribution on a failed import (`blamed`); `baseline` for the
+  /// mandatory admit-everything probe, which drops nothing; empty for the
   /// root.
   std::string why;
   /// The state itself.
@@ -394,12 +469,30 @@ struct SearchResult {
   unsigned pruned = 0;
   /// Why the loop ended: `exhausted` (no candidate left) or `node-budget`.
   std::string stopReason;
+  /// The score of the BASELINE state — the admit-everything import a plain
+  /// `--incremental` run performs. When the coloring rules nothing out the
+  /// root already admits everything, the two states are one state, and this
+  /// is the root's own score.
+  SearchScore baselineScore;
+  /// The baseline's node id: 1 when it was probed on its own, 0 when it
+  /// coincided with the root.
+  unsigned baselineNode = 0;
   /// The rendered trace, in the format documented at the top of this file.
   std::string trace;
 
-  /// True when the winner is not the root — i.e. when the search found
-  /// something the greedy single attempt would not have.
+  /// True when the winner is not the root — i.e. when some probe after the
+  /// first one won. That includes the FR-50 baseline: if the admit-everything
+  /// import beats the coloring's root state, the search DID improve on its
+  /// own starting point, and it also just proved FR-41 called something Red
+  /// that imports.
   bool improved() const { return bestNode != 0; }
+
+  /// FR-50's postcondition: the winner is no worse than not searching at all.
+  ///
+  /// True by construction — `best` is the maximum over a probed set that
+  /// always contains the baseline — so a caller checks this to catch a bug,
+  /// not to choose a code path.
+  bool atLeastBaseline() const { return !baselineScore.isBetterThan(bestScore); }
 };
 
 /// The functional core: searches for the best admissible subset of `graph`.

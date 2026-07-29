@@ -112,6 +112,31 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   const clang::RecordDecl *definition = record->getDefinition();
   if (!definition)
     return success(); // Forward declaration; imported once completed or used.
+  // A record this import already rejected has NO struct_def in the module, so
+  // there is no Rust type for a caller to name. Saying so here — at the use
+  // site, which is where the type was wanted — is what keeps a recovering
+  // import from emitting a field, a local or a parameter whose type does not
+  // exist. See the declaration in CImporterInternal.h for why the ordinary
+  // `importedRecords` memo cannot answer this.
+  if (rejectedRecords.contains(definition)) {
+    llvm::StringRef rejectedName = recordRustName(definition);
+    return emitError(loc)
+           << "unsupported: struct '"
+           << (rejectedName.empty() ? llvm::StringRef("<anonymous>")
+                                    : rejectedName)
+           << "' was rejected, so a type naming it cannot be imported";
+  }
+  LogicalResult imported = importRecordUncached(definition);
+  if (failed(imported))
+    rejectedRecords.insert(definition);
+  return imported;
+}
+
+LogicalResult
+CImporter::importRecordUncached(const clang::RecordDecl *definition) {
+  // Every diagnostic below is located on the DEFINITION: it is a verdict on
+  // this record, not on whoever asked for it. The use-site location matters
+  // only for the repeat rejection in `importRecord` above.
   Location defLoc = translateLoc(definition->getBeginLoc());
   // W2.0: a C++ `class` (TTK_Class) imports exactly like a `struct` — the
   // keyword only changes the DEFAULT member access, which the importer

@@ -753,6 +753,24 @@ int main(int argc, char **argv) {
         });
     searchExcluded =
         mlir::emitrust::excludedItemsFor(searchInputs->graph, search.best);
+    // FR-50, enforced in the shipped build. `frontierSearch` asserts the same
+    // postcondition, but an assertion is compiled out of a release build and
+    // this is exactly the guarantee a release user is relying on: `--search`
+    // must never hand back less than plain `--incremental` would have. The
+    // property is structural — `best` is a maximum over probed states and the
+    // admit-everything state is always one of them — so reaching this branch
+    // means the probe or the score is not a function of the state. Say so
+    // loudly, then fall back to the unrestricted import, which is the answer
+    // the user would have got without the flag.
+    if (!search.atLeastBaseline()) {
+      llvm::errs()
+          << "error: internal: the FR-43 search scored below the "
+             "unrestricted import (ported "
+          << search.bestScore.ported << " vs " << search.baselineScore.ported
+          << "); falling back to --incremental without --search. Please "
+             "report this with --emit=search output.\n";
+      searchExcluded.clear();
+    }
     if (emitKind == EmitKind::Search)
       return mlir::failed(writeFile(outputPath, search.trace)) ? 1 : 0;
     if (!searchTracePath.empty() &&

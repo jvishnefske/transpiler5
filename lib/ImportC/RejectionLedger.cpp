@@ -98,6 +98,8 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
      llvm::StringLiteral("self-ref-pointer-member")},
     {llvm::StringLiteral("variadic function"),
      llvm::StringLiteral("variadic-cross-tu")},
+    {llvm::StringLiteral("was rejected, so a type naming it"),
+     llvm::StringLiteral("rejected-type-cascade")},
 };
 
 /// The C++-input table (`_CXX_BLOCKER_SUBSTRINGS`), consulted after the table

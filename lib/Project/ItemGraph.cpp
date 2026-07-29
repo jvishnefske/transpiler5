@@ -127,6 +127,8 @@ llvm::StringRef mlir::emitrust::edgeKindName(EdgeKind kind) {
     return "WritesGlobal";
   case EdgeKind::TakesAddressOf:
     return "TakesAddressOf";
+  case EdgeKind::FieldIndirect:
+    return "FieldIndirect";
   }
   return "Unknown";
 }
@@ -313,6 +315,15 @@ private:
   /// canonical type, but never through a record's own fields — that
   /// indirection is what `Field` edges are for, and following it here would
   /// turn every signature edge into the transitive closure.
+  ///
+  /// `EdgeKind::Field` is the one kind that SPLITS on how the target was
+  /// reached: an occurrence that only ever sits behind a data pointer is
+  /// recorded as `FieldIndirect` instead, because the importer's
+  /// pointer-struct-member models erase such a member and the emitted Rust
+  /// never spells the target's name (see the `FieldIndirect` comment in
+  /// ItemGraph.h for the measurement). Every other kind is recorded as given:
+  /// a `struct S *` PARAMETER really does emit as `&mut S`, so a signature
+  /// edge names its target however many pointers are in the way.
   void collectTypeEdges(clang::QualType type, llvm::StringRef from,
                         EdgeKind kind);
 
@@ -482,49 +493,69 @@ void ItemGraphBuilder::collectTypeEdges(clang::QualType type,
   // Bounded by the source's type nesting; pointers are followed structurally
   // (`struct S **` -> `struct S`) but a record's fields are not, so a
   // self-referential struct cannot cycle here.
-  llvm::SmallVector<clang::QualType, 8> worklist{type};
-  llvm::SmallPtrSet<const clang::Type *, 8> seen;
+  //
+  // The flag rides along with each worklist entry: it is set the moment the
+  // walk steps through a DATA pointer and never cleared, so it answers "was
+  // every route from the declared type to this target through a pointer?".
+  // A pointer whose pointee is a FUNCTION does not set it — `int (*)(struct
+  // S)` erases nothing, the emitted function-pointer type spells `S` in its
+  // own parameter list.
+  llvm::SmallVector<std::pair<clang::QualType, bool>, 8> worklist{
+      {type, /*behindPointer=*/false}};
+  // Keyed on (type, flag), not on the type alone: `struct Holder { struct S s;
+  // struct S *p; }` must reach `S` twice, once each way, or whichever route
+  // the worklist happened to pop first would decide the edge kind.
+  llvm::SmallPtrSet<const clang::Type *, 8> seen[2];
   while (!worklist.empty()) {
-    clang::QualType current = worklist.pop_back_val();
+    auto [current, behindPointer] = worklist.pop_back_val();
     if (current.isNull())
       continue;
     // The canonical type strips typedefs, `decltype`, and sugar, so a
     // `typedef struct S Alias;` parameter yields the same edge a bare
     // `struct S` one does.
     const clang::Type *canonical = current.getCanonicalType().getTypePtr();
-    if (!seen.insert(canonical).second)
+    if (!seen[behindPointer ? 1 : 0].insert(canonical).second)
       continue;
     if (const auto *pointer = llvm::dyn_cast<clang::PointerType>(canonical)) {
-      worklist.push_back(pointer->getPointeeType());
+      clang::QualType pointee = pointer->getPointeeType();
+      bool toFunction = pointee.getCanonicalType()->isFunctionType();
+      worklist.push_back({pointee, behindPointer || !toFunction});
       continue;
     }
     if (const auto *reference =
             llvm::dyn_cast<clang::ReferenceType>(canonical)) {
-      worklist.push_back(reference->getPointeeType());
+      // A C++ reference is NOT erased: it emits as a Rust reference that
+      // spells its pointee. (It is also moot for `Field`, since a reference
+      // member makes its record inadmissible outright — `reference-type` —
+      // so the record is a Red SEED and no edge decides its color.)
+      worklist.push_back({reference->getPointeeType(), behindPointer});
       continue;
     }
     if (const auto *array = llvm::dyn_cast<clang::ArrayType>(canonical)) {
-      worklist.push_back(array->getElementType());
+      worklist.push_back({array->getElementType(), behindPointer});
       continue;
     }
     if (const auto *proto =
             llvm::dyn_cast<clang::FunctionProtoType>(canonical)) {
-      worklist.push_back(proto->getReturnType());
+      worklist.push_back({proto->getReturnType(), behindPointer});
       for (clang::QualType param : proto->getParamTypes())
-        worklist.push_back(param);
+        worklist.push_back({param, behindPointer});
       continue;
     }
     if (const auto *function =
             llvm::dyn_cast<clang::FunctionType>(canonical)) {
-      worklist.push_back(function->getReturnType());
+      worklist.push_back({function->getReturnType(), behindPointer});
       continue;
     }
+    EdgeKind reached = kind == EdgeKind::Field && behindPointer
+                           ? EdgeKind::FieldIndirect
+                           : kind;
     if (const auto *record = llvm::dyn_cast<clang::RecordType>(canonical)) {
-      addEdge(from, recordSymbolFor(record->getDecl()), kind);
+      addEdge(from, recordSymbolFor(record->getDecl()), reached);
       continue;
     }
     if (const auto *enumType = llvm::dyn_cast<clang::EnumType>(canonical))
-      addEdge(from, enumSymbolFor(enumType->getDecl()), kind);
+      addEdge(from, enumSymbolFor(enumType->getDecl()), reached);
   }
 }
 
@@ -766,7 +797,19 @@ ItemGraph ItemGraphBuilder::build(llvm::ArrayRef<clang::ASTUnit *> units) {
   // (symbol, tuIndex); the sort is a no-op today and exists so the contract
   // holds by construction rather than by coincidence.
   llvm::stable_sort(graph.nodes, NodeOrder{});
-  graph.edges.assign(edges.begin(), edges.end());
+  // `Field` SUBSUMES `FieldIndirect` for the same pair. A record that embeds
+  // another both ways (`struct Holder { struct S s; struct S *p; }`) depends
+  // on it by value, and the weaker edge alongside the stronger one would say
+  // nothing a consumer could act on while doubling the line count of every
+  // linked structure. One dependency between two items keeps one edge.
+  std::set<std::pair<std::string, std::string>> byValue;
+  for (const ItemEdge &edge : edges)
+    if (edge.kind == EdgeKind::Field)
+      byValue.insert({edge.from, edge.to});
+  for (const ItemEdge &edge : edges)
+    if (edge.kind != EdgeKind::FieldIndirect ||
+        !byValue.count({edge.from, edge.to}))
+      graph.edges.push_back(edge);
   return graph;
 }
 
