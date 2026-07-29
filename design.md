@@ -1147,6 +1147,236 @@ lists the lit test file(s) that validate it.
   (test/Import/C/malloc-local-flat.c, test/Import/C/malloc-pool-list.c,
   test/EndToEnd/malloc-stack.c, test/EndToEnd/linked-list.c)
 
+- [x] FR-40 Project item graph (W5.0). A pure-AST, whole-project dependency
+  graph over PROGRAM ITEMS, built before any IR exists, in a new
+  `lib/Project/` library independent of `CImporter`'s IR-building state.
+  A node is one top-level item: a function definition or prototype, a
+  record (`struct`/`union`/`class`), an enum, or a global variable, keyed
+  by the same symbol name the importer will emit (`mlirFuncName` /
+  `globalVarSymbolName` semantics, including the W2.0 namespace-flattening
+  prefix and the per-TU `static` mangle) so a graph node and an emitted
+  Rust item are the same thing by construction. Edges, all directed
+  item→dependency: `Calls` (a call expression in a body), `SigType` (a
+  record/enum named in the return or a parameter type), `BodyType` (a
+  record/enum named by a local, cast, or `sizeof` in the body),
+  `Field` (a record's field type), `Base` (a C++ record's base class),
+  `ReadsGlobal`/`WritesGlobal`, and `TakesAddressOf` (a function whose
+  address is taken). The graph is the SEARCH SPACE of FR-43: "expand via
+  the call graph" is a traversal of `Calls`, and "type coloring" (FR-41)
+  is a fixpoint over `Field`/`Base`/`SigType`. Deterministic iteration
+  order (symbol name, then TU index) is a hard requirement — the search
+  above it must be reproducible. Exposed for testing through a new
+  `emitrust-cc --emit=item-graph` mode printing one stable line per node
+  and per edge.
+  (test/Project/item-graph-*.c, test/Project/item-graph-cpp.cpp)
+
+- [ ] FR-41 Item coloring (W5.1). A three-color lattice over FR-40's items,
+  computed by fixpoint, that decides what a partial port can contain:
+  **Green** (the item and its whole type closure are inside the supported
+  subset), **Yellow** (the item itself is admissible but at least one
+  CALLEE is Red — it is still emitted, calling a stub), and **Red** (the
+  item is itself inadmissible, or any type it structurally depends on is
+  Red). The asymmetry between the two poison rules is the load-bearing
+  design point and follows directly from what Rust lets you write: a
+  missing FUNCTION can be replaced by a body-less stub with the right
+  signature, so call-poisoning only demotes a caller to Yellow; a missing
+  TYPE cannot be replaced at all, because its size, its fields, and its
+  `Default`/`Copy` derives are load-bearing at every use, so type-poisoning
+  propagates transitively and turns every dependent Red. Seeds come from a
+  conservative, pure-AST ADMISSIBILITY PROBE per item — a syntactic screen
+  for the constructs the importer already rejects by design (templates,
+  virtual methods, base classes, reference types, exceptions,
+  pointer-to-pointer, unsupported top-level decl kinds) — deliberately
+  UNDER-approximating: the probe may call an item Green that the real
+  import later rejects, and FR-43's search is what repairs that, so the
+  probe must stay cheap and must never call an importable item Red.
+  Exposed through `emitrust-cc --emit=coloring`.
+  (test/Project/coloring-*.c, test/Project/coloring-cpp.cpp)
+
+- [x] FR-42 Recoverable import (W5.2). Today `importDeclsIn` returns
+  `failure()` at the first unsupported declaration, so one unsupported
+  construct anywhere in a project yields NO output at all — the single
+  reason a real C++ project produces nothing today, and the thing
+  "incremental progress" has to fix. `CImporter` gains an off-by-default
+  RECOVERY MODE: a rejected top-level item is recorded in a
+  `RejectionLedger` (emitted symbol, `FileLineColLoc`, the verbatim
+  diagnostic, and the RealWorld blocker tag) and the walk CONTINUES to the
+  next item instead of aborting. A rejected function whose signature is
+  fully mappable is emitted as a STUB — the real signature, a body of
+  `unimplemented!("<reason>")` — so callers still compile; one whose
+  signature is not mappable is dropped entirely and its callers are
+  themselves demoted, which is exactly FR-41's Red/Yellow distinction
+  observed dynamically. Any IR partially built for a rejected item is
+  discarded before the walk resumes; a half-built item must never reach
+  the module. In recovery mode the located diagnostics are emitted as
+  WARNINGS, not errors, so the driver still exits 0 with a partial crate.
+  The mode is off by default and every existing single-shot path keeps
+  byte-identical output — the gate is a byte-identical `--emit=rust`
+  snapshot over the whole existing EndToEnd corpus.
+  (test/Import/C/recover-*.c, test/EndToEnd/recover-partial.cpp)
+
+- [ ] FR-43 Frontier tree search (W5.3). The driver that turns FR-40/41/42
+  into a maximal partial port. A search STATE is a set of admitted items
+  plus a representation choice per admitted item; the root state is the
+  Green∪Yellow closure (FR-41) of the ROOTS — `main` plus every
+  externally visible definition. Expansion is a best-first tree search:
+  attempt a recovering import (FR-42) of the current state; every
+  rejection it reports is a LEARNED FACT that the coloring probe missed,
+  and each child state either drops the offending item and re-colors its
+  dependents, or re-picks that item's representation. The score is
+  lexicographic — items emitted for real, then negated stub count, then
+  summed representation cost — so the search converges on the largest
+  admissible subset rather than the first one that happens to work. It is
+  bounded and reproducible: `--max-search-nodes` (default 8), memoization
+  on the admitted-set hash, and symbol-name tie-breaks. The representation
+  dimension ships with exactly ONE candidate per item — today's greedy
+  Pass-A planners (`planOwners`, `planCellSlices`, `planMallocPool`, ...)
+  — so this wave changes no existing output; the dimension exists because
+  the FR-39 container fat-op split already produced a genuine multiple
+  choice (array pool vs `Vec` vs `VecDeque`, W4.5), and that is where the
+  alternatives plug in without re-plumbing the search.
+  (test/Project/search-*.c, test/Project/search-backtrack.cpp)
+
+- [ ] FR-44 Incremental crate output and progress ratchet (W5.4).
+  `emitrust-cc --emit=crate --incremental` writes a crate that BUILDS from
+  a project only partially inside the subset, plus the report that makes
+  the progress legible: `PORTING.md` (one row per item — symbol, color,
+  blocker tag, source location) and `emitrust-progress.json` (the same,
+  machine-readable, with totals). Progress is ratcheted the same way the
+  c-testsuite ledger and the RealWorld manifest already are: a per-project
+  `expected-items.txt` records which items are expected to port, and a
+  two-way check fails on regression and prints improvements to be ratcheted
+  forward with `--update`. This is what makes the work INCREMENTAL in the
+  operational sense — each later wave is measured by how many items move
+  from Red/Yellow to Green on a fixed corpus, and no wave may silently
+  lose ground.
+  (test/RealWorld/Cpp/*, test/Project/incremental-report.cpp)
+
+- [x] FR-45 `compile_commands.json` input (W5.5). Real C++ projects are
+  described by a compilation database, not by an argv list of sources plus
+  hand-copied `-I` flags, which is all `emitrust-cc` accepts today.
+  `--compdb <dir-or-file>` loads a `JSONCompilationDatabase` and derives
+  both the source list and each file's own command line from it,
+  superseding `PerFileCompilationDatabase`'s extension-based language guess
+  when a real entry exists (the guess stays as the fallback for files the
+  database does not mention). Driver-only arguments that LibTooling must
+  not see (`-c`, `-o`, `-M*`) are filtered. Cherry-picked from
+  `verified_transpilation_pipeline`'s `parse_compilation_database.rs`,
+  which is the only piece of that prototype directly portable here — the
+  rest of it (a whole second Rust-side C parser, a Z3 verification-condition
+  layer) is a parallel architecture, not a component this one can absorb.
+  (test/Project/compdb-*.c)
+
+- [x] FR-46 C++ project corpus (W5.6). `test/RealWorld/Cpp/` extends the
+  Track 4 demand-signal corpus with small, realistic, deterministic C++
+  PROJECTS (several TUs plus headers and a `compile_commands.json`) whose
+  job is to generate demand for the C++ input subset the way the C corpus
+  did for the pointer model. Scored by FR-44's ratchet — percent of items
+  Green — rather than pass/fail, precisely because none of them will port
+  completely for a long time; a project whose ported fraction goes UP is
+  the wave's evidence, and the blocker-tag tabulation over the Red items
+  is the ranked backlog that sequences the C++ waves after this one.
+  Landed: four projects — `fixed-stats` (namespaced free functions, plain
+  structs through pointers, `extern "C"`; deliberately near-in-subset),
+  `tokenizer` (two classes, member-initializer-list constructors, mutating
+  and `const` methods), `polygon` (`const std::vector<T>&` and `T&`
+  parameters, range-for), `shapes` (abstract base, virtual dispatch through
+  a base pointer across TUs). `run_realworld.py` was EXTENDED rather than
+  forked — the outcome model, quarantine, timeout, differential oracle and
+  tag tabulation are shared, with `--corpus-kind {c,cpp}` and
+  `--manifest-format {names,outcomes}` as the only dispatch points; the C
+  path is behaviorally unchanged (9 transpiled / 4 rejected, same four
+  tags). A latent tagging bug was fixed in passing: `first_line(stderr)`
+  returned ClangTool's `[k/n] Processing file` progress chatter on any
+  MULTI-TU rejection, tagging every such program `other` — latent for the C
+  corpus only because both its multi-TU programs transpile.
+  **Baseline: 1 transpiled, 3 rejected.** `fixed-stats` already transpiles
+  and byte-matches a `clang++ -std=c++17` build.
+  (test/RealWorld/Cpp/, test/RealWorld/run_realworld.py)
+
+**W5.6 ranked C++ backlog** (from the FR-46 baseline; each project stops at
+its FIRST blocker, so a tag walks forward as each one is cleared):
+
+| Rank | Blocker | Project | First diagnostic | Cost |
+|--|--|--|--|--|
+| 1 | implicit-`this` method receiver | `tokenizer` | `unsupported assignable expression: CXXThisExpr` | low |
+| 2 | `cxx-references` | `polygon` | `unsupported: reference types are not yet supported` | med |
+| 3 | `cxx-destructor` → bases → virtual | `shapes` | `unsupported: user-declared destructor` | high |
+
+Rank 1 is the survey's key finding and was NOT a documented gap: W2.2
+landed `CXXThisExpr` as an rvalue and as a member-access base, but an
+intra-class method call (`finish();` — an implicit-`this` receiver) needs
+`addr_of` of the receiver PLACE, and `CXXThisExpr` has no assignable-place
+case. Minimal repro: `class A { void bump() { v_ = v_ + 1; }
+void both() { bump(); bump(); } int v_; };`. This blocks any class whose
+methods call each other — pervasive in real C++ — at a fraction of the cost
+of references or inheritance, so it precedes both.
+
+- [x] FR-47 Implicit-`this` method-call receiver (W5.7, rank 1 above).
+  Gives `CXXThisExpr` an assignable-place case (`emitCxxThisPlace`, in
+  `emitLValue` immediately after the `UO_Deref` branch) so
+  `emitCXXMemberCall` can take `addr_of` of the implicit receiver.
+  `(*this).bump()` already worked — it is a `UnaryOperator` reaching
+  `emitDerefLValue` — so the fix had a pinned target shape to reproduce
+  rather than a new one to invent.
+  A SECOND root cause the W5.6 survey did not name: once the place
+  existed, a method calling a sibling DECLARED LATER still failed with
+  "call to unimported method", including the very common
+  `A() { init(); }`. `importCXXMethods` was single-pass declaration-order,
+  but a C++ member function body is a complete-class context, so it
+  becomes declare-then-define (`importFunction` gains `signatureOnly`,
+  implemented by clearing `isDefinition` so a stub and a definition derive
+  their signature from one code path). This is orthogonal to `this` — it
+  reproduces identically with an explicit receiver — but "any intra-class
+  method call" is not true without it. Alternatives rejected and recorded
+  in the header: on-demand callee import recurses forever on mutual
+  recursion; a topological sort has no order for mutual recursion; hoisting
+  one shared `this` deref into the prologue would not dominate
+  nested-region uses.
+  Receiver mutability REUSES the existing rule rather than adding a second:
+  `emitCXXMemberCall`'s `is_mut = !method->isConst()`, paired with the
+  receiver type `importFunction` already fixes at signature time.
+  `emitCxxThisPlace` returns a borrow-agnostic place and makes no
+  mutability decision of its own.
+  Still rejected, each pinned and each rejecting identically with an
+  EXPLICIT receiver (so none is an implicit-`this` limitation): a sibling
+  call into a virtual method, a class-declared method never defined in any
+  TU (the new prepass creates that stub), and passing the receiver on by
+  reference (`helper(*this)`).
+  Gates: c-testsuite ledger inert at 220/220; byte-identical `--emit=rust`
+  over all 91 `test/EndToEnd/*.c`. **`tokenizer` REJECTED -> TRANSPILED**,
+  differentially validated against its `clang++` build; the C++ corpus is
+  now 2 transpiled / 2 rejected and the
+  `unsupported-assign-expr:CXXThisExpr` tag is retired. Next ranked
+  blockers: `cxx-references` (`polygon`), `cxx-destructor` (`shapes`).
+  (test/Import/Cpp/cpp-implicit-this.cpp, test/EndToEnd/cpp-method-chain.cpp)
+
+### Cherry-pick assessment: `verified_transpilation_pipeline`
+
+The archived prototype (`~/src/archive/verified_transpilation_pipeline` on
+`rainier`; a ~21 kloc Rust crate: libclang parser, own C AST, petgraph
+graphs, Z3-backed verification conditions) is a PARALLEL architecture to
+this one, so nothing lifts as code. Three of its ideas are load-bearing
+here and are cherry-picked as design:
+
+- Its `ir/graph.rs` `ConstraintDependencyGraph` (interprocedural dependency
+  edges with cycle detection and topological order, indices rather than
+  `Rc<RefCell>`) is the shape FR-40's item graph takes.
+- Its `ir/transform.rs` `TransformationSpace` — several candidate Rust
+  types per C construct, each with a cost, "lower cost = more idiomatic",
+  selection ranked by cost — is FR-43's representation dimension. Its Z3
+  validity check is NOT adopted: this project's soundness argument is
+  differential execution against a native build, and adding a solver
+  dependency to decide what a recovering import can answer by attempting
+  the import is a worse trade.
+- Its `analysis/integrated.rs` "OnlyWhenRequired" loop (start conservative,
+  attempt compilation, refine from the errors, repeat to convergence or an
+  iteration cap) is exactly FR-43's search loop, and its iteration cap is
+  why FR-43 is bounded rather than exhaustive.
+
+Its `examples/parse_compilation_database.rs` is the one directly portable
+piece and becomes FR-45.
+
 ## C99 Support Roadmap
 
 Everything the importer must handle before it can claim full C99 language
