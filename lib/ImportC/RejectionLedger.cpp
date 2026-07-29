@@ -13,7 +13,10 @@
 /// the importer's already very large translation units.
 ///
 /// The heuristic is a direct port of `classify_blocker` in
-/// `test/RealWorld/run_realworld.py`. It is duplicated rather than shared
+/// `test/RealWorld/run_realworld.py`, table for table and in the same order:
+/// the system-header symbol, `_BLOCKER_SUBSTRINGS`, `_CXX_BLOCKER_SUBSTRINGS`,
+/// `_NODE_NAMED_RE`, `_AMBIGUOUS_POINTER`, then `other`.
+/// It is duplicated rather than shared
 /// because the two run in different languages at different times (a Python
 /// survey over subprocess stderr vs. an in-process C++ import), and the ONE
 /// thing that must stay in lockstep is the tag vocabulary, not the code. Any
@@ -92,6 +95,59 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
      llvm::StringLiteral("variadic-cross-tu")},
 };
 
+/// The C++-input table (`_CXX_BLOCKER_SUBSTRINGS`), consulted after the table
+/// above and in the survey's order. Every wording here is raised only from a
+/// C++-only code path (a `CXXRecordDecl` walk, `mapType`'s reference case, or
+/// the STL recognition table), so a C input can never match one and the C
+/// corpus's tabulation is unaffected by this table's existence.
+constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
+    {llvm::StringLiteral("base classes are not supported"),
+     llvm::StringLiteral("cxx-inheritance")},
+    {llvm::StringLiteral("user-declared destructor"),
+     llvm::StringLiteral("cxx-destructor")},
+    {llvm::StringLiteral("virtual or unresolved member call"),
+     llvm::StringLiteral("cxx-virtual-call")},
+    {llvm::StringLiteral("unsupported: virtual method"),
+     llvm::StringLiteral("cxx-virtual")},
+    {llvm::StringLiteral("overloaded operator"),
+     llvm::StringLiteral("cxx-operator-overload")},
+    {llvm::StringLiteral("reference types are not yet supported"),
+     llvm::StringLiteral("cxx-references")},
+    {llvm::StringLiteral("is not a recognized STL type"),
+     llvm::StringLiteral("stl-unrecognized-type")},
+    {llvm::StringLiteral("is not a recognized STL method"),
+     llvm::StringLiteral("stl-unrecognized-method")},
+    {llvm::StringLiteral("receiver is not a recognized STL"),
+     llvm::StringLiteral("stl-unrecognized-receiver")},
+    {llvm::StringLiteral("unsupported top-level declaration"),
+     llvm::StringLiteral("unsupported-top-level-decl")},
+};
+
+/// The generic dispatch fallbacks that NAME the offending clang AST node
+/// class (`_NODE_NAMED_RE`). These are language-agnostic — a C input reaches
+/// them too — and refining them from the catch-all `other` into a node-named
+/// tag is what makes the tabulation a directly actionable backlog rather than
+/// one giant bucket. The survey uses `(\w+)` after each prefix; the same
+/// character class is spelled out here.
+struct NodeNamedPrefix {
+  llvm::StringLiteral needle;
+  llvm::StringLiteral tagPrefix;
+};
+constexpr NodeNamedPrefix kNodeNamedPrefixes[] = {
+    {llvm::StringLiteral("unsupported assignable expression: "),
+     llvm::StringLiteral("unsupported-assign-expr:")},
+    {llvm::StringLiteral("unsupported expression: "),
+     llvm::StringLiteral("unsupported-expr:")},
+    {llvm::StringLiteral("unsupported statement: "),
+     llvm::StringLiteral("unsupported-stmt:")},
+};
+
+/// The `\w` character class the survey's node-named patterns use.
+bool isWordChar(char c) {
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') || c == '_';
+}
+
 /// Reads the source line `loc` points at, or an empty string when the file
 /// cannot be read. The survey's `_cited_source_line` does the same over the
 /// `file:line:col` prefix it parses back out of the message; in-process the
@@ -143,6 +199,27 @@ std::string mlir::emitrust::classifyBlocker(llvm::StringRef diagnostic,
   for (const BlockerSubstring &entry : kBlockerSubstrings)
     if (diagnostic.contains(entry.needle))
       return entry.tag.str();
+
+  for (const BlockerSubstring &entry : kCxxBlockerSubstrings)
+    if (diagnostic.contains(entry.needle))
+      return entry.tag.str();
+
+  // The node-named fallbacks: `<prefix><NodeClass>` becomes
+  // `<tag-prefix><NodeClass>`, the node class being the run of word
+  // characters that follows.
+  for (const NodeNamedPrefix &entry : kNodeNamedPrefixes) {
+    size_t start = diagnostic.find(entry.needle);
+    if (start == llvm::StringRef::npos)
+      continue;
+    llvm::StringRef rest = diagnostic.drop_front(start + entry.needle.size());
+    size_t end = 0;
+    while (end != rest.size() && isWordChar(rest[end]))
+      ++end;
+    if (end == 0)
+      continue; // No node class actually named; fall through as the survey's
+                // regex does when it fails to match.
+    return (entry.tagPrefix + rest.take_front(end)).str();
+  }
 
   // Two wordings are raised by several unrelated blockers (a local bound to
   // a `malloc` result, a `strchr` result, and a genuinely unanalyzable

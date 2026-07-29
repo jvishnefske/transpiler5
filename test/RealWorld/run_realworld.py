@@ -45,11 +45,15 @@ Two corpus kinds share this one harness (``--corpus-kind``):
     ``--update``) while also making the checked-in manifest a readable,
     ranked backlog of C++ blockers.
 
-Scoring in ``cpp`` mode is by OUTCOME only. Per-ITEM scoring (how MUCH of a
-project ported, rather than whether all of it did) arrives with FR-44's
-``--incremental`` mode, which is landing on a parallel track; see the
-"FR-44 SEAM" block below for exactly where it plugs in. This runner
-deliberately does NOT guess FR-44's report format.
+Scoring in ``cpp`` mode is by OUTCOME **and**, since FR-44, by ITEM: every
+project is additionally transpiled with ``emitrust-cc --emit=crate
+--incremental --build``, which recovers from the items outside the subset,
+proves the partial crate still BUILDS, and writes an ``emitrust-progress.json``
+whose denominator is the FR-40 project item graph. That per-item score is
+ratcheted against a per-project ``expected-items.txt`` checked in next to the
+project's sources, with the same two-way discipline as the outcome manifest: a
+``ported`` item that stops porting is a regression, and an item that starts
+porting fails until it is ratcheted forward with ``--update``.
 """
 
 import argparse
@@ -78,9 +82,20 @@ MISCOMPILE = "MISCOMPILE"
 #: no out-of-directory headers).
 Program = namedtuple("Program", "name sources include_dirs")
 
-#: One measured outcome. ``items`` is the FR-44 per-item payload; it is
-#: ``None`` until FR-44 lands (see the FR-44 SEAM block).
+#: One measured outcome. ``items`` is the FR-44 per-item payload (an
+#: ``ItemScores``), or ``None`` when per-item scoring was not run or failed.
 Result = namedtuple("Result", "name status tag detail items")
+
+#: The FR-44 per-item payload for one project: ``report`` is the parsed
+#: ``emitrust-progress.json`` (schema ``emitrust-progress/1``; see
+#: tools/emitrust-cc/ProgressReport.h) and ``built`` says whether the partial
+#: crate that report describes actually compiled with ``cargo build --release
+#: --offline``. Both are needed: a per-item score over a crate that does not
+#: build would be a fiction.
+ItemScores = namedtuple("ItemScores", "report built")
+
+#: The per-project per-item ledger, checked in beside the project's sources.
+ITEMS_MANIFEST_NAME = "expected-items.txt"
 
 
 def parse_args(argv):
@@ -428,39 +443,81 @@ def discover_programs(corpus_dir, kind):
 
 
 # ---------------------------------------------------------------------------
-# FR-44 SEAM -- per-item incremental scoring.
+# FR-44 -- per-item incremental scoring.
 #
-# The C++ corpus (FR-46) is graded by whole-project OUTCOME only: a project
-# either transpiles end to end or it does not, and today essentially none of
-# them do. That is a coarse signal -- it cannot distinguish "3 of 40 functions
-# ported" from "0 of 40" -- and the finer one is FR-44's job: an
-# `emitrust-cc --incremental` mode landing on a parallel track that reports
-# per-ITEM (per function / per record) success.
+# The C++ corpus (FR-46) used to be graded by whole-project OUTCOME only: a
+# project either transpiled end to end or it did not, and today most do not.
+# That is a coarse signal -- it cannot distinguish "3 of 40 functions ported"
+# from "0 of 40". FR-44's `emitrust-cc --emit=crate --incremental` supplies
+# the finer one: it recovers from every item outside the subset (stubbing what
+# it can, dropping the rest), emits a crate that still BUILDS, and writes
+# `emitrust-progress.json` next to it -- one record per program item, with the
+# denominator taken from the FR-40 project item graph so it counts what the
+# project HAS rather than what the importer happened to reach.
 #
-# This is the ONE place that mode plugs in. When FR-44 lands:
-#   * `collect_per_item_scores` runs the incremental invocation for a program
-#     and returns its report, in WHATEVER shape FR-44 defines -- that format is
-#     deliberately NOT invented here, and nothing below inspects the payload;
-#   * the returned value rides along in `Result.items`, already threaded
-#     through `run_single_program`, the thread pool, the report loop, and the
-#     manifest writer;
-#   * `write_outcome_manifest` grows a per-item section (its `items` argument
-#     is already plumbed and currently always None), and `ratchet_outcomes`
-#     grows the matching per-item comparison next to the existing per-project
-#     one.
-# No other part of this runner needs to change.
+# `collect_per_item_scores` below runs that invocation and parses the report;
+# the payload rides in `Result.items` and is consumed in three places:
+# `write_outcome_manifest` (an advisory `# ported k/n` comment per project),
+# `ratchet_items` (the authoritative two-way per-item gate against each
+# project's checked-in `expected-items.txt`), and the report loop.
 # ---------------------------------------------------------------------------
-def collect_per_item_scores(tool, program, workdir):
-    """FR-44 SEAM: return the per-item score report for ``program``, or None.
+def collect_per_item_scores(tool, program, workdir, enabled):
+    """Return the FR-44 ``ItemScores`` for ``program``, or None.
 
-    Returns None unconditionally until FR-44's ``--incremental`` mode exists;
-    every consumer treats None as "per-item scoring unavailable".
+    ``enabled`` is false for the C corpus, whose programs are scored by
+    outcome alone; per-item scoring is a C++-subset instrument and running it
+    there would only double every cargo build. A None return means "per-item
+    scoring unavailable" to every consumer, and is also what a transpiler
+    failure or an unparseable report produces -- the incremental mode is meant
+    to survive a partially unsupported project, so its own failure is a real
+    signal rather than something to paper over.
     """
-    del tool, program, workdir  # Unused until FR-44 lands.
-    return None
+    if not enabled:
+        return None
+    name, sources, include_dirs = program
+    crate_dir = os.path.join(workdir, name + ".incremental")
+    if os.path.isdir(crate_dir):
+        shutil.rmtree(crate_dir)
+    include_flags = ["-I" + d for d in include_dirs]
+
+    # --build is part of the measurement, not a nicety: FR-44's headline claim
+    # is that a partially ported project still yields a COMPILING crate, so the
+    # gate proves it on every corpus project on every run.
+    rc, _, _, timed_out = run_command(
+        [tool, "--emit=crate", "--incremental", *sources, *include_flags,
+         "-o", crate_dir, "--build"],
+        TRANSPILE_BUILD_TIMEOUT,
+    )
+    report_path = os.path.join(crate_dir, "emitrust-progress.json")
+    try:
+        with open(report_path, "r", encoding="utf-8") as handle:
+            report = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return ItemScores(report, built=(rc == 0 and not timed_out))
 
 
-def run_single_program(tool, native_cc, native_std, program, workdir):
+def ported_fraction(scores):
+    """(ported, portable) item counts of an ``ItemScores``, or (0, 0)."""
+    if scores is None:
+        return 0, 0
+    totals = scores.report.get("totals", {})
+    return totals.get("ported", 0), totals.get("graph_items", 0)
+
+
+def format_ported_fraction(scores):
+    """'3/8 (37.5%)' for a report, or '-' when there is no per-item score."""
+    if scores is None:
+        return "-"
+    if scores.report.get("denominator_source") != "item-graph":
+        return "n/a (no item graph)"
+    ported, portable = ported_fraction(scores)
+    permille = scores.report.get("totals", {}).get("ported_permille", 0)
+    return "%d/%d (%d.%d%%)" % (ported, portable, permille // 10, permille % 10)
+
+
+def run_single_program(tool, native_cc, native_std, program, workdir,
+                       score_items):
     """Transpile+build, then differentially validate against a native build."""
     name, sources, include_dirs = program
     crate_dir = os.path.join(workdir, name)
@@ -470,9 +527,10 @@ def run_single_program(tool, native_cc, native_std, program, workdir):
 
     def result(status, tag, detail):
         return Result(name, status, tag, detail,
-                      collect_per_item_scores(tool, program, workdir))
+                      collect_per_item_scores(tool, program, workdir,
+                                              score_items))
 
-    rc, _out, stderr, timed_out = run_command(
+    rc, _, stderr, timed_out = run_command(
         [tool, "--emit=crate", *sources, *include_flags, "-o", crate_dir,
          "--build"],
         TRANSPILE_BUILD_TIMEOUT,
@@ -492,14 +550,14 @@ def run_single_program(tool, native_cc, native_std, program, workdir):
 
     # Native oracle: compile the same sources natively and diff stdout.
     native = os.path.join(crate_dir, "native_oracle")
-    rc, _o, nstderr, ntimed = run_command(
+    rc, _, nstderr, ntimed = run_command(
         [native_cc, native_std, "-w", *include_flags, *sources, "-o", native],
         NATIVE_BUILD_TIMEOUT)
     if ntimed or rc != 0:
         return result(MISCOMPILE, "",
                       "native build failed: " + first_line(nstderr))
 
-    n_rc, n_out, _ne, n_timed = run_command([os.path.abspath(native)], RUN_TIMEOUT, cwd=crate_dir)
+    n_rc, n_out, _, n_timed = run_command([os.path.abspath(native)], RUN_TIMEOUT, cwd=crate_dir)
     if n_timed or n_rc != 0:
         return result(MISCOMPILE, "", "native oracle run failed (rc=%s)" % n_rc)
 
@@ -546,9 +604,12 @@ def write_outcome_manifest(path, results):
             "# loudly but does not fail the gate, since it is a heuristic over\n"
             "# diagnostic wording.\n"
             "#\n"
-            "# Per-ITEM scoring (how much of a rejected project ported) is\n"
-            "# FR-44's --incremental mode; see the FR-44 SEAM block in\n"
-            "# run_realworld.py. No per-item section exists yet.\n"
+            "# The trailing '# ported k/n' comment is FR-44's per-item score,\n"
+            "# advisory here and ignored by the parser: the AUTHORITATIVE\n"
+            "# per-item ledger is each project's own expected-items.txt, next\n"
+            "# to its sources. It is repeated on this line so the manifest\n"
+            "# reads as a ranked backlog -- a REJECTED project at 6/8 items is\n"
+            "# a very different backlog entry from one at 0/40.\n"
             "#\n"
             "# Regenerated via: run_realworld.py ... --manifest-format outcomes"
             " --update\n"
@@ -557,9 +618,10 @@ def write_outcome_manifest(path, results):
             line = "%s %s" % (entry.name, entry.status)
             if entry.tag:
                 line += " " + entry.tag
+            if entry.items is not None:
+                ported, portable = ported_fraction(entry.items)
+                line += "  # ported %d/%d" % (ported, portable)
             handle.write(line + "\n")
-            # FR-44 SEAM: `entry.items`, when non-None, gets its per-item lines
-            # written here under this project's line.
 
 
 def load_outcome_manifest(path):
@@ -634,6 +696,148 @@ def ratchet_outcomes(manifest_path, results):
     return failures, notices
 
 
+def items_manifest_path(corpus_dir, name):
+    """The per-project FR-44 item ledger, beside that project's sources."""
+    return os.path.join(corpus_dir, name, ITEMS_MANIFEST_NAME)
+
+
+def write_items_manifest(path, name, scores):
+    """Write one project's '<symbol> <kind> <status>' per-item ledger.
+
+    Only the FR-40 item-graph items are recorded. The report's
+    ``off_graph_items`` -- rejected C++ member functions, anonymous and
+    block-scope records, everything ItemGraph.h documents as unmodelled -- are
+    deliberately NOT ratcheted: their symbols are not unique (three classes may
+    each define ``area_x100``) so the only total key includes an absolute
+    source path, which cannot be checked in.
+    """
+    items = scores.report.get("items", [])
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(
+            "# EmitRust per-item porting ledger for RealWorld C++ project"
+            " '%s' (FR-44).\n" % name
+            + "#\n"
+            "# One line per item of the project's FR-40 item graph, as\n"
+            "# '<symbol> <kind> <status>', sorted by symbol. Status is one of\n"
+            "# ported / stubbed / dropped / missing / declared; see\n"
+            "# tools/emitrust-cc/ProgressReport.h. Measured by\n"
+            "# 'emitrust-cc --emit=crate --incremental', whose crate is also\n"
+            "# built on every run -- a partially ported project must still\n"
+            "# COMPILE.\n"
+            "#\n"
+            "# Like the outcome manifest, this is an honest baseline and a\n"
+            "# backlog, not a conformance target, and the ratchet is two-way:\n"
+            "# an item that stops porting fails the gate as a regression, and\n"
+            "# an item that starts porting fails until it is ratcheted\n"
+            "# forward. A change between two NON-ported statuses (dropped\n"
+            "# <-> stubbed) is reported as advisory drift.\n"
+            "#\n"
+            "# Regenerated via: run_realworld.py ... --manifest-format outcomes"
+            " --update\n"
+        )
+        for item in sorted(items, key=lambda entry: entry["symbol"]):
+            handle.write("%s %s %s\n"
+                         % (item["symbol"], item["kind"] or "-",
+                            item["status"]))
+
+
+def load_items_manifest(path):
+    """Parse a per-item ledger into {symbol: (kind, status)}."""
+    expected = {}
+    with open(path, "r", encoding="utf-8") as handle:
+        for lineno, line in enumerate(handle, start=1):
+            stripped = line.split("#", 1)[0].strip()
+            if not stripped:
+                continue
+            fields = stripped.split()
+            if len(fields) != 3:
+                raise SystemExit("error: %s:%d: expected"
+                                 " '<symbol> <kind> <status>'" % (path, lineno))
+            expected[fields[0]] = (fields[1], fields[2])
+    return expected
+
+
+def ratchet_items(corpus_dir, results):
+    """Compare each project's measured per-item scores against its ledger.
+
+    Returns (failures, notices), matching ``ratchet_outcomes``: failures fail
+    the gate, notices are advisory drift.
+    """
+    failures = []
+    notices = []
+    for entry in sorted(results):
+        scores = entry.items
+        if scores is None:
+            failures.append("%s: no per-item score -- 'emitrust-cc"
+                            " --emit=crate --incremental' produced no readable"
+                            " emitrust-progress.json. Incremental mode is"
+                            " supposed to survive an unsupported project."
+                            % entry.name)
+            continue
+        if not scores.built:
+            failures.append("%s: the --incremental crate does NOT build."
+                            " A partially ported project must still compile;"
+                            " that is the whole claim of FR-44." % entry.name)
+        if scores.report.get("denominator_source") != "item-graph":
+            failures.append("%s: the project item graph could not be built, so"
+                            " the per-item score has no denominator." % entry.name)
+            continue
+
+        path = items_manifest_path(corpus_dir, entry.name)
+        if not os.path.isfile(path):
+            failures.append("%s: missing per-item ledger %s. Re-run with"
+                            " --update to record the baseline."
+                            % (entry.name, path))
+            continue
+        expected = load_items_manifest(path)
+        measured = {item["symbol"]: (item["kind"] or "-", item["status"])
+                    for item in scores.report.get("items", [])}
+
+        gone = sorted(set(expected) - set(measured))
+        if gone:
+            failures.append("%s: %d ledger item(s) no longer in the project:"
+                            " %s. Re-run with --update."
+                            % (entry.name, len(gone), ", ".join(gone)))
+        fresh = sorted(set(measured) - set(expected))
+        if fresh:
+            failures.append("%s: %d project item(s) missing from the ledger:"
+                            " %s. Re-run with --update."
+                            % (entry.name, len(fresh), ", ".join(fresh)))
+
+        regressions = []
+        improvements = []
+        for symbol in sorted(set(expected) & set(measured)):
+            want_kind, want_status = expected[symbol]
+            got_kind, got_status = measured[symbol]
+            if got_kind != want_kind:
+                notices.append("%s: %s kind drifted %r -> %r (advisory;"
+                               " --update refreshes it)"
+                               % (entry.name, symbol, want_kind, got_kind))
+            if got_status == want_status:
+                continue
+            if want_status == "ported":
+                regressions.append("%s: %s -> %s"
+                                   % (symbol, want_status, got_status))
+            elif got_status == "ported":
+                improvements.append("%s: %s -> %s"
+                                    % (symbol, want_status, got_status))
+            else:
+                notices.append("%s: %s status drifted %s -> %s (both unported;"
+                               " advisory, --update refreshes it)"
+                               % (entry.name, symbol, want_status, got_status))
+        if regressions:
+            failures.append("%s: %d item regression(s) -- expected ported, no"
+                            " longer: %s"
+                            % (entry.name, len(regressions),
+                               "; ".join(regressions)))
+        if improvements:
+            failures.append("%s: %d item(s) newly ported and not in the ledger:"
+                            " %s. Re-run with --update to ratchet forward."
+                            % (entry.name, len(improvements),
+                               "; ".join(improvements)))
+    return failures, notices
+
+
 def main(argv):
     args = parse_args(argv)
     tool = resolve_tool(args.emitrust_cc)
@@ -649,22 +853,33 @@ def main(argv):
     os.makedirs(args.workdir, exist_ok=True)
     quarantined = load_name_list(args.known_miscompiles, required=False) if args.known_miscompiles else set()
 
+    # FR-44 per-item scoring is a C++-subset instrument: the C corpus is graded
+    # by outcome alone, and running the extra incremental cargo build on each
+    # of its programs would only double the gate's wall clock.
+    score_items = args.corpus_kind == "cpp"
+
     workers = min(8, os.cpu_count() or 1)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(
             lambda p: run_single_program(tool, native_cc, native_std, p,
-                                         args.workdir), programs))
+                                         args.workdir, score_items), programs))
 
     transpiled = {e.name for e in results if e.status == TRANSPILED}
     rejected = [e for e in results if e.status == REJECTED]
     miscompiles = [e for e in results if e.status == MISCOMPILE]
 
-    # Per-program report, sorted by name.
+    # Per-program report, sorted by name. The FR-44 ported fraction rides on
+    # the TRANSPILED/REJECTED lines: for a rejected project it is the whole
+    # point of the run, and for a transpiled one it is the regression guard
+    # that says the whole project really did port.
     for entry in sorted(results):
+        suffix = ("  ported=%s" % format_ported_fraction(entry.items)
+                  if entry.items is not None else "")
         if entry.status == TRANSPILED:
-            print("TRANSPILED  %s" % entry.name)
+            print("TRANSPILED  %s%s" % (entry.name, suffix))
         elif entry.status == REJECTED:
-            print("REJECTED    %s  [%s]  %s" % (entry.name, entry.tag, entry.detail))
+            print("REJECTED    %s  [%s]%s  %s"
+                  % (entry.name, entry.tag, suffix, entry.detail))
         else:
             mark = "known, quarantined" if entry.name in quarantined else "NEW"
             print("MISCOMPILE (%s): %s" % (mark, entry.name))
@@ -693,14 +908,26 @@ def main(argv):
             write_outcome_manifest(args.manifest, results)
             print("manifest updated: %s (%d project outcomes)"
                   % (args.manifest, len(results)))
+            for entry in sorted(results):
+                if entry.items is None:
+                    print("note: %s has no per-item score; its %s is left"
+                          " untouched" % (entry.name, ITEMS_MANIFEST_NAME))
+                    continue
+                path = items_manifest_path(args.corpus, entry.name)
+                write_items_manifest(path, entry.name, entry.items)
+                print("item ledger updated: %s (%d items, %s ported)"
+                      % (path, len(entry.items.report.get("items", [])),
+                         format_ported_fraction(entry.items)))
         else:
             write_name_manifest(args.manifest, transpiled)
             print("manifest updated: %s (%d transpiled)" % (args.manifest, len(transpiled)))
     elif args.manifest_format == "outcomes":
         ratchet_failures, notices = ratchet_outcomes(args.manifest, results)
-        for notice in notices:
+        item_failures, item_notices = ratchet_items(args.corpus, results)
+        for notice in notices + item_notices:
             print("note: " + notice)
         failures.extend(ratchet_failures)
+        failures.extend(item_failures)
     else:
         manifest = load_name_list(args.manifest, required=True)
         regressions = sorted(manifest - transpiled)
@@ -716,6 +943,16 @@ def main(argv):
     print("\nsummary: total=%d transpiled=%d rejected=%d miscompiled=%d (quarantined=%d)"
           % (len(results), len(transpiled), len(rejected), len(miscompiles),
              len(miscompiles) - len(new_miscompiles)))
+
+    scored = [e for e in results if e.items is not None]
+    if scored:
+        corpus_ported = sum(ported_fraction(e.items)[0] for e in scored)
+        corpus_items = sum(ported_fraction(e.items)[1] for e in scored)
+        permille = (1000 * corpus_ported // corpus_items) if corpus_items else 0
+        print("per-item (FR-44): %d/%d item(s) ported across %d scored"
+              " project(s) (%d.%d%%)"
+              % (corpus_ported, corpus_items, len(scored), permille // 10,
+                 permille % 10))
 
     if failures:
         for failure in failures:

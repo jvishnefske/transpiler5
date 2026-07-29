@@ -1,0 +1,29 @@
+# EmitRust per-item porting ledger for RealWorld C++ project 'fixed-stats' (FR-44).
+#
+# One line per item of the project's FR-40 item graph, as
+# '<symbol> <kind> <status>', sorted by symbol. Status is one of
+# ported / stubbed / dropped / missing / declared; see
+# tools/emitrust-cc/ProgressReport.h. Measured by
+# 'emitrust-cc --emit=crate --incremental', whose crate is also
+# built on every run -- a partially ported project must still
+# COMPILE.
+#
+# Like the outcome manifest, this is an honest baseline and a
+# backlog, not a conformance target, and the ratchet is two-way:
+# an item that stops porting fails the gate as a regression, and
+# an item that starts porting fails until it is ratcheted
+# forward. A change between two NON-ported statuses (dropped
+# <-> stubbed) is reported as advisory drift.
+#
+# Regenerated via: run_realworld.py ... --manifest-format outcomes --update
+Accum record ported
+c_main function ported
+ns_fixed_div_count function ported
+ns_fixed_from_int function ported
+ns_fixed_mul function ported
+ns_fixed_to_int_round function ported
+ns_stats_mean function ported
+ns_stats_push function ported
+ns_stats_reset function ported
+ns_stats_spread function ported
+scaled_reading function ported
