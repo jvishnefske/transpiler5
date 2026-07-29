@@ -63,16 +63,27 @@ int main(void) {
 // PORTING-NEXT: | dropped | 1 |
 // PORTING-NEXT: | missing | 0 |
 // PORTING-NEXT: | declared | 0 |
-// PORTING: ## Blockers, most items first
+// FR-49: this C project has no cascade to attribute. The FR-41 probe
+// deliberately UNDER-approximates and leaves `_Complex` and `volatile`
+// Green, so no item here has a poison chain and every item is its own root
+// -- which makes the two tables identical, tag for tag and count for count.
+// That is the documented degradation, not a special case, and it is what
+// keeps the C corpus's ranked backlog exactly as it was before FR-49.
+// PORTING: ## Root blockers, most items first
+// PORTING: | other | 3 |
+// PORTING: ## Direct blockers, as reported
+// PORTING: | other | 3 |
 //
 // Items sort unported-first and cluster by blocker, so the table reads as a
 // work queue: dropped, then stubbed, then ported, alphabetical within each.
+// Each rejected row carries its root blocker and the one-element blame chain
+// that says the item is its own root; a ported row carries neither.
 // PORTING: ## Project items
-// PORTING: | dropped | red | `widen` | function |
-// PORTING: | stubbed | yellow | `c_main` | function |
-// PORTING: | stubbed | yellow | `scaled` | function |
-// PORTING: | ported | green | `Pair` | record | - | - |
-// PORTING: | ported | green | `add` | function | - | - |
+// PORTING: | dropped | red | `widen` | function | other | widen | other |
+// PORTING: | stubbed | yellow | `c_main` | function | other | c_main | other |
+// PORTING: | stubbed | yellow | `scaled` | function | other | scaled | other |
+// PORTING: | ported | green | `Pair` | record | - | - | - | - |
+// PORTING: | ported | green | `add` | function | - | - | - | - |
 
 // JSON: "schema": "emitrust-progress/1"
 // JSON: "crate": "incremental"
@@ -85,9 +96,23 @@ int main(void) {
 // JSON-NEXT: "declared": 0
 // JSON-NEXT: "off_graph_rejected": 0
 // JSON-NEXT: "ported_permille": 400
+//
+// FR-49's additions are strictly additive, so the schema id is unchanged and
+// `blockers` still carries the DIRECT tally; `root_blockers` is the new key
+// beside it, with the same contents here because nothing cascades.
+// JSON: "blockers": [
+// JSON-NEXT: { "tag": "other", "count": 3 }
+// JSON-NEXT: ],
+// JSON-NEXT: "root_blockers": [
+// JSON-NEXT: { "tag": "other", "count": 3 }
+// JSON-NEXT: ],
 // JSON: "symbol": "widen"
 // JSON: "status": "dropped"
 // JSON: "color": "red"
+// JSON: "blocker": "other"
+// JSON: "root_blocker": "other"
+// JSON-NEXT: "attributed_via": ""
+// JSON-NEXT: "blame_chain": ["widen"]
 
 // STRICT: error: unsupported: volatile-qualified type
 

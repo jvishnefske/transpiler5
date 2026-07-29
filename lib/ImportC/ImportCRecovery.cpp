@@ -229,6 +229,37 @@ std::string declLedgerName(const clang::Decl *decl) {
   return "<anonymous>";
 }
 
+/// FR-49: the FR-40 item-graph node key of the record enclosing `decl`, when
+/// `decl` is an out-of-line C++ member function of a file-scope class, and
+/// the empty string for every other declaration.
+///
+/// This is the join key `RejectedItem::ownerSymbol` documents: a member
+/// function is not a graph node, so a rejection of one can only be credited
+/// to a root cause through its CLASS, which is a node, is colored by FR-41,
+/// and carries the poison chain.
+///
+/// The naming deliberately reproduces `ItemGraphBuilder::recordSymbolFor`
+/// rather than approximating it — the same `recordRustName` on the same
+/// definition, and the same "file-scope only" screen — so the key produced
+/// here IS a node key whenever it is non-empty. A class the graph would not
+/// model (block-scope, or nested in a namespace, or with no definition in
+/// this TU) yields the empty string, and the report falls back to the direct
+/// blocker rather than attributing to something that is not in the graph.
+std::string declOwnerSymbol(const clang::Decl *decl) {
+  const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl);
+  if (!method)
+    return {};
+  const clang::CXXRecordDecl *parent = method->getParent();
+  if (!parent)
+    return {};
+  const clang::RecordDecl *definition = parent->getDefinition();
+  if (!definition)
+    return {};
+  if (!definition->getDeclContext()->getRedeclContext()->isFileContext())
+    return {};
+  return recordRustName(definition).str();
+}
+
 /// Re-emits a captured diagnostic at its original severity. Used only on the
 /// (never-observed) path where an import emitted an error and still reported
 /// success: swallowing it there would be a silent behavior change.
@@ -411,8 +442,8 @@ CImporter::importTopLevelDeclRecovering(const clang::Decl *decl) {
 
   if (rejectionLedger)
     rejectionLedger->record(RejectedItem{symbol, loc, reason,
-                                         classifyBlocker(reason, loc),
-                                         stubbed});
+                                         classifyBlocker(reason, loc), stubbed,
+                                         declOwnerSymbol(decl)});
   // The rejection is re-reported as a WARNING: the item is gone from the
   // module, but the compile as a whole succeeded, and a driver that exits 0
   // with a partial module must not have printed an error on the way.
