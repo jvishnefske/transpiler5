@@ -373,6 +373,8 @@
 
 #include "CImporterInternal.h"
 
+#include "EmitRust/ClangProjectParser.h"
+
 #include "llvm/Support/Path.h"
 
 using namespace mlir;
@@ -5540,79 +5542,6 @@ void loadImportDialects(MLIRContext &context) {
                       cf::ControlFlowDialect>();
 }
 
-/// Assembles the clang command line for one input, selecting the C or C++
-/// frontend from `isCxx` (W2.0 per-input language selection): plain C
-/// stays `-std=c11` (historical, unchanged); C++ opens with `-x c++
-/// -std=c++17`, entirely DROPPING `-std=c11` (clang hard-errors on
-/// `-std=c11 -x c++`, which is exactly why this used to reject every
-/// `.cpp` input outright). Both add clang's builtin `-resource-dir`
-/// (needed for system headers such as `<stdint.h>`) taken from the
-/// `EMITRUST_RESOURCE_DIR` environment variable or, failing that, the
-/// compile-time `EMITRUST_CLANG_RESOURCE_DIR` macro when defined, and
-/// finally the caller's extra arguments in order.
-std::vector<std::string>
-buildCommandLine(bool isCxx, llvm::ArrayRef<std::string> extraClangArgs) {
-  // C89-era programs (the c-testsuite corpus, e.g. 00144's
-  // `q = i ? 0 : 0`) assign integer expressions to pointers, which clang
-  // >= 15 hard-errors by default; demote it back to the historical
-  // warning — the importer itself classifies integer-to-pointer traffic
-  // and rejects the unsupported shapes with located diagnostics. The same
-  // demotion applies to the C++ frontend for symmetry (the importer's own
-  // classification is language-agnostic).
-  std::vector<std::string> commandLine =
-      isCxx ? std::vector<std::string>{"-x", "c++", "-std=c++17",
-                                       "-Wno-error=int-conversion"}
-            : std::vector<std::string>{"-std=c11", "-Wno-error=int-conversion"};
-  std::string resourceDir;
-  if (const char *env = std::getenv("EMITRUST_RESOURCE_DIR"))
-    resourceDir = env;
-#ifdef EMITRUST_CLANG_RESOURCE_DIR
-  if (resourceDir.empty())
-    resourceDir = EMITRUST_CLANG_RESOURCE_DIR;
-#endif
-  if (!resourceDir.empty())
-    commandLine.push_back("-resource-dir=" + resourceDir);
-  commandLine.insert(commandLine.end(), extraClangArgs.begin(),
-                     extraClangArgs.end());
-  return commandLine;
-}
-
-/// True when `path`'s extension marks it as a C++ source: `.cpp`, `.cc`,
-/// `.cxx`, `.C`, `.c++`, or `.hpp` (W2.0 per-input language selection).
-/// Anything else (including a bare `.c` or no extension) stays C.
-bool isCxxSourcePath(llvm::StringRef path) {
-  llvm::StringRef ext = llvm::sys::path::extension(path);
-  return ext == ".cpp" || ext == ".cc" || ext == ".cxx" || ext == ".C" ||
-        ext == ".c++" || ext == ".hpp";
-}
-
-/// A `CompilationDatabase` that selects the C or C++ command line
-/// (`buildCommandLine`) per file by extension (`isCxxSourcePath`),
-/// delegating to one `FixedCompilationDatabase` per language (their
-/// well-tested `CompileCommand` construction is reused verbatim — only
-/// which instance answers a given file differs). This is what lets
-/// `importCProject`'s multi-file `ClangTool` compile each input in its
-/// own language mode: a mixed C+C++ project is out of scope for W2.0 (no
-/// cross-language linkage), but nothing stops each file from compiling
-/// correctly in isolation.
-class PerFileCompilationDatabase : public clang::tooling::CompilationDatabase {
-public:
-  explicit PerFileCompilationDatabase(
-      llvm::ArrayRef<std::string> extraClangArgs)
-      : cDatabase(".", buildCommandLine(/*isCxx=*/false, extraClangArgs)),
-        cxxDatabase(".", buildCommandLine(/*isCxx=*/true, extraClangArgs)) {}
-
-  std::vector<clang::tooling::CompileCommand>
-  getCompileCommands(llvm::StringRef filePath) const override {
-    return (isCxxSourcePath(filePath) ? cxxDatabase : cDatabase)
-        .getCompileCommands(filePath);
-  }
-
-private:
-  clang::tooling::FixedCompilationDatabase cDatabase;
-  clang::tooling::FixedCompilationDatabase cxxDatabase;
-};
-
 } // namespace
 
 OwningOpRef<ModuleOp>
@@ -5623,12 +5552,12 @@ mlir::emitrust::importC(llvm::StringRef path,
 
   // Imperative shell: parse the file with clang. Parse diagnostics are
   // printed to stderr by clang's own diagnostic machinery. The language
-  // (C or C++) is selected per input by extension (W2.0).
-  PerFileCompilationDatabase compilations(extraClangArgs);
+  // (C or C++) is selected per input by extension (W2.0). The command-line
+  // assembly and the ClangTool run live in ClangProjectParser.cpp, shared
+  // verbatim with the FR-40 item graph so both see the same project.
   std::vector<std::string> sources{path.str()};
-  clang::tooling::ClangTool tool(compilations, sources);
   std::vector<std::unique_ptr<clang::ASTUnit>> asts;
-  int status = tool.buildASTs(asts);
+  int status = buildProjectASTs(sources, extraClangArgs, asts);
   if (asts.size() != 1 || !asts.front()) {
     emitError(UnknownLoc::get(&context))
         << "failed to parse C input '" << path << "'";
@@ -5675,12 +5604,11 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
   // Imperative shell: parse every source as an independent translation
   // unit. Each input selects its own language by extension (W2.0): a
   // mixed C+C++ project compiles each file correctly in isolation, though
-  // mixing them into one program stays out of scope.
-  PerFileCompilationDatabase compilations(extraClangArgs);
-  std::vector<std::string> sources(paths.begin(), paths.end());
-  clang::tooling::ClangTool tool(compilations, sources);
+  // mixing them into one program stays out of scope. See
+  // ClangProjectParser.cpp for the command-line assembly, shared verbatim
+  // with the FR-40 item graph.
   std::vector<std::unique_ptr<clang::ASTUnit>> asts;
-  int status = tool.buildASTs(asts);
+  int status = buildProjectASTs(paths, extraClangArgs, asts);
   if (asts.size() != paths.size()) {
     emitError(UnknownLoc::get(&context))
         << "failed to parse one or more C inputs";
