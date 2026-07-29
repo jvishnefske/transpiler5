@@ -37,6 +37,7 @@ set(LIBS
 add_llvm_executable(emitrust-cc
   emitrust-cc.cpp
   CrateEmitter.cpp
+  ProgressReport.cpp
   )
 llvm_update_compile_flags(emitrust-cc)
 target_link_libraries(emitrust-cc PRIVATE ${LIBS})
