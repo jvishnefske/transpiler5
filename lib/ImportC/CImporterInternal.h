@@ -1280,6 +1280,18 @@ public:
     rejectionLedger = &ledger;
   }
 
+  /// Restricts the import to the items a search state admits (FR-43):
+  /// `excluded` holds FR-40 item-graph node keys that must NOT be imported.
+  ///
+  /// Only meaningful together with `enableRecovery` — the substitution an
+  /// excluded item takes IS the recovery path — and `importCProject` calls
+  /// it only when both are asked for. `excluded` must outlive the import;
+  /// the importer holds a pointer so the (possibly large) set is not copied
+  /// per translation unit.
+  void setExcludedItems(const std::set<std::string> &excluded) {
+    excludedItems = &excluded;
+  }
+
   /// Imports every supported top-level declaration of `context`'s translation
   /// unit into the module: complete struct definitions (bare anonymous
   /// structs under synthesized shape-keyed `Anon<n>` names), function
@@ -1473,6 +1485,26 @@ private:
   /// so `importDeclsIn`'s loop keeps its ordinary `failed(...) -> return
   /// failure()` shape.
   LogicalResult importTopLevelDeclRecovering(const clang::Decl *decl);
+
+  /// FR-43: the item-graph key of `decl` when the current search state
+  /// EXCLUDES it, and the empty string otherwise (including when no search
+  /// state was set at all).
+  ///
+  /// The key is computed with exactly the primitives the item graph uses —
+  /// `cFunctionSymbolName`, `cGlobalSymbolName`, `recordRustName`, and the
+  /// enum's own name, all from `EmitRust/CSymbolNaming.h`, under this TU's
+  /// `currentTuTag` — so "the graph node named X" and "the declaration this
+  /// returns X for" are the same item by construction, the same way FR-40
+  /// makes a node key and an emitted symbol the same thing. Declaration
+  /// kinds the graph does not model (C++ member functions, block-scope and
+  /// anonymous records, typedefs) have no key and are therefore never
+  /// excludable: a search state can only speak about items the graph named,
+  /// which is exactly the vocabulary FR-41's coloring and FR-44's report use
+  /// as well.
+  ///
+  /// \param decl the top-level declaration about to be imported.
+  /// \returns the excluded item's key, or an empty string.
+  std::string frontierExcludedSymbol(const clang::Decl *decl) const;
 
   /// Emits a stub for a rejected function: a `func::FuncOp` carrying the
   /// real mapped signature whose whole body is
@@ -4254,6 +4286,11 @@ private:
   /// every code path that reads it is guarded so that a non-recovering
   /// import executes exactly the instructions it always did.
   bool recoverFromRejections = false;
+  /// The FR-43 search state's complement — item-graph keys that must not be
+  /// imported; null (the default) means "admit everything the importer can
+  /// take", i.e. exactly FR-42's behavior. Read only from
+  /// `frontierExcludedSymbol`, which is called only under recovery.
+  const std::set<std::string> *excludedItems = nullptr;
   /// Where recovered rejections are recorded; null unless recovery is on.
   emitrust::RejectionLedger *rejectionLedger = nullptr;
   /// The checkpoint of the item currently being imported under recovery, or

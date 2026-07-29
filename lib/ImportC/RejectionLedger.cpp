@@ -179,6 +179,18 @@ std::string citedSourceLine(Location loc) {
 
 std::string mlir::emitrust::classifyBlocker(llvm::StringRef diagnostic,
                                             Location loc) {
+  // FR-43's synthetic rejection, tested FIRST and outside the shared table.
+  // It is the one wording that does not come from a C construct at all: the
+  // item was excluded by a search state, so no blocker of the project's is to
+  // blame and no heuristic below could say anything true about it. The tag is
+  // deliberately absent from `classify_blocker` in run_realworld.py — that
+  // twin tags whole-PROGRAM rejections observed through a subprocess, and a
+  // search exclusion is never one — so the two vocabularies stay in step.
+  static constexpr llvm::StringLiteral kSearchExcluded =
+      "excluded by the search state";
+  if (diagnostic.starts_with(kSearchExcluded))
+    return "search-excluded";
+
   // System-header rejections name the symbol they tripped over; the name is
   // the most informative tag available, so it is parsed out first
   // (`_SYS_HEADER_RE`). The wording is fixed by `rejectSystemHeaderUse`.

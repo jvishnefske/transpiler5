@@ -49,6 +49,15 @@
 /// in on demand stay, because their name registries have no rollback and an
 /// erased definition with a live registry entry would be a dangling symbol
 /// instead of a dead one.
+///
+/// FR-43 rides on exactly this machinery. A frontier-search STATE is a set
+/// of admitted items, and probing one means importing the project with the
+/// complement EXCLUDED (`ImportOptions::excludedItems`). An excluded item is
+/// not a new outcome: it is fed into the rejection path above with a
+/// synthetic reason, so it stubs if its signature maps and drops otherwise,
+/// exactly like a genuinely unsupported item. That is what keeps the search
+/// from needing its own emission model — every state it can propose is a
+/// module the recovering importer already knows how to build.
 //
 //===----------------------------------------------------------------------===//
 
@@ -249,6 +258,48 @@ void discardClones(SmallVectorImpl<Operation *> &clones) {
 
 } // namespace
 
+//===----------------------------------------------------------------------===//
+// The FR-43 admitted-set filter
+//===----------------------------------------------------------------------===//
+
+std::string CImporter::frontierExcludedSymbol(const clang::Decl *decl) const {
+  if (!excludedItems || excludedItems->empty())
+    return {};
+  // The key derivation MIRRORS `ItemGraphBuilder::collectItems` decision for
+  // decision, including its skips: a declaration the graph does not turn into
+  // a node has no key, so it cannot be named by a search state and is left
+  // alone here. Keeping the two in the same shape (same order of kinds, same
+  // guards) is what makes "the graph's vocabulary" a real invariant rather
+  // than a coincidence.
+  std::string symbol;
+  if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+    // C++ member functions are not graph items (their emitted name depends on
+    // the owning class's assigned struct name), so they are never excludable;
+    // dropping the CLASS is how a search state removes them.
+    if (llvm::isa<clang::CXXMethodDecl>(func))
+      return {};
+    symbol = cFunctionSymbolName(func, currentTuTag);
+  } else if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
+    const clang::RecordDecl *definition = record->getDefinition();
+    if (!definition ||
+        !definition->getDeclContext()->getRedeclContext()->isFileContext())
+      return {};
+    symbol = recordRustName(definition).str();
+  } else if (const auto *enumDecl = llvm::dyn_cast<clang::EnumDecl>(decl)) {
+    const clang::EnumDecl *definition = enumDecl->getDefinition();
+    if (!definition)
+      return {};
+    symbol = definition->getName().str();
+  } else if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
+    symbol = cGlobalSymbolName(var, currentTuTag);
+  } else {
+    return {};
+  }
+  if (symbol.empty() || !excludedItems->count(symbol))
+    return {};
+  return symbol;
+}
+
 LogicalResult
 CImporter::importTopLevelDeclRecovering(const clang::Decl *decl) {
   // The insertion point is importer-wide state that a failed body import may
@@ -281,7 +332,20 @@ CImporter::importTopLevelDeclRecovering(const clang::Decl *decl) {
   };
 
   LogicalResult result = success();
-  {
+  // FR-43: an item the search state does not admit is not imported at all.
+  // It is turned into a rejection with a synthetic reason and then falls
+  // through the ordinary path below, so it stubs when its signature maps and
+  // drops otherwise — the same two outcomes an unsupported item has, and the
+  // same ledger entry shape, which is what lets FR-44's report describe a
+  // searched build without knowing a search happened.
+  std::string excluded = frontierExcludedSymbol(decl);
+  if (!excluded.empty()) {
+    result = failure();
+    captured.push_back({translateLoc(decl->getLocation()),
+                        DiagnosticSeverity::Error,
+                        "excluded by the search state: item '" + excluded +
+                            "' is not admitted"});
+  } else {
     ScopedDiagnosticHandler handler(builder.getContext(), capture);
     result = importTopLevelDecl(decl);
   }
