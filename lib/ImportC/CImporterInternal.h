@@ -26,6 +26,13 @@
 #ifndef EMITRUST_IMPORTC_CIMPORTERINTERNAL_H
 #define EMITRUST_IMPORTC_CIMPORTERINTERNAL_H
 
+// The pure decl-to-emitted-symbol naming primitives (isRustKeyword,
+// mangleMemberName, recordRustName, namespacePrefix, and the
+// cFunctionSymbolName/cGlobalSymbolName composites `mlirFuncName` and
+// `globalVarSymbolName` are thin wrappers over) live in this shared header
+// so that the FR-40 project item graph names items EXACTLY as the importer
+// emits them, by calling the same code rather than by mirroring it.
+#include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/EmitRustDialect.h"
 #include "EmitRust/EmitRustOps.h"
 #include "EmitRust/EmitRustTypes.h"
@@ -81,6 +88,16 @@
 
 using namespace mlir;
 
+// The shared naming primitives are pulled in by name rather than with a
+// blanket `using namespace mlir::emitrust`, which would also drag in every
+// dialect operation class and make the many deliberate `emitrust::`-
+// qualified spellings in this file ambiguous to read.
+using mlir::emitrust::cFunctionSymbolName;
+using mlir::emitrust::cGlobalSymbolName;
+using mlir::emitrust::isRustKeyword;
+using mlir::emitrust::mangleMemberName;
+using mlir::emitrust::namespacePrefix;
+using mlir::emitrust::recordRustName;
 
 /// Break/continue branch targets for the innermost enclosing loop or switch.
 struct LoopTargets {
@@ -325,44 +342,6 @@ struct GlobalWriteback {
   /// with a non-empty `multiBases`.
   Type multiPointeeType;
 };
-
-/// Returns whether `name` is a Rust keyword (strict or reserved, editions
-/// 2015-2021, plus the contextual `union`) and thus unusable as a Rust item
-/// name. Global variables keep their C spelling verbatim, so colliding
-/// names are rejected instead of being mangled.
-static inline bool isRustKeyword(llvm::StringRef name) {
-  static const llvm::StringSet<> keywords = {
-      // Strict keywords (2015).
-      "as", "break", "const", "continue", "crate", "else", "enum", "extern",
-      "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod",
-      "move", "mut", "pub", "ref", "return", "self", "Self", "static",
-      "struct", "super", "trait", "true", "type", "unsafe", "use", "where",
-      "while",
-      // Strict keywords (2018).
-      "async", "await", "dyn",
-      // Reserved keywords.
-      "abstract", "become", "box", "do", "final", "macro", "override", "priv",
-      "try", "typeof", "unsized", "virtual", "yield",
-      // Contextual keyword that still reads confusingly as an item name.
-      "union"};
-  return keywords.contains(name);
-}
-
-/// Returns the Rust spelling of a struct/union MEMBER name: a spelling that
-/// is a Rust keyword mangles deterministically by appending a single
-/// underscore (`type` -> `type_`, `match` -> `match_`); every other
-/// spelling is kept verbatim. Member names are the one identifier class
-/// that mangles instead of rejecting (C99-45: c-testsuite 00218 declares a
-/// member named `type`): the mangled spelling never leaves the emitted
-/// struct's own field namespace, so no cross-symbol collision policy is
-/// disturbed. Struct/enum/function/global names keep their rejections. A
-/// collision the mangle introduces (a struct declaring both `type` and
-/// `type_`) is rejected where the fields are collected.
-static inline std::string mangleMemberName(llvm::StringRef name) {
-  if (isRustKeyword(name))
-    return (name + "_").str();
-  return name.str();
-}
 
 /// Returns whether `type` is, or contains (through record fields and array
 /// elements, never through pointers), a record with a bit-field member.
@@ -4804,26 +4783,6 @@ static inline bool isUnsignedInt(Type type) {
   return intType && intType.isUnsigned();
 }
 
-/// Returns the C-declared Rust-facing name of a record: its tag name, or,
-/// for a tagless record declared through `typedef struct { ... } T;`, the
-/// typedef name. Returns an empty StringRef for a bare anonymous struct,
-/// for which `importRecord` synthesizes a shape-keyed `Anon<n>` name
-/// (retrieved through `CImporter::emittedRecordName`). The typedef name is
-/// the record's name for all mangling and cross-TU shape-dedup purposes,
-/// exactly like a tagged struct. This is the base spelling only: for
-/// file-scope records `CImporter::structSymbolName` layers the tag-versus-
-/// ordinary-namespace collision renaming on top, and block-scope records
-/// take the `<function>_<tag>` mangle in `importRecord`.
-static inline llvm::StringRef recordRustName(const clang::RecordDecl *record) {
-  llvm::StringRef name = record->getName();
-  if (!name.empty())
-    return name;
-  if (const clang::TypedefNameDecl *typedefName =
-          record->getTypedefNameForAnonDecl())
-    return typedefName->getName();
-  return {};
-}
-
 /// W2.0 C++ input tolerance: whether `init` is exactly the implicit,
 /// no-op default-construction C++ wraps a class-typed declaration with
 /// NO explicit initializer in. `struct Point p;` has no initializer
@@ -4859,34 +4818,6 @@ significantInit(const clang::VarDecl *var) {
   if (init && isVacuousDefaultConstruct(init))
     return nullptr;
   return init;
-}
-
-/// W2.0 C++ input tolerance: the `ns_<name>_`-per-level prefix reflecting
-/// `context`'s enclosing namespace chain, applied to a declaration's
-/// emitted module symbol name (`mlirFuncName`, the global-variable naming
-/// in `importGlobalVar`/`collectOrdinaryNames`) so `ns::foo` never
-/// collides with a top-level `foo`. Built outermost-to-innermost; nested
-/// namespaces compose (`a::b::foo` -> `ns_a_ns_b_foo`). An anonymous
-/// namespace — one synthesized internal-linkage entity per translation
-/// unit, however many `namespace { ... }` blocks reopen it — contributes
-/// the fixed tag `ns_anon_`. `extern "C" { ... }` (`LinkageSpecDecl`) is
-/// transparent: it is not a `NamespaceDecl`, so it is skipped while
-/// walking up and contributes nothing, matching C linkage's unchanged-name
-/// contract. Returns the empty string for plain C input, where no
-/// `NamespaceDecl` ever appears in a `DeclContext` chain.
-static inline std::string namespacePrefix(const clang::DeclContext *context) {
-  llvm::SmallVector<const clang::NamespaceDecl *, 4> chain;
-  for (; context && !context->isTranslationUnit();
-       context = context->getParent())
-    if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(context))
-      chain.push_back(ns);
-  std::string prefix;
-  for (const clang::NamespaceDecl *ns : llvm::reverse(chain)) {
-    prefix += "ns_";
-    prefix += ns->isAnonymousNamespace() ? "anon" : ns->getName().str();
-    prefix += "_";
-  }
-  return prefix;
 }
 
 /// Returns whether the canonical type of `type` is a C pointer type.

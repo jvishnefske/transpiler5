@@ -23,9 +23,12 @@
 using namespace mlir;
 
 std::string CImporter::globalVarSymbolName(const clang::VarDecl *var) const {
-  bool internal = !var->isExternallyVisible();
-  return (internal ? currentTuTag : std::string()) +
-        namespacePrefix(var->getDeclContext()) + var->getName().str();
+  // The rule (per-TU tag on internal linkage, W2.0 namespace flattening
+  // prefix, C spelling otherwise verbatim) lives in the shared
+  // `cGlobalSymbolName`; this method only supplies the importer's current
+  // per-TU tag. Shared so the FR-40 item graph keys its global nodes on the
+  // very same spelling — see EmitRust/CSymbolNaming.h.
+  return cGlobalSymbolName(var, currentTuTag);
 }
 
 LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
