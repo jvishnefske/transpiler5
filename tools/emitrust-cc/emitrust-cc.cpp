@@ -18,6 +18,12 @@
 ///                  from the clang ASTs alone — no import, no pass, no
 ///                  emission — so it is available even for projects the
 ///                  importer rejects;
+///   --emit=coloring
+///                  the FR-41 three-color lattice over that graph (which
+///                  items are inside the supported subset, which are only
+///                  blocked by a stubbable callee, and which are blocked
+///                  outright, each with the chain of items to blame), also
+///                  pure-AST and for the same reason;
 ///   --emit=import  the raw imported MLIR module, before any pass;
 ///   --emit=mlir    the MLIR module after the full pass pipeline;
 ///   --emit=rust    Rust source text (identical to the crate's src/main.rs
@@ -47,6 +53,7 @@
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 #include "EmitRust/ImportC.h"
+#include "EmitRust/Project/ItemColoring.h"
 #include "EmitRust/Project/ItemGraph.h"
 
 #include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
@@ -85,12 +92,19 @@ namespace {
 
 /// The output kinds selectable with --emit.
 ///
-/// `ItemGraph` is the odd one out: every other kind is a stage of the
-/// import-and-lower pipeline, while the item graph is a parallel, pure-AST
-/// analysis that never builds a module. It is handled before the import for
-/// exactly that reason — the graph is meant to be obtainable for a project
-/// the importer cannot yet translate.
-enum class EmitKind { ItemGraph, Import, MLIR, Rust, Crate };
+/// `ItemGraph` and `Coloring` are the odd ones out: every other kind is a
+/// stage of the import-and-lower pipeline, while those two are parallel,
+/// pure-AST analyses that never build a module. They are handled before the
+/// import for exactly that reason — both are meant to be obtainable for a
+/// project the importer cannot yet translate, which for the coloring is the
+/// whole point (an all-Green project needs no coloring).
+enum class EmitKind { ItemGraph, Coloring, Import, MLIR, Rust, Crate };
+
+/// Whether `kind` is one of the pure-AST project analyses, i.e. produced
+/// without an MLIR context, an import, or a pass.
+bool isProjectAnalysis(EmitKind kind) {
+  return kind == EmitKind::ItemGraph || kind == EmitKind::Coloring;
+}
 
 } // namespace
 
@@ -147,6 +161,15 @@ static llvm::cl::opt<EmitKind> emitKind(
                    "line per function/record/enum/global and one 'edge' "
                    "line per dependency, both sorted; computed from the "
                    "clang ASTs without importing"),
+        clEnumValN(EmitKind::Coloring, "coloring",
+                   "Three-color lattice over the item graph (FR-41): one "
+                   "'item' line per function/record/enum/global giving its "
+                   "color (green = it and its whole type closure are inside "
+                   "the supported subset, yellow = it compiles but calls a "
+                   "stubbed function, red = it cannot be emitted), the reason, "
+                   "and for a non-green item the chain of items to blame down "
+                   "to the one construct at fault; then a tally line. Also "
+                   "computed from the clang ASTs without importing"),
         clEnumValN(EmitKind::Import, "import",
                    "Raw imported MLIR module, before any pass (debugging)"),
         clEnumValN(EmitKind::MLIR, "mlir",
@@ -462,21 +485,33 @@ int main(int argc, char **argv) {
                                   inputFilenames.end());
   std::vector<std::string> extra = collectExtraClangArgs();
 
-  // The item graph is a pure-AST analysis: no MLIR context, no import, no
-  // pipeline. Handled here, before any of that machinery is set up, so the
-  // graph of a project the importer would reject is still obtainable.
-  if (emitKind == EmitKind::ItemGraph) {
+  // The item graph and the coloring are pure-AST analyses: no MLIR context,
+  // no import, no pipeline. Handled here, before any of that machinery is set
+  // up, so that both stay obtainable for a project the importer would reject.
+  if (isProjectAnalysis(emitKind)) {
     // --compdb applies here exactly as it does to an import (FR-45): the
-    // graph must see the same project, with the same per-file flags, or it
+    // analysis must see the same project, with the same per-file flags, or it
     // would describe a project the importer never compiles.
     std::string databaseError;
-    mlir::FailureOr<mlir::emitrust::ItemGraph> graph =
-        mlir::emitrust::buildItemGraph(inputs, extra, compilationDatabasePath,
-                                       databaseError);
-    if (mlir::failed(graph)) {
+    std::string text;
+    bool ok = false;
+    if (emitKind == EmitKind::ItemGraph) {
+      mlir::FailureOr<mlir::emitrust::ItemGraph> graph =
+          mlir::emitrust::buildItemGraph(inputs, extra, compilationDatabasePath,
+                                         databaseError);
+      if ((ok = mlir::succeeded(graph)))
+        text = graph->print();
+    } else {
+      mlir::FailureOr<mlir::emitrust::ItemColoring> coloring =
+          mlir::emitrust::colorItems(inputs, extra, compilationDatabasePath,
+                                     databaseError);
+      if ((ok = mlir::succeeded(coloring)))
+        text = coloring->print();
+    }
+    if (!ok) {
       // A database load failure has its own reason; otherwise clang has
-      // already printed the parse diagnostics to stderr and the graph itself
-      // raises nothing else.
+      // already printed the parse diagnostics to stderr and neither analysis
+      // raises anything else.
       if (!databaseError.empty())
         llvm::errs() << compilationDatabasePath
                      << ":1:1: error: cannot load compilation database: "
@@ -485,7 +520,7 @@ int main(int argc, char **argv) {
         llvm::errs() << "error: failed to parse one or more inputs\n";
       return 1;
     }
-    return mlir::failed(writeFile(outputPath, graph->print())) ? 1 : 0;
+    return mlir::failed(writeFile(outputPath, text)) ? 1 : 0;
   }
 
   mlir::MLIRContext context;
@@ -526,6 +561,7 @@ int main(int argc, char **argv) {
 
   switch (emitKind.getValue()) {
   case EmitKind::ItemGraph:
+  case EmitKind::Coloring:
     llvm_unreachable("handled before the import");
   case EmitKind::Import:
     llvm_unreachable("handled before the pipeline");
