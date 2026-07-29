@@ -5069,6 +5069,45 @@ static inline bool isDataPointer(clang::QualType type) {
   return isPointerType(type) && !isFunctionPointer(type);
 }
 
+/// FR-48: the referent type of a C++ LVALUE reference `type`, or a null
+/// QualType when `type` is not one.
+///
+/// An lvalue reference is exactly a data pointer that is non-null, never
+/// reseated, and never subject to arithmetic — a STRICTLY simpler case of
+/// the pointer model, which is why `mapParamType` maps it onto the very
+/// borrow types a `ParamKind::ScalarRef` pointer parameter already uses
+/// instead of growing a parallel path. RVALUE references (`T&&`) are
+/// deliberately NOT reported here: binding one implies a move, and the
+/// model has no ownership transfer to express it with.
+static inline clang::QualType cxxReferentType(clang::QualType type) {
+  if (const auto *ref =
+          type.getCanonicalType()->getAs<clang::LValueReferenceType>())
+    return ref->getPointeeType();
+  return clang::QualType();
+}
+
+/// FR-48: returns whether `decl` is declared with a C++ lvalue reference
+/// type. Such a declaration's `symbols` entry is the BORROW of the
+/// referent, not a place of its own — the same binding a scalar-reference
+/// pointer parameter gets — so its uses dereference once per access
+/// (`emitDeclRefLValue`) exactly the way a `this` receiver does.
+static inline bool isCxxReferenceDecl(const clang::ValueDecl *decl) {
+  return decl && !cxxReferentType(decl->getType()).isNull();
+}
+
+/// The pointee of an `!emitrust.ref<T>` or `!emitrust.mut_ref<T>` value
+/// type, or a null Type for anything else. The single place the two borrow
+/// types are destructured; every consumer of a borrow SSA value (`this`
+/// receivers, scalar-reference pointer parameters, C++ reference
+/// parameters) reaches its referent through this.
+static inline Type borrowPointee(Type type) {
+  if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(type))
+    return mutRef.getPointee();
+  if (auto sharedRef = llvm::dyn_cast<emitrust::RefType>(type))
+    return sharedRef.getPointee();
+  return Type();
+}
+
 /// C99-7 volatile policy: returns whether any level of `type` — the type
 /// itself, an array element, or a pointee at any pointer depth — is
 /// volatile-qualified. A volatile access has no counterpart in the
@@ -5737,14 +5776,32 @@ static inline bool voidParamOnlyTruthTested(const clang::Stmt *stmt,
   return true;
 }
 
-/// Returns the local variable at the root of an address-of call argument
-/// (`&x`, `&s.f`, `&arr[i]`), or null when no single local root is known.
-/// Feeds the same-base aliasing rejection of `emitCall`.
-static inline const clang::VarDecl *addressArgumentRoot(const clang::Expr *expr) {
-  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
-  if (!unary || unary->getOpcode() != clang::UO_AddrOf)
-    return nullptr;
-  const clang::Expr *place = stripTrivia(unary->getSubExpr());
+/// FR-48: the place expression under a C++ reference argument's implicit
+/// adjustments. Binding an `int` lvalue to a `const int &` parameter adds a
+/// `CK_NoOp` cast to the const-qualified type; that cast changes nothing
+/// about WHICH object is named, so both the root walk and the borrow look
+/// straight through it. Only `CK_NoOp` is peeled — an `LValueToRValue`
+/// would mean a genuine value read rather than a place, and peeling it
+/// would silently borrow the wrong thing.
+static inline const clang::Expr *stripLValueNoOp(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    if (cast->getCastKind() != clang::CK_NoOp)
+      break;
+    e = stripTrivia(cast->getSubExpr());
+  }
+  return e;
+}
+
+/// Returns the variable at the root of a PLACE expression (`x`, `s.f`,
+/// `arr[i]`, and chains of those), or null when no single named root is
+/// known. Factored out of `addressArgumentRoot` (FR-48) so a C++ reference
+/// argument, which names the place directly with no address-of node,
+/// identifies its root by exactly the same walk the `&`-spelled C argument
+/// does — one definition of "which object does this borrow name", so both
+/// spellings land in `emitCall`'s same-base aliasing rejection alike.
+static inline const clang::VarDecl *placeExprRoot(const clang::Expr *expr) {
+  const clang::Expr *place = stripLValueNoOp(expr);
   while (true) {
     if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(place)) {
       if (member->isArrow())
@@ -5762,6 +5819,56 @@ static inline const clang::VarDecl *addressArgumentRoot(const clang::Expr *expr)
   if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(place))
     return llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
   return nullptr;
+}
+
+/// FR-48: returns whether `expr` is a place rooted at the current method's
+/// receiver — `*this`, `this->f`, `(*this).f[i]`, and chains of those.
+/// A `VarDecl` root cannot express "the receiver", so the same-object
+/// aliasing check in `emitCXXMemberCall` needs this second rooting test
+/// alongside `placeExprRoot` to cover `m(*this)`.
+static inline bool rootsAtCxxThis(const clang::Expr *expr) {
+  const clang::Expr *place = stripLValueNoOp(expr);
+  while (true) {
+    if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(place);
+        unary && unary->getOpcode() == clang::UO_Deref) {
+      place = stripLValueNoOp(unary->getSubExpr());
+      continue;
+    }
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(place)) {
+      place = stripLValueNoOp(member->getBase());
+      continue;
+    }
+    if (const auto *subscript =
+            llvm::dyn_cast<clang::ArraySubscriptExpr>(place)) {
+      place = stripLValueNoOp(subscript->getBase());
+      continue;
+    }
+    break;
+  }
+  return llvm::isa<clang::CXXThisExpr>(place);
+}
+
+/// Returns the local variable at the root of an address-of call argument
+/// (`&x`, `&s.f`, `&arr[i]`), or null when no single local root is known.
+/// Feeds the same-base aliasing rejection of `emitCall`.
+static inline const clang::VarDecl *
+addressArgumentRoot(const clang::Expr *expr) {
+  const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stripTrivia(expr));
+  if (!unary || unary->getOpcode() != clang::UO_AddrOf)
+    return nullptr;
+  return placeExprRoot(unary->getSubExpr());
+}
+
+/// FR-48: the parameter list a call's arguments bind to, or null when the
+/// callee is not a resolved `FunctionDecl`. A `CXXMemberCallExpr`'s
+/// arguments line up with the method's parameters (the receiver is NOT an
+/// argument), so both call shapes share this accessor.
+static inline const clang::FunctionDecl *
+calleeParamSource(const clang::CallExpr *call) {
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  if (!callee)
+    return nullptr;
+  return callee->getDefinition() ? callee->getDefinition() : callee;
 }
 
 #endif // EMITRUST_IMPORTC_CIMPORTERINTERNAL_H

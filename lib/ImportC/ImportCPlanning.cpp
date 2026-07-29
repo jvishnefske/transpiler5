@@ -1514,6 +1514,26 @@ void CImporter::collectAddressTaken(const clang::Stmt *stmt) {
               unary->getSubExpr()->IgnoreParens()))
         if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
           addressTaken.insert(var);
+  // FR-48: binding a variable to a C++ reference PARAMETER takes its
+  // address just as surely as `&x` does — the call emits an
+  // `emitrust.addr_of` of the variable's place — but C++ spells it with no
+  // operator at all, so this walk would otherwise never see it. Without
+  // the mark the variable stays a promotable rank-0 memref cell, which has
+  // no `!emitrust.lvalue` place for `emitBorrowArgument` to borrow; the
+  // mark forces the same `emitrust.variable` place an `&`-taken C local
+  // already gets. This is the sole planning-side change references need:
+  // the address-taken set is the one fact about a variable that its own
+  // declaration cannot supply, because it is a property of how CALLERS
+  // use it.
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt))
+    if (const clang::FunctionDecl *callee = calleeParamSource(call))
+      for (unsigned index = 0,
+                    count = std::min<unsigned>(call->getNumArgs(),
+                                               callee->getNumParams());
+           index < count; ++index)
+        if (isCxxReferenceDecl(callee->getParamDecl(index)))
+          if (const clang::VarDecl *root = placeExprRoot(call->getArg(index)))
+            addressTaken.insert(root);
   for (const clang::Stmt *child : stmt->children())
     collectAddressTaken(child);
 }

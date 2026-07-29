@@ -12,7 +12,10 @@
 // `CImporter::collectRecordFields` raises before it collects a single field:
 // base classes, user-declared destructors, virtual methods, and overloaded
 // operators. The fifth, a reference type, is `CImporter::mapType`'s and is
-// signature-level, so it costs its callers Red rather than Yellow.
+// signature-level, so it costs its callers Red rather than Yellow. Since
+// FR-48 that fifth screen is POSITION-dependent: a reference RETURN is still
+// screened, a reference PARAMETER is not (it imports as `&T`/`&mut T`), and
+// both halves are pinned below.
 // RUN: emitrust-cc --emit=coloring %s -o - | FileCheck %s
 
 /// Green: a plain data record is the same item whether it is spelled `struct`
@@ -51,11 +54,19 @@ public:
   int key;
 };
 
-/// A reference PARAMETER: signature-level, so no stub can be written either
-/// and `calls_by_ref` is Red rather than Yellow.
-int by_ref(const Plain &p);
+/// A reference RETURN: signature-level, so no stub can be written either and
+/// `calls_by_ref` is Red rather than Yellow.
+const Plain &by_ref(const Plain &p);
 
-int calls_by_ref() { return by_ref(Plain()); }
+/// Green: a reference PARAMETER is no longer screened at all. FR-48 made
+/// `const T&`/`T&` parameters importable (as `&T`/`&mut T`), and screening a
+/// SUPPORTED construct is this probe's unsafe direction -- it would color a
+/// portable item Red and drag every caller down with it. Pinned green here
+/// precisely because the screen it used to trip is still in the table for the
+/// other reference positions.
+int by_ref_param(const Plain &p);
+
+int calls_by_ref() { return by_ref(Plain()).v + by_ref_param(Plain()); }
 
 /// A Red record in the signature: same effect, reached through the record.
 int uses_virt(Virt *v);
@@ -77,6 +88,7 @@ int main() { return calls_by_ref() + calls_uses_owned(); }
 // CHECK-NEXT: item Plain kind=record color=green reason=admissible
 // CHECK-NEXT: item Virt kind=record color=red reason=inadmissible construct=virtual-method
 // CHECK-NEXT: item by_ref kind=function color=red reason=inadmissible construct=reference-type
+// CHECK-NEXT: item by_ref_param kind=function color=green reason=admissible
 // `calls_by_ref` is Red (its callee has no stub) but its OWN signature is
 // clean, so it is stubbable and `c_main` above it is only Yellow — Red travels
 // arbitrarily far, unstubbability exactly one hop.
@@ -85,5 +97,5 @@ int main() { return calls_by_ref() + calls_uses_owned(); }
 // CHECK-NEXT: item calls_uses_owned kind=function color=yellow reason=stub-callee via=uses_owned edge=Calls chain=calls_uses_owned->uses_owned->Owned construct=destructor
 // CHECK-NEXT: item uses_owned kind=function color=red reason=red-type via=Owned edge=BodyType chain=uses_owned->Owned construct=destructor
 // CHECK-NEXT: item uses_virt kind=function color=red reason=red-type via=Virt edge=SigType chain=uses_virt->Virt construct=virtual-method
-// CHECK-NEXT: tally green=1 yellow=2 red=8
+// CHECK-NEXT: tally green=2 yellow=2 red=8
 // CHECK-NOT:  item

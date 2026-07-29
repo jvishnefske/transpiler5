@@ -20,6 +20,6 @@
 #
 # Regenerated via: run_realworld.py ... --manifest-format outcomes --update
 fixed-stats TRANSPILED  # ported 11/11
-polygon REJECTED cxx-references  # ported 2/8
+polygon REJECTED unsupported-stmt:CXXForRangeStmt  # ported 4/8
 shapes REJECTED cxx-destructor  # ported 1/7
 tokenizer TRANSPILED  # ported 5/5
