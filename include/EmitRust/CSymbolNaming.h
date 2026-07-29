@@ -40,6 +40,8 @@
 #ifndef EMITRUST_CSYMBOLNAMING_H
 #define EMITRUST_CSYMBOLNAMING_H
 
+#include "EmitRust/CSymbolLinkage.h"
+
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
 #include "clang/AST/DeclCXX.h"
@@ -160,6 +162,11 @@ static inline std::string namespacePrefix(const clang::DeclContext *context) {
 ///    unchanged-name contract.
 ///  - an internal-linkage (`static`) function takes `tuTag` in front, so
 ///    identically named file-statics in different TUs never collide.
+///
+/// FR-51 reads that last rule BACKWARDS at Rust-emission time to decide
+/// which items a library crate exports; the inverse predicate is
+/// `isInternalLinkageSymbolName` in `EmitRust/CSymbolLinkage.h`, which must
+/// be kept in step with the tagging here.
 ///
 /// \param func the function declaration to name.
 /// \param tuTag the per-TU tag for internal-linkage symbols; empty for a

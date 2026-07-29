@@ -9,10 +9,31 @@ Drives every program under a corpus directory through
                   is the DEMAND SIGNAL the corpus exists to generate.
   * TRANSPILED -- the crate built and its stdout matched a clang-compiled
                   native build of the same sources (the differential oracle).
+  * LIB_BUILT  -- the project has no ``main``, so emitrust-cc emitted a
+                  LIBRARY crate (FR-51), and that crate compiled. See below
+                  for why this is deliberately NOT ``TRANSPILED``.
   * MISCOMPILE -- the crate built but crashed, exited non-zero, or produced
                   stdout that differs from the native build; also a build that
                   reports success with no binary. Always fails, quarantine
                   aside -- a successfully transpiled program must be correct.
+
+``LIB_BUILT`` IS STRICTLY WEAKER EVIDENCE THAN ``TRANSPILED``, and the two
+must never be conflated. ``TRANSPILED`` means the transpiled program was
+RUN and BEHAVED IDENTICALLY to the native build -- a differential fact about
+semantics. A library crate has no entry point, so there is nothing to run and
+no native oracle to run it against (``clang++`` cannot even link the sources
+into an executable). All ``LIB_BUILT`` asserts is that the whole project was
+translated and that ``rustc`` accepted the result: real evidence, since a
+mistranslation usually fails to type-check, but evidence about
+WELL-FORMEDNESS, not about behavior. A ``LIB_BUILT`` project could compute
+entirely wrong answers and still score ``LIB_BUILT``.
+
+It is ranked between ``REJECTED`` and ``TRANSPILED`` by the ratchet: losing
+it is a regression, reaching it from ``REJECTED`` is an improvement that
+must be ratcheted in, and reaching ``TRANSPILED`` from it is a further
+improvement. Weakening a ``TRANSPILED`` project to ``LIB_BUILT`` is a
+REGRESSION, not a lateral move -- that would mean a program that used to be
+differentially validated no longer is.
 
 Modeled on ``test/CTestSuite/run_c_testsuite.py`` (shared helpers copied so
 this harness stays self-contained): per-crate ``target`` directories (a shared
@@ -75,7 +96,17 @@ RUN_TIMEOUT = 10
 
 REJECTED = "REJECTED"
 TRANSPILED = "TRANSPILED"
+LIB_BUILT = "LIB_BUILT"
 MISCOMPILE = "MISCOMPILE"
+
+#: Every outcome an outcome-format manifest may name.
+OUTCOMES = (REJECTED, TRANSPILED, LIB_BUILT, MISCOMPILE)
+
+#: The outcomes that mean "emitrust-cc produced a crate that compiles",
+#: ordered weakest-evidence-first. Used by the ratchet to decide which
+#: direction a change moved in; see the module docstring for why LIB_BUILT is
+#: strictly weaker than TRANSPILED and must not be conflated with it.
+BUILT_OUTCOMES = (LIB_BUILT, TRANSPILED)
 
 #: One corpus program: a display name, its translation units, and the include
 #: directories its compilation needs (always empty for the C corpus, which has
@@ -555,6 +586,20 @@ def run_single_program(tool, native_cc, native_std, program, workdir,
         detail = first_diagnostic_line(stderr)
         return result(REJECTED, classify_blocker(detail), detail)
 
+    # FR-51: a project with no ``main`` is emitted as a LIBRARY crate, whose
+    # root is src/lib.rs and which produces no executable. Detect that from
+    # the crate emitrust-cc actually wrote rather than by re-deriving the
+    # rule, and stop here: there is no binary to run and -- just as decisive
+    # -- no native oracle to run it against, since the native compiler cannot
+    # link an executable out of sources that define no entry point either.
+    # This check must precede BOTH the missing-binary MISCOMPILE below (a
+    # library legitimately has no binary) and the native build (which would
+    # fail to link and be misreported as a miscompile).
+    if os.path.isfile(os.path.join(crate_dir, "src", "lib.rs")):
+        return result(LIB_BUILT, "",
+                      "library crate (no main); built but not run -- no"
+                      " executable oracle exists for it")
+
     binary = os.path.join(crate_dir, "target", "release",
                           sanitize_crate_binary_name(name))
     if not os.path.isfile(binary):
@@ -617,6 +662,14 @@ def write_outcome_manifest(path, results):
             "# loudly but does not fail the gate, since it is a heuristic over\n"
             "# diagnostic wording.\n"
             "#\n"
+            "# LIB_BUILT (FR-51) is a project with no 'main': emitrust-cc\n"
+            "# emitted a LIBRARY crate and that crate compiled. It ranks\n"
+            "# between REJECTED and TRANSPILED and is deliberately NOT the\n"
+            "# same as TRANSPILED -- a library has no entry point, so it was\n"
+            "# never RUN and never diffed against a native build. LIB_BUILT\n"
+            "# says the project translates and type-checks; it says nothing\n"
+            "# about whether it computes the right answers.\n"
+            "#\n"
             "# The trailing '# ported k/n' comment is FR-44's per-item score,\n"
             "# advisory here and ignored by the parser: the AUTHORITATIVE\n"
             "# per-item ledger is each project's own expected-items.txt, next\n"
@@ -648,9 +701,10 @@ def load_outcome_manifest(path):
             if not stripped:
                 continue
             fields = stripped.split()
-            if len(fields) < 2 or fields[1] not in (REJECTED, TRANSPILED, MISCOMPILE):
+            if len(fields) < 2 or fields[1] not in OUTCOMES:
                 raise SystemExit("error: %s:%d: expected '<name> <OUTCOME> [tag]'"
-                                 % (path, lineno))
+                                 " with OUTCOME one of %s"
+                                 % (path, lineno, "/".join(OUTCOMES)))
             expected[fields[0]] = (fields[1], fields[2] if len(fields) > 2 else "")
     return expected
 
@@ -692,7 +746,14 @@ def ratchet_outcomes(manifest_path, results):
             continue
         if want_status == TRANSPILED:
             regressions.append("%s: %s -> %s" % (name, want_status, got.status))
-        elif got.status == TRANSPILED:
+        elif want_status == LIB_BUILT and got.status not in BUILT_OUTCOMES:
+            # FR-51: a project that used to emit a library crate that COMPILES
+            # and now does not has lost real ground, exactly as a lost
+            # TRANSPILED has. Reaching TRANSPILED from LIB_BUILT is the one
+            # move out of LIB_BUILT that is progress, and it falls through to
+            # the improvement branch below.
+            regressions.append("%s: %s -> %s" % (name, want_status, got.status))
+        elif got.status in BUILT_OUTCOMES:
             improvements.append("%s: %s -> %s" % (name, want_status, got.status))
         else:
             # REJECTED <-> MISCOMPILE. MISCOMPILE is separately fatal unless
@@ -700,8 +761,9 @@ def ratchet_outcomes(manifest_path, results):
             improvements.append("%s: %s -> %s" % (name, want_status, got.status))
 
     if regressions:
-        failures.append("%d regression(s) -- expected TRANSPILED, no longer: %s"
-                        % (len(regressions), "; ".join(regressions)))
+        failures.append("%d regression(s) -- a project that built no longer"
+                        " does, or a differentially validated one no longer"
+                        " is: %s" % (len(regressions), "; ".join(regressions)))
     if improvements:
         failures.append("%d outcome change(s) not in the manifest: %s."
                         " Re-run with --update to ratchet forward."
@@ -890,6 +952,9 @@ def main(argv):
                   if entry.items is not None else "")
         if entry.status == TRANSPILED:
             print("TRANSPILED  %s%s" % (entry.name, suffix))
+        elif entry.status == LIB_BUILT:
+            print("LIB_BUILT   %s%s  (library crate: compiled, NOT run --"
+                  " no executable oracle)" % (entry.name, suffix))
         elif entry.status == REJECTED:
             print("REJECTED    %s  [%s]%s  %s"
                   % (entry.name, entry.tag, suffix, entry.detail))
@@ -943,6 +1008,17 @@ def main(argv):
         failures.extend(item_failures)
     else:
         manifest = load_name_list(args.manifest, required=True)
+        # FR-51: the `names` manifest records only the differentially
+        # validated set, so it cannot express LIB_BUILT and deliberately does
+        # not try -- a library crate is NOT transpiling in this manifest's
+        # sense. Report the fact instead of dropping it, so a C corpus program
+        # that starts emitting a library crate is visible rather than silently
+        # indistinguishable from a rejection.
+        lib_built = sorted(e.name for e in results if e.status == LIB_BUILT)
+        if lib_built:
+            print("note: %d program(s) emitted a LIBRARY crate that compiles"
+                  " (no main, so no differential run; not recorded in this"
+                  " manifest format): %s" % (len(lib_built), ", ".join(lib_built)))
         regressions = sorted(manifest - transpiled)
         improvements = sorted(transpiled - manifest)
         if regressions:
@@ -953,9 +1029,15 @@ def main(argv):
                             " Re-run with --update to ratchet forward."
                             % (len(improvements), ", ".join(improvements)))
 
-    print("\nsummary: total=%d transpiled=%d rejected=%d miscompiled=%d (quarantined=%d)"
-          % (len(results), len(transpiled), len(rejected), len(miscompiles),
-             len(miscompiles) - len(new_miscompiles)))
+    # `transpiled` and `lib_built_count` are reported separately and never
+    # summed: only the first has been differentially validated, and a single
+    # combined "it worked" number would erase exactly the distinction FR-51
+    # introduced the outcome to preserve.
+    lib_built_count = sum(1 for e in results if e.status == LIB_BUILT)
+    print("\nsummary: total=%d transpiled=%d lib_built=%d rejected=%d"
+          " miscompiled=%d (quarantined=%d)"
+          % (len(results), len(transpiled), lib_built_count, len(rejected),
+             len(miscompiles), len(miscompiles) - len(new_miscompiles)))
 
     scored = [e for e in results if e.items is not None]
     if scored:

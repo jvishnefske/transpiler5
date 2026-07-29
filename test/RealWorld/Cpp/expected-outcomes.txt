@@ -11,6 +11,14 @@
 # loudly but does not fail the gate, since it is a heuristic over
 # diagnostic wording.
 #
+# LIB_BUILT (FR-51) is a project with no 'main': emitrust-cc
+# emitted a LIBRARY crate and that crate compiled. It ranks
+# between REJECTED and TRANSPILED and is deliberately NOT the
+# same as TRANSPILED -- a library has no entry point, so it was
+# never RUN and never diffed against a native build. LIB_BUILT
+# says the project translates and type-checks; it says nothing
+# about whether it computes the right answers.
+#
 # The trailing '# ported k/n' comment is FR-44's per-item score,
 # advisory here and ignored by the parser: the AUTHORITATIVE
 # per-item ledger is each project's own expected-items.txt, next
@@ -21,5 +29,6 @@
 # Regenerated via: run_realworld.py ... --manifest-format outcomes --update
 fixed-stats TRANSPILED  # ported 11/11
 polygon REJECTED unsupported-stmt:CXXForRangeStmt  # ported 4/8
+ringbuf-lib LIB_BUILT  # ported 12/12
 shapes REJECTED cxx-destructor  # ported 1/7
 tokenizer TRANSPILED  # ported 5/5

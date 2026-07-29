@@ -26,14 +26,17 @@
 ///                  pure-AST and for the same reason;
 ///   --emit=import  the raw imported MLIR module, before any pass;
 ///   --emit=mlir    the MLIR module after the full pass pipeline;
-///   --emit=rust    Rust source text (identical to the crate's src/main.rs
-///                  when the input defines main, else the bare translation);
-///   --emit=crate   a complete cargo crate directory (the default), with
-///                  --build optionally invoking `cargo build --release
-///                  --offline` on the result, and --incremental (FR-44)
-///                  additionally recovering from unsupported items and
-///                  writing PORTING.md / emitrust-progress.json beside the
-///                  crate;
+///   --emit=rust    Rust source text, identical to the crate root
+///                  --emit=crate would write (src/main.rs when the input
+///                  defines main, else src/lib.rs);
+///   --emit=crate   a complete cargo crate directory (the default) — a
+///                  BINARY crate when the input defines main and a LIBRARY
+///                  crate when it does not (FR-51; --crate-type overrides
+///                  the choice) — with --build optionally invoking
+///                  `cargo build --release --offline` on the result, and
+///                  --incremental (FR-44) additionally recovering from
+///                  unsupported items and writing PORTING.md /
+///                  emitrust-progress.json beside the crate;
 ///   --emit=search  the FR-43 frontier-search trace alone — which candidate
 ///                  subsets were tried, what each import attempt learned,
 ///                  and which subset won — for a project that need not
@@ -189,13 +192,17 @@ static llvm::cl::opt<EmitKind> emitKind(
                    "MLIR module after the full pass pipeline, i.e. the "
                    "emitter's input (debugging)"),
         clEnumValN(EmitKind::Rust, "rust",
-                   "Rust source text; when the input defines main this is "
-                   "byte-identical to the crate's src/main.rs (allow-header, "
-                   "translation, fn main wrapper), otherwise it is the bare "
-                   "translation"),
+                   "Rust source text, byte-identical to the crate root "
+                   "--emit=crate would write: src/main.rs when the input "
+                   "defines main (allow-header, translation, fn main "
+                   "wrapper), else src/lib.rs (allow-header and the "
+                   "translation with its exported items marked pub). "
+                   "--crate-type applies here too"),
         clEnumValN(EmitKind::Crate, "crate",
                    "Complete cargo crate directory; -o names the crate "
-                   "directory and the input must define main"),
+                   "directory. An input that defines main emits a binary "
+                   "crate, one that does not emits a library crate; see "
+                   "--crate-type"),
         clEnumValN(EmitKind::Search, "search",
                    "FR-43 frontier-search trace: the candidate item subsets "
                    "the search tried, what each import attempt learned, the "
@@ -203,6 +210,26 @@ static llvm::cl::opt<EmitKind> emitKind(
                    "--search; no crate and no module is written, and the "
                    "project need not define main")),
     llvm::cl::init(EmitKind::Crate));
+
+static llvm::cl::opt<emitrustcc::CrateTypeRequest> crateTypeOpt(
+    "crate-type", llvm::cl::desc("Shape of the emitted crate (FR-51)"),
+    llvm::cl::values(
+        clEnumValN(emitrustcc::CrateTypeRequest::Auto, "auto",
+                   "Decide from the input (the default): a project that "
+                   "defines 'main' emits a BINARY crate -- src/main.rs and a "
+                   "fn main wrapper, byte-identical to every crate emitted "
+                   "before this flag existed -- and one that does not emits a "
+                   "LIBRARY crate: src/lib.rs, a [lib] manifest section, no "
+                   "wrapper, and 'pub' on the external-linkage items a caller "
+                   "outside the crate must be able to reach"),
+        clEnumValN(emitrustcc::CrateTypeRequest::Bin, "bin",
+                   "Force a binary crate. An input that defines no 'main' is "
+                   "a located error rather than a crate that cannot link"),
+        clEnumValN(emitrustcc::CrateTypeRequest::Lib, "lib",
+                   "Force a library crate even for an input that defines "
+                   "'main', which then becomes an ordinary exported function "
+                   "('c_main') rather than the crate's entry point")),
+    llvm::cl::init(emitrustcc::CrateTypeRequest::Auto));
 
 static llvm::cl::opt<std::string>
     outputPath("o",
@@ -392,20 +419,29 @@ static mlir::LogicalResult writeModule(mlir::ModuleOp module,
 }
 
 /// Emits the cargo crate for `module` into the directory `outDir`: renders
-/// `Cargo.toml` and `src/main.rs` first (pure, no partial output on a
+/// `Cargo.toml` and the crate root first (pure, no partial output on a
 /// translation failure), then creates the directories and writes both files.
 ///
-/// \param module the fully converted module; must define `c_main`.
+/// FR-51: `type` decides the crate's shape and therefore the root's NAME —
+/// `src/main.rs` for a binary crate, `src/lib.rs` for a library one. Both
+/// files come from the pure renderers, so a library crate is not a special
+/// case here beyond the file name.
+///
+/// \param module the fully converted module; must define `c_main` when
+///        `type` is `CrateType::Bin`.
 /// \param outDir the crate directory to create and populate.
 /// \param crateName the sanitized cargo package name.
+/// \param type the crate shape to emit.
 /// \returns success if the whole crate was written.
 static mlir::LogicalResult emitCrate(mlir::ModuleOp module,
                                      llvm::StringRef outDir,
-                                     llvm::StringRef crateName) {
-  mlir::FailureOr<std::string> mainRs = emitrustcc::renderRustSource(module);
-  if (mlir::failed(mainRs))
+                                     llvm::StringRef crateName,
+                                     emitrustcc::CrateType type) {
+  mlir::FailureOr<std::string> rootRs =
+      emitrustcc::renderCrateRoot(module, type);
+  if (mlir::failed(rootRs))
     return mlir::failure();
-  std::string cargoToml = emitrustcc::renderCargoToml(crateName);
+  std::string cargoToml = emitrustcc::renderCargoToml(crateName, type);
 
   llvm::SmallString<256> srcDir(outDir);
   llvm::sys::path::append(srcDir, "src");
@@ -417,11 +453,35 @@ static mlir::LogicalResult emitCrate(mlir::ModuleOp module,
 
   llvm::SmallString<256> tomlPath(outDir);
   llvm::sys::path::append(tomlPath, "Cargo.toml");
-  llvm::SmallString<256> mainPath(srcDir);
-  llvm::sys::path::append(mainPath, "main.rs");
+  llvm::SmallString<256> rootPath(srcDir);
+  llvm::sys::path::append(rootPath, emitrustcc::crateRootFileName(type));
   if (mlir::failed(writeFile(tomlPath, cargoToml)))
     return mlir::failure();
-  return writeFile(mainPath, *mainRs);
+  return writeFile(rootPath, *rootRs);
+}
+
+/// Reports the one invalid FR-51 crate shape: a BINARY crate for a module
+/// that defines no `c_main`.
+///
+/// `--crate-type=auto` can never reach this — it selects `Lib` in exactly
+/// that case — so the diagnostic is only ever produced by an explicit
+/// `--crate-type=bin`. It is deliberately kept as an error rather than being
+/// silently downgraded to a library: the user asked for an executable, and a
+/// binary crate with no entry point does not link, so quietly handing back
+/// something else would answer a question that was not asked.
+///
+/// \param module the fully converted module.
+/// \param type the selected crate shape.
+/// \returns success unless a binary crate was requested without a `main`.
+static mlir::LogicalResult diagnoseCrateType(mlir::ModuleOp module,
+                                             emitrustcc::CrateType type) {
+  if (type != emitrustcc::CrateType::Bin || emitrustcc::hasCMain(module))
+    return mlir::success();
+  module.emitError()
+      << "cannot emit a binary crate: the input does not define a 'main' "
+         "function (imported as 'c_main'). Drop --crate-type=bin to emit a "
+         "library crate instead";
+  return mlir::failure();
 }
 
 /// Writes the two FR-44 progress artifacts into the crate directory that
@@ -654,6 +714,14 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: --incremental is only valid with --emit=crate\n";
     return 1;
   }
+  // FR-51: --crate-type selects a crate SHAPE, so it is meaningful exactly
+  // where a crate (or its root source) is produced.
+  if (crateTypeOpt != emitrustcc::CrateTypeRequest::Auto &&
+      emitKind != EmitKind::Crate && emitKind != EmitKind::Rust) {
+    llvm::errs() << "error: --crate-type is only valid with --emit=crate or "
+                    "--emit=rust\n";
+    return 1;
+  }
   if (emitKind == EmitKind::Crate && outputPath == "-") {
     llvm::errs() << "error: --emit=crate requires -o <crate directory>\n";
     return 1;
@@ -832,26 +900,32 @@ int main(int argc, char **argv) {
   case EmitKind::MLIR:
     return mlir::failed(writeModule(*module, outputPath)) ? 1 : 0;
   case EmitKind::Rust: {
+    // FR-51: `--emit=rust` is the crate ROOT, whichever shape the crate would
+    // have. That invariant used to hold only for an input with a `main` (the
+    // no-`main` case printed a bare translation, because there was no library
+    // crate for it to be the root of); now it is total.
+    emitrustcc::CrateType type =
+        emitrustcc::selectCrateType(crateTypeOpt, *module);
+    if (mlir::failed(diagnoseCrateType(*module, type)))
+      return 1;
     mlir::FailureOr<std::string> source =
-        emitrustcc::renderRustSource(*module);
+        emitrustcc::renderCrateRoot(*module, type);
     if (mlir::failed(source))
       return 1;
     return mlir::failed(writeFile(outputPath, *source)) ? 1 : 0;
   }
   case EmitKind::Crate: {
-    if (!emitrustcc::hasCMain(*module)) {
-      module->emitError()
-          << "cannot emit a crate: the input does not define a 'main' "
-             "function (imported as 'c_main')";
+    emitrustcc::CrateType type =
+        emitrustcc::selectCrateType(crateTypeOpt, *module);
+    if (mlir::failed(diagnoseCrateType(*module, type)))
       return 1;
-    }
     std::string crateName = deducedCrateName(inputs);
     // FR-44: the emitted symbol table is read BEFORE the crate is written,
     // because it is evidence about the very module being rendered.
     llvm::StringSet<> emittedSymbols;
     if (incrementalFlag)
       emittedSymbols = emitrustcc::collectEmittedSymbols(*module);
-    if (mlir::failed(emitCrate(*module, outputPath, crateName)))
+    if (mlir::failed(emitCrate(*module, outputPath, crateName, type)))
       return 1;
     if (incrementalFlag) {
       // The DENOMINATOR comes from the FR-40 item graph, which is a second,

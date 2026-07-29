@@ -1,0 +1,17 @@
+[
+  {
+    "directory": ".",
+    "file": "ring.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "ring.cpp", "-o", "ring.o"]
+  },
+  {
+    "directory": ".",
+    "file": "checksum.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "checksum.cpp", "-o", "checksum.o"]
+  },
+  {
+    "directory": ".",
+    "file": "frame.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "frame.cpp", "-o", "frame.o"]
+  }
+]

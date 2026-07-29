@@ -21,6 +21,7 @@
 
 #include "EmitRust/Target/TranslateToRust.h"
 
+#include "EmitRust/CSymbolLinkage.h"
 #include "EmitRust/EmitRustAttributes.h"
 #include "EmitRust/EmitRustDialect.h"
 #include "EmitRust/EmitRustOps.h"
@@ -57,8 +58,9 @@ namespace {
 /// result (and for-loop induction variable) as it is encountered top-down.
 class RustEmitter {
 public:
-  /// Creates an emitter writing to `os`.
-  explicit RustEmitter(raw_ostream &os) : os(os) {}
+  /// Creates an emitter writing to `os` under `options`.
+  RustEmitter(raw_ostream &os, const emitrust::RustEmitOptions &options)
+      : os(os), options(options) {}
 
   /// Emits `op` as Rust source text; dispatches over all supported ops.
   /// Unsupported operations fail with a located "unable to translate op"
@@ -255,8 +257,32 @@ private:
   /// index-typed index.
   LogicalResult emitSliceOf(emitrust::SliceOfOp sliceOfOp);
 
+  /// FR-51: the `pub ` an exported item is prefixed with, or the empty
+  /// string. Returns nothing at all unless `RustEmitOptions::exportItems` is
+  /// set, which is what keeps binary-crate output byte-identical.
+  ///
+  /// \param symbol the emitted item name, consulted only for its
+  ///        internal-linkage marker.
+  StringRef itemVisibility(StringRef symbol) const {
+    if (!options.exportItems || emitrust::isInternalLinkageSymbolName(symbol))
+      return "";
+    return "pub ";
+  }
+
+  /// The `pub ` prefix for a part of an exported TYPE — a struct field, a
+  /// tuple element, an enum variant constant. Unlike `itemVisibility` this
+  /// takes no symbol: types are exported unconditionally in library mode
+  /// (see `RustEmitOptions::exportItems` for why), so their parts must be
+  /// reachable too or the type is exported but unusable.
+  StringRef typePartVisibility() const {
+    return options.exportItems ? "pub " : "";
+  }
+
   /// Output stream tracking the current indentation.
   raw_indented_ostream os;
+
+  /// The emission knobs this translation runs under.
+  emitrust::RustEmitOptions options;
 
   /// Per-function map from SSA values to their Rust binding names.
   DenseMap<Value, std::string> valueNames;
@@ -679,7 +705,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // way.
   bool isMethod = isa<emitrust::ImplOp>(op->getParentOp()) &&
                   !op->hasAttr(emitrust::kStaticMethodAttrName);
-  os << "fn " << SymbolTable::getSymbolName(op).getValue() << "(";
+  StringRef symbol = SymbolTable::getSymbolName(op).getValue();
+  os << itemVisibility(symbol) << "fn " << symbol << "(";
   bool first = true;
   for (BlockArgument argument : entryBlock.getArguments()) {
     if (!first)
@@ -1128,15 +1155,16 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   // empty brace body; the derives keep declaration, copy, and default
   // construction working exactly as for the non-empty shape.
   if (structDefOp.getFieldNames().empty()) {
-    os << "struct " << structDefOp.getSymName() << " {}\n";
+    os << typePartVisibility() << "struct " << structDefOp.getSymName()
+       << " {}\n";
     return success();
   }
-  os << "struct " << structDefOp.getSymName() << " {\n";
+  os << typePartVisibility() << "struct " << structDefOp.getSymName() << " {\n";
   increaseIndent();
   for (auto [nameAttr, typeAttr] :
        llvm::zip_equal(structDefOp.getFieldNames(),
                        structDefOp.getFieldTypes())) {
-    os << cast<StringAttr>(nameAttr).getValue() << ": ";
+    os << typePartVisibility() << cast<StringAttr>(nameAttr).getValue() << ": ";
     if (failed(emitType(loc, cast<TypeAttr>(typeAttr).getValue())))
       return failure();
     os << ",\n";
@@ -1151,13 +1179,14 @@ LogicalResult RustEmitter::emitEnumDef(emitrust::EnumDefOp enumDefOp) {
   StringRef storage = enumDefOp.getUnsignedUnderlying() ? "u32" : "i32";
   os << "#[repr(transparent)]\n";
   os << "#[derive(Clone, Copy, PartialEq)]\n";
-  os << "struct " << name << "(" << storage << ");\n";
+  StringRef pub = typePartVisibility();
+  os << pub << "struct " << name << "(" << pub << storage << ");\n";
   os << "impl " << name << " {\n";
   increaseIndent();
   for (auto [nameAttr, value] : llvm::zip_equal(enumDefOp.getVariantNames(),
                                                 enumDefOp.getVariantValues()))
-    os << "const " << cast<StringAttr>(nameAttr).getValue() << ": " << name
-       << " = " << name << "(" << value << ");\n";
+    os << pub << "const " << cast<StringAttr>(nameAttr).getValue() << ": "
+       << name << " = " << name << "(" << value << ");\n";
   decreaseIndent();
   os << "}\n";
   StringRef firstVariant =
@@ -1575,8 +1604,13 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult mlir::emitrust::translateToRust(Operation *op, raw_ostream &os) {
+  return translateToRust(op, os, RustEmitOptions());
+}
+
+LogicalResult mlir::emitrust::translateToRust(Operation *op, raw_ostream &os,
+                                              const RustEmitOptions &options) {
   if (!op)
     return failure();
-  RustEmitter emitter(os);
+  RustEmitter emitter(os, options);
   return emitter.emitOperation(*op);
 }

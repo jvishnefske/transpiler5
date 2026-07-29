@@ -220,9 +220,27 @@ struct CapturedDiagnostic {
 /// are `NamedDecl`s; an unnamed record (or an anonymous namespace's unnamed
 /// member) has no spelling at all, which the ledger reports literally rather
 /// than inventing a name the user never wrote.
+///
+/// `main` is the one declaration whose ledger name is NOT its C spelling. The
+/// ledger's symbol is a JOIN KEY: FR-44 matches it against the FR-40 item
+/// graph's node keys, which are emitted item names, and the importer renames
+/// `main` to `c_main` (`cFunctionSymbolName`). Reporting the C spelling here
+/// would put a rejected `main` off-graph, so the report would say the project
+/// has one item it can say NOTHING about (`missing`) plus one unexplained
+/// off-graph rejection, instead of the truth: `c_main` was dropped, and why.
+///
+/// This only ever bit the DROP path. A rejected function that can be STUBBED
+/// overwrites `symbol` with `recoveryStubSymbol`, the name the stub was
+/// actually emitted under, so a stubbed `main` already joined correctly --
+/// which is why the C++ corpus's `polygon` and `shapes` ledgers read
+/// `c_main function stubbed`. The gap was unreachable before FR-51 because a
+/// project whose `main` was DROPPED could not be emitted as a crate at all,
+/// so no report was ever produced for it.
 std::string declLedgerName(const clang::Decl *decl) {
   if (const auto *named = llvm::dyn_cast<clang::NamedDecl>(decl)) {
     std::string name = named->getNameAsString();
+    if (name == "main" && llvm::isa<clang::FunctionDecl>(decl))
+      return "c_main";
     if (!name.empty())
       return name;
   }
