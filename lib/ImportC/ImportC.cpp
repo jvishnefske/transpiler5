@@ -5667,8 +5667,15 @@ mlir::emitrust::importC(llvm::StringRef path,
   // A caller that wants recovery without a ledger gets this scratch one, so
   // the importer never has to test for a null ledger mid-import.
   RejectionLedger scratchLedger;
-  if (options.recover)
+  if (options.recover) {
     importer.enableRecovery(options.ledger ? *options.ledger : scratchLedger);
+    // FR-43, single-file: this entry point emits file-statics under their
+    // BARE names (no `tu<i>_` tag) while the item graph always tags them, so
+    // only externally visible items are addressable here. Installing the set
+    // anyway keeps the two entry points' semantics one rule rather than two.
+    if (!options.excludedItems.empty())
+      importer.setExcludedItems(options.excludedItems);
+  }
   if (failed(importer.importTranslationUnit(ast.getASTContext(),
                                             /*tuTag=*/"",
                                             /*deferExtern=*/false,
@@ -5768,8 +5775,14 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
   // is a project-level artifact, and the per-TU walks accumulate into it in
   // path order.
   RejectionLedger scratchLedger;
-  if (options.recover)
+  if (options.recover) {
     importer.enableRecovery(options.ledger ? *options.ledger : scratchLedger);
+    // FR-43: the admitted set is a recovery-mode restriction, so it is only
+    // installed here. `options` outlives the import, so the reference the
+    // importer keeps stays valid.
+    if (!options.excludedItems.empty())
+      importer.setExcludedItems(options.excludedItems);
+  }
   // W3.0: scan every AST for externally visible va_list-using variadic
   // definitions BEFORE importing any of them, so the registry is complete
   // regardless of whether a caller's TU or its callee's defining TU is

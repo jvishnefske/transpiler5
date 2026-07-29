@@ -25,6 +25,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <map>
+#include <set>
 #include <string>
 
 namespace mlir {
@@ -167,6 +168,37 @@ struct ImportOptions {
   /// the project IS the database: every file it lists is imported, sorted
   /// and deduplicated.
   std::string compilationDatabasePath;
+  /// The items the caller has decided NOT to admit (FR-43). Each entry is an
+  /// FR-40 item-graph node key, i.e. the symbol the item would be emitted
+  /// under; a top-level declaration whose key is listed here is not imported
+  /// at all and takes the ORDINARY recovery path instead — a function whose
+  /// signature maps becomes an `unimplemented!()` stub, anything else is
+  /// dropped — with the reason `excluded by the search state`.
+  ///
+  /// This is the only knob FR-43's frontier search needs from the importer:
+  /// a search STATE is a set of admitted items, and probing that state means
+  /// importing with its complement excluded. Exclusion is expressed as a
+  /// synthetic REJECTION rather than as a fourth outcome so that a search
+  /// probe and an ordinary recovering import produce the same shapes of
+  /// module, ledger, and report — the search never has to model a kind of
+  /// item the rest of the system has not already seen.
+  ///
+  /// It has effect ONLY together with `recover`; the recovery path is where
+  /// the substitution happens, and a non-recovering import ignores the set
+  /// entirely (a hard-failing import has no partial answer to give). An
+  /// empty set — the default — is exactly the historical import.
+  ///
+  /// The keys are `tu<i>_`-tagged for internal-linkage items, matching
+  /// `importCProject` and `buildItemGraph`. `importC`'s single-file mode
+  /// emits file-statics under their bare names, so an excluded file-static
+  /// is only addressable through `importCProject`; every FR-43 caller goes
+  /// through the project entry point, where the two namings agree by
+  /// construction.
+  ///
+  /// `std::set` rather than a `StringSet`: nothing here is hot (one lookup
+  /// per top-level declaration), and an ordered container keeps every
+  /// derived listing deterministic without a sort at the boundary.
+  std::set<std::string> excludedItems;
 };
 
 /// Imports the C source file at `path` into an MLIR module.

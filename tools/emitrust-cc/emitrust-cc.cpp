@@ -33,7 +33,14 @@
 ///                  --offline` on the result, and --incremental (FR-44)
 ///                  additionally recovering from unsupported items and
 ///                  writing PORTING.md / emitrust-progress.json beside the
-///                  crate.
+///                  crate;
+///   --emit=search  the FR-43 frontier-search trace alone — which candidate
+///                  subsets were tried, what each import attempt learned,
+///                  and which subset won — for a project that need not
+///                  define main.
+/// With --search, --emit=crate --incremental picks the crate's item set with
+/// that same search instead of taking whatever the first recovering import
+/// happened to accept.
 /// The inputs are either positional source paths with hand-passed
 /// -I/-isystem/--extra-arg flags (the historical surface), or, with
 /// --compdb <dir-or-file>, a real compile_commands.json that supplies both
@@ -53,6 +60,7 @@
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 #include "EmitRust/ImportC.h"
+#include "EmitRust/Project/FrontierSearch.h"
 #include "EmitRust/Project/ItemColoring.h"
 #include "EmitRust/Project/ItemGraph.h"
 
@@ -98,10 +106,15 @@ namespace {
 /// import for exactly that reason — both are meant to be obtainable for a
 /// project the importer cannot yet translate, which for the coloring is the
 /// whole point (an all-Green project needs no coloring).
-enum class EmitKind { ItemGraph, Coloring, Import, MLIR, Rust, Crate };
+enum class EmitKind { ItemGraph, Coloring, Import, MLIR, Rust, Crate, Search };
 
 /// Whether `kind` is one of the pure-AST project analyses, i.e. produced
 /// without an MLIR context, an import, or a pass.
+///
+/// `Search` is deliberately NOT one of them even though it prints an
+/// analysis: FR-43's whole method is to IMPORT candidate subsets, so it needs
+/// the same machinery an ordinary compile does and simply keeps no module at
+/// the end.
 bool isProjectAnalysis(EmitKind kind) {
   return kind == EmitKind::ItemGraph || kind == EmitKind::Coloring;
 }
@@ -182,7 +195,13 @@ static llvm::cl::opt<EmitKind> emitKind(
                    "translation"),
         clEnumValN(EmitKind::Crate, "crate",
                    "Complete cargo crate directory; -o names the crate "
-                   "directory and the input must define main")),
+                   "directory and the input must define main"),
+        clEnumValN(EmitKind::Search, "search",
+                   "FR-43 frontier-search trace: the candidate item subsets "
+                   "the search tried, what each import attempt learned, the "
+                   "subset that won and why every other item is out. Implies "
+                   "--search; no crate and no module is written, and the "
+                   "project need not define main")),
     llvm::cl::init(EmitKind::Crate));
 
 static llvm::cl::opt<std::string>
@@ -226,6 +245,43 @@ static llvm::cl::opt<bool> incrementalFlag(
         "HAS, not just what the importer reached. Without this flag the "
         "compile is byte-identical to one built without it"),
     llvm::cl::init(false));
+
+static llvm::cl::opt<bool> searchFlag(
+    "search",
+    llvm::cl::desc(
+        "Frontier tree search (FR-43, only valid with --emit=crate "
+        "--incremental, and implied by --emit=search): instead of keeping "
+        "whatever the first recovering import happens to accept, search over "
+        "SETS of admitted items for the largest subset that really imports. "
+        "The root candidate is every item the FR-41 coloring calls Green or "
+        "Yellow; each candidate is probed by a real recovering import, every "
+        "rejection it reports is a fact the next candidate accounts for, and "
+        "candidates are scored lexicographically by items emitted for real, "
+        "then stub count, then representation cost. Bounded by "
+        "--max-search-nodes and reproducible run to run. This matters most "
+        "when a recovering import FAILS outright -- one item dropped can "
+        "leave the project referencing a symbol nobody defines, which is a "
+        "whole-program error no per-item recovery can undo -- where without "
+        "it --incremental produces no crate at all"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<unsigned> maxSearchNodes(
+    "max-search-nodes",
+    llvm::cl::desc("Maximum number of candidate subsets the FR-43 search may "
+                   "IMPORT (default 8). The import dominates the cost, so "
+                   "this is the bound that bounds the run time; a project "
+                   "whose coloring is exact converges after one"),
+    llvm::cl::value_desc("n"), llvm::cl::init(8));
+
+static llvm::cl::opt<std::string> searchTracePath(
+    "search-trace",
+    llvm::cl::desc("Write the FR-43 search trace to <path> ('-' means "
+                   "stderr): one line per candidate probed, per fact learned, "
+                   "per candidate pruned, then the winning item set and the "
+                   "reason every other item is out. This is how \"why did it "
+                   "stop there\" is answered. With --emit=search the trace is "
+                   "the output and this flag is unnecessary"),
+    llvm::cl::value_desc("path"), llvm::cl::init(""));
 
 static llvm::cl::opt<bool> checkRangeRefinement(
     "check-range-refinement",
@@ -433,6 +489,128 @@ static mlir::LogicalResult buildCrate(llvm::StringRef outDir) {
   return mlir::success();
 }
 
+//===----------------------------------------------------------------------===//
+// FR-43 -- the frontier search's probe
+//===----------------------------------------------------------------------===//
+
+/// Runs ONE candidate subset through the real compiler and reports what came
+/// out: the imperative shell of FR-43, whose functional core is
+/// `mlir::emitrust::frontierSearch`.
+///
+/// Everything expensive about the search is here, and it is deliberately the
+/// SAME path an ordinary `--emit=crate --incremental` compile takes — a
+/// recovering `importCProject` with the state's complement excluded, then the
+/// pinned lowering pipeline, then FR-44's join of graph, ledger and emitted
+/// symbol table. Scoring a candidate by anything cheaper would score a
+/// different compiler than the one that will produce the crate.
+///
+/// Three shell concerns live here and nowhere else:
+///
+///  - A FRESH `MLIRContext` per probe. A module is owned by its context and a
+///    probe may leave a half-built one behind; a fresh context makes each
+///    attempt independent by construction rather than by cleanup.
+///  - DIAGNOSTIC CAPTURE. A probe is a hypothesis, not a compile: its
+///    warnings are noise (the corpus's projects produce dozens each) and its
+///    error is data. The handler swallows both and keeps the first error,
+///    which is the one that killed the import and therefore the one the
+///    search must attribute.
+///  - The MISSING-SYMBOL parse. `finalizeProject`'s "'g' is referenced but
+///    not defined in any translation unit" is the canonical whole-program
+///    failure a per-item recovery cannot undo, and the symbol it names is the
+///    single most useful fact the search can get, so it is lifted out of the
+///    message text into `ProbeOutcome::failureSymbol`.
+///
+/// \param inputs the project analyses, parsed once for the whole search.
+/// \param paths the source files.
+/// \param extra the clang arguments.
+/// \param crateName the sanitized package name, for the report join only.
+/// \param state the candidate subset to probe.
+/// \returns what the attempt produced.
+static mlir::emitrust::ProbeOutcome
+probeSearchState(const mlir::emitrust::SearchInputs &inputs,
+                 llvm::ArrayRef<std::string> paths,
+                 llvm::ArrayRef<std::string> extra, llvm::StringRef crateName,
+                 const mlir::emitrust::SearchState &state) {
+  mlir::emitrust::ProbeOutcome outcome;
+
+  mlir::MLIRContext context;
+  bool haveFailure = false;
+  context.getDiagEngine().registerHandler([&](mlir::Diagnostic &diag) {
+    if (diag.getSeverity() != mlir::DiagnosticSeverity::Error || haveFailure)
+      return;
+    haveFailure = true;
+    outcome.failure = diag.str();
+    if (auto fileLoc = llvm::dyn_cast<mlir::FileLineColLoc>(diag.getLocation())) {
+      outcome.failureFile = fileLoc.getFilename().getValue().str();
+      outcome.failureLine = fileLoc.getLine();
+    }
+    // `unsupported: function 'f' is referenced but not defined in any
+    // translation unit` and its extern-global twin: the quoted run between
+    // the last `'` pair before the fixed suffix is the missing symbol.
+    static constexpr llvm::StringLiteral kSuffix =
+        "' is referenced but not defined in any translation unit";
+    llvm::StringRef message(outcome.failure);
+    if (size_t end = message.find(kSuffix); end != llvm::StringRef::npos) {
+      llvm::StringRef head = message.take_front(end);
+      if (size_t start = head.rfind('\''); start != llvm::StringRef::npos)
+        outcome.failureSymbol = head.drop_front(start + 1).str();
+    }
+  });
+  context.loadDialect<mlir::scf::SCFDialect, mlir::ub::UBDialect>();
+
+  mlir::emitrust::RejectionLedger ledger;
+  mlir::emitrust::ImportOptions options;
+  options.recover = true;
+  options.ledger = &ledger;
+  options.compilationDatabasePath = compilationDatabasePath;
+  options.excludedItems = mlir::emitrust::excludedItemsFor(inputs.graph, state);
+
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::emitrust::importCProject(paths, extra, options, context);
+  // The rejections are facts whether or not the import survived: an item the
+  // coloring called Green and the importer refused is a learned fact even on
+  // a run that later died for an unrelated reason.
+  for (const mlir::emitrust::RejectedItem &item : ledger.getItems())
+    outcome.rejections.push_back(
+        {item.symbol, item.stubbed, item.blockerTag});
+  if (!module) {
+    if (outcome.failure.empty())
+      outcome.failure = "the import failed without a located diagnostic";
+    return outcome;
+  }
+  // Lowering is part of the probe because it is part of producing a crate: a
+  // subset that imports but does not lower yields no output, and scoring it
+  // as if it did would send the search down a branch that cannot pay off.
+  if (mlir::failed(runPipeline(*module))) {
+    if (outcome.failure.empty())
+      outcome.failure = "the lowering pipeline failed";
+    return outcome;
+  }
+
+  llvm::StringSet<> emitted = emitrustcc::collectEmittedSymbols(*module);
+  emitrustcc::ProgressReport report = emitrustcc::buildProgressReport(
+      crateName, &inputs.graph, ledger.getItems(), emitted);
+  outcome.imported = true;
+  outcome.ported = report.count(emitrustcc::ItemStatus::Ported);
+  outcome.stubbed = report.count(emitrustcc::ItemStatus::Stubbed);
+  outcome.dropped = report.count(emitrustcc::ItemStatus::Dropped);
+  return outcome;
+}
+
+/// The sanitized cargo package name for this invocation: `--crate-name` when
+/// given; otherwise, for a single input its stem (historical behavior), and
+/// for several inputs the `-o` crate-directory stem (the input stems are
+/// ambiguous). A `--compdb` run with no positional inputs takes the same
+/// crate-directory stem: the database's file list is a project, not one
+/// nameable input.
+static std::string deducedCrateName(llvm::ArrayRef<std::string> inputs) {
+  llvm::StringRef stem = !crateNameOpt.empty() ? llvm::StringRef(crateNameOpt)
+                         : inputs.size() == 1
+                             ? llvm::sys::path::stem(inputs.front())
+                             : llvm::sys::path::stem(outputPath);
+  return emitrustcc::sanitizeCrateName(stem);
+}
+
 /// Collects the `-I`, `-isystem`, and `--extra-arg` options into one clang
 /// argument list, interleaved by command-line position so the include search
 /// order matches what the user wrote.
@@ -480,6 +658,23 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: --emit=crate requires -o <crate directory>\n";
     return 1;
   }
+  // FR-43: the search picks the ITEM SET of an incremental crate, so it is
+  // only meaningful where there is an item set to pick — and `--emit=search`
+  // is the search with the crate left off, so it implies the flag rather than
+  // conflicting with it.
+  bool runSearch = searchFlag || emitKind == EmitKind::Search;
+  if (searchFlag && emitKind != EmitKind::Crate &&
+      emitKind != EmitKind::Search) {
+    llvm::errs() << "error: --search is only valid with --emit=crate "
+                    "--incremental or --emit=search\n";
+    return 1;
+  }
+  if (searchFlag && emitKind == EmitKind::Crate && !incrementalFlag) {
+    llvm::errs() << "error: --search requires --incremental: the search "
+                    "chooses which items the crate contains, which only an "
+                    "incremental crate can omit\n";
+    return 1;
+  }
 
   std::vector<std::string> inputs(inputFilenames.begin(),
                                   inputFilenames.end());
@@ -523,6 +718,50 @@ int main(int argc, char **argv) {
     return mlir::failed(writeFile(outputPath, text)) ? 1 : 0;
   }
 
+  // FR-43: the frontier search runs BEFORE the compile it configures. Its
+  // output is one thing — the set of items to exclude — which then flows into
+  // the ordinary recovering import below, so everything after this block is
+  // the same code path a plain `--incremental` run takes. The search's own
+  // project analyses are kept: they were parsed once here, and reusing them
+  // for FR-44's denominator saves the report an otherwise identical parse.
+  std::optional<mlir::emitrust::SearchInputs> searchInputs;
+  std::set<std::string> searchExcluded;
+  if (runSearch) {
+    std::string databaseError;
+    mlir::FailureOr<mlir::emitrust::SearchInputs> built =
+        mlir::emitrust::buildSearchInputs(inputs, extra,
+                                          compilationDatabasePath,
+                                          databaseError);
+    if (mlir::failed(built)) {
+      if (!databaseError.empty())
+        llvm::errs() << compilationDatabasePath
+                     << ":1:1: error: cannot load compilation database: "
+                     << databaseError << "\n";
+      else
+        llvm::errs() << "error: failed to parse one or more inputs\n";
+      return 1;
+    }
+    searchInputs = std::move(*built);
+    std::string crateName = deducedCrateName(inputs);
+    mlir::emitrust::SearchOptions searchOptions;
+    searchOptions.maxNodes = maxSearchNodes;
+    mlir::emitrust::SearchResult search = mlir::emitrust::frontierSearch(
+        searchInputs->graph, searchInputs->admissibility, searchOptions,
+        [&](const mlir::emitrust::SearchState &state) {
+          return probeSearchState(*searchInputs, inputs, extra, crateName,
+                                  state);
+        });
+    searchExcluded =
+        mlir::emitrust::excludedItemsFor(searchInputs->graph, search.best);
+    if (emitKind == EmitKind::Search)
+      return mlir::failed(writeFile(outputPath, search.trace)) ? 1 : 0;
+    if (!searchTracePath.empty() &&
+        mlir::failed(writeFile(searchTracePath == "-" ? llvm::StringRef("/dev/stderr")
+                                                      : llvm::StringRef(searchTracePath),
+                               search.trace)))
+      return 1;
+  }
+
   mlir::MLIRContext context;
   context.getDiagEngine().registerHandler(
       [](mlir::Diagnostic &diag) { printDiagnostic(diag); });
@@ -545,6 +784,11 @@ int main(int argc, char **argv) {
   // the database to be parsed the way its build system parses it, recovery
   // to yield anything at all.
   importOptions.compilationDatabasePath = compilationDatabasePath;
+  // FR-43: the search's answer enters the compile here and nowhere else. An
+  // excluded item takes FR-42's recovery path (stub if its signature maps,
+  // drop otherwise), so the crate emitted below is a crate the recovering
+  // importer already knew how to build — the search chose WHICH one.
+  importOptions.excludedItems = searchExcluded;
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::emitrust::importCProject(inputs, extra, importOptions, context);
   if (!module)
@@ -562,6 +806,8 @@ int main(int argc, char **argv) {
   switch (emitKind.getValue()) {
   case EmitKind::ItemGraph:
   case EmitKind::Coloring:
+    llvm_unreachable("handled before the import");
+  case EmitKind::Search:
     llvm_unreachable("handled before the import");
   case EmitKind::Import:
     llvm_unreachable("handled before the pipeline");
@@ -581,17 +827,7 @@ int main(int argc, char **argv) {
              "function (imported as 'c_main')";
       return 1;
     }
-    // The crate name comes from --crate-name when given; otherwise, for a
-    // single input its stem (historical behavior), and for several inputs the
-    // -o crate-directory stem (the input stems are ambiguous). A --compdb
-    // run with no positional inputs takes the same crate-directory stem:
-    // the database's file list is a project, not one nameable input.
-    llvm::StringRef crateStem = !crateNameOpt.empty()
-                                    ? llvm::StringRef(crateNameOpt)
-                                : inputs.size() == 1
-                                    ? llvm::sys::path::stem(inputs.front())
-                                    : llvm::sys::path::stem(outputPath);
-    std::string crateName = emitrustcc::sanitizeCrateName(crateStem);
+    std::string crateName = deducedCrateName(inputs);
     // FR-44: the emitted symbol table is read BEFORE the crate is written,
     // because it is evidence about the very module being rendered.
     llvm::StringSet<> emittedSymbols;
@@ -605,20 +841,27 @@ int main(int argc, char **argv) {
       // item the project HAS, including the ones the importer rejected, so
       // "2 of 8 ported" is a real fraction rather than a count over whatever
       // survived. It re-parses the inputs, which is why it is computed only
-      // under --incremental.
+      // under --incremental — and not at all under --search, which already
+      // parsed the project once to build the very same graph.
       std::string databaseError;
-      mlir::FailureOr<mlir::emitrust::ItemGraph> graph =
-          mlir::emitrust::buildItemGraph(inputs, extra, compilationDatabasePath,
-                                         databaseError);
-      if (mlir::failed(graph))
-        llvm::errs() << "warning: cannot build the project item graph"
-                     << (databaseError.empty() ? "" : ": ")
-                     << databaseError
-                     << "; the progress report has no denominator "
-                        "(denominator_source: ledger-only)\n";
+      mlir::FailureOr<mlir::emitrust::ItemGraph> graph = mlir::failure();
+      if (!searchInputs) {
+        graph = mlir::emitrust::buildItemGraph(inputs, extra,
+                                               compilationDatabasePath,
+                                               databaseError);
+        if (mlir::failed(graph))
+          llvm::errs() << "warning: cannot build the project item graph"
+                       << (databaseError.empty() ? "" : ": ")
+                       << databaseError
+                       << "; the progress report has no denominator "
+                          "(denominator_source: ledger-only)\n";
+      }
+      const mlir::emitrust::ItemGraph *denominator =
+          searchInputs                ? &searchInputs->graph
+          : mlir::succeeded(graph)    ? &*graph
+                                      : nullptr;
       emitrustcc::ProgressReport report = emitrustcc::buildProgressReport(
-          crateName, mlir::succeeded(graph) ? &*graph : nullptr,
-          ledger.getItems(), emittedSymbols);
+          crateName, denominator, ledger.getItems(), emittedSymbols);
       if (mlir::failed(writeProgressArtifacts(outputPath, report)))
         return 1;
     }
