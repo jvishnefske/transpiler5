@@ -589,7 +589,7 @@ probeSearchState(const mlir::emitrust::SearchInputs &inputs,
 
   llvm::StringSet<> emitted = emitrustcc::collectEmittedSymbols(*module);
   emitrustcc::ProgressReport report = emitrustcc::buildProgressReport(
-      crateName, &inputs.graph, ledger.getItems(), emitted);
+      crateName, &inputs.graph, &inputs.coloring, ledger.getItems(), emitted);
   outcome.imported = true;
   outcome.ported = report.count(emitrustcc::ItemStatus::Ported);
   outcome.stubbed = report.count(emitrustcc::ItemStatus::Stubbed);
@@ -843,25 +843,32 @@ int main(int argc, char **argv) {
       // survived. It re-parses the inputs, which is why it is computed only
       // under --incremental — and not at all under --search, which already
       // parsed the project once to build the very same graph.
+      //
+      // FR-49 needs the FR-41 COLORING of that same graph as well, to credit
+      // each rejection to its root cause. `buildSearchInputs` computes graph,
+      // admissibility and coloring from ONE parse — the same parse the graph
+      // alone would have cost — so root attribution is free here, and the
+      // --search path below already has all three for the same reason.
       std::string databaseError;
-      mlir::FailureOr<mlir::emitrust::ItemGraph> graph = mlir::failure();
+      mlir::FailureOr<mlir::emitrust::SearchInputs> analyses = mlir::failure();
       if (!searchInputs) {
-        graph = mlir::emitrust::buildItemGraph(inputs, extra,
-                                               compilationDatabasePath,
-                                               databaseError);
-        if (mlir::failed(graph))
+        analyses = mlir::emitrust::buildSearchInputs(
+            inputs, extra, compilationDatabasePath, databaseError);
+        if (mlir::failed(analyses))
           llvm::errs() << "warning: cannot build the project item graph"
                        << (databaseError.empty() ? "" : ": ")
                        << databaseError
                        << "; the progress report has no denominator "
                           "(denominator_source: ledger-only)\n";
       }
-      const mlir::emitrust::ItemGraph *denominator =
-          searchInputs                ? &searchInputs->graph
-          : mlir::succeeded(graph)    ? &*graph
-                                      : nullptr;
+      const mlir::emitrust::SearchInputs *joined =
+          searchInputs                 ? &*searchInputs
+          : mlir::succeeded(analyses)  ? &*analyses
+                                       : nullptr;
       emitrustcc::ProgressReport report = emitrustcc::buildProgressReport(
-          crateName, denominator, ledger.getItems(), emittedSymbols);
+          crateName, joined ? &joined->graph : nullptr,
+          joined ? &joined->coloring : nullptr, ledger.getItems(),
+          emittedSymbols);
       if (mlir::failed(writeProgressArtifacts(outputPath, report)))
         return 1;
     }
