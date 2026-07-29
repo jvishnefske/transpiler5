@@ -36,6 +36,7 @@
 #include "EmitRust/EmitRustDialect.h"
 #include "EmitRust/EmitRustOps.h"
 #include "EmitRust/EmitRustTypes.h"
+#include "EmitRust/ImportC.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
@@ -1268,6 +1269,17 @@ public:
   explicit CImporter(ModuleOp module)
       : module(module), builder(module.getContext()) {}
 
+  /// Turns on recoverable import (FR-42) for every subsequent
+  /// `importTranslationUnit` call, recording each recovered rejection into
+  /// `ledger`. Off by default, and there is deliberately no way to turn it
+  /// back off: recovery is a whole-import mode chosen by the driver, and a
+  /// half-recovering import would produce a module whose completeness
+  /// depends on declaration order.
+  void enableRecovery(emitrust::RejectionLedger &ledger) {
+    recoverFromRejections = true;
+    rejectionLedger = &ledger;
+  }
+
   /// Imports every supported top-level declaration of `context`'s translation
   /// unit into the module: complete struct definitions (bare anonymous
   /// structs under synthesized shape-keyed `Anon<n>` names), function
@@ -1375,6 +1387,112 @@ private:
   /// a sibling of the record in `context->decls()`), which is exactly how
   /// W2.0 leaves method import untouched.
   LogicalResult importDeclsIn(const clang::DeclContext *context);
+
+  /// Imports ONE top-level declaration: the per-kind dispatch that
+  /// `importDeclsIn` used to inline. Split out so recoverable import
+  /// (FR-42) has a single call it can wrap, checkpoint, and roll back.
+  /// `namespace`/`extern "C"` containers are NOT handled here — they are
+  /// recursion, not items, and stay in `importDeclsIn` so that each of
+  /// their members is recovered individually rather than the whole
+  /// container being dropped as one unit.
+  LogicalResult importTopLevelDecl(const clang::Decl *decl);
+
+  //===--------------------------------------------------------------------===//
+  // Recoverable import (FR-42)
+  //===--------------------------------------------------------------------===//
+
+  /// Everything needed to undo a rejected top-level item's effect on the
+  /// module. See `rollbackTo` for what is (and is not) restored, and why.
+  struct RecoveryCheckpoint {
+    /// The last module-body operation that existed BEFORE the item began,
+    /// or null when the body was empty. Every operation after it belongs to
+    /// the item. Kept as an operation pointer rather than an index so that
+    /// an insertion elsewhere in the body cannot shift it; the one way it
+    /// could dangle — the item erasing that very operation — is closed by
+    /// routing all such erases through `eraseTopLevelOp`.
+    Operation *anchor = nullptr;
+    /// Clones of the external (body-less) declarations the item erased
+    /// while reconciling a redeclaration. Re-inserted on rollback so a call
+    /// imported against the prototype before the definition was reached
+    /// does not end up referencing a symbol that no longer exists.
+    SmallVector<Operation *> erasedExternalClones;
+  };
+
+  /// Captures the module state a rejected item must be rolled back to.
+  RecoveryCheckpoint checkpointModule();
+
+  /// Undoes a rejected item's module-level effect.
+  ///
+  /// Erases every `func::FuncOp` the item appended (which is where ALL
+  /// half-built IR lives — a function body is the only region the importer
+  /// fills incrementally), drops those symbols from `functions`, clears the
+  /// per-function scratch state whose `Value`s point into the erased bodies,
+  /// and re-inserts the prototypes the item's redeclaration reconciliation
+  /// erased.
+  ///
+  /// Deliberately NOT erased: the `struct_def`/`enum_def`/`global` operations
+  /// the item pulled in on demand while mapping its own types. Each of those
+  /// is emitted atomically by its own import routine and is tracked by a
+  /// name registry (`assignedStructNames`, `importedRecordShapes`,
+  /// `globals`, ...) that has no rollback of its own; erasing the operation
+  /// while leaving the registry entry would leave a later item referring to
+  /// a struct that is no longer defined, which is precisely the silent
+  /// corruption recovery exists to avoid. Leaving them costs an unused
+  /// definition in the emitted crate, which `#![allow(dead_code)]` already
+  /// covers. (The rejected alternative — rolling every registry back too —
+  /// was measured against this and rejected: it would have to unwind a
+  /// dozen maps plus the anonymous-record counter, and any one of them
+  /// missed is a dangling symbol rather than a dead one.)
+  void rollbackTo(const RecoveryCheckpoint &checkpoint);
+
+  /// Erases a MODULE-BODY operation, keeping any live recovery checkpoint's
+  /// anchor valid. Every erase of a module-level operation performed while
+  /// importing an item must go through here; erases of operations nested
+  /// inside a function body must not (they can never be the anchor).
+  void eraseTopLevelOp(Operation *op);
+
+  /// Resets the per-function scratch state to the same values
+  /// `importFunction`'s prologue establishes for a fresh function.
+  ///
+  /// Recovery needs this because that scratch state holds `Value`s and
+  /// `Block *`s pointing INTO the function body being erased: a following
+  /// item that read one would dereference freed IR. Normal (non-recovering)
+  /// import never needs it — the prologue overwrites every field before the
+  /// next body is built — so this is called only from `rollbackTo`, and it
+  /// must be kept in step with that prologue.
+  void resetPerFunctionState();
+
+  /// Imports one top-level declaration in recovery mode: captures the
+  /// importer's own error diagnostics instead of letting them print,
+  /// rolls the module back if the item rejected, tries a signature-only
+  /// `unimplemented!()` stub when the item was a function, records the
+  /// rejection in the ledger, and re-reports it as a WARNING.
+  ///
+  /// Returns failure only for a rejection that could not be attributed to
+  /// this item at all (today: none — every dispatch failure is recoverable),
+  /// so `importDeclsIn`'s loop keeps its ordinary `failed(...) -> return
+  /// failure()` shape.
+  LogicalResult importTopLevelDeclRecovering(const clang::Decl *decl);
+
+  /// Emits a stub for a rejected function: a `func::FuncOp` carrying the
+  /// real mapped signature whose whole body is
+  /// `unimplemented!("<reason>")`. Called by
+  /// `importTopLevelDeclRecovering` through `importFunction` (with
+  /// `recoveryStubOnly` set), which is what makes the stub's signature the
+  /// SAME signature the real import would have built rather than a
+  /// re-derived approximation — a stub whose parameter classification
+  /// differed from the real one would break every caller it exists to keep
+  /// compiling.
+  ///
+  /// The body is a single `emitrust.call_opaque "unimplemented!"` carrying
+  /// the function's result types, so the Rust emitter renders
+  /// `let vN: T = unimplemented!("...");` followed by `return vN;` — valid
+  /// for every result type because `unimplemented!()` has type `!`. (The
+  /// rejected alternative was a module-level `emitrust.verbatim` holding the
+  /// whole Rust function text: it renders fine, but it defines no MLIR
+  /// symbol, so every `func.call` to it would fail symbol resolution and the
+  /// module would not verify — exactly the callers the stub is for.)
+  LogicalResult emitRecoveryStub(func::FuncOp funcOp, Location loc);
 
   /// Located rejection for a main-file use of a declaration that
   /// `importTranslationUnit` skipped because it lives in a system header.
@@ -4082,6 +4200,35 @@ private:
   /// Shape of every imported enum, keyed by symbol name, for cross-TU
   /// deduplication and mismatch detection.
   llvm::StringMap<std::string> importedEnumShapes;
+  //===--------------------------------------------------------------------===//
+  // Recoverable import (FR-42) state
+  //===--------------------------------------------------------------------===//
+
+  /// Recoverable import mode; see `enableRecovery`. False by default, and
+  /// every code path that reads it is guarded so that a non-recovering
+  /// import executes exactly the instructions it always did.
+  bool recoverFromRejections = false;
+  /// Where recovered rejections are recorded; null unless recovery is on.
+  emitrust::RejectionLedger *rejectionLedger = nullptr;
+  /// The checkpoint of the item currently being imported under recovery, or
+  /// null. Held as importer state (rather than only on the stack) so
+  /// `eraseTopLevelOp` can keep its anchor valid from anywhere in the
+  /// import, however deeply nested.
+  RecoveryCheckpoint *activeCheckpoint = nullptr;
+  /// Signature-only import: `importFunction` builds the signature exactly as
+  /// it normally would and then, instead of importing the body, emits the
+  /// `unimplemented!()` stub body and returns. Set ONLY by
+  /// `importTopLevelDeclRecovering`, for the duration of one retry of an
+  /// already-rejected function.
+  bool recoveryStubOnly = false;
+  /// The reason text embedded in the stub emitted under `recoveryStubOnly`
+  /// — the verbatim diagnostic that rejected the real import.
+  std::string recoveryStubReason;
+  /// The MLIR symbol name the last stub claimed, read back by
+  /// `importTopLevelDeclRecovering` for the ledger (the mangling
+  /// `importFunction` applies is not reproducible from the AST alone).
+  std::string recoveryStubSymbol;
+
   /// The module receiving struct definitions and functions.
   ModuleOp module;
   /// Builder positioned inside the function body under construction.

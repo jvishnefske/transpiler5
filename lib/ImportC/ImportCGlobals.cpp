@@ -589,7 +589,11 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
              << "unsupported: conflicting definition of global variable '"
              << symbolName
              << "' (already defined in another translation unit)";
-    existingGlobal.erase(); // Upgrade the tentative definition to this one.
+    // Upgrade the tentative definition to this one. Routed through
+    // `eraseTopLevelOp` because this is a MODULE-BODY operation: a live
+    // recoverable-import checkpoint (FR-42) anchors on the last such
+    // operation and must be moved back if that is the one going away.
+    eraseTopLevelOp(existingGlobal.getOperation());
   }
 
   clang::QualType qualType = decl->getType();

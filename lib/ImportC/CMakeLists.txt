@@ -13,6 +13,8 @@ add_mlir_library(MLIREmitRustImportC
   ImportCHosted.cpp
   ImportCExpressions.cpp
   ImportCPlanning.cpp
+  ImportCRecovery.cpp
+  RejectionLedger.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/EmitRust
