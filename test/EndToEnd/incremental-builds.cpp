@@ -72,16 +72,26 @@ int main(void) {
 // items out of 7 rows.
 // PORTING-NEXT: | declared | 1 |
 //
-// The blocker table is the work queue, ranked; every C++ blocker appears.
-// PORTING: ## Blockers, most items first
+// The blocker tables are the work queue, ranked. FR-49 puts the ROOT table
+// first: here every rejected item is its OWN root (each names a construct
+// the FR-41 probe rejects directly, and none of the three depends on
+// another), so the two tables agree item for item -- but they say so in
+// their own vocabularies, the probe's construct names above and the FR-42
+// diagnostic tags below. Neither is translated into the other.
+// PORTING: ## Root blockers, most items first
+// PORTING-DAG: | base-class |
+// PORTING-DAG: | destructor |
+// PORTING-DAG: | reference-type |
+//
+// PORTING: ## Direct blockers, as reported
 // PORTING-DAG: | cxx-destructor |
 // PORTING-DAG: | cxx-inheritance |
 // PORTING-DAG: | cxx-references |
 //
 // PORTING: ## Project items
-// PORTING: | dropped | red | `Base` | record | cxx-destructor |
-// PORTING: | dropped | red | `Derived` | record | cxx-inheritance |
-// PORTING: | dropped | red | `bump` | function | cxx-references |
+// PORTING: | dropped | red | `Base` | record | destructor | Base | cxx-destructor |
+// PORTING: | dropped | red | `Derived` | record | base-class | Derived | cxx-inheritance |
+// PORTING: | dropped | red | `bump` | function | reference-type | bump | cxx-references |
 // PORTING: | ported | green | `Counter` | record |
 // PORTING: | ported | green | `c_main` | function |
 // PORTING: | ported | green | `total` | function |

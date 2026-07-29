@@ -66,6 +66,22 @@ struct RejectedItem {
   /// `unimplemented!()` stub carrying that signature was emitted in its
   /// place; false when the item was dropped from the module entirely.
   bool stubbed = false;
+  /// FR-49: the FR-40 item-graph node key of the record that ENCLOSES this
+  /// item, when the rejected declaration is an out-of-line C++ member
+  /// function of a file-scope class; empty for everything else (which is
+  /// every C item).
+  ///
+  /// A member function is not itself a graph node (`ItemGraph.h` documents
+  /// why), so a rejection of one cannot be joined to the FR-41 coloring on
+  /// its own symbol — and `symbol` here is the bare member spelling
+  /// (`area_x100`, `~Rect`), which three sibling classes may share. Its
+  /// enclosing CLASS is a node, is colored, and carries the poison chain
+  /// that names the real root blocker, so this field is the join key that
+  /// makes root-cause attribution possible for off-graph items. It is
+  /// recorded by the importer rather than recovered by name later precisely
+  /// because the name cannot be recovered: nothing in `area_x100` says
+  /// `Rect`.
+  std::string ownerSymbol;
 };
 
 /// Maps one verbatim importer diagnostic to a coarse blocker category.
@@ -90,6 +106,13 @@ struct RejectedItem {
 /// observed through a subprocess exit; an in-process importer cannot observe
 /// its own crash, so that tag is never produced here (the vocabulary still
 /// contains it, in the survey).
+///
+/// Symmetrically, two tags are produced ONLY here, from wordings a
+/// non-recovering whole-program run can never emit: `search-excluded`
+/// (FR-43's synthetic exclusion) and `cxx-cascaded-method` (FR-49; a C++
+/// member function whose class was already rejected and dropped). Both are
+/// tested before the shared tables and are absent from the survey's, which
+/// keeps the two vocabularies in step rather than adding dead entries there.
 ///
 /// \param diagnostic the verbatim diagnostic message (no location prefix).
 /// \param loc the diagnostic's location, used for the ambiguous wordings.

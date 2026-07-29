@@ -7,17 +7,100 @@
 //
 /// \file
 /// FR-44: the functional core of `emitrust-cc --emit=crate --incremental`.
-/// Pure functions that JOIN three inputs — the FR-40 whole-project item graph
+/// Pure functions that JOIN four inputs — the FR-40 whole-project item graph
 /// (the denominator: every item the project HAS), the FR-42 rejection ledger
 /// (the numerator's complement: every item the importer could not translate),
-/// and the symbol table of the module actually emitted (the evidence that a
-/// surviving item really did become Rust) — into one per-item report, and
-/// render it as `PORTING.md` (human) and `emitrust-progress.json` (machine).
+/// the symbol table of the module actually emitted (the evidence that a
+/// surviving item really did become Rust), and the FR-41 coloring (FR-49: the
+/// blame chain that says which construct is ACTUALLY to blame) — into one
+/// per-item report, and render it as `PORTING.md` (human) and
+/// `emitrust-progress.json` (machine).
 ///
 /// Nothing here touches the filesystem, the clock, or any other side effect:
-/// the imperative shell in emitrust-cc.cpp gathers the three inputs and
+/// the imperative shell in emitrust-cc.cpp gathers the four inputs and
 /// writes the two returned strings out, exactly as it does for CrateEmitter's
 /// `Cargo.toml`/`src/main.rs`.
+///
+//===----------------------------------------------------------------------===//
+//
+/// # FR-49: root-cause attribution
+///
+/// A rejection names the construct the importer TRIPPED OVER, which is very
+/// often not the construct to fix. `shapes` is the worked example: thirteen
+/// of its rejections read `unsupported: method of an unimported class`, one
+/// per member function of four classes — but every one of those methods is
+/// unimportable only because `Shape` has a user-declared destructor and
+/// `Rect`/`Circle`/`RightTriangle` have base classes. Ranking the backlog by
+/// the reported diagnostic points a reader at thirteen SYMPTOMS; ranking it
+/// by root cause points at the four constructs that would actually unblock
+/// them.
+///
+/// The attribution is a JOIN, not a new analysis. FR-41's `ItemColoring`
+/// already computes, for every non-Green item, the immediate poisoner
+/// (`via`), the edge that carried the poison, the whole `chain` to the
+/// inadmissible item at its root, and that root's `construct` tag. This file
+/// only looks it up and carries it into both artifacts:
+///
+///  - `ProgressItem::rootBlockerTag` is the coloring's `construct` — the ONE
+///    construct whose support would unblock the item.
+///  - `ProgressItem::blameChain` is the audit trail for that claim, so a
+///    reader can check the attribution instead of trusting it.
+///  - `ProgressReport::rootBlockerRanking` ranks by root; the pre-existing
+///    `blockerRanking` still ranks by the reported diagnostic. BOTH are
+///    published, in both artifacts. Nothing is thrown away.
+///
+/// ## Two vocabularies, deliberately not merged
+///
+/// A root tag comes from the FR-41 probe's construct vocabulary
+/// (`base-class`, `destructor`, `virtual-method`, `template`, ...); a direct
+/// tag comes from FR-42's `classifyBlocker` (`cxx-inheritance`,
+/// `cxx-destructor`, `dynamic-memory`, ...). They are different vocabularies
+/// with different provenance — one is a syntactic screen over the AST, the
+/// other a heuristic over diagnostic text shared with the RealWorld survey —
+/// and translating between them would invent an equivalence neither side
+/// guarantees. The artifacts therefore label which is which and keep both.
+///
+/// ## The fallback, and why it is not "unknown"
+///
+/// An item with no coloring entry, or one the coloring calls Green (the
+/// probe deliberately UNDER-approximates: it leaves Green everything it is
+/// unsure about, so most C rejections have no chain at all), is credited to
+/// its OWN direct blocker tag. That is the truthful answer — with no chain,
+/// the item is its own root — and it means the root ranking degrades exactly
+/// to the direct ranking on a project the coloring has nothing to say about,
+/// rather than collapsing into an `unknown` bucket.
+///
+/// ## Off-graph items: attribution through the enclosing class
+///
+/// C++ member functions are not item-graph nodes (`ItemGraph.h` documents
+/// why), so they have no color and no chain of their own — and all thirteen
+/// `shapes` symptoms are member functions. They are attributed to their
+/// enclosing CLASS, which IS a node, IS colored, and DOES carry a chain: the
+/// method's root is its class's root, and its blame chain is the method
+/// prepended to the class's. The join key is `RejectedItem::ownerSymbol`,
+/// recorded by the importer at rejection time, NOT recovered from the
+/// symbol: nothing in `area_x100` says `Rect`, and three sibling classes
+/// each define one.
+///
+/// Three limits of that mapping, stated rather than papered over:
+///
+///  1. A CONSTRUCTOR is spelled like its class (`Rect::Rect` is `Rect`), so
+///     its rejection collides with the class's own node key and is absorbed
+///     by the class's graph item by the join below — it never reaches
+///     `offGraphItems` at all. The absorbed row's root is still the class's
+///     root, which is the constructor's root too, so the ATTRIBUTION stays
+///     correct; what is conflated is the item IDENTITY (one row covers the
+///     class and its constructors). This predates FR-49 and is unchanged by
+///     it.
+///  2. A class the graph does not model — block-scope, or declared inside a
+///     namespace, or with no definition in the translation unit — yields an
+///     empty `ownerSymbol`, and its methods fall back to their own direct
+///     tag rather than being attributed to a node that is not there.
+///  3. The class's root explains why the method could not be imported IN
+///     THIS RUN. A method may independently contain constructs of its own
+///     that would block it even after its class is supported; the chain does
+///     not claim otherwise, and such a method simply reappears with a new
+///     blocker once its class is fixed.
 ///
 //===----------------------------------------------------------------------===//
 //
@@ -30,41 +113,51 @@
 /// a later per-item ratchet consumes this file, keys items by `symbol`, and
 /// reports the status transitions between two runs.
 ///
-/// \code
-/// {
-///   "schema": "emitrust-progress/1",   // format id; bump on any incompatible
-///   change "crate": "polygon",                // sanitized cargo package name
-///   "denominator_source": "item-graph",// "item-graph" | "ledger-only" (see
-///   below) "totals": {
-///     "graph_items":  8,   // items in the graph that CAN be ported (see
-///     `declared`) "ported":       2,   // emitted as a real Rust item
-///     "stubbed":      3,   // emitted as an unimplemented!() stub
-///     "dropped":      3,   // not emitted at all
-///     "missing":      0,   // in the graph, never rejected, yet absent from
-///     the module "declared":     0,   // prototype/extern-only; NOT counted in
-///     graph_items "off_graph_rejected": 0,  // rejected items the graph does
-///     not model "ported_permille": 250    // 1000 * ported / graph_items,
-///     truncated; 0 when graph_items == 0
-///   },
-///   "blockers": [                      // sorted by count desc, then tag
-///     { "tag": "cxx-references", "count": 5 }
-///   ],
-///   "items": [                         // the graph items; see ordering below
-///     {
-///       "symbol": "shoelace_twice",
-///       "kind": "function",            // function | record | enum | global
-///       "status": "dropped",           // ported | stubbed | dropped | missing
-///       | declared "color": "red",                // green | yellow | red |
-///       orange | grey "linkage": "extern",           // extern | intern "tu":
-///       0,                       // translation-unit index "file":
-///       "/abs/path/geom.cpp", "line": 5, "column": 52, "blocker":
-///       "cxx-references",   // "" when nothing was rejected "diagnostic":
-///       "unsupported: reference types are not yet supported"
-///     }
-///   ],
-///   "off_graph_items": [ ... same object shape, "kind" is "" ... ]
-/// }
-/// \endcode
+/// FR-49's additions are STRICTLY ADDITIVE — a new `root_blockers` array and
+/// three new per-item fields — so the version stays `emitrust-progress/1`:
+/// every key an `emitrust-progress/1` consumer reads is still present, still
+/// spelled the same, and still means the same thing. In particular
+/// `blockers` keeps its FR-44 meaning (the DIRECT, as-reported tally); the
+/// root-cause tally is the new key beside it, and the reordering to
+/// root-first happens only in `PORTING.md`, which has no consumers but
+/// people. Bumping the version would have forced `run_realworld.py`'s
+/// ratchet to change for a report it does not read a single new field of.
+///
+/// Field by field (the JSON itself carries no comments):
+///  - `schema` — format id; bumped only on an INCOMPATIBLE change.
+///  - `crate` — the sanitized cargo package name.
+///  - `denominator_source` — `item-graph` or `ledger-only`; see below.
+///  - `totals.graph_items` — graph items that CAN be ported (see `declared`).
+///  - `totals.ported` / `stubbed` / `dropped` / `missing` / `declared` — the
+///    per-status counts over `items`.
+///  - `totals.off_graph_rejected` — rejected items the graph does not model.
+///  - `totals.ported_permille` — `1000 * ported / graph_items`, truncated; 0
+///    when `graph_items` is 0.
+///  - `blockers` — the DIRECT, as-reported tally: `{ "tag", "count" }`
+///    objects sorted by count descending then tag ascending.
+///  - `root_blockers` — FR-49: the same items tallied by ROOT cause, same
+///    object shape and same order.
+///  - `items` — one object per graph item; ordering below.
+///  - `off_graph_items` — the same object shape for rejected items the graph
+///    does not model; `kind` and `linkage` are empty and `tu` is 0.
+///
+/// Each item object carries:
+///  - `symbol`, `kind` (`function`/`record`/`enum`/`global`), `status`
+///    (`ported`/`stubbed`/`dropped`/`missing`/`declared`), `color`
+///    (`green`/`yellow`/`red`/`orange`/`grey`), `linkage`
+///    (`extern`/`intern`), `tu`, `file`, `line`, `column`.
+///  - `blocker` — the FR-42 tag of the diagnostic actually raised; `""` when
+///    nothing was rejected.
+///  - `diagnostic` — that diagnostic, verbatim.
+///  - `root_blocker` — FR-49: the construct at the end of this item's blame
+///    chain, in the FR-41 probe vocabulary when a chain was available and in
+///    the FR-42 vocabulary when it was not; `""` when nothing was rejected.
+///  - `blame_chain` — FR-49: the audit trail for `root_blocker`, an array of
+///    symbols from this item to the root, `[]` when nothing was rejected and
+///    `[symbol]` when the item is its own root.
+///  - `attributed_via` — FR-49: the graph node whose chain was borrowed, for
+///    an off-graph item attributed through its enclosing class; `""`
+///    otherwise.
 ///
 /// ## What the denominator is, and what it deliberately is not
 ///
@@ -109,6 +202,7 @@
 #define EMITRUST_TOOLS_EMITRUST_CC_PROGRESSREPORT_H
 
 #include "EmitRust/ImportC.h"
+#include "EmitRust/Project/ItemColoring.h"
 #include "EmitRust/Project/ItemGraph.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -168,10 +262,27 @@ struct ProgressItem {
   std::string kind;
   /// What became of it.
   ItemStatus status;
-  /// The FR-42 blocker tag; empty unless the item was rejected.
+  /// The FR-42 blocker tag of the diagnostic this item actually raised — the
+  /// SYMPTOM. Empty unless the item was rejected.
   std::string blockerTag;
   /// The verbatim importer diagnostic; empty unless the item was rejected.
   std::string diagnostic;
+  /// FR-49: the construct at the end of this item's blame chain — the one
+  /// construct whose support would unblock it. Taken from the FR-41
+  /// coloring's `construct` when a chain was available (and then in the
+  /// PROBE's vocabulary: `base-class`, `destructor`, ...); otherwise equal to
+  /// `blockerTag`, because an item with no chain is its own root. Empty
+  /// exactly when `blockerTag` is.
+  std::string rootBlockerTag;
+  /// FR-49: the audit trail for `rootBlockerTag` — symbols from this item to
+  /// the root. Empty when the item was not rejected; `{symbol}` when the item
+  /// is its own root; for an off-graph item, `symbol` followed by its
+  /// enclosing class's own chain.
+  std::vector<std::string> blameChain;
+  /// FR-49: the graph node whose chain was borrowed, set only for an
+  /// off-graph item attributed through its enclosing class. Empty otherwise,
+  /// including for every graph item (which uses its own chain).
+  std::string attributedVia;
   /// Where to look: the item's declaration for a ported item, the rejection's
   /// own location for a rejected one (so it points at the offending
   /// construct, not at the enclosing declaration).
@@ -209,9 +320,16 @@ struct ProgressReport {
   /// port. Integer permille rather than a float so the artifacts contain no
   /// locale- or rounding-dependent text.
   unsigned portedPermille() const;
-  /// Blocker tags over `items` and `offGraphItems` together, ordered by count
-  /// descending then tag ascending — the ranked backlog.
+  /// DIRECT blocker tags over `items` and `offGraphItems` together, ordered
+  /// by count descending then tag ascending — what each item REPORTED.
   std::vector<std::pair<std::string, unsigned>> blockerRanking() const;
+  /// FR-49: the same items tallied by `rootBlockerTag` instead, same order —
+  /// the ranked backlog of constructs actually worth fixing. Both tallies
+  /// have the same total (every rejected item has exactly one of each), but
+  /// they concentrate differently: on `shapes` the direct tally is thirteen
+  /// cascade symptoms and one exclusion tag, while the root tally names the
+  /// four classes' two constructs.
+  std::vector<std::pair<std::string, unsigned>> rootBlockerRanking() const;
 };
 
 /// The names of every top-level symbol operation in `module`.
@@ -226,8 +344,8 @@ struct ProgressReport {
 /// \returns the set of top-level symbol names.
 llvm::StringSet<> collectEmittedSymbols(mlir::ModuleOp module);
 
-/// Joins the item graph, the rejection ledger, and the emitted symbol table
-/// into a report.
+/// Joins the item graph, the rejection ledger, the emitted symbol table, and
+/// (FR-49) the item coloring into a report.
 ///
 /// Rejections are first collapsed: the same declaration is rejected once per
 /// translation unit that parses the header holding it, so entries identical
@@ -237,19 +355,35 @@ llvm::StringSet<> collectEmittedSymbols(mlir::ModuleOp module);
 /// stubbed, else `Dropped`, and its reported location and diagnostic come
 /// from the first such rejection in declaration-walk order.
 ///
+/// FR-49: `coloring`, when given, supplies the root-cause attribution. A
+/// graph item takes its own `construct` and `chain`; an off-graph item takes
+/// its enclosing class's, found through `RejectedItem::ownerSymbol`. An item
+/// the coloring says nothing about keeps its direct tag as its root, so
+/// passing null degrades the report to FR-44's behavior with `root_blocker`
+/// simply mirroring `blocker` — never to a missing or `unknown` field.
+///
 /// \param crateName the sanitized cargo package name.
 /// \param graph the FR-40 item graph, or null when it could not be built.
+/// \param coloring the FR-41 coloring of that same graph, or null when it is
+///        unavailable; ignored unless `graph` is non-null.
 /// \param rejected the FR-42 ledger's items, in declaration-walk order.
 /// \param emittedSymbols the result of `collectEmittedSymbols`.
 /// \returns the fully sorted report.
 ProgressReport
 buildProgressReport(llvm::StringRef crateName,
                     const mlir::emitrust::ItemGraph *graph,
+                    const mlir::emitrust::ItemColoring *coloring,
                     llvm::ArrayRef<mlir::emitrust::RejectedItem> rejected,
                     const llvm::StringSet<> &emittedSymbols);
 
-/// Renders `PORTING.md`: a headline fraction, a ranked blocker table, the
-/// per-item table, and the off-graph table when it is nonempty.
+/// Renders `PORTING.md`: a headline fraction, the ROOT blocker table, the
+/// direct blocker table beneath it, the per-item table, and the off-graph
+/// table when it is nonempty.
+///
+/// FR-49 puts the root table FIRST because it is the work queue — the
+/// constructs whose support would unblock the most items — and keeps the
+/// direct table right under it, labelled as the symptoms, so the two are
+/// read together rather than one silently replacing the other.
 ///
 /// \param report the report to render.
 /// \returns the complete markdown text.

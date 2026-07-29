@@ -16,6 +16,11 @@
 /// `test/RealWorld/run_realworld.py`, table for table and in the same order:
 /// the system-header symbol, `_BLOCKER_SUBSTRINGS`, `_CXX_BLOCKER_SUBSTRINGS`,
 /// `_NODE_NAMED_RE`, `_AMBIGUOUS_POINTER`, then `other`.
+/// Two tags sit OUTSIDE that shared sequence and are tested before it,
+/// because both name wordings the Python twin can never observe (it reads a
+/// non-recovering whole-program run's stderr): `search-excluded` (FR-43's
+/// synthetic exclusion) and `cxx-cascaded-method` (FR-49's cascade, which
+/// only a recovering import can reach). Each is documented at its test.
 /// It is duplicated rather than shared
 /// because the two run in different languages at different times (a Python
 /// survey over subprocess stderr vs. an in-process C++ import), and the ONE
@@ -190,6 +195,27 @@ std::string mlir::emitrust::classifyBlocker(llvm::StringRef diagnostic,
       "excluded by the search state";
   if (diagnostic.starts_with(kSearchExcluded))
     return "search-excluded";
+
+  // FR-49: the CASCADE wording, tested second and, like the one above,
+  // outside the shared table. `importFunction` raises it when a C++ member
+  // function's class has no assigned struct name, which can only happen
+  // AFTER the class was rejected and dropped — i.e. only under recovering
+  // import (FR-42/FR-43). A non-recovering whole-program run dies on the
+  // class itself and never reaches the method, so `classify_blocker` in
+  // run_realworld.py — which tags whole-PROGRAM rejections observed through
+  // a subprocess — can never see this wording, exactly as it can never see
+  // `search-excluded`. Adding it to the shared C++ table would therefore add
+  // an entry the Python twin could never exercise; it is kept here instead,
+  // and the two vocabularies stay in step.
+  //
+  // The tag names the item as a SYMPTOM on purpose: the construct actually
+  // to blame is whatever sank the class, and FR-49's root attribution in
+  // ProgressReport.h credits it there through the class's FR-41 chain. This
+  // tag is what the item reports when no chain is available at all.
+  static constexpr llvm::StringLiteral kUnimportedClassMethod =
+      "method of an unimported class";
+  if (diagnostic.contains(kUnimportedClassMethod))
+    return "cxx-cascaded-method";
 
   // System-header rejections name the symbol they tripped over; the name is
   // the most informative tag available, so it is parsed out first
