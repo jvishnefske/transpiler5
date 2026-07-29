@@ -1,11 +1,11 @@
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/base-class.cpp 2>&1 | FileCheck %s --check-prefix=BASECLASS
-// RUN: not emitrust-import-c %t/reference-param.cpp 2>&1 | FileCheck %s --check-prefix=REFPARAM
+// RUN: not emitrust-import-c %t/reference-return.cpp 2>&1 | FileCheck %s --check-prefix=REFRETURN
 // RUN: not emitrust-import-c %t/template.cpp 2>&1 | FileCheck %s --check-prefix=TEMPLATE
 // RUN: not emitrust-import-c %t/try-catch.cpp 2>&1 | FileCheck %s --check-prefix=EXCEPTION
 
 // W2.0 AST-tolerance baseline. Two constructs get a dedicated located
-// rejection this wave (base classes, reference parameters); two more are
+// rejection this wave (base classes, references); two more are
 // already trivially rejected via EXISTING generic diagnostics that predate
 // W2.0 (class templates fall through the top-level decl dispatch exactly
 // like any other unrecognized Decl kind; a try/catch statement falls
@@ -33,15 +33,22 @@ int use(void) {
   return d.y;
 }
 
-//--- reference-param.cpp
-// REFPARAM: reference-param.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: reference types are not yet supported
-int add_one(int &x) {
-  return x + 1;
+//--- reference-return.cpp
+// FR-48 landed reference PARAMETERS, so the shape this case used to pin
+// (`int add_one(int &x)`) now imports as `&mut i32` and is pinned as an
+// ACCEPT in cpp-references.cpp instead. A reference RETURN is the residual
+// this slot now guards: returning a borrow means naming the lifetime it
+// stays valid for, and nothing in the signature distinguishes a referent
+// that outlives the call from a callee local, so it keeps a located
+// rejection rather than an elided-lifetime guess.
+// REFRETURN: reference-return.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: reference return types are not yet supported
+int &pick(int &x) {
+  return x;
 }
 
 int use(void) {
   int v = 41;
-  return add_one(v);
+  return pick(v);
 }
 
 //--- template.cpp

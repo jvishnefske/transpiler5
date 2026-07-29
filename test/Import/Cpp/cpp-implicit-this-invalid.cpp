@@ -9,8 +9,10 @@
 // documented starting point rather than discovering the wording fresh.
 //
 // The common thread is that none of these is blocked by the receiver
-// itself: each is blocked by a feature that FR-47 deliberately did not
-// expand into (virtual dispatch, cross-TU definition supply, references).
+// itself: each is blocked by something FR-47 deliberately did not expand
+// into (virtual dispatch, cross-TU definition supply) or, since FR-48, by
+// a genuine aliasing conflict that has nothing to do with `this` being
+// implicit.
 // Writing the same call with an EXPLICIT receiver (`other.m()`) rejects
 // identically, which is the evidence that the residual limitation is not
 // an implicit-`this` limitation.
@@ -56,12 +58,18 @@ int use(void) {
 }
 
 //--- this-ref-arg.cpp
-// Passing the receiver on to a sibling BY REFERENCE (`helper(*this)`)
-// needs reference parameters, which are separately ranked and out of
-// scope here; it is rejected at the parameter's type, before any call
-// site is reached. The implicit-`this` receiver of `helper` itself is
-// fine — only the extra `Node &` argument is not.
-// REFARG: this-ref-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: reference types are not yet supported
+// Passing the receiver on to a sibling BY REFERENCE (`merge(*this)`).
+// FR-48 landed reference parameters, so `Node &other` now maps to
+// `&mut Node` and the rejection MOVED from the parameter's type to the
+// call site — but it did not go away, and this case is now a SOUNDNESS
+// rejection rather than a missing feature. `merge(*this)` borrows one
+// object twice, once as the mutating method's receiver and once as the
+// `Node &` argument; Rust admits at most one mutable borrow, so emitting
+// it would produce a crate that does not compile. The same rule accepts
+// the shared/shared spelling (a `const` method taking `const Node &`,
+// pinned as an ACCEPT in cpp-references.cpp) and mirrors the same-base
+// rejection the C pointer path already applies to `f(&a, &a)`.
+// REFARG: this-ref-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: aliasing mutable reference argument and method receiver
 class Node {
 public:
   int merge(Node &other) { return v + other.v; }

@@ -66,12 +66,16 @@
 /// keep calling them Red until it is updated. The risk is bounded in the safe
 /// direction only by the under-approximation discipline for constructs the
 /// probe stays silent about; for the eleven it does screen, the mitigation is
-/// that each one is a permanent, by-design rejection with a single
-/// unconditional check in the importer (`base classes are not supported`,
-/// `virtual method`, `user-declared destructor`, `overloaded operator`,
-/// `reference types are not yet supported`, `_Atomic-qualified type`) or a
-/// construct the importer has no code for at all (templates, exceptions,
-/// inline asm, lambdas, `new`/`delete`).
+/// that each one is a by-design rejection with a single unconditional check
+/// in the importer (`base classes are not supported`, `virtual method`,
+/// `user-declared destructor`, `overloaded operator`, `_Atomic-qualified
+/// type`) or a construct the importer has no code for at all (templates,
+/// exceptions, inline asm, lambdas, `new`/`delete`). The C++ REFERENCE screen
+/// was one of these until FR-48 made references importable in the PARAMETER
+/// position; `typeConstructTag` now takes an `inParam` flag and exempts
+/// exactly the shapes `mapParamType` accepts, because screening a supported
+/// construct is this probe's unsafe direction. A screen that goes stale this
+/// way is the standing maintenance cost of the list above.
 //
 //===----------------------------------------------------------------------===//
 
@@ -269,6 +273,16 @@ constexpr llvm::StringLiteral NewDelete = "new-delete";
 /// that indirection is what the item graph's `Field` edges and this file's
 /// type poisoning are for, and following it here would make the probe's
 /// per-item verdict depend on other items.
+/// FR-48: the referent of a C++ LVALUE reference, or a null QualType. A local
+/// twin of `cxxReferentType` in the importer's internal header, which this
+/// library deliberately does not include.
+clang::QualType cxxReferentTypeForProbe(clang::QualType type) {
+  if (const auto *reference = llvm::dyn_cast<clang::LValueReferenceType>(
+          type.getCanonicalType().getTypePtr()))
+    return reference->getPointeeType();
+  return clang::QualType();
+}
+
 void forEachStructuralType(clang::QualType type,
                            llvm::function_ref<void(clang::QualType)> visit) {
   llvm::SmallVector<clang::QualType, 8> worklist{type};
@@ -313,14 +327,33 @@ void forEachStructuralType(clang::QualType type,
 /// about it.
 ///
 /// Only two type screens exist, and both are unconditional rejections in
-/// `CImporter::mapType` with no diverting path around them:
-/// `unsupported: reference types are not yet supported` and
-/// `unsupported: _Atomic-qualified type`. Every other type-shaped rejection
-/// the importer has is CONTEXTUAL (a data pointer is fine as a parameter and
-/// rejected as a return type; a `void *` is fine as an integer carrier; a
-/// `const char **` is fine as a string cursor) and is therefore left Green —
-/// see the under-approximation list.
-llvm::StringRef typeConstructTag(clang::QualType type) {
+/// `CImporter::mapType` with no diverting path around them: a C++ reference
+/// and `unsupported: _Atomic-qualified type`. Every other type-shaped
+/// rejection the importer has is CONTEXTUAL (a data pointer is fine as a
+/// parameter and rejected as a return type; a `void *` is fine as an integer
+/// carrier; a `const char **` is fine as a string cursor) and is therefore
+/// left Green — see the under-approximation list.
+///
+/// FR-48 made the REFERENCE screen contextual too, so it takes `inParam`:
+/// an lvalue reference in a PARAMETER position now imports (as `&T`/`&mut T`)
+/// and must NOT be screened, while a reference return, a reference member and
+/// a reference global stay unconditional rejections. Screening a supported
+/// construct is the probe's UNSAFE direction — it would color a genuinely
+/// portable item Red and drag its callers down with it — so the parameter
+/// exemption tracks `mapParamType` exactly, including the two shapes that
+/// stay rejected there (`T *&` and `T (&)[N]`).
+llvm::StringRef typeConstructTag(clang::QualType type, bool inParam = false) {
+  // The parameter exemption applies only to the OUTERMOST type: `void (*)(
+  // int &)` mentions a reference that is a parameter of the pointed-to
+  // function type, not of the item being probed, and the structural walk
+  // cannot tell the two apart once it has descended.
+  if (inParam) {
+    clang::QualType referent = cxxReferentTypeForProbe(type);
+    if (!referent.isNull() && !referent.getCanonicalType()->isArrayType() &&
+        !(referent.getCanonicalType()->isPointerType() &&
+          !referent.getCanonicalType()->isFunctionPointerType()))
+      return typeConstructTag(referent);
+  }
   llvm::StringRef found;
   forEachStructuralType(type, [&](clang::QualType current) {
     llvm::StringRef here;
@@ -475,7 +508,8 @@ void AdmissibilityProbe::probeFunction(const clang::FunctionDecl *func) {
   if (!returnTag.empty())
     verdicts.reject(symbol, returnTag, /*signatureLevel=*/true);
   for (const clang::ParmVarDecl *param : func->parameters()) {
-    llvm::StringRef paramTag = typeConstructTag(param->getType());
+    llvm::StringRef paramTag =
+        typeConstructTag(param->getType(), /*inParam=*/true);
     if (!paramTag.empty())
       verdicts.reject(symbol, paramTag, /*signatureLevel=*/true);
   }

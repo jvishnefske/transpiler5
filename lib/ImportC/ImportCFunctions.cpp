@@ -362,6 +362,17 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // no C++ return type to map (clang already reports void for one), but
   // the check is made explicit here rather than relying on that AST fact.
   if (!cxxIsCtor && !returnType->isVoidType()) {
+    // FR-48: a reference RETURN is the other hard position, rejected here
+    // (ahead of `mapType`'s residual) so the message names it. Returning a
+    // borrow means naming the lifetime it is valid for, and the model has
+    // no way to derive one: the referent may be a parameter's referent, a
+    // global, or — the miscompile case — a callee local, and nothing
+    // distinguishes them at the signature. Guessing an elided lifetime
+    // would silently accept the dangling case, so the rejection stands
+    // until an escape analysis can prove the referent outlives the call.
+    if (returnType->isReferenceType())
+      return emitError(loc)
+             << "unsupported: reference return types are not yet supported";
     // Returning an owned stream handle would let it escape its function
     // (C99-48 v1: no escapes); checked before the data-pointer return
     // classification below.

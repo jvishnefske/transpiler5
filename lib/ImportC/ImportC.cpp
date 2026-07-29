@@ -4923,14 +4923,8 @@ FailureOr<Value> CImporter::emitCxxThisPlace(Location loc) {
   // authority here (`importFunction` chose it when it built the signature),
   // and rederiving it from the AST would introduce a second, silently
   // divergable source of truth for the receiver struct type.
-  Type pointee;
-  if (auto mutRef =
-          llvm::dyn_cast<emitrust::MutRefType>(currentCxxThisRef.getType()))
-    pointee = mutRef.getPointee();
-  else if (auto sharedRef =
-               llvm::dyn_cast<emitrust::RefType>(currentCxxThisRef.getType()))
-    pointee = sharedRef.getPointee();
-  else
+  Type pointee = borrowPointee(currentCxxThisRef.getType());
+  if (!pointee)
     // Defensive: `importFunction` only ever binds `currentCxxThisRef` to the
     // entry block's leading ref/mut_ref receiver argument.
     return emitError(loc)
@@ -5012,6 +5006,26 @@ FailureOr<Value> CImporter::emitDeclRefLValue(const clang::DeclRefExpr *ref,
     return emitError(loc) << "unsupported: reference to an unknown variable";
   }
   Value place = it->second;
+  // FR-48: a C++ reference parameter's symbol IS the borrow, so the place
+  // its name denotes is the REFERENT, reached by the same fresh-per-use
+  // `emitrust.deref` `emitCxxThisPlace` builds for `this` (a `this`
+  // receiver is itself just an unnamed reference parameter, which is why
+  // the two share this shape rather than each rolling their own). Fresh
+  // per use for the same reason: a hoisted place would not dominate uses
+  // materialized inside a nested region.
+  //
+  // This branch sits ahead of the pointer-variable rejection below because
+  // that rejection is what a reference would otherwise hit: at the AST
+  // level a reference use has NO dereference node of its own (clang gives
+  // the `DeclRefExpr` the referent's type directly), so `x` on a
+  // reference parameter arrives here looking exactly like `p` on a pointer
+  // parameter — the one place the two shapes genuinely diverge.
+  if (isCxxReferenceDecl(ref->getDecl()))
+    if (Type pointee = borrowPointee(place.getType()))
+      return builder
+          .create<emitrust::DerefOp>(loc, emitrust::LValueType::get(pointee),
+                                     place)
+          .getResult();
   if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(place.getType()))
     return emitError(loc)
            << "unsupported: pointer variable used as an assignable place";

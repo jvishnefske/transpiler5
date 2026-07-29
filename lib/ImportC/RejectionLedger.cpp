@@ -116,6 +116,19 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("cxx-virtual")},
     {llvm::StringLiteral("overloaded operator"),
      llvm::StringLiteral("cxx-operator-overload")},
+    // FR-48 landed reference PARAMETERS; the four wordings below are the
+    // residual reference positions, all still tagged `cxx-references` so
+    // the backlog keeps ranking them as one blocker. "rvalue reference
+    // types are not yet supported" needs no entry of its own — it ends
+    // with the generic wording and matches it as a substring.
+    {llvm::StringLiteral("reference return types are not yet supported"),
+     llvm::StringLiteral("cxx-references")},
+    {llvm::StringLiteral("reference struct members are not yet supported"),
+     llvm::StringLiteral("cxx-references")},
+    {llvm::StringLiteral("reference-to-pointer parameter"),
+     llvm::StringLiteral("cxx-references")},
+    {llvm::StringLiteral("reference-to-array parameter"),
+     llvm::StringLiteral("cxx-references")},
     {llvm::StringLiteral("reference types are not yet supported"),
      llvm::StringLiteral("cxx-references")},
     {llvm::StringLiteral("is not a recognized STL type"),

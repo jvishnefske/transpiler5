@@ -133,11 +133,14 @@ int use(void) {
 }
 
 //--- refmember.cpp
-// Existing W2.0-era rejection: a reference-typed data member ("references
-// as members" this wave's OUT list) is rejected exactly like a
-// reference-typed function parameter, at the member declaration, whether
-// or not a method ever touches it.
-// REFMEMBER: refmember.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: reference types are not yet supported
+// A reference-typed data member is rejected at the member declaration,
+// whether or not a method ever touches it. FR-48 landed reference
+// PARAMETERS but deliberately did NOT land members, and the message was
+// sharpened to name the position: the difficulty here is ownership rather
+// than syntax -- the borrow outlives the expression that created it and is
+// stored in an object whose lifetime is unrelated to the referent's, so
+// the emitted struct would need a lifetime parameter nothing can infer.
+// REFMEMBER: refmember.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: reference struct members are not yet supported
 int global_val = 3;
 
 struct Holder {
