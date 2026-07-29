@@ -19,4 +19,4 @@
 fixed-stats TRANSPILED
 polygon REJECTED cxx-references
 shapes REJECTED cxx-destructor
-tokenizer REJECTED unsupported-assign-expr:CXXThisExpr
+tokenizer TRANSPILED

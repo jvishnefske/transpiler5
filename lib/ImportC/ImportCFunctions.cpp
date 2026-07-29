@@ -122,7 +122,8 @@ static bool isSliceRefinementOf(FunctionType earlier, FunctionType later) {
   return true;
 }
 
-LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
+LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
+                                        bool signatureOnly) {
   Location loc = translateLoc(func->getLocation());
   // W2.2: a constructor's `DeclarationName` has no ordinary identifier
   // spelling (`CXXConstructorName` is a distinct `DeclarationName::NameKind`),
@@ -187,7 +188,15 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
       !func->isReferenced())
     return success();
 
-  bool isDefinition = func->isThisDeclarationADefinition();
+  // FR-47: `signatureOnly` forces the body-less path for a declaration that
+  // DOES have a body, so `importCXXMethods`'s prepass can register every
+  // method of a class as an external stub before any of their bodies import.
+  // Expressed by clearing `isDefinition` alone (rather than by an early
+  // return from a separate signature-building routine) so that the stub's
+  // signature is computed by the ONE code path below that also computes the
+  // definition's — any divergence would trip the redeclaration check in the
+  // definition pass instead of silently emitting two shapes.
+  bool isDefinition = !signatureOnly && func->isThisDeclarationADefinition();
   // C `main` is renamed so the driver can emit its own Rust `main` wrapper;
   // the replacement name is therefore reserved, and any other spelling that
   // Rust reserves cannot be emitted as a Rust function name.

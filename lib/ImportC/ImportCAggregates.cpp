@@ -286,22 +286,60 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
 
 LogicalResult
 CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
+  // Whether `method` is one this walk imports at all; the two passes below
+  // must agree exactly, or the definition pass would emit a body for a
+  // symbol the signature pass never registered (or leave a stub behind).
+  auto isImportable = [](const clang::CXXMethodDecl *method) {
+    // Compiler-synthesized special members: out of scope.
+    return !method->isImplicit() && !method->isDeleted();
+  };
+  // Destructors, virtual methods, and overloaded operators were already
+  // rejected in `collectRecordFields`, before this class's struct_def (and
+  // so before this walk) ever ran; a copy/move/delegating constructor is
+  // out of the method wave's scope too (no value/aliasing semantics modeled
+  // for it) and is rejected here, the first point a constructor is
+  // inspected individually. Kept ahead of BOTH passes so a rejected class
+  // never half-imports.
   for (const clang::CXXMethodDecl *method : record->methods()) {
-    if (method->isImplicit() || method->isDeleted())
-      continue; // Compiler-synthesized special members: out of scope.
-    // Destructors, virtual methods, and overloaded operators were already
-    // rejected in `collectRecordFields`, before this class's struct_def
-    // (and so before this walk) ever ran; a copy/move/delegating
-    // constructor is out of this wave's scope too (no value/aliasing
-    // semantics modeled for it) and is rejected here, the first point a
-    // constructor is inspected individually.
+    if (!isImportable(method))
+      continue;
     if (const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method))
       if (ctor->isCopyOrMoveConstructor() || ctor->isDelegatingConstructor())
         return emitError(translateLoc(ctor->getLocation()))
                << "unsupported: copy/move/delegating constructor";
-    if (failed(importFunction(method)))
-      return failure();
   }
+  // FR-47, pass 1: register every method's SIGNATURE as an external stub
+  // before any body imports. A C++ member function body is a
+  // complete-class context — every member is visible from every other one,
+  // regardless of declaration order — whereas the single-pass,
+  // declaration-order import this file was built around only ever resolved
+  // a callee that had already been imported. Without this pass, a class
+  // whose methods call each other rejects with "call to unimported method"
+  // for every call that runs "up" the declaration order, most notably a
+  // constructor calling a method declared after it (`A() { init(); }`),
+  // which is the ordinary way such classes are written.
+  //
+  // Two alternatives were rejected. (a) Importing the missing callee ON
+  // DEMAND at the call site: a pair of mutually recursive methods would
+  // recurse forever, and it would make the emitted symbol order depend on
+  // call order. (b) Sorting methods into a call-graph topological order:
+  // no such order exists for mutual recursion, and it would still be a
+  // second, divergable notion of "which methods this class has". The
+  // prepass costs one extra signature computation per method and reuses
+  // the redeclaration reconciliation `importFunction` already performs for
+  // a C prototype later satisfied by its definition.
+  for (const clang::CXXMethodDecl *method : record->methods())
+    if (isImportable(method))
+      if (failed(importFunction(method, /*signatureOnly=*/true)))
+        return failure();
+  // Pass 2: import each body. A method DEFINED OUT OF LINE (declared in the
+  // class, defined in a `.cpp`) has no body here, so it stays the stub pass
+  // 1 built and is filled in when the translation-unit walk reaches its
+  // out-of-line definition — exactly the behavior this walk had before.
+  for (const clang::CXXMethodDecl *method : record->methods())
+    if (isImportable(method))
+      if (failed(importFunction(method)))
+        return failure();
   return success();
 }
 
