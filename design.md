@@ -1496,27 +1496,56 @@ of references or inheritance, so it precedes both.
   fractions unmoved — attribution changes the REPORT, not what ports.
   (test/Driver/incremental-root-blockers.cpp)
 
-- [ ] FR-50 `--search` must never lose to `--incremental` (open, W5.10).
-  A REGRESSION found by verifying FR-49's incidental finding. Repro:
-  `struct Derived : BaseA` (genuinely unsupported) and
-  `struct Holder { Derived d; int k; }` — FR-41 colors `Holder` **red**
-  via its `Field` edge, but the recovering importer imports `Holder`
-  happily. That is a FALSE RED, which the FR-41 contract says must never
-  happen, and its cost is not symmetric with a false Green: FR-43's search
-  only ever DROPS items, never adds them back, so a false Red is a
-  permanent loss. Measured: `--incremental` ports 4/5, `--incremental
-  --search` ports **3/5** — the flagship search produces strictly worse
-  output than not searching. This also sharpens FR-43's negative result:
-  the search cannot help and CAN hurt.
-  Two fixes required. (a) A safety net making the invariant hold
-  regardless of coloring precision — the unrestricted recovering import is
-  itself a valid candidate state, so the search must evaluate it and keep
-  the best, after which a coloring bug costs time but never items. (b) The
-  root cause: determine when a Red field type genuinely blocks its holder
-  and pick a rule respecting the under-approximation contract, with the
-  asymmetry argument recorded in the header — **false Greens cost a probe,
-  false Reds cost items permanently**. `Base` and `SigType` are to be
-  re-checked empirically rather than trusted.
+- [x] FR-50 `--search` never loses to `--incremental`, plus a real
+  miscompile fix (W5.10). Opened from a measured regression — but **the
+  premise was partly wrong, and the truth was worse**. The trigger was
+  `--incremental` reporting 4/5 ported where `--incremental --search`
+  reported 3/5, read as FR-43's search losing a portable item to an FR-41
+  false Red. The 4/5 was a FICTION: `Holder` emitted as
+  `{ d: Derived, k: i32 }` referencing a struct that had been dropped, and
+  `rustc` rejects that crate with `E0412`. That fourth item never existed.
+  Root cause, more serious than the reported symptom: `importedRecords`
+  was marked BEFORE the field walk, so a rejected record still handed back
+  an emitted name and `mapType` built `!emitrust.struct<"S">` for a struct
+  nobody defines. `importRecord` now remembers rejections
+  (`rejectedRecords`) and fails again at the use site so the rejection
+  CASCADES — exactly as FR-41 predicts. This materially strengthens
+  FR-42/FR-44's "the incremental crate compiles" claim, which was
+  previously violable by ANY dropped record with a by-value dependent, and
+  without it the new safety net would have preferred the broken crate.
+  (a) **Safety net.** The plain recovering import is itself a state in the
+  search space — the one whose `excludedItems` is empty — so
+  `frontierSearch` probes it unconditionally as node 1 and scores it with
+  the existing rule. Since `best` is a maximum over probed states and the
+  baseline is always one of them, the property is STRUCTURAL, not
+  aspirational. Asserted in `frontierSearch` AND checked unconditionally in
+  `emitrust-cc` with a loud internal error plus fallback, because `assert`
+  compiles out of Release — exactly where users rely on the guarantee. The
+  budget floor rises to 2 so `--max-search-nodes` cannot switch the
+  guarantee off; cost stays one probe when baseline == root.
+  (b) **The coloring rule.** A `Field` edge poisons iff the emitted Rust
+  SPELLS the target: by-value, array-of, and function-prototype fields do;
+  a POINTER field does not (it emits as `i64`), and becomes a new
+  `FieldIndirect` edge kind — appended to the enum so every existing
+  enumerator keeps its value and all golden `--emit=item-graph` output is
+  untouched. `SigType` was re-checked empirically and IS exact (a
+  `struct Atom *` PARAMETER emits as `&mut Atom` and does name the record,
+  so there is no pointer exemption there). `Base` is vacuous — a record
+  with a direct base is already an inadmissible seed.
+  KNOWN REMAINING false Red, deliberately left: `BodyType` through a
+  pointer. It costs one STUB-REPLACEABLE function (callers stay Yellow)
+  and the safety net now recovers it — verified, both cases show the
+  baseline winning.
+  The asymmetry is now recorded in `ItemColoring.h` where it belongs:
+  **a false Green costs a probe, a false Red costs items permanently.**
+  Gates: `--emit=rust` and `--emit=crate --incremental` both
+  byte-identical without `--search`; c-testsuite inert at 220/220; corpus
+  colorings unchanged item for item; a permanent per-project gate that
+  `--search` >= no-search, whose reference is the IMPORTER rather than the
+  coloring — the only test in the tree that can catch a false Red.
+  (test/Project/search-false-red.cpp, test/Project/coloring-field-indirect.c,
+  test/Project/item-graph-field-indirect.c,
+  test/RealWorld/Cpp/search-never-worse.cpp)
 
 ### Cherry-pick assessment: `verified_transpilation_pipeline`
 
