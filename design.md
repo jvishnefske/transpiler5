@@ -1445,6 +1445,79 @@ of references or inheritance, so it precedes both.
   blockers: `cxx-references` (`polygon`), `cxx-destructor` (`shapes`).
   (test/Import/Cpp/cpp-implicit-this.cpp, test/EndToEnd/cpp-method-chain.cpp)
 
+- [x] FR-48 C++ reference types (W5.9, rank 1 of the W5.6 backlog).
+  `const T&` and `T&` PARAMETERS map onto the EXISTING FR-28
+  pointer-parameter classification rather than a parallel path: a C++
+  reference is a pointer that is non-null, never reseated and never
+  arithmetic — a strictly simpler case of machinery the importer already
+  has. Reference RETURNS and reference MEMBERS stay rejected with located
+  diagnostics; lifetime and ownership for those are not settled by this
+  wave. Binding a prvalue to a `const T&` (`twice(a + b)`, `twice(7)`)
+  stages the value into a fresh local and borrows that, reproducing the
+  C++ full-expression lifetime as `let t = ...; f(&t)` — sound because the
+  borrow is SHARED, so a temporary has no other name, nothing can observe
+  it, and there is no caller-visible write to lose; C++ forbids binding a
+  prvalue to `T&`, so the mutable case is unreachable (guarded anyway).
+  An independent review hand-traced aliasing (`f(x,x)`, `a.m(a)`,
+  `a.m(a.field)`, reborrow across nested calls, reference-to-reference
+  forwarding), the `emitBorrowArgument` discriminator, C-path neutrality
+  of the `placeExprRoot` refactor, and `const T&` write-through, and found
+  no soundness issue. KNOWN GAP, fails closed rather than miscompiling: a
+  reference-to-function-pointer parameter is accepted by `mapParamType`
+  but its argument path ends in a located "unsupported pointer
+  expression".
+  **Measured: `polygon` 2/8 -> 4/8**, its first blocker walking forward
+  from `cxx-references` to `unsupported-stmt:CXXForRangeStmt` (3 items);
+  corpus 19/31 -> 21/31. Byte-identical `--emit=rust` over all 91
+  `test/EndToEnd/*.c`; c-testsuite inert at 220/220.
+  (test/Import/Cpp/cpp-references*.cpp, test/EndToEnd/cpp-references.cpp)
+
+- [x] FR-49 Root-cause blocker attribution (W5.8). Measured defect:
+  `--incremental` on `shapes` reported `other 13`, every one of them the
+  identical `unsupported: method of an unimported class` — untagged, and a
+  CASCADE SYMPTOM rather than a cause. Those 13 methods are unimportable
+  only because `Shape` has a user-declared destructor and three siblings
+  have base classes, so the artifact a person reads to choose work pointed
+  at 13 derived symptoms instead of 4 real roots. FR-41 already computes
+  the poison chain and the root construct tag; this JOINS it into the
+  report rather than recomputing it. Each item now carries its direct
+  blocker AND its root blocker plus the chain, so attribution is
+  auditable, and the table ranks by root cause while keeping the direct
+  tally. `shapes` now reads `base-class 16 / destructor 3` against a direct
+  `cxx-cascaded-method 13`.
+  Off-graph member functions (not item-graph nodes) attribute to their
+  enclosing CLASS's node via a new `RejectedItem::ownerSymbol` recorded by
+  the importer at rejection time — NOT recovered from the symbol, because
+  it cannot be: nothing in `area_x100` says `Rect`, and three sibling
+  classes each define one. Schema deliberately NOT bumped: the additions
+  are strictly additive and `blockers` keeps its FR-44 meaning, so
+  `run_realworld.py`'s ratchet reads the same keys with the same values.
+  Emitted Rust byte-identical over all 102 EndToEnd inputs; corpus
+  fractions unmoved — attribution changes the REPORT, not what ports.
+  (test/Driver/incremental-root-blockers.cpp)
+
+- [ ] FR-50 `--search` must never lose to `--incremental` (open, W5.10).
+  A REGRESSION found by verifying FR-49's incidental finding. Repro:
+  `struct Derived : BaseA` (genuinely unsupported) and
+  `struct Holder { Derived d; int k; }` — FR-41 colors `Holder` **red**
+  via its `Field` edge, but the recovering importer imports `Holder`
+  happily. That is a FALSE RED, which the FR-41 contract says must never
+  happen, and its cost is not symmetric with a false Green: FR-43's search
+  only ever DROPS items, never adds them back, so a false Red is a
+  permanent loss. Measured: `--incremental` ports 4/5, `--incremental
+  --search` ports **3/5** — the flagship search produces strictly worse
+  output than not searching. This also sharpens FR-43's negative result:
+  the search cannot help and CAN hurt.
+  Two fixes required. (a) A safety net making the invariant hold
+  regardless of coloring precision — the unrestricted recovering import is
+  itself a valid candidate state, so the search must evaluate it and keep
+  the best, after which a coloring bug costs time but never items. (b) The
+  root cause: determine when a Red field type genuinely blocks its holder
+  and pick a rule respecting the under-approximation contract, with the
+  asymmetry argument recorded in the header — **false Greens cost a probe,
+  false Reds cost items permanently**. `Base` and `SigType` are to be
+  re-checked empirically rather than trusted.
+
 ### Cherry-pick assessment: `verified_transpilation_pipeline`
 
 The archived prototype (`~/src/archive/verified_transpilation_pipeline` on
