@@ -286,8 +286,17 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     if (const auto *ref =
             llvm::dyn_cast<clang::DeclRefExpr>(sub->IgnoreParens())) {
       // A pointer parameter read as a value yields its reference SSA value.
+      //
+      // FR-48 excludes a C++ reference parameter from that shortcut, and
+      // the exclusion is the whole semantic difference between the two: a
+      // pointer's value IS the borrow (`p` reads the pointer), whereas a
+      // reference's value is its REFERENT (`x` reads the pointee). Falling
+      // through sends it to the ordinary `emitLValue` + `loadPlace` path,
+      // where `emitDeclRefLValue`'s reference branch derefs the borrow
+      // first — one `emitrust.deref` plus one `emitrust.load`, exactly
+      // what `*p` on the equivalent pointer parameter emits.
       auto it = symbols.find(ref->getDecl());
-      if (it != symbols.end() &&
+      if (it != symbols.end() && !isCxxReferenceDecl(ref->getDecl()) &&
           llvm::isa<emitrust::MutRefType, emitrust::RefType>(
               it->second.getType()))
         return it->second;
@@ -2232,9 +2241,74 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
                                                  /*is_mut=*/!method->isConst())
                      .getResult();
 
+  // FR-48: the receiver's own identity, for the same-object aliasing check
+  // on reference arguments below. A method call borrows the receiver AND
+  // each reference argument at once, so `a.m(a)` would emit two borrows of
+  // one object — the C path already rejects the equivalent `f(&a, &a)`
+  // ("aliasing mutable pointer arguments"), and the receiver is simply one
+  // more borrow to include in that rule.
+  const clang::Expr *receiverExpr =
+      call->getImplicitObjectArgument()->IgnoreParenImpCasts();
+  const clang::VarDecl *receiverRoot = placeExprRoot(receiverExpr);
+  bool receiverIsThis = rootsAtCxxThis(receiverExpr);
+  bool receiverIsMut = !method->isConst();
+
   SmallVector<Value> arguments(targetType.getNumInputs(), Value());
   arguments[0] = addrOf;
+  // Every borrow the call holds at once, so each new one can be checked
+  // against all of them. The receiver occupies slot 0 and is a borrow like
+  // any other; `borrowedThis` stands in for the receiver object when the
+  // call site names it as `this` (no `VarDecl` can express that).
+  SmallVector<std::pair<const clang::VarDecl *, bool>, 4> heldBorrows;
+  bool borrowedThis = receiverIsThis;
+  bool borrowedThisIsMut = receiverIsThis && receiverIsMut;
+  if (receiverRoot)
+    heldBorrows.push_back({receiverRoot, receiverIsMut});
   for (auto [index, argExpr] : llvm::enumerate(call->arguments())) {
+    Type input = targetType.getInput(index + 1);
+    // FR-48: a reference PARAMETER on a method takes exactly the borrow
+    // argument a free function's does — same `emitBorrowArgument`, same
+    // `emitrust.addr_of`. Before FR-48 no method parameter could ever have
+    // a ref/mut_ref type (a reference parameter never mapped), so this
+    // loop passed every argument by value; that is why the branch is new
+    // here rather than pre-existing.
+    if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(input)) {
+      // Two borrows of one object are sound only if BOTH are shared. Every
+      // borrow the call already holds is checked, not just the receiver:
+      // `a.m(a)` and `m(*this)` collide with the RECEIVER, while
+      // `a.m(x, x)` collides argument-with-argument, and both would emit
+      // Rust that fails borrowck. `emitCall` applies the same rule to a
+      // free function's arguments; the only thing this adds is that the
+      // receiver counts as one of the borrows.
+      bool argIsMut = llvm::isa<emitrust::MutRefType>(input);
+      const clang::VarDecl *argRoot = placeExprRoot(argExpr);
+      bool argIsThis = rootsAtCxxThis(argExpr);
+      bool collides = argIsThis && borrowedThis &&
+                      (argIsMut || borrowedThisIsMut);
+      if (!collides && argRoot)
+        for (auto [heldRoot, heldIsMut] : heldBorrows)
+          if (heldRoot == argRoot && (argIsMut || heldIsMut)) {
+            collides = true;
+            break;
+          }
+      if (collides)
+        return emitError(loc)
+               << "unsupported: aliasing mutable reference argument and "
+                  "method receiver";
+      if (argRoot)
+        heldBorrows.push_back({argRoot, argIsMut});
+      if (argIsThis) {
+        borrowedThis = true;
+        borrowedThisIsMut = borrowedThisIsMut || argIsMut;
+      }
+      const clang::VarDecl *unusedRoot = nullptr;
+      FailureOr<Value> reference =
+          emitBorrowArgument(loc, argExpr, input, unusedRoot);
+      if (failed(reference))
+        return failure();
+      arguments[index + 1] = *reference;
+      continue;
+    }
     FailureOr<Value> value = emitRValue(argExpr);
     if (failed(value))
       return failure();
@@ -2736,17 +2810,46 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
                                                Type paramType,
                                                const clang::VarDecl *&root) {
   root = nullptr;
-  Type pointee;
-  bool isMutParam = false;
-  if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(paramType)) {
-    pointee = mutRef.getPointee();
-    isMutParam = true;
-  } else if (auto sharedRef = llvm::dyn_cast<emitrust::RefType>(paramType)) {
-    // Shared byte-slice parameters (`const unsigned char *`, CTS-BR
-    // 00216) borrow their region base immutably.
-    pointee = sharedRef.getPointee();
-  } else {
+  // Shared byte-slice parameters (`const unsigned char *`, CTS-BR 00216)
+  // and `const T&` parameters (FR-48) borrow immutably; everything else
+  // borrows mutably.
+  Type pointee = borrowPointee(paramType);
+  bool isMutParam = llvm::isa<emitrust::MutRefType>(paramType);
+  if (!pointee)
     return emitError(loc) << "unsupported reference parameter type";
+
+  // FR-48: the argument bound to a C++ reference parameter. C spells this
+  // borrow explicitly (`f(&x)`) and C++ does not (`f(x)`) — the argument
+  // is a bare lvalue of the referent's type with no address-of node — so
+  // the ONE thing that has to be reconstructed is the borrow itself. The
+  // discriminator is the argument's own type: it is a non-pointer lvalue
+  // exactly when the parameter it feeds is a reference, since every other
+  // path into this function passes a pointer-typed expression.
+  //
+  // Everything downstream is then shared with the C path unchanged: the
+  // place comes from `emitLValue` (so a plain variable, a member, and an
+  // element all work, and a global correctly hits
+  // `rejectGlobalPointerArgument` rather than silently borrowing a staged
+  // copy), the borrow is the same `emitrust.addr_of`, and `root` is set so
+  // `emitCall`'s same-base aliasing rejection covers `f(x, x)` — the C++
+  // spelling of the `f(&x, &x)` it already rejects.
+  if (!argument->getType()->isPointerType() && argument->isLValue()) {
+    const clang::Expr *placeExpr = stripLValueNoOp(argument);
+    const clang::VarDecl *localRoot = placeExprRoot(placeExpr);
+    if (localRoot && !localRoot->hasLocalStorage())
+      return rejectGlobalPointerArgument(loc, localRoot);
+    FailureOr<Value> place = emitLValue(placeExpr);
+    if (failed(place))
+      return failure();
+    auto lvalueType =
+        llvm::dyn_cast<emitrust::LValueType>((*place).getType());
+    if (!lvalueType || lvalueType.getValueType() != pointee)
+      return emitError(loc) << "unsupported: argument type does not match "
+                               "the reference parameter";
+    root = localRoot;
+    return builder
+        .create<emitrust::AddrOfOp>(loc, paramType, *place, isMutParam)
+        .getResult();
   }
 
   if (auto sliceType = llvm::dyn_cast<emitrust::SliceType>(pointee)) {

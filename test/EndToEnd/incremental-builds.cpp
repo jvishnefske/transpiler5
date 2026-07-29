@@ -5,11 +5,11 @@
 //
 // The out-of-subset part is drawn from the two blockers the RealWorld C++
 // corpus's rejecting projects (`shapes`, `polygon`) are made of: a class with
-// a base and a user-declared destructor, and a function taking a reference.
+// a base and a user-declared destructor, and a function returning a reference.
 // Neither is stubbable as a whole item -- the class is dropped, the reference
 // signature never maps -- so this exercises the case where the report's
 // denominator can only come from the FR-40 item graph: `Base`, `Derived` and
-// `bump` leave no trace whatsoever in the emitted module, and counting emitted
+// `pick` leave no trace whatsoever in the emitted module, and counting emitted
 // symbols would silently report 3 of 3 instead of the honest 3 of 6.
 //
 // The crate is BUILT, not merely emitted: "it compiles" is the entire promise
@@ -46,9 +46,12 @@ public:
   int extra;
 };
 
-// --- Out of subset: a reference parameter. The signature never maps, so this
-// --- is dropped rather than stubbed.
-void bump(Counter &c) { c.n = c.n + 1; }
+// --- Out of subset: a reference RETURN. FR-48 landed reference PARAMETERS
+// --- (so `Counter &c` maps fine now, as `&mut Counter`), but returning a
+// --- borrow would need a lifetime the model cannot derive, so the signature
+// --- still never maps and this is dropped rather than stubbed -- keeping
+// --- this file's third blocker `cxx-references`, as it was before FR-48.
+int &pick(Counter &c) { return c.n; }
 
 // `main` is in the subset on its own and stays a real, running function: the
 // crate's binary exits 42, which is what makes "the crate builds" a claim
@@ -81,7 +84,7 @@ int main(void) {
 // PORTING: ## Project items
 // PORTING: | dropped | red | `Base` | record | cxx-destructor |
 // PORTING: | dropped | red | `Derived` | record | cxx-inheritance |
-// PORTING: | dropped | red | `bump` | function | cxx-references |
+// PORTING: | dropped | red | `pick` | function | cxx-references |
 // PORTING: | ported | green | `Counter` | record |
 // PORTING: | ported | green | `c_main` | function |
 // PORTING: | ported | green | `total` | function |

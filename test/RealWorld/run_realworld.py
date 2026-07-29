@@ -274,6 +274,15 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("virtual or unresolved member call", "cxx-virtual-call"),
     ("unsupported: virtual method", "cxx-virtual"),
     ("overloaded operator", "cxx-operator-overload"),
+    # FR-48 landed reference PARAMETERS; the four wordings below are the
+    # residual reference positions, all still tagged `cxx-references` so the
+    # backlog keeps ranking them as one blocker. "rvalue reference types are
+    # not yet supported" needs no entry of its own -- it ends with the
+    # generic wording and matches it as a substring.
+    ("reference return types are not yet supported", "cxx-references"),
+    ("reference struct members are not yet supported", "cxx-references"),
+    ("reference-to-pointer parameter", "cxx-references"),
+    ("reference-to-array parameter", "cxx-references"),
     ("reference types are not yet supported", "cxx-references"),
     ("is not a recognized STL type", "stl-unrecognized-type"),
     ("is not a recognized STL method", "stl-unrecognized-method"),

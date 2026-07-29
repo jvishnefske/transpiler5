@@ -65,14 +65,32 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     return emitError(loc) << "unsupported: volatile-qualified type";
   if (canonical->isAtomicType())
     return emitError(loc) << "unsupported: _Atomic-qualified type";
-  // W2.0: a C++ reference (lvalue `T&` or rvalue `T&&`) has no
-  // representation in this model — checked with a sharpened, dedicated
-  // message ahead of the generic tail rejection so a reference parameter
-  // (the shape `mapParamType` falls through to this function for, since a
-  // reference is not a pointer type) gets a clear diagnostic instead of
-  // the generic "unsupported type '...'" spelling. References themselves
-  // are out of scope for every wave through W2.0; only the located
-  // rejection is pinned.
+  // FR-48: a C++ reference. An lvalue reference in a PARAMETER position is
+  // supported and never arrives here: `mapParamType` intercepts it ahead
+  // of its `mapType` delegation and maps it onto the same borrow types a
+  // `ParamKind::ScalarRef` pointer parameter already uses. Every OTHER
+  // position stays rejected, each with its own located wording so a later
+  // wave has a documented starting point instead of discovering the
+  // message fresh (the sharpening W2.0 did for references as a whole,
+  // continued one level down now that one of the positions works).
+  //
+  // An rvalue reference is separated out because it is a different
+  // problem, not a harder version of the same one: binding `T&&` implies
+  // a MOVE, and this model has no ownership transfer to express it with,
+  // so no amount of borrow machinery reaches it.
+  if (canonical->isRValueReferenceType())
+    return emitError(loc)
+           << "unsupported: rvalue reference types are not yet supported";
+  // The residual lvalue-reference positions — a reference LOCAL, a
+  // reference global, a reference behind a pointer, a reference to a
+  // pointer. A reference local is the interesting one and is deliberately
+  // NOT supported: its binding is a borrow that lives from the
+  // declaration to the end of scope, so `int &r = x; r = 1; x = 2; r = 3;`
+  // would emit a `&mut x` held across an independent use of `x` and fail
+  // Rust's borrow checker. A parameter has no such hazard — its borrow is
+  // created and consumed inside one call expression, and each use inside
+  // the callee derefs afresh — which is exactly why parameters land this
+  // wave and locals do not.
   if (canonical->isReferenceType())
     return emitError(loc) << "unsupported: reference types are not yet supported";
 
@@ -428,6 +446,57 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
   // which names caller-owned storage — keeps the located rejection; the
   // deep scan also covers the Carrier shape that bypasses `mapType`.
   clang::QualType canonical = type.getCanonicalType().getUnqualifiedType();
+  // FR-48: a C++ lvalue reference parameter. A reference is a pointer that
+  // is non-null, never reseated, and never subject to arithmetic, so it is
+  // the STRICTLY SIMPLER case of the `ParamKind::ScalarRef` pointer
+  // parameter directly below, and it reuses that class's machinery whole
+  // rather than growing a parallel path: the same two borrow types, the
+  // same direct SSA binding in `bindOrdinaryParam`, the same
+  // `emitrust.deref`-per-use place resolution, and the same
+  // `emitrust.addr_of` argument at the call site.
+  //
+  // The one thing it does NOT reuse is `classifyPointerParams`, and it
+  // does not need to: that classification exists to decide whether a
+  // pointer parameter is walked (a slice) or only dereferenced (a scalar
+  // reference), and C++ forbids the walking case outright — a reference
+  // cannot be incremented or subscripted as a reference. Every reference
+  // parameter is a scalar borrow by construction, so it is answered here
+  // and never consults `kind` at all. For the same reason
+  // `PointerRegionAnalysis` (FR-28) needs no extension: it already
+  // excludes `ParmVarDecl`s from region tracking, and a reference
+  // parameter has no cursor to track.
+  //
+  // Mutability comes from the referent's constness — `const T&` borrows
+  // shared (`!emitrust.ref<T>`), `T&` borrows mutably
+  // (`!emitrust.mut_ref<T>`). Note this is FINER than the pointer
+  // parameter's own scalar fall-through, which hands back `mut_ref` even
+  // for a `const T *`: C++ code says `const T&` where C code says `T *`,
+  // so honoring const here is what makes the emitted Rust idiomatic
+  // rather than uniformly `&mut`.
+  if (clang::QualType referent = cxxReferentType(canonical);
+      !referent.isNull()) {
+    // Deep volatile keeps the C99-7 rejection: the referent names
+    // caller-owned storage, exactly like a pointee.
+    if (hasVolatileQualifier(astContext(), referent))
+      return emitError(loc) << "unsupported: volatile-qualified type";
+    // A reference TO a data pointer (`T *&`) has no representation for the
+    // same reason `T **` does not: the pointee is a pointer, which the
+    // model decomposes into (base, cursor) rather than storing. A
+    // function pointer is an ordinary Copy value and is fine.
+    if (isDataPointer(referent))
+      return emitError(loc) << "unsupported: reference-to-pointer parameter";
+    // A reference to an array (`int (&)[N]`) would borrow a whole array
+    // object; the slice machinery is reached through pointer decay, which
+    // a reference parameter never performs, so there is nothing to bind.
+    if (referent.getCanonicalType()->isArrayType())
+      return emitError(loc) << "unsupported: reference-to-array parameter";
+    FailureOr<Type> inner = mapType(referent, loc);
+    if (failed(inner))
+      return failure();
+    if (referent.isConstQualified())
+      return Type(emitrust::RefType::get(*inner));
+    return Type(emitrust::MutRefType::get(*inner));
+  }
   if (canonical->isPointerType() && !canonical->isFunctionPointerType() &&
       hasVolatileQualifier(astContext(), canonical->getPointeeType()))
     return emitError(loc) << "unsupported: volatile-qualified type";
@@ -506,6 +575,19 @@ FailureOr<Type> CImporter::mapStructFieldType(clang::QualType type,
   // pointee, so the volatile scan must run before that shortcut.
   if (hasVolatileQualifier(astContext(), type))
     return emitError(loc) << "unsupported: volatile-qualified type";
+  // FR-48: a reference-typed MEMBER is one of the two hard positions
+  // references are not supported in, and it is rejected here rather than
+  // through `mapType`'s residual so the message names the position. The
+  // difficulty is ownership, not syntax: the borrow outlives the
+  // expression that created it and is stored inside an object whose own
+  // lifetime is unrelated to the referent's, so the emitted struct would
+  // need a lifetime parameter that nothing in the model can infer or
+  // name. A reference member also silently changes the struct's copy
+  // semantics (it has no assignment operator), which the field-by-field
+  // aggregate model would get wrong.
+  if (type->isReferenceType())
+    return emitError(loc)
+           << "unsupported: reference struct members are not yet supported";
   if (isDataPointer(type)) {
     // Stage 2 of the owner-struct self-reference extension: a field Pass A
     // proved always points into the same promoted owner array stores as

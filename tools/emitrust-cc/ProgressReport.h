@@ -47,19 +47,19 @@
 ///     truncated; 0 when graph_items == 0
 ///   },
 ///   "blockers": [                      // sorted by count desc, then tag
-///     { "tag": "cxx-references", "count": 5 }
+///     { "tag": "unsupported-stmt:CXXForRangeStmt", "count": 3 }
 ///   ],
 ///   "items": [                         // the graph items; see ordering below
 ///     {
-///       "symbol": "shoelace_twice",
+///       "symbol": "bounding_box",
 ///       "kind": "function",            // function | record | enum | global
-///       "status": "dropped",           // ported | stubbed | dropped | missing
+///       "status": "stubbed",           // ported | stubbed | dropped | missing
 ///       | declared "color": "red",                // green | yellow | red |
 ///       orange | grey "linkage": "extern",           // extern | intern "tu":
 ///       0,                       // translation-unit index "file":
-///       "/abs/path/geom.cpp", "line": 5, "column": 52, "blocker":
-///       "cxx-references",   // "" when nothing was rejected "diagnostic":
-///       "unsupported: reference types are not yet supported"
+///       "/abs/path/geom.cpp", "line": 35, "column": 3, "blocker":
+///       "unsupported-stmt:CXXForRangeStmt",   // "" when nothing was rejected
+///       "diagnostic": "unsupported statement: CXXForRangeStmt"
 ///     }
 ///   ],
 ///   "off_graph_items": [ ... same object shape, "kind" is "" ... ]
