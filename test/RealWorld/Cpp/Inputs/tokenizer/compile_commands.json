@@ -1,0 +1,17 @@
+[
+  {
+    "directory": ".",
+    "file": "lexer.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "lexer.cpp", "-o", "lexer.o"]
+  },
+  {
+    "directory": ".",
+    "file": "histogram.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "histogram.cpp", "-o", "histogram.o"]
+  },
+  {
+    "directory": ".",
+    "file": "main.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "main.cpp", "-o", "main.o"]
+  }
+]

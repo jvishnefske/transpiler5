@@ -1,0 +1,8 @@
+# Quarantine list for the RealWorld C++ corpus (FR-46). Each entry is a
+# project name that emitrust-cc transpiles and builds but whose crate binary
+# diverges from the clang++ -std=c++17 native oracle (wrong output, crash,
+# timeout). Every entry MUST carry a comment with the symptom. Quarantined
+# projects keep the gate green while the bug stays visible; the runner still
+# prints each one loudly.
+#
+# Currently empty: no transpiled corpus project miscompiles.

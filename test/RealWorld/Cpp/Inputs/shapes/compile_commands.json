@@ -1,0 +1,17 @@
+[
+  {
+    "directory": ".",
+    "file": "shape.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "shape.cpp", "-o", "shape.o"]
+  },
+  {
+    "directory": ".",
+    "file": "report.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "report.cpp", "-o", "report.o"]
+  },
+  {
+    "directory": ".",
+    "file": "main.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "main.cpp", "-o", "main.o"]
+  }
+]

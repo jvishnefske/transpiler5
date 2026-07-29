@@ -1,0 +1,12 @@
+[
+  {
+    "directory": ".",
+    "file": "geom.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "geom.cpp", "-o", "geom.o"]
+  },
+  {
+    "directory": ".",
+    "file": "main.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "main.cpp", "-o", "main.o"]
+  }
+]
