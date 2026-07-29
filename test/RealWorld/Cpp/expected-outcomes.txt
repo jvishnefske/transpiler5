@@ -11,12 +11,15 @@
 # loudly but does not fail the gate, since it is a heuristic over
 # diagnostic wording.
 #
-# Per-ITEM scoring (how much of a rejected project ported) is
-# FR-44's --incremental mode; see the FR-44 SEAM block in
-# run_realworld.py. No per-item section exists yet.
+# The trailing '# ported k/n' comment is FR-44's per-item score,
+# advisory here and ignored by the parser: the AUTHORITATIVE
+# per-item ledger is each project's own expected-items.txt, next
+# to its sources. It is repeated on this line so the manifest
+# reads as a ranked backlog -- a REJECTED project at 6/8 items is
+# a very different backlog entry from one at 0/40.
 #
 # Regenerated via: run_realworld.py ... --manifest-format outcomes --update
-fixed-stats TRANSPILED
-polygon REJECTED cxx-references
-shapes REJECTED cxx-destructor
-tokenizer TRANSPILED
+fixed-stats TRANSPILED  # ported 11/11
+polygon REJECTED cxx-references  # ported 2/8
+shapes REJECTED cxx-destructor  # ported 1/7
+tokenizer TRANSPILED  # ported 5/5

@@ -24,7 +24,10 @@
 ///                  when the input defines main, else the bare translation);
 ///   --emit=crate   a complete cargo crate directory (the default), with
 ///                  --build optionally invoking `cargo build --release
-///                  --offline` on the result.
+///                  --offline` on the result, and --incremental (FR-44)
+///                  additionally recovering from unsupported items and
+///                  writing PORTING.md / emitrust-progress.json beside the
+///                  crate.
 /// The inputs are either positional source paths with hand-passed
 /// -I/-isystem/--extra-arg flags (the historical surface), or, with
 /// --compdb <dir-or-file>, a real compile_commands.json that supplies both
@@ -39,6 +42,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "CrateEmitter.h"
+#include "ProgressReport.h"
 
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
@@ -184,6 +188,22 @@ static llvm::cl::opt<bool> recoverFlag(
         "to one built without this flag"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> incrementalFlag(
+    "incremental",
+    llvm::cl::desc(
+        "Incremental crate output (FR-44, only valid with --emit=crate): "
+        "IMPLIES --recover, so a project only partially inside the supported "
+        "subset still yields a crate that BUILDS, and additionally writes two "
+        "progress artifacts into the crate directory -- PORTING.md, a "
+        "human-readable table of every project item with its porting status, "
+        "blocker tag and source location, ranked by blocker; and "
+        "emitrust-progress.json, the same data machine-readable with totals, "
+        "so two runs can be diffed item by item. The item inventory is the "
+        "FR-40 project item graph, so the denominator counts what the project "
+        "HAS, not just what the importer reached. Without this flag the "
+        "compile is byte-identical to one built without it"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> checkRangeRefinement(
     "check-range-refinement",
     llvm::cl::desc(
@@ -325,6 +345,31 @@ static mlir::LogicalResult emitCrate(mlir::ModuleOp module,
   return writeFile(mainPath, *mainRs);
 }
 
+/// Writes the two FR-44 progress artifacts into the crate directory that
+/// `emitCrate` has already created: `PORTING.md` and
+/// `emitrust-progress.json`. Both are rendered by the pure functions in
+/// ProgressReport.h; this function only names the files and writes them.
+///
+/// They live INSIDE the crate directory on purpose: the report describes that
+/// exact crate, and cargo ignores unknown files at a package root, so the
+/// crate still builds with them present.
+///
+/// \param outDir the crate directory written by emitCrate.
+/// \param report the joined per-item report.
+/// \returns success if both files were written.
+static mlir::LogicalResult
+writeProgressArtifacts(llvm::StringRef outDir,
+                       const emitrustcc::ProgressReport &report) {
+  llvm::SmallString<256> portingPath(outDir);
+  llvm::sys::path::append(portingPath, "PORTING.md");
+  llvm::SmallString<256> jsonPath(outDir);
+  llvm::sys::path::append(jsonPath, "emitrust-progress.json");
+  if (mlir::failed(
+          writeFile(portingPath, emitrustcc::renderPortingMarkdown(report))))
+    return mlir::failure();
+  return writeFile(jsonPath, emitrustcc::renderProgressJson(report));
+}
+
 /// Runs `cargo build --release --offline` on the crate in `outDir` by
 /// pointing cargo at its manifest (equivalent to running in the crate
 /// directory: the target directory lands in `<outDir>/target`). Cargo is
@@ -404,6 +449,10 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: --build is only valid with --emit=crate\n";
     return 1;
   }
+  if (incrementalFlag && emitKind != EmitKind::Crate) {
+    llvm::errs() << "error: --incremental is only valid with --emit=crate\n";
+    return 1;
+  }
   if (emitKind == EmitKind::Crate && outputPath == "-") {
     llvm::errs() << "error: --emit=crate requires -o <crate directory>\n";
     return 1;
@@ -452,7 +501,10 @@ int main(int argc, char **argv) {
   // the pipeline has confirmed the surviving subset is still lowerable).
   mlir::emitrust::RejectionLedger ledger;
   mlir::emitrust::ImportOptions importOptions;
-  importOptions.recover = recoverFlag;
+  // --incremental IMPLIES --recover: a partial crate is the whole point, and
+  // an incremental run that hard-failed at the first unsupported item could
+  // not report a per-item status for anything after it.
+  importOptions.recover = recoverFlag || incrementalFlag;
   importOptions.ledger = &ledger;
   // --recover and --compdb are the pair a real C++ project needs together:
   // the database to be parsed the way its build system parses it, recovery
@@ -504,8 +556,36 @@ int main(int argc, char **argv) {
                                     ? llvm::sys::path::stem(inputs.front())
                                     : llvm::sys::path::stem(outputPath);
     std::string crateName = emitrustcc::sanitizeCrateName(crateStem);
+    // FR-44: the emitted symbol table is read BEFORE the crate is written,
+    // because it is evidence about the very module being rendered.
+    llvm::StringSet<> emittedSymbols;
+    if (incrementalFlag)
+      emittedSymbols = emitrustcc::collectEmittedSymbols(*module);
     if (mlir::failed(emitCrate(*module, outputPath, crateName)))
       return 1;
+    if (incrementalFlag) {
+      // The DENOMINATOR comes from the FR-40 item graph, which is a second,
+      // purely analytical parse of the same project: it inventories every
+      // item the project HAS, including the ones the importer rejected, so
+      // "2 of 8 ported" is a real fraction rather than a count over whatever
+      // survived. It re-parses the inputs, which is why it is computed only
+      // under --incremental.
+      std::string databaseError;
+      mlir::FailureOr<mlir::emitrust::ItemGraph> graph =
+          mlir::emitrust::buildItemGraph(inputs, extra, compilationDatabasePath,
+                                         databaseError);
+      if (mlir::failed(graph))
+        llvm::errs() << "warning: cannot build the project item graph"
+                     << (databaseError.empty() ? "" : ": ")
+                     << databaseError
+                     << "; the progress report has no denominator "
+                        "(denominator_source: ledger-only)\n";
+      emitrustcc::ProgressReport report = emitrustcc::buildProgressReport(
+          crateName, mlir::succeeded(graph) ? &*graph : nullptr,
+          ledger.getItems(), emittedSymbols);
+      if (mlir::failed(writeProgressArtifacts(outputPath, report)))
+        return 1;
+    }
     if (buildFlag && mlir::failed(buildCrate(outputPath)))
       return 1;
     return 0;

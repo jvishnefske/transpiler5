@@ -27,6 +27,10 @@
 //     --known-miscompiles test/RealWorld/Cpp/known-miscompiles.txt \
 //     --workdir /tmp/realworld-cpp-work --update
 //
-// Per-ITEM scoring (how MUCH of a rejected project ported) is NOT part of this
-// gate; it arrives with FR-44's --incremental mode, which plugs into the
-// clearly marked "FR-44 SEAM" block in run_realworld.py.
+// Per-ITEM scoring (how MUCH of a rejected project ported) IS part of this
+// gate since FR-44: every project is additionally transpiled with
+// `emitrust-cc --emit=crate --incremental --build`, which must produce a
+// crate that COMPILES even when most of the project is out of subset, and
+// whose emitrust-progress.json is ratcheted against the project's own
+// expected-items.txt (next to its sources) with the same two-way discipline.
+// The same --update command above regenerates those per-item ledgers.
