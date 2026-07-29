@@ -4,6 +4,7 @@
 # them up transitively.
 add_mlir_library(MLIREmitRustImportC
   ImportC.cpp
+  ClangProjectParser.cpp
   ImportCTypes.cpp
   ImportCAggregates.cpp
   ImportCGlobals.cpp

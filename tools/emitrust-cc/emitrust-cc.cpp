@@ -13,6 +13,11 @@
 /// convert-to-emitrust; --check-range-refinement additionally runs the
 /// observational emitrust-range-refinement-check pass on the
 /// pre-conversion stage), and emits one of:
+///   --emit=item-graph
+///                  the FR-40 whole-project program item graph, computed
+///                  from the clang ASTs alone — no import, no pass, no
+///                  emission — so it is available even for projects the
+///                  importer rejects;
 ///   --emit=import  the raw imported MLIR module, before any pass;
 ///   --emit=mlir    the MLIR module after the full pass pipeline;
 ///   --emit=rust    Rust source text (identical to the crate's src/main.rs
@@ -38,6 +43,7 @@
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 #include "EmitRust/ImportC.h"
+#include "EmitRust/Project/ItemGraph.h"
 
 #include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -74,7 +80,13 @@
 namespace {
 
 /// The output kinds selectable with --emit.
-enum class EmitKind { Import, MLIR, Rust, Crate };
+///
+/// `ItemGraph` is the odd one out: every other kind is a stage of the
+/// import-and-lower pipeline, while the item graph is a parallel, pure-AST
+/// analysis that never builds a module. It is handled before the import for
+/// exactly that reason — the graph is meant to be obtainable for a project
+/// the importer cannot yet translate.
+enum class EmitKind { ItemGraph, Import, MLIR, Rust, Crate };
 
 } // namespace
 
@@ -126,6 +138,11 @@ static llvm::cl::opt<std::string> crateNameOpt(
 static llvm::cl::opt<EmitKind> emitKind(
     "emit", llvm::cl::desc("Output kind"),
     llvm::cl::values(
+        clEnumValN(EmitKind::ItemGraph, "item-graph",
+                   "Whole-project program item graph (FR-40): one 'node' "
+                   "line per function/record/enum/global and one 'edge' "
+                   "line per dependency, both sorted; computed from the "
+                   "clang ASTs without importing"),
         clEnumValN(EmitKind::Import, "import",
                    "Raw imported MLIR module, before any pass (debugging)"),
         clEnumValN(EmitKind::MLIR, "mlir",
@@ -379,6 +396,36 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  std::vector<std::string> inputs(inputFilenames.begin(),
+                                  inputFilenames.end());
+  std::vector<std::string> extra = collectExtraClangArgs();
+
+  // The item graph is a pure-AST analysis: no MLIR context, no import, no
+  // pipeline. Handled here, before any of that machinery is set up, so the
+  // graph of a project the importer would reject is still obtainable.
+  if (emitKind == EmitKind::ItemGraph) {
+    // --compdb applies here exactly as it does to an import (FR-45): the
+    // graph must see the same project, with the same per-file flags, or it
+    // would describe a project the importer never compiles.
+    std::string databaseError;
+    mlir::FailureOr<mlir::emitrust::ItemGraph> graph =
+        mlir::emitrust::buildItemGraph(inputs, extra, compilationDatabasePath,
+                                       databaseError);
+    if (mlir::failed(graph)) {
+      // A database load failure has its own reason; otherwise clang has
+      // already printed the parse diagnostics to stderr and the graph itself
+      // raises nothing else.
+      if (!databaseError.empty())
+        llvm::errs() << compilationDatabasePath
+                     << ":1:1: error: cannot load compilation database: "
+                     << databaseError << "\n";
+      else
+        llvm::errs() << "error: failed to parse one or more inputs\n";
+      return 1;
+    }
+    return mlir::failed(writeFile(outputPath, graph->print())) ? 1 : 0;
+  }
+
   mlir::MLIRContext context;
   context.getDiagEngine().registerHandler(
       [](mlir::Diagnostic &diag) { printDiagnostic(diag); });
@@ -387,9 +434,6 @@ int main(int argc, char **argv) {
   // context never depends on pass-internal registration details.
   context.loadDialect<mlir::scf::SCFDialect, mlir::ub::UBDialect>();
 
-  std::vector<std::string> inputs(inputFilenames.begin(),
-                                  inputFilenames.end());
-  std::vector<std::string> extra = collectExtraClangArgs();
   mlir::OwningOpRef<mlir::ModuleOp> module = mlir::emitrust::importCProject(
       inputs, extra, compilationDatabasePath, context);
   if (!module)
@@ -402,6 +446,8 @@ int main(int argc, char **argv) {
     return 1;
 
   switch (emitKind.getValue()) {
+  case EmitKind::ItemGraph:
+    llvm_unreachable("handled before the import");
   case EmitKind::Import:
     llvm_unreachable("handled before the pipeline");
   case EmitKind::MLIR:

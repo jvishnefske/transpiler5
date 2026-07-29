@@ -28,27 +28,13 @@
 using namespace mlir;
 
 std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
-  llvm::StringRef cName = func->getName();
-  if (cName == "main")
-    return "c_main";
-  // A function whose C spelling is a Rust keyword mangles like a struct
-  // member — one trailing underscore (`match` -> `match_`, CTS 00204).
-  // The mangled spelling is the symbol's identity everywhere (definition
-  // and call sites resolve through this same function); a collision with
-  // an existing `match_` is rejected in `importFunction`.
-  // W2.0: a C++ namespace chain contributes its flattening prefix ahead of
-  // the mangled base name (`namespacePrefix` is empty for plain C input,
-  // where a FunctionDecl's DeclContext is never a NamespaceDecl); `extern
-  // "C"` contributes nothing, preserving C linkage's unchanged-name
-  // contract.
-  std::string base =
-      namespacePrefix(func->getDeclContext()) + mangleMemberName(cName);
-  // Internal-linkage (`static`) functions are mangled with the per-TU tag so
-  // identically named file-statics in different TUs never collide. The tag is
-  // empty for a single-TU import, preserving the historical bare name.
-  if (func->getStorageClass() == clang::SC_Static)
-    return currentTuTag + base;
-  return base;
+  // The whole rule (`main` -> `c_main`, the Rust-keyword member mangle, the
+  // W2.0 namespace flattening prefix, the per-TU tag on internal-linkage
+  // names) lives in the shared `cFunctionSymbolName`; the only thing this
+  // method adds is the importer's current per-TU tag. It is shared rather
+  // than private so the FR-40 item graph keys its function nodes on the
+  // very same spelling — see EmitRust/CSymbolNaming.h.
+  return cFunctionSymbolName(func, currentTuTag);
 }
 
 /// W2.2: `method`'s un-suffixed mangled base name — the fixed spelling
