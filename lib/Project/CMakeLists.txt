@@ -1,5 +1,5 @@
-# The project-analysis library (FR-40): pure-AST whole-project analyses over
-# the same clang ASTs the importer consumes, computed independently of any
+# The project-analysis library (FR-40, FR-41): pure-AST whole-project analyses
+# over the same clang ASTs the importer consumes, computed independently of any
 # import. Like MLIREmitRustImportC, the clang dependencies stay PRIVATE so no
 # consumer picks them up transitively; the public headers under
 # include/EmitRust/Project only forward-declare clang types.
@@ -11,6 +11,7 @@
 # `clang -print-resource-dir` probe defines EMITRUST_CLANG_RESOURCE_DIR on
 # that target.
 add_mlir_library(MLIREmitRustProject
+  ItemColoring.cpp
   ItemGraph.cpp
 
   ADDITIONAL_HEADER_DIRS
