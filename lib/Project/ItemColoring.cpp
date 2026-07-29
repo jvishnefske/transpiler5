@@ -669,6 +669,7 @@ ColorReason redReasonFor(EdgeKind kind) {
   case EdgeKind::BodyType:
   case EdgeKind::Field:
   case EdgeKind::Base:
+  case EdgeKind::FieldIndirect:
     return ColorReason::RedType;
   case EdgeKind::ReadsGlobal:
   case EdgeKind::WritesGlobal:
@@ -676,6 +677,19 @@ ColorReason redReasonFor(EdgeKind kind) {
   }
   return ColorReason::RedType;
 }
+
+/// Whether an edge of `kind` carries poison AT ALL.
+///
+/// Every kind does except `FieldIndirect`, which is the one dependency the
+/// emitted Rust does not SPELL: the importer's pointer-struct-member models
+/// erase a `struct S *p` member to an integer or an index, so a record whose
+/// only route to a Red `S` is through such a member emits completely and
+/// compiles. Calling it Red would be a false Red, and a false Red is the one
+/// error this analysis is not allowed to make — see ItemColoring.h's
+/// asymmetry argument. It is excluded from the YELLOW rule for the same
+/// reason and one more: Yellow means "emits, but calls a stub", and a record
+/// calls nothing.
+bool poisonBearing(EdgeKind kind) { return kind != EdgeKind::FieldIndirect; }
 
 /// The rank sentinel: "not reached from any inadmissible seed". Every Red item
 /// ends up with a finite rank, because Red membership is only ever derived
@@ -726,6 +740,13 @@ private:
   /// Yellow). True exactly when the target is Red and cannot be stubbed.
   bool poisonsRed(unsigned index) const {
     return red[index] && !stubReplaceable(index);
+  }
+
+  /// The same question for a whole EDGE, which is the form every rule below
+  /// asks it in: a `FieldIndirect` edge carries no poison whatever its target
+  /// is, because the emitted Rust never names that target.
+  bool poisonsRed(const Successor &successor) const {
+    return poisonBearing(successor.kind) && poisonsRed(successor.to);
   }
 
   /// Fills in `item`'s blame fields by walking one step to the
@@ -814,7 +835,7 @@ void ColoringSolver::runColorFixpoint() {
         // stated as; `BodyType`, `SigType`, `Field`, `Base`, `ReadsGlobal`,
         // `WritesGlobal`, and a call to an unstubbable function are all just
         // instances of it.
-        if (!red[index] && poisonsRed(successor.to)) {
+        if (!red[index] && poisonsRed(successor)) {
           red[index] = true;
           changed = true;
         }
@@ -844,7 +865,7 @@ void ColoringSolver::runRankFixpoint() {
         continue;
       unsigned best = rank[index];
       for (const Successor &successor : successors[index]) {
-        if (!poisonsRed(successor.to) || rank[successor.to] == kNoRank)
+        if (!poisonsRed(successor) || rank[successor.to] == kNoRank)
           continue;
         best = std::min(best, rank[successor.to] + 1);
       }
@@ -864,13 +885,14 @@ void ColoringSolver::blame(unsigned index, bool hardOnly,
     if (hardOnly) {
       // The Red walk: only a neighbor that is strictly closer to a seed, so
       // the chain cannot loop back through a Red cycle.
-      if (!poisonsRed(successor.to) || rank[successor.to] != rank[index] - 1)
+      if (!poisonsRed(successor) || rank[successor.to] != rank[index] - 1)
         continue;
     } else {
-      // The Yellow walk: any Red neighbor. Every such neighbor is necessarily
-      // stub-replaceable — an unstubbable one would have made this item Red —
-      // and therefore a function reached along `Calls`/`TakesAddressOf`.
-      if (!red[successor.to])
+      // The Yellow walk: any Red neighbor reached along a poison-bearing
+      // edge. Every such neighbor is necessarily stub-replaceable — an
+      // unstubbable one would have made this item Red — and therefore a
+      // function reached along `Calls`/`TakesAddressOf`.
+      if (!poisonBearing(successor.kind) || !red[successor.to])
         continue;
     }
     // `successors` is sorted by (kind, symbol), so the first match IS the
@@ -937,7 +959,7 @@ ItemColoring ColoringSolver::solve() {
     // fixpoint has saturated, every Red neighbor of a non-Red item is
     // stub-replaceable, so this is precisely the stub-call case.
     bool touchesRed = llvm::any_of(successors[index], [&](const Successor &s) {
-      return red[s.to];
+      return poisonBearing(s.kind) && red[s.to];
     });
     if (!touchesRed)
       continue;

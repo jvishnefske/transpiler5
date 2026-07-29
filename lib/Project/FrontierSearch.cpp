@@ -29,6 +29,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <cassert>
 #include <climits>
 #include <deque>
 #include <memory>
@@ -419,6 +420,21 @@ SearchState mlir::emitrust::rootState(const ItemGraph &graph,
   return stateFromColoring(coloring);
 }
 
+SearchState mlir::emitrust::baselineState(const ItemGraph &graph) {
+  SearchState state;
+  for (const ItemNode &node : graph.nodes)
+    state.admitted.push_back(node.symbol);
+  // `graph.nodes` is already in symbol order; sorting makes `admits`'s binary
+  // search a local postcondition rather than an inherited one, exactly as
+  // `stateFromColoring` does.
+  llvm::sort(state.admitted);
+  state.admitted.erase(std::unique(state.admitted.begin(),
+                                   state.admitted.end()),
+                       state.admitted.end());
+  state.representation.assign(state.admitted.size(), 0);
+  return state;
+}
+
 //===----------------------------------------------------------------------===//
 // Scoring
 //===----------------------------------------------------------------------===//
@@ -451,6 +467,23 @@ SearchResult mlir::emitrust::frontierSearch(const ItemGraph &graph,
   std::map<std::string, unsigned> distance = rootDistances(graph, roots);
   unsigned budget = std::max(options.maxNodes, 1u);
 
+  // FR-50's safety net. The baseline is the plain recovering import expressed
+  // as a state, and probing it is what makes "the search is never worse than
+  // not searching" true by construction rather than by trusting FR-41's
+  // coloring. When the coloring rules nothing out the two states coincide and
+  // nothing below fires, so an exact project still costs exactly one probe.
+  SearchState baseline = baselineState(graph);
+  ItemColoring rootColoring = computeColoring(graph, admissibility);
+  SearchState root = rootState(graph, rootColoring);
+  std::string baselineSignature = baseline.signature();
+  bool baselineIsRoot = baselineSignature == root.signature();
+  // The guarantee is not subject to `--max-search-nodes`: a budget of one
+  // would probe the root and stop, leaving the baseline unmeasured and the
+  // postcondition unwitnessed. Two probes is the floor exactly when there is
+  // a second state to probe.
+  if (!baselineIsRoot)
+    budget = std::max(budget, 2u);
+
   trace << "search items=" << graph.nodes.size() << " roots=" << roots.size()
         << " max-nodes=" << budget << "\n";
 
@@ -460,8 +493,6 @@ SearchResult mlir::emitrust::frontierSearch(const ItemGraph &graph,
   // and the drops are only how it was reached.
   std::vector<std::set<std::string>> nodeDrops;
 
-  ItemColoring rootColoring = computeColoring(graph, admissibility);
-  SearchState root = rootState(graph, rootColoring);
   trace << "root 0 admitted=" << root.admitted.size()
         << " excluded=" << (graph.nodes.size() - root.admitted.size()) << "\n";
 
@@ -503,7 +534,11 @@ SearchResult mlir::emitrust::frontierSearch(const ItemGraph &graph,
                              node.outcome.stubbed,
                              current.state.representationCost(graph)};
 
-    if (id != 0)
+    if (node.why == "baseline")
+      trace << "baseline " << id << " admitted=" << node.state.admitted.size()
+            << " excluded="
+            << (graph.nodes.size() - node.state.admitted.size()) << "\n";
+    else if (id != 0)
       trace << "child " << id << " from=" << node.parent
             << " drop=" << node.drop << " cascade="
             << (result.nodes[node.parent].state.admitted.size() -
@@ -543,9 +578,34 @@ SearchResult mlir::emitrust::frontierSearch(const ItemGraph &graph,
       result.bestScore = node.score;
       result.bestNode = id;
     }
+    // The baseline's score is remembered as the FR-50 witness. It needs no
+    // special treatment above — it competed for `best` on the same terms as
+    // every other state, which is the whole point — so all that is kept here
+    // is the value the postcondition is stated against. When the coloring
+    // ruled nothing out the root IS the baseline, and the witness is the
+    // root's own score: leaving it default-constructed would state the
+    // postcondition against a score no state ever had.
+    if (node.why == "baseline" || (id == 0 && baselineIsRoot)) {
+      result.baselineScore = node.score;
+      result.baselineNode = id;
+    }
     result.nodes.push_back(std::move(node));
     nodeDrops.push_back(current.drops);
     const SearchNode &probed = result.nodes.back();
+
+    // The mandatory baseline probe is queued the moment the root has a real
+    // score to order it by. It lands at node 1: it shares the root's score
+    // with every child the root generates, ties them on rank, and then wins
+    // on the largest-admitted-set key, because it admits every item in the
+    // project and a child of the root admits strictly fewer than the root.
+    if (id == 0 && !baselineIsRoot) {
+      frontier.push_back(Pending{probed.score, /*parent=*/0, /*drop=*/"",
+                                 /*why=*/"baseline", /*repairRank=*/0,
+                                 /*dropDistance=*/UINT_MAX,
+                                 /*drops=*/{}, baseline, baselineSignature});
+      seen.insert(baselineSignature);
+      ++result.generated;
+    }
 
     // Candidates. A successful probe teaches its rejections; a failed one is
     // attributed by blame. Both are ordered by the same rule.
@@ -638,7 +698,18 @@ SearchResult mlir::emitrust::frontierSearch(const ItemGraph &graph,
   }
   trace << "summary probes=" << result.nodes.size()
         << " generated=" << result.generated << " pruned=" << result.pruned
-        << " improved=" << (result.improved() ? "yes" : "no") << "\n";
+        << " improved=" << (result.improved() ? "yes" : "no")
+        << " >=baseline=" << (result.atLeastBaseline() ? "yes" : "no") << "\n";
+
+  // FR-50's postcondition, asserted rather than repaired. `best` is a maximum
+  // over the probed states and the baseline is one of them, so a violation
+  // cannot be fixed by falling back — it would mean the probe or the score is
+  // not a function of the state, and the honest response to that is to fail
+  // loudly rather than to hide it behind a substitute answer. The trace
+  // carries the same verdict for release builds and for anyone reading the
+  // output after the fact.
+  assert(result.atLeastBaseline() &&
+         "FR-50: the frontier search scored below the unrestricted import");
 
   result.trace = traceText;
   return result;
