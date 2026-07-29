@@ -20,6 +20,15 @@
 // baseline, not a failure. The ratchet is still two-way: a project that stops
 // transpiling fails as a regression, and a project that starts transpiling
 // fails until it is ratcheted forward with:
+//
+// FR-51 adds a third outcome, LIB_BUILT, for a project with no `main`:
+// emitrust-cc emits a LIBRARY crate and it compiles. `ringbuf-lib` is the
+// corpus's one such project and exists to cover that shape, which every other
+// project here misses because every other project has an entry point.
+// LIB_BUILT is deliberately NOT TRANSPILED -- a library cannot be run, so it
+// is never diffed against a native build, and the outcome claims only that
+// the project translates and type-checks. It ranks between REJECTED and
+// TRANSPILED, and losing it is a regression exactly as losing TRANSPILED is.
 //   python3 test/RealWorld/run_realworld.py --emitrust-cc build/bin/emitrust-cc \
 //     --clang clang++ --corpus-kind cpp --manifest-format outcomes \
 //     --corpus test/RealWorld/Cpp/Inputs \

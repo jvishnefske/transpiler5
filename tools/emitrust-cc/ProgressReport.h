@@ -19,7 +19,14 @@
 /// Nothing here touches the filesystem, the clock, or any other side effect:
 /// the imperative shell in emitrust-cc.cpp gathers the four inputs and
 /// writes the two returned strings out, exactly as it does for CrateEmitter's
-/// `Cargo.toml`/`src/main.rs`.
+/// `Cargo.toml` and crate root.
+///
+/// Nothing in this file depends on the crate's SHAPE. FR-51 made a project
+/// whose `main` is dropped emit a LIBRARY crate instead of failing outright,
+/// which is the case that turned this report from unreachable into the only
+/// account of what happened -- but the report's inputs are the item graph,
+/// the ledger, the emitted symbol table and the coloring, none of which knows
+/// whether the crate root ended up being `main.rs` or `lib.rs`.
 ///
 //===----------------------------------------------------------------------===//
 //

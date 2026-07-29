@@ -7,8 +7,9 @@
 //
 /// \file
 /// This file implements the functional core of the emitrust-cc driver: the
-/// crate-name sanitizer and the pure renderers that turn a fully converted
-/// EmitRust module into `Cargo.toml` and `src/main.rs` text.
+/// crate-name sanitizer, the FR-51 crate-shape selection, and the pure
+/// renderers that turn a fully converted EmitRust module into `Cargo.toml`
+/// and crate-root (`src/main.rs` or `src/lib.rs`) text.
 //
 //===----------------------------------------------------------------------===//
 
@@ -24,7 +25,7 @@
 
 namespace emitrustcc {
 
-/// Attribute header prepended to every generated `main.rs`. The emitter's
+/// Attribute header prepended to every generated crate root. The emitter's
 /// statement-per-op, mut-let style legitimately triggers these lints (for
 /// example a `let mut` that is assigned in only one `if` arm), global
 /// variables keep their original C spelling rather than SCREAMING_CASE,
@@ -50,6 +51,22 @@ static constexpr llvm::StringLiteral kMainWrapper =
 static constexpr llvm::StringLiteral kMainArgcWrapper =
     "fn main() { std::process::exit(c_main(std::env::args_os().len() as "
     "i32)); }\n";
+
+CrateType selectCrateType(CrateTypeRequest request, mlir::ModuleOp module) {
+  switch (request) {
+  case CrateTypeRequest::Bin:
+    return CrateType::Bin;
+  case CrateTypeRequest::Lib:
+    return CrateType::Lib;
+  case CrateTypeRequest::Auto:
+    return hasCMain(module) ? CrateType::Bin : CrateType::Lib;
+  }
+  llvm_unreachable("covered switch");
+}
+
+llvm::StringRef crateRootFileName(CrateType type) {
+  return type == CrateType::Bin ? "main.rs" : "lib.rs";
+}
 
 std::string sanitizeCrateName(llvm::StringRef stem) {
   std::string name;
@@ -84,23 +101,33 @@ static bool cMainTakesArgc(mlir::ModuleOp module) {
   return funcOp && funcOp.getFunctionType().getNumInputs() == 1;
 }
 
-std::string renderCargoToml(llvm::StringRef crateName) {
+std::string renderCargoToml(llvm::StringRef crateName, CrateType type) {
   std::string toml;
   llvm::raw_string_ostream os(toml);
   os << "[package]\n"
      << "name = \"" << crateName << "\"\n"
      << "version = \"0.1.0\"\n"
      << "edition = \"2021\"\n";
+  if (type == CrateType::Lib)
+    os << "\n"
+       << "[lib]\n"
+       << "name = \"" << crateName << "\"\n"
+       << "path = \"src/lib.rs\"\n";
   return toml;
 }
 
-mlir::FailureOr<std::string> renderRustSource(mlir::ModuleOp module) {
-  const bool wrapMain = hasCMain(module);
+mlir::FailureOr<std::string> renderCrateRoot(mlir::ModuleOp module,
+                                             CrateType type) {
+  const bool wrapMain = type == CrateType::Bin;
+  mlir::emitrust::RustEmitOptions emitOptions;
+  // FR-51: only a library crate exports anything. A binary crate's items stay
+  // private, which is both what they were and what keeps this rendering
+  // byte-identical to every crate emitted before FR-51.
+  emitOptions.exportItems = type == CrateType::Lib;
   std::string source;
   llvm::raw_string_ostream os(source);
-  if (wrapMain)
-    os << kAllowHeader << "\n";
-  if (mlir::failed(mlir::emitrust::translateToRust(module, os)))
+  os << kAllowHeader << "\n";
+  if (mlir::failed(mlir::emitrust::translateToRust(module, os, emitOptions)))
     return mlir::failure();
   if (wrapMain)
     os << "\n" << (cMainTakesArgc(module) ? kMainArgcWrapper : kMainWrapper);

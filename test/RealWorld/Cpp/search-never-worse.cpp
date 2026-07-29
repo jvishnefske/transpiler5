@@ -44,6 +44,11 @@
 // are pinned alongside it so a silent DROP is a failure too, and they move
 // only forward.
 // CHECK: polygon       no-search 4/8   --search 4/8   ok
+// `ringbuf-lib` (FR-51) is the corpus's only project with no `main`, so it is
+// the only one whose crate is a LIBRARY. It is wholly inside the subset, and
+// it is checked here for the same reason as the rest: the search must not
+// silently drop an item from a crate that has no entry point either.
+// CHECK: ringbuf-lib   no-search 12/12   --search 12/12   ok
 // CHECK: shapes        no-search 1/7   --search 1/7   ok
 // CHECK: tokenizer     no-search 5/5   --search 5/5   ok
-// CHECK: All 4 corpus projects: --search >= no-search.
+// CHECK: All 5 corpus projects: --search >= no-search.
