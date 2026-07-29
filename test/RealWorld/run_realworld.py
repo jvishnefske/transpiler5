@@ -260,6 +260,10 @@ _BLOCKER_SUBSTRINGS = [
     ("pointer struct member of an externally", "pointer-member-cross-tu"),
     ("static-binding model", "self-ref-pointer-member"),
     ("variadic function", "variadic-cross-tu"),
+    # FR-50: not a blocker of its own -- the item names a type some OTHER
+    # item's rejection removed. FR-49's root-blocker table credits the real
+    # cause; this tag only keeps the cascade out of the "other" bucket.
+    ("was rejected, so a type naming it", "rejected-type-cascade"),
 ]
 # Wordings shared across blockers; refined by the cited source line's content.
 _AMBIGUOUS_POINTER = ("pointer assigned a non-address value", "with no known target object")

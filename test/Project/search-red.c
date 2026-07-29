@@ -50,11 +50,41 @@ int main(void) { return independent(2); }
 // CHECK-NEXT: probe 0 outcome=ok ported=2 stubbed=1 rep-cost=0 dropped=2
 
 // The rejections the probe reports back are the search's own exclusions:
-// `new=no` marks them as facts it already had, which is exactly why no child
-// is generated and `generated=1`.
+// `new=no` marks them as facts it already had, so none of them generates a
+// child.
 // CHECK-NEXT: learn 0 rejected=Atom as=drop tag=search-excluded new=no
 // CHECK-NEXT: learn 0 rejected=calls_uses_atom as=stub tag=search-excluded new=no
 // CHECK-NEXT: learn 0 rejected=uses_atom as=drop tag=search-excluded new=no
+
+// FR-50's mandatory second probe: the BASELINE, the state that admits every
+// item and excludes nothing, which is bit for bit the import a plain
+// `--incremental` run performs. It is probed on every project whose coloring
+// rules anything out, and it is what turns "the search is never worse than
+// not searching" into a structural property rather than a hope -- `best` is a
+// maximum over the probed states, and this state is always one of them.
+// CHECK-NEXT: baseline 1 admitted=5 excluded=0
+
+// And here the baseline EARNS its keep in the other direction: it does not
+// win, and in not winning it CONFIRMS the coloring. FR-41 predicted `Atom`,
+// `uses_atom` and `calls_uses_atom` were out; a real import of all five items
+// rejects exactly those three and scores exactly what the root scored. The
+// coloring is exact on this project, and that is now a measured fact rather
+// than an argument from the header.
+// CHECK-NEXT: probe 1 outcome=ok ported=2 stubbed=1 rep-cost=0 dropped=2
+// CHECK-NEXT: learn 1 rejected=Atom as=drop tag=other new=yes
+
+// `uses_atom` names `Atom` in its SIGNATURE. Since FR-50 the importer refuses
+// to spell a type whose own import it rejected, so the rejection CASCADES
+// rather than emitting `fn uses_atom(v0: &mut Atom)` against a struct nobody
+// defines -- which is what it used to do, and which does not compile.
+// CHECK-NEXT: learn 1 rejected=calls_uses_atom as=stub tag=other new=yes
+// CHECK-NEXT: learn 1 rejected=uses_atom as=drop tag=rejected-type-cascade new=yes
+
+// Every child the baseline proposes is a state the root already is, so all
+// three are memoized away and the search stops with two probes spent.
+// CHECK-NEXT: prune 2 from=1 drop=Atom why=memoized
+// CHECK-NEXT: prune 3 from=1 drop=calls_uses_atom why=memoized
+// CHECK-NEXT: prune 4 from=1 drop=uses_atom why=memoized
 // CHECK-NEXT: stop reason=exhausted
 // CHECK-NEXT: best 0 ported=2 stubbed=1 rep-cost=0
 // CHECK-NEXT: admitted c_main rep=default
@@ -62,4 +92,8 @@ int main(void) { return independent(2); }
 // CHECK-NEXT: excluded Atom why=red
 // CHECK-NEXT: excluded calls_uses_atom why=red
 // CHECK-NEXT: excluded uses_atom why=red
-// CHECK-NEXT: summary probes=1 generated=1 pruned=0 improved=no
+
+// `>=baseline=yes` is FR-50's postcondition, printed on every run. It is
+// `yes` by construction; a `no` would already have tripped the assertion in
+// `frontierSearch`.
+// CHECK-NEXT: summary probes=2 generated=5 pruned=3 improved=no >=baseline=yes

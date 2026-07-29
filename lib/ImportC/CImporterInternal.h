@@ -2015,7 +2015,23 @@ private:
   /// through `collectUnionSlot` (its storage field is the first arm's
   /// leaf); union shapes outside that model (including bit-field arms)
   /// and unsupported field types are rejected.
+  ///
+  /// A record whose import FAILED is remembered (`rejectedRecords`) and every
+  /// later attempt to materialize it fails again, at the new use site. This
+  /// is not an optimization: without it a rejected record still hands back an
+  /// emitted name, because `importedRecords` is marked before the field walk
+  /// runs, and `mapType` then builds an `!emitrust.struct<"S">` for a struct
+  /// nobody defines. Under `recover` — where a rejected record is DROPPED
+  /// rather than aborting the run — that produced a crate referring to a
+  /// missing Rust type, i.e. one that does not compile (FR-50). Failing again
+  /// instead propagates the rejection to whoever named the type, which is
+  /// exactly the `Field`/`SigType`/`BodyType` poisoning FR-41 predicts.
   LogicalResult importRecord(const clang::RecordDecl *record, Location loc);
+
+  /// `importRecord`'s body, without the rejection memo around it. Every exit
+  /// is a verdict on THIS record, which is what makes the wrapper's "remember
+  /// the failure" correct.
+  LogicalResult importRecordUncached(const clang::RecordDecl *definition);
 
   /// Appends the flattened field list of `record` to
   /// `fieldNames`/`fieldTypes`, resolving C11 6.7.2.1p13 anonymous
@@ -4536,6 +4552,13 @@ private:
   Value currentCxxThisRef;
   /// Struct definitions already imported (keyed on the defining decl).
   llvm::SmallPtrSet<const clang::RecordDecl *, 8> importedRecords;
+  /// Struct definitions whose import was REJECTED (keyed on the defining
+  /// decl). Disjoint from the set above in effect, though not in membership:
+  /// `importedRecords` is marked before the field walk, so a rejected record
+  /// is in both and only this set says whether a struct_def exists. Consulted
+  /// by `importRecord` so that naming a rejected type fails at the use site
+  /// rather than emitting a reference to a struct that was never defined.
+  llvm::SmallPtrSet<const clang::RecordDecl *, 4> rejectedRecords;
   /// Enum definitions already imported (keyed on the defining decl).
   llvm::SmallPtrSet<const clang::EnumDecl *, 8> importedEnums;
   /// Imported functions by MLIR symbol name.

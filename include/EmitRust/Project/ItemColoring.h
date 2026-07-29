@@ -81,6 +81,71 @@
 ///     function is still stubbable and its own callers are Yellow.
 ///
 ///===--------------------------------------------------------------------===//
+/// What "depends on" has to mean here: SPELLING, not reachability
+///===--------------------------------------------------------------------===//
+///
+/// The single rule above is stated over edges whose target is Red. It is only
+/// sound for edges the emitted Rust actually SPELLS. An edge that records a
+/// dependency the importer ERASES is not a poison channel at all, and treating
+/// it as one manufactures false Reds — the one error this analysis may never
+/// make. Exactly one edge kind is of that shape today, and it is measured
+/// rather than argued (FR-50):
+///
+///  - `Field` — the record is embedded BY VALUE, directly, as an array
+///    element, or inside a function prototype. `struct Holder { struct Atom a;
+///    }` emits as `struct Holder { a: Atom }`, so a dropped `Atom` leaves
+///    `Holder` referring to a type nobody defines and the crate does not
+///    compile. POISONS.
+///  - `FieldIndirect` — the record is reached only through a data pointer.
+///    `struct Holder { struct Atom *p; int k; }` emits as `struct Holder { p:
+///    i64, k: i32 }`: the pointer-struct-member models (FR-35/37/38/39) erase
+///    the member, `Atom` is never named, and the crate compiles with `Atom`
+///    dropped. DOES NOT POISON, in either direction — not Red, and not Yellow
+///    either, since Yellow means "emits but calls a stub" and a record calls
+///    nothing.
+///
+/// The sibling type edges were checked the same way — color the item, then
+/// actually import it and compile the result — and both are exact as they
+/// stand:
+///
+///  - `SigType` stays uniform, INCLUDING through pointers: a `struct Atom *`
+///    parameter emits as `&mut Atom` and does name the record, so there is no
+///    pointer exemption to make here. The claim that a `SigType`-Red function
+///    is unstubbable is confirmed, not merely asserted: the stub's own
+///    parameter list would have to spell the dropped type.
+///  - `Base` is VACUOUS in the current subset and is kept only so the rule set
+///    stays total. Every record with a direct base is an inadmissible SEED
+///    (`base-class`), so a `Base` edge can never be what turns its source Red.
+///
+/// `BodyType` is known NOT to be exact in one direction — a local `struct Atom
+/// *p` and a `sizeof(struct Atom)` both leave the type unnamed in the emitted
+/// Rust — and is deliberately left as it is: a false Red there costs at most
+/// the ONE function, which stays stub-replaceable, so its callers are Yellow
+/// and survive. It is listed here so the gap is a recorded debt rather than an
+/// oversight.
+///
+///===--------------------------------------------------------------------===//
+/// Why the errors are not symmetric
+///===--------------------------------------------------------------------===//
+///
+/// Every judgement call above resolves the same way, and this is the reason:
+///
+///   A FALSE GREEN COSTS A PROBE. A FALSE RED COSTS ITEMS, PERMANENTLY.
+///
+/// If this file calls an item admissible and the importer then rejects it,
+/// FR-43's search hears the rejection back from a real import, drops the item,
+/// re-colors, and continues; the price is one import attempt out of a budget
+/// of eight, and the final crate is the same. If this file calls an item
+/// inadmissible and it was importable, the item is excluded from the search's
+/// ROOT state — and the search can only ever remove items, never add them
+/// back, so no later stage can recover it. The loss is silent and total: the
+/// crate simply does not contain a thing it could have contained, and nothing
+/// in the output says so.
+///
+/// So the tie-breaking rule everywhere in this file, in the probe below and in
+/// the poison channels above alike, is: WHEN IN DOUBT, STAY GREEN.
+///
+///===--------------------------------------------------------------------===//
 /// Seeds: the admissibility probe
 ///===--------------------------------------------------------------------===//
 ///
@@ -200,7 +265,9 @@ enum class ColorReason {
   /// Red: the admissibility probe rejected the item itself.
   Inadmissible,
   /// Red: a record or enum the item depends on (`SigType`, `BodyType`,
-  /// `Field`, or `Base`) is Red, and a type has no stand-in.
+  /// `Field`, or `Base`) is Red, and a type has no stand-in. NOT
+  /// `FieldIndirect`, which the emitted Rust never spells — see the
+  /// "SPELLING, not reachability" section above.
   RedType,
   /// Red: a global the item reads or writes is Red, and a rejected global is
   /// dropped rather than stubbed.

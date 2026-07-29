@@ -1,6 +1,6 @@
 // FR-40: the type and data edges of the item graph. Pins that nested
-// records produce `Field` edges (and a self-referential one produces a
-// Field self-edge), that an enum named by a field is a `Field` edge to an
+// records produce `Field` edges (a self-referential POINTER one a
+// `FieldIndirect` self-edge), that an enum named by a field is a `Field` edge to an
 // `kind=enum` node, that signature types are `SigType` while body-only
 // mentions (local declarations, casts, `sizeof` operands) are `BodyType`,
 // that a global read and a global written from the same function produce
@@ -55,10 +55,15 @@ int main(void) { return measure(&origin); }
 // CHECK-NEXT: node tu0_scratch kind=global def=1 linkage=intern tu=0 loc={{.*}}item-graph-types.c:28:12
 
 // A record's field types are Field edges; a self-referential record's
-// pointer field is a Field self-edge, not a dropped one.
-// CHECK-NEXT: edge Branch -> Leaf kind=Field
-// CHECK-NEXT: edge Branch -> Level kind=Field
-// CHECK-NEXT: edge Chain -> Chain kind=Field
+// pointer field is a self-edge, not a dropped one -- but a `FieldIndirect`
+// one, because a POINTER member is erased by the importer's
+// pointer-struct-member models and the emitted Rust never names the pointee
+// (FR-50; see item-graph-field-indirect.c for the whole split). The trailing
+// `{{$}}` anchors are load-bearing: `kind=Field` is a prefix of
+// `kind=FieldIndirect`, so a bare substring match would confuse the two.
+// CHECK-NEXT: edge Branch -> Leaf kind=Field{{$}}
+// CHECK-NEXT: edge Branch -> Level kind=Field{{$}}
+// CHECK-NEXT: edge Chain -> Chain kind=FieldIndirect{{$}}
 
 // CHECK-NEXT: edge c_main -> measure kind=Calls
 // CHECK-NEXT: edge c_main -> origin kind=ReadsGlobal

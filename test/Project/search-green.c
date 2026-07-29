@@ -36,7 +36,16 @@ int main(void) { return step(2) - 7; }
 // CHECK-NEXT: admitted c_main rep=default
 // CHECK-NEXT: admitted step rep=default
 // CHECK-NEXT: admitted tu0_scale rep=default
-// CHECK-NEXT: summary probes=1 generated=1 pruned=0 improved=no
+
+// FR-50's baseline probe costs this project NOTHING, and that is a property
+// worth pinning rather than a happy accident. The baseline is the state that
+// admits every item; the root already admits every item, because the coloring
+// ruled nothing out; so the two states are the same state, there is no
+// `baseline` line, and `probes=1` stands exactly where it stood. The
+// safety net is paid for only by projects that have something to be wrong
+// about.
+// CHECK-NOT:  {{^}}baseline
+// CHECK:      summary probes=1 generated=1 pruned=0 improved=no >=baseline=yes
 
 // The crate a searched build emits is the crate an unsearched one emits: with
 // nothing excluded, the import options are the ones they always were.

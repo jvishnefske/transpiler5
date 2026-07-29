@@ -140,7 +140,10 @@ enum class EdgeKind {
   /// A record or enum named inside a function body: by a local declaration,
   /// by a cast, or as the operand of `sizeof`/`_Alignof`.
   BodyType,
-  /// A record's field type mentions the target record or enum.
+  /// A record's field type mentions the target record or enum BY VALUE: the
+  /// field embeds it directly, as an array of it, or inside a function
+  /// prototype. Every such occurrence is SPELLED in the emitted Rust field
+  /// list, so the target's own emission is load-bearing for this record.
   Field,
   /// A C++ record's base class (direct bases only; a grandparent is reached
   /// by following the base's own `Base` edge).
@@ -157,6 +160,24 @@ enum class EdgeKind {
   /// The source item mentions the target function outside callee position,
   /// i.e. takes its address (`&f` or the bare `f` that decays to a pointer).
   TakesAddressOf,
+  /// A record's field reaches the target record or enum ONLY through a DATA
+  /// POINTER (`struct S *p`, `struct S **pp`, `struct S *a[4]`), and never by
+  /// value. The dependency is real — it is why `struct Node { struct Node
+  /// *next; }` is self-referential — but it is a WEAKER one than `Field`,
+  /// because the importer's pointer-struct-member models (FR-35/37/38/39)
+  /// erase such a member to an integer or an index and the emitted Rust field
+  /// list never spells the target's name. Measured, not assumed: with
+  /// `struct Atom` rejected, `struct Holder { struct Atom *p; int k; }`
+  /// imports as `struct Holder { p: i64, k: i32 }` and the crate COMPILES,
+  /// while `struct Holder { struct Atom a; }` imports as `{ a: Atom }` and
+  /// does not. A function-pointer field is `Field`, not this: `int (*f)(struct
+  /// S)` crosses a pointer but its prototype still spells `S`.
+  ///
+  /// Appended to the enumeration rather than placed next to `Field` so that
+  /// every other kind keeps its enumerator value, and with it the
+  /// (`from`, `kind`, `to`) edge order, the successor order FR-41 takes its
+  /// blame minimum in, and every golden `--emit=item-graph` line.
+  FieldIndirect,
 };
 
 /// The stable spelling of `kind` used in `node ... kind=<...>` lines:
