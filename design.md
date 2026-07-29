@@ -1170,7 +1170,7 @@ lists the lit test file(s) that validate it.
   and per edge.
   (test/Project/item-graph-*.c, test/Project/item-graph-cpp.cpp)
 
-- [ ] FR-41 Item coloring (W5.1). A three-color lattice over FR-40's items,
+- [x] FR-41 Item coloring (W5.1). A three-color lattice over FR-40's items,
   computed by fixpoint, that decides what a partial port can contain:
   **Green** (the item and its whole type closure are inside the supported
   subset), **Yellow** (the item itself is admissible but at least one
@@ -1191,7 +1191,42 @@ lists the lit test file(s) that validate it.
   import later rejects, and FR-43's search is what repairs that, so the
   probe must stay cheap and must never call an importable item Red.
   Exposed through `emitrust-cc --emit=coloring`.
-  (test/Project/coloring-*.c, test/Project/coloring-cpp.cpp)
+  **AMENDMENT, from the implementation.** This entry described the two
+  poison rules separately; they are ONE rule, and stating it that way is
+  what makes the model correct: an edge to a Red target poisons its source
+  RED unless the target is STUB-REPLACEABLE, in which case only YELLOW —
+  where stub-replaceable is quoted from FR-42's actual recovery policy (a
+  rejected function whose signature still maps becomes an
+  `unimplemented!()` stub; everything else is dropped). Consequences, all
+  pinned by tests: `BodyType` poisons RED (the body mentions the type, so
+  those statements cannot be written — Yellow would claim the function
+  emits, which is false), but the SIGNATURE never named it, so the
+  function stays stub-replaceable and ITS callers are only Yellow — Red
+  bodies stop exactly at the function boundary, which is where a stub can
+  be inserted. `SigType` poisons RED *and* unstubbable, because the stub
+  would have to spell the missing type in its own parameter list, so such
+  a function's callers are Red, NOT Yellow — correcting this entry's
+  original claim that call-poisoning always yields Yellow. And
+  unstubbability does NOT propagate, only Red does: a caller of a
+  signature-broken function is Red but is itself stubbable, so ITS caller
+  is Yellow. That last rule is what stops one unsupported type from
+  reddening a whole program.
+  Blame is actionable, not just a color: each non-Green line carries the
+  immediate poisoner, the edge that carried it, the full chain to the
+  inadmissible root, and that root's construct tag.
+  The probe's deliberately-kept-Green list is FR-43's work list. It does
+  NOT screen pointer-to-pointer parameters: `const char **` string cursors
+  (CTS 00204) and `main`'s `char **argv` both import today, so the syntax
+  decides nothing and screening them would have been a false Red.
+  Validation: all 220 c-testsuite expected-pass cases plus the whole
+  `test/Import` and `test/EndToEnd` corpus colour ALL-GREEN — zero false
+  Reds or Yellows; `fixed-stats` 11/11 and `tokenizer` 5/5 Green, matching
+  the fact that both fully transpile. Determinism checked beyond the lit
+  fixture with a temporary seeded shuffle of nodes AND edges: 88 runs, zero
+  mismatches.
+  (test/Project/coloring-green.c, coloring-yellow.c, coloring-red-type.c,
+  coloring-cycle.c, coloring-determinism.c, coloring-compdb.c,
+  test/Project/coloring-cpp.cpp)
 
 - [x] FR-42 Recoverable import (W5.2). Today `importDeclsIn` returns
   `failure()` at the first unsupported declaration, so one unsupported
@@ -1215,29 +1250,63 @@ lists the lit test file(s) that validate it.
   snapshot over the whole existing EndToEnd corpus.
   (test/Import/C/recover-*.c, test/EndToEnd/recover-partial.cpp)
 
-- [ ] FR-43 Frontier tree search (W5.3). The driver that turns FR-40/41/42
+- [x] FR-43 Frontier tree search (W5.3). The driver that turns FR-40/41/42
   into a maximal partial port. A search STATE is a set of admitted items
-  plus a representation choice per admitted item; the root state is the
-  Green∪Yellow closure (FR-41) of the ROOTS — `main` plus every
-  externally visible definition. Expansion is a best-first tree search:
-  attempt a recovering import (FR-42) of the current state; every
+  plus a representation choice per admitted item; expansion is best-first:
+  attempt a recovering import (FR-42) of the current state, and every
   rejection it reports is a LEARNED FACT that the coloring probe missed,
-  and each child state either drops the offending item and re-colors its
-  dependents, or re-picks that item's representation. The score is
-  lexicographic — items emitted for real, then negated stub count, then
-  summed representation cost — so the search converges on the largest
-  admissible subset rather than the first one that happens to work. It is
-  bounded and reproducible: `--max-search-nodes` (default 8), memoization
-  on the admitted-set hash, and symbol-name tie-breaks. The representation
-  dimension ships with exactly ONE candidate per item — today's greedy
-  Pass-A planners (`planOwners`, `planCellSlices`, `planMallocPool`, ...)
-  — so this wave changes no existing output; the dimension exists because
-  the FR-39 container fat-op split already produced a genuine multiple
-  choice (array pool vs `Vec` vs `VecDeque`, W4.5), and that is where the
-  alternatives plug in without re-plumbing the search.
-  (test/Project/search-*.c, test/Project/search-backtrack.cpp)
+  so each child state drops the offending item and re-colors its
+  dependents. The score is lexicographic — items emitted for real, then
+  negated stub count, then summed representation cost. Bounded and
+  reproducible: `--max-search-nodes` (default 8, counted in IMPORTS),
+  memoization on the admitted-set hash, symbol-name tie-breaks. The
+  representation dimension ships with exactly ONE candidate per item —
+  today's greedy Pass-A planners — so this wave changes no existing
+  output; the FR-39 container fat-op split (array pool vs `Vec` vs
+  `VecDeque`, W4.5) is where alternatives plug in.
+  Surfaces: `--search` (with `--emit=crate --incremental`), `--emit=search`
+  (trace only — no crate and no `main` required, so a LIBRARY is
+  analyzable), `--search-trace`. An excluded item is implemented as a
+  SYNTHETIC REJECTION in `importTopLevelDeclRecovering`, so it stubs when
+  its signature maps and drops otherwise — no new outcome kind anywhere in
+  the importer.
+  **AMENDMENT, measured.** This entry originally specified the root state
+  as the Green-union-Yellow closure OF THE ROOTS. That is wrong under
+  FR-41's rule: the coloring is a global least fixpoint, and intersecting
+  it with root-reachability discards portable items whose only referrer is
+  Red (`polygon`'s `tu0_abs_int`, `shapes`' `tu2_isqrt`) — and in both of
+  those projects EVERY root is itself Red, so the root-closure candidate
+  set is empty, taking the corpus from 19/31 to 16/31. The root state
+  therefore admits all Green-union-Yellow items, and the roots are used
+  only to ORDER repairs (give up what the entry points lean on least).
+  **HONEST NEGATIVE RESULT on the C++ corpus.** 19/31 with the search off
+  and 19/31 with it on — not one item better. All four projects explore
+  exactly one state. The reason is precise, and is a credit to FR-41
+  rather than a defect in FR-43: the coloring is EXACT on this corpus
+  (green counts 11/11, 5/5, 2/8, 1/7 equal the achieved ported counts), so
+  there are no false Greens to repair, and `polygon`/`shapes` are blocked
+  by per-item rejections — `std::vector` references, inheritance and
+  destructors — that no choice of admitted set can move. The search
+  repairs false Greens and whole-program failures; this corpus has
+  neither. Where it DOES pay is measured in
+  `test/Project/search-backtrack.cpp`: a recovering import that dies
+  whole-program in `finalizeProject` yields NO crate under `--incremental`
+  alone, and 4 of 5 items ported plus a compiling crate under
+  `--incremental --search`. Attribution there enumerates a whole failure
+  CLASS from the graph rather than chasing the single symbol
+  `finalizeProject` happened to name first.
+  Cost: 1.08x-1.42x on the corpus (one extra import; FR-44's denominator
+  now reuses the search's graph instead of re-parsing). Worst case
+  measured at 4 probes (`search-false-green.c`), so a project heavy in
+  body-level rejections can burn the full budget for no gain —
+  `--max-search-nodes=1` or `2` is the recommendation for large projects.
+  The default stays 8 because a rejected item can leave importer state
+  that breaks a later one, and only a probe settles that.
+  (test/Project/search-green.c, search-red.c, search-bound.c,
+  search-cli.c, search-determinism.c, search-false-green.c,
+  test/Project/search-backtrack.cpp)
 
-- [ ] FR-44 Incremental crate output and progress ratchet (W5.4).
+- [x] FR-44 Incremental crate output and progress ratchet (W5.4).
   `emitrust-cc --emit=crate --incremental` writes a crate that BUILDS from
   a project only partially inside the subset, plus the report that makes
   the progress legible: `PORTING.md` (one row per item — symbol, color,
@@ -1250,7 +1319,32 @@ lists the lit test file(s) that validate it.
   operational sense — each later wave is measured by how many items move
   from Red/Yellow to Green on a fixed corpus, and no wave may silently
   lose ground.
-  (test/RealWorld/Cpp/*, test/Project/incremental-report.cpp)
+  Landed: `PORTING.md` plus `emitrust-progress.json` (schema
+  `emitrust-progress/1`, documented in `ProgressReport.h`), rendered by
+  pure functions with the driver doing the I/O, preserving the
+  `CrateEmitter` split. The denominator is the FR-40 item graph, so
+  "k of n items ported" is real rather than ledger-only, and status comes
+  from a three-way join — graph nodes (what exists) x rejection ledger
+  (what failed) x the emitted module's symbol table (evidence a survivor
+  actually became Rust) — so `ported` is VERIFIED, not inferred.
+  Graph-vs-emitted-symbol mismatches are handled explicitly: multi-TU
+  header rejections collapse on (symbol, file, line, column); `extern`
+  prototypes count as `declared` and leave both numerator and denominator;
+  and C++ member functions, which are not graph nodes, are deliberately
+  kept OUT of the denominator with their own off-graph tally — they are
+  invisible when they succeed, so counting them only when they fail would
+  make a project look WORSE the more of it ported.
+  This work also exposed and fixed an FR-42 defect: `classifyBlocker` was
+  missing the C++ substring and node-name tables its own header claims are
+  identical to `run_realworld.py`'s, so every C++ rejection tagged `other`
+  — which made the ranked blocker table useless for exactly the projects
+  it exists to serve.
+  **Baseline, untuned and checked in: `fixed-stats` 11/11, `tokenizer`
+  5/5, `polygon` 2/8, `shapes` 1/7 — corpus 19/31 (61.2%).** `polygon` and
+  `shapes`, both hard rejections before this, now emit crates that
+  `cargo build --release --offline` compiles.
+  (test/Driver/incremental.c, test/EndToEnd/incremental-builds.cpp,
+  test/RealWorld/Cpp/Inputs/*/expected-items.txt)
 
 - [x] FR-45 `compile_commands.json` input (W5.5). Real C++ projects are
   described by a compilation database, not by an argv list of sources plus
