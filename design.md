@@ -1547,6 +1547,72 @@ of references or inheritance, so it precedes both.
   test/Project/item-graph-field-indirect.c,
   test/RealWorld/Cpp/search-never-worse.cpp)
 
+- [x] FR-51 Library crates: distinguish Rust `lib` from `bin` (W5.11).
+  `--emit=crate` hard-failed without a `c_main`, so EVERY crate this tool
+  ever emitted was a BINARY crate. Two consequences, the second much larger:
+   1. `--incremental` is designed to drop unportable items, but when the
+      dropped item was `main` the emitter then hard-failed and the user got
+      no crate, no `PORTING.md`, no per-item accounting -- the exact
+      all-or-nothing behaviour `--incremental` exists to remove.
+   2. LIBRARY PROJECTS were unreachable under any flag, which is most real C
+      and C++ code. This was INVISIBLE in the corpus precisely because every
+      corpus program was authored with a `main` so the differential oracle
+      would have something to run -- a blind spot built into the benchmark's
+      own design, not into the translator.
+  Landed: `--crate-type=auto|bin|lib` (default `auto`), lib iff no `c_main`.
+  Forcing `bin` without one is a located error rather than a crate that
+  cannot link; forcing `lib` on a module with `main` demotes `c_main` to an
+  ordinary exported function. A lib writes `src/lib.rs` and a manifest
+  carrying an explicit `[lib]` (cargo would infer both; writing them means
+  reading the manifest alone answers what kind of crate it is).
+  `--emit=rust` now prints the crate root whichever shape it is, making that
+  invariant total where it previously held only for input with a `main`.
+  **Visibility, the load-bearing decision.** Exported in lib mode:
+  functions whose emitted symbol carries no internal-linkage marker, and ALL
+  record/enum definitions unconditionally -- types must be exported because
+  Rust's private-in-public rule (E0446) requires any type named in an
+  exported signature to be exported, and a C record carries no linkage of
+  its own to leak. Globals are NEVER exported: module-level mutable state is
+  not a usable Rust API, and global names are not a sound linkage oracle
+  anyway (a function-local `static` is mangled `<function>_<name>` and
+  inherits its ENCLOSING FUNCTION's tag, not one of its own).
+  Internal linkage is NOT in the IR, which was checked first:
+  `emitrust.func`/`emitrust.global` carry no visibility attribute, and
+  MLIR's `sym_visibility` is already spoken for with an INVERTED meaning --
+  `private` marks a body-less DECLARATION, so a file-`static` definition is
+  non-private while an `extern` prototype IS private. The one surviving
+  trace is the `tu<N>_` mangle, which survives because it must (two TUs may
+  each define `static helper` and both land in one flat Rust module), so
+  `isInternalLinkageSymbolName` reads back a fact the importer deliberately
+  wrote down. Its one imprecision -- an identifier literally spelled
+  `tu0_x` -- fails CONSERVATIVELY: under-export, never mis-export.
+  **New harness outcome `LIB_BUILT`, deliberately not a widened
+  TRANSPILED.** TRANSPILED is a fact about SEMANTICS (built AND ran AND
+  byte-matched a native build); a library has no entry point, and `clang++`
+  cannot even link an oracle from sources with no `main`. `LIB_BUILT` claims
+  translatability and type-correctness only -- such a project could compute
+  entirely wrong answers. It ranks between REJECTED and TRANSPILED, and
+  TRANSPILED -> LIB_BUILT is a REGRESSION, not a lateral move. Conflating
+  the two would have silently weakened the differential oracle that is this
+  project's entire soundness argument.
+  Also fixed a real bug FR-51 made reachable: `declLedgerName` reported a
+  rejected decl by its C spelling, but the ledger symbol is a JOIN KEY
+  against item-graph node keys and the importer renames `main` -> `c_main`.
+  Only the DROP path was affected (a stub overwrites the symbol with its
+  emitted name, which is why `polygon`/`shapes` already read `c_main`
+  stubbed), and a dropped `main` previously produced no report at all.
+  Gates: byte-identical `Cargo.toml`, `src/main.rs` and exit status for all
+  103 pre-existing EndToEnd inputs replayed through their OWN `--emit=crate`
+  RUN lines; c-testsuite inert at 220/220. **`argv-echo` -- the one corpus
+  project that yielded nothing at any revision -- now emits a compiling lib
+  crate with a report** (1 item, `c_main` dropped `[argv]`). New corpus
+  project `ringbuf-lib` (3 TUs, 2 headers, no `main`, plus a deliberate
+  file-`static` so both sides of the visibility rule are covered) scores
+  LIB_BUILT 12/12, with a separate consumer crate linking against it and
+  matching the native build byte for byte.
+  (test/EndToEnd/lib-crate-external-caller.c,
+  test/RealWorld/Cpp/Inputs/ringbuf-lib/)
+
 ### Cherry-pick assessment: `verified_transpilation_pipeline`
 
 The archived prototype (`~/src/archive/verified_transpilation_pipeline` on
