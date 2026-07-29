@@ -1,0 +1,22 @@
+[
+  {
+    "directory": ".",
+    "file": "fixed.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "fixed.cpp", "-o", "fixed.o"]
+  },
+  {
+    "directory": ".",
+    "file": "stats.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "stats.cpp", "-o", "stats.o"]
+  },
+  {
+    "directory": ".",
+    "file": "sensor.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "sensor.cpp", "-o", "sensor.o"]
+  },
+  {
+    "directory": ".",
+    "file": "main.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "main.cpp", "-o", "main.o"]
+  }
+]

@@ -1,0 +1,22 @@
+# RealWorld C++ corpus (FR-46): the MEASURED outcome of every
+# project, one per line, as '<name> <OUTCOME> [blocker-tag]'.
+#
+# This corpus exists to GENERATE DEMAND for the C++ input subset,
+# not to be a conformance target: a REJECTED line is the expected,
+# honest baseline and a standing backlog item, not a failure. The
+# ratchet is two-way -- a TRANSPILED project that stops
+# transpiling fails the gate as a regression, and a REJECTED
+# project that starts transpiling fails until it is ratcheted
+# forward. The blocker tag is advisory: a changed tag is reported
+# loudly but does not fail the gate, since it is a heuristic over
+# diagnostic wording.
+#
+# Per-ITEM scoring (how much of a rejected project ported) is
+# FR-44's --incremental mode; see the FR-44 SEAM block in
+# run_realworld.py. No per-item section exists yet.
+#
+# Regenerated via: run_realworld.py ... --manifest-format outcomes --update
+fixed-stats TRANSPILED
+polygon REJECTED cxx-references
+shapes REJECTED cxx-destructor
+tokenizer REJECTED unsupported-assign-expr:CXXThisExpr
