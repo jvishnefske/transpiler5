@@ -2070,7 +2070,17 @@ private:
   /// through this same path by `emitStmt`; the module-scope insertion point
   /// is guarded, so a mid-body call leaves the caller's insertion point
   /// untouched.
-  LogicalResult importFunction(const clang::FunctionDecl *func);
+  /// FR-47: `signatureOnly` imports the SIGNATURE ONLY, as if `func` were a
+  /// body-less prototype, even when this declaration does have a body — the
+  /// declare-then-define prepass `importCXXMethods` needs so that a C++
+  /// class's methods can refer to one another regardless of declaration
+  /// order (a member function body is a complete-class context in C++,
+  /// unlike C's strictly-preceding-declaration rule this importer was built
+  /// around). The definition pass then calls `importFunction` again with
+  /// the flag clear, and the ordinary redeclaration reconciliation below
+  /// erases the external stub and rebuilds it with the body.
+  LogicalResult importFunction(const clang::FunctionDecl *func,
+                               bool signatureOnly = false);
 
   /// W2.2: imports every user-declared, non-virtual, non-deleted method of
   /// `record` — plain methods, const methods, static methods, and
@@ -2081,6 +2091,12 @@ private:
   /// overloaded operator is rejected earlier, in `collectRecordFields`
   /// (before any field — or method — of the class imports), so none of
   /// those three shapes ever reaches this walk.
+  ///
+  /// FR-47: runs in TWO passes over the same method set — every signature
+  /// first (`importFunction(method, /*signatureOnly=*/true)`), then every
+  /// body — so a method may call any sibling regardless of declaration
+  /// order, matching C++'s complete-class context. See the definition for
+  /// the alternatives rejected.
   LogicalResult importCXXMethods(const clang::CXXRecordDecl *record);
 
   /// W2.2: the per-(class, overload-signature) mangled `func.func`/
@@ -3939,6 +3955,36 @@ private:
   /// dereferences directly.
   FailureOr<Value> emitDerefLValue(const clang::UnaryOperator *unary,
                                    Location loc, GlobalWriteback *writeback);
+
+  /// FR-47: `emitLValue`'s `this` branch — the place denoted by the current
+  /// method's receiver, i.e. the object `*this`, obtained by dereferencing
+  /// `currentCxxThisRef` exactly the way the method prologue and
+  /// `emitMemberBasePlace`'s `->` branch already dereference it.
+  ///
+  /// NOTE the deliberate asymmetry with `emitRValue`'s `CXXThisExpr` case,
+  /// which yields the UNDEREFERENCED ref/mut_ref (`this` is a POINTER
+  /// prvalue of type `C *`). `this` is never itself an lvalue in C++, so
+  /// the only way this branch is reached is a receiver position that clang
+  /// spells with a bare `CXXThisExpr` — the implicit object argument of
+  /// `m()` and of `this->m()` — where the place actually wanted is the
+  /// pointee. Every other place context is unreachable by construction:
+  /// `this = p` and `&this` are ill-formed, an lvalue-to-rvalue cast never
+  /// has a prvalue operand, and `(*this).x` / `(*this).m()` spell an
+  /// explicit `UnaryOperator` that reaches `emitDerefLValue` instead (which
+  /// builds the identical op — that spelling already worked before FR-47,
+  /// which is what pinned the shape this function has to reproduce).
+  ///
+  /// Receiver mutability is deliberately NOT decided here: the place is
+  /// borrow-agnostic, so the single pre-existing rule keeps applying
+  /// unchanged — `emitCXXMemberCall`'s `is_mut = !method->isConst()`, paired
+  /// with the receiver type `importFunction` already fixed at signature
+  /// time (`mut_ref` for a mutating method or a constructor, `ref` for a
+  /// `const` one). Inventing a second rule here (e.g. deciding from the
+  /// CALLER's constness) was rejected: it would double-source the decision,
+  /// and it is unnecessary because C++ itself rejects a `const` caller
+  /// reaching a non-`const` callee long before the importer runs, so no
+  /// `addr_of mut` of a shared-ref-derived place can ever be built.
+  FailureOr<Value> emitCxxThisPlace(Location loc);
 
   /// Reads the current value of a place produced by `emitLValue`.
   Value loadPlace(Location loc, Value place);

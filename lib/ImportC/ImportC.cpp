@@ -4807,6 +4807,21 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
   if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
     if (unary->getOpcode() == clang::UO_Deref)
       return emitDerefLValue(unary, loc, writeback);
+  // FR-47: an intra-class method call through the IMPLICIT receiver (`m();`
+  // inside a sibling method, and the equivalent explicit `this->m();`)
+  // reaches here, because clang spells the implicit object argument of both
+  // as a bare `CXXThisExpr` and `emitCXXMemberCall` needs the receiver's
+  // PLACE to borrow. W2.2 landed `this` only as an rvalue
+  // (`emitRValue`'s own `CXXThisExpr` case) and as a `->` member-access
+  // base, so this case was missing and every such call rejected as
+  // "unsupported assignable expression: CXXThisExpr" — the rank-1 blocker
+  // on the FR-46 C++ demand corpus, since it stops any class whose methods
+  // call each other. Sits immediately after the `UO_Deref` branch above
+  // deliberately: `(*this).m()` already worked through that branch, and
+  // this one builds the very same `emitrust.deref` place, so the two
+  // spellings stay indistinguishable downstream.
+  if (llvm::isa<clang::CXXThisExpr>(e))
+    return emitCxxThisPlace(loc);
   // W2.3: `v[i]` / `v.at(i)` over a recognized `std::vector<T>` receiver
   // both return `T&` in real C++ — a genuine place — so a plain scalar VALUE
   // read (`int x = v[i];`) wraps the call in an implicit `CK_LValueToRValue`
@@ -4879,6 +4894,40 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
                           << "' outside a string literal position";
   return emitError(loc) << "unsupported assignable expression: "
                         << e->getStmtClassName();
+}
+
+FailureOr<Value> CImporter::emitCxxThisPlace(Location loc) {
+  if (!currentCxxThisRef)
+    return emitError(loc)
+           << "unsupported: 'this' outside a non-static member function";
+  // Reuses the ref/mut_ref pointee extraction that `emitMemberBasePlace`'s
+  // `->` branch performs on any reference-typed base, rather than mapping
+  // the clang pointee type afresh: the receiver argument's MLIR type is the
+  // authority here (`importFunction` chose it when it built the signature),
+  // and rederiving it from the AST would introduce a second, silently
+  // divergable source of truth for the receiver struct type.
+  Type pointee;
+  if (auto mutRef =
+          llvm::dyn_cast<emitrust::MutRefType>(currentCxxThisRef.getType()))
+    pointee = mutRef.getPointee();
+  else if (auto sharedRef =
+               llvm::dyn_cast<emitrust::RefType>(currentCxxThisRef.getType()))
+    pointee = sharedRef.getPointee();
+  else
+    // Defensive: `importFunction` only ever binds `currentCxxThisRef` to the
+    // entry block's leading ref/mut_ref receiver argument.
+    return emitError(loc)
+           << "unsupported: 'this' receiver is not a supported reference";
+  // A FRESH deref per use, matching how every other `this` consumer already
+  // behaves (a method body reading two fields emits two `emitrust.deref`s of
+  // the same receiver argument). Hoisting one shared place into the method
+  // prologue was rejected on two counts: it would not dominate uses the
+  // importer materializes inside a nested region, and it would perturb the
+  // op stream of existing W2.2 method bodies for no gain.
+  return builder
+      .create<emitrust::DerefOp>(loc, emitrust::LValueType::get(pointee),
+                                 currentCxxThisRef)
+      .getResult();
 }
 
 FailureOr<Value> CImporter::emitDeclRefLValue(const clang::DeclRefExpr *ref,
