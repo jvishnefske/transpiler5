@@ -20,6 +20,12 @@
 ///   --emit=crate   a complete cargo crate directory (the default), with
 ///                  --build optionally invoking `cargo build --release
 ///                  --offline` on the result.
+/// The inputs are either positional source paths with hand-passed
+/// -I/-isystem/--extra-arg flags (the historical surface), or, with
+/// --compdb <dir-or-file>, a real compile_commands.json that supplies both
+/// the source list and each file's flags and language (FR-45); the two
+/// combine, a positional list with --compdb selecting a subset of the
+/// database's files.
 /// All content rendering is delegated to the pure functions in
 /// CrateEmitter.h; this file owns diagnostics, filesystem writes, and
 /// process invocation. Any failure produces a located diagnostic and a
@@ -72,9 +78,27 @@ enum class EmitKind { Import, MLIR, Rust, Crate };
 
 } // namespace
 
+// Not `cl::OneOrMore`: with --compdb the database may supply the whole
+// source list, so "no positional inputs" is legal there. The historical
+// requirement is enforced explicitly in main() instead, which keeps the
+// no---compdb command line exactly as strict as it was.
 static llvm::cl::list<std::string>
-    inputFilenames(llvm::cl::Positional, llvm::cl::desc("<input C files>"),
-                   llvm::cl::OneOrMore);
+    inputFilenames(llvm::cl::Positional, llvm::cl::desc("<input C files>"));
+
+static llvm::cl::opt<std::string> compilationDatabasePath(
+    "compdb",
+    llvm::cl::desc(
+        "Take the clang command line for each input from a "
+        "compile_commands.json: <path> is either the database file itself "
+        "or a directory containing one. Each file's flags -- include "
+        "paths, macros, and its language (the entry's -x/-std) -- come "
+        "from its database entry, resolved against that entry's "
+        "'directory'; driver-only arguments (-c, -o, -M*) are filtered "
+        "out. With no positional inputs, every file in the database is "
+        "imported; with positional inputs, only those are, still with the "
+        "database's flags. --extra-arg is appended after the database's "
+        "arguments"),
+    llvm::cl::value_desc("dir-or-file"), llvm::cl::init(""));
 
 static llvm::cl::list<std::string>
     includeDirs("I", llvm::cl::Prefix,
@@ -340,6 +364,12 @@ int main(int argc, char **argv) {
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "EmitRust C-to-Rust transpiler driver\n");
 
+  if (inputFilenames.empty() && compilationDatabasePath.empty()) {
+    llvm::errs() << "error: at least one input file is required, or "
+                    "--compdb <dir-or-file> to take the source list from a "
+                    "compilation database\n";
+    return 1;
+  }
   if (buildFlag && emitKind != EmitKind::Crate) {
     llvm::errs() << "error: --build is only valid with --emit=crate\n";
     return 1;
@@ -360,8 +390,8 @@ int main(int argc, char **argv) {
   std::vector<std::string> inputs(inputFilenames.begin(),
                                   inputFilenames.end());
   std::vector<std::string> extra = collectExtraClangArgs();
-  mlir::OwningOpRef<mlir::ModuleOp> module =
-      mlir::emitrust::importCProject(inputs, extra, context);
+  mlir::OwningOpRef<mlir::ModuleOp> module = mlir::emitrust::importCProject(
+      inputs, extra, compilationDatabasePath, context);
   if (!module)
     return 1;
 
@@ -392,7 +422,9 @@ int main(int argc, char **argv) {
     }
     // The crate name comes from --crate-name when given; otherwise, for a
     // single input its stem (historical behavior), and for several inputs the
-    // -o crate-directory stem (the input stems are ambiguous).
+    // -o crate-directory stem (the input stems are ambiguous). A --compdb
+    // run with no positional inputs takes the same crate-directory stem:
+    // the database's file list is a project, not one nameable input.
     llvm::StringRef crateStem = !crateNameOpt.empty()
                                     ? llvm::StringRef(crateNameOpt)
                                 : inputs.size() == 1
