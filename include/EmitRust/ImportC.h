@@ -62,6 +62,31 @@ OwningOpRef<ModuleOp> importC(llvm::StringRef path,
                               llvm::ArrayRef<std::string> extraClangArgs,
                               MLIRContext &context);
 
+/// Overload importing a single file whose clang command line comes from a
+/// `compile_commands.json` (FR-45).
+///
+/// `compilationDatabasePath` names either the database file itself or a
+/// directory containing one; when it is empty this is exactly the overload
+/// above (extension-guessed language, `extraClangArgs` only). When it is
+/// set, `path`'s recorded entry supplies the command line — its `-I`,
+/// `-D`, `-std`, and `-x` flags, resolved against the entry's `directory`
+/// — with driver-only arguments (`-c`, `-o`, `-M*`) filtered out, and
+/// `extraClangArgs` appended last so a caller can still override. A file
+/// the database does not mention falls back to the extension guess.
+///
+/// \param path the path of the C or C++ source file to import.
+/// \param extraClangArgs additional clang command-line arguments, appended
+///        after the database's own.
+/// \param compilationDatabasePath a `compile_commands.json` or its
+///        directory; empty selects the extension-guessing behavior.
+/// \param context the MLIR context that owns the created module.
+/// \returns the imported module, or null on failure (including a database
+///          that cannot be loaded) with diagnostics already emitted.
+OwningOpRef<ModuleOp> importC(llvm::StringRef path,
+                              llvm::ArrayRef<std::string> extraClangArgs,
+                              llvm::StringRef compilationDatabasePath,
+                              MLIRContext &context);
+
 /// Convenience overload importing a single file with no extra clang args.
 OwningOpRef<ModuleOp> importC(llvm::StringRef path, MLIRContext &context);
 
@@ -91,6 +116,44 @@ OwningOpRef<ModuleOp> importC(llvm::StringRef path, MLIRContext &context);
 ///          already emitted.
 OwningOpRef<ModuleOp> importCProject(llvm::ArrayRef<std::string> paths,
                                      llvm::ArrayRef<std::string> extraClangArgs,
+                                     MLIRContext &context);
+
+/// Overload importing a whole project described by a
+/// `compile_commands.json` (FR-45).
+///
+/// `compilationDatabasePath` names either the database file itself or a
+/// directory containing one. It changes two things and nothing else:
+///
+///  - the SOURCE LIST: when `paths` is empty, every file the database
+///    lists is imported (sorted by path and deduplicated, so the
+///    translation-unit order the module records is deterministic); when
+///    `paths` is non-empty only those files are imported, but still with
+///    the database's flags.
+///  - the COMMAND LINE of each file: its recorded entry supplies the
+///    flags and therefore the LANGUAGE (the entry's `-x`/`-std`, or the
+///    driver's own inference), resolved against that entry's `directory`
+///    field, with driver-only arguments (`-c`, `-o`, `-M*`) filtered out.
+///    `extraClangArgs` is appended after the database's arguments so a
+///    caller can override. A file the database does not mention falls back
+///    to the extension guess.
+///
+/// With an empty `compilationDatabasePath` this behaves exactly like the
+/// overload above, including the "no C input files given" error for an
+/// empty `paths`.
+///
+/// \param paths the source files to merge, or empty to take the whole
+///        database.
+/// \param extraClangArgs additional clang command-line arguments, appended
+///        after the database's own, applied to every translation unit.
+/// \param compilationDatabasePath a `compile_commands.json` or its
+///        directory; empty selects the historical behavior.
+/// \param context the MLIR context that owns the created module.
+/// \returns the merged, verified module, or null on failure (including a
+///          database that cannot be loaded) with diagnostics already
+///          emitted.
+OwningOpRef<ModuleOp> importCProject(llvm::ArrayRef<std::string> paths,
+                                     llvm::ArrayRef<std::string> extraClangArgs,
+                                     llvm::StringRef compilationDatabasePath,
                                      MLIRContext &context);
 
 } // namespace emitrust
