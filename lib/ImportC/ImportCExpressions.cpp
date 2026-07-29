@@ -2835,6 +2835,39 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
   // spelling of the `f(&x, &x)` it already rejects.
   if (!argument->getType()->isPointerType() && argument->isLValue()) {
     const clang::Expr *placeExpr = stripLValueNoOp(argument);
+    // FR-48: `f(a + b)` and `f(7)` on a `const T&` parameter. C++ lets a
+    // PRVALUE bind to a const reference by materializing a temporary that
+    // lives for the full-expression, which clang spells as a
+    // `MaterializeTemporaryExpr` — an lvalue with no underlying object for
+    // `emitLValue` to find. Staging the value into a fresh local place and
+    // borrowing THAT reproduces the C++ lifetime exactly (`let t = ...;
+    // f(&t)`), and it is sound precisely because the borrow is shared: a
+    // temporary has no other name, so nothing can observe it, and there is
+    // no caller-visible write to lose.
+    //
+    // A MUTABLE reference never reaches here — C++ itself forbids binding a
+    // prvalue to `T&` — so the `isMutParam` guard is a belt-and-braces
+    // check against ever borrowing a temporary mutably, which would
+    // silently discard the callee's writes.
+    if (const auto *temporary =
+            llvm::dyn_cast<clang::MaterializeTemporaryExpr>(placeExpr)) {
+      if (isMutParam)
+        return emitError(loc)
+               << "unsupported: mutable reference bound to a temporary";
+      FailureOr<Value> value = emitRValue(temporary->getSubExpr());
+      if (failed(value))
+        return failure();
+      if ((*value).getType() != pointee)
+        return emitError(loc) << "unsupported: argument type does not match "
+                                 "the reference parameter";
+      Value staged = createVariablePlace(loc, pointee);
+      builder.create<emitrust::AssignOp>(loc, staged, *value);
+      // `root` stays null on purpose: a temporary is a fresh object that
+      // aliases nothing, so it can never collide in the same-base check.
+      return builder
+          .create<emitrust::AddrOfOp>(loc, paramType, staged, isMutParam)
+          .getResult();
+    }
     const clang::VarDecl *localRoot = placeExprRoot(placeExpr);
     if (localRoot && !localRoot->hasLocalStorage())
       return rejectGlobalPointerArgument(loc, localRoot);

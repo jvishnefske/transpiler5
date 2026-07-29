@@ -24,7 +24,9 @@
 // reading a reference parameter as a value (not as a borrow) in arithmetic;
 // passing a reference parameter ONWARD to another reference parameter (a
 // borrow reborrowed across a call boundary); a reference bound to a struct
-// MEMBER and to an ARRAY ELEMENT rather than a whole variable; a method
+// MEMBER and to an ARRAY ELEMENT rather than a whole variable; a PRVALUE
+// bound to a `const T&` (the materialized-temporary shape, which has no
+// underlying object and must be staged); a method
 // taking `const T&` and a method taking `T&`; and `a.cmp(a)` -- a const
 // method taking a `const T&` that names its own receiver, which is SOUND
 // (two shared borrows) and must be accepted rather than swept up by the
@@ -154,6 +156,13 @@ int main(void) {
   int rhs = 90;
   swap_ints(lhs, rhs);
   printf("swapped=%d,%d\n", lhs, rhs);
+
+  // A PRVALUE bound to a `const T&`: C++ materializes a temporary that
+  // lives for the full-expression. It has no underlying object to borrow,
+  // so the value is staged into a fresh local first. Sound only because the
+  // borrow is shared -- the temporary has no other name, and there is no
+  // caller-visible write to lose.
+  printf("temp=%d lit=%d\n", twice(lhs + rhs), twice(21));
 
   // --- structs
   Point p;
