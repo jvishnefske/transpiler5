@@ -17,16 +17,142 @@
 #define EMITRUST_IMPORTC_H
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include <map>
 #include <string>
 
 namespace mlir {
 class MLIRContext;
 
 namespace emitrust {
+
+//===----------------------------------------------------------------------===//
+// Recoverable import (FR-42)
+//===----------------------------------------------------------------------===//
+
+/// One top-level declaration that the importer rejected and then recovered
+/// from, in the order the declaration walk reached it.
+///
+/// The record is deliberately self-describing rather than a back-pointer to
+/// the clang AST or to the emitted IR: both are gone by the time a driver
+/// prints the summary (the ASTs die with `importCProject`, and a dropped
+/// item has no IR at all), so everything a report needs is copied out here.
+struct RejectedItem {
+  /// The MLIR symbol name the item would have claimed — the actual
+  /// `func.func` symbol when a stub was emitted, and otherwise the source
+  /// spelling of the rejected declaration (`<anonymous>` for a declaration
+  /// with no name, which only unnamed records can be).
+  std::string symbol;
+  /// Where the rejection was raised. This is the location the importer's own
+  /// diagnostic carried — a `FileLineColLoc` for every located rejection,
+  /// which is all of them in practice — so the ledger points at the C
+  /// construct, not at the enclosing declaration.
+  Location loc;
+  /// The verbatim text of the importer diagnostic, with no `file:line:col:`
+  /// prefix and no severity word. Stored verbatim (rather than re-worded)
+  /// so a recovered build and a hard-failing build report the same string,
+  /// and so `classifyBlocker` sees exactly what the RealWorld harness sees.
+  std::string diagnostic;
+  /// The coarse blocker category from `classifyBlocker`.
+  std::string blockerTag;
+  /// True when the item was a function whose signature still mapped and an
+  /// `unimplemented!()` stub carrying that signature was emitted in its
+  /// place; false when the item was dropped from the module entirely.
+  bool stubbed = false;
+};
+
+/// Maps one verbatim importer diagnostic to a coarse blocker category.
+///
+/// The tag vocabulary is deliberately IDENTICAL to `classify_blocker` in
+/// `test/RealWorld/run_realworld.py`, which tags whole-program rejections
+/// for the RealWorld corpus survey: the two ledgers must speak the same
+/// language so a per-item recovery report and a per-program survey can be
+/// tabulated together. The heuristic is therefore a direct port —
+/// system-header symbol names split into `dynamic-memory` (the allocator
+/// family) and `libc:<name>`, then an ordered substring table, then the two
+/// wordings that several blockers share, disambiguated by reading the cited
+/// source line.
+///
+/// `loc` supplies that cited line: the Python side re-parses `file:line:col`
+/// out of the diagnostic text, while in-process the location is already a
+/// `FileLineColLoc`, so the ambiguous-wording refinement reads the file
+/// directly. A non-file location simply skips the refinement and yields the
+/// same default the Python heuristic reaches on an unreadable file.
+///
+/// The Python side additionally has a `crash` tag for a clang/importer crash
+/// observed through a subprocess exit; an in-process importer cannot observe
+/// its own crash, so that tag is never produced here (the vocabulary still
+/// contains it, in the survey).
+///
+/// \param diagnostic the verbatim diagnostic message (no location prefix).
+/// \param loc the diagnostic's location, used for the ambiguous wordings.
+/// \returns the blocker tag, never empty (`other` is the fallback).
+std::string classifyBlocker(llvm::StringRef diagnostic, Location loc);
+
+/// The rejections a recovering import accumulated.
+///
+/// This is a plain append-only value: the importer owns no ledger of its own,
+/// the caller hands one in through `ImportOptions`, and it stays valid and
+/// readable after the import returns. Keeping it out of the importer is what
+/// lets a driver print a summary after the module has already been lowered.
+class RejectionLedger {
+public:
+  /// Appends one recovered rejection.
+  void record(RejectedItem item) { items.push_back(std::move(item)); }
+
+  /// The recorded rejections, in declaration-walk order.
+  llvm::ArrayRef<RejectedItem> getItems() const { return items; }
+
+  /// True when the import rejected nothing (the recovering import produced
+  /// exactly what a non-recovering one would have).
+  bool empty() const { return items.empty(); }
+
+  /// Rejections per blocker tag, ordered by tag. `std::map` rather than a
+  /// `StringMap` so the tabulation order is deterministic without a sort at
+  /// every print, matching the survey's sorted output.
+  std::map<std::string, unsigned> tally() const;
+
+  /// Prints a human-readable summary: one line per rejected item (symbol,
+  /// location, tag, whether a stub replaced it, and the diagnostic), then a
+  /// per-tag tabulation. Prints nothing at all when the ledger is empty, so
+  /// a driver can call it unconditionally.
+  void printSummary(llvm::raw_ostream &os) const;
+
+private:
+  llvm::SmallVector<RejectedItem> items;
+};
+
+/// Knobs shared by `importC` and `importCProject`.
+///
+/// Defaulting every field to the historical behavior is the point: the
+/// three-argument entry points below construct a default `ImportOptions` and
+/// are therefore byte-for-byte the import they always were.
+struct ImportOptions {
+  /// Recoverable import (FR-42). When false — the default — the first
+  /// unsupported top-level declaration fails the whole import, exactly as
+  /// before. When true, such a declaration is recorded in `ledger`, reported
+  /// as a WARNING instead of an error, and the declaration walk continues:
+  /// a function whose signature still maps is replaced by a stub with that
+  /// signature and an `unimplemented!()` body (so its callers still compile),
+  /// and anything else is dropped. Every partial IR the rejected item built
+  /// is discarded before the walk resumes.
+  ///
+  /// Recovery applies ONLY to the top-level declaration walk. A rejection
+  /// raised anywhere else (project finalization, module verification, a
+  /// clang parse error) still fails the import, because none of those can be
+  /// attributed to a single droppable item.
+  bool recover = false;
+  /// Where recovered rejections are recorded. May be null even with
+  /// `recover` set, in which case the rejections are still warned about but
+  /// not collected.
+  RejectionLedger *ledger = nullptr;
+};
 
 /// Imports the C source file at `path` into an MLIR module.
 ///
@@ -65,6 +191,14 @@ OwningOpRef<ModuleOp> importC(llvm::StringRef path,
 /// Convenience overload importing a single file with no extra clang args.
 OwningOpRef<ModuleOp> importC(llvm::StringRef path, MLIRContext &context);
 
+/// `importC` under explicit `options`. The three-argument overload above is
+/// exactly this one with a default-constructed `ImportOptions`, so recovery
+/// is opt-in per call and every existing caller keeps its behavior.
+OwningOpRef<ModuleOp> importC(llvm::StringRef path,
+                              llvm::ArrayRef<std::string> extraClangArgs,
+                              const ImportOptions &options,
+                              MLIRContext &context);
+
 /// Imports a whole C project: parses every source file in `paths` as an
 /// independent C11 translation unit and merges them into one MLIR module,
 /// resolving external symbols across translation units and keeping
@@ -91,6 +225,21 @@ OwningOpRef<ModuleOp> importC(llvm::StringRef path, MLIRContext &context);
 ///          already emitted.
 OwningOpRef<ModuleOp> importCProject(llvm::ArrayRef<std::string> paths,
                                      llvm::ArrayRef<std::string> extraClangArgs,
+                                     MLIRContext &context);
+
+/// `importCProject` under explicit `options`. The three-argument overload
+/// above is exactly this one with a default-constructed `ImportOptions`.
+///
+/// With `options.recover` set, each translation unit recovers independently
+/// but into ONE shared ledger, and cross-TU finalization still runs over the
+/// surviving symbols: a stub emitted for a rejected definition satisfies the
+/// other TUs' prototypes exactly like a real definition would, and a dropped
+/// item leaves its prototypes referenced-but-undefined, which
+/// `finalizeProject` still rejects (that rejection is a whole-project fact,
+/// not a droppable item, so it fails the import).
+OwningOpRef<ModuleOp> importCProject(llvm::ArrayRef<std::string> paths,
+                                     llvm::ArrayRef<std::string> extraClangArgs,
+                                     const ImportOptions &options,
                                      MLIRContext &context);
 
 } // namespace emitrust

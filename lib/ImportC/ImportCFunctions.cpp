@@ -149,6 +149,14 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
       cxxMethod && llvm::isa<clang::CXXConstructorDecl>(cxxMethod);
   llvm::StringRef cName = cxxIsCtor ? llvm::StringRef() : func->getName();
 
+  // Recovery stub retry (FR-42): a variadic function has no Rust signature
+  // at all — its named parameters do not describe its call sites — so there
+  // is nothing to stub and the item stays dropped. Checked before the
+  // variadic handling below so the retry never re-enters `emitVaClones`,
+  // whose per-clone import is exactly the body import the stub replaces.
+  if (recoveryStubOnly && func->isVariadic())
+    return failure();
+
   if (func->isVariadic()) {
     const clang::FunctionDecl *definition = func->getDefinition();
     if (definition && definition->hasBody()) {
@@ -425,7 +433,16 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
                << functionType
                << " (cross-TU pointer-parameter classification)";
     }
-    existing.erase();
+    // The erased declaration is always EXTERNAL (the non-external case
+    // returned above), i.e. a body-less prototype. Recoverable import
+    // (FR-42) keeps a clone of it so that, if this definition then rejects,
+    // a call already imported against the prototype does not lose its
+    // callee; `eraseTopLevelOp` also keeps the live checkpoint's anchor
+    // valid when the prototype happens to be the last module operation.
+    if (activeCheckpoint)
+      activeCheckpoint->erasedExternalClones.push_back(
+          existing.getOperation()->clone());
+    eraseTopLevelOp(existing.getOperation());
     functions.erase(name);
   }
 
@@ -446,6 +463,14 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func) {
       funcOp->setAttr(emitrust::kStaticMethodAttrName, builder.getUnitAttr());
   }
   functions[name] = funcOp;
+  // Recovery stub retry (FR-42): the signature above is the one the real
+  // import would have used — same pointer-parameter classification, same
+  // owner/method placement, same mangled name — so every call site that
+  // survives still type-checks against it. Only the body is replaced.
+  if (recoveryStubOnly) {
+    recoveryStubSymbol = name;
+    return emitRecoveryStub(funcOp, loc);
+  }
   if (!isDefinition) {
     funcOp.setPrivate();
     return success();
@@ -1048,40 +1073,43 @@ LogicalResult CImporter::importDeclsIn(const clang::DeclContext *context) {
         return failure();
       continue;
     }
-    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
-      if (failed(importFunction(func)))
+    // Recoverable import (FR-42) wraps the per-item dispatch and nothing
+    // else: the container recursions above are not items, and a rejection
+    // inside one is recovered at the member that raised it. When recovery
+    // is off this is the historical `failed(...) -> return failure()`.
+    if (recoverFromRejections) {
+      if (failed(importTopLevelDeclRecovering(decl)))
         return failure();
       continue;
     }
-    if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
-      // An EMPTY struct that no declaration type mentions is skipped: it
-      // may only ever appear as a zero-byte member of a byte-region
-      // aggregate (CTS-BR, 00216), which never materializes the record
-      // type at all. One that IS declared with keeps the eager import.
-      if (const clang::RecordDecl *definition = record->getDefinition();
-          definition && definition->isStruct() && definition->field_empty() &&
-          !declTypeUsedRecords.contains(definition))
-        continue;
-      if (failed(importRecord(record, translateLoc(record->getBeginLoc()))))
-        return failure();
-      continue;
-    }
-    if (const auto *enumDecl = llvm::dyn_cast<clang::EnumDecl>(decl)) {
-      if (failed(importEnum(enumDecl, translateLoc(enumDecl->getBeginLoc()))))
-        return failure();
-      continue;
-    }
-    if (llvm::isa<clang::TypedefDecl>(decl) || llvm::isa<clang::EmptyDecl>(decl))
-      continue;
-    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
-      if (failed(importGlobalVar(var)))
-        return failure();
-      continue;
-    }
-    return emitError(translateLoc(decl->getBeginLoc()))
-           << "unsupported top-level declaration";
+    if (failed(importTopLevelDecl(decl)))
+      return failure();
   }
   return success();
+}
+
+LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
+  if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl))
+    return importFunction(func);
+  if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
+    // An EMPTY struct that no declaration type mentions is skipped: it
+    // may only ever appear as a zero-byte member of a byte-region
+    // aggregate (CTS-BR, 00216), which never materializes the record
+    // type at all. One that IS declared with keeps the eager import.
+    if (const clang::RecordDecl *definition = record->getDefinition();
+        definition && definition->isStruct() && definition->field_empty() &&
+        !declTypeUsedRecords.contains(definition))
+      return success();
+    return importRecord(record, translateLoc(record->getBeginLoc()));
+  }
+  if (const auto *enumDecl = llvm::dyn_cast<clang::EnumDecl>(decl))
+    return importEnum(enumDecl, translateLoc(enumDecl->getBeginLoc()));
+  if (llvm::isa<clang::TypedefDecl>(decl) || llvm::isa<clang::EmptyDecl>(decl))
+    return success();
+  if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+    return importGlobalVar(var);
+  return emitError(translateLoc(decl->getBeginLoc()))
+         << "unsupported top-level declaration";
 }
 
 LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,

@@ -5619,6 +5619,13 @@ OwningOpRef<ModuleOp>
 mlir::emitrust::importC(llvm::StringRef path,
                         llvm::ArrayRef<std::string> extraClangArgs,
                         MLIRContext &context) {
+  return importC(path, extraClangArgs, ImportOptions(), context);
+}
+
+OwningOpRef<ModuleOp>
+mlir::emitrust::importC(llvm::StringRef path,
+                        llvm::ArrayRef<std::string> extraClangArgs,
+                        const ImportOptions &options, MLIRContext &context) {
   loadImportDialects(context);
 
   // Imperative shell: parse the file with clang. Parse diagnostics are
@@ -5644,6 +5651,12 @@ mlir::emitrust::importC(llvm::StringRef path,
                           /*column=*/1);
   OwningOpRef<ModuleOp> module(ModuleOp::create(moduleLoc));
   CImporter importer(*module);
+  // FR-42: recovery is opted into per import and touches nothing when off.
+  // A caller that wants recovery without a ledger gets this scratch one, so
+  // the importer never has to test for a null ledger mid-import.
+  RejectionLedger scratchLedger;
+  if (options.recover)
+    importer.enableRecovery(options.ledger ? *options.ledger : scratchLedger);
   if (failed(importer.importTranslationUnit(ast.getASTContext(),
                                             /*tuTag=*/"",
                                             /*deferExtern=*/false,
@@ -5665,6 +5678,14 @@ OwningOpRef<ModuleOp> mlir::emitrust::importC(llvm::StringRef path,
 OwningOpRef<ModuleOp>
 mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
                                llvm::ArrayRef<std::string> extraClangArgs,
+                               MLIRContext &context) {
+  return importCProject(paths, extraClangArgs, ImportOptions(), context);
+}
+
+OwningOpRef<ModuleOp>
+mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
+                               llvm::ArrayRef<std::string> extraClangArgs,
+                               const ImportOptions &options,
                                MLIRContext &context) {
   loadImportDialects(context);
   if (paths.empty()) {
@@ -5700,6 +5721,12 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
                           /*line=*/1, /*column=*/1);
   OwningOpRef<ModuleOp> module(ModuleOp::create(moduleLoc));
   CImporter importer(*module);
+  // FR-42: one shared ledger across every TU — a project's recovery report
+  // is a project-level artifact, and the per-TU walks accumulate into it in
+  // path order.
+  RejectionLedger scratchLedger;
+  if (options.recover)
+    importer.enableRecovery(options.ledger ? *options.ledger : scratchLedger);
   // W3.0: scan every AST for externally visible va_list-using variadic
   // definitions BEFORE importing any of them, so the registry is complete
   // regardless of whether a caller's TU or its callee's defining TU is
