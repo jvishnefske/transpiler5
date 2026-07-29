@@ -171,6 +171,19 @@ static llvm::cl::opt<bool> buildFlag(
                    "--offline' on it (only valid with --emit=crate)"),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> recoverFlag(
+    "recover",
+    llvm::cl::desc(
+        "Recoverable import (FR-42): instead of failing the whole compile at "
+        "the first unsupported top-level declaration, record it, report it as "
+        "a warning, and keep importing the rest. A rejected function whose "
+        "signature still maps is replaced by a stub with that signature and "
+        "an unimplemented!() body so its callers still compile; anything else "
+        "is dropped. A summary of the recovered rejections is printed to "
+        "stderr. Off by default, in which case the compile is byte-identical "
+        "to one built without this flag"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> checkRangeRefinement(
     "check-range-refinement",
     llvm::cl::desc(
@@ -434,10 +447,24 @@ int main(int argc, char **argv) {
   // context never depends on pass-internal registration details.
   context.loadDialect<mlir::scf::SCFDialect, mlir::ub::UBDialect>();
 
-  mlir::OwningOpRef<mlir::ModuleOp> module = mlir::emitrust::importCProject(
-      inputs, extra, compilationDatabasePath, context);
+  // FR-42: the ledger outlives the import so the summary can be printed
+  // after the module has been produced (and, on a recovered compile, after
+  // the pipeline has confirmed the surviving subset is still lowerable).
+  mlir::emitrust::RejectionLedger ledger;
+  mlir::emitrust::ImportOptions importOptions;
+  importOptions.recover = recoverFlag;
+  importOptions.ledger = &ledger;
+  // --recover and --compdb are the pair a real C++ project needs together:
+  // the database to be parsed the way its build system parses it, recovery
+  // to yield anything at all.
+  importOptions.compilationDatabasePath = compilationDatabasePath;
+  mlir::OwningOpRef<mlir::ModuleOp> module =
+      mlir::emitrust::importCProject(inputs, extra, importOptions, context);
   if (!module)
     return 1;
+  // Printed before any output is written so it is visible even when a later
+  // stage fails; a no-op when nothing was recovered.
+  ledger.printSummary(llvm::errs());
 
   if (emitKind == EmitKind::Import)
     return mlir::failed(writeModule(*module, outputPath)) ? 1 : 0;

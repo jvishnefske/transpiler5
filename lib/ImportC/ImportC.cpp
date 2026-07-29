@@ -5564,6 +5564,15 @@ mlir::emitrust::importC(llvm::StringRef path,
                         llvm::ArrayRef<std::string> extraClangArgs,
                         llvm::StringRef compilationDatabasePath,
                         MLIRContext &context) {
+  ImportOptions options;
+  options.compilationDatabasePath = compilationDatabasePath.str();
+  return importC(path, extraClangArgs, options, context);
+}
+
+OwningOpRef<ModuleOp>
+mlir::emitrust::importC(llvm::StringRef path,
+                        llvm::ArrayRef<std::string> extraClangArgs,
+                        const ImportOptions &options, MLIRContext &context) {
   loadImportDialects(context);
 
   // Imperative shell: parse the file with clang. Parse diagnostics are
@@ -5578,14 +5587,14 @@ mlir::emitrust::importC(llvm::StringRef path,
   std::string databaseError;
   std::vector<std::unique_ptr<clang::ASTUnit>> asts;
   int status = buildProjectASTs(requested, extraClangArgs,
-                                compilationDatabasePath, asts, sources,
+                                options.compilationDatabasePath, asts, sources,
                                 databaseError);
   if (!databaseError.empty()) {
     // Locate the diagnostic ON the database path so the driver's
     // `file:line:col:` prefix names it; the message then carries only
     // clang's own explanation.
     emitError(FileLineColLoc::get(
-                  StringAttr::get(&context, compilationDatabasePath),
+                  StringAttr::get(&context, options.compilationDatabasePath),
                   /*line=*/1, /*column=*/1))
         << "cannot load compilation database: " << databaseError;
     return nullptr;
@@ -5605,6 +5614,12 @@ mlir::emitrust::importC(llvm::StringRef path,
                           /*column=*/1);
   OwningOpRef<ModuleOp> module(ModuleOp::create(moduleLoc));
   CImporter importer(*module);
+  // FR-42: recovery is opted into per import and touches nothing when off.
+  // A caller that wants recovery without a ledger gets this scratch one, so
+  // the importer never has to test for a null ledger mid-import.
+  RejectionLedger scratchLedger;
+  if (options.recover)
+    importer.enableRecovery(options.ledger ? *options.ledger : scratchLedger);
   if (failed(importer.importTranslationUnit(ast.getASTContext(),
                                             /*tuTag=*/"",
                                             /*deferExtern=*/false,
@@ -5636,6 +5651,16 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
                                llvm::ArrayRef<std::string> extraClangArgs,
                                llvm::StringRef compilationDatabasePath,
                                MLIRContext &context) {
+  ImportOptions options;
+  options.compilationDatabasePath = compilationDatabasePath.str();
+  return importCProject(paths, extraClangArgs, options, context);
+}
+
+OwningOpRef<ModuleOp>
+mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
+                               llvm::ArrayRef<std::string> extraClangArgs,
+                               const ImportOptions &options,
+                               MLIRContext &context) {
   loadImportDialects(context);
 
   // Imperative shell: parse every source as an independent translation
@@ -5652,14 +5677,14 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
   std::string databaseError;
   std::vector<std::unique_ptr<clang::ASTUnit>> asts;
   int status = buildProjectASTs(paths, extraClangArgs,
-                                compilationDatabasePath, asts, sources,
+                                options.compilationDatabasePath, asts, sources,
                                 databaseError);
   if (!databaseError.empty()) {
     // Locate the diagnostic ON the database path so the driver's
     // `file:line:col:` prefix names it; the message then carries only
     // clang's own explanation.
     emitError(FileLineColLoc::get(
-                  StringAttr::get(&context, compilationDatabasePath),
+                  StringAttr::get(&context, options.compilationDatabasePath),
                   /*line=*/1, /*column=*/1))
         << "cannot load compilation database: " << databaseError;
     return nullptr;
@@ -5690,6 +5715,12 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
                           /*line=*/1, /*column=*/1);
   OwningOpRef<ModuleOp> module(ModuleOp::create(moduleLoc));
   CImporter importer(*module);
+  // FR-42: one shared ledger across every TU — a project's recovery report
+  // is a project-level artifact, and the per-TU walks accumulate into it in
+  // path order.
+  RejectionLedger scratchLedger;
+  if (options.recover)
+    importer.enableRecovery(options.ledger ? *options.ledger : scratchLedger);
   // W3.0: scan every AST for externally visible va_list-using variadic
   // definitions BEFORE importing any of them, so the registry is complete
   // regardless of whether a caller's TU or its callee's defining TU is
