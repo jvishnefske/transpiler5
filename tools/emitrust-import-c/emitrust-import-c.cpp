@@ -57,6 +57,19 @@ static llvm::cl::list<std::string>
                              "(repeatable)"),
               llvm::cl::value_desc("arg"));
 
+static llvm::cl::opt<bool> externalsTrait(
+    "externals-trait",
+    llvm::cl::desc(
+        "FR-52: record a referenced-but-undefined external FUNCTION as a "
+        "requirement -- a body-less func.func marked "
+        "emitrust.external_requirement -- instead of failing the import. Only "
+        "meaningful with two or more inputs (the cross-TU resolution that "
+        "raises the rejection runs only for a project). Undefined external "
+        "GLOBALS, C++ member functions and address-taken functions keep the "
+        "rejection either way. Off by default, in which case the import is "
+        "byte-identical to one run without this flag"),
+    llvm::cl::init(false));
+
 /// Collects the `-I`, `-isystem`, and `--extra-arg` options into one clang
 /// argument list, interleaved by command-line position so the include search
 /// order matches what the user wrote.
@@ -122,12 +135,19 @@ int main(int argc, char **argv) {
   std::vector<std::string> extra = collectExtraClangArgs();
   std::vector<std::string> inputs(inputFilenames.begin(),
                                   inputFilenames.end());
+  // FR-52: `Trait` rather than `TraitWhenLibrary` — this tool emits a module,
+  // not a crate, so it has no crate shape to condition on and the flag IS the
+  // user's decision. Left at its `Reject` default when the flag is absent, so
+  // the import is exactly the one it always was.
+  mlir::emitrust::ImportOptions options;
+  if (externalsTrait)
+    options.externalRequirements = mlir::emitrust::ExternalRequirements::Trait;
   // A single input keeps the historical single-TU behavior (bare names); two
   // or more inputs are merged as a project with cross-TU linkage.
   mlir::OwningOpRef<mlir::ModuleOp> module =
       inputs.size() == 1
-          ? mlir::emitrust::importC(inputs.front(), extra, context)
-          : mlir::emitrust::importCProject(inputs, extra, context);
+          ? mlir::emitrust::importC(inputs.front(), extra, options, context)
+          : mlir::emitrust::importCProject(inputs, extra, options, context);
   if (!module)
     return 1;
 

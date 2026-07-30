@@ -21,6 +21,7 @@ set(LIBS
   MLIRFuncToEmitRust
   MLIRSCFToEmitRust
   MLIRConvertToEmitRust
+  MLIREmitRustLowerExternalRequirements
   MLIRControlFlowToSCF
   MLIRTransforms
   MLIRFuncDialect

@@ -3337,6 +3337,11 @@ CImporter::resolveFunctionPointerDecl(const clang::FunctionDecl *callee,
     return emitError(loc)
            << "unsupported: function '" << name
            << "' does not match the function pointer signature";
+  // FR-52: the emitted `Some(<name>)` constant spells the item out directly,
+  // so this name can never be routed through the external-requirement trait.
+  // Recorded here — the one place a function address resolves — rather than
+  // recovered later by scanning opaque constant text.
+  fnPointerTargetSymbols.insert(name);
   return name;
 }
 

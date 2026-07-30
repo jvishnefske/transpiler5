@@ -1,0 +1,284 @@
+//===- LowerExternalRequirements.cpp - FR-52 externals trait --------------===//
+//
+// This file is part of the EmitRust project.
+//
+//===----------------------------------------------------------------------===//
+//
+/// \file
+/// Implements `emitrust-lower-external-requirements`: the pass that turns the
+/// external-requirement declarations the C importer marked into one
+/// `emitrust.trait_def` and makes the code that needs them generic over it.
+///
+/// # Why this is a pass and not part of the importer
+///
+/// The importer knows the FACT (this symbol is referenced and nobody defines
+/// it) and records it. It does not know the SHAPE of the answer, because the
+/// answer is expressed in the emitted item names and in the call syntax, and
+/// neither exists until `convert-to-emitrust` has run: before it, a call is a
+/// `func.call` whose callee must resolve in the symbol table, so a
+/// requirement could not be erased without breaking the verifier. After it, a
+/// call is an `emitrust.call_opaque` with a plain STRING callee, which is
+/// exactly the freedom `E::<name>` and `<name>::<E>` need.
+///
+/// # The propagation rule
+///
+/// A function is generic over the trait iff it can reach a requirement
+/// through direct calls. That is the smallest correct set: a Rust caller of
+/// `f<E: Externals>` must itself name some `E`, and it has one only if it is
+/// generic too, so genericity propagates up the call graph and stops exactly
+/// where the calls do. Functions outside the closure are not touched at all,
+/// which is what keeps a project with no requirements byte-identical.
+///
+/// Recursion is handled by the worklist reaching a fixpoint rather than by
+/// any acyclicity assumption; a cycle simply converges.
+//
+//===----------------------------------------------------------------------===//
+
+#include "EmitRust/Conversion/LowerExternalRequirements.h"
+
+#include "EmitRust/EmitRustAttributes.h"
+#include "EmitRust/EmitRustDialect.h"
+#include "EmitRust/EmitRustOps.h"
+
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/SymbolTable.h"
+#include "mlir/Pass/Pass.h"
+
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/Twine.h"
+
+namespace mlir {
+namespace emitrust {
+#define GEN_PASS_DEF_EMITRUSTLOWEREXTERNALREQUIREMENTS
+#include "EmitRust/Conversion/Passes.h.inc"
+} // namespace emitrust
+} // namespace mlir
+
+using namespace mlir;
+using namespace mlir::emitrust;
+
+namespace {
+
+/// The callee name of `op` when it is one of the two call forms this pass
+/// requalifies, or an empty `StringRef` otherwise.
+///
+/// The two forms share one namespace: `convert-func-to-emitrust` writes the
+/// callee's SYMBOL into `emitrust.method_call`'s `method` attribute, and the
+/// Rust emitter renders an `emitrust.impl` member under that same symbol. So
+/// "the string naming the callee" is a single concept here.
+StringRef calleeOf(Operation *op) {
+  if (auto call = dyn_cast<emitrust::CallOpaqueOp>(op))
+    return call.getCallee();
+  if (auto call = dyn_cast<emitrust::MethodCallOp>(op))
+    return call.getMethod();
+  return StringRef();
+}
+
+/// The function symbol `attr` names as a function-POINTER value, i.e. the `X`
+/// of the opaque text `Some(X)` the importer emits for a decayed function
+/// reference, or an empty `StringRef`.
+///
+/// Reading the text back is reading a contract, not guessing: every function
+/// address in the module is produced by `resolveFunctionPointerDecl` in
+/// exactly this spelling. It matters here because such a reference is NOT a
+/// symbol use — nothing in the IR links it to the callee — so a generic
+/// function whose address is taken would otherwise be renamed out from under
+/// its own `Some(...)`.
+StringRef fnPointerTargetOf(Attribute attr) {
+  auto opaque = dyn_cast_if_present<emitrust::OpaqueAttr>(attr);
+  if (!opaque)
+    return StringRef();
+  StringRef text = opaque.getValue();
+  if (!text.consume_front("Some(") || !text.consume_back(")"))
+    return StringRef();
+  return text;
+}
+
+/// `fnPointerTargetOf` for the value of an `emitrust.constant`.
+StringRef fnPointerTargetOf(Operation *op) {
+  auto constOp = dyn_cast<emitrust::ConstantOp>(op);
+  return constOp ? fnPointerTargetOf(constOp.getValue()) : StringRef();
+}
+
+/// Replaces `op`'s callee string with `callee`.
+void setCallee(Operation *op, StringRef callee) {
+  StringAttr attr = StringAttr::get(op->getContext(), callee);
+  if (auto call = dyn_cast<emitrust::CallOpaqueOp>(op)) {
+    call.setCalleeAttr(attr);
+    return;
+  }
+  cast<emitrust::MethodCallOp>(op).setMethodAttr(attr);
+}
+
+/// Every `emitrust.func` of `module`, free functions and `emitrust.impl`
+/// members alike, in module order.
+SmallVector<emitrust::FuncOp> collectFuncs(ModuleOp module) {
+  SmallVector<emitrust::FuncOp> funcs;
+  for (Operation &op : *module.getBody()) {
+    if (auto funcOp = dyn_cast<emitrust::FuncOp>(&op)) {
+      funcs.push_back(funcOp);
+      continue;
+    }
+    if (auto implOp = dyn_cast<emitrust::ImplOp>(&op))
+      for (Operation &member : implOp.getBody().front())
+        if (auto funcOp = dyn_cast<emitrust::FuncOp>(&member))
+          funcs.push_back(funcOp);
+  }
+  return funcs;
+}
+
+/// The `emitrust-lower-external-requirements` pass.
+struct LowerExternalRequirements
+    : public emitrust::impl::EmitRustLowerExternalRequirementsBase<
+          LowerExternalRequirements> {
+  void runOnOperation() override {
+    ModuleOp module = getOperation();
+
+    // The requirements, in module order, so the emitted trait lists them in
+    // the order the declarations appear rather than in hash order.
+    SmallVector<emitrust::FuncOp> requirements;
+    for (auto funcOp : module.getOps<emitrust::FuncOp>())
+      if (funcOp->hasAttr(emitrust::kExternalRequirementAttrName))
+        requirements.push_back(funcOp);
+    if (requirements.empty())
+      return; // The overwhelmingly common case: nothing to do, nothing said.
+
+    // A type parameter shadows a same-named type inside the generic item, and
+    // a trait shares the item namespace with structs and enums, so either
+    // clash would silently change what an emitted signature means. Both are
+    // reported rather than worked around: renaming would make the emitted
+    // API depend on an unrelated C identifier.
+    for (StringRef reserved :
+         {emitrust::kExternalsTraitName, emitrust::kExternalsTypeParam}) {
+      if (Operation *clash = SymbolTable::lookupSymbolIn(module, reserved)) {
+        clash->emitError()
+            << "unsupported: the project defines an item named '" << reserved
+            << "', which clashes with the external-requirement trait";
+        return signalPassFailure();
+      }
+    }
+
+    llvm::StringSet<> requirementNames;
+    for (emitrust::FuncOp funcOp : requirements)
+      requirementNames.insert(funcOp.getSymName());
+
+    SmallVector<emitrust::FuncOp> funcs = collectFuncs(module);
+
+    // Transitive closure of callers, by fixpoint over the direct-call edges.
+    llvm::StringSet<> generic;
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (emitrust::FuncOp funcOp : funcs) {
+        if (funcOp->hasAttr(emitrust::kExternalRequirementAttrName) ||
+            generic.contains(funcOp.getSymName()))
+          continue;
+        bool needs = false;
+        funcOp.walk([&](Operation *op) {
+          // Taking the address of a generic function is an edge just like
+          // calling one: `Some(f)` must become `Some(f::<E>)`, and only a
+          // function that itself has an `E` can spell that.
+          for (StringRef name : {calleeOf(op), fnPointerTargetOf(op)})
+            if (!name.empty() &&
+                (requirementNames.contains(name) || generic.contains(name)))
+              needs = true;
+        });
+        if (needs) {
+          generic.insert(funcOp.getSymName());
+          changed = true;
+        }
+      }
+    }
+
+    // Refusals, all of them before a single edit, so a rejected module is
+    // never half-rewritten.
+    //
+    // A function POINTER to a REQUIREMENT has no spelling at all: the trait
+    // method is reached through the type parameter and `Some(E::f)` is not a
+    // function item. The importer already keeps such a symbol rejected
+    // (`isExternalRequirementShape`), so this only fires on hand-written IR —
+    // but it fires rather than emitting text that names nothing.
+    for (emitrust::FuncOp funcOp : funcs) {
+      LogicalResult refused = success();
+      funcOp.walk([&](Operation *op) {
+        StringRef target = fnPointerTargetOf(op);
+        if (!target.empty() && requirementNames.contains(target)) {
+          op->emitError() << "unsupported: the address of external requirement '"
+                          << target << "' is taken; a trait method is not a "
+                                       "function item";
+          refused = failure();
+        }
+      });
+      if (failed(refused))
+        return signalPassFailure();
+    }
+    // A function pointer stored in a module-level GLOBAL has no enclosing
+    // generic item, so there is nowhere to write the `::<E>` its target now
+    // needs. The project keeps its pre-FR-52 outcome for this shape.
+    for (auto globalOp : module.getOps<emitrust::GlobalOp>()) {
+      StringRef target = fnPointerTargetOf(globalOp.getInitAttr());
+      if (!target.empty() && generic.contains(target)) {
+        globalOp.emitError()
+            << "unsupported: global '" << globalOp.getSymName()
+            << "' holds the address of '" << target
+            << "', which the external-requirement trait makes generic";
+        return signalPassFailure();
+      }
+    }
+
+    // Requalify every call. A call to a requirement resolves through the type
+    // parameter; a call to a generic function passes it on. Nothing outside
+    // the closure can be a caller of a closure member (that is what the
+    // closure means), so no other call form needs touching.
+    for (emitrust::FuncOp funcOp : funcs)
+      funcOp.walk([&](Operation *op) {
+        if (StringRef callee = calleeOf(op); !callee.empty()) {
+          if (requirementNames.contains(callee))
+            setCallee(op, (emitrust::kExternalsTypeParam + Twine("::") + callee)
+                              .str());
+          else if (generic.contains(callee))
+            setCallee(op, (callee + Twine("::<") +
+                           emitrust::kExternalsTypeParam + ">")
+                              .str());
+          return;
+        }
+        StringRef target = fnPointerTargetOf(op);
+        if (!target.empty() && generic.contains(target))
+          cast<emitrust::ConstantOp>(op).setValueAttr(emitrust::OpaqueAttr::get(
+              &getContext(), ("Some(" + target + Twine("::<") +
+                              emitrust::kExternalsTypeParam + ">)")
+                                 .str()));
+      });
+
+    // Mark the closure. Done after the requalification so the walk above sees
+    // the module in one consistent state.
+    StringAttr traitName =
+        StringAttr::get(&getContext(), emitrust::kExternalsTraitName);
+    for (emitrust::FuncOp funcOp : funcs)
+      if (generic.contains(funcOp.getSymName()))
+        funcOp->setAttr(emitrust::kExternalsGenericAttrName, traitName);
+
+    // Materialize the trait at the FRONT of the module: a Rust reader meets
+    // the crate's requirements before the code that consumes them, and the
+    // position is free — the op only exists when there are requirements.
+    SmallVector<Attribute> names;
+    SmallVector<Attribute> types;
+    for (emitrust::FuncOp funcOp : requirements) {
+      names.push_back(StringAttr::get(&getContext(), funcOp.getSymName()));
+      types.push_back(TypeAttr::get(funcOp.getFunctionType()));
+    }
+    OpBuilder builder(&getContext());
+    builder.setInsertionPointToStart(module.getBody());
+    builder.create<emitrust::TraitDefOp>(
+        requirements.front().getLoc(), traitName,
+        builder.getArrayAttr(names), builder.getArrayAttr(types));
+
+    for (emitrust::FuncOp funcOp : requirements)
+      funcOp.erase();
+  }
+};
+
+} // namespace

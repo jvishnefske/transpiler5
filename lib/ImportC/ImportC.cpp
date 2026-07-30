@@ -5592,6 +5592,12 @@ LogicalResult CImporter::finalizeProject() {
   // as printf were never added to the module.) An external func whose symbol
   // ended up with no uses (e.g. a prototype referenced only in an
   // unevaluated context) demands no definition and is erased instead.
+  //
+  // FR-52: under a trait policy the survivors are not an error but the
+  // project's REQUIREMENTS on its environment, and are marked as such for
+  // `emitrust-lower-external-requirements` instead. Only the shapes the trait
+  // can faithfully express qualify — see `externalRequirementFor`.
+  bool trait = externalRequirementsAllowed();
   for (func::FuncOp func :
        llvm::make_early_inc_range(module.getOps<func::FuncOp>()))
     if (func.isExternal()) {
@@ -5600,11 +5606,64 @@ LogicalResult CImporter::finalizeProject() {
         func.erase();
         continue;
       }
+      if (trait && isExternalRequirementShape(func)) {
+        func->setAttr(emitrust::kExternalRequirementAttrName,
+                      builder.getUnitAttr());
+        continue;
+      }
       return emitError(firstSymbolUseLoc(func.getSymName(), func.getLoc()))
              << "unsupported: function '" << func.getSymName()
              << "' is referenced but not defined in any translation unit";
     }
   return success();
+}
+
+bool CImporter::externalRequirementsAllowed() {
+  switch (externalRequirements) {
+  case emitrust::ExternalRequirements::Reject:
+    return false;
+  case emitrust::ExternalRequirements::Trait:
+    return true;
+  case emitrust::ExternalRequirements::TraitWhenLibrary:
+    break;
+  }
+  // The library predicate, spelled exactly as `emitrustcc::hasCMain` spells
+  // it: a module that DEFINES the imported C entry point becomes a binary
+  // crate under `--crate-type=auto`, and a binary crate has no caller to
+  // supply the trait impl. A body-less `c_main` (an entry point that some
+  // TU only declared) is not a definition and does not count.
+  func::FuncOp entry = functions.lookup("c_main");
+  return !entry || entry.isExternal();
+}
+
+bool CImporter::isExternalRequirementShape(func::FuncOp func) {
+  // A C++ member function's call sites are receiver-bearing
+  // `emitrust.method_call`s; an associated trait function has no receiver to
+  // bind them to, and a missing method body is a hole in code the project
+  // OWNS rather than a requirement on its environment.
+  if (func->hasAttr(emitrust::kMethodOfAttrName))
+    return false;
+  // An address-taken function is spelled out by name inside an opaque
+  // `Some(<name>)` constant that the trait's type parameter cannot reach.
+  if (fnPointerTargetSymbols.contains(func.getSymName()))
+    return false;
+  // Every surviving reference must be a DIRECT CALL. Anything else — the
+  // callee slot of an indirect construct, an unmodelled symbol use a future
+  // op introduces — has no `E::<name>` spelling, so it keeps the rejection.
+  std::optional<SymbolTable::UseRange> uses = SymbolTable::getSymbolUses(
+      func.getSymNameAttr(), module.getOperation());
+  if (!uses)
+    return false;
+  for (SymbolTable::SymbolUse use : *uses) {
+    auto call = llvm::dyn_cast<func::CallOp>(use.getUser());
+    if (!call || call.getCalleeAttr() != use.getSymbolRef())
+      return false;
+    // A method-tagged call is a `emitrust.method_call` after conversion, for
+    // the same reason a method declaration is excluded above.
+    if (call->hasAttr(emitrust::kMethodCallAttrName))
+      return false;
+  }
+  return true;
 }
 
 //===----------------------------------------------------------------------===//
@@ -5785,6 +5844,10 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
                           /*line=*/1, /*column=*/1);
   OwningOpRef<ModuleOp> module(ModuleOp::create(moduleLoc));
   CImporter importer(*module);
+  // FR-52: the unresolved-external policy is a whole-project decision and
+  // `finalizeProject` — the only place it is consulted — runs only here, so
+  // it is installed once, unconditionally, and is inert at its default.
+  importer.setExternalRequirements(options.externalRequirements);
   // FR-42: one shared ledger across every TU — a project's recovery report
   // is a project-level artifact, and the per-TU walks accumulate into it in
   // path order.

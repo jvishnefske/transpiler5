@@ -13,6 +13,7 @@ set(LIBS
   MLIRFuncToEmitRust
   MLIRSCFToEmitRust
   MLIRConvertToEmitRust
+  MLIREmitRustLowerExternalRequirements
 )
 
 add_llvm_executable(emitrust-opt emitrust-opt.cpp)

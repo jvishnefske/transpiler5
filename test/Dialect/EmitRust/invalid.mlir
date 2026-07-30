@@ -584,3 +584,35 @@ emitrust.func @slice_of_array_element(
 // A nested aggregate initializer must match every level's extent.
 // expected-error @+1 {{aggregate init has 3 elements, but the array type '!emitrust.array<4xi8>' has 4}}
 emitrust.global @ragged <[[0 : i8, 1 : i8, 2 : i8], [3 : i8, 4 : i8, 5 : i8]]> : !emitrust.array<2x!emitrust.array<4xi8>>
+
+// -----
+
+// FR-52: the two requirement arrays must have the same length.
+// expected-error @+1 {{has 2 method names but 1 method types}}
+emitrust.trait_def @Externals ["a", "b"] [(i32) -> i32]
+
+// -----
+
+// FR-52: a requirement trait with nothing in it is never created by the
+// lowering and is not a legal hand-written shape either.
+// expected-error @+1 {{must declare at least one method}}
+emitrust.trait_def @Externals [] []
+
+// -----
+
+// FR-52: two requirements cannot share a Rust name.
+// expected-error @+1 {{duplicate method name "f"}}
+emitrust.trait_def @Externals ["f", "f"] [(i32) -> i32, (i32) -> i32]
+
+// -----
+
+// FR-52: a requirement's type must be a function type.
+// expected-error @+1 {{method "f" must have a function type}}
+emitrust.trait_def @Externals ["f"] [i32]
+
+// -----
+
+// FR-52: the emitter renders at most one result, so neither may a
+// requirement declare more.
+// expected-error @+1 {{method "f" cannot have more than one result}}
+emitrust.trait_def @Externals ["f"] [(i32) -> (i32, i32)]
