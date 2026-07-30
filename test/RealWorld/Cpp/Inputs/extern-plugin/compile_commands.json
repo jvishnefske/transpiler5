@@ -1,0 +1,12 @@
+[
+  {
+    "directory": ".",
+    "file": "sampler.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "sampler.cpp", "-o", "sampler.o"]
+  },
+  {
+    "directory": ".",
+    "file": "filter.cpp",
+    "arguments": ["clang++", "-std=c++17", "-I", ".", "-c", "filter.cpp", "-o", "filter.o"]
+  }
+]

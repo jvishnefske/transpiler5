@@ -37,6 +37,14 @@
 // interesting cases). Both sides are checked, not just the verdict, so a
 // change that lowers BOTH counts equally still shows up in the diff.
 //
+// `extern-plugin` (FR-52) is the corpus's only OPEN project -- it references
+// three functions no translation unit defines. It is checked here because it
+// is the case this gate was invented for in reverse: before FR-52 the search
+// was the ONLY thing that could produce a crate for such a project, and it
+// did so by dropping the items that referenced the undefined symbols. Now the
+// unrestricted import already yields all 7 items, so the two sides agree and
+// nothing is silently missing from either.
+// CHECK: extern-plugin   no-search 7/7   --search 7/7   ok
 // CHECK: fixed-stats   no-search 11/11   --search 11/11   ok
 // Ratcheted 2/8 -> 4/8 by FR-48 (C++ reference parameters), which landed
 // after this gate was written. The INVARIANT this file exists to protect is
@@ -51,4 +59,4 @@
 // CHECK: ringbuf-lib   no-search 12/12   --search 12/12   ok
 // CHECK: shapes        no-search 1/7   --search 1/7   ok
 // CHECK: tokenizer     no-search 5/5   --search 5/5   ok
-// CHECK: All 5 corpus projects: --search >= no-search.
+// CHECK: All 6 corpus projects: --search >= no-search.
