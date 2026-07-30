@@ -1651,6 +1651,70 @@ of references or inheritance, so it precedes both.
   separate, later decision with its own ABI and `unsafe` consequences.
   (test/Import/C/multi-tu-undefined-extern.c, test/EndToEnd/multi-tu*.c)
 
+- [x] FR-52 Traits for external requirements (W5.12). An undefined external
+  is a REQUIREMENT ON THE ENVIRONMENT, not an error. The crate now declares a
+  `pub trait Externals` whose ASSOCIATED FUNCTIONS are the unresolved
+  externals, and the transitive closure of their callers becomes generic over
+  it (`fn scaled<E: Externals>(..)` calling `E::host_scale(..)`). Associated
+  functions rather than `self`-receiver methods: nothing to thread through
+  signatures that have no receiver in C, monomorphises to a direct call, no
+  `dyn`, no `unsafe`, no `extern "C"`. Propagation is a fixpoint over callers
+  -- the smallest correct set, since a Rust caller can name an `E` only if it
+  has one -- and converges on recursion.
+  Architecture: the importer records the FACT
+  (`emitrust.external_requirement` on the kept body-less `func.func`); a new
+  pass does the work AFTER `convert-to-emitrust`, because the answer is
+  expressed in emitted names and opaque string callees -- before conversion a
+  `func.call` callee must resolve in the symbol table, so the requirement
+  could not be erased at all. A module reaching the emitter with the marker
+  still set fails exactly as an unresolved external always did, so forgetting
+  the pass cannot silently emit a broken crate. The non-obvious third case: a
+  function ADDRESS `Some(f)` is not a symbol use, so without handling it the
+  generic function would be renamed out from under its own fn-pointer
+  constant.
+  Decisions, each refused rather than half-supported: GLOBALS keep rejecting
+  (an associated const is a VALUE; a C `extern int` denotes mutable STORAGE
+  WITH AN ADDRESS, and no associated trait item yields a place an assignment
+  can write to). VARIADICS never reach the decision -- a body-less variadic
+  is not imported at all -- and their call/address sites reject with
+  locations on the C construct rather than on a whole-program fact. BIN
+  crates stay an error: `fn main` is not generic and has no caller to
+  instantiate it, and a `todo!()` default impl would turn a compile-time
+  failure into a runtime panic AND let FR-44 score an unrunnable crate as
+  fully ported, blinding the differential oracle. Name clashes are refused,
+  not worked around: a project item named `Externals`, or `E` (a type
+  parameter SHADOWS a same-named type inside the generic item, so a
+  signature would quietly change meaning).
+  NON-GOAL held: no binary library. `[lib]` still carries only `name` and
+  `path`, so the emitted library remains a plain Rust `rlib`.
+  Gates: byte-identical `Cargo.toml`, crate root, `PORTING.md`,
+  `emitrust-progress.json` and exit status for all 104 pre-existing EndToEnd
+  inputs; c-testsuite inert at 220/220. **None of the five pinned
+  undefined-extern tests changed** -- evidence the scoping rule is
+  conservative rather than convenient. New corpus project `extern-plugin`
+  (the corpus's first OPEN project) scores LIB_BUILT 7/7;
+  `test/Project/search-backtrack.cpp` ports 4/4 with 0 stubbed under
+  `--crate-type=lib`, against the search baseline's 4/5 with 1 stubbed --
+  that stub was the dropped external, now a declared requirement.
+  (test/Import/C/multi-tu-external-requirement.c,
+  test/Conversion/LowerExternalRequirements/, test/Target/Rust/trait-def.mlir,
+  test/EndToEnd/lib-crate-externals-trait.c,
+  test/RealWorld/Cpp/Inputs/extern-plugin/)
+
+**Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
+contradicted a premise this document and the accompanying paper had asserted:
+that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
+are not. The paper's experiment harness discovered every `test/EndToEnd` case
+as a SINGLE translation unit, but those six are deliberately two-TU tests
+whose companion source lives in `Inputs/` and is named on the test's own lit
+`RUN:` line. Feeding half a two-TU project makes a symbol undefined that is in
+fact defined, so the search was repairing damage the HARNESS had done. The
+affected published numbers are E3's "9 projects improved" and E2's rescue
+count; both are being re-measured with discovery derived from each test's RUN
+line. Recorded here because the failure mode -- a benchmark harness that
+silently mis-invokes the tool and then credits the tool with recovering --
+is not specific to this project.
+
 ### Cherry-pick assessment: `verified_transpilation_pipeline`
 
 The archived prototype (`~/src/archive/verified_transpilation_pipeline` on
