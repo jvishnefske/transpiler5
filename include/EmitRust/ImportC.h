@@ -152,6 +152,34 @@ private:
   llvm::SmallVector<RejectedItem> items;
 };
 
+//===----------------------------------------------------------------------===//
+// External requirements (FR-52)
+//===----------------------------------------------------------------------===//
+
+/// What `finalizeProject` does with a non-variadic external FUNCTION that
+/// some translation unit references and none defines.
+///
+/// The fact itself is a property of the whole project, not of any one
+/// declaration, which is why FR-42's per-item recovery cannot absorb it: no
+/// single item can be dropped to make the symbol appear. What CAN change is
+/// whether the fact is an ERROR or a REQUIREMENT — and which of the two it is
+/// depends entirely on what the crate is for.
+enum class ExternalRequirements {
+  /// Historical behavior: a located error at the symbol's first use site.
+  Reject,
+  /// FR-52: record the declaration as a requirement — but only if the module
+  /// defines no `c_main`, i.e. only if the crate emitted from it will be a
+  /// LIBRARY (the same predicate `selectCrateType` uses, so the importer and
+  /// the crate emitter cannot disagree). A module WITH an entry point keeps
+  /// the rejection: see `Trait` for why.
+  TraitWhenLibrary,
+  /// FR-52: always record the declaration as a requirement, even for a module
+  /// that defines `c_main`. Only correct when the caller has already decided
+  /// to emit a library crate (`--crate-type=lib`), because a BINARY crate's
+  /// `fn main` is not generic and has no caller to supply the impl.
+  Trait,
+};
+
 /// Knobs shared by `importC` and `importCProject`.
 ///
 /// Defaulting every field to the historical behavior is the point: the
@@ -222,6 +250,35 @@ struct ImportOptions {
   /// per top-level declaration), and an ordered container keeps every
   /// derived listing deterministic without a sort at the boundary.
   std::set<std::string> excludedItems;
+  /// FR-52: what to do with a referenced-but-undefined external FUNCTION.
+  /// `Reject` — the default — is the historical whole-program error, so every
+  /// existing caller is unaffected.
+  ///
+  /// Under either trait setting the declaration is KEPT in the module as a
+  /// body-less `func.func` carrying `emitrust.external_requirement`, and the
+  /// `emitrust-lower-external-requirements` pass later turns the marked set
+  /// into one `emitrust.trait_def` plus a type parameter on the transitive
+  /// closure of their callers. A module that reaches the Rust emitter with
+  /// the marker still on it fails exactly as an unresolved external always
+  /// did, so forgetting the pass cannot silently emit a broken crate.
+  ///
+  /// Three shapes are NOT recorded even under a trait setting, each because
+  /// the trait cannot faithfully express them:
+  ///  - a declaration whose ADDRESS is taken anywhere. A function pointer
+  ///    renders as `Some(<name>)`, an opaque constant that names the item
+  ///    directly rather than through the trait's type parameter;
+  ///  - a C++ MEMBER function (`emitrust.method_of`). Its call sites are
+  ///    receiver-bearing `emitrust.method_call`s, and an associated trait
+  ///    function has no receiver to bind them to. A missing method body is
+  ///    also a hole in code the project OWNS, not a requirement on its
+  ///    environment;
+  ///  - an undefined external GLOBAL, which rejects unconditionally: an
+  ///    associated const is a value, not storage, so it cannot carry the
+  ///    mutable object a C `extern int` denotes.
+  /// Undefined VARIADIC functions never reach this decision at all — a
+  /// body-less variadic declaration is not imported, and its call sites and
+  /// address-takes carry their own located rejections.
+  ExternalRequirements externalRequirements = ExternalRequirements::Reject;
 };
 
 /// Imports the C source file at `path` into an MLIR module.

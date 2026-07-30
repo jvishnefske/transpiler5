@@ -516,6 +516,53 @@ def EmitRust_AssignOp : EmitRust_Op<"assign"> {
 }
 
 //===----------------------------------------------------------------------===//
+// TraitDefOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_TraitDefOp : EmitRust_Op<"trait_def", [
+    HasParent<"::mlir::ModuleOp">, Symbol]> {
+  let summary = "Trait declaring the project's external requirements";
+  let description = [{
+    The `emitrust.trait_def` operation declares a Rust trait whose items are
+    ASSOCIATED FUNCTIONS (no `self` receiver). It exists for exactly one
+    purpose (FR-52): to express the set of symbols a translated project
+    REFERENCES but no translation unit DEFINES, as a requirement on the
+    crate's environment rather than as a whole-program error.
+
+    The method names and their signatures are two arrays of the same length.
+    Names must be non-empty and unique, and every entry of `fn_types` must be
+    a `FunctionType` with at most one result — the same arity the Rust
+    emitter accepts for `emitrust.func`.
+
+    A receiver-less shape is deliberate. A trait method with a `self`
+    parameter would force every translated call site to thread a receiver
+    value through signatures that have none in C; associated functions
+    monomorphize to a direct call, need no value at all, and keep the
+    emitted signatures within one type parameter of what they were.
+
+    Example:
+
+    ```mlir
+    emitrust.trait_def @Externals ["host_scale"] [(i32) -> i32]
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    pub trait Externals {
+        fn host_scale(v0: i32) -> i32;
+    }
+    ```
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       StrArrayAttr:$fn_names,
+                       TypeArrayAttr:$fn_types);
+  let results = (outs);
+
+  let assemblyFormat = "$sym_name $fn_names $fn_types attr-dict";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // StructDefOp
 //===----------------------------------------------------------------------===//
 

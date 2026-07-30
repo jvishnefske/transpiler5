@@ -45,6 +45,45 @@ inline constexpr llvm::StringLiteral kMethodCallAttrName =
 inline constexpr llvm::StringLiteral kStaticMethodAttrName =
     "emitrust.static_method";
 
+//===----------------------------------------------------------------------===//
+// FR-52 -- external requirements
+//===----------------------------------------------------------------------===//
+
+/// FR-52: name of the discardable `func.func`/`emitrust.func` unit attribute
+/// the C importer attaches to a body-less external function that no
+/// translation unit defines and that the project therefore REQUIRES from its
+/// environment rather than provides.
+///
+/// The attribute only marks the fact; `emitrust-lower-external-requirements`
+/// turns the marked declarations into one `emitrust.trait_def` and erases
+/// them. A module reaching the Rust emitter with this attribute still set is
+/// a bug (the emitter cannot render a body-less function), which is exactly
+/// the pre-FR-52 behavior for an unresolved external.
+inline constexpr llvm::StringLiteral kExternalRequirementAttrName =
+    "emitrust.external_requirement";
+
+/// FR-52: name of the discardable `emitrust.func` string attribute marking a
+/// function that is GENERIC over the external-requirement trait. Its value is
+/// the trait's name, so the emitter needs no module-level channel to render
+/// the bound: the function prints as `fn f<E: <value>>(...)`.
+///
+/// Set on exactly the transitive closure of callers of a requirement, so a
+/// function that needs nothing keeps the signature it always had.
+inline constexpr llvm::StringLiteral kExternalsGenericAttrName =
+    "emitrust.externals_generic";
+
+/// FR-52: the name of the emitted trait. A project defining an item with this
+/// name is a located error rather than a silent clash — see
+/// `emitrust-lower-external-requirements`.
+inline constexpr llvm::StringLiteral kExternalsTraitName = "Externals";
+
+/// FR-52: the type-parameter name a requirement-generic function is
+/// parameterized by (`fn f<E: Externals>`). A single letter keeps the
+/// emitted signatures readable; the same clash check that guards the trait
+/// name guards this one, because a Rust type parameter SHADOWS a same-named
+/// type inside the generic item.
+inline constexpr llvm::StringLiteral kExternalsTypeParam = "E";
+
 } // namespace emitrust
 } // namespace mlir
 

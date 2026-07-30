@@ -268,4 +268,45 @@ def EmitRustValueIdentityCheck
   ];
 }
 
+//===----------------------------------------------------------------------===//
+// EmitRustLowerExternalRequirements
+//===----------------------------------------------------------------------===//
+
+def EmitRustLowerExternalRequirements
+    : Pass<"emitrust-lower-external-requirements", "ModuleOp"> {
+  let summary = "Express unresolved externals as a Rust trait (FR-52)";
+  let description = [{
+    Turns the body-less `emitrust.func` declarations the C importer marked
+    `emitrust.external_requirement` — symbols the project REFERENCES but no
+    translation unit DEFINES — into one `emitrust.trait_def @Externals` and
+    makes the code that needs them generic over it.
+
+    Three edits, in this order:
+
+    - the marked declarations become the trait's associated functions, in
+      module order, and are then erased;
+    - the transitive closure of their CALLERS is marked
+      `emitrust.externals_generic = "Externals"`, so the Rust emitter renders
+      each as `fn f<E: Externals>(...)`. A function that reaches no
+      requirement is untouched and keeps the signature it always had;
+    - every call is requalified: a call to a requirement becomes
+      `E::<name>`, and a call to a closure member becomes `<name>::<E>`.
+      Both `emitrust.call_opaque` (free functions) and
+      `emitrust.method_call` (methods of an `emitrust.impl`) are rewritten,
+      which is sound because the two share one flat namespace — a method's
+      Rust name IS the callee symbol `convert-func-to-emitrust` put in the
+      call.
+
+    The pass is a NO-OP on a module with no marked declaration, which is
+    every module a project without unresolved externals produces.
+
+    Two shapes are hard errors rather than silent mis-emission: a module that
+    already defines an item named `Externals` (the trait would clash) or one
+    named `E` (a Rust type parameter SHADOWS a same-named type inside the
+    generic item, so a signature mentioning it would silently change
+    meaning).
+  }];
+  let dependentDialects = ["::mlir::emitrust::EmitRustDialect"];
+}
+
 #endif // EMITRUST_CONVERSION_PASSES

@@ -215,6 +215,12 @@ private:
   /// (each case value rendered in the discriminator's type) and a trailing
   /// `_ =>` arm for the default region.
   LogicalResult emitSwitch(emitrust::SwitchOp switchOp);
+  /// FR-52: emits `pub trait <name> { fn m(v0: T, ...) -> R; ... }`, the
+  /// crate's declaration of what its environment must supply. Always `pub`
+  /// regardless of `RustEmitOptions::exportItems`: a requirement nobody
+  /// outside the crate can name is a requirement nobody can satisfy, and the
+  /// op is only ever created for a library crate in the first place.
+  LogicalResult emitTraitDef(emitrust::TraitDefOp traitDefOp);
   /// Emits a `#[derive(Clone, Copy, Default)]` struct item with its fields.
   LogicalResult emitStructDef(emitrust::StructDefOp structDefOp);
   /// Emits a C enum as a value-preserving open enum: a
@@ -645,7 +651,7 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   for (Operation &op : *moduleOp.getBody()) {
     if (!isa<emitrust::UseOp, emitrust::VerbatimOp, emitrust::FuncOp,
              emitrust::ImplOp, emitrust::StructDefOp, emitrust::EnumDefOp,
-             emitrust::GlobalOp>(&op))
+             emitrust::GlobalOp, emitrust::TraitDefOp>(&op))
       return op.emitOpError("unable to translate op");
     if (failed(emitOperation(op)))
       return failure();
@@ -706,7 +712,16 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   bool isMethod = isa<emitrust::ImplOp>(op->getParentOp()) &&
                   !op->hasAttr(emitrust::kStaticMethodAttrName);
   StringRef symbol = SymbolTable::getSymbolName(op).getValue();
-  os << itemVisibility(symbol) << "fn " << symbol << "(";
+  os << itemVisibility(symbol) << "fn " << symbol;
+  // FR-52: a function in the transitive closure of a caller of an external
+  // requirement is generic over the requirement trait. Everything else keeps
+  // the signature it always had, so a project with no requirements is
+  // byte-identical.
+  if (auto generic =
+          op->getAttrOfType<StringAttr>(emitrust::kExternalsGenericAttrName))
+    os << "<" << emitrust::kExternalsTypeParam << ": " << generic.getValue()
+       << ">";
+  os << "(";
   bool first = true;
   for (BlockArgument argument : entryBlock.getArguments()) {
     if (!first)
@@ -1148,6 +1163,37 @@ LogicalResult RustEmitter::emitSwitch(emitrust::SwitchOp switchOp) {
   return success();
 }
 
+LogicalResult RustEmitter::emitTraitDef(emitrust::TraitDefOp traitDefOp) {
+  Location loc = traitDefOp.getLoc();
+  os << "pub trait " << traitDefOp.getSymName() << " {\n";
+  increaseIndent();
+  for (auto [nameAttr, typeAttr] : llvm::zip_equal(traitDefOp.getFnNames(),
+                                                   traitDefOp.getFnTypes())) {
+    auto fnType = cast<FunctionType>(cast<TypeAttr>(typeAttr).getValue());
+    os << "fn " << cast<StringAttr>(nameAttr).getValue() << "(";
+    // Rust removed anonymous trait-method parameters in edition 2018, so the
+    // declaration needs binder names; `v0, v1, ...` is the same scheme the
+    // emitter uses for a function's own values.
+    for (auto [index, input] : llvm::enumerate(fnType.getInputs())) {
+      if (index)
+        os << ", ";
+      os << "v" << index << ": ";
+      if (failed(emitType(loc, input)))
+        return failure();
+    }
+    os << ")";
+    if (fnType.getNumResults() == 1) {
+      os << " -> ";
+      if (failed(emitType(loc, fnType.getResult(0))))
+        return failure();
+    }
+    os << ";\n";
+  }
+  decreaseIndent();
+  os << "}\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   Location loc = structDefOp.getLoc();
   os << "#[derive(Clone, Copy, Default)]\n";
@@ -1474,6 +1520,9 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
           [&](emitrust::FuncOp funcOp) { return emitFunc(funcOp); })
       .Case<emitrust::ImplOp>(
           [&](emitrust::ImplOp implOp) { return emitImpl(implOp); })
+      .Case<emitrust::TraitDefOp>([&](emitrust::TraitDefOp traitDefOp) {
+        return emitTraitDef(traitDefOp);
+      })
       .Case<emitrust::MethodCallOp>([&](emitrust::MethodCallOp callOp) {
         return emitMethodCall(callOp);
       })

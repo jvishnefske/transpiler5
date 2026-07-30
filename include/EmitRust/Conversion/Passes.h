@@ -10,8 +10,9 @@
 /// `mlir::emitrust::registerEmitRustConversionPasses()` registers the
 /// convert-ub-to-emitrust, convert-arith-to-emitrust,
 /// convert-func-to-emitrust, convert-scf-to-emitrust,
-/// convert-to-emitrust, emitrust-range-refinement-check, and
-/// emitrust-value-identity-check passes with the global pass registry.
+/// convert-to-emitrust, emitrust-lower-external-requirements,
+/// emitrust-range-refinement-check, and emitrust-value-identity-check passes
+/// with the global pass registry.
 //
 //===----------------------------------------------------------------------===//
 
@@ -21,6 +22,7 @@
 #include "EmitRust/Conversion/ArithToEmitRust.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/FuncToEmitRust.h"
+#include "EmitRust/Conversion/LowerExternalRequirements.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 #include "EmitRust/Conversion/SCFToEmitRust.h"
 #include "EmitRust/Conversion/UBToEmitRust.h"

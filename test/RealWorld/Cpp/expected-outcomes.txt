@@ -27,6 +27,7 @@
 # a very different backlog entry from one at 0/40.
 #
 # Regenerated via: run_realworld.py ... --manifest-format outcomes --update
+extern-plugin LIB_BUILT  # ported 7/7
 fixed-stats TRANSPILED  # ported 11/11
 polygon REJECTED unsupported-stmt:CXXForRangeStmt  # ported 4/8
 ringbuf-lib LIB_BUILT  # ported 12/12

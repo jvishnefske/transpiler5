@@ -61,6 +61,7 @@
 #include "ProgressReport.h"
 
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
+#include "EmitRust/Conversion/LowerExternalRequirements.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 #include "EmitRust/ImportC.h"
 #include "EmitRust/Project/FrontierSearch.h"
@@ -381,7 +382,41 @@ static mlir::LogicalResult runPipeline(mlir::ModuleOp module) {
   if (checkRangeRefinement)
     pm.addPass(mlir::emitrust::createEmitRustRangeRefinementCheck());
   pm.addPass(mlir::emitrust::createConvertToEmitRust());
+  // FR-52: strictly after the conversion, because the trait is expressed in
+  // the EMITTED names and in the opaque string callees the conversion
+  // produces. A no-op unless the importer marked an unresolved external,
+  // which is why every existing crate stays byte-identical.
+  pm.addPass(mlir::emitrust::createEmitRustLowerExternalRequirements());
   return pm.run(module);
+}
+
+/// FR-52: the unresolved-external policy implied by `--crate-type`.
+///
+/// The mapping is the whole decision, stated once:
+///  - `bin` — REJECT. A binary crate's `fn main` is not generic and has no
+///    caller to supply an impl, so a requirement it cannot satisfy is a
+///    compile-time error, exactly as before. Emitting a `todo!()` default
+///    impl instead would turn that into a RUNTIME panic and would let FR-44
+///    score an unrunnable crate as fully ported — the differential oracle
+///    this project rests on would stop being able to tell the difference.
+///  - `auto` — REJECT for a module that defines `c_main` (which `auto` turns
+///    into a binary crate, so the reasoning above applies verbatim), and
+///    TRAIT for one that does not. The importer applies the same `c_main`
+///    predicate `selectCrateType` does, so the two cannot disagree.
+///  - `lib` — TRAIT unconditionally. The user has already said the output is
+///    a library; a library's whole job is to be linked against something,
+///    and `c_main` in it is an ordinary exported function that a caller can
+///    instantiate like any other.
+static mlir::emitrust::ExternalRequirements externalRequirementsPolicy() {
+  switch (crateTypeOpt) {
+  case emitrustcc::CrateTypeRequest::Bin:
+    return mlir::emitrust::ExternalRequirements::Reject;
+  case emitrustcc::CrateTypeRequest::Lib:
+    return mlir::emitrust::ExternalRequirements::Trait;
+  case emitrustcc::CrateTypeRequest::Auto:
+    return mlir::emitrust::ExternalRequirements::TraitWhenLibrary;
+  }
+  llvm_unreachable("covered switch");
 }
 
 /// Writes `content` to `path` ('-' means stdout) atomically with respect to
@@ -624,6 +659,10 @@ probeSearchState(const mlir::emitrust::SearchInputs &inputs,
   options.ledger = &ledger;
   options.compilationDatabasePath = compilationDatabasePath;
   options.excludedItems = mlir::emitrust::excludedItemsFor(inputs.graph, state);
+  // FR-52: the probe must compile the SAME project the final run will, or it
+  // would score a compiler that is not the one producing the crate — which is
+  // the whole reason the probe is a real import in the first place.
+  options.externalRequirements = externalRequirementsPolicy();
 
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::emitrust::importCProject(paths, extra, options, context);
@@ -875,6 +914,9 @@ int main(int argc, char **argv) {
   // drop otherwise), so the crate emitted below is a crate the recovering
   // importer already knew how to build — the search chose WHICH one.
   importOptions.excludedItems = searchExcluded;
+  // FR-52: an unresolved external is an ERROR for a binary crate and a
+  // REQUIREMENT for a library one; see `externalRequirementsPolicy`.
+  importOptions.externalRequirements = externalRequirementsPolicy();
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::emitrust::importCProject(inputs, extra, importOptions, context);
   if (!module)

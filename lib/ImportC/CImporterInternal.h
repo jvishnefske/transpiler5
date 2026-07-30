@@ -1292,6 +1292,15 @@ public:
     excludedItems = &excluded;
   }
 
+  /// FR-52: chooses what `finalizeProject` does with a referenced-but-
+  /// undefined external function. `ExternalRequirements::Reject` — the
+  /// default — is the historical whole-program error; see
+  /// `ImportC.h`'s `ExternalRequirements` for the two trait settings and for
+  /// the shapes they deliberately do not cover.
+  void setExternalRequirements(emitrust::ExternalRequirements policy) {
+    externalRequirements = policy;
+  }
+
   /// Imports every supported top-level declaration of `context`'s translation
   /// unit into the module: complete struct definitions (bare anonymous
   /// structs under synthesized shape-keyed `Anon<n>` names), function
@@ -1365,6 +1374,19 @@ public:
   LogicalResult finalizeProject();
 
 private:
+  /// FR-52: whether `finalizeProject` may record an unresolved external
+  /// function as a requirement rather than reject it. True for
+  /// `ExternalRequirements::Trait`, and for `TraitWhenLibrary` only when the
+  /// module defines no `c_main` (i.e. only when the emitted crate will be a
+  /// library).
+  bool externalRequirementsAllowed();
+
+  /// FR-52: whether `func` — a referenced body-less external — is a shape the
+  /// external-requirement trait can express: a free function (not a C++
+  /// member), whose address is never taken, and every one of whose symbol
+  /// uses is a plain direct `func.call` callee.
+  bool isExternalRequirementShape(func::FuncOp func);
+
   //===--------------------------------------------------------------------===//
   // Locations and types
   //===--------------------------------------------------------------------===//
@@ -4196,6 +4218,21 @@ private:
   /// keyed by MLIR symbol name; the location is the first reference for the
   /// diagnostic if no TU defines it.
   llvm::StringMap<Location> pendingExternGlobals;
+  /// FR-52: what `finalizeProject` does with a referenced-but-undefined
+  /// external function; see `setExternalRequirements`.
+  emitrust::ExternalRequirements externalRequirements =
+      emitrust::ExternalRequirements::Reject;
+  /// FR-52: the MLIR symbol name of every function whose ADDRESS was taken
+  /// anywhere in the project (`resolveFunctionPointerDecl`'s successful
+  /// answers).
+  ///
+  /// A function pointer is emitted as an `emitrust.constant` holding the
+  /// opaque text `Some(<name>)`, which is NOT a symbol use — the symbol-table
+  /// machinery cannot see it. So this set is the only record that the name is
+  /// still spelled out somewhere in the module, and an undefined external in
+  /// it keeps the historical rejection rather than becoming a trait
+  /// requirement whose `Some(<name>)` would dangle.
+  llvm::StringSet<> fnPointerTargetSymbols;
   /// Shape of every imported file-scope struct, keyed by symbol name, for
   /// cross-TU deduplication and mismatch detection. Block-scope records are
   /// never entered here: their identity is the defining decl (see

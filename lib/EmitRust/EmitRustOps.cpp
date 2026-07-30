@@ -358,6 +358,48 @@ static bool isValidStructFieldType(Type type) {
              EnumType, FnPtrType, mlir::emitrust::OpaqueType>(type);
 }
 
+//===----------------------------------------------------------------------===//
+// TraitDefOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the method name and type arrays have the same non-zero
+/// length (an empty requirement trait would be noise the lowering never
+/// creates), that method names are non-empty and unique, and that every
+/// signature is a `FunctionType` with at most one result — the arity the
+/// Rust emitter can render.
+LogicalResult TraitDefOp::verify() {
+  ArrayAttr names = getFnNames();
+  ArrayAttr types = getFnTypes();
+  if (names.size() != types.size())
+    return emitOpError("has ")
+           << names.size() << " method names but " << types.size()
+           << " method types";
+  if (names.empty())
+    return emitOpError("must declare at least one method");
+
+  llvm::StringSet<> seen;
+  for (auto [nameAttr, typeAttr] : llvm::zip_equal(names, types)) {
+    StringRef name = cast<StringAttr>(nameAttr).getValue();
+    if (name.empty())
+      return emitOpError("method names must not be empty");
+    if (!seen.insert(name).second)
+      return emitOpError("duplicate method name \"") << name << "\"";
+    auto fnType =
+        dyn_cast<FunctionType>(cast<TypeAttr>(typeAttr).getValue());
+    if (!fnType)
+      return emitOpError("method \"")
+             << name << "\" must have a function type";
+    if (fnType.getNumResults() > 1)
+      return emitOpError("method \"")
+             << name << "\" cannot have more than one result";
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// StructDefOp
+//===----------------------------------------------------------------------===//
+
 /// Verifies that the field name and type arrays have the same length
 /// (possibly zero: a field-less struct_def models C's empty struct and is
 /// emitted unit-like), that field names are non-empty and unique, and that

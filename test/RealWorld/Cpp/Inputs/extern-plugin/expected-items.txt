@@ -1,0 +1,28 @@
+# EmitRust per-item porting ledger for RealWorld C++ project 'extern-plugin' (FR-44).
+#
+# One line per item of the project's FR-40 item graph, as
+# '<symbol> <kind> <status>', sorted by symbol. Status is one of
+# ported / stubbed / dropped / missing / declared; see
+# tools/emitrust-cc/ProgressReport.h. Measured by
+# 'emitrust-cc --emit=crate --incremental', whose crate is also
+# built on every run -- a partially ported project must still
+# COMPILE.
+#
+# Like the outcome manifest, this is an honest baseline and a
+# backlog, not a conformance target, and the ratchet is two-way:
+# an item that stops porting fails the gate as a regression, and
+# an item that starts porting fails until it is ratcheted
+# forward. A change between two NON-ported statuses (dropped
+# <-> stubbed) is reported as advisory drift.
+#
+# Regenerated via: run_realworld.py ... --manifest-format outcomes --update
+Channel record ported
+ns_filter_boxcar function ported
+ns_filter_clamp function ported
+ns_platform_fault function declared
+ns_platform_millis function declared
+ns_platform_read_raw function declared
+ns_sampler_burst function ported
+ns_sampler_open function ported
+ns_sampler_sample function ported
+tu0_ns_filter_taps function ported

@@ -471,3 +471,8 @@ emitrust.func @method_calls(%arg0: i64) -> i32 {
   %r = emitrust.method_call %o["get"] (%arg0) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64) -> i32
   emitrust.return %r : i32
 }
+
+// FR-52: the external-requirement trait round-trips like any other
+// module-level definition op.
+// CHECK: emitrust.trait_def @Externals ["host_scale", "host_reset"] [(i32) -> i32, () -> ()]
+emitrust.trait_def @Externals ["host_scale", "host_reset"] [(i32) -> i32, () -> ()]
