@@ -1127,6 +1127,11 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   deferExternGlobals = deferExtern;
   currentSoleTU = soleTranslationUnit;
   const clang::TranslationUnitDecl *unit = astContext().getTranslationUnitDecl();
+  // FR-53: the Pass-A planners' per-declaration rejections are keyed by this
+  // TU's own `clang::Decl *`s and consulted only by this TU's declaration
+  // walk, so the map starts empty for every unit.
+  plannerRejections.clear();
+  pendingPlannerAttribution = nullptr;
   // Namespace pre-pass: record every module-symbol name this TU's ordinary
   // identifier namespace will claim, so struct tag naming
   // (`structSymbolName`) is independent of declaration order.
