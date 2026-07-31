@@ -4415,6 +4415,52 @@ since the 00204 wave, 00204.c pass).
   (test/Import/Cpp/stl-vector.cpp, stl-string.cpp, stl-invalid.cpp;
   test/EndToEnd/stl-vector.cpp, stl-string.cpp)
 
+## Track 5 Third-party validation (external demand signal)
+
+Track 4's corpus is authored by this project. That has now produced two
+demonstrated blind spots in one week -- every program was written with a
+`main`, which hid the fact that LIBRARY projects were unreachable under any
+flag (FR-51); and the paper harness enumerated multi-TU tests as single files,
+which manufactured six spurious repair-search "rescues" (recorded under
+FR-52). A self-authored benchmark encodes its authors' assumptions twice, once
+in the code and once in the harness, and neither encoding is visible from
+inside.
+
+Track 5 therefore measures UNMODIFIED THIRD-PARTY C, cloned at pinned commits
+and compiled with the project's OWN flags (via `cmake
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON` feeding FR-45's `--compdb` wherever the
+upstream build supports it). Selection within a repository must be MECHANICAL
+and stated -- every `.c` in a directory, or the compile database wholesale --
+because hand-picking the files that happen to work would reproduce exactly the
+defect this track exists to correct.
+
+**The measurement separates two failure kinds, and conflating them would make
+the result meaningless:**
+ - `PARSE_FAIL` -- clang could not build an AST at all (a missing config
+   header, an absent target define). This is a CONFIGURATION limitation of the
+   harness, and says nothing about the supported subset. How much
+   configuration a real codebase needs before the tool can even look at it is
+   itself a product finding, not a footnote.
+ - `REJECT` -- parsed cleanly, but could not be translated. This is the real
+   demand signal, and the ranked root-blocker tally over it (FR-49) is what
+   should sequence work after this track.
+
+Outcome vocabulary per unit: `TRANSLATED_FULL` (crate builds, zero stubbed,
+zero dropped), `PARTIAL` (crate builds, some stubbed or dropped), `NO_CRATE`,
+`PARSE_FAIL`.
+
+Initial target set, chosen to span best case to realistic case rather than to
+flatter: small self-contained libraries (cJSON, heatshrink, tinycbor); RTOS
+and networking cores (FreeRTOS-Kernel, lwIP `src/core`); and crypto/DSP
+(mbedTLS `library/`, tinycrypt, CMSIS-DSP). CMSIS-DSP is the deliberate best
+case -- large amounts of pure integer and fixed-point math, close to the
+supported subset -- and mbedTLS the realistic one; the GAP between those two
+is the most informative number the track can produce.
+
+Status: measurement in progress (2026-07-31). Results, and whatever they imply
+about the C99 roadmap's remaining priorities, are recorded here when the run
+completes. The result is expected to be poor; that is the point of running it.
+
 ## Track 4 RealWorld corpus (demand signal)
 
 `test/RealWorld/` is a corpus of small, realistic, deterministic C programs
