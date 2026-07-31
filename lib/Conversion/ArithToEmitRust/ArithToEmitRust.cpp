@@ -12,14 +12,15 @@
 /// unsigned operand types only; the ordered oeq/olt/ole/ogt/oge and the
 /// unordered une float predicates), the scalar select, and the signed cast
 /// operations. The unsigned-semantics operations (divui, remui, shrui, and
-/// the unsigned cmpi predicates) only convert when their type is an
-/// unsigned IntegerType, whose Rust rendering (u8..u64) has exactly the
-/// unsigned semantics; on a signless type they stay illegal, because the
-/// signless Rust rendering (i8..i64) would execute the SIGNED operation, a
-/// silent miscompile. (The Arith verifier itself currently constrains these
-/// operations to signless types, so the unsigned-accepting direction is a
-/// forward-compatibility boundary; the reject direction is what protects
-/// today's pipeline.)
+/// the unsigned cmpi predicates) map directly onto the EmitRust operation
+/// when their type is an unsigned IntegerType, whose Rust rendering
+/// (u8..u64) has exactly the unsigned semantics. On a signless type the
+/// signless Rust rendering (i8..i64) would execute the SIGNED operation, so
+/// the unsigned BINARY operations instead round-trip through the same-width
+/// `ui<N>`: `(a as uN OP b as uN) as iN`, which is bit-exact because Rust's
+/// `as` between same-width integers reinterprets the bit pattern. The
+/// unsigned cmpi predicates have no such rewrite yet and stay illegal on
+/// signless operands rather than silently miscompiling.
 //
 //===----------------------------------------------------------------------===//
 
@@ -210,29 +211,64 @@ struct CmpIOpConversion : public OpConversionPattern<arith::CmpIOp> {
 };
 
 /// Converts an unsigned-semantics Arith binary operation (divui, remui,
-/// shrui) into the corresponding EmitRust operation ONLY when the type is
-/// an unsigned IntegerType: the Rust rendering uN then has exactly the
-/// unsigned semantics (`/` and `%` truncate toward zero, `>>` is a logical
-/// shift). On a signless type — rendered iN — the same operators execute
-/// the SIGNED operation, so signless operands stay illegal instead of
-/// silently miscompiling.
+/// shrui) into the corresponding EmitRust operation.
+///
+/// On an unsigned IntegerType the mapping is direct: the Rust rendering uN
+/// has exactly the unsigned semantics (`/` and `%` truncate toward zero,
+/// `>>` is a logical shift).
+///
+/// On a signless (or signed) IntegerType the SAME Rust operator would
+/// execute the SIGNED operation on the iN rendering — a silent miscompile —
+/// so the operation is routed through the unsigned rendering instead: both
+/// operands are cast to the same-width `ui<N>`, the EmitRust operation runs
+/// there, and the result is cast back. Rust's `as` between two same-width
+/// integer types is a pure bit-pattern reinterpretation, so `(a as uN OP b
+/// as uN) as iN` reproduces the Arith operation's two's-complement result
+/// exactly. This form is reached in practice because the upstream Arith
+/// canonicalizer rewrites `trunci(shrsi(x, c))` into `trunci(shrui(x, c))`
+/// on signless operands whenever the sign-filled bits are discarded by the
+/// truncation — the narrowing-cast-of-a-shift idiom at the heart of
+/// fixed-point DSP code.
+///
+/// Non-integer types (notably `index`) have no `ui<N>` counterpart to route
+/// through and stay illegal.
 template <typename ArithOp, typename EmitRustOp>
 struct UnsignedBinaryOpConversion : public OpConversionPattern<ArithOp> {
   using OpConversionPattern<ArithOp>::OpConversionPattern;
 
-  /// Rewrites lhs/rhs into the EmitRust equivalent when the guard holds.
+  /// Rewrites lhs/rhs into the EmitRust equivalent, inserting the round trip
+  /// through the unsigned rendering when the operand type is not unsigned.
   LogicalResult
   matchAndRewrite(ArithOp op, typename ArithOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    if (!isUnsignedIntegerType(op.getType()))
+    auto intType = dyn_cast<IntegerType>(op.getType());
+    if (!intType)
       return rewriter.notifyMatchFailure(
-          op, "unsigned arith operations are only supported on unsigned "
-              "integer types");
+          op, "unsigned arith operations are only supported on integer types");
     Type resultType = this->getTypeConverter()->convertType(op.getType());
     if (!resultType)
       return rewriter.notifyMatchFailure(op, "result type conversion failed");
-    rewriter.replaceOpWithNewOp<EmitRustOp>(op, resultType, adaptor.getLhs(),
-                                            adaptor.getRhs());
+    if (intType.isUnsigned()) {
+      rewriter.replaceOpWithNewOp<EmitRustOp>(op, resultType, adaptor.getLhs(),
+                                              adaptor.getRhs());
+      return success();
+    }
+    unsigned width = intType.getWidth();
+    if (width != 8 && width != 16 && width != 32 && width != 64)
+      return rewriter.notifyMatchFailure(
+          op, "operand width has no unsigned Rust integer type to route "
+              "the unsigned semantics through");
+    auto unsignedType =
+        IntegerType::get(intType.getContext(), width, IntegerType::Unsigned);
+    Location loc = op.getLoc();
+    Value lhs =
+        emitrust::CastOp::create(rewriter, loc, unsignedType, adaptor.getLhs());
+    Value rhs =
+        emitrust::CastOp::create(rewriter, loc, unsignedType, adaptor.getRhs());
+    Value unsignedResult = EmitRustOp::create(rewriter, loc, unsignedType, lhs,
+                                              rhs);
+    rewriter.replaceOpWithNewOp<emitrust::CastOp>(op, resultType,
+                                                 unsignedResult);
     return success();
   }
 };
