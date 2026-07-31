@@ -561,6 +561,26 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
       return Type(
           emitrust::MutRefType::get(emitrust::SliceType::get(*inner)));
     }
+    // FR-55: the SAME CTS-BR const rule, in the scalar-reference position.
+    // A `const unsigned char *` that is only dereferenced borrows shared
+    // (`&u8`) exactly as the walked form above borrows `&[u8]` and the
+    // byte-region aggregate form borrows `&[u8]`. Without this the three
+    // spellings of one rule disagree, and the disagreement is observable:
+    // a caller holding a `&[u8]` region that hands ONE element to such a
+    // parameter (`f(&k[i])`, the shape every `set_key`/`encrypt_block`
+    // wrapper in real crypto code has) would have to reborrow a shared
+    // slice mutably, which is `error[E0596]` — an emitted crate that does
+    // not compile. C's own guarantee is what makes the shared borrow
+    // right, not a convenience: `const T *` says the callee never writes
+    // through the pointer, and writing through it anyway is a constraint
+    // violation clang rejects outright, so no valid program can observe a
+    // lost write. Non-u8 pointees are deliberately left mutable: their
+    // slice form is mutable too, so the two agree already, and the
+    // `&mut T` is what the rest of the model (staged globals, owner
+    // receivers) is written against.
+    if (kind == ParamKind::ScalarRef && pointee.isConstQualified() &&
+        isU8ScalarType(pointee))
+      return Type(emitrust::RefType::get(*inner));
     return Type(emitrust::MutRefType::get(*inner));
   }
   // The stripped canonical keeps a top-level-volatile value parameter
