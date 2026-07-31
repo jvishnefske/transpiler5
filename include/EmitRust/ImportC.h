@@ -195,10 +195,24 @@ struct ImportOptions {
   /// and anything else is dropped. Every partial IR the rejected item built
   /// is discarded before the walk resumes.
   ///
-  /// Recovery applies ONLY to the top-level declaration walk. A rejection
-  /// raised anywhere else (project finalization, module verification, a
-  /// clang parse error) still fails the import, because none of those can be
-  /// attributed to a single droppable item.
+  /// Recovery covers the top-level declaration walk AND the two Pass-A
+  /// planners that can reject (`planCursorParams`, `planVaMonomorph`, via
+  /// FR-53); the other seven planners return `void` and cannot reject at all.
+  /// A rejection raised anywhere else -- project finalization, module
+  /// verification, a clang parse error -- still fails the import.
+  ///
+  /// An earlier version of this comment justified the planner exclusion by
+  /// claiming such rejections "cannot be attributed to a single droppable
+  /// item". That was wrong: all seven planner `emitError` sites carry a
+  /// location inside one declaration, and FR-53 attributes every one of them.
+  /// The claim survived because nothing in the self-authored corpus exercised
+  /// it; on third-party C it was the single largest cause of lost output,
+  /// costing 14 of 22 parsed translation units.
+  ///
+  /// Recovery still stops at the IMPORT boundary. A failure in the conversion
+  /// pipeline or the Rust emitter (an un-legalizable `scf.if`, a non-finite
+  /// float constant) still costs the whole crate, which is the same
+  /// structural shape one layer down and is now the leading blocker.
   bool recover = false;
   /// Where recovered rejections are recorded. May be null even with
   /// `recover` set, in which case the rejections are still warned about but
