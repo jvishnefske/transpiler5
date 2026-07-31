@@ -581,11 +581,23 @@ def EmitRust_StructDefOp : EmitRust_Op<"struct_def", [
     `!emitrust.fn_ptr` (no lvalues or references). Values of the struct are
     referenced through the `!emitrust.struct` type carrying the same name.
 
-    The struct is emitted with `#[derive(Clone, Copy, Default)]`. This is an
-    MVP guarantee: all permitted field types are `Copy + Default`
-    (`!emitrust.fn_ptr` renders `Option<fn(...)>`, whose default is `None`),
-    and arrays are limited to at most 32 elements so that the derived
-    `Default` implementation is available on all supported Rust editions.
+    Every value of the struct is `Copy + Default`, which the emitted item
+    guarantees unconditionally: all permitted field types are themselves
+    `Copy + Default` (`!emitrust.fn_ptr` renders `Option<fn(...)>`, whose
+    default is `None`, and a nested struct or enum carries its own
+    `Default`).
+
+    `Default` comes from the derive whenever the derive can supply it, and
+    from an explicit `impl Default` otherwise. The one thing the derive
+    cannot cover is a long array field: the standard library's blanket
+    `impl<T: Default> Default for [T; N]` stops at `N == 32`, so
+    `#[derive(Default)]` on a struct holding, say, a `[u8; 64]` does not
+    compile (FR-55). Such a struct is emitted with `Default` dropped from
+    the derive list and a hand-written `impl Default` after the item whose
+    body names every field with that field's default value — exactly the
+    values the derive would have produced, field by field. The rule looks
+    only through array nesting: a long array inside a NAMED struct field is
+    already covered by that struct's own `Default`.
 
     Example:
 
@@ -598,6 +610,24 @@ def EmitRust_StructDefOp : EmitRust_Op<"struct_def", [
     struct Point {
         x: i32,
         y: i32,
+    }
+    ```
+
+    ```mlir
+    emitrust.struct_def @Block ["buf"] [!emitrust.array<64xui8>]
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    #[derive(Clone, Copy)]
+    struct Block {
+        buf: [u8; 64],
+    }
+    impl Default for Block {
+        fn default() -> Block {
+            Block {
+                buf: [0; 64],
+            }
+        }
     }
     ```
   }];

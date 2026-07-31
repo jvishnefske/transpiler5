@@ -222,6 +222,9 @@ private:
   /// op is only ever created for a library crate in the first place.
   LogicalResult emitTraitDef(emitrust::TraitDefOp traitDefOp);
   /// Emits a `#[derive(Clone, Copy, Default)]` struct item with its fields.
+  /// When some field type is outside the reach of the `Default` derive
+  /// (`derivedDefaultCovers`), `Default` drops out of the derive list and an
+  /// explicit, value-identical `impl Default` follows the item instead.
   LogicalResult emitStructDef(emitrust::StructDefOp structDefOp);
   /// Emits a C enum as a value-preserving open enum: a
   /// `#[repr(transparent)]` tuple struct over the storage integer (`i32`,
@@ -1194,18 +1197,55 @@ LogicalResult RustEmitter::emitTraitDef(emitrust::TraitDefOp traitDefOp) {
   return success();
 }
 
+/// The largest array length Rust's blanket `impl<T: Default> Default for
+/// [T; N]` covers. The library provides the impl for `N` in `0..=32` only;
+/// beyond that there is no `Default` for `[T; N]` at all, so a
+/// `#[derive(Default)]` on a struct holding one does not compile
+/// (`error[E0277]: the trait bound `[u8; 64]: Default` is not satisfied`).
+static constexpr uint64_t kMaxDerivedDefaultArrayLength = 32;
+
+/// Whether `#[derive(Default)]` covers a field of `type`.
+///
+/// Every type EmitRust admits as a struct field implements `Default` — a
+/// scalar through the standard library, an `!emitrust.fn_ptr` because it
+/// renders `Option<fn(..)>`, and an `!emitrust.struct`/`!emitrust.enum`
+/// because `emitStructDef`/`emitEnumDef` give every one of them a `Default`
+/// (derived or, for exactly the case this predicate detects, explicit).
+/// Arrays are the sole exception, and only above the blanket impl's length
+/// ceiling. The recursion stops at a named struct on purpose: that struct
+/// carries its own `Default`, so a long array BEHIND one is already handled
+/// where it was defined and does not disqualify the field here.
+static bool derivedDefaultCovers(Type type) {
+  if (auto arrayType = dyn_cast<emitrust::ArrayType>(type))
+    return arrayType.getSize() <= kMaxDerivedDefaultArrayLength &&
+           derivedDefaultCovers(arrayType.getElementType());
+  return true;
+}
+
 LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   Location loc = structDefOp.getLoc();
-  os << "#[derive(Clone, Copy, Default)]\n";
+  // FR-55: the `Default` derive is kept wherever it works — it is the
+  // shorter, more idiomatic item, and switching structs that do not need
+  // the explicit form would perturb the emitted text of every existing
+  // program for nothing. It is dropped only for a struct the derive cannot
+  // cover, which is replaced by a hand-written `impl Default` below that
+  // reproduces the derive's values exactly (the derive defaults each field
+  // independently, which is precisely what `emitDefaultValue` renders).
+  bool derivable = llvm::all_of(structDefOp.getFieldTypes(), [](Attribute a) {
+    return derivedDefaultCovers(cast<TypeAttr>(a).getValue());
+  });
+  os << "#[derive(Clone, Copy" << (derivable ? ", Default" : "") << ")]\n";
   // A field-less struct_def (C's `struct T {};`) prints unit-like with an
   // empty brace body; the derives keep declaration, copy, and default
-  // construction working exactly as for the non-empty shape.
+  // construction working exactly as for the non-empty shape. (A struct with
+  // no fields is always derivable, so it never reaches the explicit impl.)
   if (structDefOp.getFieldNames().empty()) {
     os << typePartVisibility() << "struct " << structDefOp.getSymName()
        << " {}\n";
     return success();
   }
-  os << typePartVisibility() << "struct " << structDefOp.getSymName() << " {\n";
+  StringRef name = structDefOp.getSymName();
+  os << typePartVisibility() << "struct " << name << " {\n";
   increaseIndent();
   for (auto [nameAttr, typeAttr] :
        llvm::zip_equal(structDefOp.getFieldNames(),
@@ -1215,6 +1255,28 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
       return failure();
     os << ",\n";
   }
+  decreaseIndent();
+  os << "}\n";
+  if (derivable)
+    return success();
+  os << "impl Default for " << name << " {\n";
+  increaseIndent();
+  os << "fn default() -> " << name << " {\n";
+  increaseIndent();
+  os << name << " {\n";
+  increaseIndent();
+  for (auto [nameAttr, typeAttr] :
+       llvm::zip_equal(structDefOp.getFieldNames(),
+                       structDefOp.getFieldTypes())) {
+    os << cast<StringAttr>(nameAttr).getValue() << ": ";
+    if (failed(emitDefaultValue(loc, cast<TypeAttr>(typeAttr).getValue())))
+      return failure();
+    os << ",\n";
+  }
+  decreaseIndent();
+  os << "}\n";
+  decreaseIndent();
+  os << "}\n";
   decreaseIndent();
   os << "}\n";
   return success();

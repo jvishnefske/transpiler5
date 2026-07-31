@@ -3081,8 +3081,7 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
                                it->second)
                            .getResult();
       return builder
-          .create<emitrust::AddrOfOp>(loc, paramType, rawPlace,
-                                      /*is_mut=*/true)
+          .create<emitrust::AddrOfOp>(loc, paramType, rawPlace, isMutParam)
           .getResult();
     }
   }
@@ -3117,11 +3116,37 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
     if (lvalueType.getValueType() != pointee)
       return emitError(loc) << "unsupported: argument type does not match "
                                "the pointer parameter";
+    // FR-55: the borrow's mutability is the PARAMETER's, not a constant.
+    // A `const unsigned char *` scalar-reference parameter maps to `&u8`
+    // (see `mapParamType`), and borrowing its argument mutably would both
+    // fail `AddrOfOp`'s own marker/type verifier and, where the argument
+    // designates an element of a shared byte slice, emit Rust that cannot
+    // compile.
     return builder
-        .create<emitrust::AddrOfOp>(loc, paramType, *place, /*is_mut=*/true)
+        .create<emitrust::AddrOfOp>(loc, paramType, *place, isMutParam)
         .getResult();
   }
   root = addressArgumentRoot(argument);
+  // FR-55: `&x` has no shared spelling in C — the address-of rvalue always
+  // yields `!emitrust.mut_ref` — so a SHARED scalar-reference parameter
+  // cannot go through `emitRValue`. Build the borrow at the parameter's own
+  // mutability from the same place instead; the global rejection and the
+  // pointee type check are the ones the rvalue path would have applied.
+  if (!isMutParam) {
+    if (rootsAtGlobal(addrOf->getSubExpr()))
+      return emitError(loc)
+             << "unsupported: taking the address of a global variable";
+    FailureOr<Value> place = emitLValue(addrOf->getSubExpr());
+    if (failed(place))
+      return failure();
+    auto lvalueType = llvm::dyn_cast<emitrust::LValueType>((*place).getType());
+    if (!lvalueType || lvalueType.getValueType() != pointee)
+      return emitError(loc) << "unsupported: argument type does not match "
+                               "the pointer parameter";
+    return builder
+        .create<emitrust::AddrOfOp>(loc, paramType, *place, /*is_mut=*/false)
+        .getResult();
+  }
   FailureOr<Value> value = emitRValue(argument);
   if (failed(value))
     return failure();
