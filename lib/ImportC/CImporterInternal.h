@@ -1508,6 +1508,42 @@ private:
   /// failure()` shape.
   LogicalResult importTopLevelDeclRecovering(const clang::Decl *decl);
 
+  /// FR-53: runs one Pass-A planner step under diagnostic capture and, if it
+  /// rejects, attributes the rejection to a single declaration instead of
+  /// failing the whole translation unit.
+  ///
+  /// Called ONLY when `recoverFromRejections` is set — a non-recovering import
+  /// never reaches this and keeps the historical
+  /// `failed(planner) -> return failure()` shape, diagnostics and exit code
+  /// included.
+  ///
+  /// `body` is the planner fragment whose rejections belong to ONE
+  /// declaration. Its `emitError` calls are intercepted (so a recovered
+  /// rejection does not print as an error) and the first of them becomes the
+  /// ledger's verbatim reason, exactly as `importTopLevelDeclRecovering`
+  /// derives it from a failed item import. The attributed declaration is
+  /// `attribution`, or — when `body` left `pendingPlannerAttribution` set — the
+  /// declaration `body` itself named; a failure with neither is NOT
+  /// attributable and is returned as a failure for the caller to propagate.
+  ///
+  /// \param attribution the declaration to credit when `body` names none.
+  /// \param body the planner fragment to run.
+  /// \returns which of the three outcomes below occurred.
+  enum class PlannerRecovery {
+    /// `body` succeeded; the plan it built stands.
+    Planned,
+    /// `body` rejected and the rejection was recorded against a declaration,
+    /// which `importDeclsIn` will drop or stub. A planner that builds
+    /// incremental state must replan from scratch after this.
+    Recorded,
+    /// `body` rejected and no declaration could be credited. The caller must
+    /// propagate the failure; the diagnostic has already been re-emitted.
+    Unattributable,
+  };
+  PlannerRecovery
+  recoverPlannerRejection(const clang::Decl *attribution,
+                          llvm::function_ref<LogicalResult()> body);
+
   /// FR-43: the item-graph key of `decl` when the current search state
   /// EXCLUDES it, and the empty string otherwise (including when no search
   /// state was set at all).
@@ -2387,12 +2423,46 @@ private:
   /// distinct extras signature. Runs before any declaration imports.
   LogicalResult planVaMonomorph(const clang::TranslationUnitDecl *unit);
 
+  /// One whole-TU va-monomorphization planning attempt, skipping every
+  /// declaration already in `plannerRejections`. This IS the historical
+  /// `planVaMonomorph` body; under recovery `planVaMonomorph` re-runs it until
+  /// it succeeds, adding one attributed rejection per round.
+  ///
+  /// A rejection sets `pendingPlannerAttribution` to the top-level declaration
+  /// it belongs to: the variadic definition itself for the scope checks
+  /// (va_copy, an escaping va_list), and the declaration whose body or
+  /// initializer CONTAINS the offending construct for the address-of scan and
+  /// the per-call-site clone assignment. Dropping the containing declaration
+  /// removes the construct; dropping the variadic definition additionally
+  /// removes it from the plan entirely, which is what makes every surviving
+  /// caller reject in turn (`emitCall`'s "call to a variadic function") rather
+  /// than call a clone that was never emitted.
+  LogicalResult planVaMonomorphOnce(const clang::TranslationUnitDecl *unit);
+
   /// CTS 00204 Pass A: plans the `const char **` string-cursor parameters
   /// of this TU. A pointer-to-pointer parameter of a definition qualifies
   /// when the body only ever reads through `*s` and advances it with
   /// `*s = <pointer expr>`; every other use (the parameter escaping into
   /// a global, another call, deeper writes) is a located rejection.
+  ///
+  /// FR-53: under recovery each definition is planned in isolation and its
+  /// rejection is credited to it, so one unsupported `char **` writer costs
+  /// that definition and nothing else. This is the planner that dominated the
+  /// third-party measurement — it alone accounted for most of the translation
+  /// units that used to emit no crate at all.
   LogicalResult planCursorParams(const clang::TranslationUnitDecl *unit);
+
+  /// The per-definition half of `planCursorParams`: proves `func`'s
+  /// pointer-to-pointer parameters fit the string-cursor shape and, only if
+  /// ALL of them do, admits them into `cursorParams`.
+  ///
+  /// The all-or-nothing ordering is what makes this function the unit of
+  /// FR-53 recovery: a rejection leaves `cursorParams` exactly as it found it,
+  /// so a dropped definition contributes no half-plan for a survivor to read.
+  /// A caller of a dropped definition sees NO cursor plan for its parameters,
+  /// which is the pre-CTS-00204 default and rejects the `char **` argument at
+  /// the call site — recovered in turn — rather than mis-lowering it.
+  LogicalResult planCursorParamsFor(const clang::FunctionDecl *func);
 
   /// Emits every planned clone of the monomorphized variadic definition
   /// `func` (CTS 00204); a plan with zero clones emits nothing.
@@ -4364,6 +4434,39 @@ private:
   /// `importTopLevelDeclRecovering` for the ledger (the mangling
   /// `importFunction` applies is not reproducible from the AST alone).
   std::string recoveryStubSymbol;
+
+  //===--------------------------------------------------------------------===//
+  // Recoverable Pass-A planning (FR-53)
+  //===--------------------------------------------------------------------===//
+
+  /// A Pass-A planner rejection that was attributed to one declaration.
+  struct PlannerRejection {
+    /// The rejection's own location — the offending construct, never the
+    /// declaration's `getBeginLoc()`, so the ledger points where the
+    /// non-recovering diagnostic pointed.
+    Location loc;
+    /// The verbatim diagnostic the planner would have printed.
+    std::string reason;
+  };
+
+  /// Pass-A planner rejections attributed to a top-level declaration of the TU
+  /// under import, keyed by the very `clang::Decl *` `importDeclsIn` walks.
+  /// Populated only under `recoverFromRejections`, cleared at the start of
+  /// every translation unit, and consulted in exactly one place —
+  /// `importTopLevelDeclRecovering`, which turns an entry into the same
+  /// rollback/stub/ledger/warning outcome an `importFunction` rejection has.
+  ///
+  /// The planners themselves consult it too, to SKIP an already-rejected
+  /// declaration on a replan: a plan the surviving declarations consult must
+  /// be the plan a non-recovering run over exactly those declarations would
+  /// have built, and the only way to guarantee that is to rebuild it with the
+  /// rejected declaration absent rather than to patch the half-built one.
+  llvm::DenseMap<const clang::Decl *, PlannerRejection> plannerRejections;
+
+  /// Set by a planner fragment that knows which declaration its rejection
+  /// belongs to, overriding `recoverPlannerRejection`'s default attribution;
+  /// read and cleared by that function. Null at every other moment.
+  const clang::Decl *pendingPlannerAttribution = nullptr;
 
   /// The module receiving struct definitions and functions.
   ModuleOp module;
