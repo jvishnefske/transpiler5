@@ -1613,44 +1613,6 @@ of references or inheritance, so it precedes both.
   (test/EndToEnd/lib-crate-external-caller.c,
   test/RealWorld/Cpp/Inputs/ringbuf-lib/)
 
-- [ ] FR-52 Traits for external requirements (open, W5.12). A symbol
-  referenced but defined in no translation unit is currently a hard
-  WHOLE-PROGRAM failure (`ImportC.cpp` ~5601/5618, `finalizeProject`). It is
-  not attributable to a single declaration, so FR-42 recovery cannot stub
-  around it and FR-43's search can only WITHDRAW the items that reference it
-  -- six of the nine projects the search rescues are exactly this class, and
-  "rescue" there means dropping real, translatable code.
-  But an undefined external is not an error in a LIBRARY: it is a REQUIREMENT
-  ON THE ENVIRONMENT. A partially-ported project naturally depends on things
-  not yet ported, or on foreign code that never will be. The right output is
-  a crate that declares what it needs and lets a caller supply it.
-  Design: emit a `pub trait` whose ASSOCIATED FUNCTIONS are the unresolved
-  external functions, with translated signatures, and make the transitive
-  closure of their callers generic over it (`fn caller<E: Externals>(..)`,
-  calling `E::f(..)`). Associated functions rather than `self`-receiver
-  methods: no receiver to thread through every call site, signatures stay
-  close to what they are today, and it monomorphises to a direct call with
-  no `dyn` and no runtime cost. An `extern "C"` block is not an option --
-  this project emits no `unsafe` -- so the trait is the safe-Rust expression
-  of the same dependency.
-  Open decisions the wave must settle and justify: undefined external
-  GLOBALS (associated constants cannot express mutable state -- handle them
-  or leave them rejecting, but not half-way); which functions become generic
-  and how signatures of functions that need nothing stay unchanged;
-  unresolved VARIADIC externals, which have no faithful safe-Rust signature
-  and may legitimately keep rejecting; and whether a BIN crate with
-  unresolved externals stays an error (it has no caller to supply the impl).
-  The gate that matters most is that a project with no unresolved externals
-  is BYTE-IDENTICAL -- no trait, no generic parameters, not one changed
-  byte -- because the change is invasive by nature.
-  **NON-GOAL, explicit (user direction, 2026-07-30): no binary library.** No
-  `crate-type = ["staticlib"]`, no `cdylib`, no `#[no_mangle] extern "C"`
-  export surface, no C-ABI interop layer. FR-51's `[lib]` section carries
-  only `name` and `path` and no `crate-type`, so the emitted library is a
-  plain Rust `rlib` today; it stays one. A native linkable artifact is a
-  separate, later decision with its own ABI and `unsafe` consequences.
-  (test/Import/C/multi-tu-undefined-extern.c, test/EndToEnd/multi-tu*.c)
-
 - [x] FR-52 Traits for external requirements (W5.12). An undefined external
   is a REQUIREMENT ON THE ENVIRONMENT, not an error. The crate now declares a
   `pub trait Externals` whose ASSOCIATED FUNCTIONS are the unresolved
