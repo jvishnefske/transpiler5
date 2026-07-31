@@ -1,36 +1,30 @@
-// FR / C99-2: the unsigned-semantics arith operations only convert on
-// unsigned IntegerType operands, whose Rust rendering uN carries the
-// unsigned operator semantics. On signless types — rendered iN, whose
-// operators are SIGNED — they must stay illegal and fail loudly instead of
-// silently miscompiling. The float predicates without an exact Rust
-// operator are an explicit MVP boundary for the same reason.
+// FR / C99-2: the unsigned-semantics arith operations never render as the
+// bare Rust operator on a signless type — rendered iN, whose operators are
+// SIGNED. The BINARY ones (divui/remui/shrui) are instead routed through
+// the same-width uN rendering (see arith-to-emitrust.mlir); what remains
+// illegal, and must fail loudly rather than silently miscompile, is every
+// case with no correct Rust rendering to route through: the unsigned cmpi
+// predicates on signless operands, the unsigned binary operations on a
+// type with no uN counterpart, and the float predicates without an exact
+// Rust operator.
 // RUN: not emitrust-opt --split-input-file --convert-arith-to-emitrust %s 2>&1 \
 // RUN:   | FileCheck %s
 
-// divui on signless i32 would render as the signed `/` and stays illegal.
-// CHECK: failed to legalize operation 'arith.divui'
-func.func @unsigned_div(%a: i32, %b: i32) -> i32 {
-  %0 = arith.divui %a, %b : i32
-  return %0 : i32
-}
-
-// -----
-
-// remui on signless i32 would render as the signed `%` and stays illegal.
-// CHECK: failed to legalize operation 'arith.remui'
-func.func @unsigned_rem(%a: i32, %b: i32) -> i32 {
-  %0 = arith.remui %a, %b : i32
-  return %0 : i32
-}
-
-// -----
-
-// shrui on signless i32 would render as the ARITHMETIC `>>` (Rust's shift
-// on iN sign-extends) and stays illegal.
+// `index` renders as Rust `usize` and has no `ui<N>` form to route the
+// unsigned semantics through, so shrui on it stays illegal.
 // CHECK: failed to legalize operation 'arith.shrui'
-func.func @unsigned_shr(%a: i32, %b: i32) -> i32 {
-  %0 = arith.shrui %a, %b : i32
-  return %0 : i32
+func.func @unsigned_shr_index(%a: index, %b: index) -> index {
+  %0 = arith.shrui %a, %b : index
+  return %0 : index
+}
+
+// -----
+
+// Likewise for a width with no Rust integer type at all.
+// CHECK: failed to legalize operation 'arith.divui'
+func.func @unsigned_div_i24(%a: i24, %b: i24) -> i24 {
+  %0 = arith.divui %a, %b : i24
+  return %0 : i24
 }
 
 // -----

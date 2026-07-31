@@ -41,11 +41,12 @@ func.func @int_binops(%a: i32, %b: i32) -> (i32, i32, i32, i32, i32) {
 // Bitwise and/or/xor and the left shift are sign-agnostic and convert on
 // any integer type; shrsi converts on signless/signed types only (Rust's
 // `>>` on iN is the arithmetic shift). The unsigned-semantics shrui,
-// divui, remui, and cmpi ult/ule/ugt/uge only convert on unsigned
-// IntegerType operands — which the Arith verifier itself does not admit
-// today, so on the signless types the importer produces they stay illegal
-// (covered by unsigned-invalid.mlir) rather than silently converting to
-// the signed Rust operators.
+// divui, and remui map straight onto the EmitRust operation on unsigned
+// IntegerType operands, and on signless operands round-trip through the
+// same-width uN rendering instead (see @unsigned_binops_signless below);
+// cmpi ult/ule/ugt/uge has no such rewrite and stays illegal on signless
+// operands (covered by unsigned-invalid.mlir) rather than silently
+// converting to the signed Rust operator.
 // CHECK-LABEL: func.func @bit_binops
 // CHECK:         emitrust.and %arg0, %arg1 : i32
 // CHECK:         emitrust.or %arg0, %arg1 : i32
@@ -60,6 +61,50 @@ func.func @bit_binops(%a: i32, %b: i32) -> (i32, i32, i32, i32, i32) {
   %3 = arith.shli %a, %b : i32
   %4 = arith.shrsi %a, %b : i32
   return %0, %1, %2, %3, %4 : i32, i32, i32, i32, i32
+}
+
+// FR-54: divui/remui/shrui on a SIGNLESS type have no direct rendering —
+// Rust's `/`, `%`, and `>>` on iN are the signed operations — so they are
+// routed through the same-width uN: `(a as u32 OP b as u32) as i32`. That
+// is bit-exact because Rust's `as` between same-width integer types
+// reinterprets the bit pattern. The signless shrui form is what the
+// upstream Arith canonicalizer produces from `trunci(shrsi(x, c))`, i.e.
+// from C's `(int16_t)(v >> 16)`, so without this the narrowing cast of a
+// shifted signed value cannot be lowered at all.
+// CHECK-LABEL: func.func @unsigned_binops_signless
+// CHECK:         %[[DA:.*]] = emitrust.cast %arg0 : i32 to ui32
+// CHECK:         %[[DB:.*]] = emitrust.cast %arg1 : i32 to ui32
+// CHECK:         %[[D:.*]] = emitrust.div %[[DA]], %[[DB]] : ui32
+// CHECK:         emitrust.cast %[[D]] : ui32 to i32
+// CHECK:         %[[RA:.*]] = emitrust.cast %arg0 : i32 to ui32
+// CHECK:         %[[RB:.*]] = emitrust.cast %arg1 : i32 to ui32
+// CHECK:         %[[R:.*]] = emitrust.rem %[[RA]], %[[RB]] : ui32
+// CHECK:         emitrust.cast %[[R]] : ui32 to i32
+// CHECK:         %[[SA:.*]] = emitrust.cast %arg0 : i32 to ui32
+// CHECK:         %[[SB:.*]] = emitrust.cast %arg1 : i32 to ui32
+// CHECK:         %[[S:.*]] = emitrust.shr %[[SA]], %[[SB]] : ui32
+// CHECK:         emitrust.cast %[[S]] : ui32 to i32
+// CHECK-NOT:     arith.
+func.func @unsigned_binops_signless(%a: i32, %b: i32) -> (i32, i32, i32) {
+  %0 = arith.divui %a, %b : i32
+  %1 = arith.remui %a, %b : i32
+  %2 = arith.shrui %a, %b : i32
+  return %0, %1, %2 : i32, i32, i32
+}
+
+// The same round trip applies at the other Rust integer widths.
+// CHECK-LABEL: func.func @unsigned_binops_widths
+// CHECK:         emitrust.cast %arg0 : i8 to ui8
+// CHECK:         emitrust.shr {{.*}} : ui8
+// CHECK:         emitrust.cast {{.*}} : ui8 to i8
+// CHECK:         emitrust.cast %arg2 : i64 to ui64
+// CHECK:         emitrust.shr {{.*}} : ui64
+// CHECK:         emitrust.cast {{.*}} : ui64 to i64
+// CHECK-NOT:     arith.
+func.func @unsigned_binops_widths(%a: i8, %b: i8, %c: i64, %d: i64) -> (i8, i64) {
+  %0 = arith.shrui %a, %b : i8
+  %1 = arith.shrui %c, %d : i64
+  return %0, %1 : i8, i64
 }
 
 // The bitwise operations also convert on the narrower and wider widths.
