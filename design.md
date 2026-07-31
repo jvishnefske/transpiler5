@@ -4457,9 +4457,82 @@ case -- large amounts of pure integer and fixed-point math, close to the
 supported subset -- and mbedTLS the realistic one; the GAP between those two
 is the most informative number the track can produce.
 
-Status: measurement in progress (2026-07-31). Results, and whatever they imply
-about the C99 roadmap's remaining priorities, are recorded here when the run
-completes. The result is expected to be poor; that is the point of running it.
+**RESULTS (2026-07-31). 434 units across 11 repositories; 433 parsed.**
+
+```
+                     units parsed  full partial no-crate builds  items ported
+mbedtls                163   163     0      77       31     30   3976/8415 47%
+lwip src/core           69    69     1*     34        5     30   1139/2354 48%
+tinycrypt               32    32     0      15        0      5     66/177  37%
+FreeRTOS-Kernel         31    31     0       6        3      6      61/254 24%
+CMSIS-DSP               92    92     0       0       91      0        0/0   0%
+tinycbor                13    13     0       0       13      0        0/0   0%
+cJSON / heatshrink /
+  nanopb / tiny-AES     34    33     1*      8        4     10      70/385 18%
+TOTAL                  434   433     2*    145      147     85  5328/11773
+```
+
+`*` BOTH `TRANSLATED_FULL` results are VACUOUS -- empty translation units
+behind a disabled `#ifdef` (`graph_items=0`, a two-line crate). **The real
+count of third-party translation units translated in full is ZERO.**
+
+Findings, in order of how much they should change what happens next:
+
+1. **`PARSE_FAIL` = 1 of 434.** Every project's own compile database was
+   consumed successfully and clang built an AST for essentially everything.
+   There are no configuration excuses in this data; every number below is a
+   genuine translation limit. Configuration effort was also LOWER than
+   expected -- both FreeRTOS and lwIP ship usable config headers, and the
+   measurement authored none, only ~36 lines of build glue.
+
+2. **The item fraction flatters. By KIND, functions are 1-6%.** lwIP reads
+   48% of items only because enums (100%) and records (45-63%) translate well
+   while functions do not: FreeRTOS 5/129 (3.9%), lwIP 45/714 (6.3%), nanopb
+   1/81 (1.2%). Nor is `ported` transitive -- walking the emitted call graphs,
+   STUB-FREE functions are 3/39, 26/88 and 1/5. The 39 functions with real
+   bodies are byte-swappers, config-empty inits and one-line wrappers. No
+   queue operation, no scheduler function, no TCP state-machine function.
+
+3. **73% of all rejections reduce to ONE construct: a pointer stored in a
+   struct field or a global.** `rejected-type-cascade` alone is 52% of the
+   corpus-wide tally (4186 of ~8000), and it is a cascade from that root:
+   one rejected struct disqualifies every type and function naming it. The
+   roots are each project's central types -- `netif`, `pbuf_custom`,
+   `stats_`, the `xSTATIC_*` FreeRTOS types, `pb_callback_s`, mbedTLS's
+   context structs. This is **C99-43**, the single remaining unchecked box on
+   the C99 roadmap.
+
+4. **Dynamic memory is NOT the barrier: 6 occurrences in 434 units (0.1%),
+   and twice in the whole of lwIP.** This is the sharpest correction the
+   third-party data delivers. FR-39 and the container/fat-op work invested
+   substantially in modelling `malloc` because the SELF-AUTHORED corpus
+   ranked `dynamic-memory` as its top blocker twice. Real embedded C
+   allocates statically and threads pointers through structs. The demand
+   signal was measuring its own authors.
+
+5. Defects the run exposed, each reproduced in a handful of lines and fixed
+   or filed: the Pass-A planner recovery hole (FR-53), the canonicalized
+   unsigned-op legalization gap (FR-54), and two classes of emitted crate
+   that `rustc` rejects (FR-55). Plus, still open: a SEGFAULT on lwIP's
+   121-TU target (no diagnostic, deterministic); NON-TERMINATION of
+   `--incremental` on two FreeRTOS files where strict mode finishes in
+   seconds; and `--compdb` refusing a GCC-produced compile database
+   (`-Wlogical-op` reaches clang as `-Werror,-Wunknown-warning-option`),
+   which is the first thing a real embedded user would hit since almost every
+   such project ships a gcc build.
+
+6. **FR-41's colouring is not predictive on third-party code.** CMSIS-DSP
+   colours 100% green and ports 0%; mbedTLS colours 99.6% green and ports
+   47%. The CONTRACT holds -- these are false greens, the deliberately safe
+   direction, and false reds remain zero -- but the ARGUMENT does not. FR-43's
+   permissive-unsoundness rationale was that a false green costs one probe
+   because the search repairs it; the search repairs nothing here. On a
+   self-authored corpus the colouring looked exact; on real code it is 50-100
+   points out with no repair behind it.
+
+**What this implies for priorities.** C99-43 (pointer struct members and
+pointer-to-pointer) is worth more than every other open item combined, by
+roughly an order of magnitude. Nothing else in the ranked table is close.
 
 ## Track 4 RealWorld corpus (demand signal)
 
