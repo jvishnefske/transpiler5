@@ -4534,6 +4534,43 @@ Findings, in order of how much they should change what happens next:
 pointer-to-pointer) is worth more than every other open item combined, by
 roughly an order of magnitude. Nothing else in the ranked table is close.
 
+**Track 5 re-measured after FR-53/54/55 (same pinned SHAs, same compile
+databases, same harness).** The three defects the first run exposed were
+fixed and the affected repositories re-measured:
+
+| | before | after |
+|--|--|--|
+| small libs: units emitting NO crate | 14 of 22 | **2 of 22** |
+| small libs: crates that `cargo build` | 8 | **20** |
+| small libs: ported items | 52 | **169** |
+| CMSIS-DSP: units emitting a crate | 0 of 91 | **83 of 91** |
+| tinycrypt + tiny-AES: emitted crates building | 6 of 25 | **25 of 25** |
+
+The small-libs ported FRACTION falls 18.9% -> 12.0% while absolute ported
+items more than triple, because the denominator grew fivefold: the twelve
+rescued units contribute their entire item graphs, which previously counted
+as nothing at all. A fraction that falls because a benchmark stopped hiding
+its failures is the honest direction, and it is recorded here rather than
+quietly replaced by the absolute count.
+
+**The FR-42 caveat was wrong and is corrected.** It claimed planner
+rejections "cannot be attributed to a single droppable item". All seven
+`emitError` sites in the two rejecting planners carry a location inside one
+declaration, and FR-53 attributes every one. The claim survived because
+nothing in the self-authored corpus exercised it -- the same failure mode as
+the `main`-only blind spot and the harness mis-invocation, and the third time
+a documented caveat turned out to be the dominant real-world behaviour.
+
+**Recovery still stops at the IMPORT boundary, and that is now the leading
+blocker.** The two units that still yield nothing fail AFTER the declaration
+walk: `cannot translate non-finite floating-point constant` from the Rust
+emitter, and `failed to legalize operation 'scf.if'` from the conversion
+pipeline. A single un-legalizable operation costs the entire crate exactly
+the way a planner rejection used to. FR-42's per-item recovery has no
+counterpart in the pass pipeline or the emitter; giving it one is the natural
+successor to FR-53.
+
+
 ## Track 4 RealWorld corpus (demand signal)
 
 `test/RealWorld/` is a corpus of small, realistic, deterministic C programs
