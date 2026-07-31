@@ -308,6 +308,68 @@ void discardClones(SmallVectorImpl<Operation *> &clones) {
 } // namespace
 
 //===----------------------------------------------------------------------===//
+// Recoverable Pass-A planning (FR-53)
+//===----------------------------------------------------------------------===//
+
+CImporter::PlannerRecovery
+CImporter::recoverPlannerRejection(const clang::Decl *attribution,
+                                   llvm::function_ref<LogicalResult()> body) {
+  // Same capture shape as `importTopLevelDeclRecovering`, and for the same
+  // reason: a planner reports its rejection through the diagnostic engine at
+  // the point of detection, so a scoped handler is the only way the verbatim
+  // text and location reach the ledger — and it is also what keeps a
+  // RECOVERED planner rejection from printing as an error.
+  SmallVector<CapturedDiagnostic> captured;
+  auto capture = [&captured](Diagnostic &diag) -> LogicalResult {
+    if (diag.getSeverity() != DiagnosticSeverity::Error)
+      return failure();
+    captured.push_back({diag.getLocation(), diag.getSeverity(), diag.str()});
+    for (Diagnostic &note : diag.getNotes())
+      captured.push_back(
+          {note.getLocation(), DiagnosticSeverity::Note, note.str()});
+    return success();
+  };
+
+  pendingPlannerAttribution = nullptr;
+  LogicalResult result = failure();
+  {
+    ScopedDiagnosticHandler handler(builder.getContext(), capture);
+    result = body();
+  }
+  // A fragment that named its own culprit wins over the caller's default:
+  // `planCursorParams` runs one definition at a time and the default IS the
+  // culprit, while `planVaMonomorphOnce` sweeps the whole unit and can only
+  // say which declaration is to blame at the rejection site itself.
+  const clang::Decl *credited =
+      pendingPlannerAttribution ? pendingPlannerAttribution : attribution;
+  pendingPlannerAttribution = nullptr;
+
+  if (succeeded(result)) {
+    for (const CapturedDiagnostic &diag : captured)
+      replayDiagnostic(diag);
+    return PlannerRecovery::Planned;
+  }
+  if (!credited) {
+    // Whole-program: nothing to drop, so the import fails as it always did
+    // and the diagnostics print exactly as the non-recovering run's would.
+    for (const CapturedDiagnostic &diag : captured)
+      replayDiagnostic(diag);
+    return PlannerRecovery::Unattributable;
+  }
+
+  // The first captured error is the rejection; the rest are consequences.
+  // Identical derivation to the item path, so a planner rejection and an
+  // import rejection produce the same ledger entry for the same construct.
+  Location loc = captured.empty() ? translateLoc(credited->getBeginLoc())
+                                  : captured.front().loc;
+  std::string reason = captured.empty()
+                           ? std::string("unsupported declaration")
+                           : captured.front().message;
+  plannerRejections.try_emplace(credited, PlannerRejection{loc, reason});
+  return PlannerRecovery::Recorded;
+}
+
+//===----------------------------------------------------------------------===//
 // The FR-43 admitted-set filter
 //===----------------------------------------------------------------------===//
 
@@ -388,12 +450,24 @@ CImporter::importTopLevelDeclRecovering(const clang::Decl *decl) {
   // same ledger entry shape, which is what lets FR-44's report describe a
   // searched build without knowing a search happened.
   std::string excluded = frontierExcludedSymbol(decl);
+  auto plannerIt = plannerRejections.find(decl);
   if (!excluded.empty()) {
     result = failure();
     captured.push_back({translateLoc(decl->getLocation()),
                         DiagnosticSeverity::Error,
                         "excluded by the search state: item '" + excluded +
                             "' is not admitted"});
+  } else if (plannerIt != plannerRejections.end()) {
+    // FR-53: a Pass-A planner already rejected this declaration and the plans
+    // the surviving declarations consult were rebuilt without it. Importing
+    // it now would be importing an item whose plan deliberately does not
+    // exist, so it is fed into the SAME rejection path an unsupported item
+    // takes: stubbed if its signature maps, dropped otherwise, one ledger
+    // entry either way, carrying the planner's own verbatim diagnostic and
+    // location rather than a restatement.
+    result = failure();
+    captured.push_back({plannerIt->second.loc, DiagnosticSeverity::Error,
+                        plannerIt->second.reason});
   } else {
     ScopedDiagnosticHandler handler(builder.getContext(), capture);
     result = importTopLevelDecl(decl);

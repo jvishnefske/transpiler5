@@ -24,6 +24,19 @@
 /// Split out of ImportC.cpp by pure code motion (W3.2 COMMIT A closing
 /// sub-step); see CImporterInternal.h for the CImporter class declaration
 /// this file implements.
+///
+/// FR-53 (recoverable Pass-A rejections). Only TWO of these planners can
+/// reject at all: `planCursorParams` and `planVaMonomorph`. The other five
+/// return `void` — they are strictly additive analyses that either prove a
+/// promotion and record it or leave the construct on its ordinary path, so
+/// they have no rejection to recover. Because the planners run before the
+/// declaration walk, their failures used to bypass FR-42's recovery entirely
+/// and take the whole translation unit down with them; every rejection site
+/// in both is a fact about ONE declaration, so under `recoverFromRejections`
+/// each is credited to that declaration (`recoverPlannerRejection`) and the
+/// walk drops or stubs it like any other unsupported item. With recovery off
+/// nothing here behaves differently: the first rejection still prints as an
+/// error and still fails the import.
 //
 //===----------------------------------------------------------------------===//
 
@@ -1656,60 +1669,137 @@ CImporter::planCursorParams(const clang::TranslationUnitDecl *unit) {
     const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl);
     if (!func || !func->isThisDeclarationADefinition() || !func->hasBody())
       continue;
-    // C main's `char **argv` has its own policy (dropped from the
-    // imported signature; uses rejected) — never a string cursor.
-    if (func->isMain())
+    // FR-53: every rejection this planner can raise is a fact about ONE
+    // definition — the escaping parameter and the write-through are both
+    // located inside `func`'s own body — so under recovery the definition is
+    // credited with it and dropped, and the walk continues. Without recovery
+    // the failure propagates and the whole translation unit is rejected,
+    // instruction for instruction as before.
+    if (recoverFromRejections) {
+      if (recoverPlannerRejection(decl,
+                                  [&] { return planCursorParamsFor(func); }) ==
+          PlannerRecovery::Unattributable)
+        return failure();
       continue;
-    SmallVector<const clang::ParmVarDecl *, 2> eligible;
-    for (const clang::ParmVarDecl *param : func->parameters())
-      if (isCharPointerPointerType(param->getType()))
-        eligible.push_back(param);
-    if (eligible.empty())
-      continue;
-    // The bounded shape: the parameter appears only under its own
-    // dereference — reads and the `*s = p` advancement. Everything else
-    // (stored, passed on, address-taken, content writes) escapes.
-    for (const clang::ParmVarDecl *param : eligible)
-      if (const clang::Expr *escape =
-              findCursorParamEscape(func->getBody(), param))
-        return emitError(translateLoc(escape->getBeginLoc()))
-               << "unsupported: pointer-to-pointer parameter escapes the "
-                  "string-cursor shape";
-    // Region check: a write through a pointer DERIVED from the cursor
-    // parameter (`p = *s; *p = c;`) writes region content the shared
-    // slice lowering cannot accept.
-    llvm::SmallPtrSet<const clang::ParmVarDecl *, 2> candidates(
-        eligible.begin(), eligible.end());
-    PointerRegionAnalysis analysis;
-    analysis.cursorParamQuery = [&](const clang::ParmVarDecl *param) {
-      return candidates.contains(param);
-    };
-    analysis.analyze(astContext(), func->getBody());
-    SmallVector<const clang::VarDecl *, 8> locals;
-    collectLocalPointerDecls(func->getBody(), locals);
-    for (const clang::VarDecl *var : locals) {
-      const PointerRegion *region = analysis.regionOf(var);
-      if (!region || !region->hasWriteThrough)
-        continue;
-      for (const PointerBaseBinding &binding : region->bases)
-        if (const auto *param =
-                llvm::dyn_cast_if_present<clang::ParmVarDecl>(binding.base);
-            param && candidates.contains(param))
-          return emitError(translateLoc(region->writeThroughLoc))
-                 << "unsupported: write through a string-cursor parameter";
     }
-    for (const clang::ParmVarDecl *param : eligible)
-      cursorParams.insert(param);
+    if (failed(planCursorParamsFor(func)))
+      return failure();
   }
+  return success();
+}
+
+LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
+  // C main's `char **argv` has its own policy (dropped from the
+  // imported signature; uses rejected) — never a string cursor.
+  if (func->isMain())
+    return success();
+  SmallVector<const clang::ParmVarDecl *, 2> eligible;
+  for (const clang::ParmVarDecl *param : func->parameters())
+    if (isCharPointerPointerType(param->getType()))
+      eligible.push_back(param);
+  if (eligible.empty())
+    return success();
+  // The bounded shape: the parameter appears only under its own
+  // dereference — reads and the `*s = p` advancement. Everything else
+  // (stored, passed on, address-taken, content writes) escapes.
+  for (const clang::ParmVarDecl *param : eligible)
+    if (const clang::Expr *escape =
+            findCursorParamEscape(func->getBody(), param))
+      return emitError(translateLoc(escape->getBeginLoc()))
+             << "unsupported: pointer-to-pointer parameter escapes the "
+                "string-cursor shape";
+  // Region check: a write through a pointer DERIVED from the cursor
+  // parameter (`p = *s; *p = c;`) writes region content the shared
+  // slice lowering cannot accept.
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 2> candidates(eligible.begin(),
+                                                              eligible.end());
+  PointerRegionAnalysis analysis;
+  analysis.cursorParamQuery = [&](const clang::ParmVarDecl *param) {
+    return candidates.contains(param);
+  };
+  analysis.analyze(astContext(), func->getBody());
+  SmallVector<const clang::VarDecl *, 8> locals;
+  collectLocalPointerDecls(func->getBody(), locals);
+  for (const clang::VarDecl *var : locals) {
+    const PointerRegion *region = analysis.regionOf(var);
+    if (!region || !region->hasWriteThrough)
+      continue;
+    for (const PointerBaseBinding &binding : region->bases)
+      if (const auto *param =
+              llvm::dyn_cast_if_present<clang::ParmVarDecl>(binding.base);
+          param && candidates.contains(param))
+        return emitError(translateLoc(region->writeThroughLoc))
+               << "unsupported: write through a string-cursor parameter";
+  }
+  // The admissions are the LAST thing this function does, so a rejection
+  // above leaves `cursorParams` untouched: there is no partial plan to
+  // inherit, and the all-or-nothing rule ("either every eligible parameter
+  // of this definition is a cursor, or none is") holds under recovery too.
+  for (const clang::ParmVarDecl *param : eligible)
+    cursorParams.insert(param);
   return success();
 }
 
 LogicalResult
 CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
+  if (!recoverFromRejections)
+    return planVaMonomorphOnce(unit);
+  // FR-53 under recovery: REPLAN from scratch after each attributed
+  // rejection instead of continuing with the half-built plan the rejection
+  // interrupted. The clone list of a target and the per-site clone indices
+  // are built incrementally in the last phase below, so a rejection there
+  // leaves both partially populated; and dropping a variadic DEFINITION has
+  // to un-enumerate every call site that was planned against it, which no
+  // local patch can do. Replanning makes the plan the import finally
+  // consults, by construction, the plan a non-recovering run over exactly
+  // the surviving declarations would have produced.
+  //
+  // The plan maps accumulate across the translation units of a project, so
+  // a round trip restores them to the state this TU inherited rather than
+  // clearing them (which would discard earlier TUs' plans).
+  auto plansAtEntry = vaMonomorphPlans;
+  auto sitesAtEntry = vaCallSiteClones;
+  // Every round records exactly one more declaration in `plannerRejections`
+  // and every round skips the ones already there, so the loop is bounded by
+  // the number of top-level declarations.
+  for (;;) {
+    vaMonomorphPlans = plansAtEntry;
+    vaCallSiteClones = sitesAtEntry;
+    pendingPlannerAttribution = nullptr;
+    size_t recordedBefore = plannerRejections.size();
+    switch (recoverPlannerRejection(
+        /*attribution=*/nullptr, [&] { return planVaMonomorphOnce(unit); })) {
+    case PlannerRecovery::Planned:
+      return success();
+    case PlannerRecovery::Recorded:
+      // Termination: a round that records nothing new would repeat forever.
+      // It cannot happen — every phase skips the declarations already in the
+      // map, so a re-credited declaration would have to be one the round did
+      // not look at — but a `for (;;)` deserves the check rather than the
+      // argument.
+      if (plannerRejections.size() == recordedBefore) {
+        vaMonomorphPlans = plansAtEntry;
+        vaCallSiteClones = sitesAtEntry;
+        return failure();
+      }
+      continue;
+    case PlannerRecovery::Unattributable:
+      // No declaration could be credited: propagate, exactly as a
+      // non-recovering run would, with the plans left as this TU found them.
+      vaMonomorphPlans = plansAtEntry;
+      vaCallSiteClones = sitesAtEntry;
+      return failure();
+    }
+  }
+}
+
+LogicalResult
+CImporter::planVaMonomorphOnce(const clang::TranslationUnitDecl *unit) {
   // Gather this TU's va_list-using variadic definitions.
   SmallVector<const clang::FunctionDecl *, 4> targets;
   for (const clang::Decl *decl : unit->decls()) {
-    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+    if (decl->isImplicit() || isSystemHeaderDecl(decl) ||
+        plannerRejections.contains(decl))
       continue;
     const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl);
     if (!func || !func->isThisDeclarationADefinition() || !func->hasBody() ||
@@ -1740,6 +1830,10 @@ CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
         case clang::Builtin::BI__builtin_va_copy:
         case clang::Builtin::BI__builtin_ms_va_copy:
         case clang::Builtin::BIva_copy:
+          // FR-53: a fact about this variadic DEFINITION. Dropping it also
+          // drops it from `targets` on the replan, so no call site is
+          // enumerated for it and every caller rejects at its own call.
+          pendingPlannerAttribution = func;
           return emitError(translateLoc(call->getBeginLoc()))
                  << "unsupported: va_copy";
         case clang::Builtin::BI__builtin_va_start:
@@ -1772,9 +1866,12 @@ CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
         if (var &&
             astContext().hasSameType(var->getType().getCanonicalType(),
                                      vaListType) &&
-            !consumed.contains(ref))
+            !consumed.contains(ref)) {
+          // FR-53: likewise a fact about this variadic definition.
+          pendingPlannerAttribution = func;
           return emitError(translateLoc(ref->getBeginLoc()))
                  << "unsupported: va_list escapes variadic definition";
+        }
       }
       for (const clang::Stmt *child : current->children())
         worklist.push_back(child);
@@ -1792,9 +1889,16 @@ CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
   struct SiteRecord {
     const clang::CallExpr *call;
     const clang::FunctionDecl *target;
+    /// FR-53: the top-level declaration whose body or initializer contains
+    /// `call`. The clone assignment below can reject a site for a reason that
+    /// is a property of the CALL (too few arguments, an extra this importer
+    /// cannot pass by value), which belongs to the declaration that wrote it,
+    /// not to the variadic definition it names.
+    const clang::Decl *owner;
   };
   SmallVector<SiteRecord, 8> sites;
   llvm::SmallPtrSet<const clang::Expr *, 16> calleeRefs;
+  const clang::Decl *scanOwner = nullptr;
   std::function<LogicalResult(const clang::Stmt *)> scan =
       [&](const clang::Stmt *stmt) -> LogicalResult {
     if (!stmt)
@@ -1805,24 +1909,31 @@ CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
           callee ? canonicalTargets.lookup(callee->getCanonicalDecl())
                  : nullptr;
       if (target) {
-        sites.push_back({call, target});
+        sites.push_back({call, target, scanOwner});
         calleeRefs.insert(strippedImplicitRef(call->getCallee()));
       }
     }
     if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
       if (const auto *fn = llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl()))
         if (canonicalTargets.count(fn->getCanonicalDecl()) &&
-            !calleeRefs.contains(ref))
+            !calleeRefs.contains(ref)) {
+          // FR-53: taking the address is something the SCANNED declaration
+          // does. Dropping it removes the reference and leaves the variadic
+          // definition monomorphizable from its remaining call sites.
+          pendingPlannerAttribution = scanOwner;
           return emitError(translateLoc(ref->getBeginLoc()))
                  << "unsupported: address of variadic definition";
+        }
     for (const clang::Stmt *child : stmt->children())
       if (failed(scan(child)))
         return failure();
     return success();
   };
   for (const clang::Decl *decl : unit->decls()) {
-    if (decl->isImplicit() || isSystemHeaderDecl(decl))
+    if (decl->isImplicit() || isSystemHeaderDecl(decl) ||
+        plannerRejections.contains(decl))
       continue;
+    scanOwner = decl;
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
       if (func->isThisDeclarationADefinition() && func->hasBody() &&
           failed(scan(func->getBody())))
@@ -1833,6 +1944,7 @@ CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
       if (var->hasInit() && failed(scan(var->getInit())))
         return failure();
   }
+  scanOwner = nullptr;
 
   // One clone per distinct extras signature; call sites record their
   // clone index. Every target gets a plan entry — a site-less definition
@@ -1843,9 +1955,11 @@ CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
     VaMonomorphPlan &plan =
         vaMonomorphPlans[site.target->getCanonicalDecl()];
     unsigned named = site.target->getNumParams();
-    if (site.call->getNumArgs() < named)
+    if (site.call->getNumArgs() < named) {
+      pendingPlannerAttribution = site.owner;
       return emitError(translateLoc(site.call->getBeginLoc()))
              << "unsupported: call argument count mismatch";
+    }
     SmallVector<Type, 4> extraTypes;
     for (unsigned index = named; index < site.call->getNumArgs(); ++index) {
       const clang::Expr *argument = site.call->getArg(index);
@@ -1853,12 +1967,18 @@ CImporter::planVaMonomorph(const clang::TranslationUnitDecl *unit) {
       // Extras pass BY VALUE (clang has already applied the default
       // argument promotions); a data-pointer extra has no by-value
       // representation under the decomposition.
-      if (isDataPointer(argument->getType()))
+      if (isDataPointer(argument->getType())) {
+        pendingPlannerAttribution = site.owner;
         return emitError(argLoc)
                << "unsupported: pointer argument to a variadic call";
+      }
       FailureOr<Type> mapped = mapType(argument->getType(), argLoc);
-      if (failed(mapped))
+      if (failed(mapped)) {
+        // `mapType` already emitted the located diagnostic; the attribution
+        // is all this adds.
+        pendingPlannerAttribution = site.owner;
         return failure();
+      }
       extraTypes.push_back(*mapped);
     }
     unsigned cloneIndex = plan.clones.size();
