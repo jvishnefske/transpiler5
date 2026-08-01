@@ -31,6 +31,12 @@ using namespace mlir;
 //===----------------------------------------------------------------------===//
 
 LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
+  // Belt-and-suspenders: a body-less function (e.g. an explicitly defaulted
+  // special member whose `getBody()` is null) must never reach the statement
+  // walk — `importCXXMethods` filters those out — but guard rather than
+  // dereference a null `stmt` into a crash if a new path ever slips through.
+  if (!stmt)
+    return success();
   Location loc = translateLoc(stmt->getBeginLoc());
 
   if (const auto *compound = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {

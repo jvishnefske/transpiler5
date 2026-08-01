@@ -315,8 +315,17 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
   // must agree exactly, or the definition pass would emit a body for a
   // symbol the signature pass never registered (or leave a stub behind).
   auto isImportable = [](const clang::CXXMethodDecl *method) {
-    // Compiler-synthesized special members: out of scope.
-    return !method->isImplicit() && !method->isDeleted();
+    // Compiler-synthesized special members are out of scope, and so is an
+    // EXPLICITLY defaulted one (`= default`): it has no user-written body to
+    // import, so `importFunction` would ask for a null `getBody()` and the
+    // statement walk would deref it and crash. Like the implicit member it
+    // stands in for, a defaulted special member is realized structurally (a
+    // defaulted default constructor becomes `derive(Default)`), never as an
+    // imported function body. The copy/move/delegating rejection below runs
+    // on the broader "user-declared" predicate so a *defaulted* copy/move
+    // ctor is still rejected rather than silently skipped here.
+    return !method->isImplicit() && !method->isDeleted() &&
+           !method->isDefaulted();
   };
   // Destructors, virtual methods, and overloaded operators were already
   // rejected in `collectRecordFields`, before this class's struct_def (and
@@ -326,7 +335,12 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
   // inspected individually. Kept ahead of BOTH passes so a rejected class
   // never half-imports.
   for (const clang::CXXMethodDecl *method : record->methods()) {
-    if (!isImportable(method))
+    // Broader than `isImportable`: a copy/move/delegating constructor is
+    // rejected even when `= default`, whereas `isImportable` (used by the two
+    // import passes below) additionally skips defaulted members so a null
+    // body is never emitted. Compiler-synthesized members carry none of these
+    // shapes and are skipped.
+    if (method->isImplicit() || method->isDeleted())
       continue;
     if (const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method))
       if (ctor->isCopyOrMoveConstructor() || ctor->isDelegatingConstructor())
