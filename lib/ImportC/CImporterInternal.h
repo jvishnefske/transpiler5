@@ -2414,6 +2414,17 @@ private:
                                      const clang::CXXConstructExpr *construct,
                                      Location loc);
 
+  /// Initializes `place` from a default construction whose constructor is not
+  /// user-provided (an implicit or `= default` default ctor made non-trivial
+  /// only by in-class member initializers). Applies each of the ctor's member
+  /// initializers to the matching field of `place` directly — an NSDMI's
+  /// `CXXDefaultInitExpr` resolves through `emitRValue` to the in-class
+  /// initializer — instead of calling a constructor function that was never
+  /// imported. A member with no initializer keeps `place`'s default.
+  LogicalResult emitDefaultConstructInit(Value place,
+                                         const clang::CXXConstructorDecl *ctor,
+                                         Location loc);
+
   /// CTS 00204 Pass A: plans the per-call-site monomorphization of every
   /// variadic definition whose body uses va_list. Scope checks reject
   /// va_copy, a va_list object escaping its definition (passed to any

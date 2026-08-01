@@ -198,6 +198,29 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
       return failure();
     return loadPlace(loc, *place);
   }
+  // A C++ `CXXConstructExpr` in VALUE position — a by-value argument
+  // (`f(pt)`), a by-value return (`return r;`), or any other prvalue of class
+  // type — that is a TRIVIAL copy or move of an existing object is a
+  // whole-struct value copy: unwrap to the single source operand and load it
+  // whole, exactly as `x = other;` does. A non-trivial constructor carries
+  // real side effects (silently dropping them would be a miscompile, not a
+  // merely unsupported construct) and stays rejected, as does a value-position
+  // construction with no single source to copy (a default or multi-argument
+  // construct); those materialize a temporary only the declaration position
+  // (`emitCXXConstructInit`) has a place for.
+  if (const auto *construct = llvm::dyn_cast<clang::CXXConstructExpr>(e)) {
+    const clang::CXXConstructorDecl *ctor = construct->getConstructor();
+    if (ctor && ctor->isCopyOrMoveConstructor() && ctor->isTrivial() &&
+        construct->getNumArgs() == 1)
+      return emitRValue(construct->getArg(0));
+    return emitError(loc) << "unsupported: constructor in value position "
+                             "(only a trivial copy or move is modeled)";
+  }
+  // An NSDMI (`struct D { int x = 5; };`) surfaces at each use as a
+  // `CXXDefaultInitExpr` standing in for the member's in-class initializer;
+  // its value is exactly that initializer.
+  if (const auto *defaultInit = llvm::dyn_cast<clang::CXXDefaultInitExpr>(e))
+    return emitRValue(defaultInit->getExpr());
   return emitError(loc) << "unsupported expression: " << e->getStmtClassName();
 }
 
