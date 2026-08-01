@@ -22,6 +22,7 @@
 #include "EmitRust/Conversion/ArithToEmitRust.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/FuncToEmitRust.h"
+#include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/Conversion/LowerExternalRequirements.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 #include "EmitRust/Conversion/SCFToEmitRust.h"

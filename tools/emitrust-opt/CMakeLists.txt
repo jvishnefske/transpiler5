@@ -12,6 +12,7 @@ set(LIBS
   MLIRArithToEmitRust
   MLIRFuncToEmitRust
   MLIRSCFToEmitRust
+  MLIRLowerContainers
   MLIRConvertToEmitRust
   MLIREmitRustLowerExternalRequirements
 )

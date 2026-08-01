@@ -3603,6 +3603,19 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
              builder.getStringAttr("null pointer dereference")}),
         ValueRange{pointer.nonNull});
   if (pointer.backing) {
+    if (auto collection =
+            pointer.backing.getDefiningOp<emitrust::CollectionOp>()) {
+      // W4.2e Part B (FR-39): a node-pool handle projects the shared pool at
+      // the handle's index through the high-level `collection_at`, which
+      // emitrust-lower-containers turns back into the pool subscript.
+      if (!pointer.cursor) // Defensive; pool handles always carry cursors.
+        return emitError(loc) << "unsupported heap-allocation pointer shape";
+      return builder
+          .create<emitrust::CollectionAtOp>(
+              loc, emitrust::LValueType::get(pointeeType), pointer.backing,
+              pointer.cursor)
+          .getResult();
+    }
     // A local heap-allocation cursor subscripts the pointer's synthesized
     // MUTABLE backing array (a flat [CAP x T], W4.2e Part A) at the loaded
     // cursor. Unlike a string literal, writes ARE allowed: the place feeds
