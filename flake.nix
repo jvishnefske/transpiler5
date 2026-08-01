@@ -92,6 +92,38 @@
           pdll = mkMlirShell tblgenWithPdll;
         };
 
-        packages.tblgen-with-pdll = tblgenWithPdll;
+        packages = rec {
+          default = emitrust;
+          emitrust = pkgs.stdenv.mkDerivation {
+            pname = "emitrust";
+            version = "0.1.0";
+            src = ./.;
+
+            nativeBuildInputs = [
+              pkgs.cmake
+              pkgs.ninja
+              pkgs.pkg-config
+              llvmPackages.tblgen
+            ];
+
+            buildInputs = [
+              llvmPackages.llvm
+              llvmPackages.mlir
+              llvmPackages.libclang
+              llvmPackages.clang
+            ];
+
+            MLIR_DIR = "${llvmPackages.mlir.dev}/lib/cmake/mlir";
+            LLVM_DIR = "${llvmPackages.llvm.dev}/lib/cmake/llvm";
+            Clang_DIR = "${llvmPackages.libclang.dev}/lib/cmake/clang";
+            LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+
+            postInstall = ''
+              mkdir -p $out/bin
+              cp bin/emitrust-* $out/bin/
+            '';
+          };
+          tblgen-with-pdll = tblgenWithPdll;
+        };
       });
 }
