@@ -40,8 +40,16 @@ emitrust.func @defaults() {
   // CHECK-NEXT:    let v2: Option<fn(i32) -> i32> = None;
   %2 = emitrust.constant <#emitrust.opaque<"None">>
       : !emitrust.fn_ptr<(i32) -> i32>
-  // CHECK-NEXT:    let v3: bool = v1 != v2;
+  // A `!= None` comparison lowers to an Option null-test to avoid
+  // `unpredictable_function_pointer_comparisons`.
+  // A `!= None` comparison lowers to an Option null-test to avoid
+  // `unpredictable_function_pointer_comparisons`.
+  // CHECK-NEXT:    let v3: bool = v1.is_some();
   %3 = emitrust.cmp ne, %1, %2
+      : (!emitrust.fn_ptr<(i32) -> i32>, !emitrust.fn_ptr<(i32) -> i32>) -> i1
+  // Two non-null function pointers compare by address, None-aware.
+  // CHECK-NEXT:    let v4: bool = match (v1, v1) { (Some(l), Some(r)) => core::ptr::fn_addr_eq(l, r), (None, None) => true, _ => false };
+  %4 = emitrust.cmp eq, %1, %1
       : (!emitrust.fn_ptr<(i32) -> i32>, !emitrust.fn_ptr<(i32) -> i32>) -> i1
   emitrust.return
 }

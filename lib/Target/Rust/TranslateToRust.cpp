@@ -201,6 +201,8 @@ private:
                                    StringRef method);
   /// Emits `let vN: bool = vA <pred> vB;`.
   LogicalResult emitCmp(emitrust::CmpOp cmpOp);
+  LogicalResult emitFnPtrCmp(emitrust::CmpOp cmpOp, Value lhs, Value rhs,
+                             bool isEq);
   /// Emits `let vN: T = vA as T;`.
   LogicalResult emitCast(emitrust::CastOp castOp);
   /// Emits the bit-exact float/integer reinterpretation:
@@ -988,11 +990,73 @@ static StringRef cmpPredicateSymbol(emitrust::CmpPredicate predicate) {
   return "";
 }
 
+/// Returns whether `value` is the function-pointer null constant, i.e. the
+/// `emitrust.constant` carrying the opaque `None` produced by the importer's
+/// `createFnPtrNone` for a C null function pointer.
+static bool isFnPtrNone(Value value) {
+  auto constant = value.getDefiningOp<emitrust::ConstantOp>();
+  if (!constant)
+    return false;
+  auto opaque = dyn_cast<emitrust::OpaqueAttr>(constant.getValue());
+  return opaque && opaque.getValue() == "None";
+}
+
+/// Lowers an equality/inequality comparison whose operands are `Option<fn..>`
+/// function pointers. A literal `==`/`!=` would trip
+/// `unpredictable_function_pointer_comparisons`, so:
+///   - `fp == NULL` / `fp != NULL` (one side the `None` constant) becomes
+///     `fp.is_none()` / `fp.is_some()`;
+///   - `NULL == NULL` folds to the static truth value;
+///   - `fp == gp` (neither side null) becomes a `None`-aware `match` that
+///     compares the payload addresses with `core::ptr::fn_addr_eq`.
+LogicalResult RustEmitter::emitFnPtrCmp(emitrust::CmpOp cmpOp, Value lhs,
+                                        Value rhs, bool isEq) {
+  Operation *op = cmpOp.getOperation();
+  Location loc = op->getLoc();
+  if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  bool lhsNone = isFnPtrNone(lhs);
+  bool rhsNone = isFnPtrNone(rhs);
+  if (lhsNone != rhsNone) {
+    // One side is the null constant: an Option null-test is exact and warning
+    // free, matching C's `fp == NULL` / `fp != NULL` semantics.
+    if (failed(emitOperand(loc, lhsNone ? rhs : lhs)))
+      return failure();
+    os << (isEq ? ".is_none()" : ".is_some()") << ";\n";
+    return success();
+  }
+  if (lhsNone && rhsNone) {
+    // Both sides are the null constant; the result is statically known.
+    os << (isEq ? "true" : "false") << ";\n";
+    return success();
+  }
+  // Neither side is null: compare payload function addresses, `None`-aware.
+  os << "match (";
+  if (failed(emitOperand(loc, lhs)))
+    return failure();
+  os << ", ";
+  if (failed(emitOperand(loc, rhs)))
+    return failure();
+  os << ") { (Some(l), Some(r)) => "
+     << (isEq ? "core::ptr::fn_addr_eq(l, r)" : "!core::ptr::fn_addr_eq(l, r)")
+     << ", (None, None) => " << (isEq ? "true" : "false") << ", _ => "
+     << (isEq ? "false" : "true") << " };\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitCmp(emitrust::CmpOp cmpOp) {
-  StringRef symbol = cmpPredicateSymbol(cmpOp.getPredicate());
+  emitrust::CmpPredicate predicate = cmpOp.getPredicate();
+  Operation *op = cmpOp.getOperation();
+  bool isEq = predicate == emitrust::CmpPredicate::eq;
+  bool isNe = predicate == emitrust::CmpPredicate::ne;
+  if ((isEq || isNe) &&
+      (isa<emitrust::FnPtrType>(op->getOperand(0).getType()) ||
+       isa<emitrust::FnPtrType>(op->getOperand(1).getType())))
+    return emitFnPtrCmp(cmpOp, op->getOperand(0), op->getOperand(1), isEq);
+  StringRef symbol = cmpPredicateSymbol(predicate);
   if (symbol.empty())
-    return cmpOp.getOperation()->emitOpError("unknown comparison predicate");
-  return emitBinary(cmpOp.getOperation(), symbol);
+    return op->emitOpError("unknown comparison predicate");
+  return emitBinary(op, symbol);
 }
 
 LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
