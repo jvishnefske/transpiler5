@@ -26,7 +26,7 @@ emitrust.func @spin(%arg0: i1, %arg1: i1) {
 }
 
 // CHECK-LABEL: fn for_jumps(v0: usize, v1: usize, v2: usize, v3: bool) {
-// CHECK-NEXT:    for v4 in (v0..v1).step_by(v2 as usize) {
+// CHECK-NEXT:    for _v4 in (v0..v1).step_by(v2 as usize) {
 // CHECK-NEXT:      if v3 {
 // CHECK-NEXT:        continue;
 // CHECK-NEXT:      }

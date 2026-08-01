@@ -50,7 +50,7 @@ int main(void) { return caller(); }
 // RUST: fn caller() -> i32 {
 // RUST: v6.callee(
 // RUST: impl Owner_caller_local {
-// RUST-NEXT: fn callee(&mut self, v0: i64, v1: i32) {
+// RUST-NEXT: fn callee(&mut self, _v0: i64, _v1: i32) {
 // RUST-NEXT: unimplemented!("unsupported: volatile-qualified type");
 
 // DIAG: warning: unsupported: volatile-qualified type (recovered: emitted an unimplemented!() stub with the mapped signature)

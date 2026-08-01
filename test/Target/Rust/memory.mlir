@@ -17,10 +17,10 @@ emitrust.struct_def @Point ["x", "y"] [i32, i32]
 emitrust.struct_def @Empty [] []
 
 // CHECK-LABEL: fn empty_struct_value() {
-// CHECK-NEXT:    let mut v0: Empty = Empty::default();
+// CHECK-NEXT:    let v0: Empty = Empty::default();
 // CHECK-NEXT:    let v1: Empty = v0;
-// CHECK-NEXT:    let mut v2: Empty = Empty::default();
-// CHECK-NEXT:    v2 = v1;
+// CHECK-NEXT:    let mut _v2: Empty = Empty::default();
+// CHECK-NEXT:    _v2 = v1;
 // CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @empty_struct_value() {
@@ -32,13 +32,13 @@ emitrust.func @empty_struct_value() {
 }
 
 // CHECK-LABEL: fn defaults() {
-// CHECK-NEXT:    let mut v0: i32 = 42;
-// CHECK-NEXT:    let mut v1: i32 = 0;
-// CHECK-NEXT:    let mut v2: bool = false;
-// CHECK-NEXT:    let mut v3: f64 = 0.0;
-// CHECK-NEXT:    let mut v4: Point = Point::default();
-// CHECK-NEXT:    let mut v5: [i32; 4] = [0; 4];
-// CHECK-NEXT:    let mut v6: [Point; 2] = [Point::default(); 2];
+// CHECK-NEXT:    let _v0: i32 = 42;
+// CHECK-NEXT:    let _v1: i32 = 0;
+// CHECK-NEXT:    let _v2: bool = false;
+// CHECK-NEXT:    let _v3: f64 = 0.0;
+// CHECK-NEXT:    let _v4: Point = Point::default();
+// CHECK-NEXT:    let _v5: [i32; 4] = [0; 4];
+// CHECK-NEXT:    let _v6: [Point; 2] = [Point::default(); 2];
 // CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @defaults() {
@@ -67,10 +67,10 @@ emitrust.func @fields(%arg0: i32) -> i32 {
   emitrust.return %r : i32
 }
 
-// CHECK-LABEL: fn indexing(v0: i32, v1: usize, v2: i32) -> i32 {
+// CHECK-LABEL: fn indexing(v0: i32, v1: usize, _v2: i32) -> i32 {
 // CHECK-NEXT:    let mut v3: [i32; 4] = [0; 4];
 // CHECK-NEXT:    v3[v1] = v0;
-// CHECK-NEXT:    v3[v2 as usize] = v0;
+// CHECK-NEXT:    v3[_v2 as usize] = v0;
 // CHECK-NEXT:    let v4: i32 = v3[v1];
 // CHECK-NEXT:    return v4;
 // CHECK-NEXT:  }
@@ -98,8 +98,8 @@ emitrust.func @through_ref(%arg0: !emitrust.mut_ref<i32>, %arg1: i32) -> i32 {
 
 // CHECK-LABEL: fn borrows() {
 // CHECK-NEXT:    let mut v0: i32 = 1;
-// CHECK-NEXT:    let v1: &i32 = &v0;
-// CHECK-NEXT:    let v2: &mut i32 = &mut v0;
+// CHECK-NEXT:    let _v1: &i32 = &v0;
+// CHECK-NEXT:    let _v2: &mut i32 = &mut v0;
 // CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @borrows() {
