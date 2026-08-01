@@ -2,7 +2,7 @@
 // RUN: not emitrust-import-c %t/star-width.c 2>&1 | FileCheck %s --check-prefix=STARW
 // RUN: not emitrust-import-c %t/star-precision.c 2>&1 | FileCheck %s --check-prefix=STARP
 // RUN: not emitrust-import-c %t/long-double.c 2>&1 | FileCheck %s --check-prefix=LONGDOUBLE
-// RUN: not emitrust-import-c %t/size-t-length.c 2>&1 | FileCheck %s --check-prefix=SIZET
+// RUN: not emitrust-import-c %t/size-on-float.c 2>&1 | FileCheck %s --check-prefix=SIZEFLOAT
 // RUN: not emitrust-import-c %t/pointer.c 2>&1 | FileCheck %s --check-prefix=POINTER
 // RUN: not emitrust-import-c %t/count.c 2>&1 | FileCheck %s --check-prefix=COUNT
 // RUN: not emitrust-import-c %t/hex-float.c 2>&1 | FileCheck %s --check-prefix=HEXFLOAT
@@ -51,14 +51,17 @@ int main(void) {
 }
 // LONGDOUBLE: long-double.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: length modifier 'L' on printf '%d'
 
-// The 'z' (size_t) length modifier stays rejected (as do 'j' and 't').
-//--- size-t-length.c
+// The 'z'/'j'/'t' (size_t/intmax_t/ptrdiff_t) integer-conversion lengths are
+// now supported on the integer conversions (see printf.c), but on a floating
+// conversion they are undefined (C99 7.19.6.1p7) and stay a located rejection.
+//--- size-on-float.c
 int printf(const char *fmt, ...);
 int main(void) {
-  printf("%zu\n", sizeof(int));
+  double d = 1.5;
+  printf("%zf\n", d);
   return 0;
 }
-// SIZET: size-t-length.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported printf length modifier 'z'
+// SIZEFLOAT: size-on-float.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: length modifier 'z'/'j'/'t' on printf '%f'
 
 // %p stays rejected by design: pointer provenance is compiled away by the
 // pointer decomposition, so no address exists to print.

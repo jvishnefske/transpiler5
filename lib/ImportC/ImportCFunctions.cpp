@@ -1110,7 +1110,11 @@ LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
   }
   if (const auto *enumDecl = llvm::dyn_cast<clang::EnumDecl>(decl))
     return importEnum(enumDecl, translateLoc(enumDecl->getBeginLoc()));
-  if (llvm::isa<clang::TypedefDecl>(decl) || llvm::isa<clang::EmptyDecl>(decl))
+  // A `_Static_assert`/`static_assert` is a compile-time-only check the C/C++
+  // frontend already evaluated; it produces no runtime code and is discarded,
+  // like a typedef or an empty declaration.
+  if (llvm::isa<clang::TypedefDecl>(decl) || llvm::isa<clang::EmptyDecl>(decl) ||
+      llvm::isa<clang::StaticAssertDecl>(decl))
     return success();
   if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
     return importGlobalVar(var);
@@ -1486,6 +1490,36 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "        dest[i] = b as i8;\n"
             "    }\n"
             "    dest[bytes.len()] = 0;\n"
+            "    bytes.len() as i32\n"
+            "}"));
+  }
+  if (needsSnprintfHelper && !snprintfHelperEmitted) {
+    snprintfHelperEmitted = true;
+    // C-compatible snprintf tail: writes at most `size - 1` formatted ASCII
+    // bytes plus a terminating NUL into the destination char region (C's
+    // DEFINED truncation, unlike sprintf's overflow), and returns the full
+    // formatted length excluding the NUL — the value C's snprintf returns
+    // regardless of truncation. `size == 0` writes nothing. Every write is a
+    // bounds-checked slice index, so a `size` larger than the destination
+    // region (a genuine C buffer overflow, undefined) panics rather than
+    // writing out of bounds. Emitted once per module, after all imported
+    // items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_snprintf(dest: &mut [i8], size: i64, s: &str) -> "
+            "i32 {\n"
+            "    let bytes = s.as_bytes();\n"
+            "    if size > 0 {\n"
+            "        let cap = (size as usize) - 1;\n"
+            "        let n = if bytes.len() < cap { bytes.len() } else { cap "
+            "};\n"
+            "        for i in 0..n {\n"
+            "            dest[i] = bytes[i] as i8;\n"
+            "        }\n"
+            "        dest[n] = 0;\n"
+            "    }\n"
             "    bytes.len() as i32\n"
             "}"));
   }

@@ -432,8 +432,10 @@ LogicalResult StructDefOp::verify() {
 
 /// Verifies that the variant name and value arrays have the same non-zero
 /// length, that variant names are non-empty and unique, that variant
-/// values are unique and within the i32 range, and that an enum with the
-/// `unsigned_underlying` marker (u32 storage) has no negative value.
+/// values are within the i32 range, and that an enum with the
+/// `unsigned_underlying` marker (u32 storage) has no negative value. Variant
+/// VALUES need not be distinct: a C `enum { A = 1, B = 1 }` lowers to two
+/// associated consts of equal value, which is valid Rust.
 LogicalResult EnumDefOp::verify() {
   ArrayAttr names = getVariantNames();
   ArrayRef<int64_t> values = getVariantValues();
@@ -445,15 +447,12 @@ LogicalResult EnumDefOp::verify() {
     return emitOpError("must have at least one variant");
 
   llvm::StringSet<> seenNames;
-  llvm::DenseSet<int64_t> seenValues;
   for (auto [nameAttr, value] : llvm::zip_equal(names, values)) {
     StringRef name = cast<StringAttr>(nameAttr).getValue();
     if (name.empty())
       return emitOpError("variant names must not be empty");
     if (!seenNames.insert(name).second)
       return emitOpError("duplicate variant name \"") << name << "\"";
-    if (!seenValues.insert(value).second)
-      return emitOpError("duplicate variant value ") << value;
     if (!llvm::isInt<32>(value))
       return emitOpError("variant value ")
              << value << " is out of the i32 range";
