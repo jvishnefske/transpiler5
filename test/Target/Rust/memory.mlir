@@ -85,8 +85,8 @@ emitrust.func @indexing(%arg0: i32, %arg1: index, %arg2: i32) -> i32 {
 }
 
 // CHECK-LABEL: fn through_ref(v0: &mut i32, v1: i32) -> i32 {
-// CHECK-NEXT:    (*v0) = v1;
-// CHECK-NEXT:    let v2: i32 = (*v0);
+// CHECK-NEXT:    *v0 = v1;
+// CHECK-NEXT:    let v2: i32 = *v0;
 // CHECK-NEXT:    return v2;
 // CHECK-NEXT:  }
 emitrust.func @through_ref(%arg0: !emitrust.mut_ref<i32>, %arg1: i32) -> i32 {
