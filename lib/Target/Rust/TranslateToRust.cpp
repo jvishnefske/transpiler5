@@ -343,12 +343,22 @@ private:
     bool diverges = false;     ///< all paths diverge (no fall-through)
     bool hasLoopWrite = false; ///< the binding is assigned inside a loop
     unsigned maxWrites = 0;    ///< max whole-binding writes on any single path
+    bool loopReassign = false; ///< the binding is reassigned across iterations
+  };
+
+  /// Tracks, across a loop body, whether every `break` that exits the loop
+  /// has written the binding on its path.
+  struct BreakInfo {
+    bool sawBreak = false;
+    bool allWritten = true;
   };
 
   bool isBindingWrite(Operation *op, Value binding);
   bool isBindingUser(Operation *op, Value binding);
-  Liveness analyzeSeq(Block::iterator begin, Block::iterator end, Value binding);
-  Liveness analyzeControl(Operation *op, Value binding);
+  Liveness analyzeSeq(Block::iterator begin, Block::iterator end, Value binding,
+                      bool enteringWritten, BreakInfo *brk);
+  Liveness analyzeControl(Operation *op, Value binding, bool enteringWritten,
+                          BreakInfo *brk);
   /// Decides, for each candidate binding in the function, whether its init is a
   /// dead store; fills `droppedInitOps` / `deferredNeedsMut`.
   void computeDeferredInits(Block &block);
@@ -496,19 +506,26 @@ bool RustEmitter::isBindingUser(Operation *op, Value binding) {
   return false;
 }
 
-RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding) {
+RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
+                                                  bool enteringWritten,
+                                                  BreakInfo *brk) {
   Liveness r;
-  auto seq = [&](Region &region) {
-    return region.empty()
-               ? Liveness{}
-               : analyzeSeq(region.front().begin(), region.front().end(),
-                            binding);
-  };
   if (auto ifOp = dyn_cast<emitrust::IfOp>(op)) {
-    Liveness thenL = seq(ifOp.getThenRegion());
-    Liveness elseL = seq(ifOp.getElseRegion());
+    auto arm = [&](Region &region) {
+      return region.empty()
+                 ? Liveness{}
+                 : analyzeSeq(region.front().begin(), region.front().end(),
+                              binding, enteringWritten, brk);
+    };
+    Liveness thenL = arm(ifOp.getThenRegion());
+    // An if with no else falls through with only the entering write-state.
+    Liveness elseL = ifOp.getElseRegion().empty()
+                         ? Liveness{/*readFirst=*/false,
+                                    /*writtenAtExit=*/enteringWritten}
+                         : arm(ifOp.getElseRegion());
     r.readFirst = thenL.readFirst || elseL.readFirst;
     r.hasLoopWrite = thenL.hasLoopWrite || elseL.hasLoopWrite;
+    r.loopReassign = thenL.loopReassign || elseL.loopReassign;
     bool thenW = thenL.diverges || thenL.writtenAtExit;
     bool elseW = elseL.diverges || elseL.writtenAtExit;
     r.writtenAtExit = thenW && elseW;
@@ -517,20 +534,46 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding) 
     return r;
   }
   if (isa<emitrust::ForOp, emitrust::LoopOp>(op)) {
-    Liveness body = seq(op->getRegion(0));
-    // The body may run zero times (for/while) or the loop may break, so a
-    // write inside it never guarantees the binding is set afterwards; a read
-    // inside it happens on iteration one with the binding still unwritten.
-    r.readFirst = body.readFirst;
-    r.hasLoopWrite = body.hasLoopWrite || body.maxWrites > 0;
+    Region &body = op->getRegion(0);
+    BreakInfo bodyBreaks;
+    Liveness bodyL =
+        body.empty()
+            ? Liveness{}
+            : analyzeSeq(body.front().begin(), body.front().end(), binding,
+                         enteringWritten, &bodyBreaks);
+    r.readFirst = bodyL.readFirst;
+    r.hasLoopWrite = bodyL.hasLoopWrite || bodyL.maxWrites > 0;
+    // `mut` is needed only when a write can recur: it does when a body path
+    // that writes the binding loops back (falls through with it written),
+    // but not when every write is immediately followed by a `break`.
+    r.loopReassign =
+        bodyL.loopReassign || (r.hasLoopWrite && bodyL.writtenAtExit);
+    r.maxWrites = bodyL.maxWrites;
+    if (isa<emitrust::LoopOp>(op)) {
+      // An `emitrust.loop` is a bare `loop {}`; it exits only through a
+      // `break`, so the binding is written at exit exactly when every break
+      // wrote it first. With no break it never exits (diverges).
+      r.writtenAtExit = bodyBreaks.sawBreak && bodyBreaks.allWritten;
+      r.diverges = !bodyBreaks.sawBreak;
+    }
+    // A `for` may exhaust its range and fall through with the binding still
+    // unwritten, so it never guarantees a write at exit.
     return r;
   }
   if (auto sw = dyn_cast<emitrust::SwitchOp>(op)) {
+    auto seq = [&](Region &region) {
+      return region.empty()
+                 ? Liveness{/*readFirst=*/false,
+                            /*writtenAtExit=*/enteringWritten}
+                 : analyzeSeq(region.front().begin(), region.front().end(),
+                              binding, enteringWritten, brk);
+    };
     Liveness d = seq(sw.getDefaultRegion());
     bool anyRead = d.readFirst;
     bool allWritten = d.diverges || d.writtenAtExit;
     bool allDiverge = d.diverges;
     bool loopWrite = d.hasLoopWrite;
+    bool loopReassign = d.loopReassign;
     unsigned maxWrites = d.maxWrites;
     for (Region &caseRegion : sw.getCaseRegions()) {
       Liveness ci = seq(caseRegion);
@@ -538,35 +581,59 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding) 
       allWritten = allWritten && (ci.diverges || ci.writtenAtExit);
       allDiverge = allDiverge && ci.diverges;
       loopWrite |= ci.hasLoopWrite;
+      loopReassign |= ci.loopReassign;
       maxWrites = std::max(maxWrites, ci.maxWrites);
     }
     r.readFirst = anyRead;
     r.writtenAtExit = allWritten; // the `_` arm covers every unmatched value
     r.diverges = allDiverge;
     r.hasLoopWrite = loopWrite;
+    r.loopReassign = loopReassign;
     r.maxWrites = maxWrites;
     return r;
   }
   // Any other region-carrying op: conservatively assume its regions may read
   // the binding and never guarantee a write.
-  for (Region &region : op->getRegions()) {
-    Liveness sub = seq(region);
-    r.readFirst |= sub.readFirst;
-    r.hasLoopWrite |= sub.hasLoopWrite || sub.maxWrites > 0;
-  }
+  for (Region &region : op->getRegions())
+    if (!region.empty()) {
+      Liveness sub = analyzeSeq(region.front().begin(), region.front().end(),
+                                binding, enteringWritten, brk);
+      r.readFirst |= sub.readFirst;
+      r.hasLoopWrite |= sub.hasLoopWrite || sub.maxWrites > 0;
+      r.loopReassign |= sub.loopReassign;
+    }
   return r;
 }
 
 RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
-                                              Block::iterator end,
-                                              Value binding) {
+                                              Block::iterator end, Value binding,
+                                              bool enteringWritten,
+                                              BreakInfo *brk) {
   Liveness r;
-  bool written = false;   // binding written on the current straight-line path
-  unsigned writes = 0;    // whole-binding writes on the current path
+  bool written = enteringWritten; // binding written on the current path
+  unsigned writes = 0;            // whole-binding writes on the current path
   for (auto it = begin; it != end; ++it) {
     Operation *op = &*it;
     if (unreachableOps.count(op))
       continue;
+    // A `break` exits the enclosing loop: record whether the binding is
+    // written on this path, then end the path.
+    if (isa<emitrust::BreakOp>(op)) {
+      if (brk) {
+        brk->sawBreak = true;
+        brk->allWritten = brk->allWritten && written;
+      }
+      r.diverges = true;
+      r.maxWrites = std::max(r.maxWrites, writes);
+      return r;
+    }
+    // A `continue` returns to the loop head; this straight-line path ends
+    // without exiting the loop.
+    if (isa<emitrust::ContinueOp>(op)) {
+      r.diverges = true;
+      r.maxWrites = std::max(r.maxWrites, writes);
+      return r;
+    }
     if (isBindingWrite(op, binding)) {
       written = true;
       ++writes;
@@ -576,10 +643,11 @@ RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
     if (isBindingUser(op, binding) && !written)
       r.readFirst = true;
     if (op->getNumRegions() > 0) {
-      Liveness sub = analyzeControl(op, binding);
+      Liveness sub = analyzeControl(op, binding, written, brk);
       if (sub.readFirst && !written)
         r.readFirst = true;
       r.hasLoopWrite |= sub.hasLoopWrite;
+      r.loopReassign |= sub.loopReassign;
       writes += sub.maxWrites;
       if (!written && sub.writtenAtExit)
         written = true;
@@ -608,21 +676,20 @@ void RustEmitter::computeDeferredInits(Block &block) {
       binding = letOp.getResult();
     } else if (auto variableOp = dyn_cast<emitrust::VariableOp>(op)) {
       // Only a synthesized default (no explicit initializer attribute) is a
-      // candidate, and only when the local is accessed purely as a whole
-      // scalar: any projection/address-of use would make deferred
-      // initialization (`let v: T;`) reject in Rust.
+      // candidate, and only for a scalar value type: an aggregate initialized
+      // field-by-field cannot use deferred initialization (Rust forbids
+      // assigning through a partially initialized binding, E0381). A scalar has
+      // no projections, so a borrow simply becomes another use that the
+      // definite-assignment analysis requires to follow the first write.
       if (variableOp.getInitAttr())
         return;
+      Type valueType =
+          cast<emitrust::LValueType>(variableOp.getResult().getType())
+              .getValueType();
+      if (!isa<IntegerType, FloatType, IndexType, emitrust::FnPtrType>(
+              valueType))
+        return;
       binding = variableOp.getResult();
-      for (Operation *user : binding.getUsers()) {
-        if (unreachableOps.count(user))
-          continue;
-        if (isa<emitrust::LoadOp>(user))
-          continue;
-        if (isBindingWrite(user, binding))
-          continue;
-        return; // projection, address-of, or other use: not a candidate
-      }
     } else {
       return;
     }
@@ -637,14 +704,25 @@ void RustEmitter::computeDeferredInits(Block &block) {
     }
     if (!isRead)
       return;
-    Liveness info = analyzeSeq(std::next(op->getIterator()),
-                               op->getBlock()->end(), binding);
+    Liveness info =
+        analyzeSeq(std::next(op->getIterator()), op->getBlock()->end(), binding,
+                   /*enteringWritten=*/false, /*brk=*/nullptr);
     if (info.readFirst)
       return; // the initializer is live: some path reads before writing
     droppedInitOps.insert(op);
-    // `mut` is needed when a path assigns more than once, or the binding is
-    // assigned inside a loop (a potential re-assignment across iterations).
-    deferredNeedsMut[op] = info.maxWrites >= 2 || info.hasLoopWrite;
+    // `mut` is needed when a path assigns more than once, when the binding is
+    // reassigned across loop iterations, or when it is mutably borrowed after
+    // its (single) initializing assignment.
+    bool mutBorrow = false;
+    for (Operation *user : binding.getUsers()) {
+      if (unreachableOps.count(user))
+        continue;
+      if (auto addrOf = dyn_cast<emitrust::AddrOfOp>(user))
+        mutBorrow |= addrOf.getIsMut();
+      if (auto sliceOf = dyn_cast<emitrust::SliceOfOp>(user))
+        mutBorrow |= sliceOf.getIsMut();
+    }
+    deferredNeedsMut[op] = info.maxWrites >= 2 || info.loopReassign || mutBorrow;
   });
 }
 
