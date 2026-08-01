@@ -4547,9 +4547,74 @@ group only -- mbedTLS is 36.1% and tiny-AES-c 50.0% by function. None of the
 qualitative findings change; the numbers do, and the wrong ones were
 reported before this note.
 
-**What this implies for priorities.** C99-43 (pointer struct members and
-pointer-to-pointer) is worth more than every other open item combined, by
-roughly an order of magnitude. Nothing else in the ranked table is close.
+**PREMISE REFUTED (C99-43 spike, 2026-07-31).** The conclusion above --
+"73% of rejections reduce to a pointer stored in a struct field or global,
+therefore C99-43" -- was derived from the blocker TAG
+(`rejected-type-cascade`) without checking what the cascade roots actually
+were. A spike measured them, and **a pointer stored in a struct field is
+ALREADY SUPPORTED**: `mapStructFieldType` maps every single-level
+non-function pointer field -- including `void *`, `char *` and `T **` -- to a
+plain `i64` cursor and never fails. Verified directly: `struct A { struct A
+*next; }`, `{ void *payload; }`, `{ char *name; }`, `{ int **pp; }` and
+`{ void (*cb)(int); }` all import cleanly today.
+
+What rejects is a pointer type in a **composite type position**, all four
+shapes funnelling into one residual in `mapType`. Over 80 deduped root record
+rejections:
+
+| root cause | records | share |
+|--|--:|--:|
+| fn-ptr field whose signature names a pointer | 47 | 58.8% |
+| union with a pointer arm | 9 | 11.2% |
+| union arm cannot alias the storage slot (**not a pointer problem**) | 8 | 10.0% |
+| array-of-pointer field | 7 | 8.8% |
+| other (volatile, fn-ptr pointer result, nested) | 9 | 11.2% |
+
+And the survey's #1 root is not a pointer problem at all: **`netif` fails on
+`ip_addr`'s `union { ip6_addr_t; ip4_addr_t; }`** -- the C99-44 one-slot
+union model. `netif` + `ip_addr` alone are 258 cascade-blocked items, 27.5%
+of all cascade damage in the corpus, from one union of two small structs.
+
+**The ownership census is the decisive table.** Of the 661 pointer fields the
+importer ALREADY accepts: 48.5% store a pointer received from a caller (a
+borrow needing a lifetime), 19.8% are never written, 17.7% copy another
+pointer, and only **6.4%** are the allocation-or-array-element shapes that
+index handles and arenas address. FR-37/38/39 -- the direction this project
+has been extending -- covers 6.4% of real pointer fields. Lifetimes would
+cover the 48.5%, and would break the `Copy + Default` struct invariant the
+whole dialect rests on.
+
+**Recommendation: CASCADE CONTAINMENT, not pointer translation.** Emit a
+rejected composite-position field as a placeholder (and array-of-pointer as
+`[i64; N]`, which is the cursor convention already used for scalar pointer
+fields), keeping the record importable, and reject at the ACCESS site. This
+translates no new pointers. Measured over the 212 TUs reporting in both
+configurations: records dropped 117 -> 5 (-96%), cascade-blocked items
+705 -> 29 (-96%), items ported +18.9%, **functions ported 8.3% -> 11.7%
+(+37.7%)**. The precedent is already in the tree (`unionByteArrayArms`, the
+FAM field omission): a type-level concession with rejection deferred to use.
+
+Three findings that must travel with it:
+ - **43 TUs stop emitting a crate**, because containment makes previously
+   cascaded structs import and thereby makes PRE-EXISTING non-recoverable
+   failures reachable -- 39 are `extern global variable not defined in any
+   translation unit`, 2 the FR-42 recovery non-termination, 2 legalization.
+   Stage 1 must not ship without fixing those first.
+ - **The union placeholder is NOT ready**: it silently emitted invalid Rust
+   with no diagnostic in its first cut, and even guarded it breaks 42 crates
+   with `E0609` while buying 16 items. Rejected.
+ - **FR-41's doctrine becomes false.** `ItemColoring.h`'s claim that "a
+   missing TYPE cannot be replaced… so type-poisoning is transitive" is
+   exactly what containment refutes. The colouring and FR-49's root
+   attribution would model a cascade that no longer happens. This is also
+   Contribution 1 of the accompanying paper, and needs qualifying there.
+
+**Revised priority.** Not C99-43. In order: cascade containment (Stage 1,
+gated on the enabling fixes), then fn-ptr components through the parameter
+mapper (Stage 2, which turns 47 of 80 roots into working callbacks), then the
+UNION model (Stage 3 -- 30.7% of the cascade and the real `netif` blocker,
+and a C99-44 question, not a pointer one). Index handles and lifetimes: never,
+on the measured 6.4% and the invariant break respectively.
 
 **Track 5 re-measured after FR-53/54/55 (same pinned SHAs, same compile
 databases, same harness).** The three defects the first run exposed were
