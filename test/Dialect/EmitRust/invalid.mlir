@@ -262,11 +262,6 @@ emitrust.enum_def @DupName ["Red", "Red"] [0, 1]
 
 // -----
 
-// expected-error @+1 {{duplicate variant value 0}}
-emitrust.enum_def @DupValue ["Red", "Green"] [0, 0]
-
-// -----
-
 // expected-error @+1 {{must have at least one variant}}
 emitrust.enum_def @Empty [] []
 

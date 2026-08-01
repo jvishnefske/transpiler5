@@ -825,17 +825,12 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
 
   SmallVector<llvm::StringRef> variantNames;
   SmallVector<int64_t> variantValues;
-  llvm::SmallDenseSet<int64_t> seenValues;
-  // The loop body below is unchanged from ImportC.cpp; compiling it in its
-  // own translation unit changes GCC's inlining of
-  // llvm::SmallDenseSet<int64_t>::insert enough to trip a known false
-  // positive (the growth path's "may be used uninitialized" analysis of
-  // SmallDenseMap's inline-vs-large-rep storage, not a real use of
-  // uninitialized memory: `seenValues` is default-constructed empty above).
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-#endif
+  // Enumerator NAMES must stay unique (they become the tuple-struct's
+  // associated const names), which C already guarantees within one enum; the
+  // dialect verifier enforces it. VALUES need not be distinct: two C
+  // enumerators sharing a value (`enum { A = 1, B = 1 }`) lower to two
+  // associated consts of equal value (`const A: E = E(1); const B: E =
+  // E(1);`), which is valid Rust and preserves `A == B`.
   for (const clang::EnumConstantDecl *enumerator : definition->enumerators()) {
     Location enumeratorLoc = translateLoc(enumerator->getLocation());
     llvm::StringRef name = enumerator->getName();
@@ -850,15 +845,9 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
     if (value < INT32_MIN || value > INT32_MAX)
       return emitError(enumeratorLoc)
              << "unsupported: enumerator value does not fit in i32";
-    if (!seenValues.insert(value).second)
-      return emitError(enumeratorLoc)
-             << "unsupported: duplicate enumerator value";
     variantNames.push_back(name);
     variantValues.push_back(value);
   }
-#if defined(__GNUC__) && !defined(__clang__)
-#pragma GCC diagnostic pop
-#endif
   if (variantNames.empty())
     return emitError(defLoc) << "unsupported: enum with no enumerators";
 

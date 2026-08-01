@@ -3250,7 +3250,7 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       // A '.' with no digits is precision zero (C99 7.19.6.1p4).
       precision = precisionDigits.empty() ? 0 : std::stoi(precisionDigits);
     }
-    enum class Length { None, Long, LongLong, Short, Char, LongDouble };
+    enum class Length { None, Long, LongLong, Short, Char, LongDouble, Size };
     Length lengthMod = Length::None;
     if (i < n && format[i] == 'l') {
       lengthMod = Length::Long;
@@ -3275,8 +3275,13 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       ++i;
     } else if (i < n && (format[i] == 'j' || format[i] == 'z' ||
                          format[i] == 't')) {
-      return emitError(loc) << "unsupported printf length modifier '"
-                            << llvm::Twine(std::string(1, format[i])) << "'";
+      // size_t/intmax_t/ptrdiff_t (and their unsigned twins) are all 64-bit
+      // on the LP64 x86-64 target the differential oracle uses, so `z`/`j`/`t`
+      // behave exactly like `l`/`ll` on the integer conversions. Valid only
+      // on the integer conversions; a float or c/s conversion is caught by
+      // the length-validity checks below.
+      lengthMod = Length::Size;
+      ++i;
     }
     if (i >= n)
       return emitError(loc) << "unsupported: trailing '%' in printf format";
@@ -3327,6 +3332,12 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       return emitError(loc)
              << "unsupported: length modifier 'll' on printf '%" << specName
              << "'";
+    // z/j/t are integer-conversion lengths; on a floating conversion they are
+    // undefined (C99 7.19.6.1p7) and stay a located rejection.
+    if (lengthMod == Length::Size && isFloatConv)
+      return emitError(loc)
+             << "unsupported: length modifier 'z'/'j'/'t' on printf '%"
+             << specName << "'";
     if (lengthMod != Length::None && (spec == 'c' || spec == 's'))
       return emitError(loc) << "unsupported: length modifier on printf '%"
                             << specName << "'";
@@ -3335,8 +3346,8 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
              << "unsupported: '0' flag on printf '%" << specName << "'";
     if (precision >= 0 && spec == 'c')
       return emitError(loc) << "unsupported: precision on printf '%c'";
-    bool isLong =
-        lengthMod == Length::Long || lengthMod == Length::LongLong;
+    bool isLong = lengthMod == Length::Long ||
+                  lengthMod == Length::LongLong || lengthMod == Length::Size;
     // Renders the Rust format placeholder for a numeric directive: the C
     // width maps 1:1 ("%5d" -> "{:5}"), '-' to left alignment ("%-5d" ->
     // "{:<5}"), '0' to Rust's sign-aware zero pad ("%05d" -> "{:05}"),
@@ -3556,16 +3567,34 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
   return rustFormat;
 }
 
-FailureOr<Value> CImporter::emitSprintf(const clang::CallExpr *call) {
+FailureOr<Value> CImporter::emitSprintf(const clang::CallExpr *call,
+                                        bool isSnprintf) {
   Location loc = translateLoc(call->getBeginLoc());
-  if (call->getNumArgs() < 2)
-    return emitError(loc) << "unsupported: sprintf requires a destination "
-                             "and a format string";
-  const clang::Expr *formatExpr = call->getArg(1)->IgnoreParenImpCasts();
+  // `snprintf(dest, size, fmt, ...)` carries a size bound at argument 1 that
+  // shifts the format literal and the variadic arguments one position past
+  // `sprintf(dest, fmt, ...)`.
+  const char *name = isSnprintf ? "snprintf" : "sprintf";
+  unsigned formatArgIndex = isSnprintf ? 2 : 1;
+  unsigned minArgs = isSnprintf ? 3 : 2;
+  if (call->getNumArgs() < minArgs)
+    return emitError(loc) << "unsupported: " << name
+                          << " requires a destination and a format string";
+  const clang::Expr *formatExpr =
+      call->getArg(formatArgIndex)->IgnoreParenImpCasts();
   const auto *literal = llvm::dyn_cast<clang::StringLiteral>(formatExpr);
   if (!literal || !literal->isOrdinary())
-    return emitError(loc)
-           << "unsupported: sprintf format must be an ordinary string literal";
+    return emitError(loc) << "unsupported: " << name
+                          << " format must be an ordinary string literal";
+  // snprintf's size bound (argument 1), widened to i64 for the helper. It is
+  // materialized BEFORE the destination's mutable borrow, so no load
+  // intervenes between that borrow and the helper call.
+  Value sizeValue;
+  if (isSnprintf) {
+    FailureOr<Value> size = emitRValue(call->getArg(1));
+    if (failed(size))
+      return failure();
+    sizeValue = castToIntType(loc, *size, builder.getIntegerType(64));
+  }
   FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
   if (failed(dst))
     return failure();
@@ -3576,7 +3605,7 @@ FailureOr<Value> CImporter::emitSprintf(const clang::CallExpr *call) {
   // consuming it.
   SmallVector<Value> operands;
   FailureOr<std::string> rustFormat = translatePrintfFormat(
-      loc, call, literal, /*firstArgIndex=*/2, operands);
+      loc, call, literal, /*firstArgIndex=*/formatArgIndex + 1, operands);
   if (failed(rustFormat))
     return failure();
   SmallVector<Attribute> callArguments;
@@ -3613,6 +3642,15 @@ FailureOr<Value> CImporter::emitSprintf(const clang::CallExpr *call) {
   FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true);
   if (failed(dstSlice))
     return failure();
+  if (isSnprintf) {
+    needsSnprintfHelper = true;
+    return builder
+        .create<emitrust::CallOpaqueOp>(
+            loc, TypeRange{builder.getI32Type()},
+            builder.getStringAttr("__emitrust_snprintf"),
+            /*args=*/ArrayAttr(), ValueRange{*dstSlice, sizeValue, textRef})
+        .getResult(0);
+  }
   needsSprintfHelper = true;
   return builder
       .create<emitrust::CallOpaqueOp>(

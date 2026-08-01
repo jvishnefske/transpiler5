@@ -3582,7 +3582,14 @@ private:
   /// is C's sprintf return value. A destination too small for the bytes
   /// plus the NUL terminator panics in the helper (C leaves the overflow
   /// undefined; the deterministic panic is a legal refinement).
-  FailureOr<Value> emitSprintf(const clang::CallExpr *call);
+  /// When `isSnprintf` is true the call is `snprintf(dest, size, fmt, ...)`:
+  /// the size bound shifts the format literal and variadic arguments by one
+  /// and routes to the truncating `__emitrust_snprintf` helper, which writes
+  /// at most `size - 1` bytes plus a NUL (C's defined truncation, not the
+  /// overflow panic sprintf uses) and still returns the full formatted
+  /// length. `false` is the plain `sprintf(dest, fmt, ...)`.
+  FailureOr<Value> emitSprintf(const clang::CallExpr *call,
+                               bool isSnprintf = false);
 
   /// Escapes `data` (raw decoded string-literal bytes: printable ASCII plus
   /// \n/\t/\r only; embedded NUL and any other non-ASCII byte are located
@@ -4860,6 +4867,14 @@ private:
   /// True once the `__emitrust_sprintf` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool sprintfHelperEmitted = false;
+  /// True once a definition-less `snprintf` call has been imported; triggers
+  /// the one-per-module emission of the `__emitrust_snprintf` helper that
+  /// writes at most `size - 1` formatted bytes plus a NUL into the
+  /// destination slice (C's defined truncation) and returns the full length.
+  bool needsSnprintfHelper = false;
+  /// True once the `__emitrust_snprintf` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool snprintfHelperEmitted = false;
   /// True once a definition-less `strlen` call has been imported; triggers
   /// the one-per-module emission of the `__emitrust_strlen` helper that
   /// counts bytes up to the first NUL, matching C's strlen.

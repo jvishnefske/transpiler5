@@ -1838,6 +1838,10 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     // emitCall fallthrough and simply discard the value.
     if (name == "sprintf")
       return emitSprintf(call);
+    // snprintf(dest, size, fmt, ...) shares the sprintf lowering but honors
+    // the size bound via the truncating `__emitrust_snprintf` helper.
+    if (name == "snprintf")
+      return emitSprintf(call, /*isSnprintf=*/true);
     if (name == "strcmp")
       return emitStringCompareCall(call, "strcmp", /*hasCount=*/false);
     if (name == "strncmp")
