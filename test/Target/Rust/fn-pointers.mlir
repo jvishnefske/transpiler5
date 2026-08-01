@@ -30,12 +30,11 @@ emitrust.func @calls(%arg0: !emitrust.fn_ptr<(i32, i32) -> i32>,
 
 // CHECK:      fn defaults() {
 emitrust.func @defaults() {
-  // CHECK-NEXT:    let mut _v0: Option<fn(i32) -> i32> = None;
+  // CHECK-NEXT:    let _v0: Option<fn(i32) -> i32> = None;
   %0 = emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
   // CHECK-NEXT:    let v1: Option<fn(i32) -> i32> = Some(add);
   %1 = emitrust.constant <#emitrust.opaque<"Some(add)">>
       : !emitrust.fn_ptr<(i32) -> i32>
-  // CHECK-NEXT:    _v0 = v1;
   emitrust.assign %0 = %1 : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
   // CHECK-NEXT:    let _v2: Option<fn(i32) -> i32> = None;
   %2 = emitrust.constant <#emitrust.opaque<"None">>

@@ -18,9 +18,8 @@ emitrust.struct_def @Empty [] []
 
 // CHECK-LABEL: fn empty_struct_value() {
 // CHECK-NEXT:    let v0: Empty = Empty::default();
-// CHECK-NEXT:    let v1: Empty = v0;
-// CHECK-NEXT:    let mut _v2: Empty = Empty::default();
-// CHECK-NEXT:    _v2 = v1;
+// CHECK-NEXT:    let _v1: Empty = v0;
+// CHECK-NEXT:    let _v2: Empty = Empty::default();
 // CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @empty_struct_value() {
