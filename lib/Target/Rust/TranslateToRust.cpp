@@ -37,6 +37,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -354,14 +355,28 @@ private:
   };
 
   bool isBindingWrite(Operation *op, Value binding);
-  bool isBindingUser(Operation *op, Value binding);
+  /// `partialWriteBlocks` selects how a projection use of the binding
+  /// (`v.x`, `v[i]`) that precedes the first whole write is treated: `true`
+  /// (deferral) counts it as a read, since Rust rejects a partial write to an
+  /// uninitialized binding (E0381); `false` (dead-store liveness) counts it as
+  /// a read only when the projected place is itself read, so a pure partial
+  /// write does not keep an earlier store live.
   Liveness analyzeSeq(Block::iterator begin, Block::iterator end, Value binding,
-                      bool enteringWritten, BreakInfo *brk);
+                      bool enteringWritten, BreakInfo *brk,
+                      bool partialWriteBlocks);
   Liveness analyzeControl(Operation *op, Value binding, bool enteringWritten,
-                          BreakInfo *brk);
+                          BreakInfo *brk, bool partialWriteBlocks);
   /// Decides, for each candidate binding in the function, whether its init is a
   /// dead store; fills `droppedInitOps` / `deferredNeedsMut`.
   void computeDeferredInits(Block &block);
+
+  /// Whole-binding `emitrust.assign` stores whose written value is never read
+  /// before the binding is overwritten again -- dead stores that emit nothing.
+  /// Treated as removed by every other phase (liveness, deferral, mut, naming).
+  llvm::SmallPtrSet<Operation *, 16> deadStores;
+
+  /// Populates `deadStores` for the function's entry block.
+  void computeDeadStores(Block &entryBlock);
 
   /// Returns whether `value` is read (as opposed to only written or unused)
   /// somewhere in reachable code -- used to decide `_`-prefixing and dead
@@ -376,6 +391,8 @@ private:
   /// a missed mutation would surface as a hard `cannot assign to immutable`
   /// error at build time, never as silent wrong output.
   bool lvalueIsMutated(Value value);
+  /// Whether `call` takes its receiver by `&mut` (so the receiver needs `mut`).
+  bool methodCallMutatesReceiver(emitrust::MethodCallOp call);
 };
 
 } // namespace
@@ -409,8 +426,9 @@ bool RustEmitter::valueIsRead(Value value) {
 bool RustEmitter::valueIsReadUncached(Value value) {
   for (OpOperand &use : value.getUses()) {
     Operation *owner = use.getOwner();
-    // A use inside unreachable code never executes, so it is not a real read.
-    if (unreachableOps.count(owner))
+    // A use inside unreachable code or a dropped dead store never emits, so it
+    // is not a real read.
+    if (unreachableOps.count(owner) || deadStores.count(owner))
       continue;
     // A `let` whose dead initializer we dropped no longer reads its init
     // operand, so that use does not keep `value` live.
@@ -443,10 +461,54 @@ bool RustEmitter::valueIsReadUncached(Value value) {
   return false;
 }
 
+/// Whether an STL method of the given name takes `&mut self`. The importer
+/// emits a small, closed set of STL method names; the mutating ones are listed
+/// here.
+static bool isMutatingStlMethod(llvm::StringRef name) {
+  static const llvm::StringSet<> mutating = {
+      "push",   "push_str", "pop",       "clear",   "insert",
+      "remove", "truncate", "resize",    "reserve", "append",
+      "extend", "retain",   "sort",      "reverse", "swap",
+      "set",    "drain",    "split_off", "shrink_to_fit"};
+  return mutating.contains(name);
+}
+
+bool RustEmitter::methodCallMutatesReceiver(emitrust::MethodCallOp call) {
+  Type receiverType = call.getReceiver().getType();
+  Type valueType = isa<emitrust::LValueType>(receiverType)
+                       ? cast<emitrust::LValueType>(receiverType).getValueType()
+                       : receiverType;
+  // A recognized STL container: classify by the (closed) method-name set.
+  if (isa<emitrust::OpaqueType>(valueType))
+    return isMutatingStlMethod(call.getMethod());
+  // A user struct method: the receiver is mutable exactly when the method's
+  // `self` parameter is a `&mut` reference.
+  auto structType = dyn_cast<emitrust::StructType>(valueType);
+  if (!structType)
+    return true; // unknown receiver shape: assume it can mutate
+  auto module = call->getParentOfType<ModuleOp>();
+  if (!module)
+    return true;
+  for (auto implOp : module.getOps<emitrust::ImplOp>()) {
+    if (implOp.getStructName() != structType.getName())
+      continue;
+    for (auto funcOp : implOp.getBody().front().getOps<emitrust::FuncOp>()) {
+      if (SymbolTable::getSymbolName(funcOp).getValue() != call.getMethod())
+        continue;
+      if (funcOp->hasAttr(emitrust::kStaticMethodAttrName))
+        return false; // an associated function has no receiver
+      Block &entry = funcOp.getFunctionBody().front();
+      return entry.getNumArguments() > 0 &&
+             isa<emitrust::MutRefType>(entry.getArgument(0).getType());
+    }
+  }
+  return true; // method not found in this module: assume it can mutate
+}
+
 bool RustEmitter::lvalueIsMutated(Value value) {
   for (OpOperand &use : value.getUses()) {
     Operation *owner = use.getOwner();
-    if (unreachableOps.count(owner))
+    if (unreachableOps.count(owner) || deadStores.count(owner))
       continue;
     if (auto assign = dyn_cast<emitrust::AssignOp>(owner)) {
       if (assign.getVar() == value)
@@ -470,9 +532,9 @@ bool RustEmitter::lvalueIsMutated(Value value) {
         return true;
       continue;
     }
-    // A method-call receiver may take `&mut self`; assume it can mutate.
+    // A mutating method call (`&mut self`) mutates its receiver.
     if (auto call = dyn_cast<emitrust::MethodCallOp>(owner))
-      if (call.getReceiver() == value)
+      if (call.getReceiver() == value && methodCallMutatesReceiver(call))
         return true;
   }
   return false;
@@ -499,23 +561,30 @@ bool RustEmitter::isBindingWrite(Operation *op, Value binding) {
   return assign && assign.getVar() == binding;
 }
 
-bool RustEmitter::isBindingUser(Operation *op, Value binding) {
-  for (Value operand : op->getOperands())
-    if (operand == binding)
-      return true;
-  return false;
+/// Follows place-refining projections (`v.x`, `v[i]`, `*p`, `v.0`) back to the
+/// place they ultimately refine, so a use of `v.x` can be recognized as a use
+/// of `v`.
+static Value projectionBase(Value value) {
+  while (Operation *def = value.getDefiningOp()) {
+    if (!isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
+             emitrust::EnumRawOp>(def))
+      break;
+    value = def->getOperand(0); // operand 0 is the refined base
+  }
+  return value;
 }
 
 RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
                                                   bool enteringWritten,
-                                                  BreakInfo *brk) {
+                                                  BreakInfo *brk,
+                                                  bool partialWriteBlocks) {
   Liveness r;
   if (auto ifOp = dyn_cast<emitrust::IfOp>(op)) {
     auto arm = [&](Region &region) {
       return region.empty()
                  ? Liveness{}
                  : analyzeSeq(region.front().begin(), region.front().end(),
-                              binding, enteringWritten, brk);
+                              binding, enteringWritten, brk, partialWriteBlocks);
     };
     Liveness thenL = arm(ifOp.getThenRegion());
     // An if with no else falls through with only the entering write-state.
@@ -540,7 +609,7 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
         body.empty()
             ? Liveness{}
             : analyzeSeq(body.front().begin(), body.front().end(), binding,
-                         enteringWritten, &bodyBreaks);
+                         enteringWritten, &bodyBreaks, partialWriteBlocks);
     r.readFirst = bodyL.readFirst;
     r.hasLoopWrite = bodyL.hasLoopWrite || bodyL.maxWrites > 0;
     // `mut` is needed only when a write can recur: it does when a body path
@@ -566,7 +635,7 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
                  ? Liveness{/*readFirst=*/false,
                             /*writtenAtExit=*/enteringWritten}
                  : analyzeSeq(region.front().begin(), region.front().end(),
-                              binding, enteringWritten, brk);
+                              binding, enteringWritten, brk, partialWriteBlocks);
     };
     Liveness d = seq(sw.getDefaultRegion());
     bool anyRead = d.readFirst;
@@ -597,7 +666,7 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
   for (Region &region : op->getRegions())
     if (!region.empty()) {
       Liveness sub = analyzeSeq(region.front().begin(), region.front().end(),
-                                binding, enteringWritten, brk);
+                                binding, enteringWritten, brk, partialWriteBlocks);
       r.readFirst |= sub.readFirst;
       r.hasLoopWrite |= sub.hasLoopWrite || sub.maxWrites > 0;
       r.loopReassign |= sub.loopReassign;
@@ -608,13 +677,14 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
 RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
                                               Block::iterator end, Value binding,
                                               bool enteringWritten,
-                                              BreakInfo *brk) {
+                                              BreakInfo *brk,
+                                              bool partialWriteBlocks) {
   Liveness r;
   bool written = enteringWritten; // binding written on the current path
   unsigned writes = 0;            // whole-binding writes on the current path
   for (auto it = begin; it != end; ++it) {
     Operation *op = &*it;
-    if (unreachableOps.count(op))
+    if (unreachableOps.count(op) || deadStores.count(op))
       continue;
     // A `break` exits the enclosing loop: record whether the binding is
     // written on this path, then end the path.
@@ -634,16 +704,40 @@ RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
       r.maxWrites = std::max(r.maxWrites, writes);
       return r;
     }
-    if (isBindingWrite(op, binding)) {
-      written = true;
-      ++writes;
+    // Classify an assignment as a whole write, a partial write, and/or a read
+    // of the binding through its value operand.
+    if (auto assign = dyn_cast<emitrust::AssignOp>(op)) {
+      Value target = assign.getVar();
+      if (target == binding) {
+        written = true;
+        ++writes;
+      } else if (projectionBase(target) == binding) {
+        // A partial write (`v.x = ..`). It reads nothing of the binding, but
+        // Rust forbids it before the binding is initialized (E0381), so under
+        // `partialWriteBlocks` it blocks deferral.
+        if (partialWriteBlocks && !written)
+          r.readFirst = true;
+      }
+      if (!written && projectionBase(assign.getValue()) == binding)
+        r.readFirst = true; // the assigned value reads the binding
       continue; // `emitrust.assign` carries no regions
     }
-    // A non-write operand use is a read of the binding.
-    if (isBindingUser(op, binding) && !written)
-      r.readFirst = true;
+    // A place-refining projection emits nothing and is not itself an event; its
+    // read/write is attributed to the load/store/borrow that consumes it. Only
+    // a non-base operand (e.g. an index that is the binding) reads it here.
+    unsigned baseOperands =
+        isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
+            emitrust::EnumRawOp>(op)
+            ? 1
+            : 0;
+    if (!written)
+      for (unsigned i = baseOperands, e = op->getNumOperands(); i < e; ++i)
+        if (projectionBase(op->getOperand(i)) == binding) {
+          r.readFirst = true;
+          break;
+        }
     if (op->getNumRegions() > 0) {
-      Liveness sub = analyzeControl(op, binding, written, brk);
+      Liveness sub = analyzeControl(op, binding, written, brk, partialWriteBlocks);
       if (sub.readFirst && !written)
         r.readFirst = true;
       r.hasLoopWrite |= sub.hasLoopWrite;
@@ -676,18 +770,14 @@ void RustEmitter::computeDeferredInits(Block &block) {
       binding = letOp.getResult();
     } else if (auto variableOp = dyn_cast<emitrust::VariableOp>(op)) {
       // Only a synthesized default (no explicit initializer attribute) is a
-      // candidate, and only for a scalar value type: an aggregate initialized
-      // field-by-field cannot use deferred initialization (Rust forbids
-      // assigning through a partially initialized binding, E0381). A scalar has
-      // no projections, so a borrow simply becomes another use that the
-      // definite-assignment analysis requires to follow the first write.
+      // candidate. The definite-assignment analysis is what keeps deferral
+      // safe: a projection of the binding (a partial write `v.x = ..` or a
+      // read) counts as a use, so if it precedes the first whole write the
+      // binding is `readFirst` and is not deferred (an aggregate filled purely
+      // field-by-field is left to reconstruction). A whole reassignment
+      // (`v = other`) of any type fully initializes the binding, after which
+      // partial writes are fine.
       if (variableOp.getInitAttr())
-        return;
-      Type valueType =
-          cast<emitrust::LValueType>(variableOp.getResult().getType())
-              .getValueType();
-      if (!isa<IntegerType, FloatType, IndexType, emitrust::FnPtrType>(
-              valueType))
         return;
       binding = variableOp.getResult();
     } else {
@@ -706,24 +796,65 @@ void RustEmitter::computeDeferredInits(Block &block) {
       return;
     Liveness info =
         analyzeSeq(std::next(op->getIterator()), op->getBlock()->end(), binding,
-                   /*enteringWritten=*/false, /*brk=*/nullptr);
+                   /*enteringWritten=*/false, /*brk=*/nullptr,
+                   /*partialWriteBlocks=*/true);
     if (info.readFirst)
       return; // the initializer is live: some path reads before writing
     droppedInitOps.insert(op);
     // `mut` is needed when a path assigns more than once, when the binding is
     // reassigned across loop iterations, or when it is mutably borrowed after
     // its (single) initializing assignment.
-    bool mutBorrow = false;
+    bool postInitMutation = false;
     for (Operation *user : binding.getUsers()) {
       if (unreachableOps.count(user))
         continue;
       if (auto addrOf = dyn_cast<emitrust::AddrOfOp>(user))
-        mutBorrow |= addrOf.getIsMut();
+        postInitMutation |= addrOf.getIsMut();
       if (auto sliceOf = dyn_cast<emitrust::SliceOfOp>(user))
-        mutBorrow |= sliceOf.getIsMut();
+        postInitMutation |= sliceOf.getIsMut();
+      if (auto call = dyn_cast<emitrust::MethodCallOp>(user))
+        postInitMutation |=
+            call.getReceiver() == binding && methodCallMutatesReceiver(call);
+      // A partial write (`v.x = ..`, `v[i] = ..`) mutates the binding after
+      // its initializing whole assignment.
+      if (isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
+              emitrust::EnumRawOp>(user))
+        postInitMutation |= lvalueIsMutated(user->getResult(0));
     }
-    deferredNeedsMut[op] = info.maxWrites >= 2 || info.loopReassign || mutBorrow;
+    deferredNeedsMut[op] =
+        info.maxWrites >= 2 || info.loopReassign || postInitMutation;
   });
+}
+
+void RustEmitter::computeDeadStores(Block &entryBlock) {
+  llvm::SmallPtrSet<Operation *, 16> dead;
+  // Only stores in the function's entry block are analyzed: `analyzeSeq` from
+  // just after such a store covers every forward path (nested regions of later
+  // ops are visited), so a store proven dead here is dead on every path. A
+  // store inside a loop needs cross-iteration liveness (a value can survive a
+  // `break` to a read after the loop), which is deliberately not attempted --
+  // a mistaken drop there is a miscompile.
+  for (Operation &op : entryBlock) {
+    auto assign = dyn_cast<emitrust::AssignOp>(&op);
+    if (!assign || unreachableOps.count(&op))
+      continue;
+    // The store targets either a whole binding (`v = ..`, target defined by a
+    // let/variable) or a component of one (`v.x = ..`, target a projection
+    // whose base is a variable). In both cases the store is dead when the
+    // binding's value is not read before the whole binding is overwritten or
+    // the function ends -- a whole overwrite kills every earlier component
+    // store too.
+    Value binding = projectionBase(assign.getVar());
+    Operation *def = binding.getDefiningOp();
+    if (!def || !isa<emitrust::LetOp, emitrust::VariableOp>(def))
+      continue;
+    Liveness after = analyzeSeq(std::next(op.getIterator()), entryBlock.end(),
+                                binding, /*enteringWritten=*/false,
+                                /*brk=*/nullptr, /*partialWriteBlocks=*/false);
+    if (!after.readFirst)
+      dead.insert(&op);
+  }
+  deadStores = std::move(dead);
 }
 
 FailureOr<std::string> RustEmitter::lookupName(Location loc, Value value) {
@@ -1143,6 +1274,7 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   valueReadCache.clear();
   droppedInitOps.clear();
   deferredNeedsMut.clear();
+  deadStores.clear();
 
   Region &body = fn.getFunctionBody();
   if (body.empty())
@@ -1150,6 +1282,7 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   if (!body.hasOneBlock())
     return op->emitOpError("multi-block regions are not supported");
   computeUnreachable(body.front());
+  computeDeadStores(body.front());
   computeDeferredInits(body.front());
   if (fn.getNumResults() > 1)
     return op->emitOpError(
@@ -1386,6 +1519,9 @@ LogicalResult RustEmitter::emitLet(emitrust::LetOp letOp) {
 
 LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
   Operation *op = assignOp.getOperation();
+  // A dead store emits nothing: its written value is never read.
+  if (deadStores.count(op))
+    return success();
   Location loc = op->getLoc();
   Value var = assignOp.getVar();
   if (isa<emitrust::LValueType>(var.getType())) {

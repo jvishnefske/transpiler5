@@ -7,9 +7,8 @@
 emitrust.verbatim "// module-level marker"
 
 // CHECK-LABEL: fn bindings(v0: i32) {
-// CHECK-NEXT:    let v1: i32 = v0;
+// CHECK-NEXT:    let _v1: i32;
 // CHECK-NEXT:    let mut _v2: i32 = v0;
-// CHECK-NEXT:    _v2 = v1;
 // CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @bindings(%arg0: i32) {
