@@ -310,11 +310,16 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
         if (const auto *construct =
                 llvm::dyn_cast<clang::CXXConstructExpr>(unwrapped))
           return emitCXXConstructInit(place, construct, loc);
-        // `struct T x = f();` initializes from the call's struct value
-        // exactly like the assignment form `x = f();` (CTS 00204), and
-        // `struct T x = va_arg(ap, struct T)` from the monomorphized
-        // va_arg dispatch the same way.
-        if (llvm::isa<clang::CallExpr, clang::VAArgExpr>(unwrapped)) {
+        // Any NON-list aggregate initializer reaching this point is a
+        // whole-value copy of an aggregate rvalue, initialized from one
+        // loaded value exactly as the assignment form `x = <expr>;` does:
+        // a call returning a struct/array (`struct T x = f();`, CTS 00204),
+        // a monomorphized `va_arg(ap, struct T)`, or a C copy-initialization
+        // from an existing object (`struct T y = x;`). Compound literals,
+        // string initializers, and C++ constructor calls were peeled off
+        // above; a genuinely unsupported source rejects, located, inside
+        // `emitRValue`.
+        if (!llvm::isa<clang::InitListExpr>(unwrapped)) {
           FailureOr<Value> value = emitRValue(unwrapped);
           if (failed(value))
             return failure();
@@ -324,9 +329,7 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
                       "variable";
           return storeToPlace(loc, place, *value);
         }
-        const auto *list = llvm::dyn_cast<clang::InitListExpr>(unwrapped);
-        if (!list)
-          return emitError(loc) << "unsupported: aggregate initializer";
+        const auto *list = llvm::cast<clang::InitListExpr>(unwrapped);
         return emitAggregateInitList(place, *mlirType, list, var);
       }
       FailureOr<Value> value = emitPositionedRValue(*mlirType, init);
@@ -355,6 +358,16 @@ CImporter::emitCXXConstructInit(Value place,
   const clang::CXXConstructorDecl *ctor = construct->getConstructor();
   if (!ctor || ctor->isCopyOrMoveConstructor())
     return emitError(loc) << "unsupported: copy/move construction";
+  // A default construction (0 args) whose constructor is NOT user-provided —
+  // an implicit or `= default` default ctor made non-trivial only by in-class
+  // member initializers (NSDMIs) — is never imported as a function (the
+  // method walk skips defaulted/implicit members). Apply each member
+  // initializer to `place` directly: `struct D { int x = 5; }; D d;` assigns
+  // d.x = 5. A USER-PROVIDED default ctor (a real body) keeps the imported
+  // constructor-call path below.
+  if (construct->getNumArgs() == 0 && ctor->isDefaultConstructor() &&
+      !ctor->isUserProvided())
+    return emitDefaultConstructInit(place, ctor, loc);
   std::string name = cxxMethodMangledName(ctor);
   func::FuncOp target = functions.lookup(name);
   if (!target)
@@ -384,6 +397,46 @@ CImporter::emitCXXConstructInit(Value place,
 
   auto callOp = builder.create<func::CallOp>(loc, target, arguments);
   callOp->setAttr(emitrust::kMethodCallAttrName, builder.getUnitAttr());
+  return success();
+}
+
+LogicalResult
+CImporter::emitDefaultConstructInit(Value place,
+                                    const clang::CXXConstructorDecl *ctor,
+                                    Location loc) {
+  // Walk the constructor's member initializers in declaration order. An NSDMI
+  // field carries a `CXXDefaultInitExpr` whose value `emitRValue` resolves to
+  // the in-class initializer; a member with no initializer is absent from
+  // this list and keeps `place`'s default (the aggregate-init implicit-zero
+  // tail's counterpart). A member initialized by a non-trivial construction
+  // of its own rejects, located, inside `emitRValue` rather than silently
+  // defaulting to zero.
+  for (const clang::CXXCtorInitializer *init : ctor->inits()) {
+    if (!init->isMemberInitializer())
+      continue;
+    const clang::FieldDecl *field = init->getMember();
+    if (!field || field->getName().empty())
+      return emitError(loc)
+             << "unsupported: default constructor member initializer";
+    Location fieldLoc = translateLoc(init->getSourceLocation());
+    FailureOr<Type> fieldType = mapType(field->getType(), fieldLoc);
+    if (failed(fieldType))
+      return failure();
+    Value fieldPlace =
+        builder
+            .create<emitrust::MemberOp>(
+                fieldLoc, emitrust::LValueType::get(*fieldType), place,
+                builder.getStringAttr(field->getName()))
+            .getResult();
+    FailureOr<Value> value = emitRValue(init->getInit());
+    if (failed(value))
+      return failure();
+    if ((*value).getType() != *fieldType)
+      return emitError(fieldLoc)
+             << "unsupported: default constructor member initializer type";
+    if (failed(storeToPlace(fieldLoc, fieldPlace, *value)))
+      return failure();
+  }
   return success();
 }
 
