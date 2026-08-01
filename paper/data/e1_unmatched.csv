@@ -1,0 +1,16 @@
+corpus,project,symbol,side,kind,predicted_color,actual_status,root_blocker
+cpp-realworld,shapes,area_x100,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,area_x100,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,area_x100,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,perimeter_x100,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,perimeter_x100,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,perimeter_x100,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,tag,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,tag,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,tag,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,~Circle,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,~Rect,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,~RightTriangle,off-graph,,red,dropped,base-class
+cpp-realworld,shapes,~Shape,off-graph,,red,dropped,destructor
+c-realworld,binary-tree,insert,off-graph,,red,dropped,returned-pointer
+c-realworld,expr-eval,p,off-graph,,red,dropped,global-string-cursor

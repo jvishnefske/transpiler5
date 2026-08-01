@@ -1,0 +1,23 @@
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{E2: projects yielding a \emph{compiling} Rust crate. ``strict'' is
+the conventional all-or-nothing path; ``partial'' is the mode described in
+this paper. Both columns count crates that \texttt{cargo build} accepts, not
+crates that were merely emitted.}
+\label{tab:e2}
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+\textbf{corpus} & \textbf{proj.} & \textbf{strict} & \textbf{partial}
+ & \textbf{items} & \textbf{\%} \\
+\midrule
+C\texttt{++} projects & 6 & 4 & \textbf{6} & 40/50 & 80\% \\
+C programs & 13 & 9 & \textbf{13} & 18/33 & 55\% \\
+EndToEnd & 105 & 103 & \textbf{105} & 457/495 & 92\% \\
+c-testsuite & 220 & 220 & \textbf{220} & 609/635 & 96\% \\
+synthetic & 8 & 2 & \textbf{5} & 13/20 & 65\% \\
+\midrule
+total & 352 & 338 & \textbf{349} & 1137/1233 & 92\% \\
+\bottomrule
+\end{tabular}
+\end{table}

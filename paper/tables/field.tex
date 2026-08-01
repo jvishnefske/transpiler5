@@ -1,0 +1,28 @@
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{The field-edge rule, established empirically: a field edge poisons
+if and only if the emitted Rust \emph{spells} the target's name. Each row was
+verified by dropping \texttt{struct Atom} and asking whether the emitted crate
+compiles---not by reasoning about the C type system, in which every row is a
+dependency.}
+\label{tab:field}
+\begin{tabular}{@{}llcl@{}}
+\toprule
+\textbf{C field} & \textbf{emitted Rust} & \textbf{builds} & \textbf{edge} \\
+\midrule
+\texttt{struct Atom a}       & \texttt{a: Atom}     & no  & \textsc{Field} \\
+\texttt{struct Atom a[3]}    & \texttt{[Atom; 3]}   & no  & \textsc{Field} \\
+\texttt{int (*f)(struct Atom)} & prototype names it & no  & \textsc{Field} \\
+\texttt{struct Atom *p}      & \texttt{p: i64}      & yes & \textsc{FieldIndirect} \\
+\texttt{struct Atom **pp}    & erased               & yes & \textsc{FieldIndirect} \\
+\texttt{struct Atom *a[4]}   & erased               & yes & \textsc{FieldIndirect} \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+\raggedright\scriptsize
+The function-pointer row is the instructive one: the field crosses a pointer,
+yet the prototype still spells \texttt{Atom}, so it poisons. Pointer-ness is
+not the criterion; \emph{appearing in the generated text} is.
+\end{table}
