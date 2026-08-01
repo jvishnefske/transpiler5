@@ -221,6 +221,14 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   // its value is exactly that initializer.
   if (const auto *defaultInit = llvm::dyn_cast<clang::CXXDefaultInitExpr>(e))
     return emitRValue(defaultInit->getExpr());
+  // A defaulted call argument (`f(a)` where `f(int a, int b = 10)`) surfaces
+  // at the call site as a `CXXDefaultArgExpr` standing in for the default
+  // value; its value is that expression. Recursing into it also gives any
+  // residual diagnostic a real source location — this node's own location is
+  // invalid, which is why an unsupported default used to reject WITHOUT a
+  // `file:line:col:` prefix.
+  if (const auto *defaultArg = llvm::dyn_cast<clang::CXXDefaultArgExpr>(e))
+    return emitRValue(defaultArg->getExpr());
   return emitError(loc) << "unsupported expression: " << e->getStmtClassName();
 }
 

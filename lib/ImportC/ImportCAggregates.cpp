@@ -818,6 +818,15 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
   if (!importedEnums.insert(definition).second)
     return success();
   Location defLoc = translateLoc(definition->getBeginLoc());
+  // A scoped enumeration (`enum class`/`enum struct`) has a distinct value
+  // type with no implicit integer conversions; the open-enum model (a tuple
+  // struct freely convertible to and from its integer) does not represent it.
+  // Rejected here, located at the definition, rather than surfacing later as
+  // the misleading "assigned value type does not match the place" mismatch at
+  // the first use site.
+  if (definition->isScoped())
+    return emitError(defLoc)
+           << "unsupported: scoped enumeration (enum class/struct)";
   if (isRustKeyword(definition->getName()))
     return emitError(defLoc) << "unsupported: enum name '"
                              << definition->getName()
