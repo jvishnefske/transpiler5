@@ -112,7 +112,14 @@ private:
   /// Emits the Rust place expression denoted by the lvalue-typed `value` by
   /// recursing through its chain of variable/member/subscript/deref/enum_raw
   /// producers. Any other producer (or a block argument) is an error.
-  LogicalResult emitPlaceExpr(Location loc, Value value);
+  /// Emits `value` as a Rust place expression. `derefNeedsParens` is set by
+  /// the caller when the emitted place will have a projection or index
+  /// appended (`.field`, `[i]`, `.0`, `.method()`) or otherwise sits where a
+  /// leading unary `*` would misparse; a `emitrust.deref` renders as `(*..)`
+  /// only then, and as a bare `*..` when the place stands alone (a whole-place
+  /// assignment target, an rvalue load, or an `&`/`&mut` operand).
+  LogicalResult emitPlaceExpr(Location loc, Value value,
+                              bool derefNeedsParens);
 
   /// Emits the default value of `type`: `0` for integers and index, `0.0`
   /// for floats, `false` for `i1`, `Name::default()` for structs and
@@ -483,7 +490,8 @@ LogicalResult RustEmitter::emitFloatValue(Location loc, double value,
   return success();
 }
 
-LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value) {
+LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value,
+                                         bool derefNeedsParens) {
   Operation *def = value.getDefiningOp();
   if (!def)
     return emitError(loc)
@@ -493,13 +501,17 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value) {
         return emitOperand(loc, variableOp.getResult());
       })
       .Case<emitrust::MemberOp>([&](emitrust::MemberOp memberOp) {
-        if (failed(emitPlaceExpr(loc, memberOp.getOperand())))
+        // The base is followed by `.field`, so a deref base must parenthesize.
+        if (failed(emitPlaceExpr(loc, memberOp.getOperand(),
+                                 /*derefNeedsParens=*/true)))
           return failure();
         os << "." << memberOp.getMember();
         return success();
       })
       .Case<emitrust::SubscriptOp>([&](emitrust::SubscriptOp subscriptOp) {
-        if (failed(emitPlaceExpr(loc, subscriptOp.getArray())))
+        // The base is followed by `[i]`, so a deref base must parenthesize.
+        if (failed(emitPlaceExpr(loc, subscriptOp.getArray(),
+                                 /*derefNeedsParens=*/true)))
           return failure();
         os << "[";
         if (failed(emitOperand(loc, subscriptOp.getIndex())))
@@ -510,14 +522,17 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value) {
         return success();
       })
       .Case<emitrust::DerefOp>([&](emitrust::DerefOp derefOp) {
-        os << "(*";
+        os << (derefNeedsParens ? "(*" : "*");
         if (failed(emitOperand(loc, derefOp.getOperand())))
           return failure();
-        os << ")";
+        if (derefNeedsParens)
+          os << ")";
         return success();
       })
       .Case<emitrust::EnumRawOp>([&](emitrust::EnumRawOp enumRawOp) {
-        if (failed(emitPlaceExpr(loc, enumRawOp.getOperand())))
+        // The base is followed by `.0`, so a deref base must parenthesize.
+        if (failed(emitPlaceExpr(loc, enumRawOp.getOperand(),
+                                 /*derefNeedsParens=*/true)))
           return failure();
         os << ".0";
         return success();
@@ -858,7 +873,9 @@ LogicalResult RustEmitter::emitMethodCall(emitrust::MethodCallOp callOp) {
   if (op->getNumResults() == 1 &&
       failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
-  if (failed(emitPlaceExpr(loc, callOp.getReceiver())))
+  // The receiver is followed by `.method(..)`, so a deref receiver needs parens.
+  if (failed(emitPlaceExpr(loc, callOp.getReceiver(),
+                           /*derefNeedsParens=*/true)))
     return failure();
   os << "." << callOp.getMethod() << "(";
   bool first = true;
@@ -906,7 +923,8 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
   Location loc = op->getLoc();
   Value var = assignOp.getVar();
   if (isa<emitrust::LValueType>(var.getType())) {
-    if (failed(emitPlaceExpr(loc, var)))
+    // Whole-place assignment target: a bare `*p = ..` needs no parens.
+    if (failed(emitPlaceExpr(loc, var, /*derefNeedsParens=*/false)))
       return failure();
   } else if (failed(emitOperand(loc, var))) {
     return failure();
@@ -1533,7 +1551,9 @@ LogicalResult RustEmitter::emitLoad(emitrust::LoadOp loadOp) {
   Operation *op = loadOp.getOperation();
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
-  if (failed(emitPlaceExpr(op->getLoc(), loadOp.getOperand())))
+  // Rvalue load: a bare `*p` needs no parens.
+  if (failed(emitPlaceExpr(op->getLoc(), loadOp.getOperand(),
+                           /*derefNeedsParens=*/false)))
     return failure();
   os << ";\n";
   return success();
@@ -1544,7 +1564,9 @@ LogicalResult RustEmitter::emitAddrOf(emitrust::AddrOfOp addrOfOp) {
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
   os << (addrOfOp.getIsMut() ? "&mut " : "&");
-  if (failed(emitPlaceExpr(op->getLoc(), addrOfOp.getOperand())))
+  // `&*p` / `&mut *p`: the `&` binds the whole place, so no parens.
+  if (failed(emitPlaceExpr(op->getLoc(), addrOfOp.getOperand(),
+                           /*derefNeedsParens=*/false)))
     return failure();
   os << ";\n";
   return success();
@@ -1555,7 +1577,9 @@ LogicalResult RustEmitter::emitSliceOf(emitrust::SliceOfOp sliceOfOp) {
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
   os << (sliceOfOp.getIsMut() ? "&mut " : "&");
-  if (failed(emitPlaceExpr(op->getLoc(), sliceOfOp.getBase())))
+  // The base is followed by `[i..]`, so a deref base must parenthesize.
+  if (failed(emitPlaceExpr(op->getLoc(), sliceOfOp.getBase(),
+                           /*derefNeedsParens=*/true)))
     return failure();
   os << "[";
   if (failed(emitOperand(op->getLoc(), sliceOfOp.getIndex())))

@@ -194,7 +194,7 @@ emitrust.enum_def @Mode ["Off", "On"] [0, 1] {unsigned_underlying}
 // CHECK-NEXT:    let v2: Mode = Mode(v0 as u32);
 // CHECK-NEXT:    v1 = v2;
 // CHECK-NEXT:    let v3: &mut u32 = &mut v1.0;
-// CHECK-NEXT:    let v4: u32 = (*v3);
+// CHECK-NEXT:    let v4: u32 = *v3;
 // CHECK-NEXT:    return v4;
 // CHECK-NEXT:  }
 emitrust.func @enum_from_int(%arg0: i32) -> ui32 {
