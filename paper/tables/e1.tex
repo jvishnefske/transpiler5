@@ -1,0 +1,36 @@
+% Nine columns do not fit a single column at 10pt, so this one spans
+% both. Kept as generated output rather than hand-tuned in the source.
+\begin{table*}[t]
+\centering
+\footnotesize
+\caption{E1: predicted colour against realised status. \emph{FP} is a false
+positive (predicted admissible, then dropped): recoverable, costing one
+probe. \emph{FN} is a false negative (predicted \red{red}, actually ported):
+unrecoverable, and the quantity \S\ref{sec:directional} argues must be zero.}
+\label{tab:e1}
+\begin{tabular}{@{}lrrrrrrrr@{}}
+\toprule
+ & & \multicolumn{3}{c}{\textbf{predicted}}
+ & \multicolumn{2}{c}{\textbf{realised}}
+ & \multicolumn{2}{c}{\textbf{errors}} \\
+\cmidrule(lr){3-5}\cmidrule(lr){6-7}\cmidrule(lr){8-9}
+\textbf{corpus} & \textbf{items} & \green{G} & \amber{Y} & \red{R}
+ & port. & drop. & FP & FN \\
+\midrule
+C\texttt{++} projects & 53 & 47 & 0 & 6 & 40 & 5 & 0 & \textbf{0} \\
+C programs & 33 & 33 & 0 & 0 & 18 & 1 & 1 & \textbf{0} \\
+EndToEnd & 600 & 597 & 0 & 3 & 457 & 4 & 1 & \textbf{0} \\
+c-testsuite & 651 & 651 & 0 & 0 & 609 & 0 & 0 & \textbf{0} \\
+\midrule
+total (344 proj.) & 1337 & 1328 & 0 & 9 & 1124 & 10 & 2 & \textbf{0} \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+\raggedright\scriptsize
+Statuses not shown (\texttt{stubbed}, \texttt{missing}, \texttt{declared})
+account for the remainder and are neither error kind. \texttt{declared} items
+are prototypes with no definition in the project and are excluded from the
+translated-fraction denominator. The \amber{Y} column is zero throughout:
+see \S\ref{sec:eval-precision}.
+\end{table*}

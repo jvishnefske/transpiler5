@@ -1,0 +1,38 @@
+\begin{table}[t]
+\centering
+\footnotesize
+\caption{Edge kinds of the item graph. The rightmost column is the
+propagation strength derived in \S\ref{sec:colouring}: whether a \red{red}
+target poisons its source \red{red}, only demotes it to \amber{yellow}
+(because the target is stub-replaceable), or does not poison it at all
+(because the emitted Rust never names the target).}
+\label{tab:edges}
+\begin{tabular}{@{}llc@{}}
+\toprule
+\textbf{Edge} & \textbf{Meaning} & \textbf{Poison} \\
+\midrule
+\textsc{Calls}          & body calls the target        & \amber{yellow} \\
+\textsc{CallsIndirect}  & call through a fn pointer    & --- \\
+\textsc{SigType}        & type named in the signature  & \red{red} \\
+\textsc{BodyType}       & type named inside the body   & \red{red}$^\dagger$ \\
+\textsc{Field}          & field spells the type        & \red{red} \\
+\textsc{FieldIndirect}  & field reaches it via pointer & none \\
+\textsc{Base}           & C\texttt{++} base class      & \red{red}$^\ddagger$ \\
+\textsc{ReadsGlobal}    & body reads the global        & \red{red} \\
+\textsc{WritesGlobal}   & body writes the global       & \red{red} \\
+\textsc{TakesAddressOf} & address of a function        & \amber{yellow} \\
+\bottomrule
+\end{tabular}
+
+\vspace{2pt}
+\raggedright\scriptsize
+$^\dagger$ Poisons the function \red{red}, but the function stays
+stub-replaceable, so its own callers are only \amber{yellow}
+(\S\ref{sec:colouring}).\\
+$^\ddagger$ Vacuous in practice: a record with a direct base is already an
+inadmissible seed, so a \textsc{Base} edge never decides a colour. Retained
+for totality.\\
+\textsc{CallsIndirect} carries no target and so cannot propagate; it is
+recorded because ``this item makes an indirect call'' is itself the fact a
+port-order consumer needs.
+\end{table}

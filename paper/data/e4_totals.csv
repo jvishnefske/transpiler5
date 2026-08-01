@@ -1,0 +1,25 @@
+order,sha,subject,date,corpus,projects,crates_emitted,crates_building,graph_items_total,ported_total
+1,54fe0fe,test(EndToEnd): widen C++ differential net with 3 in-subset byte-match tests,2026-07-27,c,13,9,9,,
+1,54fe0fe,test(EndToEnd): widen C++ differential net with 3 in-subset byte-match tests,2026-07-27,cpp,5,1,1,,
+1,54fe0fe,test(EndToEnd): widen C++ differential net with 3 in-subset byte-match tests,2026-07-27,all,18,10,10,,
+2,c3fbb13,W5.0: FR-46 C++ RealWorld demand corpus (4 projects) + runner C++ mode,2026-07-28,c,13,9,9,,
+2,c3fbb13,W5.0: FR-46 C++ RealWorld demand corpus (4 projects) + runner C++ mode,2026-07-28,cpp,5,1,1,,
+2,c3fbb13,W5.0: FR-46 C++ RealWorld demand corpus (4 projects) + runner C++ mode,2026-07-28,all,18,10,10,,
+3,1f1dc8f,W5.7: FR-47 implicit-`this` method-call receiver,2026-07-28,c,13,9,9,,
+3,1f1dc8f,W5.7: FR-47 implicit-`this` method-call receiver,2026-07-28,cpp,5,2,2,,
+3,1f1dc8f,W5.7: FR-47 implicit-`this` method-call receiver,2026-07-28,all,18,11,11,,
+4,385efc3,W5.4: FR-44 incremental crate output and progress ratchet,2026-07-28,c,13,12,12,32,18
+4,385efc3,W5.4: FR-44 incremental crate output and progress ratchet,2026-07-28,cpp,5,4,4,31,19
+4,385efc3,W5.4: FR-44 incremental crate output and progress ratchet,2026-07-28,all,18,16,16,63,37
+5,1a37f6c,W5.3: FR-43 frontier tree search over admitted item sets,2026-07-28,c,13,12,12,32,18
+5,1a37f6c,W5.3: FR-43 frontier tree search over admitted item sets,2026-07-28,cpp,5,4,4,31,19
+5,1a37f6c,W5.3: FR-43 frontier tree search over admitted item sets,2026-07-28,all,18,16,16,63,37
+6,c665b20,W5.9: FR-48 C++ reference types (rank-1 corpus blocker),2026-07-29,c,13,12,12,32,18
+6,c665b20,W5.9: FR-48 C++ reference types (rank-1 corpus blocker),2026-07-29,cpp,5,4,4,31,21
+6,c665b20,W5.9: FR-48 C++ reference types (rank-1 corpus blocker),2026-07-29,all,18,16,16,63,39
+7,bc0be94,"W5.10: FR-50 --search never loses to --incremental, and a real miscompile fix",2026-07-29,c,13,12,12,32,18
+7,bc0be94,"W5.10: FR-50 --search never loses to --incremental, and a real miscompile fix",2026-07-29,cpp,5,4,4,31,21
+7,bc0be94,"W5.10: FR-50 --search never loses to --incremental, and a real miscompile fix",2026-07-29,all,18,16,16,63,39
+8,4c89af1,W5.11: FR-51 library crates -- distinguish Rust lib from bin,2026-07-29,c,13,13,13,33,18
+8,4c89af1,W5.11: FR-51 library crates -- distinguish Rust lib from bin,2026-07-29,cpp,5,5,5,43,33
+8,4c89af1,W5.11: FR-51 library crates -- distinguish Rust lib from bin,2026-07-29,all,18,18,18,76,51
