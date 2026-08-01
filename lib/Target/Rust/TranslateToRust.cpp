@@ -910,9 +910,25 @@ LogicalResult RustEmitter::emitLiteral(emitrust::LiteralOp literalOp) {
   return success();
 }
 
+/// Returns whether any `emitrust.assign` writes directly to `value`. A
+/// `emitrust.let` result is a plain SSA value (never an lvalue place), so the
+/// only way to mutate it is a direct assignment; this suffices to decide
+/// whether the emitted `let` needs `mut`, avoiding a spurious `unused_mut`
+/// on the default-initialized SSA-destruction lets the SCF lowering marks
+/// mutable up front (before the arm assignments that may or may not exist).
+static bool valueHasDirectAssignUser(Value value) {
+  for (Operation *user : value.getUsers())
+    if (auto assign = dyn_cast<emitrust::AssignOp>(user))
+      if (assign.getVar() == value)
+        return true;
+  return false;
+}
+
 LogicalResult RustEmitter::emitLet(emitrust::LetOp letOp) {
   Operation *op = letOp.getOperation();
-  if (failed(emitLetPrologue(op->getResult(0), letOp.getIsMut())))
+  bool isMut =
+      letOp.getIsMut() && valueHasDirectAssignUser(op->getResult(0));
+  if (failed(emitLetPrologue(op->getResult(0), isMut)))
     return failure();
   if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
     return failure();
