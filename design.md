@@ -110,7 +110,7 @@ and f64. Any other type is a translation error with a located diagnostic.
 | assign | destination + value, same types, no result | assignment statement; verifier requires destination be a mut let result |
 | add, sub, mul, div, rem | two operands, one result, all same type | infix binary expression |
 | cmp | predicate enum (eq, ne, lt, le, gt, ge) + two same-typed operands, i1 result; enum and fn_ptr operands allow eq and ne only (PartialEq but no ordering) | infix comparison |
-| cast | one operand, one result; enum and bool result types are rejected (no Rust as-cast produces them) | as-cast expression |
+| cast | one operand, one result; a bool result type is rejected (no Rust as-cast produces a bool); an enum result requires a non-i1 integer source and renders as a tuple-struct construction (`Color(x as u32)`) | as-cast expression |
 | select | i1 condition + two same-typed value operands, one result (lvalues excluded) | let binding initialized with an if-else expression |
 | if | i1 condition + then region + optional else region, no results | if / if-else statement |
 | for | lower bound, upper bound, step + single-region body with induction argument | for loop over a stepped range |
@@ -240,9 +240,11 @@ lists the lit test file(s) that validate it.
   enumerator constants render as Name::Variant; enum equality compares the
   enum type directly while relational comparisons and integer arithmetic go
   through explicit i32 discriminant casts; int-to-enum conversions are
-  rejected with located diagnostics. (test/Import/C/enums.c,
-  enums-invalid.c, test/Target/Rust/match.mlir,
-  test/EndToEnd/switch-enum.c)
+  supported and value-preserving (the open-enum representation holds any
+  value of the underlying type, matching the C99-5 enum section and CTS-S6).
+  (test/Import/C/enums.c, enums-invalid.c, enum-from-int.c,
+  test/Target/Rust/match.mlir, test/EndToEnd/switch-enum.c,
+  test/EndToEnd/enum-from-int.c, enum-int.c)
 - [x] FR-24 c-testsuite conformance ledger: the c-testsuite single-exec
   corpus (third_party/c-testsuite submodule) runs differentially through
   run_c_testsuite.py — every transpiled test's cargo build must produce
@@ -1905,8 +1907,9 @@ rule.
   anyway). Rejected with located diagnostics: non-list aggregate
   initializers (whole-struct copies; compound literals are supported per
   C99-13; string literals on char arrays are supported per C99-28) and
-  enum-typed global elements; multi-dimensional arrays are rejected by
-  the type mapper before initializer handling.
+  enum-typed global elements. Multi-dimensional arrays and their nested
+  initializer lists ARE supported (each dimension renders its element list;
+  see arrays-multidim tests).
   (test/Import/C/aggregate-init.c, aggregate-init-invalid.c,
   test/Dialect/EmitRust/ops.mlir, invalid.mlir,
   test/Target/Rust/globals.mlir, test/EndToEnd/aggregate-init.c,
