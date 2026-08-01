@@ -24,7 +24,7 @@ emitrust.func @observe(%arg0: !emitrust.ref<!emitrust.cell_slice<i32>>, %arg1: i
 }
 
 // A byte cell-slice renders with the u8-facing element type i8.
-// CHECK: fn bytes(v0: &[std::cell::Cell<i8>]) {
+// CHECK: fn bytes(_v0: &[std::cell::Cell<i8>]) {
 emitrust.func @bytes(%arg0: !emitrust.ref<!emitrust.cell_slice<i8>>) {
   emitrust.return
 }

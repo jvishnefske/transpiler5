@@ -5,13 +5,13 @@
 // and fn_ptr struct fields and globals render like every other field type.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s --strict-whitespace
 
-// CHECK:      fn types(v0: Option<fn(i32, i32) -> i32>, v1: Option<fn()>, v2: Option<fn() -> i32>, v3: Option<fn(Option<fn(i32) -> i32>) -> Option<fn() -> i32>>) {
+// CHECK:      fn types(v0: Option<fn(i32, i32) -> i32>, _v1: Option<fn()>, _v2: Option<fn() -> i32>, _v3: Option<fn(Option<fn(i32) -> i32>) -> Option<fn() -> i32>>) {
 emitrust.func @types(%arg0: !emitrust.fn_ptr<(i32, i32) -> i32>,
                      %arg1: !emitrust.fn_ptr<()>,
                      %arg2: !emitrust.fn_ptr<() -> i32>,
                      %arg3: !emitrust.fn_ptr<(!emitrust.fn_ptr<(i32) -> i32>)
                                              -> !emitrust.fn_ptr<() -> i32>>) {
-  // CHECK-NEXT:    let v4: Option<fn(i32, i32) -> i32> = v0;
+  // CHECK-NEXT:    let _v4: Option<fn(i32, i32) -> i32> = v0;
   %0 = emitrust.let %arg0 : !emitrust.fn_ptr<(i32, i32) -> i32>
   emitrust.return
 }
@@ -30,25 +30,25 @@ emitrust.func @calls(%arg0: !emitrust.fn_ptr<(i32, i32) -> i32>,
 
 // CHECK:      fn defaults() {
 emitrust.func @defaults() {
-  // CHECK-NEXT:    let mut v0: Option<fn(i32) -> i32> = None;
+  // CHECK-NEXT:    let mut _v0: Option<fn(i32) -> i32> = None;
   %0 = emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
   // CHECK-NEXT:    let v1: Option<fn(i32) -> i32> = Some(add);
   %1 = emitrust.constant <#emitrust.opaque<"Some(add)">>
       : !emitrust.fn_ptr<(i32) -> i32>
-  // CHECK-NEXT:    v0 = v1;
+  // CHECK-NEXT:    _v0 = v1;
   emitrust.assign %0 = %1 : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
-  // CHECK-NEXT:    let v2: Option<fn(i32) -> i32> = None;
+  // CHECK-NEXT:    let _v2: Option<fn(i32) -> i32> = None;
   %2 = emitrust.constant <#emitrust.opaque<"None">>
       : !emitrust.fn_ptr<(i32) -> i32>
   // A `!= None` comparison lowers to an Option null-test to avoid
   // `unpredictable_function_pointer_comparisons`.
   // A `!= None` comparison lowers to an Option null-test to avoid
   // `unpredictable_function_pointer_comparisons`.
-  // CHECK-NEXT:    let v3: bool = v1.is_some();
+  // CHECK-NEXT:    let _v3: bool = v1.is_some();
   %3 = emitrust.cmp ne, %1, %2
       : (!emitrust.fn_ptr<(i32) -> i32>, !emitrust.fn_ptr<(i32) -> i32>) -> i1
   // Two non-null function pointers compare by address, None-aware.
-  // CHECK-NEXT:    let v4: bool = match (v1, v1) { (Some(l), Some(r)) => core::ptr::fn_addr_eq(l, r), (None, None) => true, _ => false };
+  // CHECK-NEXT:    let _v4: bool = match (v1, v1) { (Some(l), Some(r)) => core::ptr::fn_addr_eq(l, r), (None, None) => true, _ => false };
   %4 = emitrust.cmp eq, %1, %1
       : (!emitrust.fn_ptr<(i32) -> i32>, !emitrust.fn_ptr<(i32) -> i32>) -> i1
   emitrust.return

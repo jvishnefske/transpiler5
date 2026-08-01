@@ -8,8 +8,8 @@ emitrust.verbatim "// module-level marker"
 
 // CHECK-LABEL: fn bindings(v0: i32) {
 // CHECK-NEXT:    let v1: i32 = v0;
-// CHECK-NEXT:    let mut v2: i32 = v0;
-// CHECK-NEXT:    v2 = v1;
+// CHECK-NEXT:    let mut _v2: i32 = v0;
+// CHECK-NEXT:    _v2 = v1;
 // CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @bindings(%arg0: i32) {
@@ -21,8 +21,8 @@ emitrust.func @bindings(%arg0: i32) {
 
 // CHECK-LABEL: fn calls(v0: i32, v1: i32) {
 // CHECK-NEXT:    consume(v0);
-// CHECK-NEXT:    let v2: i32 = produce(v0, v1);
-// CHECK-NEXT:    let (v3, v4): (i32, i64) = pair(v0);
+// CHECK-NEXT:    let _v2: i32 = produce(v0, v1);
+// CHECK-NEXT:    let (_v3, _v4): (i32, i64) = pair(v0);
 // CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @calls(%arg0: i32, %arg1: i32) {

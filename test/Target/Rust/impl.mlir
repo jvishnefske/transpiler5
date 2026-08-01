@@ -21,7 +21,7 @@ emitrust.impl "Owner_main_arr" {
     emitrust.method_call %s["g"] (%arg1) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64) -> ()
     emitrust.return
   }
-  // CHECK: fn g(&mut self, v0: i64) {
+  // CHECK: fn g(&mut self, _v0: i64) {
   emitrust.func @g(%arg0: !emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>, %arg1: i64) {
     emitrust.return
   }

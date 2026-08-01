@@ -35,6 +35,7 @@
 #include "mlir/Support/IndentedOstream.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
@@ -146,6 +147,9 @@ private:
   /// Emits the statements of a single-block `region` one indentation level
   /// deeper. Fails on multi-block regions; an empty region emits nothing.
   LogicalResult emitRegionBody(Operation *parent, Region &region);
+  /// Emits the operations of `block` in order, stopping after the first
+  /// diverging op so unreachable trailing statements are not rendered.
+  LogicalResult emitBlockBody(Block &block);
 
   //===--------------------------------------------------------------------===//
   // Per-operation emitters
@@ -307,6 +311,61 @@ private:
 
   /// Counter feeding the sequential v0, v1, ... naming scheme.
   unsigned valueCount = 0;
+
+  /// Ops that are unreachable in the current function (they follow a diverging
+  /// op in their block, or are nested inside such an op). They are not
+  /// emitted, and a use appearing in one does not count as a real read when
+  /// deciding whether a binding is live. Populated per function by
+  /// `computeUnreachable`.
+  llvm::SmallPtrSet<Operation *, 32> unreachableOps;
+
+  /// Memoizes `valueIsReadUncached` results within a function.
+  DenseMap<Value, bool> valueReadCache;
+
+  /// Recomputes `unreachableOps` for `funcBody`'s single block.
+  void computeUnreachable(Block &block);
+
+  /// Ops (`emitrust.let` / `emitrust.variable`) whose initializer is a dead
+  /// store -- the binding is written on every path before it is read -- so the
+  /// emitted binding drops its initializer and relies on Rust's
+  /// definite-assignment. Populated per function by `computeDeferredInits`.
+  llvm::SmallPtrSet<Operation *, 16> droppedInitOps;
+
+  /// For each op in `droppedInitOps`, whether the deferred binding still needs
+  /// `mut` (some path assigns it more than once).
+  DenseMap<Operation *, bool> deferredNeedsMut;
+
+  /// Summary of how a binding is accessed across a straight-line/structured op
+  /// sequence, used to decide whether its initializer is a dead store.
+  struct Liveness {
+    bool readFirst = false;    ///< some path reads the binding before writing
+    bool writtenAtExit = false; ///< all fall-through paths have written it
+    bool diverges = false;     ///< all paths diverge (no fall-through)
+    bool hasLoopWrite = false; ///< the binding is assigned inside a loop
+    unsigned maxWrites = 0;    ///< max whole-binding writes on any single path
+  };
+
+  bool isBindingWrite(Operation *op, Value binding);
+  bool isBindingUser(Operation *op, Value binding);
+  Liveness analyzeSeq(Block::iterator begin, Block::iterator end, Value binding);
+  Liveness analyzeControl(Operation *op, Value binding);
+  /// Decides, for each candidate binding in the function, whether its init is a
+  /// dead store; fills `droppedInitOps` / `deferredNeedsMut`.
+  void computeDeferredInits(Block &block);
+
+  /// Returns whether `value` is read (as opposed to only written or unused)
+  /// somewhere in reachable code -- used to decide `_`-prefixing and dead
+  /// stores. A place-refining projection counts as a read only when the
+  /// projected value it produces is itself read.
+  bool valueIsRead(Value value);
+  bool valueIsReadUncached(Value value);
+
+  /// Returns whether the `!emitrust.lvalue` place `value` is ever mutated in
+  /// reachable code (assigned whole, assigned through a projection, mutably
+  /// borrowed, or used as a method-call receiver). Conservative toward `true`:
+  /// a missed mutation would surface as a hard `cannot assign to immutable`
+  /// error at build time, never as silent wrong output.
+  bool lvalueIsMutated(Value value);
 };
 
 } // namespace
@@ -315,11 +374,278 @@ private:
 // Structural helpers
 //===----------------------------------------------------------------------===//
 
+/// Whether `op` renders as a diverging Rust expression (defined below).
+static bool opDiverges(Operation *op);
+
 std::string RustEmitter::assignName(Value value) {
   std::string &name = valueNames[value];
   if (name.empty())
-    name = ("v" + Twine(valueCount++)).str();
+    name = ((valueIsRead(value) ? "v" : "_v") + Twine(valueCount++)).str();
   return name;
+}
+
+bool RustEmitter::valueIsRead(Value value) {
+  auto it = valueReadCache.find(value);
+  if (it != valueReadCache.end())
+    return it->second;
+  // Seed `false` first so a projection cycle (which SSA place graphs do not
+  // form, but defensively) terminates rather than recursing forever.
+  valueReadCache[value] = false;
+  bool result = valueIsReadUncached(value);
+  valueReadCache[value] = result;
+  return result;
+}
+
+bool RustEmitter::valueIsReadUncached(Value value) {
+  for (OpOperand &use : value.getUses()) {
+    Operation *owner = use.getOwner();
+    // A use inside unreachable code never executes, so it is not a real read.
+    if (unreachableOps.count(owner))
+      continue;
+    // A `let` whose dead initializer we dropped no longer reads its init
+    // operand, so that use does not keep `value` live.
+    if (droppedInitOps.count(owner))
+      if (auto letOp = dyn_cast<emitrust::LetOp>(owner))
+        if (use.get() == letOp.getInit())
+          continue;
+    // A fn-pointer null constant compared with `==`/`!=` renders as an Option
+    // null-test (`.is_none()`/`.is_some()`) on the other operand; the null
+    // side is never emitted, so it is not a read (see `emitFnPtrCmp`).
+    if (isa<emitrust::CmpOp>(owner))
+      if (auto constant = value.getDefiningOp<emitrust::ConstantOp>())
+        if (auto opaque = dyn_cast<emitrust::OpaqueAttr>(constant.getValue()))
+          if (opaque.getValue() == "None")
+            continue;
+    // The destination of an assignment is a write, not a read.
+    if (auto assign = dyn_cast<emitrust::AssignOp>(owner))
+      if (assign.getVar() == value)
+        continue;
+    // Place-refining ops emit nothing themselves; `value` is read through one
+    // only when the projected place it denotes is itself read.
+    if (isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
+            emitrust::EnumRawOp>(owner)) {
+      if (valueIsRead(owner->getResult(0)))
+        return true;
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
+bool RustEmitter::lvalueIsMutated(Value value) {
+  for (OpOperand &use : value.getUses()) {
+    Operation *owner = use.getOwner();
+    if (unreachableOps.count(owner))
+      continue;
+    if (auto assign = dyn_cast<emitrust::AssignOp>(owner)) {
+      if (assign.getVar() == value)
+        return true;
+      continue; // used as the assigned value: a read, not a mutation
+    }
+    if (auto addrOf = dyn_cast<emitrust::AddrOfOp>(owner)) {
+      if (addrOf.getIsMut())
+        return true;
+      continue;
+    }
+    if (auto sliceOf = dyn_cast<emitrust::SliceOfOp>(owner)) {
+      if (sliceOf.getIsMut())
+        return true;
+      continue;
+    }
+    // A place refined by a projection is mutated when the refined place is.
+    if (isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
+            emitrust::EnumRawOp>(owner)) {
+      if (lvalueIsMutated(owner->getResult(0)))
+        return true;
+      continue;
+    }
+    // A method-call receiver may take `&mut self`; assume it can mutate.
+    if (auto call = dyn_cast<emitrust::MethodCallOp>(owner))
+      if (call.getReceiver() == value)
+        return true;
+  }
+  return false;
+}
+
+void RustEmitter::computeUnreachable(Block &block) {
+  bool diverged = false;
+  for (Operation &op : block) {
+    if (diverged) {
+      // This op and everything nested in it is unreachable.
+      op.walk([&](Operation *nested) { unreachableOps.insert(nested); });
+      continue;
+    }
+    for (Region &region : op.getRegions())
+      for (Block &nested : region)
+        computeUnreachable(nested);
+    if (opDiverges(&op))
+      diverged = true;
+  }
+}
+
+bool RustEmitter::isBindingWrite(Operation *op, Value binding) {
+  auto assign = dyn_cast<emitrust::AssignOp>(op);
+  return assign && assign.getVar() == binding;
+}
+
+bool RustEmitter::isBindingUser(Operation *op, Value binding) {
+  for (Value operand : op->getOperands())
+    if (operand == binding)
+      return true;
+  return false;
+}
+
+RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding) {
+  Liveness r;
+  auto seq = [&](Region &region) {
+    return region.empty()
+               ? Liveness{}
+               : analyzeSeq(region.front().begin(), region.front().end(),
+                            binding);
+  };
+  if (auto ifOp = dyn_cast<emitrust::IfOp>(op)) {
+    Liveness thenL = seq(ifOp.getThenRegion());
+    Liveness elseL = seq(ifOp.getElseRegion());
+    r.readFirst = thenL.readFirst || elseL.readFirst;
+    r.hasLoopWrite = thenL.hasLoopWrite || elseL.hasLoopWrite;
+    bool thenW = thenL.diverges || thenL.writtenAtExit;
+    bool elseW = elseL.diverges || elseL.writtenAtExit;
+    r.writtenAtExit = thenW && elseW;
+    r.diverges = thenL.diverges && elseL.diverges;
+    r.maxWrites = std::max(thenL.maxWrites, elseL.maxWrites);
+    return r;
+  }
+  if (isa<emitrust::ForOp, emitrust::LoopOp>(op)) {
+    Liveness body = seq(op->getRegion(0));
+    // The body may run zero times (for/while) or the loop may break, so a
+    // write inside it never guarantees the binding is set afterwards; a read
+    // inside it happens on iteration one with the binding still unwritten.
+    r.readFirst = body.readFirst;
+    r.hasLoopWrite = body.hasLoopWrite || body.maxWrites > 0;
+    return r;
+  }
+  if (auto sw = dyn_cast<emitrust::SwitchOp>(op)) {
+    Liveness d = seq(sw.getDefaultRegion());
+    bool anyRead = d.readFirst;
+    bool allWritten = d.diverges || d.writtenAtExit;
+    bool allDiverge = d.diverges;
+    bool loopWrite = d.hasLoopWrite;
+    unsigned maxWrites = d.maxWrites;
+    for (Region &caseRegion : sw.getCaseRegions()) {
+      Liveness ci = seq(caseRegion);
+      anyRead |= ci.readFirst;
+      allWritten = allWritten && (ci.diverges || ci.writtenAtExit);
+      allDiverge = allDiverge && ci.diverges;
+      loopWrite |= ci.hasLoopWrite;
+      maxWrites = std::max(maxWrites, ci.maxWrites);
+    }
+    r.readFirst = anyRead;
+    r.writtenAtExit = allWritten; // the `_` arm covers every unmatched value
+    r.diverges = allDiverge;
+    r.hasLoopWrite = loopWrite;
+    r.maxWrites = maxWrites;
+    return r;
+  }
+  // Any other region-carrying op: conservatively assume its regions may read
+  // the binding and never guarantee a write.
+  for (Region &region : op->getRegions()) {
+    Liveness sub = seq(region);
+    r.readFirst |= sub.readFirst;
+    r.hasLoopWrite |= sub.hasLoopWrite || sub.maxWrites > 0;
+  }
+  return r;
+}
+
+RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
+                                              Block::iterator end,
+                                              Value binding) {
+  Liveness r;
+  bool written = false;   // binding written on the current straight-line path
+  unsigned writes = 0;    // whole-binding writes on the current path
+  for (auto it = begin; it != end; ++it) {
+    Operation *op = &*it;
+    if (unreachableOps.count(op))
+      continue;
+    if (isBindingWrite(op, binding)) {
+      written = true;
+      ++writes;
+      continue; // `emitrust.assign` carries no regions
+    }
+    // A non-write operand use is a read of the binding.
+    if (isBindingUser(op, binding) && !written)
+      r.readFirst = true;
+    if (op->getNumRegions() > 0) {
+      Liveness sub = analyzeControl(op, binding);
+      if (sub.readFirst && !written)
+        r.readFirst = true;
+      r.hasLoopWrite |= sub.hasLoopWrite;
+      writes += sub.maxWrites;
+      if (!written && sub.writtenAtExit)
+        written = true;
+      if (sub.diverges) {
+        r.diverges = true;
+        r.maxWrites = std::max(r.maxWrites, writes);
+        return r;
+      }
+      continue;
+    }
+    if (opDiverges(op)) {
+      r.diverges = true;
+      r.maxWrites = std::max(r.maxWrites, writes);
+      return r;
+    }
+  }
+  r.writtenAtExit = written;
+  r.maxWrites = std::max(r.maxWrites, writes);
+  return r;
+}
+
+void RustEmitter::computeDeferredInits(Block &block) {
+  block.getParentOp()->walk([&](Operation *op) {
+    Value binding;
+    if (auto letOp = dyn_cast<emitrust::LetOp>(op)) {
+      binding = letOp.getResult();
+    } else if (auto variableOp = dyn_cast<emitrust::VariableOp>(op)) {
+      // Only a synthesized default (no explicit initializer attribute) is a
+      // candidate, and only when the local is accessed purely as a whole
+      // scalar: any projection/address-of use would make deferred
+      // initialization (`let v: T;`) reject in Rust.
+      if (variableOp.getInitAttr())
+        return;
+      binding = variableOp.getResult();
+      for (Operation *user : binding.getUsers()) {
+        if (unreachableOps.count(user))
+          continue;
+        if (isa<emitrust::LoadOp>(user))
+          continue;
+        if (isBindingWrite(user, binding))
+          continue;
+        return; // projection, address-of, or other use: not a candidate
+      }
+    } else {
+      return;
+    }
+    // Only worth deferring when the binding is actually read; an unread
+    // binding is `_`-prefixed instead (its dead init then draws no warning).
+    bool isRead = false;
+    for (Operation *user : binding.getUsers()) {
+      if (unreachableOps.count(user) || isBindingWrite(user, binding))
+        continue;
+      isRead = true;
+      break;
+    }
+    if (!isRead)
+      return;
+    Liveness info = analyzeSeq(std::next(op->getIterator()),
+                               op->getBlock()->end(), binding);
+    if (info.readFirst)
+      return; // the initializer is live: some path reads before writing
+    droppedInitOps.insert(op);
+    // `mut` is needed when a path assigns more than once, or the binding is
+    // assigned inside a loop (a potential re-assignment across iterations).
+    deferredNeedsMut[op] = info.maxWrites >= 2 || info.hasLoopWrite;
+  });
 }
 
 FailureOr<std::string> RustEmitter::lookupName(Location loc, Value value) {
@@ -649,16 +975,43 @@ LogicalResult RustEmitter::emitLetPrologue(Value result, bool isMut) {
   return success();
 }
 
+/// Returns whether `op` renders as a diverging (`!`-typed) Rust expression,
+/// after which the rest of its block is unreachable. Emitting that tail would
+/// produce dead code that trips `unreachable_code` (and cascading `unused_*`),
+/// so block emission stops here. `panic!` and `std::process::exit` are the
+/// importer's diverging opaque calls; the structured terminators never have
+/// successors within their block but are covered for completeness.
+static bool opDiverges(Operation *op) {
+  if (auto call = dyn_cast<emitrust::CallOpaqueOp>(op)) {
+    llvm::StringRef callee = call.getCallee();
+    // `unimplemented!` (emitted by `--recover` for unsupported constructs)
+    // diverges even though it yields a value into a `let`.
+    return callee == "panic!" || callee == "std::process::exit" ||
+           callee == "unimplemented!";
+  }
+  return isa<emitrust::ReturnOp, emitrust::BreakOp, emitrust::ContinueOp>(op);
+}
+
+LogicalResult RustEmitter::emitBlockBody(Block &block) {
+  for (Operation &op : block) {
+    if (failed(emitOperation(op)))
+      return failure();
+    // Statements after a diverging op are unreachable; stop to keep the
+    // emitted body free of dead code.
+    if (opDiverges(&op))
+      break;
+  }
+  return success();
+}
+
 LogicalResult RustEmitter::emitRegionBody(Operation *parent, Region &region) {
   if (region.empty())
     return success();
   if (!region.hasOneBlock())
     return parent->emitOpError("multi-block regions are not supported");
   increaseIndent();
-  for (Operation &op : region.front()) {
-    if (failed(emitOperation(op)))
-      return failure();
-  }
+  if (failed(emitBlockBody(region.front())))
+    return failure();
   decreaseIndent();
   return success();
 }
@@ -708,12 +1061,18 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // Each function opens a fresh value-naming scope: v0, v1, ...
   valueNames.clear();
   valueCount = 0;
+  unreachableOps.clear();
+  valueReadCache.clear();
+  droppedInitOps.clear();
+  deferredNeedsMut.clear();
 
   Region &body = fn.getFunctionBody();
   if (body.empty())
     return op->emitOpError("cannot translate a function without a body");
   if (!body.hasOneBlock())
     return op->emitOpError("multi-block regions are not supported");
+  computeUnreachable(body.front());
+  computeDeferredInits(body.front());
   if (fn.getNumResults() > 1)
     return op->emitOpError(
         "cannot translate a function with more than one result");
@@ -765,10 +1124,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   }
   os << " {\n";
   increaseIndent();
-  for (Operation &child : entryBlock) {
-    if (failed(emitOperation(child)))
-      return failure();
-  }
+  if (failed(emitBlockBody(entryBlock)))
+    return failure();
   decreaseIndent();
   os << "}\n";
   return success();
@@ -926,9 +1283,22 @@ static bool valueHasDirectAssignUser(Value value) {
 
 LogicalResult RustEmitter::emitLet(emitrust::LetOp letOp) {
   Operation *op = letOp.getOperation();
-  bool isMut =
-      letOp.getIsMut() && valueHasDirectAssignUser(op->getResult(0));
-  if (failed(emitLetPrologue(op->getResult(0), isMut)))
+  Value result = op->getResult(0);
+  // A dead initializer is dropped: the binding is written on every path before
+  // it is read, so Rust's definite-assignment lets us defer initialization and
+  // avoid the `unused_assignments` the overwritten init would draw.
+  if (droppedInitOps.count(op)) {
+    os << "let ";
+    if (deferredNeedsMut.lookup(op))
+      os << "mut ";
+    os << assignName(result) << ": ";
+    if (failed(emitType(result.getLoc(), result.getType())))
+      return failure();
+    os << ";\n";
+    return success();
+  }
+  bool isMut = letOp.getIsMut() && valueHasDirectAssignUser(result);
+  if (failed(emitLetPrologue(result, isMut)))
     return failure();
   if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
     return failure();
@@ -1609,10 +1979,24 @@ LogicalResult RustEmitter::emitVariable(emitrust::VariableOp variableOp) {
   Location loc = variableOp.getLoc();
   Type valueType =
       cast<emitrust::LValueType>(result.getType()).getValueType();
-  // A `const`-marked variable is never written after its initializer and
-  // becomes an immutable `let` binding.
-  os << (variableOp.getIsConst() ? "let " : "let mut ") << assignName(result)
-     << ": ";
+  // A dead synthesized default is dropped in favor of Rust's deferred
+  // initialization (see `computeDeferredInits`), removing the
+  // `unused_assignments` the overwritten default would otherwise draw.
+  if (droppedInitOps.count(variableOp.getOperation())) {
+    os << "let ";
+    if (deferredNeedsMut.lookup(variableOp.getOperation()))
+      os << "mut ";
+    os << assignName(result) << ": ";
+    if (failed(emitType(loc, valueType)))
+      return failure();
+    os << ";\n";
+    return success();
+  }
+  // A `const`-marked variable is never written after its initializer, and a
+  // variable with no reachable mutation likewise needs no `mut`; either way
+  // it becomes an immutable `let` binding.
+  bool isMut = !variableOp.getIsConst() && lvalueIsMutated(result);
+  os << (isMut ? "let mut " : "let ") << assignName(result) << ": ";
   if (failed(emitType(loc, valueType)))
     return failure();
   os << " = ";

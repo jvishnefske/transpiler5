@@ -24,13 +24,13 @@ emitrust.enum_def @Color ["Red", "Green", "Blue"] [0, 1, 2]
 // CHECK-LABEL: fn simple_match(v0: i32) {
 // CHECK-NEXT:    match v0 {
 // CHECK-NEXT:        0 => {
-// CHECK-NEXT:            let v1: i32 = 1;
+// CHECK-NEXT:            let _v1: i32 = 1;
 // CHECK-NEXT:        }
 // CHECK-NEXT:        -4 => {
-// CHECK-NEXT:            let v2: i32 = 2;
+// CHECK-NEXT:            let _v2: i32 = 2;
 // CHECK-NEXT:        }
 // CHECK-NEXT:        _ => {
-// CHECK-NEXT:            let v3: i32 = 3;
+// CHECK-NEXT:            let _v3: i32 = 3;
 // CHECK-NEXT:        }
 // CHECK-NEXT:    }
 // CHECK-NEXT:    return;
@@ -84,22 +84,22 @@ emitrust.func @usize_match(%arg0: index) {
 // statements in the default arm, and an empty default arm elsewhere.
 // CHECK-LABEL: fn nested_match(v0: i32, v1: bool) {
 // CHECK-NEXT:    let v2: i32 = 0;
-// CHECK-NEXT:    let mut v3: i32 = v2;
+// CHECK-NEXT:    let mut _v3: i32 = v2;
 // CHECK-NEXT:    match v0 {
 // CHECK-NEXT:        1 => {
 // CHECK-NEXT:            if v1 {
 // CHECK-NEXT:                let v4: i32 = 5;
-// CHECK-NEXT:                v3 = v4;
+// CHECK-NEXT:                _v3 = v4;
 // CHECK-NEXT:            }
 // CHECK-NEXT:        }
 // CHECK-NEXT:        _ => {
 // CHECK-NEXT:            let v5: i32 = 7;
-// CHECK-NEXT:            v3 = v5;
+// CHECK-NEXT:            _v3 = v5;
 // CHECK-NEXT:        }
 // CHECK-NEXT:    }
 // CHECK-NEXT:    match v0 {
 // CHECK-NEXT:        2 => {
-// CHECK-NEXT:            let v6: i32 = 9;
+// CHECK-NEXT:            let _v6: i32 = 9;
 // CHECK-NEXT:        }
 // CHECK-NEXT:        _ => {
 // CHECK-NEXT:        }
@@ -157,10 +157,10 @@ emitrust.func @match_in_loop(%arg0: i32) {
 }
 
 // CHECK-LABEL: fn enum_ops(v0: Color, v1: Color) -> i32 {
-// CHECK-NEXT:    let mut v2: Color = Color::default();
+// CHECK-NEXT:    let _v2: Color = Color::default();
 // CHECK-NEXT:    let v3: Color = Color::Green;
-// CHECK-NEXT:    let v4: bool = v0 == v1;
-// CHECK-NEXT:    let v5: bool = v0 != v3;
+// CHECK-NEXT:    let _v4: bool = v0 == v1;
+// CHECK-NEXT:    let _v5: bool = v0 != v3;
 // CHECK-NEXT:    let v6: i32 = v0.0 as i32;
 // CHECK-NEXT:    return v6;
 // CHECK-NEXT:  }

@@ -81,7 +81,7 @@ int main(void) { return sum(1, 2) + use_pick(); }
 // references it.
 // RUST: fn use_pick() -> i32 {
 // RUST-NEXT: unimplemented!("unsupported: call to a variadic function")
-// RUST: fn tu0_sum__1(v0: i32, v1: i32) -> i32 {
+// RUST: fn tu0_sum__1(_v0: i32, v1: i32) -> i32 {
 // RUST: fn tu0_taker() -> Option<fn() -> i32> {
 // RUST-NEXT: unimplemented!("unsupported: address of variadic definition")
 // RUST: fn c_main() -> i32 {
