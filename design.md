@@ -4457,7 +4457,8 @@ case -- large amounts of pure integer and fixed-point math, close to the
 supported subset -- and mbedTLS the realistic one; the GAP between those two
 is the most informative number the track can produce.
 
-**RESULTS (2026-07-31). 434 units across 11 repositories; 433 parsed.**
+**RESULTS (2026-07-31). 289 per-unit measurements across 11 repositories;
+288 parsed.**
 
 ```
                      units parsed  full partial no-crate builds  items ported
@@ -4469,7 +4470,7 @@ CMSIS-DSP               92    92     0       0       91      0        0/0   0%
 tinycbor                13    13     0       0       13      0        0/0   0%
 cJSON / heatshrink /
   nanopb / tiny-AES     34    33     1*      8        4     10      70/385 18%
-TOTAL                  434   433     2*    145      147     85  5328/11773
+TOTAL                  289   288     2*    143      141     85  5328/11773
 ```
 
 `*` BOTH `TRANSLATED_FULL` results are VACUOUS -- empty translation units
@@ -4478,7 +4479,7 @@ count of third-party translation units translated in full is ZERO.**
 
 Findings, in order of how much they should change what happens next:
 
-1. **`PARSE_FAIL` = 1 of 434.** Every project's own compile database was
+1. **`PARSE_FAIL` = 1 of 289.** Every project's own compile database was
    consumed successfully and clang built an AST for essentially everything.
    There are no configuration excuses in this data; every number below is a
    genuine translation limit. Configuration effort was also LOWER than
@@ -4493,16 +4494,16 @@ Findings, in order of how much they should change what happens next:
    bodies are byte-swappers, config-empty inits and one-line wrappers. No
    queue operation, no scheduler function, no TCP state-machine function.
 
-3. **73% of all rejections reduce to ONE construct: a pointer stored in a
-   struct field or a global.** `rejected-type-cascade` alone is 52% of the
-   corpus-wide tally (4186 of ~8000), and it is a cascade from that root:
+3. **A pointer stored in a struct field or a global is the dominant
+   construct.** `rejected-type-cascade` alone is 51.6% of the corpus-wide
+   root tally (3384 of 6553), and it is a cascade from that root:
    one rejected struct disqualifies every type and function naming it. The
    roots are each project's central types -- `netif`, `pbuf_custom`,
    `stats_`, the `xSTATIC_*` FreeRTOS types, `pb_callback_s`, mbedTLS's
    context structs. This is **C99-43**, the single remaining unchecked box on
    the C99 roadmap.
 
-4. **Dynamic memory is NOT the barrier: 6 occurrences in 434 units (0.1%),
+4. **Dynamic memory is NOT the barrier: 4 occurrences in 289 units (0.06%),
    and twice in the whole of lwIP.** This is the sharpest correction the
    third-party data delivers. FR-39 and the container/fat-op work invested
    substantially in modelling `malloc` because the SELF-AUTHORED corpus
@@ -4529,6 +4530,22 @@ Findings, in order of how much they should change what happens next:
    because the search repairs it; the search repairs nothing here. On a
    self-authored corpus the colouring looked exact; on real code it is 50-100
    points out with no repair behind it.
+
+**CORRECTION (2026-07-31, same day).** The first aggregation of this track
+reported 434 units and a 73%/52% blocker split. Both were inflated by a
+defect in the AGGREGATOR, not in the measurements. It globbed
+`thirdparty_*.csv` and excluded only `_blockers.csv` by NAME, so the
+per-diagnostic tally files (137 rows) and the project-level aggregate rows
+were counted as translation units; and its blocker sum matched
+`*_blockers.csv` against a group that ships BOTH a direct and a root tally,
+double-counting it. Corrected: **289 distinct per-unit measurements**,
+`rejected-type-cascade` **51.6%** of 6553 root-tagged rejections,
+`dynamic-memory` **4**. The aggregator now selects per-unit files by SCHEMA
+(the presence of an `outcome` column) rather than by filename. A further
+correction: the "functions are 1-6%" figure holds for the RTOS/networking
+group only -- mbedTLS is 36.1% and tiny-AES-c 50.0% by function. None of the
+qualitative findings change; the numbers do, and the wrong ones were
+reported before this note.
 
 **What this implies for priorities.** C99-43 (pointer struct members and
 pointer-to-pointer) is worth more than every other open item combined, by
