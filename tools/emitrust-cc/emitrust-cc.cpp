@@ -61,6 +61,7 @@
 #include "ProgressReport.h"
 
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
+#include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/Conversion/LowerExternalRequirements.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 #include "EmitRust/ImportC.h"
@@ -375,6 +376,10 @@ static void printDiagnostic(mlir::Diagnostic &diag) {
 static mlir::LogicalResult runPipeline(mlir::ModuleOp module) {
   mlir::PassManager pm(module.getContext(),
                        mlir::ModuleOp::getOperationName());
+  // Lower the high-level container ops (the FR-39 node pool) to the concrete
+  // `[T;CAP]` array + cursor shape FIRST, before mem2reg promotes the cursor,
+  // so all downstream lowering is identical to inlining the pool directly.
+  pm.addPass(mlir::emitrust::createEmitRustLowerContainers());
   pm.addPass(mlir::createMem2Reg());
   pm.addPass(mlir::createCanonicalizerPass());
   pm.addPass(mlir::createLiftControlFlowToSCFPass());

@@ -4682,12 +4682,13 @@ private:
   /// pool index `Option<usize>` (W4.2e Part B); the emission diverts their
   /// struct-field type and read/write lowering.
   llvm::SmallPtrSet<const clang::FieldDecl *, 4> poolNextFields;
-  /// The synthesized `[T; cap]` pool place and its i64 free-cursor cell of
-  /// the function currently being imported (W4.2e Part B); null outside a
-  /// pooling function. Set at function entry, consumed by malloc-append and
-  /// every handle's member projection.
+  /// The high-level `emitrust.collection` pool place of the function
+  /// currently being imported (W4.2e Part B); null outside a pooling
+  /// function. Set at function entry, consumed by malloc-append
+  /// (`collection_push`) and every handle's member projection
+  /// (`collection_at`); lowered to the concrete `[T; cap]` array + i64 cursor
+  /// by the emitrust-lower-containers pass.
   Value currentPoolPlace;
-  Value currentPoolCursorCell;
   /// The `deref(arg0)` receiver place while importing a method body; null
   /// otherwise. Sibling method calls borrow it (rendering `(*self).m(...)`).
   Value currentReceiverPlace;

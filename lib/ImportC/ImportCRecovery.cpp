@@ -125,7 +125,6 @@ void CImporter::resetPerFunctionState() {
   currentFunctionBody = nullptr;
   currentReceiverPlace = Value();
   currentPoolPlace = Value();
-  currentPoolCursorCell = Value();
   currentMethodOwner = nullptr;
   currentOwnerIndexReturn = false;
   currentCxxThisRef = Value();

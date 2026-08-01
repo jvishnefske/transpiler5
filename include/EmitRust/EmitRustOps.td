@@ -1010,6 +1010,49 @@ def EmitRust_VariableOp : EmitRust_Op<"variable"> {
 }
 
 //===----------------------------------------------------------------------===//
+// Container ops (the backend-agnostic container computational model)
+//===----------------------------------------------------------------------===//
+// The backend-agnostic "container computational model": nullable indices into
+// a collection of `T`. One high-level representation, lowered by the
+// emitrust-lower-containers pass to a concrete container. The production
+// backend is a fixed `[T;CAP]` array + i64 free cursor (the FR-39 node-pool
+// shape); a growable `Vec<T>` backend is deferred to the heap RFC (design.md
+// W4.5). The collection place holds a placeholder
+// `!emitrust.opaque<"__emitrust_collection">` value type until the pass
+// replaces it with the concrete pool lvalue. `capacity` is the AST-recovered
+// folded trip count, required by the array backend to size the pool.
+//
+// The importer emits these three ops at malloc-pool recognition time; the
+// lowering pass runs first in the emitrust-cc pipeline (before mem2reg), so
+// everything downstream sees the concrete pool exactly as if the importer had
+// inlined it.
+
+def EmitRust_CollectionOp : EmitRust_Op<"collection"> {
+  let summary = "High-level backend-agnostic collection place";
+  let arguments = (ins TypeAttrOf<AnyType>:$element_type,
+                       OptionalAttr<I64Attr>:$capacity);
+  let results = (outs EmitRust_LValueType:$result);
+  let assemblyFormat = "attr-dict `:` qualified(type($result))";
+}
+
+def EmitRust_CollectionPushOp : EmitRust_Op<"collection_push"> {
+  let summary = "Append a defaulted element, return its index";
+  let arguments = (ins EmitRust_LValueType:$collection);
+  let results = (outs I64:$index);
+  let assemblyFormat =
+      "$collection attr-dict `:` functional-type(operands, results)";
+}
+
+def EmitRust_CollectionAtOp : EmitRust_Op<"collection_at"> {
+  let summary = "Element place at an index into the collection";
+  let arguments = (ins EmitRust_LValueType:$collection, I64:$index);
+  let results = (outs EmitRust_LValueType:$result);
+  let assemblyFormat =
+      "$collection `[` $index `]` attr-dict `:` "
+      "functional-type(operands, results)";
+}
+
+//===----------------------------------------------------------------------===//
 // MemberOp
 //===----------------------------------------------------------------------===//
 

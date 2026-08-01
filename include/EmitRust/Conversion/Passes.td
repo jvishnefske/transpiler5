@@ -309,4 +309,36 @@ def EmitRustLowerExternalRequirements
   let dependentDialects = ["::mlir::emitrust::EmitRustDialect"];
 }
 
+//===----------------------------------------------------------------------===//
+// EmitRustLowerContainers
+//===----------------------------------------------------------------------===//
+
+def EmitRustLowerContainers
+    : Pass<"emitrust-lower-containers", "ModuleOp"> {
+  let summary = "Lower the backend-agnostic container ops to a concrete pool";
+  let description = [{
+    Greedily lowers the high-level container ops
+    (`emitrust.collection`/`collection_push`/`collection_at`) to the
+    production array backend: a fixed `[T;CAP]` pool (an `emitrust.variable`)
+    plus a rank-0 `memref` i64 free cursor initialized to 0.
+
+    - `collection` becomes the pool variable and the cursor cell (stored 0).
+    - `collection_push` loads the cursor, takes that index, stores `index + 1`
+      back, and yields the index — the CAP slots are pre-defaulted by the
+      array's default value, so "append" is just a cursor bump.
+    - `collection_at` becomes an `emitrust.subscript` of the pool at the index.
+
+    This reproduces the exact legacy shape the importer previously inlined at
+    malloc-pool recognition time (FR-39). The pass runs first in the
+    emitrust-cc pipeline, before mem2reg promotes the cursor cell, so all
+    downstream lowering is byte-for-byte identical to inlining the pool
+    directly. A growable `Vec<T>` backend is deferred to the heap RFC
+    (design.md W4.5); the array pattern is the single production container
+    path.
+  }];
+  let dependentDialects = ["::mlir::emitrust::EmitRustDialect",
+                           "::mlir::arith::ArithDialect",
+                           "::mlir::memref::MemRefDialect"];
+}
+
 #endif // EMITRUST_CONVERSION_PASSES

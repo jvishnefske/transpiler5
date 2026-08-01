@@ -27,8 +27,15 @@ int sum_list(void) {
 // The node record's self-ref field is the nullable pool index.
 // CHECK: emitrust.struct_def @Node ["val", "next"] [i32, !emitrust.opaque<"Option<usize>">]
 // CHECK-LABEL: func.func @sum_list
-// A fixed [Node; 5] pool (capacity folded from the loop trip count).
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<5x!emitrust.struct<"Node">>>
+// The importer emits the pool as the high-level, backend-agnostic collection
+// place (element type + folded capacity 5); emitrust-lower-containers turns it
+// back into a fixed [Node; 5] array + i64 cursor before the rest of the
+// pipeline runs. emitrust-import-c runs no passes, so the raw fat ops show.
+// CHECK: emitrust.collection {capacity = 5 : i64, element_type = !emitrust.struct<"Node">} : !emitrust.lvalue<!emitrust.opaque<"__emitrust_collection">>
+// `n = malloc(...)` appends a defaulted slot and takes its index.
+// CHECK: emitrust.collection_push %{{.*}} : (!emitrust.lvalue<!emitrust.opaque<"__emitrust_collection">>) -> i64
+// A handle's `n->field` projection is a subscript into the shared pool.
+// CHECK: emitrust.collection_at %{{.*}}[%{{.*}}] : (!emitrust.lvalue<!emitrust.opaque<"__emitrust_collection">>, i64) -> !emitrust.lvalue<!emitrust.struct<"Node">>
 // `n->next = head` builds the Option<usize> field from the handle pair.
 // CHECK: emitrust.call_opaque "__emitrust_pool_opt"(%{{.*}}, %{{.*}}) : (i1, i64) -> !emitrust.opaque<"Option<usize>">
 // CHECK: emitrust.assign %{{.*}} = %{{.*}} : !emitrust.lvalue<!emitrust.opaque<"Option<usize>">>

@@ -506,7 +506,6 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
   currentPoolPlace = Value();
-  currentPoolCursorCell = Value();
   currentMethodOwner = nullptr;
   currentOwnerIndexReturn =
       methodOwner && ownerIndexReturns.contains(func->getCanonicalDecl());
@@ -700,10 +699,12 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
     }
   }
 
-  // W4.2e Part B (FR-39): a promoting function synthesizes its fixed
-  // `[T; cap]` node pool and an i64 free cursor (starting at 0) at entry;
-  // every handle's member projection subscripts this shared pool, and
-  // malloc appends a zeroed slot at the cursor.
+  // W4.2e Part B (FR-39): a promoting function emits its node pool at entry
+  // as the high-level, backend-agnostic `emitrust.collection` place (element
+  // type + folded capacity); every handle's member projection is a
+  // `collection_at` and malloc a `collection_push`. The
+  // emitrust-lower-containers pass turns these back into the concrete fixed
+  // `[T; cap]` array + i64 free cursor before the rest of the pipeline runs.
   if (auto poolIt = mallocPools.find(func->getCanonicalDecl());
       poolIt != mallocPools.end()) {
     const MallocPoolFacts &facts = poolIt->second;
@@ -711,13 +712,14 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
         mapType(astContext().getRecordType(facts.structDecl), loc);
     if (failed(elementType))
       return failure();
-    Type poolType =
-        emitrust::ArrayType::get(builder.getContext(), facts.cap, *elementType);
-    currentPoolPlace = createVariablePlace(loc, poolType);
-    currentPoolCursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
-    builder.create<memref::StoreOp>(
-        loc, createIntConstant(loc, builder.getIntegerType(64), 0),
-        currentPoolCursorCell);
+    Type collectionType = emitrust::OpaqueType::get(builder.getContext(),
+                                                    "__emitrust_collection");
+    currentPoolPlace =
+        builder
+            .create<emitrust::CollectionOp>(
+                loc, emitrust::LValueType::get(collectionType),
+                TypeAttr::get(*elementType), builder.getI64IntegerAttr(facts.cap))
+            .getResult();
   }
 
   if (failed(emitStmt(func->getBody())))
@@ -909,7 +911,6 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentFunctionBody = func->getBody();
   currentReceiverPlace = Value();
   currentPoolPlace = Value();
-  currentPoolCursorCell = Value();
   currentMethodOwner = nullptr;
   currentOwnerIndexReturn = false;
   currentCxxThisRef = Value();

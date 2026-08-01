@@ -1770,20 +1770,19 @@ CImporter::storePoolHandleAssign(Location loc, const clang::VarDecl *ptr,
                                  const PointerLocalInfo &info,
                                  const clang::Expr *rhs) {
   IntegerType i64Type = builder.getIntegerType(64);
-  // `n = malloc(sizeof(struct T))`: append a slot at the free cursor. The
-  // handle becomes (index = cursor, non-null = true) and the cursor
-  // advances. The pool array is zero-initialized, so the fresh slot needs
-  // no explicit clearing (malloc's indeterminate contents refined to zero).
+  // `n = malloc(sizeof(struct T))`: append a defaulted slot to the pool and
+  // take its index. The handle becomes (index, non-null = true). The
+  // high-level `collection_push` hides the free-cursor bump; the pool's
+  // slots are default-initialized, so malloc's indeterminate contents are
+  // refined to zero.
   if (asAllocCall(rhs)) {
-    Value cursor = loadPlace(loc, currentPoolCursorCell);
-    builder.create<memref::StoreOp>(loc, cursor, info.cursorCell);
+    Value idx = builder
+                    .create<emitrust::CollectionPushOp>(loc, i64Type,
+                                                        currentPoolPlace)
+                    .getResult();
+    builder.create<memref::StoreOp>(loc, idx, info.cursorCell);
     builder.create<memref::StoreOp>(loc, createBoolConstant(loc, true),
                                     info.nonNullCell);
-    Value next = builder
-                     .create<arith::AddIOp>(
-                         loc, cursor, createIntConstant(loc, i64Type, 1))
-                     .getResult();
-    builder.create<memref::StoreOp>(loc, next, currentPoolCursorCell);
     return success();
   }
   // `n = NULL`: the None side; only the flag changes (the index is dead).
