@@ -61,6 +61,11 @@ namespace emitrust {
 /// `isInternalLinkageSymbolName`.
 inline constexpr llvm::StringLiteral kAnonNamespaceTag = "ns_anon_";
 
+/// The same tag as it appears inside a SCREAMING_SNAKE_CASE global under the
+/// FR-53 idiomatic rename. Kept adjacent to `kAnonNamespaceTag` so the two
+/// spellings cannot drift apart silently.
+inline constexpr llvm::StringLiteral kAnonNamespaceTagUpper = "NS_ANON_";
+
 /// Returns whether `name` — an emitted Rust item name, i.e. the output of
 /// `cFunctionSymbolName` or `cGlobalSymbolName` — carries an
 /// internal-linkage marker.
@@ -78,7 +83,7 @@ inline bool isInternalLinkageSymbolName(llvm::StringRef name) {
   // The tags are lowercase on a snake_case function name and uppercased on a
   // SCREAMING_SNAKE_CASE global (FR-53 idiomatic rename), so both spellings of
   // each tag are accepted.
-  if (name.contains(kAnonNamespaceTag) || name.contains("NS_ANON_"))
+  if (name.contains(kAnonNamespaceTag) || name.contains(kAnonNamespaceTagUpper))
     return true;
   if (!name.consume_front("tu") && !name.consume_front("TU"))
     return false;

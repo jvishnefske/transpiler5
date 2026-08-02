@@ -6,16 +6,27 @@
 //===----------------------------------------------------------------------===//
 //
 /// \file
-/// This file implements the EmitRust-to-Rust emitter: a pure, syntax-directed
+/// This file implements the EmitRust-to-Rust emitter: a syntax-directed
 /// translation from the EmitRust dialect to Rust source text. The emitter is
 /// structured after upstream EmitC's CppEmitter: an internal emitter class
 /// holds the indented output stream and a per-function value-name map, and a
 /// llvm::TypeSwitch dispatches over the supported operations. Place
 /// operations (variable/member/subscript/deref) emit nothing at their
 /// program point; the place expressions they denote are rendered on demand
-/// by a recursive helper when a load, assign, or borrow consumes them. Every
-/// construct that cannot be represented in Rust fails the translation with a
-/// located diagnostic; no silently wrong output is ever produced.
+/// by a recursive helper when a load, assign, or borrow consumes them.
+///
+/// So the emitted Rust compiles clean under the standard lints, each function
+/// is pre-analyzed before emission (all analyses are use-list/reachability
+/// walks over the IR; they never change semantics, only rendering):
+/// unreachable statements after a diverging op are skipped, never-read
+/// bindings are `_`-prefixed, a dead initializer is dropped in favor of
+/// Rust's deferred initialization (`let v: T;`), entry-block dead stores are
+/// elided, and `mut` is emitted only for bindings that are actually mutated.
+/// A drop is made only where the analysis PROVES no read on any path; a
+/// wrong drop can only surface as a hard rustc error (E0381/E0384), never as
+/// silently different behavior. Every construct that cannot be represented
+/// in Rust fails the translation with a located diagnostic; no silently
+/// wrong output is ever produced.
 //
 //===----------------------------------------------------------------------===//
 
@@ -53,9 +64,11 @@ namespace {
 
 /// Emitter that translates EmitRust operations into Rust source text.
 ///
-/// The emitter is a functional core over an output stream: it owns no state
-/// other than the indented stream wrapper and the per-function map from SSA
-/// values to their Rust binding names. Names are assigned in emission order:
+/// The emitter is a functional core over an output stream: besides the
+/// indented stream wrapper it owns only per-function analysis caches (the
+/// value-name map plus the warning-clean rendering sets: `unreachableOps`,
+/// `deadStores`, `deferredInits`, `valueReadCache`), all recomputed from
+/// scratch at each function entry. Names are assigned in emission order:
 /// within each function, first the entry block arguments, then every op
 /// result (and for-loop induction variable) as it is encountered top-down.
 class RustEmitter {
@@ -113,8 +126,8 @@ private:
 
   /// Emits the Rust place expression denoted by the lvalue-typed `value` by
   /// recursing through its chain of variable/member/subscript/deref/enum_raw
-  /// producers. Any other producer (or a block argument) is an error.
-  /// Emits `value` as a Rust place expression. `derefNeedsParens` is set by
+  /// producers; any other producer (or a block argument) is an error.
+  /// `derefNeedsParens` is set by
   /// the caller when the emitted place will have a projection or index
   /// appended (`.field`, `[i]`, `.0`, `.method()`) or otherwise sits where a
   /// leading unary `*` would misparse; a `emitrust.deref` renders as `(*..)`
@@ -329,12 +342,11 @@ private:
   /// Ops (`emitrust.let` / `emitrust.variable`) whose initializer is a dead
   /// store -- the binding is written on every path before it is read -- so the
   /// emitted binding drops its initializer and relies on Rust's
-  /// definite-assignment. Populated per function by `computeDeferredInits`.
-  llvm::SmallPtrSet<Operation *, 16> droppedInitOps;
-
-  /// For each op in `droppedInitOps`, whether the deferred binding still needs
-  /// `mut` (some path assigns it more than once).
-  DenseMap<Operation *, bool> deferredNeedsMut;
+  /// definite-assignment. Membership means "defer"; the mapped bool is whether
+  /// the deferred binding still needs `mut` (some path assigns it more than
+  /// once, reassigns across loop iterations, or mutates it after init).
+  /// Populated per function by `computeDeferredInits`.
+  DenseMap<Operation *, bool> deferredInits;
 
   /// Summary of how a binding is accessed across a straight-line/structured op
   /// sequence, used to decide whether its initializer is a dead store.
@@ -347,6 +359,15 @@ private:
     bool loopReassign = false; ///< the binding is reassigned across iterations
   };
 
+  /// The liveness of an EMPTY region: no reads, and the entering write-state
+  /// simply falls through. A named factory instead of a braced literal so the
+  /// meaning cannot silently drift with the struct's field order.
+  static Liveness passThroughLiveness(bool enteringWritten) {
+    Liveness l;
+    l.writtenAtExit = enteringWritten;
+    return l;
+  }
+
   /// Tracks, across a loop body, whether every `break` that exits the loop
   /// has written the binding on its path.
   struct BreakInfo {
@@ -354,7 +375,6 @@ private:
     bool allWritten = true;
   };
 
-  bool isBindingWrite(Operation *op, Value binding);
   /// `partialWriteBlocks` selects how a projection use of the binding
   /// (`v.x`, `v[i]`) that precedes the first whole write is treated: `true`
   /// (deferral) counts it as a read, since Rust rejects a partial write to an
@@ -367,8 +387,15 @@ private:
   Liveness analyzeControl(Operation *op, Value binding, bool enteringWritten,
                           BreakInfo *brk, bool partialWriteBlocks);
   /// Decides, for each candidate binding in the function, whether its init is a
-  /// dead store; fills `droppedInitOps` / `deferredNeedsMut`.
+  /// dead store; fills `deferredInits`.
   void computeDeferredInits(Block &block);
+
+  /// Emits the deferred declaration `let [mut] <name>: <type>;` for a binding
+  /// whose dead initializer was dropped (see `deferredInits`).
+  LogicalResult emitDeferredBinding(Operation *op, Value result, Type type);
+
+  /// Whether any emitted (reachable, non-dead-store) assign targets `value`.
+  bool letHasEmittedAssign(Value value);
 
   /// Whole-binding `emitrust.assign` stores whose written value is never read
   /// before the binding is overwritten again -- dead stores that emit nothing.
@@ -404,6 +431,49 @@ private:
 /// Whether `op` renders as a diverging Rust expression (defined below).
 static bool opDiverges(Operation *op);
 
+/// Whether `op` is a place-refining projection (`v.x`, `v[i]`, `*p`, `v.0`).
+/// Projections emit nothing at their program point; their read/write is
+/// attributed to the load/store/borrow that consumes the refined place.
+static bool isPlaceProjection(Operation *op) {
+  return isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
+             emitrust::EnumRawOp>(op);
+}
+
+/// Whether `op` is a place projection whose refined BASE (operand 0) is
+/// `base`. False for a projection that merely uses `base` as a non-base
+/// operand, e.g. a subscript index.
+static bool refinesBase(Operation *op, Value base) {
+  return isPlaceProjection(op) && op->getOperand(0) == base;
+}
+
+/// Follows place-refining projections back to the place they ultimately
+/// refine, so a use of `v.x` can be recognized as a use of `v`.
+static Value projectionBase(Value value) {
+  while (Operation *def = value.getDefiningOp()) {
+    if (!isPlaceProjection(def))
+      break;
+    value = def->getOperand(0); // operand 0 is the refined base
+  }
+  return value;
+}
+
+/// Whether `op` is an `emitrust.assign` whose target is the whole `binding`.
+static bool isBindingWrite(Operation *op, Value binding) {
+  auto assign = dyn_cast<emitrust::AssignOp>(op);
+  return assign && assign.getVar() == binding;
+}
+
+/// Returns whether `value` is the function-pointer null constant, i.e. the
+/// `emitrust.constant` carrying the opaque `None` produced by the importer's
+/// `createFnPtrNone` for a C null function pointer.
+static bool isFnPtrNone(Value value) {
+  auto constant = value.getDefiningOp<emitrust::ConstantOp>();
+  if (!constant)
+    return false;
+  auto opaque = dyn_cast<emitrust::OpaqueAttr>(constant.getValue());
+  return opaque && opaque.getValue() == "None";
+}
+
 std::string RustEmitter::assignName(Value value) {
   std::string &name = valueNames[value];
   if (name.empty())
@@ -432,27 +502,27 @@ bool RustEmitter::valueIsReadUncached(Value value) {
       continue;
     // A `let` whose dead initializer we dropped no longer reads its init
     // operand, so that use does not keep `value` live.
-    if (droppedInitOps.count(owner))
+    if (deferredInits.count(owner))
       if (auto letOp = dyn_cast<emitrust::LetOp>(owner))
         if (use.get() == letOp.getInit())
           continue;
-    // A fn-pointer null constant compared with `==`/`!=` renders as an Option
-    // null-test (`.is_none()`/`.is_some()`) on the other operand; the null
-    // side is never emitted, so it is not a read (see `emitFnPtrCmp`).
-    if (isa<emitrust::CmpOp>(owner))
-      if (auto constant = value.getDefiningOp<emitrust::ConstantOp>())
-        if (auto opaque = dyn_cast<emitrust::OpaqueAttr>(constant.getValue()))
-          if (opaque.getValue() == "None")
-            continue;
+    // A fn-pointer null constant eq/ne-compared renders as an Option null-test
+    // (`.is_none()`/`.is_some()`) on the other operand; the null side is never
+    // emitted, so it is not a read. The guard mirrors `emitCmp`'s routing to
+    // `emitFnPtrCmp` exactly.
+    if (auto cmp = dyn_cast<emitrust::CmpOp>(owner))
+      if ((cmp.getPredicate() == emitrust::CmpPredicate::eq ||
+           cmp.getPredicate() == emitrust::CmpPredicate::ne) &&
+          isFnPtrNone(value))
+        continue;
     // The destination of an assignment is a write, not a read.
     if (auto assign = dyn_cast<emitrust::AssignOp>(owner))
       if (assign.getVar() == value)
         continue;
     // A place-refining op emits nothing itself.
-    if (isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
-            emitrust::EnumRawOp>(owner)) {
+    if (isPlaceProjection(owner)) {
       Value place = owner->getResult(0);
-      if (owner->getOperand(0) == value) {
+      if (refinesBase(owner, value)) {
         // `value` is the refined BASE: read through the projection only when
         // the projected place is itself read.
         if (valueIsRead(place))
@@ -465,10 +535,9 @@ bool RustEmitter::valueIsReadUncached(Value value) {
       if (valueIsRead(place))
         return true;
       for (Operation *consumer : place.getUsers())
-        if (auto assign = dyn_cast<emitrust::AssignOp>(consumer))
-          if (assign.getVar() == place && !unreachableOps.count(consumer) &&
-              !deadStores.count(consumer))
-            return true;
+        if (isBindingWrite(consumer, place) &&
+            !unreachableOps.count(consumer) && !deadStores.count(consumer))
+          return true;
       continue;
     }
     return true;
@@ -542,9 +611,7 @@ bool RustEmitter::lvalueIsMutated(Value value) {
     }
     // A place refined by a projection is mutated when the refined place is --
     // but only when `value` is the refined BASE, not a subscript index.
-    if (isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
-            emitrust::EnumRawOp>(owner) &&
-        owner->getOperand(0) == value) {
+    if (refinesBase(owner, value)) {
       if (lvalueIsMutated(owner->getResult(0)))
         return true;
       continue;
@@ -573,24 +640,6 @@ void RustEmitter::computeUnreachable(Block &block) {
   }
 }
 
-bool RustEmitter::isBindingWrite(Operation *op, Value binding) {
-  auto assign = dyn_cast<emitrust::AssignOp>(op);
-  return assign && assign.getVar() == binding;
-}
-
-/// Follows place-refining projections (`v.x`, `v[i]`, `*p`, `v.0`) back to the
-/// place they ultimately refine, so a use of `v.x` can be recognized as a use
-/// of `v`.
-static Value projectionBase(Value value) {
-  while (Operation *def = value.getDefiningOp()) {
-    if (!isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
-             emitrust::EnumRawOp>(def))
-      break;
-    value = def->getOperand(0); // operand 0 is the refined base
-  }
-  return value;
-}
-
 RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
                                                   bool enteringWritten,
                                                   BreakInfo *brk,
@@ -606,8 +655,7 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
     Liveness thenL = arm(ifOp.getThenRegion());
     // An if with no else falls through with only the entering write-state.
     Liveness elseL = ifOp.getElseRegion().empty()
-                         ? Liveness{/*readFirst=*/false,
-                                    /*writtenAtExit=*/enteringWritten}
+                         ? passThroughLiveness(enteringWritten)
                          : arm(ifOp.getElseRegion());
     r.readFirst = thenL.readFirst || elseL.readFirst;
     r.hasLoopWrite = thenL.hasLoopWrite || elseL.hasLoopWrite;
@@ -649,8 +697,7 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
   if (auto sw = dyn_cast<emitrust::SwitchOp>(op)) {
     auto seq = [&](Region &region) {
       return region.empty()
-                 ? Liveness{/*readFirst=*/false,
-                            /*writtenAtExit=*/enteringWritten}
+                 ? passThroughLiveness(enteringWritten)
                  : analyzeSeq(region.front().begin(), region.front().end(),
                               binding, enteringWritten, brk, partialWriteBlocks);
     };
@@ -742,11 +789,7 @@ RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
     // A place-refining projection emits nothing and is not itself an event; its
     // read/write is attributed to the load/store/borrow that consumes it. Only
     // a non-base operand (e.g. an index that is the binding) reads it here.
-    unsigned baseOperands =
-        isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
-            emitrust::EnumRawOp>(op)
-            ? 1
-            : 0;
+    unsigned baseOperands = isPlaceProjection(op) ? 1 : 0;
     if (!written)
       for (unsigned i = baseOperands, e = op->getNumOperands(); i < e; ++i)
         if (projectionBase(op->getOperand(i)) == binding) {
@@ -791,7 +834,7 @@ void RustEmitter::computeDeferredInits(Block &block) {
       // safe: a projection of the binding (a partial write `v.x = ..` or a
       // read) counts as a use, so if it precedes the first whole write the
       // binding is `readFirst` and is not deferred (an aggregate filled purely
-      // field-by-field is left to reconstruction). A whole reassignment
+      // field-by-field keeps its synthesized default). A whole reassignment
       // (`v = other`) of any type fully initializes the binding, after which
       // partial writes are fine.
       if (variableOp.getInitAttr())
@@ -817,7 +860,6 @@ void RustEmitter::computeDeferredInits(Block &block) {
                    /*partialWriteBlocks=*/true);
     if (info.readFirst)
       return; // the initializer is live: some path reads before writing
-    droppedInitOps.insert(op);
     // `mut` is needed when a path assigns more than once, when the binding is
     // reassigned across loop iterations, or when it is mutably borrowed after
     // its (single) initializing assignment.
@@ -835,12 +877,10 @@ void RustEmitter::computeDeferredInits(Block &block) {
       // A partial write (`v.x = ..`, `v[i] = ..`) mutates the binding after
       // its initializing whole assignment -- but only when the binding is the
       // refined BASE, not a subscript index (`other[binding]` merely reads it).
-      if (isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
-              emitrust::EnumRawOp>(user) &&
-          user->getOperand(0) == binding)
+      if (refinesBase(user, binding))
         postInitMutation |= lvalueIsMutated(user->getResult(0));
     }
-    deferredNeedsMut[op] =
+    deferredInits[op] =
         info.maxWrites >= 2 || info.loopReassign || postInitMutation;
   });
 }
@@ -1291,8 +1331,7 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   valueCount = 0;
   unreachableOps.clear();
   valueReadCache.clear();
-  droppedInitOps.clear();
-  deferredNeedsMut.clear();
+  deferredInits.clear();
   deadStores.clear();
 
   Region &body = fn.getFunctionBody();
@@ -1497,17 +1536,30 @@ LogicalResult RustEmitter::emitLiteral(emitrust::LiteralOp literalOp) {
   return success();
 }
 
-/// Returns whether any `emitrust.assign` writes directly to `value`. A
+LogicalResult RustEmitter::emitDeferredBinding(Operation *op, Value result,
+                                               Type type) {
+  os << "let ";
+  if (deferredInits.lookup(op))
+    os << "mut ";
+  os << assignName(result) << ": ";
+  if (failed(emitType(result.getLoc(), type)))
+    return failure();
+  os << ";\n";
+  return success();
+}
+
+/// Returns whether any EMITTED `emitrust.assign` writes directly to `value`
+/// (uses inside unreachable code or dropped dead stores never render). A
 /// `emitrust.let` result is a plain SSA value (never an lvalue place), so the
 /// only way to mutate it is a direct assignment; this suffices to decide
 /// whether the emitted `let` needs `mut`, avoiding a spurious `unused_mut`
 /// on the default-initialized SSA-destruction lets the SCF lowering marks
 /// mutable up front (before the arm assignments that may or may not exist).
-static bool valueHasDirectAssignUser(Value value) {
+bool RustEmitter::letHasEmittedAssign(Value value) {
   for (Operation *user : value.getUsers())
-    if (auto assign = dyn_cast<emitrust::AssignOp>(user))
-      if (assign.getVar() == value)
-        return true;
+    if (isBindingWrite(user, value) && !unreachableOps.count(user) &&
+        !deadStores.count(user))
+      return true;
   return false;
 }
 
@@ -1517,17 +1569,9 @@ LogicalResult RustEmitter::emitLet(emitrust::LetOp letOp) {
   // A dead initializer is dropped: the binding is written on every path before
   // it is read, so Rust's definite-assignment lets us defer initialization and
   // avoid the `unused_assignments` the overwritten init would draw.
-  if (droppedInitOps.count(op)) {
-    os << "let ";
-    if (deferredNeedsMut.lookup(op))
-      os << "mut ";
-    os << assignName(result) << ": ";
-    if (failed(emitType(result.getLoc(), result.getType())))
-      return failure();
-    os << ";\n";
-    return success();
-  }
-  bool isMut = letOp.getIsMut() && valueHasDirectAssignUser(result);
+  if (deferredInits.count(op))
+    return emitDeferredBinding(op, result, result.getType());
+  bool isMut = letOp.getIsMut() && letHasEmittedAssign(result);
   if (failed(emitLetPrologue(result, isMut)))
     return failure();
   if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
@@ -1609,17 +1653,6 @@ static StringRef cmpPredicateSymbol(emitrust::CmpPredicate predicate) {
   return "";
 }
 
-/// Returns whether `value` is the function-pointer null constant, i.e. the
-/// `emitrust.constant` carrying the opaque `None` produced by the importer's
-/// `createFnPtrNone` for a C null function pointer.
-static bool isFnPtrNone(Value value) {
-  auto constant = value.getDefiningOp<emitrust::ConstantOp>();
-  if (!constant)
-    return false;
-  auto opaque = dyn_cast<emitrust::OpaqueAttr>(constant.getValue());
-  return opaque && opaque.getValue() == "None";
-}
-
 /// Lowers an equality/inequality comparison whose operands are `Option<fn..>`
 /// function pointers. A literal `==`/`!=` would trip
 /// `unpredictable_function_pointer_comparisons`, so:
@@ -1644,7 +1677,7 @@ LogicalResult RustEmitter::emitFnPtrCmp(emitrust::CmpOp cmpOp, Value lhs,
     os << (isEq ? ".is_none()" : ".is_some()") << ";\n";
     return success();
   }
-  if (lhsNone && rhsNone) {
+  if (lhsNone) { // rhsNone too: lhsNone == rhsNone was established above
     // Both sides are the null constant; the result is statically known.
     os << (isEq ? "true" : "false") << ";\n";
     return success();
@@ -2215,16 +2248,8 @@ LogicalResult RustEmitter::emitVariable(emitrust::VariableOp variableOp) {
   // A dead synthesized default is dropped in favor of Rust's deferred
   // initialization (see `computeDeferredInits`), removing the
   // `unused_assignments` the overwritten default would otherwise draw.
-  if (droppedInitOps.count(variableOp.getOperation())) {
-    os << "let ";
-    if (deferredNeedsMut.lookup(variableOp.getOperation()))
-      os << "mut ";
-    os << assignName(result) << ": ";
-    if (failed(emitType(loc, valueType)))
-      return failure();
-    os << ";\n";
-    return success();
-  }
+  if (deferredInits.count(variableOp.getOperation()))
+    return emitDeferredBinding(variableOp.getOperation(), result, valueType);
   // A `const`-marked variable is never written after its initializer, and a
   // variable with no reachable mutation likewise needs no `mut`; either way
   // it becomes an immutable `let` binding.

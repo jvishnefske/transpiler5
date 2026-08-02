@@ -36,13 +36,9 @@ void CImporter::collectStaticLocalNames(const clang::Stmt *stmt,
   if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt))
     for (const clang::Decl *decl : declStmt->decls())
       if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
-        if (var->isStaticLocal()) {
-          std::string mangled =
-              (llvm::Twine(funcName) + "_" + var->getName()).str();
-          if (idiomaticRenameEnabled())
-            mangled = toScreamingSnakeCase(mangled);
-          ordinaryTuNames.insert(mangled);
-        }
+        if (var->isStaticLocal())
+          ordinaryTuNames.insert(globalRustName(
+              (llvm::Twine(funcName) + "_" + var->getName()).str()));
   for (const clang::Stmt *child : stmt->children())
     collectStaticLocalNames(child, funcName);
 }
@@ -100,8 +96,7 @@ CImporter::structSymbolName(const clang::RecordDecl *definition,
     // C's tag namespace is separate from the ordinary one (C99 6.2.3);
     // the module symbol table is not, so the tag yields deterministically.
     // Under the idiomatic rename the disambiguated name stays UpperCamelCase.
-    assigned = idiomaticRenameEnabled() ? toUpperCamelCase("Struct_" + base)
-                                        : "Struct_" + base;
+    assigned = typeRustName("Struct_" + base);
     if (ordinaryNameTaken(assigned))
       return emitError(loc)
              << "unsupported: struct '" << base
@@ -202,12 +197,10 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
       return emitError(defLoc)
              << "unsupported: struct definition outside file or function "
                 "scope";
-    std::string mangledBase =
-        (llvm::Twine(mlirFuncName(enclosing)) + "_" + structName).str();
-    // A block-scope record's `<fn>_<tag>` disambiguator stays UpperCamelCase
-    // under the idiomatic rename (its pieces are already renamed).
-    if (idiomaticRenameEnabled())
-      mangledBase = toUpperCamelCase(mangledBase);
+    // A block-scope record's `<fn>_<tag>` disambiguator is a type name, so it
+    // takes the type spelling (UpperCamelCase under the idiomatic rename).
+    std::string mangledBase = typeRustName(
+        (llvm::Twine(mlirFuncName(enclosing)) + "_" + structName).str());
     std::string mangled = mangledBase;
     // Each probe below tries a fresh suffix, so the loop takes at most one
     // step per already-emitted struct name — bounded and deterministic.

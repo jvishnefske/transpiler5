@@ -414,8 +414,7 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
             .str();
     // A synthesized owner struct is a type name: UpperCamelCase under the
     // idiomatic rename.
-    if (idiomaticRenameEnabled())
-      structName = toUpperCamelCase(structName);
+    structName = typeRustName(structName);
     ownerPlans[base] = OwnerPlan{structName, /*structDefCreated=*/false};
     for (const clang::FunctionDecl *fn : methodFns)
       methodPlans[fn->getCanonicalDecl()] = base;
@@ -1997,15 +1996,15 @@ CImporter::planVaMonomorphOnce(const clang::TranslationUnitDecl *unit) {
       // rename uses a single-underscore `_<n>` suffix (snake-case clean) and
       // bumps the ordinal on a collision; the verbatim path keeps the historic
       // `__<n>` suffix with an appended `_` on collision.
+      const std::string prefix = mlirFuncName(site.target);
       std::string name;
       if (idiomaticRenameEnabled()) {
         unsigned ordinal = plan.clones.size() + 1;
-        name = mlirFuncName(site.target) + "_" + std::to_string(ordinal);
+        name = prefix + "_" + std::to_string(ordinal);
         while (ordinaryNameTaken(name) || functions.lookup(name))
-          name = mlirFuncName(site.target) + "_" + std::to_string(++ordinal);
+          name = prefix + "_" + std::to_string(++ordinal);
       } else {
-        name = mlirFuncName(site.target) + "__" +
-               std::to_string(plan.clones.size() + 1);
+        name = prefix + "__" + std::to_string(plan.clones.size() + 1);
         while (ordinaryNameTaken(name) || functions.lookup(name))
           name += "_";
       }
