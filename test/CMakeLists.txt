@@ -14,6 +14,7 @@ set(EMITRUST_TEST_DEPENDS
   emitrust-translate
   emitrust-import-c
   emitrust-cc
+  emitrust-clang
 )
 
 add_lit_testsuite(check-emitrust "Running the EmitRust regression tests"

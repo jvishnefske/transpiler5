@@ -48,7 +48,8 @@ llvm_config.with_environment("PATH", config.emitrust_tools_dir, append_path=True
 llvm_config.with_environment("PATH", config.llvm_tools_dir, append_path=True)
 
 tool_dirs = [config.emitrust_tools_dir, config.llvm_tools_dir]
-tools = ["emitrust-opt", "emitrust-translate", "emitrust-import-c", "emitrust-cc"]
+tools = ["emitrust-opt", "emitrust-translate", "emitrust-import-c", "emitrust-cc",
+         "emitrust-clang"]
 
 llvm_config.add_tool_substitutions(tools, tool_dirs)
 

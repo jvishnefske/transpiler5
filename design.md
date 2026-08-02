@@ -1746,6 +1746,20 @@ of references or inheritance, so it precedes both.
   Acceptance: a small real Makefile project builds unmodified with
   CC=emitrust-clang, producing byte-identical binaries to a plain-clang
   build, with one artifact per compiled TU.
+  SPIKE (GO): `tools/emitrust-clang` proves the shape end-to-end -- a 3-TU
+  `-O2 -Wall -MD` Makefile project builds byte-identical under the shim with
+  one text-MLIR artifact per TU, `-D` macros provably reach the import,
+  `--version`/`-E`/depfiles/response-files/compile-error exit codes pass
+  through, incremental make recompiles exactly the touched TU, and a
+  rejecting construct (volatile) is recovered without failing the build
+  (test/Driver/emitrust-clang-shim.c pins the contract). Clang-21 driver
+  notes: DiagnosticsEngine takes DiagnosticOptions by reference now;
+  classification must run under an IgnoringDiagConsumer and only for `-c`
+  lines (BuildCompilation PRINTS immediate args like --version). Remaining
+  for the checkbox: cc1-key canonicalization (workflow args like
+  `-dependency-file`/`-o` currently perturb the hash), forwarding target/ABI
+  flags into the import, import-crash isolation (fork or post-hoc), argv0
+  `cc`/`gcc` aliasing, and the FR-57 artifact format.
 - [ ] FR-57 Per-TU artifacts ("object files as parse caches"). `-c` imports
   ONE translation unit in isolation and serializes the result: the imported
   emitrust module as MLIR bytecode plus the TU's item-graph shard and
@@ -1757,6 +1771,14 @@ of references or inheritance, so it precedes both.
   file is the fallback for non-ELF targets. Acceptance: bytecode round-trips
   (emit -> reload -> translate is byte-identical to the direct path), and the
   artifact survives `ar` + `ld` collection.
+  SPIKE (GO): import -> `--emit-bytecode` -> reload -> translate is
+  byte-identical to the direct path on 112/112 single-TU EndToEnd inputs
+  (bytecode ~2.5x smaller than text); an objcopy `.emitrust` section on a
+  real `.o` links, survives an `ar` archive, and dumps back byte-identical,
+  and the extracted payload still translates. First finding fixed on the
+  spot: `!emitrust.array` of enum printed but did not re-parse
+  (`ArrayType::isValidElementType` omitted EnumType;
+  test/Dialect/EmitRust/types.mlir now pins the round-trip).
 - [ ] FR-58 Link-step whole-program aggregation. "Linking" extracts every
   `.emitrust` payload from the link line's objects and archives, MERGES the
   item-graph shards (order-independent, deterministic), runs the FR-41
