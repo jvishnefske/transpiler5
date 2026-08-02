@@ -3497,11 +3497,11 @@ FailureOr<Value> CImporter::emitEnumConstant(
   // even when the enum type itself is never named.
   if (failed(importEnum(definition, loc)))
     return failure();
-  std::string path =
-      (llvm::Twine(definition->getName()) + "::" + enumerator->getName())
-          .str();
-  auto type =
-      emitrust::EnumType::get(builder.getContext(), definition->getName());
+  std::string path = (llvm::Twine(enumTypeRustName(definition->getName())) +
+                      "::" + enumVariantRustName(enumerator->getName()))
+                         .str();
+  auto type = emitrust::EnumType::get(
+      builder.getContext(), enumTypeRustName(definition->getName()));
   auto value = emitrust::OpaqueAttr::get(builder.getContext(), path);
   return builder.create<emitrust::ConstantOp>(loc, type, value).getResult();
 }

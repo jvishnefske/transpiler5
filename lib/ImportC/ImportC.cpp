@@ -1966,6 +1966,8 @@ FailureOr<Type> CImporter::getOrCreateArrayMemberEnumType(
     std::string symbol = (llvm::Twine(field->getParent()->getName()) + "_" +
                           field->getName() + "_Bases")
                              .str();
+    if (emitrust::idiomaticRenameEnabled())
+      symbol = emitrust::toUpperCamelCase(symbol);
     if (SymbolTable::lookupSymbolIn(module, symbol))
       return emitError(loc)
              << "unsupported: array-member-pointer enum name '" << symbol

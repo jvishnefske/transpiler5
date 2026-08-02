@@ -60,6 +60,7 @@
 #include "CrateEmitter.h"
 #include "ProgressReport.h"
 
+#include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/Conversion/LowerExternalRequirements.h"
@@ -257,6 +258,20 @@ static llvm::cl::opt<bool> recoverFlag(
         "is dropped. A summary of the recovered rejections is printed to "
         "stderr. Off by default, in which case the compile is byte-identical "
         "to one built without this flag"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<bool> preserveCNamesFlag(
+    "preserve-c-names",
+    llvm::cl::desc(
+        "Emit C symbol spellings verbatim instead of renaming them to Rust "
+        "convention. By default (FR-53) the emitted crate is renamed to "
+        "idiomatic Rust -- functions and struct fields to snake_case, globals, "
+        "statics, consts and enum variants to SCREAMING_SNAKE_CASE, and struct "
+        "and enum types to UpperCamelCase -- so it compiles clean under the "
+        "standard naming lints. This flag restores the historical verbatim "
+        "spelling. A rename that would fold two distinct C names onto one Rust "
+        "name is rejected with a located diagnostic; --preserve-c-names avoids "
+        "it."),
     llvm::cl::init(false));
 
 static llvm::cl::opt<bool> incrementalFlag(
@@ -743,6 +758,11 @@ int main(int argc, char **argv) {
   llvm::InitLLVM initLlvm(argc, argv);
   llvm::cl::ParseCommandLineOptions(argc, argv,
                                     "EmitRust C-to-Rust transpiler driver\n");
+
+  // FR-53: enable the idiomatic Rust rename for every naming consumer (importer
+  // and item graph) before any symbol is named. Set once here so the two paths
+  // cannot disagree.
+  mlir::emitrust::idiomaticRenameEnabled() = !preserveCNamesFlag;
 
   if (inputFilenames.empty() && compilationDatabasePath.empty()) {
     llvm::errs() << "error: at least one input file is required, or "

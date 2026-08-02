@@ -11,7 +11,7 @@
 // taken — which matters most where the signature is not a transliteration of
 // the C prototype. Here the Phase-4 owner planner promotes `callee` to a
 // METHOD of a synthesized owner struct, trading its `int *` parameter for a
-// leading `&mut Owner_caller_local` receiver plus an i64 element index. An
+// leading `&mut OwnerCallerLocal` receiver plus an i64 element index. An
 // approximated stub signature would have emitted `fn callee(buf: &mut [i32],
 // n: i32)` and broken the very call site this test pins.
 
@@ -31,10 +31,10 @@ int main(void) { return caller(); }
 // The stub carries the real planned signature — receiver, index, scalar —
 // and the `method_of` placement attribute, and nothing else.
 // CHECK-LABEL: func.func @callee(
-// CHECK-SAME: !emitrust.mut_ref<!emitrust.struct<"Owner_caller_local">>
+// CHECK-SAME: !emitrust.mut_ref<!emitrust.struct<"OwnerCallerLocal">>
 // CHECK-SAME: i64
 // CHECK-SAME: i32)
-// CHECK-SAME: emitrust.method_of = "Owner_caller_local"
+// CHECK-SAME: emitrust.method_of = "OwnerCallerLocal"
 // CHECK-NEXT: emitrust.call_opaque "unimplemented!"()
 // CHECK-SAME: unsupported: volatile-qualified type
 // CHECK-NEXT: return
@@ -44,12 +44,12 @@ int main(void) { return caller(); }
 // signature.
 // CHECK-LABEL: func.func @caller
 // CHECK: call @callee(%{{.*}}, %{{.*}}, %{{.*}}) {emitrust.method_call}
-// CHECK-SAME: (!emitrust.mut_ref<!emitrust.struct<"Owner_caller_local">>, i64, i32) -> ()
+// CHECK-SAME: (!emitrust.mut_ref<!emitrust.struct<"OwnerCallerLocal">>, i64, i32) -> ()
 
 // The emitted Rust is a well-formed method call on a well-formed method.
 // RUST: fn caller() -> i32 {
 // RUST: v6.callee(
-// RUST: impl Owner_caller_local {
+// RUST: impl OwnerCallerLocal {
 // RUST-NEXT: fn callee(&mut self, _v0: i64, _v1: i32) {
 // RUST-NEXT: unimplemented!("unsupported: volatile-qualified type");
 

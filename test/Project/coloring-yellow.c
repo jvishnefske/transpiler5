@@ -29,10 +29,10 @@ int main(void) {
   return 0;
 }
 
-// CHECK:      item blocked kind=function color=red reason=inadmissible construct=inline-asm
+// CHECK:      item SLOT kind=global color=yellow reason=stub-callee via=blocked edge=TakesAddressOf chain=SLOT->blocked construct=inline-asm
+// CHECK-NEXT: item blocked kind=function color=red reason=inadmissible construct=inline-asm
 // CHECK-NEXT: item c_main kind=function color=green reason=admissible
 // CHECK-NEXT: item caller kind=function color=yellow reason=stub-callee via=blocked edge=Calls chain=caller->blocked construct=inline-asm
 // CHECK-NEXT: item outer kind=function color=green reason=admissible
-// CHECK-NEXT: item slot kind=global color=yellow reason=stub-callee via=blocked edge=TakesAddressOf chain=slot->blocked construct=inline-asm
 // CHECK-NEXT: tally green=2 yellow=2 red=1
 // CHECK-NOT:  item

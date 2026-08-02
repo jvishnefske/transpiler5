@@ -36,13 +36,13 @@ struct Branch origin;
 int main(void) { return measure(&origin); }
 
 // CHECK:      item Branch kind=record color=green reason=admissible
+// CHECK-NEXT: item COUNTER kind=global color=green reason=admissible
+// CHECK-NEXT: item HOOK kind=global color=green reason=admissible
 // CHECK-NEXT: item Leaf kind=record color=green reason=admissible
 // CHECK-NEXT: item Level kind=enum color=green reason=admissible
+// CHECK-NEXT: item ORIGIN kind=global color=green reason=admissible
 // CHECK-NEXT: item c_main kind=function color=green reason=admissible
-// CHECK-NEXT: item counter kind=global color=green reason=admissible
-// CHECK-NEXT: item hook kind=global color=green reason=admissible
 // CHECK-NEXT: item measure kind=function color=green reason=admissible
-// CHECK-NEXT: item origin kind=global color=green reason=admissible
 // CHECK-NEXT: item tu0_depth kind=function color=green reason=admissible
 // CHECK-NEXT: tally green=9 yellow=0 red=0
 // CHECK-NOT:  item

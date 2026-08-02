@@ -56,6 +56,80 @@
 namespace mlir {
 namespace emitrust {
 
+/// FR-53 idiomatic rename. Process-wide because the SAME naming primitives feed
+/// two independent driver paths that must agree byte-for-byte (see the file
+/// header): the importer that creates MLIR/Rust items, and the FR-40 item graph
+/// that runs its own clang parse with no importer in scope. A single source of
+/// truth makes drift between the two impossible; a per-call parameter threaded
+/// through both paths could silently diverge on a missed site. It is set once,
+/// at startup, by the driver (`emitrust-cc`; default = rename ON, disabled by
+/// `--preserve-c-names`). Tools that do not set it (e.g. `emitrust-import-c`)
+/// keep verbatim C spellings, so their golden tests are unaffected.
+inline bool &idiomaticRenameEnabled() {
+  static bool enabled = false;
+  return enabled;
+}
+
+/// Converts a C identifier to `snake_case`: a `_` is inserted before every
+/// uppercase letter that begins a new word (one following a lowercase letter
+/// or a digit, or one that ends an acronym -- an uppercase followed by a
+/// lowercase), and all letters are lowercased. Existing underscores are
+/// preserved, so an already-snake name is unchanged. Used for function and
+/// struct-field names (FR-53 idiomatic rename).
+static inline std::string toSnakeCase(llvm::StringRef name) {
+  std::string out;
+  out.reserve(name.size() + 4);
+  for (size_t i = 0, e = name.size(); i < e; ++i) {
+    char c = name[i];
+    if (c >= 'A' && c <= 'Z') {
+      char prev = i > 0 ? name[i - 1] : '\0';
+      char next = i + 1 < e ? name[i + 1] : '\0';
+      bool prevLower = prev >= 'a' && prev <= 'z';
+      bool prevDigit = prev >= '0' && prev <= '9';
+      bool prevUpper = prev >= 'A' && prev <= 'Z';
+      bool nextLower = next >= 'a' && next <= 'z';
+      if (i > 0 && (prevLower || prevDigit || (prevUpper && nextLower)))
+        out.push_back('_');
+      out.push_back(static_cast<char>(c - 'A' + 'a'));
+    } else {
+      out.push_back(c);
+    }
+  }
+  return out;
+}
+
+/// Converts a C identifier to `SCREAMING_SNAKE_CASE` (snake-case, uppercased).
+/// Used for global/static/const names and enum-variant associated constants.
+static inline std::string toScreamingSnakeCase(llvm::StringRef name) {
+  std::string s = toSnakeCase(name);
+  for (char &c : s)
+    if (c >= 'a' && c <= 'z')
+      c = static_cast<char>(c - 'a' + 'A');
+  return s;
+}
+
+/// Converts a C identifier to `UpperCamelCase`: the snake-case word boundaries
+/// are removed and each word is capitalized. Used for struct/enum type names
+/// (including synthesized `Owner_<fn>_<base>` owners, which become
+/// `OwnerFnBase`).
+static inline std::string toUpperCamelCase(llvm::StringRef name) {
+  std::string snake = toSnakeCase(name);
+  std::string out;
+  out.reserve(snake.size());
+  bool capitalizeNext = true;
+  for (char c : snake) {
+    if (c == '_') {
+      capitalizeNext = true;
+      continue;
+    }
+    if (capitalizeNext && c >= 'a' && c <= 'z')
+      c = static_cast<char>(c - 'a' + 'A');
+    capitalizeNext = false;
+    out.push_back(c);
+  }
+  return out;
+}
+
 /// Returns whether `name` is a Rust keyword (strict or reserved, editions
 /// 2015-2021, plus the contextual `union`) and thus unusable as a Rust item
 /// name. Global variables keep their C spelling verbatim, so colliding
@@ -89,9 +163,24 @@ static inline bool isRustKeyword(llvm::StringRef name) {
 /// collision the mangle introduces (a struct declaring both `type` and
 /// `type_`) is rejected where the fields are collected.
 static inline std::string mangleMemberName(llvm::StringRef name) {
-  if (isRustKeyword(name))
-    return (name + "_").str();
-  return name.str();
+  std::string base =
+      idiomaticRenameEnabled() ? toSnakeCase(name) : name.str();
+  if (isRustKeyword(base))
+    return base + "_";
+  return base;
+}
+
+/// The Rust name of an enum type: `UpperCamelCase` under the idiomatic rename,
+/// the verbatim C tag otherwise. Applied identically at the enum definition,
+/// every enum value use, and the item-graph node so the three stay consistent.
+static inline std::string enumTypeRustName(llvm::StringRef name) {
+  return idiomaticRenameEnabled() ? toUpperCamelCase(name) : name.str();
+}
+
+/// The Rust name of an enum variant's associated constant:
+/// `SCREAMING_SNAKE_CASE` under the idiomatic rename, verbatim otherwise.
+static inline std::string enumVariantRustName(llvm::StringRef name) {
+  return idiomaticRenameEnabled() ? toScreamingSnakeCase(name) : name.str();
 }
 
 /// Returns the C-declared Rust-facing name of a record: its tag name, or,
@@ -104,14 +193,15 @@ static inline std::string mangleMemberName(llvm::StringRef name) {
 /// file-scope records `CImporter::structSymbolName` layers the tag-versus-
 /// ordinary-namespace collision renaming on top, and block-scope records
 /// take the `<function>_<tag>` mangle in `importRecord`.
-static inline llvm::StringRef recordRustName(const clang::RecordDecl *record) {
+static inline std::string recordRustName(const clang::RecordDecl *record) {
   llvm::StringRef name = record->getName();
-  if (!name.empty())
-    return name;
-  if (const clang::TypedefNameDecl *typedefName =
-          record->getTypedefNameForAnonDecl())
-    return typedefName->getName();
-  return {};
+  if (name.empty())
+    if (const clang::TypedefNameDecl *typedefName =
+            record->getTypedefNameForAnonDecl())
+      name = typedefName->getName();
+  if (name.empty())
+    return {};
+  return idiomaticRenameEnabled() ? toUpperCamelCase(name) : name.str();
 }
 
 /// W2.0 C++ input tolerance: the `ns_<name>_`-per-level prefix reflecting
@@ -201,8 +291,14 @@ static inline std::string cFunctionSymbolName(const clang::FunctionDecl *func,
 static inline std::string cGlobalSymbolName(const clang::VarDecl *var,
                                             llvm::StringRef tuTag) {
   bool internal = !var->isExternallyVisible();
-  return (internal ? tuTag.str() : std::string()) +
-         namespacePrefix(var->getDeclContext()) + var->getName().str();
+  std::string full = (internal ? tuTag.str() : std::string()) +
+                     namespacePrefix(var->getDeclContext()) +
+                     var->getName().str();
+  // A global becomes SCREAMING_SNAKE_CASE as a whole, so its per-TU tag and
+  // namespace prefix are uppercased too (`tu0_calls` -> `TU0_CALLS`,
+  // `ns_shapes_base` -> `NS_SHAPES_BASE`); the linkage predicate in
+  // CSymbolLinkage.h recognizes the uppercased tags.
+  return idiomaticRenameEnabled() ? toScreamingSnakeCase(full) : full;
 }
 
 } // namespace emitrust

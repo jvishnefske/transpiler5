@@ -488,7 +488,7 @@ AdmissibilityProbe::recordSymbolFor(const clang::RecordDecl *record) const {
     return {};
   if (!definition->getDeclContext()->getRedeclContext()->isFileContext())
     return {};
-  return recordRustName(definition).str();
+  return recordRustName(definition);
 }
 
 void AdmissibilityProbe::probeFunction(const clang::FunctionDecl *func) {

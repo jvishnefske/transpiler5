@@ -412,6 +412,10 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
          (owner->isExternallyVisible() ? "" : currentTuTag.c_str()) +
          owner->getName() + "_" + base->getName())
             .str();
+    // A synthesized owner struct is a type name: UpperCamelCase under the
+    // idiomatic rename.
+    if (idiomaticRenameEnabled())
+      structName = toUpperCamelCase(structName);
     ownerPlans[base] = OwnerPlan{structName, /*structDefCreated=*/false};
     for (const clang::FunctionDecl *fn : methodFns)
       methodPlans[fn->getCanonicalDecl()] = base;
@@ -1989,11 +1993,22 @@ CImporter::planVaMonomorphOnce(const clang::TranslationUnitDecl *unit) {
       }
     if (cloneIndex == plan.clones.size()) {
       // Clone names carry the original symbol plus a per-signature
-      // suffix; the original bare symbol is never emitted.
-      std::string name = mlirFuncName(site.target) + "__" +
-                         std::to_string(plan.clones.size() + 1);
-      while (ordinaryNameTaken(name) || functions.lookup(name))
-        name += "_";
+      // suffix; the original bare symbol is never emitted. The idiomatic
+      // rename uses a single-underscore `_<n>` suffix (snake-case clean) and
+      // bumps the ordinal on a collision; the verbatim path keeps the historic
+      // `__<n>` suffix with an appended `_` on collision.
+      std::string name;
+      if (idiomaticRenameEnabled()) {
+        unsigned ordinal = plan.clones.size() + 1;
+        name = mlirFuncName(site.target) + "_" + std::to_string(ordinal);
+        while (ordinaryNameTaken(name) || functions.lookup(name))
+          name = mlirFuncName(site.target) + "_" + std::to_string(++ordinal);
+      } else {
+        name = mlirFuncName(site.target) + "__" +
+               std::to_string(plan.clones.size() + 1);
+        while (ordinaryNameTaken(name) || functions.lookup(name))
+          name += "_";
+      }
       plan.clones.push_back(VaClonePlan{name, extraTypes});
     }
     vaCallSiteClones[site.call] = cloneIndex;

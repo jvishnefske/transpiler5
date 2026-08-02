@@ -12,7 +12,7 @@
 // `impl Owner_...` block. All cursors stay in bounds; the program has no
 // UB. main returns 0 and reports everything via printf.
 // RUN: emitrust-cc --emit=crate %s -o %t.crate --build
-// RUN: grep "impl Owner_main_arr" %t.crate/src/main.rs
+// RUN: grep "impl OwnerMainArr" %t.crate/src/main.rs
 // RUN: not grep "unsafe" %t.crate/src/main.rs
 // RUN: clang -std=c11 %s -o %t.native
 // RUN: %t.native > %t.native.out
