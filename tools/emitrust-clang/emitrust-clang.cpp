@@ -281,6 +281,12 @@ static void sideEmitArtifact(const CompileJob &job, llvm::raw_ostream *log) {
   // Recover-or-skip posture: an unsupported item must cost at most itself,
   // never the artifact, and the artifact must never cost the build.
   options.recover = true;
+  // FR-57a: this TU is one shard of a project whose other TUs the shim
+  // never sees, so a referenced external the TU does not define is a
+  // link-time obligation recorded in the artifact (a declaration stub
+  // marked `emitrust.extern_decl` for the FR-58 link step), not an
+  // import failure that would cost the whole artifact.
+  options.deferExternals = true;
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::emitrust::importC(job.input, job.importArgs, options, context);
 

@@ -62,6 +62,19 @@ inline constexpr llvm::StringLiteral kStaticMethodAttrName =
 inline constexpr llvm::StringLiteral kExternalRequirementAttrName =
     "emitrust.external_requirement";
 
+/// FR-57a: name of the discardable unit attribute the deferred-externals
+/// import mode attaches to a declaration-only global or function whose
+/// DEFINITION lives in another translation unit's shard. The marked
+/// `emitrust.global` has no initializer and the marked function no body;
+/// both are link-time obligations, not storage or code. A module still
+/// carrying this attribute CANNOT be emitted as Rust — the FR-58 link/merge
+/// step must resolve every marked declaration against its defining
+/// translation unit first, and the Rust emitter enforces that with a
+/// located error rather than silently emitting a crate that reads a symbol
+/// nobody defines.
+inline constexpr llvm::StringLiteral kExternDeclAttrName =
+    "emitrust.extern_decl";
+
 /// FR-52: name of the discardable `emitrust.func` string attribute marking a
 /// function that is GENERIC over the external-requirement trait. Its value is
 /// the trait's name, so the emitter needs no module-level channel to render

@@ -1307,6 +1307,16 @@ public:
     externalRequirements = policy;
   }
 
+  /// FR-57a: chooses what `finalizeProject` does with a referenced external
+  /// symbol no imported TU defines. Off — the default — keeps the
+  /// historical rejection (and the FR-52 trait path for functions). On, the
+  /// symbol becomes a declaration marked `emitrust.extern_decl` for the
+  /// FR-58 link step to resolve: an undefined extern global materializes as
+  /// a declaration-only `emitrust.global`, and a referenced body-less
+  /// function keeps its declaration. Defer takes precedence over the FR-52
+  /// trait policy.
+  void setDeferExternals(bool defer) { deferExternals = defer; }
+
   /// Imports every supported top-level declaration of `context`'s translation
   /// unit into the module: complete struct definitions (bare anonymous
   /// structs under synthesized shape-keyed `Anon<n>` names), function
@@ -4308,10 +4318,22 @@ private:
   /// When true (project import), an `extern`-only global with no definition in
   /// this TU is deferred to `finalizeProject` instead of being an error.
   bool deferExternGlobals = false;
+  /// One deferred `extern` global reference awaiting a cross-TU definition:
+  /// the first reference's location (for the diagnostic if no TU defines
+  /// it) and the global's MLIR value type (so FR-57a defer mode can
+  /// materialize a declaration-only `emitrust.global` without re-deriving
+  /// the type from a clang AST that is no longer current).
+  struct PendingExternGlobal {
+    Location loc;
+    Type type;
+  };
   /// Deferred `extern` global references awaiting a cross-TU definition,
-  /// keyed by MLIR symbol name; the location is the first reference for the
-  /// diagnostic if no TU defines it.
-  llvm::StringMap<Location> pendingExternGlobals;
+  /// keyed by MLIR symbol name.
+  llvm::StringMap<PendingExternGlobal> pendingExternGlobals;
+  /// FR-57a: whether `finalizeProject` turns referenced-but-undefined
+  /// external symbols into `emitrust.extern_decl`-marked declarations
+  /// instead of rejecting them; see `setDeferExternals`.
+  bool deferExternals = false;
   /// FR-52: what `finalizeProject` does with a referenced-but-undefined
   /// external function; see `setExternalRequirements`.
   emitrust::ExternalRequirements externalRequirements =

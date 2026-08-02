@@ -293,6 +293,23 @@ struct ImportOptions {
   /// body-less variadic declaration is not imported, and its call sites and
   /// address-takes carry their own located rejections.
   ExternalRequirements externalRequirements = ExternalRequirements::Reject;
+  /// FR-57a: deferred-externals import mode, for the per-TU FR-56/FR-57 shim
+  /// path. When false — the default — a referenced external symbol that no
+  /// imported translation unit defines is the historical whole-program
+  /// error (or, for functions, the FR-52 trait requirement when that policy
+  /// is chosen). When true, such a symbol becomes a DECLARATION instead: an
+  /// undefined extern global is materialized as a declaration-only
+  /// `emitrust.global` (no initializer) and a referenced body-less function
+  /// keeps its declaration, both carrying the `emitrust.extern_decl` unit
+  /// attribute. Defer takes precedence over the FR-52 trait policy.
+  ///
+  /// The resulting module is a per-TU SHARD, not a program: the FR-58
+  /// link/merge step must resolve every marked declaration against its
+  /// defining translation unit, and the Rust emitter refuses a module still
+  /// carrying the marker with a located error, so direct crate emission of
+  /// a deferred module cannot silently produce a crate that reads a symbol
+  /// nobody defines.
+  bool deferExternals = false;
 };
 
 /// Imports the C source file at `path` into an MLIR module.

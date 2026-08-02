@@ -1771,6 +1771,25 @@ of references or inheritance, so it precedes both.
   file is the fallback for non-ELF targets. Acceptance: bytecode round-trips
   (emit -> reload -> translate is byte-identical to the direct path), and the
   artifact survives `ar` + `ld` collection.
+  LANDED (FR-57a, the FR-58-spike blocker): `--defer-externals` /
+  `ImportOptions.deferExternals` import mode. An extern global or called
+  function whose definition lives in another TU no longer rejects the solo
+  import: it becomes a declaration-only `emitrust.global` / body-less
+  `emitrust.func` carrying `emitrust.extern_decl`, and the Rust emitter
+  REFUSES any module still carrying the marker ("unresolved deferred
+  external ... must be linked against the defining translation unit"), so
+  the flag cannot silently emit a broken crate. The shim imports in this
+  mode (plus recover), so every cross-TU-referencing TU now yields an
+  artifact. Defer takes precedence over the FR-52 trait policy; non-defer
+  behavior is unchanged (the historical located rejection is regression-
+  pinned). (test/Import/C/defer-externals.c,
+  test/Driver/emitrust-clang-shim.c, test/Dialect/EmitRust/ops.mlir)
+  Merge-oracle snapshot on `multi-tu.c` after FR-57a: solo shard 0 carries
+  `@SHARED_COUNTER {extern_decl}` + body-less `@add`/`@lib_transform`
+  obligations that shard 1 defines -- resolution is
+  declaration-for-definition replacement -- and BOTH solos claim
+  `@tu0_scale` for their own file-static, confirming the merge must
+  alpha-rename per-shard tags to global ordinals.
   SPIKE (GO): import -> `--emit-bytecode` -> reload -> translate is
   byte-identical to the direct path on 112/112 single-TU EndToEnd inputs
   (bytecode ~2.5x smaller than text); an objcopy `.emitrust` section on a
