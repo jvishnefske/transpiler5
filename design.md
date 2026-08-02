@@ -1823,6 +1823,23 @@ of references or inheritance, so it precedes both.
   shard that uses them and the merge dedups by the existing FR-26 shape key.
   Naive per-TU import + concatenation is NOT the joint import; the merge is
   a real pass with its own byte-identity oracle.
+  SPIKE 2 (three implementation-detail results): (1) GO -- a MECHANICAL
+  merge (drop `extern_decl` ops, alpha-rename shard-local `tu0_` to global
+  ordinals, concatenate bodies in TU order) reproduces the joint import's
+  Rust BYTE-IDENTICALLY on multi-tu.c, so the merge core is simple; (2) the
+  FR-57 cc1 cache key's workflow-noise blacklist was enumerated
+  empirically: the `-o` output, `-dependency-file`, `-MT`,
+  `-sys-header-deps`, `-fdebug-compilation-dir=`,
+  `-fcoverage-compilation-dir=` (and `-main-file-name` defensively) must be
+  stripped before hashing, the input CONTENT hashed separately (via the
+  depfile's file list); `-D`, the target triple, CPU, and the
+  internal-isystem set correctly perturb the key; (3) CONSTRAINT -- an
+  `extern` POINTER global cannot type its declaration stub solo (the
+  base+cursor decomposition needs the defining TU's shape): defer+recover
+  degrades gracefully (artifact emitted; accessing items stubbed/dropped
+  and ledgered), but those items are recoverable ONLY with whole-program
+  facts, so FR-58 is merge + SELECTIVE RE-IMPORT of fact-starved items
+  (the ledger identifies them), not pure concatenation.
 - [ ] FR-59 Workspace partitioning (multi-crate output). One crate cannot
   hold a kernel-scale project. The link step partitions the item graph into a
   Cargo WORKSPACE of crates (per source directory/subsystem by default,
