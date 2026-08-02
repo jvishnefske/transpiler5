@@ -5596,10 +5596,26 @@ LogicalResult CImporter::finalizeProject() {
   // definition is rejected at its first use site (falling back to the
   // declaration when no IR use survives).
   for (const auto &entry : pendingExternGlobals)
-    if (!SymbolTable::lookupSymbolIn(module, entry.getKey()))
-      return emitError(firstSymbolUseLoc(entry.getKey(), entry.getValue()))
+    if (!SymbolTable::lookupSymbolIn(module, entry.getKey())) {
+      // FR-57a defer mode: the missing definition is a link-time obligation,
+      // not an import-time error. Materialize a declaration-only global (no
+      // initializer — there is no storage to model here) with the recorded
+      // value type, marked for the FR-58 link step; the Rust emitter refuses
+      // a module still carrying the marker.
+      if (deferExternals) {
+        OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+        auto declOp = moduleBuilder.create<emitrust::GlobalOp>(
+            entry.getValue().loc, moduleBuilder.getStringAttr(entry.getKey()),
+            TypeAttr::get(entry.getValue().type), /*init=*/Attribute(),
+            /*is_const=*/UnitAttr());
+        declOp->setAttr(emitrust::kExternDeclAttrName,
+                        moduleBuilder.getUnitAttr());
+        continue;
+      }
+      return emitError(firstSymbolUseLoc(entry.getKey(), entry.getValue().loc))
              << "unsupported: extern global variable '" << entry.getKey()
              << "' is referenced but not defined in any translation unit";
+    }
 
   // No referenced non-variadic external function may remain body-less: the
   // Rust emitter cannot emit a body-less function. (Variadic prototypes such
@@ -5618,6 +5634,15 @@ LogicalResult CImporter::finalizeProject() {
       if (SymbolTable::symbolKnownUseEmpty(func.getOperation(),
                                            module.getOperation())) {
         func.erase();
+        continue;
+      }
+      // FR-57a defer mode takes precedence over both the FR-52 trait path
+      // and the rejection: the declaration is a per-TU shard's requirement
+      // on its sibling TUs, marked for the FR-58 link step. (The
+      // erase-unused branch above still applies: an unreferenced
+      // declaration demands nothing from anyone.)
+      if (deferExternals) {
+        func->setAttr(emitrust::kExternDeclAttrName, builder.getUnitAttr());
         continue;
       }
       if (trait && isExternalRequirementShape(func)) {
@@ -5750,6 +5775,9 @@ mlir::emitrust::importC(llvm::StringRef path,
                           /*column=*/1);
   OwningOpRef<ModuleOp> module(ModuleOp::create(moduleLoc));
   CImporter importer(*module);
+  // FR-57a: deferred-externals mode exists FOR this single-TU entry point
+  // (the FR-56 shim imports each TU solo); inert at its default.
+  importer.setDeferExternals(options.deferExternals);
   // FR-42: recovery is opted into per import and touches nothing when off.
   // A caller that wants recovery without a ledger gets this scratch one, so
   // the importer never has to test for a null ledger mid-import.
@@ -5763,10 +5791,20 @@ mlir::emitrust::importC(llvm::StringRef path,
     if (!options.excludedItems.empty())
       importer.setExcludedItems(options.excludedItems);
   }
-  if (failed(importer.importTranslationUnit(ast.getASTContext(),
-                                            /*tuTag=*/"",
-                                            /*deferExtern=*/false,
-                                            /*soleTranslationUnit=*/true)))
+  // FR-57a: with deferred externals this TU is one shard of a larger
+  // program, so an extern-only global takes the same deferral path a
+  // project import gives it (recorded in `pendingExternGlobals` for
+  // `finalizeProject`) instead of the immediate single-file rejection.
+  if (failed(importer.importTranslationUnit(
+          ast.getASTContext(),
+          /*tuTag=*/"",
+          /*deferExtern=*/options.deferExternals,
+          /*soleTranslationUnit=*/true)))
+    return nullptr;
+  // FR-57a: finalization is what turns the deferred references into marked
+  // declarations (and erases unused body-less prototypes). Historical
+  // single-file imports never ran it, so it stays defer-mode-only here.
+  if (options.deferExternals && failed(importer.finalizeProject()))
     return nullptr;
 
   // A verifier failure indicates an importer bug; it is still an import
@@ -5862,6 +5900,9 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
   // `finalizeProject` — the only place it is consulted — runs only here, so
   // it is installed once, unconditionally, and is inert at its default.
   importer.setExternalRequirements(options.externalRequirements);
+  // FR-57a: like the FR-52 policy above, a whole-project decision consulted
+  // only in `finalizeProject`; inert at its default.
+  importer.setDeferExternals(options.deferExternals);
   // FR-42: one shared ledger across every TU — a project's recovery report
   // is a project-level artifact, and the per-TU walks accumulate into it in
   // path order.

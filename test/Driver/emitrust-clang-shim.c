@@ -7,6 +7,10 @@
 // verbatim and emit no artifact. An import rejection must NOT fail the
 // build: the volatile local below would reject a strict import, but the
 // shim's recover-mode import still lets clang's exit code (0) through.
+// FR-57a: the shim imports in deferred-externals mode, so an extern global
+// defined in some OTHER translation unit (ext_counter below) no longer
+// costs the artifact: it becomes a declaration-only `emitrust.global`
+// marked `emitrust.extern_decl` that the FR-58 link step must resolve.
 //
 // RUN: env EMITRUST_REAL_CC=clang emitrust-clang -O2 -Wall -DANSWER=42 -c %s -o %t.o
 // RUN: clang -O2 -Wall -DANSWER=42 -c %s -o %t.ref.o
@@ -25,9 +29,18 @@
 // A rejected item (volatile) is recovered, not fatal: the artifact still
 // contains the good function above.
 //
+// FR-57a: the cross-TU extern global survives as a marked declaration-only
+// global (no initializer, FR-53 idiomatic spelling) instead of failing the
+// import.
+// CHECK: emitrust.global @EXT_COUNTER {emitrust.extern_decl} : i32
+//
 // VER: clang version
 
+extern int ext_counter;
+
 int shim_answer(void) { return ANSWER; }
+
+int shim_reads_extern(void) { return ext_counter; }
 
 int shim_rejected(int n) {
   volatile int v = n; // rejects under strict import; recovered by the shim

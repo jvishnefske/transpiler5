@@ -1289,6 +1289,28 @@ LogicalResult RustEmitter::emitRegionBody(Operation *parent, Region &region) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
+  // FR-57a: a module carrying an `emitrust.extern_decl`-marked declaration
+  // is one translation unit's SHARD, not a program — the marked symbol's
+  // definition lives in another TU. Refuse it up front, mirroring FR-52's
+  // contract that forgetting a resolution step cannot silently emit a
+  // broken crate. Walk (not just the top level): a marked body-less method
+  // declaration sits inside an `emitrust.impl`.
+  Operation *deferred = nullptr;
+  moduleOp.walk([&](Operation *op) {
+    if (!op->hasAttr(emitrust::kExternDeclAttrName))
+      return WalkResult::advance();
+    deferred = op;
+    return WalkResult::interrupt();
+  });
+  if (deferred) {
+    auto symbol =
+        deferred->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+    return deferred->emitError()
+           << "unresolved deferred external '"
+           << (symbol ? symbol.getValue() : llvm::StringRef("<unknown>"))
+           << "': the module must be linked against the defining translation "
+              "unit before Rust emission";
+  }
   for (Operation &op : *moduleOp.getBody()) {
     if (!isa<emitrust::UseOp, emitrust::VerbatimOp, emitrust::FuncOp,
              emitrust::ImplOp, emitrust::StructDefOp, emitrust::EnumDefOp,

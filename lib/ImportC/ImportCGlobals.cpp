@@ -551,7 +551,11 @@ LogicalResult CImporter::deferExternGlobal(const clang::VarDecl *key,
     mlirType = *mapped;
   }
   globals[key] = GlobalInfo{symbolName.str(), mlirType};
-  pendingExternGlobals.try_emplace(symbolName, loc);
+  // `mlirType` is always set here (whole-program composite lookup or
+  // `mapType`); recording it lets FR-57a defer mode materialize a
+  // declaration-only global for a definition that lives in another TU.
+  pendingExternGlobals.try_emplace(symbolName,
+                                   PendingExternGlobal{loc, mlirType});
   return success();
 }
 

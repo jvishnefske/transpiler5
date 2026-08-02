@@ -358,6 +358,11 @@ emitrust.global @table : !emitrust.array<4xi32>
 // CHECK: emitrust.global const @fixed : !emitrust.array<2xf64>
 emitrust.global const @fixed : !emitrust.array<2xf64>
 
+// FR-57a: a deferred-externals declaration-only global (no initializer)
+// carrying the `emitrust.extern_decl` marker round-trips.
+// CHECK: emitrust.global @deferred_ext {emitrust.extern_decl} : i32
+emitrust.global @deferred_ext {emitrust.extern_decl} : i32
+
 // CHECK: emitrust.global @origin : !emitrust.struct<"Point">
 emitrust.global @origin : !emitrust.struct<"Point">
 

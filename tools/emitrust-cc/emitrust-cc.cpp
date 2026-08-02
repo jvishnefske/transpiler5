@@ -274,6 +274,22 @@ static llvm::cl::opt<bool> preserveCNamesFlag(
         "it."),
     llvm::cl::init(false));
 
+static llvm::cl::opt<bool> deferExternalsFlag(
+    "defer-externals",
+    llvm::cl::desc(
+        "Deferred-externals import mode (FR-57a), the per-TU import mode for "
+        "the FR-56/FR-57 shim path: a referenced external symbol that no "
+        "imported translation unit defines becomes a declaration stub marked "
+        "'emitrust.extern_decl' -- an undefined extern global materializes "
+        "as a declaration-only emitrust.global, and a referenced body-less "
+        "function keeps its declaration -- instead of failing the import. "
+        "The emitted module carries those stubs as link-time obligations the "
+        "FR-58 link step must resolve, so this mode is incompatible with "
+        "direct crate emission: the Rust emitter refuses a module still "
+        "carrying a stub with a located error. Off by default, in which case "
+        "the compile is byte-identical to one built without this flag"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> incrementalFlag(
     "incremental",
     llvm::cl::desc(
@@ -683,6 +699,8 @@ probeSearchState(const mlir::emitrust::SearchInputs &inputs,
   // would score a compiler that is not the one producing the crate — which is
   // the whole reason the probe is a real import in the first place.
   options.externalRequirements = externalRequirementsPolicy();
+  // FR-57a: same same-project reasoning as the FR-52 policy above.
+  options.deferExternals = deferExternalsFlag;
 
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::emitrust::importCProject(paths, extra, options, context);
@@ -942,6 +960,10 @@ int main(int argc, char **argv) {
   // FR-52: an unresolved external is an ERROR for a binary crate and a
   // REQUIREMENT for a library one; see `externalRequirementsPolicy`.
   importOptions.externalRequirements = externalRequirementsPolicy();
+  // FR-57a: per-TU shim-path import mode; the emitted module carries
+  // declaration stubs the FR-58 link step must resolve, and the Rust
+  // emitter refuses a module still carrying one.
+  importOptions.deferExternals = deferExternalsFlag;
   mlir::OwningOpRef<mlir::ModuleOp> module =
       mlir::emitrust::importCProject(inputs, extra, importOptions, context);
   if (!module)
