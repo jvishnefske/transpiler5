@@ -96,11 +96,9 @@ CImporter::cxxMethodMangledName(const clang::CXXMethodDecl *method) const {
       mangled += ("_" + codes);
   }
   // The `<Class>_<method>[_codes]` symbol is a free-standing function name, so
-  // it is snake_case under the idiomatic rename (its UpperCamel class prefix
-  // is folded back to snake here).
-  if (idiomaticRenameEnabled())
-    return toSnakeCase(mangled);
-  return mangled;
+  // it takes the function spelling (snake_case under the idiomatic rename,
+  // folding the UpperCamel class prefix back to snake).
+  return fnRustName(mangled);
 }
 
 /// Returns whether `later` differs from `earlier` only by refining

@@ -26,9 +26,9 @@
 
 namespace emitrustcc {
 
-/// Attribute header prepended to every generated crate root. Only two lints are
-/// allowed, both because they are intrinsic to a faithful transpile rather than
-/// masking sloppy codegen:
+/// Attribute header prepended to every generated crate root. Under the default
+/// idiomatic rename only two lints are allowed, both because they are intrinsic
+/// to a faithful transpile rather than masking sloppy codegen:
 ///   - `dead_code`: rejected items intentionally keep their `struct_def` /
 ///     `global` definitions (dropping them was measured and rejected as risking
 ///     dangling symbols), and a binary crate legitimately holds unreferenced

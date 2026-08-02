@@ -8,7 +8,9 @@ emitrust.verbatim "// module-level marker"
 
 // CHECK-LABEL: fn bindings(v0: i32) {
 // CHECK-NEXT:    let _v1: i32;
-// CHECK-NEXT:    let mut _v2: i32 = v0;
+// The mut-marked let's only assignment is a dropped dead store, so the
+// emitted binding needs no `mut` either.
+// CHECK-NEXT:    let _v2: i32 = v0;
 // CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @bindings(%arg0: i32) {

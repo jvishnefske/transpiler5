@@ -6,8 +6,12 @@
 //===----------------------------------------------------------------------===//
 //
 /// \file
-/// The pure, state-free half of "what Rust item name does this clang
-/// declaration become?".
+/// The shared half of "what Rust item name does this clang declaration
+/// become?". Every primitive here is a pure function of the clang AST plus
+/// ONE piece of ambient state: the process-wide `idiomaticRenameEnabled()`
+/// flag (FR-53), set once at driver startup, which selects between verbatim
+/// C spellings and the idiomatic Rust rename. See the flag's own comment for
+/// why a single global beats threading a parameter through both consumers.
 ///
 /// Why this is a shared header rather than private importer detail (FR-40):
 /// two independent consumers must agree, byte for byte, on the emitted
@@ -170,17 +174,39 @@ static inline std::string mangleMemberName(llvm::StringRef name) {
   return base;
 }
 
+/// The Rust spelling of a fully-assembled function symbol (base name plus any
+/// structural prefixes/suffixes): `snake_case` under the idiomatic rename,
+/// verbatim otherwise.
+static inline std::string fnRustName(llvm::StringRef name) {
+  return idiomaticRenameEnabled() ? toSnakeCase(name) : name.str();
+}
+
+/// The Rust spelling of a fully-assembled type symbol (struct/enum, including
+/// synthesized `Owner_<fn>_<base>` / block-scope `<fn>_<tag>` names):
+/// `UpperCamelCase` under the idiomatic rename, verbatim otherwise.
+static inline std::string typeRustName(llvm::StringRef name) {
+  return idiomaticRenameEnabled() ? toUpperCamelCase(name) : name.str();
+}
+
+/// The Rust spelling of a fully-assembled global/static symbol (module-level
+/// state, including synthesized `<name>_backing` storage and `<fn>_<name>`
+/// static-local mangles): `SCREAMING_SNAKE_CASE` under the idiomatic rename,
+/// verbatim otherwise.
+static inline std::string globalRustName(llvm::StringRef name) {
+  return idiomaticRenameEnabled() ? toScreamingSnakeCase(name) : name.str();
+}
+
 /// The Rust name of an enum type: `UpperCamelCase` under the idiomatic rename,
 /// the verbatim C tag otherwise. Applied identically at the enum definition,
 /// every enum value use, and the item-graph node so the three stay consistent.
 static inline std::string enumTypeRustName(llvm::StringRef name) {
-  return idiomaticRenameEnabled() ? toUpperCamelCase(name) : name.str();
+  return typeRustName(name);
 }
 
 /// The Rust name of an enum variant's associated constant:
 /// `SCREAMING_SNAKE_CASE` under the idiomatic rename, verbatim otherwise.
 static inline std::string enumVariantRustName(llvm::StringRef name) {
-  return idiomaticRenameEnabled() ? toScreamingSnakeCase(name) : name.str();
+  return globalRustName(name);
 }
 
 /// Returns the C-declared Rust-facing name of a record: its tag name, or,

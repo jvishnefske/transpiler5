@@ -190,12 +190,10 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
       // program start (its C initializer must be a constant expression).
       // It is mangled as <function>_<name>; createGlobal rejects the
       // mangled name if it collides with an existing module symbol.
-      std::string mangled =
-          (llvm::Twine(currentFuncName) + "_" + var->getName()).str();
       // A function-local static is module-level state, so it takes the global
-      // SCREAMING_SNAKE_CASE spelling under the idiomatic rename.
-      if (idiomaticRenameEnabled())
-        mangled = toScreamingSnakeCase(mangled);
+      // spelling (SCREAMING_SNAKE_CASE under the idiomatic rename).
+      std::string mangled = globalRustName(
+          (llvm::Twine(currentFuncName) + "_" + var->getName()).str());
       return createGlobal(var->getCanonicalDecl(), var, mangled, loc);
     }
     return emitError(loc) << "unsupported: extern local variable";

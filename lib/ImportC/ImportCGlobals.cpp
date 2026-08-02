@@ -253,9 +253,7 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
       return failure();
     Type backingType = emitrust::ArrayType::get(
         builder.getContext(), facts.allocCount, *elementType);
-    std::string backingName = (symbolName + "_backing").str();
-    if (idiomaticRenameEnabled())
-      backingName = toScreamingSnakeCase(backingName);
+    std::string backingName = globalRustName((symbolName + "_backing").str());
     if (failed(checkFreshSymbol(backingName)))
       return failure();
     moduleBuilder.create<emitrust::GlobalOp>(
@@ -293,9 +291,7 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
     // `s->f`-style member reads resolve statically (CTS-P2).
     collectGlobalMemberBindings(key, literalValue.Val, literalType,
                                 literalInit->getBeginLoc());
-    std::string backingName = (symbolName + "_backing").str();
-    if (idiomaticRenameEnabled())
-      backingName = toScreamingSnakeCase(backingName);
+    std::string backingName = globalRustName((symbolName + "_backing").str());
     if (failed(checkFreshSymbol(backingName)))
       return failure();
     moduleBuilder.create<emitrust::GlobalOp>(
@@ -377,9 +373,7 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
       return emitError(initLoc) << "unsupported: global pointer initializer";
     auto backingType = emitrust::ArrayType::get(builder.getContext(),
                                                 length + 1, byteType);
-    std::string backingName = (symbolName + "_backing").str();
-    if (idiomaticRenameEnabled())
-      backingName = toScreamingSnakeCase(backingName);
+    std::string backingName = globalRustName((symbolName + "_backing").str());
     if (failed(checkFreshSymbol(backingName)))
       return failure();
     moduleBuilder.create<emitrust::GlobalOp>(

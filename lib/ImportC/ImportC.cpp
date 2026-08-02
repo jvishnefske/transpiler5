@@ -1963,11 +1963,10 @@ FailureOr<Type> CImporter::getOrCreateArrayMemberEnumType(
     const clang::FieldDecl *field, ArrayMemberPointerFacts &facts,
     Location loc) {
   if (facts.enumSymbol.empty()) {
-    std::string symbol = (llvm::Twine(field->getParent()->getName()) + "_" +
-                          field->getName() + "_Bases")
-                             .str();
-    if (emitrust::idiomaticRenameEnabled())
-      symbol = emitrust::toUpperCamelCase(symbol);
+    std::string symbol = emitrust::typeRustName(
+        (llvm::Twine(field->getParent()->getName()) + "_" + field->getName() +
+         "_Bases")
+            .str());
     if (SymbolTable::lookupSymbolIn(module, symbol))
       return emitError(loc)
              << "unsupported: array-member-pointer enum name '" << symbol
