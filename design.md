@@ -1771,6 +1771,24 @@ of references or inheritance, so it precedes both.
   file is the fallback for non-ELF targets. Acceptance: bytecode round-trips
   (emit -> reload -> translate is byte-identical to the direct path), and the
   artifact survives `ar` + `ld` collection.
+  LANDED (FR-57b, in the FR-56 shim): the canonicalized cache key and the
+  embedded bytecode artifact. The shim hashes the cc1 line only after
+  stripping the empirically measured workflow-noise blacklist (SPIKE 2
+  below) plus the positional input path (tools/emitrust-clang/Cc1Key.h), and
+  logs the FR-57 key PAIR — `cc1-key` (canonicalized command line) and
+  `src-hash` (main-file content bytes; folding in transitively included
+  headers via the depfile list is still open). The artifact is now MLIR
+  bytecode (`<object>.emitrust.mlirbc`, the sidecar kept as the non-ELF
+  fallback) and is embedded into the genuine object as a non-alloc
+  `.emitrust` section via LLVM's objcopy-as-a-library, staged-and-renamed so
+  no failure can truncate the `.o`; embedding failure warns and keeps the
+  sidecar, never the exit code. Pinned: an `-o`/depfile rename keeps the
+  key, a macro change misses it, the same content at another path keeps
+  both halves, the section payload dumps back byte-identical to the sidecar
+  and round-trips through emitrust-opt, and stripping `.emitrust` restores
+  delegation byte-identity (test/Driver/emitrust-clang-shim.c). Still open
+  for the checkbox: item-graph shard + rejection-ledger entries in the
+  artifact, and the depfile-driven header hashing above.
   LANDED (FR-57a, the FR-58-spike blocker): `--defer-externals` /
   `ImportOptions.deferExternals` import mode. An extern global or called
   function whose definition lives in another TU no longer rejects the solo
