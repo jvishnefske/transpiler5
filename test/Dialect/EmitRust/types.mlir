@@ -64,6 +64,16 @@ emitrust.func @array_of_struct_param(%arg0: !emitrust.array<2x!emitrust.struct<"
   emitrust.return
 }
 
+// An array of enums (C `enum Color c[3]`) must round-trip: the importer
+// creates this type for enum-typed array locals/globals, so a printer that
+// emits it but a parser that rejected it broke every serialize-reload path
+// (FR-57 discovered this as its first spike finding).
+// CHECK-LABEL: emitrust.func @array_of_enum_param(
+// CHECK-SAME: !emitrust.array<3x!emitrust.enum<"Color">>
+emitrust.func @array_of_enum_param(%arg0: !emitrust.array<3x!emitrust.enum<"Color">>) {
+  emitrust.return
+}
+
 // CHECK-LABEL: emitrust.func @lvalue_types
 emitrust.func @lvalue_types() {
   // CHECK: emitrust.variable : !emitrust.lvalue<i32>
