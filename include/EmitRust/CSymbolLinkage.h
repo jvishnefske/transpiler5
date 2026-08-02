@@ -75,9 +75,12 @@ inline constexpr llvm::StringLiteral kAnonNamespaceTag = "ns_anon_";
 /// \param name the emitted item name.
 /// \returns true when the originating declaration had internal linkage.
 inline bool isInternalLinkageSymbolName(llvm::StringRef name) {
-  if (name.contains(kAnonNamespaceTag))
+  // The tags are lowercase on a snake_case function name and uppercased on a
+  // SCREAMING_SNAKE_CASE global (FR-53 idiomatic rename), so both spellings of
+  // each tag are accepted.
+  if (name.contains(kAnonNamespaceTag) || name.contains("NS_ANON_"))
     return true;
-  if (!name.consume_front("tu"))
+  if (!name.consume_front("tu") && !name.consume_front("TU"))
     return false;
   // At least one digit, then the separating underscore: `tu12_helper` is
   // tagged, `tuple_size` and `tu_helper` are not.

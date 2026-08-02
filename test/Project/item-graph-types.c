@@ -45,14 +45,14 @@ int main(void) { return measure(&origin); }
 
 // CHECK:      node Branch kind=record def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:18:8
 // CHECK-NEXT: node Chain kind=record def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:23:8
+// CHECK-NEXT: node HOOK kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:40:7
 // CHECK-NEXT: node Leaf kind=record def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:14:8
 // CHECK-NEXT: node Level kind=enum def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:12:6
+// CHECK-NEXT: node ORIGIN kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:42:15
+// CHECK-NEXT: node TOTAL kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:27:5
+// CHECK-NEXT: node TU0_SCRATCH kind=global def=1 linkage=intern tu=0 loc={{.*}}item-graph-types.c:28:12
 // CHECK-NEXT: node c_main kind=function def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:44:5
-// CHECK-NEXT: node hook kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:40:7
 // CHECK-NEXT: node measure kind=function def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:32:5
-// CHECK-NEXT: node origin kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:42:15
-// CHECK-NEXT: node total kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:27:5
-// CHECK-NEXT: node tu0_scratch kind=global def=1 linkage=intern tu=0 loc={{.*}}item-graph-types.c:28:12
 
 // A record's field types are Field edges; a self-referential record's
 // pointer field is a self-edge, not a dropped one -- but a `FieldIndirect`
@@ -65,21 +65,22 @@ int main(void) { return measure(&origin); }
 // CHECK-NEXT: edge Branch -> Level kind=Field{{$}}
 // CHECK-NEXT: edge Chain -> Chain kind=FieldIndirect{{$}}
 
-// CHECK-NEXT: edge c_main -> measure kind=Calls
-// CHECK-NEXT: edge c_main -> origin kind=ReadsGlobal
-
 // A function-pointer global's initializer takes the target's address, and
 // the pointee's parameter type is part of the global's own signature.
-// CHECK-NEXT: edge hook -> Branch kind=SigType
-// CHECK-NEXT: edge hook -> measure kind=TakesAddressOf
+// CHECK-NEXT: edge HOOK -> Branch kind=SigType
+// CHECK-NEXT: edge HOOK -> measure kind=TakesAddressOf
+
+// CHECK-NEXT: edge ORIGIN -> Branch kind=SigType
+
+// CHECK-NEXT: edge c_main -> measure kind=Calls
+// CHECK-NEXT: edge c_main -> ORIGIN kind=ReadsGlobal
 
 // Signature types versus body-only mentions, and the read/write split:
 // `total += ...` is both, `scratch = total` writes scratch and reads total.
 // CHECK-NEXT: edge measure -> Branch kind=SigType
 // CHECK-NEXT: edge measure -> Chain kind=BodyType
 // CHECK-NEXT: edge measure -> Leaf kind=BodyType
-// CHECK-NEXT: edge measure -> total kind=ReadsGlobal
-// CHECK-NEXT: edge measure -> total kind=WritesGlobal
-// CHECK-NEXT: edge measure -> tu0_scratch kind=WritesGlobal
-// CHECK-NEXT: edge origin -> Branch kind=SigType
+// CHECK-NEXT: edge measure -> TOTAL kind=ReadsGlobal
+// CHECK-NEXT: edge measure -> TOTAL kind=WritesGlobal
+// CHECK-NEXT: edge measure -> TU0_SCRATCH kind=WritesGlobal
 // CHECK-NOT:  edge

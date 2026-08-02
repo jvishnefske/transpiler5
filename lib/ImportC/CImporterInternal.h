@@ -95,10 +95,16 @@ using namespace mlir;
 // qualified spellings in this file ambiguous to read.
 using mlir::emitrust::cFunctionSymbolName;
 using mlir::emitrust::cGlobalSymbolName;
+using mlir::emitrust::enumTypeRustName;
+using mlir::emitrust::enumVariantRustName;
+using mlir::emitrust::idiomaticRenameEnabled;
 using mlir::emitrust::isRustKeyword;
 using mlir::emitrust::mangleMemberName;
 using mlir::emitrust::namespacePrefix;
 using mlir::emitrust::recordRustName;
+using mlir::emitrust::toScreamingSnakeCase;
+using mlir::emitrust::toSnakeCase;
+using mlir::emitrust::toUpperCamelCase;
 
 /// Break/continue branch targets for the innermost enclosing loop or switch.
 struct LoopTargets {

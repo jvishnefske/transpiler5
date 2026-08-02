@@ -45,7 +45,7 @@ int use(void) {
 // `emitrust-import-c`, since the check is project-level (a single raw
 // import legitimately leaves an external declaration behind, exactly as
 // it does for a C prototype whose definition lives in another TU).
-// NOBODY: error: unsupported: function 'Partial_missing' is referenced but not defined in any translation unit
+// NOBODY: error: unsupported: function 'partial_missing' is referenced but not defined in any translation unit
 class Partial {
 public:
   int missing();

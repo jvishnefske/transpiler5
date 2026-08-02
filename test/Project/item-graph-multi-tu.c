@@ -20,27 +20,27 @@ int shared_step(void) {
 }
 
 // TU 1's only external item; nodes are ordered by symbol, not by TU.
-// CHECK:      node entry kind=function def=1 linkage=extern tu=1 loc={{.*}}item-graph-multi-tu-other.c:11:5
+// CHECK:      node TU0_TALLY kind=global def=1 linkage=intern tu=0 loc={{.*}}item-graph-multi-tu.c:13:12
 
 // The external symbol is one node, attributed to TU 0 where it is DEFINED
 // (line 17 here, not the header prototype and not TU 1's view of it).
-// CHECK-NEXT: node shared_step kind=function def=1 linkage=extern tu=0 loc={{.*}}item-graph-multi-tu.c:17:5
+// CHECK-NEXT: node TU1_TALLY kind=global def=1 linkage=intern tu=1 loc={{.*}}item-graph-multi-tu-other.c:7:12
 
 // Same spelling, different TU, different node — and each carries its own
 // TU index.
+// CHECK-NEXT: node entry kind=function def=1 linkage=extern tu=1 loc={{.*}}item-graph-multi-tu-other.c:11:5
+// CHECK-NEXT: node shared_step kind=function def=1 linkage=extern tu=0 loc={{.*}}item-graph-multi-tu.c:17:5
 // CHECK-NEXT: node tu0_bump kind=function def=1 linkage=intern tu=0 loc={{.*}}item-graph-multi-tu.c:15:13
-// CHECK-NEXT: node tu0_tally kind=global def=1 linkage=intern tu=0 loc={{.*}}item-graph-multi-tu.c:13:12
 // CHECK-NEXT: node tu1_bump kind=function def=1 linkage=intern tu=1 loc={{.*}}item-graph-multi-tu-other.c:9:13
-// CHECK-NEXT: node tu1_tally kind=global def=1 linkage=intern tu=1 loc={{.*}}item-graph-multi-tu-other.c:7:12
 
 // Each TU's static function touches only its OWN static global, and TU 1's
 // call to the external symbol resolves onto the single shared node.
 // CHECK-NEXT: edge entry -> shared_step kind=Calls
 // CHECK-NEXT: edge entry -> tu1_bump kind=Calls
 // CHECK-NEXT: edge shared_step -> tu0_bump kind=Calls
-// CHECK-NEXT: edge shared_step -> tu0_tally kind=ReadsGlobal
-// CHECK-NEXT: edge tu0_bump -> tu0_tally kind=ReadsGlobal
-// CHECK-NEXT: edge tu0_bump -> tu0_tally kind=WritesGlobal
-// CHECK-NEXT: edge tu1_bump -> tu1_tally kind=ReadsGlobal
-// CHECK-NEXT: edge tu1_bump -> tu1_tally kind=WritesGlobal
+// CHECK-NEXT: edge shared_step -> TU0_TALLY kind=ReadsGlobal
+// CHECK-NEXT: edge tu0_bump -> TU0_TALLY kind=ReadsGlobal
+// CHECK-NEXT: edge tu0_bump -> TU0_TALLY kind=WritesGlobal
+// CHECK-NEXT: edge tu1_bump -> TU1_TALLY kind=ReadsGlobal
+// CHECK-NEXT: edge tu1_bump -> TU1_TALLY kind=WritesGlobal
 // CHECK-NOT:  edge

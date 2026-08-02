@@ -38,7 +38,7 @@ void bump(struct node *n) {
 // CHECK: emitrust.assign
 
 // The Rust rendering carries the mangled spellings verbatim.
-// RUST: struct node {
+// RUST: struct Node {
 // RUST-DAG: type_: i32,
 // RUST-DAG: match_: i32,
 // RUST: }

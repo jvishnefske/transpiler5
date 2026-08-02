@@ -274,7 +274,7 @@ std::string declOwnerSymbol(const clang::Decl *decl) {
     return {};
   if (!definition->getDeclContext()->getRedeclContext()->isFileContext())
     return {};
-  return recordRustName(definition).str();
+  return recordRustName(definition);
 }
 
 /// Re-emits a captured diagnostic at its original severity. Used only on the
@@ -394,7 +394,7 @@ std::string CImporter::frontierExcludedSymbol(const clang::Decl *decl) const {
     if (!definition ||
         !definition->getDeclContext()->getRedeclContext()->isFileContext())
       return {};
-    symbol = recordRustName(definition).str();
+    symbol = recordRustName(definition);
   } else if (const auto *enumDecl = llvm::dyn_cast<clang::EnumDecl>(decl)) {
     const clang::EnumDecl *definition = enumDecl->getDefinition();
     if (!definition)

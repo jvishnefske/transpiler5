@@ -458,7 +458,7 @@ ItemGraphBuilder::recordSymbolFor(const clang::RecordDecl *record) const {
     return {};
   if (!definition->getDeclContext()->getRedeclContext()->isFileContext())
     return {};
-  return recordRustName(definition).str();
+  return recordRustName(definition);
 }
 
 std::string
@@ -466,7 +466,7 @@ ItemGraphBuilder::enumSymbolFor(const clang::EnumDecl *enumDecl) const {
   const clang::EnumDecl *definition = enumDecl->getDefinition();
   if (!definition)
     return {};
-  return definition->getName().str();
+  return mlir::emitrust::enumTypeRustName(definition->getName());
 }
 
 //===----------------------------------------------------------------------===//

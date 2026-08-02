@@ -36,9 +36,13 @@ void CImporter::collectStaticLocalNames(const clang::Stmt *stmt,
   if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt))
     for (const clang::Decl *decl : declStmt->decls())
       if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
-        if (var->isStaticLocal())
-          ordinaryTuNames.insert(
-              (llvm::Twine(funcName) + "_" + var->getName()).str());
+        if (var->isStaticLocal()) {
+          std::string mangled =
+              (llvm::Twine(funcName) + "_" + var->getName()).str();
+          if (idiomaticRenameEnabled())
+            mangled = toScreamingSnakeCase(mangled);
+          ordinaryTuNames.insert(mangled);
+        }
   for (const clang::Stmt *child : stmt->children())
     collectStaticLocalNames(child, funcName);
 }
@@ -88,14 +92,16 @@ CImporter::structSymbolName(const clang::RecordDecl *definition,
   auto cached = assignedStructNames.find(definition);
   if (cached != assignedStructNames.end())
     return cached->second;
-  llvm::StringRef base = recordRustName(definition);
+  std::string base = recordRustName(definition);
   if (base.empty())
     return std::string(); // Anonymous struct; callers reject it.
-  std::string assigned = base.str();
+  std::string assigned = base;
   if (ordinaryNameTaken(assigned)) {
     // C's tag namespace is separate from the ordinary one (C99 6.2.3);
     // the module symbol table is not, so the tag yields deterministically.
-    assigned = ("Struct_" + base).str();
+    // Under the idiomatic rename the disambiguated name stays UpperCamelCase.
+    assigned = idiomaticRenameEnabled() ? toUpperCamelCase("Struct_" + base)
+                                        : "Struct_" + base;
     if (ordinaryNameTaken(assigned))
       return emitError(loc)
              << "unsupported: struct '" << base
@@ -119,7 +125,7 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   // exist. See the declaration in CImporterInternal.h for why the ordinary
   // `importedRecords` memo cannot answer this.
   if (rejectedRecords.contains(definition)) {
-    llvm::StringRef rejectedName = recordRustName(definition);
+    std::string rejectedName = recordRustName(definition);
     return emitError(loc)
            << "unsupported: struct '"
            << (rejectedName.empty() ? llvm::StringRef("<anonymous>")
@@ -154,7 +160,7 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
     return success();
   if (!importedRecords.insert(definition).second)
     return success();
-  llvm::StringRef structName = recordRustName(definition);
+  std::string structName = recordRustName(definition);
   if (!structName.empty() && isRustKeyword(structName))
     return emitError(defLoc) << "unsupported: struct name '" << structName
                              << "' is a Rust keyword";
@@ -198,11 +204,18 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
                 "scope";
     std::string mangledBase =
         (llvm::Twine(mlirFuncName(enclosing)) + "_" + structName).str();
+    // A block-scope record's `<fn>_<tag>` disambiguator stays UpperCamelCase
+    // under the idiomatic rename (its pieces are already renamed).
+    if (idiomaticRenameEnabled())
+      mangledBase = toUpperCamelCase(mangledBase);
     std::string mangled = mangledBase;
     // Each probe below tries a fresh suffix, so the loop takes at most one
     // step per already-emitted struct name — bounded and deterministic.
     for (unsigned suffix = 2; emittedStructNames.contains(mangled); ++suffix)
-      mangled = (llvm::Twine(mangledBase) + "_" + llvm::Twine(suffix)).str();
+      mangled = idiomaticRenameEnabled()
+                    ? (llvm::Twine(mangledBase) + llvm::Twine(suffix)).str()
+                    : (llvm::Twine(mangledBase) + "_" + llvm::Twine(suffix))
+                          .str();
     emittedStructNames.insert(mangled);
     llvm::StringRef mangledRef =
         localRecordNames.try_emplace(definition, std::move(mangled))
@@ -266,7 +279,7 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
       structName =
           anonRecordShapeNames.try_emplace(shape, synthesized).first->second;
     }
-    anonRecordNames.try_emplace(definition, structName.str());
+    anonRecordNames.try_emplace(definition, structName);
   }
 
   auto existingShape = importedRecordShapes.find(structName);
@@ -799,9 +812,9 @@ CImporter::emittedRecordName(const clang::RecordDecl *definition) const {
   auto assigned = assignedStructNames.find(definition);
   if (assigned != assignedStructNames.end())
     return assigned->second;
-  llvm::StringRef name = recordRustName(definition);
+  std::string name = recordRustName(definition);
   if (!name.empty())
-    return name.str();
+    return name;
   auto anon = anonRecordNames.find(definition);
   if (anon == anonRecordNames.end())
     return {};
@@ -832,7 +845,7 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
                              << definition->getName()
                              << "' is a Rust keyword";
 
-  SmallVector<llvm::StringRef> variantNames;
+  SmallVector<std::string> variantNames;
   SmallVector<int64_t> variantValues;
   // Enumerator NAMES must stay unique (they become the tuple-struct's
   // associated const names), which C already guarantees within one enum; the
@@ -854,7 +867,7 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
     if (value < INT32_MIN || value > INT32_MAX)
       return emitError(enumeratorLoc)
              << "unsupported: enumerator value does not fit in i32";
-    variantNames.push_back(name);
+    variantNames.push_back(enumVariantRustName(name));
     variantValues.push_back(value);
   }
   if (variantNames.empty())
@@ -889,10 +902,13 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
   }
   importedEnumShapes[definition->getName()] = shape;
 
+  SmallVector<llvm::StringRef> variantNameRefs(variantNames.begin(),
+                                               variantNames.end());
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
   moduleBuilder.create<emitrust::EnumDefOp>(
-      defLoc, moduleBuilder.getStringAttr(definition->getName()),
-      moduleBuilder.getStrArrayAttr(variantNames),
+      defLoc,
+      moduleBuilder.getStringAttr(enumTypeRustName(definition->getName())),
+      moduleBuilder.getStrArrayAttr(variantNameRefs),
       moduleBuilder.getDenseI64ArrayAttr(variantValues), unsignedUnderlying);
   return success();
 }

@@ -254,6 +254,8 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
     Type backingType = emitrust::ArrayType::get(
         builder.getContext(), facts.allocCount, *elementType);
     std::string backingName = (symbolName + "_backing").str();
+    if (idiomaticRenameEnabled())
+      backingName = toScreamingSnakeCase(backingName);
     if (failed(checkFreshSymbol(backingName)))
       return failure();
     moduleBuilder.create<emitrust::GlobalOp>(
@@ -292,6 +294,8 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
     collectGlobalMemberBindings(key, literalValue.Val, literalType,
                                 literalInit->getBeginLoc());
     std::string backingName = (symbolName + "_backing").str();
+    if (idiomaticRenameEnabled())
+      backingName = toScreamingSnakeCase(backingName);
     if (failed(checkFreshSymbol(backingName)))
       return failure();
     moduleBuilder.create<emitrust::GlobalOp>(
@@ -374,6 +378,8 @@ LogicalResult CImporter::importPointerGlobal(const clang::VarDecl *key,
     auto backingType = emitrust::ArrayType::get(builder.getContext(),
                                                 length + 1, byteType);
     std::string backingName = (symbolName + "_backing").str();
+    if (idiomaticRenameEnabled())
+      backingName = toScreamingSnakeCase(backingName);
     if (failed(checkFreshSymbol(backingName)))
       return failure();
     moduleBuilder.create<emitrust::GlobalOp>(

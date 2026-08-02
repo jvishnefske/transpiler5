@@ -75,7 +75,7 @@ int main() {
 // DIAG: recovered 3 rejected top-level items:
 // DIAG: stubbed 'scaled'
 // DIAG: dropped 'widen'
-// DIAG: stubbed 'useWiden'
+// DIAG: stubbed 'use_widen'
 
 // STRICT: error: unsupported: volatile-qualified type
 // STRICT-NOT: warning:
