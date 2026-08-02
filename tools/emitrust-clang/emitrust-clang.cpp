@@ -13,17 +13,23 @@
 /// preprocessing, depfile generation, and the final native link all behave
 /// exactly as a plain-clang build — and, additionally, each driver
 /// invocation that compiles a C source with `-c` side-emits one
-/// `<object>.emitrust.mlir` artifact holding the EmitRust import of that
+/// `<object>.emitrust.mlirbc` artifact holding the EmitRust import of that
 /// translation unit, lowered through the pinned emitrust-cc pipeline to the
-/// converted emitrust-dialect module (the FR-57 per-TU parse cache; text
-/// MLIR for now, bytecode later).
+/// converted emitrust-dialect module, serialized as MLIR bytecode (the
+/// FR-57 per-TU parse cache). The same payload is then embedded into the
+/// just-produced object file as a non-alloc `.emitrust` ELF section (the
+/// gllvm model), so `ar` archives and existing link lines carry it with no
+/// build-system cooperation; the sidecar file stays as the non-ELF
+/// fallback.
 ///
 /// Argument classification is done with clang's OWN driver, never a
 /// hand-rolled filter: the argv is handed to `clang::driver::Driver`, and
 /// the `-cc1` frontend jobs of the resulting `Compilation` are the
-/// principled definition of "affects the Rust result". The full cc1 argument
-/// vector is hashed (llvm::MD5) as the prototype of the FR-57 cache key and
-/// logged when `EMITRUST_CLANG_LOG` names a log file.
+/// principled definition of "affects the Rust result". The FR-57 cache key
+/// is the PAIR logged when `EMITRUST_CLANG_LOG` names a log file:
+/// `cc1-key`, the llvm::MD5 of the CANONICALIZED cc1 argument vector
+/// (workflow-only arguments and the input path stripped, see Cc1Key.h), and
+/// `src-hash`, the MD5 of the source file's bytes.
 ///
 /// The shim's cardinal rule is that the IMPORT NEVER FAILS THE BUILD: an
 /// import error is logged (and warned about on stderr) and the exit code of
@@ -32,11 +38,14 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "Cc1Key.h"
+
 #include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/ImportC.h"
 
+#include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
@@ -55,6 +64,9 @@
 #include "clang/Driver/Job.h"
 
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
+#include "llvm/ObjCopy/ConfigManager.h"
+#include "llvm/ObjCopy/ObjCopy.h"
+#include "llvm/Object/Binary.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
@@ -65,6 +77,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/MD5.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/StringSaver.h"
 #include "llvm/Support/VirtualFileSystem.h"
@@ -87,15 +100,18 @@ struct CompileJob {
   /// The C source file the cc1 job parses.
   std::string input;
   /// The object file the cc1 job writes; the artifact lands beside it as
-  /// `<output>.emitrust.mlir`.
+  /// `<output>.emitrust.mlirbc` and is embedded into it as the `.emitrust`
+  /// section.
   std::string output;
   /// The semantic clang driver arguments recovered from the cc1 line
   /// (include paths, macro definitions, language standard), in cc1 order.
   std::vector<std::string> importArgs;
-  /// Hex MD5 of the full cc1 argument vector — the FR-57 cache-key
-  /// prototype. Workflow-only canonicalization is future work; for now the
-  /// key is the raw cc1 line, which is already independent of response-file
-  /// packaging and argv spelling differences the driver normalizes away.
+  /// Hex MD5 of the CANONICALIZED cc1 argument vector (Cc1Key.h): the
+  /// command-line half of the FR-57 cache key. Workflow-only arguments and
+  /// the input path are stripped before hashing, so the key is invariant
+  /// under output/depfile renames while remaining independent of
+  /// response-file packaging and argv spelling differences the driver
+  /// normalizes away.
   std::string cc1Hash;
 };
 
@@ -214,8 +230,10 @@ classifyCompileJobs(llvm::ArrayRef<const char *> args, llvm::StringRef realCC,
     }
 
     llvm::MD5 md5;
-    for (const char *arg : cc1) {
-      md5.update(llvm::StringRef(arg));
+    for (const std::string &arg :
+         emitrust::canonicalizeCc1Args(llvm::ArrayRef<const char *>(
+             cc1.data(), cc1.size()))) {
+      md5.update(arg);
       md5.update(llvm::StringRef("\0", 1));
     }
     llvm::MD5::MD5Result digest = md5.final();
@@ -223,11 +241,29 @@ classifyCompileJobs(llvm::ArrayRef<const char *> args, llvm::StringRef realCC,
     llvm::MD5::stringifyResult(digest, hex);
     job.cc1Hash = std::string(hex);
 
+    // The other half of the FR-57 key: the input's CONTENT, so the key pair
+    // is invariant to where the file lives yet misses when it changes.
+    // FUTURE: fold in the transitively included headers via the depfile's
+    // file list; for now only the main file's bytes are hashed.
+    std::string srcHash = "<unavailable>";
+    if (!job.input.empty()) {
+      if (llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+              llvm::MemoryBuffer::getFile(job.input)) {
+        llvm::MD5 srcMd5;
+        srcMd5.update((*buffer)->getBuffer());
+        llvm::MD5::MD5Result srcDigest = srcMd5.final();
+        llvm::SmallString<32> srcHex;
+        llvm::MD5::stringifyResult(srcDigest, srcHex);
+        srcHash = std::string(srcHex);
+      }
+    }
+
     if (log) {
       *log << "cc1:";
       for (const char *arg : cc1)
         *log << " " << arg;
-      *log << "\ncc1-key: " << job.cc1Hash << "\n";
+      *log << "\ncc1-key: " << job.cc1Hash << "\nsrc-hash: " << srcHash
+           << "\n";
     }
 
     if (emitsObject && language == "c" && !job.input.empty() &&
@@ -255,16 +291,85 @@ static mlir::LogicalResult runPipeline(mlir::ModuleOp module) {
   return pm.run(module);
 }
 
-/// Runs the EmitRust import + lowering pipeline on one compile job and
-/// writes the converted module as text MLIR to `<output>.emitrust.mlir`.
+/// Embeds the bytecode artifact at `payloadPath` into the object file at
+/// `objectPath` as a `.emitrust` section, using LLVM's objcopy-as-a-library
+/// (the exact engine behind `llvm-objcopy --add-section`, so the section is
+/// non-alloc by default and the spike's link/`ar` survival results carry
+/// over). The rewritten object is staged to a temporary file and renamed
+/// into place so a failure never leaves a truncated `.o`.
+///
+/// Embedding failure must NOT fail the build (nor even remove the sidecar,
+/// which doubles as the non-ELF fallback): every error path warns and
+/// returns.
+static void embedArtifactSection(llvm::StringRef objectPath,
+                                 llvm::StringRef payloadPath,
+                                 llvm::raw_ostream *log) {
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> payload =
+      llvm::MemoryBuffer::getFile(payloadPath);
+  if (!payload) {
+    llvm::errs() << "emitrust-clang: warning: cannot read '" << payloadPath
+                 << "' for embedding: " << payload.getError().message()
+                 << "\n";
+    return;
+  }
+
+  llvm::Expected<llvm::object::OwningBinary<llvm::object::Binary>> binary =
+      llvm::object::createBinary(objectPath);
+  if (!binary) {
+    llvm::errs() << "emitrust-clang: warning: cannot open '" << objectPath
+                 << "' for embedding: "
+                 << llvm::toString(binary.takeError()) << "\n";
+    return;
+  }
+
+  llvm::objcopy::ConfigManager config;
+  config.Common.InputFilename = objectPath;
+  config.Common.OutputFilename = objectPath;
+  config.Common.AddSection.emplace_back(".emitrust", std::move(*payload));
+
+  llvm::SmallString<256> stagedPath(objectPath);
+  stagedPath += ".emitrust-stage";
+  std::error_code ec;
+  {
+    llvm::raw_fd_ostream out(stagedPath, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      llvm::errs() << "emitrust-clang: warning: cannot write '" << stagedPath
+                   << "': " << ec.message() << "\n";
+      return;
+    }
+    if (llvm::Error error = llvm::objcopy::executeObjcopyOnBinary(
+            config, *binary->getBinary(), out)) {
+      llvm::errs() << "emitrust-clang: warning: cannot embed .emitrust "
+                      "section into '"
+                   << objectPath << "': " << llvm::toString(std::move(error))
+                   << "\n";
+      out.close();
+      llvm::sys::fs::remove(stagedPath);
+      return;
+    }
+  }
+  if ((ec = llvm::sys::fs::rename(stagedPath, objectPath))) {
+    llvm::errs() << "emitrust-clang: warning: cannot rename '" << stagedPath
+                 << "' over '" << objectPath << "': " << ec.message() << "\n";
+    llvm::sys::fs::remove(stagedPath);
+    return;
+  }
+  if (log)
+    *log << "embedded: .emitrust section in " << objectPath << "\n";
+}
+
+/// Runs the EmitRust import + lowering pipeline on one compile job, writes
+/// the converted module as MLIR bytecode to `<output>.emitrust.mlirbc`, and
+/// embeds that payload into the object file as its `.emitrust` section (the
+/// sidecar stays as the non-ELF fallback and the easy-inspection path).
 ///
 /// Import diagnostics are captured into the shim log rather than stderr so
 /// the build transcript stays byte-transparent; only a one-line warning is
 /// printed when the import fails. A failure of any kind — import, pipeline,
-/// or file write — is logged and swallowed: the build's outcome belongs to
-/// the real clang alone.
+/// file write, or embedding — is logged and swallowed: the build's outcome
+/// belongs to the real clang alone.
 static void sideEmitArtifact(const CompileJob &job, llvm::raw_ostream *log) {
-  std::string artifactPath = job.output + ".emitrust.mlir";
+  std::string artifactPath = job.output + ".emitrust.mlirbc";
 
   mlir::MLIRContext context;
   std::string diagnostics;
@@ -304,17 +409,27 @@ static void sideEmitArtifact(const CompileJob &job, llvm::raw_ostream *log) {
     return;
   }
 
-  std::error_code ec;
-  llvm::raw_fd_ostream out(artifactPath, ec, llvm::sys::fs::OF_Text);
-  if (ec) {
-    llvm::errs() << "emitrust-clang: warning: cannot write '" << artifactPath
-                 << "': " << ec.message() << "\n";
-    return;
+  {
+    std::error_code ec;
+    llvm::raw_fd_ostream out(artifactPath, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      llvm::errs() << "emitrust-clang: warning: cannot write '" << artifactPath
+                   << "': " << ec.message() << "\n";
+      return;
+    }
+    if (mlir::failed(mlir::writeBytecodeToFile(*module, out))) {
+      llvm::errs() << "emitrust-clang: warning: bytecode serialization "
+                      "failed for '"
+                   << artifactPath << "'\n";
+      out.close();
+      llvm::sys::fs::remove(artifactPath);
+      return;
+    }
   }
-  module->print(out);
-  out << "\n";
   if (log)
     *log << "artifact: " << artifactPath << " (key " << job.cc1Hash << ")\n";
+
+  embedArtifactSection(job.output, artifactPath, log);
 }
 
 /// Shim entry point: expand response files, classify with the clang driver,
