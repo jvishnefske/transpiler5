@@ -7,7 +7,10 @@
 # encapsulated inside MLIREmitRustImportC; the tool links MLIR libraries only.
 # =============================================================================
 
+# Object: FR-58 --link reads each link input as an llvm::object::ObjectFile
+# to extract the `.emitrust` section the FR-56 shim embedded.
 set(LLVM_LINK_COMPONENTS
+  Object
   Support
   )
 
@@ -32,6 +35,8 @@ set(LIBS
   MLIRSCFDialect
   MLIRUBDialect
   MLIRPass
+  MLIRParser
+  MLIRBytecodeReader
   MLIRIR
   MLIRSupport
   )
@@ -39,6 +44,7 @@ set(LIBS
 add_llvm_executable(emitrust-cc
   emitrust-cc.cpp
   CrateEmitter.cpp
+  LinkMerge.cpp
   ProgressReport.cpp
   )
 llvm_update_compile_flags(emitrust-cc)

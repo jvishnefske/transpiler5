@@ -14,6 +14,9 @@
 // defined in some OTHER translation unit (ext_counter below) no longer
 // costs the artifact: it becomes a declaration-only `emitrust.global`
 // marked `emitrust.extern_decl` that the FR-58 link step must resolve.
+// FR-58: shard mode also tags file-statics with the TU-LOCAL placeholder
+// `tu0_` -- the only place linkage survives into the module -- which the
+// link step alpha-renames to the shard's link-line ordinal.
 //
 // RUN: env EMITRUST_REAL_CC=clang emitrust-clang -O2 -Wall -DANSWER=42 -c %s -o %t.o
 // RUN: clang -O2 -Wall -DANSWER=42 -c %s -o %t.ref.o
@@ -59,6 +62,13 @@
 // A rejected item (volatile) is recovered, not fatal: the artifact still
 // contains the good function above.
 //
+// FR-58: the file-static carries the shard-local `tu0_` tag (and its
+// caller resolves through the tagged name), so the link merge can both
+// recognize it as internal linkage and rename it to the link-line ordinal.
+// CHECK: emitrust.func @tu0_shim_static_helper
+// CHECK: emitrust.func @shim_uses_static
+// CHECK: emitrust.call_opaque "tu0_shim_static_helper"
+//
 // FR-57a: the cross-TU extern global survives as a marked declaration-only
 // global (no initializer, FR-53 idiomatic spelling) instead of failing the
 // import.
@@ -76,3 +86,7 @@ int shim_rejected(int n) {
   volatile int v = n; // rejects under strict import; recovered by the shim
   return v;
 }
+
+static int shim_static_helper(int x) { return x + 3; }
+
+int shim_uses_static(int n) { return shim_static_helper(n); }
