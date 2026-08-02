@@ -1789,6 +1789,21 @@ of references or inheritance, so it precedes both.
   linear. Acceptance: a multi-TU project built via FR-56 shim + FR-58 link
   emits a crate byte-identical to today's single-invocation
   `emitrust-cc --emit=crate` on the same sources.
+  SPIKE (design constraints found, all three from one probe -- importing the
+  two `multi-tu.c` TUs solo vs jointly): (1) BLOCKER: a solo import of a TU
+  referencing an extern global defined in ANOTHER TU hard-fails even under
+  `--recover` and emits NO artifact (FR-52 traits cover extern functions
+  only; globals deliberately reject) -- at kernel scale that is nearly every
+  TU, so FR-57 needs a deferred-externals import mode where an undefined
+  extern global becomes a link-time obligation recorded in the shard, not an
+  import-time rejection; (2) per-TU tags are a LINK-time decision -- the
+  joint import assigns `tu0_scale`/`tu1_scale` by project order, while each
+  solo import would claim `tu0_` for itself, so shards must carry a
+  TU-local placeholder tag that the merge rewrites (or tags keyed by content
+  hash, not ordinal); (3) shape-dedup'd struct/enum defs appear in every
+  shard that uses them and the merge dedups by the existing FR-26 shape key.
+  Naive per-TU import + concatenation is NOT the joint import; the merge is
+  a real pass with its own byte-identity oracle.
 - [ ] FR-59 Workspace partitioning (multi-crate output). One crate cannot
   hold a kernel-scale project. The link step partitions the item graph into a
   Cargo WORKSPACE of crates (per source directory/subsystem by default,
