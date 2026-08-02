@@ -66,10 +66,10 @@ emitrust.func @fields(%arg0: i32) -> i32 {
   emitrust.return %r : i32
 }
 
-// CHECK-LABEL: fn indexing(v0: i32, v1: usize, _v2: i32) -> i32 {
+// CHECK-LABEL: fn indexing(v0: i32, v1: usize, v2: i32) -> i32 {
 // CHECK-NEXT:    let mut v3: [i32; 4] = [0; 4];
 // CHECK-NEXT:    v3[v1] = v0;
-// CHECK-NEXT:    v3[_v2 as usize] = v0;
+// CHECK-NEXT:    v3[v2 as usize] = v0;
 // CHECK-NEXT:    let v4: i32 = v3[v1];
 // CHECK-NEXT:    return v4;
 // CHECK-NEXT:  }

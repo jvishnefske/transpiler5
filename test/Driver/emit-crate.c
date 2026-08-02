@@ -14,8 +14,18 @@ int main(void) { return add(20, 22) - 42; }
 // TOML-NEXT: name = "emit_crate"
 // TOML-NEXT: version = "0.1.0"
 // TOML-NEXT: edition = "2021"
+// The lints the old blanket allow-header silenced are now denied so a
+// regression fails the build; dead_code and unused_assignments stay allowed.
+// TOML:      [lints.rust]
+// TOML-NEXT: unused_variables = "deny"
+// TOML-NEXT: unused_mut = "deny"
+// TOML-NEXT: unused_parens = "deny"
+// TOML-NEXT: unpredictable_function_pointer_comparisons = "deny"
+// TOML-NEXT: non_snake_case = "deny"
+// TOML-NEXT: non_upper_case_globals = "deny"
+// TOML-NEXT: non_camel_case_types = "deny"
 
-// MAIN: #![allow(unused_variables, unused_assignments, unused_mut, unused_parens, dead_code, non_upper_case_globals, non_camel_case_types, unpredictable_function_pointer_comparisons)]
+// MAIN: #![allow(dead_code, unused_assignments)]
 // MAIN: fn add(v0: i32, v1: i32) -> i32 {
 // MAIN: fn c_main() -> i32 {
 // MAIN: fn main() { std::process::exit(c_main()); }
