@@ -15,6 +15,7 @@
 
 #include "CrateEmitter.h"
 
+#include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/EmitRustOps.h"
 #include "EmitRust/Target/TranslateToRust.h"
 
@@ -41,8 +42,15 @@ namespace emitrustcc {
 /// Every other lint the old blanket header silenced is now DENIED in
 /// `Cargo.toml`'s `[lints.rust]` table (see `renderCargoToml`), so a regression
 /// fails the build.
+///
+/// Under `--preserve-c-names` the three naming lints join the allow list
+/// instead of the deny table: verbatim C spellings legitimately trip them, and
+/// the flag's whole point is to keep those spellings.
 static constexpr llvm::StringLiteral kAllowHeader =
     "#![allow(dead_code, unused_assignments)]\n";
+static constexpr llvm::StringLiteral kAllowHeaderPreserveNames =
+    "#![allow(dead_code, unused_assignments, non_snake_case, "
+    "non_upper_case_globals, non_camel_case_types)]\n";
 
 /// Verbatim entry-point wrapper: forwards the imported C `main`'s return
 /// value as the process exit code.
@@ -121,16 +129,20 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type) {
   // FR-53: the lints the old blanket allow header silenced are now DENIED, so
   // any regression in the emitter's warning-clean codegen fails `cargo build`.
   // `dead_code` and `unused_assignments` stay allowed in the crate root (see
-  // `kAllowHeader`); everything else must be clean.
+  // `kAllowHeader`); everything else must be clean. The three naming lints are
+  // denied only under the idiomatic rename -- `--preserve-c-names` keeps
+  // verbatim C spellings, which legitimately trip them (allowed in the
+  // header instead).
   os << "\n"
      << "[lints.rust]\n"
      << "unused_variables = \"deny\"\n"
      << "unused_mut = \"deny\"\n"
      << "unused_parens = \"deny\"\n"
-     << "unpredictable_function_pointer_comparisons = \"deny\"\n"
-     << "non_snake_case = \"deny\"\n"
-     << "non_upper_case_globals = \"deny\"\n"
-     << "non_camel_case_types = \"deny\"\n";
+     << "unpredictable_function_pointer_comparisons = \"deny\"\n";
+  if (mlir::emitrust::idiomaticRenameEnabled())
+    os << "non_snake_case = \"deny\"\n"
+       << "non_upper_case_globals = \"deny\"\n"
+       << "non_camel_case_types = \"deny\"\n";
   return toml;
 }
 
@@ -144,7 +156,9 @@ mlir::FailureOr<std::string> renderCrateRoot(mlir::ModuleOp module,
   emitOptions.exportItems = type == CrateType::Lib;
   std::string source;
   llvm::raw_string_ostream os(source);
-  os << kAllowHeader << "\n";
+  os << (mlir::emitrust::idiomaticRenameEnabled() ? kAllowHeader
+                                                  : kAllowHeaderPreserveNames)
+     << "\n";
   if (mlir::failed(mlir::emitrust::translateToRust(module, os, emitOptions)))
     return mlir::failure();
   if (wrapMain)
