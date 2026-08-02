@@ -1826,6 +1826,30 @@ of references or inheritance, so it precedes both.
   linear. Acceptance: a multi-TU project built via FR-56 shim + FR-58 link
   emits a crate byte-identical to today's single-invocation
   `emitrust-cc --emit=crate` on the same sources.
+  LANDED (FR-58 slice 1): `emitrust-cc --link a.o b.o -o out.crate
+  [--build]` -- extract every shard (`.emitrust` section via
+  llvm::object, `<obj>.emitrust.mlirbc` sidecar fallback, or a `.mlirbc`
+  named directly), parse the bytecode, merge per the SPIKE-3 algorithm
+  (tools/emitrust-cc/LinkMerge.h), and feed the merged module to the
+  EXISTING --emit=rust/crate path with no C re-parse and no pass run.
+  Prerequisite landed with it: the shim's solo import (importC,
+  defer-externals mode) now tags file-statics with the TU-local
+  placeholder `tu0_`, since nothing else in the IR records linkage and the
+  merge must alpha-rename identically spelled statics apart; non-defer
+  single-file imports are byte-identical to before. Pinned: the 2-TU
+  shared-header program (cross-TU call, extern global, dedup'd
+  struct/enum, colliding file-statics) links into a crate whose stdout
+  matches the clang-built native binary AND whose crate root is
+  BYTE-IDENTICAL to the joint import's, from the objects and from the
+  sidecars alike (test/EndToEnd/link-merge-e2e.c); the undefined-symbol
+  and shape-conflict link errors are located diagnostics
+  (test/Driver/link-merge-errors.c); the shard tag is pinned in
+  test/Driver/emitrust-clang-shim.c. Shape equality is print-to-string for
+  now (OperationEquivalence is the upgrade). Still open for the checkbox:
+  `ar` archive members, selective re-import of fact-starved items (extern
+  pointer globals, SPIKE 2's constraint), owner-planning
+  `soleTranslationUnit` divergence, indexed collision scans at 10^3+ TUs,
+  and FR-59 workspace partitioning.
   SPIKE (design constraints found, all three from one probe -- importing the
   two `multi-tu.c` TUs solo vs jointly): (1) BLOCKER: a solo import of a TU
   referencing an extern global defined in ANOTHER TU hard-fails even under

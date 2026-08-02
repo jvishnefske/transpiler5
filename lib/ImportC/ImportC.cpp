@@ -5795,9 +5795,15 @@ mlir::emitrust::importC(llvm::StringRef path,
   // program, so an extern-only global takes the same deferral path a
   // project import gives it (recorded in `pendingExternGlobals` for
   // `finalizeProject`) instead of the immediate single-file rejection.
+  // FR-58: for the same reason, a shard-mode import tags its file-statics
+  // with the TU-LOCAL placeholder `tu0_` -- the linkage fact the merge step
+  // needs (nothing else in the IR records linkage; see CSymbolLinkage.h),
+  // and the tag the link step alpha-renames to the shard's link-line
+  // ordinal. A historical non-defer single-file import keeps the bare
+  // names, byte for byte.
   if (failed(importer.importTranslationUnit(
           ast.getASTContext(),
-          /*tuTag=*/"",
+          /*tuTag=*/options.deferExternals ? "tu0_" : "",
           /*deferExtern=*/options.deferExternals,
           /*soleTranslationUnit=*/true)))
     return nullptr;

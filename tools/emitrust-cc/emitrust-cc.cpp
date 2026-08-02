@@ -44,6 +44,12 @@
 /// With --search, --emit=crate --incremental picks the crate's item set with
 /// that same search instead of taking whatever the first recovering import
 /// happened to accept.
+/// With --link (FR-58 slice 1) there is no import and no pass pipeline at
+/// all: the positional inputs are OBJECT files carrying per-TU emitrust
+/// shards (`.emitrust` section, `.emitrust.mlirbc` sidecar fallback) or
+/// shard files named directly, which are merged in link-line order by the
+/// functional core in LinkMerge.h and fed to the same --emit=rust/crate
+/// emission below.
 /// The inputs are either positional source paths with hand-passed
 /// -I/-isystem/--extra-arg flags (the historical surface), or, with
 /// --compdb <dir-or-file>, a real compile_commands.json that supplies both
@@ -58,9 +64,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "CrateEmitter.h"
+#include "LinkMerge.h"
 #include "ProgressReport.h"
 
 #include "EmitRust/CSymbolNaming.h"
+#include "EmitRust/EmitRustDialect.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/Conversion/LowerExternalRequirements.h"
@@ -78,6 +86,7 @@
 #include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Transforms/Passes.h"
@@ -90,7 +99,9 @@
 #include "llvm/Support/ErrorOr.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/InitLLVM.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
@@ -240,6 +251,27 @@ static llvm::cl::opt<std::string>
                               "('-' means stdout); output crate directory "
                               "for --emit=crate (required)"),
                llvm::cl::value_desc("path"), llvm::cl::init("-"));
+
+static llvm::cl::opt<bool> linkFlag(
+    "link",
+    llvm::cl::desc(
+        "FR-58 link step: the positional inputs are OBJECT files produced "
+        "by the emitrust-clang shim (their `.emitrust` section carries the "
+        "per-TU emitrust shard as MLIR bytecode; an object without the "
+        "section falls back to the `<object>.emitrust.mlirbc` sidecar next "
+        "to it) or `.mlirbc` shard files named directly, in any mix. The "
+        "shards are merged in link-line order per the spike-proven FR-58 "
+        "algorithm -- drop each `emitrust.extern_decl` declaration some "
+        "shard defines (an obligation nobody defines is the "
+        "undefined-symbol link error), dedup shared struct/enum/global "
+        "definitions by symbol with first occurrence winning (a "
+        "same-symbol shape mismatch is the shape-conflict link error), "
+        "alpha-rename per-TU internal-linkage `tu0_` tags to link-line "
+        "ordinals, concatenate -- and the merged module feeds the ordinary "
+        "crate-emission path. No C source is parsed and no pass pipeline "
+        "runs: the shards are already fully converted, which is the whole "
+        "point (only --emit=rust and --emit=crate apply)"),
+    llvm::cl::init(false));
 
 static llvm::cl::opt<bool> buildFlag(
     "build",
@@ -621,6 +653,83 @@ static mlir::LogicalResult buildCrate(llvm::StringRef outDir) {
 }
 
 //===----------------------------------------------------------------------===//
+// FR-58 -- the link step's imperative shell
+//===----------------------------------------------------------------------===//
+
+/// Loads, extracts, parses, and merges the link-line `inputs` into one
+/// whole-program module (FR-58 slice 1, `--link`). The functional core is
+/// `emitrustcc::findShardPayload` (payload location inside one input) and
+/// `emitrustcc::mergeLinkShards` (the spike-proven merge); this function
+/// owns the file reads and the parse. Each input is an object file whose
+/// `.emitrust` section carries the shard, an object falling back to its
+/// `<object>.emitrust.mlirbc` sidecar, or a shard file named directly —
+/// `parseSourceFile` handles MLIR bytecode and text alike. Every failure
+/// path has printed a diagnostic by the time this returns null.
+///
+/// \param inputs the link-line object/shard paths, in link order.
+/// \param context the context to parse and merge in; the EmitRust dialect
+///        is loaded here because no import will do it.
+/// \returns the merged, verified whole-program module, or null.
+static mlir::OwningOpRef<mlir::ModuleOp>
+loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
+                   mlir::MLIRContext &context) {
+  context.loadDialect<mlir::emitrust::EmitRustDialect>();
+  llvm::SmallVector<mlir::OwningOpRef<mlir::ModuleOp>> shards;
+  for (const std::string &path : inputs) {
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> file =
+        llvm::MemoryBuffer::getFile(path);
+    if (!file) {
+      llvm::errs() << "error: cannot read '" << path
+                   << "': " << file.getError().message() << "\n";
+      return nullptr;
+    }
+    std::string sectionError;
+    mlir::FailureOr<std::optional<llvm::StringRef>> payload =
+        emitrustcc::findShardPayload(**file, sectionError);
+    if (mlir::failed(payload)) {
+      llvm::errs() << "error: cannot read the .emitrust section of '" << path
+                   << "': " << sectionError << "\n";
+      return nullptr;
+    }
+    std::unique_ptr<llvm::MemoryBuffer> moduleBuffer;
+    if (*payload) {
+      // Copied out because the section contents point into `file`, which
+      // dies with this iteration, while parser diagnostics and the parsed
+      // module's string attrs must not.
+      moduleBuffer = llvm::MemoryBuffer::getMemBufferCopy(**payload, path);
+    } else {
+      // FR-57b keeps the sidecar as the non-ELF fallback; honoring it here
+      // is what makes the pair round-trip without objcopy cooperation.
+      std::string sidecar = path + ".emitrust.mlirbc";
+      llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> side =
+          llvm::MemoryBuffer::getFile(sidecar);
+      if (!side) {
+        llvm::errs() << "error: object '" << path
+                     << "' has no .emitrust section and its sidecar '"
+                     << sidecar
+                     << "' cannot be read: " << side.getError().message()
+                     << "\n";
+        return nullptr;
+      }
+      moduleBuffer = std::move(*side);
+    }
+    llvm::SourceMgr sourceMgr;
+    sourceMgr.AddNewSourceBuffer(std::move(moduleBuffer), llvm::SMLoc());
+    mlir::ParserConfig parserConfig(&context);
+    mlir::OwningOpRef<mlir::ModuleOp> shard =
+        mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, parserConfig);
+    if (!shard)
+      return nullptr;
+    shards.push_back(std::move(shard));
+  }
+  mlir::FailureOr<mlir::OwningOpRef<mlir::ModuleOp>> merged =
+      emitrustcc::mergeLinkShards(shards);
+  if (mlir::failed(merged))
+    return nullptr;
+  return std::move(*merged);
+}
+
+//===----------------------------------------------------------------------===//
 // FR-43 -- the frontier search's probe
 //===----------------------------------------------------------------------===//
 
@@ -792,6 +901,23 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: --build is only valid with --emit=crate\n";
     return 1;
   }
+  // FR-58: --link consumes already-imported, already-converted shards, so
+  // everything that configures an import or the pass pipeline is
+  // meaningless with it and is rejected rather than silently ignored.
+  if (linkFlag && emitKind != EmitKind::Rust && emitKind != EmitKind::Crate) {
+    llvm::errs() << "error: --link merges already-converted shards, so only "
+                    "--emit=rust and --emit=crate apply\n";
+    return 1;
+  }
+  if (linkFlag &&
+      (!compilationDatabasePath.empty() || recoverFlag || incrementalFlag ||
+       searchFlag || deferExternalsFlag || checkRangeRefinement)) {
+    llvm::errs() << "error: --link takes object/shard files, not C sources; "
+                    "--compdb, --recover, --incremental, --search, "
+                    "--defer-externals and --check-range-refinement do not "
+                    "apply\n";
+    return 1;
+  }
   if (incrementalFlag && emitKind != EmitKind::Crate) {
     llvm::errs() << "error: --incremental is only valid with --emit=crate\n";
     return 1;
@@ -942,41 +1068,53 @@ int main(int argc, char **argv) {
   // after the module has been produced (and, on a recovered compile, after
   // the pipeline has confirmed the surviving subset is still lowerable).
   mlir::emitrust::RejectionLedger ledger;
-  mlir::emitrust::ImportOptions importOptions;
-  // --incremental IMPLIES --recover: a partial crate is the whole point, and
-  // an incremental run that hard-failed at the first unsupported item could
-  // not report a per-item status for anything after it.
-  importOptions.recover = recoverFlag || incrementalFlag;
-  importOptions.ledger = &ledger;
-  // --recover and --compdb are the pair a real C++ project needs together:
-  // the database to be parsed the way its build system parses it, recovery
-  // to yield anything at all.
-  importOptions.compilationDatabasePath = compilationDatabasePath;
-  // FR-43: the search's answer enters the compile here and nowhere else. An
-  // excluded item takes FR-42's recovery path (stub if its signature maps,
-  // drop otherwise), so the crate emitted below is a crate the recovering
-  // importer already knew how to build — the search chose WHICH one.
-  importOptions.excludedItems = searchExcluded;
-  // FR-52: an unresolved external is an ERROR for a binary crate and a
-  // REQUIREMENT for a library one; see `externalRequirementsPolicy`.
-  importOptions.externalRequirements = externalRequirementsPolicy();
-  // FR-57a: per-TU shim-path import mode; the emitted module carries
-  // declaration stubs the FR-58 link step must resolve, and the Rust
-  // emitter refuses a module still carrying one.
-  importOptions.deferExternals = deferExternalsFlag;
-  mlir::OwningOpRef<mlir::ModuleOp> module =
-      mlir::emitrust::importCProject(inputs, extra, importOptions, context);
-  if (!module)
-    return 1;
-  // Printed before any output is written so it is visible even when a later
-  // stage fails; a no-op when nothing was recovered.
-  ledger.printSummary(llvm::errs());
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  if (linkFlag) {
+    // FR-58: the positional inputs are objects/shards, every one of them
+    // already imported AND already lowered by the FR-56 shim, so the merge
+    // replaces both the import and the pass pipeline below and the merged
+    // module goes straight to the emission switch.
+    module = loadAndMergeShards(inputs, context);
+    if (!module)
+      return 1;
+  } else {
+    mlir::emitrust::ImportOptions importOptions;
+    // --incremental IMPLIES --recover: a partial crate is the whole point,
+    // and an incremental run that hard-failed at the first unsupported item
+    // could not report a per-item status for anything after it.
+    importOptions.recover = recoverFlag || incrementalFlag;
+    importOptions.ledger = &ledger;
+    // --recover and --compdb are the pair a real C++ project needs together:
+    // the database to be parsed the way its build system parses it, recovery
+    // to yield anything at all.
+    importOptions.compilationDatabasePath = compilationDatabasePath;
+    // FR-43: the search's answer enters the compile here and nowhere else.
+    // An excluded item takes FR-42's recovery path (stub if its signature
+    // maps, drop otherwise), so the crate emitted below is a crate the
+    // recovering importer already knew how to build — the search chose
+    // WHICH one.
+    importOptions.excludedItems = searchExcluded;
+    // FR-52: an unresolved external is an ERROR for a binary crate and a
+    // REQUIREMENT for a library one; see `externalRequirementsPolicy`.
+    importOptions.externalRequirements = externalRequirementsPolicy();
+    // FR-57a: per-TU shim-path import mode; the emitted module carries
+    // declaration stubs the FR-58 link step must resolve, and the Rust
+    // emitter refuses a module still carrying one.
+    importOptions.deferExternals = deferExternalsFlag;
+    module = mlir::emitrust::importCProject(inputs, extra, importOptions,
+                                            context);
+    if (!module)
+      return 1;
+    // Printed before any output is written so it is visible even when a
+    // later stage fails; a no-op when nothing was recovered.
+    ledger.printSummary(llvm::errs());
 
-  if (emitKind == EmitKind::Import)
-    return mlir::failed(writeModule(*module, outputPath)) ? 1 : 0;
+    if (emitKind == EmitKind::Import)
+      return mlir::failed(writeModule(*module, outputPath)) ? 1 : 0;
 
-  if (mlir::failed(runPipeline(*module)))
-    return 1;
+    if (mlir::failed(runPipeline(*module)))
+      return 1;
+  }
 
   switch (emitKind.getValue()) {
   case EmitKind::ItemGraph:
