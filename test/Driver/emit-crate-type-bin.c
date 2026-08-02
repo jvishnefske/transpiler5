@@ -44,13 +44,15 @@ int main(void) {
 // BINTOML-NEXT: name = "emit_crate_type_bin"
 // BINTOML-NEXT: version = "0.1.0"
 // BINTOML-NEXT: edition = "2021"
+// BINTOML:      [lints.rust]
+// BINTOML-NEXT: unused_variables = "deny"
 // BINTOML-NOT:  [lib]
 
 // BINLAYOUT-NOT: lib.rs
 // BINLAYOUT: main.rs
 // BINLAYOUT-NOT: lib.rs
 
-// BIN: #![allow(unused_variables,
+// BIN: #![allow(dead_code, unused_assignments)]
 // BIN: fn tu0_helper(v0: i32) -> i32 {
 // BIN: fn doubled(v0: i32) -> i32 {
 // BIN: fn c_main() -> i32 {

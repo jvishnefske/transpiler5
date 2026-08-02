@@ -16,9 +16,10 @@ int main(void) {
   return 0;
 }
 
-// The allow-header comes first: the emitter's statement-per-op, mut-let
-// style legitimately triggers these lints.
-// CHECK: #![allow(unused_variables, unused_assignments, unused_mut, unused_parens, dead_code, non_upper_case_globals, non_camel_case_types, unpredictable_function_pointer_comparisons)]
+// The allow-header comes first: only dead_code and unused_assignments remain
+// allowed (both intrinsic to a faithful transpile); every other lint is denied
+// in Cargo.toml.
+// CHECK: #![allow(dead_code, unused_assignments)]
 
 // The helper function keeps its name; C main is renamed to c_main.
 // CHECK: fn twice(v0: i32) -> i32 {

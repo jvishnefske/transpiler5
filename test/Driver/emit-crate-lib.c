@@ -58,15 +58,23 @@ int axis_of(int which) { return which == 0 ? AXIS_X : AXIS_Y; }
 // LIBTOML:      [lib]
 // LIBTOML-NEXT: name = "emit_crate_lib"
 // LIBTOML-NEXT: path = "src/lib.rs"
+// The [lints.rust] deny table follows the [lib] section, same as for a binary.
+// LIBTOML:      [lints.rust]
+// LIBTOML-NEXT: unused_variables = "deny"
+// LIBTOML-NEXT: unused_mut = "deny"
+// LIBTOML-NEXT: unused_parens = "deny"
+// LIBTOML-NEXT: unpredictable_function_pointer_comparisons = "deny"
+// LIBTOML-NEXT: non_snake_case = "deny"
+// LIBTOML-NEXT: non_upper_case_globals = "deny"
+// LIBTOML-NEXT: non_camel_case_types = "deny"
 
 // The crate root is src/lib.rs, and there is no src/main.rs at all.
 // LIBLAYOUT-NOT: main.rs
 // LIBLAYOUT: lib.rs
 // LIBLAYOUT-NOT: main.rs
 
-// The allow-header is emitted for a library exactly as for a binary: the
-// emitter's statement-per-op style triggers the same lints either way.
-// LIB: #![allow(unused_variables,
+// The allow-header is emitted for a library exactly as for a binary.
+// LIB: #![allow(dead_code, unused_assignments)]
 
 // Types are exported unconditionally, with their fields and variant
 // constants: Rust's private-in-public rule (E0446) means a type named in an

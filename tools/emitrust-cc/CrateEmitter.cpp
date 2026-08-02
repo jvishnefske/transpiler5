@@ -25,19 +25,24 @@
 
 namespace emitrustcc {
 
-/// Attribute header prepended to every generated crate root. The emitter's
-/// statement-per-op, mut-let style legitimately triggers these lints (for
-/// example a `let mut` that is assigned in only one `if` arm), global
-/// variables keep their original C spelling rather than SCREAMING_CASE,
-/// struct names keep their C spelling too (including the synthesized
-/// `Owner_<fn>_<base>` owner structs), and C function-pointer null/equality
-/// tests compare `Option<fn>` values (the comparison is exact for the null
-/// case C cares about), so the generated crate silences them to stay
-/// warning-clean.
+/// Attribute header prepended to every generated crate root. Only two lints are
+/// allowed, both because they are intrinsic to a faithful transpile rather than
+/// masking sloppy codegen:
+///   - `dead_code`: rejected items intentionally keep their `struct_def` /
+///     `global` definitions (dropping them was measured and rejected as risking
+///     dangling symbols), and a binary crate legitimately holds unreferenced
+///     imported items.
+///   - `unused_assignments`: the emitter's definite-assignment/dead-store
+///     analysis eliminates these everywhere it can prove safe (byte-diff
+///     verified); the sole residual is a dead store inside a loop, whose sound
+///     cross-iteration liveness would risk a miscompile and is deliberately not
+///     attempted. It is a per-crate no-op for every input in the suite except
+///     one.
+/// Every other lint the old blanket header silenced is now DENIED in
+/// `Cargo.toml`'s `[lints.rust]` table (see `renderCargoToml`), so a regression
+/// fails the build.
 static constexpr llvm::StringLiteral kAllowHeader =
-    "#![allow(unused_variables, unused_assignments, unused_mut, "
-    "unused_parens, dead_code, non_upper_case_globals, "
-    "non_camel_case_types, unpredictable_function_pointer_comparisons)]\n";
+    "#![allow(dead_code, unused_assignments)]\n";
 
 /// Verbatim entry-point wrapper: forwards the imported C `main`'s return
 /// value as the process exit code.
@@ -113,6 +118,19 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type) {
        << "[lib]\n"
        << "name = \"" << crateName << "\"\n"
        << "path = \"src/lib.rs\"\n";
+  // FR-53: the lints the old blanket allow header silenced are now DENIED, so
+  // any regression in the emitter's warning-clean codegen fails `cargo build`.
+  // `dead_code` and `unused_assignments` stay allowed in the crate root (see
+  // `kAllowHeader`); everything else must be clean.
+  os << "\n"
+     << "[lints.rust]\n"
+     << "unused_variables = \"deny\"\n"
+     << "unused_mut = \"deny\"\n"
+     << "unused_parens = \"deny\"\n"
+     << "unpredictable_function_pointer_comparisons = \"deny\"\n"
+     << "non_snake_case = \"deny\"\n"
+     << "non_upper_case_globals = \"deny\"\n"
+     << "non_camel_case_types = \"deny\"\n";
   return toml;
 }
 

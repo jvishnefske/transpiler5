@@ -448,12 +448,27 @@ bool RustEmitter::valueIsReadUncached(Value value) {
     if (auto assign = dyn_cast<emitrust::AssignOp>(owner))
       if (assign.getVar() == value)
         continue;
-    // Place-refining ops emit nothing themselves; `value` is read through one
-    // only when the projected place it denotes is itself read.
+    // A place-refining op emits nothing itself.
     if (isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
             emitrust::EnumRawOp>(owner)) {
-      if (valueIsRead(owner->getResult(0)))
+      Value place = owner->getResult(0);
+      if (owner->getOperand(0) == value) {
+        // `value` is the refined BASE: read through the projection only when
+        // the projected place is itself read.
+        if (valueIsRead(place))
+          return true;
+        continue;
+      }
+      // `value` is a non-base operand (a subscript index). It is emitted, and
+      // so read, only when the projected place is actually emitted -- i.e. it
+      // is read, or written by a store that is not a dropped dead store.
+      if (valueIsRead(place))
         return true;
+      for (Operation *consumer : place.getUsers())
+        if (auto assign = dyn_cast<emitrust::AssignOp>(consumer))
+          if (assign.getVar() == place && !unreachableOps.count(consumer) &&
+              !deadStores.count(consumer))
+            return true;
       continue;
     }
     return true;
@@ -525,9 +540,11 @@ bool RustEmitter::lvalueIsMutated(Value value) {
         return true;
       continue;
     }
-    // A place refined by a projection is mutated when the refined place is.
+    // A place refined by a projection is mutated when the refined place is --
+    // but only when `value` is the refined BASE, not a subscript index.
     if (isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
-            emitrust::EnumRawOp>(owner)) {
+            emitrust::EnumRawOp>(owner) &&
+        owner->getOperand(0) == value) {
       if (lvalueIsMutated(owner->getResult(0)))
         return true;
       continue;
@@ -816,9 +833,11 @@ void RustEmitter::computeDeferredInits(Block &block) {
         postInitMutation |=
             call.getReceiver() == binding && methodCallMutatesReceiver(call);
       // A partial write (`v.x = ..`, `v[i] = ..`) mutates the binding after
-      // its initializing whole assignment.
+      // its initializing whole assignment -- but only when the binding is the
+      // refined BASE, not a subscript index (`other[binding]` merely reads it).
       if (isa<emitrust::MemberOp, emitrust::SubscriptOp, emitrust::DerefOp,
-              emitrust::EnumRawOp>(user))
+              emitrust::EnumRawOp>(user) &&
+          user->getOperand(0) == binding)
         postInitMutation |= lvalueIsMutated(user->getResult(0));
     }
     deferredNeedsMut[op] =
