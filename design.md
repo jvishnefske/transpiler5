@@ -1858,6 +1858,17 @@ of references or inheritance, so it precedes both.
   and ledgered), but those items are recoverable ONLY with whole-program
   facts, so FR-58 is merge + SELECTIVE RE-IMPORT of fact-starved items
   (the ledger identifies them), not pure concatenation.
+  SPIKE 3 (GO -- the merge algorithm is now fully experiment-specified): on
+  a shared-header project where BOTH shards carry identical
+  `struct_def @Point` / `enum_def @Mode`, the mechanical merge extended
+  with first-occurrence type dedup (by symbol; a same-symbol
+  different-shape pair is the link error) is again BYTE-IDENTICAL to the
+  joint import. Algorithm: shard bodies in link-line order; drop an
+  `extern_decl` op when some shard defines the symbol (error otherwise --
+  the undefined-symbol link error); dedup struct_def/enum_def/global by
+  symbol, first occurrence wins, shape conflict errors; alpha-rename
+  shard-local `tu<N>_` tags to global ordinals; concatenate; verify; feed
+  the existing crate pipeline.
 - [ ] FR-59 Workspace partitioning (multi-crate output). One crate cannot
   hold a kernel-scale project. The link step partitions the item graph into a
   Cargo WORKSPACE of crates (per source directory/subsystem by default,
