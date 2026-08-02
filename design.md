@@ -1731,6 +1731,60 @@ of references or inheritance, so it precedes both.
   test/Conversion/LowerExternalRequirements/, test/Target/Rust/trait-def.mlir,
   test/EndToEnd/lib-crate-externals-trait.c,
   test/RealWorld/Cpp/Inputs/extern-plugin/)
+- [ ] FR-56 Compiler-shim front end (`emitrust-clang`). The build system, not
+  a compilation database, drives per-TU work: `make CC=emitrust-clang` on an
+  unmodified project must complete. The shim parses the FULL argv with
+  clang's own `clang::driver::Driver` (never a hand-rolled filter), classifies
+  arguments by whether they reach the `-cc1` frontend job (the principled
+  definition of "affects the Rust result"; target/ABI flags such as
+  `-target`, `-m32`, `-fshort-enums`, `-fpack-struct` DO affect it because
+  type layout feeds the lowerings), DELEGATES the real compile to the real
+  clang so `.o` files, configure/`cc-option` probes, version checks, and the
+  final native link all behave, and side-emits the FR-57 per-TU artifact.
+  Workflow fidelity is part of the contract: `@response-files`, `-MD/-MMD`
+  depfiles, `-x`, `-E`/`-S` pass-through, exit-code and stderr transparency.
+  Acceptance: a small real Makefile project builds unmodified with
+  CC=emitrust-clang, producing byte-identical binaries to a plain-clang
+  build, with one artifact per compiled TU.
+- [ ] FR-57 Per-TU artifacts ("object files as parse caches"). `-c` imports
+  ONE translation unit in isolation and serializes the result: the imported
+  emitrust module as MLIR bytecode plus the TU's item-graph shard and
+  rejection-ledger entries, keyed by a hash of the canonicalized `-cc1` line
+  (workflow-only argument changes MUST NOT change the key; a semantic or
+  layout flag change MUST). The artifact is embedded in a `.emitrust` ELF
+  section of the genuine object file (the gllvm model), so `ar` archives and
+  existing link lines carry it with no build-system cooperation; a sidecar
+  file is the fallback for non-ELF targets. Acceptance: bytecode round-trips
+  (emit -> reload -> translate is byte-identical to the direct path), and the
+  artifact survives `ar` + `ld` collection.
+- [ ] FR-58 Link-step whole-program aggregation. "Linking" extracts every
+  `.emitrust` payload from the link line's objects and archives, MERGES the
+  item-graph shards (order-independent, deterministic), runs the FR-41
+  3-color admission GLOBALLY, and materializes Rust for admitted items FROM
+  THE CACHED MODULES -- no `.c` is re-parsed at link time. Cross-TU symbol
+  unification and shape-dedup reuse the FR-26/FR-40 machinery but must hold
+  at 10^3..10^4 TUs; collision scans and impl lookups become indexed, not
+  linear. Acceptance: a multi-TU project built via FR-56 shim + FR-58 link
+  emits a crate byte-identical to today's single-invocation
+  `emitrust-cc --emit=crate` on the same sources.
+- [ ] FR-59 Workspace partitioning (multi-crate output). One crate cannot
+  hold a kernel-scale project. The link step partitions the item graph into a
+  Cargo WORKSPACE of crates (per source directory/subsystem by default,
+  overridable), with strongly-connected components CONDENSED so no
+  inter-crate cycle exists (an SCC lands whole in one crate); cross-crate
+  references become `pub` items behind the FR-51 export rules. Acceptance: a
+  project with two acyclic subsystems emits two crates that `cargo build`
+  together; a deliberately cyclic pair condenses into one crate rather than
+  failing.
+- [ ] FR-60 Kernel-corpus ratchet. The validation story at scale: byte-diff
+  does not exist for a kernel, so the measure is the ADMITTED-ITEM ratchet --
+  a per-project manifest (the c-testsuite ledger generalized) recording which
+  items are green; CI fails on any shrink. First corpus: a Linux
+  `allnoconfig` build driven by `make CC=emitrust-clang` where the SHIM
+  passes (FR-56 workflow fidelity proven at scale) even while most items
+  reject; the rejection ledger aggregates into a queryable per-construct
+  report (inline asm, volatile, container_of, attributes) that ranks what
+  semantic work buys the most frontier.
 
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:

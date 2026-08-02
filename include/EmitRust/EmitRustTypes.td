@@ -136,7 +136,8 @@ def EmitRust_ArrayType : EmitRust_Type<"Array", "array"> {
   let description = [{
     An array type with a compile-time size of at least one element. The
     element type must be a scalar (integer, index, or float), an
-    `!emitrust.struct` type, an `!emitrust.fn_ptr` type (a C
+    `!emitrust.struct` type, an `!emitrust.enum` type (a C array of
+    enums, emitted as `[Color; N]`), an `!emitrust.fn_ptr` type (a C
     function-pointer table, emitted as `[Option<fn(...)>; N]`), or a
     nested `!emitrust.array` type (a C multi-dimensional array is an
     array of arrays); lvalues, slices, and references are rejected. The
