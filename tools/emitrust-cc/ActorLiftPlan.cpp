@@ -105,9 +105,17 @@ std::string cellBaseName(llvm::StringRef cellSymbol,
 ActorLiftAttachment
 emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
                                       const ItemGraph &graph,
-                                      const ActorPlan &plan) {
+                                      const ActorPlan &plan,
+                                      bool preserveCNames) {
   ActorLiftAttachment result;
   mlir::MLIRContext *context = module.getContext();
+  // FR-53's verbatim opt-out applies to every name DERIVED from a C
+  // spelling; synthesized type/variable names are new names and keep the
+  // idiomatic rules.
+  auto derivedName = [preserveCNames](llvm::StringRef symbol) {
+    return preserveCNames ? symbol.str()
+                          : mlir::emitrust::toSnakeCase(symbol);
+  };
 
   // -- Module indices.
   llvm::StringMap<mlir::emitrust::FuncOp> funcOps;
@@ -121,10 +129,13 @@ emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
 
   // -- Graph indices for rule 1 and the free-function cell check.
   llvm::StringMap<std::string> addressTakenBy; // target -> first taker
+  llvm::StringMap<std::string> globalAddressBy; // global -> first taker
   std::map<std::string, std::set<std::string>> callersOf;
   for (const mlir::emitrust::ItemEdge &edge : graph.edges) {
     if (mlir::emitrust::edgeKindName(edge.kind) == "TakesAddressOf")
       addressTakenBy.try_emplace(edge.to, edge.from);
+    else if (mlir::emitrust::edgeKindName(edge.kind) == "AddressOfGlobal")
+      globalAddressBy.try_emplace(edge.to, edge.from);
     else if (mlir::emitrust::edgeKindName(edge.kind) == "Calls")
       callersOf[edge.to].insert(edge.from);
   }
@@ -205,6 +216,22 @@ emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
                            "monomorphization or a recovered item)");
   }
 
+  // Rule 1b (found by the stage-B default flip: c-testsuite 00089): an
+  // owned global whose ADDRESS is taken escapes the planned actor surface.
+  // The pass's IR-level veto cannot see the escape when the importer has
+  // folded it away (00089's returned-pointer rewrite leaves only an
+  // opaque `Some(anon)` constant that names the arm textually), so the
+  // graph fact demotes at certification, with the remark at the taker.
+  for (auto [i, actor] : llvm::enumerate(plan.actors))
+    for (const std::string &global : actor.globals)
+      if (auto it = globalAddressBy.find(global);
+          it != globalAddressBy.end())
+        demote((unsigned)i,
+               "global '" + global +
+                   "' has its address taken (the address escapes the "
+                   "actor surface)",
+               it->second);
+
   // Rule 2: poison-merged actors.
   for (auto [i, actor] : llvm::enumerate(plan.actors))
     if (actor.poisoned)
@@ -245,7 +272,7 @@ emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
         continue; // Skip-if-absent (importer-folded symbol).
       if (it->second.getIsConst())
         continue; // Consts stay module items (opaque path in arms).
-      std::string field = mlir::emitrust::toSnakeCase(global);
+      std::string field = derivedName(global);
       if (!fieldNames.insert(field).second)
         fieldCollision = true;
       entry.fields.push_back({global, std::move(field)});
@@ -296,8 +323,8 @@ emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
       LiftEntry *entry = entryOfPlanActor(ownerFn.actor);
       if (!entry)
         continue;
-      std::string field = mlir::emitrust::toSnakeCase(
-          cellBaseName(global.getSymName(), owner.getSymName()));
+      std::string field =
+          derivedName(cellBaseName(global.getSymName(), owner.getSymName()));
       if (llvm::any_of(entry->fields, [&](const auto &existing) {
             return existing.second == field;
           }))
@@ -331,8 +358,8 @@ emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
                });
     llvm::StringSet<> fieldNames;
     for (mlir::emitrust::GlobalOp cell : cells) {
-      std::string field = mlir::emitrust::toSnakeCase(
-          cellBaseName(cell.getSymName(), ownerSymbol));
+      std::string field =
+          derivedName(cellBaseName(cell.getSymName(), ownerSymbol));
       if (!fieldNames.insert(field).second)
         continue;
       entry.fields.push_back({cell.getSymName().str(), std::move(field)});
@@ -390,8 +417,7 @@ emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
       continue;
     }
     for (const auto &[globalSymbol, field] : entry.fields)
-      localGlobals.push_back(
-          {globalSymbol, mlir::emitrust::toSnakeCase(globalSymbol)});
+      localGlobals.push_back({globalSymbol, derivedName(globalSymbol)});
   }
 
   // -- Attachment.

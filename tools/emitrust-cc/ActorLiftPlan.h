@@ -52,7 +52,12 @@
 ///  - a driver-only actor (no arms, no cross clients, all uses in
 ///    `c_main`) lowers each global to a named driver local,
 ///    snake_case(symbol), carrying the global's initializer — the E1
-///    "main-only globals become main locals" rule.
+///    "main-only globals become main locals" rule;
+///  - under `--preserve-c-names` (FR-53's verbatim opt-out) every name
+///    DERIVED FROM a C spelling — field, cell base, driver local — keeps
+///    the symbol verbatim instead of snake_casing it; purely SYNTHESIZED
+///    names (the actor type and `_actor` variable) keep the rules above,
+///    since they never were C spellings.
 //
 //===----------------------------------------------------------------------===//
 
@@ -98,10 +103,12 @@ struct ActorLiftAttachment {
 /// Certifies `plan` against `graph` and `module` and attaches the
 /// `emitrust-actor-lift` attribute contract for every certified actor (see
 /// the file comment). Mutates only attributes; never IR structure.
+/// `preserveCNames` selects FR-53's verbatim spelling for every name
+/// derived from a C symbol (fields, cell bases, driver locals).
 ActorLiftAttachment
 attachActorLiftAttributes(mlir::ModuleOp module,
                           const mlir::emitrust::ItemGraph &graph,
-                          const ActorPlan &plan);
+                          const ActorPlan &plan, bool preserveCNames);
 
 } // namespace emitrustcc
 

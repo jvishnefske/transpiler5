@@ -365,7 +365,8 @@ static llvm::cl::opt<std::string> actorMapPath(
 static llvm::cl::opt<bool> actorLiftFlag(
     "actor-lift",
     llvm::cl::desc(
-        "FR-62 slice 4 (stage A, default off): run the emitrust-actor-lift "
+        "FR-62 slice 4 (stage B, default ON; disable with "
+        "--actor-lift=false): run the emitrust-actor-lift "
         "pass at the tail of the pipeline. Each certified actor cluster's "
         "mutable globals become fields of a synthesized struct owned by "
         "c_main, its arms become &mut-self methods, cross-actor clients "
@@ -373,9 +374,9 @@ static llvm::cl::opt<bool> actorLiftFlag(
         "become named main locals — no thread_local survives for any "
         "lifted global. Demoted actors (address-taken arms, poison "
         "merges, variadic monomorphs, library units, --link) keep "
-        "today's form with a printed warning. Valid with --emit=mlir, "
-        "--emit=rust and --emit=crate"),
-    llvm::cl::init(false));
+        "today's form with a printed warning. Applies with --emit=mlir, "
+        "--emit=rust and --emit=crate; the default is inert elsewhere"),
+    llvm::cl::init(true));
 
 static llvm::cl::opt<std::string> ratchetBaselinePath(
     "ratchet-baseline",
@@ -1798,8 +1799,12 @@ int main(int argc, char **argv) {
     return 1;
   }
   // FR-62 slice 4: the lift runs at the tail of the lowering pipeline, so
-  // it is meaningful exactly where the lowered module is consumed.
-  if (actorLiftFlag && emitKind != EmitKind::MLIR &&
+  // it is meaningful exactly where the lowered module is consumed. The
+  // flag defaults ON (stage B), so only an EXPLICIT --actor-lift on an
+  // emission mode with no lowered module is a usage error; the default is
+  // simply inert there.
+  if (actorLiftFlag && actorLiftFlag.getNumOccurrences() > 0 &&
+      emitKind != EmitKind::MLIR &&
       emitKind != EmitKind::Rust && emitKind != EmitKind::Crate) {
     llvm::errs() << "error: --actor-lift is only valid with --emit=mlir, "
                     "--emit=rust or --emit=crate\n";
@@ -2017,10 +2022,13 @@ int main(int argc, char **argv) {
       return emitPartitionedWorkspace(inputs, context);
     // FR-62 slice 4, demotion rule 5: under --link every actor is demoted
     // (the FR-58/FR-59 interaction is a recorded later stage), so the lift
-    // never runs — but the demotions are still REPORTED per actor, from
-    // the same stored shard graphs --emit=actor-plan reads, so the flag is
-    // honest about what it did not do.
-    if (actorLiftFlag) {
+    // never runs — but when the user EXPLICITLY asked for the lift the
+    // demotions are still REPORTED per actor, from the same stored shard
+    // graphs --emit=actor-plan reads, so the flag is honest about what it
+    // did not do. The stage-B default stays silent here: rule 5 already
+    // decided, and a default must not demand FR-57d graph metadata from
+    // every artifact on every link line.
+    if (actorLiftFlag && actorLiftFlag.getNumOccurrences() > 0) {
       llvm::SmallVector<emitrustcc::ActorUnit> units;
       if (!collectLinkActorUnits(inputs, context, units))
         return 1;
@@ -2075,7 +2083,8 @@ int main(int argc, char **argv) {
     if (mlir::failed(runPipeline(*module)))
       return 1;
 
-    // FR-62 slice 4 (stage A): the actor lift is the pipeline's tail. The
+    // FR-62 slice 4 (stage B: default ON): the actor lift is the
+    // pipeline's tail. The
     // plan is a pure function of the FR-40 item graph (a second, purely
     // analytical parse, exactly as --incremental's denominator takes);
     // the driver certifies it against the demotion table and attaches the
@@ -2100,7 +2109,8 @@ int main(int argc, char **argv) {
       for (const std::string &note : plan.notes)
         llvm::errs() << "warning: actor plan: " << note << "\n";
       emitrustcc::ActorLiftAttachment attachment =
-          emitrustcc::attachActorLiftAttributes(*module, *graph, plan);
+          emitrustcc::attachActorLiftAttributes(*module, *graph, plan,
+                                                preserveCNamesFlag);
       for (const emitrustcc::ActorLiftDemotion &demotion :
            attachment.demotions) {
         llvm::errs() << "warning: actor plan: demoted " << demotion.actor

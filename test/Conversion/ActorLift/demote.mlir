@@ -1,7 +1,8 @@
 // FR-62 slice 4 (stage A): pins the pass-level DEMOTION guarantees — the
 // invariants that (a) a module carrying no actor-lift attributes is left
-// completely untouched (the default-off contract: without --actor-lift the
-// pass in the pipeline tail is a no-op byte for byte), and (b) the
+// completely untouched (the disable contract: under --actor-lift=false —
+// or stage A's default-off — no attributes are attached and the pass in
+// the pipeline tail is a no-op byte for byte), and (b) the
 // safety-net veto: an owned global with any IR use OUTSIDE the planned
 // actor surface (here a function carrying no role attribute — the shape a
 // variadic monomorph or a recovered item produces) demotes the whole actor
@@ -12,9 +13,12 @@
 // RUN: emitrust-opt %s --split-input-file --emitrust-actor-lift 2>&1 \
 // RUN:   | FileCheck %s
 
-// The (b) veto warning is a located diagnostic on the demoted global; the
-// diagnostic stream precedes the printed modules in the merged output.
+// The veto warnings are located diagnostics on the demoted globals; the
+// diagnostic stream precedes the printed modules in the merged output, so
+// every case's warning is pinned here in case order.
 // CHECK:      warning: actor lift: demoted CounterActor: global 'COUNTER' has a use outside the planned actor surface
+// CHECK:      warning: actor lift: demoted fptr: global 'FPTR' carries an initializer with no local restatement (fn_ptr opaque init)
+// CHECK:      warning: actor lift: demoted HookActor: global 'HOOK' carries an initializer with no local restatement (fn_ptr opaque init)
 
 // (a) No attributes: byte-for-byte no-op.
 // CHECK:      emitrust.global @COUNTER : i32
@@ -83,6 +87,56 @@ module attributes {
   }
   emitrust.func @c_main() -> i32 attributes {emitrust.actor_driver} {
     %0 = emitrust.call_opaque "touch"() : () -> i32
+    emitrust.return %0 : i32
+  }
+}
+
+// -----
+
+// (c) Stage-B regression (c-testsuite 00088): a fn_ptr global's opaque
+// initializer (`None`) is legal on the GLOBAL op but has no VariableOp
+// restatement — the driver-local lowering must veto it (warning pinned at
+// the top, global kept in today's form, attribute consumed), never build
+// an invalid `emitrust.variable`.
+// CHECK:      emitrust.global @FPTR <#emitrust.opaque<"None">> : !emitrust.fn_ptr<() -> i32>
+// CHECK:      emitrust.func @c_main() -> i32 {
+// CHECK-NEXT:   emitrust.global_load @FPTR
+module attributes {
+  emitrust.actor_locals = [{global = "FPTR", name = "fptr"}]} {
+  emitrust.global @FPTR <#emitrust.opaque<"None">> : !emitrust.fn_ptr<() -> i32>
+  emitrust.func @c_main() -> i32 attributes {emitrust.actor_driver} {
+    %0 = emitrust.global_load @FPTR : !emitrust.fn_ptr<() -> i32>
+    %1 = emitrust.constant <#emitrust.opaque<"None">> : !emitrust.fn_ptr<() -> i32>
+    %2 = emitrust.cmp  ne, %0, %1 : (!emitrust.fn_ptr<() -> i32>, !emitrust.fn_ptr<() -> i32>) -> i1
+    %3 = emitrust.cast %2 : i1 to i32
+    emitrust.return %3 : i32
+  }
+}
+
+// -----
+
+// (c') The same initializer veto on an ACTOR's owned global: the field-init
+// staging variable would be just as invalid, so the whole actor demotes and
+// its arm keeps the module-level thread-local form (warning pinned at the
+// top).
+// CHECK:      emitrust.global @HOOK <#emitrust.opaque<"None">> : !emitrust.fn_ptr<() -> i32>
+// CHECK-NOT:  emitrust.struct_def
+// CHECK-NOT:  emitrust.impl
+// CHECK:      emitrust.func @poke() -> i32 {
+// CHECK:        emitrust.global_load @HOOK
+module attributes {
+  emitrust.actor_lift = [{name = "HookActor", var = "hook_actor",
+                          globals = ["HOOK"], fields = ["hook"]}]} {
+  emitrust.global @HOOK <#emitrust.opaque<"None">> : !emitrust.fn_ptr<() -> i32>
+  emitrust.func @poke() -> i32 attributes {emitrust.actor_arm = "HookActor"} {
+    %0 = emitrust.global_load @HOOK : !emitrust.fn_ptr<() -> i32>
+    %1 = emitrust.constant <#emitrust.opaque<"None">> : !emitrust.fn_ptr<() -> i32>
+    %2 = emitrust.cmp  ne, %0, %1 : (!emitrust.fn_ptr<() -> i32>, !emitrust.fn_ptr<() -> i32>) -> i1
+    %3 = emitrust.cast %2 : i1 to i32
+    emitrust.return %3 : i32
+  }
+  emitrust.func @c_main() -> i32 attributes {emitrust.actor_driver} {
+    %0 = emitrust.call_opaque "poke"() : () -> i32
     emitrust.return %0 : i32
   }
 }

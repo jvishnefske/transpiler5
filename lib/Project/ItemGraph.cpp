@@ -734,6 +734,19 @@ void ItemGraphBuilder::collectLValueDependencies(const clang::Expr *expr,
     return;
   const clang::Expr *stripped = expr->IgnoreParenImpCasts();
   if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stripped)) {
+    // An EXPLICIT `&f` routes the function reference through this walk
+    // (the bare-name decay reaches the rvalue DeclRefExpr arm instead);
+    // both spellings are the same TakesAddressOf fact, and FR-62's rule 1
+    // demotion keys on it (found by the stage-B default flip: c-testsuite
+    // 00089 returns `&anon` and the edge was silently dropped).
+    if (const auto *func =
+            llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl())) {
+      if (!isSystemHeaderDecl(*sourceManager, func) &&
+          !llvm::isa<clang::CXXMethodDecl>(func))
+        addEdge(from, cFunctionSymbolName(func, tuTag),
+                EdgeKind::TakesAddressOf);
+      return;
+    }
     const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
     // Only objects with STATIC storage at file scope are globals in this
     // model; a function-local static surfaces under the importer's

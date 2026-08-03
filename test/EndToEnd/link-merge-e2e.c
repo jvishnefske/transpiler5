@@ -13,7 +13,13 @@
 // linked crate and the clang-built native binary must produce
 // byte-identical stdout, and -- the FR-58 acceptance oracle -- the linked
 // crate root must be BYTE-IDENTICAL to the joint single-invocation
-// `emitrust-cc --emit=rust` of the same two sources.
+// `emitrust-cc --emit=rust` of the same two sources. Since the FR-62
+// stage-B flip, the joint invocations pass --actor-lift=false: under
+// --link every actor demotes by rule 5 (the FR-58/FR-59 lift interaction
+// is a recorded later stage), so the merge-equivalence oracle compares
+// both sides in the same (unlifted) form -- the joint LIFTED build of this
+// program is byte-diff green against the same native, verified at the
+// stage-B flip.
 //
 // Per-TU shards through the shim:
 // RUN: env EMITRUST_REAL_CC=clang emitrust-clang -c %s -o %t.main.o
@@ -29,7 +35,7 @@
 // RUN: diff %t.native.out %t.rust.out
 //
 // Byte identity vs the joint import (the FR-58 acceptance oracle):
-// RUN: emitrust-cc --emit=rust %s %S/Inputs/link-merge-lib.c -o %t.joint.rs
+// RUN: emitrust-cc --actor-lift=false --emit=rust %s %S/Inputs/link-merge-lib.c -o %t.joint.rs
 // RUN: diff %t.joint.rs %t.crate/src/main.rs
 //
 // Sidecar inputs: linking the `.emitrust.mlirbc` sidecars directly instead
