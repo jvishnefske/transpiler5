@@ -65,10 +65,12 @@
 
 #include "CrateEmitter.h"
 #include "LinkMerge.h"
+#include "Partition.h"
 #include "ProgressReport.h"
 
 #include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/EmitRustDialect.h"
+#include "EmitRust/EmitRustOps.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/Conversion/LowerExternalRequirements.h"
@@ -82,9 +84,11 @@
 #include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/UB/IR/UBOps.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Location.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Parser/Parser.h"
@@ -92,6 +96,7 @@
 #include "mlir/Support/FileUtilities.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
@@ -273,6 +278,32 @@ static llvm::cl::opt<bool> linkFlag(
         "runs: the shards are already fully converted, which is the whole "
         "point (only --emit=rust and --emit=crate apply)"),
     llvm::cl::init(false));
+
+static llvm::cl::opt<bool> partitionFlag(
+    "partition",
+    llvm::cl::desc(
+        "FR-59: partition the --link result into a Cargo WORKSPACE of "
+        "crates instead of one crate -- one library member per source "
+        "directory by default (each shard's recorded `emitrust.source` "
+        "path decides), the binary member holding the TU that defines "
+        "`main`, path dependencies and `use <dep>::*;` imports wiring the "
+        "members together through the FR-51 export rules. Boundaries the "
+        "packaging cannot express CONDENSE with a warning instead of "
+        "failing: dependency cycles (an SCC lands whole in one crate), "
+        "globals referenced across the boundary (never exported), impl "
+        "blocks away from their type's crate, and crates referencing into "
+        "the binary member. Requires --link --emit=crate; without this "
+        "flag the single-crate output is byte-identical to before FR-59"),
+    llvm::cl::init(false));
+
+static llvm::cl::opt<std::string> partitionMapPath(
+    "partition-map",
+    llvm::cl::desc(
+        "FR-59: override file for --partition. One `<path-prefix> "
+        "<crate-name>` pair per line; the LONGEST prefix matching a "
+        "shard's recorded source path assigns it to that crate, and "
+        "unmatched shards keep the per-directory default"),
+    llvm::cl::value_desc("file"), llvm::cl::init(""));
 
 static llvm::cl::opt<bool> buildFlag(
     "build",
@@ -1187,6 +1218,220 @@ static std::vector<std::string> collectExtraClangArgs() {
   return args;
 }
 
+//===----------------------------------------------------------------------===//
+// FR-59 -- workspace partitioning
+//===----------------------------------------------------------------------===//
+
+/// `--link --partition --emit=crate`: the full workspace path. Loads and
+/// surfaces the shards exactly like `loadAndMergeShards`, HARVESTS each
+/// link-line position's partition facts (source path, item-graph text)
+/// BEFORE the selective re-import replaces group members (the returned
+/// ordinal maps then say which positions each surviving unit covers), plans
+/// the workspace with the pure `planPartition`, merges with per-op unit
+/// attribution, SPLITS the merged module into one module per crate
+/// (`emitrust.use`/`emitrust.verbatim` header ops are CLONED into every
+/// member — a member gets at most an allowed unused import, never a missing
+/// one), and writes the workspace: a virtual root manifest plus one member
+/// directory per crate, the binary member last touched by `--build` through
+/// the ordinary root-manifest cargo invocation.
+///
+/// \param inputs the link-line object/archive/shard paths, in link order.
+/// \param context the context to parse, merge, and split in.
+/// \returns the process exit code.
+static int emitPartitionedWorkspace(llvm::ArrayRef<std::string> inputs,
+                                    mlir::MLIRContext &context) {
+  llvm::SmallVector<LoadedShard> shards;
+  if (!loadLinkShards(inputs, context, shards))
+    return 1;
+  for (LoadedShard &shard : shards) {
+    llvm::SmallVector<mlir::emitrust::RejectedItem> rejections =
+        mlir::emitrust::getShardRejections(*shard.module);
+    if (!rejections.empty()) {
+      mlir::emitrust::RejectionLedger shardLedger;
+      for (mlir::emitrust::RejectedItem &item : rejections)
+        shardLedger.record(std::move(item));
+      llvm::errs() << "shard '" << shard.name << "': ";
+      shardLedger.printSummary(llvm::errs());
+    }
+  }
+
+  // Harvest per-position partition facts BEFORE the re-import replaces
+  // group members; a partition without source facts has no directory rule
+  // to apply, so an old artifact is a clean error here (partitioning was
+  // explicitly requested).
+  size_t positions = shards.size();
+  llvm::SmallVector<std::string> positionSource(positions);
+  llvm::SmallVector<std::string> positionGraph(positions);
+  for (auto [i, shard] : llvm::enumerate(shards)) {
+    std::optional<mlir::emitrust::ShardSource> source =
+        mlir::emitrust::getShardSource(*shard.module);
+    if (!source) {
+      llvm::errs() << "error: cannot partition: shard '" << shard.name
+                   << "' records no source facts (artifact predates "
+                      "FR-58?)\n";
+      return 1;
+    }
+    positionSource[i] = source->path;
+    if (std::optional<llvm::StringRef> graph =
+            mlir::emitrust::getShardItemGraph(*shard.module))
+      positionGraph[i] = graph->str();
+  }
+
+  llvm::SmallVector<llvm::SmallVector<unsigned>> ordinalMaps;
+  reimportFactStarvedGroups(shards, context, ordinalMaps);
+
+  // Units from the post-re-import shards; each unit's member positions come
+  // from its ordinal map. Impl blocks are read off the MODULE (the graph
+  // does not model methods) so the orphan rule can condense them to their
+  // type's crate.
+  llvm::SmallVector<emitrustcc::PartitionUnit> units(shards.size());
+  for (auto [k, shard] : llvm::enumerate(shards)) {
+    for (unsigned position : ordinalMaps[k]) {
+      units[k].sourcePaths.push_back(positionSource[position]);
+      units[k].graphTexts.push_back(positionGraph[position]);
+    }
+    for (mlir::Operation &op : shard.module->getBody()->getOperations())
+      if (auto impl = llvm::dyn_cast<mlir::emitrust::ImplOp>(&op))
+        units[k].implTypes.push_back(impl.getStructName().str());
+  }
+
+  std::vector<std::pair<std::string, std::string>> overrides;
+  if (!partitionMapPath.empty()) {
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> map =
+        llvm::MemoryBuffer::getFile(partitionMapPath);
+    if (!map) {
+      llvm::errs() << "error: cannot read --partition-map '"
+                   << partitionMapPath << "': " << map.getError().message()
+                   << "\n";
+      return 1;
+    }
+    for (llvm::StringRef line : llvm::split((*map)->getBuffer(), '\n')) {
+      line = line.trim();
+      if (line.empty() || line.starts_with("#"))
+        continue;
+      auto [prefix, crate] = line.split(' ');
+      crate = crate.trim();
+      if (prefix.empty() || crate.empty()) {
+        llvm::errs() << "error: malformed --partition-map line: '" << line
+                     << "' (expected '<path-prefix> <crate-name>')\n";
+        return 1;
+      }
+      overrides.emplace_back(prefix.str(),
+                             emitrustcc::sanitizeCrateName(crate));
+    }
+  }
+
+  std::string binCrateName = deducedCrateName(inputs);
+  emitrustcc::PartitionPlan plan =
+      emitrustcc::planPartition(units, binCrateName, overrides);
+  for (const std::string &note : plan.notes)
+    llvm::errs() << "warning: workspace partition: " << note << "\n";
+
+  // Per-op unit attribution, recorded before the merge splices everything
+  // into one module (op pointers are stable across the splice; erased ops
+  // are simply never looked up again).
+  llvm::DenseMap<mlir::Operation *, unsigned> opUnit;
+  for (auto [k, shard] : llvm::enumerate(shards))
+    for (mlir::Operation &op : shard.module->getBody()->getOperations())
+      opUnit[&op] = static_cast<unsigned>(k);
+
+  llvm::SmallVector<mlir::OwningOpRef<mlir::ModuleOp>> modules;
+  modules.reserve(shards.size());
+  for (LoadedShard &shard : shards)
+    modules.push_back(std::move(shard.module));
+  mlir::FailureOr<mlir::OwningOpRef<mlir::ModuleOp>> merged =
+      emitrustcc::mergeLinkShards(modules, ordinalMaps);
+  if (mlir::failed(merged))
+    return 1;
+
+  // Split the merged module into one module per crate: header ops
+  // (`emitrust.use`/`emitrust.verbatim`) are cloned into every crate in
+  // their merged order, every other op moves to its unit's crate, and the
+  // relative item order within each crate is the merged order restricted
+  // to it.
+  llvm::SmallVector<mlir::OwningOpRef<mlir::ModuleOp>> crateModules;
+  for (size_t i = 0; i < plan.crates.size(); ++i)
+    crateModules.push_back(
+        mlir::ModuleOp::create(mlir::UnknownLoc::get(&context)));
+  llvm::SmallVector<mlir::Operation *> mergedOps;
+  for (mlir::Operation &op : (*merged)->getBody()->getOperations())
+    mergedOps.push_back(&op);
+  for (mlir::Operation *op : mergedOps) {
+    if (llvm::isa<mlir::emitrust::UseOp, mlir::emitrust::VerbatimOp>(op)) {
+      mlir::OpBuilder builder(&context);
+      for (mlir::OwningOpRef<mlir::ModuleOp> &crateModule : crateModules) {
+        builder.setInsertionPointToEnd(crateModule->getBody());
+        builder.clone(*op);
+      }
+      op->erase();
+      continue;
+    }
+    auto it = opUnit.find(op);
+    if (it == opUnit.end()) {
+      op->emitError() << "internal error: merged op has no shard attribution";
+      return 1;
+    }
+    mlir::ModuleOp target = *crateModules[plan.unitCrate[it->second]];
+    op->moveBefore(target.getBody(), target.getBody()->end());
+  }
+  for (mlir::OwningOpRef<mlir::ModuleOp> &crateModule : crateModules)
+    if (mlir::failed(mlir::verify(*crateModule)))
+      return 1;
+
+  // Write the workspace.
+  if (std::error_code ec = llvm::sys::fs::create_directories(outputPath)) {
+    llvm::errs() << "error: cannot create directory '" << outputPath
+                 << "': " << ec.message() << "\n";
+    return 1;
+  }
+  llvm::SmallVector<std::string> memberNames;
+  for (const emitrustcc::PartitionCrate &crate : plan.crates)
+    memberNames.push_back(crate.name);
+  llvm::SmallString<256> rootToml(outputPath);
+  llvm::sys::path::append(rootToml, "Cargo.toml");
+  if (mlir::failed(
+          writeFile(rootToml, emitrustcc::renderWorkspaceToml(memberNames))))
+    return 1;
+
+  for (auto [index, crate] : llvm::enumerate(plan.crates)) {
+    mlir::ModuleOp module = *crateModules[index];
+    emitrustcc::CrateType type =
+        crate.isBin ? emitrustcc::CrateType::Bin : emitrustcc::CrateType::Lib;
+    if (crate.isBin && !emitrustcc::hasCMain(module)) {
+      module.emitError() << "internal error: the binary member '"
+                         << crate.name << "' lost its 'c_main'";
+      return 1;
+    }
+    llvm::SmallVector<std::string> depNames;
+    for (unsigned dep : crate.deps)
+      depNames.push_back(plan.crates[dep].name);
+    mlir::FailureOr<std::string> rootRs =
+        emitrustcc::renderCrateRoot(module, type, depNames);
+    if (mlir::failed(rootRs))
+      return 1;
+    llvm::SmallString<256> srcDir(outputPath);
+    llvm::sys::path::append(srcDir, crate.name, "src");
+    if (std::error_code ec = llvm::sys::fs::create_directories(srcDir)) {
+      llvm::errs() << "error: cannot create directory '" << srcDir
+                   << "': " << ec.message() << "\n";
+      return 1;
+    }
+    llvm::SmallString<256> tomlPath(outputPath);
+    llvm::sys::path::append(tomlPath, crate.name, "Cargo.toml");
+    llvm::SmallString<256> rootPath(srcDir);
+    llvm::sys::path::append(rootPath, emitrustcc::crateRootFileName(type));
+    if (mlir::failed(writeFile(tomlPath, emitrustcc::renderMemberCargoToml(
+                                             crate.name, type, depNames))))
+      return 1;
+    if (mlir::failed(writeFile(rootPath, *rootRs)))
+      return 1;
+  }
+
+  if (buildFlag && mlir::failed(buildCrate(outputPath)))
+    return 1;
+  return 0;
+}
+
 /// Tool entry point: validates the option combination, imports the C inputs,
 /// runs the lowering pipeline, and produces the selected output. Returns
 /// nonzero on any error; diagnostics have already been printed.
@@ -1219,6 +1464,15 @@ int main(int argc, char **argv) {
       emitKind != EmitKind::ItemGraph) {
     llvm::errs() << "error: --link merges already-converted shards, so only "
                     "--emit=rust, --emit=crate and --emit=item-graph apply\n";
+    return 1;
+  }
+  // FR-59: partitioning is a link-time, crate-emitting operation only.
+  if (partitionFlag && (!linkFlag || emitKind != EmitKind::Crate)) {
+    llvm::errs() << "error: --partition requires --link and --emit=crate\n";
+    return 1;
+  }
+  if (!partitionMapPath.empty() && !partitionFlag) {
+    llvm::errs() << "error: --partition-map requires --partition\n";
     return 1;
   }
   if (linkFlag &&
@@ -1387,6 +1641,10 @@ int main(int argc, char **argv) {
   mlir::emitrust::RejectionLedger ledger;
   mlir::OwningOpRef<mlir::ModuleOp> module;
   if (linkFlag) {
+    // FR-59: partitioning is a whole path of its own — it needs the
+    // per-shard facts the ordinary merge deliberately strips.
+    if (partitionFlag)
+      return emitPartitionedWorkspace(inputs, context);
     // FR-58: the positional inputs are objects/shards, every one of them
     // already imported AND already lowered by the FR-56 shim, so the merge
     // replaces both the import and the pass pipeline below and the merged
