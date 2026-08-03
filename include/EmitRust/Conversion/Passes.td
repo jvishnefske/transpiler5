@@ -341,4 +341,50 @@ def EmitRustLowerContainers
                            "::mlir::memref::MemRefDialect"];
 }
 
+//===----------------------------------------------------------------------===//
+// EmitRustActorLift
+//===----------------------------------------------------------------------===//
+
+def EmitRustActorLift : Pass<"emitrust-actor-lift", "ModuleOp"> {
+  let summary = "Lift planned actor clusters to struct-owned state (FR-62)";
+  let description = [{
+    FR-62 slice 4: rewrites a pipeline-stage module (pure emission dialect,
+    the exact input of the Rust emitter) into the same-thread actor shape
+    described by the discardable attributes the emitrust-cc driver attaches
+    (see EmitRust/Conversion/ActorLift.h for the attribute contract and the
+    architecture-seam rationale):
+
+    - each certified actor gets a synthesized `emitrust.struct_def` whose
+      fields are the actor's owned mutable globals (and lifted
+      function-local static cells), plus an `emitrust.impl` holding the
+      actor's arm functions rewritten to take the actor as a leading
+      `!emitrust.mut_ref` receiver (`&mut self`);
+    - `global_load`/`global_store` of an owned global become member place
+      loads/assigns on the receiver; a `global_load` of a CONST global
+      inside the impl becomes the opaque-constant path (the impl is a
+      SymbolTable, so the module-level symbol is unreachable there);
+    - cross-actor client functions stay at module level and gain one
+      `!emitrust.mut_ref` parameter per listed actor; their calls to arms
+      become `emitrust.method_call` on the dereferenced parameter, and
+      calls to other cross clients pass the parameters through (Rust's
+      implicit reborrow);
+    - the driver (`c_main`) constructs each actor as a defaulted named
+      local, materializes non-default field initializers as
+      post-construction member assigns, calls arms as method calls on the
+      local, and takes a fresh `&mut` per cross-client call; globals of
+      driver-only actors become named driver locals carrying the global's
+      initializer;
+    - whole-global snapshot round-trips (`variable` filled from a
+      `global_load` and written back by a `global_store`) collapse to
+      direct member access — the separately-tested elision cleanup;
+    - the lifted `emitrust.global` ops are deleted.
+
+    The pass is a NO-OP on a module carrying none of the attributes, which
+    is every module produced without `--actor-lift`. An actor whose globals
+    have any IR use the pass cannot rewrite is demoted on the spot with a
+    warning and left completely untouched (the safety-net veto).
+  }];
+  let dependentDialects = ["::mlir::emitrust::EmitRustDialect"];
+}
+
 #endif // EMITRUST_CONVERSION_PASSES
