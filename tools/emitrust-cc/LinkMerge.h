@@ -7,12 +7,13 @@
 //
 /// \file
 /// This file declares the functional core of `emitrust-cc --link` (FR-58
-/// slice 1): given the per-TU emitrust shards the FR-56 shim recorded — one
-/// fully converted module per object file, embedded in the object's
-/// `.emitrust` section or in the `<object>.emitrust.mlirbc` sidecar — merge
-/// them into the single whole-program module the joint import would have
-/// produced, so the EXISTING crate-emission path can materialize Rust with
-/// no `.c` re-parsed at link time.
+/// slices 1 and 2): given the per-TU emitrust shards the FR-56 shim
+/// recorded — one fully converted module per object file, embedded in the
+/// object's `.emitrust` section, in the `<object>.emitrust.mlirbc` sidecar,
+/// or archived as a static-archive member — merge them into the single
+/// whole-program module the joint import would have produced, so the
+/// EXISTING crate-emission path can materialize Rust with no `.c` re-parsed
+/// at link time.
 ///
 /// The merge algorithm is the byte-identity-proven one from design.md's
 /// FR-58 spikes (2 and 3), implemented exactly:
@@ -30,9 +31,11 @@
 ///     `emitrust.global` definitions are deduped by symbol name, first
 ///     occurrence wins; a later same-symbol definition with a DIFFERENT
 ///     shape is the shape-conflict link error. Shape comparison is
-///     print-to-string equality — acceptable for slice 1 (the printed form
-///     is a total function of the op and carries no locations);
-///     `OperationEquivalence` is the eventual upgrade.
+///     structural `mlir::OperationEquivalence` with locations ignored
+///     (slice 2): these are module-level defs with no operands, so
+///     equivalence is exactly attributes + types — two definitions with
+///     identical layout but different FIELD NAMES conflict, because field
+///     names are attributes of the definition.
 ///  4. Module-level `emitrust.use` / `emitrust.verbatim` header ops that a
 ///     later shard repeats textually are dropped, matching the joint
 ///     import's emit-once behavior.
@@ -40,10 +43,13 @@
 ///     which is then verified.
 ///
 /// Everything here is pure with respect to the filesystem: payload
-/// classification takes a loaded buffer and the merge takes parsed modules.
+/// classification takes a loaded buffer (archive expansion included — a
+/// static archive on the link line is expanded in place, each member's
+/// payload extracted in archive order) and the merge takes parsed modules.
 /// The imperative shell in emitrust-cc.cpp reads files, parses bytecode,
-/// and reports located diagnostics (every failure path in the merge emits
-/// one through the ops' recorded locations).
+/// prints the payload-less-member warnings, and reports located
+/// diagnostics (every failure path in the merge emits one through the
+/// ops' recorded locations).
 //
 //===----------------------------------------------------------------------===//
 
@@ -54,6 +60,7 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Support/LLVM.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/MemoryBuffer.h"
 
@@ -61,6 +68,51 @@
 #include <string>
 
 namespace emitrustcc {
+
+/// One static-archive member's extracted shard payload.
+struct ArchiveMemberPayload {
+  /// The member's name as `ar` recorded it (usually the object's basename).
+  std::string memberName;
+  /// The payload bytes. Points into the archive's buffer, which must
+  /// outlive this struct.
+  llvm::StringRef payload;
+};
+
+/// The result of expanding one static archive named on the link line.
+struct ArchivePayloads {
+  /// The extracted member payloads, in ARCHIVE ORDER — the members merge as
+  /// if they had been listed loose at the archive's position on the link
+  /// line.
+  llvm::SmallVector<ArchiveMemberPayload> payloads;
+  /// Member names carrying no `.emitrust` payload, in archive order. A real
+  /// build may archive objects the shim never produced (hand-written
+  /// assembly, say); the caller warns and skips each — archive members have
+  /// no sidecar to fall back to.
+  llvm::SmallVector<std::string> skippedMembers;
+};
+
+/// Returns true when `buffer` holds a static archive (regular or thin `ar`
+/// magic). A `.a` on the link line is detected by these bytes, not by its
+/// extension, so an archive under any name is expanded and a mis-named
+/// non-archive is not.
+bool isStaticArchive(const llvm::MemoryBuffer &buffer);
+
+/// Expands the static archive in `buffer`: every member that is an object
+/// file with a `.emitrust` section contributes that section's contents, in
+/// archive order; a member that is not an object file at all contributes
+/// its whole bytes (a `.mlirbc` shard archived directly, mirroring how a
+/// loose non-object link input is treated); an object member WITHOUT the
+/// section is recorded in `skippedMembers` for the caller to warn about.
+///
+/// \param buffer the raw bytes of an archive link input; must outlive the
+///        returned payloads.
+/// \param errorMessage set to a description when the archive or a member
+///        cannot be read.
+/// \returns the member payloads and skipped members, or failure with
+///          `errorMessage` set.
+mlir::FailureOr<ArchivePayloads>
+findArchivePayloads(const llvm::MemoryBuffer &buffer,
+                    std::string &errorMessage);
 
 /// Locates the emitrust shard payload inside one link input `buffer`.
 ///

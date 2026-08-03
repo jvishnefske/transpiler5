@@ -18,6 +18,7 @@
 #include "EmitRust/EmitRustOps.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 
@@ -25,6 +26,8 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/BinaryFormat/Magic.h"
+#include "llvm/Object/Archive.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/raw_ostream.h"
@@ -35,11 +38,14 @@ using namespace mlir;
 // Payload extraction
 //===----------------------------------------------------------------------===//
 
-FailureOr<std::optional<llvm::StringRef>>
-emitrustcc::findShardPayload(const llvm::MemoryBuffer &buffer,
-                             std::string &errorMessage) {
+/// The buffer-ref core of `findShardPayload`, shared with the archive
+/// expansion (an archive member is a MemoryBufferRef into the archive, not
+/// a MemoryBuffer of its own). Same three-way contract as the public
+/// wrapper.
+static FailureOr<std::optional<llvm::StringRef>>
+findShardPayloadRef(llvm::MemoryBufferRef buffer, std::string &errorMessage) {
   llvm::Expected<std::unique_ptr<llvm::object::ObjectFile>> object =
-      llvm::object::ObjectFile::createObjectFile(buffer.getMemBufferRef());
+      llvm::object::ObjectFile::createObjectFile(buffer);
   if (!object) {
     // Not an object file: the input IS the shard (bytecode or textual
     // MLIR); the parser will diagnose anything else.
@@ -63,6 +69,65 @@ emitrustcc::findShardPayload(const llvm::MemoryBuffer &buffer,
   }
   // An object with no `.emitrust` section: sidecar fallback.
   return std::optional<llvm::StringRef>();
+}
+
+FailureOr<std::optional<llvm::StringRef>>
+emitrustcc::findShardPayload(const llvm::MemoryBuffer &buffer,
+                             std::string &errorMessage) {
+  return findShardPayloadRef(buffer.getMemBufferRef(), errorMessage);
+}
+
+bool emitrustcc::isStaticArchive(const llvm::MemoryBuffer &buffer) {
+  return llvm::identify_magic(buffer.getBuffer()) ==
+         llvm::file_magic::archive;
+}
+
+FailureOr<emitrustcc::ArchivePayloads>
+emitrustcc::findArchivePayloads(const llvm::MemoryBuffer &buffer,
+                                std::string &errorMessage) {
+  llvm::Expected<std::unique_ptr<llvm::object::Archive>> archive =
+      llvm::object::Archive::create(buffer.getMemBufferRef());
+  if (!archive) {
+    errorMessage = llvm::toString(archive.takeError());
+    return failure();
+  }
+  ArchivePayloads result;
+  // `children` skips the symbol-table and string-table pseudo-members and
+  // reports iteration corruption through `err`, which must be checked even
+  // on the early-return paths.
+  llvm::Error err = llvm::Error::success();
+  for (const llvm::object::Archive::Child &child : (*archive)->children(err)) {
+    llvm::Expected<llvm::StringRef> name = child.getName();
+    if (!name) {
+      errorMessage = llvm::toString(name.takeError());
+      llvm::consumeError(std::move(err));
+      return failure();
+    }
+    llvm::Expected<llvm::MemoryBufferRef> member = child.getMemoryBufferRef();
+    if (!member) {
+      errorMessage = ("member '" + *name +
+                      "': " + llvm::toString(member.takeError()))
+                         .str();
+      llvm::consumeError(std::move(err));
+      return failure();
+    }
+    FailureOr<std::optional<llvm::StringRef>> payload =
+        findShardPayloadRef(*member, errorMessage);
+    if (failed(payload)) {
+      errorMessage = ("member '" + *name + "': " + errorMessage).str();
+      llvm::consumeError(std::move(err));
+      return failure();
+    }
+    if (*payload)
+      result.payloads.push_back({name->str(), **payload});
+    else
+      result.skippedMembers.push_back(name->str());
+  }
+  if (err) {
+    errorMessage = llvm::toString(std::move(err));
+    return failure();
+  }
+  return result;
 }
 
 //===----------------------------------------------------------------------===//
@@ -106,9 +171,12 @@ static std::optional<TuTag> parseTuTag(llvm::StringRef name) {
   return TuTag{ordinal, upper, name.drop_front(digits + 1)};
 }
 
-/// Prints `op` to a string with the default flags (no locations), the
-/// slice-1 shape-equality oracle for the dedup in step 3 and the textual
-/// identity for the use/verbatim dedup in step 4.
+/// Prints `op` to a string with the default flags (no locations): the
+/// textual identity for the use/verbatim dedup in step 4. (It was also
+/// slice 1's shape-equality oracle for step 3, replaced by structural
+/// `OperationEquivalence` in slice 2; when debugging a surprising step-3
+/// verdict, comparing the two ops' `printOpToString` output is still the
+/// quickest way to see WHERE they diverge.)
 static std::string printOpToString(Operation *op) {
   std::string text;
   llvm::raw_string_ostream os(text);
@@ -211,12 +279,21 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
       Operation *first = it->second;
       // Step 3: struct/enum/global definitions repeat in every shard that
       // uses them (shape-dedup'd per TU by the import); first occurrence
-      // wins when the shapes agree.
+      // wins when the shapes agree. Shape equality is structural
+      // OperationEquivalence: these module-level defs carry no operands
+      // (exactValueMatch is vacuous) and no regions, so equivalence is
+      // exactly attributes + types with locations ignored — identical
+      // layout under different field names is a CONFLICT, because field
+      // names are attributes.
       bool dedupable =
           isa<emitrust::StructDefOp, emitrust::EnumDefOp, emitrust::GlobalOp>(
               op) &&
           first->getName() == op.getName();
-      if (dedupable && printOpToString(first) == printOpToString(&op)) {
+      if (dedupable &&
+          OperationEquivalence::isEquivalentTo(
+              first, &op, OperationEquivalence::exactValueMatch,
+              /*markEquivalent=*/nullptr,
+              OperationEquivalence::Flags::IgnoreLocations)) {
         toErase.push_back(&op);
         continue;
       }

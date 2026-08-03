@@ -8,8 +8,11 @@
 # =============================================================================
 
 # Object: FR-58 --link reads each link input as an llvm::object::ObjectFile
-# to extract the `.emitrust` section the FR-56 shim embedded.
+# (or llvm::object::Archive, whose members it expands in place) to extract
+# the `.emitrust` sections the FR-56 shim embedded; BinaryFormat provides
+# the identify_magic archive detection.
 set(LLVM_LINK_COMPONENTS
+  BinaryFormat
   Object
   Support
   )
