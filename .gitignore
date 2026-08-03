@@ -44,6 +44,9 @@
 build/
 build-pdll/
 
+# Meson build directory
+build-meson/
+
 # Claude Code session worktrees and editor swap files
 .claude/worktrees/
 .*.swp
