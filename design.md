@@ -2178,7 +2178,7 @@ of references or inheritance, so it precedes both.
   recorded: PORTING.md/progress artifacts are not emitted per member
   (they are FR-44 import-path artifacts; the link path has no importer
   ledger of its own).
-- [ ] FR-60 Kernel-corpus ratchet. The validation story at scale: byte-diff
+- [x] FR-60 Kernel-corpus ratchet. The validation story at scale: byte-diff
   does not exist for a kernel, so the measure is the ADMITTED-ITEM ratchet --
   a per-project manifest (the c-testsuite ledger generalized) recording which
   items are green; CI fails on any shrink. First corpus: a Linux
@@ -2219,6 +2219,46 @@ of references or inheritance, so it precedes both.
   manifest is the update (test/Driver/link-ratchet.c pins manifest
   content, all four directions, the single-crate identity, and the
   gates). (tools/emitrust-cc/RatchetReport.h)
+  LANDED (FR-60b, the acceptance run — MEASURED; box checked). Corpus:
+  linux-6.6.94 (cdn.kernel.org, sha256 713981ea26b20b476ba4ce880b76b212
+  94576788d5db1c2188b167bcb06ecc56), allnoconfig +
+  CONFIG_SECTION_MISMATCH_WARN_ONLY=y (one modpost section mismatch under
+  clang 21 — the config's own knob for it), fetch-on-demand into the
+  session scratchpad; only the manifest and report land in-repo
+  (test/Kernel/linux-6.6.94-allnoconfig/). Environment blockers measured
+  and worked around: the NIX-WRAPPED clang trips the kernel's
+  `-Werror,-Wunused-command-line-argument` on `-nostdlibinc` (the
+  cc-wrapper's injected flags), so both builds use the UNWRAPPED
+  clang-21.1.8 store binaries on PATH with `make LLVM=1`; host
+  make/flex/bison serve kbuild. Baseline: `make LLVM=1 -j24` builds
+  vmlinux in ~86s wall. THE SHIM RUN PASSES: `make LLVM=1
+  CC=emitrust-clang -j24` (EMITRUST_REAL_CC=unwrapped clang) completes
+  with EXIT 0 and produces vmlinux in 2m23s wall (~1.7x the baseline;
+  side-emission cost), across 676 target objects — 834 classified C
+  compile jobs, 131 artifacts written (import + pipeline succeeded, each
+  with its FR-57d ledger), 366 imports failed at parse (no artifact, per
+  contract), ZERO importer crashes and ZERO build-visible failures:
+  FR-56's workflow fidelity holds at kernel scale. Measured finding for
+  future work: the kernel's `ld -r` steps (vmlinux.o, .tmp_*) CONCATENATE
+  the members' `.emitrust` sections into one, which no longer parses as a
+  single bytecode module — the artifact queries therefore exclude
+  linker-produced objects, and a framed multi-payload section format (or
+  per-TU section names) is the recorded fix. The report and manifest
+  compute in ~1.7s over 673 objects (543 payload-less ones skipped with
+  warnings). THE RANKING, the FR's deliverable (110,571 ledgered
+  rejections in 130 of 131 artifact TUs): rank 1 `other` 58,971 items
+  (top wordings: call to unimported function 24,789 — cross-TU calls a
+  richer defer mode could absorb; volatile-qualified type 7,135; void
+  pointer parameter 6,337), rank 2 `rejected-type-cascade` 31,895 (a
+  type-support win multiplies), rank 3 `unsupported-stmt:GCCAsmStmt`
+  8,120 in 116 TUs (inline asm, the expected kernel signature), rank 4
+  `returned-pointer` 5,437, rank 5 `self-ref-pointer-member` 2,917, then
+  `pointer-local-nonaddress` 1,225, `ptr-to-ptr` 1,166,
+  `variadic-cross-tu` 488, `unsupported-top-level-decl` 277,
+  `unsupported-expr:OffsetOfExpr` 68 (the container_of family). First
+  kernel ratchet baseline committed: admitted-total 89,799 (per-shard
+  module-level definitions minus ledgered stubs, shard keys relative to
+  the kernel root, so the manifest is checkout-portable).
 - [x] FR-61 Rustacean-style emission. The emitted Rust should read as
   expression-oriented Rust, not statement-per-op SSA transliteration; every
   slice is a pure EMITTER rendering change whose oracle is the EndToEnd

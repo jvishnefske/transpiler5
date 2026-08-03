@@ -1,0 +1,148 @@
+emitrust ratchet manifest v1
+admitted-total: 89799
+rejected-total: 110571
+crates: 1
+condensation-warnings: 0
+shard 'arch/x86/boot/a20.c': admitted=102 rejected=68
+shard 'arch/x86/boot/cmdline.c': admitted=96 rejected=67
+shard 'arch/x86/boot/compressed/cpuflags.c': admitted=45 rejected=25
+shard 'arch/x86/boot/compressed/string.c': admitted=39 rejected=37
+shard 'arch/x86/boot/cpucheck.c': admitted=104 rejected=70
+shard 'arch/x86/boot/cpuflags.c': admitted=45 rejected=24
+shard 'arch/x86/boot/cpu.c': admitted=96 rejected=69
+shard 'arch/x86/boot/early_serial_console.c': admitted=98 rejected=68
+shard 'arch/x86/boot/edd.c': admitted=95 rejected=65
+shard 'arch/x86/boot/main.c': admitted=99 rejected=75
+shard 'arch/x86/boot/memory.c': admitted=96 rejected=70
+shard 'arch/x86/boot/pm.c': admitted=122 rejected=82
+shard 'arch/x86/boot/printf.c': admitted=95 rejected=72
+shard 'arch/x86/boot/regs.c': admitted=95 rejected=67
+shard 'arch/x86/boot/string.c': admitted=39 rejected=30
+shard 'arch/x86/boot/tty.c': admitted=100 rejected=72
+shard 'arch/x86/boot/version.c': admitted=96 rejected=65
+shard 'arch/x86/boot/video-bios.c': admitted=100 rejected=72
+shard 'arch/x86/boot/video-mode.c': admitted=108 rejected=72
+shard 'arch/x86/boot/video.c': admitted=106 rejected=81
+shard 'arch/x86/boot/video-vesa.c': admitted=105 rejected=75
+shard 'arch/x86/boot/video-vga.c': admitted=109 rejected=75
+shard 'arch/x86/entry/vdso/vdso32-setup.c': admitted=1077 rejected=1084
+shard 'arch/x86/entry/vdso/vdso32/vclock_gettime.c': admitted=1599 rejected=2106
+shard 'arch/x86/entry/vdso/vdso32/vgetcpu.c': admitted=150 rejected=130
+shard 'arch/x86/entry/vdso/vdso-image-32.c': admitted=1019 rejected=1048
+shard 'arch/x86/events/probe.c': admitted=1330 rejected=1880
+shard 'arch/x86/kernel/cpu/aperfmperf.c': admitted=1868 rejected=2474
+shard 'arch/x86/kernel/cpu/capflags.c': admitted=0 rejected=5
+shard 'arch/x86/kernel/cpu/centaur.c': admitted=1578 rejected=2150
+shard 'arch/x86/kernel/cpu/cpuid-deps.c': admitted=1434 rejected=1968
+shard 'arch/x86/kernel/cpu/feat_ctl.c': admitted=1547 rejected=2143
+shard 'arch/x86/kernel/cpu/hygon.c': admitted=1669 rejected=2246
+shard 'arch/x86/kernel/cpu/intel_pconfig.c': admitted=674 rejected=665
+shard 'arch/x86/kernel/cpu/powerflags.c': admitted=670 rejected=663
+shard 'arch/x86/kernel/cpu/rdrand.c': admitted=677 rejected=688
+shard 'arch/x86/kernel/cpu/scattered.c': admitted=1651 rejected=2226
+shard 'arch/x86/kernel/cpu/topology.c': admitted=1650 rejected=2229
+shard 'arch/x86/kernel/cpu/tsx.c': admitted=1599 rejected=2153
+shard 'arch/x86/kernel/cpu/vortex.c': admitted=672 rejected=662
+shard 'arch/x86/kernel/cpu/zhaoxin.c': admitted=1544 rejected=2142
+shard 'arch/x86/kernel/fpu/bugs.c': admitted=723 rejected=738
+shard 'arch/x86/kernel/i8237.c': admitted=1472 rejected=1973
+shard 'arch/x86/kernel/io_delay.c': admitted=1427 rejected=1965
+shard 'arch/x86/kernel/pcspeaker.c': admitted=1481 rejected=2132
+shard 'arch/x86/kernel/platform-quirks.c': admitted=1618 rejected=2264
+shard 'arch/x86/kernel/resource.c': admitted=811 rejected=820
+shard 'arch/x86/kernel/trace_clock.c': admitted=476 rejected=572
+shard 'arch/x86/kernel/tsc_msr.c': admitted=1712 rejected=2238
+shard 'arch/x86/kernel/tsc_sync.c': admitted=1310 rejected=1702
+shard 'arch/x86/lib/atomic64_32.c': admitted=305 rejected=354
+shard 'arch/x86/lib/cmdline.c': admitted=215 rejected=179
+shard 'arch/x86/lib/cpu.c': admitted=1541 rejected=2135
+shard 'arch/x86/lib/delay.c': admitted=1186 rejected=1306
+shard 'arch/x86/lib/inat.c': admitted=135 rejected=53
+shard 'arch/x86/lib/insn.c': admitted=181 rejected=227
+shard 'arch/x86/lib/iomem.c': admitted=1455 rejected=2040
+shard 'arch/x86/lib/memcpy_32.c': admitted=29 rejected=50
+shard 'arch/x86/lib/misc.c': admitted=1 rejected=2
+shard 'arch/x86/lib/msr.c': admitted=1558 rejected=2167
+shard 'arch/x86/lib/msr-reg-export.c': admitted=475 rejected=574
+shard 'arch/x86/lib/pc-conf-reg.c': admitted=853 rejected=897
+shard 'arch/x86/lib/string_32.c': admitted=31 rejected=76
+shard 'arch/x86/lib/strstr_32.c': admitted=29 rejected=46
+shard 'drivers/base/container.c': admitted=1482 rejected=2146
+shard 'drivers/base/firmware_loader/builtin/main.c': admitted=1167 rejected=1516
+shard 'drivers/base/firmware.c': admitted=1482 rejected=2144
+shard 'drivers/base/transport_class.c': admitted=1479 rejected=2188
+shard 'drivers/clocksource/i8253.c': admitted=1629 rejected=2131
+shard 'drivers/tty/vt/consolemap_deftbl.c': admitted=10 rejected=3
+shard 'drivers/tty/vt/defkeymap.c': admitted=790 rejected=818
+shard 'fs/sysctls.c': admitted=846 rejected=876
+shard 'init/calibrate.c': admitted=1118 rejected=1209
+shard 'init/version.c': admitted=1141 rejected=1220
+shard 'init/version-timestamp.c': admitted=1117 rejected=1215
+shard 'kernel/printk/sysctl.c': admitted=1135 rejected=1229
+shard 'kernel/range.c': admitted=42 rejected=54
+shard 'kernel/rcu/sync.c': admitted=1108 rejected=1219
+shard 'kernel/static_call.c': admitted=1546 rejected=2140
+shard 'kernel/sys_ni.c': admitted=310 rejected=82
+shard 'kernel/time/clockevents.c': admitted=1751 rejected=2355
+shard 'kernel/time/jiffies.c': admitted=1701 rejected=2146
+shard 'kernel/time/timeconv.c': admitted=1433 rejected=1964
+shard 'kernel/time/timecounter.c': admitted=31 rejected=24
+shard 'kernel/time/vsyscall.c': admitted=1590 rejected=2095
+shard 'kernel/up.c': admitted=1197 rejected=1303
+shard 'kernel/utsname_sysctl.c': admitted=1128 rejected=1243
+shard 'lib/base64.c': admitted=147 rejected=162
+shard 'lib/bcd.c': admitted=30 rejected=15
+shard 'lib/bitrev.c': admitted=1440 rejected=1964
+shard 'lib/clz_ctz.c': admitted=148 rejected=133
+shard 'lib/cmdline.c': admitted=149 rejected=181
+shard 'lib/crc32.c': admitted=1451 rejected=1974
+shard 'lib/crypto/blake2s-generic.c': admitted=163 rejected=188
+shard 'lib/crypto/blake2s.c': admitted=1437 rejected=1974
+shard 'lib/crypto/blake2s-selftest.c': admitted=740 rejected=765
+shard 'lib/crypto/chacha.c': admitted=165 rejected=187
+shard 'lib/ctype.c': admitted=34 rejected=14
+shard 'lib/debug_locks.c': admitted=781 rejected=836
+shard 'lib/dec_and_lock.c': admitted=763 rejected=809
+shard 'lib/decompress.c': admitted=36 rejected=52
+shard 'lib/earlycpio.c': admitted=148 rejected=160
+shard 'lib/errseq.c': admitted=363 rejected=443
+shard 'lib/find_bit.c': admitted=130 rejected=218
+shard 'lib/flex_proportions.c': admitted=1157 rejected=1513
+shard 'lib/hexdump.c': admitted=161 rejected=169
+shard 'lib/iomap_copy.c': admitted=850 rejected=909
+shard 'lib/irq_regs.c': admitted=724 rejected=756
+shard 'lib/klist.c': admitted=1117 rejected=1258
+shard 'lib/list_sort.c': admitted=157 rejected=204
+shard 'lib/llist.c': admitted=399 rejected=453
+shard 'lib/lockref.c': admitted=762 rejected=832
+shard 'lib/math/div64.c': admitted=122 rejected=136
+shard 'lib/math/gcd.c': admitted=145 rejected=130
+shard 'lib/math/int_log.c': admitted=146 rejected=132
+shard 'lib/math/int_pow.c': admitted=115 rejected=125
+shard 'lib/math/int_sqrt.c': admitted=116 rejected=126
+shard 'lib/math/lcm.c': admitted=29 rejected=16
+shard 'lib/math/reciprocal_div.c': admitted=122 rejected=128
+shard 'lib/memweight.c': admitted=118 rejected=192
+shard 'lib/plist.c': admitted=62 rejected=78
+shard 'lib/ratelimit.c': admitted=1109 rejected=1207
+shard 'lib/rbtree.c': admitted=797 rejected=847
+shard 'lib/rcuref.c': admitted=791 rejected=788
+shard 'lib/refcount.c': admitted=780 rejected=839
+shard 'lib/siphash.c': admitted=169 rejected=176
+shard 'lib/sort.c': admitted=29 rejected=28
+shard 'lib/timerqueue.c': admitted=855 rejected=812
+shard 'lib/uuid.c': admitted=748 rejected=785
+shard 'lib/win_minmax.c': admitted=1439 rejected=1964
+tag 'other': 58971
+tag 'pointer-local-nonaddress': 1225
+tag 'ptr-to-ptr': 1166
+tag 'rejected-type-cascade': 31895
+tag 'returned-pointer': 5437
+tag 'self-ref-pointer-member': 2917
+tag 'strchr-result-bind': 1
+tag 'unsupported-expr:BinaryConditionalOperator': 2
+tag 'unsupported-expr:OffsetOfExpr': 68
+tag 'unsupported-stmt:AttributedStmt': 4
+tag 'unsupported-stmt:GCCAsmStmt': 8120
+tag 'unsupported-top-level-decl': 277
+tag 'variadic-cross-tu': 488
