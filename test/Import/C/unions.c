@@ -41,7 +41,7 @@ int write_read(void) {
 
 // ALIAS-DAG: emitrust.struct_def @[[U:([A-Za-z0-9_]+_)?Both]] ["a"] [i32]
 // ALIAS-LABEL: func.func @write_read
-// ALIAS: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"[[U]]">>
+// ALIAS: emitrust.variable named "v" : !emitrust.lvalue<!emitrust.struct<"[[U]]">>
 // ALIAS: emitrust.member %{{.*}}["a"] : (!emitrust.lvalue<!emitrust.struct<"[[U]]">>) -> !emitrust.lvalue<i32>
 // ALIAS-NOT: ["b"]
 
@@ -155,7 +155,7 @@ int untagged(void) {
 }
 
 // UNTAGGED-LABEL: func.func @untagged
-// UNTAGGED: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"[[U:[A-Za-z_][A-Za-z0-9_]*]]">>
+// UNTAGGED: emitrust.variable named "u" : !emitrust.lvalue<!emitrust.struct<"[[U:[A-Za-z_][A-Za-z0-9_]*]]">>
 // UNTAGGED: emitrust.member %{{.*}}["a"] : (!emitrust.lvalue<!emitrust.struct<"[[U]]">>) -> !emitrust.lvalue<i32>
 // UNTAGGED-NOT: ["b"]
 

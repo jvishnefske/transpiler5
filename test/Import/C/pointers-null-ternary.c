@@ -73,7 +73,7 @@ int ternary_real_base(int i) {
 }
 // CHECK-LABEL: func.func @ternary_real_base
 // CHECK: %[[FLAG:.*]] = memref.alloca() : memref<i1>
-// CHECK: %[[X:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[X:.*]] = emitrust.variable named "x" : !emitrust.lvalue<i32>
 // CHECK: cf.cond_br
 // CHECK: %[[TRUE:.*]] = arith.constant true
 // CHECK: memref.store %[[TRUE]], %[[FLAG]][] : memref<i1>

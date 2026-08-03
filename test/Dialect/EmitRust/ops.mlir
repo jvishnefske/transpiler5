@@ -226,6 +226,14 @@ emitrust.func @variables() {
   %0 = emitrust.variable <42 : i32> : !emitrust.lvalue<i32>
   // CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
   %1 = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+  // FR-61e: a decl-bound variable carries its final Rust base spelling and
+  // round-trips through the custom `named` syntax.
+  // CHECK: emitrust.variable named "count" <1 : i32> : !emitrust.lvalue<i32>
+  %2 = emitrust.variable named "count" <1 : i32> : !emitrust.lvalue<i32>
+  // CHECK: emitrust.variable named "buf" : !emitrust.lvalue<!emitrust.array<4xi32>>
+  %3 = emitrust.variable named "buf" : !emitrust.lvalue<!emitrust.array<4xi32>>
+  // CHECK: emitrust.variable named "lit" const <7 : i32> : !emitrust.lvalue<i32>
+  %4 = emitrust.variable named "lit" const <7 : i32> : !emitrust.lvalue<i32>
   emitrust.return
 }
 

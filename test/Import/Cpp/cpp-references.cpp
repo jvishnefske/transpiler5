@@ -190,8 +190,8 @@ int drive(void) {
 // then uniquely at two different calls -- each borrow is single-use and
 // dies at its call, which is what makes the sequence legal Rust.
 // CHECK-LABEL: func.func @drive
-// CHECK: %[[N:.*]] = emitrust.variable : !emitrust.lvalue<i32>
-// CHECK: %[[PT:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Point">>
+// CHECK: %[[N:.*]] = emitrust.variable named "n" : !emitrust.lvalue<i32>
+// CHECK: %[[PT:.*]] = emitrust.variable named "pt" : !emitrust.lvalue<!emitrust.struct<"Point">>
 
 // `const int&` argument: SHARED borrow.
 // CHECK: %[[BN:.*]] = emitrust.addr_of %[[N]] : (!emitrust.lvalue<i32>) -> !emitrust.ref<i32>

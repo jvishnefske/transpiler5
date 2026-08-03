@@ -27,7 +27,7 @@ unsigned load_local(unsigned long long off) {
 }
 // CHECK-LABEL: func.func @load_local
 // CHECK-SAME: (%{{[^ :,)]+}}: ui64) -> ui32
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<8xi8>>
+// CHECK: emitrust.variable named "buf" : !emitrust.lvalue<!emitrust.array<8xi8>>
 
 // A u32 store through the wide view.
 int store_local(unsigned long long off, unsigned v) {
@@ -40,7 +40,7 @@ int store_local(unsigned long long off, unsigned v) {
 }
 // CHECK-LABEL: func.func @store_local
 // CHECK-SAME: (%{{[^ :,)]+}}: ui64, %{{[^ :,)]+}}: ui32) -> i32
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<8xi8>>
+// CHECK: emitrust.variable named "buf" : !emitrust.lvalue<!emitrust.array<8xi8>>
 
 // A compound assignment through the wide view is a read-modify-write
 // over the same 4-byte window.
@@ -89,7 +89,7 @@ void pun_print(unsigned long long off, unsigned k) {
   printf("%s\n", t2);
 }
 // CHECK-LABEL: func.func @pun_print
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<10xi8>>
+// CHECK: emitrust.variable named "t2" : !emitrust.lvalue<!emitrust.array<10xi8>>
 // CHECK: emitrust.slice_of %{{.*}} : (!emitrust.lvalue<!emitrust.array<10xi8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>
 
 int main(void) {

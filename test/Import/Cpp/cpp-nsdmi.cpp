@@ -18,7 +18,7 @@ int use() {
 }
 
 // CHECK: emitrust.struct_def @D ["x", "y"] [i32, i32]
-// CHECK:      %[[D:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"D">>
+// CHECK:      %[[D:.*]] = emitrust.variable named "d" : !emitrust.lvalue<!emitrust.struct<"D">>
 // CHECK-NEXT: %[[MX:.*]] = emitrust.member %[[D]]["x"]
 // CHECK-NEXT: %[[C5:.*]] = arith.constant 5 : i32
 // CHECK-NEXT: emitrust.assign %[[MX]] = %[[C5]] : !emitrust.lvalue<i32>

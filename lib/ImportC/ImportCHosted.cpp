@@ -48,7 +48,11 @@ LogicalResult CImporter::emitFileLocal(const clang::VarDecl *var,
   // initializer it renders as `__EmitrustFile::Null` (C's NULL), so the
   // enum definition is needed as soon as a handle local exists.
   requestFileHelper("__EmitrustFile");
-  Value place = createVariablePlace(loc, fileHandleType());
+  // FR-61e: the FILE* handle local carries the local's final spelling.
+  Value place = createVariablePlace(
+      loc, fileHandleType(),
+      var->getName().empty() ? std::string()
+                             : mangleMemberName(var->getName()));
   fileLocals[var] = place;
   if (const clang::Expr *init = var->getInit())
     return emitFileOpenInto(place, init);

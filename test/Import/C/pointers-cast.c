@@ -17,7 +17,7 @@ int cast_peel(void) {
 }
 // CHECK-LABEL: func.func @cast_peel
 //   `(int *)arr` binds the array base; p[0] subscripts it at the cursor.
-// CHECK: %[[ARR:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<2xi32>>
+// CHECK: %[[ARR:.*]] = emitrust.variable named "arr" : !emitrust.lvalue<!emitrust.array<2xi32>>
 // CHECK: emitrust.subscript %[[ARR]][{{.*}}] : (!emitrust.lvalue<!emitrust.array<2xi32>>, i64) -> !emitrust.lvalue<i32>
 //   `(int *)(p + 1)` joins q into the same region with cursor arithmetic.
 // CHECK: arith.addi
@@ -30,6 +30,6 @@ int qual_peel(void) {
   return *cp;
 }
 // CHECK-LABEL: func.func @qual_peel
-// CHECK: %[[X:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[X:.*]] = emitrust.variable named "x" : !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[X]]
 // CHECK: emitrust.load %[[X]]

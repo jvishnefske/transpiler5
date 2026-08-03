@@ -26,7 +26,7 @@ int deref_deref_scalar(void) {
 }
 // CHECK-LABEL: func.func @deref_deref_scalar
 // CHECK-NOT: memref.alloca
-// CHECK: %[[X:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[X:.*]] = emitrust.variable named "x" : !emitrust.lvalue<i32>
 // CHECK-NOT: emitrust.addr_of
 // CHECK: emitrust.assign %[[X]] = %{{.*}} : !emitrust.lvalue<i32>
 // CHECK: %[[A:.*]] = emitrust.load %[[X]] : (!emitrust.lvalue<i32>) -> i32
@@ -51,7 +51,7 @@ int cursor_repoint(void) {
 }
 // CHECK-LABEL: func.func @cursor_repoint
 // CHECK: %[[PCELL:.*]] = memref.alloca() : memref<i64>
-// CHECK: %[[ARR:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+// CHECK: %[[ARR:.*]] = emitrust.variable named "arr" : !emitrust.lvalue<!emitrust.array<4xi32>>
 // CHECK: memref.store %{{.*}}, %[[PCELL]][] : memref<i64>
 // CHECK: %[[CUR1:.*]] = memref.load %[[PCELL]][] : memref<i64>
 // CHECK: %[[E1:.*]] = emitrust.subscript %[[ARR]][%[[CUR1]]] : (!emitrust.lvalue<!emitrust.array<4xi32>>, i64) -> !emitrust.lvalue<i32>

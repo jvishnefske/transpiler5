@@ -15,7 +15,7 @@ struct S {
 // An initializer copy (`struct S s = (struct S){...}`) initializes the
 // variable directly through the literal's list — no temp, no copy.
 // CHECK-LABEL: func.func @init_copy
-// CHECK: %[[S:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"S">>
+// CHECK: %[[S:.*]] = emitrust.variable named "s" : !emitrust.lvalue<!emitrust.struct<"S">>
 // CHECK: %[[A:.*]] = emitrust.member %[[S]]["a"]
 // CHECK: emitrust.assign %[[A]]
 // CHECK: %[[B:.*]] = emitrust.member %[[S]]["b"]
@@ -30,7 +30,7 @@ int init_copy(void) {
 // self-referencing literal (`s = (struct S){s.b, s.a}`) reads the old
 // values before the store — the lost-copy-safe swap shape.
 // CHECK-LABEL: func.func @assign_swap
-// CHECK: %[[DST:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"S">>
+// CHECK: %[[DST:.*]] = emitrust.variable named "s" : !emitrust.lvalue<!emitrust.struct<"S">>
 // CHECK: %[[TMP:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"S">>
 // CHECK: emitrust.member %[[TMP]]["a"]
 // CHECK: emitrust.member %[[TMP]]["b"]
@@ -120,7 +120,7 @@ int char_literal(void) {
 // A nested struct literal as an aggregate initializer element initializes
 // the element place directly through its own list.
 // CHECK-LABEL: func.func @nested_element
-// CHECK: %[[NT:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"T">>
+// CHECK: %[[NT:.*]] = emitrust.variable named "t" : !emitrust.lvalue<!emitrust.struct<"T">>
 // CHECK: %[[IN:.*]] = emitrust.member %[[NT]]["inner"]
 // CHECK: emitrust.member %[[IN]]["a"]
 struct T {

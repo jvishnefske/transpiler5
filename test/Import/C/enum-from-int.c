@@ -33,7 +33,7 @@ int roundtrip(int raw) {
 // CHECK-LABEL: func.func @roundtrip
 
 // The declaration takes a variable place of the enum type.
-// CHECK: %[[F:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Fred">>
+// CHECK: %[[F:.*]] = emitrust.variable named "f" : !emitrust.lvalue<!emitrust.enum<"Fred">>
 
 // `f = raw`: an arbitrary int converts through a value-preserving cast.
 // CHECK: %[[RAW:.*]] = emitrust.cast %{{[0-9]+}} : i32 to !emitrust.enum<"Fred">

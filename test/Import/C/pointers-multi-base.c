@@ -30,8 +30,8 @@ int rebind_arrays(void) {
   return first + p[0];
 }
 // CHECK-LABEL: func.func @rebind_arrays
-// CHECK: %[[A:[0-9]+]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
-// CHECK: %[[B:[0-9]+]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+// CHECK: %[[A:[0-9]+]] = emitrust.variable named "a" : !emitrust.lvalue<!emitrust.array<4xi32>>
+// CHECK: %[[B:[0-9]+]] = emitrust.variable named "b" : !emitrust.lvalue<!emitrust.array<4xi32>>
 // `p = a` stores discriminant 0 and cursor 0.
 // CHECK: memref.store %{{.*}}, %[[DISC:alloca[_0-9]*]][] : memref<i32>
 // CHECK-NEXT: memref.store %{{.*}}, %[[CUR:alloca[_0-9]*]][] : memref<i64>
@@ -74,8 +74,8 @@ int scalar_rebind(void) {
   return *d + same + now;
 }
 // CHECK-LABEL: func.func @scalar_rebind
-// CHECK: %[[X:[0-9]+]] = emitrust.variable : !emitrust.lvalue<i32>
-// CHECK: %[[Y:[0-9]+]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[X:[0-9]+]] = emitrust.variable named "x" : !emitrust.lvalue<i32>
+// CHECK: %[[Y:[0-9]+]] = emitrust.variable named "y" : !emitrust.lvalue<i32>
 // `d = &x` stores index 0; `e = &y` stores index 1 in e's own cell.
 // CHECK: memref.store %c0_i32{{[_0-9]*}}, %[[DD:alloca[_0-9]*]][] : memref<i32>
 // CHECK: memref.store %c1_i32{{[_0-9]*}}, %[[ED:alloca[_0-9]*]][] : memref<i32>

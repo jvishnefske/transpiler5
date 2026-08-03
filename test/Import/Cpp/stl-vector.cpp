@@ -53,7 +53,7 @@ int use_vector(void) {
 // The default-constructed place: an `emitrust.variable` of
 // `!emitrust.opaque<"Vec<i32>">`, immediately assigned `Vec::new()`'s
 // result (never left to the VariableOp's own dead-code default value).
-// CHECK: %[[V:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.opaque<"Vec<i32>">>
+// CHECK: %[[V:.*]] = emitrust.variable named "v" : !emitrust.lvalue<!emitrust.opaque<"Vec<i32>">>
 // CHECK: %[[NEW:.*]] = emitrust.call_opaque "Vec::new"() : () -> !emitrust.opaque<"Vec<i32>">
 // CHECK: emitrust.assign %[[V]] = %[[NEW]] : !emitrust.lvalue<!emitrust.opaque<"Vec<i32>">>
 

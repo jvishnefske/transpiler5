@@ -130,7 +130,7 @@ int members(void) {
   return gs.b + ls.c[1] + guv.s.c[0] + guv.a;
 }
 // ACCESS-LABEL: func.func @members
-// ACCESS: %[[LS:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xui8>>
+// ACCESS: %[[LS:.*]] = emitrust.variable named "ls" : !emitrust.lvalue<!emitrust.array<4xui8>>
 // ls.c[1] (offset 3) written from ls.b (offset 1):
 // ACCESS-DAG: arith.constant 3 : i64
 // ACCESS-DAG: arith.constant 1 : i64
@@ -199,8 +199,8 @@ void foo(struct W *w) {
 // PARAMS-LABEL: func.func @foo
 // PARAMS-SAME: slice<ui8>
 // The member copies land in local byte regions of the member sizes.
-// PARAMS-DAG: emitrust.variable : !emitrust.lvalue<!emitrust.array<4xui8>>
-// PARAMS-DAG: emitrust.variable : !emitrust.lvalue<!emitrust.array<17xui8>>
+// PARAMS-DAG: emitrust.variable named "copy" : !emitrust.lvalue<!emitrust.array<4xui8>>
+// PARAMS-DAG: emitrust.variable named "lt" : !emitrust.lvalue<!emitrust.array<17xui8>>
 // sizeof(struct W) folds to the FAM-free 22.
 // PARAMS-DAG: arith.constant 22 : i64
 // PARAMS: call @walk
@@ -246,9 +246,9 @@ int test_zero_init(void) {
   return 0;
 }
 // TYPEDFAM-LABEL: func.func @test_zero_init
-// TYPEDFAM: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"SEB">>
-// TYPEDFAM: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"SEC">>
-// TYPEDFAM: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"SED">>
+// TYPEDFAM: emitrust.variable named "b" : !emitrust.lvalue<!emitrust.struct<"SEB">>
+// TYPEDFAM: emitrust.variable named "c" : !emitrust.lvalue<!emitrust.struct<"SEC">>
+// TYPEDFAM: emitrust.variable named "d" : !emitrust.lvalue<!emitrust.struct<"SED">>
 // TYPEDFAM: call @test_correct_filling
 // TYPEDFAM: call @test_correct_filling
 // TYPEDFAM: call @test_correct_filling

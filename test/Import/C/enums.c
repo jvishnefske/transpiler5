@@ -47,9 +47,9 @@ enum Color pick(enum Color a, enum Color b) {
 // places, never memref cells.
 // CHECK-LABEL: func.func @describe
 // CHECK-SAME: (%[[C:.*]]: !emitrust.enum<"Color">) -> i32
-// CHECK: %[[CV:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>
+// CHECK: %[[CV:.*]] = emitrust.variable named "c" : !emitrust.lvalue<!emitrust.enum<"Color">>
 // CHECK: emitrust.assign %[[CV]] = %[[C]] : !emitrust.lvalue<!emitrust.enum<"Color">>
-// CHECK: %[[MINE:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>
+// CHECK: %[[MINE:.*]] = emitrust.variable named "mine" : !emitrust.lvalue<!emitrust.enum<"Color">>
 // CHECK: emitrust.constant <#emitrust.opaque<"Color::Green">> : !emitrust.enum<"Color">
 // CHECK: emitrust.assign %[[MINE]]
 

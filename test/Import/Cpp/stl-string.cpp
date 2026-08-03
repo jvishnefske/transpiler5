@@ -51,13 +51,13 @@ int use_string(void) {
 
 // CHECK-LABEL: func.func @use_string
 // `std::string s = "hi";`: `String::from("hi")`.
-// CHECK: %[[S:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.opaque<"String">>
+// CHECK: %[[S:.*]] = emitrust.variable named "s" : !emitrust.lvalue<!emitrust.opaque<"String">>
 // CHECK: %[[LIT:.*]] = emitrust.literal "\22hi\22" : !emitrust.opaque<"&'static str">
 // CHECK: %[[FROM:.*]] = emitrust.call_opaque "String::from"(%[[LIT]]) : (!emitrust.opaque<"&'static str">) -> !emitrust.opaque<"String">
 // CHECK: emitrust.assign %[[S]] = %[[FROM]] : !emitrust.lvalue<!emitrust.opaque<"String">>
 
 // `std::string t;`: `String::new()`.
-// CHECK: %[[T:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.opaque<"String">>
+// CHECK: %[[T:.*]] = emitrust.variable named "t" : !emitrust.lvalue<!emitrust.opaque<"String">>
 // CHECK: %[[NEW:.*]] = emitrust.call_opaque "String::new"() : () -> !emitrust.opaque<"String">
 // CHECK: emitrust.assign %[[T]] = %[[NEW]] : !emitrust.lvalue<!emitrust.opaque<"String">>
 

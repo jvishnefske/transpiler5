@@ -190,11 +190,11 @@ int use_counters(void) {
 // CHECK-LABEL: func.func @use_counters
 // Parameterized-constructor call site: default-init place, then a
 // mutable borrow feeds the "new_i" method as an ordinary method_call.
-// CHECK: %[[C:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Counter">>
+// CHECK: %[[C:.*]] = emitrust.variable named "c" : !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[CREF0:.*]] = emitrust.addr_of mut %[[C]] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.mut_ref<!emitrust.struct<"Counter">>
 // CHECK: call @Counter_new_i(%[[CREF0]], %{{.*}}) {emitrust.method_call}
 // Default-constructor call site: same shape, no extra argument.
-// CHECK: %[[C2:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Counter">>
+// CHECK: %[[C2:.*]] = emitrust.variable named "c2" : !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[C2REF:.*]] = emitrust.addr_of mut %[[C2]] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.mut_ref<!emitrust.struct<"Counter">>
 // CHECK: call @Counter_new(%[[C2REF]]) {emitrust.method_call}
 // Two mutating-method call sites (`c.inc(3)`, `c.inc(1)`): each borrows
@@ -215,7 +215,7 @@ int use_counters(void) {
 // CHECK: emitrust.call_opaque "Counter::Counter_origin"() : () -> i32
 // `Other`'s call site: same shared-borrow shape as `Counter_get`, proving
 // the two `get`s never cross-resolve.
-// CHECK: %[[OTH:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Other">>
+// CHECK: %[[OTH:.*]] = emitrust.variable named "other" : !emitrust.lvalue<!emitrust.struct<"Other">>
 // CHECK: %[[OTHREF:.*]] = emitrust.addr_of %[[OTH]] : (!emitrust.lvalue<!emitrust.struct<"Other">>) -> !emitrust.ref<!emitrust.struct<"Other">>
 // CHECK: call @Other_get(%[[OTHREF]]) {emitrust.method_call}
 // Final `c2.get()`: reuses `Counter_get` (the same symbol as `c.get()`

@@ -611,3 +611,21 @@ emitrust.trait_def @Externals ["f"] [i32]
 // requirement declare more.
 // expected-error @+1 {{method "f" cannot have more than one result}}
 emitrust.trait_def @Externals ["f"] [(i32) -> (i32, i32)]
+
+// -----
+
+// FR-61e: a carried variable name must be a valid Rust identifier.
+emitrust.func @bad_variable_name() {
+  // expected-error @+1 {{variable name must be a non-empty Rust identifier}}
+  %0 = emitrust.variable named "1bad" : !emitrust.lvalue<i32>
+  emitrust.return
+}
+
+// -----
+
+// FR-61e: an empty carried name is rejected, never silently anonymous.
+emitrust.func @empty_variable_name() {
+  // expected-error @+1 {{variable name must be a non-empty Rust identifier}}
+  %0 = emitrust.variable named "" : !emitrust.lvalue<i32>
+  emitrust.return
+}

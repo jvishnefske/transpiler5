@@ -31,7 +31,7 @@ int use_empty(void) {
 // A by-value empty-struct parameter copies into a local place and returns.
 // CHECK-LABEL: func.func @pass_through
 // CHECK-SAME: (%[[N:.*]]: !emitrust.struct<"Nothing">) -> !emitrust.struct<"Nothing">
-// CHECK: %[[NV:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Nothing">>
+// CHECK: %[[NV:.*]] = emitrust.variable named "n" : !emitrust.lvalue<!emitrust.struct<"Nothing">>
 // CHECK: emitrust.assign %[[NV]] = %[[N]] : !emitrust.lvalue<!emitrust.struct<"Nothing">>
 // CHECK: emitrust.load
 // CHECK: return
@@ -39,10 +39,10 @@ int use_empty(void) {
 // Declaration, copy assignment, and a call all work on values of the
 // empty struct.
 // CHECK-LABEL: func.func @use_empty
-// CHECK: %[[A:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Nothing">>
-// CHECK: %[[B:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Nothing">>
+// CHECK: %[[A:.*]] = emitrust.variable named "a" : !emitrust.lvalue<!emitrust.struct<"Nothing">>
+// CHECK: %[[B:.*]] = emitrust.variable named "b" : !emitrust.lvalue<!emitrust.struct<"Nothing">>
 // CHECK: emitrust.load %[[A]]
 // CHECK: emitrust.assign %[[B]]
 // CHECK: call @pass_through
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Unit">>
+// CHECK: emitrust.variable named "u" : !emitrust.lvalue<!emitrust.struct<"Unit">>
 // CHECK: return

@@ -269,7 +269,11 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
       isStlOpaque;
   if (isAggregate || isPlaceOnly || isUnsignedInt(*mlirType) ||
       addressTaken.contains(var)) {
-    Value place = createVariablePlace(loc, *mlirType);
+    // FR-61e: a decl-bound place carries the local's final Rust spelling.
+    Value place = createVariablePlace(
+        loc, *mlirType,
+        var->getName().empty() ? std::string()
+                               : mangleMemberName(var->getName()));
     symbols[var] = place;
     if (const clang::Expr *init = significantInit(var)) {
       if (isStlOpaque) {
@@ -698,7 +702,11 @@ LogicalResult CImporter::emitFnHolderLocal(const clang::VarDecl *var,
       resolveFunctionPointerDecl(target, fnPtrType, loc);
   if (failed(name))
     return failure();
-  Value place = createVariablePlace(loc, fnPtrType);
+  // FR-61e: the fn-ptr local's place carries the local's final spelling.
+  Value place = createVariablePlace(
+      loc, fnPtrType,
+      var->getName().empty() ? std::string()
+                             : mangleMemberName(var->getName()));
   symbols[var] = place;
   auto some = emitrust::OpaqueAttr::get(
       builder.getContext(), (llvm::Twine("Some(") + *name + ")").str());
@@ -732,7 +740,11 @@ LogicalResult CImporter::emitOwnerLocal(const clang::VarDecl *var,
 
   auto ownerStructType =
       emitrust::StructType::get(builder.getContext(), plan.structName);
-  Value ownerPlace = createVariablePlace(loc, ownerStructType);
+  // FR-61e: the owner place is named after the C array variable it owns.
+  Value ownerPlace = createVariablePlace(
+      loc, ownerStructType,
+      var->getName().empty() ? std::string()
+                             : mangleMemberName(var->getName()));
   ownerStructPlaces[var] = ownerPlace;
   // Every direct access to the array — and every decomposed pointer whose
   // region base it is — routes through the data member place registered

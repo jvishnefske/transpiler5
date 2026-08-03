@@ -24,7 +24,7 @@ int roundtrip(void) {
 }
 // CHECK-LABEL: func.func @roundtrip
 // CHECK-NOT: emitrust.addr_of
-// CHECK: %[[X:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[X:.*]] = emitrust.variable named "x" : !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[X]]
 //   *(int *)p reads and writes x's place directly.
 // CHECK: %[[V:.*]] = emitrust.load %[[X]] : (!emitrust.lvalue<i32>) -> i32
@@ -49,7 +49,7 @@ int double_indirect(void) {
 }
 // CHECK-LABEL: func.func @double_indirect
 // CHECK-NOT: memref.alloca
-// CHECK: %[[X2:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[X2:.*]] = emitrust.variable named "x" : !emitrust.lvalue<i32>
 // CHECK-NOT: emitrust.addr_of
 // CHECK: emitrust.assign %[[X2]]
 // CHECK: emitrust.assign %[[X2]]
@@ -74,7 +74,7 @@ int via_local(void) {
   return q[1];
 }
 // CHECK-LABEL: func.func @via_local
-// CHECK: %[[ARR:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<3xi32>>
+// CHECK: %[[ARR:.*]] = emitrust.variable named "arr" : !emitrust.lvalue<!emitrust.array<3xi32>>
 //   q = arr + 1 stores a cursor; the round-trip through v keeps it a
 //   plain i64 cell copy.
 // CHECK: memref.store %{{.*}}, %{{.*}}[] : memref<i64>
@@ -95,7 +95,7 @@ unsigned int unsigned_view(void) {
   return u;
 }
 // CHECK-LABEL: func.func @unsigned_view
-// CHECK: %[[X3:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[X3:.*]] = emitrust.variable named "x" : !emitrust.lvalue<i32>
 //   the unsigned read is x's load viewed through a bitcast
 // CHECK: %[[RAW:.*]] = emitrust.load %[[X3]] : (!emitrust.lvalue<i32>) -> i32
 // CHECK: emitrust.cast %[[RAW]] : i32 to ui32

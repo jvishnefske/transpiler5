@@ -471,6 +471,14 @@ private:
   /// Counter feeding the sequential v0, v1, ... naming scheme.
   unsigned valueCount = 0;
 
+  /// FR-61e: every binding name already emitted in the current function
+  /// (named locals AND generated vN), plus the reserved `self` and
+  /// `__emitrust_tl` spellings. A named local colliding with an earlier
+  /// binding uniquifies with `_1`, `_2`, ... (a shadowing re-`let` is
+  /// never emitted), and the vN auto-namer skips numbers whose spelling a
+  /// named local has claimed.
+  llvm::StringSet<> usedBindingNames;
+
   /// Ops that are unreachable in the current function (they follow a diverging
   /// op in their block, or are nested inside such an op). They are not
   /// emitted, and a use appearing in one does not count as a real read when
@@ -739,8 +747,32 @@ static bool isFnPtrNone(Value value) {
 
 std::string RustEmitter::assignName(Value value) {
   std::string &name = valueNames[value];
-  if (name.empty())
-    name = ((valueIsRead(value) ? "v" : "_v") + Twine(valueCount++)).str();
+  if (!name.empty())
+    return name;
+  bool read = valueIsRead(value);
+  // FR-61e: a variable carrying its C name (pre-mangled importer-side)
+  // binds under that spelling; the `_`-prefix rule for never-read bindings
+  // applies to it exactly as to generated names, and a collision with any
+  // earlier binding uniquifies (never shadows).
+  if (auto variable = value.getDefiningOp<emitrust::VariableOp>()) {
+    if (std::optional<StringRef> cName = variable.getCName()) {
+      std::string base = ((read ? "" : "_") + *cName).str();
+      std::string candidate = base;
+      for (unsigned i = 1; usedBindingNames.contains(candidate); ++i)
+        candidate = (base + "_" + Twine(i)).str();
+      usedBindingNames.insert(candidate);
+      name = candidate;
+      return name;
+    }
+  }
+  // Generated names skip forward past spellings a named local claimed, so
+  // a C local literally named `v3` can never collide with the counter.
+  std::string candidate;
+  do {
+    candidate = ((read ? "v" : "_v") + Twine(valueCount++)).str();
+  } while (usedBindingNames.contains(candidate));
+  usedBindingNames.insert(candidate);
+  name = candidate;
   return name;
 }
 
@@ -2217,6 +2249,10 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // Each function opens a fresh value-naming scope: v0, v1, ...
   valueNames.clear();
   valueCount = 0;
+  usedBindingNames.clear();
+  // Reserved spellings never claimed by assignName's direct-map paths.
+  usedBindingNames.insert("self");
+  usedBindingNames.insert("__emitrust_tl");
   unreachableOps.clear();
   valueReadCache.clear();
   deferredInits.clear();

@@ -20,7 +20,7 @@ int call_plain(void) {
   return ((int (*)(void))fp)();
 }
 // CHECK-LABEL: func.func @call_plain
-// CHECK: %[[FP:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<() -> i32>>
+// CHECK: %[[FP:.*]] = emitrust.variable named "fp" : !emitrust.lvalue<!emitrust.fn_ptr<() -> i32>>
 // CHECK: %[[T:.*]] = emitrust.constant <#emitrust.opaque<"Some(forty_two)">> : !emitrust.fn_ptr<() -> i32>
 // CHECK: emitrust.assign %[[FP]] = %[[T]]
 // CHECK: %[[V:.*]] = emitrust.load %[[FP]]
@@ -38,7 +38,7 @@ int call_attr(void) {
   return a + b;
 }
 // CHECK-LABEL: func.func @call_attr
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<() -> i32>>
+// CHECK: emitrust.variable named "fp" : !emitrust.lvalue<!emitrust.fn_ptr<() -> i32>>
 // CHECK: emitrust.constant <#emitrust.opaque<"Some(forty_two)">> : !emitrust.fn_ptr<() -> i32>
 // CHECK: emitrust.call_indirect %{{.*}}() : (!emitrust.fn_ptr<() -> i32>) -> i32
 // CHECK: emitrust.call_indirect %{{.*}}() : (!emitrust.fn_ptr<() -> i32>) -> i32
@@ -51,7 +51,7 @@ int call_arg(int n) {
   return ((int (*)(int))fp)(n);
 }
 // CHECK-LABEL: func.func @call_arg
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
+// CHECK: emitrust.variable named "fp" : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
 // CHECK: emitrust.constant <#emitrust.opaque<"Some(add_three)">> : !emitrust.fn_ptr<(i32) -> i32>
 // CHECK: emitrust.call_indirect %{{.*}}(%{{.*}}) : (!emitrust.fn_ptr<(i32) -> i32>, i32) -> i32
 // CHECK-NOT: emitrust.cast

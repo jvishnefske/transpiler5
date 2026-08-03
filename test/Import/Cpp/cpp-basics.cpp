@@ -130,10 +130,10 @@ int use_pair(void) {
 // default constructor (W2.0's `significantInit` strips that vacuous
 // `CXXConstructExpr` before it can be mistaken for a real initializer).
 // CHECK-LABEL: func.func @use_point
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Point">>
+// CHECK: emitrust.variable named "p" : !emitrust.lvalue<!emitrust.struct<"Point">>
 // CHECK: emitrust.member %{{.*}}["x"]
 // CHECK: emitrust.member %{{.*}}["y"]
 
 // CHECK-LABEL: func.func @use_pair
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Pair">>
+// CHECK: emitrust.variable named "p" : !emitrust.lvalue<!emitrust.struct<"Pair">>
 // CHECK: emitrust.member %{{.*}}["a"]

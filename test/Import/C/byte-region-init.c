@@ -31,8 +31,8 @@ int elements(void) {
   return lu1.b + lu2.b + lu22.b + lu21.b;
 }
 // CHECK-LABEL: func.func @elements
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<4xui8>>
-// CHECK-DAG: emitrust.variable : !emitrust.lvalue<!emitrust.array<23xui8>>
+// CHECK: emitrust.variable named "ls" : !emitrust.lvalue<!emitrust.array<4xui8>>
+// CHECK-DAG: emitrust.variable named "lu1" : !emitrust.lvalue<!emitrust.array<23xui8>>
 // "huhu" bytes and the trailing 43 land inside the U regions.
 // CHECK-DAG: 104 : ui8
 // CHECK-DAG: 117 : ui8
@@ -52,10 +52,10 @@ int copies(void) {
   return y.a + z.b + w.c[0];
 }
 // CHECK-LABEL: func.func @copies
-// CHECK: %[[X:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xui8>>
-// CHECK-DAG: %[[Y:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xui8>>
-// CHECK-DAG: %[[Z:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xui8>>
-// CHECK-DAG: %[[W:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xui8>>
+// CHECK: %[[X:.*]] = emitrust.variable named "x" : !emitrust.lvalue<!emitrust.array<4xui8>>
+// CHECK-DAG: %[[Y:.*]] = emitrust.variable named "y" : !emitrust.lvalue<!emitrust.array<4xui8>>
+// CHECK-DAG: %[[Z:.*]] = emitrust.variable named "z" : !emitrust.lvalue<!emitrust.array<4xui8>>
+// CHECK-DAG: %[[W:.*]] = emitrust.variable named "w" : !emitrust.lvalue<!emitrust.array<4xui8>>
 
 // String-literal members, compound literals in initializer position,
 // superfluous braces, a hole (lu4 leaves U.s.c[1] out), and useless
@@ -69,9 +69,9 @@ int literals(void) {
   return lt.a + cl.a + lu3.a + lu4.a + ls3.a;
 }
 // CHECK-LABEL: func.func @literals
-// CHECK-DAG: emitrust.variable : !emitrust.lvalue<!emitrust.array<17xui8>>
-// CHECK-DAG: emitrust.variable : !emitrust.lvalue<!emitrust.array<4xui8>>
-// CHECK-DAG: emitrust.variable : !emitrust.lvalue<!emitrust.array<23xui8>>
+// CHECK-DAG: emitrust.variable named "lt" : !emitrust.lvalue<!emitrust.array<17xui8>>
+// CHECK-DAG: emitrust.variable named "cl" : !emitrust.lvalue<!emitrust.array<4xui8>>
+// CHECK-DAG: emitrust.variable named "lu3" : !emitrust.lvalue<!emitrust.array<23xui8>>
 // "hello" and "bla" bytes appear as ui8 stores or folded images.
 // CHECK-DAG: 111 : ui8
 // CHECK-DAG: 98 : ui8
@@ -87,7 +87,7 @@ int ranges(void) {
   return lt2.a;
 }
 // CHECK-LABEL: func.func @ranges
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<17xui8>>
+// CHECK: emitrust.variable named "lt2" : !emitrust.lvalue<!emitrust.array<17xui8>>
 // CHECK-DAG: 9 : ui8
 // CHECK-DAG: emitrust.cast %{{.*}} : i32 to ui8
 

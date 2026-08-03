@@ -19,7 +19,7 @@ int concat(void) {
   return cat[3];
 }
 // CHECK-LABEL: func.func @concat
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<6xi8>>
+// CHECK: emitrust.variable named "cat" : !emitrust.lvalue<!emitrust.array<6xi8>>
 // CHECK: arith.constant 97 : i8
 // CHECK: arith.constant 98 : i8
 // CHECK: arith.constant 99 : i8
@@ -34,7 +34,7 @@ int ubytes(void) {
   return u[0];
 }
 // CHECK-LABEL: func.func @ubytes
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.array<4xui8>>
+// CHECK: emitrust.variable named "u" : !emitrust.lvalue<!emitrust.array<4xui8>>
 // CHECK: emitrust.constant <97 : ui8> : ui8
 // CHECK: emitrust.constant <98 : ui8> : ui8
 // CHECK: emitrust.constant <0 : ui8> : ui8

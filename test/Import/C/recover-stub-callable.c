@@ -48,7 +48,7 @@ int main(void) { return caller(); }
 
 // The emitted Rust is a well-formed method call on a well-formed method.
 // RUST: fn caller() -> i32 {
-// RUST: v6.callee(
+// RUST: local.callee(
 // RUST: impl OwnerCallerLocal {
 // RUST-NEXT: fn callee(&mut self, _v0: i64, _v1: i32) {
 // RUST-NEXT: unimplemented!("unsupported: volatile-qualified type");

@@ -63,7 +63,7 @@ int roundtrip(void) {
 
 // USED-DAG: emitrust.struct_def @[[U:([A-Za-z0-9_]+_)?U16]] ["u"] [ui16]
 // USED-LABEL: func.func @roundtrip
-// USED: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"[[U]]">>
+// USED: emitrust.variable named "x" : !emitrust.lvalue<!emitrust.struct<"[[U]]">>
 // USED: emitrust.member %{{.*}}["u"] : (!emitrust.lvalue<!emitrust.struct<"[[U]]">>) -> !emitrust.lvalue<ui16>
 // USED-NOT: ["b"]
 

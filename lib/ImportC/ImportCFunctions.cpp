@@ -776,10 +776,15 @@ LogicalResult CImporter::bindOrdinaryParam(const clang::ParmVarDecl *param,
     // values must not become memref cells — a memref of a dialect type
     // is illegal — and unsigned cells must not either, because mem2reg
     // materializes its default value as an `arith.constant`, which
-    // requires a signless type).
+    // requires a signless type). FR-61e: the shadow carries the
+    // parameter's final spelling; an unnamed parameter stays anonymous.
     Value place = builder
                       .create<emitrust::VariableOp>(
-                          paramLoc, emitrust::LValueType::get(type))
+                          paramLoc, emitrust::LValueType::get(type),
+                          /*init=*/Attribute(), /*isConst=*/false,
+                          param->getName().empty()
+                              ? std::string()
+                              : mangleMemberName(param->getName()))
                       .getResult();
     builder.create<emitrust::AssignOp>(paramLoc, place, blockArg);
     symbols[param] = place;
@@ -1907,12 +1912,15 @@ Block *CImporter::getLabelBlock(const clang::LabelDecl *label) {
   return block;
 }
 
-Value CImporter::createVariablePlace(Location loc, Type type) {
+Value CImporter::createVariablePlace(Location loc, Type type,
+                                     llvm::StringRef rustName) {
   OpBuilder::InsertionGuard guard(builder);
   if (currentHasLabels)
     builder.setInsertionPointToStart(entryBlock);
   return builder
-      .create<emitrust::VariableOp>(loc, emitrust::LValueType::get(type))
+      .create<emitrust::VariableOp>(loc, emitrust::LValueType::get(type),
+                                    /*init=*/Attribute(), /*isConst=*/false,
+                                    rustName)
       .getResult();
 }
 

@@ -14,7 +14,7 @@ int main(void) {
   // terminating NUL element by element (C99 6.7.8p14); elements past the
   // literal keep the place's default zero value.
   char buf[4] = "ab";
-  // CHECK: %[[BUF:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi8>>
+  // CHECK: %[[BUF:.*]] = emitrust.variable named "buf" : !emitrust.lvalue<!emitrust.array<4xi8>>
   // CHECK: emitrust.subscript %[[BUF]][%{{.*}}] : (!emitrust.lvalue<!emitrust.array<4xi8>>, i64) -> !emitrust.lvalue<i8>
   // CHECK: arith.constant 97 : i8
   // CHECK: arith.constant 98 : i8

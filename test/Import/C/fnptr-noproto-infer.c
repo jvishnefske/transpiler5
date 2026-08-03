@@ -22,7 +22,7 @@ typedef int (*fptr1)();
 int f1(fptr1 fp, int i) { return (*fp)(i); }
 // CHECK-LABEL: func.func @f1
 // CHECK-SAME: (%{{.*}}: !emitrust.fn_ptr<(i32) -> i32>, %{{.*}}: i32) -> i32
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
+// CHECK: emitrust.variable named "fp" : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
 // CHECK: emitrust.call_indirect %{{.*}}(%{{.*}}) : (!emitrust.fn_ptr<(i32) -> i32>, i32) -> i32
 
 // A LOCAL no-proto pointer initialized with a real matching function
@@ -35,7 +35,7 @@ int local_infer(void) {
   return np(4);
 }
 // CHECK-LABEL: func.func @local_infer
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
+// CHECK: emitrust.variable named "np" : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
 // CHECK: emitrust.constant <#emitrust.opaque<"Some(add_three)">> : !emitrust.fn_ptr<(i32) -> i32>
 // CHECK: emitrust.call_indirect %{{.*}}(%{{.*}}) : (!emitrust.fn_ptr<(i32) -> i32>, i32) -> i32
 

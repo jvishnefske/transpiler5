@@ -17,8 +17,8 @@ int use(void) {
 }
 
 // CHECK: emitrust.struct_def @T ["a", "b"] [i32, i32]
-// CHECK:      %[[X:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"T">>
+// CHECK:      %[[X:.*]] = emitrust.variable named "x" : !emitrust.lvalue<!emitrust.struct<"T">>
 // The copy destination and the whole-struct load-then-store of the source.
-// CHECK:      %[[Y:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"T">>
+// CHECK:      %[[Y:.*]] = emitrust.variable named "y" : !emitrust.lvalue<!emitrust.struct<"T">>
 // CHECK-NEXT: %[[V:.*]] = emitrust.load %[[X]] : (!emitrust.lvalue<!emitrust.struct<"T">>) -> !emitrust.struct<"T">
 // CHECK-NEXT: emitrust.assign %[[Y]] = %[[V]] : !emitrust.lvalue<!emitrust.struct<"T">>
