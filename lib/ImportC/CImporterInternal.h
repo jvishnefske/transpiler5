@@ -989,6 +989,16 @@ public:
   /// `p`'s region; the callee's advancement is ordinary arithmetic.
   std::function<bool(const clang::FunctionDecl *, unsigned)> cursorArgQuery;
 
+  /// Optional query telling the walk whether argument `index` of a direct
+  /// call to `callee` feeds a planned Shape-P paired out-cursor parameter
+  /// (C99-43 slice 1b), returning the index of the paired co-argument in
+  /// the same call, or -1. When set, a `&e` argument in such a position
+  /// is consumed by the call lowering AND `e` joins the co-argument
+  /// expression's region — the callee returns `e` as a cursor into that
+  /// region, exactly as if `e = <co-arg>; e += n;` had executed. Left
+  /// unset, the `&e` argument invalidates `e` (address escape).
+  std::function<int(const clang::FunctionDecl *, unsigned)> pairedArgQuery;
+
   /// Returns whether `var` is a pointer local tracked by this analysis.
   bool tracks(const clang::VarDecl *var) const {
     return pointerVars.contains(var);
@@ -2535,6 +2545,14 @@ private:
   /// Emits the pending string-cursor writebacks (local cell -> deref'd
   /// in-out parameter place) ahead of a return.
   void emitCursorWritebacks(Location loc);
+
+  /// Emits the unique admitted `*param = rhs` write of a Shape-P paired
+  /// out-cursor parameter (C99-43 slice 1b): the RHS's cursor value —
+  /// in the mapped co-parameter's slice coordinates — assigns straight
+  /// through the deref'd `&mut i64` argument. No cell, no return-site
+  /// writeback: planning proved the write unique and unconditional.
+  LogicalResult emitPairedCursorWrite(const clang::ParmVarDecl *param,
+                                      const clang::Expr *rhs, Location loc);
 
   /// Emits a call to a callee with planned string-cursor parameters: a
   /// `&p` argument in a cursor position expands to (shared region slice,
@@ -4607,10 +4625,25 @@ private:
   /// single-file import. Nothing consumes it yet (built as staged substrate
   /// for the multi-TU gate relaxations); see `WholeProgramInfo`.
   WholeProgramInfo wholeProgram;
-  /// Planned string-cursor parameters (CTS 00204): the `const char **`
-  /// parameters of definitions whose bodies stay inside the bounded
-  /// read-and-advance shape. Keyed by the DEFINITION's parameter decls.
+  /// Planned Shape-S cursor parameters (CTS 00204, element-generalized
+  /// by C99-43 slice 1): the `T **` parameters of definitions whose
+  /// bodies stay inside the bounded read-and-advance shape. Keyed by the
+  /// DEFINITION's parameter decls.
   llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> cursorParams;
+  /// Planned Shape-P paired out-cursor parameters (C99-43 slice 1b, the
+  /// strtol/endp family): a `T **` parameter with NO reads of `*p` and
+  /// exactly one unconditional top-level write `*p = <expr>` whose RHS
+  /// roots in the mapped same-element slice-classified co-parameter.
+  /// Lowers to ONE `&mut i64` input; the write assigns straight through
+  /// the reference (no cell, no return-site writeback). Keyed by the
+  /// DEFINITION's parameter decls; disjoint from `cursorParams`.
+  llvm::DenseMap<const clang::ParmVarDecl *, const clang::ParmVarDecl *>
+      pairedCursorParams;
+  /// Per-function emission state for Shape-P parameters: the deref'd
+  /// `!emitrust.lvalue<i64>` place of each paired out-cursor argument,
+  /// assigned exactly once by the admitted write. Cleared with the other
+  /// per-function maps.
+  llvm::DenseMap<const clang::ParmVarDecl *, Value> pairedCursorPlaces;
   /// Cached pointer-return kinds (CTS-P2), keyed by the function's
   /// canonical declaration: the mapped `!emitrust.fn_ptr` result type of a
   /// function whose data-pointer return classifies as a returned function

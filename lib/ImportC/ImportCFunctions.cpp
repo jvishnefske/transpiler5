@@ -353,6 +353,14 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
             emitrust::MutRefType::get(builder.getIntegerType(64)));
         continue;
       }
+      // A planned Shape-P paired out-cursor parameter (C99-43 slice 1b)
+      // lowers to ONE `&mut i64` input: the callee never touches content
+      // through it, and the co-parameter's slice carries the region.
+      if (pairedCursorParams.contains(param)) {
+        inputTypes.push_back(
+            emitrust::MutRefType::get(builder.getIntegerType(64)));
+        continue;
+      }
       FailureOr<Type> paramType =
           mapParamType(param->getType(), translateLoc(param->getLocation()),
                        paramKinds[index]);
@@ -505,6 +513,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   switchCaseBlocks.clear();
   inferredFnPtrSigs = std::move(inferredSigs);
   cursorWritebacks.clear();
+  pairedCursorPlaces.clear();
   currentVaCloneActive = false;
   currentVaExtras.clear();
   currentVaCursorCell = Value();
@@ -571,6 +580,23 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       return false;
     return cursorParams.contains(definition->getParamDecl(index));
   };
+  // Shape-P paired out-cursor positions (C99-43 slice 1b): a `&e`
+  // argument there joins `e` into the co-argument's region.
+  pointerRegions.pairedArgQuery = [this](const clang::FunctionDecl *callee,
+                                         unsigned index) -> int {
+    const clang::FunctionDecl *definition = callee->getDefinition();
+    if (!definition || index >= definition->getNumParams())
+      return -1;
+    const clang::ParmVarDecl *coParam =
+        pairedCursorParams.lookup(definition->getParamDecl(index));
+    if (!coParam)
+      return -1;
+    for (unsigned coIndex = 0; coIndex < definition->getNumParams();
+         ++coIndex)
+      if (definition->getParamDecl(coIndex) == coParam)
+        return static_cast<int>(coIndex);
+    return -1;
+  };
   pointerRegions.analyze(astContext(), func->getBody());
 
   // Method prologue (Phase 4): the receiver dereferences once into the
@@ -609,7 +635,9 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // copied into a named shadow variable (bindOrdinaryParam's by-value
   // path -- the shadow already took the spelling, and two bindings must
   // never share one), for the method receiver (self is hard-wired), and
-  // for the synthesized cursor input of a string-cursor parameter.
+  // for the synthesized cursor input of a Shape-S cursor parameter (a
+  // Shape-P paired out-cursor's single input IS named after its C
+  // parameter, so the callee reads `*endp = ...`).
   SmallVector<Attribute> paramNameSlots(functionType.getNumInputs(),
                                         builder.getStringAttr(""));
   auto paramSlotName = [&](const clang::ParmVarDecl *param,
@@ -646,6 +674,26 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
             builder.getStringAttr(mangleMemberName(param->getName()));
       if (failed(bindCursorParam(param, baseArg, cursorArg, paramLoc)))
         return failure();
+      continue;
+    }
+    // A Shape-P paired out-cursor parameter (C99-43 slice 1b) owns ONE
+    // entry-block argument: the `&mut i64` out-cursor, deref'd once and
+    // assigned exactly once by the admitted write — no cell, no
+    // writeback. Its slot is named after the C parameter (mirroring the
+    // S base-slot naming) so the callee reads `*endp = ...`.
+    if (pairedCursorParams.contains(param)) {
+      Value cursorArg = entryBlock->getArgument(entryArgIndex++);
+      if (!param->getName().empty())
+        paramNameSlots[entryArgIndex - 1] =
+            builder.getStringAttr(mangleMemberName(param->getName()));
+      Value place = builder
+                        .create<emitrust::DerefOp>(
+                            paramLoc,
+                            emitrust::LValueType::get(
+                                builder.getIntegerType(64)),
+                            cursorArg)
+                        .getResult();
+      pairedCursorPlaces[param] = place;
       continue;
     }
     Value blockArg = entryBlock->getArgument(entryArgIndex++);
@@ -924,6 +972,11 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
           emitrust::MutRefType::get(builder.getIntegerType(64)));
       continue;
     }
+    if (pairedCursorParams.contains(param)) {
+      inputTypes.push_back(
+          emitrust::MutRefType::get(builder.getIntegerType(64)));
+      continue;
+    }
     FailureOr<Type> paramType =
         mapParamType(param->getType(), translateLoc(param->getLocation()),
                      paramKinds[index]);
@@ -972,6 +1025,7 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   labelBlocks.clear();
   switchCaseBlocks.clear();
   cursorWritebacks.clear();
+  pairedCursorPlaces.clear();
   currentVaCloneActive = true;
   currentVaExtras.clear();
   currentHasLabels = containsLabelStmt(func->getBody());
@@ -1020,6 +1074,22 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
       return false;
     return cursorParams.contains(definition->getParamDecl(index));
   };
+  // See the non-clone prologue above for the Shape-P join contract.
+  pointerRegions.pairedArgQuery = [this](const clang::FunctionDecl *callee,
+                                         unsigned index) -> int {
+    const clang::FunctionDecl *definition = callee->getDefinition();
+    if (!definition || index >= definition->getNumParams())
+      return -1;
+    const clang::ParmVarDecl *coParam =
+        pairedCursorParams.lookup(definition->getParamDecl(index));
+    if (!coParam)
+      return -1;
+    for (unsigned coIndex = 0; coIndex < definition->getNumParams();
+         ++coIndex)
+      if (definition->getParamDecl(coIndex) == coParam)
+        return static_cast<int>(coIndex);
+    return -1;
+  };
   pointerRegions.analyze(astContext(), func->getBody());
 
   // Named parameter binding, then the extras: the extra block arguments
@@ -1034,6 +1104,18 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
       entryArgIndex += 2;
       if (failed(bindCursorParam(param, baseArg, cursorArg, paramLoc)))
         return failure();
+      continue;
+    }
+    if (pairedCursorParams.contains(param)) {
+      Value cursorArg = entryBlock->getArgument(entryArgIndex++);
+      Value place = builder
+                        .create<emitrust::DerefOp>(
+                            paramLoc,
+                            emitrust::LValueType::get(
+                                builder.getIntegerType(64)),
+                            cursorArg)
+                        .getResult();
+      pairedCursorPlaces[param] = place;
       continue;
     }
     Value blockArg = entryBlock->getArgument(entryArgIndex++);

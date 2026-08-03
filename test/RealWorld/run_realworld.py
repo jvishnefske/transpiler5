@@ -288,6 +288,11 @@ _BLOCKER_SUBSTRINGS = [
     # "cursor parameter").
     ("escapes the cursor-parameter shape", "ptr-to-ptr-shape-escape"),
     ("write through a cursor parameter", "ptr-to-ptr-shape-escape"),
+    ("written with a null pointer", "ptr-to-ptr-null-write"),
+    ("written with a global address", "ptr-to-ptr-global-target"),
+    ("write sites disagree on the source region", "ptr-to-ptr-shape-escape"),
+    ("write must execute unconditionally", "ptr-to-ptr-shape-escape"),
+    ("does not root in a sibling slice parameter", "ptr-to-ptr-shape-escape"),
     ("pointer-to-pointer", "ptr-to-ptr"),
     ("returned pointer value", "returned-pointer"),
     ("pointer return type", "returned-pointer"),

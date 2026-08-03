@@ -1758,6 +1758,32 @@ LogicalResult CImporter::storePointerAssign(Location loc,
   return success();
 }
 
+LogicalResult CImporter::emitPairedCursorWrite(const clang::ParmVarDecl *param,
+                                               const clang::Expr *rhs,
+                                               Location loc) {
+  Value place = pairedCursorPlaces.lookup(param);
+  if (!place) // Defensive; the prologue binds every planned P parameter.
+    return emitError(loc)
+           << "unsupported: paired cursor parameter has no bound place";
+  FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
+  if (failed(value))
+    return failure();
+  // Planning proved the RHS roots in the mapped co-parameter; verify the
+  // decomposition agrees before writing (the co-parameter's slice is the
+  // coordinate system the caller's writeback adds its own cursor to).
+  const clang::ParmVarDecl *coParam = pairedCursorParams.lookup(param);
+  if (value->base != coParam || value->member || value->baseIndex ||
+      value->literalBacking)
+    return emitError(loc) // Defensive; planning admitted the root.
+           << "unsupported: cursor parameter write does not root in a "
+              "sibling slice parameter";
+  Value cursor = value->cursor
+                     ? value->cursor
+                     : createIntConstant(loc, builder.getIntegerType(64), 0);
+  builder.create<emitrust::AssignOp>(loc, place, cursor);
+  return success();
+}
+
 const clang::MemberExpr *
 CImporter::asPoolNextFieldRead(const clang::Expr *expr) const {
   const clang::Expr *e = stripTrivia(expr);
@@ -2578,7 +2604,17 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
                               << "' has no bound pointer variable";
       return storePointerAssign(loc, it->second, op->getRHS());
     }
-    // `*s = rhs` on a string-cursor parameter (CTS 00204): the
+    // `*endp = rhs` on a Shape-P paired out-cursor parameter (C99-43
+    // slice 1b): the unique unconditional write assigns the RHS's
+    // cursor value (in the co-parameter's slice coordinates) straight
+    // through the `&mut i64` argument — no cell, no return-site
+    // writeback. Checked ahead of the Shape-S branch below: a P
+    // parameter has no pointer-local binding.
+    if (const clang::ParmVarDecl *pairedParam =
+            asPointerPointerParamDeref(op->getLHS());
+        pairedParam && pairedCursorParams.contains(pairedParam))
+      return emitPairedCursorWrite(pairedParam, op->getRHS(), loc);
+    // `*s = rhs` on a Shape-S cursor parameter (CTS 00204): the
     // advancement writes the parameter's cursor cell; the return-site
     // writebacks make it visible to the caller.
     if (const clang::ParmVarDecl *cursorParam =

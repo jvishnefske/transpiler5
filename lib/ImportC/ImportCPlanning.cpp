@@ -1691,6 +1691,76 @@ CImporter::planCursorParams(const clang::TranslationUnitDecl *unit) {
   return success();
 }
 
+namespace {
+
+/// Collects every `*param = <expr>` assignment below `stmt` and reports
+/// whether any OTHER use of `*param` exists — a read of the current
+/// position, a `**param` content read, a `(*param)++` advancement — the
+/// uses that keep a parameter in the self-walking Shape S (C99-43
+/// slice 1). The RHS of each collected write is still scanned: a
+/// self-referring RHS (`*p = *p + 1`) counts as an other-use, which is
+/// exactly the Shape-S advancement.
+void scanCursorParamUses(const clang::Stmt *stmt,
+                         const clang::ParmVarDecl *param,
+                         SmallVectorImpl<const clang::BinaryOperator *> &writes,
+                         bool &hasOtherUses) {
+  if (!stmt)
+    return;
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt);
+      binary && binary->getOpcode() == clang::BO_Assign)
+    if (asPointerPointerParamDeref(binary->getLHS()) == param) {
+      writes.push_back(binary);
+      scanCursorParamUses(binary->getRHS(), param, writes, hasOtherUses);
+      return;
+    }
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt);
+      unary && unary->getOpcode() == clang::UO_Deref)
+    if (asPointerPointerParamDeref(unary) == param) {
+      hasOtherUses = true;
+      return;
+    }
+  for (const clang::Stmt *child : stmt->children())
+    scanCursorParamUses(child, param, writes, hasOtherUses);
+}
+
+/// Deep scan for statements that break the "write executes on every
+/// path" argument: goto/label anywhere (a jump could skip the write),
+/// and — when `includeReturns` — return statements (an early return
+/// before the write leaves `*p` untouched in C, which the caller-side
+/// unconditional writeback could not reproduce).
+bool containsJumpStmt(const clang::Stmt *stmt, bool includeReturns) {
+  if (!stmt)
+    return false;
+  if (llvm::isa<clang::GotoStmt, clang::IndirectGotoStmt, clang::LabelStmt>(
+          stmt))
+    return true;
+  if (includeReturns && llvm::isa<clang::ReturnStmt>(stmt))
+    return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (containsJumpStmt(child, includeReturns))
+      return true;
+  return false;
+}
+
+/// Deep scan for a reference to any non-local-storage variable: the
+/// Shape-P global-target rejection (Q2: multi-global state is the FR-62
+/// front) fires on a write RHS that mentions a global at all, covering
+/// both the plain `*p = g` form and check_cpu's `err ? flags : NULL`.
+bool mentionsGlobalVar(const clang::Stmt *stmt) {
+  if (!stmt)
+    return false;
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+        var && !var->hasLocalStorage())
+      return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (mentionsGlobalVar(child))
+      return true;
+  return false;
+}
+
+} // namespace
+
 LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
   // C main's `char **argv` has its own policy (dropped from the
   // imported signature; uses rejected) — never a string cursor.
@@ -1734,12 +1804,100 @@ LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
         return emitError(translateLoc(region->writeThroughLoc))
                << "unsupported: write through a cursor parameter";
   }
+  // C99-43 slice 1b: classify each eligible parameter Shape S
+  // (self-walking: any read under `*p`; the historical CTS-00204
+  // semantics, two-input lowering) or Shape P (paired out-cursor: no
+  // reads, exactly one unconditional top-level `*p = <expr>` write
+  // rooting in one same-element slice-classified co-parameter;
+  // one-input lowering). Everything outside both shapes is a located
+  // rejection whose wording drives the ledger-tag split.
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> sliceParams;
+  collectSliceParams(func->getBody(), sliceParams);
+  SmallVector<const clang::ParmVarDecl *, 2> selfWalking;
+  SmallVector<
+      std::pair<const clang::ParmVarDecl *, const clang::ParmVarDecl *>, 2>
+      paired;
+  for (const clang::ParmVarDecl *param : eligible) {
+    SmallVector<const clang::BinaryOperator *, 2> writes;
+    bool hasOtherUses = false;
+    scanCursorParamUses(func->getBody(), param, writes, hasOtherUses);
+    if (hasOtherUses || writes.empty()) {
+      // Shape S. (An unused eligible parameter is a degenerate S: the
+      // two-input lowering stands and the callee reads neither input.)
+      selfWalking.push_back(param);
+      continue;
+    }
+    // Shape P admission. Exactly one write site: two sites would each
+    // claim the single out-cursor and need a join proof slice 1 does
+    // not attempt.
+    if (writes.size() > 1)
+      return emitError(translateLoc(writes[1]->getOperatorLoc()))
+             << "unsupported: cursor parameter write sites disagree on "
+                "the source region";
+    const clang::BinaryOperator *write = writes.front();
+    Location writeLoc = translateLoc(write->getOperatorLoc());
+    // The caller-side writeback is unconditional, so the write must
+    // execute on every path. Syntactic proxy, deliberately not a
+    // dataflow proof: the write is a top-level statement of the body,
+    // no preceding top-level statement contains a return, and the body
+    // contains no goto/label at all (a jump could skip the write).
+    bool topLevel = false;
+    bool cleanPrefix = true;
+    if (const auto *body =
+            llvm::dyn_cast<clang::CompoundStmt>(func->getBody()))
+      for (const clang::Stmt *stmt : body->body()) {
+        if (stmt == write) {
+          topLevel = true;
+          break;
+        }
+        if (containsJumpStmt(stmt, /*includeReturns=*/true)) {
+          cleanPrefix = false;
+          break;
+        }
+      }
+    if (!topLevel || !cleanPrefix ||
+        containsJumpStmt(func->getBody(), /*includeReturns=*/false))
+      return emitError(writeLoc)
+             << "unsupported: cursor parameter write must execute "
+                "unconditionally before every return";
+    // RHS admission, most specific wording first: NULL needs a NULL
+    // flag threaded back (a second in-out cell — Q2's excluded new
+    // mechanism); a global target is the FR-62 front; anything not
+    // rooting in a sibling same-element slice parameter has no region
+    // for the out-cursor coordinate to be relative to.
+    const clang::Expr *rhs = write->getRHS();
+    if (isNullPointerConstantExpr(rhs))
+      return emitError(writeLoc)
+             << "unsupported: cursor parameter written with a null pointer";
+    if (mentionsGlobalVar(rhs))
+      return emitError(writeLoc)
+             << "unsupported: cursor parameter written with a global "
+                "address (multi-global state is the FR-62 front)";
+    const clang::VarDecl *root = resolveArgRoot(analysis, rhs);
+    const auto *coParam = llvm::dyn_cast_if_present<clang::ParmVarDecl>(root);
+    bool admissible = coParam && coParam != param &&
+                      !isDataPointerPointerType(coParam->getType()) &&
+                      sliceParams.contains(coParam) &&
+                      llvm::is_contained(func->parameters(), coParam);
+    if (admissible)
+      admissible = astContext().hasSameUnqualifiedType(
+          pointerPointerElementType(param->getType()),
+          coParam->getType().getCanonicalType()->getPointeeType());
+    if (!admissible)
+      return emitError(writeLoc)
+             << "unsupported: cursor parameter write does not root in a "
+                "sibling slice parameter";
+    paired.push_back({param, coParam});
+  }
   // The admissions are the LAST thing this function does, so a rejection
-  // above leaves `cursorParams` untouched: there is no partial plan to
-  // inherit, and the all-or-nothing rule ("either every eligible parameter
-  // of this definition is a cursor, or none is") holds under recovery too.
-  for (const clang::ParmVarDecl *param : eligible)
+  // above leaves `cursorParams` and `pairedCursorParams` untouched: there
+  // is no partial plan to inherit, and the all-or-nothing rule ("either
+  // every eligible parameter of this definition is planned, or none is")
+  // holds under recovery too.
+  for (const clang::ParmVarDecl *param : selfWalking)
     cursorParams.insert(param);
+  for (auto &[param, coParam] : paired)
+    pairedCursorParams[param] = coParam;
   return success();
 }
 
