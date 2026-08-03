@@ -84,7 +84,7 @@ int main(void) {
     arr[i] = i;
   }
   int x = 1;
-  // CHECK: %[[ARR:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<5xi32>>
+  // CHECK: %[[ARR:.*]] = emitrust.variable named "arr" : !emitrust.lvalue<!emitrust.array<5xi32>>
   // &x to a scalar-reference parameter keeps the historical addr_of path.
   // CHECK: %[[XREF:.*]] = emitrust.addr_of mut %{{.*}} : (!emitrust.lvalue<i32>) -> !emitrust.mut_ref<i32>
   // CHECK: call @set_first(%[[XREF]])

@@ -49,7 +49,7 @@ int use_point(void) {
 
 // Local, field writes, address-of argument, by-value argument.
 // CHECK-LABEL: func.func @use_point
-// CHECK: %[[PT:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Point">>
+// CHECK: %[[PT:.*]] = emitrust.variable named "pt" : !emitrust.lvalue<!emitrust.struct<"Point">>
 // CHECK: emitrust.member %[[PT]]["x"]
 // CHECK: emitrust.assign
 // CHECK: emitrust.addr_of mut %[[PT]]

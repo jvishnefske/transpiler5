@@ -22,7 +22,7 @@ int chain(void) {
 }
 // CHECK: emitrust.struct_def @S ["p", "x"] [i64, i32]
 // CHECK-LABEL: func.func @chain
-// CHECK: %[[s:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"S">>
+// CHECK: %[[s:.*]] = emitrust.variable named "s" : !emitrust.lvalue<!emitrust.struct<"S">>
 // CHECK: %[[X1:.*]] = emitrust.member %[[s]]["x"]
 // CHECK: emitrust.assign %[[X1]]
 //   s.p = &s emits nothing; the chained read is a member of s directly.
@@ -41,7 +41,7 @@ int deref_local(void) {
   return t;
 }
 // CHECK-LABEL: func.func @deref_local
-// CHECK: %[[T:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[T:.*]] = emitrust.variable named "t" : !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[T]]
 //   *q.ip reads and writes t's place directly.
 // CHECK: %[[V:.*]] = emitrust.load %[[T]]

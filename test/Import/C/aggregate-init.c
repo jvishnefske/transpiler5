@@ -48,7 +48,7 @@ int use_globals(void) {
 // zero-fill) and assigns each explicit element through a constant-index
 // subscript place; the hole at index 2 gets no assignment.
 // CHECK-LABEL: func.func @local_array
-// CHECK: %[[A:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+// CHECK: %[[A:.*]] = emitrust.variable named "a" : !emitrust.lvalue<!emitrust.array<4xi32>>
 // CHECK-DAG: %[[I0:.*]] = arith.constant 0 : i64
 // CHECK: %[[E0:.*]] = emitrust.subscript %[[A]][%[[I0]]] : (!emitrust.lvalue<!emitrust.array<4xi32>>, i64) -> !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[E0]] = %{{.*}} : !emitrust.lvalue<i32>
@@ -67,7 +67,7 @@ int local_array(int n) {
 // A block-scope struct list assigns the designated fields through member
 // places; the undesignated field keeps the default.
 // CHECK-LABEL: func.func @local_struct
-// CHECK: %[[S:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"P">>
+// CHECK: %[[S:.*]] = emitrust.variable named "p" : !emitrust.lvalue<!emitrust.struct<"P">>
 // CHECK: %[[FX:.*]] = emitrust.member %[[S]]["x"]
 // CHECK: emitrust.assign %[[FX]]
 // CHECK-NOT: emitrust.member %[[S]]["d"]
@@ -78,7 +78,7 @@ int local_struct(int n) {
 
 // Nested block-scope lists recurse: member place, then subscripts into it.
 // CHECK-LABEL: func.func @local_nested
-// CHECK: %[[W:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"WithArr">>
+// CHECK: %[[W:.*]] = emitrust.variable named "w" : !emitrust.lvalue<!emitrust.struct<"WithArr">>
 // CHECK: %[[TAG:.*]] = emitrust.member %[[W]]["tag"]
 // CHECK: emitrust.assign %[[TAG]]
 // CHECK: %[[VALS:.*]] = emitrust.member %[[W]]["vals"] : (!emitrust.lvalue<!emitrust.struct<"WithArr">>) -> !emitrust.lvalue<!emitrust.array<3xi32>>

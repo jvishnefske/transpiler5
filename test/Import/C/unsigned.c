@@ -14,7 +14,7 @@ unsigned int arithmetic(unsigned int a, unsigned int b) {
 
 // CHECK-LABEL: func.func @arithmetic
 // CHECK-SAME: (%{{.*}}: ui32, %{{.*}}: ui32) -> ui32
-// CHECK: emitrust.variable : !emitrust.lvalue<ui32>
+// CHECK: emitrust.variable named "a" : !emitrust.lvalue<ui32>
 // CHECK: emitrust.add %{{.*}}, %{{.*}} : ui32
 // CHECK: emitrust.sub %{{.*}}, %{{.*}} : ui32
 // CHECK: emitrust.constant <2 : ui32> : ui32

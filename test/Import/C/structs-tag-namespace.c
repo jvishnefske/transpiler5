@@ -57,7 +57,7 @@ int main(void) {
 
 // Every mention of the renamed types goes through the assigned name.
 // CHECK-LABEL: func.func @c_main
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Struct_a">>
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"b">>
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Struct_f">>
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Struct_tick_calls">>
+// CHECK: emitrust.variable named "sa" : !emitrust.lvalue<!emitrust.struct<"Struct_a">>
+// CHECK: emitrust.variable named "sb" : !emitrust.lvalue<!emitrust.struct<"b">>
+// CHECK: emitrust.variable named "sf" : !emitrust.lvalue<!emitrust.struct<"Struct_f">>
+// CHECK: emitrust.variable named "st" : !emitrust.lvalue<!emitrust.struct<"Struct_tick_calls">>

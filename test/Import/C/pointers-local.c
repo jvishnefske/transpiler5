@@ -22,7 +22,7 @@ int deref_scalar(void) {
 }
 // CHECK-LABEL: func.func @deref_scalar
 // CHECK-NOT: memref.alloca() : memref<i64>
-// CHECK: %[[X:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[X:.*]] = emitrust.variable named "x" : !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[X]] = %{{.*}} : !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[X]] = %{{.*}} : !emitrust.lvalue<i32>
 // CHECK: %[[A:.*]] = emitrust.load %[[X]] : (!emitrust.lvalue<i32>) -> i32
@@ -41,7 +41,7 @@ int take_third(void) {
 }
 // CHECK-LABEL: func.func @take_third
 // CHECK: %[[QCELL:.*]] = memref.alloca() : memref<i64>
-// CHECK: %[[ARR:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+// CHECK: %[[ARR:.*]] = emitrust.variable named "arr" : !emitrust.lvalue<!emitrust.array<4xi32>>
 // CHECK: memref.store %{{.*}}, %[[QCELL]][] : memref<i64>
 // CHECK: %[[CUR:.*]] = memref.load %[[QCELL]][] : memref<i64>
 // CHECK: %[[ELEM:.*]] = emitrust.subscript %[[ARR]][%[[CUR]]] : (!emitrust.lvalue<!emitrust.array<4xi32>>, i64) -> !emitrust.lvalue<i32>
@@ -64,7 +64,7 @@ int decay_walk(void) {
 }
 // CHECK-LABEL: func.func @decay_walk
 // CHECK: %[[Q:.*]] = memref.alloca() : memref<i64>
-// CHECK: %[[ARR:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+// CHECK: %[[ARR:.*]] = emitrust.variable named "arr" : !emitrust.lvalue<!emitrust.array<4xi32>>
 //   q = arr
 // CHECK: %[[ZERO:.*]] = arith.constant 0 : i64
 // CHECK: memref.store %[[ZERO]], %[[Q]][] : memref<i64>
@@ -154,12 +154,12 @@ int arrow(void) {
 }
 // CHECK-LABEL: func.func @arrow
 // CHECK: %[[W:.*]] = memref.alloca() : memref<i64>
-// CHECK: %[[SVAR:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"S">>
+// CHECK: %[[SVAR:.*]] = emitrust.variable named "s" : !emitrust.lvalue<!emitrust.struct<"S">>
 // CHECK: emitrust.member %[[SVAR]]["x"]
 // CHECK: emitrust.assign
 // CHECK: emitrust.member %[[SVAR]]["y"]
 // CHECK: emitrust.assign
-// CHECK: %[[T:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<3x!emitrust.struct<"S">>>
+// CHECK: %[[T:.*]] = emitrust.variable named "t" : !emitrust.lvalue<!emitrust.array<3x!emitrust.struct<"S">>>
 // CHECK: memref.store %{{.*}}, %[[W]][] : memref<i64>
 // CHECK: %[[WC:.*]] = memref.load %[[W]][] : memref<i64>
 // CHECK: %[[ELEM:.*]] = emitrust.subscript %[[T]][%[[WC]]] : (!emitrust.lvalue<!emitrust.array<3x!emitrust.struct<"S">>>, i64) -> !emitrust.lvalue<!emitrust.struct<"S">>

@@ -91,7 +91,7 @@ skip:
 // function with labels the emitrust.variable place is hoisted to the entry
 // block, before any branch.
 // CHECK-LABEL: func.func @skip_init
-// CHECK: emitrust.variable : !emitrust.lvalue<ui32>
+// CHECK: emitrust.variable named "u" : !emitrust.lvalue<ui32>
 // CHECK: cf.br
 // SCF-LABEL: func.func @skip_init
 

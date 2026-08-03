@@ -46,8 +46,8 @@ int consume(void) {
 // CHECK-DAG: emitrust.struct_def @outer ["x", "nest"] [i32, !emitrust.struct<"Anon1">]
 // CHECK-DAG: emitrust.global @g <[1 : i32, 2 : i32, 3 : i32]> : !emitrust.struct<"Anon0">
 // CHECK-LABEL: func.func @consume
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Anon0">>
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Anon2">>
+// CHECK: emitrust.variable named "local" : !emitrust.lvalue<!emitrust.struct<"Anon0">>
+// CHECK: emitrust.variable named "other" : !emitrust.lvalue<!emitrust.struct<"Anon2">>
 // CHECK: emitrust.struct_def @Anon2 ["only"] [i32]
 // Exactly three anonymous shapes exist; no fourth name is minted.
 // CHECK-NOT: @Anon3

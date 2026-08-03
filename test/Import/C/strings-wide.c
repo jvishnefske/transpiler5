@@ -17,7 +17,7 @@ wchar_t wg[] = L"h€";
 
 // The euro sign is one code unit (0x20AC) in the wide encoding.
 // CHECK-LABEL: func.func @c_main
-// CHECK: %[[W:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+// CHECK: %[[W:.*]] = emitrust.variable named "s" : !emitrust.lvalue<!emitrust.array<4xi32>>
 // CHECK: emitrust.subscript %[[W]][%{{.*}}] : (!emitrust.lvalue<!emitrust.array<4xi32>>, i64) -> !emitrust.lvalue<i32>
 // CHECK: arith.constant 104 : i32
 // CHECK: arith.constant 8364 : i32

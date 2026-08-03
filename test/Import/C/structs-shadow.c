@@ -65,21 +65,21 @@ int shadow_unused(void) {
 // CHECK: emitrust.struct_def @T ["x"] [i32]
 
 // CHECK-LABEL: func.func @shadow_diff
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"T">>
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"shadow_diff_T">>
+// CHECK: emitrust.variable named "outer" : !emitrust.lvalue<!emitrust.struct<"T">>
+// CHECK: emitrust.variable named "inner" : !emitrust.lvalue<!emitrust.struct<"shadow_diff_T">>
 // CHECK: emitrust.member %{{.*}}["y"] : (!emitrust.lvalue<!emitrust.struct<"shadow_diff_T">>)
 // CHECK: emitrust.struct_def @shadow_diff_T ["y"] [i32]
 
 // CHECK-LABEL: func.func @shadow_same
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"shadow_same_T">>
+// CHECK: emitrust.variable named "local" : !emitrust.lvalue<!emitrust.struct<"shadow_same_T">>
 // CHECK: emitrust.struct_def @shadow_same_T ["x"] [i32]
 
 // CHECK-LABEL: func.func @shadow_twice
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"shadow_twice_T">>
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"shadow_twice_T_2">>
+// CHECK: emitrust.variable named "first" : !emitrust.lvalue<!emitrust.struct<"shadow_twice_T">>
+// CHECK: emitrust.variable named "second" : !emitrust.lvalue<!emitrust.struct<"shadow_twice_T_2">>
 // CHECK-DAG: emitrust.struct_def @shadow_twice_T ["a"] [i32]
 // CHECK-DAG: emitrust.struct_def @shadow_twice_T_2 ["b"] [i32]
 
 // CHECK-LABEL: func.func @shadow_unused
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.struct<"T">>
+// CHECK: emitrust.variable named "v" : !emitrust.lvalue<!emitrust.struct<"T">>
 // CHECK: emitrust.struct_def @shadow_unused_T ["z"] [i32]

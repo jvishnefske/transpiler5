@@ -67,7 +67,7 @@ int total(int *p, int n) {
 int main(void) {
   // The owner base declares the struct variable; direct accesses rewrite
   // to member("data") + subscript, and no whole-struct load ever appears.
-  // CHECK: %[[OWNER:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>
+  // CHECK: %[[OWNER:.*]] = emitrust.variable named "arr" : !emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>
   // CHECK: %[[MDATA:.*]] = emitrust.member %[[OWNER]]["data"] : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>) -> !emitrust.lvalue<!emitrust.array<8xi32>>
   int arr[8];
   // A decayed-array argument lowers to the constant cursor 0.

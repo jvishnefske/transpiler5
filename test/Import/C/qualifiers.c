@@ -80,7 +80,7 @@ int cast_qualifiers(void) {
   return *cp;
 }
 // CHECK-LABEL: func.func @cast_qualifiers
-// CHECK: %[[X:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[X:.*]] = emitrust.variable named "x" : !emitrust.lvalue<i32>
 // CHECK: %[[C9:.*]] = arith.constant 9 : i32
 // CHECK: emitrust.assign %[[X]] = %[[C9]] : !emitrust.lvalue<i32>
 // CHECK: %[[C11:.*]] = arith.constant 11 : i32
@@ -105,12 +105,12 @@ int main(void) {
   // already rejected any write through a const lvalue).
   const int local = 5;
   // CHECK-LABEL: func.func @c_main
-  // CHECK: %[[L:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+  // CHECK: %[[L:.*]] = emitrust.variable named "local" : !emitrust.lvalue<i32>
   // CHECK: emitrust.assign %[[L]] = %{{.*}} : !emitrust.lvalue<i32>
   // A const local array takes the same place + per-element-assign
   // lowering as a mutable one.
   const int arr[2] = {10, 20};
-  // CHECK: %[[ARR:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<2xi32>>
+  // CHECK: %[[ARR:.*]] = emitrust.variable named "arr" : !emitrust.lvalue<!emitrust.array<2xi32>>
   // CHECK: emitrust.subscript %[[ARR]][%{{.*}}]
   // A function-local `static const` is a mangled const module global.
   static const int cached = 40;

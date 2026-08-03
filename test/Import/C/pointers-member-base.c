@@ -26,7 +26,7 @@ int local_member(void) {
 }
 // CHECK-LABEL: func.func @local_member
 // CHECK-NOT: memref.alloca
-// CHECK: %[[S:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"P">>
+// CHECK: %[[S:.*]] = emitrust.variable named "s" : !emitrust.lvalue<!emitrust.struct<"P">>
 // CHECK: %[[MA:.*]] = emitrust.member %[[S]]["a"]
 // CHECK: emitrust.assign %[[MA]]
 //   *p = 41 writes s.b's place directly.
@@ -75,7 +75,7 @@ int mixed_base(void) {
   return r + gmix.b;
 }
 // CHECK-LABEL: func.func @mixed_base
-// CHECK: %[[A:.*]] = emitrust.variable : !emitrust.lvalue<i32>
+// CHECK: %[[A:.*]] = emitrust.variable named "a" : !emitrust.lvalue<i32>
 //   b = &a stores discriminant 0.
 // CHECK: memref.store %c0_i32{{[_0-9]*}}, %[[D:alloca[_0-9]*]][] : memref<i32>
 //   r = *b dispatches on the discriminant.

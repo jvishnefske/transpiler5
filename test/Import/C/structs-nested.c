@@ -32,8 +32,8 @@ int copy_whole(void) {
 }
 
 // CHECK-LABEL: func.func @copy_whole
-// CHECK: %[[S1:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Outer">>
-// CHECK: %[[S2:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Outer">>
+// CHECK: %[[S1:.*]] = emitrust.variable named "s1" : !emitrust.lvalue<!emitrust.struct<"Outer">>
+// CHECK: %[[S2:.*]] = emitrust.variable named "s2" : !emitrust.lvalue<!emitrust.struct<"Outer">>
 
 // Writing s2.inner.x is a two-hop member chain ending in an i32 place.
 // CHECK: %[[IN1:.*]] = emitrust.member %[[S2]]["inner"] : (!emitrust.lvalue<!emitrust.struct<"Outer">>) -> !emitrust.lvalue<!emitrust.struct<"Inner">>
@@ -75,7 +75,7 @@ void through_ptr(struct Outer *p, struct Outer s2) {
 // deref + member + member.
 // CHECK-LABEL: func.func @through_ptr
 // CHECK-SAME: (%[[P:.*]]: !emitrust.mut_ref<!emitrust.struct<"Outer">>, %[[ARG:.*]]: !emitrust.struct<"Outer">)
-// CHECK: %[[LOC:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Outer">>
+// CHECK: %[[LOC:.*]] = emitrust.variable named "s2" : !emitrust.lvalue<!emitrust.struct<"Outer">>
 // CHECK: emitrust.assign %[[LOC]] = %[[ARG]] : !emitrust.lvalue<!emitrust.struct<"Outer">>
 // CHECK: %[[PL:.*]] = emitrust.deref %[[P]] : (!emitrust.mut_ref<!emitrust.struct<"Outer">>) -> !emitrust.lvalue<!emitrust.struct<"Outer">>
 // CHECK: %[[V:.*]] = emitrust.load %[[LOC]] : (!emitrust.lvalue<!emitrust.struct<"Outer">>) -> !emitrust.struct<"Outer">
@@ -99,8 +99,8 @@ int drive(void) {
 // The caller passes &a as a mut_ref and b by value (a whole-aggregate
 // load), then reads both structs' nested members independently.
 // CHECK-LABEL: func.func @drive
-// CHECK: %[[A:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Outer">>
-// CHECK: %[[B:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Outer">>
+// CHECK: %[[A:.*]] = emitrust.variable named "a" : !emitrust.lvalue<!emitrust.struct<"Outer">>
+// CHECK: %[[B:.*]] = emitrust.variable named "b" : !emitrust.lvalue<!emitrust.struct<"Outer">>
 // CHECK: %[[BV:.*]] = emitrust.load %[[B]] : (!emitrust.lvalue<!emitrust.struct<"Outer">>) -> !emitrust.struct<"Outer">
 // CHECK: %[[AREF:.*]] = emitrust.addr_of mut %[[A]] : (!emitrust.lvalue<!emitrust.struct<"Outer">>) -> !emitrust.mut_ref<!emitrust.struct<"Outer">>
 // CHECK: call @through_ptr(%[[AREF]], %[[BV]])

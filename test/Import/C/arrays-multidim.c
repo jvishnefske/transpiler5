@@ -25,7 +25,7 @@ int sum2d(int i, int j) {
 // The local is one place of the nested array type; the initializer writes
 // element places level by level (unwritten elements keep the default zero).
 // CHECK-LABEL: func.func @sum2d
-// CHECK: %[[A:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<2x!emitrust.array<4xi32>>>
+// CHECK: %[[A:.*]] = emitrust.variable named "a" : !emitrust.lvalue<!emitrust.array<2x!emitrust.array<4xi32>>>
 // CHECK: %[[ROW0:.*]] = emitrust.subscript %[[A]][{{.*}}] : (!emitrust.lvalue<!emitrust.array<2x!emitrust.array<4xi32>>>, i64) -> !emitrust.lvalue<!emitrust.array<4xi32>>
 // CHECK: emitrust.subscript %[[ROW0]][{{.*}}] : (!emitrust.lvalue<!emitrust.array<4xi32>>, i64) -> !emitrust.lvalue<i32>
 // CHECK: emitrust.assign
@@ -49,7 +49,7 @@ int through_pointers(void) {
 // `p[1]` scales the index by the row span (4) and divides it back out to
 // reach the row place, then `[2]` subscripts the row directly.
 // CHECK-LABEL: func.func @through_pointers
-// CHECK: %[[ARR:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<2x!emitrust.array<4xi8>>>
+// CHECK: %[[ARR:.*]] = emitrust.variable named "arr" : !emitrust.lvalue<!emitrust.array<2x!emitrust.array<4xi8>>>
 // CHECK: arith.muli {{.*}} : i64
 // CHECK: arith.addi {{.*}} : i64
 // CHECK: %[[QDIV:.*]] = arith.divsi
@@ -76,7 +76,7 @@ int place_chain(int i, int j) {
 // Full place-chain access (C99-41): subscript levels compose with member
 // refinement on an array-of-arrays-of-structs.
 // CHECK-LABEL: func.func @place_chain
-// CHECK: %[[CELLS:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<2x!emitrust.array<3x!emitrust.struct<"Point">>>>
+// CHECK: %[[CELLS:.*]] = emitrust.variable named "cells" : !emitrust.lvalue<!emitrust.array<2x!emitrust.array<3x!emitrust.struct<"Point">>>>
 // CHECK: %[[CROW:.*]] = emitrust.subscript %[[CELLS]][{{.*}}] : (!emitrust.lvalue<!emitrust.array<2x!emitrust.array<3x!emitrust.struct<"Point">>>>, i32) -> !emitrust.lvalue<!emitrust.array<3x!emitrust.struct<"Point">>>
 // CHECK: %[[CELL:.*]] = emitrust.subscript %[[CROW]][{{.*}}] : (!emitrust.lvalue<!emitrust.array<3x!emitrust.struct<"Point">>>, i32) -> !emitrust.lvalue<!emitrust.struct<"Point">>
 // CHECK: emitrust.member %[[CELL]]["x"] : (!emitrust.lvalue<!emitrust.struct<"Point">>) -> !emitrust.lvalue<i32>

@@ -19,7 +19,7 @@ int local_fn_ptr(void) {
   return fp(5, 3);
 }
 // CHECK-LABEL: func.func @local_fn_ptr
-// CHECK: %[[FP:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<(i32, i32) -> i32>>
+// CHECK: %[[FP:.*]] = emitrust.variable named "fp" : !emitrust.lvalue<!emitrust.fn_ptr<(i32, i32) -> i32>>
 // CHECK: %[[ADDR:.*]] = emitrust.constant <#emitrust.opaque<"Some(add)">> : !emitrust.fn_ptr<(i32, i32) -> i32>
 // CHECK: emitrust.assign %[[FP]] = %[[ADDR]]
 // CHECK: %[[SUB:.*]] = emitrust.constant <#emitrust.opaque<"Some(sub)">> : !emitrust.fn_ptr<(i32, i32) -> i32>
@@ -39,7 +39,7 @@ int member_fn_ptr(void) {
   return v.op(10, 20);
 }
 // CHECK-LABEL: func.func @member_fn_ptr
-// CHECK: %[[V:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"S">>
+// CHECK: %[[V:.*]] = emitrust.variable named "v" : !emitrust.lvalue<!emitrust.struct<"S">>
 // CHECK: %[[M:.*]] = emitrust.member %[[V]]["op"]
 // CHECK: emitrust.assign %[[M]] = %{{.*}} : !emitrust.lvalue<!emitrust.fn_ptr<(i32, i32) -> i32>>
 // CHECK: %[[M2:.*]] = emitrust.member %[[V]]["op"]
@@ -92,7 +92,7 @@ int noproto_fn_ptr(void) {
   return np();
 }
 // CHECK-LABEL: func.func @noproto_fn_ptr
-// CHECK: emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<() -> i32>>
+// CHECK: emitrust.variable named "np" : !emitrust.lvalue<!emitrust.fn_ptr<() -> i32>>
 // CHECK: emitrust.constant <#emitrust.opaque<"Some(zero)">> : !emitrust.fn_ptr<() -> i32>
 // CHECK: emitrust.call_indirect %{{.*}}() : (!emitrust.fn_ptr<() -> i32>) -> i32
 

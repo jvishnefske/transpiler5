@@ -37,7 +37,7 @@ int use_point(void) {
 // A by-value struct parameter is copied into a local variable place.
 // CHECK-LABEL: func.func @manhattan
 // CHECK-SAME: (%[[Q:.*]]: !emitrust.struct<"Point">) -> i32
-// CHECK: %[[QV:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Point">>
+// CHECK: %[[QV:.*]] = emitrust.variable named "q" : !emitrust.lvalue<!emitrust.struct<"Point">>
 // CHECK: emitrust.assign %[[QV]] = %[[Q]] : !emitrust.lvalue<!emitrust.struct<"Point">>
 // CHECK: emitrust.member %[[QV]]["x"]
 // CHECK: emitrust.load
@@ -47,7 +47,7 @@ int use_point(void) {
 // Struct local, field writes, address-of for a pointer argument, and a
 // by-value load for a struct argument.
 // CHECK-LABEL: func.func @use_point
-// CHECK: %[[PT:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Point">>
+// CHECK: %[[PT:.*]] = emitrust.variable named "pt" : !emitrust.lvalue<!emitrust.struct<"Point">>
 // CHECK: emitrust.member %[[PT]]["x"]
 // CHECK: emitrust.assign
 // CHECK: emitrust.member %[[PT]]["y"]

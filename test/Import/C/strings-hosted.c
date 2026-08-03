@@ -18,7 +18,7 @@ int main(void) {
   // cursor 0, shared borrow of the literal's read-only backing.
   strcpy(a, "hello");
   // CHECK-LABEL: func.func @c_main
-  // CHECK: %[[A:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<10xi8>>
+  // CHECK: %[[A:.*]] = emitrust.variable named "a" : !emitrust.lvalue<!emitrust.array<10xi8>>
   // CHECK: %[[LIT:.*]] = emitrust.variable const <[104 : i8, 101 : i8, 108 : i8, 108 : i8, 111 : i8, 0 : i8]>
   // CHECK: %[[DST:.*]] = emitrust.slice_of mut %[[A]][%{{.*}}] : (!emitrust.lvalue<!emitrust.array<10xi8>>, i64) -> !emitrust.mut_ref<!emitrust.slice<i8>>
   // CHECK: %[[SRC:.*]] = emitrust.slice_of %[[LIT]][%{{.*}}] : (!emitrust.lvalue<!emitrust.array<6xi8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>

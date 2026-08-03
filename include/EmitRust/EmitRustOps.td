@@ -970,6 +970,13 @@ def EmitRust_VariableOp : EmitRust_Op<"variable"> {
     of a C string literal, for example). A variable without the marker is
     the ordinary mutable `let mut` binding.
 
+    A decl-bound variable may carry its FINAL Rust base spelling in the
+    `named` clause (FR-61e); the importer computes it (snake_cased under
+    the idiomatic rename, `_`-suffixed for Rust keywords), and the emitter
+    binds under that spelling -- `_`-prefixed when never read, uniquified
+    per function -- instead of the generated vN. Synthesized temporaries
+    carry no name.
+
     Example:
 
     ```mlir
@@ -977,35 +984,42 @@ def EmitRust_VariableOp : EmitRust_Op<"variable"> {
     %1 = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
     %2 = emitrust.variable const <[104 : i8, 0 : i8]>
         : !emitrust.lvalue<!emitrust.array<2xi8>>
+    %3 = emitrust.variable named "count" <1 : i32> : !emitrust.lvalue<i32>
     ```
     ```rust
     // Code emitted for the operations above.
     let mut v0: i32 = 42;
     let mut v1: [i32; 4] = [0; 4];
     let v2: [i8; 2] = [104, 0];
+    let mut count: i32 = 1;
     ```
   }];
 
   let arguments = (ins OptionalAttr<EmitRust_InitAttr>:$init,
-                       UnitAttr:$is_const);
+                       UnitAttr:$is_const,
+                       OptionalAttr<StrAttr>:$c_name);
   let results = (outs EmitRust_LValueType:$result);
 
   let builders = [
     OpBuilder<(ins "Type":$resultType, CArg<"Attribute", "{}">:$init,
-                   CArg<"bool", "false">:$isConst), [{
+                   CArg<"bool", "false">:$isConst,
+                   CArg<"llvm::StringRef", "{}">:$cName), [{
       if (init)
         $_state.addAttribute(getInitAttrName($_state.name), init);
       if (isConst)
         $_state.addAttribute(getIsConstAttrName($_state.name),
                              $_builder.getUnitAttr());
+      if (!cName.empty())
+        $_state.addAttribute(getCNameAttrName($_state.name),
+                             $_builder.getStringAttr(cName));
       $_state.addTypes(resultType);
     }]>
   ];
   let skipDefaultBuilders = 1;
 
   let assemblyFormat =
-      "(`const` $is_const^)? (` ` `<` $init^ `>`)? attr-dict `:` "
-      "qualified(type($result))";
+      "(`named` $c_name^)? (`const` $is_const^)? (` ` `<` $init^ `>`)? "
+      "attr-dict `:` qualified(type($result))";
   let hasVerifier = 1;
 }
 

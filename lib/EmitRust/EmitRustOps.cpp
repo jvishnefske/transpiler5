@@ -25,6 +25,7 @@
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -732,6 +733,22 @@ LogicalResult VariableOp::verify() {
     return emitOpError(
                "variable value type must be sized, but got the slice type ")
            << valueType;
+
+  // FR-61e: a carried name is the final Rust spelling and must already be a
+  // valid identifier -- the importer mangles keywords/casing before setting
+  // it, so anything else here is a producer bug, rejected loudly.
+  if (std::optional<llvm::StringRef> cName = getCName()) {
+    llvm::StringRef n = *cName;
+    auto isIdentStart = [](char c) {
+      return llvm::isAlpha(c) || c == '_';
+    };
+    auto isIdentChar = [&](char c) { return isIdentStart(c) || llvm::isDigit(c); };
+    if (n.empty() || !isIdentStart(n.front()) ||
+        !llvm::all_of(n.drop_front(), isIdentChar))
+      return emitOpError("variable name must be a non-empty Rust identifier, "
+                         "but got \"")
+             << n << "\"";
+  }
 
   Attribute init = getInitAttr();
   if (!init)

@@ -19,7 +19,7 @@ int main(void) {
 }
 
 // CHECK-LABEL: func.func @c_main() -> i32
-// CHECK: %[[BUF:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<32xi8>>
+// CHECK: %[[BUF:.*]] = emitrust.variable named "buf" : !emitrust.lvalue<!emitrust.array<32xi8>>
 
 // The format string translates like printf's (%02d -> {:02}, %d -> {})
 // into a String-producing format! call; the destination array is borrowed

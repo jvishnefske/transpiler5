@@ -77,8 +77,8 @@ unsigned int upick(int c, unsigned int a, unsigned int b) {
 // CHECK-LABEL: func.func @upick
 // The first two variables are the unsigned parameters' places; the third
 // is the conditional's result cell.
-// CHECK: emitrust.variable : !emitrust.lvalue<ui32>
-// CHECK: emitrust.variable : !emitrust.lvalue<ui32>
+// CHECK: emitrust.variable named "a" : !emitrust.lvalue<ui32>
+// CHECK: emitrust.variable named "b" : !emitrust.lvalue<ui32>
 // CHECK: %[[UCELL:.*]] = emitrust.variable : !emitrust.lvalue<ui32>
 // CHECK: cf.cond_br
 // CHECK: emitrust.assign %[[UCELL]] = %{{.*}} : !emitrust.lvalue<ui32>

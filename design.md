@@ -2014,6 +2014,25 @@ of references or inheritance, so it precedes both.
     mangleMemberName); the emitter prefers it over vN, `_`-prefixes unused
     names, and uniquifies per function (never shadows). Parameters carried
     via an `emitrust.param_names` func attr. SCOPE LIMIT (design-verified):
+    LANDED 61e slice 1 (2026-08-03): `emitrust.variable` carries
+    `named "<spelling>"` (attr `c_name`, explicit assembly clause, verifier
+    enforces identifier shape); the importer names the five decl-bound
+    sites (emitLocalVar place path, fn-ptr holder, owner place after its C
+    array, FILE* handle, by-value param shadow) through
+    createVariablePlace's new trailing rustName -- all other VariableOp
+    creations stay anonymous. Emitter binds under the carried spelling
+    with the `_`-prefix rule (drop-aware) and a per-function
+    usedBindingNames set: collisions uniquify `x`/`x_1`, the vN counter
+    skips claimed spellings (a C local named `v1` can never collide), and
+    `self`/`__emitrust_tl` are pre-seeded. Corpus: 237 of 388 variable ops
+    named (61%); 441 named bindings in the emitted crates; EndToEnd
+    123/123 byte-diff green (renames are behavior-inert; a collision bug
+    would be a loud rustc E0428/E0425), full suite 442/442, unsafe 0.
+    Golden churn: 53 Import goldens' variable lines gained `named "..."` +
+    recover-stub-callable's RUST line (`local.callee(...)`);
+    tests test/Dialect round-trip+invalid, test/Import/C/local-names.c,
+    test/Target/Rust/variable-names.mlir pin the three layers.
+    Parameters (61e-2) remain open.
     plain signed non-address-taken scalar locals are dissolved by mem2reg
     and re-materialize as SCF-lowering lets with no decl association --
     they keep vN this iteration; naming them needs work at SCF-lift time

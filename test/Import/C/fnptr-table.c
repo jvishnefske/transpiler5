@@ -69,8 +69,8 @@ void test_compound_with_relocs(void) {
   p();
 }
 // CHECK-LABEL: func.func @test_compound_with_relocs
-// CHECK-DAG: emitrust.variable : !emitrust.lvalue<!emitrust.array<2x!emitrust.struct<"Wrap">>>
-// CHECK-DAG: emitrust.variable : !emitrust.lvalue<!emitrust.fn_ptr<()>>
+// CHECK-DAG: emitrust.variable named "local_wrap" : !emitrust.lvalue<!emitrust.array<2x!emitrust.struct<"Wrap">>>
+// CHECK-DAG: emitrust.variable named "p" : !emitrust.lvalue<!emitrust.fn_ptr<()>>
 // Reading the void* member yields the fn_ptr value; no cast op is
 // needed for the assignment to p.
 // CHECK-DAG: emitrust.member %{{.*}}["func"] : {{.*}} -> !emitrust.lvalue<!emitrust.fn_ptr<()>>

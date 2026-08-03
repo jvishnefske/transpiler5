@@ -3099,8 +3099,12 @@ private:
   /// contains labels the op is hoisted to the start of the entry block so
   /// that a `goto` jumping over the declaration cannot leave a later use
   /// undominated by the definition; otherwise it is created at the current
-  /// insertion point.
-  Value createVariablePlace(Location loc, Type type);
+  /// insertion point. A non-empty `rustName` (FR-61e: the final Rust base
+  /// spelling, already through `mangleMemberName`) is carried on the op so
+  /// the emitter binds the declared local under its C name; synthesized
+  /// temporaries pass nothing.
+  Value createVariablePlace(Location loc, Type type,
+                            llvm::StringRef rustName = {});
 
   /// Returns true if `block` already ends with a terminator operation.
   static bool isTerminated(Block *block);

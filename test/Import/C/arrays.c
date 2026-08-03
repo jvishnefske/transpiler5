@@ -16,7 +16,7 @@ int sum_squares(void) {
 // promotable memref cells.
 // CHECK-LABEL: func.func @sum_squares
 // CHECK: memref.alloca() : memref<i32>
-// CHECK: %[[A:.*]] = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
+// CHECK: %[[A:.*]] = emitrust.variable named "a" : !emitrust.lvalue<!emitrust.array<4xi32>>
 // CHECK: arith.cmpi slt
 // CHECK: cf.cond_br
 
