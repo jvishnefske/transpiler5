@@ -1,5 +1,64 @@
 # EmitRust: An MLIR Dialect for Emitting Rust Source Code
 
+## Product
+
+The product is a C-to-Rust porting tool: `emitrust-cc` (and its drop-in
+compiler shim `emitrust-clang`) converts C programs and projects into
+safe, readable Rust crates whose observable behavior is byte-identical
+to the original. The user is the owner or future maintainer of a C
+codebase who wants it living in Rust — all at once for small programs,
+incrementally for large ones — without trusting anything but their own
+eyes and their own test oracle.
+
+Everything in this document below this section is an implementation
+detail of one of the following user-story epics. The epic is the unit of
+product intent; the numbered FRs are the units of verification that
+implement them; the design principles, dialect contract, and roadmaps
+are how, not why.
+
+- EPIC A — Faithful conversion. As the owner of a C program, I can
+  convert it to a Rust crate that produces byte-identical stdout and
+  exit status, so the port needs no leap of faith. Acceptance: the
+  EndToEnd differential suite, the c-testsuite conformance ledger, and
+  the three-way fuzz contract — byte-exact, never weakened.
+  Implemented by: FR-1..FR-25 (dialect, emitter, importer, driver,
+  differential oracle), the C99 support roadmap, the c-testsuite
+  checklist.
+- EPIC B — Honest limits. As a user, when something cannot be
+  converted I get a located diagnostic naming the construct and the
+  root-cause blocker — never silently wrong code — plus a ledger of
+  exactly what is and is not covered. Acceptance: pinned rejection
+  wordings, blocker-attribution tags, ledger/ratchet reports that may
+  only improve. Implemented by: FR-9, FR-19, FR-24, FR-49, the
+  rejection ledger and ratchet manifests.
+- EPIC C — My build, unchanged. As a project owner, I point the build
+  system I already have (make, compile_commands.json, a Linux kernel
+  build) at the shim compiler and get per-TU artifacts and a link-step
+  whole program, without restructuring anything. Implemented by:
+  FR-26, FR-27, FR-45, FR-56, FR-57, FR-58, FR-60.
+- EPIC D — Incremental porting. As the porter of a codebase too large
+  to convert in one shot, I get the largest provably-working subset as
+  a crate today, a frontier report of what blocks the rest, and a
+  guarantee the ported share only ever grows. Implemented by:
+  FR-40..FR-44, FR-50, FR-51, FR-52, the kernel-corpus ratchet.
+- EPIC E — Rust a person would write. As the future maintainer, the
+  output is zero-unsafe, warning-clean, idiomatic Rust — slices and
+  indices instead of pointers, enums instead of tag ints, owner
+  structs, expression-oriented style — so the port is a starting
+  point, not a museum piece. Implemented by: FR-28..FR-39, FR-53
+  warning-clean codegen, FR-61 rustacean-style emission.
+- EPIC F — Modern architecture. As the future maintainer, clustered
+  global state becomes actor-owned state behind explicit messages
+  (default-on where certified, threaded/async as opt-in modes, a
+  pluggable partitioner for actor responsibility), so the port is
+  concurrency-ready — while observable behavior never changes.
+  Implemented by: FR-30 owner structs, FR-59 workspace partitioning,
+  FR-62 and its slice list.
+
+Every epic's ultimate acceptance criterion is EPIC A's oracle: no
+feature, style, or architecture change is accepted on any evidence
+weaker than byte-identical behavior.
+
 ## Purpose
 
 EmitRust is an out-of-tree MLIR dialect modeled on the upstream EmitC dialect.
@@ -137,9 +196,12 @@ imported printf calls become Rust print macro invocations.
 
 ## MVP Functional Requirements
 
-Check a box only when the referenced regression test passes under
-ninja check-emitrust in the pinned dev shell. Traceability: each requirement
-lists the lit test file(s) that validate it.
+Every FR below is an implementation detail of one of the product epics
+(see "Product" above); the epic carries the product intent, the FR
+carries the verification. Check a box only when the referenced
+regression test passes under ninja check-emitrust in the pinned dev
+shell. Traceability: each requirement lists the lit test file(s) that
+validate it.
 
 - [x] FR-1 Dialect registration and round-trip: emitrust-opt parses and
   re-prints every MVP op with no loss. (test/Dialect/EmitRust/ops.mlir)
