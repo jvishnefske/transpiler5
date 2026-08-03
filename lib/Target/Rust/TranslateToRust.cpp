@@ -60,6 +60,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -316,6 +317,16 @@ private:
   /// Emits `impl <name> { ... }` with the contained functions rendered as
   /// `&mut self` methods one indentation level deeper.
   LogicalResult emitImpl(emitrust::ImplOp implOp);
+  /// FR-62 slice 5b: emits the per-actor runtime an `emitrust.actor_runtime`
+  /// anchor stands for, derived entirely from the referenced struct's impl —
+  /// the `<Actor>Msg` enum (variant = UpperCamel(method), payload fields =
+  /// the method's named parameters plus the per-call typed reply channel),
+  /// the `<Actor>Handle` alias of `actor_rt::Handle<Msg>`, the `spawn`
+  /// associated function holding the mailbox loop, and one wrapper per
+  /// method on the Handle's inherent impl. The shared `mod actor_rt` text
+  /// is appended once by `emitModule`. mode=async fails loudly: the async
+  /// flavor is a recorded later slice.
+  LogicalResult emitActorRuntime(emitrust::ActorRuntimeOp op);
   /// Emits `<place>.<method>(args);`, bound with a `let` when the call
   /// produces a result. Rust's auto-ref scopes the `&mut` borrow of the
   /// receiver place to the call expression.
@@ -897,9 +908,22 @@ bool RustEmitter::methodCallMutatesReceiver(emitrust::MethodCallOp call) {
   Type valueType = isa<emitrust::LValueType>(receiverType)
                        ? cast<emitrust::LValueType>(receiverType).getValueType()
                        : receiverType;
-  // A recognized STL container: classify by the (closed) method-name set.
-  if (isa<emitrust::OpaqueType>(valueType))
+  // An opaque receiver is either a recognized STL container or an actor
+  // HANDLE ("<Actor>Handle", the FR-62 slice-5b type decision: no new
+  // handle type crosses the surface). Resolve through the module's
+  // actor_runtime anchors FIRST: every handle wrapper takes `&mut self`
+  // (each call sends through the mailbox) and `shutdown` consumes the
+  // handle, while the closed STL name list would classify the read-style
+  // wrapper names (`get_*`) as non-mutating and render the handle binding
+  // without `mut` — a hard E0596 in the emitted crate (found by the spike).
+  if (auto opaqueType = dyn_cast<emitrust::OpaqueType>(valueType)) {
+    if (auto module = call->getParentOfType<ModuleOp>())
+      for (auto runtime : module.getOps<emitrust::ActorRuntimeOp>())
+        if (opaqueType.getValue() == (runtime.getActor() + "Handle").str())
+          return true;
+    // A recognized STL container: classify by the (closed) method-name set.
     return isMutatingStlMethod(call.getMethod());
+  }
   // A user struct method: the receiver is mutable exactly when the method's
   // `self` parameter is a `&mut` reference.
   auto structType = dyn_cast<emitrust::StructType>(valueType);
@@ -2270,6 +2294,52 @@ LogicalResult RustEmitter::emitRegionBody(Operation *parent, Region &region) {
 // Per-operation emitters
 //===----------------------------------------------------------------------===//
 
+/// FR-62 slice 5b: the shared actor runtime, generic over the message type.
+/// Fixed text measured by the SLICE-5b SPIKE (37 non-blank lines) and proven
+/// by its byte-diff and panic probes: `call` keeps every message synchronous
+/// (send + blocking recv), and the reap/shutdown pair preserves single-panic
+/// provenance (join + resume_unwind re-raises the actor's own payload in the
+/// caller, exit 101, no hang).
+static constexpr char kActorRtModule[] =
+    R"(mod actor_rt {
+    pub struct Handle<M> {
+        pub tx: std::sync::mpsc::Sender<M>,
+        pub join: Option<std::thread::JoinHandle<()>>,
+    }
+    impl<M> Handle<M> {
+        /// Actor is unreachable: join it and re-raise its panic payload here.
+        pub fn reap(&mut self) -> ! {
+            let join = self.join.take().expect("actor already reaped");
+            match join.join() {
+                Err(payload) => std::panic::resume_unwind(payload),
+                Ok(()) => panic!("actor exited without replying"),
+            }
+        }
+        /// send + blocking recv; disconnection on either side reaps the actor.
+        pub fn call<T>(&mut self, msg: M, rrx: std::sync::mpsc::Receiver<T>) -> T {
+            if self.tx.send(msg).is_err() {
+                self.reap();
+            }
+            match rrx.recv() {
+                Ok(v) => v,
+                Err(_) => self.reap(),
+            }
+        }
+        /// Graceful shutdown: drop the sender to end the mailbox loop, join,
+        /// and propagate a late actor panic with the original payload.
+        pub fn shutdown(self) {
+            let Handle { tx, join } = self;
+            drop(tx);
+            if let Some(join) = join {
+                if let Err(payload) = join.join() {
+                    std::panic::resume_unwind(payload);
+                }
+            }
+        }
+    }
+}
+)";
+
 LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   // FR-57a: a module carrying an `emitrust.extern_decl`-marked declaration
   // is one translation unit's SHARD, not a program — the marked symbol's
@@ -2293,15 +2363,25 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
            << "': the module must be linked against the defining translation "
               "unit before Rust emission";
   }
+  bool anyActorRuntime = false;
   for (Operation &op : *moduleOp.getBody()) {
     if (!isa<emitrust::UseOp, emitrust::VerbatimOp, emitrust::FuncOp,
              emitrust::ImplOp, emitrust::StructDefOp, emitrust::EnumDefOp,
              emitrust::DataEnumDefOp, emitrust::GlobalOp,
-             emitrust::TraitDefOp>(&op))
+             emitrust::TraitDefOp, emitrust::ActorRuntimeOp>(&op))
       return op.emitOpError("unable to translate op");
+    anyActorRuntime |= isa<emitrust::ActorRuntimeOp>(&op);
     if (failed(emitOperation(op)))
       return failure();
   }
+  // FR-62 slice 5b: the shared actor runtime — Handle<M>, the synchronous
+  // call protocol, and the reap/shutdown panic-provenance plumbing — is one
+  // fixed, message-type-generic module, emitted once per crate when any
+  // actor_runtime anchor exists (the same once-per-module epilogue posture
+  // as the importer's __emitrust_fmt_f64 helper, but emitter-owned: the
+  // anchor op is the trigger, no verbatim op carries the text).
+  if (anyActorRuntime)
+    os << kActorRtModule;
   return success();
 }
 
@@ -2313,6 +2393,163 @@ LogicalResult RustEmitter::emitImpl(emitrust::ImplOp implOp) {
       return failure();
   }
   decreaseIndent();
+  os << "}\n";
+  return success();
+}
+
+/// UpperCamelCases a snake_case method name for its message-variant
+/// spelling: `bump` -> `Bump`, `fill_table` -> `FillTable`.
+static std::string upperCamel(llvm::StringRef snake) {
+  std::string out;
+  bool upper = true;
+  for (char ch : snake) {
+    if (ch == '_') {
+      upper = true;
+      continue;
+    }
+    out += upper ? llvm::toUpper(ch) : ch;
+    upper = false;
+  }
+  return out;
+}
+
+/// The carried parameter name of `fn`'s input `index` (the
+/// `emitrust.param_names` slot), or empty when unnamed. The
+/// actor_runtime verifier requires a name for every non-receiver input of
+/// a runtime actor's method.
+static llvm::StringRef carriedParamName(emitrust::FuncOp fn, unsigned index) {
+  auto paramNames =
+      fn->getAttrOfType<ArrayAttr>(emitrust::kParamNamesAttrName);
+  if (paramNames && index < paramNames.size())
+    if (auto slot = dyn_cast<StringAttr>(paramNames[index]))
+      return slot.getValue();
+  return llvm::StringRef();
+}
+
+LogicalResult RustEmitter::emitActorRuntime(emitrust::ActorRuntimeOp op) {
+  // The async flavor is a SEPARATELY EMITTED CRATE FLAVOR (E4) landing in a
+  // later slice; reaching emission with it must fail loudly, never emit the
+  // threaded runtime under the wrong name.
+  if (op.getMode() == emitrust::ActorMode::async)
+    return op.emitError("async actor runtime is not yet emitted "
+                        "(--actor-mode=async is a recorded later slice)");
+  auto module = op->getParentOfType<ModuleOp>();
+  llvm::StringRef actor = op.getActor();
+  emitrust::ImplOp impl;
+  for (emitrust::ImplOp candidate : module.getOps<emitrust::ImplOp>())
+    if (candidate.getStructName() == actor) {
+      impl = candidate;
+      break;
+    }
+  if (!impl) // The verifier guarantees this; keep the failure located.
+    return op.emitError("actor '") << actor << "' has no impl to derive from";
+  std::string msgName = (actor + "Msg").str();
+  std::string handleName = (actor + "Handle").str();
+
+  auto methods = impl.getBody().front().getOps<emitrust::FuncOp>();
+  // Emits the reply payload type: the method's result type, or `()`.
+  auto emitReplyType = [&](emitrust::FuncOp fn) -> LogicalResult {
+    if (fn.getNumResults() == 0) {
+      os << "()";
+      return success();
+    }
+    return emitType(fn.getLoc(), fn.getResultTypes().front());
+  };
+  // Emits "name: Type, " for each non-receiver parameter.
+  auto emitParamFields = [&](emitrust::FuncOp fn) -> LogicalResult {
+    FunctionType type = fn.getFunctionType();
+    for (unsigned i = 1; i < type.getNumInputs(); ++i) {
+      llvm::StringRef name = carriedParamName(fn, i);
+      if (name.empty())
+        return fn.emitError("actor method parameter #")
+               << i << " has no name to derive its message field from";
+      os << name << ": ";
+      if (failed(emitType(fn.getLoc(), type.getInput(i))))
+        return failure();
+      os << ", ";
+    }
+    return success();
+  };
+  // Emits "name, " for each non-receiver parameter (pattern bindings and
+  // shorthand struct-literal fields alike).
+  auto emitParamNames = [&](emitrust::FuncOp fn) {
+    FunctionType type = fn.getFunctionType();
+    for (unsigned i = 1; i < type.getNumInputs(); ++i)
+      os << carriedParamName(fn, i) << ", ";
+  };
+
+  // 1. The message enum: one variant per impl method, the per-call typed
+  //    reply channel as the trailing field (`Sender<()>` keeps a void call
+  //    synchronous and C-sequenced under the same rule, E3).
+  os << "enum " << msgName << " {\n";
+  for (emitrust::FuncOp fn : methods) {
+    os << "    " << upperCamel(fn.getSymName()) << " { ";
+    if (failed(emitParamFields(fn)))
+      return failure();
+    os << "reply: std::sync::mpsc::Sender<";
+    if (failed(emitReplyType(fn)))
+      return failure();
+    os << "> },\n";
+  }
+  os << "}\n";
+
+  // 2. The handle alias.
+  os << "type " << handleName << " = actor_rt::Handle<" << msgName << ">;\n";
+
+  // 3. The inherent impl: spawn (channel + moved state + mailbox loop, one
+  //    arm per variant delegating to the existing method and replying), then
+  //    one wrapper per method (fresh reply channel + self.call).
+  os << "impl actor_rt::Handle<" << msgName << "> {\n";
+  os << "    fn spawn(mut state: " << actor << ") -> Self {\n";
+  os << "        let (tx, rx) = std::sync::mpsc::channel::<" << msgName
+     << ">();\n";
+  os << "        let join = std::thread::spawn(move || {\n";
+  os << "            for msg in rx {\n";
+  os << "                match msg {\n";
+  for (emitrust::FuncOp fn : methods) {
+    os << "                    " << msgName << "::"
+       << upperCamel(fn.getSymName()) << " { ";
+    emitParamNames(fn);
+    os << "reply } => {\n";
+    os << "                        reply.send(state." << fn.getSymName()
+       << "(";
+    bool first = true;
+    for (unsigned i = 1; i < fn.getFunctionType().getNumInputs(); ++i) {
+      if (!first)
+        os << ", ";
+      first = false;
+      os << carriedParamName(fn, i);
+    }
+    os << ")).expect(\"actor caller dropped reply receiver\");\n";
+    os << "                    }\n";
+  }
+  os << "                }\n";
+  os << "            }\n";
+  os << "        });\n";
+  os << "        Self { tx, join: Some(join) }\n";
+  os << "    }\n";
+  for (emitrust::FuncOp fn : methods) {
+    os << "    fn " << fn.getSymName() << "(&mut self";
+    FunctionType type = fn.getFunctionType();
+    for (unsigned i = 1; i < type.getNumInputs(); ++i) {
+      os << ", " << carriedParamName(fn, i) << ": ";
+      if (failed(emitType(fn.getLoc(), type.getInput(i))))
+        return failure();
+    }
+    os << ")";
+    if (fn.getNumResults() == 1) {
+      os << " -> ";
+      if (failed(emitType(fn.getLoc(), fn.getResultTypes().front())))
+        return failure();
+    }
+    os << " {\n";
+    os << "        let (rtx, rrx) = std::sync::mpsc::channel();\n";
+    os << "        self.call(" << msgName << "::"
+       << upperCamel(fn.getSymName()) << " { ";
+    emitParamNames(fn);
+    os << "reply: rtx }, rrx)\n";
+    os << "    }\n";
+  }
   os << "}\n";
   return success();
 }
@@ -3740,6 +3977,9 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
           [&](emitrust::FuncOp funcOp) { return emitFunc(funcOp); })
       .Case<emitrust::ImplOp>(
           [&](emitrust::ImplOp implOp) { return emitImpl(implOp); })
+      .Case<emitrust::ActorRuntimeOp>([&](emitrust::ActorRuntimeOp op) {
+        return emitActorRuntime(op);
+      })
       .Case<emitrust::TraitDefOp>([&](emitrust::TraitDefOp traitDefOp) {
         return emitTraitDef(traitDefOp);
       })
