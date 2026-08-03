@@ -3098,7 +3098,60 @@ of references or inheritance, so it precedes both.
   (emitrust-clang-*, link-ratchet, link-rejection-report, link-merge*,
   link-partition) were sanity-run green post-flip.
 
-**Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
+  SLICE-5b SPIKE (2026-08-03) — threaded-mode IR surface settled by
+  experiment; verdict B-PRIME: one module-level anchor op
+  `emitrust.actor_runtime @Actor mode=<threaded|async>` (symbol user;
+  verifier: struct+impl resolve, every arm signature sendable, no
+  cross client holds a mut_ref of a threaded actor), with the Msg
+  enum, spawn/mailbox loop, call wrappers, and the shared runtime all
+  EMITTER-synthesized from the impl. The as-specified alternative
+  (threadify reifies the Msg enum as a 5a data_enum_def) has a PROVEN
+  hole: call-style variants carry `mpsc::Sender<RetTy>` reply fields,
+  and `data_enum_def` derives Copy unconditionally while Sender is
+  Clone-not-Copy — an opaque field would verify in IR and fail only at
+  rustc, the forbidden failure direction; and the enum is 100%
+  mechanically derivable from the impl (variant = UpperCamel(method),
+  fields = params via param_names, reply type = return type), so
+  reification adds a verifier obligation with no information. RFC-
+  sketch region ops rejected (spawn regions wrap the whole driver per
+  actor, duplicate method_call, and cannot express the loop internals
+  either); full verbatim rejected (no verifier safety). Totality
+  proven: a two-column derivation table maps every line of the target
+  Rust to a named IR fact; the two holes it exposed are fixed in the
+  design (enum synthesis moved to the emitter; the opaque-receiver
+  mutability classifier must learn handle types or a
+  `!emitrust.actor_handle` type is introduced). Prototype: hand-
+  written post-threadify IR (existing ops only — accessor methods are
+  ordinary impl funcs, driver rewrites are method_calls on an opaque
+  handle lvalue, shutdown is a plain method_call before each return)
+  verifies and translates today; the assembled crate byte-diffed GREEN
+  against actor-lift-globals.c's native on a HARDER shape than E3's
+  (the landed plan merges counter+table into one 3-arm actor plus 4
+  synthesized get_/set_ accessors for main's direct accesses); panic
+  probe exits 101 with single-panic provenance. Shared runtime
+  measured: generic `mod actor_rt` (Handle<M>, call, reap, shutdown)
+  is 37 fixed lines emitted once as an epilogue constant (the
+  __emitrust_fmt_f64 mechanism, not a verbatim op); per-actor
+  synthesis ~4 lines/wrapper + ~3/mailbox arm + 8 fixed. Flag UX
+  decision: `--actor-mode=<same-thread|threaded|async>`, global,
+  default same-thread, applying to all eligible actors; per-actor
+  selection deferred (buys nothing measurable in v1, costs a plan-text
+  contract change and a combinatorial test matrix; the anchor op
+  carries mode PER ACTOR, so later per-actor plumbing is driver-only).
+  Composition rules: `--actor-mode=threaded --actor-lift=false` is an
+  immediate located driver error; lift-demoted actors stay same-thread
+  thread_local (the E3 landmine is dead by construction — a lifted arm
+  provably touches no unowned mutable global); thread-ineligible-but-
+  lifted actors (cross-client mut_ref, unsendable signature, accessor
+  name collision) stay lifted same-thread with a warning note —
+  demote-from-threading is not demote-from-lifting; `--actor-mode=
+  threaded --link` threads nothing and says so. Async confirmed as
+  emitter-branch-only on the same op (tokio actor_rt flavor, async
+  wrappers with immediate .await, current_thread main shim, E4's
+  unconditional-dep Cargo flavor); no IR-shape difference. Threadify
+  placement: sibling pass after actor-lift at the pipeline tail,
+  consuming one new driver-computed module attribute
+  (`emitrust.actor_thread`), since ActorLift strips its own attrs. FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
 are not. The paper's experiment harness discovered every `test/EndToEnd` case
