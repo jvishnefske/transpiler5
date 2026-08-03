@@ -67,6 +67,7 @@
 #include "LinkMerge.h"
 #include "Partition.h"
 #include "ProgressReport.h"
+#include "RatchetReport.h"
 
 #include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/EmitRustDialect.h"
@@ -129,7 +130,17 @@ namespace {
 /// import for exactly that reason — both are meant to be obtainable for a
 /// project the importer cannot yet translate, which for the coloring is the
 /// whole point (an all-Green project needs no coloring).
-enum class EmitKind { ItemGraph, Coloring, Import, MLIR, Rust, Crate, Search };
+enum class EmitKind {
+  ItemGraph,
+  Coloring,
+  Import,
+  MLIR,
+  Rust,
+  Crate,
+  Search,
+  RejectionReport,
+  Ratchet,
+};
 
 /// Whether `kind` is one of the pure-AST project analyses, i.e. produced
 /// without an MLIR context, an import, or a pass.
@@ -228,7 +239,23 @@ static llvm::cl::opt<EmitKind> emitKind(
                    "the search tried, what each import attempt learned, the "
                    "subset that won and why every other item is out. Implies "
                    "--search; no crate and no module is written, and the "
-                   "project need not define main")),
+                   "project need not define main"),
+        clEnumValN(EmitKind::RejectionReport, "rejection-report",
+                   "FR-60: aggregate the shard artifacts' FR-57d rejection "
+                   "ledgers into the per-construct report that ranks what "
+                   "semantic work buys the most frontier -- grouped by the "
+                   "classifyBlocker tag, wordings tabulated with quoted "
+                   "names normalized, deterministic. Requires --link; no "
+                   "merge and no re-import runs, so it stays a pure "
+                   "artifact query at kernel scale"),
+        clEnumValN(EmitKind::Ratchet, "ratchet",
+                   "FR-60: the per-project ratchet manifest -- admitted "
+                   "items per shard and total, the FR-59 crate facts "
+                   "(with --partition), and the per-tag rejection "
+                   "snapshot. With --ratchet-baseline the manifest is "
+                   "compared first: an admitted shrink or a condensation "
+                   "growth is an error; growth passes, and the written "
+                   "manifest is the update. Requires --link")),
     llvm::cl::init(EmitKind::Crate));
 
 static llvm::cl::opt<emitrustcc::CrateTypeRequest> crateTypeOpt(
@@ -303,6 +330,16 @@ static llvm::cl::opt<std::string> partitionMapPath(
         "<crate-name>` pair per line; the LONGEST prefix matching a "
         "shard's recorded source path assigns it to that crate, and "
         "unmatched shards keep the per-directory default"),
+    llvm::cl::value_desc("file"), llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> ratchetBaselinePath(
+    "ratchet-baseline",
+    llvm::cl::desc(
+        "FR-60: a committed ratchet manifest to compare --emit=ratchet's "
+        "result against BEFORE writing it. An admitted-item shrink (total, "
+        "per shard, or a shard vanishing) or a condensation-warning growth "
+        "is an error; admitted growth passes with a note, and the written "
+        "manifest is the update"),
     llvm::cl::value_desc("file"), llvm::cl::init(""));
 
 static llvm::cl::opt<bool> buildFlag(
@@ -1222,6 +1259,39 @@ static std::vector<std::string> collectExtraClangArgs() {
 // FR-59 -- workspace partitioning
 //===----------------------------------------------------------------------===//
 
+/// Parses the `--partition-map` file (when given) into (prefix, crate)
+/// override entries, crate names sanitized. Shared by the FR-59 workspace
+/// path and FR-60's ratchet (whose manifest records the partition facts).
+///
+/// \param overrides receives the entries, in file order.
+/// \returns true on success; false after a printed error.
+static bool loadPartitionOverrides(
+    std::vector<std::pair<std::string, std::string>> &overrides) {
+  if (partitionMapPath.empty())
+    return true;
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> map =
+      llvm::MemoryBuffer::getFile(partitionMapPath);
+  if (!map) {
+    llvm::errs() << "error: cannot read --partition-map '" << partitionMapPath
+                 << "': " << map.getError().message() << "\n";
+    return false;
+  }
+  for (llvm::StringRef line : llvm::split((*map)->getBuffer(), '\n')) {
+    line = line.trim();
+    if (line.empty() || line.starts_with("#"))
+      continue;
+    auto [prefix, crate] = line.split(' ');
+    crate = crate.trim();
+    if (prefix.empty() || crate.empty()) {
+      llvm::errs() << "error: malformed --partition-map line: '" << line
+                   << "' (expected '<path-prefix> <crate-name>')\n";
+      return false;
+    }
+    overrides.emplace_back(prefix.str(), emitrustcc::sanitizeCrateName(crate));
+  }
+  return true;
+}
+
 /// `--link --partition --emit=crate`: the full workspace path. Loads and
 /// surfaces the shards exactly like `loadAndMergeShards`, HARVESTS each
 /// link-line position's partition facts (source path, item-graph text)
@@ -1296,30 +1366,8 @@ static int emitPartitionedWorkspace(llvm::ArrayRef<std::string> inputs,
   }
 
   std::vector<std::pair<std::string, std::string>> overrides;
-  if (!partitionMapPath.empty()) {
-    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> map =
-        llvm::MemoryBuffer::getFile(partitionMapPath);
-    if (!map) {
-      llvm::errs() << "error: cannot read --partition-map '"
-                   << partitionMapPath << "': " << map.getError().message()
-                   << "\n";
-      return 1;
-    }
-    for (llvm::StringRef line : llvm::split((*map)->getBuffer(), '\n')) {
-      line = line.trim();
-      if (line.empty() || line.starts_with("#"))
-        continue;
-      auto [prefix, crate] = line.split(' ');
-      crate = crate.trim();
-      if (prefix.empty() || crate.empty()) {
-        llvm::errs() << "error: malformed --partition-map line: '" << line
-                     << "' (expected '<path-prefix> <crate-name>')\n";
-        return 1;
-      }
-      overrides.emplace_back(prefix.str(),
-                             emitrustcc::sanitizeCrateName(crate));
-    }
-  }
+  if (!loadPartitionOverrides(overrides))
+    return 1;
 
   std::string binCrateName = deducedCrateName(inputs);
   emitrustcc::PartitionPlan plan =
@@ -1432,6 +1480,113 @@ static int emitPartitionedWorkspace(llvm::ArrayRef<std::string> inputs,
   return 0;
 }
 
+//===----------------------------------------------------------------------===//
+// FR-60 -- artifact queries: rejection report and ratchet manifest
+//===----------------------------------------------------------------------===//
+
+/// `--link --emit=rejection-report` and `--link --emit=ratchet`: pure
+/// queries over the shard artifacts — no merge, no re-import, no C parsed
+/// (deliberately, so both scale to a kernel link line and stay
+/// deterministic functions of the artifacts alone; the ratchet's FR-59
+/// partition facts are likewise planned over the RAW shards). Decodes each
+/// shard's source path, ledger, and module-level definition count, then
+/// hands everything to the pure renderers in RatchetReport.h. Under
+/// `--ratchet-baseline` the comparison runs BEFORE the manifest is
+/// written: any regression is a printed error and a nonzero exit.
+///
+/// \param inputs the link-line object/archive/shard paths, in link order.
+/// \param context the context to parse the shards in.
+/// \returns the process exit code.
+static int emitLinkArtifactQuery(llvm::ArrayRef<std::string> inputs,
+                                 mlir::MLIRContext &context) {
+  llvm::SmallVector<LoadedShard> shards;
+  if (!loadLinkShards(inputs, context, shards))
+    return 1;
+
+  llvm::SmallVector<emitrustcc::ShardFacts> facts;
+  facts.reserve(shards.size());
+  for (LoadedShard &shard : shards) {
+    emitrustcc::ShardFacts shardFacts;
+    std::optional<mlir::emitrust::ShardSource> source =
+        mlir::emitrust::getShardSource(*shard.module);
+    shardFacts.sourcePath = source ? source->path : shard.name;
+    shardFacts.rejections =
+        mlir::emitrust::getShardRejections(*shard.module);
+    for (mlir::Operation &op : shard.module->getBody()->getOperations()) {
+      if (op.hasAttr(mlir::emitrust::kExternDeclAttrName))
+        continue;
+      if (llvm::isa<mlir::SymbolOpInterface>(&op))
+        ++shardFacts.definitionCount;
+    }
+    facts.push_back(std::move(shardFacts));
+  }
+
+  if (emitKind == EmitKind::RejectionReport)
+    return mlir::failed(writeFile(outputPath,
+                                  emitrustcc::renderRejectionReport(facts)))
+               ? 1
+               : 0;
+
+  // --emit=ratchet.
+  unsigned crates = 1;
+  unsigned condensationWarnings = 0;
+  if (partitionFlag) {
+    llvm::SmallVector<emitrustcc::PartitionUnit> units(shards.size());
+    for (auto [k, shard] : llvm::enumerate(shards)) {
+      units[k].sourcePaths.push_back(facts[k].sourcePath);
+      if (std::optional<llvm::StringRef> graph =
+              mlir::emitrust::getShardItemGraph(*shard.module))
+        units[k].graphTexts.push_back(graph->str());
+      for (mlir::Operation &op : shard.module->getBody()->getOperations())
+        if (auto impl = llvm::dyn_cast<mlir::emitrust::ImplOp>(&op))
+          units[k].implTypes.push_back(impl.getStructName().str());
+    }
+    std::vector<std::pair<std::string, std::string>> overrides;
+    if (!loadPartitionOverrides(overrides))
+      return 1;
+    emitrustcc::PartitionPlan plan = emitrustcc::planPartition(
+        units, deducedCrateName(inputs), overrides);
+    crates = static_cast<unsigned>(plan.crates.size());
+    condensationWarnings = static_cast<unsigned>(plan.notes.size());
+  }
+
+  emitrustcc::RatchetManifest manifest =
+      emitrustcc::buildRatchetManifest(facts, crates, condensationWarnings);
+
+  if (!ratchetBaselinePath.empty()) {
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> baselineFile =
+        llvm::MemoryBuffer::getFile(ratchetBaselinePath);
+    if (!baselineFile) {
+      llvm::errs() << "error: cannot read --ratchet-baseline '"
+                   << ratchetBaselinePath
+                   << "': " << baselineFile.getError().message() << "\n";
+      return 1;
+    }
+    emitrustcc::RatchetManifest baseline;
+    std::string parseError;
+    if (!emitrustcc::parseRatchetManifest((*baselineFile)->getBuffer(),
+                                          baseline, parseError)) {
+      llvm::errs() << "error: malformed --ratchet-baseline '"
+                   << ratchetBaselinePath << "': " << parseError << "\n";
+      return 1;
+    }
+    llvm::SmallVector<std::string> regressions =
+        emitrustcc::compareRatchetManifests(baseline, manifest);
+    for (const std::string &regression : regressions)
+      llvm::errs() << "error: ratchet regression: " << regression << "\n";
+    if (!regressions.empty())
+      return 1;
+    for (const std::string &improvement :
+         emitrustcc::ratchetImprovements(baseline, manifest))
+      llvm::errs() << "ratchet improvement: " << improvement << "\n";
+  }
+
+  return mlir::failed(writeFile(outputPath,
+                                emitrustcc::renderRatchetManifest(manifest)))
+             ? 1
+             : 0;
+}
+
 /// Tool entry point: validates the option combination, imports the C inputs,
 /// runs the lowering pipeline, and produces the selected output. Returns
 /// nonzero on any error; diagnostics have already been printed.
@@ -1458,21 +1613,40 @@ int main(int argc, char **argv) {
   // FR-58: --link consumes already-imported, already-converted shards, so
   // everything that configures an import or the pass pipeline is
   // meaningless with it and is rejected rather than silently ignored.
-  // --emit=item-graph is the exception (FR-57d): the shards CARRY their
-  // item-graph text, so dumping it per shard needs no import either.
+  // --emit=item-graph is one exception (FR-57d): the shards CARRY their
+  // item-graph text, so dumping it per shard needs no import; FR-60's
+  // rejection-report and ratchet are the other two, for the same reason.
   if (linkFlag && emitKind != EmitKind::Rust && emitKind != EmitKind::Crate &&
-      emitKind != EmitKind::ItemGraph) {
+      emitKind != EmitKind::ItemGraph &&
+      emitKind != EmitKind::RejectionReport && emitKind != EmitKind::Ratchet) {
     llvm::errs() << "error: --link merges already-converted shards, so only "
-                    "--emit=rust, --emit=crate and --emit=item-graph apply\n";
+                    "--emit=rust, --emit=crate, --emit=item-graph, "
+                    "--emit=rejection-report and --emit=ratchet apply\n";
     return 1;
   }
-  // FR-59: partitioning is a link-time, crate-emitting operation only.
-  if (partitionFlag && (!linkFlag || emitKind != EmitKind::Crate)) {
+  // FR-59: partitioning is a link-time, crate-emitting operation only —
+  // plus FR-60's ratchet, whose manifest records the partition facts.
+  if (partitionFlag &&
+      (!linkFlag ||
+       (emitKind != EmitKind::Crate && emitKind != EmitKind::Ratchet))) {
     llvm::errs() << "error: --partition requires --link and --emit=crate\n";
     return 1;
   }
   if (!partitionMapPath.empty() && !partitionFlag) {
     llvm::errs() << "error: --partition-map requires --partition\n";
+    return 1;
+  }
+  // FR-60: both artifact queries read the shard ledgers off the link line.
+  if (emitKind == EmitKind::RejectionReport && !linkFlag) {
+    llvm::errs() << "error: --emit=rejection-report requires --link\n";
+    return 1;
+  }
+  if (emitKind == EmitKind::Ratchet && !linkFlag) {
+    llvm::errs() << "error: --emit=ratchet requires --link\n";
+    return 1;
+  }
+  if (!ratchetBaselinePath.empty() && emitKind != EmitKind::Ratchet) {
+    llvm::errs() << "error: --ratchet-baseline requires --emit=ratchet\n";
     return 1;
   }
   if (linkFlag &&
@@ -1641,6 +1815,10 @@ int main(int argc, char **argv) {
   mlir::emitrust::RejectionLedger ledger;
   mlir::OwningOpRef<mlir::ModuleOp> module;
   if (linkFlag) {
+    // FR-60: pure artifact queries, dispatched before any merge.
+    if (emitKind == EmitKind::RejectionReport ||
+        emitKind == EmitKind::Ratchet)
+      return emitLinkArtifactQuery(inputs, context);
     // FR-59: partitioning is a whole path of its own — it needs the
     // per-shard facts the ordinary merge deliberately strips.
     if (partitionFlag)
@@ -1695,6 +1873,9 @@ int main(int argc, char **argv) {
   case EmitKind::ItemGraph:
   case EmitKind::Coloring:
     llvm_unreachable("handled before the import");
+  case EmitKind::RejectionReport:
+  case EmitKind::Ratchet:
+    llvm_unreachable("handled inside the --link dispatch");
   case EmitKind::Search:
     llvm_unreachable("handled before the import");
   case EmitKind::Import:
