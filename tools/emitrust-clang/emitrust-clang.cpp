@@ -43,8 +43,13 @@
 ///
 /// The shim's cardinal rule is that the IMPORT NEVER FAILS THE BUILD: an
 /// import error is logged (and warned about on stderr) and the exit code of
-/// the real clang is returned unchanged. The real compiler to delegate to is
-/// `EMITRUST_REAL_CC` when set, else `clang` found on PATH.
+/// the real clang is returned unchanged. That rule covers CRASHES too: the
+/// whole artifact side-emission runs in a forked child per compile job
+/// (`runIsolatedSideEmit`), so an importer abort costs one TU's artifact —
+/// with any partial sidecar removed — never the build; the test-only
+/// `EMITRUST_TEST_CRASH_IMPORT` env hook forces that crash. The real
+/// compiler to delegate to is `EMITRUST_REAL_CC` when set, else `clang`
+/// found on PATH.
 //
 //===----------------------------------------------------------------------===//
 
@@ -103,6 +108,9 @@
 #include <optional>
 #include <string>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 
@@ -583,6 +591,60 @@ static void sideEmitArtifact(const CompileJob &job, llvm::raw_ostream *log) {
   writeAndEmbedArtifact(*module, job, log);
 }
 
+/// FR-56 import-crash isolation: runs the whole artifact side-emission for
+/// one compile job — src-hash dependency scan, import, pipeline,
+/// serialization, embedding — in a FORKED child, so a crash anywhere in it
+/// (importer assertion, clang parser abort, MLIR verifier trap) is
+/// observed by the parent as an abnormal child exit instead of killing the
+/// build. The real compile was already delegated separately, so isolation
+/// only ever guards the side-emission; on a crash the parent warns,
+/// removes any partial sidecar (a child dying mid-serialization must not
+/// leave a truncated artifact a later link would trip over), and the
+/// delegated clang's exit code stays the shim's exit code.
+///
+/// The test-only `EMITRUST_TEST_CRASH_IMPORT` env hook aborts the child
+/// before the scan, pinning the crash path
+/// (test/Driver/emitrust-clang-crash-isolation.c); no cheap C input
+/// crashes the importer on demand.
+///
+/// A fork failure (resource exhaustion) falls back to in-process emission:
+/// losing isolation is recoverable, silently losing every artifact is not.
+static void runIsolatedSideEmit(const CompileJob &job,
+                                llvm::raw_ostream *log) {
+  // Flush inherited buffers BEFORE forking, or the child's copy of the
+  // buffered log/stderr bytes would be written twice.
+  if (log)
+    log->flush();
+  llvm::errs().flush();
+
+  pid_t child = fork();
+  if (child == 0) {
+    if (std::getenv("EMITRUST_TEST_CRASH_IMPORT"))
+      abort();
+    if (computeAndLogSrcHash(job, log))
+      sideEmitArtifact(job, log);
+    if (log)
+      log->flush();
+    llvm::errs().flush();
+    _exit(0);
+  }
+  if (child < 0) {
+    if (computeAndLogSrcHash(job, log))
+      sideEmitArtifact(job, log);
+    return;
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) < 0 ||
+      !(WIFEXITED(status) && WEXITSTATUS(status) == 0)) {
+    llvm::errs() << "emitrust-clang: warning: emitrust artifact emission "
+                    "crashed for '"
+                 << job.input << "'; no artifact written\n";
+    if (log)
+      *log << "side-emit: CRASHED for " << job.input << "\n";
+    llvm::sys::fs::remove(job.output + ".emitrust.mlirbc");
+  }
+}
+
 /// Shim entry point: expand response files, classify with the clang driver,
 /// delegate the ORIGINAL argv to the real clang, side-emit one artifact per
 /// C compile job, and return the real clang's exit code unchanged.
@@ -657,13 +719,14 @@ int main(int argc, char **argv) {
   }
 
   // Side-emit only after a SUCCESSFUL real compile: a TU the real compiler
-  // rejected has no object file for the artifact to ride with. The src-hash
-  // gate comes first — a key that missed a dependency could later be a
-  // wrong cache hit, so a failed scan costs the artifact, never the build.
+  // rejected has no object file for the artifact to ride with. Each job's
+  // emission runs in its own forked child (import-crash isolation); inside
+  // it the src-hash gate comes first — a key that missed a dependency
+  // could later be a wrong cache hit, so a failed scan costs the artifact,
+  // never the build.
   if (exitCode == 0)
     for (const CompileJob &job : jobs)
-      if (computeAndLogSrcHash(job, log))
-        sideEmitArtifact(job, log);
+      runIsolatedSideEmit(job, log);
 
   return exitCode;
 }
