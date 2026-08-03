@@ -1327,6 +1327,56 @@ static bool rendersWrappingMethod(Operation *op) {
   return intType && intType.isUnsigned();
 }
 
+/// FR-61d slice 2: the longest suffixed literal a MULTI-use constant may
+/// duplicate at its uses. Measured over the EndToEnd corpus (2026-08-03):
+/// suffixed lengths of surviving multi-use constant bindings were p50=4,
+/// p90=6, and everything beyond 12 was a pathological literal
+/// (`-9223372036854775808i64`, `4000000000.75f64` at 52 uses,
+/// `-2147483648i32` at 12 uses) that reads better behind a name; 12
+/// collapses 98% of the 1098 measured bindings while keeping every one of
+/// those.
+static constexpr size_t kInlineConstantDupMaxLen = 12;
+
+/// The length of the suffixed literal text an inlined constant renders as
+/// (mirrors `emitAttribute` + the capture's suffix append), or nullopt for
+/// an attribute kind that never inlines. Used only for the duplication
+/// threshold, so a small drift from the real rendering is a heuristic
+/// wobble, never a correctness issue.
+static std::optional<size_t>
+inlineConstantTextLength(emitrust::ConstantOp constant) {
+  Attribute value = constant.getValue();
+  if (auto intAttr = dyn_cast<IntegerAttr>(value)) {
+    if (intAttr.getType().isInteger(1))
+      return intAttr.getValue().getBoolValue() ? 4 : 5; // true / false
+    auto intType = dyn_cast<IntegerType>(intAttr.getType());
+    bool isUnsigned = intType && intType.isUnsigned();
+    SmallString<32> digits;
+    intAttr.getValue().toString(digits, /*Radix=*/10, /*Signed=*/!isUnsigned);
+    return digits.size() +
+           inlineSuffixFor(constant.getResult().getType()).size();
+  }
+  if (auto floatAttr = dyn_cast<FloatAttr>(value)) {
+    char buffer[64];
+    double v = floatAttr.getValueAsDouble();
+    std::to_chars_result res{};
+    if (floatAttr.getType().isF32())
+      res = std::to_chars(buffer, buffer + sizeof(buffer),
+                          static_cast<float>(v));
+    else
+      res = std::to_chars(buffer, buffer + sizeof(buffer), v);
+    if (res.ec != std::errc())
+      return std::nullopt;
+    StringRef text(buffer, static_cast<size_t>(res.ptr - buffer));
+    size_t n = text.size();
+    if (!text.contains('.') && !text.contains('e') && !text.contains('E'))
+      n += 2; // the appended `.0`
+    return n + inlineSuffixFor(constant.getResult().getType()).size();
+  }
+  if (auto opaque = dyn_cast<emitrust::OpaqueAttr>(value))
+    return opaque.getValue().size();
+  return std::nullopt;
+}
+
 void RustEmitter::computeDroppedOps(emitrust::FuncOp funcOp) {
   // Reverse program order: users always render after their defs (nested
   // users belong to later parent ops), so one reverse sweep sees every
@@ -1406,7 +1456,14 @@ static bool isClassifiedConsumerUse(OpOperand &use) {
 
 void RustEmitter::computeInlineCandidates(emitrust::FuncOp funcOp) {
   funcOp->walk([&](Operation *op) {
-    if (op->getNumResults() != 1 || !isPureProducer(op))
+    // FR-61d-2: `emitrust.global_load` joins the SINGLE-use inline set (a
+    // pure module-state read behind the same barrier wall as local loads);
+    // it stays out of `isPureProducer` so unused ones are not dropped.
+    // `emitrust.cell_get` stays out entirely: its defs live in
+    // `emitrust.global_cells` bodies, which are rendered by a loop that
+    // bypasses `emitBlockBody`'s capture, so promotion would be inert.
+    if (op->getNumResults() != 1 ||
+        (!isPureProducer(op) && !isa<emitrust::GlobalLoadOp>(op)))
       return;
     if (unreachableOps.count(op) || droppedOps.count(op))
       return;
@@ -1433,7 +1490,7 @@ void RustEmitter::computeInlineCandidates(emitrust::FuncOp funcOp) {
       if (letOp.getIsMut() || deferredInits.count(op) ||
           letHasEmittedAssign(letOp.getResult()))
         return;
-    } else if (isa<emitrust::LoadOp>(op)) {
+    } else if (isa<emitrust::LoadOp, emitrust::GlobalLoadOp>(op)) {
       selfReadsPlace = true;
     }
     // The tail-fold candidate keeps the FR-61a rendering (its consumer is
@@ -1441,20 +1498,44 @@ void RustEmitter::computeInlineCandidates(emitrust::FuncOp funcOp) {
     // mechanisms disjoint by construction.
     if (op == tailFoldCandidate)
       return;
-    // Exactly one REAL use (uses inside unreachable code, dropped dead
+    // Collect the REAL uses (uses inside unreachable code, dropped dead
     // stores, or dropped pure ops never render).
-    OpOperand *realUse = nullptr;
+    SmallVector<OpOperand *, 4> realUses;
     for (OpOperand &use : op->getResult(0).getUses()) {
       Operation *owner = use.getOwner();
       if (unreachableOps.count(owner) || deadStores.count(owner) ||
           droppedOps.count(owner))
         continue;
-      if (realUse)
-        return; // second real use (includes both-operands-same-value)
-      realUse = &use;
+      realUses.push_back(&use);
     }
-    if (!realUse)
+    if (realUses.empty())
       return;
+    if (auto constant = dyn_cast<emitrust::ConstantOp>(op)) {
+      // FR-61d-2: constants are position-independent literals, so neither
+      // the same-block nor the barrier requirement applies at ANY use
+      // count -- but every use must be a classified consumer position (one
+      // for-bound/lookupName consumer keeps the named binding for ALL
+      // uses). A MULTI-use constant additionally duplicates its literal at
+      // every site, which only reads well within the measured length
+      // threshold: a long literal repeated at several sites reads worse
+      // than a name (single-use constants stay unthresholded, as in
+      // slice 1).
+      if (realUses.size() > 1) {
+        std::optional<size_t> len = inlineConstantTextLength(constant);
+        if (!len || *len > kInlineConstantDupMaxLen)
+          return;
+      }
+      for (OpOperand *use : realUses)
+        if (isa<emitrust::ForOp>(use->getOwner()) ||
+            !isClassifiedConsumerUse(*use))
+          return;
+      inlinedOps.insert(op);
+      inlineTreeReadsPlace[op->getResult(0)] = false;
+      return;
+    }
+    if (realUses.size() > 1)
+      return; // only constants duplicate
+    OpOperand *realUse = realUses.front();
     Operation *consumer = realUse->getOwner();
     if (consumer->getBlock() != op->getBlock())
       return;
@@ -1530,6 +1611,10 @@ Prec RustEmitter::capturedPrec(Operation *op, StringRef text) {
         // initializer's rank; a plain name is an atom.
         auto it = inlineExprs.find(letOp.getInit());
         return it != inlineExprs.end() ? it->second.prec : Prec::Postfix;
+      })
+      .Case<emitrust::GlobalLoadOp>([](auto) {
+        // `NAME` (const) or `NAME.with(|..| ..get())`: postfix either way.
+        return Prec::Postfix;
       })
       .Default([&](Operation *) {
         llvm_unreachable("capturedPrec: op is not an inline producer");

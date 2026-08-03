@@ -206,30 +206,52 @@ emitrust.func @deref_load(%arg0: !emitrust.ref<i32>) -> i32 {
   emitrust.return %s : i32
 }
 
-// NOT inlined: a multi-use value keeps its binding (and the binding keeps
-// its baseline number: the captured single-use add consumed v2).
+// NOT inlined: a multi-use NON-CONSTANT keeps its binding (multi-use
+// CONSTANTS duplicate instead -- see dup_short below). The binding keeps
+// its baseline number: the captured single-use constant consumed v1.
 // CHECK-LABEL: fn multi_use(v0: i32) -> i32 {
-// CHECK-NEXT:    let v1: i32 = 7;
-// CHECK-NEXT:    (v0 + v1) * v1
+// CHECK-NEXT:    let v2: i32 = v0 + 7i32;
+// CHECK-NEXT:    v2 * v2
 // CHECK-NEXT:  }
 emitrust.func @multi_use(%arg0: i32) -> i32 {
   %c = emitrust.constant <7 : i32> : i32
   %a = emitrust.add %arg0, %c : i32
-  %b = emitrust.mul %a, %c : i32
+  %b = emitrust.mul %a, %a : i32
   emitrust.return %b : i32
 }
 
-// NOT inlined: a use in a nested block (the assignment lives in the `if`
-// arm; the constant's def does not dominate textually once inlined).
+// NOT inlined: a STATE-READING producer (a load) with its use in a nested
+// block -- the same-block rule only binds producers whose render point
+// matters; constants are exempt (slice 2), so the load pins it here.
 // CHECK-LABEL: fn cross_block(v0: bool, v1: i32) -> i32 {
 // CHECK-NEXT:    let v2: i32 = 5;
+// CHECK-NEXT:    let v3: i32 = v2;
+// CHECK-NEXT:    let mut v4: i32 = v1;
+// CHECK-NEXT:    if v0 {
+// CHECK-NEXT:        v4 = v3;
+// CHECK-NEXT:    }
+// CHECK-NEXT:    v4
+// CHECK-NEXT:  }
+emitrust.func @cross_block(%arg0: i1, %arg1: i32) -> i32 {
+  %v = emitrust.variable <5 : i32> : !emitrust.lvalue<i32>
+  %c = emitrust.load %v : (!emitrust.lvalue<i32>) -> i32
+  %m = emitrust.let mut %arg1 : i32
+  emitrust.if %arg0 {
+    emitrust.assign %m = %c : i32
+  }
+  emitrust.return %m : i32
+}
+
+// A single-use constant DOES cross into a nested block (slice 2 relaxed
+// the same-block rule for position-independent literals).
+// CHECK-LABEL: fn cross_block_const(v0: bool, v1: i32) -> i32 {
 // CHECK-NEXT:    let mut v3: i32 = v1;
 // CHECK-NEXT:    if v0 {
-// CHECK-NEXT:        v3 = v2;
+// CHECK-NEXT:        v3 = 5i32;
 // CHECK-NEXT:    }
 // CHECK-NEXT:    v3
 // CHECK-NEXT:  }
-emitrust.func @cross_block(%arg0: i1, %arg1: i32) -> i32 {
+emitrust.func @cross_block_const(%arg0: i1, %arg1: i32) -> i32 {
   %c = emitrust.constant <5 : i32> : i32
   %m = emitrust.let mut %arg1 : i32
   emitrust.if %arg0 {
@@ -238,16 +260,19 @@ emitrust.func @cross_block(%arg0: i1, %arg1: i32) -> i32 {
   emitrust.return %m : i32
 }
 
-// NOT inlined: a call between def and use is a barrier (the call may
-// observe or mutate state the reordered text would misrepresent; unknown
-// ops block by default).
+// NOT inlined: a call between a STATE-READING def (a load) and its use is
+// a barrier (the call may mutate what the moved text would re-read;
+// unknown ops block by default). Constants are exempt from the barrier
+// rule since slice 2 -- a literal reads the same everywhere.
 // CHECK-LABEL: fn call_barrier(_v0: i32) -> i32 {
 // CHECK-NEXT:    let v1: i32 = 9;
-// CHECK-NEXT:    let v2: i32 = get();
-// CHECK-NEXT:    v1 + v2
+// CHECK-NEXT:    let v2: i32 = v1;
+// CHECK-NEXT:    let v3: i32 = get();
+// CHECK-NEXT:    v2 + v3
 // CHECK-NEXT:  }
 emitrust.func @call_barrier(%arg0: i32) -> i32 {
-  %c = emitrust.constant <9 : i32> : i32
+  %v = emitrust.variable <9 : i32> : !emitrust.lvalue<i32>
+  %c = emitrust.load %v : (!emitrust.lvalue<i32>) -> i32
   %g = emitrust.call_opaque "get"() : () -> i32
   %r = emitrust.add %c, %g : i32
   emitrust.return %r : i32
@@ -366,4 +391,93 @@ emitrust.func @numbering_gap(%arg0: i32) -> i32 {
   %a = emitrust.add %arg0, %c : i32
   %b = emitrust.mul %a, %a : i32
   emitrust.return %b : i32
+}
+
+// --- FR-61d slice 2: multi-use constant duplication ---
+
+// A short constant (suffixed text within the measured threshold) with
+// several classified uses duplicates its literal at EVERY use and the
+// binding vanishes; each use parenthesizes independently.
+// CHECK-LABEL: fn dup_short(v0: i32) -> i32 {
+// CHECK-NEXT:    (v0 + 7i32) * 7i32 ^ 7i32
+// CHECK-NEXT:  }
+emitrust.func @dup_short(%arg0: i32) -> i32 {
+  %c = emitrust.constant <7 : i32> : i32
+  %a = emitrust.add %arg0, %c : i32
+  %b = emitrust.mul %a, %c : i32
+  %d = emitrust.xor %b, %c : i32
+  emitrust.return %d : i32
+}
+
+// A LONG literal (suffixed text over the threshold) repeated at several
+// sites reads worse than a name, so it keeps its multi-use binding.
+// CHECK-LABEL: fn dup_long(v0: u64) -> u64 {
+// CHECK-NEXT:    let v1: u64 = 10000000000;
+// CHECK-NEXT:    v0.wrapping_add(v1).wrapping_mul(v1)
+// CHECK-NEXT:  }
+emitrust.func @dup_long(%arg0: ui64) -> ui64 {
+  %c = emitrust.constant <10000000000 : ui64> : ui64
+  %a = emitrust.add %arg0, %c : ui64
+  %b = emitrust.mul %a, %c : ui64
+  emitrust.return %b : ui64
+}
+
+// A duplicated negative constant parenthesizes per use: bare as a binary
+// operand, wrapped as a method receiver.
+// CHECK-LABEL: fn dup_negative(v0: f64) -> u64 {
+// CHECK-NEXT:    (v0 * -1.5f64).to_bits().wrapping_add((-1.5f64).to_bits())
+// CHECK-NEXT:  }
+emitrust.func @dup_negative(%arg0: f64) -> ui64 {
+  %c = emitrust.constant <-1.5 : f64> : f64
+  %m = emitrust.mul %arg0, %c : f64
+  %mb = emitrust.bitcast %m : f64 to ui64
+  %cb = emitrust.bitcast %c : f64 to ui64
+  %r = emitrust.add %mb, %cb : ui64
+  emitrust.return %r : ui64
+}
+
+// ONE unclassified consumer (a for bound, rendered by name lookup) keeps
+// the named binding for ALL uses, including the classified ones.
+// CHECK-LABEL: fn dup_for_mixed(v0: usize) -> usize {
+// CHECK-NEXT:    let v1: usize = 1;
+// CHECK-NEXT:    for _v2 in (v1..v0).step_by(v1 as usize) {
+// CHECK-NEXT:        body();
+// CHECK-NEXT:    }
+// CHECK-NEXT:    v0 + v1
+// CHECK-NEXT:  }
+emitrust.func @dup_for_mixed(%arg0: index) -> index {
+  %one = emitrust.constant <1 : index> : index
+  emitrust.for %i = %one to %arg0 step %one {
+    emitrust.call_opaque "body"() : () -> ()
+  }
+  %r = emitrust.add %arg0, %one : index
+  emitrust.return %r : index
+}
+
+// --- FR-61d slice 2: single-use global-load promotion ---
+
+emitrust.global @g_counter <0 : i32> : i32
+
+// A single-use load of a mutable global inlines like any other pure read.
+// CHECK-LABEL: fn global_inline(v0: i32) -> i32 {
+// CHECK-NEXT:    g_counter.with(|__emitrust_tl| __emitrust_tl.get()) + v0
+// CHECK-NEXT:  }
+emitrust.func @global_inline(%arg0: i32) -> i32 {
+  %g = emitrust.global_load @g_counter : i32
+  %r = emitrust.add %g, %arg0 : i32
+  emitrust.return %r : i32
+}
+
+// An intervening store to ANY global is a barrier: moving the read's text
+// past it would read the new value. The load keeps its binding.
+// CHECK-LABEL: fn global_store_blocks(v0: i32) -> i32 {
+// CHECK-NEXT:    let v1: i32 = g_counter.with(|__emitrust_tl| __emitrust_tl.get());
+// CHECK-NEXT:    g_counter.with(|__emitrust_tl| __emitrust_tl.set(v0));
+// CHECK-NEXT:    v1 + v0
+// CHECK-NEXT:  }
+emitrust.func @global_store_blocks(%arg0: i32) -> i32 {
+  %g = emitrust.global_load @g_counter : i32
+  emitrust.global_store %arg0, @g_counter : i32
+  %r = emitrust.add %g, %arg0 : i32
+  emitrust.return %r : i32
 }

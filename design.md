@@ -1975,6 +1975,25 @@ of references or inheritance, so it precedes both.
     calls, global/cell reads (61d-2), for-bounds (name-lookup rendering),
     fn-ptr cmp/None. emitFor/emitGlobalCells/61b-arm bodies bypass capture
     (map-miss falls back to the name; drops ARE skipped there).
+    LANDED 61d slice 2 (2026-08-03): constants inline POSITION-
+    INDEPENDENTLY -- no same-block/barrier rule at any use count, every
+    real use must be a classified consumer (one for-bound keeps the named
+    binding for all uses) -- and a MULTI-use constant duplicates its
+    suffixed literal at every site iff the text is <= 12 chars (measured:
+    1098 surviving multi-use constant bindings, suffixed length p50=4
+    p90=6; everything >12 was a pathological literal like
+    `-9223372036854775808i64` or `4000000000.75f64` x52 uses that reads
+    better named; 12 collapses 98%). `emitrust.global_load` joined the
+    SINGLE-use inline set behind the same barrier wall (GlobalStore/
+    CellSet/calls block; a store-consumed load nests the accessor closures
+    -- pinned in globals.mlir); it stays out of the droppable set.
+    `emitrust.cell_get` promotion SKIPPED: its defs live in
+    `emitrust.global_cells` bodies, rendered by the capture-bypassing
+    loop, so promotion would be inert -- revisit if that loop ever routes
+    through emitBlockBody. Corpus: `let ` 6535 -> 4655 (-55% vs baseline
+    10273), inline captures 3079 -> 4875, multi-use constant binding
+    survivors 1098 -> 8 (long literals / for-bound consumers only),
+    EndToEnd 123/123 byte-diff green, full suite 440/440, unsafe 0.
     SPIKE 61d-0 (2026-08-03): GO. Buffered-capture mechanism prototyped for
     Constant+Add only: capture the op's normal statement rendering from the
     emitter buffer, strip indent + `;\n`, suppress the let prologue while
