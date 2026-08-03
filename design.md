@@ -3220,6 +3220,134 @@ rule.
   a cursor into a callee-local region would dangle)" — the blocker there
   is dynamic memory (C99-46, out of scope for this plan), not the
   member-pointer or owner-index-return mechanism, and is left untouched.
+  DESIGN SPIKE (2026-08-03) — candidate mappings measured; decision-ready,
+  NOT an implementation. Probe artifacts (session scratchpad,
+  c9943/probe.c + c9943/probe-rs, nothing lands in-tree): a C reference
+  with three sections (kernel T** out-params; a list.h-style circular
+  doubly-linked list over TWO bases; the RealWorld binary-tree) built
+  with clang -std=c11 -Wall -Werror, and a hand-written Rust probe crate
+  in emitted-crate style (forbid unsafe_code, deny warnings, deny
+  unused_variables, Copy+Default node structs wherever the mapping
+  permits) whose stdout is BYTE-IDENTICAL to the native build across all
+  sections — every candidate's probe path reaches differential execution.
+  CORPUS FREQUENCY, measured (kernel baseline
+  test/Kernel/linux-6.6.94-allnoconfig/rejection-report.txt, 130 TUs /
+  110,571 rejected items; c-testsuite ledger 220/220 — zero remaining
+  demand; RealWorld 7 rejected):
+  (a) T** locals/params — rank 7 `ptr-to-ptr`, 1,166 items in 89 TUs
+  (1,143 "pointer-to-pointer parameter", the CTS-P5 pinned rejection at
+  lib/ImportC/ImportCTypes.cpp:525, plus 23 string-cursor escapes).
+  Behind the item count sit only EIGHT distinct T**-parameter functions
+  in the shard TUs (skip_atoi, simple_strtoull/strtol, get_range,
+  get_option, memparse, next_arg, check_cpu) plus the boot/string.h
+  prototypes — the count multiplies through per-TU header re-rejection.
+  Every measured write through such a parameter is either a cursor into
+  a region a co-parameter already roots (`*endp = cp` x3, `*retptr`,
+  `*param`, `*val`) or one global-or-NULL (`*err_flags_ptr = err ?
+  err_flags : NULL`): 100% of observed shapes fall to candidate (iii).
+  RealWorld's argv-echo (char** argv iteration) is the same family plus
+  the W4.3 cursor-table gap.
+  (b) pointer struct members at sibling/global objects —
+  `self-ref-pointer-member`, 2,917 items in 67 TUs (first root
+  include/linux/list.h:153, __list_add's next->prev writes), plus 781
+  "pointer struct member assigned a non-address value" and 44
+  nested-aggregate initializers under rank 1. A static census over the
+  shard TUs + core headers shows the entire category is FOUR types:
+  list_head (next/prev), rb_node (rb_left/rb_right), hlist_node (next),
+  callback_head (next) — intrusive containers whose links cross
+  heterogeneous containing objects via container_of.
+  (c) T** struct members — ONE distinct field in the whole corpus slice,
+  hlist_node's pprev, zero in the shard TUs themselves (and
+  mapStructFieldType already admits T** fields as i64 at type level; the
+  2026-07-31 premise-refutation in the Track-5 section stands).
+  Adjacent, not C99-43 proper: returned-pointer 5,437 (the return half,
+  FR-36 covers only array-rooted) and void-pointer-param 6,337.
+  CANDIDATE (iii), T** OUT-PARAM AS MULTI-RETURN / &mut CURSOR — probe
+  compiles clean, byte-matches native. simple_strtoull's `char **endp`
+  erases into a second returned i64 cursor (the `*endp = cp` write is a
+  cursor write into the region parameter `cp` already roots); skip_atoi's
+  `const char **s` becomes backing + &mut i64 cursor (in-out, arity
+  preserved); check_cpu's `u32 **err_flags_ptr` (one-global-or-NULL)
+  collapses to a returned flag via the CTS-P2 GLOBAL-RETURN erasure
+  applied to an out-param — callers read the global directly, zero
+  runtime pointer state. IMPORT ANALYSIS: extend FR-28 parameter
+  classification per T** parameter p — (1) every use of p is *p
+  read/write or **p, p never reassigned/copied/subscripted/escaping;
+  (2) every value written through *p resolves via resolveArgRoot, per
+  call site exactly like slice admission, to ONE region class shared
+  with a co-parameter, or to one global/NULL; (3) every caller passes
+  &local of a decomposed pointer local (CTS-P5's consumed-&p shape,
+  relaxed to cross the call boundary). Everything outside stays the
+  located CTS-P5 rejection. Directly retires the 1,143-item rejection.
+  CANDIDATE (i), INDEX-HANDLE REGION GENERALIZATION — probe compiles
+  clean, byte-matches native, INCLUDING deletion and reverse iteration
+  on a circular doubly-linked list whose links span TWO statically
+  enumerable bases (head sentinel global + the embedded lh members of a
+  4-element pool array): FR-37's per-index enum generalizes to one
+  fieldless variant per REGION MEMBER with reads/writes decoding through
+  a genuine match, node structs stay Copy+Default, and container_of
+  COLLAPSES — the handle already names its containing element, so the C
+  offset arithmetic has no emitted counterpart. OWNER IDENTIFICATION at
+  import time: the region is the least closed set of statically
+  enumerable objects (named globals, constant-size arrays, their
+  members' embedded fields) reached by the fixpoint of every write into
+  the field class program-wide — planArrayMemberPointers' proof shape
+  (lib/ImportC/ImportCPlanning.cpp:484) with the single-ownerArray key
+  widened to a base SET and resolveArgRoot extended to
+  member-of-element addresses (&pool[i].lh). MEASURED LIMIT: kernel list
+  users traverse via container_of/list_entry (char* offset casts);
+  recognizing that idiom is a separate, large analysis, so the near-term
+  admissible subset is pools/sentinels authored without container_of —
+  a small share of the 2,917, consistent with the Track-5 6.4%
+  ownership-census finding. The per-index enum also caps at
+  kMaxOwnerArrayElements; a growable region needs the typed-index
+  (newtype) form instead — an emitted-style question (Q4).
+  CANDIDATE (ii), OWNERSHIP RESTRUCTURING (pointee moves into the
+  struct, Option-of-Box tree) — compiles clean and its inorder walk
+  cross-checks equal to the arena twin at runtime, BUT the node type
+  stops being Copy, breaking the Copy+Default struct invariant the
+  dialect rests on (the same axis on which the Track-5 census rejected
+  lifetimes); it needs a unique-incoming-edge proof (exactly one live
+  pointer per pointee — the doubly-linked list fails immediately on
+  prev/next); and the only corpus shape it fits (binary-tree) is
+  double-blocked on C99-46 malloc. NO-GO as a C99-43 mapping; revisit
+  only inside C99-46 if non-Copy emitted structs are ever accepted. Its
+  arena twin (Vec of nodes + Option<u32> handles, malloc->push,
+  NULL->None) probes clean and byte-matches — the C99-46-era
+  continuation of candidate (i), matching the recorded collection/
+  index-handle preference from the C99-46 discussion.
+  INTERACTIONS: (iii) composes with FR-58 through the existing
+  signature-starvation axis (findSignatureStarvedDecls — a refined T**
+  signature disagreeing across shards already triggers selective
+  re-import) and does not touch FR-59 (no shared state). (i)'s region
+  facts are whole-program by construction — the same fact-starvation
+  family as extern pointer globals, so FR-58's joint re-import of the
+  definer group is the delivery vehicle — and a region whose member
+  globals land in different FR-59 crates must CONDENSE exactly as
+  cross-crate globals already do; a synthesized region struct grouping
+  several globals also shifts emitted global names/layout, a
+  byte-identity surface. (ii) composes with nothing (a new non-Copy
+  type kind through every pass).
+  RANKED RECOMMENDATION: 1st (iii) — smallest analysis burden, retires
+  a measured 1,166 kernel items whose distinct shapes are 100% covered,
+  and extends machinery that exists (FR-28 classification, CTS-P2
+  erasure, CTS-P5's consumed-&p). 2nd (i) — mechanism proven by probe
+  including the multi-base and reverse-iteration cases FR-37 lacks, but
+  the admitted subset stays small until container_of recognition
+  exists; sequence behind the demand signal, entangled with C99-46's
+  arena. 3rd (ii) — NO-GO as stated. DECISION QUESTIONS only the
+  project owner can answer: (Q1) may an out-param T** become a Rust
+  multi-return, changing public signature arity (extern/FFI surface,
+  FR-58 cross-shard shape), or must the arity-preserving &mut-i64-cursor
+  form be the only admitted one? (Q2) is a synthesized region struct
+  that GROUPS several globals acceptable emitted style, or must regions
+  stay separate globals with match-routed accessors? (Q3) is a
+  generation-checked (or plain index-checked, panic-on-stale) arena
+  acceptable emitted style for the C99-46-era region — i.e. is a
+  deterministic panic an acceptable refinement of C's stale-pointer UB,
+  as it already is for null fn-ptr calls? (Q4) for handle-typed NULL,
+  Option-of-index (probe form, Default = None) or an i64 sentinel —
+  which is the FR-61 house style?
 - [x] C99-44 Unions. DECIDED and SHIPPED: the one-slot struct model —
   a supported subset with documented located rejections, not an enum
   mapping and not a blanket rejection. A named or untagged union
