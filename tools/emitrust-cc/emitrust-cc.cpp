@@ -751,10 +751,17 @@ struct LoadedShard {
 /// \param context the context to parse in; the EmitRust dialect is loaded
 ///        here because no import will do it.
 /// \param shards receives one named shard per payload, in link-line order.
-/// \returns true when every input yielded its shards.
+/// \param skipMissingPayloads FR-60: when true, an object with neither a
+///        `.emitrust` section nor a sidecar is SKIPPED with a warning
+///        instead of failing the load — the artifact queries must
+///        aggregate a kernel link line where import-failed TUs have no
+///        artifact at all. The merge path keeps the hard error: linking
+///        REQUIRES every shard.
+/// \returns true when every input yielded its shards (or was skipped).
 static bool loadLinkShards(llvm::ArrayRef<std::string> inputs,
                            mlir::MLIRContext &context,
-                           llvm::SmallVectorImpl<LoadedShard> &shards) {
+                           llvm::SmallVectorImpl<LoadedShard> &shards,
+                           bool skipMissingPayloads = false) {
   context.loadDialect<mlir::emitrust::EmitRustDialect>();
   // Parses one shard payload — copied into its own buffer named
   // `bufferName`, because payloads point into files that die before the
@@ -822,6 +829,11 @@ static bool loadLinkShards(llvm::ArrayRef<std::string> inputs,
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> side =
         llvm::MemoryBuffer::getFile(sidecar);
     if (!side) {
+      if (skipMissingPayloads) {
+        llvm::errs() << "warning: '" << path
+                     << "' carries no .emitrust payload; skipped\n";
+        continue;
+      }
       llvm::errs() << "error: object '" << path
                    << "' has no .emitrust section and its sidecar '"
                    << sidecar
@@ -1500,7 +1512,7 @@ static int emitPartitionedWorkspace(llvm::ArrayRef<std::string> inputs,
 static int emitLinkArtifactQuery(llvm::ArrayRef<std::string> inputs,
                                  mlir::MLIRContext &context) {
   llvm::SmallVector<LoadedShard> shards;
-  if (!loadLinkShards(inputs, context, shards))
+  if (!loadLinkShards(inputs, context, shards, /*skipMissingPayloads=*/true))
     return 1;
 
   llvm::SmallVector<emitrustcc::ShardFacts> facts;

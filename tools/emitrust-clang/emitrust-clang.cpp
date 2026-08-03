@@ -264,6 +264,13 @@ classifyCompileJobs(llvm::ArrayRef<const char *> args, llvm::StringRef realCC,
       } else if (arg == "-isystem" && i + 1 != e) {
         job.importArgs.push_back("-isystem");
         job.importArgs.push_back(cc1[++i]);
+      } else if ((arg == "-include" || arg == "-idirafter") && i + 1 != e) {
+        // Semantic preprocessor inputs, same class as -D: a kernel TU's
+        // semantics live behind `-include compiler_types.h`, so dropping
+        // the flag would import a different program than the one the real
+        // compile built.
+        job.importArgs.push_back(arg.str());
+        job.importArgs.push_back(cc1[++i]);
       } else if (arg.starts_with("-std=")) {
         job.importArgs.push_back(arg.str());
       } else if (arg == "-triple" && i + 1 != e) {
