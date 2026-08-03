@@ -667,6 +667,12 @@ def EmitRust_EnumDefOp : EmitRust_Op<"enum_def", [
     the C enum an unsigned underlying type, which requires every variant
     value to be non-negative).
 
+    This op models the OPEN C enum only and must not grow payloads: the
+    CLOSED Rust data-carrying enum — a real `enum` item with exhaustive
+    matching and no out-of-range values — is `emitrust.data_enum_def`, a
+    deliberately separate op with its own `!emitrust.data_enum` type, so
+    the two contracts can never mix.
+
     Example:
 
     ```mlir
@@ -696,6 +702,139 @@ def EmitRust_EnumDefOp : EmitRust_Op<"enum_def", [
   let results = (outs);
 
   let assemblyFormat = "$sym_name $variant_names $variant_values attr-dict";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// DataEnumDefOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_DataEnumDefOp : EmitRust_Op<"data_enum_def", [
+    HasParent<"::mlir::ModuleOp">, Symbol]> {
+  let summary = "Closed data-enum definition operation";
+  let description = [{
+    The `emitrust.data_enum_def` operation defines a named CLOSED Rust
+    enum at module level — a real `enum` item whose values are exactly the
+    declared variants, each optionally carrying named payload fields. It
+    is the message-reification surface for the FR-62 actor flavors and,
+    on its own merit, the data-carrying-enum surface (tagged unions,
+    Option-like shapes). Contrast `emitrust.enum_def`, which models the
+    OPEN value-preserving C enum as a `#[repr(transparent)]` tuple struct;
+    the two ops must never mix, and each carries its own type
+    (`!emitrust.data_enum` here, `!emitrust.enum` there).
+
+    Variants are given as a name array plus two parallel per-variant
+    arrays: a list of field-name lists and a list of field-type lists. A
+    variant with no fields is a unit variant. Variant names must be
+    non-empty and unique; field names must be non-empty and unique within
+    their variant; field types come from the `emitrust.struct_def` field
+    set (scalar, array, struct, OPEN enum, fn_ptr — every one `Copy`).
+    Names are emitted verbatim: the producer supplies UpperCamel variant
+    names and snake_case field names, the spellings the deny-manifest
+    naming lints accept.
+
+    The item derives `Clone, Copy` only. No `Default`: unlike
+    `emitrust.struct_def`, whose unconditional `Default` mirrors C's
+    zero-initialization of any struct object, a closed enum has no
+    canonical default variant, and nothing in the surface consumes one —
+    so none is invented (should a consumer ever require it, the pinned
+    fallback is the first variant when that variant is a unit variant).
+    No `PartialEq`: a struct payload field derives none, so the guarantee
+    could not be unconditional; `emitrust.cmp` rejects data-enum operands
+    instead. Values are constructed by `emitrust.enum_variant` and
+    consumed by `emitrust.match`; the type must not appear as a
+    `struct_def` field or a default-initialized `emitrust.variable`.
+
+    Example:
+
+    ```mlir
+    emitrust.data_enum_def @Msg ["Quit", "Move"] [[], ["x", "y"]]
+        [[], [i32, i32]]
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    #[derive(Clone, Copy)]
+    enum Msg {
+        Quit,
+        Move { x: i32, y: i32 },
+    }
+    ```
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       StrArrayAttr:$variant_names,
+                       ArrayAttr:$variant_field_names,
+                       ArrayAttr:$variant_field_types);
+  let results = (outs);
+
+  let assemblyFormat =
+      "$sym_name $variant_names $variant_field_names $variant_field_types "
+      "attr-dict";
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    /// Resolves the data-enum definition named `name` visible from `from`.
+    /// Definitions are module children (HasParent), but a consumer may sit
+    /// inside a nested symbol table (`emitrust.impl` holds its methods'
+    /// symbols), so the lookup runs in the enclosing MODULE's table, not
+    /// the nearest one. Returns null when no such definition exists or the
+    /// symbol is of a different kind.
+    static DataEnumDefOp lookupFrom(mlir::Operation *from,
+                                    llvm::StringRef name);
+
+    /// Returns the declaration index of the variant named `name`, or
+    /// std::nullopt when no such variant exists. Only valid on verified ops.
+    std::optional<unsigned> variantIndex(llvm::StringRef name);
+
+    /// Returns the field-name / field-type list of the variant at `index`.
+    /// Only valid on verified ops (the verifier pins the nested array
+    /// shapes these accessors cast into).
+    mlir::ArrayAttr variantFieldNames(unsigned index);
+    mlir::ArrayAttr variantFieldTypes(unsigned index);
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// EnumVariantOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_EnumVariantOp : EmitRust_Op<"enum_variant"> {
+  let summary = "Closed data-enum variant construction operation";
+  let description = [{
+    The `emitrust.enum_variant` operation constructs a value of a closed
+    data enum: it references a visible `emitrust.data_enum_def` and one of
+    its variants by name, takes exactly one operand per payload field of
+    that variant (types verified against the definition through the symbol
+    table), and produces the `!emitrust.data_enum` value. It renders as
+    the variant literal — `Name::Variant { field: value, ... }`, or the
+    bare `Name::Variant` path for a unit variant — as a `let` binding, and
+    participates in the FR-61a tail fold exactly like the other
+    let-producing expression ops (`emitrust.call_opaque`,
+    `emitrust.method_call`). It stays OUT of the FR-61d single-use
+    inlining set on purpose: Rust's expression grammar forbids a brace
+    variant literal in `if`/`match` scrutinee position, and the
+    never-parenthesized Cond rendering could not protect it.
+
+    Example:
+
+    ```mlir
+    %m = emitrust.enum_variant @Msg "Move"(%x, %y)
+        : (i32, i32) -> !emitrust.data_enum<"Msg">
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v2: Msg = Msg::Move { x: v0, y: v1 };
+    ```
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$enum_def, StrAttr:$variant,
+                       Variadic<AnyType>:$args);
+  let results = (outs EmitRust_DataEnumType:$result);
+
+  let assemblyFormat = [{
+    $enum_def $variant `(` $args `)` attr-dict
+    `:` functional-type($args, $result)
+  }];
   let hasVerifier = 1;
 }
 
@@ -1929,6 +2068,12 @@ def EmitRust_SwitchOp : EmitRust_Op<"switch", [
     inside a case is transparent with respect to an enclosing loop, exactly
     as under an `emitrust.if`.
 
+    This op is the C `switch` on integers: literal arms, no bindings, no
+    results, and a MANDATORY default arm because an integer scrutinee can
+    always miss every case. The closed-enum match with variant patterns,
+    payload bindings, and verifier-enforced exhaustiveness (no default
+    arm at all) is the separate `emitrust.match`.
+
     Example:
 
     ```mlir
@@ -1965,6 +2110,74 @@ def EmitRust_SwitchOp : EmitRust_Op<"switch", [
   // textual assembly nevertheless prints the case regions first.
   let regions = (region SizedRegion<1>:$defaultRegion,
                         VariadicRegion<SizedRegion<1>>:$caseRegions);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// MatchOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_MatchOp : EmitRust_Op<"match", [
+    SingleBlockImplicitTerminator<"emitrust::YieldOp">]> {
+  let summary = "Closed data-enum match operation";
+  let description = [{
+    The `emitrust.match` operation matches on a value of a closed data
+    enum (`!emitrust.data_enum`, defined by a visible
+    `emitrust.data_enum_def`), emitted as a Rust `match` with variant
+    patterns. It carries one case region PER VARIANT of the definition, in
+    declaration order: a closed enum makes the match exhaustive by
+    construction, so — in deliberate contrast to `emitrust.switch`, whose
+    integer scrutinee forces a mandatory default region — there is no
+    default arm at all, and the verifier enforces total coverage. Each
+    case region's single block takes one block argument per payload field
+    of its variant (types verified against the definition); the emitted
+    arm binds the fields to those names, `_`-prefixed when never read, so
+    the deny-manifest `unused_variables` lint stays clean.
+
+    The operation has two modes. In STATEMENT mode it produces no result;
+    case blocks terminate with the operand-less `emitrust.yield`, which
+    may be left out and inserted implicitly, and the match renders as a
+    statement. In RESULT mode it produces exactly one result; every case
+    block must terminate with an `emitrust.yield` carrying one value of
+    the result type, which renders as that arm's tail expression, and the
+    whole match renders as an expression: the right-hand side of a `let`,
+    or — through the FR-61a tail fold — the bare tail expression of the
+    enclosing function. An `emitrust.break` or `emitrust.continue` inside
+    a case is transparent with respect to an enclosing loop, exactly as
+    under an `emitrust.switch`.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.match %m : !emitrust.data_enum<"Msg"> -> i32
+    case "Quit" {
+      %c = emitrust.constant <0 : i32> : i32
+      emitrust.yield %c : i32
+    }
+    case "Move" (%x : i32, %y : i32) {
+      %s = emitrust.add %x, %y : i32
+      emitrust.yield %s : i32
+    }
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v1: i32 = match v0 {
+        Msg::Quit => {
+            0i32
+        }
+        Msg::Move { x: v2, y: v3 } => {
+            v2 + v3
+        }
+    };
+    ```
+  }];
+
+  let arguments = (ins EmitRust_DataEnumType:$scrutinee,
+                       StrArrayAttr:$variants);
+  let results = (outs Optional<AnyType>:$result);
+  let regions = (region VariadicRegion<SizedRegion<1>>:$caseRegions);
 
   let hasCustomAssemblyFormat = 1;
   let hasVerifier = 1;
@@ -2045,18 +2258,27 @@ def EmitRust_ContinueOp : EmitRust_Op<"continue"> {
 def EmitRust_YieldOp : EmitRust_Op<"yield",
     [Pure, Terminator,
      ParentOneOf<["IfOp", "ForOp", "LoopOp", "SwitchOp", "GlobalCellsOp",
-                  "WhileOp"]>]> {
+                  "WhileOp", "MatchOp"]>]> {
   let summary = "Block termination operation";
   let description = [{
     The `emitrust.yield` operation terminates the regions of `emitrust.if`,
-    `emitrust.for`, `emitrust.loop`, `emitrust.switch`, and
-    `emitrust.global_cells`. It takes no operands, produces no results, and
-    emits no Rust code; it exists purely to satisfy MLIR's structural
-    requirement that blocks end with a terminator, and may be omitted in
-    the custom syntax.
+    `emitrust.for`, `emitrust.loop`, `emitrust.switch`,
+    `emitrust.global_cells`, and `emitrust.match`. It produces no results.
+    In every position except a result-mode `emitrust.match` case it takes
+    no operands, emits no Rust code, exists purely to satisfy MLIR's
+    structural requirement that blocks end with a terminator, and may be
+    omitted in the custom syntax. Inside a case region of an
+    `emitrust.match` that produces a result it instead carries exactly one
+    operand — the value the case arm yields, verified by the match against
+    its result type and rendered as the arm's tail expression.
   }];
 
-  let assemblyFormat = "attr-dict";
+  let arguments = (ins Variadic<AnyType>:$results);
+
+  let builders = [OpBuilder<(ins), [{ /* operand-less terminator */ }]>];
+
+  let assemblyFormat = "($results^ `:` type($results))? attr-dict";
+  let hasVerifier = 1;
 }
 
 #endif // EMITRUST_EMITRUSTOPS

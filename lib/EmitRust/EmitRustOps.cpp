@@ -6,15 +6,17 @@
 //
 /// \file
 /// Implements the EmitRust dialect operations: the custom parsers and
-/// printers of `emitrust.func`, `emitrust.for`, `emitrust.assign`, and
-/// `emitrust.switch`, and the verifiers that enforce the dialect's
-/// invariants (mutability discipline of assignments, lvalue placement
-/// rules, at most one function result, matching return types, non-empty
-/// callee and literal strings, indirect-call signature agreement with the
-/// callee fn_ptr, loop-jump nesting, struct-, enum-, and global-definition
-/// well-formedness, symbol-checked global loads and stores, switch
-/// case/region agreement, the enum and fn_ptr comparison and cast
-/// restrictions, induction-variable typing, and the impl/method_call
+/// printers of `emitrust.func`, `emitrust.for`, `emitrust.assign`,
+/// `emitrust.switch`, and `emitrust.match`, and the verifiers that enforce
+/// the dialect's invariants (mutability discipline of assignments, lvalue
+/// placement rules, at most one function result, matching return types,
+/// non-empty callee and literal strings, indirect-call signature agreement
+/// with the callee fn_ptr, loop-jump nesting, struct-, enum-, data-enum-,
+/// and global-definition well-formedness, symbol-checked global loads,
+/// stores, and closed-enum variant constructions, switch case/region
+/// agreement, the closed-enum match's exhaustiveness and per-case
+/// binding/yield contracts, the enum, data-enum, and fn_ptr comparison and
+/// cast restrictions, induction-variable typing, and the impl/method_call
 /// receiver shape).
 //
 //===----------------------------------------------------------------------===//
@@ -461,6 +463,146 @@ LogicalResult EnumDefOp::verify() {
       return emitOpError("variant value ")
              << value
              << " is negative but the enum has an unsigned underlying type";
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// DataEnumDefOp
+//===----------------------------------------------------------------------===//
+
+DataEnumDefOp DataEnumDefOp::lookupFrom(Operation *from, llvm::StringRef name) {
+  // Definitions are module children, but `from` may live inside a nested
+  // symbol table (an `emitrust.impl` method), so resolve in the enclosing
+  // module's table; fall back to the nearest table for unattached IR.
+  auto nameAttr = StringAttr::get(from->getContext(), name);
+  if (auto module = from->getParentOfType<ModuleOp>())
+    return dyn_cast_or_null<DataEnumDefOp>(
+        SymbolTable::lookupSymbolIn(module, nameAttr));
+  return SymbolTable::lookupNearestSymbolFrom<DataEnumDefOp>(from, nameAttr);
+}
+
+std::optional<unsigned> DataEnumDefOp::variantIndex(llvm::StringRef name) {
+  for (auto [index, attr] : llvm::enumerate(getVariantNames()))
+    if (cast<StringAttr>(attr).getValue() == name)
+      return index;
+  return std::nullopt;
+}
+
+ArrayAttr DataEnumDefOp::variantFieldNames(unsigned index) {
+  return cast<ArrayAttr>(getVariantFieldNames()[index]);
+}
+
+ArrayAttr DataEnumDefOp::variantFieldTypes(unsigned index) {
+  return cast<ArrayAttr>(getVariantFieldTypes()[index]);
+}
+
+/// Verifies that the three variant arrays have the same non-zero length,
+/// that variant names are non-empty and unique, that each per-variant
+/// field-name / field-type pair is a same-length list of non-empty,
+/// per-variant-unique strings and valid struct-field types (the closed
+/// enum's payload set is exactly the struct_def field set — all `Copy`),
+/// pinning the nested array shapes the `variantField*` accessors and the
+/// emitter cast into.
+LogicalResult DataEnumDefOp::verify() {
+  ArrayAttr names = getVariantNames();
+  ArrayAttr fieldNameLists = getVariantFieldNames();
+  ArrayAttr fieldTypeLists = getVariantFieldTypes();
+  if (names.size() != fieldNameLists.size())
+    return emitOpError("has ")
+           << names.size() << " variant names but " << fieldNameLists.size()
+           << " variant field-name lists";
+  if (names.size() != fieldTypeLists.size())
+    return emitOpError("has ")
+           << names.size() << " variant names but " << fieldTypeLists.size()
+           << " variant field-type lists";
+  if (names.empty())
+    return emitOpError("must have at least one variant");
+
+  llvm::StringSet<> seenVariants;
+  for (auto [nameAttr, fieldNamesAttr, fieldTypesAttr] :
+       llvm::zip_equal(names, fieldNameLists, fieldTypeLists)) {
+    StringRef name = cast<StringAttr>(nameAttr).getValue();
+    if (name.empty())
+      return emitOpError("variant names must not be empty");
+    if (!seenVariants.insert(name).second)
+      return emitOpError("duplicate variant name \"") << name << "\"";
+
+    auto fieldNames = dyn_cast<ArrayAttr>(fieldNamesAttr);
+    if (!fieldNames || !llvm::all_of(fieldNames, [](Attribute a) {
+          return isa<StringAttr>(a);
+        }))
+      return emitOpError("variant \"")
+             << name << "\" field names must be an array of strings";
+    auto fieldTypes = dyn_cast<ArrayAttr>(fieldTypesAttr);
+    if (!fieldTypes || !llvm::all_of(fieldTypes, [](Attribute a) {
+          return isa<TypeAttr>(a);
+        }))
+      return emitOpError("variant \"")
+             << name << "\" field types must be an array of types";
+    if (fieldNames.size() != fieldTypes.size())
+      return emitOpError("variant \"")
+             << name << "\" has " << fieldNames.size() << " field names but "
+             << fieldTypes.size() << " field types";
+
+    llvm::StringSet<> seenFields;
+    for (auto [fieldNameAttr, fieldTypeAttr] :
+         llvm::zip_equal(fieldNames, fieldTypes)) {
+      StringRef fieldName = cast<StringAttr>(fieldNameAttr).getValue();
+      if (fieldName.empty())
+        return emitOpError("variant \"")
+               << name << "\" field names must not be empty";
+      if (!seenFields.insert(fieldName).second)
+        return emitOpError("duplicate field name \"")
+               << fieldName << "\" in variant \"" << name << "\"";
+      Type fieldType = cast<TypeAttr>(fieldTypeAttr).getValue();
+      if (!isValidStructFieldType(fieldType))
+        return emitOpError("invalid field type ")
+               << fieldType << " in variant \"" << name << "\"";
+    }
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// EnumVariantOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies through the symbol table that the referenced symbol is a
+/// visible `emitrust.data_enum_def` declaring the named variant, that the
+/// result type references that same enum, and that the operands match the
+/// variant's payload fields in count and types.
+LogicalResult EnumVariantOp::verify() {
+  DataEnumDefOp def = DataEnumDefOp::lookupFrom(getOperation(), getEnumDef());
+  if (!def)
+    return emitOpError("references '@")
+           << getEnumDef() << "' which is not a visible "
+           << "emitrust.data_enum_def";
+  auto resultType = cast<DataEnumType>(getResult().getType());
+  if (resultType.getName() != getEnumDef())
+    return emitOpError("result type ")
+           << resultType << " does not reference enum '@" << getEnumDef()
+           << "'";
+  std::optional<unsigned> index = def.variantIndex(getVariant());
+  if (!index)
+    return emitOpError("references unknown variant \"")
+           << getVariant() << "\" of '@" << getEnumDef() << "'";
+  ArrayAttr fieldNames = def.variantFieldNames(*index);
+  ArrayAttr fieldTypes = def.variantFieldTypes(*index);
+  if (getArgs().size() != fieldTypes.size())
+    return emitOpError("variant \"")
+           << getVariant() << "\" has " << fieldTypes.size()
+           << " fields, but the construction supplies " << getArgs().size()
+           << " operands";
+  for (auto [i, operand, fieldNameAttr, fieldTypeAttr] :
+       llvm::enumerate(getArgs(), fieldNames, fieldTypes)) {
+    Type fieldType = cast<TypeAttr>(fieldTypeAttr).getValue();
+    if (operand.getType() != fieldType)
+      return emitOpError("operand #")
+             << i << " has type " << operand.getType() << ", but field \""
+             << cast<StringAttr>(fieldNameAttr).getValue()
+             << "\" of variant \"" << getVariant() << "\" has type "
+             << fieldType;
   }
   return success();
 }
@@ -967,6 +1109,12 @@ LogicalResult SliceOfOp::verify() {
 /// `Option<fn(...)>` has no meaningful ordering.
 LogicalResult CmpOp::verify() {
   Type operandType = getLhs().getType();
+  // A CLOSED data enum derives no PartialEq (a struct payload field has
+  // none to derive), so no comparison can render; reject here with a
+  // located diagnostic instead of failing later in rustc.
+  if (isa<DataEnumType>(operandType))
+    return emitOpError("data_enum operands are not comparable (a closed "
+                       "data enum derives no PartialEq)");
   if (!isa<EnumType, FnPtrType>(operandType))
     return success();
   CmpPredicate predicate = getPredicate();
@@ -998,6 +1146,12 @@ LogicalResult CastOp::verify() {
   if (isa<FnPtrType>(getSource().getType()) ||
       isa<FnPtrType>(getResult().getType()))
     return emitOpError("cannot cast a fn_ptr type");
+  // A CLOSED data enum has no raw-storage channel: unlike the open enum's
+  // tuple struct there is no `.0` to project or value-preserving
+  // constructor to call, so no `as` conversion exists in either direction.
+  if (isa<DataEnumType>(getSource().getType()) ||
+      isa<DataEnumType>(getResult().getType()))
+    return emitOpError("cannot cast a data_enum type");
   return success();
 }
 
@@ -1210,6 +1364,196 @@ LogicalResult SwitchOp::verify() {
     if (!seen.insert(value).second)
       return emitOpError("has duplicate case value ") << value;
   }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// MatchOp
+//===----------------------------------------------------------------------===//
+
+/// Parses a match in the form
+/// `emitrust.match %m : type` followed by an optional `-> resultType`
+/// (result mode) and one `case "Variant" (%a : T, ...) { ... }` group per
+/// variant (the parenthesized block-argument list is omitted for a unit
+/// variant), then an optional attribute dictionary. Missing
+/// `emitrust.yield` terminators are inserted implicitly (statement mode's
+/// operand-less form; a result-mode case must spell out its
+/// value-carrying yield, which the verifier enforces).
+ParseResult MatchOp::parse(OpAsmParser &parser, OperationState &result) {
+  Builder &builder = parser.getBuilder();
+
+  OpAsmParser::UnresolvedOperand scrutinee;
+  Type type;
+  if (parser.parseOperand(scrutinee) || parser.parseColonType(type) ||
+      parser.resolveOperand(scrutinee, type, result.operands))
+    return failure();
+
+  if (succeeded(parser.parseOptionalArrow())) {
+    Type resultType;
+    if (parser.parseType(resultType))
+      return failure();
+    result.addTypes(resultType);
+  }
+
+  SmallVector<Attribute> variantNames;
+  while (succeeded(parser.parseOptionalKeyword("case"))) {
+    std::string variant;
+    if (parser.parseString(&variant))
+      return failure();
+    variantNames.push_back(builder.getStringAttr(variant));
+    SmallVector<OpAsmParser::Argument> args;
+    if (succeeded(parser.parseOptionalLParen())) {
+      if (failed(parser.parseOptionalRParen())) {
+        do {
+          OpAsmParser::Argument arg;
+          if (parser.parseArgument(arg, /*allowType=*/true))
+            return failure();
+          args.push_back(arg);
+        } while (succeeded(parser.parseOptionalComma()));
+        if (parser.parseRParen())
+          return failure();
+      }
+    }
+    Region *caseRegion = result.addRegion();
+    if (parser.parseRegion(*caseRegion, args))
+      return failure();
+    MatchOp::ensureTerminator(*caseRegion, builder, result.location);
+  }
+  result.addAttribute(getVariantsAttrName(result.name),
+                      builder.getArrayAttr(variantNames));
+
+  if (parser.parseOptionalAttrDict(result.attributes))
+    return failure();
+  return success();
+}
+
+/// Prints the match: the scrutinee with its type, `-> resultType` in
+/// result mode, and one `case "Variant"` group per case region with its
+/// block-argument bindings. Terminators print only in result mode, where
+/// they carry the arm's yielded value; statement mode hides the implicit
+/// operand-less yields exactly like `emitrust.switch`.
+void MatchOp::print(OpAsmPrinter &p) {
+  p << ' ' << getScrutinee() << " : " << getScrutinee().getType();
+  bool hasResult = getResult() != Value();
+  if (hasResult)
+    p << " -> " << getResult().getType();
+  for (auto [variant, region] :
+       llvm::zip(getVariants(), getCaseRegions())) {
+    p.printNewline();
+    p << "case " << variant << ' ';
+    Block &block = region.front();
+    if (block.getNumArguments() != 0) {
+      p << '(';
+      llvm::interleaveComma(block.getArguments(), p, [&](BlockArgument arg) {
+        p.printRegionArgument(arg);
+      });
+      p << ") ";
+    }
+    p.printRegion(region, /*printEntryBlockArgs=*/false,
+                  /*printBlockTerminators=*/hasResult);
+  }
+  p.printOptionalAttrDict((*this)->getAttrs(),
+                          /*elidedAttrs=*/{getVariantsAttrName()});
+}
+
+/// Verifies the closed-enum match contract: the scrutinee's type resolves
+/// to a visible `emitrust.data_enum_def`; the cases cover EVERY variant of
+/// that definition in declaration order (exhaustiveness — there is no
+/// default arm to fall back to); each case region binds exactly its
+/// variant's payload fields as block arguments of the declared types; and
+/// the terminators match the mode — operand-less yields on a match without
+/// a result, exactly one yielded value of the result type per case on a
+/// match with one.
+LogicalResult MatchOp::verify() {
+  auto enumType = cast<DataEnumType>(getScrutinee().getType());
+  DataEnumDefOp def =
+      DataEnumDefOp::lookupFrom(getOperation(), enumType.getName());
+  if (!def)
+    return emitOpError("scrutinee type ")
+           << enumType << " requires a visible emitrust.data_enum_def";
+
+  ArrayAttr variants = getVariants();
+  if (getCaseRegions().size() != variants.size())
+    return emitOpError("has ")
+           << getCaseRegions().size() << " case regions but "
+           << variants.size() << " case variants";
+  ArrayAttr declared = def.getVariantNames();
+  if (variants.size() != declared.size())
+    return emitOpError("has ")
+           << variants.size() << " cases but '" << enumType.getName()
+           << "' declares " << declared.size()
+           << " variants (a closed-enum match is exhaustive and has no "
+              "default arm)";
+  for (auto [index, pair] :
+       llvm::enumerate(llvm::zip_equal(variants, declared))) {
+    StringRef caseName = cast<StringAttr>(std::get<0>(pair)).getValue();
+    StringRef declName = cast<StringAttr>(std::get<1>(pair)).getValue();
+    if (caseName != declName)
+      return emitOpError("case #")
+             << index << " is \"" << caseName << "\" but '"
+             << enumType.getName() << "' declares \"" << declName
+             << "\" here (cases follow declaration order)";
+  }
+
+  bool hasResult = getResult() != Value();
+  for (auto [index, region] : llvm::enumerate(getCaseRegions())) {
+    StringRef caseName =
+        cast<StringAttr>(variants[index]).getValue();
+    ArrayAttr fieldNames = def.variantFieldNames(index);
+    ArrayAttr fieldTypes = def.variantFieldTypes(index);
+    Block &block = region.front();
+    if (block.getNumArguments() != fieldTypes.size())
+      return emitOpError("case \"")
+             << caseName << "\" region must have " << fieldTypes.size()
+             << " block arguments (one per variant field), but has "
+             << block.getNumArguments();
+    for (auto [argIndex, arg, fieldNameAttr, fieldTypeAttr] :
+         llvm::enumerate(block.getArguments(), fieldNames, fieldTypes)) {
+      Type fieldType = cast<TypeAttr>(fieldTypeAttr).getValue();
+      if (arg.getType() != fieldType)
+        return emitOpError("case \"")
+               << caseName << "\" block argument #" << argIndex
+               << " has type " << arg.getType() << ", but field \""
+               << cast<StringAttr>(fieldNameAttr).getValue()
+               << "\" has type " << fieldType;
+    }
+    auto yield = dyn_cast<YieldOp>(block.getTerminator());
+    if (!yield)
+      return emitOpError("case \"")
+             << caseName << "\" must be terminated by emitrust.yield";
+    if (!hasResult) {
+      if (!yield.getResults().empty())
+        return emitOpError("case \"")
+               << caseName
+               << "\" must not yield a value on a match without a result";
+      continue;
+    }
+    if (yield.getResults().size() != 1)
+      return emitOpError("case \"")
+             << caseName
+             << "\" must yield exactly one value of the match result type";
+    if (yield.getResults().front().getType() != getResult().getType())
+      return emitOpError("case \"")
+             << caseName << "\" yields "
+             << yield.getResults().front().getType()
+             << " but the match result type is " << getResult().getType();
+  }
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// YieldOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that operands appear only inside an `emitrust.match` case (the
+/// one position where a yield carries a value — the match's own verifier
+/// pins the count and type against its result). Everywhere else the yield
+/// is the operand-less structural terminator it always was.
+LogicalResult YieldOp::verify() {
+  if (getResults().empty())
+    return success();
+  if (!isa<MatchOp>((*this)->getParentOp()))
+    return emitOpError("operands are only supported inside an emitrust.match");
   return success();
 }
 

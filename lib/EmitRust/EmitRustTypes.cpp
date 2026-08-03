@@ -283,3 +283,15 @@ LogicalResult emitrust::EnumType::verify(
     return emitError() << "expected non empty name in !emitrust.enum type";
   return success();
 }
+
+//===----------------------------------------------------------------------===//
+// DataEnumType
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the data-enum reference carries a non-empty name.
+LogicalResult emitrust::DataEnumType::verify(
+    llvm::function_ref<InFlightDiagnostic()> emitError, llvm::StringRef name) {
+  if (name.empty())
+    return emitError() << "expected non empty name in !emitrust.data_enum type";
+  return success();
+}
