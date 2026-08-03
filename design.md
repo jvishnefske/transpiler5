@@ -2880,6 +2880,56 @@ of references or inheritance, so it precedes both.
   (slice 1 closed the gap) and adding the additive `renderActorPlan`
   declaration beside the frozen types.
 
+  SLICE 5a LANDED (2026-08-03; box stays OPEN): the closed data-enum
+  surface — three new ops + emitter support, purely additive (all 470
+  pre-existing tests byte-identical; suite 474/474). Op names:
+  `emitrust.data_enum_def` (module-level Symbol; variant names + parallel
+  per-variant field-name/field-type lists, unit variants allowed, field
+  types = the struct_def Copy set), `emitrust.enum_variant`
+  (symbol-ref + variant attr + one operand per field, arity/types
+  verified through the def), `emitrust.match` (scrutinee + one case
+  region PER VARIANT with the variant's fields as verified block
+  arguments). TYPE decision: a NEW `!emitrust.data_enum<"Name">` type,
+  NOT a reuse of `!emitrust.enum` — the open type's consumers bake
+  tuple-struct semantics in WITHOUT symbol resolution (cast's `.0`
+  projection, cmp's derived-PartialEq `==`, variable/struct-field
+  `Name::default()`, enum_raw), so reuse would have demanded closed-kind
+  rejection lookups in five existing paths, any missed one degrading to
+  a rustc-time or silent-semantics failure; the distinct type inverts
+  the failure direction — every existing consumer already rejects it
+  located — and cmp/cast additionally name it in explicit rejections.
+  Def lookups resolve in the enclosing MODULE's symbol table
+  (`DataEnumDefOp::lookupFrom`), not the nearest one, because
+  `emitrust.impl` is itself a SymbolTable and match sites live inside
+  methods. DERIVE set (measured, rustc experiment + emitted-golden
+  compile under the full deny manifest): `#[derive(Clone, Copy)]` only —
+  no `Default` (a closed enum has no canonical default, in documented
+  contrast to struct_def's unconditional one; pinned fallback if a
+  consumer ever needs it: first variant when unit) and no `PartialEq`
+  (a struct payload field derives none). EXHAUSTIVENESS contract: the
+  verifier requires the case list to equal the def's variants exactly
+  and in declaration order — no default arm exists at all (documented
+  contrast with `emitrust.switch`'s mandatory `_ =>`), so rustc sees a
+  totally covered match. RESULT-MODE integration: `emitrust.yield` gained
+  variadic operands (legal only under match, one value of the result
+  type per case, rendered as the arm's tail expression); the match and
+  the construction joined `isTailFoldableProducer` so `let r = match ...`
+  and bare function-tail `match`/variant-literal both render (FR-61a),
+  while the construction stays OUT of FR-61d inlining (a brace variant
+  literal is illegal in Rust's never-parenthesized scrutinee positions);
+  variant fields, the scrutinee, and the match yield are classified
+  FR-61d consumer positions, and unused pattern bindings reuse the
+  `_`-prefix naming so `unused_variables` stays deny-clean. Tests:
+  round-trip in test/Dialect/EmitRust/data-enum.mlir, 26 verifier
+  negatives in data-enum-invalid.mlir (incl. the open-enum-as-closed
+  wrong-kind probe), emission goldens in test/Target/Rust/data-enum.mlir
+  (def, construction in let/call-arg/tail, statement match, result match
+  in let and as function tail), and the actor-handle integration golden
+  test/Target/Rust/data-enum-actor.mlir (struct + impl + `&mut self`
+  statement-match handler + `&self` result-match accessor + driver),
+  whose emitted crate was compiled and RUN under the deny manifest
+  (exit 5 = payload(Move{2,3}), correct).
+
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
