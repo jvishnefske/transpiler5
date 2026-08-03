@@ -1951,6 +1951,39 @@ of references or inheritance, so it precedes both.
     `while`/`while let` where the SCF lowering's shape allows (172 corpus
     `loop {`s; SPIKE FIRST -- the condition prefix is statements, not an
     expression, so only a prefix-free subset lifts mechanically).
+    SPIKE 61c-0 (2026-08-03): NO-GO for the emitter-side mechanical lift;
+    the premise is measured false. Census of ALL 303 `emitrust.loop`s
+    (EndToEnd 195 + c-testsuite 108, post-61d/61e shapes, classified in
+    `emitLoop` against the live inlinedOps/droppedOps sets so "prefix-free"
+    means what the emitter actually prints):
+      - bucket A (front `if c { break }`, prefix fully consumed,
+        mechanically liftable): 0 -- the shape DOES NOT EXIST; the SCF
+        lowering always renders the body-if BEFORE the exit test.
+      - B_scf_tail_assigns (canonical destruction shape: cond binding,
+        deferred carried lets, body-if with else-defaults, tail
+        `if c == false { exit copies; break }`, backedge assigns):
+        289 (95%). Not emitter-liftable: the exit copies and else-defaults
+        read values scoped INSIDE the loop, and Rust's `while` has no
+        exit-edge slot to put them.
+      - B_scf_tail_plain (tail break-if, no exit copies): 14 (5%) -- all
+        impure-condition loops (`while ((c = fgetc(f)) != EOF)`): the
+        condition prefix contains calls, so idiomatic Rust for them IS
+        `loop { .. break }`; no lift wanted.
+      - C/D (front-break-with-assigns, non-if shapes, while-let): 0.
+    The bucket-A prototype (structural `cond == false` negation fold,
+    while-head from the 61d capture map, prefix consumed through
+    emitDropOrCapture) is implemented and byte-inert on the whole corpus
+    (443/443, EndToEnd 123/123) precisely because bucket A is empty --
+    kept as the census instrument (EMITRUST_LOOP_CENSUS) and as the
+    rendering skeleton for the real fix.
+    DESIGN CONSTRAINT for a future slice: the lift belongs BEFORE
+    SSA-destruction, not after. An `emitrust.while` op (condition region
+    yielding i1 + body region) emitted at SCF-conversion time -- where the
+    loop-carried values are still SSA and the exit copies do not exist
+    yet -- would turn ~95% of today's loops (the B_scf_tail_assigns
+    bucket) into genuine `while <cond> { .. }` renderings, with the
+    impure-condition 5% legitimately staying `loop`. That is an
+    importer/conversion FR, out of emitter scope.
   - [x] 61d Expression-tree inlining: fold single-use scalar `let vN`
     temporaries into their one consumer where evaluation order provably
     cannot change (loads/pure ops only; SPIKE FIRST -- this is the largest
