@@ -29,6 +29,7 @@ set(LIBS
   MLIRLowerContainers
   MLIRConvertToEmitRust
   MLIREmitRustLowerExternalRequirements
+  MLIREmitRustActorLift
   MLIRControlFlowToSCF
   MLIRTransforms
   MLIRFuncDialect

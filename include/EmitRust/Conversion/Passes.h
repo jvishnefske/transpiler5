@@ -11,14 +11,15 @@
 /// convert-ub-to-emitrust, convert-arith-to-emitrust,
 /// convert-func-to-emitrust, convert-scf-to-emitrust,
 /// convert-to-emitrust, emitrust-lower-external-requirements,
-/// emitrust-range-refinement-check, and emitrust-value-identity-check passes
-/// with the global pass registry.
+/// emitrust-actor-lift, emitrust-range-refinement-check, and
+/// emitrust-value-identity-check passes with the global pass registry.
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef EMITRUST_CONVERSION_PASSES_H
 #define EMITRUST_CONVERSION_PASSES_H
 
+#include "EmitRust/Conversion/ActorLift.h"
 #include "EmitRust/Conversion/ArithToEmitRust.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/FuncToEmitRust.h"

@@ -70,6 +70,13 @@ lib_lower_external_requirements = static_library(
   link_with: [libemitrust_dialect],
   dependencies: common_deps)
 
+lib_actor_lift = static_library('MLIREmitRustActorLift',
+  'Conversion/ActorLift/ActorLift.cpp',
+  include_directories: emitrust_inc,
+  cpp_args: emitrust_cpp_args,
+  link_with: [libemitrust_dialect],
+  dependencies: common_deps)
+
 # Bake clang's builtin-header resource dir in as EMITRUST_CLANG_RESOURCE_DIR,
 # same as the CMake configure-time probe; EMITRUST_RESOURCE_DIR still wins at
 # run time, and a missing clang just omits the define.
