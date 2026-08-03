@@ -1,0 +1,105 @@
+rejection report: 110571 rejected items in 130 of 130 translation units
+rank 1. other  items=58971  tus=130
+  first: ././include/linux/compiler_types.h:174:2
+  24789x unsupported: call to unimported function '<name>'
+  7135x unsupported: volatile-qualified type
+  6337x unsupported: void pointer parameter
+  3819x unsupported pointer cast (ArrayToPointerDecay)
+  2727x unsupported: incomplete struct type
+  2664x unsupported: pointer type outside a parameter position
+  1518x unsupported pointer target expression
+  1060x unsupported pointer expression: CStyleCastExpr
+  1003x unsupported: union type
+  842x unsupported: the address of a scalar object cannot be passed as a slice parameter
+  781x unsupported: pointer struct member assigned a non-address value
+  519x unsupported: null pointer constant in a pointer expression
+  516x unsupported: pointer parameter used outside a direct dereference
+  499x unsupported pointer expression: StmtExpr
+  468x unsupported: assignment to this pointer expression
+  353x unsupported pointer expression: CallExpr
+  336x unsupported: statement expression of a non-scalar type
+  333x unsupported: union arm cannot alias the storage slot
+  297x unsupported: statement expression without a final expression statement
+  279x unsupported: taking the address of a global variable
+  224x unsupported: non-constant array size
+  223x unsupported cast (PointerToIntegral)
+  201x unsupported: aggregate initializer element
+  195x unsupported: string function argument must designate a char array
+  148x unsupported: va_list type
+  141x unsupported: reference to an unknown variable
+  137x unsupported declaration inside a function body
+  126x unsupported: aliasing mutable pointer arguments (two arguments borrow object '<name>')
+  117x unsupported: function pointer result type
+  116x unsupported cast (BitCast)
+  100x unsupported: argument type does not match the pointer parameter
+  97x unsupported: GNU case range
+  97x unsupported: union with a bit-field arm
+  96x unsupported: anonymous bit-field member
+  91x unsupported: union byte-array arm access
+  86x unsupported: union with a pointer arm
+  84x unsupported: pointer-typed global variable
+  67x unsupported: extern local variable
+  65x unsupported: comparison of pointers into different objects
+  44x unsupported: pointer struct member initializer in a nested aggregate
+  44x unsupported: union with an unnamed arm
+  37x unsupported: passing a pointer into a global variable to a function
+  34x unsupported: sizeof of a struct with bit-fields
+  28x unsupported: bit-field member '<name>' in this context
+  20x unsupported: return with a value in a void function
+  18x unsupported: pointer variable '<name>' has no known target object
+  10x unsupported: pointer-typed global variable with external linkage in a multi-file project
+  7x unsupported: enumerator value does not fit in i32
+  7x unsupported: global initializer does not match its type
+  6x unsupported: a string-cursor argument must be the address of a decomposed pointer local
+  6x unsupported: argument element type does not match the slice parameter
+  6x unsupported: arithmetic on the address of a scalar object
+  3x unsupported: slice parameter element type '<name>'
+  3x unsupported: taking the address of a pointer variable
+  2x unsupported: ++/-- on this pointer expression
+  2x unsupported: global initializer for this type
+  2x unsupported: va_list escapes variadic definition
+  2x unsupported: zero-width bit-field member
+  1x unsupported subscript index type
+  1x unsupported: _Bool conversion
+  1x unsupported: non-printable or non-ASCII byte in printf '<name>' string literal
+  1x unsupported: return value type mismatch
+rank 2. rejected-type-cascade  items=31895  tus=130
+  first: ././include/linux/compiler_types.h:188:28
+  31895x unsupported: struct '<name>' was rejected, so a type naming it cannot be imported
+rank 3. unsupported-stmt:GCCAsmStmt  items=8120  tus=116
+  first: ./arch/x86/include/asm/shared/io.h:22:1
+  8120x unsupported statement: GCCAsmStmt
+rank 4. returned-pointer  items=5437  tus=127
+  first: ./include/linux/compiler.h:213:2
+  4858x unsupported: returned pointer value (only a returned function address has a representation; a cursor into a callee-local region would dangle)
+  576x unsupported: pointer return type
+  3x unsupported: returned pointer value (a member address is not a whole-global base)
+rank 5. self-ref-pointer-member  items=2917  tus=67
+  first: ./include/linux/list.h:153:13
+  2917x unsupported: pointer struct member '<name>' is used outside the static-binding model
+rank 6. pointer-local-nonaddress  items=1225  tus=92
+  first: /tmp/claude-1000/-home-j-src-transpiler5/8b2ba09b-10ca-4825-8671-3a60f87e8e36/scratchpad/linux-corpus/linux-6.6.94/arch/x86/boot/boot.h:80:18
+  1225x unsupported: pointer assigned a non-address value
+rank 7. ptr-to-ptr  items=1166  tus=89
+  first: /tmp/claude-1000/-home-j-src-transpiler5/8b2ba09b-10ca-4825-8671-3a60f87e8e36/scratchpad/linux-corpus/linux-6.6.94/arch/x86/boot/compressed/../string.h:28:66
+  1143x unsupported: pointer-to-pointer parameter
+  23x unsupported: pointer-to-pointer parameter escapes the string-cursor shape
+rank 8. variadic-cross-tu  items=488  tus=97
+  first: ./arch/x86/include/asm/alternative.h:145:2
+  486x unsupported: call to a variadic function
+  2x unsupported: variadic function definition
+rank 9. unsupported-top-level-decl  items=277  tus=70
+  first: /tmp/claude-1000/-home-j-src-transpiler5/8b2ba09b-10ca-4825-8671-3a60f87e8e36/scratchpad/linux-corpus/linux-6.6.94/arch/x86/entry/vdso/vdso-image-32.c:414:1
+  277x unsupported top-level declaration
+rank 10. unsupported-expr:OffsetOfExpr  items=68  tus=68
+  first: ./arch/x86/include/asm/ptrace.h:334:6
+  68x unsupported expression: OffsetOfExpr
+rank 11. unsupported-stmt:AttributedStmt  items=4  tus=2
+  first: /tmp/claude-1000/-home-j-src-transpiler5/8b2ba09b-10ca-4825-8671-3a60f87e8e36/scratchpad/linux-corpus/linux-6.6.94/arch/x86/boot/cmdline.c:57:4
+  4x unsupported statement: AttributedStmt
+rank 12. unsupported-expr:BinaryConditionalOperator  items=2  tus=2
+  first: /tmp/claude-1000/-home-j-src-transpiler5/8b2ba09b-10ca-4825-8671-3a60f87e8e36/scratchpad/linux-corpus/linux-6.6.94/arch/x86/lib/delay.c:209:22
+  2x unsupported expression: BinaryConditionalOperator
+rank 13. strchr-result-bind  items=1  tus=1
+  first: /tmp/claude-1000/-home-j-src-transpiler5/8b2ba09b-10ca-4825-8671-3a60f87e8e36/scratchpad/linux-corpus/linux-6.6.94/lib/base64.c:81:19
+  1x unsupported: pointer assigned a non-address value
