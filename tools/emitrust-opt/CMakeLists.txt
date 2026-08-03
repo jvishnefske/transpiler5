@@ -16,6 +16,7 @@ set(LIBS
   MLIRConvertToEmitRust
   MLIREmitRustLowerExternalRequirements
   MLIREmitRustActorLift
+  MLIREmitRustActorThread
 )
 
 add_llvm_executable(emitrust-opt emitrust-opt.cpp)

@@ -34,4 +34,18 @@
 #define GET_OP_CLASSES
 #include "EmitRust/EmitRustOps.h.inc"
 
+namespace mlir {
+namespace emitrust {
+
+/// Returns whether `type` may cross an actor thread boundary as a message
+/// payload or reply value: exactly the `emitrust.struct_def` field-validity
+/// set (scalar, array, struct, open enum, fn_ptr, trusted Copy opaque),
+/// every member of which is `Copy + Send`. Shared by the
+/// `emitrust.actor_runtime` verifier and the `emitrust-actor-thread`
+/// eligibility veto so the two can never disagree (FR-62 slice 5b).
+bool isSendableActorType(Type type);
+
+} // namespace emitrust
+} // namespace mlir
+
 #endif // EMITRUST_EMITRUSTOPS_H

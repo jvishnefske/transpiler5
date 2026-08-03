@@ -387,4 +387,43 @@ def EmitRustActorLift : Pass<"emitrust-actor-lift", "ModuleOp"> {
   let dependentDialects = ["::mlir::emitrust::EmitRustDialect"];
 }
 
+//===----------------------------------------------------------------------===//
+// EmitRustActorThread
+//===----------------------------------------------------------------------===//
+
+def EmitRustActorThread : Pass<"emitrust-actor-thread", "ModuleOp"> {
+  let summary = "Rewrite lifted actors to the threaded-runtime shape (FR-62)";
+  let description = [{
+    FR-62 slice 5b: rewrites each actor listed in the driver-computed
+    `emitrust.actor_thread` module attribute (see
+    EmitRust/Conversion/ActorThread.h for the contract) from the
+    emitrust-actor-lift output shape into the threaded driver shape — runs
+    strictly AFTER emitrust-actor-lift at the pipeline tail:
+
+    - the driver's direct member/subscript accesses of the actor local
+      become synthesized `get_<field>`/`set_<field>` accessor methods
+      (ordinary impl funcs, scalar and scalar-array-element forms) called
+      at the original access sites, order-preserving;
+    - the actor local is retyped to the opaque `<Actor>Handle` and
+      constructed by `<Actor>Handle::spawn(<Actor>::default())`; slice-4
+      post-construction member-assign initializers become `set_` calls
+      through the same accessor rewrite;
+    - `.shutdown()` is inserted before every driver return (graceful join +
+      panic-provenance propagation, the E3 clean form);
+    - one `emitrust.actor_runtime` anchor per actor, placed after the impl,
+      carries the mode for the emitter's runtime synthesis.
+
+    A listed actor whose struct_def, impl, or constructing driver local is
+    absent is skipped silently (it was lift-demoted — never lifted, so it
+    keeps today's thread_local form). A lifted-but-thread-ineligible actor
+    (cross-client `!emitrust.mut_ref`, unsendable method signature, driver
+    access with no accessor form, accessor-name collision) stays lifted
+    same-thread with a located
+    `warning: actor plan: <actor> stays same-thread: <reason>`;
+    demote-from-threading is not demote-from-lifting. The pass is a NO-OP
+    on a module without the attribute.
+  }];
+  let dependentDialects = ["::mlir::emitrust::EmitRustDialect"];
+}
+
 #endif // EMITRUST_CONVERSION_PASSES
