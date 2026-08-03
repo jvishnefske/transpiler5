@@ -6,7 +6,9 @@
 // that a global read and a global written from the same function produce
 // BOTH a `ReadsGlobal` and a `WritesGlobal` edge, that taking a function's
 // address from a global initializer is a `TakesAddressOf` edge out of the
-// GLOBAL's node, and that a global's own declared type is a `SigType` edge.
+// GLOBAL's node, that taking a GLOBAL's address (`&origin`) records
+// `AddressOfGlobal` alongside the historical `ReadsGlobal` (FR-62), and
+// that a global's own declared type is a `SigType` edge.
 // RUN: emitrust-cc --emit=item-graph %s -o - | FileCheck %s
 
 enum Level { LOW, HIGH };
@@ -43,16 +45,16 @@ struct Branch origin;
 
 int main(void) { return measure(&origin); }
 
-// CHECK:      node Branch kind=record def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:18:8
-// CHECK-NEXT: node Chain kind=record def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:23:8
-// CHECK-NEXT: node HOOK kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:40:7
-// CHECK-NEXT: node Leaf kind=record def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:14:8
-// CHECK-NEXT: node Level kind=enum def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:12:6
-// CHECK-NEXT: node ORIGIN kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:42:15
-// CHECK-NEXT: node TOTAL kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:27:5
-// CHECK-NEXT: node TU0_SCRATCH kind=global def=1 linkage=intern tu=0 loc={{.*}}item-graph-types.c:28:12
-// CHECK-NEXT: node c_main kind=function def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:44:5
-// CHECK-NEXT: node measure kind=function def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:32:5
+// CHECK:      node Branch kind=record def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:20:8
+// CHECK-NEXT: node Chain kind=record def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:25:8
+// CHECK-NEXT: node HOOK kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:42:7
+// CHECK-NEXT: node Leaf kind=record def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:16:8
+// CHECK-NEXT: node Level kind=enum def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:14:6
+// CHECK-NEXT: node ORIGIN kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:44:15
+// CHECK-NEXT: node TOTAL kind=global def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:29:5
+// CHECK-NEXT: node TU0_SCRATCH kind=global def=1 linkage=intern tu=0 loc={{.*}}item-graph-types.c:30:12
+// CHECK-NEXT: node c_main kind=function def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:46:5
+// CHECK-NEXT: node measure kind=function def=1 linkage=extern tu=0 loc={{.*}}item-graph-types.c:34:5
 
 // A record's field types are Field edges; a self-referential record's
 // pointer field is a self-edge, not a dropped one -- but a `FieldIndirect`
@@ -74,6 +76,9 @@ int main(void) { return measure(&origin); }
 
 // CHECK-NEXT: edge c_main -> measure kind=Calls
 // CHECK-NEXT: edge c_main -> ORIGIN kind=ReadsGlobal
+// `&origin` additionally records the address-taking, sorted last in
+// c_main's block (AddressOfGlobal is appended to the kind enumeration).
+// CHECK-NEXT: edge c_main -> ORIGIN kind=AddressOfGlobal
 
 // Signature types versus body-only mentions, and the read/write split:
 // `total += ...` is both, `scratch = total` writes scratch and reads total.

@@ -129,6 +129,8 @@ llvm::StringRef mlir::emitrust::edgeKindName(EdgeKind kind) {
     return "TakesAddressOf";
   case EdgeKind::FieldIndirect:
     return "FieldIndirect";
+  case EdgeKind::AddressOfGlobal:
+    return "AddressOfGlobal";
   }
   return "Unknown";
 }
@@ -281,8 +283,16 @@ private:
   /// they sit in down to `g` while the SUBSCRIPT expression itself is an
   /// ordinary read. Anything that is not a designator chain rooted at a
   /// global is handed back to the ordinary walk.
+  ///
+  /// `addressOf` rides alongside `reads`/`writes` down the same designator
+  /// chain: it is set by the two contexts whose result is a POINTER INTO
+  /// the designated object (`&` and array-to-pointer decay used as a
+  /// value), so the rooted global additionally records `AddressOfGlobal`
+  /// (FR-62) — always on top of the `ReadsGlobal` those contexts have
+  /// recorded since before the kind existed.
   void collectLValueDependencies(const clang::Expr *expr, llvm::StringRef from,
-                                 bool reads, bool writes);
+                                 bool reads, bool writes,
+                                 bool addressOf = false);
 
   //===--------------------------------------------------------------------===//
   // Symbols and edges
@@ -561,7 +571,8 @@ void ItemGraphBuilder::collectTypeEdges(clang::QualType type,
 
 void ItemGraphBuilder::collectLValueDependencies(const clang::Expr *expr,
                                                  llvm::StringRef from,
-                                                 bool reads, bool writes) {
+                                                 bool reads, bool writes,
+                                                 bool addressOf) {
   if (!expr)
     return;
   const clang::Expr *stripped = expr->IgnoreParenImpCasts();
@@ -577,19 +588,25 @@ void ItemGraphBuilder::collectLValueDependencies(const clang::Expr *expr,
         addEdge(from, symbol, EdgeKind::WritesGlobal);
       if (reads)
         addEdge(from, symbol, EdgeKind::ReadsGlobal);
+      if (addressOf)
+        addEdge(from, symbol, EdgeKind::AddressOfGlobal);
     }
     return;
   }
   // A designator chain propagates the access context to its base object and
   // is otherwise an ordinary expression: `g.a[i] = 1` writes `g`, while `i`
-  // is read by the subscript, not written by the assignment.
+  // is read by the subscript, not written by the assignment. `addressOf`
+  // propagates too: `&g.a` and `&g[i]` hand out a pointer into `g`'s
+  // storage just as `&g` does.
   if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(stripped)) {
-    collectLValueDependencies(member->getBase(), from, reads, writes);
+    collectLValueDependencies(member->getBase(), from, reads, writes,
+                              addressOf);
     return;
   }
   if (const auto *subscript =
           llvm::dyn_cast<clang::ArraySubscriptExpr>(stripped)) {
-    collectLValueDependencies(subscript->getBase(), from, reads, writes);
+    collectLValueDependencies(subscript->getBase(), from, reads, writes,
+                              addressOf);
     collectStmtDependencies(subscript->getIdx(), from);
     return;
   }
@@ -646,10 +663,40 @@ void ItemGraphBuilder::collectStmtDependencies(const clang::Stmt *stmt,
     }
     if (unary->getOpcode() == clang::UO_AddrOf) {
       // `&g` is a reference to the object that does not itself store to it,
-      // so it counts as a read; `&f` is the address-taken case handled by
-      // the DeclRefExpr arm below.
+      // so it counts as a read — and the pointer it hands out is the
+      // global's address escaping, the `AddressOfGlobal` fact (FR-62); `&f`
+      // is the address-taken case handled by the DeclRefExpr arm below.
       collectLValueDependencies(unary->getSubExpr(), from, /*reads=*/true,
-                                /*writes=*/false);
+                                /*writes=*/false, /*addressOf=*/true);
+      return;
+    }
+  }
+
+  // A subscript READ in ordinary (rvalue) position: route it through the
+  // lvalue walk so the base's array-to-pointer decay is consumed by the
+  // subscript rather than reaching the decay arm below — `g[i]` reads `g`,
+  // it does not take its address, because no pointer value survives the
+  // subscript. The lvalue walk propagates the read to the base designator
+  // chain and walks the index as an ordinary expression, exactly as it
+  // already does for a subscript inside an assignment's LHS.
+  if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(stmt)) {
+    collectLValueDependencies(subscript, from, /*reads=*/true,
+                              /*writes=*/false);
+    return;
+  }
+
+  // An array-to-pointer decay that SURVIVES as a value (returned, passed as
+  // an argument, stored, fed to pointer arithmetic — every decay except a
+  // subscript base, which the arm above consumes) hands out a pointer to
+  // the array's storage: for a global array that is the address escaping,
+  // recorded as `AddressOfGlobal` on top of the historical `ReadsGlobal`
+  // (FR-62). A function-to-pointer decay is a different cast kind and keeps
+  // its `TakesAddressOf` path through the DeclRefExpr arm below.
+  if (const auto *implicitCast = llvm::dyn_cast<clang::ImplicitCastExpr>(stmt)) {
+    if (implicitCast->getCastKind() == clang::CK_ArrayToPointerDecay) {
+      collectLValueDependencies(implicitCast->getSubExpr(), from,
+                                /*reads=*/true, /*writes=*/false,
+                                /*addressOf=*/true);
       return;
     }
   }
