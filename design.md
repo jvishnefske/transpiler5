@@ -2984,6 +2984,65 @@ of references or inheritance, so it precedes both.
   certified cluster (E1 precedent — each lift kills a thread_local and
   reads better); the flip's only gate is the byte-diff suite.
 
+  SLICE 4 STAGE A LANDED (2026-08-03; box stays OPEN — the stage-B
+  default flip is still pending its corpus-wide byte-diff run). The lift
+  is `emitrust-actor-lift`, a module pass in lib/Conversion/ActorLift
+  run by emitrust-cc strictly after the pinned pipeline under
+  `--actor-lift` (default OFF; valid with --emit=mlir/rust/crate), and
+  registered like every conversion pass so emitrust-opt exercises it in
+  isolation. ARCHITECTURE SEAM: the pass consumes ONLY discardable
+  attributes (module `emitrust.actor_lift`/`emitrust.actor_locals`,
+  function `emitrust.actor_arm`/`actor_cross`/`actor_driver` — contract
+  in Conversion/ActorLift.h) and the DRIVER computes them
+  (tools/emitrust-cc/ActorLiftPlan.cpp): certification needs graph facts
+  (TakesAddressOf) and CSymbolNaming.h names, neither of which belongs
+  in a conversion library, and hand-written attributed MLIR makes the
+  opt-level goldens trivial (test/Conversion/ActorLift/{globals,
+  threading,cross,demote}.mlir). The pure planner gained two ADDITIVE
+  fields beside the frozen E5 types, render format untouched:
+  `ActorFunction::crossActors` (the sorted per-client parameter list)
+  and `Actor::poisoned` (poison-merge vs ordinary condensation, so a
+  pure writer-rule @stdout merge stays certifiable). NAMING RULES as
+  landed: actor type = UpperCamel(plan name) + "Actor" (COUNTER ->
+  CounterActor; an actor NAMED @stdout takes its smallest real global's
+  name); driver local / cross param = snake(base) + "_actor"; field =
+  snake(global symbol); a lifted static cell drops its owner's mangle
+  prefix (ACCUMULATE_TOTAL owned by accumulate -> field `total`), and a
+  FREE function's cells (owner called only by the driver, never
+  address-taken) seed a synthesized actor named after the owner
+  (AccumulateActor/accumulate_actor); driver-only actors (no arms, no
+  cross clients, all uses in c_main) lower to NAMED main locals
+  carrying their C initializers — E1's main-only rule, so globals.c's
+  limit/ratio/c render `let mut limit: i32 = 50;`. WHAT DEMOTES: the
+  five spike rules, evaluated 1->4 with rule 5 (--link demote-all,
+  per-actor warnings from the stored shard graphs) in the driver's link
+  branch; every demotion prints `warning: actor plan: demoted <actor>:
+  <reason>` and rule 1 adds a located remark at the address-taking
+  function (actor-lift-fnptr.c pins both, over the rule-2 poison the
+  same program also triggers). Two guards beyond the table, found by
+  the corpus smoke: a synthesized type name colliding with an existing
+  symbol demotes, and the pass's own IR-level veto demotes any actor
+  whose owned global has a use outside the attributed surface OR whose
+  arm touches a mutable global it does not own — the shape
+  importer-synthesized `_BACKING` string arrays produce
+  (pointers-global.c demotes TActor and stays byte-diff green).
+  SNAPSHOT ELISION: implemented, mechanical, separately pinned
+  (globals.mlir's poke_table): an anonymous staging variable whose
+  every whole-value fill is a single-use load of ONE pass-created
+  member place and whose every whole-value load feeds a single
+  writeback assign to that same place collapses onto the member;
+  everything else keeps the sound 1:1 whole-member load/assign
+  fallback. Validation: the three spike programs as EndToEnd byte-diff
+  twins (actor-lift-globals/-threading/-cross.c) plus the two demotion
+  twins (-fnptr, -variadic) all diff green against clang natives;
+  driver goldens pin the emitted readability contract
+  (test/Driver/actor-lift-rust.c — bump IS the spike's two-line body —
+  and actor-lift-link.c), and a 107-program --emit=rust smoke over
+  test/EndToEnd plus 10 representative cargo byte-diffs
+  (pointers-global, globals-writeback-order, byte-region-walk, owners,
+  varargs-monomorph, fn-pointers, ...) ran green off-suite. Flag off =
+  zero drift: all 478 pre-existing tests byte-identical, suite 485/485.
+
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
