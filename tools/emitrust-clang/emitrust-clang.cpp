@@ -449,6 +449,15 @@ static bool computeAndLogSrcHash(const CompileJob &job,
   return true;
 }
 
+/// The job's input path made absolute for the artifact's `emitrust.source`
+/// record: the link step re-imports from whatever directory the link runs
+/// in, so a cwd-relative path the build used would dangle there.
+static std::string absoluteInputPath(const CompileJob &job) {
+  llvm::SmallString<256> path(job.input);
+  llvm::sys::fs::make_absolute(path);
+  return std::string(path);
+}
+
 /// Serializes `module` as MLIR bytecode to `<output>.emitrust.mlirbc` and
 /// embeds that payload into the object file as its `.emitrust` section (the
 /// sidecar stays as the non-ELF fallback and the easy-inspection path).
@@ -511,7 +520,8 @@ static void emitRejectedTuArtifact(const CompileJob &job,
         mlir::emitrust::classifyBlocker(diagnostic, loc), /*stubbed=*/false,
         ""});
   }
-  mlir::emitrust::attachShardMetadata(*module, "", ledger.getItems());
+  mlir::emitrust::attachShardMetadata(*module, "", ledger.getItems(),
+                                      absoluteInputPath(job), job.importArgs);
   writeAndEmbedArtifact(*module, job, log);
 }
 
@@ -596,7 +606,8 @@ static void sideEmitArtifact(const CompileJob &job, llvm::raw_ostream *log) {
     return;
   }
   mlir::emitrust::attachShardMetadata(*module, graph->print(),
-                                      ledger.getItems());
+                                      ledger.getItems(),
+                                      absoluteInputPath(job), job.importArgs);
 
   writeAndEmbedArtifact(*module, job, log);
 }

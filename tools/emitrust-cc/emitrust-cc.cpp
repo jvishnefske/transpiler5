@@ -767,15 +767,173 @@ static bool loadLinkShards(llvm::ArrayRef<std::string> inputs,
   return true;
 }
 
-/// `loadLinkShards` + FR-57d surfacing + the FR-58 merge: the full `--link`
-/// module path. Before the shards are consumed by the merge, each shard's
-/// rejection-ledger entries (recorded by the shim's recovering import and
-/// carried in the artifact, see EmitRust/ShardMetadata.h) are printed in
-/// the same summary format the joint import uses, prefixed with the shard
-/// they came from — per-TU attribution is exactly the fact FR-58's
-/// selective re-import of fact-starved items needs, so it must survive to
-/// the link step's own report. The merge itself then strips the metadata,
-/// keeping the merged module byte-comparable to the joint import's.
+/// FR-58 selective re-import of fact-starved items. A solo shard whose
+/// ledger carries a MEASURED fact-starvation rejection (an extern pointer
+/// global the solo import could not type; see design.md FR-58 SPIKE 2 and
+/// the re-import spike) is grouped with every shard whose ITEM GRAPH
+/// defines the missing global — the graph records the definition even when
+/// the defining shard's module never materialized the item — and each
+/// group's member SOURCES (recorded in the artifacts' `emitrust.source`)
+/// are re-imported JOINTLY at link time through the same recover +
+/// defer-externals import and pinned pipeline the shim runs. The group
+/// module then stands in for its member shards, with an ordinal map
+/// carrying its members' link-line positions so the merge renames its
+/// group-relative `tu<k>_` tags onto the ordinals the whole-project joint
+/// import would have used.
+///
+/// Every failure DEGRADES rather than fails: a shard with no recorded
+/// source, group members whose recorded import args differ (a joint
+/// `importCProject` applies ONE arg list to all TUs), or a re-import/
+/// pipeline failure each warn and leave the original shards — the link
+/// then produces exactly what it produced before selective re-import
+/// existed (ledgered stubs that fail loudly if executed).
+///
+/// \param shards the loaded link-line shards; group members are replaced
+///        in place (the group module lands at its first member's position,
+///        later members are dropped).
+/// \param context the context every module lives in.
+/// \param ordinalMaps receives one tag-ordinal map per surviving shard,
+///        parallel to the updated `shards`.
+static void reimportFactStarvedGroups(
+    llvm::SmallVectorImpl<LoadedShard> &shards, mlir::MLIRContext &context,
+    llvm::SmallVectorImpl<llvm::SmallVector<unsigned>> &ordinalMaps) {
+  size_t count = shards.size();
+  llvm::SmallVector<unsigned> parent(count);
+  for (unsigned i = 0; i < count; ++i)
+    parent[i] = i;
+  auto findRoot = [&](unsigned x) {
+    while (parent[x] != x) {
+      parent[x] = parent[parent[x]];
+      x = parent[x];
+    }
+    return x;
+  };
+
+  bool anyGroup = false;
+  for (unsigned i = 0; i < count; ++i) {
+    for (const mlir::emitrust::RejectedItem &item :
+         mlir::emitrust::getShardRejections(*shards[i].module)) {
+      if (!emitrustcc::isFactStarvedDiagnostic(item.diagnostic))
+        continue;
+      for (const std::string &name :
+           emitrustcc::factStarvedObjectNames(item.symbol, item.diagnostic)) {
+        std::string emitted = mlir::emitrust::globalRustName(name);
+        for (unsigned j = 0; j < count; ++j) {
+          if (j == i)
+            continue;
+          std::optional<llvm::StringRef> graph =
+              mlir::emitrust::getShardItemGraph(*shards[j].module);
+          if (graph && emitrustcc::itemGraphDefinesGlobal(*graph, emitted)) {
+            parent[findRoot(i)] = findRoot(j);
+            anyGroup = true;
+          }
+        }
+      }
+    }
+  }
+
+  if (!anyGroup) {
+    for (unsigned i = 0; i < count; ++i)
+      ordinalMaps.push_back({i});
+    return;
+  }
+
+  // Root -> sorted member positions; only multi-member components form
+  // re-import groups (a starved shard with no discovered definer has no
+  // facts to gain).
+  llvm::SmallVector<llvm::SmallVector<unsigned>> members(count);
+  for (unsigned i = 0; i < count; ++i)
+    members[findRoot(i)].push_back(i);
+
+  // Attempt each group's joint re-import; a failed group degrades to its
+  // original member shards.
+  llvm::SmallVector<std::optional<LoadedShard>> groupModule(count);
+  llvm::SmallVector<bool> grouped(count, false);
+  for (unsigned root = 0; root < count; ++root) {
+    llvm::SmallVector<unsigned> &group = members[root];
+    if (group.size() < 2)
+      continue;
+    llvm::sort(group);
+
+    std::vector<std::string> paths;
+    std::vector<std::string> args;
+    std::string groupLabel;
+    bool viable = true;
+    for (unsigned position : group) {
+      std::optional<mlir::emitrust::ShardSource> source =
+          mlir::emitrust::getShardSource(*shards[position].module);
+      if (!source) {
+        llvm::errs() << "warning: cannot re-import fact-starved group: '"
+                     << shards[position].name
+                     << "' records no source facts; keeping its stubs\n";
+        viable = false;
+        break;
+      }
+      if (paths.empty()) {
+        args = source->args;
+      } else if (args != source->args) {
+        llvm::errs() << "warning: cannot re-import fact-starved group: "
+                        "members' recorded import args differ ('"
+                     << shards[position].name << "'); keeping the stubs\n";
+        viable = false;
+        break;
+      }
+      paths.push_back(source->path);
+      groupLabel += (groupLabel.empty() ? "" : " + ") + source->path;
+    }
+    if (!viable)
+      continue;
+
+    llvm::errs() << "link-time re-import: " << groupLabel << "\n";
+    mlir::emitrust::RejectionLedger reimportLedger;
+    mlir::emitrust::ImportOptions options;
+    options.recover = true;
+    options.deferExternals = true;
+    options.ledger = &reimportLedger;
+    mlir::OwningOpRef<mlir::ModuleOp> module =
+        mlir::emitrust::importCProject(paths, args, options, context);
+    if (!module || mlir::failed(runPipeline(*module))) {
+      llvm::errs() << "warning: link-time re-import of " << groupLabel
+                   << " failed; keeping the original shards\n";
+      continue;
+    }
+    if (!reimportLedger.empty()) {
+      llvm::errs() << "link-time re-import of " << groupLabel << ": ";
+      reimportLedger.printSummary(llvm::errs());
+    }
+    groupModule[root] =
+        LoadedShard{std::move(module), ("re-import(" + groupLabel + ")")};
+    for (unsigned position : group)
+      grouped[position] = true;
+  }
+
+  llvm::SmallVector<LoadedShard> result;
+  for (unsigned position = 0; position < count; ++position) {
+    unsigned root = findRoot(position);
+    if (grouped[position]) {
+      // The group module stands at its FIRST member's position and carries
+      // its members' link-line positions as the tag-ordinal map.
+      if (position == members[root].front()) {
+        result.push_back(std::move(*groupModule[root]));
+        ordinalMaps.push_back(members[root]);
+      }
+      continue;
+    }
+    result.push_back(std::move(shards[position]));
+    ordinalMaps.push_back({position});
+  }
+  shards = std::move(result);
+}
+
+/// `loadLinkShards` + FR-57d surfacing + FR-58 selective re-import + the
+/// FR-58 merge: the full `--link` module path. Before the shards are
+/// consumed by the merge, each shard's rejection-ledger entries (recorded
+/// by the shim's recovering import and carried in the artifact, see
+/// EmitRust/ShardMetadata.h) are printed in the same summary format the
+/// joint import uses, prefixed with the shard they came from; the
+/// fact-starved subset then drives `reimportFactStarvedGroups`. The merge
+/// itself strips the metadata, keeping the merged module byte-comparable
+/// to the joint import's.
 ///
 /// \param inputs the link-line object/archive/shard paths, in link order.
 /// \param context the context to parse and merge in.
@@ -787,8 +945,6 @@ loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
   llvm::SmallVector<LoadedShard> shards;
   if (!loadLinkShards(inputs, context, shards))
     return nullptr;
-  llvm::SmallVector<mlir::OwningOpRef<mlir::ModuleOp>> modules;
-  modules.reserve(shards.size());
   for (LoadedShard &shard : shards) {
     llvm::SmallVector<mlir::emitrust::RejectedItem> rejections =
         mlir::emitrust::getShardRejections(*shard.module);
@@ -799,10 +955,15 @@ loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
       llvm::errs() << "shard '" << shard.name << "': ";
       shardLedger.printSummary(llvm::errs());
     }
-    modules.push_back(std::move(shard.module));
   }
+  llvm::SmallVector<llvm::SmallVector<unsigned>> ordinalMaps;
+  reimportFactStarvedGroups(shards, context, ordinalMaps);
+  llvm::SmallVector<mlir::OwningOpRef<mlir::ModuleOp>> modules;
+  modules.reserve(shards.size());
+  for (LoadedShard &shard : shards)
+    modules.push_back(std::move(shard.module));
   mlir::FailureOr<mlir::OwningOpRef<mlir::ModuleOp>> merged =
-      emitrustcc::mergeLinkShards(modules);
+      emitrustcc::mergeLinkShards(modules, ordinalMaps);
   if (mlir::failed(merged))
     return nullptr;
   return std::move(*merged);

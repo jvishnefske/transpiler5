@@ -185,19 +185,37 @@ static std::string printOpToString(Operation *op) {
   return text;
 }
 
-/// Step 1: alpha-renames shard-local `tu0_`/`TU0_` tags on `shard`'s
-/// module-level symbols to `ordinal`, rewriting symbol uses (globals are
-/// referenced by `FlatSymbolRefAttr`) and `emitrust.call_opaque` callees
-/// (which reference functions by plain string, not by symbol use, so
-/// `SymbolTable::replaceAllSymbolUses` cannot see them).
+/// Step 1: alpha-renames the per-TU tags on `shard`'s module-level symbols
+/// per `ordinalMap` (internal ordinal k renames to global ordinal
+/// `ordinalMap[k]`), rewriting symbol uses (globals are referenced by
+/// `FlatSymbolRefAttr`) and `emitrust.call_opaque` callees (which
+/// reference functions by plain string, not by symbol use, so
+/// `SymbolTable::replaceAllSymbolUses` cannot see them). A solo shard's
+/// map is the single element [ordinal]; a re-imported group's map lists
+/// its members' link-line positions.
 ///
-/// Collisions cannot arise from the rename itself: every renamed name
-/// carries this shard's unique ordinal, and a tag with any OTHER ordinal —
-/// which a solo import can never have assigned — is rejected here rather
-/// than renamed into a potential clash.
-static LogicalResult renameShardTags(ModuleOp shard, unsigned ordinal) {
-  llvm::StringMap<std::string> renames;
-  llvm::SmallVector<Operation *> renamedOps;
+/// Collision freedom: the map is required strictly increasing, so every
+/// target ordinal is >= its source (a TU's link-line position counts at
+/// least its group-internal predecessors), and the renames are applied in
+/// DESCENDING source-ordinal order — by the time source k renames to
+/// map[k], any source tag with a higher ordinal (which map[k] might equal)
+/// has already been renamed away. Callee strings are rewritten from a map
+/// keyed by ORIGINAL names after all symbol renames, so they cannot be
+/// captured by a name that became someone else's target in between.
+static LogicalResult renameShardTags(ModuleOp shard,
+                                     llvm::ArrayRef<unsigned> ordinalMap) {
+  for (size_t k = 1; k < ordinalMap.size(); ++k)
+    if (ordinalMap[k] <= ordinalMap[k - 1])
+      return shard.emitError()
+             << "link-shard ordinal map is not strictly increasing";
+
+  struct Rename {
+    Operation *op;
+    unsigned sourceOrdinal;
+    std::string newName;
+  };
+  llvm::SmallVector<Rename> renames;
+  llvm::StringMap<std::string> calleeRenames;
   for (Operation &op : shard.getBody()->getOperations()) {
     auto symbol = dyn_cast<SymbolOpInterface>(&op);
     if (!symbol)
@@ -206,33 +224,37 @@ static LogicalResult renameShardTags(ModuleOp shard, unsigned ordinal) {
     std::optional<TuTag> tag = parseTuTag(name);
     if (!tag)
       continue;
-    if (tag->ordinal != 0)
+    if (tag->ordinal >= ordinalMap.size())
       return op.emitError()
              << "shard symbol '" << name << "' carries per-TU tag ordinal "
-             << tag->ordinal
-             << "; a solo-imported shard may only carry 'tu0_'";
-    if (ordinal == 0)
-      continue; // tu0_ -> tu0_ is a no-op.
-    renames[name] = ((tag->upper ? "TU" : "tu") + llvm::Twine(ordinal) + "_" +
-                     tag->rest)
-                        .str();
-    renamedOps.push_back(&op);
+             << tag->ordinal << "; this shard covers only "
+             << ordinalMap.size() << " translation unit(s)";
+    unsigned target = ordinalMap[tag->ordinal];
+    if (target == tag->ordinal)
+      continue; // tu<k>_ -> tu<k>_ is a no-op.
+    std::string newName = ((tag->upper ? "TU" : "tu") + llvm::Twine(target) +
+                           "_" + tag->rest)
+                              .str();
+    calleeRenames[name] = newName;
+    renames.push_back({&op, tag->ordinal, std::move(newName)});
   }
   if (renames.empty())
     return success();
-  for (Operation *op : renamedOps) {
-    auto symbol = cast<SymbolOpInterface>(op);
-    StringAttr newName =
-        StringAttr::get(shard.getContext(), renames[symbol.getName()]);
-    if (failed(SymbolTable::replaceAllSymbolUses(op, newName, shard)))
-      return op->emitError()
+  llvm::stable_sort(renames, [](const Rename &a, const Rename &b) {
+    return a.sourceOrdinal > b.sourceOrdinal;
+  });
+  for (const Rename &rename : renames) {
+    auto symbol = cast<SymbolOpInterface>(rename.op);
+    StringAttr newName = StringAttr::get(shard.getContext(), rename.newName);
+    if (failed(SymbolTable::replaceAllSymbolUses(rename.op, newName, shard)))
+      return rename.op->emitError()
              << "cannot rewrite uses of shard symbol '" << symbol.getName()
              << "' at link";
-    SymbolTable::setSymbolName(op, newName);
+    SymbolTable::setSymbolName(rename.op, newName);
   }
   shard.walk([&](emitrust::CallOpaqueOp call) {
-    auto it = renames.find(call.getCallee());
-    if (it != renames.end())
+    auto it = calleeRenames.find(call.getCallee());
+    if (it != calleeRenames.end())
       call.setCallee(it->second);
   });
   return success();
@@ -241,18 +263,32 @@ static LogicalResult renameShardTags(ModuleOp shard, unsigned ordinal) {
 } // namespace
 
 FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
-    llvm::MutableArrayRef<OwningOpRef<ModuleOp>> shards) {
+    llvm::MutableArrayRef<OwningOpRef<ModuleOp>> shards,
+    llvm::ArrayRef<llvm::SmallVector<unsigned>> ordinalMaps) {
+  if (!ordinalMaps.empty() && ordinalMaps.size() != shards.size()) {
+    if (!shards.empty())
+      (*shards.front())->emitError()
+          << "link-shard ordinal maps do not match the shard count";
+    return failure();
+  }
+
   // Step 0: strip the FR-57 shard metadata (item-graph text, rejection
-  // ledger) from every shard. It is a per-TU fact the caller has already
-  // surfaced; the merged whole-program module must stay byte-comparable to
-  // the joint import's, which never carries it.
+  // ledger, source facts) from every shard. It is a per-TU fact the caller
+  // has already surfaced; the merged whole-program module must stay
+  // byte-comparable to the joint import's, which never carries it.
   for (OwningOpRef<ModuleOp> &shard : shards)
     emitrust::stripShardMetadata(*shard);
 
-  // Step 1: per-shard alpha-rename to global ordinals.
-  for (auto [index, shard] : llvm::enumerate(shards))
-    if (failed(renameShardTags(*shard, static_cast<unsigned>(index))))
+  // Step 1: per-shard alpha-rename to global ordinals (the positional
+  // default when the caller supplied no maps).
+  for (auto [index, shard] : llvm::enumerate(shards)) {
+    unsigned positional[1] = {static_cast<unsigned>(index)};
+    llvm::ArrayRef<unsigned> map =
+        ordinalMaps.empty() ? llvm::ArrayRef<unsigned>(positional)
+                            : llvm::ArrayRef<unsigned>(ordinalMaps[index]);
+    if (failed(renameShardTags(*shard, map)))
       return failure();
+  }
 
   // One pass over every module-level op of every shard, in link-line order,
   // classifying: definitions (for steps 2 and 3), marked declarations
@@ -340,4 +376,56 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
   if (failed(verify(merged)))
     return failure();
   return std::move(shards.front());
+}
+
+//===----------------------------------------------------------------------===//
+// FR-58 selective re-import: fact-starvation detection
+//===----------------------------------------------------------------------===//
+
+/// The two MEASURED fact-starvation wordings (design.md FR-58, SPIKE 2 and
+/// the re-import spike): both are produced by the importer's pointer
+/// classification exactly when the target object's shape was out of the
+/// solo import's reach. They are matched as substrings of the ledgered
+/// diagnostic, the same posture `classifyBlocker`'s tables take toward
+/// importer wordings.
+static constexpr llvm::StringLiteral kPointerGlobalDiag =
+    "unsupported: pointer-typed global variable";
+static constexpr llvm::StringLiteral kNoTargetObjectDiag =
+    "has no known target object";
+
+bool emitrustcc::isFactStarvedDiagnostic(llvm::StringRef diagnostic) {
+  return diagnostic.contains(kPointerGlobalDiag) ||
+         diagnostic.contains(kNoTargetObjectDiag);
+}
+
+llvm::SmallVector<std::string>
+emitrustcc::factStarvedObjectNames(llvm::StringRef symbol,
+                                   llvm::StringRef diagnostic) {
+  llvm::SmallVector<std::string> names;
+  if (diagnostic.contains(kPointerGlobalDiag))
+    // The rejected item IS the pointer global; its own C spelling names
+    // the object whose shape is missing.
+    names.push_back(symbol.str());
+  if (diagnostic.contains(kNoTargetObjectDiag)) {
+    // "pointer variable 'X' has no known target object": X is quoted.
+    size_t open = diagnostic.find('\'');
+    if (open != llvm::StringRef::npos) {
+      size_t close = diagnostic.find('\'', open + 1);
+      if (close != llvm::StringRef::npos && close > open + 1)
+        names.push_back(diagnostic.slice(open + 1, close).str());
+    }
+  }
+  return names;
+}
+
+bool emitrustcc::itemGraphDefinesGlobal(llvm::StringRef graphText,
+                                        llvm::StringRef symbol) {
+  // One graph line per item, `node <symbol> kind=global def=1 ...`; every
+  // field is a whole space-separated token (the format's stated grep
+  // contract), so a prefix match on the three leading tokens is exact.
+  std::string needle = ("node " + symbol + " kind=global def=1 ").str();
+  for (llvm::StringRef line : llvm::split(graphText, '\n'))
+    if (line.starts_with(needle))
+      return true;
+  return false;
 }

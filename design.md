@@ -1954,11 +1954,8 @@ of references or inheritance, so it precedes both.
   and shape-conflict link errors are located diagnostics
   (test/Driver/link-merge-errors.c); the shard tag is pinned in
   test/Driver/emitrust-clang-shim.c. Shape equality is print-to-string for
-  now (OperationEquivalence is the upgrade). Still open for the checkbox:
-  `ar` archive members, selective re-import of fact-starved items (extern
-  pointer globals, SPIKE 2's constraint), owner-planning
-  `soleTranslationUnit` divergence, indexed collision scans at 10^3+ TUs,
-  and FR-59 workspace partitioning.
+  now (OperationEquivalence is the upgrade). (The still-open list lives at
+  the end of the newest LANDED entry below.)
   SPIKE (design constraints found, all three from one probe -- importing the
   two `multi-tu.c` TUs solo vs jointly): (1) BLOCKER: a solo import of a TU
   referencing an extern global defined in ANOTHER TU hard-fails even under
@@ -2000,9 +1997,51 @@ of references or inheritance, so it precedes both.
   `OperationEquivalence::isEquivalentTo` (IgnoreLocations) with the same
   located error contract; same-layout different-field-name structs conflict,
   byte-identical defs dedup silently. (test/Driver/link-merge-archive.c,
-  link-merge-errors.c) Still open: selective re-import of fact-starved
-  items, the owner-planning soleTranslationUnit divergence, indexed scans
-  at 10^3+ TUs.
+  link-merge-errors.c)
+  LANDED (FR-58 selective re-import of fact-starved items). RE-IMPORT
+  SPIKE, three candidate mechanisms measured on SPIKE 2's exact shape
+  (`int arr[4]; int *cursor = arr;` in TU A, `*cursor` read in TU B):
+  merge-level synthesis (option c) is NO-GO — the defining shard's module
+  does not even carry the pointer global (the solo import materializes the
+  cursor's index global LAZILY on use, and A has no use, with an EMPTY
+  ledger), so there is no shape to copy, and the accessor's body IR was
+  never built, so there is nothing to re-admit; a facts-supplied partial
+  import (option b) collapses into (a) because typing the deref needs the
+  full pointer classification over the defining TU's AST. Mechanism landed
+  (option a, link-time selective re-import): the driver detects the two
+  MEASURED fact-starvation wordings in shards' FR-57d ledgers ("pointer-
+  typed global variable", "has no known target object" — intrinsic
+  rejections like volatile never trigger, pinned), maps the C spelling to
+  the emitted name with the pure `globalRustName`, finds the defining
+  shard through its ITEM-GRAPH text (`node <sym> kind=global def=1` — the
+  graph records what the module never materialized), union-finds the
+  groups, and re-imports each group's SOURCES jointly (recover +
+  defer-externals + pinned pipeline) from the artifacts' new
+  `emitrust.source` record (absolute path + import args, attached by the
+  shim). The group module replaces its member shards at the first member's
+  position, carrying its members' link-line positions as a tag-ordinal map
+  (`mergeLinkShards` now takes per-shard ordinal maps; the rename is
+  collision-free because the maps are strictly increasing and applied in
+  descending source order). Every failure DEGRADES with a warning to the
+  pre-re-import behavior (no source record, differing member args — a
+  joint importCProject applies one arg list — import or pipeline failure):
+  ledgered stubs that fail loudly if executed, never a broken link.
+  Pinned: the 2-TU pointer-global program links into a crate BYTE-
+  IDENTICAL to the joint import from objects and sidecars alike, stdout
+  byte-identical to the clang-built native binary, and the re-import is
+  observable on stderr (test/EndToEnd/link-reimport-e2e.c); a volatile
+  (non-starved) rejection does NOT trigger re-import
+  (test/Driver/link-merge-rejections.c); the `emitrust.source` record is
+  pinned in test/Driver/emitrust-clang-shim.c. Known limits, recorded: a
+  group whose members are non-contiguous on the link line concatenates its
+  items at the first member's position, so item ORDER can diverge from the
+  full joint import there (the executed-binary byte-diff still holds); a
+  transitively starved group (the definer itself starved on a third TU) is
+  discovered one step deep only — a persisting starvation after re-import
+  stays ledgered and stubbed, exactly as before.
+  Still open for the checkbox: owner-planning `soleTranslationUnit`
+  divergence, indexed collision scans at 10^3+ TUs, and FR-59 workspace
+  partitioning (its own FR).
   SPIKE 3 (GO -- the merge algorithm is now fully experiment-specified): on
   a shared-header project where BOTH shards carry identical
   `struct_def @Point` / `enum_def @Mode`, the mechanical merge extended
