@@ -833,14 +833,18 @@ static int emitLinkShardItemGraphs(llvm::ArrayRef<std::string> inputs,
   std::string text;
   llvm::raw_string_ostream os(text);
   for (auto [index, shard] : llvm::enumerate(shards)) {
-    llvm::StringRef graph = mlir::emitrust::getShardItemGraph(*shard.module);
-    if (graph.empty()) {
+    std::optional<llvm::StringRef> graph =
+        mlir::emitrust::getShardItemGraph(*shard.module);
+    if (!graph) {
       llvm::errs() << "error: shard '" << shard.name
                    << "' carries no item-graph metadata (artifact predates "
                       "FR-57d?)\n";
       return 1;
     }
-    os << "shard " << index << " '" << shard.name << "'\n" << graph;
+    // A present-but-empty graph is a TU that contributes no items (FR-56's
+    // whole-TU target/ABI rejection): the header still prints, the body is
+    // legitimately empty.
+    os << "shard " << index << " '" << shard.name << "'\n" << *graph;
   }
   return mlir::failed(writeFile(outputPath, text)) ? 1 : 0;
 }

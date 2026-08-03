@@ -52,6 +52,8 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
+#include <optional>
+
 namespace mlir {
 namespace emitrust {
 
@@ -94,13 +96,16 @@ inline void attachShardMetadata(ModuleOp module, llvm::StringRef itemGraphText,
   module->setAttr(kRejectionsAttrName, ArrayAttr::get(context, entries));
 }
 
-/// The shard's item-graph text, or an empty StringRef when the module
-/// carries none (an artifact from before metadata support). The returned
-/// StringRef points into the MLIRContext and outlives the module.
-inline llvm::StringRef getShardItemGraph(ModuleOp module) {
+/// The shard's item-graph text, or `std::nullopt` when the module carries
+/// no such attribute (an artifact from before metadata support). A PRESENT
+/// but EMPTY text is meaningful and distinct from absence: it is the
+/// artifact of a TU that deliberately contributes no items (FR-56's
+/// whole-TU target/ABI rejection). The returned StringRef points into the
+/// MLIRContext and outlives the module.
+inline std::optional<llvm::StringRef> getShardItemGraph(ModuleOp module) {
   if (auto attr = module->getAttrOfType<StringAttr>(kItemGraphAttrName))
     return attr.getValue();
-  return llvm::StringRef();
+  return std::nullopt;
 }
 
 /// Decodes the shard's rejection-ledger entries back into `RejectedItem`s,
