@@ -43,10 +43,13 @@ emitrust.impl "Owner_main_arr" {
 emitrust.func @c_main() -> i32 {
   // CHECK: let mut v0: Owner_main_arr = Owner_main_arr::default();
   %o = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>
+  // The index constant is used twice, so it keeps its binding; the
+  // single-use value constant inlines (suffixed) into the call (FR-61d).
+  // CHECK: let v1: i64 = 2;
   %i = emitrust.constant <2 : i64> : i64
   %v = emitrust.constant <7 : i32> : i32
   // Method call without a result: a bare statement on the owner place.
-  // CHECK: v0.fill(v1, v2);
+  // CHECK: v0.fill(v1, 7i32);
   emitrust.method_call %o["fill"] (%i, %v) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64, i32) -> ()
   // Method call with a result feeding the final return: FR-61a folds the
   // binding and the call expression becomes the tail expression.

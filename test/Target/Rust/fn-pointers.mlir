@@ -5,13 +5,14 @@
 // and fn_ptr struct fields and globals render like every other field type.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s --strict-whitespace
 
-// CHECK:      fn types(v0: Option<fn(i32, i32) -> i32>, _v1: Option<fn()>, _v2: Option<fn() -> i32>, _v3: Option<fn(Option<fn(i32) -> i32>) -> Option<fn() -> i32>>) {
+// The unused alias let drops (FR-61d), un-reading the parameter; the
+// signature carries the pinned Option<fn..> spellings.
+// CHECK:      fn types(_v0: Option<fn(i32, i32) -> i32>, _v1: Option<fn()>, _v2: Option<fn() -> i32>, _v3: Option<fn(Option<fn(i32) -> i32>) -> Option<fn() -> i32>>) {
 emitrust.func @types(%arg0: !emitrust.fn_ptr<(i32, i32) -> i32>,
                      %arg1: !emitrust.fn_ptr<()>,
                      %arg2: !emitrust.fn_ptr<() -> i32>,
                      %arg3: !emitrust.fn_ptr<(!emitrust.fn_ptr<(i32) -> i32>)
                                              -> !emitrust.fn_ptr<() -> i32>>) {
-  // CHECK-NEXT:    let _v4: Option<fn(i32, i32) -> i32> = v0;
   %0 = emitrust.let %arg0 : !emitrust.fn_ptr<(i32, i32) -> i32>
   emitrust.return
 }
@@ -36,11 +37,11 @@ emitrust.func @defaults() {
   %1 = emitrust.constant <#emitrust.opaque<"Some(add)">>
       : !emitrust.fn_ptr<(i32) -> i32>
   emitrust.assign %0 = %1 : !emitrust.lvalue<!emitrust.fn_ptr<(i32) -> i32>>
-  // CHECK-NEXT:    let _v2: Option<fn(i32) -> i32> = None;
+  // The None constant is never a read (the null-test consumes it
+  // structurally), so its dead binding drops (FR-61d) -- v2 stays a
+  // numbering gap.
   %2 = emitrust.constant <#emitrust.opaque<"None">>
       : !emitrust.fn_ptr<(i32) -> i32>
-  // A `!= None` comparison lowers to an Option null-test to avoid
-  // `unpredictable_function_pointer_comparisons`.
   // A `!= None` comparison lowers to an Option null-test to avoid
   // `unpredictable_function_pointer_comparisons`.
   // CHECK-NEXT:    let _v3: bool = v1.is_some();

@@ -22,13 +22,18 @@
 /// bindings are `_`-prefixed, a dead initializer is dropped in favor of
 /// Rust's deferred initialization (`let v: T;`), entry-block dead stores are
 /// elided, and `mut` is emitted only for bindings that are actually mutated.
-/// Two expression-oriented renderings keep the output rustacean (FR-61): the
+/// Expression-oriented renderings keep the output rustacean (FR-61): the
 /// function-final `return v;` renders as the tail expression `v` -- folding
 /// away a single-use binding defined by the immediately preceding let-
 /// producing op -- and a function-final `return;` is omitted (FR-61a); a
 /// deferred `let x: T;` whose immediately following `if` assigns `x` exactly
 /// once at the end of both arms renders as an if-expression binding
-/// `let x: T = if c { .. } else { .. };` (FR-61b).
+/// `let x: T = if c { .. } else { .. };` (FR-61b); a PURE single-real-use
+/// value (constant, arithmetic, comparison, cast, bitcast, load, alias let)
+/// renders inline at its consumer -- parenthesized by one precedence table
+/// (`needsParens`), numeric constants carrying literal type suffixes -- and
+/// a pure value with no emitted use at all emits nothing, cascading through
+/// pure chains (FR-61d).
 /// A drop is made only where the analysis PROVES no read on any path; a
 /// wrong drop can only surface as a hard rustc error (E0381/E0384), never as
 /// silently different behavior. Every construct that cannot be represented
@@ -57,6 +62,8 @@
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSwitch.h"
+
 #include "llvm/ADT/Twine.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
@@ -64,12 +71,105 @@
 
 #include <cassert>
 #include <charconv>
+#include <cstdlib>
 #include <string>
 #include <system_error>
 
 using namespace mlir;
 
 namespace {
+
+/// FR-61d: the precedence rank of a rendered Rust expression, mirroring the
+/// Rust reference's operator table exactly (higher binds tighter). An
+/// inlined expression carries its rank so a consumer position can decide
+/// parenthesization with one pure table (`needsParens`) instead of
+/// per-case reasoning.
+enum class Prec : int {
+  Compare = 1, ///< `== != < <= > >=` (non-associative: chains are errors)
+  BitOr = 2,   ///< `|`
+  BitXor = 3,  ///< `^`
+  BitAnd = 4,  ///< `&`
+  Shift = 5,   ///< `<< >>`
+  AddSub = 6,  ///< `+ -`
+  MulDiv = 7,  ///< `* / %`
+  Cast = 8,    ///< `expr as T`
+  Unary = 9,   ///< leading `-` or `*` (negative literal, deref-rooted load)
+  Postfix = 10 ///< atoms: names, suffixed literals, calls, `a.method(b)`
+};
+
+/// The rank as a comparable integer.
+static constexpr int precValue(Prec p) { return static_cast<int>(p); }
+
+/// FR-61d: the syntactic position an operand is rendered in. Every
+/// `emitOperand` call site names its position; the position plus the
+/// inlined expression's rank fully decides parenthesization.
+struct ExprPos {
+  enum class Kind {
+    Stmt,      ///< whole right-hand side / tail expression / assign value
+    Cond,      ///< `if`/`match` scrutinee position
+    Delimited, ///< inside `( )`, `[ ]` (call args, index without cast)
+    Receiver,  ///< before `.method(..)` or `[i]`
+    CastSource, ///< before ` as T` (appended by the consumer)
+    BinLhs,    ///< left operand of the infix operator of rank `rank`
+    BinRhs     ///< right operand of the infix operator of rank `rank`
+  };
+  Kind kind;
+  Prec rank; ///< meaningful for BinLhs/BinRhs only
+
+  static ExprPos stmt() { return {Kind::Stmt, Prec::Postfix}; }
+  static ExprPos cond() { return {Kind::Cond, Prec::Postfix}; }
+  static ExprPos delimited() { return {Kind::Delimited, Prec::Postfix}; }
+  static ExprPos receiver() { return {Kind::Receiver, Prec::Postfix}; }
+  static ExprPos castSource() { return {Kind::CastSource, Prec::Postfix}; }
+  static ExprPos binLhs(Prec rank) { return {Kind::BinLhs, rank}; }
+  static ExprPos binRhs(Prec rank) { return {Kind::BinRhs, rank}; }
+};
+
+/// The whole parenthesization policy in one pure function. The `Stmt`,
+/// `Cond`, and `Delimited` positions are exactly the ones the DENIED
+/// `unused_parens` lint watches (see tools/emitrust-cc/CrateEmitter.cpp,
+/// the `[lints.rust]` table): they never parenthesize, structurally, so no
+/// inlining decision can ever trip the lint. The remaining positions wrap
+/// by rank:
+///  - Receiver: anything looser than an atom binds the trailing `.method`
+///    / `[i]` wrongly (`-1.5f64.to_bits()` negates the call result);
+///  - CastSource: `as` accepts a postfix atom or another cast (chains are
+///    legal bare); everything else wraps -- including Unary, so a negative
+///    literal renders `(-5i32) as u32`;
+///  - BinLhs: strictly-looser operands wrap; equal ranks are left-
+///    associative and stay bare -- EXCEPT under a comparison, which is
+///    non-associative in Rust (`a == b == c` is a parse error), so equal
+///    ranks wrap there too. One grammar quirk on top of pure precedence:
+///    text ENDING in a bare cast (`.. as T`) directly left of a shift or
+///    comparison wraps even when its top-level rank binds tighter, because
+///    rustc parses `x as i64 << y`, `a << b as i64 < c` (and the `<`
+///    forms) as generic arguments on the type -- a hard error. The
+///    trailing-cast property (`endsInCast`) is tracked per captured
+///    expression, since a bare-rhs cast leaks to the end of any infix
+///    text;
+///  - BinRhs: equal-or-looser operands wrap (`a - (b - c)`).
+static bool needsParens(Prec rank, bool endsInCast, ExprPos pos) {
+  switch (pos.kind) {
+  case ExprPos::Kind::Stmt:
+  case ExprPos::Kind::Cond:
+  case ExprPos::Kind::Delimited:
+    return false;
+  case ExprPos::Kind::Receiver:
+    return precValue(rank) < precValue(Prec::Postfix);
+  case ExprPos::Kind::CastSource:
+    return rank != Prec::Postfix && rank != Prec::Cast;
+  case ExprPos::Kind::BinLhs:
+    if (endsInCast &&
+        (pos.rank == Prec::Shift || pos.rank == Prec::Compare))
+      return true; // `.. as T << ..` / `.. as T < ..`: generic-args misparse
+    return pos.rank == Prec::Compare
+               ? precValue(rank) <= precValue(pos.rank)
+               : precValue(rank) < precValue(pos.rank);
+  case ExprPos::Kind::BinRhs:
+    return precValue(rank) <= precValue(pos.rank);
+  }
+  llvm_unreachable("unknown expression position");
+}
 
 /// Emitter that translates EmitRust operations into Rust source text.
 ///
@@ -83,11 +183,13 @@ namespace {
 /// for-loop induction variable) as it is encountered top-down.
 ///
 /// The emitter renders into an internal string buffer and `finish()` copies
-/// it to the caller's stream. Buffering exists for exactly one edit: the
-/// FR-61a tail-expression fold emits the folded op's right-hand side as a
-/// normal statement (through the per-op emitters, so no printing logic is
-/// duplicated) and then removes the statement's trailing `;` when the
-/// function-final return is reached.
+/// it to the caller's stream. Buffering exists for two edits, both of which
+/// reuse the per-op emitters so no printing logic is duplicated: the FR-61a
+/// tail-expression fold emits the folded op's right-hand side as a normal
+/// statement and removes its trailing `;` when the function-final return is
+/// reached, and the FR-61d single-use inlining emits an inlined op's
+/// statement, captures the text (minus indentation and `;`), and erases it
+/// from the buffer so the consumer can print it inline.
 class RustEmitter {
 public:
   /// Creates an emitter writing to `os` under `options`.
@@ -104,6 +206,10 @@ public:
   void finish() {
     os.flush();
     finalOS << buffer;
+    // FR-61d instrumentation: opt-in stderr count of inline sites / drops.
+    if (::getenv("EMITRUST_INLINE_STATS"))
+      llvm::errs() << "[fr61d] inline captures: " << inlineCaptureCount
+                   << ", drops: " << dropCount << "\n";
   }
 
 private:
@@ -133,8 +239,12 @@ private:
   /// if the value has not been defined yet.
   FailureOr<std::string> lookupName(Location loc, Value value);
 
-  /// Emits the Rust name of `value`, or fails with a located diagnostic.
-  LogicalResult emitOperand(Location loc, Value value);
+  /// Emits `value` at the syntactic position `pos`: its captured inline
+  /// expression (parenthesized per `needsParens`) when FR-61d inlined it,
+  /// otherwise its Rust name; fails with a located diagnostic for an
+  /// undefined value. The position is mandatory so every call site names
+  /// where its operand lands.
+  LogicalResult emitOperand(Location loc, Value value, ExprPos pos);
 
   /// Emits the Rust rendering of `type`, or fails with a located
   /// "cannot translate type" diagnostic.
@@ -479,6 +589,75 @@ private:
   /// computed for the current function.
   void computeIfExprBindings();
 
+  // --- FR-61d: single-use expression inlining + unused-pure-value drops ---
+
+  /// Ops whose single-real-use result renders inline at its consumer
+  /// instead of through a `let` binding. Populated per function by
+  /// `computeInlineCandidates`; membership is decided entirely up front,
+  /// the capture in `emitBlockBody` only records the rendered text.
+  llvm::SmallPtrSet<Operation *, 32> inlinedOps;
+
+  /// The captured right-hand-side text of an inlined op's result, plus the
+  /// precedence rank the text renders at and whether it ends in a bare
+  /// `.. as T` cast (both consulted by `needsParens`).
+  struct InlineExpr {
+    std::string text;
+    Prec prec;
+    bool endsInCast;
+  };
+  DenseMap<Value, InlineExpr> inlineExprs;
+
+  /// Analysis-time flag per accepted candidate: the candidate's transitive
+  /// inlined tree contains an `emitrust.load`. A load's text re-reads its
+  /// place when rendered, so such a tree must not be inlined into a place
+  /// PROJECTION consumer (subscript index, deref operand): projections
+  /// render on demand at every consuming load/assign/borrow, which may sit
+  /// past a barrier or render more than once. Pure arithmetic over
+  /// immutable `let` names is position-independent and stays eligible.
+  DenseMap<Value, bool> inlineTreeReadsPlace;
+
+  /// Pure ops with no emitted use at all: they emit nothing, and every
+  /// analysis treats their uses as never-rendered (so drops cascade).
+  /// Dropping is legal only because `valueIsRead` PROVES no emitted read;
+  /// a wrong drop of a read value is a hard rustc E0425, never silent
+  /// misbehavior. Dropping an unused `emitrust.div`/`emitrust.rem`
+  /// additionally removes a divide-by-zero panic -- that panic exists only
+  /// where the C program divided by zero, which is C UB, so the elision
+  /// refines UB in the same legal direction as the dead-store elision.
+  llvm::SmallPtrSet<Operation *, 16> droppedOps;
+
+  /// Set while an inlined op's statement is being captured;
+  /// `emitLetPrologue` consumes it by naming the result (keeping surviving
+  /// v-numbering unchanged) while printing nothing, mirroring
+  /// `pendingTailFold`.
+  bool pendingInlineCapture = false;
+
+  /// Instrumentation: inline captures / drops across the whole translation
+  /// (not reset per function; reported behind EMITRUST_INLINE_STATS).
+  unsigned inlineCaptureCount = 0;
+  unsigned dropCount = 0;
+
+  /// Fills `droppedOps` for the current function with a reverse-program-
+  /// order pass (users precede defs, so cascades converge in one sweep).
+  /// Must run AFTER `tailFoldCandidate` selection and BEFORE
+  /// `computeInlineCandidates`.
+  void computeDroppedOps(emitrust::FuncOp funcOp);
+
+  /// Fills `inlinedOps` for the current function. Must run AFTER
+  /// `tailFoldCandidate` is selected (the candidate itself is excluded)
+  /// and after `computeDroppedOps` (dropped consumers are not real uses).
+  void computeInlineCandidates(emitrust::FuncOp funcOp);
+
+  /// The precedence rank `op`'s just-captured text renders at.
+  Prec capturedPrec(Operation *op, StringRef text);
+
+  /// Whether `op`'s captured text ends in a bare `.. as T` cast (its own
+  /// cast tail, or a bare-rendered inlined right operand's).
+  bool capturedEndsInCast(Operation *op);
+
+  /// Whether infix `op`'s right operand renders as bare trailing-cast text.
+  bool rhsEndsInCast(Operation *op, Prec rank);
+
   /// FR-61b: emits `let <name>: <type> = if <cond> {` .. `} else {` .. `};`
   /// for the deferred binding `op` consumed together with `ifOp`.
   LogicalResult emitIfExprBinding(Operation *op, Value result, Type valueType,
@@ -580,9 +759,10 @@ bool RustEmitter::valueIsRead(Value value) {
 bool RustEmitter::valueIsReadUncached(Value value) {
   for (OpOperand &use : value.getUses()) {
     Operation *owner = use.getOwner();
-    // A use inside unreachable code or a dropped dead store never emits, so it
-    // is not a real read.
-    if (unreachableOps.count(owner) || deadStores.count(owner))
+    // A use inside unreachable code, a dropped dead store, or an FR-61d
+    // dropped pure op never emits, so it is not a real read.
+    if (unreachableOps.count(owner) || deadStores.count(owner) ||
+        droppedOps.count(owner))
       continue;
     // A `let` whose dead initializer we dropped no longer reads its init
     // operand, so that use does not keep `value` live.
@@ -614,14 +794,13 @@ bool RustEmitter::valueIsReadUncached(Value value) {
         continue;
       }
       // `value` is a non-base operand (a subscript index). It is emitted, and
-      // so read, only when the projected place is actually emitted -- i.e. it
-      // is read, or written by a store that is not a dropped dead store.
-      if (valueIsRead(place))
+      // so read, only when the projected place is actually emitted -- read,
+      // or written ANYWHERE in its refinement tree (`v[i] = ..` but also
+      // `v[i].x = ..`, a mutable borrow, a mutating method call), which is
+      // exactly `lvalueIsMutated`. FR-61d made this exactness load-bearing:
+      // a dropped index def with a still-rendered place is a hard E0425.
+      if (valueIsRead(place) || lvalueIsMutated(place))
         return true;
-      for (Operation *consumer : place.getUsers())
-        if (isBindingWrite(consumer, place) &&
-            !unreachableOps.count(consumer) && !deadStores.count(consumer))
-          return true;
       continue;
     }
     return true;
@@ -676,7 +855,8 @@ bool RustEmitter::methodCallMutatesReceiver(emitrust::MethodCallOp call) {
 bool RustEmitter::lvalueIsMutated(Value value) {
   for (OpOperand &use : value.getUses()) {
     Operation *owner = use.getOwner();
-    if (unreachableOps.count(owner) || deadStores.count(owner))
+    if (unreachableOps.count(owner) || deadStores.count(owner) ||
+        droppedOps.count(owner))
       continue;
     if (auto assign = dyn_cast<emitrust::AssignOp>(owner)) {
       if (assign.getVar() == value)
@@ -931,7 +1111,8 @@ void RustEmitter::computeDeferredInits(Block &block) {
     // binding is `_`-prefixed instead (its dead init then draws no warning).
     bool isRead = false;
     for (Operation *user : binding.getUsers()) {
-      if (unreachableOps.count(user) || isBindingWrite(user, binding))
+      if (unreachableOps.count(user) || droppedOps.count(user) ||
+          isBindingWrite(user, binding))
         continue;
       isRead = true;
       break;
@@ -1049,6 +1230,362 @@ void RustEmitter::computeIfExprBindings() {
   }
 }
 
+// --- FR-61d helpers ---
+
+/// The Rust literal suffix an inlined constant of `type` carries so the
+/// let-binding's type annotation can be dropped without orphaning an
+/// inference anchor, or "" when the type is not suffixable (which
+/// disqualifies the constant from inlining; any residue would be a loud
+/// E0308, never a silent retype).
+static std::string inlineSuffixFor(Type type) {
+  if (auto intType = dyn_cast<IntegerType>(type)) {
+    unsigned width = intType.getWidth();
+    if (width == 1)
+      return "";
+    if (width == 8 || width == 16 || width == 32 || width == 64)
+      return ((intType.isUnsigned() ? "u" : "i") + Twine(width)).str();
+    return "";
+  }
+  if (isa<IndexType>(type))
+    return "usize";
+  if (type.isF32())
+    return "f32";
+  if (type.isF64())
+    return "f64";
+  return "";
+}
+
+/// Whether `op` is a scalar comparison (the fn-ptr comparison renders
+/// through `emitFnPtrCmp` -- Option null-tests and a `match` -- and is
+/// excluded from both inlining and dropping).
+static bool isScalarCmp(Operation *op) {
+  auto cmp = dyn_cast<emitrust::CmpOp>(op);
+  return cmp && !isa<emitrust::FnPtrType>(op->getOperand(0).getType()) &&
+         !isa<emitrust::FnPtrType>(op->getOperand(1).getType());
+}
+
+/// FR-61d: whether `op` belongs to the PURE producer set -- it renders one
+/// side-effect-free `let <name>: <type> = <rhs>;` statement. Membership
+/// gates both mechanisms: an unused pure op is dropped, a single-use pure
+/// op is inlined. Calls, literals, borrows, selects, and the global/cell
+/// accessors (FR-61d-2) stay out.
+static bool isPureProducer(Operation *op) {
+  if (isa<emitrust::CmpOp>(op))
+    return isScalarCmp(op);
+  // A cast to bool is an unsupported construct `emitCast` REJECTS with a
+  // located diagnostic; dropping an unused one would silently accept it,
+  // and rejection is a feature -- keep it out of the pure set so it always
+  // reaches the emitter's error path.
+  if (isa<emitrust::CastOp>(op))
+    return !op->getResult(0).getType().isInteger(1);
+  return isa<emitrust::ConstantOp, emitrust::AddOp, emitrust::SubOp,
+             emitrust::MulOp, emitrust::DivOp, emitrust::RemOp,
+             emitrust::AndOp, emitrust::OrOp, emitrust::XorOp,
+             emitrust::ShlOp, emitrust::ShrOp, emitrust::BitcastOp,
+             emitrust::LoadOp, emitrust::LetOp>(op);
+}
+
+/// Ops that may sit between an inlined def and its use without blocking the
+/// textual move: pure let-producing ops and never-emitted place/terminator
+/// markers. Complement-of-allowlist: anything unknown blocks by default
+/// (calls, assigns, stores, region-carrying ops, terminators). A MUTABLE
+/// borrow (`&mut` addr-of / slice-of) also blocks: moving a load's text
+/// past it could turn baseline-legal code into an E0502 borrow error.
+static bool isInlineNonBarrier(Operation *op) {
+  if (auto addrOf = dyn_cast<emitrust::AddrOfOp>(op))
+    return !addrOf.getIsMut();
+  if (auto sliceOf = dyn_cast<emitrust::SliceOfOp>(op))
+    return !sliceOf.getIsMut();
+  return isa<emitrust::ConstantOp, emitrust::LiteralOp, emitrust::AddOp,
+             emitrust::SubOp, emitrust::MulOp, emitrust::DivOp,
+             emitrust::RemOp, emitrust::AndOp, emitrust::OrOp,
+             emitrust::XorOp, emitrust::ShlOp, emitrust::ShrOp,
+             emitrust::CmpOp, emitrust::CastOp, emitrust::BitcastOp,
+             emitrust::LoadOp, emitrust::LetOp, emitrust::MemberOp,
+             emitrust::SubscriptOp, emitrust::DerefOp, emitrust::EnumRawOp,
+             emitrust::GlobalLoadOp, emitrust::CellGetOp,
+             emitrust::VariableOp, emitrust::YieldOp>(op);
+}
+
+/// The precedence rank an infix operator `symbol` renders its statement at
+/// (also the consumer rank its operand positions carry).
+static Prec infixPrec(StringRef symbol) {
+  return llvm::StringSwitch<Prec>(symbol)
+      .Cases("*", "/", "%", Prec::MulDiv)
+      .Cases("+", "-", Prec::AddSub)
+      .Cases("<<", ">>", Prec::Shift)
+      .Case("&", Prec::BitAnd)
+      .Case("^", Prec::BitXor)
+      .Case("|", Prec::BitOr)
+      .Default(Prec::Compare); // == != < <= > >=
+}
+
+/// Whether the add/sub/mul `op` renders in the postfix `a.wrapping_*(b)`
+/// method form -- the same predicate `emitWrappingBinary` routes on.
+static bool rendersWrappingMethod(Operation *op) {
+  auto intType = dyn_cast<IntegerType>(op->getResult(0).getType());
+  return intType && intType.isUnsigned();
+}
+
+void RustEmitter::computeDroppedOps(emitrust::FuncOp funcOp) {
+  // Reverse program order: users always render after their defs (nested
+  // users belong to later parent ops), so one reverse sweep sees every
+  // consumer's fate before deciding its producers -- cascades converge in a
+  // single pass. The default post-order walk visits nested ops before
+  // their parent; reversed, parents come first, which still keeps every
+  // user ahead of its def.
+  SmallVector<Operation *> ops;
+  funcOp->walk([&](Operation *op) { ops.push_back(op); });
+  for (Operation *op : llvm::reverse(ops)) {
+    if (op->getNumResults() != 1 || !isPureProducer(op))
+      continue;
+    if (unreachableOps.count(op))
+      continue; // already never emitted; dropping would double-count
+    if (auto letOp = dyn_cast<emitrust::LetOp>(op)) {
+      // A mutable or deferred `let` has assignments; dropping the binding
+      // would orphan them (E0425). Only the plain alias form can drop.
+      if (letOp.getIsMut() || deferredInits.count(op) ||
+          letHasEmittedAssign(letOp.getResult()))
+        continue;
+    }
+    // `valueIsRead` (with the droppedOps guard active) is the proof of "no
+    // emitted read". The cache is cleared each round because every new drop
+    // can un-read further values upstream.
+    valueReadCache.clear();
+    if (!valueIsRead(op->getResult(0))) {
+      droppedOps.insert(op);
+      ++dropCount;
+    }
+  }
+  // Later phases (naming, mut/`_` decisions) must see read-ness with the
+  // final drop set applied.
+  valueReadCache.clear();
+}
+
+/// FR-61d: whether `use` sits in an operand position the emitter renders
+/// through a classified `emitOperand` site. Anything else (for-loop
+/// bounds, which render by name lookup; place-typed operands; yields)
+/// disqualifies the candidate feeding it.
+static bool isClassifiedConsumerUse(OpOperand &use) {
+  Operation *owner = use.getOwner();
+  return llvm::TypeSwitch<Operation *, bool>(owner)
+      .Case<emitrust::AddOp, emitrust::SubOp, emitrust::MulOp,
+            emitrust::DivOp, emitrust::RemOp, emitrust::AndOp,
+            emitrust::OrOp, emitrust::XorOp, emitrust::ShlOp,
+            emitrust::ShrOp, emitrust::CastOp, emitrust::BitcastOp,
+            emitrust::LetOp, emitrust::ReturnOp, emitrust::CallOpaqueOp,
+            emitrust::CallIndirectOp, emitrust::IfOp, emitrust::SelectOp,
+            emitrust::SwitchOp, emitrust::GlobalStoreOp>(
+          [](auto) { return true; })
+      .Case<emitrust::CmpOp>([&](auto) { return isScalarCmp(owner); })
+      .Case<emitrust::AssignOp>([&](emitrust::AssignOp assign) {
+        // Only the assigned VALUE is an expression position; the target
+        // renders as a name/place.
+        return use.get() == assign.getValue() && use.get() != assign.getVar();
+      })
+      .Case<emitrust::MethodCallOp>([&](emitrust::MethodCallOp call) {
+        // The receiver is a place (rendered by emitPlaceExpr); arguments
+        // are delimited expression positions.
+        return use.get() != call.getReceiver();
+      })
+      .Case<emitrust::CellGetOp>([&](emitrust::CellGetOp get) {
+        return use.get() == get.getIndex();
+      })
+      .Case<emitrust::CellSetOp>([&](emitrust::CellSetOp set) {
+        return use.get() != set.getSlice();
+      })
+      .Case<emitrust::SliceOfOp>([&](emitrust::SliceOfOp sliceOf) {
+        return use.get() == sliceOf.getIndex();
+      })
+      .Case<emitrust::SubscriptOp>([&](emitrust::SubscriptOp subscript) {
+        return use.get() == subscript.getIndex();
+      })
+      .Case<emitrust::DerefOp>([](auto) { return true; })
+      .Default([](Operation *) { return false; });
+}
+
+void RustEmitter::computeInlineCandidates(emitrust::FuncOp funcOp) {
+  funcOp->walk([&](Operation *op) {
+    if (op->getNumResults() != 1 || !isPureProducer(op))
+      return;
+    if (unreachableOps.count(op) || droppedOps.count(op))
+      return;
+    // Producer-specific gates.
+    bool selfReadsPlace = false;
+    if (auto constant = dyn_cast<emitrust::ConstantOp>(op)) {
+      Attribute value = constant.getValue();
+      Type type = constant.getResult().getType();
+      if (isa<emitrust::FnPtrType>(type))
+        return; // `None` inlined loses its inference anchor (E0282)
+      auto intAttr = dyn_cast<IntegerAttr>(value);
+      auto floatAttr = dyn_cast<FloatAttr>(value);
+      if (floatAttr && !floatAttr.getValue().isFinite())
+        return; // renders as a path expr; a suffix would corrupt it
+      bool isBool = intAttr && intAttr.getType().isInteger(1);
+      bool isOpaque = isa<emitrust::OpaqueAttr>(value);
+      // Numeric constants must carry a literal suffix; a type with no
+      // suffix spelling cannot inline.
+      if (!isBool && !isOpaque && inlineSuffixFor(type).empty())
+        return;
+      if (!isBool && !isOpaque && !intAttr && !floatAttr)
+        return; // unknown attribute kind: refuse by default
+    } else if (auto letOp = dyn_cast<emitrust::LetOp>(op)) {
+      if (letOp.getIsMut() || deferredInits.count(op) ||
+          letHasEmittedAssign(letOp.getResult()))
+        return;
+    } else if (isa<emitrust::LoadOp>(op)) {
+      selfReadsPlace = true;
+    }
+    // The tail-fold candidate keeps the FR-61a rendering (its consumer is
+    // the function-final return); excluding it here keeps the two
+    // mechanisms disjoint by construction.
+    if (op == tailFoldCandidate)
+      return;
+    // Exactly one REAL use (uses inside unreachable code, dropped dead
+    // stores, or dropped pure ops never render).
+    OpOperand *realUse = nullptr;
+    for (OpOperand &use : op->getResult(0).getUses()) {
+      Operation *owner = use.getOwner();
+      if (unreachableOps.count(owner) || deadStores.count(owner) ||
+          droppedOps.count(owner))
+        continue;
+      if (realUse)
+        return; // second real use (includes both-operands-same-value)
+      realUse = &use;
+    }
+    if (!realUse)
+      return;
+    Operation *consumer = realUse->getOwner();
+    if (consumer->getBlock() != op->getBlock())
+      return;
+    if (!isClassifiedConsumerUse(*realUse))
+      return;
+    // Does the candidate's transitive inlined tree re-read a place when its
+    // text renders? (Its own load, or an inlined operand's tree.)
+    bool treeReadsPlace = selfReadsPlace;
+    for (Value operand : op->getOperands())
+      if (Operation *def = operand.getDefiningOp())
+        if (inlinedOps.count(def))
+          treeReadsPlace |= inlineTreeReadsPlace.lookup(operand);
+    // A place-projection consumer renders on demand at every consuming
+    // load/assign/borrow -- possibly past a barrier, possibly repeatedly --
+    // so only position-independent (place-read-free) text may inline there.
+    if (isa<emitrust::SubscriptOp, emitrust::DerefOp>(consumer) &&
+        treeReadsPlace)
+      return;
+    // No barrier strictly between def and use.
+    for (Operation *between = op->getNextNode(); between != consumer;
+         between = between->getNextNode()) {
+      if (unreachableOps.count(between) || deadStores.count(between) ||
+          droppedOps.count(between))
+        continue;
+      if (!isInlineNonBarrier(between))
+        return;
+    }
+    inlinedOps.insert(op);
+    inlineTreeReadsPlace[op->getResult(0)] = treeReadsPlace;
+  });
+}
+
+Prec RustEmitter::capturedPrec(Operation *op, StringRef text) {
+  return llvm::TypeSwitch<Operation *, Prec>(op)
+      .Case<emitrust::ConstantOp>([&](auto) {
+        return text.starts_with("-") ? Prec::Unary : Prec::Postfix;
+      })
+      .Case<emitrust::AddOp, emitrust::SubOp, emitrust::MulOp>(
+          [&](Operation *binary) {
+            if (rendersWrappingMethod(binary))
+              return Prec::Postfix; // `a.wrapping_add(b)`
+            return isa<emitrust::MulOp>(binary) ? Prec::MulDiv : Prec::AddSub;
+          })
+      .Case<emitrust::DivOp, emitrust::RemOp>([](auto) { return Prec::MulDiv; })
+      .Case<emitrust::AndOp>([](auto) { return Prec::BitAnd; })
+      .Case<emitrust::OrOp>([](auto) { return Prec::BitOr; })
+      .Case<emitrust::XorOp>([](auto) { return Prec::BitXor; })
+      .Case<emitrust::ShlOp, emitrust::ShrOp>([](auto) { return Prec::Shift; })
+      .Case<emitrust::CmpOp>([](auto) { return Prec::Compare; })
+      .Case<emitrust::CastOp>([&](auto) {
+        // The enum-target form renders `Name(x as i32)`, a postfix call.
+        return isa<emitrust::EnumType>(op->getResult(0).getType())
+                   ? Prec::Postfix
+                   : Prec::Cast;
+      })
+      .Case<emitrust::BitcastOp>([&](auto) {
+        // `fW::from_bits(..)` is postfix; `x.to_bits()` is too unless the
+        // signless-result ` as iW` tail demotes the whole text to a cast.
+        if (isa<FloatType>(op->getResult(0).getType()))
+          return Prec::Postfix;
+        auto intType = cast<IntegerType>(op->getResult(0).getType());
+        return intType.isUnsigned() ? Prec::Postfix : Prec::Cast;
+      })
+      .Case<emitrust::LoadOp>([&](emitrust::LoadOp loadOp) {
+        // A deref-rooted place renders with a leading `*` (unary); any
+        // other root renders a postfix name/field/index chain.
+        Operation *placeDef = loadOp.getOperand().getDefiningOp();
+        return isa_and_nonnull<emitrust::DerefOp>(placeDef) ? Prec::Unary
+                                                            : Prec::Postfix;
+      })
+      .Case<emitrust::LetOp>([&](emitrust::LetOp letOp) {
+        // An alias let renders its initializer: inherit an inlined
+        // initializer's rank; a plain name is an atom.
+        auto it = inlineExprs.find(letOp.getInit());
+        return it != inlineExprs.end() ? it->second.prec : Prec::Postfix;
+      })
+      .Default([&](Operation *) {
+        llvm_unreachable("capturedPrec: op is not an inline producer");
+        return Prec::Postfix;
+      });
+}
+
+bool RustEmitter::rhsEndsInCast(Operation *op, Prec rank) {
+  auto it = inlineExprs.find(op->getOperand(1));
+  if (it == inlineExprs.end())
+    return false;
+  const InlineExpr &rhs = it->second;
+  // The right operand's trailing cast leaks to the end of the infix text
+  // only when it renders bare in the BinRhs position.
+  return rhs.endsInCast &&
+         !needsParens(rhs.prec, rhs.endsInCast, ExprPos::binRhs(rank));
+}
+
+bool RustEmitter::capturedEndsInCast(Operation *op) {
+  return llvm::TypeSwitch<Operation *, bool>(op)
+      .Case<emitrust::CastOp>([&](auto) {
+        // The enum-target form `Name(x as i32)` ends in `)`.
+        return !isa<emitrust::EnumType>(op->getResult(0).getType());
+      })
+      .Case<emitrust::BitcastOp>([&](auto) {
+        // Only the signless-int result appends the ` as iW` tail.
+        auto intType = dyn_cast<IntegerType>(op->getResult(0).getType());
+        return intType && !intType.isUnsigned();
+      })
+      .Case<emitrust::AddOp, emitrust::SubOp, emitrust::MulOp>(
+          [&](Operation *binary) {
+            if (rendersWrappingMethod(binary))
+              return false; // `a.wrapping_add(b)` ends in `)`
+            return rhsEndsInCast(binary, isa<emitrust::MulOp>(binary)
+                                             ? Prec::MulDiv
+                                             : Prec::AddSub);
+          })
+      .Case<emitrust::DivOp, emitrust::RemOp>(
+          [&](Operation *b) { return rhsEndsInCast(b, Prec::MulDiv); })
+      .Case<emitrust::AndOp>(
+          [&](Operation *b) { return rhsEndsInCast(b, Prec::BitAnd); })
+      .Case<emitrust::OrOp>(
+          [&](Operation *b) { return rhsEndsInCast(b, Prec::BitOr); })
+      .Case<emitrust::XorOp>(
+          [&](Operation *b) { return rhsEndsInCast(b, Prec::BitXor); })
+      .Case<emitrust::ShlOp, emitrust::ShrOp>(
+          [&](Operation *b) { return rhsEndsInCast(b, Prec::Shift); })
+      .Case<emitrust::CmpOp>(
+          [&](Operation *b) { return rhsEndsInCast(b, Prec::Compare); })
+      .Case<emitrust::LetOp>([&](emitrust::LetOp letOp) {
+        auto it = inlineExprs.find(letOp.getInit());
+        return it != inlineExprs.end() && it->second.endsInCast;
+      })
+      .Default([](Operation *) { return false; });
+}
+
 FailureOr<std::string> RustEmitter::lookupName(Location loc, Value value) {
   auto it = valueNames.find(value);
   if (it == valueNames.end()) {
@@ -1058,7 +1595,23 @@ FailureOr<std::string> RustEmitter::lookupName(Location loc, Value value) {
   return it->second;
 }
 
-LogicalResult RustEmitter::emitOperand(Location loc, Value value) {
+LogicalResult RustEmitter::emitOperand(Location loc, Value value,
+                                       ExprPos pos) {
+  // FR-61d: a captured single-use expression prints inline; everything else
+  // falls through to the ordinary by-name rendering. A candidate that was
+  // marked but never captured (e.g. it sits in a region emitted outside
+  // `emitBlockBody`) misses the map and falls back to its name, which its
+  // normal `let` still bound.
+  auto it = inlineExprs.find(value);
+  if (it != inlineExprs.end()) {
+    bool parens = needsParens(it->second.prec, it->second.endsInCast, pos);
+    if (parens)
+      os << "(";
+    os << it->second.text;
+    if (parens)
+      os << ")";
+    return success();
+  }
   FailureOr<std::string> name = lookupName(loc, value);
   if (failed(name))
     return failure();
@@ -1227,7 +1780,8 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value,
            << "cannot emit a place expression for a block argument";
   return llvm::TypeSwitch<Operation *, LogicalResult>(def)
       .Case<emitrust::VariableOp>([&](emitrust::VariableOp variableOp) {
-        return emitOperand(loc, variableOp.getResult());
+        // A variable renders its name (never inlined): position is inert.
+        return emitOperand(loc, variableOp.getResult(), ExprPos::stmt());
       })
       .Case<emitrust::MemberOp>([&](emitrust::MemberOp memberOp) {
         // The base is followed by `.field`, so a deref base must parenthesize.
@@ -1243,16 +1797,25 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value,
                                  /*derefNeedsParens=*/true)))
           return failure();
         os << "[";
-        if (failed(emitOperand(loc, subscriptOp.getIndex())))
+        // An index-typed index sits bare between the delimiting brackets;
+        // any other integer gets ` as usize` appended, making it a cast
+        // source (`v1[(v0 - 1i32) as usize]`).
+        bool isIndexTyped = isa<IndexType>(subscriptOp.getIndex().getType());
+        if (failed(emitOperand(loc, subscriptOp.getIndex(),
+                               isIndexTyped ? ExprPos::delimited()
+                                            : ExprPos::castSource())))
           return failure();
-        if (!isa<IndexType>(subscriptOp.getIndex().getType()))
+        if (!isIndexTyped)
           os << " as usize";
         os << "]";
         return success();
       })
       .Case<emitrust::DerefOp>([&](emitrust::DerefOp derefOp) {
         os << (derefNeedsParens ? "(*" : "*");
-        if (failed(emitOperand(loc, derefOp.getOperand())))
+        // The `*` must bind the whole inlined expression: receiver-strength
+        // parenthesization.
+        if (failed(emitOperand(loc, derefOp.getOperand(),
+                               ExprPos::receiver())))
           return failure();
         if (derefNeedsParens)
           os << ")";
@@ -1375,6 +1938,13 @@ LogicalResult RustEmitter::emitLetPrologue(Value result, bool isMut) {
     tailFoldActive = true;
     return success();
   }
+  // Spike 61d-0: the inlined op's statement is being captured; the binding
+  // never renders, but `assignName` above still ran so surviving v-numbering
+  // is unchanged.
+  if (pendingInlineCapture) {
+    pendingInlineCapture = false;
+    return success();
+  }
   os << "let ";
   if (isMut)
     os << "mut ";
@@ -1423,6 +1993,50 @@ static bool isTailFoldableProducer(Operation *op) {
 
 LogicalResult RustEmitter::emitBlockBody(Block &block) {
   for (Operation &op : block) {
+    // FR-61d: a dropped pure op emits nothing. Its result is still named so
+    // the surviving v-numbering matches the un-dropped rendering exactly.
+    if (droppedOps.count(&op)) {
+      assignName(op.getResult(0));
+      continue;
+    }
+    // FR-61d: an inlined op renders into the buffer with its `let` prologue
+    // suppressed, then the statement text is captured, stripped of
+    // indentation and its trailing `;\n`, and removed from the buffer; the
+    // consumer prints it inline. Invariants are hard runtime checks (the
+    // tree builds -DNDEBUG, a plain assert would vanish): a violation must
+    // fail the translation loudly, never emit silently wrong text.
+    if (inlinedOps.count(&op)) {
+      if (&op == tailFoldCandidate)
+        return op.emitOpError("FR-61d: op is both tail-folded and inlined");
+      os.flush();
+      size_t start = buffer.size();
+      pendingInlineCapture = true;
+      LogicalResult captured = emitOperation(op);
+      pendingInlineCapture = false; // defensive; the prologue consumed it
+      if (failed(captured))
+        return failure();
+      os.flush();
+      StringRef text = StringRef(buffer).substr(start);
+      text = text.ltrim();
+      if (!text.ends_with(";\n"))
+        return op.emitOpError(
+            "FR-61d: captured inline statement does not end with ';'");
+      text = text.drop_back(2);
+      std::string expr = text.str();
+      // A numeric constant carries its literal type suffix so the dropped
+      // binding's type annotation cannot orphan an inference anchor.
+      if (auto constant = dyn_cast<emitrust::ConstantOp>(&op))
+        if (auto typed = dyn_cast<TypedAttr>(constant.getValue()))
+          if (isa<IntegerAttr, FloatAttr>(constant.getValue()) &&
+              !typed.getType().isInteger(1))
+            expr += inlineSuffixFor(constant.getResult().getType());
+      Prec prec = capturedPrec(&op, expr);
+      bool endsInCast = capturedEndsInCast(&op);
+      inlineExprs[op.getResult(0)] = {std::move(expr), prec, endsInCast};
+      buffer.resize(start);
+      ++inlineCaptureCount;
+      continue; // pure producers never diverge
+    }
     // FR-61a: while the fold candidate is emitted, `emitLetPrologue` names
     // its result but prints nothing, leaving only `<rhs>;`.
     pendingTailFold = (&op == tailFoldCandidate);
@@ -1528,6 +2142,11 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   tailFoldCandidate = nullptr;
   pendingTailFold = false;
   tailFoldActive = false;
+  inlinedOps.clear();
+  inlineExprs.clear();
+  inlineTreeReadsPlace.clear();
+  droppedOps.clear();
+  pendingInlineCapture = false;
 
   Region &body = fn.getFunctionBody();
   if (body.empty())
@@ -1565,6 +2184,11 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
         tailFoldCandidate = def;
     }
   }
+  // FR-61d: both run after the tail-fold candidate is known so the
+  // mechanisms stay disjoint; drops run first so a dropped consumer's
+  // operands can inline into (or drop with) the survivors.
+  computeDroppedOps(funcOp);
+  computeInlineCandidates(funcOp);
   // A function directly inside an `emitrust.impl` is a method, UNLESS it
   // carries the `static_method` marker (W2.2), in which case it is a
   // receiverless associated function (`Struct::name(...)`) and every
@@ -1636,7 +2260,7 @@ LogicalResult RustEmitter::emitReturn(emitrust::ReturnOp returnOp) {
       buffer.erase(buffer.size() - 2, 1);
       return success();
     }
-    if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+    if (failed(emitOperand(op->getLoc(), op->getOperand(0), ExprPos::stmt())))
       return failure();
     os << "\n";
     return success();
@@ -1649,7 +2273,7 @@ LogicalResult RustEmitter::emitReturn(emitrust::ReturnOp returnOp) {
     return success();
   }
   os << "return ";
-  if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+  if (failed(emitOperand(op->getLoc(), op->getOperand(0), ExprPos::stmt())))
     return failure();
   os << ";\n";
   return success();
@@ -1693,7 +2317,8 @@ LogicalResult RustEmitter::emitCallOpaque(emitrust::CallOpaqueOp callOp) {
       first = false;
       auto intAttr = dyn_cast<IntegerAttr>(arg);
       if (intAttr && isa<IndexType>(intAttr.getType())) {
-        if (failed(emitOperand(loc, op->getOperand(intAttr.getInt()))))
+        if (failed(emitOperand(loc, op->getOperand(intAttr.getInt()),
+                               ExprPos::delimited())))
           return failure();
       } else if (auto strAttr = dyn_cast<StringAttr>(arg)) {
         emitEscapedStringLiteral(strAttr.getValue());
@@ -1706,7 +2331,7 @@ LogicalResult RustEmitter::emitCallOpaque(emitrust::CallOpaqueOp callOp) {
       if (!first)
         os << ", ";
       first = false;
-      if (failed(emitOperand(loc, operand)))
+      if (failed(emitOperand(loc, operand, ExprPos::delimited())))
         return failure();
     }
   }
@@ -1722,7 +2347,7 @@ LogicalResult RustEmitter::emitCallIndirect(emitrust::CallIndirectOp callOp) {
     return failure();
   // Calling a null C function pointer is undefined behavior; the expect
   // refines it into a deterministic panic.
-  if (failed(emitOperand(loc, callOp.getCallee())))
+  if (failed(emitOperand(loc, callOp.getCallee(), ExprPos::receiver())))
     return failure();
   os << ".expect(\"null function pointer\")(";
   bool first = true;
@@ -1730,7 +2355,7 @@ LogicalResult RustEmitter::emitCallIndirect(emitrust::CallIndirectOp callOp) {
     if (!first)
       os << ", ";
     first = false;
-    if (failed(emitOperand(loc, argument)))
+    if (failed(emitOperand(loc, argument, ExprPos::delimited())))
       return failure();
   }
   os << ");\n";
@@ -1753,7 +2378,7 @@ LogicalResult RustEmitter::emitMethodCall(emitrust::MethodCallOp callOp) {
     if (!first)
       os << ", ";
     first = false;
-    if (failed(emitOperand(loc, argument)))
+    if (failed(emitOperand(loc, argument, ExprPos::delimited())))
       return failure();
   }
   os << ");\n";
@@ -1805,7 +2430,8 @@ LogicalResult RustEmitter::emitIfExprBinding(Operation *op, Value result,
   if (failed(emitType(result.getLoc(), valueType)))
     return failure();
   os << " = if ";
-  if (failed(emitOperand(ifOp.getLoc(), ifOp.getCondition())))
+  if (failed(emitOperand(ifOp.getLoc(), ifOp.getCondition(),
+                         ExprPos::cond())))
     return failure();
   os << " {\n";
   if (failed(emitArmBodyWithTail(ifOp.getThenRegion(), result)))
@@ -1824,10 +2450,18 @@ LogicalResult RustEmitter::emitArmBodyWithTail(Region &region, Value binding) {
     // its right-hand side is the arm's tail expression.
     if (isBindingWrite(&op, binding)) {
       auto assign = cast<emitrust::AssignOp>(&op);
-      if (failed(emitOperand(assign.getLoc(), assign.getValue())))
+      if (failed(emitOperand(assign.getLoc(), assign.getValue(),
+                             ExprPos::stmt())))
         return failure();
       os << "\n";
       break;
+    }
+    // FR-61d: this loop bypasses `emitBlockBody` (arm-local candidates fall
+    // back to their names -- an accepted coverage gap); dropped ops are
+    // still skipped so cascades cannot leave dangling names.
+    if (droppedOps.count(&op)) {
+      assignName(op.getResult(0));
+      continue;
     }
     if (failed(emitOperation(op)))
       return failure();
@@ -1864,7 +2498,7 @@ LogicalResult RustEmitter::emitLet(emitrust::LetOp letOp) {
   bool isMut = letOp.getIsMut() && letHasEmittedAssign(result);
   if (failed(emitLetPrologue(result, isMut)))
     return failure();
-  if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+  if (failed(emitOperand(op->getLoc(), op->getOperand(0), ExprPos::stmt())))
     return failure();
   os << ";\n";
   return success();
@@ -1881,11 +2515,12 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
     // Whole-place assignment target: a bare `*p = ..` needs no parens.
     if (failed(emitPlaceExpr(loc, var, /*derefNeedsParens=*/false)))
       return failure();
-  } else if (failed(emitOperand(loc, var))) {
+  } else if (failed(emitOperand(loc, var, ExprPos::stmt()))) {
+    // Assign targets are mut bindings, which never inline: name rendering.
     return failure();
   }
   os << " = ";
-  if (failed(emitOperand(loc, assignOp.getValue())))
+  if (failed(emitOperand(loc, assignOp.getValue(), ExprPos::stmt())))
     return failure();
   os << ";\n";
   return success();
@@ -1894,10 +2529,13 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
 LogicalResult RustEmitter::emitBinary(Operation *op, StringRef symbol) {
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
-  if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+  Prec rank = infixPrec(symbol);
+  if (failed(emitOperand(op->getLoc(), op->getOperand(0),
+                         ExprPos::binLhs(rank))))
     return failure();
   os << " " << symbol << " ";
-  if (failed(emitOperand(op->getLoc(), op->getOperand(1))))
+  if (failed(emitOperand(op->getLoc(), op->getOperand(1),
+                         ExprPos::binRhs(rank))))
     return failure();
   os << ";\n";
   return success();
@@ -1906,10 +2544,12 @@ LogicalResult RustEmitter::emitBinary(Operation *op, StringRef symbol) {
 LogicalResult RustEmitter::emitBinaryMethod(Operation *op, StringRef method) {
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
-  if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+  if (failed(emitOperand(op->getLoc(), op->getOperand(0),
+                         ExprPos::receiver())))
     return failure();
   os << "." << method << "(";
-  if (failed(emitOperand(op->getLoc(), op->getOperand(1))))
+  if (failed(emitOperand(op->getLoc(), op->getOperand(1),
+                         ExprPos::delimited())))
     return failure();
   os << ");\n";
   return success();
@@ -1962,7 +2602,7 @@ LogicalResult RustEmitter::emitFnPtrCmp(emitrust::CmpOp cmpOp, Value lhs,
   if (lhsNone != rhsNone) {
     // One side is the null constant: an Option null-test is exact and warning
     // free, matching C's `fp == NULL` / `fp != NULL` semantics.
-    if (failed(emitOperand(loc, lhsNone ? rhs : lhs)))
+    if (failed(emitOperand(loc, lhsNone ? rhs : lhs, ExprPos::receiver())))
       return failure();
     os << (isEq ? ".is_none()" : ".is_some()") << ";\n";
     return success();
@@ -1974,10 +2614,10 @@ LogicalResult RustEmitter::emitFnPtrCmp(emitrust::CmpOp cmpOp, Value lhs,
   }
   // Neither side is null: compare payload function addresses, `None`-aware.
   os << "match (";
-  if (failed(emitOperand(loc, lhs)))
+  if (failed(emitOperand(loc, lhs, ExprPos::delimited())))
     return failure();
   os << ", ";
-  if (failed(emitOperand(loc, rhs)))
+  if (failed(emitOperand(loc, rhs, ExprPos::delimited())))
     return failure();
   os << ") { (Some(l), Some(r)) => "
      << (isEq ? "core::ptr::fn_addr_eq(l, r)" : "!core::ptr::fn_addr_eq(l, r)")
@@ -2019,7 +2659,8 @@ LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
     if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
       return failure();
     os << enumType.getName() << "(";
-    if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+    if (failed(emitOperand(op->getLoc(), op->getOperand(0),
+                           ExprPos::castSource())))
       return failure();
     os << " as " << (enumDef.getUnsignedUnderlying() ? "u32" : "i32")
        << ");\n";
@@ -2027,11 +2668,16 @@ LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
   }
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
-  if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+  // An enum-typed source gets `.0` appended (postfix binds tighter than
+  // `as`), so it needs the stricter receiver parenthesization.
+  bool enumSource = isa<emitrust::EnumType>(op->getOperand(0).getType());
+  if (failed(emitOperand(op->getLoc(), op->getOperand(0),
+                         enumSource ? ExprPos::receiver()
+                                    : ExprPos::castSource())))
     return failure();
   // Enum-to-integer: the raw value is read out of the tuple struct's only
   // field before the `as` conversion.
-  if (isa<emitrust::EnumType>(op->getOperand(0).getType()))
+  if (enumSource)
     os << ".0";
   os << " as ";
   if (failed(emitType(op->getLoc(), op->getResult(0).getType())))
@@ -2051,7 +2697,11 @@ LogicalResult RustEmitter::emitBitcast(emitrust::BitcastOp bitcastOp) {
     // first converts (same-width `as`, bit-preserving) to unsigned.
     auto intType = cast<IntegerType>(op->getOperand(0).getType());
     os << (floatType.isF32() ? "f32" : "f64") << "::from_bits(";
-    if (failed(emitOperand(loc, op->getOperand(0))))
+    // A signless source gets ` as uW` appended: cast source; an unsigned
+    // one sits bare between the call parens: delimited.
+    if (failed(emitOperand(loc, op->getOperand(0),
+                           intType.isUnsigned() ? ExprPos::delimited()
+                                                : ExprPos::castSource())))
       return failure();
     if (!intType.isUnsigned())
       os << " as u" << intType.getWidth();
@@ -2061,7 +2711,7 @@ LogicalResult RustEmitter::emitBitcast(emitrust::BitcastOp bitcastOp) {
   // Float-to-integer: `to_bits` yields `uW`; a signless result converts
   // from it (same-width `as`, bit-preserving).
   auto intType = cast<IntegerType>(resultType);
-  if (failed(emitOperand(loc, op->getOperand(0))))
+  if (failed(emitOperand(loc, op->getOperand(0), ExprPos::receiver())))
     return failure();
   os << ".to_bits()";
   if (!intType.isUnsigned())
@@ -2076,13 +2726,13 @@ LogicalResult RustEmitter::emitSelect(emitrust::SelectOp selectOp) {
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
   os << "if ";
-  if (failed(emitOperand(loc, selectOp.getCondition())))
+  if (failed(emitOperand(loc, selectOp.getCondition(), ExprPos::cond())))
     return failure();
   os << " { ";
-  if (failed(emitOperand(loc, selectOp.getTrueValue())))
+  if (failed(emitOperand(loc, selectOp.getTrueValue(), ExprPos::stmt())))
     return failure();
   os << " } else { ";
-  if (failed(emitOperand(loc, selectOp.getFalseValue())))
+  if (failed(emitOperand(loc, selectOp.getFalseValue(), ExprPos::stmt())))
     return failure();
   os << " };\n";
   return success();
@@ -2095,7 +2745,7 @@ LogicalResult RustEmitter::emitIf(emitrust::IfOp ifOp) {
   if (consumedIfs.count(op))
     return success();
   os << "if ";
-  if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+  if (failed(emitOperand(op->getLoc(), op->getOperand(0), ExprPos::cond())))
     return failure();
   os << " {\n";
   if (failed(emitRegionBody(op, ifOp.getThenRegion())))
@@ -2136,7 +2786,15 @@ LogicalResult RustEmitter::emitFor(emitrust::ForOp forOp) {
   os << "for " << induction << " in (" << *lower << ".." << *upper
      << ").step_by(" << *step << " as usize) {\n";
   increaseIndent();
+  // FR-61d: this loop bypasses `emitBlockBody`, so body-local candidates
+  // are never captured (their consumers fall back to the name their normal
+  // `let` still binds -- an accepted coverage gap); dropped ops must still
+  // be skipped or a cascade-dropped operand def would leave a dangling name.
   for (Operation &child : body) {
+    if (droppedOps.count(&child)) {
+      assignName(child.getResult(0));
+      continue;
+    }
     if (failed(emitOperation(child)))
       return failure();
   }
@@ -2156,7 +2814,8 @@ LogicalResult RustEmitter::emitLoop(emitrust::LoopOp loopOp) {
 LogicalResult RustEmitter::emitSwitch(emitrust::SwitchOp switchOp) {
   Operation *op = switchOp.getOperation();
   os << "match ";
-  if (failed(emitOperand(op->getLoc(), switchOp.getDiscriminator())))
+  if (failed(emitOperand(op->getLoc(), switchOp.getDiscriminator(),
+                         ExprPos::cond())))
     return failure();
   os << " {\n";
   increaseIndent();
@@ -2463,7 +3122,8 @@ LogicalResult RustEmitter::emitGlobalStore(emitrust::GlobalStoreOp storeOp) {
     return op->emitOpError("cannot store to the immutable global @")
            << storeOp.getGlobal();
   os << global->getSymName() << ".with(|__emitrust_tl| __emitrust_tl.set(";
-  if (failed(emitOperand(op->getLoc(), storeOp.getValue())))
+  if (failed(emitOperand(op->getLoc(), storeOp.getValue(),
+                         ExprPos::delimited())))
     return failure();
   os << "));\n";
   return success();
@@ -2474,10 +3134,11 @@ LogicalResult RustEmitter::emitCellGet(emitrust::CellGetOp getOp) {
   Location loc = op->getLoc();
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
-  if (failed(emitOperand(loc, getOp.getSlice())))
+  if (failed(emitOperand(loc, getOp.getSlice(), ExprPos::receiver())))
     return failure();
   os << "[";
-  if (failed(emitOperand(loc, getOp.getIndex())))
+  // The ` as usize` conversion is always appended: cast source.
+  if (failed(emitOperand(loc, getOp.getIndex(), ExprPos::castSource())))
     return failure();
   os << " as usize].get();\n";
   return success();
@@ -2486,13 +3147,14 @@ LogicalResult RustEmitter::emitCellGet(emitrust::CellGetOp getOp) {
 LogicalResult RustEmitter::emitCellSet(emitrust::CellSetOp setOp) {
   Operation *op = setOp.getOperation();
   Location loc = op->getLoc();
-  if (failed(emitOperand(loc, setOp.getSlice())))
+  if (failed(emitOperand(loc, setOp.getSlice(), ExprPos::receiver())))
     return failure();
   os << "[";
-  if (failed(emitOperand(loc, setOp.getIndex())))
+  // The ` as usize` conversion is always appended: cast source.
+  if (failed(emitOperand(loc, setOp.getIndex(), ExprPos::castSource())))
     return failure();
   os << " as usize].set(";
-  if (failed(emitOperand(loc, setOp.getValue())))
+  if (failed(emitOperand(loc, setOp.getValue(), ExprPos::delimited())))
     return failure();
   os << ");\n";
   return success();
@@ -2525,7 +3187,12 @@ LogicalResult RustEmitter::emitGlobalCells(emitrust::GlobalCellsOp cellsOp) {
   if (failed(emitType(loc, cells.getType())))
     return failure();
   os << " = __emitrust_tl.as_slice_of_cells();\n";
+  // FR-61d: same bypass as `emitFor` -- skip dropped ops, no capture.
   for (Operation &child : body) {
+    if (droppedOps.count(&child)) {
+      assignName(child.getResult(0));
+      continue;
+    }
     if (failed(emitOperation(child)))
       return failure();
   }
@@ -2598,9 +3265,13 @@ LogicalResult RustEmitter::emitSliceOf(emitrust::SliceOfOp sliceOfOp) {
                            /*derefNeedsParens=*/true)))
     return failure();
   os << "[";
-  if (failed(emitOperand(op->getLoc(), sliceOfOp.getIndex())))
+  // Same delimited-vs-cast-source split as the subscript index.
+  bool isIndexTyped = isa<IndexType>(sliceOfOp.getIndex().getType());
+  if (failed(emitOperand(op->getLoc(), sliceOfOp.getIndex(),
+                         isIndexTyped ? ExprPos::delimited()
+                                      : ExprPos::castSource())))
     return failure();
-  if (!isa<IndexType>(sliceOfOp.getIndex().getType()))
+  if (!isIndexTyped)
     os << " as usize";
   os << "..];\n";
   return success();
