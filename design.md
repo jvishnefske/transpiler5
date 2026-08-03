@@ -1756,10 +1756,32 @@ of references or inheritance, so it precedes both.
   notes: DiagnosticsEngine takes DiagnosticOptions by reference now;
   classification must run under an IgnoringDiagConsumer and only for `-c`
   lines (BuildCompilation PRINTS immediate args like --version). Remaining
-  for the checkbox: cc1-key canonicalization (workflow args like
-  `-dependency-file`/`-o` currently perturb the hash), forwarding target/ABI
-  flags into the import, import-crash isolation (fork or post-hoc), argv0
-  `cc`/`gcc` aliasing, and the FR-57 artifact format.
+  for the checkbox: import-crash isolation (fork or post-hoc) and argv0
+  `cc`/`gcc` aliasing. (Landed since the spike: cc1-key canonicalization
+  and the FR-57 artifact format — see FR-57b/c/d — and target/ABI flag
+  forwarding, below.)
+  LANDED (FR-56 target/ABI forwarding): the layout flags on the cc1 line
+  now reach the import or reject the TU, never silently neither. SPIKE,
+  measured: `-fshort-enums` passed as an extra clang arg flips the
+  import's `sizeof(enum)` fold 4 -> 1, a forwarded `--target=
+  i386-unknown-linux-gnu` makes `long` 4 bytes wide and maps C `unsigned
+  long` to ui32, and forwarding the DEFAULT host triple is byte-identical
+  to not forwarding it — so the shim forwards the cc1 `-triple`
+  unconditionally as `--target=` (the one place `-target`/`-m32` and
+  friends all land) plus the honored ABI set `-fshort-enums` /
+  `-fno-signed-char` / `-fsigned-char` verbatim (cc1 spellings that are
+  also driver spellings). The measured CANNOT-HONOR set (`-fpack-struct
+  [=N]`: the importer models no struct packing and the emitted Rust has no
+  repr story) rejects the WHOLE TU into the artifact's ledger: the real
+  compile and its object are untouched, but the artifact is an EMPTY
+  module carrying one located whole-TU rejection per flag (and an
+  explicitly empty — not absent — item-graph attribute), so the link step
+  surfaces the reason shard-attributed while any symbol another TU needs
+  from this one fails loudly at merge instead of resolving against
+  wrong-layout IR. Pinned: the 4-vs-1 enum fold solo AND joint under the
+  same flag (the same FileCheck prefix runs over both), the `-m32` ui32
+  mapping, and the pack-struct warning + empty-module ledger artifact
+  (test/Driver/emitrust-clang-target-abi.c).
 - [x] FR-57 Per-TU artifacts ("object files as parse caches"). `-c` imports
   ONE translation unit in isolation and serializes the result: the imported
   emitrust module as MLIR bytecode plus the TU's item-graph shard and

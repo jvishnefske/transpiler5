@@ -64,6 +64,7 @@
 #include "mlir/Dialect/UB/IR/UBOps.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/Location.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/Pass/PassManager.h"
@@ -131,6 +132,13 @@ struct CompileJob {
   /// replays it through the preprocessor after the delegation, when the
   /// Compilation is long gone.
   std::vector<std::string> cc1Args;
+  /// FR-56: target/ABI cc1 flags in the measured CANNOT-HONOR set
+  /// (`-fpack-struct[=N]` today: the importer models no struct packing and
+  /// the emitted Rust has no repr story). A nonempty list rejects the WHOLE
+  /// translation unit into the artifact's ledger — an empty module carrying
+  /// the located rejection — because importing with a layout the flag
+  /// changed and the import ignored would be silently wrong code.
+  std::vector<std::string> unsupportedAbiFlags;
 };
 
 /// The optional shim log sink (`EMITRUST_CLANG_LOG`). Append-mode so that
@@ -240,6 +248,25 @@ classifyCompileJobs(llvm::ArrayRef<const char *> args, llvm::StringRef realCC,
         job.importArgs.push_back(cc1[++i]);
       } else if (arg.starts_with("-std=")) {
         job.importArgs.push_back(arg.str());
+      } else if (arg == "-triple" && i + 1 != e) {
+        // FR-56: the cc1 triple is the truth about the target the real
+        // compile laid types out for (`-target`, `-m32` and friends all
+        // land here), and the import must reflect it. Forwarded as the
+        // driver-level `--target=` since the import drives its own clang
+        // driver; for a host compile this is the default triple and a
+        // measured no-op.
+        job.importArgs.push_back(
+            ("--target=" + llvm::StringRef(cc1[++i])).str());
+      } else if (arg == "-fshort-enums" || arg == "-fno-signed-char" ||
+                 arg == "-fsigned-char") {
+        // FR-56: layout-affecting ABI flags the import pipeline HONORS —
+        // the clang AST applies them, so sizeof folds and type mappings
+        // follow (pinned in test/Driver/emitrust-clang-target-abi.c). The
+        // cc1 spellings are also valid driver spellings.
+        job.importArgs.push_back(arg.str());
+      } else if (arg == "-fpack-struct" || arg.starts_with("-fpack-struct=")) {
+        // FR-56: the measured cannot-honor set; see the field comment.
+        job.unsupportedAbiFlags.push_back(arg.str());
       } else if (!arg.starts_with("-") && !language.empty()) {
         // cc1 places its single input after the `-x <language>` pair; any
         // earlier bare argument is an option value already consumed above.
@@ -404,6 +431,72 @@ static bool computeAndLogSrcHash(const CompileJob &job,
   return true;
 }
 
+/// Serializes `module` as MLIR bytecode to `<output>.emitrust.mlirbc` and
+/// embeds that payload into the object file as its `.emitrust` section (the
+/// sidecar stays as the non-ELF fallback and the easy-inspection path).
+/// Every failure warns and returns; the build's outcome is never touched.
+static void writeAndEmbedArtifact(mlir::ModuleOp module, const CompileJob &job,
+                                  llvm::raw_ostream *log) {
+  std::string artifactPath = job.output + ".emitrust.mlirbc";
+  {
+    std::error_code ec;
+    llvm::raw_fd_ostream out(artifactPath, ec, llvm::sys::fs::OF_None);
+    if (ec) {
+      llvm::errs() << "emitrust-clang: warning: cannot write '" << artifactPath
+                   << "': " << ec.message() << "\n";
+      return;
+    }
+    if (mlir::failed(mlir::writeBytecodeToFile(module, out))) {
+      llvm::errs() << "emitrust-clang: warning: bytecode serialization "
+                      "failed for '"
+                   << artifactPath << "'\n";
+      out.close();
+      llvm::sys::fs::remove(artifactPath);
+      return;
+    }
+  }
+  if (log)
+    *log << "artifact: " << artifactPath << " (key " << job.cc1Hash << ")\n";
+
+  embedArtifactSection(job.output, artifactPath, log);
+}
+
+/// FR-56: the artifact for a translation unit whose cc1 line carries a
+/// target/ABI flag the import CANNOT honor (`CompileJob::
+/// unsupportedAbiFlags`): an EMPTY module whose ledger records one located
+/// whole-TU rejection per flag. Importing anyway would bake a layout the
+/// real compile did not use — silently wrong code — while emitting no
+/// artifact at all would lose the reason; this way the FR-58 link step
+/// surfaces the rejection shard-attributed, and any symbol another TU
+/// needs from this one fails loudly at merge. The item-graph attribute is
+/// attached EMPTY (not omitted): the TU deliberately contributes no items,
+/// which is different from an artifact that predates metadata support.
+static void emitRejectedTuArtifact(const CompileJob &job,
+                                   llvm::raw_ostream *log) {
+  mlir::MLIRContext context;
+  mlir::Location loc = mlir::FileLineColLoc::get(
+      mlir::StringAttr::get(&context, job.input), 1, 1);
+  mlir::OwningOpRef<mlir::ModuleOp> module = mlir::ModuleOp::create(loc);
+  mlir::emitrust::RejectionLedger ledger;
+  for (const std::string &flag : job.unsupportedAbiFlags) {
+    std::string diagnostic =
+        "unsupported target/ABI flag '" + flag +
+        "': the import cannot honor it, so the translation unit is rejected";
+    llvm::errs() << "emitrust-clang: warning: unsupported target/ABI flag '"
+                 << flag << "' for '" << job.input
+                 << "'; translation unit rejected into the artifact's "
+                    "ledger\n";
+    if (log)
+      *log << "abi-reject: " << flag << " for " << job.input << "\n";
+    ledger.record(mlir::emitrust::RejectedItem{
+        "<translation unit>", loc, diagnostic,
+        mlir::emitrust::classifyBlocker(diagnostic, loc), /*stubbed=*/false,
+        ""});
+  }
+  mlir::emitrust::attachShardMetadata(*module, "", ledger.getItems());
+  writeAndEmbedArtifact(*module, job, log);
+}
+
 /// Runs the EmitRust import + lowering pipeline on one compile job, writes
 /// the converted module as MLIR bytecode to `<output>.emitrust.mlirbc`, and
 /// embeds that payload into the object file as its `.emitrust` section (the
@@ -415,7 +508,12 @@ static bool computeAndLogSrcHash(const CompileJob &job,
 /// file write, or embedding — is logged and swallowed: the build's outcome
 /// belongs to the real clang alone.
 static void sideEmitArtifact(const CompileJob &job, llvm::raw_ostream *log) {
-  std::string artifactPath = job.output + ".emitrust.mlirbc";
+  // FR-56: a cc1 target/ABI flag the import cannot honor rejects the whole
+  // TU into the artifact's ledger instead of importing with wrong layout.
+  if (!job.unsupportedAbiFlags.empty()) {
+    emitRejectedTuArtifact(job, log);
+    return;
+  }
 
   mlir::MLIRContext context;
   std::string diagnostics;
@@ -482,27 +580,7 @@ static void sideEmitArtifact(const CompileJob &job, llvm::raw_ostream *log) {
   mlir::emitrust::attachShardMetadata(*module, graph->print(),
                                       ledger.getItems());
 
-  {
-    std::error_code ec;
-    llvm::raw_fd_ostream out(artifactPath, ec, llvm::sys::fs::OF_None);
-    if (ec) {
-      llvm::errs() << "emitrust-clang: warning: cannot write '" << artifactPath
-                   << "': " << ec.message() << "\n";
-      return;
-    }
-    if (mlir::failed(mlir::writeBytecodeToFile(*module, out))) {
-      llvm::errs() << "emitrust-clang: warning: bytecode serialization "
-                      "failed for '"
-                   << artifactPath << "'\n";
-      out.close();
-      llvm::sys::fs::remove(artifactPath);
-      return;
-    }
-  }
-  if (log)
-    *log << "artifact: " << artifactPath << " (key " << job.cc1Hash << ")\n";
-
-  embedArtifactSection(job.output, artifactPath, log);
+  writeAndEmbedArtifact(*module, job, log);
 }
 
 /// Shim entry point: expand response files, classify with the clang driver,
