@@ -153,6 +153,42 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type);
 mlir::FailureOr<std::string> renderCrateRoot(mlir::ModuleOp module,
                                              CrateType type);
 
+/// FR-59: `renderCrateRoot` for a WORKSPACE MEMBER that depends on
+/// `depCrates`. With an empty list this is byte-for-byte the overload
+/// above (the no-partition invariant); otherwise the `#![allow]` header
+/// additionally allows `unused_imports` (a member gets every dependency
+/// it references anywhere, not per-item) and one `use <dep>::*;` line per
+/// dependency follows the header, which is how cross-crate references —
+/// emitted as bare names — resolve against the FR-51 exports.
+///
+/// \param module the member's converted module slice.
+/// \param type the member's crate shape.
+/// \param depCrates the package names of the member's path dependencies.
+/// \returns the Rust source text, or failure with diagnostics emitted.
+mlir::FailureOr<std::string>
+renderCrateRoot(mlir::ModuleOp module, CrateType type,
+                llvm::ArrayRef<std::string> depCrates);
+
+/// FR-59: the member manifest — `renderCargoToml` plus a `[dependencies]`
+/// table of path dependencies (`<dep> = { path = "../<dep>" }`), one per
+/// entry, in order. With no deps this is byte-for-byte `renderCargoToml`.
+///
+/// \param crateName the member's package name.
+/// \param type the member's crate shape.
+/// \param depCrates the package names of the member's dependencies.
+/// \returns the manifest text.
+std::string renderMemberCargoToml(llvm::StringRef crateName, CrateType type,
+                                  llvm::ArrayRef<std::string> depCrates);
+
+/// FR-59: the virtual workspace root manifest: a `[workspace]` table with
+/// resolver 2 and the members in plan order. The root carries no
+/// `[package]` — the binary member is an ordinary member, and the shared
+/// `target/` directory lands beside this manifest.
+///
+/// \param members the member directory/package names, in plan order.
+/// \returns the manifest text.
+std::string renderWorkspaceToml(llvm::ArrayRef<std::string> members);
+
 } // namespace emitrustcc
 
 #endif // EMITRUST_TOOLS_EMITRUST_CC_CRATEEMITTER_H

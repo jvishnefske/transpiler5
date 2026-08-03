@@ -2110,7 +2110,7 @@ of references or inheritance, so it precedes both.
   symbol, first occurrence wins, shape conflict errors; alpha-rename
   shard-local `tu<N>_` tags to global ordinals; concatenate; verify; feed
   the existing crate pipeline.
-- [ ] FR-59 Workspace partitioning (multi-crate output). One crate cannot
+- [x] FR-59 Workspace partitioning (multi-crate output). One crate cannot
   hold a kernel-scale project. The link step partitions the item graph into a
   Cargo WORKSPACE of crates (per source directory/subsystem by default,
   overridable), with strongly-connected components CONDENSED so no
@@ -2119,6 +2119,65 @@ of references or inheritance, so it precedes both.
   project with two acyclic subsystems emits two crates that `cargo build`
   together; a deliberately cyclic pair condenses into one crate rather than
   failing.
+  LANDED (`emitrust-cc --link --emit=crate --partition [--partition-map
+  <file>]`). SPIKE verdicts, each recorded with its argument:
+  (1) GRAPH SOURCE — the dependency edges come from the shards' FR-57d
+  ITEM-GRAPH TEXTS (a unit that references a symbol another unit's graph
+  defines, `def=1`, first definer winning to match the merge's
+  first-occurrence type dedup), not from walking the merged module: the
+  graphs are per-shard, already carried, and indexable exactly like the
+  FR-58 definer discovery, while the merged module's `call_opaque` callees
+  are bare strings and its ops no longer record their TU (location-based
+  attribution would trip on headers and macros). The ONE fact the graph
+  cannot supply — `emitrust.impl` blocks, since the graph does not model
+  methods — is read off the module and becomes an orphan-rule condensation
+  edge (an impl must live in its type's crate).
+  (2) OVERRIDE UX — `--partition-map <file>`, one `<path-prefix>
+  <crate-name>` per line, longest prefix matching the shard's recorded
+  `emitrust.source` path wins, unmatched shards keep the per-directory
+  default. Chosen over a spec DSL as the simplest honest form: the shard
+  already records an absolute source path, and a prefix map expresses
+  both "these dirs are one subsystem" and "this subtree gets a name".
+  (3) STATICS INVARIANT — partition units are WHOLE TUs (a re-import
+  group is one unit: its members merged into one module and are
+  inseparable), so an internal-linkage symbol and its users can NEVER
+  face a crate boundary by construction — a C file-static cannot be
+  referenced from another TU. What CAN face one is module-level state
+  with external linkage, and FR-51 deliberately never exports globals, so
+  a cross-boundary global reference CONDENSES the two crates with a
+  warning naming the global — never a silently widened `pub static`.
+  Mechanism: the pure planner (tools/emitrust-cc/Partition.h, the
+  ConstraintDependencyGraph cherry-pick shape: indices, explicit cycle
+  detection, deterministic order) seeds one crate per source directory,
+  applies the forced condensations (globals, orphan-rule impls), then
+  iterates SCC condensation (a cycle collapses into its earliest member,
+  warning naming the cycle path) and bin-inbound condensation (cargo
+  cannot depend on a binary crate) to a fixpoint. The driver harvests
+  per-position source/graph facts BEFORE selective re-import replaces
+  group members (the FR-58 ordinal maps then say which positions each
+  unit covers), merges with per-op unit attribution, splits the merged
+  module into one module per crate (`emitrust.use`/`verbatim` header ops
+  cloned into every member; `unused_imports` joins the member allow
+  list), and writes a virtual workspace root plus members wired by path
+  dependencies and `use <dep>::*;` globs — how the emitter's bare
+  cross-crate names resolve against FR-51's pubs, spiked green on a
+  hand-built workspace in the emitted style before implementation.
+  Byte-identity discipline: without `--partition` nothing changes — the
+  single-crate link output is pinned byte-identical to the joint import,
+  and partitioning itself is pinned behavior-neutral (partitioned stdout
+  == unpartitioned stdout == clang-native stdout). Pinned: the 3-TU
+  two-directory project partitions into subsys_a + subsys_b + bin, one
+  `cargo build` at the root, stdout byte-identical to native AND to the
+  unpartitioned crate (test/EndToEnd/link-workspace-e2e.c); the mutually
+  recursive pair condenses into one crate with the cycle named and runs
+  green (test/EndToEnd/link-workspace-cycle-e2e.c); the cross-directory
+  global condenses with the global named, no `pub static` anywhere, the
+  member manifests carry the same deny-lint table, the override map
+  merges both dirs under one name with no warning, and the no-partition
+  path stays byte-identical (test/Driver/link-partition.c). Non-goal
+  recorded: PORTING.md/progress artifacts are not emitted per member
+  (they are FR-44 import-path artifacts; the link path has no importer
+  ledger of its own).
 - [ ] FR-60 Kernel-corpus ratchet. The validation story at scale: byte-diff
   does not exist for a kernel, so the measure is the ADMITTED-ITEM ratchet --
   a per-project manifest (the c-testsuite ledger generalized) recording which

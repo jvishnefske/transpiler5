@@ -148,6 +148,12 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type) {
 
 mlir::FailureOr<std::string> renderCrateRoot(mlir::ModuleOp module,
                                              CrateType type) {
+  return renderCrateRoot(module, type, /*depCrates=*/{});
+}
+
+mlir::FailureOr<std::string>
+renderCrateRoot(mlir::ModuleOp module, CrateType type,
+                llvm::ArrayRef<std::string> depCrates) {
   const bool wrapMain = type == CrateType::Bin;
   mlir::emitrust::RustEmitOptions emitOptions;
   // FR-51: only a library crate exports anything. A binary crate's items stay
@@ -156,14 +162,51 @@ mlir::FailureOr<std::string> renderCrateRoot(mlir::ModuleOp module,
   emitOptions.exportItems = type == CrateType::Lib;
   std::string source;
   llvm::raw_string_ostream os(source);
-  os << (mlir::emitrust::idiomaticRenameEnabled() ? kAllowHeader
-                                                  : kAllowHeaderPreserveNames)
-     << "\n";
+  llvm::StringRef header = mlir::emitrust::idiomaticRenameEnabled()
+                               ? kAllowHeader
+                               : kAllowHeaderPreserveNames;
+  if (depCrates.empty()) {
+    os << header << "\n";
+  } else {
+    // FR-59 workspace member: the allow list additionally admits
+    // unused_imports (a member gets every dependency it references
+    // anywhere, not per item), and the glob imports follow — they are how
+    // the emitter's bare cross-crate names resolve against FR-51's pubs.
+    llvm::StringRef closer = ")]\n";
+    os << header.drop_back(closer.size()) << ", unused_imports" << closer;
+    for (const std::string &dep : depCrates)
+      os << "use " << dep << "::*;\n";
+    os << "\n";
+  }
   if (mlir::failed(mlir::emitrust::translateToRust(module, os, emitOptions)))
     return mlir::failure();
   if (wrapMain)
     os << "\n" << (cMainTakesArgc(module) ? kMainArgcWrapper : kMainWrapper);
   return source;
+}
+
+std::string renderMemberCargoToml(llvm::StringRef crateName, CrateType type,
+                                  llvm::ArrayRef<std::string> depCrates) {
+  std::string toml = renderCargoToml(crateName, type);
+  if (depCrates.empty())
+    return toml;
+  llvm::raw_string_ostream os(toml);
+  os << "\n[dependencies]\n";
+  for (const std::string &dep : depCrates)
+    os << dep << " = { path = \"../" << dep << "\" }\n";
+  return toml;
+}
+
+std::string renderWorkspaceToml(llvm::ArrayRef<std::string> members) {
+  std::string toml;
+  llvm::raw_string_ostream os(toml);
+  os << "[workspace]\n"
+     << "resolver = \"2\"\n"
+     << "members = [";
+  for (auto [index, member] : llvm::enumerate(members))
+    os << (index ? ", " : "") << "\"" << member << "\"";
+  os << "]\n";
+  return toml;
 }
 
 } // namespace emitrustcc
