@@ -29,7 +29,15 @@
 /// is the PAIR logged when `EMITRUST_CLANG_LOG` names a log file:
 /// `cc1-key`, the llvm::MD5 of the CANONICALIZED cc1 argument vector
 /// (workflow-only arguments and the input path stripped, see Cc1Key.h), and
-/// `src-hash`, the MD5 of the source file's bytes.
+/// `src-hash`, the order-independent content hash of the main file PLUS
+/// every user header it transitively includes — the dependency list is
+/// collected by replaying the cc1 line through clang's preprocessor
+/// in-process (DepScan.h), never by parsing the build's own depfile — so a
+/// header-only edit misses the key while an mtime touch or an `-MF` rename
+/// keeps it. A dependency that cannot be scanned or read fails toward "no
+/// artifact + warning", never a wrong cache hit; the test-only
+/// `EMITRUST_TEST_UNREADABLE_DEP` environment hook (path or filename)
+/// forces that failure so the direction stays pinned.
 ///
 /// The shim's cardinal rule is that the IMPORT NEVER FAILS THE BUILD: an
 /// import error is logged (and warned about on stderr) and the exit code of
@@ -39,6 +47,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "Cc1Key.h"
+#include "DepScan.h"
 
 #include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
@@ -113,6 +122,11 @@ struct CompileJob {
   /// response-file packaging and argv spelling differences the driver
   /// normalizes away.
   std::string cc1Hash;
+  /// The FULL cc1 argument vector (leading "-cc1" included), copied out of
+  /// the Compilation because the src-hash's dependency scan (DepScan.h)
+  /// replays it through the preprocessor after the delegation, when the
+  /// Compilation is long gone.
+  std::vector<std::string> cc1Args;
 };
 
 /// The optional shim log sink (`EMITRUST_CLANG_LOG`). Append-mode so that
@@ -241,29 +255,13 @@ classifyCompileJobs(llvm::ArrayRef<const char *> args, llvm::StringRef realCC,
     llvm::MD5::stringifyResult(digest, hex);
     job.cc1Hash = std::string(hex);
 
-    // The other half of the FR-57 key: the input's CONTENT, so the key pair
-    // is invariant to where the file lives yet misses when it changes.
-    // FUTURE: fold in the transitively included headers via the depfile's
-    // file list; for now only the main file's bytes are hashed.
-    std::string srcHash = "<unavailable>";
-    if (!job.input.empty()) {
-      if (llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
-              llvm::MemoryBuffer::getFile(job.input)) {
-        llvm::MD5 srcMd5;
-        srcMd5.update((*buffer)->getBuffer());
-        llvm::MD5::MD5Result srcDigest = srcMd5.final();
-        llvm::SmallString<32> srcHex;
-        llvm::MD5::stringifyResult(srcDigest, srcHex);
-        srcHash = std::string(srcHex);
-      }
-    }
+    job.cc1Args.assign(cc1.begin(), cc1.end());
 
     if (log) {
       *log << "cc1:";
       for (const char *arg : cc1)
         *log << " " << arg;
-      *log << "\ncc1-key: " << job.cc1Hash << "\nsrc-hash: " << srcHash
-           << "\n";
+      *log << "\ncc1-key: " << job.cc1Hash << "\n";
     }
 
     if (emitsObject && language == "c" && !job.input.empty() &&
@@ -356,6 +354,50 @@ static void embedArtifactSection(llvm::StringRef objectPath,
   }
   if (log)
     *log << "embedded: .emitrust section in " << objectPath << "\n";
+}
+
+/// Computes and logs the `src-hash` half of the FR-57 key for one compile
+/// job: the dependency list is collected by replaying the job's cc1 line
+/// through the preprocessor in-process (DepScan.h), and the CONTENTS of the
+/// main file plus every user header are hashed as an order-independent
+/// digest multiset.
+///
+/// Runs after the delegation on purpose: the scan replays the exact cc1
+/// line the real compile ran, and its failure must cost only the artifact.
+///
+/// \returns true with the hash logged as `src-hash: <hex>`; false after a
+///          stderr warning when the scan fails or a dependency cannot be
+///          read — the caller must then emit NO artifact, because a key
+///          that missed a dependency could later be a wrong cache hit.
+static bool computeAndLogSrcHash(const CompileJob &job,
+                                 llvm::raw_ostream *log) {
+  std::optional<std::vector<std::string>> deps =
+      emitrust::scanCompileDependencies(job.cc1Args);
+  if (!deps) {
+    llvm::errs() << "emitrust-clang: warning: dependency scan failed for '"
+                 << job.input << "'; no artifact written\n";
+    if (log)
+      *log << "src-hash-unavailable: dependency scan failed for " << job.input
+           << "\n";
+    return false;
+  }
+  std::optional<std::string> testUnreadable;
+  if (const char *env = std::getenv("EMITRUST_TEST_UNREADABLE_DEP"))
+    testUnreadable = env;
+  std::string unreadablePath;
+  std::optional<std::string> hash =
+      emitrust::hashDependencyContents(*deps, testUnreadable, unreadablePath);
+  if (!hash) {
+    llvm::errs() << "emitrust-clang: warning: cannot hash dependency '"
+                 << unreadablePath << "' for '" << job.input
+                 << "'; no artifact written\n";
+    if (log)
+      *log << "src-hash-unavailable: cannot read " << unreadablePath << "\n";
+    return false;
+  }
+  if (log)
+    *log << "src-hash: " << *hash << "\n";
+  return true;
 }
 
 /// Runs the EmitRust import + lowering pipeline on one compile job, writes
@@ -506,10 +548,13 @@ int main(int argc, char **argv) {
   }
 
   // Side-emit only after a SUCCESSFUL real compile: a TU the real compiler
-  // rejected has no object file for the artifact to ride with.
+  // rejected has no object file for the artifact to ride with. The src-hash
+  // gate comes first — a key that missed a dependency could later be a
+  // wrong cache hit, so a failed scan costs the artifact, never the build.
   if (exitCode == 0)
     for (const CompileJob &job : jobs)
-      sideEmitArtifact(job, log);
+      if (computeAndLogSrcHash(job, log))
+        sideEmitArtifact(job, log);
 
   return exitCode;
 }
