@@ -57,8 +57,10 @@
               tblgen
               llvmPackages.clang-tools
 
-              # lit test runner for FileCheck-style pattern tests
-              (pkgs.python3.withPackages (ps: [ ps.lit ]))
+              # lit test runner for FileCheck-style pattern tests; psutil
+              # enables lit's per-test timeout -- without it a miscompiled
+              # non-terminating EndToEnd binary wedges check-emitrust forever
+              (pkgs.python3.withPackages (ps: [ ps.lit ps.psutil ]))
 
               # Rust toolchain for the differential end-to-end tests:
               # emitrust-cc emits a cargo crate that is built and executed
