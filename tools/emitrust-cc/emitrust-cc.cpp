@@ -63,6 +63,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "ActorLiftPlan.h"
 #include "ActorPlan.h"
 #include "CrateEmitter.h"
 #include "LinkMerge.h"
@@ -73,6 +74,7 @@
 #include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/EmitRustDialect.h"
 #include "EmitRust/EmitRustOps.h"
+#include "EmitRust/Conversion/ActorLift.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/Conversion/LowerExternalRequirements.h"
@@ -359,6 +361,21 @@ static llvm::cl::opt<std::string> actorMapPath(
         "an override can widen an actor but never split a cluster the "
         "writer/SCC rules require whole"),
     llvm::cl::value_desc("file"), llvm::cl::init(""));
+
+static llvm::cl::opt<bool> actorLiftFlag(
+    "actor-lift",
+    llvm::cl::desc(
+        "FR-62 slice 4 (stage A, default off): run the emitrust-actor-lift "
+        "pass at the tail of the pipeline. Each certified actor cluster's "
+        "mutable globals become fields of a synthesized struct owned by "
+        "c_main, its arms become &mut-self methods, cross-actor clients "
+        "thread one &mut parameter per actor, and driver-only globals "
+        "become named main locals — no thread_local survives for any "
+        "lifted global. Demoted actors (address-taken arms, poison "
+        "merges, variadic monomorphs, library units, --link) keep "
+        "today's form with a printed warning. Valid with --emit=mlir, "
+        "--emit=rust and --emit=crate"),
+    llvm::cl::init(false));
 
 static llvm::cl::opt<std::string> ratchetBaselinePath(
     "ratchet-baseline",
@@ -1191,15 +1208,19 @@ static bool loadActorOverrides(
 /// \param inputs the link-line object/archive/shard paths, in link order.
 /// \param outputPath the `-o` destination (`-` for stdout).
 /// \returns the process exit code.
-static int emitLinkActorPlan(llvm::ArrayRef<std::string> inputs,
-                             llvm::StringRef outputPath) {
-  mlir::MLIRContext context;
-  context.getDiagEngine().registerHandler(
-      [](mlir::Diagnostic &diag) { printDiagnostic(diag); });
+/// Collects one `ActorUnit` per link-line shard from the shards' stored
+/// FR-57d item-graph texts (shared by `--emit=actor-plan` and the
+/// `--actor-lift --link` demote-all warning). A shard carrying no graph is
+/// a printed error.
+///
+/// \returns true on success.
+static bool collectLinkActorUnits(
+    llvm::ArrayRef<std::string> inputs, mlir::MLIRContext &context,
+    llvm::SmallVectorImpl<emitrustcc::ActorUnit> &units) {
   llvm::SmallVector<LoadedShard> shards;
   if (!loadLinkShards(inputs, context, shards))
-    return 1;
-  llvm::SmallVector<emitrustcc::ActorUnit> units(shards.size());
+    return false;
+  units.resize(shards.size());
   for (auto [i, shard] : llvm::enumerate(shards)) {
     std::optional<llvm::StringRef> graph =
         mlir::emitrust::getShardItemGraph(*shard.module);
@@ -1207,13 +1228,24 @@ static int emitLinkActorPlan(llvm::ArrayRef<std::string> inputs,
       llvm::errs() << "error: shard '" << shard.name
                    << "' carries no item-graph metadata (artifact predates "
                       "FR-57d?)\n";
-      return 1;
+      return false;
     }
     std::optional<mlir::emitrust::ShardSource> source =
         mlir::emitrust::getShardSource(*shard.module);
     units[i].sourcePaths.push_back(source ? source->path : shard.name);
     units[i].graphTexts.push_back(graph->str());
   }
+  return true;
+}
+
+static int emitLinkActorPlan(llvm::ArrayRef<std::string> inputs,
+                             llvm::StringRef outputPath) {
+  mlir::MLIRContext context;
+  context.getDiagEngine().registerHandler(
+      [](mlir::Diagnostic &diag) { printDiagnostic(diag); });
+  llvm::SmallVector<emitrustcc::ActorUnit> units;
+  if (!collectLinkActorUnits(inputs, context, units))
+    return 1;
   std::vector<std::pair<std::string, std::string>> overrides;
   if (!loadActorOverrides(overrides))
     return 1;
@@ -1765,6 +1797,14 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: --actor-map requires --emit=actor-plan\n";
     return 1;
   }
+  // FR-62 slice 4: the lift runs at the tail of the lowering pipeline, so
+  // it is meaningful exactly where the lowered module is consumed.
+  if (actorLiftFlag && emitKind != EmitKind::MLIR &&
+      emitKind != EmitKind::Rust && emitKind != EmitKind::Crate) {
+    llvm::errs() << "error: --actor-lift is only valid with --emit=mlir, "
+                    "--emit=rust or --emit=crate\n";
+    return 1;
+  }
   // FR-60: both artifact queries read the shard ledgers off the link line.
   if (emitKind == EmitKind::RejectionReport && !linkFlag) {
     llvm::errs() << "error: --emit=rejection-report requires --link\n";
@@ -1975,6 +2015,21 @@ int main(int argc, char **argv) {
     // per-shard facts the ordinary merge deliberately strips.
     if (partitionFlag)
       return emitPartitionedWorkspace(inputs, context);
+    // FR-62 slice 4, demotion rule 5: under --link every actor is demoted
+    // (the FR-58/FR-59 interaction is a recorded later stage), so the lift
+    // never runs — but the demotions are still REPORTED per actor, from
+    // the same stored shard graphs --emit=actor-plan reads, so the flag is
+    // honest about what it did not do.
+    if (actorLiftFlag) {
+      llvm::SmallVector<emitrustcc::ActorUnit> units;
+      if (!collectLinkActorUnits(inputs, context, units))
+        return 1;
+      emitrustcc::ActorPlan plan = emitrustcc::planActors(units, {});
+      for (const emitrustcc::Actor &actor : plan.actors)
+        llvm::errs() << "warning: actor plan: demoted " << actor.name
+                     << ": --link actor lift is a later stage (demote-all "
+                        "under link)\n";
+    }
     // FR-58: the positional inputs are objects/shards, every one of them
     // already imported AND already lowered by the FR-56 shim, so the merge
     // replaces both the import and the pass pipeline below and the merged
@@ -2019,6 +2074,51 @@ int main(int argc, char **argv) {
 
     if (mlir::failed(runPipeline(*module)))
       return 1;
+
+    // FR-62 slice 4 (stage A): the actor lift is the pipeline's tail. The
+    // plan is a pure function of the FR-40 item graph (a second, purely
+    // analytical parse, exactly as --incremental's denominator takes);
+    // the driver certifies it against the demotion table and attaches the
+    // attribute contract, and the pass rewrites only what is attributed.
+    if (actorLiftFlag) {
+      std::string databaseError;
+      mlir::FailureOr<mlir::emitrust::ItemGraph> graph =
+          mlir::emitrust::buildItemGraph(inputs, extra,
+                                         compilationDatabasePath,
+                                         databaseError);
+      if (mlir::failed(graph)) {
+        llvm::errs() << "error: --actor-lift cannot build the project item "
+                        "graph"
+                     << (databaseError.empty() ? "" : ": ") << databaseError
+                     << "\n";
+        return 1;
+      }
+      emitrustcc::ActorUnit unit;
+      unit.sourcePaths.assign(inputs.begin(), inputs.end());
+      unit.graphTexts.push_back(graph->print());
+      emitrustcc::ActorPlan plan = emitrustcc::planActors(unit, {});
+      for (const std::string &note : plan.notes)
+        llvm::errs() << "warning: actor plan: " << note << "\n";
+      emitrustcc::ActorLiftAttachment attachment =
+          emitrustcc::attachActorLiftAttributes(*module, *graph, plan);
+      for (const emitrustcc::ActorLiftDemotion &demotion :
+           attachment.demotions) {
+        llvm::errs() << "warning: actor plan: demoted " << demotion.actor
+                     << ": " << demotion.reason << "\n";
+        if (!demotion.remarkText.empty())
+          mlir::emitRemark(mlir::FileLineColLoc::get(
+                               &context, demotion.remarkFile,
+                               demotion.remarkLine, demotion.remarkColumn))
+              << demotion.remarkText;
+      }
+      if (attachment.attachedAny) {
+        mlir::PassManager pm(&context,
+                             mlir::ModuleOp::getOperationName());
+        pm.addPass(mlir::emitrust::createEmitRustActorLift());
+        if (mlir::failed(pm.run(*module)))
+          return 1;
+      }
+    }
   }
 
   switch (emitKind.getValue()) {

@@ -124,6 +124,12 @@ struct ActorFunction {
   std::string symbol;
   ActorRole role = ActorRole::Free;
   unsigned actor = 0; ///< index into ActorPlan::actors; valid iff Arm.
+  /// FR-62 slice 4 (additive beside the frozen E5 fields; the pinned render
+  /// format is unchanged): for a `Cross` function, the actors its Calls
+  /// closure touches, as sorted `ActorPlan::actors` indices — the exact
+  /// per-actor `mut_ref` parameter list the actor lift threads through the
+  /// client, in parameter order. Empty for every other role.
+  llvm::SmallVector<unsigned> crossActors;
 };
 
 /// One planned actor.
@@ -134,6 +140,12 @@ struct Actor {
   /// The globals this actor owns, sorted; "@stdout" pseudo-global
   /// included when hosted sinks are visible.
   llvm::SmallVector<std::string> globals;
+  /// FR-62 slice 4 (additive; render unchanged): whether this actor was
+  /// produced by a CallsIndirect POISON merge — the write-spans-everything
+  /// condensation, distinct from an ordinary writer-rule or SCC merge. A
+  /// poisoned actor is uncertifiable for the actor lift (demotion rule 2);
+  /// a pure writer-rule "@stdout" merge is NOT poisoned and lifts fine.
+  bool poisoned = false;
 };
 
 /// The planned decomposition.
