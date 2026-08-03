@@ -63,6 +63,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "ActorPlan.h"
 #include "CrateEmitter.h"
 #include "LinkMerge.h"
 #include "Partition.h"
@@ -124,12 +125,12 @@ namespace {
 
 /// The output kinds selectable with --emit.
 ///
-/// `ItemGraph` and `Coloring` are the odd ones out: every other kind is a
-/// stage of the import-and-lower pipeline, while those two are parallel,
-/// pure-AST analyses that never build a module. They are handled before the
-/// import for exactly that reason — both are meant to be obtainable for a
-/// project the importer cannot yet translate, which for the coloring is the
-/// whole point (an all-Green project needs no coloring).
+/// `ItemGraph`, `Coloring` and `ActorPlan` are the odd ones out: every other
+/// kind is a stage of the import-and-lower pipeline, while those three are
+/// parallel, pure-AST analyses that never build a module. They are handled
+/// before the import for exactly that reason — all are meant to be
+/// obtainable for a project the importer cannot yet translate, which for the
+/// coloring is the whole point (an all-Green project needs no coloring).
 enum class EmitKind {
   ItemGraph,
   Coloring,
@@ -140,17 +141,21 @@ enum class EmitKind {
   Search,
   RejectionReport,
   Ratchet,
+  ActorPlan,
 };
 
 /// Whether `kind` is one of the pure-AST project analyses, i.e. produced
-/// without an MLIR context, an import, or a pass.
+/// without an MLIR context, an import, or a pass. `ActorPlan` qualifies
+/// because it is a pure function of the FR-40 item graph: in source mode
+/// the graph is built from the clang ASTs, and no import runs.
 ///
 /// `Search` is deliberately NOT one of them even though it prints an
 /// analysis: FR-43's whole method is to IMPORT candidate subsets, so it needs
 /// the same machinery an ordinary compile does and simply keeps no module at
 /// the end.
 bool isProjectAnalysis(EmitKind kind) {
-  return kind == EmitKind::ItemGraph || kind == EmitKind::Coloring;
+  return kind == EmitKind::ItemGraph || kind == EmitKind::Coloring ||
+         kind == EmitKind::ActorPlan;
 }
 
 } // namespace
@@ -255,7 +260,18 @@ static llvm::cl::opt<EmitKind> emitKind(
                    "snapshot. With --ratchet-baseline the manifest is "
                    "compared first: an admitted shrink or a condensation "
                    "growth is an error; growth passes, and the written "
-                   "manifest is the update. Requires --link")),
+                   "manifest is the update. Requires --link"),
+        clEnumValN(EmitKind::ActorPlan, "actor-plan",
+                   "FR-62: the actor decomposition plan -- one 'actor' line "
+                   "per planned actor with its owned global cluster (plus "
+                   "the '@stdout' pseudo-global for hosted output sinks), "
+                   "one 'fn' line per defined function with its role "
+                   "(arm/driver/free/cross), and a 'note' line per "
+                   "condensation the decomposition forced. A pure function "
+                   "of the FR-40 item graph: computed from the clang ASTs "
+                   "without importing, or under --link from the shards' "
+                   "stored FR-57d item-graph texts. --actor-map overrides "
+                   "the default co-access clustering")),
     llvm::cl::init(EmitKind::Crate));
 
 static llvm::cl::opt<emitrustcc::CrateTypeRequest> crateTypeOpt(
@@ -330,6 +346,18 @@ static llvm::cl::opt<std::string> partitionMapPath(
         "<crate-name>` pair per line; the LONGEST prefix matching a "
         "shard's recorded source path assigns it to that crate, and "
         "unmatched shards keep the per-directory default"),
+    llvm::cl::value_desc("file"), llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> actorMapPath(
+    "actor-map",
+    llvm::cl::desc(
+        "FR-62: override file for --emit=actor-plan. One `<symbol-prefix> "
+        "<actor-name>` pair per line; the LONGEST prefix matching a "
+        "global's symbol pins it to that actor (an exact symbol is just "
+        "the longest possible prefix), and unmatched globals keep the "
+        "co-access cluster default. Condensation runs after pinning, so "
+        "an override can widen an actor but never split a cluster the "
+        "writer/SCC rules require whole"),
     llvm::cl::value_desc("file"), llvm::cl::init(""));
 
 static llvm::cl::opt<std::string> ratchetBaselinePath(
@@ -1118,6 +1146,86 @@ static int emitLinkShardItemGraphs(llvm::ArrayRef<std::string> inputs,
   return mlir::failed(writeFile(outputPath, text)) ? 1 : 0;
 }
 
+/// Parses the `--actor-map` file (when given) into (symbol prefix, actor
+/// name) override entries for FR-62's `planActors` — the exact analogue of
+/// `loadPartitionOverrides`, but over SYMBOL prefixes rather than path
+/// prefixes, and with the actor name kept verbatim (it names a plan-text
+/// actor, not a cargo package). An actor name must be one whole token —
+/// the plan format's grep contract — so an embedded space is malformed.
+///
+/// \param overrides receives the entries, in file order.
+/// \returns true on success; false after a printed error.
+static bool loadActorOverrides(
+    std::vector<std::pair<std::string, std::string>> &overrides) {
+  if (actorMapPath.empty())
+    return true;
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> map =
+      llvm::MemoryBuffer::getFile(actorMapPath);
+  if (!map) {
+    llvm::errs() << "error: cannot read --actor-map '" << actorMapPath
+                 << "': " << map.getError().message() << "\n";
+    return false;
+  }
+  for (llvm::StringRef line : llvm::split((*map)->getBuffer(), '\n')) {
+    line = line.trim();
+    if (line.empty() || line.starts_with("#"))
+      continue;
+    auto [prefix, actor] = line.split(' ');
+    actor = actor.trim();
+    if (prefix.empty() || actor.empty() || actor.contains(' ')) {
+      llvm::errs() << "error: malformed --actor-map line: '" << line
+                   << "' (expected '<symbol-prefix> <actor-name>')\n";
+      return false;
+    }
+    overrides.emplace_back(prefix.str(), actor.str());
+  }
+  return true;
+}
+
+/// `--link --emit=actor-plan`: plans the FR-62 actor decomposition from
+/// the shards' STORED item-graph texts (FR-57d), one `ActorUnit` per shard
+/// in link-line order — a pure artifact query like the per-shard
+/// item-graph dump above: no merge, no re-import, no C parsed. A shard
+/// carrying no graph is a located error for the same reason as there.
+///
+/// \param inputs the link-line object/archive/shard paths, in link order.
+/// \param outputPath the `-o` destination (`-` for stdout).
+/// \returns the process exit code.
+static int emitLinkActorPlan(llvm::ArrayRef<std::string> inputs,
+                             llvm::StringRef outputPath) {
+  mlir::MLIRContext context;
+  context.getDiagEngine().registerHandler(
+      [](mlir::Diagnostic &diag) { printDiagnostic(diag); });
+  llvm::SmallVector<LoadedShard> shards;
+  if (!loadLinkShards(inputs, context, shards))
+    return 1;
+  llvm::SmallVector<emitrustcc::ActorUnit> units(shards.size());
+  for (auto [i, shard] : llvm::enumerate(shards)) {
+    std::optional<llvm::StringRef> graph =
+        mlir::emitrust::getShardItemGraph(*shard.module);
+    if (!graph) {
+      llvm::errs() << "error: shard '" << shard.name
+                   << "' carries no item-graph metadata (artifact predates "
+                      "FR-57d?)\n";
+      return 1;
+    }
+    std::optional<mlir::emitrust::ShardSource> source =
+        mlir::emitrust::getShardSource(*shard.module);
+    units[i].sourcePaths.push_back(source ? source->path : shard.name);
+    units[i].graphTexts.push_back(graph->str());
+  }
+  std::vector<std::pair<std::string, std::string>> overrides;
+  if (!loadActorOverrides(overrides))
+    return 1;
+  emitrustcc::ActorPlan plan = emitrustcc::planActors(units, overrides);
+  for (const std::string &note : plan.notes)
+    llvm::errs() << "warning: actor plan: " << note << "\n";
+  return mlir::failed(writeFile(outputPath,
+                                emitrustcc::renderActorPlan(plan)))
+             ? 1
+             : 0;
+}
+
 //===----------------------------------------------------------------------===//
 // FR-43 -- the frontier search's probe
 //===----------------------------------------------------------------------===//
@@ -1627,13 +1735,16 @@ int main(int argc, char **argv) {
   // meaningless with it and is rejected rather than silently ignored.
   // --emit=item-graph is one exception (FR-57d): the shards CARRY their
   // item-graph text, so dumping it per shard needs no import; FR-60's
-  // rejection-report and ratchet are the other two, for the same reason.
+  // rejection-report and ratchet, and FR-62's actor-plan (a pure function
+  // of those same stored graphs), are the others, for the same reason.
   if (linkFlag && emitKind != EmitKind::Rust && emitKind != EmitKind::Crate &&
       emitKind != EmitKind::ItemGraph &&
-      emitKind != EmitKind::RejectionReport && emitKind != EmitKind::Ratchet) {
+      emitKind != EmitKind::RejectionReport && emitKind != EmitKind::Ratchet &&
+      emitKind != EmitKind::ActorPlan) {
     llvm::errs() << "error: --link merges already-converted shards, so only "
                     "--emit=rust, --emit=crate, --emit=item-graph, "
-                    "--emit=rejection-report and --emit=ratchet apply\n";
+                    "--emit=rejection-report, --emit=ratchet and "
+                    "--emit=actor-plan apply\n";
     return 1;
   }
   // FR-59: partitioning is a link-time, crate-emitting operation only —
@@ -1646,6 +1757,12 @@ int main(int argc, char **argv) {
   }
   if (!partitionMapPath.empty() && !partitionFlag) {
     llvm::errs() << "error: --partition-map requires --partition\n";
+    return 1;
+  }
+  // FR-62: the actor map overrides the actor PLAN, so it is meaningful
+  // exactly where a plan is produced.
+  if (!actorMapPath.empty() && emitKind != EmitKind::ActorPlan) {
+    llvm::errs() << "error: --actor-map requires --emit=actor-plan\n";
     return 1;
   }
   // FR-60: both artifact queries read the shard ledgers off the link line.
@@ -1713,6 +1830,11 @@ int main(int argc, char **argv) {
   if (linkFlag && emitKind == EmitKind::ItemGraph)
     return emitLinkShardItemGraphs(inputs, outputPath);
 
+  // FR-62: under --link the actor plan is computed from those same stored
+  // shard graphs — a pure artifact query, one unit per shard.
+  if (linkFlag && emitKind == EmitKind::ActorPlan)
+    return emitLinkActorPlan(inputs, outputPath);
+
   // The item graph and the coloring are pure-AST analyses: no MLIR context,
   // no import, no pipeline. Handled here, before any of that machinery is set
   // up, so that both stay obtainable for a project the importer would reject.
@@ -1723,12 +1845,30 @@ int main(int argc, char **argv) {
     std::string databaseError;
     std::string text;
     bool ok = false;
-    if (emitKind == EmitKind::ItemGraph) {
+    if (emitKind == EmitKind::ItemGraph || emitKind == EmitKind::ActorPlan) {
       mlir::FailureOr<mlir::emitrust::ItemGraph> graph =
           mlir::emitrust::buildItemGraph(inputs, extra, compilationDatabasePath,
                                          databaseError);
-      if ((ok = mlir::succeeded(graph)))
-        text = graph->print();
+      if ((ok = mlir::succeeded(graph))) {
+        if (emitKind == EmitKind::ActorPlan) {
+          // FR-62 source mode: the whole project is ONE planning unit —
+          // the joint graph already keys each TU's file-statics with its
+          // own `tu<i>_` tag, so no per-unit retagging is needed.
+          std::vector<std::pair<std::string, std::string>> overrides;
+          if (!loadActorOverrides(overrides))
+            return 1;
+          emitrustcc::ActorUnit unit;
+          unit.sourcePaths.assign(inputs.begin(), inputs.end());
+          unit.graphTexts.push_back(graph->print());
+          emitrustcc::ActorPlan plan =
+              emitrustcc::planActors(unit, overrides);
+          for (const std::string &note : plan.notes)
+            llvm::errs() << "warning: actor plan: " << note << "\n";
+          text = emitrustcc::renderActorPlan(plan);
+        } else {
+          text = graph->print();
+        }
+      }
     } else {
       mlir::FailureOr<mlir::emitrust::ItemColoring> coloring =
           mlir::emitrust::colorItems(inputs, extra, compilationDatabasePath,
@@ -1884,6 +2024,7 @@ int main(int argc, char **argv) {
   switch (emitKind.getValue()) {
   case EmitKind::ItemGraph:
   case EmitKind::Coloring:
+  case EmitKind::ActorPlan:
     llvm_unreachable("handled before the import");
   case EmitKind::RejectionReport:
   case EmitKind::Ratchet:
