@@ -1756,10 +1756,25 @@ of references or inheritance, so it precedes both.
   notes: DiagnosticsEngine takes DiagnosticOptions by reference now;
   classification must run under an IgnoringDiagConsumer and only for `-c`
   lines (BuildCompilation PRINTS immediate args like --version). Remaining
-  for the checkbox: import-crash isolation (fork or post-hoc) and argv0
-  `cc`/`gcc` aliasing. (Landed since the spike: cc1-key canonicalization
-  and the FR-57 artifact format — see FR-57b/c/d — and target/ABI flag
-  forwarding, below.)
+  for the checkbox: argv0 `cc`/`gcc` aliasing. (Landed since the spike:
+  cc1-key canonicalization and the FR-57 artifact format — see FR-57b/c/d —
+  and target/ABI flag forwarding and import-crash isolation, below.)
+  LANDED (FR-56 import-crash isolation, the fork approach): the whole
+  artifact side-emission — src-hash dependency scan, import, pipeline,
+  serialization, embedding — runs in a forked child per compile job, so a
+  crash anywhere in it is an abnormal child exit the parent observes: it
+  warns, REMOVES any partial sidecar (a child dying mid-serialization must
+  not leave a truncated artifact for the link to trip over), and returns
+  the delegated real clang's exit code unchanged. The real compile was
+  delegated separately all along, so the fork guards exactly the
+  side-emission; a fork failure falls back to in-process emission (losing
+  isolation is recoverable, losing every artifact is not); inherited
+  stream buffers are flushed pre-fork so the child cannot double-write the
+  log. Pinned via the test-only `EMITRUST_TEST_CRASH_IMPORT` hook (an
+  abort in the child; no cheap C input crashes the importer on demand):
+  the build exits 0, the object is byte-identical to a plain-clang
+  compile, the warning names the input, and no artifact file remains
+  (test/Driver/emitrust-clang-crash-isolation.c).
   LANDED (FR-56 target/ABI forwarding): the layout flags on the cc1 line
   now reach the import or reject the TU, never silently neither. SPIKE,
   measured: `-fshort-enums` passed as an extra clang arg flips the
