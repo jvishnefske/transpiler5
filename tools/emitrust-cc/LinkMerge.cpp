@@ -16,6 +16,7 @@
 
 #include "EmitRust/EmitRustDialect.h"
 #include "EmitRust/EmitRustOps.h"
+#include "EmitRust/ShardMetadata.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/OperationSupport.h"
@@ -241,6 +242,13 @@ static LogicalResult renameShardTags(ModuleOp shard, unsigned ordinal) {
 
 FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
     llvm::MutableArrayRef<OwningOpRef<ModuleOp>> shards) {
+  // Step 0: strip the FR-57 shard metadata (item-graph text, rejection
+  // ledger) from every shard. It is a per-TU fact the caller has already
+  // surfaced; the merged whole-program module must stay byte-comparable to
+  // the joint import's, which never carries it.
+  for (OwningOpRef<ModuleOp> &shard : shards)
+    emitrust::stripShardMetadata(*shard);
+
   // Step 1: per-shard alpha-rename to global ordinals.
   for (auto [index, shard] : llvm::enumerate(shards))
     if (failed(renameShardTags(*shard, static_cast<unsigned>(index))))

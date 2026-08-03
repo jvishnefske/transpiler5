@@ -32,6 +32,32 @@
 // module the text artifact used to carry.
 // RUN: emitrust-opt %t.o.emitrust.mlirbc -o - | FileCheck %s
 //
+// FR-57d: the artifact carries the TU's item-graph shard and its
+// rejection-ledger entries as module attributes, keyed for the FR-58 link
+// step: `emitrust.item_graph` is the FR-40 graph's stable line format
+// (same emitted-symbol node keys as the module, `tu0_`-tagged statics
+// included), and `emitrust.rejections` is one dictionary per recovered
+// rejection (the volatile item below), so the link step can identify each
+// TU's fact-starved items without re-parsing any C.
+// RUN: emitrust-opt %t.o.emitrust.mlirbc -o - | FileCheck %s --check-prefix=META
+// META: module attributes
+// META-SAME: emitrust.item_graph =
+// META-SAME: node EXT_COUNTER kind=global def=0 linkage=extern tu=0
+// META-SAME: node shim_answer kind=function def=1 linkage=extern tu=0
+// META-SAME: node tu0_shim_static_helper kind=function def=1 linkage=intern tu=0
+// META-SAME: edge shim_reads_extern -> EXT_COUNTER kind=ReadsGlobal
+// META-SAME: edge shim_uses_static -> tu0_shim_static_helper kind=Calls
+// META-SAME: emitrust.rejections =
+// META-SAME: diagnostic = "unsupported: volatile-qualified type"
+// META-SAME: stubbed = true
+// META-SAME: symbol = "shim_rejected"
+//
+// FR-57d: the metadata-bearing bytecode round-trips BYTE-IDENTICALLY
+// through a reload (emit -> reload -> emit is a fixed point).
+// RUN: emitrust-opt %t.o.emitrust.mlirbc --emit-bytecode -o %t.rt1.mlirbc
+// RUN: emitrust-opt %t.rt1.mlirbc --emit-bytecode -o %t.rt2.mlirbc
+// RUN: cmp %t.rt1.mlirbc %t.rt2.mlirbc
+//
 // FR-57b: the object file carries the payload in its `.emitrust` section,
 // byte-identical to the sidecar.
 // RUN: llvm-objcopy --dump-section .emitrust=%t.payload %t.o
