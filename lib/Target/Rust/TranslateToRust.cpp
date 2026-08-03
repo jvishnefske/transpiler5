@@ -665,6 +665,16 @@ private:
   /// The precedence rank `op`'s just-captured text renders at.
   Prec capturedPrec(Operation *op, StringRef text);
 
+  /// FR-61d slice 3: the per-op prelude every statement-emitting loop
+  /// shares -- a dropped pure op emits nothing (its name is still
+  /// assigned), an inlined op is captured into `inlineExprs` (its buffer
+  /// text removed). Returns true when the op was consumed and the caller
+  /// must not emit it. Used by `emitBlockBody` and the region loops that
+  /// cannot route through it (`emitArmBodyWithTail`, `emitFor`,
+  /// `emitGlobalCells`), so candidates inside those bodies inline exactly
+  /// like entry-block ones.
+  FailureOr<bool> emitDropOrCapture(Operation &op);
+
   /// Whether `op`'s captured text ends in a bare `.. as T` cast (its own
   /// cast tail, or a bare-rendered inlined right operand's).
   bool capturedEndsInCast(Operation *op);
@@ -2119,52 +2129,60 @@ static bool isTailFoldableProducer(Operation *op) {
              emitrust::AddrOfOp, emitrust::SliceOfOp>(op);
 }
 
+FailureOr<bool> RustEmitter::emitDropOrCapture(Operation &op) {
+  // FR-61d: a dropped pure op emits nothing. Its result is still named so
+  // the surviving v-numbering matches the un-dropped rendering exactly.
+  if (droppedOps.count(&op)) {
+    assignName(op.getResult(0));
+    return true;
+  }
+  if (!inlinedOps.count(&op))
+    return false;
+  // FR-61d: an inlined op renders into the buffer with its `let` prologue
+  // suppressed, then the statement text is captured, stripped of
+  // indentation and its trailing `;\n`, and removed from the buffer; the
+  // consumer prints it inline. Invariants are hard runtime checks (the
+  // tree builds -DNDEBUG, a plain assert would vanish): a violation must
+  // fail the translation loudly, never emit silently wrong text.
+  if (&op == tailFoldCandidate)
+    return op.emitOpError("FR-61d: op is both tail-folded and inlined");
+  os.flush();
+  size_t start = buffer.size();
+  pendingInlineCapture = true;
+  LogicalResult captured = emitOperation(op);
+  pendingInlineCapture = false; // defensive; the prologue consumed it
+  if (failed(captured))
+    return failure();
+  os.flush();
+  StringRef text = StringRef(buffer).substr(start);
+  text = text.ltrim();
+  if (!text.ends_with(";\n"))
+    return op.emitOpError(
+        "FR-61d: captured inline statement does not end with ';'");
+  text = text.drop_back(2);
+  std::string expr = text.str();
+  // A numeric constant carries its literal type suffix so the dropped
+  // binding's type annotation cannot orphan an inference anchor.
+  if (auto constant = dyn_cast<emitrust::ConstantOp>(&op))
+    if (auto typed = dyn_cast<TypedAttr>(constant.getValue()))
+      if (isa<IntegerAttr, FloatAttr>(constant.getValue()) &&
+          !typed.getType().isInteger(1))
+        expr += inlineSuffixFor(constant.getResult().getType());
+  Prec prec = capturedPrec(&op, expr);
+  bool endsInCast = capturedEndsInCast(&op);
+  inlineExprs[op.getResult(0)] = {std::move(expr), prec, endsInCast};
+  buffer.resize(start);
+  ++inlineCaptureCount;
+  return true; // pure producers never diverge
+}
+
 LogicalResult RustEmitter::emitBlockBody(Block &block) {
   for (Operation &op : block) {
-    // FR-61d: a dropped pure op emits nothing. Its result is still named so
-    // the surviving v-numbering matches the un-dropped rendering exactly.
-    if (droppedOps.count(&op)) {
-      assignName(op.getResult(0));
+    FailureOr<bool> consumed = emitDropOrCapture(op);
+    if (failed(consumed))
+      return failure();
+    if (*consumed)
       continue;
-    }
-    // FR-61d: an inlined op renders into the buffer with its `let` prologue
-    // suppressed, then the statement text is captured, stripped of
-    // indentation and its trailing `;\n`, and removed from the buffer; the
-    // consumer prints it inline. Invariants are hard runtime checks (the
-    // tree builds -DNDEBUG, a plain assert would vanish): a violation must
-    // fail the translation loudly, never emit silently wrong text.
-    if (inlinedOps.count(&op)) {
-      if (&op == tailFoldCandidate)
-        return op.emitOpError("FR-61d: op is both tail-folded and inlined");
-      os.flush();
-      size_t start = buffer.size();
-      pendingInlineCapture = true;
-      LogicalResult captured = emitOperation(op);
-      pendingInlineCapture = false; // defensive; the prologue consumed it
-      if (failed(captured))
-        return failure();
-      os.flush();
-      StringRef text = StringRef(buffer).substr(start);
-      text = text.ltrim();
-      if (!text.ends_with(";\n"))
-        return op.emitOpError(
-            "FR-61d: captured inline statement does not end with ';'");
-      text = text.drop_back(2);
-      std::string expr = text.str();
-      // A numeric constant carries its literal type suffix so the dropped
-      // binding's type annotation cannot orphan an inference anchor.
-      if (auto constant = dyn_cast<emitrust::ConstantOp>(&op))
-        if (auto typed = dyn_cast<TypedAttr>(constant.getValue()))
-          if (isa<IntegerAttr, FloatAttr>(constant.getValue()) &&
-              !typed.getType().isInteger(1))
-            expr += inlineSuffixFor(constant.getResult().getType());
-      Prec prec = capturedPrec(&op, expr);
-      bool endsInCast = capturedEndsInCast(&op);
-      inlineExprs[op.getResult(0)] = {std::move(expr), prec, endsInCast};
-      buffer.resize(start);
-      ++inlineCaptureCount;
-      continue; // pure producers never diverge
-    }
     // FR-61a: while the fold candidate is emitted, `emitLetPrologue` names
     // its result but prints nothing, leaving only `<rhs>;`.
     pendingTailFold = (&op == tailFoldCandidate);
@@ -2312,8 +2330,31 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
       Value returned = finalReturn->getOperand(0);
       Operation *def = returned.getDefiningOp();
       if (def && def == finalReturn->getPrevNode() && returned.hasOneUse() &&
-          def->getNumResults() == 1 && isTailFoldableProducer(def))
+          def->getNumResults() == 1 && isTailFoldableProducer(def)) {
         tailFoldCandidate = def;
+      } else if (def && ifExprBindings.count(def)) {
+        // FR-61d slice 3: an if-expression binding whose consumed `if`
+        // immediately precedes the tail return, and whose only READ is
+        // that return (its other uses are exactly the two arm assignments
+        // the if-expression rendering consumes), folds too: the function
+        // body ends in the bare if-expression.
+        emitrust::IfOp ifOp = ifExprBindings.lookup(def);
+        if (def->getNextNode() == ifOp.getOperation() &&
+            ifOp->getNextNode() == finalReturn) {
+          bool returnIsOnlyRead = true;
+          for (OpOperand &use : returned.getUses()) {
+            Operation *owner = use.getOwner();
+            if (isBindingWrite(owner, returned))
+              continue; // an arm assignment, consumed by the rendering
+            if (owner != finalReturn) {
+              returnIsOnlyRead = false;
+              break;
+            }
+          }
+          if (returnIsOnlyRead)
+            tailFoldCandidate = def;
+        }
+      }
     }
   }
   // FR-61d: both run after the tail-fold candidate is known so the
@@ -2572,12 +2613,23 @@ LogicalResult RustEmitter::emitIfExprBinding(Operation *op, Value result,
                                              Type valueType,
                                              emitrust::IfOp ifOp) {
   (void)op;
-  // Never `mut`: the both-arms-assign-once shape is exactly the
-  // `deferredInits[op] == false` case.
-  os << "let " << assignName(result) << ": ";
-  if (failed(emitType(result.getLoc(), valueType)))
-    return failure();
-  os << " = if ";
+  // The name is assigned unconditionally so v-numbering stays stable even
+  // when the binding folds away.
+  std::string name = assignName(result);
+  // FR-61d slice 3: when this binding is the tail-fold candidate the `let`
+  // prefix never renders -- the if-expression itself becomes the
+  // function's tail (the statement's trailing `;` is erased by the tail
+  // return, exactly like the FR-61a fold).
+  if (pendingTailFold) {
+    pendingTailFold = false;
+    tailFoldActive = true;
+  } else {
+    os << "let " << name << ": ";
+    if (failed(emitType(result.getLoc(), valueType)))
+      return failure();
+    os << " = ";
+  }
+  os << "if ";
   if (failed(emitOperand(ifOp.getLoc(), ifOp.getCondition(),
                          ExprPos::cond())))
     return failure();
@@ -2604,13 +2656,15 @@ LogicalResult RustEmitter::emitArmBodyWithTail(Region &region, Value binding) {
       os << "\n";
       break;
     }
-    // FR-61d: this loop bypasses `emitBlockBody` (arm-local candidates fall
-    // back to their names -- an accepted coverage gap); dropped ops are
-    // still skipped so cascades cannot leave dangling names.
-    if (droppedOps.count(&op)) {
-      assignName(op.getResult(0));
+    // FR-61d slice 3: arm-local candidates route through the shared
+    // drop/capture prelude, so they inline exactly like entry-block ops
+    // (the inlined arm tail then renders through the never-parens Stmt
+    // position above).
+    FailureOr<bool> consumed = emitDropOrCapture(op);
+    if (failed(consumed))
+      return failure();
+    if (*consumed)
       continue;
-    }
     if (failed(emitOperation(op)))
       return failure();
     if (opDiverges(&op))
@@ -2934,15 +2988,15 @@ LogicalResult RustEmitter::emitFor(emitrust::ForOp forOp) {
   os << "for " << induction << " in (" << *lower << ".." << *upper
      << ").step_by(" << *step << " as usize) {\n";
   increaseIndent();
-  // FR-61d: this loop bypasses `emitBlockBody`, so body-local candidates
-  // are never captured (their consumers fall back to the name their normal
-  // `let` still binds -- an accepted coverage gap); dropped ops must still
-  // be skipped or a cascade-dropped operand def would leave a dangling name.
+  // FR-61d slice 3: body-local candidates route through the shared
+  // drop/capture prelude, so they inline exactly like entry-block ops.
+  // (The induction variable was named above, before any body op.)
   for (Operation &child : body) {
-    if (droppedOps.count(&child)) {
-      assignName(child.getResult(0));
+    FailureOr<bool> consumed = emitDropOrCapture(child);
+    if (failed(consumed))
+      return failure();
+    if (*consumed)
       continue;
-    }
     if (failed(emitOperation(child)))
       return failure();
   }
@@ -3335,12 +3389,15 @@ LogicalResult RustEmitter::emitGlobalCells(emitrust::GlobalCellsOp cellsOp) {
   if (failed(emitType(loc, cells.getType())))
     return failure();
   os << " = __emitrust_tl.as_slice_of_cells();\n";
-  // FR-61d: same bypass as `emitFor` -- skip dropped ops, no capture.
+  // FR-61d slice 3: routed through the shared drop/capture prelude like
+  // `emitFor` (this also un-blocks a future `cell_get` promotion -- its
+  // defs live here -- deliberately NOT taken in this slice).
   for (Operation &child : body) {
-    if (droppedOps.count(&child)) {
-      assignName(child.getResult(0));
+    FailureOr<bool> consumed = emitDropOrCapture(child);
+    if (failed(consumed))
+      return failure();
+    if (*consumed)
       continue;
-    }
     if (failed(emitOperation(child)))
       return failure();
   }

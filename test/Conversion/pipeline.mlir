@@ -13,14 +13,14 @@ func.func @madd(%a: i32, %b: i32, %c: i32) -> i32 {
 }
 
 // FR-61d: the single-use comparison inlines into the FR-61b if-expression
-// binding's condition; the unused SSA-destruction default constant drops.
+// binding's condition, the unused SSA-destruction default constant drops,
+// and (slice 3) the binding folds into the tail if-expression.
 // CHECK-LABEL: fn max(v0: i32, v1: i32) -> i32 {
-// CHECK-NEXT:    let v4: i32 = if v0 > v1 {
+// CHECK-NEXT:    if v0 > v1 {
 // CHECK-NEXT:      v0
 // CHECK-NEXT:    } else {
 // CHECK-NEXT:      v1
-// CHECK-NEXT:    };
-// CHECK-NEXT:    v4
+// CHECK-NEXT:    }
 // CHECK-NEXT:  }
 func.func @max(%a: i32, %b: i32) -> i32 {
   %cond = arith.cmpi sgt, %a, %b : i32

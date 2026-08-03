@@ -1994,6 +1994,21 @@ of references or inheritance, so it precedes both.
     10273), inline captures 3079 -> 4875, multi-use constant binding
     survivors 1098 -> 8 (long literals / for-bound consumers only),
     EndToEnd 123/123 byte-diff green, full suite 440/440, unsafe 0.
+    LANDED 61d slice 3 (2026-08-03): the three capture-bypassing loops
+    (61b arm bodies, for bodies, global_cells bodies) route through the
+    shared drop/capture prelude (`emitDropOrCapture`), so the EXISTING
+    qualification fires there -- arm tails inline into the never-parens
+    Stmt position, for-body candidates into their consumers; and an
+    if-expression binding whose consumed `if` immediately precedes the
+    tail return with the return as its only READ folds via the FR-61a
+    machinery (prologue suppressed in emitIfExprBinding, `;` erased at
+    the return): the function body IS the if-expression --
+    `fn sum_to(n: i32) -> i32 { if n <= 0i32 { 0i32 } else { let v6 =
+    sum_to(n - 1i32); n + v6 } }` is the emitted corpus shape. Cell_get
+    promotion is now UN-BLOCKED by the routing (deliberately not taken
+    this slice). Corpus: `let ` 4655 -> 3882 (-62% vs baseline), inline
+    captures 4875 -> 5576, EndToEnd 123/123 byte-diff green, full suite
+    443/443, unsafe 0.
     SPIKE 61d-0 (2026-08-03): GO. Buffered-capture mechanism prototyped for
     Constant+Add only: capture the op's normal statement rendering from the
     emitter buffer, strip indent + `;\n`, suppress the let prologue while

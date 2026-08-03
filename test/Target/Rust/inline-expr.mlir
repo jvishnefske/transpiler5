@@ -481,3 +481,94 @@ emitrust.func @global_store_blocks(%arg0: i32) -> i32 {
   %r = emitrust.add %g, %arg0 : i32
   emitrust.return %r : i32
 }
+
+// --- FR-61d slice 3: capture routing + if-expression tail fold ---
+
+// The full FR-61 target shape: the deferred binding + both-arms-assign if
+// whose only read is the function-final return folds into the tail
+// if-expression; arm-local candidates inline (the subtraction into the
+// call argument, the addition into the arm tail), and the call-produced
+// binding correctly SURVIVES (calls are never inline producers).
+// CHECK-LABEL: fn sum_to_shape(n: i32) -> i32 {
+// CHECK-NEXT:    if n <= 0i32 {
+// CHECK-NEXT:        0i32
+// CHECK-NEXT:    } else {
+// CHECK-NEXT:        let v5: i32 = sum_to_shape(n - 1i32);
+// CHECK-NEXT:        n + v5
+// CHECK-NEXT:    }
+// CHECK-NEXT:  }
+emitrust.func @sum_to_shape(%arg0: i32) -> i32
+    attributes {emitrust.param_names = ["n"]} {
+  %zero = emitrust.constant <0 : i32> : i32
+  %one = emitrust.constant <1 : i32> : i32
+  %cond = emitrust.cmp le, %arg0, %zero : (i32, i32) -> i1
+  %r = emitrust.let mut %zero : i32
+  emitrust.if %cond {
+    emitrust.assign %r = %zero : i32
+  } else {
+    %sub = emitrust.sub %arg0, %one : i32
+    %call = emitrust.call_opaque "sum_to_shape"(%sub) : (i32) -> i32
+    %add = emitrust.add %arg0, %call : i32
+    emitrust.assign %r = %add : i32
+  }
+  emitrust.return %r : i32
+}
+
+// A for body now routes through the capture mechanism: body-local
+// candidates inline; the induction variable's naming is untouched.
+// CHECK-LABEL: fn for_body_inline(v0: usize, v1: usize, v2: usize) {
+// CHECK-NEXT:    for v3 in (v0..v1).step_by(v2 as usize) {
+// CHECK-NEXT:        sink(v3 * 2usize);
+// CHECK-NEXT:    }
+// CHECK-NEXT:  }
+emitrust.func @for_body_inline(%arg0: index, %arg1: index, %arg2: index) {
+  emitrust.for %i = %arg0 to %arg1 step %arg2 {
+    %two = emitrust.constant <2 : index> : index
+    %m = emitrust.mul %i, %two : index
+    emitrust.call_opaque "sink"(%m) : (index) -> ()
+  }
+  emitrust.return
+}
+
+// An inlined arm tail sits in the never-parens Stmt position whatever its
+// rank -- here the loosest one (a comparison), bare.
+// CHECK-LABEL: fn arm_tail_bare(v0: bool, v1: i32, v2: i32) -> bool {
+// CHECK-NEXT:    if v0 {
+// CHECK-NEXT:        v1 < v2
+// CHECK-NEXT:    } else {
+// CHECK-NEXT:        false
+// CHECK-NEXT:    }
+// CHECK-NEXT:  }
+emitrust.func @arm_tail_bare(%arg0: i1, %arg1: i32, %arg2: i32) -> i1 {
+  %f = emitrust.constant <false> : i1
+  %r = emitrust.let mut %f : i1
+  emitrust.if %arg0 {
+    %c = emitrust.cmp lt, %arg1, %arg2 : (i32, i32) -> i1
+    emitrust.assign %r = %c : i1
+  } else {
+    %c2 = emitrust.constant <false> : i1
+    emitrust.assign %r = %c2 : i1
+  }
+  emitrust.return %r : i1
+}
+
+// NOT folded: an if-expression binding with a second read keeps its `let`
+// (the mul reads it twice; the mul itself tail-folds as before).
+// CHECK-LABEL: fn if_expr_second_use(v0: bool, v1: i32, v2: i32) -> i32 {
+// CHECK-NEXT:    let v3: i32 = if v0 {
+// CHECK-NEXT:        v1
+// CHECK-NEXT:    } else {
+// CHECK-NEXT:        v2
+// CHECK-NEXT:    };
+// CHECK-NEXT:    v3 * v3
+// CHECK-NEXT:  }
+emitrust.func @if_expr_second_use(%arg0: i1, %arg1: i32, %arg2: i32) -> i32 {
+  %r = emitrust.let mut %arg1 : i32
+  emitrust.if %arg0 {
+    emitrust.assign %r = %arg1 : i32
+  } else {
+    emitrust.assign %r = %arg2 : i32
+  }
+  %d = emitrust.mul %r, %r : i32
+  emitrust.return %d : i32
+}

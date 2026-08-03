@@ -54,13 +54,14 @@ emitrust.func @typed_loop(%arg0: i32, %arg1: i32, %arg2: i32) {
 // FR-61b: a deferred binding immediately followed by an if whose BOTH arms
 // end with the binding's only two assignments renders as an if-expression
 // binding: each arm's final assignment becomes the arm's tail expression.
+// FR-61d slice 3: when the binding's only read is the function-final
+// return, the `let` folds away and the if-expression IS the tail.
 // CHECK-LABEL: fn if_expr_binding(v0: bool, v1: i32, v2: i32) -> i32 {
-// CHECK-NEXT:    let v3: i32 = if v0 {
+// CHECK-NEXT:    if v0 {
 // CHECK-NEXT:      v1
 // CHECK-NEXT:    } else {
 // CHECK-NEXT:      v2
-// CHECK-NEXT:    };
-// CHECK-NEXT:    v3
+// CHECK-NEXT:    }
 // CHECK-NEXT:  }
 emitrust.func @if_expr_binding(%arg0: i1, %arg1: i32, %arg2: i32) -> i32 {
   %0 = emitrust.let mut %arg1 : i32
@@ -72,17 +73,16 @@ emitrust.func @if_expr_binding(%arg0: i1, %arg1: i32, %arg2: i32) -> i32 {
   emitrust.return %0 : i32
 }
 
-// FR-61b: arm statements before the final assignment stay as statements; only
-// the final assignment turns into the arm's tail expression.
+// FR-61b: arm statements before the final assignment stay as statements;
+// the final assignment turns into the arm's tail expression -- and with
+// FR-61d slice 3's capture routing the arm-local single-use producers
+// inline straight into that tail.
 // CHECK-LABEL: fn if_expr_binding_stmts(v0: bool, v1: i32) -> i32 {
-// CHECK-NEXT:    let v2: i32 = if v0 {
-// CHECK-NEXT:      let v3: i32 = v1 + v1;
-// CHECK-NEXT:      v3
+// CHECK-NEXT:    if v0 {
+// CHECK-NEXT:      v1 + v1
 // CHECK-NEXT:    } else {
-// CHECK-NEXT:      let v4: i32 = 0;
-// CHECK-NEXT:      v4
-// CHECK-NEXT:    };
-// CHECK-NEXT:    v2
+// CHECK-NEXT:      0i32
+// CHECK-NEXT:    }
 // CHECK-NEXT:  }
 emitrust.func @if_expr_binding_stmts(%arg0: i1, %arg1: i32) -> i32 {
   %0 = emitrust.let mut %arg1 : i32

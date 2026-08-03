@@ -10,18 +10,16 @@
 // also keep vN.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
-// The FR-61 target shape: the parameter name reaches every use, including
-// the recursive call argument and the if-expression condition.
+// The FR-61 target shape: the parameter name reaches every use, the
+// binding folds into the tail if-expression (FR-61d slice 3), and the
+// arm-local subtraction/addition inline while the call binding survives.
 // CHECK-LABEL: fn sum_to(n: i32) -> i32 {
-// CHECK-NEXT:    let v3: i32 = if n <= 0i32 {
+// CHECK-NEXT:    if n <= 0i32 {
 // CHECK-NEXT:        0i32
 // CHECK-NEXT:    } else {
-// CHECK-NEXT:        let v4: i32 = n - 1i32;
-// CHECK-NEXT:        let v5: i32 = sum_to(v4);
-// CHECK-NEXT:        let v6: i32 = n + v5;
-// CHECK-NEXT:        v6
-// CHECK-NEXT:    };
-// CHECK-NEXT:    v3
+// CHECK-NEXT:        let v5: i32 = sum_to(n - 1i32);
+// CHECK-NEXT:        n + v5
+// CHECK-NEXT:    }
 // CHECK-NEXT:  }
 emitrust.func @sum_to(%arg0: i32) -> i32
     attributes {emitrust.param_names = ["n"]} {
