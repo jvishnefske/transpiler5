@@ -1911,6 +1911,28 @@ of references or inheritance, so it precedes both.
   reject; the rejection ledger aggregates into a queryable per-construct
   report (inline asm, volatile, container_of, attributes) that ranks what
   semantic work buys the most frontier.
+- [ ] FR-61 Rustacean-style emission. The emitted Rust should read as
+  expression-oriented Rust, not statement-per-op SSA transliteration; every
+  slice is a pure EMITTER rendering change whose oracle is the EndToEnd
+  byte-diff (behavior identical; golden-text churn expected and updated per
+  slice). Corpus-measured opportunity (473 functions):
+  - [ ] 61a Tail-expression returns: a function-final `return v;` renders as
+    the tail expression `v`, and when `v` is a single-use binding defined by
+    the immediately preceding `let v = <expr>;` the pair folds to the tail
+    `<expr>` (115 corpus sites). `return` in non-tail positions stays.
+  - [ ] 61b If-expression bindings: a deferred `let x: T;` immediately
+    followed by an `if` whose BOTH arms end with their only `x = ...;`
+    assignment renders as `let x: T = if c { ...; a } else { ...; b };`
+    (24 corpus sites; the deferredInits analysis already identifies exactly
+    these bindings).
+  - [ ] 61c While-lift: `loop { ...; if c { break } ... }` shapes back to
+    `while`/`while let` where the SCF lowering's shape allows (172 corpus
+    `loop {`s; SPIKE FIRST -- the condition prefix is statements, not an
+    expression, so only a prefix-free subset lifts mechanically).
+  - [ ] 61d Expression-tree inlining: fold single-use scalar `let vN`
+    temporaries into their one consumer where evaluation order provably
+    cannot change (loads/pure ops only; SPIKE FIRST -- this is the largest
+    readability lever and the most semantics-sensitive).
 
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
