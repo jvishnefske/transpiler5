@@ -6,7 +6,8 @@
 //===----------------------------------------------------------------------===//
 //
 /// \file
-/// Implements `emitrust-actor-lift` (FR-62 slice 4, stage A): the module
+/// Implements `emitrust-actor-lift` (FR-62 slice 4; default-on since
+/// stage B): the module
 /// pass that rewrites a pipeline-stage module into the same-thread actor
 /// shape described by the driver-attached attributes. See
 /// `EmitRust/Conversion/ActorLift.h` for the attribute contract and the
@@ -259,6 +260,16 @@ struct ActorLift
   /// would otherwise hit the impl-SymbolTable wall); otherwise demote the
   /// actor with a warning and leave its globals and functions untouched.
   void vetoUnliftable() {
+    // A GlobalOp initializer the lift restates verbatim as a VariableOp
+    // initializer (driver local, field-init staging variable). The ONE
+    // GlobalOp-legal shape VariableOp rejects is a fn_ptr's opaque
+    // `None`/`Some(f)` expression — there is no typed attribute for
+    // function references — so it must demote rather than hit the
+    // verifier (found by the stage-B default flip: c-testsuite 00088's
+    // `int (*fptr)() = 0;`).
+    auto initRestatable = [](Attribute init) {
+      return !init || isa<ArrayAttr>(init) || isa<TypedAttr>(init);
+    };
     auto isRewritableUse = [&](Operation *user, StringAttr actorName,
                                bool driverOnly) {
       if (!isa<emitrust::GlobalLoadOp, emitrust::GlobalStoreOp>(user))
@@ -272,6 +283,14 @@ struct ActorLift
     };
     for (ActorInfo &actor : actors) {
       for (emitrust::GlobalOp global : actor.globals) {
+        if (!initRestatable(global.getInitAttr())) {
+          global.emitWarning("actor lift: demoted ")
+              << actor.name.getValue() << ": global '" << global.getSymName()
+              << "' carries an initializer with no local restatement "
+                 "(fn_ptr opaque init)";
+          actor.vetoed = true;
+          break;
+        }
         auto uses = SymbolTable::getSymbolUses(global, module);
         bool bad =
             uses && llvm::any_of(*uses, [&](const SymbolTable::SymbolUse &u) {
@@ -329,6 +348,16 @@ struct ActorLift
           fieldOfGlobal.erase(global.getSymName());
     }
     for (LocalInfo &local : locals) {
+      if (!initRestatable(local.global.getInitAttr())) {
+        local.global.emitWarning("actor lift: demoted ")
+            << local.name.getValue() << ": global '"
+            << local.global.getSymName()
+            << "' carries an initializer with no local restatement "
+               "(fn_ptr opaque init)";
+        local.vetoed = true;
+        localOfGlobal.erase(local.global.getSymName());
+        continue;
+      }
       auto uses = SymbolTable::getSymbolUses(local.global, module);
       bool bad =
           uses && llvm::any_of(*uses, [&](const SymbolTable::SymbolUse &u) {
