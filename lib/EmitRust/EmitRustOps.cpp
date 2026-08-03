@@ -608,6 +608,108 @@ LogicalResult EnumVariantOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// ActorRuntimeOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies the FR-62 slice-5b sendable contract: the actor symbol resolves
+/// to a struct_def with a non-empty impl, every impl method is a
+/// named-parameter receiver method whose parameter and result types come
+/// from the struct-field validity set (each of which is `Copy + Send`, so a
+/// message may carry it across the thread boundary), no second anchor names
+/// the same actor (the runtime synthesis is once-per-actor), and no function
+/// outside the actor's impl takes an `!emitrust.mut_ref` of the actor's
+/// struct — state behind a mailbox has no cross-thread borrows.
+LogicalResult ActorRuntimeOp::verify() {
+  auto module = getOperation()->getParentOfType<ModuleOp>();
+  auto structDef = dyn_cast_or_null<StructDefOp>(
+      SymbolTable::lookupSymbolIn(module, getActorAttr()));
+  if (!structDef)
+    return emitOpError("references '@")
+           << getActor() << "' which is not an emitrust.struct_def";
+  for (ActorRuntimeOp other : module.getOps<ActorRuntimeOp>()) {
+    if (other.getOperation() == getOperation())
+      break; // Only earlier anchors: the duplicate reports once.
+    if (other.getActor() == getActor())
+      return emitOpError("duplicate actor_runtime anchor for '@")
+             << getActor() << "'";
+  }
+  ImplOp impl;
+  for (ImplOp candidate : module.getOps<ImplOp>())
+    if (candidate.getStructName() == getActor()) {
+      impl = candidate;
+      break;
+    }
+  if (!impl)
+    return emitOpError("actor '@")
+           << getActor()
+           << "' has no emitrust.impl block to derive the message "
+              "surface from";
+  bool anyMethod = false;
+  for (FuncOp fn : impl.getBody().front().getOps<FuncOp>()) {
+    anyMethod = true;
+    if (fn->hasAttr(kStaticMethodAttrName))
+      return emitOpError("method '")
+             << fn.getSymName()
+             << "' is a static/associated function; a mailbox delegates "
+                "receiver methods only";
+    FunctionType type = fn.getFunctionType();
+    auto paramNames = fn->getAttrOfType<ArrayAttr>(kParamNamesAttrName);
+    for (unsigned i = 1; i < type.getNumInputs(); ++i) {
+      if (!isValidStructFieldType(type.getInput(i)))
+        return emitOpError("method '")
+               << fn.getSymName() << "' parameter #" << i << " type "
+               << type.getInput(i)
+               << " cannot cross the actor thread boundary";
+      StringRef name;
+      if (paramNames && i < paramNames.size())
+        if (auto slot = dyn_cast<StringAttr>(paramNames[i]))
+          name = slot.getValue();
+      if (name.empty())
+        return emitOpError("method '")
+               << fn.getSymName() << "' parameter #" << i
+               << " has no emitrust.param_names entry to name its "
+                  "message field";
+    }
+    if (type.getNumResults() == 1 &&
+        !isValidStructFieldType(type.getResult(0)))
+      return emitOpError("method '")
+             << fn.getSymName() << "' result type " << type.getResult(0)
+             << " cannot cross the actor thread boundary";
+  }
+  if (!anyMethod)
+    return emitOpError("actor '@")
+           << getActor()
+           << "'s impl holds no methods; an empty mailbox would spawn a "
+              "thread nothing can reach";
+  // No cross-thread borrow: an `!emitrust.mut_ref` of the actor's struct is
+  // legal only as the receiver of the actor's own methods.
+  auto isActorMutRef = [&](Type type) {
+    auto mutRef = dyn_cast<MutRefType>(type);
+    auto structType =
+        mutRef ? dyn_cast<StructType>(mutRef.getPointee()) : StructType();
+    return structType && structType.getName() == getActor();
+  };
+  FuncOp offender;
+  module.walk([&](FuncOp fn) {
+    bool isOwnMethod = fn->getParentOp() == impl.getOperation();
+    FunctionType type = fn.getFunctionType();
+    for (unsigned i = isOwnMethod ? 1 : 0; i < type.getNumInputs(); ++i)
+      if (isActorMutRef(type.getInput(i))) {
+        offender = fn;
+        return WalkResult::interrupt();
+      }
+    return WalkResult::advance();
+  });
+  if (offender)
+    return emitOpError("function '")
+           << offender.getSymName() << "' takes !emitrust.mut_ref of actor "
+           << "'@" << getActor()
+           << "' outside its impl; state behind a mailbox has no "
+              "cross-thread borrows";
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // GlobalOp
 //===----------------------------------------------------------------------===//
 

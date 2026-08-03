@@ -839,6 +839,63 @@ def EmitRust_EnumVariantOp : EmitRust_Op<"enum_variant"> {
 }
 
 //===----------------------------------------------------------------------===//
+// ActorRuntimeOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_ActorRuntimeOp : EmitRust_Op<"actor_runtime", [
+    HasParent<"::mlir::ModuleOp">]> {
+  let summary = "Actor runtime anchor: synthesize a mailbox runtime";
+  let description = [{
+    The `emitrust.actor_runtime` operation anchors the FR-62 slice-5b
+    runtime synthesis for one lifted actor: the emitter derives the whole
+    message surface from the referenced struct's `emitrust.impl` — a
+    message enum (variant = UpperCamel(method), payload fields = the
+    method's parameters via `emitrust.param_names`, plus a per-call typed
+    reply channel `std::sync::mpsc::Sender<R>`, `Sender<()>` for a void
+    method), a `<Actor>Handle` alias of the shared `actor_rt::Handle<Msg>`,
+    a `spawn` associated function holding the mailbox loop (one match arm
+    per method, delegating to the existing method on the moved state and
+    replying), and one wrapper per method on the Handle's inherent impl.
+    The shared `mod actor_rt` runtime (Handle/call/reap/shutdown) is a
+    fixed epilogue the emitter appends once per module when any
+    `emitrust.actor_runtime` op exists.
+
+    The op carries NO reified message enum on purpose (the SLICE-5b SPIKE's
+    B-prime verdict): a reply channel field is `Clone`-not-`Copy`, which
+    `emitrust.data_enum_def`'s unconditional Copy derive cannot carry
+    without moving the failure to rustc, and the enum is 100% mechanically
+    derivable from the impl, so reification would add a verifier obligation
+    with no information.
+
+    The handle value stays `!emitrust.opaque<"<Actor>Handle">` (the type
+    decision recorded in design.md): the emitter's opaque-receiver
+    mutability classifier resolves handle method calls to `&mut self`
+    through the module's anchor ops, so no new type crosses the surface.
+
+    The verifier pins the sendable contract: the actor symbol resolves to
+    an `emitrust.struct_def` with a non-empty `emitrust.impl`, every impl
+    method is a named-parameter receiver method whose parameter and result
+    types come from the struct-field validity set (every one `Copy + Send`),
+    and no function outside the actor's impl holds an
+    `!emitrust.mut_ref` of the actor's struct — state behind a mailbox has
+    no cross-thread borrows.
+
+    Example:
+
+    ```mlir
+    emitrust.actor_runtime @CounterActor mode = threaded
+    ```
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$actor,
+                       EmitRust_ActorModeAttr:$mode);
+  let results = (outs);
+
+  let assemblyFormat = "$actor `mode` `=` $mode attr-dict";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // GlobalOp
 //===----------------------------------------------------------------------===//
 
