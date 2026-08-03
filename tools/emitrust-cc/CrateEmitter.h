@@ -114,6 +114,19 @@ std::string sanitizeCrateName(llvm::StringRef stem);
 /// \returns true when a `c_main` EmitRust function is present.
 bool hasCMain(mlir::ModuleOp module);
 
+/// FR-62 slice 5c: returns true if `module` carries any
+/// `emitrust.actor_runtime` anchor in mode `async` — the trigger for the
+/// tokio crate flavor (the async `fn main` shim in the crate root and the
+/// unconditional tokio dependency in the manifest). Anchor-derived rather
+/// than flag-derived so the manifest exactly tracks what the crate root
+/// references: a `--actor-mode=async` run whose every actor demoted emits
+/// a crate with no tokio reference, and its manifest stays the default —
+/// the offline contract (E4) is preserved for crates that need nothing.
+///
+/// \param module the fully converted module about to be rendered.
+/// \returns true when any async-mode actor runtime anchor is present.
+bool hasAsyncActorRuntime(mlir::ModuleOp module);
+
 /// Renders the complete contents of the crate's `Cargo.toml`.
 ///
 /// The manifest is minimal: a `[package]` table with the given name, version
@@ -129,10 +142,24 @@ bool hasCMain(mlir::ModuleOp module);
 /// the question FR-51 introduced, and the one a consuming build system asks.
 /// A `CrateType::Bin` manifest is byte-identical to the pre-FR-51 output.
 ///
+/// FR-62 slice 5c: `asyncActorRuntime` (default false) selects the ASYNC
+/// crate flavor's manifest — E4's posture: never a cargo feature (a
+/// default-off optional dependency already breaks `cargo build --offline`,
+/// the measured NO-GO), but an UNCONDITIONAL `[dependencies]` entry
+/// `tokio = { version = "1", features = ["rt", "sync"] }` appended after
+/// the same `[package]`/`[lints.rust]` tables, which are byte-identical to
+/// the default manifest. The feature list is measured, not E4's recorded
+/// guess: the explicit `Builder::new_current_thread()` main shim needs no
+/// "macros" (3 crates in the dependency tree vs 10 with the attribute
+/// macro). Its offline build fails loudly at resolution — the correct
+/// failure direction.
+///
 /// \param crateName the sanitized package name.
 /// \param type the crate shape.
+/// \param asyncActorRuntime append the async flavor's tokio dependency.
 /// \returns the manifest text.
-std::string renderCargoToml(llvm::StringRef crateName, CrateType type);
+std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
+                            bool asyncActorRuntime = false);
 
 /// Renders the crate-root Rust source for `module` (`src/main.rs` for a
 /// binary crate, `src/lib.rs` for a library one).
@@ -142,6 +169,11 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type);
 /// `translateToRust` output of the module. A `CrateType::Bin` root then ends
 /// with a verbatim `fn main() { std::process::exit(c_main()); }` wrapper (or
 /// its argc-passing variant) and is byte-identical to the pre-FR-51 output.
+/// FR-62 slice 5c: when the module carries an async actor runtime anchor,
+/// `c_main` is an `async fn` and the wrapper is the current_thread shim —
+/// `tokio::runtime::Builder::new_current_thread().enable_all().build()`
+/// driving `block_on(c_main())` — chosen over `#[tokio::main]` because it
+/// needs no "macros" feature (measured: 3 dependency-tree crates vs 10).
 /// A `CrateType::Lib` root has no wrapper and is translated with
 /// `RustEmitOptions::exportItems`, so its external-linkage functions and its
 /// types are `pub`.

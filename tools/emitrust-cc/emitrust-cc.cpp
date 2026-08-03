@@ -403,9 +403,15 @@ static llvm::cl::opt<ActorModeRequest> actorModeFlag(
                    "with a warning; lift-demoted actors keep today's "
                    "form silently"),
         clEnumValN(ActorModeRequest::Async, "async",
-                   "the tokio task flavor (E4); not yet emitted -- "
-                   "requesting it is an error until the async slice "
-                   "lands")),
+                   "the tokio task flavor (E4): each eligible actor's "
+                   "state moves to a tokio task behind an unbounded "
+                   "mailbox on a current_thread runtime; every call is "
+                   "an async wrapper awaited IMMEDIATELY, so effect "
+                   "order equals program order. A SEPARATELY EMITTED "
+                   "crate flavor, never a cargo feature: the manifest "
+                   "carries an unconditional tokio dependency and its "
+                   "offline build fails loudly at resolution. Same "
+                   "lift precondition and veto UX as threaded")),
     llvm::cl::init(ActorModeRequest::SameThread));
 
 static llvm::cl::opt<std::string> ratchetBaselinePath(
@@ -689,7 +695,12 @@ static mlir::LogicalResult emitCrate(mlir::ModuleOp module,
       emitrustcc::renderCrateRoot(module, type);
   if (mlir::failed(rootRs))
     return mlir::failure();
-  std::string cargoToml = emitrustcc::renderCargoToml(crateName, type);
+  // FR-62 slice 5c: an async actor runtime anchor selects the tokio
+  // manifest flavor (unconditional dependency, E4); the manifest tracks
+  // the module, so a run whose every actor demoted keeps the default,
+  // offline-buildable manifest.
+  std::string cargoToml = emitrustcc::renderCargoToml(
+      crateName, type, emitrustcc::hasAsyncActorRuntime(module));
 
   llvm::SmallString<256> srcDir(outDir);
   llvm::sys::path::append(srcDir, "src");
@@ -1840,23 +1851,23 @@ int main(int argc, char **argv) {
                     "--emit=rust or --emit=crate\n";
     return 1;
   }
-  // FR-62 slice 5b: the actor-mode composition rules (the SLICE-5b SPIKE
-  // paragraph, verbatim contract). async is defined in the attribute space
-  // but not yet emitted -- requesting it fails loudly, never silently
-  // emits the threaded flavor. threaded REQUIRES the lift (E3's mandatory
-  // precondition: the negative control proved a non-owned cluster on a
-  // thread is a silent miscompile, the worst failure direction). Under
-  // --link every actor is rule-5 demoted, so threaded mode warns that it
-  // threads nothing rather than pretending otherwise.
-  if (actorModeFlag == ActorModeRequest::Async) {
-    llvm::errs() << "error: --actor-mode=async is not yet emitted (the "
-                    "async crate flavor is a recorded later slice)\n";
-    return 1;
-  }
-  if (actorModeFlag == ActorModeRequest::Threaded && !actorLiftFlag) {
-    llvm::errs() << "error: --actor-mode=threaded requires the actor lift "
-                    "(remove --actor-lift=false): ownership lift is a "
-                    "mandatory precondition of threaded mode\n";
+  // FR-62 slice 5b/5c: the actor-mode composition rules (the SLICE-5b
+  // SPIKE paragraph, verbatim contract; slice 5c makes async a real mode
+  // with the SAME rules). Both non-default modes REQUIRE the lift (E3's
+  // mandatory precondition: the negative control proved a non-owned
+  // cluster on a thread is a silent miscompile, the worst failure
+  // direction; an async task owns its state by the same argument). Under
+  // --link every actor is rule-5 demoted, so both modes warn that they
+  // reify nothing rather than pretending otherwise.
+  const bool reifyingActorMode = actorModeFlag == ActorModeRequest::Threaded ||
+                                 actorModeFlag == ActorModeRequest::Async;
+  llvm::StringRef actorModeName =
+      actorModeFlag == ActorModeRequest::Threaded ? "threaded" : "async";
+  if (reifyingActorMode && !actorLiftFlag) {
+    llvm::errs() << "error: --actor-mode=" << actorModeName
+                 << " requires the actor lift (remove --actor-lift=false): "
+                    "ownership lift is a mandatory precondition of "
+                 << actorModeName << " mode\n";
     return 1;
   }
   if (actorModeFlag.getNumOccurrences() > 0 &&
@@ -1867,9 +1878,13 @@ int main(int argc, char **argv) {
                     "--emit=rust or --emit=crate\n";
     return 1;
   }
-  if (actorModeFlag == ActorModeRequest::Threaded && linkFlag)
-    llvm::errs() << "warning: --actor-mode=threaded under --link threads "
-                    "nothing: every actor is demoted (rule 5)\n";
+  if (reifyingActorMode && linkFlag)
+    llvm::errs() << "warning: --actor-mode=" << actorModeName
+                 << " under --link "
+                 << (actorModeFlag == ActorModeRequest::Threaded
+                         ? "threads"
+                         : "spawns")
+                 << " nothing: every actor is demoted (rule 5)\n";
   // FR-60: both artifact queries read the shard ledgers off the link line.
   if (emitKind == EmitKind::RejectionReport && !linkFlag) {
     llvm::errs() << "error: --emit=rejection-report requires --link\n";
@@ -2181,21 +2196,20 @@ int main(int argc, char **argv) {
                                demotion.remarkLine, demotion.remarkColumn))
               << demotion.remarkText;
       }
-      // FR-62 slice 5b: under --actor-mode=threaded every certified actor
-      // is selected for the emitrust-actor-thread pass (per-actor
-      // selection is deferred; the anchor op already carries mode per
-      // actor, so later plumbing is driver-only). The list is computed
-      // HERE, beside the lift attachment, because the lift pass strips
-      // its own attributes: the actor names are read from the attribute
-      // contract before the pipeline consumes it. Actors the lift pass
-      // itself demotes (its IR-level safety-net veto) leave no struct_def
-      // behind, and the thread pass skips those SILENTLY -- demoted
-      // actors were never lifted, so they keep today's form; thread-
-      // INELIGIBLE lifted actors get the pass's located stays-same-thread
-      // warning instead.
-      bool threadActors =
-          actorModeFlag == ActorModeRequest::Threaded &&
-          attachment.attachedAny;
+      // FR-62 slice 5b/5c: under --actor-mode=threaded or =async every
+      // certified actor is selected for the emitrust-actor-thread pass
+      // (per-actor selection is deferred; the anchor op already carries
+      // mode per actor, so later plumbing is driver-only — the pass is
+      // mode-agnostic and stamps whichever mode this list carries). The
+      // list is computed HERE, beside the lift attachment, because the
+      // lift pass strips its own attributes: the actor names are read
+      // from the attribute contract before the pipeline consumes it.
+      // Actors the lift pass itself demotes (its IR-level safety-net
+      // veto) leave no struct_def behind, and the thread pass skips those
+      // SILENTLY -- demoted actors were never lifted, so they keep
+      // today's form; reification-INELIGIBLE lifted actors get the pass's
+      // located stays-same-thread warning instead.
+      bool threadActors = reifyingActorMode && attachment.attachedAny;
       if (threadActors) {
         llvm::SmallVector<mlir::Attribute> selected;
         if (auto actorsAttr = (*module)->getAttrOfType<mlir::ArrayAttr>(
@@ -2209,7 +2223,8 @@ int main(int argc, char **argv) {
                          mlir::StringAttr::get(&context, "name"), name),
                      mlir::NamedAttribute(
                          mlir::StringAttr::get(&context, "mode"),
-                         mlir::StringAttr::get(&context, "threaded"))}));
+                         mlir::StringAttr::get(&context,
+                                               actorModeName))}));
         if (selected.empty())
           threadActors = false;
         else

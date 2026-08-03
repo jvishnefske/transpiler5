@@ -324,12 +324,16 @@ private:
   /// the `<Actor>Handle` alias of `actor_rt::Handle<Msg>`, the `spawn`
   /// associated function holding the mailbox loop, and one wrapper per
   /// method on the Handle's inherent impl. The shared `mod actor_rt` text
-  /// is appended once by `emitModule`. mode=async fails loudly: the async
-  /// flavor is a recorded later slice.
+  /// is appended once by `emitModule`. Slice 5c: the anchor's mode picks
+  /// the substrate — std::sync::mpsc + std::thread (threaded) or tokio
+  /// unbounded mailbox + oneshot replies + `async` wrappers with immediate
+  /// await (async, E4's separately emitted crate flavor); the derivation
+  /// is identical.
   LogicalResult emitActorRuntime(emitrust::ActorRuntimeOp op);
   /// Emits `<place>.<method>(args);`, bound with a `let` when the call
   /// produces a result. Rust's auto-ref scopes the `&mut` borrow of the
-  /// receiver place to the call expression.
+  /// receiver place to the call expression. A call on an ASYNC actor
+  /// handle appends `.await` (FR-62 slice 5c).
   LogicalResult emitMethodCall(emitrust::MethodCallOp callOp);
   /// Emits `use <path>;`.
   LogicalResult emitUse(emitrust::UseOp useOp);
@@ -903,6 +907,37 @@ static bool isMutatingStlMethod(llvm::StringRef name) {
   return mutating.contains(name);
 }
 
+/// The module's `emitrust.actor_runtime` anchor whose "<Actor>Handle"
+/// opaque handle type is the receiver of `call`, or null when the receiver
+/// is not an actor handle (the FR-62 slice-5b type decision: the handle is
+/// `!emitrust.opaque<"<Actor>Handle">`, resolved through the anchors — no
+/// new handle type crosses the surface).
+static emitrust::ActorRuntimeOp handleAnchorFor(emitrust::MethodCallOp call) {
+  Type receiverType = call.getReceiver().getType();
+  Type valueType = isa<emitrust::LValueType>(receiverType)
+                       ? cast<emitrust::LValueType>(receiverType).getValueType()
+                       : receiverType;
+  auto opaqueType = dyn_cast<emitrust::OpaqueType>(valueType);
+  if (!opaqueType)
+    return {};
+  auto module = call->getParentOfType<ModuleOp>();
+  if (!module)
+    return {};
+  for (auto runtime : module.getOps<emitrust::ActorRuntimeOp>())
+    if (opaqueType.getValue() == (runtime.getActor() + "Handle").str())
+      return runtime;
+  return {};
+}
+
+/// FR-62 slice 5c: whether `call` is a driver call on an ASYNC actor
+/// handle — exactly the sites that append `.await` (immediate await = at
+/// most one message in flight, so effect order equals program order) and
+/// force their containing function to render `async fn`.
+static bool isAsyncHandleCall(emitrust::MethodCallOp call) {
+  emitrust::ActorRuntimeOp anchor = handleAnchorFor(call);
+  return anchor && anchor.getMode() == emitrust::ActorMode::async;
+}
+
 bool RustEmitter::methodCallMutatesReceiver(emitrust::MethodCallOp call) {
   Type receiverType = call.getReceiver().getType();
   Type valueType = isa<emitrust::LValueType>(receiverType)
@@ -916,11 +951,9 @@ bool RustEmitter::methodCallMutatesReceiver(emitrust::MethodCallOp call) {
   // handle, while the closed STL name list would classify the read-style
   // wrapper names (`get_*`) as non-mutating and render the handle binding
   // without `mut` — a hard E0596 in the emitted crate (found by the spike).
-  if (auto opaqueType = dyn_cast<emitrust::OpaqueType>(valueType)) {
-    if (auto module = call->getParentOfType<ModuleOp>())
-      for (auto runtime : module.getOps<emitrust::ActorRuntimeOp>())
-        if (opaqueType.getValue() == (runtime.getActor() + "Handle").str())
-          return true;
+  if (isa<emitrust::OpaqueType>(valueType)) {
+    if (handleAnchorFor(call))
+      return true;
     // A recognized STL container: classify by the (closed) method-name set.
     return isMutatingStlMethod(call.getMethod());
   }
@@ -2340,6 +2373,60 @@ static constexpr char kActorRtModule[] =
 }
 )";
 
+/// FR-62 slice 5c: the ASYNC flavor of the shared actor runtime (E4's
+/// separately emitted tokio crate flavor). Same shape and same
+/// single-panic-provenance contract as the threaded text above, on the
+/// tokio substrate: an UNBOUNDED mpsc mailbox (send never awaits, so the
+/// wrapper's only suspension point is the reply await — at most one
+/// message in flight, effect order equals program order on the
+/// current_thread runtime), oneshot replies, and a tokio JoinHandle whose
+/// JoinError re-raises the actor's own panic payload via `into_panic`.
+/// Probe-proven (crate builds warning-clean and runs on features
+/// ["rt", "sync"] only).
+static constexpr char kActorRtModuleAsync[] =
+    R"(mod actor_rt {
+    pub struct Handle<M> {
+        pub tx: tokio::sync::mpsc::UnboundedSender<M>,
+        pub join: Option<tokio::task::JoinHandle<()>>,
+    }
+    impl<M> Handle<M> {
+        /// Actor is unreachable: await its task and re-raise its panic here.
+        pub async fn reap(&mut self) -> ! {
+            let join = self.join.take().expect("actor already reaped");
+            match join.await {
+                Err(err) if err.is_panic() => std::panic::resume_unwind(err.into_panic()),
+                Err(_) => panic!("actor task cancelled"),
+                Ok(()) => panic!("actor exited without replying"),
+            }
+        }
+        /// Unbounded send + immediate await of the reply; disconnection on
+        /// either side reaps the actor.
+        pub async fn call<T>(&mut self, msg: M, rrx: tokio::sync::oneshot::Receiver<T>) -> T {
+            if self.tx.send(msg).is_err() {
+                self.reap().await;
+            }
+            match rrx.await {
+                Ok(v) => v,
+                Err(_) => self.reap().await,
+            }
+        }
+        /// Graceful shutdown: drop the sender to end the mailbox loop, await
+        /// the task, and propagate a late actor panic with its own payload.
+        pub async fn shutdown(self) {
+            let Handle { tx, join } = self;
+            drop(tx);
+            if let Some(join) = join {
+                if let Err(err) = join.await {
+                    if err.is_panic() {
+                        std::panic::resume_unwind(err.into_panic());
+                    }
+                }
+            }
+        }
+    }
+}
+)";
+
 LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   // FR-57a: a module carrying an `emitrust.extern_decl`-marked declaration
   // is one translation unit's SHARD, not a program — the marked symbol's
@@ -2363,14 +2450,30 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
            << "': the module must be linked against the defining translation "
               "unit before Rust emission";
   }
-  bool anyActorRuntime = false;
+  // FR-62 slice 5c: the shared `mod actor_rt` epilogue exists once per
+  // crate and its text is flavor-specific, so every anchor in one module
+  // must agree on the mode. The driver never produces a mixed module
+  // (--actor-mode is global); reaching emission with one must fail loudly
+  // at the disagreeing anchor, never emit one flavor's runtime under the
+  // other's wrappers.
+  emitrust::ActorRuntimeOp firstAnchor;
+  for (auto runtime : moduleOp.getOps<emitrust::ActorRuntimeOp>()) {
+    if (!firstAnchor) {
+      firstAnchor = runtime;
+      continue;
+    }
+    if (runtime.getMode() != firstAnchor.getMode())
+      return runtime.emitError("actor '")
+             << runtime.getActor() << "' mode disagrees with actor '"
+             << firstAnchor.getActor()
+             << "': one module carries one actor_rt runtime flavor";
+  }
   for (Operation &op : *moduleOp.getBody()) {
     if (!isa<emitrust::UseOp, emitrust::VerbatimOp, emitrust::FuncOp,
              emitrust::ImplOp, emitrust::StructDefOp, emitrust::EnumDefOp,
              emitrust::DataEnumDefOp, emitrust::GlobalOp,
              emitrust::TraitDefOp, emitrust::ActorRuntimeOp>(&op))
       return op.emitOpError("unable to translate op");
-    anyActorRuntime |= isa<emitrust::ActorRuntimeOp>(&op);
     if (failed(emitOperation(op)))
       return failure();
   }
@@ -2379,9 +2482,13 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   // fixed, message-type-generic module, emitted once per crate when any
   // actor_runtime anchor exists (the same once-per-module epilogue posture
   // as the importer's __emitrust_fmt_f64 helper, but emitter-owned: the
-  // anchor op is the trigger, no verbatim op carries the text).
-  if (anyActorRuntime)
-    os << kActorRtModule;
+  // anchor op is the trigger, no verbatim op carries the text). Slice 5c:
+  // the anchors' shared mode picks the flavor — std::thread/mpsc for
+  // threaded, tokio for async.
+  if (firstAnchor)
+    os << (firstAnchor.getMode() == emitrust::ActorMode::async
+               ? kActorRtModuleAsync
+               : kActorRtModule);
   return success();
 }
 
@@ -2427,12 +2534,12 @@ static llvm::StringRef carriedParamName(emitrust::FuncOp fn, unsigned index) {
 }
 
 LogicalResult RustEmitter::emitActorRuntime(emitrust::ActorRuntimeOp op) {
-  // The async flavor is a SEPARATELY EMITTED CRATE FLAVOR (E4) landing in a
-  // later slice; reaching emission with it must fail loudly, never emit the
-  // threaded runtime under the wrong name.
-  if (op.getMode() == emitrust::ActorMode::async)
-    return op.emitError("async actor runtime is not yet emitted "
-                        "(--actor-mode=async is a recorded later slice)");
+  // FR-62 slice 5c: mode picks the substrate — std::sync::mpsc +
+  // std::thread for threaded, tokio (unbounded mailbox + oneshot replies +
+  // async wrappers with immediate await) for async. The DERIVATION is
+  // identical (B-prime: everything from the impl), so both flavors share
+  // this function with the substrate strings switched.
+  const bool isAsync = op.getMode() == emitrust::ActorMode::async;
   auto module = op->getParentOfType<ModuleOp>();
   llvm::StringRef actor = op.getActor();
   emitrust::ImplOp impl;
@@ -2480,13 +2587,16 @@ LogicalResult RustEmitter::emitActorRuntime(emitrust::ActorRuntimeOp op) {
 
   // 1. The message enum: one variant per impl method, the per-call typed
   //    reply channel as the trailing field (`Sender<()>` keeps a void call
-  //    synchronous and C-sequenced under the same rule, E3).
+  //    synchronous and C-sequenced under the same rule, E3; the async
+  //    flavor's reply channel is a tokio oneshot).
   os << "enum " << msgName << " {\n";
   for (emitrust::FuncOp fn : methods) {
     os << "    " << upperCamel(fn.getSymName()) << " { ";
     if (failed(emitParamFields(fn)))
       return failure();
-    os << "reply: std::sync::mpsc::Sender<";
+    os << "reply: "
+       << (isAsync ? "tokio::sync::oneshot::Sender<"
+                   : "std::sync::mpsc::Sender<");
     if (failed(emitReplyType(fn)))
       return failure();
     os << "> },\n";
@@ -2498,21 +2608,40 @@ LogicalResult RustEmitter::emitActorRuntime(emitrust::ActorRuntimeOp op) {
 
   // 3. The inherent impl: spawn (channel + moved state + mailbox loop, one
   //    arm per variant delegating to the existing method and replying), then
-  //    one wrapper per method (fresh reply channel + self.call).
+  //    one wrapper per method (fresh reply channel + self.call). The async
+  //    spawn stays a plain fn: tokio::task::spawn needs only the runtime
+  //    CONTEXT (the main shim's block_on), not an async caller, and an
+  //    unbounded sender's send never awaits.
   os << "impl actor_rt::Handle<" << msgName << "> {\n";
   os << "    fn spawn(mut state: " << actor << ") -> Self {\n";
-  os << "        let (tx, rx) = std::sync::mpsc::channel::<" << msgName
-     << ">();\n";
-  os << "        let join = std::thread::spawn(move || {\n";
-  os << "            for msg in rx {\n";
+  if (isAsync) {
+    os << "        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<"
+       << msgName << ">();\n";
+    os << "        let join = tokio::task::spawn(async move {\n";
+    os << "            while let Some(msg) = rx.recv().await {\n";
+  } else {
+    os << "        let (tx, rx) = std::sync::mpsc::channel::<" << msgName
+       << ">();\n";
+    os << "        let join = std::thread::spawn(move || {\n";
+    os << "            for msg in rx {\n";
+  }
   os << "                match msg {\n";
   for (emitrust::FuncOp fn : methods) {
     os << "                    " << msgName << "::"
        << upperCamel(fn.getSymName()) << " { ";
     emitParamNames(fn);
     os << "reply } => {\n";
-    os << "                        reply.send(state." << fn.getSymName()
-       << "(";
+    // The loud-failure form differs by substrate: mpsc's SendError is
+    // Debug regardless of the payload (expect works), while a tokio
+    // oneshot returns the unsent value ITSELF on failure — no Debug bound
+    // exists, so the async arm checks is_err and panics with the same
+    // message.
+    if (isAsync)
+      os << "                        if reply.send(state." << fn.getSymName()
+         << "(";
+    else
+      os << "                        reply.send(state." << fn.getSymName()
+         << "(";
     bool first = true;
     for (unsigned i = 1; i < fn.getFunctionType().getNumInputs(); ++i) {
       if (!first)
@@ -2520,7 +2649,14 @@ LogicalResult RustEmitter::emitActorRuntime(emitrust::ActorRuntimeOp op) {
       first = false;
       os << carriedParamName(fn, i);
     }
-    os << ")).expect(\"actor caller dropped reply receiver\");\n";
+    if (isAsync) {
+      os << ")).is_err() {\n";
+      os << "                            panic!(\"actor caller dropped "
+            "reply receiver\");\n";
+      os << "                        }\n";
+    } else {
+      os << ")).expect(\"actor caller dropped reply receiver\");\n";
+    }
     os << "                    }\n";
   }
   os << "                }\n";
@@ -2529,7 +2665,8 @@ LogicalResult RustEmitter::emitActorRuntime(emitrust::ActorRuntimeOp op) {
   os << "        Self { tx, join: Some(join) }\n";
   os << "    }\n";
   for (emitrust::FuncOp fn : methods) {
-    os << "    fn " << fn.getSymName() << "(&mut self";
+    os << (isAsync ? "    async fn " : "    fn ") << fn.getSymName()
+       << "(&mut self";
     FunctionType type = fn.getFunctionType();
     for (unsigned i = 1; i < type.getNumInputs(); ++i) {
       os << ", " << carriedParamName(fn, i) << ": ";
@@ -2543,11 +2680,15 @@ LogicalResult RustEmitter::emitActorRuntime(emitrust::ActorRuntimeOp op) {
         return failure();
     }
     os << " {\n";
-    os << "        let (rtx, rrx) = std::sync::mpsc::channel();\n";
+    os << (isAsync
+               ? "        let (rtx, rrx) = tokio::sync::oneshot::channel();\n"
+               : "        let (rtx, rrx) = std::sync::mpsc::channel();\n");
     os << "        self.call(" << msgName << "::"
        << upperCamel(fn.getSymName()) << " { ";
     emitParamNames(fn);
-    os << "reply: rtx }, rrx)\n";
+    // The IMMEDIATE await is the async ordering contract (E4): the wrapper
+    // suspends until the reply, so at most one message is ever in flight.
+    os << "reply: rtx }, rrx)" << (isAsync ? ".await" : "") << "\n";
     os << "    }\n";
   }
   os << "}\n";
@@ -2668,7 +2809,17 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   bool isMethod = isa<emitrust::ImplOp>(op->getParentOp()) &&
                   !op->hasAttr(emitrust::kStaticMethodAttrName);
   StringRef symbol = SymbolTable::getSymbolName(op).getValue();
-  os << itemVisibility(symbol) << "fn " << symbol;
+  // FR-62 slice 5c: a function that method_calls an ASYNC actor handle
+  // (the driver of an async-mode actor — the pass guarantees handles never
+  // escape the constructing driver) renders `async fn`: its handle calls
+  // all carry `.await`, which needs the async context. Everything else is
+  // byte-identical to the pre-async rendering.
+  bool isAsyncFn = false;
+  op->walk([&](emitrust::MethodCallOp call) {
+    if (isAsyncHandleCall(call))
+      isAsyncFn = true;
+  });
+  os << itemVisibility(symbol) << (isAsyncFn ? "async fn " : "fn ") << symbol;
   // FR-52: a function in the transitive closure of a caller of an external
   // requirement is generic over the requirement trait. Everything else keeps
   // the signature it always had, so a project with no requirements is
@@ -2863,7 +3014,14 @@ LogicalResult RustEmitter::emitMethodCall(emitrust::MethodCallOp callOp) {
     if (failed(emitOperand(loc, argument, ExprPos::delimited())))
       return failure();
   }
-  os << ");\n";
+  os << ")";
+  // FR-62 slice 5c: a call on an async actor handle awaits IMMEDIATELY —
+  // the wrapper (and the consuming shutdown) is an `async fn`, and the
+  // instant await keeps at most one message in flight, so effect order
+  // equals program order on the current_thread runtime (E4).
+  if (isAsyncHandleCall(callOp))
+    os << ".await";
+  os << ";\n";
   return success();
 }
 
