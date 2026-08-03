@@ -47,7 +47,8 @@
 /// node <symbol> kind=<function|record|enum|global> def=<0|1> \
 ///      linkage=<extern|intern> tu=<i> loc=<file>:<line>:<col>
 /// edge <symbol> -> <symbol> kind=<Calls|CallsIndirect|SigType|BodyType|\
-///      Field|Base|ReadsGlobal|WritesGlobal|TakesAddressOf>
+///      Field|Base|ReadsGlobal|WritesGlobal|TakesAddressOf|FieldIndirect|\
+///      AddressOfGlobal>
 /// \endcode
 ///
 /// (each real line is unwrapped — there are exactly two line shapes, and
@@ -150,7 +151,11 @@ enum class EdgeKind {
   Base,
   /// A global variable is read from the source item's body or initializer.
   /// Taking a global's address counts as a read: it is a reference to the
-  /// object that does not itself store to it.
+  /// object that does not itself store to it. Address-taking ADDITIONALLY
+  /// records an `AddressOfGlobal` edge for the same pair (FR-62), so this
+  /// kind alone is unchanged from before that kind existed, and a consumer
+  /// computes "read-only, address-never-taken" as the set difference
+  /// ReadsGlobal-minus-AddressOfGlobal.
   ReadsGlobal,
   /// A global variable is assigned, compound-assigned, or incremented/
   /// decremented in the source item's body. A compound assignment or an
@@ -178,6 +183,22 @@ enum class EdgeKind {
   /// (`from`, `kind`, `to`) edge order, the successor order FR-41 takes its
   /// blame minimum in, and every golden `--emit=item-graph` line.
   FieldIndirect,
+  /// The source item takes the target GLOBAL's address: `&g`, `&g.field` /
+  /// `&g[i]` (a subobject's address escapes the same storage), or the
+  /// array-to-pointer decay of a global array used as a VALUE (returned,
+  /// passed as an argument, stored into a pointer). A subscript READ
+  /// `g[i]` is not this — its base decay feeds the subscript and no
+  /// pointer survives it. Every `AddressOfGlobal` edge is accompanied by a
+  /// `ReadsGlobal` edge for the same (`from`, `to`) pair, preserving that
+  /// kind's historical meaning (see its comment); FR-62's actor planner
+  /// needs the split because a read-only, address-never-taken footprint is
+  /// certifiable where a direction-blind one is not. The FUNCTION analogue
+  /// remains `TakesAddressOf`.
+  ///
+  /// Appended to the enumeration for the same reason as `FieldIndirect`:
+  /// every other kind keeps its enumerator value, and with it the edge
+  /// order and every golden `--emit=item-graph` line.
+  AddressOfGlobal,
 };
 
 /// The stable spelling of `kind` used in `node ... kind=<...>` lines:

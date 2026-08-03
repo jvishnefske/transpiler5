@@ -673,6 +673,12 @@ ColorReason redReasonFor(EdgeKind kind) {
     return ColorReason::RedType;
   case EdgeKind::ReadsGlobal:
   case EdgeKind::WritesGlobal:
+  case EdgeKind::AddressOfGlobal:
+    // Never the blame minimum in practice: every AddressOfGlobal edge is
+    // accompanied by a ReadsGlobal edge for the same pair (FR-62), and
+    // ReadsGlobal's smaller enumerator value wins the successor-order
+    // minimum. Handled here so the reason is right by construction, not by
+    // that pairing.
     return ColorReason::RedGlobal;
   }
   return ColorReason::RedType;
