@@ -83,7 +83,7 @@ int main(void) {
 // unchanged by Stage 4 (regression coverage that the new B4 fallback
 // does not disturb the pre-existing rule).
 // CHECK-LABEL: func.func @link_node
-// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"}
+// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"
 // CHECK: emitrust.switch %{{.*}} : i64
 // CHECK-NEXT: case 0 {
 // CHECK: node_self_Bases::E0
@@ -100,7 +100,7 @@ int main(void) {
 // cast+widen, Stage 2) and compares it directly against `x`'s own loaded
 // cursor with a plain `arith.cmpi ne` — no base-identity machinery.
 // CHECK-LABEL: func.func @find
-// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"}
+// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"
 // CHECK: ^bb1
 // CHECK: %[[FIELD:.*]] = emitrust.member %{{.*}}["self_"]
 // CHECK: %[[LOADED:.*]] = emitrust.load %[[FIELD]]

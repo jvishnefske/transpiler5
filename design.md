@@ -2009,7 +2009,7 @@ of references or inheritance, so it precedes both.
     emitArmBodyWithTail iterate ops without emitBlockBody -- captures there
     degrade gracefully to by-name, route or accept deliberately; (5) pin
     exponent-float suffixing (`1e30f64`) by test, absent from corpus.
-  - [ ] 61e Real C local names: `emitrust.variable` gains an optional
+  - [x] 61e Real C local names: `emitrust.variable` gains an optional
     `name` attr carrying the final Rust spelling (importer-side
     mangleMemberName); the emitter prefers it over vN, `_`-prefixes unused
     names, and uniquifies per function (never shadows). Parameters carried
@@ -2032,7 +2032,24 @@ of references or inheritance, so it precedes both.
     recover-stub-callable's RUST line (`local.callee(...)`);
     tests test/Dialect round-trip+invalid, test/Import/C/local-names.c,
     test/Target/Rust/variable-names.mlir pin the three layers.
-    Parameters (61e-2) remain open.
+    LANDED 61e slice 2 (2026-08-03): the importer sets a discardable
+    `emitrust.param_names` ArrayAttr (one slot per SIGNATURE INPUT; empty
+    for unnamed C params, by-value shadows, the receiver, and cursor
+    inputs; string-cursor BASE slots are named so the slice reads back as
+    `(*name)[..]`; omitted entirely when every slot is empty). The
+    FuncToEmitRust discardable-attr forwarding carries it for free; the
+    emitter claims each named argument through the same uniquifier as
+    named locals (args first, so a same-named local becomes `name_1`;
+    unused named params render `_name`; methods keep hard-wired `self`,
+    slot 0 ignored; named params do not consume vN counter numbers).
+    Va-clone signatures keep vN (clone path not wired -- synthesized
+    extras dominate there). Corpus: 430 of 494 emitted params named
+    (87%; remainder = shadowed by-value/cursor/unnamed/clone params);
+    `fn sum_to(n: i32) -> i32` with `n` at every use is real. Full suite
+    443/443, EndToEnd 123/123 byte-diff green, unsafe 0. FR-61 wrap-up
+    corpus numbers: `let ` bindings 10273 (pre-61d) -> 4655 (-55%),
+    ~4875 inline sites + ~553 drops, 441 named local bindings, 430 named
+    params, byte-diff oracle held through every slice.
     plain signed non-address-taken scalar locals are dissolved by mem2reg
     and re-materialize as SCF-lowering lets with no decl association --
     they keep vN this iteration; naming them needs work at SCF-lift time

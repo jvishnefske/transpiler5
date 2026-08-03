@@ -27,7 +27,7 @@
 // TRAIT-NEXT: }
 // TRAIT:      pub fn scaled<E: Externals>(
 // TRAIT:      pub fn banded<E: Externals>(
-// TRAIT:      pub fn plain_sum(v0: i32, v1: i32) -> i32 {
+// TRAIT:      pub fn plain_sum(a: i32, b: i32) -> i32 {
 //
 // RUN: rustc --edition=2021 --crate-type=rlib \
 // RUN:   --crate-name=lib_crate_externals_trait %t.crate/src/lib.rs -o %t.rlib

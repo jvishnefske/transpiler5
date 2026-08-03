@@ -601,6 +601,28 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   if (cxxHasReceiver)
     currentCxxThisRef = entryBlock->getArgument(0);
 
+  // FR-61e slice 2: one `emitrust.param_names` slot per signature input.
+  // A slot stays empty when the C parameter is unnamed, when its value is
+  // copied into a named shadow variable (bindOrdinaryParam's by-value
+  // path -- the shadow already took the spelling, and two bindings must
+  // never share one), for the method receiver (self is hard-wired), and
+  // for the synthesized cursor input of a string-cursor parameter.
+  SmallVector<Attribute> paramNameSlots(functionType.getNumInputs(),
+                                        builder.getStringAttr(""));
+  auto paramSlotName = [&](const clang::ParmVarDecl *param,
+                           Type argType) -> std::string {
+    if (param->getName().empty())
+      return {};
+    bool isRef =
+        llvm::isa<emitrust::MutRefType, emitrust::RefType>(argType);
+    bool shadowed =
+        !isRef && (llvm::isa<emitrust::StructType, emitrust::EnumType,
+                             emitrust::FnPtrType>(argType) ||
+                   isUnsignedInt(argType) || addressTaken.contains(param));
+    if (shadowed)
+      return {};
+    return mangleMemberName(param->getName());
+  };
   unsigned entryArgIndex = (methodOwner || cxxHasReceiver) ? 1 : 0;
   for (const clang::ParmVarDecl *param : func->parameters()) {
     // main's `argv` was dropped from the imported signature (it has no
@@ -615,11 +637,17 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       Value baseArg = entryBlock->getArgument(entryArgIndex);
       Value cursorArg = entryBlock->getArgument(entryArgIndex + 1);
       entryArgIndex += 2;
+      // The base slice reads back as `(*name)[..]`; the cursor stays vN.
+      if (!param->getName().empty())
+        paramNameSlots[entryArgIndex - 2] =
+            builder.getStringAttr(mangleMemberName(param->getName()));
       if (failed(bindCursorParam(param, baseArg, cursorArg, paramLoc)))
         return failure();
       continue;
     }
     Value blockArg = entryBlock->getArgument(entryArgIndex++);
+    paramNameSlots[entryArgIndex - 1] =
+        builder.getStringAttr(paramSlotName(param, blockArg.getType()));
     // An integer-carrier `void *` parameter (CTS-P3) is a plain i64
     // scalar; remember it so truth tests and carrier reads route to its
     // prologue cell (bound through the ordinary scalar path below).
@@ -642,6 +670,13 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
     if (failed(bindOrdinaryParam(param, blockArg, paramLoc)))
       return failure();
   }
+  // An all-empty slot array carries no information; omit it so no-param
+  // and fully-shadowed signatures keep their attribute dicts unchanged.
+  if (llvm::any_of(paramNameSlots, [](Attribute slot) {
+        return !cast<StringAttr>(slot).getValue().empty();
+      }))
+    funcOp->setAttr(emitrust::kParamNamesAttrName,
+                    builder.getArrayAttr(paramNameSlots));
 
   // W2.2: a constructor's member-initializer list (`CXXCtorInitializer`s,
   // which live OUTSIDE `getBody()`) lowers to ordinary member assignments

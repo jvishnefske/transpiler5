@@ -53,8 +53,8 @@ int main(void) {
 // BINLAYOUT-NOT: lib.rs
 
 // BIN: #![allow(dead_code, unused_assignments)]
-// BIN: fn tu0_helper(v0: i32) -> i32 {
-// BIN: fn doubled(v0: i32) -> i32 {
+// BIN: fn tu0_helper(x: i32) -> i32 {
+// BIN: fn doubled(x: i32) -> i32 {
 // BIN: fn c_main() -> i32 {
 // BIN: fn main() { std::process::exit(c_main()); }
 

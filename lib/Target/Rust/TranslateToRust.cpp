@@ -235,6 +235,12 @@ private:
   /// name (v0, v1, ...) if the value has not been named yet.
   std::string assignName(Value value);
 
+  /// FR-61e: binds `value` under the carried spelling `base`, applying the
+  /// `_`-prefix rule for never-read values and uniquifying against every
+  /// name already bound in the function. Shared by named variables
+  /// (`assignName`) and named parameters (`emitFunc`).
+  std::string claimName(Value value, StringRef base);
+
   /// Returns the Rust name previously bound to `value`, or a located error
   /// if the value has not been defined yet.
   FailureOr<std::string> lookupName(Location loc, Value value);
@@ -745,28 +751,33 @@ static bool isFnPtrNone(Value value) {
   return opaque && opaque.getValue() == "None";
 }
 
+std::string RustEmitter::claimName(Value value, StringRef base) {
+  // The `_`-prefix rule for never-read bindings applies to carried names
+  // exactly as to generated ones, and a collision with any earlier binding
+  // uniquifies with `_1`, `_2`, ... -- a shadowing re-`let` of the same
+  // spelling is never emitted.
+  std::string stem = ((valueIsRead(value) ? "" : "_") + base).str();
+  std::string candidate = stem;
+  for (unsigned i = 1; usedBindingNames.contains(candidate); ++i)
+    candidate = (stem + "_" + Twine(i)).str();
+  usedBindingNames.insert(candidate);
+  valueNames[value] = candidate;
+  return candidate;
+}
+
 std::string RustEmitter::assignName(Value value) {
   std::string &name = valueNames[value];
   if (!name.empty())
     return name;
-  bool read = valueIsRead(value);
   // FR-61e: a variable carrying its C name (pre-mangled importer-side)
-  // binds under that spelling; the `_`-prefix rule for never-read bindings
-  // applies to it exactly as to generated names, and a collision with any
-  // earlier binding uniquifies (never shadows).
-  if (auto variable = value.getDefiningOp<emitrust::VariableOp>()) {
-    if (std::optional<StringRef> cName = variable.getCName()) {
-      std::string base = ((read ? "" : "_") + *cName).str();
-      std::string candidate = base;
-      for (unsigned i = 1; usedBindingNames.contains(candidate); ++i)
-        candidate = (base + "_" + Twine(i)).str();
-      usedBindingNames.insert(candidate);
-      name = candidate;
-      return name;
-    }
-  }
+  // binds under that spelling. (Named PARAMETERS are claimed up front by
+  // `emitFunc`, so they never reach this path.)
+  if (auto variable = value.getDefiningOp<emitrust::VariableOp>())
+    if (std::optional<StringRef> cName = variable.getCName())
+      return claimName(value, *cName);
   // Generated names skip forward past spellings a named local claimed, so
   // a C local literally named `v3` can never collide with the counter.
+  bool read = valueIsRead(value);
   std::string candidate;
   do {
     candidate = ((read ? "v" : "_v") + Twine(valueCount++)).str();
@@ -2333,18 +2344,34 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
     os << "<" << emitrust::kExternalsTypeParam << ": " << generic.getValue()
        << ">";
   os << "(";
+  // FR-61e slice 2: a function carrying `emitrust.param_names` binds each
+  // non-receiver argument under its slot's spelling through the same
+  // uniquifier as named locals (arguments are named first, so a same-named
+  // body local uniquifies to `<name>_1`, never the parameter). Empty
+  // slots -- unnamed C parameters, by-value shadows whose variable already
+  // took the name, cursor inputs -- keep the generated vN.
+  auto paramNames =
+      op->getAttrOfType<ArrayAttr>(emitrust::kParamNamesAttrName);
   bool first = true;
   for (BlockArgument argument : entryBlock.getArguments()) {
     if (!first)
       os << ", ";
     first = false;
     if (isMethod && argument.getArgNumber() == 0) {
+      // The receiver is hard-wired `self`; its slot, if any, is ignored.
       valueNames[argument] = "self";
       os << (isa<emitrust::RefType>(argument.getType()) ? "&self"
                                                          : "&mut self");
       continue;
     }
-    os << assignName(argument) << ": ";
+    StringRef carried;
+    if (paramNames && argument.getArgNumber() < paramNames.size())
+      if (auto slot =
+              dyn_cast<StringAttr>(paramNames[argument.getArgNumber()]))
+        carried = slot.getValue();
+    os << (carried.empty() ? assignName(argument)
+                           : claimName(argument, carried))
+       << ": ";
     if (failed(emitType(argument.getLoc(), argument.getType())))
       return failure();
   }

@@ -33,7 +33,7 @@ void fill(int *p, int n) {
 }
 // CHECK-LABEL: func.func @fill
 // CHECK-SAME: (%[[SELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>, %[[IDX:.*]]: i64, %{{.*}}: i32)
-// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"}
+// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"
 // CHECK: %[[RCV:.*]] = emitrust.deref %[[SELF]] : (!emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>) -> !emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>
 // CHECK: %[[DATA:.*]] = emitrust.member %[[RCV]]["data"] : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>) -> !emitrust.lvalue<!emitrust.array<8xi32>>
 // CHECK: emitrust.subscript %[[DATA]][%{{.*}}] : (!emitrust.lvalue<!emitrust.array<8xi32>>, i64) -> !emitrust.lvalue<i32>
@@ -50,7 +50,7 @@ int sum(int *p, int n) {
 }
 // CHECK-LABEL: func.func @sum
 // CHECK-SAME: (%{{.*}}: !emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>, %{{.*}}: i64, %{{.*}}: i32) -> i32
-// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"}
+// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"
 // CHECK: emitrust.member %{{.*}}["data"]
 
 // A sibling method call: the receiver is the method's own dereferenced
@@ -59,7 +59,7 @@ int total(int *p, int n) {
   return sum(p, n);
 }
 // CHECK-LABEL: func.func @total
-// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"}
+// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"
 // CHECK: %[[TREF:.*]] = emitrust.addr_of mut %{{.*}} : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>) -> !emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>
 // CHECK: call @sum(%[[TREF]], %{{.*}}, %{{.*}}) {emitrust.method_call}
 
