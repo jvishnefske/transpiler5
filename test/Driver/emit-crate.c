@@ -26,6 +26,6 @@ int main(void) { return add(20, 22) - 42; }
 // TOML-NEXT: non_camel_case_types = "deny"
 
 // MAIN: #![allow(dead_code, unused_assignments)]
-// MAIN: fn add(v0: i32, v1: i32) -> i32 {
+// MAIN: fn add(a: i32, b: i32) -> i32 {
 // MAIN: fn c_main() -> i32 {
 // MAIN: fn main() { std::process::exit(c_main()); }

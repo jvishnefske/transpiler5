@@ -36,6 +36,18 @@ inline constexpr llvm::StringLiteral kMethodOfAttrName = "emitrust.method_of";
 inline constexpr llvm::StringLiteral kMethodCallAttrName =
     "emitrust.method_call";
 
+/// FR-61e: name of the discardable `func.func`/`emitrust.func` ArrayAttr of
+/// StringAttr carrying one slot per SIGNATURE INPUT with the parameter's
+/// final Rust base spelling (importer-side `mangleMemberName`). A slot is
+/// the empty string when the C parameter is unnamed, when the parameter's
+/// value was copied into a named shadow variable (two bindings must never
+/// share a spelling), when the input is a method receiver (`self` is
+/// hard-wired), or when it is the synthesized second (cursor) input of a
+/// string-cursor parameter. The Rust emitter binds each named argument
+/// through the same per-function uniquifier as named locals.
+inline constexpr llvm::StringLiteral kParamNamesAttrName =
+    "emitrust.param_names";
+
 /// W2.2: name of the discardable `func.func`/`emitrust.func` unit attribute
 /// marking a method-of-tagged function that takes NO receiver (a
 /// static/associated function, e.g. a C++ `static` member function).

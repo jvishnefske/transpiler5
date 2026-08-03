@@ -134,7 +134,7 @@ int drive(void) {
 // `emitrust.addr_of`).
 // CHECK-LABEL: func.func @Bumper_both
 // CHECK-SAME: (%[[BSELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Bumper">>)
-// CHECK-SAME: attributes {emitrust.method_of = "Bumper"}
+// CHECK-SAME: attributes {emitrust.method_of = "Bumper"
 // CHECK: %[[B1:.*]] = emitrust.deref %[[BSELF]] : (!emitrust.mut_ref<!emitrust.struct<"Bumper">>) -> !emitrust.lvalue<!emitrust.struct<"Bumper">>
 // CHECK-NEXT: %[[B1REF:.*]] = emitrust.addr_of mut %[[B1]] : (!emitrust.lvalue<!emitrust.struct<"Bumper">>) -> !emitrust.mut_ref<!emitrust.struct<"Bumper">>
 // CHECK-NEXT: call @Bumper_bump(%[[B1REF]]) {emitrust.method_call}
@@ -163,7 +163,7 @@ int drive(void) {
 // CHECK: emitrust.struct_def @Reader ["v_"] [i32]
 // CHECK-LABEL: func.func @Reader_scaled
 // CHECK-SAME: (%[[RSELF:.*]]: !emitrust.ref<!emitrust.struct<"Reader">>) -> i32
-// CHECK-SAME: attributes {emitrust.method_of = "Reader"}
+// CHECK-SAME: attributes {emitrust.method_of = "Reader"
 // CHECK: %[[R1:.*]] = emitrust.deref %[[RSELF]] : (!emitrust.ref<!emitrust.struct<"Reader">>) -> !emitrust.lvalue<!emitrust.struct<"Reader">>
 // CHECK-NEXT: %[[R1REF:.*]] = emitrust.addr_of %[[R1]] : (!emitrust.lvalue<!emitrust.struct<"Reader">>) -> !emitrust.ref<!emitrust.struct<"Reader">>
 // CHECK-NEXT: call @Reader_raw(%[[R1REF]]) {emitrust.method_call}
@@ -173,7 +173,7 @@ int drive(void) {
 // CHECK: emitrust.struct_def @Mixed ["v_"] [i32]
 // CHECK-LABEL: func.func @Mixed_grow
 // CHECK-SAME: (%[[MSELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Mixed">>)
-// CHECK-SAME: attributes {emitrust.method_of = "Mixed"}
+// CHECK-SAME: attributes {emitrust.method_of = "Mixed"
 // (Anchored on the borrow rather than on the deref: `grow`'s body reads
 // `v_` before it calls, so the call's own deref is not the body's first.)
 // CHECK: %[[M1REF:.*]] = emitrust.addr_of %{{.*}} : (!emitrust.lvalue<!emitrust.struct<"Mixed">>) -> !emitrust.ref<!emitrust.struct<"Mixed">>

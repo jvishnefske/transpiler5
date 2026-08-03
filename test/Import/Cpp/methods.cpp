@@ -123,7 +123,7 @@ int use_counters(void) {
 // zero-parameter overload keeps the bare name.
 // CHECK-LABEL: func.func @Counter_new
 // CHECK-SAME: (%[[NDSELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Counter">>)
-// CHECK-SAME: attributes {emitrust.method_of = "Counter"}
+// CHECK-SAME: attributes {emitrust.method_of = "Counter"
 // CHECK: %[[NDRCV:.*]] = emitrust.deref %[[NDSELF]] : (!emitrust.mut_ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[NDFLD:.*]] = emitrust.member %[[NDRCV]]["value"] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<i32>
 // CHECK: %[[NDZERO:.*]] = arith.constant 0 : i32
@@ -135,7 +135,7 @@ int use_counters(void) {
 // the same way, binding the incoming parameter instead of a constant.
 // CHECK-LABEL: func.func @Counter_new_i
 // CHECK-SAME: (%[[NISELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Counter">>, %[[START:.*]]: i32)
-// CHECK-SAME: attributes {emitrust.method_of = "Counter"}
+// CHECK-SAME: attributes {emitrust.method_of = "Counter"
 // CHECK: %[[NIRCV:.*]] = emitrust.deref %[[NISELF]] : (!emitrust.mut_ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[NIFLD:.*]] = emitrust.member %[[NIRCV]]["value"] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[NIFLD]] = %[[START]] : !emitrust.lvalue<i32>
@@ -146,7 +146,7 @@ int use_counters(void) {
 // `value = value + d;` is an implicit `this->value` read-modify-write.
 // CHECK-LABEL: func.func @Counter_inc
 // CHECK-SAME: (%[[INCSELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Counter">>, %[[D:.*]]: i32)
-// CHECK-SAME: attributes {emitrust.method_of = "Counter"}
+// CHECK-SAME: attributes {emitrust.method_of = "Counter"
 // CHECK: %[[INCRCV:.*]] = emitrust.deref %[[INCSELF]] : (!emitrust.mut_ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[INCFLD:.*]] = emitrust.member %[[INCRCV]]["value"] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[INCFLD]] = %{{.*}} : !emitrust.lvalue<i32>
@@ -156,7 +156,7 @@ int use_counters(void) {
 // pin. Bare name (empty parameter type-code suffix).
 // CHECK-LABEL: func.func @Counter_get
 // CHECK-SAME: (%[[GSELF:.*]]: !emitrust.ref<!emitrust.struct<"Counter">>) -> i32
-// CHECK-SAME: attributes {emitrust.method_of = "Counter"}
+// CHECK-SAME: attributes {emitrust.method_of = "Counter"
 // CHECK: %[[GRCV:.*]] = emitrust.deref %[[GSELF]] : (!emitrust.ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: emitrust.member %[[GRCV]]["value"]
 
@@ -167,7 +167,7 @@ int use_counters(void) {
 // place shape.
 // CHECK-LABEL: func.func @Counter_get_i
 // CHECK-SAME: (%[[GISELF:.*]]: !emitrust.ref<!emitrust.struct<"Counter">>, %[[OFFSET:.*]]: i32) -> i32
-// CHECK-SAME: attributes {emitrust.method_of = "Counter"}
+// CHECK-SAME: attributes {emitrust.method_of = "Counter"
 // CHECK: %[[GIRCV:.*]] = emitrust.deref %[[GISELF]] : (!emitrust.ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: emitrust.member %[[GIRCV]]["value"]
 
@@ -183,7 +183,7 @@ int use_counters(void) {
 // CHECK: emitrust.struct_def @Other ["v"] [i32]
 // CHECK-LABEL: func.func @Other_get
 // CHECK-SAME: (%[[OSELF:.*]]: !emitrust.ref<!emitrust.struct<"Other">>) -> i32
-// CHECK-SAME: attributes {emitrust.method_of = "Other"}
+// CHECK-SAME: attributes {emitrust.method_of = "Other"
 // CHECK: emitrust.member %{{.*}}["v"]
 
 // The driver: every call-site shape in one place.

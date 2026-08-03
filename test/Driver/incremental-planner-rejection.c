@@ -50,7 +50,7 @@ int main(void) { return helper(1); }
 // WARN: dropped 'consume' [ptr-to-ptr] unsupported: pointer-to-pointer parameter escapes the string-cursor shape
 
 // Both translatable items reach the crate; the rejected one leaves no trace.
-// RUST: fn tu0_helper(v0: i32) -> i32 {
+// RUST: fn tu0_helper(x: i32) -> i32 {
 // RUST: fn c_main() -> i32 {
 // RUST:     tu0_helper(1i32)
 // RUST-NOT: consume

@@ -96,7 +96,7 @@ int main(void) {
 // DIFFERENT parameter-rooted bases as belonging to one class instead of
 // rejecting the comparison outright).
 // CHECK-LABEL: func.func @unite
-// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"}
+// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"
 // CHECK: %[[RA:.*]] = call @find
 // CHECK: memref.store %[[RA]], %[[RACELL:.*]][]
 // CHECK: %[[RB:.*]] = call @find

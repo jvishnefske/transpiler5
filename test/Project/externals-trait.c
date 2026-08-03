@@ -16,12 +16,12 @@
 // LIB:      pub trait Externals {
 // LIB-NEXT:     fn host_scale(v0: i32) -> i32;
 // LIB-NEXT: }
-// LIB:      pub fn scaled<E: Externals>(v0: i32) -> i32 {
+// LIB:      pub fn scaled<E: Externals>(v: i32) -> i32 {
 // LIB:          let {{.*}} = E::host_scale({{.*}});
-// LIB:      pub fn twice<E: Externals>(v0: i32) -> i32 {
+// LIB:      pub fn twice<E: Externals>(v: i32) -> i32 {
 // LIB:          let {{.*}} = scaled::<E>({{.*}});
 // A function that reaches no requirement keeps its exact signature.
-// LIB:      pub fn untouched(v0: i32, v1: i32) -> i32 {
+// LIB:      pub fn untouched(a: i32, b: i32) -> i32 {
 
 // The SAME project with an entry point is a binary crate under `auto`, and a
 // binary crate has no caller to supply the impl -- so the historical
@@ -51,8 +51,8 @@
 // that merely INVOKES the pointer stays non-generic -- the pointer value is
 // already monomorphized by the time it is passed.
 // RUN: emitrust-cc --emit=rust %t/fnptr.c -o - | FileCheck --check-prefix=FNPTR %s
-// FNPTR:      pub fn apply(v0: Option<fn(i32) -> i32>, v1: i32) -> i32 {
-// FNPTR:      pub fn run<E: Externals>(v0: i32) -> i32 {
+// FNPTR:      pub fn apply(v0: Option<fn(i32) -> i32>, v: i32) -> i32 {
+// FNPTR:      pub fn run<E: Externals>(v: i32) -> i32 {
 // FNPTR:          let {{.*}}: Option<fn(i32) -> i32> = Some(scaled::<E>);
 // FNPTR:          let {{.*}}: Option<fn(i32) -> i32> = Some(plain);
 

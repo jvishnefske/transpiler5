@@ -22,7 +22,7 @@ int main(void) {
 // CHECK: #![allow(dead_code, unused_assignments)]
 
 // The helper function keeps its name; C main is renamed to c_main.
-// CHECK: fn twice(v0: i32) -> i32 {
+// CHECK: fn twice(x: i32) -> i32 {
 // CHECK: fn c_main() -> i32 {
 
 // The printf call renders as a print! macro invocation inside c_main; the

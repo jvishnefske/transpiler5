@@ -51,7 +51,7 @@ int main(void) {
 // CHECK: emitrust.struct_def @node ["self_", "x"] [!emitrust.enum<"node_self_Bases">, i32]
 
 // CHECK-LABEL: func.func @link_node
-// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"}
+// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"
 //   The write lowers to a genuine match over the assigned i64 index: one
 //   case per array element assigning that index's enum constant, plus a
 //   default (provably unreachable) case assigning E0.
@@ -67,7 +67,7 @@ int main(void) {
 // CHECK: emitrust.assign
 
 // CHECK-LABEL: func.func @check_node
-// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"}
+// CHECK-SAME: attributes {emitrust.method_of = "Owner_main_arr"
 //   The read decodes with a plain cast (no branching) and widens to i64.
 // CHECK: %[[FIELD:.*]] = emitrust.member %{{.*}}["self_"] : (!emitrust.lvalue<!emitrust.struct<"node">>) -> !emitrust.lvalue<!emitrust.enum<"node_self_Bases">>
 // CHECK: %[[LOADED:.*]] = emitrust.load %[[FIELD]]

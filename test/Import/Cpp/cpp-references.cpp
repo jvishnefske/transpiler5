@@ -168,7 +168,7 @@ int drive(void) {
 // CHECK: emitrust.struct_def @Accum ["total_"] [i32]
 // CHECK-LABEL: func.func @Accum_add
 // CHECK-SAME: (%[[ASELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Accum">>, %[[AV:.*]]: !emitrust.ref<i32>)
-// CHECK-SAME: attributes {emitrust.method_of = "Accum"}
+// CHECK-SAME: attributes {emitrust.method_of = "Accum"
 // CHECK: %[[AVP:.*]] = emitrust.deref %[[AV]] : (!emitrust.ref<i32>) -> !emitrust.lvalue<i32>
 // CHECK-NEXT: %[[AVL:.*]] = emitrust.load %[[AVP]] : (!emitrust.lvalue<i32>) -> i32
 // CHECK-NEXT: %[[ASUM:.*]] = arith.addi %{{.*}}, %[[AVL]] : i32
@@ -180,7 +180,7 @@ int drive(void) {
 // the case where they do not.
 // CHECK-LABEL: func.func @Accum_take
 // CHECK-SAME: (%[[TSELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Accum">>, %[[TP:.*]]: !emitrust.mut_ref<!emitrust.struct<"Point">>)
-// CHECK-SAME: attributes {emitrust.method_of = "Accum"}
+// CHECK-SAME: attributes {emitrust.method_of = "Accum"
 // CHECK: %[[TPP:.*]] = emitrust.deref %[[TP]] : (!emitrust.mut_ref<!emitrust.struct<"Point">>) -> !emitrust.lvalue<!emitrust.struct<"Point">>
 // CHECK-NEXT: %[[TPY:.*]] = emitrust.member %[[TPP]]["y"] : (!emitrust.lvalue<!emitrust.struct<"Point">>) -> !emitrust.lvalue<i32>
 
