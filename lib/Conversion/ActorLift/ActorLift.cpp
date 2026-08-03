@@ -58,6 +58,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 
 namespace mlir {
 namespace emitrust {
@@ -253,8 +254,10 @@ struct ActorLift
 
   /// The safety-net veto (see the header): re-verify on the IR that every
   /// use of every owned global is a load/store inside an attributed
-  /// function; otherwise demote the actor with a warning and leave its
-  /// globals and functions untouched.
+  /// function, and that no ARM touches a mutable global its actor does not
+  /// own (an importer-synthesized backing global, invisible to the plan,
+  /// would otherwise hit the impl-SymbolTable wall); otherwise demote the
+  /// actor with a warning and leave its globals and functions untouched.
   void vetoUnliftable() {
     auto isRewritableUse = [&](Operation *user, StringAttr actorName,
                                bool driverOnly) {
@@ -282,6 +285,44 @@ struct ActorLift
             << "' has a use outside the planned actor surface";
         actor.vetoed = true;
         break;
+      }
+      // An arm moves into the impl (a SymbolTable), where a mutable global
+      // the actor does not own is unreachable — a shape the plan cannot
+      // see when the global is importer-synthesized (e.g. a string-literal
+      // `_BACKING` array). Demote rather than fail: today's thread-local
+      // form is the sound fallback.
+      if (!actor.vetoed) {
+        llvm::StringSet<> owned;
+        for (emitrust::GlobalOp global : actor.globals)
+          owned.insert(global.getSymName());
+        module.walk([&](emitrust::FuncOp fn) {
+          if (actor.vetoed)
+            return;
+          auto arm =
+              fn->getAttrOfType<StringAttr>(emitrust::kActorArmAttrName);
+          if (arm != actor.name)
+            return;
+          fn.walk([&](Operation *op) {
+            StringRef symbol;
+            if (auto load = dyn_cast<emitrust::GlobalLoadOp>(op))
+              symbol = load.getGlobal();
+            else if (auto store = dyn_cast<emitrust::GlobalStoreOp>(op))
+              symbol = store.getGlobal();
+            else
+              return;
+            if (actor.vetoed || owned.contains(symbol))
+              return;
+            auto global = dyn_cast_or_null<emitrust::GlobalOp>(
+                SymbolTable::lookupSymbolIn(module, symbol));
+            if (global && global.getIsConst())
+              return; // The opaque-constant path covers consts.
+            op->emitWarning("actor lift: demoted ")
+                << actor.name.getValue() << ": arm '" << fn.getSymName()
+                << "' touches mutable global '" << symbol
+                << "' the actor does not own";
+            actor.vetoed = true;
+          });
+        });
       }
       if (actor.vetoed)
         for (emitrust::GlobalOp global : actor.globals)
