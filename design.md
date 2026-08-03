@@ -2039,9 +2039,45 @@ of references or inheritance, so it precedes both.
   transitively starved group (the definer itself starved on a third TU) is
   discovered one step deep only — a persisting starvation after re-import
   stays ledgered and stubbed, exactly as before.
-  Still open for the checkbox: owner-planning `soleTranslationUnit`
-  divergence, indexed collision scans at 10^3+ TUs, and FR-59 workspace
-  partitioning (its own FR).
+  LANDED (FR-58 owner-planning `soleTranslationUnit` divergence, fixed).
+  DIAGNOSED, two divergences from one probe (external `sum4(int*)` reading
+  its parameter as an array, called on an internal global in its own TU
+  and on a LOCAL array from the other TU): (1) the shim's solo import
+  passed `soleTranslationUnit=true` (ImportC.cpp), so the Phase-4
+  owner/cell-slice planners promoted the EXTERNALLY VISIBLE `sum4` to a
+  cell-slice parameter on the claim "all call sites are in this TU" — a
+  claim no shard can make; the joint import, seeing the disqualifying
+  local-array call, refuses the promotion, so the merged crate silently
+  carried a form the joint refuses. Fixed: a defer-mode (shard) import
+  never claims sole-TU (`soleTranslationUnit=!options.deferExternals`);
+  the historical non-defer single-file import keeps the claim — there the
+  TU genuinely is the program. Measured post-fix: the shard keeps the
+  conservative slice model and stubs the disqualified caller with the SAME
+  wording the joint uses. (2) The RESIDUAL one-line divergence: the
+  accessing TU shaped its call to the body-less `sum4` from the bare
+  prototype (`&mut i32`) where the definition refines to a slice — a
+  SILENT wrong shape with an empty ledger (the joint import treats the
+  mirror case, definition arriving after a shaped call, as the located
+  "called before its definition refined the signature" rejection). Fixed
+  at the MERGE, where whole-program information exists: a body-less
+  `extern_decl` FUNCTION whose type disagrees with the defining shard's is
+  signature-starvation (`findSignatureStarvedDecls`, LinkMerge.h) and
+  joins the selective re-import's union-find as a second detection axis —
+  dropping the declaration for the definition, as matching-signature
+  obligations are, would leave call sites shaped for a type the definition
+  does not have. Globals deliberately out of scope (C99 6.2.7 permits
+  looser object declaration shapes; pointer globals are ledger-detected).
+  Pinned: the shard no longer promotes (no cell-slice, conservative slice
+  signature), and the 2-TU program links BYTE-IDENTICAL to the recovering
+  joint import through the signature-triggered re-import
+  (test/Driver/link-soletu-owners.c). Known limit, recorded: the joint
+  import's refinement is itself order-sensitive (definition-after-call is
+  a located rejection and a whole-import failure), so a group whose
+  definer FOLLOWS its user on the link line degrades with a warning
+  instead of reaching byte-identity — same outcome family as the joint
+  oracle's own failure on that order.
+  Still open for the checkbox: indexed collision scans at 10^3+ TUs, and
+  FR-59 workspace partitioning (its own FR).
   SPIKE 3 (GO -- the merge algorithm is now fully experiment-specified): on
   a shared-header project where BOTH shards carry identical
   `struct_def @Point` / `enum_def @Mode`, the mechanical merge extended

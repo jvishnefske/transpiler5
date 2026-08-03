@@ -832,6 +832,25 @@ static void reimportFactStarvedGroups(
     }
   }
 
+  // Second detection axis: signature-starved extern declarations — a
+  // body-less `extern_decl` function whose declared type disagrees with
+  // the defining shard's. The declaring shard shaped its call sites from
+  // the bare prototype (its ledger is silent), so only this whole-program
+  // comparison can see the divergence; dropping the declaration for the
+  // definition, as the merge does for matching signatures, would leave
+  // those call sites shaped for a type the definition does not have.
+  {
+    llvm::SmallVector<mlir::ModuleOp> modules;
+    modules.reserve(count);
+    for (LoadedShard &shard : shards)
+      modules.push_back(*shard.module);
+    for (const emitrustcc::SignatureStarvation &starvation :
+         emitrustcc::findSignatureStarvedDecls(modules)) {
+      parent[findRoot(starvation.declShard)] = findRoot(starvation.defShard);
+      anyGroup = true;
+    }
+  }
+
   if (!anyGroup) {
     for (unsigned i = 0; i < count; ++i)
       ordinalMaps.push_back({i});

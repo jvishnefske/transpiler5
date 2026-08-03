@@ -21,6 +21,7 @@
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/SymbolTable.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/IR/Verifier.h"
 
 #include "llvm/ADT/SmallVector.h"
@@ -416,6 +417,50 @@ emitrustcc::factStarvedObjectNames(llvm::StringRef symbol,
     }
   }
   return names;
+}
+
+llvm::SmallVector<emitrustcc::SignatureStarvation>
+emitrustcc::findSignatureStarvedDecls(llvm::ArrayRef<ModuleOp> shards) {
+  // Definitions first: symbol -> (shard index, function type). Only
+  // FunctionOpInterface symbols participate (see the header: globals are
+  // deliberately out of scope).
+  llvm::StringMap<std::pair<unsigned, Type>> definitions;
+  for (auto [index, shardRef] : llvm::enumerate(shards)) {
+    ModuleOp shard = shardRef;
+    for (Operation &op : shard.getBody()->getOperations()) {
+      if (op.hasAttr(emitrust::kExternDeclAttrName))
+        continue;
+      auto symbol = dyn_cast<SymbolOpInterface>(&op);
+      auto func = dyn_cast<FunctionOpInterface>(&op);
+      if (!symbol || !func)
+        continue;
+      definitions.try_emplace(symbol.getName(),
+                              std::make_pair(static_cast<unsigned>(index),
+                                             func.getFunctionType()));
+    }
+  }
+  llvm::SmallVector<SignatureStarvation> starved;
+  for (auto [index, shardRef] : llvm::enumerate(shards)) {
+    ModuleOp shard = shardRef;
+    for (Operation &op : shard.getBody()->getOperations()) {
+      if (!op.hasAttr(emitrust::kExternDeclAttrName))
+        continue;
+      auto symbol = dyn_cast<SymbolOpInterface>(&op);
+      auto func = dyn_cast<FunctionOpInterface>(&op);
+      if (!symbol || !func)
+        continue;
+      auto it = definitions.find(symbol.getName());
+      if (it == definitions.end())
+        continue; // No definition anywhere: the undefined-symbol link
+                  // error's territory, not starvation.
+      auto [defShard, defType] = it->second;
+      if (defType == func.getFunctionType())
+        continue;
+      starved.push_back({static_cast<unsigned>(index), defShard,
+                         symbol.getName().str()});
+    }
+  }
+  return starved;
 }
 
 bool emitrustcc::itemGraphDefinesGlobal(llvm::StringRef graphText,
