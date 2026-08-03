@@ -1731,7 +1731,7 @@ of references or inheritance, so it precedes both.
   test/Conversion/LowerExternalRequirements/, test/Target/Rust/trait-def.mlir,
   test/EndToEnd/lib-crate-externals-trait.c,
   test/RealWorld/Cpp/Inputs/extern-plugin/)
-- [ ] FR-56 Compiler-shim front end (`emitrust-clang`). The build system, not
+- [x] FR-56 Compiler-shim front end (`emitrust-clang`). The build system, not
   a compilation database, drives per-TU work: `make CC=emitrust-clang` on an
   unmodified project must complete. The shim parses the FULL argv with
   clang's own `clang::driver::Driver` (never a hand-rolled filter), classifies
@@ -1755,10 +1755,29 @@ of references or inheritance, so it precedes both.
   (test/Driver/emitrust-clang-shim.c pins the contract). Clang-21 driver
   notes: DiagnosticsEngine takes DiagnosticOptions by reference now;
   classification must run under an IgnoringDiagConsumer and only for `-c`
-  lines (BuildCompilation PRINTS immediate args like --version). Remaining
-  for the checkbox: argv0 `cc`/`gcc` aliasing. (Landed since the spike:
-  cc1-key canonicalization and the FR-57 artifact format — see FR-57b/c/d —
-  and target/ABI flag forwarding and import-crash isolation, below.)
+  lines (BuildCompilation PRINTS immediate args like --version). All five
+  post-spike items are landed (cc1-key canonicalization and the FR-57
+  artifact format under FR-57b/c/d; target/ABI forwarding, crash
+  isolation, and argv0 aliasing below); box checked.
+  LANDED (FR-56 argv0 aliasing): `make CC=cc` with `cc` symlinked to the
+  shim behaves exactly like a direct invocation. argv[0] is parsed with
+  clang's OWN program-name mechanism
+  (`ToolChain::getTargetAndModeFromProgramName`, the ends-with suffix
+  table clang's main consults — no hand-rolled name table), and the result
+  is applied the way clang's main applies it, which took one measured
+  correction: `setTargetAndMode` alone carries only the NAME PARTS — the
+  driver reads the actual mode back out of argv — so the name-derived
+  `--driver-mode=` argument is inserted after argv[0] for the
+  classification AND re-inserted (with any valid target prefix as
+  `--target=`) at the front of the delegated argv, since the subprocess
+  runs under the real clang's own name and would otherwise lose the alias;
+  name-derived flags go first so an explicit user flag still wins, matching
+  clang's precedence for name-derived defaults. Pinned: `cc`- and
+  `gcc`-named symlinks produce object AND artifact bytes identical to the
+  direct invocation, and a `g++`-named symlink drives g++ mode through
+  BOTH sides — the delegated compile builds the `.c` as C++ (object
+  differs) and the classification sees the C++ job and emits no artifact
+  (test/Driver/emitrust-clang-argv0.c).
   LANDED (FR-56 import-crash isolation, the fork approach): the whole
   artifact side-emission — src-hash dependency scan, import, pipeline,
   serialization, embedding — runs in a forked child per compile job, so a
