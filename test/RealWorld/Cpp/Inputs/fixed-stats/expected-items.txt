@@ -26,4 +26,5 @@ ns_stats_mean function ported
 ns_stats_push function ported
 ns_stats_reset function ported
 ns_stats_spread function ported
+printf function declared
 scaled_reading function ported

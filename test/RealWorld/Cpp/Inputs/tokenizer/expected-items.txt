@@ -20,4 +20,5 @@ Histogram record ported
 Lexer record ported
 TokenKind enum ported
 c_main function ported
+printf function declared
 tu1_classify function ported

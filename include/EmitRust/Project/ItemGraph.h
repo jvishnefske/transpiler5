@@ -74,10 +74,19 @@
 ///    record node, and its `Base` edges are recorded.
 ///  - The graph is CLOSED: an edge is emitted only when BOTH endpoints are
 ///    nodes of this graph (`CallsIndirect`, which has no target, is the sole
-///    exception). Calls into system headers, references to block-scope tags,
-///    and uses of anything the two rules above skip therefore produce no
-///    edge rather than a dangling one, so a consumer never has to handle a
-///    target it cannot look up.
+///    edge-shape exception). Calls into system headers, references to
+///    block-scope tags, and uses of anything the two rules above skip
+///    therefore produce no edge rather than a dangling one, so a consumer
+///    never has to handle a target it cannot look up. ONE deliberate
+///    node-set exception (FR-62): a call whose resolved callee is a
+///    definition-less SYSTEM-HEADER declaration of a hosted OUTPUT SINK
+///    (printf, puts, putchar, fprintf, fwrite, sprintf, snprintf — the
+///    calls the importer lowers by name into Rust output effects)
+///    synthesizes that callee as a real `def=0` extern function node and
+///    emits the `Calls` edge, so output-effect attribution is total for
+///    actor planning; the closure invariant itself still holds, since the
+///    node exists. Every other system-header callee — including hosted
+///    NON-sink functions like strlen — still produces no edge.
 //
 //===----------------------------------------------------------------------===//
 

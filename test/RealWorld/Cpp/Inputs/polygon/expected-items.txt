@@ -21,6 +21,7 @@ bounding_box function stubbed
 c_main function stubbed
 count_strictly_inside function stubbed
 perimeter_manhattan function ported
+printf function declared
 shoelace_twice function ported
 translate function stubbed
 tu0_abs_int function ported
