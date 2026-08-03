@@ -44,14 +44,17 @@ emitrust.func @for_jumps(%arg0: index, %arg1: index, %arg2: index, %arg3: i1) {
 
 // FR-25: the staged parallel-assignment shape produced for copy-cycle loop
 // back-edges (lost-copy problem) renders as immutable temporary lets that
-// capture every source before any carried variable is assigned.
+// capture every source before any carried variable is assigned. FR-61d
+// inlines the FIRST temporary into its assignment (nothing is written
+// between its capture and its use), but the second temporary's `let` MUST
+// survive: the first assignment overwrites its source, and an assignment
+// is an inlining barrier -- this is the lost-copy protection itself.
 // CHECK-LABEL: fn rotate(v0: i32, v1: i32) -> i32 {
 // CHECK-NEXT:    let mut v2: i32 = v0;
 // CHECK-NEXT:    let mut v3: i32 = v1;
 // CHECK-NEXT:    loop {
-// CHECK-NEXT:      let v4: i32 = v3;
 // CHECK-NEXT:      let v5: i32 = v2;
-// CHECK-NEXT:      v2 = v4;
+// CHECK-NEXT:      v2 = v3;
 // CHECK-NEXT:      v3 = v5;
 // CHECK-NEXT:      break;
 // CHECK-NEXT:    }

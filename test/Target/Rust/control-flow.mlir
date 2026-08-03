@@ -1,9 +1,10 @@
 // FR-7: Control-flow emission: if, if-else, for with stepped range, and nesting.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
+// The unused arm-local constants drop (FR-61d), leaving the pinned
+// control-flow skeletons empty.
 // CHECK-LABEL: fn simple_if(v0: bool) {
 // CHECK-NEXT:    if v0 {
-// CHECK-NEXT:      let _v1: i32 = 1;
 // CHECK-NEXT:    }
 // CHECK-NEXT:  }
 emitrust.func @simple_if(%arg0: i1) {
@@ -15,9 +16,7 @@ emitrust.func @simple_if(%arg0: i1) {
 
 // CHECK-LABEL: fn if_else(v0: bool) {
 // CHECK-NEXT:    if v0 {
-// CHECK-NEXT:      let _v1: i32 = 1;
 // CHECK-NEXT:    } else {
-// CHECK-NEXT:      let _v2: i32 = 2;
 // CHECK-NEXT:    }
 // CHECK-NEXT:  }
 emitrust.func @if_else(%arg0: i1) {
@@ -29,9 +28,9 @@ emitrust.func @if_else(%arg0: i1) {
   emitrust.return
 }
 
+// The body's unused alias let drops, un-reading the induction variable.
 // CHECK-LABEL: fn stepped_loop(v0: usize, v1: usize, v2: usize) {
-// CHECK-NEXT:    for v3 in (v0..v1).step_by(v2 as usize) {
-// CHECK-NEXT:      let _v4: usize = v3;
+// CHECK-NEXT:    for _v3 in (v0..v1).step_by(v2 as usize) {
 // CHECK-NEXT:    }
 // CHECK-NEXT:  }
 emitrust.func @stepped_loop(%arg0: index, %arg1: index, %arg2: index) {
@@ -42,8 +41,7 @@ emitrust.func @stepped_loop(%arg0: index, %arg1: index, %arg2: index) {
 }
 
 // CHECK-LABEL: fn typed_loop(v0: i32, v1: i32, v2: i32) {
-// CHECK-NEXT:    for v3 in (v0..v1).step_by(v2 as usize) {
-// CHECK-NEXT:      let _v4: i32 = v3 + v3;
+// CHECK-NEXT:    for _v3 in (v0..v1).step_by(v2 as usize) {
 // CHECK-NEXT:    }
 // CHECK-NEXT:  }
 emitrust.func @typed_loop(%arg0: i32, %arg1: i32, %arg2: i32) {
@@ -139,9 +137,8 @@ emitrust.func @one_arm(%arg0: i1, %arg1: i32, %arg2: i32) -> i32 {
 }
 
 // CHECK-LABEL: fn nested(v0: usize, v1: usize, v2: usize, v3: bool) {
-// CHECK-NEXT:    for v4 in (v0..v1).step_by(v2 as usize) {
+// CHECK-NEXT:    for _v4 in (v0..v1).step_by(v2 as usize) {
 // CHECK-NEXT:      if v3 {
-// CHECK-NEXT:        let _v5: usize = v4;
 // CHECK-NEXT:      }
 // CHECK-NEXT:    }
 // CHECK-NEXT:  }

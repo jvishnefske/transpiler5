@@ -1951,10 +1951,30 @@ of references or inheritance, so it precedes both.
     `while`/`while let` where the SCF lowering's shape allows (172 corpus
     `loop {`s; SPIKE FIRST -- the condition prefix is statements, not an
     expression, so only a prefix-free subset lifts mechanically).
-  - [ ] 61d Expression-tree inlining: fold single-use scalar `let vN`
+  - [x] 61d Expression-tree inlining: fold single-use scalar `let vN`
     temporaries into their one consumer where evaluation order provably
     cannot change (loads/pure ops only; SPIKE FIRST -- this is the largest
     readability lever and the most semantics-sensitive).
+    LANDED 61d slice 1 (2026-08-03): full pure set (constants incl.
+    bool/opaque with literal suffixes on numerics, add/sub/mul/div/rem,
+    and/or/xor/shl/shr, scalar cmp, cast, bitcast, load, alias let) inlines
+    at classified consumer positions via a mandatory-`ExprPos` emitOperand
+    and ONE `needsParens` table; unused pure values drop with reverse-order
+    cascades. Corpus: `let ` bindings 10273 -> 6535 (-36%), ~3079 inline
+    sites + ~553 drops across the single-TU EndToEnd drivers; EndToEnd
+    123/123 byte-diff green, full suite 440/440, emitted `unsafe` count 0.
+    Two rustc GRAMMAR quirks found by the oracle and pinned in
+    test/Target/Rust/inline-expr.mlir: text ending in a bare `as T` cast
+    misparses as generic args when left of `<<`/`<` (tracked as a per-
+    capture `endsInCast` bit -- rank alone cannot see it), and the
+    subscript-index read idiom had to become exact (`lvalueIsMutated` on
+    the place) once drops made it load-bearing (E0425 otherwise). A dropped
+    unused div/rem elides a div-by-zero panic: C UB refinement, same
+    direction as dead-store elision. Cast-to-bool stays undroppable so its
+    rejection diagnostic survives. Not inlined by design: literals, selects,
+    calls, global/cell reads (61d-2), for-bounds (name-lookup rendering),
+    fn-ptr cmp/None. emitFor/emitGlobalCells/61b-arm bodies bypass capture
+    (map-miss falls back to the name; drops ARE skipped there).
     SPIKE 61d-0 (2026-08-03): GO. Buffered-capture mechanism prototyped for
     Constant+Add only: capture the op's normal statement rendering from the
     emitter buffer, strip indent + `;\n`, suppress the let prologue while

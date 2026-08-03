@@ -34,20 +34,19 @@ emitrust.func @tail_fold_constant() -> i32 {
   emitrust.return %0 : i32
 }
 
-// A multi-use binding does NOT fold (and its definition is not the return's
-// immediate predecessor): the `let` stays, later uses keep their names, and
-// the tail is the binding's name. The folded functions above and the
-// non-folded one here share the same v-numbering scheme, so folding never
-// shifts the numbering of other values.
+// A multi-use binding does NOT fold (and is not inlined by FR-61d either):
+// the `let` stays, later uses keep their names, and only the single-use
+// mul folds as the tail expression. The folded functions above and the
+// non-folded binding here share the same v-numbering scheme, so folding
+// never shifts the numbering of other values.
 // CHECK-LABEL: fn tail_multi_use(v0: i32) -> i32 {
 // CHECK-NEXT:    let v1: i32 = v0 + v0;
-// CHECK-NEXT:    let _v2: i32 = v1 * v1;
-// CHECK-NEXT:    v1
+// CHECK-NEXT:    v1 * v1
 // CHECK-NEXT:  }
 emitrust.func @tail_multi_use(%arg0: i32) -> i32 {
   %0 = emitrust.add %arg0, %arg0 : i32
   %1 = emitrust.mul %0, %0 : i32
-  emitrust.return %0 : i32
+  emitrust.return %1 : i32
 }
 
 // A function-final `return;` is simply omitted.

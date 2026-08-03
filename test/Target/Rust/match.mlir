@@ -21,16 +21,15 @@
 // CHECK-NEXT: }
 emitrust.enum_def @Color ["Red", "Green", "Blue"] [0, 1, 2]
 
+// The unused arm-local constants drop (FR-61d); the arm skeleton and case
+// patterns are what this pins.
 // CHECK-LABEL: fn simple_match(v0: i32) {
 // CHECK-NEXT:    match v0 {
 // CHECK-NEXT:        0 => {
-// CHECK-NEXT:            let _v1: i32 = 1;
 // CHECK-NEXT:        }
 // CHECK-NEXT:        -4 => {
-// CHECK-NEXT:            let _v2: i32 = 2;
 // CHECK-NEXT:        }
 // CHECK-NEXT:        _ => {
-// CHECK-NEXT:            let _v3: i32 = 3;
 // CHECK-NEXT:        }
 // CHECK-NEXT:    }
 // CHECK-NEXT:  }
@@ -80,24 +79,23 @@ emitrust.func @usize_match(%arg0: index) {
 
 // Nested statements inside arms: an if and assignments in a case, multiple
 // statements in the default arm, and an empty default arm elsewhere.
+// FR-61d: the single-use constants inline into the binding and the arm
+// assignments (with literal suffixes, consuming v2/v4/v5 as numbering
+// gaps); the unused arm constant drops.
 // CHECK-LABEL: fn nested_match(v0: i32, v1: bool) {
-// CHECK-NEXT:    let v2: i32 = 0;
-// CHECK-NEXT:    let mut _v3: i32 = v2;
+// CHECK-NEXT:    let mut _v3: i32 = 0i32;
 // CHECK-NEXT:    match v0 {
 // CHECK-NEXT:        1 => {
 // CHECK-NEXT:            if v1 {
-// CHECK-NEXT:                let v4: i32 = 5;
-// CHECK-NEXT:                _v3 = v4;
+// CHECK-NEXT:                _v3 = 5i32;
 // CHECK-NEXT:            }
 // CHECK-NEXT:        }
 // CHECK-NEXT:        _ => {
-// CHECK-NEXT:            let v5: i32 = 7;
-// CHECK-NEXT:            _v3 = v5;
+// CHECK-NEXT:            _v3 = 7i32;
 // CHECK-NEXT:        }
 // CHECK-NEXT:    }
 // CHECK-NEXT:    match v0 {
 // CHECK-NEXT:        2 => {
-// CHECK-NEXT:            let _v6: i32 = 9;
 // CHECK-NEXT:        }
 // CHECK-NEXT:        _ => {
 // CHECK-NEXT:        }
@@ -152,11 +150,12 @@ emitrust.func @match_in_loop(%arg0: i32) {
   emitrust.return
 }
 
+// The enum comparisons feed a sink so their rendering stays pinned (an
+// unused pure cmp would drop, FR-61d); the single-use opaque constant
+// `Color::Green` inlines as-is into the comparison.
 // CHECK-LABEL: fn enum_ops(v0: Color, v1: Color) -> i32 {
 // CHECK-NEXT:    let _v2: Color = Color::default();
-// CHECK-NEXT:    let v3: Color = Color::Green;
-// CHECK-NEXT:    let _v4: bool = v0 == v1;
-// CHECK-NEXT:    let _v5: bool = v0 != v3;
+// CHECK-NEXT:    sink(v0 == v1, v0 != Color::Green);
 // CHECK-NEXT:    v0.0 as i32
 // CHECK-NEXT:  }
 emitrust.func @enum_ops(%arg0: !emitrust.enum<"Color">, %arg1: !emitrust.enum<"Color">) -> i32 {
@@ -164,6 +163,7 @@ emitrust.func @enum_ops(%arg0: !emitrust.enum<"Color">, %arg1: !emitrust.enum<"C
   %1 = emitrust.constant <#emitrust.opaque<"Color::Green">> : !emitrust.enum<"Color">
   %2 = emitrust.cmp eq, %arg0, %arg1 : (!emitrust.enum<"Color">, !emitrust.enum<"Color">) -> i1
   %3 = emitrust.cmp ne, %arg0, %1 : (!emitrust.enum<"Color">, !emitrust.enum<"Color">) -> i1
+  emitrust.call_opaque "sink"(%2, %3) : (i1, i1) -> ()
   %4 = emitrust.cast %arg0 : !emitrust.enum<"Color"> to i32
   emitrust.return %4 : i32
 }
@@ -186,8 +186,7 @@ emitrust.enum_def @Mode ["Off", "On"] [0, 1] {unsigned_underlying}
 
 // CHECK-LABEL: fn enum_from_int(v0: i32) -> u32 {
 // CHECK-NEXT:    let mut v1: Mode;
-// CHECK-NEXT:    let v2: Mode = Mode(v0 as u32);
-// CHECK-NEXT:    v1 = v2;
+// CHECK-NEXT:    v1 = Mode(v0 as u32);
 // CHECK-NEXT:    let v3: &mut u32 = &mut v1.0;
 // CHECK-NEXT:    *v3
 // CHECK-NEXT:  }

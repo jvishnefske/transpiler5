@@ -16,9 +16,11 @@ emitrust.struct_def @Point ["x", "y"] [i32, i32]
 // CHECK-NEXT: struct Empty {}
 emitrust.struct_def @Empty [] []
 
+// The whole-struct load feeds only a dead store, so it drops (FR-61d),
+// un-reading the first variable (`_`-prefixed); the numbering keeps the
+// dropped load's v1 as a gap.
 // CHECK-LABEL: fn empty_struct_value() {
-// CHECK-NEXT:    let v0: Empty = Empty::default();
-// CHECK-NEXT:    let _v1: Empty = v0;
+// CHECK-NEXT:    let _v0: Empty = Empty::default();
 // CHECK-NEXT:    let _v2: Empty = Empty::default();
 // CHECK-NEXT:  }
 emitrust.func @empty_struct_value() {
