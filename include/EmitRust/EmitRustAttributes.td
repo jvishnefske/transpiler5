@@ -90,4 +90,28 @@ def EmitRust_CmpPredicate : I64EnumAttr<
 def EmitRust_CmpPredicateAttr
     : EnumAttr<EmitRust_Dialect, EmitRust_CmpPredicate, "cmp_predicate">;
 
+// The runtime flavor of an `emitrust.actor_runtime` anchor (FR-62 slice 5b):
+// - threaded (mnemonic: `threaded`; integer value: `0`): the actor's state
+//   moves to a spawned std::thread behind an mpsc mailbox; every call is a
+//   message with a per-call typed reply channel.
+// - async (mnemonic: `async`; integer value: `1`): the tokio task flavor
+//   (E4); the attribute space is defined now, the emission lands in a later
+//   slice.
+// `same-thread` is deliberately NOT a case: the same-thread shape needs no
+// runtime synthesis, so it has no anchor op at all.
+def EmitRust_ActorMode : I64EnumAttr<
+    "ActorMode", "runtime flavor of an emitrust.actor_runtime anchor",
+    [
+      I64EnumAttrCase<"threaded", 0>,
+      I64EnumAttrCase<"async", 1>,
+    ]> {
+  let cppNamespace = "::mlir::emitrust";
+  let genSpecializedAttr = 0;
+}
+
+// Dialect attribute wrapping the ActorMode enum. Generates the C++ class
+// `::mlir::emitrust::ActorModeAttr`.
+def EmitRust_ActorModeAttr
+    : EnumAttr<EmitRust_Dialect, EmitRust_ActorMode, "actor_mode">;
+
 #endif // EMITRUST_EMITRUSTATTRIBUTES
