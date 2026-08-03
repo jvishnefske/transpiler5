@@ -2760,6 +2760,50 @@ of references or inheritance, so it precedes both.
   unconditional panic-parity plumbing) and `--actor-mode=async` (E4's
   separate crate flavor, current_thread + immediate-await only).
 
+  SLICE 1 LANDED (2026-08-03): the three ItemGraph pre-work increments,
+  one commit each, suite 100% at every step; the box stays open. (a)
+  `AddressOfGlobal` edge kind, appended to `EdgeKind` so every existing
+  enumerator value and golden line is unchanged; the compatibility
+  decision: address-taking (`&g`, `&g.field`/`&g[i]`, and array-to-pointer
+  decay of a global array used as a value) KEEPS recording `ReadsGlobal`
+  exactly as before and additionally records `AddressOfGlobal`, so
+  existing consumers see no change and the planner computes
+  read-only-never-address-taken as the set difference; a subscript read
+  `g[i]` stays `ReadsGlobal` only (its base decay feeds the subscript, no
+  pointer survives) — pinned in test/Project/item-graph-address-of.c and
+  the extended item-graph-types.c. (b) Hosted-sink visibility: a call
+  whose resolved callee is a definition-less SYSTEM-HEADER declaration of
+  a hosted output sink synthesizes a real `def=0` extern node at the
+  callee's real loc plus the `Calls` edge — the one deliberate node-set
+  exception to the closed graph, documented at the contract. The sink set
+  mirrors the importer's output-effect emission surface by name: printf,
+  puts, putchar (emitPrintf/emitPuts in ImportCStatements.cpp,
+  emitPutchar in ImportCHosted.cpp), fprintf (emitAliasedPrintf's
+  stdout-swallow routing), fwrite (emitFileReadWrite isWrite),
+  sprintf/snprintf (emitSprintf, ImportCExpressions.cpp); hosted NON-sinks
+  (strlen et al.) keep the closed-graph silence — both pinned in
+  test/Project/item-graph-hosted-sink.c; RealWorld C++ per-item ledgers
+  ratcheted forward with the newly visible `printf function declared`
+  rows (scored counts unchanged). (c) The E2 node-key collision fixed at
+  the root: `struct G` and global `g` both keyed `G` because the graph
+  deliberately skipped `structSymbolName`'s tag-versus-ordinary rename —
+  but that rename's trigger is the per-TU ordinary-name pre-scan
+  (`collectOrdinaryNames`), not accumulated import state, so the graph
+  now runs the same pre-scan (functions, file-scope variables,
+  static-local mangles; earlier TUs' scans standing in for
+  `ordinaryNameTaken`'s already-imported component) and keys the record
+  `StructG` exactly as emitted, restoring the closure invariant — pinned
+  in test/Project/item-graph-struct-rename.c. Known residual, measured:
+  an enum whose name an ordinary identifier claims still key-collides in
+  the graph, but the importer REJECTS that program ("global variable 'E'
+  collides with an existing symbol"), so no emitted name exists to match;
+  left as-is with the contract documenting the enum rule. Text consumers
+  verified additive-tolerant (Partition.cpp filters kinds by name,
+  LinkMerge.cpp `itemGraphGlobalDefs` filters `kind=global def=1`,
+  ProgressReport joins by symbol); ItemColoring maps `AddressOfGlobal` to
+  RedGlobal (never the blame minimum — the paired `ReadsGlobal` sorts
+  first).
+
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
