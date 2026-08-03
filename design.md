@@ -3043,6 +3043,61 @@ of references or inheritance, so it precedes both.
   varargs-monomorph, fn-pointers, ...) ran green off-suite. Flag off =
   zero drift: all 478 pre-existing tests byte-identical, suite 485/485.
 
+  SLICE 4 STAGE B LANDED (default-on) (2026-08-03; box stays OPEN —
+  threaded/async actor modes are still pending). `--actor-lift` is now
+  `cl::init(true)`; the disable spelling is LLVM's own bool-flag
+  convention, `--actor-lift=false` (or `=0`) — the driver had no prior
+  negatable flag to match, so upstream's is the precedent — pinned by
+  test/Driver/actor-lift-disable.c (disable restores the thread_local
+  form byte-for-byte). Default-on semantics: the emission-mode gate
+  (`--emit=mlir/rust/crate` only) errors ONLY on an EXPLICIT
+  `--actor-lift` (getNumOccurrences), the default being inert
+  elsewhere; under `--link` the defaulted flag is SILENT — rule 5
+  already demotes all, and a default must not demand FR-57d graph
+  metadata of every artifact — while an explicit `--actor-lift --link`
+  keeps stage A's honest per-actor demote-all report
+  (actor-lift-link.c unchanged). The flip run caught three defects,
+  each fixed toward demotion with a regression pin: (1) c-testsuite
+  00088 (`int (*fptr)() = 0;`) — a fn_ptr global's opaque `None` init
+  is legal on GlobalOp but has no VariableOp restatement, so the
+  driver-local lowering built an op the verifier rejects; the pass now
+  vetoes any actor/local whose owned global carries a non-restatable
+  init (demote.mlir cases c/c'). (2) c-testsuite 00089 (`return
+  &anon`) — TWO stacked holes: the item graph dropped TakesAddressOf
+  for an EXPLICIT `&f` (the lvalue-walk DeclRefExpr arm only knew
+  VarDecls; fixed, pinned in item-graph-calls.c), and no rule demoted
+  an actor whose owned GLOBAL's address is taken — the IR veto cannot
+  see the escape once the importer's returned-pointer rewrite folds it
+  into an opaque `Some(anon)` constant that names the arm textually;
+  new certification rule 1b demotes on an AddressOfGlobal edge into an
+  owned global, with the located remark at the taker
+  (actor-lift-demote-global-addr.c pins the rule-1b-only shape). (3)
+  preserve-c-names.c — the lift's driver-local rule snake_cased a
+  VERBATIM name (`totalCount` -> `total_count`), violating FR-53's
+  opt-out; `attachActorLiftAttributes` now takes the preserve flag and
+  keeps every name DERIVED from a C spelling verbatim (fields, cell
+  bases, driver locals) while synthesized type/var names stay
+  idiomatic. Measurement corrections to stage A's "churn zero": the
+  count measured golden FILES and missed two cross-mode EQUIVALENCE
+  diffs — link-merge-e2e.c's and link-partition.c's joint-vs-link
+  byte-identity pins — which now compare a lifted joint root against a
+  rule-5-demoted link root; both joint programs were cargo-built under
+  the lift and byte-diffed green against their clang natives before
+  the pins were updated to emit the joint side with
+  `--actor-lift=false` (they pin FR-58 merge equivalence, not lift
+  policy; the FR-58/FR-59 lift interaction stays a recorded later
+  stage), and preserve-c-names.c's two `static` greps moved to the
+  lifted locals. Suite evidence: 487/487 (485 pre-existing + the two
+  new pins), c-testsuite ledger 220/220 transpiled and passed, zero
+  manifest delta, fuzz smoke green; every EndToEnd differential now
+  exercises the lift by default. Kernel: the FR-60 path is untouched
+  by construction — emitrust-clang runs its own in-process pipeline
+  (never emitrust-cc, no lift), and the kernel artifacts are consumed
+  via `-c`/`--link`, which demote by rule 5 — so the full shim rebuild
+  is not required for this slice; the 13 shim/link artifact tests
+  (emitrust-clang-*, link-ratchet, link-rejection-report, link-merge*,
+  link-partition) were sanity-run green post-flip.
+
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
