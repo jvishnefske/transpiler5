@@ -402,6 +402,22 @@ private:
   /// constant per variant, and a `Default` impl returning the first
   /// variant.
   LogicalResult emitEnumDef(emitrust::EnumDefOp enumDefOp);
+  /// FR-62 slice 5a: emits a CLOSED data enum as a real Rust enum item —
+  /// `#[derive(Clone, Copy)]` (no `Default`: a closed enum has no
+  /// canonical default; no `PartialEq`: a struct payload derives none),
+  /// unit variants bare, data variants with named fields.
+  LogicalResult emitDataEnumDef(emitrust::DataEnumDefOp defOp);
+  /// FR-62 slice 5a: emits a variant construction as a `let` binding of
+  /// the variant literal — `Name::Variant { field: value, ... }`, or the
+  /// bare path for a unit variant.
+  LogicalResult emitEnumVariant(emitrust::EnumVariantOp variantOp);
+  /// FR-62 slice 5a: emits a closed-enum match — one variant-pattern arm
+  /// per case region, payload fields bound to the block-argument names,
+  /// NO default arm (the verifier made the match exhaustive). Statement
+  /// mode renders a match statement; result mode renders the match
+  /// expression as a `let` right-hand side (tail-foldable per FR-61a),
+  /// each arm's yielded value becoming that arm's tail expression.
+  LogicalResult emitMatch(emitrust::MatchOp matchOp);
   /// Emits a global: `static NAME: T = <init-or-default>;` for `const`
   /// globals, and a `thread_local!` `std::cell::Cell` item otherwise.
   LogicalResult emitGlobal(emitrust::GlobalOp globalOp);
@@ -1484,8 +1500,13 @@ void RustEmitter::computeDroppedOps(emitrust::FuncOp funcOp) {
 
 /// FR-61d: whether `use` sits in an operand position the emitter renders
 /// through a classified `emitOperand` site. Anything else (for-loop
-/// bounds, which render by name lookup; place-typed operands; yields)
-/// disqualifies the candidate feeding it.
+/// bounds, which render by name lookup; place-typed operands; structural
+/// yields) disqualifies the candidate feeding it. The exception among
+/// yields is the value-carrying `emitrust.yield` of a result-mode
+/// `emitrust.match`, whose operand renders in the never-parenthesized arm
+/// tail position; `emitrust.enum_variant` field values and the
+/// `emitrust.match` scrutinee are classified positions too (FR-62 slice
+/// 5a).
 static bool isClassifiedConsumerUse(OpOperand &use) {
   Operation *owner = use.getOwner();
   return llvm::TypeSwitch<Operation *, bool>(owner)
@@ -1495,7 +1516,8 @@ static bool isClassifiedConsumerUse(OpOperand &use) {
             emitrust::ShrOp, emitrust::CastOp, emitrust::BitcastOp,
             emitrust::LetOp, emitrust::ReturnOp, emitrust::CallOpaqueOp,
             emitrust::CallIndirectOp, emitrust::IfOp, emitrust::SelectOp,
-            emitrust::SwitchOp, emitrust::GlobalStoreOp>(
+            emitrust::SwitchOp, emitrust::GlobalStoreOp,
+            emitrust::EnumVariantOp, emitrust::MatchOp, emitrust::YieldOp>(
           [](auto) { return true; })
       .Case<emitrust::CmpOp>([&](auto) { return isScalarCmp(owner); })
       .Case<emitrust::AssignOp>([&](emitrust::AssignOp assign) {
@@ -1847,6 +1869,10 @@ LogicalResult RustEmitter::emitType(Location loc, Type type) {
     os << enumType.getName();
     return success();
   }
+  if (auto dataEnumType = dyn_cast<emitrust::DataEnumType>(type)) {
+    os << dataEnumType.getName();
+    return success();
+  }
   if (auto fnPtrType = dyn_cast<emitrust::FnPtrType>(type)) {
     // Nullable function pointer: the C null pointer is None, so no unsafe
     // sentinel is ever needed. The `-> R` clause is omitted for a void
@@ -2139,6 +2165,13 @@ static bool opDiverges(Operation *op) {
 /// cannot arise because deferral requires assignments, i.e. more than the
 /// fold's single use.
 static bool isTailFoldableProducer(Operation *op) {
+  // FR-62 slice 5a: a variant construction and a result-mode match both
+  // render exactly one `let <name>: <type> = <rhs>;` through the prologue
+  // (the match's multi-line `};` still ends in `;`, exactly like the
+  // folded if-expression binding), so both fold. Neither joins the FR-61d
+  // pure-inlining set: a brace variant literal is illegal in Rust's
+  // scrutinee positions, which never parenthesize, and a match is a
+  // region op like `if`.
   return isa<emitrust::ConstantOp, emitrust::LiteralOp, emitrust::LetOp,
              emitrust::CallOpaqueOp, emitrust::CallIndirectOp,
              emitrust::MethodCallOp, emitrust::AddOp, emitrust::SubOp,
@@ -2147,7 +2180,8 @@ static bool isTailFoldableProducer(Operation *op) {
              emitrust::ShlOp, emitrust::ShrOp, emitrust::CmpOp,
              emitrust::CastOp, emitrust::BitcastOp, emitrust::SelectOp,
              emitrust::GlobalLoadOp, emitrust::CellGetOp, emitrust::LoadOp,
-             emitrust::AddrOfOp, emitrust::SliceOfOp>(op);
+             emitrust::AddrOfOp, emitrust::SliceOfOp,
+             emitrust::EnumVariantOp, emitrust::MatchOp>(op);
 }
 
 FailureOr<bool> RustEmitter::emitDropOrCapture(Operation &op) {
@@ -2262,7 +2296,8 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   for (Operation &op : *moduleOp.getBody()) {
     if (!isa<emitrust::UseOp, emitrust::VerbatimOp, emitrust::FuncOp,
              emitrust::ImplOp, emitrust::StructDefOp, emitrust::EnumDefOp,
-             emitrust::GlobalOp, emitrust::TraitDefOp>(&op))
+             emitrust::DataEnumDefOp, emitrust::GlobalOp,
+             emitrust::TraitDefOp>(&op))
       return op.emitOpError("unable to translate op");
     if (failed(emitOperation(op)))
       return failure();
@@ -2610,6 +2645,40 @@ LogicalResult RustEmitter::emitLiteral(emitrust::LiteralOp literalOp) {
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
   os << literalOp.getValue() << ";\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitEnumVariant(emitrust::EnumVariantOp variantOp) {
+  Operation *op = variantOp.getOperation();
+  Location loc = op->getLoc();
+  if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  emitrust::DataEnumDefOp def =
+      emitrust::DataEnumDefOp::lookupFrom(op, variantOp.getEnumDef());
+  if (!def)
+    return op->emitOpError("requires a visible emitrust.data_enum_def");
+  os << variantOp.getEnumDef() << "::" << variantOp.getVariant();
+  if (!variantOp.getArgs().empty()) {
+    // Field names come from the definition (the verifier pinned the
+    // variant's existence and the operand arity/types). Field values sit
+    // between `{ }` delimited by commas — a complete expression position
+    // like a call argument, so inlined operands never parenthesize.
+    ArrayAttr fieldNames =
+        def.variantFieldNames(*def.variantIndex(variantOp.getVariant()));
+    os << " { ";
+    bool first = true;
+    for (auto [fieldNameAttr, argument] :
+         llvm::zip_equal(fieldNames, variantOp.getArgs())) {
+      if (!first)
+        os << ", ";
+      first = false;
+      os << cast<StringAttr>(fieldNameAttr).getValue() << ": ";
+      if (failed(emitOperand(loc, argument, ExprPos::delimited())))
+        return failure();
+    }
+    os << " }";
+  }
+  os << ";\n";
   return success();
 }
 
@@ -3109,6 +3178,87 @@ LogicalResult RustEmitter::emitSwitch(emitrust::SwitchOp switchOp) {
   return success();
 }
 
+LogicalResult RustEmitter::emitMatch(emitrust::MatchOp matchOp) {
+  Operation *op = matchOp.getOperation();
+  Location loc = op->getLoc();
+  bool hasResult = op->getNumResults() == 1;
+  // Result mode is a let-producing expression statement, so it routes
+  // through the shared prologue: `let vN: T = match ... };` — which is
+  // exactly the shape the FR-61a tail fold suppresses into a bare tail
+  // `match` expression.
+  if (hasResult &&
+      failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  auto enumType = cast<emitrust::DataEnumType>(matchOp.getScrutinee().getType());
+  emitrust::DataEnumDefOp def =
+      emitrust::DataEnumDefOp::lookupFrom(op, enumType.getName());
+  if (!def)
+    return op->emitOpError("scrutinee type ")
+           << enumType << " requires a visible emitrust.data_enum_def";
+  os << "match ";
+  if (failed(emitOperand(loc, matchOp.getScrutinee(), ExprPos::cond())))
+    return failure();
+  os << " {\n";
+  increaseIndent();
+  for (auto [index, region] : llvm::enumerate(matchOp.getCaseRegions())) {
+    StringRef variantName =
+        cast<StringAttr>(matchOp.getVariants()[index]).getValue();
+    Block &block = region.front();
+    os << enumType.getName() << "::" << variantName;
+    if (block.getNumArguments() != 0) {
+      // One binding per payload field, in field order; `assignName`'s
+      // never-read `_` prefixing keeps an unused binding lint-clean.
+      ArrayAttr fieldNames = def.variantFieldNames(index);
+      os << " { ";
+      bool first = true;
+      for (auto [fieldNameAttr, argument] :
+           llvm::zip_equal(fieldNames, block.getArguments())) {
+        if (!first)
+          os << ", ";
+        first = false;
+        os << cast<StringAttr>(fieldNameAttr).getValue() << ": "
+           << assignName(argument);
+      }
+      os << " }";
+    }
+    os << " => {\n";
+    if (!hasResult) {
+      if (failed(emitRegionBody(op, region)))
+        return failure();
+      os << "}\n";
+      continue;
+    }
+    // Result mode: the arm body renders like an entry block (drops and
+    // single-use captures included) until the terminator, whose yielded
+    // value renders as the arm's tail expression in the never-parenthesized
+    // statement position.
+    increaseIndent();
+    for (Operation &child : block) {
+      if (auto yield = dyn_cast<emitrust::YieldOp>(&child)) {
+        if (failed(emitOperand(yield.getLoc(), yield.getResults().front(),
+                               ExprPos::stmt())))
+          return failure();
+        os << "\n";
+        break;
+      }
+      FailureOr<bool> consumed = emitDropOrCapture(child);
+      if (failed(consumed))
+        return failure();
+      if (*consumed)
+        continue;
+      if (failed(emitOperation(child)))
+        return failure();
+      if (opDiverges(&child))
+        break;
+    }
+    decreaseIndent();
+    os << "}\n";
+  }
+  decreaseIndent();
+  os << (hasResult ? "};\n" : "}\n");
+  return success();
+}
+
 LogicalResult RustEmitter::emitTraitDef(emitrust::TraitDefOp traitDefOp) {
   Location loc = traitDefOp.getLoc();
   os << "pub trait " << traitDefOp.getSymName() << " {\n";
@@ -3246,6 +3396,44 @@ LogicalResult RustEmitter::emitEnumDef(emitrust::EnumDefOp enumDefOp) {
   increaseIndent();
   os << "fn default() -> " << name << " { " << name << "::" << firstVariant
      << " }\n";
+  decreaseIndent();
+  os << "}\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitDataEnumDef(emitrust::DataEnumDefOp defOp) {
+  Location loc = defOp.getLoc();
+  // The derive set is deliberately minimal (measured against the deny
+  // manifest, FR-62 slice 5a): `Clone, Copy` always hold — every permitted
+  // payload type is `Copy` — but no `Default` (a closed enum has no
+  // canonical default variant, in contrast to struct_def's unconditional
+  // one) and no `PartialEq` (a struct payload field derives none).
+  os << "#[derive(Clone, Copy)]\n";
+  StringRef pub = typePartVisibility();
+  os << pub << "enum " << defOp.getSymName() << " {\n";
+  increaseIndent();
+  for (auto [nameAttr, fieldNamesAttr, fieldTypesAttr] :
+       llvm::zip_equal(defOp.getVariantNames(), defOp.getVariantFieldNames(),
+                       defOp.getVariantFieldTypes())) {
+    os << cast<StringAttr>(nameAttr).getValue();
+    auto fieldNames = cast<ArrayAttr>(fieldNamesAttr);
+    auto fieldTypes = cast<ArrayAttr>(fieldTypesAttr);
+    if (!fieldNames.empty()) {
+      os << " { ";
+      bool first = true;
+      for (auto [fieldNameAttr, fieldTypeAttr] :
+           llvm::zip_equal(fieldNames, fieldTypes)) {
+        if (!first)
+          os << ", ";
+        first = false;
+        os << cast<StringAttr>(fieldNameAttr).getValue() << ": ";
+        if (failed(emitType(loc, cast<TypeAttr>(fieldTypeAttr).getValue())))
+          return failure();
+      }
+      os << " }";
+    }
+    os << ",\n";
+  }
   decreaseIndent();
   os << "}\n";
   return success();
@@ -3630,6 +3818,12 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
       .Case<emitrust::SwitchOp>([&](emitrust::SwitchOp switchOp) {
         return emitSwitch(switchOp);
       })
+      .Case<emitrust::MatchOp>([&](emitrust::MatchOp matchOp) {
+        return emitMatch(matchOp);
+      })
+      .Case<emitrust::EnumVariantOp>([&](emitrust::EnumVariantOp variantOp) {
+        return emitEnumVariant(variantOp);
+      })
       .Case<emitrust::BreakOp>([&](emitrust::BreakOp) {
         os << "break;\n";
         return success();
@@ -3643,6 +3837,9 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
       })
       .Case<emitrust::EnumDefOp>([&](emitrust::EnumDefOp enumDefOp) {
         return emitEnumDef(enumDefOp);
+      })
+      .Case<emitrust::DataEnumDefOp>([&](emitrust::DataEnumDefOp defOp) {
+        return emitDataEnumDef(defOp);
       })
       .Case<emitrust::GlobalOp>([&](emitrust::GlobalOp globalOp) {
         return emitGlobal(globalOp);

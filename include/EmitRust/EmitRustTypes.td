@@ -359,4 +359,40 @@ def EmitRust_EnumType : EmitRust_Type<"Enum", "enum"> {
   let genVerifyDecl = 1;
 }
 
+def EmitRust_DataEnumType : EmitRust_Type<"DataEnum", "data_enum"> {
+  let summary = "EmitRust data enum type";
+
+  let description = [{
+    A named reference to a module-level `emitrust.data_enum_def` — the
+    CLOSED, data-carrying Rust enum. The type is emitted as the bare enum
+    name, e.g. `Msg`. The name must be non-empty; the referenced symbol is
+    resolved (and its kind checked) by the verifiers of the ops that
+    consume the type, not by the type itself.
+
+    This type is deliberately distinct from `!emitrust.enum`, which
+    references the OPEN value-preserving C enum: every consumer of the
+    open type bakes tuple-struct semantics into its rendering (`.0`
+    projections, `==` on the derived `PartialEq`, `Name::default()`), none
+    of which exist for a closed enum. Values of the data-enum type are
+    constructed by `emitrust.enum_variant`, consumed by `emitrust.match`,
+    and may flow as function parameters/results, `emitrust.let` bindings,
+    and call operands. They must NOT appear as `emitrust.struct_def`
+    fields (the struct's unconditional `Default` guarantee cannot cover
+    them), `emitrust.cmp` operands, `emitrust.cast` sources or results, or
+    default-initialized `emitrust.variable` locals; each of those paths
+    rejects the type with a located diagnostic.
+
+    Example:
+
+    ```mlir
+    // Data-enum type emitted as `Msg`
+    !emitrust.data_enum<"Msg">
+    ```
+  }];
+
+  let parameters = (ins StringRefParameter<"enum name">:$name);
+  let assemblyFormat = "`<` $name `>`";
+  let genVerifyDecl = 1;
+}
+
 #endif // EMITRUST_EMITRUSTTYPES
