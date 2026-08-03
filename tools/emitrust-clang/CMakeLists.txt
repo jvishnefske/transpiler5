@@ -19,6 +19,7 @@ set(LLVM_LINK_COMPONENTS
 
 set(LIBS
   MLIREmitRustImportC
+  MLIREmitRustProject
   MLIREmitRustDialect
   MLIRUBToEmitRust
   MLIRArithToEmitRust

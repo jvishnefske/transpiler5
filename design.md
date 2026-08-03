@@ -1760,7 +1760,7 @@ of references or inheritance, so it precedes both.
   `-dependency-file`/`-o` currently perturb the hash), forwarding target/ABI
   flags into the import, import-crash isolation (fork or post-hoc), argv0
   `cc`/`gcc` aliasing, and the FR-57 artifact format.
-- [ ] FR-57 Per-TU artifacts ("object files as parse caches"). `-c` imports
+- [x] FR-57 Per-TU artifacts ("object files as parse caches"). `-c` imports
   ONE translation unit in isolation and serializes the result: the imported
   emitrust module as MLIR bytecode plus the TU's item-graph shard and
   rejection-ledger entries, keyed by a hash of the canonicalized `-cc1` line
@@ -1786,9 +1786,34 @@ of references or inheritance, so it precedes both.
   key, a macro change misses it, the same content at another path keeps
   both halves, the section payload dumps back byte-identical to the sidecar
   and round-trips through emitrust-opt, and stripping `.emitrust` restores
-  delegation byte-identity (test/Driver/emitrust-clang-shim.c). Still open
-  for the checkbox: item-graph shard + rejection-ledger entries in the
-  artifact.
+  delegation byte-identity (test/Driver/emitrust-clang-shim.c).
+  LANDED (FR-57d, closing the checkbox): the artifact carries the TU's
+  item-graph shard and rejection-ledger entries, encoded as ATTRIBUTES on
+  the same bytecode module (include/EmitRust/ShardMetadata.h) rather than a
+  second artifact, so one payload rides the `.emitrust` section and MLIR's
+  bytecode round-trip covers the metadata for free (spiked first: a module
+  with a location-bearing dictionary array re-emits byte-identically).
+  `emitrust.item_graph` is `ItemGraph::print()`'s pinned line format
+  verbatim — same emitted-symbol node keys as the module, `tu0_` statics
+  included, produced by a second purely analytical parse through the SAME
+  clang shell the import used; `emitrust.rejections` is one dictionary per
+  recovered rejection (symbol/diagnostic/tag/owner/stubbed and the
+  first-class LocationAttr, omitted entirely for a clean TU). A graph-parse
+  failure after a successful import warns and emits NO artifact — never an
+  artifact missing the facts FR-58 selects by. Link side: `emitrust-cc
+  --link` surfaces each shard's ledger in the joint import's summary format
+  prefixed with the SHARD it came from (per-TU attribution being exactly
+  what FR-58's selective re-import of fact-starved items needs), `--link
+  --emit=item-graph` dumps each shard's stored graph per shard in link-line
+  order (deliberately NOT merged — shard-graph merging stays FR-58's own
+  item, and a naive concatenation printed as if merged would be silently
+  wrong), and `mergeLinkShards` STRIPS the metadata before splicing so the
+  merged module stays byte-comparable to the joint import's (the
+  link-merge-e2e crate-root byte-identity is unchanged). Pinned: the
+  metadata's content and its byte-identical bytecode reload fixed point
+  (test/Driver/emitrust-clang-shim.c), shard-attributed rejection
+  surfacing, `ar` survival of the metadata with byte-identical merged Rust,
+  and the per-shard graph dump (test/Driver/link-merge-rejections.c).
   LANDED (FR-57c, header-aware src-hash): `src-hash` now covers the WHOLE
   preprocessed input, not just the main file's bytes, so a header-only edit
   misses the cache key. SPIKE verdict, measured: parsing the depfile the

@@ -16,7 +16,9 @@
 /// `<object>.emitrust.mlirbc` artifact holding the EmitRust import of that
 /// translation unit, lowered through the pinned emitrust-cc pipeline to the
 /// converted emitrust-dialect module, serialized as MLIR bytecode (the
-/// FR-57 per-TU parse cache). The same payload is then embedded into the
+/// FR-57 per-TU parse cache) with the TU's item-graph shard and
+/// rejection-ledger entries attached as module attributes
+/// (EmitRust/ShardMetadata.h). The same payload is then embedded into the
 /// just-produced object file as a non-alloc `.emitrust` ELF section (the
 /// gllvm model), so `ar` archives and existing link lines carry it with no
 /// build-system cooperation; the sidecar file stays as the non-ELF
@@ -53,6 +55,8 @@
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/ImportC.h"
+#include "EmitRust/Project/ItemGraph.h"
+#include "EmitRust/ShardMetadata.h"
 
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
@@ -428,6 +432,11 @@ static void sideEmitArtifact(const CompileJob &job, llvm::raw_ostream *log) {
   // Recover-or-skip posture: an unsupported item must cost at most itself,
   // never the artifact, and the artifact must never cost the build.
   options.recover = true;
+  // FR-57d: the recovered rejections ride the artifact as module
+  // attributes, so the FR-58 link step can identify this TU's fact-starved
+  // items without re-parsing any C.
+  mlir::emitrust::RejectionLedger ledger;
+  options.ledger = &ledger;
   // FR-57a: this TU is one shard of a project whose other TUs the shim
   // never sees, so a referenced external the TU does not define is a
   // link-time obligation recorded in the artifact (a declaration stub
@@ -450,6 +459,28 @@ static void sideEmitArtifact(const CompileJob &job, llvm::raw_ostream *log) {
            << diagnostics;
     return;
   }
+
+  // FR-57d: the artifact also carries the TU's item-graph shard and the
+  // rejections the recovering import just accumulated, as module attributes
+  // (ShardMetadata.h) — one payload, one section, one bytecode round-trip.
+  // The graph is a second, purely analytical parse of the same TU through
+  // the same clang shell the import used, so its node keys are the module's
+  // emitted symbols by construction; if that parse fails after the import
+  // succeeded, something is genuinely wrong and the safe direction is no
+  // artifact, never an artifact missing the facts FR-58 selects by.
+  mlir::FailureOr<mlir::emitrust::ItemGraph> graph =
+      mlir::emitrust::buildItemGraph(
+          llvm::ArrayRef<std::string>(job.input), job.importArgs);
+  if (mlir::failed(graph)) {
+    llvm::errs() << "emitrust-clang: warning: item-graph construction "
+                    "failed for '"
+                 << job.input << "'; no artifact written\n";
+    if (log)
+      *log << "item-graph: FAILED for " << job.input << "\n";
+    return;
+  }
+  mlir::emitrust::attachShardMetadata(*module, graph->print(),
+                                      ledger.getItems());
 
   {
     std::error_code ec;

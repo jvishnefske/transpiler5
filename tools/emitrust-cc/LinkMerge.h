@@ -18,6 +18,13 @@
 /// The merge algorithm is the byte-identity-proven one from design.md's
 /// FR-58 spikes (2 and 3), implemented exactly:
 ///
+///  0. The FR-57 shard metadata (`emitrust.item_graph`,
+///     `emitrust.rejections` — see EmitRust/ShardMetadata.h) is stripped
+///     from every shard first: those are per-TU facts the link driver
+///     surfaces BEFORE merging (per-shard rejection summaries, the
+///     `--emit=item-graph` shard dump), and the merged whole-program module
+///     must stay byte-comparable to the joint import's, which never
+///     carries them.
 ///  1. Shards are taken in LINK-LINE ORDER; shard i's per-TU internal-linkage
 ///     tags (`tu0_`/`TU0_`, the TU-local placeholder a solo shard-mode
 ///     import assigns) are alpha-renamed to the shard's global ordinal

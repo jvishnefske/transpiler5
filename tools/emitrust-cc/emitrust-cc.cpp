@@ -77,6 +77,7 @@
 #include "EmitRust/Project/FrontierSearch.h"
 #include "EmitRust/Project/ItemColoring.h"
 #include "EmitRust/Project/ItemGraph.h"
+#include "EmitRust/ShardMetadata.h"
 
 #include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
@@ -656,46 +657,53 @@ static mlir::LogicalResult buildCrate(llvm::StringRef outDir) {
 // FR-58 -- the link step's imperative shell
 //===----------------------------------------------------------------------===//
 
-/// Loads, extracts, parses, and merges the link-line `inputs` into one
-/// whole-program module (FR-58 slices 1 and 2, `--link`). The functional
-/// core is `emitrustcc::findShardPayload` (payload location inside one
-/// input), `emitrustcc::findArchivePayloads` (static-archive expansion),
-/// and `emitrustcc::mergeLinkShards` (the spike-proven merge); this
-/// function owns the file reads and the parse. Each input is an object
-/// file whose `.emitrust` section carries the shard, an object falling
-/// back to its `<object>.emitrust.mlirbc` sidecar, a static archive whose
-/// members are expanded in archive order as if listed loose at the
-/// archive's position (a payload-less member warns and is skipped —
+/// One parsed link-line shard plus the name that attributes it in
+/// link-step reporting: the input path itself, or `<archive>(<member>)`
+/// for an expanded archive member.
+struct LoadedShard {
+  mlir::OwningOpRef<mlir::ModuleOp> module;
+  std::string name;
+};
+
+/// Loads, extracts, and parses the link-line `inputs` into per-TU shard
+/// modules, in link-line order (FR-58 slices 1 and 2, `--link`). The
+/// functional core is `emitrustcc::findShardPayload` (payload location
+/// inside one input) and `emitrustcc::findArchivePayloads` (static-archive
+/// expansion); this function owns the file reads and the parse. Each input
+/// is an object file whose `.emitrust` section carries the shard, an
+/// object falling back to its `<object>.emitrust.mlirbc` sidecar, a static
+/// archive whose members are expanded in archive order as if listed loose
+/// at the archive's position (a payload-less member warns and is skipped —
 /// members have no sidecar to fall back to), or a shard file named
 /// directly — `parseSourceFile` handles MLIR bytecode and text alike.
 /// Every failure path has printed a diagnostic by the time this returns
-/// null.
+/// false.
 ///
 /// \param inputs the link-line object/archive/shard paths, in link order.
-/// \param context the context to parse and merge in; the EmitRust dialect
-///        is loaded here because no import will do it.
-/// \returns the merged, verified whole-program module, or null.
-static mlir::OwningOpRef<mlir::ModuleOp>
-loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
-                   mlir::MLIRContext &context) {
+/// \param context the context to parse in; the EmitRust dialect is loaded
+///        here because no import will do it.
+/// \param shards receives one named shard per payload, in link-line order.
+/// \returns true when every input yielded its shards.
+static bool loadLinkShards(llvm::ArrayRef<std::string> inputs,
+                           mlir::MLIRContext &context,
+                           llvm::SmallVectorImpl<LoadedShard> &shards) {
   context.loadDialect<mlir::emitrust::EmitRustDialect>();
-  llvm::SmallVector<mlir::OwningOpRef<mlir::ModuleOp>> shards;
   // Parses one shard payload — copied into its own buffer named
   // `bufferName`, because payloads point into files that die before the
   // parsed module's string attrs and parser diagnostics do — and appends
   // it to `shards`.
   auto parseShard = [&](llvm::StringRef payload,
                         const llvm::Twine &bufferName) -> mlir::LogicalResult {
+    std::string name = bufferName.str();
     llvm::SourceMgr sourceMgr;
     sourceMgr.AddNewSourceBuffer(
-        llvm::MemoryBuffer::getMemBufferCopy(payload, bufferName),
-        llvm::SMLoc());
+        llvm::MemoryBuffer::getMemBufferCopy(payload, name), llvm::SMLoc());
     mlir::ParserConfig parserConfig(&context);
     mlir::OwningOpRef<mlir::ModuleOp> shard =
         mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, parserConfig);
     if (!shard)
       return mlir::failure();
-    shards.push_back(std::move(shard));
+    shards.push_back(LoadedShard{std::move(shard), std::move(name)});
     return mlir::success();
   };
   for (const std::string &path : inputs) {
@@ -704,7 +712,7 @@ loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
     if (!file) {
       llvm::errs() << "error: cannot read '" << path
                    << "': " << file.getError().message() << "\n";
-      return nullptr;
+      return false;
     }
     if (emitrustcc::isStaticArchive(**file)) {
       // FR-58 slice 2: expand the archive in place, members in archive
@@ -715,7 +723,7 @@ loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
       if (mlir::failed(expanded)) {
         llvm::errs() << "error: cannot expand archive '" << path
                      << "': " << archiveError << "\n";
-        return nullptr;
+        return false;
       }
       for (const std::string &member : expanded->skippedMembers)
         llvm::errs() << "warning: archive member '" << member << "' of '"
@@ -724,7 +732,7 @@ loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
            expanded->payloads)
         if (mlir::failed(parseShard(member.payload,
                                     path + "(" + member.memberName + ")")))
-          return nullptr;
+          return false;
       continue;
     }
     std::string sectionError;
@@ -733,11 +741,11 @@ loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
     if (mlir::failed(payload)) {
       llvm::errs() << "error: cannot read the .emitrust section of '" << path
                    << "': " << sectionError << "\n";
-      return nullptr;
+      return false;
     }
     if (*payload) {
       if (mlir::failed(parseShard(**payload, path)))
-        return nullptr;
+        return false;
       continue;
     }
     // FR-57b keeps the sidecar as the non-ELF fallback; honoring it here
@@ -751,16 +759,90 @@ loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
                    << sidecar
                    << "' cannot be read: " << side.getError().message()
                    << "\n";
-      return nullptr;
+      return false;
     }
     if (mlir::failed(parseShard((*side)->getBuffer(), sidecar)))
-      return nullptr;
+      return false;
+  }
+  return true;
+}
+
+/// `loadLinkShards` + FR-57d surfacing + the FR-58 merge: the full `--link`
+/// module path. Before the shards are consumed by the merge, each shard's
+/// rejection-ledger entries (recorded by the shim's recovering import and
+/// carried in the artifact, see EmitRust/ShardMetadata.h) are printed in
+/// the same summary format the joint import uses, prefixed with the shard
+/// they came from — per-TU attribution is exactly the fact FR-58's
+/// selective re-import of fact-starved items needs, so it must survive to
+/// the link step's own report. The merge itself then strips the metadata,
+/// keeping the merged module byte-comparable to the joint import's.
+///
+/// \param inputs the link-line object/archive/shard paths, in link order.
+/// \param context the context to parse and merge in.
+/// \returns the merged, verified whole-program module, or null after a
+///          printed diagnostic.
+static mlir::OwningOpRef<mlir::ModuleOp>
+loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
+                   mlir::MLIRContext &context) {
+  llvm::SmallVector<LoadedShard> shards;
+  if (!loadLinkShards(inputs, context, shards))
+    return nullptr;
+  llvm::SmallVector<mlir::OwningOpRef<mlir::ModuleOp>> modules;
+  modules.reserve(shards.size());
+  for (LoadedShard &shard : shards) {
+    llvm::SmallVector<mlir::emitrust::RejectedItem> rejections =
+        mlir::emitrust::getShardRejections(*shard.module);
+    if (!rejections.empty()) {
+      mlir::emitrust::RejectionLedger shardLedger;
+      for (mlir::emitrust::RejectedItem &item : rejections)
+        shardLedger.record(std::move(item));
+      llvm::errs() << "shard '" << shard.name << "': ";
+      shardLedger.printSummary(llvm::errs());
+    }
+    modules.push_back(std::move(shard.module));
   }
   mlir::FailureOr<mlir::OwningOpRef<mlir::ModuleOp>> merged =
-      emitrustcc::mergeLinkShards(shards);
+      emitrustcc::mergeLinkShards(modules);
   if (mlir::failed(merged))
     return nullptr;
   return std::move(*merged);
+}
+
+/// `--link --emit=item-graph`: dumps each shard's STORED item-graph text
+/// (FR-57d, `emitrust.item_graph`), one `shard <i> '<name>'` header per
+/// shard in link-line order, from the artifacts alone — no C is parsed.
+/// Deliberately NOT a merged graph: merging the shards' graphs
+/// (alpha-renaming `tu0_` tags, deduplicating shared nodes) is FR-58's own
+/// open item, and printing a naive concatenation AS IF merged would be
+/// silently wrong; the per-shard dump is the honest surface the artifacts
+/// support today. A shard carrying no graph (an artifact from before
+/// metadata support) is a located error, not an empty section — the caller
+/// asked for facts the artifact cannot supply.
+///
+/// \param inputs the link-line object/archive/shard paths, in link order.
+/// \param outputPath the `-o` destination (`-` for stdout).
+/// \returns the process exit code.
+static int emitLinkShardItemGraphs(llvm::ArrayRef<std::string> inputs,
+                                   llvm::StringRef outputPath) {
+  mlir::MLIRContext context;
+  context.getDiagEngine().registerHandler(
+      [](mlir::Diagnostic &diag) { printDiagnostic(diag); });
+  llvm::SmallVector<LoadedShard> shards;
+  if (!loadLinkShards(inputs, context, shards))
+    return 1;
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  for (auto [index, shard] : llvm::enumerate(shards)) {
+    llvm::StringRef graph = mlir::emitrust::getShardItemGraph(*shard.module);
+    if (graph.empty()) {
+      llvm::errs() << "error: shard '" << shard.name
+                   << "' carries no item-graph metadata (artifact predates "
+                      "FR-57d?)\n";
+      return 1;
+    }
+    os << "shard " << index << " '" << shard.name << "'\n" << graph;
+  }
+  return mlir::failed(writeFile(outputPath, text)) ? 1 : 0;
 }
 
 //===----------------------------------------------------------------------===//
@@ -938,9 +1020,12 @@ int main(int argc, char **argv) {
   // FR-58: --link consumes already-imported, already-converted shards, so
   // everything that configures an import or the pass pipeline is
   // meaningless with it and is rejected rather than silently ignored.
-  if (linkFlag && emitKind != EmitKind::Rust && emitKind != EmitKind::Crate) {
+  // --emit=item-graph is the exception (FR-57d): the shards CARRY their
+  // item-graph text, so dumping it per shard needs no import either.
+  if (linkFlag && emitKind != EmitKind::Rust && emitKind != EmitKind::Crate &&
+      emitKind != EmitKind::ItemGraph) {
     llvm::errs() << "error: --link merges already-converted shards, so only "
-                    "--emit=rust and --emit=crate apply\n";
+                    "--emit=rust, --emit=crate and --emit=item-graph apply\n";
     return 1;
   }
   if (linkFlag &&
@@ -989,6 +1074,11 @@ int main(int argc, char **argv) {
   std::vector<std::string> inputs(inputFilenames.begin(),
                                   inputFilenames.end());
   std::vector<std::string> extra = collectExtraClangArgs();
+
+  // FR-57d: under --link the item graph comes from the shards' stored
+  // metadata, per shard in link-line order — no C is parsed at all.
+  if (linkFlag && emitKind == EmitKind::ItemGraph)
+    return emitLinkShardItemGraphs(inputs, outputPath);
 
   // The item graph and the coloring are pure-AST analyses: no MLIR context,
   // no import, no pipeline. Handled here, before any of that machinery is set
