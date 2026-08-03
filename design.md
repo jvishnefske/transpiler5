@@ -1955,6 +1955,32 @@ of references or inheritance, so it precedes both.
     temporaries into their one consumer where evaluation order provably
     cannot change (loads/pure ops only; SPIKE FIRST -- this is the largest
     readability lever and the most semantics-sensitive).
+    SPIKE 61d-0 (2026-08-03): GO. Buffered-capture mechanism prototyped for
+    Constant+Add only: capture the op's normal statement rendering from the
+    emitter buffer, strip indent + `;\n`, suppress the let prologue while
+    still calling assignName (numbering stability), re-print at the unique
+    consumer with rank-based parens. 206 sites fired corpus-wide, EndToEnd
+    123/123 byte-diff green, full suite 439/439, nested-region capture works
+    for free (if/loop bodies flow through emitBlockBody). Corrections the
+    implementation must carry: (1) computeInlineCandidates runs AFTER
+    tail-fold candidate selection, not before; (2) non-finite float
+    constants (path-expression rendering) are disqualified from suffixing;
+    (3) the tree builds -DNDEBUG, so mechanism invariants must be
+    emitOpError failures, not asserts; (4) emitFor/emitGlobalCells/
+    emitArmBodyWithTail iterate ops without emitBlockBody -- captures there
+    degrade gracefully to by-name, route or accept deliberately; (5) pin
+    exponent-float suffixing (`1e30f64`) by test, absent from corpus.
+  - [ ] 61e Real C local names: `emitrust.variable` gains an optional
+    `name` attr carrying the final Rust spelling (importer-side
+    mangleMemberName); the emitter prefers it over vN, `_`-prefixes unused
+    names, and uniquifies per function (never shadows). Parameters carried
+    via an `emitrust.param_names` func attr. SCOPE LIMIT (design-verified):
+    plain signed non-address-taken scalar locals are dissolved by mem2reg
+    and re-materialize as SCF-lowering lets with no decl association --
+    they keep vN this iteration; naming them needs work at SCF-lift time
+    (future FR). Named now: parameters, by-value param shadows, aggregates,
+    unsigned scalars, enums, fn-ptrs, address-taken scalars, STL/FILE
+    locals, owner structs.
 
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
