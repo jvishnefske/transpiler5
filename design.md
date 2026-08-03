@@ -2804,6 +2804,36 @@ of references or inheritance, so it precedes both.
   RedGlobal (never the blame minimum — the paired `ReadsGlobal` sorts
   first).
 
+  SLICE-3 SURFACE SPIKE (2026-08-03) — verdict reshapes the slice list.
+  Question: what dialect surface does the same-thread actor emission
+  need? Measured answer: NONE. A hand-written MLIR probe expressed the
+  full E1 actor shape — actor `struct_def`, `impl` with plain `&mut
+  self` methods (one per message arm), `method_call` from `c_main`,
+  struct-init construction — entirely with existing ops; it emitted,
+  cargo-built clean under the full deny-lint manifest, and ran
+  correctly. The reified-message-enum alternative was probed honestly
+  and is DEAD for the default mode: `emitrust.enum_def` is the OPEN
+  value-preserving C enum (repr(transparent) struct + associated
+  consts) with no payload channel, `emitrust.switch` matches integer
+  discriminators only (no variant patterns, no bindings, no results),
+  and the closest approximation both reads like C (match on `.0` tags)
+  and HARD-FAILS the deny manifest (UpperCamel associated consts trip
+  `non_upper_case_globals`). Readability comparison favors plain
+  methods for same-thread anyway: E1's per-actor Reply enum +
+  accessor-with-unreachable ceremony exists only because the enum was
+  reified where no call site needs it. Decision (Option C): slice 3 as
+  a separate dialect-ops slice is DELETED; the same-thread DEFAULT-ON
+  lowering (slice 4) is a lift pass over existing ops with zero
+  dialect/emitter changes and zero golden churn outside flagged
+  programs; the data-carrying enum op set (a CLOSED enum-def op — not
+  an extension of the open `enum_def` — variant-literal construction,
+  and a binding match with per-case block arguments and a result mode)
+  moves into slice 5, where the threaded flavor structurally requires
+  message reification (E3) and where the ops also unlock the Non-Goals
+  follow-on value (tagged unions, Option-like shapes) on their own
+  merit. The owner's "message based" surface is thus not dropped but
+  lands exactly where messages are load-bearing.
+
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
