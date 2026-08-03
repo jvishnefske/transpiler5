@@ -11,7 +11,6 @@
 // CHECK-NEXT:        continue;
 // CHECK-NEXT:      }
 // CHECK-NEXT:    }
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @spin(%arg0: i1, %arg1: i1) {
   emitrust.loop {
@@ -32,7 +31,6 @@ emitrust.func @spin(%arg0: i1, %arg1: i1) {
 // CHECK-NEXT:      }
 // CHECK-NEXT:      break;
 // CHECK-NEXT:    }
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @for_jumps(%arg0: index, %arg1: index, %arg2: index, %arg3: i1) {
   emitrust.for %i = %arg0 to %arg1 step %arg2 {
@@ -57,7 +55,7 @@ emitrust.func @for_jumps(%arg0: index, %arg1: index, %arg2: index, %arg3: i1) {
 // CHECK-NEXT:      v3 = v5;
 // CHECK-NEXT:      break;
 // CHECK-NEXT:    }
-// CHECK-NEXT:    return v2;
+// CHECK-NEXT:    v2
 // CHECK-NEXT:  }
 emitrust.func @rotate(%arg0: i32, %arg1: i32) -> i32 {
   %a = emitrust.let mut %arg0 : i32

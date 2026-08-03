@@ -30,9 +30,10 @@ emitrust.impl "Owner_main_arr" {
     %s = emitrust.deref %arg0 : (!emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>) -> !emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>
     %d = emitrust.member %s["data"] : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>) -> !emitrust.lvalue<!emitrust.array<8xi32>>
     %e = emitrust.subscript %d[%arg1] : (!emitrust.lvalue<!emitrust.array<8xi32>>, i64) -> !emitrust.lvalue<i32>
-    // CHECK: let v1: i32 = (*self).data[v0 as usize];
+    // The load is the single-use producer of the returned value, so FR-61a
+    // folds the binding: the place expression is the method's tail expression.
+    // CHECK: (*self).data[v0 as usize]
     %v = emitrust.load %e : (!emitrust.lvalue<i32>) -> i32
-    // CHECK: return v1;
     emitrust.return %v : i32
   }
 // CHECK: }
@@ -47,8 +48,9 @@ emitrust.func @c_main() -> i32 {
   // Method call without a result: a bare statement on the owner place.
   // CHECK: v0.fill(v1, v2);
   emitrust.method_call %o["fill"] (%i, %v) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64, i32) -> ()
-  // Method call with a result: a let binding.
-  // CHECK: let v3: i32 = v0.sum(v1);
+  // Method call with a result feeding the final return: FR-61a folds the
+  // binding and the call expression becomes the tail expression.
+  // CHECK: v0.sum(v1)
   %r = emitrust.method_call %o["sum"] (%i) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64) -> i32
   emitrust.return %r : i32
 }

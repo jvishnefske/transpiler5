@@ -24,7 +24,7 @@ emitrust.func @calls(%arg0: !emitrust.fn_ptr<(i32, i32) -> i32>,
       : (!emitrust.fn_ptr<(i32, i32) -> i32>, i32, i32) -> i32
   // CHECK-NEXT:    v1.expect("null function pointer")();
   emitrust.call_indirect %arg1() : (!emitrust.fn_ptr<()>) -> ()
-  // CHECK-NEXT:    return v3;
+  // CHECK-NEXT:    v3
   emitrust.return %0 : i32
 }
 

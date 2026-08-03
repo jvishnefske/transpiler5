@@ -33,7 +33,6 @@ emitrust.enum_def @Color ["Red", "Green", "Blue"] [0, 1, 2]
 // CHECK-NEXT:            let _v3: i32 = 3;
 // CHECK-NEXT:        }
 // CHECK-NEXT:    }
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @simple_match(%arg0: i32) {
   emitrust.switch %arg0 : i32
@@ -65,7 +64,6 @@ emitrust.func @simple_match(%arg0: i32) {
 // CHECK-NEXT:        _ => {
 // CHECK-NEXT:        }
 // CHECK-NEXT:    }
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @usize_match(%arg0: index) {
   emitrust.switch %arg0 : index
@@ -104,7 +102,6 @@ emitrust.func @usize_match(%arg0: index) {
 // CHECK-NEXT:        _ => {
 // CHECK-NEXT:        }
 // CHECK-NEXT:    }
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @nested_match(%arg0: i32, %arg1: i1) {
   %0 = emitrust.constant <0 : i32> : i32
@@ -141,7 +138,6 @@ emitrust.func @nested_match(%arg0: i32, %arg1: i1) {
 // CHECK-NEXT:            }
 // CHECK-NEXT:        }
 // CHECK-NEXT:    }
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @match_in_loop(%arg0: i32) {
   emitrust.loop {
@@ -161,8 +157,7 @@ emitrust.func @match_in_loop(%arg0: i32) {
 // CHECK-NEXT:    let v3: Color = Color::Green;
 // CHECK-NEXT:    let _v4: bool = v0 == v1;
 // CHECK-NEXT:    let _v5: bool = v0 != v3;
-// CHECK-NEXT:    let v6: i32 = v0.0 as i32;
-// CHECK-NEXT:    return v6;
+// CHECK-NEXT:    v0.0 as i32
 // CHECK-NEXT:  }
 emitrust.func @enum_ops(%arg0: !emitrust.enum<"Color">, %arg1: !emitrust.enum<"Color">) -> i32 {
   %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>
@@ -194,8 +189,7 @@ emitrust.enum_def @Mode ["Off", "On"] [0, 1] {unsigned_underlying}
 // CHECK-NEXT:    let v2: Mode = Mode(v0 as u32);
 // CHECK-NEXT:    v1 = v2;
 // CHECK-NEXT:    let v3: &mut u32 = &mut v1.0;
-// CHECK-NEXT:    let v4: u32 = *v3;
-// CHECK-NEXT:    return v4;
+// CHECK-NEXT:    *v3
 // CHECK-NEXT:  }
 emitrust.func @enum_from_int(%arg0: i32) -> ui32 {
   %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Mode">>

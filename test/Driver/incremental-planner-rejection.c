@@ -52,7 +52,7 @@ int main(void) { return helper(1); }
 // Both translatable items reach the crate; the rejected one leaves no trace.
 // RUST: fn tu0_helper(v0: i32) -> i32 {
 // RUST: fn c_main() -> i32 {
-// RUST:     let v1: i32 = tu0_helper(v0);
+// RUST:     tu0_helper(v0)
 // RUST-NOT: consume
 
 // The two translatable items are counted as ported and the report names the

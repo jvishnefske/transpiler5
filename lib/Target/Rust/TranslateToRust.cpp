@@ -22,6 +22,13 @@
 /// bindings are `_`-prefixed, a dead initializer is dropped in favor of
 /// Rust's deferred initialization (`let v: T;`), entry-block dead stores are
 /// elided, and `mut` is emitted only for bindings that are actually mutated.
+/// Two expression-oriented renderings keep the output rustacean (FR-61): the
+/// function-final `return v;` renders as the tail expression `v` -- folding
+/// away a single-use binding defined by the immediately preceding let-
+/// producing op -- and a function-final `return;` is omitted (FR-61a); a
+/// deferred `let x: T;` whose immediately following `if` assigns `x` exactly
+/// once at the end of both arms renders as an if-expression binding
+/// `let x: T = if c { .. } else { .. };` (FR-61b).
 /// A drop is made only where the analysis PROVES no read on any path; a
 /// wrong drop can only surface as a hard rustc error (E0381/E0384), never as
 /// silently different behavior. Every construct that cannot be represented
@@ -53,7 +60,9 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/raw_ostream.h"
 
+#include <cassert>
 #include <charconv>
 #include <string>
 #include <system_error>
@@ -67,20 +76,35 @@ namespace {
 /// The emitter is a functional core over an output stream: besides the
 /// indented stream wrapper it owns only per-function analysis caches (the
 /// value-name map plus the warning-clean rendering sets: `unreachableOps`,
-/// `deadStores`, `deferredInits`, `valueReadCache`), all recomputed from
-/// scratch at each function entry. Names are assigned in emission order:
-/// within each function, first the entry block arguments, then every op
-/// result (and for-loop induction variable) as it is encountered top-down.
+/// `deadStores`, `deferredInits`, `valueReadCache`, and the FR-61 tail/
+/// if-expression rendering state), all recomputed from scratch at each
+/// function entry. Names are assigned in emission order: within each
+/// function, first the entry block arguments, then every op result (and
+/// for-loop induction variable) as it is encountered top-down.
+///
+/// The emitter renders into an internal string buffer and `finish()` copies
+/// it to the caller's stream. Buffering exists for exactly one edit: the
+/// FR-61a tail-expression fold emits the folded op's right-hand side as a
+/// normal statement (through the per-op emitters, so no printing logic is
+/// duplicated) and then removes the statement's trailing `;` when the
+/// function-final return is reached.
 class RustEmitter {
 public:
   /// Creates an emitter writing to `os` under `options`.
   RustEmitter(raw_ostream &os, const emitrust::RustEmitOptions &options)
-      : os(os), options(options) {}
+      : finalOS(os), bufferOS(buffer), os(bufferOS), options(options) {}
 
   /// Emits `op` as Rust source text; dispatches over all supported ops.
   /// Unsupported operations fail with a located "unable to translate op"
   /// diagnostic.
   LogicalResult emitOperation(Operation &op);
+
+  /// Flushes the buffered translation to the caller's stream. Must be called
+  /// exactly once, after the last `emitOperation`.
+  void finish() {
+    os.flush();
+    finalOS << buffer;
+  }
 
 private:
   //===--------------------------------------------------------------------===//
@@ -314,6 +338,17 @@ private:
     return options.exportItems ? "pub " : "";
   }
 
+  /// The caller's stream; `finish()` copies the buffered translation here.
+  raw_ostream &finalOS;
+
+  /// The whole translation, accumulated so the FR-61a fold can remove the
+  /// trailing `;` of the statement it turns into the tail expression.
+  std::string buffer;
+
+  /// Adapter presenting `buffer` as a stream (declared before `os`, which
+  /// wraps it; initialization follows declaration order).
+  llvm::raw_string_ostream bufferOS;
+
   /// Output stream tracking the current indentation.
   raw_indented_ostream os;
 
@@ -404,6 +439,55 @@ private:
 
   /// Populates `deadStores` for the function's entry block.
   void computeDeadStores(Block &entryBlock);
+
+  /// FR-61a: the function-final `emitrust.return` of the current function --
+  /// the last op the entry-block walk emits -- rendered as a tail expression
+  /// (operand only, no `return`, no `;`) or, when it has no operand, omitted.
+  /// Null when the entry block's last emitted op is not a return (e.g. the
+  /// body ends in a diverging call). Set per function by `emitFunc`.
+  Operation *tailReturn = nullptr;
+
+  /// FR-61a: the single-result let-producing op immediately preceding
+  /// `tailReturn` whose only-use result the tail return returns; its binding
+  /// never renders and its right-hand side becomes the tail expression. Null
+  /// when no such fold applies. Set per function by `emitFunc`.
+  Operation *tailFoldCandidate = nullptr;
+
+  /// FR-61a: set by `emitBlockBody` while `tailFoldCandidate` is being
+  /// emitted; `emitLetPrologue` consumes it by naming the result (keeping the
+  /// v-numbering of every other value unchanged) while printing nothing.
+  bool pendingTailFold = false;
+
+  /// FR-61a: the candidate's prologue was suppressed, so the buffer now ends
+  /// with `<rhs>;\n`; `emitReturn` removes the `;`, leaving the right-hand
+  /// side as the function's tail expression.
+  bool tailFoldActive = false;
+
+  /// FR-61b: deferred bindings (`deferredInits` members that need no `mut`)
+  /// rendered as `let x: T = if c { .. } else { .. };` -- the mapped
+  /// `emitrust.if` immediately follows the binding, both its arms end with
+  /// the binding's only two assignments, and each arm's final assignment
+  /// becomes the arm's tail expression. Populated per function by
+  /// `computeIfExprBindings`.
+  DenseMap<Operation *, emitrust::IfOp> ifExprBindings;
+
+  /// FR-61b: the `emitrust.if` ops consumed into an if-expression binding;
+  /// the normal statement walk skips them.
+  llvm::SmallPtrSet<Operation *, 8> consumedIfs;
+
+  /// Fills `ifExprBindings`/`consumedIfs` from the `deferredInits` already
+  /// computed for the current function.
+  void computeIfExprBindings();
+
+  /// FR-61b: emits `let <name>: <type> = if <cond> {` .. `} else {` .. `};`
+  /// for the deferred binding `op` consumed together with `ifOp`.
+  LogicalResult emitIfExprBinding(Operation *op, Value result, Type valueType,
+                                  emitrust::IfOp ifOp);
+
+  /// FR-61b: emits one arm of an if-expression binding: every statement
+  /// except the final assignment to `binding`, whose right-hand side is
+  /// emitted as the arm's tail expression.
+  LogicalResult emitArmBodyWithTail(Region &region, Value binding);
 
   /// Returns whether `value` is read (as opposed to only written or unused)
   /// somewhere in reachable code -- used to decide `_`-prefixing and dead
@@ -916,6 +1000,55 @@ void RustEmitter::computeDeadStores(Block &entryBlock) {
   deadStores = std::move(dead);
 }
 
+/// FR-61b: returns the `emitrust.assign` to `binding` that is `region`'s
+/// final emitted statement, or null when the arm is empty, multi-block, or
+/// ends differently. The walk mirrors emission: it stops after the first
+/// diverging op and ignores the implicit `emitrust.yield` terminator (which
+/// emits nothing).
+static Operation *armTailAssign(Region &region, Value binding) {
+  if (region.empty() || !region.hasOneBlock())
+    return nullptr;
+  Operation *last = nullptr;
+  for (Operation &op : region.front()) {
+    if (isa<emitrust::YieldOp>(op))
+      continue;
+    last = &op;
+    if (opDiverges(&op))
+      break;
+  }
+  return last && isBindingWrite(last, binding) ? last : nullptr;
+}
+
+void RustEmitter::computeIfExprBindings() {
+  for (auto [op, needsMut] : deferredInits) {
+    // A deferred binding that still needs `mut` is assigned more than once
+    // per path or mutated after init -- not the both-arms-assign-once shape.
+    if (needsMut)
+      continue;
+    auto ifOp = dyn_cast_or_null<emitrust::IfOp>(op->getNextNode());
+    if (!ifOp || ifOp.getElseRegion().empty())
+      continue;
+    Value binding = op->getResult(0);
+    Operation *thenAssign = armTailAssign(ifOp.getThenRegion(), binding);
+    Operation *elseAssign = armTailAssign(ifOp.getElseRegion(), binding);
+    if (!thenAssign || !elseAssign)
+      continue;
+    // The two arm-final assignments must be the binding's only assignments
+    // in the whole function; any other write keeps the statement form.
+    bool onlyAssignments = true;
+    for (Operation *user : binding.getUsers())
+      if (isBindingWrite(user, binding) && user != thenAssign &&
+          user != elseAssign) {
+        onlyAssignments = false;
+        break;
+      }
+    if (!onlyAssignments)
+      continue;
+    ifExprBindings[op] = ifOp;
+    consumedIfs.insert(ifOp.getOperation());
+  }
+}
+
 FailureOr<std::string> RustEmitter::lookupName(Location loc, Value value) {
   auto it = valueNames.find(value);
   if (it == valueNames.end()) {
@@ -1233,6 +1366,15 @@ void RustEmitter::emitEscapedStringLiteral(StringRef value) {
 
 LogicalResult RustEmitter::emitLetPrologue(Value result, bool isMut) {
   std::string name = assignName(result);
+  // FR-61a fold: the binding never renders -- the right-hand side that
+  // follows becomes the function's tail expression (its trailing `;` is
+  // removed when the tail return is reached). The name is still assigned
+  // above so the v-numbering of every other value is unchanged.
+  if (pendingTailFold) {
+    pendingTailFold = false;
+    tailFoldActive = true;
+    return success();
+  }
   os << "let ";
   if (isMut)
     os << "mut ";
@@ -1260,10 +1402,35 @@ static bool opDiverges(Operation *op) {
   return isa<emitrust::ReturnOp, emitrust::BreakOp, emitrust::ContinueOp>(op);
 }
 
+/// FR-61a: whether `op`'s emitter renders exactly one
+/// `let <name>: <type> = <rhs>;` statement through `emitLetPrologue`, so that
+/// suppressing the prologue leaves `<rhs>;` -- the fold's tail expression.
+/// `emitrust.variable` (a place, not a value) and every multi-result form are
+/// excluded by the caller's single-result check; a deferred `emitrust.let`
+/// cannot arise because deferral requires assignments, i.e. more than the
+/// fold's single use.
+static bool isTailFoldableProducer(Operation *op) {
+  return isa<emitrust::ConstantOp, emitrust::LiteralOp, emitrust::LetOp,
+             emitrust::CallOpaqueOp, emitrust::CallIndirectOp,
+             emitrust::MethodCallOp, emitrust::AddOp, emitrust::SubOp,
+             emitrust::MulOp, emitrust::DivOp, emitrust::RemOp,
+             emitrust::AndOp, emitrust::OrOp, emitrust::XorOp,
+             emitrust::ShlOp, emitrust::ShrOp, emitrust::CmpOp,
+             emitrust::CastOp, emitrust::BitcastOp, emitrust::SelectOp,
+             emitrust::GlobalLoadOp, emitrust::CellGetOp, emitrust::LoadOp,
+             emitrust::AddrOfOp, emitrust::SliceOfOp>(op);
+}
+
 LogicalResult RustEmitter::emitBlockBody(Block &block) {
   for (Operation &op : block) {
+    // FR-61a: while the fold candidate is emitted, `emitLetPrologue` names
+    // its result but prints nothing, leaving only `<rhs>;`.
+    pendingTailFold = (&op == tailFoldCandidate);
     if (failed(emitOperation(op)))
       return failure();
+    // A candidate whose emitter never reached `emitLetPrologue` abandons the
+    // fold; the tail return then falls back to the binding's name.
+    pendingTailFold = false;
     // Statements after a diverging op are unreachable; stop to keep the
     // emitted body free of dead code.
     if (opDiverges(&op))
@@ -1355,6 +1522,12 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   valueReadCache.clear();
   deferredInits.clear();
   deadStores.clear();
+  ifExprBindings.clear();
+  consumedIfs.clear();
+  tailReturn = nullptr;
+  tailFoldCandidate = nullptr;
+  pendingTailFold = false;
+  tailFoldActive = false;
 
   Region &body = fn.getFunctionBody();
   if (body.empty())
@@ -1364,11 +1537,34 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   computeUnreachable(body.front());
   computeDeadStores(body.front());
   computeDeferredInits(body.front());
+  computeIfExprBindings();
   if (fn.getNumResults() > 1)
     return op->emitOpError(
         "cannot translate a function with more than one result");
 
   Block &entryBlock = body.front();
+  // FR-61a: find the entry block's last EMITTED op -- the walk stops after
+  // the first diverging op, so this is either that op or the block's last.
+  // When it is a return, render it as a tail expression / omit it (void);
+  // when additionally the returned value's defining op immediately precedes
+  // the return, is a single-result let-producing op, and the value's only
+  // use is the return, fold the binding away entirely.
+  Operation *lastEmitted = nullptr;
+  for (Operation &bodyOp : entryBlock) {
+    lastEmitted = &bodyOp;
+    if (opDiverges(&bodyOp))
+      break;
+  }
+  if (auto finalReturn = dyn_cast_or_null<emitrust::ReturnOp>(lastEmitted)) {
+    tailReturn = finalReturn;
+    if (finalReturn->getNumOperands() == 1) {
+      Value returned = finalReturn->getOperand(0);
+      Operation *def = returned.getDefiningOp();
+      if (def && def == finalReturn->getPrevNode() && returned.hasOneUse() &&
+          def->getNumResults() == 1 && isTailFoldableProducer(def))
+        tailFoldCandidate = def;
+    }
+  }
   // A function directly inside an `emitrust.impl` is a method, UNLESS it
   // carries the `static_method` marker (W2.2), in which case it is a
   // receiverless associated function (`Struct::name(...)`) and every
@@ -1424,6 +1620,30 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
 
 LogicalResult RustEmitter::emitReturn(emitrust::ReturnOp returnOp) {
   Operation *op = returnOp.getOperation();
+  // FR-61a: the function-final return renders expression-oriented: a void
+  // `return;` is omitted, `return v;` becomes the tail expression `v`, and a
+  // folded single-use binding contributes its right-hand side directly.
+  if (op == tailReturn) {
+    if (op->getNumOperands() == 0)
+      return success();
+    if (tailFoldActive) {
+      tailFoldActive = false;
+      os.flush();
+      // The candidate emitted `<rhs>;\n` with its `let` prologue suppressed;
+      // removing the `;` leaves the right-hand side as the tail expression.
+      assert(StringRef(buffer).ends_with(";\n") &&
+             "tail-fold candidate must end its statement with ';'");
+      buffer.erase(buffer.size() - 2, 1);
+      return success();
+    }
+    if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
+      return failure();
+    os << "\n";
+    return success();
+  }
+  // Non-final returns are unrepresentable today (`emitrust.return` is a
+  // terminator constrained to `emitrust.func`), but the statement rendering
+  // is kept so a future dialect relaxation cannot silently emit nothing.
   if (op->getNumOperands() == 0) {
     os << "return;\n";
     return success();
@@ -1560,6 +1780,11 @@ LogicalResult RustEmitter::emitLiteral(emitrust::LiteralOp literalOp) {
 
 LogicalResult RustEmitter::emitDeferredBinding(Operation *op, Value result,
                                                Type type) {
+  // FR-61b: a deferred binding whose immediately following `if` assigns it
+  // exactly once at the end of both arms renders as an if-expression binding
+  // instead of the `let x: T;` + statement-`if` pair.
+  if (auto ifOp = ifExprBindings.lookup(op))
+    return emitIfExprBinding(op, result, type, ifOp);
   os << "let ";
   if (deferredInits.lookup(op))
     os << "mut ";
@@ -1567,6 +1792,49 @@ LogicalResult RustEmitter::emitDeferredBinding(Operation *op, Value result,
   if (failed(emitType(result.getLoc(), type)))
     return failure();
   os << ";\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitIfExprBinding(Operation *op, Value result,
+                                             Type valueType,
+                                             emitrust::IfOp ifOp) {
+  (void)op;
+  // Never `mut`: the both-arms-assign-once shape is exactly the
+  // `deferredInits[op] == false` case.
+  os << "let " << assignName(result) << ": ";
+  if (failed(emitType(result.getLoc(), valueType)))
+    return failure();
+  os << " = if ";
+  if (failed(emitOperand(ifOp.getLoc(), ifOp.getCondition())))
+    return failure();
+  os << " {\n";
+  if (failed(emitArmBodyWithTail(ifOp.getThenRegion(), result)))
+    return failure();
+  os << "} else {\n";
+  if (failed(emitArmBodyWithTail(ifOp.getElseRegion(), result)))
+    return failure();
+  os << "};\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitArmBodyWithTail(Region &region, Value binding) {
+  increaseIndent();
+  for (Operation &op : region.front()) {
+    // The arm's final assignment (its only one, per `computeIfExprBindings`):
+    // its right-hand side is the arm's tail expression.
+    if (isBindingWrite(&op, binding)) {
+      auto assign = cast<emitrust::AssignOp>(&op);
+      if (failed(emitOperand(assign.getLoc(), assign.getValue())))
+        return failure();
+      os << "\n";
+      break;
+    }
+    if (failed(emitOperation(op)))
+      return failure();
+    if (opDiverges(&op))
+      break;
+  }
+  decreaseIndent();
   return success();
 }
 
@@ -1822,6 +2090,10 @@ LogicalResult RustEmitter::emitSelect(emitrust::SelectOp selectOp) {
 
 LogicalResult RustEmitter::emitIf(emitrust::IfOp ifOp) {
   Operation *op = ifOp.getOperation();
+  // FR-61b: an `if` consumed into an if-expression binding was already
+  // rendered by `emitIfExprBinding`.
+  if (consumedIfs.count(op))
+    return success();
   os << "if ";
   if (failed(emitOperand(op->getLoc(), op->getOperand(0))))
     return failure();
@@ -2491,5 +2763,9 @@ LogicalResult mlir::emitrust::translateToRust(Operation *op, raw_ostream &os,
   if (!op)
     return failure();
   RustEmitter emitter(os, options);
-  return emitter.emitOperation(*op);
+  LogicalResult result = emitter.emitOperation(*op);
+  // Buffered emission (see `RustEmitter`): copy out whatever was rendered,
+  // preserving the pre-buffering behavior of partial output on failure.
+  emitter.finish();
+  return result;
 }

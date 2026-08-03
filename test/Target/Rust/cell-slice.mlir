@@ -19,7 +19,7 @@ emitrust.func @observe(%arg0: !emitrust.ref<!emitrust.cell_slice<i32>>, %arg1: i
   %v = emitrust.cell_get %arg0[%arg1] : (!emitrust.ref<!emitrust.cell_slice<i32>>, i64) -> i32
   // CHECK: v0[v1 as usize].set(v2);
   emitrust.cell_set %arg0[%arg1], %v : (!emitrust.ref<!emitrust.cell_slice<i32>>, i64, i32) -> ()
-  // CHECK: return v2;
+  // CHECK: v2
   emitrust.return %v : i32
 }
 
@@ -49,6 +49,5 @@ emitrust.func @caller() {
     }
     emitrust.yield
   }
-  // CHECK: return;
   emitrust.return
 }

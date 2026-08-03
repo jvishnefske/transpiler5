@@ -25,9 +25,11 @@ int main(void) {
 // CHECK: fn twice(v0: i32) -> i32 {
 // CHECK: fn c_main() -> i32 {
 
-// The printf call renders as a print! macro invocation inside c_main.
+// The printf call renders as a print! macro invocation inside c_main; the
+// function-final return renders as a tail expression (FR-61a), so no
+// `return` statement appears.
 // CHECK: print!("total={}
-// CHECK: return
+// CHECK: v2
 
 // The verbatim wrapper forwards c_main's result as the exit code.
 // CHECK: fn main() { std::process::exit(c_main()); }
