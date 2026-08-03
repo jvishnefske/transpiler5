@@ -75,24 +75,23 @@ emitrust.global @c <0 : i32> : i32
 
 // CHECK-NEXT: fn access() -> i32 {
 emitrust.func @access() -> i32 {
-  // A load from a mutable global goes through the Cell.
-  // CHECK-NEXT:     let v0: i32 = counter.with(|__emitrust_tl| __emitrust_tl.get());
+  // FR-61d slice 2: a single-use load of a mutable global inlines into its
+  // consumer -- here the store's value argument, nesting the accessor
+  // closures (the inner `__emitrust_tl` shadows the outer; the read is
+  // evaluated as the `set` argument, so load-then-store order holds).
+  // CHECK-NEXT:     counter.with(|__emitrust_tl| __emitrust_tl.set(counter.with(|__emitrust_tl| __emitrust_tl.get())));
   %0 = emitrust.global_load @counter : i32
-  // A store to a mutable global goes through the Cell.
-  // CHECK-NEXT:     counter.with(|__emitrust_tl| __emitrust_tl.set(v0));
   emitrust.global_store %0, @counter : i32
   // A load from a const global is a direct read of the static item.
   // CHECK-NEXT:     let v1: i32 = limit;
   %1 = emitrust.global_load @limit : i32
   // Whole-aggregate loads and stores move the array value through the Cell.
-  // CHECK-NEXT:     let v2: [i32; 4] = table.with(|__emitrust_tl| __emitrust_tl.get());
+  // CHECK-NEXT:     table.with(|__emitrust_tl| __emitrust_tl.set(table.with(|__emitrust_tl| __emitrust_tl.get())));
   %2 = emitrust.global_load @table : !emitrust.array<4xi32>
-  // CHECK-NEXT:     table.with(|__emitrust_tl| __emitrust_tl.set(v2));
   emitrust.global_store %2, @table : !emitrust.array<4xi32>
   // The `c` global's accessors bind `__emitrust_tl`, never `c` itself.
-  // CHECK-NEXT:     let v3: i32 = c.with(|__emitrust_tl| __emitrust_tl.get());
+  // CHECK-NEXT:     c.with(|__emitrust_tl| __emitrust_tl.set(c.with(|__emitrust_tl| __emitrust_tl.get())));
   %3 = emitrust.global_load @c : i32
-  // CHECK-NEXT:     c.with(|__emitrust_tl| __emitrust_tl.set(v3));
   emitrust.global_store %3, @c : i32
   // CHECK-NEXT:     v1
   emitrust.return %1 : i32
