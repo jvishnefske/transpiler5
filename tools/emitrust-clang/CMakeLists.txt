@@ -39,6 +39,7 @@ set(LIBS
   MLIRIR
   MLIRSupport
   clangDriver
+  clangFrontend
   clangBasic
   )
 

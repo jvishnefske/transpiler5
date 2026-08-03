@@ -1776,8 +1776,8 @@ of references or inheritance, so it precedes both.
   stripping the empirically measured workflow-noise blacklist (SPIKE 2
   below) plus the positional input path (tools/emitrust-clang/Cc1Key.h), and
   logs the FR-57 key PAIR — `cc1-key` (canonicalized command line) and
-  `src-hash` (main-file content bytes; folding in transitively included
-  headers via the depfile list is still open). The artifact is now MLIR
+  `src-hash` (content bytes; widened from the main file to the whole
+  preprocessed input by FR-57c below). The artifact is now MLIR
   bytecode (`<object>.emitrust.mlirbc`, the sidecar kept as the non-ELF
   fallback) and is embedded into the genuine object as a non-alloc
   `.emitrust` section via LLVM's objcopy-as-a-library, staged-and-renamed so
@@ -1788,7 +1788,35 @@ of references or inheritance, so it precedes both.
   and round-trips through emitrust-opt, and stripping `.emitrust` restores
   delegation byte-identity (test/Driver/emitrust-clang-shim.c). Still open
   for the checkbox: item-graph shard + rejection-ledger entries in the
-  artifact, and the depfile-driven header hashing above.
+  artifact.
+  LANDED (FR-57c, header-aware src-hash): `src-hash` now covers the WHOLE
+  preprocessed input, not just the main file's bytes, so a header-only edit
+  misses the cache key. SPIKE verdict, measured: parsing the depfile the
+  build itself produced is FRAGILE — it exists only when the build asked
+  for one, and `-MT 'custom target'` puts caller-controlled text (spaces,
+  potentially colons) before the `:` — while driving dependency collection
+  internally is uniform; since the shim already links clang's frontend, the
+  robust form needs no subprocess and no depfile syntax at all: the job's
+  own cc1 line is replayed in-process through a `PreprocessOnlyAction` with
+  a `DependencyCollector` attached (user headers only, the `-MMD` set;
+  system-header CONTENT is deliberately out of scope because the system
+  include PATHS are already in the cc1-key half, and under nix a toolchain
+  change is a store-path change that misses there), with the
+  dependency-output and output-file options cleared so the scan can touch
+  neither the build's real depfile nor the just-produced object
+  (tools/emitrust-clang/DepScan.h). The hash is an order-independent
+  MULTISET of per-file content digests: content-only, so an mtime touch
+  keeps it; path-free, so the same sources at another location keep it.
+  Failure direction: a scan failure or an unreadable dependency warns and
+  emits NO artifact — never a key that missed a dependency and could later
+  be a wrong cache hit — with the delegated compile's outcome untouched;
+  forced by the test-only `EMITRUST_TEST_UNREADABLE_DEP` env hook, since no
+  real build can delete a header between the delegated compile and the
+  hash in one invocation. Pinned: header content edit misses the key,
+  mtime-only touch keeps it, `-MD -MF <renamed> -MT 'custom target'` keeps
+  BOTH halves, a depfile-less compile hashes identically to a depfile one,
+  and the unreadable-dependency path keeps the object and drops only the
+  artifact (test/Driver/emitrust-clang-src-hash.c).
   LANDED (FR-57a, the FR-58-spike blocker): `--defer-externals` /
   `ImportOptions.deferExternals` import mode. An extern global or called
   function whose definition lives in another TU no longer rejects the solo
