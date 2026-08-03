@@ -28,6 +28,11 @@
 /// what the importer does — it is the same rule, and it has to be, or the
 /// graph would contain items the importer never emits (all of libc, via the
 /// system headers) or miss ones it does (everything inside a namespace).
+/// The one deliberate crack in that wall is the hosted-sink node set
+/// (FR-62, `isHostedSinkName`): a system-header callee the importer lowers
+/// by name into a Rust OUTPUT EFFECT is synthesized as a `def=0` node at
+/// its call, during pass 2 — see the CallExpr arm — so the closure
+/// invariant holds with the node present rather than by dropping the edge.
 ///
 /// DETERMINISM BY CONSTRUCTION, NOT BY DISCIPLINE. Nodes accumulate into a
 /// `std::map<std::string, ItemNode>` and edges into a `std::set<ItemEdge>`
@@ -213,6 +218,29 @@ ItemLinkage linkageOf(const clang::NamedDecl *decl) {
                                      : ItemLinkage::Internal;
 }
 
+/// The importer's hosted OUTPUT SINKS: definition-less system-header
+/// functions whose calls the importer lowers BY NAME into Rust output
+/// effects, mirrored here so the graph can attribute output effects totally
+/// (FR-62 hosted-sink visibility; E2 measured `@stdout` attribution
+/// reaching only 7/131 kernel TUs under the fully closed graph). The set is
+/// exactly the importer's output-effect emission surface, one cite each:
+/// printf (`emitPrintf`, ImportCStatements.cpp), puts (`emitPuts`, ibid.),
+/// putchar (`emitPutchar`, ImportCHosted.cpp), fprintf (the devirtualized
+/// stdout-swallow routing of `emitAliasedPrintf`, ImportCStatements.cpp),
+/// fwrite (`emitFileReadWrite(isWrite=true)`, ImportCHosted.cpp), sprintf
+/// and snprintf (`emitSprintf`, ImportCExpressions.cpp). Hosted NON-sink
+/// functions (strlen, strcmp, memcpy, abs, atoi, fread, ...) are
+/// deliberately absent: they produce no output effect, so their
+/// system-header calls keep the closed-graph silence. Membership is by
+/// name only — argument-shape conditions (fprintf's literal-`stdout` rule,
+/// printf's literal format) stay the importer's business, because a call
+/// the importer will REJECT still attributes an intended output effect.
+bool isHostedSinkName(llvm::StringRef name) {
+  return name == "printf" || name == "puts" || name == "putchar" ||
+         name == "fprintf" || name == "fwrite" || name == "sprintf" ||
+         name == "snprintf";
+}
+
 //===----------------------------------------------------------------------===//
 // The builder
 //===----------------------------------------------------------------------===//
@@ -272,6 +300,20 @@ private:
   /// ASSIGNMENT node while the `DeclRefExpr` that names the global is
   /// several nodes below it.
   void collectStmtDependencies(const clang::Stmt *stmt, llvm::StringRef from);
+
+  /// Synthesizes the node for a hosted-sink callee (`isHostedSinkName`) and
+  /// records the `Calls` edge from `from`. Runs in pass 2 — the one place a
+  /// node is created outside `collectItems` — because the sink is only an
+  /// item of this graph BECAUSE it is called; the closure invariant is
+  /// satisfied by inserting the node before its edge, and the node can
+  /// change no other edge's fate: the only edges that ever target it are
+  /// the ones synthesized here alongside it (`TakesAddressOf` of a
+  /// system-header function is filtered before its symbol is formed).
+  /// The node is `def=0`, extern, located at the callee's real
+  /// system-header declaration; multiple TUs' calls merge in `addNode`
+  /// exactly like a shared prototype's.
+  void addHostedSinkCall(const clang::FunctionDecl *callee,
+                         llvm::StringRef from);
 
   /// Records the global accesses `expr` performs when evaluated in a
   /// context that `writes` and/or `reads` the object it designates.
@@ -616,6 +658,20 @@ void ItemGraphBuilder::collectLValueDependencies(const clang::Expr *expr,
   collectStmtDependencies(stripped, from);
 }
 
+void ItemGraphBuilder::addHostedSinkCall(const clang::FunctionDecl *callee,
+                                         llvm::StringRef from) {
+  // The symbol comes from the same naming function as every other function
+  // node; a hosted sink is never `static`, so the per-TU tag does not
+  // apply and one program-wide node results however many TUs call it.
+  std::string symbol = cFunctionSymbolName(callee, tuTag);
+  clang::PresumedLoc loc = sourceManager->getPresumedLoc(callee->getLocation());
+  addNode({symbol, ItemKind::Function, /*isDefinition=*/false,
+           linkageOf(callee), tuIndex, loc.isValid() ? loc.getFilename() : "",
+           loc.isValid() ? loc.getLine() : 0,
+           loc.isValid() ? loc.getColumn() : 0});
+  addEdge(from, symbol, EdgeKind::Calls);
+}
+
 void ItemGraphBuilder::collectStmtDependencies(const clang::Stmt *stmt,
                                                llvm::StringRef from) {
   if (!stmt)
@@ -625,6 +681,14 @@ void ItemGraphBuilder::collectStmtDependencies(const clang::Stmt *stmt,
     if (const clang::FunctionDecl *callee = call->getDirectCallee()) {
       if (!isSystemHeaderDecl(*sourceManager, callee))
         addEdge(from, cFunctionSymbolName(callee, tuTag), EdgeKind::Calls);
+      else if (callee->getDeclName().isIdentifier() &&
+               isHostedSinkName(callee->getName()) && !callee->getDefinition())
+        // The hosted-sink exception to the closed graph (FR-62): mirror the
+        // importer's interception conditions — by name, and only when the
+        // project supplies no definition of its own (a project-defined
+        // printf is an ordinary call handled above, since its definition is
+        // not in a system header).
+        addHostedSinkCall(callee, from);
     } else {
       // A call with no resolvable callee is a call through a function
       // pointer. Recorded target-less rather than dropped: "this item makes

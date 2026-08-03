@@ -21,5 +21,6 @@ Rect record dropped
 RightTriangle record dropped
 Shape record dropped
 c_main function stubbed
+printf function declared
 report function dropped
 tu2_isqrt function ported
