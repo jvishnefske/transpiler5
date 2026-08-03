@@ -3151,7 +3151,86 @@ of references or inheritance, so it precedes both.
   unconditional-dep Cargo flavor); no IR-shape difference. Threadify
   placement: sibling pass after actor-lift at the pipeline tail,
   consuming one new driver-computed module attribute
-  (`emitrust.actor_thread`), since ActorLift strips its own attrs. FR-52's report
+  (`emitrust.actor_thread`), since ActorLift strips its own attrs.
+
+  SLICE 5b LANDED (2026-08-03; box stays OPEN — async emission is still
+  pending). `--actor-mode=threaded` is end to end — dialect anchor,
+  emitter runtime synthesis, the emitrust-actor-thread rewrite pass, and
+  the driver flag, in four suite-green commits. OP + TYPE DECISION: the
+  B-prime anchor landed as specced (`emitrust.actor_runtime @A mode =
+  <threaded|async>`; verifier: struct_def + non-empty impl resolve,
+  statics rejected, every method parameter NAMED — the message field
+  derives from emitrust.param_names, so an unnamed parameter is a
+  verifier error, mirrored as a pass veto — every param/result in the
+  struct-field validity set, exported as `isSendableActorType` so the
+  verifier and the pass veto can never disagree, no mut_ref of the
+  actor's struct outside its impl, one anchor per actor). The handle
+  stays `!emitrust.opaque<"<A>Handle">`: the classifier fix won over a
+  new `!emitrust.actor_handle` type because it is ~10 lines —
+  `methodCallMutatesReceiver` resolves opaque receivers through the
+  module's anchors BEFORE the closed STL name list, and both `let mut`
+  decision sites route through that one function — where a new type
+  would touch parse/print/emission/method_call verification, and it
+  keeps the spike's verified IR byte-identical. SYNTHESIS AS LANDED:
+  exactly synthesized-runtime.rs, with two deliberate deviations: the
+  per-actor runtime text renders at the ANCHOR's position (right after
+  the actor's impl), not end-of-file concatenation (a spike simulation
+  artifact), and `mod actor_rt` is an emitter-owned epilogue constant
+  appended once per module when any anchor exists (the
+  __emitrust_fmt_f64 posture with the anchor op as trigger, no verbatim
+  op); mode=async at emission errors "not yet emitted". THREADIFY PASS
+  (lib/Conversion/ActorThread; attr contract in ActorThread.h, {name,
+  mode} dicts, stripped after use): accessor synthesis in struct-field
+  order, get before set, scalar and scalar-array-element forms ONLY —
+  whole-aggregate driver snapshots and mixed subscript index types veto,
+  the safe direction; the driver rewrite is order-preserving at the
+  original access sites; and slice-4 post-construction member assigns
+  become set_ calls through that same accessor rewrite, landing AFTER
+  the spawn assign (uniform mechanism; semantically identical to
+  pre-spawn init because every call is synchronous — byte-diff green,
+  the one divergence from the spike paragraph's "BEFORE spawn"
+  wording). VETO UX as landed: lift-demoted actors (no struct_def /
+  impl / constructing driver local) skip SILENTLY — demote-from-lifting
+  already warned; lifted-but-ineligible actors stay lifted same-thread
+  with located `warning: actor plan: <actor> stays same-thread:
+  <reason>` for cross-client &mut (the E3 landmine rule), unsendable
+  signature (types, unnamed params, statics, externals), driver access
+  with no accessor form, and accessor-name collision. DRIVER: the
+  composition rules pinned by test/Driver/actor-mode-conflicts.c —
+  async = immediate "not yet emitted" error, threaded +
+  --actor-lift=false = immediate error, explicit non-default mode gates
+  on --emit=mlir/rust/crate, threaded + --link warns "threads nothing:
+  every actor is demoted (rule 5)", same-thread is byte-identical to
+  the default; `emitrust.actor_thread` is computed beside
+  attachActorLiftAttributes from the certified set BEFORE the lift pass
+  strips its contract, both passes in one PassManager. VALIDATION:
+  round-trip + 9 verifier negatives
+  (test/Dialect/EmitRust/actor-runtime{,-invalid}.mlir), emission
+  goldens incl. reply fields / spawn loop / wrappers / unit-reply arm /
+  epilogue-once / let-mut handle (test/Target/Rust/actor-runtime.mlir),
+  pass goldens threaded / mixed / all-five-vetoes
+  (test/Conversion/ActorThread/), and the EndToEnd twins:
+  actor-mode-threaded-globals.c (the spike's program byte-diff GREEN vs
+  the clang native; the landed plan also threads AccumulateActor — it
+  is eligible, and the global mode takes every eligible actor — where
+  the spike prototype hand-kept it same-thread for illustration),
+  actor-mode-threaded-panic.c (deterministic OOB inside an arm: exit
+  101 pinned, exactly ONE panicked line with the original
+  index-out-of-bounds provenance, stdout prefix flushed),
+  actor-mode-threaded-mixed.c (CounterActor threads while the
+  call-mediated cross client `observe` vetoes LeftActor AND RightActor,
+  both warnings pinned, byte-diff green). Zero drift: all 487
+  pre-existing tests byte-identical at the default; suite 497/497.
+  FOUND OFF-SLICE (recorded, not fixed here): an arm shape with a
+  pointer parameter walking a caller-local array plus a mutable file
+  global in its body (`void add_from(const int *src, int n) { total +=
+  src[i]; }`) fails with `'TOTAL' does not reference a valid
+  emitrust.global` on paths this slice never touches (identically under
+  --actor-lift=false) — the FR-30 owner promotion moves the function
+  into an owner impl whose SymbolTable hides module-level globals;
+  pre-existing, needs its own fix.
+
+FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
 are not. The paper's experiment harness discovered every `test/EndToEnd` case
