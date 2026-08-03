@@ -75,6 +75,7 @@
 #include "EmitRust/EmitRustDialect.h"
 #include "EmitRust/EmitRustOps.h"
 #include "EmitRust/Conversion/ActorLift.h"
+#include "EmitRust/Conversion/ActorThread.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/Conversion/LowerExternalRequirements.h"
@@ -377,6 +378,35 @@ static llvm::cl::opt<bool> actorLiftFlag(
         "today's form with a printed warning. Applies with --emit=mlir, "
         "--emit=rust and --emit=crate; the default is inert elsewhere"),
     llvm::cl::init(true));
+
+/// FR-62 slice 5b: the actor RUNTIME flavor, applied to every eligible
+/// lifted actor (per-actor selection is deferred; the anchor op carries
+/// mode per actor, so later per-actor plumbing is driver-only).
+enum class ActorModeRequest { SameThread, Threaded, Async };
+
+static llvm::cl::opt<ActorModeRequest> actorModeFlag(
+    "actor-mode",
+    llvm::cl::desc(
+        "FR-62 slice 5b: the runtime flavor of the lifted actors"),
+    llvm::cl::values(
+        clEnumValN(ActorModeRequest::SameThread, "same-thread",
+                   "the lift's default shape: actors are plain structs "
+                   "owned by c_main, calls are direct method calls"),
+        clEnumValN(ActorModeRequest::Threaded, "threaded",
+                   "each eligible actor's state moves to a spawned "
+                   "std::thread behind an mpsc mailbox; every call is a "
+                   "message with a per-call typed reply channel, so "
+                   "effect order equals program order. Requires the "
+                   "actor lift (ownership lift is a MANDATORY "
+                   "precondition: a threaded actor must own its state). "
+                   "Thread-ineligible actors stay lifted same-thread "
+                   "with a warning; lift-demoted actors keep today's "
+                   "form silently"),
+        clEnumValN(ActorModeRequest::Async, "async",
+                   "the tokio task flavor (E4); not yet emitted -- "
+                   "requesting it is an error until the async slice "
+                   "lands")),
+    llvm::cl::init(ActorModeRequest::SameThread));
 
 static llvm::cl::opt<std::string> ratchetBaselinePath(
     "ratchet-baseline",
@@ -1810,6 +1840,36 @@ int main(int argc, char **argv) {
                     "--emit=rust or --emit=crate\n";
     return 1;
   }
+  // FR-62 slice 5b: the actor-mode composition rules (the SLICE-5b SPIKE
+  // paragraph, verbatim contract). async is defined in the attribute space
+  // but not yet emitted -- requesting it fails loudly, never silently
+  // emits the threaded flavor. threaded REQUIRES the lift (E3's mandatory
+  // precondition: the negative control proved a non-owned cluster on a
+  // thread is a silent miscompile, the worst failure direction). Under
+  // --link every actor is rule-5 demoted, so threaded mode warns that it
+  // threads nothing rather than pretending otherwise.
+  if (actorModeFlag == ActorModeRequest::Async) {
+    llvm::errs() << "error: --actor-mode=async is not yet emitted (the "
+                    "async crate flavor is a recorded later slice)\n";
+    return 1;
+  }
+  if (actorModeFlag == ActorModeRequest::Threaded && !actorLiftFlag) {
+    llvm::errs() << "error: --actor-mode=threaded requires the actor lift "
+                    "(remove --actor-lift=false): ownership lift is a "
+                    "mandatory precondition of threaded mode\n";
+    return 1;
+  }
+  if (actorModeFlag.getNumOccurrences() > 0 &&
+      actorModeFlag != ActorModeRequest::SameThread &&
+      emitKind != EmitKind::MLIR && emitKind != EmitKind::Rust &&
+      emitKind != EmitKind::Crate) {
+    llvm::errs() << "error: --actor-mode is only valid with --emit=mlir, "
+                    "--emit=rust or --emit=crate\n";
+    return 1;
+  }
+  if (actorModeFlag == ActorModeRequest::Threaded && linkFlag)
+    llvm::errs() << "warning: --actor-mode=threaded under --link threads "
+                    "nothing: every actor is demoted (rule 5)\n";
   // FR-60: both artifact queries read the shard ledgers off the link line.
   if (emitKind == EmitKind::RejectionReport && !linkFlag) {
     llvm::errs() << "error: --emit=rejection-report requires --link\n";
@@ -2121,10 +2181,47 @@ int main(int argc, char **argv) {
                                demotion.remarkLine, demotion.remarkColumn))
               << demotion.remarkText;
       }
+      // FR-62 slice 5b: under --actor-mode=threaded every certified actor
+      // is selected for the emitrust-actor-thread pass (per-actor
+      // selection is deferred; the anchor op already carries mode per
+      // actor, so later plumbing is driver-only). The list is computed
+      // HERE, beside the lift attachment, because the lift pass strips
+      // its own attributes: the actor names are read from the attribute
+      // contract before the pipeline consumes it. Actors the lift pass
+      // itself demotes (its IR-level safety-net veto) leave no struct_def
+      // behind, and the thread pass skips those SILENTLY -- demoted
+      // actors were never lifted, so they keep today's form; thread-
+      // INELIGIBLE lifted actors get the pass's located stays-same-thread
+      // warning instead.
+      bool threadActors =
+          actorModeFlag == ActorModeRequest::Threaded &&
+          attachment.attachedAny;
+      if (threadActors) {
+        llvm::SmallVector<mlir::Attribute> selected;
+        if (auto actorsAttr = (*module)->getAttrOfType<mlir::ArrayAttr>(
+                mlir::emitrust::kActorLiftActorsAttrName))
+          for (mlir::Attribute entry : actorsAttr)
+            if (auto dict = llvm::dyn_cast<mlir::DictionaryAttr>(entry))
+              if (auto name = dict.getAs<mlir::StringAttr>("name"))
+                selected.push_back(mlir::DictionaryAttr::get(
+                    &context,
+                    {mlir::NamedAttribute(
+                         mlir::StringAttr::get(&context, "name"), name),
+                     mlir::NamedAttribute(
+                         mlir::StringAttr::get(&context, "mode"),
+                         mlir::StringAttr::get(&context, "threaded"))}));
+        if (selected.empty())
+          threadActors = false;
+        else
+          (*module)->setAttr(mlir::emitrust::kActorThreadAttrName,
+                             mlir::ArrayAttr::get(&context, selected));
+      }
       if (attachment.attachedAny) {
         mlir::PassManager pm(&context,
                              mlir::ModuleOp::getOperationName());
         pm.addPass(mlir::emitrust::createEmitRustActorLift());
+        if (threadActors)
+          pm.addPass(mlir::emitrust::createEmitRustActorThread());
         if (mlir::failed(pm.run(*module)))
           return 1;
       }
