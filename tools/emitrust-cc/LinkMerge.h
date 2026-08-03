@@ -193,12 +193,19 @@ bool isFactStarvedDiagnostic(llvm::StringRef diagnostic);
 llvm::SmallVector<std::string>
 factStarvedObjectNames(llvm::StringRef symbol, llvm::StringRef diagnostic);
 
-/// True when the FR-57d item-graph text `graphText` records a DEFINED
-/// global named `symbol` (a `node <symbol> kind=global def=1` line): the
-/// signal that a shard can supply the missing shape even when its MODULE
-/// does not carry the item (a defining TU with no local use of the cursor
-/// never materializes it — measured, see design.md FR-58).
-bool itemGraphDefinesGlobal(llvm::StringRef graphText, llvm::StringRef symbol);
+/// The symbols of every DEFINED global the FR-57d item-graph text records
+/// (the `node <symbol> kind=global def=1` lines): the signal that a shard
+/// can supply a missing shape even when its MODULE does not carry the item
+/// (a defining TU with no local use of the cursor never materializes it —
+/// measured, see design.md FR-58). Returned as StringRefs INTO
+/// `graphText`, which must outlive them.
+///
+/// One call per shard feeds the driver's symbol -> defining-shards index;
+/// the per-starved-name probe is then a hash lookup instead of a text scan
+/// of every shard's whole graph — the 10^3-TU measurement that motivated
+/// the indexed form is in design.md FR-58.
+llvm::SmallVector<llvm::StringRef>
+itemGraphGlobalDefs(llvm::StringRef graphText);
 
 /// One signature-starved external declaration: shard `declShard` carries a
 /// body-less `emitrust.extern_decl` FUNCTION whose type disagrees with the

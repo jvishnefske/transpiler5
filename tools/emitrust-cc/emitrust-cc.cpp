@@ -809,6 +809,17 @@ static void reimportFactStarvedGroups(
     return x;
   };
 
+  // Indexed definer discovery (measured at 10^3 shards, design.md FR-58):
+  // one pass over every shard's graph text builds the emitted-symbol ->
+  // defining-shards map, so each starved name is a hash lookup instead of
+  // a text scan of every shard's whole graph.
+  llvm::StringMap<llvm::SmallVector<unsigned, 1>> globalDefiners;
+  for (unsigned j = 0; j < count; ++j)
+    if (std::optional<llvm::StringRef> graph =
+            mlir::emitrust::getShardItemGraph(*shards[j].module))
+      for (llvm::StringRef symbol : emitrustcc::itemGraphGlobalDefs(*graph))
+        globalDefiners[symbol].push_back(j);
+
   bool anyGroup = false;
   for (unsigned i = 0; i < count; ++i) {
     for (const mlir::emitrust::RejectedItem &item :
@@ -817,16 +828,14 @@ static void reimportFactStarvedGroups(
         continue;
       for (const std::string &name :
            emitrustcc::factStarvedObjectNames(item.symbol, item.diagnostic)) {
-        std::string emitted = mlir::emitrust::globalRustName(name);
-        for (unsigned j = 0; j < count; ++j) {
+        auto it = globalDefiners.find(mlir::emitrust::globalRustName(name));
+        if (it == globalDefiners.end())
+          continue;
+        for (unsigned j : it->second) {
           if (j == i)
             continue;
-          std::optional<llvm::StringRef> graph =
-              mlir::emitrust::getShardItemGraph(*shards[j].module);
-          if (graph && emitrustcc::itemGraphDefinesGlobal(*graph, emitted)) {
-            parent[findRoot(i)] = findRoot(j);
-            anyGroup = true;
-          }
+          parent[findRoot(i)] = findRoot(j);
+          anyGroup = true;
         }
       }
     }

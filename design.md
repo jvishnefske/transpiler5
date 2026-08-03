@@ -1925,7 +1925,7 @@ of references or inheritance, so it precedes both.
   spot: `!emitrust.array` of enum printed but did not re-parse
   (`ArrayType::isValidElementType` omitted EnumType;
   test/Dialect/EmitRust/types.mlir now pins the round-trip).
-- [ ] FR-58 Link-step whole-program aggregation. "Linking" extracts every
+- [x] FR-58 Link-step whole-program aggregation. "Linking" extracts every
   `.emitrust` payload from the link line's objects and archives, MERGES the
   item-graph shards (order-independent, deterministic), runs the FR-41
   3-color admission GLOBALLY, and materializes Rust for admitted items FROM
@@ -2076,8 +2076,29 @@ of references or inheritance, so it precedes both.
   definer FOLLOWS its user on the link line degrades with a warning
   instead of reaching byte-identity — same outcome family as the joint
   oracle's own failure on that order.
-  Still open for the checkbox: indexed collision scans at 10^3+ TUs, and
-  FR-59 workspace partitioning (its own FR).
+  LANDED (FR-58 indexed scans at 10^3+ TUs, measured). Synthetic 1001-TU
+  project (shared-header struct/enum dedup'd in every shard, colliding
+  per-TU file-statics, a 1000-deep cross-TU call chain, one extern
+  global): `--link --emit=rust` merges and emits in 0.195s wall — the
+  slice-1 merge core was ALREADY hash-indexed (definitions, obligations,
+  and header dedup are StringMap/StringSet lookups; the signature-
+  starvation scan is StringMap too), confirmed by inspection and by this
+  measurement, so the FR's "collision scans and impl lookups become
+  indexed" was largely paid down at birth. The one measurable LINEAR scan
+  was the selective re-import's definer discovery — per starved name, a
+  substring scan of EVERY shard's whole item-graph text. Starved-at-scale
+  probe (1001 shards, ~41k graph nodes, 500 fact-starved shards x 2 names
+  each): total link user time BEFORE 0.79s at 500 shards -> 1.88s at 1000
+  (the scan component superlinear, ~2.4x for 2x input, and unbounded
+  toward 10^4); AFTER indexing (one pass per graph builds an
+  emitted-symbol -> defining-shards StringMap, `itemGraphGlobalDefs`
+  replacing the per-name text probe) 0.39s -> 0.94s — linear in input
+  size, discovery no longer measurable. Outputs are BYTE-IDENTICAL before
+  vs after at both scales and on every existing link test (the full-suite
+  byte-identity pins are the correctness oracle); no timing lit test is
+  added, timings being environment-bound — the numbers live here.
+  Still open for the checkbox: FR-59 workspace partitioning only (its own
+  FR).
   SPIKE 3 (GO -- the merge algorithm is now fully experiment-specified): on
   a shared-header project where BOTH shards carry identical
   `struct_def @Point` / `enum_def @Mode`, the mechanical merge extended

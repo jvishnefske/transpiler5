@@ -463,14 +463,18 @@ emitrustcc::findSignatureStarvedDecls(llvm::ArrayRef<ModuleOp> shards) {
   return starved;
 }
 
-bool emitrustcc::itemGraphDefinesGlobal(llvm::StringRef graphText,
-                                        llvm::StringRef symbol) {
+llvm::SmallVector<llvm::StringRef>
+emitrustcc::itemGraphGlobalDefs(llvm::StringRef graphText) {
   // One graph line per item, `node <symbol> kind=global def=1 ...`; every
   // field is a whole space-separated token (the format's stated grep
-  // contract), so a prefix match on the three leading tokens is exact.
-  std::string needle = ("node " + symbol + " kind=global def=1 ").str();
-  for (llvm::StringRef line : llvm::split(graphText, '\n'))
-    if (line.starts_with(needle))
-      return true;
-  return false;
+  // contract), so token-wise splitting is exact.
+  llvm::SmallVector<llvm::StringRef> symbols;
+  for (llvm::StringRef line : llvm::split(graphText, '\n')) {
+    if (!line.consume_front("node "))
+      continue;
+    auto [symbol, rest] = line.split(' ');
+    if (rest.starts_with("kind=global def=1 "))
+      symbols.push_back(symbol);
+  }
+  return symbols;
 }
