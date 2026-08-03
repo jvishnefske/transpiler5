@@ -154,11 +154,51 @@ findShardPayload(const llvm::MemoryBuffer &buffer, std::string &errorMessage);
 /// non-dedupable definitions of one symbol. The result verifies before it
 /// is returned.
 ///
+/// `ordinalMaps`, when nonempty, gives each shard its per-TU tag ordinal
+/// assignment: shard i's internal `tu<k>_`/`TU<k>_` tags rename to global
+/// ordinal `ordinalMaps[i][k]`. This is what lets a link-time RE-IMPORTED
+/// GROUP — one module produced by a joint `importCProject` over several
+/// link-line positions, whose internal tags are group-relative `tu0_`,
+/// `tu1_`, ... — stand in for its member shards while its statics still
+/// land on the ordinals the whole-project joint import would have used
+/// (the merge's byte-identity oracle). Each map must be strictly
+/// increasing (global ordinals are link-line positions, so a TU's ordinal
+/// is at least its group-internal index; the rename exploits this for
+/// collision freedom). Empty — the default — assigns shard i the single
+/// ordinal i, the historical solo-shard behavior.
+///
 /// \param shards the parsed shard modules, in link-line order; consumed.
+/// \param ordinalMaps per-shard tag ordinal assignments, parallel to
+///        `shards`, or empty for the positional default.
 /// \returns the merged, verified module, or failure after a located
 ///          diagnostic.
 mlir::FailureOr<mlir::OwningOpRef<mlir::ModuleOp>>
-mergeLinkShards(llvm::MutableArrayRef<mlir::OwningOpRef<mlir::ModuleOp>> shards);
+mergeLinkShards(llvm::MutableArrayRef<mlir::OwningOpRef<mlir::ModuleOp>> shards,
+                llvm::ArrayRef<llvm::SmallVector<unsigned>> ordinalMaps = {});
+
+/// FR-58 selective re-import, the detection half: true when `diagnostic`
+/// is one of the MEASURED fact-starvation wordings — a rejection a solo
+/// import produces precisely because a whole-program fact (the defining
+/// TU's shape for an extern pointer global) was out of reach, and which a
+/// joint re-import of the right TU group can therefore recover. Intrinsic
+/// rejections (volatile, variadics, ...) never match: re-importing those
+/// costs a parse and recovers nothing.
+bool isFactStarvedDiagnostic(llvm::StringRef diagnostic);
+
+/// The C-spelled object names a fact-starved rejection references: the
+/// rejected symbol itself for a dropped pointer-global declaration, and
+/// the single-quoted variable name inside the "no known target object"
+/// wording for a stubbed accessor. Empty when `diagnostic` is not a
+/// fact-starvation wording.
+llvm::SmallVector<std::string>
+factStarvedObjectNames(llvm::StringRef symbol, llvm::StringRef diagnostic);
+
+/// True when the FR-57d item-graph text `graphText` records a DEFINED
+/// global named `symbol` (a `node <symbol> kind=global def=1` line): the
+/// signal that a shard can supply the missing shape even when its MODULE
+/// does not carry the item (a defining TU with no local use of the cursor
+/// never materializes it — measured, see design.md FR-58).
+bool itemGraphDefinesGlobal(llvm::StringRef graphText, llvm::StringRef symbol);
 
 } // namespace emitrustcc
 

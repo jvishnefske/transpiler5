@@ -19,6 +19,11 @@
 // The link surfaces the library shard's ledger entry, shard-attributed:
 // RUN: emitrust-cc --link %t.main.o %t.lib.o --emit=rust -o %t.rs 2>%t.err
 // RUN: FileCheck %s --check-prefix=SURFACE < %t.err
+//
+// A rejection that is NOT fact-starved (volatile is intrinsic, no
+// whole-program fact can fix it) must NOT trigger the FR-58 link-time
+// re-import: re-parsing the TU would cost time and recover nothing.
+// RUN: not grep "link-time re-import" %t.err
 // SURFACE: shard '{{.*}}.lib.o': recovered 1 rejected top-level item:
 // SURFACE: stubbed 'lib_rejected'
 // SURFACE-SAME: unsupported: volatile-qualified type

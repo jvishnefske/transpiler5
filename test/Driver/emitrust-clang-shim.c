@@ -52,6 +52,13 @@
 // META-SAME: stubbed = true
 // META-SAME: symbol = "shim_rejected"
 //
+// FR-58: the artifact records its own source facts (absolute input path +
+// import args), which is what lets the link step selectively RE-IMPORT a
+// fact-starved group without any build-system cooperation.
+// META-SAME: emitrust.source =
+// META-SAME: "-DANSWER=42"
+// META-SAME: path = "{{.*}}emitrust-clang-shim.c"
+//
 // FR-57d: the metadata-bearing bytecode round-trips BYTE-IDENTICALLY
 // through a reload (emit -> reload -> emit is a fixed point).
 // RUN: emitrust-opt %t.o.emitrust.mlirbc --emit-bytecode -o %t.rt1.mlirbc
