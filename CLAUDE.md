@@ -34,6 +34,14 @@
 ## Build
 
 - `nix develop -c ninja -C build` (tools land in `build/bin/`).
+- Meson (parallel build system; CMake stays canonical for CI):
+  `nix develop -c meson setup build-meson`, then
+  `nix develop -c meson compile -C build-meson` (tools land in
+  `build-meson/tools/`) and `nix develop -c meson test -C build-meson`
+  runs the same lit suite as check-emitrust. Links the monolithic
+  libMLIR/libclang-cpp dylibs instead of static archives; the PDLL
+  showcase option is CMake-only. New tools/sources must be added to BOTH
+  the CMakeLists.txt and the meson.build files.
 - Adding a tool dir: `tools/<name>/CMakeLists.txt` + one line in
   `tools/CMakeLists.txt`, then `nix develop -c cmake build` to reconfigure.
 - New lit-visible tools go in `test/lit.cfg.py` tools list AND
