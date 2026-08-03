@@ -16,7 +16,17 @@
 // RUN: env EMITRUST_REAL_CC=clang emitrust-clang -c %S/Inputs/link-report/vol.c -o %t.vol.o
 // RUN: env EMITRUST_REAL_CC=clang emitrust-clang -c %s -o %t.main.o
 //
-// RUN: emitrust-cc --link %t.mem.o %t.vol.o %t.main.o --emit=rejection-report -o - | FileCheck %s
+// An object the shim never saw (plain clang, no artifact, no sidecar) is
+// SKIPPED with a warning rather than failing the query: at kernel scale
+// an import-failed TU has no artifact at all, and the report must still
+// aggregate the rest. The merge path keeps its hard error — only the
+// artifact QUERIES tolerate absence.
+// RUN: clang -c %s -o %t.bare.o
+// RUN: rm -f %t.bare.o.emitrust.mlirbc
+//
+// RUN: emitrust-cc --link %t.mem.o %t.vol.o %t.bare.o %t.main.o --emit=rejection-report -o - 2>%t.warn | FileCheck %s
+// RUN: FileCheck %s --check-prefix=SKIP < %t.warn
+// SKIP: warning: '{{.*}}.bare.o' carries no .emitrust payload; skipped
 //
 // `other` leads (2 items across 2 TUs); the singletons follow in tag
 // order; the clean TU contributes nothing.
