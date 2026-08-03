@@ -49,6 +49,6 @@ int main(void) {
   return 0;
 }
 
-// WARN: warning: unsupported: pointer-to-pointer parameter escapes the string-cursor shape (recovered: item dropped)
+// WARN: warning: unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape (recovered: item dropped)
 // WARN: recovered 1 rejected top-level item:
-// WARN: dropped 'fill' [ptr-to-ptr]
+// WARN: dropped 'fill' [ptr-to-ptr-shape-escape]

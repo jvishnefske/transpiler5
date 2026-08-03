@@ -80,6 +80,14 @@ struct BlockerSubstring {
 };
 constexpr BlockerSubstring kBlockerSubstrings[] = {
     {llvm::StringLiteral("use of main's argv"), llvm::StringLiteral("argv")},
+    // C99-43 slice 1: the cursor-parameter rejections split out of the
+    // generic ptr-to-ptr bucket, listed ABOVE it so first-match-wins
+    // routes them (every wording also contains "pointer-to-pointer" or
+    // "cursor parameter").
+    {llvm::StringLiteral("escapes the cursor-parameter shape"),
+     llvm::StringLiteral("ptr-to-ptr-shape-escape")},
+    {llvm::StringLiteral("write through a cursor parameter"),
+     llvm::StringLiteral("ptr-to-ptr-shape-escape")},
     {llvm::StringLiteral("pointer-to-pointer"),
      llvm::StringLiteral("ptr-to-ptr")},
     {llvm::StringLiteral("returned pointer value"),

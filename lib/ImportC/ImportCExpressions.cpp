@@ -2744,7 +2744,7 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
               : nullptr;
       if (!pointer || !pointerLocals.contains(pointer))
         return emitError(loc)
-               << "unsupported: a string-cursor argument must be the "
+               << "unsupported: a cursor argument must be the "
                   "address of a decomposed pointer local";
       cursorArgs.push_back({index, pointer});
       continue;
@@ -2779,8 +2779,8 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
     if (!info.cursorCell || info.nonNullCell || info.baseIndexCell ||
         info.member)
       return emitError(loc)
-             << "unsupported: a string-cursor argument must walk a single "
-                "byte region";
+             << "unsupported: a cursor argument must walk a single "
+                "whole region";
     Value basePlace = info.literalBacking;
     if (!basePlace) {
       auto it = symbols.find(info.base);
@@ -2801,10 +2801,16 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
                    lvalueType.getValueType()))
         elementType = sliceType.getElementType();
     }
-    if (elementType != builder.getIntegerType(8))
-      return emitError(loc) << "unsupported: a string-cursor argument must "
-                               "walk a byte region";
+    // The region's element type must be the callee's declared element
+    // (i8 for the historical char** byte cursor; the literal-backing
+    // path stays byte-only by construction — a literal region is i8).
     unsigned slotIndex = slots[cursorArg.index];
+    auto calleeSlice = llvm::cast<emitrust::SliceType>(
+        llvm::cast<emitrust::RefType>(targetType.getInput(slotIndex))
+            .getPointee());
+    if (elementType != calleeSlice.getElementType())
+      return emitError(loc) << "unsupported: a cursor argument must walk "
+                               "a region of the parameter's element type";
     // Shared whole-region slice: the callee only reads bytes; the cursor
     // travels separately, so the slice starts at element zero and both
     // sides speak absolute positions.

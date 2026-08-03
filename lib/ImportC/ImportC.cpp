@@ -3383,6 +3383,14 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       const clang::VarDecl *var = asVarRef(unary->getSubExpr());
       if (!var)
         var = asGlobalDataPointerRef(unary->getSubExpr());
+      // `(*s)++` on a planned cursor parameter (C99-43 slice 1) advances
+      // the parameter's cursor cell exactly like `*s = *s + 1`: the
+      // parameter's own pointer-local binding carries the cell.
+      if (!var)
+        if (const clang::ParmVarDecl *cursorParam =
+                asPointerPointerParamDeref(unary->getSubExpr());
+            cursorParam && cursorParams.contains(cursorParam))
+          var = cursorParam;
       auto it = var ? pointerLocals.find(var) : pointerLocals.end();
       if (it == pointerLocals.end()) {
         // `g++` on a pointer-typed global walks its stored i64 cursor

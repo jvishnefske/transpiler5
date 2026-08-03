@@ -338,14 +338,17 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
           inputTypes.push_back(refined);
           continue;
         }
-      // A planned string-cursor parameter (CTS 00204) lowers to TWO
-      // inputs: a shared byte-slice over the region and an in-out i64
-      // cursor. The advancement `*s = p` becomes a cursor write the
-      // caller observes through the reference. Mutually exclusive with
-      // the inferred-fn-ptr class above (different parameter types).
+      // A planned cursor parameter (CTS 00204, element-generalized by
+      // C99-43 slice 1) lowers to TWO inputs: a shared element slice
+      // over the region and an in-out i64 cursor. The advancement
+      // `*s = p` becomes a cursor write the caller observes through the
+      // reference. Mutually exclusive with the inferred-fn-ptr class
+      // above (different parameter types).
       if (cursorParams.contains(param)) {
-        inputTypes.push_back(emitrust::RefType::get(
-            emitrust::SliceType::get(builder.getIntegerType(8))));
+        FailureOr<Type> sliceType = mapCursorParamSliceType(param);
+        if (failed(sliceType))
+          return failure();
+        inputTypes.push_back(emitrust::RefType::get(*sliceType));
         inputTypes.push_back(
             emitrust::MutRefType::get(builder.getIntegerType(64)));
         continue;
@@ -836,13 +839,32 @@ LogicalResult CImporter::bindOrdinaryParam(const clang::ParmVarDecl *param,
   return success();
 }
 
+FailureOr<Type> CImporter::mapCursorParamSliceType(
+    const clang::ParmVarDecl *param) {
+  // The element run a `T **` cursor parameter walks is a run of T; the
+  // element maps exactly like any other value position (char keeps the
+  // historical i8 byte slice), and an element the slice type cannot
+  // view keeps a located rejection at the signature.
+  Location loc = translateLoc(param->getLocation());
+  FailureOr<Type> element =
+      mapType(pointerPointerElementType(param->getType()), loc);
+  if (failed(element))
+    return failure();
+  if (!emitrust::SliceType::isValidElementType(*element))
+    return emitError(loc)
+           << "unsupported: cursor parameter element type " << *element;
+  return Type(emitrust::SliceType::get(*element));
+}
+
 LogicalResult CImporter::bindCursorParam(const clang::ParmVarDecl *param,
                                          Value baseArg, Value cursorArg,
                                          Location paramLoc) {
-  // The shared byte-slice argument derefs once into the region base
+  // The shared element-slice argument derefs once into the region base
   // place, exactly like a slice parameter's; reads render
   // `(*base)[i as usize]` and never hold a borrow across statements.
-  auto sliceType = emitrust::SliceType::get(builder.getIntegerType(8));
+  // The element type rides in on the signature the caller built.
+  auto sliceType = llvm::cast<emitrust::SliceType>(
+      llvm::cast<emitrust::RefType>(baseArg.getType()).getPointee());
   Value basePlace =
       builder
           .create<emitrust::DerefOp>(
@@ -894,8 +916,10 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   SmallVector<Type> inputTypes;
   for (auto [index, param] : llvm::enumerate(func->parameters())) {
     if (cursorParams.contains(param)) {
-      inputTypes.push_back(emitrust::RefType::get(
-          emitrust::SliceType::get(builder.getIntegerType(8))));
+      FailureOr<Type> sliceType = mapCursorParamSliceType(param);
+      if (failed(sliceType))
+        return failure();
+      inputTypes.push_back(emitrust::RefType::get(*sliceType));
       inputTypes.push_back(
           emitrust::MutRefType::get(builder.getIntegerType(64)));
       continue;

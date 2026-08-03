@@ -8,8 +8,10 @@
 // pointer-to-array, which has no slice shape (two caller matrices keep
 // the class multi-base, so the Phase-4 owner promotion cannot absorb it
 // and the Phase-1b slice path is what runs), and an array-of-pointers
-// parameter decays to a pointer-to-pointer, which has no decomposed
-// representation (CTS-P5 keeps the general rejection).
+// parameter decays to a pointer-to-pointer, which since C99-43 slice 1
+// enters cursor-parameter planning and rejects at the subscripted USE:
+// `a[i]` walks the pointer table itself, outside the bounded shape whose
+// only uses are `*a` reads and `*a = <expr>` advancement.
 
 //--- multidim.c
 // MULTIDIM: multidim.c:2:16: error: unsupported: slice parameter element type '!emitrust.array<4xi32>'
@@ -24,7 +26,7 @@ int drive(void) {
 }
 
 //--- ptr-array.c
-// PTRARRAY: ptr-array.c:2:17: error: unsupported: pointer-to-pointer parameter
+// PTRARRAY: ptr-array.c:3:11: error: unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape
 int deref0(int *a[]) {
   return *a[0];
 }
