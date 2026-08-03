@@ -1628,6 +1628,35 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
         recordArithmetic(pointer, addrOf->getOperatorLoc());
       }
     }
+    // A `&e` argument feeding a Shape-P paired out-cursor parameter
+    // (C99-43 slice 1b) is likewise consumed, and `e` JOINS the paired
+    // co-argument expression's region: the callee hands back a cursor
+    // into the region the co-argument roots, exactly as `e = <co-arg>`
+    // followed by arithmetic would. This join is what lets a
+    // possibly-uninitialized `e` classify (and `e - base` emit) after
+    // the call.
+    if (callee && pairedArgQuery) {
+      for (unsigned index = 0, count = call->getNumArgs(); index < count;
+           ++index) {
+        int coIndex = pairedArgQuery(callee, index);
+        if (coIndex < 0 ||
+            static_cast<unsigned>(coIndex) >= call->getNumArgs())
+          continue;
+        const clang::Expr *argument = stripTrivia(call->getArg(index));
+        while (const auto *cast =
+                   llvm::dyn_cast<clang::ImplicitCastExpr>(argument))
+          argument = stripTrivia(cast->getSubExpr());
+        const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(argument);
+        if (!addrOf || addrOf->getOpcode() != clang::UO_AddrOf)
+          continue;
+        const clang::VarDecl *pointer = asLocalVarRef(addrOf->getSubExpr());
+        if (!pointer || !tracks(pointer))
+          continue;
+        consumedAddrOf.insert(addrOf);
+        recordPointerWrite(pointer, call->getArg(coIndex));
+        recordArithmetic(pointer, addrOf->getOperatorLoc());
+      }
+    }
   }
   // Pointer call arguments no longer invalidate the region (Phase 1b):
   // `emitCall` reborrows the region base per target-parameter kind

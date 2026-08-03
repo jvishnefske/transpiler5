@@ -2014,13 +2014,16 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
           methodPlans.lookup(callee->getCanonicalDecl()))
     return emitMethodCallSite(call, target, ownerBase, loc);
 
-  // A callee with planned string-cursor parameters (CTS 00204) expands
-  // each `&p` cursor argument into (shared region slice, in-out cursor)
-  // and stores the advanced cursor back after the call.
+  // A callee with planned cursor parameters (CTS 00204 / C99-43
+  // slice 1) expands each `&p` Shape-S argument into (shared region
+  // slice, in-out cursor) and each `&e` Shape-P argument into a staged
+  // out-cursor temp, storing the advanced/written cursor back after the
+  // call.
   if (const clang::FunctionDecl *definition = callee->getDefinition();
       definition && llvm::any_of(definition->parameters(),
                                  [&](const clang::ParmVarDecl *param) {
-                                   return cursorParams.contains(param);
+                                   return cursorParams.contains(param) ||
+                                          pairedCursorParams.contains(param);
                                  }))
     return emitCursorParamCall(call, target, loc);
 
@@ -2724,15 +2727,20 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
     const clang::Expr *expr;
   };
   SmallVector<PendingCursor, 2> cursorArgs;
+  SmallVector<PendingCursor, 2> pairedArgs;
   SmallVector<PendingBorrow, 4> borrows;
   // Value arguments materialize first (C leaves evaluation order
   // unspecified); every borrow-producing argument follows, immediately
   // ahead of the call.
   for (unsigned index = 0; index < numParams; ++index) {
     const clang::Expr *argument = call->getArg(index);
-    if (cursorParams.contains(definition->getParamDecl(index))) {
+    bool isCursorSlot = cursorParams.contains(definition->getParamDecl(index));
+    bool isPairedSlot =
+        pairedCursorParams.contains(definition->getParamDecl(index));
+    if (isCursorSlot || isPairedSlot) {
       // The argument must be `&p` over a decomposed pointer local — the
-      // caller-side string cursor whose advancement the callee writes.
+      // caller-side cursor the callee's advancement (Shape S) or unique
+      // out-write (Shape P) lands in.
       const clang::Expr *stripped = stripTrivia(argument);
       while (const auto *cast =
                  llvm::dyn_cast<clang::ImplicitCastExpr>(stripped))
@@ -2746,7 +2754,7 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
         return emitError(loc)
                << "unsupported: a cursor argument must be the "
                   "address of a decomposed pointer local";
-      cursorArgs.push_back({index, pointer});
+      (isCursorSlot ? cursorArgs : pairedArgs).push_back({index, pointer});
       continue;
     }
     Type input = targetType.getInput(slots[index]);
@@ -2759,6 +2767,7 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
       return failure();
     arguments[slots[index]] = *value;
   }
+  SmallVector<const clang::VarDecl *, 4> borrowRoots(numParams, nullptr);
   for (const PendingBorrow &borrow : borrows) {
     const clang::VarDecl *root = nullptr;
     FailureOr<Value> reference = emitBorrowArgument(
@@ -2766,6 +2775,7 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
     if (failed(reference))
       return failure();
     arguments[slots[borrow.index]] = *reference;
+    borrowRoots[borrow.index] = root;
   }
   struct StagedCursor {
     Value tmpPlace;
@@ -2833,6 +2843,90 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
             .getResult();
     stagedCursors.push_back({tmpPlace, info.cursorCell});
   }
+  // Shape-P paired out-cursor arguments (C99-43 slice 1b): pass the
+  // address of a staged i64 temp the callee overwrites (initialized to 0
+  // only for definite assignment — the admitted write is unconditional),
+  // then store co-argument-cursor-at-call + temp into `e`'s cursor cell.
+  // The addition is the reslice coordinate correction: ordinary slice
+  // arguments RESLICE at the caller's cursor (see emitBorrowArgument's
+  // pointer-local path), so the callee's coordinate 0 is the
+  // co-argument's cursor, not the region start.
+  struct StagedPaired {
+    Value tmpPlace;
+    Value cell;
+    Value coCursor; // Null for a whole-array decay co-argument (zero).
+  };
+  SmallVector<StagedPaired, 2> stagedPaired;
+  for (const PendingCursor &pairedArg : pairedArgs) {
+    const clang::ParmVarDecl *coParam =
+        pairedCursorParams.lookup(definition->getParamDecl(pairedArg.index));
+    unsigned coIndex = numParams;
+    for (unsigned candidate = 0; candidate < numParams; ++candidate)
+      if (definition->getParamDecl(candidate) == coParam) {
+        coIndex = candidate;
+        break;
+      }
+    if (coIndex == numParams || coIndex >= call->getNumArgs())
+      return emitError(loc) // Defensive; planning mapped a real sibling.
+             << "unsupported: call argument count mismatch";
+    // The co-slot must be a slice reference — the coordinate system the
+    // writeback below is relative to.
+    Type coInput = targetType.getInput(slots[coIndex]);
+    Type coPointee;
+    if (auto ref = llvm::dyn_cast<emitrust::RefType>(coInput))
+      coPointee = ref.getPointee();
+    else if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(coInput))
+      coPointee = mutRef.getPointee();
+    if (!coPointee || !llvm::isa<emitrust::SliceType>(coPointee))
+      return emitError(loc)
+             << "unsupported: a paired cursor argument must walk the "
+                "co-argument's region";
+    // Resolve the co-argument's root object and its cursor at the call:
+    // a direct whole-array decay is coordinate zero; a decomposed
+    // single-base non-null pointer local contributes its current cursor.
+    const clang::Expr *coArg = stripTrivia(call->getArg(coIndex));
+    while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(coArg))
+      coArg = stripTrivia(cast->getSubExpr());
+    const clang::VarDecl *coRoot = nullptr;
+    Value coCursor;
+    if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(coArg))
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl())) {
+        if (var->getType().getCanonicalType()->isArrayType()) {
+          coRoot = var;
+        } else if (auto coIt = pointerLocals.find(var);
+                   coIt != pointerLocals.end()) {
+          const PointerLocalInfo &coInfo = coIt->second;
+          if (coInfo.cursorCell && !coInfo.nonNullCell &&
+              !coInfo.baseIndexCell && !coInfo.member &&
+              !coInfo.literalBacking) {
+            coRoot = coInfo.base;
+            coCursor = loadPlace(loc, coInfo.cursorCell);
+          }
+        }
+      }
+    // `e` must walk that same single region (the writeback stores an
+    // absolute cursor over the SHARED base); `emitBorrowArgument`'s own
+    // root for the co-slot must agree.
+    const PointerLocalInfo &info =
+        pointerLocals.find(pairedArg.pointer)->second;
+    if (!coRoot || !info.cursorCell || info.nonNullCell ||
+        info.baseIndexCell || info.member || info.literalBacking ||
+        info.base != coRoot ||
+        (borrowRoots[coIndex] && borrowRoots[coIndex] != coRoot))
+      return emitError(loc)
+             << "unsupported: a paired cursor argument must walk the "
+                "co-argument's region";
+    unsigned slotIndex = slots[pairedArg.index];
+    Value tmpPlace = createVariablePlace(loc, i64Type);
+    Value zero = createIntConstant(loc, i64Type, 0);
+    builder.create<emitrust::AssignOp>(loc, tmpPlace, zero);
+    arguments[slotIndex] =
+        builder
+            .create<emitrust::AddrOfOp>(loc, targetType.getInput(slotIndex),
+                                        tmpPlace, /*is_mut=*/true)
+            .getResult();
+    stagedPaired.push_back({tmpPlace, info.cursorCell, coCursor});
+  }
   for (auto [index, value] : llvm::enumerate(arguments))
     if (!value || value.getType() != targetType.getInput(index))
       return emitError(loc) << "unsupported: call argument type mismatch";
@@ -2840,6 +2934,15 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
   for (const StagedCursor &staged : stagedCursors) {
     Value advanced = loadPlace(loc, staged.tmpPlace);
     builder.create<memref::StoreOp>(loc, advanced, staged.cell);
+  }
+  for (const StagedPaired &staged : stagedPaired) {
+    Value written = loadPlace(loc, staged.tmpPlace);
+    Value absolute =
+        staged.coCursor
+            ? builder.create<arith::AddIOp>(loc, staged.coCursor, written)
+                  .getResult()
+            : written;
+    builder.create<memref::StoreOp>(loc, absolute, staged.cell);
   }
   if (callOp->getNumResults() == 0)
     return Value();
