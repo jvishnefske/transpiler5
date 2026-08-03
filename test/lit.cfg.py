@@ -57,3 +57,19 @@ llvm_config.add_tool_substitutions(tools, tool_dirs)
 # them conditional on cargo being available on PATH.
 if shutil.which("cargo"):
     config.available_features.add("cargo")
+
+# Per-test wall-clock cap. The EndToEnd tests RUN the emitted binary, so an
+# emitter miscompile that drops a loop's exit-condition store presents as a
+# NON-TERMINATING test, not a byte diff; without a cap it wedges the suite
+# forever (observed 2026-08-03: a stale run had burned ~28 CPU-hours per
+# spinning binary). 10 minutes is far above the slowest legitimate test
+# (first-build cargo compiles included) and turns a hang into a loud
+# TIMEOUT. Requires psutil in the lit python env; skip gracefully when the
+# harness lacks it rather than failing every configuration.
+if not lit_config.maxIndividualTestTime:
+    try:
+        import psutil  # noqa: F401 -- lit's timeout support requires it
+
+        lit_config.maxIndividualTestTime = 600
+    except ImportError:
+        lit_config.warning("psutil unavailable: no per-test timeout")
