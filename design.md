@@ -2930,6 +2930,60 @@ of references or inheritance, so it precedes both.
   whose emitted crate was compiled and RUN under the deny manifest
   (exit 5 = payload(Move{2,3}), correct).
 
+  SLICE-4 SPIKE (2026-08-03) — lift mechanics de-risked, GO; the lift
+  pass is now specced by measurement. STAGE: a module pass at the tail
+  of the pipeline, pre-emission — bodies there are pure emission
+  dialect (call-site rewriting is a rename to method_call), FR-30's
+  struct/impl machinery appears fully formed, nothing downstream can
+  disturb the output, and all test/Import goldens are churn-free by
+  construction. Three hand-lifted programs ran byte-identical to their
+  clang natives through the real emitter under the deny manifest:
+  globals.c (multi-global actor + function-static actor + driver
+  locals), a threading probe (helper on the call path to an arm), and
+  a two-actor cross probe. THREADING RESOLVED: a helper whose closure
+  writes one cluster is role=arm and lifts INTO the impl (calls become
+  `(*self).bump()`); a genuine cross function gains one
+  `!emitrust.mut_ref<struct>` parameter per closure-footprint actor in
+  deterministic order, call sites materialize fresh `&mut` per call;
+  recursion needs nothing (implicit reborrow); an arm calling another
+  actor's arm is IMPOSSIBLE BY CONSTRUCTION (the writer rule already
+  condensed the two actors — which also keeps one plan valid across
+  the threaded/async modes, where an arm holding a foreign &mut could
+  not exist). Mechanical residue, all resolved with existing ops:
+  module consts referenced from arms hit the impl-SymbolTable wall
+  (`global_load @SCALE` fails verification inside impl) and rewrite to
+  the opaque-constant path rendering `SCALE`; non-zero field
+  initializers materialize as post-construction member assigns in the
+  driver; whole-global snapshot round-trips admit a separately
+  testable elision pattern; plan symbols with no IR node (importer-
+  folded cursors, @stdout) are skip-if-absent. DEMOTION RULES (demote
+  = cluster keeps today's form; UX = `note demoted <actor>: <reason>`
+  in the plan, demotion-is-not-an-error, plus a located remark only
+  where a source site exists): (1) an arm/cross function is the target
+  of a TakesAddressOf edge (measured: the plan does NOT self-demote —
+  s4-fnptr still roles the arm — so the pass must check); (2) a
+  poison-merged actor (plan note present; a pure writer-rule @stdout
+  merge is NOT demoted — printing from a method is legal same-thread,
+  the pseudo-global contributes no field, and an actor named @stdout
+  renames to its smallest real global); (3) any plan-arm symbol with
+  no matching IR function (variadic monomorphization measured:
+  `addall` vs `addall_1`); (4) no role=driver line (library TU — no
+  one constructs the actor; owner-handle export is a recorded later
+  slice); (5) --link mode (demote-all with note; the FR-58/FR-59
+  interaction is a recorded later stage). STAGING + MEASURED CHURN:
+  stage A lands the pass behind `--actor-lift` (default OFF) with
+  pass-level FileCheck goldens and dedicated EndToEnd byte-diff twins;
+  stage B flips the default in one attributable commit after a
+  corpus-wide byte-diff run. Measured on all 108 EndToEnd plans:
+  36/108 programs restructure under lift-every-certified-cluster,
+  9/108 under a multi-global-or-multi-arm-only rule — but golden-FILE
+  churn at flip time is ZERO either way (EndToEnd diffs against
+  native, Import goldens are pre-pipeline, the one global-bearing
+  Driver crate golden is --link and demoted), so the review-surface
+  argument for the conservative rule is weak. Decision: lift EVERY
+  certified cluster (E1 precedent — each lift kills a thread_local and
+  reads better); the flip's only gate is the byte-diff suite.
+
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
