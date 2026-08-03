@@ -2479,6 +2479,37 @@ of references or inheritance, so it precedes both.
     unsigned scalars, enums, fn-ptrs, address-taken scalars, STL/FILE
     locals, owner structs.
 
+- [ ] FR-62 Message-based / actor decomposition of the program graph.
+  Owner direction (2026-08-03, verbatim): "convert program graph into
+  message based rust system or (feature flag) async select passing with
+  the option of a pluggable optimizer for actor responsibility
+  partitioning." Opened as the front for the multi-global shared-state
+  shapes C99-43 slice 1 deliberately leaves rejected (the
+  `ptr-to-ptr-global-target` tag, e.g. check_cpu's global-or-NULL
+  out-param): instead of synthesizing region structs that group globals
+  (rejected under Q2 — a byte-identity surface with no owner), shared
+  state becomes actor-owned state reached by messages. Scope: SPIKE
+  FIRST, no implementation until a probe crate byte-matches a native
+  reference. Open questions the spike must answer before any FR-62 code:
+  (1) what unit becomes an actor — a translation unit, an FR-59
+  partition crate, or an owner region (the FR-37/FR-38 owner-struct
+  classes are candidate seeds)? (2) which state turns into messages
+  versus staying owned by exactly one actor — the same
+  least-closed-set fixpoint as candidate (i)'s region identification, or
+  a partition of the FR-40 item graph's data edges? (3) the async
+  feature flag: std::sync::mpsc channels in the default build versus
+  async select behind a cargo feature — both must emit from ONE plan so
+  the flag never changes observable output; (4) the pluggable
+  partitioner interface — how an "actor responsibility" optimizer plugs
+  in, and its relation to FR-59's `--partition-map` override and
+  strongly-connected-component condensation (an actor boundary must
+  respect the same no-cycles contract); (5) how actor channels compose
+  with FR-58's merge facts (cross-shard state moves shards) and with the
+  byte-diff oracle: message interleaving must be provably deterministic
+  (single-threaded executor or sequenced channels), or the mapping is
+  NO-GO — the EndToEnd byte-diff stays THE correctness oracle and a
+  nondeterministic schedule cannot pass it.
+
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
@@ -3348,6 +3379,50 @@ rule.
   as it already is for null fn-ptr calls? (Q4) for handle-typed NULL,
   Option-of-index (probe form, Default = None) or an i64 sentinel —
   which is the FR-61 house style?
+  DECISIONS (2026-08-03, owner):
+  (Q1) &mut-i64-cursor only — NO multi-return anywhere. A T** out-param
+  never changes the function's arity beyond the existing two-input
+  (slice, &mut cursor) or one-input (&mut cursor) cursor forms; the
+  public signature shape stays stable across the extern/FFI surface and
+  FR-58 cross-shard comparison.
+  (Q2) NO synthesized region structs. A `*p = <global address>` target
+  (single or multiple, including check_cpu's global-or-NULL) stays a
+  located rejection with its own tag (`ptr-to-ptr-global-target`); the
+  multi-global front is the NEW FR-62 (actor/message decomposition,
+  spike-first). The single-global-or-NULL case was verified against the
+  probe and ALSO stays rejected in slice 1: the probe's CTS-P2-style
+  erasure covers only the always-that-global write, while the measured
+  kernel shape (`*err_flags_ptr = err ? err_flags : NULL`) needs a
+  NULL-flag threaded back to the caller — a second in-out state cell
+  beyond the existing global machinery, i.e. a new mechanism, exactly
+  what slice 1 excludes.
+  (Q3) Plain idiomatic indexing now: a deterministic panic on a stale or
+  out-of-range index is an accepted refinement of C's UB, on the
+  div-by-zero precedent. Generation-checked handles are recorded as a
+  future OPT-IN optimization only, never the default emitted style.
+  (Q4) Option<index> for NULL-able handles: None = NULL, on the fn-ptr
+  (Option<fn>) precedent and the probe's Default = None form. No i64
+  sentinel.
+  SLICE 1 SCOPE (2026-08-03; the FR under implementation): generalize
+  the existing CTS-00204 cursor-parameter machinery from `char **` to
+  T** per the admitted-shape contract — per T** parameter of a DEFINED
+  function (planning stays all-or-nothing per definition, main
+  excluded): Shape S (self-walking cursor: every use under `*p`, content
+  read-only, `*p = <self-rooted expr>` advancement) lowers to
+  `(&[T], &mut i64)` for any slice-valid non-void, non-function element
+  T; Shape P (paired out-cursor, the strtol/endp family: no `*p` reads,
+  exactly one top-level unconditional `*p = <expr>` write whose RHS
+  roots in exactly one same-element slice-classified co-parameter)
+  lowers to ONE `&mut i64` input written directly, no cell and no
+  writeback. Still rejected, each with a located diagnostic and a
+  distinguishing ledger tag: shape escapes
+  (`ptr-to-ptr-shape-escape`), `*p = NULL` (`ptr-to-ptr-null-write`),
+  global targets (`ptr-to-ptr-global-target`, the FR-62 front),
+  disagreeing/unrooted write sources (escape family), T*** and void**
+  (generic `ptr-to-ptr` at mapParamType), and body-less
+  prototypes/extern decls (generic `ptr-to-ptr`; a shard that sees only
+  the prototype keeps rejecting — FR-58's signature-starvation axis is
+  the recorded future path for cross-TU definitions).
 - [x] C99-44 Unions. DECIDED and SHIPPED: the one-slot struct model —
   a supported subset with documented located rejections, not an enum
   mapping and not a blanket rejection. A named or untagged union
