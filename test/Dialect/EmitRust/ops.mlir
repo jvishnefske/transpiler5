@@ -489,3 +489,24 @@ emitrust.func @method_calls(%arg0: i64) -> i32 {
 // module-level definition op.
 // CHECK: emitrust.trait_def @Externals ["host_scale", "host_reset"] [(i32) -> i32, () -> ()]
 emitrust.trait_def @Externals ["host_scale", "host_reset"] [(i32) -> i32, () -> ()]
+
+// FR-61c: emitrust.while round-trips its condition and body regions.
+// CHECK-LABEL: emitrust.func @while_loop
+emitrust.func @while_loop(%arg0: i32, %arg1: i32) {
+  %i = emitrust.let mut %arg0 : i32
+  // CHECK:      emitrust.while {
+  // CHECK-NEXT:   %[[C:.*]] = emitrust.cmp lt, %{{.*}}, %arg1 : (i32, i32) -> i1
+  // CHECK-NEXT:   emitrust.condition %[[C]]
+  // CHECK-NEXT: } do {
+  // CHECK:        emitrust.assign
+  emitrust.while {
+    %c = emitrust.cmp lt, %i, %arg1 : (i32, i32) -> i1
+    emitrust.condition %c
+  } do {
+    %one = emitrust.constant <1 : i32> : i32
+    %next = emitrust.add %i, %one : i32
+    emitrust.assign %i = %next : i32
+    emitrust.yield
+  }
+  emitrust.return
+}

@@ -378,6 +378,9 @@ private:
   LogicalResult emitFor(emitrust::ForOp forOp);
   /// Emits `loop { ... }`.
   LogicalResult emitLoop(emitrust::LoopOp loopOp);
+  /// FR-61c: emits `while <cond> {` -- the condition region folded into
+  /// the head through the FR-61d capture machinery -- then the body.
+  LogicalResult emitWhile(emitrust::WhileOp whileOp);
   /// Emits a `match` statement with one literal integer arm per case region
   /// (each case value rendered in the discriminator's type) and a trailing
   /// `_ =>` arm for the default region.
@@ -984,14 +987,28 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
     r.maxWrites = std::max(thenL.maxWrites, elseL.maxWrites);
     return r;
   }
-  if (isa<emitrust::ForOp, emitrust::LoopOp>(op)) {
-    Region &body = op->getRegion(0);
+  if (isa<emitrust::ForOp, emitrust::LoopOp, emitrust::WhileOp>(op)) {
+    // FR-61c: `emitrust.while` analyzes its BODY like the other loops; its
+    // condition region is a pure chain that can only READ the binding, and
+    // it runs before the body on every iteration (including a zeroth
+    // iteration that never enters the body), so its reads merge in below.
+    Region &body = isa<emitrust::WhileOp>(op) ? op->getRegion(1)
+                                              : op->getRegion(0);
     BreakInfo bodyBreaks;
     Liveness bodyL =
         body.empty()
             ? Liveness{}
             : analyzeSeq(body.front().begin(), body.front().end(), binding,
                          enteringWritten, &bodyBreaks, partialWriteBlocks);
+    if (auto whileOp = dyn_cast<emitrust::WhileOp>(op)) {
+      Region &condition = whileOp.getCondition();
+      Liveness condL = analyzeSeq(condition.front().begin(),
+                                  condition.front().end(), binding,
+                                  enteringWritten, /*brk=*/nullptr,
+                                  partialWriteBlocks);
+      // The condition runs first: its read precedes any body write.
+      bodyL.readFirst = condL.readFirst || bodyL.readFirst;
+    }
     r.readFirst = bodyL.readFirst;
     r.hasLoopWrite = bodyL.hasLoopWrite || bodyL.maxWrites > 0;
     // `mut` is needed only when a write can recur: it does when a body path
@@ -1504,6 +1521,10 @@ static bool isClassifiedConsumerUse(OpOperand &use) {
         return use.get() == subscript.getIndex();
       })
       .Case<emitrust::DerefOp>([](auto) { return true; })
+      // FR-61c: the while-condition terminator consumes its operand in the
+      // never-parenthesized head position; classifying it is what lets the
+      // condition chain's final op fold.
+      .Case<emitrust::ConditionOp>([](auto) { return true; })
       .Default([](Operation *) { return false; });
 }
 
@@ -3013,6 +3034,39 @@ LogicalResult RustEmitter::emitLoop(emitrust::LoopOp loopOp) {
   return success();
 }
 
+LogicalResult RustEmitter::emitWhile(emitrust::WhileOp whileOp) {
+  // FR-61c: the condition region is a pure single-use chain the FR-61d
+  // capture machinery folds into the head expression -- every op must be
+  // consumed (captured or dropped); a leftover statement cannot render
+  // inside a `while` head and fails loudly instead of emitting wrong code.
+  Block &conditionBlock = whileOp.getCondition().front();
+  // Consume the condition chain FIRST: each capture erases its statement
+  // and leaves the stream at line start, so the `while ` printed after
+  // them gets its indentation exactly once.
+  for (Operation &op : conditionBlock.without_terminator()) {
+    if (isPlaceProjection(&op))
+      continue;
+    FailureOr<bool> consumed = emitDropOrCapture(op);
+    if (failed(consumed))
+      return failure();
+    if (!*consumed)
+      return op.emitOpError("emitrust.while condition op does not fold into "
+                            "the head expression");
+  }
+  os << "while ";
+  auto conditionOp =
+      cast<emitrust::ConditionOp>(conditionBlock.getTerminator());
+  // The head is the never-parenthesized condition position.
+  if (failed(emitOperand(conditionOp.getLoc(), conditionOp.getCondition(),
+                         ExprPos::cond())))
+    return failure();
+  os << " {\n";
+  if (failed(emitRegionBody(whileOp.getOperation(), whileOp.getBody())))
+    return failure();
+  os << "}\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitSwitch(emitrust::SwitchOp switchOp) {
   Operation *op = switchOp.getOperation();
   os << "match ";
@@ -3571,6 +3625,8 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
           [&](emitrust::ForOp forOp) { return emitFor(forOp); })
       .Case<emitrust::LoopOp>(
           [&](emitrust::LoopOp loopOp) { return emitLoop(loopOp); })
+      .Case<emitrust::WhileOp>(
+          [&](emitrust::WhileOp whileOp) { return emitWhile(whileOp); })
       .Case<emitrust::SwitchOp>([&](emitrust::SwitchOp switchOp) {
         return emitSwitch(switchOp);
       })

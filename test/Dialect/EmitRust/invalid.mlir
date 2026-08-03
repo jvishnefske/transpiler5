@@ -44,7 +44,7 @@ emitrust.func @empty_opaque_type() {
 // -----
 
 emitrust.func @break_outside_loop() {
-  // expected-error @+1 {{must appear inside an emitrust.loop or emitrust.for}}
+  // expected-error @+1 {{must appear inside an emitrust.loop, emitrust.for, or emitrust.while}}
   emitrust.break
   emitrust.return
 }
@@ -53,7 +53,7 @@ emitrust.func @break_outside_loop() {
 
 emitrust.func @continue_outside_loop(%arg0: i1) {
   emitrust.if %arg0 {
-    // expected-error @+1 {{must appear inside an emitrust.loop or emitrust.for}}
+    // expected-error @+1 {{must appear inside an emitrust.loop, emitrust.for, or emitrust.while}}
     emitrust.continue
   }
   emitrust.return
@@ -627,5 +627,18 @@ emitrust.func @bad_variable_name() {
 emitrust.func @empty_variable_name() {
   // expected-error @+1 {{variable name must be a non-empty Rust identifier}}
   %0 = emitrust.variable named "" : !emitrust.lvalue<i32>
+  emitrust.return
+}
+
+// -----
+
+// FR-61c: the while condition region must end in emitrust.condition.
+emitrust.func @while_bad_terminator(%arg0: i32, %arg1: i32) {
+  // expected-error @+1 {{condition region must be terminated by emitrust.condition}}
+  emitrust.while {
+    emitrust.yield
+  } do {
+    emitrust.yield
+  }
   emitrust.return
 }

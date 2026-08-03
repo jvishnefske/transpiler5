@@ -38,6 +38,7 @@
 
 #include "EmitRust/Conversion/EmitRustTypeConverter.h"
 #include "EmitRust/EmitRustOps.h"
+#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
@@ -266,14 +267,264 @@ struct ForLowering : public OpConversionPattern<scf::ForOp> {
   }
 };
 
-/// Converts `scf.while` into `emitrust.loop`. The carried values become
-/// mutable lets initialized from the while operands; the results become
-/// default-initialized mutable lets. Inside the loop, the before-region
-/// runs first; when the condition is false an `emitrust.if` assigns the
-/// result lets from the condition arguments and breaks; otherwise the
-/// after-region runs and assigns the carried lets at its `scf.yield`.
+/// FR-61c: whether `op` may live in an `emitrust.while` condition region --
+/// the conversion-time analogue of the emitter's FR-61d pure set. Both the
+/// pre-conversion arith spellings and the already-converted emitrust
+/// spellings can appear during partial conversion. No loads and no calls:
+/// the condition region's chain must be pure so re-evaluating it at each
+/// `while` head test is exactly the before-region's semantics.
+static bool isLiftableConditionOp(Operation *op) {
+  if (isa<arith::CmpIOp, arith::CmpFOp, arith::AddIOp, arith::SubIOp,
+          arith::MulIOp, arith::DivSIOp, arith::DivUIOp, arith::RemSIOp,
+          arith::RemUIOp, arith::AndIOp, arith::OrIOp, arith::XOrIOp,
+          arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp, arith::ConstantOp,
+          arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
+          arith::IndexCastOp, arith::AddFOp, arith::SubFOp, arith::MulFOp,
+          arith::DivFOp, arith::SIToFPOp, arith::FPToSIOp>(op))
+    return true;
+  return isa<emitrust::ConstantOp, emitrust::AddOp, emitrust::SubOp,
+             emitrust::MulOp, emitrust::DivOp, emitrust::RemOp,
+             emitrust::AndOp, emitrust::OrOp, emitrust::XorOp,
+             emitrust::ShlOp, emitrust::ShrOp, emitrust::CmpOp,
+             emitrust::CastOp, emitrust::BitcastOp>(op);
+}
+
+/// Converts `scf.while`. A loop whose before-region is a pure single-use
+/// op chain ending in `scf.condition`, and whose forwarded condition
+/// arguments are all loop-invariant or carried values, lifts to
+/// `emitrust.while` (FR-61c): the before-region becomes the condition
+/// region (folded into the Rust `while` head by the emitter), the
+/// after-region becomes the body, and the loop results are the carried
+/// lets themselves -- no body-if, no exit copies, no tail break.
+/// Everything else keeps the `emitrust.loop` lowering below: the carried
+/// values become mutable lets initialized from the while operands; the
+/// results become default-initialized mutable lets. Inside the loop, the
+/// before-region runs first; when the condition is false an `emitrust.if`
+/// assigns the result lets from the condition arguments and breaks;
+/// otherwise the after-region runs and assigns the carried lets at its
+/// `scf.yield`.
 struct WhileLowering : public OpConversionPattern<scf::WhileOp> {
   using OpConversionPattern<scf::WhileOp>::OpConversionPattern;
+
+  /// FR-61c: the recognized liftable shape. `lift-cf-to-scf` emits a C
+  /// `while` as a before-region holding the pure condition prefix, ONE
+  /// `scf.if` guarded by the condition (the loop body in its then-arm,
+  /// exit defaults in its else-arm yield), and `scf.condition` forwarding
+  /// if-results / carried args / invariants; the after-region forwards.
+  /// The degenerate form without the body-if (everything in the
+  /// after-region) is the same shape with `bodyIf == nullptr`.
+  struct WhileShape {
+    scf::IfOp bodyIf; // null in the degenerate form
+    Value cond;       // the scf-level condition value
+  };
+
+  /// FR-61c qualification. Holds when:
+  ///  - every before-region op outside the body-if is pure with a single
+  ///    result used only inside the before block (constants are exempt
+  ///    from the use count -- the emitter duplicates them);
+  ///  - the last op before `scf.condition` is either nothing or ONE
+  ///    `scf.if` guarded by the same condition `scf.condition` tests,
+  ///    whose results are used only as condition args and whose else-arm
+  ///    is a bare `scf.yield` of before-args or loop-invariant values
+  ///    (those become the loop's exit values, nameable after the while);
+  ///  - every `scf.condition` arg is an if-result, a before-block
+  ///    argument, or defined outside the loop.
+  std::optional<WhileShape> qualifiesForWhileLift(scf::WhileOp whileOp) const {
+    Block *beforeBlock = whileOp.getBeforeBody();
+    auto conditionOp = cast<scf::ConditionOp>(beforeBlock->getTerminator());
+    Value cond = conditionOp.getCondition();
+
+    auto bodyIf = dyn_cast_or_null<scf::IfOp>(conditionOp->getPrevNode());
+    if (bodyIf) {
+      if (bodyIf.getCondition() != cond)
+        return std::nullopt; // a differently-guarded if is a real statement
+      if (!bodyIf.getThenRegion().hasOneBlock())
+        return std::nullopt;
+      // The else-arm must be a bare yield (its operands become the exit
+      // values); its operands must stay nameable after the loop.
+      if (bodyIf.getNumResults() != 0) {
+        if (!bodyIf.getElseRegion().hasOneBlock())
+          return std::nullopt;
+        Block &elseBlock = bodyIf.getElseRegion().front();
+        if (!llvm::hasSingleElement(elseBlock))
+          return std::nullopt; // real else ops would have to run at exit
+        for (Value v : cast<scf::YieldOp>(elseBlock.getTerminator())
+                           .getOperands()) {
+          if (auto blockArg = dyn_cast<BlockArgument>(v)) {
+            if (blockArg.getOwner() != beforeBlock)
+              return std::nullopt;
+            continue;
+          }
+          if (Operation *def = v.getDefiningOp())
+            if (whileOp->isAncestor(def))
+              return std::nullopt;
+        }
+      }
+      // If-results may only feed the condition terminator.
+      for (Value result : bodyIf.getResults())
+        for (Operation *user : result.getUsers())
+          if (user != conditionOp)
+            return std::nullopt;
+      // The condition may only guard the body-if and the terminator.
+      for (Operation *user : cond.getUsers())
+        if (user != bodyIf && user != conditionOp)
+          return std::nullopt;
+    }
+
+    // The pure condition prefix: everything before the body-if (or the
+    // terminator in the degenerate form).
+    Operation *prefixEnd =
+        bodyIf ? bodyIf.getOperation() : conditionOp.getOperation();
+    for (Operation &op :
+         llvm::make_range(beforeBlock->begin(), prefixEnd->getIterator())) {
+      if (!isLiftableConditionOp(&op) || op.getNumResults() != 1)
+        return std::nullopt;
+      if (isa<arith::ConstantOp, emitrust::ConstantOp>(op))
+        continue;
+      Value result = op.getResult(0);
+      if (result == cond) {
+        // The condition itself: consumed by the (optional) body-if and
+        // the terminator, nothing else (checked above when bodyIf
+        // exists; enforce here for the degenerate form).
+        for (Operation *user : result.getUsers())
+          if (user != conditionOp && user != bodyIf)
+            return std::nullopt;
+        continue;
+      }
+      if (!result.hasOneUse())
+        return std::nullopt;
+      Operation *user = *result.getUsers().begin();
+      if (user->getBlock() != beforeBlock)
+        return std::nullopt; // leaks into the body: not a condition op
+    }
+
+    for (Value arg : conditionOp.getArgs()) {
+      if (bodyIf && arg.getDefiningOp() == bodyIf.getOperation())
+        continue;
+      if (auto blockArg = dyn_cast<BlockArgument>(arg)) {
+        if (blockArg.getOwner() != beforeBlock)
+          return std::nullopt;
+        continue;
+      }
+      if (Operation *def = arg.getDefiningOp())
+        if (whileOp->isAncestor(def))
+          return std::nullopt; // computed in-loop: unnameable after it
+    }
+    return WhileShape{bodyIf, cond};
+  }
+
+  /// FR-61c: builds the `emitrust.while` for a qualified loop. The
+  /// condition prefix becomes the condition region; the body-if's
+  /// then-arm (when present) plus the after-region ops become the body,
+  /// ending in the backedge assignments; the else-arm yields (or the
+  /// carried lets themselves) become the loop's replacement values.
+  LogicalResult liftToWhile(scf::WhileOp whileOp, WhileShape shape,
+                            ConversionPatternRewriter &rewriter,
+                            SmallVector<Value> &carriedLets) const {
+    Location loc = whileOp.getLoc();
+    auto lifted = rewriter.create<emitrust::WhileOp>(loc);
+
+    // Condition region: the before-block, its arguments mapped to the
+    // carried lets, its scf.condition replaced by emitrust.condition.
+    Region &conditionRegion = lifted.getCondition();
+    Block *conditionEntry;
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      conditionEntry = rewriter.createBlock(&conditionRegion);
+    }
+    Block *beforeBlock = whileOp.getBeforeBody();
+    rewriter.inlineRegionBefore(whileOp.getBefore(), conditionRegion,
+                                conditionRegion.end());
+    rewriter.mergeBlocks(beforeBlock, conditionEntry, carriedLets);
+
+    auto conditionOp = cast<scf::ConditionOp>(conditionEntry->getTerminator());
+    scf::IfOp bodyIf = shape.bodyIf;
+
+    // Collect the then-arm and else-arm yield operands (remapped) before
+    // anything moves, plus the terminator condition.
+    SmallVector<Value> thenYields, elseYields;
+    Operation *thenTerminator = nullptr;
+    if (bodyIf) {
+      thenTerminator = bodyIf.getThenRegion().front().getTerminator();
+      if (failed(rewriter.getRemappedValues(
+              cast<scf::YieldOp>(thenTerminator).getOperands(), thenYields)))
+        return rewriter.notifyMatchFailure(whileOp,
+                                           "failed to remap then yields");
+      if (bodyIf.getNumResults() != 0 &&
+          failed(rewriter.getRemappedValues(
+              cast<scf::YieldOp>(
+                  bodyIf.getElseRegion().front().getTerminator())
+                  .getOperands(),
+              elseYields)))
+        return rewriter.notifyMatchFailure(whileOp,
+                                           "failed to remap else yields");
+    }
+    Value condition = rewriter.getRemappedValue(conditionOp.getCondition());
+    if (!condition)
+      return rewriter.notifyMatchFailure(whileOp,
+                                         "failed to remap the condition");
+
+    // Maps one scf.condition argument to its value on the CONTINUE edge
+    // (body-if results are the then-arm yields) or the EXIT edge (they are
+    // the else-arm yields).
+    auto mapConditionArg = [&](Value arg, bool exiting) -> Value {
+      if (bodyIf && arg.getDefiningOp() == bodyIf.getOperation()) {
+        unsigned index = cast<OpResult>(arg).getResultNumber();
+        return exiting ? elseYields[index] : thenYields[index];
+      }
+      return rewriter.getRemappedValue(arg);
+    };
+    SmallVector<Value> continueArgs, exitArgs;
+    for (Value arg : conditionOp.getArgs()) {
+      continueArgs.push_back(mapConditionArg(arg, /*exiting=*/false));
+      exitArgs.push_back(mapConditionArg(arg, /*exiting=*/true));
+      if (!continueArgs.back() || !exitArgs.back())
+        return rewriter.notifyMatchFailure(whileOp,
+                                           "failed to remap condition args");
+    }
+
+    // Body region: the then-arm ops (when present), then the after-region
+    // ops with their arguments mapped to the continue-edge values, then
+    // the backedge assignments.
+    Region &bodyRegion = lifted.getBody();
+    Block *bodyEntry;
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      bodyEntry = rewriter.createBlock(&bodyRegion);
+    }
+    if (bodyIf) {
+      Block *thenBlock = &bodyIf.getThenRegion().front();
+      rewriter.inlineRegionBefore(bodyIf.getThenRegion(), bodyRegion,
+                                  bodyRegion.end());
+      rewriter.mergeBlocks(thenBlock, bodyEntry, /*argValues=*/{});
+      rewriter.eraseOp(thenTerminator);
+    }
+    Block *afterBlock = whileOp.getAfterBody();
+    Operation *afterTerminator = afterBlock->getTerminator();
+    rewriter.inlineRegionBefore(whileOp.getAfter(), bodyRegion,
+                                bodyRegion.end());
+    // Splice the after ops behind the then ops in the entry block.
+    Block *afterEntry = &*std::next(bodyRegion.begin());
+    rewriter.mergeBlocks(afterEntry, bodyEntry, continueArgs);
+    if (failed(lowerYield(whileOp, carriedLets, rewriter,
+                          cast<scf::YieldOp>(afterTerminator))))
+      return failure();
+
+    // Retire the condition terminator and the (now then-less) body-if.
+    {
+      OpBuilder::InsertionGuard guard(rewriter);
+      rewriter.setInsertionPoint(conditionOp);
+      rewriter.create<emitrust::ConditionOp>(loc, condition);
+    }
+    rewriter.eraseOp(conditionOp);
+    if (bodyIf)
+      rewriter.eraseOp(bodyIf);
+
+    // The loop results are the exit-edge values: else-arm yields, carried
+    // lets, or loop invariants -- all nameable after the while.
+    rewriter.replaceOp(whileOp, exitArgs);
+    return success();
+  }
 
   /// Rewrites the while loop into an infinite loop with a break.
   LogicalResult
@@ -298,6 +549,15 @@ struct WhileLowering : public OpConversionPattern<scf::WhileOp> {
                                                              init,
                                                              /*is_mut=*/true));
     }
+
+    // FR-61c: a pure-condition loop lifts to `emitrust.while` instead.
+    if (std::optional<WhileShape> shape = qualifiesForWhileLift(whileOp)) {
+      if (::getenv("EMITRUST_WHILE_LIFT_STATS"))
+        llvm::errs() << "[while-lift] lifted\n";
+      return liftToWhile(whileOp, *shape, rewriter, carriedLets);
+    }
+    if (::getenv("EMITRUST_WHILE_LIFT_STATS"))
+      llvm::errs() << "[while-lift] fallback\n";
 
     // Default-initialized mutable lets that stand in for the results.
     SmallVector<Value> resultLets;

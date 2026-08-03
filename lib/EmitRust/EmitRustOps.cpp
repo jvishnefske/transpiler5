@@ -770,6 +770,22 @@ LogicalResult VariableOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// WhileOp
+//===----------------------------------------------------------------------===//
+
+/// FR-61c: verifies the condition region ends in `emitrust.condition` (the
+/// body region's terminator stays structural -- `emitrust.yield`, or a
+/// diverging terminator like `emitrust.break`).
+LogicalResult WhileOp::verify() {
+  Block &conditionBlock = getCondition().front();
+  if (conditionBlock.empty() ||
+      !isa<ConditionOp>(conditionBlock.getTerminator()))
+    return emitOpError(
+        "condition region must be terminated by emitrust.condition");
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // MemberOp
 //===----------------------------------------------------------------------===//
 
@@ -1016,19 +1032,19 @@ LogicalResult BitcastOp::verify() {
 // BreakOp / ContinueOp
 //===----------------------------------------------------------------------===//
 
-/// Verifies that `op` has an enclosing `emitrust.loop` or `emitrust.for`,
-/// stopping the walk at function boundaries.
+/// Verifies that `op` has an enclosing `emitrust.loop`, `emitrust.for`, or
+/// `emitrust.while` (FR-61c), stopping the walk at function boundaries.
 static LogicalResult verifyLoopJump(Operation *op) {
   Operation *parent = op->getParentOp();
   while (parent) {
-    if (isa<LoopOp, ForOp>(parent))
+    if (isa<LoopOp, ForOp, WhileOp>(parent))
       return success();
     if (isa<FuncOp>(parent))
       break;
     parent = parent->getParentOp();
   }
   return op->emitOpError(
-      "must appear inside an emitrust.loop or emitrust.for");
+      "must appear inside an emitrust.loop, emitrust.for, or emitrust.while");
 }
 
 /// Verifies that the break has an enclosing loop within the same function.

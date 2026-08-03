@@ -1923,11 +1923,15 @@ of references or inheritance, so it precedes both.
   reject; the rejection ledger aggregates into a queryable per-construct
   report (inline asm, volatile, container_of, attributes) that ranks what
   semantic work buys the most frontier.
-- [ ] FR-61 Rustacean-style emission. The emitted Rust should read as
+- [x] FR-61 Rustacean-style emission. The emitted Rust should read as
   expression-oriented Rust, not statement-per-op SSA transliteration; every
   slice is a pure EMITTER rendering change whose oracle is the EndToEnd
   byte-diff (behavior identical; golden-text churn expected and updated per
-  slice). Corpus-measured opportunity (473 functions):
+  slice). Corpus-measured opportunity (473 functions): ALL FIVE SLICES
+  LANDED 2026-08-03 (61c's conversion-time while-lift closed it); final
+  corpus: `let ` 10273 -> 3175 (-69%), `loop {` 222 -> 44 (178 genuine
+  `while`s), tail expressions total, named locals + params, unsafe 0,
+  byte-diff oracle held through every slice.
   - [x] 61a Tail-expression returns: a function-final `return v;` renders as
     the tail expression `v`, and when `v` is a single-use binding defined by
     the immediately preceding `let v = <expr>;` the pair folds to the tail
@@ -1947,7 +1951,7 @@ of references or inheritance, so it precedes both.
     crates. (test/Target/Rust/tail-expr.mlir, control-flow.mlir 61b cases,
     plus expectation churn across the Target/Driver goldens, every line
     explained by 61a/61b.)
-  - [ ] 61c While-lift: `loop { ...; if c { break } ... }` shapes back to
+  - [x] 61c While-lift: `loop { ...; if c { break } ... }` shapes back to
     `while`/`while let` where the SCF lowering's shape allows (172 corpus
     `loop {`s; SPIKE FIRST -- the condition prefix is statements, not an
     expression, so only a prefix-free subset lifts mechanically).
@@ -2001,6 +2005,23 @@ of references or inheritance, so it precedes both.
     WhileOp case (generic fallback missed write-recurrence ->
     `loopReassign`); with it, EndToEnd 123/123 byte-diff green with the
     lift firing at 201 sites. Slice lands with this spike.
+    LANDED 61c (2026-08-03): `emitrust.while` (condition region +
+    `emitrust.condition` terminator, body region; breaks legal inside),
+    the conversion-time lift for both the simple and the canonical
+    body-if shapes, and the emitter's fold-into-head rendering (a
+    non-foldable condition op is a located error). 201 of 304 corpus
+    scf.whiles lift; corpus `loop {` 222 -> 44, `while` 178, `let `
+    3882 -> 3175 (exit copies, result lets, and condition bindings gone).
+    The 103-loop remainder (impure conditions -- fgetc-style -- and
+    entangled exit values) keeps `loop { .. break }` BY DESIGN: that is
+    the idiomatic Rust for those shapes. Full suite 444/444, EndToEnd
+    123/123 byte-diff green (one E0384 caught and fixed en route:
+    analyzeControl's explicit WhileOp case), unsafe 0. Pinned in
+    test/Conversion/SCFToEmitRust/while.mlir (lift + both NOT-lifted
+    cases), Dialect round-trip + verifier rejections,
+    Target/Rust/while-loop.mlir (head folding, `while true`, breaks),
+    Target/Rust/errors.mlir (unfoldable condition), and the loops.c
+    EndToEnd shape pin.
   - [x] 61d Expression-tree inlining: fold single-use scalar `let vN`
     temporaries into their one consumer where evaluation order provably
     cannot change (loads/pure ops only; SPIKE FIRST -- this is the largest

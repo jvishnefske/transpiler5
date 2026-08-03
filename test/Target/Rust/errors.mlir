@@ -25,3 +25,22 @@ emitrust.func @cast_to_bool(%arg0: i32) {
   %0 = emitrust.cast %arg0 : i32 to i1
   emitrust.return
 }
+
+// -----
+
+// FR-61c: a while condition op the FR-61d machinery cannot fold (here a
+// multi-use value needing a statement binding) is a located error --
+// statements cannot render inside a `while` head, and silently wrong
+// code is never an option.
+emitrust.func @unfoldable_while(%arg0: i32, %arg1: i32) -> i32 {
+  %m = emitrust.let mut %arg0 : i32
+  emitrust.while {
+    // CHECK: condition op does not fold into the head expression
+    %t = emitrust.add %m, %arg1 : i32
+    %c = emitrust.cmp lt, %t, %t : (i32, i32) -> i1
+    emitrust.condition %c
+  } do {
+    emitrust.yield
+  }
+  emitrust.return %m : i32
+}
