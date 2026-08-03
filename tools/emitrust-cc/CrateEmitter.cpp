@@ -65,6 +65,29 @@ static constexpr llvm::StringLiteral kMainArgcWrapper =
     "fn main() { std::process::exit(c_main(std::env::args_os().len() as "
     "i32)); }\n";
 
+/// FR-62 slice 5c: the async flavor's entry wrappers — `c_main` renders as
+/// an `async fn` when an async actor runtime anchor exists, so the shim
+/// builds a tokio CURRENT_THREAD runtime (E4's determinism substrate:
+/// single-threaded scheduling + the wrappers' immediate await keep effect
+/// order equal to program order) and drives `c_main` to completion with
+/// `block_on`. The explicit Builder form is chosen over
+/// `#[tokio::main(flavor = "current_thread")]` because it works without
+/// the "macros" feature: both were probe-built, and the attribute macro
+/// pulls tokio-macros/syn/quote/proc-macro2 (10 crates in the tree vs 3)
+/// for zero behavioral difference.
+static constexpr llvm::StringLiteral kMainWrapperAsync =
+    "fn main() { "
+    "std::process::exit(tokio::runtime::Builder::new_current_thread()"
+    ".enable_all().build().expect(\"tokio runtime build failed\")"
+    ".block_on(c_main())); }\n";
+
+/// The async shim for a `c_main` that takes the imported argc parameter.
+static constexpr llvm::StringLiteral kMainArgcWrapperAsync =
+    "fn main() { "
+    "std::process::exit(tokio::runtime::Builder::new_current_thread()"
+    ".enable_all().build().expect(\"tokio runtime build failed\")"
+    ".block_on(c_main(std::env::args_os().len() as i32))); }\n";
+
 CrateType selectCrateType(CrateTypeRequest request, mlir::ModuleOp module) {
   switch (request) {
   case CrateTypeRequest::Bin:
@@ -105,6 +128,13 @@ bool hasCMain(mlir::ModuleOp module) {
   return symbol != nullptr && llvm::isa<mlir::emitrust::FuncOp>(symbol);
 }
 
+bool hasAsyncActorRuntime(mlir::ModuleOp module) {
+  for (auto runtime : module.getOps<mlir::emitrust::ActorRuntimeOp>())
+    if (runtime.getMode() == mlir::emitrust::ActorMode::async)
+      return true;
+  return false;
+}
+
 /// Returns whether the module's `c_main` takes the imported argc
 /// parameter (a C `main(int argc, char **argv)`; `argv` is dropped at
 /// import). Callers have already established `hasCMain`.
@@ -114,7 +144,8 @@ static bool cMainTakesArgc(mlir::ModuleOp module) {
   return funcOp && funcOp.getFunctionType().getNumInputs() == 1;
 }
 
-std::string renderCargoToml(llvm::StringRef crateName, CrateType type) {
+std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
+                            bool asyncActorRuntime) {
   std::string toml;
   llvm::raw_string_ostream os(toml);
   os << "[package]\n"
@@ -143,6 +174,17 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type) {
     os << "non_snake_case = \"deny\"\n"
        << "non_upper_case_globals = \"deny\"\n"
        << "non_camel_case_types = \"deny\"\n";
+  // FR-62 slice 5c: the ASYNC crate flavor (E4) appends its tokio
+  // dependency UNCONDITIONALLY — never behind a cargo feature, whose mere
+  // declaration breaks `cargo build --offline` (the measured NO-GO) — and
+  // everything above stays byte-identical to the default manifest. The
+  // feature list is the measured minimum for the emitted shape: "rt"
+  // (Builder + task::spawn), "sync" (mpsc + oneshot); no "macros" because
+  // the main shim is the explicit Builder, not the attribute macro.
+  if (asyncActorRuntime)
+    os << "\n"
+       << "[dependencies]\n"
+       << "tokio = { version = \"1\", features = [\"rt\", \"sync\"] }\n";
   return toml;
 }
 
@@ -180,8 +222,15 @@ renderCrateRoot(mlir::ModuleOp module, CrateType type,
   }
   if (mlir::failed(mlir::emitrust::translateToRust(module, os, emitOptions)))
     return mlir::failure();
-  if (wrapMain)
-    os << "\n" << (cMainTakesArgc(module) ? kMainArgcWrapper : kMainWrapper);
+  if (wrapMain) {
+    // FR-62 slice 5c: an async actor runtime anchor means `c_main` rendered
+    // as an `async fn`, so the wrapper is the tokio current_thread shim.
+    const bool asyncMain = hasAsyncActorRuntime(module);
+    os << "\n"
+       << (cMainTakesArgc(module)
+               ? (asyncMain ? kMainArgcWrapperAsync : kMainArgcWrapper)
+               : (asyncMain ? kMainWrapperAsync : kMainWrapper));
+  }
   return source;
 }
 
