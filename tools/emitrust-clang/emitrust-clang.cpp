@@ -8,7 +8,10 @@
 /// \file
 /// This file is the FR-56 compiler-shim front end `emitrust-clang`. It is
 /// meant to be dropped into an unmodified build system as the C compiler
-/// (`make CC=emitrust-clang`): every invocation is DELEGATED verbatim to the
+/// (`make CC=emitrust-clang`, or through a `cc`/`gcc`-named symlink —
+/// argv[0] is parsed with clang's own program-name mechanism and its
+/// driver-mode/target implications are honored on both the classification
+/// and the delegation): every invocation is DELEGATED verbatim to the
 /// real clang — so object files, configure probes, `--version` checks,
 /// preprocessing, depfile generation, and the final native link all behave
 /// exactly as a plain-clang build — and, additionally, each driver
@@ -81,6 +84,7 @@
 #include "clang/Driver/Compilation.h"
 #include "clang/Driver/Driver.h"
 #include "clang/Driver/Job.h"
+#include "clang/Driver/ToolChain.h"
 
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ObjCopy/ConfigManager.h"
@@ -206,10 +210,15 @@ static std::optional<std::string> findRealCompiler() {
 /// \param args the expanded argv, argv[0] included.
 /// \param realCC the real compiler path, used as the driver's notion of the
 ///        executable so resource-dir and toolchain deduction match it.
+/// \param targetAndMode the FR-56 argv0 aliasing facts: what clang's own
+///        program-name parsing derived from the name the shim was invoked
+///        under (`cc`, `gcc`, `g++`, a target-prefixed cross name, ...),
+///        applied to the driver exactly as clang's main applies it.
 /// \param log the optional shim log, receiving each cc1 line and its hash.
 /// \returns the C compile jobs found; empty when there are none.
 static std::vector<CompileJob>
 classifyCompileJobs(llvm::ArrayRef<const char *> args, llvm::StringRef realCC,
+                    const clang::driver::ParsedClangName &targetAndMode,
                     llvm::raw_ostream *log) {
   std::vector<CompileJob> jobs;
 
@@ -220,6 +229,7 @@ classifyCompileJobs(llvm::ArrayRef<const char *> args, llvm::StringRef realCC,
       &silentConsumer, /*ShouldOwnClient=*/false);
   clang::driver::Driver driver(realCC, llvm::sys::getDefaultTargetTriple(),
                                diags);
+  driver.setTargetAndMode(targetAndMode);
   driver.setCheckInputsExist(false);
 
   std::unique_ptr<clang::driver::Compilation> compilation(
@@ -661,6 +671,17 @@ int main(int argc, char **argv) {
   if (!realCC)
     return 1;
 
+  // FR-56 argv0 aliasing: `make CC=cc` (or gcc, g++, a target-prefixed
+  // cross name) with the name symlinked to the shim must behave the way
+  // clang invoked under that name would. The name is parsed with clang's
+  // OWN mechanism — the same ends-with suffix table clang's main consults —
+  // never a hand-rolled table; the result feeds the classification driver
+  // below and is re-inserted into the delegated argv, because the
+  // subprocess runs under the real clang's own name and would otherwise
+  // lose the alias.
+  clang::driver::ParsedClangName targetAndMode =
+      clang::driver::ToolChain::getTargetAndModeFromProgramName(argv[0]);
+
   // Response-file expansion, for the shim's OWN classification only; the
   // delegation below forwards the original argv untouched and lets the real
   // clang expand for itself.
@@ -678,6 +699,13 @@ int main(int argc, char **argv) {
     expandedArgs.assign(argv, argv + argc);
   }
 
+  // Mirror clang's own main exactly: the name-derived driver mode is an
+  // ARGUMENT the driver reads back out of argv (`setTargetAndMode` alone
+  // carries only the name parts), so it is inserted right after argv[0]
+  // before classification.
+  if (targetAndMode.DriverMode)
+    expandedArgs.insert(expandedArgs.begin() + 1, targetAndMode.DriverMode);
+
   if (log) {
     *log << "invocation:";
     for (const char *arg : expandedArgs)
@@ -694,14 +722,23 @@ int main(int argc, char **argv) {
   });
   std::vector<CompileJob> jobs;
   if (hasDashC)
-    jobs = classifyCompileJobs(expandedArgs, *realCC, log);
+    jobs = classifyCompileJobs(expandedArgs, *realCC, targetAndMode, log);
 
   // Delegate to the real clang with the ORIGINAL argv (argv[0] replaced), so
   // every invocation shape — compile, link, -E, -M*, --version, configure
   // probes — behaves exactly as a plain-clang build. Stdout/stderr are
-  // inherited, never captured.
+  // inherited, never captured. The argv0-derived driver mode and target
+  // prefix are re-inserted FIRST (an explicit user flag later on the line
+  // still wins, matching clang's own precedence for name-derived defaults).
   llvm::SmallVector<llvm::StringRef, 64> delegatedArgs;
   delegatedArgs.push_back(*realCC);
+  std::string aliasTargetFlag;
+  if (targetAndMode.DriverMode)
+    delegatedArgs.push_back(targetAndMode.DriverMode);
+  if (targetAndMode.TargetIsValid) {
+    aliasTargetFlag = "--target=" + targetAndMode.TargetPrefix;
+    delegatedArgs.push_back(aliasTargetFlag);
+  }
   for (int i = 1; i < argc; ++i)
     delegatedArgs.push_back(argv[i]);
   std::string execError;
