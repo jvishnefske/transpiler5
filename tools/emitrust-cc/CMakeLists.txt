@@ -30,6 +30,7 @@ set(LIBS
   MLIRConvertToEmitRust
   MLIREmitRustLowerExternalRequirements
   MLIREmitRustActorLift
+  MLIREmitRustActorThread
   MLIRControlFlowToSCF
   MLIRTransforms
   MLIRFuncDialect

@@ -607,6 +607,10 @@ LogicalResult EnumVariantOp::verify() {
   return success();
 }
 
+bool mlir::emitrust::isSendableActorType(Type type) {
+  return isValidStructFieldType(type);
+}
+
 //===----------------------------------------------------------------------===//
 // ActorRuntimeOp
 //===----------------------------------------------------------------------===//
