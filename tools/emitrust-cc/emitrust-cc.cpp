@@ -657,16 +657,21 @@ static mlir::LogicalResult buildCrate(llvm::StringRef outDir) {
 //===----------------------------------------------------------------------===//
 
 /// Loads, extracts, parses, and merges the link-line `inputs` into one
-/// whole-program module (FR-58 slice 1, `--link`). The functional core is
-/// `emitrustcc::findShardPayload` (payload location inside one input) and
-/// `emitrustcc::mergeLinkShards` (the spike-proven merge); this function
-/// owns the file reads and the parse. Each input is an object file whose
-/// `.emitrust` section carries the shard, an object falling back to its
-/// `<object>.emitrust.mlirbc` sidecar, or a shard file named directly —
-/// `parseSourceFile` handles MLIR bytecode and text alike. Every failure
-/// path has printed a diagnostic by the time this returns null.
+/// whole-program module (FR-58 slices 1 and 2, `--link`). The functional
+/// core is `emitrustcc::findShardPayload` (payload location inside one
+/// input), `emitrustcc::findArchivePayloads` (static-archive expansion),
+/// and `emitrustcc::mergeLinkShards` (the spike-proven merge); this
+/// function owns the file reads and the parse. Each input is an object
+/// file whose `.emitrust` section carries the shard, an object falling
+/// back to its `<object>.emitrust.mlirbc` sidecar, a static archive whose
+/// members are expanded in archive order as if listed loose at the
+/// archive's position (a payload-less member warns and is skipped —
+/// members have no sidecar to fall back to), or a shard file named
+/// directly — `parseSourceFile` handles MLIR bytecode and text alike.
+/// Every failure path has printed a diagnostic by the time this returns
+/// null.
 ///
-/// \param inputs the link-line object/shard paths, in link order.
+/// \param inputs the link-line object/archive/shard paths, in link order.
 /// \param context the context to parse and merge in; the EmitRust dialect
 ///        is loaded here because no import will do it.
 /// \returns the merged, verified whole-program module, or null.
@@ -675,6 +680,24 @@ loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
                    mlir::MLIRContext &context) {
   context.loadDialect<mlir::emitrust::EmitRustDialect>();
   llvm::SmallVector<mlir::OwningOpRef<mlir::ModuleOp>> shards;
+  // Parses one shard payload — copied into its own buffer named
+  // `bufferName`, because payloads point into files that die before the
+  // parsed module's string attrs and parser diagnostics do — and appends
+  // it to `shards`.
+  auto parseShard = [&](llvm::StringRef payload,
+                        const llvm::Twine &bufferName) -> mlir::LogicalResult {
+    llvm::SourceMgr sourceMgr;
+    sourceMgr.AddNewSourceBuffer(
+        llvm::MemoryBuffer::getMemBufferCopy(payload, bufferName),
+        llvm::SMLoc());
+    mlir::ParserConfig parserConfig(&context);
+    mlir::OwningOpRef<mlir::ModuleOp> shard =
+        mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, parserConfig);
+    if (!shard)
+      return mlir::failure();
+    shards.push_back(std::move(shard));
+    return mlir::success();
+  };
   for (const std::string &path : inputs) {
     llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> file =
         llvm::MemoryBuffer::getFile(path);
@@ -682,6 +705,27 @@ loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
       llvm::errs() << "error: cannot read '" << path
                    << "': " << file.getError().message() << "\n";
       return nullptr;
+    }
+    if (emitrustcc::isStaticArchive(**file)) {
+      // FR-58 slice 2: expand the archive in place, members in archive
+      // order, exactly as if they had been listed here on the link line.
+      std::string archiveError;
+      mlir::FailureOr<emitrustcc::ArchivePayloads> expanded =
+          emitrustcc::findArchivePayloads(**file, archiveError);
+      if (mlir::failed(expanded)) {
+        llvm::errs() << "error: cannot expand archive '" << path
+                     << "': " << archiveError << "\n";
+        return nullptr;
+      }
+      for (const std::string &member : expanded->skippedMembers)
+        llvm::errs() << "warning: archive member '" << member << "' of '"
+                     << path << "' has no .emitrust payload; skipped\n";
+      for (const emitrustcc::ArchiveMemberPayload &member :
+           expanded->payloads)
+        if (mlir::failed(parseShard(member.payload,
+                                    path + "(" + member.memberName + ")")))
+          return nullptr;
+      continue;
     }
     std::string sectionError;
     mlir::FailureOr<std::optional<llvm::StringRef>> payload =
@@ -691,36 +735,26 @@ loadAndMergeShards(llvm::ArrayRef<std::string> inputs,
                    << "': " << sectionError << "\n";
       return nullptr;
     }
-    std::unique_ptr<llvm::MemoryBuffer> moduleBuffer;
     if (*payload) {
-      // Copied out because the section contents point into `file`, which
-      // dies with this iteration, while parser diagnostics and the parsed
-      // module's string attrs must not.
-      moduleBuffer = llvm::MemoryBuffer::getMemBufferCopy(**payload, path);
-    } else {
-      // FR-57b keeps the sidecar as the non-ELF fallback; honoring it here
-      // is what makes the pair round-trip without objcopy cooperation.
-      std::string sidecar = path + ".emitrust.mlirbc";
-      llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> side =
-          llvm::MemoryBuffer::getFile(sidecar);
-      if (!side) {
-        llvm::errs() << "error: object '" << path
-                     << "' has no .emitrust section and its sidecar '"
-                     << sidecar
-                     << "' cannot be read: " << side.getError().message()
-                     << "\n";
+      if (mlir::failed(parseShard(**payload, path)))
         return nullptr;
-      }
-      moduleBuffer = std::move(*side);
+      continue;
     }
-    llvm::SourceMgr sourceMgr;
-    sourceMgr.AddNewSourceBuffer(std::move(moduleBuffer), llvm::SMLoc());
-    mlir::ParserConfig parserConfig(&context);
-    mlir::OwningOpRef<mlir::ModuleOp> shard =
-        mlir::parseSourceFile<mlir::ModuleOp>(sourceMgr, parserConfig);
-    if (!shard)
+    // FR-57b keeps the sidecar as the non-ELF fallback; honoring it here
+    // is what makes the pair round-trip without objcopy cooperation.
+    std::string sidecar = path + ".emitrust.mlirbc";
+    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> side =
+        llvm::MemoryBuffer::getFile(sidecar);
+    if (!side) {
+      llvm::errs() << "error: object '" << path
+                   << "' has no .emitrust section and its sidecar '"
+                   << sidecar
+                   << "' cannot be read: " << side.getError().message()
+                   << "\n";
       return nullptr;
-    shards.push_back(std::move(shard));
+    }
+    if (mlir::failed(parseShard((*side)->getBuffer(), sidecar)))
+      return nullptr;
   }
   mlir::FailureOr<mlir::OwningOpRef<mlir::ModuleOp>> merged =
       emitrustcc::mergeLinkShards(shards);

@@ -1882,6 +1882,18 @@ of references or inheritance, so it precedes both.
   and ledgered), but those items are recoverable ONLY with whole-program
   facts, so FR-58 is merge + SELECTIVE RE-IMPORT of fact-starved items
   (the ledger identifies them), not pure concatenation.
+  LANDED (slice 2): static ARCHIVE inputs -- a `.a` on the link line
+  (detected by magic, not extension) expands its members in archive order,
+  reusing the object payload extraction; a member without a `.emitrust`
+  payload warns and is skipped (real builds archive hand-written-asm
+  objects). Archive-vs-loose linking is byte-identical. Shape-conflict
+  detection upgraded from print-equality to
+  `OperationEquivalence::isEquivalentTo` (IgnoreLocations) with the same
+  located error contract; same-layout different-field-name structs conflict,
+  byte-identical defs dedup silently. (test/Driver/link-merge-archive.c,
+  link-merge-errors.c) Still open: selective re-import of fact-starved
+  items, the owner-planning soleTranslationUnit divergence, indexed scans
+  at 10^3+ TUs.
   SPIKE 3 (GO -- the merge algorithm is now fully experiment-specified): on
   a shared-header project where BOTH shards carry identical
   `struct_def @Point` / `enum_def @Mode`, the mechanical merge extended
