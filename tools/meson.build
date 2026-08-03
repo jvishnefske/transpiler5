@@ -34,6 +34,7 @@ emitrust_import_c = executable('emitrust-import-c',
 
 emitrust_cc = executable('emitrust-cc',
   'emitrust-cc/emitrust-cc.cpp',
+  'emitrust-cc/ActorLiftPlan.cpp',
   'emitrust-cc/ActorPlan.cpp',
   'emitrust-cc/CrateEmitter.cpp',
   'emitrust-cc/LinkMerge.cpp',

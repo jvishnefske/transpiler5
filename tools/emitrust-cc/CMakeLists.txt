@@ -47,6 +47,7 @@ set(LIBS
 
 add_llvm_executable(emitrust-cc
   emitrust-cc.cpp
+  ActorLiftPlan.cpp
   ActorPlan.cpp
   CrateEmitter.cpp
   LinkMerge.cpp

@@ -438,6 +438,13 @@ ActorPlan emitrustcc::planActors(
     return footprint;
   };
 
+  // FR-62 slice 4: the surviving merge roots produced by a POISON-driven
+  // condensation (a poisoned function's footprint is the whole universe).
+  // Tracked as indices into `names` so later merges re-root them; resolved
+  // to final actors after condensation. Ordinary writer-rule/SCC merges do
+  // not mark — a pure "@stdout" writer merge stays certifiable.
+  std::set<unsigned> poisonedRoots;
+
   // R1: a non-trivial call-graph SCC is one emission unit; if its combined
   // closure footprint spans several actors, they merge. Iterative Tarjan,
   // roots and successors in sorted order for determinism.
@@ -498,9 +505,11 @@ ActorPlan emitrustcc::planActors(
     llvm::sort(components);
     for (const llvm::SmallVector<std::string> &component : components) {
       std::set<std::string> footprint;
+      bool viaPoison = false;
       for (const std::string &member : component) {
         std::set<std::string> fp = readWriteFootprint(member);
         footprint.insert(fp.begin(), fp.end());
+        viaPoison |= poisoned.count(member) != 0;
       }
       llvm::SmallVector<std::string> roots = actorsOf(footprint);
       if (roots.size() < 2)
@@ -509,6 +518,8 @@ ActorPlan emitrustcc::planActors(
           ("call cycle " + braceJoin(component) + " spans actors " +
            braceJoin(roots) + "; merged into '" + roots.front() + "'"));
       mergeInto(roots);
+      if (viaPoison)
+        poisonedRoots.insert(merged.find(nameIndex.at(roots.front())));
     }
   }
 
@@ -536,6 +547,8 @@ ActorPlan emitrustcc::planActors(
                              : "closure-writes globals of actors ") +
          braceJoin(roots) + "; merged into '" + roots.front() + "'"));
     mergeInto(roots);
+    if (poisoned.count(fn))
+      poisonedRoots.insert(merged.find(nameIndex.at(roots.front())));
   }
 
   // -- 5. Final maps.
@@ -557,6 +570,14 @@ ActorPlan emitrustcc::planActors(
     unsigned actorIndex = finalIndex.at(finalActorOf.at(element));
     plan.actors[actorIndex].globals.push_back(element);
     plan.actorOfGlobal.push_back({element, actorIndex});
+  }
+  // FR-62 slice 4: resolve the poison-merge roots to final actors. A
+  // recorded root may itself have been merged further; `merged.find`
+  // yields whichever name survived.
+  for (unsigned root : poisonedRoots) {
+    auto it = finalIndex.find(names[merged.find(root)]);
+    if (it != finalIndex.end())
+      plan.actors[it->second].poisoned = true;
   }
 
   for (const std::string &fn : defined) {
@@ -580,6 +601,12 @@ ActorPlan emitrustcc::planActors(
       assignment.actor = finalIndex.at(*roots.begin());
     } else {
       assignment.role = ActorRole::Cross;
+      // FR-62 slice 4: the client's per-actor parameter list. `roots` is a
+      // name-sorted std::set and `plan.actors` is name-sorted, so the
+      // resulting indices are sorted too — the deterministic parameter
+      // order the lift and every call site agree on.
+      for (const std::string &root : roots)
+        assignment.crossActors.push_back(finalIndex.at(root));
     }
     plan.actorOfFunction.push_back(std::move(assignment));
   }
