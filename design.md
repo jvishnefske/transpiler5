@@ -2834,6 +2834,52 @@ of references or inheritance, so it precedes both.
   merit. The owner's "message based" surface is thus not dropped but
   lands exactly where messages are load-bearing.
 
+  SLICE 2 LANDED (2026-08-03; box stays OPEN): `--emit=actor-plan` on
+  emitrust-cc — the E5 FROZEN `planActors` implemented verbatim as a pure
+  core (tools/emitrust-cc/ActorPlan.h/.cpp, Partition.cpp's architecture
+  and parser shape) plus driver wiring in both modes: a pure project
+  analysis from the FR-40 graph in source mode (no import), a pure
+  artifact query over the shards' stored FR-57d graph texts under
+  `--link` (no merge, no re-import; internal-linkage symbols retagged by
+  link-line ordinal so file-statics key as (unit, symbol) — pinned in
+  test/Driver/actor-plan-link.c with two same-named statics landing in
+  two actors). The OUTPUT FORMAT is a pinned contract in ActorPlan.h:
+  `actor <name> globals=<comma-joined-sorted>`, `fn <symbol>
+  role=<arm|driver|free|cross> actor=<name-or-->`, `note <free text>`,
+  one fact per line, whole space-separated tokens, actors sorted by name
+  and functions by symbol, byte-identical across runs (double-run diffs
+  in actor-plan-basic.c and actor-plan-link.c). Two SEMANTIC UPGRADES
+  over the E5 prototype, both bought by slice 1: (1) "@stdout" is TOTAL
+  — a Calls edge to a project-undefined printf/puts/putchar/fprintf/
+  fwrite is a write of the pseudo-global; sprintf/snprintf are
+  graph-visible sinks but deliberately NOT "@stdout" touches, because
+  emitSprintf writes the caller's BUFFER with no output effect
+  (measured consequence: byte-region-walk goes from E5's 3 actors with
+  print_/walk_w mis-roled free to 4 actors with both as @stdout arms);
+  (2) AddressOfGlobal is a WRITE for seeding and the writer rule
+  (actor-plan-address-of.c: `both`, whose closure only address-takes,
+  now condenses LEFT/RIGHT where E5 mis-roled it a harmless cross
+  reader), and a global→global address edge makes pointer and pointee
+  ONE actor — E1's rule — silently via seeding when unpinned, via a
+  noted condensation when an override pins them apart (measured
+  consequence: pointers-global folds cursor P with pointee X, matching
+  E1's hand-written twin where E5 kept them split). `--actor-map`
+  mirrors `--partition-map` exactly: one `<symbol-prefix> <actor-name>`
+  per line, longest prefix wins, pinned BEFORE condensation and excluded
+  from seeding, so overrides can widen or name but never split what the
+  writer/SCC rules require whole (actor-plan-map.c pins the forced
+  merge-back note, the malformed-line error, and the
+  `--actor-map requires --emit=actor-plan` gate); names stay verbatim
+  plan-text tokens (an embedded space is malformed), not cargo-sanitized.
+  Rule coverage: SCC condensation in actor-plan-scc.c, CallsIndirect
+  universe poison in actor-plan-poison.c (poison merges everything it
+  sees, then the survivor plan is self-consistent: `run` becomes an arm
+  of the single merged actor). Driver prints each note as
+  `warning: actor plan: <note>`. Suite 470/470. No deviation from the
+  frozen header beyond deleting its now-false DIRECTION GAP caveat
+  (slice 1 closed the gap) and adding the additive `renderActorPlan`
+  declaration beside the frozen types.
+
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
