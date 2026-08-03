@@ -1984,6 +1984,23 @@ of references or inheritance, so it precedes both.
     bucket) into genuine `while <cond> { .. }` renderings, with the
     impure-condition 5% legitimately staying `loop`. That is an
     importer/conversion FR, out of emitter scope.
+    SPIKE 61c-1 (2026-08-03): GO. `emitrust.while` prototyped end to end
+    (dialect op with condition region + `emitrust.condition` terminator;
+    conversion-time lift in WhileLowering; emitter folds the condition
+    chain into the head via the FR-61d capture machinery, Cond position).
+    The REAL lift-cf-to-scf canonical form was discovered en route: the
+    loop body lives in the BEFORE-region as a cond-guarded `scf.if` (exit
+    defaults in its else-yield), the after-region is a forwarder -- so
+    the lift recognizes {pure prefix; body-if; condition} and splits it:
+    prefix -> condition region, then-arm + after ops -> body, else-yields
+    -> the loop's replacement values. No result lets, no exit copies, no
+    tail break. Conversion count: 201 of 304 corpus scf.whiles lift
+    (66%); the 103 fallbacks are impure/entangled shapes that keep
+    today's `loop` lowering. One liveness correction found by the E0384
+    guard exactly as designed: `analyzeControl` needed an explicit
+    WhileOp case (generic fallback missed write-recurrence ->
+    `loopReassign`); with it, EndToEnd 123/123 byte-diff green with the
+    lift firing at 201 sites. Slice lands with this spike.
   - [x] 61d Expression-tree inlining: fold single-use scalar `let vN`
     temporaries into their one consumer where evaluation order provably
     cannot change (loads/pure ops only; SPIKE FIRST -- this is the largest
