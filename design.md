@@ -2187,6 +2187,38 @@ of references or inheritance, so it precedes both.
   reject; the rejection ledger aggregates into a queryable per-construct
   report (inline asm, volatile, container_of, attributes) that ranks what
   semantic work buys the most frontier.
+  LANDED (FR-60a, the two artifact queries). Both are PURE queries over
+  the FR-57d shard artifacts — no merge, no re-import, no C parsed — so
+  they scale to a kernel link line and stay deterministic functions of the
+  artifacts alone.
+  `--link --emit=rejection-report`: the per-construct report, grouped by
+  the `classifyBlocker` TAG. SPIKE settled the normalization question:
+  every shard ledger entry already carries BOTH the free-text diagnostic
+  AND the tag, and the tag vocabulary IS the normalization table (shared
+  verbatim with the RealWorld survey, so report and survey rank the same
+  language; measured: inline asm arrives as `unsupported-stmt:GCCAsmStmt`,
+  allocator use as `dynamic-memory`, system-header calls as
+  `libc:<name>`, volatile in the `other` bucket). Within a tag the
+  distinct diagnostic WORDINGS are tabulated with single-quoted spans
+  normalized to `'<name>'` (collapsing per-symbol variants — the
+  visibility that makes `other` actionable), ranked by item count then
+  tag, each tag citing its first location and its TU spread. Pinned on a
+  3-TU project rejecting on four distinct constructs
+  (test/Driver/link-rejection-report.c).
+  `--link --emit=ratchet [--partition] [--ratchet-baseline <file>]`: the
+  per-project manifest — `emitrust ratchet manifest v1` — recording
+  admitted items per shard (module-level definitions minus ledgered
+  stubs; shards keyed by source path RELATIVE to the common directory
+  prefix, so a committed manifest is checkout-portable) and total, the
+  FR-59 partition facts (crate count + condensation-warning count,
+  planned over the RAW shards; 1/0 without --partition), and the per-tag
+  rejection snapshot. The baseline comparison keeps the c-testsuite
+  ratchet's direction rules, per the pinned wordings: an admitted SHRINK
+  (total, per shard, or a shard vanishing) or a condensation GROWTH is an
+  error; growth passes with an improvement note and the freshly written
+  manifest is the update (test/Driver/link-ratchet.c pins manifest
+  content, all four directions, the single-crate identity, and the
+  gates). (tools/emitrust-cc/RatchetReport.h)
 - [x] FR-61 Rustacean-style emission. The emitted Rust should read as
   expression-oriented Rust, not statement-per-op SSA transliteration; every
   slice is a pure EMITTER rendering change whose oracle is the EndToEnd

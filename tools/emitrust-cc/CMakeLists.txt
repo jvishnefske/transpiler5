@@ -49,6 +49,7 @@ add_llvm_executable(emitrust-cc
   CrateEmitter.cpp
   LinkMerge.cpp
   Partition.cpp
+  RatchetReport.cpp
   ProgressReport.cpp
   )
 llvm_update_compile_flags(emitrust-cc)
