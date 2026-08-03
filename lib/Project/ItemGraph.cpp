@@ -47,14 +47,22 @@
 /// NAMING IS CALLED, NOT COPIED. Function and global symbols come from
 /// `cFunctionSymbolName`/`cGlobalSymbolName` — literally the functions
 /// `CImporter::mlirFuncName`/`globalVarSymbolName` are wrappers over — and
-/// record/enum symbols from `recordRustName`. The one place the graph
-/// cannot follow the importer is the part of record naming that depends on
-/// accumulated import state (`CImporter::structSymbolName`'s tag-versus-
-/// ordinary-identifier rename, the `Anon<n>` shape keying, the block-scope
-/// `<function>_<tag>` mangle); rather than mirror that logic and let it
-/// drift, records and enums whose emitted name would depend on it are NOT
-/// nodes at all (see `recordSymbolFor`). A missing node is a visible,
-/// honest gap; a wrong node key would silently corrupt every consumer.
+/// record/enum symbols from `recordRustName`. The tag-versus-ordinary-
+/// identifier rename of `CImporter::structSymbolName` is REPRODUCED
+/// (FR-62, pass 0 below): its trigger is not accumulated import state but
+/// the per-TU ordinary-name pre-scan (`collectOrdinaryNames`), which this
+/// file mirrors decl-for-decl over the same symbol-naming calls, with the
+/// earlier TUs' scans standing in for `ordinaryNameTaken`'s already-
+/// imported-symbol component (equivalent for every importable program: a
+/// TU's pre-scan is exactly the set of ordinary module symbols it goes on
+/// to claim). What still cannot be followed is naming that DOES depend on
+/// import state (the `Anon<n>` shape keying, the block-scope
+/// `<function>_<tag>` mangle); records and enums whose emitted name would
+/// depend on it are NOT nodes at all (see `recordSymbolFor`). A missing
+/// node is a visible, honest gap; a wrong node key would silently corrupt
+/// every consumer — which is precisely what the pre-fix `struct G` /
+/// global `g` key collision did, and why the rename is reproduced rather
+/// than left as a known gap.
 //
 //===----------------------------------------------------------------------===//
 
@@ -255,6 +263,37 @@ public:
 
 private:
   //===--------------------------------------------------------------------===//
+  // Pass 0: per-TU ordinary-identifier names (FR-62 rename reproduction)
+  //===--------------------------------------------------------------------===//
+
+  /// Records into `tuOrdinaryNames[tuIndex]` every module symbol `context`'s
+  /// ordinary identifier namespace will claim, mirroring
+  /// `CImporter::collectOrdinaryNamesFrom` decl-for-decl over the same
+  /// naming calls: function symbols (`cFunctionSymbolName`), file-scope
+  /// variable symbols (`cGlobalSymbolName`), and function-local statics
+  /// under their `<function>_<name>` mangle (`collectStaticLocalNames`).
+  /// One deliberate guard the importer's walk does not need: a
+  /// `FunctionDecl` whose declaration name is not a plain identifier (an
+  /// out-of-line constructor/destructor/operator) is skipped, since
+  /// `getName` is only defined for identifiers — such a name can never
+  /// collide with a record's UpperCamel spelling anyway.
+  void collectOrdinaryNames(const clang::DeclContext *context);
+
+  /// The static-local half of the pre-scan: every `static` local of a
+  /// function body claims `globalRustName(<function>_<name>)` at module
+  /// level (the importer's `collectStaticLocalNames`, reproduced).
+  void collectStaticLocalNames(const clang::Stmt *stmt,
+                               llvm::StringRef funcSymbol);
+
+  /// Whether `name` is claimed by the ordinary identifier namespace as the
+  /// importer would see it while importing the CURRENT TU:
+  /// `CImporter::ordinaryNameTaken` consults the current TU's pre-scan plus
+  /// every already-imported non-struct module symbol, and TUs import in
+  /// project order, so the union of scans `0..tuIndex` reproduces both
+  /// components for every importable program.
+  bool ordinaryNameTaken(llvm::StringRef name) const;
+
+  //===--------------------------------------------------------------------===//
   // Pass 1: nodes
   //===--------------------------------------------------------------------===//
 
@@ -340,12 +379,19 @@ private:
   // Symbols and edges
   //===--------------------------------------------------------------------===//
 
-  /// The emitted symbol of `record`, or empty when the graph deliberately
-  /// declines to name it: an anonymous record (the importer would assign a
-  /// shape-keyed `Anon<n>`) or a non-file-scope one (the importer would
-  /// apply the `<function>_<tag>` block-scope mangle). Both namings depend
-  /// on accumulated import state the graph does not carry — see this file's
-  /// header comment for why an omitted node beats a guessed one.
+  /// The emitted symbol of `record`: `recordRustName`, renamed to the
+  /// `Struct_<tag>` spelling through the same `typeRustName` composition
+  /// `CImporter::structSymbolName` uses when the ordinary identifier
+  /// namespace claims the tag spelling (FR-62 — the fix for the
+  /// `struct G` / global `g` node-key collision). Empty when the graph
+  /// deliberately declines to name it: an anonymous record (the importer
+  /// would assign a shape-keyed `Anon<n>`), a non-file-scope one (the
+  /// importer would apply the `<function>_<tag>` block-scope mangle) —
+  /// both namings depend on accumulated import state the graph does not
+  /// carry — or a record whose renamed spelling is ALSO claimed, which
+  /// `structSymbolName` rejects outright, so no emitted name exists to
+  /// match. See this file's header comment for why an omitted node beats a
+  /// guessed one.
   std::string recordSymbolFor(const clang::RecordDecl *record) const;
 
   /// The emitted symbol of `enumDecl`, or empty for an anonymous enum
@@ -379,6 +425,11 @@ private:
   void collectTypeEdges(clang::QualType type, llvm::StringRef from,
                         EdgeKind kind);
 
+  /// Pass 0 result: `tuOrdinaryNames[i]` is TU `i`'s pre-scanned ordinary
+  /// module symbols. Queried through `ordinaryNameTaken` only; never
+  /// iterated, so the container's order never reaches the boundary.
+  std::vector<std::set<std::string>> tuOrdinaryNames;
+
   /// The translation unit currently being walked.
   unsigned tuIndex = 0;
   /// The per-TU mangling tag of the unit currently being walked, `tu<i>_`.
@@ -391,6 +442,59 @@ private:
   /// Dependencies, deduplicated and ordered by construction.
   std::set<ItemEdge, EdgeOrder> edges;
 };
+
+//===----------------------------------------------------------------------===//
+// Pass 0: per-TU ordinary-identifier names
+//===----------------------------------------------------------------------===//
+
+void ItemGraphBuilder::collectStaticLocalNames(const clang::Stmt *stmt,
+                                               llvm::StringRef funcSymbol) {
+  if (!stmt)
+    return;
+  if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt))
+    for (const clang::Decl *decl : declStmt->decls())
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+        if (var->isStaticLocal())
+          tuOrdinaryNames[tuIndex].insert(globalRustName(
+              (llvm::Twine(funcSymbol) + "_" + var->getName()).str()));
+  for (const clang::Stmt *child : stmt->children())
+    collectStaticLocalNames(child, funcSymbol);
+}
+
+void ItemGraphBuilder::collectOrdinaryNames(const clang::DeclContext *context) {
+  for (const clang::Decl *decl : context->decls()) {
+    if (decl->isImplicit() || isSystemHeaderDecl(*sourceManager, decl))
+      continue;
+    if (const auto *linkageSpec =
+            llvm::dyn_cast<clang::LinkageSpecDecl>(decl)) {
+      collectOrdinaryNames(linkageSpec);
+      continue;
+    }
+    if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(decl)) {
+      collectOrdinaryNames(ns);
+      continue;
+    }
+    if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+      if (!func->getDeclName().isIdentifier())
+        continue;
+      std::string symbol = cFunctionSymbolName(func, tuTag);
+      if (func->hasBody())
+        collectStaticLocalNames(func->getBody(), symbol);
+      tuOrdinaryNames[tuIndex].insert(std::move(symbol));
+      continue;
+    }
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+      tuOrdinaryNames[tuIndex].insert(cGlobalSymbolName(var, tuTag));
+  }
+}
+
+bool ItemGraphBuilder::ordinaryNameTaken(llvm::StringRef name) const {
+  for (unsigned i = 0, e = tuIndex + 1;
+       i < e && i < tuOrdinaryNames.size(); ++i)
+    if (tuOrdinaryNames[i].count(name.str()))
+      return true;
+  return false;
+}
 
 //===----------------------------------------------------------------------===//
 // Pass 1: nodes
@@ -510,7 +614,18 @@ ItemGraphBuilder::recordSymbolFor(const clang::RecordDecl *record) const {
     return {};
   if (!definition->getDeclContext()->getRedeclContext()->isFileContext())
     return {};
-  return recordRustName(definition);
+  std::string base = recordRustName(definition);
+  if (base.empty() || !ordinaryNameTaken(base))
+    return base;
+  // The tag yields to the ordinary namespace, deterministically, exactly as
+  // in `CImporter::structSymbolName` (C's tag namespace is separate, C99
+  // 6.2.3; the module symbol table is not). The composition is the
+  // importer's own: under the idiomatic rename `typeRustName` re-camels the
+  // joined spelling, so `struct G` emits — and keys — as `StructG`.
+  std::string renamed = typeRustName("Struct_" + base);
+  if (ordinaryNameTaken(renamed))
+    return {}; // The importer rejects this program; no emitted name exists.
+  return renamed;
 }
 
 std::string
@@ -883,6 +998,16 @@ void ItemGraphBuilder::collectDependencies(const clang::DeclContext *context) {
 //===----------------------------------------------------------------------===//
 
 ItemGraph ItemGraphBuilder::build(llvm::ArrayRef<clang::ASTUnit *> units) {
+  // Pass 0 over every unit before pass 1 over any of them: a record's node
+  // key needs its TU's (and every earlier TU's) ordinary names to decide
+  // the `Struct_<tag>` rename, and pass 1 already forms record keys.
+  tuOrdinaryNames.assign(units.size(), {});
+  for (auto [index, unit] : llvm::enumerate(units)) {
+    tuIndex = static_cast<unsigned>(index);
+    tuTag = ("tu" + llvm::Twine(index) + "_").str();
+    sourceManager = &unit->getASTContext().getSourceManager();
+    collectOrdinaryNames(unit->getASTContext().getTranslationUnitDecl());
+  }
   // Pass 1 over every unit before pass 2 over any of them: the closure
   // invariant needs the complete node set, and cross-TU edges (a call from
   // TU 1 into a function defined in TU 0) would otherwise depend on the

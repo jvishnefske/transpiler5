@@ -59,14 +59,26 @@
 ///
 /// Scope and deliberate omissions, so callers know what the graph does NOT
 /// claim:
-///  - Records/enums whose emitted name depends on accumulated import state
-///    are named by their C spelling only: the tag-versus-ordinary-identifier
-///    collision rename (`Struct_<tag>`), the shape-keyed `Anon<n>` naming of
-///    bare anonymous records, and the `<function>_<tag>` block-scope mangle
-///    all live in `CImporter::structSymbolName`/`importRecord` and are not
-///    reproduced here. Consequently only NAMED, FILE-SCOPE records and enums
-///    become nodes; an anonymous or block-scope one is skipped entirely
-///    rather than given a name that might not match the emitted item.
+///  - Record naming reproduces the tag-versus-ordinary-identifier collision
+///    rename (FR-62): a record whose UpperCamel tag spelling is claimed by
+///    the ordinary identifier namespace — the same per-TU pre-scan
+///    `CImporter::collectOrdinaryNames` runs (function symbols, file-scope
+///    variable symbols, static-local mangles), plus the earlier TUs' scans
+///    standing in for `ordinaryNameTaken`'s already-imported symbols — is
+///    keyed `Struct_<tag>` through the same `typeRustName` composition
+///    `structSymbolName` uses, so `struct G` next to global `g` keys as
+///    `StructG` beside `G` exactly as emitted. When even the renamed
+///    spelling is claimed (a program the importer rejects outright) the
+///    record is skipped rather than given a wrong key. Still NOT reproduced,
+///    because they depend on accumulated import state: the shape-keyed
+///    `Anon<n>` naming of bare anonymous records and the `<function>_<tag>`
+///    block-scope mangle. Consequently only NAMED, FILE-SCOPE records and
+///    enums become nodes; an anonymous or block-scope one is skipped
+///    entirely rather than given a name that might not match the emitted
+///    item. Enums keep their bare `enumTypeRustName` spelling: the importer
+///    has no enum rename, and an enum whose name an ordinary identifier
+///    claims is a program the importer rejects ("collides with an existing
+///    symbol"), so no emitted name exists to match.
 ///  - C++ member functions are not nodes. `importDeclsIn` never reaches them
 ///    (they are declared inside a `CXXRecordDecl`, not at item scope), and
 ///    their emitted name comes from `CImporter::cxxMethodMangledName`, which
