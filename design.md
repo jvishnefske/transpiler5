@@ -3423,6 +3423,53 @@ rule.
   prototypes/extern decls (generic `ptr-to-ptr`; a shard that sees only
   the prototype keeps rejecting — FR-58's signature-starvation axis is
   the recorded future path for cross-TU definitions).
+  SLICE 1 LANDED (2026-08-03; box stays OPEN — the member-pointer,
+  global-target, and cross-TU fronts remain). What is admitted now,
+  validated by tests: Shape S over ANY slice-valid element
+  (`isDataPointerPointerType` + `mapCursorParamSliceType`; int** pinned
+  in test/Import/C/pointers-cursor-param-general.c beside a
+  byte-behavior-unchanged char** twin; `(*p)++` advancement newly routes
+  to the cursor cell), and Shape P, the strtol/endp paired out-cursor
+  (planning classification in `planCursorParamsFor`, one-input
+  `&mut i64` lowering, direct AssignOp write, call-site staged temp with
+  the co-cursor reslice correction and caller-side region join via
+  `pairedArgQuery`; pinned in pointers-cursor-param-paired.c and its
+  -invalid split-file twin). Runnable proof:
+  test/EndToEnd/cursor-param-paired.c byte-diffs a three-round
+  strtol-style walk (rounds 2+ pass a nonzero-cursor pointer local as
+  the co-argument — the shape that would miscompile without the
+  coordinate correction) plus an int** self-walking summer against
+  clang-native; stdout and exit byte-identical. New ledger tags (C++
+  table + Python twin, rows above the generic `ptr-to-ptr`):
+  `ptr-to-ptr-shape-escape` (escapes, content write-through,
+  disagreeing/unrooted/conditional P writes), `ptr-to-ptr-null-write`,
+  `ptr-to-ptr-global-target`. Wording note: the mapParamType
+  "pointer-to-pointer parameter" rejection kept its generic wording and
+  tag — the planned `ptr-to-ptr-no-def` split was measured off because
+  class-scope C++ method definitions reach mapParamType without a
+  cursor plan (planCursorParams walks only top-level decls), so the
+  wording cannot claim "no visible definition". Cast on a P write RHS
+  (`*endp = (char *)cp`) stays rejected (CStyleCastExpr) — recorded
+  follow-up. KERNEL BASELINE REFRESHED (same corpus + FR-60b
+  environment, shim rebuild `make LLVM=1 CC=emitrust-clang -j24` EXIT 0
+  in 2m07s with unwrapped clang+lld on PATH and HOSTCC=gcc for host
+  tools — the nix loader detail that FR-60b's host binaries embedded;
+  queries ~1.5s): admitted-total 89,799 -> 89,939 (+140, tool-verified
+  "ratchet improvement" against the committed baseline), rejected-total
+  110,571 -> 110,433. The old rank-7 `ptr-to-ptr` 1,166 split into
+  `ptr-to-ptr-shape-escape` 522 (54 TUs, definitions now entering
+  cursor planning and rejecting at their located escape) +
+  `ptr-to-ptr` 238 (89 TUs, prototypes/T***/void**) with the remaining
+  ~400 items either imported or moved to more specific downstream
+  wordings; zero kernel items hit the null-write/global-target tags
+  (check_cpu's family rejects earlier, on shape). One shard was added:
+  scripts/mod/empty.c (admitted=0, rejected=2 pre-existing
+  compiler_types.h header items) now appears in the manifest — an
+  object-enumeration delta from the FR-60 tolerant-query work, growth
+  direction, gate-legal. Remaining fronts unchanged: intrusive
+  member-pointer containers (rank 5), global out-param targets ->
+  FR-62, prototypes/cross-TU -> FR-58 signature starvation, argv ->
+  W4.3.
 - [x] C99-44 Unions. DECIDED and SHIPPED: the one-slot struct model —
   a supported subset with documented located rejections, not an enum
   mapping and not a blanket rejection. A named or untagged union
