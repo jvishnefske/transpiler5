@@ -16,8 +16,7 @@ emitrust.trait_def @Externals ["host_scale", "host_reset", "host_mix"]
 // A function in the closure carries the bound; the call sites were already
 // requalified by the lowering pass, so the emitter only renders them.
 // CHECK:      fn scaled<E: Externals>(v0: i32) -> i32 {
-// CHECK-NEXT:     let v1: i32 = E::host_scale(v0);
-// CHECK-NEXT:     return v1;
+// CHECK-NEXT:     E::host_scale(v0)
 // CHECK-NEXT: }
 emitrust.func @scaled(%arg0: i32) -> i32
     attributes {emitrust.externals_generic = "Externals"} {
@@ -28,7 +27,7 @@ emitrust.func @scaled(%arg0: i32) -> i32
 // A function that needs nothing keeps exactly the signature it always had --
 // no type parameter, no turbofish.
 // CHECK:      fn pure(v0: i32) -> i32 {
-// CHECK-NEXT:     return v0;
+// CHECK-NEXT:     v0
 // CHECK-NEXT: }
 emitrust.func @pure(%arg0: i32) -> i32 {
   emitrust.return %arg0 : i32

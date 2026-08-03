@@ -11,7 +11,6 @@ emitrust.verbatim "// module-level marker"
 // The mut-marked let's only assignment is a dropped dead store, so the
 // emitted binding needs no `mut` either.
 // CHECK-NEXT:    let _v2: i32 = v0;
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @bindings(%arg0: i32) {
   %0 = emitrust.let %arg0 : i32
@@ -24,7 +23,6 @@ emitrust.func @bindings(%arg0: i32) {
 // CHECK-NEXT:    consume(v0);
 // CHECK-NEXT:    let _v2: i32 = produce(v0, v1);
 // CHECK-NEXT:    let (_v3, _v4): (i32, i64) = pair(v0);
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @calls(%arg0: i32, %arg1: i32) {
   emitrust.call_opaque "consume"(%arg0) : (i32) -> ()
@@ -36,8 +34,7 @@ emitrust.func @calls(%arg0: i32, %arg1: i32) {
 // A select renders as a let binding of a Rust if expression.
 // CHECK-LABEL: fn selects(v0: bool, v1: i32, v2: i32) -> i32 {
 // CHECK-NEXT:    let v3: i32 = if v0 { v1 } else { v2 };
-// CHECK-NEXT:    let v4: i32 = if v0 { v3 } else { v1 };
-// CHECK-NEXT:    return v4;
+// CHECK-NEXT:    if v0 { v3 } else { v1 }
 // CHECK-NEXT:  }
 emitrust.func @selects(%arg0: i1, %arg1: i32, %arg2: i32) -> i32 {
   %0 = emitrust.select %arg0, %arg1, %arg2 : i32

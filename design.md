@@ -1928,15 +1928,25 @@ of references or inheritance, so it precedes both.
   slice is a pure EMITTER rendering change whose oracle is the EndToEnd
   byte-diff (behavior identical; golden-text churn expected and updated per
   slice). Corpus-measured opportunity (473 functions):
-  - [ ] 61a Tail-expression returns: a function-final `return v;` renders as
+  - [x] 61a Tail-expression returns: a function-final `return v;` renders as
     the tail expression `v`, and when `v` is a single-use binding defined by
     the immediately preceding `let v = <expr>;` the pair folds to the tail
     `<expr>` (115 corpus sites). `return` in non-tail positions stays.
-  - [ ] 61b If-expression bindings: a deferred `let x: T;` immediately
+  - [x] 61b If-expression bindings: a deferred `let x: T;` immediately
     followed by an `if` whose BOTH arms end with their only `x = ...;`
     assignment renders as `let x: T = if c { ...; a } else { ...; b };`
     (24 corpus sites; the deferredInits analysis already identifies exactly
     these bindings).
+    LANDED 61a+61b: emitter-rendered `return` statements are ZERO
+    corpus-wide (every residual `return` lives in verbatim runtime shims);
+    61b fires at 248 sites across 66 of 95 emitted crates. A dialect fact
+    discovered en route: `emitrust.return` is a FuncOp-parented terminator,
+    so a non-tail `return` cannot exist in the dialect -- the CF lift
+    already funnels early exits to a single exit -- making 61a total, not
+    partial. Byte-diff oracle held untouched; unsafe count 0 across all 95
+    crates. (test/Target/Rust/tail-expr.mlir, control-flow.mlir 61b cases,
+    plus expectation churn across the Target/Driver goldens, every line
+    explained by 61a/61b.)
   - [ ] 61c While-lift: `loop { ...; if c { break } ... }` shapes back to
     `while`/`while let` where the SCF lowering's shape allows (172 corpus
     `loop {`s; SPIKE FIRST -- the condition prefix is statements, not an

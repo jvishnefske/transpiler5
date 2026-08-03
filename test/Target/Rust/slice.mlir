@@ -28,6 +28,6 @@ emitrust.func @slice_place(%arg0: !emitrust.mut_ref<!emitrust.slice<i32>>, %arg1
   // Reslicing a dereferenced slice place composes.
   // CHECK: let _v3: &mut [i32] = &mut (*v0)[v1 as usize..];
   %t = emitrust.slice_of mut %s[%arg1] : (!emitrust.lvalue<!emitrust.slice<i32>>, i64) -> !emitrust.mut_ref<!emitrust.slice<i32>>
-  // CHECK: return v2;
+  // CHECK: v2
   emitrust.return %v : i32
 }

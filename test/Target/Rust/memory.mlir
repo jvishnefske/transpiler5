@@ -20,7 +20,6 @@ emitrust.struct_def @Empty [] []
 // CHECK-NEXT:    let v0: Empty = Empty::default();
 // CHECK-NEXT:    let _v1: Empty = v0;
 // CHECK-NEXT:    let _v2: Empty = Empty::default();
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @empty_struct_value() {
   %a = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Empty">>
@@ -38,7 +37,6 @@ emitrust.func @empty_struct_value() {
 // CHECK-NEXT:    let _v4: Point = Point::default();
 // CHECK-NEXT:    let _v5: [i32; 4] = [0; 4];
 // CHECK-NEXT:    let _v6: [Point; 2] = [Point::default(); 2];
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @defaults() {
   %0 = emitrust.variable <42 : i32> : !emitrust.lvalue<i32>
@@ -54,8 +52,7 @@ emitrust.func @defaults() {
 // CHECK-LABEL: fn fields(v0: i32) -> i32 {
 // CHECK-NEXT:    let mut v1: Point = Point::default();
 // CHECK-NEXT:    v1.x = v0;
-// CHECK-NEXT:    let v2: i32 = v1.y;
-// CHECK-NEXT:    return v2;
+// CHECK-NEXT:    v1.y
 // CHECK-NEXT:  }
 emitrust.func @fields(%arg0: i32) -> i32 {
   %p = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"Point">>
@@ -70,8 +67,7 @@ emitrust.func @fields(%arg0: i32) -> i32 {
 // CHECK-NEXT:    let mut v3: [i32; 4] = [0; 4];
 // CHECK-NEXT:    v3[v1] = v0;
 // CHECK-NEXT:    v3[v2 as usize] = v0;
-// CHECK-NEXT:    let v4: i32 = v3[v1];
-// CHECK-NEXT:    return v4;
+// CHECK-NEXT:    v3[v1]
 // CHECK-NEXT:  }
 emitrust.func @indexing(%arg0: i32, %arg1: index, %arg2: i32) -> i32 {
   %a = emitrust.variable : !emitrust.lvalue<!emitrust.array<4xi32>>
@@ -85,8 +81,7 @@ emitrust.func @indexing(%arg0: i32, %arg1: index, %arg2: i32) -> i32 {
 
 // CHECK-LABEL: fn through_ref(v0: &mut i32, v1: i32) -> i32 {
 // CHECK-NEXT:    *v0 = v1;
-// CHECK-NEXT:    let v2: i32 = *v0;
-// CHECK-NEXT:    return v2;
+// CHECK-NEXT:    *v0
 // CHECK-NEXT:  }
 emitrust.func @through_ref(%arg0: !emitrust.mut_ref<i32>, %arg1: i32) -> i32 {
   %p = emitrust.deref %arg0 : (!emitrust.mut_ref<i32>) -> !emitrust.lvalue<i32>
@@ -99,7 +94,6 @@ emitrust.func @through_ref(%arg0: !emitrust.mut_ref<i32>, %arg1: i32) -> i32 {
 // CHECK-NEXT:    let mut v0: i32 = 1;
 // CHECK-NEXT:    let _v1: &i32 = &v0;
 // CHECK-NEXT:    let _v2: &mut i32 = &mut v0;
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @borrows() {
   %v = emitrust.variable <1 : i32> : !emitrust.lvalue<i32>
@@ -110,7 +104,6 @@ emitrust.func @borrows() {
 
 // CHECK-LABEL: fn printing(v0: i32) {
 // CHECK-NEXT:    print!("x={}\n", v0);
-// CHECK-NEXT:    return;
 // CHECK-NEXT:  }
 emitrust.func @printing(%arg0: i32) {
   emitrust.call_opaque "print!"(%arg0) {args = ["x={}\0A", 0 : index]} : (i32) -> ()

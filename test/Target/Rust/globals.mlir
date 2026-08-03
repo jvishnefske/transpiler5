@@ -94,6 +94,6 @@ emitrust.func @access() -> i32 {
   %3 = emitrust.global_load @c : i32
   // CHECK-NEXT:     c.with(|__emitrust_tl| __emitrust_tl.set(v3));
   emitrust.global_store %3, @c : i32
-  // CHECK-NEXT:     return v1;
+  // CHECK-NEXT:     v1
   emitrust.return %1 : i32
 }
