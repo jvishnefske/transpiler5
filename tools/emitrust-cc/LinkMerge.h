@@ -200,6 +200,32 @@ factStarvedObjectNames(llvm::StringRef symbol, llvm::StringRef diagnostic);
 /// never materializes it — measured, see design.md FR-58).
 bool itemGraphDefinesGlobal(llvm::StringRef graphText, llvm::StringRef symbol);
 
+/// One signature-starved external declaration: shard `declShard` carries a
+/// body-less `emitrust.extern_decl` FUNCTION whose type disagrees with the
+/// type shard `defShard` defines for the same symbol. This is the merge-
+/// level face of the importer's cross-TU pointer-parameter refinement (a
+/// solo shard shapes a call from the bare prototype; the defining body
+/// refines the model to a slice/cell-slice/owner form the shard could not
+/// know), so the pair must be re-imported jointly — dropping the
+/// declaration for the definition, as a matching-signature obligation is,
+/// would leave call sites shaped for a type the definition does not have.
+struct SignatureStarvation {
+  /// Index (into the scanned shard list) of the declaring shard.
+  unsigned declShard;
+  /// Index of the defining shard.
+  unsigned defShard;
+  /// The shared symbol name.
+  std::string symbol;
+};
+
+/// Scans the shards, in order, for signature-starved external function
+/// declarations (see `SignatureStarvation`). Pure: no module is modified.
+/// Globals are deliberately out of scope — C99 6.2.7 permits looser
+/// declaration shapes for objects (`extern int a[];` vs `int a[4];`), and
+/// the pointer-global starvation is already ledger-detected.
+llvm::SmallVector<SignatureStarvation>
+findSignatureStarvedDecls(llvm::ArrayRef<mlir::ModuleOp> shards);
+
 } // namespace emitrustcc
 
 #endif // EMITRUST_TOOLS_EMITRUST_CC_LINKMERGE_H

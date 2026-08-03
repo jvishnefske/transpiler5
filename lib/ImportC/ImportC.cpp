@@ -5801,11 +5801,21 @@ mlir::emitrust::importC(llvm::StringRef path,
   // and the tag the link step alpha-renames to the shard's link-line
   // ordinal. A historical non-defer single-file import keeps the bare
   // names, byte for byte.
+  //
+  // FR-58 owner-planning divergence (measured, see design.md): a shard is
+  // BY DEFINITION not the whole program, so defer mode must not claim
+  // `soleTranslationUnit` -- under that claim the Phase-4 owner/cell-slice
+  // planners promote EXTERNALLY VISIBLE functions on the strength of "all
+  // call sites are in this TU", which no shard can know; a caller in
+  // another TU (a local-array argument, say) makes the joint import refuse
+  // the very promotion the shard performed, and the merged crate would
+  // silently carry the promoted form. The historical non-defer single-file
+  // import keeps the claim: there, the TU genuinely is the program.
   if (failed(importer.importTranslationUnit(
           ast.getASTContext(),
           /*tuTag=*/options.deferExternals ? "tu0_" : "",
           /*deferExtern=*/options.deferExternals,
-          /*soleTranslationUnit=*/true)))
+          /*soleTranslationUnit=*/!options.deferExternals)))
     return nullptr;
   // FR-57a: finalization is what turns the deferred references into marked
   // declarations (and erases unused body-less prototypes). Historical
