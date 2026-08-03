@@ -1841,6 +1841,70 @@ def EmitRust_LoopOp : EmitRust_Op<"loop", [
 }
 
 //===----------------------------------------------------------------------===//
+// WhileOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_WhileOp : EmitRust_Op<"while", [NoRegionArguments]> {
+  let summary = "While loop operation with a foldable condition region";
+  let description = [{
+    The `emitrust.while` operation represents a Rust `while` expression used
+    as a statement (FR-61c). Its `condition` region holds a PURE chain of
+    single-use ops ending in `emitrust.condition`; the Rust emitter folds
+    the whole chain into the while head through the FR-61d single-use
+    inlining, so the region must render statement-free (the conversion that
+    creates the op guarantees it; the emitter rejects a non-foldable
+    condition with a located error rather than emitting wrong code). The
+    `body` region renders as the loop body; loop-carried values stay
+    `let mut` bindings above the op, reassigned at the body's end, exactly
+    like the `emitrust.loop` lowering -- the win over `emitrust.loop` is
+    eliminating the body-if / exit-copy / tail-break scaffolding of
+    SSA-destruction, not the value plumbing.
+
+    Example:
+
+    ```mlir
+    emitrust.while {
+      %c = emitrust.cmp lt, %i, %n : (i32, i32) -> i1
+      emitrust.condition %c
+    } do {
+      emitrust.assign %i = %next : i32
+    }
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    while i < n {
+        i = next;
+    }
+    ```
+  }];
+
+  let results = (outs);
+  let regions = (region SizedRegion<1>:$condition, SizedRegion<1>:$body);
+
+  let assemblyFormat = "$condition `do` $body attr-dict";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ConditionOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_ConditionOp : EmitRust_Op<"condition",
+    [Pure, Terminator, HasParent<"WhileOp">]> {
+  let summary = "Condition terminator of an emitrust.while condition region";
+  let description = [{
+    The `emitrust.condition` operation terminates the condition region of
+    `emitrust.while`, carrying the i1 the while head tests. It emits no
+    Rust code itself; the emitter renders its operand (usually an inlined
+    FR-61d expression) as the `while <cond>` head in the never-parenthesized
+    condition position.
+  }];
+
+  let arguments = (ins I1:$condition);
+  let assemblyFormat = "$condition attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
 // SwitchOp
 //===----------------------------------------------------------------------===//
 
@@ -1980,7 +2044,8 @@ def EmitRust_ContinueOp : EmitRust_Op<"continue"> {
 
 def EmitRust_YieldOp : EmitRust_Op<"yield",
     [Pure, Terminator,
-     ParentOneOf<["IfOp", "ForOp", "LoopOp", "SwitchOp", "GlobalCellsOp"]>]> {
+     ParentOneOf<["IfOp", "ForOp", "LoopOp", "SwitchOp", "GlobalCellsOp",
+                  "WhileOp"]>]> {
   let summary = "Block termination operation";
   let description = [{
     The `emitrust.yield` operation terminates the regions of `emitrust.if`,

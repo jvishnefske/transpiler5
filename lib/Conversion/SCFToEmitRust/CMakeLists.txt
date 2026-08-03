@@ -11,6 +11,7 @@ add_mlir_conversion_library(MLIRSCFToEmitRust
 
   LINK_LIBS PUBLIC
   MLIREmitRustDialect
+  MLIRArithDialect
   MLIRSCFDialect
   MLIRPass
   MLIRTransformUtils

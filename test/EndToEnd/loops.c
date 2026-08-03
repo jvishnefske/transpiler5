@@ -11,6 +11,9 @@
 // RUN: %t.native > %t.native.out
 // RUN: %t.crate/target/release/loops > %t.rust.out
 // RUN: diff %t.native.out %t.rust.out
+// FR-61c shape pin: the inner counting loop renders as a genuine Rust
+// `while` (the conversion-time lift), not a `loop { .. break }`.
+// RUN: grep -q "while v" %t.crate/src/main.rs
 
 int printf(const char *, ...);
 
