@@ -1698,7 +1698,7 @@ LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
     return success();
   SmallVector<const clang::ParmVarDecl *, 2> eligible;
   for (const clang::ParmVarDecl *param : func->parameters())
-    if (isCharPointerPointerType(param->getType()))
+    if (isDataPointerPointerType(param->getType()))
       eligible.push_back(param);
   if (eligible.empty())
     return success();
@@ -1710,7 +1710,7 @@ LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
             findCursorParamEscape(func->getBody(), param))
       return emitError(translateLoc(escape->getBeginLoc()))
              << "unsupported: pointer-to-pointer parameter escapes the "
-                "string-cursor shape";
+                "cursor-parameter shape";
   // Region check: a write through a pointer DERIVED from the cursor
   // parameter (`p = *s; *p = c;`) writes region content the shared
   // slice lowering cannot accept.
@@ -1732,7 +1732,7 @@ LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
               llvm::dyn_cast_if_present<clang::ParmVarDecl>(binding.base);
           param && candidates.contains(param))
         return emitError(translateLoc(region->writeThroughLoc))
-               << "unsupported: write through a string-cursor parameter";
+               << "unsupported: write through a cursor parameter";
   }
   // The admissions are the LAST thing this function does, so a rejection
   // above leaves `cursorParams` untouched: there is no partial plan to

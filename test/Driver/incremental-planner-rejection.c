@@ -38,7 +38,7 @@ static int helper(int x) { return x + 1; }
 // non-recovering error carried -- because that precision is what makes the
 // rejection attributable to one declaration in the first place.
 static int consume(unsigned char **out, size_t n) {
-  // WARN: :[[#@LINE+1]]:3: warning: unsupported: pointer-to-pointer parameter escapes the string-cursor shape (recovered: item dropped)
+  // WARN: :[[#@LINE+1]]:3: warning: unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape (recovered: item dropped)
   (*out)[0] = (unsigned char)n;
   return 0;
 }
@@ -47,7 +47,7 @@ int main(void) { return helper(1); }
 
 // The driver exits 0 and summarizes what it dropped.
 // WARN: recovered 1 rejected top-level item:
-// WARN: dropped 'consume' [ptr-to-ptr] unsupported: pointer-to-pointer parameter escapes the string-cursor shape
+// WARN: dropped 'consume' [ptr-to-ptr-shape-escape] unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape
 
 // Both translatable items reach the crate; the rejected one leaves no trace.
 // RUST: fn tu0_helper(x: i32) -> i32 {
@@ -73,17 +73,17 @@ int main(void) { return helper(1); }
 // PORTING: | ported | 2 |
 // PORTING-NEXT: | stubbed | 0 |
 // PORTING: | root blocker | items |
-// PORTING: | ptr-to-ptr | 1 |
+// PORTING: | ptr-to-ptr-shape-escape | 1 |
 // PORTING: ## Rejected items outside the item graph
-// PORTING: | dropped | red | `consume` | - | ptr-to-ptr | consume | ptr-to-ptr | unsupported: pointer-to-pointer parameter escapes the string-cursor shape |
+// PORTING: | dropped | red | `consume` | - | ptr-to-ptr-shape-escape | consume | ptr-to-ptr-shape-escape | unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape |
 
 // JSON: "graph_items": 3
 // JSON-NEXT: "ported": 2
 // JSON-NEXT: "stubbed": 0
-// JSON: { "tag": "ptr-to-ptr", "count": 1 }
+// JSON: { "tag": "ptr-to-ptr-shape-escape", "count": 1 }
 // JSON: "off_graph_items": [
 // JSON-NEXT: {
 // JSON-NEXT: "symbol": "consume"
 // JSON: "status": "dropped"
 
-// STRICT: error: unsupported: pointer-to-pointer parameter escapes the string-cursor shape
+// STRICT: error: unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape

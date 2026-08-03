@@ -2480,8 +2480,8 @@ private:
   LogicalResult planCursorParams(const clang::TranslationUnitDecl *unit);
 
   /// The per-definition half of `planCursorParams`: proves `func`'s
-  /// pointer-to-pointer parameters fit the string-cursor shape and, only if
-  /// ALL of them do, admits them into `cursorParams`.
+  /// pointer-to-pointer parameters fit the cursor-parameter shape and, only
+  /// if ALL of them do, admits them into `cursorParams`.
   ///
   /// The all-or-nothing ordering is what makes this function the unit of
   /// FR-53 recovery: a rejection leaves `cursorParams` exactly as it found it,
@@ -2518,10 +2518,16 @@ private:
   LogicalResult bindOrdinaryParam(const clang::ParmVarDecl *param,
                                   Value blockArg, Location paramLoc);
 
-  /// Binds a planned string-cursor parameter (CTS 00204): the shared
-  /// byte-slice argument derefs into the region base place, the in-out
-  /// cursor copies into a local i64 cell at entry, and every return site
-  /// copies it back (`cursorWritebacks`).
+  /// Maps a planned `T **` cursor parameter's element run to its slice
+  /// type `!emitrust.slice<T'>` (C99-43 slice 1: T' = mapType(T), i8 for
+  /// the historical char** string cursor). An element type the slice
+  /// cannot view is a located rejection.
+  FailureOr<Type> mapCursorParamSliceType(const clang::ParmVarDecl *param);
+
+  /// Binds a planned cursor parameter (CTS 00204, element-generalized):
+  /// the shared element-slice argument derefs into the region base place,
+  /// the in-out cursor copies into a local i64 cell at entry, and every
+  /// return site copies it back (`cursorWritebacks`).
   LogicalResult bindCursorParam(const clang::ParmVarDecl *param,
                                 Value baseArg, Value cursorArg,
                                 Location paramLoc);
@@ -5776,11 +5782,13 @@ static inline bool isSecondOrderPointerType(clang::QualType type) {
          isPointerType(type.getCanonicalType()->getPointeeType());
 }
 
-/// Returns whether `type` is a pointer to a pointer to char — the
-/// `const char **` string-cursor parameter shape (CTS 00204). Deeper
-/// pointer nesting and non-char pointees keep the historical
-/// pointer-to-pointer parameter rejection.
-static inline bool isCharPointerPointerType(clang::QualType type) {
+/// Returns whether `type` is the two-level cursor-parameter shape
+/// `T **` (C99-43 slice 1, generalizing the CTS-00204 `const char **`
+/// string cursor): exactly two pointer levels whose element T is a
+/// non-void, non-function, non-pointer type a slice can view. Deeper
+/// nesting (T***) and void** keep the historical pointer-to-pointer
+/// parameter rejection.
+static inline bool isDataPointerPointerType(clang::QualType type) {
   clang::QualType canonical = type.getCanonicalType();
   const auto *outer = canonical->getAs<clang::PointerType>();
   if (!outer)
@@ -5789,7 +5797,20 @@ static inline bool isCharPointerPointerType(clang::QualType type) {
       outer->getPointeeType().getCanonicalType()->getAs<clang::PointerType>();
   if (!inner)
     return false;
-  return inner->getPointeeType().getCanonicalType()->isCharType();
+  clang::QualType element = inner->getPointeeType().getCanonicalType();
+  return !element->isVoidType() && !element->isFunctionType() &&
+         !element->isPointerType();
+}
+
+/// The element type a `T **` cursor parameter walks: the pointee of the
+/// parameter's POINTEE (`int **p` walks a run of `int`). Only meaningful
+/// for types `isDataPointerPointerType` accepts.
+static inline clang::QualType
+pointerPointerElementType(clang::QualType type) {
+  return type.getCanonicalType()
+      ->getPointeeType()
+      .getCanonicalType()
+      ->getPointeeType();
 }
 
 /// Matches `*s` where `s` is a pointer-to-pointer PARAMETER read through

@@ -282,6 +282,12 @@ _DYNMEM_NAMES = {"malloc", "calloc", "realloc", "free", "aligned_alloc"}
 _ALLOC_KEYWORDS = ("malloc", "calloc", "realloc", "aligned_alloc")
 _BLOCKER_SUBSTRINGS = [
     ("use of main's argv", "argv"),
+    # C99-43 slice 1: the cursor-parameter rejections split out of the
+    # generic ptr-to-ptr bucket, listed ABOVE it so first-match-wins
+    # routes them (every wording also contains "pointer-to-pointer" or
+    # "cursor parameter").
+    ("escapes the cursor-parameter shape", "ptr-to-ptr-shape-escape"),
+    ("write through a cursor parameter", "ptr-to-ptr-shape-escape"),
     ("pointer-to-pointer", "ptr-to-ptr"),
     ("returned pointer value", "returned-pointer"),
     ("pointer return type", "returned-pointer"),
