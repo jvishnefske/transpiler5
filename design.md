@@ -2510,6 +2510,194 @@ of references or inheritance, so it precedes both.
   NO-GO — the EndToEnd byte-diff stays THE correctness oracle and a
   nondeterministic schedule cannot pass it.
 
+  SPIKE RECORD (2026-08-03). All five experiments ran; every verdict is
+  below; the box stays open (no implementation yet — these verdicts
+  gate the slice list at the end). Direction update, superseding the
+  actor-RFC's deferral as to WHETHER while its technical findings stand:
+  the owner decided the message-based style is DEFAULT-ON wherever the
+  planner certifies actor clusters; single-cluster programs keep today's
+  shape; the byte-diff oracle is unchanged and inviolable. The reframe
+  that dissolves the RFC's "mailbox is ceremony" objection: message
+  dispatch is an EMISSION STYLE in synchronous same-thread form — actors
+  are structs OWNING their global clusters as plain fields, one message
+  enum plus a `handle(&mut self, msg)` match per actor, call sites are
+  direct method calls; threads/async become flagged execution modes over
+  the SAME message surface. The RFC's thread_local landmine dies by
+  construction for owned globals. All prototypes lived and died in the
+  session scratchpad; only this record is committed.
+
+  E1 — hand-written same-thread twins: GO. Three probe programs
+  (globals.c, globals-writeback-order.c, pointers-global.c) rewritten in
+  the actor shape and proven byte-identical (stdout + exit) against
+  their clang natives under the exact emitted-manifest deny-lint set.
+  Zero unsafe, zero thread_local among owned globals, and the
+  forced-shared list is EMPTY — every global found exactly one owner:
+  globals.c became Counter{counter}, Accumulator{total} (the
+  function-static became the whole state of its own actor), Table{table},
+  with const `scale` staying a const item and main-only globals becoming
+  main locals; pointers-global.c put pointer global `q` and its pointee
+  region `arr` in ONE actor with the cursor as a private usize index
+  (legally resting one-past-end), and the never-rebound cursor `p`
+  folded away entirely. Borrow-conflict inventory: seven shapes, all
+  resolved with per-statement let-temps or direct field paths — nothing
+  needed whole-program restructuring, and two resolutions were proven
+  unnecessary even inline (`a.t[2] = a.handle(Sum)` and two handle calls
+  in one `println!` both borrow-check). Headline: the C11 6.5.16p3
+  staged-snapshot writeback hazard — the entire reason
+  globals-writeback-order.c exists — VANISHES by construction, because
+  plain fields have no whole-global snapshot to revert. Readability (the
+  default-on justification): fill_table today is ten lines of
+  `TABLE.with(|__emitrust_tl| ...)` snapshot get/set round-trips per
+  loop; the actor arm is three lines,
+  `for i in 0..4 { self.table[i] += (i as i32 + 1) * SCALE; }`. Caveat
+  carried forward: the probes have zero actor-to-actor calls, so the
+  cluster-crossing arm call is the unexercised stressor for the op
+  design.
+
+  E2 — footprint-certifier prototype: GO with a measured caveat.
+  A script over `--emit=item-graph` text covered 108/108 EndToEnd
+  programs and 131/131 kernel TU shard graphs (dumped via `--link
+  --emit=item-graph`). 32 EndToEnd programs certify >= 2 clusters
+  (threshold was 10) — but every one of the 32 cross-cluster functions
+  is `c_main`; under a touched-only view (globals directly accessed by
+  some non-main function) only 3 EndToEnd programs are multi-cluster.
+  EndToEnd multi-cluster structure is main-mediated, so there the
+  override map is the primary control; the KERNEL is where the default
+  partition has substance — 104/131 TUs >= 2 touched clusters (jiffies.o
+  39, clockevents.o 38) and 1,388 non-main cross-cluster functions
+  across 88 TUs. CallsIndirect universe-poisoning is NOT the feared
+  triviality risk: 2.3% of EndToEnd defined functions, 0.7% kernel
+  (mostly header static-inlines). stdout-as-pseudo-global attribution
+  works for 96/108 EndToEnd programs but only 7/131 kernel TUs (closed
+  graph). Determinism: the full pipeline twice, byte-identical. One
+  format defect surfaced: a record/global node-key collision
+  (pointers-member.c `struct G` vs global `g`) drops the global's node
+  line while its edges survive — certifier workaround is treating
+  Reads/WritesGlobal edge targets as authoritative; worth an upstream
+  fix. Two ItemGraph gaps confirmed and named as pre-work slices:
+  "AddressOfGlobal edge kind" (ReadsGlobal folds address-taking, so
+  read-only actor interfaces are uncertifiable — footprints stay
+  direction-blind) and "hosted-sink visibility" (synthesize the
+  hosted-sink name set at graph build so `@stdout`, later
+  `@heap`/`@stderr`, attribution is total).
+
+  E3 — threaded sync round-trip: GO at a priced, bounded per-actor cost.
+  globals.c with the Table actor on a real thread (RFC mpsc lowering)
+  is byte-diff GREEN; the per-call typed reply channel
+  (`mpsc::Sender<RetTy>` carried in the message) deletes E1's
+  Reply-enum ceremony, and void arms carrying `Sender<()>` keep every
+  call synchronous and C-sequenced under one rule. The NEGATIVE CONTROL
+  is the landmine evidence the RFC predicted: leaving `table` in
+  today's thread_local!+Cell form builds clean, exits 0, and diverges in
+  5 output lines (the spawned actor fills its fresh zero-initialized
+  copy: native table 6/12/18/24 sum=102 c=-44 vs 0/0/0/0 sum=60 c=-50)
+  — a silent miscompile, the worst failure mode. Consequence recorded
+  as a hard rule: ownership lift is a MANDATORY PRECONDITION of
+  threaded mode; `--actor-mode=threaded` must refuse (located
+  diagnostic, rejection-is-a-feature) any actor whose cluster is not
+  fully field-owned, never fall back to accessors. Panic parity: exit
+  101 comes for free (reply sender drops during unwind, caller's recv
+  fails immediately — no hang) but with polluted provenance; the clean
+  form (join + resume_unwind: handle struct, reap(), shutdown()) costs
+  +29 non-blank lines per actor and should be unconditional. Ceremony:
+  threaded Table 74 non-blank lines vs 36 same-thread (~2x, two of four
+  arms being synthesized Get/Set accessors forced by the thread
+  boundary); crate total +31%.
+
+  E4 — async variant and the zero-dep contract: posture decided, async
+  is a SEPARATELY EMITTED CRATE FLAVOR, never a feature in the default
+  manifest. Honest inventory first: std::sync::mpsc has no stable
+  select; the only real substrates are tokio or crossbeam-channel, both
+  third-party, admissible only under the owner's feature-flag allowance.
+  The offline contract test then overturned the feature mechanism
+  itself: declaring even a default-off optional dependency
+  (`[features] async = ["dep:tokio"]`) breaks
+  `cargo build --offline` with an empty CARGO_HOME in every variant —
+  no lockfile, stale lockfile, even a fully pinned lockfile ("no
+  matching package named `tokio` found / location searched: crates.io
+  index", cargo 1.96.2): resolution needs the registry index even with
+  the feature off, while the control crate without the sections passes.
+  So the async flavor gets its own Cargo.toml, emitted only under
+  `--actor-mode=async`, with an UNCONDITIONAL dep — `tokio = { version
+  = "1", features = ["rt", "sync", "macros"] }` appended to the same
+  [package]/[lints.rust] — and no `#[cfg(feature)]` bifurcation in the
+  source; its offline build fails loudly at resolution, the correct
+  failure direction. The semantics twin is GREEN: current_thread
+  runtime, each actor a spawned task, every call = send with a oneshot
+  reply + IMMEDIATE await (at most one message in flight, so effect
+  order equals program order; stdout only from main); byte-diff clean,
+  exit parity, 10/10 runs identical, zero lint deviations. Structural
+  cost note: main's direct field accesses must become synthesized
+  Get/Set arms (the task owns the state). Free-running select stays
+  permanently out of scope — RFC condition 3 deliberately unmet, the
+  byte-exact oracle is never weakened.
+
+  E5 — pluggable planner: GO, signature FROZEN. `planActors` mirrors
+  `planPartition` exactly in kind: pure (strings in, plan out, no
+  filesystem, no MLIR), infallible, condensation-not-failure with
+  deterministic warning notes, `--actor-map` longest-prefix overrides.
+  Frozen shape: `ActorPlan planActors(ArrayRef<ActorUnit> units,
+  ArrayRef<pair<string, string>> overrides)` where ActorUnit carries
+  `sourcePaths` + parallel FR-57d `graphTexts` (a re-import group is one
+  unit; internal-linkage globals key as (unit, symbol)); ActorPlan
+  carries a sorted `actors` list (each: name — override name or
+  smallest owned global, stable across merges — plus sorted owned
+  globals including `@stdout`), a total `actorOfGlobal` map, a per-
+  defined-function `actorOfFunction` with a four-value role enum (Arm
+  with its actor index; Driver = c_main, exempt from the writer rule;
+  Free = empty footprint, callable from any arm; Cross = multi-actor
+  READER — after condensation writes never span, so cross functions are
+  message-passing clients, not arms), and `notes`. Two rules beyond
+  E2's co-access clustering: non-trivial call-graph SCCs spanning actors
+  condense, and a non-main function whose closure WRITE-footprint spans
+  more than one actor condenses them (`@stdout` hosted-sink calls count
+  as writes; direction-blindness caveat until the AddressOfGlobal slice
+  lands). Interface lesson: the `seeds` parameter was DROPPED — any
+  seed cluster is expressible as exact-symbol override entries sharing
+  an actor name, and the extra behavior seeds would add (a named group
+  that co-access silently grows) is a footgun. Dry run on 6 EndToEnd
+  programs + 2 kernel TUs, all three configs: DEFAULT reproduces E2's
+  clusters (7/8 exact; the divergence is the new writer rule composing
+  with poison on kernel tty — 53 clusters correctly condense to 1 when
+  a poisoned non-main writer is present); FORCE-ONE-ACTOR is isomorphic
+  to the status quo on all 8 (exactly one actor, every non-main
+  function Arm or Free, zero Cross, zero notes) — the compatibility
+  proof that single-cluster programs keep today's shape under
+  default-on; FORCE-MAX-SPLIT condenses back wherever the writer/SCC
+  rules demand (soundness re-verified from raw graph text on every
+  output plan: no non-main multi-actor writer survives). Determinism:
+  two full runs byte-identical. The doc-commented frozen header is the
+  contract for the implementation slice.
+
+  The five open questions above, answered by the spike: (1) the actor
+  unit is the per-global-cluster by transitive co-access, SCC-condensed,
+  with FR-30 owner structs absorbed as pre-made actors; (2) state is
+  owned by exactly one actor — messages carry only the sendable set
+  (scalars, C-enums, Copy structs; cursors never cross); (3) NOT a
+  cargo feature — E4's offline contract makes async a separately
+  emitted crate flavor; (4) the planner interface is frozen above,
+  pluggable via `--actor-map` exactly as `--partition-map`; (5)
+  determinism is by construction per mode — same-thread trivially,
+  threaded via uniform blocking calls over a FIFO mailbox, async via
+  current_thread + immediate await — and free-running select is
+  permanently out of scope.
+
+  Post-spike slice list (the implementation plan this record gates):
+  (1) ItemGraph pre-work, additive to the graph format: AddressOfGlobal
+  edge kind, hosted-sink visibility, and the record/global node-key
+  collision fix E2 surfaced; (2) `--emit=actor-plan`: the frozen
+  planActors as a pure core + FileCheck goldens (Partition.cpp
+  precedent and sizing, ~1 slice); (3) actor dialect ops + verifiers
+  (the RFC sketch shaped by E1's measured conventions and the
+  global_cells region discipline); (4) same-thread message lowering
+  DEFAULT-ON for certified clusters, with staged corpus-wide golden
+  churn (FR-61-style, hunk-attributable, byte-diff held at every
+  stage; single-cluster programs proven unchanged by E5's one-actor
+  isomorphism); (5) execution modes: `--actor-mode=threaded` (E3's
+  pricing; ownership-lift precondition enforced by located rejection;
+  unconditional panic-parity plumbing) and `--actor-mode=async` (E4's
+  separate crate flavor, current_thread + immediate-await only).
+
 **Measurement defect found while landing FR-52 (2026-07-30).** FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
