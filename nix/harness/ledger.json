@@ -1,0 +1,20 @@
+{
+  "epochs": {
+    "1": {
+      "corpus_root": "test/EndToEnd",
+      "corpus_hash": "sha256:934b6ba698e9dd206e6dc062f5ad7434d570807bd660a481e5b278f629693d08",
+      "revisions": [
+        {
+          "emitter_rev": "b654ad851da7378591e6071ec1584c7887352826",
+          "timestamp": "2026-08-04T16:10:42",
+          "metrics": {
+            "total_warnings": 798,
+            "train_total": 604,
+            "held_out_total": 194
+          },
+          "note": "assign_op_pattern: fold self-referential v=v op e into v op= e"
+        }
+      ]
+    }
+  }
+}

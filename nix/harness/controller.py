@@ -353,6 +353,11 @@ def cmd_accept(args):
     with open(mfile, "w") as f:
         json.dump(metrics, f)
     epoch_mod.ledger_append(args.id, rev, mfile, note=args.note)
+    # The ledger records the rev just committed, so it is a follow-up commit
+    # (it cannot be inside the commit whose hash it names).
+    sh(["git", "add", os.path.relpath(epoch_mod.LEDGER, REPO)])
+    sh(["git", "commit", "-m", f"chore(harness): ledger += {rev[:12]} (FR-63)",
+        "-m", "Claude-Session: https://claude.ai/code/session_01BkJc4yNyeFb2XWGshwUe15"])
     print(f"ACCEPT: committed {rev[:12]}; clippy total -> {total}")
     return 0
 
