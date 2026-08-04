@@ -3582,6 +3582,69 @@ here and are cherry-picked as design:
 Its `examples/parse_compilation_database.rs` is the one directly portable
 piece and becomes FR-45.
 
+- [ ] FR-63 Agentic improvement harness. Turn the one-shot clippy ratchet
+  (loop #1: 1621 → 961, `ecf3efd`/`d5ad1c3`) into an autonomous loop that
+  improves the emitter across THREE signals — correctness bugs, emitted-Rust
+  quality, and construct demand — under a fixed safety contract, framed as an
+  OPTIMIZATION over a frozen epoch corpus (the epoch / compiler-revision
+  concept, `~/src/dressage-design.md` §10–§11). The canonical plan is
+  `AGENTIC_HARNESS.md`; the implementation is `nix/harness/`. THE CONTRACT
+  (hard gates, never traded for score): (1) the byte-diff oracle is supreme —
+  correctness is `check-emitrust` at 100%, never cargo/clippy clean, which is
+  compile-only and cannot see a miscompile; (2) full lit suite 100%, goldens
+  updated the same change a spelling shifts; (3) no new `unsafe`, no new
+  allow-attribute beyond the crate-root header (`#![allow(dead_code,
+  unused_assignments)]`); (4) ratchets never regress (clippy total, RealWorld,
+  c-testsuite, kernel); (5) held-out generalization — a train-only improvement
+  that regresses held-out is rejected (anti-Goodhart); (6) off-limits without a
+  human + a new idea: cross-iteration loop liveness (miscompiled 3×) and
+  `needless_late_init` (a liveness change, not a spelling one); (7)
+  human-gated: `git push`, `flake.nix`, external side effects, any design
+  decision (record an FR spike NO-GO). The ARCHITECTURE is a load-bearing
+  split: a deterministic Python CONTROLLER (`nix/harness/controller.py`, no
+  LLM) measures/gates/ratchets/commits, and a Claude Code OPTIMIZER subagent
+  (`nix/harness/OPTIMIZER.md`) only proposes ONE emitter edit per iteration and
+  never scores its own work — that separation is why the paired
+  champion-vs-candidate comparison over the frozen corpus is valid.
+
+  - [x] FR-63.1 Controller CLI. `nix/harness/controller.py` with subcommands
+    `collect · freeze · establish · gate · score · accept · revert · iterate`
+    wrapping LOOP.md 1–6 headless. `gate` = build + `check-emitrust` 100% +
+    scan emitted Rust for no-new-`unsafe`/allow; `score` = train fell AND
+    held-out not regressed; `accept` = ratchet baselines + atomic
+    emitter+baseline commit + ledger append; `revert` = `git checkout`.
+    AC MET: one iteration runs headless with Result-style exit codes; an
+    injected gate failure reverts and exits non-zero (proven:
+    `iterate --fail-inject` → revert → exit 3).
+  - [x] FR-63.2 Epoch freeze + trajectory ledger. `nix/harness/epoch.py`,
+    `nix/harness/ledger.json`. `freeze` pins the discovery corpus (file list +
+    content hash) as `epoch-N`; `ledger-append` records `(emitter_rev,
+    metrics)` per accepted revision; totals are never compared across epochs.
+    AC MET: epoch-1 (test/EndToEnd, 125 files) freezes and `verify` reproduces
+    the pinned hash; `ledger-show` renders the descent.
+  - [x] FR-63.3 Held-out split gate. `epoch.py split` partitions the epoch
+    train/held-out as a pure function of `(seed, path)`; `clippy_eval.py
+    --file-list` measures each slice; the optimizer sees only train, the
+    controller scores both. AC MET: a synthetic train-only overfit (train
+    999→724 but held-out 100→237) is rejected by `score` with exit 2.
+    epoch-1 split 94 train / 31 held-out (seed 1); champion 724 + 237 = 961.
+  - [x] FR-63.4 Signal merge + prioritizer. `nix/harness/signals.py` unifies
+    correctness (`explore.py --json`), quality (`clippy-baseline.json`), and
+    demand (REJECT tags / RealWorld) into one ranked, deduped queue scored by
+    `severity × leverage × 1/risk`, severity-tiered so a bug outranks any
+    quality lint. AC MET: a crash outranks a 253-count clippy lint; the long
+    tail (per-program lints, 1-of-N rarities) and off-limits items are excluded;
+    output is a stable ranked JSON queue.
+  - [x] FR-63.5 Optimizer subagent spec + dispatch. `nix/harness/OPTIMIZER.md`:
+    one item/iteration, byte-diff gated, goldens same change, no `unsafe`/allow,
+    off-limits enforced, worktree isolation (diff+checkout+apply -3, never `git
+    stash` — shared across worktrees). AC: an iteration lands green through the
+    loop (see the RUN record for the first accepted revision).
+  - [x] FR-63.6 Continuous mode + termination. `nix/harness/LOOP.md`: a `/loop`
+    wrapper stopping when the top item is non-systematic (long tail) OR budget
+    OR K dry rounds OR blocked. AC: the loop runs several iterations and stops
+    on plateau.
+
 ## C99 Support Roadmap
 
 Everything the importer must handle before it can claim full C99 language
