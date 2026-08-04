@@ -466,6 +466,10 @@ private:
   /// with the `mut` marker; the `as usize` cast is omitted for an
   /// index-typed index.
   LogicalResult emitSliceOf(emitrust::SliceOfOp sliceOfOp);
+  /// Emits `let vN: &[i8] = &<table>[idx as usize][..];` — one command-line
+  /// argument's byte run borrowed out of the argv table (C99-43 C3); the
+  /// `as usize` cast is omitted for an index-typed index.
+  LogicalResult emitArgvArg(emitrust::ArgvArgOp argvArgOp);
 
   /// FR-51: the `pub ` an exported item is prefixed with, or the empty
   /// string. Returns nothing at all unless `RustEmitOptions::exportItems` is
@@ -1596,6 +1600,11 @@ static bool isClassifiedConsumerUse(OpOperand &use) {
       .Case<emitrust::SliceOfOp>([&](emitrust::SliceOfOp sliceOf) {
         return use.get() == sliceOf.getIndex();
       })
+      .Case<emitrust::ArgvArgOp>([&](emitrust::ArgvArgOp argvArg) {
+        // The table renders as a parameter name; only the index is a
+        // delimited expression position (mirrors the slice-of index).
+        return use.get() == argvArg.getIndex();
+      })
       .Case<emitrust::SubscriptOp>([&](emitrust::SubscriptOp subscript) {
         return use.get() == subscript.getIndex();
       })
@@ -1916,6 +1925,13 @@ LogicalResult RustEmitter::emitType(Location loc, Type type) {
     if (failed(emitType(loc, cellSliceType.getElementType())))
       return failure();
     os << ">]";
+    return success();
+  }
+  if (isa<emitrust::ArgvTableType>(type)) {
+    // C99-43 C3: the argv table parameter — one owned NUL-terminated byte
+    // vector per command-line argument, borrowed shared. The reference is
+    // part of the rendering (the type only ever appears as a parameter).
+    os << "&[Vec<i8>]";
     return success();
   }
   if (auto structType = dyn_cast<emitrust::StructType>(type)) {
@@ -4139,6 +4155,29 @@ LogicalResult RustEmitter::emitSliceOf(emitrust::SliceOfOp sliceOfOp) {
   return success();
 }
 
+LogicalResult RustEmitter::emitArgvArg(emitrust::ArgvArgOp argvArgOp) {
+  Operation *op = argvArgOp.getOperation();
+  if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+    return failure();
+  os << "&";
+  // The table is always a parameter name (nothing constructs a table
+  // inside a function), rendered like an indirect-call callee.
+  if (failed(emitOperand(op->getLoc(), argvArgOp.getTable(),
+                         ExprPos::receiver())))
+    return failure();
+  os << "[";
+  // Same delimited-vs-cast-source split as the slice-of index.
+  bool isIndexTyped = isa<IndexType>(argvArgOp.getIndex().getType());
+  if (failed(emitOperand(op->getLoc(), argvArgOp.getIndex(),
+                         isIndexTyped ? ExprPos::delimited()
+                                      : ExprPos::castSource())))
+    return failure();
+  if (!isIndexTyped)
+    os << " as usize";
+  os << "][..];\n";
+  return success();
+}
+
 //===----------------------------------------------------------------------===//
 // Dispatch
 //===----------------------------------------------------------------------===//
@@ -4289,6 +4328,9 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
       })
       .Case<emitrust::SliceOfOp>([&](emitrust::SliceOfOp sliceOfOp) {
         return emitSliceOf(sliceOfOp);
+      })
+      .Case<emitrust::ArgvArgOp>([&](emitrust::ArgvArgOp argvArgOp) {
+        return emitArgvArg(argvArgOp);
       })
       .Case<emitrust::YieldOp>(
           [&](emitrust::YieldOp) { return success(); })

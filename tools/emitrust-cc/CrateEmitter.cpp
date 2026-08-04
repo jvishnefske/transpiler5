@@ -88,6 +88,45 @@ static constexpr llvm::StringLiteral kMainArgcWrapperAsync =
     ".enable_all().build().expect(\"tokio runtime build failed\")"
     ".block_on(c_main(std::env::args_os().len() as i32))); }\n";
 
+/// C99-43 C3: wrapper for a C `main(int argc, char **argv)` whose argv was
+/// admitted into the table form (`c_main(argc, &[Vec<i8>])`). The argument
+/// vector is collected from `args_os` as RAW BYTES — each OS argument's
+/// bytes widened to `i8` with a trailing NUL appended, reproducing C's
+/// NUL-terminated `char*` strings byte-for-byte (an argument that is not
+/// valid Unicode still round-trips, where a `String` collection would panic
+/// or lossily replace). The `&[Vec<i8>]` borrow is passed alongside the
+/// `argc` count. `OsStrExt::as_bytes` is the unix raw-bytes accessor.
+static constexpr llvm::StringLiteral kMainArgvWrapper =
+    "fn main() {\n"
+    "    use std::os::unix::ffi::OsStrExt;\n"
+    "    let __emitrust_argv: Vec<Vec<i8>> = std::env::args_os()\n"
+    "        .map(|a| {\n"
+    "            a.as_bytes().iter().map(|&b| b as i8)"
+    ".chain(std::iter::once(0i8)).collect()\n"
+    "        })\n"
+    "        .collect();\n"
+    "    std::process::exit(c_main(__emitrust_argv.len() as i32, "
+    "&__emitrust_argv));\n"
+    "}\n";
+
+/// The async shim for a `c_main` that takes the imported argv table: the
+/// same raw-bytes argv collection as the sync wrapper, driving the async
+/// `c_main` to completion on the tokio current_thread runtime.
+static constexpr llvm::StringLiteral kMainArgvWrapperAsync =
+    "fn main() {\n"
+    "    use std::os::unix::ffi::OsStrExt;\n"
+    "    let __emitrust_argv: Vec<Vec<i8>> = std::env::args_os()\n"
+    "        .map(|a| {\n"
+    "            a.as_bytes().iter().map(|&b| b as i8)"
+    ".chain(std::iter::once(0i8)).collect()\n"
+    "        })\n"
+    "        .collect();\n"
+    "    std::process::exit(tokio::runtime::Builder::new_current_thread()\n"
+    "        .enable_all().build().expect(\"tokio runtime build failed\")\n"
+    "        .block_on(c_main(__emitrust_argv.len() as i32, "
+    "&__emitrust_argv)));\n"
+    "}\n";
+
 CrateType selectCrateType(CrateTypeRequest request, mlir::ModuleOp module) {
   switch (request) {
   case CrateTypeRequest::Bin:
@@ -135,13 +174,16 @@ bool hasAsyncActorRuntime(mlir::ModuleOp module) {
   return false;
 }
 
-/// Returns whether the module's `c_main` takes the imported argc
-/// parameter (a C `main(int argc, char **argv)`; `argv` is dropped at
-/// import). Callers have already established `hasCMain`.
-static bool cMainTakesArgc(mlir::ModuleOp module) {
+/// Returns the number of parameters the module's `c_main` takes, selecting
+/// the entry wrapper: 0 for `main(void)`, 1 for a `main(int argc, ...)` whose
+/// argv was dropped at import (C99-43 C3 leaves argc-only programs at arity
+/// 1, byte-identical), 2 for a `main(int argc, char **argv)` whose argv was
+/// admitted into the `!emitrust.argv_table` (C99-43 C3). Callers have already
+/// established `hasCMain`.
+static unsigned cMainInputCount(mlir::ModuleOp module) {
   auto funcOp = llvm::dyn_cast_if_present<mlir::emitrust::FuncOp>(
       mlir::SymbolTable::lookupSymbolIn(module, "c_main"));
-  return funcOp && funcOp.getFunctionType().getNumInputs() == 1;
+  return funcOp ? funcOp.getFunctionType().getNumInputs() : 0;
 }
 
 std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
@@ -226,10 +268,22 @@ renderCrateRoot(mlir::ModuleOp module, CrateType type,
     // FR-62 slice 5c: an async actor runtime anchor means `c_main` rendered
     // as an `async fn`, so the wrapper is the tokio current_thread shim.
     const bool asyncMain = hasAsyncActorRuntime(module);
-    os << "\n"
-       << (cMainTakesArgc(module)
-               ? (asyncMain ? kMainArgcWrapperAsync : kMainArgcWrapper)
-               : (asyncMain ? kMainWrapperAsync : kMainWrapper));
+    // C99-43 C3: 3-way select on `c_main`'s arity. Arity 0/1 stay
+    // byte-identical to the pre-C3 emitter; arity 2 carries the admitted
+    // argv table and gets the raw-bytes `args_os` collection wrapper.
+    llvm::StringRef wrapper;
+    switch (cMainInputCount(module)) {
+    case 2:
+      wrapper = asyncMain ? kMainArgvWrapperAsync : kMainArgvWrapper;
+      break;
+    case 1:
+      wrapper = asyncMain ? kMainArgcWrapperAsync : kMainArgcWrapper;
+      break;
+    default:
+      wrapper = asyncMain ? kMainWrapperAsync : kMainWrapper;
+      break;
+    }
+    os << "\n" << wrapper;
   }
   return source;
 }

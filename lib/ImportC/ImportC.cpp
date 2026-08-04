@@ -4903,6 +4903,14 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
     return emitDeclRefLValue(ref, loc, writeback);
   if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e))
     return emitMemberLValue(member, loc, writeback);
+  // C99-43 C3: an `argv[i][j]` byte place resolves through the argv table
+  // (emitrust.argv_arg + deref + subscript), never the generic pointer
+  // decomposition — the table has no cursor cell for the subscript to walk.
+  // This makes `emitRValue(argv[i][j])`, comparisons (`argv[1][n] != 0`),
+  // and `%d`/`%i` holes all read through the same slice place.
+  if (mainArgvTableValue)
+    if (const clang::ArraySubscriptExpr *argvByte = matchArgvByteRead(e))
+      return emitArgvByteLValue(argvByte, loc);
   if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(e))
     return emitSubscriptLValue(subscript, loc, writeback);
   if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))

@@ -1,6 +1,7 @@
 # RealWorld corpus: program names emitrust-cc transpiles AND whose
 # crate output matches a clang-native build (Track 4, W4.0).
 # One program name per line. Regenerated via: run_realworld.py ... --update
+argv-echo
 base64
 calc
 crc32

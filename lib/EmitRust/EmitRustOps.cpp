@@ -1221,6 +1221,23 @@ LogicalResult SliceOfOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// ArgvArgOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the result is a shared reference to a byte slice — the
+/// only run an argv table stores (C99-43 C3: one NUL-terminated `Vec<i8>`
+/// per command-line argument, borrowed whole as `&[i8]`).
+LogicalResult ArgvArgOp::verify() {
+  auto refType = dyn_cast<RefType>(getResult().getType());
+  auto slice = refType ? dyn_cast<SliceType>(refType.getPointee()) : SliceType();
+  if (!slice || !slice.getElementType().isSignlessInteger(8))
+    return emitOpError("result must be a !emitrust.ref of "
+                       "!emitrust.slice<i8>, but got ")
+           << getResult().getType();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // CmpOp
 //===----------------------------------------------------------------------===//
 

@@ -261,6 +261,34 @@ def EmitRust_CellSliceType : EmitRust_Type<"CellSlice", "cell_slice"> {
   let genVerifyDecl = 1;
 }
 
+def EmitRust_ArgvTableType : EmitRust_Type<"ArgvTable", "argv_table"> {
+  let summary = "EmitRust argv table type";
+
+  let description = [{
+    The command-line argument table of C `main`'s admitted `char **argv`
+    parameter (C99-43 C3), emitted as `&[Vec<i8>]`: one owned NUL-terminated
+    byte vector per argument, borrowed as a shared slice. The crate's
+    `fn main` wrapper collects `std::env::args_os()` into the backing
+    `Vec<Vec<i8>>` (raw OS bytes -- `args()` would panic on non-UTF-8
+    arguments and diverge from the native binary) and passes the borrow.
+
+    The type is opaque on purpose: `!emitrust.slice` cannot carry a
+    `Vec<i8>` element (slices view runs of scalars or structs), and no
+    other operation needs to decompose the table. Its only consumer is
+    `emitrust.argv_arg`, which borrows one argument's byte run as an
+    `!emitrust.ref<!emitrust.slice<i8>>`; from there the ordinary slice
+    surface (deref, subscript, loads) applies. The type is only valid as a
+    function parameter -- nothing creates a table value inside a function.
+
+    Example:
+
+    ```mlir
+    // Parameter type emitted as `&[Vec<i8>]`
+    !emitrust.argv_table
+    ```
+  }];
+}
+
 def EmitRust_FnPtrType : EmitRust_Type<"FnPtr", "fn_ptr"> {
   let summary = "EmitRust nullable function pointer type";
 
