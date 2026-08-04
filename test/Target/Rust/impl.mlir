@@ -13,11 +13,11 @@ emitrust.impl "Owner_main_arr" {
     %s = emitrust.deref %arg0 : (!emitrust.mut_ref<!emitrust.struct<"Owner_main_arr">>) -> !emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>
     %d = emitrust.member %s["data"] : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>) -> !emitrust.lvalue<!emitrust.array<8xi32>>
     %e = emitrust.subscript %d[%arg1] : (!emitrust.lvalue<!emitrust.array<8xi32>>, i64) -> !emitrust.lvalue<i32>
-    // CHECK: (*self).data[v0 as usize] = v1;
+    // CHECK: self.data[v0 as usize] = v1;
     emitrust.assign %e = %arg2 : !emitrust.lvalue<i32>
     // A sibling method call through the dereferenced receiver, without a
     // result: a bare statement.
-    // CHECK: (*self).g(v0);
+    // CHECK: self.g(v0);
     emitrust.method_call %s["g"] (%arg1) : (!emitrust.lvalue<!emitrust.struct<"Owner_main_arr">>, i64) -> ()
     emitrust.return
   }
@@ -32,7 +32,7 @@ emitrust.impl "Owner_main_arr" {
     %e = emitrust.subscript %d[%arg1] : (!emitrust.lvalue<!emitrust.array<8xi32>>, i64) -> !emitrust.lvalue<i32>
     // The load is the single-use producer of the returned value, so FR-61a
     // folds the binding: the place expression is the method's tail expression.
-    // CHECK: (*self).data[v0 as usize]
+    // CHECK: self.data[v0 as usize]
     %v = emitrust.load %e : (!emitrust.lvalue<i32>) -> i32
     emitrust.return %v : i32
   }

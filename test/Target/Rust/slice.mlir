@@ -21,9 +21,9 @@ emitrust.func @slice_of_forms(%arg0: i64, %arg1: index) {
 emitrust.func @slice_place(%arg0: !emitrust.mut_ref<!emitrust.slice<i32>>, %arg1: i64) -> i32 {
   %s = emitrust.deref %arg0 : (!emitrust.mut_ref<!emitrust.slice<i32>>) -> !emitrust.lvalue<!emitrust.slice<i32>>
   %e = emitrust.subscript %s[%arg1] : (!emitrust.lvalue<!emitrust.slice<i32>>, i64) -> !emitrust.lvalue<i32>
-  // CHECK: let v2: i32 = (*v0)[v1 as usize];
+  // CHECK: let v2: i32 = v0[v1 as usize];
   %v = emitrust.load %e : (!emitrust.lvalue<i32>) -> i32
-  // CHECK: (*v0)[v1 as usize] = v2;
+  // CHECK: v0[v1 as usize] = v2;
   emitrust.assign %e = %v : !emitrust.lvalue<i32>
   // Reslicing a dereferenced slice place composes.
   // CHECK: let _v3: &mut [i32] = &mut (*v0)[v1 as usize..];

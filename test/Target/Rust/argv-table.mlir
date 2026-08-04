@@ -21,7 +21,7 @@ emitrust.func @c_main(%arg0: i32, %arg1: !emitrust.argv_table) -> i32 {
   // The byte read renders through the shared place machinery —
   // `(*ref)[j as usize]` — and the single-use load folds inline into
   // the consuming call (FR-61d).
-  // CHECK: __emitrust_byte_out((*v3)[1i64 as usize]);
+  // CHECK: __emitrust_byte_out(v3[1i64 as usize]);
   %e = emitrust.subscript %p[%j] : (!emitrust.lvalue<!emitrust.slice<i8>>, i64) -> !emitrust.lvalue<i8>
   %v = emitrust.load %e : (!emitrust.lvalue<i8>) -> i8
   emitrust.call_opaque "__emitrust_byte_out"(%v) : (i8) -> ()

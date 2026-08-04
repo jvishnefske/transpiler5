@@ -33,10 +33,10 @@ emitrust.impl "Counter" {
   // CHECK-NEXT:         Msg::Quit => {
   // CHECK-NEXT:         }
   // CHECK-NEXT:         Msg::Add { amount: v1 } => {
-  // CHECK-NEXT:             (*self).count = (*self).count + v1;
+  // CHECK-NEXT:             self.count = self.count + v1;
   // CHECK-NEXT:         }
   // CHECK-NEXT:         Msg::Move { x: v4, y: _v5 } => {
-  // CHECK-NEXT:             (*self).count = v4;
+  // CHECK-NEXT:             self.count = v4;
   // CHECK-NEXT:         }
   // CHECK-NEXT:     }
   // CHECK-NEXT: }
@@ -63,7 +63,7 @@ emitrust.impl "Counter" {
   // CHECK:      fn payload(&self, v0: Msg) -> i32 {
   // CHECK-NEXT:     match v0 {
   // CHECK-NEXT:         Msg::Quit => {
-  // CHECK-NEXT:             (*self).count
+  // CHECK-NEXT:             self.count
   // CHECK-NEXT:         }
   // CHECK-NEXT:         Msg::Add { amount: v3 } => {
   // CHECK-NEXT:             v3

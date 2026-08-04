@@ -42,8 +42,8 @@ int main(void) {
 // CHECK-NEXT: }
 // CHECK:      impl CounterActor {
 // CHECK-NEXT:     fn bump(&mut self) -> i32 {
-// CHECK-NEXT:         (*self).counter = (*self).counter + SCALE;
-// CHECK-NEXT:         (*self).counter
+// CHECK-NEXT:         self.counter = self.counter + SCALE;
+// CHECK-NEXT:         self.counter
 // CHECK-NEXT:     }
 // CHECK-NEXT: }
 // CHECK:      struct TallyActor {
@@ -51,8 +51,8 @@ int main(void) {
 // CHECK-NEXT: }
 // CHECK:      impl TallyActor {
 // CHECK-NEXT:     fn tally(&mut self, x: i32) -> i32 {
-// CHECK-NEXT:         (*self).total = (*self).total + x;
-// CHECK-NEXT:         (*self).total
+// CHECK-NEXT:         self.total = self.total + x;
+// CHECK-NEXT:         self.total
 // CHECK-NEXT:     }
 // CHECK-NEXT: }
 // CHECK:      fn c_main() -> i32 {
