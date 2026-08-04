@@ -13,20 +13,18 @@
 // linked crate and the clang-built native binary must produce
 // byte-identical stdout, and -- the FR-58 acceptance oracle -- the linked
 // crate root must be BYTE-IDENTICAL to the joint single-invocation
-// `emitrust-cc --emit=rust` of the same two sources. Since the FR-62
-// stage-B flip, the joint invocations pass --actor-lift=false: under
-// --link every actor demotes by rule 5 (the FR-58/FR-59 lift interaction
-// is a recorded later stage), so the merge-equivalence oracle compares
-// both sides in the same (unlifted) form -- the joint LIFTED build of this
-// program is byte-diff green against the same native, verified at the
-// stage-B flip.
+// `emitrust-cc --emit=rust` of the same two sources. Since FR-62 F1a the
+// link side LIFTS under the explicit --actor-lift, so the
+// merge-equivalence oracle compares both sides in the same LIFTED form
+// (the joint default is stage B's lift-on); both shards are solo, which
+// is exactly where the joint-vs-link identity pin is sound.
 //
 // Per-TU shards through the shim:
 // RUN: env EMITRUST_REAL_CC=clang emitrust-clang -c %s -o %t.main.o
 // RUN: env EMITRUST_REAL_CC=clang emitrust-clang -c %S/Inputs/link-merge-lib.c -o %t.lib.o
 //
 // Link the objects into a crate and build it:
-// RUN: emitrust-cc --link %t.main.o %t.lib.o -o %t.crate --crate-name link_merge --build
+// RUN: emitrust-cc --actor-lift --link %t.main.o %t.lib.o -o %t.crate --crate-name link_merge --build
 //
 // Differential oracle against the clang-linked native binary:
 // RUN: clang -std=c11 %s %S/Inputs/link-merge-lib.c -o %t.native
@@ -35,19 +33,19 @@
 // RUN: diff %t.native.out %t.rust.out
 //
 // Byte identity vs the joint import (the FR-58 acceptance oracle):
-// RUN: emitrust-cc --actor-lift=false --emit=rust %s %S/Inputs/link-merge-lib.c -o %t.joint.rs
+// RUN: emitrust-cc --emit=rust %s %S/Inputs/link-merge-lib.c -o %t.joint.rs
 // RUN: diff %t.joint.rs %t.crate/src/main.rs
 //
 // Sidecar inputs: linking the `.emitrust.mlirbc` sidecars directly instead
 // of the objects yields the same bytes:
-// RUN: emitrust-cc --link %t.main.o.emitrust.mlirbc %t.lib.o.emitrust.mlirbc --emit=rust -o %t.sidecar.rs
+// RUN: emitrust-cc --actor-lift --link %t.main.o.emitrust.mlirbc %t.lib.o.emitrust.mlirbc --emit=rust -o %t.sidecar.rs
 // RUN: diff %t.joint.rs %t.sidecar.rs
 //
 // Sidecar FALLBACK: an object whose `.emitrust` section is missing (here:
 // stripped) falls back to the `<obj>.emitrust.mlirbc` sidecar next to it:
 // RUN: llvm-objcopy --remove-section .emitrust %t.main.o %t.stripped.o
 // RUN: cp %t.main.o.emitrust.mlirbc %t.stripped.o.emitrust.mlirbc
-// RUN: emitrust-cc --link %t.stripped.o %t.lib.o --emit=rust -o %t.fallback.rs
+// RUN: emitrust-cc --actor-lift --link %t.stripped.o %t.lib.o --emit=rust -o %t.fallback.rs
 // RUN: diff %t.joint.rs %t.fallback.rs
 
 #include "Inputs/link-merge.h"
