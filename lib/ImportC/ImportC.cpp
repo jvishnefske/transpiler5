@@ -1657,6 +1657,39 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
         recordArithmetic(pointer, addrOf->getOperatorLoc());
       }
     }
+    // A `&p` argument feeding a Shape-G single-global-or-NULL out-param
+    // cursor (C99-43 C1) is likewise consumed. The callee hands back an
+    // Option<i64> offset into its plan's statically-known global, so
+    // that global binds as `p`'s region base — the caller's later reads
+    // (`p[i]`, `*p`) resolve into its backing through the CTS-P6
+    // staged-copy machinery — and a null-writing callee marks the
+    // region nullable, giving `p` the CTS-P8 flag cell its `if (p)`
+    // tests read. A pure-NULL callee (no global) contributes only the
+    // nullable fact.
+    if (callee && globalCursorArgQuery) {
+      for (unsigned index = 0, count = call->getNumArgs(); index < count;
+           ++index) {
+        std::optional<GlobalCursorPlan> plan =
+            globalCursorArgQuery(callee, index);
+        if (!plan)
+          continue;
+        const clang::Expr *argument = stripTrivia(call->getArg(index));
+        while (const auto *cast =
+                   llvm::dyn_cast<clang::ImplicitCastExpr>(argument))
+          argument = stripTrivia(cast->getSubExpr());
+        const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(argument);
+        if (!addrOf || addrOf->getOpcode() != clang::UO_AddrOf)
+          continue;
+        const clang::VarDecl *pointer = asLocalVarRef(addrOf->getSubExpr());
+        if (!pointer || !tracks(pointer))
+          continue;
+        consumedAddrOf.insert(addrOf);
+        if (plan->global)
+          addBase(pointer, plan->global, addrOf->getOperatorLoc());
+        if (plan->writesNull)
+          recordNullable(pointer, addrOf->getOperatorLoc());
+      }
+    }
   }
   // Pointer call arguments no longer invalidate the region (Phase 1b):
   // `emitCall` reborrows the region base per target-parameter kind

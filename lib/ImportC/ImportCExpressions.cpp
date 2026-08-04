@@ -2015,15 +2015,17 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     return emitMethodCallSite(call, target, ownerBase, loc);
 
   // A callee with planned cursor parameters (CTS 00204 / C99-43
-  // slice 1) expands each `&p` Shape-S argument into (shared region
-  // slice, in-out cursor) and each `&e` Shape-P argument into a staged
-  // out-cursor temp, storing the advanced/written cursor back after the
-  // call.
+  // slice 1 / C1) expands each `&p` Shape-S argument into (shared
+  // region slice, in-out cursor), each `&e` Shape-P argument into a
+  // staged out-cursor temp, and each `&p` Shape-G argument into a
+  // staged `Option<i64>` cell, storing the advanced/written state back
+  // after the call.
   if (const clang::FunctionDecl *definition = callee->getDefinition();
       definition && llvm::any_of(definition->parameters(),
                                  [&](const clang::ParmVarDecl *param) {
                                    return cursorParams.contains(param) ||
-                                          pairedCursorParams.contains(param);
+                                          pairedCursorParams.contains(param) ||
+                                          globalCursorParams.contains(param);
                                  }))
     return emitCursorParamCall(call, target, loc);
 
@@ -2728,6 +2730,7 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
   };
   SmallVector<PendingCursor, 2> cursorArgs;
   SmallVector<PendingCursor, 2> pairedArgs;
+  SmallVector<PendingCursor, 2> globalArgs;
   SmallVector<PendingBorrow, 4> borrows;
   // Value arguments materialize first (C leaves evaluation order
   // unspecified); every borrow-producing argument follows, immediately
@@ -2737,10 +2740,12 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
     bool isCursorSlot = cursorParams.contains(definition->getParamDecl(index));
     bool isPairedSlot =
         pairedCursorParams.contains(definition->getParamDecl(index));
-    if (isCursorSlot || isPairedSlot) {
+    bool isGlobalSlot =
+        globalCursorParams.contains(definition->getParamDecl(index));
+    if (isCursorSlot || isPairedSlot || isGlobalSlot) {
       // The argument must be `&p` over a decomposed pointer local — the
-      // caller-side cursor the callee's advancement (Shape S) or unique
-      // out-write (Shape P) lands in.
+      // caller-side cursor the callee's advancement (Shape S), unique
+      // out-write (Shape P), or Option out-cell (Shape G) lands in.
       const clang::Expr *stripped = stripTrivia(argument);
       while (const auto *cast =
                  llvm::dyn_cast<clang::ImplicitCastExpr>(stripped))
@@ -2754,7 +2759,10 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
         return emitError(loc)
                << "unsupported: a cursor argument must be the "
                   "address of a decomposed pointer local";
-      (isCursorSlot ? cursorArgs : pairedArgs).push_back({index, pointer});
+      (isCursorSlot   ? cursorArgs
+       : isPairedSlot ? pairedArgs
+                      : globalArgs)
+          .push_back({index, pointer});
       continue;
     }
     Type input = targetType.getInput(slots[index]);
@@ -2927,6 +2935,50 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
             .getResult();
     stagedPaired.push_back({tmpPlace, info.cursorCell, coCursor});
   }
+  // Shape-G single-global-or-NULL out-cell arguments (C99-43 C1): pass
+  // the address of a staged `Option<i64>` temp (initialized None only
+  // for definite assignment — the admitted write is unconditional),
+  // then destructure the written Option back into the pointer local's
+  // cells: the CTS-P8 non-null flag takes `.is_some()` and the cursor
+  // cell takes `.unwrap_or(0)` (dead while the flag is false; the
+  // never-null plan reads its offset back with the Q3 deterministic
+  // panic spelling `.expect("null pointer read")` instead). Later uses
+  // of the pointer then flow through the decomposed-pointer machinery
+  // unchanged, resolving against the plan's statically-known global.
+  struct StagedGlobal {
+    Value tmpPlace;
+    Value cursorCell; // Null for a degenerate (scalar-global) pointer.
+    Value flagCell;   // Null when the region never sees NULL.
+  };
+  SmallVector<StagedGlobal, 2> stagedGlobal;
+  for (const PendingCursor &globalArg : globalArgs) {
+    const GlobalCursorPlan &plan =
+        globalCursorParams.lookup(definition->getParamDecl(globalArg.index));
+    const PointerLocalInfo &info =
+        pointerLocals.find(globalArg.pointer)->second;
+    // The pointer must decompose against exactly the plan's global (a
+    // pure-NULL plan constrains nothing): a multi-base, member-rooted,
+    // literal- or allocation-backed pointer has no representation for
+    // the returned offset.
+    if (info.baseIndexCell || info.member || info.literalBacking ||
+        info.backing || (plan.global && info.base != plan.global))
+      return emitError(loc)
+             << "unsupported: a global out-cell argument must decompose "
+                "against the callee's target global";
+    unsigned slotIndex = slots[globalArg.index];
+    Value tmpPlace = createVariablePlace(loc, optionCursorType());
+    Value none = builder
+                     .create<emitrust::LiteralOp>(loc, optionCursorType(),
+                                                  builder.getStringAttr("None"))
+                     .getResult();
+    builder.create<emitrust::AssignOp>(loc, tmpPlace, none);
+    arguments[slotIndex] =
+        builder
+            .create<emitrust::AddrOfOp>(loc, targetType.getInput(slotIndex),
+                                        tmpPlace, /*is_mut=*/true)
+            .getResult();
+    stagedGlobal.push_back({tmpPlace, info.cursorCell, info.nonNullCell});
+  }
   for (auto [index, value] : llvm::enumerate(arguments))
     if (!value || value.getType() != targetType.getInput(index))
       return emitError(loc) << "unsupported: call argument type mismatch";
@@ -2943,6 +2995,42 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
                   .getResult()
             : written;
     builder.create<memref::StoreOp>(loc, absolute, staged.cell);
+  }
+  for (const StagedGlobal &staged : stagedGlobal) {
+    if (staged.flagCell) {
+      Value flag = builder
+                       .create<emitrust::MethodCallOp>(
+                           loc, TypeRange{builder.getI1Type()},
+                           staged.tmpPlace,
+                           builder.getStringAttr("is_some"), ValueRange{})
+                       .getResult(0);
+      builder.create<memref::StoreOp>(loc, flag, staged.flagCell);
+    }
+    if (staged.cursorCell) {
+      Value cursor;
+      if (staged.flagCell) {
+        Value zero = createIntConstant(loc, i64Type, 0);
+        cursor = builder
+                     .create<emitrust::MethodCallOp>(
+                         loc, TypeRange{i64Type}, staged.tmpPlace,
+                         builder.getStringAttr("unwrap_or"), ValueRange{zero})
+                     .getResult(0);
+      } else {
+        Value message =
+            builder
+                .create<emitrust::LiteralOp>(
+                    loc,
+                    emitrust::OpaqueType::get(builder.getContext(), "&str"),
+                    builder.getStringAttr("\"null pointer read\""))
+                .getResult();
+        cursor = builder
+                     .create<emitrust::MethodCallOp>(
+                         loc, TypeRange{i64Type}, staged.tmpPlace,
+                         builder.getStringAttr("expect"), ValueRange{message})
+                     .getResult(0);
+      }
+      builder.create<memref::StoreOp>(loc, cursor, staged.cursorCell);
+    }
   }
   if (callOp->getNumResults() == 0)
     return Value();

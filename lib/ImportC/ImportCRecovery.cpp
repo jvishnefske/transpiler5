@@ -118,6 +118,7 @@ void CImporter::resetPerFunctionState() {
   inferredFnPtrSigs.clear();
   cursorWritebacks.clear();
   pairedCursorPlaces.clear();
+  globalCursorPlaces.clear();
   voidFnPtrHolders.clear();
   currentVaCloneActive = false;
   currentVaExtras.clear();

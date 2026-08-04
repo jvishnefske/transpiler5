@@ -1,6 +1,4 @@
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/null-write.c 2>&1 | FileCheck %s --check-prefix=NULLW
-// RUN: not emitrust-import-c %t/global-target.c 2>&1 | FileCheck %s --check-prefix=GLOBAL
 // RUN: not emitrust-import-c %t/conditional-write.c 2>&1 | FileCheck %s --check-prefix=COND
 // RUN: not emitrust-import-c %t/disagreeing-roots.c 2>&1 | FileCheck %s --check-prefix=DISAGREE
 // RUN: not emitrust-import-c %t/unrooted-write.c 2>&1 | FileCheck %s --check-prefix=UNROOTED
@@ -11,43 +9,17 @@
 // pointers-cursor-param-paired.c). Each case pins the exact wording,
 // because the wording IS the ledger-tag split: the substring table in
 // RejectionLedger.cpp (and its Python twin in run_realworld.py) routes
-// "written with a null pointer" to ptr-to-ptr-null-write, "written with
-// a global address" to ptr-to-ptr-global-target (the FR-62
-// actor-decomposition front), and the remaining shape failures to the
-// ptr-to-ptr-shape-escape family, all ahead of the generic ptr-to-ptr
-// row. A prototype without a visible definition never reaches planning
+// the shape failures below to the ptr-to-ptr-shape-escape family,
+// ahead of the generic ptr-to-ptr row. The historical cases (1)
+// `*endp = NULL` and (2) `*out = <one global>` moved to the ADMITTED
+// side under C99-43 front C1 (single-global-or-NULL Option-cell
+// mapping, pointers-cursor-param-global.c); the residual multi-global /
+// outside-grammar rejections and their narrowed "global address"
+// wordings are pinned in pointers-cursor-param-global-invalid.c. A
+// prototype without a visible definition never reaches planning
 // and keeps the historical generic wording (recorded in design.md:
 // class-scope C++ methods reach mapParamType for DEFINED functions too,
 // so the no-def wording split was measured off).
-
-// (1) `*endp = NULL`: C's "no conversion" contract needs a NULL-flag
-// threaded back to the caller — a second in-out state cell slice 1
-// does not synthesize (Q2 reasoning).
-//--- null-write.c
-void reset(const char *s, const char **endp) {
-  *endp = 0;
-}
-int main(void) {
-  const char *t = "a";
-  const char *e;
-  reset(t, &e);
-  return 0;
-}
-// NULLW: null-write.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: cursor parameter written with a null pointer
-
-// (2) `*out = <global address>` (the check_cpu global-or-NULL family,
-// u32** shape): multi-global state is the FR-62 front.
-//--- global-target.c
-unsigned err_flags[4];
-void report(unsigned err, unsigned **out) {
-  *out = err_flags;
-}
-int main(void) {
-  unsigned *e;
-  report(1u, &e);
-  return 0;
-}
-// GLOBAL: global-target.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: cursor parameter written with a global address (multi-global state is the FR-62 front)
 
 // (3) A write nested in control flow: the caller-side writeback is
 // unconditional, so admission demands the write execute on every path

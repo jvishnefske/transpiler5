@@ -1784,6 +1784,62 @@ LogicalResult CImporter::emitPairedCursorWrite(const clang::ParmVarDecl *param,
   return success();
 }
 
+LogicalResult CImporter::emitGlobalCursorWrite(const clang::ParmVarDecl *param,
+                                               const clang::Expr *rhs,
+                                               Location loc) {
+  Value place = globalCursorPlaces.lookup(param);
+  if (!place) // Defensive; the prologue binds every planned G parameter.
+    return emitError(loc)
+           << "unsupported: cursor parameter has no bound out-cell place";
+  // Re-classify against the C1 grammar so planning and emission can
+  // never disagree on what the write means (defensive: planning already
+  // admitted exactly this RHS).
+  FailureOr<std::optional<GlobalCursorPlan>> shape =
+      classifyGlobalCursorWrite(param, rhs, loc);
+  if (failed(shape))
+    return failure();
+  if (!*shape)
+    return emitError(loc) // Defensive; planning admitted the RHS.
+           << "unsupported: cursor parameter write does not fit the "
+              "single-global-or-NULL shape";
+  auto assignArm = [&](bool some) {
+    Value value =
+        builder
+            .create<emitrust::LiteralOp>(
+                loc, optionCursorType(),
+                builder.getStringAttr(some ? "Some(0i64)" : "None"))
+            .getResult();
+    builder.create<emitrust::AssignOp>(loc, place, value);
+  };
+  // The whole-global (always-Some) and null (always-None) forms assign
+  // directly; the ternary branches and assigns per arm, merging through
+  // the referenced cell exactly like `storePointerAssign`'s conditional
+  // split.
+  if (const auto *conditional =
+          llvm::dyn_cast<clang::ConditionalOperator>(stripTrivia(rhs));
+      conditional && !isNullPointerConstantExpr(rhs)) {
+    bool trueIsSome = !isNullPointerConstantExpr(conditional->getTrueExpr());
+    FailureOr<Value> condition = emitCondition(conditional->getCond());
+    if (failed(condition))
+      return failure();
+    Block *trueBlock = createBlock();
+    Block *falseBlock = createBlock();
+    Block *endBlock = createBlock();
+    builder.create<cf::CondBranchOp>(loc, *condition, trueBlock, ValueRange(),
+                                     falseBlock, ValueRange());
+    builder.setInsertionPointToEnd(trueBlock);
+    assignArm(trueIsSome);
+    builder.create<cf::BranchOp>(loc, endBlock);
+    builder.setInsertionPointToEnd(falseBlock);
+    assignArm(!trueIsSome);
+    builder.create<cf::BranchOp>(loc, endBlock);
+    builder.setInsertionPointToEnd(endBlock);
+    return success();
+  }
+  assignArm(/*some=*/(*shape)->global != nullptr);
+  return success();
+}
+
 const clang::MemberExpr *
 CImporter::asPoolNextFieldRead(const clang::Expr *expr) const {
   const clang::Expr *e = stripTrivia(expr);
@@ -2614,6 +2670,15 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
             asPointerPointerParamDeref(op->getLHS());
         pairedParam && pairedCursorParams.contains(pairedParam))
       return emitPairedCursorWrite(pairedParam, op->getRHS(), loc);
+    // `*efp = rhs` on a Shape-G single-global-or-NULL out-param cursor
+    // (C99-43 C1): the unique unconditional write assigns Some(0)/None
+    // through the `&mut Option<i64>` cell (the ternary form branches
+    // and assigns per arm). Like Shape P, a G parameter has no
+    // pointer-local binding.
+    if (const clang::ParmVarDecl *globalParam =
+            asPointerPointerParamDeref(op->getLHS());
+        globalParam && globalCursorParams.contains(globalParam))
+      return emitGlobalCursorWrite(globalParam, op->getRHS(), loc);
     // `*s = rhs` on a Shape-S cursor parameter (CTS 00204): the
     // advancement writes the parameter's cursor cell; the return-site
     // writebacks make it visible to the caller.
