@@ -3645,6 +3645,28 @@ piece and becomes FR-45.
     OR K dry rounds OR blocked. AC: the loop runs several iterations and stops
     on plateau.
 
+  RUN RECORD (2026-08-04, epoch-1 = test/EndToEnd, 125 files, 94 train / 31
+  held-out, seed 1). The loop ran end-to-end for TWO byte-diff-gated quality
+  iterations, each: collect → optimizer subagent → controller gate (build +
+  check-emitrust 523/523 + emitted-Rust scan unsafe=0/no-new-allow) → score
+  (train AND held-out fell) → accept (ratchet + atomic emitter+golden+baseline
+  commit + ledger). (1) `assign_op_pattern` — fold self-referential
+  `v = v <op> e` → `v <op>= e` in `emitAssign` (inlined RHS, bare-binding target,
+  unsigned `.wrapping_*` excluded); clippy 961 → 798, train 724 → 604, held-out
+  237 → 194 (commit `b654ad8`). (2) `explicit_auto_deref` — drop the explicit
+  `(*x)` on `.field` / `[i]` / `.0` / method-receiver bases (the `emitrust.deref`
+  operand is always a reference, so Deref coercion re-adds exactly one), clippy
+  798 → 559, train 604 → 431, held-out 194 → 128 (commit `9d123b1`). Cumulative
+  961 → 559 (−402, 42%); the byte-diff oracle stayed 523/523 and `unsafe` stayed
+  0 at every commit; held-out fell at both steps (generalization, not overfit).
+  The trajectory ledger (`nix/harness/ledger.json`) records the monotone
+  descent; `epoch.py ledger-show --id 1` renders it. Controller mechanics proven
+  before autonomy: `iterate --fail-inject` reverts and exits 3; a synthetic
+  train-only overfit (train↓ held-out↑) is rejected by `score` with exit 2. The
+  remaining `assign_op_pattern` (SCF-hoisted accumulators, LValue-place targets)
+  and the deeper quality tail are the next iterations; `needless_late_init`
+  stays off-limits.
+
 ## C99 Support Roadmap
 
 Everything the importer must handle before it can claim full C99 language
