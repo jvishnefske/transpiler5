@@ -24,7 +24,7 @@ void f1(int argc)
 }
 // CHECK-LABEL: func.func @f1
 // CHECK-NOT: !emitrust.array
-// CHECK: emitrust.call_opaque "print!"() {args = ["boom!\0A"]}
+// CHECK: emitrust.call_opaque "println!"() {args = ["boom!"]}
 // CHECK-NOT: !emitrust.array
 
 // A dead VLA with a compound — but still side-effect-free — size

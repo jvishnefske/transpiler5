@@ -3197,6 +3197,35 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
   return success(succeeded(emitCall(call)));
 }
 
+void CImporter::emitPrintMacro(Location loc, std::string rustFormat,
+                               ValueRange operands) {
+  // A newline-terminated format folds its trailing `\n` into `println!`,
+  // which writes byte-for-byte the same stdout as `print!` of the original
+  // string (clippy::print_with_newline). A format without a trailing newline
+  // keeps `print!`.
+  StringRef macro = "print!";
+  if (!rustFormat.empty() && rustFormat.back() == '\n') {
+    rustFormat.pop_back();
+    macro = "println!";
+  }
+  // A bare `println!()` (the whole format was a lone newline, no holes)
+  // renders from an empty args array; `println!("")` would trip
+  // clippy::println_empty_string.
+  if (rustFormat.empty() && operands.empty()) {
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(), builder.getStringAttr(macro),
+        builder.getArrayAttr({}), ValueRange());
+    return;
+  }
+  SmallVector<Attribute> callArguments;
+  callArguments.push_back(builder.getStringAttr(rustFormat));
+  for (unsigned i = 0, e = operands.size(); i < e; ++i)
+    callArguments.push_back(builder.getIndexAttr(i));
+  builder.create<emitrust::CallOpaqueOp>(
+      loc, TypeRange(), builder.getStringAttr(macro),
+      builder.getArrayAttr(callArguments), operands);
+}
+
 LogicalResult
 CImporter::emitAliasedPrintf(const clang::CallExpr *call,
                              const clang::FunctionDecl *target) {
@@ -3237,13 +3266,7 @@ CImporter::emitAliasedPrintf(const clang::CallExpr *call,
   if (failed(rustFormat))
     return failure();
 
-  SmallVector<Attribute> callArguments;
-  callArguments.push_back(builder.getStringAttr(*rustFormat));
-  for (unsigned i = 0, e = operands.size(); i < e; ++i)
-    callArguments.push_back(builder.getIndexAttr(i));
-  builder.create<emitrust::CallOpaqueOp>(
-      loc, TypeRange(), builder.getStringAttr("print!"),
-      builder.getArrayAttr(callArguments), operands);
+  emitPrintMacro(loc, *rustFormat, operands);
   return success();
 }
 
@@ -3273,13 +3296,7 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
   if (argvBypassed && rustFormat->empty() && operands.empty())
     return success();
 
-  SmallVector<Attribute> callArguments;
-  callArguments.push_back(builder.getStringAttr(*rustFormat));
-  for (unsigned i = 0, e = operands.size(); i < e; ++i)
-    callArguments.push_back(builder.getIndexAttr(i));
-  builder.create<emitrust::CallOpaqueOp>(
-      loc, TypeRange(), builder.getStringAttr("print!"),
-      builder.getArrayAttr(callArguments), operands);
+  emitPrintMacro(loc, *rustFormat, operands);
   return success();
 }
 
@@ -3302,13 +3319,7 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
   auto flushSegment = [&]() {
     if (rustFormat.empty() && operands.empty())
       return;
-    SmallVector<Attribute> callArguments;
-    callArguments.push_back(builder.getStringAttr(rustFormat));
-    for (unsigned k = 0, e = operands.size(); k < e; ++k)
-      callArguments.push_back(builder.getIndexAttr(k));
-    builder.create<emitrust::CallOpaqueOp>(
-        loc, TypeRange(), builder.getStringAttr("print!"),
-        builder.getArrayAttr(callArguments), operands);
+    emitPrintMacro(loc, rustFormat, operands);
     rustFormat.clear();
     operands.clear();
   };

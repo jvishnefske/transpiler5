@@ -34,7 +34,7 @@ int main(void) {
 
 // The filled buffer reads back through the existing %s machinery.
 // CHECK: emitrust.call_opaque "__emitrust_cstr"
-// CHECK: emitrust.call_opaque "print!"
+// CHECK: emitrust.call_opaque "println!"
 
 // The helper is emitted once at module level as safe Rust: it copies the
 // formatted bytes plus a NUL terminator into the destination slice

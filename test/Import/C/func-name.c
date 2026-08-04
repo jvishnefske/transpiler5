@@ -21,7 +21,7 @@ void show(void) {
 }
 // CHECK-LABEL: func.func @show
 // CHECK: %[[NAME:.*]] = emitrust.literal "\22show\22" : !emitrust.opaque<"&'static str">
-// CHECK: emitrust.call_opaque "print!"(%[[NAME]]) {args = ["{}\0A", 0 : index]}
+// CHECK: emitrust.call_opaque "println!"(%[[NAME]]) {args = ["{}", 0 : index]}
 
 // __FUNCTION__ is the same name; puts routes through the same literal
 // path onto println!. __PRETTY_FUNCTION__ carries clang's full-signature
@@ -33,11 +33,11 @@ void alias_forms(void) {
 }
 // CHECK-LABEL: func.func @alias_forms
 // CHECK: emitrust.literal "\22alias_forms\22"
-// CHECK: emitrust.call_opaque "print!"
+// CHECK: emitrust.call_opaque "println!"
 // CHECK: emitrust.literal "\22alias_forms\22"
 // CHECK: emitrust.call_opaque "println!"
 // CHECK: emitrust.literal "\22void alias_forms(void)\22"
-// CHECK: emitrust.call_opaque "print!"
+// CHECK: emitrust.call_opaque "println!"
 
 // A char pointer bound to __func__ is a cursor into the name's read-only
 // literal region: the backing byte array holds the name's bytes plus the

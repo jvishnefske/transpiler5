@@ -59,7 +59,7 @@ void print_it(void) {
 // CHECK-LABEL: func.func @print_it
 // CHECK: %[[SLICE:.*]] = emitrust.slice_of %{{.*}}[%{{.*}}] : (!emitrust.lvalue<!emitrust.array<3xi8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>
 // CHECK: %[[STR:.*]] = emitrust.call_opaque "__emitrust_cstr"(%[[SLICE]])
-// CHECK: emitrust.call_opaque "print!"(%[[STR]])
+// CHECK: emitrust.call_opaque "println!"(%[[STR]])
 
 // A definition-less strlen call over a literal-bound pointer counts bytes
 // up to the first NUL through the __emitrust_strlen helper, converted to

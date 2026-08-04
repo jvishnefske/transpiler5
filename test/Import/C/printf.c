@@ -20,7 +20,7 @@ int main(void) {
 // printed re-escaped as \0A).
 // CHECK-LABEL: func.func @c_main() -> i32
 // CHECK: %[[F:.*]] = emitrust.call_opaque "__emitrust_fmt_f64"(%{{.*}}) : (f64) -> !emitrust.opaque<"String">
-// CHECK: emitrust.call_opaque "print!"(%{{.*}}, %{{.*}}, %[[F]]) {args = ["d={} l={} f={} done 100%\0A", 0 : index, 1 : index, 2 : index]} : (i32, i64, !emitrust.opaque<"String">) -> ()
+// CHECK: emitrust.call_opaque "println!"(%{{.*}}, %{{.*}}, %[[F]]) {args = ["d={} l={} f={} done 100%", 0 : index, 1 : index, 2 : index]} : (i32, i64, !emitrust.opaque<"String">) -> ()
 // CHECK: return
 
 // The %f helper is emitted once at module level: {:.6} matches C for every

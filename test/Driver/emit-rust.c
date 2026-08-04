@@ -30,7 +30,7 @@ int main(void) {
 // FR-61d slice 2 the returned multi-use zero constant duplicates as a
 // suffixed literal, so the tail is the literal itself -- and no `return`
 // statement appears.
-// CHECK: print!("total={}
+// CHECK: println!("total={}
 // CHECK: 0i32
 
 // The verbatim wrapper forwards c_main's result as the exit code.

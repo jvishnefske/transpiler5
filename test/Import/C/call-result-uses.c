@@ -46,7 +46,7 @@ int main(void) {
   printf("%d\n", mk().m);
   // CHECK: call @mk() : () -> !emitrust.struct<"T">
   // CHECK: emitrust.member %{{.*}}["m"]
-  // CHECK: emitrust.call_opaque "print!"
+  // CHECK: emitrust.call_opaque "println!"
 
   // Two independent calls in one argument list materialize two
   // independent temporaries (the 00204 fr_hfa12().a / fr_hfa12().b
@@ -56,14 +56,14 @@ int main(void) {
   // CHECK-DAG: call @mkp() : () -> !emitrust.struct<"pair">
   // CHECK-DAG: emitrust.member %{{.*}}["a"]
   // CHECK-DAG: emitrust.member %{{.*}}["b"]
-  // CHECK: emitrust.call_opaque "print!"
+  // CHECK: emitrust.call_opaque "println!"
 
   // Declaration-with-call-initializer imports like the assignment form.
   struct T x = mk();
   printf("%d\n", x.m);
   // CHECK: call @mk() : () -> !emitrust.struct<"T">
   // CHECK: emitrust.member %{{.*}}["m"]
-  // CHECK: emitrust.call_opaque "print!"
+  // CHECK: emitrust.call_opaque "println!"
 
   return 0;
   // CHECK: return

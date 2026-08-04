@@ -49,15 +49,15 @@ int devirt_print(int x) {
   return 0;
 }
 // CHECK-LABEL: func.func @devirt_print
-// CHECK: emitrust.call_opaque "print!"(%{{.*}}) {args = ["direct {}\0A", 0 : index]} : (i32) -> ()
+// CHECK: emitrust.call_opaque "println!"(%{{.*}}) {args = ["direct {}", 0 : index]} : (i32) -> ()
 // CHECK: %[[R:.*]] = call @add(%{{.*}}, %{{.*}}) : (i32, i32) -> i32
-// CHECK: emitrust.call_opaque "print!"(%[[R]]) {args = ["value {}\0A", 0 : index]} : (i32) -> ()
+// CHECK: emitrust.call_opaque "println!"(%[[R]]) {args = ["value {}", 0 : index]} : (i32) -> ()
 // CHECK-NOT: emitrust.call_indirect
 
 // Multiple converted directives through the alias in one format.
 void devirt_two(int a, int b) { fprintfptr(stdout, "a=%d b=%d\n", a, b); }
 // CHECK-LABEL: func.func @devirt_two
-// CHECK: emitrust.call_opaque "print!"(%{{.*}}, %{{.*}}) {args = ["a={} b={}\0A", 0 : index, 1 : index]} : (i32, i32) -> ()
+// CHECK: emitrust.call_opaque "println!"(%{{.*}}, %{{.*}}) {args = ["a={} b={}", 0 : index, 1 : index]} : (i32, i32) -> ()
 
 // The aliases stay erased through the whole module.
 // CHECK-NOT: emitrust.global @addptr

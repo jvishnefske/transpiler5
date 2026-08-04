@@ -83,4 +83,4 @@ int use_string(void) {
 
 // `s.c_str()` fed to printf '%s': a shared borrow of `s`, no helper call.
 // CHECK: %[[CSTRREF:.*]] = emitrust.addr_of %[[S]] : (!emitrust.lvalue<!emitrust.opaque<"String">>) -> !emitrust.ref<!emitrust.opaque<"String">>
-// CHECK: emitrust.call_opaque "print!"(%[[CSTRREF]])
+// CHECK: emitrust.call_opaque "println!"(%[[CSTRREF]])

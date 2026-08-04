@@ -16,7 +16,7 @@ int main(void) {
   // width, and the flag bitmask travel as i32 constants).
   printf("%.5d %+d % d %+10.5d\n", d, d, d, d);
   // CHECK-COUNT-4: emitrust.call_opaque "__emitrust_fmt_i64"(%{{.*}}, %{{.*}}, %{{.*}}, %{{.*}}) : (i64, i32, i32, i32) -> !emitrust.opaque<"String">
-  // CHECK: emitrust.call_opaque "print!"({{.*}}) {args = ["{} {} {} {}\0A", 0 : index, 1 : index, 2 : index, 3 : index]}
+  // CHECK: emitrust.call_opaque "println!"({{.*}}) {args = ["{} {} {} {}", 0 : index, 1 : index, 2 : index, 3 : index]}
 
   // Unsigned precision and '#' route through __emitrust_fmt_u64 (value
   // zero-extended to ui64, with the base as the second argument).
@@ -29,20 +29,20 @@ int main(void) {
   printf("%hd %hhd\n", d, d);
   // CHECK: arith.trunci %{{.*}} : i32 to i16
   // CHECK: arith.trunci %{{.*}} : i32 to i8
-  // CHECK: emitrust.call_opaque "print!"(%{{.*}}, %{{.*}}) {args = ["{} {}\0A", 0 : index, 1 : index]} : (i16, i8) -> ()
+  // CHECK: emitrust.call_opaque "println!"(%{{.*}}, %{{.*}}) {args = ["{} {}", 0 : index, 1 : index]} : (i16, i8) -> ()
   printf("%hu %04hhx\n", d, d);
   // CHECK: emitrust.cast %{{.*}} : i32 to ui16
   // CHECK: emitrust.cast %{{.*}} : i32 to ui8
-  // CHECK: emitrust.call_opaque "print!"(%{{.*}}, %{{.*}}) {args = ["{} {:04x}\0A", 0 : index, 1 : index]} : (ui16, ui8) -> ()
+  // CHECK: emitrust.call_opaque "println!"(%{{.*}}, %{{.*}}) {args = ["{} {:04x}", 0 : index, 1 : index]} : (ui16, ui8) -> ()
 
   // ll is 64-bit, identical to l on this target.
   printf("%lld %llx\n", ll, ll);
-  // CHECK: emitrust.call_opaque "print!"(%{{.*}}, %{{.*}}) {args = ["{} {:x}\0A", 0 : index, 1 : index]} : (i64, ui64) -> ()
+  // CHECK: emitrust.call_opaque "println!"(%{{.*}}, %{{.*}}) {args = ["{} {:x}", 0 : index, 1 : index]} : (i64, ui64) -> ()
 
   // %.Ns of a string literal truncates at import time.
   printf("%.3s\n", "abcdef");
   // CHECK: emitrust.literal "\22abc\22"
-  // CHECK: emitrust.call_opaque "print!"(%{{.*}}) {args = ["{}\0A", 0 : index]}
+  // CHECK: emitrust.call_opaque "println!"(%{{.*}}) {args = ["{}", 0 : index]}
 
   // %.Ns of a char array routes through __emitrust_cstr_n (stops at N
   // bytes or the first NUL, whichever comes first).
@@ -52,7 +52,7 @@ int main(void) {
   // Width on %s and %c right-aligns by default (C's rule; Rust's string
   // formatting would left-align, so the alignment is explicit).
   printf("[%10s][%-10s][%5c][%-5c]\n", "x", "y", 65, 66);
-  // CHECK: emitrust.call_opaque "print!"({{.*}}) {args = ["[{:>10}][{:<10}][{:>5}][{:<5}]\0A", 0 : index, 1 : index, 2 : index, 3 : index]}
+  // CHECK: emitrust.call_opaque "println!"({{.*}}) {args = ["[{:>10}][{:<10}][{:>5}][{:<5}]", 0 : index, 1 : index, 2 : index, 3 : index]}
 
   return 0;
 }

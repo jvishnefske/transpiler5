@@ -3712,6 +3712,20 @@ private:
   /// performs.
   LogicalResult emitPrintf(const clang::CallExpr *call);
 
+  /// Emits a single printf-family output as an `emitrust.call_opaque` to the
+  /// idiomatic Rust print macro, choosing the macro from `rustFormat`'s
+  /// trailing newline: a format ending in `'\n'` drops that one byte and
+  /// prints through `println!` (stdout-identical to `print!` of the
+  /// newline-terminated string), otherwise it keeps `print!`. `operands`
+  /// supplies one SSA value per `{}` placeholder, in order. The degenerate
+  /// bare `println!()` case (format is exactly `"\n"` with no operands) is
+  /// emitted with an empty args array so it renders `println!()` rather than
+  /// `println!("")` (which would trip `clippy::println_empty_string`). All
+  /// printf-family emission sites route through here so the macro choice is
+  /// centralized.
+  void emitPrintMacro(Location loc, std::string rustFormat,
+                      ValueRange operands);
+
   /// Translates the C printf-family format string `literal` into a Rust
   /// format string, consuming the directive arguments of `call` starting
   /// at `firstArgIndex` and appending their lowered SSA values to
