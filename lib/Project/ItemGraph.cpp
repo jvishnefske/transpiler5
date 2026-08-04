@@ -525,6 +525,19 @@ private:
                                  bool reads, bool writes,
                                  bool addressOf = false);
 
+  /// C99-43 C1: when `assign` is `*pp = <rhs>` on a data
+  /// pointer-to-pointer PARAMETER with every RHS alternative a whole
+  /// statically-known file-scope global or a null pointer constant (the
+  /// admitted single-global-or-NULL grammar, including the
+  /// `cond ? g : NULL` ternary), records each named global as
+  /// `ReadsGlobal` (the emitted Some-offset write holds no address into
+  /// its storage), walks the ternary condition normally, and returns
+  /// true. Returns false — recording nothing — for every other
+  /// assignment, which then takes the ordinary walk (a surviving decay
+  /// stays `AddressOfGlobal`).
+  bool walkGlobalCursorWrite(const clang::BinaryOperator *assign,
+                             llvm::StringRef from);
+
   //===--------------------------------------------------------------------===//
   // Symbols and edges
   //===--------------------------------------------------------------------===//
@@ -936,6 +949,91 @@ void ItemGraphBuilder::collectLValueDependencies(const clang::Expr *expr,
   collectStmtDependencies(stripped, from);
 }
 
+/// The whole-address-of-one-global matcher of the C1 carve-out
+/// (`walkGlobalCursorWrite`): an array-to-pointer decay of a file-scope
+/// global array or `&g` over a file-scope global, and nothing derived
+/// (`g + 1`, `&g[i]` keep the ordinary walk). The syntactic twin of the
+/// importer's `asWholeGlobalAddress` (ImportCPlanning.cpp); a
+/// function-local static is excluded exactly as the importer excludes it.
+static const clang::VarDecl *asWholeGlobalAddressExpr(const clang::Expr *expr) {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e);
+      unary && unary->getOpcode() == clang::UO_AddrOf)
+    e = unary->getSubExpr()->IgnoreParenImpCasts();
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var || !var->hasGlobalStorage() || var->isStaticLocal())
+    return nullptr;
+  return var;
+}
+
+/// The `*pp` LHS matcher of the C1 carve-out: a dereference of a data
+/// pointer-to-pointer PARAMETER (the only position the importer's
+/// cursor-parameter planning refines).
+static const clang::ParmVarDecl *asPtrPtrParamDeref(const clang::Expr *expr) {
+  const auto *unary =
+      llvm::dyn_cast<clang::UnaryOperator>(expr->IgnoreParenImpCasts());
+  if (!unary || unary->getOpcode() != clang::UO_Deref)
+    return nullptr;
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+      unary->getSubExpr()->IgnoreParenImpCasts());
+  if (!ref)
+    return nullptr;
+  const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl());
+  if (!param)
+    return nullptr;
+  clang::QualType type = param->getType().getCanonicalType();
+  if (!type->isPointerType())
+    return nullptr;
+  clang::QualType pointee = type->getPointeeType().getCanonicalType();
+  if (!pointee->isPointerType() || pointee->isFunctionPointerType())
+    return nullptr;
+  return param;
+}
+
+bool ItemGraphBuilder::walkGlobalCursorWrite(const clang::BinaryOperator *assign,
+                                             llvm::StringRef from) {
+  const clang::ParmVarDecl *param = asPtrPtrParamDeref(assign->getLHS());
+  if (!param)
+    return false;
+  clang::ASTContext &context = param->getASTContext();
+  auto isNull = [&](const clang::Expr *e) {
+    return e->isNullPointerConstant(context,
+                                    clang::Expr::NPC_NeverValueDependent) !=
+           clang::Expr::NPCK_NotNull;
+  };
+  auto readGlobal = [&](const clang::VarDecl *global) {
+    addEdge(from, cGlobalSymbolName(global, tuTag), EdgeKind::ReadsGlobal);
+  };
+  const clang::Expr *rhs = assign->getRHS()->IgnoreParens();
+  if (const clang::VarDecl *global = asWholeGlobalAddressExpr(rhs)) {
+    readGlobal(global);
+    return true;
+  }
+  if (const auto *conditional =
+          llvm::dyn_cast<clang::ConditionalOperator>(rhs);
+      conditional && !isNull(rhs)) {
+    const clang::Expr *trueArm = conditional->getTrueExpr();
+    const clang::Expr *falseArm = conditional->getFalseExpr();
+    const clang::VarDecl *trueGlobal = asWholeGlobalAddressExpr(trueArm);
+    const clang::VarDecl *falseGlobal = asWholeGlobalAddressExpr(falseArm);
+    bool covered = (trueGlobal || isNull(trueArm)) &&
+                   (falseGlobal || isNull(falseArm)) &&
+                   (trueGlobal || falseGlobal);
+    if (!covered)
+      return false;
+    collectStmtDependencies(conditional->getCond(), from);
+    if (trueGlobal)
+      readGlobal(trueGlobal);
+    if (falseGlobal)
+      readGlobal(falseGlobal);
+    return true;
+  }
+  return false;
+}
+
 void ItemGraphBuilder::addHostedSinkCall(const clang::FunctionDecl *callee,
                                          llvm::StringRef from) {
   // The symbol comes from the same naming function as every other function
@@ -988,6 +1086,23 @@ void ItemGraphBuilder::collectStmtDependencies(const clang::Stmt *stmt,
 
   if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt)) {
     if (binary->isAssignmentOp()) {
+      // C99-43 C1 carve-out: `*pp = <single-global-or-NULL>` on a T**
+      // parameter is the admitted out-param cursor write, whose emitted
+      // form ERASES the address into a `Some(0)` offset — no pointer
+      // into the global's storage survives, so the RHS records plain
+      // `ReadsGlobal` instead of the `AddressOfGlobal` the decay arm
+      // below would stamp (which FR-62's rule 1b would turn into a
+      // spurious thread-local demotion; the spike pinned the actor form
+      // as the target shape). Sound even when the importer later
+      // REJECTS the function (a residual global shape, an escape
+      // elsewhere): the item then has no imported function op and the
+      // actor plan's missing-function rule still demotes.
+      if (!binary->isCompoundAssignmentOp() &&
+          walkGlobalCursorWrite(binary, from)) {
+        collectLValueDependencies(binary->getLHS(), from,
+                                  /*reads=*/false, /*writes=*/true);
+        return;
+      }
       // A compound assignment (`g += 1`) genuinely both reads and writes.
       collectLValueDependencies(binary->getLHS(), from,
                                 /*reads=*/binary->isCompoundAssignmentOp(),

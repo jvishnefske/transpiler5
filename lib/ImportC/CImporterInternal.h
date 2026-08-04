@@ -883,6 +883,22 @@ struct SecondOrderRegion {
   std::string invalidReason;
 };
 
+/// The C99-43 C1 (Shape G) plan of one single-global-or-NULL out-param
+/// cursor `T **p`: the parameter lowers to ONE in-out `&mut Option<i64>`
+/// cell (Q1: arity preserved; Q4: Option-of-cursor NULL — None = C NULL,
+/// Some(offset) = element offset into `global`'s backing). `global` is
+/// the ONE statically-known target every admitted write names, or null
+/// for the degenerate pure-NULL writer (`*p = 0` only). `writesNull` is
+/// true when the callee can write NULL through the cell (a null-constant
+/// or ternary RHS), which is what marks the caller-side pointer region
+/// nullable.
+struct GlobalCursorPlan {
+  /// The single whole-global target; null for a pure-NULL writer.
+  const clang::VarDecl *global = nullptr;
+  /// Whether any admitted write can store NULL through the cell.
+  bool writesNull = false;
+};
+
 /// Steensgaard-style union-find pre-pass that groups the pointer locals of
 /// one function body into ownership regions (Phase 1a of pointer support).
 /// One AST walk (in the style of `collectAddressTaken`) unions pointers on
@@ -998,6 +1014,20 @@ public:
   /// region, exactly as if `e = <co-arg>; e += n;` had executed. Left
   /// unset, the `&e` argument invalidates `e` (address escape).
   std::function<int(const clang::FunctionDecl *, unsigned)> pairedArgQuery;
+
+  /// Optional query telling the walk whether argument `index` of a direct
+  /// call to `callee` feeds a planned Shape-G single-global-or-NULL
+  /// out-param cursor (C99-43 C1), returning the parameter's plan. When
+  /// set, a `&p` argument in such a position is consumed by the call
+  /// lowering (a staged `Option<i64>` temp the callee overwrites), the
+  /// plan's global binds as `p`'s region base — the caller's later reads
+  /// route into that backing at the returned offset — and a null-writing
+  /// callee marks the region nullable (the CTS-P8 flag cell carries the
+  /// Option discriminant). Left unset, the `&p` argument invalidates
+  /// `p` (address escape).
+  std::function<std::optional<GlobalCursorPlan>(const clang::FunctionDecl *,
+                                                unsigned)>
+      globalCursorArgQuery;
 
   /// Returns whether `var` is a pointer local tracked by this analysis.
   bool tracks(const clang::VarDecl *var) const {
@@ -2553,6 +2583,39 @@ private:
   /// writeback: planning proved the write unique and unconditional.
   LogicalResult emitPairedCursorWrite(const clang::ParmVarDecl *param,
                                       const clang::Expr *rhs, Location loc);
+
+  /// Classifies the RHS of a Shape-G candidate write `*param = rhs`
+  /// against the C99-43 C1 single-global-or-NULL grammar: a whole
+  /// statically-known global `g` (array decay or `&g`), a null pointer
+  /// constant, or `cond ? g : NULL` (either arm order). Returns the
+  /// admitted plan, `std::nullopt` when the RHS names no global and no
+  /// null constant (the Shape-P sibling-root path applies instead), or
+  /// a located rejection for the residual global cases — more than one
+  /// distinct global, a global mixed with a non-global root, a derived
+  /// address, an element-type mismatch — every wording carrying the
+  /// "global address" needle the ledger tables route to
+  /// `ptr-to-ptr-global-target`. Shared by planning and the write
+  /// emission so both sides agree on the grammar.
+  FailureOr<std::optional<GlobalCursorPlan>>
+  classifyGlobalCursorWrite(const clang::ParmVarDecl *param,
+                            const clang::Expr *rhs, Location writeLoc);
+
+  /// Emits the unique admitted `*param = rhs` write of a Shape-G
+  /// single-global-or-NULL out-param cursor (C99-43 C1): `Some(0)` /
+  /// `None` values assign through the deref'd `&mut Option<i64>` cell —
+  /// the ternary form branches and assigns per arm. No cell copy, no
+  /// return-site writeback: planning proved the write unique and
+  /// unconditional.
+  LogicalResult emitGlobalCursorWrite(const clang::ParmVarDecl *param,
+                                      const clang::Expr *rhs, Location loc);
+
+  /// The C1 Option-of-cursor cell type: `Option<i64>` as an emitrust
+  /// opaque type (None = C NULL, Some(offset) = element offset into the
+  /// planned global's backing). One helper so the signature seat, the
+  /// callee write, and the call-site staging can never drift apart.
+  emitrust::OpaqueType optionCursorType() {
+    return emitrust::OpaqueType::get(builder.getContext(), "Option<i64>");
+  }
 
   /// Emits a call to a callee with planned string-cursor parameters: a
   /// `&p` argument in a cursor position expands to (shared region slice,
@@ -4644,6 +4707,21 @@ private:
   /// assigned exactly once by the admitted write. Cleared with the other
   /// per-function maps.
   llvm::DenseMap<const clang::ParmVarDecl *, Value> pairedCursorPlaces;
+  /// Planned Shape-G single-global-or-NULL out-param cursors (C99-43
+  /// C1): a `T **` parameter with NO reads of `*p` and exactly one
+  /// unconditional top-level write whose RHS is one whole statically
+  /// known global, NULL, or `cond ? g : NULL`. Lowers to ONE
+  /// `&mut Option<i64>` input written directly with `Some(0)`/`None`
+  /// values (no cell, no return-site writeback). Keyed by the
+  /// DEFINITION's parameter decls; disjoint from `cursorParams` and
+  /// `pairedCursorParams`.
+  llvm::DenseMap<const clang::ParmVarDecl *, GlobalCursorPlan>
+      globalCursorParams;
+  /// Per-function emission state for Shape-G parameters: the deref'd
+  /// `!emitrust.lvalue<!emitrust.opaque<"Option<i64>">>` place of each
+  /// out-cell argument, assigned exactly once by the admitted write.
+  /// Cleared with the other per-function maps.
+  llvm::DenseMap<const clang::ParmVarDecl *, Value> globalCursorPlaces;
   /// Cached pointer-return kinds (CTS-P2), keyed by the function's
   /// canonical declaration: the mapped `!emitrust.fn_ptr` result type of a
   /// function whose data-pointer return classifies as a returned function

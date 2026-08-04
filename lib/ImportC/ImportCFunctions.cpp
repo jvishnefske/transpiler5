@@ -361,6 +361,16 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
             emitrust::MutRefType::get(builder.getIntegerType(64)));
         continue;
       }
+      // A planned Shape-G single-global-or-NULL out-param cursor
+      // (C99-43 C1) lowers to ONE `&mut Option<i64>` in-out cell:
+      // None = C NULL, Some(offset) = element offset into the plan's
+      // global backing. Arity-preserving (Q1) and Option-form NULL
+      // (Q4); the region itself never crosses the boundary — the
+      // caller's reads resolve against the statically-known global.
+      if (globalCursorParams.contains(param)) {
+        inputTypes.push_back(emitrust::MutRefType::get(optionCursorType()));
+        continue;
+      }
       FailureOr<Type> paramType =
           mapParamType(param->getType(), translateLoc(param->getLocation()),
                        paramKinds[index]);
@@ -514,6 +524,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   inferredFnPtrSigs = std::move(inferredSigs);
   cursorWritebacks.clear();
   pairedCursorPlaces.clear();
+  globalCursorPlaces.clear();
   currentVaCloneActive = false;
   currentVaExtras.clear();
   currentVaCursorCell = Value();
@@ -596,6 +607,21 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       if (definition->getParamDecl(coIndex) == coParam)
         return static_cast<int>(coIndex);
     return -1;
+  };
+  // Shape-G single-global-or-NULL positions (C99-43 C1): a `&p`
+  // argument there is consumed by the Option-cell staging, binds the
+  // plan's global as p's region base, and a null-writing callee marks
+  // the region nullable.
+  pointerRegions.globalCursorArgQuery =
+      [this](const clang::FunctionDecl *callee,
+             unsigned index) -> std::optional<GlobalCursorPlan> {
+    const clang::FunctionDecl *definition = callee->getDefinition();
+    if (!definition || index >= definition->getNumParams())
+      return std::nullopt;
+    auto it = globalCursorParams.find(definition->getParamDecl(index));
+    if (it == globalCursorParams.end())
+      return std::nullopt;
+    return it->second;
   };
   pointerRegions.analyze(astContext(), func->getBody());
 
@@ -694,6 +720,24 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
                             cursorArg)
                         .getResult();
       pairedCursorPlaces[param] = place;
+      continue;
+    }
+    // A Shape-G single-global-or-NULL out-param cursor (C99-43 C1)
+    // owns ONE entry-block argument: the `&mut Option<i64>` cell,
+    // deref'd once and assigned exactly once by the admitted write.
+    // Named after the C parameter so the callee reads `*efp = ...`.
+    if (globalCursorParams.contains(param)) {
+      Value cellArg = entryBlock->getArgument(entryArgIndex++);
+      if (!param->getName().empty())
+        paramNameSlots[entryArgIndex - 1] =
+            builder.getStringAttr(mangleMemberName(param->getName()));
+      Value place =
+          builder
+              .create<emitrust::DerefOp>(
+                  paramLoc, emitrust::LValueType::get(optionCursorType()),
+                  cellArg)
+              .getResult();
+      globalCursorPlaces[param] = place;
       continue;
     }
     Value blockArg = entryBlock->getArgument(entryArgIndex++);
@@ -977,6 +1021,10 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
           emitrust::MutRefType::get(builder.getIntegerType(64)));
       continue;
     }
+    if (globalCursorParams.contains(param)) {
+      inputTypes.push_back(emitrust::MutRefType::get(optionCursorType()));
+      continue;
+    }
     FailureOr<Type> paramType =
         mapParamType(param->getType(), translateLoc(param->getLocation()),
                      paramKinds[index]);
@@ -1026,6 +1074,7 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   switchCaseBlocks.clear();
   cursorWritebacks.clear();
   pairedCursorPlaces.clear();
+  globalCursorPlaces.clear();
   currentVaCloneActive = true;
   currentVaExtras.clear();
   currentHasLabels = containsLabelStmt(func->getBody());
@@ -1090,6 +1139,21 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
         return static_cast<int>(coIndex);
     return -1;
   };
+  // Shape-G single-global-or-NULL positions (C99-43 C1): a `&p`
+  // argument there is consumed by the Option-cell staging, binds the
+  // plan's global as p's region base, and a null-writing callee marks
+  // the region nullable.
+  pointerRegions.globalCursorArgQuery =
+      [this](const clang::FunctionDecl *callee,
+             unsigned index) -> std::optional<GlobalCursorPlan> {
+    const clang::FunctionDecl *definition = callee->getDefinition();
+    if (!definition || index >= definition->getNumParams())
+      return std::nullopt;
+    auto it = globalCursorParams.find(definition->getParamDecl(index));
+    if (it == globalCursorParams.end())
+      return std::nullopt;
+    return it->second;
+  };
   pointerRegions.analyze(astContext(), func->getBody());
 
   // Named parameter binding, then the extras: the extra block arguments
@@ -1116,6 +1180,17 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
                             cursorArg)
                         .getResult();
       pairedCursorPlaces[param] = place;
+      continue;
+    }
+    if (globalCursorParams.contains(param)) {
+      Value cellArg = entryBlock->getArgument(entryArgIndex++);
+      Value place =
+          builder
+              .create<emitrust::DerefOp>(
+                  paramLoc, emitrust::LValueType::get(optionCursorType()),
+                  cellArg)
+              .getResult();
+      globalCursorPlaces[param] = place;
       continue;
     }
     Value blockArg = entryBlock->getArgument(entryArgIndex++);

@@ -289,7 +289,12 @@ _BLOCKER_SUBSTRINGS = [
     ("escapes the cursor-parameter shape", "ptr-to-ptr-shape-escape"),
     ("write through a cursor parameter", "ptr-to-ptr-shape-escape"),
     ("written with a null pointer", "ptr-to-ptr-null-write"),
-    ("written with a global address", "ptr-to-ptr-global-target"),
+    # C99-43 C1 narrowed this family: single-global-or-NULL writes are
+    # admitted (the Option-cell mapping), so the needle widened from
+    # "written with a global address" to catch the residual wordings --
+    # "more than one global address" and "a global address outside the
+    # single-global-or-NULL shape" -- which stay the FR-62 front.
+    ("global address", "ptr-to-ptr-global-target"),
     ("write sites disagree on the source region", "ptr-to-ptr-shape-escape"),
     ("write must execute unconditionally", "ptr-to-ptr-shape-escape"),
     ("does not root in a sibling slice parameter", "ptr-to-ptr-shape-escape"),

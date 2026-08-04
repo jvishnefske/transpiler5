@@ -1743,9 +1743,10 @@ bool containsJumpStmt(const clang::Stmt *stmt, bool includeReturns) {
 }
 
 /// Deep scan for a reference to any non-local-storage variable: the
-/// Shape-P global-target rejection (Q2: multi-global state is the FR-62
-/// front) fires on a write RHS that mentions a global at all, covering
-/// both the plain `*p = g` form and check_cpu's `err ? flags : NULL`.
+/// residual Shape-G rejection (C99-43 C1 admits single-global-or-NULL;
+/// Q2's synthesized-region prohibition keeps multi-global state on the
+/// FR-62 front) fires on a write RHS that mentions a global OUTSIDE the
+/// whole-global grammar `classifyGlobalCursorWrite` admits.
 bool mentionsGlobalVar(const clang::Stmt *stmt) {
   if (!stmt)
     return false;
@@ -1757,6 +1758,55 @@ bool mentionsGlobalVar(const clang::Stmt *stmt) {
     if (mentionsGlobalVar(child))
       return true;
   return false;
+}
+
+/// Collects every distinct non-local-storage variable referenced below
+/// `stmt`. The multi-write rejection consults it to say the C1
+/// multi-global wording when two write sites name two distinct globals
+/// (`*p = g1; ... *p = g2;`) instead of the generic disagreeing-sites
+/// wording.
+void collectGlobalVarRefs(const clang::Stmt *stmt,
+                          llvm::SmallPtrSetImpl<const clang::VarDecl *> &out) {
+  if (!stmt)
+    return;
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+        var && !var->hasLocalStorage())
+      out.insert(var->getCanonicalDecl());
+  for (const clang::Stmt *child : stmt->children())
+    collectGlobalVarRefs(child, out);
+}
+
+/// Matches an expression that is the WHOLE address of one statically
+/// known file-scope global — an array-to-pointer decay of a global
+/// array, or `&g` over a global scalar — through implicit no-op and
+/// bit casts (so a sloppy C pointer conversion still names its global
+/// and the element-type check can reject it with a located wording).
+/// Returns null for everything else, including static locals (their
+/// backing is function-scoped and not addressable from the caller) and
+/// any derived address (`g + 1`, `&g[i]`).
+const clang::VarDecl *asWholeGlobalAddress(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    clang::CastKind kind = cast->getCastKind();
+    if (kind == clang::CK_ArrayToPointerDecay) {
+      e = stripTrivia(cast->getSubExpr());
+      break;
+    }
+    if (kind != clang::CK_NoOp && kind != clang::CK_BitCast)
+      return nullptr;
+    e = stripTrivia(cast->getSubExpr());
+  }
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e);
+      unary && unary->getOpcode() == clang::UO_AddrOf)
+    e = stripTrivia(unary->getSubExpr());
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var || var->hasLocalStorage() || var->isStaticLocal())
+    return nullptr;
+  return var;
 }
 
 } // namespace
@@ -1817,6 +1867,8 @@ LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
   SmallVector<
       std::pair<const clang::ParmVarDecl *, const clang::ParmVarDecl *>, 2>
       paired;
+  SmallVector<std::pair<const clang::ParmVarDecl *, GlobalCursorPlan>, 2>
+      globalTargets;
   for (const clang::ParmVarDecl *param : eligible) {
     SmallVector<const clang::BinaryOperator *, 2> writes;
     bool hasOtherUses = false;
@@ -1827,13 +1879,25 @@ LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
       selfWalking.push_back(param);
       continue;
     }
-    // Shape P admission. Exactly one write site: two sites would each
+    // Shape P/G admission. Exactly one write site: two sites would each
     // claim the single out-cursor and need a join proof slice 1 does
-    // not attempt.
-    if (writes.size() > 1)
+    // not attempt. Two sites naming two DISTINCT globals get the C1
+    // multi-global wording instead (the ledger's FR-62 front), since
+    // the single-global-or-NULL shape is what they just missed.
+    if (writes.size() > 1) {
+      llvm::SmallPtrSet<const clang::VarDecl *, 4> writeGlobals;
+      for (const clang::BinaryOperator *siteWrite : writes)
+        collectGlobalVarRefs(siteWrite->getRHS(), writeGlobals);
+      if (writeGlobals.size() > 1)
+        return emitError(translateLoc(writes[1]->getOperatorLoc()))
+               << "unsupported: cursor parameter written with more than "
+                  "one global address (single-global-or-NULL is the "
+                  "admitted C1 shape; multi-global state is the FR-62 "
+                  "front)";
       return emitError(translateLoc(writes[1]->getOperatorLoc()))
              << "unsupported: cursor parameter write sites disagree on "
                 "the source region";
+    }
     const clang::BinaryOperator *write = writes.front();
     Location writeLoc = translateLoc(write->getOperatorLoc());
     // The caller-side writeback is unconditional, so the write must
@@ -1860,19 +1924,25 @@ LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
       return emitError(writeLoc)
              << "unsupported: cursor parameter write must execute "
                 "unconditionally before every return";
-    // RHS admission, most specific wording first: NULL needs a NULL
-    // flag threaded back (a second in-out cell — Q2's excluded new
-    // mechanism); a global target is the FR-62 front; anything not
-    // rooting in a sibling same-element slice parameter has no region
-    // for the out-cursor coordinate to be relative to.
+    // RHS admission, most specific first. C99-43 C1 (Shape G): a null
+    // pointer constant, one whole statically-known global, or the
+    // check_cpu ternary `cond ? g : NULL` is the single-global-or-NULL
+    // Option-cell plan — the historical NULL-flag objection (Q2's
+    // "second in-out state cell") is obsoleted by the Option cell
+    // folding the flag and the offset into one value. The residual
+    // global shapes (multi-global, mixed roots, derived addresses,
+    // element mismatches) reject inside the classifier with "global
+    // address" wordings; a global-free non-null RHS falls through to
+    // Shape P, which requires a sibling same-element slice root.
     const clang::Expr *rhs = write->getRHS();
-    if (isNullPointerConstantExpr(rhs))
-      return emitError(writeLoc)
-             << "unsupported: cursor parameter written with a null pointer";
-    if (mentionsGlobalVar(rhs))
-      return emitError(writeLoc)
-             << "unsupported: cursor parameter written with a global "
-                "address (multi-global state is the FR-62 front)";
+    FailureOr<std::optional<GlobalCursorPlan>> shapeG =
+        classifyGlobalCursorWrite(param, rhs, writeLoc);
+    if (failed(shapeG))
+      return failure();
+    if (*shapeG) {
+      globalTargets.push_back({param, **shapeG});
+      continue;
+    }
     const clang::VarDecl *root = resolveArgRoot(analysis, rhs);
     const auto *coParam = llvm::dyn_cast_if_present<clang::ParmVarDecl>(root);
     bool admissible = coParam && coParam != param &&
@@ -1890,15 +1960,86 @@ LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
     paired.push_back({param, coParam});
   }
   // The admissions are the LAST thing this function does, so a rejection
-  // above leaves `cursorParams` and `pairedCursorParams` untouched: there
-  // is no partial plan to inherit, and the all-or-nothing rule ("either
-  // every eligible parameter of this definition is planned, or none is")
-  // holds under recovery too.
+  // above leaves `cursorParams`, `pairedCursorParams`, and
+  // `globalCursorParams` untouched: there is no partial plan to inherit,
+  // and the all-or-nothing rule ("either every eligible parameter of this
+  // definition is planned, or none is") holds under recovery too.
   for (const clang::ParmVarDecl *param : selfWalking)
     cursorParams.insert(param);
   for (auto &[param, coParam] : paired)
     pairedCursorParams[param] = coParam;
+  for (auto &[param, plan] : globalTargets)
+    globalCursorParams[param] = plan;
   return success();
+}
+
+FailureOr<std::optional<GlobalCursorPlan>>
+CImporter::classifyGlobalCursorWrite(const clang::ParmVarDecl *param,
+                                     const clang::Expr *rhs,
+                                     Location writeLoc) {
+  // Element compatibility: the caller-side reads through the pointer
+  // resolve against the global's backing, so the parameter's element
+  // type must match the global — a scalar of exactly that type, or an
+  // array whose element type matches at SOME nesting level (the flat
+  // row-major cursor convention every other base binding uses).
+  auto elementMatches = [&](const clang::VarDecl *global) {
+    clang::QualType element = pointerPointerElementType(param->getType());
+    if (const clang::ConstantArrayType *array =
+            astContext().getAsConstantArrayType(global->getType())) {
+      for (const clang::ConstantArrayType *level = array; level;
+           level = astContext().getAsConstantArrayType(
+               level->getElementType()))
+        if (astContext().hasSameUnqualifiedType(element,
+                                                level->getElementType()))
+          return true;
+      return false;
+    }
+    return astContext().hasSameUnqualifiedType(
+        element, global->getType().getCanonicalType());
+  };
+  auto outsideGrammar = [&]() -> LogicalResult {
+    return emitError(writeLoc)
+           << "unsupported: cursor parameter written with a global address "
+              "outside the single-global-or-NULL shape";
+  };
+  auto admitted = [&](const clang::VarDecl *global, bool writesNull)
+      -> FailureOr<std::optional<GlobalCursorPlan>> {
+    if (global && !elementMatches(global))
+      return outsideGrammar();
+    // Canonical decl: the caller-side region binding (`addBase`) and the
+    // call-site base agreement check compare canonical globals.
+    return std::optional<GlobalCursorPlan>(GlobalCursorPlan{
+        global ? global->getCanonicalDecl() : nullptr, writesNull});
+  };
+  if (isNullPointerConstantExpr(rhs))
+    return admitted(nullptr, /*writesNull=*/true);
+  if (const auto *conditional = llvm::dyn_cast<clang::ConditionalOperator>(
+          stripTrivia(rhs))) {
+    const clang::Expr *trueArm = conditional->getTrueExpr();
+    const clang::Expr *falseArm = conditional->getFalseExpr();
+    const clang::VarDecl *trueGlobal = asWholeGlobalAddress(trueArm);
+    const clang::VarDecl *falseGlobal = asWholeGlobalAddress(falseArm);
+    if (trueGlobal && falseGlobal)
+      return emitError(writeLoc)
+             << "unsupported: cursor parameter written with more than one "
+                "global address (single-global-or-NULL is the admitted C1 "
+                "shape; multi-global state is the FR-62 front)";
+    if (trueGlobal && isNullPointerConstantExpr(falseArm))
+      return admitted(trueGlobal, /*writesNull=*/true);
+    if (falseGlobal && isNullPointerConstantExpr(trueArm))
+      return admitted(falseGlobal, /*writesNull=*/true);
+    // A global anywhere else in the conditional (a derived address arm,
+    // a global mixed with a local root) is outside the C1 grammar; a
+    // global-free conditional falls through to the Shape-P path.
+    if (mentionsGlobalVar(trueArm) || mentionsGlobalVar(falseArm))
+      return outsideGrammar();
+    return std::optional<GlobalCursorPlan>();
+  }
+  if (const clang::VarDecl *global = asWholeGlobalAddress(rhs))
+    return admitted(global, /*writesNull=*/false);
+  if (mentionsGlobalVar(rhs))
+    return outsideGrammar();
+  return std::optional<GlobalCursorPlan>();
 }
 
 LogicalResult

@@ -2138,6 +2138,13 @@ LogicalResult RustEmitter::emitDefaultValue(Location loc, Type type) {
       os << "Vec::new()";
       return success();
     }
+    // The C99-43 C1 Option-of-cursor cell (`Option<i64>`, the staged
+    // out-cell temp of a single-global-or-NULL call): the default is the
+    // C null pointer, mirroring `!emitrust.fn_ptr`'s None above.
+    if (opaqueType.getValue().starts_with("Option<")) {
+      os << "None";
+      return success();
+    }
   }
   return emitError(loc) << "no default value for type " << type;
 }
