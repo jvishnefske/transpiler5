@@ -27,13 +27,13 @@ static void show(const char *s) {
 // CHECK: %[[C0:.*]] = memref.load %[[CUR]][] : memref<i64>
 // CHECK: %[[SL0:.*]] = emitrust.slice_of %[[BASE]][%[[C0]]] : (!emitrust.lvalue<!emitrust.slice<i8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>
 // CHECK: %[[STR0:.*]] = emitrust.call_opaque "__emitrust_cstr"(%[[SL0]]) : (!emitrust.ref<!emitrust.slice<i8>>) -> !emitrust.opaque<"String">
-// CHECK: emitrust.call_opaque "print!"(%[[STR0]]) {args = ["[{}]\0A", 0 : index]}
+// CHECK: emitrust.call_opaque "println!"(%[[STR0]]) {args = ["[{}]", 0 : index]}
 //   s++ advances the cursor cell; the second %s slices from the new cursor.
 // CHECK: arith.addi
 // CHECK: %[[C1:.*]] = memref.load %[[CUR]][] : memref<i64>
 // CHECK: %[[SL1:.*]] = emitrust.slice_of %[[BASE]][%[[C1]]] : (!emitrust.lvalue<!emitrust.slice<i8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>
 // CHECK: %[[STR1:.*]] = emitrust.call_opaque "__emitrust_cstr"(%[[SL1]])
-// CHECK: emitrust.call_opaque "print!"(%[[STR1]])
+// CHECK: emitrust.call_opaque "println!"(%[[STR1]])
 
 int main(void) {
   char buf[4] = "ab";

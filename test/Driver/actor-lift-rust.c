@@ -62,4 +62,4 @@ int main(void) {
 // CHECK-NEXT:     let mut limit: i32 = 50;
 // CHECK:          counter_actor.bump()
 // CHECK:          tally_actor.tally(2i32)
-// CHECK:          print!("b={} t={} limit={}\n"
+// CHECK:          println!("b={} t={} limit={}"

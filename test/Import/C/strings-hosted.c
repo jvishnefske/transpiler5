@@ -27,7 +27,7 @@ int main(void) {
   // The copied-into array reads back through the %s machinery.
   printf("%s\n", a);
   // CHECK: emitrust.call_opaque "__emitrust_cstr"
-  // CHECK: emitrust.call_opaque "print!"
+  // CHECK: emitrust.call_opaque "println!"
 
   // strncpy carries its count as i64.
   strncpy(a, "gosh", 2);

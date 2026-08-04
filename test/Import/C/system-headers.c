@@ -25,7 +25,7 @@ int main(void) {
 
 // CHECK-LABEL: func.func @add
 // CHECK-LABEL: func.func @c_main() -> i32
-// CHECK: emitrust.call_opaque "print!"
+// CHECK: emitrust.call_opaque "println!"
 // CHECK: return
 
 // CHECK-NOT: emitrust.struct_def

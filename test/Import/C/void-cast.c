@@ -18,7 +18,7 @@ int cast_call(void) {
 
 // CHECK-LABEL: func.func @cast_call
 // CHECK: call @tick
-// CHECK: emitrust.call_opaque "print!"
+// CHECK: emitrust.call_opaque "println!"
 // SCF-LABEL: func.func @cast_call
 
 int cast_assign(int a) {

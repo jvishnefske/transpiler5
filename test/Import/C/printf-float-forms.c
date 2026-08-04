@@ -14,7 +14,7 @@ int main(void) {
   // Bare %f/%lf keep the existing fast path.
   printf("%f %lf\n", x, x);
   // CHECK-COUNT-2: emitrust.call_opaque "__emitrust_fmt_f64"(%{{.*}}) : (f64) -> !emitrust.opaque<"String">
-  // CHECK: emitrust.call_opaque "print!"(%{{.*}}, %{{.*}}) {args = ["{} {}\0A", 0 : index, 1 : index]}
+  // CHECK: emitrust.call_opaque "println!"(%{{.*}}, %{{.*}}) {args = ["{} {}", 0 : index, 1 : index]}
 
   // Adjusted %f and the e/g families go through __emitrust_fmt_float.
   printf("%.2f %10.3f %-10f %+f % f %#.0f %08.2f\n", x, x, x, x, x, x, x);

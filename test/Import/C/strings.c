@@ -26,14 +26,14 @@ int main(void) {
   printf("%s says %s\n", "she", "hi");
   // CHECK: %[[L0:.*]] = emitrust.literal "\22she\22" : !emitrust.opaque<"&'static str">
   // CHECK: %[[L1:.*]] = emitrust.literal "\22hi\22" : !emitrust.opaque<"&'static str">
-  // CHECK: emitrust.call_opaque "print!"(%[[L0]], %[[L1]]) {args = ["{} says {}\0A", 0 : index, 1 : index]}
+  // CHECK: emitrust.call_opaque "println!"(%[[L0]], %[[L1]]) {args = ["{} says {}", 0 : index, 1 : index]}
 
   // A %s char-array lvalue is borrowed whole and rendered by the
   // on-demand __emitrust_cstr helper, which stops at the first NUL like C.
   printf("%s\n", buf);
   // CHECK: %[[SL:.*]] = emitrust.slice_of %[[BUF]][%{{.*}}] : (!emitrust.lvalue<!emitrust.array<4xi8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>
   // CHECK: %[[S:.*]] = emitrust.call_opaque "__emitrust_cstr"(%[[SL]]) : (!emitrust.ref<!emitrust.slice<i8>>) -> !emitrust.opaque<"String">
-  // CHECK: emitrust.call_opaque "print!"(%[[S]]) {args = ["{}\0A", 0 : index]}
+  // CHECK: emitrust.call_opaque "println!"(%[[S]]) {args = ["{}", 0 : index]}
 
   // A global char array stages the usual whole-value local copy first.
   printf("%s\n", greeting);
