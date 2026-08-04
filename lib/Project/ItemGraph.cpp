@@ -84,12 +84,14 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <tuple>
 #include <utility>
@@ -168,6 +170,154 @@ std::string ItemGraph::print() const {
     os << "edge " << edge.from << " -> " << (edge.to.empty() ? "?" : edge.to)
        << " kind=" << edgeKindName(edge.kind) << "\n";
   return text;
+}
+
+//===----------------------------------------------------------------------===//
+// Parsing (FR-62 F1a) — the printer's exact inverse
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// The inverse of `itemKindName`; no match is std::nullopt.
+std::optional<ItemKind> parseItemKind(llvm::StringRef spelling) {
+  if (spelling == "function")
+    return ItemKind::Function;
+  if (spelling == "record")
+    return ItemKind::Record;
+  if (spelling == "enum")
+    return ItemKind::Enum;
+  if (spelling == "global")
+    return ItemKind::Global;
+  return std::nullopt;
+}
+
+/// The inverse of `edgeKindName`; no match is std::nullopt.
+std::optional<EdgeKind> parseEdgeKind(llvm::StringRef spelling) {
+  static constexpr EdgeKind kinds[] = {
+      EdgeKind::Calls,        EdgeKind::CallsIndirect,
+      EdgeKind::SigType,      EdgeKind::BodyType,
+      EdgeKind::Field,        EdgeKind::Base,
+      EdgeKind::ReadsGlobal,  EdgeKind::WritesGlobal,
+      EdgeKind::TakesAddressOf, EdgeKind::FieldIndirect,
+      EdgeKind::AddressOfGlobal};
+  for (EdgeKind kind : kinds)
+    if (spelling == edgeKindName(kind))
+      return kind;
+  return std::nullopt;
+}
+
+} // namespace
+
+FailureOr<ItemGraph>
+mlir::emitrust::parseItemGraphText(llvm::StringRef text, std::string &error) {
+  auto fail = [&](llvm::StringRef line, llvm::StringRef reason) {
+    error = ("malformed item-graph line '" + line + "': " + reason).str();
+    return failure();
+  };
+  ItemGraph graph;
+  for (llvm::StringRef line : llvm::split(text, '\n')) {
+    if (line.empty())
+      continue;
+    llvm::StringRef rest = line;
+    if (rest.consume_front("node ")) {
+      // node <symbol> kind=<k> def=<0|1> linkage=<l> tu=<i>
+      //      loc=<file>:<line>:<col> — every field one whole token.
+      ItemNode node;
+      llvm::SmallVector<llvm::StringRef, 6> tokens;
+      rest.split(tokens, ' ');
+      if (tokens.size() != 6)
+        return fail(line, "expected 6 node fields");
+      node.symbol = tokens[0].str();
+      if (node.symbol.empty())
+        return fail(line, "empty node symbol");
+      llvm::StringRef kindToken = tokens[1], defToken = tokens[2],
+                      linkageToken = tokens[3], tuToken = tokens[4],
+                      locToken = tokens[5];
+      if (!kindToken.consume_front("kind="))
+        return fail(line, "expected kind=");
+      std::optional<ItemKind> kind = parseItemKind(kindToken);
+      if (!kind)
+        return fail(line, "unknown item kind");
+      node.kind = *kind;
+      if (!defToken.consume_front("def=") ||
+          (defToken != "0" && defToken != "1"))
+        return fail(line, "expected def=0 or def=1");
+      node.isDefinition = defToken == "1";
+      if (!linkageToken.consume_front("linkage="))
+        return fail(line, "expected linkage=");
+      if (linkageToken == "intern")
+        node.linkage = ItemLinkage::Internal;
+      else if (linkageToken == "extern")
+        node.linkage = ItemLinkage::External;
+      else
+        return fail(line, "unknown linkage");
+      if (!tuToken.consume_front("tu=") ||
+          tuToken.getAsInteger(10, node.tuIndex))
+        return fail(line, "expected tu=<index>");
+      if (!locToken.consume_front("loc="))
+        return fail(line, "expected loc=");
+      // The file may itself contain ':' (a Windows drive, an odd path), so
+      // the line and column split off the RIGHT end.
+      auto [fileLine, columnToken] = locToken.rsplit(':');
+      auto [file, lineToken] = fileLine.rsplit(':');
+      if (file.empty() || lineToken.getAsInteger(10, node.line) ||
+          columnToken.getAsInteger(10, node.column))
+        return fail(line, "expected loc=<file>:<line>:<col>");
+      node.file = file.str();
+      graph.nodes.push_back(std::move(node));
+      continue;
+    }
+    if (rest.consume_front("edge ")) {
+      // edge <from> -> <to|?> kind=<K>
+      llvm::SmallVector<llvm::StringRef, 4> tokens;
+      rest.split(tokens, ' ');
+      if (tokens.size() != 4 || tokens[1] != "->")
+        return fail(line, "expected 'edge <from> -> <to> kind=<kind>'");
+      ItemEdge edge;
+      edge.from = tokens[0].str();
+      llvm::StringRef kindToken = tokens[3];
+      if (edge.from.empty() || tokens[2].empty())
+        return fail(line, "empty edge endpoint");
+      if (!kindToken.consume_front("kind="))
+        return fail(line, "expected kind=");
+      std::optional<EdgeKind> kind = parseEdgeKind(kindToken);
+      if (!kind)
+        return fail(line, "unknown edge kind");
+      edge.kind = *kind;
+      // `?` is CallsIndirect's fixed no-target token, and only its.
+      if (tokens[2] == "?") {
+        if (edge.kind != EdgeKind::CallsIndirect)
+          return fail(line, "target '?' is only valid for CallsIndirect");
+      } else {
+        if (edge.kind == EdgeKind::CallsIndirect)
+          return fail(line, "CallsIndirect takes the fixed target '?'");
+        edge.to = tokens[2].str();
+      }
+      graph.edges.push_back(std::move(edge));
+      continue;
+    }
+    return fail(line, "unknown line prefix (expected 'node ' or 'edge ')");
+  }
+  return graph;
+}
+
+std::string mlir::emitrust::retagInternalSymbol(llvm::StringRef symbol,
+                                                unsigned ordinal) {
+  llvm::StringRef rest = symbol;
+  llvm::StringRef tag;
+  if (rest.consume_front("tu"))
+    tag = "tu";
+  else if (rest.consume_front("TU"))
+    tag = "TU";
+  else
+    return symbol.str();
+  size_t digits = 0;
+  while (digits < rest.size() && llvm::isDigit(rest[digits]))
+    ++digits;
+  if (digits == 0 || digits >= rest.size() || rest[digits] != '_')
+    return symbol.str();
+  return (tag + llvm::Twine(ordinal) + "_" + rest.drop_front(digits + 1))
+      .str();
 }
 
 namespace {

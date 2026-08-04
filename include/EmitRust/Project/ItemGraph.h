@@ -328,6 +328,38 @@ FailureOr<ItemGraph> buildItemGraph(llvm::ArrayRef<clang::ASTUnit *> units);
 FailureOr<ItemGraph> buildItemGraph(llvm::ArrayRef<std::string> paths,
                                     llvm::ArrayRef<std::string> extraClangArgs);
 
+/// Parses a text produced by `ItemGraph::print` back into a graph (FR-62
+/// F1a): the exact inverse of the printer over its two pinned line shapes,
+/// so `print(parse(print(g))) == print(g)` for every graph. The parse is
+/// STRICT about the shapes it accepts — a malformed `node`/`edge` line, an
+/// unknown kind/linkage spelling, or an unrecognized line prefix is a
+/// failure with `error` set — because every input is printer output (a
+/// stored FR-57d shard text or a live `print()`), and silently dropping a
+/// line the printer emitted would hand consumers a graph missing facts.
+/// Blank lines are permitted and ignored. Node and edge ORDER is preserved
+/// verbatim (printer output is already in the published sort order); the
+/// parser does not re-sort, so a hand-permuted text round-trips its own
+/// permutation.
+///
+/// \param text the graph text, in `ItemGraph::print`'s line format.
+/// \param error receives the first offending line's reason on failure.
+/// \returns the parsed graph, or failure with `error` set.
+FailureOr<ItemGraph> parseItemGraphText(llvm::StringRef text,
+                                        std::string &error);
+
+/// Rewrites the per-TU tag of an internal-linkage symbol — `tu<j>_` on
+/// functions, `TU<J>_` on FR-53-renamed globals — to `ordinal`, the exact
+/// alpha-rename the FR-58 link merge applies to shard symbols. A per-TU
+/// shard artifact tags its file-statics `tu0_`; retagging by the shard's
+/// link-line ordinal is what keeps two shards' same-named statics distinct
+/// when their graphs (or modules) are combined. A symbol without the tag
+/// is returned unchanged.
+///
+/// \param symbol the emitted symbol spelling (a graph node key).
+/// \param ordinal the target TU ordinal (a link-line position).
+/// \returns the retagged spelling, or `symbol` verbatim when untagged.
+std::string retagInternalSymbol(llvm::StringRef symbol, unsigned ordinal);
+
 /// `buildItemGraph` driven by a `compile_commands.json` (FR-45).
 ///
 /// The graph must see EXACTLY the project the importer would see, so it
