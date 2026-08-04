@@ -38,8 +38,12 @@
             packages = [
               llvmPackages.clang
 
-              # Build tooling
+              # Build tooling. Meson drives the parallel build defined by
+              # the meson.build files (CMake stays canonical for CI); it is
+              # pinned here so `nix develop -c meson ...` cannot silently
+              # fall through to a host meson of unknown version.
               pkgs.cmake
+              pkgs.meson
               pkgs.ninja
               pkgs.pkg-config
               llvmPackages.lld
