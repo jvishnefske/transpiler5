@@ -3489,6 +3489,59 @@ of references or inheritance, so it precedes both.
   export-skip lives in the shared tail (an exported owner is excluded
   from mode selection silently, mirroring the same-thread exclusion).
 
+  FR-62 F1b LANDED (2026-08-04): bin-local actor lift under
+  `--partition`, after a GO probe on a 3-TU corpus (a cluster in a TU
+  the globals invariant condenses into the bin crate, a cluster in the
+  main TU, a cluster wholly inside a lib member). The probe's two
+  findings ARE the slice's soundness argument: (1) the ORDINAL
+  INVARIANT holds on the partition path for free — the partition
+  harvest already stores one graph text per link-line position
+  (positionGraph), so per-position ActorUnits make the merge's running
+  retag ordinal equal the link position, exactly the alpha-rename
+  renameShardTags gave the merged module the split distributes
+  (probe: plan symbols TU1_Y_TOTAL/TU2_M_COUNT/X_COUNT == emitted
+  member symbols); (2) the FR-59 GLOBALS INVARIANT makes every actor
+  cluster CRATE-LOCAL by construction (state never crosses a member
+  boundary, and no lib member can reference into the bin crate), so
+  bin-locality is decidable per actor from the merged graph's defining
+  positions (node tuIndex -> ordinal map -> unitCrate), the lift's
+  rewrite set is closed within the bin module, and lib members' bytes
+  are untouched by construction — "spans workspace crates" in the
+  demote note names the actor SYSTEM (driver in bin, state elsewhere);
+  post-condensation an actor's own cluster never literally straddles
+  members. Implementation is driver-side: liftPartitionBinActors runs
+  after the split on the binary member's module only, planning over
+  the WHOLE link line (both invariants are whole-link facts) and
+  passing the plan to the shared runActorLiftTail INTACT — not-bin-
+  local actors demote through a new certification rule 0
+  (attachActorLiftAttributes' preDemotions: (actor index, reason)
+  entries applied before any table rule), which keeps the universe
+  total and actor indices stable, so partial demotion of a cross
+  client's targets composes through the machinery rules 1b/2 already
+  exercise, and static-cell lifting behaves exactly as F1a on the bin
+  module. Symbols the merged graph cannot place demote conservatively
+  (fail-toward-current). Missing/unreadable FR-57d graph metadata
+  demotes-all — warning iff the lift was explicit, silent under the
+  stage-B default (F1a-3's posture). A workspace with NO binary member
+  skips silently (F2 export under --partition is a later stage).
+  Recorded edge: "@stdout is total" means printf-calling arms in
+  different members seed/merge into one actor that then demotes as
+  not-bin-local — conservative, correct, and a reason for the later
+  stage. RECORDED LATER STAGE, not attempted: actor-aware partition
+  condensation — feeding actor edges into planPartition so a cluster
+  is STEERED into the binary crate instead of demoted. VALIDATION:
+  test/Driver/actor-lift-partition.c (both bin-local clusters lift in
+  the bin member, the lib-side cluster demotes with the note, the lib
+  member keeps the thread-local form with no actor struct,
+  --actor-lift=false stays fully demoted with no chatter),
+  test/Driver/link-partition.c pins the spans-note on both --partition
+  runs (its corpus's one actor is lib-side; the gapp bin member stays
+  byte-identical — nothing attaches, no pass runs), and THE oracle
+  test/EndToEnd/actor-partition-lift.c: the partitioned workspace's
+  stdout byte-diffed against the clang-native binary AND against the
+  fully-lifted single-crate link of the same objects. Suite 514/514
+  (the F1a 512 plus the two new tests).
+
 FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
