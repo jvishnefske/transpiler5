@@ -3339,10 +3339,42 @@ of references or inheritance, so it precedes both.
   responsibility partitioning" — the frozen planActors core +
   `--actor-map` overrides: test/Driver/actor-plan-{basic,map,scc,
   poison,address-of,link}.c. Deliberately out of scope and recorded as
-  such, not blocking: per-actor mode selection (anchor carries mode per
-  actor; driver plumbing only), genuinely concurrent actors /
-  free-running select (permanently rejected), and the off-slice
-  FR-30-owner SymbolTable bug noted under 5b.
+  such, not blocking: genuinely concurrent actors / free-running select
+  (permanently rejected), and the off-slice FR-30-owner SymbolTable bug
+  noted under 5b.
+
+  F3 LANDED (2026-08-03): per-actor mode selection via
+  `--actor-mode-map <file>` — driver plumbing only, exactly as the 5b
+  spike predicted (the anchor op and the emitrust-actor-thread pass
+  already carry/stamp mode PER ACTOR; no pass, dialect or emitter
+  change, and `--actor-map`'s plan-override contract is untouched). One
+  `<actor-name> <mode>` line per actor, the name being the LIFTED actor
+  type name (e.g. CounterActor — the spelling in the emitted struct,
+  the thread-pass warnings and the anchor op), the mode being
+  threaded|async|same-thread. Semantics: an entry OVERRIDES the global
+  --actor-mode for exactly that actor, in either direction;
+  `same-thread` EXCLUDES the actor from the anchor selection, so it
+  keeps the slice-4 struct shape (exclusion by choice, the same
+  observable shape as the thread pass's cross-client veto); a name
+  matching no lifted actor is a WARNING and the entry is ignored
+  (fail-toward-noop); a malformed line (wrong field count, unknown
+  mode) is an ERROR in `--actor-map`'s wording style; and a resulting
+  per-module threaded+async mix is a LOCATED driver error — one crate
+  carries one actor_rt runtime flavor — with the emission rejection in
+  actor-runtime-mixed-modes-invalid.mlir untouched as backstop.
+  Reifying (threaded/async) entries compose exactly like the global
+  flag: the lift is the same mandatory precondition, the
+  lowered-emission gate is shared, and under --link the map reifies
+  nothing (rule 5) and says so; a same-thread-only map composes
+  silently everywhere, like --actor-mode=same-thread. VALIDATION:
+  Driver surface test/Driver/actor-mode-map.c (override both
+  directions in the anchor report, located mix error, unknown-name
+  warning, both malformed shapes, lift/emission/link gates) and
+  EndToEnd byte-diff test/EndToEnd/actor-mode-map-mixed.c (two
+  thread-eligible actors, the Inputs/ map opts one out: CounterActor
+  keeps the mailbox runtime, TotalActor keeps the struct shape with no
+  warning printed, no thread_local survives, stdout byte-diffs the
+  clang native). Suite 507/507.
 
 FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
