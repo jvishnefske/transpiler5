@@ -15,7 +15,8 @@ emitrust_opt = executable('emitrust-opt',
   include_directories: emitrust_inc,
   cpp_args: tool_link_args,
   link_with: [lib_convert_to_emitrust, lib_lower_containers,
-              lib_lower_external_requirements, lib_actor_lift],
+              lib_lower_external_requirements, lib_actor_lift,
+              lib_actor_thread],
   dependencies: [llvm_dep, mlir_dep, tblgen_dep])
 
 emitrust_translate = executable('emitrust-translate',
@@ -45,7 +46,8 @@ emitrust_cc = executable('emitrust-cc',
   cpp_args: tool_link_args,
   link_with: [lib_project, lib_importc, lib_target_rust,
               lib_convert_to_emitrust, lib_lower_containers,
-              lib_lower_external_requirements, lib_actor_lift],
+              lib_lower_external_requirements, lib_actor_lift,
+              lib_actor_thread],
   dependencies: [llvm_dep, mlir_dep, clang_dep, tblgen_dep])
 
 emitrust_clang = executable('emitrust-clang',
