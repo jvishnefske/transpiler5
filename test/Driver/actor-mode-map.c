@@ -21,8 +21,9 @@
 //  - a reifying (threaded/async) entry composes exactly like the global
 //    --actor-mode: the lift is a mandatory precondition and the emission
 //    modes are gated the same way;
-//  - under --link a reifying entry reifies nothing (rule 5) and must SAY
-//    so, mirroring --actor-mode's link warning.
+//  - under --link a reifying entry reifies nothing (FR-62 F1a: the link
+//    lift is same-thread only; actor mode under link is a recorded later
+//    stage) and must SAY so, mirroring --actor-mode's link warning.
 //
 // Exclusion under a global reifying mode: CounterActor threads,
 // TotalActor stays a plain lifted struct.
@@ -78,12 +79,12 @@
 // RUN:   | FileCheck %s --check-prefix=GATE
 // GATE: error: --actor-mode-map is only valid with --emit=mlir, --emit=rust or --emit=crate
 //
-// Under --link every actor is rule-5 demoted: a reifying map entry
+// Under --link the lift is same-thread only: a reifying map entry
 // reifies nothing and must say so; the link still succeeds.
 // RUN: env EMITRUST_REAL_CC=clang emitrust-clang -c %s -o %t.o
 // RUN: emitrust-cc --actor-mode-map %t.one.map --link %t.o --emit=rust -o %t.link.rs 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=LINKWARN
-// LINKWARN: warning: --actor-mode-map under --link reifies nothing: every actor is demoted (rule 5)
+// LINKWARN: warning: --actor-mode-map under --link reifies nothing: actor mode under --link is a later stage (lifted actors stay same-thread)
 
 int printf(const char *, ...);
 
