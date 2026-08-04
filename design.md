@@ -4199,6 +4199,36 @@ rule.
   ownership-census finding. The per-index enum also caps at
   kMaxOwnerArrayElements; a growable region needs the typed-index
   (newtype) form instead — an emitted-style question (Q4).
+  CONTAINER_OF RECOGNITION SPIKE (census, NO-GO — the recorded C99-43
+  design decision on this front): full census over the kernel slice's
+  real include closure (131 shard TUs, 761 reachable files via kbuild
+  .cmd dep lists; tarball sha256 matches the FR-60b record): 183
+  textual sites, 26 real code sites (5 shard TUs + header inlines, 416
+  per-TU materialized instances), every chain expanding through the one
+  include/linux/container_of.h definition; open-coded (char*)-offsetof
+  downcasts: ZERO in the slice. NO-GO on three measured blockers:
+  (1) payoff ~zero — every containing type in the slice is
+  independently rejected on fronts the recognizer does not touch
+  (kref/refcount_t volatile atomics, the 7,135-item rank;
+  function-pointer + incomplete-struct members, the 31,895-item
+  cascade), so perfect recognition converts approximately no rejected
+  items today; (2) the canonical shape falsifies the invariant — 8 of
+  26 sites are for_each_entry loops whose exit-test downcast passes
+  through a bare sentinel head embedded in NO container object, so a
+  sound per-expression member-provenance proof must reject the idiom's
+  most common form, and admitting it forces loop-level guarded-validity
+  idiom recognition, the same fragile shape-specific machinery class
+  the malloc-pool IR-rewrite NO-GO measured and rejected; (3) the
+  closed-region precondition fails on the slice's actual lists — they
+  are open cross-TU registration sets (i8253.c's global registered into
+  clockevents.c's static heads; per-cpu registrants under real
+  configs), which do not close per-TU and can never close over dynamic
+  registrants. What would change the verdict: demand from a corpus with
+  otherwise-admissible, statically-closed containers; candidate (i)'s
+  widened multi-base fixpoint landed under FR-58 joint re-import; or
+  the volatile/incomplete-struct fronts retiring first. DECISION: the
+  container_of-free admissible subset (candidate (i)'s arena/index
+  form, byte-matched above) stays sequenced behind that demand signal.
   CANDIDATE (ii), OWNERSHIP RESTRUCTURING (pointee moves into the
   struct, Option-of-Box tree) — compiles clean and its inorder walk
   cross-checks equal to the arena twin at runtime, BUT the node type
