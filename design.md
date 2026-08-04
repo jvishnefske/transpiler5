@@ -2541,7 +2541,7 @@ of references or inheritance, so it precedes both.
     unsigned scalars, enums, fn-ptrs, address-taken scalars, STL/FILE
     locals, owner structs.
 
-- [ ] FR-62 Message-based / actor decomposition of the program graph.
+- [x] FR-62 Message-based / actor decomposition of the program graph.
   Owner direction (2026-08-03, verbatim): "convert program graph into
   message based rust system or (feature flag) async select passing with
   the option of a pluggable optimizer for actor responsibility
@@ -3229,6 +3229,97 @@ of references or inheritance, so it precedes both.
   --actor-lift=false) — the FR-30 owner promotion moves the function
   into an owner impl whose SymbolTable hides module-level globals;
   pre-existing, needs its own fix.
+
+  SLICE 5c LANDED (2026-08-03; box CHECKED below). `--actor-mode=async`
+  is end to end — emitter branch + manifest flavor only, exactly as the
+  5b spike predicted: NO pass or dialect change (verified before
+  implementation: `emitrust-actor-thread` parses and stamps
+  "threaded"|"async" from the `emitrust.actor_thread` attr already; only
+  the driver hard-coded the mode string, a driver-only fix). EMITTER AS
+  LANDED: the mode=async branch of the actor_runtime handler shares the
+  threaded derivation with the substrate strings switched — Msg reply
+  fields are `tokio::sync::oneshot::Sender<T>`, spawn moves the state
+  onto `tokio::task::spawn` behind an UNBOUNDED mailbox (send never
+  awaits, so the wrapper's only suspension point is the reply await; the
+  arm's loud-failure form is `is_err` + panic because a tokio oneshot
+  returns the unsent value itself, no Debug bound), wrappers are `async
+  fn` with `self.call(..).await` — the IMMEDIATE await, E4's ordering
+  contract (at most one message in flight, effect order = program order
+  on the current_thread runtime); every driver method_call on an async
+  handle appends `.await` and the containing function renders `async
+  fn` (mechanical rule: a function containing an async-handle call is
+  async — the pass guarantees handles never escape the constructing
+  driver, so this is exactly c_main); the shared `mod actor_rt` epilogue
+  has a tokio flavor (UnboundedSender + tokio::task::JoinHandle;
+  reap/shutdown are async fns re-raising the actor's OWN payload via
+  `JoinError::into_panic` + resume_unwind — single-panic provenance
+  kept). A module MIXING anchor modes is rejected loudly at emission
+  (one crate carries one actor_rt flavor; the driver can't produce it,
+  a hand-written module must not silently get one flavor's runtime
+  under the other's wrappers). RUNTIME-SHIM DECISION, measured not
+  assumed: both shims probe-built; the explicit
+  `tokio::runtime::Builder::new_current_thread().enable_all().build()
+  .block_on(c_main())` wrapper needs NO "macros" feature, so the
+  manifest dependency is `tokio = { version = "1", features = ["rt",
+  "sync"] }` — 3 crates in the dependency tree vs 10 for
+  `#[tokio::main]` (tokio-macros/syn/quote/proc-macro2/unicode-ident)
+  with zero behavioral difference; E4's recorded ["rt","sync","macros"]
+  list was the attribute-macro guess, superseded by measurement.
+  MANIFEST FLAVOR: default manifest byte-for-byte plus one appended
+  `[dependencies]` table with the unconditional tokio entry (never a
+  cargo feature — the offline NO-GO stands); one deliberate refinement
+  of the slice spec: the flavor tracks the MODULE (any async anchor),
+  not the bare flag, so a `--actor-mode=async` run whose every actor
+  demoted emits a crate with no tokio reference AND the default
+  offline-buildable manifest + sync main wrapper — the offline contract
+  is preserved exactly for crates that need nothing
+  (test/Driver/actor-mode-async-crate.c pins both directions plus the
+  default-manifest prefix diff). DRIVER: async obeys the SAME
+  composition rules as threaded — `--actor-lift=false` is the same
+  located error, `--link` warns "spawns nothing: every actor is demoted
+  (rule 5)", the emission-mode gate is shared, and the "not yet
+  emitted" error is deleted (actor-mode-conflicts.c updated).
+  VALIDATION: Target golden actor-runtime-async.mlir (enum/spawn/async
+  wrappers/.await/async fn c_main/plain fn unaffected/epilogue-once),
+  emission negative actor-runtime-mixed-modes-invalid.mlir, Driver
+  golden actor-mode-async-crate.c, and the EndToEnd twins — tokio WAS
+  fetchable in this environment (resolved 1.53.1 from the warm cargo
+  cache), so the FULL byte-diff path was taken, no REQUIRES-gated skip:
+  actor-mode-async-globals.c (the spike program byte-diffs the tokio
+  crate vs the clang native AND pins 3-run byte-identical determinism;
+  greps prove async fired and no std::thread/thread_local/unsafe
+  survives) and actor-mode-async-panic.c (deterministic OOB in an async
+  arm: exit 101, exactly ONE panicked line with the original
+  index-out-of-bounds provenance through into_panic, stdout prefix
+  flushed). Zero drift: all 497 pre-existing tests pass byte-identical;
+  suite 502/502.
+
+  FR-62 BOX DECISION (2026-08-03): CHECKED. The owner's verbatim ask is
+  covered component by component with passing validating tests in the
+  suite: (1) "convert program graph into message based rust system" —
+  the default-on same-thread lift: pass goldens
+  test/Conversion/ActorLift/{globals,cross,threading,demote}.mlir,
+  driver composition test/Driver/actor-lift-{disable,rust,link}.c, and
+  the EndToEnd lift twins
+  test/EndToEnd/actor-lift-{globals,cross,fnptr,threading,variadic}.c;
+  plus the threaded reification: dialect round-trip + 9 negatives
+  test/Dialect/EmitRust/actor-runtime{,-invalid}.mlir, emission golden
+  test/Target/Rust/actor-runtime.mlir, pass goldens
+  test/Conversion/ActorThread/{threaded,mixed,veto}.mlir, EndToEnd
+  twins test/EndToEnd/actor-mode-threaded-{globals,panic,mixed}.c.
+  (2) "(feature flag) async select passing" — landed as the SEPARATE
+  crate flavor (E4's offline contract overturned the cargo-feature
+  mechanism itself; free-running select stays permanently out of scope,
+  RFC condition 3 deliberately unmet — the byte-exact oracle is never
+  weakened): the slice-5c evidence above, with the full byte-diff run
+  locally, not skipped. (3) "pluggable optimizer for actor
+  responsibility partitioning" — the frozen planActors core +
+  `--actor-map` overrides: test/Driver/actor-plan-{basic,map,scc,
+  poison,address-of,link}.c. Deliberately out of scope and recorded as
+  such, not blocking: per-actor mode selection (anchor carries mode per
+  actor; driver plumbing only), genuinely concurrent actors /
+  free-running select (permanently rejected), and the off-slice
+  FR-30-owner SymbolTable bug noted under 5b.
 
 FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
