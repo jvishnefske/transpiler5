@@ -4617,6 +4617,72 @@ rule.
   unchanged, zero items on the global-target tag before and after
   (check_cpu still rejects on shape, the variant-B guard), so the
   committed baseline stands.
+  FRONT C3 LANDED (2026-08-04; box stays OPEN — the orchestrator closes
+  it): the argv cursor table (retires the W4.3 gap). C `main`'s
+  `char **argv` imports as the opaque `!emitrust.argv_table` parameter
+  when EVERY use fits the admitted read grammar; the c_main signature
+  then reads `c_main(argc: i32, argv: !emitrust.argv_table) -> i32`
+  (rendered `fn c_main(v0: i32, v1: &[Vec<i8>]) -> i32`). THE WRAPPER
+  (spike-validated against the hand target twin_a, byte-diff-proved): a
+  3-way arity select in CrateEmitter (0/1/2 c_main inputs) adds the
+  arity-2 entry shim, which collects the argument vector from
+  `std::env::args_os()` as RAW BYTES — each OS argument's bytes widened
+  to `i8` with a trailing NUL appended (`OsStrExt::as_bytes` +
+  `chain(once(0i8))`), reproducing C's NUL-terminated `char*` strings
+  byte-for-byte, so a non-Unicode argument round-trips where a `String`
+  collection would panic or lossily replace — then calls
+  `c_main(__emitrust_argv.len() as i32, &__emitrust_argv)`. The async
+  twin drives it on the tokio current_thread runtime; the arity-0/1
+  wrappers (`main(void)`, argc-only) stay BYTE-IDENTICAL to the pre-C3
+  emitter (zero churn on every non-argv crate). ADMITTED READ GRAMMAR
+  (planArgvUsesFor, admit-all-or-drop): (1) a whole-value `argv[i]` fed
+  as a DIRECT `printf` `%s`/`%.Ns` argument with no field width — it
+  borrows argument i's NUL-terminated byte run as an
+  `emitrust.argv_arg` -> `!emitrust.ref<!emitrust.slice<i8>>`
+  (`&table[i as usize][..]`); (2) `argv[i][j]` bytes consumed as VALUES
+  — `%c` holes, comparisons/NUL-scans (`while (argv[1][n]) n++`),
+  scalar reads, and `%d`/`%i` — resolving through the SHARED slice place
+  (`emitrust.argv_arg` + deref + subscript) via a new emitLValue argv
+  branch, so a byte read, a comparison, and a `%d` all read one way; and
+  (3) argc used as the plain i32 loop/print scalar. EVERYTHING ELSE
+  leaves the parameter unadmitted and keeps the historical located
+  rejection ("use of main's argv parameter (command-line argument values
+  are not modeled)", RejectionLedger `{"use of main's argv", "argv"}`,
+  wording and tag byte-identical): stores of `argv`/`argv[i]` to a local,
+  escapes to other calls, address-of (`&argv[i]`), pointer arithmetic
+  (`argv++`, `*argv`), writes, pointer-value tests (`argv[0] != 0`), and
+  a `%s` with an explicit field width (`%10s`, which the raw helper
+  cannot pad). LATIN-1 BYPASS (the reason for the raw `*_out` helpers):
+  an argv-fed `%s`/`%c` hole in the stdout `print!` context must NOT flow
+  through the `__emitrust_cstr`/`__emitrust_fmt_c` Display funnels, whose
+  byte-to-char widening emits two-byte UTF-8 for any argument byte
+  128..=255 and would double-encode a non-ASCII argument (the spike's
+  matrix column C, the `héllo` case). Instead translatePrintfFormat
+  splits the format: the pending segment flushes as its own `print!`
+  call, and the hole renders through the on-demand raw helpers —
+  `__emitrust_cstr_out` (NUL-scan + `write_all` of the raw bytes),
+  `__emitrust_cstr_n_out` (the `%.Ns` twin), `__emitrust_byte_out` (one
+  raw byte) — all writing to the SAME globally buffered stdout handle
+  `print!` locks, so segment ordering holds even on block-buffered pipes.
+  A `%d`/`%i` of an argv byte is NOT bypassed: it flows through the exact
+  integer path (i8 -> cast -> `{}`). HARNESS GATE (spike-measured): the
+  native oracle and the crate binary live at different absolute paths, so
+  a program echoing `argv[0]` (now importable) would diff on the path
+  alone. run_realworld.py's `run_command` gained an optional `argv0`
+  that runs `Popen([argv0]+cmd[1:], executable=cmd[0], ...)`; the SAME
+  `argv0` ("./" + name) is passed to BOTH the native and crate runs,
+  equalizing `argv[0]` — a no-op for every existing program (none read
+  argv[0]). TESTS: test/Import/C/main-argv.c (admitted signature seat +
+  the printf bypass split), main-argv-invalid.c (the five non-admitted
+  shapes, exact wording twin), test/EndToEnd/argv-echo.c (byte-diff vs
+  clang native across four arg vectors — no args, several, spaces, and a
+  UTF-8 arg — echoing only argv[1..] to dodge the path difference),
+  the dialect round-trip test/Dialect/EmitRust/argv-table{,-invalid}.mlir
+  and target test/Target/Rust/argv-table.mlir, and RealWorld argv-echo
+  promoted to expected-transpile.txt behind the argv0 gate. The FR-51
+  dropped-main Driver test now STORES argv (still non-admitted) to keep
+  exercising the recovery path, since a `%s` of argv is now admitted.
+  Suite 517 -> 523.
 - [x] C99-44 Unions. DECIDED and SHIPPED: the one-slot struct model —
   a supported subset with documented located rejections, not an enum
   mapping and not a blanket rejection. A named or untagged union
@@ -6895,8 +6961,10 @@ prints a **blocker-tag tabulation** — the survey signal W4.1 reads. Gated in
 `ninja check-emitrust` via the `test/RealWorld/realworld.c` lit stub
 (`REQUIRES: cargo`); the corpus lives under `Inputs/` so it is excluded from
 lit discovery (`config.excludes = ["Inputs"]`) yet regression-protected through
-the stub. `argv` VALUES are dropped at import (the main wrapper passes only
-`argc`), so command-line-argument programs reject.
+the stub. `argv` VALUES that fit the C99-43 C3 admitted read grammar (whole
+`argv[i]` fed to `printf` `%s`, `argv[i][j]` bytes, argc loops) now import as
+the argv cursor table (`argv-echo` transpiles); every other argv use is still
+dropped at import, so those command-line-argument programs reject.
 
 **Blocker tags** are a heuristic over the first diagnostic line: the
 system-header symbol is parsed out (`free`/`realloc`/`malloc`/`calloc` →
@@ -6960,7 +7028,7 @@ transpiles); seven rejected programs remain.
 | 3 | strchr-result-bind | 1 (`grep-lite`) | no | med | bind a strchr result to a pointer local |
 | 4 | global-string-cursor | 1 (`expr-eval`) | no | med | global `char*` into a literal, walked as a cursor |
 | 5 | returned-pointer | 1 (`binary-tree`, ALSO dynamic-memory) | likely | high | pointer to a heap object |
-| 6 | argv | 1 (`argv-echo`) | — | high | W4.3 argv cursor table |
+| 6 | argv | 1 (`argv-echo`) | — | high | **LANDED** — C99-43 C3 argv cursor table (see the C99-43 FRONT C3 record) |
 
 Rationale: the `crc32` crash is a robustness override — a compiler must never
 segfault, and the fix is cheap and localized, so it precedes the entire feature
@@ -6968,8 +7036,9 @@ ladder. `dynamic-memory` clears the most single-blocker programs (2) at moderate
 non-RFC cost, so it leads the ladder (W4.2). `binary-tree` is DOUBLE-blocked
 (returned-pointer AND dynamic-memory — its returned pointer roots in a
 `malloc`'d node, not an array), so it will not clear until both land; it sits at
-the RFC-likely tail. `argv` needs the second-order cursor-table generalization
-(W4.3). Ranks 2–6 are future waves; only rank 1 is actioned this session.
+the RFC-likely tail. `argv` needed the second-order cursor-table
+generalization (W4.3), now LANDED as C99-43 C3 (see the FRONT C3 record).
+Ranks 2–6 are future waves; only rank 1 is actioned this session.
 
 **W4.1 update: `crc32` crash fixed.** `emitBorrowArgument` gained a
 `literalBacking` branch (right after `emitPointerRValue`, before any base-keyed
