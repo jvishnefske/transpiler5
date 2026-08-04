@@ -6962,6 +6962,54 @@ the way a planner rejection used to. FR-42's per-item recovery has no
 counterpart in the pass pipeline or the emitter; giving it one is the natural
 successor to FR-53.
 
+**External-validation lessons, consolidated (and the paper's disposition).**
+The accompanying paper's four contributions do NOT survive third-party
+validation equally, and the split is the durable lesson -- more than any
+single number, because the numbers move (this section was re-measured after
+FR-53/54/55; the small-libs table above is the current state).
+ - **Contribution 1 (emission-derived colouring) is corpus-bound in its
+   MEASUREMENT, sound in its RULE.** Zero false negatives across 1337 items
+   is a fact about the corpus we wrote; on unmodified third-party C the same
+   probe admits ~99.6-99.7% of items (CMSIS-DSP 100% green / 0% ported,
+   mbedTLS 99.6% / 47%). The contract holds -- false greens are the safe
+   direction and false reds stay zero -- but the precision claim does not
+   generalise (finding 6; the `ItemColoring.h` doctrine qualification at the
+   cascade-containment record above).
+ - **Contribution 2 (subtractive search) splits: the asymmetry SURVIVES, the
+   cost model does NOT.** That the search is unsound in exactly one direction
+   is STRUCTURAL -- it follows from the search being subtractive, holds for
+   any approximation seeding any subtractive search, and no corpus can refute
+   it. But FR-43's rationale that a false green "costs only one probe because
+   the search repairs it" fails: the search repairs NOTHING on non-synthetic
+   input, so a false green costs an over-promising colouring with nothing
+   behind it.
+ - **Contributions 3-4 (yield, ratcheted progress) are real but small, and
+   about PARTIAL translation.** Whole-program yield on unmodified third-party
+   embedded C is ZERO (both `TRANSLATED_FULL` results are vacuous empty TUs).
+   The value the data supports is PARTIAL translation as a demand-and-backlog
+   instrument (post-FR-53/54/55: CMSIS-DSP 83/91 crates building, small libs
+   20/22) plus the methodology itself -- not end-to-end translation of
+   arbitrary embedded C, which the paper's headline measurement set would let
+   a reader assume.
+ - **The durable rule.** Every claim this project validated ONLY on
+   self-authored input has later failed on real input -- the `main`-only
+   blind spot (FR-51), the harness mis-invocation (FR-52), the FR-42
+   attribution caveat, and now Contribution 1's precision: FOUR recurrences,
+   which is itself the finding. Going forward every claim is classified as
+   STRUCTURAL (true by construction, corpus-independent -- e.g. the search
+   asymmetry, the byte-diff oracle's soundness) or MEASURED (state its corpus
+   and treat as un-generalised until an EXTERNAL corpus confirms it). A
+   self-authored benchmark is not evidence of external validity; it encodes
+   its authors' assumptions twice, in the code and in the harness.
+ - **Paper commit disposition.** The orphaned worktree commit `006ca14`
+   ("paper: add external-validation section and requalify the claims it
+   breaks", 2026-07-31) is SUPERSEDED, not rebased: its numbers predate
+   FR-53/54/55 (it records CMSIS-DSP at 0 crates against the re-measured 83),
+   and it is a full paper snapshot on a stale base rather than a surgical
+   delta. The lessons are captured here against current data; if the paper's
+   External Validation section is written into `paper/paper.tex`, it must draw
+   from the re-measured Track 5 numbers above, not from that commit.
+
 
 ## Track 4 RealWorld corpus (demand signal)
 
