@@ -828,17 +828,31 @@ LogicalResult GlobalOp::verify() {
   return success();
 }
 
+GlobalOp GlobalOp::lookupFrom(Operation *from, llvm::StringRef name) {
+  // Globals are module children, but `from` may live inside a nested
+  // symbol table (an `emitrust.impl` method after FR-30 owner promotion),
+  // so resolve in the enclosing module's table; fall back to the nearest
+  // table for unattached IR. Mirrors DataEnumDefOp::lookupFrom.
+  auto nameAttr = StringAttr::get(from->getContext(), name);
+  if (auto module = from->getParentOfType<ModuleOp>())
+    return dyn_cast_or_null<GlobalOp>(
+        SymbolTable::lookupSymbolIn(module, nameAttr));
+  return SymbolTable::lookupNearestSymbolFrom<GlobalOp>(from, nameAttr);
+}
+
 //===----------------------------------------------------------------------===//
 // GlobalLoadOp / GlobalStoreOp
 //===----------------------------------------------------------------------===//
 
-/// Resolves the referenced global of a load or store, or emits an error on
-/// `op` when the symbol does not name an `emitrust.global`.
+/// Resolves the referenced global of a load, store, or cell-slice borrow,
+/// or emits an error on `op` when the symbol does not name an
+/// `emitrust.global`. The lookup runs in the enclosing MODULE's symbol
+/// table (via GlobalOp::lookupFrom): `emitrust.impl` is itself a
+/// SymbolTable, so a nearest-table lookup from an accessor nested in an
+/// owner impl's method would never see module-level globals.
 static FailureOr<GlobalOp> resolveGlobal(Operation *op,
-                                         SymbolTableCollection &symbolTable,
                                          FlatSymbolRefAttr symbol) {
-  auto global =
-      symbolTable.lookupNearestSymbolFrom<GlobalOp>(op, symbol.getAttr());
+  GlobalOp global = GlobalOp::lookupFrom(op, symbol.getValue());
   if (!global)
     return op->emitOpError("'")
            << symbol.getValue()
@@ -851,7 +865,7 @@ static FailureOr<GlobalOp> resolveGlobal(Operation *op,
 LogicalResult
 GlobalLoadOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   FailureOr<GlobalOp> global =
-      resolveGlobal(getOperation(), symbolTable, getGlobalAttr());
+      resolveGlobal(getOperation(), getGlobalAttr());
   if (failed(global))
     return failure();
   if (getResult().getType() != global->getType())
@@ -866,7 +880,7 @@ GlobalLoadOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 LogicalResult
 GlobalStoreOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   FailureOr<GlobalOp> global =
-      resolveGlobal(getOperation(), symbolTable, getGlobalAttr());
+      resolveGlobal(getOperation(), getGlobalAttr());
   if (failed(global))
     return failure();
   if (global->getIsConst())
@@ -946,7 +960,7 @@ LogicalResult GlobalCellsOp::verify() {
 LogicalResult
 GlobalCellsOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
   FailureOr<GlobalOp> global =
-      resolveGlobal(getOperation(), symbolTable, getGlobalAttr());
+      resolveGlobal(getOperation(), getGlobalAttr());
   if (failed(global))
     return failure();
   if (global->getIsConst())

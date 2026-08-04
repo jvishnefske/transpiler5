@@ -3228,7 +3228,32 @@ of references or inheritance, so it precedes both.
   emitrust.global` on paths this slice never touches (identically under
   --actor-lift=false) — the FR-30 owner promotion moves the function
   into an owner impl whose SymbolTable hides module-level globals;
-  pre-existing, needs its own fix.
+  pre-existing, needs its own fix. FIXED (2026-08-03): root cause
+  confirmed exactly as recorded — `emitrust.impl` carries the
+  SymbolTable trait, so every nearest-table global lookup rooted inside
+  an owner method resolved in the impl's table and never saw the
+  module-level `emitrust.global`. Fixed at the dialect layer with the
+  slice-5a precedent: `GlobalOp::lookupFrom` (EmitRustOps.td/.cpp,
+  mirroring `DataEnumDefOp::lookupFrom`) resolves in the ENCLOSING
+  MODULE's table, and ALL global-accessor lookups route through it —
+  the shared `resolveGlobal` behind the GlobalLoadOp / GlobalStoreOp /
+  GlobalCellsOp verifySymbolUses verifiers, plus the emitter's own
+  `lookupGlobal` in TranslateToRust.cpp (emitGlobalLoad /
+  emitGlobalStore / emitGlobalCells). No emission behavior changed for
+  any accepted program (globals are HasParent<ModuleOp>, so the module
+  table is strictly the correct scope; previously-REJECTED programs now
+  verify, nothing else moves). VALIDATION: dialect round-trip with all
+  three accessors inside an impl method
+  (test/Dialect/EmitRust/global-in-impl.mlir), emitter golden for
+  load+store inside an impl (test/Target/Rust/global-in-impl.mlir), and
+  the EndToEnd repro of the recorded shape — main fills a local array,
+  add_from walks it via the promoted owner method while updating two
+  file globals — byte-diff GREEN vs the clang native
+  (test/EndToEnd/global-in-owner-impl.c). The slice-4 opaque-constant
+  lift workaround is untouched (behavior-pinned). Suite 505/505 (was
+  502 + the 3 new tests); zero drift; the c-testsuite ledger is
+  unchanged (the runner ratchets loudly on new passes and stayed
+  green against the existing manifest).
 
   SLICE 5c LANDED (2026-08-03; box CHECKED below). `--actor-mode=async`
   is end to end — emitter branch + manifest flavor only, exactly as the

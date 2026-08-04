@@ -3923,11 +3923,15 @@ LogicalResult RustEmitter::emitGlobal(emitrust::GlobalOp globalOp) {
 }
 
 /// Resolves the `emitrust.global` referenced by the load or store `op`, or
-/// fails with a located diagnostic when the symbol does not name one.
+/// fails with a located diagnostic when the symbol does not name one. The
+/// lookup runs in the enclosing MODULE's symbol table (GlobalOp::lookupFrom):
+/// `emitrust.impl` is itself a SymbolTable, so a nearest-table lookup from
+/// an accessor nested in an owner impl's method would never see the
+/// module-level globals.
 static FailureOr<emitrust::GlobalOp> lookupGlobal(Operation *op,
                                                   FlatSymbolRefAttr symbol) {
-  auto global = SymbolTable::lookupNearestSymbolFrom<emitrust::GlobalOp>(
-      op, symbol.getAttr());
+  emitrust::GlobalOp global =
+      emitrust::GlobalOp::lookupFrom(op, symbol.getValue());
   if (!global) {
     op->emitOpError("'") << symbol.getValue()
                          << "' does not reference a valid emitrust.global";
