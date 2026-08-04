@@ -386,8 +386,12 @@ static llvm::cl::opt<bool> actorLiftFlag(
         "thread one &mut parameter per actor, and driver-only globals "
         "become named main locals — no thread_local survives for any "
         "lifted global. Demoted actors (address-taken arms, poison "
-        "merges, variadic monomorphs, library units, --link) keep "
-        "today's form with a printed warning. Applies with --emit=mlir, "
+        "merges, variadic monomorphs, library units) keep today's form "
+        "with a printed warning. Under --link the lift runs on the "
+        "merged module from the shards' stored item-graph metadata "
+        "(FR-62 F1a, same-thread only); a link line with a metadata-less "
+        "shard demotes every actor — with a note when the flag is "
+        "explicit, silently under the default. Applies with --emit=mlir, "
         "--emit=rust and --emit=crate; the default is inert elsewhere"),
     llvm::cl::init(true));
 
@@ -2135,8 +2139,9 @@ int main(int argc, char **argv) {
   // mandatory precondition: the negative control proved a non-owned
   // cluster on a thread is a silent miscompile, the worst failure
   // direction; an async task owns its state by the same argument). Under
-  // --link every actor is rule-5 demoted, so both modes warn that they
-  // reify nothing rather than pretending otherwise.
+  // --link the lift runs same-thread only (F1a; actor MODE under link is
+  // a recorded later stage), so both modes warn that they reify nothing
+  // there rather than pretending otherwise.
   const bool reifyingActorMode = actorModeFlag == ActorModeRequest::Threaded ||
                                  actorModeFlag == ActorModeRequest::Async;
   llvm::StringRef actorModeName =
@@ -2162,14 +2167,15 @@ int main(int argc, char **argv) {
                  << (actorModeFlag == ActorModeRequest::Threaded
                          ? "threads"
                          : "spawns")
-                 << " nothing: every actor is demoted (rule 5)\n";
+                 << " nothing: actor mode under --link is a later stage "
+                    "(lifted actors stay same-thread)\n";
   // FR-62 F3: the per-actor mode map composes exactly like --actor-mode,
   // entry by entry. A reifying (threaded/async) entry carries the same
   // lift precondition (E3's mandatory-ownership argument holds per actor)
   // and the same lowered-emission gate as the global flag, and under
-  // --link it reifies nothing (every actor is rule-5 demoted) and must
-  // say so. A same-thread-only map composes silently everywhere, like
-  // --actor-mode=same-thread.
+  // --link it reifies nothing (the F1a link lift is same-thread only)
+  // and must say so. A same-thread-only map composes silently
+  // everywhere, like --actor-mode=same-thread.
   std::vector<std::pair<std::string, std::string>> actorModeOverrides;
   if (!loadActorModeOverrides(actorModeOverrides))
     return 1;
@@ -2196,7 +2202,8 @@ int main(int argc, char **argv) {
     }
     if (linkFlag)
       llvm::errs() << "warning: --actor-mode-map under --link reifies "
-                      "nothing: every actor is demoted (rule 5)\n";
+                      "nothing: actor mode under --link is a later stage "
+                      "(lifted actors stay same-thread)\n";
   }
   // FR-60: both artifact queries read the shard ledgers off the link line.
   if (emitKind == EmitKind::RejectionReport && !linkFlag) {
@@ -2427,19 +2434,22 @@ int main(int argc, char **argv) {
     // per-shard facts the ordinary merge deliberately strips.
     if (partitionFlag)
       return emitPartitionedWorkspace(inputs, context);
-    // FR-62 F1a: an EXPLICIT --actor-lift under --link runs the SAME
-    // plan + attach + pass machinery as the source path, on the MERGED
-    // module, from the same stored shard graphs --emit=actor-plan reads.
-    // The unit shape is load-bearing: one graph text per link-line
-    // position, so the planner's running TU-ordinal retag coincides with
-    // the merge's per-position alpha-rename and the plan's symbols ARE
-    // the merged module's symbols (verified for solo shards and for a
-    // non-contiguous re-import group alike). A shard lacking FR-57d graph
-    // metadata demotes every actor with a note — fail-toward-current,
-    // never a failed link. The stage-B default stays demote-all and
-    // SILENT here (rule 5): a default must not demand graph metadata of
-    // every artifact on every link line.
-    bool wantLinkLift = actorLiftFlag && actorLiftFlag.getNumOccurrences() > 0;
+    // FR-62 F1a: --actor-lift under --link runs the SAME plan + attach +
+    // pass machinery as the source path, on the MERGED module, from the
+    // stored shard graphs --emit=actor-plan reads. The unit shape is
+    // load-bearing: one graph text per link-line position, so the
+    // planner's running TU-ordinal retag coincides with the merge's
+    // per-position alpha-rename and the plan's symbols ARE the merged
+    // module's symbols (verified for solo shards and for a
+    // non-contiguous re-import group alike). A shard lacking FR-57d
+    // graph metadata demotes every actor — fail-toward-current, never a
+    // failed link: with a NOTE when the lift was EXPLICITLY requested
+    // (the flag stays honest about what it did not do), SILENTLY when
+    // the flag is stage B's default (F1a-3: a default must not demand
+    // graph metadata of old artifacts — the same posture as the stage-B
+    // flip's silent rule-5 record).
+    bool explicitLift = actorLiftFlag.getNumOccurrences() > 0;
+    bool wantLinkLift = actorLiftFlag;
     llvm::SmallVector<emitrustcc::ActorUnit> units;
     std::string missingShard;
     if (wantLinkLift &&
@@ -2461,15 +2471,18 @@ int main(int argc, char **argv) {
       if (missingShard.empty())
         merged = mergeLinkUnitGraphs(units, graphError);
       if (!missingShard.empty()) {
-        llvm::errs() << "warning: actor plan: --link lift demoted every "
-                        "actor: shard '"
-                     << missingShard
-                     << "' carries no item-graph metadata (artifact "
-                        "predates FR-57d?)\n";
+        if (explicitLift)
+          llvm::errs() << "warning: actor plan: --link lift demoted every "
+                          "actor: shard '"
+                       << missingShard
+                       << "' carries no item-graph metadata (artifact "
+                          "predates FR-57d?)\n";
       } else if (mlir::failed(merged)) {
-        llvm::errs() << "warning: actor plan: --link lift demoted every "
-                        "actor: stored item-graph metadata is unreadable: "
-                     << graphError << "\n";
+        if (explicitLift)
+          llvm::errs() << "warning: actor plan: --link lift demoted every "
+                          "actor: stored item-graph metadata is "
+                          "unreadable: "
+                       << graphError << "\n";
       } else {
         emitrustcc::ActorPlan plan = emitrustcc::planActors(units, {});
         if (mlir::failed(runActorLiftTail(

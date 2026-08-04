@@ -50,13 +50,14 @@
 //
 // No-partition byte-identity: without --partition the same link emits the
 // single crate exactly as before -- crate root byte-identical to the joint
-// import's --emit=rust, no workspace members anywhere. The joint side
-// passes --actor-lift=false since the FR-62 stage-B flip: --link demotes
-// every actor by rule 5, so the merge-equivalence pin compares both sides
-// unlifted (the joint LIFTED build byte-diffed green at the flip).
+// import's --emit=rust, no workspace members anywhere. Since FR-62 F1a-3
+// the defaulted --actor-lift lifts under --link too (every shard carries
+// FR-57d graph metadata), so both sides compare in the same LIFTED form;
+// the --partition path above stays demoted (its lift is F1b, a later
+// slice).
 // RUN: rm -rf %t.single
 // RUN: emitrust-cc --link %t.a.o %t.b.o %t.main.o -o %t.single --crate-name gapp --emit=crate
-// RUN: emitrust-cc --actor-lift=false --emit=rust %S/Inputs/link-partition-global/ga/def.c %S/Inputs/link-partition-global/gb/use.c %s -o %t.joint.rs
+// RUN: emitrust-cc --emit=rust %S/Inputs/link-partition-global/ga/def.c %S/Inputs/link-partition-global/gb/use.c %s -o %t.joint.rs
 // RUN: diff %t.joint.rs %t.single/src/main.rs
 // RUN: not ls %t.single/ga
 //
