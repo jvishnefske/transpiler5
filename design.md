@@ -2967,7 +2967,8 @@ of references or inheritance, so it precedes both.
   no matching IR function (variadic monomorphization measured:
   `addall` vs `addall_1`); (4) no role=driver line (library TU — no
   one constructs the actor; owner-handle export is a recorded later
-  slice); (5) --link mode (demote-all with note; the FR-58/FR-59
+  slice, landed since as F2 — see the FR-62 F2 record after the box
+  decision); (5) --link mode (demote-all with note; the FR-58/FR-59
   interaction is a recorded later stage). STAGING + MEASURED CHURN:
   stage A lands the pass behind `--actor-lift` (default OFF) with
   pass-level FileCheck goldens and dedicated EndToEnd byte-diff twins;
@@ -3375,6 +3376,65 @@ of references or inheritance, so it precedes both.
   keeps the mailbox runtime, TotalActor keeps the struct shape with no
   warning printed, no thread_local survives, stdout byte-diffs the
   clang native). Suite 507/507.
+
+  FR-62 F2 LANDED (2026-08-04): owner-handle export for library TUs —
+  the "later slice" slice-4's demotion rule 4 recorded. A library unit
+  (no driver role / no `c_main`) no longer demotes its certified
+  actors: each EXPORTS as an owner handle. EXPORT SEMANTICS: the
+  per-actor dict in `emitrust.actor_lift` gains an `export` unit key;
+  the pass skips driver construction, marks the synthesized struct_def
+  with `emitrust.private_fields` (the ONE emitter change:
+  `emitStructDef` keeps `pub struct` but drops the per-field `pub ` in
+  export mode, so state is reachable only through the constructor and
+  methods — a no-op byte-wise for binary crates), external-linkage
+  arms render as pub `&mut self` methods, internal `tuN_` arms stay
+  private methods, and non-arm functions in the closure footprint
+  (cross clients) keep the synthesized `&mut Owner` first parameters
+  on their now-pub signatures — an INTENTIONAL API arity change, one
+  `note: actor plan: exported <actor>: owner handle '<Type>'
+  (construct with <Type>::new())` per export on the compile line.
+  NEW() STRATEGY (spike-settled): Default + member assigns — an
+  associated `fn new()` (`emitrust.static_method`, receiverless, pub
+  in export mode) synthesized as the impl's first function, whose body
+  relocates slice-4's driver-side field-initializer materialization
+  (named `owner` variable defaulted, scalar inits via
+  `emitrust.constant`, aggregate inits via a const staging variable
+  loaded once, owner returned by value — renders as the tail-folded
+  three-liner). No struct-literal op exists and none was invented.
+  DERIVE-BYPASS HAZARD, RECORDED NOT FIXED: the struct keeps
+  `#[derive(Clone, Copy, Default)]` — new() itself DEPENDS on the
+  Default derive — so a consumer can bypass new() via
+  `Owner::default()` (skipping the C initializers) or Copy-fork actor
+  state through a plain assignment. Accepted for this slice: the
+  fields being private keeps accidental misuse low, and dropping
+  Copy/Default would break the constructor strategy and the emitted
+  idiom everywhere else. EXPORT GUARDS (fail-toward-current, standard
+  demote warning + thread-local form): an arm generic over the FR-52
+  external-requirements trait must NOT export — the emitter renders
+  method calls without a turbofish, so every internal call site of a
+  generic method is an E0283; the demoted generic-over-thread_locals
+  form is the proven shape (lib-crate-externals-trait.c) — and an arm
+  named `new` collides with the synthesized constructor. NEW
+  CERTIFICATION RULE 1c, found by the export flip on
+  Import/C/defer-externals.c: an owned global that is a
+  deferred-external DECLARATION (`emitrust.extern_decl`, FR-57a)
+  demotes in EVERY mode — another TU owns that state, and lifting
+  would delete the declaration and silently drop the FR-58 link
+  obligation. Exported actors are excluded from `--actor-mode`
+  reification (a library actor has no driver to own a handle).
+  VALIDATION: pass golden test/Conversion/ActorLift/export.mlir
+  (private-fields marker, new()-first impl, scalar + staged aggregate
+  inits, bare-default new(), cross params, globals deleted), driver
+  surface test/Driver/actor-lift-lib.c (export note, FR-52-veto and
+  rule-1 demotions still noting, pub/private emitted posture), and THE
+  oracle test/EndToEnd/actor-lib-export.c +
+  Inputs/actor-lib-consumer.rs — emitted crate compiled as an rlib, a
+  hand-written consumer drives new(), pub arms, the private-arm
+  wrapper, and the &mut-threaded cross function, byte-diffed against
+  the clang-built native via the `#ifdef LIB_CRATE_MAIN` driver trick,
+  plus negative rustc probes pinning E0616 (field privacy, not E0603)
+  and E0624 (internal arm stays a private method). Zero drift outside
+  intent; suite 508/508.
 
 FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
