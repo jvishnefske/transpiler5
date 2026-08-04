@@ -232,23 +232,63 @@ emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
                    "actor surface)",
                it->second);
 
+  // Rule 1c (found by the F2 export flip: Import/C/defer-externals.c): a
+  // deferred-external global (FR-57a `emitrust.extern_decl`) is a
+  // DECLARATION, not storage — another translation unit owns the state,
+  // so the actor cannot own it as a field: lifting would delete the
+  // declaration and silently drop the FR-58 link obligation, and a
+  // synthesized new() would fabricate an initializer this TU never had.
+  for (auto [i, actor] : llvm::enumerate(plan.actors))
+    for (const std::string &global : actor.globals)
+      if (auto it = globalOps.find(global);
+          it != globalOps.end() &&
+          it->second->hasAttr(mlir::emitrust::kExternDeclAttrName))
+        demote((unsigned)i,
+               "global '" + global +
+                   "' is a deferred external declaration (another "
+                   "translation unit defines it)");
+
   // Rule 2: poison-merged actors.
   for (auto [i, actor] : llvm::enumerate(plan.actors))
     if (actor.poisoned)
       demote(i, "condensed under indirect-call poison (an indirect call "
                 "may reach any state)");
 
-  // Rule 4: no driver, nothing constructs the actors.
+  // Rule 4 (FR-62 F2): no driver, nothing constructs the actors — a
+  // LIBRARY unit. The certified actors EXPORT as owner handles (pub struct
+  // with private fields, synthesized `new()` carrying the C initializers)
+  // instead of demoting, with two library-only guards:
+  //  - an arm generic over the FR-52 external-requirements trait must not
+  //    export: the emitter renders method calls without a turbofish, so
+  //    every internal call site of the exported method is an E0283.
+  //    Fail toward current behavior — the demoted thread-local form is the
+  //    proven generic-compatible shape (lib-crate-externals-trait.c);
+  //  - an arm named `new` would collide with the synthesized constructor
+  //    inside the impl.
   bool haveDriver =
       llvm::any_of(plan.actorOfFunction,
                    [](const ActorFunction &fn) {
                      return fn.role == ActorRole::Driver;
                    }) &&
       funcOps.count("c_main");
-  if (!haveDriver)
-    for (unsigned i = 0; i < plan.actors.size(); ++i)
-      demote(i, "library unit has no driver (no main constructs the "
-                "actors; owner-handle export is a later slice)");
+  bool exportOwners = !haveDriver;
+  if (exportOwners)
+    for (const ActorFunction &fn : plan.actorOfFunction) {
+      if (fn.role != ActorRole::Arm)
+        continue;
+      if (fn.symbol == "new") {
+        demote(fn.actor, "arm 'new' collides with the synthesized "
+                         "constructor of an exported owner");
+        continue;
+      }
+      auto it = funcOps.find(fn.symbol);
+      if (it != funcOps.end() &&
+          it->second->hasAttr(mlir::emitrust::kExternalsGenericAttrName))
+        demote(fn.actor,
+               "arm '" + fn.symbol +
+                   "' is generic over the external-requirements trait (an "
+                   "exported method call cannot carry the type parameter)");
+    }
 
   // -- Certified plan actors -> lift entries (field-less ones are simply
   // not lifted: a pure "@stdout" or const-only actor synthesizes nothing
@@ -431,14 +471,22 @@ emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
         globals.push_back(builder.getStringAttr(globalSymbol));
         fields.push_back(builder.getStringAttr(field));
       }
-      actorDicts.push_back(builder.getDictionaryAttr(
-          {builder.getNamedAttr("name",
-                                builder.getStringAttr(entry.typeName)),
-           builder.getNamedAttr("var",
-                                builder.getStringAttr(entry.varName)),
-           builder.getNamedAttr("globals", builder.getArrayAttr(globals)),
-           builder.getNamedAttr("fields",
-                                builder.getArrayAttr(fields))}));
+      llvm::SmallVector<mlir::NamedAttribute> dict{
+          builder.getNamedAttr("name",
+                               builder.getStringAttr(entry.typeName)),
+          builder.getNamedAttr("var",
+                               builder.getStringAttr(entry.varName)),
+          builder.getNamedAttr("globals", builder.getArrayAttr(globals)),
+          builder.getNamedAttr("fields", builder.getArrayAttr(fields))};
+      // FR-62 F2: a library unit's certified actor exports as an owner
+      // handle — the pass synthesizes new() and keeps the fields private.
+      if (exportOwners) {
+        dict.push_back(builder.getNamedAttr("export", builder.getUnitAttr()));
+        if (entry.planActor >= 0)
+          result.exports.push_back(
+              {plan.actors[entry.planActor].name, entry.typeName});
+      }
+      actorDicts.push_back(builder.getDictionaryAttr(dict));
     }
     module->setAttr(mlir::emitrust::kActorLiftActorsAttrName,
                     builder.getArrayAttr(actorDicts));

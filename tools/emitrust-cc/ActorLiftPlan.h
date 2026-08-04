@@ -22,15 +22,28 @@
 ///     a fn-pointer call site cannot thread the receiver; additionally
 ///     reported as a located remark at the address-taking function when the
 ///     graph carries its location;
+///  1c. an owned global that is a deferred-external DECLARATION (FR-57a
+///     `emitrust.extern_decl`): another translation unit owns the state,
+///     so lifting would delete the declaration and drop the FR-58 link
+///     obligation (found by the F2 export flip on a --defer-externals
+///     library TU);
 ///  2. a poison-merged actor (`Actor::poisoned`); a pure writer-rule
 ///     "@stdout" merge is NOT poisoned and lifts fine — the pseudo-global
 ///     contributes no field, and an actor NAMED "@stdout" takes its
 ///     smallest real global's name for the synthesized type instead;
 ///  3. a plan arm/cross symbol with no top-level imported `emitrust.func`
 ///     (variadic monomorphization, recovery drops, FR-30 owner methods);
-///  4. a plan with no driver role, or a module with no `c_main` (library
-///     unit: nobody constructs the actors; owner-handle export is a
-///     recorded later slice);
+///  4. (FR-62 F2) a plan with no driver role, or a module with no `c_main`
+///     (library unit: nobody constructs the actors), no longer demotes —
+///     each certified actor EXPORTS as an owner handle instead: its dict
+///     carries the `export` unit key, the pass synthesizes an associated
+///     `fn new()` carrying the C initializers, and the struct is emitted
+///     pub with PRIVATE fields. Two library-only demotions guard the
+///     export: an arm that is generic over the FR-52 external-requirements
+///     trait (an exported method call cannot carry the type parameter —
+///     E0283 at every internal call site — so the actor keeps the proven
+///     generic-compatible thread-local form), and an arm named `new`
+///     (it would collide with the synthesized constructor);
 ///  5. `--link` (demote-all) is handled by the caller before any plan
 ///     reaches this function.
 /// Additionally, a synthesized type/variable name colliding with an
@@ -91,6 +104,15 @@ struct ActorLiftDemotion {
   unsigned remarkColumn = 0;
 };
 
+/// One exported owner handle (FR-62 F2): a certified actor in a library
+/// unit, exported as a pub struct with private fields and a synthesized
+/// `new()` instead of being demoted; the driver prints one
+/// `note: actor plan: exported <actor>: ...` per entry.
+struct ActorLiftExport {
+  std::string actor;    ///< The PLAN actor name (the plan-text identity).
+  std::string typeName; ///< The exported owner struct name.
+};
+
 /// What `attachActorLiftAttributes` did.
 struct ActorLiftAttachment {
   /// Whether any lift attribute was attached — i.e. whether running the
@@ -98,6 +120,8 @@ struct ActorLiftAttachment {
   bool attachedAny = false;
   /// The demoted actors, in plan (name-sorted) order.
   llvm::SmallVector<ActorLiftDemotion> demotions;
+  /// The exported owner handles (library units only), in entry order.
+  llvm::SmallVector<ActorLiftExport> exports;
 };
 
 /// Certifies `plan` against `graph` and `module` and attaches the

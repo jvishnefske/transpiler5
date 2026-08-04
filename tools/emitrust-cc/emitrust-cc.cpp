@@ -1501,6 +1501,15 @@ static mlir::LogicalResult runActorLiftTail(
                            demotion.remarkLine, demotion.remarkColumn))
           << demotion.remarkText;
   }
+  // FR-62 F2: a library unit's certified actors export as owner
+  // handles (rule 4 no longer demotes them); one note per export so
+  // the intentional API change — new() plus &mut-threaded functions —
+  // is visible on the compile line.
+  for (const emitrustcc::ActorLiftExport &exported : attachment.exports)
+    llvm::errs() << "note: actor plan: exported " << exported.actor
+                 << ": owner handle '" << exported.typeName
+                 << "' (construct with " << exported.typeName
+                 << "::new())\n";
   // FR-62 slice 5b/5c + F3: each certified actor's runtime mode is the
   // global --actor-mode unless an --actor-mode-map entry names it; actors
   // whose effective mode is same-thread are EXCLUDED from the
@@ -1533,6 +1542,12 @@ static mlir::LogicalResult runActorLiftTail(
         if (auto dict = llvm::dyn_cast<mlir::DictionaryAttr>(entry))
           if (auto name = dict.getAs<mlir::StringAttr>("name")) {
             knownActors.insert(name.getValue());
+            // FR-62 F2: an exported owner (library unit) has no driver
+            // to own a reified handle — it keeps the same-thread owner
+            // form regardless of --actor-mode or a map entry (the skip
+            // mirrors the same-thread exclusion, silently by design).
+            if (dict.get("export"))
+              continue;
             llvm::StringRef mode = globalMode;
             for (const auto &override_ : actorModeOverrides)
               if (override_.first == name.getValue())

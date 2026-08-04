@@ -3732,13 +3732,22 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
        << " {}\n";
     return success();
   }
+  // FR-62 F2: an exported owner struct (`emitrust.private_fields`) keeps
+  // its FIELDS private even in export mode — the struct itself stays pub,
+  // but its state is reachable only through the synthesized `new()` and
+  // the exported methods. Without exportItems the prefix is empty either
+  // way, so the attribute cannot shift a binary-crate byte.
+  StringRef fieldVisibility =
+      structDefOp->hasAttr(emitrust::kPrivateFieldsAttrName)
+          ? ""
+          : typePartVisibility();
   StringRef name = structDefOp.getSymName();
   os << typePartVisibility() << "struct " << name << " {\n";
   increaseIndent();
   for (auto [nameAttr, typeAttr] :
        llvm::zip_equal(structDefOp.getFieldNames(),
                        structDefOp.getFieldTypes())) {
-    os << typePartVisibility() << cast<StringAttr>(nameAttr).getValue() << ": ";
+    os << fieldVisibility << cast<StringAttr>(nameAttr).getValue() << ": ";
     if (failed(emitType(loc, cast<TypeAttr>(typeAttr).getValue())))
       return failure();
     os << ",\n";

@@ -57,6 +57,17 @@ inline constexpr llvm::StringLiteral kParamNamesAttrName =
 inline constexpr llvm::StringLiteral kStaticMethodAttrName =
     "emitrust.static_method";
 
+/// FR-62 F2: name of the discardable `emitrust.struct_def` unit attribute
+/// marking an exported owner struct whose FIELDS stay private. In library
+/// (export) mode the emitter renders every struct's parts `pub` so the
+/// exported type is usable; an owner-handle struct is the exception — its
+/// state must only be constructed through the synthesized `new()` and
+/// mutated through the exported methods, so its fields render with no
+/// visibility prefix. Without `RustEmitOptions::exportItems` the attribute
+/// is a no-op (binary-crate fields carry no `pub` to begin with).
+inline constexpr llvm::StringLiteral kPrivateFieldsAttrName =
+    "emitrust.private_fields";
+
 //===----------------------------------------------------------------------===//
 // FR-52 -- external requirements
 //===----------------------------------------------------------------------===//
