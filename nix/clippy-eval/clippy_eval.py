@@ -7,11 +7,20 @@ idiomatic-Rust debt and the work queue for the auto-improvement loop
 (LOOP.md); `total_warnings` is the ratcheted metric -- it must never rise.
 
   clippy_eval.py [corpus] [--baseline FILE] [--update] [--top N]
+                 [--file-list FILE] [--json FILE]
 
 Default corpus is test/EndToEnd. Exit code is non-zero when the total exceeds
 the baseline (the ratchet fired) unless --update rewrites the baseline. A
 crate that does not transpile standalone is skipped (not clippy's concern);
 the skip count is reported so the denominator is honest.
+
+``--file-list FILE`` restricts the measurement to an explicit, newline-
+separated set of ``.c`` paths instead of enumerating the corpus directory.
+This is what makes the FR-63.3 held-out split possible: the harness measures
+the train slice and the held-out slice as two independent file lists over the
+frozen epoch corpus, so the controller can reject a change that lowers train
+warnings while regressing held-out. ``--json FILE`` also dumps the full
+report (used by the controller's score step) without touching the baseline.
 """
 import argparse
 import collections
@@ -51,9 +60,12 @@ def crate_lints(cfile, workdir):
     return lints
 
 
-def measure(corpus):
-    files = sorted(os.path.join(corpus, x) for x in os.listdir(corpus)
-                   if x.endswith(".c"))
+def measure(corpus, file_list=None):
+    if file_list is not None:
+        files = sorted(file_list)
+    else:
+        files = sorted(os.path.join(corpus, x) for x in os.listdir(corpus)
+                       if x.endswith(".c"))
     total = collections.Counter()
     linted = skipped = 0
     with tempfile.TemporaryDirectory() as wd:
@@ -79,15 +91,33 @@ def main():
     ap.add_argument("--baseline", default="nix/clippy-eval/clippy-baseline.json")
     ap.add_argument("--update", action="store_true")
     ap.add_argument("--top", type=int, default=20)
+    ap.add_argument("--file-list", default=None,
+                    help="newline-separated .c paths to measure instead of "
+                         "enumerating the corpus dir (held-out split)")
+    ap.add_argument("--json", default=None,
+                    help="dump the full report to this path (does not touch "
+                         "the baseline)")
     args = ap.parse_args()
 
-    report = measure(args.corpus)
+    file_list = None
+    if args.file_list:
+        with open(args.file_list) as f:
+            file_list = [ln.strip() for ln in f if ln.strip()
+                         and not ln.startswith("#")]
+
+    report = measure(args.corpus, file_list=file_list)
     print(f"crates linted: {report['crates_linted']}  "
           f"(skipped {report['crates_skipped']})")
     print(f"total clippy warnings: {report['total_warnings']}")
     print("ranked lints (the work queue):")
     for lint, n in list(report["by_lint"].items())[:args.top]:
         print(f"  {n:5d}  {lint}")
+
+    if args.json:
+        with open(args.json, "w") as f:
+            json.dump(report, f, indent=2)
+            f.write("\n")
+        print(f"report written: {args.json}")
 
     baseline = None
     if os.path.exists(args.baseline):

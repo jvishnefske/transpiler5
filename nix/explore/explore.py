@@ -292,6 +292,25 @@ class Explorer:
                   f"(new signatures still arriving -- raise --seconds/--files).")
         print("new-signature times (s): "
               f"{[round(t, 1) for t in self.new_sig_times]}")
+        if self.args.json:
+            self.dump_json(self.args.json)
+
+    def dump_json(self, path):
+        """Machine-readable signatures for the FR-63 signal merger
+        (nix/harness/signals.py). ``count`` is occurrences-1 in the same
+        convention the text report uses (+1 for the exemplar); the merger
+        adds one back. Paths are corpus-relative for stability."""
+        import json
+        sigs = {s: {"count": d["count"],
+                    "file": os.path.relpath(d["file"], self.args.corpus),
+                    "repro": d["repro"], "detail": d["detail"]}
+                for s, d in self.signatures.items()}
+        with open(path, "w") as f:
+            json.dump({"corpus": self.args.corpus, "runs": self.runs,
+                       "total_files": self.total_files, "signatures": sigs},
+                      f, indent=2)
+            f.write("\n")
+        print(f"signatures written: {path}")
 
 
 def main():
@@ -304,6 +323,9 @@ def main():
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--byte-diff", action="store_true")
     ap.add_argument("--recursive", action="store_true")
+    ap.add_argument("--json", default=None,
+                    help="dump distinct signatures as JSON (for the FR-63 "
+                         "signal merger, nix/harness/signals.py)")
     ap.add_argument("--min-files", type=int, default=30)
     ap.add_argument("--plateau", type=float, default=15.0,
                     help="stop after this many idle SECONDS with no new outcome")

@@ -1,0 +1,33 @@
+# epoch-1 HELD-OUT slice -- seed=1 held_out_frac=0.25
+# sha256:934b6ba698e9dd206e6dc062f5ad7434d570807bd660a481e5b278f629693d08
+test/EndToEnd/actor-lib-export.c
+test/EndToEnd/actor-lift-fnptr.c
+test/EndToEnd/actor-lift-globals.c
+test/EndToEnd/actor-mode-threaded-globals.c
+test/EndToEnd/actor-partition-lift.c
+test/EndToEnd/array-self-ref-member-cross-param.c
+test/EndToEnd/bitfields-zeroextend.c
+test/EndToEnd/enum-from-int.c
+test/EndToEnd/enum-int.c
+test/EndToEnd/float-literals.c
+test/EndToEnd/float.c
+test/EndToEnd/fn-pointers.c
+test/EndToEnd/fnptr-eq.c
+test/EndToEnd/fnptr-noproto-infer.c
+test/EndToEnd/globals-writeback-order.c
+test/EndToEnd/lib-crate-externals-trait.c
+test/EndToEnd/loops.c
+test/EndToEnd/lostcopy-nested-branch.c
+test/EndToEnd/malloc-stack.c
+test/EndToEnd/multi-tu-gate-g3-owner-fallback.c
+test/EndToEnd/pointers-local.c
+test/EndToEnd/pointers-null.c
+test/EndToEnd/pointers-ptr-to-ptr.c
+test/EndToEnd/printf-user-defined.c
+test/EndToEnd/qualifiers.c
+test/EndToEnd/stmt-expr.c
+test/EndToEnd/string-cursor.c
+test/EndToEnd/struct-long-arrays.c
+test/EndToEnd/struct-tag-namespace.c
+test/EndToEnd/switch-general.c
+test/EndToEnd/unions.c

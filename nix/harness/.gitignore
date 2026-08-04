@@ -1,0 +1,5 @@
+# Transient controller scratch — regenerated every run, never committed.
+queue.json
+.candidate.json
+.metrics.json
+.score-*.json

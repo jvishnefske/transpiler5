@@ -1,13 +1,22 @@
-# Agentic improvement harness — plan
+# Agentic improvement harness (FR-63)
 
 An autonomous loop that improves the C→Rust transpiler under a fixed safety
-contract: **discovery tools generate a ranked backlog, subagents implement one
+contract: **discovery tools generate a ranked backlog, a subagent implements one
 item at a time, the byte-diff oracle and the ratchets gate every commit, and the
 loop never ships red.** The agents are the actuators; the oracle is the
-invariant; the ratchet files are the long-term memory. This plan wires the
-harnesses already in the tree (`nix/explore`, `nix/clippy-eval`, `nix/corpus`,
-`test/RealWorld`, `test/CTestSuite`) into that loop and states what the loop may
-and may not do on its own.
+invariant; the ratchet files are the long-term memory. This is the canonical
+harness doc — it wires the tools already in the tree (`nix/explore`,
+`nix/clippy-eval`, `nix/corpus`, `test/RealWorld`, `test/CTestSuite`) into a
+loop framed as an **optimization over a frozen epoch corpus**, and states what
+the loop may and may not do on its own. The implementation lives in
+`nix/harness/` (controller, epoch, signals) and is tracked as FR-63 in
+`design.md`; see `nix/harness/README.md` for the file map.
+
+The design's load-bearing idea is a **split** (§2c): the measure/gate/ratchet
+layer is a deterministic Python controller, and a Claude Code subagent only
+*proposes* an edit — it never scores or gates its own work. That separation is
+why the paired comparison between the champion and a candidate emitter revision
+over the frozen corpus is valid.
 
 ## 0. The contract (non-negotiable — every iteration obeys these)
 
@@ -25,7 +34,14 @@ and may not do on its own.
   handle gets a LOCATED diagnostic or a hard rustc/panic error — never a quiet
   behaviour change. Dropping emitted code is legal only when analysis PROVES no
   read on any path.
-- **No `unsafe`.** If a change seems to need it, the change is wrong.
+- **No new `unsafe`; no new allow-attribute** beyond the established crate-root
+  header (`#![allow(dead_code, unused_assignments)]`). The emitter must emit the
+  idiomatic form, not suppress the lint. `unsafe` is pinned at 0. If a change
+  seems to need `unsafe`, the change is wrong.
+- **Held-out generalization.** The epoch corpus is split train/held-out by seed
+  (§2b); the optimizer sees only train, the controller scores both, and a change
+  that lowers train warnings while regressing held-out is rejected. This is the
+  anti-Goodhart guard — it stops the optimizer special-casing the corpus it sees.
 - **Off-limits without a human + a new idea:** cross-iteration loop liveness
   (miscompiled 3×), `needless_late_init` (a liveness change, not a spelling
   one). See CLAUDE.md and `nix/clippy-eval/LOOP.md`.
@@ -68,7 +84,44 @@ Merge the signals into a single ranked queue. Score each candidate by
 
 Skip the long tail: per-program one-off rejections and 1-in-N corpus rarities
 are not worth an emitter change (the explorer's plateau already declines to
-chase them).
+chase them). Severity is a strict tier, not just a factor: a correctness bug
+outranks a quality lint no matter how many warnings the lint retires, so the
+queue is tiered by severity and ordered by the `leverage × 1/risk` product
+*within* each tier (`nix/harness/signals.py`).
+
+## 2a. The epoch — freeze once, compare in pairs
+
+Sampling is redundant (CMSIS-DSP's 660 files are a few shapes), so the
+discovery corpus is drawn once and **frozen** as `epoch-N`: the exact file list
+plus a content hash (`nix/harness/epoch.py freeze`). Every emitter revision is
+measured on the identical sample, so the warning delta between two revisions is
+attributable to the emitter change alone — a paired comparison, and a single
+systematic emitter fix retires hundreds of warnings at once. Re-sampling starts
+a NEW epoch; totals are **never** compared across epochs (the population
+changed). This is the epoch / compiler-revision optimization concept from
+`~/src/dressage-design.md` §10–§11 made concrete.
+
+## 2b. Held-out split — the anti-Goodhart guard
+
+`epoch.py split` partitions the epoch train/held-out as a pure function of
+`(seed, path)` — reproducible, and adding a file never reshuffles the rest. The
+optimizer subagent is shown ONLY the train list (`epoch-N.train.txt`); the
+controller scores both slices and rejects any change that regresses held-out
+(`controller.py score`, exit 2). A "prettier" emission that overfits the visible
+corpus fails here even when the byte-diff oracle passes.
+
+## 2c. The controller / optimizer split (load-bearing)
+
+The measure/gate/ratchet layer is a deterministic Python **controller**
+(`nix/harness/controller.py`, no LLM) with subcommands
+`collect · freeze · establish · gate · score · accept · revert · iterate`. The
+editing is a Claude Code **optimizer** subagent (`nix/harness/OPTIMIZER.md`)
+that changes ONE emitter site per iteration and hands back. The `champion.json`
+records the current champion's train/held-out score and the permitted
+allow-lines; `ledger.json` records `(emitter_rev, metrics)` per accepted
+revision so the descent is queryable (`epoch.py ledger-show`). The gate enforces
+the byte-diff oracle + no-new-unsafe/allow (contract clauses 1–3); score
+enforces the ratchet + held-out (clauses 4–5).
 
 ## 3. The per-item loop (subagent-driven TDD)
 
@@ -134,7 +187,25 @@ c-testsuite ledger, kernel rejection tally, explorer CRASH/MISCOMPILE count, and
 the `unsafe` count (invariant: 0). A rise in any is a regression the ratchets
 should already have caught; surfacing it here is the backstop.
 
-## 7. First epics (ready now)
+## 7. Implementation status (FR-63, in `nix/harness/`)
+
+Built and proven headless (see `design.md` FR-63):
+
+- **FR-63.1 controller CLI** — `controller.py`; one iteration runs headless with
+  Result-style exit codes; an injected gate failure reverts and exits non-zero.
+- **FR-63.2 epoch freeze + ledger** — `epoch.py`, `ledger.json`; the pinned hash
+  reproduces the sample; `ledger-show` renders the descent.
+- **FR-63.3 held-out split** — `epoch.py split` + `clippy_eval.py --file-list`;
+  a synthetic train-only overfit is rejected (score exit 2).
+- **FR-63.4 signal merge + prioritizer** — `signals.py`; a crash outranks a
+  clippy lint, the long tail is excluded, output is a stable ranked JSON queue.
+- **FR-63.5 optimizer subagent** — `OPTIMIZER.md`; one item/iteration, byte-diff
+  gated, goldens same change, no unsafe/allow, off-limits enforced, worktree
+  isolation.
+- **FR-63.6 continuous mode** — `LOOP.md`; a `/loop` wrapper stopping on plateau
+  / long tail / budget / K dry rounds.
+
+## 8. First epics (ready now)
 
 1. **Clippy spelling debt** (`LOOP.md`): baseline 961 after loop #1
    (`println!`). Next stdout-preserving targets: `assign_op_pattern` (253),
