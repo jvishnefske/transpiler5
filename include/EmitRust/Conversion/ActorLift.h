@@ -47,6 +47,15 @@
 ///    A listed global with no matching `emitrust.global` is skipped (the
 ///    plan may own symbols the importer folded away); a listed CONST global
 ///    is a producer bug and fails the pass loudly.
+///    An entry may additionally carry `export` (UnitAttr, FR-62 F2): the
+///    actor lives in a LIBRARY unit with no constructing driver and is
+///    exported as an owner handle instead — the pass marks the synthesized
+///    struct_def with `emitrust.private_fields` (pub struct, private
+///    fields in export-mode emission) and synthesizes an associated
+///    `fn new()` (`emitrust.static_method`) as the impl's first function,
+///    carrying each field's C initializer as the same Default-plus-member-
+///    assign materialization the driver construction uses. No driver
+///    construction happens for an exported actor (there is no driver).
 ///  - `emitrust.actor_locals`: ArrayAttr of DictionaryAttr
 ///      {global = StringAttr, name = StringAttr}
 ///    for globals of driver-only actors (no arms, no cross clients): each

@@ -31,6 +31,11 @@
 ///  - cross clients receive the caller's own `mut_ref` block arguments when
 ///    they call each other (Rust's implicit reborrow), while the driver
 ///    materializes a fresh `emitrust.addr_of mut` per call site;
+///  - an actor whose dict carries `export` (FR-62 F2, library unit with no
+///    driver) skips driver construction: the struct_def is marked
+///    `emitrust.private_fields` and the impl opens with a synthesized
+///    associated `fn new()` carrying the same field-initializer
+///    materialization the driver construction would have used;
 ///  - the snapshot-elision cleanup collapses the importer's whole-global
 ///    round-trip (`variable` filled from a `global_load`, refined by
 ///    subscripts, written back by a `global_store`) into direct member
@@ -83,6 +88,10 @@ struct ActorInfo {
   emitrust::ImplOp impl;   ///< The synthesized impl (once created).
   Value driverLocal;       ///< The driver's actor variable (lvalue).
   bool vetoed = false;     ///< Safety-net demotion: leave untouched.
+  /// FR-62 F2: exported owner handle (library unit, no driver) — the
+  /// struct_def gets `emitrust.private_fields` and the impl a synthesized
+  /// `fn new()` carrying the field initializers.
+  bool exported = false;
 };
 
 /// One driver-only global lowered to a named `c_main` local.
@@ -170,6 +179,7 @@ struct ActorLift
       ActorInfo info;
       info.name = dict.getAs<StringAttr>("name");
       info.var = dict.getAs<StringAttr>("var");
+      info.exported = dict.get("export") != nullptr;
       auto globalsAttr = dict.getAs<ArrayAttr>("globals");
       auto fieldsAttr = dict.getAs<ArrayAttr>("fields");
       if (!info.name || !info.var || !globalsAttr || !fieldsAttr ||
@@ -419,13 +429,49 @@ struct ActorLift
         names.push_back(fieldName);
         types.push_back(TypeAttr::get(global.getType()));
       }
-      builder.create<emitrust::StructDefOp>(
+      auto structDef = builder.create<emitrust::StructDefOp>(
           anchor.getLoc(), actor.name, builder.getArrayAttr(names),
           builder.getArrayAttr(types));
+      // FR-62 F2: an exported owner is a pub struct with PRIVATE fields —
+      // consumers construct through new() and mutate through the methods.
+      if (actor.exported)
+        structDef->setAttr(emitrust::kPrivateFieldsAttrName,
+                           builder.getUnitAttr());
       actor.impl = builder.create<emitrust::ImplOp>(anchor.getLoc(),
                                                     actor.name.getValue());
       actor.impl.getBody().emplaceBlock();
+      if (actor.exported)
+        synthesizeOwnerNew(actor);
     }
+  }
+
+  /// FR-62 F2: synthesizes the exported owner's associated `fn new()` as
+  /// the impl's first function — the slice-4 driver-side construction
+  /// (Default variable + post-construction member assigns for non-default
+  /// field initializers) relocated into the constructor, ending with the
+  /// owner returned by value. The `emitrust.static_method` marker makes it
+  /// a receiverless associated function, rendered `pub` in export mode.
+  void synthesizeOwnerNew(ActorInfo &actor) {
+    OpBuilder builder(&getContext());
+    Block &implBlock = actor.impl.getBody().front();
+    builder.setInsertionPointToEnd(&implBlock);
+    Location loc = actor.impl.getLoc();
+    SmallVector<Type> results{actor.structType};
+    auto fn = builder.create<emitrust::FuncOp>(
+        loc, "new", builder.getFunctionType({}, results));
+    fn->setAttr(emitrust::kStaticMethodAttrName, builder.getUnitAttr());
+    Block *entry = &fn.getBody().emplaceBlock();
+    OpBuilder body = OpBuilder::atBlockEnd(entry);
+    auto owner = body.create<emitrust::VariableOp>(
+        loc, emitrust::LValueType::get(actor.structType),
+        /*init=*/Attribute(), /*isConst=*/false, "owner");
+    for (auto [fieldIndex, global] : llvm::enumerate(actor.globals))
+      if (global.getInitAttr())
+        materializeFieldInit(body, loc, owner.getResult(),
+                             actor.fieldNames[fieldIndex], global);
+    auto value = body.create<emitrust::LoadOp>(loc, actor.structType,
+                                               owner.getResult());
+    body.create<emitrust::ReturnOp>(loc, value.getResult());
   }
 
   /// The receiver lvalue for `actorIndex` inside `context`, creating the
