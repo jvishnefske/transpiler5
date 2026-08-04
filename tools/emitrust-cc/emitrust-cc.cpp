@@ -380,8 +380,8 @@ static llvm::cl::opt<bool> actorLiftFlag(
     llvm::cl::init(true));
 
 /// FR-62 slice 5b: the actor RUNTIME flavor, applied to every eligible
-/// lifted actor (per-actor selection is deferred; the anchor op carries
-/// mode per actor, so later per-actor plumbing is driver-only).
+/// lifted actor; F3's `--actor-mode-map` overrides it per actor (the
+/// anchor op carries mode per actor, so the plumbing is driver-only).
 enum class ActorModeRequest { SameThread, Threaded, Async };
 
 static llvm::cl::opt<ActorModeRequest> actorModeFlag(
@@ -413,6 +413,20 @@ static llvm::cl::opt<ActorModeRequest> actorModeFlag(
                    "offline build fails loudly at resolution. Same "
                    "lift precondition and veto UX as threaded")),
     llvm::cl::init(ActorModeRequest::SameThread));
+
+static llvm::cl::opt<std::string> actorModeMapPath(
+    "actor-mode-map",
+    llvm::cl::desc(
+        "FR-62 F3: per-actor mode override file for the actor lift. One "
+        "`<actor-name> <mode>` pair per line, where <actor-name> is the "
+        "LIFTED actor type name (e.g. CounterActor) and <mode> is "
+        "`threaded`, `async` or `same-thread`; an entry overrides the "
+        "global --actor-mode for exactly that actor, and `same-thread` "
+        "keeps it a plain lifted struct (no runtime anchor). A name "
+        "matching no lifted actor warns and is ignored; a per-module "
+        "threaded+async mix is a located error (one crate carries one "
+        "actor_rt runtime flavor)"),
+    llvm::cl::value_desc("file"), llvm::cl::init(""));
 
 static llvm::cl::opt<std::string> ratchetBaselinePath(
     "ratchet-baseline",
@@ -1241,6 +1255,57 @@ static bool loadActorOverrides(
   return true;
 }
 
+/// Parses the `--actor-mode-map` file (when given) into (lifted actor
+/// type name, mode) entries for FR-62 F3's per-actor mode selection —
+/// `loadActorOverrides`'s sibling, but keyed by the LIFTED actor type
+/// name (the exact spelling in the emitted struct, the thread-pass
+/// warnings and the `emitrust.actor_runtime` anchor) and with the mode
+/// constrained to the --actor-mode vocabulary. A later line for the same
+/// actor overrides an earlier one; the entries keep first-occurrence
+/// order so the unknown-name warnings print deterministically.
+///
+/// \param overrides receives the (name, mode) entries, names unique.
+/// \returns true on success; false after a printed error.
+static bool loadActorModeOverrides(
+    std::vector<std::pair<std::string, std::string>> &overrides) {
+  if (actorModeMapPath.empty())
+    return true;
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> map =
+      llvm::MemoryBuffer::getFile(actorModeMapPath);
+  if (!map) {
+    llvm::errs() << "error: cannot read --actor-mode-map '"
+                 << actorModeMapPath << "': " << map.getError().message()
+                 << "\n";
+    return false;
+  }
+  for (llvm::StringRef line : llvm::split((*map)->getBuffer(), '\n')) {
+    line = line.trim();
+    if (line.empty() || line.starts_with("#"))
+      continue;
+    auto [actor, mode] = line.split(' ');
+    mode = mode.trim();
+    if (actor.empty() || mode.empty() || mode.contains(' ')) {
+      llvm::errs() << "error: malformed --actor-mode-map line: '" << line
+                   << "' (expected '<actor-name> <mode>')\n";
+      return false;
+    }
+    if (mode != "threaded" && mode != "async" && mode != "same-thread") {
+      llvm::errs() << "error: malformed --actor-mode-map line: '" << line
+                   << "' (mode must be 'threaded', 'async' or "
+                      "'same-thread')\n";
+      return false;
+    }
+    auto existing = llvm::find_if(overrides, [&](const auto &entry) {
+      return entry.first == actor;
+    });
+    if (existing != overrides.end())
+      existing->second = mode.str();
+    else
+      overrides.emplace_back(actor.str(), mode.str());
+  }
+  return true;
+}
+
 /// `--link --emit=actor-plan`: plans the FR-62 actor decomposition from
 /// the shards' STORED item-graph texts (FR-57d), one `ActorUnit` per shard
 /// in link-line order — a pure artifact query like the per-shard
@@ -1885,6 +1950,41 @@ int main(int argc, char **argv) {
                          ? "threads"
                          : "spawns")
                  << " nothing: every actor is demoted (rule 5)\n";
+  // FR-62 F3: the per-actor mode map composes exactly like --actor-mode,
+  // entry by entry. A reifying (threaded/async) entry carries the same
+  // lift precondition (E3's mandatory-ownership argument holds per actor)
+  // and the same lowered-emission gate as the global flag, and under
+  // --link it reifies nothing (every actor is rule-5 demoted) and must
+  // say so. A same-thread-only map composes silently everywhere, like
+  // --actor-mode=same-thread.
+  std::vector<std::pair<std::string, std::string>> actorModeOverrides;
+  if (!loadActorModeOverrides(actorModeOverrides))
+    return 1;
+  llvm::StringRef mapReifyingMode;
+  for (const auto &entry : actorModeOverrides)
+    if (entry.second != "same-thread") {
+      mapReifyingMode = entry.second;
+      break;
+    }
+  if (!mapReifyingMode.empty()) {
+    if (!actorLiftFlag) {
+      llvm::errs() << "error: --actor-mode-map mode '" << mapReifyingMode
+                   << "' requires the actor lift (remove "
+                      "--actor-lift=false): ownership lift is a mandatory "
+                      "precondition of "
+                   << mapReifyingMode << " mode\n";
+      return 1;
+    }
+    if (emitKind != EmitKind::MLIR && emitKind != EmitKind::Rust &&
+        emitKind != EmitKind::Crate) {
+      llvm::errs() << "error: --actor-mode-map is only valid with "
+                      "--emit=mlir, --emit=rust or --emit=crate\n";
+      return 1;
+    }
+    if (linkFlag)
+      llvm::errs() << "warning: --actor-mode-map under --link reifies "
+                      "nothing: every actor is demoted (rule 5)\n";
+  }
   // FR-60: both artifact queries read the shard ledgers off the link line.
   if (emitKind == EmitKind::RejectionReport && !linkFlag) {
     llvm::errs() << "error: --emit=rejection-report requires --link\n";
@@ -2196,40 +2296,75 @@ int main(int argc, char **argv) {
                                demotion.remarkLine, demotion.remarkColumn))
               << demotion.remarkText;
       }
-      // FR-62 slice 5b/5c: under --actor-mode=threaded or =async every
-      // certified actor is selected for the emitrust-actor-thread pass
-      // (per-actor selection is deferred; the anchor op already carries
-      // mode per actor, so later plumbing is driver-only — the pass is
-      // mode-agnostic and stamps whichever mode this list carries). The
-      // list is computed HERE, beside the lift attachment, because the
-      // lift pass strips its own attributes: the actor names are read
-      // from the attribute contract before the pipeline consumes it.
-      // Actors the lift pass itself demotes (its IR-level safety-net
-      // veto) leave no struct_def behind, and the thread pass skips those
-      // SILENTLY -- demoted actors were never lifted, so they keep
-      // today's form; reification-INELIGIBLE lifted actors get the pass's
-      // located stays-same-thread warning instead.
-      bool threadActors = reifyingActorMode && attachment.attachedAny;
-      if (threadActors) {
+      // FR-62 slice 5b/5c + F3: each certified actor's runtime mode is
+      // the global --actor-mode unless an --actor-mode-map entry names
+      // it; actors whose effective mode is same-thread are EXCLUDED from
+      // the emitrust-actor-thread selection (they keep the slice-4
+      // struct shape — exclusion by choice, exactly the shape of the
+      // pass's cross-client veto). The list is computed HERE, beside the
+      // lift attachment, because the lift pass strips its own
+      // attributes: the actor names are read from the attribute contract
+      // before the pipeline consumes it. Actors the lift pass itself
+      // demotes (its IR-level safety-net veto) leave no struct_def
+      // behind, and the thread pass skips those SILENTLY -- demoted
+      // actors were never lifted, so they keep today's form;
+      // reification-INELIGIBLE lifted actors get the pass's located
+      // stays-same-thread warning instead. A map name matching no lifted
+      // actor warns and is ignored (fail-toward-noop); a threaded+async
+      // mix among the selected actors is a located error here, because
+      // one crate carries one actor_rt runtime flavor (the emission
+      // rejection in actor-runtime-mixed-modes-invalid.mlir stays as
+      // backstop for hand-written modules).
+      bool threadActors = false;
+      if (reifyingActorMode || !actorModeOverrides.empty()) {
+        llvm::StringRef globalMode =
+            reifyingActorMode ? actorModeName : "same-thread";
+        llvm::StringSet<> knownActors;
         llvm::SmallVector<mlir::Attribute> selected;
+        llvm::StringRef firstName, firstMode, clashName;
         if (auto actorsAttr = (*module)->getAttrOfType<mlir::ArrayAttr>(
                 mlir::emitrust::kActorLiftActorsAttrName))
           for (mlir::Attribute entry : actorsAttr)
             if (auto dict = llvm::dyn_cast<mlir::DictionaryAttr>(entry))
-              if (auto name = dict.getAs<mlir::StringAttr>("name"))
+              if (auto name = dict.getAs<mlir::StringAttr>("name")) {
+                knownActors.insert(name.getValue());
+                llvm::StringRef mode = globalMode;
+                for (const auto &override_ : actorModeOverrides)
+                  if (override_.first == name.getValue())
+                    mode = override_.second;
+                if (mode == "same-thread")
+                  continue;
+                if (firstMode.empty()) {
+                  firstName = name.getValue();
+                  firstMode = mode;
+                } else if (mode != firstMode && clashName.empty()) {
+                  clashName = name.getValue();
+                }
                 selected.push_back(mlir::DictionaryAttr::get(
                     &context,
                     {mlir::NamedAttribute(
                          mlir::StringAttr::get(&context, "name"), name),
                      mlir::NamedAttribute(
                          mlir::StringAttr::get(&context, "mode"),
-                         mlir::StringAttr::get(&context,
-                                               actorModeName))}));
-        if (selected.empty())
-          threadActors = false;
-        else
+                         mlir::StringAttr::get(&context, mode))}));
+              }
+        for (const auto &override_ : actorModeOverrides)
+          if (!knownActors.contains(override_.first))
+            llvm::errs() << "warning: --actor-mode-map: actor '"
+                         << override_.first
+                         << "' matches no lifted actor; entry ignored\n";
+        if (!clashName.empty()) {
+          mlir::emitError((*module)->getLoc())
+              << "actor '" << clashName << "' mode disagrees with actor '"
+              << firstName
+              << "': one crate carries one actor_rt runtime flavor";
+          return 1;
+        }
+        if (!selected.empty()) {
           (*module)->setAttr(mlir::emitrust::kActorThreadAttrName,
                              mlir::ArrayAttr::get(&context, selected));
+          threadActors = true;
+        }
       }
       if (attachment.attachedAny) {
         mlir::PassManager pm(&context,
