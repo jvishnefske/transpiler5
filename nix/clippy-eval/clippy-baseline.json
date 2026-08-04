@@ -1,0 +1,27 @@
+{
+  "corpus": "test/EndToEnd",
+  "crates_linted": 111,
+  "crates_skipped": 14,
+  "total_warnings": 1621,
+  "by_lint": {
+    "clippy::print_with_newline": 660,
+    "clippy::needless_late_init": 296,
+    "clippy::assign_op_pattern": 253,
+    "clippy::explicit_auto_deref": 239,
+    "clippy::bool_comparison": 37,
+    "clippy::field_reassign_with_default": 35,
+    "clippy::missing_const_for_thread_local": 29,
+    "clippy::unnecessary_cast": 19,
+    "clippy::assertions_on_constants": 17,
+    "clippy::identity_op": 12,
+    "clippy::approx_constant": 5,
+    "clippy::collapsible_else_if": 4,
+    "clippy::needless_else": 3,
+    "clippy::if_same_then_else": 3,
+    "clippy::precedence": 2,
+    "clippy::type_complexity": 2,
+    "clippy::manual_range_contains": 2,
+    "clippy::manual_unwrap_or_default": 2,
+    "clippy::useless_format": 1
+  }
+}
