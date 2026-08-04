@@ -328,7 +328,10 @@ def cmd_accept(args):
     # 3. atomic commit: emitter sources + all baselines together.
     with open(CLIPPY_BASELINE) as f:
         total = json.load(f)["total_warnings"]
-    sh(["git", "add", "-A", "lib", "tools", "include",
+    # Emitter sources AND the goldens the optimizer shifted (a golden left
+    # uncommitted would leave the committed tree failing check-emitrust) AND
+    # the ratchet baselines -- one atomic revision.
+    sh(["git", "add", "-A", "lib", "tools", "include", "test",
         "nix/clippy-eval/clippy-baseline.json", "nix/harness/champion.json"])
     msg = (args.message or
            f"feat(quality): harness iteration -- clippy total -> {total} "
