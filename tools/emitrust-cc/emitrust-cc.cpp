@@ -117,10 +117,13 @@
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <system_error>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1325,14 +1328,21 @@ static bool loadActorModeOverrides(
 /// \param outputPath the `-o` destination (`-` for stdout).
 /// \returns the process exit code.
 /// Collects one `ActorUnit` per link-line shard from the shards' stored
-/// FR-57d item-graph texts (shared by `--emit=actor-plan` and the
-/// `--actor-lift --link` demote-all warning). A shard carrying no graph is
-/// a printed error.
+/// FR-57d item-graph texts (shared by `--emit=actor-plan` and the F1a
+/// `--actor-lift --link` lift). One unit holds exactly ONE graph text at
+/// its link-line position — the shape that makes the planner's running
+/// TU-ordinal retag coincide with the FR-58 merge's per-position
+/// alpha-rename (LinkMerge's renameShardTags), so the plan's symbols ARE
+/// the merged module's symbols by construction. A shard carrying no graph
+/// is a printed error when `missingShard` is null; otherwise the first
+/// such shard's name is reported there and the load still succeeds (the
+/// F1a caller demotes every actor instead of failing the link).
 ///
 /// \returns true on success.
 static bool collectLinkActorUnits(
     llvm::ArrayRef<std::string> inputs, mlir::MLIRContext &context,
-    llvm::SmallVectorImpl<emitrustcc::ActorUnit> &units) {
+    llvm::SmallVectorImpl<emitrustcc::ActorUnit> &units,
+    std::string *missingShard = nullptr) {
   llvm::SmallVector<LoadedShard> shards;
   if (!loadLinkShards(inputs, context, shards))
     return false;
@@ -1341,6 +1351,11 @@ static bool collectLinkActorUnits(
     std::optional<llvm::StringRef> graph =
         mlir::emitrust::getShardItemGraph(*shard.module);
     if (!graph) {
+      if (missingShard) {
+        if (missingShard->empty())
+          *missingShard = shard.name;
+        continue;
+      }
       llvm::errs() << "error: shard '" << shard.name
                    << "' carries no item-graph metadata (artifact predates "
                       "FR-57d?)\n";
@@ -1352,6 +1367,71 @@ static bool collectLinkActorUnits(
     units[i].graphTexts.push_back(graph->str());
   }
   return true;
+}
+
+/// FR-62 F1a: parses and merges the link units' stored graph texts into
+/// ONE `ItemGraph` keyed exactly as `planActors` keys its access index:
+/// each unit is one link-line position holding one graph text, and
+/// internal-linkage symbols retag by that running ordinal through the
+/// SAME `retagInternalSymbol` the planner uses — the FR-58 merge's
+/// alpha-rename, so the merged graph's node keys are the MERGED module's
+/// emitted symbols. Nodes dedup by symbol with definition-wins (the FR-58
+/// first-definer dedup and the plan's owner expectations provably agree;
+/// a shape disagreement is a hard link error before this ever runs) so
+/// the rule-1 remark locates at the definer; edges dedup as a set. Both
+/// re-sort into the published `ItemGraph` order.
+///
+/// \param units the link-line actor units, one graph text each.
+/// \param error receives the first parse failure's reason.
+/// \returns the merged graph, or failure with `error` set.
+static mlir::FailureOr<mlir::emitrust::ItemGraph>
+mergeLinkUnitGraphs(llvm::ArrayRef<emitrustcc::ActorUnit> units,
+                    std::string &error) {
+  unsigned totalMembers = 0;
+  for (const emitrustcc::ActorUnit &unit : units)
+    totalMembers += unit.graphTexts.size();
+  std::map<std::string, mlir::emitrust::ItemNode> nodes;
+  std::set<std::tuple<std::string, mlir::emitrust::EdgeKind, std::string>>
+      edges;
+  unsigned ordinal = 0;
+  for (const emitrustcc::ActorUnit &unit : units) {
+    for (const std::string &text : unit.graphTexts) {
+      mlir::FailureOr<mlir::emitrust::ItemGraph> parsed =
+          mlir::emitrust::parseItemGraphText(text, error);
+      if (mlir::failed(parsed))
+        return mlir::failure();
+      // Single-member links keep the graph's own spellings, exactly like
+      // the planner's single-member plan (and like the merge, whose
+      // identity ordinal map renames nothing there).
+      std::map<std::string, std::string> rename;
+      if (totalMembers > 1)
+        for (const mlir::emitrust::ItemNode &node : parsed->nodes)
+          if (node.linkage == mlir::emitrust::ItemLinkage::Internal)
+            rename.emplace(node.symbol, mlir::emitrust::retagInternalSymbol(
+                                            node.symbol, ordinal));
+      auto mapped = [&](const std::string &symbol) {
+        auto it = rename.find(symbol);
+        return it == rename.end() ? symbol : it->second;
+      };
+      for (mlir::emitrust::ItemNode node : parsed->nodes) {
+        node.symbol = mapped(node.symbol);
+        node.tuIndex = ordinal;
+        auto [it, inserted] = nodes.emplace(node.symbol, node);
+        if (!inserted && node.isDefinition && !it->second.isDefinition)
+          it->second = std::move(node);
+      }
+      for (const mlir::emitrust::ItemEdge &edge : parsed->edges)
+        edges.emplace(mapped(edge.from), edge.kind,
+                      edge.to.empty() ? std::string() : mapped(edge.to));
+      ++ordinal;
+    }
+  }
+  mlir::emitrust::ItemGraph graph;
+  for (auto &[symbol, node] : nodes)
+    graph.nodes.push_back(std::move(node));
+  for (const auto &[from, kind, to] : edges)
+    graph.edges.push_back({from, to, kind});
+  return graph;
 }
 
 static int emitLinkActorPlan(llvm::ArrayRef<std::string> inputs,
@@ -1372,6 +1452,130 @@ static int emitLinkActorPlan(llvm::ArrayRef<std::string> inputs,
                                 emitrustcc::renderActorPlan(plan)))
              ? 1
              : 0;
+}
+
+/// FR-62 F1a: the lift tail shared by the source path and the `--link`
+/// path — prints the plan notes, certifies and attaches the actor-lift
+/// attribute contract on `module` (`attachActorLiftAttributes`, the one
+/// real spelling of those attributes), prints the demotion warnings and
+/// rule-1's located remarks, composes the slice-5b/5c + F3 actor-mode
+/// selection, and runs the lift (and thread) passes when anything was
+/// attached. `allowReifiedModes` is true on the source path only: under
+/// `--link` actor MODE is a recorded later stage — the early link
+/// warnings have already said a reifying mode reifies nothing there — so
+/// the link lift is same-thread and the whole selection block is skipped.
+///
+/// \param module the post-pipeline (or merged) module to lift in place.
+/// \param context the module's context (remark/pass plumbing).
+/// \param graph the item graph whose keys are `module`'s emitted symbols.
+/// \param plan the actor plan over that same graph.
+/// \param allowReifiedModes whether --actor-mode/--actor-mode-map may
+///        select actors for a reified runtime here.
+/// \param reifyingActorMode whether the global --actor-mode is reifying.
+/// \param actorModeName the global mode's spelling (valid when reifying).
+/// \param actorModeOverrides F3's per-actor (name, mode) entries.
+/// \returns failure after a printed error (mode clash or pass failure).
+static mlir::LogicalResult runActorLiftTail(
+    mlir::ModuleOp module, mlir::MLIRContext &context,
+    const mlir::emitrust::ItemGraph &graph,
+    const emitrustcc::ActorPlan &plan, bool allowReifiedModes,
+    bool reifyingActorMode, llvm::StringRef actorModeName,
+    llvm::ArrayRef<std::pair<std::string, std::string>>
+        actorModeOverrides) {
+  for (const std::string &note : plan.notes)
+    llvm::errs() << "warning: actor plan: " << note << "\n";
+  emitrustcc::ActorLiftAttachment attachment =
+      emitrustcc::attachActorLiftAttributes(module, graph, plan,
+                                            preserveCNamesFlag);
+  for (const emitrustcc::ActorLiftDemotion &demotion :
+       attachment.demotions) {
+    llvm::errs() << "warning: actor plan: demoted " << demotion.actor
+                 << ": " << demotion.reason << "\n";
+    if (!demotion.remarkText.empty())
+      mlir::emitRemark(mlir::FileLineColLoc::get(
+                           &context, demotion.remarkFile,
+                           demotion.remarkLine, demotion.remarkColumn))
+          << demotion.remarkText;
+  }
+  // FR-62 slice 5b/5c + F3: each certified actor's runtime mode is the
+  // global --actor-mode unless an --actor-mode-map entry names it; actors
+  // whose effective mode is same-thread are EXCLUDED from the
+  // emitrust-actor-thread selection (they keep the slice-4 struct shape —
+  // exclusion by choice, exactly the shape of the pass's cross-client
+  // veto). The list is computed HERE, beside the lift attachment, because
+  // the lift pass strips its own attributes: the actor names are read
+  // from the attribute contract before the pipeline consumes it. Actors
+  // the lift pass itself demotes (its IR-level safety-net veto) leave no
+  // struct_def behind, and the thread pass skips those SILENTLY --
+  // demoted actors were never lifted, so they keep today's form;
+  // reification-INELIGIBLE lifted actors get the pass's located
+  // stays-same-thread warning instead. A map name matching no lifted
+  // actor warns and is ignored (fail-toward-noop); a threaded+async mix
+  // among the selected actors is a located error here, because one crate
+  // carries one actor_rt runtime flavor (the emission rejection in
+  // actor-runtime-mixed-modes-invalid.mlir stays as backstop for
+  // hand-written modules).
+  bool threadActors = false;
+  if (allowReifiedModes &&
+      (reifyingActorMode || !actorModeOverrides.empty())) {
+    llvm::StringRef globalMode =
+        reifyingActorMode ? actorModeName : "same-thread";
+    llvm::StringSet<> knownActors;
+    llvm::SmallVector<mlir::Attribute> selected;
+    llvm::StringRef firstName, firstMode, clashName;
+    if (auto actorsAttr = module->getAttrOfType<mlir::ArrayAttr>(
+            mlir::emitrust::kActorLiftActorsAttrName))
+      for (mlir::Attribute entry : actorsAttr)
+        if (auto dict = llvm::dyn_cast<mlir::DictionaryAttr>(entry))
+          if (auto name = dict.getAs<mlir::StringAttr>("name")) {
+            knownActors.insert(name.getValue());
+            llvm::StringRef mode = globalMode;
+            for (const auto &override_ : actorModeOverrides)
+              if (override_.first == name.getValue())
+                mode = override_.second;
+            if (mode == "same-thread")
+              continue;
+            if (firstMode.empty()) {
+              firstName = name.getValue();
+              firstMode = mode;
+            } else if (mode != firstMode && clashName.empty()) {
+              clashName = name.getValue();
+            }
+            selected.push_back(mlir::DictionaryAttr::get(
+                &context,
+                {mlir::NamedAttribute(
+                     mlir::StringAttr::get(&context, "name"), name),
+                 mlir::NamedAttribute(
+                     mlir::StringAttr::get(&context, "mode"),
+                     mlir::StringAttr::get(&context, mode))}));
+          }
+    for (const auto &override_ : actorModeOverrides)
+      if (!knownActors.contains(override_.first))
+        llvm::errs() << "warning: --actor-mode-map: actor '"
+                     << override_.first
+                     << "' matches no lifted actor; entry ignored\n";
+    if (!clashName.empty()) {
+      mlir::emitError(module->getLoc())
+          << "actor '" << clashName << "' mode disagrees with actor '"
+          << firstName
+          << "': one crate carries one actor_rt runtime flavor";
+      return mlir::failure();
+    }
+    if (!selected.empty()) {
+      module->setAttr(mlir::emitrust::kActorThreadAttrName,
+                      mlir::ArrayAttr::get(&context, selected));
+      threadActors = true;
+    }
+  }
+  if (attachment.attachedAny) {
+    mlir::PassManager pm(&context, mlir::ModuleOp::getOperationName());
+    pm.addPass(mlir::emitrust::createEmitRustActorLift());
+    if (threadActors)
+      pm.addPass(mlir::emitrust::createEmitRustActorThread());
+    if (mlir::failed(pm.run(module)))
+      return mlir::failure();
+  }
+  return mlir::success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -2223,31 +2427,58 @@ int main(int argc, char **argv) {
     // per-shard facts the ordinary merge deliberately strips.
     if (partitionFlag)
       return emitPartitionedWorkspace(inputs, context);
-    // FR-62 slice 4, demotion rule 5: under --link every actor is demoted
-    // (the FR-58/FR-59 interaction is a recorded later stage), so the lift
-    // never runs — but when the user EXPLICITLY asked for the lift the
-    // demotions are still REPORTED per actor, from the same stored shard
-    // graphs --emit=actor-plan reads, so the flag is honest about what it
-    // did not do. The stage-B default stays silent here: rule 5 already
-    // decided, and a default must not demand FR-57d graph metadata from
+    // FR-62 F1a: an EXPLICIT --actor-lift under --link runs the SAME
+    // plan + attach + pass machinery as the source path, on the MERGED
+    // module, from the same stored shard graphs --emit=actor-plan reads.
+    // The unit shape is load-bearing: one graph text per link-line
+    // position, so the planner's running TU-ordinal retag coincides with
+    // the merge's per-position alpha-rename and the plan's symbols ARE
+    // the merged module's symbols (verified for solo shards and for a
+    // non-contiguous re-import group alike). A shard lacking FR-57d graph
+    // metadata demotes every actor with a note — fail-toward-current,
+    // never a failed link. The stage-B default stays demote-all and
+    // SILENT here (rule 5): a default must not demand graph metadata of
     // every artifact on every link line.
-    if (actorLiftFlag && actorLiftFlag.getNumOccurrences() > 0) {
-      llvm::SmallVector<emitrustcc::ActorUnit> units;
-      if (!collectLinkActorUnits(inputs, context, units))
-        return 1;
-      emitrustcc::ActorPlan plan = emitrustcc::planActors(units, {});
-      for (const emitrustcc::Actor &actor : plan.actors)
-        llvm::errs() << "warning: actor plan: demoted " << actor.name
-                     << ": --link actor lift is a later stage (demote-all "
-                        "under link)\n";
-    }
+    bool wantLinkLift = actorLiftFlag && actorLiftFlag.getNumOccurrences() > 0;
+    llvm::SmallVector<emitrustcc::ActorUnit> units;
+    std::string missingShard;
+    if (wantLinkLift &&
+        !collectLinkActorUnits(inputs, context, units, &missingShard))
+      return 1;
     // FR-58: the positional inputs are objects/shards, every one of them
     // already imported AND already lowered by the FR-56 shim, so the merge
     // replaces both the import and the pass pipeline below and the merged
-    // module goes straight to the emission switch.
+    // module goes straight to the emission switch. The merge STRIPS the
+    // shard metadata, which is why the lift's graph facts were collected
+    // above and the attachment happens after the merge, on the module the
+    // emission actually consumes.
     module = loadAndMergeShards(inputs, context);
     if (!module)
       return 1;
+    if (wantLinkLift) {
+      std::string graphError;
+      mlir::FailureOr<mlir::emitrust::ItemGraph> merged = mlir::failure();
+      if (missingShard.empty())
+        merged = mergeLinkUnitGraphs(units, graphError);
+      if (!missingShard.empty()) {
+        llvm::errs() << "warning: actor plan: --link lift demoted every "
+                        "actor: shard '"
+                     << missingShard
+                     << "' carries no item-graph metadata (artifact "
+                        "predates FR-57d?)\n";
+      } else if (mlir::failed(merged)) {
+        llvm::errs() << "warning: actor plan: --link lift demoted every "
+                        "actor: stored item-graph metadata is unreadable: "
+                     << graphError << "\n";
+      } else {
+        emitrustcc::ActorPlan plan = emitrustcc::planActors(units, {});
+        if (mlir::failed(runActorLiftTail(
+                *module, context, *merged, plan,
+                /*allowReifiedModes=*/false, reifyingActorMode,
+                actorModeName, actorModeOverrides)))
+          return 1;
+      }
+    }
   } else {
     mlir::emitrust::ImportOptions importOptions;
     // --incremental IMPLIES --recover: a partial crate is the whole point,
@@ -2309,100 +2540,14 @@ int main(int argc, char **argv) {
       unit.sourcePaths.assign(inputs.begin(), inputs.end());
       unit.graphTexts.push_back(graph->print());
       emitrustcc::ActorPlan plan = emitrustcc::planActors(unit, {});
-      for (const std::string &note : plan.notes)
-        llvm::errs() << "warning: actor plan: " << note << "\n";
-      emitrustcc::ActorLiftAttachment attachment =
-          emitrustcc::attachActorLiftAttributes(*module, *graph, plan,
-                                                preserveCNamesFlag);
-      for (const emitrustcc::ActorLiftDemotion &demotion :
-           attachment.demotions) {
-        llvm::errs() << "warning: actor plan: demoted " << demotion.actor
-                     << ": " << demotion.reason << "\n";
-        if (!demotion.remarkText.empty())
-          mlir::emitRemark(mlir::FileLineColLoc::get(
-                               &context, demotion.remarkFile,
-                               demotion.remarkLine, demotion.remarkColumn))
-              << demotion.remarkText;
-      }
-      // FR-62 slice 5b/5c + F3: each certified actor's runtime mode is
-      // the global --actor-mode unless an --actor-mode-map entry names
-      // it; actors whose effective mode is same-thread are EXCLUDED from
-      // the emitrust-actor-thread selection (they keep the slice-4
-      // struct shape — exclusion by choice, exactly the shape of the
-      // pass's cross-client veto). The list is computed HERE, beside the
-      // lift attachment, because the lift pass strips its own
-      // attributes: the actor names are read from the attribute contract
-      // before the pipeline consumes it. Actors the lift pass itself
-      // demotes (its IR-level safety-net veto) leave no struct_def
-      // behind, and the thread pass skips those SILENTLY -- demoted
-      // actors were never lifted, so they keep today's form;
-      // reification-INELIGIBLE lifted actors get the pass's located
-      // stays-same-thread warning instead. A map name matching no lifted
-      // actor warns and is ignored (fail-toward-noop); a threaded+async
-      // mix among the selected actors is a located error here, because
-      // one crate carries one actor_rt runtime flavor (the emission
-      // rejection in actor-runtime-mixed-modes-invalid.mlir stays as
-      // backstop for hand-written modules).
-      bool threadActors = false;
-      if (reifyingActorMode || !actorModeOverrides.empty()) {
-        llvm::StringRef globalMode =
-            reifyingActorMode ? actorModeName : "same-thread";
-        llvm::StringSet<> knownActors;
-        llvm::SmallVector<mlir::Attribute> selected;
-        llvm::StringRef firstName, firstMode, clashName;
-        if (auto actorsAttr = (*module)->getAttrOfType<mlir::ArrayAttr>(
-                mlir::emitrust::kActorLiftActorsAttrName))
-          for (mlir::Attribute entry : actorsAttr)
-            if (auto dict = llvm::dyn_cast<mlir::DictionaryAttr>(entry))
-              if (auto name = dict.getAs<mlir::StringAttr>("name")) {
-                knownActors.insert(name.getValue());
-                llvm::StringRef mode = globalMode;
-                for (const auto &override_ : actorModeOverrides)
-                  if (override_.first == name.getValue())
-                    mode = override_.second;
-                if (mode == "same-thread")
-                  continue;
-                if (firstMode.empty()) {
-                  firstName = name.getValue();
-                  firstMode = mode;
-                } else if (mode != firstMode && clashName.empty()) {
-                  clashName = name.getValue();
-                }
-                selected.push_back(mlir::DictionaryAttr::get(
-                    &context,
-                    {mlir::NamedAttribute(
-                         mlir::StringAttr::get(&context, "name"), name),
-                     mlir::NamedAttribute(
-                         mlir::StringAttr::get(&context, "mode"),
-                         mlir::StringAttr::get(&context, mode))}));
-              }
-        for (const auto &override_ : actorModeOverrides)
-          if (!knownActors.contains(override_.first))
-            llvm::errs() << "warning: --actor-mode-map: actor '"
-                         << override_.first
-                         << "' matches no lifted actor; entry ignored\n";
-        if (!clashName.empty()) {
-          mlir::emitError((*module)->getLoc())
-              << "actor '" << clashName << "' mode disagrees with actor '"
-              << firstName
-              << "': one crate carries one actor_rt runtime flavor";
-          return 1;
-        }
-        if (!selected.empty()) {
-          (*module)->setAttr(mlir::emitrust::kActorThreadAttrName,
-                             mlir::ArrayAttr::get(&context, selected));
-          threadActors = true;
-        }
-      }
-      if (attachment.attachedAny) {
-        mlir::PassManager pm(&context,
-                             mlir::ModuleOp::getOperationName());
-        pm.addPass(mlir::emitrust::createEmitRustActorLift());
-        if (threadActors)
-          pm.addPass(mlir::emitrust::createEmitRustActorThread());
-        if (mlir::failed(pm.run(*module)))
-          return 1;
-      }
+      // The shared F1a lift tail: attach, report, compose the actor-mode
+      // selection (allowed here — this is the source path), run the
+      // passes.
+      if (mlir::failed(runActorLiftTail(*module, context, *graph, plan,
+                                        /*allowReifiedModes=*/true,
+                                        reifyingActorMode, actorModeName,
+                                        actorModeOverrides)))
+        return 1;
     }
   }
 
