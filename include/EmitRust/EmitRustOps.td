@@ -957,6 +957,16 @@ def EmitRust_GlobalOp : EmitRust_Op<"global", [
   let assemblyFormat =
       "(`const` $is_const^)? $sym_name (` ` `<` $init^ `>`)? attr-dict `:` $type";
   let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    /// Resolves the global named `name` visible from `from`. Globals are
+    /// module children, but an accessor may live inside a nested symbol
+    /// table (`emitrust.impl` holds the SymbolTable trait and FR-30 owner
+    /// promotion moves functions into impl blocks), so the lookup runs in
+    /// the enclosing MODULE's table, not the nearest one. Returns null
+    /// when no such global exists or the symbol is of a different kind.
+    static GlobalOp lookupFrom(mlir::Operation *from, llvm::StringRef name);
+  }];
 }
 
 //===----------------------------------------------------------------------===//
