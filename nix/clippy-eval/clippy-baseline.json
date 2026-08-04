@@ -2,9 +2,8 @@
   "corpus": "test/EndToEnd",
   "crates_linted": 111,
   "crates_skipped": 14,
-  "total_warnings": 1621,
+  "total_warnings": 961,
   "by_lint": {
-    "clippy::print_with_newline": 660,
     "clippy::needless_late_init": 296,
     "clippy::assign_op_pattern": 253,
     "clippy::explicit_auto_deref": 239,
