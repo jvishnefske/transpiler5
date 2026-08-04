@@ -1,0 +1,3 @@
+# FR-62 F3 (actor-mode-map-mixed.c): TotalActor opts out of the global
+# threaded mode and stays a plain lifted struct.
+TotalActor same-thread
