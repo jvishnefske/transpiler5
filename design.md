@@ -4261,7 +4261,7 @@ rule.
   semantics), member-of-nested writes, and assignment through a pointer
   deref, import-level and differential. (test/Import/C/structs-nested.c,
   test/EndToEnd/structs-nested.c)
-- [ ] C99-43 Pointers to pointers and pointer members inside structs
+- [x] C99-43 Pointers to pointers and pointer members inside structs
   (design decision needed alongside C99-26: reference-typed struct fields
   require Rust lifetimes, which the dialect deliberately does not model;
   candidate mappings are index-based handles or ownership restructuring).
@@ -4683,6 +4683,32 @@ rule.
   dropped-main Driver test now STORES argv (still non-admitted) to keep
   exercising the recovery path, since a `%s` of argv is now admitted.
   Suite 517 -> 523.
+  BOX CLOSED (2026-08-04, orchestrator). This was the C99 roadmap's LAST
+  unchecked box; the design is now all-boxes-checked. The original
+  acceptance ("pointers to pointers and pointer members inside structs")
+  is not a single landing but a settled disposition across four measured
+  fronts, each recorded above with its own verdict — the box closes on
+  the union of them, NOT on a claim that every ptr-to-ptr shape now
+  transpiles. Owner questions Q1-Q4 were answered first (2026-08-03):
+  &mut-i64-cursor only (no multi-return), no synthesized region structs,
+  plain idiomatic indexing with a deterministic panic on a stale handle,
+  Option<index> for NULL-able handles. Against those, the fronts map:
+  (member-pointer half) FR-37/FR-38 self-referential array-member
+  pointers via `emitrust.enum_def` + `match`, and the array-rooted
+  returned-pointer half via FR-36 — both pre-existing and unchanged.
+  (C1) single-global-or-NULL out-param cursors (Shape G) LANDED, mapping
+  a `T **p` write of one file-scope global / NULL / `cond ? g : NULL` to
+  `&mut Option<i64>`. (C2) container_of intrusive-container recognition
+  is a recorded NO-GO (three measured blockers; the four link types stay
+  the located rejection). (C3) the argv cursor table LANDED (this
+  record), retiring the W4.3 gap. (C4) the residual — body-less T**
+  prototypes / signature-starved redeclarations — is NOT a ptr-to-ptr
+  modelling gap but FR-58's signature-starvation axis, recorded there
+  with its preconditions; it does not hold this box open. Everything
+  outside these admitted subsets keeps its byte-identical located
+  rejection: the box is closed on a PROVEN disposition (landed, NO-GO,
+  or reassigned-and-recorded) for every front, with the safe failure
+  direction — a loud rejection — preserved for all the rest.
 - [x] C99-44 Unions. DECIDED and SHIPPED: the one-slot struct model —
   a supported subset with documented located rejections, not an enum
   mapping and not a blanket rejection. A named or untagged union
@@ -6780,8 +6806,12 @@ Findings, in order of how much they should change what happens next:
    one rejected struct disqualifies every type and function naming it. The
    roots are each project's central types -- `netif`, `pbuf_custom`,
    `stats_`, the `xSTATIC_*` FreeRTOS types, `pb_callback_s`, mbedTLS's
-   context structs. This is **C99-43**, the single remaining unchecked box on
-   the C99 roadmap.
+   context structs. This is **C99-43**, which was the last unchecked box on
+   the C99 roadmap (now closed on its four-front disposition — C1 landed,
+   C2 NO-GO, C3 landed, C4 on FR-58's axis); the pointer-in-struct-field
+   cascade this data ranks first is the member-pointer front, admitted
+   only for the FR-37/FR-38 array-rooted subset and otherwise still the
+   located rejection this tabulation counts.
 
 4. **Dynamic memory is NOT the barrier: 4 occurrences in 289 units (0.06%),
    and twice in the whole of lwIP.** This is the sharpest correction the
