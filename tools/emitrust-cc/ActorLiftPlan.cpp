@@ -102,11 +102,10 @@ std::string cellBaseName(llvm::StringRef cellSymbol,
 
 } // namespace
 
-ActorLiftAttachment
-emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
-                                      const ItemGraph &graph,
-                                      const ActorPlan &plan,
-                                      bool preserveCNames) {
+ActorLiftAttachment emitrustcc::attachActorLiftAttributes(
+    mlir::ModuleOp module, const ItemGraph &graph, const ActorPlan &plan,
+    bool preserveCNames,
+    llvm::ArrayRef<std::pair<unsigned, std::string>> preDemotions) {
   ActorLiftAttachment result;
   mlir::MLIRContext *context = module.getContext();
   // FR-53's verbatim opt-out applies to every name DERIVED from a C
@@ -189,6 +188,16 @@ emitrustcc::attachActorLiftAttributes(mlir::ModuleOp module,
       }
     demoted[actorIndex] = std::move(demotion);
   };
+
+  // Rule 0 (FR-62 F1b): caller-supplied pre-demotions run before any
+  // table rule, so the caller's reason (the partition path's
+  // `spans workspace crates`) wins over whatever rule would have fired
+  // next. The plan itself stays whole — universe and actor indices are
+  // untouched — so partial demotion of a cross client's targets composes
+  // through the same machinery rules 1b/2 already exercise.
+  for (const auto &[actorIndex, reason] : preDemotions)
+    if (actorIndex < plan.actors.size())
+      demote(actorIndex, reason);
 
   // Rules 1 and 3, per arm/cross function.
   for (const ActorFunction &fn : plan.actorOfFunction) {

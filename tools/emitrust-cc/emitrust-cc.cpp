@@ -1478,19 +1478,23 @@ static int emitLinkActorPlan(llvm::ArrayRef<std::string> inputs,
 /// \param reifyingActorMode whether the global --actor-mode is reifying.
 /// \param actorModeName the global mode's spelling (valid when reifying).
 /// \param actorModeOverrides F3's per-actor (name, mode) entries.
+/// \param preDemotions FR-62 F1b's rule-0 entries: (plan actor index,
+///        reason) pairs certification demotes before any table rule —
+///        the partition path's not-bin-local demotions.
 /// \returns failure after a printed error (mode clash or pass failure).
 static mlir::LogicalResult runActorLiftTail(
     mlir::ModuleOp module, mlir::MLIRContext &context,
     const mlir::emitrust::ItemGraph &graph,
     const emitrustcc::ActorPlan &plan, bool allowReifiedModes,
     bool reifyingActorMode, llvm::StringRef actorModeName,
-    llvm::ArrayRef<std::pair<std::string, std::string>>
-        actorModeOverrides) {
+    llvm::ArrayRef<std::pair<std::string, std::string>> actorModeOverrides,
+    llvm::ArrayRef<std::pair<unsigned, std::string>> preDemotions = {}) {
   for (const std::string &note : plan.notes)
     llvm::errs() << "warning: actor plan: " << note << "\n";
   emitrustcc::ActorLiftAttachment attachment =
       emitrustcc::attachActorLiftAttributes(module, graph, plan,
-                                            preserveCNamesFlag);
+                                            preserveCNamesFlag,
+                                            preDemotions);
   for (const emitrustcc::ActorLiftDemotion &demotion :
        attachment.demotions) {
     llvm::errs() << "warning: actor plan: demoted " << demotion.actor
@@ -1783,6 +1787,130 @@ static bool loadPartitionOverrides(
   return true;
 }
 
+/// FR-62 F1b: the bin-local actor lift under `--partition`. The partition
+/// path used to demote every actor; this lifts exactly the actors whose
+/// whole cluster — owned globals, arms, and cross clients — sits in the
+/// BINARY member's unit set, and demotes every other actor through the
+/// certification's rule 0 with the `spans workspace crates` reason.
+/// Soundness rests on two probed facts (design.md's F1b record):
+///
+///  - THE ORDINAL INVARIANT: `positionGraph` is harvested per link-line
+///    position, so per-position `ActorUnit`s make `mergeLinkUnitGraphs`'s
+///    running retag ordinal EQUAL the link position — the same
+///    alpha-rename `renameShardTags` applied to the merged module whose
+///    ops the split distributed, so the plan's symbols ARE the bin
+///    module's symbols (F1a's invariant, unchanged shape).
+///  - THE FR-59 GLOBALS INVARIANT: module-level state never crosses a
+///    crate boundary, so an actor's globals and every function touching
+///    them land in ONE crate (bin-locality is decidable from the merged
+///    graph's defining positions alone), and no lib member can reference
+///    into the binary crate (cargo cannot depend on a bin) — the lift's
+///    rewrite set is closed within the bin module and every lib member's
+///    bytes are untouched by construction.
+///
+/// The plan is computed over the WHOLE link line (never over the bin
+/// units alone: both the ordinal invariant and cross-actor-writer
+/// soundness are whole-link facts) and passed to the shared lift tail
+/// INTACT — rule-0 pre-demotion keeps the universe total and the actor
+/// indices stable. A position with no FR-57d graph metadata or an
+/// unreadable graph demotes everything: a warning when the lift was
+/// explicitly requested, silent under the stage-B default (F1a-3's
+/// posture). Symbols the merged graph cannot place (no node) demote
+/// their actor conservatively — fail-toward-current. Actor-aware
+/// partition condensation (feeding actor edges into `planPartition` so a
+/// cluster is STEERED into the binary crate) is the recorded later
+/// stage, not attempted here.
+///
+/// \param binModule the split-out binary member's module, lifted in place.
+/// \param context the module's context.
+/// \param positionSource per link-line-position source paths.
+/// \param positionGraph per link-line-position FR-57d graph texts.
+/// \param graphlessShard first shard lacking graph metadata ("" if none).
+/// \param ordinalMaps per post-re-import-unit link-line positions.
+/// \param plan the partition plan over those units.
+/// \param binCrate the binary member's index in `plan.crates`.
+/// \returns failure after a printed error (lift pass failure).
+static mlir::LogicalResult liftPartitionBinActors(
+    mlir::ModuleOp binModule, mlir::MLIRContext &context,
+    llvm::ArrayRef<std::string> positionSource,
+    llvm::ArrayRef<std::string> positionGraph,
+    llvm::StringRef graphlessShard,
+    llvm::ArrayRef<llvm::SmallVector<unsigned>> ordinalMaps,
+    const emitrustcc::PartitionPlan &plan, unsigned binCrate) {
+  bool explicitLift = actorLiftFlag.getNumOccurrences() > 0;
+  if (!graphlessShard.empty()) {
+    if (explicitLift)
+      llvm::errs() << "warning: actor plan: --partition lift demoted every "
+                      "actor: shard '"
+                   << graphlessShard
+                   << "' carries no item-graph metadata (artifact predates "
+                      "FR-57d?)\n";
+    return mlir::success();
+  }
+  llvm::SmallVector<emitrustcc::ActorUnit> units(positionGraph.size());
+  for (auto [i, text] : llvm::enumerate(positionGraph)) {
+    units[i].sourcePaths.push_back(positionSource[i]);
+    units[i].graphTexts.push_back(text);
+  }
+  std::string graphError;
+  mlir::FailureOr<mlir::emitrust::ItemGraph> graph =
+      mergeLinkUnitGraphs(units, graphError);
+  if (mlir::failed(graph)) {
+    if (explicitLift)
+      llvm::errs() << "warning: actor plan: --partition lift demoted every "
+                      "actor: stored item-graph metadata is unreadable: "
+                   << graphError << "\n";
+    return mlir::success();
+  }
+  emitrustcc::ActorPlan actorPlan = emitrustcc::planActors(units, {});
+
+  // Which crate defines each merged-graph symbol: node tuIndex is the
+  // DEFINING link-line position (def-wins dedup), the ordinal maps say
+  // which post-re-import unit covers it, and the partition plan says
+  // which crate that unit landed in.
+  llvm::SmallVector<unsigned> crateOfPosition(positionGraph.size(), 0);
+  for (auto [k, map] : llvm::enumerate(ordinalMaps))
+    for (unsigned position : map)
+      crateOfPosition[position] = plan.unitCrate[k];
+  llvm::StringMap<unsigned> crateOfSymbol;
+  for (const mlir::emitrust::ItemNode &node : graph->nodes)
+    if (node.tuIndex < crateOfPosition.size())
+      crateOfSymbol[node.symbol] = crateOfPosition[node.tuIndex];
+
+  // Rule-0 pre-demotions: an actor is bin-local iff every owned real
+  // global, every arm, and every cross client places in the binary
+  // member; an unplaceable symbol demotes conservatively. "@stdout" is a
+  // pseudo-global with no position and never constrains placement.
+  llvm::SmallVector<bool> binLocal(actorPlan.actors.size(), true);
+  auto place = [&](const std::string &symbol, unsigned actorIndex) {
+    auto it = crateOfSymbol.find(symbol);
+    if (it == crateOfSymbol.end() || it->second != binCrate)
+      binLocal[actorIndex] = false;
+  };
+  for (auto [i, actor] : llvm::enumerate(actorPlan.actors))
+    for (const std::string &global : actor.globals)
+      if (global != "@stdout")
+        place(global, static_cast<unsigned>(i));
+  for (const emitrustcc::ActorFunction &fn : actorPlan.actorOfFunction) {
+    if (fn.role == emitrustcc::ActorRole::Arm)
+      place(fn.symbol, fn.actor);
+    else if (fn.role == emitrustcc::ActorRole::Cross)
+      for (unsigned target : fn.crossActors)
+        place(fn.symbol, target);
+  }
+  llvm::SmallVector<std::pair<unsigned, std::string>> preDemotions;
+  for (auto [i, local] : llvm::enumerate(binLocal))
+    if (!local)
+      preDemotions.emplace_back(static_cast<unsigned>(i),
+                                "spans workspace crates");
+
+  return runActorLiftTail(binModule, context, *graph, actorPlan,
+                          /*allowReifiedModes=*/false,
+                          /*reifyingActorMode=*/false,
+                          /*actorModeName=*/"",
+                          /*actorModeOverrides=*/{}, preDemotions);
+}
+
 /// `--link --partition --emit=crate`: the full workspace path. Loads and
 /// surfaces the shards exactly like `loadAndMergeShards`, HARVESTS each
 /// link-line position's partition facts (source path, item-graph text)
@@ -1792,7 +1920,9 @@ static bool loadPartitionOverrides(
 /// attribution, SPLITS the merged module into one module per crate
 /// (`emitrust.use`/`emitrust.verbatim` header ops are CLONED into every
 /// member — a member gets at most an allowed unused import, never a missing
-/// one), and writes the workspace: a virtual root manifest plus one member
+/// one), runs the FR-62 F1b bin-local actor lift on the binary member's
+/// module (`liftPartitionBinActors`; lib members are never touched), and
+/// writes the workspace: a virtual root manifest plus one member
 /// directory per crate, the binary member last touched by `--build` through
 /// the ordinary root-manifest cargo invocation.
 ///
@@ -1823,6 +1953,7 @@ static int emitPartitionedWorkspace(llvm::ArrayRef<std::string> inputs,
   size_t positions = shards.size();
   llvm::SmallVector<std::string> positionSource(positions);
   llvm::SmallVector<std::string> positionGraph(positions);
+  std::string graphlessShard;
   for (auto [i, shard] : llvm::enumerate(shards)) {
     std::optional<mlir::emitrust::ShardSource> source =
         mlir::emitrust::getShardSource(*shard.module);
@@ -1836,6 +1967,8 @@ static int emitPartitionedWorkspace(llvm::ArrayRef<std::string> inputs,
     if (std::optional<llvm::StringRef> graph =
             mlir::emitrust::getShardItemGraph(*shard.module))
       positionGraph[i] = graph->str();
+    else if (graphlessShard.empty())
+      graphlessShard = shard.name; // FR-62 F1b: demotes the lift below.
   }
 
   llvm::SmallVector<llvm::SmallVector<unsigned>> ordinalMaps;
@@ -1916,6 +2049,24 @@ static int emitPartitionedWorkspace(llvm::ArrayRef<std::string> inputs,
   for (mlir::OwningOpRef<mlir::ModuleOp> &crateModule : crateModules)
     if (mlir::failed(mlir::verify(*crateModule)))
       return 1;
+
+  // FR-62 F1b: lift the binary member's bin-local actors (see
+  // `liftPartitionBinActors`); every other actor demotes with the
+  // `spans workspace crates` warning. A workspace with no binary member
+  // has no driver to own a handle (F2 export under --partition is a
+  // later stage), so the lift skips silently — today's demoted form.
+  if (actorLiftFlag) {
+    int binIndex = -1;
+    for (auto [i, crate] : llvm::enumerate(plan.crates))
+      if (crate.isBin)
+        binIndex = static_cast<int>(i);
+    if (binIndex >= 0 &&
+        mlir::failed(liftPartitionBinActors(
+            *crateModules[binIndex], context, positionSource, positionGraph,
+            graphlessShard, ordinalMaps, plan,
+            static_cast<unsigned>(binIndex))))
+      return 1;
+  }
 
   // Write the workspace.
   if (std::error_code ec = llvm::sys::fs::create_directories(outputPath)) {

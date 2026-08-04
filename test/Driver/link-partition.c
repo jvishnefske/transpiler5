@@ -22,6 +22,12 @@
 // GLOBAL-SAME: global
 // GLOBAL-SAME: SHARED_G
 //
+// FR-62 F1b: the bin-local partition lift covers only the binary
+// member's actors; this corpus's one actor (SHARED_G and its arms) lives
+// in the 'ga' lib member, so it demotes with the spans-note and the
+// workspace keeps today's demoted form everywhere:
+// GLOBAL: warning: actor plan: demoted SHARED_G: spans workspace crates
+//
 // One lib member (ga absorbed gb), one bin member; the global is private
 // in it -- no pub static anywhere in the workspace.
 // RUN: ls %t.ws/ga/src/lib.rs %t.ws/gapp/src/main.rs
@@ -46,6 +52,7 @@
 // RUN: rm -rf %t.ws2
 // RUN: emitrust-cc --link %t.a.o %t.b.o %t.main.o -o %t.ws2 --crate-name gapp --emit=crate --partition --partition-map %t.map 2>%t.err2
 // RUN: not grep "condensing" %t.err2
+// RUN: grep "demoted SHARED_G: spans workspace crates" %t.err2
 // RUN: ls %t.ws2/combined/src/lib.rs %t.ws2/gapp/src/main.rs
 //
 // No-partition byte-identity: without --partition the same link emits the
@@ -53,8 +60,8 @@
 // import's --emit=rust, no workspace members anywhere. Since FR-62 F1a-3
 // the defaulted --actor-lift lifts under --link too (every shard carries
 // FR-57d graph metadata), so both sides compare in the same LIFTED form;
-// the --partition path above stays demoted (its lift is F1b, a later
-// slice).
+// the --partition runs above lift only BIN-LOCAL actors (F1b), and this
+// corpus has none, so their emitted crates keep today's demoted form.
 // RUN: rm -rf %t.single
 // RUN: emitrust-cc --link %t.a.o %t.b.o %t.main.o -o %t.single --crate-name gapp --emit=crate
 // RUN: emitrust-cc --emit=rust %S/Inputs/link-partition-global/ga/def.c %S/Inputs/link-partition-global/gb/use.c %s -o %t.joint.rs
