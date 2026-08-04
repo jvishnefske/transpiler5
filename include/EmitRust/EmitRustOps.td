@@ -1541,6 +1541,45 @@ def EmitRust_SliceOfOp : EmitRust_Op<"slice_of"> {
 }
 
 //===----------------------------------------------------------------------===//
+// ArgvArgOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_ArgvArgOp : EmitRust_Op<"argv_arg"> {
+  let summary = "Argv table argument borrow operation";
+  let description = [{
+    The `emitrust.argv_arg` operation borrows one command-line argument's
+    NUL-terminated byte run out of an `!emitrust.argv_table` value (C99-43
+    C3), producing a shared `!emitrust.ref<!emitrust.slice<i8>>`. It is
+    emitted as a `let` binding of the whole-vector slice borrow
+    `&table[index as usize][..]` (the `as usize` cast is omitted when the
+    index is of `index` type); an out-of-range index panics where the C
+    read is undefined behavior, the accepted refinement direction. From
+    the result, the ordinary slice surface applies: `emitrust.deref` +
+    `emitrust.subscript` read single argument bytes, and the on-demand
+    `__emitrust_cstr_out` printf helper consumes the slice whole.
+
+    Example:
+
+    ```mlir
+    %s = emitrust.argv_arg %argv[%i]
+        : (!emitrust.argv_table, i32) -> !emitrust.ref<!emitrust.slice<i8>>
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v2: &[i8] = &v0[v1 as usize][..];
+    ```
+  }];
+
+  let arguments = (ins EmitRust_ArgvTableType:$table,
+                       AnyTypeOf<[AnyInteger, Index]>:$index);
+  let results = (outs EmitRust_RefType:$result);
+
+  let assemblyFormat =
+      "$table `[` $index `]` attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // Binary arithmetic operations
 //===----------------------------------------------------------------------===//
 

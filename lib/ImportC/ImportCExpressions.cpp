@@ -24,6 +24,84 @@
 using namespace mlir;
 
 //===----------------------------------------------------------------------===//
+// C99-43 C3: admitted argv read lowering
+//===----------------------------------------------------------------------===//
+
+const clang::Expr *
+CImporter::matchArgvWholeSubscript(const clang::Expr *expr) const {
+  // Only an admitted `main` binds the table; without it argv never reaches
+  // here (its uses were rejected at the signature), so nothing matches.
+  if (!mainArgvTableValue)
+    return nullptr;
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  const auto *sub = llvm::dyn_cast<clang::ArraySubscriptExpr>(e);
+  if (!sub)
+    return nullptr;
+  const auto *ref =
+      llvm::dyn_cast<clang::DeclRefExpr>(sub->getBase()->IgnoreParenImpCasts());
+  if (!ref || ref->getDecl() != mainArgvAdmittedParam)
+    return nullptr;
+  return sub->getIdx();
+}
+
+const clang::ArraySubscriptExpr *
+CImporter::matchArgvByteRead(const clang::Expr *expr) const {
+  if (!mainArgvTableValue)
+    return nullptr;
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  const auto *outer = llvm::dyn_cast<clang::ArraySubscriptExpr>(e);
+  if (!outer)
+    return nullptr;
+  // The outer base must itself be a whole-value `argv[i]` borrow.
+  if (!matchArgvWholeSubscript(outer->getBase()))
+    return nullptr;
+  return outer;
+}
+
+FailureOr<Value> CImporter::emitArgvArgSlice(Location loc,
+                                             const clang::Expr *indexExpr) {
+  FailureOr<Value> index = emitRValue(indexExpr);
+  if (failed(index))
+    return failure();
+  auto sliceRefType = emitrust::RefType::get(
+      emitrust::SliceType::get(builder.getIntegerType(8)));
+  return builder
+      .create<emitrust::ArgvArgOp>(loc, sliceRefType, mainArgvTableValue,
+                                   *index)
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitArgvByteLValue(const clang::ArraySubscriptExpr *subscript,
+                             Location loc) {
+  // The byte place of `argv[i][j]`: borrow argument i's slice, deref to the
+  // slice place, subscript byte j — reusing the ordinary slice element read.
+  const clang::Expr *innerIndex =
+      matchArgvWholeSubscript(subscript->getBase());
+  if (!innerIndex)
+    return emitError(loc)
+           << "unsupported: use of main's argv parameter (command-line "
+              "argument values are not modeled)";
+  FailureOr<Value> slice = emitArgvArgSlice(loc, innerIndex);
+  if (failed(slice))
+    return failure();
+  auto i8Type = builder.getIntegerType(8);
+  Value place =
+      builder
+          .create<emitrust::DerefOp>(
+              loc, emitrust::LValueType::get(emitrust::SliceType::get(i8Type)),
+              *slice)
+          .getResult();
+  FailureOr<Value> byteIndex = emitRValue(subscript->getIdx());
+  if (failed(byteIndex))
+    return failure();
+  return builder
+      .create<emitrust::SubscriptOp>(loc, emitrust::LValueType::get(i8Type),
+                                     place, *byteIndex)
+      .getResult();
+}
+
+//===----------------------------------------------------------------------===//
 // Expressions
 //===----------------------------------------------------------------------===//
 

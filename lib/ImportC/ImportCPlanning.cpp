@@ -1811,11 +1811,233 @@ const clang::VarDecl *asWholeGlobalAddress(const clang::Expr *expr) {
 
 } // namespace
 
-LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
-  // C main's `char **argv` has its own policy (dropped from the
-  // imported signature; uses rejected) — never a string cursor.
-  if (func->isMain())
+namespace {
+
+/// One printf directive's admission-relevant facts (C99-43 C3): the
+/// conversion character and whether an explicit field width was spelled
+/// (a width on `%s` needs the C-string length for its padding, which the
+/// raw byte path does not compute — such an argv feed stays rejected).
+struct PrintfArgDirective {
+  char conv;
+  bool hasWidth;
+};
+
+/// The argv admission's parent map: a plain child->parent map over ONE
+/// function body (C99-43 C3). Built by one recursive walk so the
+/// per-reference use classification can climb upward; local and
+/// deterministic, no AST-context-wide parent machinery.
+using StmtParentMap = llvm::DenseMap<const clang::Stmt *, const clang::Stmt *>;
+
+/// The result of climbing from a node through parens and implicit casts:
+/// the first semantically distinct parent (null at the body root), the
+/// last trivia node directly under it (the exact child the parent
+/// stores), and whether an lvalue-to-rvalue conversion was crossed (the
+/// marker of a VALUE read).
+struct TriviaClimb {
+  const clang::Stmt *parent;
+  const clang::Stmt *argNode;
+  bool sawLValueToRValue;
+};
+
+} // namespace
+
+/// Builds the child->parent map under `stmt` (`stmt` itself has no entry).
+static void buildStmtParentMap(const clang::Stmt *stmt,
+                               StmtParentMap &parents) {
+  for (const clang::Stmt *child : stmt->children())
+    if (child) {
+      parents[child] = stmt;
+      buildStmtParentMap(child, parents);
+    }
+}
+
+/// Collects every reference to `param` below `stmt`, in source order.
+static void
+collectParamRefs(const clang::Stmt *stmt, const clang::ParmVarDecl *param,
+                 SmallVectorImpl<const clang::DeclRefExpr *> &out) {
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (ref->getDecl() == param)
+      out.push_back(ref);
+  for (const clang::Stmt *child : stmt->children())
+    if (child)
+      collectParamRefs(child, param, out);
+}
+
+/// Climbs from `node` (see `TriviaClimb`).
+static TriviaClimb climbTrivia(const clang::Stmt *node,
+                               const StmtParentMap &parents) {
+  TriviaClimb climb{nullptr, node, false};
+  const clang::Stmt *p = parents.lookup(node);
+  while (p) {
+    if (llvm::isa<clang::ParenExpr>(p)) {
+      climb.argNode = p;
+      p = parents.lookup(p);
+      continue;
+    }
+    if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(p)) {
+      if (cast->getCastKind() == clang::CK_LValueToRValue)
+        climb.sawLValueToRValue = true;
+      climb.argNode = p;
+      p = parents.lookup(p);
+      continue;
+    }
+    break;
+  }
+  climb.parent = p;
+  return climb;
+}
+
+/// Scans `format` (decoded literal bytes) into one entry per consumed
+/// vararg, in order. Returns false — no admission — on a trailing `%` or
+/// any `*` width/precision: the runtime-consuming forms shift argument
+/// positions and are rejected by the printf lowering anyway, and bailing
+/// here keeps every such argv program on the single historical argv
+/// rejection wording.
+static bool scanPrintfArgDirectives(llvm::StringRef format,
+                                    SmallVectorImpl<PrintfArgDirective> &out) {
+  for (size_t i = 0, n = format.size(); i < n; ++i) {
+    if (format[i] != '%')
+      continue;
+    if (++i >= n)
+      return false;
+    if (format[i] == '%')
+      continue;
+    while (i < n && (format[i] == '-' || format[i] == '0' ||
+                     format[i] == '+' || format[i] == ' ' ||
+                     format[i] == '#'))
+      ++i;
+    if (i < n && format[i] == '*')
+      return false;
+    bool hasWidth = false;
+    while (i < n && format[i] >= '0' && format[i] <= '9') {
+      hasWidth = true;
+      ++i;
+    }
+    if (i < n && format[i] == '.') {
+      ++i;
+      if (i < n && format[i] == '*')
+        return false;
+      while (i < n && format[i] >= '0' && format[i] <= '9')
+        ++i;
+    }
+    while (i < n && (format[i] == 'h' || format[i] == 'l' ||
+                     format[i] == 'j' || format[i] == 'z' ||
+                     format[i] == 't' || format[i] == 'L'))
+      ++i;
+    if (i >= n)
+      return false;
+    out.push_back({format[i], hasWidth});
+  }
+  return true;
+}
+
+/// Returns whether `argNode` — the exact stored argument node of `call` —
+/// sits in a directly-intercepted `printf` call (by-name, no project
+/// definition, mirroring the statement lowering's intercept) at a `%s`
+/// position with no field width. A precision (`%.Ns`) is admitted: the
+/// raw byte path bounds the scan without needing the padded length.
+static bool admittedPrintfStringArg(const clang::CallExpr *call,
+                                    const clang::Stmt *argNode) {
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  if (!callee || !callee->getDeclName().isIdentifier() ||
+      callee->getName() != "printf" || callee->getDefinition())
+    return false;
+  if (call->getNumArgs() < 2)
+    return false;
+  const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+      call->getArg(0)->IgnoreParenImpCasts());
+  if (!literal || !literal->isOrdinary())
+    return false;
+  unsigned argIndex = 0;
+  for (unsigned k = 1, e = call->getNumArgs(); k < e; ++k)
+    if (call->getArg(k) == argNode) {
+      argIndex = k;
+      break;
+    }
+  if (argIndex == 0)
+    return false;
+  SmallVector<PrintfArgDirective, 8> directives;
+  if (!scanPrintfArgDirectives(literal->getString(), directives))
+    return false;
+  unsigned position = argIndex - 1;
+  return position < directives.size() && directives[position].conv == 's' &&
+         !directives[position].hasWidth;
+}
+
+/// Classifies ONE argv reference against the C99-43 C3 admitted read
+/// grammar: `argv[i]` whole-value as a direct-printf `%s`/`%.Ns`
+/// argument, or `argv[i][j]` consumed as a VALUE (any lvalue-to-rvalue
+/// context: comparisons, arithmetic, `%d`/`%c` holes, scalar
+/// initializers). Everything else — stores, other calls, address-of,
+/// `argv` arithmetic (`argv++`, `argv+1`, bare `*argv`), writes,
+/// pointer-value tests (`argv[0] != 0`) — is not admitted.
+static bool argvUseAdmitted(const clang::DeclRefExpr *ref,
+                            const StmtParentMap &parents) {
+  // `argv` itself must be the BASE of a subscript (crossing its own
+  // lvalue-to-rvalue read of the pointer value).
+  TriviaClimb toSub1 = climbTrivia(ref, parents);
+  const auto *sub1 =
+      llvm::dyn_cast_if_present<clang::ArraySubscriptExpr>(toSub1.parent);
+  if (!sub1 || sub1->getBase() != toSub1.argNode)
+    return false;
+  TriviaClimb fromSub1 = climbTrivia(sub1, parents);
+  if (!fromSub1.parent)
+    return false;
+  if (const auto *sub2 =
+          llvm::dyn_cast<clang::ArraySubscriptExpr>(fromSub1.parent)) {
+    // `argv[i][j]`: admitted exactly when the byte is read as a value.
+    if (sub2->getBase() != fromSub1.argNode)
+      return false;
+    return climbTrivia(sub2, parents).sawLValueToRValue;
+  }
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(fromSub1.parent))
+    return admittedPrintfStringArg(call, fromSub1.argNode);
+  return false;
+}
+
+LogicalResult CImporter::planArgvUsesFor(const clang::FunctionDecl *func) {
+  // C99-43 C3: admit `main`'s argv into the table form only when EVERY
+  // use fits the read grammar; otherwise record nothing, leaving the
+  // historical signature-time rejection (wording and ledger tag
+  // byte-identical). Never rejects here — see the header comment.
+  if (func->getNumParams() != 2 || !func->getBody())
     return success();
+  const clang::ParmVarDecl *argvParam = func->getParamDecl(1);
+  // Shape gate mirrors the signature import: only the standard `char **`
+  // form can carry the table; a non-standard shape keeps its
+  // signature-time shape rejection.
+  clang::QualType argvType = argvParam->getType().getCanonicalType();
+  const auto *outer = argvType->getAs<clang::PointerType>();
+  const auto *inner = outer ? outer->getPointeeType()
+                                  .getCanonicalType()
+                                  ->getAs<clang::PointerType>()
+                            : nullptr;
+  if (!inner || !astContext().hasSameUnqualifiedType(inner->getPointeeType(),
+                                                     astContext().CharTy))
+    return success();
+  // An unused argv keeps the dropped-parameter arity-1 signature,
+  // byte-identical for every argc-only program.
+  if (!argvParam->isReferenced() && !argvParam->isUsed())
+    return success();
+  StmtParentMap parents;
+  buildStmtParentMap(func->getBody(), parents);
+  SmallVector<const clang::DeclRefExpr *, 8> refs;
+  collectParamRefs(func->getBody(), argvParam, refs);
+  if (refs.empty())
+    return success();
+  for (const clang::DeclRefExpr *ref : refs)
+    if (!argvUseAdmitted(ref, parents))
+      return success();
+  mainArgvAdmittedParam = argvParam;
+  return success();
+}
+
+LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
+  // C main's `char **argv` has its own policy (the C99-43 C3 read grammar
+  // imports as the argv table; everything else is dropped from the
+  // imported signature with uses rejected) — never a string cursor.
+  if (func->isMain())
+    return planArgvUsesFor(func);
   SmallVector<const clang::ParmVarDecl *, 2> eligible;
   for (const clang::ParmVarDecl *param : func->parameters())
     if (isDataPointerPointerType(param->getType()))

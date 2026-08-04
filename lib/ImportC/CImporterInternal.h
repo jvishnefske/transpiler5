@@ -2531,6 +2531,22 @@ private:
   /// the call site — recovered in turn — rather than mis-lowering it.
   LogicalResult planCursorParamsFor(const clang::FunctionDecl *func);
 
+  /// C99-43 C3: classifies every use of C `main`'s `char **argv`
+  /// parameter against the admitted read grammar — whole-value `argv[i]`
+  /// as a direct `printf` `%s`/`%.Ns` argument (no field width) and
+  /// `argv[i][j]` byte reads consumed as VALUES — and, when EVERY use is
+  /// admitted, records the parameter in `mainArgvAdmittedParam` so the
+  /// signature import adds the `!emitrust.argv_table` input. NEVER
+  /// rejects: any use outside the grammar (stores, escapes to other
+  /// calls, address-of, pointer arithmetic like `argv++`/`*argv`,
+  /// writes, pointer-value tests like `argv[0] != 0`) simply leaves the
+  /// parameter unadmitted, keeping the historical located rejection at
+  /// the signature (ImportCFunctions' c_main special case) with its
+  /// wording — and ledger tag — byte-identical. Runs at
+  /// `planCursorParamsFor`'s `main` early-return, so the plan exists
+  /// before any signature is built.
+  LogicalResult planArgvUsesFor(const clang::FunctionDecl *func);
+
   /// Emits every planned clone of the monomorphized variadic definition
   /// `func` (CTS 00204); a plan with zero clones emits nothing.
   LogicalResult emitVaClones(const clang::FunctionDecl *func,
@@ -2571,6 +2587,40 @@ private:
   LogicalResult bindCursorParam(const clang::ParmVarDecl *param,
                                 Value baseArg, Value cursorArg,
                                 Location paramLoc);
+
+  /// Binds C `main`'s admitted argv-table parameter (C99-43 C3): records
+  /// the `!emitrust.argv_table` entry-block argument in
+  /// `mainArgvTableValue` for the translation-time argv intercepts. The
+  /// parameter deliberately does NOT enter `symbols`: every admitted use
+  /// is intercepted syntactically (printf `%s` holes, `argv[i][j]`
+  /// subscripts), so an argv reference reaching the generic
+  /// decl-reference path is a bug that must fail loudly there.
+  void bindArgvParam(const clang::ParmVarDecl *param, Value tableArg);
+
+  /// Returns the index expression when `expr` (parens/implicit casts
+  /// stripped) is a whole-value subscript `argv[i]` of the admitted argv
+  /// table, null otherwise.
+  const clang::Expr *matchArgvWholeSubscript(const clang::Expr *expr) const;
+
+  /// Returns the outer subscript when `expr` (parens/implicit casts
+  /// stripped) is a byte read `argv[i][j]` over the admitted argv table,
+  /// null otherwise.
+  const clang::ArraySubscriptExpr *
+  matchArgvByteRead(const clang::Expr *expr) const;
+
+  /// Emits `emitrust.argv_arg` borrowing argument `indexExpr`'s
+  /// NUL-terminated byte run out of the bound argv table, as an
+  /// `!emitrust.ref<!emitrust.slice<i8>>`.
+  FailureOr<Value> emitArgvArgSlice(Location loc,
+                                    const clang::Expr *indexExpr);
+
+  /// `emitLValue`'s argv branch (C99-43 C3): the byte place of
+  /// `argv[i][j]` — `emitrust.argv_arg` + deref + subscript, reusing the
+  /// existing slice element read. An out-of-range i or j panics where the
+  /// C read is UB (the accepted refinement direction).
+  FailureOr<Value>
+  emitArgvByteLValue(const clang::ArraySubscriptExpr *subscript,
+                     Location loc);
 
   /// Emits the pending string-cursor writebacks (local cell -> deref'd
   /// in-out parameter place) ahead of a return.
@@ -3672,11 +3722,28 @@ private:
   /// unknown conversions keep their located rejections here so every
   /// caller enforces the same subset. Fails if `call` supplies too few or
   /// too many arguments for the directives.
+  /// C99-43 C3: with `allowArgvBypass` set (the stdout `print!` context
+  /// only — `emitPrintf`), an argv-fed `%s`/`%c` hole BYPASSES the
+  /// `__emitrust_cstr`/`__emitrust_fmt_c` Display funnels, whose Latin-1
+  /// byte-to-char widening would double-encode any non-ASCII argument
+  /// byte: the pending format segment is flushed as its own `print!`
+  /// call, the hole renders through the raw on-demand helpers
+  /// (`__emitrust_cstr_out`/`__emitrust_cstr_n_out`/`__emitrust_byte_out`
+  /// — NUL-scan + `write_all` on the SAME globally buffered stdout handle
+  /// `print!` locks, so ordering holds even on block-buffered pipes), and
+  /// translation continues into a fresh segment whose remainder the
+  /// caller prints. `*argvBypassed` reports whether any hole took the
+  /// bypass (so the caller can skip an empty trailing `print!`). Without
+  /// the flag an argv-fed hole is a located rejection in the historical
+  /// argv wording — planning admits argv only into the direct-printf
+  /// path, so reaching one here is the loud-failure direction.
   FailureOr<std::string>
   translatePrintfFormat(Location loc, const clang::CallExpr *call,
                         const clang::StringLiteral *literal,
                         unsigned firstArgIndex,
-                        SmallVectorImpl<Value> &operands);
+                        SmallVectorImpl<Value> &operands,
+                        bool allowArgvBypass = false,
+                        bool *argvBypassed = nullptr);
 
   /// Lowers a definition-less `sprintf(dest, fmt, ...)` call (CTS-P9,
   /// 00186). The format must be an ordinary string literal and translates
@@ -4938,6 +5005,19 @@ private:
   std::string currentFuncName;
   /// True while translating C `main` (enables the implicit `return 0`).
   bool currentIsMain = false;
+  /// C99-43 C3: C `main`'s `char **argv` parameter when planning admitted
+  /// EVERY use of it (whole-value `argv[i]` printf `%s` arguments and
+  /// `argv[i][j]` byte reads as values) — the signature then carries the
+  /// `!emitrust.argv_table` input. Null when argv is absent, unused, or
+  /// used outside the admitted grammar (the historical signature-time
+  /// rejection stands). Keyed by the DEFINITION's parameter decl;
+  /// planning-scope, NOT reset per function.
+  const clang::ParmVarDecl *mainArgvAdmittedParam = nullptr;
+  /// Per-function emission state: the `!emitrust.argv_table` entry-block
+  /// argument while translating an admitted `main`, null elsewhere. The
+  /// translation-time argv intercepts (printf holes, `argv[i][j]`
+  /// places) consume it; deliberately never entered into `symbols`.
+  Value mainArgvTableValue;
   /// True while emitting the body of a va_list monomorphization clone
   /// (CTS 00204): enables the va_start/va_end/va_arg lowerings and the
   /// elision of `va_list` locals.
@@ -4983,6 +5063,30 @@ private:
   /// True once the `__emitrust_cstr_n` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool cStrNHelperEmitted = false;
+  /// True once an argv-fed `%s` hole has been imported (C99-43 C3);
+  /// triggers the one-per-module emission of the raw `__emitrust_cstr_out`
+  /// helper — NUL-scan + `write_all` of the raw bytes on the shared
+  /// stdout handle, bypassing the Latin-1 `__emitrust_cstr` funnel that
+  /// would double-encode non-ASCII argument bytes.
+  bool needsCStrOutHelper = false;
+  /// True once the `__emitrust_cstr_out` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool cStrOutHelperEmitted = false;
+  /// True once an argv-fed `%.Ns` hole has been imported (C99-43 C3);
+  /// triggers emission of the raw `__emitrust_cstr_n_out` helper (stops
+  /// at N bytes or the first NUL, whichever comes first).
+  bool needsCStrNOutHelper = false;
+  /// True once the `__emitrust_cstr_n_out` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool cStrNOutHelperEmitted = false;
+  /// True once an argv-fed `%c` hole has been imported (C99-43 C3);
+  /// triggers emission of the raw `__emitrust_byte_out` helper (one raw
+  /// byte via `write_all`, bypassing the ASCII-only `__emitrust_fmt_c`
+  /// char widening).
+  bool needsByteOutHelper = false;
+  /// True once the `__emitrust_byte_out` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool byteOutHelperEmitted = false;
   /// True once a signed integer printf directive outside the 1:1 Rust
   /// format-spec subset (precision or '+'/' ' flags) has been imported;
   /// triggers emission of the `__emitrust_fmt_i64` wrapper (plus the

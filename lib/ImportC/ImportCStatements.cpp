@@ -3258,10 +3258,20 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
            << "unsupported: printf format must be an ordinary string literal";
 
   SmallVector<Value> operands;
+  // C99-43 C3: the stdout `print!` context is the only caller that permits an
+  // argv-fed `%s`/`%c` hole to bypass the Latin-1 Display funnels — the
+  // format is split into segments around the raw `*_out` helper calls.
+  bool argvBypassed = false;
   FailureOr<std::string> rustFormat = translatePrintfFormat(
-      loc, call, literal, /*firstArgIndex=*/1, operands);
+      loc, call, literal, /*firstArgIndex=*/1, operands,
+      /*allowArgvBypass=*/true, &argvBypassed);
   if (failed(rustFormat))
     return failure();
+
+  // When a trailing bypass consumed the whole format tail, there is no
+  // residual segment to print; emitting `print!("")` would be dead output.
+  if (argvBypassed && rustFormat->empty() && operands.empty())
+    return success();
 
   SmallVector<Attribute> callArguments;
   callArguments.push_back(builder.getStringAttr(*rustFormat));
@@ -3276,7 +3286,8 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
 FailureOr<std::string> CImporter::translatePrintfFormat(
     Location loc, const clang::CallExpr *call,
     const clang::StringLiteral *literal, unsigned firstArgIndex,
-    SmallVectorImpl<Value> &operands) {
+    SmallVectorImpl<Value> &operands, bool allowArgvBypass,
+    bool *argvBypassed) {
   // Translate the C format string into a Rust format string. The literal's
   // bytes already have C escapes decoded (a "\n" is a real newline byte);
   // the StringAttr printer re-escapes them for the textual assembly.
@@ -3284,6 +3295,23 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
   std::string rustFormat;
   rustFormat.reserve(format.size());
   unsigned argIndex = firstArgIndex;
+  // C99-43 C3: flushes the format accumulated so far as its own `print!`
+  // call and starts a fresh segment, so a raw `*_out` helper call can be
+  // sequenced in program order between two format segments. A no-op when the
+  // pending segment is empty (avoids `print!("")`).
+  auto flushSegment = [&]() {
+    if (rustFormat.empty() && operands.empty())
+      return;
+    SmallVector<Attribute> callArguments;
+    callArguments.push_back(builder.getStringAttr(rustFormat));
+    for (unsigned k = 0, e = operands.size(); k < e; ++k)
+      callArguments.push_back(builder.getIndexAttr(k));
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(), builder.getStringAttr("print!"),
+        builder.getArrayAttr(callArguments), operands);
+    rustFormat.clear();
+    operands.clear();
+  };
   for (size_t i = 0, n = format.size(); i < n; ++i) {
     char c = format[i];
     // C printf stops at an embedded NUL while Rust's print! would emit the
@@ -3509,6 +3537,57 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       return emitError(loc) << "unsupported: too few arguments to printf";
     const clang::Expr *argExpr = call->getArg(argIndex);
     unsigned argNumber = argIndex++;
+
+    // C99-43 C3: an argv-fed `%s`/`%c` hole in the stdout `print!` context
+    // bypasses the Latin-1 `__emitrust_cstr`/`__emitrust_fmt_c` Display
+    // funnels (whose byte-to-char widening double-encodes non-ASCII argument
+    // bytes) by flushing the pending format segment and writing the raw bytes
+    // through the on-demand `*_out` helpers on the same buffered stdout handle.
+    if (allowArgvBypass && mainArgvTableValue) {
+      if (spec == 's') {
+        if (const clang::Expr *idxExpr = matchArgvWholeSubscript(argExpr)) {
+          if (argvBypassed)
+            *argvBypassed = true;
+          flushSegment();
+          FailureOr<Value> slice = emitArgvArgSlice(loc, idxExpr);
+          if (failed(slice))
+            return failure();
+          if (precision >= 0) {
+            // `%.Ns`: at most N raw bytes, stopping earlier at a NUL.
+            needsCStrNOutHelper = true;
+            Value count = createIntConstant(loc, builder.getIntegerType(64),
+                                            static_cast<int64_t>(precision));
+            builder.create<emitrust::CallOpaqueOp>(
+                loc, TypeRange(),
+                builder.getStringAttr("__emitrust_cstr_n_out"),
+                /*args=*/ArrayAttr(), ValueRange{*slice, count});
+          } else {
+            needsCStrOutHelper = true;
+            builder.create<emitrust::CallOpaqueOp>(
+                loc, TypeRange(),
+                builder.getStringAttr("__emitrust_cstr_out"),
+                /*args=*/ArrayAttr(), ValueRange{*slice});
+          }
+          continue;
+        }
+      } else if (spec == 'c') {
+        if (const clang::ArraySubscriptExpr *byte = matchArgvByteRead(argExpr)) {
+          if (argvBypassed)
+            *argvBypassed = true;
+          flushSegment();
+          FailureOr<Value> place = emitArgvByteLValue(byte, loc);
+          if (failed(place))
+            return failure();
+          Value byteValue = loadPlace(loc, *place);
+          needsByteOutHelper = true;
+          builder.create<emitrust::CallOpaqueOp>(
+              loc, TypeRange(),
+              builder.getStringAttr("__emitrust_byte_out"),
+              /*args=*/ArrayAttr(), ValueRange{byteValue});
+          continue;
+        }
+      }
+    }
 
     if (spec == 's') {
       std::optional<unsigned> stringPrecision;

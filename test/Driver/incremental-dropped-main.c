@@ -5,13 +5,14 @@
 // "cannot emit a crate: the input does not define a 'main' function" -- so the
 // user got no crate, no PORTING.md, and no per-item numbers. That is exactly
 // the all-or-nothing outcome the flag exists to remove, and it was reachable
-// on a real corpus program (test/RealWorld/Inputs/argv-echo.c, whose `main`
-// is dropped for using `argv`).
+// on a real corpus program (a `main` that uses `argv` outside the C99-43 C3
+// admitted read grammar, so the importer drops it).
 //
-// The input below reproduces it minimally: `main` takes `argv`, which the
-// importer cannot model, so the recovering import drops it and the module has
-// no `c_main`. The project is now emitted as a LIBRARY crate, and the report
-// is written.
+// The input below reproduces it minimally: `main` STORES `argv` to a local
+// (a pointer-value use outside the admitted `argv[i]`/`argv[i][j]` read
+// grammar), which the importer cannot model, so the recovering import drops
+// it and the module has no `c_main`. The project is now emitted as a LIBRARY
+// crate, and the report is written.
 //
 // RUN: emitrust-cc --emit=crate --incremental %s -o %t.crate 2>%t.err
 // RUN: ls %t.crate | FileCheck %s --check-prefix=ARTIFACTS
@@ -38,7 +39,10 @@ int describe(int n) { return width_of(n) * 100 + n; }
 
 int main(int argc, char **argv) {
   printf("%d\n", describe(argc));
-  printf("%s\n", argv[0]);
+  // Storing argv (the pointer value) to a local is outside the admitted
+  // read grammar (C99-43 C3), so main stays dropped as it always was.
+  char **rest = argv;
+  printf("%s\n", rest[1]);
   return 0;
 }
 

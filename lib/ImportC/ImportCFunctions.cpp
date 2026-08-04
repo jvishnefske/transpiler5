@@ -316,11 +316,27 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
                       inner->getPointeeType(), astContext().CharTy))
       return emitError(loc) << "unsupported: main must take zero or two "
                                "(int, char **) parameters";
-    if (argvParam->isReferenced() || argvParam->isUsed())
+    // C99-43 C3: when planning admitted EVERY argv use (whole-value
+    // `argv[i]` printf `%s` arguments; `argv[i][j]` byte reads as
+    // values), the signature carries the `!emitrust.argv_table` input
+    // and the crate wrapper passes the collected `Vec<Vec<i8>>` borrow.
+    // The admitted param is recorded on the DEFINITION; a same-TU
+    // prototype visit consults it so both build one signature.
+    const clang::FunctionDecl *definition = func->getDefinition();
+    const clang::ParmVarDecl *defArgvParam =
+        definition && definition->getNumParams() == 2
+            ? definition->getParamDecl(1)
+            : argvParam;
+    bool argvAdmitted =
+        mainArgvAdmittedParam && defArgvParam == mainArgvAdmittedParam;
+    if ((argvParam->isReferenced() || argvParam->isUsed()) && !argvAdmitted)
       return emitError(translateLoc(argvParam->getLocation()))
              << "unsupported: use of main's argv parameter (command-line "
                 "argument values are not modeled)";
     inputTypes.push_back(builder.getIntegerType(32));
+    if (argvAdmitted)
+      inputTypes.push_back(
+          emitrust::ArgvTableType::get(builder.getContext()));
   } else {
     for (auto [index, param] : llvm::enumerate(func->parameters())) {
       if (methodOwner && isPointerType(param->getType()) &&
@@ -543,6 +559,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       globalReturnBases.lookup(func->getCanonicalDecl());
   currentFuncName = name;
   currentIsMain = name == "c_main";
+  mainArgvTableValue = Value();
   bodyRegion = &funcOp.getBody();
   entryBlock = funcOp.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
@@ -682,11 +699,21 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   };
   unsigned entryArgIndex = (methodOwner || cxxHasReceiver) ? 1 : 0;
   for (const clang::ParmVarDecl *param : func->parameters()) {
-    // main's `argv` was dropped from the imported signature (it has no
-    // entry-block argument); its uses were rejected at signature time, so
-    // no binding is needed.
-    if (currentIsMain && isPointerType(param->getType()))
+    // main's `argv`: an admitted parameter (C99-43 C3) owns the
+    // `!emitrust.argv_table` entry-block argument, named after its C
+    // spelling so the signature reads `argv: &[Vec<i8>]`; otherwise it
+    // was dropped from the imported signature (no entry-block argument;
+    // uses were rejected at signature time, so no binding is needed).
+    if (currentIsMain && isPointerType(param->getType())) {
+      if (param == mainArgvAdmittedParam) {
+        Value tableArg = entryBlock->getArgument(entryArgIndex++);
+        if (!param->getName().empty())
+          paramNameSlots[entryArgIndex - 1] =
+              builder.getStringAttr(mangleMemberName(param->getName()));
+        bindArgvParam(param, tableArg);
+      }
       continue;
+    }
     Location paramLoc = translateLoc(param->getLocation());
     // A string-cursor parameter (CTS 00204) owns TWO entry-block
     // arguments: the shared region slice and the in-out cursor.
@@ -980,6 +1007,18 @@ LogicalResult CImporter::bindCursorParam(const clang::ParmVarDecl *param,
   pointerLocals[param] = PointerLocalInfo{param, cell};
   cursorWritebacks.push_back({cell, cursorPlace});
   return success();
+}
+
+void CImporter::bindArgvParam(const clang::ParmVarDecl *param,
+                              Value tableArg) {
+  // C99-43 C3: record the `!emitrust.argv_table` argument for the
+  // translation-time argv intercepts (printf `%s`/`%c` holes,
+  // `argv[i][j]` byte places). Deliberately NOT entered into `symbols`:
+  // every admitted use is intercepted syntactically, so an argv reference
+  // reaching the generic decl-reference path fails loudly there instead
+  // of silently borrowing a mistyped place.
+  (void)param;
+  mainArgvTableValue = tableArg;
 }
 
 void CImporter::emitCursorWritebacks(Location loc) {
@@ -1463,6 +1502,70 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "fn __emitrust_cstr_n(s: &[i8], n: i64) -> String {\n"
             "    s.iter().take(n as usize).take_while(|&&b| b != 0)"
             ".map(|&b| (b as u8) as char).collect()\n"
+            "}"));
+  }
+  if (needsCStrOutHelper && !cStrOutHelperEmitted) {
+    cStrOutHelperEmitted = true;
+    // C-compatible `%s` rendering of an argv argument (C99-43 C3): the
+    // raw bytes up to (not including) the first NUL go straight to
+    // stdout via `write_all`, BYPASSING the `__emitrust_cstr` Display
+    // funnel whose Latin-1 byte-to-char widening would double-encode any
+    // non-ASCII argument byte (the spike's matrix column C). The write
+    // goes through the same globally buffered stdout handle `print!`
+    // locks, so segment ordering holds even on block-buffered pipes.
+    // Emitted once per module, after all imported items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_cstr_out(s: &[i8]) {\n"
+            "    use std::io::Write;\n"
+            "    let end = s.iter().position(|&b| b == 0)"
+            ".unwrap_or(s.len());\n"
+            "    let bytes: Vec<u8> = s[..end].iter().map(|&b| b as u8)"
+            ".collect();\n"
+            "    std::io::stdout().write_all(&bytes)"
+            ".expect(\"stdout write failed\");\n"
+            "}"));
+  }
+  if (needsCStrNOutHelper && !cStrNOutHelperEmitted) {
+    cStrNOutHelperEmitted = true;
+    // The `%.Ns` twin of `__emitrust_cstr_out`: at most N bytes, stopping
+    // earlier at a NUL (C99 7.19.6.1p8 lets the run lack a terminator
+    // when the precision bounds the read, which `take` mirrors by
+    // stopping at the slice end). Raw bytes like the unbounded form.
+    // Emitted once per module, after all imported items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_cstr_n_out(s: &[i8], n: i64) {\n"
+            "    use std::io::Write;\n"
+            "    let end = s.iter().take(n as usize)"
+            ".position(|&b| b == 0)"
+            ".unwrap_or(s.len().min(n as usize));\n"
+            "    let bytes: Vec<u8> = s[..end].iter().map(|&b| b as u8)"
+            ".collect();\n"
+            "    std::io::stdout().write_all(&bytes)"
+            ".expect(\"stdout write failed\");\n"
+            "}"));
+  }
+  if (needsByteOutHelper && !byteOutHelperEmitted) {
+    byteOutHelperEmitted = true;
+    // C-compatible `%c` rendering of an argv byte (C99-43 C3): C
+    // converts to unsigned char and writes that ONE byte; `write_all` of
+    // the raw byte matches it for every value 0..=255, where the
+    // `__emitrust_fmt_c` char widening would emit two-byte UTF-8 for
+    // 128..=255. Shares the buffered stdout handle with `print!`.
+    // Emitted once per module, after all imported items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_byte_out(b: i8) {\n"
+            "    use std::io::Write;\n"
+            "    std::io::stdout().write_all(&[b as u8])"
+            ".expect(\"stdout write failed\");\n"
             "}"));
   }
   if ((needsIntFormatSignedHelper || needsIntFormatUnsignedHelper) &&

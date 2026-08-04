@@ -204,16 +204,34 @@ def load_name_list(path, required):
     return names
 
 
-def run_command(cmd, timeout, cwd=None, env=None):
-    """Run ``cmd`` with a hard timeout; SIGKILL the whole group on timeout."""
+def run_command(cmd, timeout, cwd=None, env=None, argv0=None):
+    """Run ``cmd`` with a hard timeout; SIGKILL the whole group on timeout.
+
+    ``argv0`` overrides the child's ``argv[0]`` (its ``sys.argv[0]``/C
+    ``argv[0]``) while still executing the file at ``cmd[0]``. C99-43 C3: the
+    native oracle and the crate binary live at DIFFERENT absolute paths, so a
+    program that echoes ``argv[0]`` (now importable via the admitted argv
+    table) would diverge spuriously on the path alone. Passing the SAME
+    ``argv0`` to both runs equalizes it; every existing program ignores
+    ``argv[0]``, so this is a no-op for them.
+    """
     full_env = None
     if env:
         full_env = dict(os.environ)
         full_env.update(env)
-    proc = subprocess.Popen(
-        cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, cwd=cwd, env=full_env, start_new_session=True,
-    )
+    if argv0 is not None:
+        proc = subprocess.Popen(
+            [argv0] + list(cmd[1:]), executable=cmd[0],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=cwd, env=full_env,
+            start_new_session=True,
+        )
+    else:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=cwd, env=full_env,
+            start_new_session=True,
+        )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
         return proc.returncode, stdout, stderr, False
@@ -631,11 +649,14 @@ def run_single_program(tool, native_cc, native_std, program, workdir,
         return result(MISCOMPILE, "",
                       "native build failed: " + first_line(nstderr))
 
-    n_rc, n_out, _, n_timed = run_command([os.path.abspath(native)], RUN_TIMEOUT, cwd=crate_dir)
+    # C99-43 C3: equalize argv[0] across the two runs (see run_command) so a
+    # program echoing the program name diffs on content, not on its path.
+    run_argv0 = "./" + name
+    n_rc, n_out, _, n_timed = run_command([os.path.abspath(native)], RUN_TIMEOUT, cwd=crate_dir, argv0=run_argv0)
     if n_timed or n_rc != 0:
         return result(MISCOMPILE, "", "native oracle run failed (rc=%s)" % n_rc)
 
-    c_rc, c_out, c_err, c_timed = run_command([os.path.abspath(binary)], RUN_TIMEOUT, cwd=crate_dir)
+    c_rc, c_out, c_err, c_timed = run_command([os.path.abspath(binary)], RUN_TIMEOUT, cwd=crate_dir, argv0=run_argv0)
     if c_timed:
         return result(MISCOMPILE, "", "crate binary timed out after %ss" % RUN_TIMEOUT)
     if c_rc != 0:
