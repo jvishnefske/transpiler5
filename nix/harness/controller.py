@@ -35,10 +35,12 @@ import os
 import subprocess
 import sys
 
-import epoch as epoch_mod
-import signals as signals_mod
-
 HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)  # sibling harness modules resolve when imported too
+import epoch as epoch_mod          # noqa: E402
+import signals as signals_mod      # noqa: E402
+
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 CLIPPY_EVAL = os.path.join(REPO, "nix", "clippy-eval", "clippy_eval.py")
 CLIPPY_BASELINE = os.path.join(REPO, "nix", "clippy-eval", "clippy-baseline.json")
@@ -221,7 +223,7 @@ def cmd_gate(args):
     champ = _load_champion_optional()
     permitted = set(champ.get("allow_lines", [])) if champ else None
     files = epoch_files(args.id) if args.id else _default_scan_files()
-    unsafe, allow_lines, ok, failed = scan_emitted(files)
+    unsafe, allow_lines, ok, _ = scan_emitted(files)
     print(f"  scan: {ok} crates emitted, unsafe_tokens={unsafe}, "
           f"allow_lines={len(allow_lines)}")
     if unsafe:
