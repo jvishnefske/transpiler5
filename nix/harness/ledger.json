@@ -13,6 +13,16 @@
             "held_out_total": 194
           },
           "note": "assign_op_pattern: fold self-referential v=v op e into v op= e"
+        },
+        {
+          "emitter_rev": "9d123b10af60fba66b994114b2e116e0d197de6a",
+          "timestamp": "2026-08-04T16:22:14",
+          "metrics": {
+            "total_warnings": 559,
+            "train_total": 431,
+            "held_out_total": 128
+          },
+          "note": "explicit_auto_deref: drop (*x) on .field/[i]/.0/method bases (Deref coercion re-adds)"
         }
       ]
     }
