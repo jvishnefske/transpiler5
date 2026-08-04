@@ -3436,6 +3436,59 @@ of references or inheritance, so it precedes both.
   and E0624 (internal arm stays a private method). Zero drift outside
   intent; suite 508/508.
 
+  FR-62 F1a LANDED (2026-08-04): actor lift under `--link`, the
+  single-crate slice, in three suite-green commits after a GO spike
+  that byte-matched a hand-attached merged-module lift against both
+  oracles (joint-module identity and native stdout), including a
+  non-contiguous re-import group shard. F1a-1: `parseItemGraphText` +
+  the hoisted `retagInternalSymbol` live beside the printer in
+  lib/Project/ItemGraph.{h,cpp} (FailureOr + error string, strict over
+  the printer's two line shapes, order-preserving); the planner's old
+  lenient scanner and its private retag are DELETED — the link-side
+  retag IS the planner's function, one implementation — and the
+  round-trip print(parse(print)) == print is pinned over every
+  `--emit=item-graph` input via a hidden `--verify-item-graph-roundtrip`
+  oracle (test/Project/item-graph-roundtrip.c). F1a-2: the linkFlag
+  branch replaces demote-all under explicit `--actor-lift`:
+  collectLinkActorUnits → planActors → `mergeLinkUnitGraphs` (parse +
+  shared retag + def-wins dedup into ONE ItemGraph) → the REAL
+  `attachActorLiftAttributes` on the MERGED module (post-merge is
+  mandatory — the merge strips shard metadata) → the lift pass via a
+  PassManager; the whole tail (notes, attach, demotions, remarks, F3
+  mode-map selection, pass run) is the shared `runActorLiftTail`
+  helper with `allowReifiedModes=false` under --link, so the link lift
+  is SAME-THREAD ONLY and reifying modes keep their reifies-nothing
+  warnings (mode-under-link stays a recorded later stage). A shard
+  with missing OR unreadable graph-text metadata demotes-all — a
+  warning when the flag is explicit, SILENT when defaulted. F1a-3: the
+  defaulted flag lifts under --link iff every shard carries metadata
+  (a default must not demand metadata of old artifacts — the stage-B
+  precedent). ALPHA-RENAMING INVARIANT (the spike's constraint):
+  internal-symbol retag ordinals must equal link-line positions —
+  satisfied by one-graph-text-per-link-position units; the merge's
+  `renameShardTags` ordinal maps coincide by construction, PROBED to
+  hold for solo shards and non-contiguous re-import groups, and the
+  attach-level skip-if-absent plus the pass's IR veto demote loudly on
+  any divergence (both simulated divergence modes demote, never
+  miscompile). JOINT-IDENTITY SCOPE: for a non-contiguous group the
+  merged item order differs from joint source order, so joint-vs-link
+  byte-identity pins hold only for solo-shard corpora or groups
+  spanning the whole link line — goldens for group corpora diff
+  link-vs-link. Loud-safe edge, recorded: a recovery-stub arm can be
+  planned into an actor; lifting it is safe because the stub body
+  stays `unimplemented!()`. VALIDATION: test/EndToEnd/actor-link-lift.c
+  (three TUs, same-named file-statics in two — kept apart as distinct
+  actors; native byte-diff + joint-vs-link identity),
+  test/Driver/actor-lift-link.c (explicit lift + the no-metadata
+  negative), link-merge-e2e.c / link-reimport-e2e.c byte-diffs with
+  the link side now lifted and the joint `--actor-lift=false`
+  workaround dropped, link-partition.c identity on the default
+  (--partition runs stay demoted — F1b); link/shim/actor sweep 56/56,
+  the 6 emitrust-clang shim artifact tests untouched by construction
+  (verified by run). Suite 509/509; 512/512 after the F2 merge, whose
+  export-skip lives in the shared tail (an exported owner is excluded
+  from mode selection silently, mirroring the same-thread exclusion).
+
 FR-52's report
 contradicted a premise this document and the accompanying paper had asserted:
 that six `multi-tu*` EndToEnd projects were rescued by FR-43's search. They
