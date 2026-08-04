@@ -12,7 +12,7 @@
 // CHECK-LABEL: fn count(v0: i32) -> i32 {
 // CHECK-NEXT:    let mut v2: i32 = 0i32;
 // CHECK-NEXT:    while v2 < v0 {
-// CHECK-NEXT:        v2 = v2 + 1i32;
+// CHECK-NEXT:        v2 += 1i32;
 // CHECK-NEXT:    }
 // CHECK-NEXT:    v2
 // CHECK-NEXT:  }
@@ -37,7 +37,7 @@ emitrust.func @count(%arg0: i32) -> i32 {
 // CHECK-LABEL: fn masked(v0: i32, _v1: i32) -> i32 {
 // CHECK-NEXT:    let mut v2: i32 = v0;
 // CHECK-NEXT:    while v2 & 7i32 != 0i32 {
-// CHECK-NEXT:        v2 = v2 >> 1i32;
+// CHECK-NEXT:        v2 >>= 1i32;
 // CHECK-NEXT:    }
 // CHECK-NEXT:    v2
 // CHECK-NEXT:  }

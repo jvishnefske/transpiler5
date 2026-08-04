@@ -2,11 +2,11 @@
   "corpus": "test/EndToEnd",
   "crates_linted": 111,
   "crates_skipped": 14,
-  "total_warnings": 961,
+  "total_warnings": 798,
   "by_lint": {
     "clippy::needless_late_init": 296,
-    "clippy::assign_op_pattern": 253,
     "clippy::explicit_auto_deref": 239,
+    "clippy::assign_op_pattern": 90,
     "clippy::bool_comparison": 37,
     "clippy::field_reassign_with_default": 35,
     "clippy::missing_const_for_thread_local": 29,
