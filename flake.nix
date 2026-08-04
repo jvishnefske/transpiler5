@@ -98,38 +98,46 @@
           pdll = mkMlirShell tblgenWithPdll;
         };
 
-        packages = rec {
-          default = emitrust;
-          emitrust = pkgs.stdenv.mkDerivation {
-            pname = "emitrust";
-            version = "0.1.0";
-            src = ./.;
+        packages =
+          let
+            emitrust = pkgs.stdenv.mkDerivation {
+              pname = "emitrust";
+              version = "0.1.0";
+              src = ./.;
 
-            nativeBuildInputs = [
-              pkgs.cmake
-              pkgs.ninja
-              pkgs.pkg-config
-              llvmPackages.tblgen
-            ];
+              nativeBuildInputs = [
+                pkgs.cmake
+                pkgs.ninja
+                pkgs.pkg-config
+                llvmPackages.tblgen
+              ];
 
-            buildInputs = [
-              llvmPackages.llvm
-              llvmPackages.mlir
-              llvmPackages.libclang
-              llvmPackages.clang
-            ];
+              buildInputs = [
+                llvmPackages.llvm
+                llvmPackages.mlir
+                llvmPackages.libclang
+                llvmPackages.clang
+              ];
 
-            MLIR_DIR = "${llvmPackages.mlir.dev}/lib/cmake/mlir";
-            LLVM_DIR = "${llvmPackages.llvm.dev}/lib/cmake/llvm";
-            Clang_DIR = "${llvmPackages.libclang.dev}/lib/cmake/clang";
-            LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
+              MLIR_DIR = "${llvmPackages.mlir.dev}/lib/cmake/mlir";
+              LLVM_DIR = "${llvmPackages.llvm.dev}/lib/cmake/llvm";
+              Clang_DIR = "${llvmPackages.libclang.dev}/lib/cmake/clang";
+              LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
 
-            postInstall = ''
-              mkdir -p $out/bin
-              cp bin/emitrust-* $out/bin/
-            '';
-          };
-          tblgen-with-pdll = tblgenWithPdll;
-        };
+              postInstall = ''
+                mkdir -p $out/bin
+                cp bin/emitrust-* $out/bin/
+              '';
+            };
+            # Transpile-corpus derivations: run emitrust-cc against upstream
+            # embedded C (CMSIS-DSP, lwIP, FreeRTOS) fetched directly, NOT from
+            # nixpkgs. See nix/corpus/README.md.
+            corpus = import ./nix/corpus { inherit pkgs emitrust; };
+          in
+          {
+            default = emitrust;
+            inherit emitrust;
+            tblgen-with-pdll = tblgenWithPdll;
+          } // corpus;
       });
 }
