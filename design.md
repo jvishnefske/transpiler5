@@ -4243,10 +4243,28 @@ rule.
   NULL->None) probes clean and byte-matches — the C99-46-era
   continuation of candidate (i), matching the recorded collection/
   index-handle preference from the C99-46 discussion.
-  INTERACTIONS: (iii) composes with FR-58 through the existing
-  signature-starvation axis (findSignatureStarvedDecls — a refined T**
-  signature disagreeing across shards already triggers selective
-  re-import) and does not touch FR-59 (no shared state). (i)'s region
+  INTERACTIONS: (iii) is ROUTED on FR-58's signature-starvation axis
+  (findSignatureStarvedDecls), but a verification probe MEASURED that
+  the composition does not fire today for the T** family: the caller
+  shard rejects a bare body-less T** prototype at import
+  ("unsupported: pointer-to-pointer parameter", tag ptr-to-ptr), so no
+  extern_decl func op exists for findSignatureStarvedDecls to compare
+  (it scans kExternDeclAttrName ops only), the ledger axis
+  (isFactStarvedDiagnostic) matches neither diagnostic produced, and a
+  forced joint re-import hits the same rejection — a single-TU
+  differential pins the root cause: even a redundant T** redeclaration
+  AFTER an admitted Shape-S definition hard-errors, because Shape
+  refinement is body-driven and the decl path has no admission for
+  body-less T** signatures. The T* control (sum4-style slice
+  refinement through a bare prototype) DOES rescue and byte-matches
+  native, so the machinery itself is sound. Composition therefore
+  needs two importer-side preconditions FR-58 does not provide:
+  (a) admit body-less T** prototypes as extern_decls carrying the
+  unrefined type, letting the existing disagreement trigger fire, and
+  (b) tolerate T** redeclarations beside an admitted cursor-shape
+  definition. The front REMAINS on FR-58's axis with those
+  preconditions recorded — not a C99-43 box blocker. (iii) does not
+  touch FR-59 (no shared state). (i)'s region
   facts are whole-program by construction — the same fact-starvation
   family as extern pointer globals, so FR-58's joint re-import of the
   definer group is the delivery vehicle — and a region whose member
