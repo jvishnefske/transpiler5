@@ -2043,17 +2043,35 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value,
       })
       .Case<emitrust::MemberOp>([&](emitrust::MemberOp memberOp) {
         // The base is followed by `.field`, so a deref base must parenthesize.
-        if (failed(emitPlaceExpr(loc, memberOp.getOperand(),
-                                 /*derefNeedsParens=*/true)))
-          return failure();
+        Value base = memberOp.getOperand();
+        if (auto derefOp = base.getDefiningOp<emitrust::DerefOp>()) {
+          // clippy::explicit_auto_deref: (*x).field -> x.field. The deref
+          // operand is always a reference (EmitRustOps.td), so Deref coercion
+          // re-adds the deref.
+          if (failed(emitOperand(loc, derefOp.getOperand(),
+                                 ExprPos::receiver())))
+            return failure();
+        } else {
+          if (failed(emitPlaceExpr(loc, base, /*derefNeedsParens=*/true)))
+            return failure();
+        }
         os << "." << memberOp.getMember();
         return success();
       })
       .Case<emitrust::SubscriptOp>([&](emitrust::SubscriptOp subscriptOp) {
         // The base is followed by `[i]`, so a deref base must parenthesize.
-        if (failed(emitPlaceExpr(loc, subscriptOp.getArray(),
-                                 /*derefNeedsParens=*/true)))
-          return failure();
+        Value base = subscriptOp.getArray();
+        if (auto derefOp = base.getDefiningOp<emitrust::DerefOp>()) {
+          // clippy::explicit_auto_deref: (*x)[i] -> x[i]. The deref operand is
+          // always a reference (EmitRustOps.td), so Deref coercion re-adds the
+          // deref.
+          if (failed(emitOperand(loc, derefOp.getOperand(),
+                                 ExprPos::receiver())))
+            return failure();
+        } else {
+          if (failed(emitPlaceExpr(loc, base, /*derefNeedsParens=*/true)))
+            return failure();
+        }
         os << "[";
         // An index-typed index sits bare between the delimiting brackets;
         // any other integer gets ` as usize` appended, making it a cast
@@ -2081,9 +2099,18 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value,
       })
       .Case<emitrust::EnumRawOp>([&](emitrust::EnumRawOp enumRawOp) {
         // The base is followed by `.0`, so a deref base must parenthesize.
-        if (failed(emitPlaceExpr(loc, enumRawOp.getOperand(),
-                                 /*derefNeedsParens=*/true)))
-          return failure();
+        Value base = enumRawOp.getOperand();
+        if (auto derefOp = base.getDefiningOp<emitrust::DerefOp>()) {
+          // clippy::explicit_auto_deref: (*x).0 -> x.0. The deref operand is
+          // always a reference (EmitRustOps.td), so Deref coercion re-adds the
+          // deref.
+          if (failed(emitOperand(loc, derefOp.getOperand(),
+                                 ExprPos::receiver())))
+            return failure();
+        } else {
+          if (failed(emitPlaceExpr(loc, base, /*derefNeedsParens=*/true)))
+            return failure();
+        }
         os << ".0";
         return success();
       })
@@ -3025,9 +3052,17 @@ LogicalResult RustEmitter::emitMethodCall(emitrust::MethodCallOp callOp) {
       failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
   // The receiver is followed by `.method(..)`, so a deref receiver needs parens.
-  if (failed(emitPlaceExpr(loc, callOp.getReceiver(),
-                           /*derefNeedsParens=*/true)))
-    return failure();
+  Value receiver = callOp.getReceiver();
+  if (auto derefOp = receiver.getDefiningOp<emitrust::DerefOp>()) {
+    // clippy::explicit_auto_deref: (*x).method() -> x.method(). The deref
+    // operand is always a reference (EmitRustOps.td), so Deref coercion re-adds
+    // the deref.
+    if (failed(emitOperand(loc, derefOp.getOperand(), ExprPos::receiver())))
+      return failure();
+  } else {
+    if (failed(emitPlaceExpr(loc, receiver, /*derefNeedsParens=*/true)))
+      return failure();
+  }
   os << "." << callOp.getMethod() << "(";
   bool first = true;
   for (Value argument : callOp.getArgs()) {

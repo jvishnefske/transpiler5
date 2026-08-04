@@ -67,7 +67,7 @@ emitrust.func @param_local_clash(%arg0: i32) -> i32
 // normally.
 // CHECK: impl Counter {
 // CHECK-NEXT: fn bump(&mut self, amount: i32) {
-// CHECK-NEXT:    (*self).n = amount;
+// CHECK-NEXT:    self.n = amount;
 // CHECK-NEXT:  }
 emitrust.impl "Counter" {
   emitrust.func @bump(%arg0: !emitrust.mut_ref<!emitrust.struct<"Counter">>,

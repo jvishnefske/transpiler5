@@ -83,6 +83,6 @@ int summary(void) { return peek() + get_flags(); }
 // The cross client: pub, one &mut parameter for the exported actor only
 // (FLAGS demoted), the arm call a method call on it.
 // RUST:      pub fn summary(counter_actor: &mut CounterActor) -> i32 {
-// RUST-NEXT:     let v0: i32 = (*counter_actor).peek();
+// RUST-NEXT:     let v0: i32 = counter_actor.peek();
 // RUST-NEXT:     let v1: i32 = get_flags();
 // RUST-NEXT:     v0 + v1
