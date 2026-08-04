@@ -18,6 +18,8 @@
 
 #include "ActorPlan.h"
 
+#include "EmitRust/Project/ItemGraph.h"
+
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringRef.h"
@@ -42,79 +44,6 @@ bool isStdoutSinkName(llvm::StringRef symbol) {
 
 /// The distinguished pseudo-global; planner-side only, never a graph node.
 constexpr llvm::StringLiteral kStdout = "@stdout";
-
-/// One parsed `node` line of an item-graph text.
-struct GraphNode {
-  llvm::StringRef symbol;
-  llvm::StringRef kind; // "function" | "record" | "enum" | "global"
-  bool isDefinition;
-  bool isInternal; // linkage=intern
-};
-
-/// One parsed `edge` line.
-struct GraphEdge {
-  llvm::StringRef from;
-  llvm::StringRef to; // empty for the `?` CallsIndirect target
-  llvm::StringRef kind;
-};
-
-/// Parses the two pinned line shapes of `ItemGraph::print` (every field is
-/// a whole space-separated token — the format's stated grep contract).
-/// Mirrors Partition.cpp's parser, plus the `linkage=` field the
-/// (unit, symbol) keying of file-statics needs.
-void parseGraphText(llvm::StringRef text,
-                    llvm::SmallVectorImpl<GraphNode> &nodes,
-                    llvm::SmallVectorImpl<GraphEdge> &edges) {
-  for (llvm::StringRef line : llvm::split(text, '\n')) {
-    if (line.consume_front("node ")) {
-      auto [symbol, rest] = line.split(' ');
-      llvm::StringRef kind, def, linkage;
-      for (llvm::StringRef token : llvm::split(rest, ' ')) {
-        if (token.consume_front("kind="))
-          kind = token;
-        else if (token.consume_front("def="))
-          def = token;
-        else if (token.consume_front("linkage="))
-          linkage = token;
-      }
-      nodes.push_back({symbol, kind, def == "1", linkage == "intern"});
-    } else if (line.consume_front("edge ")) {
-      auto [from, rest] = line.split(' ');
-      llvm::StringRef arrow, tail;
-      std::tie(arrow, tail) = rest.split(' ');
-      if (arrow != "->")
-        continue;
-      auto [to, kindToken] = tail.split(' ');
-      llvm::StringRef kind = kindToken;
-      kind.consume_front("kind=");
-      edges.push_back({from, to == "?" ? llvm::StringRef() : to, kind});
-    }
-  }
-}
-
-/// Rewrites the per-TU tag of an internal-linkage symbol — `tu<j>_` on
-/// functions, `TU<J>_` on FR-53-renamed globals — to the member TU's
-/// link-line ordinal, exactly the alpha-rename the FR-58 merge applies.
-/// Each member graph text is a single-TU artifact (its tags are `tu0_`),
-/// so the retag is what makes two units' same-named file-statics distinct
-/// plan elements. A symbol without the tag is returned unchanged.
-std::string retagInternalSymbol(llvm::StringRef symbol, unsigned ordinal) {
-  llvm::StringRef rest = symbol;
-  llvm::StringRef tag;
-  if (rest.consume_front("tu"))
-    tag = "tu";
-  else if (rest.consume_front("TU"))
-    tag = "TU";
-  else
-    return symbol.str();
-  size_t digits = 0;
-  while (digits < rest.size() && llvm::isDigit(rest[digits]))
-    ++digits;
-  if (digits == 0 || digits >= rest.size() || rest[digits] != '_')
-    return symbol.str();
-  return (tag + llvm::Twine(ordinal) + "_" + rest.drop_front(digits + 1))
-      .str();
-}
 
 /// Union-find with path compression; the root with the SMALLER id
 /// survives, so over an index space built from a sorted vector the
@@ -168,7 +97,13 @@ struct AccessIndex {
 /// Parses and merges every unit's graph texts (first-def-wins on `def`,
 /// matching the FR-58 merge's first-occurrence dedup), retagging each
 /// member's internal-linkage symbols with its running TU ordinal so that
-/// file-statics key as (unit, symbol).
+/// file-statics key as (unit, symbol). The parser is the shared
+/// `parseItemGraphText` (FR-62 F1a) — one implementation for the planner
+/// and the link-side graph merge, so their keying cannot drift. A text
+/// that fails to parse contributes nothing (every real input is printer
+/// output, so this arm is unreachable short of artifact corruption, and
+/// the fail direction — fewer facts, more demotion — is the safe one);
+/// its ordinal still advances so later members keep their link positions.
 AccessIndex buildAccessIndex(llvm::ArrayRef<ActorUnit> units) {
   AccessIndex index;
   unsigned totalMembers = 0;
@@ -177,53 +112,63 @@ AccessIndex buildAccessIndex(llvm::ArrayRef<ActorUnit> units) {
   unsigned ordinal = 0;
   for (const ActorUnit &unit : units) {
     for (const std::string &text : unit.graphTexts) {
-      llvm::SmallVector<GraphNode> nodes;
-      llvm::SmallVector<GraphEdge> edges;
-      parseGraphText(text, nodes, edges);
+      std::string parseError;
+      mlir::FailureOr<mlir::emitrust::ItemGraph> parsed =
+          mlir::emitrust::parseItemGraphText(text, parseError);
+      if (mlir::failed(parsed)) {
+        ++ordinal;
+        continue;
+      }
       // A single-member plan keeps the graph's own spellings (a joint
       // source-mode graph already tags each TU's statics distinctly);
       // with several members each text is a single-TU artifact whose
       // `tu0_` tags would collide, so retag by the running ordinal.
       std::map<std::string, std::string> rename;
       if (totalMembers > 1)
-        for (const GraphNode &node : nodes)
-          if (node.isInternal)
-            rename.emplace(node.symbol.str(),
-                           retagInternalSymbol(node.symbol, ordinal));
-      auto mapped = [&](llvm::StringRef symbol) {
-        auto it = rename.find(symbol.str());
-        return it == rename.end() ? symbol.str() : it->second;
+        for (const mlir::emitrust::ItemNode &node : parsed->nodes)
+          if (node.linkage == mlir::emitrust::ItemLinkage::Internal)
+            rename.emplace(node.symbol, mlir::emitrust::retagInternalSymbol(
+                                            node.symbol, ordinal));
+      auto mapped = [&](const std::string &symbol) {
+        auto it = rename.find(symbol);
+        return it == rename.end() ? symbol : it->second;
       };
-      std::map<std::string, llvm::StringRef> kindOf;
-      for (const GraphNode &node : nodes) {
-        kindOf.emplace(node.symbol.str(), node.kind);
-        if (node.kind == "function")
+      std::map<std::string, mlir::emitrust::ItemKind> kindOf;
+      for (const mlir::emitrust::ItemNode &node : parsed->nodes) {
+        kindOf.emplace(node.symbol, node.kind);
+        if (node.kind == mlir::emitrust::ItemKind::Function)
           index.functions[mapped(node.symbol)] |= node.isDefinition;
-        else if (node.kind == "global")
+        else if (node.kind == mlir::emitrust::ItemKind::Global)
           index.globals[mapped(node.symbol)] |= node.isDefinition;
       }
-      for (const GraphEdge &edge : edges) {
-        auto fromKind = kindOf.find(edge.from.str());
+      for (const mlir::emitrust::ItemEdge &edge : parsed->edges) {
+        auto fromKind = kindOf.find(edge.from);
         bool fromFunction =
-            fromKind != kindOf.end() && fromKind->second == "function";
+            fromKind != kindOf.end() &&
+            fromKind->second == mlir::emitrust::ItemKind::Function;
         bool fromGlobal =
-            fromKind != kindOf.end() && fromKind->second == "global";
-        if (edge.kind == "CallsIndirect") {
+            fromKind != kindOf.end() &&
+            fromKind->second == mlir::emitrust::ItemKind::Global;
+        if (edge.kind == mlir::emitrust::EdgeKind::CallsIndirect) {
           if (fromFunction)
             index.indirect.insert(mapped(edge.from));
           continue;
         }
         if (edge.to.empty())
           continue;
-        if (edge.kind == "Calls" && fromFunction)
+        if (edge.kind == mlir::emitrust::EdgeKind::Calls && fromFunction)
           index.calls[mapped(edge.from)].insert(mapped(edge.to));
-        else if (edge.kind == "ReadsGlobal" && fromFunction)
+        else if (edge.kind == mlir::emitrust::EdgeKind::ReadsGlobal &&
+                 fromFunction)
           index.reads[mapped(edge.from)].insert(mapped(edge.to));
-        else if (edge.kind == "WritesGlobal" && fromFunction)
+        else if (edge.kind == mlir::emitrust::EdgeKind::WritesGlobal &&
+                 fromFunction)
           index.writes[mapped(edge.from)].insert(mapped(edge.to));
-        else if (edge.kind == "AddressOfGlobal" && fromFunction)
+        else if (edge.kind == mlir::emitrust::EdgeKind::AddressOfGlobal &&
+                 fromFunction)
           index.writes[mapped(edge.from)].insert(mapped(edge.to));
-        else if (edge.kind == "AddressOfGlobal" && fromGlobal)
+        else if (edge.kind == mlir::emitrust::EdgeKind::AddressOfGlobal &&
+                 fromGlobal)
           index.globalAddressPairs.emplace(mapped(edge.from),
                                            mapped(edge.to));
       }

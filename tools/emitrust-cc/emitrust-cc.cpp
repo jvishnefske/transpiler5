@@ -363,6 +363,15 @@ static llvm::cl::opt<std::string> actorMapPath(
         "writer/SCC rules require whole"),
     llvm::cl::value_desc("file"), llvm::cl::init(""));
 
+static llvm::cl::opt<bool> verifyItemGraphRoundtripFlag(
+    "verify-item-graph-roundtrip", llvm::cl::Hidden,
+    llvm::cl::desc(
+        "FR-62 F1a test oracle: after computing --emit=item-graph's text, "
+        "parse it back through parseItemGraphText and require the re-print "
+        "to be byte-identical; any mismatch (or parse failure) is an "
+        "error. Output is unchanged when the check passes"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> actorLiftFlag(
     "actor-lift",
     llvm::cl::desc(
@@ -2087,6 +2096,25 @@ int main(int argc, char **argv) {
           text = emitrustcc::renderActorPlan(plan);
         } else {
           text = graph->print();
+          // FR-62 F1a: the parser round-trip oracle. print -> parse ->
+          // print must be byte-identity; checked here, where the real
+          // printer output exists, so every --emit=item-graph test input
+          // can pin it with one extra flag.
+          if (verifyItemGraphRoundtripFlag) {
+            std::string parseError;
+            mlir::FailureOr<mlir::emitrust::ItemGraph> reparsed =
+                mlir::emitrust::parseItemGraphText(text, parseError);
+            if (mlir::failed(reparsed)) {
+              llvm::errs() << "error: item-graph round-trip parse failed: "
+                           << parseError << "\n";
+              return 1;
+            }
+            if (reparsed->print() != text) {
+              llvm::errs() << "error: item-graph round-trip re-print is "
+                              "not byte-identical to the original\n";
+              return 1;
+            }
+          }
         }
       }
     } else {
