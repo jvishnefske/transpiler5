@@ -4550,6 +4550,73 @@ rule.
   member-pointer containers (rank 5), global out-param targets ->
   FR-62, prototypes/cross-TU -> FR-58 signature starvation, argv ->
   W4.3.
+  FRONT C1 LANDED (2026-08-04; box stays OPEN — the orchestrator closes
+  it after C3): single-global-or-NULL out-param cursors (Shape G),
+  narrowing Q2's global-target rejection to the residual multi-global
+  case. ADMITTED GRAMMAR: a `T **p` cursor parameter in an
+  otherwise-admissible cursor-param function (single unconditional
+  top-level write, all other uses of `p` under `*p`), whose write RHS is
+  ONE whole statically-known file-scope global `g` (array decay or `&g`
+  over a scalar, element types matching), a null pointer constant, or
+  `cond ? g : NULL` in either arm order. THE MAPPING (spike-validated
+  against the hand target, byte-diff-proved): the parameter lowers to
+  ONE `&mut Option<i64>` in-out cell — Q1 arity preserved, Q4
+  Option-form NULL (None = C NULL, Some(offset) = element offset into
+  g's backing; always Some(0) under this grammar) — the callee's write
+  assigns `Some(0i64)`/`None` (the ternary branches per arm), and the
+  caller stages an Option temp (init None), passing `&mut`, then
+  destructures it back into the pointer local's EXISTING CTS-P8/P6
+  cells: non-null flag from `.is_some()`, cursor from `.unwrap_or(0)`
+  (a never-null plan reads back with `.expect("null pointer read")`,
+  the Q3 deterministic-panic spelling; an actual None-read still panics
+  through the CTS-P8 `assert!(flag, "null pointer dereference")` guard
+  at the read site — the existing precedent, kept over the spike's
+  expect-at-read spelling because the read path is shared machinery).
+  Later uses (`if (p)`, `p[i]`, `*p`) flow through the decomposed-
+  pointer model unchanged, resolving against the plan's global — the
+  region binds via the new `globalCursorArgQuery` seam in
+  PointerRegionAnalysis, so no address ever escapes. Q2 NOTE: the
+  recorded "needs a second in-out state cell" objection is OBSOLETE —
+  the Option cell folds the NULL flag and the offset into one value;
+  the synthesized-region PROHIBITION stands and is exactly what keeps
+  multi-global rejected. ACTOR INTERPLAY (spike finding, implemented):
+  the FR-40 item graph's assignment walk now classifies the admitted C1
+  write as `ReadsGlobal` instead of `AddressOfGlobal` (the emitted
+  Some-offset holds no address), so the callee JOINS the global's actor
+  group and emits as a `&mut self` method with caller reads routed
+  through the actor field — the spike's target shape; when the function
+  fails import for any other reason the actor plan's missing-function
+  rule still demotes, so the carve-out can never leak an address. The
+  thread-local demoted form was probed byte-correct as well (a separate
+  caller-side `ef = err_flags` decay binding still demotes and
+  byte-matches). NARROWED REJECTIONS (both ledger tables updated in
+  lock-step, needle widened to "global address", same
+  `ptr-to-ptr-global-target` tag): "written with more than one global
+  address" (two globals in one ternary, or across two write sites) and
+  "written with a global address outside the single-global-or-NULL
+  shape" (mixed global/local roots, derived addresses like `g + 1`,
+  explicit-cast scalar puns, element-type mismatches, static locals).
+  The pure-NULL write `*p = 0` is admitted as the degenerate
+  empty-global-set grammar point, so the `ptr-to-ptr-null-write`
+  wording is no longer raised (its table rows stay for old recorded
+  ledgers). Variant B (`if (p) *p = ...;`) stays the
+  `ptr-to-ptr-shape-escape` rejection: `p` outside `*p` has no
+  representation under the `&mut Option<i64>` mapping; the spike's
+  erased-guard lowering byte-matched but needs the all-sites proof
+  recorded on FR-58's axis (body-less T** prototypes/redeclarations
+  still hard-error — boundary unchanged). TESTS:
+  test/Import/C/pointers-cursor-param-global.c (admitted grammar +
+  caller flow goldens), pointers-cursor-param-global-invalid.c (the
+  residual rejections, exact wordings), test/EndToEnd/
+  cursor-param-global-or-null.c (check_cpu-shaped twin, both branches,
+  mid-loop global mutation, byte-diff vs clang native; actor form),
+  pointers-cursor-param-paired-invalid.c trimmed (its null-write and
+  global-target cases moved to the admitted side). Suite 507 -> 510.
+  KERNEL RATCHET: refreshed run (same corpus + FR-60b environment)
+  measured NO DELTA — admitted-total 89,939 and rejected-total 110,433
+  unchanged, zero items on the global-target tag before and after
+  (check_cpu still rejects on shape, the variant-B guard), so the
+  committed baseline stands.
 - [x] C99-44 Unions. DECIDED and SHIPPED: the one-slot struct model —
   a supported subset with documented located rejections, not an enum
   mapping and not a blanket rejection. A named or untagged union
