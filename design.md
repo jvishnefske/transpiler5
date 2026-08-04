@@ -314,11 +314,9 @@ validate it.
   output; any mismatch is a fatal MISCOMPILE unless explicitly quarantined
   in known-miscompiles.txt, and the expected-pass.txt manifest ratchets in
   both directions (regressions and unrecorded passes both fail). Current
-  ledger: 220 total, 179 transpiled, 179 passed, 0 miscompiled,
-  41 unsupported (the remaining tests need unions, pointer-to-pointer or
-  void* casts, pointer globals, anonymous structs, wide strings, or
-  system-header contents outside the C subset; see the c-testsuite
-  checklist below).
+  ledger: 220 total, 220 transpiled, 220 passed, 0 miscompiled,
+  0 unsupported (known-miscompiles.txt is empty; the 220/220 completion
+  milestone is recorded in the c-testsuite checklist below).
   (test/CTestSuite/)
 
   Differential fuzzing (test/Fuzz/): a seeded generator (genprog.py)
