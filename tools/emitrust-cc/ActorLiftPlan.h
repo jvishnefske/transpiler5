@@ -18,6 +18,13 @@
 ///
 /// Demotion rules (the SLICE-4 SPIKE table; demotion-is-not-an-error, one
 /// warning per demoted actor, first matching rule wins):
+///  0. (FR-62 F1b) a caller-supplied PRE-DEMOTION: the `preDemotions`
+///     entries demote their actors before any table rule runs, with the
+///     caller's reason. The partition path uses this to demote every
+///     actor whose cluster is not bin-local (`spans workspace crates`)
+///     while keeping the plan — and so the universe and every actor
+///     index — intact; partial demotion of a cross client's targets then
+///     composes through the same machinery rules 1b/2 already exercise;
 ///  1. an arm or cross function is the target of a `TakesAddressOf` edge —
 ///     a fn-pointer call site cannot thread the receiver; additionally
 ///     reported as a located remark at the address-taking function when the
@@ -79,9 +86,11 @@
 
 #include "ActorPlan.h"
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <string>
+#include <utility>
 
 namespace mlir {
 class ModuleOp;
@@ -129,10 +138,13 @@ struct ActorLiftAttachment {
 /// the file comment). Mutates only attributes; never IR structure.
 /// `preserveCNames` selects FR-53's verbatim spelling for every name
 /// derived from a C symbol (fields, cell bases, driver locals).
-ActorLiftAttachment
-attachActorLiftAttributes(mlir::ModuleOp module,
-                          const mlir::emitrust::ItemGraph &graph,
-                          const ActorPlan &plan, bool preserveCNames);
+/// `preDemotions` is rule 0: (plan actor index, reason) entries the caller
+/// decided before certification — FR-62 F1b's partition demotions; each
+/// demotes its actor with the given reason before any table rule runs.
+ActorLiftAttachment attachActorLiftAttributes(
+    mlir::ModuleOp module, const mlir::emitrust::ItemGraph &graph,
+    const ActorPlan &plan, bool preserveCNames,
+    llvm::ArrayRef<std::pair<unsigned, std::string>> preDemotions = {});
 
 } // namespace emitrustcc
 
