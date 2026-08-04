@@ -3214,6 +3214,32 @@ LogicalResult RustEmitter::emitLet(emitrust::LetOp letOp) {
   return success();
 }
 
+/// Returns the Rust compound-assignment operator (`+=`, `-=`, ...) for a
+/// self-referential integer binary op eligible for `clippy::assign_op_pattern`
+/// folding, or an empty `StringRef` if the op is not foldable. `+`/`-`/`*` are
+/// excluded on unsigned types: there the emitter renders the `.wrapping_*`
+/// method form (see `emitWrappingBinary`) and `+=` would silently change the
+/// overflow semantics. `/ % & | ^ << >>` are always infix on every integer
+/// type, so they fold unconditionally.
+static StringRef compoundAssignSymbol(Operation *op) {
+  auto isUnsignedResult = [&]() {
+    auto intType = dyn_cast<IntegerType>(op->getResult(0).getType());
+    return intType && intType.isUnsigned();
+  };
+  return TypeSwitch<Operation *, StringRef>(op)
+      .Case<emitrust::AddOp>([&](auto) { return isUnsignedResult() ? "" : "+="; })
+      .Case<emitrust::SubOp>([&](auto) { return isUnsignedResult() ? "" : "-="; })
+      .Case<emitrust::MulOp>([&](auto) { return isUnsignedResult() ? "" : "*="; })
+      .Case<emitrust::DivOp>([&](auto) -> StringRef { return "/="; })
+      .Case<emitrust::RemOp>([&](auto) -> StringRef { return "%="; })
+      .Case<emitrust::AndOp>([&](auto) -> StringRef { return "&="; })
+      .Case<emitrust::OrOp>([&](auto) -> StringRef { return "|="; })
+      .Case<emitrust::XorOp>([&](auto) -> StringRef { return "^="; })
+      .Case<emitrust::ShlOp>([&](auto) -> StringRef { return "<<="; })
+      .Case<emitrust::ShrOp>([&](auto) -> StringRef { return ">>="; })
+      .Default([](Operation *) { return StringRef(); });
+}
+
 LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
   Operation *op = assignOp.getOperation();
   // A dead store emits nothing: its written value is never read.
@@ -3221,6 +3247,37 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
     return success();
   Location loc = op->getLoc();
   Value var = assignOp.getVar();
+
+  // FR-63: fold a self-referential compound assignment `v = v <op> e` into the
+  // Rust compound-assign operator `v <op>= e` (clippy::assign_op_pattern).
+  // Conservative gate (single evaluation, no double-compute):
+  //   1. the target is a bare binding, not an LValueType place (a `*p`/`a[i]`
+  //      place could carry side effects and would evaluate twice);
+  //   2. the RHS renders inline here (a value hoisted to its own `let` would be
+  //      double-computed if folded), so it must be in `inlineExprs`;
+  //   3. the RHS op is a foldable integer binary op (`compoundAssignSymbol`);
+  //   4. its first operand is the SAME SSA value as the target (self-reference
+  //      is exact value equality in this IR — see the `i = i + 1` shape).
+  // `v = v + e` and `v += e` compute the same value for a side-effect-free
+  // place (identical overflow behaviour on the signed/infix path), so stdout
+  // is unchanged and the byte-diff oracle stays green.
+  if (!isa<emitrust::LValueType>(var.getType())) {
+    Value val = assignOp.getValue();
+    Operation *binOp = val.getDefiningOp();
+    if (binOp && inlineExprs.count(val)) {
+      StringRef sym = compoundAssignSymbol(binOp);
+      if (!sym.empty() && binOp->getOperand(0) == var) {
+        if (failed(emitOperand(loc, var, ExprPos::stmt())))
+          return failure();
+        os << " " << sym << " ";
+        if (failed(emitOperand(loc, binOp->getOperand(1), ExprPos::stmt())))
+          return failure();
+        os << ";\n";
+        return success();
+      }
+    }
+  }
+
   if (isa<emitrust::LValueType>(var.getType())) {
     // Whole-place assignment target: a bare `*p = ..` needs no parens.
     if (failed(emitPlaceExpr(loc, var, /*derefNeedsParens=*/false)))
