@@ -278,12 +278,12 @@ emitrust.func @call_barrier(%arg0: i32) -> i32 {
   emitrust.return %r : i32
 }
 
-// NOT inlined: `emitrust.for` renders its bounds by name lookup, so
-// for-bound consumers disqualify their operands' defs.
+// FR-61f: `emitrust.for` bounds/step render through `emitOperand`, so the
+// constant lower bound inlines into the range head and the unit step drops
+// `.step_by` -- `for i in 0..n` instead of `let v1=0; let v2=1; (v1..v0)
+// .step_by(v2 as usize)`.
 // CHECK-LABEL: fn for_bound(v0: usize) {
-// CHECK-NEXT:    let v1: usize = 0;
-// CHECK-NEXT:    let v2: usize = 1;
-// CHECK-NEXT:    for _v3 in (v1..v0).step_by(v2 as usize) {
+// CHECK-NEXT:    for _v3 in 0usize..v0 {
 // CHECK-NEXT:        body();
 // CHECK-NEXT:    }
 // CHECK-NEXT:  }
@@ -436,14 +436,15 @@ emitrust.func @dup_negative(%arg0: f64) -> ui64 {
   emitrust.return %r : ui64
 }
 
-// ONE unclassified consumer (a for bound, rendered by name lookup) keeps
-// the named binding for ALL uses, including the classified ones.
+// FR-61f: the constant `1` is now a classified consumer at the for bound
+// (like every other use), so as a short multi-use literal it duplicates into
+// every site -- the lower bound, and the trailing `v0 + 1` -- while the unit
+// step drops `.step_by`. No `let` binding survives.
 // CHECK-LABEL: fn dup_for_mixed(v0: usize) -> usize {
-// CHECK-NEXT:    let v1: usize = 1;
-// CHECK-NEXT:    for _v2 in (v1..v0).step_by(v1 as usize) {
+// CHECK-NEXT:    for _v2 in 1usize..v0 {
 // CHECK-NEXT:        body();
 // CHECK-NEXT:    }
-// CHECK-NEXT:    v0 + v1
+// CHECK-NEXT:    v0 + 1usize
 // CHECK-NEXT:  }
 emitrust.func @dup_for_mixed(%arg0: index) -> index {
   %one = emitrust.constant <1 : index> : index
@@ -452,6 +453,22 @@ emitrust.func @dup_for_mixed(%arg0: index) -> index {
   }
   %r = emitrust.add %arg0, %one : index
   emitrust.return %r : index
+}
+
+// FR-61f: a NON-unit step keeps `.step_by` (the `as usize` cast is
+// load-bearing for an i32 step), with the constant bound and step inlined.
+// CHECK-LABEL: fn for_step2(v0: i32) {
+// CHECK-NEXT:    for _v3 in (0i32..v0).step_by(2i32 as usize) {
+// CHECK-NEXT:        body();
+// CHECK-NEXT:    }
+// CHECK-NEXT:  }
+emitrust.func @for_step2(%arg0: i32) {
+  %zero = emitrust.constant <0 : i32> : i32
+  %two = emitrust.constant <2 : i32> : i32
+  emitrust.for %i = %zero to %arg0 step %two : i32 {
+    emitrust.call_opaque "body"() : () -> ()
+  }
+  emitrust.return
 }
 
 // --- FR-61d slice 2: single-use global-load promotion ---
