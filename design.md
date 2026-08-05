@@ -2684,6 +2684,43 @@ of references or inheritance, so it precedes both.
     wiring (the AST matcher + place-emission of body-touched loop-carried
     scalars, or the scf.while->scf.for raiser) that makes ordinary C counting
     loops actually reach `emitrust.for` -- a future slice, byte-diff-gated.
+    LANDED 61f-2 (2026-08-05): the importer WIRING (AST place-emission),
+    so ordinary C counting loops now emit `for i in LO..HI` at import. A
+    fast path in `emitForStmt` runs `matchRangeFor` (the design's clauses:
+    DeclStmt `int i = LO`, `i < HI`, `i++`/`i += K`, `i` body-immutable +
+    non-escaping, `HI` invariant, no break/continue/goto/return in the body)
+    and, on a match, `emitRangeFor` builds the `emitrust.for`. Soundness rests
+    on a whitelist proven necessary by the byte-diff oracle: a first cut leaked
+    param/decomposed-pointer memref cells inside the region (17 EndToEnd
+    byte-diff FAILs -- the spike-0 promotion blocker) so the matcher now
+    rejects any body touching anything but the induction, an automatic integer
+    local (pre-marked into `placeBackedScalars` by a function pre-pass ->
+    `emitrust.variable` place), and an integer array. The induction is the
+    region block argument used DIRECTLY (body-immutable), named via the FR-61e
+    `NameLoc` carrier (`inductionValues` maps the decl to the block-arg value;
+    the scalar-read path returns it before the place path) -- no place, no seed
+    store, no redundant `let i` binding. Two EMITTER folds keep it clippy-clean
+    (and help the whole corpus): (a) a place-backed scalar with a constant
+    integer init carries it as the `emitrust.variable` init attribute
+    (`let mut s: i32 = 0`, not a late `let mut s; s = 0`); (b) the FR-63
+    compound-assign fold (`v = v <op> e` -> `v <op>= e`) extended to a bare
+    `emitrust.variable` place whose operand-0 is an INLINE load of that place
+    (`s = s + i` -> `s += i`) -- gated to bare local places (projections
+    excluded: re-read side effects) and inline loads (a barrier-hoisted bound
+    load must not fold, else the dropped operand orphans its `let vN`; caught
+    as an unused-variable rustc error by the byte-diff oracle, then fixed).
+    Coverage: 170/178 corpus for-loops are the canonical shape; array-fill and
+    accumulator loops now lift (a body reading a param or pointer still falls
+    back -- future widening). Full suite 525/525 byte-diff green, clippy
+    559->548 (NET -11: assign_op 93->67 corpus-wide more than offsets the
+    +11 place-accumulator late-init), unsafe 0, no new allow. Tests:
+    test/EndToEnd/range-for.c (byte-diff: accumulator `+=`, array fill, step 2,
+    `i <= n` while-fallback), test/Target/Rust/compound-assign-place.mlir (the
+    place fold + its non-self-ref negative), test/Import/C/arrays.c goldens.
+    STILL OUT (future widening): `i <= HI` (`..=`), descending (`.rev()`), the
+    `i = LO` assignment-form init, and bodies touching params/pointers (place
+    those too); plus a residual +11 place-accumulator `needless_late_init` for
+    NON-constant inits a later late-init-merge fold could clean.
 
 - [x] FR-62 Message-based / actor decomposition of the program graph.
   Owner direction (2026-08-03, verbatim): "convert program graph into

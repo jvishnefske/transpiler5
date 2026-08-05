@@ -148,7 +148,12 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   // `Vec::push`'s `T`) still needs the loaded value, exactly like the
   // `CK_LValueToRValue` case below.
   if (const auto *scalarRef = llvm::dyn_cast<clang::DeclRefExpr>(e))
-    if (llvm::isa<clang::VarDecl>(scalarRef->getDecl())) {
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(scalarRef->getDecl())) {
+      // FR-61f: a lifted range-`for` induction resolves to its `emitrust.for`
+      // block-argument value directly (body-immutable per matcher clause 4),
+      // with no place to load.
+      if (Value induction = inductionValues.lookup(var))
+        return induction;
       FailureOr<Value> place = emitLValue(scalarRef);
       if (failed(place))
         return failure();
@@ -394,6 +399,12 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
   case clang::CK_LValueToRValue: {
     if (const auto *ref =
             llvm::dyn_cast<clang::DeclRefExpr>(sub->IgnoreParens())) {
+      // FR-61f: a lifted range-`for` induction resolves to its `emitrust.for`
+      // block-argument value directly (body-immutable per matcher clause 4);
+      // it has no place, so the ordinary load path below would not find it.
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+        if (Value induction = inductionValues.lookup(var))
+          return induction;
       // A pointer parameter read as a value yields its reference SSA value.
       //
       // FR-48 excludes a C++ reference parameter from that shortcut, and

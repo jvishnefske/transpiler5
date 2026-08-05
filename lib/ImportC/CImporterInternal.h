@@ -1307,6 +1307,19 @@ struct VaMonomorphPlan {
   SmallVector<VaClonePlan, 4> clones;
 };
 
+/// FR-61f: a canonical C counting `for` recognized on the clang AST as a
+/// half-open ascending range loop `for (int i = LO; i < HI; i += K)`. The
+/// induction `i` is loop-scoped (declared in the init), `HI` is
+/// loop-invariant, and `K` is a positive integer constant. Produced by
+/// `matchRangeFor` and consumed by `emitRangeFor` to emit an `emitrust.for`
+/// (`for i in LO..HI { .. }`) instead of the CFG `while` lowering.
+struct RangeFor {
+  const clang::VarDecl *iv; ///< induction variable, declared in the init
+  const clang::Expr *lo;    ///< LO: the induction's initial value
+  const clang::Expr *hi;    ///< HI: half-open upper bound (loop-invariant)
+  int64_t step;             ///< K: positive constant step
+};
+
 class CImporter {
 public:
   /// Creates an importer that appends to `module`. The translation-unit
@@ -3248,7 +3261,8 @@ private:
   /// the emitter binds the declared local under its C name; synthesized
   /// temporaries pass nothing.
   Value createVariablePlace(Location loc, Type type,
-                            llvm::StringRef rustName = {});
+                            llvm::StringRef rustName = {},
+                            mlir::Attribute init = {});
 
   /// Returns true if `block` already ends with a terminator operation.
   static bool isTerminated(Block *block);
@@ -3582,6 +3596,27 @@ private:
   /// Emits `for` as init in the current block plus condition, body,
   /// increment, and exit blocks; `continue` targets the increment block.
   LogicalResult emitForStmt(const clang::ForStmt *stmt);
+
+  /// FR-61f: sound AST matcher for the canonical counting `for`. Returns a
+  /// `RangeFor` iff every clause holds (init `int i = LO;`, cond `i < HI`,
+  /// inc `i++`/`i += K` with K a positive constant, `i` body-immutable and
+  /// non-escaping, `HI` loop-invariant, no `break`/`continue`/`goto`/
+  /// `return`/label in the body). Any doubt returns nullopt so the caller
+  /// falls through to the already-correct CFG `while` lowering.
+  std::optional<RangeFor> matchRangeFor(const clang::ForStmt *stmt);
+
+  /// FR-61f: emits a matched `RangeFor` as an `emitrust.for` with the
+  /// induction seeded from the region's block argument into a place.
+  LogicalResult emitRangeFor(const RangeFor &range,
+                             const clang::ForStmt *stmt);
+
+  /// FR-61f: function-body pre-pass. Walks every range-eligible `for` and
+  /// unions the body-touched signed-scalar locals (accumulators declared
+  /// before the loop and temps declared inside, minus the induction) into
+  /// `placeBackedScalars`, so `emitLocalVar` routes them to
+  /// `emitrust.variable` places (which `convert-to-emitrust` accepts inside
+  /// a region op) rather than un-promotable `memref.alloca` cells.
+  void collectRangeForPlaceScalars(const clang::Stmt *stmt);
 
   /// Emits `do`/`while` as body/condition/exit blocks: the body is entered
   /// unconditionally, the condition block branches back to the body or to
@@ -4725,6 +4760,17 @@ private:
   const clang::Stmt *currentFunctionBody = nullptr;
   /// Per-function set of locals whose address is taken.
   llvm::SmallPtrSet<const clang::VarDecl *, 8> addressTaken;
+  /// FR-61f: per-function set of signed-scalar locals a range-eligible `for`
+  /// body touches; `emitLocalVar` routes these to `emitrust.variable`
+  /// places instead of `memref.alloca` cells (filled by
+  /// `collectRangeForPlaceScalars`).
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> placeBackedScalars;
+  /// FR-61f: a lifted range-`for`'s induction variable mapped to its
+  /// `emitrust.for` block-argument value. Clause 4 guarantees the induction
+  /// is body-immutable and non-address-taken, so every read is that SSA value
+  /// directly -- no place, no seed store, no `let i` binding. An outer
+  /// induction stays registered while a nested loop body emits.
+  llvm::DenseMap<const clang::VarDecl *, mlir::Value> inductionValues;
   /// Per-function pointer region analysis (Phase-1a decomposition).
   PointerRegionAnalysis pointerRegions;
   /// Program-wide registry of synthesized compound-literal backing

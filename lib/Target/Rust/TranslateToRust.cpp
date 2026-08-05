@@ -3298,24 +3298,46 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
   // FR-63: fold a self-referential compound assignment `v = v <op> e` into the
   // Rust compound-assign operator `v <op>= e` (clippy::assign_op_pattern).
   // Conservative gate (single evaluation, no double-compute):
-  //   1. the target is a bare binding, not an LValueType place (a `*p`/`a[i]`
-  //      place could carry side effects and would evaluate twice);
-  //   2. the RHS renders inline here (a value hoisted to its own `let` would be
+  //   1. the RHS renders inline here (a value hoisted to its own `let` would be
   //      double-computed if folded), so it must be in `inlineExprs`;
-  //   3. the RHS op is a foldable integer binary op (`compoundAssignSymbol`);
-  //   4. its first operand is the SAME SSA value as the target (self-reference
-  //      is exact value equality in this IR — see the `i = i + 1` shape).
-  // `v = v + e` and `v += e` compute the same value for a side-effect-free
-  // place (identical overflow behaviour on the signed/infix path), so stdout
+  //   2. the RHS op is a foldable integer binary op (`compoundAssignSymbol`);
+  //   3. the RHS's first operand is the target's current value. Two shapes:
+  //      - SSA binding: the operand IS the target SSA value (`i = i + 1`);
+  //      - FR-61f bare-variable PLACE: the operand is an `emitrust.load` of
+  //        the SAME `emitrust.variable` place (`s = s + i`). A projection
+  //        place (`*p`/`a[i]`) is EXCLUDED -- re-reading it under `<op>=`
+  //        could re-run a side effect and evaluate twice.
+  // `v = v + e` and `v += e` compute the same value for such a side-effect-free
+  // target (identical overflow behaviour on the signed/infix path), so stdout
   // is unchanged and the byte-diff oracle stays green.
-  if (!isa<emitrust::LValueType>(var.getType())) {
+  {
     Value val = assignOp.getValue();
     Operation *binOp = val.getDefiningOp();
     if (binOp && inlineExprs.count(val)) {
       StringRef sym = compoundAssignSymbol(binOp);
-      if (!sym.empty() && binOp->getOperand(0) == var) {
-        if (failed(emitOperand(loc, var, ExprPos::stmt())))
+      bool selfRef = false;
+      if (!sym.empty()) {
+        if (!isa<emitrust::LValueType>(var.getType())) {
+          selfRef = binOp->getOperand(0) == var;
+        } else if (var.getDefiningOp<emitrust::VariableOp>()) {
+          // Bare local place: operand 0 must be a load OF this place that
+          // renders INLINE (as the place read). A load bound to its own
+          // `let vN` -- e.g. hoisted before a method-call barrier -- must NOT
+          // fold, or dropping the `<op>=` operand orphans that binding
+          // (rustc unused-variable error, not a miscompile, caught here).
+          Value op0val = binOp->getOperand(0);
+          Operation *op0 = op0val.getDefiningOp();
+          selfRef = op0 && isa<emitrust::LoadOp>(op0) &&
+                    op0->getOperand(0) == var && inlineExprs.count(op0val);
+        }
+      }
+      if (selfRef) {
+        if (isa<emitrust::LValueType>(var.getType())) {
+          if (failed(emitPlaceExpr(loc, var, /*derefNeedsParens=*/false)))
+            return failure();
+        } else if (failed(emitOperand(loc, var, ExprPos::stmt()))) {
           return failure();
+        }
         os << " " << sym << " ";
         if (failed(emitOperand(loc, binOp->getOperand(1), ExprPos::stmt())))
           return failure();

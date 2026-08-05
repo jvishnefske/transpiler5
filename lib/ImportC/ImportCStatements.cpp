@@ -267,8 +267,28 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   bool isPlaceOnly =
       llvm::isa<emitrust::EnumType, emitrust::FnPtrType>(*mlirType) ||
       isStlOpaque;
+  // FR-61f: a signed-scalar local a range-eligible `for` body touches is
+  // routed to a place too — a `memref.alloca` cell cannot be promoted by
+  // mem2reg across the region op and `convert-to-emitrust` rejects it.
   if (isAggregate || isPlaceOnly || isUnsignedInt(*mlirType) ||
-      addressTaken.contains(var)) {
+      addressTaken.contains(var) || placeBackedScalars.contains(var)) {
+    // FR-61f: a place-backed range-`for` scalar with a compile-time-constant
+    // integer initializer carries it as the variable's init attribute, so it
+    // renders `let mut s: i32 = 0;` instead of a late `let mut s; s = 0;`
+    // (clippy::needless_late_init). Scoped to placeBackedScalars so no other
+    // place local's golden shifts.
+    if (placeBackedScalars.contains(var) && !isUnsignedInt(*mlirType))
+      if (const clang::Expr *init = significantInit(var))
+        if (std::optional<llvm::APSInt> constant =
+                init->getIntegerConstantExpr(astContext())) {
+          Value place = createVariablePlace(
+              loc, *mlirType,
+              var->getName().empty() ? std::string()
+                                     : mangleMemberName(var->getName()),
+              builder.getIntegerAttr(*mlirType, constant->getExtValue()));
+          symbols[var] = place;
+          return success();
+        }
     // FR-61e: a decl-bound place carries the local's final Rust spelling.
     Value place = createVariablePlace(
         loc, *mlirType,
@@ -2217,6 +2237,12 @@ LogicalResult CImporter::emitForStmt(const clang::ForStmt *stmt) {
   Location loc = translateLoc(stmt->getForLoc());
   if (stmt->getConditionVariable())
     return emitError(loc) << "unsupported: declaration in for condition";
+  // FR-61f: a canonical ascending counting loop lifts to `emitrust.for`
+  // (`for i in LO..HI`). Every non-canonical shape returns nullopt and falls
+  // through to the CFG `while` lowering below — reject-to-the-already-correct
+  // lowering is the whole safety story.
+  if (std::optional<RangeFor> range = matchRangeFor(stmt))
+    return emitRangeFor(*range, stmt);
   if (const clang::Stmt *init = stmt->getInit())
     if (failed(emitStmt(init)))
       return failure();
@@ -2255,6 +2281,323 @@ LogicalResult CImporter::emitForStmt(const clang::ForStmt *stmt) {
 
   builder.setInsertionPointToEnd(exitBlock);
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// FR-61f: range-`for` lift (AST place-emission variant)
+//===----------------------------------------------------------------------===//
+
+namespace {
+
+/// Whether `e` (ignoring parens and implicit casts) is a reference to `var`.
+bool isRefTo(const clang::Expr *e, const clang::VarDecl *var) {
+  const auto *ref =
+      llvm::dyn_cast<clang::DeclRefExpr>(e->IgnoreParenImpCasts());
+  return ref && ref->getDecl() == var;
+}
+
+/// Whether `e` is a positive integer constant; writes its value to `out`.
+bool positiveConst(const clang::Expr *e, clang::ASTContext &ctx,
+                   int64_t &out) {
+  std::optional<llvm::APSInt> value = e->getIntegerConstantExpr(ctx);
+  if (!value || value->isNonPositive())
+    return false;
+  out = value->getExtValue();
+  return true;
+}
+
+/// Clause 3: matches an ascending unit/constant-step increment on `iv`
+/// (`iv++`, `++iv`, `iv += K`, `iv = iv + K`, `iv = K + iv`), writing the
+/// positive step to `step`.
+bool matchStep(const clang::Expr *inc, const clang::VarDecl *iv,
+               clang::ASTContext &ctx, int64_t &step) {
+  const clang::Expr *e = inc->IgnoreParenImpCasts();
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e)) {
+    if ((unary->getOpcode() == clang::UO_PostInc ||
+         unary->getOpcode() == clang::UO_PreInc) &&
+        isRefTo(unary->getSubExpr(), iv)) {
+      step = 1;
+      return true;
+    }
+    return false;
+  }
+  // CompoundAssignOperator derives from BinaryOperator, so it must be
+  // checked first.
+  if (const auto *compound =
+          llvm::dyn_cast<clang::CompoundAssignOperator>(e)) {
+    if (compound->getOpcode() == clang::BO_AddAssign &&
+        isRefTo(compound->getLHS(), iv))
+      return positiveConst(compound->getRHS(), ctx, step);
+    return false;
+  }
+  if (const auto *assign = llvm::dyn_cast<clang::BinaryOperator>(e)) {
+    if (assign->getOpcode() != clang::BO_Assign ||
+        !isRefTo(assign->getLHS(), iv))
+      return false;
+    const auto *add = llvm::dyn_cast<clang::BinaryOperator>(
+        assign->getRHS()->IgnoreParenImpCasts());
+    if (!add || add->getOpcode() != clang::BO_Add)
+      return false;
+    if (isRefTo(add->getLHS(), iv))
+      return positiveConst(add->getRHS(), ctx, step);
+    if (isRefTo(add->getRHS(), iv))
+      return positiveConst(add->getLHS(), ctx, step);
+    return false;
+  }
+  return false;
+}
+
+/// Clause 4/5 helper: whether the subtree assigns to, or increments/
+/// decrements, `var`.
+bool stmtWritesVar(const clang::Stmt *stmt, const clang::VarDecl *var) {
+  if (!stmt)
+    return false;
+  if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(stmt))
+    if (bo->isAssignmentOp() && isRefTo(bo->getLHS(), var))
+      return true;
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt))
+    if (unary->isIncrementDecrementOp() && isRefTo(unary->getSubExpr(), var))
+      return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (stmtWritesVar(child, var))
+      return true;
+  return false;
+}
+
+/// Whether the subtree contains a call (used to keep `HI` side-effect free).
+bool stmtContainsCall(const clang::Stmt *stmt) {
+  if (!stmt)
+    return false;
+  if (llvm::isa<clang::CallExpr>(stmt))
+    return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (stmtContainsCall(child))
+      return true;
+  return false;
+}
+
+/// Collects the `VarDecl`s a subtree references.
+void collectRefVars(const clang::Stmt *stmt,
+                    llvm::SmallPtrSetImpl<const clang::VarDecl *> &out) {
+  if (!stmt)
+    return;
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+      out.insert(var);
+  for (const clang::Stmt *child : stmt->children())
+    collectRefVars(child, out);
+}
+
+/// Whether emitting `stmt` would create cf basic blocks in the function
+/// region (nested control flow, short-circuit `&&`/`||`, `?:`, statement
+/// expressions) or install a loop exit/jump edge (`break`/`continue`/`goto`/
+/// `return`/labels/`case`). An `emitrust.for` body is a single-block region,
+/// so any of these in the body makes the loop non-liftable in this slice.
+bool blocksRangeForLift(const clang::Stmt *stmt) {
+  if (!stmt)
+    return false;
+  if (llvm::isa<clang::IfStmt, clang::WhileStmt, clang::ForStmt,
+                clang::DoStmt, clang::SwitchStmt, clang::CXXForRangeStmt,
+                clang::BreakStmt, clang::ContinueStmt, clang::GotoStmt,
+                clang::IndirectGotoStmt, clang::ReturnStmt, clang::LabelStmt,
+                clang::CaseStmt, clang::DefaultStmt,
+                clang::ConditionalOperator, clang::BinaryConditionalOperator,
+                clang::StmtExpr>(stmt))
+    return true;
+  if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(stmt))
+    if (bo->getOpcode() == clang::BO_LAnd ||
+        bo->getOpcode() == clang::BO_LOr)
+      return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (blocksRangeForLift(child))
+      return true;
+  return false;
+}
+
+} // namespace
+
+std::optional<RangeFor>
+CImporter::matchRangeFor(const clang::ForStmt *stmt) {
+  const clang::Stmt *init = stmt->getInit();
+  const clang::Expr *cond = stmt->getCond();
+  const clang::Expr *inc = stmt->getInc();
+  const clang::Stmt *body = stmt->getBody();
+  if (!init || !cond || !inc || !body)
+    return std::nullopt;
+
+  // Clause 1 (+6): the init declares the induction `int i = LO;`. Only the
+  // DeclStmt form is accepted in v1 -- an init-declared `i` is loop-scoped in
+  // C, so it cannot be referenced after the loop and clause 6 (no escape)
+  // holds for free. The assignment form `i = LO;` (i declared outside) could
+  // escape and falls back to the CFG `while`.
+  const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(init);
+  if (!declStmt || !declStmt->isSingleDecl())
+    return std::nullopt;
+  const auto *iv = llvm::dyn_cast<clang::VarDecl>(declStmt->getSingleDecl());
+  if (!iv || !iv->isLocalVarDecl())
+    return std::nullopt;
+  // The induction must be exactly `int` (i32): this guarantees the bounds and
+  // step share the ForOp's single operand type (AllTypesMatch) with no width
+  // juggling.
+  if (iv->getType().getCanonicalType() != astContext().IntTy)
+    return std::nullopt;
+  const clang::Expr *lo = iv->getInit();
+  if (!lo)
+    return std::nullopt;
+
+  // Clause 2: cond is `i < HI` (half-open, ascending). `<=`, `>`, `>=` fall
+  // back for v1.
+  const auto *cmp =
+      llvm::dyn_cast<clang::BinaryOperator>(cond->IgnoreParenImpCasts());
+  if (!cmp || cmp->getOpcode() != clang::BO_LT || !isRefTo(cmp->getLHS(), iv))
+    return std::nullopt;
+  const clang::Expr *hi = cmp->getRHS();
+
+  // Clause 3: inc is `i++`/`++i` (K=1) or `i += K`/`i = i + K` with K a
+  // positive integer constant.
+  int64_t step = 0;
+  if (!matchStep(inc, iv, astContext(), step))
+    return std::nullopt;
+
+  // Clause 4: `i` is body-immutable -- never written in the body and `&i`
+  // never taken anywhere in the function.
+  if (addressTaken.contains(iv) || stmtWritesVar(body, iv))
+    return std::nullopt;
+
+  // Clause 5: `HI` is loop-invariant and side-effect free. A constant bound
+  // is trivially invariant; otherwise every var it reads must be unwritten in
+  // the body and it must not read the induction.
+  if (hi->HasSideEffects(astContext()) || stmtContainsCall(hi))
+    return std::nullopt;
+  if (!hi->getIntegerConstantExpr(astContext())) {
+    llvm::SmallPtrSet<const clang::VarDecl *, 8> hiVars;
+    collectRefVars(hi, hiVars);
+    for (const clang::VarDecl *var : hiVars) {
+      if (var == iv || stmtWritesVar(body, var))
+        return std::nullopt;
+    }
+  }
+
+  // No exit edge exists in an `emitrust.for`: reject any body that would emit
+  // cf blocks or jump.
+  if (blocksRangeForLift(body))
+    return std::nullopt;
+
+  // The body is a single-block region: nothing it touches may be backed by a
+  // `memref.alloca` cell, because mem2reg cannot promote a cell whose
+  // load/store lives inside the region op and `convert-to-emitrust` then
+  // rejects the leftover alloca (spike 61f-0). The one exception is an
+  // automatic-storage integer local, which `collectRangeForPlaceScalars`
+  // pre-marks into `placeBackedScalars` so it materializes as an
+  // `emitrust.variable` place instead of a cell. Whitelist accordingly:
+  //   - the induction (materialized by emitRangeFor itself);
+  //   - an automatic integer local (placed);
+  //   - an automatic integer-element array (already an `emitrust` place).
+  // Everything else -- parameters (memref cells), decomposed pointers (i64
+  // cursor cells), globals/statics, floats, structs -- rejects to the CFG
+  // `while` lowering. Deliberately narrow: a green suite with partial
+  // coverage beats a broad matcher that miscompiles.
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> bodyVars;
+  collectRefVars(body, bodyVars);
+  for (const clang::VarDecl *var : bodyVars) {
+    if (var == iv)
+      continue;
+    if (!var->isLocalVarDecl() || !var->hasLocalStorage())
+      return std::nullopt;
+    clang::QualType varType = var->getType().getCanonicalType();
+    if (varType->isIntegerType())
+      continue;
+    if (const clang::ArrayType *array = astContext().getAsArrayType(varType))
+      if (array->getElementType().getCanonicalType()->isIntegerType())
+        continue;
+    return std::nullopt;
+  }
+
+  return RangeFor{iv, lo, hi, step};
+}
+
+LogicalResult CImporter::emitRangeFor(const RangeFor &range,
+                                      const clang::ForStmt *stmt) {
+  Location loc = translateLoc(stmt->getForLoc());
+  Type intType = builder.getI32Type();
+
+  // Bounds are evaluated once, in the current block, before the loop.
+  FailureOr<Value> lo = emitRValue(range.lo);
+  if (failed(lo))
+    return failure();
+  FailureOr<Value> hi = emitRValue(range.hi);
+  if (failed(hi))
+    return failure();
+  Value loValue = *lo;
+  Value hiValue = *hi;
+  // The induction is `int`; coerce any differently-typed bound to i32 so the
+  // ForOp's three operands share a type (AllTypesMatch).
+  if (loValue.getType() != intType)
+    loValue = builder.create<emitrust::CastOp>(loc, intType, loValue);
+  if (hiValue.getType() != intType)
+    hiValue = builder.create<emitrust::CastOp>(loc, intType, hiValue);
+  Value stepValue = createIntConstant(loc, intType, range.step);
+
+  auto forOp =
+      builder.create<emitrust::ForOp>(loc, loValue, hiValue, stepValue);
+
+  // The induction block argument carries the C source name as a `NameLoc`
+  // (the FR-61e slice-3 path in the emitter reads it), so it renders
+  // `for i in LO..HI` -- snake_case idiomatic / verbatim under
+  // `--preserve-c-names` -- or `for _i in ..` when the body never reads it.
+  Location ivLoc =
+      range.iv->getName().empty()
+          ? loc
+          : Location(NameLoc::get(
+                builder.getStringAttr(mangleMemberName(range.iv->getName())),
+                loc));
+  Region &region = forOp.getRegion();
+  Block *bodyBlock;
+  {
+    OpBuilder::InsertionGuard guard(builder);
+    bodyBlock = builder.createBlock(&region, region.end(), TypeRange{intType},
+                                    {ivLoc});
+  }
+
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(bodyBlock);
+
+  // The induction is body-immutable (matcher clause 4) and non-address-taken,
+  // so every read is the block-argument value directly -- no place, no seed
+  // store, no redundant `let i` binding. `emitRValue`'s scalar-read entry
+  // consults `inductionValues` before the ordinary place path. The entry
+  // stays registered while a nested loop body emits (a nested body may read
+  // this induction) and is cleared per function.
+  inductionValues[range.iv] = bodyBlock->getArgument(0);
+
+  if (failed(emitStmt(stmt->getBody())))
+    return failure();
+
+  if (!isTerminated(builder.getInsertionBlock()))
+    builder.create<emitrust::YieldOp>(loc);
+  return success();
+}
+
+void CImporter::collectRangeForPlaceScalars(const clang::Stmt *stmt) {
+  if (!stmt)
+    return;
+  if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt))
+    if (std::optional<RangeFor> range = matchRangeFor(forStmt)) {
+      llvm::SmallPtrSet<const clang::VarDecl *, 8> refs;
+      collectRefVars(forStmt->getBody(), refs);
+      for (const clang::VarDecl *var : refs) {
+        // The induction is materialized by `emitRangeFor` itself; params are
+        // SSA block args and globals are already places -- only body-local
+        // integer scalars would otherwise take the un-promotable
+        // `memref.alloca` cell path.
+        if (var == range->iv || !var->isLocalVarDecl() ||
+            !var->hasLocalStorage() || !var->getType()->isIntegerType())
+          continue;
+        placeBackedScalars.insert(var);
+      }
+    }
+  for (const clang::Stmt *child : stmt->children())
+    collectRangeForPlaceScalars(child);
 }
 
 LogicalResult CImporter::emitDoStmt(const clang::DoStmt *stmt) {
