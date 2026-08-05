@@ -3224,6 +3224,13 @@ private:
   /// entry block, leaving the current insertion point untouched.
   Value createEntryAlloca(Location loc, Type elementType);
 
+  /// FR-61e freshness guard for scalar-local name preservation: whether a
+  /// signed scalar's imported initializer is a fresh, in-function computation
+  /// whose location may carry the local's source name onto the promoted SSA
+  /// value. Rejects values whose location is shared with another binding
+  /// (constants, bare loads, parameters/block arguments).
+  static bool carriesLocalName(Value value);
+
   /// Appends a fresh empty block to the current function body without
   /// moving the insertion point.
   Block *createBlock();
