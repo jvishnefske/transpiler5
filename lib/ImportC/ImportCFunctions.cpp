@@ -546,6 +546,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   currentVaCursorCell = Value();
   currentHasLabels = containsLabelStmt(func->getBody());
   currentFunctionBody = func->getBody();
+  placeBackedScalars.clear();
+  inductionValues.clear();
   currentReceiverPlace = Value();
   currentPoolPlace = Value();
   currentMethodOwner = nullptr;
@@ -564,6 +566,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   entryBlock = funcOp.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
   collectAddressTaken(func->getBody());
+  // FR-61f: mark body-touched scalars of range-eligible loops as places.
+  collectRangeForPlaceScalars(func->getBody());
   // Calls to carrier-returning functions are carrier sources of the
   // assigned pointer's region (CTS-P3).
   pointerRegions.carrierReturnQuery =
@@ -1118,6 +1122,8 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentVaExtras.clear();
   currentHasLabels = containsLabelStmt(func->getBody());
   currentFunctionBody = func->getBody();
+  placeBackedScalars.clear();
+  inductionValues.clear();
   currentReceiverPlace = Value();
   currentPoolPlace = Value();
   currentMethodOwner = nullptr;
@@ -1131,6 +1137,8 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   entryBlock = funcOp.addEntryBlock();
   builder.setInsertionPointToStart(entryBlock);
   collectAddressTaken(func->getBody());
+  // FR-61f: mark body-touched scalars of range-eligible loops as places.
+  collectRangeForPlaceScalars(func->getBody());
   pointerRegions.carrierReturnQuery =
       [this](const clang::FunctionDecl *callee) {
         return isCarrierReturnFunction(callee);
@@ -2232,14 +2240,13 @@ Block *CImporter::getLabelBlock(const clang::LabelDecl *label) {
 }
 
 Value CImporter::createVariablePlace(Location loc, Type type,
-                                     llvm::StringRef rustName) {
+                                     llvm::StringRef rustName, Attribute init) {
   OpBuilder::InsertionGuard guard(builder);
   if (currentHasLabels)
     builder.setInsertionPointToStart(entryBlock);
   return builder
-      .create<emitrust::VariableOp>(loc, emitrust::LValueType::get(type),
-                                    /*init=*/Attribute(), /*isConst=*/false,
-                                    rustName)
+      .create<emitrust::VariableOp>(loc, emitrust::LValueType::get(type), init,
+                                    /*isConst=*/false, rustName)
       .getResult();
 }
 

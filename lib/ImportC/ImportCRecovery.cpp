@@ -104,6 +104,8 @@ void CImporter::resetPerFunctionState() {
   // use-after-free waiting for the next item that reads it.
   symbols.clear();
   addressTaken.clear();
+  placeBackedScalars.clear();
+  inductionValues.clear();
   fileLocals.clear();
   pointerLocals.clear();
   pointerPointerLocals.clear();
