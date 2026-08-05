@@ -2571,6 +2571,56 @@ of references or inheritance, so it precedes both.
     (no golden shifts), clippy total 559->559 (+0), unsafe 0, no new `#[allow]`.
     (tests: test/Target/Rust/variable-names.mlir scalar-carrier case,
     test/EndToEnd/preserve-c-names.c scalar `let area` in both modes.)
+  - [ ] 61f Range-`for` lift: a canonical C counting loop
+    (`for (i = LO; i < HI; i += K)`) should render as `for i in LO..HI` /
+    `.step_by(K)` instead of the FR-61c `while i < HI { ..; i += K }`. The
+    `emitrust.for` op + `emitFor` renderer + `scf.for`->`emitrust.for`
+    `ForLowering` ALREADY exist (built for the FR-39 pool-iteration loops);
+    the gap is purely that the pinned pipeline's `lift-cf-to-scf` produces
+    `scf.while`, never `scf.for`, so ordinary C counting loops never reach
+    the for path. Opportunity is large: 170 of 178 corpus for-loops (96%)
+    are the canonical counting shape.
+    THE MATCHER (sound, on the clang AST): a `ForStmt` is range-eligible iff
+    (1) init is `int i = LO;` or `i = LO;` (integer induction `i`); (2) cond
+    is `i < HI` (half-open; `i <= HI` -> `..=` and descending `i > HI` ->
+    `.rev()` deferred); (3) inc is `i++`/`++i` (step 1) or `i += K`/`i = i+K`
+    with K a positive int constant; (4) `i` is body-IMMUTABLE (no write /
+    `++` / `&i` in the body, `i` not in `addressTaken`) -- the correctness-
+    critical clause; (5) `HI` is loop-invariant (no var it reads is written
+    in the body, no side effects); (6) `i` does not escape (declared in init,
+    not read after the loop). Any clause failing falls through to today's CFG
+    (`while`) -- reject-to-the-already-correct-lowering is the whole safety
+    story, and matching on the AST (intent explicit) dodges the loop-carried
+    liveness inference that miscompiled 3x.
+    SPIKE 61f-0 (2026-08-04): NO-GO for the IMPORT-TIME emission of
+    `emitrust.for`; measured, decisive blocker. Emitting the region op at
+    import (before `mem2reg`) prevents `mem2reg` from promoting ANY signed
+    scalar the body touches, because `createEntryAlloca` hoists every scalar
+    alloca to the ENTRY block and mem2reg does not promote an entry alloca
+    whose loads/stores live inside a nested region. `convert-to-emitrust`
+    then rejects the un-promoted `memref.alloca` ("failed to legalize ...
+    explicitly marked illegal"). Confirmed on two probes through the real
+    `emitrust-opt` pipeline: an accumulator (`s += i`) AND a mere body-local
+    temp (`int t = i*2;`) both fail. Only a body that touches ZERO signed
+    scalar local survives (a pure `for(i..) use(i)` rendered
+    `for v2 in (v0..n).step_by(v1 as usize)` end-to-end, byte-inert) -- a
+    rare shape, and even it renders poorly (bound constants not inlined into
+    the range, `.step_by(1 as usize)` noise).
+    DESIGN CONSTRAINT for the real slice (mirrors FR-61c's while-lift): the
+    lift must happen AFTER mem2reg, at conversion time, NOT at import. Let the
+    loop become `scf.while` (mem2reg promotes every scalar into iter_args),
+    then RAISE the counting `scf.while` -> `scf.for`: recognize a loop-carried
+    value `i` with entry `LO`, backedge `i += K`, guard `i < HI` (HI
+    invariant), `i` not otherwise recurrent, and rewrite. No upstream
+    while->for raiser exists (`-scf-for-to-while` is the forward direction
+    only) -- it must be written. Prereq: `emitrust.for` must gain optional
+    iter_args + results and `emitFor` must render them (`let mut acc = init;
+    for i in a..b { ..; acc = new }` + live-out results), exactly the
+    loop-carried machinery `emitrust.while` already has via `loopReassign`.
+    That is a multi-slice effort in the 3x-miscompiled loop-liveness area, so
+    it stays OUT until scheduled with the byte-diff suite in the loop. Also
+    needed for idiomatic output: `emitFor` should inline constant bounds into
+    the range and drop `.step_by(1)`.
 
 - [x] FR-62 Message-based / actor decomposition of the program graph.
   Owner direction (2026-08-03, verbatim): "convert program graph into
