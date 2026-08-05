@@ -83,3 +83,31 @@ emitrust.func @same_name(%arg0: i32) -> i32 {
   %s = emitrust.add %a, %b : i32
   emitrust.return %s : i32
 }
+
+// FR-61e slice 3: a plain signed scalar local stays on the alloca -> mem2reg
+// SSA path (no `emitrust.variable`), so it carries its C name as a `NameLoc`
+// wrapped around the promoted init value's location. `assignName` reads the
+// `NameLoc` right after the `VariableOp` c_name check and binds under that
+// spelling through the same collision-safe `claimName` -- so a multi-use
+// scalar (a surviving `let` binding) is named, exactly like a carried
+// variable, without any `emitrust.variable` op.
+// CHECK-LABEL: fn scalar_carrier(v0: i32, v1: i32) -> i32 {
+// CHECK-NEXT:    let area: i32 = v0 * v1;
+// CHECK-NEXT:    area + area
+// CHECK-NEXT:  }
+emitrust.func @scalar_carrier(%arg0: i32, %arg1: i32) -> i32 {
+  %a = emitrust.mul %arg0, %arg1 : i32 loc("area")
+  %s = emitrust.add %a, %a : i32
+  emitrust.return %s : i32
+}
+
+// A single-use scalar is inlined by FR-61d, so its binding never exists and
+// the carried `NameLoc` is simply never consumed -- "only surviving bindings"
+// get named. The value renders inline with no `let` and no name.
+// CHECK-LABEL: fn scalar_carrier_single_use(v0: i32, v1: i32) -> i32 {
+// CHECK-NEXT:    v0 * v1
+// CHECK-NEXT:  }
+emitrust.func @scalar_carrier_single_use(%arg0: i32, %arg1: i32) -> i32 {
+  %a = emitrust.mul %arg0, %arg1 : i32 loc("temp")
+  emitrust.return %a : i32
+}

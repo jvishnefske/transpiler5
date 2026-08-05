@@ -823,6 +823,16 @@ std::string RustEmitter::assignName(Value value) {
   if (auto variable = value.getDefiningOp<emitrust::VariableOp>())
     if (std::optional<StringRef> cName = variable.getCName())
       return claimName(value, *cName);
+  // FR-61e: a signed scalar local kept on the SSA path (alloca -> mem2reg)
+  // carries its source name as a `NameLoc` wrapped around the promoted init
+  // value's location (set at the declaration store, guarded so only a fresh
+  // single-use computation is named). Reaching here means the value is a
+  // surviving `let` binding — a single-use temp is inlined by FR-61 and never
+  // asks for a name — so bind it under that spelling, collision-uniquified by
+  // `claimName` exactly like a `VariableOp` c_name. The name is pre-mangled
+  // importer-side, so no re-mangling here.
+  if (auto nameLoc = dyn_cast<NameLoc>(value.getLoc()))
+    return claimName(value, nameLoc.getName().strref());
   // Generated names skip forward past spellings a named local claimed, so
   // a C local literally named `v3` can never collide with the counter.
   bool read = valueIsRead(value);

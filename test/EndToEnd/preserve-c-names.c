@@ -11,9 +11,15 @@
 // thread_local static to the local: verbatim mode must keep `totalCount`
 // verbatim there too (the flip exposed a snake_casing of verbatim names in
 // the lift's driver-local rule, fixed with this pin).
+// FR-61e slice 3: a plain signed scalar local (`int boxArea = w * h;`, used
+// twice so it survives mem2reg as a `let` binding) is named from its source
+// spelling too -- verbatim `boxArea` under --preserve-c-names, snake_case
+// `box_area` under the default idiomatic rename -- via the NameLoc carrier,
+// stdout-neutral so the byte-diff below stays green.
 // RUN: emitrust-cc --preserve-c-names --emit=crate %s -o %t.crate --build
 // RUN: grep "fn addNumbers" %t.crate/src/main.rs
 // RUN: grep "let totalCount" %t.crate/src/main.rs
+// RUN: grep "let boxArea" %t.crate/src/main.rs
 // RUN: grep "struct my_pair" %t.crate/src/main.rs
 // RUN: grep "non_snake_case" %t.crate/src/main.rs
 // RUN: not grep "non_snake_case" %t.crate/Cargo.toml
@@ -21,6 +27,7 @@
 // RUN: emitrust-cc --emit=crate %s -o %t.renamed.crate --build
 // RUN: grep "fn add_numbers" %t.renamed.crate/src/main.rs
 // RUN: grep "let total_count" %t.renamed.crate/src/main.rs
+// RUN: grep "let box_area" %t.renamed.crate/src/main.rs
 // RUN: grep "struct MyPair" %t.renamed.crate/src/main.rs
 // RUN: grep 'non_snake_case = "deny"' %t.renamed.crate/Cargo.toml
 // RUN: clang -std=c11 %s -o %t.native
@@ -41,10 +48,17 @@ int totalCount = 3;
 
 int addNumbers(int a, int b) { return a + b; }
 
+// A signed scalar local whose fresh init (`w * h`) is read twice survives
+// mem2reg as a `let` binding, so it carries its source name.
+int scaledArea(int w, int h) {
+  int boxArea = w * h;
+  return boxArea + boxArea;
+}
+
 int main(void) {
   struct my_pair p;
   p.first = addNumbers(20, 2);
   p.second = totalCount;
-  printf("%d %d\n", p.first, p.second);
+  printf("%d %d %d\n", p.first, p.second, scaledArea(3, 4));
   return 0;
 }

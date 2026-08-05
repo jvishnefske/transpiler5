@@ -2538,6 +2538,39 @@ of references or inheritance, so it precedes both.
     (future FR). Named now: parameters, by-value param shadows, aggregates,
     unsigned scalars, enums, fn-ptrs, address-taken scalars, STL/FILE
     locals, owner structs.
+    LANDED 61e slice 3 (2026-08-04): plain signed non-address-taken scalars
+    named via a `NameLoc` carrier (approach A', chosen over the fallback of
+    routing them through `emitrust.variable` -- which would materialize
+    single-use temps and churn the Import/C goldens). The scalar stays on the
+    alloca->mem2reg SSA path (FR-61d single-use inlining untouched); at the
+    decl store the importer wraps the imported init value's location in
+    `NameLoc(mangleMemberName(name), origLoc)`, and stock mem2reg's
+    store-forwarding rides that value onto its uses, so a surviving `let`
+    binding reaches the emitter carrying its name. `assignName` reads the
+    `NameLoc` right after the `VariableOp` c_name check and routes it through
+    the same collision-safe `claimName` (so `int match;`->`match_`, snake_case
+    by default / verbatim under `--preserve-c-names`, `x`/`x_1` on collision).
+    FRESHNESS GUARD (`carriesLocalName`): the name is attached ONLY when the
+    init is a fresh in-function computation -- NOT a bare load (`int y=x;`, whose
+    value IS x's promoted SSA value), a constant (`int n=5;`, CSE-mergeable), or
+    a parameter/block-arg -- so a shared value can never be misnamed; the miss
+    is always a `vN`, never a wrong name.
+    SPIKE A' (2026-08-04): GO. On the 7-program probe the `NameLoc` reached the
+    binding for straight-line multi-use scalars (`int area=w*h; ... area+..+area`
+    -> `let area`), single-use temps stayed inlined (no binding, no name), the
+    guard blocked the copy/constant misnaming, `int match;`->`let match_`, and
+    stdout was byte-identical to clang-native in BOTH modes. SCOPE (measured,
+    not a bug): a LOOP-CARRIED accumulator's surviving binding is a merge-point
+    block argument, and `lift-cf-to-scf` regenerates the loop `iter_args` as
+    fresh block args, discarding any location placed on them -- so accumulators
+    stay vN. Tagging the alloca (mem2reg copies alloca loc onto block args) was
+    prototyped and confirmed byte-inert BUT yielded zero new names for exactly
+    this reason, so it was dropped as dead complexity. Partial preservation of
+    the clean straight-line cases is the accepted outcome (only-surviving-
+    bindings; single-use style untouched). Full suite 523/523 byte-diff green
+    (no golden shifts), clippy total 559->559 (+0), unsafe 0, no new `#[allow]`.
+    (tests: test/Target/Rust/variable-names.mlir scalar-carrier case,
+    test/EndToEnd/preserve-c-names.c scalar `let area` in both modes.)
 
 - [x] FR-62 Message-based / actor decomposition of the program graph.
   Owner direction (2026-08-03, verbatim): "convert program graph into

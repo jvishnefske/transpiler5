@@ -352,9 +352,46 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
     FailureOr<Value> value = emitRValue(init);
     if (failed(value))
       return failure();
+    // FR-61e: preserve the C local's source name on the promoted SSA value.
+    // A signed non-address-taken scalar is imported as a rank-0 alloca and
+    // promoted to SSA by stock mem2reg, which store-forwards the init value
+    // (keeping ITS location) onto every use. Wrapping that value's location
+    // in a `NameLoc` therefore rides through promotion to the emitter, which
+    // reads it in `assignName` and binds `let <name>` instead of `let vN`.
+    //
+    // Only a fresh, in-function, single-use computation may carry the name.
+    // The stored value can be SHARED and renaming it would misname the real
+    // owner: a bare load (`int y = x;` — the value IS x's promoted value), a
+    // constant (`int n = 5;` — CSE-mergeable), or a parameter/block-argument
+    // (`int y = p;`). Naming only clean computations is the accepted partial
+    // outcome; the miss is a `vN`, never a wrong name. A single-use scalar
+    // stays inlined by FR-61 (no binding, so the carrier is simply unused).
+    if (!var->getName().empty() && carriesLocalName(*value))
+      (*value).setLoc(NameLoc::get(
+          builder.getStringAttr(mangleMemberName(var->getName())),
+          (*value).getLoc()));
     return storeToPlace(loc, cell, *value);
   }
   return success();
+}
+
+/// FR-61e freshness guard: whether `value` — the imported initializer of a
+/// signed scalar local — is a fresh, in-function computation whose location
+/// may be repurposed to carry the local's source name (see the call site).
+/// Rejects the values whose location is shared with another binding: a
+/// parameter / block argument (no defining op), a constant (CSE-mergeable),
+/// and a bare load (its value is the loaded variable's own SSA value). The
+/// value is freshly produced here and not yet stored, so it currently has no
+/// uses; a genuine multi-use only arises later, at which point it is a `let`
+/// binding that legitimately wants the name.
+bool CImporter::carriesLocalName(Value value) {
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return false;
+  if (llvm::isa<arith::ConstantOp, emitrust::ConstantOp, memref::LoadOp,
+                emitrust::LoadOp>(def))
+    return false;
+  return true;
 }
 
 LogicalResult
