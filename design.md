@@ -2621,6 +2621,41 @@ of references or inheritance, so it precedes both.
     it stays OUT until scheduled with the byte-diff suite in the loop. Also
     needed for idiomatic output: `emitFor` should inline constant bounds into
     the range and drop `.step_by(1)`.
+    PRIOR ART -- ClangIR `cir-mlir-scf-prepare` + `LowerCIRLoopToSCF`
+    (llvm/clangir, ThroughMLIR path; reviewed 2026-08-04). NOT usable as a
+    drop-in pass: it operates on the `cir` dialect and we emit none (our
+    importer goes clang AST -> memref/cf/arith/emitrust directly), so no CIR
+    pass is in our pipeline to help or hurt. But it is the best reference and
+    it sharpens this FR two ways:
+    (a) CORROBORATION of the matcher: CIR's `SCFLoop::analysis()` chooses
+    `scf.for` iff the SAME preconditions hold -- constant step from the inc,
+    IV address identified, comparison restricted to `<`/`<=`, upper bound
+    hoisted (loop-invariant, by `cir-mlir-scf-prepare`), IV init discoverable
+    from a prior store, IV defined in the loop's block; `break`/`continue`
+    force `cir.while`; non-canonical falls to `scf.while`. Clause-for-clause
+    our matcher above (independent confirmation, incl. `<=` -> `..=`).
+    (b) A THIRD path the SPIKE missed -- recognize on the STRUCTURED/MEMORY
+    form, BEFORE SSA-destruction, not after. CIR's lowering "strictly relies
+    on structured regions (`forOp.getCond()/getBody()/getStep()`) and would
+    fail on shattered basic blocks"; it reads LO from the IV's prior store and
+    HI from the `cmp` on the loaded IV -- i.e. it analyzes the loop on the
+    alloca+load/store form with structure intact, and never needs a mem2reg
+    that promotes across the loop region. THE REAL LESSON: what hurts us is
+    our OWN `emitForStmt` (ImportCStatements.cpp:2216) shattering every C
+    for-loop into cf blocks at import -- it discards exactly the structured
+    loop such an analysis needs, forcing the harder re-raise-from-`scf.while`
+    direction. We hold the richest form of all: the clang AST. So a CIR-style
+    variant becomes viable and may be SIMPLER than the `scf.while->scf.for`
+    raiser: on the AST fast path, emit the loop's body-touched loop-carried
+    scalars as `emitrust.variable` PLACES (which convert-to-emitrust accepts
+    and the emitter renders `let mut acc; for i in a..b { acc = .. }`) rather
+    than `memref.alloca` cells -- dodging the spike's promotion blocker
+    entirely, no mem2reg needed for them. Cost: those scalars materialize as
+    places (skip FR-61d single-use inlining) and it needs a pre-scan of which
+    locals the loop body touches + retroactively placing an accumulator
+    declared before the loop (`int s = 0;` then `for`). A future slice picks
+    between this (AST place-emission) and the conversion-time raiser; either
+    way the byte-diff suite stays in the loop from the first increment.
 
 - [x] FR-62 Message-based / actor decomposition of the program graph.
   Owner direction (2026-08-03, verbatim): "convert program graph into
