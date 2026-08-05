@@ -1618,6 +1618,11 @@ static bool isClassifiedConsumerUse(OpOperand &use) {
       .Case<emitrust::SubscriptOp>([&](emitrust::SubscriptOp subscript) {
         return use.get() == subscript.getIndex();
       })
+      // FR-61f: all three `emitrust.for` operands (lower/upper/step) render in
+      // the range head as expression positions, so a constant or single-use
+      // pure bound inlines into `for i in LO..HI` instead of forcing a
+      // `let vN =` above the loop.
+      .Case<emitrust::ForOp>([](auto) { return true; })
       .Case<emitrust::DerefOp>([](auto) { return true; })
       // FR-61c: the while-condition terminator consumes its operand in the
       // never-parenthesized head position; classifying it is what lets the
@@ -1685,21 +1690,18 @@ void RustEmitter::computeInlineCandidates(emitrust::FuncOp funcOp) {
     if (auto constant = dyn_cast<emitrust::ConstantOp>(op)) {
       // FR-61d-2: constants are position-independent literals, so neither
       // the same-block nor the barrier requirement applies at ANY use
-      // count -- but every use must be a classified consumer position (one
-      // for-bound/lookupName consumer keeps the named binding for ALL
-      // uses). A MULTI-use constant additionally duplicates its literal at
-      // every site, which only reads well within the measured length
-      // threshold: a long literal repeated at several sites reads worse
-      // than a name (single-use constants stay unthresholded, as in
-      // slice 1).
+      // count -- but every use must be a classified consumer position. A
+      // MULTI-use constant additionally duplicates its literal at every
+      // site, which only reads well within the measured length threshold: a
+      // long literal repeated at several sites reads worse than a name
+      // (single-use constants stay unthresholded, as in slice 1).
       if (realUses.size() > 1) {
         std::optional<size_t> len = inlineConstantTextLength(constant);
         if (!len || *len > kInlineConstantDupMaxLen)
           return;
       }
       for (OpOperand *use : realUses)
-        if (isa<emitrust::ForOp>(use->getOwner()) ||
-            !isClassifiedConsumerUse(*use))
+        if (!isClassifiedConsumerUse(*use))
           return;
       inlinedOps.insert(op);
       inlineTreeReadsPlace[op->getResult(0)] = false;
@@ -3572,6 +3574,17 @@ LogicalResult RustEmitter::emitIf(emitrust::IfOp ifOp) {
   return success();
 }
 
+/// FR-61f: whether `value` is the integer constant one -- the step of the
+/// overwhelmingly common C counting loop (`i++`), rendered as a bare range
+/// with no `.step_by`.
+static bool isConstantIntOne(Value value) {
+  auto constant = value.getDefiningOp<emitrust::ConstantOp>();
+  if (!constant)
+    return false;
+  auto intAttr = dyn_cast<IntegerAttr>(constant.getValue());
+  return intAttr && intAttr.getValue().isOne();
+}
+
 LogicalResult RustEmitter::emitFor(emitrust::ForOp forOp) {
   Operation *op = forOp.getOperation();
   Location loc = op->getLoc();
@@ -3586,17 +3599,32 @@ LogicalResult RustEmitter::emitFor(emitrust::ForOp forOp) {
     return op->emitOpError(
         "expected a single induction-variable block argument");
 
-  FailureOr<std::string> lower = lookupName(loc, op->getOperand(0));
-  FailureOr<std::string> upper = lookupName(loc, op->getOperand(1));
-  FailureOr<std::string> step = lookupName(loc, op->getOperand(2));
-  if (failed(lower) || failed(upper) || failed(step))
-    return failure();
-
   // The induction variable is named when the loop is emitted, i.e. after all
   // values defined above the loop and before the loop body's results.
   std::string induction = assignName(body.getArgument(0));
-  os << "for " << induction << " in (" << *lower << ".." << *upper
-     << ").step_by(" << *step << " as usize) {\n";
+  // FR-61f: render the range head idiomatically. Bounds and step flow through
+  // `emitOperand`, so a constant / single-use pure bound inlines into the head
+  // (`for i in 0..n`) instead of forcing a `let vN =` above the loop. A unit
+  // step (`i++`) drops `.step_by` entirely and the range needs no wrapping
+  // parens; a non-unit step keeps `(lo..hi).step_by(k as usize)`. Range `..`
+  // is Rust's lowest-precedence operator, so a `delimited` bound never needs
+  // parens (`0..n + 1` parses as `0..(n + 1)`).
+  bool unitStep = isConstantIntOne(op->getOperand(2));
+  os << "for " << induction << " in ";
+  if (!unitStep)
+    os << "(";
+  if (failed(emitOperand(loc, op->getOperand(0), ExprPos::delimited())))
+    return failure();
+  os << "..";
+  if (failed(emitOperand(loc, op->getOperand(1), ExprPos::delimited())))
+    return failure();
+  if (!unitStep) {
+    os << ").step_by(";
+    if (failed(emitOperand(loc, op->getOperand(2), ExprPos::delimited())))
+      return failure();
+    os << " as usize)";
+  }
+  os << " {\n";
   increaseIndent();
   // FR-61d slice 3: body-local candidates route through the shared
   // drop/capture prelude, so they inline exactly like entry-block ops.

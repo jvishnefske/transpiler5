@@ -2656,6 +2656,34 @@ of references or inheritance, so it precedes both.
     declared before the loop (`int s = 0;` then `for`). A future slice picks
     between this (AST place-emission) and the conversion-time raiser; either
     way the byte-diff suite stays in the loop from the first increment.
+    SPIKE 61f-1 (2026-08-04): GO for the place-emission variant. Hand-built
+    the accumulator loop `int sum(int n){int s=0; for(i..) s=s+i; return s;}`
+    with `s` as an `emitrust.variable` place (not a memref cell) and the loop
+    as `emitrust.for`, and pushed it through the real `emitrust-opt` pipeline:
+    it converts and renders correct working Rust (`let mut s; for i in 0..n {
+    s = s + i } s`) -- the 61f-0 promotion blocker is gone because a place is
+    never a `memref.alloca` for mem2reg to choke on. Also found `ForLowering`
+    (scf.for->emitrust.for) ALREADY lowers iter_args to external `let mut` +
+    `assign` + results, so the conversion-time raiser path would reuse even
+    more machinery (only the scf.while->scf.for raiser is missing).
+    LANDED 61f-1 (2026-08-04): the `emitFor` RENDERING half (pure emitter,
+    byte-diff-safe, needed by BOTH future paths and by today's FR-39 pool
+    loops). Bounds and step now flow through `emitOperand` (so a constant /
+    single-use pure bound inlines into the range head instead of forcing a
+    `let vN =` above the loop) and a unit step (`i++`) drops `.step_by`
+    entirely with no wrapping parens: `for i in 0..n {` replaces `let v0=0;
+    let v1=1; for _ in (v0..n).step_by(v1 as usize) {`. `emitrust.for` became
+    a classified consumer use (all three operands are range-head expression
+    positions) and the FR-61d-2 constant-inline exclusion for for-bounds was
+    removed; a non-unit step keeps `(lo..hi).step_by(k as usize)` (i32 cast
+    load-bearing). Range `..` is Rust's lowest-precedence operator so a
+    `delimited` bound never needs parens. Full suite 523/523 byte-diff green
+    (only inline-expr.mlir's two for-bound goldens shifted -- they pinned the
+    OLD non-inlining behavior, now inverted, plus a new for_step2 case),
+    clippy 559->559 (+0), unsafe 0, no new allow. STILL OUT: the importer
+    wiring (the AST matcher + place-emission of body-touched loop-carried
+    scalars, or the scf.while->scf.for raiser) that makes ordinary C counting
+    loops actually reach `emitrust.for` -- a future slice, byte-diff-gated.
 
 - [x] FR-62 Message-based / actor decomposition of the program graph.
   Owner direction (2026-08-03, verbatim): "convert program graph into
