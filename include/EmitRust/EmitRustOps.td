@@ -437,6 +437,46 @@ def EmitRust_LiteralOp : EmitRust_Op<"literal",
 }
 
 //===----------------------------------------------------------------------===//
+// StringRepeatOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_StringRepeatOp : EmitRust_Op<"string_repeat", [Pure]> {
+  let summary = "Idiomatic `String::repeat` of a constant single-byte fill";
+  let description = [{
+    The `emitrust.string_repeat` operation constructs an owned `String` by
+    repeating the single ASCII character `$fill` exactly `$count` times. It is
+    the fused lowering of the C `char *a = malloc(N); for (i..) a[i]=C; a[N-1]=0`
+    constant-fill string idiom (FR-64) and renders as
+    `"<fill>".repeat((<count>) as usize)`.
+
+    The `$fill` attribute is a one-character string whose byte is ASCII
+    `0x01..0x7F` — a valid, non-NUL, single-byte UTF-8 scalar — so the produced
+    `String`'s bytes equal the original C buffer's bytes exactly (the byte-diff
+    soundness gate; a multi-byte or NUL fill is rejected at import). The
+    `$count` operand is an `i64` fill count widened from the C size expression.
+
+    The result type is always `!emitrust.opaque<"String">`.
+
+    Example:
+
+    ```mlir
+    %s = emitrust.string_repeat "a", %n : i64 -> !emitrust.opaque<"String">
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let a: String = "a".repeat((n) as usize);
+    ```
+  }];
+
+  let arguments = (ins I64:$count, StrAttr:$fill);
+  let results = (outs EmitRust_OpaqueType:$result);
+
+  let assemblyFormat =
+      "$fill `,` $count attr-dict `:` type($count) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // LetOp
 //===----------------------------------------------------------------------===//
 

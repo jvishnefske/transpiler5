@@ -1216,6 +1216,439 @@ CImporter::asPointerParamRead(const clang::Expr *expr) const {
   return nullptr;
 }
 
+namespace {
+// FR-64 string-fill recognition helpers -------------------------------------
+
+/// Strips parens, implicit casts, and no-ops down to the core expression.
+const clang::Expr *peelToCore(const clang::Expr *e) {
+  e = stripTrivia(e);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    e = stripTrivia(cast->getSubExpr());
+  return e;
+}
+
+/// The compile-time integer-constant value of `e` (after peeling), or nullopt.
+std::optional<llvm::APSInt> constInt(clang::ASTContext &ctx,
+                                     const clang::Expr *e) {
+  return peelToCore(e)->getIntegerConstantExpr(ctx);
+}
+
+/// Structural equality of two expressions modulo parens/implicit casts,
+/// under canonical profiling (`len` and `(unsigned)len` compare equal).
+bool exprEquiv(clang::ASTContext &ctx, const clang::Expr *a,
+               const clang::Expr *b) {
+  a = peelToCore(a);
+  b = peelToCore(b);
+  llvm::FoldingSetNodeID ida, idb;
+  a->Profile(ida, ctx, /*Canonical=*/true);
+  b->Profile(idb, ctx, /*Canonical=*/true);
+  return ida == idb;
+}
+
+/// Whether `stmt` names `var` in a DeclRefExpr, collecting each such use.
+void collectVarRefs(const clang::Stmt *stmt, const clang::VarDecl *var,
+                    llvm::SmallVectorImpl<const clang::DeclRefExpr *> &out) {
+  if (!stmt)
+    return;
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (ref->getDecl()->getCanonicalDecl() == var->getCanonicalDecl())
+      out.push_back(ref);
+  for (const clang::Stmt *child : stmt->children())
+    collectVarRefs(child, var, out);
+}
+
+/// Collects every variable named anywhere in `stmt`.
+void collectVars(const clang::Stmt *stmt,
+                 llvm::SmallPtrSetImpl<const clang::VarDecl *> &out) {
+  if (!stmt)
+    return;
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+      out.insert(var->getCanonicalDecl());
+  for (const clang::Stmt *child : stmt->children())
+    collectVars(child, out);
+}
+
+/// Whether `var` is assigned, incremented/decremented, or address-taken
+/// anywhere in `stmt` (a write TO the variable itself, not through it).
+bool mutatesVar(const clang::Stmt *stmt, const clang::VarDecl *var) {
+  if (!stmt)
+    return false;
+  if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(stmt)) {
+    if (bo->isAssignmentOp())
+      if (const auto *ref =
+              llvm::dyn_cast<clang::DeclRefExpr>(peelToCore(bo->getLHS())))
+        if (ref->getDecl()->getCanonicalDecl() == var->getCanonicalDecl())
+          return true;
+  } else if (const auto *uo = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
+    if (uo->isIncrementDecrementOp() || uo->getOpcode() == clang::UO_AddrOf)
+      if (const auto *ref =
+              llvm::dyn_cast<clang::DeclRefExpr>(peelToCore(uo->getSubExpr())))
+        if (ref->getDecl()->getCanonicalDecl() == var->getCanonicalDecl())
+          return true;
+  }
+  for (const clang::Stmt *child : stmt->children())
+    if (mutatesVar(child, var))
+      return true;
+  return false;
+}
+
+/// Collects every `for` statement below `stmt`.
+void collectForStmts(const clang::Stmt *stmt,
+                     llvm::SmallVectorImpl<const clang::ForStmt *> &out) {
+  if (!stmt)
+    return;
+  if (const auto *f = llvm::dyn_cast<clang::ForStmt>(stmt))
+    out.push_back(f);
+  for (const clang::Stmt *child : stmt->children())
+    collectForStmts(child, out);
+}
+
+/// Collects every `buf[X] = RHS` store below `stmt` (the LHS is a subscript
+/// whose base is `buf`).
+void collectBufferStores(
+    const clang::Stmt *stmt, const clang::VarDecl *buf,
+    llvm::SmallVectorImpl<const clang::BinaryOperator *> &out) {
+  if (!stmt)
+    return;
+  if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(stmt))
+    if (bo->getOpcode() == clang::BO_Assign)
+      if (const auto *sub = llvm::dyn_cast<clang::ArraySubscriptExpr>(
+              peelToCore(bo->getLHS())))
+        if (const auto *base =
+                llvm::dyn_cast<clang::DeclRefExpr>(peelToCore(sub->getBase())))
+          if (base->getDecl()->getCanonicalDecl() == buf->getCanonicalDecl())
+            out.push_back(bo);
+  for (const clang::Stmt *child : stmt->children())
+    collectBufferStores(child, buf, out);
+}
+
+/// Whether the pointee of a `char *`-family pointer is a single byte char
+/// (`char`, `signed char`, `unsigned char`) — the only fills whose `String`
+/// bytes can equal the C bytes.
+bool isByteCharPointee(clang::QualType pointee) {
+  return pointee->isCharType() ||
+         pointee->isSpecificBuiltinType(clang::BuiltinType::SChar) ||
+         pointee->isSpecificBuiltinType(clang::BuiltinType::UChar);
+}
+
+/// Matches the canonical constant-fill loop `for (int i = 0; i < HI; ++i)
+/// buf[i] = C;` against `f`, filling the fill byte, the count bound `HI`, the
+/// induction, and the `buf` reference in `buf[i]`. Returns false for any other
+/// shape (a non-zero start, a non-constant/non-ASCII fill, a body that is not
+/// exactly one `buf[i] = const` store, ...).
+bool matchConstFillLoop(clang::ASTContext &ctx, const clang::ForStmt *f,
+                        const clang::VarDecl *buf, char &fillOut,
+                        const clang::Expr *&hiOut, const clang::VarDecl *&ivOut,
+                        const clang::DeclRefExpr *&bufRefOut) {
+  if (!f->getInit() || !f->getCond() || !f->getInc() || !f->getBody())
+    return false;
+  // init: `int i = 0;` (loop-scoped, so `i` cannot escape).
+  const auto *ds = llvm::dyn_cast<clang::DeclStmt>(f->getInit());
+  if (!ds || !ds->isSingleDecl())
+    return false;
+  const auto *iv = llvm::dyn_cast<clang::VarDecl>(ds->getSingleDecl());
+  if (!iv || !iv->isLocalVarDecl() || !iv->getType()->isIntegerType() ||
+      !iv->getInit())
+    return false;
+  std::optional<llvm::APSInt> lo = constInt(ctx, iv->getInit());
+  if (!lo || *lo != 0)
+    return false;
+  // cond: `i < HI`.
+  const auto *cmp = llvm::dyn_cast<clang::BinaryOperator>(
+      f->getCond()->IgnoreParenImpCasts());
+  if (!cmp || cmp->getOpcode() != clang::BO_LT)
+    return false;
+  const auto *lhs = llvm::dyn_cast<clang::DeclRefExpr>(peelToCore(cmp->getLHS()));
+  if (!lhs || lhs->getDecl()->getCanonicalDecl() != iv->getCanonicalDecl())
+    return false;
+  const clang::Expr *hi = cmp->getRHS();
+  // inc: `++i` / `i++`.
+  const auto *inc = llvm::dyn_cast<clang::UnaryOperator>(f->getInc());
+  if (!inc || !inc->isIncrementOp())
+    return false;
+  const auto *incRef =
+      llvm::dyn_cast<clang::DeclRefExpr>(peelToCore(inc->getSubExpr()));
+  if (!incRef || incRef->getDecl()->getCanonicalDecl() != iv->getCanonicalDecl())
+    return false;
+  // body: exactly `buf[i] = C;`.
+  const clang::Stmt *body = f->getBody();
+  if (const auto *cs = llvm::dyn_cast<clang::CompoundStmt>(body)) {
+    if (cs->size() != 1)
+      return false;
+    body = cs->body_front();
+  }
+  const auto *assign = llvm::dyn_cast<clang::BinaryOperator>(body);
+  if (!assign || assign->getOpcode() != clang::BO_Assign)
+    return false;
+  const auto *sub =
+      llvm::dyn_cast<clang::ArraySubscriptExpr>(peelToCore(assign->getLHS()));
+  if (!sub)
+    return false;
+  const auto *baseRef =
+      llvm::dyn_cast<clang::DeclRefExpr>(peelToCore(sub->getBase()));
+  if (!baseRef ||
+      baseRef->getDecl()->getCanonicalDecl() != buf->getCanonicalDecl())
+    return false;
+  const auto *idxRef =
+      llvm::dyn_cast<clang::DeclRefExpr>(peelToCore(sub->getIdx()));
+  if (!idxRef || idxRef->getDecl()->getCanonicalDecl() != iv->getCanonicalDecl())
+    return false;
+  // The fill must be a compile-time constant ASCII byte 0x01..0x7F: a valid,
+  // non-NUL, single-byte UTF-8 scalar, so the `String`'s bytes == the C bytes.
+  std::optional<llvm::APSInt> fill = constInt(ctx, assign->getRHS());
+  if (!fill || fill->isNegative())
+    return false;
+  int64_t byte = fill->getSExtValue();
+  if (byte < 0x01 || byte > 0x7F)
+    return false;
+  fillOut = static_cast<char>(byte);
+  hiOut = hi;
+  ivOut = iv;
+  bufRefOut = baseRef;
+  return true;
+}
+
+/// Whether `sizeExpr` provably yields at least `count + 1`: either both fold
+/// to non-negative constants with `size >= count + 1`, or `sizeExpr` is
+/// `count + k` / `k + count` with `k >= 1` a constant and `count` structurally
+/// equal to the loop bound. Anything else is unprovable (rejected).
+bool provesCapacity(clang::ASTContext &ctx, const clang::Expr *sizeExpr,
+                    const clang::Expr *count) {
+  std::optional<llvm::APSInt> sc = constInt(ctx, sizeExpr);
+  std::optional<llvm::APSInt> cc = constInt(ctx, count);
+  if (sc && cc) {
+    if (sc->isNegative() || cc->isNegative())
+      return false;
+    return sc->getSExtValue() >= cc->getSExtValue() + 1;
+  }
+  const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(peelToCore(sizeExpr));
+  if (!bo || bo->getOpcode() != clang::BO_Add)
+    return false;
+  std::optional<llvm::APSInt> lhsK = constInt(ctx, bo->getLHS());
+  std::optional<llvm::APSInt> rhsK = constInt(ctx, bo->getRHS());
+  if (rhsK && !rhsK->isNegative() && *rhsK >= 1 &&
+      exprEquiv(ctx, bo->getLHS(), count))
+    return true;
+  if (lhsK && !lhsK->isNegative() && *lhsK >= 1 &&
+      exprEquiv(ctx, bo->getRHS(), count))
+    return true;
+  return false;
+}
+} // namespace
+
+void CImporter::planStringFill(const clang::TranslationUnitDecl *unit) {
+  clang::ASTContext &ctx = astContext();
+  for (const clang::FunctionDecl *func : collectPassAFunctionDefinitions(unit)) {
+    const clang::Stmt *body = func->getBody();
+    if (!body)
+      continue;
+
+    // Candidate buffers: every local `char *a = malloc(...)/calloc(...)`.
+    llvm::SmallVector<const clang::VarDecl *, 4> candidates;
+    std::function<void(const clang::Stmt *)> collect =
+        [&](const clang::Stmt *s) {
+          if (!s)
+            return;
+          if (const auto *ds = llvm::dyn_cast<clang::DeclStmt>(s))
+            for (const clang::Decl *decl : ds->decls())
+              if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+                if (var->hasLocalStorage() &&
+                    !llvm::isa<clang::ParmVarDecl>(var) &&
+                    isDataPointer(var->getType()) && var->getInit() &&
+                    asAllocCall(var->getInit()) &&
+                    isByteCharPointee(var->getType()
+                                          .getCanonicalType()
+                                          ->getPointeeType()))
+                  candidates.push_back(var);
+          for (const clang::Stmt *child : s->children())
+            collect(child);
+        };
+    collect(body);
+
+    for (const clang::VarDecl *a : candidates) {
+      // 1. The allocation's char-capacity expression.
+      const clang::CallExpr *alloc = asAllocCall(a->getInit());
+      llvm::StringRef callee = alloc->getDirectCallee()->getName();
+      const clang::Expr *sizeExpr = nullptr;
+      bool isCalloc = callee == "calloc";
+      if (isCalloc) {
+        if (alloc->getNumArgs() != 2)
+          continue;
+        std::optional<llvm::APSInt> elt = constInt(ctx, alloc->getArg(1));
+        if (!elt || *elt != 1) // element size must be 1 (a char)
+          continue;
+        sizeExpr = alloc->getArg(0);
+      } else {
+        if (alloc->getNumArgs() != 1)
+          continue;
+        sizeExpr = alloc->getArg(0);
+      }
+
+      // 2. The unique constant-fill loop over `a`.
+      llvm::SmallVector<const clang::ForStmt *, 4> fors;
+      collectForStmts(body, fors);
+      const clang::ForStmt *fillLoop = nullptr;
+      char fillChar = 0;
+      const clang::Expr *countExpr = nullptr;
+      const clang::VarDecl *iv = nullptr;
+      const clang::DeclRefExpr *fillBufRef = nullptr;
+      bool ambiguous = false;
+      for (const clang::ForStmt *f : fors) {
+        char c = 0;
+        const clang::Expr *hi = nullptr;
+        const clang::VarDecl *ivar = nullptr;
+        const clang::DeclRefExpr *bufRef = nullptr;
+        if (matchConstFillLoop(ctx, f, a, c, hi, ivar, bufRef)) {
+          if (fillLoop) {
+            ambiguous = true;
+            break;
+          }
+          fillLoop = f;
+          fillChar = c;
+          countExpr = hi;
+          iv = ivar;
+          fillBufRef = bufRef;
+        }
+      }
+      if (!fillLoop || ambiguous)
+        continue;
+
+      // 3. The count must be non-negative for `repeat` to match the C loop:
+      //    an unsigned bound, or a non-negative integer constant. A signed
+      //    bound could be negative (0 C iterations vs a panicking `repeat`).
+      bool countNonNeg = countExpr->getType()->isUnsignedIntegerType();
+      if (!countNonNeg)
+        if (std::optional<llvm::APSInt> k = constInt(ctx, countExpr))
+          countNonNeg = !k->isNegative();
+      if (!countNonNeg)
+        continue;
+
+      // 4. The count must be loop-invariant and side-effect free, and every
+      //    variable it reads must be unwritten in the function, so evaluating
+      //    it once at the decl site yields the loop's per-iteration value.
+      if (countExpr->HasSideEffects(ctx))
+        continue;
+      llvm::SmallPtrSet<const clang::VarDecl *, 8> countVars;
+      collectVars(countExpr, countVars);
+      bool countStable = true;
+      for (const clang::VarDecl *v : countVars)
+        if (v->getCanonicalDecl() == iv->getCanonicalDecl() ||
+            mutatesVar(body, v)) {
+          countStable = false;
+          break;
+        }
+      if (!countStable)
+        continue;
+
+      // 5. The allocation must hold at least count + 1 bytes (room for NUL).
+      if (!provesCapacity(ctx, sizeExpr, countExpr))
+        continue;
+
+      // 6. Buffer stores: the one fill store (in the loop) plus at most one
+      //    NUL store `a[count] = 0`. Any other store shape is unliftable.
+      llvm::SmallVector<const clang::BinaryOperator *, 4> stores;
+      collectBufferStores(body, a, stores);
+      const clang::BinaryOperator *nulStore = nullptr;
+      const clang::DeclRefExpr *nulBufRef = nullptr;
+      bool badStore = false;
+      for (const clang::BinaryOperator *store : stores) {
+        if (stmtContains(fillLoop, store))
+          continue; // the fill store, already validated
+        const auto *sub = llvm::cast<clang::ArraySubscriptExpr>(
+            peelToCore(store->getLHS()));
+        std::optional<llvm::APSInt> rhs = constInt(ctx, store->getRHS());
+        if (!rhs || *rhs != 0 || !exprEquiv(ctx, sub->getIdx(), countExpr) ||
+            nulStore) {
+          badStore = true;
+          break;
+        }
+        nulStore = store;
+        nulBufRef =
+            llvm::dyn_cast<clang::DeclRefExpr>(peelToCore(sub->getBase()));
+      }
+      if (badStore)
+        continue;
+      // A `malloc` buffer's terminator must be explicit (its bytes are
+      // indeterminate); a `calloc` buffer is pre-zeroed, so the NUL is
+      // implicit and the store optional.
+      if (!isCalloc && !nulStore)
+        continue;
+
+      // 7. Every other use of `a` must be a supported string consumer
+      //    (`puts`/`printf("%s")`) or `free`. Build the allowed-reference set
+      //    as each consumer validates; a use outside it (a byte read, a
+      //    pointer copy, an escape, a return) leaves the buffer unlifted.
+      llvm::SmallPtrSet<const clang::DeclRefExpr *, 8> allowed;
+      allowed.insert(fillBufRef);
+      if (nulBufRef)
+        allowed.insert(nulBufRef);
+      llvm::SmallVector<const clang::CallExpr *, 8> calls;
+      collectCallExprs(body, calls);
+      unsigned printConsumers = 0;
+      bool badUse = false;
+      for (const clang::CallExpr *call : calls) {
+        const clang::DeclRefExpr *argRef = nullptr;
+        for (unsigned k = 0; k < call->getNumArgs(); ++k)
+          if (const auto *r = llvm::dyn_cast<clang::DeclRefExpr>(
+                  peelToCore(call->getArg(k))))
+            if (r->getDecl()->getCanonicalDecl() == a->getCanonicalDecl()) {
+              argRef = r;
+              break;
+            }
+        if (!argRef)
+          continue; // this call does not pass `a` directly
+        const clang::FunctionDecl *fn = call->getDirectCallee();
+        llvm::StringRef name = fn ? fn->getName() : llvm::StringRef();
+        auto isPercentS = [&](const clang::Expr *fmt) {
+          const clang::StringLiteral *lit = underlyingStringLiteral(
+              fmt->IgnoreParenImpCasts());
+          return lit && lit->isOrdinary() && lit->getString() == "%s";
+        };
+        if (name == "free" && call->getNumArgs() == 1) {
+          allowed.insert(argRef);
+        } else if (name == "puts" && call->getNumArgs() == 1) {
+          allowed.insert(argRef);
+          ++printConsumers;
+        } else if (name == "printf" && call->getNumArgs() == 2 &&
+                   isPercentS(call->getArg(0)) && argRef == peelToCore(call->getArg(1))) {
+          allowed.insert(argRef);
+          ++printConsumers;
+        } else {
+          badUse = true;
+          break;
+        }
+      }
+      if (badUse || printConsumers == 0)
+        continue;
+
+      // Every reference to `a` must be accounted for by an allowed construct;
+      // an unaccounted use (byte read, `&a`, `p = a`, `return a`) is unsound.
+      llvm::SmallVector<const clang::DeclRefExpr *, 8> aRefs;
+      collectVarRefs(body, a, aRefs);
+      bool allAccounted = true;
+      for (const clang::DeclRefExpr *ref : aRefs)
+        if (!allowed.contains(ref)) {
+          allAccounted = false;
+          break;
+        }
+      if (!allAccounted)
+        continue;
+
+      // Recognized: record the facts, and mark the fill loop and NUL store
+      // for elision (they fuse into the `String::repeat` binding).
+      StringFillFacts facts;
+      facts.bufferDecl = a;
+      facts.fillChar = fillChar;
+      facts.countExpr = countExpr;
+      stringFillLocals[a] = facts;
+      stringFillElidedStmts.insert(fillLoop);
+      if (nulStore)
+        stringFillElidedStmts.insert(nulStore);
+    }
+  }
+}
+
 void CImporter::collectCellSliceCallFacts(clang::ASTContext &context) {
   astContextPtr = &context;
   const clang::TranslationUnitDecl *unit = context.getTranslationUnitDecl();

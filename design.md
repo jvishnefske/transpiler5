@@ -3870,6 +3870,60 @@ piece and becomes FR-45.
   and the deeper quality tail are the next iterations; `needless_late_init`
   stays off-limits.
 
+- [x] FR-64 Constant-fill `char` buffer → idiomatic Rust `String` (W4.5 heap
+  memory-model change). The importer previously REJECTED a runtime-sized heap
+  `char` buffer outright (`malloc(len+1)` with a `ParmVarDecl` size fails the
+  compile-time-constant gate in `recordAllocBase` → the pinned located
+  rejection `unsupported: allocation size is not a compile-time constant`).
+  Owner-chosen target: emit an idiomatic owned `String`. A literal lowering of
+  `a[i]='c'` onto a `String` is impossible in safe Rust (`String` has no
+  `IndexMut`; per-byte mutation needs `unsafe`, which CLAUDE.md bans), so the
+  ONLY safe path is to recognize the WHOLE constant-fill idiom and fuse it:
+  `char *a = malloc(N+1); for (i=0;i<N;++i) a[i]=C; a[N]='\0'; puts(a);
+  free(a);` lifts to `let a: String = "C".repeat(N as usize); println!("{}",
+  a);` — the malloc + fill loop + NUL terminator fused into one
+  `emitrust.string_repeat` binding (the one new op: `i64` count + a char
+  `StrAttr` → `!emitrust.opaque<"String">`, rendered `"C".repeat((N) as
+  usize)`), `puts`/`printf("%s")` printing the `String` by `Display`, and
+  `free` a no-op (the `String` drops at scope end — exactly what `free`
+  denotes under single ownership).
+  **SPIKE VERDICT: GO (2026-08-06).** Hand-drove the target emission for the
+  fixed motivating input end-to-end (`emitrust-cc --emit=crate --build` vs
+  `clang -std=c11`): byte-IDENTICAL for `len>0`, `len==0` (empty string + `\n`),
+  and multi-char fills. Resolved unknowns: `"c".repeat(count as usize)` renders
+  the repeat form no existing op produces; `println!("{}", a)` (String:
+  Display) writes the same bytes as C `puts` (string + `\n`); a single-byte
+  UTF-8 fill makes `String` bytes == C bytes exactly. No shape forced `unsafe`
+  or a non-additive change.
+  **RECOGNITION is conservative (unprovable → the historical located rejection,
+  never a miscompile), pure-AST in `planStringFill`** (mirrors `planMallocPool`,
+  runs before the pointer-region emission passes consult it via
+  `stringValueLocalQuery`). All clauses must hold: a local `char *a =
+  malloc(N+1)`/`calloc(N+1,1)` with a `char` (i8/u8) pointee; a canonical
+  `for (int i=0;i<N;++i) a[i]=C` counted loop with a COMPILE-TIME-CONSTANT fill;
+  an explicit NUL terminator `a[N]='\0'` (implicit for pre-zeroed `calloc`); a
+  provable capacity `SIZE >= N+1`; a NON-NEGATIVE count (unsigned bound or
+  non-negative constant — a signed bound could be negative, 0 C iterations vs a
+  panicking `repeat`); and `a` used ONLY in supported consumer positions
+  (`puts`/`printf("%s")`/`free`) — every DeclRefExpr to `a` must be accounted
+  for by an allowed construct, so a byte read (`x=a[j]`), a pointer copy
+  (`p=a`), `&a`, `return a`, or a second write leaves the buffer UNLIFTED.
+  **Soundness gate:** the fill byte must be ASCII `0x01..0x7F` (a valid,
+  non-NUL, single-byte UTF-8 scalar), verified in both `planStringFill` and the
+  `emitrust.string_repeat` op verifier — anything else rejects rather than
+  mistranslate the bytes.
+  Gates (all green): new `test/EndToEnd/malloc-string-fill.c` byte-diffs the
+  built crate against the clang native for a non-foldable `argc`-derived count
+  covering `len>0` and `len==0`; `test/Import/C/string-fill-lift.c` pins the
+  fused `string_repeat`/`String` binding with NO surviving subscript/loop/free;
+  four `string-fill-reject-*.c` goldens keep the located rejection for a byte
+  read, a varying fill, a non-ASCII fill, and the user's buggy `++len` snippet;
+  full lit 532/532; emitted Rust `unsafe=0`; `controller.py gate` PASS (113
+  crates, unsafe=0, no new allow); strict additivity — `malloc-local-flat.c`,
+  `malloc-stack.c`, `malloc-local-nonconst-invalid.c` byte-identical.
+  (test/EndToEnd/malloc-string-fill.c, test/Import/C/string-fill-lift.c,
+  test/Import/C/string-fill-reject-{byteread,varfill,nonascii,buggyinc}.c)
+
 ## C99 Support Roadmap
 
 Everything the importer must handle before it can claim full C99 language

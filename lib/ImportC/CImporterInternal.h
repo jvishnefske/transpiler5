@@ -702,6 +702,28 @@ struct MallocPoolFacts {
   const clang::CallExpr *allocSite = nullptr;
 };
 
+/// FR-64: the recognized facts of a constant-fill C string buffer that lifts
+/// to an idiomatic Rust `String`. The whole `char *a = malloc(N+1); for (i=0;
+/// i<N; ++i) a[i]=C; a[N]='\0';` idiom is fused into a single
+/// `let a: String = "C".repeat(N as usize);` binding, and every recognized
+/// consumer (`puts`/`printf("%s")`) prints the `String` by `Display`. The
+/// recognizer is conservative: any buffer with an arbitrary byte read, a
+/// non-constant or non-ASCII fill, an escape, a return, or a size that cannot
+/// be proven `>= count + 1` is NOT recorded and keeps its historical located
+/// rejection.
+struct StringFillFacts {
+  /// The lifted buffer local (`a`); the `let a: String` binding site.
+  const clang::VarDecl *bufferDecl = nullptr;
+  /// The constant fill byte `C`, guaranteed ASCII 0x01..0x7F (single-byte
+  /// UTF-8, non-NUL) so the `String`'s bytes equal the C buffer's bytes.
+  char fillChar = 0;
+  /// The half-open fill count expression `N` (the loop's upper bound), imported
+  /// as an i64 rvalue and widened to `usize` for `.repeat`. Loop-invariant and
+  /// side-effect free; every variable it reads is unwritten in the function, so
+  /// evaluating it once at the decl site yields the loop's per-iteration value.
+  const clang::Expr *countExpr = nullptr;
+};
+
 /// Registry of the synthesized backing declarations for block-scope
 /// compound literals used as pointer-region bases (C99-13). A compound
 /// literal in expression position is a fresh anonymous object with the
@@ -981,6 +1003,14 @@ public:
   /// tracks it. Left unset (the pure-AST planning passes), the holder is
   /// tracked and conservatively invalid, which planning never consumes.
   std::function<bool(const clang::VarDecl *)> fnHolderQuery;
+
+  /// Optional query telling the walk whether a local `char *` declaration is
+  /// a recognized constant-fill string local (FR-64): its `malloc`/`calloc`
+  /// binding is lifted whole to `String::repeat`, so the pointer-region model
+  /// must NOT claim it as a flat heap backing (`recordAllocBase` is skipped).
+  /// Left unset (the pure-AST planning passes), the local keeps its historical
+  /// region tracking and its located non-constant-size rejection.
+  std::function<bool(const clang::VarDecl *)> stringValueLocalQuery;
 
   /// The importer-owned registry of synthesized compound-literal backing
   /// declarations (C99-13): a decayed or address-taken block-scope
@@ -1872,6 +1902,23 @@ private:
   /// like the owner passes it is additive; an unprovable function is simply
   /// left unpromoted (its node pointers keep the region-driven rejection).
   void planMallocPool(const clang::TranslationUnitDecl *unit);
+
+  /// FR-64: pure-AST recognition of constant-fill C string buffers that lift
+  /// to `String::repeat`. For every function definition it scans each local
+  /// `char *a = malloc(N+1)`/`calloc(N+1, 1)` bound to a canonical `[0,N)`
+  /// constant-ASCII fill loop, a NUL terminator, and only string-consumer uses
+  /// (`puts`/`printf("%s")`/`free`), recording a `StringFillFacts` into
+  /// `stringFillLocals` and marking the fill loop and NUL store for elision in
+  /// `stringFillElidedStmts`. Runs alongside the other Pass-A planners, before
+  /// any IR is built. Emits no diagnostic and never fails: a buffer that fails
+  /// any clause is simply not recorded and keeps its historical rejection.
+  void planStringFill(const clang::TranslationUnitDecl *unit);
+
+  /// FR-64: emits the fused `let a: String = "<fill>".repeat(<count> as usize)`
+  /// binding for a recognized constant-fill string local, in place of the
+  /// pointer decomposition. Called from `emitLocalVar` when `stringFillLocals`
+  /// holds `var`.
+  LogicalResult emitStringFillLocal(const clang::VarDecl *var, Location loc);
 
   /// Folds the trip count of `stmt` when it is a `for`/`while` loop with a
   /// foldable bound (`for (i = A; i < B; i++)`-style, or an equivalent
@@ -4961,6 +5008,18 @@ private:
   /// instead of the region-driven decomposition.
   llvm::DenseMap<const clang::VarDecl *, const clang::FunctionDecl *>
       poolHandleVars;
+  /// FR-64: every `char *` local lifted to a `String` constant-fill binding,
+  /// keyed by its declaration. Consulted at `emitLocalVar` (to build the
+  /// `String::repeat` binding), in `emitPrintfStringArg`/`emitPuts` (to print
+  /// the `String` by `Display`), in the `free` handler (a no-op — `String`
+  /// drops at scope end), and by `stringValueLocalQuery` (to skip the
+  /// pointer-region flat-backing model).
+  llvm::DenseMap<const clang::VarDecl *, StringFillFacts> stringFillLocals;
+  /// FR-64: the fill-loop and NUL-terminator statements of every recognized
+  /// string-fill local, elided at `emitStmt` (they are fused into the
+  /// `String::repeat` binding). The `free` call is intercepted separately in
+  /// the free handler, not elided here.
+  llvm::DenseSet<const clang::Stmt *> stringFillElidedStmts;
   /// Self-referential node-pool fields (`next`) that render as the nullable
   /// pool index `Option<usize>` (W4.2e Part B); the emission diverts their
   /// struct-field type and read/write lowering.

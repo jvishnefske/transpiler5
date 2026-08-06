@@ -458,6 +458,8 @@ private:
   LogicalResult emitGlobalCells(emitrust::GlobalCellsOp cellsOp);
   /// Emits `let mut vN: T = <init-or-default>;` for a local variable.
   LogicalResult emitVariable(emitrust::VariableOp variableOp);
+  /// Emits `let vN: String = "<fill>".repeat((<count>) as usize);` (FR-64).
+  LogicalResult emitStringRepeat(emitrust::StringRepeatOp op);
   /// Emits `let vN: T = <place-expr>;`.
   LogicalResult emitLoad(emitrust::LoadOp loadOp);
   /// Emits `let vN: &T = &<place>;` or `let vN: &mut T = &mut <place>;`.
@@ -1545,7 +1547,8 @@ static bool isPureProducer(Operation *op) {
              emitrust::MulOp, emitrust::DivOp, emitrust::RemOp,
              emitrust::AndOp, emitrust::OrOp, emitrust::XorOp,
              emitrust::ShlOp, emitrust::ShrOp, emitrust::BitcastOp,
-             emitrust::LoadOp, emitrust::LetOp>(op);
+             emitrust::LoadOp, emitrust::LetOp,
+             emitrust::StringRepeatOp>(op);
 }
 
 /// Ops that may sit between an inlined def and its use without blocking the
@@ -1707,6 +1710,10 @@ static bool isClassifiedConsumerUse(OpOperand &use) {
         // are delimited expression positions.
         return use.get() != call.getReceiver();
       })
+      // FR-64: the `.repeat` count is a delimited expression position, so a
+      // single-use cast/load bound inlines into `"c".repeat(<count> as usize)`
+      // instead of forcing a `let vN =` above the binding.
+      .Case<emitrust::StringRepeatOp>([](auto) { return true; })
       .Case<emitrust::CellGetOp>([&](emitrust::CellGetOp get) {
         return use.get() == get.getIndex();
       })
@@ -4366,6 +4373,20 @@ LogicalResult RustEmitter::emitVariable(emitrust::VariableOp variableOp) {
   return success();
 }
 
+LogicalResult RustEmitter::emitStringRepeat(emitrust::StringRepeatOp op) {
+  if (failed(emitLetPrologue(op.getResult(), /*isMut=*/false)))
+    return failure();
+  // `"<fill>".repeat((<count>) as usize)` — the fused C malloc + constant-fill
+  // loop + NUL terminator (FR-64). The fill's single ASCII byte is escaped as
+  // a Rust string literal; the i64 count widens to `usize`.
+  emitEscapedStringLiteral(op.getFill());
+  os << ".repeat(";
+  if (failed(emitOperand(op.getLoc(), op.getCount(), ExprPos::castSource())))
+    return failure();
+  os << " as usize);\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitLoad(emitrust::LoadOp loadOp) {
   Operation *op = loadOp.getOperation();
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
@@ -4465,6 +4486,9 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
           [&](emitrust::ReturnOp returnOp) { return emitReturn(returnOp); })
       .Case<emitrust::CallOpaqueOp>([&](emitrust::CallOpaqueOp callOp) {
         return emitCallOpaque(callOp);
+      })
+      .Case<emitrust::StringRepeatOp>([&](emitrust::StringRepeatOp op) {
+        return emitStringRepeat(op);
       })
       .Case<emitrust::CallIndirectOp>([&](emitrust::CallIndirectOp callOp) {
         return emitCallIndirect(callOp);

@@ -598,6 +598,9 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   pointerRegions.fnHolderQuery = [this](const clang::VarDecl *var) {
     return voidFnPtrHolders.contains(var);
   };
+  pointerRegions.stringValueLocalQuery = [this](const clang::VarDecl *var) {
+    return stringFillLocals.contains(var);
+  };
   pointerRegions.literalTemps = &literalTemps;
   // String-cursor parameters (CTS 00204): the walk binds `p = *s` to the
   // parameter's region and lets `&p` arguments to cursor positions pass
@@ -1159,6 +1162,9 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   pointerRegions.fnHolderQuery = [this](const clang::VarDecl *var) {
     return voidFnPtrHolders.contains(var);
   };
+  pointerRegions.stringValueLocalQuery = [this](const clang::VarDecl *var) {
+    return stringFillLocals.contains(var);
+  };
   pointerRegions.literalTemps = &literalTemps;
   pointerRegions.cursorParamQuery = [this](const clang::ParmVarDecl *param) {
     return cursorParams.contains(param);
@@ -1422,6 +1428,11 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // strictly additive, must run before `collectDeclTypeRecords` so a
   // promoted self-ref field's `Option<usize>` type reaches record emission.
   planMallocPool(unit);
+  // FR-64: pure-AST recognition of constant-fill `char` buffers that lift to
+  // an idiomatic `String::repeat`. Runs after `planMallocPool` (a string-fill
+  // buffer is never a node pool) and before the pointer-region emission passes
+  // consult `stringFillLocals` via `stringValueLocalQuery`.
+  planStringFill(unit);
   // CTS-P10 Pass A: cell-slice classification of pointer-parameter
   // classes whose bases are all mutable global arrays.
   planCellSlices(unit, soleTranslationUnit);
