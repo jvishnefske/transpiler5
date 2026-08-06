@@ -1649,6 +1649,280 @@ void CImporter::planStringFill(const clang::TranslationUnitDecl *unit) {
   }
 }
 
+namespace {
+// FR-65 Vec-lift recognition helpers ----------------------------------------
+
+/// Whether the pointee of a data pointer is a non-char, non-bool arithmetic
+/// scalar (int/short/long/long long/float/double and unsigned forms) — the
+/// element domain that lifts to a `Vec<T>`. Char-family pointees are the
+/// String/byte domain (claimed first by `planStringFill`); `bool` is not an
+/// arithmetic scalar here.
+bool isVecScalarPointee(clang::QualType pointee) {
+  if (isByteCharPointee(pointee) || pointee->isBooleanType())
+    return false;
+  return pointee->isIntegerType() || pointee->isRealFloatingType();
+}
+
+/// The mapped Rust element type for a `Vec`-liftable non-char scalar pointee,
+/// or a null `Type` when the width is unsupported (`__int128`, `long double`,
+/// ...). Diagnostic-free (planning-safe): mirrors the scalar cases of
+/// `mapType`/`rustSpellingForElementType` without touching the diagnostic
+/// engine, and round-trips through `parseStlElementType` exactly (`int` →
+/// signless `i32` → `"i32"`; `unsigned` → `ui32` → `"u32"`).
+Type vecElementType(clang::ASTContext &ctx, clang::QualType pointee,
+                    MLIRContext *mctx) {
+  if (const auto *bt = pointee->getAs<clang::BuiltinType>()) {
+    if (bt->getKind() == clang::BuiltinType::Float)
+      return Float32Type::get(mctx);
+    if (bt->getKind() == clang::BuiltinType::Double)
+      return Float64Type::get(mctx);
+  }
+  if (pointee->isIntegerType()) {
+    unsigned width = ctx.getIntWidth(pointee);
+    if (width == 16 || width == 32 || width == 64)
+      return pointee->isUnsignedIntegerType()
+                 ? IntegerType::get(mctx, width, IntegerType::Unsigned)
+                 : IntegerType::get(mctx, width);
+  }
+  return {};
+}
+
+/// Extracts the element-count expression from a `malloc` size of the form
+/// `count * K` / `K * count` where `K` folds to `elementBytes` (covering
+/// `count * sizeof(T)`, `sizeof(T) * count`, and `count * <literal ==
+/// sizeof(T)>`). Returns null when neither factor folds to `elementBytes`
+/// (a non-extractable size stays rejected). `elementBytes` must be > 0.
+const clang::Expr *extractElementCount(clang::ASTContext &ctx,
+                                       const clang::Expr *sizeExpr,
+                                       uint64_t elementBytes) {
+  if (elementBytes == 0)
+    return nullptr;
+  const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(peelToCore(sizeExpr));
+  if (!bo || bo->getOpcode() != clang::BO_Mul)
+    return nullptr;
+  auto foldsToElt = [&](const clang::Expr *e) {
+    std::optional<llvm::APSInt> k = constInt(ctx, e);
+    return k && !k->isNegative() && k->getZExtValue() == elementBytes;
+  };
+  if (foldsToElt(bo->getRHS()))
+    return bo->getLHS();
+  if (foldsToElt(bo->getLHS()))
+    return bo->getRHS();
+  return nullptr;
+}
+
+/// Collects every `&EXPR` address-of operator below `stmt`.
+void collectAddrOfs(const clang::Stmt *stmt,
+                    llvm::SmallVectorImpl<const clang::UnaryOperator *> &out) {
+  if (!stmt)
+    return;
+  if (const auto *uo = llvm::dyn_cast<clang::UnaryOperator>(stmt))
+    if (uo->getOpcode() == clang::UO_AddrOf)
+      out.push_back(uo);
+  for (const clang::Stmt *child : stmt->children())
+    collectAddrOfs(child, out);
+}
+
+/// Collects the base `DeclRefExpr` of every `buf[...]` subscript below `stmt`
+/// whose base roots in `buf` (the `buf` reference in `buf[i]`).
+void collectSubscriptBaseRefs(
+    const clang::Stmt *stmt, const clang::VarDecl *buf,
+    llvm::SmallVectorImpl<const clang::DeclRefExpr *> &out) {
+  if (!stmt)
+    return;
+  if (const auto *sub = llvm::dyn_cast<clang::ArraySubscriptExpr>(stmt))
+    if (const auto *base =
+            llvm::dyn_cast<clang::DeclRefExpr>(peelToCore(sub->getBase())))
+      if (base->getDecl()->getCanonicalDecl() == buf->getCanonicalDecl())
+        out.push_back(base);
+  for (const clang::Stmt *child : stmt->children())
+    collectSubscriptBaseRefs(child, buf, out);
+}
+} // namespace
+
+void CImporter::planVecLift(const clang::TranslationUnitDecl *unit) {
+  clang::ASTContext &ctx = astContext();
+  for (const clang::FunctionDecl *func : collectPassAFunctionDefinitions(unit)) {
+    const clang::Stmt *body = func->getBody();
+    if (!body)
+      continue;
+
+    // Candidate buffers: every local `T *a = malloc(...)/calloc(...)` whose
+    // pointee is a non-char scalar. A char buffer is the String/byte domain
+    // and was already claimed by `planStringFill` (which runs first).
+    llvm::SmallVector<const clang::VarDecl *, 4> candidates;
+    std::function<void(const clang::Stmt *)> collect =
+        [&](const clang::Stmt *s) {
+          if (!s)
+            return;
+          if (const auto *ds = llvm::dyn_cast<clang::DeclStmt>(s))
+            for (const clang::Decl *decl : ds->decls())
+              if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+                if (var->hasLocalStorage() &&
+                    !llvm::isa<clang::ParmVarDecl>(var) &&
+                    isDataPointer(var->getType()) && var->getInit() &&
+                    asAllocCall(var->getInit()) &&
+                    isVecScalarPointee(var->getType()
+                                           .getCanonicalType()
+                                           ->getPointeeType()))
+                  candidates.push_back(var);
+          for (const clang::Stmt *child : s->children())
+            collect(child);
+        };
+    collect(body);
+    if (candidates.empty())
+      continue;
+
+    // The foldable-int resolver the array arm uses (`recordAllocBase` via
+    // `evalFoldableInt`): a size that folds to a compile-time constant (a
+    // literal, a `sizeof`, or a foldable automatic local like `int cap = 4`)
+    // belongs to the EXISTING array arm (`[T; N]` backing), NOT the Vec arm.
+    // The Vec arm claims ONLY genuinely runtime counts, so the two are
+    // disjoint and the array goldens stay byte-identical.
+    PointerRegionAnalysis regions;
+    regions.literalTemps = &literalTemps;
+    regions.analyze(ctx, body);
+    regions.primeForFolding(ctx, body);
+
+    for (const clang::VarDecl *a : candidates) {
+      // Never claim a buffer `planStringFill` already lifted (the element-type
+      // gates are disjoint, but keep the arms strictly ordered).
+      if (stringFillLocals.contains(a))
+        continue;
+
+      clang::QualType pointee =
+          a->getType().getCanonicalType()->getPointeeType();
+      // The element must map to a supported scalar Rust spelling; an
+      // unsupported width (`__int128`, `long double`) stays rejected.
+      Type elementType = vecElementType(ctx, pointee, builder.getContext());
+      if (!elementType)
+        continue;
+      uint64_t elementBytes = ctx.getTypeSizeInChars(pointee).getQuantity();
+
+      // 1. Extract the runtime element count from the allocation size.
+      const clang::CallExpr *alloc = asAllocCall(a->getInit());
+      llvm::StringRef callee = alloc->getDirectCallee()->getName();
+      const clang::Expr *countExpr = nullptr;
+      if (callee == "calloc") {
+        // `calloc(count, sizeof(T))` / `calloc(sizeof(T), count)`: the count
+        // is the factor that is NOT the per-element byte size.
+        if (alloc->getNumArgs() != 2)
+          continue;
+        auto isEltSize = [&](const clang::Expr *e) {
+          std::optional<llvm::APSInt> k = constInt(ctx, e);
+          return k && !k->isNegative() && k->getZExtValue() == elementBytes;
+        };
+        if (isEltSize(alloc->getArg(1)))
+          countExpr = alloc->getArg(0);
+        else if (isEltSize(alloc->getArg(0)))
+          countExpr = alloc->getArg(1);
+        else
+          continue;
+      } else { // malloc
+        if (alloc->getNumArgs() != 1)
+          continue;
+        countExpr = extractElementCount(ctx, alloc->getArg(0), elementBytes);
+      }
+      if (!countExpr)
+        continue;
+
+      // 2. The count must be genuinely RUNTIME: a count that folds to a
+      //    compile-time constant (a literal, `sizeof`, or a foldable automatic
+      //    local) is the EXISTING array arm's domain (`[T; N]` backing), which
+      //    stays untouched. Only a non-foldable count lifts to `Vec`.
+      uint64_t foldedCount = 0;
+      if (regions.evalFoldableInt(countExpr, foldedCount))
+        continue;
+
+      // 3. The runtime count must be non-negative for `vec![_; n as usize]` to
+      //    match C: a signed, possibly-negative count would produce a huge
+      //    `size_t` (a null/failed malloc in C) but a panicking `vec![]` in
+      //    Rust. A non-foldable count is provably non-negative only via an
+      //    unsigned type — checked on the PEELED core, since `count * sizeof(T)`
+      //    promotes the operand to `size_t` (an implicit unsigned cast that
+      //    would otherwise mask a signed `int` count).
+      if (!peelToCore(countExpr)->getType()->isUnsignedIntegerType())
+        continue;
+
+      // 4. The count must be side-effect free, and every variable it reads
+      //    unwritten in the function, so evaluating it once at the decl site
+      //    (exactly where `malloc` evaluates it) yields a stable `Vec` length.
+      if (countExpr->HasSideEffects(ctx))
+        continue;
+      llvm::SmallPtrSet<const clang::VarDecl *, 8> countVars;
+      collectVars(countExpr, countVars);
+      bool countStable = true;
+      for (const clang::VarDecl *v : countVars)
+        if (mutatesVar(body, v)) {
+          countStable = false;
+          break;
+        }
+      if (!countStable)
+        continue;
+
+      // 5. Usage accounting (soundness): every reference to `a` must be a
+      //    subscript base `a[i]` or a `free(a)` argument. Any other use — a
+      //    byte-arithmetic `a + k`/`a++`/`p - a`, `&a`, `p = a`, `return a`,
+      //    passing `a` to a function, `*a`, a NULL compare/reassign, a second
+      //    alloc — leaves `a` UNLIFTED with its historical rejection.
+      llvm::SmallPtrSet<const clang::DeclRefExpr *, 8> allowed;
+      llvm::SmallVector<const clang::DeclRefExpr *, 8> subBaseRefs;
+      collectSubscriptBaseRefs(body, a, subBaseRefs);
+      for (const clang::DeclRefExpr *ref : subBaseRefs)
+        allowed.insert(ref);
+      llvm::SmallVector<const clang::CallExpr *, 8> calls;
+      collectCallExprs(body, calls);
+      for (const clang::CallExpr *call : calls) {
+        const clang::FunctionDecl *fn = call->getDirectCallee();
+        if (!fn || fn->getName() != "free" || call->getNumArgs() != 1)
+          continue;
+        if (const auto *r = llvm::dyn_cast<clang::DeclRefExpr>(
+                peelToCore(call->getArg(0))))
+          if (r->getDecl()->getCanonicalDecl() == a->getCanonicalDecl())
+            allowed.insert(r);
+      }
+      // An element escape `&a[i]` (an address-of over a subscript rooted in
+      // `a`) is out of the direct-indexing scope: the element reference could
+      // escape into pointer arithmetic. Reject the whole buffer.
+      llvm::SmallVector<const clang::UnaryOperator *, 8> addrOfs;
+      collectAddrOfs(body, addrOfs);
+      bool escapes = false;
+      for (const clang::UnaryOperator *uo : addrOfs)
+        if (const auto *sub = llvm::dyn_cast<clang::ArraySubscriptExpr>(
+                peelToCore(uo->getSubExpr())))
+          if (const auto *base = llvm::dyn_cast<clang::DeclRefExpr>(
+                  peelToCore(sub->getBase())))
+            if (base->getDecl()->getCanonicalDecl() == a->getCanonicalDecl()) {
+              escapes = true;
+              break;
+            }
+      if (escapes)
+        continue;
+
+      // Every reference to `a` must be accounted for, and there must be at
+      // least one subscript (an unindexed buffer has nothing to lift).
+      llvm::SmallVector<const clang::DeclRefExpr *, 8> aRefs;
+      collectVarRefs(body, a, aRefs);
+      bool allAccounted = true;
+      for (const clang::DeclRefExpr *ref : aRefs)
+        if (!allowed.contains(ref)) {
+          allAccounted = false;
+          break;
+        }
+      if (!allAccounted || subBaseRefs.empty())
+        continue;
+
+      // Recognized: record the facts. No statement elision — the `a[i] = x`
+      // writes stay as real `Vec` index writes (`Vec<T>` has `IndexMut`).
+      VecFacts facts;
+      facts.bufferDecl = a;
+      facts.elementType = elementType;
+      facts.countExpr = countExpr;
+      vecValueLocals[a] = facts;
+    }
+  }
+}
+
 void CImporter::collectCellSliceCallFacts(clang::ASTContext &context) {
   astContextPtr = &context;
   const clang::TranslationUnitDecl *unit = context.getTranslationUnitDecl();

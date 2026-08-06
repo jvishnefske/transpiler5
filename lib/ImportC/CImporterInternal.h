@@ -724,6 +724,27 @@ struct StringFillFacts {
   const clang::Expr *countExpr = nullptr;
 };
 
+/// FR-65: the recognized facts of a runtime-sized heap buffer of a non-char
+/// scalar element type that lifts to an owned Rust `Vec<T>` (the Vec arm of the
+/// {array, Vec, span, Option} representation match). A `T *a = malloc(n *
+/// sizeof(T))` / `calloc(n, sizeof(T))` whose only uses are `a[i]` indexing
+/// (read AND write — `Vec<T>` has `IndexMut`, so there is no constant-fill
+/// restriction) and `free(a)` binds `let a: Vec<T> = vec![<zero>; n as usize]`.
+/// The recognizer is conservative: pointer arithmetic, `&a`, aliasing, an
+/// escape/return, a nullable buffer, a char element, or a non-extractable size
+/// leaves the buffer UNLIFTED with its historical located rejection.
+struct VecFacts {
+  /// The lifted buffer local (`a`); the `let a: Vec<T>` binding site.
+  const clang::VarDecl *bufferDecl = nullptr;
+  /// The mapped Rust element type `T` (a non-char arithmetic scalar), used to
+  /// spell the `Vec<T>` opaque type and the suffixed zero fill literal.
+  mlir::Type elementType;
+  /// The element-count expression `n` (extracted from the allocation size),
+  /// imported as an i64 rvalue at the decl site and widened to `usize` for
+  /// `vec![_; n]`. Non-negative and side-effect free.
+  const clang::Expr *countExpr = nullptr;
+};
+
 /// Registry of the synthesized backing declarations for block-scope
 /// compound literals used as pointer-region bases (C99-13). A compound
 /// literal in expression position is a fresh anonymous object with the
@@ -1011,6 +1032,14 @@ public:
   /// Left unset (the pure-AST planning passes), the local keeps its historical
   /// region tracking and its located non-constant-size rejection.
   std::function<bool(const clang::VarDecl *)> stringValueLocalQuery;
+
+  /// Optional query telling the walk whether a local `T *` declaration is a
+  /// recognized runtime-sized heap buffer lifted to `Vec<T>` (FR-65): its
+  /// `malloc`/`calloc` binding becomes `vec![<zero>; n]`, so the
+  /// pointer-region model must NOT claim it as a flat heap backing
+  /// (`recordAllocBase`'s const-size gate is skipped). Left unset, the local
+  /// keeps its historical region tracking and its located rejection.
+  std::function<bool(const clang::VarDecl *)> vecValueLocalQuery;
 
   /// The importer-owned registry of synthesized compound-literal backing
   /// declarations (C99-13): a decayed or address-taken block-scope
@@ -1919,6 +1948,25 @@ private:
   /// pointer decomposition. Called from `emitLocalVar` when `stringFillLocals`
   /// holds `var`.
   LogicalResult emitStringFillLocal(const clang::VarDecl *var, Location loc);
+
+  /// FR-65: pure-AST recognition of runtime-sized heap buffers of a non-char
+  /// scalar element type that lift to an owned `Vec<T>` (the Vec arm of the
+  /// {array, Vec, span, Option} representation match). For every function
+  /// definition it scans each local `T *a = malloc(n * sizeof(T))`/`calloc(n,
+  /// sizeof(T))` whose only uses are `a[i]` indexing and `free(a)`, recording a
+  /// `VecFacts` into `vecValueLocals`. Runs alongside the other Pass-A
+  /// planners, after `planStringFill` (char buffers are the String domain and
+  /// are claimed first). Emits no diagnostic and never fails: a buffer that
+  /// fails any clause is simply not recorded and keeps its historical
+  /// non-constant-size rejection. Unlike FR-64 there is NO statement elision:
+  /// the `a[i] = x` writes are kept as real `Vec` index writes.
+  void planVecLift(const clang::TranslationUnitDecl *unit);
+
+  /// FR-65: emits the `let a: Vec<T> = vec![<zero>; <count> as usize]` binding
+  /// for a recognized runtime-sized heap buffer, in place of the pointer
+  /// decomposition. Called from `emitLocalVar` when `vecValueLocals` holds
+  /// `var`.
+  LogicalResult emitVecLocal(const clang::VarDecl *var, Location loc);
 
   /// Folds the trip count of `stmt` when it is a `for`/`while` loop with a
   /// foldable bound (`for (i = A; i < B; i++)`-style, or an equivalent
@@ -5020,6 +5068,15 @@ private:
   /// `String::repeat` binding). The `free` call is intercepted separately in
   /// the free handler, not elided here.
   llvm::DenseSet<const clang::Stmt *> stringFillElidedStmts;
+  /// FR-65: every `T *` local lifted to a `Vec<T>` runtime-sized heap buffer,
+  /// keyed by its declaration. Consulted at `emitLocalVar` (to build the
+  /// `vec![<zero>; n]` binding), at `emitSubscriptLValue` (to route `a[i]`
+  /// read/write to the Vec index place), in the `free` handler (a no-op — the
+  /// `Vec` drops at scope end), and by `vecValueLocalQuery` (to skip the
+  /// pointer-region flat-backing model). Unlike `stringFillLocals` there is no
+  /// companion elided-statement set: the `a[i] = x` writes are kept as real
+  /// `Vec` index writes.
+  llvm::DenseMap<const clang::VarDecl *, VecFacts> vecValueLocals;
   /// Self-referential node-pool fields (`next`) that render as the nullable
   /// pool index `Option<usize>` (W4.2e Part B); the emission diverts their
   /// struct-field type and read/write lowering.
