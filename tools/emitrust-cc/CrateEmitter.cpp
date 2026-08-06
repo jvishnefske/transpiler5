@@ -27,18 +27,18 @@
 namespace emitrustcc {
 
 /// Attribute header prepended to every generated crate root. Under the default
-/// idiomatic rename only two lints are allowed, both because they are intrinsic
-/// to a faithful transpile rather than masking sloppy codegen:
+/// idiomatic rename only one lint is allowed, because it is intrinsic to a
+/// faithful transpile rather than masking sloppy codegen:
 ///   - `dead_code`: rejected items intentionally keep their `struct_def` /
 ///     `global` definitions (dropping them was measured and rejected as risking
 ///     dangling symbols), and a binary crate legitimately holds unreferenced
 ///     imported items.
-///   - `unused_assignments`: the emitter's definite-assignment/dead-store
-///     analysis eliminates these everywhere it can prove safe (byte-diff
-///     verified); the sole residual is a dead store inside a loop, whose sound
-///     cross-iteration liveness would risk a miscompile and is deliberately not
-///     attempted. It is a per-crate no-op for every input in the suite except
-///     one.
+/// `unused_assignments` was formerly allowed here to mask a single residual: a
+/// dead store inside a loop body, whose sound cross-iteration liveness would
+/// risk a miscompile and is deliberately not attempted. FR-61f lifts canonical
+/// C counting loops to `emitrust.for` range heads (no explicit backedge store),
+/// removing that residual; the lint is now DENIED in `Cargo.toml` like every
+/// other lint, so a regression fails the build instead of hiding.
 /// Every other lint the old blanket header silenced is now DENIED in
 /// `Cargo.toml`'s `[lints.rust]` table (see `renderCargoToml`), so a regression
 /// fails the build.
@@ -47,9 +47,9 @@ namespace emitrustcc {
 /// instead of the deny table: verbatim C spellings legitimately trip them, and
 /// the flag's whole point is to keep those spellings.
 static constexpr llvm::StringLiteral kAllowHeader =
-    "#![allow(dead_code, unused_assignments)]\n";
+    "#![allow(dead_code)]\n";
 static constexpr llvm::StringLiteral kAllowHeaderPreserveNames =
-    "#![allow(dead_code, unused_assignments, non_snake_case, "
+    "#![allow(dead_code, non_snake_case, "
     "non_upper_case_globals, non_camel_case_types)]\n";
 
 /// Verbatim entry-point wrapper: forwards the imported C `main`'s return
@@ -201,14 +201,16 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
        << "path = \"src/lib.rs\"\n";
   // FR-53: the lints the old blanket allow header silenced are now DENIED, so
   // any regression in the emitter's warning-clean codegen fails `cargo build`.
-  // `dead_code` and `unused_assignments` stay allowed in the crate root (see
-  // `kAllowHeader`); everything else must be clean. The three naming lints are
-  // denied only under the idiomatic rename -- `--preserve-c-names` keeps
-  // verbatim C spellings, which legitimately trip them (allowed in the
-  // header instead).
+  // Only `dead_code` stays allowed in the crate root (see `kAllowHeader`);
+  // everything else must be clean. `unused_assignments` joined the deny table
+  // once FR-61f's range-for lift removed the last loop-body residual. The three
+  // naming lints are denied only under the idiomatic rename --
+  // `--preserve-c-names` keeps verbatim C spellings, which legitimately trip
+  // them (allowed in the header instead).
   os << "\n"
      << "[lints.rust]\n"
      << "unused_variables = \"deny\"\n"
+     << "unused_assignments = \"deny\"\n"
      << "unused_mut = \"deny\"\n"
      << "unused_parens = \"deny\"\n"
      << "unpredictable_function_pointer_comparisons = \"deny\"\n";

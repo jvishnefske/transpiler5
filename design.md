@@ -2722,6 +2722,26 @@ of references or inheritance, so it precedes both.
     those too); plus a residual +11 place-accumulator `needless_late_init` for
     NON-constant inits a later late-init-merge fold could clean.
 
+    FOLLOW-UP (2026-08-05): `unused_assignments` PROMOTED from the crate-root
+    allow header to a denied `[lints.rust]` lint (CrateEmitter.cpp), making the
+    emitter honest -- a future regression now fails `cargo build` instead of
+    hiding. FR-61f's range-for lift removed the counting-loop backedge stores
+    that motivated the suppression, but the full suite under the deny table
+    surfaced ONE surviving loop-body residual: compound-literals.c emitted a
+    dead `v[1] = 55` inside a loop whose buffer is wholly overwritten (`v = tmpl`)
+    at the top of every iteration. That shape is decidable WITHOUT cross-iteration
+    liveness (the off-limits 3x-miscompiled path): the top-of-body whole overwrite
+    is a per-iteration kill, so a partial store after the binding's last
+    in-iteration read cannot reach the next iteration's reads nor escape the loop.
+    `computeLoopBodyDeadStores` (TranslateToRust.cpp) elides exactly that,
+    narrowly (entry-block-direct loops, single-block bodies, hoisted binding, no
+    escaping borrow, whole-overwrite first touch); any store lacking the kill is
+    kept (a cross-iteration-live store stays put -- no liveness reasoning). Suite
+    526/526 byte-diff green under the deny table, gate PASS (unsafe 0, allow set
+    SMALLER). Tests: test/Target/Rust/loop-body-dead-store.mlir (positive + the
+    cross-iteration-live negative), the four Driver header/deny goldens, and
+    compound-literals.c is now its own EndToEnd regression under the deny table.
+
 - [x] FR-62 Message-based / actor decomposition of the program graph.
   Owner direction (2026-08-03, verbatim): "convert program graph into
   message based rust system or (feature flag) async select passing with
@@ -3776,8 +3796,8 @@ piece and becomes FR-45.
   correctness is `check-emitrust` at 100%, never cargo/clippy clean, which is
   compile-only and cannot see a miscompile; (2) full lit suite 100%, goldens
   updated the same change a spelling shifts; (3) no new `unsafe`, no new
-  allow-attribute beyond the crate-root header (`#![allow(dead_code,
-  unused_assignments)]`); (4) ratchets never regress (clippy total, RealWorld,
+  allow-attribute beyond the crate-root header (`#![allow(dead_code)]`);
+  (4) ratchets never regress (clippy total, RealWorld,
   c-testsuite, kernel); (5) held-out generalization — a train-only improvement
   that regresses held-out is rejected (anti-Goodhart); (6) off-limits without a
   human + a new idea: cross-iteration loop liveness (miscompiled 3×) and

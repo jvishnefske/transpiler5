@@ -39,7 +39,7 @@
     }
   },
   "allow_lines": [
-    "#![allow(dead_code, unused_assignments)]"
+    "#![allow(dead_code)]"
   ],
   "unsafe_count": 0
 }
