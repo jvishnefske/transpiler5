@@ -305,6 +305,23 @@ LogicalResult StringRepeatOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// VecFillOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult VecFillOp::verify() {
+  // The result must be a `Vec<...>` — the op only ever constructs one.
+  auto opaque = dyn_cast<OpaqueType>(getResult().getType());
+  if (!opaque || !opaque.getValue().starts_with("Vec<"))
+    return emitOpError() << "result type must be !emitrust.opaque<\"Vec<...>\">";
+  // The fill is the suffixed Rust zero literal for the element type
+  // (`0i32`, `0.0f64`, ...); it must be non-empty so the rendered
+  // `vec![<fill>; n]` names an element value.
+  if (getFill().empty())
+    return emitOpError() << "fill must be a non-empty zero literal";
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // AssignOp
 //===----------------------------------------------------------------------===//
 

@@ -1106,6 +1106,12 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
   // routes the local to its `String` binding and never consults this region).
   if (stringValueLocalQuery && stringValueLocalQuery(ptr))
     return;
+  // FR-65: a recognized runtime-sized heap buffer is lifted whole to
+  // `Vec<T>` (`vec![<zero>; n]`), so its `malloc`/`calloc` binding never
+  // reaches `recordAllocBase`'s compile-time-constant size gate — leave the
+  // region untracked (the emitter routes the local to its `Vec` binding).
+  if (vecValueLocalQuery && vecValueLocalQuery(ptr))
+    return;
   const clang::Expr *e = stripTrivia(rhs);
   clang::SourceLocation loc = e->getBeginLoc();
 
@@ -5487,6 +5493,26 @@ CImporter::emitSubscriptLValue(const clang::ArraySubscriptExpr *subscript,
   if (exprRootsInByteRegion(subscript))
     return emitByteRegionLeafLValue(subscript, loc, writeback);
   const clang::Expr *base = subscript->getBase()->IgnoreParenImpCasts();
+  // FR-65: a subscript whose base roots in a lifted `Vec<T>` local routes to
+  // the shared STL vector index place — `emitrust.subscript(vecPlace, idx) :
+  // lvalue<T>`. One interception covers BOTH read (`x = a[i]` loads the place)
+  // and write (`a[i] = x` assigns it); the place machinery is shared and `mut`
+  // is inferred automatically. `planVecLift` proved the buffer is used only
+  // through such subscripts and `free`, so the pointer-decompose branch below
+  // never sees it.
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(base))
+    if (const auto *root = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+      if (vecValueLocals.contains(root)) {
+        Value vecPlace = symbols.lookup(root);
+        if (vecPlace)
+          if (auto lvalueType =
+                  llvm::dyn_cast<emitrust::LValueType>(vecPlace.getType()))
+            if (auto vecType = llvm::dyn_cast<emitrust::OpaqueType>(
+                    lvalueType.getValueType()))
+              return emitStlVectorIndexPlace(vecPlace, vecType,
+                                             subscript->getIdx(), loc,
+                                             "vector index");
+      }
   if (!base->getType().getCanonicalType()->isArrayType()) {
     // Subscript through a pointer: decompose it into (base, cursor) and
     // subscript the base object at cursor+index. A subscripted pointer

@@ -477,6 +477,48 @@ def EmitRust_StringRepeatOp : EmitRust_Op<"string_repeat", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
+// VecFillOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_VecFillOp : EmitRust_Op<"vec_fill", [Pure]> {
+  let summary = "Idiomatic `vec![<zero>; n]` runtime-sized heap buffer";
+  let description = [{
+    The `emitrust.vec_fill` operation constructs an owned `Vec<T>` of `$count`
+    zero-initialized elements. It is the lowering of the C runtime-sized heap
+    buffer idiom `T *a = malloc(n * sizeof(T))` / `calloc(n, sizeof(T))` for a
+    non-char scalar element type `T` used only through `a[i]` indexing and
+    `free` (FR-65, the Vec arm of the {array, Vec, span, Option} representation
+    match) and renders as `vec![<fill>; (<count>) as usize]`.
+
+    The `$fill` attribute is the suffixed Rust zero literal for the element
+    type (`"0i32"`, `"0u32"`, `"0.0f64"`, ...). Zero is the sound refinement of
+    `malloc`'s indeterminate bytes — a defined program writes every element
+    before reading it — and matches `calloc`'s pre-zeroing exactly. The
+    `$count` operand is an `i64` element count widened from the C size
+    expression; it widens to `usize` at the fill site.
+
+    The result type is always `!emitrust.opaque<"Vec<T>">`.
+
+    Example:
+
+    ```mlir
+    %v = emitrust.vec_fill "0i32", %n : i64 -> !emitrust.opaque<"Vec<i32>">
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let a: Vec<i32> = vec![0i32; (n) as usize];
+    ```
+  }];
+
+  let arguments = (ins I64:$count, StrAttr:$fill);
+  let results = (outs EmitRust_OpaqueType:$result);
+
+  let assemblyFormat =
+      "$fill `,` $count attr-dict `:` type($count) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
 // LetOp
 //===----------------------------------------------------------------------===//
 

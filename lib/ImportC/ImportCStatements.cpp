@@ -211,6 +211,13 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   // never reaches the region model.
   if (stringFillLocals.contains(var))
     return emitStringFillLocal(var, loc);
+  // FR-65: a recognized runtime-sized heap buffer lifts whole to a
+  // `let a: Vec<T> = vec![<zero>; n as usize]` binding, replacing the pointer
+  // decomposition entirely (its `a[i]` uses become `Vec` index places and
+  // `free` a no-op). Checked before every pointer/owner path so the `T *`
+  // never reaches the region model.
+  if (vecValueLocals.contains(var))
+    return emitVecLocal(var, loc);
   // An owner-promoted array (Phase 4) declares the owner struct variable
   // instead; every direct access rewrites to the struct's "data" member.
   if (ownerPlans.contains(var))
@@ -1295,6 +1302,51 @@ LogicalResult CImporter::emitStringFillLocal(const clang::VarDecl *var,
               builder.getStringAttr(std::string(1, facts.fillChar)))
           .getResult();
   return storeToPlace(loc, place, repeated);
+}
+
+LogicalResult CImporter::emitVecLocal(const clang::VarDecl *var, Location loc) {
+  // FR-65: the lowering of a C `T *a = malloc(n * sizeof(T))` / `calloc(n,
+  // sizeof(T))` runtime-sized heap buffer of a non-char scalar element type
+  // into a single owned `Vec<T>` binding. The `a[i]` reads/writes become
+  // `Vec` index places (`emitSubscriptLValue` routing), and `free(a)` is a
+  // no-op — the `Vec` drops at scope end. `planVecLift` proved every soundness
+  // clause (non-negative extractable count, index-only + free usage, no
+  // escape/alias), so emission is unconditional here.
+  const VecFacts &facts = vecValueLocals[var];
+  // Spell `Vec<T>` from the mapped element type; the spelling round-trips
+  // through `parseStlElementType` at the subscript sites.
+  std::optional<std::string> spelling =
+      rustSpellingForElementType(facts.elementType);
+  if (!spelling)
+    return emitError(loc) << "unsupported: Vec element type";
+  auto vecType =
+      emitrust::OpaqueType::get(builder.getContext(), "Vec<" + *spelling + ">");
+  Value place = createVariablePlace(
+      loc, vecType,
+      var->getName().empty() ? std::string() : mangleMemberName(var->getName()));
+  symbols[var] = place;
+  // The element count is imported once at the decl site — exactly where
+  // `malloc` evaluates it — and widened to i64 for `vec![_; n as usize]`.
+  FailureOr<Value> count = emitRValue(facts.countExpr);
+  if (failed(count))
+    return failure();
+  Value count64 = castToIntType(loc, *count, builder.getIntegerType(64));
+  // The suffixed zero fill: `0i32`/`0u32`/... for integers, `0.0f32`/`0.0f64`
+  // for floats. Zero is the sound refinement of `malloc`'s indeterminate bytes
+  // (a defined program writes each element before reading it) and matches
+  // `calloc`'s pre-zeroing exactly.
+  std::string fill;
+  if (llvm::isa<Float32Type>(facts.elementType))
+    fill = "0.0f32";
+  else if (llvm::isa<Float64Type>(facts.elementType))
+    fill = "0.0f64";
+  else
+    fill = "0" + *spelling;
+  Value filled = builder
+                     .create<emitrust::VecFillOp>(loc, vecType, count64,
+                                                  builder.getStringAttr(fill))
+                     .getResult();
+  return storeToPlace(loc, place, filled);
 }
 
 LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
@@ -3603,6 +3655,10 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
           // `String` drops at scope end, exactly the deallocation `free`
           // denotes (escape/return are rejected, so ownership is single).
           if (stringFillLocals.contains(root))
+            return success();
+          // FR-65: `free` of a lifted `Vec<T>` local is a no-op — the `Vec`
+          // drops at scope end (single owner: escape/return are rejected).
+          if (vecValueLocals.contains(root))
             return success();
           auto it = pointerLocals.find(root);
           if (it != pointerLocals.end() && it->second.backing)

@@ -460,6 +460,8 @@ private:
   LogicalResult emitVariable(emitrust::VariableOp variableOp);
   /// Emits `let vN: String = "<fill>".repeat((<count>) as usize);` (FR-64).
   LogicalResult emitStringRepeat(emitrust::StringRepeatOp op);
+  /// Emits `let vN: Vec<T> = vec![<fill>; (<count>) as usize];` (FR-65).
+  LogicalResult emitVecFill(emitrust::VecFillOp op);
   /// Emits `let vN: T = <place-expr>;`.
   LogicalResult emitLoad(emitrust::LoadOp loadOp);
   /// Emits `let vN: &T = &<place>;` or `let vN: &mut T = &mut <place>;`.
@@ -1548,7 +1550,7 @@ static bool isPureProducer(Operation *op) {
              emitrust::AndOp, emitrust::OrOp, emitrust::XorOp,
              emitrust::ShlOp, emitrust::ShrOp, emitrust::BitcastOp,
              emitrust::LoadOp, emitrust::LetOp,
-             emitrust::StringRepeatOp>(op);
+             emitrust::StringRepeatOp, emitrust::VecFillOp>(op);
 }
 
 /// Ops that may sit between an inlined def and its use without blocking the
@@ -1714,6 +1716,10 @@ static bool isClassifiedConsumerUse(OpOperand &use) {
       // single-use cast/load bound inlines into `"c".repeat(<count> as usize)`
       // instead of forcing a `let vN =` above the binding.
       .Case<emitrust::StringRepeatOp>([](auto) { return true; })
+      // FR-65: the `vec![_; <count>]` count is a delimited expression
+      // position, so a single-use cast/load bound inlines into it instead of
+      // forcing a `let vN =` above the binding.
+      .Case<emitrust::VecFillOp>([](auto) { return true; })
       .Case<emitrust::CellGetOp>([&](emitrust::CellGetOp get) {
         return use.get() == get.getIndex();
       })
@@ -4387,6 +4393,21 @@ LogicalResult RustEmitter::emitStringRepeat(emitrust::StringRepeatOp op) {
   return success();
 }
 
+LogicalResult RustEmitter::emitVecFill(emitrust::VecFillOp op) {
+  if (failed(emitLetPrologue(op.getResult(), /*isMut=*/false)))
+    return failure();
+  // `vec![<fill>; (<count>) as usize]` — the runtime-sized heap buffer of a
+  // non-char scalar element type (FR-65, the Vec arm of the {array, Vec, span,
+  // Option} representation match). The fill is the element type's suffixed
+  // zero literal (`0i32`, `0.0f64`, ...) emitted verbatim; the i64 count
+  // widens to `usize`.
+  os << "vec![" << op.getFill() << "; ";
+  if (failed(emitOperand(op.getLoc(), op.getCount(), ExprPos::castSource())))
+    return failure();
+  os << " as usize];\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitLoad(emitrust::LoadOp loadOp) {
   Operation *op = loadOp.getOperation();
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
@@ -4487,6 +4508,8 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
       .Case<emitrust::CallOpaqueOp>([&](emitrust::CallOpaqueOp callOp) {
         return emitCallOpaque(callOp);
       })
+      .Case<emitrust::VecFillOp>(
+          [&](emitrust::VecFillOp op) { return emitVecFill(op); })
       .Case<emitrust::StringRepeatOp>([&](emitrust::StringRepeatOp op) {
         return emitStringRepeat(op);
       })

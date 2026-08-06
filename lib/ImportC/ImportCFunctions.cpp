@@ -601,6 +601,9 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   pointerRegions.stringValueLocalQuery = [this](const clang::VarDecl *var) {
     return stringFillLocals.contains(var);
   };
+  pointerRegions.vecValueLocalQuery = [this](const clang::VarDecl *var) {
+    return vecValueLocals.contains(var);
+  };
   pointerRegions.literalTemps = &literalTemps;
   // String-cursor parameters (CTS 00204): the walk binds `p = *s` to the
   // parameter's region and lets `&p` arguments to cursor positions pass
@@ -1165,6 +1168,9 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   pointerRegions.stringValueLocalQuery = [this](const clang::VarDecl *var) {
     return stringFillLocals.contains(var);
   };
+  pointerRegions.vecValueLocalQuery = [this](const clang::VarDecl *var) {
+    return vecValueLocals.contains(var);
+  };
   pointerRegions.literalTemps = &literalTemps;
   pointerRegions.cursorParamQuery = [this](const clang::ParmVarDecl *param) {
     return cursorParams.contains(param);
@@ -1433,6 +1439,13 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // buffer is never a node pool) and before the pointer-region emission passes
   // consult `stringFillLocals` via `stringValueLocalQuery`.
   planStringFill(unit);
+  // FR-65: pure-AST recognition of runtime-sized non-char scalar heap buffers
+  // that lift to an owned `Vec<T>` (the Vec arm of the {array, Vec, span,
+  // Option} representation match). Runs after `planStringFill` (char buffers
+  // are the String/byte domain and are claimed first) and before the
+  // pointer-region emission passes consult `vecValueLocals` via
+  // `vecValueLocalQuery`.
+  planVecLift(unit);
   // CTS-P10 Pass A: cell-slice classification of pointer-parameter
   // classes whose bases are all mutable global arrays.
   planCellSlices(unit, soleTranslationUnit);

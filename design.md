@@ -1261,7 +1261,12 @@ validate it.
     RealWorld ledger unchanged). The array backend is THE production container
     path; the spike's `vec` pattern + the `backend` option were dropped (a
     growable `Vec`/heap backend stays RFC-gated at W4.5, a memory-model change
-    needing explicit sign-off). The placeholder collection value type is
+    needing explicit sign-off — SIGNED OFF and shipped as the Vec arm of the
+    {array, Vec, span, Option} representation match, FR-65: a runtime-sized
+    non-char scalar `malloc`/`calloc` used only via `a[i]` + `free` now lifts to
+    an owned `Vec<T>` (`emitrust.vec_fill` → `vec![<zero>; n as usize]`); the
+    foldable-const array backend below stays THE path for compile-time sizes and
+    is untouched). The placeholder collection value type is
     `emitrust.opaque<"__emitrust_collection">`. W4.2e Part A (the flat-buffer
     local `malloc`) does not fit the push/at model and stays inlined as-is.
   - The `Option<usize>` field required relaxing `emitrust.struct_def`'s
@@ -3923,6 +3928,77 @@ piece and becomes FR-45.
   `malloc-stack.c`, `malloc-local-nonconst-invalid.c` byte-identical.
   (test/EndToEnd/malloc-string-fill.c, test/Import/C/string-fill-lift.c,
   test/Import/C/string-fill-reject-{byteread,varfill,nonascii,buggyinc}.c)
+
+- [x] FR-65 Runtime-sized heap buffer → Rust `Vec<T>` (W4.5 heap memory-model
+  change, the **Vec arm of the {array, Vec, span, Option} representation
+  match**; owner-signed-off — the request that authorized this increment IS the
+  RFC sign-off the Vec backend needed). A pointer/heap local is classified into
+  exactly ONE representation: **array** (`malloc`/`calloc` whose size folds to a
+  compile-time constant → `[T; N]` + i64 cursor, FR-39 Part A, untouched),
+  **Vec** (a **runtime** element count of a non-char scalar, used only via
+  `a[i]` + `free` → `Vec<T>`, THIS increment), **span** (a non-owning pointer
+  parameter → `&[T]`/`&mut [T]`, untouched), or **Option** (a nullable
+  pointer/handle → `Option<_>`, untouched), else rejected. The importer
+  previously REJECTED a runtime-sized non-char buffer outright (`int *a =
+  malloc(n * sizeof(int))` with a runtime `n` fails `recordAllocBase`'s
+  compile-time-constant size gate → the located `unsupported: allocation size is
+  not a compile-time constant`). Unlike the FR-64 `String` arm, `Vec<T>` has
+  `IndexMut`, so arbitrary `a[i] = x` / `x = a[i]` are safe in pure safe Rust —
+  there is NO constant-fill restriction. `T *a = malloc(n * sizeof(T))` /
+  `calloc(n, sizeof(T))` for a non-char arithmetic scalar `T`
+  (int/short/long/long long/float/double + unsigned forms; char/signed/unsigned
+  char are the FR-64 String/byte domain, claimed first) used ONLY through `a[i]`
+  indexing and `free` lifts to `let a: Vec<T> = vec![<zero>; n as usize];` — the
+  malloc a real heap `Vec` allocation (the ONE new op `emitrust.vec_fill`: an
+  `i64` count + a suffixed-zero `StrAttr` → `!emitrust.opaque<"Vec<T>">`,
+  rendered `vec![<fill>; (<count>) as usize]`), `free` a no-op (the `Vec` drops
+  at scope end), and every `a[i]` routed to the existing STL-vector index place
+  (`emitrust.subscript`, shared with the C++ `std::vector` path — `mut` inferred
+  automatically). The `a[i] = x` writes are KEPT as real index writes (NO
+  statement elision, unlike FR-64).
+  **SPIKE VERDICT: GO (2026-08-06).** Hand-drove the target emission for a fixed
+  runtime input end-to-end (`emitrust-cc --emit=crate --build` vs `clang
+  -std=c11`): byte-IDENTICAL for `n > 0` and `n == 0` (an empty `Vec`, never
+  indexed). Resolved unknowns: `vec![0; n]` (zero-init) is the sound refinement
+  of `malloc`'s indeterminate bytes (a defined program writes each element
+  before reading it; `calloc` matches exactly — the same rule the array backing
+  already uses); `Vec` `a[i]` panic-on-OOB is an owner-accepted UB refinement
+  (Q3, design.md:4821); the count widens to `usize`; NO shape forced `unsafe`.
+  **RECOGNITION is conservative (unprovable → the historical located rejection,
+  never a miscompile), pure-AST in `planVecLift`** (mirrors `planStringFill`,
+  runs right after it so char buffers are claimed by the String arm first;
+  before the pointer-region emission passes consult `vecValueLocals` via
+  `vecValueLocalQuery`). All clauses must hold: a local `T *a =
+  malloc(count * sizeof(T))` / `calloc(count, sizeof(T))` with a non-char scalar
+  pointee mapping to a supported Rust element width; a runtime element count
+  extracted from the size (`count*sizeof(T)`, `sizeof(T)*count`, `count*K` with
+  `K == sizeof(T)`, `calloc(count, sizeof(T))`) that does NOT fold via the array
+  arm's `evalFoldableInt` resolver (a foldable-const size stays the array arm's
+  domain — the arms are DISJOINT, so `malloc-local-flat.c` is byte-identical);
+  a NON-NEGATIVE count (an unsigned type on the PEELED core, since `count *
+  sizeof(T)` promotes the operand to `size_t` — a signed possibly-negative count
+  would produce a huge failed `size_t` malloc in C but a panicking `vec![]` in
+  Rust); a side-effect-free count reading only vars unwritten in the function;
+  and `a` used ONLY as an `a[i]` subscript base or a `free(a)` argument — every
+  DeclRefExpr to `a` must be accounted for, so a byte-arithmetic `a++`/`a+k`, an
+  `&a[i]` element escape, `&a`, `p = a`, `return a`, passing `a` to a function,
+  `*a`, a NULL compare/reassign, or a second alloc leaves the buffer UNLIFTED.
+  Gates (all green): new `test/EndToEnd/malloc-vec-fill.c` byte-diffs the built
+  crate against the clang native for a non-foldable `argc`-derived count
+  covering `n > 0` and `n == 0`; `test/Import/C/vec-fill-lift.c` pins the
+  `vec_fill`/`Vec<i32>` binding with `emitrust.subscript` read+write and no
+  surviving `free`; five `vec-fill-reject-*.c` goldens keep the located
+  rejection for pointer arithmetic, an escape/return, an alias, function-passing,
+  and a char element; full lit 539/539 (CMake and `meson test` parity); emitted
+  Rust `unsafe=0`; `controller.py gate` PASS (114 crates, unsafe=0, no new
+  allow); strict additivity — `malloc-local-flat.c`,
+  `malloc-local-nonconst-invalid.c`, and the FR-64 `string-fill-*` goldens
+  byte-identical. Documented follow-ons (not built): a Vec pointer-arithmetic /
+  cursor model, a Vec→`&mut [T]` span bridge for function-passing/return, struct
+  elements (`vec![T::default(); n]`), a nullable buffer → `Option<Vec<T>>`, and
+  `VecDeque`/`mpsc` (design.md:1187-1199).
+  (test/EndToEnd/malloc-vec-fill.c, test/Import/C/vec-fill-lift.c,
+  test/Import/C/vec-fill-reject-{ptrarith,escape,alias,funcpass,char}.c)
 
 ## C99 Support Roadmap
 
