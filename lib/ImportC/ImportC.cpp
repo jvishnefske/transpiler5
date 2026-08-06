@@ -1100,6 +1100,12 @@ void PointerRegionAnalysis::poisonRecordPointerFields(
 
 void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
                                                const clang::Expr *rhs) {
+  // FR-64: a recognized constant-fill string local is lifted whole to
+  // `String::repeat`, so its `malloc`/`calloc` binding is not modeled as a
+  // flat heap backing — leave the region untracked entirely (the emitter
+  // routes the local to its `String` binding and never consults this region).
+  if (stringValueLocalQuery && stringValueLocalQuery(ptr))
+    return;
   const clang::Expr *e = stripTrivia(rhs);
   clang::SourceLocation loc = e->getBeginLoc();
 

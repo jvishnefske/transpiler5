@@ -37,6 +37,12 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
   // dereference a null `stmt` into a crash if a new path ever slips through.
   if (!stmt)
     return success();
+  // FR-64: the constant-fill loop and NUL terminator of a lifted string
+  // buffer are fused into its `String::repeat` binding at the decl site, so
+  // they emit nothing here. (The `free` call is intercepted in the free
+  // handler, not elided.)
+  if (stringFillElidedStmts.contains(stmt))
+    return success();
   Location loc = translateLoc(stmt->getBeginLoc());
 
   if (const auto *compound = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {
@@ -198,6 +204,13 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
     }
     return emitError(loc) << "unsupported: extern local variable";
   }
+  // FR-64: a recognized constant-fill string buffer lifts whole to a
+  // `let a: String = "c".repeat(n as usize)` binding, replacing the pointer
+  // decomposition entirely (its fill loop, NUL store, and `free` are fused
+  // or elided). Checked before every pointer/owner path so the `char *`
+  // never reaches the region model.
+  if (stringFillLocals.contains(var))
+    return emitStringFillLocal(var, loc);
   // An owner-promoted array (Phase 4) declares the owner struct variable
   // instead; every direct access rewrites to the struct's "data" member.
   if (ownerPlans.contains(var))
@@ -1251,6 +1264,37 @@ CImporter::getOrCreateLiteralBacking(const clang::StringLiteral *literal,
     return failure();
   literalBackings[literal] = *backing;
   return *backing;
+}
+
+LogicalResult CImporter::emitStringFillLocal(const clang::VarDecl *var,
+                                             Location loc) {
+  // FR-64: the fused lowering of the C `char *a = malloc(N+1); for (i=0;
+  // i<N; ++i) a[i]=C; a[N]='\0';` constant-fill idiom into a single owned
+  // `String` binding. The fill loop and NUL store are elided (see
+  // `stringFillElidedStmts`); `free(a)` is a no-op; every consumer prints the
+  // `String` by `Display`. `planStringFill` proved every soundness clause
+  // (constant ASCII fill, unsigned/non-negative count, size >= count+1, no
+  // byte read/escape/return), so emission is unconditional here.
+  const StringFillFacts &facts = stringFillLocals[var];
+  auto stringType = emitrust::OpaqueType::get(builder.getContext(), "String");
+  Value place = createVariablePlace(
+      loc, stringType,
+      var->getName().empty() ? std::string() : mangleMemberName(var->getName()));
+  symbols[var] = place;
+  // The fill count `N` is imported once at the decl site; it is loop-invariant
+  // and reads only variables unwritten in the function, so its value equals
+  // the loop's per-iteration bound. Widen to i64 for the `.repeat` count.
+  FailureOr<Value> count = emitRValue(facts.countExpr);
+  if (failed(count))
+    return failure();
+  Value count64 = castToIntType(loc, *count, builder.getIntegerType(64));
+  Value repeated =
+      builder
+          .create<emitrust::StringRepeatOp>(
+              loc, stringType, count64,
+              builder.getStringAttr(std::string(1, facts.fillChar)))
+          .getResult();
+  return storeToPlace(loc, place, repeated);
 }
 
 LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
@@ -3555,6 +3599,11 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
         while (const clang::Expr *peeled = peelPointerCast(astContext(), arg))
           arg = stripTrivia(peeled);
         if (const clang::VarDecl *root = asLoadedLocalVarRef(arg)) {
+          // FR-64: `free` of a lifted `String` local is a no-op — the
+          // `String` drops at scope end, exactly the deallocation `free`
+          // denotes (escape/return are rejected, so ownership is single).
+          if (stringFillLocals.contains(root))
+            return success();
           auto it = pointerLocals.find(root);
           if (it != pointerLocals.end() && it->second.backing)
             return success();
@@ -4313,6 +4362,20 @@ CImporter::emitPrintfStringArg(const clang::Expr *expr,
   // predefined identifier's `const char[N]` lvalue type.
   const clang::Expr *arg = expr->IgnoreParenImpCasts();
   Location loc = translateLoc(arg->getBeginLoc());
+  // FR-64: a lifted constant-fill string local prints its `String` by
+  // `Display` — load the value directly (rendered `a`, auto-borrowed by the
+  // format macro), bypassing the i8-slice `__emitrust_cstr` `%s` path. A
+  // precision on such an argument is not modeled (the buffer has no NUL-free
+  // suffix contract), so it keeps the historical rejection below.
+  if (!precision)
+    if (const clang::VarDecl *local = asLoadedLocalVarRef(arg))
+      if (stringFillLocals.contains(local)) {
+        auto stringType =
+            emitrust::OpaqueType::get(builder.getContext(), "String");
+        return builder
+            .create<emitrust::LoadOp>(loc, stringType, symbols[local])
+            .getResult();
+      }
   // W2.3: `printf("%s", s.c_str())` — the idiomatic C++ shape, since
   // `std::string` has no implicit conversion to `const char*` — borrows
   // the String place shared, exactly like `__emitrust_sprintf`'s staged

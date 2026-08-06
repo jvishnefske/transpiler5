@@ -283,6 +283,28 @@ LogicalResult LiteralOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// StringRepeatOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult StringRepeatOp::verify() {
+  // The result must be exactly `String` — the op only ever constructs one.
+  auto opaque = dyn_cast<OpaqueType>(getResult().getType());
+  if (!opaque || opaque.getValue() != "String")
+    return emitOpError() << "result type must be !emitrust.opaque<\"String\">";
+  // The fill must be a single ASCII byte in 0x01..0x7F: a valid, non-NUL,
+  // single-byte UTF-8 scalar, so the produced `String`'s bytes equal the C
+  // buffer's bytes exactly (the byte-diff soundness gate).
+  StringRef fill = getFill();
+  if (fill.size() != 1)
+    return emitOpError() << "fill must be exactly one character";
+  unsigned char byte = static_cast<unsigned char>(fill[0]);
+  if (byte < 0x01 || byte > 0x7F)
+    return emitOpError()
+           << "fill byte must be ASCII 0x01..0x7F (single-byte UTF-8, non-NUL)";
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // AssignOp
 //===----------------------------------------------------------------------===//
 
