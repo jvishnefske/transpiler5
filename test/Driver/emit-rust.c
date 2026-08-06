@@ -16,10 +16,9 @@ int main(void) {
   return 0;
 }
 
-// The allow-header comes first: only dead_code and unused_assignments remain
-// allowed (both intrinsic to a faithful transpile); every other lint is denied
-// in Cargo.toml.
-// CHECK: #![allow(dead_code, unused_assignments)]
+// The allow-header comes first: only dead_code remains allowed (intrinsic to a
+// faithful transpile); every other lint is denied in Cargo.toml.
+// CHECK: #![allow(dead_code)]
 
 // The helper function keeps its name; C main is renamed to c_main.
 // CHECK: fn twice(x: i32) -> i32 {

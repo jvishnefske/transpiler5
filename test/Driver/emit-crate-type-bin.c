@@ -52,7 +52,7 @@ int main(void) {
 // BINLAYOUT: main.rs
 // BINLAYOUT-NOT: lib.rs
 
-// BIN: #![allow(dead_code, unused_assignments)]
+// BIN: #![allow(dead_code)]
 // BIN: fn tu0_helper(x: i32) -> i32 {
 // BIN: fn doubled(x: i32) -> i32 {
 // BIN: fn c_main() -> i32 {

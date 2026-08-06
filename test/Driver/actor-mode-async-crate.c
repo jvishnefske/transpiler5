@@ -27,6 +27,7 @@
 // TOML-NEXT: edition = "2021"
 // TOML:      [lints.rust]
 // TOML-NEXT: unused_variables = "deny"
+// TOML-NEXT: unused_assignments = "deny"
 // TOML-NEXT: unused_mut = "deny"
 // TOML-NEXT: unused_parens = "deny"
 // TOML-NEXT: unpredictable_function_pointer_comparisons = "deny"

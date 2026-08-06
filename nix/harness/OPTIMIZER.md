@@ -39,8 +39,8 @@ candidate is trustworthy.
   change seems to need it, the change is wrong.
 - **No new allow-attribute.** Do not silence a lint with `#[allow(...)]`; emit
   the idiomatic form. Only the established crate-root header
-  (`#![allow(dead_code, unused_assignments)]`) is permitted, and the gate
-  rejects any allow-line outside the champion's recorded set.
+  (`#![allow(dead_code)]`) is permitted, and the gate rejects any allow-line
+  outside the champion's recorded set.
 - **No behaviour change.** The emitted program must compute exactly what it did
   — the byte-diff oracle is the arbiter, and a "prettier" emission that shifts a
   byte of stdout is a miscompile, not a cleanup.

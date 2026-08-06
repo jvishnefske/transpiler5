@@ -61,6 +61,7 @@ int axis_of(int which) { return which == 0 ? AXIS_X : AXIS_Y; }
 // The [lints.rust] deny table follows the [lib] section, same as for a binary.
 // LIBTOML:      [lints.rust]
 // LIBTOML-NEXT: unused_variables = "deny"
+// LIBTOML-NEXT: unused_assignments = "deny"
 // LIBTOML-NEXT: unused_mut = "deny"
 // LIBTOML-NEXT: unused_parens = "deny"
 // LIBTOML-NEXT: unpredictable_function_pointer_comparisons = "deny"
@@ -74,7 +75,7 @@ int axis_of(int which) { return which == 0 ? AXIS_X : AXIS_Y; }
 // LIBLAYOUT-NOT: main.rs
 
 // The allow-header is emitted for a library exactly as for a binary.
-// LIB: #![allow(dead_code, unused_assignments)]
+// LIB: #![allow(dead_code)]
 
 // Types are exported unconditionally, with their fields and variant
 // constants: Rust's private-in-public rule (E0446) means a type named in an

@@ -602,6 +602,11 @@ private:
   /// Populates `deadStores` for the function's entry block.
   void computeDeadStores(Block &entryBlock);
 
+  /// Extends `deadStores` with the one narrow loop-body shape that is decidable
+  /// without cross-iteration liveness: a partial store whose binding is wholly
+  /// overwritten at the top of every iteration and is not live-out of the loop.
+  void computeLoopBodyDeadStores(Block &entryBlock);
+
   /// FR-61a: the function-final `emitrust.return` of the current function --
   /// the last op the entry-block walk emits -- rendered as a tail expression
   /// (operand only, no `return`, no `;`) or, when it has no operand, omitted.
@@ -1307,6 +1312,43 @@ void RustEmitter::computeDeferredInits(Block &block) {
   });
 }
 
+/// Whether `binding` is ever borrowed (`&v` / `&mut v` / a slice borrow). A
+/// borrow can alias the binding, so a store's value could be observed through
+/// the reference even when no direct read of the binding follows -- such a
+/// binding is excluded from loop-body dead-store elision.
+static bool bindingIsBorrowed(Value binding) {
+  for (Operation *user : binding.getUsers())
+    if (isa<emitrust::AddrOfOp, emitrust::SliceOfOp>(user))
+      return true;
+  return false;
+}
+
+/// Whether the first op in `body` (in program order) that touches `binding` is
+/// an unconditional whole overwrite of it (`binding = ..` at the top level of
+/// the body block). This is the per-iteration kill that lets a partial store
+/// later in the body be dropped without cross-iteration liveness: entering the
+/// body, the binding is clobbered before anything reads it, so nothing a prior
+/// iteration left in it survives. A first touch that is a read, a partial
+/// write, or nested under control flow does not qualify.
+static bool firstBodyTouchIsWholeWrite(Block &body, Value binding) {
+  Operation *first = nullptr;
+  for (Operation *user : binding.getUsers()) {
+    // Lift the user to its top-level ancestor inside `body`; skip users that
+    // live outside this loop body entirely.
+    Operation *top = user;
+    while (top && top->getBlock() != &body)
+      top = top->getParentOp();
+    if (!top)
+      continue;
+    if (!first || top->isBeforeInBlock(first))
+      first = top;
+  }
+  if (!first)
+    return false;
+  auto assign = dyn_cast<emitrust::AssignOp>(first);
+  return assign && assign.getVar() == binding;
+}
+
 void RustEmitter::computeDeadStores(Block &entryBlock) {
   llvm::SmallPtrSet<Operation *, 16> dead;
   // Only stores in the function's entry block are analyzed: `analyzeSeq` from
@@ -1336,6 +1378,70 @@ void RustEmitter::computeDeadStores(Block &entryBlock) {
       dead.insert(&op);
   }
   deadStores = std::move(dead);
+  computeLoopBodyDeadStores(entryBlock);
+}
+
+void RustEmitter::computeLoopBodyDeadStores(Block &entryBlock) {
+  // The one loop-body dead store that FR-61f's range-for lift did not already
+  // remove: a partial store (`v[i] = ..`, `v.f = ..`) inside a loop body whose
+  // binding is unconditionally overwritten AS A WHOLE at the top of every
+  // iteration and is never read after the loop. That top-of-body overwrite is a
+  // local, per-iteration kill -- the value the partial store leaves behind
+  // cannot reach the next iteration's reads (they follow the overwrite) nor
+  // escape the loop (the binding is not live-out), so the property is decided
+  // from the body block plus the post-loop tail ALONE. No cross-iteration
+  // liveness is involved: that path miscompiled three times (CLAUDE.md) and is
+  // still off-limits. This exception is kept deliberately narrow -- loops that
+  // are direct children of the entry block, single-block bodies, a binding
+  // hoisted above the loop with no escaping borrow.
+  for (Operation &loopOp : entryBlock) {
+    if (!isa<emitrust::ForOp, emitrust::WhileOp, emitrust::LoopOp>(&loopOp))
+      continue;
+    // `emitrust.while` keeps its body in region 1 (region 0 is the condition);
+    // `for`/`loop` bodies are region 0.
+    Region &bodyRegion = isa<emitrust::WhileOp>(&loopOp) ? loopOp.getRegion(1)
+                                                         : loopOp.getRegion(0);
+    if (bodyRegion.empty() || !bodyRegion.hasOneBlock())
+      continue;
+    Block &body = bodyRegion.front();
+    for (Operation &op : body) {
+      auto assign = dyn_cast<emitrust::AssignOp>(&op);
+      if (!assign || unreachableOps.count(&op) || deadStores.count(&op))
+        continue;
+      Value target = assign.getVar();
+      Value binding = projectionBase(target);
+      // Only PARTIAL stores are candidates: a whole write is either the very
+      // overwrite that provides the per-iteration kill or has its own analysis.
+      if (target == binding)
+        continue;
+      Operation *def = binding.getDefiningOp();
+      if (!def || !isa<emitrust::LetOp, emitrust::VariableOp>(def))
+        continue;
+      // The binding must be hoisted ABOVE the loop; a loop-local `let` is a
+      // different, unhandled shape.
+      if (def->getBlock() == &body)
+        continue;
+      if (bindingIsBorrowed(binding))
+        continue;
+      // Per-iteration kill: the binding's first touch in the body is a whole
+      // overwrite (so the back-edge cannot carry this store's value forward).
+      if (!firstBodyTouchIsWholeWrite(body, binding))
+        continue;
+      // Not read in the remainder of this iteration, up to the back-edge.
+      if (analyzeSeq(std::next(op.getIterator()), body.end(), binding,
+                     /*enteringWritten=*/false, /*brk=*/nullptr,
+                     /*partialWriteBlocks=*/false)
+              .readFirst)
+        continue;
+      // Not live-out: not read after the loop before the function ends.
+      if (analyzeSeq(std::next(loopOp.getIterator()), entryBlock.end(), binding,
+                     /*enteringWritten=*/false, /*brk=*/nullptr,
+                     /*partialWriteBlocks=*/false)
+              .readFirst)
+        continue;
+      deadStores.insert(&op);
+    }
+  }
 }
 
 /// FR-61b: returns the `emitrust.assign` to `binding` that is `region`'s
