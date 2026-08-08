@@ -50,7 +50,7 @@ acceptance = """
 [[tasks]]
 id = "task-003"
 title = "vector front/back/pop_back + string push_back/clear (W2.6)"
-status = "todo"
+status = "done"
 deps = ["task-001"]
 acceptance = """
 - Widen the STL method if-chains in emitStlMemberCall

@@ -2480,6 +2480,37 @@ CImporter::emitStlVectorIndexPlace(Value receiver,
 }
 
 FailureOr<Value>
+CImporter::emitStlVectorEndPlace(Value receiver,
+                                 emitrust::OpaqueType vectorType, bool isFront,
+                                 Location loc) {
+  llvm::StringRef spelling = vectorType.getValue();
+  // Strip the "Vec<" prefix and trailing ">".
+  Type elementType =
+      parseStlElementType(spelling.substr(4, spelling.size() - 5));
+  if (!elementType)
+    return emitError(loc) << "unsupported: " << (isFront ? "front" : "back")
+                          << " element type";
+  Value index;
+  if (isFront) {
+    index = builder.create<arith::ConstantOp>(loc, builder.getIndexAttr(0))
+                .getResult();
+  } else {
+    Value len = builder
+                    .create<emitrust::MethodCallOp>(
+                        loc, TypeRange{builder.getIndexType()}, receiver,
+                        builder.getStringAttr("len"), ValueRange{})
+                    .getResult(0);
+    Value one = builder.create<arith::ConstantOp>(loc, builder.getIndexAttr(1))
+                    .getResult();
+    index = builder.create<arith::SubIOp>(loc, len, one).getResult();
+  }
+  return builder
+      .create<emitrust::SubscriptOp>(
+          loc, emitrust::LValueType::get(elementType), receiver, index)
+      .getResult();
+}
+
+FailureOr<Value>
 CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
   const clang::CXXMethodDecl *method = call->getMethodDecl();
@@ -2573,6 +2604,29 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
         return failure();
       return loadPlace(loc, *place);
     }
+    // W2.6: front()/back() lower to index places (`v[0]` /
+    // `v[v.len() - 1]`), shared with emitLValue's value-read path.
+    if (methodName == "front" || methodName == "back") {
+      if (call->getNumArgs() != 0)
+        return emitError(loc)
+               << "unsupported: " << methodName << " takes no arguments";
+      FailureOr<Value> place = emitStlVectorEndPlace(
+          *receiver, opaque, /*isFront=*/methodName == "front", loc);
+      if (failed(place))
+        return failure();
+      return loadPlace(loc, *place);
+    }
+    if (methodName == "pop_back") {
+      // `pop_back` on an empty vector is C++ UB; Rust's `pop` is simply a
+      // no-op there (returns None) — a benign refinement. The Option result
+      // is deliberately unbound (statement position).
+      if (call->getNumArgs() != 0)
+        return emitError(loc) << "unsupported: pop_back takes no arguments";
+      builder.create<emitrust::MethodCallOp>(loc, TypeRange(), *receiver,
+                                             builder.getStringAttr("pop"),
+                                             ValueRange{});
+      return Value();
+    }
     return emitError(loc) << "unsupported: std::vector::" << methodName
                           << " is not a recognized STL method";
   }
@@ -2581,6 +2635,33 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
     return emitLenCall();
   if (methodName == "empty")
     return emitEmptyCall();
+  // W2.6: push_back(c) is the method spelling of `+= 'c'` and reuses its
+  // exact emission (`push(c as char)` via the printf-'%c' ASCII policy in
+  // wrapCharFormat); clear() mirrors the vector spelling.
+  if (methodName == "push_back") {
+    if (call->getNumArgs() != 1)
+      return emitError(loc)
+             << "unsupported: push_back requires exactly one argument";
+    if (!call->getArg(0)->getType().getCanonicalType()->isIntegerType())
+      return emitError(loc)
+             << "unsupported: std::string::push_back argument type";
+    FailureOr<Value> argument = emitRValue(call->getArg(0));
+    if (failed(argument))
+      return failure();
+    Value character = wrapCharFormat(loc, *argument);
+    builder.create<emitrust::MethodCallOp>(loc, TypeRange(), *receiver,
+                                           builder.getStringAttr("push"),
+                                           ValueRange{character});
+    return Value();
+  }
+  if (methodName == "clear") {
+    if (call->getNumArgs() != 0)
+      return emitError(loc) << "unsupported: clear takes no arguments";
+    builder.create<emitrust::MethodCallOp>(loc, TypeRange(), *receiver,
+                                           builder.getStringAttr("clear"),
+                                           ValueRange{});
+    return Value();
+  }
   if (methodName == "c_str")
     return emitError(loc)
            << "unsupported: std::string::c_str() is only recognized as a "

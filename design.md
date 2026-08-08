@@ -7240,6 +7240,34 @@ since the 00204 wave, 00204.c pass).
   (test/Import/Cpp/cpp-init-statements.cpp;
   test/EndToEnd/cpp-init-statements.cpp; test/Cpp17Suite/expected-pass.txt)
 
+- [x] W2.6 STL method expansion (task-003): vector `front()`/`back()`/
+  `pop_back()`, string `push_back(char)`/`clear()`. Spike verdict GO with
+  these spellings, all reusing existing ops (zero emitter changes):
+  front/back lower to SUBSCRIPT PLACES (`v[0]` / `v[v.len() - 1]`,
+  index-typed operands so no `as usize` cast) via a new shared helper
+  `emitStlVectorEndPlace` — C++ front/back on an empty vector is UB, so
+  Rust's index panic (or the usize-underflow panic feeding `len - 1`) is
+  a safe refinement, never silent wrong data; pop_back is a bare
+  discarded `pop` (`v.pop();` — Vec::pop is not `#[must_use]`, verified
+  warning-free; empty pop_back is C++ UB, a benign None no-op here);
+  string push_back reuses `operator+= char`'s exact emission
+  (`push(c as char)` through wrapCharFormat's ASCII policy); string clear
+  mirrors the vector spelling. Because front/back return `T&`, a scalar
+  value read reaches `emitLValue`'s `CXXMemberCallExpr` case (the same
+  `CK_LValueToRValue` route `at()` took in W2.3) — that case widened from
+  `at`-only to at/front/back, sharing the same two-consumer place
+  contract. The stl-invalid BADMETHOD split flipped from `pop_back` (now
+  supported) to `resize` to keep pinning the rejection tail.
+  Gates: corpus 00301-00302 flipped UNSUPPORTED->PASS, Cpp17Suite ledger
+  ratcheted to exactly 9 PASS / 17 UNSUPPORTED / 0 MISCOMPILE; new pins
+  test/Import/Cpp/stl-methods.cpp (IR spellings) and
+  test/EndToEnd/stl-methods.cpp (byte-diff vs clang++, two seeds,
+  back-after-pop observability); the 41-test C++ slice passes; C path
+  untouched by construction (every new path is behind
+  `isInStdNamespace()`).
+  (test/Import/Cpp/stl-methods.cpp, stl-invalid.cpp;
+  test/EndToEnd/stl-methods.cpp; test/Cpp17Suite/expected-pass.txt)
+
 ## Track 5 Third-party validation (external demand signal)
 
 Track 4's corpus is authored by this project. That has now produced two
