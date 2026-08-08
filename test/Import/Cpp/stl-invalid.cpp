@@ -59,13 +59,14 @@ int use(void) {
 
 //--- bad-vector-method.cpp
 #include <vector>
-// Only push_back/size/operator[]/at/empty/clear are recognized; every
-// other vector method (pop_back, back, front, insert, erase, begin/end,
-// ...) is a located rejection naming the entity.
-// BADMETHOD: bad-vector-method.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::vector::pop_back is not a recognized STL method
+// Only push_back/size/operator[]/at/empty/clear (W2.3) plus
+// front/back/pop_back (W2.6) are recognized; every other vector method
+// (insert, erase, resize, reserve, begin/end, ...) is a located rejection
+// naming the entity. (This split used pop_back until W2.6 landed it.)
+// BADMETHOD: bad-vector-method.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::vector::resize is not a recognized STL method
 int use(void) {
   std::vector<int> v;
-  v.pop_back();
+  v.resize(3);
   return 0;
 }
 

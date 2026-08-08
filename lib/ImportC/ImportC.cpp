@@ -4977,11 +4977,22 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
   }
   if (const auto *memberCall = llvm::dyn_cast<clang::CXXMemberCallExpr>(e)) {
     const clang::CXXMethodDecl *method = memberCall->getMethodDecl();
-    if (method && method->getParent()->isInStdNamespace() &&
-        method->getDeclName().isIdentifier() && method->getName() == "at") {
-      if (memberCall->getNumArgs() != 1)
-        return emitError(loc) << "unsupported: at requires exactly one "
-                                 "argument";
+    // W2.6 widened the W2.3 `at()`-only case: `front()`/`back()` also
+    // return `T&` in real C++, so a scalar value read of either reaches
+    // here through the same `CK_LValueToRValue` route as `at()`.
+    llvm::StringRef stlPlaceMethod =
+        method && method->getParent()->isInStdNamespace() &&
+                method->getDeclName().isIdentifier()
+            ? method->getName()
+            : llvm::StringRef();
+    if (stlPlaceMethod == "at" || stlPlaceMethod == "front" ||
+        stlPlaceMethod == "back") {
+      bool isAt = stlPlaceMethod == "at";
+      if (memberCall->getNumArgs() != (isAt ? 1u : 0u))
+        return emitError(loc)
+               << "unsupported: " << stlPlaceMethod
+               << (isAt ? " requires exactly one argument"
+                        : " takes no arguments");
       FailureOr<Value> receiver = emitLValue(
           memberCall->getImplicitObjectArgument()->IgnoreParenImpCasts());
       if (failed(receiver))
@@ -4995,8 +5006,11 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
         return emitError(loc)
                << "unsupported: member call receiver is not a recognized "
                   "std::vector";
-      return emitStlVectorIndexPlace(*receiver, opaqueType,
-                                     memberCall->getArg(0), loc, "at");
+      if (isAt)
+        return emitStlVectorIndexPlace(*receiver, opaqueType,
+                                       memberCall->getArg(0), loc, "at");
+      return emitStlVectorEndPlace(*receiver, opaqueType,
+                                   /*isFront=*/stlPlaceMethod == "front", loc);
     }
   }
   // A compound literal is an lvalue in C99 (C99-13): its place is the

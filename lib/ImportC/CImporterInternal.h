@@ -2556,6 +2556,19 @@ private:
                                            Location loc,
                                            llvm::StringRef opName);
 
+  /// W2.6: `front()`/`back()` PLACE implementation over a `Vec<T>`
+  /// receiver: the `emitrust.subscript` place at index-typed 0 (`v[0]`)
+  /// or `len - 1` (`v[v.len() - 1]`; index-typed operands render bare, no
+  /// `as usize`). C++ front/back on an empty vector is UB; Rust's index
+  /// panic (or the usize-underflow panic feeding `len - 1`) is a safe
+  /// refinement. Same two consumer shapes as `emitStlVectorIndexPlace`:
+  /// loaded by `emitStlMemberCall`'s statement-discard path, consumed
+  /// as-is by `emitLValue`'s `CXXMemberCallExpr` case (the path a scalar
+  /// value read takes, since both return `T&` behind `CK_LValueToRValue`).
+  FailureOr<Value> emitStlVectorEndPlace(Value receiver,
+                                         emitrust::OpaqueType vectorType,
+                                         bool isFront, Location loc);
+
   /// W2.3: imports the (possibly implicit) `CXXConstructExpr` initializing
   /// a local of a recognized STL opaque type `stlType`. Supports exactly:
   /// a zero-argument default construction (`Vec::new()` / `String::new()`)
