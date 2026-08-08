@@ -64,8 +64,8 @@ acceptance = """
 
 [[tasks]]
 id = "task-004"
-title = "std::array -> opaque [T; N] (W2.7)"
-status = "todo"
+title = "std::array -> !emitrust.array<NxT>, the C-array type (W2.7)"
+status = "done"
 deps = ["task-001"]
 acceptance = """
 - mapStdLibraryType (lib/ImportC/ImportCTypes.cpp) gains the `array` case;

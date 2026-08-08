@@ -344,6 +344,17 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
         if (const auto *compound =
                 llvm::dyn_cast<clang::CompoundLiteralExpr>(unwrapped))
           unwrapped = compound->getInitializer()->IgnoreParenImpCasts();
+        // W2.7: `std::array<T, N> a = {e0, ...};` — the semantic
+        // InitListExpr is STRUCT-shaped (one member, the record's inner
+        // `T[N]`), wrapping the element list one level deep. Peel to the
+        // inner list so the ordinary array-init path below sees the
+        // elements; the mapped type is already `!emitrust.array<NxT>`.
+        if (const auto *outer = llvm::dyn_cast<clang::InitListExpr>(unwrapped);
+            outer && outer->getNumInits() == 1 &&
+            isStdArrayRecordType(var->getType()))
+          if (const auto *inner =
+                  llvm::dyn_cast<clang::InitListExpr>(outer->getInit(0)))
+            unwrapped = inner;
         if (const auto *literal =
                 llvm::dyn_cast<clang::StringLiteral>(unwrapped))
           return emitStringArrayInit(place, *mlirType, literal);

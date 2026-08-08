@@ -389,6 +389,15 @@ Type CImporter::parseStlElementType(llvm::StringRef spelling) {
   return emitrust::StructType::get(context, spelling);
 }
 
+bool CImporter::isStdArrayRecordType(clang::QualType type) {
+  const auto *record = type.getCanonicalType()->getAs<clang::RecordType>();
+  if (!record)
+    return false;
+  const clang::RecordDecl *decl = record->getDecl();
+  return decl->isInStdNamespace() && decl->getIdentifier() &&
+         decl->getName() == "array";
+}
+
 bool CImporter::isStlOpaqueType(Type type) {
   auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
   return opaque && (opaque.getValue() == "String" ||
@@ -418,6 +427,27 @@ FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
              << "> element type is not in the supported STL element set";
     return Type(emitrust::OpaqueType::get(builder.getContext(),
                                           "Vec<" + *spelling + ">"));
+  }
+  // W2.7: `std::array<T, N>` maps to the SAME `!emitrust.array<NxT>` a C
+  // `T[N]` maps to — no new opaque family, and every existing array path
+  // (aggregate init, subscript places, struct fields, multi-dim nesting)
+  // applies unchanged. The importer-side special cases are the aggregate
+  // initializer's one-level struct-wrapper peel (emitLocalVar) and the
+  // `size()` member call (a compile-time constant N).
+  if (name == "array" && spec) {
+    const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+    if (args.size() < 2 ||
+        args[0].getKind() != clang::TemplateArgument::Type ||
+        args[1].getKind() != clang::TemplateArgument::Integral)
+      return emitError(loc)
+             << "unsupported: std::array shape could not be determined";
+    FailureOr<Type> element = mapType(args[0].getAsType(), loc);
+    if (failed(element))
+      return failure();
+    uint64_t size = args[1].getAsIntegral().getZExtValue();
+    if (size == 0)
+      return emitError(loc) << "unsupported: zero-length std::array";
+    return Type(emitrust::ArrayType::get(builder.getContext(), size, *element));
   }
   if (name == "basic_string") {
     if (spec) {

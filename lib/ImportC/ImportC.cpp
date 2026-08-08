@@ -4963,6 +4963,25 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
       if (failed(receiver))
         return failure();
       auto lvalueType = llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+      // W2.7: a `std::array<T, N>` receiver is an `!emitrust.array<NxT>`
+      // place — build the identical `emitrust.subscript` place a C
+      // `a[i]` builds (read AND write positions, like any C array).
+      if (auto arrayType =
+              lvalueType ? llvm::dyn_cast<emitrust::ArrayType>(
+                               lvalueType.getValueType())
+                         : emitrust::ArrayType()) {
+        FailureOr<Value> index = emitRValue(opCall->getArg(1));
+        if (failed(index))
+          return failure();
+        if (!llvm::isa<IntegerType>((*index).getType()))
+          return emitError(loc)
+                 << "unsupported: operator[] index must be an integer";
+        return builder
+            .create<emitrust::SubscriptOp>(
+                loc, emitrust::LValueType::get(arrayType.getElementType()),
+                *receiver, *index)
+            .getResult();
+      }
       auto opaqueType = lvalueType ? llvm::dyn_cast<emitrust::OpaqueType>(
                                          lvalueType.getValueType())
                                    : emitrust::OpaqueType();
