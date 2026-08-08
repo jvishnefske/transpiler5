@@ -1,0 +1,10 @@
+# Cpp17Suite conformance ledger for emitrust-cc.
+# One passing corpus filename per line.  Regenerated via:
+#   run_cpp17_suite.py ... --update
+# Every feature task in docs/plans/tasks.toml flips named
+# corpus entries UNSUPPORTED->PASS and ratchets this ledger
+# forward in the same commit.
+00101.cpp
+00102.cpp
+00103.cpp
+00104.cpp

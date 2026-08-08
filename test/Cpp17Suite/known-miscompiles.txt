@@ -1,0 +1,5 @@
+# Quarantine list for Cpp17Suite: corpus filenames (NNNNN.cpp) that are
+# KNOWN to transpile successfully but produce wrong runtime behavior.
+# Every entry here is an acknowledged, tracked compiler bug -- an
+# unquarantined MISCOMPILE always fails the suite, manifest or not.
+# Keep this file empty except under a tracked, time-boxed investigation.
