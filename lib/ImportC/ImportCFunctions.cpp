@@ -68,7 +68,10 @@ static std::string cxxOverloadParamCode(clang::QualType type) {
 std::string
 CImporter::cxxMethodMangledName(const clang::CXXMethodDecl *method) const {
   const clang::CXXRecordDecl *record = method->getParent();
-  llvm::StringRef structName = assignedStructNames.lookup(record);
+  // `lookup` returns the mapped std::string BY VALUE; binding it to a
+  // StringRef would dangle the moment the temporary dies (observed as
+  // garbage bytes in mangled names under the dylib build).
+  std::string structName = assignedStructNames.lookup(record);
   std::string baseName = cxxMethodBaseName(method);
   // The overload suffix is present only when the class declares MORE THAN
   // ONE method (or constructor) sharing this base name (a genuine C++
@@ -83,7 +86,7 @@ CImporter::cxxMethodMangledName(const clang::CXXMethodDecl *method) const {
     if (cxxMethodBaseName(candidate) == baseName)
       ++sharingCount;
   }
-  std::string mangled = (structName + "_" + llvm::StringRef(baseName)).str();
+  std::string mangled = structName + "_" + baseName;
   if (sharingCount > 1) {
     std::string codes;
     for (const clang::ParmVarDecl *param : method->parameters())
@@ -280,7 +283,9 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   bool cxxHasReceiver = cxxMethod && !cxxMethod->isStatic();
   emitrust::StructType cxxOwnerStructType;
   if (cxxMethod) {
-    llvm::StringRef ownerName =
+    // By-value lookup: a StringRef binding would dangle (see
+    // cxxMethodMangledName).
+    std::string ownerName =
         assignedStructNames.lookup(cxxMethod->getParent());
     if (ownerName.empty()) // Defensive; the class was already imported.
       return emitError(loc) << "unsupported: method of an unimported class";

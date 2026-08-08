@@ -2281,7 +2281,9 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   // always self-consistent with whatever the Rust emitter later prints for
   // that same function inside its `impl` block.
   if (staticMethod) {
-    llvm::StringRef structName =
+    // By-value lookup: a StringRef binding would dangle (see
+    // cxxMethodMangledName).
+    std::string structName =
         assignedStructNames.lookup(staticMethod->getParent());
     if (structName.empty()) // Defensive; the class was already imported.
       return emitError(loc)
