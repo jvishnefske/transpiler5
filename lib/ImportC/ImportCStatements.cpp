@@ -55,6 +55,14 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
     return success();
   if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt)) {
     for (const clang::Decl *decl : declStmt->decls()) {
+      // W2.9: a structured binding (`auto [a, b] = src;`) has its own
+      // desugar; DecompositionDecl IS-A VarDecl, so this must be checked
+      // before the generic local-variable path silently mishandles it.
+      if (const auto *decomp = llvm::dyn_cast<clang::DecompositionDecl>(decl)) {
+        if (failed(emitDecompositionDecl(decomp)))
+          return failure();
+        continue;
+      }
       if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
         if (failed(emitLocalVar(var)))
           return failure();
@@ -538,6 +546,121 @@ CImporter::emitDefaultConstructInit(Value place,
              << "unsupported: default constructor member initializer type";
     if (failed(storeToPlace(fieldLoc, fieldPlace, *value)))
       return failure();
+  }
+  return success();
+}
+
+LogicalResult
+CImporter::emitDecompositionDecl(const clang::DecompositionDecl *decomp) {
+  Location loc = translateLoc(decomp->getLocation());
+  // Only the BY-VALUE form (`auto [a, b] = src;`) is supported: the
+  // holding object is a copy nothing else can alias, so materializing one
+  // scalar local per binding is observably identical (each binding IS a
+  // member of the hidden copy; separate locals only differ in address
+  // identity, which nothing in the subset can observe). The reference
+  // forms (`auto &[a, b]`) alias the SOURCE object — per-binding copies
+  // would miscompile writes — and stay rejected.
+  if (decomp->getType()->isReferenceType())
+    return emitError(loc)
+           << "unsupported: structured binding by reference";
+  clang::QualType holdingType = decomp->getType().getCanonicalType();
+  FailureOr<Type> mapped = mapType(holdingType, loc);
+  if (failed(mapped))
+    return failure();
+  auto structType = llvm::dyn_cast<emitrust::StructType>(*mapped);
+  auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(*mapped);
+  if (!structType && !arrayType)
+    return emitError(loc) << "unsupported: structured binding source type";
+  const clang::Expr *init = decomp->getInit();
+  if (!init)
+    return emitError(loc)
+           << "unsupported: structured binding without an initializer";
+  // The holding value: emitRValue's CXXConstructExpr trivial-copy path
+  // unwraps the copy to its source and loads it whole; a factory-call
+  // initializer is a plain struct-returning call. Non-trivial sources
+  // reject, located, inside emitRValue.
+  FailureOr<Value> holdingValue = emitRValue(init->IgnoreParenImpCasts());
+  if (failed(holdingValue))
+    return failure();
+  if ((*holdingValue).getType() != *mapped)
+    return emitError(loc)
+           << "unsupported: structured binding initializer type";
+  Value holdingPlace = createVariablePlace(loc, *mapped, std::string());
+  if (failed(storeToPlace(loc, holdingPlace, *holdingValue)))
+    return failure();
+  llvm::ArrayRef<clang::BindingDecl *> bindings = decomp->bindings();
+  for (auto [index, binding] : llvm::enumerate(bindings)) {
+    Location bindingLoc = translateLoc(binding->getLocation());
+    Value memberPlace;
+    if (arrayType) {
+      // std::array (and a C array, should one ever reach here) decomposes
+      // element-wise: binding i reads element i.
+      if (index >= arrayType.getSize())
+        return emitError(bindingLoc)
+               << "unsupported: structured binding arity";
+      Value indexValue =
+          builder.create<arith::ConstantOp>(loc, builder.getIndexAttr(index))
+              .getResult();
+      memberPlace = builder
+                        .create<emitrust::SubscriptOp>(
+                            bindingLoc,
+                            emitrust::LValueType::get(
+                                arrayType.getElementType()),
+                            holdingPlace, indexValue)
+                        .getResult();
+    } else {
+      // Struct-shaped sources decompose field-wise, in declaration order.
+      // For std::pair the tuple-like protocol's get<0>/get<1> are BY
+      // DEFINITION .first/.second, so the zip is exact. For any other
+      // record, guard that clang itself bound this binding to the zipped
+      // field (a MemberExpr on that FieldDecl): a user type with a custom
+      // tuple-like protocol (std::tuple_size + get<i>) binds through get
+      // calls instead, and a field-zip desugar of one would miscompile —
+      // reject it, located, rather than guess.
+      const auto *record = holdingType->getAs<clang::RecordType>();
+      const clang::RecordDecl *definition =
+          record ? record->getDecl()->getDefinition() : nullptr;
+      if (!definition)
+        return emitError(bindingLoc)
+               << "unsupported: structured binding source type";
+      llvm::SmallVector<const clang::FieldDecl *> fields;
+      for (const clang::FieldDecl *field : definition->fields())
+        fields.push_back(field);
+      if (fields.size() != bindings.size())
+        return emitError(bindingLoc)
+               << "unsupported: structured binding arity";
+      const clang::FieldDecl *field = fields[index];
+      if (!isStdPairRecordType(holdingType)) {
+        const auto *bound = llvm::dyn_cast_if_present<clang::MemberExpr>(
+            binding->getBinding());
+        if (!bound || bound->getMemberDecl() != field)
+          return emitError(bindingLoc)
+                 << "unsupported: structured binding over a tuple-like "
+                    "protocol type";
+      }
+      if (field->getName().empty())
+        return emitError(bindingLoc)
+               << "unsupported: structured binding over an unnamed field";
+      FailureOr<Type> fieldType = mapType(field->getType(), bindingLoc);
+      if (failed(fieldType))
+        return failure();
+      memberPlace = builder
+                        .create<emitrust::MemberOp>(
+                            bindingLoc,
+                            emitrust::LValueType::get(*fieldType),
+                            holdingPlace,
+                            builder.getStringAttr(field->getName()))
+                        .getResult();
+    }
+    Value value = loadPlace(bindingLoc, memberPlace);
+    Value bindingPlace = createVariablePlace(
+        bindingLoc, value.getType(),
+        binding->getName().empty()
+            ? std::string()
+            : mangleMemberName(binding->getName()));
+    if (failed(storeToPlace(bindingLoc, bindingPlace, value)))
+      return failure();
+    symbols[binding] = bindingPlace;
   }
   return success();
 }

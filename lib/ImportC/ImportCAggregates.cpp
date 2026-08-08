@@ -110,6 +110,15 @@ CImporter::structSymbolName(const clang::RecordDecl *definition,
 
 LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
                                       Location loc) {
+  // W2.9 hardening: a DEPENDENT record — most concretely a class template
+  // partial specialization, which IS-A RecordDecl and so reaches this
+  // path straight from the TU walk (`template <size_t I> struct
+  // std::tuple_element<I, Swapped> {...};`) — has no concrete layout to
+  // import; letting one through used to crash (SIGILL via
+  // llvm_unreachable) instead of rejecting. Located rejection, per the
+  // rejection-is-a-feature rule.
+  if (record->isDependentType())
+    return emitError(loc) << "unsupported: dependent class template";
   const clang::RecordDecl *definition = record->getDefinition();
   if (!definition)
     return success(); // Forward declaration; imported once completed or used.

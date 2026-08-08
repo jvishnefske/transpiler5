@@ -2590,6 +2590,15 @@ private:
                                       const clang::CXXConstructExpr *construct,
                                       Location loc);
 
+  /// W2.9: by-value structured binding (`auto [a, b] = src;`): the
+  /// holding copy materializes into an anonymous place and each
+  /// BindingDecl becomes an ordinary scalar local initialized from the
+  /// zipped field (struct sources) or element (array sources), registered
+  /// in `symbols` so every later reference resolves like a plain local.
+  /// Reference forms and tuple-like-protocol user types stay rejected.
+  LogicalResult
+  emitDecompositionDecl(const clang::DecompositionDecl *decomp);
+
   /// W2.3: imports the (possibly implicit) `CXXConstructExpr` initializing
   /// a local of a recognized STL opaque type `stlType`. Supports exactly:
   /// a zero-argument default construction (`Vec::new()` / `String::new()`)

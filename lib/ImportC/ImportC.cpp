@@ -3882,6 +3882,14 @@ bool CImporter::isByteRegionRecord(const clang::RecordDecl *record) {
   const clang::RecordDecl *definition = record->getDefinition();
   if (!definition)
     return false;
+  // W2.9 hardening: a DEPENDENT record (a class template partial
+  // specialization pattern reaching a TU-scope scan) has no concrete
+  // layout; asking clang for its size (getTypeSizeInChars below) blows
+  // the stack instead of failing. It can never be a byte region.
+  // importRecord separately rejects it, located, if an import is ever
+  // attempted.
+  if (definition->isDependentType())
+    return false;
   auto it = byteRegionRecords.find(definition);
   if (it != byteRegionRecords.end())
     return it->second;
