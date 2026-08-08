@@ -2569,6 +2569,14 @@ private:
                                          emitrust::OpaqueType vectorType,
                                          bool isFront, Location loc);
 
+  /// W2.7: whether `type` is a `std::array<T, N>` specialization (the one
+  /// std-namespace record that maps to a non-opaque type,
+  /// `!emitrust.array<NxT>`; see mapStdLibraryType). Used where the
+  /// CLANG-side shape needs distinguishing — the aggregate initializer's
+  /// struct-wrapper peel — since the mapped type alone is
+  /// indistinguishable from a C array's.
+  bool isStdArrayRecordType(clang::QualType type);
+
   /// W2.3: imports the (possibly implicit) `CXXConstructExpr` initializing
   /// a local of a recognized STL opaque type `stlType`. Supports exactly:
   /// a zero-argument default construction (`Vec::new()` / `String::new()`)

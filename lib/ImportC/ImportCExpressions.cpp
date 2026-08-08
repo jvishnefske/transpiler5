@@ -2526,6 +2526,30 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
     return failure();
   auto receiverLValueType =
       llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+  // W2.7: a `std::array<T, N>` receiver maps to `!emitrust.array<NxT>`,
+  // not an opaque — its one recognized method is `size()`, a compile-time
+  // constant N (emitted index-typed, then cast to the call's declared
+  // C type, mirroring emitLenCall's cast convention below).
+  if (receiverLValueType) {
+    if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(
+            receiverLValueType.getValueType())) {
+      if (methodName == "size" && call->getNumArgs() == 0) {
+        Value n = builder
+                      .create<arith::ConstantOp>(
+                          loc, builder.getIndexAttr(arrayType.getSize()))
+                      .getResult();
+        FailureOr<Type> resultType = mapType(call->getType(), loc);
+        if (failed(resultType))
+          return failure();
+        auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+        if (!intType)
+          return emitError(loc) << "unsupported: size result type";
+        return builder.create<emitrust::CastOp>(loc, intType, n).getResult();
+      }
+      return emitError(loc) << "unsupported: std::array::" << methodName
+                            << " is not a recognized STL method";
+    }
+  }
   auto opaque = receiverLValueType ? llvm::dyn_cast<emitrust::OpaqueType>(
                                          receiverLValueType.getValueType())
                                    : emitrust::OpaqueType();
