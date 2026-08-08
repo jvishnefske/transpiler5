@@ -7392,6 +7392,44 @@ since the 00204 wave, 00204.c pass).
   test/EndToEnd/cpp-structured-bindings.cpp;
   test/Cpp17Suite/expected-pass.txt)
 
+- [x] W2.10 Ranged-for over container locals (task-007; R3 spike-gated,
+  verdict GO on ALL THREE forms including the `&`-mutation stretch goal).
+  New `CXXForRangeStmt` case in emitStmt dispatching to
+  `emitCXXForRangeStmt`: a len()-bounded counted CFG loop (i64 counter
+  cell — an index-typed `arith.cmpi` does not legalize through
+  convert-to-emitrust, found by the spike's first build; an i64 subscript
+  index renders `[i as usize]` like the existing at()/[] paths), the
+  condition re-reading `len()` (vector) or the constant N (std::array)
+  each iteration. R3 mitigation, enforced not assumed: the range must be
+  a bare LOCAL DeclRefExpr resolving through `symbols`, and the body may
+  not name the range variable AT ALL (conservative descendant scan of the
+  ORIGINAL body, which never contains the compiler's __range/__begin/
+  __end references) — so the only access path into the container is the
+  loop variable and the length is loop-invariant by construction, making
+  the len()-per-iteration desugar exact against C++'s evaluate-end-once
+  semantics. A by-value loop variable is a fresh per-iteration copy in
+  its own place (writes never touch the container; pinned end-to-end); a
+  REFERENCE loop variable's symbol binds directly to the per-iteration
+  `emitrust.subscript` place, so element reads and writes go through the
+  container — the mutation form needed no other machinery, which is why
+  the stretch goal GOed. break/continue ride the existing loopStack.
+  The stl-invalid RANGEDFOR pin FLIPPED from "unsupported statement:
+  CXXForRangeStmt" to the new frontier, "ranged-for body may not use the
+  range variable" (a body push_back would silently diverge otherwise).
+  Init-statement ranged-for (`for (init; x : v)`) stays rejected.
+  Gates: corpus 00701-00703 flipped UNSUPPORTED->PASS (00702 included:
+  mutation-form spike GO), Cpp17Suite ledger ratcheted to exactly 19 PASS
+  / 7 UNSUPPORTED / 0 MISCOMPILE — the 7 remaining are the copy-elision
+  sensor (00801) and the six 009xx frontier markers, the corpus's
+  designed steady state; new pins test/Import/Cpp/stl-ranged-for.cpp
+  (len-cast-compare chain, per-iteration copy place, the `&` form binding
+  the subscript place with no named copy, constant-N array bound) and
+  test/EndToEnd/stl-ranged-for.cpp (byte-diff vs clang++: copy-does-not-
+  leak, mutation-lands, break/continue, array form, two seeds); the C++
+  slice passes; C path untouched (CXXForRangeStmt never appears in C).
+  (test/Import/Cpp/stl-ranged-for.cpp, stl-invalid.cpp;
+  test/EndToEnd/stl-ranged-for.cpp; test/Cpp17Suite/expected-pass.txt)
+
 ## Track 5 Third-party validation (external demand signal)
 
 Track 4's corpus is authored by this project. That has now produced two

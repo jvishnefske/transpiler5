@@ -137,15 +137,19 @@ int use(void) {
 
 //--- ranged-for.cpp
 #include <vector>
-// Ranged-for over a vector is OUT this wave: `CXXForRangeStmt` has no
-// statement-import case at all (deferred, not merely unrecognized-method
-// rejected), so it falls through the EXISTING generic statement dispatch
-// exactly like W2.0's try/catch baseline (cpp-basics-invalid.cpp).
-// RANGEDFOR: ranged-for.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported statement: CXXForRangeStmt
+// W2.10 FLIPPED this pin: ranged-for over a container local now imports
+// (test/Import/Cpp/stl-ranged-for.cpp). The frontier moved to the R3
+// safety restriction: the loop BODY may not name the range variable at
+// all — that is the guarantee that the container's length is
+// loop-invariant, which is what makes the len()-per-iteration desugar
+// exact against C++'s evaluate-end-once semantics (a push_back inside
+// the body would diverge silently otherwise).
+// RANGEDFOR: ranged-for.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: ranged-for body may not use the range variable
 int use(void) {
   std::vector<int> v;
   int total = 0;
   for (int x : v) {
+    v.push_back(x);
     total += x;
   }
   return total;

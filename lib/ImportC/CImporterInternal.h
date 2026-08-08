@@ -2599,6 +2599,15 @@ private:
   LogicalResult
   emitDecompositionDecl(const clang::DecompositionDecl *decomp);
 
+  /// W2.10: ranged-for over a recognized container local (Vec<T> opaque
+  /// or std::array-mapped !emitrust.array), lowered to a len()-bounded
+  /// counted CFG loop. Restrictions (the R3 end-evaluation mitigation):
+  /// the range must be a bare local DeclRefExpr and the body may not name
+  /// the range variable, so the length is loop-invariant by construction.
+  /// A by-value loop variable is a fresh per-iteration copy; a reference
+  /// loop variable binds directly to the per-iteration element place.
+  LogicalResult emitCXXForRangeStmt(const clang::CXXForRangeStmt *stmt);
+
   /// W2.3: imports the (possibly implicit) `CXXConstructExpr` initializing
   /// a local of a recognized STL opaque type `stlType`. Supports exactly:
   /// a zero-argument default construction (`Vec::new()` / `String::new()`)
