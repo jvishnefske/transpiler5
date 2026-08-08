@@ -7139,6 +7139,74 @@ since the 00204 wave, 00204.c pass).
   (test/Import/Cpp/stl-vector.cpp, stl-string.cpp, stl-invalid.cpp;
   test/EndToEnd/stl-vector.cpp, stl-string.cpp)
 
+- [x] W2.4 C++17 feature corpus + conformance ratchet (`test/Cpp17Suite/`),
+  the measurement infrastructure for the W2.5–W2.10 implementation loop
+  (`docs/plans/tasks.toml`). A 26-program in-repo corpus of small C++17
+  programs (`Inputs/NNNNN.cpp`), each printing deterministic output through
+  the `extern "C" printf` channel and exiting 0, paired with committed
+  `.expected` files generated ONCE at authoring time from `clang++
+  -std=c++17` native runs. Hundreds-block per feature group: 001xx day-one
+  PASS seeds (vector, string, methods/overloads, namespaces/NSDMI), 002xx
+  if/switch-with-init, 003xx vector/string method expansion, 004xx
+  `std::array`, 005xx `std::pair`, 006xx structured bindings, 007xx
+  ranged-for, 00801 a corpus-only copy-elision sensor (counting copy-ctor
+  factory; C++17 guarantees elision for the prvalue return, so `copies=0`
+  is the only correct output — if the transpiler ever silently accepts
+  copy-ctors and materializes an extra copy, the ratchet flags MISCOMPILE),
+  009xx frontier markers with no implementation task (virtual call,
+  try/catch, lambda, `std::optional`, `std::string_view`, `std::variant`).
+  The runner `run_cpp17_suite.py` is a DELIBERATE clone of the proven
+  `test/CTestSuite/run_c_testsuite.py` (not a shared module; zero refactor
+  risk to the C ledger): tri-state classification (UNSUPPORTED is a legal
+  steady state — that count IS the frontier measurement; MISCOMPILE is
+  always fatal unless quarantined in `known-miscompiles.txt`, which is
+  committed empty), two-way `expected-pass.txt` manifest (regressions AND
+  unrecorded improvements both hard-fail — a forgotten `--update` is
+  uncommittable), `--update` ratchets forward. Deltas from the clone
+  source only: `--suite` points at `Inputs/` directly, glob `*.cpp`,
+  manifest header reworded. Single lit entry `cpp17-suite.cpp`
+  (`REQUIRES: cargo`, the c-testsuite fake-suffix trick); the corpus lives
+  under `Inputs/` precisely because lit's `config.excludes` skips it, so
+  no corpus file is discovered as an individual test; no CMake/meson
+  change needed (`add_lit_testsuite` discovers the test tree
+  recursively). Spike found and fixed a REAL pre-existing miscompile-class
+  bug: `cxxMethodMangledName` (and two siblings in `importFunction` /
+  `emitStlOperatorCall`'s static-method path) bound `llvm::StringRef` to
+  the TEMPORARY `std::string` returned by-value from
+  `assignedStructNames.lookup()` — dangling-pointer UB that happened to
+  survive the static-archive link but produced garbage mangled names
+  (`'h�^m _new'`) under the meson dylib build, failing
+  `cpp-defaulted-ctor`/`cpp-methods-overload` at HEAD; all three sites now
+  bind the owned `std::string`. R1 probe (structured bindings might
+  silently mis-import — `DecompositionDecl` IS-A `VarDecl`): all of
+  00601-00603 reject with LOCATED diagnostics today (pair/array via the
+  STL-type rejection, user-struct via the copy-construction rejection),
+  no silent wrong code, so no task-001 guard was needed. Ratchet
+  directions hand-verified: deleting a passing entry from the manifest
+  fails with "improvement(s) ... re-run with --update", adding a
+  non-passing entry fails with "regression(s)". Day-one ledger: 4 PASS
+  (00101-00104) / 22 UNSUPPORTED / 0 MISCOMPILE.
+  Gates (measured on a machine where HEAD itself is NOT green — pristine
+  HEAD fails every system-header test here, `'vector' file not found`,
+  pending the separately-in-flight Darwin sysroot/libc++ configure-time
+  baking in lib/ImportC/CMakeLists.txt + meson): validated on BOTH
+  available configurations instead. (1) The working copy's meson build
+  (which carries the in-flight sysroot fix): 515/540, cpp17-suite PASSES,
+  every Import/Cpp and EndToEnd cpp-* test passes, all 25 failures are
+  hosted-libc/link-merge tests owned by that in-flight work, none in this
+  wave's blast radius. (2) A clean worktree at HEAD + exactly this wave's
+  diff (CMake, no sysroot fix): every non-system-header test passes; the
+  system-header failures are attributable to the missing sysroot alone
+  (header lookup fails in clang's preprocessor, before any imported-code
+  path this wave touches). The
+  dangling-StringRef fix was verified directly: cpp-defaulted-ctor,
+  cpp-methods-overload, and Import/Cpp/methods.cpp fail at pristine HEAD
+  under the meson dylib link and pass with the fix, byte-identical
+  goldens.
+  (test/Cpp17Suite/cpp17-suite.cpp, run_cpp17_suite.py, expected-pass.txt,
+  known-miscompiles.txt, Inputs/001xx-009xx; docs/plans/tasks.toml;
+  Makefile)
+
 ## Track 5 Third-party validation (external demand signal)
 
 Track 4's corpus is authored by this project. That has now produced two
