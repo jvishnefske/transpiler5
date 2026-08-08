@@ -2577,6 +2577,19 @@ private:
   /// indistinguishable from a C array's.
   bool isStdArrayRecordType(clang::QualType type);
 
+  /// W2.8: whether `type` is a `std::pair<T1, T2>` specialization (which
+  /// imports as a synthesized real struct; see mapStdLibraryType's pair
+  /// case).
+  bool isStdPairRecordType(clang::QualType type);
+
+  /// W2.8: field-wise import of std::pair's two-argument value
+  /// constructor onto `place` (`.first = arg0; .second = arg1;`),
+  /// mirroring emitDefaultConstructInit's member-place shape. No libc++
+  /// constructor body is ever imported.
+  LogicalResult emitPairConstructInit(Value place,
+                                      const clang::CXXConstructExpr *construct,
+                                      Location loc);
+
   /// W2.3: imports the (possibly implicit) `CXXConstructExpr` initializing
   /// a local of a recognized STL opaque type `stlType`. Supports exactly:
   /// a zero-argument default construction (`Vec::new()` / `String::new()`)

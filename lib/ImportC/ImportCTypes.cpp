@@ -398,6 +398,15 @@ bool CImporter::isStdArrayRecordType(clang::QualType type) {
          decl->getName() == "array";
 }
 
+bool CImporter::isStdPairRecordType(clang::QualType type) {
+  const auto *record = type.getCanonicalType()->getAs<clang::RecordType>();
+  if (!record)
+    return false;
+  const clang::RecordDecl *decl = record->getDecl();
+  return decl->isInStdNamespace() && decl->getIdentifier() &&
+         decl->getName() == "pair";
+}
+
 bool CImporter::isStlOpaqueType(Type type) {
   auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
   return opaque && (opaque.getValue() == "String" ||
@@ -448,6 +457,52 @@ FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
     if (size == 0)
       return emitError(loc) << "unsupported: zero-length std::array";
     return Type(emitrust::ArrayType::get(builder.getContext(), size, *element));
+  }
+  // W2.8: `std::pair<T1, T2>` imports as an importer-synthesized REAL
+  // struct (route (b) of the task-005 spike): the specialization's record
+  // genuinely holds just the two public fields `first`/`second`, so
+  // importing it through the ordinary importRecord machinery reuses every
+  // existing struct path (member places read/write, by-value returns,
+  // parameter passing) with zero emitter changes. The struct name is
+  // shape-keyed from the mapped element spellings (`PairI32I32`, ...) and
+  // PRE-SEEDED into assignedStructNames so distinct instantiations — all
+  // spelled `pair` in clang — cannot collide; construction is field-wise
+  // (emitPairConstructInit), since no libc++ method is ever imported.
+  if (name == "pair" && spec) {
+    const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+    if (args.size() < 2 ||
+        args[0].getKind() != clang::TemplateArgument::Type ||
+        args[1].getKind() != clang::TemplateArgument::Type)
+      return emitError(loc)
+             << "unsupported: std::pair shape could not be determined";
+    FailureOr<Type> firstType = mapType(args[0].getAsType(), loc);
+    if (failed(firstType))
+      return failure();
+    FailureOr<Type> secondType = mapType(args[1].getAsType(), loc);
+    if (failed(secondType))
+      return failure();
+    std::optional<std::string> firstSpelling =
+        rustSpellingForElementType(*firstType);
+    std::optional<std::string> secondSpelling =
+        rustSpellingForElementType(*secondType);
+    auto nameable = [](const std::optional<std::string> &spelling) {
+      return spelling && llvm::all_of(*spelling, [](char c) {
+               return llvm::isAlnum(c) || c == '_';
+             });
+    };
+    if (!nameable(firstSpelling) || !nameable(secondSpelling))
+      return emitError(loc) << "unsupported: std::pair element type is not "
+                               "in the supported set";
+    const clang::RecordDecl *definition = decl->getDefinition();
+    if (!definition)
+      return emitError(loc) << "unsupported: std::pair without a definition";
+    if (!assignedStructNames.contains(definition))
+      assignedStructNames[definition] =
+          typeRustName("Pair_" + *firstSpelling + "_" + *secondSpelling);
+    if (failed(importRecord(definition, loc)))
+      return failure();
+    return Type(emitrust::StructType::get(
+        builder.getContext(), assignedStructNames.lookup(definition)));
   }
   if (name == "basic_string") {
     if (spec) {

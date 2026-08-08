@@ -462,6 +462,14 @@ CImporter::emitCXXConstructInit(Value place,
   if (construct->getNumArgs() == 0 && ctor->isDefaultConstructor() &&
       !ctor->isUserProvided())
     return emitDefaultConstructInit(place, ctor, loc);
+  // W2.8: std::pair's two-argument value constructor assigns the two
+  // fields directly (no libc++ method is ever imported); everything else
+  // about the pair — member access, copies, by-value returns — rides the
+  // ordinary synthesized-struct machinery. Checked before the imported-
+  // constructor lookup, which could never find a std ctor.
+  if (isStdPairRecordType(construct->getType()) &&
+      construct->getNumArgs() == 2)
+    return emitPairConstructInit(place, construct, loc);
   std::string name = cxxMethodMangledName(ctor);
   func::FuncOp target = functions.lookup(name);
   if (!target)
@@ -531,6 +539,51 @@ CImporter::emitDefaultConstructInit(Value place,
     if (failed(storeToPlace(fieldLoc, fieldPlace, *value)))
       return failure();
   }
+  return success();
+}
+
+LogicalResult
+CImporter::emitPairConstructInit(Value place,
+                                 const clang::CXXConstructExpr *construct,
+                                 Location loc) {
+  // Walk the specialization's fields (exactly `first`, `second`, in
+  // declaration order) zipped with the two constructor arguments,
+  // mirroring emitDefaultConstructInit's member-place/assign shape. An
+  // argument whose value cannot import rejects, located, inside
+  // emitRValue.
+  const auto *record =
+      construct->getType().getCanonicalType()->getAs<clang::RecordType>();
+  const clang::RecordDecl *definition = record->getDecl()->getDefinition();
+  if (!definition)
+    return emitError(loc) << "unsupported: std::pair without a definition";
+  unsigned index = 0;
+  for (const clang::FieldDecl *field : definition->fields()) {
+    if (index >= construct->getNumArgs())
+      break;
+    if (field->getName().empty())
+      return emitError(loc) << "unsupported: std::pair field shape";
+    Location fieldLoc = translateLoc(construct->getArg(index)->getBeginLoc());
+    FailureOr<Type> fieldType = mapType(field->getType(), fieldLoc);
+    if (failed(fieldType))
+      return failure();
+    Value fieldPlace =
+        builder
+            .create<emitrust::MemberOp>(
+                fieldLoc, emitrust::LValueType::get(*fieldType), place,
+                builder.getStringAttr(field->getName()))
+            .getResult();
+    FailureOr<Value> value = emitRValue(construct->getArg(index));
+    if (failed(value))
+      return failure();
+    if ((*value).getType() != *fieldType)
+      return emitError(fieldLoc)
+             << "unsupported: std::pair constructor argument type";
+    if (failed(storeToPlace(fieldLoc, fieldPlace, *value)))
+      return failure();
+    ++index;
+  }
+  if (index != construct->getNumArgs())
+    return emitError(loc) << "unsupported: std::pair constructor arity";
   return success();
 }
 
