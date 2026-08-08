@@ -114,7 +114,7 @@ acceptance = """
 [[tasks]]
 id = "task-007"
 title = "ranged-for over vector/array (W2.10) -- risk R3 spike-gated"
-status = "todo"
+status = "done"
 deps = ["task-003", "task-004"]
 acceptance = """
 - New CXXForRangeStmt case in emitStmt (after the ForStmt case), lowering

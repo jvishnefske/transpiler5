@@ -106,6 +106,9 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
     return emitWhileStmt(whileStmt);
   if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt))
     return emitForStmt(forStmt);
+  // W2.10: ranged-for over a recognized container local.
+  if (const auto *rangeFor = llvm::dyn_cast<clang::CXXForRangeStmt>(stmt))
+    return emitCXXForRangeStmt(rangeFor);
   if (const auto *switchStmt = llvm::dyn_cast<clang::SwitchStmt>(stmt))
     return emitSwitchStmt(switchStmt);
   if (llvm::isa<clang::BreakStmt>(stmt)) {
@@ -2496,6 +2499,182 @@ LogicalResult CImporter::emitIfStmt(const clang::IfStmt *stmt) {
   }
 
   builder.setInsertionPointToEnd(contBlock);
+  return success();
+}
+
+/// Whether any descendant of `stmt` is a DeclRefExpr naming `var`.
+/// Conservative body scan for emitCXXForRangeStmt: the original (not
+/// desugared) body never references the compiler-internal __range/__begin/
+/// __end variables, so any hit is a genuine source-level use of the range.
+static bool referencesDecl(const clang::Stmt *stmt,
+                           const clang::ValueDecl *var) {
+  if (!stmt)
+    return false;
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (ref->getDecl() == var)
+      return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (referencesDecl(child, var))
+      return true;
+  return false;
+}
+
+LogicalResult
+CImporter::emitCXXForRangeStmt(const clang::CXXForRangeStmt *stmt) {
+  Location loc = translateLoc(stmt->getForLoc());
+  // R3 (end-evaluation semantics): C++ evaluates the range's end() ONCE;
+  // this desugar re-reads len() each iteration. The two agree exactly
+  // when the container's LENGTH cannot change during the loop, which the
+  // two restrictions below guarantee: the range must be a bare local
+  // DeclRefExpr (no temporaries, no calls), and the loop body may not
+  // name the range variable at all — so the only access path into the
+  // container is the loop variable, and an element write (the `&` form)
+  // can never change the length. Everything else keeps a located
+  // rejection; the CFG shape mirrors emitForStmt's generic lowering.
+  if (stmt->getInit())
+    return emitError(loc)
+           << "unsupported: ranged-for init-statement";
+  const clang::Expr *rangeInit = stmt->getRangeInit()->IgnoreParenImpCasts();
+  const auto *rangeRef = llvm::dyn_cast<clang::DeclRefExpr>(rangeInit);
+  const auto *rangeVar =
+      rangeRef ? llvm::dyn_cast<clang::VarDecl>(rangeRef->getDecl()) : nullptr;
+  if (!rangeVar)
+    return emitError(loc)
+           << "unsupported: ranged-for range must be a named local "
+              "container";
+  auto symbolIt = symbols.find(rangeVar);
+  if (symbolIt == symbols.end())
+    return emitError(loc)
+           << "unsupported: ranged-for range must be a named local "
+              "container";
+  Value rangePlace = symbolIt->second;
+  auto rangeLValue =
+      llvm::dyn_cast<emitrust::LValueType>(rangePlace.getType());
+  if (!rangeLValue)
+    return emitError(loc)
+           << "unsupported: ranged-for range must be a named local "
+              "container";
+  // Element type: a Vec<T> opaque or a std::array-mapped !emitrust.array.
+  auto vecType =
+      llvm::dyn_cast<emitrust::OpaqueType>(rangeLValue.getValueType());
+  auto arrayType =
+      llvm::dyn_cast<emitrust::ArrayType>(rangeLValue.getValueType());
+  Type elementType;
+  if (vecType && isStlOpaqueType(vecType) &&
+      vecType.getValue().starts_with("Vec<")) {
+    llvm::StringRef spelling = vecType.getValue();
+    elementType = parseStlElementType(spelling.substr(4, spelling.size() - 5));
+    if (!elementType)
+      return emitError(loc) << "unsupported: ranged-for element type";
+  } else if (arrayType) {
+    elementType = arrayType.getElementType();
+  } else {
+    return emitError(loc)
+           << "unsupported: ranged-for range is not a recognized container";
+  }
+  if (referencesDecl(stmt->getBody(), rangeVar))
+    return emitError(loc)
+           << "unsupported: ranged-for body may not use the range variable";
+  const clang::VarDecl *loopVar = stmt->getLoopVariable();
+  if (!loopVar)
+    return emitError(loc) << "unsupported: ranged-for loop variable shape";
+  bool byReference = loopVar->getType()->isReferenceType();
+  if (!byReference) {
+    FailureOr<Type> mappedVar = mapType(loopVar->getType(), loc);
+    if (failed(mappedVar))
+      return failure();
+    if (*mappedVar != elementType)
+      return emitError(loc)
+             << "unsupported: ranged-for loop variable type does not match "
+                "the element type";
+  }
+
+  // i = 0; while (i < len) { <bind loop var to element i>; body; i += 1 }
+  // The counter is i64, not index-typed: `convert-to-emitrust` legalizes
+  // integer arith.cmpi but not an index-typed one, and an i64 subscript
+  // index renders as `[i as usize]`, matching the existing at()/[] paths.
+  Type i64 = builder.getIntegerType(64);
+  Value indexCell = createEntryAlloca(loc, i64);
+  Value zero =
+      builder.create<arith::ConstantOp>(loc, builder.getIntegerAttr(i64, 0))
+          .getResult();
+  builder.create<memref::StoreOp>(loc, zero, indexCell);
+
+  Block *condBlock = createBlock();
+  Block *bodyBlock = createBlock();
+  Block *incBlock = createBlock();
+  Block *exitBlock = createBlock();
+  builder.create<cf::BranchOp>(loc, condBlock);
+
+  builder.setInsertionPointToEnd(condBlock);
+  Value current = builder.create<memref::LoadOp>(loc, indexCell).getResult();
+  Value bound;
+  if (vecType) {
+    Value len = builder
+                    .create<emitrust::MethodCallOp>(
+                        loc, TypeRange{builder.getIndexType()}, rangePlace,
+                        builder.getStringAttr("len"), ValueRange{})
+                    .getResult(0);
+    bound = builder.create<emitrust::CastOp>(loc, i64, len).getResult();
+  } else {
+    bound = builder
+                .create<arith::ConstantOp>(
+                    loc, builder.getIntegerAttr(
+                             i64, static_cast<int64_t>(arrayType.getSize())))
+                .getResult();
+  }
+  Value inBounds =
+      builder
+          .create<arith::CmpIOp>(loc, arith::CmpIPredicate::slt, current,
+                                 bound)
+          .getResult();
+  builder.create<cf::CondBranchOp>(loc, inBounds, bodyBlock, ValueRange(),
+                                   exitBlock, ValueRange());
+
+  builder.setInsertionPointToEnd(bodyBlock);
+  Value bodyIndex = builder.create<memref::LoadOp>(loc, indexCell).getResult();
+  Value elementPlace =
+      builder
+          .create<emitrust::SubscriptOp>(
+              loc, emitrust::LValueType::get(elementType), rangePlace,
+              bodyIndex)
+          .getResult();
+  if (byReference) {
+    // The reference loop variable IS the element place: reads load it,
+    // writes assign through it, exactly like a C++ reference local. The
+    // subscript re-executes per iteration at runtime, so every use in the
+    // body sees the current element.
+    symbols[loopVar] = elementPlace;
+  } else {
+    // The by-value loop variable is a fresh per-iteration copy in its own
+    // place (writes to it never touch the container).
+    Value element = loadPlace(loc, elementPlace);
+    Value varPlace = createVariablePlace(
+        loc, elementType,
+        loopVar->getName().empty() ? std::string()
+                                   : mangleMemberName(loopVar->getName()));
+    if (failed(storeToPlace(loc, varPlace, element)))
+      return failure();
+    symbols[loopVar] = varPlace;
+  }
+  loopStack.push_back({exitBlock, incBlock});
+  LogicalResult bodyResult = emitStmt(stmt->getBody());
+  loopStack.pop_back();
+  if (failed(bodyResult))
+    return failure();
+  if (!isTerminated(builder.getInsertionBlock()))
+    builder.create<cf::BranchOp>(loc, incBlock);
+
+  builder.setInsertionPointToEnd(incBlock);
+  Value beforeInc = builder.create<memref::LoadOp>(loc, indexCell).getResult();
+  Value one =
+      builder.create<arith::ConstantOp>(loc, builder.getIntegerAttr(i64, 1))
+          .getResult();
+  Value next = builder.create<arith::AddIOp>(loc, beforeInc, one).getResult();
+  builder.create<memref::StoreOp>(loc, next, indexCell);
+  builder.create<cf::BranchOp>(loc, condBlock);
+
+  builder.setInsertionPointToEnd(exitBlock);
   return success();
 }
 
