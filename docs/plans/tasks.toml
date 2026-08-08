@@ -99,7 +99,7 @@ acceptance = """
 [[tasks]]
 id = "task-006"
 title = "structured bindings (W2.9)"
-status = "todo"
+status = "done"
 deps = ["task-004", "task-005"]
 acceptance = """
 - DecompositionDecl handling in the DeclStmt case of emitStmt
