@@ -309,9 +309,14 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   // (cpp-basics.cpp). Destructor/virtual/operator-overload rejections
   // already ran above, in `collectRecordFields`, before any field of this
   // struct was collected.
+  // W2.8: a std-namespace record's methods are never imported (call sites
+  // intercept them; std::pair's value construction is field-wise), so the
+  // method walk — which would reject e.g. pair's defaulted copy ctor —
+  // must not run on one.
   if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(definition))
-    if (failed(importCXXMethods(cxxRecord)))
-      return failure();
+    if (!cxxRecord->isInStdNamespace())
+      if (failed(importCXXMethods(cxxRecord)))
+        return failure();
   return success();
 }
 
@@ -414,17 +419,26 @@ LogicalResult CImporter::collectRecordFields(
     // half-imports (no struct_def, no methods). Compiler-synthesized
     // special members the class did not itself declare are skipped: they
     // carry none of these three shapes and never surface a diagnostic.
-    for (const clang::CXXMethodDecl *method : cxxRecord->methods()) {
-      if (method->isImplicit() || method->isDeleted())
-        continue;
-      Location methodLoc = translateLoc(method->getLocation());
-      if (llvm::isa<clang::CXXDestructorDecl>(method))
-        return emitError(methodLoc)
-               << "unsupported: user-declared destructor";
-      if (method->isVirtual())
-        return emitError(methodLoc) << "unsupported: virtual method";
-      if (method->isOverloadedOperator())
-        return emitError(methodLoc) << "unsupported: overloaded operator";
+    // W2.8: a std-namespace record (std::pair, the one that imports
+    // through this path) is exempt from the member-shape gate: its
+    // methods (operator=, converting constructors) are NEVER imported —
+    // every std member call is intercepted at the call site — so their
+    // shapes cannot half-import anything. The base-class check above
+    // stays unconditional: a std record with bases would still silently
+    // drop inherited data.
+    if (!cxxRecord->isInStdNamespace()) {
+      for (const clang::CXXMethodDecl *method : cxxRecord->methods()) {
+        if (method->isImplicit() || method->isDeleted())
+          continue;
+        Location methodLoc = translateLoc(method->getLocation());
+        if (llvm::isa<clang::CXXDestructorDecl>(method))
+          return emitError(methodLoc)
+                 << "unsupported: user-declared destructor";
+        if (method->isVirtual())
+          return emitError(methodLoc) << "unsupported: virtual method";
+        if (method->isOverloadedOperator())
+          return emitError(methodLoc) << "unsupported: overloaded operator";
+      }
     }
   }
   // Interns a synthesized or mangled member spelling in the arena so the

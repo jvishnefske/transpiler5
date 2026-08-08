@@ -81,7 +81,7 @@ acceptance = """
 [[tasks]]
 id = "task-005"
 title = "std::pair (W2.8) -- spike REQUIRED first (risk R2)"
-status = "todo"
+status = "done"
 deps = ["task-001"]
 acceptance = """
 - Spike prototypes BOTH routes before committing to one: (a) opaque Rust

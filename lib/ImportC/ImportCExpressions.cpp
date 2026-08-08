@@ -296,6 +296,23 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
     if (ctor && ctor->isCopyOrMoveConstructor() && ctor->isTrivial() &&
         construct->getNumArgs() == 1)
       return emitRValue(construct->getArg(0));
+    // W2.8: a std::pair VALUE construction (`return std::pair<int,int>(q,
+    // r);`, a by-value argument, ...) materializes an anonymous temp
+    // place, runs the field-wise init on it, and loads it whole —
+    // mirroring the compound-literal shape above. C++17's guaranteed
+    // elision means the native leg constructs the target directly; the
+    // temp-and-load models the same single construction (fields assigned
+    // exactly once), so the observable behavior is identical.
+    if (isStdPairRecordType(construct->getType()) &&
+        construct->getNumArgs() == 2) {
+      FailureOr<Type> pairType = mapType(construct->getType(), loc);
+      if (failed(pairType))
+        return failure();
+      Value place = createVariablePlace(loc, *pairType, std::string());
+      if (failed(emitPairConstructInit(place, construct, loc)))
+        return failure();
+      return loadPlace(loc, place);
+    }
     return emitError(loc) << "unsupported: constructor in value position "
                              "(only a trivial copy or move is modeled)";
   }
