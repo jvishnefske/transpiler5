@@ -2245,8 +2245,21 @@ LogicalResult CImporter::emitPointerCompoundAssign(
 
 LogicalResult CImporter::emitIfStmt(const clang::IfStmt *stmt) {
   Location loc = translateLoc(stmt->getIfLoc());
-  if (stmt->getConditionVariable() || stmt->getInit())
-    return emitError(loc) << "unsupported: declaration in if condition";
+  // W2.5: C++17 `if (init; cond)` and the condition-declaration form
+  // (`if (int x = f())`) desugar by hoisting the declarations into the
+  // enclosing block, in source order (the init-statement may itself be
+  // followed by a condition declaration). Both are evaluated exactly once
+  // in C++, so hoisting is exact; the variable outliving the `if`'s C++
+  // scope is unobservable without destructors (outside the subset), and a
+  // later same-named declaration is a distinct VarDecl (locals are keyed
+  // by decl identity), emitted as an ordinary Rust `let` shadowing. Both
+  // getters are always null for C input.
+  if (const clang::Stmt *init = stmt->getInit())
+    if (failed(emitStmt(init)))
+      return failure();
+  if (stmt->getConditionVariable())
+    if (failed(emitStmt(stmt->getConditionVariableDeclStmt())))
+      return failure();
   // A compile-time-constant, side-effect-free condition (a literal, a
   // folded `__builtin_expect(!!(0), 0)`, ...) elides the dead arm BEFORE
   // lowering, so a dead arm may contain constructs that could never lower
@@ -2727,8 +2740,15 @@ LogicalResult CImporter::emitDoStmt(const clang::DoStmt *stmt) {
 
 LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
   Location loc = translateLoc(stmt->getSwitchLoc());
-  if (stmt->getConditionVariable() || stmt->getInit())
-    return emitError(loc) << "unsupported: declaration in switch condition";
+  // W2.5: `switch (init; cond)` and a condition declaration hoist into the
+  // enclosing block exactly like emitIfStmt's desugar (evaluated once;
+  // scope extension unobservable without destructors; null for C input).
+  if (const clang::Stmt *init = stmt->getInit())
+    if (failed(emitStmt(init)))
+      return failure();
+  if (stmt->getConditionVariable())
+    if (failed(emitStmt(stmt->getConditionVariableDeclStmt())))
+      return failure();
 
   // Evaluate the controlling expression to an integer flag. An enum
   // condition arrives behind its integral-promotion cast; it is peeled and

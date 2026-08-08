@@ -33,7 +33,7 @@ acceptance = """
 [[tasks]]
 id = "task-002"
 title = "if/switch with init-statement desugar (W2.5)"
-status = "todo"
+status = "done"
 deps = ["task-001"]
 acceptance = """
 - Replace the located rejections at lib/ImportC/ImportCStatements.cpp
