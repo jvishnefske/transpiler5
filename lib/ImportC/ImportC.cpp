@@ -2211,7 +2211,8 @@ namespace {
 /// classification is only sound once this TU's own Pass-A has run) or
 /// emit a diagnostic (this is a speculative fact-gathering probe, not a
 /// real import step).
-Type mapSpeculativeScalarType(OpBuilder &builder, clang::QualType type) {
+Type mapSpeculativeScalarType(OpBuilder &builder, clang::ASTContext &context,
+                              clang::QualType type) {
   const auto *builtin = llvm::dyn_cast<clang::BuiltinType>(type.getTypePtr());
   if (!builtin)
     return Type();
@@ -2225,7 +2226,9 @@ Type mapSpeculativeScalarType(OpBuilder &builder, clang::QualType type) {
     return builder.getIntegerType(16);
   case clang::BuiltinType::Int:
     return builder.getIntegerType(32);
+  // FR-56 target-width `long`, mirroring `mapType` (see its comment).
   case clang::BuiltinType::Long:
+    return builder.getIntegerType(context.getTypeSize(type));
   case clang::BuiltinType::LongLong:
     return builder.getIntegerType(64);
   case clang::BuiltinType::Float:
@@ -2241,6 +2244,8 @@ Type mapSpeculativeScalarType(OpBuilder &builder, clang::QualType type) {
   case clang::BuiltinType::UInt:
     return IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
   case clang::BuiltinType::ULong:
+    return IntegerType::get(builder.getContext(), context.getTypeSize(type),
+                            IntegerType::Unsigned);
   case clang::BuiltinType::ULongLong:
     return IntegerType::get(builder.getContext(), 64, IntegerType::Unsigned);
   default:
@@ -2265,7 +2270,7 @@ Type mapSpeculativeArrayType(OpBuilder &builder, clang::ASTContext &context,
     return emitrust::ArrayType::get(
         builder.getContext(), array->getSize().getZExtValue(), element);
   }
-  return mapSpeculativeScalarType(builder, type);
+  return mapSpeculativeScalarType(builder, context, type);
 }
 } // namespace
 
@@ -3126,7 +3131,7 @@ CImporter::emitPointerLocalRead(Location loc, const clang::VarDecl *var) {
         isStaticallyNullRegion(pointerRegions.regionOf(var)))
       return PtrExprValue{};
     return emitError(loc) << "unsupported: pointer variable '"
-                          << var->getName()
+                          << canonicalStreamName(var->getName())
                           << "' has no known target object";
   }
   const PointerLocalInfo &info = it->second;
@@ -3264,7 +3269,7 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         return emitError(loc) << "unsupported: pointer parameter used "
                                  "outside a direct dereference";
       return emitError(loc) << "unsupported: pointer variable '"
-                            << var->getName()
+                            << canonicalStreamName(var->getName())
                             << "' has no known target object";
     }
     case clang::CK_ArrayToPointerDecay: {

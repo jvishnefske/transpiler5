@@ -190,12 +190,17 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   // storage of its own: the consumption cursor is the clone's internal
   // cell, and every reference to the object is consumed by the
   // va_start/va_arg/va_end lowerings (the planner verified this).
-  // Outside a clone the type keeps its C99-37 rejection via mapType.
-  if (currentVaCloneActive &&
-      astContext().hasSameType(
-          var->getType().getCanonicalType(),
-          astContext().getBuiltinVaListType().getCanonicalType()))
-    return success();
+  // Outside a clone the type keeps its C99-37 rejection below. Both
+  // checks go through the typedef SUGAR, not the canonical type: on
+  // AArch64 Darwin `__builtin_va_list` is plain `char *`, so a canonical
+  // match would swallow every char* clone-local here and miss the
+  // rejection below entirely (the pointer machinery diverts before
+  // mapType's canonical checks ever run).
+  if (isVaListSugarType(var->getType(), astContext())) {
+    if (currentVaCloneActive)
+      return success();
+    return emitError(loc) << "unsupported: va_list type";
+  }
   // C99-7: pointer locals divert into the decomposition before `mapType`
   // runs, so the volatile scan happens up front for every local shape
   // (including the pointer's own qualifier, `int * volatile p`).
@@ -4116,7 +4121,7 @@ CImporter::emitAliasedPrintf(const clang::CallExpr *call,
         stream ? llvm::dyn_cast<clang::NamedDecl>(stream->getDecl())
                : nullptr;
     if (!streamDecl || !streamDecl->getDeclName().isIdentifier() ||
-        streamDecl->getName() != "stdout")
+        canonicalStreamName(streamDecl->getName()) != "stdout")
       return emitError(translateLoc(call->getArg(0)->getBeginLoc()))
              << "unsupported: a devirtualized fprintf call requires the "
                 "literal 'stdout' stream argument";

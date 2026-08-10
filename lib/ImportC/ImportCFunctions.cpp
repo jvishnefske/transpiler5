@@ -1700,7 +1700,11 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
     // `__emitrust_fmt_edigits` extracts correctly-rounded e-style digits
     // and reports whether rounding carried into the next decade (glibc's
     // %#g drops the mantissa fraction exactly when that carry lands on
-    // ev == P; an exact power of ten keeps it). Non-finite values pad
+    // ev == P; an exact power of ten keeps it). That carry-drop is a
+    // glibc-only quirk — Darwin's libc keeps the zeros ("1.00000e+06"
+    // where glibc prints "1.e+06") — so the emitted shim gates it on
+    // cfg!(target_os = "linux"): the oracle is byte-parity with the HOST
+    // C library the native reference binary links. Non-finite values pad
     // with spaces even under '0', as glibc does. Validated byte-exactly
     // against glibc across structured and fuzzed batteries. Flag bits as
     // in `__emitrust_fmt_int`; conv: 0=f, 1=e, 2=g.
@@ -1784,7 +1788,8 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "            let (m, ev, carried) = "
             "__emitrust_fmt_edigits(mag, pp - 1);\n"
             "            if ev < -4 || ev >= pp as i32 {\n"
-            "                let mut m = if carried && ev == pp as i32 {\n"
+            "                let mut m = if carried && ev == pp as i32\n"
+            "                    && cfg!(target_os = \"linux\") {\n"
             "                    String::from(\"1\")\n"
             "                } else {\n"
             "                    m\n"
