@@ -417,10 +417,20 @@ bool CImporter::isStdPairRecordType(clang::QualType type) {
          decl->getName() == "pair";
 }
 
+bool CImporter::isStdOptionalRecordType(clang::QualType type) {
+  const auto *record = type.getCanonicalType()->getAs<clang::RecordType>();
+  if (!record)
+    return false;
+  const clang::RecordDecl *decl = record->getDecl();
+  return decl->isInStdNamespace() && decl->getIdentifier() &&
+         decl->getName() == "optional";
+}
+
 bool CImporter::isStlOpaqueType(Type type) {
   auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
   return opaque && (opaque.getValue() == "String" ||
-                    opaque.getValue().starts_with("Vec<"));
+                    opaque.getValue().starts_with("Vec<") ||
+                    opaque.getValue().starts_with("Option<"));
 }
 
 FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
@@ -513,6 +523,32 @@ FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
       return failure();
     return Type(emitrust::StructType::get(
         builder.getContext(), assignedStructNames.lookup(definition)));
+  }
+  // W2.11: `std::optional<T>` maps to `!emitrust.opaque<"Option<S>">` where
+  // S is the mapped element's Rust spelling — Rust's `Option<T>` IS the
+  // semantic model (engaged/empty), so no synthesized struct is needed and
+  // the existing opaque machinery (variable places, method_call receivers)
+  // applies unchanged. A nested optional element is OUT this wave:
+  // `Option<Option<T>>` would need `Some(None)` construction shapes the
+  // recognized constructor table cannot spell yet.
+  if (name == "optional" && spec) {
+    const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+    if (args.size() < 1 || args[0].getKind() != clang::TemplateArgument::Type)
+      return emitError(loc)
+             << "unsupported: std::optional element type could not be "
+                "determined";
+    clang::QualType elementType = args[0].getAsType();
+    FailureOr<Type> mappedElement = mapType(elementType, loc);
+    if (failed(mappedElement))
+      return failure();
+    std::optional<std::string> spelling =
+        rustSpellingForElementType(*mappedElement);
+    if (!spelling || llvm::StringRef(*spelling).starts_with("Option<"))
+      return emitError(loc)
+             << "unsupported: std::optional<" << elementType.getAsString()
+             << "> element type is not in the supported STL element set";
+    return Type(emitrust::OpaqueType::get(builder.getContext(),
+                                          "Option<" + *spelling + ">"));
   }
   if (name == "basic_string") {
     if (spec) {

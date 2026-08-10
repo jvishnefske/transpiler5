@@ -293,6 +293,21 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   // (`emitCXXConstructInit`) has a place for.
   if (const auto *construct = llvm::dyn_cast<clang::CXXConstructExpr>(e)) {
     const clang::CXXConstructorDecl *ctor = construct->getConstructor();
+    // W2.11: a std::optional VALUE construction — `return v;` /
+    // `return std::nullopt;` convert through a CXXConstructExpr — routes
+    // to emitStlConstruct, which yields the `Some(v)` / `None` rvalue
+    // directly (no temp place needed; the opaque IS the value). This
+    // interception sits BEFORE the generic trivial-copy unwrap below:
+    // optional<int>'s copy ctor is trivial, so `return a;` (copy of an
+    // existing optional) would otherwise slip through as a whole-value
+    // load; emitStlConstruct's copy/move guard keeps it a located
+    // rejection this wave instead.
+    if (isStdOptionalRecordType(construct->getType())) {
+      FailureOr<Type> optionalType = mapType(construct->getType(), loc);
+      if (failed(optionalType))
+        return failure();
+      return emitStlConstruct(*optionalType, construct, loc);
+    }
     if (ctor && ctor->isCopyOrMoveConstructor() && ctor->isTrivial() &&
         construct->getNumArgs() == 1)
       return emitRValue(construct->getArg(0));
@@ -339,6 +354,16 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
   switch (cast->getCastKind()) {
   case clang::CK_NoOp:
     return emitRValue(sub);
+  case clang::CK_ConstructorConversion:
+    // W2.11: a converting-constructor conversion TO std::optional (`return
+    // v;` / `return std::nullopt;` wrap their CXXConstructExpr in this
+    // cast kind) is the construction itself — recurse so emitRValue's
+    // optional routing sees the construct. Every other constructor
+    // conversion keeps the located rejection below.
+    if (isStdOptionalRecordType(cast->getType()))
+      return emitRValue(sub);
+    return emitError(loc) << "unsupported cast ("
+                          << cast->getCastKindName() << ")";
   case clang::CK_FunctionToPointerDecay:
     // A function used as a value decays to a `Some(name)` fn_ptr constant.
     return emitFunctionPointerConstant(sub, cast->getType(), loc);
@@ -2669,6 +2694,46 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
       return Value();
     }
     return emitError(loc) << "unsupported: std::vector::" << methodName
+                          << " is not a recognized STL method";
+  }
+  // W2.11: std::optional. `has_value()` -> `is_some()` (a genuine bool on
+  // both sides); `value_or(d)` -> `unwrap_or(d)` (identical semantics:
+  // the contained value if engaged, else the default — both by value).
+  // Everything else — value() (panic message differs from the C++
+  // exception), operator*/operator-> (UB when empty; no place model for
+  // the contained value this wave) — is a located rejection.
+  if (typeSpelling.starts_with("Option<")) {
+    if (methodName == "has_value") {
+      if (call->getNumArgs() != 0)
+        return emitError(loc)
+               << "unsupported: has_value takes no arguments";
+      return builder
+          .create<emitrust::MethodCallOp>(loc, TypeRange{builder.getI1Type()},
+                                          *receiver,
+                                          builder.getStringAttr("is_some"),
+                                          ValueRange{})
+          .getResult(0);
+    }
+    if (methodName == "value_or") {
+      if (call->getNumArgs() != 1)
+        return emitError(loc)
+               << "unsupported: value_or requires exactly one argument";
+      Type elementType = parseStlElementType(
+          typeSpelling.substr(7, typeSpelling.size() - 8));
+      FailureOr<Value> argument = emitRValue(call->getArg(0));
+      if (failed(argument))
+        return failure();
+      if (!elementType || (*argument).getType() != elementType)
+        return emitError(loc)
+               << "unsupported: std::optional::value_or argument type";
+      return builder
+          .create<emitrust::MethodCallOp>(loc, TypeRange{elementType},
+                                          *receiver,
+                                          builder.getStringAttr("unwrap_or"),
+                                          ValueRange{*argument})
+          .getResult(0);
+    }
+    return emitError(loc) << "unsupported: std::optional::" << methodName
                           << " is not a recognized STL method";
   }
   // std::string.

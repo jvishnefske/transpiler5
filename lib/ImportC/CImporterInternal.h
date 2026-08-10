@@ -2496,7 +2496,8 @@ private:
 
   /// W2.3 STL recognition: whether `type` is a recognized STL opaque type
   /// (an `!emitrust.opaque` whose value is exactly "String" or begins with
-  /// "Vec<") — the set `mapStdLibraryType` ever produces.
+  /// "Vec<" or, since W2.11, "Option<") — the set `mapStdLibraryType` ever
+  /// produces.
   static bool isStlOpaqueType(Type type);
 
   /// W2.3: the Rust spelling of a MAPPED element type `T` for composing
@@ -2581,6 +2582,14 @@ private:
   /// imports as a synthesized real struct; see mapStdLibraryType's pair
   /// case).
   bool isStdPairRecordType(clang::QualType type);
+
+  /// W2.11: whether `type` is a `std::optional<T>` specialization (which
+  /// maps to the `!emitrust.opaque<"Option<S>">` family; see
+  /// mapStdLibraryType's optional case). Used where the CLANG-side shape
+  /// needs distinguishing: `emitRValue`'s value-position `CXXConstructExpr`
+  /// routing, which must intercept optional construction (`return v;` /
+  /// `return std::nullopt;`) before the generic trivial-copy unwrap.
+  bool isStdOptionalRecordType(clang::QualType type);
 
   /// W2.8: field-wise import of std::pair's two-argument value
   /// constructor onto `place` (`.first = arg0; .second = arg1;`),

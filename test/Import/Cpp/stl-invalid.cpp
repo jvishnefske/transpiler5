@@ -11,6 +11,9 @@
 // RUN: not emitrust-import-c %t/string-index.cpp 2>&1 | FileCheck %s --check-prefix=STRINGINDEX
 // RUN: not emitrust-import-c %t/cstr-elsewhere.cpp 2>&1 | FileCheck %s --check-prefix=CSTRELSEWHERE
 // RUN: not emitrust-import-c %t/ranged-for.cpp 2>&1 | FileCheck %s --check-prefix=RANGEDFOR
+// RUN: not emitrust-import-c %t/optional-copy-ctor.cpp 2>&1 | FileCheck %s --check-prefix=OPTCOPY
+// RUN: not emitrust-import-c %t/optional-value.cpp 2>&1 | FileCheck %s --check-prefix=OPTVALUE
+// RUN: not emitrust-import-c %t/optional-deref.cpp 2>&1 | FileCheck %s --check-prefix=OPTDEREF
 
 // W2.3 located rejections: every construct explicitly OUT of the STL
 // recognition surface this wave, authored so a later wave has a documented
@@ -153,5 +156,45 @@ int use(void) {
     total += x;
   }
   return total;
+}
+
+//--- optional-copy-ctor.cpp
+#include <optional>
+// W2.11 frontier: copy construction of a std::optional is OUT (the same
+// copy/move guard that protects vector/string construction fires first
+// in emitStlConstruct, so the message keeps its established spelling).
+// OPTCOPY: optional-copy-ctor.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::vector/std::string copy/move construction
+int use(void) {
+  std::optional<int> a;
+  std::optional<int> b = a;
+  return 0;
+}
+
+//--- optional-value.cpp
+#include <optional>
+// W2.11 frontier: only has_value()/value_or() are recognized; value()
+// is OUT (Rust's unwrap panic message differs from the C++ exception,
+// so it cannot be silently substituted).
+// (A VALUE-READ of value() — `return a.value();` — is caught even
+// earlier, by the generic assignable-expression rejection in emitLValue,
+// since value() returns `T&`; the statement shape below reaches the
+// optional method table and pins its sharper, entity-naming wording.)
+// OPTVALUE: optional-value.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::optional::value is not a recognized STL method
+int use(void) {
+  std::optional<int> a;
+  a.value();
+  return 0;
+}
+
+//--- optional-deref.cpp
+#include <optional>
+// W2.11 frontier: operator* is OUT (UB when empty; no place model for
+// the contained value this wave) — it reaches emitStlOperatorCall's
+// operator table, whose default arm rejects it.
+// OPTDEREF: optional-deref.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: this STL operator is not a recognized STL method
+int use(void) {
+  std::optional<int> a;
+  *a;
+  return 0;
 }
 

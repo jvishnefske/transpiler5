@@ -336,9 +336,21 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
         const clang::Expr *unwrapped = init->IgnoreParenImpCasts();
         const auto *construct =
             llvm::dyn_cast<clang::CXXConstructExpr>(unwrapped);
-        if (!construct)
+        if (!construct) {
+          // W2.11: a non-CXXConstructExpr initializer of an STL opaque
+          // local — `std::optional<int> a = find_even(8);`, a bare
+          // CallExpr under C++17's guaranteed elision (no ctor wrapper
+          // exists in the AST) — initializes from the loaded rvalue when
+          // its mapped type matches exactly; anything else keeps the
+          // located rejection.
+          FailureOr<Value> value = emitRValue(init);
+          if (failed(value))
+            return failure();
+          if (*value && (*value).getType() == *mlirType)
+            return storeToPlace(loc, place, *value);
           return emitError(loc)
                  << "unsupported: std::vector/std::string initializer";
+        }
         FailureOr<Value> value = emitStlConstruct(*mlirType, construct, loc);
         if (failed(value))
           return failure();
@@ -727,6 +739,60 @@ CImporter::emitStlConstruct(Type stlType,
   if (ctor && ctor->isCopyOrMoveConstructor())
     return emitError(loc)
            << "unsupported: std::vector/std::string copy/move construction";
+  // W2.11: std::optional construction — branched on the spelling BEFORE the
+  // zero-argument String/Vec branch below, which must never see Option.
+  // Recognized shapes: the default ctor and the std::nullopt_t converting
+  // ctor (both render `None`), and the element converting ctor
+  // (`Some(v)`). libstdc++/libc++ declare no defaulted trailing parameters
+  // on these, but a CXXDefaultArgExpr-filled trailing argument is treated
+  // as absent for shape classification, mirroring the String literal ctor.
+  if (opaque.getValue().starts_with("Option<")) {
+    auto emitNone = [&]() -> FailureOr<Value> {
+      return builder
+          .create<emitrust::LiteralOp>(loc, stlType,
+                                       builder.getStringAttr("None"))
+          .getResult();
+    };
+    llvm::SmallVector<const clang::Expr *> realArgs;
+    for (const clang::Expr *arg : construct->arguments())
+      if (!llvm::isa<clang::CXXDefaultArgExpr>(arg))
+        realArgs.push_back(arg);
+    // (i) `std::optional<T> o;` / (ii) all-defaulted arguments -> None.
+    if (realArgs.empty())
+      return emitNone();
+    // (iii) the std::nullopt_t converting ctor -> None.
+    const clang::Expr *first = realArgs.front()->IgnoreParenImpCasts();
+    if (const auto *record =
+            first->getType().getCanonicalType()->getAs<clang::RecordType>();
+        record && record->getDecl()->isInStdNamespace() &&
+        record->getDecl()->getIdentifier() &&
+        record->getDecl()->getName() == "nullopt_t")
+      return emitNone();
+    // (iv) the element converting ctor -> Some(v). The inner spelling
+    // round-trips through parseStlElementType so the argument's mapped
+    // type must equal the element type exactly (no implicit conversion
+    // surface beyond what clang already materialized in the AST).
+    if (realArgs.size() == 1) {
+      llvm::StringRef spelling = opaque.getValue();
+      Type elementType =
+          parseStlElementType(spelling.substr(7, spelling.size() - 8));
+      FailureOr<Value> value = emitRValue(realArgs.front());
+      if (failed(value))
+        return failure();
+      if (elementType && (*value).getType() == elementType)
+        return builder
+            .create<emitrust::CallOpaqueOp>(loc, TypeRange{stlType},
+                                            builder.getStringAttr("Some"),
+                                            /*args=*/ArrayAttr(),
+                                            ValueRange{*value})
+            .getResult(0);
+    }
+    // (v) anything else (in-place construction, converting from another
+    // optional's element set, ...) stays a located rejection.
+    return emitError(loc)
+           << "unsupported: this std::optional constructor shape is not "
+              "supported";
+  }
   // Zero-argument construction: `std::vector<T> v;` / `std::string s;` (an
   // ALWAYS-significant initializer, unlike a POD struct's vacuous default
   // ctor — see `isVacuousDefaultConstruct` — since neither's default ctor
