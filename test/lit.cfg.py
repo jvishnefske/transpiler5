@@ -1,6 +1,7 @@
 # -*- Python -*-
 
 import os
+import platform
 import shutil
 
 import lit.formats
@@ -29,7 +30,30 @@ config.test_exec_root = os.path.join(config.emitrust_obj_root, "test")
 config.substitutions.append(("%PATH%", config.environment["PATH"]))
 config.substitutions.append(("%shlibext", config.llvm_shlib_ext))
 
+# The `.emitrust` payload section emitrust-clang embeds needs a
+# "<segment>,<section>" spelling on Mach-O (llvm-objcopy rejects a flat
+# ELF-style name there); tests that strip/dump it with llvm-objcopy directly
+# use this substitution instead of hardcoding the ELF spelling. Matches
+# emitRustSectionSpec in emitrust-clang.cpp.
+if platform.system() == "Darwin":
+    config.available_features.add("system-darwin")
+config.substitutions.append((
+    "%emitrust_section_spec",
+    "__TEXT,__emitrust" if platform.system() == "Darwin" else ".emitrust",
+))
+
 llvm_config.with_system_environment(["HOME", "INCLUDE", "LIB", "TMP", "TEMP"])
+
+# The EndToEnd --build tests have cargo invoke rustc, whose Darwin linker
+# step resolves the SDK from $SDKROOT and otherwise shells out to
+# `xcrun --show-sdk-path`, which fails inside the sandboxed test
+# environment ("error: unable to find sdk: 'macosx'"). The nix dev shell
+# exports a correct SDKROOT; forward it. (The IMPORTER deliberately does
+# not rely on this — it bakes the SDK path in at configure time, see
+# darwinSysrootArg — this is only for the rustc/cc subprocesses tests
+# spawn.)
+if platform.system() == "Darwin":
+    llvm_config.with_system_environment(["SDKROOT"])
 
 # use_default_substitutions provides FileCheck, not, count, %s, %t, etc.
 llvm_config.use_default_substitutions()

@@ -28,7 +28,7 @@
 // library object and archive BOTH copies. The bare member is skipped with a
 // warning (archive members have no sidecar to fall back to), the payload
 // member still resolves `add`, and the output is unchanged:
-// RUN: llvm-objcopy --remove-section .emitrust %t.lib.o %t.bare.o
+// RUN: llvm-objcopy --remove-section %emitrust_section_spec %t.lib.o %t.bare.o
 // RUN: rm -f %t.mixed.a
 // RUN: llvm-ar rcs %t.mixed.a %t.bare.o %t.lib.o
 // RUN: emitrust-cc --link %t.main.o %t.mixed.a --emit=rust -o %t.mixed.rs 2>%t.warn.txt

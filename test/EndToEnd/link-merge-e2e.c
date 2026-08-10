@@ -44,7 +44,7 @@
 //
 // Sidecar FALLBACK: an object whose `.emitrust` section is missing (here:
 // stripped) falls back to the `<obj>.emitrust.mlirbc` sidecar next to it:
-// RUN: llvm-objcopy --remove-section .emitrust %t.main.o %t.stripped.o
+// RUN: llvm-objcopy --remove-section %emitrust_section_spec %t.main.o %t.stripped.o
 // RUN: cp %t.main.o.emitrust.mlirbc %t.stripped.o.emitrust.mlirbc
 // RUN: emitrust-cc --link %t.stripped.o %t.lib.o --emit=rust -o %t.fallback.rs
 // RUN: diff %t.joint.rs %t.fallback.rs
