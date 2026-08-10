@@ -68,6 +68,64 @@ std::optional<std::string> clangResourceDirArg() {
   return "-resource-dir=" + resourceDir;
 }
 
+#ifdef __APPLE__
+/// Returns `-isysroot<path>` so clang can find Darwin's system headers
+/// (`<stdio.h>`, `<math.h>`, ...). `FixedCompilationDatabase`/`ClangTool`
+/// invoke clang's frontend directly and never run `clang::driver::Driver`'s
+/// SDK auto-detection, so without this every host header the importer's
+/// test corpora `#include` is invisible on macOS.
+///
+/// Deliberately NOT resolved by reading `$SDKROOT`/shelling out to `xcrun`
+/// at run time, the way an earlier version of this function did: lit
+/// sandboxes the test environment (`with_system_environment` only forwards
+/// a small allowlist, and `SDKROOT` isn't in it), and even when a stray
+/// `DEVELOPER_DIR` from the nix dev shell DID leak through, it pointed
+/// `xcrun` at a bare SDK store path with no `Info.plist`, so the real
+/// system `xcrun` failed to resolve `-sdk macosx` and printed its error
+/// text to stdout, which then got parsed as if it were the path. Baking
+/// the SDK path in at CONFIGURE time — the same trick `clangResourceDirArg`
+/// already uses for the resource dir, in the CMakeLists.txt/meson.build
+/// probes next to this file — sidesteps the whole problem: it runs inside
+/// the real nix dev shell, once, and the answer is immune to whatever
+/// environment a later test invocation happens to have. `EMITRUST_SYSROOT`
+/// is still honored at run time, for a user overriding the SDK outside the
+/// nix shell.
+std::optional<std::string> darwinSysrootArg() {
+  std::string sysroot;
+  if (const char *env = std::getenv("EMITRUST_SYSROOT"))
+    sysroot = env;
+#ifdef EMITRUST_CLANG_SYSROOT
+  if (sysroot.empty())
+    sysroot = EMITRUST_CLANG_SYSROOT;
+#endif
+  if (sysroot.empty())
+    return std::nullopt;
+  return "-isysroot" + sysroot;
+}
+
+/// Returns `-isystem<dir>` for libc++'s headers (`<vector>`, `<string>`,
+/// ...), needed for the same reason `darwinSysrootArg` is: the nix clang
+/// WRAPPER injects this path into every invocation of the `clang`/`clang++`
+/// shell script by default (independent of `NIX_CFLAGS_COMPILE` — it is
+/// part of the wrapper's own baked-in configuration), but `FixedCompilationDatabase`/
+/// `ClangTool` call into the frontend in-process and never run that wrapper
+/// script at all, so C++ imports otherwise fail on the very first standard
+/// header. Baked in at configure time (`EMITRUST_CLANG_LIBCXX_DIR`), same
+/// as the resource dir and sysroot probes next to this file.
+std::optional<std::string> darwinLibcxxArg() {
+  std::string libcxxDir;
+  if (const char *env = std::getenv("EMITRUST_LIBCXX_DIR"))
+    libcxxDir = env;
+#ifdef EMITRUST_CLANG_LIBCXX_DIR
+  if (libcxxDir.empty())
+    libcxxDir = EMITRUST_CLANG_LIBCXX_DIR;
+#endif
+  if (libcxxDir.empty())
+    return std::nullopt;
+  return "-isystem" + libcxxDir;
+}
+#endif
+
 /// Assembles the clang command line for one input, selecting the C or C++
 /// frontend from `isCxx` (W2.0 per-input language selection): plain C
 /// stays `-std=c11` (historical, unchanged); C++ opens with `-x c++
@@ -93,6 +151,21 @@ buildCommandLine(bool isCxx, llvm::ArrayRef<std::string> extraClangArgs) {
             : std::vector<std::string>{"-std=c11", "-Wno-error=int-conversion"};
   if (std::optional<std::string> resourceDirArg = clangResourceDirArg())
     commandLine.push_back(*resourceDirArg);
+#ifdef __APPLE__
+  if (std::optional<std::string> sysrootArg = darwinSysrootArg())
+    commandLine.push_back(*sysrootArg);
+  if (isCxx)
+    if (std::optional<std::string> libcxxArg = darwinLibcxxArg())
+      commandLine.push_back(*libcxxArg);
+  // The Darwin SDK defaults `_USE_FORTIFY_LEVEL` to 2 when `_FORTIFY_SOURCE`
+  // is undefined, macro-rewriting `strcpy`/`sprintf`/... call sites into
+  // `__builtin___*_chk` builtins the importer does not model (the importer's
+  // hosted surface is the ISO C names). Level 0 keeps the standard spellings;
+  // the check-vs-unchecked call is behavior-identical for a well-defined
+  // program, so the EndToEnd byte-diff against the (fortified) native build
+  // is unaffected.
+  commandLine.push_back("-D_FORTIFY_SOURCE=0");
+#endif
   commandLine.insert(commandLine.end(), extraClangArgs.begin(),
                      extraClangArgs.end());
   return commandLine;
@@ -177,7 +250,8 @@ filterRecordedCommandLine(llvm::ArrayRef<std::string> recorded,
   std::vector<std::string> args;
   if (recorded.empty())
     return args;
-  args.push_back(isCxxDriverName(recorded.front()) ? "clang++" : "clang-tool");
+  bool isCxx = isCxxDriverName(recorded.front());
+  args.push_back(isCxx ? "clang++" : "clang-tool");
 
   // Driver-only flags that consume the following argument when spelled
   // separately, and that also accept it joined ("-ofoo.o", "-MFfoo.d").
@@ -206,6 +280,15 @@ filterRecordedCommandLine(llvm::ArrayRef<std::string> recorded,
 
   if (std::optional<std::string> resourceDirArg = clangResourceDirArg())
     args.push_back(*resourceDirArg);
+#ifdef __APPLE__
+  if (std::optional<std::string> sysrootArg = darwinSysrootArg())
+    args.push_back(*sysrootArg);
+  if (isCxx)
+    if (std::optional<std::string> libcxxArg = darwinLibcxxArg())
+      args.push_back(*libcxxArg);
+  // See buildCommandLine: keep the SDK from fortify-rewriting libc calls.
+  args.push_back("-D_FORTIFY_SOURCE=0");
+#endif
   args.push_back("-Wno-error=int-conversion");
   args.insert(args.end(), extraClangArgs.begin(), extraClangArgs.end());
   return args;
