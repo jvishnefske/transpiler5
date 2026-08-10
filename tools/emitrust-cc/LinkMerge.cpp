@@ -40,6 +40,19 @@ using namespace mlir;
 // Payload extraction
 //===----------------------------------------------------------------------===//
 
+/// True when `name` (as returned by `SectionRef::getName()`) is the
+/// emitrust payload section for `object`'s format. Mach-O's `getName()`
+/// reports only the bare section name (the segment half is a separate
+/// field), so the query name diverges from the write side's
+/// `<segment>,<section>` `--add-section` spelling (`emitRustSectionSpec` in
+/// emitrust-clang.cpp) even though both name the same section.
+static bool isEmitRustSectionName(const llvm::object::ObjectFile &object,
+                                  llvm::StringRef name) {
+  if (object.isMachO())
+    return name == "__emitrust";
+  return name == ".emitrust";
+}
+
 /// The buffer-ref core of `findShardPayload`, shared with the archive
 /// expansion (an archive member is a MemoryBufferRef into the archive, not
 /// a MemoryBuffer of its own). Same three-way contract as the public
@@ -60,7 +73,7 @@ findShardPayloadRef(llvm::MemoryBufferRef buffer, std::string &errorMessage) {
       llvm::consumeError(name.takeError());
       continue;
     }
-    if (*name != ".emitrust")
+    if (!isEmitRustSectionName(**object, *name))
       continue;
     llvm::Expected<llvm::StringRef> contents = section.getContents();
     if (!contents) {

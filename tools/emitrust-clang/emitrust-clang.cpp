@@ -345,6 +345,26 @@ static mlir::LogicalResult runPipeline(mlir::ModuleOp module) {
   return pm.run(module);
 }
 
+/// Returns the `--add-section` name for the emitrust payload, spelled for
+/// `binary`'s own object format: a flat `.emitrust` on ELF/COFF, but
+/// `<segment>,<section>` on Mach-O, which `llvm-objcopy` requires there
+/// (a flat name is rejected outright) and which `LinkMerge.cpp`'s
+/// `findShardPayloadRef` must match on the read side.
+///
+/// `__TEXT`, not `__DATA`: every Mach-O object already has a `__TEXT`
+/// segment load command (it holds `__text` at minimum), so adding one more
+/// section to it only grows an existing command. A fresh `__DATA` segment
+/// would have to be created solely to hold our section, and `llvm-objcopy
+/// --remove-section` deletes the section entry but leaves that now-empty
+/// segment command behind — an extra `LC_SEGMENT_64` that keeps the
+/// stripped object from ever matching a plain-clang reference byte-for-byte
+/// (see `Driver/emitrust-clang-shim.c`'s delegation-transparency check).
+static std::string emitRustSectionSpec(const llvm::object::Binary &binary) {
+  if (binary.isMachO())
+    return "__TEXT,__emitrust";
+  return ".emitrust";
+}
+
 /// Embeds the bytecode artifact at `payloadPath` into the object file at
 /// `objectPath` as a `.emitrust` section, using LLVM's objcopy-as-a-library
 /// (the exact engine behind `llvm-objcopy --add-section`, so the section is
@@ -376,10 +396,12 @@ static void embedArtifactSection(llvm::StringRef objectPath,
     return;
   }
 
+  std::string sectionSpec = emitRustSectionSpec(*binary->getBinary());
+
   llvm::objcopy::ConfigManager config;
   config.Common.InputFilename = objectPath;
   config.Common.OutputFilename = objectPath;
-  config.Common.AddSection.emplace_back(".emitrust", std::move(*payload));
+  config.Common.AddSection.emplace_back(sectionSpec, std::move(*payload));
 
   llvm::SmallString<256> stagedPath(objectPath);
   stagedPath += ".emitrust-stage";
@@ -393,10 +415,9 @@ static void embedArtifactSection(llvm::StringRef objectPath,
     }
     if (llvm::Error error = llvm::objcopy::executeObjcopyOnBinary(
             config, *binary->getBinary(), out)) {
-      llvm::errs() << "emitrust-clang: warning: cannot embed .emitrust "
-                      "section into '"
-                   << objectPath << "': " << llvm::toString(std::move(error))
-                   << "\n";
+      llvm::errs() << "emitrust-clang: warning: cannot embed " << sectionSpec
+                   << " section into '" << objectPath
+                   << "': " << llvm::toString(std::move(error)) << "\n";
       out.close();
       llvm::sys::fs::remove(stagedPath);
       return;
@@ -409,7 +430,8 @@ static void embedArtifactSection(llvm::StringRef objectPath,
     return;
   }
   if (log)
-    *log << "embedded: .emitrust section in " << objectPath << "\n";
+    *log << "embedded: " << sectionSpec << " section in " << objectPath
+        << "\n";
 }
 
 /// Computes and logs the `src-hash` half of the FR-57 key for one compile
