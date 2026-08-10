@@ -38,7 +38,11 @@
   `nix develop -c meson setup build-meson`, then
   `nix develop -c meson compile -C build-meson` (tools land in
   `build-meson/tools/`) and `nix develop -c meson test -C build-meson`
-  runs the same lit suite as check-emitrust. Links the monolithic
+  runs the same lit suite as check-emitrust. The suite is split into two
+  complementary meson suites: `meson test --suite fast` runs everything
+  except EndToEnd (~24% of the wall time — the inner-loop command;
+  `ninja check-emitrust-fast` is the CMake spelling), while plain
+  `meson test` runs both tiers and remains the pre-commit gate. Links the monolithic
   libMLIR/libclang-cpp dylibs instead of static archives; the PDLL
   showcase option is CMake-only. New tools/sources must be added to BOTH
   the CMakeLists.txt and the meson.build files.

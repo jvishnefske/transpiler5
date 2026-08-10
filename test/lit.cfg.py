@@ -82,6 +82,18 @@ llvm_config.add_tool_substitutions(tools, tool_dirs)
 if shutil.which("cargo"):
     config.available_features.add("cargo")
 
+# The corpus/harness mega-tests (CTestSuite, Cpp17Suite, RealWorld, Fuzz)
+# each spawn their own burst of cargo/rustc/clang subprocesses. When lit
+# schedules several of them CONCURRENTLY — which the fast tier makes much
+# more likely by stripping out the EndToEnd tests that used to dilute
+# them — an 8 GB host hits memory pressure and the OS SIGKILLs innocent
+# bystanders (observed 2026-08-10: exit 137 "Killed: 9" on emitrust-clang
+# mid-compile, cascading into spurious MISCOMPILE classifications in the
+# harness ledgers). Cap how many run at once; each still parallelizes
+# internally. The victims of a kill are arbitrary, so the cap lives here
+# with the culprits, not with the tests that happened to die.
+lit_config.parallelism_groups["heavy-harness"] = 2
+
 # Per-test wall-clock cap. The EndToEnd tests RUN the emitted binary, so an
 # emitter miscompile that drops a loop's exit-condition store presents as a
 # NON-TERMINATING test, not a byte diff; without a cap it wedges the suite
