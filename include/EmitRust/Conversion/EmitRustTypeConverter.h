@@ -52,13 +52,20 @@ inline void populateEmitRustTypeConverter(TypeConverter &typeConverter) {
 /// Returns the zero/default attribute for `type`: `0` for integer and index
 /// types (which renders as `false` for i1), `0.0` for floating-point types,
 /// and the opaque `None` expression for `!emitrust.fn_ptr` (the null
-/// function pointer). Returns a null attribute for any other type.
+/// function pointer) and for the `!emitrust.opaque<"Option<...">` family
+/// (W2.11 std::optional and the C99-43 Option-of-cursor cell — the Rust
+/// emitter's own default for these is the same `None`, see
+/// `RustEmitter`'s default-value rendering). Returns a null attribute for
+/// any other type.
 inline Attribute getDefaultValueAttr(Type type) {
   if (isa<Float32Type, Float64Type>(type))
     return FloatAttr::get(type, 0.0);
   if (isa<IntegerType, IndexType>(type))
     return IntegerAttr::get(type, 0);
   if (isa<FnPtrType>(type))
+    return OpaqueAttr::get(type.getContext(), "None");
+  if (auto opaque = dyn_cast<OpaqueType>(type);
+      opaque && opaque.getValue().starts_with("Option<"))
     return OpaqueAttr::get(type.getContext(), "None");
   return nullptr;
 }
