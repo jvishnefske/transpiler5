@@ -5859,6 +5859,47 @@ static inline bool isFileHandleLocal(const clang::VarDecl *var) {
          callee->getName() == "fopen" && !callee->getDefinition();
 }
 
+/// Returns whether a declared type names `va_list` / `__builtin_va_list`
+/// through its typedef sugar. The C99-37 rejection cannot rely on the
+/// CANONICAL type everywhere: on AArch64 Darwin `__builtin_va_list` is
+/// plain `char *`, so a canonical comparison either misses the va_list
+/// (the type-level checks) or swallows every `char *` (the clone-local
+/// skip). The sugar names the user's intent unambiguously on every
+/// target; x86_64's `__va_list_tag [1]` record form keeps its canonical
+/// checks for expression positions that have lost the sugar.
+static inline bool isVaListSugarType(clang::QualType type,
+                                     clang::ASTContext &context) {
+  const clang::TypedefNameDecl *builtinDecl =
+      context.getBuiltinVaListDecl();
+  for (clang::QualType current = type; !current.isNull();) {
+    const auto *typedefType = current->getAs<clang::TypedefType>();
+    if (!typedefType)
+      return false;
+    const clang::TypedefNameDecl *decl = typedefType->getDecl();
+    if (builtinDecl &&
+        decl->getCanonicalDecl() == builtinDecl->getCanonicalDecl())
+      return true;
+    current = decl->getUnderlyingType();
+  }
+  return false;
+}
+
+/// Returns the standard C name of a hosted stdio stream variable,
+/// canonicalizing Darwin's spellings: on macOS `<stdio.h>` defines
+/// `stdin`/`stdout`/`stderr` as macros for the libc globals
+/// `__stdinp`/`__stdoutp`/`__stderrp`, so the AST decl the importer sees
+/// carries the dunder name even though the user wrote the ISO spelling.
+/// Any other name passes through unchanged. Used both for recognition
+/// (the devirtualized-fprintf stdout check) and for diagnostics, which
+/// should print the name the user actually wrote.
+static inline llvm::StringRef canonicalStreamName(llvm::StringRef name) {
+  return llvm::StringSwitch<llvm::StringRef>(name)
+      .Case("__stdinp", "stdin")
+      .Case("__stdoutp", "stdout")
+      .Case("__stderrp", "stderr")
+      .Default(name);
+}
+
 /// Returns the data-pointer field a member expression designates, or null
 /// when `expr` is not a member access or its field is not a data pointer.
 static inline const clang::FieldDecl *dataPointerFieldOf(const clang::Expr *expr) {

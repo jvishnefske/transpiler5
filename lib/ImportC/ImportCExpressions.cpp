@@ -2010,7 +2010,7 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
           stream ? llvm::dyn_cast<clang::NamedDecl>(stream->getDecl())
                  : nullptr;
       if (!streamDecl || !streamDecl->getDeclName().isIdentifier() ||
-          streamDecl->getName() != "stdout")
+          canonicalStreamName(streamDecl->getName()) != "stdout")
         return emitError(translateLoc(call->getArg(0)->getBeginLoc()))
                << "unsupported: fprintf to a FILE* stream (only the "
                   "devirtualized stdout form is supported)";

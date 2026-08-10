@@ -125,7 +125,14 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
       return Type(builder.getIntegerType(16));
     case clang::BuiltinType::Int:
       return Type(builder.getIntegerType(32));
+    // FR-56: `long` maps by the TARGET's width, not a hardcoded 64 — a
+    // forwarded `-m32` triple makes it 4 bytes, and on 32-bit Darwin
+    // triples `size_t` is spelled `unsigned long` (where 32-bit Linux
+    // spells it `unsigned int`), so the hardcoded width would leak ui64
+    // into every sizeof fold there. 64-bit targets are unchanged.
     case clang::BuiltinType::Long:
+      return Type(
+          builder.getIntegerType(astContext().getTypeSize(canonical)));
     case clang::BuiltinType::LongLong:
       return Type(builder.getIntegerType(64));
     case clang::BuiltinType::Float:
@@ -157,6 +164,9 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
       return Type(IntegerType::get(builder.getContext(), 32,
                                    IntegerType::Unsigned));
     case clang::BuiltinType::ULong:
+      return Type(IntegerType::get(builder.getContext(),
+                                   astContext().getTypeSize(canonical),
+                                   IntegerType::Unsigned));
     case clang::BuiltinType::ULongLong:
       return Type(IntegerType::get(builder.getContext(), 64,
                                    IntegerType::Unsigned));
@@ -531,6 +541,13 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
   // which names caller-owned storage — keeps the located rejection; the
   // deep scan also covers the Carrier shape that bypasses `mapType`.
   clang::QualType canonical = type.getCanonicalType().getUnqualifiedType();
+  // C99-37 in the parameter position, by SUGAR: on AArch64 Darwin
+  // `__builtin_va_list` is canonically `char *`, so without this a
+  // va_list parameter would import as an ordinary scalar-ref pointer
+  // instead of keeping its permanent rejection (see mapType's canonical
+  // checks, which cover the x86_64 record form).
+  if (isVaListSugarType(type, astContext()))
+    return emitError(loc) << "unsupported: va_list type";
   // FR-48: a C++ lvalue reference parameter. A reference is a pointer that
   // is non-null, never reseated, and never subject to arithmetic, so it is
   // the STRICTLY SIMPLER case of the `ParamKind::ScalarRef` pointer
@@ -714,6 +731,19 @@ FailureOr<Type> CImporter::mapStructFieldType(clang::QualType type,
     }
     return Type(builder.getIntegerType(64));
   }
+  // A function-pointer field of a SYSTEM-HEADER record stores as the same
+  // inert i64 slot a data-pointer field does, WITHOUT mapping its
+  // signature. Darwin's `struct __sFILE` carries cookie-I/O callback
+  // members (`_close`/`_read`/`_seek`/`_write`) whose `void *` parameters
+  // reject in fn-ptr signature mapping, which would make every
+  // FILE*-parameter signature un-importable on macOS — glibc's
+  // `_IO_FILE` has only data-pointer members, so this branch never fires
+  // there. The record import exists only to keep hosted FILE handles
+  // representable; main-file uses of such fields stay rejected at the
+  // use site, so the slot is never read.
+  if (field && type.getCanonicalType()->isFunctionPointerType() &&
+      isSystemHeaderDecl(field))
+    return Type(builder.getIntegerType(64));
   return mapType(type, loc);
 }
 
