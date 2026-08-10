@@ -23,6 +23,17 @@ add_lit_testsuite(check-emitrust "Running the EmitRust regression tests"
 )
 set_target_properties(check-emitrust PROPERTIES FOLDER "Tests")
 
+# Fast tier: everything except EndToEnd (the cargo-build byte-diff oracle,
+# ~76% of the suite's time) — the inner-loop target, mirroring meson's
+# `meson test --suite fast`. check-emitrust remains the pre-commit gate.
+add_lit_testsuite(check-emitrust-fast
+  "Running the EmitRust regression tests (fast tier, no EndToEnd)"
+  ${CMAKE_CURRENT_BINARY_DIR}
+  ARGS --filter-out=EndToEnd/
+  DEPENDS ${EMITRUST_TEST_DEPENDS}
+)
+set_target_properties(check-emitrust-fast PROPERTIES FOLDER "Tests")
+
 add_lit_testsuites(EMITRUST ${CMAKE_CURRENT_SOURCE_DIR}
   DEPENDS ${EMITRUST_TEST_DEPENDS}
 )
