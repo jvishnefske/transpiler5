@@ -97,6 +97,44 @@ if clang_exe.found()
   endif
 endif
 
+# Same trick for Darwin's SDK sysroot (see the CMakeLists.txt probe next to
+# this file for why it must be baked in at configure time rather than read
+# from $SDKROOT/xcrun at run time: lit sandboxes the test environment and
+# doesn't forward SDKROOT). $SDKROOT from the configuring shell (e.g. the
+# nix dev shell) is tried first; `xcrun --show-sdk-path` covers a plain
+# Xcode/Command Line Tools setup with no SDKROOT exported.
+if host_machine.system() == 'darwin'
+  sysroot_probe = run_command('sh', '-c',
+    'printf %s "${SDKROOT:-$(xcrun --show-sdk-path 2>/dev/null)}"',
+    check: false)
+  emitrust_sysroot = sysroot_probe.stdout().strip()
+  if sysroot_probe.returncode() == 0 and emitrust_sysroot != ''
+    importc_resource_args += ['-DEMITRUST_CLANG_SYSROOT="' + emitrust_sysroot + '"']
+  endif
+
+  # Same trick again for libc++'s headers (see CMakeLists.txt's probe next
+  # to this file for why: the nix clang wrapper injects this path
+  # unconditionally, but FixedCompilationDatabase/ClangTool never run that
+  # wrapper). Discovered by asking the wrapped compiler what it would
+  # search, rather than hardcoding a nix store path.
+  if clang_exe.found()
+    # Search only within the printed "#include <...> search starts here"
+    # block, and require "libcxx" in the path: an unfiltered grep matches
+    # clang's own unresolved default entry first ("<bin>/../include/c++/v1",
+    # printed even though it doesn't exist), not the wrapper's real,
+    # absolute, nix-store-rooted injection.
+    libcxx_probe = run_command('sh', '-c',
+      'echo | "' + clang_exe.full_path() + '++" -E -x c++ - -v 2>&1 | '
+      + 'sed -n "/search starts here/,/End of search list/p" | '
+      + 'grep -o "/[^ ]*libcxx[^ ]*include/c++/v1" | head -n1',
+      check: false)
+    emitrust_libcxx_dir = libcxx_probe.stdout().strip()
+    if libcxx_probe.returncode() == 0 and emitrust_libcxx_dir != ''
+      importc_resource_args += ['-DEMITRUST_CLANG_LIBCXX_DIR="' + emitrust_libcxx_dir + '"']
+    endif
+  endif
+endif
+
 lib_importc = static_library('MLIREmitRustImportC',
   'ImportC/ImportC.cpp',
   'ImportC/ClangProjectParser.cpp',

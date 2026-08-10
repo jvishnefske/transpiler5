@@ -55,13 +55,15 @@ if mlir_prefix == ''
   error('could not read MLIR_INSTALL_PREFIX from MLIRConfig.cmake')
 endif
 
-# nixpkgs ships only the versioned dylib name (libMLIR.so.21.1, no dev
-# symlink), so resolve it by glob instead of find_library.
+# On Linux, nixpkgs ships only the versioned dylib name (libMLIR.so.21.1,
+# no dev symlink); on Darwin it ships a plain libMLIR.dylib. Either way,
+# resolve it by glob instead of find_library.
+libmlir_glob = host_machine.system() == 'darwin' ? 'libMLIR.dylib' : 'libMLIR.so*'
 libmlir_path = run_command('sh', '-c',
-  'ls "' + mlir_prefix + '/lib"/libMLIR.so* 2>/dev/null | sort | head -n1',
+  'ls "' + mlir_prefix + '/lib"/' + libmlir_glob + ' 2>/dev/null | sort | head -n1',
   check: true).stdout().strip()
 if libmlir_path == ''
-  error('no libMLIR.so* under ' + mlir_prefix + '/lib')
+  error('no ' + libmlir_glob + ' under ' + mlir_prefix + '/lib')
 endif
 
 llvm_dep = dependency('llvm', version: '>=21', method: 'config-tool',
