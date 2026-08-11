@@ -3756,7 +3756,9 @@ LogicalResult RustEmitter::emitFor(emitrust::ForOp forOp) {
     os << "(";
   if (failed(emitOperand(loc, op->getOperand(0), ExprPos::delimited())))
     return failure();
-  os << "..";
+  // FR-61f widening: the `inclusive` attribute renders Rust's inclusive
+  // range (`..=`), the image of C's ascending `i <= HI` loop.
+  os << (forOp.getInclusive() ? "..=" : "..");
   if (failed(emitOperand(loc, op->getOperand(1), ExprPos::delimited())))
     return failure();
   if (!unitStep) {

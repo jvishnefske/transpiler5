@@ -2991,12 +2991,19 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   if (!lo)
     return std::nullopt;
 
-  // Clause 2: cond is `i < HI` (half-open, ascending). `<=`, `>`, `>=` fall
-  // back for v1.
+  // Clause 2: cond is `i < HI` (half-open) or `i <= HI` (inclusive, the
+  // FR-61f widening slice — renders `..=`; C's only divergence is the
+  // final `i++` overflow at HI == INT_MAX, which is C UB, so Rust's
+  // cleanly-terminating `..=` is a legal refinement). Descending (`>`,
+  // `>=`) still falls back.
   const auto *cmp =
       llvm::dyn_cast<clang::BinaryOperator>(cond->IgnoreParenImpCasts());
-  if (!cmp || cmp->getOpcode() != clang::BO_LT || !isRefTo(cmp->getLHS(), iv))
+  if (!cmp ||
+      (cmp->getOpcode() != clang::BO_LT &&
+       cmp->getOpcode() != clang::BO_LE) ||
+      !isRefTo(cmp->getLHS(), iv))
     return std::nullopt;
+  bool inclusive = cmp->getOpcode() == clang::BO_LE;
   const clang::Expr *hi = cmp->getRHS();
 
   // Clause 3: inc is `i++`/`++i` (K=1) or `i += K`/`i = i + K` with K a
@@ -3059,7 +3066,7 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
     return std::nullopt;
   }
 
-  return RangeFor{iv, lo, hi, step};
+  return RangeFor{iv, lo, hi, step, inclusive};
 }
 
 LogicalResult CImporter::emitRangeFor(const RangeFor &range,
@@ -3085,7 +3092,8 @@ LogicalResult CImporter::emitRangeFor(const RangeFor &range,
   Value stepValue = createIntConstant(loc, intType, range.step);
 
   auto forOp =
-      builder.create<emitrust::ForOp>(loc, loValue, hiValue, stepValue);
+      builder.create<emitrust::ForOp>(loc, loValue, hiValue, stepValue,
+                                      /*inclusive=*/range.inclusive);
 
   // The induction block argument carries the C source name as a `NameLoc`
   // (the FR-61e slice-3 path in the emitter reads it), so it renders

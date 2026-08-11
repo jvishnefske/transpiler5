@@ -2092,7 +2092,10 @@ def EmitRust_ForOp : EmitRust_Op<"for", [
     ```
 
     The operation takes three SSA operands representing the lower bound,
-    upper bound, and step, all of the same integer or index type. Its single
+    upper bound, and step, all of the same integer or index type. The
+    `inclusive` unit attribute selects Rust's inclusive range (`lb..=ub`,
+    the image of C's ascending `i <= HI` loop); its absence keeps the
+    half-open `lb..ub`. Its single
     region has one block whose sole argument is the induction variable, of
     the same type as the bounds. The trailing colon-type is optional in the
     custom syntax and defaults to `index`. The body block is terminated with
@@ -2114,7 +2117,8 @@ def EmitRust_ForOp : EmitRust_Op<"for", [
 
   let arguments = (ins EmitRust_IntegerOrIndexType:$lowerBound,
                        EmitRust_IntegerOrIndexType:$upperBound,
-                       EmitRust_IntegerOrIndexType:$step);
+                       EmitRust_IntegerOrIndexType:$step,
+                       UnitAttr:$inclusive);
   let results = (outs);
   let regions = (region SizedRegion<1>:$region);
 
