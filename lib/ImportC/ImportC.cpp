@@ -4971,6 +4971,16 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
       if (opCall->getNumArgs() != 2)
         return emitError(loc) << "unsupported: operator[] requires exactly "
                                  "one index argument";
+      // W2.12: a `std::string_view` receiver is a decomposed local (shared
+      // literal backing + cursor/len cells) with NO place of its own, so
+      // it is intercepted before the receiver place emission below; its
+      // byte place is the backing subscripted at cursor + i.
+      if (const auto *svRef = llvm::dyn_cast<clang::DeclRefExpr>(
+              opCall->getArg(0)->IgnoreParenImpCasts()))
+        if (const auto *svVar =
+                llvm::dyn_cast<clang::VarDecl>(svRef->getDecl()))
+          if (stringViewLocals.contains(svVar))
+            return emitStringViewIndexPlace(svVar, opCall->getArg(1), loc);
       FailureOr<Value> receiver =
           emitLValue(opCall->getArg(0)->IgnoreParenImpCasts());
       if (failed(receiver))

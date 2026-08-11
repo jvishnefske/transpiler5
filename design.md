@@ -7552,6 +7552,50 @@ since the 00204 wave, 00204.c pass).
   the built crate against clang++ with argc-derived seeds covering
   engaged and empty on both call sites; full lit 100%; C path untouched.
 
+- [x] W2.12 `std::string_view` over a string literal (task-009; flips
+  Cpp17Suite 00905; VALIDATED 2026-08-11: full lit 558/558, ledger exactly
+  21 PASS / 5 UNSUPPORTED / 0 MISCOMPILE, all four import goldens passed on
+  first execution). Implementation deviations from the spike sheet, all
+  recorded in code comments: a third interception site in `emitLValue`'s
+  `OO_Subscript` branch (`sv[i]` value reads route through
+  `CK_LValueToRValue`, never reaching `emitStlOperatorCall`); the
+  member/operator interceptions sit BEFORE the receiver `emitLValue`
+  (a decomposed local has no symbols entry); `castToIntType` reuse instead
+  of unconditional casts; the rebinding rejection spelled through the
+  method-template family (`std::string_view::operator= is not a recognized
+  STL method`). A literal-initialized `string_view` LOCAL decomposes at
+  import into (shared literal backing array, mutable i64 cursor, mutable i64
+  len) — the same decomposition the C pointer machinery already applies to
+  `const char *p = "..."; p += 6; p[0]` — and no `string_view` type is ever
+  materialized: `sv.size()` reads len (cast to the call's declared C type,
+  the emitLenCall convention), `sv.remove_prefix(n)` is cursor += n; len -=
+  n, and `sv[i]` is `subscript backing[cursor + i]` loading i8 (C `char`
+  semantics exactly, no `as_bytes()` casts). The `&str`-reslicing route was
+  REJECTED on measured grounds: the dialect has no range-slice op and no
+  byte-subscript path on opaque receivers — two new capabilities vs zero.
+  Frontier (LOCATED rejections this wave, all verified rejecting today at
+  the mapType tail): string_view parameters/returns, construction from
+  `std::string`, rebinding after init, `data()`, comparisons, `substr`,
+  `find`, `remove_suffix`, `front`/`back`.
+  **SPIKE VERDICT: GO (2026-08-10).** Hand-drove the full chain: intended
+  post-pipeline IR written with EXISTING ops only (variable const backing,
+  let-mut cursor/len, cast/add/sub/assign, subscript/load, call_opaque
+  println!) parses through emitrust-opt and renders through
+  emitrust-translate — the renderer even folds cursor advance to `+= 6i64`
+  and keeps the size-before-remove_prefix read correctly ordered — and the
+  rendered crate's stdout is BYTE-IDENTICAL to the clang++ native
+  ("12 6 c\n"), unsafe-0, clippy-0. The C-analog probe confirmed the
+  decomposition is the house pattern (the importer already emits it for
+  char-pointer literal walks, constant-folding the static case).
+  Gates: corpus 00905 UNSUPPORTED->PASS, Cpp17Suite ledger ratchets to
+  exactly 21 PASS / 5 UNSUPPORTED / 0 MISCOMPILE; new pins
+  test/Import/Cpp/stl-string-view.cpp (decomposition shape, size cast,
+  remove_prefix folds, subscript i8 load) and stl-invalid.cpp frontier
+  additions (param, from-std::string, rebinding, an unrecognized method);
+  new test/EndToEnd/stl-string-view.cpp byte-diffs the built crate against
+  clang++ with an argc-derived prefix so folding cannot hide a miscompile;
+  full lit 100%; C path untouched (byte-identical literal-backing goldens).
+
 ## Track 5 Third-party validation (external demand signal)
 
 Track 4's corpus is authored by this project. That has now produced two
