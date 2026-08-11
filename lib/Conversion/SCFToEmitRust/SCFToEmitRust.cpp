@@ -235,9 +235,11 @@ struct ForLowering : public OpConversionPattern<scf::ForOp> {
                                                           /*is_mut=*/true));
     }
 
+    // scf.for is half-open by construction, so `inclusive` is never set on
+    // this path.
     auto loweredFor = rewriter.create<emitrust::ForOp>(
         loc, adaptor.getLowerBound(), adaptor.getUpperBound(),
-        adaptor.getStep());
+        adaptor.getStep(), /*inclusive=*/false);
 
     // The default builder leaves the region empty: create the body block
     // with the induction-variable argument ourselves.

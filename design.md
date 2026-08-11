@@ -2722,10 +2722,22 @@ of references or inheritance, so it precedes both.
     test/EndToEnd/range-for.c (byte-diff: accumulator `+=`, array fill, step 2,
     `i <= n` while-fallback), test/Target/Rust/compound-assign-place.mlir (the
     place fold + its non-self-ref negative), test/Import/C/arrays.c goldens.
-    STILL OUT (future widening): `i <= HI` (`..=`), descending (`.rev()`), the
+    STILL OUT (future widening): descending (`.rev()`), the
     `i = LO` assignment-form init, and bodies touching params/pointers (place
     those too); plus a residual +11 place-accumulator `needless_late_init` for
     NON-constant inits a later late-init-merge fold could clean.
+    LANDED 61f-3 (2026-08-10): the `i <= HI` inclusive widening. `emitrust.for`
+    gained an `inclusive` UnitAttr (round-trips through the existing optional
+    attr-dict — no custom-syntax change), `emitFor` renders `LO..=HI` when set
+    (`.step_by` wrapping unchanged), and matcher clause 2 accepts `BO_LE`,
+    tagging the RangeFor. Soundness: C's only divergence is the final `i++`
+    overflow at `HI == INT_MAX`, which is C UB — Rust's cleanly-terminating
+    `..=` is a legal refinement. scf.for is half-open by construction, so the
+    SCFToEmitRust path never sets the attr. The EndToEnd `i <= n`
+    while-fallback pin FLIPPED to `for i in 1i32..=n` (byte-diff green); a new
+    descending `i > 0; i--` case keeps the while-fallback frontier pinned.
+    (test/Target/Rust/for-inclusive.mlir, test/Import/C/range-for-inclusive.c,
+    test/EndToEnd/range-for.c)
 
     FOLLOW-UP (2026-08-05): `unused_assignments` PROMOTED from the crate-root
     allow header to a denied `[lints.rust]` lint (CrateEmitter.cpp), making the

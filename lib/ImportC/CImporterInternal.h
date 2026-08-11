@@ -1375,8 +1375,9 @@ struct VaMonomorphPlan {
 struct RangeFor {
   const clang::VarDecl *iv; ///< induction variable, declared in the init
   const clang::Expr *lo;    ///< LO: the induction's initial value
-  const clang::Expr *hi;    ///< HI: half-open upper bound (loop-invariant)
+  const clang::Expr *hi;    ///< HI: upper bound (loop-invariant)
   int64_t step;             ///< K: positive constant step
+  bool inclusive;           ///< `i <= HI` (renders `..=`) vs `i < HI`
 };
 
 class CImporter {

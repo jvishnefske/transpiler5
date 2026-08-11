@@ -22,8 +22,11 @@
 // RUN: grep "for i in 0i32..5i32" %t.crate/src/main.rs
 // A non-unit step keeps `.step_by`.
 // RUN: grep "step_by(2i32 as usize)" %t.crate/src/main.rs
-// The `i <= hi` inclusive loop is NOT canonical (v1 half-open only): it must
-// fall back to a `while`, never a range `for`.
+// The `i <= hi` inclusive loop lifts to Rust's inclusive range (`..=`),
+// the FR-61f widening slice.
+// RUN: grep "for i in 1i32..=n" %t.crate/src/main.rs
+// A DESCENDING loop is still not canonical (ascending only): it must fall
+// back to a `while`, never a range `for`.
 // RUN: grep "while " %t.crate/src/main.rs
 
 int printf(const char *, ...);
@@ -45,10 +48,18 @@ int evens_below(int n) {
   return s;
 }
 
-// Inclusive bound: not canonical in v1, stays a `while`.
+// Inclusive bound: lifts to `for i in 1i32..=n` (FR-61f widening).
 int inclusive_sum(int n) {
   int s = 0;
   for (int i = 1; i <= n; i++)
+    s = s + i;
+  return s;
+}
+
+// Descending: still non-canonical (ascending only), stays a `while`.
+int countdown_sum(int n) {
+  int s = 0;
+  for (int i = n; i > 0; i--)
     s = s + i;
   return s;
 }
@@ -60,6 +71,7 @@ int main(void) {
   int fill = 0;
   for (int i = 0; i < 5; i++)
     fill = fill + a[i];
-  printf("%d %d %d %d\n", sum_to(10), evens_below(10), inclusive_sum(4), fill);
+  printf("%d %d %d %d %d\n", sum_to(10), evens_below(10), inclusive_sum(4),
+         countdown_sum(4), fill);
   return 0;
 }
