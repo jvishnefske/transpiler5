@@ -14,6 +14,10 @@
 // RUN: not emitrust-import-c %t/optional-copy-ctor.cpp 2>&1 | FileCheck %s --check-prefix=OPTCOPY
 // RUN: not emitrust-import-c %t/optional-value.cpp 2>&1 | FileCheck %s --check-prefix=OPTVALUE
 // RUN: not emitrust-import-c %t/optional-deref.cpp 2>&1 | FileCheck %s --check-prefix=OPTDEREF
+// RUN: not emitrust-import-c %t/string-view-param.cpp 2>&1 | FileCheck %s --check-prefix=SVPARAM
+// RUN: not emitrust-import-c %t/string-view-from-string.cpp 2>&1 | FileCheck %s --check-prefix=SVFROMSTRING
+// RUN: not emitrust-import-c %t/string-view-rebind.cpp 2>&1 | FileCheck %s --check-prefix=SVREBIND
+// RUN: not emitrust-import-c %t/string-view-substr.cpp 2>&1 | FileCheck %s --check-prefix=SVSUBSTR
 
 // W2.3 located rejections: every construct explicitly OUT of the STL
 // recognition surface this wave, authored so a later wave has a documented
@@ -195,6 +199,54 @@ int use(void) {
 int use(void) {
   std::optional<int> a;
   *a;
+  return 0;
+}
+
+//--- string-view-param.cpp
+#include <string_view>
+// W2.12 frontier: only a literal-initialized string_view LOCAL is
+// decomposed (into backing + cursor/len cells; no string_view type is
+// ever materialized). A parameter (or return) still maps its type and
+// keeps the mapType-tail rejection — the decomposition never applies.
+// SVPARAM: string-view-param.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::basic_string_view is not a recognized STL type
+int take(std::string_view p) { return (int)p.size(); }
+
+//--- string-view-from-string.cpp
+#include <string>
+#include <string_view>
+// W2.12 frontier: constructing a string_view over a std::string (a
+// UserDefinedConversion member call, not the recognized literal ctor
+// chain) falls through the local interception to the same mapType-tail
+// rejection — the view would dangle-track a heap buffer the cursor/len
+// decomposition cannot model.
+// SVFROMSTRING: string-view-from-string.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::basic_string_view is not a recognized STL type
+int use(void) {
+  std::string s = "hi";
+  std::string_view sv = s;
+  return 0;
+}
+
+//--- string-view-rebind.cpp
+#include <string_view>
+// W2.12 frontier: rebinding after init (operator=) is OUT — the
+// decomposition binds ONE literal backing for the local's lifetime, and
+// a rebind would need to re-point the shared backing.
+// SVREBIND: string-view-rebind.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::string_view::operator= is not a recognized STL method
+int use(void) {
+  std::string_view sv = "abc";
+  sv = "other";
+  return 0;
+}
+
+//--- string-view-substr.cpp
+#include <string_view>
+// W2.12 frontier: only size()/remove_prefix()/operator[] are recognized;
+// every other method (data, substr, find, remove_suffix, front, back,
+// comparisons) is a located rejection naming the entity.
+// SVSUBSTR: string-view-substr.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::string_view::substr is not a recognized STL method
+int use(void) {
+  std::string_view sv = "abc";
+  sv.substr(1);
   return 0;
 }
 

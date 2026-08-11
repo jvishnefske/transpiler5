@@ -1969,6 +1969,28 @@ private:
   /// `var`.
   LogicalResult emitVecLocal(const clang::VarDecl *var, Location loc);
 
+  /// W2.12: matches the ONE recognized `std::string_view` local
+  /// initializer chain — `ImplicitCastExpr<ConstructorConversion>` over
+  /// `CXXConstructExpr 'void (const char *)'` over an
+  /// `ArrayToPointerDecay`ed ordinary `StringLiteral` (trailing
+  /// `CXXDefaultArgExpr`s tolerated) — returning the literal, or null when
+  /// the local's initializer is any other shape (absent, from a
+  /// std::string, from another view, the (pointer, count) ctor, a wide
+  /// literal, ...), in which case `emitLocalVar` falls through to
+  /// `mapType`'s located rejection.
+  const clang::StringLiteral *
+  matchStringViewLiteralInit(const clang::VarDecl *var);
+
+  /// W2.12: decomposes the literal-initialized `std::string_view` local
+  /// `var` into (shared read-only literal backing via
+  /// `getOrCreateLiteralBacking`, entry i64 cursor cell initialized to 0,
+  /// entry i64 len cell initialized to the literal's length WITHOUT the
+  /// terminating NUL) and records the triple in `stringViewLocals`. No
+  /// string_view value or place is ever materialized.
+  LogicalResult emitStringViewLocal(const clang::VarDecl *var,
+                                    const clang::StringLiteral *literal,
+                                    Location loc);
+
   /// Folds the trip count of `stmt` when it is a `for`/`while` loop with a
   /// foldable bound (`for (i = A; i < B; i++)`-style, or an equivalent
   /// `while`) into `out`, using `regions.evalFoldableInt` (W4.2e Part B).
@@ -2591,6 +2613,38 @@ private:
   /// routing, which must intercept optional construction (`return v;` /
   /// `return std::nullopt;`) before the generic trivial-copy unwrap.
   bool isStdOptionalRecordType(clang::QualType type);
+
+  /// W2.12: whether `type` is a `std::basic_string_view` specialization
+  /// (`std::string_view` is its char typedef). string_view has NO type
+  /// mapping — a literal-initialized LOCAL decomposes at `emitLocalVar`
+  /// into (shared literal backing, cursor cell, len cell; see
+  /// `emitStringViewLocal`), and every other string_view position keeps
+  /// the mapType-tail rejection.
+  bool isStdStringViewRecordType(clang::QualType type);
+
+  /// W2.12: imports a `CXXMemberCallExpr` whose receiver is a decomposed
+  /// string_view local `var` (a `stringViewLocals` entry) — intercepted at
+  /// the top of `emitStlMemberCall` BEFORE the receiver place emission,
+  /// since a decomposed local has no place of its own. Recognized:
+  /// size() (len-cell load, cast to the call's declared C type per the
+  /// emitLenCall convention) and remove_prefix(n) (cursor += n; len -= n;
+  /// statement position). Anything else is a located rejection naming the
+  /// entity.
+  FailureOr<Value> emitStringViewMemberCall(const clang::CXXMemberCallExpr *call,
+                                            const clang::VarDecl *var,
+                                            Location loc);
+
+  /// W2.12: the byte PLACE of `sv[i]` over a decomposed string_view local
+  /// `var`: the shared literal backing subscripted at cursor + i, typed
+  /// `!emitrust.lvalue<i8>` (C `char` semantics). Two consumer shapes,
+  /// mirroring `emitStlVectorIndexPlace`: loaded by `emitStlOperatorCall`'s
+  /// statement-discard path, consumed as-is by `emitLValue`'s
+  /// `CXXOperatorCallExpr` case (the path a scalar value read takes, since
+  /// string_view's operator[] returns `const char&` behind
+  /// `CK_LValueToRValue`). Read position only — the backing is const.
+  FailureOr<Value> emitStringViewIndexPlace(const clang::VarDecl *var,
+                                            const clang::Expr *idxExpr,
+                                            Location loc);
 
   /// W2.8: field-wise import of std::pair's two-argument value
   /// constructor onto `place` (`.first = arg0; .second = arg1;`),
@@ -4938,6 +4992,19 @@ private:
   /// Per-function decomposition of each accepted pointer local and each
   /// slice-classified pointer parameter, keyed by its declaration.
   llvm::DenseMap<const clang::VarDecl *, PointerLocalInfo> pointerLocals;
+  /// W2.12: per-function decomposition of each literal-initialized
+  /// `std::string_view` local (see `emitStringViewLocal`): the literal's
+  /// shared read-only backing byte array place plus two entry
+  /// `memref<i64>` cells — the byte cursor into the backing and the
+  /// remaining length (the literal's length without the NUL at init;
+  /// `remove_prefix` advances the cursor and shrinks the length).
+  struct StringViewLocalInfo {
+    Value backing;
+    Value cursorCell;
+    Value lenCell;
+  };
+  llvm::DenseMap<const clang::VarDecl *, StringViewLocalInfo>
+      stringViewLocals;
   /// Per-function second-order pointer locals (CTS-P5), each mapped to the
   /// single first-order pointer local it statically selects (the
   /// degenerate one-cell region of cursor cells); a second-order pointer

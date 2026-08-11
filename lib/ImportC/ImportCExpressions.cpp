@@ -2559,6 +2559,16 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
   std::string methodName = method->getDeclName().isIdentifier()
                                 ? method->getName().str()
                                 : std::string();
+  // W2.12: a `std::string_view` receiver is a decomposed LOCAL (shared
+  // literal backing + cursor/len cells; see emitStringViewLocal) with no
+  // place of its own, so it is intercepted BEFORE the receiver place
+  // emission below (the std::array precedent below handles a non-opaque
+  // receiver, but this one has no lvalue at all).
+  if (const auto *svRef = llvm::dyn_cast<clang::DeclRefExpr>(
+          call->getImplicitObjectArgument()->IgnoreParenImpCasts()))
+    if (const auto *svVar = llvm::dyn_cast<clang::VarDecl>(svRef->getDecl()))
+      if (stringViewLocals.contains(svVar))
+        return emitStringViewMemberCall(call, svVar, loc);
   // The implicit object argument may be wrapped in an implicit
   // qualification-adjustment cast (const-method binding), mirroring
   // `emitCXXMemberCall`.
@@ -2777,8 +2787,112 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
 }
 
 FailureOr<Value>
+CImporter::emitStringViewMemberCall(const clang::CXXMemberCallExpr *call,
+                                    const clang::VarDecl *var, Location loc) {
+  // W2.12: the method table of a decomposed string_view local. size()
+  // loads the len cell and casts to the call expression's declared C type
+  // (the emitLenCall convention); remove_prefix(n) is the cursor += n /
+  // len -= n pair (C++ requires n <= size() — UB otherwise — so the plain
+  // arithmetic is exact for defined programs; statement position, returns
+  // void). Everything else (data, substr, find, remove_suffix, front,
+  // back, ...) is a located rejection naming the entity.
+  const StringViewLocalInfo &info = stringViewLocals.find(var)->second;
+  const clang::CXXMethodDecl *method = call->getMethodDecl();
+  std::string methodName = method->getDeclName().isIdentifier()
+                                ? method->getName().str()
+                                : std::string();
+  IntegerType i64Type = builder.getIntegerType(64);
+  if (methodName == "size") {
+    if (call->getNumArgs() != 0)
+      return emitError(loc) << "unsupported: size takes no arguments";
+    Value len = loadPlace(loc, info.lenCell);
+    FailureOr<Type> resultType = mapType(call->getType(), loc);
+    if (failed(resultType))
+      return failure();
+    auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+    if (!intType)
+      return emitError(loc) << "unsupported: size result type";
+    return castToIntType(loc, len, intType);
+  }
+  if (methodName == "remove_prefix") {
+    if (call->getNumArgs() != 1)
+      return emitError(loc)
+             << "unsupported: remove_prefix requires exactly one argument";
+    FailureOr<Value> amount = emitRValue(call->getArg(0));
+    if (failed(amount))
+      return failure();
+    if (!llvm::isa<IntegerType>((*amount).getType()))
+      return emitError(loc)
+             << "unsupported: remove_prefix amount must be an integer";
+    Value amount64 = castToIntType(loc, *amount, i64Type);
+    Value cursor = loadPlace(loc, info.cursorCell);
+    Value advanced =
+        builder.create<arith::AddIOp>(loc, cursor, amount64).getResult();
+    builder.create<memref::StoreOp>(loc, advanced, info.cursorCell);
+    Value len = loadPlace(loc, info.lenCell);
+    Value trimmed =
+        builder.create<arith::SubIOp>(loc, len, amount64).getResult();
+    builder.create<memref::StoreOp>(loc, trimmed, info.lenCell);
+    return Value();
+  }
+  return emitError(loc) << "unsupported: std::string_view::" << methodName
+                        << " is not a recognized STL method";
+}
+
+FailureOr<Value>
+CImporter::emitStringViewIndexPlace(const clang::VarDecl *var,
+                                    const clang::Expr *idxExpr, Location loc) {
+  // W2.12: `sv[i]` — the shared literal backing subscripted at
+  // cursor + i, an `!emitrust.lvalue<i8>` byte place (C `char`
+  // semantics). Read position only: the backing is const, and C++
+  // requires i < size() (UB otherwise), so Rust's bounds panic on an
+  // out-of-range index is a safe refinement.
+  const StringViewLocalInfo &info = stringViewLocals.find(var)->second;
+  FailureOr<Value> index = emitRValue(idxExpr);
+  if (failed(index))
+    return failure();
+  if (!llvm::isa<IntegerType>((*index).getType()))
+    return emitError(loc)
+           << "unsupported: operator[] index must be an integer";
+  Value index64 = castToIntType(loc, *index, builder.getIntegerType(64));
+  Value cursor = loadPlace(loc, info.cursorCell);
+  Value position =
+      builder.create<arith::AddIOp>(loc, cursor, index64).getResult();
+  return builder
+      .create<emitrust::SubscriptOp>(
+          loc, emitrust::LValueType::get(builder.getIntegerType(8)),
+          info.backing, position)
+      .getResult();
+}
+
+FailureOr<Value>
 CImporter::emitStlOperatorCall(const clang::CXXOperatorCallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
+  // W2.12: a `std::string_view` receiver — a decomposed local with no
+  // place of its own — is intercepted before the receiver place emission
+  // below. `sv[i]` loads the backing[cursor + i] byte place; every other
+  // operator (operator= rebinding after init included) is a located
+  // rejection naming the entity.
+  if (const auto *svRef = llvm::dyn_cast<clang::DeclRefExpr>(
+          call->getArg(0)->IgnoreParenImpCasts()))
+    if (const auto *svVar = llvm::dyn_cast<clang::VarDecl>(svRef->getDecl()))
+      if (stringViewLocals.contains(svVar)) {
+        if (call->getOperator() == clang::OO_Subscript) {
+          if (call->getNumArgs() != 2)
+            return emitError(loc)
+                   << "unsupported: operator[] requires exactly one index "
+                      "argument";
+          FailureOr<Value> place =
+              emitStringViewIndexPlace(svVar, call->getArg(1), loc);
+          if (failed(place))
+            return failure();
+          return loadPlace(loc, *place);
+        }
+        return emitError(loc)
+               << "unsupported: std::string_view::operator"
+               << clang::getOperatorSpelling(call->getOperator())
+               << " is not a recognized STL method";
+      }
   FailureOr<Value> receiver =
       emitLValue(call->getArg(0)->IgnoreParenImpCasts());
   if (failed(receiver))

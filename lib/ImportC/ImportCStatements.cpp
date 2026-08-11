@@ -278,6 +278,15 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   // plain variable path below, bypassing the pointer decomposition.
   if (type->isPointerType() && !type->isFunctionPointerType())
     return emitPointerLocal(var, loc);
+  // W2.12: a literal-initialized `std::string_view` local decomposes into
+  // (shared literal backing, i64 cursor cell, i64 len cell) — no
+  // string_view type is ever materialized, so the divert happens BEFORE
+  // `mapType` runs. Any OTHER string_view local shape (from a
+  // std::string, from another view, uninitialized, ...) falls through to
+  // `mapType`'s located tail rejection below.
+  if (isStdStringViewRecordType(type))
+    if (const clang::StringLiteral *literal = matchStringViewLiteralInit(var))
+      return emitStringViewLocal(var, literal, loc);
   FailureOr<Type> mlirType = mapType(type, loc);
   if (failed(mlirType))
     return failure();
@@ -1532,6 +1541,77 @@ CImporter::getOrCreateLiteralBacking(const clang::StringLiteral *literal,
     return failure();
   literalBackings[literal] = *backing;
   return *backing;
+}
+
+const clang::StringLiteral *
+CImporter::matchStringViewLiteralInit(const clang::VarDecl *var) {
+  // W2.12: the one recognized shape is copy-initialization from an
+  // ordinary string literal through string_view's `const char*`
+  // converting constructor — under C++17's guaranteed elision the AST is
+  // exactly ImplicitCastExpr<ConstructorConversion> -> CXXConstructExpr
+  // 'void (const char *)' -> ArrayToPointerDecay -> StringLiteral, with
+  // any trailing CXXDefaultArgExpr-filled arguments treated as absent
+  // (mirroring the std::string literal-ctor classification).
+  const clang::Expr *init = var->getInit();
+  if (!init)
+    return nullptr;
+  const clang::Expr *e = init->IgnoreParens();
+  if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e))
+    e = cleanups->getSubExpr()->IgnoreParens();
+  const auto *conversion = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+  if (!conversion ||
+      conversion->getCastKind() != clang::CK_ConstructorConversion)
+    return nullptr;
+  const auto *construct = llvm::dyn_cast<clang::CXXConstructExpr>(
+      conversion->getSubExpr()->IgnoreParens());
+  if (!construct)
+    return nullptr;
+  const clang::Expr *pointerArg = nullptr;
+  for (const clang::Expr *arg : construct->arguments()) {
+    if (llvm::isa<clang::CXXDefaultArgExpr>(arg))
+      continue;
+    if (pointerArg)
+      return nullptr; // Two real arguments: the (pointer, count) ctor.
+    pointerArg = arg;
+  }
+  if (!pointerArg)
+    return nullptr;
+  const auto *decay =
+      llvm::dyn_cast<clang::ImplicitCastExpr>(pointerArg->IgnoreParens());
+  if (!decay || decay->getCastKind() != clang::CK_ArrayToPointerDecay)
+    return nullptr;
+  const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+      decay->getSubExpr()->IgnoreParens());
+  if (!literal || !literal->isOrdinary())
+    return nullptr;
+  return literal;
+}
+
+LogicalResult
+CImporter::emitStringViewLocal(const clang::VarDecl *var,
+                               const clang::StringLiteral *literal,
+                               Location loc) {
+  // W2.12: the decomposition — the literal's shared read-only backing
+  // (bytes plus the terminating NUL, reused across every consumer of the
+  // same literal in this function), an i64 cursor cell starting at byte
+  // 0, and an i64 len cell starting at the literal's length WITHOUT the
+  // NUL (a view never includes the terminator). The cells are ordinary
+  // entry allocas, so the pipeline's mem2reg/promotion applies unchanged.
+  FailureOr<Value> backing = getOrCreateLiteralBacking(literal, loc);
+  if (failed(backing))
+    return failure();
+  IntegerType i64Type = builder.getIntegerType(64);
+  Value cursorCell = createEntryAlloca(loc, i64Type);
+  Value lenCell = createEntryAlloca(loc, i64Type);
+  builder.create<memref::StoreOp>(loc, createIntConstant(loc, i64Type, 0),
+                                  cursorCell);
+  builder.create<memref::StoreOp>(
+      loc,
+      createIntConstant(loc, i64Type,
+                        static_cast<int64_t>(literal->getLength())),
+      lenCell);
+  stringViewLocals[var] = StringViewLocalInfo{*backing, cursorCell, lenCell};
+  return success();
 }
 
 LogicalResult CImporter::emitStringFillLocal(const clang::VarDecl *var,

@@ -426,6 +426,15 @@ bool CImporter::isStdOptionalRecordType(clang::QualType type) {
          decl->getName() == "optional";
 }
 
+bool CImporter::isStdStringViewRecordType(clang::QualType type) {
+  const auto *record = type.getCanonicalType()->getAs<clang::RecordType>();
+  if (!record)
+    return false;
+  const clang::RecordDecl *decl = record->getDecl();
+  return decl->isInStdNamespace() && decl->getIdentifier() &&
+         decl->getName() == "basic_string_view";
+}
+
 bool CImporter::isStlOpaqueType(Type type) {
   auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
   return opaque && (opaque.getValue() == "String" ||

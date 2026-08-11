@@ -533,6 +533,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   addressTaken.clear();
   fileLocals.clear();
   pointerLocals.clear();
+  stringViewLocals.clear();
   pointerPointerLocals.clear();
   carrierLocals.clear();
   carrierParams.clear();
@@ -1117,6 +1118,7 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   addressTaken.clear();
   fileLocals.clear();
   pointerLocals.clear();
+  stringViewLocals.clear();
   pointerPointerLocals.clear();
   carrierLocals.clear();
   carrierParams.clear();
