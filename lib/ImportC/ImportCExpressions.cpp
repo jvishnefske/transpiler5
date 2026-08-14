@@ -308,6 +308,20 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
         return failure();
       return emitStlConstruct(*optionalType, construct, loc);
     }
+    // W2.14: a std::variant VALUE construction (`return 7;` in a
+    // variant-returning function, a converting by-value argument) routes
+    // to emitVariantConstruct, which yields the enum_variant rvalue
+    // directly. Intercepted BEFORE the generic trivial-copy unwrap for
+    // the same reason as optional above: the two-scalar variant's copy
+    // ctor is trivial, so a copy of an existing variant would otherwise
+    // slip through; emitVariantConstruct's copy/move guard keeps it a
+    // located rejection this wave.
+    if (isStdVariantRecordType(construct->getType())) {
+      FailureOr<Type> variantType = mapType(construct->getType(), loc);
+      if (failed(variantType))
+        return failure();
+      return emitVariantConstruct(*variantType, construct, loc);
+    }
     if (ctor && ctor->isCopyOrMoveConstructor() && ctor->isTrivial() &&
         construct->getNumArgs() == 1)
       return emitRValue(construct->getArg(0));
@@ -490,6 +504,12 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
               llvm::dyn_cast<clang::FieldDecl>(memberExpr->getMemberDecl()))
         if (field->isBitField())
           return emitBitFieldRead(memberExpr, loc);
+    // W2.14: `std::get<T>(v)` returns `T&`; the value read of that
+    // reference IS the match expansion (there is no place for the
+    // result), so the free-function call is intercepted here before the
+    // generic lvalue path below would try to form one.
+    if (const clang::CallExpr *getCall = matchVariantGetCall(sub))
+      return emitVariantGet(getCall);
     FailureOr<Value> place = emitLValue(sub);
     if (failed(place))
       return failure();
@@ -1991,6 +2011,30 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   }
   if (!callee->getDeclName().isIdentifier())
     return emitError(loc) << "unsupported callee";
+  // W2.14: the std::variant FREE-function vocabulary — the first
+  // std-namespace free-function interception in this dispatch (members
+  // and operators divert above; a free `std::get` would otherwise fall
+  // to the unspecific system-header/unimported-function rejections).
+  // `std::get<T>` over a recognized variant expands to its RESULT-mode
+  // match; holds_alternative and visit stay located rejections this wave
+  // (no alternative-state tracker exists, and visit's callable dispatch
+  // has no image). Gated on the argument's record shape so the
+  // same-named functions over pairs/tuples/arrays keep their historical
+  // diagnostics.
+  if (callee->isInStdNamespace()) {
+    llvm::StringRef stdName = callee->getName();
+    if (call->getNumArgs() >= 1 &&
+        isStdVariantRecordType(call->getArg(0)->getType())) {
+      if (stdName == "get")
+        return emitVariantGet(call);
+      if (stdName == "holds_alternative")
+        return emitError(loc) << "unsupported: std::holds_alternative is "
+                                 "not a recognized STL function";
+    }
+    if (stdName == "visit")
+      return emitError(loc)
+             << "unsupported: std::visit is not a recognized STL function";
+  }
   // The hosted (definition-less) printf lowering is statement-position
   // only; a project-supplied printf definition is an ordinary imported
   // function whose result is an ordinary value in every position.
@@ -2649,6 +2693,40 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
       return emitError(loc) << "unsupported: std::array::" << methodName
                             << " is not a recognized STL method";
     }
+    // W2.14: a std::variant receiver (a synthesized `!emitrust.data_enum`
+    // place). Its one recognized method is `index()`, expanded to a
+    // RESULT-mode exhaustive match minting the alternative's declaration
+    // index as an i32 constant per arm, then cast to the call's declared
+    // size_t (mirroring emitLenCall's cast convention). Everything else —
+    // valueless_by_exception (exception-machinery state the importer's
+    // exception-free subset can never reach), emplace, swap, ... — is a
+    // located rejection naming the entity.
+    if (auto dataEnum = llvm::dyn_cast<emitrust::DataEnumType>(
+            receiverLValueType.getValueType())) {
+      if (methodName == "index" && call->getNumArgs() == 0) {
+        Value scrutinee = loadPlace(loc, *receiver);
+        IntegerType i32Type = builder.getIntegerType(32);
+        emitrust::MatchOp match = createVariantMatch(
+            loc, scrutinee, dataEnum, i32Type, [&](unsigned index, Value) {
+              Value constant = createIntConstant(loc, i32Type, index);
+              builder.create<emitrust::YieldOp>(loc, ValueRange{constant});
+            });
+        FailureOr<Type> resultType = mapType(call->getType(), loc);
+        if (failed(resultType))
+          return failure();
+        auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+        if (!intType)
+          return emitError(loc) << "unsupported: index result type";
+        Value result = match.getResult();
+        if (intType != i32Type)
+          result =
+              builder.create<emitrust::CastOp>(loc, intType, result)
+                  .getResult();
+        return result;
+      }
+      return emitError(loc) << "unsupported: std::variant::" << methodName
+                            << " is not a recognized STL method";
+    }
   }
   auto opaque = receiverLValueType ? llvm::dyn_cast<emitrust::OpaqueType>(
                                          receiverLValueType.getValueType())
@@ -2947,6 +3025,40 @@ CImporter::emitStlOperatorCall(const clang::CXXOperatorCallExpr *call) {
     return failure();
   auto receiverLValueType =
       llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+  // W2.14: a std::variant receiver (a synthesized `!emitrust.data_enum`
+  // place). operator= from an alternative VALUE re-tags the place with a
+  // fresh enum_variant — assignment replaces the held alternative
+  // wholesale on both sides, so no in-place mutation image is needed;
+  // the alternative is selected by EXACT mapped-type equality, like the
+  // converting ctor. Every other operator (==, <, ...) and every other
+  // right-hand shape (another variant, a non-alternative value) is a
+  // located rejection naming the entity.
+  if (receiverLValueType) {
+    if (auto dataEnum = llvm::dyn_cast<emitrust::DataEnumType>(
+            receiverLValueType.getValueType())) {
+      if (call->getOperator() != clang::OO_Equal)
+        return emitError(loc)
+               << "unsupported: std::variant::operator"
+               << clang::getOperatorSpelling(call->getOperator())
+               << " is not a recognized STL method";
+      if (call->getNumArgs() != 2)
+        return emitError(loc)
+               << "unsupported: operator= requires exactly one argument";
+      FailureOr<Value> rhs = emitRValue(call->getArg(1));
+      if (failed(rhs))
+        return failure();
+      std::optional<unsigned> index =
+          variantAltIndex(dataEnum, (*rhs).getType());
+      if (!index)
+        return emitError(loc)
+               << "unsupported: std::variant::operator= right-hand side "
+                  "type";
+      Value value = createVariantValue(loc, dataEnum, *index, *rhs);
+      if (failed(storeToPlace(loc, *receiver, value)))
+        return failure();
+      return Value();
+    }
+  }
   auto opaque = receiverLValueType ? llvm::dyn_cast<emitrust::OpaqueType>(
                                          receiverLValueType.getValueType())
                                    : emitrust::OpaqueType();
@@ -3045,6 +3157,101 @@ CImporter::emitStlOperatorCall(const clang::CXXOperatorCallExpr *call) {
     return emitError(loc) << "unsupported: this STL operator is not a "
                              "recognized STL method";
   }
+}
+
+emitrust::MatchOp CImporter::createVariantMatch(
+    Location loc, Value scrutinee, emitrust::DataEnumType enumType,
+    Type resultType,
+    llvm::function_ref<void(unsigned index, Value payload)> buildArm) {
+  llvm::SmallVector<Type, 2> alternatives =
+      variantEnumAlternatives.lookup(enumType.getName());
+  auto match = builder.create<emitrust::MatchOp>(
+      loc, resultType ? TypeRange{resultType} : TypeRange{}, scrutinee,
+      builder.getStrArrayAttr({"V0", "V1"}), /*caseRegionsCount=*/2);
+  OpBuilder::InsertionGuard guard(builder);
+  for (unsigned index = 0; index < 2; ++index) {
+    Block &block = match.getCaseRegions()[index].emplaceBlock();
+    Value payload = block.addArgument(alternatives[index], loc);
+    builder.setInsertionPointToStart(&block);
+    buildArm(index, payload);
+  }
+  return match;
+}
+
+const clang::CallExpr *CImporter::matchVariantGetCall(const clang::Expr *e) {
+  const auto *call = llvm::dyn_cast<clang::CallExpr>(e->IgnoreParens());
+  if (!call || llvm::isa<clang::CXXMemberCallExpr>(call) ||
+      call->getNumArgs() != 1)
+    return nullptr;
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  if (!callee || !callee->isInStdNamespace() ||
+      !callee->getDeclName().isIdentifier() || callee->getName() != "get")
+    return nullptr;
+  if (!isStdVariantRecordType(call->getArg(0)->getType()))
+    return nullptr;
+  return call;
+}
+
+FailureOr<Value> CImporter::emitVariantGet(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  const clang::FunctionDecl *callee = call->getDirectCallee();
+  const clang::TemplateArgumentList *templateArgs =
+      callee->getTemplateSpecializationArgs();
+  if (!templateArgs || templateArgs->size() < 1)
+    return emitError(loc)
+           << "unsupported: std::get shape could not be determined";
+  const clang::TemplateArgument &selector = templateArgs->get(0);
+  if (selector.getKind() != clang::TemplateArgument::Type)
+    return emitError(loc)
+           << "unsupported: std::get<index> over a std::variant (only the "
+              "alternative-type form std::get<T> is recognized)";
+  FailureOr<Value> receiver =
+      emitLValue(call->getArg(0)->IgnoreParenImpCasts());
+  if (failed(receiver))
+    return failure();
+  auto receiverLValueType =
+      llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+  auto enumType = receiverLValueType
+                      ? llvm::dyn_cast<emitrust::DataEnumType>(
+                            receiverLValueType.getValueType())
+                      : emitrust::DataEnumType();
+  if (!enumType)
+    return emitError(loc) << "unsupported: std::get receiver is not a "
+                             "recognized std::variant local";
+  FailureOr<Type> requested = mapType(selector.getAsType(), loc);
+  if (failed(requested))
+    return failure();
+  std::optional<unsigned> held = variantAltIndex(enumType, *requested);
+  if (!held)
+    return emitError(loc) << "unsupported: std::get type argument is not "
+                             "an alternative of this std::variant";
+  // The held arm yields its payload; the OTHER arm diverges through the
+  // panic! image (already in the emitter's diverging set, so the
+  // mandatory RESULT-mode yield after it — carrying a dummy typed
+  // operand the emitter provably drops — never renders). C++ throws
+  // bad_variant_access here; catch is unsupported, so no program in the
+  // supported subset can observe the difference.
+  emitrust::MatchOp match = createVariantMatch(
+      loc, loadPlace(loc, *receiver), enumType, *requested,
+      [&](unsigned index, Value payload) {
+        if (index == *held) {
+          builder.create<emitrust::YieldOp>(loc, ValueRange{payload});
+          return;
+        }
+        Attribute message =
+            builder.getStringAttr("std::get: wrong variant alternative");
+        builder.create<emitrust::CallOpaqueOp>(
+            loc, TypeRange(), builder.getStringAttr("panic!"),
+            builder.getArrayAttr({message}), ValueRange());
+        Value dummy =
+            builder
+                .create<arith::ConstantOp>(
+                    loc,
+                    llvm::cast<TypedAttr>(builder.getZeroAttr(*requested)))
+                .getResult();
+        builder.create<emitrust::YieldOp>(loc, ValueRange{dummy});
+      });
+  return match.getResult();
 }
 
 FailureOr<Value> CImporter::emitMethodCallSite(

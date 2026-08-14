@@ -25,6 +25,13 @@
 // RUN: not emitrust-import-c %t/lambda-nonscalar-capture.cpp 2>&1 | FileCheck %s --check-prefix=LAMNONSCALAR
 // RUN: not emitrust-import-c %t/lambda-escape-copy.cpp 2>&1 | FileCheck %s --check-prefix=LAMESCCOPY
 // RUN: not emitrust-import-c %t/lambda-escape-arg.cpp 2>&1 | FileCheck %s --check-prefix=LAMESCARG
+// RUN: not emitrust-import-c %t/variant-three.cpp 2>&1 | FileCheck %s --check-prefix=VARTHREE
+// RUN: not emitrust-import-c %t/variant-duplicate.cpp 2>&1 | FileCheck %s --check-prefix=VARDUP
+// RUN: not emitrust-import-c %t/variant-nonscalar.cpp 2>&1 | FileCheck %s --check-prefix=VARNONSCALAR
+// RUN: not emitrust-import-c %t/variant-holds.cpp 2>&1 | FileCheck %s --check-prefix=VARHOLDS
+// RUN: not emitrust-import-c %t/variant-visit.cpp 2>&1 | FileCheck %s --check-prefix=VARVISIT
+// RUN: not emitrust-import-c %t/variant-get-index.cpp 2>&1 | FileCheck %s --check-prefix=VARGETIDX
+// RUN: not emitrust-import-c %t/variant-valueless.cpp 2>&1 | FileCheck %s --check-prefix=VARVALUELESS
 
 // W2.3 located rejections: every construct explicitly OUT of the STL
 // recognition surface this wave, authored so a later wave has a documented
@@ -334,4 +341,93 @@ int use(void) {
   int a = 1;
   auto f = [a](int x) { return a + x; };
   return apply(f);
+}
+
+//--- variant-three.cpp
+#include <variant>
+// W2.14 frontier: only a TWO-alternative std::variant synthesizes the
+// closed data enum (the match expansions and the V0/V1 image are
+// two-arm by construction); any other arity is a located type-level
+// rejection.
+// VARTHREE: variant-three.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: only a two-alternative std::variant is recognized
+int use(void) {
+  std::variant<int, double, char> t;
+  return 0;
+}
+
+//--- variant-duplicate.cpp
+#include <variant>
+// W2.14 frontier: duplicate alternatives are indistinguishable BY TYPE
+// at every use site (the converting ctor, operator=, and std::get<T>
+// all select the variant by exact mapped-type equality), so the shape
+// stays a type-level rejection. NOTE the default-ctor spelling: the
+// `= 1` form is ill-formed C++ (ambiguous converting ctor) and dies in
+// the clang frontend before the importer runs.
+// VARDUP: variant-duplicate.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::variant with duplicate alternatives
+int use(void) {
+  std::variant<int, int> d;
+  return 0;
+}
+
+//--- variant-nonscalar.cpp
+#include <string>
+#include <variant>
+// W2.14 frontier: only scalar (signed-integer/floating) alternatives
+// are in this wave's set — a std::string alternative maps to an owned
+// String, which the Copy-deriving data_enum_def payload field set
+// cannot hold.
+// VARNONSCALAR: variant-nonscalar.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::variant alternative type is not in the supported scalar set
+int use(void) {
+  std::variant<int, std::string> s;
+  return 0;
+}
+
+//--- variant-holds.cpp
+#include <variant>
+// W2.14 frontier: holds_alternative is OUT this wave (the corpus only
+// gets the held alternative; no alternative-state tracker exists in the
+// importer) — a located FREE-function rejection, since std::variant's
+// vocabulary lives in free functions, not methods.
+// VARHOLDS: variant-holds.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::holds_alternative is not a recognized STL function
+int use(void) {
+  std::variant<int, double> v = 1;
+  bool h = std::holds_alternative<int>(v);
+  return (int)h;
+}
+
+//--- variant-visit.cpp
+#include <variant>
+// W2.14 frontier: std::visit's callable dispatch has no image (the
+// visitor is a generic lambda — a template the importer never admits);
+// rejected AT THE CALL, before the visitor is ever imported.
+// VARVISIT: variant-visit.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::visit is not a recognized STL function
+int use(void) {
+  std::variant<int, double> v = 1;
+  std::visit([](auto) {}, v);
+  return 0;
+}
+
+//--- variant-get-index.cpp
+#include <variant>
+// W2.14 frontier: only the alternative-TYPE form std::get<T> is
+// recognized (the type selects the held arm of the match expansion);
+// the index form get<0> would need the same selection routed through
+// an integral template argument — a located rejection this wave.
+// VARGETIDX: variant-get-index.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::get<index> over a std::variant (only the alternative-type form std::get<T> is recognized)
+int use(void) {
+  std::variant<int, double> v = 1;
+  int g = std::get<0>(v);
+  return g;
+}
+
+//--- variant-valueless.cpp
+#include <variant>
+// W2.14 frontier: valueless_by_exception is exception-machinery state
+// the importer's exception-free subset can never reach; it falls to the
+// per-class STL-method rejection naming the entity.
+// VARVALUELESS: variant-valueless.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::variant::valueless_by_exception is not a recognized STL method
+int use(void) {
+  std::variant<int, double> v = 1;
+  bool b = v.valueless_by_exception();
+  return (int)b;
 }
