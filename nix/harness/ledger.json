@@ -43,6 +43,16 @@
             "held_out_total": 96
           },
           "note": "bool_comparison: fold cmp-vs-bool-literal -- identity / !name / exact integer predicate inversion; float-order and compound bool stay unfolded"
+        },
+        {
+          "emitter_rev": "8c6868295f8d695f8719220a0a95c534c832af70",
+          "timestamp": "2026-08-14T16:29:20",
+          "metrics": {
+            "total_warnings": 414,
+            "train_total": 328,
+            "held_out_total": 83
+          },
+          "note": "field_reassign_with_default: fuse default-init struct locals with the adjacent field-store prefix into a functional-update literal (all-fields drops the base, shorthand when text==field)"
         }
       ]
     }
