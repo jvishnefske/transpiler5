@@ -977,6 +977,45 @@ static bool isVacuousAssert(Operation *op) {
   return flag && flag.getType().isInteger(1) && !flag.getValue().isZero();
 }
 
+/// FR-63 (clippy::identity_op): the lhs of a shift whose amount is the
+/// literal integer 0, or null. `x << 0` / `x >> 0` compute exactly `x` for
+/// every integer type (a zero amount shifts in no bits, and it is always
+/// below the width, so no panic path exists either;
+/// `SameOperandsAndResultType` makes the lhs's type the result's), so
+/// `emitBinary` renders the lhs ALONE. Only the literal-zero constant
+/// amount qualifies: a non-zero or non-constant amount keeps the infix
+/// rendering, and no other identity (`+ 0`, `* 1`, `| 0`, ...) folds here.
+static Value zeroShiftLhs(Operation *op) {
+  if (!op || !isa<emitrust::ShlOp, emitrust::ShrOp>(op))
+    return Value();
+  auto constant = op->getOperand(1).getDefiningOp<emitrust::ConstantOp>();
+  if (!constant)
+    return Value();
+  auto amount = dyn_cast<IntegerAttr>(constant.getValue());
+  if (!amount || !amount.getValue().isZero())
+    return Value();
+  return op->getOperand(0);
+}
+
+/// FR-63 (clippy::identity_op): whether `use` is the never-rendered zero
+/// amount of a folded shift, so read-tracking must not count it (a zero
+/// constant read only by folded shifts would otherwise orphan a `let`).
+/// One carve-out keeps read-tracking aligned with emission: a zero-shift
+/// consumed as an assign's VALUE may render through the FR-63
+/// compound-assign path (`x <<= 0`), which prints the amount verbatim --
+/// that pre-existing dead-statement shape is out of this fold's scope --
+/// so the amount stays read there.
+static bool isDroppedZeroShiftAmount(OpOperand &use) {
+  Operation *owner = use.getOwner();
+  if (use.getOperandNumber() != 1 || !zeroShiftLhs(owner))
+    return false;
+  for (Operation *user : owner->getResult(0).getUsers())
+    if (auto assign = dyn_cast<emitrust::AssignOp>(user))
+      if (assign.getValue() == owner->getResult(0))
+        return false;
+  return true;
+}
+
 bool RustEmitter::valueIsRead(Value value) {
   auto it = valueReadCache.find(value);
   if (it != valueReadCache.end())
@@ -997,6 +1036,11 @@ bool RustEmitter::valueIsReadUncached(Value value) {
     // guard) never emits, so it is not a real read.
     if (unreachableOps.count(owner) || deadStores.count(owner) ||
         droppedOps.count(owner) || isVacuousAssert(owner))
+      continue;
+    // FR-63 (clippy::identity_op): the literal-zero amount of a folded
+    // shift never renders (`emitBinary` emits the lhs alone), so that use
+    // is not a read. The lhs use (operand 0) keeps its ordinary read.
+    if (isDroppedZeroShiftAmount(use))
       continue;
     // A `let` whose dead initializer we dropped no longer reads its init
     // operand, so that use does not keep `value` live.
@@ -1928,12 +1972,14 @@ void RustEmitter::computeInlineCandidates(emitrust::FuncOp funcOp) {
     if (op == tailFoldCandidate)
       return;
     // Collect the REAL uses (uses inside unreachable code, dropped dead
-    // stores, dropped pure ops, or FR-63 vacuous asserts never render).
+    // stores, dropped pure ops, FR-63 vacuous asserts, or the FR-63 folded
+    // zero-shift amount never render).
     SmallVector<OpOperand *, 4> realUses;
     for (OpOperand &use : op->getResult(0).getUses()) {
       Operation *owner = use.getOwner();
       if (unreachableOps.count(owner) || deadStores.count(owner) ||
-          droppedOps.count(owner) || isVacuousAssert(owner))
+          droppedOps.count(owner) || isVacuousAssert(owner) ||
+          isDroppedZeroShiftAmount(use))
         continue;
       realUses.push_back(&use);
     }
@@ -2009,7 +2055,17 @@ Prec RustEmitter::capturedPrec(Operation *op, StringRef text) {
       .Case<emitrust::AndOp>([](auto) { return Prec::BitAnd; })
       .Case<emitrust::OrOp>([](auto) { return Prec::BitOr; })
       .Case<emitrust::XorOp>([](auto) { return Prec::BitXor; })
-      .Case<emitrust::ShlOp, emitrust::ShrOp>([](auto) { return Prec::Shift; })
+      .Case<emitrust::ShlOp, emitrust::ShrOp>([&](Operation *shift) {
+        // FR-63 (clippy::identity_op): a zero-amount shift renders its
+        // lhs's text alone -- inherit its rank (a plain name is an atom),
+        // or a consumer would parenthesize for the Shift rank that was
+        // never emitted.
+        if (Value lhs = zeroShiftLhs(shift)) {
+          auto it = inlineExprs.find(lhs);
+          return it != inlineExprs.end() ? it->second.prec : Prec::Postfix;
+        }
+        return Prec::Shift;
+      })
       .Case<emitrust::CmpOp>([&](emitrust::CmpOp cmp) {
         // FR-63 (clippy::bool_comparison): the rank must match the shape
         // `emitCmp` actually rendered, or a consumer drops needed parens.
@@ -2105,8 +2161,16 @@ bool RustEmitter::capturedEndsInCast(Operation *op) {
           [&](Operation *b) { return rhsEndsInCast(b, Prec::BitOr); })
       .Case<emitrust::XorOp>(
           [&](Operation *b) { return rhsEndsInCast(b, Prec::BitXor); })
-      .Case<emitrust::ShlOp, emitrust::ShrOp>(
-          [&](Operation *b) { return rhsEndsInCast(b, Prec::Shift); })
+      .Case<emitrust::ShlOp, emitrust::ShrOp>([&](Operation *b) {
+        // FR-63 (clippy::identity_op): the folded zero-shift's text is the
+        // lhs's alone -- inherit its trailing-cast property (a bare cast
+        // left of a shift/comparison must still wrap).
+        if (Value lhs = zeroShiftLhs(b)) {
+          auto it = inlineExprs.find(lhs);
+          return it != inlineExprs.end() && it->second.endsInCast;
+        }
+        return rhsEndsInCast(b, Prec::Shift);
+      })
       .Case<emitrust::CmpOp>([&](emitrust::CmpOp cmp) {
         // FR-63 (clippy::bool_comparison): the trailing-cast property must
         // match the shape `emitCmp` actually rendered.
@@ -3929,6 +3993,23 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
 }
 
 LogicalResult RustEmitter::emitBinary(Operation *op, StringRef symbol) {
+  // FR-63 (clippy::identity_op): a shift by the literal 0 is the identity
+  // on every integer type; render the lhs ALONE. The right-hand side is
+  // the never-parenthesized Stmt position, so the lhs's text renders
+  // exactly as it would at its own statement, and `capturedPrec` /
+  // `capturedEndsInCast` inherit the lhs's classification so consumers
+  // parenthesize the text that was ACTUALLY emitted. Spelling only: the
+  // computed value is bit-identical, and the dropped amount is excluded
+  // from read-tracking (`isDroppedZeroShiftAmount`) so it cannot orphan a
+  // binding.
+  if (Value lhs = zeroShiftLhs(op)) {
+    if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+      return failure();
+    if (failed(emitOperand(op->getLoc(), lhs, ExprPos::stmt())))
+      return failure();
+    os << ";\n";
+    return success();
+  }
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
   Prec rank = infixPrec(symbol);
