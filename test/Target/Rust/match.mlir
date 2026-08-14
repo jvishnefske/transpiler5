@@ -152,11 +152,14 @@ emitrust.func @match_in_loop(%arg0: i32) {
 
 // The enum comparisons feed a sink so their rendering stays pinned (an
 // unused pure cmp would drop, FR-61d); the single-use opaque constant
-// `Color::Green` inlines as-is into the comparison.
+// `Color::Green` inlines as-is into the comparison. Color's underlying is
+// signed, so the enum-to-int raw read's ` as i32` is the identity on the
+// i32 field and drops (FR-63 clippy::unnecessary_cast, pinned in
+// cast-identity.mlir): the tail renders the bare raw read `v0.0`.
 // CHECK-LABEL: fn enum_ops(v0: Color, v1: Color) -> i32 {
 // CHECK-NEXT:    let _v2: Color = Color::default();
 // CHECK-NEXT:    sink(v0 == v1, v0 != Color::Green);
-// CHECK-NEXT:    v0.0 as i32
+// CHECK-NEXT:    v0.0
 // CHECK-NEXT:  }
 emitrust.func @enum_ops(%arg0: !emitrust.enum<"Color">, %arg1: !emitrust.enum<"Color">) -> i32 {
   %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>

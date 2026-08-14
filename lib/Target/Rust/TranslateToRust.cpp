@@ -1016,6 +1016,60 @@ static bool isDroppedZeroShiftAmount(OpOperand &use) {
   return true;
 }
 
+/// FR-63 (clippy::unnecessary_cast): the enum def `enumType` names, or null
+/// when none is visible from `op` (no def keeps today's rendering -- the
+/// conservative direction).
+static emitrust::EnumDefOp lookupEnumDef(Operation *op,
+                                         emitrust::EnumType enumType) {
+  return SymbolTable::lookupNearestSymbolFrom<emitrust::EnumDefOp>(
+      op, StringAttr::get(op->getContext(), enumType.getName()));
+}
+
+/// FR-63 (clippy::unnecessary_cast): whether `type` renders exactly as the
+/// open enum's tuple-struct raw field (`u32` under `unsigned_underlying`,
+/// else `i32` -- the two spellings `emitCast`'s constructor branch prints).
+static bool rendersAsEnumUnderlying(emitrust::EnumDefOp enumDef, Type type) {
+  auto intType = dyn_cast<IntegerType>(type);
+  return intType && intType.getWidth() == 32 &&
+         intType.isUnsigned() == enumDef.getUnsignedUnderlying();
+}
+
+/// FR-63 (clippy::unnecessary_cast): whether the ` as T` tail of a
+/// non-enum-result cast is the identity -- the rendered source expression
+/// already has the rendered target type -- so `emitCast` drops it. Two
+/// source shapes qualify: an enum-typed source reads its raw field
+/// (`<recv>.0`, typed by the def's u32/i32 underlying), identity exactly
+/// when T matches that underlying (`c.0 as i32` over a u32 field is a REAL
+/// conversion and keeps its cast); any other source renders at its own
+/// type, identity when source and target types render alike -- `emitType`
+/// spells signless and signed integers identically (`iN`), so rendered,
+/// not nominal, equality is the authority. `i1` renders `bool`: a cast TO
+/// bool is rejected upstream and a bool source is a real conversion, so
+/// neither joins. The enum-CONSTRUCTION identity (`Name(x as i32)` ->
+/// `Name(x)`) is a separate site inside the ctor parens, handled in
+/// `emitCast`'s enum-result branch; it never changes the captured
+/// Postfix/no-tail classification, while this tail drop does (see
+/// `capturedPrec` / `capturedEndsInCast`).
+static bool isIdentityCastTail(emitrust::CastOp castOp) {
+  Operation *op = castOp.getOperation();
+  Type resultType = op->getResult(0).getType();
+  if (isa<emitrust::EnumType>(resultType) || resultType.isInteger(1))
+    return false;
+  Type sourceType = op->getOperand(0).getType();
+  if (auto enumType = dyn_cast<emitrust::EnumType>(sourceType)) {
+    auto enumDef = lookupEnumDef(op, enumType);
+    return enumDef && rendersAsEnumUnderlying(enumDef, resultType);
+  }
+  if (sourceType == resultType)
+    return true;
+  auto sourceInt = dyn_cast<IntegerType>(sourceType);
+  auto resultInt = dyn_cast<IntegerType>(resultType);
+  return sourceInt && resultInt &&
+         sourceInt.getWidth() == resultInt.getWidth() &&
+         sourceInt.getWidth() != 1 &&
+         sourceInt.isUnsigned() == resultInt.isUnsigned();
+}
+
 bool RustEmitter::valueIsRead(Value value) {
   auto it = valueReadCache.find(value);
   if (it != valueReadCache.end())
@@ -2086,11 +2140,23 @@ Prec RustEmitter::capturedPrec(Operation *op, StringRef text) {
         }
         return Prec::Compare;
       })
-      .Case<emitrust::CastOp>([&](auto) {
+      .Case<emitrust::CastOp>([&](emitrust::CastOp castOp) {
         // The enum-target form renders `Name(x as i32)`, a postfix call.
-        return isa<emitrust::EnumType>(op->getResult(0).getType())
-                   ? Prec::Postfix
-                   : Prec::Cast;
+        if (isa<emitrust::EnumType>(op->getResult(0).getType()))
+          return Prec::Postfix;
+        // FR-63 (clippy::unnecessary_cast): a dropped identity tail leaves
+        // the source text alone -- `<recv>.0` (a postfix chain) for an
+        // enum source; otherwise inherit the operand's rank (a plain name
+        // is an atom), or a consumer would parenthesize for the Cast rank
+        // that was never emitted -- or worse, DROP parens a looser
+        // inherited rank still needs.
+        if (isIdentityCastTail(castOp)) {
+          if (isa<emitrust::EnumType>(op->getOperand(0).getType()))
+            return Prec::Postfix;
+          auto it = inlineExprs.find(op->getOperand(0));
+          return it != inlineExprs.end() ? it->second.prec : Prec::Postfix;
+        }
+        return Prec::Cast;
       })
       .Case<emitrust::BitcastOp>([&](auto) {
         // `fW::from_bits(..)` is postfix; `x.to_bits()` is too unless the
@@ -2136,9 +2202,22 @@ bool RustEmitter::rhsEndsInCast(Operation *op, Prec rank) {
 
 bool RustEmitter::capturedEndsInCast(Operation *op) {
   return llvm::TypeSwitch<Operation *, bool>(op)
-      .Case<emitrust::CastOp>([&](auto) {
+      .Case<emitrust::CastOp>([&](emitrust::CastOp castOp) {
         // The enum-target form `Name(x as i32)` ends in `)`.
-        return !isa<emitrust::EnumType>(op->getResult(0).getType());
+        if (isa<emitrust::EnumType>(op->getResult(0).getType()))
+          return false;
+        // FR-63 (clippy::unnecessary_cast): the dropped identity tail's
+        // text ends in `.0` for an enum source (never a cast); otherwise
+        // it is the operand's own property -- which may itself be true
+        // when the operand ends in a surviving REAL cast
+        // (`x as u32 as u32` drops only the outer identity).
+        if (isIdentityCastTail(castOp)) {
+          if (isa<emitrust::EnumType>(op->getOperand(0).getType()))
+            return false;
+          auto it = inlineExprs.find(op->getOperand(0));
+          return it != inlineExprs.end() && it->second.endsInCast;
+        }
+        return true;
       })
       .Case<emitrust::BitcastOp>([&](auto) {
         // Only the signless-int result appends the ` as iW` tail.
@@ -4327,6 +4406,21 @@ LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
     if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
       return failure();
     os << enumType.getName() << "(";
+    // FR-63 (clippy::unnecessary_cast): the constructor argument converts
+    // to the raw field's type; when the operand already renders at exactly
+    // that type the ` as u32/i32` is the identity and drops -- the operand
+    // then sits bare between the call parens (Delimited, which never
+    // parenthesizes), so an infix operand also sheds its cast-source
+    // parens: `Temp((v - 4i32) as i32)` -> `Temp(v - 4i32)`. Any width or
+    // signedness conversion keeps the cast; the ctor's Postfix/no-tail
+    // classification is unchanged either way.
+    if (rendersAsEnumUnderlying(enumDef, op->getOperand(0).getType())) {
+      if (failed(emitOperand(op->getLoc(), op->getOperand(0),
+                             ExprPos::delimited())))
+        return failure();
+      os << ");\n";
+      return success();
+    }
     if (failed(emitOperand(op->getLoc(), op->getOperand(0),
                            ExprPos::castSource())))
       return failure();
@@ -4339,6 +4433,26 @@ LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
   // An enum-typed source gets `.0` appended (postfix binds tighter than
   // `as`), so it needs the stricter receiver parenthesization.
   bool enumSource = isa<emitrust::EnumType>(op->getOperand(0).getType());
+  // FR-63 (clippy::unnecessary_cast): an identity ` as T` tail drops. The
+  // enum source keeps its `.0` raw read (the field IS the target type);
+  // any other source renders exactly as it would at its own statement
+  // (Stmt never parenthesizes), and `capturedPrec`/`capturedEndsInCast`
+  // inherit its classification so consumers parenthesize the text that
+  // was ACTUALLY emitted. Spelling only: the operand is still read, so no
+  // binding is orphaned and read-tracking is untouched.
+  if (isIdentityCastTail(castOp)) {
+    if (enumSource) {
+      if (failed(emitOperand(op->getLoc(), op->getOperand(0),
+                             ExprPos::receiver())))
+        return failure();
+      os << ".0";
+    } else if (failed(emitOperand(op->getLoc(), op->getOperand(0),
+                                  ExprPos::stmt()))) {
+      return failure();
+    }
+    os << ";\n";
+    return success();
+  }
   if (failed(emitOperand(op->getLoc(), op->getOperand(0),
                          enumSource ? ExprPos::receiver()
                                     : ExprPos::castSource())))
