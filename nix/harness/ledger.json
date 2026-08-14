@@ -95,6 +95,22 @@
           "note": "assign_op_pattern: look through the lost-copy pass-through let alias + commutative operand-1 fold (integer Add/Mul/And/Or/Xor, pure RHS; floats and places excluded)"
         }
       ]
+    },
+    "2": {
+      "corpus_root": "test/EndToEnd",
+      "corpus_hash": "sha256:2ccc9683d1fedcebddb9c5b3114bf4ccaa8dbbbc0d035f4853363f9fbe1cc84d",
+      "revisions": [
+        {
+          "emitter_rev": "8425a675d50a0af33d27f9e9c9f94005f516ecbb",
+          "timestamp": "2026-08-14T17:26:12",
+          "metrics": {
+            "total_warnings": 331,
+            "train_total": 250,
+            "held_out_total": 81
+          },
+          "note": "unnecessary_cast: drop identity casts in the enum lowering (raw-field reads and ctor args already at the underlying type; signedness-changing and bool casts survive)"
+        }
+      ]
     }
   }
 }
