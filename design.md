@@ -4119,7 +4119,50 @@ piece and becomes FR-45.
   lib/ImportC/ImportCExpressions.cpp, tools/emitrust-clang/emitrust-clang.cpp,
   tools/emitrust-cc/LinkMerge.cpp, test/lit.cfg.py)
 
-## C99 Support Roadmap
+- [x] FR-67 GCC compile-database tolerance (Track 5 open defect: "the first
+  thing a real embedded user would hit, since almost every such project
+  ships a gcc build"). A `compile_commands.json` recorded from a GCC build
+  carries GCC-only warning flags (`-Wlogical-op`, `-Wno-psabi`, ...) plus
+  the project's `-Werror`; replayed through the clang frontend the unknown
+  flag becomes `-Werror,-Wunknown-warning-option` and the import dies on a
+  flag that has ZERO bearing on the AST. The importer's job is to build the
+  AST the project's own build would see — its warnings-as-errors POLICY is
+  the project's CI concern, not the importer's, and no `-W` flag changes
+  parse or semantics. Fix in `filterRecordedCommandLine`
+  (lib/ImportC/ClangProjectParser.cpp:248, the FR-45 argument filter):
+  (a) drop `-Werror` and `-Werror=*` (and `-pedantic-errors`) from recorded
+  command lines — recorded-database entries only, the no-`--compdb` path
+  stays bit-for-bit; (b) append `-Wno-unknown-warning-option` so GCC-only
+  `-W` spellings degrade to clang's ignorable unknown-warning note instead
+  of an error. Explicitly NOT dropped: `-W*` flags themselves (harmless
+  once unknown ones are non-fatal), `-D`/`-I`/`-std` (load-bearing),
+  `-f*`/`-m*` (ABI-relevant; unknown ones remain a loud frontend error by
+  design — silently dropping an ABI flag could change layout).
+  Gates: new lit test test/Project/compdb-gcc-flags.c (split-file db in
+  the compdb-filtered-args.c style) pinning: a db entry with
+  `-Werror -Wlogical-op` imports cleanly; `-Werror=format` is dropped;
+  an unknown `-fplugin=x.so`-style flag still fails loudly with clang's
+  own error; the no-compdb command line is unchanged (existing
+  compdb-* and Driver goldens all hold). Full lit 100%.
+  **SPIKE VERDICT: GO (2026-08-14).** Motivating failure reproduced
+  verbatim (`-Werror -Wlogical-op` -> "unknown warning option ...
+  [-Werror,-Wunknown-warning-option]", exit 1, no output). Differential
+  probes proved BOTH halves independently load-bearing: the suppressor
+  alone still dies on any genuine warning under the project's -Werror,
+  and the drop alone still dies on the unknown GCC flag. Trailing
+  suppressor position verified to override earlier flags; the filter
+  loops only over RECORDED entries, so a user's own --extra-arg=-Werror
+  is structurally never stripped (pinned with a real-warning witness).
+  Witness substitutions the spike forced: `-Werror=unused-variable` is
+  the behavioral pin for the -Werror=* drop (a format-string reproducer
+  dies earlier on the importer's own ArrayToPointerDecay rejection, so
+  -Werror=format only rides along); the unknown-flag frontier pin is
+  `-fbogus-flag-xyz` (`-fplugin=x.so` is a VALID clang flag) and checks
+  stderr text only — the spike measured that an unknown driver argument
+  prints clang's error but exits 0 WITH output on both the compdb and
+  no-compdb paths, a PRE-EXISTING fail-loudly gap (ImportC.cpp:5935/
+  :6067 status wiring) recorded here as the follow-up FR-68 candidate,
+  deliberately out of FR-67's scope.
 
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the

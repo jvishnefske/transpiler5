@@ -232,14 +232,23 @@ bool isCxxDriverName(llvm::StringRef argv0) {
 ///     path in the argument list, which the driver would take for a second
 ///     INPUT FILE and reject. (`ClangTool` installs overlapping default
 ///     `ArgumentsAdjuster`s, but filtering here keeps the contract
-///     explicit and independent of that default set.) Everything else —
-///     `-I`, `-isystem`, `-D`, `-std`, `-x`, `-f*`, `-W*`, and the input
-///     file itself — is preserved verbatim.
+///     explicit and independent of that default set.) FR-67 additionally
+///     drops the error-promotion flags `-Werror`, `-Werror=<diag>`, and
+///     `-pedantic-errors`: a database recorded from a GCC build replays
+///     GCC-only warning spellings through the clang frontend, where the
+///     project's own `-Werror` turns them into hard errors with zero
+///     bearing on the AST. Everything else — `-I`, `-isystem`, `-D`,
+///     `-std`, `-x`, `-f*`, the remaining `-W*` flags, and the input file
+///     itself — is preserved verbatim (`-f*`/`-m*` are ABI-relevant, so an
+///     unknown one stays a loud frontend error by design).
 ///  3. The importer's own required arguments are appended: the resource
-///     dir (`clangResourceDirArg`) and the `-Wno-error=int-conversion`
-///     demotion `buildCommandLine` documents, which no external database
-///     entry would ever carry, and finally the caller's `extraClangArgs`
-///     LAST so that `--extra-arg` can override the database.
+///     dir (`clangResourceDirArg`), the `-Wno-error=int-conversion`
+///     demotion `buildCommandLine` documents, and the FR-67
+///     `-Wno-unknown-warning-option` demotion (so a surviving GCC-only
+///     `-W` spelling degrades below even clang's note) — none of which an
+///     external database entry would ever carry — and finally the caller's
+///     `extraClangArgs` LAST so that `--extra-arg` can override the
+///     database (a USER-written `-Werror` is therefore never stripped).
 ///
 /// Trailing position is safe for all three: none of them is
 /// input-position-sensitive the way `-x` is (which is why `-x` is left
@@ -275,6 +284,13 @@ filterRecordedCommandLine(llvm::ArrayRef<std::string> recorded,
           return arg.size() > flag.size() && arg.starts_with(flag);
         }))
       continue;
+    // FR-67: recorded error promotion is dropped — only the promotion, never
+    // the warnings themselves (`-Wunused-variable` et al. survive and demote
+    // to warnings). User-supplied promotion arrives via `extraClangArgs`
+    // below and is untouched.
+    if (arg == "-Werror" || arg == "-pedantic-errors" ||
+        arg.starts_with("-Werror="))
+      continue;
     args.push_back(arg.str());
   }
 
@@ -290,6 +306,11 @@ filterRecordedCommandLine(llvm::ArrayRef<std::string> recorded,
   args.push_back("-D_FORTIFY_SOURCE=0");
 #endif
   args.push_back("-Wno-error=int-conversion");
+  // FR-67: GCC-only `-W` spellings recorded by a foreign compiler must
+  // degrade to nothing, not an unknown-warning-option diagnostic. Trailing
+  // position suppresses earlier unknown `-W` flags; sitting BEFORE
+  // `extraClangArgs` keeps `--extra-arg` able to re-enable it.
+  args.push_back("-Wno-unknown-warning-option");
   args.insert(args.end(), extraClangArgs.begin(), extraClangArgs.end());
   return args;
 }
