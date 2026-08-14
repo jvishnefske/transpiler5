@@ -3802,7 +3802,7 @@ here and are cherry-picked as design:
 Its `examples/parse_compilation_database.rs` is the one directly portable
 piece and becomes FR-45.
 
-- [ ] FR-63 Agentic improvement harness. Turn the one-shot clippy ratchet
+- [x] FR-63 Agentic improvement harness. Turn the one-shot clippy ratchet
   (loop #1: 1621 → 961, `ecf3efd`/`d5ad1c3`) into an autonomous loop that
   improves the emitter across THREE signals — correctness bugs, emitted-Rust
   quality, and construct demand — under a fixed safety contract, framed as an
@@ -3886,6 +3886,37 @@ piece and becomes FR-45.
   remaining `assign_op_pattern` (SCF-hoisted accumulators, LValue-place targets)
   and the deeper quality tail are the next iterations; `needless_late_init`
   stays off-limits.
+
+  RUN RECORD 2 (2026-08-14, same epoch-1). Champion first RE-ESTABLISHED at
+  the current emitter (out-of-band W2.9-W2.14 + FR-61f changes since the
+  first run: train 419 / held-out 125), then SIX byte-diff-gated iterations
+  ran the loop to its designed termination, every one accepted on the first
+  gate: (1) assign_op_pattern projection places — structural place identity
+  + purity walk, 491 (`95a7aa9`); (2) bool_comparison — identity / `!name` /
+  exact integer predicate inversion, float order stays unfolded, 451
+  (`a632d49`); (3) field_reassign_with_default — fuse the adjacent
+  field-store prefix into a functional-update literal, all-fields drops the
+  base, shorthand avoids redundant_field_names, 414 (`8c68682`);
+  (4) missing_const_for_thread_local — const-block provably-const Cell
+  initializers, struct-default stays unwrapped, 385 (`7aa34df`);
+  (5) assertions_on_constants — drop the vacuous `assert!(true)` null guard,
+  constant-false keeps firing, 368 (`9028d43`); (6) identity_op — zero-shift
+  renders its lhs (offset-0 bitfields), 356 (`c960731`); plus a 7th closing
+  the assign_op_pattern SSA residue — the real blocker was the lost-copy
+  cycle breaker's pass-through `let` alias hiding the binary op; alias
+  look-through + a commutative operand-1 leg (integer Add/Mul/And/Or/Xor,
+  pure RHS), 350 (`f19b530`). Cumulative ledger descent 798 -> 350 (-56%),
+  held-out 125 -> 73 (fell at every step — generalization, never overfit),
+  unsafe 0 and full lit 100% at every commit. TERMINATED at plateau per
+  LOOP.md: unnecessary_cast (x19) is HELD-OUT-ONLY (train 0), so the
+  anti-Goodhart score gate can never validate it inside epoch-1 — it needs
+  an epoch-2 re-split; approx_constant (x5) is a recorded NO-GO (the
+  idiomatic std-const substitution changes the emitted float value — a
+  miscompile — and an allow-attribute is contract-banned; the exact literal
+  is the only correct spelling); needless_late_init (257, now 94% of the
+  train residue) stays off-limits without a human + a new idea; the rest is
+  a <=3-count per-program long tail. Harness infra hardened this run:
+  controller auto-detects meson vs CMake build trees (`52b2c6a`).
 
 - [x] FR-64 Constant-fill `char` buffer → idiomatic Rust `String` (W4.5 heap
   memory-model change). The importer previously REJECTED a runtime-sized heap
