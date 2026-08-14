@@ -938,6 +938,45 @@ std::string RustEmitter::assignName(Value value) {
   return name;
 }
 
+/// FR-63 (clippy::assertions_on_constants): the importer's deterministic
+/// null guard is `emitrust.call_opaque "assert!"(<flag>)` with
+/// `args = [<index>, <message>]` (ImportC: a C null deref is UB, so the
+/// deterministic panic is a legal refinement). When the flag operand
+/// constant-folded to the literal `true` the assertion can never fire, so
+/// emitting NOTHING for the statement is behavior-identical -- and the
+/// rendered `assert!(true, ...)` is exactly what clippy flags. Only the
+/// exact `assert!` callee with a provably-true constant condition
+/// qualifies: `assert!(false, ...)` fires (a behavioral panic the
+/// byte-diff oracle observes), a non-constant flag guards a real path, and
+/// other callees -- notably diverging `panic!`, which is load-bearing for
+/// match arms and `opDiverges` -- keep today's rendering.
+static bool isVacuousAssert(Operation *op) {
+  auto call = dyn_cast<emitrust::CallOpaqueOp>(op);
+  if (!call || call.getCallee() != "assert!" || op->getNumResults() != 0)
+    return false;
+  // The condition is `assert!`'s FIRST argument: with an `args` attribute an
+  // index attr selects the operand; without one it is the first operand.
+  Value condition;
+  if (std::optional<ArrayAttr> args = call.getArgs()) {
+    if (args->empty())
+      return false;
+    auto argIndex = dyn_cast<IntegerAttr>((*args)[0]);
+    if (!argIndex || !isa<IndexType>(argIndex.getType()) ||
+        argIndex.getValue().uge(op->getNumOperands()))
+      return false;
+    condition = op->getOperand(argIndex.getInt());
+  } else {
+    if (op->getNumOperands() == 0)
+      return false;
+    condition = op->getOperand(0);
+  }
+  auto constant = condition.getDefiningOp<emitrust::ConstantOp>();
+  if (!constant)
+    return false;
+  auto flag = dyn_cast<IntegerAttr>(constant.getValue());
+  return flag && flag.getType().isInteger(1) && !flag.getValue().isZero();
+}
+
 bool RustEmitter::valueIsRead(Value value) {
   auto it = valueReadCache.find(value);
   if (it != valueReadCache.end())
@@ -953,10 +992,11 @@ bool RustEmitter::valueIsRead(Value value) {
 bool RustEmitter::valueIsReadUncached(Value value) {
   for (OpOperand &use : value.getUses()) {
     Operation *owner = use.getOwner();
-    // A use inside unreachable code, a dropped dead store, or an FR-61d
-    // dropped pure op never emits, so it is not a real read.
+    // A use inside unreachable code, a dropped dead store, an FR-61d
+    // dropped pure op, or an FR-63 vacuous assert (constant-true null
+    // guard) never emits, so it is not a real read.
     if (unreachableOps.count(owner) || deadStores.count(owner) ||
-        droppedOps.count(owner))
+        droppedOps.count(owner) || isVacuousAssert(owner))
       continue;
     // A `let` whose dead initializer we dropped no longer reads its init
     // operand, so that use does not keep `value` live.
@@ -1888,12 +1928,12 @@ void RustEmitter::computeInlineCandidates(emitrust::FuncOp funcOp) {
     if (op == tailFoldCandidate)
       return;
     // Collect the REAL uses (uses inside unreachable code, dropped dead
-    // stores, or dropped pure ops never render).
+    // stores, dropped pure ops, or FR-63 vacuous asserts never render).
     SmallVector<OpOperand *, 4> realUses;
     for (OpOperand &use : op->getResult(0).getUses()) {
       Operation *owner = use.getOwner();
       if (unreachableOps.count(owner) || deadStores.count(owner) ||
-          droppedOps.count(owner))
+          droppedOps.count(owner) || isVacuousAssert(owner))
         continue;
       realUses.push_back(&use);
     }
@@ -3366,6 +3406,12 @@ LogicalResult RustEmitter::emitReturn(emitrust::ReturnOp returnOp) {
 
 LogicalResult RustEmitter::emitCallOpaque(emitrust::CallOpaqueOp callOp) {
   Operation *op = callOp.getOperation();
+  // FR-63 (clippy::assertions_on_constants): a null guard whose flag folded
+  // to literal `true` can never fire; emit nothing. Read-tracking already
+  // treats this statement as never-emitted (see `isVacuousAssert`), so a
+  // true constant read only by dropped asserts leaves no orphaned `let`.
+  if (isVacuousAssert(op))
+    return success();
   Location loc = op->getLoc();
   unsigned numResults = op->getNumResults();
 
