@@ -33,6 +33,16 @@
             "held_out_total": 104
           },
           "note": "assign_op_pattern: fold pure projection places (field/index/deref) -- structural place identity + purity walk"
+        },
+        {
+          "emitter_rev": "a632d4985d20ab6fec339c995a2cae4b6b797efa",
+          "timestamp": "2026-08-14T16:05:33",
+          "metrics": {
+            "total_warnings": 451,
+            "train_total": 352,
+            "held_out_total": 96
+          },
+          "note": "bool_comparison: fold cmp-vs-bool-literal -- identity / !name / exact integer predicate inversion; float-order and compound bool stay unfolded"
         }
       ]
     }
