@@ -83,6 +83,16 @@
             "held_out_total": 74
           },
           "note": "identity_op: render the lhs alone for shifts by a constant zero (bitfield offset-0 lowering); compound <<=0 and shared zero constants keep today's rendering"
+        },
+        {
+          "emitter_rev": "f19b5303d115e6cec4c7df6a6de46774fda605cc",
+          "timestamp": "2026-08-14T17:12:25",
+          "metrics": {
+            "total_warnings": 350,
+            "train_total": 274,
+            "held_out_total": 73
+          },
+          "note": "assign_op_pattern: look through the lost-copy pass-through let alias + commutative operand-1 fold (integer Add/Mul/And/Or/Xor, pure RHS; floats and places excluded)"
         }
       ]
     }
