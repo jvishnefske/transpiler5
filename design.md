@@ -3917,6 +3917,15 @@ piece and becomes FR-45.
   train residue) stays off-limits without a human + a new idea; the rest is
   a <=3-count per-program long tail. Harness infra hardened this run:
   controller auto-detects meson vs CMake build trees (`52b2c6a`).
+  EPOCH-2 CODA (same day): the seed-2 re-split (`fd2130a`) moved
+  unnecessary_cast to 18 train / 1 held-out, and one further accepted
+  iteration closed it — the identity casts were manufactured by emitCast's
+  enum branches (raw-field reads and ctor args already at the underlying
+  type); signedness-changing (`c.0 as i32` over u32, C99-5) and bool casts
+  survive (`8425a67`, clippy total 350 -> 331). Epoch-2 then terminated at
+  the same plateau: approx_constant NO-GO, needless_late_init 235 (94% of
+  the train residue, off-limits), rest <=3 long tail. Full-corpus descent
+  since the ratchet began: 1621 -> 331 (-80%).
 
 - [x] FR-64 Constant-fill `char` buffer → idiomatic Rust `String` (W4.5 heap
   memory-model change). The importer previously REJECTED a runtime-sized heap
