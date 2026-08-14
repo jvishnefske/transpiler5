@@ -63,6 +63,16 @@
             "held_out_total": 81
           },
           "note": "missing_const_for_thread_local: const-block the Cell initializer when the init attr/type is provably const (literals, const arrays/aggregates, None/Some(fn); struct-default stays unwrapped)"
+        },
+        {
+          "emitter_rev": "9028d433e60ca95940a0ed8bb38fd82fa616e583",
+          "timestamp": "2026-08-14T16:46:31",
+          "metrics": {
+            "total_warnings": 368,
+            "train_total": 287,
+            "held_out_total": 78
+          },
+          "note": "assertions_on_constants: drop the vacuous assert!(true) null guard at emission (constant-false and non-constant flags keep firing; shared true constants still render for surviving consumers)"
         }
       ]
     }
