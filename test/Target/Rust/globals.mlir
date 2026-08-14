@@ -1,11 +1,16 @@
 // C99-14/C99-15: global emission: const globals render as plain static
 // items read directly; mutable globals render as thread_local Cell items
 // accessed through .with(), so the generated crate stays free of `unsafe`
-// and `static mut`.
+// and `static mut`. FR-63 (clippy::missing_const_for_thread_local): the
+// Cell initializer is wrapped in a `const { ... }` block exactly when the
+// rendered expression is provably const-evaluable (literals, arrays and
+// struct literals of const leaves, fn-ptr None/fn references); a
+// `S::default()` default stays unwrapped because a derived Default is not
+// a const fn — conservative non-wrap, never a wrong wrap.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s --strict-whitespace
 
 // CHECK:      thread_local! {
-// CHECK-NEXT:     static counter: std::cell::Cell<i32> = std::cell::Cell::new(0);
+// CHECK-NEXT:     static counter: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 // CHECK-NEXT: }
 emitrust.global @counter <0 : i32> : i32
 
@@ -17,18 +22,18 @@ emitrust.global const @limit <100 : i32> : i32
 emitrust.global const @zero : i64
 
 // CHECK-NEXT: thread_local! {
-// CHECK-NEXT:     static ratio: std::cell::Cell<f64> = std::cell::Cell::new(2.5);
+// CHECK-NEXT:     static ratio: std::cell::Cell<f64> = const { std::cell::Cell::new(2.5) };
 // CHECK-NEXT: }
 emitrust.global @ratio <2.5 : f64> : f64
 
 // CHECK-NEXT: thread_local! {
-// CHECK-NEXT:     static flag: std::cell::Cell<bool> = std::cell::Cell::new(true);
+// CHECK-NEXT:     static flag: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 // CHECK-NEXT: }
 emitrust.global @flag <true> : i1
 
 // Zero-initialized array and struct globals use the type's default value.
 // CHECK-NEXT: thread_local! {
-// CHECK-NEXT:     static table: std::cell::Cell<[i32; 4]> = std::cell::Cell::new([0; 4]);
+// CHECK-NEXT:     static table: std::cell::Cell<[i32; 4]> = const { std::cell::Cell::new([0; 4]) };
 // CHECK-NEXT: }
 emitrust.global @table : !emitrust.array<4xi32>
 
@@ -43,6 +48,9 @@ emitrust.global const @fixed : !emitrust.array<2xf64>
 emitrust.struct_def @Point ["x", "y"] [i32, i32]
 
 // CHECK-NEXT: thread_local! {
+// A defaulted struct global stays UNWRAPPED: `Point::default()` calls the
+// derived Default impl, which is not a const fn, so a `const { ... }`
+// block would not compile.
 // CHECK-NEXT:     static origin: std::cell::Cell<Point> = std::cell::Cell::new(Point::default());
 // CHECK-NEXT: }
 emitrust.global @origin : !emitrust.struct<"Point">
@@ -53,14 +61,14 @@ emitrust.global const @pair <[1 : i32, -2 : i32]> : !emitrust.array<2xi32>
 
 // A struct initializer renders as a struct literal with named fields.
 // CHECK-NEXT: thread_local! {
-// CHECK-NEXT:     static unit: std::cell::Cell<Point> = std::cell::Cell::new(Point { x: 3, y: -4, });
+// CHECK-NEXT:     static unit: std::cell::Cell<Point> = const { std::cell::Cell::new(Point { x: 3, y: -4, }) };
 // CHECK-NEXT: }
 emitrust.global @unit <[3 : i32, -4 : i32]> : !emitrust.struct<"Point">
 
 // Nested aggregates recurse: array-of-struct as struct literals inside an
 // array literal.
 // CHECK-NEXT: thread_local! {
-// CHECK-NEXT:     static corners: std::cell::Cell<[Point; 2]> = std::cell::Cell::new([Point { x: 1, y: 2, }, Point { x: 0, y: 0, }]);
+// CHECK-NEXT:     static corners: std::cell::Cell<[Point; 2]> = const { std::cell::Cell::new([Point { x: 1, y: 2, }, Point { x: 0, y: 0, }]) };
 // CHECK-NEXT: }
 emitrust.global @corners <[[1 : i32, 2 : i32], [0 : i32, 0 : i32]]> : !emitrust.array<2x!emitrust.struct<"Point">>
 
@@ -69,7 +77,7 @@ emitrust.global @corners <[[1 : i32, 2 : i32], [0 : i32, 0 : i32]]> : !emitrust.
 // from resolving against (and being rejected for shadowing) the
 // thread-local key.
 // CHECK-NEXT: thread_local! {
-// CHECK-NEXT:     static c: std::cell::Cell<i32> = std::cell::Cell::new(0);
+// CHECK-NEXT:     static c: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 // CHECK-NEXT: }
 emitrust.global @c <0 : i32> : i32
 

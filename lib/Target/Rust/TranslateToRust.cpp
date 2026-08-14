@@ -4723,6 +4723,74 @@ LogicalResult RustEmitter::emitAggregateInit(Operation *op, Location loc,
                         << type;
 }
 
+/// Returns true when the initializer expression `emitGlobal` renders for a
+/// mutable global of `type` — the `init` attribute when non-null, the
+/// type's default value otherwise — is provably const-evaluable, so the
+/// thread-local Cell initializer may be wrapped in a `const { ... }` block
+/// (clippy::missing_const_for_thread_local; `std::cell::Cell::new` is a
+/// const fn, so the wrap is legal whenever its argument is). The predicate
+/// mirrors the emitInit dispatch exactly: scalar literals, `[<const>; N]`
+/// defaults, aggregate literals with const leaves, and the fn-ptr `None` /
+/// `Some(<fn item>)` opaque spellings (fn-item-to-fn-pointer coercion is
+/// allowed in const context). Everything else — notably `S::default()`,
+/// whose derived Default impl is not a const fn — conservatively stays
+/// unwrapped: a missed wrap is only a lint, a wrong wrap is a compile
+/// error.
+static bool isConstEvaluableInit(Operation *op, Attribute init, Type type) {
+  if (!init) {
+    // Default value (emitDefaultValue): scalar zero literals, fn-ptr None,
+    // and `[<default>; N]` arrays are const; struct `S::default()` is not.
+    if (isa<IntegerType, IndexType>(type) || type.isF32() || type.isF64())
+      return true;
+    if (isa<emitrust::FnPtrType>(type))
+      return true;
+    if (auto arrayType = dyn_cast<emitrust::ArrayType>(type))
+      return isConstEvaluableInit(op, nullptr, arrayType.getElementType());
+    return false;
+  }
+  // Scalar leaves (emitAttribute): integer/bool/float literals and the
+  // f32/f64 INFINITY constants are all const expressions.
+  if (isa<IntegerAttr, FloatAttr>(init))
+    return true;
+  // Opaque fn-ptr initializers: only the two importer-produced spellings
+  // are proven — `None` and `Some(<identifier>)` naming a fn item.
+  if (auto opaque = dyn_cast<emitrust::OpaqueAttr>(init)) {
+    if (!isa<emitrust::FnPtrType>(type))
+      return false;
+    StringRef text = opaque.getValue();
+    if (text == "None")
+      return true;
+    if (text.consume_front("Some(") && text.consume_back(")"))
+      return !text.empty() && !llvm::isDigit(text.front()) &&
+             llvm::all_of(text,
+                          [](char c) { return llvm::isAlnum(c) || c == '_'; });
+    return false;
+  }
+  // Aggregate list initializers (emitAggregateInit): an array or struct
+  // literal is const iff every leaf is.
+  if (auto elements = dyn_cast<ArrayAttr>(init)) {
+    if (auto arrayType = dyn_cast<emitrust::ArrayType>(type))
+      return llvm::all_of(elements, [&](Attribute element) {
+        return isConstEvaluableInit(op, element, arrayType.getElementType());
+      });
+    if (auto structType = dyn_cast<emitrust::StructType>(type)) {
+      auto structDef =
+          SymbolTable::lookupNearestSymbolFrom<emitrust::StructDefOp>(
+              op, StringAttr::get(op->getContext(), structType.getName()));
+      if (!structDef || elements.size() != structDef.getFieldTypes().size())
+        return false;
+      for (auto [element, fieldType] :
+           llvm::zip_equal(elements, structDef.getFieldTypes()))
+        if (!isConstEvaluableInit(op, element,
+                                  cast<TypeAttr>(fieldType).getValue()))
+          return false;
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
 LogicalResult RustEmitter::emitGlobal(emitrust::GlobalOp globalOp) {
   Location loc = globalOp.getLoc();
   Type type = globalOp.getType();
@@ -4752,16 +4820,27 @@ LogicalResult RustEmitter::emitGlobal(emitrust::GlobalOp globalOp) {
 
   // Mutable global: interior mutability through a thread-local Cell keeps
   // the generated crate free of `unsafe` and `static mut`. Exact for the
-  // single-threaded programs the importer accepts.
+  // single-threaded programs the importer accepts. When the initializer is
+  // provably const-evaluable it renders inside a `const { ... }` block
+  // (clippy::missing_const_for_thread_local) — same value, same semantics
+  // for these single-threaded programs.
+  bool constInit = isConstEvaluableInit(globalOp.getOperation(),
+                                        globalOp.getInitAttr(), type);
   os << "thread_local! {\n";
   increaseIndent();
   os << "static " << globalOp.getSymName() << ": std::cell::Cell<";
   if (failed(emitType(loc, type)))
     return failure();
-  os << "> = std::cell::Cell::new(";
+  os << "> = ";
+  if (constInit)
+    os << "const { ";
+  os << "std::cell::Cell::new(";
   if (failed(emitInit()))
     return failure();
-  os << ");\n";
+  os << ")";
+  if (constInit)
+    os << " }";
+  os << ";\n";
   decreaseIndent();
   os << "}\n";
   return success();
