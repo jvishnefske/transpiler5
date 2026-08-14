@@ -8189,6 +8189,24 @@ the way a planner rejection used to. FR-42's per-item recovery has no
 counterpart in the pass pipeline or the emitter; giving it one is the natural
 successor to FR-53.
 
+**Track 5 spot re-measurement (2026-08-14, post FR-67/68/69/70, fresh
+HEAD clones, not the pinned SHAs — a smoke check, not a comparable
+re-run).** cJSON (2 units) + tinycrypt (15 units), solo-TU
+`--emit=crate --crate-type=lib --incremental` with each project's own
+include dir: **17/17 units emit crates and every crate builds.**
+Aggregate 95 ported / 76 stubbed / 21 dropped over 522 graph items.
+The ranked residual diagnostics on rejected items (deduped): void
+pointer parameter x10 (tinycrypt's `_set` memset-alike is the root of
+most of its cascade), pointer assigned a non-address value x11,
+struct-cascade roots x12, call to unimported function x10, aliasing
+mutable pointer arguments x8, ArrayToPointerDecay x7, pointer struct
+member x7 — i.e. the demand ranking that motivated Stage 2/3 holds on
+live code, and no NEW defect class appeared (no segfault, no
+non-termination, no rustc-rejected crate on these 17 units). The
+strict-mode (no `--incremental`) baseline is 0/17 — recovery mode is
+what carries external code, consistent with Contribution 3-4's
+disposition.
+
 **External-validation lessons, consolidated (and the paper's disposition).**
 The accompanying paper's four contributions do NOT survive third-party
 validation equally, and the split is the durable lesson -- more than any
