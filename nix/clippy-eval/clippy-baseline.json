@@ -2,10 +2,9 @@
   "corpus": "test/EndToEnd",
   "crates_linted": 114,
   "crates_skipped": 14,
-  "total_warnings": 414,
+  "total_warnings": 385,
   "by_lint": {
     "clippy::needless_late_init": 310,
-    "clippy::missing_const_for_thread_local": 29,
     "clippy::unnecessary_cast": 19,
     "clippy::assertions_on_constants": 17,
     "clippy::identity_op": 12,

@@ -2,12 +2,11 @@
   "epoch_id": 1,
   "corpus_root": "test/EndToEnd",
   "corpus_hash": "sha256:934b6ba698e9dd206e6dc062f5ad7434d570807bd660a481e5b278f629693d08",
-  "emitter_rev": "8684ccee56d0e735bb4de0178b49845d5a03f866",
+  "emitter_rev": "98e3acf07d3a764d5d33be59f3df78591deb4da7",
   "train": {
-    "total_warnings": 328,
+    "total_warnings": 301,
     "by_lint": {
       "clippy::needless_late_init": 257,
-      "clippy::missing_const_for_thread_local": 27,
       "clippy::assertions_on_constants": 14,
       "clippy::identity_op": 8,
       "clippy::assign_op_pattern": 5,
@@ -21,13 +20,12 @@
     }
   },
   "held_out": {
-    "total_warnings": 83,
+    "total_warnings": 81,
     "by_lint": {
       "clippy::needless_late_init": 50,
       "clippy::unnecessary_cast": 19,
       "clippy::identity_op": 4,
       "clippy::assertions_on_constants": 3,
-      "clippy::missing_const_for_thread_local": 2,
       "clippy::type_complexity": 2,
       "clippy::assign_op_pattern": 2,
       "clippy::precedence": 1

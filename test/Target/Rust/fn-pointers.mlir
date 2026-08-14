@@ -60,13 +60,17 @@ emitrust.func @defaults() {
 // CHECK-NEXT: }
 emitrust.struct_def @Dispatch ["op"] [!emitrust.fn_ptr<(i32, i32) -> i32>]
 
+// FR-63 (clippy::missing_const_for_thread_local): both fn-ptr initializer
+// shapes are const-evaluable — `None` trivially, and `Some(add)` because
+// fn-item-to-fn-pointer coercion is allowed in const context — so both
+// wrap in a `const { ... }` block.
 // CHECK:      thread_local! {
-// CHECK-NEXT:     static handler: std::cell::Cell<Option<fn(i32) -> i32>> = std::cell::Cell::new(None);
+// CHECK-NEXT:     static handler: std::cell::Cell<Option<fn(i32) -> i32>> = const { std::cell::Cell::new(None) };
 // CHECK-NEXT: }
 emitrust.global @handler : !emitrust.fn_ptr<(i32) -> i32>
 
 // CHECK:      thread_local! {
-// CHECK-NEXT:     static bound: std::cell::Cell<Option<fn(i32, i32) -> i32>> = std::cell::Cell::new(Some(add));
+// CHECK-NEXT:     static bound: std::cell::Cell<Option<fn(i32, i32) -> i32>> = const { std::cell::Cell::new(Some(add)) };
 // CHECK-NEXT: }
 emitrust.global @bound <#emitrust.opaque<"Some(add)">>
     : !emitrust.fn_ptr<(i32, i32) -> i32>

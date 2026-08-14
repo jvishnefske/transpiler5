@@ -10,7 +10,7 @@
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
 // CHECK:      thread_local! {
-// CHECK-NEXT:     static total: std::cell::Cell<i32> = std::cell::Cell::new(0);
+// CHECK-NEXT:     static total: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 // CHECK-NEXT: }
 emitrust.global @total <0 : i32> : i32
 
