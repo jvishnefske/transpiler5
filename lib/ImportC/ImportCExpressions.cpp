@@ -1903,6 +1903,40 @@ CImporter::emitSizeofAlignof(const clang::UnaryExprOrTypeTraitExpr *expr) {
   return createScalarIntConstant(loc, *resultType, value);
 }
 
+FailureOr<Value> CImporter::emitLambdaLocalCall(
+    const clang::CXXOperatorCallExpr *call, const clang::VarDecl *var) {
+  Location loc = translateLoc(call->getBeginLoc());
+  const LambdaLocalInfo &info = lambdaLocals.find(var)->second;
+  // Op handles are value-semantic; copy out of the const ref (the
+  // generated accessors are non-const).
+  func::FuncOp target = info.funcOp;
+  FunctionType targetType = target.getFunctionType();
+  unsigned frozenCount = info.frozenCaptures.size();
+  // Defensive: clang already type-checked the call against operator(),
+  // so the counts can only disagree if the lift built a wrong signature.
+  if (call->getNumArgs() - 1 + frozenCount != targetType.getNumInputs())
+    return emitError(loc) << "unsupported: call argument count mismatch";
+  // The frozen capture values (loaded at the lambda's declaration point,
+  // which dominates every use of the local) come first, then this call's
+  // own arguments.
+  SmallVector<Value> arguments(info.frozenCaptures.begin(),
+                               info.frozenCaptures.end());
+  for (unsigned index = 1; index < call->getNumArgs(); ++index) {
+    Type input = targetType.getInput(frozenCount + index - 1);
+    FailureOr<Value> value =
+        emitPositionedRValue(input, call->getArg(index));
+    if (failed(value))
+      return failure();
+    if ((*value).getType() != input)
+      return emitError(loc) << "unsupported: call argument type mismatch";
+    arguments.push_back(*value);
+  }
+  auto callOp = builder.create<func::CallOp>(loc, target, arguments);
+  if (callOp->getNumResults() == 0)
+    return Value();
+  return callOp->getResult(0);
+}
+
 FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
   // W2.2: a genuine C++ instance-method call (`obj.method(args)` or
@@ -1923,6 +1957,20 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
         opCall->getDirectCallee());
     if (opMethod && opMethod->getParent()->isInStdNamespace())
       return emitStlOperatorCall(opCall);
+    // W2.13: a direct `f(args)` operator() call on a RECOGNIZED lifted
+    // lambda local rewrites to `lifted(frozen..., args...)`. Any other
+    // lambda call shape (an unregistered local means its declaration
+    // already rejected; an immediately-invoked lambda expression was
+    // never a local at all) falls through to the located "unsupported
+    // callee" rejection below.
+    if (opMethod && opMethod->getParent()->isLambda() &&
+        opCall->getOperator() == clang::OO_Call && opCall->getNumArgs() >= 1)
+      if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+              opCall->getArg(0)->IgnoreParenImpCasts()))
+        if (const auto *lambdaVar =
+                llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+          if (lambdaLocals.contains(lambdaVar))
+            return emitLambdaLocalCall(opCall, lambdaVar);
   }
   const clang::FunctionDecl *callee = call->getDirectCallee();
   if (!callee)
