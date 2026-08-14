@@ -435,6 +435,15 @@ bool CImporter::isStdStringViewRecordType(clang::QualType type) {
          decl->getName() == "basic_string_view";
 }
 
+bool CImporter::isStdVariantRecordType(clang::QualType type) {
+  const auto *record = type.getCanonicalType()->getAs<clang::RecordType>();
+  if (!record)
+    return false;
+  const clang::RecordDecl *decl = record->getDecl();
+  return decl->isInStdNamespace() && decl->getIdentifier() &&
+         decl->getName() == "variant";
+}
+
 bool CImporter::isStlOpaqueType(Type type) {
   auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
   return opaque && (opaque.getValue() == "String" ||
@@ -558,6 +567,87 @@ FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
              << "> element type is not in the supported STL element set";
     return Type(emitrust::OpaqueType::get(builder.getContext(),
                                           "Option<" + *spelling + ">"));
+  }
+  // W2.14: `std::variant<A, B>` over exactly two DISTINCT supported
+  // scalar alternatives imports as a SYNTHESIZED closed two-variant Rust
+  // data enum — route (a) of the W2.14 spike: no Rust std variant image
+  // exists (so no opaque mapping is possible), and the data-enum dialect
+  // machinery (enum_variant construction, RESULT-mode match expansion
+  // for index()/std::get<T>) renders today. The enum name is shape-keyed
+  // from the mapped alternative spellings (`VariantI32F64` — UpperCamel;
+  // rustc rejects the double-underscore sketch under the crate's
+  // non_camel_case_types deny) so distinct instantiations — all spelled
+  // `variant` in clang — cannot collide, and repeated mentions reuse one
+  // module-level definition. Everything the recognizer cannot prove is a
+  // located rejection: any arity but two, duplicate alternatives
+  // (indistinguishable BY TYPE at every use site, since construction,
+  // operator=, and std::get<T> all select by exact mapped-type
+  // equality), and non-scalar alternatives (the Copy-deriving
+  // data_enum_def payload set) this wave.
+  if (name == "variant" && spec) {
+    const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+    // The alternatives arrive as one Pack template argument
+    // (`variant<_Types...>`); flatten defensively.
+    llvm::SmallVector<clang::QualType, 4> alternatives;
+    for (const clang::TemplateArgument &arg : args.asArray()) {
+      if (arg.getKind() == clang::TemplateArgument::Type) {
+        alternatives.push_back(arg.getAsType());
+        continue;
+      }
+      if (arg.getKind() != clang::TemplateArgument::Pack)
+        return emitError(loc)
+               << "unsupported: std::variant shape could not be determined";
+      for (const clang::TemplateArgument &element : arg.pack_elements()) {
+        if (element.getKind() != clang::TemplateArgument::Type)
+          return emitError(loc)
+                 << "unsupported: std::variant shape could not be determined";
+        alternatives.push_back(element.getAsType());
+      }
+    }
+    if (alternatives.size() != 2)
+      return emitError(loc)
+             << "unsupported: only a two-alternative std::variant is "
+                "recognized";
+    llvm::SmallVector<Type, 2> mapped;
+    llvm::SmallVector<std::string, 2> spellings;
+    for (clang::QualType alternative : alternatives) {
+      FailureOr<Type> element = mapType(alternative, loc);
+      if (failed(element))
+        return failure();
+      // Scalars only this wave: floats and SIGNLESS (signed-C) integers —
+      // the types whose arith constants back the V0{0} default image and
+      // the panic-arm dummy yields. Unsigned integers (emitrust-typed,
+      // not arith-constructible) and every aggregate/opaque stay out.
+      auto intType = llvm::dyn_cast<IntegerType>(*element);
+      bool scalar =
+          llvm::isa<FloatType>(*element) || (intType && intType.isSignless());
+      std::optional<std::string> spelling =
+          rustSpellingForElementType(*element);
+      if (!scalar || !spelling)
+        return emitError(loc) << "unsupported: std::variant alternative "
+                                 "type is not in the supported scalar set";
+      mapped.push_back(*element);
+      spellings.push_back(*spelling);
+    }
+    if (mapped[0] == mapped[1])
+      return emitError(loc)
+             << "unsupported: std::variant with duplicate alternatives";
+    std::string enumName = typeRustName(
+        ("Variant_" + spellings[0] + "_" + spellings[1]));
+    auto [it, inserted] = variantEnumAlternatives.try_emplace(
+        enumName, llvm::SmallVector<Type, 2>(mapped));
+    if (inserted) {
+      OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+      moduleBuilder.create<emitrust::DataEnumDefOp>(
+          loc, moduleBuilder.getStringAttr(enumName),
+          moduleBuilder.getStrArrayAttr({"V0", "V1"}),
+          moduleBuilder.getArrayAttr({moduleBuilder.getStrArrayAttr({"v"}),
+                                      moduleBuilder.getStrArrayAttr({"v"})}),
+          moduleBuilder.getArrayAttr(
+              {moduleBuilder.getTypeArrayAttr({mapped[0]}),
+               moduleBuilder.getTypeArrayAttr({mapped[1]})}));
+    }
+    return Type(emitrust::DataEnumType::get(builder.getContext(), enumName));
   }
   if (name == "basic_string") {
     if (spec) {

@@ -2622,6 +2622,15 @@ private:
   /// the mapType-tail rejection.
   bool isStdStringViewRecordType(clang::QualType type);
 
+  /// W2.14: whether `type` is a `std::variant<...>` specialization (which
+  /// maps to a synthesized closed data enum; see mapStdLibraryType's
+  /// variant case). Used where the CLANG-side shape needs distinguishing:
+  /// `emitRValue`'s value-position `CXXConstructExpr` routing (before the
+  /// generic trivial-copy unwrap) and the std free-function interceptions
+  /// (`std::get`/`std::holds_alternative`), which must not disturb the
+  /// same-named functions over pairs/tuples/arrays.
+  bool isStdVariantRecordType(clang::QualType type);
+
   /// W2.12: imports a `CXXMemberCallExpr` whose receiver is a decomposed
   /// string_view local `var` (a `stringViewLocals` entry) — intercepted at
   /// the top of `emitStlMemberCall` BEFORE the receiver place emission,
@@ -2736,6 +2745,59 @@ private:
   FailureOr<Value> emitStlConstruct(Type stlType,
                                     const clang::CXXConstructExpr *construct,
                                     Location loc);
+
+  /// W2.14: imports the `CXXConstructExpr` producing a std::variant VALUE
+  /// (`variantType` is the mapped `!emitrust.data_enum`). Supports exactly:
+  /// the default construction — C++17 [variant.ctor]p2 value-initializes
+  /// the FIRST alternative, emitted as the EXPLICIT `V0 { 0 }` image (a
+  /// data enum deliberately derives no Default, so the emitter's
+  /// default-value path must never see it) — and the converting ctor from
+  /// an alternative value, selected by EXACT mapped-type equality (clang
+  /// already materialized any implicit conversion in the AST). Copy/move
+  /// construction and every other shape (in_place tags, ...) are located
+  /// rejections this wave.
+  FailureOr<Value>
+  emitVariantConstruct(Type variantType,
+                       const clang::CXXConstructExpr *construct, Location loc);
+
+  /// W2.14: the alternative index (0 or 1) of `altType` in the synthesized
+  /// variant enum `enumType`, or std::nullopt when `altType` is not an
+  /// alternative (selection is by exact mapped-type equality).
+  std::optional<unsigned> variantAltIndex(emitrust::DataEnumType enumType,
+                                          Type altType);
+
+  /// W2.14: constructs the `emitrust.enum_variant` value tagging `payload`
+  /// as alternative `index` (0 -> "V0", 1 -> "V1") of `enumType`.
+  Value createVariantValue(Location loc, emitrust::DataEnumType enumType,
+                           unsigned index, Value payload);
+
+  /// W2.14: creates a two-arm RESULT-mode (or, with a null `resultType`,
+  /// statement-mode) `emitrust.match` over `scrutinee` — exhaustive by
+  /// construction, one case per declared variant in order. `buildArm` is
+  /// invoked once per arm with the builder positioned inside that arm's
+  /// fresh block (its payload bound as the block argument) and must
+  /// terminate it with an `emitrust.yield`.
+  emitrust::MatchOp createVariantMatch(
+      Location loc, Value scrutinee, emitrust::DataEnumType enumType,
+      Type resultType,
+      llvm::function_ref<void(unsigned index, Value payload)> buildArm);
+
+  /// W2.14: matches a `std::get<T>(v)` free-function call over a
+  /// recognized std::variant argument (any other callee, arity, or
+  /// argument record shape returns null). Shared by `emitCall`'s std
+  /// free-function interception and the `CK_LValueToRValue` read path —
+  /// std::get returns `T&`, so the value read of that reference IS the
+  /// match expansion and no place for the result ever exists.
+  const clang::CallExpr *matchVariantGetCall(const clang::Expr *e);
+
+  /// W2.14: expands `std::get<T>(v)` over a recognized std::variant local
+  /// into a RESULT-mode match yielding the held payload in T's arm and
+  /// diverging through the `panic!` image in the other (the corpus only
+  /// gets the held alternative; catch is unsupported, so no program can
+  /// observe the C++ bad_variant_access instead — a behavior-compatible
+  /// refinement for the supported subset). The index form `std::get<0>`
+  /// stays a located rejection.
+  FailureOr<Value> emitVariantGet(const clang::CallExpr *call);
 
   /// W2.2: lowers `place`'s initialization from a non-trivial
   /// `CXXConstructExpr` by invoking the matching constructor method
@@ -4925,6 +4987,14 @@ private:
   /// Shape of every imported enum, keyed by symbol name, for cross-TU
   /// deduplication and mismatch detection.
   llvm::StringMap<std::string> importedEnumShapes;
+  /// W2.14: the two alternative types of every SYNTHESIZED std::variant
+  /// data enum, keyed by its shape-keyed symbol name (`VariantI32F64`).
+  /// First insertion emits the module-level `emitrust.data_enum_def`;
+  /// every later mention of the same shape — spelled `variant` in clang
+  /// regardless of instantiation — reuses the one definition. Consulted
+  /// by `variantAltIndex` (construction/assignment/get selection) and
+  /// `createVariantMatch` (per-arm payload types).
+  llvm::StringMap<llvm::SmallVector<Type, 2>> variantEnumAlternatives;
   //===--------------------------------------------------------------------===//
   // Recoverable import (FR-42) state
   //===--------------------------------------------------------------------===//

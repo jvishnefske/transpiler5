@@ -7649,6 +7649,55 @@ since the 00204 wave, 00204.c pass).
   crate against clang++ including a capture mutated between creation and
   calls with an argc-derived seed; full lit 100%; C path untouched.
 
+- [x] W2.14 `std::variant<int, double>` (task-011; flips Cpp17Suite 00906).
+  The C++17 sum-type vocabulary type. Corpus surface (00906, the whole
+  gate this wave): construction from an alternative value
+  (`std::variant<int, double> v = 7;`), `v.index()` (0-based alternative
+  index as an integer), `std::get<T>(v)` for the CURRENTLY-HELD
+  alternative, and reassignment to the OTHER alternative (`v = 2.5;`).
+  Candidate Rust images for the spike to differentiate: (a) a synthesized
+  two-variant Rust enum (`enum __Variant_i32_f64 { V0(i32), V1(f64) }`
+  plus match-based `index`/`get` expansions — the FR-40 tuple-struct-enum
+  precedent shows synthesized module-level enums render today), vs (b) an
+  opaque-type mapping in the W2.11 `Option` style if a std-library image
+  exists. `std::get` on the WRONG alternative throws in C++; the corpus
+  only gets the held alternative, so a match-with-panic image is
+  behavior-compatible for the supported subset — anything the recognizer
+  cannot prove stays a LOCATED rejection (mixed-alternative `get`,
+  `holds_alternative`, `visit`, `valueless_by_exception`, non-scalar or
+  duplicate alternatives, >2 alternatives this wave).
+  Gates: corpus 00906 UNSUPPORTED->PASS, Cpp17Suite ledger ratchets to
+  exactly 23 PASS / 3 UNSUPPORTED / 0 MISCOMPILE; new pins
+  test/Import/Cpp/stl-variant.cpp (construction, index, get, cross-
+  alternative reassignment) and stl-invalid.cpp frontier additions for
+  the rejected shapes; new test/EndToEnd/stl-variant.cpp byte-diffs the
+  built crate against clang++ with argc-derived seeds exercising both
+  alternatives; full lit 100%; C path untouched.
+  **SPIKE VERDICT: GO (2026-08-14), route (a) synthesized data enum, zero
+  new dialect ops.** Hand-written importer-shaped IR (module-level
+  emitrust.data_enum_def, variable+assign locals, RESULT-mode
+  emitrust.match expansions for index()/get<T> with a call_opaque
+  "panic!" arm) round-trips emitrust-opt, survives the exact emitrust-cc
+  pass pipeline, and the spliced crate byte-diffs clean against the
+  clang++ native with both alternatives exercised. Measured constraints
+  that shipped: the sketch name `__Variant_i32_f64` is REJECTED by the
+  crate's non_camel_case_types deny — the enum is `Variant_i32_f64` at
+  import (idiomatic rename yields VariantI32F64), with brace variants
+  V0{v}/V1{v} (data_enum_def's only form, not the sketched tuple form);
+  the variant local must never route through emitDefaultValue (data_enum
+  has no Default) — the deferred-init `let v;` path carries it. Two
+  deliberate upgrades over the entry's frontier list: mixed-alternative
+  `get` ships the byte-diffed match-with-panic image (sound: catch is
+  unsupported, the C++ throw is unobservable), and default construction
+  `variant<int,double> v;` is SUPPORTED via an explicit V0{0} image
+  ([variant.ctor]p2 makes it provable) — both pinned as positive cases.
+  std::get is the importer's FIRST std-namespace free-function
+  interception in emitCall; per-shape LOCATED rejection wordings minted
+  for >2/duplicate/non-scalar alternatives, holds_alternative, visit,
+  get<index>, valueless_by_exception (duplicate-alternatives pin uses
+  the default-ctor spelling — `variant<int,int> d = 1` is ill-formed
+  C++ and dies in the clang frontend before the importer).
+
 ## Track 5 Third-party validation (external demand signal)
 
 Track 4's corpus is authored by this project. That has now produced two

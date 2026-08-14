@@ -324,8 +324,15 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   // `emitrust.variable` places rather than memref cells: a memref of a
   // dialect type is illegal, and mem2reg materializes an unsigned cell's
   // default value as an `arith.constant`, which requires a signless type.
+  // A W2.14 std::variant local (a synthesized `!emitrust.data_enum`) is a
+  // place for the same dialect-type reason; its construction is ALWAYS an
+  // explicit enum_variant assign below (no init attribute — a data enum
+  // deliberately derives no Default, and the emitter's deferred-init path
+  // renders the place correctly for both the single-assign and the
+  // reassigned shape).
   bool isPlaceOnly =
-      llvm::isa<emitrust::EnumType, emitrust::FnPtrType>(*mlirType) ||
+      llvm::isa<emitrust::EnumType, emitrust::FnPtrType,
+                emitrust::DataEnumType>(*mlirType) ||
       isStlOpaque;
   // FR-61f: a signed-scalar local a range-eligible `for` body touches is
   // routed to a place too — a `memref.alloca` cell cannot be promoted by
@@ -356,6 +363,22 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
                                : mangleMemberName(var->getName()));
     symbols[var] = place;
     if (const clang::Expr *init = significantInit(var)) {
+      // W2.14: a std::variant local's initializer is a CXXConstructExpr
+      // (the converting ctor from an alternative value, or the
+      // NON-vacuous default ctor — variant's is not trivial, so
+      // significantInit keeps it); it routes to emitVariantConstruct and
+      // the resulting enum_variant value is assigned into the place.
+      if (llvm::isa<emitrust::DataEnumType>(*mlirType)) {
+        const auto *construct = llvm::dyn_cast<clang::CXXConstructExpr>(
+            init->IgnoreParenImpCasts());
+        if (!construct)
+          return emitError(loc) << "unsupported: std::variant initializer";
+        FailureOr<Value> value = emitVariantConstruct(*mlirType, construct,
+                                                      loc);
+        if (failed(value))
+          return failure();
+        return storeToPlace(loc, place, *value);
+      }
       if (isStlOpaque) {
         const clang::Expr *unwrapped = init->IgnoreParenImpCasts();
         const auto *construct =
@@ -966,6 +989,75 @@ CImporter::emitStlConstruct(Type stlType,
             "is not supported (only default construction and "
             "std::string's string-literal conversion constructor are "
             "recognized)";
+}
+
+std::optional<unsigned>
+CImporter::variantAltIndex(emitrust::DataEnumType enumType, Type altType) {
+  auto it = variantEnumAlternatives.find(enumType.getName());
+  if (it == variantEnumAlternatives.end())
+    return std::nullopt;
+  for (auto [index, type] : llvm::enumerate(it->second))
+    if (type == altType)
+      return static_cast<unsigned>(index);
+  return std::nullopt;
+}
+
+Value CImporter::createVariantValue(Location loc,
+                                    emitrust::DataEnumType enumType,
+                                    unsigned index, Value payload) {
+  return builder
+      .create<emitrust::EnumVariantOp>(
+          loc, enumType,
+          FlatSymbolRefAttr::get(builder.getContext(), enumType.getName()),
+          builder.getStringAttr(index == 0 ? "V0" : "V1"),
+          ValueRange{payload})
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitVariantConstruct(Type variantType,
+                                const clang::CXXConstructExpr *construct,
+                                Location loc) {
+  auto enumType = llvm::cast<emitrust::DataEnumType>(variantType);
+  const clang::CXXConstructorDecl *ctor = construct->getConstructor();
+  if (ctor && ctor->isCopyOrMoveConstructor())
+    return emitError(loc)
+           << "unsupported: std::variant copy/move construction";
+  llvm::SmallVector<const clang::Expr *> realArgs;
+  for (const clang::Expr *arg : construct->arguments())
+    if (!llvm::isa<clang::CXXDefaultArgExpr>(arg))
+      realArgs.push_back(arg);
+  // (i) `std::variant<A, B> v;` — C++17 [variant.ctor]p2
+  // value-initializes the FIRST alternative, so the image is the
+  // EXPLICIT `V0 { 0 }` (never the emitter's default-value path: a data
+  // enum deliberately derives no Default).
+  if (realArgs.empty()) {
+    llvm::SmallVector<Type, 2> alternatives =
+        variantEnumAlternatives.lookup(enumType.getName());
+    Value zero =
+        builder
+            .create<arith::ConstantOp>(
+                loc, llvm::cast<TypedAttr>(builder.getZeroAttr(
+                         alternatives[0])))
+            .getResult();
+    return createVariantValue(loc, enumType, 0, zero);
+  }
+  // (ii) the converting ctor from an alternative VALUE: the argument's
+  // mapped type selects the variant by EXACT type equality (clang
+  // already materialized any implicit conversion in the AST).
+  if (realArgs.size() == 1) {
+    FailureOr<Value> value = emitRValue(realArgs.front());
+    if (failed(value))
+      return failure();
+    if (std::optional<unsigned> index =
+            variantAltIndex(enumType, (*value).getType()))
+      return createVariantValue(loc, enumType, *index, *value);
+  }
+  // (iii) anything else (in_place construction, a converting argument
+  // outside the alternative set, ...) stays a located rejection.
+  return emitError(loc)
+         << "unsupported: this std::variant constructor shape is not "
+            "supported";
 }
 
 void CImporter::collectVoidFnPtrHolders(const clang::Stmt *body) {
