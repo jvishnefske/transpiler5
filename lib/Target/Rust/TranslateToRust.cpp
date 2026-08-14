@@ -3947,12 +3947,57 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
   {
     Value val = assignOp.getValue();
     Operation *binOp = val.getDefiningOp();
+    // FR-63 (assign_op_pattern residue): the lost-copy cycle breaker wraps
+    // every rotated back-edge value in a pass-through alias
+    // (`%t = emitrust.let %rhs`) before the backedge assign, so `binOp` is
+    // the LetOp and the identity checks below never fired. When the target
+    // is an SSA binding and BOTH the alias and its initializer render
+    // inline in this statement (the alias's own `let` never emits -- its
+    // text IS the initializer's text), look through the alias chain.
+    // Restricted to the SSA-binding leg: place targets keep the exact
+    // load-identity gate pinned by compound-assign-place/-projection.mlir.
+    // A zero-shift initializer is refused: it renders its lhs ALONE
+    // (`v = v;`), so "folding" it would resurrect the dropped amount as
+    // `v <<= 0`.
+    if (!isa<emitrust::LValueType>(var.getType())) {
+      while (auto alias = dyn_cast_if_present<emitrust::LetOp>(binOp)) {
+        Value init = alias.getInit();
+        Operation *initDef = init.getDefiningOp();
+        if (!initDef || !inlineExprs.count(val) || !inlineExprs.count(init) ||
+            zeroShiftLhs(initDef))
+          break;
+        val = init;
+        binOp = initDef;
+      }
+    }
     if (binOp && inlineExprs.count(val)) {
       StringRef sym = compoundAssignSymbol(binOp);
       bool selfRef = false;
+      // When set, the target is operand ONE and the fold renders operand
+      // ZERO as the compound-assign right-hand side (`a = e + a` -> `a += e`).
+      bool foldOperandZero = false;
       if (!sym.empty()) {
         if (!isa<emitrust::LValueType>(var.getType())) {
           selfRef = binOp->getOperand(0) == var;
+          // FR-63 (assign_op_pattern residue), commutative leg: clippy also
+          // flags `a = e + a`. Fold only when the op is commutative with an
+          // identical infix rendering on INTEGERS (`+ * & | ^`; unsigned
+          // `+`/`*` already returned an empty symbol above via the
+          // wrapping-method exclusion, floats are excluded because swapping
+          // addition/multiplication operands is NaN-payload-order sensitive)
+          // and operand 0 is provably pure to reorder against the read of
+          // the target (a name, a literal, or a pure inline load/cast chain;
+          // anything the purity walker cannot prove keeps the plain form).
+          // `a = a + e` and `a += e` both evaluate `e`, read `a`, add, and
+          // store -- only the operand order of the commutative op differs.
+          if (!selfRef && binOp->getOperand(1) == var &&
+              isa<IntegerType>(binOp->getResult(0).getType()) &&
+              isa<emitrust::AddOp, emitrust::MulOp, emitrust::AndOp,
+                  emitrust::OrOp, emitrust::XorOp>(binOp) &&
+              isPureRenderedValue(binOp->getOperand(0))) {
+            selfRef = true;
+            foldOperandZero = true;
+          }
         } else {
           Value op0val = binOp->getOperand(0);
           Operation *op0 = op0val.getDefiningOp();
@@ -3969,7 +4014,8 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
           return failure();
         }
         os << " " << sym << " ";
-        if (failed(emitOperand(loc, binOp->getOperand(1), ExprPos::stmt())))
+        if (failed(emitOperand(loc, binOp->getOperand(foldOperandZero ? 0 : 1),
+                               ExprPos::stmt())))
           return failure();
         os << ";\n";
         return success();
