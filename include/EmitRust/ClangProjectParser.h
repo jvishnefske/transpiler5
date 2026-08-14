@@ -19,10 +19,14 @@
 /// would silently diverge the moment either side gains a flag.
 ///
 /// The factoring is deliberately mechanical: `buildProjectASTs` returns
-/// `ClangTool::buildASTs`' raw status and leaves every interpretation of it
-/// to the caller, because `importC` and `importCProject` classify a
-/// partially-built AST list slightly differently (a distinct diagnostic for
-/// the single-file case) and neither's behavior may change.
+/// `ClangTool::buildASTs`' status — hardened by FR-68 so that ANY
+/// error-severity clang diagnostic forces it nonzero, because driver-level
+/// errors (an unknown argument in a recorded command line) reach neither the
+/// raw status nor the ASTUnit's DiagnosticsEngine — and leaves every further
+/// interpretation of it to the caller, because `importC` and
+/// `importCProject` classify a partially-built AST list slightly differently
+/// (a distinct diagnostic for the single-file case) and neither's behavior
+/// may change.
 //
 //===----------------------------------------------------------------------===//
 
@@ -42,6 +46,29 @@ class ASTUnit;
 
 namespace mlir {
 namespace emitrust {
+
+/// The first error-severity clang diagnostic observed while building a
+/// project's ASTs, attributed to the translation unit whose build produced
+/// it (FR-68).
+///
+/// This channel exists because a driver-level error — clang's
+/// `error: unknown argument: '-fbogus-flag-xyz'` for a GCC-only flag in a
+/// recorded `compile_commands.json` entry or a typo'd `--extra-arg` — is
+/// printed UNLOCATED by clang and never reaches the ASTUnit's
+/// `DiagnosticsEngine`, so a caller that wants to reject with a located
+/// message naming the offending TU can learn the attribution only from the
+/// shell's own diagnostic consumer. It is deliberately NOT folded into the
+/// database-load `error` out-parameter: every caller treats a nonempty
+/// `error` as "the compilation database could not be loaded", a different
+/// failure with a different located message.
+struct ProjectParseError {
+  /// Path of the translation unit being built when the diagnostic fired
+  /// (as resolved by the shell, so usable as a diagnostic location); empty
+  /// when no error-severity diagnostic was seen.
+  std::string file;
+  /// Clang's own rendered message text, without any location prefix.
+  std::string message;
+};
 
 /// True when `path`'s extension marks it as a C++ source: `.cpp`, `.cc`,
 /// `.cxx`, `.C`, `.c++`, or `.hpp` (W2.0 per-input language selection).
@@ -97,19 +124,33 @@ int buildProjectASTs(llvm::ArrayRef<std::string> paths,
 /// \param paths the source files to parse; empty means "the whole database".
 /// \param extraClangArgs arguments appended LAST, so `--extra-arg` overrides
 ///        the database.
+/// FR-68: the returned status is `ClangTool::buildASTs`' own, forced to 1
+/// when it would be 0 despite an error-severity diagnostic having fired
+/// during the run. That closes two holes at this single choke point for all
+/// callers: driver-level errors (unknown argument) that bypass both the raw
+/// status and the ASTUnit engine, and `buildASTs`' measured habit of
+/// returning 0 even for genuine parse errors. Status 2 ("skipped: no
+/// compile command") produces no diagnostic and keeps its meaning; warnings
+/// are NOT counted, so FR-67's demoted-warning flows stay non-fatal.
+///
+/// \param paths the source files to parse; empty means "the whole database".
+/// \param extraClangArgs arguments appended LAST, so `--extra-arg` overrides
+///        the database.
 /// \param compilationDatabasePath a directory holding a
 ///        `compile_commands.json`, the JSON file itself, or empty for none.
 /// \param asts receives one unit per successfully parsed input.
 /// \param resolvedSources receives the translation-unit list actually used.
 /// \param error receives a human-readable reason when the database cannot be
 ///        loaded; untouched otherwise.
+/// \param firstClangError receives the first error-severity diagnostic and
+///        its TU attribution (FR-68); untouched when none fired.
 /// \returns zero when every input compiled without an error.
 int buildProjectASTs(llvm::ArrayRef<std::string> paths,
                      llvm::ArrayRef<std::string> extraClangArgs,
                      llvm::StringRef compilationDatabasePath,
                      std::vector<std::unique_ptr<clang::ASTUnit>> &asts,
                      std::vector<std::string> &resolvedSources,
-                     std::string &error);
+                     std::string &error, ProjectParseError &firstClangError);
 
 } // namespace emitrust
 } // namespace mlir

@@ -4164,6 +4164,60 @@ piece and becomes FR-45.
   :6067 status wiring) recorded here as the follow-up FR-68 candidate,
   deliberately out of FR-67's scope.
 
+- [x] FR-68 Unknown-driver-argument imports must fail loudly (the FR-67
+  spike's measured gap). Today an unknown clang driver argument (e.g. a
+  GCC-only `-f` flag in a recorded database, or a typo in `--extra-arg`)
+  prints clang's own `error: unknown argument: '-fbogus-flag-xyz'` on
+  stderr — yet the import proceeds, the tool EXITS 0, and a module/crate
+  is emitted, on BOTH the compdb and no-compdb paths. That is the exact
+  silent-recovery shape the repo rules forbid: a command line the
+  frontend rejected may have carried an ABI-relevant flag, so the emitted
+  code is unvouched. Both single-TU and project entry points already
+  check `status != 0 || hasErrorOccurred()` (ImportC.cpp:5935, :6067) and
+  return null — so the SIGNAL is what is missing: the driver-level
+  diagnostic evidently reaches neither `ClangTool::run`'s return status
+  nor the ASTUnit's DiagnosticsEngine. Spike must first establish where
+  the "unknown argument" diagnostic is produced and swallowed
+  (ToolInvocation / driver::Driver diagnostics vs the AST consumer), then
+  choose the narrowest capture — plausibly a counting DiagnosticConsumer
+  installed via `ClangTool::setDiagnosticConsumer` whose error count
+  joins the existing status check — such that ANY error-severity
+  diagnostic during AST building fails the import with a located message
+  naming the offending TU. Warnings must NOT become failures (FR-67's
+  demoted warnings and `-Wno-error=int-conversion` flow must survive).
+  Gates: the FR-67 pin test/Project/compdb-gcc-flags.c's unknown-flag
+  section upgrades from stderr-text-only to `not emitrust-cc` +
+  no-output; a no-compdb twin pin via --extra-arg; every existing
+  compdb-*/Driver/Import test unchanged (they are the no-false-positive
+  oracle — any test that today imports with a stray driver warning must
+  still pass); full lit 100%.
+  **SPIKE VERDICT: GO (2026-08-14).** The diagnostic is swallowed in
+  ToolInvocation's PRIVATE driver-side DiagnosticsEngine: a consumer
+  installed via ClangTool::setDiagnosticConsumer receives it at level
+  Error while buildASTs returns status 0 and hasErrorOccurred() stays
+  false. The landed capture lives INSIDE buildProjectASTs (not the two
+  entry points as first drafted) so all FIVE callers close at one choke
+  point — the spike also measured that buildASTs returns 0 even on a
+  genuine PARSE error, so the three status-only Project callers
+  (ItemGraph/ItemColoring/FrontierSearch) were accepting parse-error
+  runs; the folded error count closes that too. The consumer REPLACES
+  the tooling fallback printer, so it forwards
+  HandleDiagnostic/BeginSourceFile/EndSourceFile to a real
+  TextDiagnosticPrinter with ShowOptionNames=1 — measured byte-identical
+  stderr across a 511-file corpus (Import/C + Project + Driver +
+  c-testsuite single-exec), where the corpus differential also showed
+  ZERO cases of consumer-error without hasErrorOccurred, i.e. no
+  existing import newly fails. Warnings stay level-3 and never count;
+  -Wno-error=int-conversion demotes before the consumer sees it;
+  status 2 (missing compile command) keeps its meaning. Attribution of
+  the located message uses an appendArgumentsAdjuster side-channel
+  (fires before the driver diagnostic), rendering
+  `<tu>:1:1: error: clang error while building this translation unit:
+  unknown argument: '...'` with clang's own text preserved byte-for-byte
+  above it. New twin pin test/Project/extra-arg-unknown-flag.c covers
+  the no-compdb path; the FR-67 pin's unknown-flag section upgraded to
+  `not` + no-output. Full suite 571/571.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test

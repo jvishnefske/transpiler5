@@ -25,7 +25,11 @@
 
 #include "EmitRust/ClangProjectParser.h"
 
+#include "clang/Basic/Diagnostic.h"
+#include "clang/Basic/DiagnosticOptions.h"
 #include "clang/Frontend/ASTUnit.h"
+#include "clang/Frontend/TextDiagnosticPrinter.h"
+#include "clang/Tooling/ArgumentsAdjusters.h"
 #include "clang/Tooling/CompilationDatabase.h"
 #include "clang/Tooling/JSONCompilationDatabase.h"
 #include "clang/Tooling/Tooling.h"
@@ -442,6 +446,78 @@ makeCompilationDatabase(llvm::StringRef compilationDatabasePath,
 /// database may also carry several entries for one file (different
 /// configurations), and importing the same TU twice would be a spurious
 /// duplicate-definition error.
+/// FR-68: the diagnostic consumer installed on the `ClangTool` run so that
+/// error-severity diagnostics FORCE a nonzero status. A driver-level error —
+/// clang's `error: unknown argument: '-fbogus-flag-xyz'` for a GCC-only flag
+/// in a recorded compdb entry or a typo'd `--extra-arg` — is produced by
+/// `ToolInvocation`'s private driver-side engine: it reaches neither
+/// `ClangTool::buildASTs`' return status nor the ASTUnit's
+/// `DiagnosticsEngine`, so without this consumer the import would proceed
+/// and silently emit a module built with a rejected (possibly ABI-relevant)
+/// command line.
+///
+/// Installing a consumer REPLACES `ToolInvocation`'s fallback
+/// `TextDiagnosticPrinter`, so this one must be a byte-transparent wrapper:
+/// it forwards `BeginSourceFile`/`EndSourceFile` (the CompilerInstance
+/// drives them here, and caret rendering breaks without them),
+/// `HandleDiagnostic`, and `finish` to a real printer over `llvm::errs()`
+/// whose options set `ShowOptionNames` — the ASTUnit path's default —
+/// because a default-constructed `DiagnosticOptions` would drop the
+/// `[-Wunused-variable]` suffix warnings carry today. Only diagnostics at
+/// `Error` severity or above are counted: warnings must stay non-fatal
+/// (FR-67's demoted `-Werror` flows depend on it), and notes ride along
+/// with their parent.
+class ForwardingErrorCountingConsumer : public clang::DiagnosticConsumer {
+public:
+  ForwardingErrorCountingConsumer(
+      const std::string &currentFile,
+      mlir::emitrust::ProjectParseError &firstError)
+      : currentFile(currentFile), firstError(firstError),
+        printer(llvm::errs(), diagOpts) {
+    // Read by `printer` at diagnostic time; the member order keeps
+    // `diagOpts` alive for the printer's whole life (it holds a reference).
+    diagOpts.ShowOptionNames = 1;
+  }
+
+  void BeginSourceFile(const clang::LangOptions &langOpts,
+                       const clang::Preprocessor *pp) override {
+    printer.BeginSourceFile(langOpts, pp);
+  }
+  void EndSourceFile() override { printer.EndSourceFile(); }
+  void finish() override { printer.finish(); }
+
+  void HandleDiagnostic(clang::DiagnosticsEngine::Level level,
+                        const clang::Diagnostic &info) override {
+    // Keep the base class's NumErrors/NumWarnings bookkeeping contract.
+    clang::DiagnosticConsumer::HandleDiagnostic(level, info);
+    if (level >= clang::DiagnosticsEngine::Error) {
+      ++errorCount;
+      if (firstError.file.empty() && firstError.message.empty()) {
+        llvm::SmallString<128> text;
+        info.FormatDiagnostic(text);
+        firstError.file = currentFile;
+        firstError.message = std::string(text);
+      }
+    }
+    printer.HandleDiagnostic(level, info);
+  }
+
+  /// Diagnostics at `Error` severity or above seen during the whole run,
+  /// across every TU. Nonzero means the run failed even if
+  /// `ClangTool::buildASTs` says otherwise.
+  unsigned errorCount = 0;
+
+private:
+  /// The TU the tool is currently building, maintained by the arguments
+  /// adjuster in `buildProjectASTs` — the adjuster fires before the driver
+  /// parses the command line, so even an unlocated driver error can be
+  /// attributed to its TU.
+  const std::string &currentFile;
+  mlir::emitrust::ProjectParseError &firstError;
+  clang::DiagnosticOptions diagOpts;
+  clang::TextDiagnosticPrinter printer;
+};
+
 std::vector<std::string>
 selectSourcePaths(llvm::ArrayRef<std::string> paths,
                   const clang::tooling::CompilationDatabase &compilations,
@@ -469,10 +545,14 @@ int mlir::emitrust::buildProjectASTs(
   std::vector<std::string> resolvedSources;
   std::string error;
   // An empty database path cannot fail to load, so `error` stays empty and
-  // this is exactly the historical PerFileCompilationDatabase run.
+  // this is exactly the historical PerFileCompilationDatabase run. The
+  // FR-68 attribution is dropped here — this overload's contract reports
+  // failure through the status alone, and clang has already printed the
+  // diagnostic itself.
+  ProjectParseError firstClangError;
   return buildProjectASTs(paths, extraClangArgs,
                           /*compilationDatabasePath=*/"", asts,
-                          resolvedSources, error);
+                          resolvedSources, error, firstClangError);
 }
 
 int mlir::emitrust::buildProjectASTs(
@@ -480,7 +560,8 @@ int mlir::emitrust::buildProjectASTs(
     llvm::ArrayRef<std::string> extraClangArgs,
     llvm::StringRef compilationDatabasePath,
     std::vector<std::unique_ptr<clang::ASTUnit>> &asts,
-    std::vector<std::string> &resolvedSources, std::string &error) {
+    std::vector<std::string> &resolvedSources, std::string &error,
+    ProjectParseError &firstClangError) {
   std::unique_ptr<clang::tooling::CompilationDatabase> compilations =
       makeCompilationDatabase(compilationDatabasePath, extraClangArgs, error);
   if (!compilations) {
@@ -493,5 +574,25 @@ int mlir::emitrust::buildProjectASTs(
   resolvedSources = selectSourcePaths(
       paths, *compilations, /*haveDatabase=*/!compilationDatabasePath.empty());
   clang::tooling::ClangTool tool(*compilations, resolvedSources);
-  return tool.buildASTs(asts);
+  // FR-68: attribution side-channel. The adjuster fires once per TU, BEFORE
+  // the driver parses that TU's command line, so `currentFile` names the
+  // right unit even for unlocated driver-level errors. Both it and the
+  // consumer are per-call locals: attribution state must not leak across
+  // concurrent or successive runs.
+  std::string currentFile;
+  tool.appendArgumentsAdjuster(
+      [&currentFile](const clang::tooling::CommandLineArguments &args,
+                     llvm::StringRef filename) {
+        currentFile = filename.str();
+        return args;
+      });
+  ForwardingErrorCountingConsumer consumer(currentFile, firstClangError);
+  tool.setDiagnosticConsumer(&consumer);
+  int status = tool.buildASTs(asts);
+  // Fold the consumer's verdict into the status, but never overwrite a
+  // nonzero one: status 2 (a TU skipped for want of a compile command,
+  // which produces no error diagnostic) must keep its meaning.
+  if (status == 0 && consumer.errorCount > 0)
+    status = 1;
+  return status;
 }

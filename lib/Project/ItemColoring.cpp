@@ -1079,8 +1079,14 @@ mlir::emitrust::colorItems(llvm::ArrayRef<std::string> paths,
   // would leave open the possibility of the two halves seeing different ASTs.
   std::vector<std::unique_ptr<clang::ASTUnit>> owned;
   std::vector<std::string> sources;
-  int status = buildProjectASTs(paths, extraClangArgs, compilationDatabasePath,
-                                owned, sources, error);
+  // FR-68: the attribution is unused here — a driver-level error still fails
+  // the build through the hardened status below, and clang has already
+  // printed the diagnostic itself; only the importer entry points relocate
+  // it onto the offending TU.
+  ProjectParseError firstClangError;
+  int status =
+      buildProjectASTs(paths, extraClangArgs, compilationDatabasePath, owned,
+                       sources, error, firstClangError);
   if (!error.empty())
     return failure();
   if (owned.size() != sources.size() || status != 0)
