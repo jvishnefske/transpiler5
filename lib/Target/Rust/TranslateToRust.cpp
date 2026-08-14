@@ -2568,18 +2568,28 @@ LogicalResult RustEmitter::emitAttribute(Location loc, Attribute attr) {
   }
   if (auto floatAttr = dyn_cast<FloatAttr>(attr)) {
     // A fold of `1.0 / 0.0` produces an infinity constant; Rust spells it
-    // deterministically. NaN constants stay rejected: Rust does not
-    // guarantee the sign/payload of its NAN constant, so a byte pattern
-    // could silently diverge from C's.
+    // deterministically. NaN constants render as `fW::from_bits(0x..uW)`
+    // with the exact APFloat bit pattern: Rust's NAN constant pins neither
+    // sign nor payload, and the importer's %f/%g shims print nan/-nan by
+    // sign bit, so only the bits are byte-exact — deterministic
+    // sign+payload by construction (FR-69). from_bits is a const fn, so
+    // this spelling is legal in every rendering context (locals, statics,
+    // const-block thread_local initializers).
     if (floatAttr.getValue().isInfinity()) {
       os << (floatAttr.getType().isF32() ? "f32" : "f64")
          << (floatAttr.getValue().isNegative() ? "::NEG_INFINITY"
                                                : "::INFINITY");
       return success();
     }
-    if (!floatAttr.getValue().isFinite())
-      return emitError(loc)
-             << "cannot translate non-finite floating-point constant";
+    if (!floatAttr.getValue().isFinite()) {
+      llvm::APInt bits = floatAttr.getValue().bitcastToAPInt();
+      SmallString<32> hex;
+      bits.toString(hex, /*Radix=*/16, /*Signed=*/false);
+      bool isF32 = floatAttr.getType().isF32();
+      os << (isF32 ? "f32" : "f64") << "::from_bits(0x" << hex
+         << (isF32 ? "u32)" : "u64)");
+      return success();
+    }
     return emitFloatValue(loc, floatAttr.getValueAsDouble(),
                           floatAttr.getType().isF32());
   }
@@ -5035,8 +5045,9 @@ static bool isConstEvaluableInit(Operation *op, Attribute init, Type type) {
       return isConstEvaluableInit(op, nullptr, arrayType.getElementType());
     return false;
   }
-  // Scalar leaves (emitAttribute): integer/bool/float literals and the
-  // f32/f64 INFINITY constants are all const expressions.
+  // Scalar leaves (emitAttribute): integer/bool/float literals, the
+  // f32/f64 INFINITY constants, and NaN `fW::from_bits(..)` renderings
+  // (from_bits is a const fn) are all const expressions.
   if (isa<IntegerAttr, FloatAttr>(init))
     return true;
   // Opaque fn-ptr initializers: only the two importer-produced spellings
