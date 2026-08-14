@@ -1516,6 +1516,16 @@ private:
   /// uses is a plain direct `func.call` callee.
   bool isExternalRequirementShape(func::FuncOp func);
 
+  /// FR-70: whether the undefined extern GLOBAL named `symbol` (with the
+  /// recorded MLIR value type `type`) is a shape the trait can express as a
+  /// getter/setter pair of associated functions: a scalar (integer or
+  /// float), whose address is taken in no TU (an AST fact — see
+  /// `WholeProgramInfo::addressTakenGlobals`), and every one of whose
+  /// surviving IR uses is a direct whole-value `emitrust.global_load` /
+  /// `emitrust.global_store`. Everything else keeps the historical
+  /// rejection: the refusal shrinks, it never silently mis-emits.
+  bool isExternalRequirementGlobalShape(llvm::StringRef symbol, Type type);
+
   //===--------------------------------------------------------------------===//
   // Locations and types
   //===--------------------------------------------------------------------===//

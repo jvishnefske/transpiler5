@@ -45,6 +45,7 @@
 #define EMITRUST_CSYMBOLNAMING_H
 
 #include "EmitRust/CSymbolLinkage.h"
+#include "EmitRust/RustCasing.h"
 
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
@@ -74,65 +75,10 @@ inline bool &idiomaticRenameEnabled() {
   return enabled;
 }
 
-/// Converts a C identifier to `snake_case`: a `_` is inserted before every
-/// uppercase letter that begins a new word (one following a lowercase letter
-/// or a digit, or one that ends an acronym -- an uppercase followed by a
-/// lowercase), and all letters are lowercased. Existing underscores are
-/// preserved, so an already-snake name is unchanged. Used for function and
-/// struct-field names (FR-53 idiomatic rename).
-static inline std::string toSnakeCase(llvm::StringRef name) {
-  std::string out;
-  out.reserve(name.size() + 4);
-  for (size_t i = 0, e = name.size(); i < e; ++i) {
-    char c = name[i];
-    if (c >= 'A' && c <= 'Z') {
-      char prev = i > 0 ? name[i - 1] : '\0';
-      char next = i + 1 < e ? name[i + 1] : '\0';
-      bool prevLower = prev >= 'a' && prev <= 'z';
-      bool prevDigit = prev >= '0' && prev <= '9';
-      bool prevUpper = prev >= 'A' && prev <= 'Z';
-      bool nextLower = next >= 'a' && next <= 'z';
-      if (i > 0 && (prevLower || prevDigit || (prevUpper && nextLower)))
-        out.push_back('_');
-      out.push_back(static_cast<char>(c - 'A' + 'a'));
-    } else {
-      out.push_back(c);
-    }
-  }
-  return out;
-}
-
-/// Converts a C identifier to `SCREAMING_SNAKE_CASE` (snake-case, uppercased).
-/// Used for global/static/const names and enum-variant associated constants.
-static inline std::string toScreamingSnakeCase(llvm::StringRef name) {
-  std::string s = toSnakeCase(name);
-  for (char &c : s)
-    if (c >= 'a' && c <= 'z')
-      c = static_cast<char>(c - 'a' + 'A');
-  return s;
-}
-
-/// Converts a C identifier to `UpperCamelCase`: the snake-case word boundaries
-/// are removed and each word is capitalized. Used for struct/enum type names
-/// (including synthesized `Owner_<fn>_<base>` owners, which become
-/// `OwnerFnBase`).
-static inline std::string toUpperCamelCase(llvm::StringRef name) {
-  std::string snake = toSnakeCase(name);
-  std::string out;
-  out.reserve(snake.size());
-  bool capitalizeNext = true;
-  for (char c : snake) {
-    if (c == '_') {
-      capitalizeNext = true;
-      continue;
-    }
-    if (capitalizeNext && c >= 'a' && c <= 'z')
-      c = static_cast<char>(c - 'a' + 'A');
-    capitalizeNext = false;
-    out.push_back(c);
-  }
-  return out;
-}
+// The casing primitives (`toSnakeCase`, `toScreamingSnakeCase`,
+// `toUpperCamelCase`) live in EmitRust/RustCasing.h, included above: they are
+// clang-free and the FR-70 lowering pass in lib/Conversion (MLIR-only) must
+// share the exact derivation. Everything below is a function of the clang AST.
 
 /// Returns whether `name` is a Rust keyword (strict or reserved, editions
 /// 2015-2021, plus the contextual `union`) and thus unusable as a Rust item

@@ -257,6 +257,21 @@ ActorLiftAttachment emitrustcc::attachActorLiftAttributes(
                    "' is a deferred external declaration (another "
                    "translation unit defines it)");
 
+  // Rule 1c, FR-70 arm: an external-REQUIREMENT global (FR-70
+  // `emitrust.external_requirement`) is a declaration for the same reason —
+  // the ENVIRONMENT owns the storage, supplied later through the Externals
+  // trait impl — so lifting it into an actor field would delete the
+  // requirement and fabricate an initializer this project never had.
+  for (auto [i, actor] : llvm::enumerate(plan.actors))
+    for (const std::string &global : actor.globals)
+      if (auto it = globalOps.find(global);
+          it != globalOps.end() &&
+          it->second->hasAttr(mlir::emitrust::kExternalRequirementAttrName))
+        demote((unsigned)i,
+               "global '" + global +
+                   "' is an external requirement (the consumer supplies "
+                   "its storage)");
+
   // Rule 2: poison-merged actors.
   for (auto [i, actor] : llvm::enumerate(plan.actors))
     if (actor.poisoned)

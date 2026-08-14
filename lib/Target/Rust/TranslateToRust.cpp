@@ -3090,6 +3090,20 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
            << "': the module must be linked against the defining translation "
               "unit before Rust emission";
   }
+  // FR-70: a module reaching emission with an external-requirement GLOBAL
+  // still marked skipped `emitrust-lower-external-requirements`. Unlike a
+  // marked FUNCTION (body-less, so translation dies naturally), a
+  // declaration-only global is perfectly renderable — as DEFAULTED
+  // thread_local storage the C program never had — so silence here would be
+  // a miscompile, not an error. Refuse instead, completing the FR-52 marker
+  // contract for the global side.
+  for (auto globalOp : moduleOp.getOps<emitrust::GlobalOp>())
+    if (globalOp->hasAttr(emitrust::kExternalRequirementAttrName))
+      return globalOp.emitError()
+             << "unlowered external-requirement global '"
+             << globalOp.getSymName()
+             << "': emitrust-lower-external-requirements must run before "
+                "Rust emission";
   // FR-62 slice 5c: the shared `mod actor_rt` epilogue exists once per
   // crate and its text is flavor-specific, so every anchor in one module
   // must agree on the mode. The driver never produces a mixed module

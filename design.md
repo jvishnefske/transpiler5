@@ -4265,6 +4265,72 @@ piece and becomes FR-45.
   import-stage rejection. Bonus first-ever golden coverage of the
   infinity arm. Full suite 573/573.
 
+- [x] FR-70 Extern-global requirements: getter/setter trait items for the
+  non-address-taken subset (Track 5 Stage-1 enabler: 39 of the 43
+  crate-killing solo-TU failures are `extern global variable ... not
+  defined in any translation unit`). REVISES an FR-52 recorded refusal on
+  new evidence and a new shape: FR-52 rejected globals because "an
+  associated const is a VALUE ... no associated trait item yields a place
+  an assignment can write to" — true for associated consts, but a
+  getter/setter PAIR of associated functions (`fn g_config() -> i32` /
+  `fn set_g_config(v: i32)`) expresses read and write of external storage
+  without ever needing an address, monomorphises to direct calls, no dyn,
+  no unsafe, exactly the FR-52 contract. The conservative gate that makes
+  it sound: ONLY an extern global whose every surviving IR use is a
+  direct whole-value load or store qualifies; any address-taken use,
+  member/index projection into it, aggregate type the trait can't
+  faithfully pass by value, or volatile keeps today's located rejection
+  verbatim (the refusal shrinks, never disappears). Write-less globals
+  emit only the getter. Architecture mirrors FR-52 exactly: the importer
+  records the FACT (the marker attr on a declaration-only global);
+  emitrust-lower-external-requirements does the work after
+  convert-to-emitrust (rewrites loads/stores to `E::g()` / `E::set_g(v)`
+  opaque callees, adds the items to the `Externals` trait, extends the
+  same caller-fixpoint generic propagation); a module reaching the
+  emitter with the marker still set fails loudly (the FR-52/57a marker
+  contract). BIN crates stay an error for the same FR-44-blinding reason.
+  Spike must verify: (a) the pass can rewrite a global LOAD/STORE (today
+  it rewrites calls) — the emitted-name/opaque-callee seam supports it;
+  (b) the trait grows mixed fn+global items in one propagation fixpoint;
+  (c) an address-taken probe stays the verbatim rejection; (d) the five
+  pinned undefined-extern tests and extern-plugin corpus scores are
+  unchanged except where a global now qualifies (any score change must be
+  an improvement and explained). Gates: new pins
+  test/Import/C/multi-tu-external-requirement-global.c (marker fact),
+  test/Conversion/LowerExternalRequirements/ global rewrite + frontier
+  (address-taken, projection, volatile rejections verbatim),
+  test/Target/Rust/trait-def.mlir grows the getter/setter spelling,
+  test/EndToEnd/lib-crate-externals-global.c (lib crate builds; a
+  consumer impl supplies storage and the byte-diff runs against a
+  clang native given the same definitions); existing five
+  undefined-extern pins byte-unchanged; full lit 100%.
+  **SPIKE VERDICT: GO (2026-08-14).** Hand-written target lib.rs (mixed
+  fn+global trait items, generic propagation) byte-diffed IDENTICAL
+  against the clang native with a thread_local-Cell consumer supplying
+  storage; hand post-pass IR round-trips emitrust-opt and renders
+  through emitrust-translate with ZERO new ops (trait_def already
+  accepts ()->T and (T)->() items; load -> result-bearing call_opaque
+  expression, store -> call_opaque statement). Two measured hazards
+  reshaped the design: (1) `&g` leaves NO surviving IR use (the body
+  drops), so the "every surviving IR use" gate was UNSOUND as an IR
+  scan — the qualifying fact is AST-level: scalar type AND symbol not in
+  wholeProgram.addressTakenGlobals (previously consumer-less); (2) an
+  unmarked decl-only GlobalOp silently renders a DEFAULTED thread_local
+  static — a silent-miscompile shape — so the marker joined the
+  emitter's refusal walk, and ActorLiftPlan Rule 1c grew the marker (an
+  actor lift would otherwise fabricate storage). Naming: getter =
+  toSnakeCase(symbol), setter = set_+getter, derived-name collisions
+  refused before any edit; casing helpers hoisted to the clang-free
+  include/EmitRust/RustCasing.h (the conversion lib links MLIR-only).
+  Pointers never reach the scalar map (deferExternPointerGlobal);
+  aggregates/address-taken/bin crates keep the verbatim rejection
+  (probed); volatile rejects earlier by construction. The
+  multi-tu-external-requirement-negative GLOBAL arm flips deliberately
+  (host_counter now qualifies — the improvement the FR exists for);
+  the five frozen undefined-extern pins are byte-unchanged. Solo-TU
+  `extern int g_config` + accessor under default `auto` now emits the
+  trait crate — the exact Track 5 shape. Full suite 576/576.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test

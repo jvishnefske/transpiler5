@@ -1,17 +1,42 @@
 // FR-52: rendering the external-requirement trait and the functions that are
-// generic over it.
+// generic over it. FR-70 adds GLOBAL requirements to the same trait as a
+// getter/setter pair of ordinary associated functions -- `fn g_config() ->
+// i32` / `fn set_g_config(v0: i32)` -- so this golden also pins that exact
+// spelling and the expression/statement rendering of their call sites.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
 // The trait is ALWAYS `pub`, even here where nothing asked for exported
 // items: a requirement the crate's consumer cannot name is a requirement
-// nobody can satisfy.
+// nobody can satisfy. A global's getter/setter items need no special
+// rendering at all: they are `() -> T` and `(T) -> ()` associated functions
+// like any other.
 // CHECK:      pub trait Externals {
 // CHECK-NEXT:     fn host_scale(v0: i32) -> i32;
 // CHECK-NEXT:     fn host_reset();
 // CHECK-NEXT:     fn host_mix(v0: i32, v1: f64) -> f64;
+// CHECK-NEXT:     fn g_config() -> i32;
+// CHECK-NEXT:     fn set_g_config(v0: i32);
 // CHECK-NEXT: }
-emitrust.trait_def @Externals ["host_scale", "host_reset", "host_mix"]
-    [(i32) -> i32, () -> (), (i32, f64) -> f64]
+emitrust.trait_def @Externals
+    ["host_scale", "host_reset", "host_mix", "g_config", "set_g_config"]
+    [(i32) -> i32, () -> (), (i32, f64) -> f64, () -> i32, (i32) -> ()]
+
+// FR-70: a getter call is a result-bearing opaque call, so its value binds
+// (or folds) exactly where the global load's value flowed; a setter call is
+// a statement. Nothing here is global-specific by the time it renders --
+// which is the point: the pass lowered storage access to plain calls.
+// CHECK:      fn bump<E: Externals>(v0: i32) -> i32 {
+// CHECK-NEXT:     let v1: i32 = E::g_config();
+// CHECK-NEXT:     E::set_g_config(v1 + v0);
+// CHECK-NEXT:     v1
+// CHECK-NEXT: }
+emitrust.func @bump(%arg0: i32) -> i32
+    attributes {emitrust.externals_generic = "Externals"} {
+  %0 = emitrust.call_opaque "E::g_config"() : () -> i32
+  %1 = emitrust.add %0, %arg0 : i32
+  emitrust.call_opaque "E::set_g_config"(%1) : (i32) -> ()
+  emitrust.return %0 : i32
+}
 
 // A function in the closure carries the bound; the call sites were already
 // requalified by the lowering pass, so the emitter only renders them.

@@ -5755,6 +5755,11 @@ Location CImporter::firstSymbolUseLoc(llvm::StringRef symbol,
 }
 
 LogicalResult CImporter::finalizeProject() {
+  // FR-52/FR-70: whether an unresolved external may become a requirement on
+  // the ENVIRONMENT is one whole-project policy decision, consumed by both
+  // the global loop here and the function loop below, so it is computed
+  // once, first.
+  bool trait = externalRequirementsAllowed();
   // Every deferred `extern` global that was referenced must have a real
   // definition in some translation unit; the Rust program otherwise reads
   // an undefined symbol. Unreferenced extern declarations were skipped at
@@ -5778,6 +5783,26 @@ LogicalResult CImporter::finalizeProject() {
                         moduleBuilder.getUnitAttr());
         continue;
       }
+      // FR-70: under a trait policy, a scalar global whose every access is a
+      // direct whole-value load or store is not an error but a REQUIREMENT —
+      // storage the environment owns, read and written through a getter/
+      // setter pair on the Externals trait. Recorded exactly like the FR-57a
+      // branch above but with the FR-52 requirement marker;
+      // `emitrust-lower-external-requirements` does the rewriting, and the
+      // Rust emitter refuses a module still carrying the marker (a
+      // declaration-only global would otherwise silently render DEFAULTED
+      // storage the C program never had).
+      if (trait && isExternalRequirementGlobalShape(entry.getKey(),
+                                                    entry.getValue().type)) {
+        OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+        auto reqOp = moduleBuilder.create<emitrust::GlobalOp>(
+            entry.getValue().loc, moduleBuilder.getStringAttr(entry.getKey()),
+            TypeAttr::get(entry.getValue().type), /*init=*/Attribute(),
+            /*is_const=*/UnitAttr());
+        reqOp->setAttr(emitrust::kExternalRequirementAttrName,
+                       moduleBuilder.getUnitAttr());
+        continue;
+      }
       return emitError(firstSymbolUseLoc(entry.getKey(), entry.getValue().loc))
              << "unsupported: extern global variable '" << entry.getKey()
              << "' is referenced but not defined in any translation unit";
@@ -5792,8 +5817,7 @@ LogicalResult CImporter::finalizeProject() {
   // FR-52: under a trait policy the survivors are not an error but the
   // project's REQUIREMENTS on its environment, and are marked as such for
   // `emitrust-lower-external-requirements` instead. Only the shapes the trait
-  // can faithfully express qualify — see `externalRequirementFor`.
-  bool trait = externalRequirementsAllowed();
+  // can faithfully express qualify — see `isExternalRequirementShape`.
   for (func::FuncOp func :
        llvm::make_early_inc_range(module.getOps<func::FuncOp>()))
     if (func.isExternal()) {
@@ -5839,6 +5863,38 @@ bool CImporter::externalRequirementsAllowed() {
   // TU only declared) is not a definition and does not count.
   func::FuncOp entry = functions.lookup("c_main");
   return !entry || entry.isExternal();
+}
+
+bool CImporter::isExternalRequirementGlobalShape(llvm::StringRef symbol,
+                                                 Type type) {
+  // Only a type the trait can faithfully pass BY VALUE qualifies: the
+  // getter/setter pair copies a whole scalar in and out. Pointer-typed
+  // externs never reach the scalar pending map (`deferExternPointerGlobal`);
+  // aggregates keep the rejection — projections into environment-owned
+  // struct or array storage need PLACES, which no associated trait item
+  // yields, and admitting the whole-value copy alone would make the frontier
+  // depend on which accesses an optimization happened to leave.
+  if (!llvm::isa<IntegerType, FloatType>(type))
+    return false;
+  // Address-takenness is an AST fact, not an IR one: `&g` on an undefined
+  // extern can leave NO surviving symbol use at all (the pointer plan
+  // swallows the body it flowed into), so an IR-use scan alone would wrongly
+  // qualify it. The whole-program pre-scan records the fact under exactly
+  // this symbol key (`addressBoundGlobal` → `globalVarSymbolName`, the same
+  // naming `pendingExternGlobals` is keyed by).
+  if (wholeProgram.addressTakenGlobals.contains(symbol))
+    return false;
+  // And every IR use that DID survive must be a direct whole-value load or
+  // store — the only two shapes `E::g()` / `E::set_g(v)` can express.
+  std::optional<SymbolTable::UseRange> uses = SymbolTable::getSymbolUses(
+      StringAttr::get(module.getContext(), symbol), module.getOperation());
+  if (!uses)
+    return false;
+  for (SymbolTable::SymbolUse use : *uses)
+    if (!llvm::isa<emitrust::GlobalLoadOp, emitrust::GlobalStoreOp>(
+            use.getUser()))
+      return false;
+  return true;
 }
 
 bool CImporter::isExternalRequirementShape(func::FuncOp func) {
