@@ -2,11 +2,10 @@
   "corpus": "test/EndToEnd",
   "crates_linted": 114,
   "crates_skipped": 14,
-  "total_warnings": 356,
+  "total_warnings": 350,
   "by_lint": {
     "clippy::needless_late_init": 310,
     "clippy::unnecessary_cast": 19,
-    "clippy::assign_op_pattern": 7,
     "clippy::approx_constant": 5,
     "clippy::needless_else": 3,
     "clippy::if_same_then_else": 3,
@@ -14,6 +13,7 @@
     "clippy::type_complexity": 2,
     "clippy::manual_range_contains": 2,
     "clippy::manual_unwrap_or_default": 2,
-    "clippy::useless_format": 1
+    "clippy::useless_format": 1,
+    "clippy::assign_op_pattern": 1
   }
 }
