@@ -705,6 +705,35 @@ private:
   /// computed for the current function.
   void computeIfExprBindings();
 
+  // --- FR-63 (clippy::field_reassign_with_default): default + field-store
+  //     fusion into a functional-update struct literal ---
+
+  /// Per struct-typed, default-initialized (`let [mut] s: S = S::default();`)
+  /// `emitrust.variable`, the maximal PREFIX of consecutive statement-position
+  /// assigns to DISTINCT single-level fields of that variable, fused into one
+  /// `let s: S = S { f1: v1, .., ..S::default() };` literal (field order =
+  /// program assign order; Rust evaluates literal fields in written order and
+  /// the derived `S::default()` is pure, so evaluation order is preserved
+  /// observably). Populated per function by `computeFieldInitFuses`.
+  DenseMap<Operation *, SmallVector<emitrust::AssignOp, 4>> fieldInitFuses;
+
+  /// Reverse map: fused `emitrust.assign` -> its `emitrust.variable`. The
+  /// LAST assign of a fuse renders the whole `let` (every fused value's
+  /// inline text has been captured by then); the variable and the earlier
+  /// fused assigns render nothing. `lvalueIsMutated` skips members, so the
+  /// binding's mut-ness is recomputed over the SURVIVING mutations only.
+  DenseMap<Operation *, Operation *> fusedAssignOwner;
+
+  /// Fills `fieldInitFuses`/`fusedAssignOwner`. Must run AFTER
+  /// `computeDeferredInits` (a deferred binding never fuses) and
+  /// `computeInlineCandidates` (the statement scan skips inline-consumed and
+  /// dropped ops, which render nothing at their program point).
+  void computeFieldInitFuses(emitrust::FuncOp funcOp);
+
+  /// Emits the fused functional-update `let` for `variableOp` (see
+  /// `fieldInitFuses`); called from `emitAssign` at the fuse's last assign.
+  LogicalResult emitFusedFieldInit(emitrust::VariableOp variableOp);
+
   // --- FR-61d: single-use expression inlining + unused-pure-value drops ---
 
   /// Ops whose single-real-use result renders inline at its consumer
@@ -1064,6 +1093,15 @@ bool RustEmitter::lvalueIsMutated(Value value) {
     Operation *owner = use.getOwner();
     if (unreachableOps.count(owner) || deadStores.count(owner) ||
         droppedOps.count(owner))
+      continue;
+    // FR-63 (field_reassign_with_default): a fused field store renders as a
+    // literal field, not as a mutation, so it must not force `mut` on the
+    // fused binding (deny(unused_mut) makes a stale `mut` a hard rustc
+    // failure). Pre-fuse analyses see the maps empty and keep today's
+    // conservative answer; only the fused binding's own emission consults
+    // the post-fuse answer. (For a VALUE use of an lvalue the assign case
+    // below `continue`s anyway, so this skip cannot hide a real mutation.)
+    if (fusedAssignOwner.count(owner))
       continue;
     if (auto assign = dyn_cast<emitrust::AssignOp>(owner)) {
       if (assign.getVar() == value)
@@ -2066,6 +2104,141 @@ FailureOr<std::string> RustEmitter::lookupName(Location loc, Value value) {
   return it->second;
 }
 
+/// FR-63 (field_reassign_with_default): whether `value`'s transitive operand
+/// tree reaches a place rooted at `root`. Any such reach (a load's place, a
+/// borrow, a method receiver, the variable itself) would observe the struct
+/// mid-construction, so it disqualifies the fuse from that assign onward.
+/// Conservative toward `true`: a false positive only keeps the plain
+/// statement rendering.
+static bool valueTreeReachesPlace(Value value, Value root,
+                                  llvm::SmallPtrSetImpl<Operation *> &visited) {
+  if (value == root || projectionBase(value) == root)
+    return true;
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return false; // a block argument never aliases a local variable place
+  if (!visited.insert(def).second)
+    return false;
+  bool reaches = false;
+  def->walk([&](Operation *nested) {
+    for (Value operand : nested->getOperands())
+      if (valueTreeReachesPlace(operand, root, visited))
+        reaches = true;
+  });
+  return reaches;
+}
+
+void RustEmitter::computeFieldInitFuses(emitrust::FuncOp funcOp) {
+  funcOp->walk([&](emitrust::VariableOp variableOp) {
+    // Gate 1: exactly the `let [mut] s: S = S::default();` rendering — a
+    // struct-typed variable with no initializer whose dead default was NOT
+    // dropped in favor of deferred initialization. (Enums are skipped: an
+    // `!emitrust.enum` place has no fields, only the `.0` raw slot.)
+    Operation *varOp = variableOp.getOperation();
+    if (variableOp.getInitAttr() || variableOp.getIsConst() ||
+        deferredInits.count(varOp) || unreachableOps.count(varOp))
+      return;
+    Value result = variableOp.getResult();
+    if (!isa<emitrust::StructType>(
+            cast<emitrust::LValueType>(result.getType()).getValueType()))
+      return;
+    // Gate 2: the maximal prefix of consecutive statement-position assigns
+    // to DISTINCT single-level fields of this variable. Ops that render
+    // nothing at their own program point — place projections, inlined
+    // single-use producers, dropped pure ops — are skipped: their renders
+    // happen at consumers at-or-after the fuse point, where every field
+    // holds the same value as after the sequential stores. ANY other
+    // statement (a `let`, a call, a nested/indexed or whole-binding store,
+    // a dead store, a repeated field, a value that reads this variable)
+    // ends the prefix; everything from there on renders unchanged.
+    SmallVector<emitrust::AssignOp, 4> fused;
+    llvm::StringSet<> seenFields;
+    for (Operation *op = varOp->getNextNode(); op; op = op->getNextNode()) {
+      if (isPlaceProjection(op) || droppedOps.count(op) ||
+          inlinedOps.count(op))
+        continue;
+      auto assign = dyn_cast<emitrust::AssignOp>(op);
+      if (!assign || deadStores.count(op))
+        break;
+      auto member = assign.getVar().getDefiningOp<emitrust::MemberOp>();
+      if (!member || member.getOperand() != result)
+        break; // whole-binding store, or a nested/indexed place
+      if (!seenFields.insert(member.getMember()).second)
+        break; // a literal cannot repeat a field
+      llvm::SmallPtrSet<Operation *, 16> visited;
+      if (valueTreeReachesPlace(assign.getValue(), result, visited))
+        break; // the value reads the variable being built
+      fused.push_back(assign);
+    }
+    if (fused.empty())
+      return;
+    for (emitrust::AssignOp assign : fused)
+      fusedAssignOwner[assign.getOperation()] = varOp;
+    fieldInitFuses[varOp] = std::move(fused);
+  });
+}
+
+LogicalResult RustEmitter::emitFusedFieldInit(emitrust::VariableOp variableOp) {
+  Operation *op = variableOp.getOperation();
+  Value result = variableOp.getResult();
+  Location loc = variableOp.getLoc();
+  Type valueType = cast<emitrust::LValueType>(result.getType()).getValueType();
+  auto structType = cast<emitrust::StructType>(valueType);
+  const SmallVector<emitrust::AssignOp, 4> &assigns = fieldInitFuses[op];
+  // Mut-ness recomputed over the SURVIVING mutations only: `lvalueIsMutated`
+  // skips the fused assigns, so a binding whose only stores fused loses its
+  // `mut` while any later store/borrow/mutating call keeps it. Both failure
+  // directions are loud rustc errors (unused_mut is denied; a missing `mut`
+  // is E0596/E0384), never silent misbehavior.
+  bool isMut = lvalueIsMutated(result);
+  os << (isMut ? "let mut " : "let ") << assignName(result) << ": ";
+  if (failed(emitType(loc, valueType)))
+    return failure();
+  // When the fused fields cover the whole struct the functional-update base
+  // would be dead (clippy::needless_update), so it is dropped and the
+  // literal matches the aggregate-initializer style exactly. The struct_def
+  // is a module-level symbol, and `emitrust.impl` is itself a SymbolTable
+  // (so `lookupNearestSymbolFrom` from a method body would miss it): resolve
+  // in the enclosing module directly. An unresolved def keeps the base —
+  // conservative, never wrong.
+  bool coversAllFields = false;
+  if (auto module = op->getParentOfType<ModuleOp>())
+    if (auto structDef = dyn_cast_or_null<emitrust::StructDefOp>(
+            SymbolTable::lookupSymbolIn(
+                module, StringAttr::get(op->getContext(),
+                                        structType.getName()))))
+      coversAllFields = assigns.size() == structDef.getFieldNames().size();
+  os << " = " << structType.getName() << " { ";
+  for (emitrust::AssignOp assign : assigns) {
+    auto member = cast<emitrust::MemberOp>(assign.getVar().getDefiningOp());
+    StringRef field = member.getMember();
+    // clippy::redundant_field_names: a value whose rendered text is exactly
+    // the field's name (a same-named binding, e.g. a C local lifted from
+    // `s.a = a;`) collapses to the field shorthand `S { a, .. }`. Every
+    // value reaching here is already named (its `let`/argument emitted
+    // before the fuse point) or captured in `inlineExprs`, so the compare
+    // is against the final text.
+    auto inlined = inlineExprs.find(assign.getValue());
+    std::string namedText = valueNames.lookup(assign.getValue());
+    StringRef valueText = inlined != inlineExprs.end()
+                              ? StringRef(inlined->second.text)
+                              : StringRef(namedText);
+    if (valueText == field) {
+      os << field << ", ";
+      continue;
+    }
+    os << field << ": ";
+    if (failed(emitOperand(assign.getLoc(), assign.getValue(),
+                           ExprPos::delimited())))
+      return failure();
+    os << ", ";
+  }
+  if (!coversAllFields)
+    os << ".." << structType.getName() << "::default() ";
+  os << "};\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitOperand(Location loc, Value value,
                                        ExprPos pos) {
   // FR-61d: a captured single-use expression prints inline; everything else
@@ -3005,6 +3178,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   inlineTreeReadsPlace.clear();
   droppedOps.clear();
   pendingInlineCapture = false;
+  fieldInitFuses.clear();
+  fusedAssignOwner.clear();
 
   Region &body = fn.getFunctionBody();
   if (body.empty())
@@ -3070,6 +3245,9 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // operands can inline into (or drop with) the survivors.
   computeDroppedOps(funcOp);
   computeInlineCandidates(funcOp);
+  // FR-63 (field_reassign_with_default): after the inline/drop sets — the
+  // fuse's statement scan skips exactly the ops those passes silenced.
+  computeFieldInitFuses(funcOp);
   // A function directly inside an `emitrust.impl` is a method, UNLESS it
   // carries the `static_method` marker (W2.2), in which case it is a
   // receiverless associated function (`Struct::name(...)`) and every
@@ -3616,6 +3794,15 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
   // A dead store emits nothing: its written value is never read.
   if (deadStores.count(op))
     return success();
+  // FR-63 (clippy::field_reassign_with_default): a fused field store is a
+  // literal field, not a statement; the fuse's LAST assign renders the whole
+  // `let` for its variable (see `computeFieldInitFuses`).
+  if (Operation *owner = fusedAssignOwner.lookup(op)) {
+    auto fuse = fieldInitFuses.find(owner);
+    if (op != fuse->second.back().getOperation())
+      return success();
+    return emitFusedFieldInit(cast<emitrust::VariableOp>(owner));
+  }
   Location loc = op->getLoc();
   Value var = assignOp.getVar();
 
@@ -4715,6 +4902,15 @@ LogicalResult RustEmitter::emitVariable(emitrust::VariableOp variableOp) {
   // `unused_assignments` the overwritten default would otherwise draw.
   if (deferredInits.count(variableOp.getOperation()))
     return emitDeferredBinding(variableOp.getOperation(), result, valueType);
+  // FR-63 (clippy::field_reassign_with_default): the default and its
+  // immediately-following field stores render as ONE functional-update
+  // literal at the fuse's LAST assign (every fused value's inline text has
+  // been captured by then; nothing renders in between). The name is still
+  // claimed here so the surviving v-numbering matches the unfused rendering.
+  if (fieldInitFuses.count(variableOp.getOperation())) {
+    assignName(result);
+    return success();
+  }
   // A `const`-marked variable is never written after its initializer, and a
   // variable with no reachable mutation likewise needs no `mut`; either way
   // it becomes an immutable `let` binding.
