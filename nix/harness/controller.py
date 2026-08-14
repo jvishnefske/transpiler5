@@ -45,8 +45,17 @@ REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 CLIPPY_EVAL = os.path.join(REPO, "nix", "clippy-eval", "clippy_eval.py")
 CLIPPY_BASELINE = os.path.join(REPO, "nix", "clippy-eval", "clippy-baseline.json")
 CHAMPION = os.path.join(HERE, "champion.json")
-EMITRUST_CC = os.environ.get("EMITRUST_CC",
-                             os.path.join(REPO, "build", "bin", "emitrust-cc"))
+def _default_emitrust_cc():
+    # CMake trees put tools in build/bin/, meson trees in build/tools/.
+    for rel in (("build", "bin", "emitrust-cc"),
+                ("build", "tools", "emitrust-cc")):
+        p = os.path.join(REPO, *rel)
+        if os.path.exists(p):
+            return p
+    return os.path.join(REPO, "build", "bin", "emitrust-cc")
+
+
+EMITRUST_CC = os.environ.get("EMITRUST_CC", _default_emitrust_cc())
 
 # The one allow-attribute the emitter is permitted to emit at the crate root.
 # Any allow-line outside the champion's recorded set is a new suppression and
@@ -212,7 +221,14 @@ def cmd_gate(args):
             return 4
 
     if not args.no_oracle:
-        r = sh(["nix", "develop", "-c", "ninja", "-C", "build", "check-emitrust"])
+        # A meson-configured build dir has no `check-emitrust` ninja target;
+        # `meson test` runs the identical lit suite (CLAUDE.md build notes).
+        if os.path.isdir(os.path.join(REPO, "build", "meson-info")):
+            oracle = ["nix", "develop", "-c", "meson", "test", "-C", "build"]
+        else:
+            oracle = ["nix", "develop", "-c", "ninja", "-C", "build",
+                      "check-emitrust"]
+        r = sh(oracle)
         if r.returncode != 0:
             print("GATE: check-emitrust FAILED (byte-diff oracle is supreme)")
             return 5
