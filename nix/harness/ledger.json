@@ -53,6 +53,16 @@
             "held_out_total": 83
           },
           "note": "field_reassign_with_default: fuse default-init struct locals with the adjacent field-store prefix into a functional-update literal (all-fields drops the base, shorthand when text==field)"
+        },
+        {
+          "emitter_rev": "7aa34df11234b4fa2dff733fae48b9645f1a4679",
+          "timestamp": "2026-08-14T16:36:50",
+          "metrics": {
+            "total_warnings": 385,
+            "train_total": 301,
+            "held_out_total": 81
+          },
+          "note": "missing_const_for_thread_local: const-block the Cell initializer when the init attr/type is provably const (literals, const arrays/aggregates, None/Some(fn); struct-default stays unwrapped)"
         }
       ]
     }
