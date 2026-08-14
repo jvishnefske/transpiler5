@@ -23,6 +23,16 @@
             "held_out_total": 128
           },
           "note": "explicit_auto_deref: drop (*x) on .field/[i]/.0/method bases (Deref coercion re-adds)"
+        },
+        {
+          "emitter_rev": "95a7aa94ca319a755d669d8a65879e15dd49ce34",
+          "timestamp": "2026-08-14T15:48:16",
+          "metrics": {
+            "total_warnings": 491,
+            "train_total": 382,
+            "held_out_total": 104
+          },
+          "note": "assign_op_pattern: fold pure projection places (field/index/deref) -- structural place identity + purity walk"
         }
       ]
     }
