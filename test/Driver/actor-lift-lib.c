@@ -68,8 +68,7 @@ int summary(void) { return peek() + get_flags(); }
 // RUST-NEXT: }
 // RUST:      impl CounterActor {
 // RUST-NEXT:     pub fn new() -> CounterActor {
-// RUST-NEXT:         let mut owner: CounterActor = CounterActor::default();
-// RUST-NEXT:         owner.counter = 5i32;
+// RUST-NEXT:         let owner: CounterActor = CounterActor { counter: 5i32, };
 // RUST-NEXT:         owner
 // RUST-NEXT:     }
 // RUST:          pub fn bump(&mut self, by: i32) -> i32 {

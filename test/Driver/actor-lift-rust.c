@@ -57,8 +57,7 @@ int main(void) {
 // CHECK-NEXT: }
 // CHECK:      fn c_main() -> i32 {
 // CHECK-NEXT:     let mut counter_actor: CounterActor = CounterActor::default();
-// CHECK-NEXT:     let mut tally_actor: TallyActor = TallyActor::default();
-// CHECK-NEXT:     tally_actor.total = 7i32;
+// CHECK-NEXT:     let mut tally_actor: TallyActor = TallyActor { total: 7i32, };
 // CHECK-NEXT:     let mut limit: i32 = 50;
 // CHECK:          counter_actor.bump()
 // CHECK:          tally_actor.tally(2i32)

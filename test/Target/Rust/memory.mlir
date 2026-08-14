@@ -51,9 +51,11 @@ emitrust.func @defaults() {
   emitrust.return
 }
 
+// FR-63 (field_reassign_with_default): the default + its immediately-
+// following single-level field store fuse into a functional-update literal;
+// with no surviving mutation the binding also loses `mut`.
 // CHECK-LABEL: fn fields(v0: i32) -> i32 {
-// CHECK-NEXT:    let mut v1: Point = Point::default();
-// CHECK-NEXT:    v1.x = v0;
+// CHECK-NEXT:    let v1: Point = Point { x: v0, ..Point::default() };
 // CHECK-NEXT:    v1.y
 // CHECK-NEXT:  }
 emitrust.func @fields(%arg0: i32) -> i32 {
