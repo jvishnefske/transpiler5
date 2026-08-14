@@ -598,6 +598,36 @@ private:
   /// Whether any emitted (reachable, non-dead-store) assign targets `value`.
   bool letHasEmittedAssign(Value value);
 
+  /// FR-63 (assign_op_pattern over projection places): whether dropping one
+  /// textual render of `value` is provably effect-free. A value outside
+  /// `inlineExprs` renders as a NAME (its `let`/argument binding still
+  /// emits), so a dropped occurrence is inert; an inline render must be a
+  /// pure expression tree (constant, cast chain, load of a pure place) --
+  /// anything else (a call, an unclassified producer) is not provably
+  /// effect-free and blocks the fold.
+  bool isPureRenderedValue(Value value);
+
+  /// FR-63: whether `place`'s projection chain renders as a provably pure
+  /// expression: member/enum_raw/subscript/deref links down to a root
+  /// `emitrust.variable`, with every non-place operand (subscript index,
+  /// deref base) passing `isPureRenderedValue`.
+  bool isPureRenderedPlace(Value place);
+
+  /// FR-63: whether `kept` and `dropped` denote the SAME runtime value at
+  /// the statement being emitted, such that dropping `dropped`'s render is
+  /// effect-free. Same SSA value: yes iff pure (the kept render still uses
+  /// every shared name). Distinct defs must be structurally identical pure
+  /// twins -- equal constants, cast pairs, or load pairs of the same place
+  /// -- and (constants aside) BOTH must render inline HERE: a side hoisted
+  /// to an earlier `let` read the place at an earlier program point, which
+  /// an intervening write could distinguish.
+  bool isSamePureReadValue(Value kept, Value dropped);
+
+  /// FR-63: structural identity of two place-projection chains (the importer
+  /// materializes the LHS place and the RHS load's place as separate SSA
+  /// chains), pure per `isPureRenderedPlace` so one render can be dropped.
+  bool isSamePureReadPlace(Value kept, Value dropped);
+
   /// Whole-binding `emitrust.assign` stores whose written value is never read
   /// before the binding is overwritten again -- dead stores that emit nothing.
   /// Treated as removed by every other phase (liveness, deferral, mut, naming).
@@ -3406,6 +3436,118 @@ static StringRef compoundAssignSymbol(Operation *op) {
       .Default([](Operation *) { return StringRef(); });
 }
 
+bool RustEmitter::isPureRenderedValue(Value value) {
+  // Outside `inlineExprs` the value renders as its binding's name (the
+  // binding statement itself still emits, and the fold's kept render keeps
+  // the name alive), so one dropped occurrence cannot change behaviour.
+  if (!inlineExprs.count(value))
+    return true;
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return true; // block arguments render as names
+  if (isa<emitrust::ConstantOp>(def))
+    return true;
+  if (isa<emitrust::CastOp>(def))
+    return isPureRenderedValue(def->getOperand(0));
+  if (auto load = dyn_cast<emitrust::LoadOp>(def))
+    return isPureRenderedPlace(load.getOperand());
+  return false; // not provably effect-free: refuse by default
+}
+
+bool RustEmitter::isPureRenderedPlace(Value place) {
+  while (true) {
+    Operation *def = place.getDefiningOp();
+    if (!def)
+      return false; // block-argument places never render (emitPlaceExpr errs)
+    if (isa<emitrust::VariableOp>(def))
+      return true; // root: renders its name
+    if (auto member = dyn_cast<emitrust::MemberOp>(def)) {
+      place = member.getOperand();
+      continue;
+    }
+    if (auto enumRaw = dyn_cast<emitrust::EnumRawOp>(def)) {
+      place = enumRaw.getOperand();
+      continue;
+    }
+    if (auto subscript = dyn_cast<emitrust::SubscriptOp>(def)) {
+      if (!isPureRenderedValue(subscript.getIndex()))
+        return false;
+      place = subscript.getArray();
+      continue;
+    }
+    if (auto deref = dyn_cast<emitrust::DerefOp>(def))
+      return isPureRenderedValue(deref.getOperand()); // ref base ends chain
+    return false; // unknown place producer: refuse by default
+  }
+}
+
+bool RustEmitter::isSamePureReadValue(Value kept, Value dropped) {
+  if (kept == dropped)
+    return isPureRenderedValue(kept);
+  if (kept.getType() != dropped.getType())
+    return false;
+  Operation *keptDef = kept.getDefiningOp();
+  Operation *droppedDef = dropped.getDefiningOp();
+  if (!keptDef || !droppedDef)
+    return false; // distinct block arguments are distinct values
+  // Equal constants are the same value at ANY program point; the dropped
+  // one must still render inline, or its orphaned `let` would draw an
+  // unused-variable diagnostic once the fold removes its only use.
+  auto keptConst = dyn_cast<emitrust::ConstantOp>(keptDef);
+  auto droppedConst = dyn_cast<emitrust::ConstantOp>(droppedDef);
+  if (keptConst || droppedConst)
+    return keptConst && droppedConst &&
+           keptConst.getValue() == droppedConst.getValue() &&
+           inlineExprs.count(dropped);
+  // Everything below re-reads state when its text renders, so BOTH sides
+  // must render inline in the statement being emitted -- a side hoisted to
+  // an earlier `let` captured an earlier value.
+  if (!inlineExprs.count(kept) || !inlineExprs.count(dropped))
+    return false;
+  if (isa<emitrust::CastOp>(keptDef) && isa<emitrust::CastOp>(droppedDef))
+    return isSamePureReadValue(keptDef->getOperand(0),
+                               droppedDef->getOperand(0));
+  if (isa<emitrust::LoadOp>(keptDef) && isa<emitrust::LoadOp>(droppedDef))
+    return isSamePureReadPlace(keptDef->getOperand(0),
+                               droppedDef->getOperand(0));
+  return false; // unknown producer pair: refuse by default
+}
+
+bool RustEmitter::isSamePureReadPlace(Value kept, Value dropped) {
+  if (kept == dropped)
+    return isPureRenderedPlace(kept);
+  Operation *keptDef = kept.getDefiningOp();
+  Operation *droppedDef = dropped.getDefiningOp();
+  if (!keptDef || !droppedDef)
+    return false;
+  auto keptMember = dyn_cast<emitrust::MemberOp>(keptDef);
+  auto droppedMember = dyn_cast<emitrust::MemberOp>(droppedDef);
+  if (keptMember || droppedMember)
+    return keptMember && droppedMember &&
+           keptMember.getMember() == droppedMember.getMember() &&
+           isSamePureReadPlace(keptMember.getOperand(),
+                               droppedMember.getOperand());
+  auto keptRaw = dyn_cast<emitrust::EnumRawOp>(keptDef);
+  auto droppedRaw = dyn_cast<emitrust::EnumRawOp>(droppedDef);
+  if (keptRaw || droppedRaw)
+    return keptRaw && droppedRaw &&
+           isSamePureReadPlace(keptRaw.getOperand(), droppedRaw.getOperand());
+  auto keptSub = dyn_cast<emitrust::SubscriptOp>(keptDef);
+  auto droppedSub = dyn_cast<emitrust::SubscriptOp>(droppedDef);
+  if (keptSub || droppedSub)
+    return keptSub && droppedSub &&
+           isSamePureReadValue(keptSub.getIndex(), droppedSub.getIndex()) &&
+           isSamePureReadPlace(keptSub.getArray(), droppedSub.getArray());
+  auto keptDeref = dyn_cast<emitrust::DerefOp>(keptDef);
+  auto droppedDeref = dyn_cast<emitrust::DerefOp>(droppedDef);
+  if (keptDeref || droppedDeref)
+    return keptDeref && droppedDeref &&
+           isSamePureReadValue(keptDeref.getOperand(),
+                               droppedDeref.getOperand());
+  // Distinct `emitrust.variable` roots (or unknown producers) never match.
+  return false;
+}
+
 LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
   Operation *op = assignOp.getOperation();
   // A dead store emits nothing: its written value is never read.
@@ -3422,13 +3564,26 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
   //   2. the RHS op is a foldable integer binary op (`compoundAssignSymbol`);
   //   3. the RHS's first operand is the target's current value. Two shapes:
   //      - SSA binding: the operand IS the target SSA value (`i = i + 1`);
-  //      - FR-61f bare-variable PLACE: the operand is an `emitrust.load` of
-  //        the SAME `emitrust.variable` place (`s = s + i`). A projection
-  //        place (`*p`/`a[i]`) is EXCLUDED -- re-reading it under `<op>=`
-  //        could re-run a side effect and evaluate twice.
+  //      - PLACE target (FR-61f bare variable, FR-63 projection): the operand
+  //        is an `emitrust.load` of the SAME place, rendering INLINE (a load
+  //        bound to its own `let vN` -- e.g. hoisted before a method-call
+  //        barrier -- must NOT fold, or dropping the `<op>=` operand orphans
+  //        that binding: rustc unused-variable error, not a miscompile,
+  //        caught here). The importer materializes the LHS place and the RHS
+  //        load's place as SEPARATE SSA chains, so SSA identity is not
+  //        required: `isSamePureReadPlace` accepts structurally identical,
+  //        provably PURE projection chains (member/enum_raw/subscript/deref
+  //        down to a root `emitrust.variable`, every index/deref-base operand
+  //        a constant, a name, or a pure inline twin). Today such a place
+  //        renders twice (LHS place + RHS load); the fold renders it once --
+  //        legal only because re-rendering was effect-free, so dropping one
+  //        render cannot change behaviour. When purity or identity is
+  //        unprovable (a call in an index, differing indices, a hoisted
+  //        operand), the assign keeps its `p = p <op> e` form.
   // `v = v + e` and `v += e` compute the same value for such a side-effect-free
-  // target (identical overflow behaviour on the signed/infix path), so stdout
-  // is unchanged and the byte-diff oracle stays green.
+  // target (identical overflow behaviour on the signed/infix path -- unsigned
+  // `+ - *` render `.wrapping_*` and are excluded upstream), so stdout is
+  // unchanged and the byte-diff oracle stays green.
   {
     Value val = assignOp.getValue();
     Operation *binOp = val.getDefiningOp();
@@ -3438,16 +3593,12 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
       if (!sym.empty()) {
         if (!isa<emitrust::LValueType>(var.getType())) {
           selfRef = binOp->getOperand(0) == var;
-        } else if (var.getDefiningOp<emitrust::VariableOp>()) {
-          // Bare local place: operand 0 must be a load OF this place that
-          // renders INLINE (as the place read). A load bound to its own
-          // `let vN` -- e.g. hoisted before a method-call barrier -- must NOT
-          // fold, or dropping the `<op>=` operand orphans that binding
-          // (rustc unused-variable error, not a miscompile, caught here).
+        } else {
           Value op0val = binOp->getOperand(0);
           Operation *op0 = op0val.getDefiningOp();
           selfRef = op0 && isa<emitrust::LoadOp>(op0) &&
-                    op0->getOperand(0) == var && inlineExprs.count(op0val);
+                    inlineExprs.count(op0val) &&
+                    isSamePureReadPlace(var, op0->getOperand(0));
         }
       }
       if (selfRef) {
