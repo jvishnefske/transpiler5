@@ -417,9 +417,23 @@ LogicalResult CImporter::collectRecordFields(
   // is a C `struct`, a bare C++ `class`, or a `struct`/`class` that
   // simply lists none, and imports exactly like a C struct either way.
   if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(record)) {
-    if (cxxRecord->getNumBases() > 0)
-      return emitError(translateLoc(cxxRecord->bases_begin()->getBeginLoc()))
+    for (const clang::CXXBaseSpecifier &base : cxxRecord->bases()) {
+      // The one exemption: an EMPTY base of a STD-NAMESPACE record.
+      // libstdc++ 15 makes `std::pair` derive from `__pair_base`, an
+      // ABI-control tag with no data members whatsoever — skipping it
+      // drops nothing (the data-loss rationale above is about inherited
+      // FIELDS), and the synthesized Pair struct's shape is unchanged
+      // byte for byte. A base carrying any data, and every base of a
+      // USER record (whose layout the C-struct model must not
+      // misrepresent even when empty), keeps the rejection.
+      const clang::CXXRecordDecl *baseRecord =
+          base.getType()->getAsCXXRecordDecl();
+      if (cxxRecord->isInStdNamespace() && baseRecord &&
+          baseRecord->hasDefinition() && baseRecord->isEmpty())
+        continue;
+      return emitError(translateLoc(base.getBeginLoc()))
              << "unsupported: base classes are not supported";
+    }
     // W2.2: a user-declared destructor (no drop semantics modeled), a
     // virtual method (no vtable/dynamic dispatch), or an overloaded
     // operator (no operator-overload lowering) is rejected at the
@@ -433,8 +447,9 @@ LogicalResult CImporter::collectRecordFields(
     // methods (operator=, converting constructors) are NEVER imported —
     // every std member call is intercepted at the call site — so their
     // shapes cannot half-import anything. The base-class check above
-    // stays unconditional: a std record with bases would still silently
-    // drop inherited data.
+    // stays in force for any base CARRYING data: a std record with such
+    // a base would still silently drop inherited data (only the empty
+    // std-namespace tag base is skipped, per the loop above).
     if (!cxxRecord->isInStdNamespace()) {
       for (const clang::CXXMethodDecl *method : cxxRecord->methods()) {
         if (method->isImplicit() || method->isDeleted())

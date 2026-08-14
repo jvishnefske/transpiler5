@@ -60,3 +60,6 @@ result
 # Python bytecode from the test harnesses
 __pycache__/
 *.pyc
+
+# clangd index cache
+.cache/
