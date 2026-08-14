@@ -1361,8 +1361,14 @@ mlir::emitrust::buildItemGraph(llvm::ArrayRef<std::string> paths,
   // database, so only the shell knows how many units there are, and the
   // `tuIndex` of every item keys off this resolved order.
   std::vector<std::string> sources;
-  int status = buildProjectASTs(paths, extraClangArgs,
-                                compilationDatabasePath, owned, sources, error);
+  // FR-68: the attribution is unused here — a driver-level error still fails
+  // the build through the hardened status below, and clang has already
+  // printed the diagnostic itself; only the importer entry points relocate
+  // it onto the offending TU.
+  ProjectParseError firstClangError;
+  int status =
+      buildProjectASTs(paths, extraClangArgs, compilationDatabasePath, owned,
+                       sources, error, firstClangError);
   if (!error.empty())
     return failure();
   if (owned.size() != sources.size() || status != 0)

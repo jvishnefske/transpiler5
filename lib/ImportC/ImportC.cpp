@@ -5912,10 +5912,11 @@ mlir::emitrust::importC(llvm::StringRef path,
   std::vector<std::string> requested{path.str()};
   std::vector<std::string> sources;
   std::string databaseError;
+  ProjectParseError firstClangError;
   std::vector<std::unique_ptr<clang::ASTUnit>> asts;
   int status = buildProjectASTs(requested, extraClangArgs,
                                 options.compilationDatabasePath, asts, sources,
-                                databaseError);
+                                databaseError, firstClangError);
   if (!databaseError.empty()) {
     // Locate the diagnostic ON the database path so the driver's
     // `file:line:col:` prefix names it; the message then carries only
@@ -5932,8 +5933,29 @@ mlir::emitrust::importC(llvm::StringRef path,
     return nullptr;
   }
   clang::ASTUnit &ast = *asts.front();
-  if (status != 0 || ast.getDiagnostics().hasErrorOccurred())
+  // A parse error was already printed, located, by clang's own machinery;
+  // returning null silently keeps that historical stderr byte-for-byte.
+  if (ast.getDiagnostics().hasErrorOccurred())
     return nullptr;
+  if (status != 0) {
+    // FR-68: an error-severity diagnostic that BYPASSED the ASTUnit's
+    // engine — in practice a driver-level rejection such as
+    // `unknown argument: '-fbogus-flag-xyz'`, which clang prints unlocated.
+    // Importing anyway would silently honor a command line the driver
+    // rejected (possibly an ABI-relevant flag), so fail with a diagnostic
+    // located on the offending translation unit carrying clang's own text.
+    InFlightDiagnostic diag =
+        emitError(FileLineColLoc::get(
+            StringAttr::get(&context, firstClangError.file.empty()
+                                          ? path
+                                          : llvm::StringRef(
+                                                firstClangError.file)),
+            /*line=*/1, /*column=*/1))
+        << "clang error while building this translation unit";
+    if (!firstClangError.message.empty())
+      diag << ": " << firstClangError.message;
+    return nullptr;
+  }
 
   // Functional core: translate the AST into a fresh module.
   Location moduleLoc =
@@ -6038,10 +6060,11 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
   // both see the same project.
   std::vector<std::string> sources;
   std::string databaseError;
+  ProjectParseError firstClangError;
   std::vector<std::unique_ptr<clang::ASTUnit>> asts;
   int status = buildProjectASTs(paths, extraClangArgs,
                                 options.compilationDatabasePath, asts, sources,
-                                databaseError);
+                                databaseError, firstClangError);
   if (!databaseError.empty()) {
     // Locate the diagnostic ON the database path so the driver's
     // `file:line:col:` prefix names it; the message then carries only
@@ -6064,11 +6087,31 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
         << "failed to parse one or more C inputs";
     return nullptr;
   }
+  // A parse error was already printed, located, by clang's own machinery;
+  // returning null silently keeps that historical stderr byte-for-byte.
   for (const std::unique_ptr<clang::ASTUnit> &ast : asts)
     if (!ast || ast->getDiagnostics().hasErrorOccurred())
       return nullptr;
-  if (status != 0)
+  if (status != 0) {
+    // FR-68: an error-severity diagnostic that BYPASSED every ASTUnit's
+    // engine — in practice a driver-level rejection such as
+    // `unknown argument: '-fbogus-flag-xyz'` from one TU's recorded command
+    // line, which clang prints unlocated. Importing anyway would silently
+    // honor a command line the driver rejected (possibly an ABI-relevant
+    // flag), so fail with a diagnostic located on the offending translation
+    // unit carrying clang's own text.
+    InFlightDiagnostic diag =
+        emitError(FileLineColLoc::get(
+            StringAttr::get(&context, firstClangError.file.empty()
+                                          ? llvm::StringRef(sources.front())
+                                          : llvm::StringRef(
+                                                firstClangError.file)),
+            /*line=*/1, /*column=*/1))
+        << "clang error while building this translation unit";
+    if (!firstClangError.message.empty())
+      diag << ": " << firstClangError.message;
     return nullptr;
+  }
 
   // Functional core: merge every AST into one module with shared cross-TU
   // dedup and extern-resolution state. All ASTs stay alive for the whole

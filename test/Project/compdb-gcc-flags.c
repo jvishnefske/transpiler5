@@ -3,7 +3,9 @@
 // RUN: emitrust-cc --emit=import --compdb %t/ok -o - 2>%t/ok.err | FileCheck %s
 // RUN: FileCheck %s --check-prefix=OKERR --implicit-check-not=error: --implicit-check-not="unknown warning option" --input-file=%t/ok.err
 // RUN: sed -e "s|@DIR@|%t|g" %t/fbogus/compile_commands.json.in > %t/fbogus/compile_commands.json
-// RUN: emitrust-cc --emit=import --compdb %t/fbogus -o %t/fbogus.mlir 2>&1 | FileCheck %s --check-prefix=FBOGUS
+// RUN: rm -f %t/fbogus.mlir
+// RUN: not emitrust-cc --emit=import --compdb %t/fbogus -o %t/fbogus.mlir 2>&1 | FileCheck %s --check-prefix=FBOGUS
+// RUN: not ls %t/fbogus.mlir
 // RUN: sed -e "s|@DIR@|%t|g" %t/extra/compile_commands.json.in > %t/extra/compile_commands.json
 // RUN: not emitrust-cc --emit=import --compdb %t/extra --extra-arg=-Werror -o /dev/null 2>&1 | FileCheck %s --check-prefix=EXTRA
 
@@ -27,11 +29,12 @@
 //  - `pedantic.c`'s entry drops `-pedantic-errors`, admitting the `0b101`
 //    binary literal that is a hard `-Wc23-extensions` error under it.
 //  - FRONTIER (fbogus): `-f*`/`-m*` flags are ABI-relevant and are NOT
-//    filtered; an unknown one still reaches the driver and fails loudly
-//    with clang's own located rejection. (Pinned as stderr text: today the
-//    driver-level unknown-argument error is not reflected in the exit code
-//    on either the compdb or no-compdb path — a pre-existing gap at
-//    ImportC.cpp's status wiring, recorded as follow-up work, not FR-67.)
+//    filtered; an unknown one still reaches the driver and fails LOUDLY
+//    (FR-68): clang's own unknown-argument error on stderr, a located
+//    rejection naming the offending translation unit, a nonzero exit, and
+//    NO module output — the rejected command line may have carried an
+//    ABI-relevant flag, so silently importing anyway could emit
+//    wrong-layout code.
 //  - FRONTIER (extra): only RECORDED command lines are softened. The
 //    user's own `--extra-arg=-Werror` is appended after the database's
 //    flags and must still promote a real warning to a fatal error.
@@ -96,6 +99,10 @@ int extra_fn(void) { int e = 1; return 0; }
 // whole stream is the pin).
 // OKERR: warning: unused variable 'u' [-Wunused-variable]
 
+// The driver's own (unlocated) error comes first, from clang's stderr
+// machinery; the importer then rejects with a diagnostic LOCATED on the
+// translation unit whose command line carried the bad flag.
 // FBOGUS: error: unknown argument: '-fbogus-flag-xyz'
+// FBOGUS: werr.c:1:1: error: clang error while building this translation unit: unknown argument: '-fbogus-flag-xyz'
 
 // EXTRA: error: unused variable 'e' [-Werror,-Wunused-variable]
