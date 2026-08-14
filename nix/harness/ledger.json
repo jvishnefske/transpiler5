@@ -73,6 +73,16 @@
             "held_out_total": 78
           },
           "note": "assertions_on_constants: drop the vacuous assert!(true) null guard at emission (constant-false and non-constant flags keep firing; shared true constants still render for surviving consumers)"
+        },
+        {
+          "emitter_rev": "c96073188896c02f9cc8e99d28a32007daeff0e1",
+          "timestamp": "2026-08-14T17:00:38",
+          "metrics": {
+            "total_warnings": 356,
+            "train_total": 279,
+            "held_out_total": 74
+          },
+          "note": "identity_op: render the lhs alone for shifts by a constant zero (bitfield offset-0 lowering); compound <<=0 and shared zero constants keep today's rendering"
         }
       ]
     }
