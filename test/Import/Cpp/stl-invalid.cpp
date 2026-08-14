@@ -18,6 +18,13 @@
 // RUN: not emitrust-import-c %t/string-view-from-string.cpp 2>&1 | FileCheck %s --check-prefix=SVFROMSTRING
 // RUN: not emitrust-import-c %t/string-view-rebind.cpp 2>&1 | FileCheck %s --check-prefix=SVREBIND
 // RUN: not emitrust-import-c %t/string-view-substr.cpp 2>&1 | FileCheck %s --check-prefix=SVSUBSTR
+// RUN: not emitrust-import-c %t/lambda-mutable.cpp 2>&1 | FileCheck %s --check-prefix=LAMMUT
+// RUN: not emitrust-import-c %t/lambda-ref-capture.cpp 2>&1 | FileCheck %s --check-prefix=LAMREFCAP
+// RUN: not emitrust-import-c %t/lambda-default-copy.cpp 2>&1 | FileCheck %s --check-prefix=LAMDEFCOPY
+// RUN: not emitrust-import-c %t/lambda-default-ref.cpp 2>&1 | FileCheck %s --check-prefix=LAMDEFREF
+// RUN: not emitrust-import-c %t/lambda-nonscalar-capture.cpp 2>&1 | FileCheck %s --check-prefix=LAMNONSCALAR
+// RUN: not emitrust-import-c %t/lambda-escape-copy.cpp 2>&1 | FileCheck %s --check-prefix=LAMESCCOPY
+// RUN: not emitrust-import-c %t/lambda-escape-arg.cpp 2>&1 | FileCheck %s --check-prefix=LAMESCARG
 
 // W2.3 located rejections: every construct explicitly OUT of the STL
 // recognition surface this wave, authored so a later wave has a documented
@@ -250,3 +257,81 @@ int use(void) {
   return 0;
 }
 
+
+//--- lambda-mutable.cpp
+// W2.13 frontier: the lambda lift freezes each by-value capture ONCE at
+// the declaration point; a `mutable` lambda's operator() can write its
+// closure copy, state the lift has no representation for.
+// LAMMUT: lambda-mutable.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: mutable lambda
+int use(void) {
+  int a = 1;
+  auto f = [a](int x) mutable { return a += x; };
+  return f(1);
+}
+
+//--- lambda-ref-capture.cpp
+// W2.13 frontier: an explicit by-reference capture aliases the enclosing
+// local — the opposite of the freeze-at-declaration model.
+// LAMREFCAP: lambda-ref-capture.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: lambda capture by reference
+int use(void) {
+  int a = 1;
+  auto f = [&a](int x) { return a + x; };
+  return f(1);
+}
+
+//--- lambda-default-copy.cpp
+// W2.13 frontier: a default capture ([=] or [&]) captures an implicit,
+// use-derived set; only an EXPLICIT by-value capture list is recognized.
+// LAMDEFCOPY: lambda-default-copy.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: lambda default capture; only explicit by-value captures are supported
+int use(void) {
+  int a = 1;
+  auto f = [=](int x) { return a + x; };
+  return f(1);
+}
+
+//--- lambda-default-ref.cpp
+// W2.13 frontier: the by-reference default capture shares the
+// default-capture rejection above.
+// LAMDEFREF: lambda-default-ref.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: lambda default capture; only explicit by-value captures are supported
+int use(void) {
+  int a = 1;
+  auto f = [&](int x) { return a + x; };
+  return f(1);
+}
+
+//--- lambda-nonscalar-capture.cpp
+// W2.13 frontier: only SCALAR (integer/floating) captures freeze to a
+// prepended parameter; an aggregate capture would need a by-value struct
+// copy at the declaration point.
+// LAMNONSCALAR: lambda-nonscalar-capture.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: lambda capture of a non-scalar variable
+struct Pt { int x; int y; };
+int use(void) {
+  Pt p = {1, 2};
+  auto f = [p]() { return p.x + p.y; };
+  return f();
+}
+
+//--- lambda-escape-copy.cpp
+// W2.13 frontier: every use of the lambda local must be a direct
+// operator() call; copying it into another variable lets the closure
+// escape the lift's call-rewrite, so the recognizer rejects AT THE USE.
+// LAMESCCOPY: lambda-escape-copy.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: lambda 'f' escapes its declaration (every use must be a direct call)
+int use(void) {
+  int a = 1;
+  auto f = [a](int x) { return a + x; };
+  auto g = f;
+  return g(1);
+}
+
+//--- lambda-escape-arg.cpp
+// W2.13 frontier: passing a lambda to a function requires naming its
+// closure type — a template — which is rejected before any function
+// body imports (the pre-existing template rejection, unchanged by the
+// lift; pinned here so the escape-by-argument shape has a baseline).
+// LAMESCARG: lambda-escape-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported top-level declaration
+template <typename F> int apply(F f) { return f(1); }
+int use(void) {
+  int a = 1;
+  auto f = [a](int x) { return a + x; };
+  return apply(f);
+}

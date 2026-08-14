@@ -64,6 +64,21 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
         continue;
       }
       if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
+        // W2.13: `auto f = [caps](params) {...};` lifts to a module-level
+        // fn at the declaration point. Intercepted BEFORE the generic
+        // local-variable path — emitLocalVar would convert the closure
+        // record's type and die at the operator() member-shape gate. The
+        // C++17 AST shape is VarDecl cinit -> LambdaExpr DIRECTLY (no
+        // construct/cleanups wrapper), and matching only that shape keeps
+        // e.g. a lambda-to-fn-pointer conversion initializer (cast nodes
+        // in between) on its historical rejection path.
+        if (var->hasLocalStorage() && var->getInit())
+          if (const auto *lambda = llvm::dyn_cast<clang::LambdaExpr>(
+                  var->getInit()->IgnoreParens())) {
+            if (failed(emitLambdaLocal(var, lambda)))
+              return failure();
+            continue;
+          }
         if (failed(emitLocalVar(var)))
           return failure();
         continue;
@@ -692,6 +707,102 @@ CImporter::emitDecompositionDecl(const clang::DecompositionDecl *decomp) {
     symbols[binding] = bindingPlace;
   }
   return success();
+}
+
+/// W2.13: returns the first use of `var` under `stmt` that is NOT the
+/// callee-object of a direct `operator()` call, or null if every use is
+/// one. The callee-object position of a recognized call (`f(args)`: the
+/// CXXOperatorCallExpr's arg 0, a DeclRefExpr behind an implicit NoOp
+/// const cast) is skipped; its ARGUMENT subtrees are still scanned (a
+/// pathological `f(g(1))` must still flag `g`... and even `f(f(1))`'s
+/// inner call is itself a recognized callee-object). Any other
+/// DeclRefExpr to `var` — a copy initializer, a call argument, a return —
+/// is the escape the lift cannot represent.
+static const clang::DeclRefExpr *
+findNonCallLambdaUse(const clang::Stmt *stmt, const clang::VarDecl *var) {
+  if (!stmt)
+    return nullptr;
+  if (const auto *opCall = llvm::dyn_cast<clang::CXXOperatorCallExpr>(stmt);
+      opCall && opCall->getOperator() == clang::OO_Call &&
+      opCall->getNumArgs() >= 1) {
+    if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+            opCall->getArg(0)->IgnoreParenImpCasts());
+        ref && ref->getDecl()->getCanonicalDecl() == var->getCanonicalDecl()) {
+      for (unsigned index = 1; index < opCall->getNumArgs(); ++index)
+        if (const clang::DeclRefExpr *bad =
+                findNonCallLambdaUse(opCall->getArg(index), var))
+          return bad;
+      return nullptr;
+    }
+  }
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (ref->getDecl()->getCanonicalDecl() == var->getCanonicalDecl())
+      return ref;
+  for (const clang::Stmt *child : stmt->children())
+    if (const clang::DeclRefExpr *bad = findNonCallLambdaUse(child, var))
+      return bad;
+  return nullptr;
+}
+
+LogicalResult CImporter::emitLambdaLocal(const clang::VarDecl *var,
+                                         const clang::LambdaExpr *lambda) {
+  Location loc = translateLoc(var->getLocation());
+  // Recognizer gate (design.md W2.13), each failure a located rejection.
+  // A default capture ([=]/[&]) captures an implicit, use-derived set;
+  // only an EXPLICIT by-value capture list is recognized.
+  if (lambda->getCaptureDefault() != clang::LCD_None)
+    return emitError(loc) << "unsupported: lambda default capture; only "
+                             "explicit by-value captures are supported";
+  // A generic lambda's operator() is a template with no one signature to
+  // lift.
+  if (lambda->getLambdaClass()->isGenericLambda())
+    return emitError(loc) << "unsupported: generic lambda";
+  // A mutable lambda's operator() can write its closure copy — state the
+  // freeze-at-declaration model has no representation for.
+  if (lambda->isMutable())
+    return emitError(loc) << "unsupported: mutable lambda";
+  SmallVector<const clang::VarDecl *, 4> captures;
+  for (const clang::LambdaCapture &capture : lambda->captures()) {
+    if (capture.capturesThis())
+      return emitError(loc) << "unsupported: lambda capture of 'this'";
+    if (capture.getCaptureKind() != clang::LCK_ByCopy)
+      return emitError(loc) << "unsupported: lambda capture by reference";
+    const auto *capVar =
+        llvm::dyn_cast_or_null<clang::VarDecl>(capture.getCapturedVar());
+    if (!capVar || capVar->isInitCapture())
+      return emitError(loc) << "unsupported: lambda init-capture";
+    // SCALAR captures only: each freezes to one loaded value passed as a
+    // prepended argument. An aggregate would need a by-value copy of the
+    // whole object at the declaration point.
+    clang::QualType type = capVar->getType();
+    if (!type->isIntegerType() && !type->isRealFloatingType())
+      return emitError(loc)
+             << "unsupported: lambda capture of a non-scalar variable";
+    captures.push_back(capVar);
+  }
+  // Every use of the lambda local must be the callee-object of a direct
+  // operator() call: the call rewrite is the ONLY consumer that knows the
+  // lifted symbol and the frozen values, so any other use (a copy, an
+  // argument, a return) would let the closure escape it.
+  if (const clang::DeclRefExpr *bad =
+          findNonCallLambdaUse(currentFunctionBody, var))
+    return emitError(translateLoc(bad->getBeginLoc()))
+           << "unsupported: lambda '" << var->getName()
+           << "' escapes its declaration (every use must be a direct call)";
+  // Freeze the captures at the declaration point: one load per capture,
+  // in capture-list order. This IS C++'s capture-by-value semantics — the
+  // closure copies each captured value at construction — so a mutation of
+  // the source variable between here and a call is invisible to the call
+  // (the EndToEnd byte-diff pins this against the native build).
+  SmallVector<Value, 4> frozenCaptures;
+  for (const clang::Expr *init : lambda->capture_inits()) {
+    FailureOr<Value> value = emitRValue(init);
+    if (failed(value))
+      return failure();
+    frozenCaptures.push_back(*value);
+  }
+  return importLiftedLambda(var, lambda, std::move(frozenCaptures),
+                            std::move(captures), loc);
 }
 
 LogicalResult

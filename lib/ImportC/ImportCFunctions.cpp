@@ -543,6 +543,12 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   loopStack.clear();
   labelBlocks.clear();
   switchCaseBlocks.clear();
+  // W2.13: recognized lambda locals are per-function; the pending-body
+  // queue is drained at the end of THIS import, so any entry still here
+  // is a leftover of a rolled-back rejection (FR-42) whose FuncOp no
+  // longer exists — dropping it is the only safe disposition.
+  lambdaLocals.clear();
+  pendingLiftedLambdas.clear();
   inferredFnPtrSigs = std::move(inferredSigs);
   cursorWritebacks.clear();
   pairedCursorPlaces.clear();
@@ -900,7 +906,224 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
 
   if (failed(emitStmt(func->getBody())))
     return failure();
+  if (failed(finalizeFunction(funcOp, loc)))
+    return failure();
+  // W2.13: lifted lambda bodies import only now — the shared body
+  // emitter's per-function state is single-occupancy, so they had to
+  // wait for this function's own emission to finish.
+  return importPendingLiftedLambdas();
+}
+
+LogicalResult CImporter::importLiftedLambda(
+    const clang::VarDecl *var, const clang::LambdaExpr *lambda,
+    SmallVector<Value, 4> frozenCaptures,
+    SmallVector<const clang::VarDecl *, 4> captures, Location loc) {
+  const clang::CXXMethodDecl *callOperator = lambda->getCallOperator();
+  // The block-scope `<function>_<name>` mangle (the static-local
+  // convention, function spelling): a lambda local is a block-scope
+  // entity surfacing at module level, so it takes the enclosing
+  // function's (already-mangled) name as its prefix. Deliberately NOT
+  // modeled by the FR-40 item graph, like every block-scope mangle.
+  std::string name = fnRustName(
+      (llvm::Twine(currentFuncName) + "_" + var->getName()).str());
+  if (functions.lookup(name) || ordinaryNameTaken(name))
+    return emitError(loc) << "unsupported: lambda '" << var->getName()
+                          << "' lifts to '" << name
+                          << "', which collides with an existing symbol";
+  // Signature: the frozen captures PREPENDED, then the operator()'s own
+  // parameters. Types map through the plain value mapping — a parameter
+  // shape only `mapParamType`'s pointer classification could admit keeps
+  // a located rejection here.
+  SmallVector<Type> inputTypes;
+  for (const clang::VarDecl *capture : captures) {
+    FailureOr<Type> type =
+        mapType(capture->getType().getCanonicalType(), loc);
+    if (failed(type))
+      return failure();
+    inputTypes.push_back(*type);
+  }
+  for (const clang::ParmVarDecl *param : callOperator->parameters()) {
+    FailureOr<Type> type = mapType(param->getType().getCanonicalType(),
+                                   translateLoc(param->getLocation()));
+    if (failed(type))
+      return failure();
+    inputTypes.push_back(*type);
+  }
+  SmallVector<Type> resultTypes;
+  clang::QualType returnType = callOperator->getReturnType();
+  if (!returnType->isVoidType()) {
+    // Mirrors importFunction's reference-return rejection (FR-48): no
+    // lifetime can be derived at the signature.
+    if (returnType->isReferenceType())
+      return emitError(loc)
+             << "unsupported: reference return types are not yet supported";
+    FailureOr<Type> mapped = mapType(returnType, loc);
+    if (failed(mapped))
+      return failure();
+    resultTypes.push_back(*mapped);
+  }
+  FunctionType functionType = builder.getFunctionType(inputTypes, resultTypes);
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPointToEnd(module.getBody());
+  auto funcOp = builder.create<func::FuncOp>(loc, name, functionType);
+  functions[name] = funcOp;
+  lambdaLocals[var] =
+      LambdaLocalInfo{funcOp, std::move(frozenCaptures), callOperator};
+  pendingLiftedLambdas.push_back(
+      PendingLiftedLambda{funcOp, callOperator, std::move(captures)});
+  return success();
+}
+
+LogicalResult CImporter::importPendingLiftedLambdas() {
+  // A lambda declared inside a lifted body re-queues, so drain until
+  // empty rather than iterating a snapshot.
+  while (!pendingLiftedLambdas.empty()) {
+    PendingLiftedLambda pending = std::move(pendingLiftedLambdas.front());
+    pendingLiftedLambdas.erase(pendingLiftedLambdas.begin());
+    if (failed(importLiftedLambdaBody(pending)))
+      return failure();
+  }
+  return success();
+}
+
+LogicalResult
+CImporter::importLiftedLambdaBody(const PendingLiftedLambda &pending) {
+  func::FuncOp funcOp = pending.funcOp;
+  const clang::CXXMethodDecl *callOperator = pending.callOperator;
+  const clang::Stmt *body = callOperator->getBody();
+  Location loc = translateLoc(callOperator->getBeginLoc());
+  OpBuilder::InsertionGuard guard(builder);
+
+  // Function prologue: the same per-function state reset importFunction
+  // performs (mirroring emitVaClone's secondary prologue — the enclosing
+  // function's emission is already finalized when this runs, so nothing
+  // needs saving). The pointerRegions query wiring installed by the
+  // enclosing importFunction captures only `this` and program-wide plan
+  // maps, so it stays valid across the re-analysis.
+  symbols.clear();
+  addressTaken.clear();
+  fileLocals.clear();
+  pointerLocals.clear();
+  stringViewLocals.clear();
+  lambdaLocals.clear();
+  pointerPointerLocals.clear();
+  carrierLocals.clear();
+  carrierParams.clear();
+  literalBackings.clear();
+  paramCells.clear();
+  ownerStructPlaces.clear();
+  loopStack.clear();
+  labelBlocks.clear();
+  switchCaseBlocks.clear();
+  inferredFnPtrSigs.clear();
+  cursorWritebacks.clear();
+  pairedCursorPlaces.clear();
+  globalCursorPlaces.clear();
+  currentVaCloneActive = false;
+  currentVaExtras.clear();
+  currentVaCursorCell = Value();
+  currentHasLabels = containsLabelStmt(body);
+  currentFunctionBody = body;
+  placeBackedScalars.clear();
+  inductionValues.clear();
+  currentReceiverPlace = Value();
+  currentPoolPlace = Value();
+  currentMethodOwner = nullptr;
+  currentOwnerIndexReturn = false;
+  currentCxxThisRef = Value();
+  FunctionType functionType = funcOp.getFunctionType();
+  currentReturnType =
+      functionType.getNumResults() ? functionType.getResult(0) : Type();
+  currentErasedReturnBase = nullptr;
+  currentFuncName = funcOp.getSymName().str();
+  currentIsMain = false;
+  mainArgvTableValue = Value();
+  bodyRegion = &funcOp.getBody();
+  entryBlock = funcOp.addEntryBlock();
+  builder.setInsertionPointToStart(entryBlock);
+  collectAddressTaken(body);
+  collectRangeForPlaceScalars(body);
+  collectVoidFnPtrHolders(body);
+  pointerRegions.analyze(astContext(), body);
+
+  // Bind the capture VarDecls (prepended arguments) and the operator()'s
+  // ParmVarDecls (trailing arguments) into `symbols`: the operator()
+  // body's DeclRefExprs point at the ENCLOSING VarDecls, not closure
+  // fields, so these bindings are the entire capture rewrite. Slot
+  // naming mirrors importFunction's paramSlotName (empty when the value
+  // is copied into a named shadow variable, which then owns the
+  // spelling).
+  SmallVector<Attribute> paramNameSlots(functionType.getNumInputs(),
+                                        builder.getStringAttr(""));
+  auto slotName = [&](const clang::VarDecl *decl, Type argType) -> std::string {
+    if (decl->getName().empty())
+      return {};
+    bool isRef =
+        llvm::isa<emitrust::MutRefType, emitrust::RefType>(argType);
+    bool shadowed =
+        !isRef && (llvm::isa<emitrust::StructType, emitrust::EnumType,
+                             emitrust::FnPtrType>(argType) ||
+                   isUnsignedInt(argType) || addressTaken.contains(decl));
+    if (shadowed)
+      return {};
+    return mangleMemberName(decl->getName());
+  };
+  unsigned entryArgIndex = 0;
+  for (const clang::VarDecl *capture : pending.captures) {
+    Value blockArg = entryBlock->getArgument(entryArgIndex);
+    paramNameSlots[entryArgIndex] =
+        builder.getStringAttr(slotName(capture, blockArg.getType()));
+    ++entryArgIndex;
+    if (failed(bindLiftedCaptureValue(capture, blockArg, loc)))
+      return failure();
+  }
+  for (const clang::ParmVarDecl *param : callOperator->parameters()) {
+    Value blockArg = entryBlock->getArgument(entryArgIndex);
+    paramNameSlots[entryArgIndex] =
+        builder.getStringAttr(slotName(param, blockArg.getType()));
+    ++entryArgIndex;
+    if (failed(bindOrdinaryParam(param, blockArg,
+                                 translateLoc(param->getLocation()))))
+      return failure();
+  }
+  if (llvm::any_of(paramNameSlots, [](Attribute slot) {
+        return !cast<StringAttr>(slot).getValue().empty();
+      }))
+    funcOp->setAttr(emitrust::kParamNamesAttrName,
+                    builder.getArrayAttr(paramNameSlots));
+
+  if (failed(emitStmt(body)))
+    return failure();
   return finalizeFunction(funcOp, loc);
+}
+
+LogicalResult CImporter::bindLiftedCaptureValue(const clang::VarDecl *var,
+                                                Value blockArg, Location loc) {
+  Type type = blockArg.getType();
+  // Mirrors bindOrdinaryParam's by-value branches for the scalar shapes
+  // the capture gate admits (bindOrdinaryParam itself takes a
+  // ParmVarDecl, which a captured local is not). Unsigned scalars and
+  // address-taken captures copy into a named `emitrust.variable` shadow
+  // (a memref cell of either would break mem2reg — see bindOrdinaryParam);
+  // plain signed/float scalars take a promotable rank-0 cell.
+  if (isUnsignedInt(type) || addressTaken.contains(var)) {
+    Value place = builder
+                      .create<emitrust::VariableOp>(
+                          loc, emitrust::LValueType::get(type),
+                          /*init=*/Attribute(), /*isConst=*/false,
+                          var->getName().empty()
+                              ? std::string()
+                              : mangleMemberName(var->getName()))
+                      .getResult();
+    builder.create<emitrust::AssignOp>(loc, place, blockArg);
+    symbols[var] = place;
+    return success();
+  }
+  Value cell = createEntryAlloca(loc, type);
+  builder.create<memref::StoreOp>(loc, blockArg, cell);
+  symbols[var] = cell;
+  paramCells.push_back(cell);
+  return success();
 }
 
 LogicalResult CImporter::bindOrdinaryParam(const clang::ParmVarDecl *param,

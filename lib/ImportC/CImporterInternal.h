@@ -2663,6 +2663,59 @@ private:
   LogicalResult
   emitDecompositionDecl(const clang::DecompositionDecl *decomp);
 
+  /// W2.13: by-value-capture lambda local via LAMBDA LIFTING
+  /// (`auto f = [a, b](int x) {...};`, intercepted in the DeclStmt walk
+  /// BEFORE the VarDecl's type conversion so the closure record never
+  /// reaches aggregate import). Recognizer gate: explicit by-value
+  /// captures of SCALAR locals only, non-mutable, non-generic, and every
+  /// use of the lambda local in the enclosing body is a direct operator()
+  /// call; anything else is a located rejection. On acceptance, freezes
+  /// each capture (one load at the declaration point) and hands off to
+  /// `importLiftedLambda`.
+  LogicalResult emitLambdaLocal(const clang::VarDecl *var,
+                                const clang::LambdaExpr *lambda);
+
+  /// W2.13: creates the lifted module-level FuncOp for a recognized
+  /// lambda local — the captures PREPENDED as parameters ahead of the
+  /// operator()'s own — under the block-scope `<function>_<name>` mangle,
+  /// registers it in `lambdaLocals` (with the frozen capture values) for
+  /// the call rewrite, and queues the body import on
+  /// `pendingLiftedLambdas`.
+  LogicalResult importLiftedLambda(const clang::VarDecl *var,
+                                   const clang::LambdaExpr *lambda,
+                                   SmallVector<Value, 4> frozenCaptures,
+                                   SmallVector<const clang::VarDecl *, 4>
+                                       captures,
+                                   Location loc);
+
+  /// W2.13: drains `pendingLiftedLambdas` at the end of `importFunction`
+  /// (a lambda inside a lifted body re-queues, so this loops until
+  /// empty).
+  LogicalResult importPendingLiftedLambdas();
+
+  /// W2.13: imports one lifted lambda's body: resets the per-function
+  /// emission state (mirroring `emitVaClone`'s secondary prologue), binds
+  /// the capture VarDecls AND the operator()'s ParmVarDecls to the entry
+  /// block arguments — the operator() body's DeclRefExprs point at the
+  /// ENCLOSING VarDecls, not closure fields, so binding the captured
+  /// decls themselves is the whole rewrite — then reuses the shared body
+  /// emitter. `importFunction` cannot be reused verbatim: the prepended
+  /// capture parameters exist in no FunctionDecl.
+  struct PendingLiftedLambda; // defined with the queue below
+  LogicalResult importLiftedLambdaBody(const PendingLiftedLambda &pending);
+
+  /// W2.13: binds a lifted lambda's capture (a non-Parm VarDecl, so
+  /// `bindOrdinaryParam` cannot take it) to its prepended entry-block
+  /// argument, mirroring bindOrdinaryParam's scalar/place branches.
+  LogicalResult bindLiftedCaptureValue(const clang::VarDecl *var,
+                                       Value blockArg, Location loc);
+
+  /// W2.13: rewrites a direct `f(args)` operator() call on a registered
+  /// lifted-lambda local to `lifted(frozen..., args...)`.
+  FailureOr<Value>
+  emitLambdaLocalCall(const clang::CXXOperatorCallExpr *call,
+                      const clang::VarDecl *var);
+
   /// W2.10: ranged-for over a recognized container local (Vec<T> opaque
   /// or std::array-mapped !emitrust.array), lowered to a len()-bounded
   /// counted CFG loop. Restrictions (the R3 end-evaluation mitigation):
@@ -5005,6 +5058,35 @@ private:
   };
   llvm::DenseMap<const clang::VarDecl *, StringViewLocalInfo>
       stringViewLocals;
+  /// W2.13: per-function registry of recognized lifted-lambda locals
+  /// (`auto f = [a, b](int x) {...};`, see `emitLambdaLocal`): the
+  /// module-level fn the lambda lifted to, the capture values FROZEN at
+  /// the declaration point (one load per capture, in capture-list order —
+  /// C++'s capture-by-value semantics: a later mutation of the source
+  /// variable is invisible to every call), and the closure's operator()
+  /// (whose body becomes the lifted fn's body). Every use of a registered
+  /// local is a direct operator() call — the recognizer verified this —
+  /// rewritten by `emitLambdaLocalCall` to `lifted(frozen..., args...)`.
+  struct LambdaLocalInfo {
+    func::FuncOp funcOp;
+    SmallVector<Value, 4> frozenCaptures;
+    const clang::CXXMethodDecl *callOperator;
+  };
+  llvm::DenseMap<const clang::VarDecl *, LambdaLocalInfo> lambdaLocals;
+  /// W2.13: lifted lambdas whose module-level FuncOp signature exists but
+  /// whose body has not yet imported. Bodies import AFTER the enclosing
+  /// function's own emission completes (`importPendingLiftedLambdas` at
+  /// the end of `importFunction`) because the shared body emitter's
+  /// per-function state (`symbols`, `entryBlock`, ...) is
+  /// single-occupancy. Cleared defensively in `importFunction`'s
+  /// definition prologue so a rolled-back rejection (FR-42) can never
+  /// leave a stale entry pointing at an erased FuncOp.
+  struct PendingLiftedLambda {
+    func::FuncOp funcOp;
+    const clang::CXXMethodDecl *callOperator;
+    SmallVector<const clang::VarDecl *, 4> captures;
+  };
+  SmallVector<PendingLiftedLambda, 2> pendingLiftedLambdas;
   /// Per-function second-order pointer locals (CTS-P5), each mapped to the
   /// single first-order pointer local it statically selects (the
   /// degenerate one-cell region of cursor cells); a second-order pointer
