@@ -33,7 +33,7 @@ emitrust.impl "Counter" {
   // CHECK-NEXT:         Msg::Quit => {
   // CHECK-NEXT:         }
   // CHECK-NEXT:         Msg::Add { amount: v1 } => {
-  // CHECK-NEXT:             self.count = self.count + v1;
+  // CHECK-NEXT:             self.count += v1;
   // CHECK-NEXT:         }
   // CHECK-NEXT:         Msg::Move { x: v4, y: _v5 } => {
   // CHECK-NEXT:             self.count = v4;

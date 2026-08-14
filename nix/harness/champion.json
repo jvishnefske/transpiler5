@@ -2,17 +2,17 @@
   "epoch_id": 1,
   "corpus_root": "test/EndToEnd",
   "corpus_hash": "sha256:934b6ba698e9dd206e6dc062f5ad7434d570807bd660a481e5b278f629693d08",
-  "emitter_rev": "9924816c5841b5ee1121976efe48523146134d59",
+  "emitter_rev": "52b2c6a4ebcc723446b52848f34fa3a31bbc389b",
   "train": {
-    "total_warnings": 419,
+    "total_warnings": 382,
     "by_lint": {
       "clippy::needless_late_init": 257,
-      "clippy::assign_op_pattern": 44,
       "clippy::bool_comparison": 30,
       "clippy::missing_const_for_thread_local": 27,
-      "clippy::field_reassign_with_default": 22,
+      "clippy::field_reassign_with_default": 24,
       "clippy::assertions_on_constants": 14,
       "clippy::identity_op": 8,
+      "clippy::assign_op_pattern": 5,
       "clippy::approx_constant": 5,
       "clippy::needless_else": 3,
       "clippy::if_same_then_else": 3,
@@ -23,10 +23,9 @@
     }
   },
   "held_out": {
-    "total_warnings": 125,
+    "total_warnings": 104,
     "by_lint": {
       "clippy::needless_late_init": 50,
-      "clippy::assign_op_pattern": 23,
       "clippy::unnecessary_cast": 19,
       "clippy::field_reassign_with_default": 13,
       "clippy::bool_comparison": 8,
@@ -34,6 +33,7 @@
       "clippy::assertions_on_constants": 3,
       "clippy::missing_const_for_thread_local": 2,
       "clippy::type_complexity": 2,
+      "clippy::assign_op_pattern": 2,
       "clippy::precedence": 1
     }
   },

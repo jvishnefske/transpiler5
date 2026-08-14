@@ -2,9 +2,10 @@
 // clippy::assign_op_pattern) extends to a bare `emitrust.variable` PLACE, not
 // only SSA bindings -- an accumulator kept as a place by the range-`for` lift
 // (`s = s + i` -> `s += i`) still folds. The fold is gated so it stays sound:
-// the target must be a bare local variable place (a projection like `*p`/`a[i]`
-// is excluded elsewhere -- re-reading it under `<op>=` could re-run a side
-// effect), and operand 0 must be an INLINE load OF that place (a load bound to
+// the target here is a bare local variable place (projection places `*p`/
+// `a[i]`/`x.f` fold too, under the structural purity gate pinned by
+// compound-assign-projection.mlir), and operand 0 must be an INLINE load OF
+// that place (a load bound to
 // its own `let vN`, e.g. hoisted before a barrier, must not fold or the
 // dropped operand would orphan that binding). A non-self-referential assign
 // (`s = t + e`) never folds.
