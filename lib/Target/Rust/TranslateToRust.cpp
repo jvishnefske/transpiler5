@@ -372,10 +372,35 @@ private:
   /// builds), the infix `symbol` form otherwise.
   LogicalResult emitWrappingBinary(Operation *op, StringRef symbol,
                                    StringRef method);
-  /// Emits `let vN: bool = vA <pred> vB;`.
+  /// Emits `let vN: bool = vA <pred> vB;` -- except that an eq/ne
+  /// comparison against a literal bool constant renders the idiomatic
+  /// fold `boolCmpShape` classifies (clippy::bool_comparison).
   LogicalResult emitCmp(emitrust::CmpOp cmpOp);
   LogicalResult emitFnPtrCmp(emitrust::CmpOp cmpOp, Value lhs, Value rhs,
                              bool isEq);
+
+  /// FR-63 (clippy::bool_comparison): how an eq/ne comparison against a
+  /// literal bool constant renders. The classification is shared by
+  /// `emitCmp` (the rendering), `capturedPrec`, and `capturedEndsInCast`
+  /// (the captured text's rank), so the parenthesization table always sees
+  /// the shape that was actually emitted.
+  enum class BoolCmpShape {
+    None,        ///< no single literal-bool side: the ordinary infix form
+    Identity,    ///< `x == true` / `x != false`: the operand's text alone
+    NegateName,  ///< `x == false` / `x != true`, `x` rendered by name: `!x`
+    InvertInner, ///< the operand is an inlined comparison whose predicate
+                 ///< inverts exactly: its infix text, predicate inverted
+    Unfolded     ///< negative polarity with no lint-free spelling (an
+                 ///< inlined float ORDER comparison -- NaN makes `!(a < b)`
+                 ///< differ from `a >= b`, and the `!(..)` spelling trips
+                 ///< `nonminimal_bool` -- or an inlined non-comparison
+                 ///< text): keep the literal comparison
+  };
+  /// Classifies `cmpOp` and, for every shape but `None`, sets `operand` to
+  /// the non-constant side. Consulted at emission/capture time only: the
+  /// `InvertInner`/`Unfolded` split depends on `inlineExprs`, which is
+  /// final for the operand once its def has been emitted.
+  BoolCmpShape boolCmpShape(emitrust::CmpOp cmpOp, Value &operand);
   /// Emits `let vN: T = vA as T;`.
   LogicalResult emitCast(emitrust::CastOp castOp);
   /// Emits the bit-exact float/integer reinterpretation:
@@ -1907,7 +1932,26 @@ Prec RustEmitter::capturedPrec(Operation *op, StringRef text) {
       .Case<emitrust::OrOp>([](auto) { return Prec::BitOr; })
       .Case<emitrust::XorOp>([](auto) { return Prec::BitXor; })
       .Case<emitrust::ShlOp, emitrust::ShrOp>([](auto) { return Prec::Shift; })
-      .Case<emitrust::CmpOp>([](auto) { return Prec::Compare; })
+      .Case<emitrust::CmpOp>([&](emitrust::CmpOp cmp) {
+        // FR-63 (clippy::bool_comparison): the rank must match the shape
+        // `emitCmp` actually rendered, or a consumer drops needed parens.
+        Value operand;
+        switch (boolCmpShape(cmp, operand)) {
+        case BoolCmpShape::Identity: {
+          // The fold renders the operand's text alone: inherit its rank
+          // (a plain name is an atom).
+          auto it = inlineExprs.find(operand);
+          return it != inlineExprs.end() ? it->second.prec : Prec::Postfix;
+        }
+        case BoolCmpShape::NegateName:
+          return Prec::Unary; // renders `!name`
+        case BoolCmpShape::None:
+        case BoolCmpShape::InvertInner:
+        case BoolCmpShape::Unfolded:
+          break; // all render an infix comparison
+        }
+        return Prec::Compare;
+      })
       .Case<emitrust::CastOp>([&](auto) {
         // The enum-target form renders `Name(x as i32)`, a postfix call.
         return isa<emitrust::EnumType>(op->getResult(0).getType())
@@ -1985,8 +2029,27 @@ bool RustEmitter::capturedEndsInCast(Operation *op) {
           [&](Operation *b) { return rhsEndsInCast(b, Prec::BitXor); })
       .Case<emitrust::ShlOp, emitrust::ShrOp>(
           [&](Operation *b) { return rhsEndsInCast(b, Prec::Shift); })
-      .Case<emitrust::CmpOp>(
-          [&](Operation *b) { return rhsEndsInCast(b, Prec::Compare); })
+      .Case<emitrust::CmpOp>([&](emitrust::CmpOp cmp) {
+        // FR-63 (clippy::bool_comparison): the trailing-cast property must
+        // match the shape `emitCmp` actually rendered.
+        Value operand;
+        switch (boolCmpShape(cmp, operand)) {
+        case BoolCmpShape::Identity: {
+          // The operand's text alone: inherit its trailing-cast property.
+          auto it = inlineExprs.find(operand);
+          return it != inlineExprs.end() && it->second.endsInCast;
+        }
+        case BoolCmpShape::NegateName:
+          return false; // `!name` never ends in a cast
+        case BoolCmpShape::InvertInner:
+          // The rendered right operand is the INNER comparison's.
+          return rhsEndsInCast(operand.getDefiningOp(), Prec::Compare);
+        case BoolCmpShape::None:
+        case BoolCmpShape::Unfolded:
+          break;
+        }
+        return rhsEndsInCast(cmp.getOperation(), Prec::Compare);
+      })
       .Case<emitrust::LetOp>([&](emitrust::LetOp letOp) {
         auto it = inlineExprs.find(letOp.getInit());
         return it != inlineExprs.end() && it->second.endsInCast;
@@ -3689,6 +3752,95 @@ static StringRef cmpPredicateSymbol(emitrust::CmpPredicate predicate) {
   return "";
 }
 
+/// FR-63 (clippy::bool_comparison): the logically complementary predicate
+/// (`!(a PRED b)` == `a INV(PRED) b` -- exact only where
+/// `cmpPredicateInvertsExactly` says so).
+static emitrust::CmpPredicate invertCmpPredicate(
+    emitrust::CmpPredicate predicate) {
+  switch (predicate) {
+  case emitrust::CmpPredicate::eq:
+    return emitrust::CmpPredicate::ne;
+  case emitrust::CmpPredicate::ne:
+    return emitrust::CmpPredicate::eq;
+  case emitrust::CmpPredicate::lt:
+    return emitrust::CmpPredicate::ge;
+  case emitrust::CmpPredicate::le:
+    return emitrust::CmpPredicate::gt;
+  case emitrust::CmpPredicate::gt:
+    return emitrust::CmpPredicate::le;
+  case emitrust::CmpPredicate::ge:
+    return emitrust::CmpPredicate::lt;
+  }
+  llvm_unreachable("unknown comparison predicate");
+}
+
+/// Whether inverting `cmp`'s predicate renders the exact complement.
+/// eq/ne are complementary for EVERY operand type (IEEE included: a NaN
+/// makes `==` false and `!=` true), the order predicates only over totally
+/// ordered integer/index operands (`!(a < b)` is not `a >= b` when a NaN
+/// is involved).
+static bool cmpPredicateInvertsExactly(emitrust::CmpOp cmp) {
+  switch (cmp.getPredicate()) {
+  case emitrust::CmpPredicate::eq:
+  case emitrust::CmpPredicate::ne:
+    return true;
+  default:
+    break;
+  }
+  return isa<IntegerType, IndexType>(cmp.getLhs().getType());
+}
+
+/// The literal value of a bool (i1) `emitrust.constant` defining `value`,
+/// or nullopt for anything else.
+static std::optional<bool> boolConstantValue(Value value) {
+  auto constant = value.getDefiningOp<emitrust::ConstantOp>();
+  if (!constant)
+    return std::nullopt;
+  auto intAttr = dyn_cast<IntegerAttr>(constant.getValue());
+  if (!intAttr || !intAttr.getType().isInteger(1))
+    return std::nullopt;
+  return intAttr.getValue().getBoolValue();
+}
+
+RustEmitter::BoolCmpShape RustEmitter::boolCmpShape(emitrust::CmpOp cmpOp,
+                                                    Value &operand) {
+  emitrust::CmpPredicate predicate = cmpOp.getPredicate();
+  bool isEq = predicate == emitrust::CmpPredicate::eq;
+  bool isNe = predicate == emitrust::CmpPredicate::ne;
+  if (!isEq && !isNe)
+    return BoolCmpShape::None;
+  // Fn-pointer comparisons render through `emitFnPtrCmp`; keep the
+  // classifier aligned with `emitCmp`'s routing.
+  if (isa<emitrust::FnPtrType>(cmpOp.getLhs().getType()) ||
+      isa<emitrust::FnPtrType>(cmpOp.getRhs().getType()))
+    return BoolCmpShape::None;
+  std::optional<bool> lhsLit = boolConstantValue(cmpOp.getLhs());
+  std::optional<bool> rhsLit = boolConstantValue(cmpOp.getRhs());
+  // Exactly ONE side must be the literal: two literals are a constant-fold
+  // opportunity, not a spelling change (out of scope), and none is an
+  // ordinary comparison.
+  if (lhsLit.has_value() == rhsLit.has_value())
+    return BoolCmpShape::None;
+  bool literal = lhsLit ? *lhsLit : *rhsLit;
+  operand = lhsLit ? cmpOp.getRhs() : cmpOp.getLhs();
+  // (eq,true)/(ne,false) keep the operand's truth value; the other two
+  // pairings negate it.
+  if (isEq == literal)
+    return BoolCmpShape::Identity;
+  if (!inlineExprs.count(operand))
+    return BoolCmpShape::NegateName;
+  auto inner = operand.getDefiningOp<emitrust::CmpOp>();
+  if (!inner || !cmpPredicateInvertsExactly(inner))
+    return BoolCmpShape::Unfolded;
+  // An inner comparison that is ITSELF a bool-literal fold captured a
+  // non-infix text (`!x` or a bare operand); inverting its predicate would
+  // not describe that text. Conservative non-fold.
+  Value ignored;
+  if (boolCmpShape(inner, ignored) != BoolCmpShape::None)
+    return BoolCmpShape::Unfolded;
+  return BoolCmpShape::InvertInner;
+}
+
 /// Lowers an equality/inequality comparison whose operands are `Option<fn..>`
 /// function pointers. A literal `==`/`!=` would trip
 /// `unpredictable_function_pointer_comparisons`, so:
@@ -3741,6 +3893,56 @@ LogicalResult RustEmitter::emitCmp(emitrust::CmpOp cmpOp) {
       (isa<emitrust::FnPtrType>(op->getOperand(0).getType()) ||
        isa<emitrust::FnPtrType>(op->getOperand(1).getType())))
     return emitFnPtrCmp(cmpOp, op->getOperand(0), op->getOperand(1), isEq);
+  // FR-63 (clippy::bool_comparison): a comparison against a literal bool
+  // constant renders the idiomatic identity/negation instead of the
+  // literal infix form. Spelling only -- every shape computes exactly what
+  // the infix comparison did.
+  Location loc = op->getLoc();
+  Value boolOperand;
+  switch (boolCmpShape(cmpOp, boolOperand)) {
+  case BoolCmpShape::Identity:
+    if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+      return failure();
+    // The whole right-hand side: the never-parenthesized Stmt position, so
+    // the operand's text renders exactly as it did at its own statement.
+    if (failed(emitOperand(loc, boolOperand, ExprPos::stmt())))
+      return failure();
+    os << ";\n";
+    return success();
+  case BoolCmpShape::NegateName:
+    if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+      return failure();
+    os << "!";
+    // The shape's precondition is a by-name rendering (an atom, never
+    // parenthesized); the Receiver rank still guards the `!` binding
+    // should that precondition ever loosen.
+    if (failed(emitOperand(loc, boolOperand, ExprPos::receiver())))
+      return failure();
+    os << ";\n";
+    return success();
+  case BoolCmpShape::InvertInner: {
+    auto inner = cast<emitrust::CmpOp>(boolOperand.getDefiningOp());
+    StringRef symbol =
+        cmpPredicateSymbol(invertCmpPredicate(inner.getPredicate()));
+    if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+      return failure();
+    // Re-render the inner comparison's operands at the same infix
+    // positions `emitBinary` gave them, under the inverted operator: the
+    // text is byte-identical to the inner capture except for the symbol.
+    if (failed(emitOperand(loc, inner.getLhs(),
+                           ExprPos::binLhs(Prec::Compare))))
+      return failure();
+    os << " " << symbol << " ";
+    if (failed(emitOperand(loc, inner.getRhs(),
+                           ExprPos::binRhs(Prec::Compare))))
+      return failure();
+    os << ";\n";
+    return success();
+  }
+  case BoolCmpShape::None:
+  case BoolCmpShape::Unfolded:
+    break; // the ordinary infix rendering below
+  }
   StringRef symbol = cmpPredicateSymbol(predicate);
   if (symbol.empty())
     return op->emitOpError("unknown comparison predicate");
