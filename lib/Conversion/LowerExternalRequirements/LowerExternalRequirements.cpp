@@ -8,6 +8,12 @@
 /// Implements `emitrust-lower-external-requirements`: the pass that turns the
 /// external-requirement declarations the C importer marked into one
 /// `emitrust.trait_def` and makes the code that needs them generic over it.
+/// FR-52 covered marked FUNCTIONS; FR-70 adds marked GLOBALS, expressed as a
+/// getter/setter pair of associated functions (`fn g() -> T` /
+/// `fn set_g(v: T)`) whose call sites replace the whole-value
+/// `emitrust.global_load`/`global_store` ops — read/write external STORAGE
+/// modelled without an address, monomorphised to direct calls, no dyn, no
+/// unsafe.
 ///
 /// # Why this is a pass and not part of the importer
 ///
@@ -39,8 +45,10 @@
 #include "EmitRust/EmitRustAttributes.h"
 #include "EmitRust/EmitRustDialect.h"
 #include "EmitRust/EmitRustOps.h"
+#include "EmitRust/RustCasing.h"
 
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 
@@ -143,7 +151,14 @@ struct LowerExternalRequirements
     for (auto funcOp : module.getOps<emitrust::FuncOp>())
       if (funcOp->hasAttr(emitrust::kExternalRequirementAttrName))
         requirements.push_back(funcOp);
-    if (requirements.empty())
+    // FR-70: the marked GLOBALS — external storage the project reads and
+    // writes but never defines — join the same trait as a getter/setter pair
+    // of associated functions. Same collection rule, same order.
+    SmallVector<emitrust::GlobalOp> globalRequirements;
+    for (auto globalOp : module.getOps<emitrust::GlobalOp>())
+      if (globalOp->hasAttr(emitrust::kExternalRequirementAttrName))
+        globalRequirements.push_back(globalOp);
+    if (requirements.empty() && globalRequirements.empty())
       return; // The overwhelmingly common case: nothing to do, nothing said.
 
     // A type parameter shadows a same-named type inside the generic item, and
@@ -165,6 +180,28 @@ struct LowerExternalRequirements
     for (emitrust::FuncOp funcOp : requirements)
       requirementNames.insert(funcOp.getSymName());
 
+    // FR-70: the trait spelling of each global requirement, derived at this
+    // single point. The getter is the snake_case of the emitted SYMBOL — the
+    // one derivation both naming modes agree on (`G_CONFIG` under the FR-53
+    // idiomatic rename and verbatim `g_config` both yield `g_config`) — and
+    // the setter prefixes `set_`. Which accessors actually become trait
+    // items is decided by the uses recorded below: a write-less global emits
+    // only the getter, so the item list and the rewrites stay self-consistent
+    // by construction.
+    struct GlobalAccessors {
+      std::string getter;
+      std::string setter;
+      bool hasLoad = false;
+      bool hasStore = false;
+    };
+    llvm::StringMap<GlobalAccessors> globalAccessors;
+    for (auto globalOp : globalRequirements) {
+      GlobalAccessors info;
+      info.getter = emitrust::toSnakeCase(globalOp.getSymName());
+      info.setter = "set_" + info.getter;
+      globalAccessors[globalOp.getSymName()] = std::move(info);
+    }
+
     SmallVector<emitrust::FuncOp> funcs = collectFuncs(module);
 
     // Transitive closure of callers, by fixpoint over the direct-call edges.
@@ -185,6 +222,16 @@ struct LowerExternalRequirements
             if (!name.empty() &&
                 (requirementNames.contains(name) || generic.contains(name)))
               needs = true;
+          // FR-70: touching a requirement GLOBAL is an edge for the same
+          // reason a call is — the rewritten `E::<getter>()` needs an `E`
+          // in scope, and only a generic function has one.
+          if (auto load = dyn_cast<emitrust::GlobalLoadOp>(op)) {
+            if (globalAccessors.contains(load.getGlobal()))
+              needs = true;
+          } else if (auto store = dyn_cast<emitrust::GlobalStoreOp>(op)) {
+            if (globalAccessors.contains(store.getGlobal()))
+              needs = true;
+          }
         });
         if (needs) {
           generic.insert(funcOp.getSymName());
@@ -228,6 +275,68 @@ struct LowerExternalRequirements
         return signalPassFailure();
       }
     }
+    // FR-70: every use of a marked global must be a whole-value load or
+    // store — the only two shapes `E::g()` / `E::set_g(v)` can express. The
+    // importer's gate guarantees this for imported IR, so like the
+    // fn-pointer refusal above this fires only on hand-written IR — but it
+    // fires rather than erasing a global out from under a use the rewrite
+    // cannot express. The same walk records which accessors each global
+    // actually needs.
+    for (auto globalOp : globalRequirements) {
+      GlobalAccessors &info = globalAccessors[globalOp.getSymName()];
+      std::optional<SymbolTable::UseRange> uses = SymbolTable::getSymbolUses(
+          globalOp.getSymNameAttr(), module.getOperation());
+      if (!uses)
+        continue;
+      for (SymbolTable::SymbolUse use : *uses) {
+        Operation *user = use.getUser();
+        if (isa<emitrust::GlobalLoadOp>(user)) {
+          info.hasLoad = true;
+          continue;
+        }
+        if (isa<emitrust::GlobalStoreOp>(user)) {
+          info.hasStore = true;
+          continue;
+        }
+        user->emitError() << "unsupported: external-requirement global '"
+                          << globalOp.getSymName()
+                          << "' has a use that is not a whole-value load or "
+                             "store";
+        return signalPassFailure();
+      }
+    }
+    // FR-70: the derived accessor names share the trait's single item
+    // namespace with the function requirements, so a collision would emit a
+    // trait Rust rejects. Renaming is not an option for the same reason the
+    // Externals/E clash above is not worked around: the emitted API would
+    // silently depend on an unrelated C identifier. Only the accessors that
+    // will actually be emitted participate, so a write-less `x` never
+    // reserves `set_x`.
+    {
+      llvm::StringMap<StringRef> itemSource;
+      for (emitrust::FuncOp funcOp : requirements)
+        itemSource[funcOp.getSymName()] = funcOp.getSymName();
+      for (auto globalOp : globalRequirements) {
+        const GlobalAccessors &info = globalAccessors[globalOp.getSymName()];
+        SmallVector<StringRef, 2> items;
+        if (info.hasLoad)
+          items.push_back(info.getter);
+        if (info.hasStore)
+          items.push_back(info.setter);
+        for (StringRef item : items) {
+          auto [it, inserted] =
+              itemSource.insert({item, globalOp.getSymName()});
+          if (!inserted) {
+            globalOp.emitError()
+                << "unsupported: external requirement '"
+                << globalOp.getSymName() << "' derives trait item '" << item
+                << "', which collides with the item derived from '"
+                << it->second << "'";
+            return signalPassFailure();
+          }
+        }
+      }
+    }
 
     // Requalify every call. A call to a requirement resolves through the type
     // parameter; a call to a generic function passes it on. Nothing outside
@@ -253,6 +362,47 @@ struct LowerExternalRequirements
                                  .str()));
       });
 
+    // FR-70: rewrite every access of a marked global to its accessor. A load
+    // becomes a result-bearing opaque call — an EXPRESSION that sits exactly
+    // where the load's value flowed — and a store becomes a call STATEMENT
+    // consuming the stored value. Done BEFORE the marked globals are erased:
+    // both ops verify their symbol reference, so the other order would leave
+    // dangling uses.
+    SmallVector<emitrust::GlobalLoadOp> loads;
+    SmallVector<emitrust::GlobalStoreOp> stores;
+    module.walk([&](Operation *op) {
+      if (auto load = dyn_cast<emitrust::GlobalLoadOp>(op)) {
+        if (globalAccessors.contains(load.getGlobal()))
+          loads.push_back(load);
+      } else if (auto store = dyn_cast<emitrust::GlobalStoreOp>(op)) {
+        if (globalAccessors.contains(store.getGlobal()))
+          stores.push_back(store);
+      }
+    });
+    for (emitrust::GlobalLoadOp load : loads) {
+      OpBuilder builder(load);
+      auto call = builder.create<emitrust::CallOpaqueOp>(
+          load.getLoc(), TypeRange{load.getResult().getType()},
+          builder.getStringAttr((emitrust::kExternalsTypeParam +
+                                 Twine("::") +
+                                 globalAccessors[load.getGlobal()].getter)
+                                    .str()),
+          /*args=*/ArrayAttr(), ValueRange());
+      load.getResult().replaceAllUsesWith(call.getResult(0));
+      load.erase();
+    }
+    for (emitrust::GlobalStoreOp store : stores) {
+      OpBuilder builder(store);
+      builder.create<emitrust::CallOpaqueOp>(
+          store.getLoc(), TypeRange(),
+          builder.getStringAttr((emitrust::kExternalsTypeParam +
+                                 Twine("::") +
+                                 globalAccessors[store.getGlobal()].setter)
+                                    .str()),
+          /*args=*/ArrayAttr(), ValueRange{store.getValue()});
+      store.erase();
+    }
+
     // Mark the closure. Done after the requalification so the walk above sees
     // the module in one consistent state.
     StringAttr traitName =
@@ -270,14 +420,42 @@ struct LowerExternalRequirements
       names.push_back(StringAttr::get(&getContext(), funcOp.getSymName()));
       types.push_back(TypeAttr::get(funcOp.getFunctionType()));
     }
-    OpBuilder builder(&getContext());
-    builder.setInsertionPointToStart(module.getBody());
-    builder.create<emitrust::TraitDefOp>(
-        requirements.front().getLoc(), traitName,
-        builder.getArrayAttr(names), builder.getArrayAttr(types));
+    // FR-70: the globals contribute their USED accessors after the function
+    // requirements, getter before setter, in module order. The item types
+    // are ordinary associated-function types — `() -> T` and `(T) -> ()` —
+    // so the emitter needs nothing global-specific to render them.
+    for (auto globalOp : globalRequirements) {
+      const GlobalAccessors &info = globalAccessors[globalOp.getSymName()];
+      Type valueType = globalOp.getType();
+      if (info.hasLoad) {
+        names.push_back(StringAttr::get(&getContext(), info.getter));
+        types.push_back(
+            TypeAttr::get(FunctionType::get(&getContext(), {}, {valueType})));
+      }
+      if (info.hasStore) {
+        names.push_back(StringAttr::get(&getContext(), info.setter));
+        types.push_back(
+            TypeAttr::get(FunctionType::get(&getContext(), {valueType}, {})));
+      }
+    }
+    // `names` can only be empty on hand-written IR (a marked global no code
+    // touches — the importer's referenced-only policy never produces one);
+    // an itemless trait would say nothing, so none is emitted.
+    if (!names.empty()) {
+      OpBuilder builder(&getContext());
+      builder.setInsertionPointToStart(module.getBody());
+      builder.create<emitrust::TraitDefOp>(
+          requirements.empty() ? globalRequirements.front().getLoc()
+                               : requirements.front().getLoc(),
+          traitName, builder.getArrayAttr(names), builder.getArrayAttr(types));
+    }
 
     for (emitrust::FuncOp funcOp : requirements)
       funcOp.erase();
+    // After the load/store rewrite above, nothing references the marked
+    // globals any more; the requirement now lives in the trait.
+    for (auto globalOp : globalRequirements)
+      globalOp.erase();
   }
 };
 

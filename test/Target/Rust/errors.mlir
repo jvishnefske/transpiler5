@@ -44,3 +44,15 @@ emitrust.func @unfoldable_while(%arg0: i32, %arg1: i32) -> i32 {
   }
   emitrust.return %m : i32
 }
+
+// -----
+
+// FR-70 marker contract: a module reaching emission with an
+// external-requirement GLOBAL still marked skipped
+// emitrust-lower-external-requirements. Unlike a marked FUNCTION (body-less,
+// so translation dies naturally), a declaration-only global is perfectly
+// renderable -- as a DEFAULTED thread_local static, i.e. fabricated storage
+// the C program never had. Silence here would be a miscompile, so the
+// emitter refuses instead.
+// CHECK: unlowered external-requirement global 'g_config': emitrust-lower-external-requirements must run before Rust emission
+emitrust.global @g_config {emitrust.external_requirement} : i32

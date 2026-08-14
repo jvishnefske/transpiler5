@@ -75,13 +75,18 @@ inline constexpr llvm::StringLiteral kPrivateFieldsAttrName =
 /// FR-52: name of the discardable `func.func`/`emitrust.func` unit attribute
 /// the C importer attaches to a body-less external function that no
 /// translation unit defines and that the project therefore REQUIRES from its
-/// environment rather than provides.
+/// environment rather than provides. FR-70 attaches the same marker to a
+/// declaration-only `emitrust.global` whose undefined external STORAGE
+/// qualifies as a requirement (scalar, address never taken, every use a
+/// whole-value load or store).
 ///
 /// The attribute only marks the fact; `emitrust-lower-external-requirements`
-/// turns the marked declarations into one `emitrust.trait_def` and erases
-/// them. A module reaching the Rust emitter with this attribute still set is
-/// a bug (the emitter cannot render a body-less function), which is exactly
-/// the pre-FR-52 behavior for an unresolved external.
+/// turns the marked declarations into one `emitrust.trait_def` (a global
+/// contributing a getter/setter pair) and erases them. A module reaching the
+/// Rust emitter with this attribute still set is a bug: a marked function
+/// dies naturally (the emitter cannot render a body-less function), and a
+/// marked GLOBAL — which would otherwise silently render as defaulted
+/// storage — is refused explicitly by the emitter.
 inline constexpr llvm::StringLiteral kExternalRequirementAttrName =
     "emitrust.external_requirement";
 

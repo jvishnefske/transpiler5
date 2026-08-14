@@ -60,14 +60,15 @@ static llvm::cl::list<std::string>
 static llvm::cl::opt<bool> externalsTrait(
     "externals-trait",
     llvm::cl::desc(
-        "FR-52: record a referenced-but-undefined external FUNCTION as a "
-        "requirement -- a body-less func.func marked "
-        "emitrust.external_requirement -- instead of failing the import. Only "
+        "FR-52/FR-70: record a referenced-but-undefined external FUNCTION "
+        "(a body-less func.func) or scalar whole-value-accessed GLOBAL (a "
+        "declaration-only emitrust.global) as a requirement marked "
+        "emitrust.external_requirement, instead of failing the import. Only "
         "meaningful with two or more inputs (the cross-TU resolution that "
-        "raises the rejection runs only for a project). Undefined external "
-        "GLOBALS, C++ member functions and address-taken functions keep the "
-        "rejection either way. Off by default, in which case the import is "
-        "byte-identical to one run without this flag"),
+        "raises the rejection runs only for a project). Address-taken or "
+        "aggregate globals, C++ member functions and address-taken functions "
+        "keep the rejection either way. Off by default, in which case the "
+        "import is byte-identical to one run without this flag"),
     llvm::cl::init(false));
 
 /// Collects the `-I`, `-isystem`, and `--extra-arg` options into one clang
