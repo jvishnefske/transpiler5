@@ -1867,6 +1867,29 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             ".expect(\"stdout write failed\");\n"
             "}"));
   }
+  // FR-92: the on-demand `__emitrust_chunk_<R>x<C>` reshaping helpers,
+  // one per (rows, cols) shape a 2D-array-pointer cast argument used
+  // (`Cipher((state_t*)buf, ...)`): `as_chunks_mut::<C>()` views the
+  // `&mut [u8]` byte run as C-byte rows and `try_into` fixes the row
+  // count, panicking at runtime on an under-length view (the argv_arg
+  // out-of-range precedent — panic where the C access was UB; a
+  // STATICALLY undersized source already rejected at import). Each shape
+  // is emitted once per module, after all imported items.
+  for (std::pair<int64_t, int64_t> dims : neededChunkHelpers) {
+    if (!emittedChunkHelpers.insert(dims).second)
+      continue;
+    std::string rows = std::to_string(dims.first);
+    std::string cols = std::to_string(dims.second);
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_chunk_" + rows + "x" + cols +
+            "(b: &mut [u8]) -> &mut [[u8; " + cols + "]; " + rows + "] {\n"
+            "    let (rows, _) = b.as_chunks_mut::<" + cols + ">();\n"
+            "    (&mut rows[.." + rows + "]).try_into().unwrap()\n"
+            "}"));
+  }
   if ((needsIntFormatSignedHelper || needsIntFormatUnsignedHelper) &&
       !intFormatCoreHelperEmitted) {
     intFormatCoreHelperEmitted = true;

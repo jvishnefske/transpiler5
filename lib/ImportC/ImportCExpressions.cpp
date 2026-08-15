@@ -4665,6 +4665,94 @@ FailureOr<Value> CImporter::emitBorrowArgument(
       }
     }
   }
+  // FR-92: pointer-to-array parameters (`state_t *` =
+  // `uint8_t (*)[4][4]`, tiny-AES-c's Cipher family) map to whole-array
+  // references (`&mut [[u8; 4]; 4]`), and two argument shapes are
+  // admitted over that mapping:
+  //   (1) FORWARDING — `Cipher(state, rk)` passes the caller's own
+  //       pointer-to-array parameter through unchanged (aes.c:413/439:
+  //       Cipher/InvCipher never index, they only forward). The block
+  //       argument IS the borrow and Rust's implicit reborrow makes the
+  //       bare value a legal call operand; `root` is the parameter so
+  //       `emitCall`'s same-base aliasing guard covers `f(state, state)`.
+  //   (2) THE 2D CAST — `Cipher((state_t*)buf, rk)` reinterprets a byte
+  //       run as the 4x4 state at the SAME u8 element (layout identity,
+  //       never a transmute): the cast's source reslices to `&mut [u8]`
+  //       through the EXISTING slice-argument machinery (a recursive
+  //       borrow at a synthetic `&mut [u8]` parameter type covers the
+  //       three aes.c flavors — a plain `uint8_t*` parameter at its
+  //       cursor, a WALKING cursor at its current offset, a local byte
+  //       array at cursor 0), and the on-demand module-level
+  //       `__emitrust_chunk_<R>x<C>` helper reshapes the byte view into
+  //       `&mut [[u8; C]; R]`. A view too short for R*C panics at
+  //       runtime (the argv_arg out-of-range precedent: panic where the
+  //       C access was UB, the accepted refinement direction), but a
+  //       STATICALLY undersized source — a constant-extent array base
+  //       behind a constant cursor — rejects at import, because the
+  //       importer can prove the panic on every execution. Only the
+  //       mutable, u8-leaf, 2D destination is admitted; every declined
+  //       shape falls through to the historical located rejections (an
+  //       element-type-changing cast stays "unsupported pointer
+  //       expression: CStyleCastExpr"; a `state_t*` LOCAL binding is not
+  //       an argument and stays "pointer assigned a non-address value" —
+  //       a whole-array reference has no (base, cursor) pointer
+  //       decomposition, which is why the admission lives HERE and not in
+  //       `emitPointerRValue`).
+  if (auto destArray = llvm::dyn_cast<emitrust::ArrayType>(pointee)) {
+    if (const clang::ParmVarDecl *forwarded = asPointerParamRef(stripped)) {
+      auto it = symbols.find(forwarded);
+      if (it != symbols.end() && it->second.getType() == paramType) {
+        root = forwarded;
+        return it->second;
+      }
+    }
+    auto rowType =
+        llvm::dyn_cast<emitrust::ArrayType>(destArray.getElementType());
+    IntegerType leafType =
+        rowType ? llvm::dyn_cast<IntegerType>(rowType.getElementType())
+                : IntegerType();
+    if (const auto *cast = llvm::dyn_cast<clang::CStyleCastExpr>(stripped);
+        cast && isMutParam && rowType && leafType &&
+        leafType.getWidth() == 8 && leafType.isUnsigned()) {
+      Type byteSliceType =
+          emitrust::MutRefType::get(emitrust::SliceType::get(leafType));
+      FailureOr<Value> byteView = emitBorrowArgument(
+          loc, cast->getSubExpr(), byteSliceType, root, rootPath);
+      if (failed(byteView))
+        return failure();
+      int64_t rows = static_cast<int64_t>(destArray.getSize());
+      int64_t cols = static_cast<int64_t>(rowType.getSize());
+      // The import-time extent arm: a constant-extent array base behind
+      // a constant start cursor either covers R*C bytes or provably
+      // panics on every run — refuse the latter here, with a located
+      // diagnostic, instead of emitting the guaranteed panic.
+      if (auto sliceOf = (*byteView).getDefiningOp<emitrust::SliceOfOp>()) {
+        auto baseLValue = llvm::dyn_cast<emitrust::LValueType>(
+            sliceOf.getBase().getType());
+        auto baseArray =
+            baseLValue ? llvm::dyn_cast<emitrust::ArrayType>(
+                             baseLValue.getValueType())
+                       : emitrust::ArrayType();
+        llvm::APInt start;
+        if (baseArray &&
+            matchPattern(sliceOf.getIndex(), m_ConstantInt(&start)) &&
+            static_cast<int64_t>(baseArray.getSize()) -
+                    start.getSExtValue() <
+                rows * cols)
+          return emitError(loc) << "unsupported: cast source region is "
+                                   "smaller than the destination array";
+      }
+      neededChunkHelpers.insert({rows, cols});
+      std::string helperName = ("__emitrust_chunk_" + llvm::Twine(rows) +
+                                "x" + llvm::Twine(cols))
+                                   .str();
+      return builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{paramType}, builder.getStringAttr(helperName),
+              /*args=*/ArrayAttr(), ValueRange{*byteView})
+          .getResult(0);
+    }
+  }
   if (!isAddressOf || involvesDecomposedPointer(argument)) {
     FailureOr<PtrExprValue> pointer = emitPointerRValue(argument);
     if (failed(pointer))
