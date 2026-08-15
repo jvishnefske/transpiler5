@@ -193,6 +193,11 @@ struct LowerExternalRequirements
       std::string setter;
       bool hasLoad = false;
       bool hasStore = false;
+      // FR-80: some use is an `emitrust.global_addr` — the getter then
+      // returns the REFERENCE (`() -> !emitrust.ref<T>`, rendered
+      // `fn g() -> &'static T`) instead of the value, and loads read
+      // through it, so ONE item serves value reads and addresses alike.
+      bool hasAddr = false;
     };
     llvm::StringMap<GlobalAccessors> globalAccessors;
     for (auto globalOp : globalRequirements) {
@@ -230,6 +235,11 @@ struct LowerExternalRequirements
               needs = true;
           } else if (auto store = dyn_cast<emitrust::GlobalStoreOp>(op)) {
             if (globalAccessors.contains(store.getGlobal()))
+              needs = true;
+          } else if (auto addr = dyn_cast<emitrust::GlobalAddrOp>(op)) {
+            // FR-80: taking a requirement's address is an edge exactly
+            // like loading it — the rewritten `E::<getter>()` needs an E.
+            if (globalAccessors.contains(addr.getGlobal()))
               needs = true;
           }
         });
@@ -296,6 +306,15 @@ struct LowerExternalRequirements
         }
         if (isa<emitrust::GlobalStoreOp>(user)) {
           info.hasStore = true;
+          continue;
+        }
+        // FR-80: an address use makes the getter address-carrying. The
+        // dialect verifier already restricts `global_addr` to const
+        // globals, so hasAddr and hasStore are mutually exclusive by
+        // construction (a const global refuses stores structurally).
+        if (isa<emitrust::GlobalAddrOp>(user)) {
+          info.hasLoad = true;
+          info.hasAddr = true;
           continue;
         }
         user->emitError() << "unsupported: external-requirement global '"
@@ -370,6 +389,7 @@ struct LowerExternalRequirements
     // dangling uses.
     SmallVector<emitrust::GlobalLoadOp> loads;
     SmallVector<emitrust::GlobalStoreOp> stores;
+    SmallVector<emitrust::GlobalAddrOp> addrs;
     module.walk([&](Operation *op) {
       if (auto load = dyn_cast<emitrust::GlobalLoadOp>(op)) {
         if (globalAccessors.contains(load.getGlobal()))
@@ -377,10 +397,34 @@ struct LowerExternalRequirements
       } else if (auto store = dyn_cast<emitrust::GlobalStoreOp>(op)) {
         if (globalAccessors.contains(store.getGlobal()))
           stores.push_back(store);
+      } else if (auto addr = dyn_cast<emitrust::GlobalAddrOp>(op)) {
+        if (globalAccessors.contains(addr.getGlobal()))
+          addrs.push_back(addr);
       }
     });
     for (emitrust::GlobalLoadOp load : loads) {
       OpBuilder builder(load);
+      const GlobalAccessors &info = globalAccessors[load.getGlobal()];
+      // FR-80: when the getter is address-carrying, a whole-value load
+      // reads THROUGH the returned reference — call, then deref-and-load —
+      // so mixed value/address usage resolves to the one &'static item.
+      if (info.hasAddr) {
+        Type valueType = load.getResult().getType();
+        auto call = builder.create<emitrust::CallOpaqueOp>(
+            load.getLoc(), TypeRange{emitrust::RefType::get(valueType)},
+            builder.getStringAttr(
+                (emitrust::kExternalsTypeParam + Twine("::") + info.getter)
+                    .str()),
+            /*args=*/ArrayAttr(), ValueRange());
+        auto place = builder.create<emitrust::DerefOp>(
+            load.getLoc(), emitrust::LValueType::get(valueType),
+            call.getResult(0));
+        auto read = builder.create<emitrust::LoadOp>(load.getLoc(),
+                                                     valueType, place);
+        load.getResult().replaceAllUsesWith(read.getResult());
+        load.erase();
+        continue;
+      }
       auto call = builder.create<emitrust::CallOpaqueOp>(
           load.getLoc(), TypeRange{load.getResult().getType()},
           builder.getStringAttr((emitrust::kExternalsTypeParam +
@@ -390,6 +434,21 @@ struct LowerExternalRequirements
           /*args=*/ArrayAttr(), ValueRange());
       load.getResult().replaceAllUsesWith(call.getResult(0));
       load.erase();
+    }
+    // FR-80: every address becomes the same result-bearing getter call —
+    // the reference VALUE `E::<getter>()` returns, which is the consumer's
+    // one static item, so identity is preserved across every rewrite site.
+    for (emitrust::GlobalAddrOp addr : addrs) {
+      OpBuilder builder(addr);
+      auto call = builder.create<emitrust::CallOpaqueOp>(
+          addr.getLoc(), TypeRange{addr.getResult().getType()},
+          builder.getStringAttr((emitrust::kExternalsTypeParam +
+                                 Twine("::") +
+                                 globalAccessors[addr.getGlobal()].getter)
+                                    .str()),
+          /*args=*/ArrayAttr(), ValueRange());
+      addr.getResult().replaceAllUsesWith(call.getResult(0));
+      addr.erase();
     }
     for (emitrust::GlobalStoreOp store : stores) {
       OpBuilder builder(store);
@@ -429,8 +488,13 @@ struct LowerExternalRequirements
       Type valueType = globalOp.getType();
       if (info.hasLoad) {
         names.push_back(StringAttr::get(&getContext(), info.getter));
-        types.push_back(
-            TypeAttr::get(FunctionType::get(&getContext(), {}, {valueType})));
+        // FR-80: the address-carrying getter's item type returns the
+        // reference; the emitter renders it `fn <getter>() -> &'static T`.
+        Type resultType = info.hasAddr
+                              ? Type(emitrust::RefType::get(valueType))
+                              : valueType;
+        types.push_back(TypeAttr::get(
+            FunctionType::get(&getContext(), {}, {resultType})));
       }
       if (info.hasStore) {
         names.push_back(StringAttr::get(&getContext(), info.setter));

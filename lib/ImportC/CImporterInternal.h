@@ -1818,9 +1818,13 @@ private:
   /// proved a `void *` Slice parameter is walked as (see
   /// `voidByteSliceElem`); a `void *` has no pointee of its own to derive
   /// the element from, so it rides in beside `kind`.
+  /// FR-80: `sharedConstRecord`, when set by the signature builder (via
+  /// `requirementSharedConstStructParam`), maps a const-struct-pointee
+  /// ScalarRef parameter as a SHARED `!emitrust.ref<T>` borrow.
   FailureOr<Type> mapParamType(clang::QualType type, Location loc,
                                ParamKind kind,
-                               clang::QualType voidByteElem = clang::QualType());
+                               clang::QualType voidByteElem = clang::QualType(),
+                               bool sharedConstRecord = false);
 
   /// FR-71: the byte element (`char` or `unsigned char`) the admission
   /// scan recorded for the `index`th parameter of `func` — non-null
@@ -3327,6 +3331,51 @@ private:
   /// or member/subscript chains over one) is rooted at an imported global;
   /// used to reject taking the address of a global.
   bool rootsAtGlobal(const clang::Expr *expr) const;
+
+  /// FR-80: peels member selections off `expr` (both the dot spelling
+  /// `g.m.n` and lwIP's arrow-through-address spelling `(&g)->m`) down to
+  /// a variable root, appending the traversed fields root-to-leaf onto
+  /// `path`. Returns the root variable, or null when the expression is not
+  /// a pure member path over one (subscripts, calls, casts other than
+  /// paren/implicit all disqualify).
+  const clang::VarDecl *
+  addressPathRoot(const clang::Expr *expr,
+                  SmallVectorImpl<const clang::FieldDecl *> &path) const;
+
+  /// FR-80: whether `&var` (projected through `path`) qualifies as an
+  /// ADDRESS-CARRYING const-struct requirement: trait policy on (C only),
+  /// `var` an externally visible extern CONST STRUCT with no definition
+  /// seen so far (this TU or an earlier one), its struct_def visible, and
+  /// every path field a plain named field of a plain struct. Purely a
+  /// predicate — emits nothing — so a `false` falls back to the historical
+  /// located rejection. Definitions appearing in LATER translation units
+  /// are caught by finalizeProject's backstop over surviving
+  /// `emitrust.global_addr` ops.
+  bool addressableRequirementGlobal(
+      const clang::VarDecl *var,
+      ArrayRef<const clang::FieldDecl *> path);
+
+  /// FR-80: materializes the address of the qualifying requirement global
+  /// `var` as a shared reference value: `emitrust.global_addr` for the
+  /// whole object, plus deref + member projection + a shared reborrow for
+  /// an interior-member path (the IP4_ADDR_ANY chain). The result's
+  /// pointee is the leaf's mapped type; callers check it against the
+  /// consuming position's expected type.
+  FailureOr<Value>
+  emitRequirementGlobalAddress(Location loc, const clang::VarDecl *var,
+                               ArrayRef<const clang::FieldDecl *> path);
+
+  /// FR-80: whether the `index`th parameter of body-less `func` borrows
+  /// SHARED as a const-struct-pointee requirement parameter (`&T` instead
+  /// of the historical `&mut T`) — the borrow shape a consumer-supplied
+  /// `&'static T` requirement address can actually flow into. Mirrors
+  /// FR-75's eager-slice rule: C-only, trait-gated
+  /// (`classifyTimeTraitEligible`), body-less non-variadic functions only,
+  /// so bin crates, the ledgers, and defer mode keep their historical
+  /// shapes byte-for-byte; a definition appearing in a later TU is the
+  /// same located signature-refinement conflict FR-75 accepts.
+  bool requirementSharedConstStructParam(const clang::FunctionDecl *func,
+                                         const clang::ParmVarDecl *param);
 
   /// Stores a staged copy back where it came from, if `writeback` captured
   /// one; no-op otherwise. A staged global copy stores back into its

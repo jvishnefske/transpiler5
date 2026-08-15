@@ -415,7 +415,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       }
       FailureOr<Type> paramType =
           mapParamType(param->getType(), translateLoc(param->getLocation()),
-                       paramKinds[index], voidByteSliceElem(func, index));
+                       paramKinds[index], voidByteSliceElem(func, index),
+                       requirementSharedConstStructParam(func, param));
       if (failed(paramType))
         return failure();
       inputTypes.push_back(*paramType);
@@ -1331,6 +1332,8 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
       return failure();
     inputTypes.push_back(*paramType);
   }
+  // (No FR-80 shared-const-struct flag here: a va-clone only exists for a
+  // DEFINED variadic body, which the rule excludes twice over.)
   unsigned namedInputCount = inputTypes.size();
   for (Type extraType : clone.extraTypes)
     inputTypes.push_back(extraType);

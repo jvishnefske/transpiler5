@@ -6,6 +6,12 @@
 // FR-79 adds the BY-VALUE STRUCT getter of a const-struct requirement --
 // `fn cfg() -> S;` -- and pins that its call site binds a Copy temporary on
 // which field projection is ordinary member access.
+// FR-80 adds the ADDRESS-CARRYING getter -- a trait-item RESULT of
+// !emitrust.ref type renders `&'static T` (a bare `&` in a zero-arg trait
+// fn signature is rustc E0106; the requirement address is the consumer's
+// static item, so 'static is the truthful lifetime). The spelling is
+// confined to trait-item results: everywhere else a ref stays a bare `&`,
+// as the call-site bindings below pin.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
 // The trait is ALWAYS `pub`, even here where nothing asked for exported
@@ -21,10 +27,11 @@
 // CHECK-NEXT:     fn g_config() -> i32;
 // CHECK-NEXT:     fn set_g_config(v0: i32);
 // CHECK-NEXT:     fn cfg() -> S;
+// CHECK-NEXT:     fn any() -> &'static S;
 // CHECK-NEXT: }
 emitrust.trait_def @Externals
-    ["host_scale", "host_reset", "host_mix", "g_config", "set_g_config", "cfg"]
-    [(i32) -> i32, () -> (), (i32, f64) -> f64, () -> i32, (i32) -> (), () -> !emitrust.struct<"S">]
+    ["host_scale", "host_reset", "host_mix", "g_config", "set_g_config", "cfg", "any"]
+    [(i32) -> i32, () -> (), (i32, f64) -> f64, () -> i32, (i32) -> (), () -> !emitrust.struct<"S">, () -> !emitrust.ref<!emitrust.struct<"S">>]
 
 // FR-70: a getter call is a result-bearing opaque call, so its value binds
 // (or folds) exactly where the global load's value flowed; a setter call is
@@ -64,6 +71,31 @@ emitrust.func @read_cfg() -> i32
   %2 = emitrust.member %1["x"] : (!emitrust.lvalue<!emitrust.struct<"S">>) -> !emitrust.lvalue<i32>
   %3 = emitrust.load %2 : (!emitrust.lvalue<i32>) -> i32
   emitrust.return %3 : i32
+}
+
+// FR-80: the address getter's call site binds an ordinary `&S` value — the
+// 'static spelling exists ONLY in the trait item — and everything after it
+// is the existing reference machinery: field reads auto-deref through the
+// binding, the interior-member address (the lwIP IP4_ADDR_ANY chain) is a
+// plain shared reborrow of the projected member, and the ref value passes
+// straight into a `&S` parameter.
+// CHECK:      fn read_any<E: Externals>() -> i32 {
+// CHECK-NEXT:     let v0: &S = E::any();
+// CHECK-NEXT:     let v1: &i32 = &v0.x;
+// CHECK-NEXT:     v0.y + *v1
+// CHECK-NEXT: }
+emitrust.func @read_any() -> i32
+    attributes {emitrust.externals_generic = "Externals"} {
+  %0 = emitrust.call_opaque "E::any"() : () -> !emitrust.ref<!emitrust.struct<"S">>
+  %1 = emitrust.deref %0 : (!emitrust.ref<!emitrust.struct<"S">>) -> !emitrust.lvalue<!emitrust.struct<"S">>
+  %2 = emitrust.member %1["x"] : (!emitrust.lvalue<!emitrust.struct<"S">>) -> !emitrust.lvalue<i32>
+  %3 = emitrust.addr_of %2 : (!emitrust.lvalue<i32>) -> !emitrust.ref<i32>
+  %4 = emitrust.member %1["y"] : (!emitrust.lvalue<!emitrust.struct<"S">>) -> !emitrust.lvalue<i32>
+  %5 = emitrust.load %4 : (!emitrust.lvalue<i32>) -> i32
+  %6 = emitrust.deref %3 : (!emitrust.ref<i32>) -> !emitrust.lvalue<i32>
+  %7 = emitrust.load %6 : (!emitrust.lvalue<i32>) -> i32
+  %8 = emitrust.add %5, %7 : i32
+  emitrust.return %8 : i32
 }
 
 // A function in the closure carries the bound; the call sites were already

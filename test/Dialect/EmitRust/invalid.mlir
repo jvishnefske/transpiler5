@@ -379,6 +379,36 @@ emitrust.func @store_to_immutable(%arg0: i32) {
 
 // -----
 
+// FR-80: global_addr must name a real global.
+emitrust.func @addr_unknown_symbol() {
+  // expected-error @+1 {{'missing' does not reference a valid emitrust.global}}
+  %0 = emitrust.global_addr @missing : !emitrust.ref<i32>
+  emitrust.return
+}
+
+// -----
+
+// FR-80: the reference pointee must be the global's value type.
+emitrust.global const @g_addr_mismatch <0 : i32> : i32
+emitrust.func @addr_type_mismatch() {
+  // expected-error @+1 {{result pointee type 'i64' does not match the value type 'i32' of the global @g_addr_mismatch}}
+  %0 = emitrust.global_addr @g_addr_mismatch : !emitrust.ref<i64>
+  emitrust.return
+}
+
+// -----
+
+// FR-80: only a const global has a stable SHARED address to lend — a
+// mutable global's storage is a thread-local Cell with no lendable `&T`.
+emitrust.global @g_addr_mut <0 : i32> : i32
+emitrust.func @addr_of_mutable() {
+  // expected-error @+1 {{cannot take the address of the mutable global @g_addr_mut}}
+  %0 = emitrust.global_addr @g_addr_mut : !emitrust.ref<i32>
+  emitrust.return
+}
+
+// -----
+
 emitrust.func @slice_variable() {
   // expected-error @+1 {{variable value type must be sized, but got the slice type '!emitrust.slice<i32>'}}
   %0 = emitrust.variable : !emitrust.lvalue<!emitrust.slice<i32>>

@@ -4140,9 +4140,31 @@ FailureOr<Value> CImporter::emitBorrowArgument(
     // A global region base would pass a borrow of the staged local copy
     // (writes through it would be lost); mirror the historical
     // address-of-a-global rejection (with the cell-slice boundary
-    // wording when Pass A pinned one).
-    if (pointer->base && !pointer->base->hasLocalStorage())
+    // wording when Pass A pinned one). FR-80 first: a DEGENERATE pointer
+    // (whole-object or single-member address, no cursor, no null, no
+    // multi-base) into a qualifying const-struct requirement resolves to
+    // the requirement's own `emitrust.global_addr` — the dhcp/udp local
+    // `ip_addr_t *p = &ip_addr_any; f(p);` flow — and only into a SHARED
+    // parameter, the borrow shape the `&'static` getter lends.
+    if (pointer->base && !pointer->base->hasLocalStorage()) {
+      if (!isMutParam && !pointer->cursor && !pointer->baseIndex &&
+          !pointer->literalBacking && !pointer->backing) {
+        SmallVector<const clang::FieldDecl *, 2> fieldPath;
+        if (pointer->member)
+          fieldPath.push_back(pointer->member);
+        if (addressableRequirementGlobal(pointer->base, fieldPath)) {
+          FailureOr<Value> addr =
+              emitRequirementGlobalAddress(loc, pointer->base, fieldPath);
+          if (failed(addr))
+            return failure();
+          if ((*addr).getType() != paramType)
+            return emitError(loc) << "unsupported: argument type does not "
+                                     "match the pointer parameter";
+          return *addr;
+        }
+      }
       return rejectGlobalPointerArgument(loc, pointer->base);
+    }
     FailureOr<Value> place = emitPointerPlace(loc, *pointer, pointee);
     if (failed(place))
       return failure();
@@ -4167,6 +4189,28 @@ FailureOr<Value> CImporter::emitBorrowArgument(
   // mutability from the same place instead; the global rejection and the
   // pointee type check are the ones the rvalue path would have applied.
   if (!isMutParam) {
+    // FR-80: `&g` (or an interior-member `&g.m` / `&((&g)->m)`) on a
+    // qualifying extern const struct is an ADDRESS-CARRYING requirement:
+    // the shared reference the parameter needs is exactly what the
+    // requirement getter's `&'static T` supplies, so the address lowers to
+    // `emitrust.global_addr` instead of rejecting. Every non-qualifying
+    // shape keeps the historical located rejection below.
+    {
+      SmallVector<const clang::FieldDecl *, 2> fieldPath;
+      const clang::VarDecl *reqGlobal =
+          addressPathRoot(addrOf->getSubExpr(), fieldPath);
+      if (reqGlobal && lookupGlobal(reqGlobal) &&
+          addressableRequirementGlobal(reqGlobal, fieldPath)) {
+        FailureOr<Value> addr =
+            emitRequirementGlobalAddress(loc, reqGlobal, fieldPath);
+        if (failed(addr))
+          return failure();
+        if ((*addr).getType() != paramType)
+          return emitError(loc) << "unsupported: argument type does not "
+                                   "match the pointer parameter";
+        return *addr;
+      }
+    }
     if (rootsAtGlobal(addrOf->getSubExpr()))
       return emitError(loc)
              << "unsupported: taking the address of a global variable";

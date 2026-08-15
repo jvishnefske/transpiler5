@@ -1112,6 +1112,125 @@ bool CImporter::rootsAtGlobal(const clang::Expr *expr) const {
   return false;
 }
 
+const clang::VarDecl *
+CImporter::addressPathRoot(const clang::Expr *expr,
+                           SmallVectorImpl<const clang::FieldDecl *> &path)
+    const {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e)) {
+    const auto *field =
+        llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+    if (!field)
+      return nullptr;
+    const clang::Expr *base = member->getBase();
+    // lwIP's IP4_ADDR_ANY spelling routes the arrow through a
+    // parenthesized address-of: `(&g)->m` designates the same member
+    // place as `g.m`, so the `&`/`->` pair cancels.
+    if (member->isArrow()) {
+      const auto *unary =
+          llvm::dyn_cast<clang::UnaryOperator>(base->IgnoreParenImpCasts());
+      if (!unary || unary->getOpcode() != clang::UO_AddrOf)
+        return nullptr;
+      base = unary->getSubExpr();
+    }
+    const clang::VarDecl *root = addressPathRoot(base, path);
+    if (!root)
+      return nullptr;
+    path.push_back(field); // Post-order: fields land root-to-leaf.
+    return root;
+  }
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  return ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+}
+
+bool CImporter::addressableRequirementGlobal(
+    const clang::VarDecl *var, ArrayRef<const clang::FieldDecl *> path) {
+  if (!var || astContext().getLangOpts().CPlusPlus ||
+      !classifyTimeTraitEligible())
+    return false;
+  if (!var->hasGlobalStorage() || !var->isExternallyVisible())
+    return false;
+  // A CONST STRUCT extern: the only type FR-80 admits — const-ness is what
+  // makes the shared `&'static` lend faithful, and the struct type is what
+  // the requirement getter's pointee names.
+  clang::QualType type = var->getType().getCanonicalType();
+  if (!type.isConstQualified() || !type->isStructureType())
+    return false;
+  // No definition seen so far: neither in this TU (an initializer on any
+  // redeclaration) nor in an earlier one (a materialized module global).
+  // A definition in a LATER TU is caught by finalizeProject's backstop
+  // over surviving `emitrust.global_addr` ops.
+  if (var->getAnyInitializer())
+    return false;
+  const GlobalInfo *info = lookupGlobal(var->getCanonicalDecl());
+  if (!info || !pendingExternGlobals.contains(info->symbol))
+    return false;
+  if (SymbolTable::lookupSymbolIn(module, info->symbol))
+    return false;
+  auto structType = llvm::dyn_cast<emitrust::StructType>(info->type);
+  if (!structType ||
+      !llvm::isa_and_nonnull<emitrust::StructDefOp>(
+          SymbolTable::lookupSymbolIn(module, structType.getName())))
+    return false;
+  // Every projected field must be a plain named field of a plain struct:
+  // the shapes with their own storage model (byte regions, union slots and
+  // arms, bit-field windows, data-pointer i64 cursors, flattened
+  // anonymous members) keep their historical rejections.
+  for (const clang::FieldDecl *field : path) {
+    const clang::RecordDecl *parent = field->getParent();
+    if (!parent || !parent->isStruct() || isByteRegionRecord(parent))
+      return false;
+    if (field->isBitField() || field->isAnonymousStructOrUnion())
+      return false;
+    if (isDataPointer(field->getType()))
+      return false;
+    if (field->getType().getCanonicalType()->isArrayType())
+      return false;
+    if (unionByteArrayArms.contains(field) || opaqueUnionArms.contains(field))
+      return false;
+  }
+  return true;
+}
+
+FailureOr<Value> CImporter::emitRequirementGlobalAddress(
+    Location loc, const clang::VarDecl *var,
+    ArrayRef<const clang::FieldDecl *> path) {
+  const GlobalInfo *info = lookupGlobal(var->getCanonicalDecl());
+  assert(info && "qualification requires an imported global");
+  Value addr = builder
+                   .create<emitrust::GlobalAddrOp>(
+                       loc, emitrust::RefType::get(info->type),
+                       globalSymbol(info->symbol))
+                   .getResult();
+  if (path.empty())
+    return addr;
+  // The interior-member address (the IP4_ADDR_ANY chain): project through
+  // the reference and reborrow the leaf shared. The projection is on the
+  // REQUIREMENT's own place — never on a staged copy, which would hand out
+  // a fresh address per use and break pointer identity.
+  Value place = builder
+                    .create<emitrust::DerefOp>(
+                        loc, emitrust::LValueType::get(info->type), addr)
+                    .getResult();
+  Type leafType = info->type;
+  for (const clang::FieldDecl *field : path) {
+    FailureOr<Type> fieldType =
+        mapType(flattenedFieldStorage(field)->getType(), loc);
+    if (failed(fieldType))
+      return failure();
+    place = builder
+                .create<emitrust::MemberOp>(
+                    loc, emitrust::LValueType::get(*fieldType), place,
+                    builder.getStringAttr(flattenedFieldName(field)))
+                .getResult();
+    leafType = *fieldType;
+  }
+  return builder
+      .create<emitrust::AddrOfOp>(loc, emitrust::RefType::get(leafType),
+                                  place, /*is_mut=*/false)
+      .getResult();
+}
+
 LogicalResult
 CImporter::flushGlobalWriteback(Location loc,
                                 const GlobalWriteback &writeback) {

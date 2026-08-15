@@ -1123,6 +1123,46 @@ def EmitRust_GlobalStoreOp : EmitRust_Op<"global_store",
 }
 
 //===----------------------------------------------------------------------===//
+// GlobalAddrOp
+//===----------------------------------------------------------------------===//
+
+def EmitRust_GlobalAddrOp : EmitRust_Op<"global_addr",
+    [DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Address of a const global as a shared reference";
+  let description = [{
+    The `emitrust.global_addr` operation yields the address of a `const`
+    `emitrust.global` as a shared reference whose pointee is the global's
+    value type. It is the FR-80 pre-lowering anchor for an ADDRESS-CARRYING
+    external requirement: the C importer emits it for `&g` on a qualifying
+    extern const struct, and `emitrust-lower-external-requirements` rewrites
+    it into the requirement's `E::<getter>()` call, whose
+    `() -> !emitrust.ref<T>` item renders `fn getter() -> &'static T` —
+    the consumer's one static item, so every rewritten address is the SAME
+    stable address and pointer identity is preserved.
+
+    Only `const` globals qualify structurally: a mutable global's storage
+    is a thread-local `Cell` with no lendable `&T`. The op has NO Rust
+    rendering of its own — an instance that survives to emission was never
+    resolved into a requirement, and the emitter refuses it loudly (the
+    FR-52 marker contract).
+
+    Example:
+
+    ```mlir
+    %r = emitrust.global_addr @cfg : !emitrust.ref<!emitrust.struct<"S">>
+    ```
+  }];
+
+  // The result is AnyType in ODS (like global_load's) so the assembly
+  // prints the full `!emitrust.ref<...>` spelling; the verifier enforces
+  // the shared-reference shape.
+  let arguments = (ins FlatSymbolRefAttr:$global);
+  let results = (outs AnyType:$result);
+
+  let assemblyFormat = "$global attr-dict `:` type($result)";
+}
+
+//===----------------------------------------------------------------------===//
 // CellGetOp
 //===----------------------------------------------------------------------===//
 

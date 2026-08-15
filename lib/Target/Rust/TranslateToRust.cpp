@@ -3169,6 +3169,25 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
              << globalOp.getSymName()
              << "': emitrust-lower-external-requirements must run before "
                 "Rust emission";
+  // FR-80, the ADDRESS side of the same contract: a surviving
+  // `emitrust.global_addr` was never rewritten to its `E::<getter>()` call
+  // — the lowering was skipped, or the target was never a requirement (a
+  // DEFINED const global's address has no supported Rust spelling). The op
+  // has no rendering of its own, so silence is impossible, but the named
+  // refusal beats a generic translation failure.
+  {
+    emitrust::GlobalAddrOp leakedAddr;
+    moduleOp.walk([&](emitrust::GlobalAddrOp addrOp) {
+      leakedAddr = addrOp;
+      return WalkResult::interrupt();
+    });
+    if (leakedAddr)
+      return leakedAddr.emitError()
+             << "unlowered external-requirement address of '"
+             << leakedAddr.getGlobal()
+             << "': emitrust-lower-external-requirements must run before "
+                "Rust emission";
+  }
   // FR-78 marker contract: an `emitrust.opaque_union`-marked struct_def is
   // a differing-aggregate-arm C union imported as an opaque byte blob. The
   // importer rejects every access through any arm at its own site; if one
@@ -4951,8 +4970,21 @@ LogicalResult RustEmitter::emitTraitDef(emitrust::TraitDefOp traitDefOp) {
     os << ")";
     if (fnType.getNumResults() == 1) {
       os << " -> ";
-      if (failed(emitType(loc, fnType.getResult(0))))
+      // FR-80: a REFERENCE result on a trait item spells its lifetime out
+      // as `&'static`. A bare `&` return on a zero-argument signature is
+      // rustc E0106 (nothing to elide from), and 'static is the truthful
+      // lifetime: the only producer of a ref-result item is the
+      // address-carrying requirement getter, whose implementor lends its
+      // own static item. Confined to trait-item results on purpose —
+      // everywhere else a ref renders bare `&` through `emitType`.
+      if (auto refResult =
+              dyn_cast<emitrust::RefType>(fnType.getResult(0))) {
+        os << "&'static ";
+        if (failed(emitType(loc, refResult.getPointee())))
+          return failure();
+      } else if (failed(emitType(loc, fnType.getResult(0)))) {
         return failure();
+      }
     }
     os << ";\n";
   }
