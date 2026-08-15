@@ -393,9 +393,10 @@ LogicalResult AssignOp::verify() {
 static bool isValidStructFieldType(Type type) {
   // OpaqueType is permitted for the render-verbatim field types the trusted
   // importer synthesizes (e.g. the node-pool nullable index `Option<usize>`,
-  // W4.2e Part B) -- the producer guarantees these are `Copy + Default`, the
-  // struct_def MVP invariant. A non-Copy opaque (e.g. `Vec<T>`) is never
-  // emitted as a field.
+  // W4.2e Part B, and the FR-94 owned FAM tail `Vec<u8>`) -- the producer
+  // guarantees these are `Default`. A non-Copy opaque (`Vec<T>`/`String`)
+  // is admitted since FR-94: the translator detects it and drops `Copy`
+  // from the struct's derive.
   return isa<IntegerType, IndexType, FloatType, ArrayType, StructType,
              EnumType, FnPtrType, mlir::emitrust::OpaqueType>(type);
 }
@@ -1288,10 +1289,18 @@ LogicalResult AddrOfOp::verify() {
 /// reference (mirroring AddrOfOp).
 LogicalResult SliceOfOp::verify() {
   Type baseValueType = cast<LValueType>(getBase().getType()).getValueType();
-  Type elementType = indexableElementType(baseValueType);
-  if (!elementType)
-    return emitOpError("base must be an lvalue of !emitrust.array or "
-                       "!emitrust.slice type, but got ")
+  // FR-94: an `!emitrust.opaque` base (the owned `Vec<u8>` FAM tail; the
+  // W2.3 `Vec<T>` recognition surface generally) is accepted with the
+  // SubscriptOp trust model — an opaque does not structurally decompose
+  // into an element type, so the result slice's element is trusted rather
+  // than cross-checked. The mut-marker/result-shape checks below still
+  // apply.
+  Type elementType = isa<OpaqueType>(baseValueType)
+                         ? Type()
+                         : indexableElementType(baseValueType);
+  if (!elementType && !isa<OpaqueType>(baseValueType))
+    return emitOpError("base must be an lvalue of !emitrust.array, "
+                       "!emitrust.slice, or !emitrust.opaque type, but got ")
            << getBase().getType();
 
   Type pointee;
@@ -1310,7 +1319,7 @@ LogicalResult SliceOfOp::verify() {
   if (!resultSlice)
     return emitOpError("result pointee must be an !emitrust.slice, but got ")
            << pointee;
-  if (resultSlice.getElementType() != elementType)
+  if (elementType && resultSlice.getElementType() != elementType)
     return emitOpError("result slice element type ")
            << resultSlice.getElementType()
            << " does not match the base element type " << elementType;

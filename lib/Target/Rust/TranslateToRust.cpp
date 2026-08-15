@@ -5048,7 +5048,19 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   bool derivable = llvm::all_of(structDefOp.getFieldTypes(), [](Attribute a) {
     return derivedDefaultCovers(cast<TypeAttr>(a).getValue());
   });
-  os << "#[derive(Clone, Copy" << (derivable ? ", Default" : "") << ")]\n";
+  // FR-94: `Copy` drops from the derive when a field is a non-Copy opaque —
+  // the owned `Vec<u8>` FAM tail (or a `String`). Every other opaque the
+  // importer synthesizes as a field (`Option<usize>`, W4.2e Part B) is Copy,
+  // and every non-opaque field type EmitRust admits is Copy, so the derive
+  // stays byte-identical for every struct without an owned tail. Measured:
+  // deriving Copy on a Vec-carrying struct is rustc E0204.
+  bool copyable = llvm::none_of(structDefOp.getFieldTypes(), [](Attribute a) {
+    auto opaque = dyn_cast<emitrust::OpaqueType>(cast<TypeAttr>(a).getValue());
+    return opaque && (opaque.getValue().starts_with("Vec<") ||
+                      opaque.getValue() == "String");
+  });
+  os << "#[derive(Clone" << (copyable ? ", Copy" : "")
+     << (derivable ? ", Default" : "") << ")]\n";
   // A field-less struct_def (C's `struct T {};`) prints unit-like with an
   // empty brace body; the derives keep declaration, copy, and default
   // construction working exactly as for the non-empty shape. (A struct with

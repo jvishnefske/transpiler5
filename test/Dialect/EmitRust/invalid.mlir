@@ -441,7 +441,9 @@ emitrust.func @slice_bad_element(%arg0: !emitrust.mut_ref<!emitrust.slice<i32>>)
 
 emitrust.func @slice_of_non_array(%arg0: i64) {
   %0 = emitrust.variable : !emitrust.lvalue<i32>
-  // expected-error @+1 {{base must be an lvalue of !emitrust.array or !emitrust.slice type}}
+  // FR-94: the admitted base set grew the opaque arm (the owned `Vec<u8>`
+  // FAM tail slices like a member array); a scalar base stays rejected.
+  // expected-error @+1 {{base must be an lvalue of !emitrust.array, !emitrust.slice, or !emitrust.opaque type}}
   %1 = emitrust.slice_of mut %0[%arg0] : (!emitrust.lvalue<i32>, i64) -> !emitrust.mut_ref<!emitrust.slice<i32>>
   emitrust.return
 }

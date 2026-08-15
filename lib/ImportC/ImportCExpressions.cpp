@@ -2381,6 +2381,29 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       arguments[index] = *carrier;
       continue;
     }
+    // FR-94: an OWNED-RECORD parameter (the free-only wrapper's by-value
+    // FAM record) takes its pointer argument as a MOVE of the caller's
+    // owned FAM local — `dec_free(d)` loads (moves) `d`, so a later use is
+    // rustc E0382, the loud direction. Any other pointer argument to an
+    // owned struct slot has no owner to move from and rejects located.
+    if (llvm::isa<emitrust::StructType>(input) &&
+        isDataPointer(argument->getType())) {
+      const clang::Expr *peeled = stripTrivia(argument);
+      while (const clang::Expr *sub = peelPointerCast(astContext(), peeled))
+        peeled = stripTrivia(sub);
+      const clang::VarDecl *owned = asLoadedLocalVarRef(peeled);
+      Value ownedPlace = owned ? symbols.lookup(owned) : Value();
+      if (owned && famAllocLocals.contains(owned) && ownedPlace &&
+          ownedPlace.getType() == Type(emitrust::LValueType::get(input))) {
+        arguments[index] =
+            builder.create<emitrust::LoadOp>(loc, input, ownedPlace)
+                .getResult();
+        continue;
+      }
+      return emitError(loc)
+             << "unsupported: pointer argument to an owned "
+                "flexible-array-record parameter is not an owned local";
+    }
     // Positioned against the callee's input: a refined
     // (callsite-inferred, FR-29 / CTS 00209) fn-ptr parameter binds a
     // directly-referenced function at the refined signature.
@@ -3868,9 +3891,12 @@ bool CImporter::matchMemberArraySliceArg(
     SmallVectorImpl<const clang::FieldDecl *> &path) {
   // The decayed leaf must be a fixed-extent array FIELD — the whole
   // region the slice covers. (A flexible/zero-length tail has no extent;
-  // an incomplete array is not a ConstantArrayType and never matches.)
+  // an incomplete array is not a ConstantArrayType and never matches —
+  // EXCEPT, FR-94, an ADMITTED FAM tail, whose owned `Vec<u8>` member IS
+  // the whole region and slices like any member array.)
   const auto *leaf = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
-  if (!leaf || !leaf->getType().getCanonicalType()->isConstantArrayType())
+  if (!leaf || (!leaf->getType().getCanonicalType()->isConstantArrayType() &&
+                famTailField(leaf->getParent()) != leaf))
     return false;
   return matchMemberChainRoot(member, isMutParam, chainRoot, path);
 }
@@ -3922,6 +3948,21 @@ bool CImporter::matchMemberChainRoot(
             ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
         if (!var || !var->hasLocalStorage())
           return false;
+        // FR-94: an owned FAM-record local roots the chain at its own
+        // struct place (the degenerate whole-object decomposition); its
+        // symbols place is the owned lvalue, always mutably borrowable.
+        if (famAllocLocals.contains(var)) {
+          auto ownedIt = symbols.find(var);
+          if (ownedIt == symbols.end())
+            return false;
+          auto ownedLValue =
+              llvm::dyn_cast<emitrust::LValueType>(ownedIt->second.getType());
+          if (!ownedLValue ||
+              !llvm::isa<emitrust::StructType>(ownedLValue.getValueType()))
+            return false;
+          chainRoot = var;
+          break;
+        }
         auto localIt = pointerLocals.find(var);
         if (localIt == pointerLocals.end())
           return false;
@@ -4074,15 +4115,26 @@ CImporter::classifyMemberArrayDecay(const clang::MemberExpr *member) {
   // Typed root: a nonzero fixed-extent array leaf over a SINGLE-link
   // chain — nested chains, 2D member rows (the decayed operand is a
   // subscript, never a MemberExpr), and global roots keep the
-  // historical rejection.
+  // historical rejection. FR-94: an ADMITTED FAM tail is the one
+  // extent-less leaf that classifies — its owned `Vec<u8>` member is the
+  // backing region.
+  bool famLeaf = famTailField(leaf->getParent()) == leaf;
   const clang::ConstantArrayType *leafArray =
       astContext().getAsConstantArrayType(leaf->getType());
-  if (!leafArray || leafArray->getSize().isZero())
+  if ((!leafArray || leafArray->getSize().isZero()) && !famLeaf)
     return std::nullopt;
   const clang::Expr *base = stripTrivia(member->getBase());
   if (member->isArrow()) {
     const auto *ref =
         llvm::dyn_cast<clang::DeclRefExpr>(base->IgnoreParenImpCasts());
+    // FR-94: an owned FAM-record LOCAL is an admitted arrow root for its
+    // own tail (`p = d->buffers` / `p = &d->buffers[k]`): the member place
+    // projects on the owned struct local.
+    if (famLeaf && ref)
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+          var && !llvm::isa<clang::ParmVarDecl>(var) &&
+          famAllocLocals.contains(var))
+        return std::make_pair(var, leaf);
     const auto *param =
         ref ? llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()) : nullptr;
     if (!param)
@@ -4322,10 +4374,18 @@ FailureOr<bool> CImporter::tryEmitMemberArraySlicePlace(
   auto memberLValue =
       llvm::dyn_cast<emitrust::LValueType>((*memberPlace).getType());
   Type memberElement;
-  if (memberLValue)
+  if (memberLValue) {
     if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(
             memberLValue.getValueType()))
       memberElement = arrayType.getElementType();
+    // FR-94: an admitted FAM tail's member place is the owned `Vec<u8>`
+    // field; its element is the byte the slice window carries.
+    else if (auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(
+                 memberLValue.getValueType());
+             opaque && opaque.getValue() == "Vec<u8>")
+      memberElement =
+          IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  }
   if (!memberElement)
     return emitError(loc) << "unsupported pointer target place";
   Value cursorValue;

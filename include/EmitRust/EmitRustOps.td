@@ -1653,8 +1653,11 @@ def EmitRust_SliceOfOp : EmitRust_Op<"slice_of"> {
     (the `as usize` cast is omitted when the index is of `index` type).
     The base lvalue's wrapped value type must be an `!emitrust.array` or
     `!emitrust.slice` whose element type equals the result slice's element
-    type, and the `mut` marker must be present if and only if the result is
-    an `!emitrust.mut_ref` (mirroring `emitrust.addr_of`).
+    type, or an `!emitrust.opaque` (the FR-94 owned `Vec<u8>` FAM tail; the
+    `Vec<T>` recognition surface generally), whose result element is trusted
+    rather than cross-checked (the `emitrust.subscript` opaque trust model).
+    The `mut` marker must be present if and only if the result is an
+    `!emitrust.mut_ref` (mirroring `emitrust.addr_of`).
 
     Example:
 

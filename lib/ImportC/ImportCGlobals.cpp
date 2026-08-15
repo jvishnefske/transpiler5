@@ -594,6 +594,20 @@ LogicalResult CImporter::createGlobal(const clang::VarDecl *key,
   if (isRustKeyword(symbolName))
     return emitError(loc) << "unsupported: global variable name '"
                           << symbolName << "' is a Rust keyword";
+  // FR-94: a GLOBAL of an admitted owned-tail FAM record has no
+  // representation this wave: the record's struct_def carries a non-Copy
+  // `Vec<u8>` field, and both the staged-copy global model and the actor
+  // owner lift require a Copy (or at least clone-rendered) image — without
+  // this gate the emitted crate dies at rustc (E0204/E0507) instead of a
+  // located diagnostic. (C itself forbids the record as a member or array
+  // element, so the global is the ONE type-position that can smuggle the
+  // Vec field behind a Copy derive.)
+  if (const clang::RecordDecl *record =
+          decl->getType().getCanonicalType()->getAsRecordDecl();
+      record && famTailField(record))
+    return emitError(loc)
+           << "unsupported: global variable of a flexible-array-member "
+              "record with an owned tail";
   // Globals are emitted as `static` items (thread-local or plain), and Rust
   // identifier patterns cannot shadow statics, so a global spelled like the
   // thread-local accessor binder would break every mutable-global access.
