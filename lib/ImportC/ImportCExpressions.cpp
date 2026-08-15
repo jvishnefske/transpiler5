@@ -3921,6 +3921,92 @@ bool CImporter::matchMemberArraySliceArg(
   return true;
 }
 
+FailureOr<bool> CImporter::tryEmitMemberArraySlicePlace(
+    Location loc, const clang::Expr *stripped, bool isMutParam,
+    Value &place, Value &cursor, Type &element,
+    const clang::VarDecl *&chainRoot,
+    SmallVectorImpl<const clang::FieldDecl *> &path) {
+  const clang::Expr *decayedOperand = nullptr;
+  const clang::Expr *cursorIndex = nullptr; // null => whole member.
+  if (const auto *memberDecay =
+          llvm::dyn_cast<clang::ImplicitCastExpr>(stripped);
+      memberDecay &&
+      memberDecay->getCastKind() == clang::CK_ArrayToPointerDecay) {
+    decayedOperand = stripTrivia(memberDecay->getSubExpr());
+  } else if (const auto *addrOf =
+                 llvm::dyn_cast<clang::UnaryOperator>(stripped);
+             addrOf && addrOf->getOpcode() == clang::UO_AddrOf) {
+    // `&s.m[k]`: address of a subscript over the decayed member.
+    if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(
+            stripTrivia(addrOf->getSubExpr())))
+      if (const auto *decay = llvm::dyn_cast<clang::ImplicitCastExpr>(
+              stripTrivia(subscript->getBase()));
+          decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay) {
+        decayedOperand = stripTrivia(decay->getSubExpr());
+        cursorIndex = subscript->getIdx();
+      }
+  } else if (const auto *add =
+                 llvm::dyn_cast<clang::BinaryOperator>(stripped);
+             add && add->getOpcode() == clang::BO_Add) {
+    // `s.m + k` (C also admits the commuted `k + s.m`).
+    const clang::Expr *pointerSide = stripTrivia(add->getLHS());
+    const clang::Expr *indexSide = stripTrivia(add->getRHS());
+    if (!pointerSide->getType()->isPointerType())
+      std::swap(pointerSide, indexSide);
+    if (const auto *decay =
+            llvm::dyn_cast<clang::ImplicitCastExpr>(pointerSide);
+        decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay) {
+      decayedOperand = stripTrivia(decay->getSubExpr());
+      cursorIndex = indexSide;
+    }
+  }
+  const auto *member =
+      llvm::dyn_cast_or_null<clang::MemberExpr>(decayedOperand);
+  std::optional<llvm::APSInt> constantCursor;
+  if (member && cursorIndex)
+    constantCursor = cursorIndex->getIntegerConstantExpr(astContext());
+  const clang::VarDecl *root = nullptr;
+  SmallVector<const clang::FieldDecl *, 2> matchedPath;
+  if (!member ||
+      (cursorIndex && !constantCursor &&
+       !isPureSliceCursorExpr(cursorIndex)) ||
+      !matchMemberArraySliceArg(member, isMutParam, root, matchedPath))
+    return false;
+  FailureOr<Value> memberPlace =
+      emitMemberLValue(member, loc, /*writeback=*/nullptr);
+  if (failed(memberPlace))
+    return failure();
+  auto memberLValue =
+      llvm::dyn_cast<emitrust::LValueType>((*memberPlace).getType());
+  Type memberElement;
+  if (memberLValue)
+    if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(
+            memberLValue.getValueType()))
+      memberElement = arrayType.getElementType();
+  if (!memberElement)
+    return emitError(loc) << "unsupported pointer target place";
+  Value cursorValue;
+  if (constantCursor) {
+    cursorValue = createIntConstant(loc, builder.getIntegerType(64),
+                                    constantCursor->getExtValue());
+  } else if (cursorIndex) {
+    FailureOr<Value> rawIndex = emitRValue(cursorIndex);
+    if (failed(rawIndex))
+      return failure();
+    if (!llvm::isa<IntegerType>((*rawIndex).getType()))
+      return emitError(loc) << "unsupported subscript index type";
+    cursorValue = castToIntType(loc, *rawIndex, builder.getIntegerType(64));
+  } else {
+    cursorValue = createIntConstant(loc, builder.getIntegerType(64), 0);
+  }
+  place = *memberPlace;
+  cursor = cursorValue;
+  element = memberElement;
+  chainRoot = root;
+  path.assign(matchedPath.begin(), matchedPath.end());
+  return true;
+}
+
 FailureOr<Value> CImporter::emitBorrowArgument(
     Location loc, const clang::Expr *argument, Type paramType,
     const clang::VarDecl *&root,
@@ -4040,7 +4126,9 @@ FailureOr<Value> CImporter::emitBorrowArgument(
     // compress shape): a dot/arrow projection chain ending at an
     // array-typed field decays to the same whole-region slice a top-level
     // array does — `slice_of` over the member PLACE at cursor 0. The
-    // interception lives HERE, in the slice-argument position only, and
+    // interception lives HERE, in the slice-argument position (and,
+    // FR-87, in the hosted byte-family REGION position through the
+    // shared `tryEmitMemberArraySlicePlace` core), and
     // NOT in `emitPointerRValue`'s decay case: member decay in
     // non-argument positions (a pointer local bound to `s.iv`) must keep
     // its verbatim rejection, because the pointer decomposition has no
@@ -4058,64 +4146,17 @@ FailureOr<Value> CImporter::emitBorrowArgument(
     // inc/dec) DECLINES the interception so the historical located
     // decay rejection fires unchanged.
     {
-      const clang::Expr *decayedOperand = nullptr;
-      const clang::Expr *cursorIndex = nullptr; // null => whole member.
-      if (const auto *memberDecay =
-              llvm::dyn_cast<clang::ImplicitCastExpr>(strippedArg);
-          memberDecay &&
-          memberDecay->getCastKind() == clang::CK_ArrayToPointerDecay) {
-        decayedOperand = stripTrivia(memberDecay->getSubExpr());
-      } else if (const auto *addrOf =
-                     llvm::dyn_cast<clang::UnaryOperator>(strippedArg);
-                 addrOf && addrOf->getOpcode() == clang::UO_AddrOf) {
-        // `&s.m[k]`: address of a subscript over the decayed member.
-        if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(
-                stripTrivia(addrOf->getSubExpr())))
-          if (const auto *decay = llvm::dyn_cast<clang::ImplicitCastExpr>(
-                  stripTrivia(subscript->getBase()));
-              decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay) {
-            decayedOperand = stripTrivia(decay->getSubExpr());
-            cursorIndex = subscript->getIdx();
-          }
-      } else if (const auto *add =
-                     llvm::dyn_cast<clang::BinaryOperator>(strippedArg);
-                 add && add->getOpcode() == clang::BO_Add) {
-        // `s.m + k` (C also admits the commuted `k + s.m`).
-        const clang::Expr *pointerSide = stripTrivia(add->getLHS());
-        const clang::Expr *indexSide = stripTrivia(add->getRHS());
-        if (!pointerSide->getType()->isPointerType())
-          std::swap(pointerSide, indexSide);
-        if (const auto *decay =
-                llvm::dyn_cast<clang::ImplicitCastExpr>(pointerSide);
-            decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay) {
-          decayedOperand = stripTrivia(decay->getSubExpr());
-          cursorIndex = indexSide;
-        }
-      }
-      const auto *member =
-          llvm::dyn_cast_or_null<clang::MemberExpr>(decayedOperand);
-      std::optional<llvm::APSInt> constantCursor;
-      if (member && cursorIndex)
-        constantCursor = cursorIndex->getIntegerConstantExpr(astContext());
+      Value memberPlace;
+      Value memberCursor;
+      Type memberElement;
       const clang::VarDecl *chainRoot = nullptr;
       SmallVector<const clang::FieldDecl *, 2> chainPath;
-      if (member &&
-          (!cursorIndex || constantCursor ||
-           isPureSliceCursorExpr(cursorIndex)) &&
-          matchMemberArraySliceArg(member, isMutParam, chainRoot, chainPath)) {
-        FailureOr<Value> place =
-            emitMemberLValue(member, loc, /*writeback=*/nullptr);
-        if (failed(place))
-          return failure();
-        auto memberLValue =
-            llvm::dyn_cast<emitrust::LValueType>((*place).getType());
-        Type memberElement;
-        if (memberLValue)
-          if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(
-                  memberLValue.getValueType()))
-            memberElement = arrayType.getElementType();
-        if (!memberElement)
-          return emitError(loc) << "unsupported pointer target place";
+      FailureOr<bool> matched = tryEmitMemberArraySlicePlace(
+          loc, strippedArg, isMutParam, memberPlace, memberCursor,
+          memberElement, chainRoot, chainPath);
+      if (failed(matched))
+        return failure();
+      if (*matched) {
         if (memberElement != sliceType.getElementType())
           return emitError(loc)
                  << "unsupported: argument element type does not "
@@ -4123,23 +4164,9 @@ FailureOr<Value> CImporter::emitBorrowArgument(
         root = chainRoot;
         if (rootPath)
           rootPath->assign(chainPath.begin(), chainPath.end());
-        Value cursor;
-        if (constantCursor) {
-          cursor = createIntConstant(loc, builder.getIntegerType(64),
-                                     constantCursor->getExtValue());
-        } else if (cursorIndex) {
-          FailureOr<Value> rawIndex = emitRValue(cursorIndex);
-          if (failed(rawIndex))
-            return failure();
-          if (!llvm::isa<IntegerType>((*rawIndex).getType()))
-            return emitError(loc) << "unsupported subscript index type";
-          cursor =
-              castToIntType(loc, *rawIndex, builder.getIntegerType(64));
-        } else {
-          cursor = createIntConstant(loc, builder.getIntegerType(64), 0);
-        }
         return builder
-            .create<emitrust::SliceOfOp>(loc, paramType, *place, cursor,
+            .create<emitrust::SliceOfOp>(loc, paramType, memberPlace,
+                                         memberCursor,
                                          /*is_mut=*/isMutParam)
             .getResult();
       }
