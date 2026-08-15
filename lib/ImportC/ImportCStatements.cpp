@@ -4053,6 +4053,38 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
     builder.create<emitrust::AssignOp>(loc, staged, stored);
     return staged;
   }
+  // FR-83: a store to an integer-scalar leaf through an opaque-union ARM
+  // scatters the value over the blob byte view at the leaf's
+  // clang-computed offset (`to_ne_bytes`; a single blob subscript for one
+  // byte). Same staging contract as the wide byte view above: the
+  // assigned value is re-loadable from a temporary, and a staged global
+  // base commits through the writeback.
+  if (isOpaqueArmScalarLeaf(op->getLHS())) {
+    GlobalWriteback writeback;
+    FailureOr<WideByteAccess> access =
+        resolveOpaqueArmByteView(op->getLHS(), loc, &writeback);
+    if (failed(access))
+      return failure();
+    FailureOr<Value> value = emitRValue(op->getRHS());
+    if (failed(value))
+      return failure();
+    Value stored = *value;
+    if (stored.getType() != access->valueType) {
+      FailureOr<Value> converted =
+          convertScalarValue(loc, stored, access->valueType);
+      if (failed(converted))
+        return failure();
+      stored = *converted;
+    }
+    if (failed(commitGlobalWriteback(
+            loc, writeback, assignStalenessRisk(op), [&]() {
+              return emitOpaqueArmStore(*access, stored, loc);
+            })))
+      return failure();
+    Value staged = createVariablePlace(loc, access->valueType);
+    builder.create<emitrust::AssignOp>(loc, staged, stored);
+    return staged;
+  }
   GlobalWriteback writeback;
   FailureOr<Value> place = emitLValue(op->getLHS(), &writeback);
   if (failed(place))
@@ -4148,6 +4180,31 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
     if (failed(commitGlobalWriteback(
             loc, writeback, assignStalenessRisk(op), [&]() {
               return emitWideByteStore(*access, *result, loc);
+            })))
+      return failure();
+    Value staged = createVariablePlace(loc, access->valueType);
+    builder.create<emitrust::AssignOp>(loc, staged, *result);
+    return staged;
+  }
+  // FR-83: compound assignment through an opaque-union arm leaf is a
+  // read-modify-write over the same blob byte view — one widened load,
+  // the computation at Sema's type, one widened store (and, over a staged
+  // global base, the writeback).
+  if (isOpaqueArmScalarLeaf(op->getLHS())) {
+    GlobalWriteback writeback;
+    FailureOr<WideByteAccess> access =
+        resolveOpaqueArmByteView(op->getLHS(), loc, &writeback);
+    if (failed(access))
+      return failure();
+    FailureOr<Value> current = emitOpaqueArmLoad(*access, loc);
+    if (failed(current))
+      return failure();
+    FailureOr<Value> result = buildCompoundAssignValue(loc, op, *current);
+    if (failed(result))
+      return failure();
+    if (failed(commitGlobalWriteback(
+            loc, writeback, assignStalenessRisk(op), [&]() {
+              return emitOpaqueArmStore(*access, *result, loc);
             })))
       return failure();
     Value staged = createVariablePlace(loc, access->valueType);
@@ -4296,6 +4353,32 @@ FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
     // C evaluates postfix forms to the original value and prefix forms to
     // the updated one.
     return op->isPostfix() ? current : *next;
+  }
+  // FR-83: ++/-- on an integer-scalar leaf through an opaque-union ARM is
+  // a read-modify-write over the blob byte view (the composed
+  // load/store images; a one-byte leaf never stages ne_bytes).
+  if (isOpaqueArmScalarLeaf(op->getSubExpr())) {
+    GlobalWriteback writeback;
+    FailureOr<WideByteAccess> access =
+        resolveOpaqueArmByteView(op->getSubExpr(), loc, &writeback);
+    if (failed(access))
+      return failure();
+    FailureOr<Value> current = emitOpaqueArmLoad(*access, loc);
+    if (failed(current))
+      return failure();
+    Value one = createScalarIntConstant(loc, access->valueType, 1);
+    clang::BinaryOperatorKind opcode =
+        op->isIncrementOp() ? clang::BO_Add : clang::BO_Sub;
+    FailureOr<Value> next = buildBinaryArith(loc, opcode, *current, one);
+    if (failed(next))
+      return failure();
+    if (failed(commitGlobalWriteback(
+            loc, writeback, op->getSubExpr()->HasSideEffects(astContext()),
+            [&]() { return emitOpaqueArmStore(*access, *next, loc); })))
+      return failure();
+    // C evaluates postfix forms to the original value and prefix forms
+    // to the updated one.
+    return op->isPostfix() ? *current : *next;
   }
   GlobalWriteback writeback;
   FailureOr<Value> place = emitLValue(op->getSubExpr(), &writeback);

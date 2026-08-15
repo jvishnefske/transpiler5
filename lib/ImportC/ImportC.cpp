@@ -2419,6 +2419,16 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
       tus.push_back(tuIndex);
   };
 
+  // FR-83 (the FR-82 fold prerequisite): a `&` IMMEDIATELY cancelled by
+  // `->` or unary `*` — `(&g)->f`, `(*(&g)).f`, lwIP's macro-expanded
+  // `((T*)&ip_data)->...` after the cast peels — folds to a plain member
+  // access at emission and never materializes an address, so it must not
+  // mark the global address-taken (the mark is what disqualifies the
+  // FR-81 requirement model). The scan visits parents before children, so
+  // the cancelling node records its `&` here and the `UO_AddrOf` case
+  // below skips exactly that set; a real address-take still marks.
+  llvm::SmallPtrSet<const clang::Stmt *, 8> derefCancelledAddrOf;
+
   // One statement/expression subtree: enumerates direct external calls,
   // externally visible function address-takings, explicit address-of of
   // externally visible globals, fn-ptr global writes/escapes, and
@@ -2429,6 +2439,19 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
   auto scan = [&](auto &&self, const clang::Stmt *stmt) -> void {
     if (!stmt)
       return;
+    // FR-83: note a `&` this node cancels (see `derefCancelledAddrOf`).
+    auto noteCancelledAddrOf = [&](const clang::Expr *base) {
+      if (const auto *inner = llvm::dyn_cast_or_null<clang::UnaryOperator>(
+              base ? base->IgnoreParenImpCasts() : nullptr))
+        if (inner->getOpcode() == clang::UO_AddrOf)
+          derefCancelledAddrOf.insert(inner);
+    };
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(stmt))
+      if (member->isArrow())
+        noteCancelledAddrOf(member->getBase());
+    if (const auto *deref = llvm::dyn_cast<clang::UnaryOperator>(stmt))
+      if (deref->getOpcode() == clang::UO_Deref)
+        noteCancelledAddrOf(deref->getSubExpr());
     if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
       if (const auto *callee = call->getDirectCallee()) {
         if (callee->isExternallyVisible() && !isSystemHeaderDecl(callee))
@@ -2460,9 +2483,14 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
     }
     if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt)) {
       if (unary->getOpcode() == clang::UO_AddrOf) {
-        std::string taken = addressBoundGlobal(unary);
-        if (!taken.empty())
-          wholeProgram.addressTakenGlobals.insert(taken);
+        // FR-83: a deref-cancelled `&` (recorded by its `->`/`*` parent
+        // above) folds away at emission — skip the address-taken mark for
+        // it, and it alone.
+        if (!derefCancelledAddrOf.contains(unary)) {
+          std::string taken = addressBoundGlobal(unary);
+          if (!taken.empty())
+            wholeProgram.addressTakenGlobals.insert(taken);
+        }
         markFnPtrWrite(unary->getSubExpr());
       }
       if (unary->isIncrementDecrementOp())
@@ -2890,7 +2918,11 @@ FailureOr<Value> CImporter::emitWideByteLoad(const WideByteAccess &access,
                                              Location loc) {
   auto u8Type = IntegerType::get(builder.getContext(), 8,
                                  IntegerType::Unsigned);
-  IntegerType byteType = builder.getIntegerType(8);
+  // The historical CTS-P11 base is a C char array (signless i8, gathered
+  // through a u8 cast per byte); an FR-83 blob base is already ui8 and
+  // needs no cast.
+  IntegerType byteType =
+      access.elementType ? access.elementType : builder.getIntegerType(8);
   IntegerType cursorType = builder.getIntegerType(64);
   auto bytesType = emitrust::ArrayType::get(builder.getContext(),
                                             access.byteWidth, u8Type);
@@ -2914,7 +2946,9 @@ FailureOr<Value> CImporter::emitWideByteLoad(const WideByteAccess &access,
     Value byte =
         builder.create<emitrust::LoadOp>(loc, byteType, element).getResult();
     Value unsignedByte =
-        builder.create<emitrust::CastOp>(loc, u8Type, byte).getResult();
+        byteType == u8Type
+            ? byte
+            : builder.create<emitrust::CastOp>(loc, u8Type, byte).getResult();
     Value slot = builder
                      .create<emitrust::SubscriptOp>(
                          loc, emitrust::LValueType::get(u8Type), bytesVar,
@@ -2937,7 +2971,8 @@ LogicalResult CImporter::emitWideByteStore(const WideByteAccess &access,
                                            Value value, Location loc) {
   auto u8Type = IntegerType::get(builder.getContext(), 8,
                                  IntegerType::Unsigned);
-  IntegerType byteType = builder.getIntegerType(8);
+  IntegerType byteType =
+      access.elementType ? access.elementType : builder.getIntegerType(8);
   IntegerType cursorType = builder.getIntegerType(64);
   auto bytesType = emitrust::ArrayType::get(builder.getContext(),
                                             access.byteWidth, u8Type);
@@ -2966,7 +3001,10 @@ LogicalResult CImporter::emitWideByteStore(const WideByteAccess &access,
     Value byte =
         builder.create<emitrust::LoadOp>(loc, u8Type, slot).getResult();
     Value signedByte =
-        builder.create<emitrust::CastOp>(loc, byteType, byte).getResult();
+        byteType == u8Type
+            ? byte
+            : builder.create<emitrust::CastOp>(loc, byteType, byte)
+                  .getResult();
     Value targetIndex =
         k == 0 ? access.cursor
                : builder.create<arith::AddIOp>(loc, access.cursor, kValue)
@@ -2978,6 +3016,205 @@ LogicalResult CImporter::emitWideByteStore(const WideByteAccess &access,
                         .getResult();
     builder.create<emitrust::AssignOp>(loc, element, signedByte);
   }
+  return success();
+}
+
+bool CImporter::isOpaqueArmScalarLeaf(const clang::Expr *expr) const {
+  const clang::Expr *e = expr ? expr->IgnoreParenImpCasts() : nullptr;
+  if (!e)
+    return false;
+  // Only a plain INTEGER scalar leaf has the ne_bytes/byte-subscript
+  // image: `_Bool` converts by zero-comparison (not truncation), an enum
+  // maps to its own item type, and a `_BitInt`'s storage size need not
+  // match its mapped width. Floats stay out (the helpers are emitted for
+  // integer widths only; measured lwIP demand is u32/u8).
+  clang::QualType leafType = e->getType().getCanonicalType();
+  if (!leafType->isIntegerType() || leafType->isBooleanType() ||
+      leafType->isEnumeralType() || leafType->isBitIntType())
+    return false;
+  // Walk leaf-inward: dot members and array-typed subscripts only, ending
+  // at an opaque-union ARM selection (the arm itself may be dot or arrow —
+  // its base is the union, resolved by the ordinary member-base
+  // machinery). Any other link (an arrow through an interior pointer, a
+  // bit-field, a call) is not a pure layout projection of the blob.
+  for (const clang::Expr *cur = e;;) {
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(cur)) {
+      const auto *field =
+          llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+      if (!field || field->isBitField())
+        return false;
+      if (opaqueUnionArms.contains(field))
+        return true;
+      if (member->isArrow())
+        return false;
+      cur = member->getBase()->IgnoreParenImpCasts();
+      continue;
+    }
+    if (const auto *subscript =
+            llvm::dyn_cast<clang::ArraySubscriptExpr>(cur)) {
+      const clang::Expr *base = subscript->getBase()->IgnoreParenImpCasts();
+      if (!base->getType().getCanonicalType()->isArrayType())
+        return false;
+      cur = base;
+      continue;
+    }
+    return false;
+  }
+}
+
+FailureOr<CImporter::WideByteAccess>
+CImporter::resolveOpaqueArmByteView(const clang::Expr *expr, Location loc,
+                                    GlobalWriteback *writeback) {
+  // Collect the projection chain leaf-first down to (and including) the
+  // ARM member; the classifier proved the shapes, so the casts hold.
+  llvm::SmallVector<const clang::Expr *, 4> chain;
+  const clang::MemberExpr *armMember = nullptr;
+  for (const clang::Expr *cur = expr->IgnoreParenImpCasts(); !armMember;) {
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(cur)) {
+      chain.push_back(member);
+      const auto *field =
+          llvm::cast<clang::FieldDecl>(member->getMemberDecl());
+      if (opaqueUnionArms.contains(field)) {
+        armMember = member;
+        break;
+      }
+      cur = member->getBase()->IgnoreParenImpCasts();
+      continue;
+    }
+    const auto *subscript = llvm::cast<clang::ArraySubscriptExpr>(cur);
+    chain.push_back(subscript);
+    cur = subscript->getBase()->IgnoreParenImpCasts();
+  }
+  const auto *armField =
+      llvm::cast<clang::FieldDecl>(armMember->getMemberDecl());
+  // The union's place resolves through the ordinary member-base machinery
+  // (dot on an lvalue, arrow through a pointer, staged global copies with
+  // their writeback), then projects to the blob field — the byte array
+  // sized by C sizeof of the union, exactly as `collectUnionSlot` built
+  // the struct_def.
+  FailureOr<Value> unionPlace = emitMemberBasePlace(armMember, loc, writeback);
+  if (failed(unionPlace))
+    return failure();
+  const clang::RecordDecl *unionDecl = armField->getParent();
+  uint64_t blobBytes =
+      astContext()
+          .getTypeSizeInChars(astContext().getRecordType(unionDecl))
+          .getQuantity();
+  auto u8Type =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  auto blobType =
+      emitrust::ArrayType::get(builder.getContext(), blobBytes, u8Type);
+  Value blobPlace = builder
+                        .create<emitrust::MemberOp>(
+                            loc, emitrust::LValueType::get(blobType),
+                            *unionPlace, builder.getStringAttr("opaque"))
+                        .getResult();
+  // Accumulate the leaf's byte offset arm-outward: clang's ASTRecordLayout
+  // gives each member's authoritative offset, and a subscript adds its
+  // element-size-scaled index (constant-folded when it evaluates, a
+  // runtime i64 term otherwise) — the byte-region walk's precedent
+  // (`resolveByteRegionRef`).
+  int64_t constOff = 0;
+  Value dynOff;
+  IntegerType cursorType = builder.getIntegerType(64);
+  for (const clang::Expr *link : llvm::reverse(chain)) {
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(link)) {
+      const auto *field =
+          llvm::cast<clang::FieldDecl>(member->getMemberDecl());
+      constOff += static_cast<int64_t>(
+          astContext()
+              .getASTRecordLayout(field->getParent())
+              .getFieldOffset(field->getFieldIndex()) /
+          8);
+      continue;
+    }
+    const auto *subscript = llvm::cast<clang::ArraySubscriptExpr>(link);
+    uint64_t elementSize =
+        astContext().getTypeSizeInChars(subscript->getType()).getQuantity();
+    clang::Expr::EvalResult eval;
+    if (subscript->getIdx()->EvaluateAsInt(eval, astContext()) &&
+        !eval.HasSideEffects) {
+      constOff += eval.Val.getInt().getSExtValue() *
+                  static_cast<int64_t>(elementSize);
+      continue;
+    }
+    FailureOr<Value> index = emitRValue(subscript->getIdx());
+    if (failed(index))
+      return failure();
+    Value index64 = castToIntType(loc, *index, cursorType);
+    if (elementSize != 1) {
+      Value scale = createIntConstant(loc, cursorType,
+                                      static_cast<int64_t>(elementSize));
+      index64 = builder.create<arith::MulIOp>(loc, index64, scale).getResult();
+    }
+    dynOff = dynOff
+                 ? builder.create<arith::AddIOp>(loc, dynOff, index64)
+                       .getResult()
+                 : index64;
+  }
+  FailureOr<Type> leafType = mapType(expr->getType(), loc);
+  if (failed(leafType))
+    return failure();
+  auto valueType = llvm::dyn_cast<IntegerType>(*leafType);
+  uint64_t byteWidth =
+      astContext().getTypeSizeInChars(expr->getType()).getQuantity();
+  // Defensive: the classifier admits only plain integer leaves, whose
+  // mapped type is integral and whose window fits the blob; anything else
+  // keeps the arm-access rejection (same wording as the frontier's).
+  if (!valueType || byteWidth == 0 ||
+      (!dynOff && (constOff < 0 || static_cast<uint64_t>(constOff) +
+                                           byteWidth >
+                                       blobBytes)))
+    return emitError(loc) << "unsupported: opaque union arm access";
+  Value cursor;
+  if (dynOff && constOff == 0) {
+    cursor = dynOff;
+  } else {
+    cursor = createIntConstant(loc, cursorType, constOff);
+    if (dynOff)
+      cursor = builder.create<arith::AddIOp>(loc, cursor, dynOff).getResult();
+  }
+  return WideByteAccess{blobPlace, cursor, valueType,
+                        static_cast<unsigned>(byteWidth), u8Type};
+}
+
+FailureOr<Value> CImporter::emitOpaqueArmLoad(const WideByteAccess &access,
+                                              Location loc) {
+  if (access.byteWidth != 1)
+    return emitWideByteLoad(access, loc);
+  // A one-byte leaf is a single blob subscript; a differently-signed leaf
+  // (plain/signed char) reinterprets the u8 bit-exactly.
+  auto u8Type =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  Value element = builder
+                      .create<emitrust::SubscriptOp>(
+                          loc, emitrust::LValueType::get(u8Type),
+                          access.basePlace, access.cursor)
+                      .getResult();
+  Value byte =
+      builder.create<emitrust::LoadOp>(loc, u8Type, element).getResult();
+  if (byte.getType() != access.valueType)
+    byte = builder.create<emitrust::CastOp>(loc, access.valueType, byte)
+               .getResult();
+  return byte;
+}
+
+LogicalResult CImporter::emitOpaqueArmStore(const WideByteAccess &access,
+                                            Value value, Location loc) {
+  if (access.byteWidth != 1)
+    return emitWideByteStore(access, value, loc);
+  auto u8Type =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  Value stored = value;
+  if (stored.getType() != u8Type)
+    stored =
+        builder.create<emitrust::CastOp>(loc, u8Type, stored).getResult();
+  Value element = builder
+                      .create<emitrust::SubscriptOp>(
+                          loc, emitrust::LValueType::get(u8Type),
+                          access.basePlace, access.cursor)
+                      .getResult();
+  builder.create<emitrust::AssignOp>(loc, element, stored);
   return success();
 }
 
@@ -5237,13 +5474,17 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   // array arm can be modeled on that one slot.
   if (unionByteArrayArms.contains(field))
     return emitError(loc) << "unsupported: union byte-array arm access";
-  // FR-78: an opaque-union arm exists only at the type level too — the
-  // union admitted as a sizeof-sized byte blob, and the blob carries no
-  // arm-typed view, so EVERY access through any arm (read, write,
-  // compound, ++/--, nested projection, dot or arrow) rejects here, at
-  // its own site. This check is load-bearing: a leaked arm member op
-  // verifies and translates, dying only as rustc E0609 (the emitter's
-  // marker backstop is the last line, not this one's substitute).
+  // FR-78: an opaque-union arm exists only at the type level — the union
+  // admitted as a sizeof-sized byte blob, and the blob carries no
+  // arm-typed view. FR-83 lowers the ONE enumerated family — integer-
+  // scalar leaves, intercepted BEFORE any lvalue is requested (the
+  // rvalue-read, assignment, compound-assignment, and ++/-- paths route
+  // through `resolveOpaqueArmByteView`) — so every arm access that still
+  // reaches this generic lvalue path (whole-arm copies, array decay,
+  // float leaves, region-rooted bases) rejects here, at its own site.
+  // This check is load-bearing: a leaked arm member op verifies and
+  // translates, dying only as rustc E0609 (the emitter's marker backstop
+  // is the last line, not this one's substitute).
   if (opaqueUnionArms.contains(field))
     return emitError(loc) << "unsupported: opaque union arm access";
   // A data-pointer member has no place of its own (its stored i64

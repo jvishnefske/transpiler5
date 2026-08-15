@@ -496,6 +496,18 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
         return failure();
       return emitWideByteLoad(*access, loc);
     }
+    // FR-83: an integer-scalar leaf through an opaque-union ARM reads as
+    // a byte view of the blob at the leaf's clang-computed offset — the
+    // same wide-byte image (`from_ne_bytes` over the window; a single
+    // blob subscript for one byte). Intercepted here, before any lvalue
+    // is requested: the blob has no arm-typed place.
+    if (isOpaqueArmScalarLeaf(sub)) {
+      FailureOr<WideByteAccess> access =
+          resolveOpaqueArmByteView(sub, loc, /*writeback=*/nullptr);
+      if (failed(access))
+        return failure();
+      return emitOpaqueArmLoad(*access, loc);
+    }
     // A bit-field member read is the synthesized mask-and-shift accessor
     // over its backing field (C99-45); no lvalue of the member exists.
     if (const auto *memberExpr =

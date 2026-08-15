@@ -5063,6 +5063,69 @@ piece and becomes FR-45.
   union-arm model, after which the folds alone flip ip6_frag
   immediately. All current rejections stay located and pinned.
 
+- [x] FR-83 Opaque-union arm access as blob byte-views at
+  clang-computed offsets (the FR-82 redirect: 220 of 258 measured
+  IP_DATA-front occurrences cross the u_addr arm of the FR-78
+  opaque union, and the dual-stack ip_addr_t is the real netif-era
+  blocker). The model: an ARM ACCESS on an FR-78 opaque-union blob
+  — `u.<arm>.<field...>` reads and writes, dot or arrow, nested to
+  scalar leaves — lowers to a byte-view of the blob at the leaf's
+  clang-computed offset: reads render
+  `T::from_ne_bytes(blob[OFF..OFF+K].try_into()...)`-shaped safe
+  images (exact by definition: the blob IS the union's C memory and
+  clang's ASTRecordLayout gives the authoritative offsets), writes
+  the mirror `copy_from_slice(&v.to_ne_bytes())`; C's
+  type-punning-through-arms semantics falls out for free because
+  every arm reads the same bytes. Scope gates the spike must
+  resolve: scalar-leaf accesses only this wave (integer/float
+  leaves; nested struct arms decompose per-leaf; ARRAY leaves and
+  whole-ARM aggregate copies measured for demand and admitted only
+  if the byte-image is clean); address-of an arm stays rejected
+  (unchanged wording); bitfield arms stay rejected (FR-78 trigger
+  already excludes them); the FR-78 emitter backstop REMAINS for
+  any unenumerated path — this FR converts enumerated rejections
+  into images, never weakens the backstop. Offsets are AST facts
+  recorded at import (an attr on the access or a synthesized
+  accessor — spike differentiates; the FR-40 byte-identity
+  invariant applies if accessors are named). Rendering must stay
+  deny-clean (no unsafe, no transmute). Gates: Import pins (read
+  and write through both arms of a dual-stack-shaped union at
+  IR level; nested leaf; the pun property pinned — write ip4 arm,
+  read the byte-equivalent through the other arm's overlapping
+  leaf); frontier pins (address-of-arm, array leaf if rejected —
+  verbatim); EndToEnd byte-diff of the pun semantics vs clang
+  native (both arms, both directions, argc-seeded); lwIP re-probe
+  (with the FR-82 folds' prerequisite met, measure what flips —
+  ip6_frag expected first); full lit 100%; C path only; the FR-78
+  never-accessed containment pins unchanged.
+  **SPIKE VERDICT: GO (2026-08-15).** Model (iii) won — direct
+  inline byte-view emission at the access site: no offset attr, no
+  synthesized accessors, no FR-40 naming exposure; offsets are
+  arith constants computed at import from getASTRecordLayout
+  (already used in-importer), and the images reuse the EXISTING
+  emitWideByteLoad/Store machinery after parameterizing its
+  hard-coded i8 element for ui8 blobs — unwrap-free per-byte
+  gather, no new ops, alignment-free by construction. The FR-78
+  emitter backstop was measured to refuse even the blob field's OWN
+  selection, so it gained exactly ONE enumerated allowance (the
+  marked struct_def's single blob field name, cross-checked) while
+  arm names keep refusing — errors.mlir's pin unchanged plus a
+  positive twin. Scope: integer scalar leaves INCLUDING
+  array-element leaves at const or RUNTIME index (the dominant lwIP
+  demand — ip6.addr[k]: 112 fold-reads + 22 fold-writes; runtime
+  cursor byte-diffed); float leaves, whole-arm copies,
+  address-of-arm, anonymous/bitfield arms stay located. The FR-82
+  FOLD GATE LANDED IN THIS WAVE (measured as the joint
+  prerequisite): a deref-cancelled `&` no longer marks the global
+  in addressBoundGlobal (real address-takes still mark), pinned by
+  multi-tu-deref-cancelled-addr.c. Pun semantics byte-diffed both
+  directions at four argc seeds. lwIP MEASURED FLIP: ip6_frag
+  whole-crate loss -> crate + progress JSON at 603 permille ported,
+  and ip6/nd6/ip4/icmp6/mld6/icmp all now produce crates; tcp_in
+  and udp keep the whole-crate IP_DATA loss on surviving
+  non-fold address shapes (the residual the FR-82 table
+  predicted). Full suite 618/618.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
