@@ -5372,6 +5372,35 @@ piece and becomes FR-45.
   measured (member-address arguments — the FR-89 candidate).
   Full suite 633/633.
 
+- [x] FR-89 Member-array arguments to void*-admitted byte params
+  (CORRECTED by the spike: the motivating site is hmac_prng.c:143
+  — `_set(prng->key, ...)` — NOT ctr_prng.c:137, which is a
+  locals-only memcpy that already imports; ctr_prng's real
+  blockers are the member-ADDRESS seam `&ctx->key`, "unsupported
+  pointer target expression", recorded as the FR-90 candidate
+  below). The AST measured the argument as
+  BitCast<void*>(ArrayToPointerDecay(MemberExpr)) — the FR-86
+  bin-C hypothesis CONFIRMED: the work is the void*-mediated
+  BitCast peel in emitBorrowArgument's strip loop (CK_NoOp-only
+  before), scoped with peelPointerCast semantics (void pointee one
+  side, volatile-blocking, ARGUMENT path only) — after which the
+  FR-86 member matcher, element check, and (VarDecl, field-path)
+  aliasing guard compose FOR FREE (the hand-stitched IR needed
+  zero new pieces; the typed and void* callee signatures are
+  byte-identical). Peel placement is BEHIND the string-literal
+  head — peeling ahead would have re-routed an already-importing
+  const-literal shape to a fresh MUTABLE backing (an unintended
+  byte shift, caught in implementation and pinned positively).
+  Frontier held: non-byte member elements land the in-source
+  element check; impure cursors and the all-u8 CTS-BR byte-region
+  boundary keep their verbatim rejections; the literal-to-void*
+  i8/ui8 rejection pinned unchanged. Measured external outcome,
+  honestly: both hmac_prng ArrayToPointerDecay wordings
+  eliminated; tc_hmac_prng_init advances to the 146:38
+  null-constant blocker (not ported — the spike's port prediction
+  refuted by the implementation's own re-probe); tu0_update
+  advances to the scalar-address rejection. Full suite 636/636.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
