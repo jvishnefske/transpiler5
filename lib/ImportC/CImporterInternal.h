@@ -4462,10 +4462,36 @@ private:
   /// for plain address-of arguments that involve no decomposed pointer.
   /// `root` receives the argument's region base declaration when one is
   /// statically known (feeding the aliasing rejection in `emitCall`).
-  FailureOr<Value> emitBorrowArgument(Location loc,
-                                      const clang::Expr *argument,
-                                      Type paramType,
-                                      const clang::VarDecl *&root);
+  /// FR-74: `rootPath`, when provided, receives the member projection
+  /// chain (outermost field first) for a member-array slice argument —
+  /// the borrow then covers only that FIELD of `root`, so `emitCall`'s
+  /// aliasing guard can admit disjoint sibling fields of one struct
+  /// while still rejecting prefix-overlapping borrows. Every other
+  /// argument shape leaves the path empty (a whole-object borrow, which
+  /// collides with everything under the same root — the historical
+  /// behavior).
+  FailureOr<Value> emitBorrowArgument(
+      Location loc, const clang::Expr *argument, Type paramType,
+      const clang::VarDecl *&root,
+      SmallVectorImpl<const clang::FieldDecl *> *rootPath = nullptr);
+
+  /// FR-74: matches a member-array slice ARGUMENT — a dot/arrow
+  /// projection chain ending at a fixed-extent array-typed field —
+  /// against the admitted base forms: a LOCAL struct place (dot chains,
+  /// nested) or an arrow at the chain root through a ref/mut_ref-struct
+  /// pointer parameter (the one pointer convention whose member place
+  /// is the pointee itself rather than a staged copy or a decomposed
+  /// cursor). On a match, `chainRoot` receives the root variable and
+  /// `path` the field chain (outermost first). A non-match returns
+  /// false WITHOUT diagnosing so the caller falls through to the
+  /// historical verbatim rejection: global roots (their member place is
+  /// a staged copy — a mutable slice of it would silently lose the
+  /// callee's writes), unions (arms overlap), byte-region records
+  /// (subscript-of-region model), and every unprovable base.
+  bool matchMemberArraySliceArg(const clang::MemberExpr *member,
+                                bool isMutParam,
+                                const clang::VarDecl *&chainRoot,
+                                SmallVectorImpl<const clang::FieldDecl *> &path);
 
   /// Returns whether any declaration reference below `stmt` names a
   /// decomposed pointer (a pointer local or slice parameter registered in
