@@ -325,6 +325,9 @@ _BLOCKER_SUBSTRINGS = [
     ("pointer struct member of an externally", "pointer-member-cross-tu"),
     ("static-binding model", "self-ref-pointer-member"),
     ("variadic function", "variadic-cross-tu"),
+    # FR-77: a fn-ptr constant naming a function no TU defines is refused at
+    # the address-taking site, so the containing item carries the blocker.
+    ("address of undefined function", "fnptr-undefined-target"),
     # FR-50: not a blocker of its own -- the item names a type some OTHER
     # item's rejection removed. FR-49's root-blocker table credits the real
     # cause; this tag only keeps the cascade out of the "other" bucket.

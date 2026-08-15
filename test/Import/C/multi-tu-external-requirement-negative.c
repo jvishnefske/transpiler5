@@ -18,12 +18,17 @@ int unrelated(int v) { return v; }
 // which spells the item out directly. The trait's type parameter cannot reach
 // inside that text, so routing the CALL through `E::host_op` would leave the
 // fn-pointer reference dangling. The whole symbol therefore keeps rejecting.
+// FR-77 moved the rejection FORWARD, from finalizeProject's
+// referenced-but-not-defined walk to the address-taking site itself (the
+// walk cannot see an opaque `Some(<name>)`, so an initializer-only reference
+// used to escape it entirely); the pin follows: same refusal, now located on
+// the address-taking expression with the FR-77 wording.
 int host_op(int v);
 
 int apply(int (*f)(int), int v) { return f(v); }
 
 int run(int v) { return apply(host_op, v) + host_op(v); }
-// ADDR: error: unsupported: function 'host_op' is referenced but not defined in any translation unit
+// ADDR: addr-taken.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: taking the address of undefined function 'host_op'
 
 //--- global-addr.c
 // FR-70 revised FR-52's blanket refusal of undefined external OBJECTS: a

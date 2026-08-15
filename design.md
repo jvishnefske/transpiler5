@@ -4626,6 +4626,71 @@ piece and becomes FR-45.
   forward to a struct-pointer component, same wording. cJSON's hooks
   stay frontier on their void* RESULT type (not a param question).
   Full suite 593/593.
+  EXTERNAL RE-PROBE (same day): ported 97 -> 100 on the tinycrypt/cJSON
+  corpus — and the probe EXPOSED FR-77 (below): tinycrypt ecc.c became
+  the corpus's first CRATE_NOBUILD (rustc E0425), the fail-loudly gap
+  at the recovery seam that FR-76's type admission made reachable.
+
+- [x] FR-77 Fn-ptr constants naming an unemitted function must fail
+  loudly at finalize — and recovery must attribute the drop (found
+  2026-08-14 by the external probe: post-FR-76, tinycrypt ecc.c's
+  `static uECC_RNG_Function g_rng_function = &default_CSPRNG;` emits
+  `Some(default_csprng)` in the thread_local initializer while
+  `default_CSPRNG` (extern, defined in another TU) is not emitted —
+  rustc E0425, the corpus's first CRATE_NOBUILD). Mechanism: a fn-ptr
+  constant is an OPAQUE attr, not a SymbolUse — FR-52's entry records
+  this exact hazard for the rename case — so finalizeProject's
+  referenced-but-not-defined walk never sees the reference; in strict
+  mode some OTHER use usually rejects the TU first, but in --recover /
+  --incremental those functions drop and the dangling initializer
+  survives to emission. Repo rule violated: a recovered item reaching
+  emission unresolved must fail loudly THERE — a broken crate is loud
+  but unattributed and costs the whole unit. Fix, two layers per the
+  FR-52 marker precedent: (1) finalizeProject walks every fn-ptr
+  constant attr (reuse the FR-52 Some(f) walk) and any name not
+  resolving to an emitted definition is a LOCATED rejection at the
+  initializer/assignment site ("cannot take the address of undefined
+  function 'x'" family — requirements are values a generic trait item
+  cannot provide, so requirement-resolved names reject identically);
+  (2) under recovery the rejection attributes to the CONTAINING item
+  (the global and transitively its readers) so the crate still emits
+  without it — restoring the per-item cost model. Backstop: the Rust
+  emitter refuses a fn-ptr constant naming a symbol absent from the
+  module (marker-contract style), so a future planner change cannot
+  silently regress. Gates: Import pin (strict: located rejection;
+  wording pinned) + recovery pin (crate builds, global dropped,
+  PORTING.md blocker attributed) via a two-TU fixture where TU2
+  defines the function (multi-TU import stays accepted — the
+  cross-TU definition case must keep working); EndToEnd: the ecc
+  shape reduced (static fn-ptr = &extern_fn, callers recovered)
+  builds and byte-diffs with the definition present; external
+  re-probe restores tinycrypt 15/15 CRATE_BUILDS (evidence); full
+  lit 100%.
+  **SPIKE VERDICT: GO (2026-08-14).** Two premise corrections the spike
+  measured: STRICT mode was broken too (an initializer-only reference
+  emits the dangling crate even without recovery — the design entry
+  under-claimed), and the fix does NOT belong at
+  isExternalRequirementShape (it already excludes address-taken names
+  — verified); the sole escape is the ERASE-UNUSED branch
+  (symbolKnownUseEmpty -> func.erase) running before every check,
+  because a fn-ptr constant is an opaque attr with no SymbolUse. Set
+  completeness proven by reading every Some(<name>) production site:
+  all route through resolveFunctionPointerDecl/Target into
+  fnPointerTargetSymbols — upgraded to a StringMap<Location> so the
+  finalize rejection is LOCATED at the first resolution site. Layered
+  fix as landed: (1) finalize consults the map before erasing (defer
+  mode marks emitrust.extern_decl instead — the link shard previously
+  ERASED the prototype and the FR-58 link step never learned the
+  obligation); (2) recovery rejects at the USE site inside the
+  per-decl walk, where drop + transitive reader-stub + progress-JSON
+  attribution already exist (proven by probe — zero new dataflow
+  machinery); (3) emitter backstop refuses a fn_ptr-typed
+  Some(<ident>) naming a symbol absent from the module, RECURSING into
+  ArrayAttr aggregate initializers (the FR-52 global check did not —
+  fnptr tables escaped it) while Some(0i64)/qualified spellings pass.
+  Wording: "taking the address of undefined function 'X'". Motivating
+  case re-proven: ecc.c:62:43 located warning, g_rng_function dropped
+  [fnptr-undefined-target], crate BUILDS. Full suite 598/598.
 
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the

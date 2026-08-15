@@ -121,6 +121,11 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
      llvm::StringLiteral("self-ref-pointer-member")},
     {llvm::StringLiteral("variadic function"),
      llvm::StringLiteral("variadic-cross-tu")},
+    // FR-77: a fn-ptr constant naming a function no TU defines is refused at
+    // the address-taking site, so under recovery the CONTAINING item (a
+    // global initializer, typically) carries the blocker.
+    {llvm::StringLiteral("address of undefined function"),
+     llvm::StringLiteral("fnptr-undefined-target")},
     {llvm::StringLiteral("was rejected, so a type naming it"),
      llvm::StringLiteral("rejected-type-cascade")},
 };
