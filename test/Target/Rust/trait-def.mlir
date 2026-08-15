@@ -3,23 +3,28 @@
 // getter/setter pair of ordinary associated functions -- `fn g_config() ->
 // i32` / `fn set_g_config(v0: i32)` -- so this golden also pins that exact
 // spelling and the expression/statement rendering of their call sites.
+// FR-79 adds the BY-VALUE STRUCT getter of a const-struct requirement --
+// `fn cfg() -> S;` -- and pins that its call site binds a Copy temporary on
+// which field projection is ordinary member access.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
 // The trait is ALWAYS `pub`, even here where nothing asked for exported
 // items: a requirement the crate's consumer cannot name is a requirement
 // nobody can satisfy. A global's getter/setter items need no special
 // rendering at all: they are `() -> T` and `(T) -> ()` associated functions
-// like any other.
+// like any other -- including FR-79's struct-returning getter, whose `T` is
+// just a struct type.
 // CHECK:      pub trait Externals {
 // CHECK-NEXT:     fn host_scale(v0: i32) -> i32;
 // CHECK-NEXT:     fn host_reset();
 // CHECK-NEXT:     fn host_mix(v0: i32, v1: f64) -> f64;
 // CHECK-NEXT:     fn g_config() -> i32;
 // CHECK-NEXT:     fn set_g_config(v0: i32);
+// CHECK-NEXT:     fn cfg() -> S;
 // CHECK-NEXT: }
 emitrust.trait_def @Externals
-    ["host_scale", "host_reset", "host_mix", "g_config", "set_g_config"]
-    [(i32) -> i32, () -> (), (i32, f64) -> f64, () -> i32, (i32) -> ()]
+    ["host_scale", "host_reset", "host_mix", "g_config", "set_g_config", "cfg"]
+    [(i32) -> i32, () -> (), (i32, f64) -> f64, () -> i32, (i32) -> (), () -> !emitrust.struct<"S">]
 
 // FR-70: a getter call is a result-bearing opaque call, so its value binds
 // (or folds) exactly where the global load's value flowed; a setter call is
@@ -36,6 +41,29 @@ emitrust.func @bump(%arg0: i32) -> i32
   %1 = emitrust.add %0, %arg0 : i32
   emitrust.call_opaque "E::set_g_config"(%1) : (i32) -> ()
   emitrust.return %0 : i32
+}
+
+// FR-79: the struct getter's call site is nothing special either -- the
+// result-bearing opaque call binds a Copy temporary of the struct type, and
+// the field read is plain member access on that temporary (never on the
+// erased global). The struct itself renders with the usual Copy derive,
+// which is what makes the by-value return a faithful read.
+// CHECK:      struct S {
+// CHECK:      fn read_cfg<E: Externals>() -> i32 {
+// CHECK-NEXT:     let v0: S = E::cfg();
+// CHECK-NEXT:     let v1: S;
+// CHECK-NEXT:     v1 = v0;
+// CHECK-NEXT:     v1.x
+// CHECK-NEXT: }
+emitrust.struct_def @S ["x", "y"] [i32, i32]
+emitrust.func @read_cfg() -> i32
+    attributes {emitrust.externals_generic = "Externals"} {
+  %0 = emitrust.call_opaque "E::cfg"() : () -> !emitrust.struct<"S">
+  %1 = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"S">>
+  emitrust.assign %1 = %0 : !emitrust.lvalue<!emitrust.struct<"S">>
+  %2 = emitrust.member %1["x"] : (!emitrust.lvalue<!emitrust.struct<"S">>) -> !emitrust.lvalue<i32>
+  %3 = emitrust.load %2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %3 : i32
 }
 
 // A function in the closure carries the bound; the call sites were already
