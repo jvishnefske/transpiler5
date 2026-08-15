@@ -71,6 +71,7 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -5939,6 +5940,15 @@ private:
   /// True once the `__emitrust_cstr_n_out` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool cStrNOutHelperEmitted = false;
+  /// (rows, cols) shapes for which a 2D-array-pointer cast argument
+  /// (FR-92, `Cipher((state_t*)buf, ...)`) has been imported; each
+  /// triggers the one-per-module emission of the matching
+  /// `__emitrust_chunk_<R>x<C>` helper that reshapes a `&mut [u8]` view
+  /// into `&mut [[u8; C]; R]` (`as_chunks_mut` + `try_into`).
+  llvm::SetVector<std::pair<int64_t, int64_t>> neededChunkHelpers;
+  /// Shapes whose `__emitrust_chunk_<R>x<C>` helper has been emitted, so
+  /// a multi-TU import never emits one twice.
+  llvm::DenseSet<std::pair<int64_t, int64_t>> emittedChunkHelpers;
   /// True once an argv-fed `%c` hole has been imported (C99-43 C3);
   /// triggers emission of the raw `__emitrust_byte_out` helper (one raw
   /// byte via `write_all`, bypassing the ASCII-only `__emitrust_fmt_c`
@@ -7037,12 +7047,34 @@ static inline const clang::ParmVarDecl *asPointerParamRef(const clang::Expr *exp
   return param;
 }
 
+/// Returns whether `expr` is a bare reference to a pointer parameter whose
+/// pointee is a CONSTANT-SIZE ARRAY (`state_t *` = `uint8_t (*)[4][4]`,
+/// tiny-AES-c's Cipher family) — the FR-92 forwarding shape.
+static inline bool isForwardedArrayPointerParam(const clang::Expr *expr) {
+  const clang::ParmVarDecl *param = asPointerParamRef(expr);
+  return param && param->getType()
+                      .getCanonicalType()
+                      ->getPointeeType()
+                      ->isConstantArrayType();
+}
+
 /// Recursive walk of `classifyPointerParams`: collects every pointer
 /// parameter whose use demands the whole element run. A direct dereference
 /// (`*p`) or arrow (`p->f`) is benign and keeps the parameter a scalar
 /// reference; any other appearance of a pointer parameter (subscript,
 /// arithmetic, comparison, difference, reassignment, copy into a pointer
-/// local, address-of, call argument) inserts it into `sliceParams`.
+/// local, address-of, call argument) inserts it into `sliceParams` —
+/// EXCEPT (FR-92) a pointer-to-CONSTANT-SIZE-ARRAY parameter in the CALL
+/// ARGUMENT position (`Cipher(state, rk)` forwarding `state_t *`,
+/// aes.c:413/439): a slice cannot view array elements
+/// (`SliceType::isValidElementType` rejects them), so the Slice class
+/// could only ever reject, while the scalar whole-array reference
+/// (`&mut [[u8; 4]; 4]`) forwards as the bare call operand (Rust's
+/// implicit reborrow). The exception is POSITIONAL, exactly like the
+/// deref/arrow benign cases: any other appearance (a subscript
+/// `a[i][j]`, arithmetic, reassignment) still classifies Slice so its
+/// historical located rejection is untouched (array-params-invalid.c's
+/// multidim pin).
 static inline void collectSliceParams(
     const clang::Stmt *stmt,
     llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &sliceParams) {
@@ -7055,6 +7087,23 @@ static inline void collectSliceParams(
   if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(stmt))
     if (member->isArrow() && asPointerParamRef(member->getBase()))
       return; // Benign arrow access; the base has no other children.
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
+    bool anyForwarded = false;
+    for (const clang::Expr *arg : call->arguments())
+      if (isForwardedArrayPointerParam(arg)) {
+        anyForwarded = true;
+        break;
+      }
+    if (anyForwarded) {
+      // Walk the callee and the non-forwarding arguments only; the
+      // forwarded whole-array references stay scalar.
+      collectSliceParams(call->getCallee(), sliceParams);
+      for (const clang::Expr *arg : call->arguments())
+        if (!isForwardedArrayPointerParam(arg))
+          collectSliceParams(arg, sliceParams);
+      return;
+    }
+  }
   if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
     if (const auto *param =
             llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()))
