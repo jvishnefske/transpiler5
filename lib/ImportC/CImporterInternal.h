@@ -1510,6 +1510,18 @@ private:
   /// library).
   bool externalRequirementsAllowed();
 
+  /// FR-75: the classify-time approximation of `externalRequirementsAllowed`
+  /// — whether a body-less function imported from the CURRENT AST may become
+  /// a trait requirement, decided before `finalizeProject` can run. True for
+  /// `ExternalRequirements::Trait`; for `TraitWhenLibrary` true iff this
+  /// TU's AST defines no `main` (the same predicate `finalizeProject`
+  /// applies to the merged module, evaluated per TU — for a multi-TU project
+  /// whose `main` lives in ANOTHER TU the two can diverge, and every
+  /// divergent outcome is a located rejection, never silent). Always false
+  /// under `deferExternals` (FR-57a is untouched by FR-75). Gates the eager
+  /// slice classification in `classifyPointerParams`; cached per AST.
+  bool classifyTimeTraitEligible();
+
   /// FR-52: whether `func` — a referenced body-less external — is a shape the
   /// external-requirement trait can express: a free function (not a C++
   /// member), whose address is never taken, and every one of whose symbol
@@ -1804,8 +1816,13 @@ private:
   /// derive from the definition's body via `collectSliceParams`; a function
   /// with no definition in the merged ASTs classifies every pointer
   /// parameter as `ScalarRef` (the cross-TU assumption checked at
-  /// definition-time signature refinement in `importFunction`). Results are
-  /// cached per canonical declaration.
+  /// definition-time signature refinement in `importFunction`) — EXCEPT
+  /// under FR-75's trait gate (C mode, `classifyTimeTraitEligible`), where
+  /// a body-less function's arithmetic-pointee data-pointer parameters
+  /// classify as SLICES eagerly (a requirement signature must carry the C
+  /// region contract, not one element) and a `void *` parameter joins by
+  /// TU-wide call-site consensus (`voidParamCallSitesAllByteViews`).
+  /// Results are cached per canonical declaration.
   ArrayRef<ParamKind> classifyPointerParams(const clang::FunctionDecl *func);
 
   /// Principal-kind classification of a data-pointer return type (CTS-P2):
@@ -5247,6 +5264,9 @@ private:
   /// read through `voidByteSliceElem`.
   llvm::DenseMap<const clang::FunctionDecl *, SmallVector<clang::QualType, 4>>
       voidByteElemsCache;
+  /// FR-75: per-AST cache of `classifyTimeTraitEligible`'s TraitWhenLibrary
+  /// leg (whether the TU's AST defines no `main`); each TU is scanned once.
+  llvm::DenseMap<const clang::ASTContext *, bool> classifyTimeTraitCache;
   /// CTS 00204 va_list monomorphization plans, keyed by the variadic
   /// definition's canonical declaration (per-AST decls; entries from
   /// different TUs never conflict).
@@ -6905,6 +6925,73 @@ static inline bool voidParamByteUsesOk(const clang::Stmt *stmt,
       return false; // A use no byte conversion consumed.
   for (const clang::Stmt *child : stmt->children())
     if (!voidParamByteUsesOk(child, param, elem))
+      return false;
+  return true;
+}
+
+/// FR-75: one call-site argument of the `void *` consensus scan. Returns
+/// whether `arg` is an admissible byte VIEW: after the implicit argument
+/// adjustments (decay, the cast to `void *`), the underlying expression's
+/// type is a byte array or a byte pointer (`char` / `unsigned char`
+/// element — which `uint8_t` canonicalizes to). `elem` accumulates the
+/// element (canonical, unqualified) across the walk exactly like FR-71's
+/// body scan: mixed byte pointees make the element ambiguous and decline.
+/// Deliberately a TYPE-shape test only — a byte-typed argument that still
+/// has no region behind it (`&x` on a scalar) is admitted here and then
+/// rejected LOCATED at the call-site slice lowering, so over-admission
+/// can never silently borrow one element.
+static inline bool voidParamCallSiteByteViewOk(const clang::Expr *arg,
+                                               clang::ASTContext &ctx,
+                                               clang::QualType &elem) {
+  const clang::Expr *e = arg->IgnoreParenImpCasts();
+  clang::QualType type = e->getType();
+  clang::QualType pointee;
+  if (const clang::ArrayType *array = ctx.getAsArrayType(type))
+    pointee = array->getElementType();
+  else if (type->isPointerType())
+    pointee = type->getPointeeType();
+  else
+    return false;
+  pointee = pointee.getCanonicalType().getUnqualifiedType();
+  if (!ctx.hasSameType(pointee, ctx.CharTy) &&
+      !ctx.hasSameType(pointee, ctx.UnsignedCharTy))
+    return false;
+  if (elem.isNull())
+    elem = pointee;
+  else if (!ctx.hasSameType(elem, pointee))
+    return false; // Mixed byte pointees: the element is ambiguous.
+  return true;
+}
+
+/// FR-75: the CALL-SITE CONSENSUS scan for a declaration-only `void *`
+/// parameter under a trait policy. FR-71's admission is a body-usage fact
+/// and cannot run without a body, so a body-less function's `void *`
+/// parameter is admitted from the OUTSIDE instead: every direct call to
+/// `callee` below `stmt` must pass an admissible byte view (one
+/// consistent element, `voidParamCallSiteByteViewOk`) in position
+/// `index`. `sawCall` records that at least one call site exists — a
+/// parameter no call constrains has no consensus to join and keeps the
+/// verbatim rejection. Any non-byte or non-view call site returns false.
+static inline bool voidParamCallSitesAllByteViews(
+    const clang::Stmt *stmt, const clang::FunctionDecl *callee,
+    unsigned index, clang::QualType &elem, bool &sawCall) {
+  if (!stmt)
+    return true;
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
+    const clang::FunctionDecl *direct = call->getDirectCallee();
+    if (direct &&
+        direct->getCanonicalDecl() == callee->getCanonicalDecl()) {
+      if (index >= call->getNumArgs())
+        return false;
+      sawCall = true;
+      if (!voidParamCallSiteByteViewOk(call->getArg(index),
+                                       direct->getASTContext(), elem))
+        return false;
+    }
+  }
+  for (const clang::Stmt *child : stmt->children())
+    if (!voidParamCallSitesAllByteViews(child, callee, index, elem,
+                                        sawCall))
       return false;
   return true;
 }

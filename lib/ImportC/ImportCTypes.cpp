@@ -909,8 +909,63 @@ CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
                                             clang::QualType());
   // The classification is a property of the definition's body; without a
   // definition in the merged ASTs every pointer parameter stays a scalar
-  // reference (checked at definition-time signature refinement).
+  // reference (checked at definition-time signature refinement) — EXCEPT
+  // the FR-75 requirement gate below.
   const clang::FunctionDecl *definition = func->getDefinition();
+  // FR-75: a body-less function under a trait policy is (prospectively) a
+  // REQUIREMENT on the environment, and a requirement signature must carry
+  // the C region contract: `unsigned char *buf` means a region an
+  // implementor may touch anywhere in, so a scalar reference (`&mut u8`,
+  // one element) misrepresents it. Every arithmetic-pointee data-pointer
+  // parameter therefore classifies as a SLICE eagerly — `mapParamType`'s
+  // existing Slice branch produces `&mut [T]` (`&[u8]` for the const-u8
+  // flavor, FR-55/CTS-BR) and the type-driven call-site lowering produces
+  // region views at each argument's cursor; a call site with no region
+  // behind it keeps its located rejection (never a silent one-element
+  // borrow). A `void *` parameter has no pointee to classify from and no
+  // body for FR-71's scan, so it joins by CALL-SITE CONSENSUS: a TU-wide
+  // AST scan admits it as a byte-slice cursor iff every direct call site
+  // passes an admissible byte view with one consistent element; anything
+  // else keeps the verbatim void-pointer rejection. C-only, gated by
+  // `classifyTimeTraitEligible` (never under FR-57a defer; for
+  // `TraitWhenLibrary` only when this TU defines no `main`), so bin
+  // crates, the c-testsuite ledger, and defer mode keep their historical
+  // scalar shapes byte-for-byte. Non-arithmetic pointees (structs,
+  // pointer-to-array) deliberately keep today's classification: the FR-75
+  // mandate is the scalar-pointer region contract.
+  if ((!definition || !definition->hasBody()) && !func->isVariadic() &&
+      !astContext().getLangOpts().CPlusPlus && classifyTimeTraitEligible()) {
+    for (auto [index, param] : llvm::enumerate(func->parameters())) {
+      clang::QualType type = param->getType();
+      if (!isDataPointer(type))
+        continue;
+      clang::QualType pointee =
+          type.getCanonicalType()->getPointeeType().getCanonicalType();
+      if (pointee->isVoidType()) {
+        clang::QualType elem;
+        bool sawCall = false;
+        bool allByteViews = true;
+        for (const clang::Decl *decl :
+             astContext().getTranslationUnitDecl()->decls()) {
+          const auto *fn = llvm::dyn_cast<clang::FunctionDecl>(decl);
+          if (!fn || !fn->doesThisDeclarationHaveABody())
+            continue;
+          if (!voidParamCallSitesAllByteViews(fn->getBody(), func, index,
+                                              elem, sawCall)) {
+            allByteViews = false;
+            break;
+          }
+        }
+        if (allByteViews && sawCall && !elem.isNull()) {
+          kinds[index] = ParamKind::Slice;
+          byteElems[index] = elem;
+        }
+        continue;
+      }
+      if (pointee->isArithmeticType())
+        kinds[index] = ParamKind::Slice;
+    }
+  }
   if (definition && definition->hasBody() &&
       definition->getNumParams() == kinds.size()) {
     llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> sliceParams;

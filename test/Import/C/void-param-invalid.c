@@ -71,7 +71,10 @@ int truthmix(void *p) {
 
 // A declaration WITHOUT a body cannot qualify: the admission is a
 // body-usage fact of the definition (keeps the Driver ledger golden for
-// declaration-only void* signatures stable).
+// declaration-only void* signatures stable). FR-75's call-site CONSENSUS
+// admission for declaration-only void* params is TRAIT-MODE only (see
+// external-requirement-void-consensus.c); this bin-mode run never
+// reaches it.
 // DECLONLY: declonly.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: void pointer parameter
 
 //--- declonly.c
