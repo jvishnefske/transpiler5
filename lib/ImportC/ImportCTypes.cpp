@@ -667,7 +667,8 @@ FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
 }
 
 FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
-                                        ParamKind kind) {
+                                        ParamKind kind,
+                                        clang::QualType voidByteElem) {
   // C99-7: qualifiers on the parameter OBJECT itself are body-local and
   // never part of the function type (C11 6.7.6.3p15 composite rules;
   // `int x[volatile 5]` adjusts to `int * volatile x`, c-testsuite
@@ -750,9 +751,24 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     if (kind == ParamKind::Carrier)
       return Type(builder.getIntegerType(64));
     // A `void *` parameter has no element type to classify against and no
-    // region to join at the call boundary (CTS-P9).
-    if (pointee.getCanonicalType()->isVoidType())
+    // region to join at the call boundary (CTS-P9) — EXCEPT the FR-71
+    // byte-cursor admission: when the body scan proved every use converts
+    // to one consistent byte pointee, the parameter maps as that byte
+    // slice (the element rides in through `voidByteElem`; the `void`
+    // pointee itself carries the constness, so `const void *` borrows
+    // shared exactly like a walked `const uint8_t *`).
+    if (pointee.getCanonicalType()->isVoidType()) {
+      if (kind == ParamKind::Slice && !voidByteElem.isNull()) {
+        FailureOr<Type> inner = mapType(voidByteElem, loc);
+        if (failed(inner))
+          return failure();
+        auto slice = emitrust::SliceType::get(*inner);
+        if (pointee.isConstQualified())
+          return Type(emitrust::RefType::get(slice));
+        return Type(emitrust::MutRefType::get(slice));
+      }
       return emitError(loc) << "unsupported: void pointer parameter";
+    }
     // A pointee that is itself a *data* pointer has no representation
     // (CTS-P5); a function-pointer pointee is an ordinary Copy value
     // (`!emitrust.fn_ptr`) and slices/references over it are fine — the
@@ -889,6 +905,8 @@ CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
   if (it != paramKindsCache.end())
     return it->second;
   SmallVector<ParamKind, 4> kinds(func->getNumParams(), ParamKind::ScalarRef);
+  SmallVector<clang::QualType, 4> byteElems(func->getNumParams(),
+                                            clang::QualType());
   // The classification is a property of the definition's body; without a
   // definition in the merged ASTs every pointer parameter stays a scalar
   // reference (checked at definition-time signature refinement).
@@ -904,20 +922,41 @@ CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
       // overrides the per-body slice classification.
       if (cellSliceParams.contains(param))
         kinds[index] = ParamKind::CellSlice;
-      // A `void *` parameter that the body only ever truth-tests is an
-      // integer carrier (CTS-P3): it lowers as a plain i64 and call sites
-      // pass carrier values. Any other `void *` parameter keeps the
-      // historical rejection in `mapParamType`.
-      if (isDataPointer(param->getType()) &&
+      bool isVoidPointerParam =
+          isDataPointer(param->getType()) &&
           param->getType()
               .getCanonicalType()
               ->getPointeeType()
               .getCanonicalType()
-              ->isVoidType() &&
-          voidParamOnlyTruthTested(definition->getBody(), param))
+              ->isVoidType();
+      // A `void *` parameter that the body only ever truth-tests is an
+      // integer carrier (CTS-P3): it lowers as a plain i64 and call sites
+      // pass carrier values.
+      if (isVoidPointerParam &&
+          voidParamOnlyTruthTested(definition->getBody(), param)) {
         kinds[index] = ParamKind::Carrier;
+        continue;
+      }
+      // FR-71: a `void *` parameter whose EVERY use converts to ONE
+      // consistent byte pointee (`uint8_t *`/`unsigned char *`/`char *`
+      // — the tinycrypt `_set`/`_compare` shape) is a byte-slice cursor:
+      // it classifies `Slice` with the scanned element recorded for
+      // `mapParamType` (a `void *` has no pointee to derive it from).
+      // C-only by design — the C++ `static_cast` shape diverts before
+      // this and keeps its verbatim rejection. Any `void *` parameter
+      // neither scan admits keeps the historical rejection in
+      // `mapParamType`.
+      if (isVoidPointerParam && !astContext().getLangOpts().CPlusPlus) {
+        clang::QualType elem;
+        if (voidParamByteUsesOk(definition->getBody(), param, elem) &&
+            !elem.isNull()) {
+          kinds[index] = ParamKind::Slice;
+          byteElems[index] = elem;
+        }
+      }
     }
   }
+  voidByteElemsCache.try_emplace(canonical, std::move(byteElems));
   auto [entry, inserted] =
       paramKindsCache.try_emplace(canonical, std::move(kinds));
   (void)inserted;

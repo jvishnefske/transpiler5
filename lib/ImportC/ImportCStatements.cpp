@@ -2192,6 +2192,22 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
     if (const auto *baseParam = llvm::dyn_cast<clang::ParmVarDecl>(base);
         baseParam && cursorParams.contains(baseParam))
       baseElement = baseElement.getCanonicalType()->getPointeeType();
+    // FR-71: a `void *` parameter admitted as a byte-slice cursor has no
+    // pointee of its own; its element unit is the byte element the
+    // admission scan proved (the same element the signature's slice
+    // carries), so the local's pointee validates against THAT. By
+    // construction they agree — the scan required every conversion to
+    // name one pointee — so a mismatch here would be a defect, and the
+    // located rejection below stays as the defensive net.
+    if (const auto *baseParam = llvm::dyn_cast<clang::ParmVarDecl>(base);
+        baseParam && baseElement.getCanonicalType()->isVoidType())
+      if (const auto *owner = llvm::dyn_cast<clang::FunctionDecl>(
+              baseParam->getDeclContext())) {
+        clang::QualType admitted = voidByteSliceElem(
+            owner, baseParam->getFunctionScopeIndex());
+        if (!admitted.isNull())
+          baseElement = admitted;
+      }
     if (!wildcard && !astContext().hasSameUnqualifiedType(pointee, baseElement))
       return emitError(bindLoc)
              << "unsupported: pointer element type does not match its "

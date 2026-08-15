@@ -1777,9 +1777,27 @@ private:
   /// `!emitrust.mut_ref<!emitrust.slice<T>>` for `ParamKind::Slice`
   /// (array parameters have already decayed to pointers in clang);
   /// function-pointer parameters stay by-value `!emitrust.fn_ptr` values;
-  /// everything else maps like `mapType` and ignores `kind`.
+  /// everything else maps like `mapType` and ignores `kind`. FR-71:
+  /// `voidByteElem`, when non-null, is the byte element the admission scan
+  /// proved a `void *` Slice parameter is walked as (see
+  /// `voidByteSliceElem`); a `void *` has no pointee of its own to derive
+  /// the element from, so it rides in beside `kind`.
   FailureOr<Type> mapParamType(clang::QualType type, Location loc,
-                               ParamKind kind);
+                               ParamKind kind,
+                               clang::QualType voidByteElem = clang::QualType());
+
+  /// FR-71: the byte element (`char` or `unsigned char`) the admission
+  /// scan recorded for the `index`th parameter of `func` — non-null
+  /// exactly when that parameter is a `void *` admitted as a byte-slice
+  /// cursor. Valid only after `classifyPointerParams(func)` (which fills
+  /// the cache); both existing signature builders call it first.
+  clang::QualType voidByteSliceElem(const clang::FunctionDecl *func,
+                                    unsigned index) const {
+    auto it = voidByteElemsCache.find(func->getCanonicalDecl());
+    if (it == voidByteElemsCache.end() || index >= it->second.size())
+      return clang::QualType();
+    return it->second[index];
+  }
 
   /// Returns the Phase-1b classification of every parameter of `func`
   /// (non-pointer parameters report `ScalarRef`, which is ignored). Kinds
@@ -5188,6 +5206,13 @@ private:
   /// declarations are distinct clang decls, so entries never conflict).
   llvm::DenseMap<const clang::FunctionDecl *, SmallVector<ParamKind, 4>>
       paramKindsCache;
+  /// FR-71: byte elements of `void *` parameters admitted as byte-slice
+  /// cursors, keyed like `paramKindsCache` (canonical declaration) and
+  /// index-aligned with its entry; a null slot (or an absent entry) means
+  /// the parameter was not admitted. Filled by `classifyPointerParams`,
+  /// read through `voidByteSliceElem`.
+  llvm::DenseMap<const clang::FunctionDecl *, SmallVector<clang::QualType, 4>>
+      voidByteElemsCache;
   /// CTS 00204 va_list monomorphization plans, keyed by the variadic
   /// definition's canonical declaration (per-AST decls; entries from
   /// different TUs never conflict).
@@ -6745,6 +6770,56 @@ static inline bool voidParamOnlyTruthTested(const clang::Stmt *stmt,
       return false; // A use that no truth-test context consumed.
   for (const clang::Stmt *child : stmt->children())
     if (!voidParamOnlyTruthTested(child, param))
+      return false;
+  return true;
+}
+
+/// FR-71: the byte-cursor admission scan for a `void *` parameter.
+/// Returns whether EVERY use of `param` below `stmt` is a conversion
+/// (implicit or explicit `CK_BitCast`) to ONE consistent byte-pointee
+/// pointer type — `char *` or `unsigned char *` (which `uint8_t *`
+/// canonicalizes to); `elem` accumulates that pointee (canonical,
+/// unqualified) across the walk. Such a parameter acts exactly like a
+/// byte pointer the body renamed, so it admits as a byte-slice cursor
+/// (`ParamKind::Slice` with `elem` as the slice element). The scan is
+/// deliberately conservative, mirroring `voidParamOnlyTruthTested`: any
+/// reference of `param` that no qualifying conversion consumed — a
+/// non-byte or mixed-pointee conversion, arithmetic, comparison, a store
+/// of the pointer itself, a return, a truth test, a call argument —
+/// returns false, keeping the historical void-pointer-parameter
+/// rejection verbatim. A body with NO use at all leaves `elem` null and
+/// the caller declines the admission (an unused `void *` is already the
+/// integer-carrier class, CTS-P3).
+static inline bool voidParamByteUsesOk(const clang::Stmt *stmt,
+                                       const clang::ParmVarDecl *param,
+                                       clang::QualType &elem) {
+  if (!stmt)
+    return true;
+  if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(stmt))
+    if ((llvm::isa<clang::ImplicitCastExpr>(cast) ||
+         llvm::isa<clang::CStyleCastExpr>(cast)) &&
+        cast->getCastKind() == clang::CK_BitCast &&
+        asPointerParamRef(cast->getSubExpr()) == param) {
+      clang::QualType to = cast->getType().getCanonicalType();
+      if (!to->isPointerType())
+        return false;
+      clang::ASTContext &ctx = param->getASTContext();
+      clang::QualType pointee =
+          to->getPointeeType().getCanonicalType().getUnqualifiedType();
+      if (!ctx.hasSameType(pointee, ctx.CharTy) &&
+          !ctx.hasSameType(pointee, ctx.UnsignedCharTy))
+        return false; // Non-byte pointee: outside the subset.
+      if (elem.isNull())
+        elem = pointee;
+      else if (!ctx.hasSameType(elem, pointee))
+        return false; // Mixed byte pointees: the element is ambiguous.
+      return true; // The conversion consumed the reference below it.
+    }
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (ref->getDecl() == param)
+      return false; // A use no byte conversion consumed.
+  for (const clang::Stmt *child : stmt->children())
+    if (!voidParamByteUsesOk(child, param, elem))
       return false;
   return true;
 }

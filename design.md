@@ -4331,6 +4331,67 @@ piece and becomes FR-45.
   `extern int g_config` + accessor under default `auto` now emits the
   trait crate — the exact Track 5 shape. Full suite 576/576.
 
+- [x] FR-71 `void *` parameter as byte cursor for the provably-byte-typed
+  subset (top-ranked diagnostic of the 2026-08-14 Track 5 spot
+  re-measurement: x10, the root of most of tinycrypt's residual cascade
+  via its `_set(void *to, uint8_t val, unsigned len)` memset-alike and
+  `_compare(const void *, const void *, size_t)`). Today ANY void*
+  parameter is a located type-level rejection
+  (ImportCTypes.cpp:755) that disqualifies the function and cascades to
+  every caller. The provable subset: a void* PARAMETER qualifies iff
+  every use of it inside the function body is (a) an implicit or
+  explicit conversion to ONE consistent byte-pointee pointer type
+  (uint8_t* / unsigned char* / char* — i8/u8), including
+  initialization of a byte-pointer local from it, or (b) a direct
+  argument to a recognized byte-family libc call (memset/memcpy/
+  memcmp/memmove) the importer already models. A qualifying param
+  imports exactly as a byte-array cursor param under the existing
+  (backing, cursor) convention — no new ops, no new types; the
+  const-qualified form maps like a const byte pointer. Everything else
+  keeps the verbatim rejection: a use converting to a non-byte pointee,
+  pointer arithmetic at non-byte width, storing the void* into any
+  place, returning it, comparing it against another pointer, void*
+  RESULTS, void* in composite positions (struct field/global), and
+  variadic/fn-ptr signatures naming void*. Call sites: an argument
+  passing an admissible byte view (char/uint8 array, byte cursor)
+  lowers as the cursor convention already does; any other argument
+  shape (struct pointer, non-byte array) is a LOCATED call-site
+  rejection — the concession is per-function, never a silent cast.
+  Gates: Import pins test/Import/C/void-param-byte.c (the _set and
+  _compare shapes at IR level: cursor param convention, byte loads/
+  stores through the cast, const form) and void-param-invalid.c
+  frontier additions (non-byte conversion, store of the param, void*
+  result, struct-pointer call site — verbatim wordings); EndToEnd
+  byte-diff test/EndToEnd/void-param-byte.c (memset-alike + compare
+  over stack arrays, argc-seeded, vs clang native); full lit 100%;
+  C++ path untouched.
+  **SPIKE VERDICT: GO (2026-08-14).** The byte-typed sibling signature
+  already imports as ParamKind::Slice (ref/mut_ref<slice<ui8>> with the
+  (backing, cursor) pair) and the BODY path is already void*-transparent
+  — peelPointerCast (CTS-P9 pointee wildcard) peels the void*-mediated
+  casts in both the region analysis and store lowering — so the whole
+  change concentrates in classifyPointerParams + mapParamType (Carrier
+  bypass precedent) + call-site coercion; hand-captured IR round-trips
+  the full pass pipeline and the spliced crate byte-diffed the void*
+  ORIGINAL's clang native at two argc seeds. Constraints that shipped:
+  clause (b) was measured DEAD and dropped (the modeled memset/memcpy
+  emitters reject slice-param arguments — admitting it would only shift
+  the wording), so only clause (a) admits; the qualifying scan follows
+  the voidParamOnlyTruthTested conservative template with a per-param
+  byte-element side map (ParamKind carries no payload; mixed i8/u8
+  bodies decline); the C++ path is explicitly gated (!CPlusPlus — the
+  shared signature builder runs classifyPointerParams for C++ too) and
+  the .cpp rejection is pinned verbatim; frontier pins use MEASURED
+  per-shape wordings (store-into-global and struct-field shapes fire
+  earlier region wordings, not the param wording; declaration-only
+  signatures cannot qualify, keeping the Driver link-rejection golden).
+  The int-array call-site resolves to the element-mismatch wording (the
+  void-wildcard peel routes it there). Spike also EXPOSED a pre-existing
+  naming defect out of scope here: a STATIC leading-underscore function
+  (tu0__set) fails the crate's denied non_snake_case lint for any param
+  type — its fix is byte-identity-sensitive (CSymbolNaming/FR-40/crate
+  goldens) and is the recorded FR-72 candidate. Full suite 579/579.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
