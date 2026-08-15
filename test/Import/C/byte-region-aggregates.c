@@ -17,9 +17,10 @@
 // a static FAM-tail initializer folds into an EXTENDED image (this
 // overturns the previous C99-17 declaration-site rejection — only
 // runtime FAM-tail accesses reject now, see flexible-array-invalid.c).
-// Int-leaf records stay on the typed struct path unchanged, and FAM /
-// GNU zero-length members are tolerated (dropped, zero size
-// contribution) there too when unaccessed.
+// Int-leaf records stay on the typed struct path unchanged, and GNU
+// zero-length members are tolerated (dropped, zero size contribution)
+// there too when unaccessed; a gap-free Vec-mappable FAM leaf on a
+// typed record grows the FR-94/95 owned Vec tail field instead.
 //
 // RUN: split-file %s %t
 // RUN: emitrust-import-c %t/globals.c | FileCheck %s --check-prefix=GLOBALS --implicit-check-not=emitrust.struct_def
@@ -214,10 +215,13 @@ int main(void) {
 
 //--- typedfam.c
 // Int-leaf records stay on the TYPED struct path — the byte-region
-// model does not absorb them. FAM and GNU zero-length array members on
-// typed records are TOLERATED when unaccessed: they contribute zero
-// size and no field (the 00216 test_zero_init shape, with sub-level
-// designators zero-filling every sibling).
+// model does not absorb them. GNU zero-length array members on typed
+// records are TOLERATED when unaccessed: they contribute zero size and
+// no field (the 00216 test_zero_init shape, with sub-level designators
+// zero-filling every sibling). FR-95: a gap-free Vec-mappable FAM leaf
+// (SED's `int r[];`) instead grows the owned Vec tail field — its
+// local's tail defaults to the EMPTY Vec, matching C's zero-extent
+// local tail (any access panics, the loud direction).
 struct SEA { int i; int j; int k; int l; };
 struct SEB { struct SEA a; int r[1]; };
 struct SEC { struct SEA a; int r[0]; };
@@ -225,7 +229,7 @@ struct SED { struct SEA a; int r[]; };
 // TYPEDFAM-DAG: emitrust.struct_def @SEA ["i", "j", "k", "l"] [i32, i32, i32, i32]
 // TYPEDFAM-DAG: emitrust.struct_def @SEB ["a", "r"] [!emitrust.struct<"SEA">, !emitrust.array<1xi32>]
 // TYPEDFAM-DAG: emitrust.struct_def @SEC ["a"] [!emitrust.struct<"SEA">]
-// TYPEDFAM-DAG: emitrust.struct_def @SED ["a"] [!emitrust.struct<"SEA">]
+// TYPEDFAM-DAG: emitrust.struct_def @SED ["a", "r"] [!emitrust.struct<"SEA">, !emitrust.opaque<"Vec<i32>">]
 
 int printf(const char *, ...);
 

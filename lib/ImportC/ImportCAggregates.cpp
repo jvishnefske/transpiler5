@@ -628,18 +628,17 @@ LogicalResult CImporter::collectRecordFields(
     // RUNTIME accesses to the tail reject, with a dedicated located
     // wording (see `checkSpecialArrayMemberAccess`). GNU zero-length
     // array members (`T r[0];`) get the same zero-size, field-less
-    // treatment. FR-94 AMENDS the amendment: an ADMITTED tail (gap-free
-    // u8 FAM of a typed record, `famTailField`) grows a trailing OWNED
-    // `Vec<u8>` field — the allocation-backed tail representation; the
-    // translator drops `Copy` from the derive for exactly this field
-    // shape, and Clang's sizeof/offsetof folds are unaffected (the Vec is
-    // a Rust-side owner, not C layout).
+    // treatment. FR-94/95 AMEND the amendment: an ADMITTED tail (gap-free
+    // u8 or Vec-mappable FAM of a typed record, `famTailField`) grows a
+    // trailing OWNED `Vec<T>` field — the allocation-backed tail
+    // representation; the translator drops `Copy` from the derive for
+    // exactly this field shape, and Clang's sizeof/offsetof folds are
+    // unaffected (the Vec is a Rust-side owner, not C layout).
     if (field->getType()->isIncompleteArrayType()) {
       if (famTailField(record) == field) {
-        if (failed(appendField(
-                internName(mangleMemberName(field->getName())),
-                emitrust::OpaqueType::get(builder.getContext(), "Vec<u8>"),
-                fieldLoc, field->getName())))
+        if (failed(appendField(internName(mangleMemberName(field->getName())),
+                               famTailVecType(field), fieldLoc,
+                               field->getName())))
           return failure();
       }
       continue;

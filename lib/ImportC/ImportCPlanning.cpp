@@ -2072,6 +2072,40 @@ void CImporter::planFamLift(const clang::TranslationUnitDecl *unit) {
                     countExpr = sum->getLHS();
                   if (!countExpr || countExpr->HasSideEffects(ctx))
                     continue;
+                  // FR-95: a TYPED (non-u8) tail's count side is a byte
+                  // extent `k * sizeof(elem)` (heatshrink's
+                  // `buf_sz * sizeof(uint16_t)` — the factor folds
+                  // NUMERICALLY, so a uint16_t sizeof matches an int16_t
+                  // tail), possibly routed through its own never-rewritten
+                  // local (`size_t index_sz = k*sizeof(elem);
+                  // malloc(index_sz + sizeof(S))`, encoder.c:92-94). The
+                  // recorded count becomes the extracted ELEMENT count `k`;
+                  // an unmatched factor or the plain-add byte form keeps
+                  // the dedicated FAM-alloc rejection. The u8 arm keeps its
+                  // byte-count path untouched (bytes ARE elements).
+                  const clang::FieldDecl *tailField = famTailField(record);
+                  clang::QualType tailElement =
+                      ctx.getAsArrayType(tailField->getType())
+                          ->getElementType();
+                  if (!isU8ScalarType(tailElement)) {
+                    const clang::Expr *countSide = peelToCore(countExpr);
+                    if (const auto *countRef =
+                            llvm::dyn_cast<clang::DeclRefExpr>(countSide))
+                      if (const auto *countVar =
+                              llvm::dyn_cast<clang::VarDecl>(
+                                  countRef->getDecl());
+                          countVar && countVar->hasLocalStorage() &&
+                          !llvm::isa<clang::ParmVarDecl>(countVar) &&
+                          countVar->getInit() &&
+                          !mutatesVar(body, countVar))
+                        countSide = peelToCore(countVar->getInit());
+                    uint64_t elementBytes = static_cast<uint64_t>(
+                        ctx.getTypeSizeInChars(tailElement).getQuantity());
+                    countExpr =
+                        extractElementCount(ctx, countSide, elementBytes);
+                    if (!countExpr || countExpr->HasSideEffects(ctx))
+                      continue;
+                  }
                   std::optional<llvm::APSInt> constCount =
                       constInt(ctx, countExpr);
                   if (constCount ? constCount->isNegative()

@@ -5635,7 +5635,55 @@ piece and becomes FR-45.
   BONUS: the admitted malloc(sizeof+CONST) over-count shape was a
   LATENT MISCOMPILE (constant-true null branch, measured) — now
   routed to the byte-diff-proven owned representation.
-  Full suite 654/654.
+  Full suite 654/654. Measured post-land: encoder 20/28,
+  decoder 12/17.
+
+- [x] FR-95 Non-byte FAM tails (the encoder's search_index
+  residue: `struct hs_index { uint16_t size; int16_t index[]; }`
+  allocated `malloc(sizeof(hs_index) + size*sizeof(int16_t))` —
+  the second FAM record in heatshrink, with an int16 element
+  tail; FR-94 admitted u8 tails only). The generalization: the
+  tail Vec's element type follows the FAM's element (Vec<i16>,
+  vec![0i16; n]), the allocation recognition divides the
+  non-sizeof side by sizeof(elem) (the count arithmetic must
+  match — `size * sizeof(int16_t)` is the multiply form), and
+  access sites lower over the typed Vec exactly as FR-94's byte
+  form (indexing is element-typed, no byte windows needed unless
+  a byte view of the typed tail appears — measure; if it does,
+  the FR-83 byte-view precedent applies or it stays located).
+  Alignment note the spike must check: the tail's element
+  alignment vs the struct's (an i16 tail after a u16 field is
+  aligned; C guarantees the FAM offset is suitably aligned — the
+  Vec representation sidesteps layout entirely, so this should
+  be moot; confirm). Gates: Import pins (typed-tail alloc fold,
+  element-typed indexing, the multiply-form count recognition)
+  + frontier arms (mismatched element arithmetic, byte-view of
+  a typed tail if rejected); EndToEnd byte-diff (typed-tail
+  lifecycle, argc-seeded, vs clang native); external re-probe
+  (encoder search_index family measured); full lit 100%; C path
+  only.
+  **SPIKE VERDICT: GO (2026-08-15) — with SCOPE HONESTY the
+  headline.** The translate side proved fully prefix-generic (the
+  struct-literal fuse was op-ORDER-gated, not element-gated), so
+  the extension is planning/importer-side only: the famTailField
+  gate widens to vecElementType-mappable elements, planFamLift
+  grows the multiply-form matcher + a count-side LOCAL peel
+  (heatshrink's `index_sz = n*sizeof(uint16_t)` spelling;
+  extractElementCount's numeric fold legitimately matches
+  sizeof(uint16_t)==2 to an i16 tail), and the void*-cursor
+  WILDCARD stays u8-only (void arithmetic is byte-granular —
+  widening it over Vec<i16> would miscompile). Byte views of
+  typed tails stay located (corpus has zero). THE DECISIVE
+  DIFFERENTIAL: a member-held FAM binding with the ADMITTED u8
+  element rejects identically to the i16 corpus shape — the
+  member-pointer wall is orthogonal to element admission, so the
+  encoder fractions were PREDICTED unchanged and measured
+  unchanged (20/28); the member-held FAM pointer (alloc-into-
+  member, member-read, free-of-member) + the returned-pointer
+  alloc are the named FR-96 fronts. Three frontier pins moved
+  forward (int tails became Vec-mappable; arms rewritten to long
+  double / mismatched-arithmetic / void-view shapes, wordings
+  preserved). Full suite 656/656.
 
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
