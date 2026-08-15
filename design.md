@@ -4696,6 +4696,55 @@ piece and becomes FR-45.
   case re-proven: ecc.c:62:43 located warning, g_rng_function dropped
   [fnptr-undefined-target], crate BUILDS. Full suite 598/598.
 
+- [x] FR-73 Tu-prefix composition must not manufacture double
+  underscores (the FR-71-spike naming candidate, re-reproduced
+  2026-08-14): a STATIC C function with a leading underscore — the
+  ubiquitous `static void _set(...)` helper idiom — composes with the
+  per-TU statics prefix to `tu0__set`, and rustc's DENIED
+  non_snake_case lint rejects consecutive underscores ("method
+  `tu0__set` should have a snake case name"), a hard crate-build
+  failure whenever such a helper actually emits (owner-method or free
+  form alike). The plain extern `_set` is fine — a LEADING underscore
+  is legal snake_case; only the prefix+underscore CONCATENATION
+  manufactures the illegal `__`. Fix in the one naming seam
+  (CSymbolNaming — the tu-prefix composition point shared by the
+  importer and the FR-40 item graph, per the byte-identity invariant):
+  when the prefixed symbol begins with underscore(s), collapse the
+  boundary (`tu0_` + `_set` -> `tu0_set`), and on collision with an
+  existing emitted name apply the naming machinery's existing
+  disambiguation rather than inventing a new scheme. The composition
+  change is byte-identity-sensitive: every golden carrying a
+  tu-prefixed underscore symbol shifts and must be updated in the
+  same change; the item graph and importer must agree byte-for-byte
+  (CSymbolNaming is the single source — verify no second composition
+  site exists). Gates: Import pin (static `_set` emits a
+  snake-case-clean name, pinned exactly; a collision fixture `_set` +
+  `set` both static in one TU pins the disambiguation); EndToEnd
+  byte-diff with a static leading-underscore helper that EMITS (the
+  FR-71 spike shape) building clean under the deny set; the
+  multi-TU/static goldens that shift updated in the same change; full
+  lit 100%.
+  **SPIKE VERDICT: GO (2026-08-14).** Exactly TWO composition
+  primitives exist (cFunctionSymbolName/cGlobalSymbolName; one
+  cosmetic-only owner-tag concat routed through the new helper), and
+  the measured golden-churn surface was ZERO pinned bytes — the only
+  `tuN__` hits in test/ were two intent comments. The same defect
+  fires at the C++ namespace boundary (`a::_f` -> `ns_a__f`), so the
+  collapse landed as a shared `joinSymbolPrefix` primitive covering
+  both: with a non-empty prefix, ALL leading underscores of the base
+  fold into the boundary (`tu0_`+`_set` -> `tu0_set`, `__x` ->
+  `tu0_x` — rustc's own suggestion in every measured case), both
+  rename modes. NO disambiguation counter exists in the machinery —
+  collisions are located rejections — and the spike MEASURED a silent-
+  merge window the collapse would have opened (decl-only `static int
+  _set(int)` silently satisfied by `set`'s definition): closed by a
+  raw-spelling-aware fold-collision guard ("function name 'set' emits
+  as 'tu0_set', which collides with '_set' (leading underscores fold
+  into the symbol prefix)"), pinned in both C and C++ frontier tests.
+  Cross-TU distinctness preserved (tu0_helper/tu1_helper); LinkMerge/
+  retag/CSymbolLinkage parse collapsed names as ordinary tagged names.
+  Full suite 603/603.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test

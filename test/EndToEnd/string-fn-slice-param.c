@@ -15,10 +15,10 @@
 // defines only the sign, and glibc's return magnitude differs from the
 // helper's byte difference, so printing the raw value would diff for a
 // reason that is not a miscompile. The functions are non-static on
-// purpose: a static leading-underscore name emits the tu-prefixed
-// `tu0__set`, which trips the crate's denied non_snake_case lint — a
-// pre-existing, param-type-independent naming defect outside FR-72's
-// scope. Deterministic, no UB.
+// purpose: this test pins the byte-family-call admission for
+// EXTERNAL-linkage helpers; the file-static leading-underscore form now
+// folds its tu-prefix boundary (`tu0_set`, FR-73) and is pinned by
+// static-underscore-helper.c. Deterministic, no UB.
 // RUN: emitrust-cc --emit=crate %s -o %t.crate --build
 // RUN: clang -std=c11 %s -o %t.native
 // RUN: %t.native > %t.native.out

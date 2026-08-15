@@ -52,6 +52,24 @@ LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   // `globalVarSymbolName`.
   std::string symbolName = globalVarSymbolName(var);
 
+  // FR-73 (same guard as importFunction's): the underscore fold into the
+  // per-TU/namespace prefix (`_x` -> `tu0_x`, `joinSymbolPrefix` in
+  // CSymbolNaming.h) must not silently merge two file-scope globals — in
+  // defer-externals mode two same-composed tentative definitions would
+  // otherwise quietly unify. A DIFFERENT raw spelling in this TU that
+  // composes to the same emitted name rejects the later declaration here.
+  {
+    std::string firstRaw = ordinaryTuNameOwners.lookup(symbolName);
+    if (!firstRaw.empty() && firstRaw != var->getName() &&
+        (var->getName().starts_with("_") ||
+         llvm::StringRef(firstRaw).starts_with("_")))
+      return emitError(loc)
+             << "unsupported: global variable '" << var->getName()
+             << "' emits as '" << symbolName << "', which collides with '"
+             << firstRaw
+             << "' (leading underscores fold into the symbol prefix)";
+  }
+
   // C reconciliation of redeclarations: a variable that is only ever
   // `extern`-declared has no storage in this translation unit; a tentative
   // definition (`int g;`) behaves as a zero-initialized definition.

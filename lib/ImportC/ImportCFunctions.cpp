@@ -243,6 +243,27 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // pick up that tag.
   std::string name =
       cxxMethod ? cxxMethodMangledName(cxxMethod) : mlirFuncName(func);
+  // FR-73: leading underscores of an internal-linkage or namespaced name
+  // fold into the prefix boundary (`_set` -> `tu0_set`; `joinSymbolPrefix`
+  // in CSymbolNaming.h), and the fold must not silently merge two C
+  // symbols: without this guard a prototype-only `static int _set(int)`
+  // would be "satisfied" by a same-TU `set` definition and every
+  // `_set(...)` call would execute set's body. When a DIFFERENT raw
+  // spelling in this TU composes to the same emitted name, the later
+  // declaration is rejected where it appears. Scoped to underscore folds
+  // (one side's raw spelling leads with '_') so the pre-existing collision
+  // machinery keeps its own wordings; C++ methods take their own naming
+  // path and are outside the pre-scanned ordinary map.
+  if (!cxxMethod) {
+    std::string firstRaw = ordinaryTuNameOwners.lookup(name);
+    if (!firstRaw.empty() && firstRaw != cName &&
+        (cName.starts_with("_") ||
+         llvm::StringRef(firstRaw).starts_with("_")))
+      return emitError(loc)
+             << "unsupported: function name '" << cName << "' emits as '"
+             << name << "', which collides with '" << firstRaw
+             << "' (leading underscores fold into the symbol prefix)";
+  }
 
   // K&R callsite-prototype inference (FR-29, CTS 00209): the definition's
   // body refines argument-called prototype-less fn-ptr decls to their

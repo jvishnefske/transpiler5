@@ -10,10 +10,11 @@
 // all stored values derived from argc so constant folding cannot
 // pre-compute the digests and hide a miscompile. `cargo build` success
 // alone proves nothing here — the stdout diff is the oracle. The
-// functions are non-static on purpose: a static leading-underscore name
-// emits the tu-prefixed `tu0__set`, which trips the crate's denied
-// non_snake_case lint — a pre-existing, param-type-independent naming
-// defect outside FR-71's scope. main returns 0 and reports everything
+// functions are non-static on purpose: this test pins the
+// void*-parameter admission for EXTERNAL-linkage helpers; the
+// file-static leading-underscore form now folds its tu-prefix boundary
+// (`tu0_set`, FR-73) and is pinned by static-underscore-helper.c.
+// main returns 0 and reports everything
 // through printf, so lit's per-command exit-code checking covers both
 // runs and diff covers the observable behavior. Deterministic, no UB.
 // RUN: emitrust-cc --emit=crate %s -o %t.crate --build

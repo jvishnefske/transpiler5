@@ -5082,6 +5082,17 @@ private:
   /// mangles to `match_`, which must not silently merge with a source
   /// declaration already spelled `match_`.
   llvm::StringSet<> ordinaryRawTuNames;
+  /// FR-73: the raw C spelling that FIRST claimed each composed ordinary
+  /// name in this TU's pre-scan (functions and file-scope variables,
+  /// keyed by the composed module-symbol name). Backs the
+  /// underscore-fold collision guard: leading underscores fold into the
+  /// per-TU/namespace prefix boundary (`_set` -> `tu0_set`,
+  /// CSymbolNaming.h `joinSymbolPrefix`), and `ordinaryTuNames` alone — a
+  /// set — cannot see two DIFFERENT raw spellings composing to one name.
+  /// `importFunction`/`importGlobalVar` consult this map and reject the
+  /// later declaration; without it a prototype-only `static int _set(int)`
+  /// would be silently "satisfied" by a same-TU `set` definition.
+  llvm::StringMap<std::string> ordinaryTuNameOwners;
   /// Symbol name assigned to each struct definition by `structSymbolName`,
   /// keyed on the defining declaration (per-TU decls are distinct; cross-TU
   /// unification still happens by final name through
