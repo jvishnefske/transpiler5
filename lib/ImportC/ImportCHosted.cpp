@@ -342,9 +342,33 @@ CImporter::emitCharRegionArg(const clang::Expr *expr) {
   return *pointer;
 }
 
+/// The element type under a borrowed char-region slice
+/// (`!emitrust.ref/mut_ref<!emitrust.slice<T>>`), used by the byte-family
+/// callers to keep the emitted helper's signature in agreement with the
+/// call site (FR-72): the helper images are i8- or u8-typed, and
+/// CallOpaqueOp is untyped at translate time, so a disagreement would
+/// surface only as a rustc E0308 in the emitted crate.
+static Type charRegionElement(Value slice) {
+  Type pointee;
+  if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(slice.getType()))
+    pointee = mutRef.getPointee();
+  else if (auto ref = llvm::dyn_cast<emitrust::RefType>(slice.getType()))
+    pointee = ref.getPointee();
+  return llvm::cast<emitrust::SliceType>(pointee).getElementType();
+}
+
+/// Whether the borrowed char-region slice is the unsigned (ui8/u8)
+/// element domain — the `uint8_t *` parameter convention — which selects
+/// the parallel `__emitrust_*_u8` helper images.
+static bool isUnsignedByteRegion(Value slice) {
+  auto intType = llvm::dyn_cast<IntegerType>(charRegionElement(slice));
+  return intType && intType.isUnsigned();
+}
+
 FailureOr<Value> CImporter::emitCharRegionSlice(Location loc,
                                                 const PtrExprValue &pointer,
-                                                bool isMut) {
+                                                bool isMut,
+                                                bool allowUnsignedByte) {
   Value place = pointer.literalBacking;
   if (place && isMut)
     return emitError(loc) << "unsupported: a string literal region cannot "
@@ -358,14 +382,55 @@ FailureOr<Value> CImporter::emitCharRegionSlice(Location loc,
     place = it->second;
   }
   auto lvalueType = llvm::dyn_cast<emitrust::LValueType>(place.getType());
-  emitrust::ArrayType arrayType =
-      lvalueType
-          ? llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType())
-          : emitrust::ArrayType();
-  if (!arrayType || arrayType.getElementType() != builder.getIntegerType(8))
+  Type i8Type = builder.getIntegerType(8);
+  Type ui8Type =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  Type elementType;
+  bool isSliceParamRegion = false;
+  if (lvalueType) {
+    if (auto arrayType =
+            llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType())) {
+      if (arrayType.getElementType() == i8Type)
+        elementType = arrayType.getElementType();
+    } else if (auto sliceBase = llvm::dyn_cast<emitrust::SliceType>(
+                   lvalueType.getValueType())) {
+      // FR-72: a byte-slice PARAMETER region (the (deref'd backing,
+      // cursor) decomposition of a `char */uint8_t *` — or FR-71-admitted
+      // `void *` — parameter) reslices at the argument's cursor exactly
+      // like the general slice-param call machinery; the slice's own
+      // length keeps every helper access bounds-checked.
+      if (sliceBase.getElementType() == i8Type ||
+          sliceBase.getElementType() == ui8Type) {
+        elementType = sliceBase.getElementType();
+        isSliceParamRegion = true;
+      }
+    }
+  }
+  if (!elementType)
     return emitError(loc) << "unsupported: string function argument must "
                              "designate a char array";
-  auto sliceType = emitrust::SliceType::get(arrayType.getElementType());
+  if (isSliceParamRegion) {
+    // The str*-family/strchr/atoi/strlen/sprintf helpers are i8-typed;
+    // only the byte-family callers (memset/memcpy/memmove/memcmp) carry
+    // u8 helper images, so a ui8 region anywhere else rejects here
+    // instead of failing element typing only at rustc (E0308).
+    if (elementType == ui8Type && !allowUnsignedByte)
+      return emitError(loc) << "unsupported: string function argument over "
+                               "an unsigned char region";
+    // A shared (const-pointee) slice parameter can only be a SOURCE
+    // region: the SliceOfOp verifier and translate both accept a `mut`
+    // reslice of it, so without this check the emitted `&mut (*p)[..]`
+    // would fail only at rustc (E0596).
+    if (isMut) {
+      auto deref = place.getDefiningOp<emitrust::DerefOp>();
+      if (!deref ||
+          !llvm::isa<emitrust::MutRefType>(deref.getOperand().getType()))
+        return emitError(loc) << "unsupported: a shared byte-slice "
+                                 "parameter cannot be a mutable string "
+                                 "argument";
+    }
+  }
+  auto sliceType = emitrust::SliceType::get(elementType);
   Type refType = isMut ? Type(emitrust::MutRefType::get(sliceType))
                        : Type(emitrust::RefType::get(sliceType));
   return builder
@@ -446,12 +511,18 @@ LogicalResult CImporter::emitMemsetCall(const clang::CallExpr *call) {
     return emitError(loc) << "unsupported: memset argument type";
   Value fill = castToIntType(loc, *byte, builder.getI32Type());
   Value count = castToIntType(loc, *n, builder.getIntegerType(64));
-  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true);
+  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true,
+                                                  /*allowUnsignedByte=*/true);
   if (failed(dstSlice))
     return failure();
-  requestStringHelper("__emitrust_memset");
+  // FR-72 element agreement: a ui8 (uint8_t-parameter) region takes the
+  // u8 helper image; an i8 region keeps the historical helper.
+  llvm::StringRef helper = isUnsignedByteRegion(*dstSlice)
+                               ? "__emitrust_memset_u8"
+                               : "__emitrust_memset";
+  requestStringHelper(helper);
   builder.create<emitrust::CallOpaqueOp>(
-      loc, TypeRange(), builder.getStringAttr("__emitrust_memset"),
+      loc, TypeRange(), builder.getStringAttr(helper),
       /*args=*/ArrayAttr(), ValueRange{*dstSlice, fill, count});
   return success();
 }
@@ -475,6 +546,17 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
     return emitError(loc) << "unsupported: " << name << " count type";
   Value count = castToIntType(loc, *n, builder.getIntegerType(64));
   if (dst->base && dst->base == src->base) {
+    // FR-72: source and destination in the same PARAMETER reject. The
+    // array shape below is a deliberate UB refinement over a PROVABLE
+    // whole region; a parameter's extent is not provable, and silently
+    // riding `copy_within` would make an overlapping (C-undefined)
+    // memcpy uncertifiable by the byte-diff oracle.
+    if (llvm::isa<clang::ParmVarDecl>(dst->base))
+      return emitError(loc)
+             << "unsupported: " << name
+             << " source and destination point into the same slice "
+                "parameter '"
+             << dst->base->getName() << "'";
     // Both arguments point into the same object: two slice borrows would
     // alias a mutable borrow, so the whole array is borrowed mutably once
     // and the helper receives both element cursors (`copy_within`; its
@@ -493,16 +575,27 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
         ValueRange{*slice, dst->cursor, src->cursor, count});
     return success();
   }
-  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true);
+  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true,
+                                                  /*allowUnsignedByte=*/true);
   if (failed(dstSlice))
     return failure();
-  FailureOr<Value> srcSlice =
-      emitCharRegionSlice(loc, *src, /*isMut=*/false);
+  FailureOr<Value> srcSlice = emitCharRegionSlice(
+      loc, *src, /*isMut=*/false, /*allowUnsignedByte=*/true);
   if (failed(srcSlice))
     return failure();
-  requestStringHelper("__emitrust_memcpy");
+  // FR-72 element agreement: no helper signature fits an i8/ui8 mix (a
+  // string-literal backing is i8; a uint8_t parameter is ui8), so a
+  // mixed call rejects here instead of E0308 in the emitted crate.
+  if (charRegionElement(*dstSlice) != charRegionElement(*srcSlice))
+    return emitError(loc)
+           << "unsupported: " << name
+           << " arguments mix char and unsigned char regions";
+  llvm::StringRef helper = isUnsignedByteRegion(*dstSlice)
+                               ? "__emitrust_memcpy_u8"
+                               : "__emitrust_memcpy";
+  requestStringHelper(helper);
   builder.create<emitrust::CallOpaqueOp>(
-      loc, TypeRange(), builder.getStringAttr("__emitrust_memcpy"),
+      loc, TypeRange(), builder.getStringAttr(helper),
       /*args=*/ArrayAttr(), ValueRange{*dstSlice, *srcSlice, count});
   return success();
 }
@@ -531,23 +624,35 @@ CImporter::emitStringCompareCall(const clang::CallExpr *call,
     count = castToIntType(loc, *n, builder.getIntegerType(64));
   }
   // Both borrows are shared, so even two arguments into the same object
-  // coexist.
-  FailureOr<Value> lhsSlice =
-      emitCharRegionSlice(loc, *lhs, /*isMut=*/false);
+  // coexist. Only the byte-family memcmp carries a u8 helper image
+  // (FR-72); strcmp/strncmp are NUL-terminated i8 string functions and
+  // keep the i8-only region rule.
+  bool isByteFamily = name == "memcmp";
+  FailureOr<Value> lhsSlice = emitCharRegionSlice(
+      loc, *lhs, /*isMut=*/false, /*allowUnsignedByte=*/isByteFamily);
   if (failed(lhsSlice))
     return failure();
-  FailureOr<Value> rhsSlice =
-      emitCharRegionSlice(loc, *rhs, /*isMut=*/false);
+  FailureOr<Value> rhsSlice = emitCharRegionSlice(
+      loc, *rhs, /*isMut=*/false, /*allowUnsignedByte=*/isByteFamily);
   if (failed(rhsSlice))
     return failure();
+  // FR-72 element agreement: an i8/ui8 mix has no helper signature that
+  // fits both regions, so it rejects here instead of E0308 at rustc.
+  if (charRegionElement(*lhsSlice) != charRegionElement(*rhsSlice))
+    return emitError(loc)
+           << "unsupported: " << name
+           << " arguments mix char and unsigned char regions";
+  std::string helper = ("__emitrust_" + name).str();
+  if (isByteFamily && isUnsignedByteRegion(*lhsSlice))
+    helper += "_u8";
   SmallVector<Value> operands{*lhsSlice, *rhsSlice};
   if (count)
     operands.push_back(count);
-  requestStringHelper(("__emitrust_" + name).str());
+  requestStringHelper(helper);
   Value result = builder
                      .create<emitrust::CallOpaqueOp>(
                          loc, TypeRange{builder.getI32Type()},
-                         builder.getStringAttr(("__emitrust_" + name).str()),
+                         builder.getStringAttr(helper),
                          /*args=*/ArrayAttr(), operands)
                      .getResult(0);
   // The declared result type is C's int (i32) for the standard

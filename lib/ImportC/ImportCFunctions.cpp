@@ -2271,6 +2271,41 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "    }\n"
        "    0\n"
        "}"},
+      // FR-72: the u8 images of the byte-family helpers, selected when
+      // the call site's regions are ui8 (uint8_t/unsigned char slice
+      // parameters, including FR-71-admitted void*). Byte-for-byte the
+      // same algorithms as the i8 originals — mem* is sign-agnostic and
+      // both compare/fill in the unsigned domain — only the slice
+      // element differs, keeping the helper signature in agreement with
+      // the call site.
+      {"__emitrust_memset_u8",
+       "fn __emitrust_memset_u8(s: &mut [u8], c: i32, n: i64) {\n"
+       "    let b = c as u8;\n"
+       "    let mut i = 0usize;\n"
+       "    while (i as i64) < n {\n"
+       "        s[i] = b;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_memcpy_u8",
+       "fn __emitrust_memcpy_u8(dst: &mut [u8], src: &[u8], n: i64) {\n"
+       "    let mut i = 0usize;\n"
+       "    while (i as i64) < n {\n"
+       "        dst[i] = src[i];\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_memcmp_u8",
+       "fn __emitrust_memcmp_u8(a: &[u8], b: &[u8], n: i64) -> i32 {\n"
+       "    let mut i = 0usize;\n"
+       "    while (i as i64) < n {\n"
+       "        let x = a[i];\n"
+       "        let y = b[i];\n"
+       "        if x != y { return (x as i32) - (y as i32); }\n"
+       "        i += 1;\n"
+       "    }\n"
+       "    0\n"
+       "}"},
   };
   for (const auto &helper : kStringHelpers) {
     if (!neededStringHelpers.contains(helper.name) ||

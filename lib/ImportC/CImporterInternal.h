@@ -3855,15 +3855,23 @@ private:
 
   /// Borrows the char region of a decomposed pointer as a byte slice from
   /// its cursor: `emitrust.slice_of` of the region's place — the literal
-  /// backing, or the base object's own place — typed
-  /// `!emitrust.ref<!emitrust.slice<i8>>` (or `mut_ref` when `isMut`).
-  /// Rejects a mutable borrow of a read-only literal region and any base
-  /// whose place is not a char array (both located diagnostics); the
-  /// array's compile-time-known size is what makes every helper access
-  /// bounds-checked safe Rust.
+  /// backing, the base object's own place, or (FR-72) a byte-slice
+  /// PARAMETER's deref'd backing (`!emitrust.lvalue<!emitrust.slice<i8|
+  /// ui8>>`, resliced at the cursor exactly like the general slice-param
+  /// call machinery) — typed `!emitrust.ref<!emitrust.slice<i8|ui8>>`
+  /// (or `mut_ref` when `isMut`). Rejects a mutable borrow of a
+  /// read-only literal region, a mutable borrow of a SHARED slice
+  /// parameter (a `const` pointee; rustc E0596 would be the only
+  /// downstream catch), a ui8 parameter region unless the caller's
+  /// helper family has u8 images (`allowUnsignedByte` — the str*-family
+  /// helpers are i8-typed), and any base whose place is neither a char
+  /// array nor a byte-slice parameter (all located diagnostics); the
+  /// array's compile-time-known size — or the slice's own length — is
+  /// what makes every helper access bounds-checked safe Rust.
   FailureOr<Value> emitCharRegionSlice(Location loc,
                                        const PtrExprValue &pointer,
-                                       bool isMut);
+                                       bool isMut,
+                                       bool allowUnsignedByte = false);
 
   /// Records that the hosted `<string.h>` helper `name` must be emitted at
   /// the end of the module (see `stringHelperSource`).
@@ -6775,26 +6783,77 @@ static inline bool voidParamOnlyTruthTested(const clang::Stmt *stmt,
 }
 
 /// FR-71: the byte-cursor admission scan for a `void *` parameter.
-/// Returns whether EVERY use of `param` below `stmt` is a conversion
-/// (implicit or explicit `CK_BitCast`) to ONE consistent byte-pointee
-/// pointer type — `char *` or `unsigned char *` (which `uint8_t *`
-/// canonicalizes to); `elem` accumulates that pointee (canonical,
-/// unqualified) across the walk. Such a parameter acts exactly like a
-/// byte pointer the body renamed, so it admits as a byte-slice cursor
-/// (`ParamKind::Slice` with `elem` as the slice element). The scan is
-/// deliberately conservative, mirroring `voidParamOnlyTruthTested`: any
-/// reference of `param` that no qualifying conversion consumed — a
+/// Returns whether EVERY use of `param` below `stmt` is either (a) a
+/// conversion (implicit or explicit `CK_BitCast`) to ONE consistent
+/// byte-pointee pointer type — `char *` or `unsigned char *` (which
+/// `uint8_t *` canonicalizes to) — or (b, FR-72) a bare reference passed
+/// DIRECTLY as a REGION argument of a modeled definition-less
+/// byte-family libc call (memset's destination, memcpy/memmove/memcmp's
+/// two regions), which consumes the parameter as an unsigned-char region
+/// — the sibling `uint8_t *` convention; memset's own `void *` parameter
+/// wraps the argument in NO cast, so clause (a) can never see the
+/// tinycrypt `_set` shape whose body is ONLY `memset(to, val, len)`.
+/// `elem` accumulates the pointee (canonical, unqualified) across the
+/// walk. Such a parameter acts exactly like a byte pointer the body
+/// renamed, so it admits as a byte-slice cursor (`ParamKind::Slice` with
+/// `elem` as the slice element). The scan is deliberately conservative,
+/// mirroring `voidParamOnlyTruthTested`: any reference of `param` that
+/// no qualifying conversion or byte-family region position consumed — a
 /// non-byte or mixed-pointee conversion, arithmetic, comparison, a store
-/// of the pointer itself, a return, a truth test, a call argument —
-/// returns false, keeping the historical void-pointer-parameter
-/// rejection verbatim. A body with NO use at all leaves `elem` null and
-/// the caller declines the admission (an unused `void *` is already the
-/// integer-carrier class, CTS-P3).
+/// of the pointer itself, a return, a truth test, any other call
+/// argument (including a byte-family COUNT position) — returns false,
+/// keeping the historical void-pointer-parameter rejection verbatim. A
+/// body with NO use at all leaves `elem` null and the caller declines
+/// the admission (an unused `void *` is already the integer-carrier
+/// class, CTS-P3).
 static inline bool voidParamByteUsesOk(const clang::Stmt *stmt,
                                        const clang::ParmVarDecl *param,
                                        clang::QualType &elem) {
   if (!stmt)
     return true;
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
+    const clang::FunctionDecl *callee = call->getDirectCallee();
+    if (callee && callee->getDeclName().isIdentifier() &&
+        !callee->getDefinition() && call->getNumArgs() == 3) {
+      llvm::StringRef name = callee->getName();
+      unsigned regionArgs = name == "memset" ? 1
+                            : name == "memcpy" || name == "memmove" ||
+                                    name == "memcmp"
+                                ? 2
+                                : 0;
+      if (regionArgs) {
+        clang::ASTContext &ctx = param->getASTContext();
+        for (auto [index, arg] : llvm::enumerate(call->arguments())) {
+          // The region positions accept the bare parameter reference
+          // under the implicit value/qualification/void* adjustments a
+          // call argument carries; anything else in ANY position walks
+          // generally (so clause (a) still consumes a cast shape, and an
+          // unconsumed reference still disqualifies).
+          const clang::Expr *e = stripTrivia(arg);
+          while (const auto *argCast =
+                     llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+            if (argCast->getCastKind() != clang::CK_LValueToRValue &&
+                argCast->getCastKind() != clang::CK_NoOp &&
+                argCast->getCastKind() != clang::CK_BitCast)
+              break;
+            e = stripTrivia(argCast->getSubExpr());
+          }
+          const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+          if (index < regionArgs && ref && ref->getDecl() == param) {
+            clang::QualType pointee = ctx.UnsignedCharTy;
+            if (elem.isNull())
+              elem = pointee;
+            else if (!ctx.hasSameType(elem, pointee))
+              return false; // Mixed with an i8 cast elsewhere in the body.
+            continue; // The region position consumed the reference.
+          }
+          if (!voidParamByteUsesOk(arg, param, elem))
+            return false;
+        }
+        return voidParamByteUsesOk(call->getCallee(), param, elem);
+      }
+    }
+  }
   if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(stmt))
     if ((llvm::isa<clang::ImplicitCastExpr>(cast) ||
          llvm::isa<clang::CStyleCastExpr>(cast)) &&
