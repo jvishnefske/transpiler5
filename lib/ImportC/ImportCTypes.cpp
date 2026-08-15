@@ -781,6 +781,16 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     // callee only ever truth-tests it, so the value never needs a region.
     if (kind == ParamKind::Carrier)
       return Type(builder.getIntegerType(64));
+    // FR-88: a NULLABLE byte-slice parameter is an Option-wrapped shared
+    // byte slice. The type is the OpaqueType spelling the C99-43
+    // Option-of-cursor cells already render through (`Option<` opaque
+    // values are established translate surface); classification
+    // guarantees the const-u8 pointee, so the wrapped reference is
+    // always the shared `&[u8]` — Copy, so per-use-site unwraps never
+    // move the parameter value.
+    if (kind == ParamKind::Nullable)
+      return Type(emitrust::OpaqueType::get(builder.getContext(),
+                                            "Option<&[u8]>"));
     // A `void *` parameter has no element type to classify against and no
     // region to join at the call boundary (CTS-P9) — EXCEPT the FR-71
     // byte-cursor admission: when the body scan proved every use converts
@@ -1070,6 +1080,32 @@ CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
             !elem.isNull()) {
           kinds[index] = ParamKind::Slice;
           byteElems[index] = elem;
+        }
+      }
+      // FR-88: a `const uint8_t *` parameter whose body null-tests it and
+      // uses its region ONLY under a proven null guard (the tinycrypt
+      // `if (personalization) memcpy(..., personalization, ...)` /
+      // `if (p == NULL) return;` shapes) is NULLABLE: it maps as
+      // `Option<&[u8]>`, so a C null-constant argument becomes a legal
+      // `None` instead of the call-site rejection. CONST-POINTEE ONLY
+      // (`Option<&mut [u8]>` is not Copy, so multiple use-site unwraps
+      // would move it); C-only. A candidate the scan declines keeps its
+      // historical classification — sound, because the declined shape
+      // keeps BOTH the statically-non-null fold and the null-constant
+      // call-site rejection verbatim. Requires a test AND a guarded use:
+      // a never-used or never-tested parameter gains nothing from the
+      // signature change.
+      if (!astContext().getLangOpts().CPlusPlus &&
+          kinds[index] == ParamKind::Slice && isDataPointer(param->getType())) {
+        clang::QualType pointee =
+            param->getType().getCanonicalType()->getPointeeType();
+        if (pointee.isConstQualified() && isU8ScalarType(pointee)) {
+          bool sawTest = false;
+          bool sawUse = false;
+          if (nullableParamUsesOk(definition->getBody(), param,
+                                  /*nonNull=*/false, sawTest, sawUse) &&
+              sawTest && sawUse)
+            kinds[index] = ParamKind::Nullable;
         }
       }
     }
