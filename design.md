@@ -9055,6 +9055,31 @@ recorded wave-scale fronts: struct-as-bytes erasure, the member-pointer
 linked-list shape (cJSON x11), and aliasing mutable arguments
 (ecc/cbc/hmac x8) — i.e. Stage 2/3 of the cascade plan plus C99-44.
 
+**THE LWIP CAMPAIGN (2026-08-14/15, FR-76..FR-84).** The
+cascade-containment stages plus the measurement loop ran as one
+continuous arc — each landed FR's lwIP re-probe named the next FR —
+and src/core went from 20 of 38 units importing to **35 of 38**
+(+75%): FR-76 fn-ptr components (Stage 2), FR-77 fn-ptr-constant
+fail-loudly (the probe's own regression, caught and fixed same-day),
+FR-78 opaque-union containment (Stage 3 — the historically-rejected
+model landed with COMPLETE access interception; the corpus-wide
+cascade wording vanished), FR-79/80/81 the requirement-type matrix
+(const-struct getters, &'static address-carrying items, mutable
+struct get/set), FR-82 a NO-GO whose measured shape table REDIRECTED
+the effort, FR-83 union-arm byte-views + the deref-cancelled-& fold
+(seven units flipped in one wave), FR-84 the module-first lookup
+defect (two more). The three residuals have recorded root causes:
+tcp_in/udp keep CALL-CONST/ESCAPE/PTRCMP address shapes of IP_DATA
+(the FR-82 table — admission needs explicit callee-non-mutation
+contract machinery, never a silent assumption), etharp needs a
+byte-region const requirement for the packed ETHBROADCAST record.
+Method note for the paper: two design refusals (FR-52 globals,
+the Track 5 union placeholder) were REVISED on new measured evidence
+with new mechanisms, one candidate (FR-82) was refuted BY its own
+spike's measurement before any code was written, and one evidence
+clause (FR-79's) was falsified and rewritten — the
+STRUCTURAL/MEASURED discipline holding under autonomous operation.
+
 **External-validation lessons, consolidated (and the paper's disposition).**
 The accompanying paper's four contributions do NOT survive third-party
 validation equally, and the split is the durable lesson -- more than any
