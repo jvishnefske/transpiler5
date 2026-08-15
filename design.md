@@ -4630,6 +4630,10 @@ piece and becomes FR-45.
   corpus — and the probe EXPOSED FR-77 (below): tinycrypt ecc.c became
   the corpus's first CRATE_NOBUILD (rustc E0425), the fail-loudly gap
   at the recovery seam that FR-76's type admission made reachable.
+  POST-FR-77 CORRECTION: 17/17 crates build again and ported settles at
+  97 — the "100" was inflated by the BROKEN crate's own progress JSON
+  (it claimed 750-permille ported while unbuildable). An honest
+  denominator beat a flattering one, again.
 
 - [x] FR-77 Fn-ptr constants naming an unemitted function must fail
   loudly at finalize — and recovery must attribute the drop (found
