@@ -3,23 +3,26 @@
 // RUN: not emitrust-import-c %t/whole-plus-member.c 2>&1 | FileCheck %s --check-prefix=WHOLEPLUS
 // RUN: not emitrust-import-c %t/ptr-local.c 2>&1 | FileCheck %s --check-prefix=PTRLOCAL
 // RUN: not emitrust-import-c %t/global-struct.c 2>&1 | FileCheck %s --check-prefix=GLOBAL
-// RUN: not emitrust-import-c %t/offset-plus.c 2>&1 | FileCheck %s --check-prefix=OFFSETPLUS
-// RUN: not emitrust-import-c %t/offset-subscript.c 2>&1 | FileCheck %s --check-prefix=OFFSETSUB
+// RUN: not emitrust-import-c %t/impure-call-index.c 2>&1 | FileCheck %s --check-prefix=CALLIDX
+// RUN: not emitrust-import-c %t/impure-incdec-index.c 2>&1 | FileCheck %s --check-prefix=INCIDX
 
-// FR-74 frontier: member-array arguments decay to slice parameters ONLY
-// for the provable shapes — a dot/arrow projection chain over an
-// addressable LOCAL struct place, borrowing exactly one field per
-// borrow. Everything else keeps a located rejection, because each of
-// these shapes would otherwise emit code that is wrong or fails only
+// FR-74/FR-86 frontier: member-array arguments decay to slice
+// parameters ONLY for the provable shapes — a dot/arrow projection
+// chain over an addressable LOCAL struct place (whole-member, or
+// FR-86's offset forms with a PURE index), borrowing exactly one field
+// per borrow. Everything else keeps a located rejection, because each
+// of these shapes would otherwise emit code that is wrong or fails only
 // downstream: the SAME field twice in one call is two overlapping
 // borrows (rustc E0499 after emission); a whole-struct borrow plus a
 // member of the same struct overlaps by prefix; a pointer LOCAL bound
 // to a member array is a non-argument decay position the pointer
 // decomposition has no representation for; a GLOBAL struct's member
 // place is a staged local copy, so a mutable slice of it would silently
-// lose the callee's writes; and offset forms (`s.iv + 2`, `&s.iv[2]`)
-// are not the whole-member cursor-0 shape this wave admits. Rejection
-// is a feature: every wording below is pinned verbatim as measured.
+// lose the callee's writes; and an IMPURE offset index (a call, an
+// inc/dec) cannot be evaluated exactly once at the borrow point, so
+// the FR-86 interception DECLINES and the historical decay rejection
+// fires unchanged. Rejection is a feature: every wording below is
+// pinned verbatim as measured.
 
 // The same FIELD twice into two mutable slice parameters: overlapping
 // mutable borrows. The (base, field-path) guard collides on the exact
@@ -95,39 +98,37 @@ int main(void) {
   return (int)g.iv[0];
 }
 
-// Offset arithmetic over the decayed member (`s.iv + 2`): not the
-// whole-member cursor-0 shape; keeps the decay rejection verbatim.
-// OFFSETPLUS: offset-plus.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported pointer cast (ArrayToPointerDecay)
+// FR-86 purity gate: a function-CALL index cannot be admitted — the
+// interception evaluates the index once at the borrow point, and a call
+// there would reorder its side effects against the other arguments —
+// so it declines and the decay rejection stays verbatim.
+// CALLIDX: impure-call-index.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported pointer cast (ArrayToPointerDecay)
 
-//--- offset-plus.c
-struct S { unsigned char iv[8]; unsigned int n; };
-static void bump(unsigned char *buf, unsigned len) {
-  unsigned i;
-  for (i = 0; i < len; i++)
-    buf[i] = (unsigned char)(buf[i] + 1u);
+//--- impure-call-index.c
+struct S { unsigned char key[16]; unsigned int n; };
+static unsigned int bump_idx(void) { static unsigned int c; return c++; }
+static void sink(const unsigned char *p, unsigned int n) {
+  unsigned int i;
+  for (i = 0; i < n; i++) { if (p[i]) return; }
 }
 int main(void) {
   struct S s;
-  s.n = 6u;
-  s.iv[2] = 1;
-  bump(s.iv + 2, s.n);
-  return (int)s.iv[2];
+  s.key[0] = 1;
+  sink(&s.key[bump_idx()], 4u);
+  return 0;
 }
 
-// The subscript-address spelling of the same offset shape (`&s.iv[2]`).
-// OFFSETSUB: offset-subscript.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported pointer cast (ArrayToPointerDecay)
+// FR-86 purity gate: an inc/dec in the index is a side effect the
+// single borrow-point evaluation would misplace; declined the same way.
+// INCIDX: impure-incdec-index.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported pointer cast (ArrayToPointerDecay)
 
-//--- offset-subscript.c
-struct S { unsigned char iv[8]; unsigned int n; };
-static void bump(unsigned char *buf, unsigned len) {
-  unsigned i;
-  for (i = 0; i < len; i++)
-    buf[i] = (unsigned char)(buf[i] + 1u);
+//--- impure-incdec-index.c
+struct S { unsigned char key[16]; unsigned int n; };
+static void sink(const unsigned char *p, unsigned int n) {
+  unsigned int i;
+  for (i = 0; i < n; i++) { if (p[i]) return; }
 }
-int main(void) {
-  struct S s;
-  s.n = 6u;
-  s.iv[2] = 1;
-  bump(&s.iv[2], s.n);
-  return (int)s.iv[2];
+void inc_idx(struct S *s, unsigned int i) {
+  sink(&s->key[i++], 4u);
+  s->n = i;
 }

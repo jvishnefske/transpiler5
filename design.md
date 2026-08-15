@@ -5223,6 +5223,55 @@ piece and becomes FR-45.
   udp) are the IP_DATA CALL-CONST/ESCAPE/PTRCMP shapes needing
   contract machinery. Full suite 623/623.
 
+- [x] FR-86 Offset member-array arguments and the residual decay
+  census (the 8 remaining ArrayToPointerDecay sites in the
+  tinycrypt corpus, all in fn-level items FR-74/75 nearly reach):
+  three measured sub-shapes — (1) OFFSET forms FR-74 explicitly
+  deferred: `&s.m[k]` and `s.m + k` as slice arguments (hmac.c's
+  `&dummy_state.key[TC_SHA256_DIGEST_SIZE]`, aes's
+  `s->words + Nb*Nr`) — the FR-74 interception extends with a
+  nonzero cursor (the existing slice_of already takes a cursor;
+  the index expression must be pure to evaluate once, same
+  element-agreement rules); (2) member arrays to DEFINED callees
+  whose params did not classify Slice (`arrInc(ctx->V, sizeof
+  ctx->V)` — establish why the callee's body-driven classification
+  missed); (3) the `(void)_copy(state, sizeof(state), in, ...)`
+  shape — a top-level LOCAL array to a DECLARATION-ONLY slice
+  param, which FR-75 should admit; root-cause the residual (the
+  void-cast value position? the FR-72 byte-family dispatch
+  colliding with a user function named _copy? sizeof-of-array
+  arguments?). Spike must census all 8 sites into these bins,
+  root-cause (2) and (3), and land what is provably byte-safe;
+  frontier stays located for impure index expressions and
+  whatever (2)/(3) reveal as genuinely unsound. Gates: Import pins
+  per admitted shape (offset member-array with const and runtime
+  pure index; the (2)/(3) shapes as measured) + frontier arms;
+  EndToEnd byte-diff (offset slices into member and local arrays,
+  argc-seeded, vs clang native); external re-probe (the 8 sites'
+  fn items measured — tc_aes_decrypt/tc_sha256_update expected to
+  stub less or port); full lit 100%; C path only.
+  **SPIKE VERDICT: GO (2026-08-15), with the entry's bins (2) and
+  (3) both DISPROVEN by the census** — arrInc's body classification
+  does NOT miss, and `(void)_copy(...)` imports clean already (the
+  string-fn dispatch is getDefinition-guarded; FR-75 covers the
+  decl-only callee). The REAL bins: (1) offset forms, 3 sites; (A)
+  an unnamed dominant bin, 5 sites — member arrays whose struct-
+  pointer ROOT is null-compared and therefore DECOMPOSED
+  (mut_ref<slice<struct>> + cursor), where the FR-74 matcher bailed
+  on decomposed roots; (C) a void*-bitcast wrapper (1 site) and (D)
+  hosted byte-family member args (1 site) stay located this wave.
+  Landed: the FR-74 interception takes the emitted pure index as
+  the slice_of CURSOR (impure indices decline and the verbatim
+  decay wording still fires — pinned); decomposed roots build the
+  member place via subscript-at-cursor -> member (no new ops), with
+  rustc measured to ACCEPT sha256's dual disjoint-field borrow
+  through one decomposed root; the owner-promoted variant
+  (array<struct> receiver) admits too. Both byte-diff suites
+  argc-seeded and byte-identical (bin-1 at five argc values, bin-A
+  with u8 carry-wrap exercised). OFFSETPLUS/OFFSETSUB frontier arms
+  moved to positive pins. Expected corpus effect: 6/8 sites flip
+  (residuals C and D keep located wordings). Full suite 626/626.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
