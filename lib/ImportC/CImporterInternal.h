@@ -486,6 +486,36 @@ struct PtrExprValue {
   Value backing;
 };
 
+/// FR-87: a resolved hosted byte-family (memset/memcpy/memmove/memcmp)
+/// region argument. Either the historical pointer decomposition
+/// (`pointer`, when `memberPlace` is null) or a MEMBER-ARRAY region
+/// resolved by the FR-74/86 member interception: the member chain's
+/// emitted place lvalue plus the i64 element cursor, with the array's
+/// element type and the (root, field-path) aliasing key. The member
+/// channel deliberately does NOT ride `PtrExprValue` — the pointer
+/// decomposition has no representation for a member-rooted region, and
+/// non-argument member decays must keep their verbatim rejection.
+struct CharRegionArg {
+  /// The historical decomposition; meaningful only when `memberPlace`
+  /// is null.
+  PtrExprValue pointer;
+  /// The member-array place lvalue
+  /// (`!emitrust.lvalue<!emitrust.array<NxT>>`); null for the pointer
+  /// channel.
+  Value memberPlace;
+  /// The i64 element cursor into the member array (0 for a whole-array
+  /// decay, k for `&s.m[k]` / `s.m + k`).
+  Value memberCursor;
+  /// The member array's element type (i8, ui8, or ui32 — anything else
+  /// never reaches this channel).
+  Type memberElement;
+  /// The member chain's root variable and field path, the FR-74
+  /// (VarDecl, field-path) aliasing key.
+  const clang::VarDecl *memberRoot = nullptr;
+  SmallVector<const clang::FieldDecl *, 2> memberPath;
+  bool isMember() const { return static_cast<bool>(memberPlace); }
+};
+
 /// Phase-1b classification of one pointer parameter, derived from the
 /// function definition's body. `ScalarRef` parameters are only dereferenced
 /// (`*p`) or arrowed (`p->f`), or are unused, and stay plain
@@ -3943,6 +3973,34 @@ private:
   /// a scalar object (no cursor) is rejected with a located diagnostic.
   FailureOr<PtrExprValue> emitCharRegionArg(const clang::Expr *expr);
 
+  /// FR-87: resolves a hosted BYTE-FAMILY (memset/memcpy/memmove/
+  /// memcmp) region argument. When `interceptMember` is set (the byte
+  /// family only — the str* family keeps its historical frontier), a
+  /// MEMBER-ARRAY shape (dot/arrow/nested chain, whole or at an
+  /// FR-86 offset cursor, including the decomposed null-compared
+  /// root) with an i8/ui8/ui32 element resolves through the FR-74/86
+  /// member interception to the member channel of `CharRegionArg`;
+  /// every other shape (and every other element type) falls through to
+  /// `emitCharRegionArg` unchanged, keeping the historical located
+  /// rejections verbatim. `isMut` is the mutability the caller will
+  /// request for the region's borrow; a mutable member region through
+  /// a shared root declines at the matcher (the safe direction).
+  FailureOr<CharRegionArg> emitByteRegionArg(const clang::Expr *expr,
+                                             bool isMut,
+                                             bool interceptMember);
+
+  /// FR-87: borrows a `CharRegionArg` as a byte slice. The pointer
+  /// channel delegates to `emitCharRegionSlice` unchanged; the member
+  /// channel is an `emitrust.slice_of` of the member place at its
+  /// cursor. Member elements are gated exactly like FR-72's parameter
+  /// regions: ui8 outside the byte family and ui32 anywhere here (the
+  /// u32 subset is memset-destination-only and lowered by
+  /// `emitMemsetCall` itself) keep located rejections.
+  FailureOr<Value> emitByteRegionSlice(Location loc,
+                                       const CharRegionArg &arg,
+                                       bool isMut,
+                                       bool allowUnsignedByte = false);
+
   /// Borrows the char region of a decomposed pointer as a byte slice from
   /// its cursor: `emitrust.slice_of` of the region's place — the literal
   /// backing, the base object's own place, or (FR-72) a byte-slice
@@ -4585,6 +4643,22 @@ private:
                                 bool isMutParam,
                                 const clang::VarDecl *&chainRoot,
                                 SmallVectorImpl<const clang::FieldDecl *> &path);
+
+  /// The shared core of the FR-74/86 member-array interception, used by
+  /// both the slice-ARGUMENT position (`emitBorrowArgument`) and —
+  /// FR-87 — the hosted byte-family REGION position
+  /// (`emitByteRegionArg`). Parses the decayed spellings (`s.m`,
+  /// `&s.m[k]`, `s.m + k` / `k + s.m`) out of the stripped argument,
+  /// gates the offset index on constant-or-pure (FR-86), and on a
+  /// `matchMemberArraySliceArg` match emits the member place and the
+  /// i64 cursor. Returns false (success) when the shape DECLINES — the
+  /// caller falls through to the historical rejection unchanged — and
+  /// failure only when emission of the matched place/cursor fails.
+  FailureOr<bool> tryEmitMemberArraySlicePlace(
+      Location loc, const clang::Expr *stripped, bool isMutParam,
+      Value &place, Value &cursor, Type &element,
+      const clang::VarDecl *&chainRoot,
+      SmallVectorImpl<const clang::FieldDecl *> &path);
 
   /// Returns whether any declaration reference below `stmt` names a
   /// decomposed pointer (a pointer local or slice parameter registered in

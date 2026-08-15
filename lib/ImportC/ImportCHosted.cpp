@@ -439,6 +439,82 @@ FailureOr<Value> CImporter::emitCharRegionSlice(Location loc,
       .getResult();
 }
 
+FailureOr<CharRegionArg>
+CImporter::emitByteRegionArg(const clang::Expr *expr, bool isMut,
+                             bool interceptMember) {
+  // FR-87: the member-array shapes FR-74/86 admit as slice ARGUMENTS
+  // resolve as byte-family REGIONS too, through the same interception
+  // core, BEFORE the pointer decomposition (which has no member-rooted
+  // representation and would reject with the historical decay wording).
+  // The strip mirrors `emitCharRegionArg`: the void* parameters of
+  // memset/memcpy/memcmp wrap their arguments in implicit pointer
+  // bitcasts (and const-qualified parameters in no-op casts).
+  if (interceptMember) {
+    const clang::Expr *e = stripTrivia(expr);
+    while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+      if ((cast->getCastKind() != clang::CK_BitCast &&
+           cast->getCastKind() != clang::CK_NoOp) ||
+          !isPointerType(cast->getType()))
+        break;
+      e = stripTrivia(cast->getSubExpr());
+    }
+    Location loc = translateLoc(e->getBeginLoc());
+    CharRegionArg arg;
+    FailureOr<bool> matched = tryEmitMemberArraySlicePlace(
+        loc, e, isMut, arg.memberPlace, arg.memberCursor, arg.memberElement,
+        arg.memberRoot, arg.memberPath);
+    if (failed(matched))
+      return failure();
+    Type i8Type = builder.getIntegerType(8);
+    Type ui8Type =
+        IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+    Type ui32Type =
+        IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
+    // Only the elements with an admitted (or explicitly gated: ui32 is
+    // memset-destination-only) helper image take the member channel;
+    // every other element declines so the historical located rejection
+    // stays verbatim.
+    if (*matched && (arg.memberElement == i8Type ||
+                     arg.memberElement == ui8Type ||
+                     arg.memberElement == ui32Type))
+      return arg;
+  }
+  FailureOr<PtrExprValue> pointer = emitCharRegionArg(expr);
+  if (failed(pointer))
+    return failure();
+  CharRegionArg arg;
+  arg.pointer = *pointer;
+  return arg;
+}
+
+FailureOr<Value> CImporter::emitByteRegionSlice(Location loc,
+                                                const CharRegionArg &arg,
+                                                bool isMut,
+                                                bool allowUnsignedByte) {
+  if (!arg.isMember())
+    return emitCharRegionSlice(loc, arg.pointer, isMut, allowUnsignedByte);
+  Type i8Type = builder.getIntegerType(8);
+  Type ui8Type =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  // FR-87 u32 gate: the only admitted u32 use is the memset destination,
+  // which `emitMemsetCall` lowers itself (word-fill image) before ever
+  // reaching here — every other byte-family (and str*-family) position
+  // rejects located, mirroring FR-72's unsigned-char-region wording.
+  if (arg.memberElement != i8Type && arg.memberElement != ui8Type)
+    return emitError(loc) << "unsupported: string function argument over "
+                             "an unsigned int region";
+  if (arg.memberElement == ui8Type && !allowUnsignedByte)
+    return emitError(loc) << "unsupported: string function argument over "
+                             "an unsigned char region";
+  auto sliceType = emitrust::SliceType::get(arg.memberElement);
+  Type refType = isMut ? Type(emitrust::MutRefType::get(sliceType))
+                       : Type(emitrust::RefType::get(sliceType));
+  return builder
+      .create<emitrust::SliceOfOp>(loc, refType, arg.memberPlace,
+                                   arg.memberCursor, isMut)
+      .getResult();
+}
+
 void CImporter::requestStringHelper(llvm::StringRef name) {
   neededStringHelpers.insert(name);
 }
@@ -497,7 +573,8 @@ LogicalResult CImporter::emitMemsetCall(const clang::CallExpr *call) {
   if (call->getNumArgs() != 3)
     return emitError(loc)
            << "unsupported: memset requires exactly 3 arguments";
-  FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
+  FailureOr<CharRegionArg> dst = emitByteRegionArg(
+      call->getArg(0), /*isMut=*/true, /*interceptMember=*/true);
   if (failed(dst))
     return failure();
   FailureOr<Value> byte = emitRValue(call->getArg(1));
@@ -511,7 +588,49 @@ LogicalResult CImporter::emitMemsetCall(const clang::CallExpr *call) {
     return emitError(loc) << "unsupported: memset argument type";
   Value fill = castToIntType(loc, *byte, builder.getI32Type());
   Value count = castToIntType(loc, *n, builder.getIntegerType(64));
-  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true,
+  Type ui32Type =
+      IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
+  if (dst->isMember() && dst->memberElement == ui32Type) {
+    // FR-87 u32 subset: a `unsigned int` member array as the memset
+    // DESTINATION is byte-fillable exactly — memset semantics are bytes
+    // — when the byte count provably covers whole words (compile-time
+    // constant, multiple of 4) and the fill byte is a compile-time
+    // constant, so the fill WORD is its replication b * 0x01010101
+    // (endianness-neutral: all four bytes equal; the spike's byte-diff
+    // caught a hand-picked word constant here). The element cursor and
+    // the byte count pass through to the `__emitrust_memset_u32` word
+    // walker unchanged. Everything outside the subset rejects located.
+    std::optional<llvm::APSInt> constCount =
+        call->getArg(2)->getIntegerConstantExpr(astContext());
+    if (!constCount || constCount->getExtValue() % 4 != 0)
+      return emitError(loc)
+             << "unsupported: memset over an unsigned int region requires "
+                "a constant byte count that is a multiple of 4";
+    std::optional<llvm::APSInt> constFill =
+        call->getArg(1)->getIntegerConstantExpr(astContext());
+    if (!constFill)
+      return emitError(loc)
+             << "unsupported: memset over an unsigned int region requires "
+                "a constant fill byte";
+    uint32_t fillByte =
+        static_cast<uint32_t>(constFill->getExtValue()) & 0xFFu;
+    uint32_t fillWord = fillByte * 0x01010101u;
+    auto sliceType = emitrust::SliceType::get(ui32Type);
+    Value slice =
+        builder
+            .create<emitrust::SliceOfOp>(
+                loc, emitrust::MutRefType::get(sliceType), dst->memberPlace,
+                dst->memberCursor, /*is_mut=*/true)
+            .getResult();
+    Value word = createScalarIntConstant(loc, ui32Type,
+                                         static_cast<int64_t>(fillWord));
+    requestStringHelper("__emitrust_memset_u32");
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(), builder.getStringAttr("__emitrust_memset_u32"),
+        /*args=*/ArrayAttr(), ValueRange{slice, word, count});
+    return success();
+  }
+  FailureOr<Value> dstSlice = emitByteRegionSlice(loc, *dst, /*isMut=*/true,
                                                   /*allowUnsignedByte=*/true);
   if (failed(dstSlice))
     return failure();
@@ -533,10 +652,12 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
   if (call->getNumArgs() != 3)
     return emitError(loc)
            << "unsupported: " << name << " requires exactly 3 arguments";
-  FailureOr<PtrExprValue> dst = emitCharRegionArg(call->getArg(0));
+  FailureOr<CharRegionArg> dst = emitByteRegionArg(
+      call->getArg(0), /*isMut=*/true, /*interceptMember=*/true);
   if (failed(dst))
     return failure();
-  FailureOr<PtrExprValue> src = emitCharRegionArg(call->getArg(1));
+  FailureOr<CharRegionArg> src = emitByteRegionArg(
+      call->getArg(1), /*isMut=*/false, /*interceptMember=*/true);
   if (failed(src))
     return failure();
   FailureOr<Value> n = emitRValue(call->getArg(2));
@@ -545,41 +666,111 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
   if (!llvm::isa<IntegerType>((*n).getType()))
     return emitError(loc) << "unsupported: " << name << " count type";
   Value count = castToIntType(loc, *n, builder.getIntegerType(64));
-  if (dst->base && dst->base == src->base) {
-    // FR-72: source and destination in the same PARAMETER reject. The
-    // array shape below is a deliberate UB refinement over a PROVABLE
-    // whole region; a parameter's extent is not provable, and silently
-    // riding `copy_within` would make an overlapping (C-undefined)
-    // memcpy uncertifiable by the byte-diff oracle.
-    if (llvm::isa<clang::ParmVarDecl>(dst->base))
+  // FR-87: the u32 member subset is memset-destination-only — no
+  // memcpy/memmove word image is admitted, so either u32 member region
+  // rejects here with the same wording the slice gate uses.
+  Type ui32Type =
+      IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
+  if ((dst->isMember() && dst->memberElement == ui32Type) ||
+      (src->isMember() && src->memberElement == ui32Type))
+    return emitError(loc) << "unsupported: string function argument over "
+                             "an unsigned int region";
+  // FR-74/87 aliasing key: a member region borrows only its FIELD, so
+  // the collision key is (root, field-path). Member paths always end at
+  // an ARRAY leaf, so two DISTINCT paths of one root can never prefix-
+  // overlap — they are disjoint fields and the two-borrow emission below
+  // is legal Rust — while the SAME path is a provable whole region and
+  // rides `copy_within` on the member place (memmove's overlap-correct
+  // semantics, refining C's undefined overlapping memcpy; the naive
+  // two-borrow form is rustc E0502). A member/non-member mix on one
+  // root has no provable relation and rejects.
+  const clang::VarDecl *dstRoot =
+      dst->isMember() ? dst->memberRoot : dst->pointer.base;
+  const clang::VarDecl *srcRoot =
+      src->isMember() ? src->memberRoot : src->pointer.base;
+  if (dstRoot && dstRoot == srcRoot) {
+    if (dst->isMember() != src->isMember())
       return emitError(loc)
              << "unsupported: " << name
-             << " source and destination point into the same slice "
-                "parameter '"
-             << dst->base->getName() << "'";
-    // Both arguments point into the same object: two slice borrows would
-    // alias a mutable borrow, so the whole array is borrowed mutably once
-    // and the helper receives both element cursors (`copy_within`; its
-    // memmove semantics refine C's undefined overlapping memcpy).
-    PtrExprValue whole{dst->base,
-                       createIntConstant(loc, builder.getIntegerType(64), 0),
-                       Value()};
-    FailureOr<Value> slice = emitCharRegionSlice(loc, whole, /*isMut=*/true);
-    if (failed(slice))
-      return failure();
-    requestStringHelper("__emitrust_memcpy_within");
-    builder.create<emitrust::CallOpaqueOp>(
-        loc, TypeRange(),
-        builder.getStringAttr("__emitrust_memcpy_within"),
-        /*args=*/ArrayAttr(),
-        ValueRange{*slice, dst->cursor, src->cursor, count});
-    return success();
+             << " source and destination point into the same object '"
+             << dstRoot->getName() << "'";
+    if (dst->isMember()) {
+      if (dst->memberPath == src->memberPath) {
+        Type ui8Type = IntegerType::get(builder.getContext(), 8,
+                                        IntegerType::Unsigned);
+        auto sliceType = emitrust::SliceType::get(dst->memberElement);
+        // The WHOLE member array is borrowed (cursor 0): the helper's
+        // dst/src cursors are absolute element offsets into the member,
+        // so a slice starting at the dst cursor would shift the copy
+        // window (the spike-mandated byte-diff caught exactly that).
+        Value zero =
+            createIntConstant(loc, builder.getIntegerType(64), 0);
+        Value slice = builder
+                          .create<emitrust::SliceOfOp>(
+                              loc, emitrust::MutRefType::get(sliceType),
+                              dst->memberPlace, zero,
+                              /*is_mut=*/true)
+                          .getResult();
+        llvm::StringRef helper = dst->memberElement == ui8Type
+                                     ? "__emitrust_memcpy_within_u8"
+                                     : "__emitrust_memcpy_within";
+        requestStringHelper(helper);
+        builder.create<emitrust::CallOpaqueOp>(
+            loc, TypeRange(), builder.getStringAttr(helper),
+            /*args=*/ArrayAttr(),
+            ValueRange{slice, dst->memberCursor, src->memberCursor, count});
+        return success();
+      }
+      // Distinct member paths of one root: disjoint fields, admitted
+      // below. (Defensive: a proper prefix would be a matcher bug —
+      // array leaves have no fields — but reject rather than emit.)
+      size_t common =
+          std::min(dst->memberPath.size(), src->memberPath.size());
+      if (llvm::ArrayRef(dst->memberPath).take_front(common) ==
+          llvm::ArrayRef(src->memberPath).take_front(common))
+        return emitError(loc)
+               << "unsupported: " << name
+               << " source and destination point into the same object '"
+               << dstRoot->getName() << "'";
+    } else {
+      // FR-72: source and destination in the same PARAMETER reject. The
+      // array shape below is a deliberate UB refinement over a PROVABLE
+      // whole region; a parameter's extent is not provable, and silently
+      // riding `copy_within` would make an overlapping (C-undefined)
+      // memcpy uncertifiable by the byte-diff oracle.
+      if (llvm::isa<clang::ParmVarDecl>(dstRoot))
+        return emitError(loc)
+               << "unsupported: " << name
+               << " source and destination point into the same slice "
+                  "parameter '"
+               << dstRoot->getName() << "'";
+      // Both arguments point into the same object: two slice borrows
+      // would alias a mutable borrow, so the whole array is borrowed
+      // mutably once and the helper receives both element cursors
+      // (`copy_within`; its memmove semantics refine C's undefined
+      // overlapping memcpy).
+      PtrExprValue whole{
+          dstRoot, createIntConstant(loc, builder.getIntegerType(64), 0),
+          Value()};
+      FailureOr<Value> slice =
+          emitCharRegionSlice(loc, whole, /*isMut=*/true);
+      if (failed(slice))
+        return failure();
+      requestStringHelper("__emitrust_memcpy_within");
+      builder.create<emitrust::CallOpaqueOp>(
+          loc, TypeRange(),
+          builder.getStringAttr("__emitrust_memcpy_within"),
+          /*args=*/ArrayAttr(),
+          ValueRange{*slice, dst->pointer.cursor, src->pointer.cursor,
+                     count});
+      return success();
+    }
   }
-  FailureOr<Value> dstSlice = emitCharRegionSlice(loc, *dst, /*isMut=*/true,
+  FailureOr<Value> dstSlice = emitByteRegionSlice(loc, *dst, /*isMut=*/true,
                                                   /*allowUnsignedByte=*/true);
   if (failed(dstSlice))
     return failure();
-  FailureOr<Value> srcSlice = emitCharRegionSlice(
+  FailureOr<Value> srcSlice = emitByteRegionSlice(
       loc, *src, /*isMut=*/false, /*allowUnsignedByte=*/true);
   if (failed(srcSlice))
     return failure();
@@ -608,10 +799,18 @@ CImporter::emitStringCompareCall(const clang::CallExpr *call,
   if (call->getNumArgs() != expected)
     return emitError(loc) << "unsupported: " << name << " requires exactly "
                           << expected << " arguments";
-  FailureOr<PtrExprValue> lhs = emitCharRegionArg(call->getArg(0));
+  // Both borrows are shared, so even two arguments into the same object
+  // (FR-87: or the same member FIELD) coexist. Only the byte-family
+  // memcmp carries a u8 helper image (FR-72) — and, FR-87, member-array
+  // regions — strcmp/strncmp are NUL-terminated i8 string functions and
+  // keep the i8-only region rule and the historical member frontier.
+  bool isByteFamily = name == "memcmp";
+  FailureOr<CharRegionArg> lhs = emitByteRegionArg(
+      call->getArg(0), /*isMut=*/false, /*interceptMember=*/isByteFamily);
   if (failed(lhs))
     return failure();
-  FailureOr<PtrExprValue> rhs = emitCharRegionArg(call->getArg(1));
+  FailureOr<CharRegionArg> rhs = emitByteRegionArg(
+      call->getArg(1), /*isMut=*/false, /*interceptMember=*/isByteFamily);
   if (failed(rhs))
     return failure();
   Value count;
@@ -623,16 +822,11 @@ CImporter::emitStringCompareCall(const clang::CallExpr *call,
       return emitError(loc) << "unsupported: " << name << " count type";
     count = castToIntType(loc, *n, builder.getIntegerType(64));
   }
-  // Both borrows are shared, so even two arguments into the same object
-  // coexist. Only the byte-family memcmp carries a u8 helper image
-  // (FR-72); strcmp/strncmp are NUL-terminated i8 string functions and
-  // keep the i8-only region rule.
-  bool isByteFamily = name == "memcmp";
-  FailureOr<Value> lhsSlice = emitCharRegionSlice(
+  FailureOr<Value> lhsSlice = emitByteRegionSlice(
       loc, *lhs, /*isMut=*/false, /*allowUnsignedByte=*/isByteFamily);
   if (failed(lhsSlice))
     return failure();
-  FailureOr<Value> rhsSlice = emitCharRegionSlice(
+  FailureOr<Value> rhsSlice = emitByteRegionSlice(
       loc, *rhs, /*isMut=*/false, /*allowUnsignedByte=*/isByteFamily);
   if (failed(rhsSlice))
     return failure();

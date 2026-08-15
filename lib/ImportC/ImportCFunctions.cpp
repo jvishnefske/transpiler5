@@ -2332,6 +2332,29 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "    }\n"
        "    0\n"
        "}"},
+      // FR-87: the u8 image of the same-region copy_within helper, for
+      // same-(root, field-path) memcpy/memmove over a ui8 member array
+      // (memmove's overlap-correct semantics, refining C's undefined
+      // overlapping memcpy exactly like the i8 original).
+      {"__emitrust_memcpy_within_u8",
+       "fn __emitrust_memcpy_within_u8(s: &mut [u8], dst: i64, src: i64, "
+       "n: i64) {\n"
+       "    s.copy_within(src as usize..(src + n) as usize, dst as usize);\n"
+       "}"},
+      // FR-87: the word-fill memset image for a `unsigned int` member
+      // array destination. `n` stays the BYTE count; admission requires
+      // it to be a constant multiple of 4 and the fill word to be the
+      // constant replicated fill byte (b * 0x01010101, endianness-
+      // neutral since all four bytes are equal), so the word walk is
+      // byte-exact memset.
+      {"__emitrust_memset_u32",
+       "fn __emitrust_memset_u32(s: &mut [u32], w: u32, n: i64) {\n"
+       "    let mut i = 0usize;\n"
+       "    while ((i * 4) as i64) < n {\n"
+       "        s[i] = w;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
   };
   for (const auto &helper : kStringHelpers) {
     if (!neededStringHelpers.contains(helper.name) ||
