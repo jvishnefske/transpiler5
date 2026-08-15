@@ -5865,6 +5865,45 @@ bool CImporter::externalRequirementsAllowed() {
   return !entry || entry.isExternal();
 }
 
+bool CImporter::classifyTimeTraitEligible() {
+  // FR-57a defer mode takes precedence over the trait path in
+  // `finalizeProject`, so it must equally suppress the eager slice
+  // classification: a deferred declaration keeps its historical
+  // scalar-reference shape for the FR-58 link step.
+  if (deferExternals)
+    return false;
+  switch (externalRequirements) {
+  case emitrust::ExternalRequirements::Reject:
+    return false;
+  case emitrust::ExternalRequirements::Trait:
+    return true;
+  case emitrust::ExternalRequirements::TraitWhenLibrary:
+    break;
+  }
+  // The per-TU spelling of the library predicate: `finalizeProject` asks
+  // whether the merged MODULE defines `c_main`, but classification runs
+  // mid-import, so the question is asked of the current AST — does THIS
+  // TU define `main`? (A body-less `main` declaration does not count,
+  // matching `externalRequirementsAllowed`.) For a multi-TU project whose
+  // `main` lives in another TU the approximation diverges; every
+  // divergent outcome is a located rejection downstream, never a silent
+  // shape change. Scanned once per AST.
+  clang::ASTContext &ctx = astContext();
+  auto it = classifyTimeTraitCache.find(&ctx);
+  if (it != classifyTimeTraitCache.end())
+    return it->second;
+  bool definesMain = false;
+  for (const clang::Decl *decl : ctx.getTranslationUnitDecl()->decls())
+    if (const auto *fn = llvm::dyn_cast<clang::FunctionDecl>(decl))
+      if (fn->getDeclName().isIdentifier() && fn->getName() == "main" &&
+          fn->getDefinition()) {
+        definesMain = true;
+        break;
+      }
+  classifyTimeTraitCache.try_emplace(&ctx, !definesMain);
+  return !definesMain;
+}
+
 bool CImporter::isExternalRequirementGlobalShape(llvm::StringRef symbol,
                                                  Type type) {
   // Only a type the trait can faithfully pass BY VALUE qualifies: the
