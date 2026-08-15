@@ -234,10 +234,15 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
             .first->second;
     structDefRecords[mangledRef] = definition;
     OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
-    moduleBuilder.create<emitrust::StructDefOp>(
+    auto structDef = moduleBuilder.create<emitrust::StructDefOp>(
         defLoc, moduleBuilder.getStringAttr(mangledRef),
         moduleBuilder.getStrArrayAttr(fieldNames),
         moduleBuilder.getTypeArrayAttr(fieldTypes));
+    // FR-78: the opaque-union marker anchors the emitter's backstop (any
+    // leaked arm access is refused at translate, never rustc E0609).
+    if (opaqueUnions.contains(definition))
+      structDef->setAttr(emitrust::kOpaqueUnionAttrName,
+                         moduleBuilder.getUnitAttr());
     return success();
   }
 
@@ -250,6 +255,16 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
     llvm::raw_string_ostream os(shape);
     for (auto [fieldName, fieldType] : llvm::zip(fieldNames, fieldTypes))
       os << fieldName << ':' << fieldType << ';';
+    // FR-78: every opaque union shares one blob field shape
+    // (`opaque:[u8;N]`), but the C arm types are the real identity — fold
+    // them into the shape key so two structurally different anonymous
+    // opaque unions never merge under the shape-keyed `Anon<n>` naming,
+    // while the same union reached through a shared header in several TUs
+    // still dedups to one struct_def.
+    if (opaqueUnions.contains(definition))
+      for (const clang::FieldDecl *arm : definition->fields())
+        os << arm->getName() << '@'
+           << arm->getType().getCanonicalType().getAsString() << ';';
   }
 
   // File-scope named records go through the tag-versus-ordinary-namespace
@@ -315,10 +330,15 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   structDefRecords[structName] = definition;
 
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
-  moduleBuilder.create<emitrust::StructDefOp>(
+  auto structDef = moduleBuilder.create<emitrust::StructDefOp>(
       defLoc, moduleBuilder.getStringAttr(structName),
       moduleBuilder.getStrArrayAttr(fieldNames),
       moduleBuilder.getTypeArrayAttr(fieldTypes));
+  // FR-78: the opaque-union marker anchors the emitter's backstop (any
+  // leaked arm access is refused at translate, never rustc E0609).
+  if (opaqueUnions.contains(definition))
+    structDef->setAttr(emitrust::kOpaqueUnionAttrName,
+                       moduleBuilder.getUnitAttr());
   // W2.2: a genuine C++ class's non-static-data-member methods (mutating,
   // const, static, and non-delegating constructors) import onto the
   // `emitrust.impl`/`emitrust.method_of` surface right after the struct
@@ -783,6 +803,49 @@ LogicalResult CImporter::collectUnionSlot(
     if (slotWidth != 0 && armWidth != 0)
       return emitError(unionLoc)
              << "unsupported: union arms of differing sizes";
+    // FR-78: exactly where the residual one-slot rejection would fire, an
+    // ALL-aggregate-arm union (every arm a record or constant array —
+    // lwIP's `union { ip6_addr_t; ip4_addr_t; }`) diverts to the OPAQUE
+    // STORAGE model instead: the union imports as a single sizeof-sized
+    // byte blob whose struct_def carries `emitrust.opaque_union`, so a
+    // RECORD containing it imports and whole-value copies work, while
+    // every access through any arm rejects at its own site
+    // (`emitMemberLValue`/`projectMemberPlace`/`emitRecordInitField`/
+    // `convertAPValueInit`) and the Rust emitter refuses any leaked arm
+    // access (marker contract). Any scalar, pointer, bit-field, or
+    // unnamed arm keeps the C99-44 one-slot rejections above verbatim,
+    // and the C++ path is out of scope — both keep today's record-level
+    // rejection.
+    bool allArmsAggregate =
+        !astContext().getLangOpts().CPlusPlus &&
+        llvm::all_of(definition->fields(), [&](const clang::FieldDecl *f) {
+          return f->getType()->isRecordType() ||
+                 astContext().getAsConstantArrayType(f->getType());
+        });
+    if (allArmsAggregate) {
+      // Arms admitted earlier in this loop (identical-type aliases) were
+      // recorded as slot aliases; under the opaque model EVERY arm is
+      // access-rejected instead, so those entries must not survive.
+      fieldNames.clear();
+      fieldTypes.clear();
+      for (const clang::FieldDecl *member : definition->fields()) {
+        unionSlotStorage.erase(member);
+        opaqueUnionArms.insert(member);
+      }
+      opaqueUnions.insert(definition);
+      // C sizeof of the union (largest arm rounded up to alignment, C99
+      // 6.7.2.1), NOT the largest arm's bare size: keeps the existing
+      // sizeof/alignof constant folds consistent with the blob.
+      uint64_t bytes =
+          astContext()
+              .getTypeSizeInChars(astContext().getRecordType(definition))
+              .getQuantity();
+      fieldNames.push_back(memberNameArena.emplace_back("opaque"));
+      fieldTypes.push_back(emitrust::ArrayType::get(
+          builder.getContext(), bytes,
+          IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned)));
+      return success();
+    }
     return emitError(unionLoc)
            << "unsupported: union arm cannot alias the storage slot";
   }

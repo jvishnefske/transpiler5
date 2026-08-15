@@ -1415,6 +1415,15 @@ LogicalResult CImporter::emitRecordInitField(Value place,
     return emitError(elementLoc) << "unsupported: flexible array member access";
   if (isZeroLengthArrayType(field->getType()))
     return success();
+  // FR-78: a braced initializer naming an opaque-union arm cannot land on
+  // the blob — this per-field path is EXACTLY where the rejected
+  // placeholder attempt leaked (the union branch of
+  // `emitRecordInitFields` emitted the active arm's member op with no
+  // slot lookup, rustc E0609). A list initializing NO arm never reaches
+  // here and keeps the blob's zero default.
+  if (opaqueUnionArms.contains(field))
+    return emitError(elementLoc)
+           << "unsupported: opaque union arm initializer";
   // An admitted `void *` fn-ptr member (CTS-BR, 00216) initializes from
   // the address of a function of its one signature: the member place is
   // the retyped fn_ptr field, the value the folded Some(target) (or None

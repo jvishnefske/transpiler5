@@ -88,3 +88,26 @@ emitrust.func @use_missing() -> !emitrust.fn_ptr<(i32) -> i32> {
   %0 = emitrust.constant <#emitrust.opaque<"Some(missing)">> : !emitrust.fn_ptr<(i32) -> i32>
   emitrust.return %0 : !emitrust.fn_ptr<(i32) -> i32>
 }
+
+// -----
+
+// FR-78 marker contract: an `emitrust.opaque_union`-marked struct_def is a
+// differing-aggregate-arm C union imported as OPAQUE STORAGE (one byte-blob
+// field); the importer must reject every access through any union arm at
+// its own site. If one leaks here anyway, nothing structural catches it --
+// `emitrust.member` field names are not cross-checked against the
+// struct_def, so the verifier passes and the rendered Rust selects a field
+// the struct does not have: rustc E0609, a whole-crate loss with no source
+// location (exactly how the pre-FR-78 union placeholder died). The emitter
+// therefore refuses ANY member selection on a marked type, even a
+// well-typed-looking one.
+emitrust.struct_def @U ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
+emitrust.struct_def @Rec ["u"] [!emitrust.struct<"U">]
+emitrust.func @leak(%arg0: !emitrust.mut_ref<!emitrust.struct<"Rec">>) -> i32 {
+  %0 = emitrust.deref %arg0 : (!emitrust.mut_ref<!emitrust.struct<"Rec">>) -> !emitrust.lvalue<!emitrust.struct<"Rec">>
+  %1 = emitrust.member %0["u"] : (!emitrust.lvalue<!emitrust.struct<"Rec">>) -> !emitrust.lvalue<!emitrust.struct<"U">>
+  // CHECK: opaque union 'U' member access leaked to emission; the importer must reject this at the access site
+  %2 = emitrust.member %1["a"] : (!emitrust.lvalue<!emitrust.struct<"U">>) -> !emitrust.lvalue<i32>
+  %3 = emitrust.load %2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %3 : i32
+}
