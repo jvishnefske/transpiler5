@@ -400,6 +400,20 @@ static bool isValidStructFieldType(Type type) {
              EnumType, FnPtrType, mlir::emitrust::OpaqueType>(type);
 }
 
+StructDefOp StructDefOp::lookupFrom(Operation *from, llvm::StringRef name) {
+  // FR-84: definitions are module children, but `from` may live inside a
+  // nested symbol table (an `emitrust.impl` method — the actor plan stages
+  // an exported struct global's aggregate initializer in a variable inside
+  // the owner's new()), so resolve in the enclosing module's table; fall
+  // back to the nearest table for unattached IR. Mirrors
+  // DataEnumDefOp::lookupFrom / GlobalOp::lookupFrom.
+  auto nameAttr = StringAttr::get(from->getContext(), name);
+  if (auto module = from->getParentOfType<ModuleOp>())
+    return dyn_cast_or_null<StructDefOp>(
+        SymbolTable::lookupSymbolIn(module, nameAttr));
+  return SymbolTable::lookupNearestSymbolFrom<StructDefOp>(from, nameAttr);
+}
+
 //===----------------------------------------------------------------------===//
 // TraitDefOp
 //===----------------------------------------------------------------------===//
@@ -803,8 +817,10 @@ static LogicalResult verifyAggregateInit(Operation *op, Attribute init,
     return success();
   }
   if (auto structType = dyn_cast<StructType>(type)) {
-    auto structDef = SymbolTable::lookupNearestSymbolFrom<StructDefOp>(
-        op, StringAttr::get(op->getContext(), structType.getName()));
+    // FR-84: module-first resolution — `op` may be an impl-nested
+    // emitrust.variable (the actor plan's staged initializer in the owner's
+    // new()), whose nearest symbol table is the def-less emitrust.impl.
+    StructDefOp structDef = StructDefOp::lookupFrom(op, structType.getName());
     if (!structDef)
       return op->emitOpError("aggregate init for struct type ")
              << type << " requires a visible emitrust.struct_def";

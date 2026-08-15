@@ -3120,8 +3120,11 @@ verifyFnPtrTargetsPresent(Operation *op, Attribute init, Type type,
     return success();
   }
   if (auto structType = dyn_cast<emitrust::StructType>(type)) {
-    auto structDef = SymbolTable::lookupNearestSymbolFrom<emitrust::StructDefOp>(
-        op, StringAttr::get(op->getContext(), structType.getName()));
+    // FR-84: module-first — the walked emitrust.constant may sit inside an
+    // impl method, and a nearest-table miss here would silently SKIP the
+    // located refusal this check exists to give (rustc E0425 instead).
+    emitrust::StructDefOp structDef =
+        emitrust::StructDefOp::lookupFrom(op, structType.getName());
     if (!structDef || elements.size() != structDef.getFieldTypes().size())
       return success(); // Shape mismatch is the aggregate renderer's error.
     for (auto [element, fieldType] :
@@ -5186,9 +5189,12 @@ LogicalResult RustEmitter::emitAggregateInit(Operation *op, Location loc,
     return success();
   }
   if (auto structType = dyn_cast<emitrust::StructType>(type)) {
-    auto structDef = SymbolTable::lookupNearestSymbolFrom<
-        emitrust::StructDefOp>(op, StringAttr::get(op->getContext(),
-                                                   structType.getName()));
+    // FR-84: module-first resolution — `op` may be an impl-nested
+    // emitrust.variable (the actor plan's staged initializer in the
+    // owner's new()), whose nearest symbol table is the def-less
+    // emitrust.impl.
+    emitrust::StructDefOp structDef =
+        emitrust::StructDefOp::lookupFrom(op, structType.getName());
     if (!structDef)
       return op->emitOpError("aggregate init for struct type ")
              << type << " requires a visible emitrust.struct_def";
@@ -5262,6 +5268,10 @@ static bool isConstEvaluableInit(Operation *op, Attribute init, Type type) {
         return isConstEvaluableInit(op, element, arrayType.getElementType());
       });
     if (auto structType = dyn_cast<emitrust::StructType>(type)) {
+      // The nearest-table lookup is exact here: `op` is always the
+      // GlobalOp under emitGlobal, and emitrust.global carries
+      // HasParent<ModuleOp>, so the nearest table IS the module — the
+      // FR-84 impl-nesting pitfall cannot occur at this site.
       auto structDef =
           SymbolTable::lookupNearestSymbolFrom<emitrust::StructDefOp>(
               op, StringAttr::get(op->getContext(), structType.getName()));

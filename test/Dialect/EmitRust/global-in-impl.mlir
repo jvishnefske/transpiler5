@@ -9,6 +9,13 @@
 // slice 5a), the accessors must resolve in the ENCLOSING MODULE's symbol
 // table. All three accessor ops are exercised inside a method; the file
 // must verify and reprint byte-stably through a second emitrust-opt.
+//
+// FR-84 extends the same pin to the aggregate-init verifier: an
+// `emitrust.variable` with a struct list initializer INSIDE an impl method
+// (the shape the actor plan stages for an exported const-struct global's
+// initializer in the owner's new()) must resolve the module-level
+// `emitrust.struct_def` — the nearest-table lookup saw only the impl's
+// def-less table and killed the whole crate (the lwIP ip4_addr loss).
 // RUN: emitrust-opt %s | emitrust-opt | FileCheck %s
 
 // CHECK: emitrust.global @total <0 : i32> : i32
@@ -44,4 +51,20 @@ emitrust.impl "Owner_main_values" {
     }
     emitrust.return
   }
+
+  // FR-84: a struct aggregate init (with a nested array field, partially
+  // zero-filled) inside the impl's nested symbol table sees the
+  // module-level struct_defs @Cal and @Inner below.
+  // CHECK-LABEL: emitrust.func @stage_init
+  emitrust.func @stage_init(%arg0: !emitrust.mut_ref<!emitrust.struct<"Owner_main_values">>) {
+    // CHECK: emitrust.variable const <[-7 : i32, [2 : i32, -3 : i32, 0 : i32], [1 : i32, 2 : i32]]> : !emitrust.lvalue<!emitrust.struct<"Cal">>
+    %0 = emitrust.variable const <[-7 : i32, [2 : i32, -3 : i32, 0 : i32], [1 : i32, 2 : i32]]> : !emitrust.lvalue<!emitrust.struct<"Cal">>
+    emitrust.return
+  }
 }
+
+// The defs sit AFTER the impl on purpose: resolution is by symbol table,
+// not lexical order.
+// CHECK: emitrust.struct_def @Cal
+emitrust.struct_def @Cal ["base", "taps", "inner"] [i32, !emitrust.array<3xi32>, !emitrust.struct<"Inner">]
+emitrust.struct_def @Inner ["a", "b"] [i32, i32]
