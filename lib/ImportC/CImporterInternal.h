@@ -5264,6 +5264,14 @@ private:
   /// read through `voidByteSliceElem`.
   llvm::DenseMap<const clang::FunctionDecl *, SmallVector<clang::QualType, 4>>
       voidByteElemsCache;
+  /// FR-76: true while `mapType` is mapping the COMPONENTS of a fn-ptr
+  /// type. The component loop classifies arithmetic-pointee scalar-pointer
+  /// parameters as region-typed slices, but only ONE level deep: a nested
+  /// fn-ptr component whose own signature names a pointer stays on the
+  /// plain-`mapType` path (and its pointer residual), keeping nested
+  /// fn-ptrs-with-pointer-components an explicit frontier while
+  /// pointer-free nested fn_ptrs remain valid components as before.
+  bool mappingFnPtrComponent = false;
   /// FR-75: per-AST cache of `classifyTimeTraitEligible`'s TraitWhenLibrary
   /// leg (whether the TU's AST defines no `main`); each TU is scanned once.
   llvm::DenseMap<const clang::ASTContext *, bool> classifyTimeTraitCache;

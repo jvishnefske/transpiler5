@@ -1654,6 +1654,12 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // identifier namespace will claim, so struct tag naming
   // (`structSymbolName`) is independent of declaration order.
   collectOrdinaryNames(unit);
+  // CTS-S Pass A: per-TU fn-ptr facts (written globals, address-taken
+  // functions) and the devirtualization aliases of never-reassigned
+  // global function pointers. Pure-AST; hoisted before `planOwners`
+  // (FR-76) so the owner planner can consult `addressTakenFunctions` —
+  // an address-taken function cannot become an owner method.
+  planFnPtrAliases(unit);
   // Phase-4 Pass A: pure-AST owner planning over every function definition
   // before any IR is built; Pass B below consults the plans.
   planOwners(unit, soleTranslationUnit);
@@ -1679,10 +1685,6 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // CTS-P10 Pass A: cell-slice classification of pointer-parameter
   // classes whose bases are all mutable global arrays.
   planCellSlices(unit, soleTranslationUnit);
-  // CTS-S Pass A: per-TU fn-ptr facts (written globals, address-taken
-  // functions) and the devirtualization aliases of never-reassigned
-  // global function pointers.
-  planFnPtrAliases(unit);
   // CTS 00204 Pass A: string-cursor parameter plans and va_list
   // monomorphization plans. Both run BEFORE any declaration imports so
   // their located rejections (escape shapes, va_copy, address-of) beat

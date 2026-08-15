@@ -17,6 +17,8 @@
 
 #include "CImporterInternal.h"
 
+#include "llvm/Support/SaveAndRestore.h"
+
 using namespace mlir;
 
 //===----------------------------------------------------------------------===//
@@ -271,12 +273,40 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
   if (canonical->isFunctionPointerType()) {
     const auto *fnType =
         canonical->getPointeeType()->castAs<clang::FunctionType>();
+    // FR-76: an arithmetic-pointee scalar-pointer PARAMETER component
+    // classifies as a region-typed slice — the same `mapParamType` Slice
+    // branch a body-classified parameter uses (`&mut [T]`, shared `&[u8]`
+    // for the const-u8 flavor, FR-55/CTS-BR) — so a callback signature
+    // like `void (*)(uint8_t *, unsigned)` imports instead of funneling
+    // into the pointer residual and rejecting the whole record. One level
+    // deep only (`mappingFnPtrComponent` gates the recursion: a NESTED
+    // fn-ptr component keeps plain mapping, so nested-with-pointer stays a
+    // located frontier) and C-only (the C++ divert is untouched). Unlike
+    // FR-75's eager block this is gate-free — the classification is a
+    // property of the TYPE, not of a trait policy — and the address-taken
+    // forcing in `classifyPointerParams` keeps a bound function's own
+    // signature exactly equal, so `resolveFunctionPointerDecl`'s equality
+    // check stays the loud backstop for every unforceable mismatch
+    // (CellSlice, Carrier). Components outside the subset — struct
+    // pointers, `void *` (no consensus source solo-TU), pointer-to-pointer
+    // — fall through to `mapType` and keep their located rejections.
+    const bool classifyComponents =
+        !astContext().getLangOpts().CPlusPlus && !mappingFnPtrComponent;
+    llvm::SaveAndRestore<bool> componentGuard(mappingFnPtrComponent, true);
     SmallVector<Type> inputs;
     if (const auto *proto = llvm::dyn_cast<clang::FunctionProtoType>(fnType)) {
       if (proto->isVariadic())
         return emitError(loc) << "unsupported: variadic function pointer type";
       for (clang::QualType param : proto->getParamTypes()) {
-        FailureOr<Type> mapped = mapType(param, loc);
+        bool sliceComponent = false;
+        if (classifyComponents && isDataPointer(param)) {
+          clang::QualType pointee =
+              param.getCanonicalType()->getPointeeType();
+          sliceComponent = pointee.getCanonicalType()->isArithmeticType();
+        }
+        FailureOr<Type> mapped =
+            sliceComponent ? mapParamType(param, loc, ParamKind::Slice)
+                           : mapType(param, loc);
         if (failed(mapped))
           return failure();
         if (!emitrust::FnPtrType::isValidComponentType(*mapped))
@@ -1009,6 +1039,35 @@ CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
           byteElems[index] = elem;
         }
       }
+    }
+  }
+  // FR-76 unification (option (b) of the spike): a function whose ADDRESS
+  // is taken is (prospectively) bound into a fn-ptr position, and the
+  // fn-ptr TYPE mapping classifies every arithmetic-pointee scalar-pointer
+  // component as a region-typed slice. The function's own classification
+  // must present the same region contract or the natural callback-table
+  // shape would mismatch at the binding — measured in the spike: a
+  // deref-only body stays ScalarRef (`&mut u8`) under `collectSliceParams`
+  // alone, and a direct call with a local array would promote the callee
+  // to an Owner_ method (`planOwners` now disqualifies address-taken
+  // functions for the same reason). Only ScalarRef is forced: CellSlice (a
+  // Cell-backed global class has no `&mut [T]` to lend) and Carrier keep
+  // their kinds and fall to `resolveFunctionPointerDecl`'s located
+  // signature-mismatch rejection, never a silent unification. C-only;
+  // variadic targets can never bind to a fn_ptr, and a system-header
+  // address is rejected at resolution, so both are excluded from forcing.
+  if (!astContext().getLangOpts().CPlusPlus && !func->isVariadic() &&
+      !isSystemHeaderDecl(func) &&
+      llvm::is_contained(addressTakenFunctions, canonical) &&
+      func->getNumParams() == kinds.size()) {
+    for (auto [index, param] : llvm::enumerate(func->parameters())) {
+      if (kinds[index] != ParamKind::ScalarRef ||
+          !isDataPointer(param->getType()))
+        continue;
+      clang::QualType pointee =
+          param->getType().getCanonicalType()->getPointeeType();
+      if (pointee.getCanonicalType()->isArithmeticType())
+        kinds[index] = ParamKind::Slice;
     }
   }
   voidByteElemsCache.try_emplace(canonical, std::move(byteElems));
