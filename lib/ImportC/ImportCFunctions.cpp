@@ -394,7 +394,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       }
       FailureOr<Type> paramType =
           mapParamType(param->getType(), translateLoc(param->getLocation()),
-                       paramKinds[index]);
+                       paramKinds[index], voidByteSliceElem(func, index));
       if (failed(paramType))
         return failure();
       inputTypes.push_back(*paramType);
@@ -1305,7 +1305,7 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
     }
     FailureOr<Type> paramType =
         mapParamType(param->getType(), translateLoc(param->getLocation()),
-                     paramKinds[index]);
+                     paramKinds[index], voidByteSliceElem(func, index));
     if (failed(paramType))
       return failure();
     inputTypes.push_back(*paramType);
