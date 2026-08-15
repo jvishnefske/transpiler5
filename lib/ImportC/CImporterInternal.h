@@ -4568,10 +4568,13 @@ private:
   /// FR-74: matches a member-array slice ARGUMENT — a dot/arrow
   /// projection chain ending at a fixed-extent array-typed field —
   /// against the admitted base forms: a LOCAL struct place (dot chains,
-  /// nested) or an arrow at the chain root through a ref/mut_ref-struct
-  /// pointer parameter (the one pointer convention whose member place
-  /// is the pointee itself rather than a staged copy or a decomposed
-  /// cursor). On a match, `chainRoot` receives the root variable and
+  /// nested), an arrow at the chain root through a ref/mut_ref-struct
+  /// pointer parameter (the pointer convention whose member place is
+  /// the pointee itself), or — FR-86 mechanism A — an arrow root
+  /// through a DECOMPOSED (null-compared) struct-pointer parameter's
+  /// own slice-of-struct region, whose member place is the
+  /// subscript-at-current-cursor projection `s->n` already lowers to.
+  /// On a match, `chainRoot` receives the root variable and
   /// `path` the field chain (outermost first). A non-match returns
   /// false WITHOUT diagnosing so the caller falls through to the
   /// historical verbatim rejection: global roots (their member place is

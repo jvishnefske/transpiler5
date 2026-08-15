@@ -17,6 +17,18 @@
 // borrow in Rust. Note main deliberately touches no member array
 // element before the pinned calls, so each pinned `member` op is the
 // argument's own projection.
+//
+// FR-86 extends the SAME interception with a NONZERO cursor for the
+// OFFSET spellings `s.m + k` and `&s.m[k]` (tinycrypt's
+// `add_round_key(state, s->words + Nb*Nr)` and hmac's
+// `&dummy_state.key[TC_SHA256_DIGEST_SIZE]`): `slice_of` already takes
+// a cursor operand, so the offset argument is the member place at
+// cursor k. An integer-constant index folds to a literal i64 cursor; a
+// runtime index is admitted only when conservatively PURE (it is
+// evaluated exactly once, ahead of the call) and rides in as the
+// cast-to-i64 rvalue. Both dot and arrow roots are pinned, in the
+// constant and the runtime-pure form — these were FR-74's explicitly
+// deferred frontier arms (OFFSETPLUS/OFFSETSUB), now moved forward.
 
 struct S {
   unsigned char a[8];
@@ -81,6 +93,21 @@ static void compress(struct S *s) {
   // CHECK: %[[YS:.+]] = emitrust.slice_of mut %[[XB]][%{{.+}}]
   // CHECK-NEXT: call @mix(%[[XS]], %[[YS]],
   mix(s->a, s->b, s->n);
+  /* FR-86 ARROW-root offset, CONSTANT index: the `+ 4` folds to a
+     literal i64 cursor on the same member place. */
+  // CHECK: %[[OA:.+]] = emitrust.member %{{.+}}["a"]
+  // CHECK-NEXT: %[[OC:.+]] = arith.constant 4 : i64
+  // CHECK-NEXT: %[[OS:.+]] = emitrust.slice_of mut %[[OA]][%[[OC]]]
+  // CHECK-NEXT: call @bump(%[[OS]],
+  bump(s->a + 4, 4u);
+  /* FR-86 ARROW-root offset, RUNTIME PURE index (`&s->b[s->n - 6u]`):
+     the index expression is a member load — pure, evaluated once —
+     and becomes the cast-to-i64 cursor. */
+  // CHECK: %[[RB:.+]] = emitrust.member %{{.+}}["b"]
+  // CHECK: %[[RC:.+]] = emitrust.cast %{{.+}} : ui32 to i64
+  // CHECK-NEXT: %[[RS:.+]] = emitrust.slice_of mut %[[RB]][%[[RC]]]
+  // CHECK-NEXT: call @bump(%[[RS]],
+  bump(&s->b[s->n - 6u], 2u);
 }
 
 /* NESTED dot chain: o.in.iv projects two members deep (the C field
@@ -126,6 +153,21 @@ int main(void) {
   // CHECK-NEXT: %[[SIV:.+]] = emitrust.slice_of mut %[[MIV]][%[[C3]]]
   // CHECK-NEXT: call @bump(%[[SIV]],
   bump(o.in.iv, o.n);
+  /* FR-86 DOT-root offset, CONSTANT index — the former OFFSETPLUS
+     frontier arm (`s.a + 2`), now a positive pin. */
+  // CHECK: %[[PA2:.+]] = emitrust.member %{{.+}}["a"]
+  // CHECK-NEXT: %[[PC2:.+]] = arith.constant 2 : i64
+  // CHECK-NEXT: %[[PS2:.+]] = emitrust.slice_of mut %[[PA2]][%[[PC2]]]
+  // CHECK-NEXT: call @bump(%[[PS2]],
+  bump(s.a + 2, 6u);
+  /* FR-86 DOT-root subscript-address, RUNTIME PURE index — the former
+     OFFSETSUB arm's spelling with a member-load index (`&s.a[s.n - 4u]`,
+     the hmac/cmac shape), shared borrow for the const parameter. */
+  // CHECK: %[[QA:.+]] = emitrust.member %{{.+}}["a"]
+  // CHECK: %[[QC:.+]] = emitrust.cast %{{.+}} : ui32 to i64
+  // CHECK-NEXT: %[[QS:.+]] = emitrust.slice_of %[[QA]][%[[QC]]]
+  // CHECK-NEXT: call @csum(%[[QS]],
+  c += csum(&s.a[s.n - 4u], 4u);
   // CHECK: call @compress(
   compress(&s);
   return (int)(c & 3u) + (r & 3);

@@ -3716,6 +3716,66 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
   return callOp->getResult(0);
 }
 
+/// FR-86: conservative purity for a slice-argument OFFSET index. The
+/// interception evaluates the index exactly ONCE, ahead of the call, so
+/// admission requires only that the evaluation itself has no side
+/// effects (nothing to duplicate, nothing to reorder). Admitted:
+/// integer/character literals, enum constants, reads of local variables
+/// and parameters, member chains over those (an `->` root reads its
+/// pointer — also pure), sizeof/alignof, casts and parens, unary
+/// +/-/~/! and non-assignment binary arithmetic over pure operands.
+/// Everything else — a CALL, an inc/dec, any assignment, and every
+/// unlisted node — is treated as impure, which DECLINES the
+/// interception so the historical located decay rejection fires
+/// unchanged (the pinned frontier).
+static bool isPureSliceCursorExpr(const clang::Expr *expr) {
+  expr = stripTrivia(expr);
+  if (llvm::isa<clang::IntegerLiteral, clang::CharacterLiteral>(expr))
+    return true;
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(expr)) {
+    if (llvm::isa<clang::EnumConstantDecl>(ref->getDecl()))
+      return true;
+    const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+    return var && var->hasLocalStorage();
+  }
+  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(expr))
+    return isPureSliceCursorExpr(member->getBase());
+  if (const auto *cast = llvm::dyn_cast<clang::CastExpr>(expr))
+    return isPureSliceCursorExpr(cast->getSubExpr());
+  if (llvm::isa<clang::UnaryExprOrTypeTraitExpr>(expr))
+    return true;
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(expr)) {
+    switch (unary->getOpcode()) {
+    case clang::UO_Plus:
+    case clang::UO_Minus:
+    case clang::UO_Not:
+    case clang::UO_LNot:
+      return isPureSliceCursorExpr(unary->getSubExpr());
+    default:
+      return false;
+    }
+  }
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(expr)) {
+    switch (binary->getOpcode()) {
+    case clang::BO_Add:
+    case clang::BO_Sub:
+    case clang::BO_Mul:
+    case clang::BO_Div:
+    case clang::BO_Rem:
+    case clang::BO_Shl:
+    case clang::BO_Shr:
+    case clang::BO_And:
+    case clang::BO_Or:
+    case clang::BO_Xor:
+      return isPureSliceCursorExpr(binary->getLHS()) &&
+             isPureSliceCursorExpr(binary->getRHS());
+    default:
+      return false;
+    }
+  }
+  return false;
+}
+
 bool CImporter::matchMemberArraySliceArg(
     const clang::MemberExpr *member, bool isMutParam,
     const clang::VarDecl *&chainRoot,
@@ -3741,12 +3801,69 @@ bool CImporter::matchMemberArraySliceArg(
     const clang::Expr *base = stripTrivia(link->getBase());
     if (link->isArrow()) {
       // Arrow only at the chain ROOT, through a ref/mut_ref-struct
-      // pointer parameter: its member place is the pointee itself
-      // (deref + member). A decomposed pointer or an erased-global
-      // return base resolves to a staged copy or cursor state instead,
-      // so those fall through to the historical rejection.
-      if (isDecomposedPointerExpr(base))
-        return false;
+      // pointer parameter (its member place is the pointee itself,
+      // deref + member) or — FR-86 mechanism A — through a DECOMPOSED
+      // struct-pointer parameter. A null-compared struct pointer
+      // (`if (s == (Cp)0) return;` — tinycrypt null-checks every
+      // context pointer) demotes to the (slice-of-struct base, i64
+      // cursor) representation, and its member place is exactly what
+      // `s->n` already lowers to: subscript the deref'd slice base at
+      // the CURRENT cursor, then project the member. Admission is
+      // deliberately narrow — the root must be the parameter's OWN
+      // self-based region (pointerLocals base == the var itself; no
+      // nullable discriminant, no multi-base, no literal/heap backing,
+      // no member base), its symbols-held place must be either the
+      // deref'd slice-of-struct base (the Phase-1b slice
+      // decomposition) or the owner method's array-of-struct data
+      // place (the owner-region pointer-parameter form of the same
+      // decomposition — receiver methods always hold `&mut self`, so
+      // mutability is given there), and a MUTABLE slice cannot borrow
+      // through a SHARED (const-pointee) slice region. Every other
+      // decomposed shape (and an erased-global return base, which
+      // resolves to a staged copy) falls through to the historical
+      // rejection.
+      if (isDecomposedPointerExpr(base)) {
+        const auto *ref =
+            llvm::dyn_cast<clang::DeclRefExpr>(base->IgnoreParenImpCasts());
+        const auto *var =
+            ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+        if (!var || !var->hasLocalStorage())
+          return false;
+        auto localIt = pointerLocals.find(var);
+        if (localIt == pointerLocals.end())
+          return false;
+        const PointerLocalInfo &info = localIt->second;
+        if (info.base != var || info.nonNullCell || info.baseIndexCell ||
+            info.literalBacking || info.backing || info.member)
+          return false;
+        auto it = symbols.find(var);
+        if (it == symbols.end())
+          return false;
+        auto lvalue =
+            llvm::dyn_cast<emitrust::LValueType>(it->second.getType());
+        if (!lvalue)
+          return false;
+        Type regionElement;
+        bool ownerDataRegion = false;
+        if (auto sliceType =
+                llvm::dyn_cast<emitrust::SliceType>(lvalue.getValueType())) {
+          regionElement = sliceType.getElementType();
+        } else if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(
+                       lvalue.getValueType())) {
+          regionElement = arrayType.getElementType();
+          ownerDataRegion = true;
+        }
+        if (!regionElement || !llvm::isa<emitrust::StructType>(regionElement))
+          return false;
+        if (isMutParam && !ownerDataRegion) {
+          auto deref = it->second.getDefiningOp<emitrust::DerefOp>();
+          if (!deref || !llvm::isa<emitrust::MutRefType>(
+                            deref->getOperand(0).getType()))
+            return false;
+        }
+        chainRoot = var;
+        break;
+      }
       // The pointer READ under `->` arrives as an LValueToRValue cast
       // over the parameter reference; peel it to name the root.
       const auto *ref =
@@ -3929,15 +4046,62 @@ FailureOr<Value> CImporter::emitBorrowArgument(
     // its verbatim rejection, because the pointer decomposition has no
     // representation for a member-rooted region. Unadmitted chains fall
     // through to `emitPointerRValue`'s historical rejection unchanged.
-    if (const auto *memberDecay =
-            llvm::dyn_cast<clang::ImplicitCastExpr>(strippedArg);
-        memberDecay &&
-        memberDecay->getCastKind() == clang::CK_ArrayToPointerDecay) {
-      const auto *member = llvm::dyn_cast<clang::MemberExpr>(
-          stripTrivia(memberDecay->getSubExpr()));
+    //
+    // FR-86 extends the SAME interception with a NONZERO cursor for the
+    // OFFSET spellings `s.m + k` and `&s.m[k]` (tinycrypt's
+    // `add_round_key(state, s->words + Nb*Nr)`): `slice_of` already
+    // takes a cursor operand, so the offset argument is the member
+    // place at cursor k. The index is evaluated exactly ONCE, ahead of
+    // the call: an integer-constant index folds to a literal i64
+    // cursor, and a runtime index is admitted only when conservatively
+    // PURE (`isPureSliceCursorExpr`) — an impure index (a call, an
+    // inc/dec) DECLINES the interception so the historical located
+    // decay rejection fires unchanged.
+    {
+      const clang::Expr *decayedOperand = nullptr;
+      const clang::Expr *cursorIndex = nullptr; // null => whole member.
+      if (const auto *memberDecay =
+              llvm::dyn_cast<clang::ImplicitCastExpr>(strippedArg);
+          memberDecay &&
+          memberDecay->getCastKind() == clang::CK_ArrayToPointerDecay) {
+        decayedOperand = stripTrivia(memberDecay->getSubExpr());
+      } else if (const auto *addrOf =
+                     llvm::dyn_cast<clang::UnaryOperator>(strippedArg);
+                 addrOf && addrOf->getOpcode() == clang::UO_AddrOf) {
+        // `&s.m[k]`: address of a subscript over the decayed member.
+        if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(
+                stripTrivia(addrOf->getSubExpr())))
+          if (const auto *decay = llvm::dyn_cast<clang::ImplicitCastExpr>(
+                  stripTrivia(subscript->getBase()));
+              decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay) {
+            decayedOperand = stripTrivia(decay->getSubExpr());
+            cursorIndex = subscript->getIdx();
+          }
+      } else if (const auto *add =
+                     llvm::dyn_cast<clang::BinaryOperator>(strippedArg);
+                 add && add->getOpcode() == clang::BO_Add) {
+        // `s.m + k` (C also admits the commuted `k + s.m`).
+        const clang::Expr *pointerSide = stripTrivia(add->getLHS());
+        const clang::Expr *indexSide = stripTrivia(add->getRHS());
+        if (!pointerSide->getType()->isPointerType())
+          std::swap(pointerSide, indexSide);
+        if (const auto *decay =
+                llvm::dyn_cast<clang::ImplicitCastExpr>(pointerSide);
+            decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay) {
+          decayedOperand = stripTrivia(decay->getSubExpr());
+          cursorIndex = indexSide;
+        }
+      }
+      const auto *member =
+          llvm::dyn_cast_or_null<clang::MemberExpr>(decayedOperand);
+      std::optional<llvm::APSInt> constantCursor;
+      if (member && cursorIndex)
+        constantCursor = cursorIndex->getIntegerConstantExpr(astContext());
       const clang::VarDecl *chainRoot = nullptr;
       SmallVector<const clang::FieldDecl *, 2> chainPath;
       if (member &&
+          (!cursorIndex || constantCursor ||
+           isPureSliceCursorExpr(cursorIndex)) &&
           matchMemberArraySliceArg(member, isMutParam, chainRoot, chainPath)) {
         FailureOr<Value> place =
             emitMemberLValue(member, loc, /*writeback=*/nullptr);
@@ -3959,9 +4123,23 @@ FailureOr<Value> CImporter::emitBorrowArgument(
         root = chainRoot;
         if (rootPath)
           rootPath->assign(chainPath.begin(), chainPath.end());
-        Value zero = createIntConstant(loc, builder.getIntegerType(64), 0);
+        Value cursor;
+        if (constantCursor) {
+          cursor = createIntConstant(loc, builder.getIntegerType(64),
+                                     constantCursor->getExtValue());
+        } else if (cursorIndex) {
+          FailureOr<Value> rawIndex = emitRValue(cursorIndex);
+          if (failed(rawIndex))
+            return failure();
+          if (!llvm::isa<IntegerType>((*rawIndex).getType()))
+            return emitError(loc) << "unsupported subscript index type";
+          cursor =
+              castToIntType(loc, *rawIndex, builder.getIntegerType(64));
+        } else {
+          cursor = createIntConstant(loc, builder.getIntegerType(64), 0);
+        }
         return builder
-            .create<emitrust::SliceOfOp>(loc, paramType, *place, zero,
+            .create<emitrust::SliceOfOp>(loc, paramType, *place, cursor,
                                          /*is_mut=*/isMutParam)
             .getResult();
       }
