@@ -5126,6 +5126,50 @@ piece and becomes FR-45.
   non-fold address shapes (the residual the FR-82 table
   predicted). Full suite 618/618.
 
+- [x] FR-84 Aggregate-init verifier resolves struct_defs
+  module-first (the ip4_addr/ip6_addr lwIP failure, root-caused
+  2026-08-15): `const ip_addr_t ip_addr_any = IPADDR4_INIT(...)`
+  defines the global in-TU; the actor plan exports it into an owner
+  impl, and `verifyAggregateInit` (EmitRustOps.cpp:806) resolves
+  the struct_def with `lookupNearestSymbolFrom` FROM INSIDE
+  `emitrust.impl` — which is itself a SymbolTable, so the
+  module-level def is invisible and the verifier kills the whole
+  crate with "aggregate init for struct type ... requires a visible
+  emitrust.struct_def". This is the DOCUMENTED nearest-table
+  pitfall the codebase has fixed twice before (the lookupGlobal
+  comment; the DataEnumDefOp helper at EmitRustOps.cpp:515-521,
+  which resolves module-first with a nearest-table fallback for
+  unattached IR). Fix: the same module-first pattern at the
+  struct_def lookup in verifyAggregateInit (and audit the file's
+  remaining lookupNearestSymbolFrom uses — :891's GlobalOp helper
+  already has the module-first shape; any other bare nearest-table
+  lookups over module-level symbol kinds get the same treatment or
+  a comment stating why nesting cannot occur). Gates: a dialect pin
+  (ops.mlir/actor-shaped: an emitrust.variable with struct
+  aggregate init INSIDE an emitrust.impl verifies when the
+  struct_def is at module level; invalid.mlir keeps the
+  missing-def rejection); an Import pin reproducing the
+  actor-exported const-struct-global shape (in-TU defined const
+  struct global with aggregate init + an accessor, actor-planned);
+  EndToEnd byte-diff of that shape vs clang native; lwIP re-probe
+  evidence (ip4_addr.c/ip6_addr.c flip to crates); full lit 100%.
+  LANDED (2026-08-15): StructDefOp::lookupFrom minted on the
+  DataEnumDefOp/GlobalOp precedent and used by verifyAggregateInit;
+  the audit found and fixed TWO sibling bare lookups the fix made
+  live — the emitter's emitAggregateInit (the identical death moved
+  to emission) and verifyFnPtrTargetsPresent (an impl-nested miss
+  silently SKIPPED the FR-77 located refusal); isConstEvaluableInit
+  commented (GlobalOp is HasParent<ModuleOp> — nesting impossible);
+  lookupEnumDef and emitCast's enum_def lookup left with rationale
+  (byte-identity risk / pre-existing latent class — the :4591 cast
+  site is the recorded follow-up candidate). Pins:
+  global-in-impl.mlir extended (defs-after-impl, nested recursion),
+  invalid.mlir impl-nested twin, Driver/actor-lift-struct-global.c,
+  EndToEnd/actor-lib-struct-global.c byte-diff. lwIP evidence:
+  ip4_addr.c exit 1 -> crate at 645 permille ported with
+  IpAddrAnyActor carrying the exported constant; ip6_addr.c flips
+  too. Full suite 620/620.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test

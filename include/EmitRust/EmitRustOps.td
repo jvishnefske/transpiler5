@@ -721,6 +721,19 @@ def EmitRust_StructDefOp : EmitRust_Op<"struct_def", [
 
   let assemblyFormat = "$sym_name $field_names $field_types attr-dict";
   let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    /// Resolves the struct definition named `name` visible from `from`.
+    /// Definitions are module children (HasParent), but a consumer may sit
+    /// inside a nested symbol table (`emitrust.impl` holds its methods'
+    /// symbols — e.g. the actor plan stages an exported struct global's
+    /// aggregate initializer in a variable inside the owner's new()), so
+    /// the lookup runs in the enclosing MODULE's table, not the nearest
+    /// one. Returns null when no such definition exists or the symbol is
+    /// of a different kind. Mirrors DataEnumDefOp/GlobalOp::lookupFrom.
+    static StructDefOp lookupFrom(mlir::Operation *from,
+                                  llvm::StringRef name);
+  }];
 }
 
 //===----------------------------------------------------------------------===//

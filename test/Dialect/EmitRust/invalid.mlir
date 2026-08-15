@@ -329,6 +329,19 @@ emitrust.global @no_struct_def <[1 : i32]> : !emitrust.struct<"Ghost">
 
 // -----
 
+// FR-84: the module-first lookup still REJECTS a genuinely missing def —
+// an impl-nested aggregate init only resolves defs the module actually
+// holds, with the same wording as the module-level case above.
+emitrust.impl "Owner" {
+  emitrust.func @stage(%arg0: !emitrust.mut_ref<!emitrust.struct<"Owner">>) {
+    // expected-error @+1 {{aggregate init for struct type '!emitrust.struct<"Ghost">' requires a visible emitrust.struct_def}}
+    %0 = emitrust.variable const <[1 : i32]> : !emitrust.lvalue<!emitrust.struct<"Ghost">>
+    emitrust.return
+  }
+}
+
+// -----
+
 emitrust.struct_def @Pair ["a", "b"] [i32, i32]
 // expected-error @+1 {{aggregate init has 1 elements, but struct 'Pair' has 2 fields}}
 emitrust.global @field_count <[1 : i32]> : !emitrust.struct<"Pair">
