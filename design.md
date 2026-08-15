@@ -9473,6 +9473,19 @@ recorded wave-scale fronts: struct-as-bytes erasure, the member-pointer
 linked-list shape (cJSON x11), and aliasing mutable arguments
 (ecc/cbc/hmac x8) — i.e. Stage 2/3 of the cascade plan plus C99-44.
 
+**THE TINY-AES MILESTONE (2026-08-15, FR-91..FR-93).** The widened
+corpus (tiny-AES-c, heatshrink) was mined the same way: FR-91 member
+windows on byte-region roots (the CTS-BR boundary opened), FR-92 the
+2D-array-pointer cast + state_t* param family, FR-93 window-backed
+pointer locals + multi-base call dispatch with the split_at_mut arm
+(the deepest wave — the naive borrow image failed measured borrowck
+and the sound dispatch was byte-diff-proven). Outcome: **tiny-AES-c
+at 23/24 items — its measured ceiling** (record `missing` is inherent
+to the byte-region model): a complete real-world AES (ECB/CBC/CTR)
+transpiles to safe Rust byte-identical against the clang native.
+Heatshrink's residue is the FAM representation (recorded NO-GO,
+future FR); tinycrypt's is member-FIELD escaping stores.
+
 **THE TINYCRYPT SEAM ARC (2026-08-15, FR-86..FR-90).** After the lwIP
 campaign, the per-unit diagnostics of the tinycrypt/cJSON corpus were
 mined seam by seam, each FR's re-probe naming the next: FR-86 offset
