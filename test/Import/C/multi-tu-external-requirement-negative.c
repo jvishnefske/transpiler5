@@ -1,12 +1,15 @@
 // FR-52 boundaries: the shapes that keep rejecting even under
 // --externals-trait, each because the trait cannot express them faithfully.
+// (The global-agg arm is the exception: FR-79 and FR-81 flipped the
+// struct-typed extern global POSITIVE, so its arm now pins the flip -- the
+// pin moved forward, it did not loosen.)
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c --externals-trait %t/addr-taken.c \
 // RUN:   %t/empty.c 2>&1 | FileCheck --check-prefix=ADDR %s
 // RUN: not emitrust-import-c --externals-trait %t/global-addr.c \
 // RUN:   %t/empty.c 2>&1 | FileCheck --check-prefix=GLOBAL-ADDR %s
-// RUN: not emitrust-import-c --externals-trait %t/global-agg.c \
-// RUN:   %t/empty.c 2>&1 | FileCheck --check-prefix=GLOBAL-AGG %s
+// RUN: emitrust-import-c --externals-trait %t/global-agg.c \
+// RUN:   %t/empty.c | FileCheck --check-prefix=GLOBAL-AGG %s
 // RUN: not emitrust-import-c --externals-trait %t/variadic.c \
 // RUN:   %t/empty.c 2>&1 | FileCheck --check-prefix=VARIADIC %s
 
@@ -51,11 +54,14 @@ int bump(void) {
 // GLOBAL-ADDR: error: unsupported: extern global variable 'host_counter' is referenced but not defined in any translation unit
 
 //--- global-agg.c
-// An AGGREGATE extern global keeps rejecting too, even though its accesses
-// lower to whole-value load/store at the IR level: the trait passes values
-// by copy, and C code holding `extern struct` storage expects places (member
-// projections, element addresses) the pair cannot faithfully model. The
-// frontier is decided on the TYPE, not on the IR use shape.
+// A STRUCT extern global no longer rejects on its type: FR-79 admitted the
+// const struct (getter-only) and FR-81 the non-const struct (whole-value
+// getter/setter pair -- sequentially, staged get/modify/set through a Copy
+// struct is exact). The frontier is now decided on the USE SHAPE: whole-value
+// loads and stores qualify, while addresses into the global (and arrays,
+// whose element access needs a place) keep the rejection -- see
+// multi-tu-external-requirement-nonconst-struct-negative.c. This arm pins
+// the flip of FR-70's recorded aggregate refusal.
 struct cfg {
   int a;
   int b;
@@ -66,7 +72,7 @@ int first(void) {
   struct cfg snapshot = host_cfg;
   return snapshot.a;
 }
-// GLOBAL-AGG: error: unsupported: extern global variable 'host_cfg' is referenced but not defined in any translation unit
+// GLOBAL-AGG: emitrust.global @host_cfg {emitrust.external_requirement} : !emitrust.struct<"cfg">
 
 //--- variadic.c
 // An undefined VARIADIC external never reaches the requirement decision at

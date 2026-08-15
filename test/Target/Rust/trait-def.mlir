@@ -6,6 +6,10 @@
 // FR-79 adds the BY-VALUE STRUCT getter of a const-struct requirement --
 // `fn cfg() -> S;` -- and pins that its call site binds a Copy temporary on
 // which field projection is ordinary member access.
+// FR-81 adds the BY-VALUE STRUCT SETTER of a NON-const struct requirement --
+// `fn set_cfg(v0: S);` -- and pins the staged read-modify-write call site:
+// getter call, member-assign on the bound Copy temporary, whole-value
+// setter call STATEMENT (never a projection into environment storage).
 // FR-80 adds the ADDRESS-CARRYING getter -- a trait-item RESULT of
 // !emitrust.ref type renders `&'static T` (a bare `&` in a zero-arg trait
 // fn signature is rustc E0106; the requirement address is the consumer's
@@ -27,11 +31,12 @@
 // CHECK-NEXT:     fn g_config() -> i32;
 // CHECK-NEXT:     fn set_g_config(v0: i32);
 // CHECK-NEXT:     fn cfg() -> S;
+// CHECK-NEXT:     fn set_cfg(v0: S);
 // CHECK-NEXT:     fn any() -> &'static S;
 // CHECK-NEXT: }
 emitrust.trait_def @Externals
-    ["host_scale", "host_reset", "host_mix", "g_config", "set_g_config", "cfg", "any"]
-    [(i32) -> i32, () -> (), (i32, f64) -> f64, () -> i32, (i32) -> (), () -> !emitrust.struct<"S">, () -> !emitrust.ref<!emitrust.struct<"S">>]
+    ["host_scale", "host_reset", "host_mix", "g_config", "set_g_config", "cfg", "set_cfg", "any"]
+    [(i32) -> i32, () -> (), (i32, f64) -> f64, () -> i32, (i32) -> (), () -> !emitrust.struct<"S">, (!emitrust.struct<"S">) -> (), () -> !emitrust.ref<!emitrust.struct<"S">>]
 
 // FR-70: a getter call is a result-bearing opaque call, so its value binds
 // (or folds) exactly where the global load's value flowed; a setter call is
@@ -71,6 +76,32 @@ emitrust.func @read_cfg() -> i32
   %2 = emitrust.member %1["x"] : (!emitrust.lvalue<!emitrust.struct<"S">>) -> !emitrust.lvalue<i32>
   %3 = emitrust.load %2 : (!emitrust.lvalue<i32>) -> i32
   emitrust.return %3 : i32
+}
+
+// FR-81: the setter's call site is the staged read-modify-write the importer
+// emits for a field store through a non-const struct requirement: the
+// getter's Copy value seeds a mutable temporary, the member-assign lands on
+// the temporary, and the setter call renders as a STATEMENT carrying the
+// whole value -- which is why no dead-store analysis can touch it (a call
+// statement is never an elision candidate; external storage stays
+// observable).
+// CHECK:      fn write_cfg<E: Externals>(v0: i32) {
+// CHECK-NEXT:     let mut v1: S;
+// CHECK-NEXT:     let v2: S = E::cfg();
+// CHECK-NEXT:     v1 = v2;
+// CHECK-NEXT:     v1.x = v0;
+// CHECK-NEXT:     E::set_cfg(v1);
+// CHECK-NEXT: }
+emitrust.func @write_cfg(%arg0: i32)
+    attributes {emitrust.externals_generic = "Externals"} {
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"S">>
+  %1 = emitrust.call_opaque "E::cfg"() : () -> !emitrust.struct<"S">
+  emitrust.assign %0 = %1 : !emitrust.lvalue<!emitrust.struct<"S">>
+  %2 = emitrust.member %0["x"] : (!emitrust.lvalue<!emitrust.struct<"S">>) -> !emitrust.lvalue<i32>
+  emitrust.assign %2 = %arg0 : !emitrust.lvalue<i32>
+  %3 = emitrust.load %0 : (!emitrust.lvalue<!emitrust.struct<"S">>) -> !emitrust.struct<"S">
+  emitrust.call_opaque "E::set_cfg"(%3) : (!emitrust.struct<"S">) -> ()
+  emitrust.return
 }
 
 // FR-80: the address getter's call site binds an ordinary `&S` value — the

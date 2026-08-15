@@ -3,11 +3,11 @@
 // GETTER-ONLY trait item: imported structs are Copy, so a by-value return is
 // a faithful read, and const-ness means no writer ever needs the setter a
 // multi-field by-value write could tear. This pin REVISES the aggregate arm
-// of FR-70's recorded refusal for exactly the const case; the NON-const
-// struct extern keeps the verbatim rejection (the GLOBAL-AGG arm of
-// multi-tu-external-requirement-negative.c), as do address-taken and
-// array-of-struct shapes (multi-tu-external-requirement-const-struct-
-// negative.c). The pin also holds the FIELD-PROJECTION shape: `g.field`
+// of FR-70's recorded refusal for exactly the const case; FR-81 later
+// flipped the NON-const struct extern too (whole-value getter/setter pair,
+// multi-tu-external-requirement-nonconst-struct.c), while address-taken and
+// array-of-struct shapes keep rejecting (multi-tu-external-requirement-
+// const-struct-negative.c). The pin also holds the FIELD-PROJECTION shape: `g.field`
 // imports as a whole-value load into a temporary, then member on the
 // temporary -- so every surviving symbol use is a load the FR-70 rewrite
 // already covers.
