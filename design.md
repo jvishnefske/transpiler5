@@ -8443,6 +8443,15 @@ non-termination, no rustc-rejected crate on these 17 units). The
 strict-mode (no `--incremental`) baseline is 0/17 — recovery mode is
 what carries external code, consistent with Contribution 3-4's
 disposition.
+FOLLOW-UP (same day, after FR-71/72/74/75 landed from this probe's
+ranking): tinycrypt utils.c is 4/4 real items (_set/_copy/_compare all
+ported); the solo-TU sha256/aes stubs correctly PERSIST because their
+TUs call `_set((uint8_t*)s, 0, sizeof(*s))` — a STRUCT erased to bytes,
+which the FR-75 consensus scan rightly declines (transmute territory,
+not a byte view). The residual external demand is now exclusively the
+recorded wave-scale fronts: struct-as-bytes erasure, the member-pointer
+linked-list shape (cJSON x11), and aliasing mutable arguments
+(ecc/cbc/hmac x8) — i.e. Stage 2/3 of the cascade plan plus C99-44.
 
 **External-validation lessons, consolidated (and the paper's disposition).**
 The accompanying paper's four contributions do NOT survive third-party
