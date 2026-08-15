@@ -2348,21 +2348,41 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
 
   // Borrow-producing arguments: each resolves to a fresh borrow of its
   // region base. Two borrows of the same base would alias mutably in Rust;
-  // they are rejected rather than emitted.
-  SmallVector<const clang::VarDecl *, 4> borrowRoots;
+  // they are rejected rather than emitted. FR-74: a member-array argument
+  // borrows only its FIELD, so the collision key is (base, member path)
+  // with PREFIX-overlap semantics — the same field twice collides, a
+  // whole-object borrow (empty path) collides with any member of the same
+  // base, and DISJOINT sibling fields of one struct are admitted: their
+  // storage is non-overlapping in C, and the emitted two-simultaneous-&mut
+  // shape over sibling fields is legal Rust (rustc-verified in the FR-74
+  // spike). Non-member borrows keep an empty path, preserving the
+  // historical whole-object collision behavior byte-for-byte.
+  SmallVector<std::pair<const clang::VarDecl *,
+                        SmallVector<const clang::FieldDecl *, 2>>,
+              4>
+      borrowRoots;
   for (const PendingBorrow &borrow : borrows) {
     const clang::VarDecl *root = nullptr;
-    FailureOr<Value> reference = emitBorrowArgument(
-        loc, borrow.expr, targetType.getInput(borrow.index), root);
+    SmallVector<const clang::FieldDecl *, 2> rootPath;
+    FailureOr<Value> reference =
+        emitBorrowArgument(loc, borrow.expr,
+                           targetType.getInput(borrow.index), root, &rootPath);
     if (failed(reference))
       return failure();
-    if (root && llvm::is_contained(borrowRoots, root))
-      return emitError(loc)
-             << "unsupported: aliasing mutable pointer arguments (two "
-                "arguments borrow object '"
-             << root->getName() << "')";
-    if (root)
-      borrowRoots.push_back(root);
+    if (root) {
+      for (const auto &held : borrowRoots) {
+        if (held.first != root)
+          continue;
+        size_t common = std::min(held.second.size(), rootPath.size());
+        if (llvm::ArrayRef(held.second).take_front(common) ==
+            llvm::ArrayRef(rootPath).take_front(common))
+          return emitError(loc)
+                 << "unsupported: aliasing mutable pointer arguments (two "
+                    "arguments borrow object '"
+                 << root->getName() << "')";
+      }
+      borrowRoots.push_back({root, rootPath});
+    }
     arguments[borrow.index] = *reference;
   }
 
@@ -3684,10 +3704,98 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
   return callOp->getResult(0);
 }
 
-FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
-                                               const clang::Expr *argument,
-                                               Type paramType,
-                                               const clang::VarDecl *&root) {
+bool CImporter::matchMemberArraySliceArg(
+    const clang::MemberExpr *member, bool isMutParam,
+    const clang::VarDecl *&chainRoot,
+    SmallVectorImpl<const clang::FieldDecl *> &path) {
+  // The decayed leaf must be a fixed-extent array FIELD — the whole
+  // region the slice covers. (A flexible/zero-length tail has no extent;
+  // an incomplete array is not a ConstantArrayType and never matches.)
+  const auto *leaf = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+  if (!leaf || !leaf->getType().getCanonicalType()->isConstantArrayType())
+    return false;
+  SmallVector<const clang::FieldDecl *, 4> reversed;
+  const clang::MemberExpr *link = member;
+  while (true) {
+    const auto *field =
+        llvm::dyn_cast<clang::FieldDecl>(link->getMemberDecl());
+    // Union arms OVERLAP by construction (disjoint-field admission is a
+    // struct-only fact), and a byte-region record's members are windows
+    // of one region base, not places; both keep the verbatim rejection.
+    if (!field || field->getParent()->isUnion() ||
+        isByteRegionRecord(field->getParent()))
+      return false;
+    reversed.push_back(field);
+    const clang::Expr *base = stripTrivia(link->getBase());
+    if (link->isArrow()) {
+      // Arrow only at the chain ROOT, through a ref/mut_ref-struct
+      // pointer parameter: its member place is the pointee itself
+      // (deref + member). A decomposed pointer or an erased-global
+      // return base resolves to a staged copy or cursor state instead,
+      // so those fall through to the historical rejection.
+      if (isDecomposedPointerExpr(base))
+        return false;
+      // The pointer READ under `->` arrives as an LValueToRValue cast
+      // over the parameter reference; peel it to name the root.
+      const auto *ref =
+          llvm::dyn_cast<clang::DeclRefExpr>(base->IgnoreParenImpCasts());
+      const auto *var =
+          ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+      if (!var || !var->hasLocalStorage())
+        return false;
+      auto it = symbols.find(var);
+      if (it == symbols.end())
+        return false;
+      Type held = it->second.getType();
+      if (auto lvalue = llvm::dyn_cast<emitrust::LValueType>(held))
+        held = lvalue.getValueType();
+      Type pointeeType;
+      if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(held)) {
+        pointeeType = mutRef.getPointee();
+      } else if (auto sharedRef = llvm::dyn_cast<emitrust::RefType>(held)) {
+        // `&S` cannot yield `&mut s.field`; only a shared slice may
+        // borrow through a shared struct reference.
+        if (isMutParam)
+          return false;
+        pointeeType = sharedRef.getPointee();
+      } else {
+        return false;
+      }
+      if (!llvm::isa<emitrust::StructType>(pointeeType))
+        return false;
+      chainRoot = var;
+      break;
+    }
+    if (const auto *inner = llvm::dyn_cast<clang::MemberExpr>(base)) {
+      link = inner;
+      continue;
+    }
+    // Dot chain root: an addressable LOCAL struct place. A global root
+    // is refused here — its member place would be a staged local copy,
+    // and a mutable slice of the copy would silently lose the callee's
+    // writes.
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(base);
+    const auto *var =
+        ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+    if (!var || !var->hasLocalStorage())
+      return false;
+    auto it = symbols.find(var);
+    if (it == symbols.end())
+      return false;
+    auto lvalue = llvm::dyn_cast<emitrust::LValueType>(it->second.getType());
+    if (!lvalue || !llvm::isa<emitrust::StructType>(lvalue.getValueType()))
+      return false;
+    chainRoot = var;
+    break;
+  }
+  path.assign(reversed.rbegin(), reversed.rend());
+  return true;
+}
+
+FailureOr<Value> CImporter::emitBorrowArgument(
+    Location loc, const clang::Expr *argument, Type paramType,
+    const clang::VarDecl *&root,
+    SmallVectorImpl<const clang::FieldDecl *> *rootPath) {
   root = nullptr;
   // Shared byte-slice parameters (`const unsigned char *`, CTS-BR 00216)
   // and `const T&` parameters (FR-48) borrow immutably; everything else
@@ -3799,6 +3907,53 @@ FailureOr<Value> CImporter::emitBorrowArgument(Location loc,
                                            /*is_mut=*/isMutParam)
               .getResult();
         }
+    // FR-74: a MEMBER-ARRAY argument (`bump(s.iv, s.n)` — tinycrypt's
+    // compress shape): a dot/arrow projection chain ending at an
+    // array-typed field decays to the same whole-region slice a top-level
+    // array does — `slice_of` over the member PLACE at cursor 0. The
+    // interception lives HERE, in the slice-argument position only, and
+    // NOT in `emitPointerRValue`'s decay case: member decay in
+    // non-argument positions (a pointer local bound to `s.iv`) must keep
+    // its verbatim rejection, because the pointer decomposition has no
+    // representation for a member-rooted region. Unadmitted chains fall
+    // through to `emitPointerRValue`'s historical rejection unchanged.
+    if (const auto *memberDecay =
+            llvm::dyn_cast<clang::ImplicitCastExpr>(strippedArg);
+        memberDecay &&
+        memberDecay->getCastKind() == clang::CK_ArrayToPointerDecay) {
+      const auto *member = llvm::dyn_cast<clang::MemberExpr>(
+          stripTrivia(memberDecay->getSubExpr()));
+      const clang::VarDecl *chainRoot = nullptr;
+      SmallVector<const clang::FieldDecl *, 2> chainPath;
+      if (member &&
+          matchMemberArraySliceArg(member, isMutParam, chainRoot, chainPath)) {
+        FailureOr<Value> place =
+            emitMemberLValue(member, loc, /*writeback=*/nullptr);
+        if (failed(place))
+          return failure();
+        auto memberLValue =
+            llvm::dyn_cast<emitrust::LValueType>((*place).getType());
+        Type memberElement;
+        if (memberLValue)
+          if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(
+                  memberLValue.getValueType()))
+            memberElement = arrayType.getElementType();
+        if (!memberElement)
+          return emitError(loc) << "unsupported pointer target place";
+        if (memberElement != sliceType.getElementType())
+          return emitError(loc)
+                 << "unsupported: argument element type does not "
+                    "match the slice parameter";
+        root = chainRoot;
+        if (rootPath)
+          rootPath->assign(chainPath.begin(), chainPath.end());
+        Value zero = createIntConstant(loc, builder.getIntegerType(64), 0);
+        return builder
+            .create<emitrust::SliceOfOp>(loc, paramType, *place, zero,
+                                         /*is_mut=*/isMutParam)
+            .getResult();
+      }
+    }
     // Slice parameter: reslice the argument's region base from its cursor.
     // A decayed array decomposes to cursor 0, `&arr[i]` to cursor i, a
     // walking pointer to its current cursor, and a slice parameter's own
