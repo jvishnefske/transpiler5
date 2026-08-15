@@ -9334,6 +9334,27 @@ recorded wave-scale fronts: struct-as-bytes erasure, the member-pointer
 linked-list shape (cJSON x11), and aliasing mutable arguments
 (ecc/cbc/hmac x8) — i.e. Stage 2/3 of the cascade plan plus C99-44.
 
+**THE TINYCRYPT SEAM ARC (2026-08-15, FR-86..FR-90).** After the lwIP
+campaign, the per-unit diagnostics of the tinycrypt/cJSON corpus were
+mined seam by seam, each FR's re-probe naming the next: FR-86 offset
+member-arrays + the decomposed-root bin its census discovered (and two
+design-entry bins DISPROVEN), FR-87 member-array regions for the
+hosted byte family (byte-diff caught a real miscompile
+mid-implementation), FR-88 nullable byte-slice params as Option<&[u8]>
+(the fold-flip trap measured and closed), FR-89 the void*-BitCast
+peel (one line of peel; the spike corrected the entry's motivating
+site), FR-90 member-address arguments on decomposed roots (the
+"loop breaks it" framing refuted — the trigger was null-compare
+demotion). Corpus: 95 -> 109 of 326 items ported (+15%), all 17
+crates building throughout. TERMINAL RANKING of this corpus: the
+residuals are exclusively the recorded new-idea fronts — the
+member-pointer linked-list shape (cJSON, x11+x12 cascade), aliasing
+mutable arguments (ecc's in-place bignum ops, x9 — the copy-in image
+is UNSOUND because C callees may observe their own writes through
+the alias, the same hazard class FR-82 measured), and pointer struct
+members (x9). Near-reach seam mining here is done; further external
+progress needs either the deferred fronts or a WIDER corpus.
+
 **THE LWIP CAMPAIGN (2026-08-14/15, FR-76..FR-84).** The
 cascade-containment stages plus the measurement loop ran as one
 continuous arc — each landed FR's lwIP re-probe named the next FR —
