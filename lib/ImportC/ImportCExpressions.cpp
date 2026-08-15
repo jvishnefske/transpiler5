@@ -4057,6 +4057,39 @@ FailureOr<bool> CImporter::tryEmitMemberArraySlicePlace(
   return true;
 }
 
+/// FR-89: returns the operand of a void*-MEDIATED pointer cast (the
+/// implicit bitcast Sema inserts converting to or from `void *` at a
+/// call argument, or its explicit spelling) or null for every other
+/// cast. This is `peelPointerCast`'s pointee-wildcard rule (CTS-P9)
+/// narrowed to the void-on-one-side case for the borrow-ARGUMENT path:
+/// same-pointee and qualification-only casts are NOT peeled here — the
+/// slice branch's own CK_NoOp strip and the string-literal head already
+/// own those spellings, and a general peel would newly claim typed-path
+/// cast spellings this FR does not prove. A volatile-qualified pointee
+/// blocks the peel so the site keeps a located rejection (C99-7).
+static const clang::Expr *
+peelVoidMediatedArgumentCast(clang::ASTContext &context,
+                             const clang::Expr *expr) {
+  const auto *cast = llvm::dyn_cast<clang::CastExpr>(expr);
+  if (!cast || (!llvm::isa<clang::CStyleCastExpr>(cast) &&
+                !llvm::isa<clang::ImplicitCastExpr>(cast)))
+    return nullptr;
+  if (cast->getCastKind() != clang::CK_NoOp &&
+      cast->getCastKind() != clang::CK_BitCast)
+    return nullptr;
+  clang::QualType from = cast->getSubExpr()->getType().getCanonicalType();
+  clang::QualType to = cast->getType().getCanonicalType();
+  if (!isDataPointer(from) || !isDataPointer(to))
+    return nullptr;
+  clang::QualType fromPointee = from->getPointeeType().getCanonicalType();
+  clang::QualType toPointee = to->getPointeeType().getCanonicalType();
+  if (fromPointee.isVolatileQualified() || toPointee.isVolatileQualified())
+    return nullptr;
+  if (!fromPointee->isVoidType() && !toPointee->isVoidType())
+    return nullptr;
+  return cast->getSubExpr();
+}
+
 FailureOr<Value> CImporter::emitBorrowArgument(
     Location loc, const clang::Expr *argument, Type paramType,
     const clang::VarDecl *&root,
@@ -4172,6 +4205,34 @@ FailureOr<Value> CImporter::emitBorrowArgument(
                                            /*is_mut=*/isMutParam)
               .getResult();
         }
+    // FR-89: a member-array argument to a void*-ADMITTED byte-cursor
+    // parameter (FR-71 body-scan / FR-75 consensus) arrives WRAPPED in
+    // the implicit void* BitCast Sema inserts at the conversion site
+    // (`bitcast<void*>(decay(prng->key))` — tinycrypt's
+    // `_set(prng->key, 0x00, sizeof(prng->key))` at hmac_prng.c:143 and
+    // `tc_hmac_update(&prng->h, prng->v, ...)` at :88). The FR-74/86
+    // matcher below sees only decay / `&s.m[k]` / `s.m + k` heads, so
+    // the void*-mediated cast is peeled here — AFTER the string-literal
+    // head (a literal to an i8-element void* param keeps its exact
+    // pre-FR-89 pointer-rvalue lowering, and a ui8-element one its
+    // element-mismatch rejection: the peel provably admits nothing on
+    // the literal shapes) and BEFORE the member matcher, on the
+    // borrow-ARGUMENT path only. Every shape the matcher then declines
+    // falls through to `emitPointerRValue` on the UNPEELED argument,
+    // so all non-member void* arguments keep their exact current
+    // behavior; element agreement against the admitted byte element and
+    // the (root, field-path) aliasing guard compose downstream
+    // unchanged.
+    while (const clang::Expr *peeled =
+               peelVoidMediatedArgumentCast(astContext(), strippedArg)) {
+      strippedArg = stripTrivia(peeled);
+      while (const auto *noop =
+                 llvm::dyn_cast<clang::ImplicitCastExpr>(strippedArg)) {
+        if (noop->getCastKind() != clang::CK_NoOp)
+          break;
+        strippedArg = stripTrivia(noop->getSubExpr());
+      }
+    }
     // FR-74: a MEMBER-ARRAY argument (`bump(s.iv, s.n)` — tinycrypt's
     // compress shape): a dot/arrow projection chain ending at an
     // array-typed field decays to the same whole-region slice a top-level
