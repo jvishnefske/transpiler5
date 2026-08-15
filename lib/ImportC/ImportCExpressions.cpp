@@ -3836,6 +3836,13 @@ bool CImporter::matchMemberArraySliceArg(
   const auto *leaf = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
   if (!leaf || !leaf->getType().getCanonicalType()->isConstantArrayType())
     return false;
+  return matchMemberChainRoot(member, isMutParam, chainRoot, path);
+}
+
+bool CImporter::matchMemberChainRoot(
+    const clang::MemberExpr *member, bool isMutParam,
+    const clang::VarDecl *&chainRoot,
+    SmallVectorImpl<const clang::FieldDecl *> &path) {
   SmallVector<const clang::FieldDecl *, 4> reversed;
   const clang::MemberExpr *link = member;
   while (true) {
@@ -4456,6 +4463,76 @@ FailureOr<Value> CImporter::emitBorrowArgument(
   const clang::Expr *stripped = stripTrivia(argument);
   const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(stripped);
   bool isAddressOf = addrOf && addrOf->getOpcode() == clang::UO_AddrOf;
+  // FR-90: a member-ADDRESS argument (`&s->field`, field STRUCT-typed —
+  // tinycrypt's `tc_aes_encrypt(..., &ctx->key)` and hmac's
+  // `tc_sha256_init(&ctx->hash_state)`) whose chain roots at a
+  // DECOMPOSED (null-compared) struct-pointer parameter. The null
+  // compare demotes the root from the ref/mut_ref receiver convention —
+  // whose `&s->field` already borrows through the historical
+  // emitLValue+addr_of path below — to the (slice-of-struct base, i64
+  // cursor) decomposition, and the decomposed routing has no
+  // member-address representation (`classifyMemberAddress` leaves arrow
+  // roots unhandled), so the shape historically rejected "unsupported
+  // pointer target expression". The member PLACE, however, is exactly
+  // what FR-86 mechanism A already builds for member-ARRAY arguments of
+  // the same roots — subscript the deref'd base at the CURRENT cursor,
+  // then project the field chain — so the address is that place's
+  // borrow at the PARAMETER's own mutability. Admission mirrors the
+  // FR-74/86 matcher root-for-root (`matchMemberChainRoot`: the
+  // decomposed root must be the parameter's OWN self-based region,
+  // union arms and byte-region records decline, a mutable borrow cannot
+  // go through a shared slice region); the leaf must be a plain
+  // STRUCT-typed field — a scalar, union, or array leaf declines so the
+  // historical located rejection fires unchanged. (root, field-path)
+  // feed emitCall's prefix-overlap aliasing guard, so disjoint sibling
+  // borrows of one root — including the mixed addr_of + slice_of pair
+  // `f(&prng->h, prng->key, ...)` — are admitted while any overlap
+  // (the same field twice, a whole-root forward plus a member) stays a
+  // located rejection. Gated on the DECOMPOSED root: a non-decomposed
+  // argument keeps the historical paths below byte-for-byte. The
+  // qualification NoOp Sema wraps a `struct T *` argument in at a
+  // `const struct T *` parameter (the FR-80 shared-const-struct
+  // requirement convention, and const-pointee params generally) is
+  // peeled INSIDE this interception only — `isAddressOf` and the
+  // routing below see the unpeeled argument, so every shape the
+  // interception declines keeps its exact current behavior.
+  const clang::Expr *addrExpr = stripped;
+  while (const auto *noop = llvm::dyn_cast<clang::ImplicitCastExpr>(addrExpr)) {
+    if (noop->getCastKind() != clang::CK_NoOp)
+      break;
+    addrExpr = stripTrivia(noop->getSubExpr());
+  }
+  const auto *memberAddrOf = llvm::dyn_cast<clang::UnaryOperator>(addrExpr);
+  if (memberAddrOf && memberAddrOf->getOpcode() == clang::UO_AddrOf &&
+      involvesDecomposedPointer(argument) &&
+      llvm::isa<emitrust::StructType>(pointee)) {
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(
+            stripTrivia(memberAddrOf->getSubExpr()))) {
+      const auto *leaf =
+          llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+      const clang::VarDecl *chainRoot = nullptr;
+      SmallVector<const clang::FieldDecl *, 2> chainPath;
+      if (leaf && leaf->getType().getCanonicalType()->isStructureType() &&
+          matchMemberChainRoot(member, isMutParam, chainRoot, chainPath)) {
+        FailureOr<Value> memberPlace =
+            emitMemberLValue(member, loc, /*writeback=*/nullptr);
+        if (failed(memberPlace))
+          return failure();
+        auto memberLValue =
+            llvm::dyn_cast<emitrust::LValueType>((*memberPlace).getType());
+        if (!memberLValue || memberLValue.getValueType() != pointee)
+          return emitError(loc) << "unsupported: argument type does not "
+                                   "match the pointer parameter";
+        root = chainRoot;
+        if (rootPath)
+          rootPath->assign(chainPath.begin(), chainPath.end());
+        return builder
+            .create<emitrust::AddrOfOp>(loc, paramType, *memberPlace,
+                                        isMutParam)
+            .getResult();
+      }
+    }
+  }
   if (!isAddressOf || involvesDecomposedPointer(argument)) {
     FailureOr<PtrExprValue> pointer = emitPointerRValue(argument);
     if (failed(pointer))

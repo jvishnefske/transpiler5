@@ -5401,6 +5401,54 @@ piece and becomes FR-45.
   refuted by the implementation's own re-probe); tu0_update
   advances to the scalar-address rejection. Full suite 636/636.
 
+- [x] FR-90 Member-ADDRESS arguments to struct-pointer params (the
+  FR-89 spike's recorded candidate: ctr_prng's `&ctx->key` — the
+  address of a struct-typed FIELD passed where a struct-pointer
+  param expects a receiver — rejects "unsupported pointer target
+  expression" at ctr_prng.c:93/148/247; the struct-typed sibling
+  of FR-74's member-array arguments). Candidate: a `&s.member` /
+  `&s->member` argument whose member is STRUCT-typed and whose
+  callee param is the matching mut_ref<struct>/owner convention
+  lowers as the member place's borrow (`&mut s.key` /
+  `&s.key`), with the FR-74 (VarDecl, field-path) aliasing guard
+  (same field twice mutably rejects; disjoint siblings admit —
+  rustc-verified precedent). THE MEASURED NUANCE the spike must
+  characterize first: `&prng->h` at hmac_prng.c:84/87/88 is
+  ACCEPTED today in straight-line code yet the same shape rejects
+  at 210:19 inside a while loop — find the existing acceptance
+  path (some member-address shapes already work!), why loop
+  context breaks it, and whether FR-90 is an extension of that
+  path or a fix to its loop blindspot. Frontier: address-of
+  SCALAR members to struct-pointer params, nested unions/blobs,
+  escaping stores of the address. Gates: Import pins
+  (dot/arrow, mut and shared, disjoint-sibling double borrow,
+  the null-compared-root shape in and out of loops) + frontier
+  arms (measured wordings); EndToEnd byte-diff (mutation through
+  the borrowed member visible across calls, in and out of loops,
+  argc-seeded, vs clang native); external re-probe (ctr_prng
+  93/148/247, hmac.c 103/119/134, hmac_prng 210 — the wording's
+  entire 7-site corpus footprint); full lit 100%; C path only.
+  **SPIKE VERDICT: GO (2026-08-15), with the "loop breaks it"
+  framing REFUTED.** The trigger is a NULL-COMPARE on the base
+  struct-pointer param, which demotes it to the DECOMPOSED
+  representation; the routing fork then sends decomposed-root
+  args into a path where classifyMemberAddress leaves arrow roots
+  unhandled — loops accept fine. Landed as a NEW interception
+  (the struct-leaf addr_of sibling of the FR-74/86 matcher, with
+  the chain-root walk refactored out for reuse): decomposed base
+  deref -> subscript-at-cursor -> member -> addr_of{mut} renders
+  `&mut o[cursor as usize].field`, zero new ops, identical inside
+  loops (fresh borrow per iteration). The mixed addr_of+slice_of
+  same-root pair (hmac_prng's real loop shape: &prng->h plus
+  prng->key in one call) admits as disjoint — rustc-verified;
+  same-member-twice is caught by the (VarDecl, field-path) guard;
+  nested struct-leaf paths (&s->d.l) landed FREE (the chain walk
+  handles multi-link paths); scalar/union leaves and escaping
+  stores keep measured rejections; the pre-existing non-decomposed
+  same-member-twice E0499 asymmetry left unchanged (loud, not
+  silent). Byte-diff at 3 argc seeds in and out of loops.
+  Full suite 639/639.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
