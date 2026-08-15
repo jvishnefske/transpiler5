@@ -382,10 +382,20 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
       // be the owner itself or C `main`, and all of its call sites must be
       // visible — an externally visible function qualifies when this TU is
       // the whole program OR when the whole-program facts prove no other TU
-      // references it (W3.3 G3).
+      // references it (W3.3 G3). FR-76: an ADDRESS-TAKEN function is
+      // disqualified too — a fn-pointer call site cannot thread the owner
+      // receiver (the actor-lift demotion rule), and the address-taken
+      // forcing keeps its pointer parameters slice-typed so they equal the
+      // fn-ptr component types it is bound into; promoting its class would
+      // re-route those parameters through a receiver and break that
+      // equality transitively. C-only, matching the forcing's gate
+      // (`planFnPtrAliases` is hoisted before this pass to supply the set).
       if (fn == owner || fn->getName() == "main" ||
           (fn->isExternallyVisible() && !soleTranslationUnit &&
            !externalFnFullyVisible(fn)) ||
+          (!astContext().getLangOpts().CPlusPlus &&
+           llvm::is_contained(addressTakenFunctions,
+                              fn->getCanonicalDecl())) ||
           disqualifyingReturn) {
         qualifies = false;
         break;

@@ -4260,17 +4260,63 @@ FailureOr<Value> CImporter::emitIndirectCall(const clang::CallExpr *call) {
 
   // Argument checking mirrors the direct-call path, each argument
   // positioned against the fn_ptr's input (see emitPositionedRValue).
+  // FR-76: a Ref/MutRef input — a fn_ptr carrying region-typed slice
+  // components — takes a borrow argument exactly like a direct call to a
+  // slice-classified callee: value arguments materialize first (no load
+  // may sit between a `&mut` borrow and the call consuming it), each
+  // borrow resolves to a fresh region view through `emitBorrowArgument`,
+  // and two borrows of one base keep the same-base aliasing rejection
+  // with `emitCall`'s (base, member-path) prefix-overlap semantics. A
+  // fn_ptr can never carry a cell-slice input (the component verifier
+  // admits only slice refs), so the direct path's cell-global staging has
+  // no counterpart here.
   ArrayRef<Type> inputs = fnPtrType.getInputs();
-  SmallVector<Value> arguments;
+  SmallVector<Value> arguments(call->getNumArgs(), Value());
+  struct PendingBorrow {
+    unsigned index;
+    const clang::Expr *expr;
+  };
+  SmallVector<PendingBorrow, 4> borrows;
   for (auto [index, argument] : llvm::enumerate(call->arguments())) {
-    FailureOr<Value> value = emitPositionedRValue(
-        index < inputs.size() ? inputs[index] : Type(), argument);
+    Type input = index < inputs.size() ? inputs[index] : Type();
+    if (input && llvm::isa<emitrust::MutRefType, emitrust::RefType>(input)) {
+      borrows.push_back({static_cast<unsigned>(index), argument});
+      continue;
+    }
+    FailureOr<Value> value = emitPositionedRValue(input, argument);
     if (failed(value))
       return failure();
-    arguments.push_back(*value);
+    arguments[index] = *value;
   }
   if (arguments.size() != inputs.size())
     return emitError(loc) << "unsupported: call argument count mismatch";
+  SmallVector<std::pair<const clang::VarDecl *,
+                        SmallVector<const clang::FieldDecl *, 2>>,
+              4>
+      borrowRoots;
+  for (const PendingBorrow &borrow : borrows) {
+    const clang::VarDecl *root = nullptr;
+    SmallVector<const clang::FieldDecl *, 2> rootPath;
+    FailureOr<Value> reference = emitBorrowArgument(
+        loc, borrow.expr, inputs[borrow.index], root, &rootPath);
+    if (failed(reference))
+      return failure();
+    if (root) {
+      for (const auto &held : borrowRoots) {
+        if (held.first != root)
+          continue;
+        size_t common = std::min(held.second.size(), rootPath.size());
+        if (llvm::ArrayRef(held.second).take_front(common) ==
+            llvm::ArrayRef(rootPath).take_front(common))
+          return emitError(loc)
+                 << "unsupported: aliasing mutable pointer arguments (two "
+                    "arguments borrow object '"
+                 << root->getName() << "')";
+      }
+      borrowRoots.push_back({root, rootPath});
+    }
+    arguments[borrow.index] = *reference;
+  }
   for (auto [index, value] : llvm::enumerate(arguments))
     if (value.getType() != inputs[index])
       return emitError(loc) << "unsupported: call argument type mismatch";

@@ -50,9 +50,15 @@ int main(void) {
 // NOPROTO: error: unsupported: function 'zero' does not match the function pointer signature
 
 //--- pointer-component.c
-void writer(int *out) { *out = 1; }
+// FR-76 moved arithmetic-pointee scalar-pointer components INTO the
+// supported set (`void (*)(int *)` is now a fn_ptr over `&mut [i32]`,
+// pinned in fnptr-slice-components.c), so this pin advanced to the
+// nearest still-unsupported component: a STRUCT-pointer component has no
+// region-typed slice shape and keeps the located pointer residual.
+struct S { int x; };
+void taker(struct S *p) { p->x = 1; }
 int main(void) {
-  void (*fp)(int *) = writer;
+  void (*fp)(struct S *) = taker;
   return 0;
 }
 // COMPONENT: error: unsupported: pointer type outside a parameter position

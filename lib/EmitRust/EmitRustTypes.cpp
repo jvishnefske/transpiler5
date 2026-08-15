@@ -185,7 +185,13 @@ LogicalResult emitrust::CellSliceType::verify(
 
 /// Returns whether `type` may be used as a fn_ptr parameter or result type:
 /// an emitter-supported scalar (i1, i8/i16/i32/i64 signless, u8/u16/u32/u64,
-/// index, f32, f64), an EmitRust struct or enum, or a nested fn_ptr.
+/// index, f32, f64), an EmitRust struct or enum, a nested fn_ptr, or (FR-76)
+/// a region-typed slice borrow (`ref`/`mut_ref` of a `slice`) — the Rust
+/// spelling `fn(&mut [u8], u32)` is an ordinary higher-ranked fn type with
+/// elided lifetimes, so it renders and calls with no emitter change. Bare
+/// scalar borrows (`&mut u8`) stay outside the set: a fn-ptr signature is a
+/// contract with unknown implementors, and the region contract is what the
+/// C pointer parameter means (see the FR-75/FR-76 design entries).
 bool emitrust::FnPtrType::isValidComponentType(Type type) {
   if (auto intType = llvm::dyn_cast<IntegerType>(type)) {
     if (intType.isSigned())
@@ -195,6 +201,10 @@ bool emitrust::FnPtrType::isValidComponentType(Type type) {
       return intType.isSignless();
     return width == 8 || width == 16 || width == 32 || width == 64;
   }
+  if (auto refType = llvm::dyn_cast<emitrust::RefType>(type))
+    return llvm::isa<emitrust::SliceType>(refType.getPointee());
+  if (auto mutRefType = llvm::dyn_cast<emitrust::MutRefType>(type))
+    return llvm::isa<emitrust::SliceType>(mutRefType.getPointee());
   return llvm::isa<IndexType, Float32Type, Float64Type, emitrust::StructType,
                    emitrust::EnumType, emitrust::FnPtrType>(type);
 }
