@@ -574,10 +574,14 @@ LogicalResult CImporter::deferExternGlobal(const clang::VarDecl *key,
   // declaration-only global for a definition that lives in another TU.
   // FR-79: the const qualifier is captured alongside — an AST fact
   // finalizeProject needs (it licenses the getter-only struct requirement)
-  // but can no longer derive there.
+  // but can no longer derive there. FR-85: captured via `isConstant`, not
+  // `isConstQualified`, because an ARRAY is const-qualified through its
+  // element type (C11 6.7.3p9 — `const u8_t key[4]` has no top-level
+  // qualifier); for non-array types the two agree, so the FR-79 struct and
+  // scalar answers are unchanged.
   pendingExternGlobals.try_emplace(
       symbolName,
-      PendingExternGlobal{loc, mlirType, canonical.isConstQualified()});
+      PendingExternGlobal{loc, mlirType, canonical.isConstant(astContext())});
   return success();
 }
 

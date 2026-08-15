@@ -16,6 +16,13 @@
 // static item, so 'static is the truthful lifetime). The spelling is
 // confined to trait-item results: everywhere else a ref stays a bare `&`,
 // as the call-site bindings below pin.
+// FR-85 adds the BY-VALUE BYTE-REGION getter of a const byte-region
+// requirement -- `fn ethbroadcast() -> [u8; 6];` -- an array-typed item
+// result needing no special rendering (Rust arrays are Copy) -- plus the
+// byte-slice-parameter item shape (`fn eth_out(v0: &[u8]);`) a body-less
+// byte-region-pointee callee lowers to, and pins the call site: the
+// getter's value seeds a temporary on which subscripting and the shared
+// byte slice are ordinary, exactly the importer's staged-copy image.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
 // The trait is ALWAYS `pub`, even here where nothing asked for exported
@@ -33,10 +40,12 @@
 // CHECK-NEXT:     fn cfg() -> S;
 // CHECK-NEXT:     fn set_cfg(v0: S);
 // CHECK-NEXT:     fn any() -> &'static S;
+// CHECK-NEXT:     fn eth_out(v0: &[u8]);
+// CHECK-NEXT:     fn ethbroadcast() -> [u8; 6];
 // CHECK-NEXT: }
 emitrust.trait_def @Externals
-    ["host_scale", "host_reset", "host_mix", "g_config", "set_g_config", "cfg", "set_cfg", "any"]
-    [(i32) -> i32, () -> (), (i32, f64) -> f64, () -> i32, (i32) -> (), () -> !emitrust.struct<"S">, (!emitrust.struct<"S">) -> (), () -> !emitrust.ref<!emitrust.struct<"S">>]
+    ["host_scale", "host_reset", "host_mix", "g_config", "set_g_config", "cfg", "set_cfg", "any", "eth_out", "ethbroadcast"]
+    [(i32) -> i32, () -> (), (i32, f64) -> f64, () -> i32, (i32) -> (), () -> !emitrust.struct<"S">, (!emitrust.struct<"S">) -> (), () -> !emitrust.ref<!emitrust.struct<"S">>, (!emitrust.ref<!emitrust.slice<ui8>>) -> (), () -> !emitrust.array<6xui8>]
 
 // FR-70: a getter call is a result-bearing opaque call, so its value binds
 // (or folds) exactly where the global load's value flowed; a setter call is
@@ -127,6 +136,33 @@ emitrust.func @read_any() -> i32
   %7 = emitrust.load %6 : (!emitrust.lvalue<i32>) -> i32
   %8 = emitrust.add %5, %7 : i32
   emitrust.return %8 : i32
+}
+
+// FR-85: the byte-region getter's call site is the importer's staged-copy
+// image rendered plainly -- the array-valued opaque call binds a Copy
+// temporary, and both the element read and the shared byte slice
+// (`slice_of`, the argument-pass shape) work on that TEMPORARY, never on
+// environment-owned storage.
+// CHECK:      fn eth_first<E: Externals>() -> i32 {
+// CHECK-NEXT:     let v0: [u8; 6] = E::ethbroadcast();
+// CHECK-NEXT:     let v1: [u8; 6];
+// CHECK-NEXT:     v1 = v0;
+// CHECK-NEXT:     let v3: &[u8] = &v1[0i64 as usize..];
+// CHECK-NEXT:     E::eth_out(v3);
+// CHECK-NEXT:     v1[0i64 as usize] as i32
+// CHECK-NEXT: }
+emitrust.func @eth_first() -> i32
+    attributes {emitrust.externals_generic = "Externals"} {
+  %0 = emitrust.call_opaque "E::ethbroadcast"() : () -> !emitrust.array<6xui8>
+  %1 = emitrust.variable : !emitrust.lvalue<!emitrust.array<6xui8>>
+  emitrust.assign %1 = %0 : !emitrust.lvalue<!emitrust.array<6xui8>>
+  %c0 = emitrust.constant <0 : i64> : i64
+  %2 = emitrust.slice_of %1[%c0] : (!emitrust.lvalue<!emitrust.array<6xui8>>, i64) -> !emitrust.ref<!emitrust.slice<ui8>>
+  emitrust.call_opaque "E::eth_out"(%2) : (!emitrust.ref<!emitrust.slice<ui8>>) -> ()
+  %3 = emitrust.subscript %1[%c0] : (!emitrust.lvalue<!emitrust.array<6xui8>>, i64) -> !emitrust.lvalue<ui8>
+  %4 = emitrust.load %3 : (!emitrust.lvalue<ui8>) -> ui8
+  %5 = emitrust.cast %4 : ui8 to i32
+  emitrust.return %5 : i32
 }
 
 // A function in the closure carries the bound; the call sites were already
