@@ -300,6 +300,25 @@ struct WholeProgramInfo {
   /// the globals `planCellSlices` may keep on the cell-slice path despite
   /// their external linkage (:724 lift).
   llvm::StringSet<> cellSliceEligibleGlobals;
+
+  //=== FR-77: whole-program function definitions ==========================
+
+  /// `mlirFuncName`s of every externally visible function DEFINED in some
+  /// TU of the project. The FR-77 use-site gate: taking a function's address
+  /// emits the opaque `Some(<name>)`, which no later walk can see as a
+  /// symbol use, so `resolveFunctionPointerDecl` must know AT THE USE SITE
+  /// whether any TU will ever supply the definition — order-independently,
+  /// which is exactly what this pre-import fact provides. Internal-linkage
+  /// functions are not recorded: a static's definition can only live in the
+  /// current TU, where `FunctionDecl::hasBody` already answers.
+  llvm::StringSet<> definedFunctions;
+  /// True once `collectWholeProgramInfo` has run — i.e. this is a PROJECT
+  /// import whose `definedFunctions` is authoritative. The historical
+  /// single-file `importC` entry point never pre-scans (and never runs
+  /// `finalizeProject`), so the FR-77 use-site gate must stay inert there:
+  /// with no whole-program view, an external target's definition may
+  /// legitimately live outside the import entirely.
+  bool prescanRan = false;
 };
 
 /// The emission-side identity of one pointer-region base: the bound object
@@ -4959,15 +4978,21 @@ private:
       emitrust::ExternalRequirements::Reject;
   /// FR-52: the MLIR symbol name of every function whose ADDRESS was taken
   /// anywhere in the project (`resolveFunctionPointerDecl`'s successful
-  /// answers).
+  /// answers), mapped to the FIRST resolution site.
   ///
   /// A function pointer is emitted as an `emitrust.constant` holding the
   /// opaque text `Some(<name>)`, which is NOT a symbol use — the symbol-table
-  /// machinery cannot see it. So this set is the only record that the name is
+  /// machinery cannot see it. So this map is the only record that the name is
   /// still spelled out somewhere in the module, and an undefined external in
   /// it keeps the historical rejection rather than becoming a trait
-  /// requirement whose `Some(<name>)` would dangle.
-  llvm::StringSet<> fnPointerTargetSymbols;
+  /// requirement whose `Some(<name>)` would dangle. FR-77 extends the record
+  /// with the resolution location: `finalizeProject` must refuse (or, in
+  /// defer mode, mark) such a name BEFORE the erase-unused branch — an
+  /// initializer-only reference has no SymbolUse at all, so
+  /// `firstSymbolUseLoc` would find nothing and the erased prototype would
+  /// leave the `Some(<name>)` dangling in the crate (rustc E0425) — and the
+  /// located diagnostic needs the address-taking site recorded here.
+  llvm::StringMap<Location> fnPointerTargetSymbols;
   /// Shape of every imported file-scope struct, keyed by symbol name, for
   /// cross-TU deduplication and mismatch detection. Block-scope records are
   /// never entered here: their identity is the defining decl (see

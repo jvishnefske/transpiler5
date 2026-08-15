@@ -3067,6 +3067,71 @@ static constexpr char kActorRtModuleAsync[] =
 }
 )";
 
+/// FR-77 backstop, the parse-back half: the fn-item identifier inside an
+/// importer-produced fn-ptr constant spelling `Some(<identifier>)`, or an
+/// empty StringRef for every other opaque text. Deliberately restricted to
+/// IDENTIFIER-shaped payloads on fn_ptr-typed positions: the va-cursor
+/// spelling `Some(0i64)` (digit-led) and the FR-52 requirement rewrite's
+/// `::`-qualified spelling are other contracts' opaque text and must pass
+/// untouched.
+static StringRef fnPtrConstantTargetIdent(Attribute attr) {
+  auto opaque = dyn_cast_if_present<emitrust::OpaqueAttr>(attr);
+  if (!opaque)
+    return StringRef();
+  StringRef text = opaque.getValue();
+  if (!text.consume_front("Some(") || !text.consume_back(")"))
+    return StringRef();
+  if (text.empty() || llvm::isDigit(text.front()))
+    return StringRef();
+  for (char c : text)
+    if (!llvm::isAlnum(c) && c != '_')
+      return StringRef();
+  return text;
+}
+
+/// FR-77 backstop, the recursive half: walks an initializer attribute
+/// alongside its type — recursing through array elements and struct fields
+/// exactly as `emitAggregateInit` will render them (the FR-52 global check
+/// this generalizes stopped at the top level, which would miss every fn-ptr
+/// TABLE) — and refuses any fn_ptr-typed `Some(<identifier>)` leaf naming a
+/// function absent from `fnItems`. `op` anchors the diagnostic and the
+/// struct-def symbol lookup.
+static LogicalResult
+verifyFnPtrTargetsPresent(Operation *op, Attribute init, Type type,
+                          const llvm::StringSet<> &fnItems) {
+  if (isa<emitrust::FnPtrType>(type)) {
+    StringRef target = fnPtrConstantTargetIdent(init);
+    if (!target.empty() && !fnItems.contains(target))
+      return op->emitError()
+             << "dangling function pointer target '" << target
+             << "': the module defines no function with that name";
+    return success();
+  }
+  auto elements = dyn_cast_if_present<ArrayAttr>(init);
+  if (!elements)
+    return success();
+  if (auto arrayType = dyn_cast<emitrust::ArrayType>(type)) {
+    for (Attribute element : elements)
+      if (failed(verifyFnPtrTargetsPresent(op, element,
+                                           arrayType.getElementType(),
+                                           fnItems)))
+        return failure();
+    return success();
+  }
+  if (auto structType = dyn_cast<emitrust::StructType>(type)) {
+    auto structDef = SymbolTable::lookupNearestSymbolFrom<emitrust::StructDefOp>(
+        op, StringAttr::get(op->getContext(), structType.getName()));
+    if (!structDef || elements.size() != structDef.getFieldTypes().size())
+      return success(); // Shape mismatch is the aggregate renderer's error.
+    for (auto [element, fieldType] :
+         llvm::zip_equal(elements, structDef.getFieldTypes()))
+      if (failed(verifyFnPtrTargetsPresent(
+              op, element, cast<TypeAttr>(fieldType).getValue(), fnItems)))
+        return failure();
+  }
+  return success();
+}
+
 LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   // FR-57a: a module carrying an `emitrust.extern_decl`-marked declaration
   // is one translation unit's SHARD, not a program — the marked symbol's
@@ -3104,6 +3169,35 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
              << globalOp.getSymName()
              << "': emitrust-lower-external-requirements must run before "
                 "Rust emission";
+  // FR-77: a fn-ptr constant is rendered by writing its opaque
+  // `Some(<name>)` text verbatim, and that name is NOT a symbol use — no
+  // verifier, no walk, nothing structural keeps a planner change from
+  // handing this emitter a module that spells out a function it does not
+  // contain. The rendered crate would be rustc E0425: a whole-crate loss
+  // this emitter could have refused with a located diagnostic. So, marker-
+  // contract style, refuse any identifier-shaped fn_ptr-typed
+  // `Some(<name>)` — global initializers (recursed through aggregates) and
+  // `emitrust.constant` rvalues alike — whose name is not a function item
+  // of this module.
+  {
+    llvm::StringSet<> fnItems;
+    moduleOp.walk(
+        [&](emitrust::FuncOp fn) { fnItems.insert(fn.getSymName()); });
+    for (auto globalOp : moduleOp.getOps<emitrust::GlobalOp>())
+      if (Attribute init = globalOp.getInitAttr())
+        if (failed(verifyFnPtrTargetsPresent(globalOp.getOperation(), init,
+                                             globalOp.getType(), fnItems)))
+          return failure();
+    WalkResult dangling = moduleOp.walk([&](emitrust::ConstantOp constant) {
+      if (failed(verifyFnPtrTargetsPresent(constant.getOperation(),
+                                           constant.getValue(),
+                                           constant.getType(), fnItems)))
+        return WalkResult::interrupt();
+      return WalkResult::advance();
+    });
+    if (dangling.wasInterrupted())
+      return failure();
+  }
   // FR-62 slice 5c: the shared `mod actor_rt` epilogue exists once per
   // crate and its text is flavor-specific, so every anchor in one module
   // must agree on the mode. The driver never produces a mixed module

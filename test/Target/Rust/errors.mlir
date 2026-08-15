@@ -56,3 +56,35 @@ emitrust.func @unfoldable_while(%arg0: i32, %arg1: i32) -> i32 {
 // emitter refuses instead.
 // CHECK: unlowered external-requirement global 'g_config': emitrust-lower-external-requirements must run before Rust emission
 emitrust.global @g_config {emitrust.external_requirement} : i32
+
+// -----
+
+// FR-77 marker contract: a fn-ptr constant's `Some(<name>)` is OPAQUE text,
+// not a SymbolUse, so nothing structural stops a planner change from
+// emitting a module that spells out a function the module does not contain
+// -- the rendered crate is then rustc E0425, a whole-crate loss the emitter
+// could have refused. The backstop: any identifier-shaped `Some(<name>)` on
+// a fn_ptr-typed global initializer must resolve to a function in the
+// module. (Non-identifier spellings -- `Some(0i64)` option-cursors,
+// `Some(f::<T>)` requirement rewrites -- are other contracts' and pass.)
+// CHECK: dangling function pointer target 'helper': the module defines no function with that name
+emitrust.global @TU0_CB <#emitrust.opaque<"Some(helper)">> : !emitrust.fn_ptr<(i32) -> i32>
+
+// -----
+
+// FR-77, the aggregate position: a fn-ptr TABLE's leaves are the same opaque
+// spelling nested in an ArrayAttr, so the walk must recurse (the FR-52
+// global-initializer check did not, which is exactly how a table would have
+// slipped this net).
+// CHECK: dangling function pointer target 'op_a': the module defines no function with that name
+emitrust.global const @OPS <[#emitrust.opaque<"Some(op_a)">, #emitrust.opaque<"None">]> : !emitrust.array<2x!emitrust.fn_ptr<(i32) -> i32>>
+
+// -----
+
+// FR-77, the rvalue position: an `emitrust.constant` of fn_ptr type inside a
+// body dangles the same way.
+emitrust.func @use_missing() -> !emitrust.fn_ptr<(i32) -> i32> {
+  // CHECK: dangling function pointer target 'missing': the module defines no function with that name
+  %0 = emitrust.constant <#emitrust.opaque<"Some(missing)">> : !emitrust.fn_ptr<(i32) -> i32>
+  emitrust.return %0 : !emitrust.fn_ptr<(i32) -> i32>
+}

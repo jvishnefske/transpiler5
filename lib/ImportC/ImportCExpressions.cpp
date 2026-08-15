@@ -4442,11 +4442,29 @@ CImporter::resolveFunctionPointerDecl(const clang::FunctionDecl *callee,
     return emitError(loc)
            << "unsupported: function '" << name
            << "' does not match the function pointer signature";
+  // FR-77: the emitted constant will spell `Some(<name>)` — opaque text no
+  // symbol-table walk can see — so a name NO translation unit defines must
+  // be refused HERE, at the address-taking site, where the diagnostic is
+  // located on the C construct and the per-decl recovery walk can drop the
+  // containing item (and transitively stub its readers) instead of losing
+  // the crate to a dangling reference (rustc E0425). The project-wide
+  // definition set comes from the pre-import whole-program scan, so the
+  // answer is independent of TU import order; defer mode skips the gate —
+  // a shard cannot know the link line, so `finalizeProject` marks the
+  // prototype as an `emitrust.extern_decl` link obligation instead. The
+  // historical single-file entry point (no pre-scan, no finalize) also
+  // stays untouched: it emits a body-less prototype exactly as before.
+  if (wholeProgram.prescanRan && !deferExternals && !callee->hasBody() &&
+      !wholeProgram.definedFunctions.contains(name))
+    return emitError(loc)
+           << "unsupported: taking the address of undefined function '" << name
+           << "'";
   // FR-52: the emitted `Some(<name>)` constant spells the item out directly,
   // so this name can never be routed through the external-requirement trait.
-  // Recorded here — the one place a function address resolves — rather than
-  // recovered later by scanning opaque constant text.
-  fnPointerTargetSymbols.insert(name);
+  // Recorded here — the one place a function address resolves — with the
+  // first resolution site, the location FR-77's finalize-time refusal needs
+  // (an initializer-only reference leaves no SymbolUse to locate on).
+  fnPointerTargetSymbols.try_emplace(name, loc);
   return name;
 }
 

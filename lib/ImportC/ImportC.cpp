@@ -2477,12 +2477,24 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
       self(self, child);
   };
 
+  // FR-77: the pre-scan ran, so `wholeProgram.definedFunctions` below is the
+  // authoritative project-wide definition set and the use-site
+  // undefined-target gate in `resolveFunctionPointerDecl` may consult it.
+  wholeProgram.prescanRan = true;
+
   for (const clang::Decl *decl : unit->decls()) {
     if (decl->isImplicit() || isSystemHeaderDecl(decl))
       continue;
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
-      if (func->hasBody() && func->getDefinition() == func)
+      if (func->hasBody() && func->getDefinition() == func) {
+        // FR-77: record the definition fact for the whole-program
+        // undefined-fn-ptr-target gate. Externally visible only — the one
+        // linkage that can satisfy another TU's reference — so the name is
+        // tag-free, matching `resolveFunctionPointerDecl`'s query.
+        if (func->isExternallyVisible())
+          wholeProgram.definedFunctions.insert(mlirFuncName(func));
         scan(scan, func->getBody());
+      }
       continue;
     }
     if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
@@ -5821,6 +5833,27 @@ LogicalResult CImporter::finalizeProject() {
   for (func::FuncOp func :
        llvm::make_early_inc_range(module.getOps<func::FuncOp>()))
     if (func.isExternal()) {
+      // FR-77: an address-taken function is spelled out as the OPAQUE text
+      // `Some(<name>)`, which is not a SymbolUse, so it must be checked
+      // BEFORE the erase-unused branch below — to that branch an
+      // initializer-only reference looks unreferenced, and erasing the
+      // prototype would ship a crate whose `Some(<name>)` dangles (rustc
+      // E0425, whole crate lost). In defer mode the name is a link
+      // obligation like any other referenced external (the FR-58 link step
+      // resolves or reports it); otherwise it is refused, located at the
+      // recorded address-taking site. The use-site gate in
+      // `resolveFunctionPointerDecl` normally fires first — this is the
+      // finalize-time backstop completing the same contract.
+      auto fnPtrTarget = fnPointerTargetSymbols.find(func.getSymName());
+      if (fnPtrTarget != fnPointerTargetSymbols.end()) {
+        if (deferExternals) {
+          func->setAttr(emitrust::kExternDeclAttrName, builder.getUnitAttr());
+          continue;
+        }
+        return emitError(fnPtrTarget->second)
+               << "unsupported: taking the address of undefined function '"
+               << func.getSymName() << "'";
+      }
       if (SymbolTable::symbolKnownUseEmpty(func.getOperation(),
                                            module.getOperation())) {
         func.erase();

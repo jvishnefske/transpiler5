@@ -74,3 +74,14 @@ emitrust.global @handler : !emitrust.fn_ptr<(i32) -> i32>
 // CHECK-NEXT: }
 emitrust.global @bound <#emitrust.opaque<"Some(add)">>
     : !emitrust.fn_ptr<(i32, i32) -> i32>
+
+// FR-77: every `Some(<name>)` above must name a function the module
+// actually contains — the emitter now refuses a dangling target (see
+// errors.mlir), so this fixture carries the definition the importer would
+// always have emitted alongside the constants. Placed last so every pinned
+// rendering above is byte-unchanged.
+// CHECK:      fn add(
+emitrust.func @add(%arg0: i32, %arg1: i32) -> i32 {
+  %0 = emitrust.add %arg0, %arg1 : i32
+  emitrust.return %0 : i32
+}
