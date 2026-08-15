@@ -4693,6 +4693,31 @@ private:
       const clang::VarDecl *&chainRoot,
       SmallVectorImpl<const clang::FieldDecl *> &path);
 
+  /// FR-91: the byte-region arm of the member-array interception. A
+  /// member chain ending in a BYTE-REGION record (CTS-BR) has no member
+  /// PLACES — the object is one flat byte region and a `struct *` over
+  /// it is a byte slice — so the argument window is the region place at
+  /// `cursor + constant layout byte offset` (`resolveByteRegionRef`),
+  /// borrowed OPEN-ENDED by `emitrust.slice_of` (faithful because every
+  /// byte-family helper carries an explicit count and slice-param
+  /// callees never read a length). Admission is narrow: the leaf must
+  /// be a fixed-extent u8 array (a flexible/zero-length tail has no
+  /// extent), every link a non-union byte-region field, the root a
+  /// LOCAL dot place or an arrow through a byte-region pointer whose
+  /// pointee is non-const when the window is mutable, and the FR-86
+  /// offset-index purity gate applies unchanged; declined shapes return
+  /// false WITHOUT diagnosing so the historical decay rejection stays
+  /// verbatim, while `resolveByteRegionRef`'s own rejections (a
+  /// null-compared or otherwise demoted pointer root) stay located.
+  /// Callers key aliasing on the root with an EMPTY field path: windows
+  /// of one region share ONE slice place, so the FR-74 disjoint-sibling
+  /// two-borrow admission must NOT transfer (two `slice_of`s of one
+  /// place with a mut is rustc E0502).
+  FailureOr<bool> tryEmitByteRegionMemberWindow(
+      Location loc, const clang::MemberExpr *member,
+      const clang::Expr *cursorIndex, bool isMutParam, Value &place,
+      Value &cursor, Type &element, const clang::VarDecl *&chainRoot);
+
   /// Returns whether any declaration reference below `stmt` names a
   /// decomposed pointer (a pointer local or slice parameter registered in
   /// `pointerLocals`), in which case a borrow-producing call argument must

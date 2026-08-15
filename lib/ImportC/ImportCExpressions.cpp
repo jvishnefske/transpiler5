@@ -3978,6 +3978,119 @@ bool CImporter::matchMemberChainRoot(
   return true;
 }
 
+FailureOr<bool> CImporter::tryEmitByteRegionMemberWindow(
+    Location loc, const clang::MemberExpr *member,
+    const clang::Expr *cursorIndex, bool isMutParam, Value &place,
+    Value &cursor, Type &element, const clang::VarDecl *&chainRoot) {
+  // The leaf must be a fixed-extent u8 array: a flexible/zero-length
+  // tail has no extent (the heatshrink `hsd->buffers` FAM sites stay
+  // located at the decay), and a non-array or nested-record leaf is not
+  // a window this interception proves.
+  const auto *leaf = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+  if (!leaf)
+    return false;
+  const clang::ConstantArrayType *leafArray =
+      astContext().getAsConstantArrayType(leaf->getType());
+  if (!leafArray || leafArray->getSize().isZero() ||
+      !isU8ScalarType(leafArray->getElementType()))
+    return false;
+  // FR-86 purity gate, unchanged: the offset index is evaluated exactly
+  // once, ahead of the borrow, so an impure index declines.
+  std::optional<llvm::APSInt> constantCursor;
+  if (cursorIndex) {
+    constantCursor = cursorIndex->getIntegerConstantExpr(astContext());
+    if (!constantCursor && !isPureSliceCursorExpr(cursorIndex))
+      return false;
+  }
+  // Chain walk — AST-only, so a decline emits no IR. Every link must be
+  // a non-union byte-region field (a union arm keeps the historical
+  // rejection), and the root must be LOCAL: a global root's region
+  // place would be a staged copy, and a mutable window of the copy
+  // would silently lose the callee's writes (the typed member path
+  // refuses globals identically). An arrow root through a CONST
+  // (shared) region cannot yield a `&mut` window.
+  const clang::MemberExpr *link = member;
+  const clang::VarDecl *rootVar = nullptr;
+  while (true) {
+    const auto *field =
+        llvm::dyn_cast<clang::FieldDecl>(link->getMemberDecl());
+    if (!field || field->getParent()->isUnion() ||
+        !isByteRegionRecord(field->getParent()))
+      return false;
+    const clang::Expr *base = stripTrivia(link->getBase());
+    if (link->isArrow()) {
+      clang::QualType baseType = base->getType().getCanonicalType();
+      if (!baseType->isPointerType())
+        return false;
+      if (isMutParam && baseType->getPointeeType().isConstQualified())
+        return false;
+      const auto *ref =
+          llvm::dyn_cast<clang::DeclRefExpr>(base->IgnoreParenImpCasts());
+      const auto *var =
+          ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+      if (!var || !var->hasLocalStorage())
+        return false;
+      rootVar = var;
+      break;
+    }
+    if (const auto *inner = llvm::dyn_cast<clang::MemberExpr>(base)) {
+      link = inner;
+      continue;
+    }
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(base);
+    const auto *var =
+        ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+    if (!var || !var->hasLocalStorage())
+      return false;
+    rootVar = var;
+    break;
+  }
+  // Resolution may still reject, LOCATED: a null-compared or otherwise
+  // demoted pointer root hits `resolveByteRegionPointer`'s existing
+  // literalBacking/baseIndex/nonNull/member rejections — that frontier
+  // stays where the byte-region contract put it.
+  FailureOr<ByteRegionRef> region = resolveByteRegionRef(member, nullptr);
+  if (failed(region))
+    return failure();
+  Type ui8Type =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  auto lvalueType =
+      llvm::dyn_cast<emitrust::LValueType>(region->place.getType());
+  Type baseElement;
+  if (lvalueType) {
+    if (auto arrayType =
+            llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType()))
+      baseElement = arrayType.getElementType();
+    else if (auto sliceType =
+                 llvm::dyn_cast<emitrust::SliceType>(lvalueType.getValueType()))
+      baseElement = sliceType.getElementType();
+  }
+  if (baseElement != ui8Type)
+    return emitError(loc) << "unsupported pointer target place";
+  // The window cursor: the region's byte offset (constant layout offset
+  // plus the pointer parameter's runtime cursor) plus the FR-86 offset
+  // index. A constant index folds into the constant part.
+  ByteRegionRef window = *region;
+  if (constantCursor)
+    window.constOff += constantCursor->getExtValue();
+  Value cursorValue = byteRegionOffset(loc, window);
+  if (cursorIndex && !constantCursor) {
+    FailureOr<Value> rawIndex = emitRValue(cursorIndex);
+    if (failed(rawIndex))
+      return failure();
+    if (!llvm::isa<IntegerType>((*rawIndex).getType()))
+      return emitError(loc) << "unsupported subscript index type";
+    Value index64 = castToIntType(loc, *rawIndex, builder.getIntegerType(64));
+    cursorValue =
+        builder.create<arith::AddIOp>(loc, cursorValue, index64).getResult();
+  }
+  place = region->place;
+  cursor = cursorValue;
+  element = ui8Type;
+  chainRoot = rootVar;
+  return true;
+}
+
 FailureOr<bool> CImporter::tryEmitMemberArraySlicePlace(
     Location loc, const clang::Expr *stripped, bool isMutParam,
     Value &place, Value &cursor, Type &element,
@@ -4019,6 +4132,25 @@ FailureOr<bool> CImporter::tryEmitMemberArraySlicePlace(
   }
   const auto *member =
       llvm::dyn_cast_or_null<clang::MemberExpr>(decayedOperand);
+  // FR-91: a member chain ending in a BYTE-REGION record routes through
+  // the region-window arm instead of the typed member matcher (which
+  // deliberately declines byte-region parents). The window reports an
+  // EMPTY field path: region windows share ONE slice place, so aliasing
+  // must key on the root alone — a second window of the same root in
+  // one call collides, and the byte-family same-root pair rides
+  // `copy_within` on the whole region with absolute byte cursors.
+  if (member)
+    if (const auto *leafField =
+            llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+        leafField && isByteRegionRecord(leafField->getParent())) {
+      FailureOr<bool> window = tryEmitByteRegionMemberWindow(
+          loc, member, cursorIndex, isMutParam, place, cursor, element,
+          chainRoot);
+      if (failed(window) || !*window)
+        return window;
+      path.clear();
+      return true;
+    }
   std::optional<llvm::APSInt> constantCursor;
   if (member && cursorIndex)
     constantCursor = cursorIndex->getIntegerConstantExpr(astContext());
