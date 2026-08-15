@@ -416,12 +416,17 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
 
     // The owner struct is named after the C spellings (`main`, not the
     // renamed `c_main`); an internal-linkage owning function takes the
-    // per-TU tag so identically named statics never collide.
+    // per-TU tag so identically named statics never collide. The tag
+    // joins through `joinSymbolPrefix` (FR-73) so a leading-underscore
+    // owner folds into the tag boundary exactly as the owner's own
+    // function symbol does — this is the one composition site outside
+    // `cFunctionSymbolName`/`cGlobalSymbolName`, kept on the same rule.
+    std::string taggedOwner = emitrust::joinSymbolPrefix(
+        owner->isExternallyVisible() ? llvm::StringRef() :
+                                       llvm::StringRef(currentTuTag),
+        owner->getName());
     std::string structName =
-        (llvm::Twine("Owner_") +
-         (owner->isExternallyVisible() ? "" : currentTuTag.c_str()) +
-         owner->getName() + "_" + base->getName())
-            .str();
+        (llvm::Twine("Owner_") + taggedOwner + "_" + base->getName()).str();
     // A synthesized owner struct is a type name: UpperCamelCase under the
     // idiomatic rename.
     structName = typeRustName(structName);

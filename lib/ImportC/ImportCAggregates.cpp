@@ -46,6 +46,7 @@ void CImporter::collectStaticLocalNames(const clang::Stmt *stmt,
 void CImporter::collectOrdinaryNames(const clang::TranslationUnitDecl *unit) {
   ordinaryTuNames.clear();
   ordinaryRawTuNames.clear();
+  ordinaryTuNameOwners.clear();
   collectOrdinaryNamesFrom(unit);
 }
 
@@ -68,6 +69,11 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
       std::string funcName = mlirFuncName(func);
       ordinaryTuNames.insert(funcName);
       ordinaryRawTuNames.insert(func->getName());
+      // FR-73: remember which raw spelling claimed the composed name
+      // first (try_emplace keeps the first claimant; redeclarations of
+      // the same raw name agree), so the underscore-fold guard in
+      // importFunction can reject a DIFFERENT spelling folding onto it.
+      ordinaryTuNameOwners.try_emplace(funcName, func->getName().str());
       // Function-local statics surface at module level under their
       // `<function>_<name>` mangle (see emitLocalVar), claiming that
       // spelling in the ordinary namespace.
@@ -76,8 +82,12 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
       continue;
     }
     if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
-      ordinaryTuNames.insert(globalVarSymbolName(var));
+      std::string varName = globalVarSymbolName(var);
+      ordinaryTuNames.insert(varName);
       ordinaryRawTuNames.insert(var->getName());
+      // FR-73: same first-claimant record as the function branch, for the
+      // underscore-fold guard in importGlobalVar.
+      ordinaryTuNameOwners.try_emplace(varName, var->getName().str());
     }
   }
 }

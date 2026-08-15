@@ -176,6 +176,29 @@ static inline std::string recordRustName(const clang::RecordDecl *record) {
   return idiomaticRenameEnabled() ? toUpperCamelCase(name) : name.str();
 }
 
+/// FR-73: joins a structural symbol prefix (the per-TU statics tag
+/// `tu<i>_`, the namespace chain `ns_a_`) onto a mangled base name without
+/// manufacturing consecutive underscores. Every non-empty prefix ends in
+/// `_`, and `toSnakeCase` never doubles an existing underscore, so prefix
+/// concatenation was the ONE producer of the `__` that rustc's denied
+/// non_snake_case lint rejects outright (`tu0__set` fails the emitted
+/// crate's build; rustc's own suggestion is the fold applied here). The
+/// rule: ALL leading underscores of the base collapse into the boundary
+/// underscore the prefix already carries (`tu0_` + `_set` -> `tu0_set`,
+/// `tu0_` + `__x` -> `tu0_x`, `ns_a_` + `_f` -> `ns_a_f`); with an empty
+/// prefix the base is untouched (a bare leading underscore is legal
+/// snake_case). A fold that would merge two distinct C spellings (`_set`
+/// and `set` in one TU both composing to `tu0_set`) is rejected with a
+/// located diagnostic where the later declaration is imported
+/// (`CImporter::importFunction` / `importGlobalVar`, backed by the
+/// pre-scan's composed-name-to-raw-spelling map) — never silently unified.
+static inline std::string joinSymbolPrefix(llvm::StringRef prefix,
+                                           llvm::StringRef base) {
+  if (prefix.empty())
+    return base.str();
+  return (prefix + base.ltrim('_')).str();
+}
+
 /// W2.0 C++ input tolerance: the `ns_<name>_`-per-level prefix reflecting
 /// `context`'s enclosing namespace chain, applied to a declaration's
 /// emitted module symbol name (`mlirFuncName`, the global-variable naming
@@ -224,6 +247,10 @@ static inline std::string namespacePrefix(const clang::DeclContext *context) {
 ///    unchanged-name contract.
 ///  - an internal-linkage (`static`) function takes `tuTag` in front, so
 ///    identically named file-statics in different TUs never collide.
+///  - each prefix joins through `joinSymbolPrefix` (FR-73): leading
+///    underscores of the prefixed name fold into the boundary so the
+///    composition never manufactures the `__` rustc's denied
+///    non_snake_case lint rejects.
 ///
 /// FR-51 reads that last rule BACKWARDS at Rust-emission time to decide
 /// which items a library crate exports; the inverse predicate is
@@ -239,10 +266,10 @@ static inline std::string cFunctionSymbolName(const clang::FunctionDecl *func,
   llvm::StringRef cName = func->getName();
   if (cName == "main")
     return "c_main";
-  std::string base =
-      namespacePrefix(func->getDeclContext()) + mangleMemberName(cName);
+  std::string base = joinSymbolPrefix(namespacePrefix(func->getDeclContext()),
+                                      mangleMemberName(cName));
   if (func->getStorageClass() == clang::SC_Static)
-    return (tuTag + base).str();
+    return joinSymbolPrefix(tuTag, base);
   return base;
 }
 
@@ -254,7 +281,11 @@ static inline std::string cFunctionSymbolName(const clang::FunctionDecl *func,
 /// internal-linkage global — `static` at file scope, or any global in an
 /// anonymous namespace — takes `tuTag` in front so identically named
 /// file-statics in different TUs stay distinct; a C++ namespace chain
-/// contributes its flattening prefix (`namespacePrefix`).
+/// contributes its flattening prefix (`namespacePrefix`). The prefixes
+/// join through `joinSymbolPrefix` (FR-73): a leading-underscore C
+/// spelling folds into the prefix boundary (`_x` -> `tu0_x`) instead of
+/// composing the `tu0__x` that rustc's denied non_snake_case lint (or its
+/// SCREAMING_SNAKE_CASE sibling for the renamed `TU0__X`) rejects.
 ///
 /// \param var the file-scope variable declaration to name.
 /// \param tuTag the per-TU tag for internal-linkage symbols; empty for a
@@ -263,9 +294,10 @@ static inline std::string cFunctionSymbolName(const clang::FunctionDecl *func,
 static inline std::string cGlobalSymbolName(const clang::VarDecl *var,
                                             llvm::StringRef tuTag) {
   bool internal = !var->isExternallyVisible();
-  std::string full = (internal ? tuTag.str() : std::string()) +
-                     namespacePrefix(var->getDeclContext()) +
-                     var->getName().str();
+  std::string full =
+      joinSymbolPrefix((internal ? tuTag.str() : std::string()) +
+                           namespacePrefix(var->getDeclContext()),
+                       var->getName());
   // A global becomes SCREAMING_SNAKE_CASE as a whole, so its per-TU tag and
   // namespace prefix are uppercased too (`tu0_calls` -> `TU0_CALLS`,
   // `ns_shapes_base` -> `NS_SHAPES_BASE`); the linkage predicate in
