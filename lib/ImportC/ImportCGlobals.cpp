@@ -735,6 +735,39 @@ FailureOr<Attribute> CImporter::convertGlobalInit(const clang::VarDecl *decl,
   return convertAPValueInit(*value, type, decl->getType(), initLoc);
 }
 
+/// FR-78: whether a constant value is recursively all-zero (integers and
+/// floats zero, aggregates zero in every element/field, a union's active
+/// arm — if any — itself all-zero). Exactly the values static-storage
+/// zero-fill produces, so an opaque union's blob may represent them as its
+/// zero bytes; any kind not listed (pointers, lvalues, ...) is
+/// conservatively NOT zero and keeps the located rejection.
+static bool isZeroAPValue(const clang::APValue &value) {
+  switch (value.getKind()) {
+  case clang::APValue::Int:
+    return value.getInt().isZero();
+  case clang::APValue::Float:
+    return value.getFloat().isPosZero();
+  case clang::APValue::Array: {
+    for (unsigned i = 0, n = value.getArrayInitializedElts(); i != n; ++i)
+      if (!isZeroAPValue(value.getArrayInitializedElt(i)))
+        return false;
+    return !value.hasArrayFiller() || isZeroAPValue(value.getArrayFiller());
+  }
+  case clang::APValue::Struct: {
+    if (value.getStructNumBases() != 0)
+      return false; // C records have no bases; conservative for C++.
+    for (unsigned i = 0, n = value.getStructNumFields(); i != n; ++i)
+      if (!isZeroAPValue(value.getStructField(i)))
+        return false;
+    return true;
+  }
+  case clang::APValue::Union:
+    return !value.getUnionField() || isZeroAPValue(value.getUnionValue());
+  default:
+    return false;
+  }
+}
+
 FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
                                                    Type type,
                                                    clang::QualType cType,
@@ -823,6 +856,24 @@ FailureOr<Attribute> CImporter::convertAPValueInit(const clang::APValue &value,
         return emitError(loc)
                << "unsupported: global initializer does not match its type";
       Type slotType = llvm::cast<TypeAttr>(slotTypes[0]).getValue();
+      // FR-78: an opaque union's constant admits only the ALL-ZERO value
+      // (no active arm, or an active arm whose value is recursively
+      // zero) — that is static-storage zero-fill, which lands on the
+      // blob's zero bytes exactly. Anything else would need the arm's
+      // byte image, which the blob model does not carry this wave; a
+      // located rejection at the global keeps the record importable
+      // while the constant stays out (never silently wrong bytes).
+      if (opaqueUnions.contains(unionRecord)) {
+        auto blobType = llvm::cast<emitrust::ArrayType>(slotType);
+        if (!isZeroAPValue(value))
+          return emitError(loc)
+                 << "unsupported: opaque union arm initializer";
+        SmallVector<Attribute> zeros(
+            blobType.getSize(),
+            builder.getIntegerAttr(blobType.getElementType(), 0));
+        return Attribute(builder.getArrayAttr(
+            {Attribute(builder.getArrayAttr(zeros))}));
+      }
       FailureOr<Attribute> slot =
           convertAnonymousSlotInit(value, unionRecord, slotType, loc);
       if (failed(slot))

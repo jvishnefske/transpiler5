@@ -5040,6 +5040,26 @@ private:
   /// no access through the arm is representable on that slot;
   /// `emitMemberLValue` rejects each such access at its own site.
   llvm::SmallPtrSet<const clang::FieldDecl *, 4> unionByteArrayArms;
+  /// FR-78: differing-aggregate-arm unions admitted at the TYPE level as
+  /// OPAQUE STORAGE — a one-field struct_def holding a sizeof-sized
+  /// `[u8; N]` blob (field spelling "opaque"), marked
+  /// `emitrust.opaque_union`. The containing record imports (the
+  /// containment win) and whole-value traffic works, but no access through
+  /// any arm is representable on the blob. `collectUnionSlot` populates
+  /// both sets exactly where the one-slot residual rejection ("union arm
+  /// cannot alias the storage slot") would have fired, and only when EVERY
+  /// arm is an aggregate (record or constant array) on the C import path;
+  /// `emitMemberLValue`/`projectMemberPlace` reject each arm access,
+  /// `emitRecordInitField` each active-arm initializer, and
+  /// `convertAPValueInit` each non-zero constant, all at their own sites.
+  /// The Rust emitter's marker backstop refuses any leaked arm access
+  /// (`kOpaqueUnionAttrName`, TranslateToRust.cpp) — the pre-FR-78
+  /// placeholder attempt died as rustc E0609 precisely because its guard
+  /// was not access-complete.
+  llvm::SmallPtrSet<const clang::RecordDecl *, 4> opaqueUnions;
+  /// Every arm FieldDecl of every union in `opaqueUnions`; consulted by
+  /// the access-site rejections listed there.
+  llvm::SmallPtrSet<const clang::FieldDecl *, 8> opaqueUnionArms;
   /// The C99-45 accessor geometry of one bit-field member: the window
   /// `[offset, offset + width)` of the synthesized unsigned backing field
   /// `backingName` (of type `backingType`) in its flattened parent

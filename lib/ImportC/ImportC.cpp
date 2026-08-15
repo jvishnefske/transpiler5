@@ -4770,6 +4770,11 @@ CImporter::projectMemberPlace(Location loc, Value basePlace,
   auto baseType = llvm::dyn_cast<emitrust::LValueType>(basePlace.getType());
   if (!baseType || !llvm::isa<emitrust::StructType>(baseType.getValueType()))
     return emitError(loc) << "unsupported member access base";
+  // FR-78 belt: an opaque-union arm has no field behind it to project
+  // (member-rooted region bases funnel here; `emitMemberLValue` carries
+  // the primary check).
+  if (opaqueUnionArms.contains(field))
+    return emitError(loc) << "unsupported: opaque union arm access";
   FailureOr<Type> fieldType = mapType(field->getType(), loc);
   if (failed(fieldType))
     return failure();
@@ -5232,6 +5237,15 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   // array arm can be modeled on that one slot.
   if (unionByteArrayArms.contains(field))
     return emitError(loc) << "unsupported: union byte-array arm access";
+  // FR-78: an opaque-union arm exists only at the type level too — the
+  // union admitted as a sizeof-sized byte blob, and the blob carries no
+  // arm-typed view, so EVERY access through any arm (read, write,
+  // compound, ++/--, nested projection, dot or arrow) rejects here, at
+  // its own site. This check is load-bearing: a leaked arm member op
+  // verifies and translates, dying only as rustc E0609 (the emitter's
+  // marker backstop is the last line, not this one's substitute).
+  if (opaqueUnionArms.contains(field))
+    return emitError(loc) << "unsupported: opaque union arm access";
   // A data-pointer member has no place of its own (its stored i64
   // carries no information); reads resolve through the static binding
   // in `emitPointerRValue` and writes through `emitMemberPointerAssign` —

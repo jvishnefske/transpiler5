@@ -103,6 +103,20 @@ inline constexpr llvm::StringLiteral kExternalRequirementAttrName =
 inline constexpr llvm::StringLiteral kExternDeclAttrName =
     "emitrust.extern_decl";
 
+/// FR-78: name of the discardable unit attribute marking a struct_def that
+/// models a differing-aggregate-arm C union as OPAQUE STORAGE — a single
+/// sizeof-sized byte-blob field. The type and every whole-value use are
+/// admitted (the containment win: records naming the union import), but
+/// the blob carries no arm-typed view, so the importer must reject every
+/// access through any union arm at its own site. Nothing structural backs
+/// that promise up — `emitrust.member` field names are not cross-checked
+/// against the struct_def, so a leaked arm access verifies, translates,
+/// and dies only as rustc E0609 (a whole-crate loss with no source
+/// location). The Rust emitter therefore refuses ANY member selection on a
+/// marked struct type, marker-contract style (see FR-52/FR-57a above).
+inline constexpr llvm::StringLiteral kOpaqueUnionAttrName =
+    "emitrust.opaque_union";
+
 /// FR-52: name of the discardable `emitrust.func` string attribute marking a
 /// function that is GENERIC over the external-requirement trait. Its value is
 /// the trait's name, so the emitter needs no module-level channel to render

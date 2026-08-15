@@ -3169,6 +3169,41 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
              << globalOp.getSymName()
              << "': emitrust-lower-external-requirements must run before "
                 "Rust emission";
+  // FR-78 marker contract: an `emitrust.opaque_union`-marked struct_def is
+  // a differing-aggregate-arm C union imported as an opaque byte blob. The
+  // importer rejects every access through any arm at its own site; if one
+  // leaks here anyway, nothing structural catches it — `emitrust.member`
+  // field names are not cross-checked against the struct_def, so the
+  // verifier passes and the rendered Rust selects a field the struct does
+  // not have: rustc E0609, a whole-crate loss with no source location
+  // (exactly how the pre-FR-78 union placeholder died). Refuse ANY member
+  // selection on a marked type instead, even the blob field's own name —
+  // no supported path ever projects into the blob.
+  llvm::StringSet<> opaqueUnionNames;
+  for (auto structDefOp : moduleOp.getOps<emitrust::StructDefOp>())
+    if (structDefOp->hasAttr(emitrust::kOpaqueUnionAttrName))
+      opaqueUnionNames.insert(structDefOp.getSymName());
+  if (!opaqueUnionNames.empty()) {
+    emitrust::MemberOp leaked;
+    llvm::StringRef leakedUnion;
+    moduleOp.walk([&](emitrust::MemberOp memberOp) {
+      auto lvalueType =
+          dyn_cast<emitrust::LValueType>(memberOp.getOperand().getType());
+      auto structType =
+          lvalueType ? dyn_cast<emitrust::StructType>(lvalueType.getValueType())
+                     : emitrust::StructType();
+      if (!structType || !opaqueUnionNames.contains(structType.getName()))
+        return WalkResult::advance();
+      leaked = memberOp;
+      leakedUnion = structType.getName();
+      return WalkResult::interrupt();
+    });
+    if (leaked)
+      return leaked.emitError()
+             << "opaque union '" << leakedUnion
+             << "' member access leaked to emission; the importer must "
+                "reject this at the access site";
+  }
   // FR-77: a fn-ptr constant is rendered by writing its opaque
   // `Some(<name>)` text verbatim, and that name is NOT a symbol use — no
   // verifier, no walk, nothing structural keeps a planner change from
