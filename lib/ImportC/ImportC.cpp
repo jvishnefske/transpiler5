@@ -5813,7 +5813,11 @@ LogicalResult CImporter::finalizeProject() {
       // direct whole-value load or store is not an error but a REQUIREMENT —
       // storage the environment owns, read and written through a getter/
       // setter pair on the Externals trait. FR-79 extends the admission to
-      // CONST STRUCT globals, getter-only. Recorded exactly like the FR-57a
+      // CONST STRUCT globals, getter-only; FR-81 to NON-const structs,
+      // whose whole-value pair is exact for the single-threaded programs
+      // the importer accepts (address-taken structs stay out — a mutable
+      // requirement address would need `&'static mut`). Recorded exactly
+      // like the FR-57a
       // branch above but with the FR-52 requirement marker;
       // `emitrust-lower-external-requirements` does the rewriting, and the
       // Rust emitter refuses a module still carrying the marker (a
@@ -5985,24 +5989,27 @@ bool CImporter::isExternalRequirementGlobalShape(llvm::StringRef symbol,
   // getter/setter pair copies a whole scalar in and out. Pointer-typed
   // externs never reach the scalar pending map (`deferExternPointerGlobal`).
   // FR-79: a CONST struct qualifies too, GETTER-ONLY — imported structs are
-  // Copy, so the by-value return is a faithful read, and const-ness means
-  // no writer ever needs the setter whose by-value write could tear a
-  // multi-field invariant. The struct_def must be visible in the final
+  // Copy, so the by-value return is a faithful read. FR-81 completes the
+  // matrix with the NON-const struct, getter/setter PAIR: the tearing FR-70
+  // feared assumed concurrent observers, but the mutable-global model is
+  // already exact only for the single-threaded programs the importer
+  // accepts, and sequentially the staged whole-value get/modify/set the
+  // importer lowers field stores to (copy, member-assign the temporary, one
+  // store back — with fresh loads per RHS read and a post-call refresh) IS
+  // the C-sequenced semantics. The struct_def must be visible in the final
   // module (a recovery mode can drop one); when it is not, the safe failure
-  // is the historical rejection. All other aggregates — non-const structs,
-  // arrays — keep the rejection: projections into environment-owned
-  // storage need PLACES, which no associated trait item yields, and
-  // admitting the whole-value copy alone would make the frontier depend on
-  // which accesses an optimization happened to leave.
+  // is the historical rejection. Arrays keep the rejection: element access
+  // into environment-owned storage needs PLACES, which no associated trait
+  // item yields.
   bool constStruct = false;
   if (!llvm::isa<IntegerType, FloatType>(type)) {
     auto structType = llvm::dyn_cast<emitrust::StructType>(type);
-    if (!structType || !isConst)
+    if (!structType)
       return false;
     if (!llvm::isa_and_nonnull<emitrust::StructDefOp>(
             SymbolTable::lookupSymbolIn(module, structType.getName())))
       return false;
-    constStruct = true;
+    constStruct = isConst;
   }
   // Address-takenness is an AST fact, not an IR one: `&g` on an undefined
   // extern can leave NO surviving symbol use at all (the pointer plan

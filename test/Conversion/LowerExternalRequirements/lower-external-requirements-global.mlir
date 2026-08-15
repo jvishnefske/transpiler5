@@ -200,3 +200,38 @@ emitrust.func @read_value() -> i32 {
   emitrust.return %3 : i32
 }
 emitrust.global const @cfg {emitrust.external_requirement} : !emitrust.struct<"S">
+
+// -----
+
+// FR-81: a NON-const STRUCT requirement (marker attr, NO `const`) gets the
+// getter/setter PAIR with the struct passed BY VALUE both ways -- the same
+// use-derived item list and load/store rewrites as FR-70's scalars, with
+// zero struct-specific shapes: the importer's staged read-modify-write
+// (copy the whole value, member-assign the temporary, store the whole value
+// back) means the pass only ever sees whole-value loads and stores. The
+// setter call is a STATEMENT, which is what keeps it outside every
+// dead-store analysis: external storage is observable, so a set whose value
+// is never re-read locally must still be emitted.
+// CHECK-LABEL: emitrust.trait_def @Externals ["ip_data", "set_ip_data"] [() -> !emitrust.struct<"ip_globals">, (!emitrust.struct<"ip_globals">) -> ()]
+// CHECK:      emitrust.func @set_ttl
+// CHECK-SAME:   emitrust.externals_generic = "Externals"
+// CHECK:        %[[G:.*]] = emitrust.call_opaque "E::ip_data"() : () -> !emitrust.struct<"ip_globals">
+// CHECK:        emitrust.assign %[[C:.*]] = %[[G]]
+// CHECK:        emitrust.member %[[C]]["ttl"]
+// CHECK:        %[[W:.*]] = emitrust.load %[[C]]
+// CHECK:        emitrust.call_opaque "E::set_ip_data"(%[[W]]) : (!emitrust.struct<"ip_globals">) -> ()
+// CHECK-NOT:    emitrust.global_load
+// CHECK-NOT:    emitrust.global_store
+// CHECK-NOT:  emitrust.global @IP_DATA
+emitrust.struct_def @ip_globals ["ttl", "addr"] [i32, ui32]
+emitrust.func @set_ttl(%arg0: i32) {
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"ip_globals">>
+  %1 = emitrust.global_load @IP_DATA : !emitrust.struct<"ip_globals">
+  emitrust.assign %0 = %1 : !emitrust.lvalue<!emitrust.struct<"ip_globals">>
+  %2 = emitrust.member %0["ttl"] : (!emitrust.lvalue<!emitrust.struct<"ip_globals">>) -> !emitrust.lvalue<i32>
+  emitrust.assign %2 = %arg0 : !emitrust.lvalue<i32>
+  %3 = emitrust.load %0 : (!emitrust.lvalue<!emitrust.struct<"ip_globals">>) -> !emitrust.struct<"ip_globals">
+  emitrust.global_store %3, @IP_DATA : !emitrust.struct<"ip_globals">
+  emitrust.return
+}
+emitrust.global @IP_DATA {emitrust.external_requirement} : !emitrust.struct<"ip_globals">

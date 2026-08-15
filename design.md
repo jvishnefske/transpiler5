@@ -4939,6 +4939,66 @@ piece and becomes FR-45.
   `IP_DATA` blocker (x10 units — the next demand item), etharp the
   scope cost above. Full suite 611/611.
 
+- [x] FR-81 Non-const struct extern globals as whole-value
+  getter/setter requirements (the IP_DATA front: 10 lwIP src/core
+  units fail solely on `extern struct ip_globals ip_data` — defined
+  in sibling ip.c — after FR-78/80 removed the blockers ahead of it).
+  REVISITS FR-70's aggregate refusal on its own precedent: the
+  tearing argument assumed concurrent observers, but the dialect's
+  entire mutable-global model is already "exact for the
+  single-threaded programs the importer accepts" (the thread_local
+  Cell rationale) — sequentially, a whole-value get/modify/set round
+  trip through a Copy struct is EXACT: a field write `g.x = v`
+  lowers to `E::set_g(S { x: v, ..E::g() })`-shaped
+  read-modify-write (or bind-modify-set through a temporary), and a
+  field read projects the getter's Copy temporary (the FR-79
+  machinery). Conservative gates: the struct type must import
+  (FR-78 blobs OK — Copy holds); address-taken stays REJECTED
+  (identity of a mutable requirement is FR-80's &'static territory
+  and a mutable static borrow is unsafe/RefCell land — measure the
+  lwIP demand: does any of the 10 units take &ip_data? If yes,
+  quantify what whole-value alone buys before implementing);
+  arrays-of-struct stay rejected; compound assignment and ++/--
+  through fields lower via the same read-modify-write; aliasing
+  hazards (a getter temporary read while a set is pending in the
+  same statement) must be proven absent by the statement-ordered
+  lowering or rejected. Trait plumbing mirrors FR-70/79 (marker,
+  lower-external-requirements rewrite of loads AND stores, fixpoint,
+  emitter refusal, ActorLift demotion). Gates: Import pins (field
+  read, field write, whole-struct read/write, compound assign;
+  address-taken and array frontier verbatim); trait golden grows the
+  by-value setter; EndToEnd lib-crate byte-diff with a consumer
+  supplying Cell<S> storage (field writes observed across calls,
+  argc-seeded, vs clang native given the same definitions); lwIP
+  re-probe evidence (the 10 IP_DATA units — measured); full lit
+  100%; C path only.
+  **SPIKE VERDICT: GO (2026-08-15) — with the lwIP justification
+  HONESTLY DOWNGRADED per the entry's own instruction.** The
+  machinery was already fully type-generic: the importer emits the
+  staged-copy read-modify-write, fresh per-read global_loads in
+  multi-access statements, and a staged-copy REFRESH after an RHS
+  call mutating the same global; the lower pass's store/setter path
+  worked on struct types BY EXECUTION; GlobalStoreOp's verifier only
+  refuses is_const globals. The ONE code change is a single line in
+  isExternalRequirementGlobalShape (drop the !isConst bar for
+  structs; constStruct/address-gates stay const-keyed). Sequencing
+  evidence byte-diffed: six state transitions including the
+  RHS-call-refresh hazard and the multi-access swap; dead-store risk
+  retired by observation (the setter is a call statement, never an
+  elision candidate). THE DECISIVE MEASUREMENT: whole-value get/set
+  un-errors ONE of the 10 IP_DATA units (dhcp, and only via
+  --incremental per-item recovery — its sole real use reads a
+  POINTER member, which rejects in the pointer plan regardless);
+  the other 9 take interior member addresses via the ip.h macro
+  family (&ip_data.current_iphdr_src etc.: ip6 61x, tcp_in 73x,
+  udp 32x...), so FR-81's own address-taken gate keeps them
+  rejected. FR-81's justification is closing the requirement-type
+  MATRIX, not lwIP progress; the IP_DATA front needs a
+  member-address/place-projection requirement FR (per-member items
+  or FR-80's &'static extended to mutable interior places) —
+  recorded as the FR-82 candidate. lwIP baseline 13 failing units
+  -> 12. Full suite 614/614.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
