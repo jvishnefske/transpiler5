@@ -2034,15 +2034,29 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
         return joinReject();
       if (isPointerType(base->getType())) {
         // A slice-classified pointer parameter base: its deref'd slice
-        // place was registered in the prologue with a cursor cell.
+        // place was registered in the prologue with a cursor cell. A
+        // byte-region-record pointee (FR-93's window root — the aes cbc
+        // shape's `ctx` base next to the walking `buf` parameter) is
+        // the flat byte image, walked by a u8 pointee at absolute byte
+        // offsets.
+        clang::QualType baseElement =
+            base->getType().getCanonicalType()->getPointeeType();
+        bool elementOk =
+            wildcard ||
+            astContext().hasSameUnqualifiedType(pointee, baseElement) ||
+            (!astContext().getLangOpts().CPlusPlus &&
+             isByteRegionAggregate(baseElement) && isU8ScalarType(pointee));
         auto baseInfo = pointerLocals.find(base);
         if (baseInfo == pointerLocals.end() ||
-            !baseInfo->second.cursorCell ||
-            (!wildcard &&
-             !astContext().hasSameUnqualifiedType(
-                 pointee,
-                 base->getType().getCanonicalType()->getPointeeType())))
+            !baseInfo->second.cursorCell || !elementOk)
           return joinReject();
+        anyCursored = true;
+      } else if (!astContext().getLangOpts().CPlusPlus &&
+                 isByteRegionAggregate(base->getType()) &&
+                 isU8ScalarType(pointee)) {
+        // FR-93 (C path only): a LOCAL byte-region aggregate base — its
+        // own flat byte array, cursored at absolute byte offsets (the
+        // dot-root window form of the same shape).
         anyCursored = true;
       } else if (const clang::ConstantArrayType *array =
                      astContext().getAsConstantArrayType(base->getType())) {
@@ -2169,7 +2183,37 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
   bool wildcard = pointee.getCanonicalType()->isVoidType();
 
   Value cursorCell;
-  if (binding.member) {
+  // FR-93 is C-path-only, and a whole-array member pointer
+  // (`int (*p)[4] = &s.arr`, pointee == the member type itself) keeps
+  // the degenerate CTS-P9 arm below unchanged.
+  const clang::ConstantArrayType *memberArray =
+      binding.member && !astContext().getLangOpts().CPlusPlus &&
+              !astContext().hasSameUnqualifiedType(
+                  pointee, binding.member->getType())
+          ? astContext().getAsConstantArrayType(binding.member->getType())
+          : nullptr;
+  if (binding.member && memberArray) {
+    // FR-93: a member-ARRAY base (`p = s->arr`) is a cursored element
+    // run over the member's own place — the (backing, cursor) local
+    // convention with a MEMBER-place backing. The pointee must be the
+    // member array's element type at some nesting level, mirroring the
+    // top-level array branch below; arithmetic walks the cursor inside
+    // the member's extent (out-of-extent accesses panic at the
+    // subscript, the accepted loud refinement of C's UB).
+    bool matchesLevel = wildcard;
+    for (const clang::ConstantArrayType *level = memberArray;
+         level && !matchesLevel;
+         level = astContext().getAsConstantArrayType(
+             level->getElementType()))
+      if (astContext().hasSameUnqualifiedType(pointee,
+                                              level->getElementType()))
+        matchesLevel = true;
+    if (!matchesLevel)
+      return emitError(bindLoc)
+             << "unsupported: pointer element type does not match its "
+                "target array";
+    cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
+  } else if (binding.member) {
     // A `&struct.member` base (CTS-P9) is a degenerate one-element run
     // rooted at the member's own place: no cursor, and any pointer
     // arithmetic would walk past the member into sibling storage, which
@@ -2217,10 +2261,28 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
         if (!admitted.isNull())
           baseElement = admitted;
       }
-    if (!wildcard && !astContext().hasSameUnqualifiedType(pointee, baseElement))
+    // FR-93 (C path only): a byte-region-record pointee (the FR-91
+    // window root, `uint8_t *Iv = ctx->Iv;`) has no per-element pointee
+    // of its own — the parameter's region place IS the flat byte image —
+    // so a u8 local cursor walks it at absolute byte offsets.
+    if (!astContext().getLangOpts().CPlusPlus &&
+        isByteRegionAggregate(baseElement) && isU8ScalarType(pointee)) {
+      // Element agreement is byte-for-byte by construction.
+    } else if (!wildcard &&
+               !astContext().hasSameUnqualifiedType(pointee, baseElement)) {
       return emitError(bindLoc)
              << "unsupported: pointer element type does not match its "
                 "target parameter";
+    }
+    cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
+  } else if (!astContext().getLangOpts().CPlusPlus &&
+             isByteRegionAggregate(base->getType()) &&
+             isU8ScalarType(pointee)) {
+    // FR-93 (C path only): a LOCAL byte-region aggregate base bound
+    // through a member window decay (`q = s.iv`): the aggregate is its
+    // own flat byte array, walked at absolute byte offsets exactly like
+    // a decayed byte array. Non-u8 pointees keep the degenerate
+    // whole-object branch below (CTS-BR `struct B *p = &x` unchanged).
     cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
   } else if (const clang::ConstantArrayType *array =
                  astContext().getAsConstantArrayType(base->getType())) {
@@ -2423,7 +2485,29 @@ LogicalResult CImporter::storePointerAssign(Location loc,
         info.cursorCell);
     return success();
   }
-  FailureOr<PtrExprValue> value = emitPointerRValue(rhs);
+  // FR-93: a member-array decay source (`p = s->arr;`, `Iv = ctx->Iv;`)
+  // resolves through the shared classifier into its member-place (typed)
+  // or window (byte-region, absolute byte cursor) decomposition. The
+  // interception lives HERE, on the pointer-local binding path, and NOT
+  // in `emitPointerRValue`: argument-position member decays must keep
+  // their FR-74/86/91 interceptions and historical rejections
+  // byte-for-byte (the FAM/const-mut/impure-index/global-root pins).
+  FailureOr<PtrExprValue> value = [&]() -> FailureOr<PtrExprValue> {
+    const clang::Expr *peeled = stripTrivia(rhs);
+    while (const clang::Expr *sub = peelPointerCast(astContext(), peeled))
+      peeled = stripTrivia(sub);
+    const auto *decay = llvm::dyn_cast<clang::ImplicitCastExpr>(peeled);
+    const auto *member =
+        decay && decay->getCastKind() == clang::CK_ArrayToPointerDecay
+            ? llvm::dyn_cast<clang::MemberExpr>(
+                  stripTrivia(decay->getSubExpr()))
+            : nullptr;
+    if (member)
+      if (auto target = classifyMemberArrayDecay(member))
+        return emitMemberArrayDecayValue(loc, member, target->first,
+                                         target->second);
+    return emitPointerRValue(rhs);
+  }();
   if (failed(value))
     return failure();
   if (!info.multiBases.empty()) {

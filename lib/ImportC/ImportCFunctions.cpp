@@ -638,6 +638,13 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   pointerRegions.vecValueLocalQuery = [this](const clang::VarDecl *var) {
     return vecValueLocals.contains(var);
   };
+  // FR-93: member-array decays bound to pointer locals classify through
+  // the shared admission (typed member-place backings and byte-region
+  // window roots); the classifier itself gates the C++ path off.
+  pointerRegions.memberArrayDecayQuery =
+      [this](const clang::MemberExpr *member) {
+        return classifyMemberArrayDecay(member);
+      };
   pointerRegions.literalTemps = &literalTemps;
   // String-cursor parameters (CTS 00204): the walk binds `p = *s` to the
   // parameter's region and lets `&p` arguments to cursor positions pass
@@ -1436,6 +1443,12 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   pointerRegions.vecValueLocalQuery = [this](const clang::VarDecl *var) {
     return vecValueLocals.contains(var);
   };
+  // FR-93: same member-array decay classification as the non-clone
+  // prologue above.
+  pointerRegions.memberArrayDecayQuery =
+      [this](const clang::MemberExpr *member) {
+        return classifyMemberArrayDecay(member);
+      };
   pointerRegions.literalTemps = &literalTemps;
   pointerRegions.cursorParamQuery = [this](const clang::ParmVarDecl *param) {
     return cursorParams.contains(param);
@@ -2374,6 +2387,18 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "fn __emitrust_memcpy_within_u8(s: &mut [u8], dst: i64, src: i64, "
        "n: i64) {\n"
        "    s.copy_within(src as usize..(src + n) as usize, dst as usize);\n"
+       "}"},
+      // FR-93: the split primitive of the same-base (mut, shared) call
+      // pair — the aes cbc `XorWithIv(buf, Iv)` arm once Iv walks buf's
+      // region. `split_at_mut` at the MUTABLE cursor keeps both borrows
+      // legal; the shared window then subscripts strictly below it, so
+      // an out-of-window read panics where the C read reached into the
+      // mutable half (the accepted loud refinement of C UB-adjacent
+      // reads; never a silent wrong byte).
+      {"__emitrust_split_mut_u8",
+       "fn __emitrust_split_mut_u8(s: &mut [u8], n: i64) -> (&mut [u8], "
+       "&mut [u8]) {\n"
+       "    s.split_at_mut(n as usize)\n"
        "}"},
       // FR-87: the word-fill memset image for a `unsigned int` member
       // array destination. `n` stays the BYTE count; admission requires

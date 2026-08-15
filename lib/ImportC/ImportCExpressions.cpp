@@ -2390,6 +2390,42 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     arguments[index] = *value;
   }
 
+  // FR-93: EXACTLY ONE multi-base pointer borrow argument (the aes cbc
+  // `XorWithIv(buf, Iv)` shape) dispatches the WHOLE call on the
+  // argument's enum-of-bases discriminant — no single region base
+  // exists, so each arm materializes its base's slice view and repeats
+  // the call. Scope is deliberately narrow: a direct void callee, no
+  // cell-slice/nullable inputs, one multi-base argument — everything
+  // else (two multi-base arguments, a result-carrying callee) falls
+  // through to `emitBorrowArgument`'s located multi-base rejection.
+  if (!astContext().getLangOpts().CPlusPlus && !staticMethod && !vaClone &&
+      cellGlobals.empty() && targetType.getNumResults() == 0 &&
+      !borrows.empty()) {
+    unsigned multiCount = 0;
+    unsigned multiIndex = 0;
+    const clang::VarDecl *multiVar = nullptr;
+    bool nullableSlotSeen = false;
+    for (const PendingBorrow &borrow : borrows) {
+      if (isNullableByteSliceType(targetType.getInput(borrow.index)))
+        nullableSlotSeen = true;
+      if (const clang::VarDecl *var = asMultiBasePointerRead(borrow.expr)) {
+        multiCount++;
+        multiIndex = borrow.index;
+        multiVar = var;
+      }
+    }
+    if (multiCount == 1 && !nullableSlotSeen) {
+      SmallVector<std::pair<unsigned, const clang::Expr *>, 4> borrowList;
+      for (const PendingBorrow &borrow : borrows)
+        borrowList.push_back({borrow.index, borrow.expr});
+      if (failed(emitMultiBaseCallDispatch(call, target, loc, arguments,
+                                           borrowList, multiIndex,
+                                           multiVar)))
+        return failure();
+      return Value();
+    }
+  }
+
   // Borrow-producing arguments: each resolves to a fresh borrow of its
   // region base. Two borrows of the same base would alias mutably in Rust;
   // they are rejected rather than emitted. FR-74: a member-array argument
@@ -3978,6 +4014,124 @@ bool CImporter::matchMemberChainRoot(
   return true;
 }
 
+std::optional<std::pair<const clang::VarDecl *, const clang::FieldDecl *>>
+CImporter::classifyMemberArrayDecay(const clang::MemberExpr *member) {
+  // C path only (the FR-93 gate): the C++ importer keeps the historical
+  // non-address rejection for every member decay.
+  if (astContext().getLangOpts().CPlusPlus)
+    return std::nullopt;
+  const auto *leaf = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+  if (!leaf || leaf->getParent()->isUnion())
+    return std::nullopt;
+  if (isByteRegionRecord(leaf->getParent())) {
+    // FR-91 window root. The leaf gate mirrors
+    // `tryEmitByteRegionMemberWindow`: a fixed-extent nonzero u8 array
+    // only — a flexible/zero-length tail has no extent (the heatshrink
+    // FAM pins), and a nested record never decays.
+    const clang::ConstantArrayType *leafArray =
+        astContext().getAsConstantArrayType(leaf->getType());
+    if (!leafArray || leafArray->getSize().isZero() ||
+        !isU8ScalarType(leafArray->getElementType()))
+      return std::nullopt;
+    const clang::MemberExpr *link = member;
+    while (true) {
+      const auto *field =
+          llvm::dyn_cast<clang::FieldDecl>(link->getMemberDecl());
+      if (!field || field->getParent()->isUnion() ||
+          !isByteRegionRecord(field->getParent()))
+        return std::nullopt;
+      const clang::Expr *base = stripTrivia(link->getBase());
+      if (link->isArrow()) {
+        // Arrow only at the root, through a byte-region struct-pointer
+        // PARAMETER — its region place is the prologue's deref'd byte
+        // slice, the exact base the absolute cursor walks.
+        const auto *ref =
+            llvm::dyn_cast<clang::DeclRefExpr>(base->IgnoreParenImpCasts());
+        const auto *param =
+            ref ? llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()) : nullptr;
+        if (!param || !isPointerType(param->getType()))
+          return std::nullopt;
+        return std::make_pair(static_cast<const clang::VarDecl *>(param),
+                              static_cast<const clang::FieldDecl *>(nullptr));
+      }
+      if (const auto *inner = llvm::dyn_cast<clang::MemberExpr>(base)) {
+        link = inner;
+        continue;
+      }
+      // Dot root: a directly named LOCAL byte-region aggregate — its own
+      // flat byte array. A global root's place would be a staged copy
+      // (writes silently lost), so it keeps the historical rejection.
+      const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(base);
+      const auto *var =
+          ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+      if (!var || !var->hasLocalStorage() ||
+          !isByteRegionAggregate(var->getType()))
+        return std::nullopt;
+      return std::make_pair(var,
+                            static_cast<const clang::FieldDecl *>(nullptr));
+    }
+  }
+  // Typed root: a nonzero fixed-extent array leaf over a SINGLE-link
+  // chain — nested chains, 2D member rows (the decayed operand is a
+  // subscript, never a MemberExpr), and global roots keep the
+  // historical rejection.
+  const clang::ConstantArrayType *leafArray =
+      astContext().getAsConstantArrayType(leaf->getType());
+  if (!leafArray || leafArray->getSize().isZero())
+    return std::nullopt;
+  const clang::Expr *base = stripTrivia(member->getBase());
+  if (member->isArrow()) {
+    const auto *ref =
+        llvm::dyn_cast<clang::DeclRefExpr>(base->IgnoreParenImpCasts());
+    const auto *param =
+        ref ? llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()) : nullptr;
+    if (!param)
+      return std::nullopt;
+    clang::QualType baseType = param->getType().getCanonicalType();
+    if (!baseType->isPointerType())
+      return std::nullopt;
+    const clang::RecordDecl *record =
+        baseType->getPointeeType()->getAsRecordDecl();
+    if (!record ||
+        record->getCanonicalDecl() != leaf->getParent()->getCanonicalDecl())
+      return std::nullopt;
+    return std::make_pair(static_cast<const clang::VarDecl *>(param), leaf);
+  }
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(base);
+  const auto *var =
+      ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+  if (!var || !var->hasLocalStorage() ||
+      !var->getType().getCanonicalType()->getAsRecordDecl())
+    return std::nullopt;
+  return std::make_pair(var, leaf);
+}
+
+FailureOr<PtrExprValue>
+CImporter::emitMemberArrayDecayValue(Location loc,
+                                     const clang::MemberExpr *member,
+                                     const clang::VarDecl *root,
+                                     const clang::FieldDecl *field) {
+  if (!field) {
+    // Byte-region window: the absolute byte cursor is the field's layout
+    // offset plus the root's own runtime cursor (FR-91 convention).
+    FailureOr<ByteRegionRef> region = resolveByteRegionRef(member, nullptr);
+    if (failed(region))
+      return failure();
+    // Defensive net: the classifier admits local roots only, so the
+    // resolved place must be the root's own symbols place — a staged
+    // copy here would silently decouple the cursor from the object.
+    auto it = symbols.find(root);
+    if (it == symbols.end() || region->place != it->second)
+      return emitError(loc)
+             << "unsupported: pointer assigned a non-address value";
+    return PtrExprValue{root, byteRegionOffset(loc, *region)};
+  }
+  PtrExprValue value{
+      root, createIntConstant(loc, builder.getIntegerType(64), 0)};
+  value.member = field;
+  return value;
+}
+
 FailureOr<bool> CImporter::tryEmitByteRegionMemberWindow(
     Location loc, const clang::MemberExpr *member,
     const clang::Expr *cursorIndex, bool isMutParam, Value &place,
@@ -4507,6 +4661,40 @@ FailureOr<Value> CImporter::emitBorrowArgument(
                                        cursor, isMutParam)
           .getResult();
     }
+    // FR-93: a member-array-backed pointer (`p = s->arr; f(p);`) borrows
+    // ONLY its field — slice_of over the freshly projected member place
+    // at the current cursor, keyed (root, field) so `emitCall`'s
+    // prefix-overlap aliasing guard sees exactly the FR-74 member key.
+    // Degenerate (scalar-member, cursorless) pointers keep the paths
+    // below byte-for-byte.
+    if (pointer->member && pointer->cursor) {
+      auto memberIt = symbols.find(pointer->base);
+      if (memberIt == symbols.end())
+        return emitError(loc) << "unsupported: pointer target '"
+                              << pointer->base->getName()
+                              << "' is not an importable place";
+      FailureOr<Value> memberPlace =
+          projectPointerMemberBase(loc, memberIt->second, pointer->member);
+      if (failed(memberPlace))
+        return failure();
+      auto memberLValue =
+          llvm::dyn_cast<emitrust::LValueType>((*memberPlace).getType());
+      auto memberArray =
+          memberLValue ? llvm::dyn_cast<emitrust::ArrayType>(
+                             memberLValue.getValueType())
+                       : emitrust::ArrayType();
+      if (!memberArray)
+        return emitError(loc) << "unsupported pointer target place";
+      if (memberArray.getElementType() != sliceType.getElementType())
+        return emitError(loc) << "unsupported: argument element type does "
+                                 "not match the slice parameter";
+      if (rootPath)
+        rootPath->assign(1, pointer->member);
+      return builder
+          .create<emitrust::SliceOfOp>(loc, paramType, *memberPlace,
+                                       pointer->cursor, /*is_mut=*/isMutParam)
+          .getResult();
+    }
     if (!pointer->cursor)
       return emitError(loc) << "unsupported: the address of a scalar object "
                                "cannot be passed as a slice parameter";
@@ -4854,6 +5042,237 @@ FailureOr<Value> CImporter::emitBorrowArgument(
   if (failed(value))
     return failure();
   return *value;
+}
+
+/// The (possibly cast-wrapped) plain read of a LOCAL pointer variable —
+/// parameter or local — a call argument names; unlike `asLocalVarRef`,
+/// parameters are included (a slice parameter is its own region base,
+/// and the FR-93 split pairing keys on exactly that). Peels the
+/// qualification / void* casts an argument position wraps the read in
+/// (mirroring emitCharRegionArg's strip) plus the load itself.
+static const clang::VarDecl *asPointerVarRead(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    if (cast->getCastKind() != clang::CK_BitCast &&
+        cast->getCastKind() != clang::CK_NoOp &&
+        cast->getCastKind() != clang::CK_LValueToRValue)
+      break;
+    if (cast->getCastKind() != clang::CK_LValueToRValue &&
+        !isPointerType(cast->getType()))
+      break;
+    e = stripTrivia(cast->getSubExpr());
+  }
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  const auto *var =
+      ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+  return var && var->hasLocalStorage() ? var : nullptr;
+}
+
+const clang::VarDecl *
+CImporter::asMultiBasePointerRead(const clang::Expr *expr) const {
+  const clang::VarDecl *var = asPointerVarRead(expr);
+  if (!var)
+    return nullptr;
+  auto it = pointerLocals.find(var);
+  return it != pointerLocals.end() && it->second.baseIndexCell ? var
+                                                               : nullptr;
+}
+
+const clang::VarDecl *
+CImporter::asPlainCursorPointerRead(const clang::Expr *expr) const {
+  const clang::VarDecl *var = asPointerVarRead(expr);
+  if (!var)
+    return nullptr;
+  auto it = pointerLocals.find(var);
+  if (it == pointerLocals.end())
+    return nullptr;
+  const PointerLocalInfo &info = it->second;
+  if (!info.base || !info.cursorCell || info.baseIndexCell ||
+      info.nonNullCell || info.member || info.literalBacking || info.backing)
+    return nullptr;
+  return var;
+}
+
+LogicalResult CImporter::emitMultiBaseCallDispatch(
+    const clang::CallExpr *call, func::FuncOp target, Location loc,
+    MutableArrayRef<Value> arguments,
+    ArrayRef<std::pair<unsigned, const clang::Expr *>> borrows,
+    unsigned multiIndex, const clang::VarDecl *multiVar) {
+  (void)call;
+  FunctionType targetType = target.getFunctionType();
+  const PointerLocalInfo &info = pointerLocals.find(multiVar)->second;
+  Type multiInput = targetType.getInput(multiIndex);
+  auto multiSlice =
+      llvm::dyn_cast_or_null<emitrust::SliceType>(borrowPointee(multiInput));
+  bool multiMut = llvm::isa<emitrust::MutRefType>(multiInput);
+  // Only a slice input has a per-base region view; anything else keeps
+  // the located multi-base rejection.
+  if (!multiSlice)
+    return emitError(loc) << "unsupported: passing a pointer bound to "
+                             "multiple objects to a function";
+  Value discriminant = loadPlace(loc, info.baseIndexCell);
+  Value multiCursor =
+      info.cursorCell
+          ? loadPlace(loc, info.cursorCell)
+          : createIntConstant(loc, builder.getIntegerType(64), 0);
+  Type ui8Type =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  // The active base's whole-region place + element type. Member bases
+  // have no shared cursor coordinate and stay located.
+  auto armBasePlace = [&](const PointerBaseKey &armBase)
+      -> FailureOr<Value> {
+    if (armBase.member)
+      return emitError(loc) << "unsupported: passing a pointer bound to "
+                               "multiple objects to a function";
+    auto it = symbols.find(armBase.var);
+    if (it == symbols.end())
+      return emitError(loc) << "unsupported: pointer target '"
+                            << armBase.var->getName()
+                            << "' is not an importable place";
+    auto lvalueType =
+        llvm::dyn_cast<emitrust::LValueType>(it->second.getType());
+    Type elementType;
+    if (lvalueType) {
+      if (auto arrayType =
+              llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType()))
+        elementType = arrayType.getElementType();
+      else if (auto sliceType = llvm::dyn_cast<emitrust::SliceType>(
+                   lvalueType.getValueType()))
+        elementType = sliceType.getElementType();
+    }
+    if (!elementType || elementType != multiSlice.getElementType())
+      return emitError(loc) << "unsupported: argument element type does "
+                               "not match the slice parameter";
+    return it->second;
+  };
+  return emitMultiBaseDispatch(
+      loc, info.multiBases, discriminant,
+      [&](const PointerBaseKey &armBase) -> LogicalResult {
+        FailureOr<Value> basePlace = armBasePlace(armBase);
+        if (failed(basePlace))
+          return failure();
+        SmallVector<Value> armArguments(arguments.begin(), arguments.end());
+        // The split pairing: this arm's base also feeds a MUTABLE
+        // cursored slice argument of the same call while the multi-base
+        // view is SHARED — the aes `XorWithIv(buf, Iv)` arm once Iv is
+        // in buf's region. `split_at_mut` at the mutable cursor keeps
+        // both borrows legal; the shared window subscripts strictly
+        // below it, so an out-of-window read panics where the C read
+        // was into the mutable half (the accepted loud refinement).
+        int splitPartner = -1;
+        const clang::VarDecl *splitVar = nullptr;
+        if (!multiMut && multiSlice.getElementType() == ui8Type) {
+          for (auto [index, expr] : borrows) {
+            if (index == multiIndex)
+              continue;
+            const clang::VarDecl *plain = asPlainCursorPointerRead(expr);
+            if (!plain)
+              continue;
+            if (pointerLocals.find(plain)->second.base != armBase.var)
+              continue;
+            auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(
+                targetType.getInput(index));
+            auto slice =
+                mutRef ? llvm::dyn_cast<emitrust::SliceType>(
+                             mutRef.getPointee())
+                       : emitrust::SliceType();
+            if (!slice || slice.getElementType() != ui8Type)
+              continue;
+            splitPartner = static_cast<int>(index);
+            splitVar = plain;
+            break;
+          }
+        }
+        // Aliasing roots held in THIS arm (prefix-overlap semantics,
+        // exactly the non-dispatch borrow loop's guard).
+        SmallVector<std::pair<const clang::VarDecl *,
+                              SmallVector<const clang::FieldDecl *, 2>>,
+                    4>
+            armRoots;
+        armRoots.push_back({armBase.var, {}});
+        auto sliceUi8 = emitrust::SliceType::get(ui8Type);
+        if (splitPartner >= 0) {
+          Value mutCursor = loadPlace(
+              loc, pointerLocals.find(splitVar)->second.cursorCell);
+          Type mutSliceRef = emitrust::MutRefType::get(sliceUi8);
+          Value zero =
+              createIntConstant(loc, builder.getIntegerType(64), 0);
+          Value whole = builder
+                            .create<emitrust::SliceOfOp>(
+                                loc, mutSliceRef, *basePlace, zero,
+                                /*is_mut=*/true)
+                            .getResult();
+          requestStringHelper("__emitrust_split_mut_u8");
+          auto split = builder.create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{mutSliceRef, mutSliceRef},
+              builder.getStringAttr("__emitrust_split_mut_u8"),
+              /*args=*/ArrayAttr(), ValueRange{whole, mutCursor});
+          armArguments[splitPartner] = split.getResult(1); // [cursor..]
+          Value lowPlace = builder
+                               .create<emitrust::DerefOp>(
+                                   loc, emitrust::LValueType::get(sliceUi8),
+                                   split.getResult(0))
+                               .getResult();
+          armArguments[multiIndex] =
+              builder
+                  .create<emitrust::SliceOfOp>(loc, multiInput, lowPlace,
+                                               multiCursor,
+                                               /*is_mut=*/false)
+                  .getResult();
+        } else {
+          armArguments[multiIndex] =
+              builder
+                  .create<emitrust::SliceOfOp>(loc, multiInput, *basePlace,
+                                               multiCursor, multiMut)
+                  .getResult();
+        }
+        for (auto [index, expr] : borrows) {
+          if (index == multiIndex ||
+              static_cast<int>(index) == splitPartner)
+            continue;
+          const clang::VarDecl *root = nullptr;
+          SmallVector<const clang::FieldDecl *, 2> rootPath;
+          FailureOr<Value> reference = emitBorrowArgument(
+              loc, expr, targetType.getInput(index), root, &rootPath);
+          if (failed(reference))
+            return failure();
+          if (root) {
+            for (const auto &held : armRoots) {
+              if (held.first != root)
+                continue;
+              size_t common =
+                  std::min(held.second.size(), rootPath.size());
+              if (llvm::ArrayRef(held.second).take_front(common) ==
+                  llvm::ArrayRef(rootPath).take_front(common))
+                return emitError(loc)
+                       << "unsupported: aliasing mutable pointer arguments "
+                          "(two arguments borrow object '"
+                       << root->getName() << "')";
+            }
+            armRoots.push_back({root, rootPath});
+          }
+          armArguments[index] = *reference;
+        }
+        for (auto [index, value] : llvm::enumerate(armArguments))
+          if (value.getType() != targetType.getInput(index))
+            return emitError(loc)
+                   << "unsupported: call argument type mismatch";
+        builder.create<func::CallOp>(loc, target, armArguments);
+        // Staged byte-region-global slice arguments store back inside
+        // the arm — the same load-modify-store shape as the
+        // non-dispatch call tail.
+        if (!pendingStagedGlobalStores.empty()) {
+          SmallVector<std::pair<Value, std::string>, 2> stores =
+              std::move(pendingStagedGlobalStores);
+          pendingStagedGlobalStores.clear();
+          for (auto &[place, symbol] : stores) {
+            Value value = loadPlace(loc, place);
+            builder.create<emitrust::GlobalStoreOp>(loc, value,
+                                                    globalSymbol(symbol));
+          }
+        }
+        return success();
+      });
 }
 
 

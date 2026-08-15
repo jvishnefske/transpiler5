@@ -1316,6 +1316,19 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
         return markInvalid(
             ptr, loc, "unsupported: pointer assigned a non-address value");
       }
+      // `p = s->arr` / `p = s.arr` (FR-93): a MEMBER-array decay binds a
+      // member-place backing — a TYPED single-link chain roots the region
+      // at (root, field) with a member-relative cursor, and a BYTE-REGION
+      // chain (FR-91) roots it at the region ROOT itself (field null),
+      // whose flat byte image the absolute byte cursor walks. Placed
+      // BEFORE the subscript peel: a decayed member ROW (`p = s->mat[i]`)
+      // must keep the historical rejection, not silently drop its row
+      // offset. Unclassified member shapes (nested typed chains, global
+      // roots, union arms) fall through to the rejection below unchanged.
+      if (memberArrayDecayQuery)
+        if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(sub))
+          if (auto target = memberArrayDecayQuery(member))
+            return addBase(ptr, target->first, loc, target->second);
       while (const auto *inner =
                  llvm::dyn_cast<clang::ArraySubscriptExpr>(sub))
         sub = inner->getBase()->IgnoreParenImpCasts();
@@ -3781,6 +3794,8 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       PtrExprValue result{info.base, unary->isPostfix() ? current : next,
                           info.literalBacking, nonNull, baseIndex,
                           info.multiBases};
+      // FR-93: a member-array-backed pointer walks inside its member.
+      result.member = info.member;
       result.backing = info.backing;
       return result;
     }
@@ -3832,6 +3847,8 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       PtrExprValue result{pointer->base, cursor, pointer->literalBacking,
                           pointer->nonNull, pointer->baseIndex,
                           pointer->multiBases};
+      // FR-93: a member-array-backed pointer walks inside its member.
+      result.member = pointer->member;
       result.backing = pointer->backing;
       return result;
     }
@@ -3914,6 +3931,9 @@ CImporter::emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript) {
   PtrExprValue result{pointer->base, cursor, pointer->literalBacking,
                       pointer->nonNull, pointer->baseIndex,
                       pointer->multiBases};
+  // FR-93: a member-array-backed pointer subscripts inside its member
+  // place; the member survives the cursor offset.
+  result.member = pointer->member;
   result.backing = pointer->backing;
   return result;
 }
@@ -4075,15 +4095,42 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
   }
   // A `&struct.member` base (CTS-P9) resolves to the member's projection
   // on the object's place (or on its staged copy, whose whole value the
-  // writeback stores back).
+  // writeback stores back). FR-93: a member-ARRAY base additionally
+  // carries a cursor, so `refineElementPlace` subscripts the projected
+  // member place; a reference-held struct-pointer parameter root derefs
+  // freshly per use (projectPointerMemberBase).
   if (pointer.member) {
     FailureOr<Value> memberPlace =
-        projectMemberPlace(loc, basePlace, pointer.member);
+        projectPointerMemberBase(loc, basePlace, pointer.member);
     if (failed(memberPlace))
       return failure();
     basePlace = *memberPlace;
   }
   return refineElementPlace(loc, basePlace, pointer.cursor, pointeeType);
+}
+
+FailureOr<Value>
+CImporter::projectPointerMemberBase(Location loc, Value basePlace,
+                                    const clang::FieldDecl *member) {
+  // FR-93: a ScalarRef struct-pointer parameter root holds its raw
+  // `&mut S` / `&S` block argument in `symbols`; the member projection
+  // needs the pointee PLACE, so the reference derefs freshly at each
+  // use — the reason no borrow is ever held across statements.
+  if (!llvm::isa<emitrust::LValueType>(basePlace.getType())) {
+    Type held = basePlace.getType();
+    Type refPointee;
+    if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(held))
+      refPointee = mutRef.getPointee();
+    else if (auto sharedRef = llvm::dyn_cast<emitrust::RefType>(held))
+      refPointee = sharedRef.getPointee();
+    if (!refPointee || !llvm::isa<emitrust::StructType>(refPointee))
+      return emitError(loc) << "unsupported member access base";
+    basePlace = builder
+                    .create<emitrust::DerefOp>(
+                        loc, emitrust::LValueType::get(refPointee), basePlace)
+                    .getResult();
+  }
+  return projectMemberPlace(loc, basePlace, member);
 }
 
 FailureOr<std::pair<Value, std::string>>
@@ -5095,7 +5142,8 @@ CImporter::materializeLocalElementPlace(Location loc,
                           << "' is not an importable place";
   Value place = it->second;
   if (base.member) {
-    FailureOr<Value> memberPlace = projectMemberPlace(loc, place, base.member);
+    FailureOr<Value> memberPlace =
+        projectPointerMemberBase(loc, place, base.member);
     if (failed(memberPlace))
       return failure();
     place = *memberPlace;

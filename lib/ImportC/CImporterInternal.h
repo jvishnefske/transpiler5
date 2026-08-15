@@ -503,7 +503,8 @@ struct PtrExprValue {
 /// element type and the (root, field-path) aliasing key. The member
 /// channel deliberately does NOT ride `PtrExprValue` — the pointer
 /// decomposition has no representation for a member-rooted region, and
-/// non-argument member decays must keep their verbatim rejection.
+/// non-argument member decays ride FR-93's member-place backing on
+/// `PtrExprValue` (base + `member` + cursor) instead.
 struct CharRegionArg {
   /// The historical decomposition; meaningful only when `memberPlace`
   /// is null.
@@ -615,8 +616,10 @@ struct PointerLocalInfo {
   /// discriminants copy soundly across `p = q`.
   SmallVector<PointerBaseKey, 2> multiBases;
   /// The struct member a single `&struct.member` base roots at (CTS-P9);
-  /// null for whole-object bases. A member base is a degenerate
-  /// one-element run: no cursor, no arithmetic.
+  /// null for whole-object bases. A SCALAR member base is a degenerate
+  /// one-element run: no cursor, no arithmetic. A member-ARRAY base
+  /// (FR-93, `p = s->arr`) is a cursored run over the member's own
+  /// place, with `cursorCell` counting elements from the member's start.
   const clang::FieldDecl *member = nullptr;
   /// The synthesized MUTABLE entry-block backing array place of a local
   /// heap-allocation region (W4.2e Part A): an
@@ -1090,6 +1093,23 @@ public:
   /// tracks it. Left unset (the pure-AST planning passes), the holder is
   /// tracked and conservatively invalid, which planning never consumes.
   std::function<bool(const clang::VarDecl *)> fnHolderQuery;
+
+  /// FR-93: optional query classifying `p = <member-array decay>` (the
+  /// non-argument member-decay form, `int *p = s->arr;` /
+  /// `uint8_t *Iv = ctx->Iv;`). Returns the chain root plus, for a TYPED
+  /// single-link member array, the leaf field — such a binding roots the
+  /// region at (root, field) with a member-relative cursor. A null field
+  /// with a non-null root is a BYTE-REGION window root (FR-91): the
+  /// member is a window of the root's one flat byte region, so the root
+  /// itself is the (cursored) base and the emission computes the absolute
+  /// byte cursor from the field's layout offset. `std::nullopt` keeps
+  /// the historical non-address rejection. Left unset (the pure-AST
+  /// planning passes and the C++ path), every member decay keeps that
+  /// rejection, which planning never consumes.
+  std::function<std::optional<
+      std::pair<const clang::VarDecl *, const clang::FieldDecl *>>(
+      const clang::MemberExpr *)>
+      memberArrayDecayQuery;
 
   /// Optional query telling the walk whether a local `char *` declaration is
   /// a recognized constant-fill string local (FR-64): its `malloc`/`calloc`
@@ -4071,6 +4091,21 @@ private:
   LogicalResult emitMemcpyCall(const clang::CallExpr *call,
                                llvm::StringRef name);
 
+  /// FR-93: the multi-base-SOURCE arm of `emitMemcpyCall` (the aes tail
+  /// `memcpy(ctx->Iv, Iv, 16)`): a member/window destination with a
+  /// multi-base pointer source dispatches per source base — the
+  /// same-root WINDOW arm rides the whole-region
+  /// `__emitrust_memcpy_within_u8` image with absolute byte cursors
+  /// (memmove semantics refine C's undefined exact-overlap self-copy),
+  /// and each cross-root arm the two-slice `__emitrust_memcpy_u8`
+  /// image. Anything outside the u8 window shape keeps the located
+  /// multi-base string-function rejection.
+  LogicalResult emitMultiBaseMemcpy(const clang::CallExpr *call,
+                                    llvm::StringRef name,
+                                    const CharRegionArg &dst,
+                                    const clang::VarDecl *srcVar,
+                                    Location loc);
+
   /// Lowers a value-position call to a definition-less `atoi`: the
   /// argument's char region is borrowed as a shared byte slice from its
   /// cursor and parsed by the `__emitrust_atoi` helper with C's exact
@@ -4718,6 +4753,78 @@ private:
       Location loc, const clang::MemberExpr *member,
       const clang::Expr *cursorIndex, bool isMutParam, Value &place,
       Value &cursor, Type &element, const clang::VarDecl *&chainRoot);
+
+  /// FR-93: classifies the operand of a NON-ARGUMENT member-array decay
+  /// bound to a pointer local (`p = s->arr;`, `Iv = ctx->Iv;`) — the
+  /// shared admission consulted by BOTH the region analysis
+  /// (`memberArrayDecayQuery`) and `emitPointerRValue`'s decay arm, so
+  /// the two can never disagree. TYPED roots: the leaf must be a
+  /// nonzero fixed-extent array field of a non-union record and the
+  /// chain a SINGLE link over a directly named local struct (dot) or a
+  /// struct-pointer PARAMETER (arrow); returns (root, leaf).
+  /// BYTE-REGION roots (FR-91): every link a non-union byte-region
+  /// field, the root a local byte-region aggregate (dot) or a pointer
+  /// PARAMETER (arrow); returns (root, nullptr) — the root region
+  /// itself is the base and the cursor is the absolute byte offset.
+  /// `std::nullopt` (nested typed chains, global roots, 2D member rows,
+  /// non-array leaves, the C++ path) keeps the historical non-address
+  /// rejection. AST-only: never emits IR.
+  std::optional<std::pair<const clang::VarDecl *, const clang::FieldDecl *>>
+  classifyMemberArrayDecay(const clang::MemberExpr *member);
+
+  /// FR-93: emits the decomposition of a classified member-array decay
+  /// (`classifyMemberArrayDecay`): a TYPED root yields (root, field) at
+  /// member-relative cursor 0; a BYTE-REGION window root (null field)
+  /// yields (root, absolute byte cursor) via `resolveByteRegionRef` +
+  /// `byteRegionOffset` — the FR-91 window convention, layout offset
+  /// plus the root's own runtime cursor.
+  FailureOr<PtrExprValue>
+  emitMemberArrayDecayValue(Location loc, const clang::MemberExpr *member,
+                            const clang::VarDecl *root,
+                            const clang::FieldDecl *field);
+
+  /// FR-93: resolves the member-place backing of a member-array-backed
+  /// pointer (base variable's held place + field) to the member's place
+  /// lvalue. A reference-held struct-pointer parameter root (the
+  /// ScalarRef convention: `symbols[s]` is the raw `&mut S` block
+  /// argument) derefs freshly at the use site — the reason no borrow is
+  /// ever held across statements — before the `emitrust.member`
+  /// projection; a dot root's struct place projects directly. Any other
+  /// held shape (a decomposed slice-of-struct root, a staged copy)
+  /// rejects located.
+  FailureOr<Value> projectPointerMemberBase(Location loc, Value basePlace,
+                                            const clang::FieldDecl *member);
+
+  /// FR-93: returns the multi-base pointer local/parameter a call
+  /// argument reads (a plain load of a `pointerLocals` entry carrying
+  /// the CTS-P7 enum-of-bases discriminant), peeling the
+  /// qualification/void* casts an argument position wraps it in; null
+  /// for every other shape.
+  const clang::VarDecl *asMultiBasePointerRead(const clang::Expr *expr) const;
+
+  /// FR-93: returns the SINGLE-base cursored pointer (a slice parameter
+  /// or an admitted pointer local: self- or object-based, cursor cell,
+  /// no discriminant/null/member/backing state) a call argument reads;
+  /// null otherwise. The split-arm pairing keys on its region base.
+  const clang::VarDecl *asPlainCursorPointerRead(const clang::Expr *expr) const;
+
+  /// FR-93: emits a direct call with EXACTLY ONE multi-base slice
+  /// argument as a WHOLE-CALL dispatch over the argument's
+  /// enum-of-bases discriminant (plain cf CFG, `emitMultiBaseDispatch`):
+  /// each arm materializes the active base's open-ended slice view at
+  /// the shared absolute cursor next to the other borrow arguments,
+  /// re-emitted per arm. The arm whose base COLLIDES with another
+  /// MUTABLE cursored slice argument of the same base splits the base
+  /// with `__emitrust_split_mut_u8` (split_at_mut at the mutable
+  /// cursor; the shared window subscripts strictly below it —
+  /// out-of-window reads panic, the accepted loud refinement); any
+  /// other collision keeps the located aliasing rejection. Void
+  /// callees only (the caller guarantees it).
+  LogicalResult emitMultiBaseCallDispatch(
+      const clang::CallExpr *call, func::FuncOp target, Location loc,
+      MutableArrayRef<Value> arguments,
+      ArrayRef<std::pair<unsigned, const clang::Expr *>> borrows,
+      unsigned multiIndex, const clang::VarDecl *multiVar);
 
   /// Returns whether any declaration reference below `stmt` names a
   /// decomposed pointer (a pointer local or slice parameter registered in

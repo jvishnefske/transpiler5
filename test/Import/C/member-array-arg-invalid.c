@@ -1,7 +1,6 @@
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/same-field.c 2>&1 | FileCheck %s --check-prefix=SAMEFIELD
 // RUN: not emitrust-import-c %t/whole-plus-member.c 2>&1 | FileCheck %s --check-prefix=WHOLEPLUS
-// RUN: not emitrust-import-c %t/ptr-local.c 2>&1 | FileCheck %s --check-prefix=PTRLOCAL
 // RUN: not emitrust-import-c %t/global-struct.c 2>&1 | FileCheck %s --check-prefix=GLOBAL
 // RUN: not emitrust-import-c %t/impure-call-index.c 2>&1 | FileCheck %s --check-prefix=CALLIDX
 // RUN: not emitrust-import-c %t/impure-incdec-index.c 2>&1 | FileCheck %s --check-prefix=INCIDX
@@ -14,15 +13,17 @@
 // of these shapes would otherwise emit code that is wrong or fails only
 // downstream: the SAME field twice in one call is two overlapping
 // borrows (rustc E0499 after emission); a whole-struct borrow plus a
-// member of the same struct overlaps by prefix; a pointer LOCAL bound
-// to a member array is a non-argument decay position the pointer
-// decomposition has no representation for; a GLOBAL struct's member
+// member of the same struct overlaps by prefix; a GLOBAL struct's member
 // place is a staged local copy, so a mutable slice of it would silently
 // lose the callee's writes; and an IMPURE offset index (a call, an
 // inc/dec) cannot be evaluated exactly once at the borrow point, so
 // the FR-86 interception DECLINES and the historical decay rejection
-// fires unchanged. Rejection is a feature: every wording below is
-// pinned verbatim as measured.
+// fires unchanged. (A pointer LOCAL bound to a member array — the
+// non-argument decay position rejected here through FR-92 — is
+// admitted by FR-93's member-place backing; its pins live in
+// pointers-member-array-local.c and its frontier in
+// pointers-member-array-local-invalid.c.) Rejection is a feature:
+// every wording below is pinned verbatim as measured.
 
 // The same FIELD twice into two mutable slice parameters: overlapping
 // mutable borrows. The (base, field-path) guard collides on the exact
@@ -63,20 +64,6 @@ int main(void) {
   s.a[0] = 1;
   both(&s, s.a, 8u);
   return s.a[0];
-}
-
-// Non-argument decay position: a pointer LOCAL bound to a member array
-// stays rejected this wave, with the pointer-decomposition wording (NOT
-// the ArrayToPointerDecay one — the binding site rejects first).
-// PTRLOCAL: ptr-local.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer assigned a non-address value
-
-//--- ptr-local.c
-struct S { unsigned char iv[8]; unsigned int n; };
-int main(void) {
-  struct S s;
-  unsigned char *p = s.iv;
-  s.iv[0] = 1;
-  return p[0];
 }
 
 // A GLOBAL struct's member array: the member place is a staged local
