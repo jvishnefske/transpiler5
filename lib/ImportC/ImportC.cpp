@@ -3318,6 +3318,20 @@ FailureOr<Value> CImporter::emitPointerTruth(const clang::Expr *expr) {
   Location loc = translateLoc(expr->getBeginLoc());
   if (isNullPointerConstantExpr(expr)) // `if (NULL)` is constant false.
     return createBoolConstant(loc, false);
+  // FR-88: a NULLABLE byte-slice parameter's truth test (`if (p)`, `!p`)
+  // is its Option discriminant — never the statically-non-null constant
+  // fold below, because `None` call sites are legal for this class. The
+  // let-bound i1 keeps the emitted guard clippy-clean.
+  if (const clang::ParmVarDecl *param = asPointerParamRef(expr);
+      param && nullableByteParams.contains(param)) {
+    Value place = symbols.lookup(param);
+    return builder
+        .create<emitrust::MethodCallOp>(loc, TypeRange{builder.getI1Type()},
+                                        place,
+                                        builder.getStringAttr("is_some"),
+                                        ValueRange{})
+        .getResult(0);
+  }
   // An integer-carrier pointer (CTS-P3) is a plain i64; its truth test is
   // an integer comparison against zero.
   if (Value cell = lookupCarrierCell(expr)) {

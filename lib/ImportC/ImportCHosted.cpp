@@ -312,6 +312,35 @@ CImporter::emitCharRegionArg(const clang::Expr *expr) {
       break;
     e = stripTrivia(cast->getSubExpr());
   }
+  // FR-88: a NULLABLE byte-slice parameter used as a byte-family region.
+  // The guard-dominance scan already proved every such use sits under a
+  // proven null guard, so the value is unwrapped AT the use site — the
+  // panic-free placement: `p.unwrap()` sits inside the guard by
+  // construction (MethodCallOp is non-Pure, so no canonicalization can
+  // hoist it out) — and the deref'd `&[u8]` slice place rides the
+  // ordinary FR-72 reslice machinery through `slicePlace`.
+  if (const clang::ParmVarDecl *param = asPointerParamRef(e);
+      param && nullableByteParams.contains(param)) {
+    auto sliceType = emitrust::SliceType::get(
+        IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned));
+    Value place = symbols.lookup(param);
+    Value unwrapped =
+        builder
+            .create<emitrust::MethodCallOp>(
+                loc, TypeRange{emitrust::RefType::get(sliceType)}, place,
+                builder.getStringAttr("unwrap"), ValueRange{})
+            .getResult(0);
+    Value slicePlace =
+        builder
+            .create<emitrust::DerefOp>(
+                loc, emitrust::LValueType::get(sliceType), unwrapped)
+            .getResult();
+    PtrExprValue value{
+        nullptr, createIntConstant(loc, builder.getIntegerType(64), 0),
+        Value()};
+    value.slicePlace = slicePlace;
+    return value;
+  }
   // A decayed string literal argument — or `__func__`, whose
   // function-name literal is the same shape (C99-29) — creates (or
   // reuses) the literal's read-only backing; unlike a literal bound to a
@@ -373,6 +402,12 @@ FailureOr<Value> CImporter::emitCharRegionSlice(Location loc,
   if (place && isMut)
     return emitError(loc) << "unsupported: a string literal region cannot "
                              "be a mutable string argument";
+  // FR-88: a nullable parameter's guarded use carries its unwrapped
+  // `!emitrust.lvalue<!emitrust.slice<ui8>>` place directly; it joins
+  // the slice-param branch below (shared-source rules included) exactly
+  // like the FR-72 deref'd backing it is.
+  if (!place)
+    place = pointer.slicePlace;
   if (!place) {
     auto it = symbols.find(pointer.base);
     if (it == symbols.end())
@@ -390,7 +425,14 @@ FailureOr<Value> CImporter::emitCharRegionSlice(Location loc,
   if (lvalueType) {
     if (auto arrayType =
             llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType())) {
-      if (arrayType.getElementType() == i8Type)
+      // FR-88: a ui8 (uint8_t) LOCAL/staged array is a byte-family
+      // region too — the ctr_prng `memcpy(personalization_buf, ...)`
+      // destination — under the same u8-helper gate the FR-72
+      // slice-param branch uses; str*-family positions
+      // (allowUnsignedByte=false) keep the historical char-array
+      // rejection wording verbatim.
+      if (arrayType.getElementType() == i8Type ||
+          (allowUnsignedByte && arrayType.getElementType() == ui8Type))
         elementType = arrayType.getElementType();
     } else if (auto sliceBase = llvm::dyn_cast<emitrust::SliceType>(
                    lvalueType.getValueType())) {

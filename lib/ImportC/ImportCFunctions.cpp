@@ -735,7 +735,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
         llvm::isa<emitrust::MutRefType, emitrust::RefType>(argType);
     bool shadowed =
         !isRef && (llvm::isa<emitrust::StructType, emitrust::EnumType,
-                             emitrust::FnPtrType>(argType) ||
+                             emitrust::FnPtrType, emitrust::OpaqueType>(
+                       argType) ||
                    isUnsignedInt(argType) || addressTaken.contains(param));
     if (shadowed)
       return {};
@@ -1187,15 +1188,17 @@ LogicalResult CImporter::bindOrdinaryParam(const clang::ParmVarDecl *param,
     return success();
   }
   if (llvm::isa<emitrust::StructType, emitrust::EnumType,
-                emitrust::FnPtrType>(type) ||
+                emitrust::FnPtrType, emitrust::OpaqueType>(type) ||
       isUnsignedInt(type) || addressTaken.contains(param)) {
-    // By-value struct, enum, function pointer, or unsigned scalar, or an
-    // address-taken scalar: copy into a Rust variable (dialect-typed
-    // values must not become memref cells — a memref of a dialect type
-    // is illegal — and unsigned cells must not either, because mem2reg
-    // materializes its default value as an `arith.constant`, which
-    // requires a signless type). FR-61e: the shadow carries the
-    // parameter's final spelling; an unnamed parameter stays anonymous.
+    // By-value struct, enum, function pointer, opaque (FR-88's
+    // `Option<&[u8]>` nullable byte-slice parameter), or unsigned
+    // scalar, or an address-taken scalar: copy into a Rust variable
+    // (dialect-typed values must not become memref cells — a memref of a
+    // dialect type is illegal — and unsigned cells must not either,
+    // because mem2reg materializes its default value as an
+    // `arith.constant`, which requires a signless type). FR-61e: the
+    // shadow carries the parameter's final spelling; an unnamed
+    // parameter stays anonymous.
     Value place = builder
                       .create<emitrust::VariableOp>(
                           paramLoc, emitrust::LValueType::get(type),
@@ -1206,6 +1209,14 @@ LogicalResult CImporter::bindOrdinaryParam(const clang::ParmVarDecl *param,
                       .getResult();
     builder.create<emitrust::AssignOp>(paramLoc, place, blockArg);
     symbols[param] = place;
+    // FR-88: the named lvalue place is the method-call receiver for the
+    // parameter's null tests (`is_some`/`is_none`) and per-use-site
+    // `unwrap`s; the set routes those interceptions and, critically,
+    // BYPASSES the statically-non-null comparison fold — `None` call
+    // sites are legal for this class, so folding its null test would be
+    // a miscompile, not a rejection.
+    if (isNullableByteSliceType(type) && isDataPointer(param->getType()))
+      nullableByteParams.insert(param);
     return success();
   }
   if (llvm::isa<emitrust::ArrayType>(type))

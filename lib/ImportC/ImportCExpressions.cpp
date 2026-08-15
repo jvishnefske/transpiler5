@@ -1213,6 +1213,23 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
           break;
         pointerSide = stripTrivia(cast->getSubExpr());
       }
+      // FR-88: a NULLABLE byte-slice parameter's null test is REAL — its
+      // `None` call sites are legal — so it must never reach the
+      // statically-non-null fold below. It lowers to the Option
+      // discriminant method call on the parameter's lvalue place
+      // (`is_none` for `==`, `is_some` for `!=`), the fn-ptr precedent's
+      // spelling; the let-bound i1 keeps the emitted guard
+      // clippy-clean (never inline a method call into the `if`).
+      if (const clang::ParmVarDecl *param = asPointerParamRef(pointerSide);
+          param && nullableByteParams.contains(param)) {
+        Value place = symbols.lookup(param);
+        return builder
+            .create<emitrust::MethodCallOp>(
+                loc, TypeRange{builder.getI1Type()}, place,
+                builder.getStringAttr(isEq ? "is_none" : "is_some"),
+                ValueRange{})
+            .getResult(0);
+      }
       FailureOr<PtrExprValue> pointer = emitPointerRValue(pointerSide);
       if (failed(pointer))
         return failure();
@@ -2333,6 +2350,21 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
              << "unsupported: argument to a cell-slice parameter must be a "
                 "whole global array or a forwarded cell-slice parameter";
     }
+    // FR-88: a NULLABLE byte-slice parameter (`Option<&[u8]>`). C's null
+    // pointer constant is the `None` value — an inline constant, exactly
+    // like a fn-ptr `None` — and every other argument resolves as a
+    // shared byte-region borrow in the borrow phase below, wrapped in
+    // `Some(...)` there; a region-less argument keeps its located
+    // rejection inside `emitBorrowArgument`, never a silent one-element
+    // borrow.
+    if (isNullableByteSliceType(input)) {
+      if (isNullPointerConstantExpr(argument)) {
+        arguments[index] = createFnPtrNone(loc, input);
+        continue;
+      }
+      borrows.push_back({index, argument});
+      continue;
+    }
     if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(input)) {
       borrows.push_back({index, argument});
       continue;
@@ -2376,9 +2408,20 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   for (const PendingBorrow &borrow : borrows) {
     const clang::VarDecl *root = nullptr;
     SmallVector<const clang::FieldDecl *, 2> rootPath;
+    // FR-88: a nullable parameter's argument borrows the SHARED byte
+    // slice its Option wraps — the ordinary `&[u8]` slice-argument
+    // machinery, region views, aliasing keys and rejections included —
+    // and the reference is then wrapped in `Some(...)` below.
+    Type input = targetType.getInput(borrow.index);
+    bool nullableSlot = isNullableByteSliceType(input);
+    Type borrowType =
+        nullableSlot
+            ? Type(emitrust::RefType::get(
+                  emitrust::SliceType::get(IntegerType::get(
+                      builder.getContext(), 8, IntegerType::Unsigned))))
+            : input;
     FailureOr<Value> reference =
-        emitBorrowArgument(loc, borrow.expr,
-                           targetType.getInput(borrow.index), root, &rootPath);
+        emitBorrowArgument(loc, borrow.expr, borrowType, root, &rootPath);
     if (failed(reference))
       return failure();
     if (root) {
@@ -2395,6 +2438,13 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
       }
       borrowRoots.push_back({root, rootPath});
     }
+    if (nullableSlot)
+      reference = builder
+                      .create<emitrust::CallOpaqueOp>(
+                          loc, TypeRange{input},
+                          builder.getStringAttr("Some"),
+                          /*args=*/ArrayAttr(), ValueRange{*reference})
+                      .getResult(0);
     arguments[borrow.index] = *reference;
   }
 
@@ -4866,15 +4916,14 @@ bool CImporter::isDecomposedPointerExpr(const clang::Expr *expr) const {
 }
 
 bool CImporter::isNullPointerConstantExpr(const clang::Expr *expr) const {
-  if (expr->isNullPointerConstant(astContext(),
-                                  clang::Expr::NPC_NeverValueDependent) !=
-      clang::Expr::NPCK_NotNull)
-    return true;
   // `(const void *) 0`: only the UNQUALIFIED `void *` cast is a formal
   // null pointer constant (C11 6.3.2.3p3), but the qualified cast still
   // yields the null pointer value; clang models both as CK_NullToPointer.
-  const auto *cast = llvm::dyn_cast<clang::CastExpr>(stripTrivia(expr));
-  return cast && cast->getCastKind() == clang::CK_NullToPointer;
+  // FR-88 extends the same reasoning to the corpus's `(uint8_t *) 0`
+  // spelling, whose NullToPointer cast arrives WRAPPED in an implicit
+  // BitCast/NoOp qualification adjustment (tinycrypt's `p == (uint8_t *)
+  // 0` sanity checks); the shared helper peels the wrapper.
+  return isNullPointerConstantShape(expr, astContext());
 }
 
 bool CImporter::isStaticallyNullPointerExpr(const clang::Expr *expr) {

@@ -484,6 +484,14 @@ struct PtrExprValue {
   /// literal; writes through this backing are allowed. Null for
   /// object-based and string-literal pointers.
   Value backing;
+  /// FR-88: the unwrapped slice place (`!emitrust.lvalue<!emitrust.slice<
+  /// ui8>>`, the deref of a fresh `p.unwrap()` method call) of a NULLABLE
+  /// byte-slice parameter's guarded region use. Like `literalBacking` it
+  /// is a base-less region whose storage is a place Value rather than a
+  /// named object; unlike it, the place is emitted AT the use site so the
+  /// panic-free unwrap sits inside the proven null guard by construction.
+  /// Null for every other pointer value.
+  Value slicePlace;
 };
 
 /// FR-87: a resolved hosted byte-family (memset/memcpy/memmove/memcmp)
@@ -531,8 +539,16 @@ struct CharRegionArg {
 /// parameters (CTS-P3) are `void *` parameters of a defined function whose
 /// body only ever truth-tests them: they carry an integer in pointer
 /// clothing and become plain i64 values (call sites pass carrier values,
-/// with null as the i64 zero).
-enum class ParamKind { ScalarRef, Slice, CellSlice, Carrier };
+/// with null as the i64 zero). `Nullable` parameters (FR-88) are
+/// `const uint8_t *` parameters of a defined function whose body
+/// null-tests them and uses their region ONLY under a proven null guard
+/// (the tinycrypt `if (personalization) memcpy(..., personalization,
+/// ...)` shape): they become `!emitrust.opaque<"Option<&[u8]>">` values —
+/// call sites pass `Some(region)` or an inline `None` for C's null
+/// pointer constant, null tests lower to `is_some`/`is_none` method
+/// calls, and each guarded region use unwraps to the shared byte slice
+/// at the use site.
+enum class ParamKind { ScalarRef, Slice, CellSlice, Carrier, Nullable };
 
 /// Why a pointer-parameter class with global bases does NOT lower to a
 /// cell-slice (CTS-P10 boundaries), keyed by the global base so the
@@ -5625,6 +5641,14 @@ private:
   /// prologue cells live in `symbols` like any scalar parameter, and this
   /// set routes their truth tests and carrier reads.
   llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> carrierParams;
+  /// FR-88: NULLABLE byte-slice parameters (`ParamKind::Nullable`) of the
+  /// function currently being emitted: their `Option<&[u8]>` value lives
+  /// in a named `emitrust.variable` place in `symbols` (the by-value
+  /// shadow branch), and this set routes their null tests to
+  /// `is_some`/`is_none` method calls (the statically-non-null fold MUST
+  /// NOT fire for them: `None` call sites are legal) and their guarded
+  /// region uses to per-use `unwrap` slice places.
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> nullableByteParams;
   /// Parameters whose interprocedural class qualified for the cell-slice
   /// lowering (CTS-P10), keyed by the definition's parameter declaration;
   /// populated by `planCellSlices` and consulted by
@@ -7168,6 +7192,342 @@ static inline bool voidParamByteUsesOk(const clang::Stmt *stmt,
     if (!voidParamByteUsesOk(child, param, elem))
       return false;
   return true;
+}
+
+/// FR-88: the null-pointer-constant test shared by the nullable-param
+/// scan and `CImporter::isNullPointerConstantExpr`. Beyond clang's own
+/// formal NPC check it recognizes (a) a qualified `(const void *) 0`
+/// (clang models it as CK_NullToPointer but C11 6.3.2.3p3 makes only the
+/// unqualified cast a formal NPC) and (b) the corpus's `(uint8_t *) 0`
+/// spelling, whose explicit NullToPointer cast arrives WRAPPED in an
+/// implicit BitCast/NoOp qualification adjustment when compared against a
+/// differently-qualified pointer (tinycrypt hmac_prng/ccm's sanity
+/// checks) — the wrapper is peeled before the CK_NullToPointer check.
+static inline bool isNullPointerConstantShape(const clang::Expr *expr,
+                                              clang::ASTContext &ctx) {
+  if (expr->isNullPointerConstant(ctx, clang::Expr::NPC_NeverValueDependent) !=
+      clang::Expr::NPCK_NotNull)
+    return true;
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *implicit = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    if (implicit->getCastKind() != clang::CK_BitCast &&
+        implicit->getCastKind() != clang::CK_NoOp)
+      break;
+    e = stripTrivia(implicit->getSubExpr());
+  }
+  const auto *cast = llvm::dyn_cast<clang::CastExpr>(e);
+  return cast && cast->getCastKind() == clang::CK_NullToPointer;
+}
+
+/// FR-88: the pointer-typed parameter a (possibly BitCast-adjusted)
+/// reference names, or null. Mirrors the emission-side peel of the
+/// null-comparison path: a param compared against a cast null constant
+/// (`p == (uint8_t *) 0`) carries an implicit BitCast the plain
+/// `asPointerParamRef` single-cast peel does not see.
+static inline const clang::ParmVarDecl *
+nullableParamRefUnder(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
+    if (cast->getCastKind() != clang::CK_LValueToRValue &&
+        cast->getCastKind() != clang::CK_NoOp &&
+        cast->getCastKind() != clang::CK_BitCast)
+      break;
+    e = stripTrivia(cast->getSubExpr());
+  }
+  const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
+  if (!ref)
+    return nullptr;
+  const auto *param = llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl());
+  if (!param || !isPointerType(param->getType()))
+    return nullptr;
+  return param;
+}
+
+static inline bool nullableParamUsesOk(const clang::Stmt *stmt,
+                                       const clang::ParmVarDecl *param,
+                                       bool nonNull, bool &sawTest,
+                                       bool &sawUse);
+
+/// FR-88: what the truth of a guard condition proves about `param`.
+enum class NullGuardClass {
+  /// No claim (the condition was walked generally for stray uses).
+  None,
+  /// Condition TRUE implies the parameter is non-null (`p`, `p != 0`,
+  /// `0 != p`, or a `&&` conjunction containing such a test).
+  Pos,
+  /// Condition FALSE implies the parameter is non-null (`!p`, `p == 0`,
+  /// `p == (uint8_t *) 0`, or a `||` disjunction containing such a test
+  /// — the early-exit `if (p == NULL || bad) return;` shape).
+  Neg
+};
+
+/// FR-88: classifies a guard condition against `param`, consuming the
+/// qualifying null-test spellings; every unrecognized subtree is walked
+/// generally (with the INCOMING `nonNull` fact, never a promoted one:
+/// short-circuit knowledge is deliberately not modeled), so a stray use
+/// of `param` inside a condition still disqualifies through `ok`.
+static inline NullGuardClass
+nullableGuardClass(const clang::Expr *cond, const clang::ParmVarDecl *param,
+                   bool nonNull, bool &ok, bool &sawTest, bool &sawUse) {
+  const clang::Expr *e = stripTrivia(cond);
+  if (nullableParamRefUnder(e) == param) {
+    sawTest = true;
+    return NullGuardClass::Pos;
+  }
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e))
+    if (cast->getCastKind() == clang::CK_PointerToBoolean)
+      return nullableGuardClass(cast->getSubExpr(), param, nonNull, ok,
+                                sawTest, sawUse);
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    if (unary->getOpcode() == clang::UO_LNot) {
+      NullGuardClass sub = nullableGuardClass(unary->getSubExpr(), param,
+                                              nonNull, ok, sawTest, sawUse);
+      // `!X` proves by the OPPOSITE edge: X Pos means "X true => non-null",
+      // so `!X` false => X true => non-null (Neg), and symmetrically.
+      if (sub == NullGuardClass::Pos)
+        return NullGuardClass::Neg;
+      if (sub == NullGuardClass::Neg)
+        return NullGuardClass::Pos;
+      return NullGuardClass::None;
+    }
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e)) {
+    if (binary->getOpcode() == clang::BO_EQ ||
+        binary->getOpcode() == clang::BO_NE) {
+      clang::ASTContext &ctx = param->getASTContext();
+      const clang::Expr *lhs = binary->getLHS();
+      const clang::Expr *rhs = binary->getRHS();
+      bool lhsNull = isNullPointerConstantShape(lhs, ctx);
+      bool rhsNull = isNullPointerConstantShape(rhs, ctx);
+      const clang::Expr *pointerSide =
+          lhsNull ? rhs : rhsNull ? lhs : nullptr;
+      if (pointerSide && nullableParamRefUnder(pointerSide) == param) {
+        sawTest = true;
+        return binary->getOpcode() == clang::BO_EQ ? NullGuardClass::Neg
+                                                   : NullGuardClass::Pos;
+      }
+      // Not this parameter's test: fall through to the general walk.
+    }
+    if (binary->getOpcode() == clang::BO_LAnd) {
+      NullGuardClass lhs = nullableGuardClass(binary->getLHS(), param,
+                                              nonNull, ok, sawTest, sawUse);
+      NullGuardClass rhs = nullableGuardClass(binary->getRHS(), param,
+                                              nonNull, ok, sawTest, sawUse);
+      // `A && B` true implies BOTH true, so a Pos conjunct proves
+      // non-null; a Neg conjunct proves nothing here (and falsity of the
+      // conjunction proves nothing either). A Pos/Neg mix is a
+      // contradictory test; decline the parameter.
+      if ((lhs == NullGuardClass::Pos && rhs == NullGuardClass::Neg) ||
+          (lhs == NullGuardClass::Neg && rhs == NullGuardClass::Pos))
+        ok = false;
+      if (lhs == NullGuardClass::Pos || rhs == NullGuardClass::Pos)
+        return NullGuardClass::Pos;
+      return NullGuardClass::None;
+    }
+    if (binary->getOpcode() == clang::BO_LOr) {
+      NullGuardClass lhs = nullableGuardClass(binary->getLHS(), param,
+                                              nonNull, ok, sawTest, sawUse);
+      NullGuardClass rhs = nullableGuardClass(binary->getRHS(), param,
+                                              nonNull, ok, sawTest, sawUse);
+      // `A || B` false implies BOTH false, so a Neg disjunct proves
+      // non-null on the false edge (tinycrypt's `if (p == NULL || bad)
+      // return;`); a Pos disjunct proves nothing in a disjunction.
+      if ((lhs == NullGuardClass::Pos && rhs == NullGuardClass::Neg) ||
+          (lhs == NullGuardClass::Neg && rhs == NullGuardClass::Pos))
+        ok = false;
+      if (lhs == NullGuardClass::Neg || rhs == NullGuardClass::Neg)
+        return NullGuardClass::Neg;
+      return NullGuardClass::None;
+    }
+  }
+  // Unrecognized condition shape: no claim; walk it generally so any
+  // stray use of the parameter inside still disqualifies.
+  if (!nullableParamUsesOk(e, param, nonNull, sawTest, sawUse))
+    ok = false;
+  return NullGuardClass::None;
+}
+
+/// FR-88: whether `stmt` returns on EVERY path — the conservative
+/// spelling the early-exit promotion accepts: a return statement, or a
+/// compound whose LAST statement always returns. (goto-exit variants are
+/// deliberately out of scope; nothing in the measured corpus needs them.)
+static inline bool nullableStmtAlwaysReturns(const clang::Stmt *stmt) {
+  if (!stmt)
+    return false;
+  if (llvm::isa<clang::ReturnStmt>(stmt))
+    return true;
+  if (const auto *compound = llvm::dyn_cast<clang::CompoundStmt>(stmt))
+    return !compound->body_empty() &&
+           nullableStmtAlwaysReturns(compound->body_back());
+  return false;
+}
+
+/// FR-88: one `if` statement of the nullable-param scan. Classifies the
+/// condition, walks both branches with the proven facts on each edge
+/// (`Pos` proves the THEN branch, `Neg` proves the ELSE branch), and
+/// reports through `provenAfter` whether the statement PROMOTES the fact
+/// for the remainder of the enclosing compound: a `Neg` guard whose then
+/// branch always returns and that has no else (`if (p == NULL) return;`)
+/// proves the parameter non-null for everything after it.
+static inline bool nullableIfOk(const clang::IfStmt *ifStmt,
+                                const clang::ParmVarDecl *param, bool nonNull,
+                                bool &sawTest, bool &sawUse,
+                                bool &provenAfter) {
+  provenAfter = false;
+  bool ok = true;
+  NullGuardClass cls = nullableGuardClass(ifStmt->getCond(), param, nonNull,
+                                          ok, sawTest, sawUse);
+  if (!ok)
+    return false;
+  if (!nullableParamUsesOk(ifStmt->getInit(), param, nonNull, sawTest,
+                           sawUse))
+    return false;
+  bool thenFlag = nonNull || cls == NullGuardClass::Pos;
+  bool elseFlag = nonNull || cls == NullGuardClass::Neg;
+  if (!nullableParamUsesOk(ifStmt->getThen(), param, thenFlag, sawTest,
+                           sawUse) ||
+      !nullableParamUsesOk(ifStmt->getElse(), param, elseFlag, sawTest,
+                           sawUse))
+    return false;
+  provenAfter = cls == NullGuardClass::Neg && !ifStmt->getElse() &&
+                nullableStmtAlwaysReturns(ifStmt->getThen());
+  return true;
+}
+
+/// FR-88: the guard-dominance scan for a NULLABLE byte-slice parameter
+/// candidate (`const uint8_t *`). Returns whether every use of `param`
+/// below `stmt` is either (a) a qualifying null TEST — a bare truth test,
+/// `!p`, or an EQ/NE comparison against a null pointer constant
+/// (including the corpus's `(uint8_t *) 0` cast spelling), all of which
+/// emission lowers to `is_some`/`is_none` — or (b) a bare reference in a
+/// byte-family libc SOURCE region position (memcpy/memmove's source,
+/// memcmp's two regions; never a written region — the pointee is const)
+/// in a context where a guard PROVED the parameter non-null: the `then`
+/// of a `Pos` guard, the `else` of a `Neg` guard, or any statement after
+/// a `Neg`-guard early exit in the same compound. The scan is
+/// deliberately conservative, mirroring `voidParamOnlyTruthTested`: any
+/// other appearance (an unguarded region use, subscripts, arithmetic,
+/// reassignment, any other call argument, a count position) returns
+/// false and the parameter DECLINES to its historical classification —
+/// which is sound, because a declined parameter keeps the statically-
+/// non-null fold AND the null-constant call-site rejection verbatim. The
+/// caller additionally requires `sawTest && sawUse`: a never-tested or
+/// never-used parameter gains nothing from an Option signature.
+static inline bool nullableParamUsesOk(const clang::Stmt *stmt,
+                                       const clang::ParmVarDecl *param,
+                                       bool nonNull, bool &sawTest,
+                                       bool &sawUse) {
+  if (!stmt)
+    return true;
+  if (const auto *ifStmt = llvm::dyn_cast<clang::IfStmt>(stmt)) {
+    bool provenAfter = false;
+    return nullableIfOk(ifStmt, param, nonNull, sawTest, sawUse,
+                        provenAfter);
+  }
+  if (const auto *compound = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {
+    // Sequence-aware walk: a `Neg`-guard early exit proves the parameter
+    // non-null from the NEXT statement to the end of this compound (the
+    // parameter is never reassigned in a qualifying body — reassignment
+    // is an unconsumed use — so the fact can never be invalidated).
+    bool flag = nonNull;
+    for (const clang::Stmt *child : compound->body()) {
+      if (const auto *childIf = llvm::dyn_cast<clang::IfStmt>(child)) {
+        bool provenAfter = false;
+        if (!nullableIfOk(childIf, param, flag, sawTest, sawUse,
+                          provenAfter))
+          return false;
+        flag |= provenAfter;
+        continue;
+      }
+      if (!nullableParamUsesOk(child, param, flag, sawTest, sawUse))
+        return false;
+    }
+    return true;
+  }
+  if (const auto *conditional =
+          llvm::dyn_cast<clang::ConditionalOperator>(stmt)) {
+    bool ok = true;
+    NullGuardClass cls = nullableGuardClass(conditional->getCond(), param,
+                                            nonNull, ok, sawTest, sawUse);
+    if (!ok)
+      return false;
+    return nullableParamUsesOk(conditional->getTrueExpr(), param,
+                               nonNull || cls == NullGuardClass::Pos,
+                               sawTest, sawUse) &&
+           nullableParamUsesOk(conditional->getFalseExpr(), param,
+                               nonNull || cls == NullGuardClass::Neg,
+                               sawTest, sawUse);
+  }
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
+    const clang::FunctionDecl *callee = call->getDirectCallee();
+    if (callee && callee->getDeclName().isIdentifier() &&
+        !callee->getDefinition() && call->getNumArgs() == 3) {
+      llvm::StringRef name = callee->getName();
+      // SOURCE positions only: the const pointee excludes every written
+      // region, so memset's destination and memcpy/memmove's destination
+      // never consume the reference (a const argument there is a clang
+      // constraint violation anyway).
+      unsigned firstSource =
+          name == "memcpy" || name == "memmove" ? 1
+          : name == "memcmp"                    ? 0
+                                                : 3;
+      if (firstSource < 2) {
+        for (auto [index, arg] : llvm::enumerate(call->arguments())) {
+          if (index >= firstSource && index < 2 &&
+              nullableParamRefUnder(arg) == param) {
+            if (!nonNull)
+              return false; // A region use outside every proven guard.
+            sawUse = true;
+            continue; // The source position consumed the reference.
+          }
+          if (!nullableParamUsesOk(arg, param, nonNull, sawTest, sawUse))
+            return false;
+        }
+        return nullableParamUsesOk(call->getCallee(), param, nonNull,
+                                   sawTest, sawUse);
+      }
+    }
+  }
+  if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(stmt))
+    if (binary->getOpcode() == clang::BO_EQ ||
+        binary->getOpcode() == clang::BO_NE) {
+      // A null comparison in ANY expression position is a consumed test
+      // (emission intercepts every pointer null comparison of a nullable
+      // parameter, wherever it appears).
+      clang::ASTContext &ctx = param->getASTContext();
+      const clang::Expr *lhs = binary->getLHS();
+      const clang::Expr *rhs = binary->getRHS();
+      bool lhsNull = isNullPointerConstantShape(lhs, ctx);
+      bool rhsNull = isNullPointerConstantShape(rhs, ctx);
+      const clang::Expr *pointerSide =
+          lhsNull ? rhs : rhsNull ? lhs : nullptr;
+      if (pointerSide && nullableParamRefUnder(pointerSide) == param) {
+        sawTest = true;
+        return true;
+      }
+    }
+  if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(stmt))
+    if (cast->getCastKind() == clang::CK_PointerToBoolean &&
+        nullableParamRefUnder(cast->getSubExpr()) == param) {
+      sawTest = true; // A bare truth test (`if (p)`, `!p`) is consumed.
+      return true;
+    }
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    if (ref->getDecl() == param)
+      return false; // A use no test or guarded source position consumed.
+  for (const clang::Stmt *child : stmt->children())
+    if (!nullableParamUsesOk(child, param, nonNull, sawTest, sawUse))
+      return false;
+  return true;
+}
+
+/// FR-88: whether `type` is the NULLABLE byte-slice parameter type —
+/// the `Option<&[u8]>` opaque `mapParamType` produces for
+/// `ParamKind::Nullable`. String-matched on the opaque spelling: the
+/// dialect needs no new type (translate already renders `Option<`-opaque
+/// values, C99-43), so the spelling IS the type's identity.
+static inline bool isNullableByteSliceType(mlir::Type type) {
+  auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
+  return opaque && opaque.getValue() == "Option<&[u8]>";
 }
 
 /// FR-75: one call-site argument of the `void *` consensus scan. Returns
