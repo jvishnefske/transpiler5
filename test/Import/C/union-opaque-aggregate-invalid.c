@@ -1,45 +1,48 @@
-// FR-78 negative space: a differing-aggregate-arm union imports as OPAQUE
-// STORAGE (union-opaque-aggregate.c), so the TYPE and every whole-value
-// use are admitted — but no access path through ANY arm is representable
-// on the blob, and each one must die as a LOCATED rejection at its own
-// access site, never as leaked Rust (the pre-FR-78 placeholder broke 42
-// crates with rustc E0609 because its guard missed access paths; this
-// file enumerates them). Pinned per shape: arm reads, arm writes, nested
-// projection, compound assignment, ++, arrow access through a
-// pointer-to-union parameter (all `unsupported: opaque union arm
-// access`), active-arm initializers — local designated, non-zero global
-// constant, compound literal (`unsupported: opaque union arm
-// initializer`), address-of an arm (the existing union-member-address
-// rejection), and the CTS-R2 anonymous-MEMBER union, which keeps its
-// record-level `unsupported: union type` rejection (the opaque model is
-// for named/typed unions only).
+// FR-78/FR-83 negative space: a differing-aggregate-arm union imports as
+// OPAQUE STORAGE (union-opaque-aggregate.c), and FR-83 opened exactly ONE
+// access family on the blob — integer-SCALAR leaves (including
+// array-element leaves), pinned positive in union-opaque-arm-access.c.
+// Everything else through an arm is still not representable and must die
+// as a LOCATED rejection at its own access site, never as leaked Rust
+// (the pre-FR-78 placeholder broke 42 crates with rustc E0609 because its
+// guard missed access paths; this file enumerates the surviving
+// frontier). Pinned per shape: whole-ARM writes and FLOAT leaves (the
+// scalar-leaf model is IntegerType-only) keep `unsupported: opaque union
+// arm access`; a whole-ARM aggregate read keeps its generic
+// expression rejection; an arm ARRAY decaying to a pointer keeps the
+// pointer-cast rejection; active-arm initializers — local designated,
+// non-zero global constant, compound literal — keep `unsupported: opaque
+// union arm initializer`; address-of an arm keeps the existing
+// union-member-address rejection (NOT probed in return position, where
+// the returned-pointer rejection preempts it); and the CTS-R2
+// anonymous-MEMBER union keeps its record-level `unsupported: union type`
+// rejection (the opaque model is for named/typed unions only).
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/read.c 2>&1 | FileCheck %s --check-prefix=READ
-// RUN: not emitrust-import-c %t/write.c 2>&1 | FileCheck %s --check-prefix=WRITE
-// RUN: not emitrust-import-c %t/nested.c 2>&1 | FileCheck %s --check-prefix=NESTED
-// RUN: not emitrust-import-c %t/compound.c 2>&1 | FileCheck %s --check-prefix=COMPOUND
-// RUN: not emitrust-import-c %t/incdec.c 2>&1 | FileCheck %s --check-prefix=INCDEC
-// RUN: not emitrust-import-c %t/arrow.c 2>&1 | FileCheck %s --check-prefix=ARROW
+// RUN: not emitrust-import-c %t/whole-arm-read.c 2>&1 | FileCheck %s --check-prefix=WHOLEARMREAD
+// RUN: not emitrust-import-c %t/whole-arm-write.c 2>&1 | FileCheck %s --check-prefix=WHOLEARMWRITE
+// RUN: not emitrust-import-c %t/array-decay.c 2>&1 | FileCheck %s --check-prefix=ARRAYDECAY
+// RUN: not emitrust-import-c %t/float-leaf.c 2>&1 | FileCheck %s --check-prefix=FLOATLEAF
 // RUN: not emitrust-import-c %t/addrof.c 2>&1 | FileCheck %s --check-prefix=ADDROF
 // RUN: not emitrust-import-c %t/init-local.c 2>&1 | FileCheck %s --check-prefix=INITLOCAL
 // RUN: not emitrust-import-c %t/init-global.c 2>&1 | FileCheck %s --check-prefix=INITGLOBAL
 // RUN: not emitrust-import-c %t/compound-literal.c 2>&1 | FileCheck %s --check-prefix=CLIT
 // RUN: not emitrust-import-c %t/anon-member.c 2>&1 | FileCheck %s --check-prefix=ANONMEMBER
 
-// READ: read.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm access
-// WRITE: write.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm access
-// NESTED: nested.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm access
-// COMPOUND: compound.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm access
-// INCDEC: incdec.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm access
-// ARROW: arrow.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm access
+// WHOLEARMREAD: whole-arm-read.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported expression: MemberExpr
+// WHOLEARMWRITE: whole-arm-write.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm access
+// ARRAYDECAY: array-decay.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported pointer cast (ArrayToPointerDecay)
+// FLOATLEAF: float-leaf.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm access
 // ADDROF: addrof.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: taking the address of a union member
 // INITLOCAL: init-local.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm initializer
 // INITGLOBAL: init-global.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm initializer
 // CLIT: compound-literal.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm initializer
 // ANONMEMBER: anon-member.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: union type
 
-//--- read.c
-// A plain read through an arm: the blob carries no arm-typed view.
+//--- whole-arm-read.c
+// A whole-ARM aggregate copy out of the union: the blob has no arm-typed
+// value to load, and the lwIP demand for whole-arm shapes is pointer
+// comparison / const calls / escapes, not leaf access — out of the FR-83
+// scalar-leaf scope.
 struct A {
   int ax[10];
 };
@@ -54,13 +57,14 @@ union U {
   struct B b;
 };
 
-int read_arm(void) {
+int whole_arm_read(void) {
   union U u;
-  return u.b.bs;
+  struct B b2 = u.b;
+  return b2.bs;
 }
 
-//--- write.c
-// A write through an arm (dot access on a local).
+//--- whole-arm-write.c
+// A whole-ARM aggregate store into the union dies at the arm selection.
 struct A {
   int ax[10];
 };
@@ -75,99 +79,46 @@ union U {
   struct B b;
 };
 
-void write_arm(void) {
+void whole_arm_write(union U *u, struct B b2) { u->b = b2; }
+
+//--- array-decay.c
+// An arm ARRAY decaying to a pointer argument: no blob byte view yields a
+// pointer, so the decay keeps its pointer-cast rejection.
+struct A {
+  int ax[10];
+};
+
+struct B {
+  short bs;
+  char bc;
+};
+
+union U {
+  struct A a;
+  struct B b;
+};
+
+void sink(int *p);
+
+void decay(void) {
   union U u;
-  u.b.bs = 1;
+  sink(u.a.ax);
 }
 
-//--- nested.c
-// Deep projection through an arm (u.a.ax[3]) dies at the ARM selection,
-// not somewhere down the chain.
-struct A {
-  int ax[10];
+//--- float-leaf.c
+// A FLOAT leaf through an arm: the byte-view image is IntegerType-only
+// (ne_bytes helpers are emitted for integer widths), so a float leaf
+// keeps the arm-access rejection at its own site.
+union F {
+  struct FA {
+    float f;
+  } fa;
+  struct FB {
+    int i;
+  } ib;
 };
 
-struct B {
-  short bs;
-  char bc;
-};
-
-union U {
-  struct A a;
-  struct B b;
-};
-
-struct Rec {
-  int before;
-  union U u;
-  int after;
-};
-
-int deep(void) {
-  struct Rec r;
-  return r.u.a.ax[3];
-}
-
-//--- compound.c
-// Compound assignment through an arm funnels into the same lvalue path.
-struct A {
-  int ax[10];
-};
-
-struct B {
-  short bs;
-  char bc;
-};
-
-union U {
-  struct A a;
-  struct B b;
-};
-
-void comp(void) {
-  union U u;
-  u.b.bs += 2;
-}
-
-//--- incdec.c
-// ++ through an arm funnels into the same lvalue path.
-struct A {
-  int ax[10];
-};
-
-struct B {
-  short bs;
-  char bc;
-};
-
-union U {
-  struct A a;
-  struct B b;
-};
-
-void bump(void) {
-  union U u;
-  u.b.bs++;
-}
-
-//--- arrow.c
-// Arrow access through a pointer-to-union parameter: the same arm
-// interception must hold when the union arrives by reference.
-struct A {
-  int ax[10];
-};
-
-struct B {
-  short bs;
-  char bc;
-};
-
-union U {
-  struct A a;
-  struct B b;
-};
-
-int through_ptr(union U *p) { return p->a.ax[0]; }
+float float_leaf(union F *p) { return p->fa.f; }
 
 //--- addrof.c
 // &u.a: taking the address of a union member keeps its established

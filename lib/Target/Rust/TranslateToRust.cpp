@@ -61,6 +61,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -3196,13 +3197,22 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   // verifier passes and the rendered Rust selects a field the struct does
   // not have: rustc E0609, a whole-crate loss with no source location
   // (exactly how the pre-FR-78 union placeholder died). Refuse ANY member
-  // selection on a marked type instead, even the blob field's own name —
-  // no supported path ever projects into the blob.
-  llvm::StringSet<> opaqueUnionNames;
+  // selection on a marked type — with ONE enumerated allowance (FR-83):
+  // a selection of the marked struct_def's single BLOB field by its own
+  // name, cross-checked against the def right here, so the selected field
+  // provably exists and the E0609 hazard cannot recur. That is how FR-83
+  // renders arm accesses as blob byte views; an arm name, any other name,
+  // or a marked def without exactly one field still refuses.
+  llvm::StringMap<StringAttr> opaqueUnionBlobFields;
   for (auto structDefOp : moduleOp.getOps<emitrust::StructDefOp>())
-    if (structDefOp->hasAttr(emitrust::kOpaqueUnionAttrName))
-      opaqueUnionNames.insert(structDefOp.getSymName());
-  if (!opaqueUnionNames.empty()) {
+    if (structDefOp->hasAttr(emitrust::kOpaqueUnionAttrName)) {
+      ArrayAttr fieldNames = structDefOp.getFieldNames();
+      StringAttr blobField =
+          fieldNames.size() == 1 ? dyn_cast<StringAttr>(fieldNames[0])
+                                 : StringAttr();
+      opaqueUnionBlobFields[structDefOp.getSymName()] = blobField;
+    }
+  if (!opaqueUnionBlobFields.empty()) {
     emitrust::MemberOp leaked;
     llvm::StringRef leakedUnion;
     moduleOp.walk([&](emitrust::MemberOp memberOp) {
@@ -3211,7 +3221,12 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
       auto structType =
           lvalueType ? dyn_cast<emitrust::StructType>(lvalueType.getValueType())
                      : emitrust::StructType();
-      if (!structType || !opaqueUnionNames.contains(structType.getName()))
+      if (!structType)
+        return WalkResult::advance();
+      auto it = opaqueUnionBlobFields.find(structType.getName());
+      if (it == opaqueUnionBlobFields.end())
+        return WalkResult::advance();
+      if (it->second && memberOp.getMember() == it->second.getValue())
         return WalkResult::advance();
       leaked = memberOp;
       leakedUnion = structType.getName();

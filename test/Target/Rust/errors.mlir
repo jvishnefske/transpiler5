@@ -117,8 +117,11 @@ emitrust.func @use_missing() -> !emitrust.fn_ptr<(i32) -> i32> {
 // struct_def, so the verifier passes and the rendered Rust selects a field
 // the struct does not have: rustc E0609, a whole-crate loss with no source
 // location (exactly how the pre-FR-78 union placeholder died). The emitter
-// therefore refuses ANY member selection on a marked type, even a
-// well-typed-looking one.
+// therefore refuses any member selection on a marked type with ONE
+// enumerated exception — FR-83's blob byte views select the struct_def's
+// single blob field by its own name, cross-checked against the def
+// (opaque-union-blob.mlir pins the positive side); an ARM name still
+// refuses here.
 emitrust.struct_def @U ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
 emitrust.struct_def @Rec ["u"] [!emitrust.struct<"U">]
 emitrust.func @leak(%arg0: !emitrust.mut_ref<!emitrust.struct<"Rec">>) -> i32 {
@@ -126,6 +129,24 @@ emitrust.func @leak(%arg0: !emitrust.mut_ref<!emitrust.struct<"Rec">>) -> i32 {
   %1 = emitrust.member %0["u"] : (!emitrust.lvalue<!emitrust.struct<"Rec">>) -> !emitrust.lvalue<!emitrust.struct<"U">>
   // CHECK: opaque union 'U' member access leaked to emission; the importer must reject this at the access site
   %2 = emitrust.member %1["a"] : (!emitrust.lvalue<!emitrust.struct<"U">>) -> !emitrust.lvalue<i32>
+  %3 = emitrust.load %2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %3 : i32
+}
+
+// -----
+
+// FR-83 cross-check boundary: the blob-field allowance requires the marked
+// struct_def to have exactly ONE field — a marked def with several fields
+// has no blob to select, so even a name that matches SOME field keeps the
+// refusal (refuse-by-default is the contract; the allowance is enumerated,
+// not name-based).
+emitrust.struct_def @M ["opaque", "extra"] [!emitrust.array<4xui8>, i32] {emitrust.opaque_union}
+emitrust.struct_def @Holder ["m"] [!emitrust.struct<"M">]
+emitrust.func @multi_field(%arg0: !emitrust.mut_ref<!emitrust.struct<"Holder">>) -> i32 {
+  %0 = emitrust.deref %arg0 : (!emitrust.mut_ref<!emitrust.struct<"Holder">>) -> !emitrust.lvalue<!emitrust.struct<"Holder">>
+  %1 = emitrust.member %0["m"] : (!emitrust.lvalue<!emitrust.struct<"Holder">>) -> !emitrust.lvalue<!emitrust.struct<"M">>
+  // CHECK: opaque union 'M' member access leaked to emission; the importer must reject this at the access site
+  %2 = emitrust.member %1["opaque"] : (!emitrust.lvalue<!emitrust.struct<"M">>) -> !emitrust.lvalue<i32>
   %3 = emitrust.load %2 : (!emitrust.lvalue<i32>) -> i32
   emitrust.return %3 : i32
 }

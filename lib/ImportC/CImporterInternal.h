@@ -4788,10 +4788,11 @@ private:
   pointerElementTypeFromAST(const clang::Expr *expr) const;
 
   /// The resolved target of one wide byte access: the byte-array place
-  /// (a local array, a string-literal backing, or a staged global copy),
-  /// the i64 byte cursor, and the access width.
+  /// (a local array, a string-literal backing, a staged global copy, or an
+  /// FR-83 opaque-union blob projection), the i64 byte cursor, and the
+  /// access width.
   struct WideByteAccess {
-    /// The `!emitrust.lvalue<!emitrust.array<Nxi8>>` byte-run place.
+    /// The `!emitrust.lvalue<!emitrust.array<NxE>>` byte-run place.
     Value basePlace;
     /// The i64 cursor of the access's first byte.
     Value cursor;
@@ -4799,6 +4800,11 @@ private:
     IntegerType valueType;
     /// sizeof(T) of the viewed type, in bytes.
     unsigned byteWidth;
+    /// The byte-run's element type. Null keeps the historical CTS-P11
+    /// signless-i8 image (a C char array base, gathered through u8
+    /// casts); the FR-83 opaque-union blob passes ui8, whose bytes need
+    /// no cast at all.
+    IntegerType elementType = {};
   };
 
   /// Resolves the wide byte access a `wideByte` classification `view`
@@ -4822,6 +4828,38 @@ private:
   /// the bytes are stored back (as i8) at the cursor.
   LogicalResult emitWideByteStore(const WideByteAccess &access, Value value,
                                   Location loc);
+
+  /// FR-83 classification (AST-only, side-effect-free): true when `expr`
+  /// is an INTEGER-scalar leaf — a plain integer type, not `_Bool`, an
+  /// enum, a `_BitInt`, or a bit-field — reached from an FR-78
+  /// opaque-union ARM through dot members and (array-typed) subscripts
+  /// only. Exactly these accesses lower to blob byte views; every other
+  /// arm shape keeps its located rejection (`emitMemberLValue` /
+  /// `projectMemberPlace` and the initializer paths).
+  bool isOpaqueArmScalarLeaf(const clang::Expr *expr) const;
+
+  /// Resolves the blob byte view an opaque-union arm leaf designates
+  /// (`isOpaqueArmScalarLeaf(expr)` must hold): the union base's place
+  /// (through the ordinary member-base machinery — staged global copies
+  /// record their store-back in `writeback`), projected to the blob field,
+  /// with the i64 cursor accumulated from clang's ASTRecordLayout field
+  /// offsets plus any (constant-folded or runtime, element-size-scaled)
+  /// subscript terms — the byte-region walk's precedent.
+  FailureOr<WideByteAccess> resolveOpaqueArmByteView(const clang::Expr *expr,
+                                                     Location loc,
+                                                     GlobalWriteback *writeback);
+
+  /// Emits the read of a resolved arm byte view: a single blob subscript
+  /// for a one-byte leaf (cast to the leaf type when signedness differs),
+  /// the `from_ne_bytes` wide image otherwise.
+  FailureOr<Value> emitOpaqueArmLoad(const WideByteAccess &access,
+                                     Location loc);
+
+  /// Emits the write of a resolved arm byte view: a single blob subscript
+  /// assign for a one-byte leaf, the `to_ne_bytes` wide image otherwise.
+  /// `value` must already be at `access.valueType`.
+  LogicalResult emitOpaqueArmStore(const WideByteAccess &access, Value value,
+                                   Location loc);
 
   /// Emits an expression as an assignable place: either a rank-0 memref
   /// value (scalar locals) or an `!emitrust.lvalue` value (aggregates,
@@ -5102,15 +5140,19 @@ private:
   /// OPAQUE STORAGE — a one-field struct_def holding a sizeof-sized
   /// `[u8; N]` blob (field spelling "opaque"), marked
   /// `emitrust.opaque_union`. The containing record imports (the
-  /// containment win) and whole-value traffic works, but no access through
-  /// any arm is representable on the blob. `collectUnionSlot` populates
-  /// both sets exactly where the one-slot residual rejection ("union arm
+  /// containment win) and whole-value traffic works. FR-83 opens ONE
+  /// access family on the blob: integer-scalar leaves (including
+  /// array-element leaves) lower to byte views at clang-computed offsets
+  /// (`isOpaqueArmScalarLeaf`/`resolveOpaqueArmByteView`); every other
+  /// arm access stays unrepresentable. `collectUnionSlot` populates both
+  /// sets exactly where the one-slot residual rejection ("union arm
   /// cannot alias the storage slot") would have fired, and only when EVERY
   /// arm is an aggregate (record or constant array) on the C import path;
-  /// `emitMemberLValue`/`projectMemberPlace` reject each arm access,
-  /// `emitRecordInitField` each active-arm initializer, and
+  /// `emitMemberLValue`/`projectMemberPlace` reject each remaining arm
+  /// access, `emitRecordInitField` each active-arm initializer, and
   /// `convertAPValueInit` each non-zero constant, all at their own sites.
   /// The Rust emitter's marker backstop refuses any leaked arm access
+  /// except the blob field's own cross-checked selection
   /// (`kOpaqueUnionAttrName`, TranslateToRust.cpp) — the pre-FR-78
   /// placeholder attempt died as rustc E0609 precisely because its guard
   /// was not access-complete.
