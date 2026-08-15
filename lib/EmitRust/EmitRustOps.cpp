@@ -828,7 +828,12 @@ static LogicalResult verifyAggregateInit(Operation *op, Attribute init,
 
 /// Verifies that the global's value type is a scalar, array, struct, or
 /// fn_ptr, that the `const` marker is only used with const-initializable
-/// (scalar or array) value types, and that a present initializer is a typed
+/// (scalar or array) value types — or, FR-79, on an initializer-less
+/// DECLARATION-ONLY struct global carrying the extern-decl or
+/// external-requirement marker, which is never rendered as storage, so the
+/// const-evaluable-initializer rationale does not apply and the marker
+/// instead enforces the getter-only contract (the store verifier below
+/// refuses writes through it) — and that a present initializer is a typed
 /// attribute of the value type on a scalar global, an opaque attribute on a
 /// fn_ptr global, or a structurally matching element list (ArrayAttr) on an
 /// array or struct global.
@@ -837,7 +842,14 @@ LogicalResult GlobalOp::verify() {
   if (!isScalarValueType(type) &&
       !isa<ArrayType, StructType, FnPtrType>(type))
     return emitOpError("invalid global value type ") << type;
-  if (getIsConst() && isa<StructType, FnPtrType>(type))
+  bool declarationOnlyMarked =
+      !getInitAttr() && (getOperation()->hasAttr(kExternDeclAttrName) ||
+                         getOperation()->hasAttr(kExternalRequirementAttrName));
+  if (getIsConst() && isa<FnPtrType>(type))
+    return emitOpError(
+               "const marker requires a scalar or array value type, but got ")
+           << type;
+  if (getIsConst() && isa<StructType>(type) && !declarationOnlyMarked)
     return emitOpError(
                "const marker requires a scalar or array value type, but got ")
            << type;

@@ -1002,7 +1002,12 @@ def EmitRust_GlobalOp : EmitRust_Op<"global", [
     A global carrying the `const` marker is never written; it is emitted as
     a plain Rust `static` item read directly. Because a plain `static`
     requires a const-evaluable initializer, the `const` marker is limited to
-    scalar and array value types (a struct's `default()` is not const).
+    scalar and array value types (a struct's `default()` is not const) --
+    except on an initializer-less declaration-only global carrying the
+    `emitrust.extern_decl` or `emitrust.external_requirement` marker, which
+    is never rendered as storage at all: there the marker records the C
+    const fact, and the store verifier turns it into an enforced
+    getter-only contract for FR-79's const-struct requirements.
     A global without the marker is mutable; to stay free of `unsafe` it is
     emitted as a `thread_local!` `std::cell::Cell` accessed through
     `emitrust.global_load` and `emitrust.global_store`. The emitted code is

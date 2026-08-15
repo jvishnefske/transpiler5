@@ -572,8 +572,12 @@ LogicalResult CImporter::deferExternGlobal(const clang::VarDecl *key,
   // `mlirType` is always set here (whole-program composite lookup or
   // `mapType`); recording it lets FR-57a defer mode materialize a
   // declaration-only global for a definition that lives in another TU.
-  pendingExternGlobals.try_emplace(symbolName,
-                                   PendingExternGlobal{loc, mlirType});
+  // FR-79: the const qualifier is captured alongside — an AST fact
+  // finalizeProject needs (it licenses the getter-only struct requirement)
+  // but can no longer derive there.
+  pendingExternGlobals.try_emplace(
+      symbolName,
+      PendingExternGlobal{loc, mlirType, canonical.isConstQualified()});
   return success();
 }
 

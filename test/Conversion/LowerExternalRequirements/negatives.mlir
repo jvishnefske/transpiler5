@@ -94,6 +94,27 @@ emitrust.func @touch() -> i32 {
 
 // -----
 
+// FR-79: a CONST requirement global is GETTER-ONLY -- const-ness is what
+// licenses the by-value struct getter, and a store would need exactly the
+// setter that contract rules out. The refusal is STRUCTURAL, not a pass
+// walk: the importer marks the minted requirement global `const`, and the
+// dialect verifier already refuses any store through a const global, so
+// the offending module never reaches the pass at all (an UNMARKED struct
+// requirement with a store would silently mint a setter -- the const
+// marker is what closes that gap). Imported IR cannot carry the store
+// anyway (clang rejects writes through const), so this fires only on
+// hand-written IR -- but it fires, located at the store, rather than
+// minting a setter for storage the C program promised never to write.
+emitrust.struct_def @S ["x", "y"] [i32, i32]
+emitrust.global const @cfg {emitrust.external_requirement} : !emitrust.struct<"S">
+emitrust.func @clobber(%arg0: !emitrust.struct<"S">) {
+  // expected-error @+1 {{cannot store to the immutable global @cfg}}
+  emitrust.global_store %arg0, @cfg : !emitrust.struct<"S">
+  emitrust.return
+}
+
+// -----
+
 // FR-70: the derived accessor names share the trait's single namespace with
 // the FUNCTION requirements, so a getter colliding with a required function
 // is refused the same way.

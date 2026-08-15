@@ -1548,14 +1548,19 @@ private:
   bool isExternalRequirementShape(func::FuncOp func);
 
   /// FR-70: whether the undefined extern GLOBAL named `symbol` (with the
-  /// recorded MLIR value type `type`) is a shape the trait can express as a
-  /// getter/setter pair of associated functions: a scalar (integer or
-  /// float), whose address is taken in no TU (an AST fact — see
+  /// recorded MLIR value type `type` and C constness `isConst`) is a shape
+  /// the trait can express as a getter/setter pair of associated functions:
+  /// a scalar (integer or float) — or, FR-79, a CONST struct whose
+  /// `emitrust.struct_def` is visible in the module, expressed GETTER-ONLY
+  /// (imported structs are Copy, so the by-value return is a faithful read,
+  /// and const-ness means no writer needs the setter) — whose address is
+  /// taken in no TU (an AST fact — see
   /// `WholeProgramInfo::addressTakenGlobals`), and every one of whose
   /// surviving IR uses is a direct whole-value `emitrust.global_load` /
   /// `emitrust.global_store`. Everything else keeps the historical
   /// rejection: the refusal shrinks, it never silently mis-emits.
-  bool isExternalRequirementGlobalShape(llvm::StringRef symbol, Type type);
+  bool isExternalRequirementGlobalShape(llvm::StringRef symbol, Type type,
+                                        bool isConst);
 
   //===--------------------------------------------------------------------===//
   // Locations and types
@@ -4960,10 +4965,14 @@ private:
   /// the first reference's location (for the diagnostic if no TU defines
   /// it) and the global's MLIR value type (so FR-57a defer mode can
   /// materialize a declaration-only `emitrust.global` without re-deriving
-  /// the type from a clang AST that is no longer current).
+  /// the type from a clang AST that is no longer current). FR-79: the C
+  /// const qualifier is recorded too -- it decides whether a struct-typed
+  /// extern qualifies as a GETTER-ONLY requirement, and it is an AST fact
+  /// no longer derivable once finalizeProject runs.
   struct PendingExternGlobal {
     Location loc;
     Type type;
+    bool isConst = false;
   };
   /// Deferred `extern` global references awaiting a cross-TU definition,
   /// keyed by MLIR symbol name.

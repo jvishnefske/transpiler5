@@ -7,7 +7,10 @@
 // mixed fn+global requirements, that write-less globals emit only the
 // getter (and read-less only the setter), that the item spelling is the
 // snake_case of the emitted symbol, and that the marked global itself is
-// erased only after every use has been rewritten.
+// erased only after every use has been rewritten. FR-79 extends the same
+// machinery to CONST STRUCT requirements -- by-value struct getter, no
+// setter, field projection on the bound Copy temporary -- with zero new
+// rewrite shapes (the last case below pins that).
 // RUN: emitrust-opt %s --split-input-file --emitrust-lower-external-requirements \
 // RUN:   | FileCheck %s
 
@@ -118,3 +121,35 @@ emitrust.func @raise() {
   emitrust.return
 }
 emitrust.global @g_flag {emitrust.external_requirement} : i32
+
+// -----
+
+// FR-79: a CONST STRUCT requirement is getter-only by construction -- a
+// const global has no stores, so the use-derived item list never grows a
+// setter -- and the rewrite is the SAME load-to-call: the whole-value load
+// becomes a result-bearing `E::<getter>()` whose Copy value binds exactly
+// where the load's flowed, and field projection stays untouched on the
+// bound temporary (the importer lowers `g.field` as load-then-member, so
+// there is nothing global-specific left to rewrite). The trait item type is
+// the struct BY VALUE.
+// CHECK-LABEL: emitrust.trait_def @Externals ["ip_addr_any"] [() -> !emitrust.struct<"ip_addr">]
+// CHECK-NOT:  set_ip_addr_any
+// CHECK:      emitrust.func @is_any
+// CHECK-SAME:   emitrust.externals_generic = "Externals"
+// CHECK:        %[[V:.*]] = emitrust.call_opaque "E::ip_addr_any"() : () -> !emitrust.struct<"ip_addr">
+// CHECK:        emitrust.assign %{{.*}} = %[[V]]
+// CHECK:        emitrust.member %{{.*}}["addr"]
+// CHECK-NOT:    emitrust.global_load
+// CHECK-NOT:  emitrust.global @ip_addr_any
+emitrust.struct_def @ip_addr ["addr", "kind"] [i32, i32]
+emitrust.func @is_any(%arg0: i32) -> i32 {
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"ip_addr">>
+  %1 = emitrust.global_load @ip_addr_any : !emitrust.struct<"ip_addr">
+  emitrust.assign %0 = %1 : !emitrust.lvalue<!emitrust.struct<"ip_addr">>
+  %2 = emitrust.member %0["addr"] : (!emitrust.lvalue<!emitrust.struct<"ip_addr">>) -> !emitrust.lvalue<i32>
+  %3 = emitrust.load %2 : (!emitrust.lvalue<i32>) -> i32
+  %4 = emitrust.cmp eq, %arg0, %3 : (i32, i32) -> i1
+  %5 = emitrust.cast %4 : i1 to i32
+  emitrust.return %5 : i32
+}
+emitrust.global const @ip_addr_any {emitrust.external_requirement} : !emitrust.struct<"ip_addr">

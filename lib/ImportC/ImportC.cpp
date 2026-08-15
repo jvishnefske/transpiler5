@@ -5812,19 +5812,25 @@ LogicalResult CImporter::finalizeProject() {
       // FR-70: under a trait policy, a scalar global whose every access is a
       // direct whole-value load or store is not an error but a REQUIREMENT —
       // storage the environment owns, read and written through a getter/
-      // setter pair on the Externals trait. Recorded exactly like the FR-57a
+      // setter pair on the Externals trait. FR-79 extends the admission to
+      // CONST STRUCT globals, getter-only. Recorded exactly like the FR-57a
       // branch above but with the FR-52 requirement marker;
       // `emitrust-lower-external-requirements` does the rewriting, and the
       // Rust emitter refuses a module still carrying the marker (a
       // declaration-only global would otherwise silently render DEFAULTED
-      // storage the C program never had).
+      // storage the C program never had). The C const fact is carried onto
+      // the op: a const-marked global structurally refuses stores (the
+      // dialect verifier), which is what makes getter-only an enforced
+      // contract rather than an accident of the observed uses.
       if (trait && isExternalRequirementGlobalShape(entry.getKey(),
-                                                    entry.getValue().type)) {
+                                                    entry.getValue().type,
+                                                    entry.getValue().isConst)) {
         OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
         auto reqOp = moduleBuilder.create<emitrust::GlobalOp>(
             entry.getValue().loc, moduleBuilder.getStringAttr(entry.getKey()),
             TypeAttr::get(entry.getValue().type), /*init=*/Attribute(),
-            /*is_const=*/UnitAttr());
+            /*is_const=*/entry.getValue().isConst ? moduleBuilder.getUnitAttr()
+                                                  : UnitAttr());
         reqOp->setAttr(emitrust::kExternalRequirementAttrName,
                        moduleBuilder.getUnitAttr());
         continue;
@@ -5952,16 +5958,28 @@ bool CImporter::classifyTimeTraitEligible() {
 }
 
 bool CImporter::isExternalRequirementGlobalShape(llvm::StringRef symbol,
-                                                 Type type) {
+                                                 Type type, bool isConst) {
   // Only a type the trait can faithfully pass BY VALUE qualifies: the
   // getter/setter pair copies a whole scalar in and out. Pointer-typed
-  // externs never reach the scalar pending map (`deferExternPointerGlobal`);
-  // aggregates keep the rejection — projections into environment-owned
-  // struct or array storage need PLACES, which no associated trait item
-  // yields, and admitting the whole-value copy alone would make the frontier
-  // depend on which accesses an optimization happened to leave.
-  if (!llvm::isa<IntegerType, FloatType>(type))
-    return false;
+  // externs never reach the scalar pending map (`deferExternPointerGlobal`).
+  // FR-79: a CONST struct qualifies too, GETTER-ONLY — imported structs are
+  // Copy, so the by-value return is a faithful read, and const-ness means
+  // no writer ever needs the setter whose by-value write could tear a
+  // multi-field invariant. The struct_def must be visible in the final
+  // module (a recovery mode can drop one); when it is not, the safe failure
+  // is the historical rejection. All other aggregates — non-const structs,
+  // arrays — keep the rejection: projections into environment-owned
+  // storage need PLACES, which no associated trait item yields, and
+  // admitting the whole-value copy alone would make the frontier depend on
+  // which accesses an optimization happened to leave.
+  if (!llvm::isa<IntegerType, FloatType>(type)) {
+    auto structType = llvm::dyn_cast<emitrust::StructType>(type);
+    if (!structType || !isConst)
+      return false;
+    if (!llvm::isa_and_nonnull<emitrust::StructDefOp>(
+            SymbolTable::lookupSymbolIn(module, structType.getName())))
+      return false;
+  }
   // Address-takenness is an AST fact, not an IR one: `&g` on an undefined
   // extern can leave NO surviving symbol use at all (the pointer plan
   // swallows the body it flowed into), so an IR-use scan alone would wrongly
