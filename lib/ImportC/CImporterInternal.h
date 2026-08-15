@@ -4660,6 +4660,23 @@ private:
                                 const clang::VarDecl *&chainRoot,
                                 SmallVectorImpl<const clang::FieldDecl *> &path);
 
+  /// The chain-root walk shared by `matchMemberArraySliceArg` (FR-74/86,
+  /// array-typed leaf) and the FR-90 member-ADDRESS interception
+  /// (struct-typed leaf, `&s->field` in `emitBorrowArgument`): validates
+  /// a dot/arrow projection chain against the admitted base forms — a
+  /// LOCAL struct place, an arrow root through a ref/mut_ref-struct
+  /// pointer parameter, or an arrow root through a DECOMPOSED
+  /// (null-compared) struct-pointer parameter's own self-based region
+  /// (slice-of-struct, or the owner method's array-of-struct data
+  /// place) — and fills `chainRoot`/`path` (outermost field first) on a
+  /// match. The LEAF is the caller's business: this walk only refuses
+  /// union arms, byte-region records, and unprovable bases, returning
+  /// false WITHOUT diagnosing so callers keep their historical verbatim
+  /// rejections.
+  bool matchMemberChainRoot(const clang::MemberExpr *member, bool isMutParam,
+                            const clang::VarDecl *&chainRoot,
+                            SmallVectorImpl<const clang::FieldDecl *> &path);
+
   /// The shared core of the FR-74/86 member-array interception, used by
   /// both the slice-ARGUMENT position (`emitBorrowArgument`) and —
   /// FR-87 — the hosted byte-family REGION position
