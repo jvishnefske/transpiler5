@@ -5840,6 +5840,28 @@ LogicalResult CImporter::finalizeProject() {
              << "' is referenced but not defined in any translation unit";
     }
 
+  // FR-80 backstop: an `emitrust.global_addr` was emitted optimistically —
+  // the importing TU saw an extern const struct with no definition SO FAR —
+  // but only a global the loop above just MARKED as a requirement gives it
+  // a meaning (the lowering rewrites it to the &'static getter). A
+  // definition in a later TU (or any other survivor) has no address model,
+  // so it keeps the historical located rejection, at the address-taking
+  // site the op's location preserves.
+  {
+    emitrust::GlobalAddrOp stray;
+    module.walk([&](emitrust::GlobalAddrOp addrOp) {
+      Operation *target =
+          SymbolTable::lookupSymbolIn(module, addrOp.getGlobalAttr());
+      if (target && target->hasAttr(emitrust::kExternalRequirementAttrName))
+        return WalkResult::advance();
+      stray = addrOp;
+      return WalkResult::interrupt();
+    });
+    if (stray)
+      return emitError(stray.getLoc())
+             << "unsupported: taking the address of a global variable";
+  }
+
   // No referenced non-variadic external function may remain body-less: the
   // Rust emitter cannot emit a body-less function. (Variadic prototypes such
   // as printf were never added to the module.) An external func whose symbol
@@ -5972,6 +5994,7 @@ bool CImporter::isExternalRequirementGlobalShape(llvm::StringRef symbol,
   // storage need PLACES, which no associated trait item yields, and
   // admitting the whole-value copy alone would make the frontier depend on
   // which accesses an optimization happened to leave.
+  bool constStruct = false;
   if (!llvm::isa<IntegerType, FloatType>(type)) {
     auto structType = llvm::dyn_cast<emitrust::StructType>(type);
     if (!structType || !isConst)
@@ -5979,6 +6002,7 @@ bool CImporter::isExternalRequirementGlobalShape(llvm::StringRef symbol,
     if (!llvm::isa_and_nonnull<emitrust::StructDefOp>(
             SymbolTable::lookupSymbolIn(module, structType.getName())))
       return false;
+    constStruct = true;
   }
   // Address-takenness is an AST fact, not an IR one: `&g` on an undefined
   // extern can leave NO surviving symbol use at all (the pointer plan
@@ -5986,18 +6010,32 @@ bool CImporter::isExternalRequirementGlobalShape(llvm::StringRef symbol,
   // qualify it. The whole-program pre-scan records the fact under exactly
   // this symbol key (`addressBoundGlobal` → `globalVarSymbolName`, the same
   // naming `pendingExternGlobals` is keyed by).
-  if (wholeProgram.addressTakenGlobals.contains(symbol))
+  //
+  // FR-80 makes this gate SHAPE-AWARE rather than absolute: a CONST STRUCT
+  // is exactly the type whose address the `fn g() -> &'static T` getter
+  // can now carry, so for it the decision falls to the surviving-use scan
+  // below (loads and global_addrs both rewrite against the one getter; a
+  // swallowed non-qualifying use has already rejected at its own site or
+  // been dropped by a recovery mode that reports it). Every other type
+  // keeps the absolute disqualifier: a by-value getter erases identity.
+  if (!constStruct && wholeProgram.addressTakenGlobals.contains(symbol))
     return false;
   // And every IR use that DID survive must be a direct whole-value load or
-  // store — the only two shapes `E::g()` / `E::set_g(v)` can express.
+  // store — the only shapes `E::g()` / `E::set_g(v)` can express — or, for
+  // the const struct, the FR-80 address anchor the lowering rewrites to
+  // the same getter.
   std::optional<SymbolTable::UseRange> uses = SymbolTable::getSymbolUses(
       StringAttr::get(module.getContext(), symbol), module.getOperation());
   if (!uses)
     return false;
-  for (SymbolTable::SymbolUse use : *uses)
-    if (!llvm::isa<emitrust::GlobalLoadOp, emitrust::GlobalStoreOp>(
+  for (SymbolTable::SymbolUse use : *uses) {
+    if (llvm::isa<emitrust::GlobalLoadOp, emitrust::GlobalStoreOp>(
             use.getUser()))
-      return false;
+      continue;
+    if (constStruct && llvm::isa<emitrust::GlobalAddrOp>(use.getUser()))
+      continue;
+    return false;
+  }
   return true;
 }
 

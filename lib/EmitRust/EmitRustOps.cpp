@@ -944,6 +944,36 @@ GlobalStoreOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
 }
 
 //===----------------------------------------------------------------------===//
+// GlobalAddrOp
+//===----------------------------------------------------------------------===//
+
+/// Verifies that the address references a `const` `emitrust.global` whose
+/// value type equals the shared reference's pointee. Const-ness is part of
+/// the op's own contract (not just the requirement pipeline's): a mutable
+/// global's storage is a thread-local `Cell`, which has no lendable `&T`,
+/// so a non-const target could never be given a faithful meaning.
+LogicalResult
+GlobalAddrOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  FailureOr<GlobalOp> global =
+      resolveGlobal(getOperation(), getGlobalAttr());
+  if (failed(global))
+    return failure();
+  if (!global->getIsConst())
+    return emitOpError("cannot take the address of the mutable global @")
+           << getGlobal();
+  auto refType = dyn_cast<RefType>(getResult().getType());
+  if (!refType)
+    return emitOpError("result must be a shared !emitrust.ref, but got ")
+           << getResult().getType();
+  Type pointee = refType.getPointee();
+  if (pointee != global->getType())
+    return emitOpError("result pointee type ")
+           << pointee << " does not match the value type "
+           << global->getType() << " of the global @" << getGlobal();
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // CellGetOp / CellSetOp
 //===----------------------------------------------------------------------===//
 

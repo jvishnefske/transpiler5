@@ -698,7 +698,8 @@ FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
 
 FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
                                         ParamKind kind,
-                                        clang::QualType voidByteElem) {
+                                        clang::QualType voidByteElem,
+                                        bool sharedConstRecord) {
   // C99-7: qualifiers on the parameter OBJECT itself are body-local and
   // never part of the function type (C11 6.7.6.3p15 composite rules;
   // `int x[volatile 5]` adjusts to `int * volatile x`, c-testsuite
@@ -864,6 +865,19 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     if (kind == ParamKind::ScalarRef && pointee.isConstQualified() &&
         isU8ScalarType(pointee))
       return Type(emitrust::RefType::get(*inner));
+    // FR-80: a body-less (prospective requirement) function's const-STRUCT
+    // pointee borrows shared too — the borrow shape the consumer-supplied
+    // `&'static T` requirement address can flow into. Same soundness
+    // rationale as the CTS-BR/FR-55 u8 rule above: `const T *` means the
+    // callee never writes through the pointer, and a write anyway is a
+    // constraint violation clang rejects. Gated by the SIGNATURE BUILDER
+    // (`requirementSharedConstStructParam`) so defined functions, bin
+    // crates, the ledgers, and defer mode keep their historical `&mut T`
+    // byte-for-byte.
+    if (kind == ParamKind::ScalarRef && sharedConstRecord &&
+        pointee.isConstQualified() &&
+        pointee.getCanonicalType()->isStructureType())
+      return Type(emitrust::RefType::get(*inner));
     return Type(emitrust::MutRefType::get(*inner));
   }
   // The stripped canonical keeps a top-level-volatile value parameter
@@ -926,6 +940,25 @@ FailureOr<Type> CImporter::mapStructFieldType(clang::QualType type,
       isSystemHeaderDecl(field))
     return Type(builder.getIntegerType(64));
   return mapType(type, loc);
+}
+
+bool CImporter::requirementSharedConstStructParam(
+    const clang::FunctionDecl *func, const clang::ParmVarDecl *param) {
+  // Body-less under a trait policy only: a definition's own body decides
+  // its shapes, and every non-trait mode keeps the historical `&mut T`.
+  const clang::FunctionDecl *definition = func->getDefinition();
+  if (definition && definition->hasBody())
+    return false;
+  if (func->isVariadic() || astContext().getLangOpts().CPlusPlus)
+    return false;
+  if (!classifyTimeTraitEligible())
+    return false;
+  clang::QualType type = param->getType();
+  if (!isDataPointer(type))
+    return false;
+  clang::QualType pointee = type.getCanonicalType()->getPointeeType();
+  return pointee.isConstQualified() &&
+         pointee.getCanonicalType()->isStructureType();
 }
 
 ArrayRef<ParamKind>

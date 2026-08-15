@@ -153,3 +153,50 @@ emitrust.func @is_any(%arg0: i32) -> i32 {
   emitrust.return %5 : i32
 }
 emitrust.global const @ip_addr_any {emitrust.external_requirement} : !emitrust.struct<"ip_addr">
+
+// -----
+
+// FR-80: an ADDRESS-CARRYING const-struct requirement. When any use of the
+// marked global is an `emitrust.global_addr`, the getter returns the
+// REFERENCE -- `() -> !emitrust.ref<T>`, rendered `fn g() -> &'static T` --
+// and every global_addr becomes the same result-bearing `E::<getter>()`
+// call, so pointer identity is the identity of the consumer's one static
+// item. A whole-value LOAD of the same global in the same module (the
+// MIXED shape) rewrites against the SAME ref getter: call, then
+// deref-and-load of the returned reference -- one image serves both, and
+// the trait never grows a second item for the same symbol.
+// CHECK-LABEL: emitrust.trait_def @Externals ["cfg"] [() -> !emitrust.ref<!emitrust.struct<"S">>]
+// CHECK:      emitrust.func @pass_addr
+// CHECK-SAME:   emitrust.externals_generic = "Externals"
+// CHECK:        %[[R:.*]] = emitrust.call_opaque "E::cfg"() : () -> !emitrust.ref<!emitrust.struct<"S">>
+// CHECK:        emitrust.call_opaque "take"(%[[R]]) : (!emitrust.ref<!emitrust.struct<"S">>) -> i32
+// CHECK:      emitrust.func @read_value
+// CHECK-SAME:   emitrust.externals_generic = "Externals"
+// CHECK:        %[[R2:.*]] = emitrust.call_opaque "E::cfg"() : () -> !emitrust.ref<!emitrust.struct<"S">>
+// CHECK:        %[[P:.*]] = emitrust.deref %[[R2]] : (!emitrust.ref<!emitrust.struct<"S">>) -> !emitrust.lvalue<!emitrust.struct<"S">>
+// CHECK:        %[[V:.*]] = emitrust.load %[[P]] : (!emitrust.lvalue<!emitrust.struct<"S">>) -> !emitrust.struct<"S">
+// CHECK:        emitrust.assign %{{.*}} = %[[V]]
+// CHECK-NOT:    emitrust.global_load
+// CHECK-NOT:    emitrust.global_addr
+// CHECK-NOT:  emitrust.global @cfg
+emitrust.struct_def @S ["x", "y"] [i32, i32]
+emitrust.func @take(%arg0: !emitrust.ref<!emitrust.struct<"S">>) -> i32 {
+  %0 = emitrust.deref %arg0 : (!emitrust.ref<!emitrust.struct<"S">>) -> !emitrust.lvalue<!emitrust.struct<"S">>
+  %1 = emitrust.member %0["x"] : (!emitrust.lvalue<!emitrust.struct<"S">>) -> !emitrust.lvalue<i32>
+  %2 = emitrust.load %1 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %2 : i32
+}
+emitrust.func @pass_addr() -> i32 {
+  %0 = emitrust.global_addr @cfg : !emitrust.ref<!emitrust.struct<"S">>
+  %1 = emitrust.call_opaque "take"(%0) : (!emitrust.ref<!emitrust.struct<"S">>) -> i32
+  emitrust.return %1 : i32
+}
+emitrust.func @read_value() -> i32 {
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.struct<"S">>
+  %1 = emitrust.global_load @cfg : !emitrust.struct<"S">
+  emitrust.assign %0 = %1 : !emitrust.lvalue<!emitrust.struct<"S">>
+  %2 = emitrust.member %0["y"] : (!emitrust.lvalue<!emitrust.struct<"S">>) -> !emitrust.lvalue<i32>
+  %3 = emitrust.load %2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %3 : i32
+}
+emitrust.global const @cfg {emitrust.external_requirement} : !emitrust.struct<"S">

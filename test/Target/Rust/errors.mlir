@@ -59,6 +59,24 @@ emitrust.global @g_config {emitrust.external_requirement} : i32
 
 // -----
 
+// FR-80 marker contract, the ADDRESS side: an `emitrust.global_addr` that
+// survives to emission was never rewritten to its `E::<getter>()` call --
+// either the lowering pass was skipped or (this case) the target is a
+// DEFINED const global, which was never a requirement, and whose address
+// has no supported Rust spelling (const statics render by value; nothing
+// lends a stable `&'static` to project code). There is no faithful
+// rendering, so the emitter refuses loudly, per the FR-52 extern_decl
+// contract. A marked-global module is already refused by the FR-70 walk
+// above; this backstop is what catches the marker-LESS survivor.
+emitrust.global const @lim <9 : i32> : i32
+emitrust.func @escapes() -> !emitrust.ref<i32> {
+  // CHECK: unlowered external-requirement address of 'lim': emitrust-lower-external-requirements must run before Rust emission
+  %0 = emitrust.global_addr @lim : !emitrust.ref<i32>
+  emitrust.return %0 : !emitrust.ref<i32>
+}
+
+// -----
+
 // FR-77 marker contract: a fn-ptr constant's `Some(<name>)` is OPAQUE text,
 // not a SymbolUse, so nothing structural stops a planner change from
 // emitting a module that spells out a function the module does not contain

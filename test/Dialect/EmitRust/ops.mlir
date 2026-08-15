@@ -401,6 +401,26 @@ emitrust.func @global_access() {
   emitrust.return
 }
 
+// FR-80: an address-carrying const-struct requirement. The declaration-only
+// marked global (FR-79's relaxation) round-trips with the const marker, and
+// `emitrust.global_addr` yields the shared reference the lowering pass
+// rewrites into the `fn g() -> &'static T` getter call.
+// CHECK: emitrust.global const @ext_cfg {emitrust.external_requirement} : !emitrust.struct<"Point">
+emitrust.global const @ext_cfg {emitrust.external_requirement} : !emitrust.struct<"Point">
+// A const global with an initializer takes an address too (the requirement
+// marker is not part of the op's own contract; unresolved survivors are
+// refused at emission).
+// CHECK: emitrust.global const @cfg_lim <9 : i32> : i32
+emitrust.global const @cfg_lim <9 : i32> : i32
+// CHECK-LABEL: emitrust.func @global_address
+emitrust.func @global_address() {
+  // CHECK: emitrust.global_addr @ext_cfg : !emitrust.ref<!emitrust.struct<"Point">>
+  %0 = emitrust.global_addr @ext_cfg : !emitrust.ref<!emitrust.struct<"Point">>
+  // CHECK: emitrust.global_addr @cfg_lim : !emitrust.ref<i32>
+  %1 = emitrust.global_addr @cfg_lim : !emitrust.ref<i32>
+  emitrust.return
+}
+
 // CHECK-LABEL: emitrust.func @slice_places
 emitrust.func @slice_places(%arg0: !emitrust.mut_ref<!emitrust.slice<i32>>, %arg1: i64, %arg2: index) {
   // CHECK: emitrust.deref %{{.*}} : (!emitrust.mut_ref<!emitrust.slice<i32>>) -> !emitrust.lvalue<!emitrust.slice<i32>>
