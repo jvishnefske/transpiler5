@@ -698,6 +698,16 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
       call->getArg(0), /*isMut=*/true, /*interceptMember=*/true);
   if (failed(dst))
     return failure();
+  // FR-93: a MULTI-BASE pointer source (the aes tail
+  // `memcpy(ctx->Iv, Iv, 16)`) has no single region to borrow; the copy
+  // dispatches per source base instead. Intercepted BEFORE the source's
+  // region resolution, whose pointer channel rejects any multi-base
+  // read.
+  if (const clang::VarDecl *multiSrc =
+          astContext().getLangOpts().CPlusPlus
+              ? nullptr
+              : asMultiBasePointerRead(call->getArg(1)))
+    return emitMultiBaseMemcpy(call, name, *dst, multiSrc, loc);
   FailureOr<CharRegionArg> src = emitByteRegionArg(
       call->getArg(1), /*isMut=*/false, /*interceptMember=*/true);
   if (failed(src))
@@ -831,6 +841,109 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
       loc, TypeRange(), builder.getStringAttr(helper),
       /*args=*/ArrayAttr(), ValueRange{*dstSlice, *srcSlice, count});
   return success();
+}
+
+LogicalResult CImporter::emitMultiBaseMemcpy(const clang::CallExpr *call,
+                                             llvm::StringRef name,
+                                             const CharRegionArg &dst,
+                                             const clang::VarDecl *srcVar,
+                                             Location loc) {
+  Type ui8Type =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  // Only the u8 member/window destination shape is admitted this wave;
+  // everything else keeps the located multi-base rejection the pointer
+  // channel would have raised.
+  if (!dst.isMember() || dst.memberElement != ui8Type)
+    return emitError(loc) << "unsupported: passing a pointer bound to "
+                             "multiple objects to a string function";
+  FailureOr<Value> n = emitRValue(call->getArg(2));
+  if (failed(n))
+    return failure();
+  if (!llvm::isa<IntegerType>((*n).getType()))
+    return emitError(loc) << "unsupported: " << name << " count type";
+  Value count = castToIntType(loc, *n, builder.getIntegerType(64));
+  const PointerLocalInfo &info = pointerLocals.find(srcVar)->second;
+  Value discriminant = loadPlace(loc, info.baseIndexCell);
+  Value srcCursor =
+      info.cursorCell
+          ? loadPlace(loc, info.cursorCell)
+          : createIntConstant(loc, builder.getIntegerType(64), 0);
+  auto sliceUi8 = emitrust::SliceType::get(ui8Type);
+  return emitMultiBaseDispatch(
+      loc, info.multiBases, discriminant,
+      [&](const PointerBaseKey &armBase) -> LogicalResult {
+        if (armBase.member)
+          return emitError(loc)
+                 << "unsupported: passing a pointer bound to multiple "
+                    "objects to a string function";
+        if (armBase.var == dst.memberRoot) {
+          // Same-root arm. Only the WINDOW destination (empty path:
+          // absolute byte cursors over ONE region place) has a provable
+          // relation to the source cursor; it rides the whole-region
+          // copy_within image — memmove semantics, refining C's
+          // undefined overlapping (and exact-overlap self-) memcpy.
+          if (!dst.memberPath.empty())
+            return emitError(loc)
+                   << "unsupported: " << name
+                   << " source and destination point into the same "
+                      "object '"
+                   << dst.memberRoot->getName() << "'";
+          Value zero =
+              createIntConstant(loc, builder.getIntegerType(64), 0);
+          Value slice = builder
+                            .create<emitrust::SliceOfOp>(
+                                loc, emitrust::MutRefType::get(sliceUi8),
+                                dst.memberPlace, zero,
+                                /*is_mut=*/true)
+                            .getResult();
+          requestStringHelper("__emitrust_memcpy_within_u8");
+          builder.create<emitrust::CallOpaqueOp>(
+              loc, TypeRange(),
+              builder.getStringAttr("__emitrust_memcpy_within_u8"),
+              /*args=*/ArrayAttr(),
+              ValueRange{slice, dst.memberCursor, srcCursor, count});
+          return success();
+        }
+        // Cross-root arm: two disjoint regions, two slices.
+        auto it = symbols.find(armBase.var);
+        if (it == symbols.end())
+          return emitError(loc) << "unsupported: pointer target '"
+                                << armBase.var->getName()
+                                << "' is not an importable place";
+        auto lvalueType =
+            llvm::dyn_cast<emitrust::LValueType>(it->second.getType());
+        Type elementType;
+        if (lvalueType) {
+          if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(
+                  lvalueType.getValueType()))
+            elementType = arrayType.getElementType();
+          else if (auto sliceType = llvm::dyn_cast<emitrust::SliceType>(
+                       lvalueType.getValueType()))
+            elementType = sliceType.getElementType();
+        }
+        if (elementType != ui8Type)
+          return emitError(loc)
+                 << "unsupported: " << name
+                 << " arguments mix char and unsigned char regions";
+        Value dstSlice = builder
+                             .create<emitrust::SliceOfOp>(
+                                 loc, emitrust::MutRefType::get(sliceUi8),
+                                 dst.memberPlace, dst.memberCursor,
+                                 /*is_mut=*/true)
+                             .getResult();
+        Value srcSlice = builder
+                             .create<emitrust::SliceOfOp>(
+                                 loc, emitrust::RefType::get(sliceUi8),
+                                 it->second, srcCursor,
+                                 /*is_mut=*/false)
+                             .getResult();
+        requestStringHelper("__emitrust_memcpy_u8");
+        builder.create<emitrust::CallOpaqueOp>(
+            loc, TypeRange(),
+            builder.getStringAttr("__emitrust_memcpy_u8"),
+            /*args=*/ArrayAttr(), ValueRange{dstSlice, srcSlice, count});
+        return success();
+      });
 }
 
 FailureOr<Value>
