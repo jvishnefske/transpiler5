@@ -1938,6 +1938,366 @@ void CImporter::planVecLift(const clang::TranslationUnitDecl *unit) {
   }
 }
 
+void CImporter::planFamLift(const clang::TranslationUnitDecl *unit) {
+  // FR-94: pure-AST recognition of the allocation-backed FAM-tail shapes.
+  // C path only — the C++ importer keeps every historical FAM rejection.
+  clang::ASTContext &ctx = astContext();
+  if (ctx.getLangOpts().CPlusPlus)
+    return;
+  SmallVector<const clang::FunctionDecl *> funcs =
+      collectPassAFunctionDefinitions(unit);
+
+  // The admitted FAM record behind a data-pointer type, or null.
+  auto famPointee =
+      [&](clang::QualType type) -> const clang::RecordDecl * {
+    if (!isDataPointer(type))
+      return nullptr;
+    const clang::RecordDecl *record =
+        type.getCanonicalType()->getPointeeType()->getAsRecordDecl();
+    return record && famTailField(record) ? record : nullptr;
+  };
+
+  // The (possibly cast-wrapped) plain read of a local variable a null test
+  // names: `hsd == NULL` converts `hsd` to `void *` via an implicit BitCast,
+  // which `asLoadedLocalVarRef` alone does not peel.
+  auto loadedLocal = [&](const clang::Expr *expr) -> const clang::VarDecl * {
+    const clang::Expr *e = stripTrivia(expr);
+    while (true) {
+      if (const clang::Expr *sub = peelPointerCast(ctx, e)) {
+        e = stripTrivia(sub);
+        continue;
+      }
+      if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+          cast && (cast->getCastKind() == clang::CK_LValueToRValue ||
+                   cast->getCastKind() == clang::CK_NoOp ||
+                   cast->getCastKind() == clang::CK_BitCast)) {
+        e = stripTrivia(cast->getSubExpr());
+        continue;
+      }
+      break;
+    }
+    return asLocalVarRef(e);
+  };
+
+  // A malloc-failure null test of `var`: `!var`, `var == NULL`, `NULL == var`.
+  auto isNullTestOf = [&](const clang::Expr *cond,
+                          const clang::VarDecl *var) {
+    const clang::Expr *e = stripTrivia(cond);
+    if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e);
+        unary && unary->getOpcode() == clang::UO_LNot)
+      return loadedLocal(unary->getSubExpr()) == var;
+    const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e);
+    if (!binary || binary->getOpcode() != clang::BO_EQ)
+      return false;
+    auto isNull = [&](const clang::Expr *side) {
+      return side->isNullPointerConstant(
+                 ctx, clang::Expr::NPC_NeverValueDependent) !=
+             clang::Expr::NPCK_NotNull;
+    };
+    if (isNull(binary->getRHS()))
+      return loadedLocal(binary->getLHS()) == var;
+    if (isNull(binary->getLHS()))
+      return loadedLocal(binary->getRHS()) == var;
+    return false;
+  };
+
+  // The claims chain (an allocator's callers claim locals bound to its
+  // calls, which may make THEIR functions allocators), so iterate to a
+  // fixpoint; each arm is idempotent.
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const clang::FunctionDecl *func : funcs) {
+      const clang::Stmt *body = func->getBody();
+      if (!body)
+        continue;
+
+      // (a) Direct-malloc locals: `S *d = malloc(sizeof(S) + n)` over an
+      // admitted record. The count side must be non-negative (unsigned or
+      // a foldable non-negative constant — CONSTANT tails are admitted
+      // here, replacing the historical over-counted struct-array backing),
+      // side-effect free, and stable (every variable it reads unwritten in
+      // the function), so evaluating it once at the decl site — exactly
+      // where malloc evaluates it — yields the tail's extent.
+      // (b) Owned-return call locals: `S *d = alloc_fn(...)` over a
+      // recognized allocator (a later fixpoint round may add the callee).
+      std::function<void(const clang::Stmt *)> claimLocals =
+          [&](const clang::Stmt *s) {
+            if (!s)
+              return;
+            if (const auto *ds = llvm::dyn_cast<clang::DeclStmt>(s))
+              for (const clang::Decl *decl : ds->decls()) {
+                const auto *var = llvm::dyn_cast<clang::VarDecl>(decl);
+                if (!var || !var->hasLocalStorage() ||
+                    llvm::isa<clang::ParmVarDecl>(var) || !var->getInit() ||
+                    famAllocLocals.contains(var))
+                  continue;
+                const clang::RecordDecl *record = famPointee(var->getType());
+                if (!record)
+                  continue;
+                if (const clang::CallExpr *alloc =
+                        asAllocCall(var->getInit())) {
+                  if (alloc->getDirectCallee()->getName() != "malloc" ||
+                      alloc->getNumArgs() != 1)
+                    continue;
+                  // The size may route through a never-rewritten local
+                  // (`size_t sz = sizeof(S) + n; malloc(sz)` — heatshrink's
+                  // spelling); resolve it to its initializer.
+                  const clang::Expr *sizeExpr =
+                      peelToCore(alloc->getArg(0));
+                  if (const auto *szRef =
+                          llvm::dyn_cast<clang::DeclRefExpr>(sizeExpr))
+                    if (const auto *szVar = llvm::dyn_cast<clang::VarDecl>(
+                            szRef->getDecl());
+                        szVar && szVar->hasLocalStorage() &&
+                        !llvm::isa<clang::ParmVarDecl>(szVar) &&
+                        szVar->getInit() && !mutatesVar(body, szVar))
+                      sizeExpr = peelToCore(szVar->getInit());
+                  const auto *sum =
+                      llvm::dyn_cast<clang::BinaryOperator>(sizeExpr);
+                  if (!sum || sum->getOpcode() != clang::BO_Add)
+                    continue;
+                  uint64_t recordBytes = static_cast<uint64_t>(
+                      ctx.getTypeSizeInChars(ctx.getRecordType(record))
+                          .getQuantity());
+                  auto foldsToRecord = [&](const clang::Expr *e) {
+                    std::optional<llvm::APSInt> k = constInt(ctx, e);
+                    return k && !k->isNegative() &&
+                           k->getZExtValue() == recordBytes;
+                  };
+                  const clang::Expr *countExpr = nullptr;
+                  if (foldsToRecord(sum->getLHS()))
+                    countExpr = sum->getRHS();
+                  else if (foldsToRecord(sum->getRHS()))
+                    countExpr = sum->getLHS();
+                  if (!countExpr || countExpr->HasSideEffects(ctx))
+                    continue;
+                  std::optional<llvm::APSInt> constCount =
+                      constInt(ctx, countExpr);
+                  if (constCount ? constCount->isNegative()
+                                 : !peelToCore(countExpr)
+                                        ->getType()
+                                        ->isUnsignedIntegerType())
+                    continue;
+                  llvm::SmallPtrSet<const clang::VarDecl *, 8> countVars;
+                  collectVars(countExpr, countVars);
+                  bool countStable = true;
+                  for (const clang::VarDecl *v : countVars)
+                    if (mutatesVar(body, v)) {
+                      countStable = false;
+                      break;
+                    }
+                  if (!countStable)
+                    continue;
+                  FamAllocFacts facts;
+                  facts.countExpr = countExpr;
+                  famAllocLocals[var] = facts;
+                  changed = true;
+                  continue;
+                }
+                // Owned-return call form.
+                const clang::Expr *init = stripTrivia(var->getInit());
+                while (const clang::Expr *sub =
+                           peelPointerCast(ctx, init))
+                  init = stripTrivia(sub);
+                const auto *call = llvm::dyn_cast<clang::CallExpr>(init);
+                const clang::FunctionDecl *callee =
+                    call ? call->getDirectCallee() : nullptr;
+                if (!callee ||
+                    !famOwnedReturnFns.contains(callee->getCanonicalDecl()))
+                  continue;
+                // The callee's record must be the local's own pointee.
+                if (famPointee(callee->getReturnType()) != record)
+                  continue;
+                FamAllocFacts facts;
+                facts.initCall = call;
+                famAllocLocals[var] = facts;
+                changed = true;
+              }
+            for (const clang::Stmt *child : s->children())
+              claimLocals(child);
+          };
+      claimLocals(body);
+
+      // Elide the claimed locals' malloc-failure guards (`if (!d) ...`, no
+      // else): `vec!` is infallible (the FR-65 precedent), so the guard
+      // body — typically `return NULL`, which has no owned-return
+      // representation — is unreachable in the emitted crate.
+      SmallVector<const clang::Stmt *, 4> elidedHere;
+      std::function<void(const clang::Stmt *)> elideGuards =
+          [&](const clang::Stmt *s) {
+            if (!s)
+              return;
+            if (const auto *ifStmt = llvm::dyn_cast<clang::IfStmt>(s);
+                ifStmt && !ifStmt->getElse() && !ifStmt->getInit() &&
+                !ifStmt->getConditionVariable()) {
+              const clang::VarDecl *guarded = nullptr;
+              for (const auto &entry : famAllocLocals)
+                if (isNullTestOf(ifStmt->getCond(), entry.first)) {
+                  guarded = entry.first;
+                  break;
+                }
+              if (guarded) {
+                elidedHere.push_back(ifStmt);
+                if (famElidedStmts.insert(ifStmt).second)
+                  changed = true;
+                return; // Nothing inside the elided guard emits.
+              }
+            }
+            for (const clang::Stmt *child : s->children())
+              elideGuards(child);
+          };
+      elideGuards(body);
+
+      // (c) Free-only wrapper parameters: every use of a
+      // pointer-to-admitted-record parameter is `free(param)` or an
+      // arrow-member READ (heatshrink_decoder_free computes the byte size
+      // from `hsd->window_sz2`/`hsd->input_buffer_size` before freeing —
+      // reads of the owned value before its drop). A member WRITE through
+      // the parameter would mutate the wrapper's own copy where C mutates
+      // the caller's object, so any write use declines the wrapper.
+      for (const clang::ParmVarDecl *param : func->parameters()) {
+        if (famOwnedParams.contains(param) || !famPointee(param->getType()))
+          continue;
+        llvm::SmallVector<const clang::DeclRefExpr *, 4> refs;
+        collectVarRefs(body, param, refs);
+        if (refs.empty())
+          continue;
+        auto refOf =
+            [&](const clang::Expr *expr) -> const clang::DeclRefExpr * {
+          const clang::Expr *e = stripTrivia(expr);
+          while (true) {
+            if (const clang::Expr *sub = peelPointerCast(ctx, e)) {
+              e = stripTrivia(sub);
+              continue;
+            }
+            if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+                cast && (cast->getCastKind() == clang::CK_LValueToRValue ||
+                         cast->getCastKind() == clang::CK_NoOp ||
+                         cast->getCastKind() == clang::CK_BitCast)) {
+              e = stripTrivia(cast->getSubExpr());
+              continue;
+            }
+            break;
+          }
+          return llvm::dyn_cast<clang::DeclRefExpr>(e);
+        };
+        llvm::SmallPtrSet<const clang::DeclRefExpr *, 8> allowed;
+        bool sawFree = false;
+        llvm::SmallVector<const clang::CallExpr *, 8> calls;
+        collectCallExprs(body, calls);
+        for (const clang::CallExpr *call : calls) {
+          const clang::FunctionDecl *fn = call->getDirectCallee();
+          if (!fn || fn->hasBody() || !fn->getIdentifier() ||
+              fn->getName() != "free" || call->getNumArgs() != 1)
+            continue;
+          if (const clang::DeclRefExpr *ref = refOf(call->getArg(0)))
+            if (ref->getDecl()->getCanonicalDecl() ==
+                param->getCanonicalDecl()) {
+              allowed.insert(ref);
+              sawFree = true;
+            }
+        }
+        // Arrow-member READ bases join the allowed set...
+        std::function<void(const clang::Stmt *)> collectMemberBases =
+            [&](const clang::Stmt *s) {
+              if (!s)
+                return;
+              if (const auto *memberExpr =
+                      llvm::dyn_cast<clang::MemberExpr>(s);
+                  memberExpr && memberExpr->isArrow())
+                if (const clang::DeclRefExpr *ref =
+                        refOf(memberExpr->getBase()))
+                  if (ref->getDecl()->getCanonicalDecl() ==
+                      param->getCanonicalDecl())
+                    allowed.insert(ref);
+              for (const clang::Stmt *child : s->children())
+                collectMemberBases(child);
+            };
+        collectMemberBases(body);
+        // ...and any ref under a WRITE target (assignment LHS, ++/--)
+        // leaves the allowed set again (over-approximate: an index read
+        // inside a write target also declines — conservative).
+        std::function<void(const clang::Stmt *, bool)> dropWriteRefs =
+            [&](const clang::Stmt *s, bool inWriteTarget) {
+              if (!s)
+                return;
+              if (inWriteTarget)
+                if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(s);
+                    ref && ref->getDecl()->getCanonicalDecl() ==
+                               param->getCanonicalDecl())
+                  allowed.erase(ref);
+              const clang::Stmt *writeChild = nullptr;
+              if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(s);
+                  bo && bo->isAssignmentOp())
+                writeChild = bo->getLHS();
+              else if (const auto *uo =
+                           llvm::dyn_cast<clang::UnaryOperator>(s);
+                       uo && uo->isIncrementDecrementOp())
+                writeChild = uo->getSubExpr();
+              for (const clang::Stmt *child : s->children())
+                dropWriteRefs(child,
+                              inWriteTarget || child == writeChild);
+            };
+        dropWriteRefs(body, false);
+        bool onlyFreedOrRead = llvm::all_of(
+            refs, [&](const clang::DeclRefExpr *ref) {
+              return allowed.contains(ref);
+            });
+        if (sawFree && onlyFreedOrRead) {
+          famOwnedParams.insert(param);
+          changed = true;
+        }
+      }
+
+      // (d) Owned-return classification: every return site yields a
+      // claimed local (or an elided-guard NULL), with at least one claimed
+      // local actually returned.
+      const clang::FunctionDecl *canonical = func->getCanonicalDecl();
+      if (!famOwnedReturnFns.contains(canonical) &&
+          famPointee(func->getReturnType())) {
+        SmallVector<const clang::ReturnStmt *> returns;
+        collectReturnStmts(body, returns);
+        bool sawOwned = false;
+        bool allPinned = !returns.empty();
+        for (const clang::ReturnStmt *ret : returns) {
+          const clang::Expr *value = ret->getRetValue();
+          if (!value) {
+            allPinned = false;
+            break;
+          }
+          if (value->isNullPointerConstant(
+                  ctx, clang::Expr::NPC_NeverValueDependent) !=
+              clang::Expr::NPCK_NotNull) {
+            // A NULL return is admissible only inside an ELIDED guard
+            // (it never emits); anywhere else the function keeps its
+            // historical returned-pointer rejection.
+            bool insideElided =
+                llvm::any_of(elidedHere, [&](const clang::Stmt *s) {
+                  return stmtContains(s, ret);
+                });
+            if (!insideElided) {
+              allPinned = false;
+              break;
+            }
+            continue;
+          }
+          const clang::VarDecl *returned = asLoadedLocalVarRef(value);
+          if (!returned || !famAllocLocals.contains(returned)) {
+            allPinned = false;
+            break;
+          }
+          sawOwned = true;
+        }
+        if (allPinned && sawOwned) {
+          famOwnedReturnFns.insert(canonical);
+          changed = true;
+        }
+      }
+    }
+  }
+}
+
 void CImporter::collectCellSliceCallFacts(clang::ASTContext &context) {
   astContextPtr = &context;
   const clang::TranslationUnitDecl *unit = context.getTranslationUnitDecl();

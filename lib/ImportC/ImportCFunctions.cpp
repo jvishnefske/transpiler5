@@ -638,6 +638,18 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   pointerRegions.vecValueLocalQuery = [this](const clang::VarDecl *var) {
     return vecValueLocals.contains(var);
   };
+  // FR-94: FAM-record owned-tail locals bypass the region model entirely
+  // (the owned struct binding replaces the decomposition), and the
+  // `&d->tail[k]` binding arm gates on the admitted FAM leaf.
+  pointerRegions.famValueLocalQuery = [this](const clang::VarDecl *var) {
+    return famAllocLocals.contains(var);
+  };
+  pointerRegions.famTailMemberQuery =
+      [this](const clang::MemberExpr *member) {
+        const auto *leaf =
+            llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+        return leaf && famTailField(leaf->getParent()) == leaf;
+      };
   // FR-93: member-array decays bound to pointer locals classify through
   // the shared admission (typed member-place backings and byte-region
   // window roots); the classifier itself gates the C++ path off.
@@ -1443,6 +1455,17 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   pointerRegions.vecValueLocalQuery = [this](const clang::VarDecl *var) {
     return vecValueLocals.contains(var);
   };
+  // FR-94: same owned-tail bypass and FAM-leaf gate as the non-clone
+  // prologue above.
+  pointerRegions.famValueLocalQuery = [this](const clang::VarDecl *var) {
+    return famAllocLocals.contains(var);
+  };
+  pointerRegions.famTailMemberQuery =
+      [this](const clang::MemberExpr *member) {
+        const auto *leaf =
+            llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+        return leaf && famTailField(leaf->getParent()) == leaf;
+      };
   // FR-93: same member-array decay classification as the non-clone
   // prologue above.
   pointerRegions.memberArrayDecayQuery =
@@ -1730,6 +1753,13 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // pointer-region emission passes consult `vecValueLocals` via
   // `vecValueLocalQuery`.
   planVecLift(unit);
+  // FR-94: pure-AST recognition of FAM-record owned-tail locals, owned-return
+  // allocators, and free-only wrapper parameters. Runs after `planVecLift`
+  // (its record-pointee candidates are disjoint from the scalar-buffer arms
+  // above, but the arms stay strictly ordered) and before any signature is
+  // built (`classifyPointerReturn`/`classifyPointerParams` consult the
+  // owned-return and owned-parameter sets).
+  planFamLift(unit);
   // CTS-P10 Pass A: cell-slice classification of pointer-parameter
   // classes whose bases are all mutable global arrays.
   planCellSlices(unit, soleTranslationUnit);

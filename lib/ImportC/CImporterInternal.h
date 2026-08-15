@@ -550,7 +550,19 @@ struct CharRegionArg {
 /// pointer constant, null tests lower to `is_some`/`is_none` method
 /// calls, and each guarded region use unwraps to the shared byte slice
 /// at the use site.
-enum class ParamKind { ScalarRef, Slice, CellSlice, Carrier, Nullable };
+enum class ParamKind {
+  ScalarRef,
+  Slice,
+  CellSlice,
+  Carrier,
+  Nullable,
+  /// FR-94: a pointer-to-FAM-record parameter whose EVERY body use is
+  /// `free(param)` (the free-only wrapper, heatshrink_decoder_free's shape)
+  /// takes the record OWNED BY VALUE — dropping the parameter is the
+  /// deallocation, and a caller's use-after-free becomes rustc E0382 (the
+  /// loud direction) because the argument MOVES in.
+  OwnedRecord,
+};
 
 /// Why a pointer-parameter class with global bases does NOT lower to a
 /// cell-slice (CTS-P10 boundaries), keyed by the global base so the
@@ -812,6 +824,25 @@ struct VecFacts {
   /// imported as an i64 rvalue at the decl site and widened to `usize` for
   /// `vec![_; n]`. Non-negative and side-effect free.
   const clang::Expr *countExpr = nullptr;
+};
+
+/// FR-94: the recognized facts of a flexible-array-member record local with
+/// an allocation-backed tail. `S *d = malloc(sizeof(S) + n)` (S an ADMITTED
+/// FAM record: gap-free layout, u8 tail leaf — see `famTailField`) binds an
+/// OWNED struct local whose trailing `Vec<u8>` field is `vec![0u8; n]`; the
+/// alternative source is a call to a recognized owned-return allocator
+/// (`S *d = alloc_fn(...)`), which binds the call's by-value result. The
+/// malloc-failure null guard (`if (!d) ...`, no else) is elided — `vec!` is
+/// infallible, the FR-65 precedent — and `free(d)` is a no-op drop.
+struct FamAllocFacts {
+  /// The tail element-count expression `n` (the non-sizeof side of the
+  /// `sizeof(S) + n` malloc argument); null for the owned-return call form.
+  /// Non-negative (unsigned or a foldable non-negative constant) and
+  /// side-effect free; every variable it reads is unwritten in the function.
+  const clang::Expr *countExpr = nullptr;
+  /// The owned-return allocator call the local binds (`S *d = alloc_fn(...)`),
+  /// or null for the direct-malloc form.
+  const clang::CallExpr *initCall = nullptr;
 };
 
 /// Registry of the synthesized backing declarations for block-scope
@@ -1126,6 +1157,21 @@ public:
   /// (`recordAllocBase`'s const-size gate is skipped). Left unset, the local
   /// keeps its historical region tracking and its located rejection.
   std::function<bool(const clang::VarDecl *)> vecValueLocalQuery;
+
+  /// FR-94: optional query telling the walk whether a local `S *` declaration
+  /// is a recognized FAM-record owned-tail local: its `malloc(sizeof(S) + n)`
+  /// (or owned-return call) binding lifts to an owned struct local with a
+  /// `Vec<u8>` tail, so the pointer-region model must NOT claim it
+  /// (`recordAllocBase`'s FAM rejection is skipped). Left unset, the local
+  /// keeps its historical region tracking and located rejections.
+  std::function<bool(const clang::VarDecl *)> famValueLocalQuery;
+
+  /// FR-94: optional query telling the walk whether a member expression's
+  /// leaf is an ADMITTED FAM tail (`famTailField(parent) == leaf`), used to
+  /// gate the `&d->tail[k]` pointer-local binding arm — constant-extent
+  /// member arrays must NOT newly admit that spelling (the FR-93 frontier
+  /// stays pinned). Left unset, the arm never fires.
+  std::function<bool(const clang::MemberExpr *)> famTailMemberQuery;
 
   /// The importer-owned registry of synthesized compound-literal backing
   /// declarations (C99-13): a decayed or address-taken block-scope
@@ -2108,6 +2154,40 @@ private:
   /// decomposition. Called from `emitLocalVar` when `vecValueLocals` holds
   /// `var`.
   LogicalResult emitVecLocal(const clang::VarDecl *var, Location loc);
+
+  /// FR-94: returns the ADMITTED flexible-array-member tail field of `record`
+  /// (the field that grows an owned `Vec<u8>` struct member), or null when the
+  /// record is outside the admission. Admitted: a C-path struct (never a
+  /// union, never byte-region — those keep their flat-image model and pins)
+  /// whose LAST field is an incomplete `unsigned char` array sitting exactly
+  /// at sizeof (gap-free layout, offsetof(tail) == sizeof(S)): a padding-gap
+  /// layout lets C legally index the tail below sizeof, which the tail-only
+  /// Vec cannot represent, so it stays on the historical FAM rejections.
+  /// Cached per record definition.
+  const clang::FieldDecl *famTailField(const clang::RecordDecl *record);
+
+  /// FR-94: pure-AST recognition of FAM-record owned-tail locals, owned-return
+  /// allocators, and free-only wrapper parameters. For every function
+  /// definition it scans (a) each local `S *d = malloc(sizeof(S) + n)` over an
+  /// admitted record (recording `FamAllocFacts` into `famAllocLocals` and the
+  /// local's `if (!d) ...` null guards into `famElidedStmts`); (b) each
+  /// pointer-to-admitted-record parameter whose every use is `free(param)`
+  /// (into `famOwnedParams`); then, to a fixpoint, (c) functions whose every
+  /// return site yields a claimed local (or an elided-guard NULL), which lift
+  /// to OWNED struct returns (`famOwnedReturnFns`), and (d) locals bound to
+  /// calls of those allocators, which claim `FamAllocFacts` with `initCall`.
+  /// Runs alongside the other Pass-A planners, after `planVecLift`. Emits no
+  /// diagnostic and never fails: an unclaimed shape keeps its historical
+  /// located rejections.
+  void planFamLift(const clang::TranslationUnitDecl *unit);
+
+  /// FR-94: emits the owned struct local for a recognized FAM-record
+  /// owned-tail local — `let d: S = S { tail: vec![0u8; n], ..S::default() }`
+  /// for the direct-malloc form (a struct variable whose tail member binds an
+  /// `emitrust.vec_fill`; the translator fuses the member assign into the
+  /// struct-literal init), or the by-value call result for the owned-return
+  /// form. Called from `emitLocalVar` when `famAllocLocals` holds `var`.
+  LogicalResult emitFamLocal(const clang::VarDecl *var, Location loc);
 
   /// W2.12: matches the ONE recognized `std::string_view` local
   /// initializer chain — `ImplicitCastExpr<ConstructorConversion>` over
@@ -5862,6 +5942,31 @@ private:
   /// companion elided-statement set: the `a[i] = x` writes are kept as real
   /// `Vec` index writes.
   llvm::DenseMap<const clang::VarDecl *, VecFacts> vecValueLocals;
+  /// FR-94: every `S *` local lifted to an OWNED FAM-record struct local with
+  /// a `Vec<u8>` tail, keyed by its declaration. Consulted at `emitLocalVar`
+  /// (to build the owned binding), at `emitPointerRValue` (the degenerate
+  /// whole-object decomposition that routes `d->f`, borrows, and null-test
+  /// folds through the existing machinery), in the `free` handler (a no-op
+  /// drop), at `emitReturnStmt`/`emitCall` (owned moves), and by
+  /// `famValueLocalQuery` (to skip the pointer-region model).
+  llvm::DenseMap<const clang::VarDecl *, FamAllocFacts> famAllocLocals;
+  /// FR-94: the `if (!d) ...` malloc-failure guards of claimed owned-tail
+  /// locals, elided at `emitStmt` — `vec!` is infallible (the FR-65
+  /// precedent), so the guard body (typically `return NULL`) is unreachable
+  /// in the emitted crate and has no owned-return representation.
+  llvm::DenseSet<const clang::Stmt *> famElidedStmts;
+  /// FR-94: functions returning a pointer to an admitted FAM record whose
+  /// every return site yields a claimed owned-tail local — their signatures
+  /// lift to OWNED struct returns (keyed by canonical decl).
+  llvm::DenseSet<const clang::FunctionDecl *> famOwnedReturnFns;
+  /// FR-94: pointer-to-admitted-FAM-record parameters whose every body use is
+  /// `free(param)` — the free-only wrapper shape; they map OWNED BY VALUE
+  /// (`ParamKind::OwnedRecord`) and their `free` is a no-op drop.
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> famOwnedParams;
+  /// FR-94: the per-definition admission cache of `famTailField` (null =
+  /// probed and declined).
+  llvm::DenseMap<const clang::RecordDecl *, const clang::FieldDecl *>
+      famTailFieldCache;
   /// Self-referential node-pool fields (`next`) that render as the nullable
   /// pool index `Option<usize>` (W4.2e Part B); the emission diverts their
   /// struct-field type and read/write lowering.

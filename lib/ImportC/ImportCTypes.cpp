@@ -817,6 +817,11 @@ FailureOr<Type> CImporter::mapParamType(clang::QualType type, Location loc,
     if (pointee.getCanonicalType()->isPointerType() &&
         !pointee.getCanonicalType()->isFunctionPointerType())
       return emitError(loc) << "unsupported: pointer-to-pointer parameter";
+    // FR-94: the free-only wrapper's FAM-record parameter takes the record
+    // OWNED BY VALUE (dropping it is the deallocation); the caller's
+    // argument MOVES in, so a use-after-free is rustc E0382, never silent.
+    if (kind == ParamKind::OwnedRecord)
+      return mapType(pointee, loc);
     // CTS-BR (00216): a pointer to a byte-region aggregate is a byte
     // slice parameter regardless of the body-usage classification —
     // member reads through it are region reads at constant byte offsets
@@ -1139,6 +1144,14 @@ CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
         kinds[index] = ParamKind::Slice;
     }
   }
+  // FR-94: the free-only wrapper's FAM-record parameters (planFamLift's
+  // `famOwnedParams`) override to OWNED BY VALUE — checked last so no other
+  // classification can claim them first.
+  if (const clang::FunctionDecl *definition = func->getDefinition();
+      definition && definition->getNumParams() == kinds.size())
+    for (auto [index, param] : llvm::enumerate(definition->parameters()))
+      if (famOwnedParams.contains(param))
+        kinds[index] = ParamKind::OwnedRecord;
   voidByteElemsCache.try_emplace(canonical, std::move(byteElems));
   auto [entry, inserted] =
       paramKindsCache.try_emplace(canonical, std::move(kinds));
@@ -1152,6 +1165,18 @@ FailureOr<Type> CImporter::classifyPointerReturn(
   auto it = pointerReturnKinds.find(canonical);
   if (it != pointerReturnKinds.end())
     return it->second;
+  // FR-94: a recognized FAM-record allocator (`planFamLift` pinned every
+  // return site to a claimed owned-tail local, or an elided-guard NULL)
+  // returns the record OWNED BY VALUE — the tail rides along, and callers
+  // bind the result to their own owned locals.
+  if (famOwnedReturnFns.contains(canonical)) {
+    FailureOr<Type> mapped = mapType(
+        func->getReturnType().getCanonicalType()->getPointeeType(), loc);
+    if (failed(mapped))
+      return failure();
+    pointerReturnKinds.try_emplace(canonical, *mapped);
+    return *mapped;
+  }
   const clang::FunctionDecl *definition = func->getDefinition();
   if (!definition || !definition->hasBody())
     return emitError(loc) << "unsupported: pointer return type";

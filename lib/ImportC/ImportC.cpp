@@ -737,6 +737,19 @@ void PointerRegionAnalysis::recordAllocBase(const clang::VarDecl *ptr,
     return markInvalid(ptr, loc,
                        "unsupported: allocation bound to a pointer with an "
                        "unsized element type");
+  // FR-94: an allocation binding a flexible-array-member record that the
+  // owned-tail recognition did NOT claim (the re-binding form, a calloc, an
+  // unmatched size shape, a gap layout, a non-u8 tail) must never fall
+  // through to the element-divisibility path below: a divisible size would
+  // silently keep the historical OVER-COUNTED backing (`sizeof(S)+32` on a
+  // 2-byte record synthesized a 17-record array — tail bytes became extra
+  // whole records). The branch sits BEFORE `elementBytes` on purpose.
+  if (const clang::RecordDecl *record = pointee->getAsRecordDecl();
+      record && record->getDefinition() &&
+      record->getDefinition()->hasFlexibleArrayMember())
+    return markInvalid(ptr, loc,
+                       "unsupported: unrecognized allocation of a "
+                       "flexible-array-member record");
   uint64_t elementBytes =
       context->getTypeSizeInChars(pointee).getQuantity();
   auto evalConstant = [&](const clang::Expr *arg, uint64_t &out) {
@@ -1112,6 +1125,12 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
   // region untracked (the emitter routes the local to its `Vec` binding).
   if (vecValueLocalQuery && vecValueLocalQuery(ptr))
     return;
+  // FR-94: a recognized FAM-record owned-tail local is lifted whole to an
+  // owned struct with a `Vec<u8>` tail, so its binding never reaches
+  // `recordAllocBase`'s FAM rejection — leave the region untracked (the
+  // emitter routes the local to its owned struct binding).
+  if (famValueLocalQuery && famValueLocalQuery(ptr))
+    return;
   const clang::Expr *e = stripTrivia(rhs);
   clang::SourceLocation loc = e->getBeginLoc();
 
@@ -1388,6 +1407,17 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
         // Nested subscripts (`p = &arr[i][j]`) peel to the same root.
         const clang::Expr *base =
             subscript->getBase()->IgnoreParenImpCasts();
+        // FR-94: `p = &d->tail[k]` over an ADMITTED FAM tail (heatshrink's
+        // poll-site `uint8_t *buf = &hsd->buffers[ibs]`) binds the member
+        // Vec place as a cursored backing at cursor k — the FR-93 member
+        // convention with a nonzero initial cursor. Gated on the FAM leaf
+        // so constant-extent member arrays keep their pinned frontier.
+        if (const auto *memberExpr = llvm::dyn_cast<clang::MemberExpr>(base))
+          if (famTailMemberQuery && famTailMemberQuery(memberExpr) &&
+              memberArrayDecayQuery)
+            if (auto target = memberArrayDecayQuery(memberExpr);
+                target && target->second)
+              return addBase(ptr, target->first, loc, target->second);
         while (const auto *inner =
                    llvm::dyn_cast<clang::ArraySubscriptExpr>(base))
           base = inner->getBase()->IgnoreParenImpCasts();
@@ -3522,6 +3552,18 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
         return emitError(loc)
                << "unsupported use of pointer-to-pointer variable '"
                << var->getName() << "'";
+      // FR-94: a FAM-record owned-tail local decomposes as the DEGENERATE
+      // whole-object pointer to its own struct place — `d->f` resolves as a
+      // member of the owned local, borrows pass `&mut d`, and null tests
+      // fold statically non-null (the owned binding is infallible).
+      if (famAllocLocals.contains(var))
+        return PtrExprValue{var, Value()};
+      // FR-94: the free-only wrapper's OWNED-BY-VALUE parameter decomposes
+      // the same degenerate way, so its member READS (the byte-size
+      // computation before the drop) resolve on the by-value shadow place.
+      if (const auto *parm = llvm::dyn_cast<clang::ParmVarDecl>(var);
+          parm && famOwnedParams.contains(parm))
+        return PtrExprValue{var, Value()};
       // A statically-null pointer (CTS-P9) has no pointerLocals entry at
       // all; emitPointerLocalRead folds it to the empty decomposition.
       if (pointerLocals.contains(var) ||
@@ -4340,6 +4382,57 @@ bool CImporter::isByteRegionAggregate(clang::QualType type) {
   return record && isByteRegionRecord(record);
 }
 
+const clang::FieldDecl *
+CImporter::famTailField(const clang::RecordDecl *record) {
+  // FR-94: the ADMITTED flexible-array-member tail — the field that grows an
+  // owned `Vec<u8>` struct member. C path only: the C++ importer keeps every
+  // historical FAM rejection.
+  if (!record || astContext().getLangOpts().CPlusPlus)
+    return nullptr;
+  const clang::RecordDecl *definition = record->getDefinition();
+  if (!definition || definition->isInvalidDecl() ||
+      definition->isDependentType())
+    return nullptr;
+  auto it = famTailFieldCache.find(definition);
+  if (it != famTailFieldCache.end())
+    return it->second;
+  const clang::FieldDecl *result = [&]() -> const clang::FieldDecl * {
+    // Structs only; a union's arms alias, and a BYTE-REGION record keeps its
+    // flat-image model and every FR-91 pin (its FAM folds into the image at
+    // the type level and its accesses keep their historical rejections).
+    if (!definition->isStruct() || !definition->hasFlexibleArrayMember() ||
+        isByteRegionRecord(definition))
+      return nullptr;
+    const clang::FieldDecl *last = nullptr;
+    for (const clang::FieldDecl *field : definition->fields())
+      last = field;
+    // The tail must be THIS record's own trailing incomplete array (a nested
+    // FAM record propagates `hasFlexibleArrayMember` without one) with a u8
+    // leaf — heatshrink's `uint8_t buffers[]`; hs_index's `int16_t index[]`
+    // stays on the historical rejections.
+    if (!last || !last->getType()->isIncompleteArrayType())
+      return nullptr;
+    const clang::ArrayType *tail =
+        astContext().getAsArrayType(last->getType());
+    if (!tail || !isU8ScalarType(tail->getElementType()))
+      return nullptr;
+    // Gap-free layout only: offsetof(tail) == sizeof(S). A padding-gap
+    // layout (constructible: {u8; u16; u8; u8 t[];} has offsetof 5 < sizeof
+    // 6) lets C legally index the tail below sizeof, which the tail-only Vec
+    // cannot represent; it keeps the historical FAM rejections.
+    const clang::ASTRecordLayout &layout =
+        astContext().getASTRecordLayout(definition);
+    uint64_t offsetBits = layout.getFieldOffset(last->getFieldIndex());
+    uint64_t sizeBits =
+        static_cast<uint64_t>(layout.getSize().getQuantity()) * 8;
+    if (offsetBits != sizeBits)
+      return nullptr;
+    return last;
+  }();
+  famTailFieldCache[definition] = result;
+  return result;
+}
+
 bool CImporter::exprRootsInByteRegion(const clang::Expr *expr) {
   const clang::Expr *e = expr->IgnoreParenImpCasts();
   if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e)) {
@@ -5073,6 +5166,16 @@ CImporter::projectMemberPlace(Location loc, Value basePlace,
   // the primary check).
   if (opaqueUnionArms.contains(field))
     return emitError(loc) << "unsupported: opaque union arm access";
+  // FR-94: an admitted FAM tail projects at its owned `Vec<u8>` field type
+  // (the incomplete array type itself has no mapping).
+  if (famTailField(field->getParent()) == field)
+    return builder
+        .create<emitrust::MemberOp>(
+            loc,
+            emitrust::LValueType::get(
+                emitrust::OpaqueType::get(builder.getContext(), "Vec<u8>")),
+            basePlace, builder.getStringAttr(flattenedFieldName(field)))
+        .getResult();
   FailureOr<Type> fieldType = mapType(field->getType(), loc);
   if (failed(fieldType))
     return failure();
@@ -5104,7 +5207,17 @@ FailureOr<Value> CImporter::refineElementPlace(Location loc, Value basePlace,
       elementType = arrayType.getElementType();
     else if (auto sliceType = llvm::dyn_cast<emitrust::SliceType>(valueType))
       elementType = sliceType.getElementType();
-    else
+    else if (auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(valueType);
+             opaque && opaque.getValue().starts_with("Vec<") &&
+             opaque.getValue().ends_with(">")) {
+      // FR-94: a Vec-typed member place (the owned FAM tail) subscripts by
+      // the cursor exactly like a slice; the element type comes from the
+      // spelling (the W2.3 `emitrust.subscript`-over-opaque trust model).
+      elementType = parseStlElementType(
+          opaque.getValue().substr(4, opaque.getValue().size() - 5));
+      if (!elementType)
+        return emitError(loc) << "unsupported pointer target place";
+    } else
       return emitError(loc) << "unsupported pointer target place";
     uint64_t span = flatElementCount(elementType);
     Value index = cursor;
@@ -5522,6 +5635,23 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   const auto *field = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
   if (!field)
     return emitError(loc) << "unsupported member access";
+  // FR-94: an ADMITTED FAM tail (gap-free u8 trailing member of a typed
+  // record) designates its owned `Vec<u8>` field; the base resolves through
+  // the ordinary member-base machinery (`&mut S` parameters, owned FAM
+  // locals, dot chains), and unresolvable bases (extern pointers, globals'
+  // pointer members) keep their located rejections there.
+  if (famTailField(field->getParent()) == field) {
+    FailureOr<Value> base = emitMemberBasePlace(member, loc, writeback);
+    if (failed(base))
+      return failure();
+    return builder
+        .create<emitrust::MemberOp>(
+            loc,
+            emitrust::LValueType::get(
+                emitrust::OpaqueType::get(builder.getContext(), "Vec<u8>")),
+            *base, builder.getStringAttr(flattenedFieldName(field)))
+        .getResult();
+  }
   // A flexible array member tail and a GNU zero-length array member have
   // no storage behind sizeof; runtime access is a located rejection
   // (CTS-BR, 00216).
@@ -5938,6 +6068,15 @@ CImporter::emitSubscriptLValue(const clang::ArraySubscriptExpr *subscript,
   auto baseType = llvm::dyn_cast<emitrust::LValueType>((*basePlace).getType());
   if (!baseType)
     return emitError(loc) << "unsupported subscript base";
+  // FR-94: `d->tail[i]` over an admitted FAM tail — the member place is the
+  // owned `Vec<u8>` field (an incomplete array is an array type in C, so the
+  // subscript arrives on this array-typed-base path); it indexes through the
+  // shared STL vector index place exactly like a lifted FR-65 `Vec` local.
+  if (auto opaque =
+          llvm::dyn_cast<emitrust::OpaqueType>(baseType.getValueType());
+      opaque && opaque.getValue().starts_with("Vec<"))
+    return emitStlVectorIndexPlace(*basePlace, opaque, subscript->getIdx(),
+                                   loc, "vector index");
   auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(baseType.getValueType());
   if (!arrayType)
     return emitError(loc) << "unsupported subscript base";

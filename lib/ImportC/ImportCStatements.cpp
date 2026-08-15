@@ -43,6 +43,12 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
   // handler, not elided.)
   if (stringFillElidedStmts.contains(stmt))
     return success();
+  // FR-94: the malloc-failure null guard (`if (!d) ...`) of a claimed
+  // owned-tail FAM local is elided — `vec!` is infallible (the FR-65
+  // precedent), so the guard body is unreachable in the emitted crate and
+  // its `return NULL` has no owned-return representation.
+  if (famElidedStmts.contains(stmt))
+    return success();
   Location loc = translateLoc(stmt->getBeginLoc());
 
   if (const auto *compound = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {
@@ -249,6 +255,12 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   // never reaches the region model.
   if (vecValueLocals.contains(var))
     return emitVecLocal(var, loc);
+  // FR-94: a recognized FAM-record owned-tail local lifts whole to an owned
+  // struct binding whose tail member is `vec![0u8; n]` (or the by-value
+  // result of a recognized owned-return allocator call), replacing the
+  // pointer decomposition entirely.
+  if (famAllocLocals.contains(var))
+    return emitFamLocal(var, loc);
   // An owner-promoted array (Phase 4) declares the owner struct variable
   // instead; every direct access rewrites to the struct's "data" member.
   if (ownerPlans.contains(var))
@@ -1902,6 +1914,67 @@ LogicalResult CImporter::emitVecLocal(const clang::VarDecl *var, Location loc) {
   return storeToPlace(loc, place, filled);
 }
 
+LogicalResult CImporter::emitFamLocal(const clang::VarDecl *var,
+                                      Location loc) {
+  // FR-94: the owned lowering of a FAM-record heap local. The C
+  // `S *d = malloc(sizeof(S) + n)` binds `let mut d: S = S { tail:
+  // vec![0u8; n], ..S::default() }` — the struct variable's tail-member
+  // assign fuses into the struct-literal init at translate — and the
+  // owned-return call form binds the callee's by-value result. `planFamLift`
+  // proved every soundness clause (admitted gap-free u8-tail record,
+  // non-negative side-effect-free count, elided null guards), so emission is
+  // unconditional here.
+  const FamAllocFacts &facts = famAllocLocals[var];
+  clang::QualType pointee =
+      var->getType().getCanonicalType()->getPointeeType();
+  FailureOr<Type> structType = mapType(pointee, loc);
+  if (failed(structType))
+    return failure();
+  if (!llvm::isa<emitrust::StructType>(*structType))
+    return emitError(loc) << "unsupported: flexible-array record type";
+  Value place = createVariablePlace(
+      loc, *structType,
+      var->getName().empty() ? std::string()
+                             : mangleMemberName(var->getName()));
+  symbols[var] = place;
+  if (facts.initCall) {
+    // `S *d = alloc_fn(...)`: the recognized allocator returns the record
+    // BY VALUE; the binding is a plain move into the owned local.
+    FailureOr<Value> value = emitCall(facts.initCall);
+    if (failed(value))
+      return failure();
+    if (!*value || (*value).getType() != *structType)
+      return emitError(loc)
+             << "unsupported: flexible-array record initializer";
+    builder.create<emitrust::AssignOp>(loc, place, *value);
+    return success();
+  }
+  const clang::FieldDecl *tail = famTailField(pointee->getAsRecordDecl());
+  if (!tail) // Defensive; planFamLift only claims admitted records.
+    return emitError(loc) << "unsupported: flexible-array record type";
+  auto vecType = emitrust::OpaqueType::get(builder.getContext(), "Vec<u8>");
+  Value tailPlace =
+      builder
+          .create<emitrust::MemberOp>(
+              loc, emitrust::LValueType::get(vecType), place,
+              builder.getStringAttr(flattenedFieldName(tail)))
+          .getResult();
+  // The tail count is imported once at the decl site — exactly where malloc
+  // evaluates it — and widened to i64 for `vec![0u8; n as usize]`. The zero
+  // fill is the sound refinement of malloc's indeterminate tail bytes (a
+  // defined program writes each byte before reading it).
+  FailureOr<Value> count = emitRValue(facts.countExpr);
+  if (failed(count))
+    return failure();
+  Value count64 = castToIntType(loc, *count, builder.getIntegerType(64));
+  Value filled = builder
+                     .create<emitrust::VecFillOp>(loc, vecType, count64,
+                                                  builder.getStringAttr("0u8"))
+                     .getResult();
+  builder.create<emitrust::AssignOp>(loc, tailPlace, filled);
+  return success();
+}
+
 LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
                                           Location loc) {
   clang::QualType pointee =
@@ -2192,6 +2265,25 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
                   pointee, binding.member->getType())
           ? astContext().getAsConstantArrayType(binding.member->getType())
           : nullptr;
+  // FR-94: an ADMITTED FAM-tail member base (`buf = &d->buffers[k]`) is a
+  // cursored element run over the tail's owned Vec member place; the
+  // pointee must be the tail's own u8 element (or the void wildcard).
+  if (binding.member && !memberArray &&
+      famTailField(binding.member->getParent()) == binding.member) {
+    bool wildcardTail = pointee.getCanonicalType()->isVoidType();
+    if (!wildcardTail && !isU8ScalarType(pointee))
+      return emitError(bindLoc)
+             << "unsupported: pointer element type does not match its "
+                "target array";
+    PointerLocalInfo info;
+    info.base = binding.base;
+    info.cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
+    info.member = binding.member;
+    pointerLocals[var] = info;
+    if (const clang::Expr *init = var->getInit())
+      return storePointerAssign(loc, var, init);
+    return success();
+  }
   if (binding.member && memberArray) {
     // FR-93: a member-ARRAY base (`p = s->arr`) is a cursored element
     // run over the member's own place — the (backing, cursor) local
@@ -2506,6 +2598,36 @@ LogicalResult CImporter::storePointerAssign(Location loc,
       if (auto target = classifyMemberArrayDecay(member))
         return emitMemberArrayDecayValue(loc, member, target->first,
                                          target->second);
+    // FR-94: `p = &d->tail[k]` over an ADMITTED FAM tail (the heatshrink
+    // poll-site window binding) is the member decay at cursor k. Gated on
+    // the FAM leaf so constant-extent member arrays keep their pinned
+    // frontier ("pointer assigned a non-address value").
+    if (const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(peeled);
+        addrOf && addrOf->getOpcode() == clang::UO_AddrOf)
+      if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(
+              stripTrivia(addrOf->getSubExpr())))
+        if (const auto *subDecay = llvm::dyn_cast<clang::ImplicitCastExpr>(
+                stripTrivia(subscript->getBase()));
+            subDecay &&
+            subDecay->getCastKind() == clang::CK_ArrayToPointerDecay)
+          if (const auto *tailMember = llvm::dyn_cast<clang::MemberExpr>(
+                  stripTrivia(subDecay->getSubExpr())))
+            if (const auto *leaf = llvm::dyn_cast<clang::FieldDecl>(
+                    tailMember->getMemberDecl());
+                leaf && famTailField(leaf->getParent()) == leaf)
+              if (auto target = classifyMemberArrayDecay(tailMember)) {
+                FailureOr<Value> index = emitRValue(subscript->getIdx());
+                if (failed(index))
+                  return failure();
+                if (!llvm::isa<IntegerType>((*index).getType()))
+                  return emitError(loc)
+                         << "unsupported subscript index type";
+                Value index64 =
+                    castToIntType(loc, *index, builder.getIntegerType(64));
+                PtrExprValue value{target->first, index64};
+                value.member = target->second;
+                return value;
+              }
     return emitPointerRValue(rhs);
   }();
   if (failed(value))
@@ -3824,6 +3946,23 @@ LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
           llvm::cast<clang::DeclRefExpr>(fnExpr)->getDecl());
       value = emitFunctionPointerConstant(
           fnExpr, astContext().getPointerType(fn->getType()), loc);
+    } else if (isDataPointer(retValue->getType()) &&
+               llvm::isa<emitrust::StructType>(currentReturnType)) {
+      // FR-94: an owned FAM-record return (`return d;` in a recognized
+      // allocator): the classified struct return moves the owned local out.
+      // `planFamLift` pinned every return site to a claimed local or to an
+      // elided-guard NULL (which never emits), so the checks below are
+      // defensive nets.
+      const clang::Expr *peeled = stripTrivia(retValue);
+      while (const clang::Expr *sub = peelPointerCast(astContext(), peeled))
+        peeled = stripTrivia(sub);
+      const clang::VarDecl *owned = asLoadedLocalVarRef(peeled);
+      Value ownedPlace = owned ? symbols.lookup(owned) : Value();
+      if (!owned || !famAllocLocals.contains(owned) || !ownedPlace)
+        return emitError(loc) << "unsupported: returned pointer value";
+      value = builder
+                  .create<emitrust::LoadOp>(loc, currentReturnType, ownedPlace)
+                  .getResult();
     } else {
       value = emitRValue(retValue);
     }
@@ -3960,6 +4099,18 @@ CImporter::emitVoidConditionalStmt(const clang::ConditionalOperator *op) {
 
 LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  // FR-94: a whole-record assignment of an ADMITTED FAM record has no
+  // representation: C's FAM assignment copies the FIELDS and NOT the tail
+  // (the destination keeps its own tail storage), while every Rust spelling
+  // of the owned-Vec representation either MOVES or CLONES the tail — no
+  // rendering reproduces C, so the site rejects rather than silently
+  // diverging. Non-admitted FAM records (gap layouts, non-u8 tails) have no
+  // Vec field and keep their historical fields-only Copy semantics.
+  if (const clang::RecordDecl *record =
+          op->getLHS()->getType()->getAsRecordDecl();
+      record && famTailField(record))
+    return emitError(loc) << "unsupported: whole-record assignment of a "
+                             "flexible-array-member record";
   // Reassigning a FILE* handle local (`f = fopen(...)` after fclose, the
   // serial-reuse shape of 00187) stores a fresh handle into its owned
   // place. Non-handle FILE* destinations fall through to the historical
@@ -4600,9 +4751,31 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
           // drops at scope end (single owner: escape/return are rejected).
           if (vecValueLocals.contains(root))
             return success();
+          // FR-94: `free` of an owned FAM-record local is a no-op — the
+          // struct (and its Vec tail) drops at scope end, or moved into the
+          // owned free wrapper earlier (in which case this free is the
+          // wrapper's own and never emits here).
+          if (famAllocLocals.contains(root))
+            return success();
           auto it = pointerLocals.find(root);
           if (it != pointerLocals.end() && it->second.backing)
             return success();
+        }
+        // FR-94: `free(param)` inside the free-only wrapper — the parameter
+        // is OWNED BY VALUE (`ParamKind::OwnedRecord`), so dropping it at
+        // scope end IS the deallocation and the free itself is a no-op.
+        // (`asLoadedLocalVarRef` excludes parameters, hence the own peel.)
+        {
+          const clang::Expr *paramArg = stripTrivia(arg);
+          if (const auto *cast =
+                  llvm::dyn_cast<clang::ImplicitCastExpr>(paramArg);
+              cast && cast->getCastKind() == clang::CK_LValueToRValue)
+            paramArg = stripTrivia(cast->getSubExpr());
+          if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(paramArg))
+            if (const auto *parm =
+                    llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl());
+                parm && famOwnedParams.contains(parm))
+              return success();
         }
         return emitError(freeLoc)
                << "unsupported: free of a pointer not rooted in a "
