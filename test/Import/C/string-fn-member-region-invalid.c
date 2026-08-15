@@ -5,7 +5,6 @@
 // RUN: not emitrust-import-c %t/u32-memcpy.c 2>&1 | FileCheck %s --check-prefix=U32MEMCPY
 // RUN: not emitrust-import-c %t/u32-memcmp.c 2>&1 | FileCheck %s --check-prefix=U32MEMCMP
 // RUN: not emitrust-import-c %t/impure-index.c 2>&1 | FileCheck %s --check-prefix=IMPURE
-// RUN: not emitrust-import-c %t/byte-record.c 2>&1 | FileCheck %s --check-prefix=BYTEREC
 // RUN: not emitrust-import-c %t/mixed-member.c 2>&1 | FileCheck %s --check-prefix=MIXEDMEM
 // RUN: not emitrust-import-c %t/strcpy-member.c 2>&1 | FileCheck %s --check-prefix=STRCPYMEM
 
@@ -19,10 +18,11 @@
 // has no compile-time replicated word (`b * 0x01010101`), and u32
 // memcpy/memcmp have no admitted image at all. An IMPURE offset index
 // (a call) declines the interception — the single borrow-point
-// evaluation would reorder its side effects — and a BYTE-REGION record
-// (every scalar leaf `unsigned char`) keeps the FR-83 blob model, whose
-// members are windows of one region base, not places; both keep the
-// historical decay rejection verbatim. FR-72's element-agreement rule
+// evaluation would reorder its side effects — and keeps the
+// historical decay rejection verbatim. (A BYTE-REGION record's member
+// used to reject here too; FR-91 moved that boundary — the member is
+// now a WINDOW of the region base, see byte-region-member-window.c —
+// so that pin lives in the positive file.) FR-72's element-agreement rule
 // composes unchanged: a mixed i8/ui8 member pair has no helper
 // signature that fits both. The str*-family stays UNintercepted:
 // FR-87 is byte-family-only, so a member char array as a strcpy
@@ -129,23 +129,6 @@ int main(void) {
   struct C c;
   f(&c);
   return (int)(c.V[0] & 1u);
-}
-
-// A byte-region record (every scalar leaf `unsigned char`): its members
-// are windows of the FR-83 blob region, not places — the member
-// interception declines and the historical rejection stays.
-// BYTEREC: byte-record.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported pointer cast (ArrayToPointerDecay)
-
-//--- byte-record.c
-#include <string.h>
-struct B { unsigned char x[8]; unsigned char y[8]; };
-void f(struct B *b) {
-  memset(b->x, 0, 8);
-}
-int main(void) {
-  struct B b;
-  f(&b);
-  return (int)(b.x[0] & 1u);
 }
 
 // FR-72's element-agreement rule composes with member regions: a MIXED

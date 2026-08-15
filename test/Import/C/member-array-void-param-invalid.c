@@ -26,10 +26,13 @@
 // shape); a STRING LITERAL to a ui8-element void* param keeps its
 // exact pre-FR-89 element-mismatch rejection (char is i8 — the peel
 // sits after the literal head and provably admits nothing new there);
-// and an ALL-u8 struct's member array is the byte-region-aggregate
-// boundary (CTS-BR), which rejects at decay even on the TYPED path —
-// FR-89 must not move that boundary. Rejection is a feature: every
-// wording below is pinned verbatim as measured against the built tool.
+// and an ALL-u8 struct's member arrays are WINDOWS of one byte-region
+// slice place (FR-91 moved the CTS-BR boundary from the decay to the
+// window admission), so TWO mutable windows of the same root in one
+// call stay rejected — at the root-keyed aliasing guard, since the
+// two-`slice_of`-of-one-place form is rustc E0502. Rejection is a
+// feature: every wording below is pinned verbatim as measured against
+// the built tool.
 
 // A non-byte (unsigned, ui32) member element into the admitted ui8
 // byte-cursor param: the element check rejects, per call, never a
@@ -137,11 +140,14 @@ int main(void) {
   return (int)rd("ab", 2u);
 }
 
-// An ALL-u8 struct is a byte-region aggregate (CTS-BR): its member
-// place is not projectable, the matcher declines, and the decay
-// rejection stays — identical to the TYPED-path boundary, which FR-89
-// must not move.
-// BYTEREGION: byteregion.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported pointer cast (ArrayToPointerDecay)
+// An ALL-u8 struct is a byte-region aggregate (CTS-BR): FR-91 admits
+// its member arrays as WINDOWS of the one region slice place, so both
+// arguments here resolve — but they are two views of the SAME place
+// with a mut among them (E0502 in the naive emission), so the
+// root-keyed aliasing guard rejects the call. The pin moves forward:
+// the shape rejected at the decay before FR-91, and stays a located
+// rejection now.
+// BYTEREGION: byteregion.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: aliasing mutable pointer arguments (two arguments borrow object 's')
 
 //--- byteregion.c
 typedef unsigned char u8;
