@@ -3,12 +3,17 @@
 // the record imports with sizeof excluding the FAM (byte-region records
 // additionally fold static FAM-tail initializers into an extended
 // image; typed records drop the field), see byte-region-aggregates.c
-// for the positive pins. What remains rejected, with a dedicated
-// located wording so the shape never degrades to the generic array
-// fallback (`unsupported: non-constant array size`), is any RUNTIME
-// access to the FAM tail. The same policy covers GNU zero-length array
-// members (`T r[0];`): tolerated as a zero-size, field-less
-// contribution when unaccessed; accessing one is a located rejection.
+// for the positive pins. FR-94/95 AMEND again: a gap-free u8 or
+// Vec-mappable tail (u8 by FR-94; i16/i32/i64/u16/u32/u64/f32/f64 by
+// FR-95) is ADMITTED as an owned Vec member — see
+// flexible-array-owned-tail.c / flexible-array-owned-typed-tail.c —
+// so these arms pin the residue OUTSIDE the admission: an element with
+// no Vec mapping (long double) keeps every RUNTIME tail access on the
+// dedicated located wording, never degrading to the generic array
+// fallback (`unsupported: non-constant array size`). The same policy
+// covers GNU zero-length array members (`T r[0];`): tolerated as a
+// zero-size, field-less contribution when unaccessed; accessing one is
+// a located rejection.
 //
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/fam-read.c 2>&1 | FileCheck %s --check-prefix=FAMREAD
@@ -17,23 +22,25 @@
 
 //--- fam-read.c
 // Reading the tail through a pointer to the record: rejected at the
-// access site, not at the declaration.
+// access site, not at the declaration (long double has no Vec mapping,
+// so the FR-94/95 admission never claims the record).
 struct S {
   int n;
-  int tail[];
+  long double tail[];
 };
 
-int g(struct S *p) {
+long double g(struct S *p) {
   return p->tail[0];
 }
 // FAMREAD: fam-read.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: flexible array member access
 
 //--- fam-write.c
-// Writing the tail is the same rejection: the tail has no storage
-// behind sizeof, so neither direction of runtime access is modeled.
+// Writing the tail is the same rejection: the non-admitted tail has no
+// storage behind sizeof, so neither direction of runtime access is
+// modeled.
 struct S {
   int n;
-  int tail[];
+  long double tail[];
 };
 
 void h(struct S *p) {

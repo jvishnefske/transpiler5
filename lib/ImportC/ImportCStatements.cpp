@@ -1916,13 +1916,14 @@ LogicalResult CImporter::emitVecLocal(const clang::VarDecl *var, Location loc) {
 
 LogicalResult CImporter::emitFamLocal(const clang::VarDecl *var,
                                       Location loc) {
-  // FR-94: the owned lowering of a FAM-record heap local. The C
+  // FR-94/95: the owned lowering of a FAM-record heap local. The C
   // `S *d = malloc(sizeof(S) + n)` binds `let mut d: S = S { tail:
-  // vec![0u8; n], ..S::default() }` — the struct variable's tail-member
+  // vec![<zero>; n], ..S::default() }` — the struct variable's tail-member
   // assign fuses into the struct-literal init at translate — and the
   // owned-return call form binds the callee's by-value result. `planFamLift`
-  // proved every soundness clause (admitted gap-free u8-tail record,
-  // non-negative side-effect-free count, elided null guards), so emission is
+  // proved every soundness clause (admitted gap-free record, non-negative
+  // side-effect-free count — the BYTE extent for a u8 tail, the extracted
+  // ELEMENT count for a typed one — elided null guards), so emission is
   // unconditional here.
   const FamAllocFacts &facts = famAllocLocals[var];
   clang::QualType pointee =
@@ -1952,7 +1953,7 @@ LogicalResult CImporter::emitFamLocal(const clang::VarDecl *var,
   const clang::FieldDecl *tail = famTailField(pointee->getAsRecordDecl());
   if (!tail) // Defensive; planFamLift only claims admitted records.
     return emitError(loc) << "unsupported: flexible-array record type";
-  auto vecType = emitrust::OpaqueType::get(builder.getContext(), "Vec<u8>");
+  auto vecType = famTailVecType(tail);
   Value tailPlace =
       builder
           .create<emitrust::MemberOp>(
@@ -1960,16 +1961,30 @@ LogicalResult CImporter::emitFamLocal(const clang::VarDecl *var,
               builder.getStringAttr(flattenedFieldName(tail)))
           .getResult();
   // The tail count is imported once at the decl site — exactly where malloc
-  // evaluates it — and widened to i64 for `vec![0u8; n as usize]`. The zero
-  // fill is the sound refinement of malloc's indeterminate tail bytes (a
-  // defined program writes each byte before reading it).
+  // evaluates it — and widened to i64 for `vec![<zero>; n as usize]`. The
+  // suffixed zero fill (`0u8` for the byte tail, `0i16`/`0.0f32`/... for
+  // typed tails, mirroring `emitVecLocal`) is the sound refinement of
+  // malloc's indeterminate tail bytes (a defined program writes each
+  // element before reading it).
   FailureOr<Value> count = emitRValue(facts.countExpr);
   if (failed(count))
     return failure();
   Value count64 = castToIntType(loc, *count, builder.getIntegerType(64));
+  clang::QualType tailElement =
+      astContext().getAsArrayType(tail->getType())->getElementType();
+  std::string fill = "0u8";
+  if (!isU8ScalarType(tailElement)) {
+    Type elementType = famTailVecElementType(tailElement);
+    if (llvm::isa<Float32Type>(elementType))
+      fill = "0.0f32";
+    else if (llvm::isa<Float64Type>(elementType))
+      fill = "0.0f64";
+    else
+      fill = "0" + *rustSpellingForElementType(elementType);
+  }
   Value filled = builder
                      .create<emitrust::VecFillOp>(loc, vecType, count64,
-                                                  builder.getStringAttr("0u8"))
+                                                  builder.getStringAttr(fill))
                      .getResult();
   builder.create<emitrust::AssignOp>(loc, tailPlace, filled);
   return success();
@@ -2265,13 +2280,25 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
                   pointee, binding.member->getType())
           ? astContext().getAsConstantArrayType(binding.member->getType())
           : nullptr;
-  // FR-94: an ADMITTED FAM-tail member base (`buf = &d->buffers[k]`) is a
-  // cursored element run over the tail's owned Vec member place; the
-  // pointee must be the tail's own u8 element (or the void wildcard).
+  // FR-94/95: an ADMITTED FAM-tail member base (`buf = &d->buffers[k]`,
+  // `index = hsi->index`) is a cursored element run over the tail's owned
+  // Vec member place; the pointee must be the tail's own element. The void
+  // WILDCARD stays u8-only (FR-95): void* cursor arithmetic is
+  // byte-granular and would miscompile over a typed Vec, so a typed tail
+  // requires the exact element pointee.
   if (binding.member && !memberArray &&
       famTailField(binding.member->getParent()) == binding.member) {
-    bool wildcardTail = pointee.getCanonicalType()->isVoidType();
-    if (!wildcardTail && !isU8ScalarType(pointee))
+    clang::QualType tailElement =
+        astContext()
+            .getAsArrayType(binding.member->getType())
+            ->getElementType();
+    bool tailIsU8 = isU8ScalarType(tailElement);
+    bool wildcardTail =
+        tailIsU8 && pointee.getCanonicalType()->isVoidType();
+    bool matchesElement =
+        tailIsU8 ? isU8ScalarType(pointee)
+                 : astContext().hasSameUnqualifiedType(pointee, tailElement);
+    if (!wildcardTail && !matchesElement)
       return emitError(bindLoc)
              << "unsupported: pointer element type does not match its "
                 "target array";

@@ -4384,9 +4384,9 @@ bool CImporter::isByteRegionAggregate(clang::QualType type) {
 
 const clang::FieldDecl *
 CImporter::famTailField(const clang::RecordDecl *record) {
-  // FR-94: the ADMITTED flexible-array-member tail — the field that grows an
-  // owned `Vec<u8>` struct member. C path only: the C++ importer keeps every
-  // historical FAM rejection.
+  // FR-94/95: the ADMITTED flexible-array-member tail — the field that grows
+  // an owned `Vec<T>` struct member. C path only: the C++ importer keeps
+  // every historical FAM rejection.
   if (!record || astContext().getLangOpts().CPlusPlus)
     return nullptr;
   const clang::RecordDecl *definition = record->getDefinition();
@@ -4407,14 +4407,17 @@ CImporter::famTailField(const clang::RecordDecl *record) {
     for (const clang::FieldDecl *field : definition->fields())
       last = field;
     // The tail must be THIS record's own trailing incomplete array (a nested
-    // FAM record propagates `hasFlexibleArrayMember` without one) with a u8
-    // leaf — heatshrink's `uint8_t buffers[]`; hs_index's `int16_t index[]`
-    // stays on the historical rejections.
+    // FAM record propagates `hasFlexibleArrayMember` without one) whose leaf
+    // is u8 (heatshrink's `uint8_t buffers[]`, FR-94) or a Vec-mappable
+    // scalar (FR-95: hs_index's `int16_t index[]` — the FR-65 element
+    // domain); char/bool/__int128/long double/aggregate leaves keep the
+    // historical rejections.
     if (!last || !last->getType()->isIncompleteArrayType())
       return nullptr;
     const clang::ArrayType *tail =
         astContext().getAsArrayType(last->getType());
-    if (!tail || !isU8ScalarType(tail->getElementType()))
+    if (!tail || (!isU8ScalarType(tail->getElementType()) &&
+                  !famTailVecElementType(tail->getElementType())))
       return nullptr;
     // Gap-free layout only: offsetof(tail) == sizeof(S). A padding-gap
     // layout (constructible: {u8; u16; u8; u8 t[];} has offsetof 5 < sizeof
@@ -4431,6 +4434,41 @@ CImporter::famTailField(const clang::RecordDecl *record) {
   }();
   famTailFieldCache[definition] = result;
   return result;
+}
+
+Type CImporter::famTailVecElementType(clang::QualType element) {
+  // FR-95: mirrors planVecLift's element domain (`vecElementType`) so a
+  // typed tail lifts to exactly the `Vec<T>` shapes FR-65 already renders.
+  // Width gates out the char family and bool (width 8 and 1); floats map
+  // to f32/f64 only.
+  clang::QualType canonical = element.getCanonicalType();
+  if (const auto *builtin = canonical->getAs<clang::BuiltinType>()) {
+    if (builtin->getKind() == clang::BuiltinType::Float)
+      return Float32Type::get(builder.getContext());
+    if (builtin->getKind() == clang::BuiltinType::Double)
+      return Float64Type::get(builder.getContext());
+  }
+  if (!canonical->isIntegerType())
+    return {};
+  unsigned width = astContext().getIntWidth(canonical);
+  if (width != 16 && width != 32 && width != 64)
+    return {};
+  return canonical->isUnsignedIntegerType()
+             ? IntegerType::get(builder.getContext(), width,
+                                IntegerType::Unsigned)
+             : IntegerType::get(builder.getContext(), width);
+}
+
+emitrust::OpaqueType CImporter::famTailVecType(const clang::FieldDecl *tail) {
+  clang::QualType element =
+      astContext().getAsArrayType(tail->getType())->getElementType();
+  if (isU8ScalarType(element))
+    return emitrust::OpaqueType::get(builder.getContext(), "Vec<u8>");
+  std::optional<std::string> spelling =
+      rustSpellingForElementType(famTailVecElementType(element));
+  assert(spelling && "famTailField admitted an unspellable tail element");
+  return emitrust::OpaqueType::get(builder.getContext(),
+                                   "Vec<" + *spelling + ">");
 }
 
 bool CImporter::exprRootsInByteRegion(const clang::Expr *expr) {
@@ -5166,15 +5204,13 @@ CImporter::projectMemberPlace(Location loc, Value basePlace,
   // the primary check).
   if (opaqueUnionArms.contains(field))
     return emitError(loc) << "unsupported: opaque union arm access";
-  // FR-94: an admitted FAM tail projects at its owned `Vec<u8>` field type
+  // FR-94/95: an admitted FAM tail projects at its owned `Vec<T>` field type
   // (the incomplete array type itself has no mapping).
   if (famTailField(field->getParent()) == field)
     return builder
         .create<emitrust::MemberOp>(
-            loc,
-            emitrust::LValueType::get(
-                emitrust::OpaqueType::get(builder.getContext(), "Vec<u8>")),
-            basePlace, builder.getStringAttr(flattenedFieldName(field)))
+            loc, emitrust::LValueType::get(famTailVecType(field)), basePlace,
+            builder.getStringAttr(flattenedFieldName(field)))
         .getResult();
   FailureOr<Type> fieldType = mapType(field->getType(), loc);
   if (failed(fieldType))
@@ -5635,21 +5671,20 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   const auto *field = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
   if (!field)
     return emitError(loc) << "unsupported member access";
-  // FR-94: an ADMITTED FAM tail (gap-free u8 trailing member of a typed
-  // record) designates its owned `Vec<u8>` field; the base resolves through
-  // the ordinary member-base machinery (`&mut S` parameters, owned FAM
-  // locals, dot chains), and unresolvable bases (extern pointers, globals'
-  // pointer members) keep their located rejections there.
+  // FR-94/95: an ADMITTED FAM tail (gap-free u8 or Vec-mappable trailing
+  // member of a typed record) designates its owned `Vec<T>` field; the base
+  // resolves through the ordinary member-base machinery (`&mut S`
+  // parameters, owned FAM locals, dot chains), and unresolvable bases
+  // (extern pointers, globals' pointer members) keep their located
+  // rejections there.
   if (famTailField(field->getParent()) == field) {
     FailureOr<Value> base = emitMemberBasePlace(member, loc, writeback);
     if (failed(base))
       return failure();
     return builder
         .create<emitrust::MemberOp>(
-            loc,
-            emitrust::LValueType::get(
-                emitrust::OpaqueType::get(builder.getContext(), "Vec<u8>")),
-            *base, builder.getStringAttr(flattenedFieldName(field)))
+            loc, emitrust::LValueType::get(famTailVecType(field)), *base,
+            builder.getStringAttr(flattenedFieldName(field)))
         .getResult();
   }
   // A flexible array member tail and a GNU zero-length array member have

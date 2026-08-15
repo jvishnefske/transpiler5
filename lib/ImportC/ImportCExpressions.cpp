@@ -3892,11 +3892,19 @@ bool CImporter::matchMemberArraySliceArg(
   // The decayed leaf must be a fixed-extent array FIELD — the whole
   // region the slice covers. (A flexible/zero-length tail has no extent;
   // an incomplete array is not a ConstantArrayType and never matches —
-  // EXCEPT, FR-94, an ADMITTED FAM tail, whose owned `Vec<u8>` member IS
-  // the whole region and slices like any member array.)
+  // EXCEPT, FR-94, an ADMITTED u8 FAM tail, whose owned `Vec<u8>` member
+  // IS the whole region and slices like any member array. FR-95 keeps
+  // this byte-window slice path u8-only: a TYPED tail's slice argument
+  // declines here and stays on its located rejection.)
   const auto *leaf = llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
-  if (!leaf || (!leaf->getType().getCanonicalType()->isConstantArrayType() &&
-                famTailField(leaf->getParent()) != leaf))
+  if (!leaf)
+    return false;
+  bool famU8Tail =
+      famTailField(leaf->getParent()) == leaf &&
+      isU8ScalarType(
+          astContext().getAsArrayType(leaf->getType())->getElementType());
+  if (!leaf->getType().getCanonicalType()->isConstantArrayType() &&
+      !famU8Tail)
     return false;
   return matchMemberChainRoot(member, isMutParam, chainRoot, path);
 }

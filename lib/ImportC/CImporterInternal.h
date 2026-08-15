@@ -826,19 +826,24 @@ struct VecFacts {
   const clang::Expr *countExpr = nullptr;
 };
 
-/// FR-94: the recognized facts of a flexible-array-member record local with
-/// an allocation-backed tail. `S *d = malloc(sizeof(S) + n)` (S an ADMITTED
-/// FAM record: gap-free layout, u8 tail leaf — see `famTailField`) binds an
-/// OWNED struct local whose trailing `Vec<u8>` field is `vec![0u8; n]`; the
-/// alternative source is a call to a recognized owned-return allocator
-/// (`S *d = alloc_fn(...)`), which binds the call's by-value result. The
-/// malloc-failure null guard (`if (!d) ...`, no else) is elided — `vec!` is
-/// infallible, the FR-65 precedent — and `free(d)` is a no-op drop.
+/// FR-94/95: the recognized facts of a flexible-array-member record local
+/// with an allocation-backed tail. `S *d = malloc(sizeof(S) + n)` (S an
+/// ADMITTED FAM record: gap-free layout, u8 or Vec-mappable tail leaf — see
+/// `famTailField`) binds an OWNED struct local whose trailing `Vec<T>` field
+/// is `vec![<zero>; count]`; the alternative source is a call to a
+/// recognized owned-return allocator (`S *d = alloc_fn(...)`), which binds
+/// the call's by-value result. The malloc-failure null guard (`if (!d) ...`,
+/// no else) is elided — `vec!` is infallible, the FR-65 precedent — and
+/// `free(d)` is a no-op drop.
 struct FamAllocFacts {
-  /// The tail element-count expression `n` (the non-sizeof side of the
-  /// `sizeof(S) + n` malloc argument); null for the owned-return call form.
-  /// Non-negative (unsigned or a foldable non-negative constant) and
-  /// side-effect free; every variable it reads is unwritten in the function.
+  /// The tail count expression; null for the owned-return call form. For a
+  /// u8 tail this is the BYTE extent (the raw non-sizeof side of the
+  /// `sizeof(S) + n` malloc argument — bytes ARE elements); for a TYPED
+  /// tail (FR-95) it is the extracted ELEMENT count `k` of the
+  /// `k * sizeof(elem)` count side (the multiply form, factor matched
+  /// numerically). Non-negative (unsigned or a foldable non-negative
+  /// constant) and side-effect free; every variable it reads is unwritten
+  /// in the function.
   const clang::Expr *countExpr = nullptr;
   /// The owned-return allocator call the local binds (`S *d = alloc_fn(...)`),
   /// or null for the direct-malloc form.
@@ -2155,16 +2160,32 @@ private:
   /// `var`.
   LogicalResult emitVecLocal(const clang::VarDecl *var, Location loc);
 
-  /// FR-94: returns the ADMITTED flexible-array-member tail field of `record`
-  /// (the field that grows an owned `Vec<u8>` struct member), or null when the
-  /// record is outside the admission. Admitted: a C-path struct (never a
-  /// union, never byte-region — those keep their flat-image model and pins)
-  /// whose LAST field is an incomplete `unsigned char` array sitting exactly
-  /// at sizeof (gap-free layout, offsetof(tail) == sizeof(S)): a padding-gap
-  /// layout lets C legally index the tail below sizeof, which the tail-only
-  /// Vec cannot represent, so it stays on the historical FAM rejections.
-  /// Cached per record definition.
+  /// FR-94/95: returns the ADMITTED flexible-array-member tail field of
+  /// `record` (the field that grows an owned `Vec<T>` struct member), or null
+  /// when the record is outside the admission. Admitted: a C-path struct
+  /// (never a union, never byte-region — those keep their flat-image model
+  /// and pins) whose LAST field is an incomplete array of `unsigned char`
+  /// (FR-94) or of a Vec-mappable scalar (FR-95: `famTailVecElementType`,
+  /// hs_index's `int16_t index[]`) sitting exactly at sizeof (gap-free
+  /// layout, offsetof(tail) == sizeof(S)): a padding-gap layout lets C
+  /// legally index the tail below sizeof, which the tail-only Vec cannot
+  /// represent, so it stays on the historical FAM rejections. Cached per
+  /// record definition.
   const clang::FieldDecl *famTailField(const clang::RecordDecl *record);
+
+  /// FR-95: the mapped Rust element type of a TYPED (non-u8) admitted FAM
+  /// tail element — integer widths 16/32/64 (signed and unsigned) plus
+  /// f32/f64, exactly the FR-65 `Vec<T>` element domain (`vecElementType`).
+  /// Null when the element has no Vec mapping (char family, bool, __int128,
+  /// long double, aggregates), which keeps the record on the historical FAM
+  /// rejections. Diagnostic-free (planning-safe).
+  mlir::Type famTailVecElementType(clang::QualType element);
+
+  /// FR-94/95: the owned `Vec<T>` opaque type of an ADMITTED tail field —
+  /// `Vec<u8>` for the byte tail, `Vec<i16>`/... for typed tails. The
+  /// spelling round-trips through `parseStlElementType` at the subscript
+  /// sites.
+  emitrust::OpaqueType famTailVecType(const clang::FieldDecl *tail);
 
   /// FR-94: pure-AST recognition of FAM-record owned-tail locals, owned-return
   /// allocators, and free-only wrapper parameters. For every function
