@@ -6239,18 +6239,33 @@ bool CImporter::isExternalRequirementGlobalShape(llvm::StringRef symbol,
   // store back — with fresh loads per RHS read and a post-call refresh) IS
   // the C-sequenced semantics. The struct_def must be visible in the final
   // module (a recovery mode can drop one); when it is not, the safe failure
-  // is the historical rejection. Arrays keep the rejection: element access
-  // into environment-owned storage needs PLACES, which no associated trait
-  // item yields.
+  // is the historical rejection. FR-85 admits one array shape: the CONST
+  // BYTE REGION (`!emitrust.array<Nxui8>`, the CTS-BR image of a u8-only
+  // record, a record array, or a plain byte array — the type key erases
+  // the distinction, and all three share the image below), getter-only.
+  // The licensing fact is the importer's byte-region lowering: EVERY use —
+  // `&g` at an argument position included — is a staged whole-value copy
+  // (`global_load` + temporary + slice_of/subscript), never a carried
+  // address, so a by-value `fn g() -> [u8; N]` reproduces the emitted IR
+  // exactly and no pointer identity exists to lose. Arrays of any OTHER
+  // element type keep the rejection: element access into environment-owned
+  // storage needs PLACES, which no associated trait item yields.
   bool constStruct = false;
+  bool constByteRegion = false;
   if (!llvm::isa<IntegerType, FloatType>(type)) {
-    auto structType = llvm::dyn_cast<emitrust::StructType>(type);
-    if (!structType)
-      return false;
-    if (!llvm::isa_and_nonnull<emitrust::StructDefOp>(
-            SymbolTable::lookupSymbolIn(module, structType.getName())))
-      return false;
-    constStruct = isConst;
+    if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(type)) {
+      if (!isConst || !arrayType.getElementType().isUnsignedInteger(8))
+        return false;
+      constByteRegion = true;
+    } else {
+      auto structType = llvm::dyn_cast<emitrust::StructType>(type);
+      if (!structType)
+        return false;
+      if (!llvm::isa_and_nonnull<emitrust::StructDefOp>(
+              SymbolTable::lookupSymbolIn(module, structType.getName())))
+        return false;
+      constStruct = isConst;
+    }
   }
   // Address-takenness is an AST fact, not an IR one: `&g` on an undefined
   // extern can leave NO surviving symbol use at all (the pointer plan
@@ -6264,21 +6279,30 @@ bool CImporter::isExternalRequirementGlobalShape(llvm::StringRef symbol,
   // can now carry, so for it the decision falls to the surviving-use scan
   // below (loads and global_addrs both rewrite against the one getter; a
   // swallowed non-qualifying use has already rejected at its own site or
-  // been dropped by a recovery mode that reports it). Every other type
-  // keeps the absolute disqualifier: a by-value getter erases identity.
-  if (!constStruct && wholeProgram.addressTakenGlobals.contains(symbol))
+  // been dropped by a recovery mode that reports it). FR-85 exempts the
+  // const byte region for the complementary reason: the AST-level `&g` is
+  // real, but the byte-region lowering never carries the address — the
+  // pointer plan stages a copy and slices the TEMPORARY — so the decision
+  // again falls to the surviving-use scan, which for this arm accepts
+  // LOADS ONLY (a copy-back `global_store` from a cast-away-const write
+  // must keep the rejection, never silently write to a copy). Every other
+  // type keeps the absolute disqualifier: a by-value getter erases
+  // identity.
+  if (!constStruct && !constByteRegion &&
+      wholeProgram.addressTakenGlobals.contains(symbol))
     return false;
   // And every IR use that DID survive must be a direct whole-value load or
   // store — the only shapes `E::g()` / `E::set_g(v)` can express — or, for
   // the const struct, the FR-80 address anchor the lowering rewrites to
-  // the same getter.
+  // the same getter. The const byte region is loads-only.
   std::optional<SymbolTable::UseRange> uses = SymbolTable::getSymbolUses(
       StringAttr::get(module.getContext(), symbol), module.getOperation());
   if (!uses)
     return false;
   for (SymbolTable::SymbolUse use : *uses) {
-    if (llvm::isa<emitrust::GlobalLoadOp, emitrust::GlobalStoreOp>(
-            use.getUser()))
+    if (llvm::isa<emitrust::GlobalLoadOp>(use.getUser()))
+      continue;
+    if (!constByteRegion && llvm::isa<emitrust::GlobalStoreOp>(use.getUser()))
       continue;
     if (constStruct && llvm::isa<emitrust::GlobalAddrOp>(use.getUser()))
       continue;

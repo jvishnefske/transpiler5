@@ -5170,6 +5170,59 @@ piece and becomes FR-45.
   IpAddrAnyActor carrying the exported constant; ip6_addr.c flips
   too. Full suite 620/620.
 
+- [x] FR-85 Const byte-region extern globals as address-carrying
+  requirements (the etharp residual: `extern const struct eth_addr
+  ethbroadcast, ethzero` where `struct eth_addr { u8_t addr[6]; }`
+  is a PACKED single-byte-array record that imports via the
+  byte-region model with no StructDefOp — so FR-79/80's
+  struct-def-based qualification cannot see it, and etharp.c keeps
+  the whole-crate "referenced but not defined" loss). The candidate
+  image: a const-qualified extern global whose type is a byte-region
+  record qualifies for an FR-80-style address-carrying requirement
+  whose trait item returns the REGION view (`fn ethbroadcast() ->
+  &'static [u8; 6]`-shaped, or whatever ref form the byte-region
+  param convention already uses) — `&g` in argument positions
+  receives it where the callee param is the matching const byte
+  region; whole-value reads flow as region reads. Spike must
+  establish: how byte-region record externs are classified today
+  (where they fail — pendingExternGlobals with what type?); what
+  the byte-region param convention's ref type IS (slice vs fixed
+  array ref) and whether trait items can carry it (the FR-80
+  &'static rendering generalizes?); the etharp use-shape census
+  (argument-pass to body-less vs defined callees, casts,
+  whole-value reads — the FR-82 note says the mix is broad, so
+  quantify what the image covers and record what stays rejected);
+  the GlobalAddr op's const-only verifier interplay. NO-GO
+  recordable with the measured split. Gates (if GO): Import pins
+  (qualifying shape + frontier arms, measured wordings); trait
+  golden; EndToEnd lib-crate byte-diff with a consumer supplying
+  the 6-byte constant (argument-pass + read, argc-seeded, vs clang
+  native); lwIP re-probe (etharp measured); full lit 100%; C path
+  only.
+  **SPIKE VERDICT: GO (2026-08-15) — with the candidate image
+  REVISED by measurement.** The importer emits NO global_addr for
+  byte regions: every etharp-shaped use (&g at argument position,
+  member read) is already a staged-copy global_load, so the getter
+  is BY-VALUE (`fn ethbroadcast() -> [u8; 6]`, trait item
+  () -> array<6xui8>) — not the guessed &'static form — and the
+  entire lowering/emission chain was measured type-agnostic (ZERO
+  changes to LowerExternalRequirements, GlobalAddrOp, or
+  TranslateToRust; the implementation surface is the two gates in
+  isExternalRequirementGlobalShape plus one constness-capture fix:
+  isConstQualified -> isConstant, since C11 6.7.3p9 puts array
+  constness on the element type). The MLIR-type key erases record
+  vs record-array vs plain byte array (all -> array<Nxui8>) — the
+  widened surface embraced and pinned, sound because all three
+  share the loads-only image. Mut-cast stores fail loudly
+  (immutable-global verifier); non-const byte regions keep the
+  generic rejection; the FR-80 negative ARRAY arm (non-byte
+  elements) stays the boundary. lwIP MEASURED: etharp FLIPPED
+  (whole-crate FAIL -> 40/76 items, 526 permille; ETHBROADCAST/
+  ETHZERO end use-less after the netif cascade and erase cleanly)
+  — **36 of 38 src/core units now import**; the last two (tcp_in,
+  udp) are the IP_DATA CALL-CONST/ESCAPE/PTRCMP shapes needing
+  contract machinery. Full suite 623/623.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
