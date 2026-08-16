@@ -9713,6 +9713,38 @@ recorded wave-scale fronts: struct-as-bytes erasure, the member-pointer
 linked-list shape (cJSON x11), and aliasing mutable arguments
 (ecc/cbc/hmac x8) — i.e. Stage 2/3 of the cascade plan plus C99-44.
 
+**SESSION CODA (2026-08-14/15, the autonomous factory run,
+FR-67..FR-98).** One continuous session ran the house protocol
+end to end thirty-two times: 30 FRs landed, 1 spike NO-GO recorded
+with its measured table (FR-82, whose redirect became FR-83), and
+1 candidate refuted before any code (the FR-79 evidence clause).
+Alongside: W2.14 std::variant closed the Cpp17Suite frontier, the
+FR-63 quality harness ran 8 accepted iterations across 3 epochs to
+its designed plateau (full-corpus clippy 1621 -> 331, -80%,
+held-out improving at every step), and the gcc-15/libstdc++-15
+host drift was fixed. External outcomes, all measured: lwIP
+src/core 20 -> 36 of 38 units importing; tinycrypt/cJSON 95 -> 109
+of 326 items; tiny-AES-c to its 23/24 ceiling (a complete
+real-world AES in safe byte-identical Rust); heatshrink encoder
+16 -> 23/28 and decoder 8 -> 12/17 (the FAM representation, owned
+Option members, and the two-wall tail-local composition). The
+suite grew 562 -> 665 tests, 100% at every one of ~80 commits;
+the byte-diff oracle caught two real miscompiles and one wrong
+constant mid-wave that compile-clean evidence would have missed;
+three latent defects (E0609 leak, dangling fn-ptr names, the
+over-count malloc shape) were found by the external probes and
+closed with backstops. The method held: every claim
+STRUCTURAL-or-MEASURED, every refusal located, every spike
+verdict recorded with its evidence, and the measurement loop —
+land, re-probe, let the diagnostic name the next FR — drove the
+entire arc without a single human-picked work item. Remaining
+recorded fronts for the next session: the five heatshrink encoder
+walls (returned-pointer alloc first), the decoder's output_info
+members, cJSON's linked-list member pointers, ecc's aliasing
+in-place bignum ops, tcp_in/udp's contract machinery, and the
+Sema-fact side-channel RFC (CFG dominance for FR-88-class guards
+is the ranked first spike).
+
 **THE TINY-AES MILESTONE (2026-08-15, FR-91..FR-93).** The widened
 corpus (tiny-AES-c, heatshrink) was mined the same way: FR-91 member
 windows on byte-region roots (the CTS-BR boundary opened), FR-92 the
