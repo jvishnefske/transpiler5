@@ -4163,6 +4163,26 @@ CImporter::classifyMemberArrayDecay(const clang::MemberExpr *member) {
           var && !llvm::isa<clang::ParmVarDecl>(var) &&
           famAllocLocals.contains(var))
         return std::make_pair(var, leaf);
+    // FR-98: a recognized MEMBER-READ local over a lifted member-held FAM
+    // field (FR-96, `hsi = hse->search_index`) is an admitted arrow root
+    // for the POINTEE record's own tail (`index = hsi->index`,
+    // heatshrink_encoder.c:425): the local names no place of its own, so
+    // each use re-projects the member's Option payload fresh and
+    // subscripts the projected tail Vec (emitPointerPlace's
+    // famMemberLocals arm). The famOptionMemberPointee gate is the poison
+    // mirror of famOptionMemberOf: an unlifted or poisoned field keeps the
+    // historical non-address rejection.
+    if (famLeaf && ref)
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+          var && !llvm::isa<clang::ParmVarDecl>(var))
+        if (const clang::MemberExpr *rootInit = famMemberLocals.lookup(var))
+          if (const auto *rootField = llvm::dyn_cast<clang::FieldDecl>(
+                  rootInit->getMemberDecl()))
+            if (const clang::RecordDecl *pointee =
+                    famOptionMemberPointee(rootField);
+                pointee && pointee->getDefinition() ==
+                               leaf->getParent()->getDefinition())
+              return std::make_pair(var, leaf);
     const auto *param =
         ref ? llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl()) : nullptr;
     if (!param)

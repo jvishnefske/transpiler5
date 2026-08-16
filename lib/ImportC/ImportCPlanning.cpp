@@ -1295,8 +1295,12 @@ void collectVars(const clang::Stmt *stmt,
     collectVars(child, out);
 }
 
+} // namespace
+
 /// Whether `var` is assigned, incremented/decremented, or address-taken
 /// anywhere in `stmt` (a write TO the variable itself, not through it).
+/// Declared in CImporterInternal.h: shared with the FR-98 member-base
+/// root-motion gate in ImportC.cpp.
 bool mutatesVar(const clang::Stmt *stmt, const clang::VarDecl *var) {
   if (!stmt)
     return false;
@@ -1318,6 +1322,8 @@ bool mutatesVar(const clang::Stmt *stmt, const clang::VarDecl *var) {
       return true;
   return false;
 }
+
+namespace {
 
 /// Collects every `for` statement below `stmt`.
 void collectForStmts(const clang::Stmt *stmt,

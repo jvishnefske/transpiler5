@@ -4141,6 +4141,28 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
     }
     return staged;
   }
+  // FR-98 Arm A: a FAM-tail pointer local rooted at a recognized
+  // MEMBER-READ local (`index = hsi->index` after `hsi = hse->search_index`,
+  // FR-96): the root binds no place of its own (`symbols` has no entry), so
+  // every use re-projects the member's Option payload FRESH — the FR-96
+  // per-use discipline extended through one more member link — then
+  // projects the tail's owned Vec member and subscripts it at this
+  // pointer's own cursor.
+  if (pointer.member)
+    if (const clang::MemberExpr *rootInit =
+            famMemberLocals.lookup(pointer.base)) {
+      FailureOr<Value> projected = emitFamOptionMemberProjection(
+          rootInit, llvm::cast<clang::FieldDecl>(rootInit->getMemberDecl()),
+          loc, writeback);
+      if (failed(projected))
+        return failure();
+      FailureOr<Value> memberPlace =
+          projectMemberPlace(loc, *projected, pointer.member);
+      if (failed(memberPlace))
+        return failure();
+      return refineElementPlace(loc, *memberPlace, pointer.cursor,
+                                pointeeType);
+    }
   auto it = symbols.find(pointer.base);
   Value basePlace;
   if (it != symbols.end()) {
@@ -4164,6 +4186,45 @@ FailureOr<Value> CImporter::emitPointerPlace(Location loc,
   // member place; a reference-held struct-pointer parameter root derefs
   // freshly per use (projectPointerMemberBase).
   if (pointer.member) {
+    // FR-98 Arm B: a struct-pointer PARAMETER root whose place is an
+    // ELEMENT RUN of its struct — a slice-classified parameter (`data =
+    // hse->buffer` when `hse` also escapes to a call; the deref'd struct
+    // slice) or a promoted owner-region parameter (FR-30; the receiver's
+    // data array). The member projection first subscripts the run at the
+    // ROOT'S OWN cursor — the identical load the direct `hse->member` path
+    // emits. MANDATORY gate: a MOVED root (`hse++`, `hse = q`, `&hse`)
+    // would silently retarget every later use of the local through the
+    // moved cursor — a miscompile, not a rejection — and the region model
+    // records no arithmetic fact for parameters, so the gate re-checks the
+    // root's mutation at the AST level (`mutatesVar`, the planFamLift
+    // stability gate).
+    if (auto lvalueType =
+            llvm::dyn_cast<emitrust::LValueType>(basePlace.getType())) {
+      Type runElement;
+      if (auto sliceType =
+              llvm::dyn_cast<emitrust::SliceType>(lvalueType.getValueType()))
+        runElement = sliceType.getElementType();
+      else if (auto arrayType =
+                   llvm::dyn_cast<emitrust::ArrayType>(lvalueType.getValueType()))
+        runElement = arrayType.getElementType();
+      if (runElement && llvm::isa<emitrust::StructType>(runElement)) {
+        if (const auto *fn = llvm::dyn_cast<clang::FunctionDecl>(
+                pointer.base->getDeclContext());
+            !fn || mutatesVar(fn->getBody(), pointer.base))
+          return emitError(loc)
+                 << "unsupported: member-array binding rooted at a "
+                    "struct-pointer parameter that is itself modified";
+        auto rootInfo = pointerLocals.find(pointer.base);
+        if (rootInfo == pointerLocals.end() || !rootInfo->second.cursorCell)
+          return emitError(loc) << "unsupported member access base";
+        Value rootCursor = loadPlace(loc, rootInfo->second.cursorCell);
+        FailureOr<Value> element =
+            refineElementPlace(loc, basePlace, rootCursor, runElement);
+        if (failed(element))
+          return failure();
+        basePlace = *element;
+      }
+    }
     FailureOr<Value> memberPlace =
         projectPointerMemberBase(loc, basePlace, pointer.member);
     if (failed(memberPlace))
@@ -5390,6 +5451,25 @@ FailureOr<Value>
 CImporter::materializeLocalElementPlace(Location loc,
                                         const PointerBaseKey &base,
                                         Value cursor, Type pointeeType) {
+  // FR-98: a member-read-local root (FR-96) has no `symbols` place; the
+  // element resolves through a fresh Option-payload projection exactly
+  // like `emitPointerPlace`'s Arm A. (No multi-base region can currently
+  // carry this base — the join gate element-checks the member type, and a
+  // FAM tail's incomplete array type never matches — but the resolver
+  // stays total so a future admission cannot silently miss.)
+  if (base.member)
+    if (const clang::MemberExpr *rootInit = famMemberLocals.lookup(base.var)) {
+      FailureOr<Value> projected = emitFamOptionMemberProjection(
+          rootInit, llvm::cast<clang::FieldDecl>(rootInit->getMemberDecl()),
+          loc, /*writeback=*/nullptr);
+      if (failed(projected))
+        return failure();
+      FailureOr<Value> memberPlace =
+          projectMemberPlace(loc, *projected, base.member);
+      if (failed(memberPlace))
+        return failure();
+      return refineElementPlace(loc, *memberPlace, cursor, pointeeType);
+    }
   auto it = symbols.find(base.var);
   if (it == symbols.end())
     return emitError(loc) << "unsupported: pointer target '"
