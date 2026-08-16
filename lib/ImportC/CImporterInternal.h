@@ -1082,6 +1082,13 @@ struct GlobalCursorPlan {
 /// translation unit.
 void mergeRegionFacts(PointerRegion &target, const PointerRegion &absorbed);
 
+/// Whether `var` is assigned, incremented/decremented, or address-taken
+/// anywhere in `stmt` (a write TO the variable itself, not through it).
+/// Defined in ImportCPlanning.cpp (planFamLift's member-read-local gate);
+/// shared with the FR-98 member-base root-motion gate in ImportC.cpp, which
+/// must reject a member-array binding whose struct-pointer root moves.
+bool mutatesVar(const clang::Stmt *stmt, const clang::VarDecl *var);
+
 class PointerRegionAnalysis {
 public:
   /// Analyzes `body`, replacing any previous analysis state. `context` is
