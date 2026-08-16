@@ -647,6 +647,24 @@ LogicalResult CImporter::collectRecordFields(
             astContext().getAsConstantArrayType(field->getType());
         zeroLength && zeroLength->getSize().isZero())
       continue;
+    // FR-96: a pointer to an ADMITTED FAM record inside a container that
+    // is ITSELF an admitted FAM record is an OWNED NULLABLE member —
+    // `Option<pointee>` (`None` is C's null; the payload's Vec tail owns
+    // the allocation). Gated on the program-wide poison set: any
+    // unrecognized use keeps the historical i64 slot and the member-wall
+    // rejections, and a NON-FAM container keeps its i64 slot and Copy
+    // semantics (the whole-record-assignment rejection only covers FAM
+    // containers).
+    if (famOptionMemberPointee(field)) {
+      FailureOr<emitrust::OpaqueType> optionType =
+          famOptionMemberType(field, fieldLoc);
+      if (failed(optionType))
+        return failure();
+      if (failed(appendField(internName(mangleMemberName(field->getName())),
+                             *optionType, fieldLoc, field->getName())))
+        return failure();
+      continue;
+    }
     // A FILE* member of a MAIN-FILE record would store an owned handle
     // inside an aggregate, which the function-local handle model does not
     // cover (C99-48); the check must precede the data-pointer cursor

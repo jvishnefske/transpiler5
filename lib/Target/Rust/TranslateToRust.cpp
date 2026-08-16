@@ -1200,6 +1200,15 @@ bool RustEmitter::methodCallMutatesReceiver(emitrust::MethodCallOp call) {
   if (isa<emitrust::OpaqueType>(valueType)) {
     if (handleAnchorFor(call))
       return true;
+    // FR-96: the Option-member payload projection (`as_mut().unwrap()`)
+    // takes `&mut self` — the receiver binding must be mutable even though
+    // the composite spelling is outside the closed STL name set. Without
+    // this, a container whose only remaining projection is a read (its
+    // final `None` store is a proven-dead store the emitter drops) renders
+    // a non-mut binding and dies as rustc E0596 (found by the FR-96
+    // owned-free-wrapper shape).
+    if (call.getMethod().starts_with("as_mut"))
+      return true;
     // A recognized STL container: classify by the (closed) method-name set.
     return isMutatingStlMethod(call.getMethod());
   }
