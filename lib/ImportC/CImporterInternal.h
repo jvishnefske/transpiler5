@@ -1178,6 +1178,27 @@ public:
   /// stays pinned). Left unset, the arm never fires.
   std::function<bool(const clang::MemberExpr *)> famTailMemberQuery;
 
+  /// FR-96: optional query telling the walk whether a member pointer WRITE
+  /// `base->field = rhs` targets a LIFT-CANDIDATE member-held FAM field (a
+  /// pointer to an admitted FAM record inside a container that is itself an
+  /// admitted FAM record) with a RECOGNIZED right-hand side — the planned
+  /// `malloc(count + sizeof(S))` alloc form or a null pointer constant.
+  /// Such a write is owned by the Option-member machinery: the walk must
+  /// neither poison the field nor record per-instance member facts for it
+  /// (any UNRECOGNIZED use still poisons, which vetoes the lift
+  /// program-wide). Left unset, every member pointer write keeps the
+  /// historical poison/binding behavior.
+  std::function<bool(const clang::FieldDecl *, const clang::Expr *)>
+      famMemberWriteQuery;
+
+  /// FR-96: optional query telling the walk whether a local `S *`
+  /// declaration is a recognized MEMBER-READ local (`struct hs_index *hsi =
+  /// hse->search_index`) over a lifted member-held FAM field: every use
+  /// re-projects the member's Option payload (`as_mut().unwrap()`), so the
+  /// pointer-region model must not claim it. Left unset, the local keeps
+  /// its historical region tracking and located rejections.
+  std::function<bool(const clang::VarDecl *)> famMemberLocalQuery;
+
   /// The importer-owned registry of synthesized compound-literal backing
   /// declarations (C99-13): a decayed or address-taken block-scope
   /// compound literal binds its backing declaration as an ordinary local
@@ -2187,6 +2208,84 @@ private:
   /// sites.
   emitrust::OpaqueType famTailVecType(const clang::FieldDecl *tail);
 
+  /// FR-96: the ADMITTED FAM record behind a LIFT-CANDIDATE member-held
+  /// pointer field — `field` is a data pointer to an admitted FAM record,
+  /// its CONTAINER is itself an admitted FAM record (already non-Copy: this
+  /// wave's scope; a non-FAM container keeps its i64 slot and Copy
+  /// semantics), and the pointee is not the container itself (an `Option<S>`
+  /// field inside S would be an infinite-size type). Shape-only — no poison
+  /// consultation — so `planOwners`'s per-function walks can use it while
+  /// the poison set is still being built. Null otherwise.
+  const clang::RecordDecl *famMemberFieldShape(const clang::FieldDecl *field);
+
+  /// FR-96: `famMemberFieldShape` restricted to fields that actually LIFT:
+  /// the shape holds AND no unrecognized use poisoned the field
+  /// program-wide (`poisonedPtrFields` is complete after `planOwners`).
+  /// Every emission arm gates on this, so a poisoned field keeps the
+  /// historical member-wall rejection at each use.
+  const clang::RecordDecl *
+  famOptionMemberPointee(const clang::FieldDecl *field);
+
+  /// FR-96: the `Option<...>` opaque type of a lifted member-held FAM field
+  /// — the pointee record's struct SYMBOL inside `Option<...>`, so the
+  /// verbatim-rendered opaque spelling always agrees with the emitted
+  /// struct_def name.
+  FailureOr<emitrust::OpaqueType>
+  famOptionMemberType(const clang::FieldDecl *field, Location loc);
+
+  /// FR-96: classifies `expr` (trivia and value-preserving pointer casts
+  /// peeled) as a read of a LIFTED member-held FAM field — the member
+  /// expression itself, or a recognized member-read local bound to one —
+  /// returning the member expression to project through, or null.
+  const clang::MemberExpr *famOptionMemberOf(const clang::Expr *expr);
+
+  /// FR-94/95/96: the count-expression extraction shared by `planFamLift`
+  /// arm (a) and the FR-96 member arm: for `malloc(sizeExpr)` over admitted
+  /// `record`, resolves the never-rewritten size local, requires the
+  /// `sizeof(S) + count` sum, extracts the ELEMENT count for typed tails
+  /// (FR-95's numeric multiply fold, with its own count-local peel), and
+  /// enforces non-negativity, side-effect freedom, and count stability
+  /// against `body`. Returns the count expression, or null when the
+  /// allocation stays on its historical rejections. Diagnostic-free.
+  const clang::Expr *famMemberAllocCountExpr(const clang::Stmt *body,
+                                             const clang::RecordDecl *record,
+                                             const clang::CallExpr *alloc);
+
+  /// FR-96: whether the member pointer write `field = rhs` inside `func` is
+  /// owned by the Option-member machinery (the `famMemberWriteQuery`
+  /// predicate): a lift-candidate field with a null-constant or
+  /// recognized-alloc right-hand side.
+  bool famMemberLiftRecognizes(const clang::FunctionDecl *func,
+                               const clang::FieldDecl *field,
+                               const clang::Expr *rhs);
+
+  /// FR-96: the lifted member's Option place — `emitrust.member` of the
+  /// container's resolved base place at the `Option<...>` type.
+  FailureOr<Value> emitFamOptionMemberPlace(const clang::MemberExpr *member,
+                                            const clang::FieldDecl *field,
+                                            Location loc,
+                                            GlobalWriteback *writeback);
+
+  /// FR-96: a fresh PER-USE projection of the lifted member's payload —
+  /// `method_call ["as_mut().unwrap"] -> mut_ref<S> -> deref -> lvalue<S>`,
+  /// the FR-88 unwrap recipe one type deeper. Never let-bound: the
+  /// bound-borrow shape is rustc E0499 against the real do_indexing
+  /// structure (FR-96 spike), while per-use projections are NLL-safe.
+  /// `unwrap()`'s panic on None is the deterministic fail-loud refinement
+  /// of C's null-dereference undefined behavior.
+  FailureOr<Value>
+  emitFamOptionMemberProjection(const clang::MemberExpr *member,
+                                const clang::FieldDecl *field, Location loc,
+                                GlobalWriteback *writeback);
+
+  /// FR-96: lowers `base->field = rhs` on a lifted member — the `None`
+  /// literal for the null constant, or the recognized alloc as a temp
+  /// record value (tail `vec_fill`, `emitFamTailFill`'s FR-94 recipe)
+  /// moved through `Some(...)` into the member place.
+  LogicalResult emitFamOptionMemberAssign(const clang::MemberExpr *member,
+                                          const clang::FieldDecl *field,
+                                          const clang::Expr *rhs, Location loc);
+
   /// FR-94: pure-AST recognition of FAM-record owned-tail locals, owned-return
   /// allocators, and free-only wrapper parameters. For every function
   /// definition it scans (a) each local `S *d = malloc(sizeof(S) + n)` over an
@@ -2209,6 +2308,14 @@ private:
   /// struct-literal init), or the by-value call result for the owned-return
   /// form. Called from `emitLocalVar` when `famAllocLocals` holds `var`.
   LogicalResult emitFamLocal(const clang::VarDecl *var, Location loc);
+
+  /// FR-94/96: binds `record`'s admitted FAM tail member of the struct
+  /// place `place` to `vec![<zero>; count]` — the shared tail-initialization
+  /// tail of `emitFamLocal`'s direct-malloc form, reused by the FR-96
+  /// alloc-into-member temp (the translator fuses the member assign into
+  /// the struct-literal init in both positions).
+  LogicalResult emitFamTailFill(Value place, const clang::RecordDecl *record,
+                                const clang::Expr *countExpr, Location loc);
 
   /// W2.12: matches the ONE recognized `std::string_view` local
   /// initializer chain — `ImplicitCastExpr<ConstructorConversion>` over
@@ -5988,6 +6095,21 @@ private:
   /// probed and declined).
   llvm::DenseMap<const clang::RecordDecl *, const clang::FieldDecl *>
       famTailFieldCache;
+  /// FR-96: recognized alloc-into-member assignments (`hse->search_index =
+  /// malloc(index_sz + sizeof(struct hs_index))`, encoder.c:92-98), keyed
+  /// by the assignment's RIGHT-HAND expression (exactly the `rhs` that
+  /// `emitMemberPointerAssign` receives), holding the extracted tail count
+  /// expression. Recorded by `planFamLift`'s member arm; consulted by
+  /// `emitFamOptionMemberAssign`.
+  llvm::DenseMap<const clang::Expr *, const clang::Expr *>
+      famMemberAllocAssigns;
+  /// FR-96: recognized member-read locals (`struct hs_index *hsi =
+  /// hse->search_index`, encoder.c:420/463), keyed by declaration, holding
+  /// the initializing member expression every use re-projects (per-use
+  /// `as_mut().unwrap()` — the local itself binds NO code and the region
+  /// model skips it via `famMemberLocalQuery`).
+  llvm::DenseMap<const clang::VarDecl *, const clang::MemberExpr *>
+      famMemberLocals;
   /// Self-referential node-pool fields (`next`) that render as the nullable
   /// pool index `Option<usize>` (W4.2e Part B); the emission diverts their
   /// struct-field type and read/write lowering.

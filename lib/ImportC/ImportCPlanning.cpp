@@ -166,6 +166,17 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
        collectPassAFunctionDefinitions(unit)) {
     PointerRegionAnalysis analysis;
     analysis.literalTemps = &literalTemps;
+    // FR-96: a RECOGNIZED write to a lift-candidate member-held FAM field
+    // must not poison it HERE — this walk is what builds the program-wide
+    // `poisonedPtrFields` set the lift gates on. The query is pure shape
+    // recognition (planFamLift has not run yet, so no planned facts exist),
+    // and the emission-time prologues install the same predicate, so
+    // planning and emission agree by construction. Any unrecognized use
+    // still poisons and vetoes the lift.
+    analysis.famMemberWriteQuery = [this, func](const clang::FieldDecl *field,
+                                                const clang::Expr *rhs) {
+      return famMemberLiftRecognizes(func, field, rhs);
+    };
     analysis.analyze(astContext(), func->getBody());
 
     // Data-pointer parameters are class nodes; a pointer-to-pointer
@@ -2037,91 +2048,12 @@ void CImporter::planFamLift(const clang::TranslationUnitDecl *unit) {
                   continue;
                 if (const clang::CallExpr *alloc =
                         asAllocCall(var->getInit())) {
-                  if (alloc->getDirectCallee()->getName() != "malloc" ||
-                      alloc->getNumArgs() != 1)
-                    continue;
-                  // The size may route through a never-rewritten local
-                  // (`size_t sz = sizeof(S) + n; malloc(sz)` — heatshrink's
-                  // spelling); resolve it to its initializer.
-                  const clang::Expr *sizeExpr =
-                      peelToCore(alloc->getArg(0));
-                  if (const auto *szRef =
-                          llvm::dyn_cast<clang::DeclRefExpr>(sizeExpr))
-                    if (const auto *szVar = llvm::dyn_cast<clang::VarDecl>(
-                            szRef->getDecl());
-                        szVar && szVar->hasLocalStorage() &&
-                        !llvm::isa<clang::ParmVarDecl>(szVar) &&
-                        szVar->getInit() && !mutatesVar(body, szVar))
-                      sizeExpr = peelToCore(szVar->getInit());
-                  const auto *sum =
-                      llvm::dyn_cast<clang::BinaryOperator>(sizeExpr);
-                  if (!sum || sum->getOpcode() != clang::BO_Add)
-                    continue;
-                  uint64_t recordBytes = static_cast<uint64_t>(
-                      ctx.getTypeSizeInChars(ctx.getRecordType(record))
-                          .getQuantity());
-                  auto foldsToRecord = [&](const clang::Expr *e) {
-                    std::optional<llvm::APSInt> k = constInt(ctx, e);
-                    return k && !k->isNegative() &&
-                           k->getZExtValue() == recordBytes;
-                  };
-                  const clang::Expr *countExpr = nullptr;
-                  if (foldsToRecord(sum->getLHS()))
-                    countExpr = sum->getRHS();
-                  else if (foldsToRecord(sum->getRHS()))
-                    countExpr = sum->getLHS();
-                  if (!countExpr || countExpr->HasSideEffects(ctx))
-                    continue;
-                  // FR-95: a TYPED (non-u8) tail's count side is a byte
-                  // extent `k * sizeof(elem)` (heatshrink's
-                  // `buf_sz * sizeof(uint16_t)` — the factor folds
-                  // NUMERICALLY, so a uint16_t sizeof matches an int16_t
-                  // tail), possibly routed through its own never-rewritten
-                  // local (`size_t index_sz = k*sizeof(elem);
-                  // malloc(index_sz + sizeof(S))`, encoder.c:92-94). The
-                  // recorded count becomes the extracted ELEMENT count `k`;
-                  // an unmatched factor or the plain-add byte form keeps
-                  // the dedicated FAM-alloc rejection. The u8 arm keeps its
-                  // byte-count path untouched (bytes ARE elements).
-                  const clang::FieldDecl *tailField = famTailField(record);
-                  clang::QualType tailElement =
-                      ctx.getAsArrayType(tailField->getType())
-                          ->getElementType();
-                  if (!isU8ScalarType(tailElement)) {
-                    const clang::Expr *countSide = peelToCore(countExpr);
-                    if (const auto *countRef =
-                            llvm::dyn_cast<clang::DeclRefExpr>(countSide))
-                      if (const auto *countVar =
-                              llvm::dyn_cast<clang::VarDecl>(
-                                  countRef->getDecl());
-                          countVar && countVar->hasLocalStorage() &&
-                          !llvm::isa<clang::ParmVarDecl>(countVar) &&
-                          countVar->getInit() &&
-                          !mutatesVar(body, countVar))
-                        countSide = peelToCore(countVar->getInit());
-                    uint64_t elementBytes = static_cast<uint64_t>(
-                        ctx.getTypeSizeInChars(tailElement).getQuantity());
-                    countExpr =
-                        extractElementCount(ctx, countSide, elementBytes);
-                    if (!countExpr || countExpr->HasSideEffects(ctx))
-                      continue;
-                  }
-                  std::optional<llvm::APSInt> constCount =
-                      constInt(ctx, countExpr);
-                  if (constCount ? constCount->isNegative()
-                                 : !peelToCore(countExpr)
-                                        ->getType()
-                                        ->isUnsignedIntegerType())
-                    continue;
-                  llvm::SmallPtrSet<const clang::VarDecl *, 8> countVars;
-                  collectVars(countExpr, countVars);
-                  bool countStable = true;
-                  for (const clang::VarDecl *v : countVars)
-                    if (mutatesVar(body, v)) {
-                      countStable = false;
-                      break;
-                    }
-                  if (!countStable)
+                  // The count extraction (size-local peel, the sizeof(S)
+                  // sum, FR-95's typed-element multiply fold, stability)
+                  // is shared with the FR-96 member arm.
+                  const clang::Expr *countExpr =
+                      famMemberAllocCountExpr(body, record, alloc);
+                  if (!countExpr)
                     continue;
                   FamAllocFacts facts;
                   facts.countExpr = countExpr;
@@ -2330,6 +2262,193 @@ void CImporter::planFamLift(const clang::TranslationUnitDecl *unit) {
       }
     }
   }
+
+  // FR-96 member arm: record the recognized alloc-into-member assignments
+  // (keyed by the assignment's rhs — the key `emitMemberPointerAssign`
+  // receives) and the member-read locals whose every use re-projects the
+  // member. Pure recognition, outside the claims fixpoint (nothing here
+  // feeds the local-claim arms); unclaimed shapes keep their historical
+  // poison/rejections. The poison veto is applied at the USE sites via
+  // `famOptionMemberPointee` (planOwners completed the set before this
+  // planner runs).
+  auto peelValueCasts = [&](const clang::Expr *expr) -> const clang::Expr * {
+    const clang::Expr *e = stripTrivia(expr);
+    while (true) {
+      if (const clang::Expr *sub = peelPointerCast(ctx, e)) {
+        e = stripTrivia(sub);
+        continue;
+      }
+      if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+          cast && (cast->getCastKind() == clang::CK_LValueToRValue ||
+                   cast->getCastKind() == clang::CK_NoOp ||
+                   cast->getCastKind() == clang::CK_BitCast)) {
+        e = stripTrivia(cast->getSubExpr());
+        continue;
+      }
+      break;
+    }
+    return e;
+  };
+  for (const clang::FunctionDecl *func : funcs) {
+    const clang::Stmt *body = func->getBody();
+    if (!body)
+      continue;
+    std::function<void(const clang::Stmt *)> scanMembers =
+        [&](const clang::Stmt *s) {
+          if (!s)
+            return;
+          // Alloc-into-member: `base->field = malloc(count + sizeof(S))`
+          // (heatshrink's encoder.c:92-98 shape, size-local and FR-95
+          // multiply peels included).
+          if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(s);
+              binary && binary->getOpcode() == clang::BO_Assign)
+            if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(
+                    stripTrivia(binary->getLHS())))
+              if (const auto *field = llvm::dyn_cast<clang::FieldDecl>(
+                      member->getMemberDecl()))
+                if (const clang::RecordDecl *pointee =
+                        famMemberFieldShape(field))
+                  if (const clang::CallExpr *alloc =
+                          asAllocCall(binary->getRHS()))
+                    if (const clang::Expr *countExpr =
+                            famMemberAllocCountExpr(body, pointee, alloc))
+                      famMemberAllocAssigns[binary->getRHS()] = countExpr;
+          // Member-read locals: `struct hs_index *hsi = base->field;`
+          // (encoder.c:420/463). The base must be a stable named variable
+          // (never rewritten — each use re-emits the member expression)
+          // and the local itself never reassigned.
+          if (const auto *ds = llvm::dyn_cast<clang::DeclStmt>(s))
+            for (const clang::Decl *decl : ds->decls()) {
+              const auto *var = llvm::dyn_cast<clang::VarDecl>(decl);
+              if (!var || !var->hasLocalStorage() ||
+                  llvm::isa<clang::ParmVarDecl>(var) || !var->getInit() ||
+                  !isDataPointer(var->getType()))
+                continue;
+              const auto *member = llvm::dyn_cast<clang::MemberExpr>(
+                  peelValueCasts(var->getInit()));
+              if (!member)
+                continue;
+              const auto *field = llvm::dyn_cast<clang::FieldDecl>(
+                  member->getMemberDecl());
+              if (!field)
+                continue;
+              const clang::RecordDecl *pointee = famMemberFieldShape(field);
+              if (!pointee)
+                continue;
+              const clang::RecordDecl *varPointee = var->getType()
+                                                        .getCanonicalType()
+                                                        ->getPointeeType()
+                                                        ->getAsRecordDecl();
+              if (!varPointee ||
+                  varPointee->getDefinition() != pointee->getDefinition())
+                continue;
+              const auto *baseRef = llvm::dyn_cast<clang::DeclRefExpr>(
+                  peelValueCasts(member->getBase()));
+              const auto *baseVar =
+                  baseRef ? llvm::dyn_cast<clang::VarDecl>(baseRef->getDecl())
+                          : nullptr;
+              if (!baseVar || mutatesVar(body, baseVar) ||
+                  mutatesVar(body, var))
+                continue;
+              famMemberLocals[var] = member;
+            }
+          for (const clang::Stmt *child : s->children())
+            scanMembers(child);
+        };
+    scanMembers(body);
+  }
+}
+
+const clang::Expr *
+CImporter::famMemberAllocCountExpr(const clang::Stmt *body,
+                                   const clang::RecordDecl *record,
+                                   const clang::CallExpr *alloc) {
+  // FR-94/95/96: the shared malloc-count extraction (see the header doc).
+  clang::ASTContext &ctx = astContext();
+  const clang::FunctionDecl *callee = alloc->getDirectCallee();
+  if (!callee || callee->getName() != "malloc" || alloc->getNumArgs() != 1)
+    return nullptr;
+  const clang::FieldDecl *tailField = famTailField(record);
+  if (!tailField)
+    return nullptr;
+  // The size may route through a never-rewritten local
+  // (`size_t sz = sizeof(S) + n; malloc(sz)` — heatshrink's spelling);
+  // resolve it to its initializer.
+  const clang::Expr *sizeExpr = peelToCore(alloc->getArg(0));
+  if (const auto *szRef = llvm::dyn_cast<clang::DeclRefExpr>(sizeExpr))
+    if (const auto *szVar =
+            llvm::dyn_cast<clang::VarDecl>(szRef->getDecl());
+        szVar && szVar->hasLocalStorage() &&
+        !llvm::isa<clang::ParmVarDecl>(szVar) && szVar->getInit() &&
+        !mutatesVar(body, szVar))
+      sizeExpr = peelToCore(szVar->getInit());
+  const auto *sum = llvm::dyn_cast<clang::BinaryOperator>(sizeExpr);
+  if (!sum || sum->getOpcode() != clang::BO_Add)
+    return nullptr;
+  uint64_t recordBytes = static_cast<uint64_t>(
+      ctx.getTypeSizeInChars(ctx.getRecordType(record)).getQuantity());
+  auto foldsToRecord = [&](const clang::Expr *e) {
+    std::optional<llvm::APSInt> k = constInt(ctx, e);
+    return k && !k->isNegative() && k->getZExtValue() == recordBytes;
+  };
+  const clang::Expr *countExpr = nullptr;
+  if (foldsToRecord(sum->getLHS()))
+    countExpr = sum->getRHS();
+  else if (foldsToRecord(sum->getRHS()))
+    countExpr = sum->getLHS();
+  if (!countExpr || countExpr->HasSideEffects(ctx))
+    return nullptr;
+  // FR-95: a TYPED (non-u8) tail's count side is a byte extent
+  // `k * sizeof(elem)` (heatshrink's `buf_sz * sizeof(uint16_t)` — the
+  // factor folds NUMERICALLY, so a uint16_t sizeof matches an int16_t
+  // tail), possibly routed through its own never-rewritten local
+  // (`size_t index_sz = k*sizeof(elem); malloc(index_sz + sizeof(S))`,
+  // encoder.c:92-94). The recorded count becomes the extracted ELEMENT
+  // count `k`; an unmatched factor or the plain-add byte form keeps the
+  // dedicated FAM-alloc rejection. The u8 arm keeps its byte-count path
+  // untouched (bytes ARE elements).
+  clang::QualType tailElement =
+      ctx.getAsArrayType(tailField->getType())->getElementType();
+  if (!isU8ScalarType(tailElement)) {
+    const clang::Expr *countSide = peelToCore(countExpr);
+    if (const auto *countRef =
+            llvm::dyn_cast<clang::DeclRefExpr>(countSide))
+      if (const auto *countVar =
+              llvm::dyn_cast<clang::VarDecl>(countRef->getDecl());
+          countVar && countVar->hasLocalStorage() &&
+          !llvm::isa<clang::ParmVarDecl>(countVar) && countVar->getInit() &&
+          !mutatesVar(body, countVar))
+        countSide = peelToCore(countVar->getInit());
+    uint64_t elementBytes = static_cast<uint64_t>(
+        ctx.getTypeSizeInChars(tailElement).getQuantity());
+    countExpr = extractElementCount(ctx, countSide, elementBytes);
+    if (!countExpr || countExpr->HasSideEffects(ctx))
+      return nullptr;
+  }
+  std::optional<llvm::APSInt> constCount = constInt(ctx, countExpr);
+  if (constCount ? constCount->isNegative()
+                 : !peelToCore(countExpr)->getType()->isUnsignedIntegerType())
+    return nullptr;
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> countVars;
+  collectVars(countExpr, countVars);
+  for (const clang::VarDecl *v : countVars)
+    if (mutatesVar(body, v))
+      return nullptr;
+  return countExpr;
+}
+
+bool CImporter::famMemberLiftRecognizes(const clang::FunctionDecl *func,
+                                        const clang::FieldDecl *field,
+                                        const clang::Expr *rhs) {
+  const clang::RecordDecl *pointee = famMemberFieldShape(field);
+  if (!pointee || !func || !func->getBody())
+    return false;
+  if (isNullPointerConstantExpr(rhs))
+    return true;
+  const clang::CallExpr *alloc = asAllocCall(rhs);
+  if (!alloc)
+    return false;
+  return famMemberAllocCountExpr(func->getBody(), pointee, alloc) != nullptr;
 }
 
 void CImporter::collectCellSliceCallFacts(clang::ASTContext &context) {

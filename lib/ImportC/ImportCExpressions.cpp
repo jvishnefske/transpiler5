@@ -1230,6 +1230,26 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
                 ValueRange{})
             .getResult(0);
       }
+      // FR-96: a LIFTED member-held FAM field's null test is REAL — `None`
+      // is the unallocated/freed state — so it must never reach the
+      // statically-non-null fold below. Same let-bound Option discriminant
+      // shape as the FR-88 nullable parameter, on the member's place; a
+      // member-read local's own null test projects the same member.
+      if (const clang::MemberExpr *optMember =
+              famOptionMemberOf(pointerSide)) {
+        const auto *optField =
+            llvm::cast<clang::FieldDecl>(optMember->getMemberDecl());
+        FailureOr<Value> place = emitFamOptionMemberPlace(
+            optMember, optField, loc, /*writeback=*/nullptr);
+        if (failed(place))
+          return failure();
+        return builder
+            .create<emitrust::MethodCallOp>(
+                loc, TypeRange{builder.getI1Type()}, *place,
+                builder.getStringAttr(isEq ? "is_none" : "is_some"),
+                ValueRange{})
+            .getResult(0);
+      }
       FailureOr<PtrExprValue> pointer = emitPointerRValue(pointerSide);
       if (failed(pointer))
         return failure();

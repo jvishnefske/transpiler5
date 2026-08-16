@@ -1131,6 +1131,12 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
   // emitter routes the local to its owned struct binding).
   if (famValueLocalQuery && famValueLocalQuery(ptr))
     return;
+  // FR-96: a recognized member-read local over a lifted member-held FAM
+  // field (`struct hs_index *hsi = hse->search_index`) re-projects the
+  // member's Option payload at every use — the region model never claims
+  // it (the emitter binds no code for the declaration at all).
+  if (famMemberLocalQuery && famMemberLocalQuery(ptr))
+    return;
   const clang::Expr *e = stripTrivia(rhs);
   clang::SourceLocation loc = e->getBeginLoc();
 
@@ -1586,21 +1592,31 @@ void PointerRegionAnalysis::visit(const clang::Stmt *stmt) {
           recordPointerWrite(cursorParam, binary->getRHS());
         } else if (const clang::FieldDecl *field =
                        dataPointerFieldOf(binary->getLHS())) {
-          // `s.f = rhs` on a directly named instance binds the member;
-          // a write through any other place (an arrow, a subscripted
-          // element, a nested member) has an instance path outside the
-          // model and poisons the field program-wide.
-          const auto *member = llvm::cast<clang::MemberExpr>(
-              stripTrivia(binary->getLHS()));
-          const clang::VarDecl *instance = nullptr;
-          if (!member->isArrow())
-            if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
-                    stripTrivia(member->getBase())))
-              instance = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
-          if (instance)
-            recordMemberPointerWrite(instance, field, binary->getRHS());
-          else
-            poisonMemberField(field, binary->getOperatorLoc());
+          // FR-96: a RECOGNIZED write to a lift-candidate member-held FAM
+          // field (the planned alloc form or the null constant) is owned
+          // by the Option-member machinery — neither a poison nor a
+          // per-instance member fact. Any unrecognized write falls through
+          // and poisons, vetoing the lift program-wide.
+          if (famMemberWriteQuery &&
+              famMemberWriteQuery(field, binary->getRHS())) {
+            // Owned by the FR-96 Option-member lowering.
+          } else {
+            // `s.f = rhs` on a directly named instance binds the member;
+            // a write through any other place (an arrow, a subscripted
+            // element, a nested member) has an instance path outside the
+            // model and poisons the field program-wide.
+            const auto *member = llvm::cast<clang::MemberExpr>(
+                stripTrivia(binary->getLHS()));
+            const clang::VarDecl *instance = nullptr;
+            if (!member->isArrow())
+              if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+                      stripTrivia(member->getBase())))
+                instance = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+            if (instance)
+              recordMemberPointerWrite(instance, field, binary->getRHS());
+            else
+              poisonMemberField(field, binary->getOperatorLoc());
+          }
         }
       } else if (const clang::VarDecl *var =
                      trackedWritePlaceRoot(binary->getLHS())) {
@@ -2048,6 +2064,12 @@ LogicalResult CImporter::emitMemberPointerAssign(
     // pair.
     if (member->isArrow() && poolNextFields.contains(field->getCanonicalDecl()))
       return emitPoolNextFieldAssign(member, rhs, loc);
+    // FR-96: a LIFTED member-held FAM field write — `None` for the null
+    // constant, `Some(temp record)` for the planned alloc form. A poisoned
+    // field never reaches this arm and keeps the member-wall rejection
+    // below.
+    if (famOptionMemberPointee(field))
+      return emitFamOptionMemberAssign(member, field, rhs, loc);
   }
   FailureOr<const MemberPointerFacts *> binding =
       resolveMemberPointerBinding(member, loc);
@@ -4471,6 +4493,90 @@ emitrust::OpaqueType CImporter::famTailVecType(const clang::FieldDecl *tail) {
                                    "Vec<" + *spelling + ">");
 }
 
+const clang::RecordDecl *
+CImporter::famMemberFieldShape(const clang::FieldDecl *field) {
+  // FR-96: the lift-candidate shape — a data pointer to an ADMITTED FAM
+  // record held inside a container that is ITSELF an admitted FAM record.
+  // The container gate is this wave's scope: a FAM container is already
+  // non-Copy (its Vec tail drops the derive), so the owned Option payload
+  // cannot be duplicated by a whole-record copy — that shape rejects at
+  // `emitAssign`. C path only (famTailField declines on the C++ path).
+  if (!field || !isDataPointer(field->getType()))
+    return nullptr;
+  const clang::RecordDecl *pointee = field->getType()
+                                         .getCanonicalType()
+                                         ->getPointeeType()
+                                         ->getAsRecordDecl();
+  if (!pointee || !famTailField(pointee))
+    return nullptr;
+  const clang::RecordDecl *container = field->getParent();
+  if (!container || !famTailField(container))
+    return nullptr;
+  // A self-referential member (`struct node *next` inside node) would be
+  // an infinite-size `Option<S>` field inside S; it stays on the wall.
+  if (pointee->getDefinition() == container->getDefinition())
+    return nullptr;
+  return pointee;
+}
+
+const clang::RecordDecl *
+CImporter::famOptionMemberPointee(const clang::FieldDecl *field) {
+  const clang::RecordDecl *pointee = famMemberFieldShape(field);
+  // The poison set is complete after planOwners: any use outside the
+  // recognized family (address-of, ++/--, unrecognized alloc forms,
+  // whole-struct init paths) vetoed the lift, and every use keeps the
+  // historical member-wall rejection.
+  if (!pointee || poisonedPtrFields.count(field))
+    return nullptr;
+  return pointee;
+}
+
+FailureOr<emitrust::OpaqueType>
+CImporter::famOptionMemberType(const clang::FieldDecl *field, Location loc) {
+  clang::QualType pointee =
+      field->getType().getCanonicalType()->getPointeeType();
+  FailureOr<Type> structType = mapType(pointee, loc);
+  if (failed(structType))
+    return failure();
+  auto record = llvm::dyn_cast<emitrust::StructType>(*structType);
+  if (!record) // Defensive; the shape admitted a FAM record pointee.
+    return emitError(loc) << "unsupported: flexible-array record type";
+  return emitrust::OpaqueType::get(
+      builder.getContext(), ("Option<" + record.getName() + ">").str());
+}
+
+const clang::MemberExpr *
+CImporter::famOptionMemberOf(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (true) {
+    if (const clang::Expr *sub = peelPointerCast(astContext(), e)) {
+      e = stripTrivia(sub);
+      continue;
+    }
+    if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+        cast && (cast->getCastKind() == clang::CK_LValueToRValue ||
+                 cast->getCastKind() == clang::CK_NoOp ||
+                 cast->getCastKind() == clang::CK_BitCast)) {
+      e = stripTrivia(cast->getSubExpr());
+      continue;
+    }
+    break;
+  }
+  const clang::MemberExpr *member = llvm::dyn_cast<clang::MemberExpr>(e);
+  if (!member) {
+    // A recognized member-read local stands for its initializing member
+    // expression; every use re-projects it.
+    if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e))
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+        member = famMemberLocals.lookup(var);
+    if (!member)
+      return nullptr;
+  }
+  const auto *field =
+      llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
+  return field && famOptionMemberPointee(field) ? member : nullptr;
+}
+
 bool CImporter::exprRootsInByteRegion(const clang::Expr *expr) {
   const clang::Expr *e = expr->IgnoreParenImpCasts();
   if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e)) {
@@ -5764,6 +5870,15 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
 FailureOr<Value>
 CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
                                GlobalWriteback *writeback) {
+  // FR-96: `->` through a LIFTED member-held FAM field — directly
+  // (`hse->search_index->size`) or through a recognized member-read local
+  // (`hsi->index[i]` after `hsi = hse->search_index`) — resolves to a
+  // fresh PER-USE projection of the member's Option payload.
+  if (member->isArrow())
+    if (const clang::MemberExpr *inner = famOptionMemberOf(member->getBase()))
+      return emitFamOptionMemberProjection(
+          inner, llvm::cast<clang::FieldDecl>(inner->getMemberDecl()), loc,
+          writeback);
   Value basePlace;
   const clang::CallExpr *erasedCall = nullptr;
   const clang::VarDecl *erasedBase =
@@ -5852,6 +5967,61 @@ CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
   if (!baseType || !llvm::isa<emitrust::StructType>(baseType.getValueType()))
     return emitError(loc) << "unsupported member access base";
   return basePlace;
+}
+
+FailureOr<Value>
+CImporter::emitFamOptionMemberPlace(const clang::MemberExpr *member,
+                                    const clang::FieldDecl *field,
+                                    Location loc,
+                                    GlobalWriteback *writeback) {
+  // FR-96: the member's Option place. The container base resolves through
+  // the ordinary member-base machinery (`&mut S` parameters, owned FAM
+  // locals, FR-94 owned-by-value wrapper parameters, dot chains) and
+  // unresolvable bases keep their located rejections there.
+  FailureOr<Value> base = emitMemberBasePlace(member, loc, writeback);
+  if (failed(base))
+    return failure();
+  FailureOr<emitrust::OpaqueType> optionType =
+      famOptionMemberType(field, loc);
+  if (failed(optionType))
+    return failure();
+  return builder
+      .create<emitrust::MemberOp>(
+          loc, emitrust::LValueType::get(*optionType), *base,
+          builder.getStringAttr(flattenedFieldName(field)))
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitFamOptionMemberProjection(const clang::MemberExpr *member,
+                                         const clang::FieldDecl *field,
+                                         Location loc,
+                                         GlobalWriteback *writeback) {
+  // FR-96: the per-use payload projection — `as_mut().unwrap()` borrowed
+  // fresh at every use and consumed immediately (NLL-safe; the let-bound
+  // borrow shape is rustc E0499 against the real do_indexing structure).
+  // `unwrap()`'s panic on None is the deterministic fail-loud refinement
+  // of C's null-dereference undefined behavior (the FR-88 precedent).
+  FailureOr<Value> optionPlace =
+      emitFamOptionMemberPlace(member, field, loc, writeback);
+  if (failed(optionPlace))
+    return failure();
+  clang::QualType pointee =
+      field->getType().getCanonicalType()->getPointeeType();
+  FailureOr<Type> structType = mapType(pointee, loc);
+  if (failed(structType))
+    return failure();
+  Value borrow =
+      builder
+          .create<emitrust::MethodCallOp>(
+              loc, TypeRange{Type(emitrust::MutRefType::get(*structType))},
+              *optionPlace, builder.getStringAttr("as_mut().unwrap"),
+              ValueRange{})
+          .getResult(0);
+  return builder
+      .create<emitrust::DerefOp>(loc, emitrust::LValueType::get(*structType),
+                                 borrow)
+      .getResult();
 }
 
 Value CImporter::createBitFieldMask(Location loc, IntegerType backingType,

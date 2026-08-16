@@ -5685,6 +5685,59 @@ piece and becomes FR-45.
   double / mismatched-arithmetic / void-view shapes, wordings
   preserved). Full suite 656/656.
 
+- [x] FR-96 Member-held owned FAM records as nullable owned fields
+  (the FR-95-named front: heatshrink_encoder — itself a FAM
+  record — holds `struct hs_index *search_index`, allocated
+  inline in encoder_alloc, read into locals for indexing, freed
+  in encoder_free; every hs_index function blocks on this wall).
+  The composition candidate: a struct FIELD holding a pointer to
+  an admitted FAM record becomes an OWNED NULLABLE member —
+  `Option<HsIndex>` (FR-94's owned value type + the FR-88 Option
+  machinery) — with alloc-into-member = Some(value) assignment,
+  member-read-then-index lowering through as_mut/as_ref borrows
+  of the field's payload, free-of-member = None assignment, and
+  null tests on the member = is_some/is_none; the containing
+  record's Copy drops (FR-94's non-Copy-field detection
+  generalizes from opaque to struct fields — the container is
+  itself a FAM record here, already non-Copy). THE RISK SURFACE:
+  the member-read local (`hs_index *hsi = hse->search_index`)
+  binds a BORROW of the field's payload — its lifetime vs other
+  uses of hse in the same scope is the FR-93 aliasing question
+  one level deeper (spike must measure the real encoder shapes
+  against rustc); escaping the borrow stays located. NO-GO
+  recordable — this is the deepest ownership composition yet.
+  Gates (if GO): Import pins (field decl, Some-assignment,
+  guarded member-read + indexing, None-assignment/free, null
+  tests) + frontier arms; EndToEnd byte-diff (the two-record
+  lifecycle, argc-seeded, vs clang native); external re-probe
+  (encoder search_index family + fractions measured); full lit
+  100%; C path only.
+  **SPIKE VERDICT: GO (2026-08-15).** The borrow question resolved
+  by MEASUREMENT: the let-bound member-read borrow fails rustc
+  E0499 on the real do_indexing structure (hsi held while
+  get_input_offset(hse) is called), so the member-read local is an
+  FR-93-style STATIC BINDING whose every use projects
+  `hse.search_index.as_mut().unwrap()` FRESH — a short-lived
+  borrow consumed immediately, NLL-safe on both real encoder
+  functions. The dialect needed NOTHING new: opaque
+  Option<hs_index> field + the FR-88 machinery one type deeper
+  (method_call "as_mut().unwrap" -> mut_ref<struct> -> deref ->
+  member/subscript, mirroring the ImportCHosted unwrap recipe);
+  Some(%val) renders a MOVE fusing the vec-fill struct literal;
+  free-of-member = None store. Field typing is TU-GLOBAL and
+  survives the allocating function being dropped on the separate
+  returned-pointer wall (poison suppression — a dropped alloc
+  must not re-poison); the encoder_alloc NULL guard lowers
+  FAITHFULLY to an infallibly-false is_none (no elision
+  widening). unwrap-on-None is the legal fail-loud refinement of
+  C's NULL-deref UB. Escapes/address-of/++/returned members keep
+  measured rejections; admission scoped to already-non-Copy (FAM)
+  containers. Honest externals: encoder 20->22/28
+  (find_longest_match + encoder_free); do_indexing additionally
+  blocks on an i16-array byte-splat memset (named micro-front);
+  encoder_alloc stays on the returned-pointer front.
+  Full suite 659/659.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test

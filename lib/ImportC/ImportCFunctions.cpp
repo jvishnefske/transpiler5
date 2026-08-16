@@ -650,6 +650,18 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
             llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
         return leaf && famTailField(leaf->getParent()) == leaf;
       };
+  // FR-96: member-read locals over lifted member-held FAM fields bypass
+  // the region model (every use is a fresh Option projection), and a
+  // recognized member write is owned by the Option-member machinery —
+  // the same predicate planOwners used, so the poison set and the
+  // emission agree.
+  pointerRegions.famMemberLocalQuery = [this](const clang::VarDecl *var) {
+    return famMemberLocals.contains(var);
+  };
+  pointerRegions.famMemberWriteQuery =
+      [this, func](const clang::FieldDecl *field, const clang::Expr *rhs) {
+        return famMemberLiftRecognizes(func, field, rhs);
+      };
   // FR-93: member-array decays bound to pointer locals classify through
   // the shared admission (typed member-place backings and byte-region
   // window roots); the classifier itself gates the C++ path off.
@@ -1465,6 +1477,15 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
         const auto *leaf =
             llvm::dyn_cast<clang::FieldDecl>(member->getMemberDecl());
         return leaf && famTailField(leaf->getParent()) == leaf;
+      };
+  // FR-96: same member-read-local bypass and recognized-member-write
+  // ownership as the non-clone prologue above.
+  pointerRegions.famMemberLocalQuery = [this](const clang::VarDecl *var) {
+    return famMemberLocals.contains(var);
+  };
+  pointerRegions.famMemberWriteQuery =
+      [this, func](const clang::FieldDecl *field, const clang::Expr *rhs) {
+        return famMemberLiftRecognizes(func, field, rhs);
       };
   // FR-93: same member-array decay classification as the non-clone
   // prologue above.

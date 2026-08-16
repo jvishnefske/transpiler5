@@ -1950,7 +1950,15 @@ LogicalResult CImporter::emitFamLocal(const clang::VarDecl *var,
     builder.create<emitrust::AssignOp>(loc, place, *value);
     return success();
   }
-  const clang::FieldDecl *tail = famTailField(pointee->getAsRecordDecl());
+  return emitFamTailFill(place, pointee->getAsRecordDecl(), facts.countExpr,
+                         loc);
+}
+
+LogicalResult CImporter::emitFamTailFill(Value place,
+                                         const clang::RecordDecl *record,
+                                         const clang::Expr *countExpr,
+                                         Location loc) {
+  const clang::FieldDecl *tail = famTailField(record);
   if (!tail) // Defensive; planFamLift only claims admitted records.
     return emitError(loc) << "unsupported: flexible-array record type";
   auto vecType = famTailVecType(tail);
@@ -1960,13 +1968,13 @@ LogicalResult CImporter::emitFamLocal(const clang::VarDecl *var,
               loc, emitrust::LValueType::get(vecType), place,
               builder.getStringAttr(flattenedFieldName(tail)))
           .getResult();
-  // The tail count is imported once at the decl site — exactly where malloc
-  // evaluates it — and widened to i64 for `vec![<zero>; n as usize]`. The
-  // suffixed zero fill (`0u8` for the byte tail, `0i16`/`0.0f32`/... for
+  // The tail count is imported once at the binding site — exactly where
+  // malloc evaluates it — and widened to i64 for `vec![<zero>; n as usize]`.
+  // The suffixed zero fill (`0u8` for the byte tail, `0i16`/`0.0f32`/... for
   // typed tails, mirroring `emitVecLocal`) is the sound refinement of
   // malloc's indeterminate tail bytes (a defined program writes each
   // element before reading it).
-  FailureOr<Value> count = emitRValue(facts.countExpr);
+  FailureOr<Value> count = emitRValue(countExpr);
   if (failed(count))
     return failure();
   Value count64 = castToIntType(loc, *count, builder.getIntegerType(64));
@@ -1987,6 +1995,60 @@ LogicalResult CImporter::emitFamLocal(const clang::VarDecl *var,
                                                   builder.getStringAttr(fill))
                      .getResult();
   builder.create<emitrust::AssignOp>(loc, tailPlace, filled);
+  return success();
+}
+
+LogicalResult CImporter::emitFamOptionMemberAssign(
+    const clang::MemberExpr *member, const clang::FieldDecl *field,
+    const clang::Expr *rhs, Location loc) {
+  // FR-96: `base->field = rhs` on a lifted member-held FAM field.
+  FailureOr<Value> optionPlace =
+      emitFamOptionMemberPlace(member, field, loc, /*writeback=*/nullptr);
+  if (failed(optionPlace))
+    return failure();
+  FailureOr<emitrust::OpaqueType> optionType = famOptionMemberType(field, loc);
+  if (failed(optionType))
+    return failure();
+  // `base->field = NULL` (and `free(base->field)`, routed here by the free
+  // handler as a None store): dropping the old payload IS the deallocation.
+  if (isNullPointerConstantExpr(rhs)) {
+    Value none = builder
+                     .create<emitrust::LiteralOp>(
+                         loc, *optionType, builder.getStringAttr("None"))
+                     .getResult();
+    builder.create<emitrust::AssignOp>(loc, *optionPlace, none);
+    return success();
+  }
+  // The recognized alloc form: a temp record value whose tail binds
+  // `vec![<zero>; n]` (the translator fuses the member assign into the
+  // struct-literal init — `S { tail: vec![...], ..S::default() }`), moved
+  // through `Some(...)` into the member place.
+  auto alloc = famMemberAllocAssigns.find(rhs);
+  if (alloc == famMemberAllocAssigns.end())
+    // Defensive; an unrecognized write poisoned the field in Pass A, so it
+    // cannot reach the lifted arm.
+    return emitError(loc)
+           << "unsupported: pointer struct member assigned this value";
+  clang::QualType pointee =
+      field->getType().getCanonicalType()->getPointeeType();
+  FailureOr<Type> structType = mapType(pointee, loc);
+  if (failed(structType))
+    return failure();
+  if (!llvm::isa<emitrust::StructType>(*structType))
+    return emitError(loc) << "unsupported: flexible-array record type";
+  Value temp = createVariablePlace(loc, *structType);
+  if (failed(emitFamTailFill(temp, pointee->getAsRecordDecl(), alloc->second,
+                             loc)))
+    return failure();
+  Value moved =
+      builder.create<emitrust::LoadOp>(loc, *structType, temp).getResult();
+  Value some = builder
+                   .create<emitrust::CallOpaqueOp>(
+                       loc, TypeRange{Type(*optionType)},
+                       builder.getStringAttr("Some"),
+                       /*args=*/ArrayAttr(), ValueRange{moved})
+                   .getResult(0);
+  builder.create<emitrust::AssignOp>(loc, *optionPlace, some);
   return success();
 }
 
@@ -4803,6 +4865,32 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
                     llvm::dyn_cast<clang::ParmVarDecl>(ref->getDecl());
                 parm && famOwnedParams.contains(parm))
               return success();
+        }
+        // FR-96: `free(base->field)` on a lifted member-held FAM record
+        // (heatshrink_encoder_free's `HEATSHRINK_FREE(hse->search_index,
+        // ...)`, encoder.c:110) — the member owns its payload, so storing
+        // `None` drops it, which IS the deallocation. A member-read local
+        // (`free(hsi)`) frees the same owned payload and routes
+        // identically.
+        if (const clang::MemberExpr *member = famOptionMemberOf(arg)) {
+          const auto *field =
+              llvm::cast<clang::FieldDecl>(member->getMemberDecl());
+          FailureOr<Value> place =
+              emitFamOptionMemberPlace(member, field, freeLoc,
+                                       /*writeback=*/nullptr);
+          if (failed(place))
+            return failure();
+          FailureOr<emitrust::OpaqueType> optionType =
+              famOptionMemberType(field, freeLoc);
+          if (failed(optionType))
+            return failure();
+          Value none = builder
+                           .create<emitrust::LiteralOp>(
+                               freeLoc, *optionType,
+                               builder.getStringAttr("None"))
+                           .getResult();
+          builder.create<emitrust::AssignOp>(freeLoc, *place, none);
+          return success();
         }
         return emitError(freeLoc)
                << "unsupported: free of a pointer not rooted in a "
