@@ -394,6 +394,71 @@ static bool isUnsignedByteRegion(Value slice) {
   return intType && intType.isUnsigned();
 }
 
+/// FR-97 (generalizing FR-87's u32 subset): the byte width of a TYPED
+/// integer element admitted for the gated byte-splat memset image
+/// (i16/ui16/i32/ui32/i64/ui64), or nullopt outside the map. The byte
+/// elements (i8/ui8) ride the historical byte helpers and are
+/// deliberately excluded.
+static std::optional<unsigned> typedSplatWidthBytes(Type element) {
+  auto intType = llvm::dyn_cast<IntegerType>(element);
+  // The importer spells C's signed integers signless and its unsigned
+  // ones explicitly Unsigned; an explicitly Signed type never occurs.
+  if (!intType || intType.isSigned())
+    return std::nullopt;
+  switch (intType.getWidth()) {
+  case 16:
+  case 32:
+  case 64:
+    return intType.getWidth() / 8;
+  default:
+    return std::nullopt;
+  }
+}
+
+/// The diagnostic spelling of a typed integer region: the FR-87 u32
+/// wording ("an unsigned int region") is pinned verbatim by the FR-87
+/// frontier tests; every other mapped width shares one generalized
+/// spelling.
+static llvm::StringRef typedRegionDesc(Type element) {
+  auto intType = llvm::cast<IntegerType>(element);
+  return intType.getWidth() == 32 && intType.isUnsigned()
+             ? "an unsigned int region"
+             : "a typed integer region";
+}
+
+/// The per-width word-fill helper image for a mapped splat element (see
+/// kStringHelpers in ImportCFunctions.cpp).
+static llvm::StringRef typedSplatHelper(Type element) {
+  auto intType = llvm::cast<IntegerType>(element);
+  bool isUnsignedElement = intType.isUnsigned();
+  switch (intType.getWidth()) {
+  case 16:
+    return isUnsignedElement ? "__emitrust_memset_u16"
+                             : "__emitrust_memset_i16";
+  case 32:
+    return isUnsignedElement ? "__emitrust_memset_u32"
+                             : "__emitrust_memset_i32";
+  default:
+    return isUnsignedElement ? "__emitrust_memset_u64"
+                             : "__emitrust_memset_i64";
+  }
+}
+
+/// Whether a resolved i64 element cursor is the constant 0 — the
+/// whole-array decay `memset(a, ...)`. FR-97 admits only whole LOCAL
+/// arrays; an offset destination (`memset(a + 1, ...)`) is unexercised
+/// by the motivating corpus and keeps the historical located rejection
+/// this wave.
+static bool isConstantZeroIndex(Value cursor) {
+  if (!cursor)
+    return false;
+  auto constant = cursor.getDefiningOp<arith::ConstantOp>();
+  if (!constant)
+    return false;
+  auto attr = llvm::dyn_cast<IntegerAttr>(constant.getValue());
+  return attr && attr.getValue().isZero();
+}
+
 FailureOr<Value> CImporter::emitCharRegionSlice(Location loc,
                                                 const PtrExprValue &pointer,
                                                 bool isMut,
@@ -510,15 +575,13 @@ CImporter::emitByteRegionArg(const clang::Expr *expr, bool isMut,
     Type i8Type = builder.getIntegerType(8);
     Type ui8Type =
         IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
-    Type ui32Type =
-        IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
-    // Only the elements with an admitted (or explicitly gated: ui32 is
-    // memset-destination-only) helper image take the member channel;
-    // every other element declines so the historical located rejection
-    // stays verbatim.
+    // Only the elements with an admitted (or explicitly gated: the
+    // FR-97 typed-integer widths are memset-destination-only) helper
+    // image take the member channel; every other element declines so
+    // the historical located rejection stays verbatim.
     if (*matched && (arg.memberElement == i8Type ||
                      arg.memberElement == ui8Type ||
-                     arg.memberElement == ui32Type))
+                     typedSplatWidthBytes(arg.memberElement)))
       return arg;
   }
   FailureOr<PtrExprValue> pointer = emitCharRegionArg(expr);
@@ -538,13 +601,15 @@ FailureOr<Value> CImporter::emitByteRegionSlice(Location loc,
   Type i8Type = builder.getIntegerType(8);
   Type ui8Type =
       IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
-  // FR-87 u32 gate: the only admitted u32 use is the memset destination,
-  // which `emitMemsetCall` lowers itself (word-fill image) before ever
-  // reaching here — every other byte-family (and str*-family) position
-  // rejects located, mirroring FR-72's unsigned-char-region wording.
+  // FR-87/97 typed gate: the only admitted typed-integer use is the
+  // memset destination, which `emitMemsetCall` lowers itself (word-fill
+  // image) before ever reaching here — every other byte-family (and
+  // str*-family) position rejects located, mirroring FR-72's
+  // unsigned-char-region wording (the FR-87 u32 spelling verbatim; the
+  // FR-97 widths share the generalized spelling).
   if (arg.memberElement != i8Type && arg.memberElement != ui8Type)
     return emitError(loc) << "unsupported: string function argument over "
-                             "an unsigned int region";
+                          << typedRegionDesc(arg.memberElement);
   if (arg.memberElement == ui8Type && !allowUnsignedByte)
     return emitError(loc) << "unsupported: string function argument over "
                              "an unsigned char region";
@@ -630,45 +695,91 @@ LogicalResult CImporter::emitMemsetCall(const clang::CallExpr *call) {
     return emitError(loc) << "unsupported: memset argument type";
   Value fill = castToIntType(loc, *byte, builder.getI32Type());
   Value count = castToIntType(loc, *n, builder.getIntegerType(64));
-  Type ui32Type =
-      IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
-  if (dst->isMember() && dst->memberElement == ui32Type) {
-    // FR-87 u32 subset: a `unsigned int` member array as the memset
-    // DESTINATION is byte-fillable exactly — memset semantics are bytes
-    // — when the byte count provably covers whole words (compile-time
-    // constant, multiple of 4) and the fill byte is a compile-time
-    // constant, so the fill WORD is its replication b * 0x01010101
-    // (endianness-neutral: all four bytes equal; the spike's byte-diff
-    // caught a hand-picked word constant here). The element cursor and
-    // the byte count pass through to the `__emitrust_memset_u32` word
-    // walker unchanged. Everything outside the subset rejects located.
+  // FR-97 (generalizing FR-87's u32 member subset): a TYPED integer
+  // array as the memset DESTINATION is byte-fillable exactly — memset
+  // semantics are bytes — when the byte count provably covers whole
+  // elements (compile-time constant, multiple of the element size) and
+  // the fill byte is a compile-time constant, so the fill WORD is its
+  // per-width replication b * 0x0101 / 0x01010101 / 0x0101010101010101
+  // (endianness-neutral: all bytes equal; the FR-87 spike's byte-diff
+  // caught a hand-picked word constant here — 0xAB is the proof byte).
+  // Destinations: FR-87's MEMBER regions at every mapped width, and —
+  // FR-97 — a whole LOCAL typed array (constant-zero cursor; offset
+  // destinations keep the historical located rejection this wave). The
+  // element cursor and the byte count pass through to the per-width
+  // `__emitrust_memset_*` word walker unchanged. Everything inside the
+  // typed subset but outside the gates rejects located.
+  Type splatElement;
+  Value splatPlace;
+  Value splatCursor;
+  if (dst->isMember()) {
+    if (typedSplatWidthBytes(dst->memberElement)) {
+      splatElement = dst->memberElement;
+      splatPlace = dst->memberPlace;
+      splatCursor = dst->memberCursor;
+    }
+  } else if (const PtrExprValue &ptr = dst->pointer;
+             ptr.base && !ptr.literalBacking && !ptr.slicePlace &&
+             !ptr.backing && !ptr.nonNull && !ptr.baseIndex &&
+             ptr.multiBases.empty() && !ptr.member &&
+             isConstantZeroIndex(ptr.cursor)) {
+    // The LOCAL typed-array destination: the same place resolution
+    // `emitCharRegionSlice` uses (which would reject every non-byte
+    // element with the char-array wording), restricted to the plain
+    // single-base whole-object pointer shape.
+    auto it = symbols.find(ptr.base);
+    if (it != symbols.end()) {
+      if (auto lvalueType =
+              llvm::dyn_cast<emitrust::LValueType>(it->second.getType()))
+        if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(
+                lvalueType.getValueType()))
+          if (typedSplatWidthBytes(arrayType.getElementType())) {
+            splatElement = arrayType.getElementType();
+            splatPlace = it->second;
+            splatCursor = ptr.cursor;
+          }
+    }
+  }
+  if (splatElement) {
+    int64_t elemBytes = *typedSplatWidthBytes(splatElement);
+    llvm::StringRef desc = typedRegionDesc(splatElement);
     std::optional<llvm::APSInt> constCount =
         call->getArg(2)->getIntegerConstantExpr(astContext());
-    if (!constCount || constCount->getExtValue() % 4 != 0)
+    if (!constCount || constCount->getExtValue() % elemBytes != 0)
       return emitError(loc)
-             << "unsupported: memset over an unsigned int region requires "
-                "a constant byte count that is a multiple of 4";
+             << "unsupported: memset over " << desc
+             << " requires a constant byte count that is a multiple of "
+             << elemBytes;
     std::optional<llvm::APSInt> constFill =
         call->getArg(1)->getIntegerConstantExpr(astContext());
     if (!constFill)
-      return emitError(loc)
-             << "unsupported: memset over an unsigned int region requires "
-                "a constant fill byte";
-    uint32_t fillByte =
-        static_cast<uint32_t>(constFill->getExtValue()) & 0xFFu;
-    uint32_t fillWord = fillByte * 0x01010101u;
-    auto sliceType = emitrust::SliceType::get(ui32Type);
-    Value slice =
-        builder
-            .create<emitrust::SliceOfOp>(
-                loc, emitrust::MutRefType::get(sliceType), dst->memberPlace,
-                dst->memberCursor, /*is_mut=*/true)
-            .getResult();
-    Value word = createScalarIntConstant(loc, ui32Type,
-                                         static_cast<int64_t>(fillWord));
-    requestStringHelper("__emitrust_memset_u32");
+      return emitError(loc) << "unsupported: memset over " << desc
+                            << " requires a constant fill byte";
+    uint64_t fillByte =
+        static_cast<uint64_t>(constFill->getExtValue()) & 0xFFu;
+    uint64_t pattern = elemBytes == 2   ? 0x0101u
+                       : elemBytes == 4 ? 0x01010101u
+                                        : 0x0101010101010101u;
+    uint64_t fillWord = fillByte * pattern;
+    // Signed elements carry the word's sign-extended bit pattern
+    // (0xFF -> -1i16; 0xAB -> -21589i16 / -1414812757i32); unsigned
+    // ones its zero-extended value (0xFF over ui64 is the exact
+    // all-ones pattern, u64::MAX).
+    int64_t fillValue =
+        llvm::cast<IntegerType>(splatElement).isUnsigned()
+            ? static_cast<int64_t>(fillWord)
+            : llvm::APInt(elemBytes * 8, fillWord).getSExtValue();
+    auto sliceType = emitrust::SliceType::get(splatElement);
+    Value slice = builder
+                      .create<emitrust::SliceOfOp>(
+                          loc, emitrust::MutRefType::get(sliceType),
+                          splatPlace, splatCursor, /*is_mut=*/true)
+                      .getResult();
+    Value word = createScalarIntConstant(loc, splatElement, fillValue);
+    llvm::StringRef helper = typedSplatHelper(splatElement);
+    requestStringHelper(helper);
     builder.create<emitrust::CallOpaqueOp>(
-        loc, TypeRange(), builder.getStringAttr("__emitrust_memset_u32"),
+        loc, TypeRange(), builder.getStringAttr(helper),
         /*args=*/ArrayAttr(), ValueRange{slice, word, count});
     return success();
   }
@@ -718,15 +829,23 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
   if (!llvm::isa<IntegerType>((*n).getType()))
     return emitError(loc) << "unsupported: " << name << " count type";
   Value count = castToIntType(loc, *n, builder.getIntegerType(64));
-  // FR-87: the u32 member subset is memset-destination-only — no
-  // memcpy/memmove word image is admitted, so either u32 member region
-  // rejects here with the same wording the slice gate uses.
-  Type ui32Type =
-      IntegerType::get(builder.getContext(), 32, IntegerType::Unsigned);
-  if ((dst->isMember() && dst->memberElement == ui32Type) ||
-      (src->isMember() && src->memberElement == ui32Type))
+  // FR-87/97: the typed-integer member subset is memset-destination-only
+  // — no memcpy/memmove word image is admitted, so either typed member
+  // region rejects here with the same wording the slice gate uses
+  // (before the same-root branch below could ever select a byte-typed
+  // copy_within image for it).
+  Type wallI8Type = builder.getIntegerType(8);
+  Type wallUi8Type =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  auto isTypedMember = [&](const CharRegionArg &arg) {
+    return arg.isMember() && arg.memberElement != wallI8Type &&
+           arg.memberElement != wallUi8Type;
+  };
+  if (isTypedMember(*dst) || isTypedMember(*src))
     return emitError(loc) << "unsupported: string function argument over "
-                             "an unsigned int region";
+                          << typedRegionDesc(isTypedMember(*dst)
+                                                 ? dst->memberElement
+                                                 : src->memberElement);
   // FR-74/87 aliasing key: a member region borrows only its FIELD, so
   // the collision key is (root, field-path). Member paths always end at
   // an ARRAY leaf, so two DISTINCT paths of one root can never prefix-

@@ -516,8 +516,9 @@ struct CharRegionArg {
   /// The i64 element cursor into the member array (0 for a whole-array
   /// decay, k for `&s.m[k]` / `s.m + k`).
   Value memberCursor;
-  /// The member array's element type (i8, ui8, or ui32 — anything else
-  /// never reaches this channel).
+  /// The member array's element type (i8, ui8, or a gated FR-97
+  /// typed-integer splat width: i16/ui16/i32/ui32/i64/ui64 — anything
+  /// else never reaches this channel).
   Type memberElement;
   /// The member chain's root variable and field path, the FR-74
   /// (VarDecl, field-path) aliasing key.

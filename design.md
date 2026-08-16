@@ -5736,7 +5736,50 @@ piece and becomes FR-45.
   (find_longest_match + encoder_free); do_indexing additionally
   blocks on an i16-array byte-splat memset (named micro-front);
   encoder_alloc stays on the returned-pointer front.
-  Full suite 659/659.
+  Full suite 659/659. Measured post-land: encoder 22/28.
+
+- [x] FR-97 Byte-splat memset over typed arrays (the FR-96-named
+  micro-front: `memset(last, 0xFF, sizeof(last))` over
+  `int16_t last[256]` in heatshrink's do_indexing — plus the
+  general shape wherever a memset destination is a typed
+  scalar array, local or member). FR-87 proved the gated typed
+  admission for u32 MEMBER regions (const count % elem == 0,
+  const fill byte, fill word = b replicated across the element's
+  bytes); the generalization: (a) i16/u16/i32/i64 elements with
+  the same replication rule (0xFF over i16 = -1i16 fill —
+  endianness-neutral because all bytes equal); (b) LOCAL typed
+  arrays as destinations (FR-87 was member regions — find where
+  a local typed-array memset rejects today and route it to the
+  same gated fill image); (c) the sizeof(array) count spelling.
+  Frontier stays: non-splat fill bytes where replication doesn't
+  hold trivially always holds for any byte — actually replication
+  holds for EVERY const byte; the gates are const count divisible
+  by elem size and const fill; non-const stays located. Gates:
+  Import pins (i16 local, member, sizeof count, 0x00 and 0xFF
+  fills) + frontier arms; EndToEnd byte-diff (typed splat fills
+  vs clang native, argc-seeded reads); external re-probe
+  (do_indexing measured — encoder 23/28 the target); full lit
+  100%; C path only.
+  **SPIKE VERDICT: GO (2026-08-15) — with the external gate
+  RESTATED by measurement.** The FR-87 u32 arm generalized to the
+  full width map {i16,ui16,i32,ui32,i64,ui64} with per-width
+  replication proven by the mandatory NON-symmetric byte
+  (0xAB -> -21589i16 / -1414812757i32 / -6076574518398440533i64;
+  0xFF -> -1i16 / 65535u16 / u64::MAX carried exactly through the
+  dialect); five new kStringHelpers images; LOCAL destinations
+  admitted narrowly (single-base whole-object pointer, constant-
+  zero cursor — offset/exotic backings stay located); the member
+  element filter widened for memset ONLY (the memcpy/memcmp/str*
+  walls generalized to guard ALL non-byte member elements —
+  closing a mistyping path the copy_within branch could have
+  taken); sizeof counts fold via getIntegerConstantExpr (no new
+  folding needed). THE RESTATEMENT: a lift simulation proved
+  23/28 is NOT reachable by FR-97 alone — do_indexing's first
+  diagnostic ADVANCES to the typed-FAM-tail-through-Option-member
+  binding (`int16_t *const index = hsi->index` — the FR-93 local
+  binding composed through the FR-96 projection, the named next
+  micro-front); the achieved gate is that advance, pinned.
+  Full suite 662/662.
 
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
