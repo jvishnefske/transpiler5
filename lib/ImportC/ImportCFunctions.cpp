@@ -2465,6 +2465,52 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "        i += 1;\n"
        "    }\n"
        "}"},
+      // FR-97: the per-width siblings of the FR-87 u32 word-fill image —
+      // byte-splat memset over TYPED integer arrays (i16/u16/i32/i64/u64
+      // elements, LOCAL or member destinations). `n` stays the BYTE
+      // count and the walker strides the element size, so the same
+      // admission gates (constant count, multiple of the element size;
+      // constant replicated fill word) keep every fill byte-exact.
+      {"__emitrust_memset_i16",
+       "fn __emitrust_memset_i16(s: &mut [i16], w: i16, n: i64) {\n"
+       "    let mut i = 0usize;\n"
+       "    while ((i * 2) as i64) < n {\n"
+       "        s[i] = w;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_memset_u16",
+       "fn __emitrust_memset_u16(s: &mut [u16], w: u16, n: i64) {\n"
+       "    let mut i = 0usize;\n"
+       "    while ((i * 2) as i64) < n {\n"
+       "        s[i] = w;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_memset_i32",
+       "fn __emitrust_memset_i32(s: &mut [i32], w: i32, n: i64) {\n"
+       "    let mut i = 0usize;\n"
+       "    while ((i * 4) as i64) < n {\n"
+       "        s[i] = w;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_memset_i64",
+       "fn __emitrust_memset_i64(s: &mut [i64], w: i64, n: i64) {\n"
+       "    let mut i = 0usize;\n"
+       "    while ((i * 8) as i64) < n {\n"
+       "        s[i] = w;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_memset_u64",
+       "fn __emitrust_memset_u64(s: &mut [u64], w: u64, n: i64) {\n"
+       "    let mut i = 0usize;\n"
+       "    while ((i * 8) as i64) < n {\n"
+       "        s[i] = w;\n"
+       "        i += 1;\n"
+       "    }\n"
+       "}"},
   };
   for (const auto &helper : kStringHelpers) {
     if (!neededStringHelpers.contains(helper.name) ||
