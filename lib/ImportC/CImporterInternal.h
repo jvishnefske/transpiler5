@@ -6985,6 +6985,46 @@ static inline const clang::FieldDecl *dataPointerFieldOf(const clang::Expr *expr
   return field;
 }
 
+/// FR-107: returns the array type of a pointer-ARRAY struct member
+/// (`T *m[N]`) that is admitted as an `[i64; N]` run of inert cursor
+/// slots, or null for every other type.
+///
+/// This is the one-dimension-out extension of the CTS-P2 scalar member
+/// rule: a data-pointer member stores as a plain i64 cursor whose value
+/// carries no runtime information, so an ARRAY of them stores as an
+/// array of such slots. Admitting the TYPE is the whole point — a record
+/// carrying one stops gating every type that merely NAMES it (lwIP's
+/// `struct netif` is blocked by exactly two such members, netif.h's
+/// `void *client_data[N]` and stats.h's `struct stats_mem *memp[N]`) —
+/// and every ELEMENT USE stays a located rejection, because nothing
+/// binds an element to a target object.
+///
+/// Deliberately excluded, each keeping its pre-existing rejection:
+///  - an array of POINTER-TO-POINTER (`int **m[4]`): a cursor whose
+///    pointee is itself a cursor has no representation here;
+///  - a MULTI-DIMENSIONAL pointer array (`int *m[2][3]`): the single
+///    `getAsConstantArrayType` peel sees an element of array type, not a
+///    data pointer;
+///  - a FILE* element, which keeps the function-local-handle rejection
+///    `mapType` gives it;
+///  - a FUNCTION-pointer element, which is not a data pointer and
+///    already maps to a real `!emitrust.fn_ptr` table;
+///  - an INCOMPLETE (flexible) array of pointers, which is not a
+///    `ConstantArrayType` and keeps its FR-94/95 tail handling.
+static inline const clang::ConstantArrayType *
+pointerArrayMemberType(const clang::ASTContext &context, clang::QualType type) {
+  const clang::ConstantArrayType *array =
+      context.getAsConstantArrayType(type.getCanonicalType());
+  if (!array)
+    return nullptr;
+  clang::QualType element = array->getElementType();
+  if (!isDataPointer(element) || isFilePtrType(element))
+    return nullptr;
+  if (element.getCanonicalType()->getPointeeType()->isPointerType())
+    return nullptr;
+  return array;
+}
+
 /// Returns the operand of a pointer cast (explicit C-style, or the
 /// implicit bitcast Sema inserts for `void *` conversions) that is
 /// transparent to the (base, cursor) decomposition, or null for every
