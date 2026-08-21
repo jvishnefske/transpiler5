@@ -10487,6 +10487,93 @@ since the 00204 wave, 00204.c pass).
   the default-ctor spelling — `variant<int,int> d = 1` is ill-formed
   C++ and dies in the clang frontend before the importer).
 
+
+### Roadmap: the C++ completion program (W2.15+)
+
+W2.0-W2.14 opened a data-and-methods C++ subset plus a hand-recognized
+STL surface (vector/string/array/pair/optional/string_view/variant, by-value
+lambdas, structured bindings, ranged-for). The Cpp17Suite ledger stands at
+23/26 with three frontier markers left: 00801 (copy constructor / elision
+sensor), 00901 (inheritance + virtual dispatch), 00902 (exceptions).
+
+Measured frontier, 2026-08-21, one probe per construct through
+`build/tools/emitrust-cc --emit=rust` (every one is a LOCATED rejection --
+the subset boundary is honest today, nothing silently miscompiles):
+
+| construct | today's diagnostic |
+|---|---|
+| `template <typename T> T add(T,T)` | `unsupported top-level declaration` (ImportCFunctions.cpp:1734) |
+| `template <typename T> struct Box` | `unsupported top-level declaration` (same site) |
+| user destructor `~R()` | `unsupported: user-declared destructor` |
+| `struct D : Base` | `unsupported: base classes are not supported` |
+| `std::cout << x` | `unsupported assignable expression: CXXOperatorCallExpr` |
+| `std::make_unique<int>` | `unsupported: std::unique_ptr is not a recognized STL type` |
+| `std::map<int,int>` | `unsupported: std::map is not a recognized STL type` |
+
+Wave order below is by unlock-value over risk. Templates lead because
+clang has ALREADY monomorphized them: an instantiation is a concrete,
+fully typed `FunctionDecl`/`ClassTemplateSpecializationDecl` with a body,
+so the import is a naming and traversal problem, not a type-inference one
+(AST-dump verified: `implicit_instantiation` nodes hang off the
+`FunctionTemplateDecl`/`ClassTemplateDecl` with `TemplateArgument type
+'int'` and a `CompoundStmt`). RAII follows because no real C++ class
+survives without it, then inheritance, then the STL containers that carry
+whole-program demand.
+
+- [ ] W2.15 Function-template monomorphization. `importTopLevelDecl`
+  (ImportCFunctions.cpp:1710) gains a `FunctionTemplateDecl` case that
+  imports every `specializations()` member which
+  `isThisDeclarationADefinition()`, and skips the uninstantiated pattern
+  entirely. Naming: `mlirFuncName` must not collide two instantiations of
+  one template, so a specialization takes a template-argument suffix built
+  from the same overload type-code table W2.2's `cxxMethodMangledName`
+  introduced (extended as the fixtures need). A call site already resolves
+  by callee decl identity, so `add<int>(2,3)` needs no separate handling
+  once the name is a function of the specialization decl.
+  Acceptance: a new corpus entry 01001 (single-type-parameter function
+  template, two distinct instantiations, both called) flips
+  UNSUPPORTED->PASS with a byte-diff-clean EndToEnd leg; explicit
+  specialization, non-type template parameters, variadic templates and
+  SFINAE-heavy patterns stay LOCATED rejections with newly minted
+  wordings; CTestSuite ledger unchanged; full suite 100%.
+  **NOT SPIKED.**
+
+- [ ] W2.16 Class-template monomorphization: `ClassTemplateDecl` ->
+  one emitted struct per specialization (`Box<int>` -> `Box_i32`), methods
+  and constructors riding W2.2's existing `importCXXMethods` surface
+  unchanged. Depends on W2.15's suffix scheme. **NOT SPIKED.**
+
+- [ ] W2.17 User-declared destructors -> `impl Drop`. RAII is the C++
+  idiom the current subset most conspicuously lacks; Rust's Drop is a
+  near-exact match for scope-end destruction in reverse declaration order.
+  First wave: locals with no copy/move, no early-return interaction beyond
+  what Rust already guarantees. **NOT SPIKED.**
+
+- [ ] W2.18 Single non-virtual inheritance: base as a first field with
+  member/method access flattened through it. Flips nothing alone but is
+  the prerequisite for 00901. **NOT SPIKED.**
+
+- [ ] W2.19 Virtual dispatch through a base pointer (flips 00901).
+  **NOT SPIKED.**
+
+- [ ] W2.20 `std::map`/`std::set` -> `BTreeMap`/`BTreeSet` (ordered
+  iteration is the observable C++ semantics, so BTree is the correct
+  default, not HashMap). **NOT SPIKED.**
+
+- [ ] W2.21 `std::unique_ptr` -> `Box<T>`, `std::make_unique` ->
+  `Box::new`. **NOT SPIKED.**
+
+- [ ] W2.22 `std::cout`/`std::cerr` `<<` chains -> `print!`/`eprint!`
+  with `std::endl` as a newline plus flush. **NOT SPIKED.**
+
+- [ ] W2.23 Copy constructors and C++ value semantics (the 00801
+  sensor). **NOT SPIKED.**
+
+- [ ] W2.24 `try`/`throw`/`catch` (flips 00902). Ranked last: the
+  Rust image (Result threading vs unwind) is a genuine design question,
+  not an implementation detail. **NOT SPIKED.**
+
+
 ## Track 5 Third-party validation (external demand signal)
 
 Track 4's corpus is authored by this project. That has now produced two
