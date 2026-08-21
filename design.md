@@ -6261,6 +6261,19 @@ piece and becomes FR-45.
   mapper when the record is still under construction, which is
   why the component must resolve to the record BY NAME and never
   by structural expansion).
+  THE RECURSION RISK HAS A NAMED RE-ENTRY POINT. `mapType`'s
+  struct arm calls `importRecord(definition, loc)` BEFORE it
+  builds the type (ImportCTypes.cpp:211), and only then resolves
+  the name — so mapping a `struct Node *` component while
+  `struct Node` is itself mid-import re-enters `importRecord`.
+  That guard must already exist, because self-referential records
+  round-trip today (`struct uf_node { struct uf_node *parent; }`
+  in test/EndToEnd/union-find.c promotes to an `enum_def`); the
+  spike's job is to confirm the guard covers the fn-ptr-COMPONENT
+  path too, not to invent one. Reassuringly, the type itself is
+  built by NAME (`StructType::get(context, structName)`,
+  :221) — never structurally — so the constructed type cannot
+  recurse even if the import does.
   IT IS NOT ONE BRANCH AFTER ALL — there is a SECOND, DIALECT
   half, verified by reading the verifier rather than assumed.
   `emitrust::FnPtrType::isValidComponentType`
