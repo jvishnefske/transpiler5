@@ -6110,6 +6110,226 @@ piece and becomes FR-45.
   and saying so is cheaper than rediscovering it.
   Full suite 672/672, both tiers, Fail 0.
 
+- [ ] FR-101 Borrow-bundle scalarization (the `output_info` front —
+  the LAST shape standing on both heatshrink units, 8 ranked
+  items: encoder poll/st_flush_bit_buffer/can_take_byte/push_bits
+  and decoder poll/st_yield_literal/st_yield_backref/push_byte).
+  The shape is one C idiom: a function-LOCAL struct whose members
+  are BORROWS of the enclosing function's own parameters
+  (`typedef struct { uint8_t *buf; size_t buf_size; size_t
+  *output_size; } output_info;` — heatshrink_decoder.c:37-40),
+  built once from those parameters and then passed BY ADDRESS
+  down a chain of helpers that only project its members. The
+  existing CTS-P2 model already resolves a pointer member bound
+  to a sibling local WITHIN one function (pointers-member.c's
+  `deref_local`); what it cannot do is carry that static binding
+  ACROSS a call, because the callee cannot name the caller's
+  target object. Rust's answer would be a lifetime-parametric
+  borrow struct, which is outside the region/cursor value model.
+  The transform instead is SROA: scalarize the bundle away
+  entirely — each local instance becomes one local per member
+  (the pointer members becoming FR-93 window-backed pointer
+  locals bound to the enclosing parameters), and each `B *`
+  PARAMETER becomes one parameter per member. Every residue then
+  lands on machinery that already exists: slice parameters for
+  the byte members, and FR-100 callee-aware forwarding for the
+  scalar `size_t *output_size` member as it is threaded down the
+  chain. FR-100 was built as this increment's prerequisite and
+  this is the increment that cashes it.
+  THE GATE (a struct type B is a borrow bundle iff, TU-wide):
+  B is complete and NOT self-referential (no member of type `B *`
+  and no member whose type contains B); every member is an
+  arithmetic scalar or a data pointer to an arithmetic type; every
+  instance of B is a function-LOCAL (never a global, never a
+  member of another struct, never an array element, never heap);
+  every instance's address is taken ONLY as a direct call argument
+  at a parameter of type `B *`; no B value is copied wholesale,
+  returned, or compared; and every `B *` parameter in the TU is
+  used ONLY as `p->member` or forwarded as a direct call argument
+  at another `B *` parameter. CRUCIALLY the transform fires ONLY
+  when a `B *` PARAMETER actually exists — a bundle-shaped struct
+  that is never passed by address keeps its byte-for-byte
+  identical emission through the existing CTS-P2 path, which is
+  what confines this change to shapes that reject today.
+  Frontier stays: self-referential structs (the linked-list /
+  union-find / malloc-pool node families, which the non-self-
+  reference clause excludes by construction), bundles with array
+  or nested-struct members, bundles whose address escapes to a
+  global or a return, and `B *` parameters that are subscripted,
+  null-tested, compared, or reassigned.
+  Gates: Import pins (the 3-level chain admitted; the scalar and
+  slice members split correctly in the SAME call; gate arms —
+  self-referential, escaping, stored, array-member — each still
+  located) + EndToEnd byte-diff (the heatshrink-fidelity chain,
+  argc-seeded, vs clang native) + a BYTE-IDENTITY check that the
+  never-passed bundle (`pointers-member.c`'s `struct Q`) and the
+  self-referential families emit unchanged + external re-probe
+  (heatshrink encoder 24 -> 28/28 and decoder 13 -> 17/17 the
+  target — this front is the whole residue on both units, so a
+  clean close is the claim; honestly restated if another wall
+  appears) + full lit 100%; C path only.
+  **SPIKE VERDICT: GO (2026-08-20) — the target representation is
+  proven to exist and to be byte-correct BEFORE any transform
+  work.** The heatshrink-fidelity 3-level reproducer (local
+  bundle -> `yield_lit(&oi, ...)` -> `push_byte(oi, ...)`, the
+  decoder's exact chain) rejects today at
+  "pointer parameter used outside a direct dereference". The
+  HAND-SCALARIZED form of the same program — the exact output the
+  transform must produce — imports, builds, and byte-diffs
+  IDENTICAL to `clang -std=c11` at three argv widths, with the
+  two classes correctly split in the same call (`out_buf` a
+  `&mut [u8]` resliced at its cursor, `output_size` a `&mut u64`
+  forwarded bare under FR-100). So the increment is the
+  RECOGNITION AND REWRITE only; no new value kind, no new dialect
+  op, and no lifetime model.
+  BLAST RADIUS, surveyed before designing the gate: every struct
+  with a pointer member in a currently-PASSING test is either
+  self-referential (array-self-ref-member x3, linked-list,
+  malloc-pool-list, union-find, multi-tu-gate-g2 x2,
+  pointers-member's `struct S`) or carries a FAM/Option member
+  (flexible-array-* x3) — all excluded by the gate's own clauses
+  — with the single exception of `pointers-member.c`'s
+  `struct Q { int *ip; int pad; }`, whose address is never taken
+  as a call argument and which the "a `B *` parameter must exist"
+  clause therefore leaves untouched. That clause is not a
+  convenience: it is the reason this transform cannot shift a
+  byte of any emission that works today, and it must be pinned.
+
+- [ ] FR-102 Struct-pointer components in function-pointer types
+  (the largest measured root in the whole external corpus, found
+  2026-08-20 by widening the probe to lwIP `src/core`).
+  MEASUREMENT FIRST, on a corpus WIDENED for this ranking
+  (cJSON, tinycrypt, tiny-AES-c, heatshrink, jsmn, inih, qoi,
+  tinyexpr, log.c, lwIP src/core — 1576 graph items, 787 ported).
+  The #1 blocker corpus-wide is "pointer type outside a parameter
+  position" at 110 items, and behind it sit the cascades it
+  causes: `TcpPcb` 64, `Netif` 58, `UEccCurveT` 40, `State` 14,
+  `Printbuffer` 9, `TeExpr` 8, `InternalHooks` 7, `ParseBuffer` 7,
+  `Stats` 6. Whole small libraries are gated on it — `inih` is
+  1/11 items and `log.c` 0/16, both because their entire public
+  API takes a callback.
+  Every located instance is a FUNCTION-POINTER STRUCT MEMBER:
+  `tcp_sent_fn sent` / `tcp_accept_fn accept` (tcp.h:352, :231),
+  `netif_input_fn input` (netif.h:297), `pbuf_free_custom_fn
+  custom_free_function` (pbuf.h:249).
+  THE GAP IS NOT WHAT IT LOOKS LIKE. Function-pointer struct
+  members are ALREADY fully supported: a `struct ops { int
+  (*f)(int,int); int tag; }` imports today as
+  `f: Option<fn(i32, i32) -> i32>` with a
+  `.expect("null function pointer")` at the indirect call — the
+  value model, the null representation and the call lowering all
+  exist. Nor is the blocker self-reference, which was the first
+  hypothesis (the `uECC_Curve` inside `struct uECC_Curve_t`
+  shape): a DIFFERENTIAL probe isolated it — a fn-pointer member
+  whose signature names a COMPLETE, UNRELATED struct
+  (`int (*)(struct payload *, int)`) rejects identically. The
+  blocker is simply that a POINTER COMPONENT of a
+  function-pointer type outside the arithmetic-pointee subset has
+  no mapping.
+  THE 110 SPLIT INTO TWO COMPONENT FAMILIES, and only the first
+  is in scope here. STRUCT-POINTER components are the large,
+  tractable family: `log_LogFn` = `void (*)(log_Event *)`,
+  lwIP's `tcp_sent_fn`/`netif_input_fn`, tinycrypt's
+  `uECC_Curve` — these carry a complete record type and map the
+  way an ordinary struct-pointer parameter already does. `void *`
+  components are a DIFFERENT and harder problem — `inih`'s
+  `ini_handler` = `int (*)(void *user, const char *, ...)` and
+  `log.c`'s `log_set_lock` = `void (*)(bool, void *udata)` — and
+  the existing code comment says exactly why: a `void *` has no
+  pointee to classify from and, unlike FR-71's parameter case,
+  no call-site consensus is available for a component type in a
+  solo TU. The `void *` arm is deliberately NOT in this FR (it is
+  the separately ranked "void pointer parameter" front, 54
+  items); scoping FR-102 to struct pointers is what keeps it one
+  increment.
+  THE ANCHOR IS ONE BRANCH, and the code already names the gap.
+  FR-76's fn-ptr component classification
+  (ImportCTypes.cpp:293-316) maps an ARITHMETIC-pointee component
+  through `mapParamType(..., ParamKind::Slice)`; its own comment
+  states "Components outside the subset — struct pointers,
+  `void *` ..., pointer-to-pointer — fall through to `mapType`
+  and keep their located rejections", and `mapType` rejects every
+  pointer at ImportCTypes.cpp:355-357. The proposed admission: a
+  component whose pointee is a COMPLETE STRUCT maps the way an
+  ordinary function's struct-pointer parameter already does
+  (`&mut Record`) — a mapping that demonstrably exists, since
+  `heatshrink_encoder *hse` is `&mut HeatshrinkEncoder` today.
+  Self-reference should then fall out rather than needing its own
+  design, because `Option<fn(&mut Node, i32) -> i32>` is legal
+  Rust with no cycle — but that is a PREDICTION, and the spike
+  must confirm it (the risk is unbounded recursion in the type
+  mapper when the record is still under construction, which is
+  why the component must resolve to the record BY NAME and never
+  by structural expansion).
+  IT IS NOT ONE BRANCH AFTER ALL — there is a SECOND, DIALECT
+  half, verified by reading the verifier rather than assumed.
+  `emitrust::FnPtrType::isValidComponentType`
+  (lib/EmitRust/EmitRustTypes.cpp:195-210) admits a `RefType` or
+  `MutRefType` component ONLY when its pointee is a `SliceType`
+  (:204-207); a bare `StructType` is already valid (:208-209, the
+  by-value component) but `&mut Struct` is NOT. So even a mapper
+  that produced the right type would be refused by the dialect.
+  FR-102 must therefore widen the fn_ptr component set to
+  reference-to-struct (and, for the promoted self-referential
+  record, reference-to-enum) — which makes this a DIALECT change,
+  carrying the round-trip and verifier obligations that implies,
+  not a pure importer change. Rust-side this composes without a
+  lifetime annotation (`fn(&mut Node, i32) -> i32` is
+  higher-ranked and elides), but the emitter's rendering of a
+  reference component inside a fn-ptr type must be confirmed, not
+  assumed.
+  Frontier stays: `void *` components (no consensus source in a
+  solo TU), pointer-to-pointer components, incomplete-struct
+  pointees, and nested fn-ptr components (the existing
+  `mappingFnPtrComponent` one-level gate).
+  Gates: Import pins (unrelated-struct component; self-
+  referential component; the indirect call through the member) +
+  frontier arms each still located + EndToEnd byte-diff (a
+  callback table dispatched through a struct member, argc-seeded,
+  vs clang native) + external re-probe (lwIP src/core and the
+  tinycrypt `UEccCurveT` cascade both measured; the cascade
+  counts are the claim to VERIFY, since a cascade root opening
+  does NOT mean the items behind it port — ecc's aliasing-bignum
+  wall is independent and known to sit behind `UEccCurveT`) +
+  full lit 100%; C path only.
+  **NOT YET SPIKED** — the isolation above is measured, the
+  admission is a proposal. Ranked FIRST among open fronts on
+  corpus evidence.
+
+- [ ] FR-103 Undefined extern globals: recover instead of failing
+  the TU (measured 2026-08-20, ranked BELOW FR-102).
+  Both lwIP units that fail to import AT ALL — `tcp_in.c` and
+  `udp.c`, the only 2 of 20 — die on the same single cause:
+  `extern struct ip_globals ip_data;` (ip.h:139), defined in
+  `ip.c`. An external-requirement route for globals already
+  exists (ImportC.cpp:6583-6595, `isExternalRequirementGlobalShape`
+  under a trait policy) but it is a GETTER-ONLY contract — a
+  const-marked global that structurally refuses stores — and
+  `ip_data` is mutable, so it falls to the hard rejection at
+  ImportC.cpp:6596-6598 and takes the whole translation unit
+  with it.
+  Two framings, and the cheap one is the right first move:
+  (a) RECOVERY — the failure fires in a module-FINALIZATION loop,
+  after the items are built, so unlike every other unsupported
+  construct it cannot be attributed to an item and dropped. Make
+  it recoverable under `--incremental` by attributing the
+  reference back to the referencing items and dropping those,
+  so the rest of the unit still imports. This is the same
+  "recovery must never silently emit wrong code" contract the
+  other arms honour, and it is what takes lwIP from 18/20 to
+  20/20 units.
+  (b) REQUIREMENT — a mutable extern global as a trait
+  requirement, which needs an accessor contract (or Cell
+  semantics across the trait boundary) rather than the getter,
+  and is the larger design.
+  HONEST VALUE: the two units are ~45 functions, but they are
+  dense in `tcp_pcb`/`udp_pcb` callback members, so most of their
+  items are blocked by FR-102 REGARDLESS. This front's real
+  payoff is therefore mostly gated behind FR-102 and it should be
+  sequenced after it — recorded here so the measurement is not
+  redone.
+  **NOT SPIKED.**
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
