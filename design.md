@@ -6390,6 +6390,70 @@ piece and becomes FR-45.
   measured; the cursor-return representation is a proposal.
   Ranked SECOND, after FR-102.
 
+- [ ] FR-105 DEFECT: a loop-assigned deferred binding is emitted
+  without `mut` (E0384) — found 2026-08-20 by adding a BUILD
+  oracle to the external probe loop.
+  HOW IT WAS MISSED. The Track 5 loop measures IMPORT
+  (emitrust-progress.json) and never ran `cargo build` over the
+  emitted corpus crates. Doing so for the first time: 43 of 46
+  crates build clean, and 3 DO NOT COMPILE. That is a whole
+  defect class the progress-JSON oracle is structurally blind to,
+  and it invalidates a claim already in this file — the session
+  coda calls tiny-AES-c "a complete real-world AES in safe
+  byte-identical Rust", but its emitted crate fails to compile
+  with three E0384s. The ceiling was measured by import, not by
+  build. (Corrected here rather than in the coda so the original
+  record and its correction both stand.)
+  MINIMAL REPRODUCER, 8 lines, and it is NOT an `--incremental`
+  artifact — strict mode fails identically:
+    static void f(unsigned n, unsigned char *out) {
+      unsigned i, j;
+      for (i = 0; i < n; ++i) { j = i * 4; out[j] = (unsigned char)i; }
+    }
+  emits `let j: u32;` and then assigns `j` inside the loop —
+  `error[E0384]: cannot assign twice to immutable variable`. The
+  inconsistency is visible in one line of tiny-AES-c's output:
+  `let j: u32;` on line 8 next to `let mut k: u32;` on line 9,
+  for two variables assigned by the SAME C statement
+  (`j = i * 4; k = (i - Nk) * 4;`, aes.c:211) in the same loop.
+  ROOT CAUSE, read out of the emitter rather than guessed.
+  `deferredInits[op] = info.maxWrites >= 2 || info.loopReassign
+  || postInitMutation` (TranslateToRust.cpp:1555-1556) decides
+  `mut`. For a loop, `r.loopReassign = bodyL.loopReassign ||
+  (r.hasLoopWrite && bodyL.writtenAtExit)`
+  (TranslateToRust.cpp:1353-1355), whose own comment states the
+  intent as "a write can recur ... when A BODY PATH that writes
+  the binding loops back". But `writtenAtExit` is documented at
+  TranslateToRust.cpp:582 as "ALL fall-through paths have written
+  it" and is computed that way (`allWritten = allWritten && ...`,
+  :1385). ANY-path intent, ALL-path implementation. A binding
+  written under a condition inside the loop — the overwhelmingly
+  common case, since the lifted `for` becomes
+  `loop { if cond { ...write... } if !cond { break } }` — has a
+  non-writing path, so `writtenAtExit` is false, `loopReassign`
+  is false, and the `mut` is dropped even though the write
+  plainly recurs.
+  THE FIX DIRECTION: `loopReassign` needs an ANY-path property —
+  there EXISTS a body path that writes the binding and reaches
+  the back edge (as opposed to breaking or returning) — which is
+  what the comment already describes. The write-then-`break`
+  shape must keep its current `false`.
+  WHY THIS IS DELICATE AND MUST BE SPIKED, NOT PATCHED: emitted
+  crates deny `unused_mut`, so over-marking is a hard rustc error
+  exactly as under-marking is. Both failure directions are loud
+  — which is the project's design — but it means the predicate
+  has to be EXACT, not merely more conservative, and the blast
+  radius across the existing goldens must be measured before any
+  change lands. A golden that shifts is a behavior change under
+  this repo's byte-identity rule.
+  Gates: the 8-line reproducer as an EndToEnd byte-diff (it must
+  BUILD and match clang, which today it cannot) + Import/golden
+  pins for the write-then-break shape keeping `let` + the
+  unconditional-write shape + a corpus BUILD sweep added to the
+  probe loop as a standing oracle + full lit 100%.
+  **NOT SPIKED** — root cause is measured and located; the fix
+  and its blast radius are not.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
