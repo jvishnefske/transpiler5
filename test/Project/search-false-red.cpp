@@ -36,9 +36,16 @@ struct BaseA {
   int a;
 };
 
-// Genuinely unsupported: `CImporter::collectRecordFields` rejects a base class
-// unconditionally, before it collects a single field.
-struct Derived : BaseA {
+// Genuinely unsupported. W2.18 MOVED this pin forward rather than loosening
+// it: a single public NON-VIRTUAL base is now admitted as an ordinary first
+// field (pinned in test/Import/Cpp/inheritance.cpp), so the shape this test
+// needs -- one `CImporter::collectRecordFields` still rejects before it
+// collects a single field -- is a VIRTUAL base. One shared subobject reached
+// from several derived paths has no by-value-field image at all: each path
+// would get its own copy. It keeps the same `cxx-inheritance` tag and the
+// same `base-class` root blocker the plain spelling had, so every count and
+// chain below is unchanged.
+struct Derived : virtual BaseA {
   int b;
 };
 

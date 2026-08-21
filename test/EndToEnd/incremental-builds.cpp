@@ -94,12 +94,22 @@ int main(void) {
 // that tag, reorder with it. The ROOT attribution is unchanged
 // (`destructor` still ranks the item in the table above), which is the
 // property this test exists to pin.
-// PORTING-DAG: | cxx-inheritance |
+//
+// W2.18 moved the `Derived` row forward the same way: a single public
+// non-virtual base is now ADMITTED as a first field, so what keeps
+// `Derived` out is no longer inheritance itself but the DESTRUCTOR its
+// base carries -- a drop-family miscompile channel (a merely inheriting
+// class does not answer `hasUserDeclaredDestructor`, so none of W2.17's
+// use-site drop gates fires for it, and the emitted struct would keep a
+// `Copy` derive it must not have). It reports under `cxx-drop-base`, which
+// sorts ahead of `cxx-references` exactly as `cxx-inheritance` did, so the
+// item-row order is unchanged. The root attribution is still `base-class`.
+// PORTING-DAG: | cxx-drop-base |
 // PORTING-DAG: | cxx-references |
 // PORTING-DAG: | cxx-virtual-destructor |
 //
 // PORTING: ## Project items
-// PORTING: | dropped | red | `Derived` | record | base-class | Derived | cxx-inheritance |
+// PORTING: | dropped | red | `Derived` | record | base-class | Derived | cxx-drop-base |
 // PORTING: | dropped | red | `pick` | function | reference-type | pick | cxx-references |
 // PORTING: | dropped | red | `Base` | record | destructor | Base | cxx-virtual-destructor |
 // PORTING: | ported | green | `Counter` | record |

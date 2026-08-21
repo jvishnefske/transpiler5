@@ -740,6 +740,50 @@ CImporter::emitDefaultConstructInit(Value place,
   // of its own rejects, located, inside `emitRValue` rather than silently
   // defaulting to zero.
   for (const clang::CXXCtorInitializer *init : ctor->inits()) {
+    // W2.18: a BASE initializer on an IMPLICIT (or `= default`) derived
+    // default constructor. This arm was a MEASURED SILENT MISCOMPILE
+    // before the wave -- the `continue` below skipped it, so
+    // `struct Seed { int s; Seed() : s(7) {} }; struct Holder : Seed { int
+    // extra; }; Holder h;` left `h.base.s` at the Rust zero (native 9,
+    // Rust 2) with no diagnostic, no verifier failure and a crate that
+    // built clean. The base's own construction is the same place-based
+    // call `emitCXXConstructInit` builds everywhere else, applied to
+    // `place.base` rather than to a field of `place`.
+    if (init->isBaseInitializer()) {
+      Location baseLoc = translateLoc(init->getSourceLocation());
+      const auto *baseConstruct =
+          llvm::dyn_cast<clang::CXXConstructExpr>(init->getInit());
+      if (!baseConstruct)
+        return emitError(baseLoc)
+               << "unsupported: base constructor initializer";
+      const clang::CXXRecordDecl *baseRecord =
+          init->getBaseClass()->getAsCXXRecordDecl();
+      if (baseRecord && baseRecord->hasDefinition() && baseRecord->isEmpty()) {
+        // An EMPTY base has no `base` field to construct into (see
+        // `collectRecordFields`). A TRIVIAL construction of it has no
+        // observable effect, so there is nothing to emit; a user-provided
+        // constructor body would be silently DROPPED, so it rejects.
+        const clang::CXXConstructorDecl *baseCtor =
+            baseConstruct->getConstructor();
+        if (baseCtor && baseCtor->isTrivial())
+          continue;
+        return emitError(baseLoc)
+               << "unsupported: constructor of an empty base class";
+      }
+      FailureOr<Type> baseFieldType =
+          mapType(init->getBaseClass()->getCanonicalTypeInternal(), baseLoc);
+      if (failed(baseFieldType))
+        return failure();
+      Value basePlace =
+          builder
+              .create<emitrust::MemberOp>(
+                  baseLoc, emitrust::LValueType::get(*baseFieldType), place,
+                  builder.getStringAttr("base"))
+              .getResult();
+      if (failed(emitCXXConstructInit(basePlace, baseConstruct, baseLoc)))
+        return failure();
+      continue;
+    }
     if (!init->isMemberInitializer())
       continue;
     const clang::FieldDecl *field = init->getMember();

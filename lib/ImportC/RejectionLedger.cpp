@@ -138,6 +138,35 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
 constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
     {llvm::StringLiteral("base classes are not supported"),
      llvm::StringLiteral("cxx-inheritance")},
+    // W2.18 admitted the SINGLE public non-virtual base as an ordinary
+    // first field; the wording above is RETAINED for the residual shapes
+    // (multiple, virtual and non-public inheritance, an undefined or
+    // class-template-specialization base). The wordings below are the
+    // measured miscompile channels around the admitted subset, each with
+    // its own tag so the backlog can rank them separately -- the same
+    // discipline W2.17 applied to the destructor family.
+    //
+    // A base carrying a destructor belongs to the DROP family, not the
+    // inheritance one: the divergence is a drop that never happens (the
+    // derived class does not answer `hasUserDeclaredDestructor`, so no
+    // W2.17 use-site gate fires) plus a `Copy` derive the class must not
+    // have.
+    {llvm::StringLiteral("base class with a destructor"),
+     llvm::StringLiteral("cxx-drop-base")},
+    // An empty base carries no field to project through: both wordings are
+    // the residual accesses that would otherwise name a field that does
+    // not exist, or drop a base constructor body.
+    {llvm::StringLiteral("inherited member of an empty base class"),
+     llvm::StringLiteral("cxx-inheritance-empty-base")},
+    {llvm::StringLiteral("constructor of an empty base class"),
+     llvm::StringLiteral("cxx-inheritance-empty-base")},
+    {llvm::StringLiteral("inherited member through a pointer to a derived "
+                         "class"),
+     llvm::StringLiteral("cxx-inheritance-upcast")},
+    {llvm::StringLiteral("inherited access through a non-struct place"),
+     llvm::StringLiteral("cxx-inheritance")},
+    {llvm::StringLiteral("base constructor initializer"),
+     llvm::StringLiteral("cxx-inheritance")},
     // W2.17 admitted the non-virtual, same-TU-defined destructor; the
     // generic wording below is RETAINED for the residual shape (a union
     // destructor), and every measured miscompile channel around the

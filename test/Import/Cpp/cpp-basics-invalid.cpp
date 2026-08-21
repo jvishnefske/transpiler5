@@ -34,12 +34,29 @@
 // diagnostic to pin for that shape yet.
 
 //--- base-class.cpp
+// W2.18 MOVED this pin forward rather than loosening it. The shape this
+// case used to hold -- plain single public non-virtual inheritance,
+// `struct Derived : Base` over a data-only base -- now IMPORTS, with the
+// base as an ordinary first field named `base` and every inherited access
+// flattened through it; the positive behaviour is pinned in
+// test/Import/Cpp/inheritance.cpp and the byte-diff oracle is
+// test/EndToEnd/cpp-inheritance.cpp. MULTIPLE inheritance is the residual
+// this slot now guards: two bases need two fields, and the single `base`
+// name (with every inherited access routed through it) stops being
+// unambiguous. The rest of the surviving inheritance frontier -- virtual
+// and non-public bases, a destructor-carrying base, an empty base, object
+// slicing and every upcast spelling -- is in
+// test/Import/Cpp/inheritance-invalid.cpp.
 struct Base {
   int x;
 };
 
+struct Other {
+  int z;
+};
+
 // BASECLASS: base-class.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: base classes are not supported
-struct Derived : Base {
+struct Derived : Base, Other {
   int y;
 };
 

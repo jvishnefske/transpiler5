@@ -83,13 +83,21 @@ int main(void) { return total(20, 22); }
 // `destructor` still ranks the item in the table above -- which is the
 // property this test exists to pin.
 // PORTING-DAG: | cxx-virtual-destructor |
-// PORTING-DAG: | cxx-inheritance |
+// W2.18 moved this pin FORWARD too. A single public non-virtual base is now
+// ADMITTED as a first field, so `Derived` no longer reports the generic
+// `cxx-inheritance`; what keeps it out is the DESTRUCTOR its base carries,
+// which is a drop-family miscompile channel (a merely inheriting class does
+// not answer `hasUserDeclaredDestructor`, so no W2.17 use-site gate fires)
+// and reports under its own `cxx-drop-base` tag. The ROOT attribution is
+// unchanged -- `base-class` still ranks the item in the table above -- which
+// is the property this test exists to pin.
+// PORTING-DAG: | cxx-drop-base |
 //
 // A graph item that IS its own root carries the one-element chain saying so.
-// (The two rows are listed by direct blocker tag, so W2.17's rename of
-// `cxx-destructor` -> `cxx-virtual-destructor` put `cxx-inheritance` first.)
+// (The two rows are listed by direct blocker tag, and `cxx-drop-base` sorts
+// ahead of `cxx-virtual-destructor` exactly as `cxx-inheritance` did.)
 // PORTING: ## Project items
-// PORTING: | dropped | red | `Derived` | record | base-class | Derived | cxx-inheritance |
+// PORTING: | dropped | red | `Derived` | record | base-class | Derived | cxx-drop-base |
 // PORTING: | dropped | red | `Base` | record | destructor | Base | cxx-virtual-destructor |
 //
 // The off-graph member function borrows its class's chain with itself
