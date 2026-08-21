@@ -182,6 +182,14 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("cxx-class-template-pack")},
     {llvm::StringLiteral("class template instantiation collides with the existing struct"),
      llvm::StringLiteral("cxx-class-template-name-clash")},
+    // FR-108: the non-template half of the same guard. Language-agnostic
+    // — a plain C program reaches it (`typedef struct { int v; } Box;`
+    // beside `struct Box { int v; };`) — so the tag carries no `cxx-`
+    // prefix. Without this entry the clash tabulates as `other` and the
+    // backlog cannot see a silent-wrong-code channel turning into a
+    // located rejection.
+    {llvm::StringLiteral("collides with the emitted name of a different struct"),
+     llvm::StringLiteral("record-name-clash")},
     {llvm::StringLiteral("unsupported top-level declaration"),
      llvm::StringLiteral("unsupported-top-level-decl")},
 };

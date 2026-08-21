@@ -266,9 +266,12 @@ std::string declLedgerName(const clang::Decl *decl) {
 /// rather than approximating it — the same `recordRustName` on the same
 /// definition, and the same "file-scope only" screen — so the key produced
 /// here IS a node key whenever it is non-empty. A class the graph would not
-/// model (block-scope, or nested in a namespace, or with no definition in
-/// this TU) yields the empty string, and the report falls back to the direct
-/// blocker rather than attributing to something that is not in the graph.
+/// model (block-scope, or with no definition in this TU) yields the empty
+/// string, and the report falls back to the direct blocker rather than
+/// attributing to something that is not in the graph. A class nested in a
+/// NAMESPACE is modelled and does yield a symbol — `isFileContext()` is
+/// true for a `Decl::Namespace` — and since FR-108 that symbol carries the
+/// namespace prefix, composed for free by `recordRustName`.
 std::string declOwnerSymbol(const clang::Decl *decl) {
   const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(decl);
   if (!method)

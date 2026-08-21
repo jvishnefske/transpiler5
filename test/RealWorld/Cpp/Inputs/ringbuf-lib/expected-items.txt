@@ -16,7 +16,7 @@
 # <-> stubbed) is reported as advisory drift.
 #
 # Regenerated via: run_realworld.py ... --manifest-format outcomes --update
-Ring record ported
+NsRingRing record ported
 ns_checksum_fold function ported
 ns_checksum_of_ring function ported
 ns_frame_encode function ported

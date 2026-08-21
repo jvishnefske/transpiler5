@@ -459,6 +459,34 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
                << "unsupported: class template instantiation collides with "
                   "the existing struct '"
                << structName << "'";
+      // FR-108: the NON-TEMPLATE half of the very same channel, and the
+      // one that needed no C++ at all to fire. Two DIFFERENT file-scope
+      // records in ONE TU that compute the same emitted name merged
+      // silently here — the second returned success below, BEFORE
+      // `importCXXMethods` ever ran, and since every method mangles
+      // `<StructName>_<method>` the second type's call sites resolved to
+      // the FIRST type's bodies (measured: `struct box_i32` beside
+      // `struct BoxI32` prints `101 1` natively and `101 101` from the
+      // emitted crate; `typedef struct { int v; } Box;` beside `struct
+      // Box { int v; };` quietly becomes one Rust type in plain C).
+      //
+      // REJECT rather than rename: `ItemGraphBuilder::recordSymbolFor`
+      // and FR-41's coloring probe recompute record symbols from the AST
+      // ALONE, with no importer state, so an order-dependent
+      // disambiguator would be unreproducible there and across the
+      // cross-TU merge — it would break the CSymbolNaming.h byte-identity
+      // invariant. The AST-pure injective spelling is the raw C one,
+      // which `--preserve-c-names` already emits; the guard keys off the
+      // EMITTED name, so that mode keeps transpiling these unharmed.
+      //
+      // Gated on a USER-WRITTEN name: the shape-keyed `Anon<n>` path
+      // above merges two same-shape anonymous records ON PURPOSE
+      // (CTS-R1) and must not be caught.
+      if (!thisSpec && !ownerSpec && !recordRustName(definition).empty())
+        return emitError(defLoc)
+               << "unsupported: struct '" << structName
+               << "' collides with the emitted name of a different struct "
+                  "in this translation unit";
     }
     if (existingShape->second != shape)
       return emitError(defLoc)
