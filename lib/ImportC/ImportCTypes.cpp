@@ -1046,10 +1046,20 @@ CImporter::classifyPointerParams(const clang::FunctionDecl *func) {
   }
   if (definition && definition->hasBody() &&
       definition->getNumParams() == kinds.size()) {
+    // FR-100 (C only): the TU-wide forwarding fixpoint answers the slice
+    // question for C definitions, so a parameter that is only FORWARDED
+    // into a callee that keeps a scalar reference keeps one too. The C++
+    // path keeps the per-body walk verbatim (the FR's scope is the C
+    // out-parameter idiom, and the C++ emission stays byte-identical).
+    bool useFixpoint = !astContext().getLangOpts().CPlusPlus;
     llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> sliceParams;
-    collectSliceParams(definition->getBody(), sliceParams);
+    if (useFixpoint)
+      computeForwardSliceParams();
+    else
+      collectSliceParams(definition->getBody(), sliceParams);
     for (auto [index, param] : llvm::enumerate(definition->parameters())) {
-      if (sliceParams.contains(param))
+      if (useFixpoint ? forwardSliceParams.contains(param)
+                      : sliceParams.contains(param))
         kinds[index] = ParamKind::Slice;
       // The interprocedural cell-slice class (CTS-P10, planned in Pass A)
       // overrides the per-body slice classification.
@@ -1445,3 +1455,58 @@ bool CImporter::isCarrierReturnExpr(PointerRegionAnalysis &regions,
   return false;
 }
 
+// FR-100: resolve the TU-wide forwarding fixpoint for the current AST.
+// Seeds are the per-body LOCAL slice demands (every non-benign,
+// non-forwarding appearance); each forwarding edge (callerParam ->
+// calleeParam) then propagates a slice demand BACKWARD, iterated to
+// stability. The relation is monotone over a finite set, so it
+// terminates, and — unlike an on-demand recursive query — the answer
+// does not depend on which function the importer classifies first, which
+// is what makes mutual-recursion cycles (a <-> b forwarding one another's
+// parameter) well-defined instead of order-dependent.
+//
+// Computed once per AST: one `CImporter` spans every TU of a project and
+// `astContext()` is swapped per TU, so a single "already computed" flag
+// would reuse the first TU's answer for the second and silently
+// scalarize its parameters.
+void CImporter::computeForwardSliceParams() {
+  if (!forwardSliceComputedFor.insert(&astContext()).second)
+    return;
+  llvm::SmallPtrSet<const clang::ParmVarDecl *, 16> seeds;
+  SmallVector<std::pair<const clang::ParmVarDecl *, const clang::ParmVarDecl *>>
+      edges;
+  // FR-75 interaction: under a trait policy, ANOTHER TU that sees only a
+  // DECLARATION of an externally visible function classifies its
+  // arithmetic-pointee data-pointer parameters as Slice eagerly (the
+  // requirement-shape gate above), and this TU's definition may not
+  // disagree with that assumption — it would be a conflicting
+  // redeclaration. So for such a function the pre-FR-100 (per-body) class
+  // is SEEDED here. Seeding, rather than special-casing the lookup, is
+  // what keeps the result consistent: the demand also propagates BACKWARD
+  // through forwarding edges, demoting any caller that forwards into the
+  // function instead of leaving it to mismatch at the call site. The cost
+  // is recorded in the FR entry: under a trait policy FR-100's exception
+  // applies to internal-linkage functions only.
+  bool traitEligible = classifyTimeTraitEligible();
+  for (const clang::Decl *decl :
+       astContext().getTranslationUnitDecl()->decls()) {
+    const auto *fn = llvm::dyn_cast<clang::FunctionDecl>(decl);
+    if (!fn || !fn->doesThisDeclarationHaveABody())
+      continue;
+    collectSliceParamsWithEdges(fn->getBody(), seeds, edges);
+    if (traitEligible && fn->isExternallyVisible()) {
+      llvm::SmallPtrSet<const clang::ParmVarDecl *, 4> local;
+      collectSliceParams(fn->getBody(), local);
+      seeds.insert(local.begin(), local.end());
+    }
+  }
+  forwardSliceParams.insert(seeds.begin(), seeds.end());
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const auto &[caller, callee] : edges)
+      if (forwardSliceParams.contains(callee) &&
+          forwardSliceParams.insert(caller).second)
+        changed = true;
+  }
+}
