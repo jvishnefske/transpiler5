@@ -982,6 +982,22 @@ FailureOr<Type> CImporter::mapStructFieldType(clang::QualType type,
   if (field && type.getCanonicalType()->isFunctionPointerType() &&
       isSystemHeaderDecl(field))
     return Type(builder.getIntegerType(64));
+  // FR-107: a pointer-ARRAY member (`T *m[N]`) stores as `[i64; N]` — one
+  // inert cursor slot per element, the scalar data-pointer member rule
+  // taken one dimension out. Only the TYPE is admitted: no element is
+  // ever bound to a target object, so every element read, write,
+  // address-of, comparison, cast, argument and return keeps a LOCATED
+  // rejection at the use (see pointers-member-array-invalid.c). What this
+  // buys is cascade dissolution — a record whose pointer-array members
+  // are never touched in a TU stops gating every type that names it.
+  if (const clang::ConstantArrayType *array =
+          pointerArrayMemberType(astContext(), type)) {
+    uint64_t size = array->getSize().getZExtValue();
+    if (size == 0) // Defensive: a zero-length member is dropped earlier.
+      return emitError(loc) << "unsupported: zero-length array";
+    return Type(emitrust::ArrayType::get(builder.getContext(), size,
+                                         builder.getIntegerType(64)));
+  }
   return mapType(type, loc);
 }
 

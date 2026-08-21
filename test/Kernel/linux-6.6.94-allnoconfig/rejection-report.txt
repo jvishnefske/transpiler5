@@ -104,3 +104,14 @@ rank 13. unsupported-expr:BinaryConditionalOperator  items=2  tus=2
 rank 14. strchr-result-bind  items=1  tus=1
   first: /tmp/claude-1000/-home-j-src-transpiler5/8b2ba09b-10ca-4825-8671-3a60f87e8e36/scratchpad/linux-corpus/linux-6.6.94/lib/base64.c:81:19
   1x unsupported: pointer assigned a non-address value
+
+STALE AFTER FR-107 (pointer-ARRAY struct members). This report is a
+checked-in RECORD of one measurement; no lit test consumes it. FR-107
+admits `T *m[N]` struct members as `[i64; N]` slot runs, which retires
+some share of the `2664x unsupported: pointer type outside a parameter
+position` count above and can move `468x unsupported: assignment to this
+pointer expression` (element stores now land there instead of at the
+field type). The kernel corpus was NOT re-measured for FR-107 — the
+allnoconfig tree is not checked in — so the numbers above are correct
+for the run that produced them and stale for HEAD. Regenerate before
+quoting them again.

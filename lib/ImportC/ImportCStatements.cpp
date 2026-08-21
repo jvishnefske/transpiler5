@@ -1514,6 +1514,34 @@ LogicalResult CImporter::emitRecordInitField(Value place,
     }
     return success();
   }
+  // FR-107: a pointer-ARRAY member's `[i64; N]` slot run carries no
+  // runtime information either — no element is bound to a target object —
+  // so an all-null brace list (the `{0}` a real declaration writes) keeps
+  // the place's zero default and emits nothing, exactly like the scalar
+  // data-pointer member above. An element naming an ADDRESS would be a
+  // binding nothing records, so it is a located rejection HERE rather
+  // than a silently dropped initializer. Without this branch the field
+  // fell to the union-pun tail's `mapType`, which reported the
+  // out-of-position pointer wording at a brace that is in no bad
+  // position at all.
+  if (pointerArrayMemberType(astContext(), field->getType())) {
+    const auto *list = llvm::dyn_cast<clang::InitListExpr>(element);
+    if (!list)
+      return emitError(elementLoc)
+             << "unsupported: pointer-array struct member initializer";
+    if (const clang::InitListExpr *semantic = list->getSemanticForm())
+      list = semantic;
+    for (unsigned i = 0, n = list->getNumInits(); i != n; ++i) {
+      const clang::Expr *init = list->getInit(i);
+      if (llvm::isa<clang::ImplicitValueInitExpr>(init))
+        continue;
+      if (!init->isNullPointerConstant(
+              astContext(), clang::Expr::NPC_ValueDependentIsNull))
+        return emitError(translateLoc(init->getBeginLoc()))
+               << "unsupported: pointer-array struct member initializer";
+    }
+    return success();
+  }
   if (field->isAnonymousStructOrUnion()) {
     // The anonymous member's fields live inline in the parent place; its
     // nested list (the semantic form always materializes one) recurses

@@ -6461,7 +6461,7 @@ piece and becomes FR-45.
   Full suite 681/681, both tiers, Fail 0; corpus BUILD sweep 42
   of 44, matching the FR-106 ledger exactly.
 
-- [ ] FR-107 Pointer-ARRAY struct members (`T *m[N]`) — the real
+- [x] FR-107 Pointer-ARRAY struct members (`T *m[N]`) — the real
   root under lwIP's two biggest cascades, identified 2026-08-21
   by peeling the chain rather than reading a diagnostic count.
   CORRECTION FIRST, because this entry exists to fix a mistake
@@ -6798,6 +6798,77 @@ piece and becomes FR-45.
   arms already pinned must not shift a byte + EndToEnd byte-diff
   of the search-loop shape + full lit 100%.
   **NOT SPIKED.**
+  **DELIVERED (2026-08-21) — wave 1, type admission only. The
+  value is SMALL, it was measured cleanly, and measuring it
+  exposed a flaw in how this whole file has been ranking work.**
+  THE CLEAN MEASUREMENT the spike obtained where I could not:
+  pristine corpus, tools-before vs tools-after, identical item
+  SETS (0 entered, 0 left). lwIP src/core 583 -> 621 ported.
+  The per-ITEM transition table: 38 missing->ported, 25
+  dropped->stubbed, 21 dropped->declared. The graph_items -21 is
+  EXPLAINED rather than contamination — declared +21 matches it
+  exactly, being extern functions that counted as in-graph
+  dropped while `struct netif` was rejected and became ordinary
+  undefined externs once the type mapped.
+  THE HONEST HEADLINE: of the 38 new ports, 33 are RECORD items
+  and only FIVE are code (one static global and four static
+  functions in netif.c). The 71-item "Netif cascade" DOES NOT
+  PORT — it dissolves into 21 declared + 25 stubbed. FR-102's
+  lesson repeats verbatim, now for the third time in this file:
+  opening a root does not port what sits behind it. `TcpPcb` 64
+  is UNCHANGED, because tcp_pcb needs this AND the `void *`
+  fn-ptr component family FR-102 held out.
+  Where the follow-on value actually shows: the 25
+  dropped->stubbed are real lwIP functions that now reach their
+  NEXT blocker — `call to 'fflush'` (LWIP_ASSERT/LWIP_PLATFORM_DIAG)
+  5 -> 18, `copying a global pointer variable` 11 -> 13,
+  `void pointer parameter` 32 -> 34. That re-attribution is the
+  increment's real product.
+  Representation as proposed: `[i64; N]`, record imports, and
+  every unresolvable element use keeps a LOCATED rejection —
+  24 element-use arms pinned, one new wording added
+  (`pointer-array struct member initializer`). Element BINDING is
+  deliberately deferred to a wave 2: the spike measured that
+  admitting constant-index element resolution buys ZERO further
+  lwIP items, so it is unjustified until something demands it.
+  A latent hazard was DISPROVED rather than assumed: member-
+  pointer reads return a cursor-less `PtrExprValue`, so
+  `refineElementPlace` short-circuits and the feared
+  `long *m[N]` / `void *m[N]` i64 collision cannot arise while
+  element bindings stay degenerate — which is now a constraint,
+  not a coincidence.
+  Full suite 685/685, both tiers, Fail 0; BUILD sweep 42 of 44,
+  matching the FR-106 ledger.
+
+- **MEASUREMENT CORRECTION (2026-08-21) — the corpus ranking in
+  this file has been counting TYPES, and it changed the order of
+  the queue.** Chasing FR-107's "38 ported but only 5 of them
+  code" figure exposed it. `emitrust-progress.json` counts one
+  item per (unit, symbol) across ALL kinds, so a record imported
+  in 18 translation units contributes EIGHTEEN `ported` items.
+  Measured on the current corpus: of 858 `ported` items,
+  record 444, function 211, enum 109, global 94 — only 25% are
+  code. For lwIP specifically the gap is extreme: 34 of ~2576
+  function items, against a headline "621 ported / 61.5%".
+  RE-RANKED ON FUNCTION ITEMS ONLY (single clean run, deduped
+  per unit): TcpPcb cascade 48, `pointer assigned a non-address
+  value` 36, `void pointer parameter` 35, `pointer return type`
+  24, `returned pointer value` 22, `pointer type outside a
+  parameter position` 20.
+  That last line is the point. "pointer type outside a parameter
+  position" ranked #1 at 110 on all-items and is #6 at 20 on
+  function items — and it is the diagnostic that justified BOTH
+  FR-102 and FR-107. Neither increment was wrong (FR-102 found
+  and fixed two latent name-resolution defects that emitted
+  references to nonexistent types; FR-107 dissolved a false
+  cascade and re-attributed 25 functions to their real
+  blockers), but the ORDER was chosen on an inflated number, and
+  saying so is cheaper than letting the next session inherit it.
+  STANDING RULE from here: rank fronts by FUNCTION items ported
+  and by function-item blockers. Small function-dense libraries
+  are unaffected — heatshrink's 28/28 is 25/25 functions plus 3
+  type items, so that claim stands as made — the distortion is
+  specific to large multi-unit codebases with many shared types.
 
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
