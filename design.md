@@ -6110,7 +6110,7 @@ piece and becomes FR-45.
   and saying so is cheaper than rediscovering it.
   Full suite 672/672, both tiers, Fail 0.
 
-- [ ] FR-101 Borrow-bundle scalarization (the `output_info` front —
+- [x] FR-101 Borrow-bundle scalarization (the `output_info` front —
   the LAST shape standing on both heatshrink units, 8 ranked
   items: encoder poll/st_flush_bit_buffer/can_take_byte/push_bits
   and decoder poll/st_yield_literal/st_yield_backref/push_byte).
@@ -6127,10 +6127,12 @@ piece and becomes FR-45.
   target object. Rust's answer would be a lifetime-parametric
   borrow struct, which is outside the region/cursor value model.
   The transform instead is SROA: scalarize the bundle away
-  entirely — each local instance becomes one local per member
-  (the pointer members becoming FR-93 window-backed pointer
-  locals bound to the enclosing parameters), and each `B *`
-  PARAMETER becomes one parameter per member. Every residue then
+  entirely — each local instance becomes one local per member,
+  and each `B *` PARAMETER becomes one parameter per member.
+  (This entry first prescribed "the pointer members becoming
+  FR-93 window-backed pointer locals bound to the enclosing
+  parameters". That is WRONG and the spike measured it — see the
+  delivered verdict.) Every residue then
   lands on machinery that already exists: slice parameters for
   the byte members, and FR-100 callee-aware forwarding for the
   scalar `size_t *output_size` member as it is threaded down the
@@ -6194,6 +6196,65 @@ piece and becomes FR-45.
   clause therefore leaves untouched. That clause is not a
   convenience: it is the reason this transform cannot shift a
   byte of any emission that works today, and it must be pinned.
+  **DELIVERED (2026-08-21) — front CLOSED at import, with three
+  design corrections the spike measured and one honest limit on
+  what that means.**
+  MEASURED: heatshrink encoder 24 -> **28/28** and decoder
+  13 -> **17/17**, stubbed 4 -> 0 and dropped 0 on BOTH units.
+  The `output_info` front is gone, no new wall appeared behind
+  it, and the denominator did NOT fall — `OutputInfo` remains a
+  ported record item in both graphs, so the arithmetic this entry
+  predicted is confirmed rather than reached by shrinking the
+  measure.
+  THREE CORRECTIONS, each from a differential the spike built:
+  (1) THIS ENTRY'S OWN PRESCRIPTION WAS WRONG. Materialising a
+  pointer LOCAL for a scalar pointer member flips the enclosing
+  parameter's classification from ScalarRef to Slice and breaks
+  every caller — a 5-line differential one statement apart:
+  `static void f(size_t *os) { size_t *q = os; g(q); }` rejects
+  at the caller, while the same function without the alias local
+  imports. A local for a BYTE member is harmless; for a SCALAR
+  POINTER member it is fatal. Plain value locals for arithmetic
+  members are fine.
+  (2) EXPANDING TO ALL MEMBERS MAKES A PANIC REACHABLE ON LEGAL
+  C. A callee that never uses the byte member would get a
+  degenerate `&mut u8` parameter, and the caller reborrows
+  `&mut oi_buf[0]` — which on a ZERO-LENGTH output window
+  (exactly heatshrink's `poll(hsd, &out[len], cap-len, &n)` when
+  `len == cap`) indexes an empty slice: the native prints `n=0`
+  and exits 0, the Rust panicked with `index out of bounds`. The
+  fix, measured: expand each `B *` parameter to only the members
+  the callee TRANSITIVELY uses — a monotone call-graph fixpoint,
+  the same shape as FR-100's, needing 2 iterations on the real
+  encoder. That zero-length case is now a regression arm.
+  (3) THE GATE AS WRITTEN HAD TWO HOLES. "used ONLY as
+  `p->member`" admits a STORE `p->member = X`, and two currently
+  PINNED rejections passed every clause —
+  pointers-member-array-local-invalid.c's ESCAPE arm and
+  pointers-member-invalid.c's aliased-write arm. A member-STORE
+  clause and a >=1-instance clause were added; both pinned.
+  IMPLEMENTATION NOTE worth keeping: the transform rewrites the
+  clang AST in place BEFORE any planner runs, so the TU is
+  ordinary scalar C by the time the importer sees it and NOT ONE
+  of the ~8 anticipated importer sites was touched. Byte-identity
+  was measured, not argued: behind a temporary kill switch,
+  output was diffed over all 823 `.c` files in `test/` plus the
+  whole c-testsuite single-exec corpus — exactly ONE file differs
+  (the new test) — and over 449 external corpus units, where
+  exactly two differ, both heatshrink, both in the target
+  direction.
+  **THE HONEST LIMIT — the same trap this file's coda fell into
+  for tiny-AES-c, so it is stated plainly rather than celebrated
+  around.** 28/28 and 17/17 are IMPORT figures. Under the
+  FR-105/FR-106 build oracle NEITHER emitted crate compiles: the
+  encoder fails `unused_assignments` on `len`, and the decoder
+  now fails the SAME lint on `i` — a NEW instance, surfaced
+  precisely because FR-101 made it port more code. heatshrink is
+  fully IMPORTED and not yet BUILDABLE, and FR-106 is now the
+  only thing between this corpus and a compiling encoder/decoder
+  pair. No claim of "a complete real-world heatshrink in safe
+  Rust" is made or implied.
+  Full suite 675/675, both tiers, Fail 0.
 
 - [ ] FR-102 Struct-pointer components in function-pointer types
   (the largest measured root in the whole external corpus, found

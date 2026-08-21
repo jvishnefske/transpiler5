@@ -1752,6 +1752,12 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // identifier namespace will claim, so struct tag naming
   // (`structSymbolName`) is independent of declaration order.
   collectOrdinaryNames(unit);
+  // FR-101 Pass 0: borrow-bundle scalarization rewrites the clang AST
+  // itself, so it must run before EVERY planner and every analysis — they
+  // must all see the scalarized form and never the bundle. A no-op unless
+  // the whole-TU gate holds (see ImportCBorrowBundle.cpp), which is what
+  // keeps every emission that works today byte-for-byte identical.
+  scalarizeBorrowBundles(context);
   // CTS-S Pass A: per-TU fn-ptr facts (written globals, address-taken
   // functions) and the devirtualization aliases of never-reassigned
   // global function pointers. Pure-AST; hoisted before `planOwners`

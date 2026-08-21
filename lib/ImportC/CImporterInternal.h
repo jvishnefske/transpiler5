@@ -8283,4 +8283,20 @@ calleeParamSource(const clang::CallExpr *call) {
   return callee->getDefinition() ? callee->getDefinition() : callee;
 }
 
+/// FR-101: scalar replacement of BORROW BUNDLES, run once per translation
+/// unit BEFORE any planner, analysis or signature build sees the AST (see
+/// ImportCBorrowBundle.cpp for the gate and the rewrite). A struct type
+/// whose members are borrows of the enclosing function's own parameters,
+/// built as a function LOCAL and passed BY ADDRESS down a chain of helpers
+/// that only project its members, is rewritten away entirely: the instance
+/// and its binding stores are erased, each `B *` parameter expands in place
+/// into one parameter per demanded member, and every `&oi` / bare-`oi`
+/// argument expands into the member sources. After it runs the translation
+/// unit is ordinary scalar C, so nothing downstream is bundle-aware.
+///
+/// The transform fires ONLY when a `B *` PARAMETER exists and every clause
+/// of the gate holds TU-wide; otherwise it is a no-op and the emission is
+/// byte-for-byte what it was. C path only.
+void scalarizeBorrowBundles(clang::ASTContext &context);
+
 #endif // EMITRUST_IMPORTC_CIMPORTERINTERNAL_H
