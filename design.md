@@ -6395,9 +6395,14 @@ piece and becomes FR-45.
   oracle to the external probe loop.
   HOW IT WAS MISSED. The Track 5 loop measures IMPORT
   (emitrust-progress.json) and never ran `cargo build` over the
-  emitted corpus crates. Doing so for the first time: 43 of 46
-  crates build clean, and 3 DO NOT COMPILE. That is a whole
-  defect class the progress-JSON oracle is structurally blind to,
+  emitted corpus crates. Doing so for the first time: of 46
+  crates, 44 build and 2 DO NOT COMPILE (a third, tinyexpr, fails
+  only `cargo clippy` on `approx_constant` — clippy's own
+  deny-by-default correctness group objecting to a faithfully
+  transpiled pi literal — and BUILDS fine, so it is not a build
+  defect; the first count of "3" written here was wrong and is
+  corrected rather than quietly dropped). That is a whole defect
+  class the progress-JSON oracle is structurally blind to,
   and it invalidates a claim already in this file — the session
   coda calls tiny-AES-c "a complete real-world AES in safe
   byte-identical Rust", but its emitted crate fails to compile
@@ -6453,6 +6458,51 @@ piece and becomes FR-45.
   probe loop as a standing oracle + full lit 100%.
   **NOT SPIKED** — root cause is measured and located; the fix
   and its blast radius are not.
+
+- [ ] FR-106 DEFECT: the `unused_assignments` deny fires on
+  real-world code — a documented assumption is falsified
+  (found by the same build oracle as FR-105).
+  The second of the two non-building corpus crates is the
+  heatshrink ENCODER: `error: value assigned to 'len' is never
+  read` at `find_longest_match`, where `len = 0` is followed on
+  every path by either an overwrite (`len = 1`) or no read.
+  THIS IS THE TRIPWIRE WORKING, NOT A STRAY LINT. The deny is
+  deliberate and its rationale is written down at
+  tools/emitrust-cc/CrateEmitter.cpp:36-41: "`unused_assignments`
+  was formerly allowed here to mask a single residual: a dead
+  store inside a loop body, whose sound cross-iteration liveness
+  would risk a miscompile and is deliberately not attempted.
+  FR-61f lifts canonical C counting loops to `emitrust.for` range
+  heads (no explicit backedge store), removing that residual; the
+  lint is now DENIED ... so a regression fails the build instead
+  of hiding." The finding is exactly that: FR-61f's premise — that
+  the range-for lift removes the LAST loop-body residual — holds
+  for the internal corpus but is FALSE on external code.
+  `find_longest_match` is a search loop, not a canonical counting
+  loop, so the lift does not reach it and the residual is back.
+  The tripwire did its job; the conclusion it delivers is that
+  the premise needs revising.
+  Three directions, none yet chosen, and the first is explicitly
+  fenced by CLAUDE.md:
+  (a) EXTEND the elision to this shape — cross-iteration loop
+  liveness, attempted three times and miscompiled three times.
+  Off-limits without a new idea AND the byte-diff suite in the
+  loop; noted here so nobody re-derives that the obvious fix is
+  the dangerous one.
+  (b) RE-ALLOW the lint — cheap, but it deletes the tripwire that
+  found this, and FR-53 deliberately removed that allowance.
+  (c) NARROW the residual — recognize the specific
+  write-then-overwrite-on-every-path shape (which rustc itself
+  proves dead, flow-sensitively, and which needs no
+  cross-ITERATION reasoning at all: both stores are in the same
+  iteration). This looks like the honest middle and is the one to
+  spike first, precisely because it is NOT the cross-iteration
+  problem (a) is fenced against — but that distinction must be
+  PROVEN on the real shape, not assumed from the diagram.
+  Gates: the heatshrink encoder crate must BUILD + the elision
+  arms already pinned must not shift a byte + EndToEnd byte-diff
+  of the search-loop shape + full lit 100%.
+  **NOT SPIKED.**
 
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
