@@ -6464,7 +6464,7 @@ piece and becomes FR-45.
   measured; the cursor-return representation is a proposal.
   Ranked SECOND, after FR-102.
 
-- [ ] FR-105 DEFECT: a loop-assigned deferred binding is emitted
+- [x] FR-105 DEFECT: a loop-assigned deferred binding is emitted
   without `mut` (E0384) — found 2026-08-20 by adding a BUILD
   oracle to the external probe loop.
   HOW IT WAS MISSED. The Track 5 loop measures IMPORT
@@ -6504,8 +6504,11 @@ piece and becomes FR-45.
   intent as "a write can recur ... when A BODY PATH that writes
   the binding loops back". But `writtenAtExit` is documented at
   TranslateToRust.cpp:582 as "ALL fall-through paths have written
-  it" and is computed that way (`allWritten = allWritten && ...`,
-  :1385). ANY-path intent, ALL-path implementation. A binding
+  it" and is computed that way (`allWritten = allWritten && ...`
+  — cited here as :1385, which is the SwitchOp merge; the IfOp
+  merge that this defect actually flows through is :1322. Both
+  are ALL-path merges so the diagnosis stands, but the citation
+  was wrong and is corrected rather than quietly swapped). ANY-path intent, ALL-path implementation. A binding
   written under a condition inside the loop — the overwhelmingly
   common case, since the lifted `for` becomes
   `loop { if cond { ...write... } if !cond { break } }` — has a
@@ -6557,6 +6560,71 @@ piece and becomes FR-45.
   corpus BUILD sweep. Ranked ABOVE FR-102 despite being smaller:
   emitting code that does not compile is a worse defect than not
   covering a construct.
+  **DELIVERED (2026-08-21) — and the spike DID falsify the
+  blast-radius argument above, which is why it was written down
+  as reasoning rather than fact.** The claim "every case the
+  corrected predicate newly marks is one rustc already rejects"
+  is TRUE for the exact predicate and FALSE for the naive
+  "write reaches the back edge" wording this entry proposed. The
+  counterexample is a binding whose ONLY write is BEFORE two
+  nested loops, where an inner loop merely `break`s: the naive
+  form let that pre-loop write leak out of the inner loop, up
+  into the outer body, and set `loopReassign` — emitting
+  `let mut j` for a binding that needs none, which under the
+  emitted manifest's own `#![deny(unused_mut)]` is a hard error.
+  A currently-BUILDING shape broken. So the fix had to be
+  SCOPED, not merely any-path.
+  THE EXACT PREDICATE: one new ANY-path field
+  (`anyWriteFallThrough`) added BESIDE `writtenAtExit` — never
+  redefining it, because the dead-store analyses share it — with
+  the flag RESET to false at every loop-body and while-condition
+  entry, so inside a body it means "written since the top of THIS
+  iteration". `continue` turns out to be a third back-edge
+  terminator and is handled at its own site. The old ALL-path
+  term is REPLACED, not unioned: measured, both variants emit
+  byte-identical Rust everywhere, because anything the old term
+  caught already has `maxWrites >= 2`.
+  EXACTNESS, NOT CONSERVATISM — measured against rustc itself.
+  23 hand-written dialect shapes were put through a FLIP
+  DIFFERENTIAL: for every emitted binding, flipping the
+  mut/bare choice was handed to rustc under
+  `deny(unused_mut, unused_variables, unused_assignments)`. In
+  all 23, flipping `mut`->bare gives E0384 and bare->`mut` gives
+  "variable does not need to be mutable". The emitted choice is
+  the UNIQUE rustc-accepted one in every case.
+  MEASURED OUTCOMES: tiny-AES-c's crate BUILDS for the first
+  time, and its two adjacent declarations are finally consistent
+  (`let mut j` beside `let mut k`); its stdout byte-diffs
+  IDENTICAL to the clang native across ECB/CBC/CTR. The 8-line
+  reproducer builds and byte-diffs identical. A randomized
+  differential over 150 generated programs with a deferred
+  binding buried in random loop/branch nests went from 65 E0384
+  failures to 150/150 building, zero E0384, zero unused_mut.
+  Corpus emitted-source diff across all crates: exactly SIX
+  lines, i.e. three bindings, all in tiny-AES-c. Nothing else
+  moved a byte. c-testsuite ledger 220/220, miscompiled 0.
+  THE MISSING ORACLE IS NOW IN THE REPO: `nix/corpus/build-sweep.py`
+  plus a `build-known-fail.txt` RATCHET. It REGENERATES every
+  crate from the current tools before building — not optional,
+  and learned the hard way during this very increment, where a
+  STALE heatshrink decoder crate built clean while the same unit
+  regenerated from current tools did not. FR-106's two heatshrink
+  crates are pinned in the ledger so neither can mask a
+  regression of this class nor be fixed by accident.
+  COUNT RECONCILIATION, since this entry carried two different
+  numbers: "46 crates / 2 failing" was correct when written
+  (pre-FR-101, and counting two header-only crates synthesized
+  for the probe); the sweep's curated corpus is 44, and at
+  FR-105's baseline 3 were failing because FR-101 had by then
+  made the heatshrink DECODER port enough code to hit FR-106 too.
+  Both numbers were true at their own time; neither is edited
+  away.
+  KNOWN-UNVERIFIED PATH, recorded rather than hidden: the
+  generic-region fallback that `emitrust.match` reaches
+  propagates `anyWriteFallThrough` by OR. No input in the suite
+  or the corpus exercises it, so that arm is reasoned, not
+  measured.
+  Full suite 677/677, both tiers, Fail 0.
 
 - [ ] FR-106 DEFECT: the `unused_assignments` deny fires on
   real-world code — a documented assumption is falsified

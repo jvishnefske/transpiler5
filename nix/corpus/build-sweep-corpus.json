@@ -1,0 +1,25 @@
+{
+  "_comment": [
+    "Project spec for nix/corpus/build-sweep.py -- the BUILD half of the",
+    "external probe loop. Paths are relative to the corpus root passed on the",
+    "command line (a directory of upstream clones; see README.md). A project",
+    "whose directory is absent is skipped, so a partial corpus still sweeps.",
+    "`sources` is a directory whose *.c files each become one lib crate;",
+    "`includes` are added as -I. Files matching `skip` are not swept (test",
+    "harnesses, benchmarks, examples -- they are not library translation",
+    "units and their main()s pull in unrelated shapes)."
+  ],
+  "skip": ["test", "bench", "example", "demo", "fuzz", "main"],
+  "projects": [
+    {"name": "cJSON",      "sources": "cJSON",              "includes": ["cJSON"]},
+    {"name": "tinycrypt",  "sources": "tinycrypt/lib/source", "includes": ["tinycrypt/lib/include"]},
+    {"name": "tiny-AES-c", "sources": "tiny-AES-c",         "includes": ["tiny-AES-c"]},
+    {"name": "heatshrink", "sources": "heatshrink",         "includes": ["heatshrink"]},
+    {"name": "jsmn",       "sources": "jsmn",               "includes": ["jsmn"]},
+    {"name": "inih",       "sources": "inih",               "includes": ["inih"]},
+    {"name": "qoi",        "sources": "qoi",                "includes": ["qoi"]},
+    {"name": "tinyexpr",   "sources": "tinyexpr",           "includes": ["tinyexpr"]},
+    {"name": "logc",       "sources": "logc/src",           "includes": ["logc/src"]},
+    {"name": "lwip",       "sources": "lwip/src/core",      "includes": ["lwip/src/include", "lwip/test/unit", "lwip/contrib/ports/unix/port/include"]}
+  ]
+}
