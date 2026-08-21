@@ -1,0 +1,13 @@
+# Standing ledger for nix/corpus/build-sweep.py: emitted corpus crates that
+# are KNOWN not to build, one `<crate> <rustc-code-or-message-prefix>` per
+# line. The sweep fails if a crate outside this list fails to build, AND if a
+# crate on this list starts building or starts failing on a DIFFERENT code.
+# A ratchet, not a mute: an entry may only be REMOVED (with the fix that
+# earns it), never quietly widened.
+#
+# heatshrink's encoder and decoder are design.md FR-106 (the `unused_assignments`
+# deny firing on a real search loop -- the tripwire working, not a stray lint).
+# They are pinned here so FR-106 can neither mask a regression of FR-105's
+# E0384 class nor be "fixed" by accident without this ledger moving.
+heatshrink_heatshrink_encoder unused_assignments
+heatshrink_heatshrink_decoder unused_assignments

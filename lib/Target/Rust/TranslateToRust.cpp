@@ -584,14 +584,22 @@ private:
     bool hasLoopWrite = false; ///< the binding is assigned inside a loop
     unsigned maxWrites = 0;    ///< max whole-binding writes on any single path
     bool loopReassign = false; ///< the binding is reassigned across iterations
+    /// FR-105: the ANY-path counterpart of `writtenAtExit` -- SOME path
+    /// through this construct leaves it by FALLING THROUGH with the binding
+    /// written. `enteringAnyWrite` seeds it, and every loop body is entered
+    /// with that seed FALSE, so inside a loop body the flag means exactly
+    /// "written on this path since the top of THIS iteration".
+    bool anyWriteFallThrough = false;
   };
 
   /// The liveness of an EMPTY region: no reads, and the entering write-state
   /// simply falls through. A named factory instead of a braced literal so the
   /// meaning cannot silently drift with the struct's field order.
-  static Liveness passThroughLiveness(bool enteringWritten) {
+  static Liveness passThroughLiveness(bool enteringWritten,
+                                      bool enteringAnyWrite) {
     Liveness l;
     l.writtenAtExit = enteringWritten;
+    l.anyWriteFallThrough = enteringAnyWrite;
     return l;
   }
 
@@ -600,6 +608,12 @@ private:
   struct BreakInfo {
     bool sawBreak = false;
     bool allWritten = true;
+    /// FR-105: some `break` path had written the binding SINCE THE TOP
+    /// OF THE ITERATION (a write from before the loop does not count).
+    bool anyBreakWritten = false;
+    /// FR-105: some `continue` -- a back edge -- was reached with the
+    /// binding written since the top of the iteration.
+    bool anyContinueWritten = false;
   };
 
   /// `partialWriteBlocks` selects how a projection use of the binding
@@ -609,10 +623,11 @@ private:
   /// a read only when the projected place is itself read, so a pure partial
   /// write does not keep an earlier store live.
   Liveness analyzeSeq(Block::iterator begin, Block::iterator end, Value binding,
-                      bool enteringWritten, BreakInfo *brk,
-                      bool partialWriteBlocks);
+                      bool enteringWritten, bool enteringAnyWrite,
+                      BreakInfo *brk, bool partialWriteBlocks);
   Liveness analyzeControl(Operation *op, Value binding, bool enteringWritten,
-                          BreakInfo *brk, bool partialWriteBlocks);
+                          bool enteringAnyWrite, BreakInfo *brk,
+                          bool partialWriteBlocks);
   /// Decides, for each candidate binding in the function, whether its init is a
   /// dead store; fills `deferredInits`.
   void computeDeferredInits(Block &block);
@@ -1299,6 +1314,7 @@ void RustEmitter::computeUnreachable(Block &block) {
 
 RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
                                                   bool enteringWritten,
+                                                  bool enteringAnyWrite,
                                                   BreakInfo *brk,
                                                   bool partialWriteBlocks) {
   Liveness r;
@@ -1307,12 +1323,13 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
       return region.empty()
                  ? Liveness{}
                  : analyzeSeq(region.front().begin(), region.front().end(),
-                              binding, enteringWritten, brk, partialWriteBlocks);
+                              binding, enteringWritten, enteringAnyWrite, brk,
+                              partialWriteBlocks);
     };
     Liveness thenL = arm(ifOp.getThenRegion());
     // An if with no else falls through with only the entering write-state.
     Liveness elseL = ifOp.getElseRegion().empty()
-                         ? passThroughLiveness(enteringWritten)
+                         ? passThroughLiveness(enteringWritten, enteringAnyWrite)
                          : arm(ifOp.getElseRegion());
     r.readFirst = thenL.readFirst || elseL.readFirst;
     r.hasLoopWrite = thenL.hasLoopWrite || elseL.hasLoopWrite;
@@ -1320,6 +1337,8 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
     bool thenW = thenL.diverges || thenL.writtenAtExit;
     bool elseW = elseL.diverges || elseL.writtenAtExit;
     r.writtenAtExit = thenW && elseW;
+    r.anyWriteFallThrough =
+        thenL.anyWriteFallThrough || elseL.anyWriteFallThrough;
     r.diverges = thenL.diverges && elseL.diverges;
     r.maxWrites = std::max(thenL.maxWrites, elseL.maxWrites);
     return r;
@@ -1336,23 +1355,37 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
         body.empty()
             ? Liveness{}
             : analyzeSeq(body.front().begin(), body.front().end(), binding,
-                         enteringWritten, &bodyBreaks, partialWriteBlocks);
+                         enteringWritten, /*enteringAnyWrite=*/false,
+                         &bodyBreaks, partialWriteBlocks);
     if (auto whileOp = dyn_cast<emitrust::WhileOp>(op)) {
       Region &condition = whileOp.getCondition();
       Liveness condL = analyzeSeq(condition.front().begin(),
                                   condition.front().end(), binding,
-                                  enteringWritten, /*brk=*/nullptr,
-                                  partialWriteBlocks);
+                                  enteringWritten, /*enteringAnyWrite=*/false,
+                                  /*brk=*/nullptr, partialWriteBlocks);
       // The condition runs first: its read precedes any body write.
       bodyL.readFirst = condL.readFirst || bodyL.readFirst;
     }
     r.readFirst = bodyL.readFirst;
     r.hasLoopWrite = bodyL.hasLoopWrite || bodyL.maxWrites > 0;
-    // `mut` is needed only when a write can recur: it does when a body path
-    // that writes the binding loops back (falls through with it written),
-    // but not when every write is immediately followed by a `break`.
-    r.loopReassign =
-        bodyL.loopReassign || (r.hasLoopWrite && bodyL.writtenAtExit);
+    // `mut` is needed only when a write can recur, and it recurs exactly when
+    // SOME body path writes the binding and reaches the BACK EDGE -- by
+    // falling through the body, or by a `continue`. A write whose every path
+    // ends in `break`/`return` never reaches it and keeps its bare `let`.
+    // FR-105: this is an ANY-path question, and asking the ALL-path
+    // `writtenAtExit` instead lost the `mut` on the commonest shape there is
+    // (a lifted C `for`, whose write sits under the loop's own condition) --
+    // `error[E0384]` at build time. `anyWriteFallThrough` is reseeded false
+    // at the body entry, so only writes from THIS iteration can qualify.
+    bool backEdgeWrite =
+        bodyL.anyWriteFallThrough || bodyBreaks.anyContinueWritten;
+    r.loopReassign = bodyL.loopReassign || backEdgeWrite;
+    // Leaving the loop with the binding written since the top of the
+    // iteration: through a `break` that had written it, or -- for a `for`/
+    // `while`, whose head can end the loop -- by a body fall-through.
+    r.anyWriteFallThrough = bodyBreaks.anyBreakWritten;
+    if (!isa<emitrust::LoopOp>(op))
+      r.anyWriteFallThrough |= bodyL.anyWriteFallThrough;
     r.maxWrites = bodyL.maxWrites;
     if (isa<emitrust::LoopOp>(op)) {
       // An `emitrust.loop` is a bare `loop {}`; it exits only through a
@@ -1368,11 +1401,13 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
   if (auto sw = dyn_cast<emitrust::SwitchOp>(op)) {
     auto seq = [&](Region &region) {
       return region.empty()
-                 ? passThroughLiveness(enteringWritten)
+                 ? passThroughLiveness(enteringWritten, enteringAnyWrite)
                  : analyzeSeq(region.front().begin(), region.front().end(),
-                              binding, enteringWritten, brk, partialWriteBlocks);
+                              binding, enteringWritten, enteringAnyWrite, brk,
+                              partialWriteBlocks);
     };
     Liveness d = seq(sw.getDefaultRegion());
+    bool anyWriteFT = d.anyWriteFallThrough;
     bool anyRead = d.readFirst;
     bool allWritten = d.diverges || d.writtenAtExit;
     bool allDiverge = d.diverges;
@@ -1382,6 +1417,7 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
     for (Region &caseRegion : sw.getCaseRegions()) {
       Liveness ci = seq(caseRegion);
       anyRead |= ci.readFirst;
+      anyWriteFT |= ci.anyWriteFallThrough;
       allWritten = allWritten && (ci.diverges || ci.writtenAtExit);
       allDiverge = allDiverge && ci.diverges;
       loopWrite |= ci.hasLoopWrite;
@@ -1390,6 +1426,7 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
     }
     r.readFirst = anyRead;
     r.writtenAtExit = allWritten; // the `_` arm covers every unmatched value
+    r.anyWriteFallThrough = anyWriteFT;
     r.diverges = allDiverge;
     r.hasLoopWrite = loopWrite;
     r.loopReassign = loopReassign;
@@ -1400,11 +1437,13 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
   // the binding and never guarantee a write.
   for (Region &region : op->getRegions())
     if (!region.empty()) {
-      Liveness sub = analyzeSeq(region.front().begin(), region.front().end(),
-                                binding, enteringWritten, brk, partialWriteBlocks);
+      Liveness sub =
+          analyzeSeq(region.front().begin(), region.front().end(), binding,
+                     enteringWritten, enteringAnyWrite, brk, partialWriteBlocks);
       r.readFirst |= sub.readFirst;
       r.hasLoopWrite |= sub.hasLoopWrite || sub.maxWrites > 0;
       r.loopReassign |= sub.loopReassign;
+      r.anyWriteFallThrough |= sub.anyWriteFallThrough;
     }
   return r;
 }
@@ -1412,11 +1451,15 @@ RustEmitter::Liveness RustEmitter::analyzeControl(Operation *op, Value binding,
 RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
                                               Block::iterator end, Value binding,
                                               bool enteringWritten,
+                                              bool enteringAnyWrite,
                                               BreakInfo *brk,
                                               bool partialWriteBlocks) {
   Liveness r;
   bool written = enteringWritten; // binding written on the current path
   unsigned writes = 0;            // whole-binding writes on the current path
+  // FR-105: written on SOME path reaching here, counting only writes
+  // since the seed point (the top of the enclosing loop iteration).
+  bool anyWritten = enteringAnyWrite;
   for (auto it = begin; it != end; ++it) {
     Operation *op = &*it;
     if (unreachableOps.count(op) || deadStores.count(op))
@@ -1427,6 +1470,7 @@ RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
       if (brk) {
         brk->sawBreak = true;
         brk->allWritten = brk->allWritten && written;
+        brk->anyBreakWritten |= anyWritten;
       }
       r.diverges = true;
       r.maxWrites = std::max(r.maxWrites, writes);
@@ -1435,6 +1479,8 @@ RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
     // A `continue` returns to the loop head; this straight-line path ends
     // without exiting the loop.
     if (isa<emitrust::ContinueOp>(op)) {
+      if (brk)
+        brk->anyContinueWritten |= anyWritten;
       r.diverges = true;
       r.maxWrites = std::max(r.maxWrites, writes);
       return r;
@@ -1445,6 +1491,7 @@ RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
       Value target = assign.getVar();
       if (target == binding) {
         written = true;
+        anyWritten = true;
         ++writes;
       } else if (projectionBase(target) == binding) {
         // A partial write (`v.x = ..`). It reads nothing of the binding, but
@@ -1468,11 +1515,16 @@ RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
           break;
         }
     if (op->getNumRegions() > 0) {
-      Liveness sub = analyzeControl(op, binding, written, brk, partialWriteBlocks);
+      Liveness sub = analyzeControl(op, binding, written, anyWritten, brk,
+                                    partialWriteBlocks);
       if (sub.readFirst && !written)
         r.readFirst = true;
       r.hasLoopWrite |= sub.hasLoopWrite;
       r.loopReassign |= sub.loopReassign;
+      // A construct that never falls through ends this path; otherwise the
+      // ANY-write state is its own fall-through state, or the entering one
+      // carried across it.
+      anyWritten = sub.anyWriteFallThrough || (anyWritten && !sub.diverges);
       writes += sub.maxWrites;
       if (!written && sub.writtenAtExit)
         written = true;
@@ -1490,6 +1542,7 @@ RustEmitter::Liveness RustEmitter::analyzeSeq(Block::iterator begin,
     }
   }
   r.writtenAtExit = written;
+  r.anyWriteFallThrough = anyWritten;
   r.maxWrites = std::max(r.maxWrites, writes);
   return r;
 }
@@ -1528,8 +1581,8 @@ void RustEmitter::computeDeferredInits(Block &block) {
       return;
     Liveness info =
         analyzeSeq(std::next(op->getIterator()), op->getBlock()->end(), binding,
-                   /*enteringWritten=*/false, /*brk=*/nullptr,
-                   /*partialWriteBlocks=*/true);
+                   /*enteringWritten=*/false, /*enteringAnyWrite=*/false,
+                   /*brk=*/nullptr, /*partialWriteBlocks=*/true);
     if (info.readFirst)
       return; // the initializer is live: some path reads before writing
     // `mut` is needed when a path assigns more than once, when the binding is
@@ -1618,6 +1671,7 @@ void RustEmitter::computeDeadStores(Block &entryBlock) {
       continue;
     Liveness after = analyzeSeq(std::next(op.getIterator()), entryBlock.end(),
                                 binding, /*enteringWritten=*/false,
+                                /*enteringAnyWrite=*/false,
                                 /*brk=*/nullptr, /*partialWriteBlocks=*/false);
     if (!after.readFirst)
       dead.insert(&op);
@@ -1674,14 +1728,14 @@ void RustEmitter::computeLoopBodyDeadStores(Block &entryBlock) {
         continue;
       // Not read in the remainder of this iteration, up to the back-edge.
       if (analyzeSeq(std::next(op.getIterator()), body.end(), binding,
-                     /*enteringWritten=*/false, /*brk=*/nullptr,
-                     /*partialWriteBlocks=*/false)
+                     /*enteringWritten=*/false, /*enteringAnyWrite=*/false,
+                     /*brk=*/nullptr, /*partialWriteBlocks=*/false)
               .readFirst)
         continue;
       // Not live-out: not read after the loop before the function ends.
       if (analyzeSeq(std::next(loopOp.getIterator()), entryBlock.end(), binding,
-                     /*enteringWritten=*/false, /*brk=*/nullptr,
-                     /*partialWriteBlocks=*/false)
+                     /*enteringWritten=*/false, /*enteringAnyWrite=*/false,
+                     /*brk=*/nullptr, /*partialWriteBlocks=*/false)
               .readFirst)
         continue;
       deadStores.insert(&op);
