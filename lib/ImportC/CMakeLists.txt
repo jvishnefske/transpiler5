@@ -7,6 +7,7 @@ add_mlir_library(MLIREmitRustImportC
   ClangProjectParser.cpp
   ImportCTypes.cpp
   ImportCAggregates.cpp
+  ImportCBorrowBundle.cpp
   ImportCGlobals.cpp
   ImportCFunctions.cpp
   ImportCStatements.cpp
