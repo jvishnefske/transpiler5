@@ -50,6 +50,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
 #include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclTemplate.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -227,6 +228,138 @@ static inline std::string namespacePrefix(const clang::DeclContext *context) {
   return prefix;
 }
 
+/// W2.15 template-argument TYPE CODE: the deterministic spelling one
+/// `Type` template argument contributes to a monomorphized function
+/// template's emitted symbol.
+///
+/// This is a table SEPARATE from W2.2's overload codes
+/// (`cxxOverloadParamCode` in lib/ImportC/ImportCFunctions.cpp), and
+/// deliberately so: that table spells EVERY integer `i`, a choice pinned
+/// byte-for-byte by test/Import/Cpp/methods.cpp (`Counter_get_i`) and
+/// harmless there because one class rarely overloads on `int` versus
+/// `long`. Two instantiations of ONE template, by contrast, are two
+/// different functions with the same C++ spelling and the same source
+/// location, so a code that fuses `add<int>` with `add<long>` makes the
+/// second definition collide with the first. The template table is
+/// therefore WIDER: integers carry width and signedness.
+///
+/// Every code is snake-safe BY CONSTRUCTION — the record/enum code runs
+/// through `toSnakeCase` unconditionally (not only under the FR-53
+/// idiomatic rename), because the suffix is appended AFTER
+/// `mangleMemberName` has done its own casing and would otherwise escape
+/// it: a `struct P` argument emitting `sum_P` is not merely ugly, it is a
+/// hard `cargo build` failure under rustc's denied `non_snake_case` lint.
+///
+/// The `x` fallback cannot disambiguate two arguments that both land on
+/// it (two distinct function-pointer types, two distinct lambda closure
+/// types). That is not a silent miscompile: the second instantiation
+/// collides on the composed symbol and `CImporter::importFunction`
+/// rejects it with a located, template-aware wording (pinned in
+/// test/Import/Cpp/function-templates-invalid.cpp). Widening the table is
+/// how a future wave admits such a shape.
+static inline std::string templateArgTypeCode(clang::QualType type) {
+  clang::QualType canonical = type.getCanonicalType().getUnqualifiedType();
+  if (canonical->isVoidType())
+    return "v";
+  // Checked before the builtin switch: `bool` is a builtin AND satisfies
+  // `isIntegerType`, and it must not share an integer code.
+  if (canonical->isBooleanType())
+    return "b";
+  // An enum is an integer type but has its OWN identity: two distinct
+  // enums instantiating one template are two different functions, so they
+  // take their tag names rather than a shared integer code.
+  if (const auto *enumType = canonical->getAs<clang::EnumType>()) {
+    if (const clang::IdentifierInfo *id = enumType->getDecl()->getIdentifier())
+      return toSnakeCase(id->getName());
+    return "x";
+  }
+  if (const auto *builtin = canonical->getAs<clang::BuiltinType>()) {
+    switch (builtin->getKind()) {
+    case clang::BuiltinType::Char_S:
+    case clang::BuiltinType::SChar:
+      return "i8";
+    case clang::BuiltinType::Char_U:
+    case clang::BuiltinType::UChar:
+    case clang::BuiltinType::Char8:
+      return "u8";
+    case clang::BuiltinType::Short:
+      return "i16";
+    case clang::BuiltinType::UShort:
+    case clang::BuiltinType::Char16:
+      return "u16";
+    case clang::BuiltinType::Int:
+    case clang::BuiltinType::WChar_S:
+      return "i32";
+    case clang::BuiltinType::UInt:
+    case clang::BuiltinType::WChar_U:
+    case clang::BuiltinType::Char32:
+      return "u32";
+    case clang::BuiltinType::Long:
+    case clang::BuiltinType::LongLong:
+      return "i64";
+    case clang::BuiltinType::ULong:
+    case clang::BuiltinType::ULongLong:
+      return "u64";
+    case clang::BuiltinType::Float:
+      return "f";
+    case clang::BuiltinType::Double:
+    case clang::BuiltinType::LongDouble:
+      return "d";
+    default:
+      return "x";
+    }
+  }
+  // A pointer NESTS its pointee's code behind `p`, so `int *` and
+  // `double *` stay distinct arguments.
+  if (canonical->isPointerType())
+    return "p" + templateArgTypeCode(canonical->getPointeeType());
+  if (const auto *recordType = canonical->getAs<clang::RecordType>()) {
+    if (const clang::IdentifierInfo *id = recordType->getDecl()->getIdentifier())
+      return toSnakeCase(id->getName());
+    // An unnamed record — most importantly a lambda closure type — has no
+    // stable spelling to code with.
+    return "x";
+  }
+  return "x";
+}
+
+/// W2.15 template-argument suffix: `""` for an ordinary function, and
+/// `"_" + code` per template argument, in template-parameter declaration
+/// order, for a function-template specialization.
+///
+/// It lives here, inside the shared naming header, for one load-bearing
+/// reason: EVERY name-recomputation site in the project (call sites,
+/// `resolveFunctionPointerDecl`, the Pass-A planners, recovery, and the
+/// FR-40 item graph) reaches a function's symbol through
+/// `cFunctionSymbolName`. Appending the suffix in the importer's
+/// definition path instead would leave all of them computing the
+/// UNSUFFIXED name, and `add<int>(2, 3)` would resolve to nothing
+/// ("call to unimported function 'add'"). Putting it here is also what
+/// makes design.md's "a call site needs no separate handling" true, and
+/// keeps the CLAUDE.md byte-identity invariant (importer and item graph
+/// agree on a symbol) intact for free.
+///
+/// A NON-type argument codes as the `x` fallback rather than asserting:
+/// this must stay a total function of the AST for the item graph's sake.
+/// The importer never emits such a symbol — non-type arguments and
+/// parameter packs are LOCATED rejections in
+/// `CImporter::importTopLevelDecl` before any naming happens.
+static inline std::string
+templateArgSuffix(const clang::FunctionDecl *func) {
+  const clang::TemplateArgumentList *args =
+      func->getTemplateSpecializationArgs();
+  if (!args)
+    return std::string();
+  std::string suffix;
+  for (const clang::TemplateArgument &arg : args->asArray()) {
+    suffix += "_";
+    suffix += arg.getKind() == clang::TemplateArgument::Type
+                  ? templateArgTypeCode(arg.getAsType())
+                  : std::string("x");
+  }
+  return suffix;
+}
+
 /// The emitted module symbol of the function `func` in a translation unit
 /// whose per-TU mangling tag is `tuTag` (`"tu<i>_"` under a multi-file
 /// import, empty for a single-file one).
@@ -245,6 +378,9 @@ static inline std::string namespacePrefix(const clang::DeclContext *context) {
 ///    a `FunctionDecl`'s `DeclContext` is never a `NamespaceDecl`);
 ///    `extern "C"` contributes nothing, preserving C linkage's
 ///    unchanged-name contract.
+///  - a W2.15 function-template specialization takes one `_<code>` suffix
+///    per template argument (`templateArgSuffix`, above), which is what
+///    keeps `add<int>` and `add<long>` distinct symbols.
 ///  - an internal-linkage (`static`) function takes `tuTag` in front, so
 ///    identically named file-statics in different TUs never collide.
 ///  - each prefix joins through `joinSymbolPrefix` (FR-73): leading
@@ -268,6 +404,12 @@ static inline std::string cFunctionSymbolName(const clang::FunctionDecl *func,
     return "c_main";
   std::string base = joinSymbolPrefix(namespacePrefix(func->getDeclContext()),
                                       mangleMemberName(cName));
+  //  - W2.15: a function-template specialization appends one type code per
+  //    template argument (`templateArgSuffix`), so two instantiations of one
+  //    template never share a symbol. The suffix goes on AFTER the namespace
+  //    prefix and BEFORE the internal-linkage tag join, so a `static`
+  //    template in a namespace composes all three.
+  base += templateArgSuffix(func);
   if (func->getStorageClass() == clang::SC_Static)
     return joinSymbolPrefix(tuTag, base);
   return base;

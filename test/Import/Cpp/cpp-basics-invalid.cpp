@@ -1,17 +1,31 @@
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/base-class.cpp 2>&1 | FileCheck %s --check-prefix=BASECLASS
 // RUN: not emitrust-import-c %t/reference-return.cpp 2>&1 | FileCheck %s --check-prefix=REFRETURN
-// RUN: not emitrust-import-c %t/template.cpp 2>&1 | FileCheck %s --check-prefix=TEMPLATE
 // RUN: not emitrust-import-c %t/try-catch.cpp 2>&1 | FileCheck %s --check-prefix=EXCEPTION
 
 // W2.0 AST-tolerance baseline. Two constructs get a dedicated located
-// rejection this wave (base classes, references); two more are
-// already trivially rejected via EXISTING generic diagnostics that predate
-// W2.0 (class templates fall through the top-level decl dispatch exactly
-// like any other unrecognized Decl kind; a try/catch statement falls
-// through the statement dispatch the same way) — pinned here so a later
-// wave (templates, member functions, exceptions) has a documented
-// baseline to work from. Virtual methods and multiple/virtual inheritance
+// rejection this wave (base classes, references); one more is
+// already trivially rejected via an EXISTING generic diagnostic that
+// predates W2.0 (a try/catch statement falls through the statement
+// dispatch exactly like any other unrecognized Stmt kind) — pinned here
+// so a later wave (member functions, exceptions) has a documented
+// baseline to work from.
+//
+// W2.15 RETIRED this file's third case. `//--- template.cpp` used to pin
+// `template <typename T> T identity(T x)` plus `identity<int>(41)` as
+// `error: unsupported top-level declaration`; function-template
+// monomorphization landed, so that exact input now IMPORTS, to
+// `func.func @identity_i32`. The pin moved forward rather than
+// loosening: the positive behaviour (and the binding template-argument
+// suffix scheme) is pinned in test/Import/Cpp/function-templates.cpp and
+// the surviving template frontier — explicit specializations, non-type
+// template arguments, parameter packs — in
+// test/Import/Cpp/function-templates-invalid.cpp. A template CLASS still
+// falls through the top-level decl dispatch to the generic wording
+// (W2.16), which stays pinned in test/Import/Cpp/methods-invalid.cpp's
+// TEMPLATE case.
+//
+// Virtual methods and multiple/virtual inheritance
 // are deliberately NOT covered here: a method (virtual or not) on a class
 // with no base classes is silently IGNORED, not rejected, by design this
 // wave (see cpp-basics.cpp and ImportC.cpp's file comment) — there is no
@@ -49,17 +63,6 @@ int &pick(int &x) {
 int use(void) {
   int v = 41;
   return pick(v);
-}
-
-//--- template.cpp
-// TEMPLATE: template.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported top-level declaration
-template <typename T>
-T identity(T x) {
-  return x;
-}
-
-int use(void) {
-  return identity<int>(41);
 }
 
 //--- try-catch.cpp

@@ -332,10 +332,19 @@ int use(void) {
 
 //--- lambda-escape-arg.cpp
 // W2.13 frontier: passing a lambda to a function requires naming its
-// closure type — a template — which is rejected before any function
-// body imports (the pre-existing template rejection, unchanged by the
-// lift; pinned here so the escape-by-argument shape has a baseline).
-// LAMESCARG: lambda-escape-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported top-level declaration
+// closure type, which in practice means a function template.
+//
+// W2.15 MOVED this pin forward rather than loosening it. Until function
+// templates were monomorphized, `apply` was rejected wholesale as
+// `unsupported top-level declaration` and the lambda never mattered.
+// Now clang's `apply<(lambda ...)>` instantiation IS imported, so the
+// rejection lands one level deeper and one level more precisely: on the
+// closure class's `operator()`, at the lambda's own source location. The
+// escape-by-argument shape is still out — that is the invariant this
+// section pins — but the diagnostic now names the real obstacle (the
+// closure type is a record with an overloaded call operator) instead of
+// the incidental one.
+// LAMESCARG: lambda-escape-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: overloaded operator
 template <typename F> int apply(F f) { return f(1); }
 int use(void) {
   int a = 1;

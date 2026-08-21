@@ -243,6 +243,11 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // pick up that tag.
   std::string name =
       cxxMethod ? cxxMethodMangledName(cxxMethod) : mlirFuncName(func);
+  // W2.15: remember that a function-template instantiation claimed this
+  // composed spelling, so a LATER hand-written definition colliding with
+  // it gets the template-aware wording below rather than the cross-TU one.
+  if (func->getTemplateSpecializationArgs())
+    templateSpecSymbolNames.insert(name);
   // FR-73: leading underscores of an internal-linkage or namespaced name
   // fold into the prefix boundary (`_set` -> `tu0_set`; `joinSymbolPrefix`
   // in CSymbolNaming.h), and the fold must not silently merge two C
@@ -484,10 +489,25 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   if (func::FuncOp existing = functions.lookup(name)) {
     if (!isDefinition)
       return success(); // Redundant declaration.
-    if (!existing.isExternal())
+    if (!existing.isExternal()) {
+      // W2.15: within ONE translation unit two symbols can now collide for
+      // a reason the cross-TU wording describes wrongly — the finite
+      // template-argument code table aliased two distinct arguments onto
+      // one code (two function-pointer types, two closure types), or an
+      // ordinary hand-written function already owns the composed spelling.
+      // Either side of the clash may be the template one, so the check
+      // asks both "is this decl an instantiation?" and "did an
+      // instantiation claim this name earlier?".
+      if (func->getTemplateSpecializationArgs() ||
+          templateSpecSymbolNames.contains(name))
+        return emitError(loc)
+               << "unsupported: function template instantiation collides "
+                  "with the existing symbol '"
+               << name << "'";
       return emitError(loc)
              << "unsupported: conflicting definition of '" << name
              << "' (already defined in another translation unit)";
+    }
     if (existing.getFunctionType() != functionType) {
       // A definition may refine a prototype-only import's pointer
       // parameters from scalar references to slices (the prototype's TU
@@ -1706,9 +1726,103 @@ LogicalResult CImporter::importDeclsIn(const clang::DeclContext *context) {
   return success();
 }
 
+/// W2.15: the located rejection a function-template specialization whose
+/// template ARGUMENTS are outside the admitted subset earns, or success
+/// when every argument is a plain type.
+///
+/// Driven off the `TemplateArgument` kind rather than off anything in the
+/// body, which is not a stylistic choice: a body-driven check is
+/// measurably insufficient. `template <int N> int ident(int x) { return x; }`
+/// never mentions `N`, and `template <typename... Ts> int first(int a, Ts...)`
+/// need contain no pack expression — both bodies import as ordinary
+/// functions, under a symbol whose suffix codes the non-type argument as
+/// the `x` placeholder, so two instantiations silently fuse into one.
+/// Both shapes are regression-pinned in
+/// test/Import/Cpp/function-templates-invalid.cpp.
+static LogicalResult checkTemplateArguments(const clang::FunctionDecl *spec,
+                                            Location loc) {
+  const clang::TemplateArgumentList *args =
+      spec->getTemplateSpecializationArgs();
+  if (!args)
+    return success();
+  for (const clang::TemplateArgument &arg : args->asArray()) {
+    if (arg.getKind() == clang::TemplateArgument::Pack)
+      return emitError(loc)
+             << "unsupported: variadic function template (template "
+                "parameter pack)";
+    if (arg.getKind() != clang::TemplateArgument::Type)
+      return emitError(loc) << "unsupported: non-type template argument in "
+                               "function template instantiation";
+  }
+  return success();
+}
+
 LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
-  if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl))
+  // W2.15 function-template monomorphization. Clang has already
+  // instantiated every specialization the program requests, each a
+  // concrete `FunctionDecl` with a dependent-free body hanging off the
+  // template; the importer walks THOSE and never touches the
+  // uninstantiated pattern, whose parameters are dependent types with no
+  // mapping. Skipping the pattern structurally (rather than filtering it
+  // out) is also what keeps a NEVER-instantiated template — e.g. the
+  // `template <size_t I> int get(...)` tuple-protocol overload in
+  // test/Import/Cpp/cpp-structured-bindings.cpp — importing exactly as it
+  // did before this wave: it contributes no specializations, so nothing
+  // is examined and nothing is rejected.
+  //
+  // This arm runs BEFORE the `FunctionDecl` arm. A `FunctionTemplateDecl`
+  // is not a `FunctionDecl`, so the order is not required by the type
+  // dispatch, but the explicit-specialization guard below reads more
+  // plainly next to the arm it pairs with.
+  //
+  // KNOWN GAPS, recorded rather than left silent:
+  //  * an `extern template` explicit-instantiation DECLARATION is not a
+  //    definition and is skipped here; a call to it surfaces at the call
+  //    site as "call to unimported function '<sym>'".
+  //  * a member function template never reaches this walk (it is declared
+  //    inside a record) and surfaces as "call to unimported method".
+  //  * two TUs instantiating one header template both emit the symbol and
+  //    the FR-58 shard merge rejects with "duplicate definition of
+  //    '<sym>' at link"; template vague linkage / COMDAT dedup is out of
+  //    scope for W2.15.
+  if (const auto *tmpl = llvm::dyn_cast<clang::FunctionTemplateDecl>(decl)) {
+    for (const clang::FunctionDecl *spec : tmpl->specializations()) {
+      if (!spec->isThisDeclarationADefinition())
+        continue;
+      // An implicit instantiation reports the PATTERN's location, so every
+      // instantiation of one template shares a diagnostic location. That
+      // is accepted (there is no better source position for generated
+      // code) and is why the lit pins match line/column loosely.
+      Location specLoc = translateLoc(spec->getLocation());
+      if (spec->getTemplateSpecializationKind() ==
+          clang::TSK_ExplicitSpecialization)
+        return emitError(specLoc)
+               << "unsupported: explicit function template specialization";
+      if (failed(checkTemplateArguments(spec, specLoc)))
+        return failure();
+      if (failed(importFunction(spec)))
+        return failure();
+    }
+    return success();
+  }
+  if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+    // W2.15: an EXPLICIT SPECIALIZATION is visited twice — once through
+    // its template's `specializations()` list above, once here as an
+    // ordinary top-level declaration. Rejecting at both sites is what
+    // makes the rejection effective under FR-42 recovery, where dropping
+    // the template item would otherwise leave this visit free to admit
+    // the specialization's hand-written body silently.
+    if (func->getTemplateSpecializationKind() ==
+        clang::TSK_ExplicitSpecialization)
+      return emitError(translateLoc(func->getLocation()))
+             << "unsupported: explicit function template specialization";
+    // An implicit or explicit INSTANTIATION belongs to the template arm
+    // above, which already imported it; importing it again here would
+    // collide with itself.
+    if (func->getTemplateSpecializationKind() != clang::TSK_Undeclared)
+      return success();
     return importFunction(func);
+  }
   if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
     // An EMPTY struct that no declaration type mentions is skipped: it
     // may only ever appear as a zero-byte member of a byte-region
