@@ -10502,7 +10502,7 @@ the subset boundary is honest today, nothing silently miscompiles):
 
 | construct | today's diagnostic |
 |---|---|
-| `template <typename T> T add(T,T)` | `unsupported top-level declaration` (ImportCFunctions.cpp:1734) |
+| `template <typename T> T add(T,T)` | LANDED W2.15 (was `unsupported top-level declaration`) |
 | `template <typename T> struct Box` | `unsupported top-level declaration` (same site) |
 | user destructor `~R()` | `unsupported: user-declared destructor` |
 | `struct D : Base` | `unsupported: base classes are not supported` |
@@ -10520,23 +10520,101 @@ so the import is a naming and traversal problem, not a type-inference one
 survives without it, then inheritance, then the STL containers that carry
 whole-program demand.
 
-- [ ] W2.15 Function-template monomorphization. `importTopLevelDecl`
-  (ImportCFunctions.cpp:1710) gains a `FunctionTemplateDecl` case that
-  imports every `specializations()` member which
-  `isThisDeclarationADefinition()`, and skips the uninstantiated pattern
-  entirely. Naming: `mlirFuncName` must not collide two instantiations of
-  one template, so a specialization takes a template-argument suffix built
-  from the same overload type-code table W2.2's `cxxMethodMangledName`
-  introduced (extended as the fixtures need). A call site already resolves
-  by callee decl identity, so `add<int>(2,3)` needs no separate handling
-  once the name is a function of the specialization decl.
-  Acceptance: a new corpus entry 01001 (single-type-parameter function
-  template, two distinct instantiations, both called) flips
-  UNSUPPORTED->PASS with a byte-diff-clean EndToEnd leg; explicit
-  specialization, non-type template parameters, variadic templates and
-  SFINAE-heavy patterns stay LOCATED rejections with newly minted
-  wordings; CTestSuite ledger unchanged; full suite 100%.
-  **NOT SPIKED.**
+- [x] W2.15 Function-template monomorphization. Spike verdict
+  **GO-WITH-CONSTRAINTS** (2026-08-21, prototype built and fully
+  reverted): 17 template shapes were `--emit=crate --build`'d and
+  byte-diffed against their `clang++ -std=c++17` natives -- 01001, two
+  instantiations, float/double, int/long, `T*`, `T&`, record argument,
+  namespaced, anon-namespace static, defaulted argument, two type
+  parameters, deduced (no explicit args), SFINAE, SFINAE-on-return-type,
+  `if constexpr`, bool, function-pointer argument -- ALL BYTE-IDENTICAL.
+  The dialect needs nothing new: a specialization is an ordinary
+  `emitrust.func` and the monomorphized IR uses only ops that already
+  round-trip through `emitrust-opt` byte-stably.
+  Landed: (1) **The `FunctionTemplateDecl` arm** in `importTopLevelDecl`
+  (`ImportCFunctions.cpp`) imports every `specializations()` member that
+  `isThisDeclarationADefinition()` and never looks at the uninstantiated
+  pattern -- which is why a never-instantiated template (the TUPLEPROTO
+  pin in `cpp-structured-bindings.cpp`) still costs nothing, and why the
+  `isSystemHeaderDecl` skip keeps `<type_traits>`/`std::max` out of the
+  walk for free. Enumeration order is a `FoldingSetVector`'s insertion
+  order = source order; 12 separate `--emit=rust` runs of 01001.cpp give
+  one md5. (2) **The template-argument suffix lives inside
+  `cFunctionSymbolName`** (`include/EmitRust/CSymbolNaming.h`), appended
+  after the namespace prefix and before the `SC_Static` tuTag join --
+  NOT at the `importFunction` mangling site where `cxxMethodMangledName`
+  is applied. This placement is load-bearing, and the spike measured why:
+  16 sites across the importer and the FR-40 item graph recompute a
+  function's symbol name from its decl, and a suffix applied at the
+  mangling site alone makes every one of them resolve an unsuffixed name
+  (`unsupported: call to unimported function 'add'`). Inside
+  `cFunctionSymbolName`, the CLAUDE.md importer/item-graph byte-identity
+  invariant holds for free and design.md's original "no call-site change
+  needed" claim comes true. (3) **A SEPARATE, WIDER type-code table**
+  (`templateArgTypeCode`/`templateArgSuffix`): W2.2's
+  `cxxOverloadParamCode` is byte-frozen -- its `i`/`b` codes are pinned
+  by CHECK lines in `test/Import/Cpp/methods.cpp` (`Counter_new_i`) --
+  and reusing it verbatim was measured to break, since one `i` for every
+  integer makes `add<int>` and `add<long>` both `add_i`. The template
+  path gets `i8/u8/i16/u16/i32/u32/i64/u64/f/d/b/v/p<pointee>` plus the
+  snake_cased tag name for a record or enum. Snake-safety is by
+  construction, not by luck: a record-typed argument first emitted `fn
+  sum_P(...)` and cargo hard-failed on `-D non-snake-case` (the correct
+  safe-failure direction, but it must not ship), because
+  `cFunctionSymbolName` snake-cases via `mangleMemberName` BEFORE the
+  suffix is appended. (4) **Rejections are checked on the
+  specialization's `TemplateArgument` kind, never left to the body** --
+  the spike measured body-driven rejection to be silently insufficient:
+  `template <typename... Ts> int first(int, Ts...)` (no `SizeOfPackExpr`
+  anywhere) and `template <int N> int ident(int)` (N unused) BOTH
+  imported silently under the naive arm, with a placeholder type code in
+  the emitted symbol name and a collision waiting for the second
+  instantiation. Three wordings minted: `non-type template argument in
+  function template instantiation`, `variadic function template
+  (template parameter pack)`, `explicit function template
+  specialization`. Because an implicit instantiation reports the
+  PATTERN's `getLocation()`, every instantiation of one template shares
+  a diagnostic location. (5) **Collisions get a template-aware wording**
+  -- `function template instantiation collides with the existing symbol
+  '<sym>'`, backed by a new `templateSpecSymbolNames` set and a
+  `FunctionTemplateDecl` arm in `collectOrdinaryNamesFrom`
+  (`ImportCAggregates.cpp`) so the pre-scan claims specialization names.
+  Both clash orders are pinned (template first, hand-written `add_i32`
+  first). Aliasing codes that USED to collide nonsensically (two enums
+  both `isIntegerType()` -> `val_i`) cannot: enums and records carry
+  their own tag name. (6) **The FR-40 item graph got real arms**
+  (`collectItems`, `collectDependencies`, `collectOrdinaryNames` in
+  `lib/Project/ItemGraph.cpp`), not a known-gap comment, so
+  `--emit=item-graph` over a template input is complete -- nodes plus
+  per-instantiation `Calls` edges -- rather than silently understating
+  the `--incremental` denominator. (7) **An explicit specialization is
+  visited TWICE** (once via `specializations()`, once as an ordinary
+  top-level `FunctionDecl`); both sites reject, and under `--recover`
+  the recovered crate carries
+  `unimplemented!("unsupported: explicit function template
+  specialization")` -- never the specialization's body.
+  CORRECTION to this entry's original acceptance text: SFINAE was
+  listed as a must-stay-rejected shape and that was wrong -- SFINAE and
+  `if constexpr` both work, because clang resolves them before the
+  importer ever sees an instantiation. Only explicit specialization,
+  non-type template arguments and parameter packs are out.
+  KNOWN GAPS, recorded as source comments at the arm, not silent:
+  `extern template` declarations are skipped as non-definitions; member
+  function templates are unreachable from `importTopLevelDecl`; and a
+  cross-TU duplicate instantiation reaches FR-58's `duplicate definition
+  of '<sym>' at link`.
+  Gates: full meson suite 689/689 (fast 492 + slow/EndToEnd 197), 0
+  failures, 0 OOM markers. Cpp17Suite `total=27 transpiled=24 passed=24
+  miscompiled=0 unsupported=3` -- the ledger ratchets by exactly
+  `01001.cpp`. CTestSuite ledger unchanged at 220/220/0/0 with the file
+  untouched in git. The EndToEnd byte-diff was rerun after wiping its
+  Output dir (not a stale artifact): 42 bytes identical.
+  (test/Import/Cpp/function-templates.cpp,
+  function-templates-invalid.cpp; test/Project/item-graph-function-template.cpp;
+  test/EndToEnd/cpp-function-template.cpp;
+  test/Cpp17Suite/Inputs/01001.cpp; retired the `template.cpp` section of
+  test/Import/Cpp/cpp-basics-invalid.cpp, re-minted LAMESCARG in
+  stl-invalid.cpp)
 
 - [ ] W2.16 Class-template monomorphization: `ClassTemplateDecl` ->
   one emitted struct per specialization (`Box<int>` -> `Box_i32`), methods

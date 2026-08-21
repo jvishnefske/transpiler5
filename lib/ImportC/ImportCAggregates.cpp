@@ -65,6 +65,27 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
       collectOrdinaryNamesFrom(ns);
       continue;
     }
+    // W2.15: mirror importTopLevelDecl's function-template arm. Each
+    // INSTANTIATION becomes an emitted module symbol, so the pre-scan must
+    // claim its composed (suffixed) spelling too — otherwise
+    // `structSymbolName`'s ordinary-name collision check and the FR-73
+    // underscore-fold guard are blind to every template symbol in the TU
+    // and a struct tag could be assigned a name an instantiation owns.
+    // The uninstantiated pattern is skipped here for exactly the reason it
+    // is skipped there.
+    if (const auto *tmpl = llvm::dyn_cast<clang::FunctionTemplateDecl>(decl)) {
+      for (const clang::FunctionDecl *spec : tmpl->specializations()) {
+        if (!spec->isThisDeclarationADefinition())
+          continue;
+        std::string specName = mlirFuncName(spec);
+        ordinaryTuNames.insert(specName);
+        ordinaryRawTuNames.insert(spec->getName());
+        ordinaryTuNameOwners.try_emplace(specName, spec->getName().str());
+        if (spec->hasBody())
+          collectStaticLocalNames(spec->getBody(), specName);
+      }
+      continue;
+    }
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
       std::string funcName = mlirFuncName(func);
       ordinaryTuNames.insert(funcName);

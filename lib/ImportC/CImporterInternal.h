@@ -5682,6 +5682,16 @@ private:
   /// with these are renamed (see `structSymbolName`).
   llvm::StringSet<> ordinaryTuNames;
 
+  /// W2.15: composed module-symbol names claimed by a function-template
+  /// INSTANTIATION in this import. The finite template-argument code table
+  /// can alias two distinct arguments onto one code, and a hand-written
+  /// function can already own a composed spelling; either way the loser of
+  /// the clash must get a template-aware located rejection instead of the
+  /// cross-TU "already defined in another translation unit" wording, which
+  /// is nonsense for a single-TU template collision. A set (not a map)
+  /// because only the fact of the claim matters.
+  llvm::StringSet<> templateSpecSymbolNames;
+
   /// The RAW C spellings the current TU's ordinary identifier namespace
   /// declares (functions and file-scope variables, no mangling applied).
   /// Backs the keyword-function collision check (CTS 00204): `match`

@@ -637,6 +637,20 @@ void ItemGraphBuilder::collectOrdinaryNames(const clang::DeclContext *context) {
       collectOrdinaryNames(ns);
       continue;
     }
+    // W2.15: a function template's INSTANTIATIONS are the emitted items
+    // (the pattern is not), so they claim the ordinary names — mirroring
+    // `CImporter::collectOrdinaryNamesFrom`.
+    if (const auto *tmpl = llvm::dyn_cast<clang::FunctionTemplateDecl>(decl)) {
+      for (const clang::FunctionDecl *spec : tmpl->specializations()) {
+        if (!spec->isThisDeclarationADefinition())
+          continue;
+        std::string symbol = cFunctionSymbolName(spec, tuTag);
+        if (spec->hasBody())
+          collectStaticLocalNames(spec->getBody(), symbol);
+        tuOrdinaryNames[tuIndex].insert(std::move(symbol));
+      }
+      continue;
+    }
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
       if (!func->getDeclName().isIdentifier())
         continue;
@@ -701,6 +715,28 @@ void ItemGraphBuilder::collectItems(const clang::DeclContext *context) {
     std::string file = presumed.isValid() ? presumed.getFilename() : "";
     unsigned line = presumed.isValid() ? presumed.getLine() : 0;
     unsigned column = presumed.isValid() ? presumed.getColumn() : 0;
+
+    // W2.15: a function template contributes one item per INSTANTIATION,
+    // mirroring `CImporter::importTopLevelDecl`'s arm — the uninstantiated
+    // pattern is not an item (nothing is emitted for it). Without this the
+    // whole-program index would be silently incomplete: the specializations
+    // would have no node while a caller's body still adds a `Calls` edge
+    // under their (suffixed) names, and that denominator feeds
+    // `--incremental`'s PORTING.md / emitrust-progress.json.
+    if (const auto *tmpl = llvm::dyn_cast<clang::FunctionTemplateDecl>(decl)) {
+      for (const clang::FunctionDecl *spec : tmpl->specializations()) {
+        if (!spec->isThisDeclarationADefinition())
+          continue;
+        clang::PresumedLoc specLoc =
+            sourceManager->getPresumedLoc(spec->getLocation());
+        addNode({cFunctionSymbolName(spec, tuTag), ItemKind::Function,
+                 /*isDefinition=*/true, linkageOf(spec), tuIndex,
+                 specLoc.isValid() ? specLoc.getFilename() : "",
+                 specLoc.isValid() ? specLoc.getLine() : 0,
+                 specLoc.isValid() ? specLoc.getColumn() : 0});
+      }
+      continue;
+    }
 
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
       // C++ member functions are not items: they are declared inside a
@@ -1242,6 +1278,18 @@ void ItemGraphBuilder::collectDependencies(const clang::DeclContext *context) {
     }
     if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(decl)) {
       collectDependencies(ns);
+      continue;
+    }
+    // W2.15: edges out of an instantiation's own body. Without this arm a
+    // `scale<double>` node would exist with no `Calls` edge to the
+    // `add<double>` its body invokes, and the index would understate the
+    // porting frontier.
+    if (const auto *tmpl = llvm::dyn_cast<clang::FunctionTemplateDecl>(decl)) {
+      for (const clang::FunctionDecl *spec : tmpl->specializations()) {
+        if (!spec->isThisDeclarationADefinition())
+          continue;
+        collectFunctionDependencies(spec, cFunctionSymbolName(spec, tuTag));
+      }
       continue;
     }
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
