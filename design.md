@@ -6292,9 +6292,25 @@ piece and becomes FR-45.
   does NOT mean the items behind it port — ecc's aliasing-bignum
   wall is independent and known to sit behind `UEccCurveT`) +
   full lit 100%; C path only.
-  **NOT YET SPIKED** — the isolation above is measured, the
-  admission is a proposal. Ranked FIRST among open fronts on
-  corpus evidence.
+  TWO PINS ALREADY EXIST FOR THIS FRONTIER and must move with
+  it, exactly as FR-100 moved FR-92's FWDSCALAR arm:
+  test/Import/C/fnptr-slice-components-invalid.c:24-32 is a
+  STRUCTPTR arm asserting that `struct Ops { void (*f)(struct S
+  *p); }` rejects — that is precisely the shape FR-102 admits, so
+  the arm becomes a POSITIVE pin with its prose rewritten, never
+  deleted — while the VOIDCOMP (:34-41) and NESTED (:52-59) arms
+  in the same file MUST keep rejecting verbatim, since neither
+  the `void *` component family nor the nested-fn-ptr one-level
+  gate is in scope. test/Import/C/fn-pointers-invalid.c:64
+  carries a COMPONENT arm to re-check the same way.
+  One thing this does NOT need: the Rust renderer already
+  recurses into `emitType` for every fn-ptr component
+  (lib/Target/Rust/TranslateToRust.cpp:2539-2559), so a
+  `&mut Node` component renders without any emitter change —
+  verified by reading, still to be confirmed by a golden.
+  **NOT YET SPIKED** — the isolation, the dialect obligation and
+  the two pins above are measured; the admission is a proposal.
+  Ranked FIRST among open fronts on corpus evidence.
 
 - [ ] FR-103 Undefined extern globals: recover instead of failing
   the TU (measured 2026-08-20, ranked BELOW FR-102).
@@ -6329,6 +6345,50 @@ piece and becomes FR-45.
   sequenced after it — recorded here so the measurement is not
   redone.
   **NOT SPIKED.**
+
+- [ ] FR-104 Returned cursors into a PARAMETER region (the #2
+  corpus family, 97 items — but only its decidable sub-family is
+  proposed here).
+  "returned pointer value" is one diagnostic covering three
+  unrelated shapes, and conflating them is what has made this
+  front look intractable. (i) OWNED ALLOCATION — closed by FR-99.
+  (ii) A CURSOR INTO A CALLER-SUPPLIED REGION — the subject of
+  this entry. (iii) A BORROW OF A HEAP TREE NODE (cJSON's
+  `cJSON_GetObjectItem` family) — genuinely needs an ownership
+  model and stays out.
+  Family (ii) has an exact fit in the existing model, which is
+  why it is worth separating. The importer ALREADY decomposes
+  every pointer into (region base, i64 cursor); the current
+  rejection wording says "a cursor into a callee-local region
+  would dangle" — true, but a cursor into a region the CALLER
+  ITSELF PASSED IN does not dangle, and its base is already known
+  at the call site, because the caller is the one who supplied
+  it. So only the CURSOR need cross the return: the function
+  returns an i64 index and the caller re-slices the argument
+  region it already holds. No lifetime and no new value kind —
+  the return carries the half of the decomposition that is not
+  already caller-known.
+  Measured instances, all tiny and self-contained:
+  `ini_lskip(const char *s) { while (...) s++; return (char*)s; }`
+  and `ini_rstrip(char *s, char *end)` (inih ini.c:50-62) are the
+  canonical string-walk shape; `jsmn_alloc_token` (jsmn.h:106-118)
+  returns `&tokens[parser->toknext++]` — a cursor into its
+  `tokens` PARAMETER — and additionally has a NULL return, so it
+  composes with FR-99 as an `Option` of a cursor. Between them
+  inih (1/11 items) and jsmn (5/9) are largely gated on this plus
+  FR-102.
+  THE GATE: every return site must yield a pointer whose region
+  base is the SAME single pointer parameter, on every path; a
+  function that could return a cursor into two different
+  parameter regions has no single base for the caller to
+  re-slice and keeps the verbatim rejection — the same multi-base
+  condition the ARGUMENT path already rejects, reused rather than
+  invented. Returns of a global-region cursor (`log_level_string`'s
+  static string table) and of callee-local or heap regions stay
+  out.
+  **NOT SPIKED** — the family separation and the instances are
+  measured; the cursor-return representation is a proposal.
+  Ranked SECOND, after FR-102.
 
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
