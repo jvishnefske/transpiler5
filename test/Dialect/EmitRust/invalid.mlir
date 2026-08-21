@@ -495,8 +495,42 @@ emitrust.func @subscript_slice_element_mismatch(%arg0: !emitrust.mut_ref<!emitru
 
 // -----
 
+// A BARE SCALAR borrow is not a component: a fn-ptr signature is a
+// contract with unknown implementors, and the region contract is what a C
+// pointer parameter means. FR-102 widened the borrow set to `struct`
+// pointees only; this stays invalid.
 // expected-error @+1 {{invalid fn_ptr parameter type '!emitrust.ref<i32>'}}
 emitrust.func @fn_ptr_bad_component(%arg0: !emitrust.fn_ptr<(!emitrust.ref<i32>) -> i32>) {
+  emitrust.return
+}
+
+// -----
+
+// FR-102 C3: reference-to-ENUM is deliberately OUT of the component set.
+// A C `enum T *` component never reaches the record arm (clang calls an
+// enum arithmetic, so it takes the FR-76 slice branch), which makes this
+// unreachable from the importer and therefore unpinnable dialect surface.
+// expected-error @+1 {{invalid fn_ptr parameter type '!emitrust.ref<!emitrust.enum<"Color">>'}}
+emitrust.func @fn_ptr_enum_ref_component(%arg0: !emitrust.fn_ptr<(!emitrust.ref<!emitrust.enum<"Color">>) -> i32>) {
+  emitrust.return
+}
+
+// -----
+
+// A `data_enum` borrow stays invalid too: owner promotion turns a
+// self-referential record's struct-pointer parameter into an (owner
+// receiver, index) PAIR, which no fn_ptr component can carry.
+// expected-error @+1 {{invalid fn_ptr parameter type '!emitrust.mut_ref<!emitrust.data_enum<"Msg">>'}}
+emitrust.func @fn_ptr_data_enum_ref_component(%arg0: !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.data_enum<"Msg">>)>) {
+  emitrust.return
+}
+
+// -----
+
+// A borrow of a borrow is not a component (the pointer-to-pointer
+// frontier's dialect half).
+// expected-error @+1 {{invalid fn_ptr parameter type '!emitrust.mut_ref<!emitrust.mut_ref<!emitrust.struct<"S">>>'}}
+emitrust.func @fn_ptr_ref_of_ref_component(%arg0: !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.mut_ref<!emitrust.struct<"S">>>)>) {
   emitrust.return
 }
 

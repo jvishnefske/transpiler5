@@ -312,9 +312,14 @@ def EmitRust_FnPtrType : EmitRust_Type<"FnPtr", "fn_ptr"> {
 
     Component (parameter and result) types are restricted to the
     emitter-supported scalars (i1, i8/i16/i32/i64, u8/u16/u32/u64, index,
-    f32, f64), `!emitrust.struct`, `!emitrust.enum`, and nested
-    `!emitrust.fn_ptr`; pointers, references, lvalues, and arrays are
-    rejected.
+    f32, f64), `!emitrust.struct`, `!emitrust.enum`, nested
+    `!emitrust.fn_ptr`, and a `ref`/`mut_ref` borrow of an
+    `!emitrust.slice` (FR-76) or of an `!emitrust.struct` (FR-102) — the
+    Rust spellings `fn(&mut [u8], u32)` and `fn(&mut Node, i32) -> i32`
+    are higher-ranked fn types with elided lifetimes. Every other pointer
+    or reference (a bare scalar borrow, a borrow of an `enum`,
+    `data_enum`, `array`, or `cell_slice`, a borrow of a borrow), plus
+    lvalues and arrays, are rejected.
   }];
 
   let parameters = (ins ArrayRefParameter<"Type">:$inputs,
@@ -323,9 +328,11 @@ def EmitRust_FnPtrType : EmitRust_Type<"FnPtr", "fn_ptr"> {
   let extraClassDeclaration = [{
     /// Returns whether `type` may be used as a fn_ptr parameter or result
     /// type: an emitter-supported scalar (i1, i8/i16/i32/i64 signless,
-    /// u8/u16/u32/u64, index, f32, f64), an EmitRust struct or enum, or a
-    /// nested fn_ptr. References, lvalues, arrays, and opaque types are
-    /// rejected.
+    /// u8/u16/u32/u64, index, f32, f64), an EmitRust struct or enum, a
+    /// nested fn_ptr, or a `ref`/`mut_ref` borrow of a `slice` (FR-76) or
+    /// of a `struct` (FR-102). Every other reference (bare scalar borrow,
+    /// borrow of an enum/data_enum/array/cell_slice/borrow), plus
+    /// lvalues, arrays, and opaque types, are rejected.
     static bool isValidComponentType(Type type);
   }];
 

@@ -6256,7 +6256,7 @@ piece and becomes FR-45.
   Rust" is made or implied.
   Full suite 675/675, both tiers, Fail 0.
 
-- [ ] FR-102 Struct-pointer components in function-pointer types
+- [x] FR-102 Struct-pointer components in function-pointer types
   (the largest measured root in the whole external corpus, found
   2026-08-20 by widening the probe to lwIP `src/core`).
   MEASUREMENT FIRST, on a corpus WIDENED for this ranking
@@ -6385,6 +6385,81 @@ piece and becomes FR-45.
   **NOT YET SPIKED** — the isolation, the dialect obligation and
   the two pins above are measured; the admission is a proposal.
   Ranked FIRST among open fronts on corpus evidence.
+  **DELIVERED (2026-08-21) — and THE CASCADE ARITHMETIC ABOVE IS
+  WRONG. Corrected here, in full, because it is the reason this
+  front was ranked first and the ranking does not survive
+  measurement.** The admission works exactly as designed and the
+  real movement is +25 items across the corpus (795 -> 820,
+  +3.1%), NOT the 110-plus-cascades this entry projected.
+  WHAT ACTUALLY OPENED: the root diagnostic "pointer type outside
+  a parameter position" fell 110 -> 84 corpus-wide (lwIP alone
+  91 -> 65, independently re-measured), and lwIP src/core went
+  570 -> 583 ported. `UEccCurveT` and `PbufCustom` are the only
+  cascade roots that OPEN — and `UEccCurveT` yields just +12
+  tinycrypt items, because the aliasing-bignum wall behind it is
+  independent, exactly as this entry warned but did not discount
+  for.
+  WHAT DID NOT OPEN, AND WHY THE ATTRIBUTION WAS WRONG: `TcpPcb`
+  (64) and `Netif` (58) — the two largest cascades, and more than
+  half the projected value — are NOT caused by fn-pointer
+  components at all. A two-line probe (`#include "lwip/netif.h"`
+  + `struct netif probe;`) puts the root at netif.h:334, which is
+  `void *state;` — a plain VOID-POINTER DATA MEMBER. `struct
+  tcp_pcb` reports the SAME root through `ip_pcb`. Both belong to
+  the separately ranked void* front that this FR explicitly
+  excludes. They were grouped under this root because they share
+  its diagnostic TEXT, and one diagnostic string covering several
+  unrelated causes is precisely the trap FR-104's entry names for
+  "returned pointer value" — the same mistake was made here, one
+  entry later. `Stats` (6) is `struct stats_mem *memp[MEMP_MAX]`,
+  an ARRAY of struct pointers, also not a fn-ptr component.
+  `State` 14, `Printbuffer` 9, `TeExpr` 8, `InternalHooks` 7,
+  `ParseBuffer` 7: unchanged. cJSON, tinyexpr, inih, log.c and
+  tiny-AES-c moved by ZERO — inih stays 1/11 and log.c 0/16, both
+  gated on void* components and (for log.c) `va_list`.
+  A REPORTING ARTIFACT TO EXPECT, recorded so the next measurer
+  does not read it as a regression: the `Netif` cascade count
+  RISES 58 -> 71 after this change, because more items now get
+  far enough through import to name `Netif` before failing.
+  TWO REAL DEFECTS FOUND, both latent and both FIXED here — this
+  is the increment's under-advertised value. FR-102 is the first
+  feature whose types resolve a record's own name DURING the
+  field walk, and that exposed a NAME-RESOLUTION ORDERING bug
+  that emitted code referencing types that do not exist, with NO
+  located diagnostic and nothing in the verifier to catch it
+  (struct types are opaque by name, so `emitrust-opt` cannot
+  cross-check a `struct_def` field type):
+  (a) a BLOCK-SCOPE record with a self-referential fn-ptr member
+  emitted `struct CMainLoc { visit: Option<fn(&mut Loc, ...)> }`
+  — rustc E0412;
+  (b) a TAG-vs-ORDINARY collision under `--preserve-c-names`
+  emitted a member naming a FUNCTION as a type — E0573/E0412.
+  Cause: `structSymbolName` and the block-scope mangling both ran
+  AFTER `collectRecordFields`, while a self-referential component
+  resolves through `emittedRecordName` DURING it. Both name
+  decisions are now hoisted above the field walk — with the
+  discipline, found by the suite rather than by reading, that
+  both maps must be ERASED on every field-walk failure path, or
+  C++ cascade attribution drifts (Driver/incremental-root-blockers
+  loses `cxx-cascaded-method`).
+  SCOPE HELD: the dialect widening admits `ref`/`mut_ref` of
+  SliceType and StructType only — EnumType was measured INERT
+  (identical +25 with and without) and is pinned as a NEGATIVE
+  dialect arm rather than admitted on speculation. Both frontier
+  pins moved as directed, prose rewritten, never deleted, with
+  VOIDCOMP/VARIADIC/NESTED/MISMATCH kept verbatim.
+  KNOWN-UNVERIFIED, recorded not hidden: (i) a FAM-pointee record
+  reaching a fn-ptr component maps with its tail DROPPED from the
+  `struct_def`, guarded only by the FR-29 binding-equality
+  backstop — a lossy shape with no oracle over it, and under
+  "rejection is a feature" the correct answer is a located
+  rejection; ranked as the next follow-on. (ii) the FR-52
+  `extern_decl` marker interaction and (iii) the FR-80
+  `sharedConstRecord` `&Struct` vs `&mut Struct` mismatch are
+  reasoned-inert and unexercised by the corpus, so the green
+  suite is NOT evidence about them.
+  Full suite 681/681, both tiers, Fail 0; corpus BUILD sweep 42
+  of 44, matching the FR-106 ledger exactly.
 
 - [ ] FR-103 Undefined extern globals: recover instead of failing
   the TU (measured 2026-08-20, ranked BELOW FR-102).
