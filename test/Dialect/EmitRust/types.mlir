@@ -157,6 +157,49 @@ emitrust.func @fn_ptr_mixed_components(
   emitrust.return
 }
 
+// FR-76 retro-pin: a region-typed slice borrow is a valid component and
+// has had NO round-trip coverage anywhere in test/Dialect (the only
+// reference-component coverage was the negative at invalid.mlir).
+// CHECK-LABEL: emitrust.func @fn_ptr_slice_components(
+// CHECK-SAME: !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.slice<ui8>>, !emitrust.ref<!emitrust.slice<ui8>>, ui32)>
+emitrust.func @fn_ptr_slice_components(
+    %arg0: !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.slice<ui8>>,
+                             !emitrust.ref<!emitrust.slice<ui8>>, ui32)>) {
+  emitrust.return
+}
+
+// FR-102: a `ref`/`mut_ref` borrow of a named STRUCT is a valid component.
+// The Rust spelling `fn(&mut Node, i32) -> i32` is higher-ranked with
+// elided lifetimes, so no annotation is carried in the type.
+// CHECK-LABEL: emitrust.func @fn_ptr_struct_ref_components(
+// CHECK-SAME: !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.struct<"Node">>, !emitrust.ref<!emitrust.struct<"Point">>, i32) -> i32>
+emitrust.func @fn_ptr_struct_ref_components(
+    %arg0: !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.struct<"Node">>,
+                             !emitrust.ref<!emitrust.struct<"Point">>,
+                             i32) -> i32>) {
+  emitrust.return
+}
+
+// FR-102: the same component in a struct_def FIELD position — the shape
+// the C importer actually emits for `struct node { int (*visit)(struct
+// node *, int); }`, including the SELF-REFERENCE (the field names the
+// struct_def being defined; struct types are by-name, so this is legal).
+// CHECK: emitrust.struct_def @Node ["val", "visit"] [i32, !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.struct<"Node">>, i32) -> i32>]
+emitrust.struct_def @Node ["val", "visit"]
+    [i32, !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.struct<"Node">>,
+                            i32) -> i32>]
+
+// FR-102: mixing a slice borrow and a struct borrow in one signature is
+// the shape the corpus sweep produced (`Option<fn(&mut Fsm, &mut [u8])>`).
+// CHECK-LABEL: emitrust.func @fn_ptr_mixed_borrow_components(
+// CHECK-SAME: !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.struct<"Fsm">>, !emitrust.mut_ref<!emitrust.slice<ui8>>) -> ui32>
+emitrust.func @fn_ptr_mixed_borrow_components(
+    %arg0: !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.struct<"Fsm">>,
+                             !emitrust.mut_ref<!emitrust.slice<ui8>>)
+                            -> ui32>) {
+  emitrust.return
+}
+
 // CHECK-LABEL: emitrust.func @fn_ptr_nested(
 // CHECK-SAME: !emitrust.fn_ptr<(!emitrust.fn_ptr<(i32) -> i32>) -> !emitrust.fn_ptr<() -> i32>>
 emitrust.func @fn_ptr_nested(

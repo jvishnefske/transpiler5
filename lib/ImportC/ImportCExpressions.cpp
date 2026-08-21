@@ -5679,8 +5679,11 @@ CImporter::resolveFunctionPointerDecl(const clang::FunctionDecl *callee,
   // The imported function's MLIR signature must equal the fn_ptr's
   // component types exactly. This rejects prototype mismatches (including
   // a prototype-less `int (*)()` pointer bound to a function with
-  // parameters) and functions whose data-pointer parameters import as
-  // references, which no fn_ptr can carry.
+  // parameters) and functions whose pointer parameters classify to a shape
+  // the fn_ptr's component does not carry — after FR-76/FR-102 that is no
+  // longer every data pointer (an arithmetic-pointee slice and a
+  // complete-record `&mut Record` both unify), but CellSlice, Carrier and
+  // owner-promoted receivers still land here, loudly.
   FunctionType targetType = target.getFunctionType();
   if (targetType.getInputs() != fnPtrType.getInputs() ||
       targetType.getResults() != fnPtrType.getResults())

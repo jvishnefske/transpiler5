@@ -3,14 +3,24 @@
 // RUN: not emitrust-import-c %t/mismatch.c 2>&1 | FileCheck %s --check-prefix=MISMATCH
 // RUN: not emitrust-import-c %t/cast-mismatch.c 2>&1 | FileCheck %s --check-prefix=CASTMISMATCH
 // RUN: not emitrust-import-c %t/noproto-args.c 2>&1 | FileCheck %s --check-prefix=NOPROTO
-// RUN: not emitrust-import-c %t/pointer-component.c 2>&1 | FileCheck %s --check-prefix=COMPONENT
+// RUN: emitrust-import-c %t/pointer-component.c | FileCheck %s --check-prefix=COMPONENT
 
 // FR-29: every unsupported function pointer construct fails the import
 // with a located diagnostic: a pointer to a variadic function, a function
 // bound to a pointer with a different signature (including a
 // prototype-less `int (*)()` pointer bound to a function with
-// parameters), a call with arguments through a prototype-less pointer,
-// and a fn_ptr whose component types fall outside the supported set.
+// parameters), and a call with arguments through a prototype-less
+// pointer.
+//
+// The last arm is a MOVED FRONTIER. It pinned a fn_ptr whose component
+// types fall outside the supported set, most recently a STRUCT-pointer
+// component; FR-102 admits that shape, so the arm advanced to the
+// POSITIVE spelling and now pins what matters about it here — that the
+// BINDING still goes through the FR-29 signature-equality check at
+// `resolveFunctionPointerDecl`, i.e. `taker`'s own imported signature
+// must equal the component type exactly for `Some(taker)` to be emitted.
+// The rejecting flavors of the component frontier live in
+// fnptr-struct-components-invalid.c.
 
 //--- variadic.c
 int printf(const char *, ...);
@@ -51,14 +61,16 @@ int main(void) {
 
 //--- pointer-component.c
 // FR-76 moved arithmetic-pointee scalar-pointer components INTO the
-// supported set (`void (*)(int *)` is now a fn_ptr over `&mut [i32]`,
-// pinned in fnptr-slice-components.c), so this pin advanced to the
-// nearest still-unsupported component: a STRUCT-pointer component has no
-// region-typed slice shape and keeps the located pointer residual.
+// supported set (`void (*)(int *)` is a fn_ptr over `&mut [i32]`, pinned
+// in fnptr-slice-components.c) and FR-102 moved COMPLETE-record pointees
+// in after it. `taker` is address-taken with a non-arithmetic pointee, so
+// the FR-76 slice forcing leaves it ScalarRef and its signature equals the
+// component type — the equality check unifies and the binding emits.
 struct S { int x; };
 void taker(struct S *p) { p->x = 1; }
 int main(void) {
   void (*fp)(struct S *) = taker;
   return 0;
 }
-// COMPONENT: error: unsupported: pointer type outside a parameter position
+// COMPONENT: func.func @taker(%{{.*}}: !emitrust.mut_ref<!emitrust.struct<"S">>)
+// COMPONENT: emitrust.constant <#emitrust.opaque<"Some(taker)">> : !emitrust.fn_ptr<(!emitrust.mut_ref<!emitrust.struct<"S">>)>

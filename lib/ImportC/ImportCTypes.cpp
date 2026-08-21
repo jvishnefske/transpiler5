@@ -287,9 +287,24 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
     // forcing in `classifyPointerParams` keeps a bound function's own
     // signature exactly equal, so `resolveFunctionPointerDecl`'s equality
     // check stays the loud backstop for every unforceable mismatch
-    // (CellSlice, Carrier). Components outside the subset — struct
-    // pointers, `void *` (no consensus source solo-TU), pointer-to-pointer
-    // — fall through to `mapType` and keep their located rejections.
+    // (CellSlice, Carrier).
+    //
+    // FR-102 widens the subset by one shape: a component whose pointee is
+    // a COMPLETE record maps through the SAME `mapParamType` ScalarRef
+    // branch an ordinary struct-pointer parameter takes (`&mut Record`,
+    // or `&mut [u8]` when the record is a byte region), so a callback
+    // signature like `int (*)(struct payload *, int)` — including the
+    // SELF-REFERENTIAL `int (*)(struct node *, int)` inside `struct node`
+    // itself, which terminates on `importedRecords` and resolves the type
+    // by name — imports instead of rejecting the whole record. Rust needs
+    // no lifetime there: `fn(&mut Node, i32) -> i32` is higher-ranked and
+    // elides. Completeness is checked BEFORE the dispatch: an incomplete
+    // pointee must keep the pointer residual verbatim rather than move to
+    // `mapParamType`'s incomplete-struct wording. Components still outside
+    // the subset — `void *` (no consensus source solo-TU),
+    // pointer-to-pointer, incomplete pointees, mutually recursive pairs
+    // (incomplete by construction) — fall through to `mapType` and keep
+    // their located rejections.
     const bool classifyComponents =
         !astContext().getLangOpts().CPlusPlus && !mappingFnPtrComponent;
     llvm::SaveAndRestore<bool> componentGuard(mappingFnPtrComponent, true);
@@ -299,14 +314,27 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
         return emitError(loc) << "unsupported: variadic function pointer type";
       for (clang::QualType param : proto->getParamTypes()) {
         bool sliceComponent = false;
+        bool structRefComponent = false;
         if (classifyComponents && isDataPointer(param)) {
           clang::QualType pointee =
               param.getCanonicalType()->getPointeeType();
           sliceComponent = pointee.getCanonicalType()->isArithmeticType();
+          // FR-102: a COMPLETE record pointee takes the ordinary
+          // struct-pointer parameter mapping. The completeness test is the
+          // gate, not an afterthought — routing an incomplete pointee into
+          // `mapParamType` would replace the frontier's pointer residual
+          // with the incomplete-struct wording.
+          if (!sliceComponent)
+            if (const auto *recordType =
+                    pointee.getCanonicalType()->getAs<clang::RecordType>())
+              structRefComponent =
+                  recordType->getDecl()->getDefinition() != nullptr;
         }
         FailureOr<Type> mapped =
-            sliceComponent ? mapParamType(param, loc, ParamKind::Slice)
-                           : mapType(param, loc);
+            sliceComponent  ? mapParamType(param, loc, ParamKind::Slice)
+            : structRefComponent
+                ? mapParamType(param, loc, ParamKind::ScalarRef)
+                : mapType(param, loc);
         if (failed(mapped))
           return failure();
         if (!emitrust::FnPtrType::isValidComponentType(*mapped))

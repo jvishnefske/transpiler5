@@ -185,13 +185,18 @@ LogicalResult emitrust::CellSliceType::verify(
 
 /// Returns whether `type` may be used as a fn_ptr parameter or result type:
 /// an emitter-supported scalar (i1, i8/i16/i32/i64 signless, u8/u16/u32/u64,
-/// index, f32, f64), an EmitRust struct or enum, a nested fn_ptr, or (FR-76)
-/// a region-typed slice borrow (`ref`/`mut_ref` of a `slice`) — the Rust
-/// spelling `fn(&mut [u8], u32)` is an ordinary higher-ranked fn type with
-/// elided lifetimes, so it renders and calls with no emitter change. Bare
-/// scalar borrows (`&mut u8`) stay outside the set: a fn-ptr signature is a
-/// contract with unknown implementors, and the region contract is what the
-/// C pointer parameter means (see the FR-75/FR-76 design entries).
+/// index, f32, f64), an EmitRust struct or enum, a nested fn_ptr, or a
+/// borrow of a region or a named struct (`ref`/`mut_ref` of a `slice`,
+/// FR-76, or of a `struct`, FR-102) — the Rust spellings `fn(&mut [u8],
+/// u32)` and `fn(&mut Node, i32) -> i32` are ordinary higher-ranked fn
+/// types with elided lifetimes, so they render and call with no emitter
+/// change. Bare scalar borrows (`&mut u8`) stay outside the set: a fn-ptr
+/// signature is a contract with unknown implementors, and the region
+/// contract is what the C pointer parameter means (see the FR-75/FR-76
+/// design entries). Borrows of an `enum` or `data_enum` stay outside too:
+/// a C `enum T *` component classifies as a slice (clang calls an enum
+/// arithmetic), so reference-to-enum is unreachable from the importer and
+/// admitting it would be unpinnable dialect surface (FR-102 C3).
 bool emitrust::FnPtrType::isValidComponentType(Type type) {
   if (auto intType = llvm::dyn_cast<IntegerType>(type)) {
     if (intType.isSigned())
@@ -202,9 +207,11 @@ bool emitrust::FnPtrType::isValidComponentType(Type type) {
     return width == 8 || width == 16 || width == 32 || width == 64;
   }
   if (auto refType = llvm::dyn_cast<emitrust::RefType>(type))
-    return llvm::isa<emitrust::SliceType>(refType.getPointee());
+    return llvm::isa<emitrust::SliceType, emitrust::StructType>(
+        refType.getPointee());
   if (auto mutRefType = llvm::dyn_cast<emitrust::MutRefType>(type))
-    return llvm::isa<emitrust::SliceType>(mutRefType.getPointee());
+    return llvm::isa<emitrust::SliceType, emitrust::StructType>(
+        mutRefType.getPointee());
   return llvm::isa<IndexType, Float32Type, Float64Type, emitrust::StructType,
                    emitrust::EnumType, emitrust::FnPtrType>(type);
 }

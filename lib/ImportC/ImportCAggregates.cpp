@@ -179,15 +179,70 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
     return emitError(defLoc) << "unsupported: struct name '" << structName
                              << "' is a Rust keyword";
 
+  // FR-102: the EMITTED name must be decided BEFORE the field walk. A
+  // self-referential fn-ptr component (`struct node { int (*visit)(struct
+  // node *, int); }`) resolves its own type through `emittedRecordName`
+  // DURING the walk; if the block-scope mangling and the tag-versus-
+  // ordinary collision rename below had not run yet, the component would
+  // name the raw tag while the struct_def is emitted as `c_main_loc` /
+  // `Struct_ops` — a dangling type reference with no located diagnostic
+  // (rustc E0412/E0573). Deciding here keeps the field type and the
+  // struct_def symbol one decision, which is the CSymbolNaming.h
+  // byte-identity invariant.
+  //
+  // The commitment must be UNDONE when the field walk fails: a record
+  // whose name is claimed but whose import is rejected changes cascade
+  // attribution downstream (the C++ method/statement cascade tags), so
+  // every failure path below erases both maps. The "struct definition
+  // outside file or function scope" rejection deliberately stays where it
+  // was, AFTER the walk: a missing entry here is exactly that case.
+  std::string assignedStorage;
+  const bool localScopeRecord =
+      !structName.empty() &&
+      !definition->getDeclContext()->getRedeclContext()->isFileContext();
+  if (localScopeRecord) {
+    const clang::FunctionDecl *enclosing = nullptr;
+    for (const clang::DeclContext *ctx = definition->getDeclContext();
+         ctx && !enclosing; ctx = ctx->getParent())
+      enclosing = llvm::dyn_cast<clang::FunctionDecl>(ctx);
+    if (enclosing) {
+      // A block-scope record's `<fn>_<tag>` disambiguator is a type name,
+      // so it takes the type spelling (UpperCamelCase under the idiomatic
+      // rename). Each probe below tries a fresh suffix, so the loop takes
+      // at most one step per already-emitted struct name — bounded and
+      // deterministic.
+      std::string mangledBase = typeRustName(
+          (llvm::Twine(mlirFuncName(enclosing)) + "_" + structName).str());
+      std::string mangled = mangledBase;
+      for (unsigned suffix = 2; emittedStructNames.contains(mangled); ++suffix)
+        mangled = idiomaticRenameEnabled()
+                      ? (llvm::Twine(mangledBase) + llvm::Twine(suffix)).str()
+                      : (llvm::Twine(mangledBase) + "_" + llvm::Twine(suffix))
+                            .str();
+      emittedStructNames.insert(mangled);
+      localRecordNames.try_emplace(definition, std::move(mangled));
+    }
+  } else if (!structName.empty()) {
+    FailureOr<std::string> assigned = structSymbolName(definition, defLoc);
+    if (failed(assigned))
+      return failure();
+    assignedStorage = std::move(*assigned);
+  }
+
   SmallVector<llvm::StringRef> fieldNames;
   SmallVector<Type> fieldTypes;
   // A union flattens to its single storage slot; every other record keeps
   // the anonymous-member-resolving field walk.
   if (definition->isUnion()) {
-    if (failed(collectUnionSlot(definition, fieldNames, fieldTypes)))
+    if (failed(collectUnionSlot(definition, fieldNames, fieldTypes))) {
+      assignedStructNames.erase(definition);
+      localRecordNames.erase(definition);
       return failure();
+    }
   } else if (unsigned bitFieldRuns = 0; failed(collectRecordFields(
                  definition, fieldNames, fieldTypes, bitFieldRuns))) {
+    assignedStructNames.erase(definition);
+    localRecordNames.erase(definition);
     return failure();
   }
   // An empty member list (`struct T {};`, a GNU/C2x shape clang accepts) is
@@ -206,32 +261,17 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   // anonymous record has no tag to mangle and is excluded: whatever its
   // scope, it takes the shape-keyed `Anon<n>` path below, where the
   // defining decl is already the identity and the shape is the name key.
-  if (!structName.empty() &&
-      !definition->getDeclContext()->getRedeclContext()->isFileContext()) {
-    const clang::FunctionDecl *enclosing = nullptr;
-    for (const clang::DeclContext *ctx = definition->getDeclContext();
-         ctx && !enclosing; ctx = ctx->getParent())
-      enclosing = llvm::dyn_cast<clang::FunctionDecl>(ctx);
-    if (!enclosing)
+  if (localScopeRecord) {
+    // The name was decided above; a MISSING entry means no enclosing
+    // function was found, which is the outside-file-or-function-scope
+    // rejection (kept at its original position so the diagnostic order
+    // relative to the field walk does not move).
+    auto known = localRecordNames.find(definition);
+    if (known == localRecordNames.end())
       return emitError(defLoc)
              << "unsupported: struct definition outside file or function "
                 "scope";
-    // A block-scope record's `<fn>_<tag>` disambiguator is a type name, so it
-    // takes the type spelling (UpperCamelCase under the idiomatic rename).
-    std::string mangledBase = typeRustName(
-        (llvm::Twine(mlirFuncName(enclosing)) + "_" + structName).str());
-    std::string mangled = mangledBase;
-    // Each probe below tries a fresh suffix, so the loop takes at most one
-    // step per already-emitted struct name — bounded and deterministic.
-    for (unsigned suffix = 2; emittedStructNames.contains(mangled); ++suffix)
-      mangled = idiomaticRenameEnabled()
-                    ? (llvm::Twine(mangledBase) + llvm::Twine(suffix)).str()
-                    : (llvm::Twine(mangledBase) + "_" + llvm::Twine(suffix))
-                          .str();
-    emittedStructNames.insert(mangled);
-    llvm::StringRef mangledRef =
-        localRecordNames.try_emplace(definition, std::move(mangled))
-            .first->second;
+    llvm::StringRef mangledRef = known->second;
     structDefRecords[mangledRef] = definition;
     OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
     auto structDef = moduleBuilder.create<emitrust::StructDefOp>(
@@ -274,14 +314,8 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   // `structSymbolName`, which caches the decision per defining decl for
   // `emittedRecordName`). The renamed spelling is what the shape dedup and
   // the emitted struct_def below use.
-  std::string assignedStorage;
-  if (!structName.empty()) {
-    FailureOr<std::string> assigned = structSymbolName(definition, defLoc);
-    if (failed(assigned))
-      return failure();
-    assignedStorage = std::move(*assigned);
+  if (!assignedStorage.empty())
     structName = assignedStorage;
-  }
 
   // A bare anonymous struct (no tag, no typedef name) gets a synthesized
   // `Anon<n>` name that is a deterministic function of its field shape:
