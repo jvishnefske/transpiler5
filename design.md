@@ -6870,57 +6870,109 @@ piece and becomes FR-45.
   type items, so that claim stands as made — the distortion is
   specific to large multi-unit codebases with many shared types.
 
-- [ ] FR-108 DEFECT: emitted record names are not injective, and
+- [x] FR-108 DEFECT: emitted record names are not injective, and
   two distinct records that collide silently SHARE METHODS.
-  Measured on unpatched HEAD (2026-08-21, W2.16's spike), with
-  no templates anywhere, byte-diffed against `clang++`:
-  (a) THE UPPER-CAMEL RENAME IS NOT INJECTIVE. `struct box_i32
-  {int v; int get() const {return v+100;}}` beside `struct BoxI32
-  {int v; int get() const {return v;}}` both compute the emitted
-  name `BoxI32`. Native prints `101 1`; the emitted crate prints
-  `101 101`.
-  (b) RECORD NAMES CARRY NO NAMESPACE PREFIX, unlike
-  `cFunctionSymbolName`, which applies `namespacePrefix`. `::Box`
-  beside `ns::Box` with different `get()` bodies: native `1 101`,
-  emitted crate `1 1`.
-  ROOT CAUSE, one line: `importedRecordShapes`
-  (lib/ImportC/ImportCAggregates.cpp:367-374) is keyed by the
-  emitted NAME plus the field shape, so the second of two
-  distinct `RecordDecl`s that agree on both returns success
-  BEFORE `importCXXMethods` (:409) runs. Every method mangles as
-  `<StructName>_<method>` (ImportCFunctions.cpp:103), so the
-  second type's call sites then resolve to the FIRST type's
-  bodies. Only same-shape collisions are silent — a differing
-  shape already fails loudly, if with a misleading cross-TU
-  wording.
-  WHY THE OBVIOUS FIX IS WRONG: "reject any name reuse" breaks
-  the legitimate user of that path — the cross-TU merge, where
-  two units including one header must resolve to ONE emitted
-  struct (probed: `a.cpp b.cpp` sharing a header template give
-  one `BoxI32`, one impl, byte-identical output). The
-  discriminator that works is DECL IDENTITY WITHIN ONE IMPORT:
-  record the owning `RecordDecl*` alongside the shape and reject
-  when a DIFFERENT decl from the SAME tuTag claims the name.
-  W2.16 shipped exactly that guard for the template half (its
-  clause (5)) and pinned both clash orders; this entry is the
-  REMAINING non-template half — the plain `box_i32`/`BoxI32`
-  case and the namespace case — which W2.16 did not close and
-  which has no test today, because a test for it would be a
-  failing test.
-  Acceptance: y01 (`box_i32` vs `BoxI32`) and n02 (`::Box` vs
-  `ns::Box`) become byte-diff-clean EndToEnd legs, or LOCATED
-  rejections if the injective-naming route is rejected on
-  design grounds; the cross-TU merge stays byte-identical; the
-  namespace half decides whether record names take
-  `namespacePrefix` (the symmetric fix, and the one that also
-  makes `ns::Box` and `::Box` coexist rather than merely
-  diagnose). CTestSuite ledger unchanged.
-  RANKED FIRST among open work: this is a silent-wrong-code
-  channel, and CLAUDE.md's safe-failure rule makes closing it
-  precede any new feature.
-  **NOT SPIKED** (the failure shapes are measured; the fix
-  choice is not).
-
+  Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21; both patches
+  applied, measured, reverted; tree clean and 693/693 re-verified
+  at baseline before implementation).
+  The channel, re-measured on unpatched HEAD rather than trusted
+  from W2.16's report, byte-diffed against `clang++ -std=c++17`:
+  (a) `struct box_i32 {int v; int get() const {return v+100;}}`
+  beside `struct BoxI32 {int v; int get() const {return v;}}` —
+  both compute `BoxI32` because `toUpperCamelCase` is not
+  injective. Native `102 2`; the crate exits 0 with NO diagnostic,
+  one `struct BoxI32`, one `impl`, and prints `102 102`.
+  `BoxI32::get`'s body is never emitted at all.
+  (b) `::Box` beside `ns::Box` — record names carried no namespace
+  prefix, unlike `cFunctionSymbolName`. Native `2 102`; crate
+  `2 2`. Dialect-level smoking gun:
+  `%9 = call @Box_get(%8) {emitrust.method_call}` — the `ns::Box`
+  object dispatching to `::Box`'s body.
+  (c) NEW, found by the spike and in PLAIN C with no C++ at all:
+  `typedef struct { int v; } Box;` beside `struct Box { int v; };`
+  in one TU merged silently into one emitted struct. Harmless
+  today (C has no methods), but the same channel.
+  Root cause: `importedRecordShapes` (ImportCAggregates.cpp) is
+  keyed by emitted NAME plus field shape, so the second of two
+  distinct `RecordDecl`s that agree on both returns success before
+  `importCXXMethods` runs; every method mangles
+  `<StructName>_<method>`, so the second type's call sites resolve
+  to the first type's bodies.
+  Landed as TWO patches, and the spike's central finding is that
+  they are NOT alternatives — P2 creates fresh collisions that
+  only P1 catches (`struct ns_ns_box` beside `ns::box` both
+  compose `NsNsBox`; measured, in both rename modes).
+  **P1 — the same-TU decl-identity guard** extends W2.16's block
+  to the non-template half: a different file-scope record in the
+  SAME tuTag claiming an already-claimed name is a LOCATED
+  rejection, `struct '<n>' collides with the emitted name of a
+  different struct in this translation unit`. Its gate
+  `!recordRustName(definition).empty()` is load-bearing: without
+  it, two same-shape ANONYMOUS records that legitimately merge to
+  one `Anon0` start rejecting (measured). P1's measured cost on
+  the full suite was ZERO — 693/693 with no golden shift — and it
+  fixes a second defect for free: a same-TU different-shape clash
+  used to report the misleading `...in another translation unit`.
+  **P2 — `namespacePrefix` on record names**, composed inside
+  `recordRustName` before the camel fold, exactly where W2.16 put
+  the template suffix. `ns::Box` -> `NsNsBox`, `a::b::Pt` ->
+  `NsANsBPt`, `ns::Box<int>` -> `NsNsBoxI32` (the prefix composes
+  with the template suffix BEFORE the fold, so the
+  `non_camel_case_types` deny is satisfied by construction).
+  P2 makes the namespace half COEXIST rather than merely
+  diagnose — the two repro programs now byte-diff clean.
+  WHY NO INJECTIVE NAMING FOR HALF (a) — the measured NO, not a
+  preference: `ItemGraph.cpp`'s `recordSymbolFor` and
+  `ItemColoring.cpp` recompute record symbols from the AST ALONE,
+  per TU, with no importer state (their own doc declines names
+  needing accumulated state). Any order- or context-dependent
+  disambiguator is therefore unreproducible in the FR-40 item
+  graph and across TUs, breaking BOTH the CSymbolNaming.h
+  byte-identity invariant and the cross-TU merge. The only
+  AST-pure injective spellings are the raw C spelling — which is
+  `--preserve-c-names`, and it already transpiles the repro
+  correctly today — or a hash, which shifts every existing struct
+  name. So half (a) rejects and half (b) coexists: the two halves
+  genuinely wanted different answers.
+  THE CONSTRAINT THAT KEPT THE FIX HONEST: "reject any name
+  reuse" would break the legitimate user of that path, the
+  cross-TU merge. Two units including one header must resolve to
+  ONE emitted struct; the `ownerTu == currentTuTag` clause is
+  what separates that from a same-TU clash, and W2.16's
+  `samePattern` allowance (so `Box<char>`/`Box<signed char>`
+  aliasing onto one type code keeps merging) is untouched. The
+  cross-TU merge is now PINNED for plain, namespaced and template
+  records — plain and namespaced were previously unpinned.
+  COVERAGE MOVED, NOT DELETED: W2.16's `COLNS` rejection section
+  is retired, because its input now transpiles correctly; it
+  became a positive EndToEnd byte-diff leg
+  (`cpp-namespace-class-template.cpp`) that cites the retirement,
+  and the retired section cites it back. COLTMPL/COLHAND are
+  unchanged and still failing.
+  EXTERNAL-CORPUS DIFFERENTIAL, the evidence that this narrowing
+  costs real code nothing: cJSON, tinycrypt, tiny-AES-c,
+  heatshrink and lwIP re-imported under `--recover`, 4917
+  diagnostic lines, baseline vs patched diff = find(1) ordering
+  only, ZERO occurrences of the new wording anywhere.
+  Gates: full meson suite 700/700 (fast 500 + slow/EndToEnd 200),
+  0 failures, 0 OOM markers, all 7 new files re-run under `lit -v`
+  with fresh Output artifacts (not stale passes). CTestSuite
+  220/220/0/0 and Cpp17Suite 25/28/0 both untouched in git. Exactly
+  3 golden lines re-goldened, each self-consistent with unchanged
+  neighbours in the same file that already carried namespace
+  prefixes on FUNCTIONS (`ns_ring_*` beside `Ring` -> `NsRingRing`).
+  New ledger tag `record-name-clash` mirrored into
+  RejectionLedger.cpp and test/RealWorld/run_realworld.py.
+  KNOWN GAP, recorded not silent: for half (a) the FR-40 item
+  graph still yields ONE `node BoxI32` while the importer rejects
+  the program — a graph/importer disagreement, not wrong code,
+  since the import fails loudly. Follow-on, not this wave.
+  (test/EndToEnd/cpp-namespace-records.cpp,
+  cpp-namespace-class-template.cpp;
+  test/Import/Cpp/cpp-namespace-records.cpp,
+  cpp-record-name-collide-invalid.cpp, cpp-record-cross-tu-merge.cpp;
+  test/Import/C/struct-name-collide-invalid.c;
+  test/Project/item-graph-namespace-record.cpp)
 
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the

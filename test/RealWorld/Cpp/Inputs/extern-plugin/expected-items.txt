@@ -16,7 +16,7 @@
 # <-> stubbed) is reported as advisory drift.
 #
 # Regenerated via: run_realworld.py ... --manifest-format outcomes --update
-Channel record ported
+NsSamplerChannel record ported
 ns_filter_boxcar function ported
 ns_filter_clamp function ported
 ns_platform_fault function declared

@@ -16,7 +16,7 @@
 # <-> stubbed) is reported as advisory drift.
 #
 # Regenerated via: run_realworld.py ... --manifest-format outcomes --update
-Accum record ported
+NsStatsAccum record ported
 c_main function ported
 ns_fixed_div_count function ported
 ns_fixed_from_int function ported

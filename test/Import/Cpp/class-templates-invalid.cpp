@@ -8,7 +8,6 @@
 // RUN: not emitrust-import-c %t/static-data-member.cpp 2>&1 | FileCheck %s --check-prefix=STATICMEM
 // RUN: not emitrust-import-c %t/collide-template-first.cpp 2>&1 | FileCheck %s --check-prefix=COLTMPL
 // RUN: not emitrust-import-c %t/collide-handwritten-first.cpp 2>&1 | FileCheck %s --check-prefix=COLHAND
-// RUN: not emitrust-import-c %t/collide-namespace.cpp 2>&1 | FileCheck %s --check-prefix=COLNS
 // RUN: emitrust-cc --recover --emit=rust %t/explicit-spec.cpp | FileCheck %s --check-prefix=EXPLSPECREC --implicit-check-not="v * 2" --implicit-check-not="struct BoxI8"
 // RUN: emitrust-cc --recover --emit=rust %t/explicit-spec.cpp 2>&1 >/dev/null | FileCheck %s --check-prefix=EXPLSPECRECDIAG
 
@@ -49,7 +48,7 @@
 //    it — and because every method mangles as `<StructName>_<method>`,
 //    the SECOND type's call sites then resolved to the FIRST type's
 //    bodies. That is a silent miscompile (measured: native `1 101`,
-//    emitted crate `1 1`), so the three `collide-*` sections below pin a
+//    emitted crate `1 1`), so the `collide-*` sections below pin a
 //    located rejection instead. The discriminator is DECL IDENTITY WITHIN
 //    ONE TRANSLATION UNIT: the legitimate user of the merge path is the
 //    same header template instantiated in several TUs, which must keep
@@ -57,6 +56,17 @@
 //    instantiations of the SAME pattern whose arguments alias onto one
 //    type code (`Box<char>`/`Box<signed char>`) must keep merging too —
 //    they emit literally the same code.
+//
+//    FR-108 RETIRED THE THIRD `collide-*` SECTION. `collide-namespace`
+//    pinned `::Box<int>` beside `ns::Box<int>` as a rejection, on the
+//    grounds that record names carried NO namespace prefix and so the two
+//    patterns composed one spelling. FR-108 gave record names the same
+//    `namespacePrefix` `cFunctionSymbolName` has always applied, so those
+//    two now COEXIST as `BoxI32` and `NsNsBoxI32` with their own method
+//    sets. The rejection was SUPERSEDED, not dropped: its exact input is
+//    now a byte-diff EndToEnd leg,
+//    test/EndToEnd/cpp-namespace-class-template.cpp. The two sections
+//    that remain involve no namespace and must keep failing.
 //
 // A note on locations: an IMPLICIT instantiation reports the PATTERN's
 // `getLocation()`, so all instantiations of one template necessarily
@@ -266,38 +276,6 @@ int main(int argc, char **argv) {
   h.v = argc;
   Box<int> b(argc);
   printf("%d %d\n", h.get(), b.get());
-  return 0;
-}
-
-//--- collide-namespace.cpp
-// The namespace flavor of the same silent miscompile (measured at HEAD
-// with the prototype: native `1 101`, crate `1 1`). Record names carry NO
-// namespace prefix — unlike `cFunctionSymbolName`'s `namespacePrefix` —
-// so `::Box<int>` and `ns::Box<int>` compose the identical spelling from
-// two DIFFERENT patterns. Different patterns is exactly the case the
-// same-pattern merge exemption must not cover.
-// COLNS: collide-namespace.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: class template instantiation collides with the existing struct 'Box_i32'
-extern "C" int printf(const char *, ...);
-template <typename T>
-struct Box {
-  T v;
-  Box(T x) : v(x) {}
-  int get() const { return (int)v; }
-};
-
-namespace ns {
-template <typename T>
-struct Box {
-  T v;
-  Box(T x) : v(x) {}
-  int get() const { return (int)v + 100; }
-};
-} // namespace ns
-
-int main(int argc, char **argv) {
-  Box<int> a(argc);
-  ns::Box<int> b(argc);
-  printf("%d %d\n", a.get(), b.get());
   return 0;
 }
 

@@ -365,6 +365,9 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("non-type template argument in class template instantiation", "cxx-class-template-nttp"),
     ("variadic class template (template parameter pack)", "cxx-class-template-pack"),
     ("class template instantiation collides with the existing struct", "cxx-class-template-name-clash"),
+    # FR-108 record-name clash (language-agnostic; mirrors
+    # lib/ImportC/RejectionLedger.cpp).
+    ("collides with the emitted name of a different struct", "record-name-clash"),
     ("unsupported top-level declaration", "unsupported-top-level-decl"),
 ]
 # Generic dispatch fallbacks that name the offending AST node class. These are

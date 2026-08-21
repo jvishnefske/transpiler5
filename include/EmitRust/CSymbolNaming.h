@@ -173,6 +173,14 @@ static inline std::string enumVariantRustName(llvm::StringRef name) {
 /// built on it.
 static inline std::string templateArgSuffix(const clang::RecordDecl *record);
 
+/// FR-108: forward declarations only — both are DEFINED below (beside the
+/// function-symbol layer that has always used them), but `recordRustName`
+/// has to come first because the rest of this header's type-naming layer
+/// is built on it.
+static inline std::string joinSymbolPrefix(llvm::StringRef prefix,
+                                           llvm::StringRef base);
+static inline std::string namespacePrefix(const clang::DeclContext *context);
+
 static inline std::string recordRustName(const clang::RecordDecl *record) {
   llvm::StringRef name = record->getName();
   if (name.empty())
@@ -192,7 +200,25 @@ static inline std::string recordRustName(const clang::RecordDecl *record) {
   // per-class method mangle reads the assigned struct name out of
   // `CImporter::assignedStructNames`, so `Box_i32_get` -> `box_i32_get`
   // falls out with no edit.
-  std::string spelled = name.str() + templateArgSuffix(record);
+  //
+  // FR-108: the record name takes the SAME `ns_<name>_`-per-level
+  // namespace prefix `cFunctionSymbolName` has always applied. Without it
+  // `::Box` and `ns::Box` composed one spelling, the second definition
+  // was silently merged into the first by the shape-keyed dedup in
+  // `importRecordUncached`, and every `ns::Box` call site dispatched to
+  // `::Box`'s method bodies (measured: native `1 101`, emitted crate
+  // `1 1`). The prefix goes on BEFORE the idiomatic camel fold, exactly
+  // like the template suffix and for the same reason: folded in first,
+  // `ns::Box<int>` becomes the lint-clean `NsNsBoxI32` rather than an
+  // `ns_ns_Box_i32` that rustc's denied `non_camel_case_types` refuses.
+  // Being a pure function of the AST, it composes for free at the three
+  // sites that recompute a record symbol without importer state
+  // (`ItemGraphBuilder::recordSymbolFor`, FR-41's coloring probe, FR-42's
+  // recovery owner symbol). `std::` records never reach here — their
+  // names are pre-seeded — so `std::pair<int, int>` stays `PairI32I32`.
+  std::string spelled =
+      joinSymbolPrefix(namespacePrefix(record->getDeclContext()),
+                       name.str() + templateArgSuffix(record));
   return idiomaticRenameEnabled() ? toUpperCamelCase(spelled) : spelled;
 }
 
