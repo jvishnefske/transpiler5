@@ -575,6 +575,28 @@ private:
   /// Populated per function by `computeDeferredInits`.
   DenseMap<Operation *, bool> deferredInits;
 
+  /// W2.17: the names of every `emitrust.struct_def` carrying
+  /// `emitrust.has_drop`, collected once per module before any function is
+  /// emitted. A binding of such a struct is DROPPED at scope end, and
+  /// `drop()` reads every field, so no store to it is ever dead and its
+  /// initializer can never be deferred -- `let x: T;` (uninitialized) is
+  /// never dropped in Rust, so eliding the initializer silently deletes the
+  /// destructor's side effects. Measured: clang++ printed `dtor 5`, the
+  /// hand-driven Rust printed nothing, and the crate compiled clean.
+  llvm::StringSet<> dropStructNames;
+
+  /// Whether `binding`'s (possibly lvalue-wrapped, possibly array-element)
+  /// type is a struct that carries `emitrust.has_drop`.
+  bool bindingHasDrop(Value binding) const {
+    Type type = binding.getType();
+    if (auto lvalueType = dyn_cast<emitrust::LValueType>(type))
+      type = lvalueType.getValueType();
+    while (auto arrayType = dyn_cast<emitrust::ArrayType>(type))
+      type = arrayType.getElementType();
+    auto structType = dyn_cast<emitrust::StructType>(type);
+    return structType && dropStructNames.contains(structType.getName());
+  }
+
   /// Summary of how a binding is accessed across a straight-line/structured op
   /// sequence, used to decide whether its initializer is a dead store.
   struct Liveness {
@@ -1236,7 +1258,12 @@ bool RustEmitter::methodCallMutatesReceiver(emitrust::MethodCallOp call) {
   if (!module)
     return true;
   for (auto implOp : module.getOps<emitrust::ImplOp>()) {
-    if (implOp.getStructName() != structType.getName())
+    // W2.17: skip trait impls -- `impl Drop for T`'s single member is named
+    // `drop`, which would otherwise answer a method-mutability query for a
+    // user method spelled `drop` (a legal C++ member name, measured to take
+    // the module symbol `<Struct>_drop` on its own).
+    if (implOp.getStructName() != structType.getName() ||
+        implOp.getTraitName())
       continue;
     for (auto funcOp : implOp.getBody().front().getOps<emitrust::FuncOp>()) {
       if (SymbolTable::getSymbolName(funcOp).getValue() != call.getMethod())
@@ -1567,6 +1594,13 @@ void RustEmitter::computeDeferredInits(Block &block) {
     } else {
       return;
     }
+    // W2.17: a binding whose struct carries a `Drop` impl is NEVER deferred.
+    // `let x: T;` is an uninitialized Rust binding and is never dropped, so
+    // deferring the initializer deletes the destructor's side effects
+    // outright -- a compile-clean miscompile. (`drop()` is a read of the
+    // whole object on every path, so the initializer is by definition live.)
+    if (bindingHasDrop(binding))
+      return;
     // Only worth deferring when the binding is actually read; an unread
     // binding is `_`-prefixed instead (its dead init then draws no warning).
     bool isRead = false;
@@ -1669,6 +1703,12 @@ void RustEmitter::computeDeadStores(Block &entryBlock) {
     Operation *def = binding.getDefiningOp();
     if (!def || !isa<emitrust::LetOp, emitrust::VariableOp>(def))
       continue;
+    // W2.17: `drop()` reads every field of a destructor-carrying object on
+    // every path, so no store to one is ever dead. Dropping such a store
+    // would leave the destructor printing a different value (or, when the
+    // initializer went with it, not running at all).
+    if (bindingHasDrop(binding))
+      continue;
     Liveness after = analyzeSeq(std::next(op.getIterator()), entryBlock.end(),
                                 binding, /*enteringWritten=*/false,
                                 /*enteringAnyWrite=*/false,
@@ -1715,6 +1755,9 @@ void RustEmitter::computeLoopBodyDeadStores(Block &entryBlock) {
         continue;
       Operation *def = binding.getDefiningOp();
       if (!def || !isa<emitrust::LetOp, emitrust::VariableOp>(def))
+        continue;
+      // W2.17: see `computeDeadStores` -- `drop()` reads the whole object.
+      if (bindingHasDrop(binding))
         continue;
       // The binding must be hoisted ABOVE the loop; a loop-local `let` is a
       // different, unhandled shape.
@@ -1959,6 +2002,10 @@ void RustEmitter::computeDroppedOps(emitrust::FuncOp funcOp) {
       // would orphan them (E0425). Only the plain alias form can drop.
       if (letOp.getIsMut() || deferredInits.count(op) ||
           letHasEmittedAssign(letOp.getResult()))
+        continue;
+      // W2.17: a destructor-carrying binding is observable even when never
+      // read -- dropping it deletes the destructor's side effects.
+      if (bindingHasDrop(letOp.getResult()))
         continue;
     }
     // `valueIsRead` (with the droppedOps guard active) is the proof of "no
@@ -2386,6 +2433,12 @@ void RustEmitter::computeFieldInitFuses(emitrust::FuncOp funcOp) {
         deferredInits.count(varOp) || unreachableOps.count(varOp))
       return;
     Value result = variableOp.getResult();
+    // W2.17: never fuse a destructor-carrying struct. The fuse renders
+    // `S { f: v, ..Default::default() }`, whose functional-update BASE is a
+    // whole extra `S` -- constructed, moved out of field-wise, and then
+    // DROPPED. Measured: one spurious `dtor 0 0` line ahead of the real one.
+    if (bindingHasDrop(result))
+      return;
     if (!isa<emitrust::StructType>(
             cast<emitrust::LValueType>(result.getType()).getValueType()))
       return;
@@ -3333,6 +3386,13 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
     if (dangling.wasInterrupted())
       return failure();
   }
+  // W2.17: the has_drop struct set, collected once before any function is
+  // emitted -- the per-function liveness analyses consult it to keep every
+  // binding of a destructor-carrying struct initialized and its stores live.
+  dropStructNames.clear();
+  for (auto structDefOp : moduleOp.getOps<emitrust::StructDefOp>())
+    if (structDefOp->hasAttr(emitrust::kHasDropAttrName))
+      dropStructNames.insert(structDefOp.getSymName());
   // FR-62 slice 5c: the shared `mod actor_rt` epilogue exists once per
   // crate and its text is flavor-specific, so every anchor in one module
   // must agree on the mode. The driver never produces a mixed module
@@ -3376,7 +3436,15 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
 }
 
 LogicalResult RustEmitter::emitImpl(emitrust::ImplOp implOp) {
-  os << "impl " << implOp.getStructName() << " {\n";
+  // W2.17: a `trait_name` turns the block into `impl <Trait> for <Struct>`
+  // (the verifier has already pinned that the trait is `Drop` and that the
+  // body is exactly `fn drop(&mut self)`). Absent the attribute -- which no
+  // pre-W2.17 module can carry -- this is the historical inherent header,
+  // byte for byte.
+  if (std::optional<StringRef> traitName = implOp.getTraitName())
+    os << "impl " << *traitName << " for " << implOp.getStructName() << " {\n";
+  else
+    os << "impl " << implOp.getStructName() << " {\n";
   increaseIndent();
   for (Operation &op : implOp.getBody().front()) {
     if (failed(emitOperation(op)))
@@ -3427,7 +3495,8 @@ LogicalResult RustEmitter::emitActorRuntime(emitrust::ActorRuntimeOp op) {
   llvm::StringRef actor = op.getActor();
   emitrust::ImplOp impl;
   for (emitrust::ImplOp candidate : module.getOps<emitrust::ImplOp>())
-    if (candidate.getStructName() == actor) {
+    // W2.17: only the INHERENT impl is the actor's message surface.
+    if (candidate.getStructName() == actor && !candidate.getTraitName()) {
       impl = candidate;
       break;
     }
@@ -3696,6 +3765,11 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // way.
   bool isMethod = isa<emitrust::ImplOp>(op->getParentOp()) &&
                   !op->hasAttr(emitrust::kStaticMethodAttrName);
+  // W2.17: a TRAIT impl's member never takes a visibility prefix -- measured
+  // rustc "error[E0449]: visibility qualifiers are not permitted here". Only
+  // export mode emits one at all, so this cannot move a binary crate's bytes.
+  auto parentImpl = dyn_cast<emitrust::ImplOp>(op->getParentOp());
+  bool inTraitImpl = parentImpl && parentImpl.getTraitName().has_value();
   StringRef symbol = SymbolTable::getSymbolName(op).getValue();
   // FR-62 slice 5c: a function that method_calls an ASYNC actor handle
   // (the driver of an async-mode actor — the pass guarantees handles never
@@ -3707,7 +3781,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
     if (isAsyncHandleCall(call))
       isAsyncFn = true;
   });
-  os << itemVisibility(symbol) << (isAsyncFn ? "async fn " : "fn ") << symbol;
+  os << (inTraitImpl ? StringRef("") : itemVisibility(symbol))
+     << (isAsyncFn ? "async fn " : "fn ") << symbol;
   // FR-52: a function in the transitive closure of a caller of an external
   // requirement is generic over the requirement trait. Everything else keeps
   // the signature it always had, so a project with no requirements is
@@ -5122,6 +5197,12 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
     return opaque && (opaque.getValue().starts_with("Vec<") ||
                       opaque.getValue() == "String");
   });
+  // W2.17: a struct rendered with an `impl Drop` cannot be `Copy` -- measured
+  // rustc "error[E0184]: the trait `Copy` cannot be implemented for this
+  // type; the type has a destructor". Same direction as FR-94's opaque-tail
+  // rule above. No existing golden can shift: no pre-W2.17 module can carry
+  // the marker, because a user-declared destructor was a hard rejection.
+  copyable = copyable && !structDefOp->hasAttr(emitrust::kHasDropAttrName);
   os << "#[derive(Clone" << (copyable ? ", Copy" : "")
      << (derivable ? ", Default" : "") << ")]\n";
   // A field-less struct_def (C's `struct T {};`) prints unit-like with an

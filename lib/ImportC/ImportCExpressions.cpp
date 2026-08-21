@@ -322,6 +322,14 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
         return failure();
       return emitVariantConstruct(*variantType, construct, loc);
     }
+    // W2.17: a class with a user-declared destructor still has a TRIVIAL
+    // implicit copy constructor at the Decl level (verified by AST dump),
+    // so this unwrap fires for it and lowers a C++ whole-value COPY into a
+    // Rust MOVE -- one destructor run where C++ has two. Refused here, at
+    // the copy, so no value-position channel is left open.
+    if (ctor && userDeclaredDestructor(astContext(), construct->getType()))
+      return emitError(loc)
+             << "unsupported: value copy of a class with a destructor";
     if (ctor && ctor->isCopyOrMoveConstructor() && ctor->isTrivial() &&
         construct->getNumArgs() == 1)
       return emitRValue(construct->getArg(0));

@@ -342,6 +342,20 @@ _AMBIGUOUS_POINTER = ("pointer assigned a non-address value", "with no known tar
 # them -- the C corpus's tabulation is unchanged by this table's existence.
 _CXX_BLOCKER_SUBSTRINGS = [
     ("base classes are not supported", "cxx-inheritance"),
+    # W2.17 admitted the non-virtual, same-TU-defined destructor; the generic
+    # wording is retained for the residual (union) shape, and every measured
+    # miscompile channel around the admitted subset gets its own tag.
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("virtual destructor", "cxx-virtual-destructor"),
+    ("destructor with no definition in this translation unit", "cxx-destructor-no-body"),
+    ("destructor collides with the member function 'dtor'", "cxx-destructor-name-clash"),
+    ("struct member of a class with a destructor", "cxx-drop-member"),
+    ("array of a class with a destructor", "cxx-drop-array"),
+    ("global or static object of a class with a destructor", "cxx-drop-global"),
+    ("class with a destructor passed or returned by value", "cxx-drop-by-value"),
+    ("value copy of a class with a destructor", "cxx-drop-by-value"),
+    ("outside a function, loop, or branch body", "cxx-drop-scope"),
+    ("in a loop whose increment has side effects", "cxx-drop-scope"),
     ("user-declared destructor", "cxx-destructor"),
     ("virtual or unresolved member call", "cxx-virtual-call"),
     ("unsupported: virtual method", "cxx-virtual"),

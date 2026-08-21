@@ -138,6 +138,35 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
 constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
     {llvm::StringLiteral("base classes are not supported"),
      llvm::StringLiteral("cxx-inheritance")},
+    // W2.17 admitted the non-virtual, same-TU-defined destructor; the
+    // generic wording below is RETAINED for the residual shape (a union
+    // destructor), and every measured miscompile channel around the
+    // admitted subset gets its own tag so the backlog can rank them
+    // separately instead of collapsing them into one `cxx-destructor`.
+    {llvm::StringLiteral("virtual destructor"),
+     llvm::StringLiteral("cxx-virtual-destructor")},
+    {llvm::StringLiteral("destructor with no definition in this translation "
+                         "unit"),
+     llvm::StringLiteral("cxx-destructor-no-body")},
+    {llvm::StringLiteral("destructor collides with the member function "
+                         "'dtor'"),
+     llvm::StringLiteral("cxx-destructor-name-clash")},
+    {llvm::StringLiteral("struct member of a class with a destructor"),
+     llvm::StringLiteral("cxx-drop-member")},
+    {llvm::StringLiteral("array of a class with a destructor"),
+     llvm::StringLiteral("cxx-drop-array")},
+    {llvm::StringLiteral("global or static object of a class with a "
+                         "destructor"),
+     llvm::StringLiteral("cxx-drop-global")},
+    {llvm::StringLiteral("class with a destructor passed or returned by "
+                         "value"),
+     llvm::StringLiteral("cxx-drop-by-value")},
+    {llvm::StringLiteral("value copy of a class with a destructor"),
+     llvm::StringLiteral("cxx-drop-by-value")},
+    {llvm::StringLiteral("outside a function, loop, or branch body"),
+     llvm::StringLiteral("cxx-drop-scope")},
+    {llvm::StringLiteral("in a loop whose increment has side effects"),
+     llvm::StringLiteral("cxx-drop-scope")},
     {llvm::StringLiteral("user-declared destructor"),
      llvm::StringLiteral("cxx-destructor")},
     {llvm::StringLiteral("virtual or unresolved member call"),

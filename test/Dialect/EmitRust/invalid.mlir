@@ -721,3 +721,87 @@ emitrust.func @while_bad_terminator(%arg0: i32, %arg1: i32) {
   }
   emitrust.return
 }
+
+// -----
+
+// W2.17: `trait_name` on an `emitrust.impl` names the ONE trait impl the
+// dialect models. Anything else would render `impl <whatever> for T` with
+// a body the emitter has no contract for, so it is refused structurally.
+// expected-error @+1 {{trait impl names '"Rc"', but 'Drop' is the only modeled trait}}
+emitrust.impl "Owner" {
+  emitrust.func @drop(%arg0: !emitrust.mut_ref<!emitrust.struct<"Owner">>) {
+    emitrust.return
+  }
+} {trait_name = "Rc"}
+
+// -----
+
+// A Drop impl holds exactly one function and it is named `drop`: rustc
+// E0407 ("method is not a member of trait Drop") is what a differently
+// named member would become, so the verifier pins the shape here instead.
+emitrust.impl "Owner" {
+  // expected-error @+1 {{'Drop' impl member must be named 'drop'}}
+  emitrust.func @cleanup(%arg0: !emitrust.mut_ref<!emitrust.struct<"Owner">>) {
+    emitrust.return
+  }
+} {trait_name = "Drop"}
+
+// -----
+
+// `Drop::drop` returns nothing; a result would render a signature rustc
+// rejects (E0053).
+emitrust.impl "Owner" {
+  // expected-error @+1 {{'Drop' impl member 'drop' must have no results}}
+  emitrust.func @drop(%arg0: !emitrust.mut_ref<!emitrust.struct<"Owner">>) -> i32 {
+    %0 = emitrust.constant <0 : i32> : i32
+    emitrust.return %0 : i32
+  }
+} {trait_name = "Drop"}
+
+// -----
+
+// `Drop::drop` takes `&mut self` and nothing else.
+emitrust.impl "Owner" {
+  // expected-error @+1 {{'Drop' impl member 'drop' must take exactly one argument, the &mut self receiver}}
+  emitrust.func @drop(%arg0: !emitrust.mut_ref<!emitrust.struct<"Owner">>, %arg1: i32) {
+    emitrust.return
+  }
+} {trait_name = "Drop"}
+
+// -----
+
+// A receiverless associated function cannot be a Drop impl member: the
+// W2.2 static-method escape hatch is explicitly closed here.
+emitrust.impl "Owner" {
+  // expected-error @+1 {{'Drop' impl member 'drop' must take exactly one argument, the &mut self receiver}}
+  emitrust.func @drop() attributes {emitrust.static_method} {
+    emitrust.return
+  }
+} {trait_name = "Drop"}
+
+// -----
+
+// A shared `&self` receiver is accepted by the INHERENT impl (W2.2 const
+// methods) but not by a Drop impl: `Drop::drop` is `&mut self`.
+emitrust.impl "Owner" {
+  // expected-error @+1 {{'Drop' impl member 'drop' receiver must be a !emitrust.mut_ref of !emitrust.struct<"Owner">}}
+  emitrust.func @drop(%arg0: !emitrust.ref<!emitrust.struct<"Owner">>) {
+    emitrust.return
+  }
+} {trait_name = "Drop"}
+
+// -----
+
+// A Drop impl holds exactly ONE function. A second member would render
+// inside `impl Drop for Owner`, where rustc has no trait item for it
+// (E0407). (The empty-body counterpart is unrepresentable in textual IR:
+// `emitrust.impl`'s single region must have a block.)
+// expected-error @+1 {{'Drop' impl must hold exactly one emitrust.func}}
+emitrust.impl "Owner" {
+  emitrust.func @drop(%arg0: !emitrust.mut_ref<!emitrust.struct<"Owner">>) {
+    emitrust.return
+  }
+  emitrust.func @also(%arg1: !emitrust.mut_ref<!emitrust.struct<"Owner">>) {
+    emitrust.return
+  }
+} {trait_name = "Drop"}

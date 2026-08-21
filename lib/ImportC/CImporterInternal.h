@@ -1089,6 +1089,16 @@ void mergeRegionFacts(PointerRegion &target, const PointerRegion &absorbed);
 /// must reject a member-array binding whose struct-pointer root moves.
 bool mutatesVar(const clang::Stmt *stmt, const clang::VarDecl *var);
 
+/// W2.17: the USER-DECLARED destructor of the class `type` ultimately names,
+/// or null. Array types are peeled (an array's element type is what decides
+/// whether the storage is destructor-carrying) and so are typedef sugar and
+/// cv-qualifiers. A compiler-synthesized destructor is NOT one: it has no
+/// body to import and no observable effect, so it must never make a plain C
+/// struct look like an RAII class. Defined in ImportCAggregates.cpp and
+/// shared with the local/global/parameter/expression admission checks.
+const clang::CXXDestructorDecl *userDeclaredDestructor(clang::ASTContext &context,
+                                                       clang::QualType type);
+
 class PointerRegionAnalysis {
 public:
   /// Analyzes `body`, replacing any previous analysis state. `context` is
@@ -4069,6 +4079,21 @@ private:
   /// side-effecting size expression keep the non-constant-array-size
   /// rejection.
   LogicalResult emitLocalVar(const clang::VarDecl *var);
+
+  /// W2.17: verifies that `var` -- a LOCAL of a destructor-carrying class --
+  /// occupies a scope whose Rust rendering ends at the same program point,
+  /// so the emitted `Drop` runs where the C++ destructor does. Admitted:
+  /// a `DeclStmt` that is a DIRECT child of a `CompoundStmt` which is
+  /// itself the function body, a for/while/do BODY, or an if/else branch,
+  /// with no `goto`/label anywhere in the function and no for-increment
+  /// that can have side effects. Everything else is a located rejection --
+  /// each excluded shape was MEASURED to move the drop point silently:
+  /// a bare nested block and a switch case are FLATTENED by the importer
+  /// (no scope op exists in the dialect), a for-init declaration is HOISTED
+  /// out of the loop, a `goto` hoists the binding to function top, and a
+  /// general for-increment renders at the BOTTOM OF THE BODY, i.e. ahead of
+  /// the drop rather than after it.
+  LogicalResult checkDropLocalScope(const clang::VarDecl *var, Location loc);
 
   /// Populates `voidFnPtrHolders` with the admitted local `void *`
   /// fn-ptr holders of `body` (CTS-F, 00210): a local `void *` whose

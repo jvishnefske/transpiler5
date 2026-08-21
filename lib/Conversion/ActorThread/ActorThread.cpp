@@ -135,7 +135,10 @@ struct ActorThread
       return; // Lift-demoted (or field-less): never lifted, skip silently.
     emitrust::ImplOp impl;
     for (emitrust::ImplOp candidate : module.getOps<emitrust::ImplOp>())
-      if (candidate.getStructName() == name.getValue()) {
+      // W2.17: a trait impl (`impl Drop for T`) is not a method table; only
+      // the INHERENT impl carries the arms a mailbox could serve.
+      if (candidate.getStructName() == name.getValue() &&
+          !candidate.getTraitName()) {
         impl = candidate;
         break;
       }

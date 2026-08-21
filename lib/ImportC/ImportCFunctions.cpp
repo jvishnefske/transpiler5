@@ -45,6 +45,15 @@ std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
 static std::string cxxMethodBaseName(const clang::CXXMethodDecl *method) {
   if (llvm::isa<clang::CXXConstructorDecl>(method))
     return "new";
+  // W2.17: a destructor's `DeclarationName` is the special
+  // `CXXDestructorName` kind and has no ordinary identifier, so `getName()`
+  // would assert. The fixed base name is `dtor`, deliberately NOT `drop`:
+  // a member function literally spelled `void drop()` is legal C++ and
+  // already takes the module symbol `<Struct>_drop` (measured), so reusing
+  // it would silently merge two different functions. The in-IMPL symbol is
+  // separately renamed to `drop` by `convert-func-to-emitrust`.
+  if (llvm::isa<clang::CXXDestructorDecl>(method))
+    return "dtor";
   return mangleMemberName(method->getName());
 }
 
@@ -269,6 +278,24 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
              << name << "', which collides with '" << firstRaw
              << "' (leading underscores fold into the symbol prefix)";
   }
+
+  // W2.17: a destructor-carrying class crossing a call boundary BY VALUE is
+  // a silent miscompile, not an unmodeled construct. C++ destroys the
+  // callee's parameter COPY as well as the caller's object -- the destructor
+  // runs TWICE -- while Rust moves and runs it once (measured). The subset
+  // models no copy constructor, so nothing could make the counts agree.
+  // Checked on the signature, ahead of every parameter-classification path,
+  // so a prototype and its definition reject identically. The receiver is
+  // not a parameter here (it is a reference, added below) and so is exempt.
+  for (const clang::ParmVarDecl *param : func->parameters())
+    if (userDeclaredDestructor(astContext(), param->getType()))
+      return emitError(translateLoc(param->getLocation()))
+             << "unsupported: class with a destructor passed or returned by "
+                "value";
+  if (userDeclaredDestructor(astContext(), func->getReturnType()))
+    return emitError(loc)
+           << "unsupported: class with a destructor passed or returned by "
+              "value";
 
   // K&R callsite-prototype inference (FR-29, CTS 00209): the definition's
   // body refines argument-called prototype-less fn-ptr decls to their
@@ -554,6 +581,11 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
                     builder.getStringAttr(cxxOwnerStructType.getName()));
     if (!cxxHasReceiver)
       funcOp->setAttr(emitrust::kStaticMethodAttrName, builder.getUnitAttr());
+    // W2.17: the destructor body becomes `impl Drop for <Struct>`'s single
+    // member. The marker is what `convert-func-to-emitrust` keys on to
+    // route it into a SECOND, trait-carrying impl and rename it to `drop`.
+    if (llvm::isa<clang::CXXDestructorDecl>(cxxMethod))
+      funcOp->setAttr(emitrust::kDropImplAttrName, builder.getUnitAttr());
   }
   functions[name] = funcOp;
   // Recovery stub retry (FR-42): the signature above is the one the real

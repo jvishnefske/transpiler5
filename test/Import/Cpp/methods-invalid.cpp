@@ -1,5 +1,4 @@
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/destructor.cpp 2>&1 | FileCheck %s --check-prefix=DTOR
 // RUN: not emitrust-import-c %t/virtual.cpp 2>&1 | FileCheck %s --check-prefix=VIRTUAL
 // RUN: not emitrust-import-c %t/try-catch.cpp 2>&1 | FileCheck %s --check-prefix=TRYCATCH
 // RUN: not emitrust-import-c %t/throw.cpp 2>&1 | FileCheck %s --check-prefix=THROW
@@ -21,6 +20,21 @@
 // context; they are pinned here too for a complete, one-file located-
 // rejection ledger for this subset, per the wave's deliverable list.
 //
+// W2.17 RETIRED this file's DESTRUCTOR case. `//--- destructor.cpp` used
+// to pin `class HasDtor { ~HasDtor() {} int inc(int d); int x; };` plus a
+// local of it as `error: unsupported: user-declared destructor`; a
+// non-virtual destructor defined in this translation unit is now ADMITTED
+// and lowers to `impl Drop for HasDtor`, so that exact input IMPORTS. The
+// pin moved FORWARD rather than loosening: the positive behaviour is
+// pinned in test/Import/Cpp/destructors.cpp (and byte-diffed in
+// test/EndToEnd/cpp-destructor.cpp), and the surviving destructor frontier
+// -- virtual destructors, a destructor with no definition in this TU, a
+// union destructor, and the six OBJECT positions whose drop point the
+// emitter cannot reproduce (member, array, global/static, by value, an
+// unmodeled scope, a side-effecting for-increment) -- in
+// test/Import/Cpp/destructors-invalid.cpp. The generic wording this case
+// pinned is still raised, for the union shape.
+//
 // W2.16 RETIRED this file's TEMPLATE case. `//--- template.cpp` used to
 // pin `template <typename T> class Box { public: T value; T get(); };`
 // plus `Box<int> b;` as `error: unsupported top-level declaration`;
@@ -34,24 +48,6 @@
 // arguments, parameter packs, member function templates, static data
 // members, and same-TU name clashes — in
 // test/Import/Cpp/class-templates-invalid.cpp.
-
-//--- destructor.cpp
-// A user-declared destructor is out of scope this wave (no drop
-// semantics): REJECT at the destructor's own declaration, regardless of
-// whether it is ever invoked.
-// DTOR: destructor.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: user-declared destructor
-class HasDtor {
-public:
-  ~HasDtor() {}
-  int inc(int d) { return x + d; }
-  int x;
-};
-
-int use(void) {
-  HasDtor h;
-  h.x = 1;
-  return h.inc(h.x);
-}
 
 //--- virtual.cpp
 // A virtual method is out of scope this wave (no vtable/dynamic dispatch):
