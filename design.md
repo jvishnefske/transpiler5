@@ -5966,6 +5966,150 @@ piece and becomes FR-45.
   across BOTH legs (accepted at argc==1, rejected at argc==4) vs
   clang native. Full suite 668/668, both tiers, Fail 0.
 
+- [x] FR-100 Scalar out-parameter forwarding, callee-aware (the
+  named prerequisite for the `output_info` borrow-bundle front —
+  FR-99's re-probe left BOTH heatshrink units with residual walls
+  of exactly one shape, and this is its first of two arms).
+  Today `collectSliceParams` (CImporterInternal.h:7440-7478)
+  demotes a pointer parameter to `Slice` on ANY appearance that
+  is not a direct dereference or arrow — including a bare
+  forwarding reference in a call-argument position. FR-92 already
+  carved a POSITIONAL exception there for constant-array
+  pointees. The scalar analogue cannot be positional: a
+  pointer-to-array can never BE a slice, which is what made
+  FR-92's exception safe, and that is false for arithmetic
+  pointees. The admitted shape is therefore CALLEE-AWARE — a
+  forwarded arithmetic-pointee parameter keeps `ScalarRef` iff
+  the callee's corresponding parameter is itself `ScalarRef` —
+  and to stay ORDER-INDEPENDENT it is computed as a TU-wide
+  MONOTONE FIXPOINT over forwarding edges (seeds = local slice
+  demands; each edge propagates a demand BACKWARD to stability),
+  never as an on-demand recursive query, whose answer for a
+  mutual-recursion cycle would depend on which function was
+  classified first. Call sites forward the bare operand (Rust's
+  implicit reborrow), exactly as FR-92's arm does, with symbol-
+  type equality as the proof the callee agreed on the class.
+  HONEST SCOPE: the standalone corpus delta is ~0. This
+  increment's justification is (a) the out-parameter idiom is
+  pervasive in C independently of this corpus and (b) it is the
+  measured prerequisite for the `output_info` arm — the bundle
+  scalarization cannot pass a `size_t *output_size` member on
+  without it. It must not be scored as a corpus win.
+  Frontier stays: non-arithmetic pointees, forwarding into a
+  callee with no in-TU definition (the region contract is
+  unknown), variadic callees, and arity mismatches — all keep
+  today's conservative `Slice`.
+  Gates: Import pins (the forwarding shape admitted; the
+  DIFFERENTIAL that a subscripting callee still forces Slice on
+  its caller's forwarded parameter; cycle and self-forward arms)
+  + the three measured suite interactions below, each resolved
+  not suppressed + EndToEnd byte-diff (an out-param chain,
+  argc-seeded, vs clang native) + full lit 100%; C path only.
+  **SPIKE VERDICT: GO WITH CONSTRAINTS (2026-08-20) — both the
+  naive and the fixpoint forms were BUILT and measured against
+  the suite, and the blast radius is the evidence.** The naive
+  positional form (arithmetic pointees admitted unconditionally
+  in call-argument position) breaks 10 tests INCLUDING three
+  c-testsuite ledger regressions (logger no longer transpiling;
+  00200.c, 00216.c no longer passing) and RealWorld — a definite
+  NO-GO, and the reason the callee-aware framing is mandatory
+  rather than a refinement. The fixpoint form breaks 3, with the
+  ledger and RealWorld regressions GONE, and each of the three is
+  a design constraint rather than a defect:
+  (1) FR-75 INTERACTION — `external-requirement-slice-refine.c`
+  fails with "conflicting redeclaration of 'helper'". The
+  requirement gate (ImportCTypes.cpp:1016-1046) EAGERLY classifies
+  a body-less arithmetic-pointee parameter as `Slice` under a
+  trait policy; the fixpoint, seeded only from definitions, can
+  disagree. The fixpoint must therefore be seeded with the eager
+  requirement classification too, so forwarding INTO a
+  requirement propagates `Slice` backward.
+  (2) CROSS-TU — `pointers-param-invalid.c:49` stops emitting the
+  "called as ... before its definition refined the signature"
+  diagnostic. A forwarding edge whose callee is defined in
+  ANOTHER TU is not resolvable at classification time and must
+  stay conservative (`Slice`), leaving that refinement diagnostic
+  firing verbatim.
+  (3) A DELIBERATE FRONTIER PIN MOVES — `array-2d-pointer-invalid.c:85-93`
+  carries FR-92's own differential ("the forward exception is for
+  pointer-to-array pointees ONLY ... a scalar `int*` parameter
+  passed on as a call argument still classifies as a slice") and
+  its FWDSCALAR arm. FR-100 is precisely the FR that opens that
+  frontier, so the arm must be REWRITTEN as a positive pin with
+  its comment updated to name the callee-aware rule — never
+  deleted, and never left asserting a rejection that no longer
+  happens.
+  Positive evidence: on the fixpoint build the motivating shape
+  imports with the discrimination the naive form could not make —
+  in a flattened `output_info` program, `output_size` stays
+  `&mut u64` (forwarded, scalar) while `out_buf` correctly stays
+  `&mut [u8]` (its callee subscripts it), in the SAME call. A
+  working prototype diff (173 lines, both hunks: the edge-
+  collecting walker and the call-site forwarding arm) is the
+  implementation reference.
+  **DELIVERED (2026-08-20) — with constraint (1) CORRECTED: the
+  entry's own remedy for it did not work.** The re-drive measured
+  the FULL gate (this entry's blast-radius numbers came from the
+  fast tier alone) and found the fixpoint form at 667/668, sole
+  failure the FR-92 pin — the ledger and RealWorld regressions of
+  the naive form confirmed gone, MEASURED not inferred.
+  THE CORRECTION: constraint (1) is NOT resolved by scoping the
+  fixpoint per-AST. The live regression is not the body-less
+  callee this entry describes (the in-TU body-less case already
+  forces conservatism) but a DEFINITION whose class the fixpoint
+  DEMOTES while another TU's declaration was eagerly classified
+  `Slice` by the FR-75 gate — in default `--crate-type=auto`
+  mode, i.e. the ordinary multi-TU C library layout, a two-file
+  `decl-first.c` + `def-fwd.c` pair went from importing to
+  "conflicting redeclaration of 'helper'".
+  The working remedy, measured against two candidates: inside the
+  fixpoint, ALSO seed the per-body slice answer for every
+  externally visible body-carrying function in a trait-eligible
+  TU — as a SEED, not a lookup special-case, so the demand
+  propagates BACKWARD through forwarding edges and a static
+  caller is demoted with it rather than mismatching at the call.
+  (The rejected candidate — forcing `Slice` on every arithmetic
+  pointee of every externally visible function — scored 476/478:
+  it erases FR-75's own recorded deliberate regression.) MEASURED
+  PRICE, recorded so it is not rediscovered: under a trait policy
+  FR-100 applies to `static` functions only; two incidental
+  improvements the unremedied prototype had are given back to
+  baseline parity.
+  Beyond the gate: byte-identical stdout vs clang across 15
+  programs x 3 argv widths, including mutual recursion, K&R
+  definitions, swapped argument positions, callee-defined-after-
+  caller, and a generated 400-function / 800-edge densely
+  mutually-recursive forwarding graph (imports in 0.15s) — the
+  order-independence claim exercised at scale, not asserted.
+  `emitrust-opt` idempotent on the emitted modules and no new
+  dialect ops (the forward renders as a plain `call @g(%arg0)` on
+  an existing `mut_ref` block argument). The `g(p, p)` double-
+  borrow hazard takes the EXISTING located aliasing rejection —
+  no un-compilable Rust escapes. CORPUS: totals identical to
+  baseline and every emitted crate source BYTE-IDENTICAL under
+  `diff -rq`, which is the evidence for this entry's "~0 corpus
+  delta, not a corpus win" clause rather than a hope.
+  FR-92's FWDSCALAR pin was rewritten as a positive arm with its
+  prose updated, and a new FWDSLICE arm keeps the differential
+  that made FR-92's exception pointee-keyed: when the callee
+  SUBSCRIPTS, the slice demand propagates BACKWARD onto the
+  forwarding caller.
+  ONE HONEST NEGATIVE, found by mutation and recorded in the test
+  itself: the implementation added a `!isa<SliceType>(pointee)`
+  exclusion to the call-site arm against an offset-zero
+  miscompile, and a byte-diff pin was written for it — but
+  DELETING THE GUARD LEAVES THAT PIN PASSING, because the
+  slice-argument branch above (ImportCExpressions.cpp:4596-4857)
+  ends in an unconditional return, so a slice pointee can never
+  reach the forwarding arm. The guard is unreachable defense in
+  depth, not a live condition. The test was KEPT — it pins the
+  real composition, a walking-cursor slice argument beside a
+  forwarded scalar out-parameter in the same call at a non-zero
+  cursor — with its intent comment corrected to say exactly what
+  it does and does not pin. A pin that cannot fail pins nothing,
+  and saying so is cheaper than rediscovering it.
+  Full suite 672/672, both tiers, Fail 0.
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test

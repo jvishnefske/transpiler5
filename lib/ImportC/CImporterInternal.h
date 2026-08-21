@@ -5899,6 +5899,21 @@ private:
   /// declarations are distinct clang decls, so entries never conflict).
   llvm::DenseMap<const clang::FunctionDecl *, SmallVector<ParamKind, 4>>
       paramKindsCache;
+  /// FR-100: the TU-wide forwarding fixpoint. `forwardSliceParams` holds
+  /// every pointer parameter that demands a slice EITHER locally (a
+  /// non-benign appearance in its own body) OR transitively, through a
+  /// forwarding edge into a callee parameter that demands one. Computed
+  /// ONCE PER AST (`forwardSliceComputedFor`, mirroring
+  /// `classifyTimeTraitCache`: one `CImporter` spans every TU of a
+  /// project and `astContext()` is swapped per TU, so a single global
+  /// flag would reuse TU 1's answer, empty, for TU 2 and silently
+  /// scalarize its parameters), so the classification never depends on
+  /// the order functions are classified in. Keys stay valid because all
+  /// ASTs live for the whole import (see ImportC.cpp's merged-AST
+  /// invariant), the same property `paramKindsCache` relies on.
+  llvm::DenseSet<const clang::ParmVarDecl *> forwardSliceParams;
+  llvm::DenseSet<const clang::ASTContext *> forwardSliceComputedFor;
+  void computeForwardSliceParams();
   /// FR-71: byte elements of `void *` parameters admitted as byte-slice
   /// cursors, keyed like `paramKindsCache` (canonical declaration) and
   /// index-aligned with its entry; a null slot (or an absent entry) means
@@ -7497,9 +7512,28 @@ static inline bool isForwardedArrayPointerParam(const clang::Expr *expr) {
 /// `a[i][j]`, arithmetic, reassignment) still classifies Slice so its
 /// historical located rejection is untouched (array-params-invalid.c's
 /// multidim pin).
-static inline void collectSliceParams(
+/// FR-100 adds the CALLEE-AWARE scalar analogue on the SAME walk, via
+/// the optional `edges` sink (null = the historical conservative
+/// behavior, byte-for-byte). A bare ARITHMETIC-pointee pointer-parameter
+/// reference in a DIRECT-CALL ARGUMENT position, whose callee is an
+/// in-TU DEFINITION that is non-variadic and of matching arity, records
+/// a FORWARDING EDGE (callerParam -> calleeParam) instead of an
+/// immediate slice demand; `computeForwardSliceParams` then resolves the
+/// edges to a TU-wide fixpoint, so a forwarded parameter keeps its
+/// scalar reference IFF the callee's corresponding parameter keeps one.
+/// The positional FR-92 exception cannot be reused for these pointees (a
+/// pointer-to-array can never BE a slice, an arithmetic pointee can), and
+/// the callee-blind form was measured to miscompile-adjacent regress the
+/// c-testsuite ledger. Every OTHER appearance behaves exactly as before,
+/// which is why the two flavors share one walker: a deref/arrow benign
+/// arm or the FR-92 positional arm edited in only one of two copies is
+/// the maintenance hazard this fold removes.
+static inline void collectSliceParamsImpl(
     const clang::Stmt *stmt,
-    llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &sliceParams) {
+    llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &sliceParams,
+    llvm::SmallVectorImpl<
+        std::pair<const clang::ParmVarDecl *, const clang::ParmVarDecl *>>
+        *edges) {
   if (!stmt)
     return;
   if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(stmt))
@@ -7510,19 +7544,44 @@ static inline void collectSliceParams(
     if (member->isArrow() && asPointerParamRef(member->getBase()))
       return; // Benign arrow access; the base has no other children.
   if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
-    bool anyForwarded = false;
-    for (const clang::Expr *arg : call->arguments())
+    // FR-100: a USABLE callee is a direct, in-TU definition with a body,
+    // non-variadic, of matching arity. Anything else (an indirect call, a
+    // body-less or other-TU callee, a variadic one, an arity mismatch)
+    // records no edge, so the argument falls through to the conservative
+    // slice demand below and keeps its historical located rejection.
+    const clang::FunctionDecl *calleeDef = nullptr;
+    if (edges)
+      if (const clang::FunctionDecl *callee = call->getDirectCallee())
+        if (const clang::FunctionDecl *def = callee->getDefinition();
+            def && def->hasBody() && !def->isVariadic() &&
+            def->getNumParams() == call->getNumArgs())
+          calleeDef = def;
+    llvm::SmallPtrSet<const clang::Expr *, 4> deferred;
+    for (auto [index, arg] : llvm::enumerate(call->arguments())) {
       if (isForwardedArrayPointerParam(arg)) {
-        anyForwarded = true;
-        break;
+        deferred.insert(arg); // FR-92: positional, pointee-keyed.
+        continue;
       }
-    if (anyForwarded) {
+      if (!calleeDef)
+        continue;
+      const clang::ParmVarDecl *fwd = asPointerParamRef(arg);
+      if (!fwd)
+        continue;
+      if (!fwd->getType()
+               .getCanonicalType()
+               ->getPointeeType()
+               ->isArithmeticType())
+        continue;
+      edges->emplace_back(fwd, calleeDef->getParamDecl(index));
+      deferred.insert(arg);
+    }
+    if (!deferred.empty()) {
       // Walk the callee and the non-forwarding arguments only; the
-      // forwarded whole-array references stay scalar.
-      collectSliceParams(call->getCallee(), sliceParams);
+      // forwarded references carry no local demand of their own.
+      collectSliceParamsImpl(call->getCallee(), sliceParams, edges);
       for (const clang::Expr *arg : call->arguments())
-        if (!isForwardedArrayPointerParam(arg))
-          collectSliceParams(arg, sliceParams);
+        if (!deferred.contains(arg))
+          collectSliceParamsImpl(arg, sliceParams, edges);
       return;
     }
   }
@@ -7532,7 +7591,26 @@ static inline void collectSliceParams(
       if (isPointerType(param->getType()))
         sliceParams.insert(param);
   for (const clang::Stmt *child : stmt->children())
-    collectSliceParams(child, sliceParams);
+    collectSliceParamsImpl(child, sliceParams, edges);
+}
+
+/// The conservative flavor: every call-argument appearance that is not
+/// FR-92's positional exception demands a slice.
+static inline void collectSliceParams(
+    const clang::Stmt *stmt,
+    llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &sliceParams) {
+  collectSliceParamsImpl(stmt, sliceParams, /*edges=*/nullptr);
+}
+
+/// The FR-100 flavor: scalar forwarding becomes an edge to resolve, not
+/// a demand. Only `computeForwardSliceParams` should call this.
+static inline void collectSliceParamsWithEdges(
+    const clang::Stmt *stmt,
+    llvm::SmallPtrSetImpl<const clang::ParmVarDecl *> &sliceParams,
+    llvm::SmallVectorImpl<
+        std::pair<const clang::ParmVarDecl *, const clang::ParmVarDecl *>>
+        &edges) {
+  collectSliceParamsImpl(stmt, sliceParams, &edges);
 }
 
 static inline bool voidParamOnlyTruthTested(const clang::Stmt *stmt,

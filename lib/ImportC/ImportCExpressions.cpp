@@ -5016,6 +5016,33 @@ FailureOr<Value> CImporter::emitBorrowArgument(
   //       a whole-array reference has no (base, cursor) pointer
   //       decomposition, which is why the admission lives HERE and not in
   //       `emitPointerRValue`).
+  // FR-100: the CALLEE-AWARE scalar analogue of FR-92's forwarding arm.
+  // A caller whose own parameter is a scalar reference (the classifier's
+  // TU-wide forwarding fixpoint kept it one precisely because this
+  // callee's parameter is one too) passes the block argument through as
+  // the bare operand, exactly as the whole-array forward below does; the
+  // SYMBOL-TYPE EQUALITY is the proof the callee agreed on the class, so
+  // a callee the fixpoint (or a later override, e.g. FR-76's
+  // address-taken rule) classified as a Slice falls through to its
+  // historical located rejection instead of borrowing one element of a
+  // run the callee may walk. `root` is the parameter, so `emitCall`'s
+  // same-base aliasing guard still covers `g(p, p)`. The arm is for
+  // SCALAR references only: a slice-pointee parameter (or a CellSlice
+  // one) carries a CURSOR, and the slice-argument machinery above
+  // reslices it at that cursor — forwarding such a value bare would
+  // silently hand the callee the whole region from offset zero, so both
+  // region-shaped pointees are excluded here rather than relying on the
+  // earlier branch to always return.
+  if (!llvm::isa<emitrust::ArrayType>(pointee) &&
+      !llvm::isa<emitrust::SliceType>(pointee)) {
+    if (const clang::ParmVarDecl *forwarded = asPointerParamRef(stripped)) {
+      auto it = symbols.find(forwarded);
+      if (it != symbols.end() && it->second.getType() == paramType) {
+        root = forwarded;
+        return it->second;
+      }
+    }
+  }
   if (auto destArray = llvm::dyn_cast<emitrust::ArrayType>(pointee)) {
     if (const clang::ParmVarDecl *forwarded = asPointerParamRef(stripped)) {
       auto it = symbols.find(forwarded);
