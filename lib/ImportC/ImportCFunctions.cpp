@@ -589,6 +589,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       methodOwner && ownerIndexReturns.contains(func->getCanonicalDecl());
   currentCxxThisRef = Value();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
+  currentFamOptionPayload = famOptionReturnPayload(func, currentReturnType);
+  famOptionTemps.clear();
   // An erased single-global-base pointer return (CTS-S, 00089): return
   // sites emit a bare `return` instead of the classified `&global`.
   currentErasedReturnBase =
@@ -1088,6 +1090,8 @@ CImporter::importLiftedLambdaBody(const PendingLiftedLambda &pending) {
   FunctionType functionType = funcOp.getFunctionType();
   currentReturnType =
       functionType.getNumResults() ? functionType.getResult(0) : Type();
+  currentFamOptionPayload = Type(); // FR-99: no C++ lambda is a FAM allocator.
+  famOptionTemps.clear();
   currentErasedReturnBase = nullptr;
   currentFuncName = funcOp.getSymName().str();
   currentIsMain = false;
@@ -1432,6 +1436,8 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentOwnerIndexReturn = false;
   currentCxxThisRef = Value();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
+  currentFamOptionPayload = famOptionReturnPayload(func, currentReturnType);
+  famOptionTemps.clear();
   currentErasedReturnBase = nullptr;
   currentFuncName = clone.name;
   currentIsMain = false;
@@ -2736,6 +2742,24 @@ Block *CImporter::getLabelBlock(const clang::LabelDecl *label) {
   if (!block)
     block = createBlock();
   return block;
+}
+
+/// FR-99: the payload struct `S` of a nullable owned FAM return's
+/// `Option<S>` signature, or a null Type when `func` has no such return.
+/// Gated on `famNullableReturnFns` so no other Option-typed signature (the
+/// C++ `std::optional` returns) can be mistaken for one.
+Type CImporter::famOptionReturnPayload(const clang::FunctionDecl *func,
+                                       Type returnType) {
+  if (!func || !famNullableReturnFns.contains(func->getCanonicalDecl()))
+    return Type();
+  auto opaque = llvm::dyn_cast_or_null<emitrust::OpaqueType>(returnType);
+  if (!opaque)
+    return Type();
+  llvm::StringRef payload = opaque.getValue();
+  if (!payload.consume_front("Option<") || !payload.consume_back(">") ||
+      payload.empty())
+    return Type();
+  return emitrust::StructType::get(builder.getContext(), payload);
 }
 
 Value CImporter::createVariablePlace(Location loc, Type type,

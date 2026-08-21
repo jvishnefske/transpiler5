@@ -3397,6 +3397,28 @@ FailureOr<Value> CImporter::emitPointerTruth(const clang::Expr *expr) {
                                         ValueRange{})
         .getResult(0);
   }
+  // FR-99: a local bound to a NULLABLE owned-FAM allocator holds its result
+  // in an Option temp until the recognized guard resolves it, so its truth
+  // test IS the Option discriminant — never the statically-non-null constant
+  // fold below, which would silently delete the guard. A test after the temp
+  // was unwrapped has no discriminant left to read (the payload is already
+  // owned), so it rejects rather than folding.
+  if (const clang::VarDecl *bound = famNullableBoundLocal(expr)) {
+    Value temp = famOptionTemps.lookup(bound);
+    if (!temp)
+      return emitError(loc)
+             << "unsupported: null test of '"
+             << canonicalStreamName(bound->getName())
+             << "' outside its binding guard (a nullable "
+                "flexible-array-record allocator result is unwrapped at the "
+                "guard immediately following the binding)";
+    return builder
+        .create<emitrust::MethodCallOp>(loc, TypeRange{builder.getI1Type()},
+                                        temp,
+                                        builder.getStringAttr("is_some"),
+                                        ValueRange{})
+        .getResult(0);
+  }
   // An integer-carrier pointer (CTS-P3) is a plain i64; its truth test is
   // an integer comparison against zero.
   if (Value cell = lookupCarrierCell(expr)) {
@@ -4593,17 +4615,22 @@ CImporter::famOptionMemberPointee(const clang::FieldDecl *field) {
 }
 
 FailureOr<emitrust::OpaqueType>
+CImporter::famOptionOfStruct(Type structType, Location loc) {
+  auto record = llvm::dyn_cast<emitrust::StructType>(structType);
+  if (!record) // Defensive; the shape admitted a FAM record.
+    return emitError(loc) << "unsupported: flexible-array record type";
+  return emitrust::OpaqueType::get(
+      builder.getContext(), ("Option<" + record.getName() + ">").str());
+}
+
+FailureOr<emitrust::OpaqueType>
 CImporter::famOptionMemberType(const clang::FieldDecl *field, Location loc) {
   clang::QualType pointee =
       field->getType().getCanonicalType()->getPointeeType();
   FailureOr<Type> structType = mapType(pointee, loc);
   if (failed(structType))
     return failure();
-  auto record = llvm::dyn_cast<emitrust::StructType>(*structType);
-  if (!record) // Defensive; the shape admitted a FAM record pointee.
-    return emitError(loc) << "unsupported: flexible-array record type";
-  return emitrust::OpaqueType::get(
-      builder.getContext(), ("Option<" + record.getName() + ">").str());
+  return famOptionOfStruct(*structType, loc);
 }
 
 const clang::MemberExpr *
