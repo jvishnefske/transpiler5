@@ -359,6 +359,12 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("is not a recognized STL type", "stl-unrecognized-type"),
     ("is not a recognized STL method", "stl-unrecognized-method"),
     ("receiver is not a recognized STL", "stl-unrecognized-receiver"),
+    # W2.16 class-template frontier; mirrors lib/ImportC/RejectionLedger.cpp.
+    ("explicit class template specialization", "cxx-class-template-explicit-spec"),
+    ("partial class template specialization", "cxx-class-template-partial-spec"),
+    ("non-type template argument in class template instantiation", "cxx-class-template-nttp"),
+    ("variadic class template (template parameter pack)", "cxx-class-template-pack"),
+    ("class template instantiation collides with the existing struct", "cxx-class-template-name-clash"),
     ("unsupported top-level declaration", "unsupported-top-level-decl"),
 ]
 # Generic dispatch fallbacks that name the offending AST node class. These are

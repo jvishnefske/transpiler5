@@ -1758,6 +1758,50 @@ static LogicalResult checkTemplateArguments(const clang::FunctionDecl *spec,
 }
 
 LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
+  // W2.16 class-template monomorphization, the record twin of W2.15's
+  // arm below. Clang has already instantiated every specialization the
+  // program requests, each a concrete `ClassTemplateSpecializationDecl`
+  // (which IS-A `CXXRecordDecl`) with substituted fields and instantiated
+  // constructor/method members, so the walk hands them to W2.2's ordinary
+  // `importRecord` + `importCXXMethods` surface UNCHANGED and never
+  // touches the uninstantiated pattern (whose fields are dependent types
+  // with no mapping). A never-instantiated template contributes no
+  // specializations, so it is examined not at all.
+  //
+  // The frontier verdicts (explicit/partial specialization, non-type
+  // argument, parameter pack) deliberately do NOT live here: a record
+  // specialization is reached by THREE routes — this walk, the ordinary
+  // top-level `RecordDecl` visit below, and on demand from `mapType` when
+  // a local/member/parameter names the type — and only the last one is
+  // still live once FR-42 recovery has dropped the first two. They live
+  // on the record import itself (`importRecordUncached`), which all three
+  // routes funnel through. See test/Import/Cpp/class-templates-invalid.cpp.
+  //
+  // KNOWN GAPS, recorded rather than left silent:
+  //  * a MEMBER function template is declared inside the record, so it
+  //    never reaches this walk and surfaces at its call as "call to
+  //    unimported method".
+  //  * a static DATA member of a class template is a global, not a field;
+  //    the walk imports records and methods only, so a use surfaces as
+  //    "reference to an unknown variable".
+  //  * a record name carries no namespace prefix, so two same-named
+  //    templates in different namespaces compose one spelling; that is a
+  //    located collision rejection in `importRecordUncached`, never a
+  //    silent merge.
+  if (const auto *classTmpl = llvm::dyn_cast<clang::ClassTemplateDecl>(decl)) {
+    for (const clang::ClassTemplateSpecializationDecl *spec :
+         classTmpl->specializations()) {
+      if (!spec->isThisDeclarationADefinition())
+        continue;
+      // An implicit instantiation reports the PATTERN's location, so every
+      // instantiation of one template shares a diagnostic location. That
+      // is accepted (there is no better source position for generated
+      // code) and is why the lit pins match line/column loosely.
+      if (failed(importRecord(spec, translateLoc(spec->getLocation()))))
+        return failure();
+    }
+    return success();
+  }
   // W2.15 function-template monomorphization. Clang has already
   // instantiated every specialization the program requests, each a
   // concrete `FunctionDecl` with a dependent-free body hanging off the
@@ -1824,6 +1868,14 @@ LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
     return importFunction(func);
   }
   if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
+    // W2.16: a `ClassTemplateSpecializationDecl` IS-A `RecordDecl` and
+    // reaches HERE as well as through the class-template arm above (an
+    // explicit specialization is listed in both places, and this visit is
+    // the one still live once FR-42 recovery has dropped the template
+    // item). No guard is needed at this site: `importRecord` is idempotent
+    // for an already-imported specialization, and every frontier verdict
+    // lives on the record import itself, so both visits agree.
+    //
     // An EMPTY struct that no declaration type mentions is skipped: it
     // may only ever appear as a zero-byte member of a byte-region
     // aggregate (CTS-BR, 00216), which never materializes the record

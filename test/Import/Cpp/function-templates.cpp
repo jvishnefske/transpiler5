@@ -18,7 +18,8 @@
 // die with a nonsense cross-TU wording. Hence:
 //
 // PINNED template-argument suffix scheme (binding; W2.16's class
-// templates are required to compose with it — see design.md W2.15/W2.16):
+// templates compose with it and reuse its code table — see design.md
+// W2.15/W2.16):
 //
 //   <the ordinary cFunctionSymbolName base> + ("_" + <code>) per Type
 //   template argument, in DECLARATION ORDER of the template parameters.
@@ -47,8 +48,13 @@
 //
 // Rejections that stay rejections (see function-templates-invalid.cpp):
 // explicit specializations, non-type template arguments, and template
-// parameter packs. Class templates keep the generic `unsupported
-// top-level declaration` (W2.16) — pinned in methods-invalid.cpp.
+// parameter packs. Class templates compose with this scheme rather than
+// extending it: W2.16 reuses `templateArgTypeCode` VERBATIM for the
+// struct-name suffix (`Box<int>` -> `Box_i32`), so one argument codes the
+// same way whichever kind of template it instantiates — pinned in
+// test/Import/Cpp/class-templates.cpp. The one deliberate difference is
+// placement: a function's suffix is appended after the snake_case base, a
+// record's before the UpperCamel rename.
 
 extern "C" int printf(const char *, ...);
 

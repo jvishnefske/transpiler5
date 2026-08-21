@@ -6870,6 +6870,58 @@ piece and becomes FR-45.
   type items, so that claim stands as made — the distortion is
   specific to large multi-unit codebases with many shared types.
 
+- [ ] FR-108 DEFECT: emitted record names are not injective, and
+  two distinct records that collide silently SHARE METHODS.
+  Measured on unpatched HEAD (2026-08-21, W2.16's spike), with
+  no templates anywhere, byte-diffed against `clang++`:
+  (a) THE UPPER-CAMEL RENAME IS NOT INJECTIVE. `struct box_i32
+  {int v; int get() const {return v+100;}}` beside `struct BoxI32
+  {int v; int get() const {return v;}}` both compute the emitted
+  name `BoxI32`. Native prints `101 1`; the emitted crate prints
+  `101 101`.
+  (b) RECORD NAMES CARRY NO NAMESPACE PREFIX, unlike
+  `cFunctionSymbolName`, which applies `namespacePrefix`. `::Box`
+  beside `ns::Box` with different `get()` bodies: native `1 101`,
+  emitted crate `1 1`.
+  ROOT CAUSE, one line: `importedRecordShapes`
+  (lib/ImportC/ImportCAggregates.cpp:367-374) is keyed by the
+  emitted NAME plus the field shape, so the second of two
+  distinct `RecordDecl`s that agree on both returns success
+  BEFORE `importCXXMethods` (:409) runs. Every method mangles as
+  `<StructName>_<method>` (ImportCFunctions.cpp:103), so the
+  second type's call sites then resolve to the FIRST type's
+  bodies. Only same-shape collisions are silent — a differing
+  shape already fails loudly, if with a misleading cross-TU
+  wording.
+  WHY THE OBVIOUS FIX IS WRONG: "reject any name reuse" breaks
+  the legitimate user of that path — the cross-TU merge, where
+  two units including one header must resolve to ONE emitted
+  struct (probed: `a.cpp b.cpp` sharing a header template give
+  one `BoxI32`, one impl, byte-identical output). The
+  discriminator that works is DECL IDENTITY WITHIN ONE IMPORT:
+  record the owning `RecordDecl*` alongside the shape and reject
+  when a DIFFERENT decl from the SAME tuTag claims the name.
+  W2.16 shipped exactly that guard for the template half (its
+  clause (5)) and pinned both clash orders; this entry is the
+  REMAINING non-template half — the plain `box_i32`/`BoxI32`
+  case and the namespace case — which W2.16 did not close and
+  which has no test today, because a test for it would be a
+  failing test.
+  Acceptance: y01 (`box_i32` vs `BoxI32`) and n02 (`::Box` vs
+  `ns::Box`) become byte-diff-clean EndToEnd legs, or LOCATED
+  rejections if the injective-naming route is rejected on
+  design grounds; the cross-TU merge stays byte-identical; the
+  namespace half decides whether record names take
+  `namespacePrefix` (the symmetric fix, and the one that also
+  makes `ns::Box` and `::Box` coexist rather than merely
+  diagnose). CTestSuite ledger unchanged.
+  RANKED FIRST among open work: this is a silent-wrong-code
+  channel, and CLAUDE.md's safe-failure rule makes closing it
+  precede any new feature.
+  **NOT SPIKED** (the failure shapes are measured; the fix
+  choice is not).
+
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
@@ -10503,7 +10555,7 @@ the subset boundary is honest today, nothing silently miscompiles):
 | construct | today's diagnostic |
 |---|---|
 | `template <typename T> T add(T,T)` | LANDED W2.15 (was `unsupported top-level declaration`) |
-| `template <typename T> struct Box` | `unsupported top-level declaration` (same site) |
+| `template <typename T> struct Box` | LANDED W2.16 (was `unsupported top-level declaration`) |
 | user destructor `~R()` | `unsupported: user-declared destructor` |
 | `struct D : Base` | `unsupported: base classes are not supported` |
 | `std::cout << x` | `unsupported assignable expression: CXXOperatorCallExpr` |
@@ -10616,10 +10668,89 @@ whole-program demand.
   test/Import/Cpp/cpp-basics-invalid.cpp, re-minted LAMESCARG in
   stl-invalid.cpp)
 
-- [ ] W2.16 Class-template monomorphization: `ClassTemplateDecl` ->
-  one emitted struct per specialization (`Box<int>` -> `Box_i32`), methods
-  and constructors riding W2.2's existing `importCXXMethods` surface
-  unchanged. Depends on W2.15's suffix scheme. **NOT SPIKED.**
+- [x] W2.16 Class-template monomorphization. Spike verdict
+  **GO-WITH-CONSTRAINTS** (2026-08-21, prototype built and fully
+  reverted). The differential that settles the wave's premise:
+  hand-monomorphized C++ (`struct Box_i32 {...}; struct Box_d {...};`)
+  versus the template `Box<T>` at int/double with the same `main`,
+  `--emit=rust` both -- **ZERO BYTES DIFFERENT**. A specialization
+  produces literally the emitter output the non-template path already
+  produces, so W2.2's `importRecord`/`importCXXMethods` surface does
+  ride unchanged and the dialect needs nothing new (the ops in the
+  corpus entry's IR are all pre-W2.16; `emitrust-opt` round-trips
+  byte-stably). Nine further crates were built and byte-diffed against
+  `clang++ -std=c++17`: the full use matrix (local, member of a plain
+  struct, by-value param, reference param, return type, array), a
+  two-parameter template at BOTH argument orders, char/signed
+  char/unsigned char, long/long long/unsigned, a defaulted template
+  parameter, a namespaced template, a never-instantiated sibling, and a
+  constructor calling a later-declared method (FR-47's two-pass).
+  Landed: (1) **The `ClassTemplateDecl` arm** mirrors W2.15's -- walk
+  `specializations()`, import each `isThisDeclarationADefinition()`,
+  never look at the pattern. (2) **The suffix placement is INVERTED
+  relative to W2.15, and that inversion is measured, not stylistic.**
+  The record suffix is composed inside `recordRustName`
+  (`CSymbolNaming.h`) BEFORE `toUpperCamelCase`, where the function
+  suffix goes AFTER `mangleMemberName`'s snake-case. Appending after
+  the rename yields `Box_i32`, which trips the crate's
+  `non_camel_case_types` deny; composing before it yields `BoxI32`.
+  All 8 record-name recomputation sites then pick the suffix up for
+  free, including `cxxMethodMangledName` via `assignedStructNames`, so
+  `box_i32_new`/`box_i32_get` fall out with no extra work.
+  (3) **W2.15's double-visit lesson is a TRIPLE-visit lesson for
+  records**, and this is why the frontier verdicts live in
+  `importRecordUncached` rather than in the arm: a
+  `ClassTemplateSpecializationDecl` reaches record import from the new
+  arm, from the top-level `RecordDecl` arm, AND on demand from
+  `mapType` when a local/member/param names the type. Under `--recover`
+  the first two drop the item but the third still fired -- measured
+  emitting `struct BoxI8` for an explicitly specialized shape and
+  `struct BoxPi32` for a partial-specialization instantiation. One site
+  now covers all three routes; the second visit reports the cascade
+  wording rather than repeating the first, and both are pinned.
+  (4) **Five new LOCATED wordings**: `partial class template
+  specialization`, `explicit class template specialization`, `non-type
+  template argument in class template instantiation`, `variadic class
+  template (template parameter pack)`, and -- beyond the wave's
+  original statement -- `class template instantiation collides with the
+  existing struct '<n>'`, which exists because W2.16 WIDENS the FR-108
+  silent-collision channel and shipping a widened miscompile channel is
+  not allowed. Partial-specialization discrimination is real:
+  `getSpecializedTemplateOrPartial()` catches the `Box<int*>`
+  instantiation that hangs off `specializations()` and would otherwise
+  have been admitted as `BoxPi32`. (5) **STL non-regression is
+  STRUCTURAL, not incidental.** `std::vector<int>` is a
+  `ClassTemplateSpecializationDecl` too, and the reason the new arm
+  never touches it is not only `importDeclsIn`'s system-header skip:
+  `mapStdLibraryType` PRE-SEEDS `assignedStructNames`, so
+  `recordRustName` is never consulted for an STL type at all.
+  `std::pair<int,int>` still emits `PairI32I32` through the
+  pre-seeding path; every STL lit test stayed green; a probe mixing
+  `std::vector`/`std::pair`/`std::string` with a user `Box<T>` in one
+  TU byte-diffs clean. (6) **FR-40 item-graph arms** in `collectItems`
+  and `collectDependencies`, plus a correction to two stale
+  "the importer has no template machinery" comments in
+  `ItemColoring.cpp`, and the 5 new wordings mirrored into
+  `RejectionLedger.cpp` and `test/RealWorld/run_realworld.py`.
+  KNOWN GAPS, each landing on a PRE-EXISTING located rejection rather
+  than a new one: a member function template
+  (`call to unimported method`), a static data member of a class
+  template (`reference to an unknown variable`).
+  SPIN-OFF: the spike measured two silent miscompiles on unpatched
+  HEAD with no templates involved -- see **FR-108**, filed in the same
+  commit and ranked ahead of every remaining C++ wave.
+  Gates: full meson suite 693/693 (fast 495 + slow/EndToEnd 198), 0
+  failures, 0 OOM markers, binaries verified newer than the sources.
+  Cpp17Suite `total=28 transpiled=25 passed=25 miscompiled=0
+  unsupported=3` -- ratchets by exactly `01002.cpp`. CTestSuite
+  220/220/0/0 with the directory untouched in git. Cross-TU merge of a
+  shared header template still produces ONE `struct BoxI32` and
+  byte-identical output; `--emit=rust` md5-stable over 5 runs.
+  (test/Import/Cpp/class-templates.cpp, class-templates-invalid.cpp;
+  test/Project/item-graph-class-template.cpp;
+  test/EndToEnd/cpp-class-template.cpp;
+  test/Cpp17Suite/Inputs/01002.cpp; retired the `template.cpp` section
+  of test/Import/Cpp/methods-invalid.cpp)
 
 - [ ] W2.17 User-declared destructors -> `impl Drop`. RAII is the C++
   idiom the current subset most conspicuously lacks; Rust's Drop is a

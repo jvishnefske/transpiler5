@@ -166,6 +166,13 @@ static inline std::string enumVariantRustName(llvm::StringRef name) {
 /// file-scope records `CImporter::structSymbolName` layers the tag-versus-
 /// ordinary-namespace collision renaming on top, and block-scope records
 /// take the `<function>_<tag>` mangle in `importRecord`.
+/// W2.16: forward declaration only — the definition sits beside its
+/// `FunctionDecl` sibling below, next to the `templateArgTypeCode` table
+/// both overloads share, while its one caller (`recordRustName`) has to
+/// come first because the rest of this header's type-naming layer is
+/// built on it.
+static inline std::string templateArgSuffix(const clang::RecordDecl *record);
+
 static inline std::string recordRustName(const clang::RecordDecl *record) {
   llvm::StringRef name = record->getName();
   if (name.empty())
@@ -174,7 +181,19 @@ static inline std::string recordRustName(const clang::RecordDecl *record) {
       name = typedefName->getName();
   if (name.empty())
     return {};
-  return idiomaticRenameEnabled() ? toUpperCamelCase(name) : name.str();
+  // W2.16: a class-template specialization takes one `_<code>` suffix per
+  // template argument, and it goes on BEFORE the idiomatic rename — the
+  // OPPOSITE placement from W2.15's function side, where the suffix is
+  // appended to an already-snake_cased base. The ordering is load-bearing,
+  // not cosmetic: appended AFTER the rename, `Box<int>` would emit as
+  // `Box_i32`, which rustc's denied `non_camel_case_types` lint rejects
+  // outright; folded in first it becomes `BoxI32`, which is lint-clean and
+  // still injective per code. Everything downstream is free — the
+  // per-class method mangle reads the assigned struct name out of
+  // `CImporter::assignedStructNames`, so `Box_i32_get` -> `box_i32_get`
+  // falls out with no edit.
+  std::string spelled = name.str() + templateArgSuffix(record);
+  return idiomaticRenameEnabled() ? toUpperCamelCase(spelled) : spelled;
 }
 
 /// FR-73: joins a structural symbol prefix (the per-TU statics tag
@@ -352,6 +371,44 @@ templateArgSuffix(const clang::FunctionDecl *func) {
     return std::string();
   std::string suffix;
   for (const clang::TemplateArgument &arg : args->asArray()) {
+    suffix += "_";
+    suffix += arg.getKind() == clang::TemplateArgument::Type
+                  ? templateArgTypeCode(arg.getAsType())
+                  : std::string("x");
+  }
+  return suffix;
+}
+
+/// W2.16 template-argument suffix for a RECORD: `""` for an ordinary
+/// struct/class, and `"_" + code` per template argument, in
+/// template-parameter declaration order, for a class-template
+/// specialization. It reuses `templateArgTypeCode` VERBATIM rather than
+/// minting a second table, so `Box<int>` and `add<int>` code the same
+/// argument the same way.
+///
+/// It lives here, inside `recordRustName`'s reach, for the same
+/// load-bearing reason the function overload lives inside
+/// `cFunctionSymbolName`: all 8 name-RECOMPUTATION sites in the project
+/// (`structSymbolName`, the rejected-record wording,
+/// `importRecordUncached`, `emittedRecordName`, the two FR-42 recovery
+/// sites, the FR-40 item graph's `recordSymbolFor`, the coloring probe)
+/// reach a record's symbol through `recordRustName`. Suffixing at the
+/// struct_def emission site alone would leave every one of them naming an
+/// UNSUFFIXED type, and a local of type `Box<int>` would resolve to
+/// nothing.
+///
+/// A NON-type argument codes as the `x` fallback rather than asserting:
+/// this must stay a total function of the AST for the item graph's sake.
+/// The importer never emits such a symbol — non-type arguments and
+/// parameter packs are LOCATED rejections in
+/// `CImporter::importRecordUncached` before any struct_def is created.
+static inline std::string templateArgSuffix(const clang::RecordDecl *record) {
+  const auto *spec =
+      llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record);
+  if (!spec)
+    return std::string();
+  std::string suffix;
+  for (const clang::TemplateArgument &arg : spec->getTemplateArgs().asArray()) {
     suffix += "_";
     suffix += arg.getKind() == clang::TemplateArgument::Type
                   ? templateArgTypeCode(arg.getAsType())

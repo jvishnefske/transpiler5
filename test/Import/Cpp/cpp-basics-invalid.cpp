@@ -20,10 +20,12 @@
 // suffix scheme) is pinned in test/Import/Cpp/function-templates.cpp and
 // the surviving template frontier — explicit specializations, non-type
 // template arguments, parameter packs — in
-// test/Import/Cpp/function-templates-invalid.cpp. A template CLASS still
-// falls through the top-level decl dispatch to the generic wording
-// (W2.16), which stays pinned in test/Import/Cpp/methods-invalid.cpp's
-// TEMPLATE case.
+// test/Import/Cpp/function-templates-invalid.cpp. W2.16 then did the
+// same for a template CLASS — `template <typename T> struct Box` now
+// imports one struct per instantiation (`Box<int>` -> `Box_i32`), pinned
+// in test/Import/Cpp/class-templates.cpp, with its own surviving
+// frontier in test/Import/Cpp/class-templates-invalid.cpp. Neither
+// spelling reaches the generic top-level wording any more.
 //
 // Virtual methods and multiple/virtual inheritance
 // are deliberately NOT covered here: a method (virtual or not) on a class
