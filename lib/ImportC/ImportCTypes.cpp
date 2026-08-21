@@ -1174,6 +1174,18 @@ FailureOr<Type> CImporter::classifyPointerReturn(
         func->getReturnType().getCanonicalType()->getPointeeType(), loc);
     if (failed(mapped))
       return failure();
+    // FR-99: an allocator with a REACHABLE `return NULL` (a parameter
+    // validation, or a member-allocation failure arm) returns the record
+    // NULLABLY: `Option<S>`, spelled exactly as `famOptionMemberType` spells
+    // the FR-96 member-position one. Callers bind it through the Option temp
+    // and unwrap at the binding or at the recognized guard.
+    if (famNullableReturnFns.contains(canonical)) {
+      FailureOr<emitrust::OpaqueType> option = famOptionOfStruct(*mapped, loc);
+      if (failed(option))
+        return failure();
+      pointerReturnKinds.try_emplace(canonical, Type(*option));
+      return Type(*option);
+    }
     pointerReturnKinds.try_emplace(canonical, *mapped);
     return *mapped;
   }

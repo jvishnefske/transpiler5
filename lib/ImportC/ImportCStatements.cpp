@@ -1941,9 +1941,32 @@ LogicalResult CImporter::emitFamLocal(const clang::VarDecl *var,
   if (facts.initCall) {
     // `S *d = alloc_fn(...)`: the recognized allocator returns the record
     // BY VALUE; the binding is a plain move into the owned local.
+    const clang::FunctionDecl *callee = facts.initCall->getDirectCallee();
+    bool nullable =
+        callee && famNullableReturnFns.contains(callee->getCanonicalDecl());
     FailureOr<Value> value = emitCall(facts.initCall);
     if (failed(value))
       return failure();
+    if (nullable) {
+      // FR-99: a NULLABLE allocator hands back `Option<S>`. The result lands
+      // in a temp place (an SSA value cannot cross the guard's block edge),
+      // and the payload `unwrap` runs either right here (the unguarded bind)
+      // or in the recognized guard's continuation block (the guarded bind),
+      // so the temp is moved exactly once on every path.
+      FailureOr<emitrust::OpaqueType> optionType =
+          famOptionOfStruct(*structType, loc);
+      if (failed(optionType))
+        return failure();
+      if (!*value || (*value).getType() != Type(*optionType))
+        return emitError(loc)
+               << "unsupported: flexible-array record initializer";
+      Value temp = createVariablePlace(loc, Type(*optionType));
+      builder.create<emitrust::AssignOp>(loc, temp, *value);
+      famOptionTemps[var] = temp;
+      if (famNullableGuardedLocals.contains(var))
+        return success();
+      return emitFamNullableUnwrap(var, loc);
+    }
     if (!*value || (*value).getType() != *structType)
       return emitError(loc)
              << "unsupported: flexible-array record initializer";
@@ -1952,6 +1975,43 @@ LogicalResult CImporter::emitFamLocal(const clang::VarDecl *var,
   }
   return emitFamTailFill(place, pointee->getAsRecordDecl(), facts.countExpr,
                          loc);
+}
+
+LogicalResult CImporter::emitFamNullableUnwrap(const clang::VarDecl *var,
+                                               Location loc) {
+  auto temp = famOptionTemps.find(var);
+  Value place = symbols.lookup(var);
+  if (temp == famOptionTemps.end() || !place)
+    // Defensive; the binding installs both before any unwrap can run.
+    return emitError(loc) << "unsupported: flexible-array record initializer";
+  auto lvalue = llvm::dyn_cast<emitrust::LValueType>(place.getType());
+  if (!lvalue || !llvm::isa<emitrust::StructType>(lvalue.getValueType()))
+    return emitError(loc) << "unsupported: flexible-array record type";
+  Value payload = builder
+                      .create<emitrust::MethodCallOp>(
+                          loc, TypeRange{lvalue.getValueType()}, temp->second,
+                          builder.getStringAttr("unwrap"), ValueRange{})
+                      .getResult(0);
+  builder.create<emitrust::AssignOp>(loc, place, payload);
+  famOptionTemps.erase(var);
+  return success();
+}
+
+const clang::VarDecl *
+CImporter::famNullableBoundLocal(const clang::Expr *expr) {
+  const clang::Expr *e = stripTrivia(expr);
+  while (const clang::Expr *sub = peelPointerCast(astContext(), e))
+    e = stripTrivia(sub);
+  const clang::VarDecl *var = asLoadedLocalVarRef(e);
+  if (!var)
+    return nullptr;
+  auto it = famAllocLocals.find(var);
+  if (it == famAllocLocals.end() || !it->second.initCall)
+    return nullptr;
+  const clang::FunctionDecl *callee = it->second.initCall->getDirectCallee();
+  return callee && famNullableReturnFns.contains(callee->getCanonicalDecl())
+             ? var
+             : nullptr;
 }
 
 LogicalResult CImporter::emitFamTailFill(Value place,
@@ -3173,6 +3233,13 @@ LogicalResult CImporter::emitIfStmt(const clang::IfStmt *stmt) {
   }
 
   builder.setInsertionPointToEnd(contBlock);
+  // FR-99: the recognized guarded bind's DEFERRED payload unwrap lands in the
+  // guard's continuation — `p = <temp>.unwrap()` — so the `None` arm never
+  // touches the payload and the temp is moved exactly once.
+  if (const clang::VarDecl *bound = famNullableGuards.lookup(stmt))
+    if (famOptionTemps.contains(bound) &&
+        failed(emitFamNullableUnwrap(bound, loc)))
+      return failure();
   return success();
 }
 
@@ -4035,6 +4102,39 @@ LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
           llvm::cast<clang::DeclRefExpr>(fnExpr)->getDecl());
       value = emitFunctionPointerConstant(
           fnExpr, astContext().getPointerType(fn->getType()), loc);
+    } else if (isDataPointer(retValue->getType()) &&
+               currentFamOptionPayload) {
+      // FR-99: a NULLABLE owned FAM-record return. `planFamLift` pinned every
+      // return site to a claimed owned local or to a NULL; a NULL inside an
+      // elided malloc guard never reaches here at all, so every NULL that
+      // does is REACHABLE and emits the `None` literal, and every owned
+      // return moves the local out through `Some(...)`.
+      if (retValue->isNullPointerConstant(
+              astContext(), clang::Expr::NPC_NeverValueDependent) !=
+          clang::Expr::NPCK_NotNull) {
+        value = builder
+                    .create<emitrust::LiteralOp>(
+                        loc, currentReturnType, builder.getStringAttr("None"))
+                    .getResult();
+      } else {
+        const clang::Expr *peeled = stripTrivia(retValue);
+        while (const clang::Expr *sub = peelPointerCast(astContext(), peeled))
+          peeled = stripTrivia(sub);
+        const clang::VarDecl *owned = asLoadedLocalVarRef(peeled);
+        Value ownedPlace = owned ? symbols.lookup(owned) : Value();
+        if (!owned || !famAllocLocals.contains(owned) || !ownedPlace)
+          return emitError(loc) << "unsupported: returned pointer value";
+        Value moved = builder
+                          .create<emitrust::LoadOp>(
+                              loc, currentFamOptionPayload, ownedPlace)
+                          .getResult();
+        value = builder
+                    .create<emitrust::CallOpaqueOp>(
+                        loc, TypeRange{currentReturnType},
+                        builder.getStringAttr("Some"),
+                        /*args=*/ArrayAttr(), ValueRange{moved})
+                    .getResult(0);
+      }
     } else if (isDataPointer(retValue->getType()) &&
                llvm::isa<emitrust::StructType>(currentReturnType)) {
       // FR-94: an owned FAM-record return (`return d;` in a recognized

@@ -2301,9 +2301,14 @@ private:
   /// local's `if (!d) ...` null guards into `famElidedStmts`); (b) each
   /// pointer-to-admitted-record parameter whose every use is `free(param)`
   /// (into `famOwnedParams`); then, to a fixpoint, (c) functions whose every
-  /// return site yields a claimed local (or an elided-guard NULL), which lift
+  /// return site yields a claimed local (or a NULL), which lift
   /// to OWNED struct returns (`famOwnedReturnFns`), and (d) locals bound to
   /// calls of those allocators, which claim `FamAllocFacts` with `initCall`.
+  /// FR-99 splits (c): an allocator with a REACHABLE `return NULL` — one that
+  /// is not inside an elided malloc guard — additionally joins
+  /// `famNullableReturnFns` and lifts to an `Option<S>` return, and its
+  /// callers' null guards are recognized (`famNullableGuards`) instead of
+  /// elided.
   /// Runs alongside the other Pass-A planners, after `planVecLift`. Emits no
   /// diagnostic and never fails: an unclaimed shape keeps its historical
   /// located rejections.
@@ -2316,6 +2321,24 @@ private:
   /// struct-literal init), or the by-value call result for the owned-return
   /// form. Called from `emitLocalVar` when `famAllocLocals` holds `var`.
   LogicalResult emitFamLocal(const clang::VarDecl *var, Location loc);
+
+  /// FR-99: emits the deferred payload binding of a nullable-allocator-bound
+  /// local — `p = <temp>.unwrap()` — and retires the temp. Called at the
+  /// binding itself for an unguarded bind, and from `emitIfStmt`'s
+  /// continuation block for a recognized guarded bind. `unwrap()`'s panic on
+  /// `None` is the deterministic fail-loud refinement of C's
+  /// null-dereference undefined behaviour (the FR-88 precedent).
+  LogicalResult emitFamNullableUnwrap(const clang::VarDecl *var, Location loc);
+
+  /// FR-99: `expr` as the local it names when that local is bound to a
+  /// NULLABLE owned-FAM allocator call; null otherwise. Pointer casts and the
+  /// lvalue-to-rvalue conversion are peeled.
+  const clang::VarDecl *famNullableBoundLocal(const clang::Expr *expr);
+
+  /// FR-99: the `Option<S>` opaque of the admitted FAM record `structType`,
+  /// spelled exactly as `famOptionMemberType` spells the member-position one.
+  FailureOr<emitrust::OpaqueType> famOptionOfStruct(Type structType,
+                                                    Location loc);
 
   /// FR-94/96: binds `record`'s admitted FAM tail member of the struct
   /// place `place` to `vec![<zero>; count]` — the shared tail-initialization
@@ -3987,6 +4010,10 @@ private:
   /// spelling, already through `mangleMemberName`) is carried on the op so
   /// the emitter binds the declared local under its C name; synthesized
   /// temporaries pass nothing.
+  /// FR-99: the payload struct `S` of a nullable owned FAM return's
+  /// `Option<S>` signature, or a null Type when `func` has no such return.
+  Type famOptionReturnPayload(const clang::FunctionDecl *func, Type returnType);
+
   Value createVariablePlace(Location loc, Type type,
                             llvm::StringRef rustName = {},
                             mlir::Attribute init = {});
@@ -6095,6 +6122,38 @@ private:
   /// every return site yields a claimed owned-tail local — their signatures
   /// lift to OWNED struct returns (keyed by canonical decl).
   llvm::DenseSet<const clang::FunctionDecl *> famOwnedReturnFns;
+  /// FR-99: the subset of `famOwnedReturnFns` with at least one REACHABLE
+  /// `return NULL` — a leading parameter validation
+  /// (`heatshrink_encoder_alloc`, `heatshrink_decoder_alloc`) or the
+  /// free-then-NULL arm of a member allocation. Their signatures lift to
+  /// `!emitrust.opaque<"Option<S>">`: owned returns wrap `Some(...)`, the
+  /// reachable NULLs emit the `None` literal, and an ELIDED malloc-guard NULL
+  /// still emits nothing. Inserted ATOMICALLY with `famOwnedReturnFns` so a
+  /// caller's claim round (which gates on that set) never observes a stale
+  /// nullability — `famElidedStmts` is insert-only, so a wrong elision would
+  /// be unrecoverable inside the fixpoint.
+  llvm::DenseSet<const clang::FunctionDecl *> famNullableReturnFns;
+  /// FR-99: the recognized GUARDED BINDS — an `if (p == NULL) ...` / `if (!p)`
+  /// with no else/init/condition-variable that IMMEDIATELY follows the
+  /// declaration `S *p = f(...)` of a local bound to a nullable allocator,
+  /// and whose body never names `p`. Keyed by the guard, valued by the local.
+  /// Such a guard is NOT elided (its `None` is reachable — eliding it would
+  /// delete a live branch): it folds to the Option discriminant on the temp,
+  /// and the payload `unwrap` is deferred into its continuation block.
+  llvm::DenseMap<const clang::IfStmt *, const clang::VarDecl *>
+      famNullableGuards;
+  /// FR-99: the locals a `famNullableGuards` entry defers (the reverse index).
+  llvm::SmallPtrSet<const clang::VarDecl *, 4> famNullableGuardedLocals;
+  /// FR-99: the LIVE Option temp place of each nullable-allocator-bound local,
+  /// from its binding until the `unwrap` consumes it (immediately at an
+  /// unguarded bind, in the guard's continuation at a guarded one). A null
+  /// test while the temp is live folds to `is_none`/`is_some`; one after it is
+  /// a LOCATED rejection — never the statically-non-null constant fold (which
+  /// would silently delete the branch) and never a second move of the temp.
+  llvm::DenseMap<const clang::VarDecl *, Value> famOptionTemps;
+  /// FR-99: the payload struct of the current function's `Option<S>` owned
+  /// FAM return, or null when the current function has no such return.
+  Type currentFamOptionPayload;
   /// FR-94: pointer-to-admitted-FAM-record parameters whose every body use is
   /// `free(param)` — the free-only wrapper shape; they map OWNED BY VALUE
   /// (`ParamKind::OwnedRecord`) and their `free` is a no-op drop.

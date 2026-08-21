@@ -1230,6 +1230,28 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
                 ValueRange{})
             .getResult(0);
       }
+      // FR-99: a local bound to a NULLABLE owned-FAM allocator holds its
+      // result in an Option temp until the recognized guard resolves it, so
+      // its null test IS the Option discriminant (`is_none` for `==`,
+      // `is_some` for `!=`) — never the statically-non-null fold below, which
+      // would silently delete the guard. A test after the temp was unwrapped
+      // has no discriminant left to read and rejects.
+      if (const clang::VarDecl *bound = famNullableBoundLocal(pointerSide)) {
+        Value temp = famOptionTemps.lookup(bound);
+        if (!temp)
+          return emitError(loc)
+                 << "unsupported: null test of '"
+                 << canonicalStreamName(bound->getName())
+                 << "' outside its binding guard (a nullable "
+                    "flexible-array-record allocator result is unwrapped at "
+                    "the guard immediately following the binding)";
+        return builder
+            .create<emitrust::MethodCallOp>(
+                loc, TypeRange{builder.getI1Type()}, temp,
+                builder.getStringAttr(isEq ? "is_none" : "is_some"),
+                ValueRange{})
+            .getResult(0);
+      }
       // FR-96: a LIFTED member-held FAM field's null test is REAL — `None`
       // is the unallocated/freed state — so it must never reach the
       // statically-non-null fold below. Same let-bound Option discriminant

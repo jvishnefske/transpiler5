@@ -2095,6 +2095,24 @@ void CImporter::planFamLift(const clang::TranslationUnitDecl *unit) {
       // else): `vec!` is infallible (the FR-65 precedent), so the guard
       // body — typically `return NULL`, which has no owned-return
       // representation — is unreachable in the emitted crate.
+      // FR-99: the callee of a call-bound local's initializer when that
+      // callee is a NULLABLE allocator (a reachable `return NULL`). Such a
+      // local's guard must NOT be elided: the `None` is reachable, so
+      // deleting the branch would be a miscompile.
+      auto nullableInitCallee =
+          [&](const clang::VarDecl *var) -> const clang::FunctionDecl * {
+        auto it = famAllocLocals.find(var);
+        if (it == famAllocLocals.end() || !it->second.initCall)
+          return nullptr;
+        const clang::FunctionDecl *callee =
+            it->second.initCall->getDirectCallee();
+        if (!callee)
+          return nullptr;
+        const clang::FunctionDecl *canonicalCallee = callee->getCanonicalDecl();
+        return famNullableReturnFns.contains(canonicalCallee) ? canonicalCallee
+                                                              : nullptr;
+      };
+
       SmallVector<const clang::Stmt *, 4> elidedHere;
       std::function<void(const clang::Stmt *)> elideGuards =
           [&](const clang::Stmt *s) {
@@ -2106,6 +2124,10 @@ void CImporter::planFamLift(const clang::TranslationUnitDecl *unit) {
               const clang::VarDecl *guarded = nullptr;
               for (const auto &entry : famAllocLocals)
                 if (isNullTestOf(ifStmt->getCond(), entry.first)) {
+                  // FR-99: a nullable allocator's failure is REAL; its guard
+                  // stays a live branch on the Option discriminant.
+                  if (nullableInitCallee(entry.first))
+                    break;
                   guarded = entry.first;
                   break;
                 }
@@ -2120,6 +2142,60 @@ void CImporter::planFamLift(const clang::TranslationUnitDecl *unit) {
               elideGuards(child);
           };
       elideGuards(body);
+
+      // FR-99: the recognized GUARDED BIND — a declaration `S *p = f(...)` of
+      // a nullable-allocator-bound local followed IMMEDIATELY, in the same
+      // compound statement, by an else-less null test of `p` whose body never
+      // names `p`. Adjacency is what makes "exactly two call-site shapes"
+      // enforceable: the Option temp is moved by `unwrap` exactly once, in
+      // the guard's continuation, so nothing between the binding and the
+      // guard can read a payload the guard has not yet proved present. Any
+      // other null test of such a local is a located rejection at the test.
+      std::function<bool(const clang::Stmt *, const clang::VarDecl *)>
+          namesVar = [&](const clang::Stmt *s, const clang::VarDecl *var) {
+            if (!s)
+              return false;
+            if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(s))
+              if (ref->getDecl() == var)
+                return true;
+            for (const clang::Stmt *child : s->children())
+              if (namesVar(child, var))
+                return true;
+            return false;
+          };
+      std::function<void(const clang::Stmt *)> claimNullableGuards =
+          [&](const clang::Stmt *s) {
+            if (!s)
+              return;
+            if (const auto *comp = llvm::dyn_cast<clang::CompoundStmt>(s)) {
+              SmallVector<const clang::Stmt *, 16> kids(comp->body_begin(),
+                                                        comp->body_end());
+              for (size_t i = 0; i + 1 < kids.size(); ++i) {
+                const auto *ds = llvm::dyn_cast<clang::DeclStmt>(kids[i]);
+                if (!ds || !ds->isSingleDecl())
+                  continue;
+                const auto *var =
+                    llvm::dyn_cast<clang::VarDecl>(ds->getSingleDecl());
+                if (!var || !nullableInitCallee(var))
+                  continue;
+                const auto *ifStmt = llvm::dyn_cast<clang::IfStmt>(kids[i + 1]);
+                if (!ifStmt || ifStmt->getElse() || ifStmt->getInit() ||
+                    ifStmt->getConditionVariable())
+                  continue;
+                if (!isNullTestOf(ifStmt->getCond(), var))
+                  continue;
+                if (namesVar(ifStmt->getThen(), var))
+                  continue;
+                if (famNullableGuards.try_emplace(ifStmt, var).second) {
+                  famNullableGuardedLocals.insert(var);
+                  changed = true;
+                }
+              }
+            }
+            for (const clang::Stmt *child : s->children())
+              claimNullableGuards(child);
+          };
+      claimNullableGuards(body);
 
       // (c) Free-only wrapper parameters: every use of a
       // pointer-to-admitted-record parameter is `free(param)` or an
@@ -2231,6 +2307,7 @@ void CImporter::planFamLift(const clang::TranslationUnitDecl *unit) {
         SmallVector<const clang::ReturnStmt *> returns;
         collectReturnStmts(body, returns);
         bool sawOwned = false;
+        bool sawNullable = false;
         bool allPinned = !returns.empty();
         for (const clang::ReturnStmt *ret : returns) {
           const clang::Expr *value = ret->getRetValue();
@@ -2241,17 +2318,20 @@ void CImporter::planFamLift(const clang::TranslationUnitDecl *unit) {
           if (value->isNullPointerConstant(
                   ctx, clang::Expr::NPC_NeverValueDependent) !=
               clang::Expr::NPCK_NotNull) {
-            // A NULL return is admissible only inside an ELIDED guard
-            // (it never emits); anywhere else the function keeps its
-            // historical returned-pointer rejection.
+            // A NULL return inside an ELIDED malloc guard never emits.
+            // FR-99: ANY OTHER NULL return is REACHABLE — a leading
+            // parameter validation, or the free-then-NULL arm of a member
+            // allocation (heatshrink_encoder_alloc has both) — and lifts to
+            // the `None` of an Option-typed owned return. The rest of the
+            // classification is untouched: every non-NULL return must still
+            // be a claimed owned local, and at least one must be, so an
+            // all-NULL function is still not an allocator.
             bool insideElided =
                 llvm::any_of(elidedHere, [&](const clang::Stmt *s) {
                   return stmtContains(s, ret);
                 });
-            if (!insideElided) {
-              allPinned = false;
-              break;
-            }
+            if (!insideElided)
+              sawNullable = true;
             continue;
           }
           const clang::VarDecl *returned = asLoadedLocalVarRef(value);
@@ -2263,6 +2343,12 @@ void CImporter::planFamLift(const clang::TranslationUnitDecl *unit) {
         }
         if (allPinned && sawOwned) {
           famOwnedReturnFns.insert(canonical);
+          // FR-99: nullability is inserted ATOMICALLY with the owned-return
+          // claim — a caller's local can only be claimed in a round where the
+          // callee is already in `famOwnedReturnFns`, so `elideGuards` never
+          // sees a callee whose nullability is still unknown.
+          if (sawNullable)
+            famNullableReturnFns.insert(canonical);
           changed = true;
         }
       }

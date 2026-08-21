@@ -134,6 +134,8 @@ void CImporter::resetPerFunctionState() {
   currentOwnerIndexReturn = false;
   currentCxxThisRef = Value();
   currentReturnType = Type();
+  currentFamOptionPayload = Type(); // FR-99
+  famOptionTemps.clear();
   currentErasedReturnBase = nullptr;
   currentFuncName.clear();
   currentIsMain = false;
