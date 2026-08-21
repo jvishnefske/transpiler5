@@ -56,6 +56,7 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclTemplate.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/OperationKinds.h"
@@ -1098,6 +1099,36 @@ bool mutatesVar(const clang::Stmt *stmt, const clang::VarDecl *var);
 /// shared with the local/global/parameter/expression admission checks.
 const clang::CXXDestructorDecl *userDeclaredDestructor(clang::ASTContext &context,
                                                        clang::QualType type);
+
+/// W2.18: peels the implicit derived-to-base conversion clang wraps around
+/// the receiver of an INHERITED access, appending one entry to `hops` per
+/// base traversed and returning the innermost expression (the derived-class
+/// place-yielding expression, typically a `CXXThisExpr` or a `DeclRefExpr`).
+///
+/// Two AST details this exists to encapsulate, both measured with
+/// `-Xclang -ast-dump`. (1) A multi-level chain is ONE `ImplicitCastExpr`
+/// carrying a MULTI-ENTRY `CastExpr::path()`, derived-most first -- not a
+/// stack of casts -- so the path must be walked rather than the cast
+/// counted. (2) A QUALIFIED inherited call (`Base::get()`) inserts an extra
+/// `CK_NoOp` cast above the derived-to-base one, so `CK_NoOp` is
+/// transparent here. Everything else terminates the peel: this must never
+/// swallow an lvalue-to-rvalue conversion or any other cast whose meaning
+/// the caller has to honour.
+///
+/// With the base modelled as an ordinary FIRST field named `base`, each hop
+/// is exactly one `emitrust.member ["base"]` projection; see
+/// `CImporter::projectBaseHops`. Defined in ImportCAggregates.cpp.
+const clang::Expr *
+peelDerivedToBaseCasts(const clang::Expr *expr,
+                       llvm::SmallVectorImpl<clang::QualType> &hops);
+
+/// Whether `record` is a class whose SINGLE base W2.18 admits as a `base`
+/// first field. False for a record with no bases, and for every shape the
+/// wave leaves rejected (multiple, virtual, non-public, undefined,
+/// template-specialization, or destructor-carrying bases). Shared with
+/// FR-41's admissibility probe so the coloring can never call a class the
+/// importer admits Red. Defined in ImportCAggregates.cpp.
+bool admitsSingleBaseAsField(const clang::CXXRecordDecl *record);
 
 class PointerRegionAnalysis {
 public:
@@ -5497,6 +5528,16 @@ private:
   /// reaching a non-`const` callee long before the importer runs, so no
   /// `addr_of mut` of a shared-ref-derived place can ever be built.
   FailureOr<Value> emitCxxThisPlace(Location loc);
+
+  /// W2.18: refines the derived-class place `place` into the base
+  /// subobject named by `hops` (as produced by `peelDerivedToBaseCasts`),
+  /// one `emitrust.member ["base"]` per hop, derived-most first. An EMPTY
+  /// base carries no field at all (see `collectRecordFields`), so an access
+  /// routed through one is a located rejection rather than a projection
+  /// onto a field that does not exist.
+  FailureOr<Value> projectBaseHops(Value place,
+                                   llvm::ArrayRef<clang::QualType> hops,
+                                   Location loc);
 
   /// Reads the current value of a place produced by `emitLValue`.
   Value loadPlace(Location loc, Value place);

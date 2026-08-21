@@ -8,14 +8,23 @@
 // part of the ENCLOSING RECORD instead — which is a node, and which is exactly
 // the item that will not be emitted because of it.
 //
-// The four are the four unconditional rejections
-// `CImporter::collectRecordFields` raises before it collects a single field:
-// base classes, user-declared destructors, virtual methods, and overloaded
-// operators. The fifth, a reference type, is `CImporter::mapType`'s and is
-// signature-level, so it costs its callers Red rather than Yellow. Since
-// FR-48 that fifth screen is POSITION-dependent: a reference RETURN is still
-// screened, a reference PARAMETER is not (it imports as `&T`/`&mut T`), and
-// both halves are pinned below.
+// The four are the four rejections `CImporter::collectRecordFields` raises
+// before it collects a single field: base classes, user-declared
+// destructors, virtual methods, and overloaded operators. The fifth, a
+// reference type, is `CImporter::mapType`'s and is signature-level, so it
+// costs its callers Red rather than Yellow.
+//
+// Three of those five screens are now POSITION- or SHAPE-dependent rather
+// than unconditional, and BOTH halves of each are pinned below, because
+// screening a construct the importer SUPPORTS is this probe's unsafe
+// direction: it colors a portable item Red and drags every caller down with
+// it, with no diagnostic and no later stage that could recover it (see
+// test/Project/search-false-red.cpp). Since FR-48 a reference RETURN is
+// screened and a reference PARAMETER is not. Since W2.17 a destructor that
+// is non-virtual and DEFINED in this translation unit is admitted (it
+// becomes `impl Drop`) and only the residual shapes are screened. Since
+// W2.18 a SINGLE public non-virtual base is admitted (as an ordinary first
+// field) and only the shapes with no such image are screened.
 // RUN: emitrust-cc --emit=coloring %s -o - | FileCheck %s
 
 /// Green: a plain data record is the same item whether it is spelled `struct`
@@ -26,9 +35,24 @@ public:
   int v;
 };
 
-/// `unsupported: base classes are not supported` — importing only the derived
-/// class's own fields would silently lose the inherited data.
-class Derived : public Plain {
+/// `unsupported: base classes are not supported`. W2.18 MOVED this pin
+/// forward rather than loosening it: the plain `class Derived : public
+/// Plain` this used to spell is now ADMITTED (the base becomes a first
+/// field named `base`), so the residual the screen must still catch is a
+/// VIRTUAL base -- one shared subobject reached from several derived paths,
+/// which a by-value field cannot represent.
+class Derived : public virtual Plain {
+public:
+  int extra;
+};
+
+/// Green, and the reason the screen above had to be narrowed in lockstep
+/// with the importer: a single public NON-VIRTUAL base over a data-only
+/// class imports as `struct Flat { base: Plain, extra: i32 }` with every
+/// inherited access flattened through the field (pinned in
+/// test/Import/Cpp/inheritance.cpp). Colouring it Red would be a FALSE RED
+/// -- unrecoverable, and strictly worse than not searching at all.
+class Flat : public Plain {
 public:
   int extra;
 };
@@ -40,7 +64,12 @@ public:
   int side;
 };
 
-/// `unsupported: user-declared destructor` — no drop semantics are modeled.
+/// `unsupported: destructor with no definition in this translation unit`.
+/// W2.17 admits a non-virtual destructor DEFINED in this TU (it becomes
+/// `impl Drop`), so the screen is narrowed to the residual shapes; this one
+/// is body-less, which stays out because an uncalled, undefined method is
+/// silently dropped from emission and the `impl Drop` -- and every side
+/// effect in it -- would vanish with it.
 class Owned {
 public:
   ~Owned();
@@ -84,6 +113,7 @@ int main() { return calls_by_ref() + calls_uses_owned(); }
 
 // CHECK:      item Derived kind=record color=red reason=inadmissible construct=base-class
 // CHECK-NEXT: item Eq kind=record color=red reason=inadmissible construct=overloaded-operator
+// CHECK-NEXT: item Flat kind=record color=green reason=admissible
 // CHECK-NEXT: item Owned kind=record color=red reason=inadmissible construct=destructor
 // CHECK-NEXT: item Plain kind=record color=green reason=admissible
 // CHECK-NEXT: item Virt kind=record color=red reason=inadmissible construct=virtual-method
@@ -97,5 +127,5 @@ int main() { return calls_by_ref() + calls_uses_owned(); }
 // CHECK-NEXT: item calls_uses_owned kind=function color=yellow reason=stub-callee via=uses_owned edge=Calls chain=calls_uses_owned->uses_owned->Owned construct=destructor
 // CHECK-NEXT: item uses_owned kind=function color=red reason=red-type via=Owned edge=BodyType chain=uses_owned->Owned construct=destructor
 // CHECK-NEXT: item uses_virt kind=function color=red reason=red-type via=Virt edge=SigType chain=uses_virt->Virt construct=virtual-method
-// CHECK-NEXT: tally green=2 yellow=2 red=8
+// CHECK-NEXT: tally green=3 yellow=2 red=8
 // CHECK-NOT:  item

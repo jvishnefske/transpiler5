@@ -659,6 +659,70 @@ userDeclaredDestructor(clang::ASTContext &context, clang::QualType type) {
   return record->getDestructor();
 }
 
+/// Declared in CImporterInternal.h: shared with FR-41's admissibility probe
+/// (lib/Project/ItemColoring.cpp), which must screen exactly the shapes this
+/// answers false for -- screening one it admits would color a portable class
+/// Red and drag every caller down with it.
+bool admitsSingleBaseAsField(const clang::CXXRecordDecl *record) {
+  // Exactly ONE base. Multiple inheritance has no single-field image at
+  // all: two bases would need two fields, and the `base` name (and every
+  // inherited access through it) stops being unambiguous.
+  if (record->getNumBases() != 1)
+    return false;
+  const clang::CXXBaseSpecifier &base = *record->bases_begin();
+  // A VIRTUAL base is shared between several derived paths, which a
+  // by-value field cannot represent (each path would get its own copy).
+  if (base.isVirtual())
+    return false;
+  // PRIVATE/PROTECTED inheritance is "implemented in terms of": the base's
+  // members are not part of the derived interface, but a plain `base` field
+  // makes them reachable from anywhere in the crate. Out of subset until
+  // the emitted field's visibility is modelled.
+  if (base.getAccessSpecifier() != clang::AS_public)
+    return false;
+  const clang::CXXRecordDecl *baseRecord = base.getType()->getAsCXXRecordDecl();
+  if (!baseRecord || !baseRecord->hasDefinition())
+    return false;
+  // W2.16 monomorphizes a class template at its point of use; a
+  // specialization reached only as a BASE has never been exercised through
+  // that ordering, so it stays out rather than being guessed at.
+  if (llvm::isa<clang::ClassTemplateSpecializationDecl>(baseRecord))
+    return false;
+  return true;
+}
+
+/// Declared in CImporterInternal.h.
+const clang::Expr *
+peelDerivedToBaseCasts(const clang::Expr *expr,
+                       llvm::SmallVectorImpl<clang::QualType> &hops) {
+  const clang::Expr *e = expr;
+  for (;;) {
+    e = e->IgnoreParens();
+    const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e);
+    if (!cast)
+      return e;
+    clang::CastKind kind = cast->getCastKind();
+    if (kind == clang::CK_DerivedToBase ||
+        kind == clang::CK_UncheckedDerivedToBase) {
+      // ONE cast node, one path entry per base traversed, derived-most
+      // first: `C -> A` through `B` is a single cast whose path is
+      // `(B -> A)`. Appending the path in order therefore appends the hops
+      // in projection order (`self.base.base`).
+      for (const clang::CXXBaseSpecifier *hop : cast->path())
+        hops.push_back(hop->getType());
+      e = cast->getSubExpr();
+      continue;
+    }
+    // A qualified inherited call (`Base::get()`) inserts a `CK_NoOp` above
+    // the derived-to-base cast; it changes nothing about the place.
+    if (kind == clang::CK_NoOp) {
+      e = cast->getSubExpr();
+      continue;
+    }
+    return e;
+  }
+}
+
 LogicalResult CImporter::collectRecordFields(
     const clang::RecordDecl *record,
     SmallVectorImpl<llvm::StringRef> &fieldNames,
@@ -675,6 +739,7 @@ LogicalResult CImporter::collectRecordFields(
   // simply lists none, and imports exactly like a C struct either way.
   if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(record)) {
     for (const clang::CXXBaseSpecifier &base : cxxRecord->bases()) {
+      Location baseLoc = translateLoc(base.getBeginLoc());
       // The one exemption: an EMPTY base of a STD-NAMESPACE record.
       // libstdc++ 15 makes `std::pair` derive from `__pair_base`, an
       // ABI-control tag with no data members whatsoever — skipping it
@@ -688,8 +753,50 @@ LogicalResult CImporter::collectRecordFields(
       if (cxxRecord->isInStdNamespace() && baseRecord &&
           baseRecord->hasDefinition() && baseRecord->isEmpty())
         continue;
-      return emitError(translateLoc(base.getBeginLoc()))
-             << "unsupported: base classes are not supported";
+      // W2.18 NARROWS the W2.0 rejection above rather than removing it.
+      // Rust has no inheritance, so the ONE image that loses no inherited
+      // data is the base as an ordinary FIRST field named `base`, with
+      // every inherited access flattened through it (`self.base.x`,
+      // `self.base.base_get()`, and `self.base.base` for a two-level
+      // chain). It is PREPENDED, before the `fields()` walk below, for two
+      // reasons: the C++ object's own layout puts the base subobject
+      // first, and `appendField`'s duplicate-final-name guard only catches
+      // a derived member literally spelled `base` if the synthesized field
+      // is already in the list. Everything outside the measured
+      // byte-diff-clean subset keeps the W2.0 wording.
+      if (!admitsSingleBaseAsField(cxxRecord)) {
+        return emitError(baseLoc)
+               << "unsupported: base classes are not supported";
+      }
+      // A base with a user-declared destructor is a MEASURED miscompile
+      // channel, exactly like the destructor-carrying MEMBER W2.17 rejects
+      // below: the derived class does not answer `hasUserDeclaredDestructor`
+      // for an INHERITED destructor, so none of W2.17's use-site drop gates
+      // (`checkDropLocalScope`, by-value, array, global) would fire for
+      // `Derived d;`, and the emitted struct keeps a `Copy` derive it must
+      // not have (measured: rustc E0204 on the emitted crate).
+      if (userDeclaredDestructor(astContext(), base.getType()))
+        return emitError(baseLoc)
+               << "unsupported: base class with a destructor";
+      // An EMPTY base carries no inherited DATA, so the data-loss
+      // rationale does not apply and a synthesized field would be pure
+      // invention: the `[u8; 1]` placeholder a field-less record maps to
+      // is not the C++ object (which applies the empty-base optimization
+      // and adds no storage at all). Skipped exactly like the
+      // std-namespace tag base above; an inherited METHOD reached through
+      // such a base has no `base` field to project through and is a
+      // located rejection in `projectBaseHops`.
+      if (baseRecord->isEmpty())
+        continue;
+      // `mapType` on the base's record type is what imports the base class
+      // (and lands its `struct_def` ahead of this one); a rejection inside
+      // it — a virtual method on the base, say — surfaces with the base's
+      // own located diagnostic rather than this one.
+      FailureOr<Type> baseType = mapType(base.getType(), baseLoc);
+      if (failed(baseType))
+        return failure();
+      fieldNames.push_back("base");
+      fieldTypes.push_back(*baseType);
     }
     // W2.2: a user-declared destructor (no drop semantics modeled), a
     // virtual method (no vtable/dynamic dispatch), or an overloaded

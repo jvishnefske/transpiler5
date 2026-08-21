@@ -2667,6 +2667,23 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   // unimported method".
   if (method->getParent()->isInStdNamespace())
     return emitStlMemberCall(call);
+  // W2.18: the implicit object argument of an INHERITED call is wrapped in
+  // an implicit derived-to-base conversion, which is NOT a
+  // qualification-only adjustment -- it names a different object (the base
+  // subobject). The hops are peeled here, ahead of the imported-method
+  // lookup, so that an access through an EMPTY base (which carries no
+  // `base` field at all, see `collectRecordFields`) reports the real
+  // blocker instead of the lookup's consequential "call to unimported
+  // method" wording.
+  llvm::SmallVector<clang::QualType, 2> baseHops;
+  const clang::Expr *receiverExprPeeled =
+      peelDerivedToBaseCasts(call->getImplicitObjectArgument(), baseHops);
+  for (clang::QualType hop : baseHops) {
+    const clang::CXXRecordDecl *hopRecord = hop->getAsCXXRecordDecl();
+    if (hopRecord && hopRecord->hasDefinition() && hopRecord->isEmpty())
+      return emitError(loc)
+             << "unsupported: inherited member of an empty base class";
+  }
   std::string name = cxxMethodMangledName(method);
   func::FuncOp target = functions.lookup(name);
   if (!target)
@@ -2680,8 +2697,14 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   // qualification-adjustment cast (e.g. adding `const` to bind a non-const
   // object to a const method's implicit `const Counter&` parameter); the
   // place-yielding expression underneath is unaffected by qualifiers.
-  FailureOr<Value> receiver = emitLValue(
-      call->getImplicitObjectArgument()->IgnoreParenImpCasts());
+  //
+  // The derived-to-base hops peeled above are replayed as explicit
+  // `member ["base"]` projections below: `IgnoreParenImpCasts` strips that
+  // conversion SILENTLY, so before W2.18 an inherited call would have
+  // borrowed the DERIVED place and handed it to the base method's `&Base`
+  // parameter.
+  FailureOr<Value> receiver =
+      emitLValue(receiverExprPeeled->IgnoreParenImpCasts());
   if (failed(receiver))
     return failure();
   auto receiverLValueType =
@@ -2690,6 +2713,12 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
       !llvm::isa<emitrust::StructType>(receiverLValueType.getValueType()))
     return emitError(loc)
            << "unsupported: member call receiver is not a struct place";
+  if (!baseHops.empty()) {
+    FailureOr<Value> baseReceiver = projectBaseHops(*receiver, baseHops, loc);
+    if (failed(baseReceiver))
+      return failure();
+    receiver = baseReceiver;
+  }
 
   Value addrOf = builder
                      .create<emitrust::AddrOfOp>(loc, targetType.getInput(0),

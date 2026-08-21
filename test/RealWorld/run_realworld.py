@@ -342,6 +342,18 @@ _AMBIGUOUS_POINTER = ("pointer assigned a non-address value", "with no known tar
 # them -- the C corpus's tabulation is unchanged by this table's existence.
 _CXX_BLOCKER_SUBSTRINGS = [
     ("base classes are not supported", "cxx-inheritance"),
+    # W2.18 admitted the SINGLE public non-virtual base as an ordinary first
+    # field; the wording above is retained for the residual shapes (multiple,
+    # virtual and non-public inheritance, an undefined or template-
+    # specialization base). The wordings below are the measured miscompile
+    # channels around the admitted subset, each with its own tag.
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("base class with a destructor", "cxx-drop-base"),
+    ("inherited member of an empty base class", "cxx-inheritance-empty-base"),
+    ("constructor of an empty base class", "cxx-inheritance-empty-base"),
+    ("inherited member through a pointer to a derived class", "cxx-inheritance-upcast"),
+    ("inherited access through a non-struct place", "cxx-inheritance"),
+    ("base constructor initializer", "cxx-inheritance"),
     # W2.17 admitted the non-virtual, same-TU-defined destructor; the generic
     # wording is retained for the residual (union) shape, and every measured
     # miscompile channel around the admitted subset gets its own tag.

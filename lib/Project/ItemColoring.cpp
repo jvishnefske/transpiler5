@@ -530,6 +530,57 @@ void AdmissibilityProbe::probeFunction(const clang::FunctionDecl *func) {
     });
 }
 
+/// W2.18: whether the SINGLE base of `record` is one the importer admits as
+/// an ordinary first field named `base`. Mirrors
+/// `admitsSingleBaseAsField` in lib/ImportC/ImportCAggregates.cpp, which is
+/// the source of truth; that function lives behind the importer's private
+/// header, so the rule is restated here rather than shared. The two must
+/// move together: a shape the importer admits but this screens is a FALSE
+/// RED, the one direction FR-41 may not get wrong.
+static bool admitsSingleBaseAsField(const clang::CXXRecordDecl *record) {
+  if (record->getNumBases() != 1)
+    return false;
+  const clang::CXXBaseSpecifier &base = *record->bases_begin();
+  if (base.isVirtual() || base.getAccessSpecifier() != clang::AS_public)
+    return false;
+  const clang::CXXRecordDecl *baseRecord = base.getType()->getAsCXXRecordDecl();
+  if (!baseRecord || !baseRecord->hasDefinition())
+    return false;
+  if (llvm::isa<clang::ClassTemplateSpecializationDecl>(baseRecord))
+    return false;
+  // A base carrying a destructor is a separate importer rejection
+  // (`unsupported: base class with a destructor`), so it is screened here
+  // too -- under the base-class tag, because a base class is what makes the
+  // shape unrepresentable.
+  if (baseRecord->hasUserDeclaredDestructor())
+    return false;
+  return true;
+}
+
+/// W2.17: whether a user-declared destructor is one the importer turns into
+/// `impl Drop`. Mirrors the CLASS-LEVEL disqualifiers in
+/// `CImporter::collectRecordFields`; the wave's USE-SITE gates (a
+/// destructor-carrying member, array, global, by-value parameter or return,
+/// or an unmodelled scope) are raised where the OBJECT is declared and have
+/// no record-level screen at all, so they are not restated here.
+static bool admitsDestructorAsDrop(const clang::CXXRecordDecl *record,
+                                   const clang::CXXMethodDecl *destructor) {
+  if (destructor->isVirtual() || record->isUnion())
+    return false;
+  // An uncalled, undefined method is silently dropped from emission, so a
+  // body-less destructor would emit no `impl Drop` at all.
+  if (!destructor->hasBody())
+    return false;
+  // The destructor's module symbol is `<Struct>_dtor`; a member function
+  // literally spelled `dtor` collides with it.
+  for (const clang::CXXMethodDecl *other : record->methods())
+    if (!other->isImplicit() && !other->isDeleted() &&
+        !llvm::isa<clang::CXXDestructorDecl>(other) &&
+        other->getDeclName().isIdentifier() && other->getName() == "dtor")
+      return false;
+  return true;
+}
+
 void AdmissibilityProbe::probeRecord(const clang::RecordDecl *record,
                                      llvm::StringRef symbol) {
   // A record is never stub-replaceable — a rejected record is DROPPED, not
@@ -540,18 +591,25 @@ void AdmissibilityProbe::probeRecord(const clang::RecordDecl *record,
     return;
   }
   if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(record)) {
-    // The four C++ record rejections `CImporter::collectRecordFields` raises
-    // unconditionally, before any field of the class is collected. Every
-    // member is checked (rather than stopping at the first) so that the tag
-    // kept is the smallest of the set, not the first in declaration order.
-    if (cxxRecord->getNumBases() > 0)
+    // The C++ record rejections `CImporter::collectRecordFields` raises
+    // before any field of the class is collected. Every member is checked
+    // (rather than stopping at the first) so that the tag kept is the
+    // smallest of the set, not the first in declaration order.
+    //
+    // Both record-level screens below are NARROWER than they were, and
+    // deliberately so: screening a construct the importer SUPPORTS is this
+    // probe's unsafe direction -- it colors a portable item Red and drags
+    // every caller down with it, with no diagnostic and no later stage that
+    // could recover it (see test/Project/search-false-red.cpp).
+    if (cxxRecord->getNumBases() > 0 && !admitsSingleBaseAsField(cxxRecord))
       verdicts.reject(symbol, tag::BaseClass, /*signatureLevel=*/false);
     for (const clang::CXXMethodDecl *method : cxxRecord->methods()) {
       // Compiler-synthesized special members carry none of these shapes and
       // never surface a diagnostic in the importer either.
       if (method->isImplicit() || method->isDeleted())
         continue;
-      if (llvm::isa<clang::CXXDestructorDecl>(method))
+      if (llvm::isa<clang::CXXDestructorDecl>(method) &&
+          !admitsDestructorAsDrop(cxxRecord, method))
         verdicts.reject(symbol, tag::Destructor, /*signatureLevel=*/false);
       if (method->isVirtual())
         verdicts.reject(symbol, tag::VirtualMethod, /*signatureLevel=*/false);

@@ -5975,8 +5975,72 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
 }
 
 FailureOr<Value>
+CImporter::projectBaseHops(Value place, llvm::ArrayRef<clang::QualType> hops,
+                           Location loc) {
+  for (clang::QualType hop : hops) {
+    auto placeType = llvm::dyn_cast<emitrust::LValueType>(place.getType());
+    if (!placeType ||
+        !llvm::isa<emitrust::StructType>(placeType.getValueType()))
+      return emitError(loc)
+             << "unsupported: inherited access through a non-struct place";
+    // An empty base contributes NO field (see `collectRecordFields`), so
+    // there is nothing to project through. Rejected here rather than
+    // emitting `self.base` against a struct that has no such field, which
+    // would be a rustc E0609 in the generated crate instead of a located
+    // diagnostic.
+    const clang::CXXRecordDecl *hopRecord = hop->getAsCXXRecordDecl();
+    if (hopRecord && hopRecord->hasDefinition() && hopRecord->isEmpty())
+      return emitError(loc)
+             << "unsupported: inherited member of an empty base class";
+    FailureOr<Type> hopType = mapType(hop, loc);
+    if (failed(hopType))
+      return failure();
+    place = builder
+                .create<emitrust::MemberOp>(
+                    loc, emitrust::LValueType::get(*hopType), place,
+                    builder.getStringAttr("base"))
+                .getResult();
+  }
+  return place;
+}
+
+FailureOr<Value>
 CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
                                GlobalWriteback *writeback) {
+  // W2.18: an INHERITED field access (`x` / `this->x` inside a derived
+  // method, `d.x` on a derived object) reaches here with clang's implicit
+  // derived-to-base conversion wrapped around the member's base
+  // expression. The base is an ordinary first field, so the access is the
+  // derived place refined by one `member ["base"]` per hop -- and the peel
+  // must happen HERE, ahead of every other dispatch below, because
+  // `member->isArrow()` is true for the `this`-rooted spelling (the cast's
+  // type is `Base *`) and the arrow path would otherwise hand the cast to
+  // `emitRValue`, which rejects it as `unsupported cast
+  // (UncheckedDerivedToBase)`.
+  {
+    llvm::SmallVector<clang::QualType, 2> hops;
+    const clang::Expr *inner = peelDerivedToBaseCasts(member->getBase(), hops);
+    if (!hops.empty()) {
+      // Two receiver spellings are in subset: the implicit/explicit `this`
+      // of a derived method (arrow, because the cast produced a pointer),
+      // and a derived OBJECT place (`d.x`, non-arrow). An upcast reached
+      // through a real pointer variable (`p->x` for `Derived *p`) is NOT
+      // peeled: it keeps the pre-existing pointer-path rejection rather
+      // than silently borrowing the pointer's own place as a struct.
+      FailureOr<Value> place = failure();
+      if (llvm::isa<clang::CXXThisExpr>(inner))
+        place = emitCxxThisPlace(loc);
+      else if (!member->isArrow())
+        place = emitLValue(inner, writeback);
+      else
+        return emitError(loc)
+               << "unsupported: inherited member through a pointer to a "
+                  "derived class";
+      if (failed(place))
+        return failure();
+      return projectBaseHops(*place, hops, loc);
+    }
+  }
   // FR-96: `->` through a LIFTED member-held FAM field — directly
   // (`hse->search_index->size`) or through a recognized member-read local
   // (`hsi->index[i]` after `hsi = hse->search_index`) — resolves to a

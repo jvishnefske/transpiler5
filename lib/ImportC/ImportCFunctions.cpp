@@ -950,6 +950,57 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
     for (auto [index, param] : llvm::enumerate(func->parameters()))
       rawCtorParamArgs[param] = entryBlock->getArgument(1 + index);
     for (const clang::CXXCtorInitializer *init : ctorDecl->inits()) {
+      // W2.18: a BASE initializer (`Derived(int a, int b) : Base(a), y(b)`)
+      // is a `CXXCtorInitializer` with `isBaseInitializer()`, not a field
+      // one, and its child is a `CXXConstructExpr` for the base's
+      // constructor. With the base as a first field it is exactly a
+      // constructor call against `self.base`, which is what
+      // `emitCXXConstructInit` already builds (`addr_of mut` + a
+      // `emitrust.method_call`-tagged `func.call`). Deliberately NOT routed
+      // through `emitRValue` like a field initializer: measured, that path
+      // rejects any class-typed initializer as `unsupported: constructor in
+      // value position`.
+      if (init->isBaseInitializer()) {
+        Location baseLoc = translateLoc(init->getSourceLocation());
+        const auto *baseConstruct =
+            llvm::dyn_cast<clang::CXXConstructExpr>(init->getInit());
+        if (!baseConstruct)
+          return emitError(baseLoc)
+                 << "unsupported: base constructor initializer";
+        const clang::CXXRecordDecl *baseRecord =
+            init->getBaseClass()->getAsCXXRecordDecl();
+        if (baseRecord && baseRecord->hasDefinition() && baseRecord->isEmpty()) {
+          // An EMPTY base has no `base` field to construct into (see
+          // `collectRecordFields`). A TRIVIAL construction of it has no
+          // observable effect, so there is nothing to emit; a user-provided
+          // constructor body would be silently DROPPED, so it rejects.
+          const clang::CXXConstructorDecl *baseCtor =
+              baseConstruct->getConstructor();
+          if (baseCtor && baseCtor->isTrivial())
+            continue;
+          return emitError(baseLoc)
+                 << "unsupported: constructor of an empty base class";
+        }
+        FailureOr<Type> baseFieldType =
+            mapType(init->getBaseClass()->getCanonicalTypeInternal(), baseLoc);
+        if (failed(baseFieldType))
+          return failure();
+        Value baseSelfPlace =
+            builder
+                .create<emitrust::DerefOp>(
+                    baseLoc, emitrust::LValueType::get(cxxOwnerStructType),
+                    currentCxxThisRef)
+                .getResult();
+        Value basePlace =
+            builder
+                .create<emitrust::MemberOp>(
+                    baseLoc, emitrust::LValueType::get(*baseFieldType),
+                    baseSelfPlace, builder.getStringAttr("base"))
+                .getResult();
+        if (failed(emitCXXConstructInit(basePlace, baseConstruct, baseLoc)))
+          return failure();
+        continue;
+      }
       if (!init->isMemberInitializer())
         return emitError(loc)
                << "unsupported: non-member constructor initializer";
