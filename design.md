@@ -6456,8 +6456,33 @@ piece and becomes FR-45.
   pins for the write-then-break shape keeping `let` + the
   unconditional-write shape + a corpus BUILD sweep added to the
   probe loop as a standing oracle + full lit 100%.
-  **NOT SPIKED** — root cause is measured and located; the fix
-  and its blast radius are not.
+  BLAST RADIUS — argued down from "unknown" to "provably ~0", and
+  the argument is worth stating because it inverts the risk
+  assessment above. The worry was symmetric: `unused_mut` is
+  denied, so ADDING `mut` where it is not needed is as hard an
+  error as omitting it. But consider what the corrected predicate
+  actually changes. It adds `mut` exactly where a body path
+  writes the binding AND reaches the back edge. For any such
+  binding, rustc ALREADY sees a possible second assignment and
+  ALREADY rejects with E0384 — rustc does not prove loops run
+  once. So every case the fix newly marks is a case that does not
+  compile TODAY; the fix cannot take a currently-building crate
+  and break it. The write-then-`break` shape, which is the one
+  that legitimately keeps `let`, is excluded by the "reaches the
+  back edge" clause — and rustc accepts it for the same reason
+  (the back edge is unreachable from the write). The two analyses
+  agree at both ends.
+  Corroborating measurement: the entire suite contains only SEVEN
+  deferred-binding pins (`CHECK: let <name>: <type>;` with no
+  `mut`), all in hand-written `test/Target/Rust/*.mlir`, none of
+  them inside a loop.
+  **NOT SPIKED** — root cause is measured and located, and the
+  blast-radius argument above is reasoning rather than a
+  measurement, so the spike's job is to falsify it by building
+  the corrected predicate and running the full suite plus the
+  corpus BUILD sweep. Ranked ABOVE FR-102 despite being smaller:
+  emitting code that does not compile is a worse defect than not
+  covering a construct.
 
 - [ ] FR-106 DEFECT: the `unused_assignments` deny fires on
   real-world code — a documented assumption is falsified
