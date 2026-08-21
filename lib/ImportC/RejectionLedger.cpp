@@ -167,6 +167,21 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("stl-unrecognized-method")},
     {llvm::StringLiteral("receiver is not a recognized STL"),
      llvm::StringLiteral("stl-unrecognized-receiver")},
+    // W2.16 class-template frontier. Every wording below is emitted only
+    // from `CImporter::importRecordUncached`'s specialization checks or
+    // its same-TU name-clash guard, so a C program can never match one;
+    // without these entries all five tabulate as `other` and the backlog
+    // cannot rank the class-template front at all.
+    {llvm::StringLiteral("explicit class template specialization"),
+     llvm::StringLiteral("cxx-class-template-explicit-spec")},
+    {llvm::StringLiteral("partial class template specialization"),
+     llvm::StringLiteral("cxx-class-template-partial-spec")},
+    {llvm::StringLiteral("non-type template argument in class template instantiation"),
+     llvm::StringLiteral("cxx-class-template-nttp")},
+    {llvm::StringLiteral("variadic class template (template parameter pack)"),
+     llvm::StringLiteral("cxx-class-template-pack")},
+    {llvm::StringLiteral("class template instantiation collides with the existing struct"),
+     llvm::StringLiteral("cxx-class-template-name-clash")},
     {llvm::StringLiteral("unsupported top-level declaration"),
      llvm::StringLiteral("unsupported-top-level-decl")},
 };

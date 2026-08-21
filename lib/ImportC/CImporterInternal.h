@@ -5676,6 +5676,15 @@ private:
   /// Synthesized struct_defs (Phase-4 owner structs) have no entry and
   /// keep the positional field conversion.
   llvm::StringMap<const clang::RecordDecl *> structDefRecords;
+  /// W2.16: the per-TU mangling tag of the import that claimed each
+  /// emitted file-scope struct symbol. The FR-58 shape dedup merges by
+  /// NAME, which is correct for one header struct reached through several
+  /// TUs and a SILENT MISCOMPILE for two different types in ONE TU (the
+  /// second type's `<StructName>_<method>` call sites resolve to the
+  /// first's bodies). This map is what lets `importRecordUncached` tell
+  /// the two apart without breaking the cross-TU merge; tags are unique
+  /// per translation unit (`tu<i>_`, empty for a sole TU).
+  llvm::StringMap<std::string> structNameOwnerTuTags;
   /// Module-symbol names the current TU's ordinary identifier namespace
   /// claims (functions, file-scope variables, mangled function-local
   /// statics), pre-scanned by `collectOrdinaryNames`; struct tags colliding

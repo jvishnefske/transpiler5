@@ -738,6 +738,34 @@ void ItemGraphBuilder::collectItems(const clang::DeclContext *context) {
       continue;
     }
 
+    // W2.16: a class template contributes one RECORD item per
+    // INSTANTIATION, mirroring `CImporter::importTopLevelDecl`'s arm — the
+    // uninstantiated pattern is not an item (nothing is emitted for it).
+    // Without this the whole-program index would be silently incomplete:
+    // an instantiation would have no node while a body naming it still
+    // adds a `BodyType` edge under its (suffixed) name, and that
+    // denominator feeds `--incremental`'s PORTING.md /
+    // emitrust-progress.json.
+    if (const auto *classTmpl =
+            llvm::dyn_cast<clang::ClassTemplateDecl>(decl)) {
+      for (const clang::ClassTemplateSpecializationDecl *spec :
+           classTmpl->specializations()) {
+        if (!spec->isThisDeclarationADefinition())
+          continue;
+        std::string symbol = recordSymbolFor(spec);
+        if (symbol.empty())
+          continue;
+        clang::PresumedLoc specLoc =
+            sourceManager->getPresumedLoc(spec->getLocation());
+        addNode({std::move(symbol), ItemKind::Record, /*isDefinition=*/true,
+                 ItemLinkage::External, tuIndex,
+                 specLoc.isValid() ? specLoc.getFilename() : "",
+                 specLoc.isValid() ? specLoc.getLine() : 0,
+                 specLoc.isValid() ? specLoc.getColumn() : 0});
+      }
+      continue;
+    }
+
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
       // C++ member functions are not items: they are declared inside a
       // record, so `importDeclsIn` never reaches them, and their emitted
@@ -1296,6 +1324,22 @@ void ItemGraphBuilder::collectDependencies(const clang::DeclContext *context) {
       if (llvm::isa<clang::CXXMethodDecl>(func))
         continue;
       collectFunctionDependencies(func, cFunctionSymbolName(func, tuTag));
+      continue;
+    }
+    // W2.16: field edges out of a class-template INSTANTIATION, the record
+    // twin of the arm above. Without it `Wrap<Point>` would have a node
+    // but no `Field` edge to `Point`, so the coloring pass could not
+    // propagate an inadmissible field type through an instantiation.
+    if (const auto *classTmpl =
+            llvm::dyn_cast<clang::ClassTemplateDecl>(decl)) {
+      for (const clang::ClassTemplateSpecializationDecl *spec :
+           classTmpl->specializations()) {
+        if (!spec->isThisDeclarationADefinition())
+          continue;
+        std::string symbol = recordSymbolFor(spec);
+        if (!symbol.empty())
+          collectRecordDependencies(spec, symbol);
+      }
       continue;
     }
     if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {

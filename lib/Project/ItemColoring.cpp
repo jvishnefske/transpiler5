@@ -374,12 +374,21 @@ llvm::StringRef typeConstructTag(clang::QualType type, bool inParam = false) {
 /// template, an explicit or implicit instantiation of one, or a member of an
 /// instantiated template.
 ///
-/// The importer has no template machinery whatsoever: the one
-/// `ClassTemplateSpecializationDecl` mention in the whole importer is W2.3's
-/// STL recognition, which fires only for records in namespace `std` and
-/// diverts them to a hand-written `std::vector`/`std::string` model before any
-/// generic import. Those live in system headers and are never item graph
-/// nodes, so nothing this screen can reach is importable.
+/// The screen is deliberately CONSERVATIVE about templates rather than
+/// authoritative. W2.15 and W2.16 gave the importer real template
+/// machinery — a function or class template's INSTANTIATIONS import, one
+/// item each, under the `templateArgSuffix` naming scheme — so an
+/// instantiation reaching here is no longer "obviously unimportable". It
+/// is still screened out because a template's ADMISSIBILITY is a property
+/// of each instantiation, not of the pattern this predicate is asked
+/// about, and the probe has no per-instantiation key to record a verdict
+/// under; the item graph does (`collectItems` walks `specializations()`),
+/// so the instantiations still appear in the index. Screening the pattern
+/// out only ever under-approximates: it can leave an item uncolored, never
+/// color an inadmissible one green. W2.3's STL recognition, which diverts
+/// `std`-namespace records to a hand-written model before any generic
+/// import, remains a separate matter — those live in system headers and
+/// are never item graph nodes at all.
 bool isTemplated(const clang::Decl *decl) {
   if (const auto *record = llvm::dyn_cast<clang::CXXRecordDecl>(decl)) {
     if (record->getDescribedClassTemplate())
@@ -613,10 +622,12 @@ void AdmissibilityProbe::probeDeclsIn(const clang::DeclContext *context) {
       probeGlobal(var);
       continue;
     }
-    // Anything else is not an item graph node, so it has no key to record a
-    // verdict under. Templates in particular arrive here (a `ClassTemplateDecl`
-    // is not a `RecordDecl`) and are silently skipped, exactly as the graph
-    // skips them.
+    // Anything else has no key here to record a verdict under. A
+    // `ClassTemplateDecl` in particular arrives here (it is not a
+    // `RecordDecl`) and is skipped — note this is NO LONGER symmetric with
+    // the item graph, which since W2.16 emits one record node per
+    // instantiation: the probe under-approximates, leaving those items
+    // uncolored rather than coloring them wrongly.
   }
 }
 

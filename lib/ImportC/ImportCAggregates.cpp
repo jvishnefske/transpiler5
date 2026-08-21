@@ -173,12 +173,68 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   return imported;
 }
 
+/// W2.16: the located rejection a class-template specialization outside
+/// the admitted subset earns, or success when it is a plain instantiation
+/// of a primary template at type arguments only.
+///
+/// Driven off the specialization's OWN properties — its specialization
+/// kind, its specialized-from link, and its `TemplateArgument` kinds —
+/// never off anything in the class body, which is measurably
+/// insufficient: `template <int N> struct Fixed { int v; ... };` mentions
+/// `N` nowhere, so a field-driven check sees an ordinary struct and admits
+/// it under a name whose suffix codes the non-type argument as the `x`
+/// placeholder, silently fusing `Fixed<3>` and `Fixed<40>` into one struct
+/// with one set of methods. Both shapes are regression-pinned in
+/// test/Import/Cpp/class-templates-invalid.cpp.
+///
+/// It is called from `importRecordUncached` rather than from the
+/// `ClassTemplateDecl` walk because a specialization is reached by three
+/// routes (the walk, the top-level `RecordDecl` visit, and `mapType` on
+/// demand) and only the record import is common to all three — the
+/// on-demand route is still live after FR-42 recovery drops the other two,
+/// and it was measured emitting struct_defs for rejected shapes.
+static LogicalResult checkClassTemplateSpecialization(
+    const clang::ClassTemplateSpecializationDecl *spec, Location loc) {
+  if (spec->getSpecializationKind() == clang::TSK_ExplicitSpecialization)
+    return emitError(loc)
+           << "unsupported: explicit class template specialization";
+  // An instantiation whose pattern is a PARTIAL specialization is fully
+  // concrete (not dependent, so `importRecord`'s dependent-type guard does
+  // not see it) and would otherwise be admitted carrying the partial's
+  // body under a name computed from the primary template.
+  if (llvm::isa<clang::ClassTemplatePartialSpecializationDecl *>(
+          spec->getSpecializedTemplateOrPartial()))
+    return emitError(loc)
+           << "unsupported: partial class template specialization";
+  for (const clang::TemplateArgument &arg : spec->getTemplateArgs().asArray()) {
+    if (arg.getKind() == clang::TemplateArgument::Pack)
+      return emitError(loc) << "unsupported: variadic class template "
+                               "(template parameter pack)";
+    if (arg.getKind() != clang::TemplateArgument::Type)
+      return emitError(loc) << "unsupported: non-type template argument in "
+                               "class template instantiation";
+  }
+  return success();
+}
+
 LogicalResult
 CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   // Every diagnostic below is located on the DEFINITION: it is a verdict on
   // this record, not on whoever asked for it. The use-site location matters
   // only for the repeat rejection in `importRecord` above.
   Location defLoc = translateLoc(definition->getBeginLoc());
+  // W2.16: the class-template frontier, checked before any name is
+  // composed or any struct_def is emitted. A std-namespace specialization
+  // is exempt: `mapStdLibraryType` is the authoritative route for those
+  // (it pre-seeds their emitted names and models them by hand), and
+  // `std::array<T, N>`-shaped non-type arguments are its business, not
+  // this wave's.
+  if (const auto *spec =
+          llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(definition))
+    if (!spec->isInStdNamespace() &&
+        failed(checkClassTemplateSpecialization(
+            spec, translateLoc(spec->getLocation()))))
+      return failure();
   // W2.0: a C++ `class` (TTK_Class) imports exactly like a `struct` — the
   // keyword only changes the DEFAULT member access, which the importer
   // ignores anyway (it walks `fields()`, skipping AccessSpecDecl entries
@@ -366,6 +422,44 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
 
   auto existingShape = importedRecordShapes.find(structName);
   if (existingShape != importedRecordShapes.end()) {
+    // W2.16: the dedup below merges by emitted NAME, and that merge is a
+    // SILENT MISCOMPILE when the name is claimed by a DIFFERENT type in
+    // the SAME translation unit — every method mangles as
+    // `<StructName>_<method>`, so the second type's call sites resolve to
+    // the first type's bodies (measured: `Box<int>` plus a hand-written
+    // `struct Box_i32` print `1 101` natively and `1 1` from the emitted
+    // crate). Template instantiations widen that channel, because a
+    // composed spelling can now coincide with a hand-written tag or with
+    // another namespace's same-named template, so a clash involving one is
+    // a located rejection here.
+    //
+    // The discriminator is DECL IDENTITY WITHIN ONE TU, and it has to be,
+    // because two legitimate mergers travel this same path: the SAME
+    // header template instantiated in several TUs (different tuTags, one
+    // struct_def — the FR-58 shard merge depends on it), and two
+    // instantiations of the SAME pattern whose arguments alias onto one
+    // type code (`Box<char>`/`Box<signed char>` both code `i8`), which
+    // emit literally the same code and so may still merge.
+    const clang::RecordDecl *owner = structDefRecords.lookup(structName);
+    auto ownerTu = structNameOwnerTuTags.find(structName);
+    if (owner && owner != definition &&
+        ownerTu != structNameOwnerTuTags.end() &&
+        ownerTu->second == currentTuTag && !owner->isInStdNamespace() &&
+        !definition->isInStdNamespace()) {
+      const auto *thisSpec =
+          llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(definition);
+      const auto *ownerSpec =
+          llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(owner);
+      const bool samePattern =
+          thisSpec && ownerSpec &&
+          thisSpec->getSpecializedTemplate()->getCanonicalDecl() ==
+              ownerSpec->getSpecializedTemplate()->getCanonicalDecl();
+      if ((thisSpec || ownerSpec) && !samePattern)
+        return emitError(defLoc)
+               << "unsupported: class template instantiation collides with "
+                  "the existing struct '"
+               << structName << "'";
+    }
     if (existingShape->second != shape)
       return emitError(defLoc)
              << "unsupported: conflicting definition of struct '" << structName
@@ -383,6 +477,11 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   importedRecordShapes[structName] = shape;
   emittedStructNames.insert(structName);
   structDefRecords[structName] = definition;
+  // W2.16: which TU claimed the name, so the same-TU collision check above
+  // can tell a genuine clash from the cross-TU header merge it must not
+  // break. Recorded for EVERY file-scope record, not just template ones:
+  // either side of a clash may be the hand-written one.
+  structNameOwnerTuTags[structName] = currentTuTag;
 
   OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
   auto structDef = moduleBuilder.create<emitrust::StructDefOp>(

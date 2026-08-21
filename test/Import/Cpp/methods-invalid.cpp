@@ -4,7 +4,6 @@
 // RUN: not emitrust-import-c %t/try-catch.cpp 2>&1 | FileCheck %s --check-prefix=TRYCATCH
 // RUN: not emitrust-import-c %t/throw.cpp 2>&1 | FileCheck %s --check-prefix=THROW
 // RUN: not emitrust-import-c %t/operator.cpp 2>&1 | FileCheck %s --check-prefix=OPERATOR
-// RUN: not emitrust-import-c %t/template.cpp 2>&1 | FileCheck %s --check-prefix=TEMPLATE
 // RUN: not emitrust-import-c %t/refmember.cpp 2>&1 | FileCheck %s --check-prefix=REFMEMBER
 
 // W2.2 located-rejection baseline for the class-methods subset. Three of
@@ -21,6 +20,20 @@
 // EXISTING W2.0-era rejections, verified unchanged in a class-method
 // context; they are pinned here too for a complete, one-file located-
 // rejection ledger for this subset, per the wave's deliverable list.
+//
+// W2.16 RETIRED this file's TEMPLATE case. `//--- template.cpp` used to
+// pin `template <typename T> class Box { public: T value; T get(); };`
+// plus `Box<int> b;` as `error: unsupported top-level declaration`;
+// class-template monomorphization landed, so that exact input now
+// IMPORTS, to `emitrust.struct_def @Box_i32` with a `Box_i32_get` method
+// riding this very wave's `importCXXMethods` surface unchanged. The pin
+// moved FORWARD rather than loosening: the positive behaviour (and the
+// binding struct-name suffix scheme) is pinned in
+// test/Import/Cpp/class-templates.cpp, and the surviving class-template
+// frontier — explicit and partial specializations, non-type template
+// arguments, parameter packs, member function templates, static data
+// members, and same-TU name clashes — in
+// test/Import/Cpp/class-templates-invalid.cpp.
 
 //--- destructor.cpp
 // A user-declared destructor is out of scope this wave (no drop
@@ -111,25 +124,6 @@ int use(void) {
   Vec2 b;
   b.x = 2;
   return a + b;
-}
-
-//--- template.cpp
-// Existing W2.0-era rejection: a class template falls through the
-// top-level decl dispatch exactly like the free-function template case
-// already pinned in cpp-basics-invalid.cpp's TEMPLATE check, re-verified
-// unchanged for a template CLASS with a member function.
-// TEMPLATE: template.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported top-level declaration
-template <typename T>
-class Box {
-public:
-  T value;
-  T get() { return value; }
-};
-
-int use(void) {
-  Box<int> b;
-  b.value = 5;
-  return b.get();
 }
 
 //--- refmember.cpp
