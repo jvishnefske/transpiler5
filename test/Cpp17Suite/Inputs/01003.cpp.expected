@@ -1,0 +1,19 @@
+ctor 2
+bump 3
+ctor 100
+bump 100
+dtor 100
+ctor 101
+bump 102
+dtor 102
+ctor 900
+bump 909
+dtor 909
+ctor 12
+bump 14
+dtor 14
+dtor 3
+scoped=17
+guard ctor 7
+done
+guard dtor 7

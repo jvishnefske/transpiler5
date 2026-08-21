@@ -10608,7 +10608,7 @@ the subset boundary is honest today, nothing silently miscompiles):
 |---|---|
 | `template <typename T> T add(T,T)` | LANDED W2.15 (was `unsupported top-level declaration`) |
 | `template <typename T> struct Box` | LANDED W2.16 (was `unsupported top-level declaration`) |
-| user destructor `~R()` | `unsupported: user-declared destructor` |
+| user destructor `~R()` | LANDED W2.17 (non-virtual, defined in this TU) |
 | `struct D : Base` | `unsupported: base classes are not supported` |
 | `std::cout << x` | `unsupported assignable expression: CXXOperatorCallExpr` |
 | `std::make_unique<int>` | `unsupported: std::unique_ptr is not a recognized STL type` |
@@ -10804,11 +10804,111 @@ whole-program demand.
   test/Cpp17Suite/Inputs/01002.cpp; retired the `template.cpp` section
   of test/Import/Cpp/methods-invalid.cpp)
 
-- [ ] W2.17 User-declared destructors -> `impl Drop`. RAII is the C++
-  idiom the current subset most conspicuously lacks; Rust's Drop is a
-  near-exact match for scope-end destruction in reverse declaration order.
-  First wave: locals with no copy/move, no early-return interaction beyond
-  what Rust already guarantees. **NOT SPIKED.**
+- [x] W2.17 User-declared destructors -> `impl Drop`. Spike verdict
+  **GO-WITH-CONSTRAINTS** (2026-08-21; ~20 probes, each one emitted with
+  `--emit=rust` for a destructor-FREE skeleton and then hand-driven by
+  adding exactly `impl Drop` and removing `Copy`, so the measured Rust is
+  precisely what the emitter would produce; stdout byte-diffed against
+  `clang++ -std=c++17`).
+  Rust's Drop is a near-exact match for scope-end destruction, and a
+  destructor that `printf`s makes drop ORDER directly observable, so the
+  differential is not vacuous. What the spike established is that the
+  match holds for a NARROW set of object positions and silently breaks
+  for the rest -- so this wave admits the subset it measured and rejects
+  everything else, LOCATED.
+  BYTE-IDENTICAL, admitted: several locals in one scope (reverse drop
+  order), loop-body and `do`-while-body locals, if/else-branch locals,
+  early `return` structurized into if/else + tail expression, W2.16
+  class templates with a destructor at TWO instantiations, an
+  out-of-line same-TU destructor definition, a const-reference parameter
+  of a Drop class, and a user method literally named `drop` beside the
+  destructor.
+  SILENT MISCOMPILES, each now a LOCATED rejection -- these are the
+  wave's real content, because every one of them compiles clean and
+  prints the wrong thing: a bare nested block and a `switch` case block
+  (the emitter FLATTENS bare compound statements; no scope op exists in
+  the dialect), a `for`-init object (hoisted out of the loop), a
+  `goto`/label function (the binding is hoisted to function top, so the
+  goto-taken path drops an object C++ never constructed),
+  Drop-typed MEMBERS (C++ destroys members in REVERSE declaration
+  order, Rust drops fields FORWARD), arrays, globals/statics (the
+  emitter localizes `static R g;` and the whole-struct copies become
+  moves -- measured `dtor 99 / dtor 0` against `dtor 0 / dtor 99`),
+  and by-value parameters (C++ destroys the callee's copy, Rust moves:
+  2 dtors vs 1).
+  TWO BLOCKERS THE SPIKE FOUND THAT NO ANCHOR SHEET PREDICTED, both
+  silent and compile-clean, and the wave was a NO-GO without them:
+  (a) **THE DEAD-STORE MACHINERY DELETES DESTRUCTORS.** For an object
+  whose stores are all dead the emitter produces `let _a: R;`, and an
+  UNINITIALIZED Rust binding is NEVER dropped -- measured clang
+  `dtor 7 / hi / dtor 5` against Rust printing `hi` alone. This is
+  CLAUDE.md's "dropping emitted code is legal only when the analysis
+  PROVES no read on any path" hazard turned live: once a type has a
+  Drop impl, `drop()` is a read of every field, so NO store to such an
+  object is ever dead. The guard therefore had to reach five separate
+  liveness computations -- `computeDeferredInits`, `computeDeadStores`,
+  `computeLoopBodyDeadStores`, `computeFieldInitFuses` and
+  `computeDroppedOps` -- and it has its own byte-diff regression leg.
+  (b) **A DESTRUCTOR DEFINED IN ANOTHER TU EMITS NO `impl Drop` AT
+  ALL**, because an uncalled AND undefined method is silently dropped
+  from emission and a destructor is never explicitly called. Admission
+  therefore REQUIRES a body in this TU; otherwise
+  `destructor with no definition in this translation unit`.
+  Landed on the dialect with **no new op and no assembly-format
+  change**: `OptionalAttr<StrAttr>:$trait_name` on `emitrust.impl`
+  (absent = zero byte shift; two impls per struct were already legal
+  and `ImplOp::verify` already accepted an `&mut self` receiver), a
+  discardable `emitrust.has_drop` unit attribute on `struct_def`, and an
+  importer-side `emitrust.drop_impl` func marker following W2.2's
+  `emitrust.static_method` precedent. The Drop impl is structurally
+  pinned by the verifier: exactly one `emitrust.func` named `drop`,
+  `!emitrust.mut_ref<!emitrust.struct<Owner>>` receiver, zero results.
+  Emitter changes: `impl <trait> for <struct>`; `Copy` dropped whenever
+  `has_drop` (E0184 -- and `[R::default(); 3]` is E0277, which is why
+  arrays reject); visibility suppressed inside a trait impl (E0449 in a
+  lib crate); and the four OTHER impl-by-struct-name lookups taught to
+  SKIP trait impls, or they would have picked the Drop impl.
+  `FuncToEmitRust`'s `getOrCreateImpl` now keys on (struct, trait) --
+  measured merging the drop function into the inherent impl otherwise.
+  NAMING: the destructor cannot take `<Struct>_drop`, because a user
+  method `void drop()` already occupies that module symbol; it takes
+  `<Struct>_dtor` with an explicit clash guard
+  (`cxx-destructor-name-clash`), and the in-impl symbol is exactly
+  `drop` (E0407 otherwise).
+  THREE SHAPES FOUND DURING IMPLEMENTATION, beyond the spike:
+  the field-init FUSE (`S { f: v, ..Default::default() }` constructs,
+  moves out of, and drops an extra base object on a Drop type -- a
+  spurious `dtor 0 0`); a side-effecting `for`-increment (rendered at
+  the bottom of the Rust body, i.e. AFTER the drop, where C++ destroys
+  first); and a UNION destructor, which bypassed the member gate
+  entirely because a union goes through `collectUnionSlot` and never
+  `collectRecordFields` -- it emitted an `impl Drop`, and is the shape
+  that keeps the original `cxx-destructor` wording alive.
+  Eleven located wordings, eight tags, all mirrored into
+  `RejectionLedger.cpp` AND `test/RealWorld/run_realworld.py`. The
+  RealWorld `shapes` project's tag refines `cxx-destructor` ->
+  `cxx-virtual-destructor` with its ported count unchanged at 1/7 (it
+  has virtual destructors); `polygon`'s pre-existing advisory tag drift
+  was deliberately NOT absorbed by a `--update` and stays visible.
+  NRVO NOTE: return-by-value happens to byte-diff clean, but only
+  because clang applied NRVO at -O0 -- correctness resting on an
+  OPTIONAL elision is not a subset boundary, so it stays rejected;
+  `ReturnStmt::getNRVOCandidate()` is the wave-2 hook.
+  Gates: full meson suite 709/709 (fast 507 + slow/EndToEnd 202), 0
+  failures, no OOM signature. Cpp17Suite ratchets 25 -> 26 (`01003.cpp`)
+  at `total=29 transpiled=26 passed=26 miscompiled=0 unsupported=3`;
+  CTestSuite 220/220/0/0 unchanged; RealWorld C++ per-item 40/50
+  unchanged. Both new byte-diff legs verified non-vacuous under `lit -a`
+  (437-byte and 20-byte native stdouts, all RUN lines executed).
+  (test/Import/Cpp/destructors.cpp, destructors-invalid.cpp;
+  test/EndToEnd/cpp-destructor.cpp, cpp-destructor-deadstore.cpp;
+  test/Dialect/EmitRust/drop-impl.mlir, invalid.mlir;
+  test/Target/Rust/drop-impl.mlir;
+  test/Conversion/FuncToEmitRust/drop-impl.mlir;
+  test/Driver/emit-crate-lib-drop.cpp;
+  test/Project/item-graph-destructor.cpp;
+  test/Cpp17Suite/Inputs/01003.cpp; retired the destructor case of
+  test/Import/Cpp/methods-invalid.cpp)
 
 - [ ] W2.18 Single non-virtual inheritance: base as a first field with
   member/method access flattened through it. Flips nothing alone but is

@@ -68,6 +68,32 @@ inline constexpr llvm::StringLiteral kStaticMethodAttrName =
 inline constexpr llvm::StringLiteral kPrivateFieldsAttrName =
     "emitrust.private_fields";
 
+/// W2.17: name of the discardable `emitrust.struct_def` unit attribute
+/// marking a struct whose C++ class declared a destructor, i.e. a struct
+/// the emitter renders with an `impl Drop`. It carries two consequences the
+/// emitter cannot re-derive from the impl alone (the struct is rendered
+/// before any impl is seen, and the liveness analyses run per function):
+///
+/// * `Copy` drops out of the derive list. Measured rustc E0184: "the trait
+///   `Copy` cannot be implemented for this type; the type has a
+///   destructor". `Clone`/`Default` stay -- both compile alongside `Drop`.
+/// * Every binding of the struct is treated as READ on every path, so its
+///   synthesized initializer can never be deferred and no store to it is
+///   ever dead. An UNINITIALIZED Rust binding (`let x: T;`) is NEVER
+///   dropped, so eliding the initializer would silently delete the
+///   destructor's side effects -- a compile-clean miscompile (measured).
+inline constexpr llvm::StringLiteral kHasDropAttrName = "emitrust.has_drop";
+
+/// W2.17: name of the discardable `func.func`/`emitrust.func` unit attribute
+/// the C importer attaches to an imported C++ destructor body (the W2.2
+/// `emitrust.static_method` precedent). `convert-func-to-emitrust` consumes
+/// it: instead of joining the class's INHERENT `emitrust.impl`, the function
+/// is routed into a second `emitrust.impl` for the same struct carrying
+/// `trait_name = "Drop"`, and is RENAMED to the symbol `drop` (rustc E0407
+/// otherwise). The rename is safe because `emitrust.impl` is a SymbolTable
+/// and nothing in the subset ever calls a destructor.
+inline constexpr llvm::StringLiteral kDropImplAttrName = "emitrust.drop_impl";
+
 //===----------------------------------------------------------------------===//
 // FR-52 -- external requirements
 //===----------------------------------------------------------------------===//

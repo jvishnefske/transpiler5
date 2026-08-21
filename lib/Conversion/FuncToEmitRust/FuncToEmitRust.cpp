@@ -126,17 +126,25 @@ private:
 struct FuncOpConversion : public OpConversionPattern<func::FuncOp> {
   using OpConversionPattern<func::FuncOp>::OpConversionPattern;
 
-  /// Returns the module-level `emitrust.impl` for `structName`, creating it
-  /// (with its single empty block) at the end of the module on first use.
+  /// Returns the module-level `emitrust.impl` for `structName` under
+  /// `traitName` (null for the inherent impl), creating it (with its single
+  /// empty block) at the end of the module on first use. W2.17: the lookup
+  /// is keyed on the PAIR -- a struct with a destructor carries two impls,
+  /// and routing the destructor into the inherent one (which is what a
+  /// name-only lookup does, measured) would render it as an ordinary method
+  /// named `drop` instead of a `Drop` impl.
   static emitrust::ImplOp getOrCreateImpl(ModuleOp module, Location loc,
                                           StringAttr structName,
+                                          StringAttr traitName,
                                           ConversionPatternRewriter &rewriter) {
     for (auto implOp : module.getOps<emitrust::ImplOp>())
-      if (implOp.getStructName() == structName.getValue())
+      if (implOp.getStructName() == structName.getValue() &&
+          implOp.getTraitNameAttr() == traitName)
         return implOp;
     OpBuilder::InsertionGuard guard(rewriter);
     rewriter.setInsertionPointToEnd(module.getBody());
-    auto implOp = rewriter.create<emitrust::ImplOp>(loc, structName);
+    auto implOp =
+        rewriter.create<emitrust::ImplOp>(loc, structName, traitName);
     rewriter.createBlock(&implOp.getBody());
     return implOp;
   }
@@ -174,14 +182,24 @@ struct FuncOpConversion : public OpConversionPattern<func::FuncOp> {
     OpBuilder::InsertionGuard guard(rewriter);
     auto methodOf =
         funcOp->getAttrOfType<StringAttr>(emitrust::kMethodOfAttrName);
+    // W2.17: an imported C++ destructor lands in the class's `Drop` impl
+    // under the symbol `drop` -- rustc E0407 ("method is not a member of
+    // trait Drop") is what any other spelling becomes. The rename is safe:
+    // `emitrust.impl` is a SymbolTable (two classes' `drop` cannot
+    // collide) and nothing in the subset ever CALLS a destructor, so there
+    // is no call site to rewrite.
+    bool isDropImpl = funcOp->hasAttr(emitrust::kDropImplAttrName);
+    StringRef newName = isDropImpl ? StringRef("drop") : funcOp.getName();
     if (methodOf) {
       auto module = funcOp->getParentOfType<ModuleOp>();
-      emitrust::ImplOp implOp =
-          getOrCreateImpl(module, funcOp.getLoc(), methodOf, rewriter);
+      emitrust::ImplOp implOp = getOrCreateImpl(
+          module, funcOp.getLoc(), methodOf,
+          isDropImpl ? rewriter.getStringAttr("Drop") : StringAttr(),
+          rewriter);
       rewriter.setInsertionPointToEnd(&implOp.getBody().front());
     }
     auto newFuncOp = rewriter.create<emitrust::FuncOp>(
-        funcOp.getLoc(), funcOp.getName(),
+        funcOp.getLoc(), newName,
         FunctionType::get(rewriter.getContext(),
                           signatureConverter.getConvertedTypes(),
                           resultType ? TypeRange(resultType) : TypeRange()));
@@ -191,7 +209,8 @@ struct FuncOpConversion : public OpConversionPattern<func::FuncOp> {
     for (const NamedAttribute &namedAttr : funcOp->getAttrs()) {
       if (namedAttr.getName() != funcOp.getFunctionTypeAttrName() &&
           namedAttr.getName() != SymbolTable::getSymbolAttrName() &&
-          namedAttr.getName() != emitrust::kMethodOfAttrName)
+          namedAttr.getName() != emitrust::kMethodOfAttrName &&
+          namedAttr.getName() != emitrust::kDropImplAttrName)
         newFuncOp->setAttr(namedAttr.getName(), namedAttr.getValue());
     }
 

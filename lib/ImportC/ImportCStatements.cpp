@@ -24,6 +24,12 @@
 
 #include "CImporterInternal.h"
 
+// W2.17: `checkDropLocalScope` walks OUTWARD from a declaration through its
+// enclosing statements, which is the one place this importer needs clang's
+// parent map (every other walk is top-down).
+#include "clang/AST/ASTTypeTraits.h"
+#include "clang/AST/ParentMapContext.h"
+
 using namespace mlir;
 
 //===----------------------------------------------------------------------===//
@@ -205,6 +211,122 @@ static bool referencesVar(const clang::Stmt *stmt,
   return false;
 }
 
+
+/// W2.17: whether `stmt` contains a `goto`, an indirect goto, or a label.
+/// Such a function has its locals HOISTED to function top by the importer's
+/// label lowering, so a destructor-carrying local would construct on paths
+/// C++ never constructs on (measured: an extra `dtor 0`).
+static bool containsGotoOrLabel(const clang::Stmt *stmt) {
+  if (!stmt)
+    return false;
+  if (llvm::isa<clang::GotoStmt, clang::IndirectGotoStmt, clang::LabelStmt,
+                clang::AddrLabelExpr>(stmt))
+    return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (containsGotoOrLabel(child))
+      return true;
+  return false;
+}
+
+/// W2.17: whether `expr` can have an observable side effect of the kind a
+/// destructor's printf competes with -- i.e. contains a call. Used on a
+/// `for` INCREMENT: C++ destroys the body's locals BEFORE evaluating it,
+/// while the importer's for -> while lowering renders it at the BOTTOM OF
+/// THE BODY, ahead of the drop (measured: `inc`/`dtor` lines swap).
+static bool containsCall(const clang::Stmt *stmt) {
+  if (!stmt)
+    return false;
+  if (llvm::isa<clang::CallExpr, clang::CXXConstructExpr>(stmt))
+    return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (containsCall(child))
+      return true;
+  return false;
+}
+
+/// The single `CompoundStmt` `node` is a direct child of, or null.
+static const clang::CompoundStmt *
+enclosingBlock(clang::ASTContext &context, const clang::Stmt *node) {
+  for (const clang::DynTypedNode &parent : context.getParents(*node))
+    if (const auto *block = parent.get<clang::CompoundStmt>())
+      return block;
+  return nullptr;
+}
+
+LogicalResult CImporter::checkDropLocalScope(const clang::VarDecl *var,
+                                             Location loc) {
+  clang::ASTContext &context = astContext();
+  auto rejectScope = [&]() -> LogicalResult {
+    return emitError(loc) << "unsupported: object of a class with a destructor "
+                             "outside a function, loop, or branch body";
+  };
+  const clang::DeclStmt *declStmt = nullptr;
+  for (const clang::DynTypedNode &parent : context.getParents(*var))
+    if (const auto *candidate = parent.get<clang::DeclStmt>())
+      declStmt = candidate;
+  if (!declStmt)
+    return rejectScope(); // a for-init condition variable, a catch handler, ...
+  const clang::Stmt *node = declStmt;
+  // Walk outward one enclosing block at a time. Every step must land on a
+  // block whose Rust rendering is a real `{ ... }` at the same nesting.
+  for (;;) {
+    const clang::CompoundStmt *block = enclosingBlock(context, node);
+    if (!block)
+      return rejectScope(); // for-init, a switch case label, a bare statement
+    const clang::Stmt *stmtParent = nullptr;
+    const clang::FunctionDecl *funcParent = nullptr;
+    for (const clang::DynTypedNode &parent : context.getParents(*block)) {
+      if (const auto *asStmt = parent.get<clang::Stmt>())
+        stmtParent = asStmt;
+      if (const auto *asFunc = parent.get<clang::FunctionDecl>())
+        funcParent = asFunc;
+    }
+    if (funcParent) {
+      // The function body itself. A lambda's `operator()` is also a
+      // FunctionDecl; its capture/lift machinery is out of this subset.
+      const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(funcParent);
+      if (method && method->getParent()->isLambda())
+        return rejectScope();
+      if (containsGotoOrLabel(funcParent->getBody()))
+        return rejectScope();
+      return success();
+    }
+    if (const auto *forStmt =
+            llvm::dyn_cast_or_null<clang::ForStmt>(stmtParent)) {
+      if (forStmt->getBody() != block)
+        return rejectScope();
+      if (containsCall(forStmt->getInc()))
+        return emitError(loc)
+               << "unsupported: object of a class with a destructor in a loop "
+                  "whose increment has side effects";
+      node = forStmt;
+      continue;
+    }
+    if (const auto *whileStmt =
+            llvm::dyn_cast_or_null<clang::WhileStmt>(stmtParent)) {
+      if (whileStmt->getBody() != block)
+        return rejectScope();
+      node = whileStmt;
+      continue;
+    }
+    if (const auto *doStmt =
+            llvm::dyn_cast_or_null<clang::DoStmt>(stmtParent)) {
+      if (doStmt->getBody() != block)
+        return rejectScope();
+      node = doStmt;
+      continue;
+    }
+    if (const auto *ifStmt =
+            llvm::dyn_cast_or_null<clang::IfStmt>(stmtParent)) {
+      if (ifStmt->getThen() != block && ifStmt->getElse() != block)
+        return rejectScope();
+      node = ifStmt;
+      continue;
+    }
+    return rejectScope(); // bare nested block, switch case block, ...
+  }
+}
+
 LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   Location loc = translateLoc(var->getLocation());
   // A `va_list` local inside a monomorphization clone (CTS 00204) has no
@@ -227,6 +349,23 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   // (including the pointer's own qualifier, `int * volatile p`).
   if (hasVolatileQualifier(astContext(), var->getType()))
     return emitError(loc) << "unsupported: volatile-qualified type";
+  // W2.17: a destructor-carrying object is admitted only where its Rust
+  // `Drop` runs at the same program point as the C++ destructor. The three
+  // rejected positions here are all measured SILENT miscompiles: a
+  // function-local `static` is module-level state a Rust `static` never
+  // drops; an ARRAY is destroyed in reverse index order by C++ and forward
+  // order by Rust (and `[X; N]` repeat is rustc E0277 once `Copy` is gone);
+  // an unmodeled scope moves the drop point (see `checkDropLocalScope`).
+  if (userDeclaredDestructor(astContext(), var->getType())) {
+    if (!var->hasLocalStorage())
+      return emitError(loc) << "unsupported: global or static object of a "
+                               "class with a destructor";
+    if (astContext().getAsArrayType(var->getType()))
+      return emitError(loc)
+             << "unsupported: array of a class with a destructor";
+    if (failed(checkDropLocalScope(var, loc)))
+      return failure();
+  }
   if (!var->hasLocalStorage()) {
     if (var->isStaticLocal()) {
       // A function-local static is module-level state initialized once at

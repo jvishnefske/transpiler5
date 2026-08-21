@@ -132,6 +132,43 @@ LogicalResult FuncOp::verify() {
 LogicalResult ImplOp::verify() {
   if (getStructName().empty())
     return emitOpError("struct name must not be empty");
+  // W2.17: a trait impl is structurally pinned instead of merely rendered.
+  // `Drop` is the only trait the emitter has a contract for, and its single
+  // member's shape is fixed by the trait itself -- `fn drop(&mut self)`,
+  // no results. Every deviation below is a rustc error the emitted crate
+  // would hit later and further away (E0407 for a misnamed member, E0053
+  // for a result, E0046 for an empty impl, E0449 for a visibility
+  // qualifier), so the refusal is kept here, at the IR, where it is
+  // located.
+  if (std::optional<StringRef> traitName = getTraitName()) {
+    if (*traitName != "Drop")
+      return emitOpError("trait impl names '\"")
+             << *traitName << "\"', but 'Drop' is the only modeled trait";
+    auto members = getBody().front().getOps<FuncOp>();
+    if (std::distance(members.begin(), members.end()) != 1 ||
+        !llvm::hasSingleElement(getBody().front()))
+      return emitOpError("'Drop' impl must hold exactly one emitrust.func");
+    FuncOp dropFn = *members.begin();
+    if (dropFn.getSymName() != "drop")
+      return dropFn.emitOpError("'Drop' impl member must be named 'drop'");
+    FunctionType dropType = dropFn.getFunctionType();
+    if (dropType.getNumResults() != 0)
+      return dropFn.emitOpError(
+          "'Drop' impl member 'drop' must have no results");
+    if (dropType.getNumInputs() != 1 ||
+        dropFn->hasAttr(kStaticMethodAttrName))
+      return dropFn.emitOpError("'Drop' impl member 'drop' must take exactly "
+                                "one argument, the &mut self receiver");
+    auto mutRef = dyn_cast<MutRefType>(dropType.getInput(0));
+    auto dropStruct =
+        mutRef ? dyn_cast<StructType>(mutRef.getPointee()) : StructType();
+    if (!dropStruct || dropStruct.getName() != getStructName())
+      return dropFn.emitOpError(
+                 "'Drop' impl member 'drop' receiver must be a "
+                 "!emitrust.mut_ref of !emitrust.struct<\"")
+             << getStructName() << "\">, but got " << dropType.getInput(0);
+    return success();
+  }
   for (Operation &op : getBody().front()) {
     auto funcOp = dyn_cast<FuncOp>(op);
     if (!funcOp)
@@ -693,7 +730,9 @@ LogicalResult ActorRuntimeOp::verify() {
   }
   ImplOp impl;
   for (ImplOp candidate : module.getOps<ImplOp>())
-    if (candidate.getStructName() == getActor()) {
+    // W2.17: only the INHERENT impl carries the actor's message surface; a
+    // trait impl (`impl Drop for T`) is not a method table.
+    if (candidate.getStructName() == getActor() && !candidate.getTraitName()) {
       impl = candidate;
       break;
     }

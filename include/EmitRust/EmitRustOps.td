@@ -178,7 +178,7 @@ def EmitRust_FuncOp : EmitRust_Op<"func", [
 def EmitRust_ImplOp : EmitRust_Op<"impl", [
     HasParent<"::mlir::ModuleOp">, SymbolTable, NoRegionArguments,
     NoTerminator]> {
-  let summary = "Inherent impl block for an owner struct";
+  let summary = "Inherent (or Drop trait) impl block for an owner struct";
   let description = [{
     The `emitrust.impl` operation renders a Rust inherent `impl` block for
     the named struct. Its single region holds only `emitrust.func`
@@ -208,10 +208,45 @@ def EmitRust_ImplOp : EmitRust_Op<"impl", [
         }
     }
     ```
+
+    W2.17: the optional `trait_name` attribute turns the block into a TRAIT
+    impl -- `impl <trait_name> for <struct_name>` -- and `Drop` is the only
+    modeled trait. A struct may carry both an inherent impl and a `Drop`
+    impl; every consumer that looks an impl up BY STRUCT NAME (method
+    mutability, actor derivation) skips the trait-carrying ones, so a
+    module with no destructor is byte-identical to before. The attribute is
+    covered by `attr-dict`, so the assembly format is unchanged.
+
+    ```mlir
+    emitrust.impl "Owner" {
+      emitrust.func @drop(%self: !emitrust.mut_ref<!emitrust.struct<"Owner">>) {
+        ...
+      }
+    } {trait_name = "Drop"}
+    ```
+    ```rust
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            ...
+        }
+    }
+    ```
   }];
 
-  let arguments = (ins StrAttr:$struct_name);
+  let arguments = (ins StrAttr:$struct_name, OptionalAttr<StrAttr>:$trait_name);
   let regions = (region SizedRegion<1>:$body);
+
+  // The inherent-impl builder every pre-W2.17 caller uses, unchanged: the
+  // optional trait name defaults to absent.
+  let builders = [
+    OpBuilder<(ins "::llvm::StringRef":$structName), [{
+      build($_builder, $_state, $_builder.getStringAttr(structName),
+            ::mlir::StringAttr());
+    }]>,
+    OpBuilder<(ins "::mlir::StringAttr":$structName), [{
+      build($_builder, $_state, structName, ::mlir::StringAttr());
+    }]>
+  ];
 
   let assemblyFormat = "$struct_name $body attr-dict";
   let hasVerifier = 1;

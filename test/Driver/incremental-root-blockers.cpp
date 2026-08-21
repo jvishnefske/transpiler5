@@ -76,13 +76,21 @@ int main(void) { return total(20, 22); }
 // classified at all and fell into the `other` bucket.
 // PORTING: ## Direct blockers, as reported
 // PORTING-DAG: | cxx-cascaded-method |
-// PORTING-DAG: | cxx-destructor |
+// W2.17 moved this pin FORWARD, not loosened it: a non-virtual,
+// same-TU-defined destructor is now ADMITTED (it becomes `impl Drop`), so
+// `virtual ~Base()` above reports under the newly minted, more specific
+// `cxx-virtual-destructor` tag. The ROOT attribution is unchanged --
+// `destructor` still ranks the item in the table above -- which is the
+// property this test exists to pin.
+// PORTING-DAG: | cxx-virtual-destructor |
 // PORTING-DAG: | cxx-inheritance |
 //
 // A graph item that IS its own root carries the one-element chain saying so.
+// (The two rows are listed by direct blocker tag, so W2.17's rename of
+// `cxx-destructor` -> `cxx-virtual-destructor` put `cxx-inheritance` first.)
 // PORTING: ## Project items
-// PORTING: | dropped | red | `Base` | record | destructor | Base | cxx-destructor |
 // PORTING: | dropped | red | `Derived` | record | base-class | Derived | cxx-inheritance |
+// PORTING: | dropped | red | `Base` | record | destructor | Base | cxx-virtual-destructor |
 //
 // The off-graph member function borrows its class's chain with itself
 // prepended, so `twice` is credited to the base class it never mentions.

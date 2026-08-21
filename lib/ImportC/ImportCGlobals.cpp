@@ -44,6 +44,15 @@ LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   if (var->getTLSKind() != clang::VarDecl::TLS_None)
     return emitError(loc) << "unsupported: thread-local global variable";
 
+  // W2.17: a destructor-carrying object at file scope has no Rust analogue.
+  // C++ destroys it at exit, in reverse construction order; a Rust `static`
+  // is NEVER dropped -- and the emitter localizes such storage into a
+  // function-scope binding whose drop then runs at the WRONG time
+  // (measured: `dtor 99 / dtor 0` in C++ against `dtor 0 / dtor 99`).
+  if (userDeclaredDestructor(astContext(), var->getType()))
+    return emitError(loc) << "unsupported: global or static object of a class "
+                             "with a destructor";
+
   // Internal-linkage (`static`) globals are mangled with the per-TU tag so
   // identically named file-statics in different TUs stay distinct; external
   // globals keep their bare C name and unify across TUs. The tag is empty for

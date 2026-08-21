@@ -311,6 +311,22 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   // A union flattens to its single storage slot; every other record keeps
   // the anonymous-member-resolving field walk.
   if (definition->isUnion()) {
+    // W2.17: the union import path does NOT run the C++ member gate
+    // (`collectRecordFields`), so the destructor admission has to be
+    // repeated here. A union's members are not independently alive, so
+    // "destroy the members in reverse declaration order" has nothing to
+    // reproduce -- this is the residual shape the GENERIC `user-declared
+    // destructor` wording (and the `cxx-destructor` tag) is retained for.
+    if (const auto *cxxUnion =
+            llvm::dyn_cast<clang::CXXRecordDecl>(definition))
+      for (const clang::CXXMethodDecl *method : cxxUnion->methods())
+        if (!method->isImplicit() && !method->isDeleted() &&
+            llvm::isa<clang::CXXDestructorDecl>(method)) {
+          assignedStructNames.erase(definition);
+          localRecordNames.erase(definition);
+          return emitError(translateLoc(method->getLocation()))
+                 << "unsupported: user-declared destructor";
+        }
     if (failed(collectUnionSlot(definition, fieldNames, fieldTypes))) {
       assignedStructNames.erase(definition);
       localRecordNames.erase(definition);
@@ -521,6 +537,14 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   if (opaqueUnions.contains(definition))
     structDef->setAttr(emitrust::kOpaqueUnionAttrName,
                        moduleBuilder.getUnitAttr());
+  // W2.17: the class declared a destructor, so the emitted struct gets an
+  // `impl Drop` -- which costs it `Copy` (rustc E0184) and makes every
+  // binding of it unconditionally live (an uninitialized Rust binding is
+  // never dropped). Both consequences are decided from the struct alone, so
+  // they ride the struct_def rather than the impl.
+  if (userDeclaredDestructor(astContext(),
+                             astContext().getRecordType(definition)))
+    structDef->setAttr(emitrust::kHasDropAttrName, moduleBuilder.getUnitAttr());
   // W2.2: a genuine C++ class's non-static-data-member methods (mutating,
   // const, static, and non-delegating constructors) import onto the
   // `emitrust.impl`/`emitrust.method_of` surface right after the struct
@@ -614,6 +638,27 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
   return success();
 }
 
+/// Declared in CImporterInternal.h: shared with the local/global/parameter
+/// and expression admission checks in the other ImportC translation units.
+const clang::CXXDestructorDecl *
+userDeclaredDestructor(clang::ASTContext &context, clang::QualType type) {
+  // An array's ELEMENT type is what decides: `Tracer a[3]` is three
+  // destructor-carrying objects, and the array wrapper adds nothing.
+  while (const clang::ArrayType *arrayType =
+             context.getAsArrayType(type.getCanonicalType()))
+    type = arrayType->getElementType();
+  const auto *record =
+      llvm::dyn_cast_or_null<clang::CXXRecordDecl>(type->getAsRecordDecl());
+  if (!record || !record->hasDefinition())
+    return nullptr;
+  // A COMPILER-SYNTHESIZED destructor is not one: it has no body to import
+  // and no observable effect, so every plain C struct (and every C++ class
+  // without RAII) must keep answering "no" here.
+  if (!record->hasUserDeclaredDestructor())
+    return nullptr;
+  return record->getDestructor();
+}
+
 LogicalResult CImporter::collectRecordFields(
     const clang::RecordDecl *record,
     SmallVectorImpl<llvm::StringRef> &fieldNames,
@@ -667,9 +712,48 @@ LogicalResult CImporter::collectRecordFields(
         if (method->isImplicit() || method->isDeleted())
           continue;
         Location methodLoc = translateLoc(method->getLocation());
-        if (llvm::isa<clang::CXXDestructorDecl>(method))
-          return emitError(methodLoc)
-                 << "unsupported: user-declared destructor";
+        // W2.17: a user-declared destructor is ADMITTED (it becomes
+        // `impl Drop for T`) for exactly the shape whose drop points were
+        // measured byte-identical against `clang++ -std=c++17`. The three
+        // class-level disqualifiers below stay LOUD; the use-site ones
+        // (members, arrays, globals, by-value, unmodeled scopes) are raised
+        // where the object is declared, in `emitLocalVar`/`importGlobalVar`/
+        // `importFunction`, since the class itself is fine there.
+        if (llvm::isa<clang::CXXDestructorDecl>(method)) {
+          // No vtable, no dynamic dispatch: checked BEFORE the general
+          // admission so the diagnostic names the real blocker (a virtual
+          // `~Shape()` used to report the generic destructor wording).
+          if (method->isVirtual())
+            return emitError(methodLoc) << "unsupported: virtual destructor";
+          // A union's members are not independently alive, so "destroy the
+          // members in reverse order" has no meaning to reproduce; this is
+          // the residual shape the generic wording is retained for.
+          if (cxxRecord->isUnion())
+            return emitError(methodLoc)
+                   << "unsupported: user-declared destructor";
+          // An uncalled, undefined method is silently DROPPED from emission
+          // (measured), and nothing ever calls a destructor -- so a body-less
+          // one would emit no `impl Drop` at all and lose every side effect
+          // without a diagnostic. An out-of-line definition ELSEWHERE IN THIS
+          // TU is fine: `hasBody` finds it across redeclarations, and the
+          // FR-47 signature prepass leaves a stub the definition fills in.
+          if (!method->hasBody())
+            return emitError(methodLoc)
+                   << "unsupported: destructor with no definition in this "
+                      "translation unit";
+          // The destructor's module symbol is `<Struct>_dtor`; a member
+          // function literally spelled `dtor` would land on the same symbol
+          // (the overload-suffix counter deliberately skips destructors).
+          for (const clang::CXXMethodDecl *other : cxxRecord->methods())
+            if (!other->isImplicit() && !other->isDeleted() &&
+                !llvm::isa<clang::CXXDestructorDecl>(other) &&
+                other->getDeclName().isIdentifier() &&
+                other->getName() == "dtor")
+              return emitError(methodLoc)
+                     << "unsupported: destructor collides with the member "
+                        "function 'dtor'";
+          continue;
+        }
         if (method->isVirtual())
           return emitError(methodLoc) << "unsupported: virtual method";
         if (method->isOverloadedOperator())
@@ -704,6 +788,14 @@ LogicalResult CImporter::collectRecordFields(
   for (unsigned index = 0, count = fields.size(); index != count; ++index) {
     const clang::FieldDecl *field = fields[index];
     Location fieldLoc = translateLoc(field->getLocation());
+    // W2.17: a member whose class carries a destructor is a SILENT
+    // MISCOMPILE channel, not merely an unmodeled one -- C++ destroys the
+    // members of an object in REVERSE declaration order after the enclosing
+    // body, Rust drops the fields in FORWARD order (measured: the middle
+    // `dtor` line swaps). Array-typed members decide on the element type.
+    if (userDeclaredDestructor(astContext(), field->getType()))
+      return emitError(fieldLoc)
+             << "unsupported: struct member of a class with a destructor";
     if (field->isBitField()) {
       // C99-45: pack the maximal run of consecutively declared bit-field
       // members, LSB-first in declaration order, into one backing field.
