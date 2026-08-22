@@ -153,10 +153,10 @@ anchor = "W2.25"
 id = "FR-120"
 rank = 5
 kind = "feature"
-status = "open"
-size = "L"
-title = "Struct-pointer prerequisite: method calls + base-subobject bindings"
-summary = "W2.19's named prerequisite -- and per W2.26's census it now gates the WHOLE destructor-family cascade payoff (tinyxml2 11/11 roots need pointers/heap/dispatch). Route p->m() through the working p->x deref path (small); base-subobject binding kind in PointerRegion (large); CK_DerivedToBase peel; ItemColoring re-sync."
+status = "spiked"
+size = "M"
+title = "Struct-pointer method calls + upcast bindings (no third binding kind needed)"
+summary = "GO: hops are recomputable under the single-base guard, so the region binds the whole derived object and consumers reconcile via projectBaseHops. Open question answered YES by byte-diff. Honest unlocks: 00901 still blocked (empty base), tinyxml2 delta ZERO -- necessary, not sufficient."
 blocked_by = []
 anchor = "FR-120"
 

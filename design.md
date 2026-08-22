@@ -7630,14 +7630,80 @@ piece and becomes FR-45.
 
 
 - [ ] FR-120 Struct-pointer prerequisite: method calls and
-  base-subobject bindings through struct pointers. This is the
-  PREREQUISITE FR named by W2.19's NO-GO verdict, given its own number
-  so it can be sequenced and tracked; the four measured items and all
-  evidence live in the W2.19 entry (the small `emitCXXMemberCall`
-  routing item, the LARGE base-subobject binding-kind item in
-  `PointerRegion`, the `peelPointerCast` `CK_DerivedToBase` case, and
-  the ItemColoring screen re-sync). W2.19b and W2.19c are blocked on
-  it; W2.19a is not. **SPIKED (as part of W2.19's spike).**
+  base-subobject bindings through struct pointers. Spike verdict
+  **GO-WITH-CONSTRAINTS** (2026-08-22), and the LARGE item came back
+  MATERIALLY SIMPLER than W2.19's NO-GO predicted: **no third binding
+  kind is needed.** Under W2.18's admission guard (single, public,
+  non-virtual base) the hop path from a bound derived record to any
+  viewed base record is UNIQUE and recomputable from the two types
+  alone -- so `peelPointerCast` learns CK_DerivedToBase gated on a
+  `uniquePublicSingleBaseChain` predicate, the region binds the WHOLE
+  derived object with an ordinary null-member binding, and every
+  struct-place consumer reconciles via a `reconcileUpcastPlace` that
+  recomputes hops into the existing `projectBaseHops`. WITHOUT the
+  reconcile the naive peel is a rustc E0609 miscompile channel --
+  measured design fact: `emitPointerPlace` with a null cursor returns
+  the derived place with NO pointee type check, and `emitrust.member`
+  does not verify field existence.
+  THE OPEN QUESTION W2.19 LEFT -- whether the region analysis yields a
+  usable single-base fact for a C++ local base pointer end-to-end --
+  is ANSWERED YES with byte-diffs: inherited field read/write, base
+  method, mutating base method through `Base *p = &d;`, a two-level
+  A<-B<-C chain (one cast node, two-entry path), and non-virtual name
+  hiding (`p->tag()` binds Base::tag while `d.tag()` binds
+  Derived::tag). The W2.18 UPPTR frontier pin flips to exactly the
+  intended IR -- pointer fully erased, ZERO new dialect ops.
+  ITEM 1 (method calls through struct pointers): GO, byte-identical
+  across local/param/const/mutating/chained/(*p).m() shapes, and
+  **E0502 cannot recur structurally** -- each argument renders as its
+  own `let` and the receiver borrow is an inline autoref under
+  two-phase borrows, unlike W2.21's Box path which materialized the
+  receiver &mut ahead of arguments.
+  THE GAP W2.19'S SPIKE COULD NOT SEE (it never built the patch): a
+  const method through a NON-const pointer parameter stacks a NoOp
+  qualification cast the benign-arrow screen in
+  `collectSliceParamsImpl` misses via single-peel `asPointerParamRef`,
+  so the parameter classifies SLICE and call sites die with the
+  scalar-as-slice wording. The fix must be SCOPED to the benign-arrow
+  screen: looping the peel inside the shared helper was measured to
+  break the FR-100 CONSTPTR pin, which deliberately requires a bare
+  parameter ref.
+  ITEM 4: items 1-3 need NO ItemColoring re-sync -- measured, not
+  assumed; no pointer-use screen exists to go stale. The duplicated
+  virtual screen and admitsSingleBaseAsField re-sync with W2.19b, when
+  class-level admission actually changes. The stale-screen lesson
+  landed instead at collectSliceParamsImpl, the screen W2.19 did not
+  list.
+  THE HONEST UNLOCK NUMBERS, both falsifying this entry's hopes:
+  **00901 does NOT flip even mechanically devirtualized** -- with
+  virtual deleted, Shape is an EMPTY base, W2.18 emits no base field,
+  and the reconcile lands on the empty-base rejection. DESIGN NOTE FOR
+  W2.19b, discovered here: a devirtualized call's resolved target is
+  the DERIVED class's method, whose receiver is the derived place
+  itself -- NO hop projection -- so W2.19b's receiver resolution must
+  reconcile toward the devirt TARGET's class, not the pointer's static
+  pointee; the empty-base wall only blocks non-virtual calls
+  statically bound to a fieldless base. And **tinyxml2's delta is
+  ZERO** -- the W2.26 census's "11/11 roots need FR-120" means
+  critical-path membership, not sufficiency; every root is still gated
+  on destructors/virtual/new first.
+  SOUNDNESS FENCES SURVIVE, pinned: the multi-object rejection fires
+  THROUGH the new method-call receiver path; the region-join rejection
+  for different derived types; global base pointers stay out both ways
+  (the globals planner has its own unrelaxed check, and a mutating
+  method through a global pointer needs a writeback flush that does
+  not exist -- staging would silently drop the mutation, so it gets a
+  new wording instead); slicing dies at the copy/move gate before the
+  deref.
+  STAYS REJECTED: base-pointer parameters/members/arrays, new/delete,
+  base references, empty-base upcast access, virtual anything.
+  UNRESOLVED: cross-TU upcast bindings; pointer REBINDING across an
+  upcast mid-function (only initializer forms probed); Box-pointee
+  inherited access; the writeback-flush design; and IF the single-base
+  admission guard ever widens to multiple inheritance, the
+  recomputable-hops argument collapses and the stored-path third kind
+  becomes real -- assert the predicate against that day.
+  **SPIKED.**
 
 - [ ] FR-121 DEFECT (found by FR-113's spike, the next uniform
   spdlog blocker): a deferred `[i8; N]` binding (a `__FILE__`-derived
