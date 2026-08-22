@@ -774,6 +774,15 @@ void ItemGraphBuilder::collectItems(const clang::DeclContext *context) {
       // appear here at item scope, and is skipped for the same reason.
       if (llvm::isa<clang::CXXMethodDecl>(func))
         continue;
+      // FR-119: a free operator (or literal operator) has no identifier
+      // spelling, so `cFunctionSymbolName` would key it as "" -- two such
+      // operators deduped into ONE empty-named node, and getName() asserts
+      // in debug builds. The importer rejects the item located
+      // (`unsupported: overloaded operator`); the graph skips it AST-pure,
+      // BEFORE any naming call, mirroring the tuOrdinaryNames collector's
+      // existing screen.
+      if (!func->getDeclName().isIdentifier())
+        continue;
       addNode({cFunctionSymbolName(func, tuTag), ItemKind::Function,
                func->isThisDeclarationADefinition(), linkageOf(func), tuIndex,
                std::move(file), line, column});

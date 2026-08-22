@@ -684,6 +684,14 @@ void AdmissibilityProbe::probeDeclsIn(const clang::DeclContext *context) {
       // probed as part of the enclosing RECORD instead, which is a node.
       if (llvm::isa<clang::CXXMethodDecl>(func))
         continue;
+      // FR-119: a free operator's DeclarationName is not an identifier, so
+      // ItemGraph mints no node for it -- a verdict here would key nothing.
+      // Screened AST-pure BEFORE probeFunction so `cFunctionSymbolName` is
+      // never called on it: the empty-symbol early-return inside
+      // probeFunction only saved NDEBUG builds by accident (getName()
+      // asserts in debug), which was the latent assert path FR-119 closes.
+      if (!func->getDeclName().isIdentifier())
+        continue;
       probeFunction(func);
       continue;
     }

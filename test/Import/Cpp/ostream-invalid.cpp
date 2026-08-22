@@ -165,11 +165,15 @@ void f(std::ostream &o) { (void)o; }
 
 //--- user-operator.cpp
 #include <iostream>
-// ALREADY FENCED by the same tail, at the overload's own SIGNATURE, so the
-// whole TU rejects loudly rather than a call site silently picking a
-// built-in overload. A user `operator<<` is the ostream-dispatch feature in
-// miniature; it needs the ostream value W2.22 does not model.
-// USEROP: user-operator.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::basic_ostream is not a recognized STL type
+// FENCED since FR-119 by the free-operator guard in `importFunction`, at
+// the DECLARATION, before the signature's ostream parameter is even
+// mapped: a user `operator<<` is a free non-member operator first, and the
+// non-identifier DeclarationName rejects with the operator wording (the
+// one pin the relocated guard was measured to move -- it used to read
+// `std::basic_ostream is not a recognized STL type` from
+// `mapStdLibraryType`'s tail). Still loud, still located, now the more
+// precise root cause.
+// USEROP: user-operator.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: overloaded operator
 struct T {
   int v;
 };
