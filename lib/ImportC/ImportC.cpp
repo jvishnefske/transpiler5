@@ -5747,6 +5747,18 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
     return emitError(loc) << "unsupported use of '"
                           << predefined->getIdentKindName()
                           << "' outside a string literal position";
+  // W2.22: a `std::cout`/`std::cerr` `<<` chain has no place — the whole
+  // construct lowers to print macros in statement position. Reaching here
+  // means the chain's ostream result feeds something that needs an lvalue
+  // (`(std::cout << 1).good()`, an inner link of a chain whose base is NOT
+  // cout/cerr); name the real cause instead of the generic node class.
+  if (const auto *opCall = llvm::dyn_cast<clang::CXXOperatorCallExpr>(e)) {
+    llvm::StringRef stream;
+    llvm::SmallVector<const clang::CXXOperatorCallExpr *> links;
+    if (matchOstreamChain(opCall, stream, links))
+      return emitError(loc) << "unsupported: the result of a std::ostream << "
+                               "chain must be unused";
+  }
   return emitError(loc) << "unsupported assignable expression: "
                         << e->getStmtClassName();
 }

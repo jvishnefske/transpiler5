@@ -382,6 +382,15 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("reference-to-pointer parameter", "cxx-references"),
     ("reference-to-array parameter", "cxx-references"),
     ("reference types are not yet supported", "cxx-references"),
+    # W2.22 ostream frontier; mirrors lib/ImportC/RejectionLedger.cpp. The
+    # generic ("std::ostream << operand") row is LAST of the six so the
+    # specific shapes above it win first-match.
+    ("result of a std::ostream << chain must be unused", "cxx-ostream-value-use"),
+    ("pointer std::ostream << operand prints a nondeterministic address", "cxx-ostream-pointer-operand"),
+    ("std::ostream << operand must be a string literal", "cxx-ostream-cstr-operand"),
+    ("is not a recognized std::ostream manipulator", "cxx-ostream-manipulator"),
+    ("std::ostream << string literal", "cxx-ostream-string-literal"),
+    ("std::ostream << operand", "cxx-ostream-operand-type"),
     ("is not a recognized STL type", "stl-unrecognized-type"),
     ("is not a recognized STL method", "stl-unrecognized-method"),
     ("receiver is not a recognized STL", "stl-unrecognized-receiver"),

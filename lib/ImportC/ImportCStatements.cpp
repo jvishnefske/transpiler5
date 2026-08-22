@@ -5056,6 +5056,20 @@ FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
 }
 
 LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
+  // W2.22: a statement-position `std::cout`/`std::cerr` `<<` chain lowers to
+  // the Rust print macros. Intercepted here, ahead of every by-name and
+  // operator dispatch below: the chain is a `CXXOperatorCallExpr` whose
+  // argument 0 is the NEXT chain link, which the ordinary operator path
+  // would hand to `emitLValue` (there is no ostream place, hence today's
+  // "unsupported assignable expression: CXXOperatorCallExpr"). Statement
+  // position is the only position: the chain's ostream result has no
+  // representation, so `emitCall`/`emitLValue` reject every value use.
+  if (const auto *opCall = llvm::dyn_cast<clang::CXXOperatorCallExpr>(call)) {
+    llvm::StringRef stream;
+    llvm::SmallVector<const clang::CXXOperatorCallExpr *> links;
+    if (matchOstreamChain(opCall, stream, links))
+      return emitOstreamChain(opCall);
+  }
   const clang::FunctionDecl *callee = call->getDirectCallee();
   // va_start/va_end inside a monomorphization clone (CTS 00204):
   // va_start resets the internal consumption cursor; va_end is a no-op.
@@ -5222,15 +5236,16 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
 }
 
 void CImporter::emitPrintMacro(Location loc, std::string rustFormat,
-                               ValueRange operands) {
+                               ValueRange operands, bool toStderr) {
   // A newline-terminated format folds its trailing `\n` into `println!`,
   // which writes byte-for-byte the same stdout as `print!` of the original
   // string (clippy::print_with_newline). A format without a trailing newline
-  // keeps `print!`.
-  StringRef macro = "print!";
+  // keeps `print!`. W2.22's `std::cerr` chains select the stderr twins,
+  // whose macro contract (and clippy lints) are identical.
+  StringRef macro = toStderr ? "eprint!" : "print!";
   if (!rustFormat.empty() && rustFormat.back() == '\n') {
     rustFormat.pop_back();
-    macro = "println!";
+    macro = toStderr ? "eprintln!" : "println!";
   }
   // A bare `println!()` (the whole format was a lone newline, no holes)
   // renders from an empty args array; `println!("")` would trip
@@ -5321,6 +5336,341 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
     return success();
 
   emitPrintMacro(loc, *rustFormat, operands);
+  return success();
+}
+
+llvm::StringRef CImporter::stdOstreamGlobalName(const clang::Expr *expr) {
+  const auto *ref =
+      llvm::dyn_cast<clang::DeclRefExpr>(expr->IgnoreParenImpCasts());
+  if (!ref)
+    return {};
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var || !var->isInStdNamespace() || !var->getDeclName().isIdentifier())
+    return {};
+  llvm::StringRef name = var->getName();
+  if (name == "cout" || name == "cerr")
+    return name;
+  return {};
+}
+
+bool CImporter::matchOstreamChain(
+    const clang::CXXOperatorCallExpr *call, llvm::StringRef &stream,
+    llvm::SmallVectorImpl<const clang::CXXOperatorCallExpr *> &links) {
+  links.clear();
+  const clang::Expr *cursor = call;
+  while (const auto *link =
+             llvm::dyn_cast<clang::CXXOperatorCallExpr>(cursor->IgnoreParens())) {
+    if (link->getOperator() != clang::OO_LessLess || link->getNumArgs() != 2)
+      return false;
+    links.push_back(link);
+    cursor = link->getArg(0);
+  }
+  stream = stdOstreamGlobalName(cursor);
+  if (stream.empty()) {
+    links.clear();
+    return false;
+  }
+  // The walk descended outermost-first; the operands are written in the
+  // reverse order.
+  std::reverse(links.begin(), links.end());
+  return true;
+}
+
+LogicalResult
+CImporter::emitOstreamChain(const clang::CXXOperatorCallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  llvm::StringRef stream;
+  llvm::SmallVector<const clang::CXXOperatorCallExpr *> links;
+  // Only reached through the `emitCallStmt` recognizer, which already
+  // matched; the re-match keeps the flattening in one place.
+  if (!matchOstreamChain(call, stream, links))
+    return emitError(loc) << "unsupported: unrecognized std::ostream << chain";
+  bool toStderr = stream == "cerr";
+  llvm::StringRef byteHelper =
+      toStderr ? "__emitrust_byte_err" : "__emitrust_byte_out";
+
+  std::string rustFormat;
+  llvm::SmallVector<Value> operands;
+  // Flushes the accumulated format text and its operands as their own
+  // macro call and starts a fresh segment. The same shape as
+  // `translatePrintfFormat`'s argv-bypass `flushSegment`, and for the same
+  // reason: a raw byte write has to be sequenced BETWEEN two format
+  // segments, in program order.
+  auto flushSegment = [&]() {
+    if (rustFormat.empty() && operands.empty())
+      return;
+    emitPrintMacro(loc, rustFormat, operands, toStderr);
+    rustFormat.clear();
+    operands.clear();
+  };
+  // Appends literal bytes to the pending format segment under the same
+  // guards `translatePrintfFormat` applies to a C format string: an
+  // embedded NUL would print further than C++ does, a non-ASCII byte would
+  // reach the generated Rust source verbatim and fail rustc's UTF-8 check,
+  // and Rust's `{`/`}` need doubling.
+  auto appendLiteral = [&](llvm::StringRef data,
+                           Location dataLoc) -> LogicalResult {
+    for (char c : data) {
+      if (c == '\0')
+        return emitError(dataLoc)
+               << "unsupported: NUL byte in a std::ostream << string literal";
+      if ((c < 0x20 || c > 0x7e) && c != '\n' && c != '\t' && c != '\r')
+        return emitError(dataLoc)
+               << "unsupported: non-printable or non-ASCII byte in a "
+                  "std::ostream << string literal";
+      if (c == '{') {
+        rustFormat += "{{";
+        continue;
+      }
+      if (c == '}') {
+        rustFormat += "}}";
+        continue;
+      }
+      rustFormat += c;
+    }
+    return success();
+  };
+
+  auto i32Type = builder.getIntegerType(32);
+  auto stringType = emitrust::OpaqueType::get(builder.getContext(), "String");
+  for (const clang::CXXOperatorCallExpr *link : links) {
+    const clang::Expr *argExpr = link->getArg(1);
+    Location argLoc = translateLoc(argExpr->getBeginLoc());
+    // The operand's admissibility is decided by the RESOLVED overload's
+    // PARAMETER type, never by the source expression's type: libstdc++
+    // routes `unsigned short` to `operator<<(unsigned short)`, `size_t` to
+    // `(unsigned long)`, and both an unscoped enum and `wchar_t` to
+    // `(int)` — each of which prints differently from what the written
+    // type suggests. Member overloads (int/double/bool/manipulator) carry
+    // the value in parameter 0; the ADL FREE `std::operator<<` overloads
+    // (`const char *`, the three char types, `std::string`) carry it in
+    // parameter 1 after the stream.
+    const clang::FunctionDecl *callee = link->getDirectCallee();
+    unsigned paramIndex =
+        llvm::isa_and_nonnull<clang::CXXMethodDecl>(callee) ? 0 : 1;
+    if (!callee || callee->getNumParams() <= paramIndex)
+      return emitError(argLoc)
+             << "unsupported: a std::ostream << operand with no resolved "
+                "operator<<";
+    clang::QualType paramType = callee->getParamDecl(paramIndex)
+                                    ->getType()
+                                    .getNonReferenceType()
+                                    .getUnqualifiedType();
+    std::string paramName =
+        paramType.getAsString(astContext().getPrintingPolicy());
+
+    // C++17 sequences `E1 << E2` left to right and WRITES E1's output
+    // before E2 is evaluated. Hoisting a side-effecting operand into a
+    // `let` ahead of the pending `print!` would reorder that output — a
+    // measured miscompile, not a theoretical one — so the segment is
+    // flushed first and the operand evaluated after.
+    if (argExpr->HasSideEffects(astContext()))
+      flushSegment();
+
+    // `std::endl` is the ONE manipulator this wave models: a newline plus a
+    // flush, and the flush is unobservable (see `emitOstreamChain`'s
+    // contract). It arrives as a `FunctionToPointerDecay` over a
+    // `DeclRefExpr` naming the `endl` function TEMPLATE's specialization,
+    // so the recognizer reads the decayed declaration's name. Every other
+    // manipulator (`std::hex`, `std::flush`, `std::ends`, ...) keeps a
+    // located rejection: none of them has a modeled image.
+    if (paramType->isFunctionPointerType()) {
+      const auto *ref =
+          llvm::dyn_cast<clang::DeclRefExpr>(argExpr->IgnoreParenImpCasts());
+      const auto *fn =
+          ref ? llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl()) : nullptr;
+      if (fn && fn->isInStdNamespace() && fn->getDeclName().isIdentifier()) {
+        if (fn->getName() == "endl") {
+          rustFormat += '\n';
+          continue;
+        }
+        return emitError(argLoc)
+               << "unsupported: std::" << fn->getName()
+               << " is not a recognized std::ostream manipulator";
+      }
+      return emitError(argLoc) << "unsupported: a std::ostream << operand of "
+                                  "type '"
+                               << paramName
+                               << "' is not a recognized output type";
+    }
+
+    // A `const char *` operand. A string LITERAL folds straight into the
+    // format string (inheriting the ASCII/NUL/brace guards above). Any
+    // other `const char *` stays rejected this wave: printing it needs the
+    // raw `__emitrust_cstr_out` byte funnel, since the Latin-1
+    // `__emitrust_cstr` Display funnel double-encodes a runtime byte >=
+    // 128 into two UTF-8 bytes where C++ writes one (measured).
+    if (paramType->isPointerType()) {
+      clang::QualType pointee = paramType->getPointeeType();
+      if (pointee->isCharType()) {
+        const clang::StringLiteral *literal =
+            underlyingStringLiteral(argExpr->IgnoreParenImpCasts());
+        if (!literal || !literal->isOrdinary())
+          return emitError(argLoc)
+                 << "unsupported: a 'const char *' std::ostream << operand "
+                    "must be a string literal";
+        if (failed(appendLiteral(literal->getString(), argLoc)))
+          return failure();
+        continue;
+      }
+      // `operator<<(const void *)` prints an ADDRESS, which the pointer
+      // decomposition has compiled away and which no deterministic
+      // byte-diff could reproduce anyway — the same policy `%p` keeps.
+      return emitError(argLoc)
+             << "unsupported: a pointer std::ostream << operand prints a "
+                "nondeterministic address";
+    }
+
+    if (const auto *builtin = paramType->getAs<clang::BuiltinType>()) {
+      switch (builtin->getKind()) {
+      // The three CHARACTER overloads. libstdc++ writes ONE RAW BYTE for
+      // each of `char`, `signed char` and `unsigned char` (the explicitly
+      // signed variants are characters too, not numbers — measured), so
+      // the operand goes through `__emitrust_byte_out`/`_err`, NOT the
+      // `__emitrust_fmt_c` Display funnel whose `(x as u8) as char`
+      // widening emits two UTF-8 bytes for 128..=255. A raw write is not a
+      // format hole, so the pending segment flushes around it.
+      case clang::BuiltinType::Char_S:
+      case clang::BuiltinType::Char_U:
+      case clang::BuiltinType::SChar:
+      case clang::BuiltinType::UChar: {
+        flushSegment();
+        FailureOr<Value> value = emitRValue(argExpr);
+        if (failed(value))
+          return failure();
+        auto valueIntType = llvm::dyn_cast<IntegerType>((*value).getType());
+        if (!valueIntType)
+          return emitError(argLoc)
+                 << "unsupported: a std::ostream << operand of type '"
+                 << paramName << "' is not a recognized output type";
+        Value byte = castToIntType(argLoc, *value, builder.getIntegerType(8));
+        if (toStderr)
+          needsByteErrHelper = true;
+        else
+          needsByteOutHelper = true;
+        builder.create<emitrust::CallOpaqueOp>(
+            argLoc, TypeRange(), builder.getStringAttr(byteHelper),
+            /*args=*/ArrayAttr(), ValueRange{byte});
+        continue;
+      }
+      // `operator<<(float)` and `operator<<(double)` are `%.6g` by
+      // construction (libstdc++ hands both to `_M_insert<double>` with the
+      // default precision 6), which the project's C-compatible
+      // `__emitrust_fmt_float(x, conv=2, prec=-1, ...)` reproduces byte for
+      // byte — including `inf`/`-inf`/`nan`/`-0`/`1e+06`/`1e+300`, none of
+      // which Rust's `{}`, `{:.6}` or `{:e}` gets right.
+      case clang::BuiltinType::Float:
+      case clang::BuiltinType::Double: {
+        FailureOr<Value> value = emitRValue(argExpr);
+        if (failed(value))
+          return failure();
+        Value widened = *value;
+        if (!llvm::isa<Float64Type>(widened.getType())) {
+          if (!llvm::isa<Float32Type>(widened.getType()))
+            return emitError(argLoc)
+                   << "unsupported: a std::ostream << operand of type '"
+                   << paramName << "' is not a recognized output type";
+          widened = builder
+                        .create<arith::ExtFOp>(argLoc, builder.getF64Type(),
+                                               widened)
+                        .getResult();
+        }
+        needsFloatFormatExtHelper = true;
+        Value formatted =
+            builder
+                .create<emitrust::CallOpaqueOp>(
+                    argLoc, TypeRange{stringType},
+                    builder.getStringAttr("__emitrust_fmt_float"),
+                    /*args=*/ArrayAttr(),
+                    ValueRange{widened, createIntConstant(argLoc, i32Type, 2),
+                               createIntConstant(argLoc, i32Type, -1),
+                               createIntConstant(argLoc, i32Type, 0),
+                               createIntConstant(argLoc, i32Type, 0)})
+                .getResult(0);
+        operands.push_back(formatted);
+        rustFormat += "{}";
+        continue;
+      }
+      default:
+        break;
+      }
+      // `operator<<(bool)` prints `1`/`0` in the default (non-`boolalpha`)
+      // stream state, where Rust's `{}` on a `bool` prints `true`/`false`;
+      // the zero-extension to `i32` is what makes the two agree.
+      if (paramType->isBooleanType()) {
+        FailureOr<Value> value = emitRValue(argExpr);
+        if (failed(value))
+          return failure();
+        FailureOr<Value> widened =
+            extendBool(argLoc, *value, astContext().IntTy);
+        if (failed(widened))
+          return failure();
+        operands.push_back(*widened);
+        rustFormat += "{}";
+        continue;
+      }
+      // Every integer overload: Rust's `{}` is byte-identical to
+      // libstdc++'s on all of them, at the extremes included (measured on
+      // SHRT_MIN..ULLONG_MAX). The value is cast to the OVERLOAD's exact
+      // width and signedness first, which is what makes an unscoped enum
+      // (`operator<<(int)`) and a `size_t` (`(unsigned long)`) print what
+      // C++ prints rather than what their written types suggest.
+      if (paramType->isIntegerType()) {
+        FailureOr<Value> value = emitRValue(argExpr);
+        if (failed(value))
+          return failure();
+        if (!llvm::isa<IntegerType>((*value).getType()))
+          return emitError(argLoc)
+                 << "unsupported: a std::ostream << operand of type '"
+                 << paramName << "' is not a recognized output type";
+        unsigned bits = astContext().getTypeSize(paramType);
+        IntegerType target =
+            paramType->isSignedIntegerType()
+                ? builder.getIntegerType(bits)
+                : IntegerType::get(builder.getContext(), bits,
+                                   IntegerType::Unsigned);
+        operands.push_back(castToIntType(argLoc, *value, target));
+        rustFormat += "{}";
+        continue;
+      }
+    }
+
+    // A `std::string` operand borrows its `String` place shared and prints
+    // by `Display` — the same lowering, on the same place, that
+    // `printf("%s", s.c_str())` already uses, so it inherits exactly the
+    // existing string-content guarantees and adds no new exposure.
+    if (const auto *record = paramType->getAsCXXRecordDecl();
+        record && record->isInStdNamespace() &&
+        record->getDeclName().isIdentifier() &&
+        record->getName() == "basic_string") {
+      FailureOr<Value> place = emitLValue(argExpr->IgnoreParenImpCasts());
+      if (failed(place))
+        return failure();
+      auto lvalueType =
+          llvm::dyn_cast<emitrust::LValueType>((*place).getType());
+      auto opaque =
+          lvalueType ? llvm::dyn_cast<emitrust::OpaqueType>(
+                           lvalueType.getValueType())
+                     : emitrust::OpaqueType();
+      if (!opaque || opaque.getValue() != "String")
+        return emitError(argLoc)
+               << "unsupported: a std::ostream << operand of type '"
+               << paramName << "' is not a recognized output type";
+      operands.push_back(
+          builder
+              .create<emitrust::AddrOfOp>(
+                  argLoc, emitrust::RefType::get(opaque), *place,
+                  /*is_mut=*/false)
+              .getResult());
+      rustFormat += "{}";
+      continue;
+    }
+
+    return emitError(argLoc)
+           << "unsupported: a std::ostream << operand of type '" << paramName
+           << "' is not a recognized output type";
+  }
+  flushSegment();
   return success();
 }
 
