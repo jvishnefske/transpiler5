@@ -7020,33 +7020,150 @@ piece and becomes FR-45.
   **NOT SPIKED.**
 
 - [ ] FR-112 CONTAINMENT -- keep the record, reject at the access
-  site. **RANKED #1 BY THE MEASURED C++ DEMAND SIGNAL** (see Track 5).
-  59.2% of all blocked items in the external corpus -- 3949 of 6669 --
-  never had their own construct examined: their diagnostic is `method
-  of an unimported class` (2315) or `struct 'X' was rejected, so a
-  type naming it cannot be imported` (1634). ONE unsupported member
-  function rejects the ENTIRE class. Six-line repro:
-  a struct with two scalar fields and one `bool operator==` also
-  drops `int plain(C a){ return a.v; }`, a function that never touches
-  the operator. Substituting an ordinary `const char *name() const`
-  for the operator gives the identical outcome, so it is the MEMBER,
-  not the layout. design.md ALREADY reached the right disposition for
-  C in the C99-43 spike -- keep the record, reject at the access
-  site -- and it has no C++ counterpart. This is containment, not
-  feature work, and it is worth more than every named C++ wave
-  combined: it turns 1625 of the operator family and 502 of the
-  unrooted-method family back into candidates WITHOUT translating a
-  single operator. The thing it must invert is W2.2's deliberate
-  ordering ("a rejected class never half-imports"), so the wave must
-  establish what that ordering was protecting and classify every
-  class-level rejection as genuinely CLASS-level (a base the importer
-  cannot model, a virtual method implying a vtable, a destructor whose
-  Drop timing is unreproducible) versus merely MEMBER-level (an
-  overloaded operator, a method using an unsupported statement -- the
-  record's DATA is perfectly representable). CAUTION design.md records
-  three times (FR-102, FR-107) and which holds here: opening a root
-  does not port what sits behind it; the C precedent measured cascade
-  -96% but functions ported only 8.3% -> 11.7%. **SPIKE IN FLIGHT.**
+  site. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21), **with a
+  MEASURED CORRECTION TO ITS OWN #1 RANKING** -- see the payoff
+  section below. The C99-43 disposition transfers to C++ classes, and
+  more cheaply than it did for C: for every member-level shape, the
+  access-site rejection machinery ALREADY EXISTS AND ALREADY FIRES --
+  no new op, no new diagnostic path, no new IR.
+  THE SOUNDNESS CRITERION, derived and then verified against clang
+  ASTs: **an omitted member is safe iff every use of it appears in the
+  AST as an explicit node the importer's expression walk visits.**
+  Members invoked IMPLICITLY have no rejectable site and must stay
+  class-level. That single rule classifies the whole surface.
+  MEMBER-LEVEL, safe to omit, each with the pre-existing rejection
+  that catches its use: an overloaded operator (`==`, `+=`, `++`,
+  `[]`, `()`, `=`) hits the unconditional non-identifier-callee guard
+  at ImportCExpressions.cpp:2119; a user `operator=` reached through
+  an ENCLOSING class's IMPLICIT copy-assignment hits the same guard
+  (the nastiest channel, and it is already closed); a conversion
+  function hits `unsupported cast (UserDefinedConversion)` on every
+  implicit AND explicit use; a method whose signature or body fails to
+  import hits `call to unimported method`; a static one hits `call to
+  unimported function`.
+  CLASS-LEVEL, must stay, each with the measured reason: a COPY/MOVE/
+  DELEGATING CONSTRUCTOR is invoked implicitly at by-value pass,
+  return and init, so there is NO CALL NODE TO REJECT -- omitting a
+  copy ctor that sets `v=99` substitutes Rust's bitwise Copy and
+  silently prints `1 1`; a destructor (virtual, or missing a body in
+  this TU) is likewise implicit; a base class outside
+  `admitsSingleBaseAsField` drops inherited DATA; a base with a
+  destructor is W2.18's measured E0204 channel; a Drop-typed member is
+  W2.17's reverse-order channel; the class-template and emitted-name
+  collision gates all guard measured miscompiles; and field-level type
+  failures are the FR-107/C99-43 axis, not this one.
+  SEVEN BLOCKING CONSTRAINTS, each measured. **C1** `cxxMethodBaseName`
+  calls `getName()` on non-identifier DeclarationNames -- see FR-117,
+  which must be fixed FIRST, because `cxxMethodMangledName`'s
+  overload-count loop walks EVERY method of the class, so admitting
+  one operator-carrying class puts every SIBLING method through it.
+  **C2** the per-method import must run to a FIXPOINT: with the caller
+  declared BEFORE the callee, the FR-47 signature prepass registers a
+  stub, the caller imports a `func.call` against it, then the callee's
+  body fails and its func is erased -- leaving
+  `'func.call' op 'c_bad' does not reference a valid function`. Loud,
+  but it kills the whole TU and is not attributable to one item under
+  recovery. Re-running both FR-47 passes until the omitted set stops
+  growing converges (measured 3 rounds reversed, 2 forward; the set
+  only grows, bounded by the method count). **C3** every remaining
+  class-level gate must move AHEAD of `struct_def` emission -- see
+  FR-118; this is what W2.2's ordering was really protecting, and it
+  is ALREADY BROKEN today. **C4** leave `virtual method` CLASS-level
+  this wave: every virtual call is already rejected at the site, but
+  the vptr is real storage the emitted struct lacks -- a probe folds
+  `sizeof(C) == 16` faithfully from clang's ASTContext for a struct
+  the emitter renders as 4 bytes, and any program using that constant
+  to size a buffer is internally inconsistent. Measured payoff for
+  including it: ZERO. **C5** `ItemColoring.cpp:614-618` is a STALE
+  SCREEN the day this lands -- confirmed, three FALSE REDS on the
+  motivating repro, which breaks FR-41's stated "false reds remain
+  zero" contract and starves FR-43's `--search`, whose root candidates
+  must be Green|Yellow. `ItemGraph.cpp` needs NO change (it never made
+  methods item nodes, and record naming is AST-pure, so CSymbolNaming
+  byte-identity is untouched). **C6** the ledger needs its own tag:
+  every containment rejection lands in the catch-all `other`, and
+  since FR-112 was itself ranked #1 FROM that tabulation, shifting
+  mass into `other` blinds the next ranking. **C7** FR-108's collision
+  channel widens as more classes claim emitted names (loud, so a
+  coverage note rather than a soundness hole).
+  BYTE-DIFF ORACLE PASSED: a `Vec2` carrying an omitted `operator==`
+  AND an omitted-body method, with `main` touching neither, goes from
+  an EMPTY emitted crate to a full one in STRICT mode with zero
+  rejections, byte-identical to the native.
+  **THE PAYOFF CORRECTION, and it is the honest headline.** Measured
+  on two pinned repos: tinyxml2 items 19/48 -> 22/48 with FUNCTIONS
+  0/7 -> 0/7; jsoncpp completely unchanged at 25/126. Rejection
+  ledgers move 227 -> 226 and 620 -> 614. Attributing all 180 of
+  tinyxml2's cascaded methods to their owning class shows why: their
+  roots are `base class with a destructor` and `virtual destructor`,
+  five of the six biggest. Only three classes root on an overloaded
+  operator, and ALL THREE immediately hit the next class-level gate,
+  the copy/move constructor. jsoncpp is the same -- 34 destructor-family
+  roots, 16 explicit function-template specializations, and FOUR
+  operators. **So FR-112 does NOT unlock the 3949-item cascade the
+  Track 5 ranking attributed to it; the real root underneath is the
+  POLYMORPHIC-RAII family, which is W2.26 and is a genuinely
+  class-level barrier.** The prior caution recorded three times in
+  this file (C99-43, FR-102, FR-107) held again, and worse than
+  predicted.
+  IT IS STILL WORTH DOING, for a reason the ranking could not see: it
+  converts OPAQUE CASCADES INTO RANKABLE DATA. StrPair's methods went
+  from 14 x `method of an unimported class` -- which carries no
+  information at all -- to their own real diagnostics
+  (`CXXDeleteExpr`, `unsupported pointer expression: CXXThisExpr`,
+  returned-pointer). That is exactly the FR-115 problem, fixed for the
+  shapes contained, and it is what the NEXT prioritization needs. The
+  emitted artifact also grows and still builds (tinyxml2's crate
+  263 -> 299 lines, BUILD-OK both sides; no crate regressed, unlike
+  C99-43's "43 TUs stop emitting a crate").
+  Regression tests the wave must ship: the copy-ctor stays-class-level
+  probe (prints `1 99` natively), the implicit enclosing `operator=`,
+  the sibling-fixpoint dangling-call probe, the two-conversion-function
+  naming probe, the `sizeof`-vs-layout probe pinning why virtual stays
+  out, the EndToEnd byte-diff, and a coloring golden pinning zero
+  false reds for an operator-carrying class.
+  UNRESOLVED: whether the full 11-repo corpus ranks like the two-repo
+  sample (which says the operator root is ~2-4% of cascades, not the
+  majority) -- someone should re-run it before sizing this FR; the
+  `--link` shard-merge behavior when one shard omits a method another
+  imports; and whether omitting a member shifts any `--emit=crate`
+  golden byte (the spike patch was env-gated, so untested in the on
+  state against goldens).
+
+- [ ] FR-117 DEFECT (found by FR-112's spike, and it is LIVE TODAY on
+  unpatched HEAD, independent of any containment work):
+  `cxxMethodBaseName` (ImportCFunctions.cpp:57) falls through to
+  `mangleMemberName(method->getName())` for a DeclarationName that is
+  NOT an identifier. Conversion functions bypass the W2.2 member-shape
+  gate entirely, because `isOverloadedOperator()` is FALSE for a
+  `CXXConversionDecl`. Measured: `struct C { int v; operator int()
+  const {...} };` emits `pub fn c_(&self)` -- an EMPTY method name --
+  and two conversion functions in one class give
+  `unsupported: conflicting definition of 'c_'`. The fix is to reject
+  or omit a non-identifier DeclarationName explicitly; conversion
+  functions are the natural first entry on FR-112's omission list,
+  since every use of one is ALREADY a `UserDefinedConversion`
+  rejection and importing one emits uncallable dead code. Must land
+  BEFORE FR-112, which widens the blast radius: the overload-count
+  loop walks every method of the class, so one operator-carrying class
+  drags all its siblings through this path. **SPIKED by measurement.**
+
+- [ ] FR-118 DEFECT (found by FR-112's spike): W2.2's "a rejected
+  class never half-imports" invariant IS ALREADY VIOLATED on unpatched
+  HEAD. `importCXXMethods` runs AFTER the `StructDefOp` is created and
+  after `structSymbolName` assigns the name, and NEITHER IS UNDONE
+  when it fails. Measured: a class whose method body fails to import
+  emits `pub struct C { pub v: i32 }` into the crate while the record
+  is marked rejected and all three of its using functions cascade.
+  Also observed in a real artifact -- tinyxml2's `StrPair` reaches the
+  copy/move gate, is put in `rejectedRecords`, yet the emitted crate
+  contains its `struct_def`, an `impl Drop` and three methods, while a
+  user still reports "struct 'NsTinyxml2StrPair' was rejected".
+  Fix: move the copy/move/delegating-constructor check into
+  `collectRecordFields` alongside the other class-level gates, and
+  audit `importCXXMethods` so nothing left in it can fail the record.
+  This is FR-112's constraint C3 and is worth doing on its own.
+  **SPIKED by measurement.**
 
 - [ ] FR-113 DEFECT: a rejected scoped enum still emits a cast to
   itself and the VERIFIER destroys the whole crate -- `--incremental`
@@ -11715,6 +11832,30 @@ whole-program demand.
   front into candidates without translating a single operator, and the
   residue is what this wave is actually sized against. **NOT SPIKED.**
 
+
+- [ ] W2.26 (NEW WAVE) POLYMORPHIC RAII -- a class with a virtual
+  destructor, or a base class carrying a destructor. **This is the
+  measured root under the Track 5 cascade, and FR-112's spike is what
+  identified it**: attributing all 180 of tinyxml2's cascaded methods
+  to their owning classes puts `base class with a destructor` and
+  `virtual destructor` at five of the six biggest roots, and jsoncpp
+  has 34 destructor-family roots against 4 operator ones. It is the
+  33.4% row of the demand table, and the destructor half of it was on
+  no wave at all. It is genuinely CLASS-level -- destruction is
+  implicit, so FR-112's containment criterion ("safe iff every use is
+  an explicit AST node") explicitly does NOT apply, and W2.18 measured
+  the concrete channel: a merely-inheriting derived class does not
+  answer `hasUserDeclaredDestructor`, so every W2.17 use-site drop
+  gate misses it and the emitted struct keeps a `Copy` it must not
+  have (rustc E0204). W2.19's spike additionally measured that
+  W2.18's empty-base SKIP silently loses `~Base` entirely once a base
+  destructor exists -- currently masked by the very rejection this
+  wave would remove, so that guard is load-bearing and this wave must
+  either keep it or materialize the base field. Sequencing: this is
+  the front with the most real demand behind it, but it is also the
+  one whose soundness argument is hardest, and it should be spiked
+  only after FR-117/FR-118 clean up the ordering it depends on.
+  **NOT SPIKED.**
 ## Track 5 Third-party validation (external demand signal)
 
 Track 4's corpus is authored by this project. That has now produced two
@@ -12160,7 +12301,21 @@ pugixml's 42 units do not manufacture it.
 all blocked items -- 3949 of 6669 -- never had their own construct
 examined.** Their diagnostic is `method of an unimported class` or
 `struct 'X' was rejected`. ONE unsupported member function rejects the
-ENTIRE class; see FR-112, which is now the top-ranked open item.
+ENTIRE class.
+
+**CORRECTION, 2026-08-21, from FR-112's spike -- this table's own
+attribution of that 59.2% was wrong.** The cascade is real, but its
+ROOT is not the overloaded operator. Attributing tinyxml2's 180
+cascaded methods to their owning classes puts `base class with a
+destructor` and `virtual destructor` at five of the six biggest roots;
+only three classes root on an operator and all three immediately hit
+the copy/move-constructor gate behind it. jsoncpp: 34 destructor-family
+roots, 4 operator roots. So the front with the demand behind it is
+**W2.26 polymorphic RAII**, not FR-112 and not W2.25. FR-112 measured
+tinyxml2 items 19/48 -> 22/48 and jsoncpp unchanged. It is still worth
+doing -- it converts opaque cascades into rankable diagnostics, which
+is the FR-115 problem -- but it is not an unlock. The alphabetic-minimum
+root tag described below is exactly how this table mis-attributed it.
 
 **THE ROADMAP WAS AIMED AT 4.7% OF MEASURED DEMAND.** W2.19 + W2.21 +
 W2.23 + W2.24 together are 316 of 6669 items. `std::unique_ptr` appears
