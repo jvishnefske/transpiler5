@@ -77,12 +77,11 @@ anchor = "FR-113 DEFECT"
 
 [[items]]
 id = "FR-114"
-rank = 3
 kind = "defect"
-status = "spiked"
+status = "landed"
 size = "M"
-title = "Overload collisions: widen the x-fallback, suffix free fns, honest wording"
-summary = "GO, zero golden churn: frozen W2.2 codes stay, x-fallback delegates to W2.15's table with an r-reference arm, free fns get the per-param suffix inside cFunctionSymbolName (item graph agrees by construction). Raytracing +2; interval exposes a 4-gate stack."
+title = "Overload collisions: wide x-fallback, free-fn suffixes, honest wording"
+summary = "Landed 2026-08-22: zero golden shifts held; enum overloads became a positive case (FR-113 interim); raytracing 264 -> 262 recovered, +2 ported; the --incremental c_main kill is dead."
 blocked_by = []
 anchor = "FR-114 DEFECT"
 

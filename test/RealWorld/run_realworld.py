@@ -390,6 +390,13 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("omitted from class", "cxx-omitted-member"),
     ("call to unimported method", "cxx-omitted-member"),
     ("overloaded operator", "cxx-operator-overload"),
+    # FR-114: residual overload-set collisions the widened suffix table
+    # cannot split (frozen member `i` pairs, long/long long, two fn-pointer
+    # params, separator-free member code aliasing). Previously hid inside
+    # the cross-TU "conflicting definition" wording and tabulated [other].
+    # No substring overlap with the "overloaded operator" row above.
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("C++ overload set for", "cxx-overload-collision"),
     # FR-117: a user-defined conversion function. The member is OMITTED from
     # the class, but its residual use positions (the explicit
     # `c.operator int()` spelling, an out-of-line definition) are located

@@ -443,6 +443,100 @@ static inline std::string templateArgSuffix(const clang::RecordDecl *record) {
   return suffix;
 }
 
+/// FR-114 per-parameter type code for a FREE-function overload suffix:
+/// `templateArgTypeCode`'s table verbatim, plus an `r`-prefixed arm for
+/// REFERENCE parameters (`const S &` -> `rs`), which the template table
+/// never needed — a template argument deduced through a reference
+/// parameter is the referenced type itself. Reusing the W2.15 table
+/// keeps one type coding one way everywhere (`g(double)` -> `g_d`,
+/// `add<double>` -> `add_d`); the `r` prefix keeps `f(S)` and
+/// `f(const S&)` distinct symbols, which is what resolves W2.23's noted
+/// `T(const T&)`/`T(const U&)` hazard once copy constructors are
+/// admitted. Codes that the table cannot split (long/long long both
+/// `i64`, double/long double both `d`, two function pointers both `px`)
+/// are NOT silent: the composed symbols collide and
+/// `CImporter::importFunction` rejects the second with the FR-114
+/// overload-set wording (pinned in
+/// test/Import/Cpp/overload-collisions-invalid.cpp).
+static inline std::string overloadArgTypeCode(clang::QualType type) {
+  clang::QualType canonical = type.getCanonicalType();
+  if (canonical->isReferenceType())
+    return "r" + templateArgTypeCode(canonical.getNonReferenceType());
+  return templateArgTypeCode(type);
+}
+
+/// FR-114: the size of the same-TU overload set `func` belongs to — the
+/// number of same-named, non-template FunctionDecls its (transparent-
+/// context-skipping) declaration context declares. Redeclarations
+/// COLLAPSE: a DeclContext's lookup table stores one entry per entity,
+/// so a plain-C prototype + definition pair counts as 1 and C input can
+/// never grow a suffix. A FunctionTemplateDecl is not a FunctionDecl and
+/// so never counts (its instantiations are suffixed by
+/// `templateArgSuffix` instead); the belt-and-braces
+/// `getDescribedFunctionTemplate` filter keeps any templated-pattern
+/// FunctionDecl a lookup might surface from counting either. Methods and
+/// constructors never reach this predicate through `cFunctionSymbolName`
+/// (they are named by `CImporter::cxxMethodMangledName`), but
+/// `importFunction`'s collision wording shares this free-function half of
+/// the overload-set test.
+static inline unsigned overloadSetSize(const clang::FunctionDecl *func) {
+  if (!func->getDeclName().isIdentifier())
+    return 1;
+  const clang::DeclContext *context =
+      func->getDeclContext()->getRedeclContext();
+  unsigned size = 0;
+  for (const clang::NamedDecl *sibling : context->lookup(func->getDeclName()))
+    if (const auto *fn = llvm::dyn_cast<clang::FunctionDecl>(sibling))
+      if (!fn->getDescribedFunctionTemplate())
+        ++size;
+  return size;
+}
+
+/// FR-114 free-function overload suffix: `""` for a function that is the
+/// SOLE non-template owner of its name (every pre-FR-114 import — the
+/// zero-churn guarantee), and one `_<code>` per parameter, in declaration
+/// order, when the declaration context holds a genuine C++ overload set.
+/// A zero-parameter overload contributes no `_<code>` at all (the loop
+/// never runs), so it keeps the bare historical name — a zero-arg C++
+/// signature is unique within its overload set by construction
+/// (raytracing's `random_double()` vs `random_double(double, double)` is
+/// the worked example, pinned in test/Import/Cpp/overload-suffix.cpp).
+///
+/// It lives here, inside the shared naming header, for W2.15's
+/// load-bearing reason: EVERY name-recomputation site in the project
+/// (call sites, `resolveFunctionPointerDecl`, the Pass-A planners,
+/// recovery, the FR-40 item graph, the FR-41 coloring probe) reaches a
+/// free function's symbol through `cFunctionSymbolName`, so all of them
+/// compute the identical suffix BY CONSTRUCTION. Suffixing in the
+/// importer's definition path instead would leave the item graph and the
+/// --incremental probe on the UNSUFFIXED name — which is precisely the
+/// pre-FR-114 defect, where the collision cascaded into a spurious
+/// "call argument type mismatch" that stubbed c_main itself.
+///
+/// Guards, each deliberate:
+///  - a template specialization is excluded (its `templateArgSuffix`
+///    already separates instantiations; the pattern's name is claimed by
+///    the hand-written/instantiation collision rules, W2.15);
+///  - a non-identifier name (a free `operator+`) is excluded — those are
+///    FR-119 territory and are rejected before naming matters;
+///  - a method never arrives here (see `overloadSetSize`), so the member
+///    scheme's frozen W2.2 codes are untouched.
+static inline std::string
+overloadParamSuffix(const clang::FunctionDecl *func) {
+  if (func->getTemplateSpecializationArgs())
+    return std::string();
+  if (llvm::isa<clang::CXXMethodDecl>(func))
+    return std::string();
+  if (overloadSetSize(func) <= 1)
+    return std::string();
+  std::string suffix;
+  for (const clang::ParmVarDecl *param : func->parameters()) {
+    suffix += "_";
+    suffix += overloadArgTypeCode(param->getType());
+  }
+  return suffix;
+}
+
 /// The emitted module symbol of the function `func` in a translation unit
 /// whose per-TU mangling tag is `tuTag` (`"tu<i>_"` under a multi-file
 /// import, empty for a single-file one).
@@ -487,6 +581,13 @@ static inline std::string cFunctionSymbolName(const clang::FunctionDecl *func,
     return "c_main";
   std::string base = joinSymbolPrefix(namespacePrefix(func->getDeclContext()),
                                       mangleMemberName(cName));
+  //  - FR-114: a member of a free-function OVERLOAD SET appends one type
+  //    code per parameter (`overloadParamSuffix`, empty for every sole
+  //    owner of a name), so `g(int)`/`g(double)` emit `g_i32`/`g_d`
+  //    instead of colliding. It composes before the template suffix
+  //    textually, but the two are mutually exclusive by construction (a
+  //    specialization returns the empty overload suffix).
+  base += overloadParamSuffix(func);
   //  - W2.15: a function-template specialization appends one type code per
   //    template argument (`templateArgSuffix`), so two instantiations of one
   //    template never share a symbol. The suffix goes on AFTER the namespace
