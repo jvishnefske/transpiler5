@@ -412,6 +412,43 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
       for (const clang::FieldDecl *arm : definition->fields())
         os << arm->getName() << '@'
            << arm->getType().getCanonicalType().getAsString() << ';';
+    // FR-122: the field shape alone cannot see MEMBER semantics, so two
+    // same-named records with identical fields but different member
+    // surfaces merged silently -- and the merged struct_def carried
+    // whichever TU's members (dtor presence, dtor body, method bodies)
+    // were imported first. Both merge orders were byte-diffed as silent
+    // miscompiles on the defined-behavior idiomatic-rename channel
+    // (`struct c` POD vs droppy `struct C`): droppy-first gave the POD a
+    // phantom destructor, POD-first deleted the legitimate dtor line.
+    // Fold the ODR hash of the definition into the key so a divergent
+    // member surface becomes the loud cross-TU conflict below -- a drop
+    // BIT was measured and rejected as designed, because it cannot see
+    // the method-body and dtor-body theft channels.
+    //
+    // Two gates keep the legitimate mergers on the shape-only key:
+    // (a) template specializations are EXEMPT -- W2.16's samePattern
+    //     aliasing merges `Box<char>`/`Box<signed char>`, whose two
+    //     specializations hash DIFFERENTLY while emitting literally the
+    //     same code (residue, recorded not fixed: divergent member
+    //     surfaces of the SAME specialization keep merging silently);
+    // (b) only records with a member surface -- a user-declared dtor
+    //     (mirroring `userDeclaredDestructor`, so this key and the
+    //     has_drop attribute below can never disagree) or any
+    //     non-implicit method -- carry the suffix, so pure field-only
+    //     PODs (FR-108(c) benign twins, CTS-R1 Anon merges) and all of C
+    //     keep today's shape-only merge untouched by construction.
+    if (const auto *cxx = llvm::dyn_cast<clang::CXXRecordDecl>(definition))
+      if (!llvm::isa<clang::ClassTemplateSpecializationDecl>(cxx) &&
+          cxx->hasDefinition()) {
+        bool hasMemberSurface = cxx->hasUserDeclaredDestructor();
+        for (const clang::CXXMethodDecl *method : cxx->methods())
+          if (!method->isImplicit()) {
+            hasMemberSurface = true;
+            break;
+          }
+        if (hasMemberSurface)
+          os << "odr:" << cxx->getODRHash() << ';';
+      }
   }
 
   // File-scope named records go through the tag-versus-ordinary-namespace

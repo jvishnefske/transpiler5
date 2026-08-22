@@ -114,3 +114,119 @@ int main(int argc, char **argv) {
 // TMPL-NOT: emitrust.struct_def @Box_i32
 // TMPLFN-COUNT-1: func.func @Box_i32_get
 // TMPLFN-NOT: func.func @Box_i32_get
+
+// ---------------------------------------------------------------------------
+// FR-122 legs. The dedup key now folds in the ODR hash for records with a
+// member surface (user-declared dtor or any non-implicit method), so these
+// pins say the LEGITIMATE mergers keep merging under the sharpened key:
+//
+//  * DROPPY -- a shared-header class carrying a DESTRUCTOR (plus a method).
+//    No pinned case carried a dtor before this wave -- that gap is exactly
+//    how the FR-122 defect hid: colliding a droppy record with a POD twin
+//    silently gained or lost the `impl Drop` depending on TU order. Two
+//    TUs including ONE droppy header must still resolve to one struct_def
+//    (with has_drop), one dtor body, and one method body -- and this merge
+//    surviving proves getODRHash is stable across separate per-TU
+//    ASTContexts.
+//  * TWIN -- a pure field-only POD spelled out INDEPENDENTLY in two TUs (no
+//    shared header). Gate (b) keeps PODs on the shape-only key, so the
+//    benign twin merge -- and with it all of C -- is untouched.
+//  * ALIAS -- W2.16's samePattern aliasing, `Box<char>` in one TU and
+//    `Box<signed char>` in another, both coding `i8`. The two
+//    specializations hash DIFFERENTLY, so this merge survives only
+//    because gate (a) exempts ClassTemplateSpecializationDecl from the
+//    ODR suffix -- this leg is the pin that keeps that exemption honest.
+// RUN: emitrust-import-c %t/drop-a.cpp %t/drop-b.cpp | FileCheck %s --check-prefix=DROPPY
+// RUN: emitrust-import-c %t/drop-a.cpp %t/drop-b.cpp | FileCheck %s --check-prefix=DROPPYFN
+// RUN: emitrust-import-c %t/twin-a.cpp %t/twin-b.cpp | FileCheck %s --check-prefix=TWIN
+// RUN: emitrust-import-c %t/alias-a.cpp %t/alias-b.cpp | FileCheck %s --check-prefix=ALIAS
+
+//--- drop.h
+#pragma once
+extern "C" int printf(const char *, ...);
+struct Keeper {
+  int v;
+  ~Keeper() { printf("keeper out %d\n", v); }
+  int get() const { return v; }
+};
+
+//--- drop-a.cpp
+#include "drop.h"
+int use_k1(int x) {
+  Keeper k;
+  k.v = x + 3;
+  return k.get();
+}
+
+//--- drop-b.cpp
+#include "drop.h"
+int use_k1(int);
+int main(int argc, char **argv) {
+  Keeper k;
+  k.v = argc + 8;
+  return k.get() + use_k1(argc);
+}
+
+// One struct_def WITH the drop marker, one Drop body, one method body.
+// DROPPY-COUNT-1: emitrust.struct_def @Keeper ["v"] [i32] {emitrust.has_drop}
+// DROPPY-NOT: emitrust.struct_def @Keeper
+// DROPPYFN-COUNT-1: func.func @Keeper_dtor
+// DROPPYFN-NOT: func.func @Keeper_dtor
+// DROPPYFN-COUNT-1: func.func @Keeper_get
+// DROPPYFN-NOT: func.func @Keeper_get
+
+//--- twin-a.cpp
+struct Twin {
+  int a;
+  int b;
+};
+int use_p1(int x) {
+  Twin t;
+  t.a = x;
+  t.b = x + 1;
+  return t.a + t.b;
+}
+
+//--- twin-b.cpp
+struct Twin {
+  int a;
+  int b;
+};
+int use_p1(int);
+int main(int argc, char **argv) {
+  Twin t;
+  t.a = argc + 2;
+  t.b = argc + 3;
+  return t.a + t.b + use_p1(argc);
+}
+
+// TWIN-COUNT-1: emitrust.struct_def @Twin ["a", "b"] [i32, i32]
+// TWIN-NOT: emitrust.struct_def @Twin
+
+//--- alias.h
+#pragma once
+template <typename T>
+struct Box {
+  T v;
+  Box(T x) : v(x) {}
+  T get() const { return v; }
+};
+
+//--- alias-a.cpp
+#include "alias.h"
+int use_a(int x) {
+  Box<char> b((char)x);
+  return (int)b.get();
+}
+
+//--- alias-b.cpp
+#include "alias.h"
+int use_a(int);
+int main(int argc, char **argv) {
+  Box<signed char> b((signed char)argc);
+  return (int)b.get() + use_a(argc);
+}
+
+// ALIAS-COUNT-1: emitrust.struct_def @Box_i8 ["v"] [i8]
+// ALIAS-NOT: emitrust.struct_def @Box_i8
+// ALIAS-NOT: emitrust.struct_def @Box
