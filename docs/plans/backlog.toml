@@ -113,10 +113,10 @@ anchor = "FR-121 DEFECT"
 id = "FR-122"
 rank = 1
 kind = "defect"
-status = "open"
+status = "spiked"
 size = "S"
-title = "Cross-TU dedup key is shape-only: POD merges onto a drop class, inherits Drop"
-summary = "FR-118's miscompile with a LEGITIMATE drop-class donor; pre-existing, widened by FR-112. Fold drop-identity into the shape key -> existing loud shape-conflict rejection."
+title = "Cross-TU dedup: ODR-hash the member surface (drop-bit alone insufficient)"
+summary = "VERIFIED both orders miscompile silently (opposite polarities), rename channel gives a defined-behavior oracle. Fix: shape key += getODRHash, gated non-template + has member surface. Zero suite/corpus cost; diff saved in spike scratch."
 blocked_by = []
 anchor = "FR-122 DEFECT"
 
