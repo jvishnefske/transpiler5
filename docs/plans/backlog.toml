@@ -1,0 +1,265 @@
+# Machine-readable backlog index over design.md.
+#
+# design.md remains the AUTHORITATIVE evidence ledger: every item here has a
+# prose entry there (checkbox + spike verdict + measured evidence), found via
+# `anchor`. This file is the QUEUE: status, rank, and dependency edges, cheap
+# to query (`docs/plans/plan.py next`) instead of reading 12k lines.
+#
+# SYNC RULE (enforced by `plan.py check`, run by test/Driver/backlog-check.c
+# in the fast lit tier): every unchecked `- [ ] FR-*/W2.*` box in design.md
+# must have an entry here whose status is not landed/no-go, and vice versa.
+# Update BOTH files in the same commit.
+#
+# status: open      = not started (spike still required if kind != tooling)
+#         spiked    = spike verdict recorded in design.md; ready to implement
+#         landed    = box checked in design.md (kept only when another item's
+#                     blocked_by references it)
+#         deferred  = deliberately parked, with the reason in design.md
+# rank:   ascending priority among non-landed items; derived from the Track 5
+#         demand measurement (2026-08-21) and the safe-failure rule (defects
+#         that can miscompile outrank features).
+# size:   S (<1 day), M (one wave), L (multi-wave / needs a design decision)
+
+schema = 1
+
+# ---- landed stubs referenced by blocked_by edges ----
+
+[[items]]
+id = "FR-116"
+status = "landed"
+title = "Global touched from a C++ method body breaks the crate"
+anchor = "FR-116 DEFECT"
+
+[[items]]
+id = "FR-117"
+status = "landed"
+title = "cxxMethodBaseName on non-identifier DeclarationName"
+anchor = "FR-117 DEFECT"
+
+[[items]]
+id = "FR-118"
+status = "landed"
+title = "Rejected class half-imports (silent Drop-merge miscompile)"
+anchor = "FR-118 DEFECT"
+
+# ---- open queue, by rank ----
+
+[[items]]
+id = "FR-112"
+rank = 1
+kind = "containment"
+status = "spiked"
+size = "M"
+title = "Class containment: keep the record, reject at the access site"
+summary = "One unsupported member no longer rejects the whole class; omission is safe iff every use is an explicit AST node. GO-WITH-CONSTRAINTS; C1/C3 prerequisites landed as FR-117/FR-118."
+blocked_by = ["FR-117", "FR-118"]
+anchor = "FR-112 CONTAINMENT"
+
+[[items]]
+id = "W2.26"
+rank = 2
+kind = "spike"
+status = "open"
+size = "L"
+title = "Polymorphic RAII: virtual destructors / base with destructor"
+summary = "The measured root under the Track 5 cascade (33.4%); genuinely class-level, so FR-112 cannot reach it. W2.18's empty-base skip loses ~Base once admitted -- that guard is load-bearing."
+blocked_by = ["FR-118"]
+anchor = "W2.26"
+
+[[items]]
+id = "FR-113"
+rank = 3
+kind = "defect"
+status = "open"
+size = "M"
+title = "Rejected scoped enum emits a cast to itself; verifier kills the crate"
+summary = "All 8 spdlog units die after full recovery; the FR-53 successor with a 4-line repro."
+blocked_by = []
+anchor = "FR-113 DEFECT"
+
+[[items]]
+id = "FR-114"
+rank = 4
+kind = "defect"
+status = "open"
+size = "M"
+title = "Same-arity ctor/free-fn overloads collide with a wrong diagnostic"
+summary = "s_new_xx collision blames 'another translation unit' in a single TU; kills raytracing's interval. Same root as W2.23's overload-code finding."
+blocked_by = []
+anchor = "FR-114 DEFECT"
+
+[[items]]
+id = "FR-119"
+rank = 5
+kind = "defect"
+status = "open"
+size = "S"
+title = "Free non-member operator emits `fn (...)` -- exit 0, unbuildable crate"
+summary = "Escapes FR-117's CXXMethodDecl-scoped backstops; violates fail-loudly. Symbol-spelling fix with byte-identity consequences."
+blocked_by = []
+anchor = "FR-119 DEFECT"
+
+[[items]]
+id = "FR-115"
+rank = 6
+kind = "defect"
+status = "open"
+size = "M"
+title = "Rejected C++ records carry no diagnostic (70% of unported items silent)"
+summary = "Measurability defect: cascade rooting needed a second tool. FR-112 pays part of this down for contained shapes."
+blocked_by = []
+anchor = "FR-115 DEFECT"
+
+[[items]]
+id = "W2.25"
+rank = 7
+kind = "feature"
+status = "open"
+size = "L"
+title = "Operator overloading"
+summary = "Biggest single construct (2212 items) but 1625 of those are cascade; FR-112 first, then size against the 587-item residue."
+blocked_by = ["FR-112"]
+anchor = "W2.25"
+
+[[items]]
+id = "FR-120"
+rank = 8
+kind = "feature"
+status = "open"
+size = "L"
+title = "Struct-pointer prerequisite: method calls + base-subobject bindings"
+summary = "W2.19's named prerequisite: route p->m() through the working p->x deref path (small), add a base-subobject binding kind to PointerRegion (large), teach peelPointerCast CK_DerivedToBase, re-sync the ItemColoring screens."
+blocked_by = []
+anchor = "FR-120"
+
+[[items]]
+id = "W2.19a"
+rank = 9
+kind = "feature"
+status = "spiked"
+size = "M"
+title = "Virtual methods on values only (static dispatch)"
+summary = "Needs zero pointer work; byte-diffed by the W2.19 spike's value-call legs. Rejects every base-pointer/reference use, LOCATED."
+blocked_by = []
+anchor = "W2.19"
+
+[[items]]
+id = "W2.19b"
+rank = 10
+kind = "feature"
+status = "spiked"
+size = "M"
+title = "Devirtualized single-object base pointer (flips 00901)"
+summary = "Leg D: byte-identical; soundness already enforced by the multi-object rejection. Needs FR-120 items 1-3."
+blocked_by = ["FR-120"]
+anchor = "W2.19"
+
+[[items]]
+id = "FR-110"
+rank = 11
+kind = "quality"
+status = "open"
+size = "L"
+title = "Emitted C++ methods carry their class name (bi.box_i32_get())"
+summary = "Biggest idiomaticity gap, clippy-blind; fix at the W2.17 impl-move rename hook, NOT the mangler. Heavy golden churn, byte-identity contract."
+blocked_by = []
+anchor = "FR-110 QUALITY"
+
+[[items]]
+id = "W2.23"
+rank = 12
+kind = "feature"
+status = "spiked"
+size = "M"
+title = "Copy constructors / value semantics"
+summary = "GO: only the NRVO-candidate return is implementation-defined; AST already encodes guaranteed elision as absent nodes. 00801 additionally needs the ConstructorConversion unwrap (FR-116 already landed). Demand: 4 items."
+blocked_by = ["FR-116"]
+anchor = "W2.23 Copy constructors"
+
+[[items]]
+id = "FR-111"
+rank = 13
+kind = "quality"
+status = "open"
+size = "S"
+title = "field_reassign_with_default fuse over-gated for Drop types"
+summary = "Narrow the bindingHasDrop guard to 'has Drop AND not all-fields'."
+blocked_by = []
+anchor = "FR-111 QUALITY"
+
+[[items]]
+id = "FR-103"
+rank = 14
+kind = "feature"
+status = "open"
+size = "M"
+title = "Undefined extern globals: recover instead of failing the TU"
+summary = "lwIP 18/20 -> 20/20 units; value mostly gated behind the landed FR-102, so re-measure before implementing."
+blocked_by = []
+anchor = "FR-103 Undefined extern globals"
+
+[[items]]
+id = "FR-104"
+rank = 15
+kind = "feature"
+status = "open"
+size = "L"
+title = "Returned cursors into a PARAMETER region (decidable sub-family)"
+summary = "The #2 C corpus family (97 items); only the caller-supplied-region shape is proposed."
+blocked_by = []
+anchor = "FR-104 Returned cursors"
+
+[[items]]
+id = "FR-106"
+rank = 16
+kind = "defect"
+status = "open"
+size = "M"
+title = "unused_assignments deny fires on real code"
+summary = "The emitted-crate lint tripwire rejects legitimate programs; see entry for the measured shapes."
+blocked_by = []
+anchor = "FR-106 DEFECT"
+
+[[items]]
+id = "FR-82"
+rank = 17
+kind = "feature"
+status = "open"
+size = "M"
+title = "Interior-member addresses of requirement globals"
+summary = "Longstanding C-side front; see entry."
+blocked_by = []
+anchor = "FR-82 Interior-member addresses"
+
+[[items]]
+id = "W2.24"
+rank = 18
+kind = "feature"
+status = "spiked"
+size = "L"
+title = "Exceptions as Result threading (synthesized closed data enum)"
+summary = "GO on image A; image B measured NO-GO (catch_unwind swallows the project's own UB-refinement panics). Demand is nil (0 in RealWorld, 11 items in Track 5) -- stays last."
+blocked_by = []
+anchor = "W2.24"
+
+[[items]]
+id = "W2.19c"
+rank = 19
+kind = "feature"
+status = "deferred"
+size = "L"
+title = "Trait objects (the only image reaching the shapes corpus)"
+summary = "Needs a user-trait verifier contract, a real trait-def op with &self + default bodies, an upcast op, and __base_<Root> + forwarding synthesis (whose omission is the measured 33-9 silent miscompile)."
+blocked_by = ["FR-120", "W2.19b"]
+anchor = "W2.19"
+
+[[items]]
+id = "T-EPOCH4"
+rank = 20
+kind = "tooling"
+status = "open"
+size = "S"
+title = "Harness epoch 4: freeze the union corpus (grown C + first C++)"
+summary = "epoch-3 froze 144 EndToEnd .c files; there are now 167 plus 52 measurable C++ crates no epoch covers."
+blocked_by = []
+anchor = "epoch 4"

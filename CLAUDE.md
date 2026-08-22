@@ -1,9 +1,22 @@
 # Working protocol: plan, spike, subagent TDD, commit, repeat
 
-1. **Plan in design.md.** Every feature is a numbered FR with testable
-   acceptance criteria; check its box only when tests validate it. Spike
-   verdicts (GO / NO-GO / design constraints found) are recorded inside the
-   FR entry so the rationale survives the session.
+1. **Plan in design.md; queue in docs/plans/backlog.toml.** Every feature
+   is a numbered FR with testable acceptance criteria in design.md (the
+   prose EVIDENCE ledger — spike verdicts and measured evidence live
+   there and nowhere else); check its box only when tests validate it.
+   `docs/plans/backlog.toml` is the machine-readable index over the open
+   items (status, rank, blocked_by). Query it instead of re-reading
+   design.md:
+   - `python3 docs/plans/plan.py next -n 3` — next unblocked items
+   - `python3 docs/plans/plan.py brief FR-113` — just that prose entry
+   - `python3 docs/plans/plan.py json | jq ...` — arbitrary queries
+   Update BOTH files in the same commit (new FR → new index entry; box
+   checked → status = landed). `plan.py check` enforces the sync and runs
+   in the fast lit tier (test/Driver/backlog-check.c), so drift fails the
+   pre-commit gate. When editing design.md by script, prefer anchored
+   single-entry edits over start..end range replacements — a range edit
+   once silently deleted three FR entries, and the checker exists because
+   of it.
 2. **Spike before implementing.** The business case is settled; the risk is
    implementation detail. De-risk with code experiments FIRST: adversarial
    inputs, differential probes (solo vs joint, mode A vs mode B), and
@@ -64,3 +77,10 @@
   without a new idea AND the byte-diff suite in the loop.
 - Worktree waves: never `git stash` in agent worktrees (the stash is shared
   across worktrees); use diff + checkout + apply -3.
+- Spike/agent worktrees: run `scripts/spike-worktree-setup.sh` from inside
+  the worktree FIRST. It fast-forwards to the main tree's HEAD (fresh
+  worktrees have started 100+ commits stale) and pins llvm-config to the
+  devshell's LLVM via a meson native file (the host's newer
+  /usr/bin/llvm-config-N otherwise wins and the build fails on mixed
+  headers). Compile in the background; measure unpatched behavior with
+  read-only COPIES of the main tree's built tools meanwhile.
