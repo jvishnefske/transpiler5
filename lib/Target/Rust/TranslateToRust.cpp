@@ -1056,11 +1056,12 @@ static bool isDroppedZeroShiftAmount(OpOperand &use) {
 
 /// FR-63 (clippy::unnecessary_cast): the enum def `enumType` names, or null
 /// when none is visible from `op` (no def keeps today's rendering -- the
-/// conservative direction).
+/// conservative direction). Resolved through EnumDefOp::lookupFrom
+/// (FR-113): `emitrust.impl` is a SymbolTable, so a nearest-table lookup
+/// from inside a C++ method could never see the module-level enum_def.
 static emitrust::EnumDefOp lookupEnumDef(Operation *op,
                                          emitrust::EnumType enumType) {
-  return SymbolTable::lookupNearestSymbolFrom<emitrust::EnumDefOp>(
-      op, StringAttr::get(op->getContext(), enumType.getName()));
+  return emitrust::EnumDefOp::lookupFrom(op, enumType.getName());
 }
 
 /// FR-63 (clippy::unnecessary_cast): whether `type` renders exactly as the
@@ -4771,8 +4772,12 @@ LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
   // source converted to the enum's storage type, preserving the value
   // exactly as C's conversion to the underlying type does.
   if (auto enumType = dyn_cast<emitrust::EnumType>(op->getResult(0).getType())) {
-    auto enumDef = SymbolTable::lookupNearestSymbolFrom<emitrust::EnumDefOp>(
-        op, StringAttr::get(op->getContext(), enumType.getName()));
+    // FR-113: resolved in the enclosing module's table (EnumDefOp::
+    // lookupFrom) -- `emitrust.impl` is a SymbolTable, so the previous
+    // nearest-table lookup could never see a module-level enum_def from
+    // inside a C++ method and hard-errored on every cast-to-enum there.
+    auto enumDef =
+        emitrust::EnumDefOp::lookupFrom(op, enumType.getName());
     if (!enumDef)
       return op->emitOpError("cast to enum type ")
              << enumType << " requires a visible emitrust.enum_def";

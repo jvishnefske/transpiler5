@@ -1583,18 +1583,34 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
     return success(); // Incomplete; imported once completed or used.
   if (definition->getName().empty())
     return success(); // Anonymous; enumerators import as i32 at use sites.
+  // FR-113: an enum this import already rejected has NO enum_def in the
+  // module, so there is no Rust type for a caller to name and no variant
+  // constant to reference. Saying so here — at the use site, which is where
+  // the type or enumerator was wanted — is what keeps a recovering import
+  // from shipping a field or a constant whose type does not exist (the
+  // measured failure was a SILENTLY unbuildable crate: `pub m: Match` with
+  // no `Match` anywhere, E0425 with zero attribution). Mirrors
+  // `importRecord`'s rejectedRecords wrapper; see CImporterInternal.h for
+  // why the ordinary `importedEnums` memo cannot answer this.
+  if (rejectedEnums.contains(definition))
+    return emitError(loc)
+           << "unsupported: enum '" << definition->getName()
+           << "' was rejected, so a type naming it cannot be imported";
   if (!importedEnums.insert(definition).second)
     return success();
+  LogicalResult imported = importEnumUncached(definition);
+  if (failed(imported))
+    rejectedEnums.insert(definition);
+  return imported;
+}
+
+LogicalResult
+CImporter::importEnumUncached(const clang::EnumDecl *definition) {
   Location defLoc = translateLoc(definition->getBeginLoc());
-  // A scoped enumeration (`enum class`/`enum struct`) has a distinct value
-  // type with no implicit integer conversions; the open-enum model (a tuple
-  // struct freely convertible to and from its integer) does not represent it.
-  // Rejected here, located at the definition, rather than surfacing later as
-  // the misleading "assigned value type does not match the place" mismatch at
-  // the first use site.
-  if (definition->isScoped())
-    return emitError(defLoc)
-           << "unsupported: scoped enumeration (enum class/struct)";
+  // A SCOPED enumeration (`enum class`/`enum struct`) is deliberately NOT
+  // rejected here (FR-113): scoping is compile-time namespacing that clang
+  // already discharged at every resolved use site, so the definition
+  // imports as the same underlying-typed open enum an unscoped enum gets.
   if (isRustKeyword(definition->getName()))
     return emitError(defLoc) << "unsupported: enum name '"
                              << definition->getName()

@@ -1,30 +1,40 @@
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/enum-class.cpp 2>&1 | FileCheck %s --check-prefix=ENUMCLASS
-// RUN: not emitrust-import-c %t/enum-struct.cpp 2>&1 | FileCheck %s --check-prefix=ENUMSTRUCT
+// RUN: not emitrust-import-c %t/keyword-name.cpp 2>&1 | FileCheck %s --check-prefix=KWNAME
+// RUN: not emitrust-import-c %t/big-value.cpp 2>&1 | FileCheck %s --check-prefix=BIGVAL
+// RUN: not emitrust-import-c %t/empty.cpp 2>&1 | FileCheck %s --check-prefix=EMPTY
 // RUN: not emitrust-import-c %t/nonliftable-default.cpp 2>&1 | FileCheck %s --check-prefix=NLDEFAULT
 
-// Two Stage-D diagnostic-quality fixes:
-//  - a scoped enumeration (`enum class`/`enum struct`) rejects with a specific
-//    message located AT THE DEFINITION, not the old misleading "assigned value
-//    type does not match the place" surfacing at the first use site;
-//  - a defaulted argument the importer cannot lift now rejects with a real
-//    file:line:col location (recursed into the default value expression),
-//    where it used to reject WITHOUT a location prefix.
+// FR-113 RETIRED the blanket scoped-enumeration rejection this file's first
+// two legs used to pin: `enum class`/`enum struct` now import as their
+// underlying-typed C-like image (test/Import/Cpp/cpp-enum-class.cpp pins
+// the admission). What this file pins instead is that the RESIDUAL enum
+// definition gates -- keyword-named enums, values outside i32, an empty
+// enum (expressible only in C++) -- still reject scoped definitions with
+// the same LOCATED wordings the unscoped gates carry, at the definition,
+// not as a downstream type mismatch. The NLDEFAULT leg is unrelated to
+// enums and survives from the original Stage-D file: a defaulted argument
+// the importer cannot lift rejects with a real file:line:col location
+// (recursed into the default value expression).
 
-//--- enum-class.cpp
-// ENUMCLASS: enum-class.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: scoped enumeration (enum class/struct)
-enum class Color { Red, Green, Blue };
-int use() {
-  Color c = Color::Green;
-  return (int)c;
+//--- keyword-name.cpp
+// KWNAME: keyword-name.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: enum name 'match' is a Rust keyword
+enum class match { First, Second };
+int use(match m) {
+  return static_cast<int>(m);
 }
 
-//--- enum-struct.cpp
-// ENUMSTRUCT: enum-struct.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: scoped enumeration (enum class/struct)
-enum struct Mode { Off, On };
-int use() {
-  Mode m = Mode::On;
-  return (int)m;
+//--- big-value.cpp
+// BIGVAL: big-value.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: enumerator value does not fit in i32
+enum class Big : long long { V = 3000000000LL };
+int use(Big b) {
+  return 0;
+}
+
+//--- empty.cpp
+// EMPTY: empty.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: enum with no enumerators
+enum class Empty {};
+int use(Empty e) {
+  return 0;
 }
 
 //--- nonliftable-default.cpp

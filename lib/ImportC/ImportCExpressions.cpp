@@ -140,14 +140,23 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
     return emitRValue(materialize->getSubExpr());
   // An enumerator used as a plain expression has type `int` in C: a named
   // enum's constant is rendered as its Rust variant cast to i32, while an
-  // anonymous enum's constant is a plain i32 value.
+  // anonymous enum's constant is a plain i32 value. In C++ the reference
+  // HAS the enum type (both scoped and unscoped), so the enum-typed
+  // constant is returned as-is (FR-113 C1): the enclosing context is
+  // either enum-typed itself (assignment, return, call argument, a CK_NoOp
+  // `static_cast<Color>(Blue)`) or an explicit IntegralCast node that
+  // emits the enum-to-integer conversion — forcing i32 here instead made
+  // `Color c = Color::Green;` reject with the misleading "assigned value
+  // type does not match the place". The type test keeps the C path
+  // byte-identical, because a C enumerator reference is int-typed.
   if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e))
     if (const auto *enumerator =
             llvm::dyn_cast<clang::EnumConstantDecl>(ref->getDecl())) {
       FailureOr<Value> constant = emitEnumConstant(enumerator, loc);
       if (failed(constant))
         return failure();
-      if (llvm::isa<emitrust::EnumType>((*constant).getType()))
+      if (llvm::isa<emitrust::EnumType>((*constant).getType()) &&
+          !namedEnumDeclOf(ref->getType()))
         return castEnumToI32(loc, *constant);
       return constant;
     }
@@ -630,6 +639,25 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
       auto sourceType = llvm::dyn_cast<IntegerType>((*value).getType());
       if (!sourceType || sourceType.getWidth() == 1)
         return emitError(loc) << "unsupported: integer to enum conversion";
+      // FR-113 C2: the emitted open enum stores a fixed u32/i32, but C++'s
+      // conversion to the enum truncates to the (possibly NARROWER) fixed
+      // underlying type first — `static_cast<PT>(301)` with underlying
+      // `unsigned char` is 45, not 301 (a measured byte-diff miscompile for
+      // already-admitted unscoped `enum : unsigned char` too). An
+      // intermediate cast at the underlying width reproduces the
+      // truncation (and, for a signed underlying, the sign-extension back
+      // into storage): rendered `Pt(v as u8 as u32)`.
+      clang::QualType underlying = target->getIntegerType();
+      if (unsigned width = astContext().getTypeSize(underlying); width < 32) {
+        Type narrowType =
+            underlying->isUnsignedIntegerType()
+                ? Type(IntegerType::get(builder.getContext(), width,
+                                        IntegerType::Unsigned))
+                : Type(builder.getIntegerType(width));
+        if ((*value).getType() != narrowType)
+          value = builder.create<emitrust::CastOp>(loc, narrowType, *value)
+                      .getResult();
+      }
       FailureOr<Type> mapped = mapType(cast->getType(), loc);
       if (failed(mapped))
         return failure();

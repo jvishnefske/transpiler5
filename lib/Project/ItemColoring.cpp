@@ -698,10 +698,13 @@ void AdmissibilityProbe::probeDeclsIn(const clang::DeclContext *context) {
       continue;
     }
     if (llvm::isa<clang::EnumDecl>(decl)) {
-      // Enums are unconditionally admissible: `CImporter::importEnum` has no
-      // syntactic rejection at all, so there is nothing here a screen could
-      // honestly find. A scoped `enum class` is deliberately NOT screened —
-      // see the under-approximation list.
+      // Enums are screened as unconditionally admissible. Since FR-113
+      // admitted scoped enums, that is NEARLY true: `CImporter::importEnum`
+      // still rejects a keyword-named enum or enumerator, a value outside
+      // i32, an empty enum, and a cross-TU shape conflict. Those are left
+      // GREEN here deliberately — a false GREEN costs one wasted import
+      // attempt (the allowed, optimistic direction) — see the
+      // under-approximation list.
       continue;
     }
     if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
@@ -1119,8 +1122,12 @@ ItemColoring ColoringSolver::solve() {
 ///  - `volatile`-qualified types. Rejected by `mapType`, but a top-level
 ///    `volatile` on a parameter object is stripped and accepted, and an array
 ///    parameter's bracket qualifiers adjust onto the decayed pointer.
-///  - SCOPED ENUMS (`enum class`). `importEnum` has no scoped-enum check; the
-///    probe does not add one it cannot justify from the importer's own code.
+///  - ENUM DEFINITION GATES. Scoped enums are ADMITTED since FR-113 (they
+///    import as their underlying-typed C-like image), and `importEnum`'s
+///    residual gates — keyword-named enums/enumerators, values outside i32,
+///    an empty enum, a cross-TU shape conflict — are left GREEN: rare in
+///    practice, cheap to discover by an import attempt, and the shape
+///    conflict is a cross-TU property a per-item probe cannot see anyway.
 ///  - `dynamic_cast`, `typeid`, RTTI generally. No importer code handles them,
 ///    but they are also unreachable without the base classes and virtual
 ///    methods that are already screened, so a tag would never fire alone.

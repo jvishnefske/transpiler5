@@ -2863,7 +2863,21 @@ private:
   /// so spellings that are Rust keywords are rejected, as are values
   /// outside the `i32` range and duplicate values (the generated Rust enum
   /// needs one variant per discriminant).
+  ///
+  /// FR-113: an enum whose import FAILED is remembered (`rejectedEnums`) and
+  /// every later attempt to materialize it fails again, at the new use site
+  /// — the same failure-sticky memo `importRecord` carries, because the same
+  /// cache poison existed here: `importedEnums` is marked before any gate
+  /// runs, so a rejected definition looked already-imported and `mapType`'s
+  /// enum branch handed back an `!emitrust.enum<...>` with no enum_def in
+  /// the module (a module-wide verifier kill under `--emit=crate`, or a
+  /// silently unbuildable crate under `--recover`).
   LogicalResult importEnum(const clang::EnumDecl *enumDecl, Location loc);
+
+  /// `importEnum`'s body, without the rejection memo around it. Every exit
+  /// is a verdict on THIS definition, which is what makes the wrapper's
+  /// "remember the failure" correct. Mirrors `importRecordUncached`.
+  LogicalResult importEnumUncached(const clang::EnumDecl *definition);
 
   /// Imports a function declaration or definition as a `func.func`. C
   /// `main` is renamed to `c_main`. Body-less variadic declarations (such
@@ -6546,6 +6560,14 @@ private:
   llvm::SmallPtrSet<const clang::RecordDecl *, 4> rejectedRecords;
   /// Enum definitions already imported (keyed on the defining decl).
   llvm::SmallPtrSet<const clang::EnumDecl *, 8> importedEnums;
+  /// Enum definitions whose import was REJECTED (keyed on the defining
+  /// decl). Same contract as `rejectedRecords`: `importedEnums` is marked
+  /// before the gates run, so a rejected enum is in both sets and only this
+  /// one says whether an enum_def exists. Consulted by `importEnum` so that
+  /// naming a rejected enum (through `mapType`'s enum branch or
+  /// `emitEnumConstant`) fails at the use site instead of emitting a
+  /// reference to an enum that was never defined (FR-113).
+  llvm::SmallPtrSet<const clang::EnumDecl *, 4> rejectedEnums;
   /// Imported functions by MLIR symbol name.
   llvm::StringMap<func::FuncOp> functions;
   /// Imported globals (file-scope variables and function-local statics),
