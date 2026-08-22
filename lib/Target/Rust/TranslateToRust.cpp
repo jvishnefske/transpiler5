@@ -1246,8 +1246,26 @@ bool RustEmitter::methodCallMutatesReceiver(emitrust::MethodCallOp call) {
     // owned-free-wrapper shape).
     if (call.getMethod().starts_with("as_mut"))
       return true;
-    // A recognized STL container: classify by the (closed) method-name set.
-    return isMutatingStlMethod(call.getMethod());
+    // W2.21: a `Box<Struct>` receiver (std::unique_ptr). The method is the
+    // PAYLOAD struct's own, called through Rust auto-deref, so its
+    // mutability is the payload method's `self` — not anything the closed
+    // STL name set can answer. Without this branch a `Box<Node>` whose only
+    // uses are user-named methods renders `let q: Box<Node>` and dies as
+    // rustc E0596 ("cannot borrow `*q` as mutable"), measured on the
+    // spike's loop-body box.
+    if (call.getMethod() != "as_ref" && call.getMethod() != "as_mut") {
+      llvm::StringRef spelling =
+          cast<emitrust::OpaqueType>(valueType).getValue();
+      if (spelling.starts_with("Box<") && spelling.ends_with(">")) {
+        llvm::StringRef payload = spelling.drop_front(4).drop_back(1);
+        if (!payload.contains('<'))
+          valueType = emitrust::StructType::get(call.getContext(), payload);
+      }
+    }
+    if (!isa<emitrust::StructType>(valueType))
+      // A recognized STL container: classify by the (closed) method-name
+      // set.
+      return isMutatingStlMethod(call.getMethod());
   }
   // A user struct method: the receiver is mutable exactly when the method's
   // `self` parameter is a `&mut` reference.
@@ -2907,6 +2925,19 @@ LogicalResult RustEmitter::emitDefaultValue(Location loc, Type type) {
     // C null pointer, mirroring `!emitrust.fn_ptr`'s None above.
     if (opaqueType.getValue().starts_with("Option<")) {
       os << "None";
+      return success();
+    }
+    // W2.21: the defensive arm for a `Box<T>` (std::unique_ptr) place. Like
+    // the arms above this is dead for every program the importer produces
+    // (`emitStlBoxLocalInit` always follows the place with an explicit
+    // `emitrust.assign` of `Box::new(..)`, and a Box local with no
+    // initializer is a located rejection because C++'s default-constructed
+    // unique_ptr is NULL), but `emitVariable` renders a default for every
+    // no-initializer `emitrust.variable` and dies at translate time
+    // otherwise. `Default::default()` resolves under the emitted
+    // `let x: Box<T> =` annotation.
+    if (opaqueType.getValue().starts_with("Box<")) {
+      os << "Default::default()";
       return success();
     }
   }

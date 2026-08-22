@@ -28,6 +28,7 @@
 // enclosing statements, which is the one place this importer needs clang's
 // parent map (every other walk is top-down).
 #include "clang/AST/ASTTypeTraits.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "clang/AST/ParentMapContext.h"
 
 using namespace mlir;
@@ -349,6 +350,19 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   // (including the pointer's own qualifier, `int * volatile p`).
   if (hasVolatileQualifier(astContext(), var->getType()))
     return emitError(loc) << "unsupported: volatile-qualified type";
+  // W2.21: `int *q = p.get();` / `int *q = p.release();`. The pointer
+  // PLANNER claims this local long before `emitStlMemberCall` runs and
+  // reports its generic "pointer assigned a non-address value"; the real
+  // blocker is that a raw pointer out of a Box has no representation at
+  // all (a raw `T *` bound to a local is scalarized away entirely in this
+  // model, measured), and release() additionally LEAKS the payload unless
+  // the caller frees it.
+  if (const clang::Expr *init = var->getInit())
+    if (llvm::StringRef rawCall = matchStlBoxRawPointerCall(init);
+        !rawCall.empty())
+      return emitError(loc) << "unsupported: std::unique_ptr::" << rawCall
+                            << "() hands out a raw pointer to the payload, "
+                               "which has no place in this model";
   // W2.17: a destructor-carrying object is admitted only where its Rust
   // `Drop` runs at the same program point as the C++ destructor. The three
   // rejected positions here are all measured SILENT miscompiles: a
@@ -531,6 +545,15 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
         return storeToPlace(loc, place, *value);
       }
       if (isStlOpaque) {
+        // W2.21: a `std::unique_ptr` local. Its initializer is NOT a
+        // CXXConstructExpr — `auto p = std::make_unique<T>(..)` is
+        // ExprWithCleanups -> CXXBindTemporaryExpr -> CallExpr under C++17
+        // guaranteed elision — so it diverts before the construct
+        // dispatch below, which would reject it as an unrecognized
+        // initializer without ever naming unique_ptr.
+        if (auto boxType = llvm::dyn_cast<emitrust::OpaqueType>(*mlirType);
+            boxType && isStlBoxOpaque(boxType))
+          return emitStlBoxLocalInit(place, boxType, init, loc);
         const clang::Expr *unwrapped = init->IgnoreParenImpCasts();
         const auto *construct =
             llvm::dyn_cast<clang::CXXConstructExpr>(unwrapped);
@@ -620,6 +643,15 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
         return failure();
       return storeToPlace(loc, place, *value);
     }
+    // W2.21: a `std::unique_ptr` local with no significant initializer is a
+    // DEFAULT-CONSTRUCTED (null) unique_ptr. A Rust `Box<T>` has no null
+    // state, and letting it fall through here would leave the place
+    // rendering the emitter's defensive `Default::default()` arm — a live,
+    // non-null payload where C++ had none.
+    if (isStlOpaque && isStlBoxOpaque(*mlirType))
+      return emitError(loc)
+             << "unsupported: a Box<T> cannot be null, so a "
+                "default-constructed std::unique_ptr has no image";
     return success();
   }
 
@@ -1065,6 +1097,203 @@ CImporter::emitPairConstructInit(Value place,
   }
   if (index != construct->getNumArgs())
     return emitError(loc) << "unsupported: std::pair constructor arity";
+  return success();
+}
+
+LogicalResult CImporter::emitStlBoxLocalInit(Value place,
+                                             emitrust::OpaqueType boxType,
+                                             const clang::Expr *init,
+                                             Location loc) {
+  Type payload = stlBoxPayloadType(boxType);
+  if (!payload)
+    return emitError(loc) << "unsupported: std::unique_ptr payload type";
+  // C++17 guaranteed elision means there is no CXXConstructExpr wrapper on
+  // a make_unique initializer at all: the shape is ExprWithCleanups ->
+  // CXXBindTemporaryExpr -> CallExpr (AST-confirmed, clang 21.1.8 /
+  // libstdc++ 15).
+  const clang::Expr *e = init->IgnoreParenImpCasts();
+  while (true) {
+    if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e)) {
+      e = cleanups->getSubExpr()->IgnoreParenImpCasts();
+      continue;
+    }
+    if (const auto *bind = llvm::dyn_cast<clang::CXXBindTemporaryExpr>(e)) {
+      e = bind->getSubExpr()->IgnoreParenImpCasts();
+      continue;
+    }
+    if (const auto *materialize =
+            llvm::dyn_cast<clang::MaterializeTemporaryExpr>(e)) {
+      e = materialize->getSubExpr()->IgnoreParenImpCasts();
+      continue;
+    }
+    break;
+  }
+  if (const auto *construct = llvm::dyn_cast<clang::CXXConstructExpr>(e)) {
+    const clang::CXXConstructorDecl *ctor = construct->getConstructor();
+    if (ctor && ctor->isCopyOrMoveConstructor())
+      return emitError(loc)
+             << "unsupported: a moved-from std::unique_ptr is null and "
+                "testable, but Rust cannot read a moved-from binding";
+    // The DEFAULT constructor (and the nullptr_t one) is the nullability
+    // boundary; `std::unique_ptr<T> p(new T(..));` is a different shape —
+    // an owning-pointer adoption whose `new` expression this subset does
+    // not model at all — and says so.
+    if (!ctor || ctor->isDefaultConstructor() ||
+        construct->getNumArgs() == 0 ||
+        llvm::all_of(construct->arguments(), [](const clang::Expr *arg) {
+          return llvm::isa<clang::CXXDefaultArgExpr>(arg) ||
+                 arg->getType()->isNullPtrType();
+        }))
+      return emitError(loc)
+             << "unsupported: a Box<T> cannot be null, so a "
+                "default-constructed std::unique_ptr has no image";
+    return emitError(loc)
+           << "unsupported: this std::unique_ptr initializer shape is not "
+              "supported (only std::make_unique<T>(args) is recognized)";
+  }
+  const auto *call = llvm::dyn_cast<clang::CallExpr>(e);
+  const clang::FunctionDecl *callee = call ? call->getDirectCallee() : nullptr;
+  if (!callee || !callee->isInStdNamespace() ||
+      !callee->getDeclName().isIdentifier() ||
+      callee->getName() != "make_unique")
+    return emitError(loc)
+           << "unsupported: this std::unique_ptr initializer shape is not "
+              "supported (only std::make_unique<T>(args) is recognized)";
+  // A SCALAR payload is one `Box::new(v)`. `std::make_unique<int>()`
+  // VALUE-initializes, so the zero-argument spelling boxes a zero.
+  if (!llvm::isa<emitrust::StructType>(payload)) {
+    Value value;
+    if (call->getNumArgs() == 0) {
+      if (auto intType = llvm::dyn_cast<IntegerType>(payload))
+        value = createScalarIntConstant(loc, intType, 0);
+      else
+        return emitError(loc)
+               << "unsupported: this std::unique_ptr initializer shape is "
+                  "not supported (only std::make_unique<T>(args) is "
+                  "recognized)";
+    } else if (call->getNumArgs() == 1) {
+      FailureOr<Value> argument = emitRValue(call->getArg(0));
+      if (failed(argument))
+        return failure();
+      // The forwarding-reference parameter (`Args&&`) applies NO
+      // conversion, so the argument arrives at its own type; an
+      // implicit-conversion surface is out of subset rather than silently
+      // widened here.
+      if ((*argument).getType() != payload)
+        return emitError(loc)
+               << "unsupported: std::make_unique argument type does not "
+                  "match the std::unique_ptr payload";
+      value = *argument;
+    } else {
+      return emitError(loc)
+             << "unsupported: this std::unique_ptr initializer shape is not "
+                "supported (only std::make_unique<T>(args) is recognized)";
+    }
+    Value boxed = builder
+                      .create<emitrust::CallOpaqueOp>(
+                          loc, TypeRange{Type(boxType)},
+                          builder.getStringAttr("Box::new"),
+                          /*args=*/ArrayAttr(), ValueRange{value})
+                      .getResult(0);
+    return storeToPlace(loc, place, boxed);
+  }
+  // A STRUCT payload takes the W2.17 two-step: `Box::new(T::default())`
+  // establishes the storage, then the C++ constructor runs as an ordinary
+  // `&mut self` method on the Box place (Rust auto-deref). This is exactly
+  // the shape a plain `T t(args);` local already takes
+  // (`emitCXXConstructInit`), lifted one indirection.
+  auto structType = llvm::cast<emitrust::StructType>(payload);
+  const clang::RecordType *record =
+      call->getType().getCanonicalType()->getAs<clang::RecordType>();
+  const auto *spec =
+      record ? llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(
+                   record->getDecl())
+             : nullptr;
+  if (!spec || spec->getTemplateArgs().size() < 1 ||
+      spec->getTemplateArgs()[0].getKind() != clang::TemplateArgument::Type)
+    return emitError(loc)
+           << "unsupported: std::unique_ptr shape could not be determined";
+  const clang::CXXRecordDecl *payloadRecord =
+      spec->getTemplateArgs()[0].getAsType()->getAsCXXRecordDecl();
+  if (!payloadRecord || !payloadRecord->hasDefinition())
+    return emitError(loc) << "unsupported: std::unique_ptr payload type";
+  Value defaulted =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{payload},
+              builder.getStringAttr((structType.getName() + "::default").str()),
+              /*args=*/ArrayAttr(), ValueRange{})
+          .getResult(0);
+  Value boxed = builder
+                    .create<emitrust::CallOpaqueOp>(
+                        loc, TypeRange{Type(boxType)},
+                        builder.getStringAttr("Box::new"),
+                        /*args=*/ArrayAttr(), ValueRange{defaulted})
+                    .getResult(0);
+  if (failed(storeToPlace(loc, place, boxed)))
+    return failure();
+  // Constructor selection. The instantiated `std::make_unique<T, Args...>`
+  // body is not imported, so the constructor is resolved here by ARITY over
+  // the user-declared, non-copy/move set; an overload set that cannot be
+  // resolved that way rejects rather than guessing.
+  llvm::SmallVector<const clang::CXXConstructorDecl *, 2> candidates;
+  for (const clang::CXXConstructorDecl *ctor : payloadRecord->ctors()) {
+    if (ctor->isImplicit() || ctor->isDeleted() ||
+        ctor->isCopyOrMoveConstructor())
+      continue;
+    if (ctor->getNumParams() != call->getNumArgs())
+      continue;
+    candidates.push_back(ctor);
+  }
+  if (candidates.empty()) {
+    // `std::make_unique<T>()` on a class with NO user-declared default
+    // constructor VALUE-initializes, which zeroes every member — the same
+    // thing `T::default()` above already produced. An in-class member
+    // initializer (NSDMI) would make that false, so it rejects.
+    if (call->getNumArgs() == 0 &&
+        !payloadRecord->hasUserProvidedDefaultConstructor()) {
+      for (const clang::FieldDecl *field : payloadRecord->fields())
+        if (field->hasInClassInitializer())
+          return emitError(loc)
+                 << "unsupported: std::make_unique of a class with in-class "
+                    "member initializers and no constructor";
+      return success();
+    }
+    return emitError(loc)
+           << "unsupported: no std::make_unique constructor of '"
+           << payloadRecord->getName()
+           << "' matches the argument count";
+  }
+  if (candidates.size() != 1)
+    return emitError(loc)
+           << "unsupported: std::make_unique constructor overload of '"
+           << payloadRecord->getName() << "' is ambiguous by arity";
+  std::string ctorName = cxxMethodMangledName(candidates.front());
+  func::FuncOp target = functions.lookup(ctorName);
+  if (!target)
+    return emitError(loc) << "unsupported: call to an unimported constructor '"
+                          << ctorName << "'";
+  FunctionType targetType = target.getFunctionType();
+  if (call->getNumArgs() + 1 != targetType.getNumInputs())
+    return emitError(loc)
+           << "unsupported: constructor argument count mismatch";
+  SmallVector<Value> arguments;
+  for (auto [index, argExpr] : llvm::enumerate(call->arguments())) {
+    Type input = targetType.getInput(index + 1);
+    if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(input))
+      return emitError(loc)
+             << "unsupported: reference argument to a constructor called "
+                "through std::make_unique";
+    FailureOr<Value> value = emitRValue(argExpr);
+    if (failed(value))
+      return failure();
+    if ((*value).getType() != input)
+      return emitError(loc) << "unsupported: call argument type mismatch";
+    arguments.push_back(*value);
+  }
+  builder.create<emitrust::MethodCallOp>(loc, TypeRange{}, place,
+                                         builder.getStringAttr(ctorName),
+                                         arguments);
   return success();
 }
 
@@ -4877,6 +5106,42 @@ CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
       return failure();
     return place;
   }
+  // W2.21: `*n = rhs` / `p->f = rhs` through a std::unique_ptr takes the
+  // SAME mandatory right-hand-side-first order the map place above does,
+  // for the second of its two reasons: the payload place is
+  // `DerefMut::deref_mut(&mut p)`, a MUTABLE borrow of the Box held for as
+  // long as the place lives, so an LHS place built first and a right-hand
+  // side that reads the same Box (`p->id = p->get() + 1`) is rustc E0502.
+  // Right-hand-side-first ends the read borrow under NLL before the write
+  // borrow is taken. `stlBoxWriteContext` is what makes the place mutable
+  // at all: a READ of a Box payload takes the shared `Deref::deref` borrow,
+  // because two `&mut` borrows of one Box live at once (two field reads in
+  // one printf) would be rustc E0499.
+  if (isStlBoxWriteExpr(op->getLHS())) {
+    FailureOr<Value> value = emitRValue(op->getRHS());
+    if (failed(value))
+      return failure();
+    FailureOr<Value> place;
+    {
+      llvm::SaveAndRestore<bool> writing(stlBoxWriteContext, true);
+      place = emitLValue(op->getLHS());
+    }
+    if (failed(place))
+      return failure();
+    Value toStore = *value;
+    if (auto lvalueType =
+            llvm::dyn_cast<emitrust::LValueType>((*place).getType());
+        lvalueType && lvalueType.getValueType() != toStore.getType()) {
+      FailureOr<Value> converted =
+          convertScalarValue(loc, toStore, lvalueType.getValueType());
+      if (failed(converted))
+        return failure();
+      toStore = *converted;
+    }
+    if (failed(storeToPlace(loc, *place, toStore)))
+      return failure();
+    return place;
+  }
   // A decomposed pointer has no place to re-load the assigned value from;
   // a function pointer is an ordinary value with an ordinary place.
   if (isPointerType(op->getLHS()->getType()) &&
@@ -5033,6 +5298,30 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   // order as the plain assignment above — C++17 sequences E2 before E1 in
   // `E1 op= E2` too, and the entry place's mutable borrow would otherwise
   // collide with any read of the same map on the right.
+  // W2.21: `*n += rhs` / `p->f += rhs` through a std::unique_ptr takes the
+  // same right-hand-side-first order and the same mutable payload borrow
+  // as the plain assignment (see `emitAssignToPlace`); one `&mut` place
+  // serves both the load and the store.
+  if (isStlBoxWriteExpr(op->getLHS())) {
+    FailureOr<Value> rhs = emitRValue(op->getRHS());
+    if (failed(rhs))
+      return failure();
+    FailureOr<Value> place;
+    {
+      llvm::SaveAndRestore<bool> writing(stlBoxWriteContext, true);
+      place = emitLValue(op->getLHS());
+    }
+    if (failed(place))
+      return failure();
+    Value current = loadPlace(loc, *place);
+    FailureOr<Value> result =
+        buildCompoundAssignValue(loc, op, current, *rhs);
+    if (failed(result))
+      return failure();
+    if (failed(storeToPlace(loc, *place, *result)))
+      return failure();
+    return place;
+  }
   if (isStlMapSubscriptExpr(op->getLHS())) {
     FailureOr<Value> rhs = emitRValue(op->getRHS());
     if (failed(rhs))
@@ -5286,7 +5575,15 @@ FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
     return op->isPostfix() ? *current : *next;
   }
   GlobalWriteback writeback;
-  FailureOr<Value> place = emitLValue(op->getSubExpr(), &writeback);
+  // W2.21: `(*n)++` / `p->f++` through a std::unique_ptr needs the MUTABLE
+  // payload borrow; a shared `Deref::deref` place would reach rustc as a
+  // deferred E0594 instead.
+  FailureOr<Value> place;
+  {
+    llvm::SaveAndRestore<bool> writing(stlBoxWriteContext,
+                                       isStlBoxWriteExpr(op->getSubExpr()));
+    place = emitLValue(op->getSubExpr(), &writeback);
+  }
   if (failed(place))
     return failure();
   Value current = loadPlace(loc, *place);

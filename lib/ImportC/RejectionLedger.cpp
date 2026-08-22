@@ -264,6 +264,48 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("stl-map-at-write")},
     {llvm::StringLiteral("requires a structured binding"),
      llvm::StringLiteral("stl-map-ranged-for")},
+    // W2.21 std::unique_ptr frontier. Every row here sits BEFORE the three
+    // generic STL rows below so first-match keeps them distinguishable in
+    // the ledger; mirrored into test/RealWorld/run_realworld.py.
+    // `stl-shared-ptr` is a PERMANENT rejection rather than a backlog item:
+    // Rc/Arc have different aliasing rules from shared_ptr and this subset
+    // has no model for shared ownership at all. `stl-unique-ptr-nullable`
+    // is THE wave boundary -- std::unique_ptr maps to a bare Box<T>, which
+    // cannot be null, so every default-construct / nullptr-compare /
+    // reset() spelling lands there and a later Option<Box<T>> wave is
+    // exactly the ranking signal this tag carries.
+    {llvm::StringLiteral("the std::unique_ptr<T[]> array form"),
+     llvm::StringLiteral("stl-unique-ptr-array-form")},
+    {llvm::StringLiteral("with a deleter other than std::default_delete"),
+     llvm::StringLiteral("stl-unique-ptr-deleter")},
+    {llvm::StringLiteral("is not in the supported payload set"),
+     llvm::StringLiteral("stl-unique-ptr-payload-type")},
+    {llvm::StringLiteral("std::unique_ptr payload does not match"),
+     llvm::StringLiteral("stl-unique-ptr-payload-type")},
+    {llvm::StringLiteral("no model for shared ownership"),
+     llvm::StringLiteral("stl-shared-ptr")},
+    {llvm::StringLiteral("a Box<T> cannot be null"),
+     llvm::StringLiteral("stl-unique-ptr-nullable")},
+    {llvm::StringLiteral("moved-from std::unique_ptr"),
+     llvm::StringLiteral("stl-unique-ptr-move")},
+    {llvm::StringLiteral("hands out a raw pointer to the payload"),
+     llvm::StringLiteral("stl-unique-ptr-raw-pointer")},
+    {llvm::StringLiteral("std::make_unique is only recognized as the initializer"),
+     llvm::StringLiteral("stl-make-unique-position")},
+    {llvm::StringLiteral("std::make_unique argument type does not match"),
+     llvm::StringLiteral("stl-make-unique-argument")},
+    {llvm::StringLiteral("this std::unique_ptr initializer shape"),
+     llvm::StringLiteral("stl-unique-ptr-construct")},
+    {llvm::StringLiteral("std::unique_ptr shape could not be determined"),
+     llvm::StringLiteral("stl-unique-ptr-construct")},
+    {llvm::StringLiteral("std::make_unique of a class with in-class member initializers"),
+     llvm::StringLiteral("stl-unique-ptr-construct")},
+    {llvm::StringLiteral("std::make_unique constructor"),
+     llvm::StringLiteral("stl-unique-ptr-construct")},
+    {llvm::StringLiteral("called through a std::unique_ptr"),
+     llvm::StringLiteral("stl-unique-ptr-ref-argument")},
+    {llvm::StringLiteral("called through std::make_unique"),
+     llvm::StringLiteral("stl-unique-ptr-ref-argument")},
     {llvm::StringLiteral("is not a recognized STL type"),
      llvm::StringLiteral("stl-unrecognized-type")},
     {llvm::StringLiteral("is not a recognized STL method"),
