@@ -6974,7 +6974,7 @@ piece and becomes FR-45.
   test/Import/C/struct-name-collide-invalid.c;
   test/Project/item-graph-namespace-record.cpp)
 
-- [ ] FR-109 QUALITY: `clippy::manual_unwrap_or_default`, 12
+- [x] FR-109 QUALITY: `clippy::manual_unwrap_or_default`, 12
   warnings across 12 crates (9 C++ + 3 C), ONE emitter site, zero
   variance -- the most replicated non-off-limits lint in either
   corpus, and the FR-63 harness's own `signals.py` ranks it #1 for
@@ -6988,6 +6988,12 @@ piece and becomes FR-45.
   signature line, not the body). The sweep already verified the
   patch: lint gone, stdout byte-identical to the unpatched crate AND
   to the clang-built native. **SPIKED by measurement.**
+  LANDED 2026-08-21: the emitted helper now reads
+  `let ev: i32 = e.parse().unwrap_or(0);`, verified in a `%g`/`%e`
+  program's `--emit=rust` output beside the untouched `te.parse()`
+  line it was modelled on. Full meson suite 721/721 with no golden
+  shift, confirming the prediction that the one golden touching this
+  helper pins its signature line and not its body.
 
 - [ ] FR-110 QUALITY, DESIGN-LEVEL: every emitted C++ method carries
   its class name. `bi.box_i32_get()` inside `impl BoxI32`, and

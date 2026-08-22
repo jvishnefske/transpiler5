@@ -2358,10 +2358,14 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             "        Some(t) => t,\n"
             "        None => (s.as_str(), \"0\"),\n"
             "    };\n"
-            "    let ev: i32 = match e.parse() {\n"
-            "        Ok(v) => v,\n"
-            "        Err(_) => 0,\n"
-            "    };\n"
+            // FR-109: `.unwrap_or(0)`, not a match and not
+            // `.unwrap_or_default()`. The match spelling is what
+            // clippy::manual_unwrap_or_default fires on -- 12 warnings
+            // across 12 crates, the most replicated non-off-limits lint
+            // in either corpus. `unwrap_or(0)` is the proven-clean
+            // spelling: the `pre` binding four lines below already uses
+            // it and has never warned.
+            "    let ev: i32 = e.parse().unwrap_or(0);\n"
             "    let pre: i32 = {\n"
             "        let t = format!(\"{:e}\", mag);\n"
             "        match t.split_once('e') {\n"
