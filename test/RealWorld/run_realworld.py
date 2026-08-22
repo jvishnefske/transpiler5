@@ -336,6 +336,10 @@ _BLOCKER_SUBSTRINGS = [
     ("unsupported: enumerator", "enum-def-rejected"),
     ("enum with no enumerators", "enum-def-rejected"),
     ("conflicting definition of enum", "enum-def-rejected"),
+    # FR-122: cross-TU record conflicts (field shape OR, now, a divergent
+    # member surface via the ODR-hashed key) get their own tag instead of
+    # [other]. Fires in plain C too. Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("conflicting definition of struct", "struct-shape-conflict"),
     # FR-50: not a blocker of its own -- the item names a type some OTHER
     # item's rejection removed. FR-49's root-blocker table credits the real
     # cause; this tag only keeps the cascade out of the "other" bucket.

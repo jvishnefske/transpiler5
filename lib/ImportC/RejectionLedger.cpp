@@ -139,6 +139,13 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
      llvm::StringLiteral("enum-def-rejected")},
     {llvm::StringLiteral("conflicting definition of enum"),
      llvm::StringLiteral("enum-def-rejected")},
+    // FR-122: the cross-TU record dedup key now folds in the ODR hash of
+    // the member surface, so a name reused with divergent members (dtor
+    // presence/body, method bodies) rejects under the same wording the
+    // field-shape conflict always used. Fires in plain C too (the C table
+    // is the right home), previously tabulated [other].
+    {llvm::StringLiteral("conflicting definition of struct"),
+     llvm::StringLiteral("struct-shape-conflict")},
     {llvm::StringLiteral("was rejected, so a type naming it"),
      llvm::StringLiteral("rejected-type-cascade")},
 };

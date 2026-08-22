@@ -110,12 +110,11 @@ anchor = "FR-121 DEFECT"
 
 [[items]]
 id = "FR-122"
-rank = 1
 kind = "defect"
-status = "spiked"
+status = "landed"
 size = "S"
 title = "Cross-TU dedup: ODR-hash the member surface (drop-bit alone insufficient)"
-summary = "VERIFIED both orders miscompile silently (opposite polarities), rename channel gives a defined-behavior oracle. Fix: shape key += getODRHash, gated non-template + has member surface. Zero suite/corpus cost; diff saved in spike scratch."
+summary = "Landed 2026-08-22: shape key += getODRHash (gated non-template + member surface); all six silent channels now reject loud; droppy-header/twin-POD/samePattern merges pinned surviving; tag struct-shape-conflict."
 blocked_by = []
 anchor = "FR-122 DEFECT"
 

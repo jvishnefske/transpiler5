@@ -7589,7 +7589,7 @@ piece and becomes FR-45.
   borrow-position analogue. Loud direction, never silent. Root cause
   not yet isolated. **NOT SPIKED.**
 
-- [ ] FR-122 DEFECT: the cross-TU record dedup key is
+- [x] FR-122 DEFECT: the cross-TU record dedup key is
   FIELD-SHAPE-ONLY, and colliding records silently exchange member
   semantics. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-22), and
   the spike VERIFIED the miscompile by byte-diff and found it WORSE
@@ -7654,6 +7654,30 @@ piece and becomes FR-45.
   not the FR-116 plan-vs-IR kind. No screen change this wave.
   Implementer's diff saved at the spike scratchpad
   (fr122-variantC-key.diff). **SPIKED.**
+  LANDED 2026-08-22. The key gained `odr:<getODRHash()>;` gated exactly
+  as specified; all six silent channels (dtor presence both orders,
+  method-body theft both orders, dtor-body theft both orders) now take
+  the existing loud conflict wording at the second-defining TU, and
+  under --recover degrade to dropped + cascade + unimplemented!() stub
+  with the new `struct-shape-conflict` tag (mirrored, and placed in the
+  C table -- the wording fires in plain C too). The droppy
+  shared-header merge is byte-diffed pre/post (crate src byte-identical,
+  proving hash stability across per-TU ASTContexts); twin-POD and
+  W2.16 samePattern negative pins are net-new. Two probe-shape facts
+  the implementer inherited from the re-spike: rename-channel legs must
+  run through emitrust-cc (import-c keeps @c/@C distinct, no
+  collision), and droppy probe objects must sit at FUNCTION scope
+  (W2.17's inner-block gate fires before the dedup is reached).
+  Template exemption boundary re-measured: divergent same-
+  specialization member surfaces still merge silently -- the recorded
+  IFNDR residue, unchanged. Gates: full meson suite 745/745 (fast 530
+  + slow/EndToEnd 215; +2 = the two new files), zero golden shifts,
+  all ledgers unchanged.
+  (test/Import/Cpp/cpp-record-cross-tu-odr-invalid.cpp;
+  test/EndToEnd/cpp-cross-tu-record-odr.cpp; extended
+  test/Import/Cpp/cpp-record-cross-tu-merge.cpp with
+  DROPPY/TWIN/ALIAS legs)
+
 
 - [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
   the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and
