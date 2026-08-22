@@ -204,6 +204,28 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("cxx-virtual")},
     {llvm::StringLiteral("overloaded operator"),
      llvm::StringLiteral("cxx-operator-overload")},
+    // FR-117: a user-defined CONVERSION FUNCTION. The member itself is
+    // OMITTED from the class rather than rejected (so no ledger entry is
+    // raised for the class), but its residual USE positions -- the explicit
+    // `c.operator int()` call spelling and an out-of-line definition, which
+    // is a top-level item in its own right -- are located rejections and
+    // need a tag of their own, because they are a distinct backlog item from
+    // the operator-overload family above.
+    {llvm::StringLiteral("unsupported: conversion function"),
+     llvm::StringLiteral("cxx-conversion-function")},
+    // The IMPLICIT half of the same construct: every implicit and
+    // `static_cast` use of a conversion function reaches `importCast` as
+    // `CK_UserDefinedConversion`. Measured untagged before FR-117, so all of
+    // it tabulated as the catch-all `other` -- and since FR-112 was ranked
+    // #1 FROM that tabulation, leaving it there would blind the next
+    // ranking exactly where FR-117 shifts mass into it.
+    {llvm::StringLiteral("unsupported cast (UserDefinedConversion)"),
+     llvm::StringLiteral("cxx-user-conversion")},
+    // FR-118: the class-level gate whose late position was the half-import
+    // miscompile. Also measured untagged (`dropped 'C' [other]`), which is
+    // why the tinyxml2/jsoncpp cascade attribution could not see it.
+    {llvm::StringLiteral("copy/move/delegating constructor"),
+     llvm::StringLiteral("cxx-copy-ctor")},
     // FR-48 landed reference PARAMETERS; the four wordings below are the
     // residual reference positions, all still tagged `cxx-references` so
     // the backlog keeps ranking them as one blocker. "rvalue reference
