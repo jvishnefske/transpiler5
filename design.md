@@ -7205,32 +7205,97 @@ piece and becomes FR-45.
   measurability defect, and it is why the ranked table below needed
   two tools instead of one. **NOT SPIKED.**
 
-- [ ] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
-  the crate. Found by W2.23's spike; no committed test can see it,
-  because W2.17's destructor corpus observes side effects via `printf`
-  and never via a global counter. Three-line repro:
-  `int g = 7; struct S { int v; S(int x) : v(x) {} int peek() { return
-  g + v; } };` gives `error: 'emitrust.global_load' op 'G' does not
-  reference a valid emitrust.global`, on both `--emit=rust` and
-  `--emit=crate`. `--actor-lift=false` works perfectly (the global
-  becomes a thread_local Cell and the method reads it).
-  ROOT CAUSE, located: the ActorPlan is built entirely from the FR-40
-  item graph's `ReadsGlobal`/`WritesGlobal` edges
-  (tools/emitrust-cc/ActorPlan.cpp:161-167), and the item graph
-  DELIBERATELY SKIPS every `CXXMethodDecl`
-  (lib/Project/ItemGraph.cpp:775 and :1324, "C++ member functions are
-  not items"). So a global touched only from a method body has no
-  access edge, the planner concludes `c_main` owns it and localizes
-  it, and the impl's `global_load` dangles. THE FIX HAS AN IN-TREE
-  PRECEDENT: the cell path already carries exactly this guard
-  (tools/emitrust-cc/ActorLiftPlan.cpp:64-72, "an owner METHOD inside
-  an impl is out of scope"); only the actor path lacks it. A second
-  manifestation is a global bumped by a free function called from a
-  method, which emits a call to a bare `bump()` the lift renamed --
-  rustc E0425. Both manifestations are LOUD, never silent: a blocker,
-  not a miscompile hazard. Real C++ classes read globals constantly,
-  and this also blocks 00801. **SPIKED by measurement (W2.23).**
-
+- [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
+  the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and
+  the increment came out SMALLER than either shape this entry
+  proposed -- one source file, `lib/Conversion/ActorLift/ActorLift.cpp`,
+  +131/-13.
+  **THIS ENTRY'S ORIGINAL ROOT CAUSE WAS WRONG, and the correction is
+  the useful part.** It blamed the FR-40 item graph's `CXXMethodDecl`
+  skip. That skip is real but NOT OPERATIVE. The operative root is that
+  `emitrust.impl` carries the MLIR `SymbolTable` trait, and upstream
+  `walkSymbolUses` returns without recursing when
+  `from->hasTrait<OpTrait::SymbolTable>()` -- so EVERY use query in the
+  actor-lift stack is structurally blind to method bodies. Proved at
+  the pass level with hand-written IR and no importer in the picture:
+  `emitrust-opt hand_local.mlir --emitrust-actor-lift` reproduces the
+  identical verifier error. The locals veto saw zero uses and
+  `symbolKnownUseEmpty` let the global be erased under a live
+  reference.
+  COROLLARY WORTH RECORDING: the "in-tree precedent" this entry cited
+  (`ActorLiftPlan.cpp`'s "an owner METHOD inside an impl is out of
+  scope") is DEAD CODE for this shape -- the impl use never reaches
+  it. What actually keeps the cell path safe is the empty use-set
+  making `uniqueUsingFunction` return null. A fix built by mirroring
+  that "precedent" would not have worked.
+  FOUR MANIFESTATIONS, NOT TWO. Beyond the read-from-method and the
+  free-function-arm cases this entry listed, the spike found: a
+  genuine cross-client called from a method body (the lift prepends
+  one `&mut` per actor to the callee while the method's call site
+  keeps the old arity -- `error[E0061]: this function takes 3
+  arguments but 1 argument was supplied`), and a FUNCTION-POINTER
+  reference to an arm taken inside a method body (`error[E0425]:
+  cannot find value 'bump' in this scope`). The control matters: the
+  identical fn-pointer shape in a FREE function is handled correctly
+  today, so this is specifically the method blind spot. That reference
+  is opaque TEXT in the IR, so there is no structured symbol to query
+  and it needs an identifier-token match. A fix covering only the two
+  manifestations this entry listed would have shipped a still-broken
+  compiler.
+  THE DIFFERENTIAL THAT SHRANK THE CHANGE: shape A (make the PLANNER
+  impl-aware as well) versus shape B (the pass only). `--emit=rust`
+  was dumped for all 20 probes under both builds -- EVERY `.rs`
+  BYTE-IDENTICAL, with only demotion WORDING differing on 8 stderr
+  files. The planner change buys nothing observable, so B shipped:
+  zero changes to `tools/emitrust-cc`, zero to `ItemGraph.cpp`, zero
+  to `ItemColoring.cpp`, zero `test/Project/` golden churn, no
+  CSymbolNaming exposure, no new dialect ops.
+  Landed: `forEachGlobalUse` unions the pre-existing symbol-use set
+  with an additive `impl.walk` over the global load/store/addr/cells
+  ops -- a module with no `emitrust.impl` gets a BYTE-IDENTICAL use
+  set, which is why nothing in the C corpus moved. Plus
+  `calledFromImpl` for the arm/cross/fn-pointer cases, and one new
+  veto. Two reused wordings, two new ones, both LOCATED on the
+  method-body reference site rather than the callee definition.
+  COST IS CONTAINED PER-CLUSTER, not program-wide: in a two-global
+  probe the actor whose global is touched only by a free arm SURVIVES
+  as a real lifted actor while only the method-touched one demotes,
+  and that containment is pinned so the fix cannot silently widen into
+  a program-wide actor-lift kill.
+  ALSO MEASURED: a WRITE from a method, a read from a constructor
+  init-list, a write from a W2.17 destructor, and a read from a W2.16
+  class-template instantiation's method ALL hit the same error today
+  and are all byte-identical after. A `const` global read from a
+  method WORKS today -- FR-116 is exclusively a NON-CONST-global
+  defect. A function-static inside a method was already correct.
+  THE FR-41 PROBE IS STRUCTURALLY INCAPABLE OF SENSING THIS. Checked
+  explicitly because W2.17, W2.18 and W2.19 each found a stale screen:
+  `--emit=coloring` reports `red=0` for every broken shape, which is
+  CORRECT -- the importer admits them all, as `--actor-lift=false`
+  proves. The divergence is plan-versus-IR, not importer-versus-screen,
+  so the coloring probe must not be used as the sensor here.
+  00801 IS NOT UNBLOCKED: it dies at `unsupported: copy/move/delegating
+  constructor` long before the lift, confirming W2.23's
+  three-independent-unblocks finding. It stays a sensor and its source
+  is untouched.
+  Gates: full meson suite 727/727 (fast 519 + slow/EndToEnd 208), 0
+  failures; baseline was 721, +6 = exactly the six new files, and all
+  five behavior tests were confirmed FAILING before the change.
+  CTestSuite 220/220/0/0 and Cpp17Suite 30/33 both unchanged.
+  `test/Project` goldens 37/37 untouched. Both `--actor-mode=threaded`
+  and `--actor-mode=async` succeed on the repro with the same demotion.
+  KNOWN GAPS, recorded not silent: the `forEachGlobalUse` emptiness
+  check that replaced `symbolKnownUseEmpty` is now UNREACHABLE for
+  every shape that could be constructed, so it ships untested -- a
+  safety net with no pin. And a library unit still emits
+  `note: actor plan: exported G: ...` from the driver BEFORE the pass
+  demotes, so the note is now common rather than rare and is unpinned;
+  worth its own follow-up.
+  (test/Conversion/ActorLift/impl-method-use.mlir;
+  test/Driver/actor-lift-cpp-method-global.cpp,
+  actor-lift-cpp-method-arm.cpp;
+  test/EndToEnd/cpp-method-global.cpp, cpp-method-global-arm.cpp;
+  test/Import/Cpp/cpp-method-global.cpp)
 
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the

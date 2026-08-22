@@ -59,6 +59,8 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 
+#include <cctype>
+
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
@@ -246,6 +248,84 @@ struct ActorLift
     return success();
   }
 
+  /// FR-116: every op in the module naming `symbol`, INCLUDING ops
+  /// inside `emitrust.impl` regions. MLIR's SymbolTable use-walk stops at
+  /// nested symbol tables and `emitrust.impl` carries the SymbolTable
+  /// trait, so `getSymbolUses`/`symbolKnownUseEmpty` are structurally
+  /// blind to C++ method bodies.
+  void forEachGlobalUse(StringRef symbol,
+                        llvm::function_ref<void(Operation *)> cb) {
+    // (1) The module scope, unchanged: strictly the pre-FR-116 set.
+    auto global = dyn_cast_or_null<emitrust::GlobalOp>(
+        SymbolTable::lookupSymbolIn(module, symbol));
+    if (global)
+      if (auto uses = SymbolTable::getSymbolUses(global, module))
+        for (const SymbolTable::SymbolUse &use : *uses)
+          cb(use.getUser());
+    // (2) ADDITIVE: the impl-region blind spot. emitrust.impl is the
+    // dialect's only SymbolTable-trait op, so this is the whole gap.
+    module.walk([&](emitrust::ImplOp impl) {
+      impl.walk([&](Operation *op) {
+        StringRef used;
+        if (auto load = dyn_cast<emitrust::GlobalLoadOp>(op))
+          used = load.getGlobal();
+        else if (auto store = dyn_cast<emitrust::GlobalStoreOp>(op))
+          used = store.getGlobal();
+        else if (auto addr = dyn_cast<emitrust::GlobalAddrOp>(op))
+          used = addr.getGlobal();
+        else if (auto cells = dyn_cast<emitrust::GlobalCellsOp>(op))
+          used = cells.getGlobal();
+        else
+          return;
+        if (used == symbol)
+          cb(op);
+      });
+    });
+  }
+
+  /// FR-116 (2nd manifestation): whether any `emitrust.call_opaque`
+  /// inside an `emitrust.impl` region calls `callee`. Such a call site is
+  /// unreachable after the callee becomes an actor method (rustc E0425)
+  /// and the plan cannot see it (methods are not item-graph nodes).
+  Operation *calledFromImpl(StringRef callee) {
+    Operation *found = nullptr;
+    auto mentions = [&](StringRef text) {
+      size_t at = text.find(callee);
+      while (at != StringRef::npos) {
+        auto identChar = [](char c) {
+          return std::isalnum((unsigned char)c) || c == '_';
+        };
+        bool leftOk = at == 0 || !identChar(text[at - 1]);
+        size_t end = at + callee.size();
+        bool rightOk = end == text.size() || !identChar(text[end]);
+        if (leftOk && rightOk)
+          return true;
+        at = text.find(callee, at + 1);
+      }
+      return false;
+    };
+    module.walk([&](emitrust::ImplOp impl) {
+      impl.walk([&](Operation *op) {
+        if (found)
+          return;
+        if (auto call = dyn_cast<emitrust::CallOpaqueOp>(op)) {
+          if (call.getCallee() == callee) {
+            found = op;
+            return;
+          }
+        }
+        // FR-116 4th manifestation: a fn-pointer reference to an arm from
+        // a method body is opaque TEXT (`Some(bump)`), so the only
+        // available check is a token match inside the impl's opaque attrs.
+        op->getAttrDictionary().walk([&](emitrust::OpaqueAttr opaque) {
+          if (!found && mentions(opaque.getValue()))
+            found = op;
+        });
+      });
+    });
+    return found;
+  }
+
   /// Whether `fn` is attributed to actor `name`'s surface (arm of it,
   /// cross client listing it, or the driver).
   static bool onActorSurface(emitrust::FuncOp fn, StringAttr name) {
@@ -301,12 +381,11 @@ struct ActorLift
           actor.vetoed = true;
           break;
         }
-        auto uses = SymbolTable::getSymbolUses(global, module);
-        bool bad =
-            uses && llvm::any_of(*uses, [&](const SymbolTable::SymbolUse &u) {
-              return !isRewritableUse(u.getUser(), actor.name,
-                                      /*driverOnly=*/false);
-            });
+        bool bad = false;
+        forEachGlobalUse(global.getSymName(), [&](Operation *user) {
+          if (!isRewritableUse(user, actor.name, /*driverOnly=*/false))
+            bad = true;
+        });
         if (!bad)
           continue;
         global.emitWarning("actor lift: demoted ")
@@ -353,6 +432,43 @@ struct ActorLift
           });
         });
       }
+      // FR-116 (2nd/3rd/4th manifestations): an arm or a cross client
+      // named from a C++ METHOD BODY. Renaming the arm into an actor
+      // method leaves the impl calling a free function that no longer
+      // exists (rustc E0425), and a cross client grows one `&mut`
+      // parameter per actor that the method's call site does not pass
+      // (E0061). Both call sites are invisible to the plan (methods are
+      // not item-graph nodes) and to every SymbolTable query here, so the
+      // veto has to walk the impl regions itself.
+      if (!actor.vetoed) {
+        module.walk([&](emitrust::FuncOp fn) {
+          if (actor.vetoed)
+            return;
+          bool mine = false;
+          const char *role = nullptr;
+          if (fn->getAttrOfType<StringAttr>(emitrust::kActorArmAttrName) ==
+              actor.name) {
+            mine = true;
+            role = "arm";
+          } else if (auto cross = fn->getAttrOfType<ArrayAttr>(
+                         emitrust::kActorCrossAttrName)) {
+            for (Attribute member : cross)
+              if (member == actor.name) {
+                mine = true;
+                role = "cross client";
+              }
+          }
+          if (!mine)
+            return;
+          Operation *call = calledFromImpl(fn.getSymName());
+          if (!call)
+            return;
+          call->emitWarning("actor lift: demoted ")
+              << actor.name.getValue() << ": " << role << " '"
+              << fn.getSymName() << "' is referenced from a method body";
+          actor.vetoed = true;
+        });
+      }
       if (actor.vetoed)
         for (emitrust::GlobalOp global : actor.globals)
           fieldOfGlobal.erase(global.getSymName());
@@ -368,12 +484,11 @@ struct ActorLift
         localOfGlobal.erase(local.global.getSymName());
         continue;
       }
-      auto uses = SymbolTable::getSymbolUses(local.global, module);
-      bool bad =
-          uses && llvm::any_of(*uses, [&](const SymbolTable::SymbolUse &u) {
-            return !isRewritableUse(u.getUser(), StringAttr(),
-                                    /*driverOnly=*/true);
-          });
+      bool bad = false;
+      forEachGlobalUse(local.global.getSymName(), [&](Operation *user) {
+        if (!isRewritableUse(user, StringAttr(), /*driverOnly=*/true))
+          bad = true;
+      });
       if (!bad)
         continue;
       local.global.emitWarning("actor lift: demoted ")
@@ -907,7 +1022,10 @@ struct ActorLift
       if (!local.vetoed)
         doomed.push_back(local.global);
     for (emitrust::GlobalOp global : doomed) {
-      if (!SymbolTable::symbolKnownUseEmpty(global, module))
+      bool used = false;
+      forEachGlobalUse(global.getSymName(),
+                       [&](Operation *) { used = true; });
+      if (used)
         return global.emitError("actor lift: internal: lifted global '")
                << global.getSymName() << "' still has uses";
       global.erase();
