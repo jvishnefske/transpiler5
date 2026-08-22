@@ -56,12 +56,11 @@ anchor = "FR-112 CONTAINMENT"
 
 [[items]]
 id = "W2.26"
-rank = 6
 kind = "feature"
-status = "spiked"
+status = "landed"
 size = "M"
 title = "Polymorphic RAII, value-only subset (transitive has_drop)"
-summary = "GO on implementability, but tinyxml2 unlock is 0/11 -- the cascade payoff is gated behind W2.19c+FR-120. Value: the destruction substrate W2.19c assumes, plus closing the E0204 and empty-base traps. The transitive predicate is a soundness prerequisite for W2.17's existing gates."
+summary = "Landed 2026-08-22: transitive userOrInheritedDestructor at all gates, merely-inheriting = has_drop only, empty droppy base materialized, sole-virtual-dtor admitted as Drop. The __pair_base defaulted-dtor filter was the suite-found deviation. Cpp17Suite 30 -> 31."
 blocked_by = ["FR-118"]
 anchor = "W2.26"
 

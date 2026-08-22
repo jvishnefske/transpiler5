@@ -23,11 +23,14 @@
 // direction: it colors a portable item Red and drags every caller down with
 // it, with no diagnostic and no later stage that could recover it (see
 // test/Project/search-false-red.cpp). Since FR-48 a reference RETURN is
-// screened and a reference PARAMETER is not. Since W2.17 a destructor that
-// is non-virtual and DEFINED in this translation unit is admitted (it
-// becomes `impl Drop`) and only the residual shapes are screened. Since
-// W2.18 a SINGLE public non-virtual base is admitted (as an ordinary first
-// field) and only the shapes with no such image are screened.
+// screened and a reference PARAMETER is not. Since W2.17 a destructor
+// DEFINED in this translation unit is admitted (it becomes `impl Drop`)
+// and only the residual shapes are screened -- since W2.26 that includes
+// a VIRTUAL destructor when it is the sole virtual member, and a base
+// carrying a destructor (the derived class gets a transitive has_drop;
+// see coloring-cpp-class-gates.cpp). Since W2.18 a SINGLE public
+// non-virtual base is admitted (as an ordinary first field) and only the
+// shapes with no such image are screened.
 // RUN: emitrust-cc --emit=coloring %s -o - | FileCheck %s
 
 /// Green: a plain data record is the same item whether it is spelled `struct`

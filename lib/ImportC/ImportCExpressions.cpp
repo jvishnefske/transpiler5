@@ -348,7 +348,9 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
     // so this unwrap fires for it and lowers a C++ whole-value COPY into a
     // Rust MOVE -- one destructor run where C++ has two. Refused here, at
     // the copy, so no value-position channel is left open.
-    if (ctor && userDeclaredDestructor(astContext(), construct->getType()))
+    // W2.26: transitive -- copying a droppy-DERIVED value would likewise
+    // turn C++'s two destructor runs into Rust's one.
+    if (ctor && userOrInheritedDestructor(astContext(), construct->getType()))
       return emitError(loc)
              << "unsupported: value copy of a class with a destructor";
     if (ctor && ctor->isCopyOrMoveConstructor() && ctor->isTrivial() &&
@@ -2041,6 +2043,13 @@ CImporter::emitSizeofAlignof(const clang::UnaryExprOrTypeTraitExpr *expr) {
   // keeps (the same reasoning as the bit-field rejection above).
   if (typeContainsLongDouble(operand))
     return emitError(loc) << "unsupported: sizeof/alignof of long double";
+  // W2.26: the sole-virtual-dtor class is admitted as a value, so the fold
+  // over a polymorphic type became reachable -- and it would promise the
+  // vptr-carrying native layout (16) for a struct the emitter renders
+  // without a vptr (4). Same screen family as the two above.
+  if (typeContainsPolymorphicRecord(operand))
+    return emitError(loc)
+           << "unsupported: sizeof/alignof of a polymorphic class";
   int64_t value =
       kind == clang::UETT_SizeOf
           ? astContext().getTypeSizeInChars(operand).getQuantity()

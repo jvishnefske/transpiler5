@@ -28,10 +28,11 @@
 // pin moved FORWARD rather than loosening: the positive behaviour is
 // pinned in test/Import/Cpp/destructors.cpp (and byte-diffed in
 // test/EndToEnd/cpp-destructor.cpp), and the surviving destructor frontier
-// -- virtual destructors, a destructor with no definition in this TU, a
-// union destructor, and the six OBJECT positions whose drop point the
-// emitter cannot reproduce (member, array, global/static, by value, an
-// unmodeled scope, a side-effecting for-increment) -- in
+// -- a destructor with no definition in this TU, a union destructor, a
+// virtual destructor beside another virtual method (W2.26 admitted the
+// sole-virtual-dtor class), and the six OBJECT positions whose drop point
+// the emitter cannot reproduce (member, array, global/static, by value,
+// an unmodeled scope, a side-effecting for-increment) -- in
 // test/Import/Cpp/destructors-invalid.cpp. The generic wording this case
 // pinned is still raised, for the union shape.
 //

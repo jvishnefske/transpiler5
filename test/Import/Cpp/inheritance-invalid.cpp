@@ -4,7 +4,6 @@
 // RUN: not emitrust-import-c %t/private-base.cpp 2>&1 | FileCheck %s --check-prefix=PRIVBASE
 // RUN: not emitrust-import-c %t/protected-base.cpp 2>&1 | FileCheck %s --check-prefix=PROTBASE
 // RUN: not emitrust-import-c %t/template-base.cpp 2>&1 | FileCheck %s --check-prefix=TMPLBASE
-// RUN: not emitrust-import-c %t/dtor-base.cpp 2>&1 | FileCheck %s --check-prefix=DTORBASE
 // RUN: not emitrust-import-c %t/virtual-method-base.cpp 2>&1 | FileCheck %s --check-prefix=VIRTMETHOD
 // RUN: not emitrust-import-c %t/base-field-collision.cpp 2>&1 | FileCheck %s --check-prefix=COLLIDE
 // RUN: not emitrust-import-c %t/empty-base-call.cpp 2>&1 | FileCheck %s --check-prefix=EMPTYCALL
@@ -16,11 +15,11 @@
 // RUN: not emitrust-import-c %t/derived-pointer-member.cpp 2>&1 | FileCheck %s --check-prefix=DERIVEDPTR
 
 // W2.18 located-rejection ledger for single non-virtual inheritance. The
-// wave admits exactly ONE shape -- a single PUBLIC, NON-VIRTUAL base,
+// wave admitted exactly ONE shape -- a single PUBLIC, NON-VIRTUAL base,
 // defined in this translation unit, that is not a class-template
-// specialization and carries no user-declared destructor, accessed only
-// through a derived OBJECT place or the derived class's own `this` (see
-// inheritance.cpp). That subset was chosen because it is the subset that
+// specialization, accessed only through a derived OBJECT place or the
+// derived class's own `this` (see inheritance.cpp); W2.26 extended it to
+// a base CARRYING a destructor (inheritance-drop.cpp). That subset was chosen because it is the subset that
 // byte-diffs clean against `clang++ -std=c++17`; every shape below either
 // has no base-as-first-field image at all, or was MEASURED to diverge.
 //
@@ -41,15 +40,16 @@
 //   as a base has never been exercised through that ordering. Keeps the
 //   W2.0 wording. (The reverse -- a class TEMPLATE as the DERIVED class --
 //   is admitted; it is pinned in class-templates.cpp.)
-// * a base carrying a USER-DECLARED DESTRUCTOR: a measured silent
-//   miscompile, and the reason it gets a wording of its own. A merely
-//   INHERITING class does not answer `hasUserDeclaredDestructor`, so none
-//   of W2.17's use-site drop gates (local scope, by-value, array, global)
-//   fires for `Derived d;` -- and the emitted struct keeps the `Copy`
-//   derive it must not have, so the crate is rustc E0204. A destructor on
-//   the DERIVED class over a plain base stays ADMITTED (byte-diff clean:
-//   base-as-first-field drops `Derived::drop`, then `base`, which is
-//   exactly C++'s derived-body-then-base order).
+// * a base carrying a USER-DECLARED DESTRUCTOR: ADMITTED since W2.26.
+//   The E0204/lost-drop channel that kept it out is closed by the
+//   TRANSITIVE drop predicate (a merely-inheriting class now answers
+//   droppy, so every W2.17 use-site gate fires for it and the emitter
+//   suppresses `Copy`); the pin moved FORWARD to
+//   test/Import/Cpp/inheritance-drop.cpp and the byte-diff oracle
+//   test/EndToEnd/cpp-inheritance-drop.cpp. The residual drop-family
+//   rejections around the admitted chain (droppy member BESIDE a droppy
+//   base, arrays/globals/by-value/copies/bare-block objects of a
+//   droppy-DERIVED class) are pinned in inheritance-drop-invalid.cpp.
 // * any VIRTUAL METHOD in the chain: no vtable, no dynamic dispatch. Not
 //   a new rejection -- the base class's own import raises it first, at the
 //   method, which is where the real blocker is. W2.19's job.
@@ -115,20 +115,6 @@ template <typename T> struct Box { T v; };
 // TMPLBASE: template-base.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: base classes are not supported
 struct D : Box<int> { int c; };
 int use() { D d; d.c = 1; return d.c; }
-
-//--- dtor-base.cpp
-extern "C" int printf(const char *, ...);
-struct A {
-  int a;
-  A(int v) : a(v) {}
-  ~A() { printf("bye %d\n", a); }
-};
-// DTORBASE: dtor-base.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: base class with a destructor
-struct D : A {
-  int c;
-  D(int v) : A(v), c(v) {}
-};
-int use() { D d(1); return d.c; }
 
 //--- virtual-method-base.cpp
 // The base's own import raises this, at the method, before the derived

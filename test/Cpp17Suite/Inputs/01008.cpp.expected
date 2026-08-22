@@ -1,0 +1,14 @@
+ctor Base 1
+plain body 3
+~Base 1
+ctor Base 4
+loud body 5
+~Loud 5
+~Base 4
+ctor Base 7
+leaf body 9
+~Mid 8
+~Base 7
+circle body 11
+~Shape
+sum=27

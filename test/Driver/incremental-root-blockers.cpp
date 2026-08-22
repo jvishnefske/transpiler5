@@ -31,15 +31,19 @@
 // RUN: diff %t.crate/src/main.rs %t.recover.crate/src/main.rs
 
 // --- The first root: a user-declared destructor. `destructor` is written
-// --- nowhere else in this file.
+// --- nowhere else in this file. W2.26 admitted the virtual destructor
+// --- (sole-virtual-dtor classes are values now), so what keeps `Base` out
+// --- is that the destructor has NO BODY in this translation unit.
 class Base {
 public:
   virtual ~Base();
   int seed;
 };
 
-// --- The second root: a base class.
-class Derived : public Base {
+// --- The second root: a base class. W2.26 admitted the droppy PUBLIC base
+// --- (the old `cxx-drop-base` shape imports now), so the inheritance that
+// --- keeps `Derived` out is PRIVATE -- still squarely the base-class root.
+class Derived : Base {
 public:
   int twice() const;
   int extra;
@@ -76,29 +80,29 @@ int main(void) { return total(20, 22); }
 // classified at all and fell into the `other` bucket.
 // PORTING: ## Direct blockers, as reported
 // PORTING-DAG: | cxx-cascaded-method |
-// W2.17 moved this pin FORWARD, not loosened it: a non-virtual,
-// same-TU-defined destructor is now ADMITTED (it becomes `impl Drop`), so
-// `virtual ~Base()` above reports under the newly minted, more specific
-// `cxx-virtual-destructor` tag. The ROOT attribution is unchanged --
-// `destructor` still ranks the item in the table above -- which is the
-// property this test exists to pin.
-// PORTING-DAG: | cxx-virtual-destructor |
-// W2.18 moved this pin FORWARD too. A single public non-virtual base is now
-// ADMITTED as a first field, so `Derived` no longer reports the generic
-// `cxx-inheritance`; what keeps it out is the DESTRUCTOR its base carries,
-// which is a drop-family miscompile channel (a merely inheriting class does
-// not answer `hasUserDeclaredDestructor`, so no W2.17 use-site gate fires)
-// and reports under its own `cxx-drop-base` tag. The ROOT attribution is
-// unchanged -- `base-class` still ranks the item in the table above -- which
-// is the property this test exists to pin.
-// PORTING-DAG: | cxx-drop-base |
+// W2.17, then W2.26, moved this pin FORWARD, never loosened it: W2.17
+// admitted the non-virtual same-TU-defined destructor (the tag moved to
+// `cxx-virtual-destructor`), and W2.26 admitted the sole-virtual-dtor
+// class itself -- so what reports now is the destructor's missing BODY,
+// under `cxx-destructor-no-body`. The ROOT attribution is unchanged
+// through both moves -- `destructor` still ranks the item in the table
+// above -- which is the property this test exists to pin.
+// PORTING-DAG: | cxx-destructor-no-body |
+// W2.18 moved this pin FORWARD too, and W2.26 again: a single public
+// non-virtual base is admitted as a first field, and a droppy public base
+// now imports as well (the old `cxx-drop-base` tag retired with the
+// transitive drop predicate), so the inheritance that keeps `Derived` out
+// is PRIVATE and reports the generic `cxx-inheritance` wording. The ROOT
+// attribution is unchanged -- `base-class` still ranks the item in the
+// table above -- which is the property this test exists to pin.
+// PORTING-DAG: | cxx-inheritance |
 //
 // A graph item that IS its own root carries the one-element chain saying so.
-// (The two rows are listed by direct blocker tag, and `cxx-drop-base` sorts
-// ahead of `cxx-virtual-destructor` exactly as `cxx-inheritance` did.)
+// (The two rows are listed by direct blocker tag, and `cxx-destructor-no-body`
+// sorts ahead of `cxx-inheritance`.)
 // PORTING: ## Project items
-// PORTING: | dropped | red | `Derived` | record | base-class | Derived | cxx-drop-base |
-// PORTING: | dropped | red | `Base` | record | destructor | Base | cxx-virtual-destructor |
+// PORTING: | dropped | red | `Base` | record | destructor | Base | cxx-destructor-no-body |
+// PORTING: | dropped | red | `Derived` | record | base-class | Derived | cxx-inheritance |
 //
 // The off-graph member function borrows its class's chain with itself
 // prepended, so `twice` is credited to the base class it never mentions.

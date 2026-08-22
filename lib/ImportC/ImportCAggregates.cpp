@@ -432,8 +432,12 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
     //     same code (residue, recorded not fixed: divergent member
     //     surfaces of the SAME specialization keep merging silently);
     // (b) only records with a member surface -- a user-declared dtor
-    //     (mirroring `userDeclaredDestructor`, so this key and the
-    //     has_drop attribute below can never disagree) or any
+    //     (mirroring `userDeclaredDestructor`; W2.26's TRANSITIVE
+    //     has_drop can additionally mark a merely-inheriting class whose
+    //     key carries no dtor bit, but that opens no theft channel: the
+    //     inherited droppiness is derived entirely from the base FIELD's
+    //     type, which is itself part of the shape key, so two records
+    //     merging on the key always agree on has_drop) or any
     //     non-implicit method -- carry the suffix, so pure field-only
     //     PODs (FR-108(c) benign twins, CTS-R1 Anon merges) and all of C
     //     keep today's shape-only merge untouched by construction.
@@ -592,9 +596,14 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   // `impl Drop` -- which costs it `Copy` (rustc E0184) and makes every
   // binding of it unconditionally live (an uninitialized Rust binding is
   // never dropped). Both consequences are decided from the struct alone, so
-  // they ride the struct_def rather than the impl.
-  if (userDeclaredDestructor(astContext(),
-                             astContext().getRecordType(definition)))
+  // they ride the struct_def rather than the impl. W2.26 made the predicate
+  // TRANSITIVE: a merely-inheriting derived class gets ONLY this attr -- no
+  // impl Drop, no dtor func -- and Rust's field-drop glue runs the base's
+  // destructor through the `base` field exactly once; without the attr the
+  // derive keeps `Copy` beside that field's Drop, which is rustc E0204
+  // (measured), the loud backstop this synthesis exists to avoid.
+  if (userOrInheritedDestructor(astContext(),
+                                astContext().getRecordType(definition)))
     structDef->setAttr(emitrust::kHasDropAttrName, moduleBuilder.getUnitAttr());
   // W2.2: a genuine C++ class's non-static-data-member methods (mutating,
   // const, static, and non-delegating constructors) import onto the
@@ -924,6 +933,45 @@ userDeclaredDestructor(clang::ASTContext &context, clang::QualType type) {
   return record->getDestructor();
 }
 
+/// Declared in CImporterInternal.h: W2.26's transitive drop predicate. The
+/// recursion walks exactly the SINGLE public non-virtual base chain --
+/// the one chain shape `admitsSingleBaseAsField` below turns into a `base`
+/// field -- because that field is what Rust's field-drop glue runs the
+/// inherited destructor through. Any other base shape is already a located
+/// rejection at the class, so answering "not droppy" for it never lets an
+/// object exist to miss a gate. The whole chain is walked, not one level:
+/// a droppy ROOT under a dtor-less middle class still makes every class
+/// above it droppy (measured byte-identical to three levels).
+const clang::CXXDestructorDecl *
+userOrInheritedDestructor(clang::ASTContext &context, clang::QualType type) {
+  if (const clang::CXXDestructorDecl *own =
+          userDeclaredDestructor(context, type))
+    return own;
+  while (const clang::ArrayType *arrayType =
+             context.getAsArrayType(type.getCanonicalType()))
+    type = arrayType->getElementType();
+  const auto *record =
+      llvm::dyn_cast_or_null<clang::CXXRecordDecl>(type->getAsRecordDecl());
+  if (!record || !record->hasDefinition() || record->getNumBases() != 1)
+    return nullptr;
+  const clang::CXXBaseSpecifier &base = *record->bases_begin();
+  if (base.isVirtual() || base.getAccessSpecifier() != clang::AS_public)
+    return nullptr;
+  const clang::CXXDestructorDecl *inherited =
+      userOrInheritedDestructor(context, base.getType());
+  // An inherited destructor counts only if it is user-PROVIDED (a real
+  // body). An explicitly `= default`ed one is user-DECLARED -- so the
+  // own-class predicate above still answers for it, where the no-body
+  // class gate keeps the loud W2.17 behavior -- but it is trivial and has
+  // no effect to lose, and treating it as droppy would reject every
+  // std::pair: gcc-15's pair publicly inherits `__pair_base`, whose
+  // defaulted destructor is exactly this shape (measured: the transitive
+  // predicate without this filter regressed corpus entries 00502/00601).
+  if (inherited && !inherited->isUserProvided())
+    return nullptr;
+  return inherited;
+}
+
 /// Declared in CImporterInternal.h: shared with FR-41's admissibility probe
 /// (lib/Project/ItemColoring.cpp), which must screen exactly the shapes this
 /// answers false for -- screening one it admits would color a portable class
@@ -1033,25 +1081,32 @@ LogicalResult CImporter::collectRecordFields(
         return emitError(baseLoc)
                << "unsupported: base classes are not supported";
       }
-      // A base with a user-declared destructor is a MEASURED miscompile
-      // channel, exactly like the destructor-carrying MEMBER W2.17 rejects
-      // below: the derived class does not answer `hasUserDeclaredDestructor`
-      // for an INHERITED destructor, so none of W2.17's use-site drop gates
-      // (`checkDropLocalScope`, by-value, array, global) would fire for
-      // `Derived d;`, and the emitted struct keeps a `Copy` derive it must
-      // not have (measured: rustc E0204 on the emitted crate).
-      if (userDeclaredDestructor(astContext(), base.getType()))
-        return emitError(baseLoc)
-               << "unsupported: base class with a destructor";
-      // An EMPTY base carries no inherited DATA, so the data-loss
-      // rationale does not apply and a synthesized field would be pure
-      // invention: the `[u8; 1]` placeholder a field-less record maps to
-      // is not the C++ object (which applies the empty-base optimization
-      // and adds no storage at all). Skipped exactly like the
-      // std-namespace tag base above; an inherited METHOD reached through
-      // such a base has no `base` field to project through and is a
-      // located rejection in `projectBaseHops`.
-      if (baseRecord->isEmpty())
+      // W2.26 ADMITS the destructor-carrying base (W2.17's E0204 channel
+      // is closed by the transitive predicate: every use-site drop gate
+      // now fires for a merely-inheriting `Derived d;`, and the emitter
+      // suppresses `Copy` from the transitive has_drop above). The base
+      // lands as the ordinary first field, whose Drop is exactly where
+      // Rust's field-drop glue runs `~Base` -- after the derived drop
+      // body, which is C++'s derived-body-then-base order (measured
+      // byte-identical to three levels, cpp-inheritance-drop.cpp). The
+      // residual drop-ORDER divergence -- a droppy MEMBER beside a droppy
+      // base -- stays rejected at the member below.
+      //
+      // An EMPTY NON-DROPPY base carries no inherited DATA, so the
+      // data-loss rationale does not apply and a synthesized field would
+      // be pure invention: the `[u8; 1]` placeholder a field-less,
+      // method-less record maps to is not the C++ object (which applies
+      // the empty-base optimization and adds no storage at all). Skipped
+      // exactly like the std-namespace tag base above; an inherited
+      // METHOD reached through such a base has no `base` field to project
+      // through and is a located rejection in `projectBaseHops`. An empty
+      // DROPPY base is NOT skipped: skipping it loses `~Base` outright
+      // (the measured ~Shape-loss trap), so it is MATERIALIZED -- a
+      // destructor is a user-declared method, which already keeps the
+      // record off the byte-region path, so `mapType` below yields a true
+      // zero-field struct_def whose Drop impl the field carries.
+      if (baseRecord->isEmpty() &&
+          !userOrInheritedDestructor(astContext(), base.getType()))
         continue;
       // `mapType` on the base's record type is what imports the base class
       // (and lands its `struct_def` ahead of this one); a rejection inside
@@ -1093,11 +1148,15 @@ LogicalResult CImporter::collectRecordFields(
         // where the object is declared, in `emitLocalVar`/`importGlobalVar`/
         // `importFunction`, since the class itself is fine there.
         if (llvm::isa<clang::CXXDestructorDecl>(method)) {
-          // No vtable, no dynamic dispatch: checked BEFORE the general
-          // admission so the diagnostic names the real blocker (a virtual
-          // `~Shape()` used to report the generic destructor wording).
-          if (method->isVirtual())
-            return emitError(methodLoc) << "unsupported: virtual destructor";
+          // W2.26 admits a VIRTUAL destructor here: destruction of a value
+          // is static, and every site where the dynamism could be observed
+          // (new, upcast, virtual member call) is an explicit AST node that
+          // is already a located rejection. The practical reach is exactly
+          // the class whose SOLE virtual member is the destructor: this
+          // branch `continue`s, so any OTHER virtual method still hits the
+          // class-level `virtual method` rejection below. The vptr the
+          // native layout carries is refused where it could be observed --
+          // `emitSizeofAlignof` screens polymorphic operands.
           // A union's members are not independently alive, so "destroy the
           // members in reverse order" has no meaning to reproduce; this is
           // the residual shape the generic wording is retained for.
@@ -1177,7 +1236,13 @@ LogicalResult CImporter::collectRecordFields(
     // members of an object in REVERSE declaration order after the enclosing
     // body, Rust drops the fields in FORWARD order (measured: the middle
     // `dtor` line swaps). Array-typed members decide on the element type.
-    if (userDeclaredDestructor(astContext(), field->getType()))
+    // W2.26: TRANSITIVE, like every drop gate -- a member of a
+    // merely-inheriting droppy-derived class diverges identically, and a
+    // droppy member BESIDE a droppy base is the wave's re-measured order
+    // divergence (native `~D ~M ~B` vs image `~D ~B ~M`, the base being
+    // the FIRST field), so this gate is precisely what keeps that shape
+    // out while the base itself is admitted.
+    if (userOrInheritedDestructor(astContext(), field->getType()))
       return emitError(fieldLoc)
              << "unsupported: struct member of a class with a destructor";
     if (field->isBitField()) {

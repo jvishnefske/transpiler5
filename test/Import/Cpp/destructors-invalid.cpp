@@ -1,5 +1,4 @@
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/virtual-dtor.cpp 2>&1 | FileCheck %s --check-prefix=VIRTDTOR
 // RUN: not emitrust-import-c %t/no-body.cpp 2>&1 | FileCheck %s --check-prefix=NOBODY
 // RUN: not emitrust-import-c %t/union-dtor.cpp 2>&1 | FileCheck %s --check-prefix=UNIONDTOR
 // RUN: not emitrust-import-c %t/dtor-name-clash.cpp 2>&1 | FileCheck %s --check-prefix=DTORCLASH
@@ -19,10 +18,14 @@
 // RUN: emitrust-cc --recover --emit=rust %t/drop-nested-block.cpp 2>&1 >/dev/null | FileCheck %s --check-prefix=NESTEDBLOCKRECDIAG
 
 // W2.17 located-rejection ledger for user-declared destructors. The wave
-// admits exactly ONE shape -- a non-virtual destructor, defined in this
-// translation unit, on a class with no base classes, every object of
-// which is a LOCAL whose `DeclStmt` sits directly in a function body, a
-// loop body, or an if/else branch (see destructors.cpp). That subset was
+// admitted exactly ONE shape -- a non-virtual destructor, defined in this
+// translation unit, every object of which is a LOCAL whose `DeclStmt`
+// sits directly in a function body, a loop body, or an if/else branch
+// (see destructors.cpp). W2.26 widened the CLASS side of that subset --
+// a destructor-carrying single public base and a sole-virtual-dtor class
+// are admitted, transitively (inheritance-drop.cpp) -- while every
+// OBJECT-position gate here still stands, now keyed on the transitive
+// predicate (inheritance-drop-invalid.cpp pins the derived-class runs). That subset was
 // chosen because it is the subset that byte-diffs clean against
 // `clang++ -std=c++17`; EVERY other shape below was MEASURED to diverge,
 // and each divergence is a SILENT MISCOMPILE (the crate compiles clean
@@ -53,10 +56,13 @@
 //   body's locals BEFORE evaluating the increment; the importer lowers a
 //   general `for` into a `while` with the increment at the BOTTOM OF THE
 //   BODY, i.e. before the drop. Measured swap of `inc`/`dtor` lines.
-// * a virtual destructor: no vtable/dynamic dispatch is modeled at all.
-//   Checked BEFORE the general destructor admission so the diagnostic
-//   names the actual blocker (a virtual `~Shape()` used to report the
-//   generic `user-declared destructor`).
+// * a virtual destructor: ADMITTED since W2.26 for the class whose SOLE
+//   virtual member is the destructor (destruction of a value is static,
+//   and every site where dynamism could be observed is already a located
+//   rejection) -- the pin moved FORWARD to
+//   test/Import/Cpp/inheritance-drop.cpp, and the residual (a virtual
+//   destructor beside any OTHER virtual method) is pinned in
+//   inheritance-drop-invalid.cpp under the `virtual method` wording.
 // * a destructor with no definition in THIS translation unit: an
 //   uncalled, undefined method is silently DROPPED from emission, and
 //   nothing ever calls a destructor -- so the class would emit with NO
@@ -66,19 +72,6 @@
 // (and still tabulated as `cxx-destructor`) for the residual shape a
 // union destructor is; test/Import/Cpp/methods-invalid.cpp's `destructor`
 // case moved FORWARD to that shape rather than loosening.
-
-//--- virtual-dtor.cpp
-// VIRTDTOR: virtual-dtor.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: virtual destructor
-extern "C" int printf(const char *, ...);
-struct S {
-  int id;
-  virtual ~S() { printf("dtor %d\n", id); }
-};
-int use(void) {
-  S s;
-  s.id = 1;
-  return s.id;
-}
 
 //--- no-body.cpp
 // NOBODY: no-body.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: destructor with no definition in this translation unit

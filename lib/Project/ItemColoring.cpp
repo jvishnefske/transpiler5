@@ -548,13 +548,49 @@ static bool admitsSingleBaseAsField(const clang::CXXRecordDecl *record) {
     return false;
   if (llvm::isa<clang::ClassTemplateSpecializationDecl>(baseRecord))
     return false;
-  // A base carrying a destructor is a separate importer rejection
-  // (`unsupported: base class with a destructor`), so it is screened here
-  // too -- under the base-class tag, because a base class is what makes the
-  // shape unrepresentable.
-  if (baseRecord->hasUserDeclaredDestructor())
-    return false;
+  // W2.26: a base carrying a destructor is ADMITTED (the importer's
+  // transitive drop predicate marks the derived class has_drop and lands
+  // the base as the first field), so the old dtor screen here is gone --
+  // keeping it would color a now-portable class Red, the one direction
+  // FR-41 may not get wrong.
   return true;
+}
+
+/// W2.26: the coloring restatement of the importer's TRANSITIVE drop
+/// predicate (`userOrInheritedDestructor` in ImportCAggregates.cpp): the
+/// class's own user-declared destructor or one inherited down the single
+/// public non-virtual base chain. Restated for the same behind-the-private-
+/// header reason as `admitsSingleBaseAsField` above; the two must move
+/// together.
+static const clang::CXXDestructorDecl *
+transitiveDestructor(clang::ASTContext &context, clang::QualType type) {
+  while (const clang::ArrayType *arrayType =
+             context.getAsArrayType(type.getCanonicalType()))
+    type = arrayType->getElementType();
+  const auto *record =
+      llvm::dyn_cast_or_null<clang::CXXRecordDecl>(type->getAsRecordDecl());
+  if (!record || !record->hasDefinition())
+    return nullptr;
+  if (record->hasUserDeclaredDestructor())
+    return record->getDestructor();
+  if (record->getNumBases() != 1)
+    return nullptr;
+  const clang::CXXBaseSpecifier &base = *record->bases_begin();
+  if (base.isVirtual() || base.getAccessSpecifier() != clang::AS_public)
+    return nullptr;
+  const clang::CXXDestructorDecl *inherited =
+      transitiveDestructor(context, base.getType());
+  // An inherited destructor counts only when user-PROVIDED: a defaulted
+  // one is trivial (gcc-15's std::pair inherits exactly that shape from
+  // `__pair_base`, and screening it would be a false red on every pair).
+  if (inherited && !inherited->isUserProvided())
+    return nullptr;
+  return inherited;
+}
+
+static bool typeHasTransitiveDestructor(clang::ASTContext &context,
+                                        clang::QualType type) {
+  return transitiveDestructor(context, type) != nullptr;
 }
 
 /// W2.17: whether a user-declared destructor is one the importer turns into
@@ -565,7 +601,12 @@ static bool admitsSingleBaseAsField(const clang::CXXRecordDecl *record) {
 /// no record-level screen at all, so they are not restated here.
 static bool admitsDestructorAsDrop(const clang::CXXRecordDecl *record,
                                    const clang::CXXMethodDecl *destructor) {
-  if (destructor->isVirtual() || record->isUnion())
+  // W2.26: `isVirtual` alone no longer disqualifies -- the sole-virtual-
+  // dtor class is admitted as a value. A virtual destructor beside any
+  // OTHER virtual method is still red, via the virtual-method screen in
+  // `probeRecord` (which must in turn EXCLUDE destructors, or every
+  // admitted virtual dtor would stay falsely red through the double tag).
+  if (record->isUnion())
     return false;
   // An uncalled, undefined method is silently dropped from emission, so a
   // body-less destructor would emit no `impl Drop` at all.
@@ -622,7 +663,7 @@ void AdmissibilityProbe::probeRecord(const clang::RecordDecl *record,
       // FR-112's motivating repro: the direction that breaks FR-41's
       // "false reds remain zero" contract and starves FR-43's `--search`
       // (test/Project/coloring-cpp-class-gates.cpp pins both halves).
-      if (method->isVirtual())
+      if (method->isVirtual() && !llvm::isa<clang::CXXDestructorDecl>(method))
         verdicts.reject(symbol, tag::VirtualMethod, /*signatureLevel=*/false);
       // FR-118: the screen this probe was MISSING, measured as a live FALSE
       // GREEN -- the importer rejects a copy/move/delegating constructor
@@ -650,6 +691,17 @@ void AdmissibilityProbe::probeRecord(const clang::RecordDecl *record,
     llvm::StringRef fieldTag = typeConstructTag(field->getType());
     if (!fieldTag.empty())
       verdicts.reject(symbol, fieldTag, /*signatureLevel=*/false);
+    // W2.26: a member whose class carries a destructor -- its own or a
+    // TRANSITIVELY inherited one -- is an importer rejection (`struct
+    // member of a class with a destructor`, the measured member-vs-base
+    // drop-order divergence). Before this wave the class was usually Red
+    // through the base-dtor screen above; with that screen gone, skipping
+    // the member screen would widen a false GREEN (FR-118's lesson).
+    if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(record))
+      if (!cxxRecord->isInStdNamespace() &&
+          typeHasTransitiveDestructor(record->getASTContext(),
+                                      field->getType()))
+        verdicts.reject(symbol, tag::Destructor, /*signatureLevel=*/false);
   }
 }
 
