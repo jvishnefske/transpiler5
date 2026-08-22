@@ -16,16 +16,26 @@
 // import simply rejects later -- but it makes FR-49's root attribution
 // credit the wrong construct.
 //
-// FALSE RED, closed on the IMPORTER side: a UNION carrying an overloaded
-// operator was screened Red here while the importer ADMITTED it (the union
-// path takes `collectUnionSlot` and never runs the W2.2 member-shape gate),
-// which is the direction ItemColoring's doctrine forbids -- it colors a
-// portable item Red, drags every caller down with no diagnostic, and starves
-// FR-43's `--search`, whose roots must be Green|Yellow. Rather than narrow
-// the screen, FR-117 made the importer raise the SAME
-// `unsupported: overloaded operator` the struct path always raised, so the
-// two now agree by REJECTION. `UnionOp` below is Red on both sides, which is
-// what makes it a true red.
+// FALSE RED, closed on the IMPORTER side by FR-117 and then RE-DECIDED by
+// FR-112: a UNION carrying an overloaded operator was screened Red here
+// while the importer ADMITTED it (the union path takes `collectUnionSlot`
+// and never runs the W2.2 member-shape gate) -- the direction
+// ItemColoring's doctrine forbids. FR-117 closed it by making the union
+// path REJECT like the struct path; FR-112 closed it the other way for
+// good: BOTH operator gates are gone, an overloaded operator is OMITTED
+// member-by-member (its uses are located rejections at the call), and the
+// operator screen here went with them. `UnionOp` and `OpStruct` below are
+// Green with the member omitted -- coloring an operator-carrying class Red
+// now would be three FALSE REDS on FR-112's motivating repro, breaking
+// FR-41's "false reds remain zero" contract and starving FR-43's
+// `--search`, whose roots must be Green|Yellow.
+//
+// `VirtMethod` pins the boundary: FR-112 deliberately kept
+// `unsupported: virtual method` CLASS-level (the vptr is real storage the
+// emitted struct lacks -- `sizeof` folds 16 for a struct the emitter
+// renders as 4 bytes), so the isVirtual screen must STAY, mirroring the
+// importer gate in `collectRecordFields`. Green-with-omission next to
+// red-for-virtual is exactly the line FR-112 draws.
 //
 // A CONVERSION FUNCTION is deliberately NOT screened: FR-117 omits it and
 // keeps the class importable, so screening it would mint a fresh false red.
@@ -70,11 +80,25 @@ struct DefaultedCopy {
   DefaultedCopy(const DefaultedCopy &) = default;
 };
 
-/// Red on both sides now: the union's overloaded operator.
+/// Green since FR-112: the union path omits the operator like the struct
+/// path does.
 union UnionOp {
   int a;
   float b;
   int operator+(int x) const { return a + x; }
+};
+
+/// Green since FR-112: the operator is omitted, the siblings import.
+struct OpStruct {
+  int v;
+  int get() const { return v; }
+  int operator+(int x) const { return v + x; }
+};
+
+/// Red: the virtual-method gate stays class-level this wave.
+struct VirtMethod {
+  int v;
+  virtual int get() const;
 };
 
 /// Green: a conversion function is omitted, not rejected.
@@ -90,8 +114,10 @@ int main() { return 0; }
 // CHECK-NEXT: item DefaultedCopy kind=record color=red reason=inadmissible construct=copy-move-constructor
 // CHECK-NEXT: item Delegating kind=record color=red reason=inadmissible construct=copy-move-constructor
 // CHECK-NEXT: item Movable kind=record color=red reason=inadmissible construct=copy-move-constructor
+// CHECK-NEXT: item OpStruct kind=record color=green reason=admissible
 // CHECK-NEXT: item Plain kind=record color=green reason=admissible
-// CHECK-NEXT: item UnionOp kind=record color=red reason=inadmissible construct=overloaded-operator
+// CHECK-NEXT: item UnionOp kind=record color=green reason=admissible
+// CHECK-NEXT: item VirtMethod kind=record color=red reason=inadmissible construct=virtual-method
 // CHECK-NEXT: item c_main kind=function color=green reason=admissible
-// CHECK-NEXT: tally green=3 yellow=0 red=5
+// CHECK-NEXT: tally green=5 yellow=0 red=5
 // CHECK-NOT:  item

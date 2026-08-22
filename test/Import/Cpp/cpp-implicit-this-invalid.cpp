@@ -69,7 +69,12 @@ int use(void) {
 // the shared/shared spelling (a `const` method taking `const Node &`,
 // pinned as an ACCEPT in cpp-references.cpp) and mirrors the same-base
 // rejection the C pointer path already applies to `f(&a, &a)`.
-// REFARG: this-ref-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: aliasing mutable reference argument and method receiver
+// FR-112 contained the rejection one level further: the aliasing call is
+// a BODY failure of `self_merge`, so that method is omitted (warning
+// below, same wording) and `merge` plus the class itself import; the use
+// of the omitted method is the located error.
+// REFARG: this-ref-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: aliasing mutable reference argument and method receiver (omitted: method 'self_merge' of class 'Node')
+// REFARG: this-ref-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to unimported method 'Node_self_merge'
 class Node {
 public:
   int merge(Node &other) { return v + other.v; }

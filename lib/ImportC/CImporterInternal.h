@@ -2909,6 +2909,14 @@ private:
   /// the alternatives rejected.
   LogicalResult importCXXMethods(const clang::CXXRecordDecl *record);
 
+  /// FR-118/FR-112: erases every already-imported method func of `record`
+  /// by MANGLED NAME (on-demand pulls are left alone, `rollbackTo`'s
+  /// legitimately-exempt category) and resets the per-function scratch
+  /// state that pointed into the erased bodies. Shared between the FR-118
+  /// whole-class undo in `importRecordUncached` and the per-iteration
+  /// clean slate of the FR-112 containment fixpoint in `importCXXMethods`.
+  void eraseImportedMethodFuncs(const clang::CXXRecordDecl *record);
+
   /// W2.2: the per-(class, overload-signature) mangled `func.func`/
   /// `emitrust.impl` symbol name for `method`:
   /// `<StructName>_<methodBaseName>[_<overloadSuffix>]`. `<StructName>` is

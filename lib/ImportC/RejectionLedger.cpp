@@ -202,6 +202,22 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("cxx-virtual-call")},
     {llvm::StringLiteral("unsupported: virtual method"),
      llvm::StringLiteral("cxx-virtual")},
+    // FR-112 containment: a member-level shape no longer rejects the CLASS;
+    // the member is omitted and its USES are the rejections. Both wordings
+    // below are those use sites -- the spelled/implicit operator call
+    // (whose message names the omitted member and its class) and the call
+    // to a method omitted because its own signature or body failed (the
+    // static-method variant takes the same wording; see the C8 note at the
+    // call dispatch). Tagged separately from the operator family because
+    // FR-112 was itself ranked from a tabulation these used to blind by
+    // landing in the catch-all `other`. ORDER MATTERS TWICE: the first
+    // needle must sit ABOVE the "overloaded operator" row (its message
+    // contains both substrings, and first match wins), and both rows are
+    // mirrored AT THE SAME POSITION into test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("omitted from class"),
+     llvm::StringLiteral("cxx-omitted-member")},
+    {llvm::StringLiteral("call to unimported method"),
+     llvm::StringLiteral("cxx-omitted-member")},
     {llvm::StringLiteral("overloaded operator"),
      llvm::StringLiteral("cxx-operator-overload")},
     // FR-117: a user-defined CONVERSION FUNCTION. The member itself is

@@ -206,9 +206,13 @@ int use(int n) {
 //--- static-data-member.cpp
 // KNOWN GAP: a static data member of a class template is an emitted
 // GLOBAL, not a field, and the instantiation walk imports records and
-// methods only. It surfaces at the use as the pre-existing unknown-
-// variable wording.
-// STATICMEM: static-data-member.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: reference to an unknown variable
+// methods only. Since FR-112 the unknown-variable rejection inside
+// `get`'s body is CONTAINED -- the method is omitted (warning below,
+// carrying the pre-existing wording) and the instantiation itself
+// imports -- so the gap now surfaces as the located call-site rejection
+// of the omitted method.
+// STATICMEM: static-data-member.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: reference to an unknown variable (omitted: method 'get' of class 'Counted_i32')
+// STATICMEM: static-data-member.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to unimported method 'Counted_i32_get'
 template <typename T>
 struct Counted {
   static int count;

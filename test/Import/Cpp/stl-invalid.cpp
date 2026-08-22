@@ -351,13 +351,19 @@ int use(void) {
 // templates were monomorphized, `apply` was rejected wholesale as
 // `unsupported top-level declaration` and the lambda never mattered.
 // Now clang's `apply<(lambda ...)>` instantiation IS imported, so the
-// rejection lands one level deeper and one level more precisely: on the
-// closure class's `operator()`, at the lambda's own source location. The
-// escape-by-argument shape is still out — that is the invariant this
-// section pins — but the diagnostic now names the real obstacle (the
-// closure type is a record with an overloaded call operator) instead of
-// the incidental one.
-// LAMESCARG: lambda-escape-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: overloaded operator
+// rejection lands one level deeper: on the closure CLASS, at the
+// lambda's own source location. FR-112 moved it once more -- the
+// class-level `unsupported: overloaded operator` gate is gone (a member
+// operator is omitted, not class-fatal), so the closure record now
+// rejects on the next thing `collectRecordFields` meets: its UNNAMED
+// capture field. The escape-by-argument shape is still out -- that is
+// the invariant this section pins -- and still located at the lambda;
+// had the field collection admitted it, the `operator()` call inside
+// `apply` would still be a located rejection at the call (the
+// non-identifier-callee guard, which deliberately keeps the generic
+// wording for lambda closures rather than calling one an "omitted
+// member").
+// LAMESCARG: lambda-escape-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: unnamed struct member
 template <typename F> int apply(F f) { return f(1); }
 int use(void) {
   int a = 1;

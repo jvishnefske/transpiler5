@@ -7027,7 +7027,7 @@ piece and becomes FR-45.
   AND not all-fields". Worth 2 warnings; removes a hazard class.
   **NOT SPIKED.**
 
-- [ ] FR-112 CONTAINMENT -- keep the record, reject at the access
+- [x] FR-112 CONTAINMENT -- keep the record, reject at the access
   site. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21), **with a
   MEASURED CORRECTION TO ITS OWN #1 RANKING** -- see the payoff
   section below. The C99-43 disposition transfers to C++ classes, and
@@ -7137,6 +7137,54 @@ piece and becomes FR-45.
   imports; and whether omitting a member shifts any `--emit=crate`
   golden byte (the spike patch was env-gated, so untested in the on
   state against goldens).
+  LANDED 2026-08-22, after a re-spike at HEAD reaffirmed C1-C7 and
+  added **C8: the static-method variant of the C2 dangling call is
+  VERIFIER-SILENT** -- a prepass-resolved static call renders as
+  `emitrust.call_opaque "C::C_helper"` (a string, not a symbol
+  reference), so `emitrust-opt` exits 0 on a dangling one and the only
+  backstop is rustc E0599 at cargo time. The fixpoint therefore
+  converges on importFunction failure alone, and the
+  caller-before-STATIC-callee ordering is pinned at the import level.
+  Also resolved by measurement: BOTH operator gates removed (struct
+  AND union paths -- `importCXXMethods` runs for unions, so removing
+  only the struct gate would have minted a false GREEN for
+  `union { operator+ }`). Ctor/dtor failures stay class-level beyond
+  the spec's list: the soundness criterion itself forces it (implicit
+  invocation, and a construct site does not reject loudly on a
+  missing ctor func) -- pinned by the DTORFAIL section. Mangling is
+  byte-stable under omission: `cxxMethodMangledName`'s overload-count
+  loop is a pure AST function, so omitted NAMED methods still count
+  in sibling overload sets and no sibling symbol shifts.
+  The use-site wording MINTS the member it names
+  (`call to overloaded operator 'operator+' omitted from class
+  'Vec2'`), and static omitted-method uses take the method wording so
+  they classify under the new `cxx-omitted-member` tag (the C-shared
+  "function" wording is pinned by a C test and could not move).
+  EXTERNAL EFFECT, measured: tinyxml2 cascaded-methods 198 -> 180,
+  `cxx-operator-overload` 3 -> 0, and the crate goes 84 -> 263 lines
+  BUILD-OK -- `XMLUtil` imports with ~9 omitted methods each carrying
+  a real per-construct diagnostic (returned-pointer, libc:isspace,
+  pointer comparisons). StrPair/XMLHandle/XMLConstHandle still drop,
+  but now on their REAL root (`cxx-copy-ctor`), exactly as this
+  entry's payoff-correction predicted.
+  One test reshape worth recording: the FR-118 EndToEnd input moved
+  its planted failure from an ordinary method body into the
+  DESTRUCTOR body, because under containment the old shape imports
+  and legitimately owns the emitted name with `has_drop` -- and the
+  main TU's same-shape POD would then merge onto a live drop-carrying
+  class, the exact divergence the byte-diff forbids. The oracle is
+  unweakened. That reshape is also what surfaced FR-122.
+  Gates: full meson suite 738/738 (fast 527 + slow/EndToEnd 211), 0
+  failures; CTestSuite 220/220/0/0 and Cpp17Suite 30/33 unchanged; no
+  Driver golden byte shifted.
+  (test/Import/Cpp/cpp-contained-member.cpp,
+  cpp-contained-member-invalid.cpp, cpp-contained-fixpoint.cpp;
+  test/EndToEnd/cpp-contained-member.cpp; frontier pins moved forward
+  in methods-invalid.cpp, class-templates-invalid.cpp,
+  cpp-implicit-this-invalid.cpp, stl-invalid.cpp,
+  cpp-conversion-function-invalid.cpp, cpp-rejected-class-no-trace.cpp,
+  coloring-cpp.cpp, coloring-cpp-class-gates.cpp)
+
 
 - [x] FR-117 DEFECT: `cxxMethodBaseName` called `getName()` on a
   non-identifier `DeclarationName`. Spike verdict
@@ -7404,6 +7452,21 @@ piece and becomes FR-45.
   taught loop-assigned deferred bindings to take `mut`; this is the
   borrow-position analogue. Loud direction, never silent. Root cause
   not yet isolated. **NOT SPIKED.**
+
+- [ ] FR-122 DEFECT (found during FR-112's implementation,
+  pre-existing at HEAD): the cross-TU record dedup key is
+  FIELD-SHAPE-ONLY, so a legitimately imported DESTRUCTOR-CARRYING
+  class and a same-name same-shape POD in another TU merge silently,
+  and the POD inherits `impl Drop` -- clang sees no destructor on the
+  POD, so no W2.17 use-site gate fires. This is FR-118's miscompile
+  shape with a legitimate (not rejected) drop class as the donor;
+  pre-existing for ANY importable drop class, and FR-112 widens
+  exposure by importing more classes. FIX DIRECTION: fold
+  drop-identity into the shape key (ImportCAggregates.cpp, the shape
+  string near the FR-58 dedup), turning the merge into the existing
+  loud shape-conflict rejection. The FR-118 EndToEnd input dodges this
+  shape today by planting its failure in the destructor body -- that
+  dodge is the evidence, not a fix. **NOT SPIKED.**
 
 - [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
   the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and

@@ -2155,8 +2155,40 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   default:
     break;
   }
-  if (!callee->getDeclName().isIdentifier())
+  if (!callee->getDeclName().isIdentifier()) {
+    // FR-112: a MEMBER overloaded operator is OMITTED from its class's
+    // import (the class itself stays importable), so its use sites are the
+    // only place the construct can be reported -- and they must be rankable.
+    // The wording names the omitted member and its class, and it is the
+    // needle of the `cxx-omitted-member` ledger tag (ordered ABOVE the
+    // "overloaded operator" needle in lib/ImportC/RejectionLedger.cpp and
+    // test/RealWorld/run_realworld.py, since this message contains both
+    // substrings). Every spelled use (`a + b`, `b = a`) and the implicit
+    // ENCLOSING-`operator=` channel (a member with a user `operator=` makes
+    // the enclosing class's implicit copy-assignment non-trivial, so
+    // `outer1 = outer2` arrives here as a CXXOperatorCallExpr naming it)
+    // lands on this guard. Lambdas keep the generic wording (their
+    // `operator()` is the closure-call frontier, not an omitted member),
+    // and so do std-namespace records (their methods are intercepted, never
+    // imported, so "omitted" would misreport the boundary).
+    if (const auto *methodCallee =
+            llvm::dyn_cast<clang::CXXMethodDecl>(callee);
+        methodCallee && methodCallee->isOverloadedOperator() &&
+        !methodCallee->getParent()->isLambda() &&
+        !methodCallee->getParent()->isInStdNamespace()) {
+      const clang::RecordDecl *ownerDefinition =
+          methodCallee->getParent()->getDefinition();
+      std::string ownerName =
+          ownerDefinition ? recordRustName(ownerDefinition) : std::string();
+      return emitError(loc)
+             << "unsupported: call to overloaded operator '"
+             << callee->getDeclName().getAsString() << "' omitted from class '"
+             << (ownerName.empty() ? llvm::StringRef("<anonymous>")
+                                   : llvm::StringRef(ownerName))
+             << "'";
+    }
     return emitError(loc) << "unsupported callee";
+  }
   // W2.14: the std::variant FREE-function vocabulary — the first
   // std-namespace free-function interception in this dispatch (members
   // and operators divert above; a free `std::get` would otherwise fall
@@ -2397,6 +2429,18 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   if (!target) {
     if (isSystemHeaderDecl(callee))
       return rejectSystemHeaderUse(loc, "call to", callee->getName());
+    // FR-112: a STATIC METHOD with no imported func can only be a member
+    // the class's import OMITTED (the FR-47 prepass registers every
+    // importable method before any body runs), so it takes the method
+    // wording -- which the `cxx-omitted-member` ledger needle classifies --
+    // rather than the C "unimported function" one. This import-level
+    // rejection is ALL there is for a static: a resolved static call
+    // renders as an opaque callee string the verifier never checks
+    // (design.md FR-112, constraint C8), so a miss here would surface only
+    // as rustc E0599 at cargo time.
+    if (staticMethod)
+      return emitError(loc) << "unsupported: call to unimported method '"
+                            << name << "'";
     return emitError(loc) << "unsupported: call to unimported function '"
                           << name << "'";
   }

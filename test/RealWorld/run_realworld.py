@@ -371,6 +371,12 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("user-declared destructor", "cxx-destructor"),
     ("virtual or unresolved member call", "cxx-virtual-call"),
     ("unsupported: virtual method", "cxx-virtual"),
+    # FR-112 containment: an omitted member's USE sites. The first needle
+    # must sit ABOVE the "overloaded operator" row (its message contains
+    # both substrings; first match wins). Mirrors
+    # lib/ImportC/RejectionLedger.cpp.
+    ("omitted from class", "cxx-omitted-member"),
+    ("call to unimported method", "cxx-omitted-member"),
     ("overloaded operator", "cxx-operator-overload"),
     # FR-117: a user-defined conversion function. The member is OMITTED from
     # the class, but its residual use positions (the explicit
