@@ -328,6 +328,14 @@ _BLOCKER_SUBSTRINGS = [
     # FR-77: a fn-ptr constant naming a function no TU defines is refused at
     # the address-taking site, so the containing item carries the blocker.
     ("address of undefined function", "fnptr-undefined-target"),
+    # FR-113 admitted scoped enums; the residual enum-definition gates
+    # (keyword names/enumerators, values outside i32, empty, cross-TU shape
+    # conflict) previously tabulated [other].
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("unsupported: enum name", "enum-def-rejected"),
+    ("unsupported: enumerator", "enum-def-rejected"),
+    ("enum with no enumerators", "enum-def-rejected"),
+    ("conflicting definition of enum", "enum-def-rejected"),
     # FR-50: not a blocker of its own -- the item names a type some OTHER
     # item's rejection removed. FR-49's root-blocker table credits the real
     # cause; this tag only keeps the cascade out of the "other" bucket.

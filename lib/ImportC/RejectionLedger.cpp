@@ -126,6 +126,19 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
     // global initializer, typically) carries the blocker.
     {llvm::StringLiteral("address of undefined function"),
      llvm::StringLiteral("fnptr-undefined-target")},
+    // FR-113 admitted scoped enums; the RESIDUAL enum-definition gates
+    // (keyword-named enums and enumerators, values outside i32, an empty
+    // enum, a cross-TU shape conflict) previously tabulated [other]. The
+    // "unsupported: enumerator" needle also catches the value-range and
+    // incomplete-enum wordings, which are the same front.
+    {llvm::StringLiteral("unsupported: enum name"),
+     llvm::StringLiteral("enum-def-rejected")},
+    {llvm::StringLiteral("unsupported: enumerator"),
+     llvm::StringLiteral("enum-def-rejected")},
+    {llvm::StringLiteral("enum with no enumerators"),
+     llvm::StringLiteral("enum-def-rejected")},
+    {llvm::StringLiteral("conflicting definition of enum"),
+     llvm::StringLiteral("enum-def-rejected")},
     {llvm::StringLiteral("was rejected, so a type naming it"),
      llvm::StringLiteral("rejected-type-cascade")},
 };

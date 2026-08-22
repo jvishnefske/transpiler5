@@ -833,6 +833,20 @@ def EmitRust_EnumDefOp : EmitRust_Op<"enum_def", [
 
   let assemblyFormat = "$sym_name $variant_names $variant_values attr-dict";
   let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    /// Resolves the enum definition named `name` visible from `from`.
+    /// Definitions are module children (HasParent), but a consumer may sit
+    /// inside a nested symbol table (`emitrust.impl` holds its methods'
+    /// symbols, so a cast-to-enum inside any C++ method would never see a
+    /// module-level enum_def through a nearest-table lookup -- FR-113), so
+    /// the lookup runs in the enclosing MODULE's table, not the nearest
+    /// one. Returns null when no such definition exists or the symbol is
+    /// of a different kind. Mirrors StructDefOp/DataEnumDefOp/GlobalOp::
+    /// lookupFrom (the FR-84 pattern).
+    static EnumDefOp lookupFrom(mlir::Operation *from,
+                                llvm::StringRef name);
+  }];
 }
 
 //===----------------------------------------------------------------------===//

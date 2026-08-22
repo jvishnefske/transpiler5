@@ -524,6 +524,19 @@ LogicalResult StructDefOp::verify() {
 // EnumDefOp
 //===----------------------------------------------------------------------===//
 
+EnumDefOp EnumDefOp::lookupFrom(Operation *from, llvm::StringRef name) {
+  // FR-113: definitions are module children, but `from` may live inside a
+  // nested symbol table (an `emitrust.impl` method — any cast-to-enum
+  // inside a C++ method body), so resolve in the enclosing module's table;
+  // fall back to the nearest table for unattached IR. Mirrors
+  // StructDefOp/DataEnumDefOp/GlobalOp::lookupFrom (the FR-84 pattern).
+  auto nameAttr = StringAttr::get(from->getContext(), name);
+  if (auto module = from->getParentOfType<ModuleOp>())
+    return dyn_cast_or_null<EnumDefOp>(
+        SymbolTable::lookupSymbolIn(module, nameAttr));
+  return SymbolTable::lookupNearestSymbolFrom<EnumDefOp>(from, nameAttr);
+}
+
 /// Verifies that the variant name and value arrays have the same non-zero
 /// length, that variant names are non-empty and unique, that variant
 /// values are within the i32 range, and that an enum with the

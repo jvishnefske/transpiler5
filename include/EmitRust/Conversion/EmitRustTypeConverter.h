@@ -51,12 +51,18 @@ inline void populateEmitRustTypeConverter(TypeConverter &typeConverter) {
 
 /// Returns the zero/default attribute for `type`: `0` for integer and index
 /// types (which renders as `false` for i1), `0.0` for floating-point types,
-/// and the opaque `None` expression for `!emitrust.fn_ptr` (the null
+/// the opaque `None` expression for `!emitrust.fn_ptr` (the null
 /// function pointer) and for the `!emitrust.opaque<"Option<...">` family
 /// (W2.11 std::optional and the C99-43 Option-of-cursor cell — the Rust
 /// emitter's own default for these is the same `None`, see
-/// `RustEmitter`'s default-value rendering). Returns a null attribute for
-/// any other type.
+/// `RustEmitter`'s default-value rendering), and the `Name::default()`
+/// expression for `!emitrust.enum` (FR-113: every emitted enum_def carries
+/// an explicit `impl Default` returning its first variant, and the
+/// placeholder is dead — the SCF lowerings overwrite it on every branch —
+/// so any well-formed value serves; without this, a branch merge with an
+/// enum result, e.g. a switch whose cases each return an enumerator, was a
+/// NON-located `failed to legalize 'scf.index_switch'` that killed the
+/// whole unit). Returns a null attribute for any other type.
 inline Attribute getDefaultValueAttr(Type type) {
   if (isa<Float32Type, Float64Type>(type))
     return FloatAttr::get(type, 0.0);
@@ -67,6 +73,9 @@ inline Attribute getDefaultValueAttr(Type type) {
   if (auto opaque = dyn_cast<OpaqueType>(type);
       opaque && opaque.getValue().starts_with("Option<"))
     return OpaqueAttr::get(type.getContext(), "None");
+  if (auto enumType = dyn_cast<EnumType>(type))
+    return OpaqueAttr::get(type.getContext(),
+                           (enumType.getName() + "::default()").str());
   return nullptr;
 }
 

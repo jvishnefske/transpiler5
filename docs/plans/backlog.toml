@@ -67,12 +67,11 @@ anchor = "W2.26"
 
 [[items]]
 id = "FR-113"
-rank = 2
 kind = "defect"
-status = "spiked"
+status = "landed"
 size = "M"
-title = "Scoped enums: recovery hardening + admission (two stacked defects)"
-summary = "GO: failure-blind importEnum memoization (FR-118's cache poison, enum flavor) + EnumDefOp missing the FR-84 lookupFrom (impl is a SymbolTable, casts in methods never see module enum_defs). Ship both + the C2 truncation cast. spdlog 0/7 -> 7/7 crates."
+title = "Scoped enums: hardening + admission + enum lookup + SCF enum default"
+summary = "Landed 2026-08-22: spdlog 0/7 -> 7/7 crates with the real implementation; the hardening also fixed a SILENT unbuildable-crate flavor; C1 shipped as the fix; the SCF default-init deviation closed the branchy-enum hole."
 blocked_by = []
 anchor = "FR-113 DEFECT"
 

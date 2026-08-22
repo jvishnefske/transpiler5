@@ -7311,7 +7311,7 @@ piece and becomes FR-45.
   test/EndToEnd/cpp-rejected-class-no-trace.cpp,
   cpp-conversion-function.cpp; test/Project/coloring-cpp-class-gates.cpp)
 
-- [ ] FR-113 DEFECT: a rejected scoped enum still emits a cast to
+- [x] FR-113 DEFECT: a rejected scoped enum still emits a cast to
   itself and the VERIFIER destroys the whole crate. Spike verdict
   **GO-WITH-CONSTRAINTS** (2026-08-22): ship BOTH routes -- recovery
   hardening (mandatory, tiny, closes the FR-42/FR-52 contract
@@ -7387,6 +7387,52 @@ piece and becomes FR-45.
   pins the scoped rejection wording -- retired BY DESIGN under
   admission, replaced per C1.
   **SPIKED.**
+  LANDED 2026-08-22, all three parts plus one deviation the spec could
+  not have predicted. The re-verification spike found a STRONGER form
+  of the hardening case: a keyword-named enum under recovery shipped a
+  SILENT unbuildable crate (exit 0, `pub m: Match` with no Match
+  definition, cargo E0425 with zero attribution) -- the FR-50 silent
+  breakage class, so the hardening fixes a silent defect, not just the
+  loud verifier kill; pinned as the C10 regression with
+  --implicit-check-not on both choke points. importEnum is now
+  wrapper + importEnumUncached (the FR-118/importRecord pattern),
+  C9-safe: the rejected-check sits after the incomplete/anonymous
+  SUCCESS early-outs and before the memo. C1 shipped as the fix, not
+  the fence -- the DeclRefExpr branch keys on the ref's TYPE being the
+  named enum, which covers assignment, return, call-arg AND the
+  CK_NoOp static_cast facet in one change, with the C path
+  byte-identical by construction (C enumerator refs are int-typed).
+  C2's truncation cast renders `Pt((v + 300i32) as u8 as u32)` with a
+  sign-extending i8 variant; the pre-existing UNSCOPED
+  `enum : unsigned char` miscompile (301 vs 45) gets its own EndToEnd
+  regression leg. C3 shipped as EnumDefOp::lookupFrom at both emitter
+  sites; the third site audited and left -- its comment's claim
+  (emitrust.global is HasParent<ModuleOp>) checks out.
+  THE DEVIATION, required and byte-diff-pinned: with C1 shipped,
+  enum-typed constants newly reach the CF->SCF lift, and fmt's
+  parse_align becomes an scf.index_switch with an ENUM result -- the
+  SCF lowering's default-init had no enum case, so all 7 spdlog units
+  died on a NON-located `failed to legalize` with the spec's changes
+  alone (the spike's 7/7 patch predated C1). `getDefaultValueAttr`
+  gained an EnumType case (`Name::default()`; the placeholder is dead
+  by construction since SCF lowerings assign on every branch). This
+  also CLOSES the C8 branchy-enum hole (scf.if enum-merge, unscoped
+  too, pre-existing) rather than fencing it -- pinned by the branchy
+  EndToEnd leg covering both shapes.
+  SPDLOG ORACLE, real implementation: **0/7 -> 7/7 crates emitted**,
+  1/7 cargo-builds, the 6 failures being the single uniform E0596
+  signature already filed as FR-121. The `enum-def-rejected` and
+  `rejected-type-cascade` tags observed live in the tabulations.
+  Gates: full meson suite 743/743 (fast 529 + slow/EndToEnd 214), 0
+  failures; CTestSuite 220/220/0/0 and Cpp17Suite ledgers unchanged;
+  backlog-check green. The Stage-D golden retired BY DESIGN and
+  replaced with scoped-flavor residual-gate pins; the NLDEFAULT leg
+  preserved.
+  (test/EndToEnd/cpp-enum-scoped.cpp, cpp-enum-narrow-underlying.cpp,
+  cpp-enum-branchy.cpp; test/Import/Cpp/cpp-enum-class.cpp,
+  cpp-enum-class-invalid.cpp; test/Import/C/enum-rejected-cascade.c,
+  enums-invalid.c)
+
 
 - [ ] FR-114 DEFECT: same-arity overloaded CONSTRUCTORS and FREE
   functions collide in the emitted symbol, and the diagnostic blames
