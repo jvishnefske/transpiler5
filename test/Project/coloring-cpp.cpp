@@ -8,11 +8,14 @@
 // part of the ENCLOSING RECORD instead — which is a node, and which is exactly
 // the item that will not be emitted because of it.
 //
-// The four are the four rejections `CImporter::collectRecordFields` raises
-// before it collects a single field: base classes, user-declared
-// destructors, virtual methods, and overloaded operators. The fifth, a
-// reference type, is `CImporter::mapType`'s and is signature-level, so it
-// costs its callers Red rather than Yellow.
+// Three of the four record-level screens mirror rejections
+// `CImporter::collectRecordFields` raises before it collects a single
+// field: base classes, user-declared destructors, and virtual methods.
+// (Overloaded operators were screened here too until FR-112 made the
+// importer OMIT them, member by member, instead of rejecting the class --
+// see `Eq` below.) The fifth screened construct, a reference type, is
+// `CImporter::mapType`'s and is signature-level, so it costs its callers
+// Red rather than Yellow.
 //
 // Three of those five screens are now POSITION- or SHAPE-dependent rather
 // than unconditional, and BOTH halves of each are pinned below, because
@@ -76,7 +79,11 @@ public:
   int handle;
 };
 
-/// `unsupported: overloaded operator` — no operator-overload lowering.
+/// Green since FR-112: an overloaded operator is OMITTED from the imported
+/// class (every use is a located rejection at the call), so screening it
+/// would color a portable item Red -- the probe's unsafe direction. The
+/// virtual-method screen right above stays: FR-112 deliberately kept
+/// `virtual` class-level (the vptr is storage the emitted struct lacks).
 class Eq {
 public:
   bool operator==(int rhs) const;
@@ -112,7 +119,7 @@ int calls_uses_owned() { return uses_owned(); }
 int main() { return calls_by_ref() + calls_uses_owned(); }
 
 // CHECK:      item Derived kind=record color=red reason=inadmissible construct=base-class
-// CHECK-NEXT: item Eq kind=record color=red reason=inadmissible construct=overloaded-operator
+// CHECK-NEXT: item Eq kind=record color=green reason=admissible
 // CHECK-NEXT: item Flat kind=record color=green reason=admissible
 // CHECK-NEXT: item Owned kind=record color=red reason=inadmissible construct=destructor
 // CHECK-NEXT: item Plain kind=record color=green reason=admissible
@@ -127,5 +134,5 @@ int main() { return calls_by_ref() + calls_uses_owned(); }
 // CHECK-NEXT: item calls_uses_owned kind=function color=yellow reason=stub-callee via=uses_owned edge=Calls chain=calls_uses_owned->uses_owned->Owned construct=destructor
 // CHECK-NEXT: item uses_owned kind=function color=red reason=red-type via=Owned edge=BodyType chain=uses_owned->Owned construct=destructor
 // CHECK-NEXT: item uses_virt kind=function color=red reason=red-type via=Virt edge=SigType chain=uses_virt->Virt construct=virtual-method
-// CHECK-NEXT: tally green=3 yellow=2 red=8
+// CHECK-NEXT: tally green=4 yellow=2 red=7
 // CHECK-NOT:  item

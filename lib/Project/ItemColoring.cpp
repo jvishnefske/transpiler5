@@ -241,8 +241,6 @@ constexpr llvm::StringLiteral BaseClass = "base-class";
 constexpr llvm::StringLiteral VirtualMethod = "virtual-method";
 /// A user-declared destructor.
 constexpr llvm::StringLiteral Destructor = "destructor";
-/// A user-declared overloaded operator.
-constexpr llvm::StringLiteral OverloadedOperator = "overloaded-operator";
 /// A user-declared copy, move, or delegating constructor.
 constexpr llvm::StringLiteral CopyMoveConstructor = "copy-move-constructor";
 /// An lvalue or rvalue reference anywhere in a type.
@@ -613,11 +611,19 @@ void AdmissibilityProbe::probeRecord(const clang::RecordDecl *record,
       if (llvm::isa<clang::CXXDestructorDecl>(method) &&
           !admitsDestructorAsDrop(cxxRecord, method))
         verdicts.reject(symbol, tag::Destructor, /*signatureLevel=*/false);
+      // FR-112 kept this screen while REMOVING the overloaded-operator one
+      // that used to sit under it: the importer still rejects a virtual
+      // method at the class (the vptr is real storage the emitted struct
+      // lacks; no use-site rejection can repair a layout), so the screen
+      // mirrors `collectRecordFields` exactly. An overloaded operator, by
+      // contrast, is now OMITTED member-by-member -- on the struct AND
+      // union paths -- with the class importable and every use a located
+      // rejection, so screening it was measured as three FALSE REDS on
+      // FR-112's motivating repro: the direction that breaks FR-41's
+      // "false reds remain zero" contract and starves FR-43's `--search`
+      // (test/Project/coloring-cpp-class-gates.cpp pins both halves).
       if (method->isVirtual())
         verdicts.reject(symbol, tag::VirtualMethod, /*signatureLevel=*/false);
-      if (method->isOverloadedOperator())
-        verdicts.reject(symbol, tag::OverloadedOperator,
-                        /*signatureLevel=*/false);
       // FR-118: the screen this probe was MISSING, measured as a live FALSE
       // GREEN -- the importer rejects a copy/move/delegating constructor
       // (`CImporter::importCXXMethods`, which is why FR-118 had to undo the

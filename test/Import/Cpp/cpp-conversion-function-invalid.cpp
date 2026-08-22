@@ -3,7 +3,6 @@
 // RUN: not emitrust-import-c %t/static-cast-use.cpp 2>&1 | FileCheck %s --check-prefix=STATICCAST
 // RUN: not emitrust-import-c %t/explicit-call.cpp 2>&1 | FileCheck %s --check-prefix=EXPLICIT
 // RUN: not emitrust-import-c %t/out-of-line.cpp 2>&1 | FileCheck %s --check-prefix=OUTOFLINE
-// RUN: not emitrust-import-c %t/union-operator.cpp 2>&1 | FileCheck %s --check-prefix=UNIONOP
 
 // FR-117 located-rejection ledger for the non-identifier `DeclarationName`
 // family: conversion functions and overloaded operators. A method whose name
@@ -27,14 +26,13 @@
 // unnamed symbol. Per the repo rule that a recovered item reaching emission
 // unresolved must fail loudly, `importFunction` refuses it.
 //
-// `union-operator` closes a bypass that is broader than design.md's FR-117
-// entry recorded: the C++ UNION path never calls `collectRecordFields`
-// (`importRecordUncached` takes the `collectUnionSlot` branch), so the W2.2
-// member-shape gate never ran on a union and a union's overloaded operator
-// was ADMITTED as another empty-named method -- while FR-41's coloring probe
-// screened the same union Red. That was a FALSE RED, the one direction
-// ItemColoring's doctrine forbids. The union path now raises the SAME
-// wording the struct path always did, so the screen and the importer agree.
+// FR-117's fifth section here (`union-operator`) was RETIRED BY FR-112: the
+// union-path class-level operator gate it pinned existed only to keep the
+// importer and FR-41's coloring screen in agreement, and FR-112 removed
+// BOTH operator gates (struct and union path) together with the screen --
+// a union's overloaded operator is now OMITTED exactly like a struct's,
+// pinned positive in cpp-contained-member.cpp, with every use located-
+// rejected in cpp-contained-member-invalid.cpp.
 //
 // A fourth channel on the same axis is KNOWN AND DELIBERATELY LEFT OPEN
 // here: a NON-MEMBER `operator+` is an ordinary top-level `FunctionDecl`
@@ -98,17 +96,3 @@ struct C {
 };
 
 C::operator int() const { return v; }
-
-//--- union-operator.cpp
-// UNIONOP: union-operator.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: overloaded operator
-union U {
-  int a;
-  float b;
-  int operator+(int x) const { return a + x; }
-};
-
-int use(int n) {
-  U u;
-  u.a = n;
-  return u.a;
-}

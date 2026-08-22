@@ -35,6 +35,21 @@
 // test/Import/Cpp/destructors-invalid.cpp. The generic wording this case
 // pinned is still raised, for the union shape.
 //
+// FR-112 MOVED this file's OPERATOR, TRYCATCH and THROW pins from the
+// class to the USE SITE. A member-level shape -- an overloaded operator,
+// or a method whose body fails to import (try/catch and throw are body
+// failures here) -- no longer rejects the whole class: the member is
+// OMITTED (with the method's own per-construct diagnostic as a warning,
+// since the class still imports), the siblings import, and every USE of
+// the omitted member is a located error. The pins moved FORWARD rather
+// than loosening: the positive half (class imports with the member
+// omitted) is in test/Import/Cpp/cpp-contained-member.cpp, the per-channel
+// use-site rejections in cpp-contained-member-invalid.cpp, and the
+// caller-before-callee fixpoint in cpp-contained-fixpoint.cpp. VIRTUAL
+// stays a class-level rejection this wave: the vptr is real storage the
+// emitted struct lacks (`sizeof` folds faithfully from clang for a struct
+// the emitter renders smaller), which no use-site rejection can repair.
+//
 // W2.16 RETIRED this file's TEMPLATE case. `//--- template.cpp` used to
 // pin `template <typename T> class Box { public: T value; T get(); };`
 // plus `Box<int> b;` as `error: unsupported top-level declaration`;
@@ -64,9 +79,10 @@ int use(Base2 *b) {
 
 //--- try-catch.cpp
 // Existing W2.0 rejection (test/Import/Cpp/cpp-basics-invalid.cpp's
-// EXCEPTION case), re-verified unchanged when the try/catch lives inside
-// a method body rather than a free function.
-// TRYCATCH: try-catch.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported statement: CXXTryStmt
+// EXCEPTION case). FR-112: inside a METHOD body it is now a containment
+// omission (warning, class imports) and the member's USE is the error.
+// TRYCATCH: try-catch.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported statement: CXXTryStmt (omitted: method 'attempt' of class 'Risky')
+// TRYCATCH: try-catch.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to unimported method 'Risky_attempt'
 class Risky {
 public:
   int attempt(int x) {
@@ -85,9 +101,10 @@ int use(void) {
 
 //--- throw.cpp
 // Existing W2.0-era rejection (CXXThrowExpr falls through the expression
-// dispatch like any other unrecognized Expr kind), re-verified unchanged
-// inside a method body.
-// THROW: throw.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported expression: CXXThrowExpr
+// dispatch like any other unrecognized Expr kind). FR-112: inside a
+// method body it is a containment omission; the use is the error.
+// THROW: throw.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported expression: CXXThrowExpr (omitted: method 'risky' of class 'Thrower')
+// THROW: throw.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to unimported method 'Thrower_risky'
 class Thrower {
 public:
   int risky(int x) {
@@ -104,11 +121,13 @@ int use(void) {
 }
 
 //--- operator.cpp
-// Operator overloading beyond none is out of scope this wave: REJECT at
-// the operator method's own declaration. Today (NEW pin not yet wired),
-// this instead fails later, differently, and less precisely at the call
-// site with "unsupported callee".
-// OPERATOR: operator.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: overloaded operator
+// FR-112 flipped this pin BACK to the call site, but located and named
+// this time: the operator is OMITTED from the class (which imports, with
+// its siblings intact -- cpp-contained-member.cpp), and the spelled use
+// rejects with a wording that names the omitted member and its class,
+// rather than W2.2's class-level rejection or the pre-W2.2 bare
+// "unsupported callee".
+// OPERATOR: operator.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to overloaded operator 'operator+' omitted from class 'Vec2'
 struct Vec2 {
   int x;
   int operator+(const Vec2 &o) const { return x + o.x; }

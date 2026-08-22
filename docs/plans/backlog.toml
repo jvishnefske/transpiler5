@@ -46,12 +46,11 @@ anchor = "FR-118 DEFECT"
 
 [[items]]
 id = "FR-112"
-rank = 1
 kind = "containment"
-status = "spiked"
+status = "landed"
 size = "M"
 title = "Class containment: keep the record, reject at the access site"
-summary = "One unsupported member no longer rejects the whole class; omission is safe iff every use is an explicit AST node. GO-WITH-CONSTRAINTS; C1/C3 prerequisites landed as FR-117/FR-118."
+summary = "Landed 2026-08-22: operators/conversions/failing methods are omitted, uses reject located, fixpoint handles caller-before-callee incl. the verifier-silent static case (C8). tinyxml2 cascaded 198->180, crate 84->263 BUILD-OK."
 blocked_by = ["FR-117", "FR-118"]
 anchor = "FR-112 CONTAINMENT"
 
@@ -109,6 +108,17 @@ title = "Deferred [i8;N] binding borrowed &mut without mut (E0596)"
 summary = "FR-105's sibling in the deferred-binding machinery; 2x per spdlog unit, 6/7 units, the next blocker once FR-113 lets crates emit. Loud, never silent."
 blocked_by = ["FR-113"]
 anchor = "FR-121 DEFECT"
+
+[[items]]
+id = "FR-122"
+rank = 1
+kind = "defect"
+status = "open"
+size = "S"
+title = "Cross-TU dedup key is shape-only: POD merges onto a drop class, inherits Drop"
+summary = "FR-118's miscompile with a LEGITIMATE drop-class donor; pre-existing, widened by FR-112. Fold drop-identity into the shape key -> existing loud shape-conflict rejection."
+blocked_by = []
+anchor = "FR-122 DEFECT"
 
 [[items]]
 id = "FR-115"

@@ -328,23 +328,18 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
           return emitError(translateLoc(method->getLocation()))
                  << "unsupported: user-declared destructor";
         }
-        // FR-117: the same bypass, for the OVERLOADED OPERATOR half of the
-        // W2.2 member-shape gate. Measured on unpatched HEAD: a `struct`
-        // carrying `operator+` was rejected here with the wording below,
-        // while the identical `union` was ADMITTED and imported the operator
-        // as an empty-named method -- and FR-41's coloring probe screened
-        // that same union Red, which is the FALSE RED direction
-        // ItemColoring's doctrine forbids. Raising the struct path's own
-        // wording is what makes the screen and the importer agree, at no
-        // cost in new vocabulary (see test/Project/coloring-cpp-class-gates.cpp).
-        // A union cannot have a virtual member, so the gate's third arm has
+        // FR-112 RETIRED the union-path OVERLOADED OPERATOR gate FR-117 had
+        // added here. That gate existed only to keep this path in step with
+        // the struct path's W2.2 member-shape gate (the union path never
+        // runs `collectRecordFields`); both are gone together, and an
+        // operator is now OMITTED by `importCXXMethods`' `isImportable`
+        // (non-identifier `DeclarationName`) with every use a located
+        // rejection at the call -- see cpp-contained-member.cpp. FR-41's
+        // coloring screen was removed in the same change, so the importer
+        // and the screen still agree, by ADMISSION now
+        // (test/Project/coloring-cpp-class-gates.cpp). A union cannot have
+        // a virtual member, so the struct path's kept virtual gate has
         // nothing to mirror here.
-        if (method->isOverloadedOperator()) {
-          assignedStructNames.erase(definition);
-          localRecordNames.erase(definition);
-          return emitError(translateLoc(method->getLocation()))
-                 << "unsupported: overloaded operator";
-        }
       }
     if (failed(collectUnionSlot(definition, fieldNames, fieldTypes))) {
       assignedStructNames.erase(definition);
@@ -614,18 +609,10 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
         // Method funcs are erased BY NAME rather than by position so that a
         // type or global this class's bodies pulled in on demand -- which is
         // `rollbackTo`'s legitimately-exempt category -- is left alone.
-        for (const clang::CXXMethodDecl *method : cxxRecord->methods()) {
-          if (method->isImplicit() || method->isDeleted())
-            continue;
-          func::FuncOp emitted =
-              functions.lookup(cxxMethodMangledName(method));
-          if (!emitted)
-            continue;
-          functions.erase(emitted.getName());
-          eraseTopLevelOp(emitted.getOperation());
-        }
-        // Points into the bodies just erased.
-        resetPerFunctionState();
+        // FR-112 factored the erase into `eraseImportedMethodFuncs`, which
+        // is also the per-iteration clean slate of the containment fixpoint
+        // inside `importCXXMethods` itself.
+        eraseImportedMethodFuncs(cxxRecord);
         eraseTopLevelOp(structDef.getOperation());
         importedRecordShapes.erase(structName);
         emittedStructNames.erase(structName);
@@ -643,6 +630,27 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   return success();
 }
 
+/// FR-118/FR-112: erases every already-imported method func of `record` BY
+/// NAME (a type or global the class's bodies pulled in on demand is
+/// `rollbackTo`'s legitimately-exempt category and is left alone), then
+/// clears the per-function scratch state, which points into the bodies just
+/// erased. Shared between the FR-118 whole-class undo in
+/// `importRecordUncached` and the per-iteration clean slate of FR-112's
+/// containment fixpoint in `importCXXMethods`.
+void CImporter::eraseImportedMethodFuncs(const clang::CXXRecordDecl *record) {
+  for (const clang::CXXMethodDecl *method : record->methods()) {
+    if (method->isImplicit() || method->isDeleted())
+      continue;
+    func::FuncOp emitted = functions.lookup(cxxMethodMangledName(method));
+    if (!emitted)
+      continue;
+    functions.erase(emitted.getName());
+    eraseTopLevelOp(emitted.getOperation());
+  }
+  // Points into the bodies just erased.
+  resetPerFunctionState();
+}
+
 LogicalResult
 CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
   // Whether `method` is one this walk imports at all; the two passes below
@@ -658,18 +666,21 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
     // imported function body. The copy/move/delegating rejection below runs
     // on the broader "user-declared" predicate so a *defaulted* copy/move
     // ctor is still rejected rather than silently skipped here.
-    // FR-117: a member whose `DeclarationName` is NOT an ordinary identifier
-    // -- a conversion function (`operator int()`) or, on the union path
-    // where the W2.2 member-shape gate never ran, an overloaded operator --
-    // has no spelling to mangle and used to import as `<Struct>_`, an
-    // EMPTY method name nobody can call (two of them in one class collided
-    // outright). It is OMITTED rather than made class-level fatal, which is
-    // sound because every USE of one is already a located rejection:
-    // implicit and `static_cast` uses are
+    // FR-117 (widened by FR-112): a member whose `DeclarationName` is NOT
+    // an ordinary identifier -- a conversion function (`operator int()`)
+    // or, since FR-112 removed both class-level operator gates, ANY
+    // overloaded operator -- has no spelling to mangle and used to import
+    // as `<Struct>_`, an EMPTY method name nobody can call (two of them in
+    // one class collided outright). It is OMITTED rather than class-level
+    // fatal, which is sound because every USE of one is already a located
+    // rejection: implicit and `static_cast` conversion uses are
     // `unsupported cast (UserDefinedConversion)`, the explicit
     // `c.operator int()` spelling and an out-of-line definition are
-    // `unsupported: conversion function`. Constructors and destructors keep
-    // their FIXED base names (`new`, `dtor`) and are unaffected.
+    // `unsupported: conversion function`, and a spelled or implicit
+    // operator call is `call to overloaded operator ... omitted from class
+    // ...` at the call dispatch's non-identifier-callee guard. Constructors
+    // and destructors keep their FIXED base names (`new`, `dtor`) and are
+    // unaffected.
     if (!method->getDeclName().isIdentifier() &&
         !llvm::isa<clang::CXXConstructorDecl>(method) &&
         !llvm::isa<clang::CXXDestructorDecl>(method))
@@ -677,13 +688,18 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
     return !method->isImplicit() && !method->isDeleted() &&
            !method->isDefaulted();
   };
-  // Destructors, virtual methods, and overloaded operators were already
+  // Destructors outside the W2.17 subset and virtual methods were already
   // rejected in `collectRecordFields`, before this class's struct_def (and
   // so before this walk) ever ran; a copy/move/delegating constructor is
   // out of the method wave's scope too (no value/aliasing semantics modeled
   // for it) and is rejected here, the first point a constructor is
   // inspected individually. Kept ahead of BOTH passes so a rejected class
-  // never half-imports.
+  // never half-imports. It CANNOT become an FR-112 omission: a copy/move/
+  // delegating constructor is invoked implicitly at by-value pass, return
+  // and init -- there is no call node to reject -- and omitting one
+  // substitutes Rust's bitwise Copy for the user's constructor (measured:
+  // a copy ctor that sets `v=99` prints `1 99` natively and `1 1` when
+  // omitted).
   for (const clang::CXXMethodDecl *method : record->methods()) {
     // Broader than `isImportable`: a copy/move/delegating constructor is
     // rejected even when `= default`, whereas `isImportable` (used by the two
@@ -717,18 +733,136 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
   // prepass costs one extra signature computation per method and reuses
   // the redeclaration reconciliation `importFunction` already performs for
   // a C prototype later satisfied by its definition.
-  for (const clang::CXXMethodDecl *method : record->methods())
-    if (isImportable(method))
-      if (failed(importFunction(method, /*signatureOnly=*/true)))
-        return failure();
-  // Pass 2: import each body. A method DEFINED OUT OF LINE (declared in the
+  //
+  // Pass 2 imports each body. A method DEFINED OUT OF LINE (declared in the
   // class, defined in a `.cpp`) has no body here, so it stays the stub pass
   // 1 built and is filled in when the translation-unit walk reaches its
   // out-of-line definition — exactly the behavior this walk had before.
-  for (const clang::CXXMethodDecl *method : record->methods())
-    if (isImportable(method))
-      if (failed(importFunction(method)))
-        return failure();
+  //
+  // FR-112 CONTAINMENT: a failure in either pass no longer rejects the
+  // class when the failing member is an ORDINARY method (instance or
+  // static). The member joins the omitted set — with its own verbatim
+  // per-construct diagnostic re-reported as a warning, and a ledger entry
+  // so the rejection stays rankable — and every USE of it is a located
+  // rejection at the call site by pre-existing machinery ("call to
+  // unimported method 'X'"). A CONSTRUCTOR or DESTRUCTOR failure stays
+  // class-level: both are invoked implicitly (value init, scope exit), so
+  // there is no call node a use-site rejection could attach to, exactly
+  // the copy/move-constructor argument above.
+  //
+  // THE FIXPOINT (design.md FR-112, constraint C2): on any omission, every
+  // already-imported method func of the class is erased
+  // (`eraseImportedMethodFuncs`, the FR-118 clean-slate tool minus the
+  // struct_def/cache erasure) and BOTH passes re-run skipping the omitted
+  // set, until it stops growing. With the caller declared BEFORE the
+  // failing callee, pass 1 registers the callee's stub, the caller imports
+  // a call against it, and the callee's body then fails — a single-pass
+  // omission would leave that caller holding a dangling reference:
+  // measured as `'func.call' op ... does not reference a valid function`
+  // for an instance callee (a TU-killing verifier error attributable to no
+  // item), and as a verifier-SILENT dangling `emitrust.call_opaque` string
+  // for a STATIC callee (constraint C8: nothing downstream catches it
+  // before rustc), which is why convergence keys off importFunction
+  // failure alone, never off verifier feedback. The re-run rejects such a
+  // caller AT ITS CALL and it joins the omitted set in turn; the set only
+  // grows and is bounded by the method count, so termination is
+  // structural. Pinned in test/Import/Cpp/cpp-contained-fixpoint.cpp.
+  llvm::SmallPtrSet<const clang::CXXMethodDecl *, 8> omittedMethods;
+  auto isContainable = [](const clang::CXXMethodDecl *method) {
+    return !llvm::isa<clang::CXXConstructorDecl>(method) &&
+           !llvm::isa<clang::CXXDestructorDecl>(method);
+  };
+  std::string className = recordRustName(record);
+  if (className.empty())
+    className = "<anonymous>";
+  // The FR-49 owner join key, same derivation as the recovery ledger's
+  // `declOwnerSymbol`: file-scope classes are graph nodes, everything else
+  // reports no owner.
+  std::string ownerSymbol =
+      record->getDeclContext()->getRedeclContext()->isFileContext()
+          ? recordRustName(record)
+          : std::string();
+  bool omissionGrew = true;
+  while (omissionGrew) {
+    omissionGrew = false;
+    for (bool signatureOnly : {true, false}) {
+      for (const clang::CXXMethodDecl *method : record->methods()) {
+        if (!isImportable(method) || omittedMethods.contains(method))
+          continue;
+        if (!isContainable(method)) {
+          // Constructor/destructor: errors flow to the caller unscoped, and
+          // a failure rejects the class (the FR-118 undo runs there).
+          if (failed(importFunction(method, signatureOnly)))
+            return failure();
+          continue;
+        }
+        // Same capture shape as `importTopLevelDeclRecovering`, and for the
+        // same reason: the rejection is reported through the diagnostic
+        // engine at the point of detection, deep inside the import, and a
+        // scoped handler is the only way the verbatim text and location
+        // reach the omission warning and the ledger — and it is what keeps
+        // a CONTAINED rejection from printing as an error in strict mode.
+        struct CapturedDiagnostic {
+          Location loc;
+          DiagnosticSeverity severity;
+          std::string message;
+        };
+        SmallVector<CapturedDiagnostic> captured;
+        auto capture = [&captured](Diagnostic &diag) -> LogicalResult {
+          if (diag.getSeverity() != DiagnosticSeverity::Error)
+            return failure();
+          captured.push_back(
+              {diag.getLocation(), diag.getSeverity(), diag.str()});
+          for (Diagnostic &note : diag.getNotes())
+            captured.push_back(
+                {note.getLocation(), DiagnosticSeverity::Note, note.str()});
+          return success();
+        };
+        LogicalResult result = failure();
+        {
+          ScopedDiagnosticHandler handler(builder.getContext(), capture);
+          result = importFunction(method, signatureOnly);
+        }
+        if (succeeded(result)) {
+          // Never observed (an import that emitted an error and still
+          // reported success); swallowing it would be a silent change.
+          for (const CapturedDiagnostic &diag : captured)
+            emitError(diag.loc) << diag.message;
+          continue;
+        }
+        omittedMethods.insert(method);
+        Location loc = captured.empty()
+                           ? translateLoc(method->getLocation())
+                           : captured.front().loc;
+        std::string reason = captured.empty()
+                                 ? std::string("unsupported declaration")
+                                 : captured.front().message;
+        // `getName()` is safe here: a containable, importable method always
+        // has an ordinary identifier `DeclarationName` (non-identifier
+        // members were omitted by `isImportable` without ever importing).
+        InFlightDiagnostic warning = emitWarning(loc)
+                                     << reason << " (omitted: method '"
+                                     << method->getName() << "' of class '"
+                                     << className << "')";
+        for (const CapturedDiagnostic &diag : llvm::drop_begin(captured))
+          warning.attachNote(diag.loc) << diag.message;
+        // One ledger entry per omitted member, carrying the member's OWN
+        // per-construct diagnostic: this is what turns an opaque
+        // `method of an unimported class` cascade into rankable data
+        // (design.md FR-112's honest payoff).
+        if (rejectionLedger)
+          rejectionLedger->record(emitrust::RejectedItem{
+              method->getNameAsString(), loc, reason,
+              emitrust::classifyBlocker(reason, loc), /*stubbed=*/false,
+              ownerSymbol});
+        eraseImportedMethodFuncs(record);
+        omissionGrew = true;
+        break;
+      }
+      if (omissionGrew)
+        break;
+    }
+  }
   return success();
 }
 
@@ -892,12 +1026,13 @@ LogicalResult CImporter::collectRecordFields(
       fieldNames.push_back("base");
       fieldTypes.push_back(*baseType);
     }
-    // W2.2: a user-declared destructor (no drop semantics modeled), a
-    // virtual method (no vtable/dynamic dispatch), or an overloaded
-    // operator (no operator-overload lowering) is rejected at the
-    // member's own declaration — checked here, before any field (or
-    // method) of the class imports, so a rejected class never
-    // half-imports (no struct_def, no methods). Compiler-synthesized
+    // W2.2 (narrowed by FR-112): a user-declared destructor outside the
+    // W2.17-admitted subset (no drop semantics modeled for it) or a
+    // virtual method (no vtable/dynamic dispatch, and vptr STORAGE the
+    // emitted struct cannot carry) is rejected at the member's own
+    // declaration — checked here, before any field (or method) of the
+    // class imports, so a rejected class never half-imports (no
+    // struct_def, no methods). Compiler-synthesized
     // special members the class did not itself declare are skipped: they
     // carry none of these three shapes and never surface a diagnostic.
     // W2.8: a std-namespace record (std::pair, the one that imports
@@ -955,10 +1090,21 @@ LogicalResult CImporter::collectRecordFields(
                         "function 'dtor'";
           continue;
         }
+        // FR-112 kept this gate CLASS-level on purpose while retiring the
+        // overloaded-operator one below it: every virtual CALL is already a
+        // located rejection at the site, but the vptr is real storage the
+        // emitted struct lacks -- `sizeof(C)` folds faithfully (16) from
+        // clang's ASTContext for a struct the emitter renders as 4 bytes,
+        // so any program sizing a buffer from it would be internally
+        // inconsistent. No use-site rejection can repair a layout.
         if (method->isVirtual())
           return emitError(methodLoc) << "unsupported: virtual method";
-        if (method->isOverloadedOperator())
-          return emitError(methodLoc) << "unsupported: overloaded operator";
+        // An overloaded operator is NOT rejected here since FR-112: it is
+        // OMITTED by `importCXXMethods` (non-identifier `DeclarationName`,
+        // same channel as FR-117's conversion functions), and every use --
+        // spelled, implicit-enclosing-`operator=`, or explicit member-call
+        // syntax -- is a located rejection at the call
+        // (cpp-contained-member-invalid.cpp).
       }
     }
   }

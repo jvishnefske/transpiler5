@@ -9,9 +9,15 @@
 // RUN:   | FileCheck %s --check-prefix=GATEIR --implicit-check-not="struct_def"
 // RUN: emitrust-cc --recover --emit=rust %t/body-fail.cpp \
 // RUN:   | FileCheck %s --check-prefix=BODY \
-// RUN:     --implicit-check-not="struct C" --implicit-check-not="impl Drop"
+// RUN:     --implicit-check-not="impl Drop" --implicit-check-not="fn c_bad"
 // RUN: emitrust-cc --recover --emit=rust %t/body-fail.cpp 2>&1 >/dev/null \
 // RUN:   | FileCheck %s --check-prefix=BODYDIAG
+// RUN: emitrust-cc --recover --emit=rust %t/dtor-body-fail.cpp \
+// RUN:   | FileCheck %s --check-prefix=DTORFAIL \
+// RUN:     --implicit-check-not="struct C" --implicit-check-not="impl Drop" \
+// RUN:     --implicit-check-not="c_dtor"
+// RUN: emitrust-cc --recover --emit=rust %t/dtor-body-fail.cpp 2>&1 >/dev/null \
+// RUN:   | FileCheck %s --check-prefix=DTORFAILDIAG
 // RUN: emitrust-cc --recover --emit=rust %t/name-claim.cpp \
 // RUN:   | FileCheck %s --check-prefix=CLAIM \
 // RUN:     --implicit-check-not="collides with the emitted name"
@@ -35,15 +41,24 @@
 // runs a destructor the C++ program never runs. This file is the
 // single-TU half of that regression.
 //
-// `body-fail` is the section that decides the SHAPE of the fix. design.md's
-// FR-118 proposed hoisting the copy/move/delegating-constructor check into
-// `collectRecordFields` "and auditing `importCXXMethods` so nothing left in
-// it can fail the record". That audit is not achievable: pass 2 imports an
-// ARBITRARY method body and can fail on any unsupported construct in the
-// language, which `body-fail` exercises and which reproduces the identical
-// half-import. The fix that ships is therefore the UNDO on the failure path
-// (erase the struct_def, the class's method funcs, and every name-registry
-// entry the record claimed), not the hoist.
+// `body-fail` decided the SHAPE of the FR-118 fix (the undo, not the
+// hoist: pass 2 imports an ARBITRARY method body and can fail on any
+// unsupported construct, so no class-level predicate exists to move
+// earlier) -- and was then RE-DECIDED by FR-112 containment: an ORDINARY
+// method whose body fails no longer rejects the class at all. The method
+// is OMITTED (the warning carries its own per-construct diagnostic), the
+// class and its importable ctor emit normally, and the USE of the omitted
+// method is what cascades -- `uses` is stubbed on the located `call to
+// unimported method`, not on a whole-class `struct 'C' was rejected`. The
+// no-trace invariant this file pins therefore narrows to what it always
+// really protected: the CLASS-LEVEL failure paths.
+//
+// `dtor-body-fail` is the section that keeps the FR-118 undo honest now
+// that ordinary bodies are contained: a DESTRUCTOR body failure cannot be
+// contained (a destructor is invoked implicitly at scope exit -- there is
+// no call node to reject, exactly the copy-ctor argument), so it is the
+// surviving in-`importCXXMethods` body failure that must still erase the
+// struct_def, the method funcs, and every name-registry claim.
 //
 // `name-claim` is the bonus the undo buys: on HEAD a rejected class kept its
 // claim on the emitted name and STARVED a perfectly importable sibling,
@@ -87,12 +102,15 @@ int survivor(int n) { return n + 1; }
 // GATEDIAG: class-gate.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: struct 'C' was rejected, so a type naming it cannot be imported (recovered: emitted an unimplemented!() stub with the mapped signature)
 
 //--- body-fail.cpp
-// The failure is in the BODY of an ordinary method -- no class-level
-// predicate can hoist it -- and it must still leave no trace.
+// FR-112: the failure is in the BODY of an ORDINARY method, so the method
+// is omitted and the CLASS stays. The struct, its default constructor and
+// the untouched sibling method all emit; only the USER of the omitted
+// method is stubbed, on the located call-site rejection.
 struct C {
   int v;
   C() : v(1) {}
   int bad() const { return *(int *)(long)v; }
+  int fine() const { return v + 1; }
 };
 
 int uses(int n) {
@@ -103,9 +121,37 @@ int uses(int n) {
 
 int survivor(int n) { return n + 2; }
 
+// BODY: struct C {
 // BODY: fn survivor
-// BODYDIAG: body-fail.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported pointer expression: CStyleCastExpr (recovered: item dropped)
-// BODYDIAG: body-fail.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: struct 'C' was rejected, so a type naming it cannot be imported (recovered: emitted an unimplemented!() stub with the mapped signature)
+// BODY: impl C {
+// BODY: fn c_new
+// BODY: fn c_fine
+// BODYDIAG: body-fail.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported pointer expression: CStyleCastExpr (omitted: method 'bad' of class 'C')
+// BODYDIAG: body-fail.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: call to unimported method 'c_bad' (recovered: emitted an unimplemented!() stub with the mapped signature)
+
+//--- dtor-body-fail.cpp
+// The surviving class-level BODY failure: a destructor is invoked
+// implicitly, so its failing body cannot be contained and the FR-118 undo
+// must still leave no trace.
+extern "C" int printf(const char *, ...);
+
+struct C {
+  int v;
+  C() : v(1) {}
+  ~C() { printf("dtor %d\n", *(int *)(long)v); }
+};
+
+int uses(int n) {
+  C c;
+  c.v = n;
+  return c.v;
+}
+
+int survivor(int n) { return n + 4; }
+
+// DTORFAIL: fn survivor
+// DTORFAILDIAG: dtor-body-fail.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported pointer expression: CStyleCastExpr (recovered: item dropped)
+// DTORFAILDIAG: dtor-body-fail.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: struct 'C' was rejected, so a type naming it cannot be imported (recovered: emitted an unimplemented!() stub with the mapped signature)
 
 //--- name-claim.cpp
 // `C` is rejected; `struct c` idiomatically renames to the SAME emitted
