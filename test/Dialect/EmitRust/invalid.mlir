@@ -805,3 +805,18 @@ emitrust.impl "Owner" {
     emitrust.return
   }
 } {trait_name = "Drop"}
+
+// -----
+
+// FR-119: an EMPTY sym_name is unrepresentable in pretty syntax -- the
+// printer renders `@<<INVALID EMPTY SYMBOL>>` and the print->parse
+// round-trip is broken -- yet MLIR core accepts it and the in-memory
+// module used to verify clean, so the renderer emitted the unparseable
+// Rust `fn (`. The verifier backstop makes that state unreachable at
+// emission (strict, recover, and standalone-translate alike), per the
+// CLAUDE.md contract that nothing may silently emit wrong code. Generic
+// op form is the only way to write the repro.
+// expected-error @+1 {{requires a non-empty symbol name}}
+"emitrust.func"() <{function_type = () -> (), sym_name = ""}> ({
+  "emitrust.return"() : () -> ()
+}) : () -> ()

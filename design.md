@@ -7539,7 +7539,7 @@ piece and becomes FR-45.
   measurability defect, and it is why the ranked table below needed
   two tools instead of one. **NOT SPIKED.**
 
-- [ ] FR-119 DEFECT: a free NON-MEMBER `operator` declaration escapes
+- [x] FR-119 DEFECT: a free NON-MEMBER `operator` declaration escapes
   every backstop and emits a syntactically invalid crate, silently.
   Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-22): fix shape (a),
   located rejection PLUS the dialect verifier backstop, both proven at
@@ -7602,6 +7602,32 @@ piece and becomes FR-45.
   empty-sym_name verifier test, and a negative pin that friend-inline
   operators still omit (the separate channel, recorded).
   **SPIKED.**
+  LANDED 2026-08-22, both halves plus the graph re-sync. The importer
+  guard sits immediately after the referenced-only prototype skip
+  (placement verified load-bearing: the stl-map STRUCTKEY prototype
+  keeps silently skipping, and the cost was exactly the one predicted
+  pin edit -- ostream USEROP's wording became the more precise
+  `unsupported: overloaded operator`). Recovery drops the operator as
+  its own item under the EXISTING cxx-operator-overload tag and the
+  recovered crate cargo-builds, with --implicit-check-not pinning that
+  the nameless `fn (` never appears. The two-operator
+  `conflicting definition of ''` leak is pinned GONE; literal operators
+  ride the same guard, located at the declaration.
+  `FuncOp::verify` now rejects an empty sym_name -- firing in opt AND
+  translate modes -- and the lit case had to use GENERIC-form op syntax
+  because the pretty form cannot even spell an empty name. ItemGraph
+  skips non-identifier free FunctionDecls and ItemColoring screens them
+  BEFORE probeFunction (not inside), which also closes the latent
+  debug-build assert path through cFunctionSymbolName. The friend-inline
+  silent-omission channel is pinned AS-IS and filed as FR-123.
+  Gates: full meson suite 752/752 (fast 535 + slow/EndToEnd 217; +2 =
+  the two new files), zero golden shifts beyond the USEROP line, all
+  ledgers unchanged.
+  (test/Import/Cpp/free-operator-invalid.cpp;
+  test/Project/free-operator-graph.cpp;
+  test/Dialect/EmitRust/invalid.mlir; the USEROP edit in
+  test/Import/Cpp/ostream-invalid.cpp)
+
 
 - [ ] FR-120 Struct-pointer prerequisite: method calls and
   base-subobject bindings through struct pointers. This is the
@@ -7711,6 +7737,17 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-record-cross-tu-merge.cpp with
   DROPPY/TWIN/ALIAS legs)
 
+
+- [ ] FR-123 DEFECT (found by FR-119's spike, pre-existing, SEPARATE
+  channel): a FRIEND operator defined INLINE in a class is silently
+  omitted -- zero diagnostics, invisible to every ledger, exactly the
+  FR-115 measurability hole in miniature. Uses of it still reject
+  located (`unsupported callee`), so it is dead code loss rather than
+  wrong code, but the policy is rejection-is-a-feature and located.
+  The channel is pinned AS-IS by the FRIEND section of
+  test/Import/Cpp/free-operator-invalid.cpp (module contains the
+  struct_def and c_main with zero diagnostics), so any change to its
+  behavior fails a test and must come through this FR. **NOT SPIKED.**
 
 - [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
   the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and

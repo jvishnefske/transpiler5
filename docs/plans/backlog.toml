@@ -87,12 +87,11 @@ anchor = "FR-114 DEFECT"
 
 [[items]]
 id = "FR-119"
-rank = 4
 kind = "defect"
-status = "spiked"
+status = "landed"
 size = "S"
 title = "Free operators: located rejection + empty-sym_name verifier backstop"
-summary = "GO: channel fully mapped (empty name from getName under NDEBUG, verifier never checked sym_name, broken print->parse). Backstop costs zero. Zero corpus TUs hit it TODAY but the channel arms as admission widens. Admission is W2.25's, behind FR-114."
+summary = "Landed 2026-08-22: guard after the prototype skip (one pin edit as predicted), FuncOp::verify rejects empty sym_name in opt AND translate, graph/coloring skip non-identifier free fns. Friend-inline channel filed as FR-123."
 blocked_by = []
 anchor = "FR-119 DEFECT"
 
@@ -106,6 +105,17 @@ title = "Deferred [i8;N] binding borrowed &mut without mut (E0596)"
 summary = "FR-105's sibling in the deferred-binding machinery; 2x per spdlog unit, 6/7 units, the next blocker once FR-113 lets crates emit. Loud, never silent."
 blocked_by = ["FR-113"]
 anchor = "FR-121 DEFECT"
+
+[[items]]
+id = "FR-123"
+rank = 22
+kind = "defect"
+status = "open"
+size = "S"
+title = "Friend operator defined inline in a class is silently omitted"
+summary = "Dead-code loss, not wrong code (uses reject located), but zero diagnostics -- the FR-115 hole in miniature. Channel pinned as-is by free-operator-invalid.cpp's FRIEND section."
+blocked_by = []
+anchor = "FR-123 DEFECT"
 
 [[items]]
 id = "FR-122"

@@ -236,17 +236,15 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // `importCXXMethods` performs, so that a conversion function reached any
   // OTHER way (an out-of-line definition, which is a top-level item in its
   // own right) fails loudly instead of emitting an unnamed symbol. A
-  // NON-MEMBER operator is deliberately left alone here: it is a separate
-  // (and still open) defect -- measured, it emits
-  // `emitrust.func @<<INVALID EMPTY SYMBOL>>` and the unparseable Rust
-  // `pub fn (v0: A, b: i32) -> i32` -- but every free operator the suite
-  // exercises today is ALREADY fenced by a more specific diagnostic raised
-  // later on the same item (`std::basic_ostream is not a recognized STL
-  // type` in test/Import/Cpp/ostream-invalid.cpp, the map key-set screen in
-  // stl-map-invalid.cpp), and refusing it here would replace those pins
-  // with a vaguer wording. Fixing it needs a real symbol spelling for a
-  // non-identifier name, which is a naming change with byte-identity
-  // consequences, not a one-line guard.
+  // NON-MEMBER operator does NOT reject here: FR-119 closes that channel
+  // with its own guard placed AFTER the referenced-only prototype skip
+  // further down. Placement is load-bearing -- widening THIS guard to
+  // `!namedByIdentifier` alone was measured to break two pins, because an
+  // unreferenced body-less operator PROTOTYPE (stl-map-invalid.cpp's free
+  // `operator<`) must keep skipping silently, and the deliberate cost is
+  // exactly one wording (ostream-invalid.cpp's user `operator<<` now says
+  // `unsupported: overloaded operator` instead of the STL-type tail's
+  // vaguer fence). See the FR-119 guard below.
   const auto *cxxMethod = llvm::dyn_cast<clang::CXXMethodDecl>(func);
   bool cxxIsCtor =
       cxxMethod && llvm::isa<clang::CXXConstructorDecl>(cxxMethod);
@@ -312,6 +310,22 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   if (!func->isThisDeclarationADefinition() && !func->getDefinition() &&
       !func->isReferenced())
     return success();
+
+  // FR-119: a free (non-member) operator -- operator+, operator<<, a
+  // literal operator""_kb, anything whose DeclarationName is not an
+  // ordinary identifier -- is a plain FunctionDecl and slipped past the
+  // `cxxMethod &&` refusal above: `cFunctionSymbolName` returned "" (the
+  // getName() assert compiles out under NDEBUG), MLIR accepted the empty
+  // sym_name, and the crate carried the unparseable `fn (v0: A, b: i32)`
+  // with no diagnostic anywhere. Rejected HERE, after the referenced-only
+  // skip, so unreferenced body-less operator prototypes stay silently
+  // skipped by design; the same wording rides the existing
+  // cxx-operator-overload ledger tag, and under --recover the operator
+  // drops as its own item. The emitrust.func verifier's empty-sym_name
+  // check is the emission-side backstop for whatever this guard cannot
+  // see.
+  if (!cxxMethod && !namedByIdentifier)
+    return emitError(loc) << "unsupported: overloaded operator";
 
   // FR-47: `signatureOnly` forces the body-less path for a declaration that
   // DOES have a body, so `importCXXMethods`'s prepass can register every

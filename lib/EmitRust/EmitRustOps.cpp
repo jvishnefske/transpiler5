@@ -83,6 +83,14 @@ void FuncOp::print(OpAsmPrinter &p) {
 /// result is of lvalue type, and that the entry block's argument types match
 /// the function signature.
 LogicalResult FuncOp::verify() {
+  // FR-119: MLIR core accepts an empty sym_name, but the printer renders it
+  // as `@<<INVALID EMPTY SYMBOL>>` (print->parse is broken) and the Rust
+  // renderer would emit the unparseable `fn (`. Refusing it here fires
+  // located at the C source loc in strict, recover, and
+  // standalone-translate modes alike, closing the whole class of
+  // empty-name defects at emission.
+  if (getSymName().empty())
+    return emitOpError("requires a non-empty symbol name");
   if (getFunctionType().getNumResults() > 1)
     return emitOpError("requires zero or exactly one result, but has ")
            << getFunctionType().getNumResults();
