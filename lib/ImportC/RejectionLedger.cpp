@@ -240,6 +240,16 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("cxx-omitted-member")},
     {llvm::StringLiteral("overloaded operator"),
      llvm::StringLiteral("cxx-operator-overload")},
+    // FR-114: the residual overload-set collisions the widened suffix
+    // table cannot split (frozen member `i` pairs, long/long long, two
+    // fn-pointer params, separator-free member code aliasing). Previously
+    // these hid inside the cross-TU "conflicting definition" wording and
+    // tabulated [other], which is exactly how the raytracing ranking
+    // mis-attributed interval's cascade. No substring overlap with the
+    // "overloaded operator" row above. Mirrored into
+    // test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("C++ overload set for"),
+     llvm::StringLiteral("cxx-overload-collision")},
     // FR-117: a user-defined CONVERSION FUNCTION. The member itself is
     // OMITTED from the class rather than rejected (so no ledger entry is
     // raised for the class), but its residual USE positions -- the explicit

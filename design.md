@@ -7434,7 +7434,7 @@ piece and becomes FR-45.
   enums-invalid.c)
 
 
-- [ ] FR-114 DEFECT: same-arity overloaded CONSTRUCTORS and FREE
+- [x] FR-114 DEFECT: same-arity overloaded CONSTRUCTORS and FREE
   functions collide in the emitted symbol, and the diagnostic blames
   the wrong thing. Spike verdict **GO** (2026-08-22), fix shape (b) --
   the zero-golden-churn one, measured against the alternatives:
@@ -7493,6 +7493,39 @@ piece and becomes FR-45.
   record codes resolve W2.23's noted `T(const T&)`/`T(const U&)`
   hazard for free once copy ctors are admitted.
   **SPIKED.**
+  LANDED 2026-08-22, shape (b) as spiked, with two post-spike deltas
+  the re-verification caught: the ENUM-ARGUMENT call gap is GONE (FR-113
+  admitted enum method arguments in the interim, so `h(int)`/`h(Color)`
+  ships as a POSITIVE case `M_h_i`/`M_h_color`, not the rejection the
+  original spike would have pinned -- the stale-note trap, avoided by
+  re-measuring); and int/long now DISAMBIGUATES on the FREE path via
+  the wide table, so the free still-colliding pin uses genuinely
+  aliasing pairs (long vs long long, two fn-pointer params).
+  Landed: `overloadArgTypeCode`/`overloadSetSize`/`overloadParamSuffix`
+  in CSymbolNaming.h, appended in cFunctionSymbolName after the
+  namespace join and before templateArgSuffix -- the item graph, the
+  FR-41 probe, recovery and every call site compute the suffix by
+  construction. cxxOverloadParamCode: reference arm first
+  (`const S&` -> `rs`), `b`/`i` frozen, enum carve-out to the tag-name
+  code, x-fallback delegates to templateArgTypeCode. The honest
+  overload-set wording sits between the template-collision wording and
+  the cross-TU wording, interpolating the RAW computed symbol; tag
+  `cxx-overload-collision` mirrored. Separator-free member
+  concatenation KEPT with the collision guard pinned as the documented
+  backstop (`K_h_abi` aliasing leg); the prototype-only merge
+  acceptance recorded at the `!isDefinition` site with the loud
+  `referenced but not defined` backstop pinned.
+  The motivating --incremental kill is dead: the free pair imports with
+  no dropped item and no stubbed c_main. Raytracing oracle: 264 -> 262
+  recovered rejections, +2 ported (`random_double_d_d`, `random_int`),
+  zero collision lines remain, and `interval` now shows its honest
+  four-gate stack. Gates: full meson suite 750/750 (fast 533 +
+  slow/EndToEnd 217), ZERO golden shifts, frozen-code pins
+  (Counter_new_i, C_new_i) intact, both ledgers unchanged.
+  (test/Import/Cpp/overload-suffix.cpp, overload-collisions-invalid.cpp,
+  overload-cross-tu-asymmetric.cpp; test/EndToEnd/cpp-free-overload.cpp,
+  cpp-ctor-overload.cpp)
+
 
 - [ ] FR-115 DEFECT: a rejected C++ record never says WHY. `struct 'X'
   was rejected` is raised at every use site while X's own item carries

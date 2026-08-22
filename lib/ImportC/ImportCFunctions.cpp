@@ -71,21 +71,67 @@ static std::string cxxMethodBaseName(const clang::CXXMethodDecl *method) {
   return mangleMemberName(method->getName());
 }
 
-/// W2.2 per-overload parameter type code: `i` for a canonical `int`, `b`
-/// for `bool` — the two builtin types this wave's overloaded fixture
-/// classes (test/Import/Cpp/methods.cpp, cpp-methods-overload.cpp) actually
-/// overload on. Deterministic and extendable: a future wave adds table
-/// entries as new overloaded parameter types are admitted; any type this
-/// table does not yet distinguish falls back to a fixed placeholder code,
-/// which cannot itself disambiguate a same-shaped fallback overload set,
-/// but that shape is out of this wave's tested scope.
+/// W2.2 per-overload parameter type code, widened by FR-114. The two W2.2
+/// codes are FROZEN byte-for-byte by CHECK pins (`i` for any non-bool
+/// integer — test/Import/Cpp/methods.cpp's Counter_new_i/Counter_get_i,
+/// cpp-defaulted-ctor.cpp's C_new_i — and `b` for bool), so they keep
+/// their historical spellings and their historical breadth: int/long and
+/// int/unsigned still share `i` on the member path even though the free
+/// path splits them (_i32/_i64). Everything that previously fell to the
+/// `x` placeholder now delegates to W2.15's `templateArgTypeCode` table
+/// (d/f/p<pointee>/record-snake-name), with two FR-114 additions layered
+/// on top:
+///  - a REFERENCE parameter takes the `r` prefix over its referenced
+///    type's code (`const S &` -> `rs`, via `overloadArgTypeCode`), which
+///    is what splits the motivating `S(double,double)` /
+///    `S(const S&,const S&)` pair into S_new_dd / S_new_rsrs;
+///  - an ENUM is carved out ahead of the frozen `i` arm (an enum
+///    satisfies `isIntegerType`, so it used to collide with a genuine int
+///    overload) and takes its tag-name code, the same choice W2.15 made.
+/// Codes concatenate WITHOUT separators on the member path (frozen by the
+/// same pins), so multi-char record codes can alias across overloads
+/// (`h(A, Bi)` and `h(Ab, I)` both compose `abi`). That is not silent:
+/// the composed symbols collide and `importFunction` rejects the second
+/// with the FR-114 overload-set wording — the documented backstop, pinned
+/// in test/Import/Cpp/overload-collisions-invalid.cpp.
 static std::string cxxOverloadParamCode(clang::QualType type) {
   clang::QualType canonical = type.getCanonicalType();
+  if (canonical->isReferenceType())
+    return emitrust::overloadArgTypeCode(canonical);
+  canonical = canonical.getUnqualifiedType();
   if (canonical->isBooleanType())
     return "b";
+  if (canonical->isEnumeralType())
+    return emitrust::templateArgTypeCode(canonical);
   if (canonical->isIntegerType())
     return "i";
-  return "x";
+  return emitrust::templateArgTypeCode(canonical);
+}
+
+/// FR-114: is `func` a member of a genuine same-TU C++ overload set (>1
+/// same-named, non-implicit, non-template function in its own declaration
+/// context)? This is the discriminator between the honest overload-set
+/// collision wording and the genuine cross-TU duplicate wording in
+/// `importFunction`: a lookup of size 1 means the colliding earlier
+/// definition can only have come from ANOTHER translation unit. Methods
+/// and constructors count their siblings on the class (the same walk
+/// `cxxMethodMangledName`'s suffix decision uses — `getDeclName()`
+/// equality covers named methods and the shared `CXXConstructorName`
+/// alike); free functions share `overloadSetSize`'s lookup-based count,
+/// where redeclarations collapse.
+static bool isSameTUOverloadSet(const clang::FunctionDecl *func) {
+  if (const auto *method = llvm::dyn_cast<clang::CXXMethodDecl>(func)) {
+    unsigned sharing = 0;
+    for (const clang::CXXMethodDecl *candidate :
+         method->getParent()->methods()) {
+      if (candidate->isImplicit() || candidate->isDeleted())
+        continue;
+      if (candidate->getDeclName() == method->getDeclName())
+        ++sharing;
+    }
+    return sharing > 1;
+  }
+  return emitrust::overloadSetSize(func) > 1;
 }
 
 std::string
@@ -585,8 +631,17 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // statics are mangled per-TU, so any collision here is a genuine external
   // clash — for a valid single TU clang has already merged redeclarations.)
   if (func::FuncOp existing = functions.lookup(name)) {
+    // Redundant declaration. FR-114 records the accepted residual hazard
+    // here: two PROTOTYPE-ONLY overloads whose suffix AND MLIR signature
+    // both coincide (e.g. `int f(long);` next to `int f(long long);`,
+    // both `f_i64` over i64) merge silently on this path. The measured
+    // backstops keep it honest: an uncalled colliding prototype emits no
+    // code at all, a CALL against the wrong shape fails the argument-type
+    // check, and a referenced-but-undefined survivor lands on the loud
+    // whole-program "referenced but not defined in any translation unit"
+    // failure (pinned in test/Import/Cpp/overload-cross-tu-asymmetric.cpp).
     if (!isDefinition)
-      return success(); // Redundant declaration.
+      return success();
     if (!existing.isExternal()) {
       // W2.15: within ONE translation unit two symbols can now collide for
       // a reason the cross-TU wording describes wrongly — the finite
@@ -602,6 +657,23 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
                << "unsupported: function template instantiation collides "
                   "with the existing symbol '"
                << name << "'";
+      // FR-114: when the colliding declaration belongs to a genuine
+      // same-TU overload set, say so honestly — the earlier wording blamed
+      // a phantom second translation unit. The residual shapes that land
+      // here are the ones the suffix table cannot split by design: the
+      // frozen member `i` code (int/long, int/unsigned), same-Rust-type
+      // free pairs (long/long long, double/long double), two
+      // function-pointer parameters (both `px`), and separator-free
+      // member code aliasing (`abi`). The wording interpolates the
+      // COMPUTED symbol (raw importer spelling); pinned in
+      // test/Import/Cpp/overload-collisions-invalid.cpp.
+      if (isSameTUOverloadSet(func))
+        return emitError(loc)
+               << "unsupported: C++ overload set for '"
+               << func->getDeclName().getAsString()
+               << "' maps two overloads onto one emitted symbol '" << name
+               << "' (parameter types not distinguishable in the overload "
+                  "suffix)";
       return emitError(loc)
              << "unsupported: conflicting definition of '" << name
              << "' (already defined in another translation unit)";
