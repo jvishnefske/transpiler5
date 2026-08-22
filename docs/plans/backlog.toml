@@ -57,18 +57,18 @@ anchor = "FR-112 CONTAINMENT"
 
 [[items]]
 id = "W2.26"
-rank = 2
-kind = "spike"
-status = "open"
-size = "L"
-title = "Polymorphic RAII: virtual destructors / base with destructor"
-summary = "The measured root under the Track 5 cascade (33.4%); genuinely class-level, so FR-112 cannot reach it. W2.18's empty-base skip loses ~Base once admitted -- that guard is load-bearing."
+rank = 6
+kind = "feature"
+status = "spiked"
+size = "M"
+title = "Polymorphic RAII, value-only subset (transitive has_drop)"
+summary = "GO on implementability, but tinyxml2 unlock is 0/11 -- the cascade payoff is gated behind W2.19c+FR-120. Value: the destruction substrate W2.19c assumes, plus closing the E0204 and empty-base traps. The transitive predicate is a soundness prerequisite for W2.17's existing gates."
 blocked_by = ["FR-118"]
 anchor = "W2.26"
 
 [[items]]
 id = "FR-113"
-rank = 3
+rank = 2
 kind = "defect"
 status = "open"
 size = "M"
@@ -79,7 +79,7 @@ anchor = "FR-113 DEFECT"
 
 [[items]]
 id = "FR-114"
-rank = 4
+rank = 3
 kind = "defect"
 status = "open"
 size = "M"
@@ -90,7 +90,7 @@ anchor = "FR-114 DEFECT"
 
 [[items]]
 id = "FR-119"
-rank = 5
+rank = 4
 kind = "defect"
 status = "open"
 size = "S"
@@ -101,7 +101,7 @@ anchor = "FR-119 DEFECT"
 
 [[items]]
 id = "FR-115"
-rank = 6
+rank = 9
 kind = "defect"
 status = "open"
 size = "M"
@@ -112,7 +112,7 @@ anchor = "FR-115 DEFECT"
 
 [[items]]
 id = "W2.25"
-rank = 7
+rank = 10
 kind = "feature"
 status = "open"
 size = "L"
@@ -123,18 +123,18 @@ anchor = "W2.25"
 
 [[items]]
 id = "FR-120"
-rank = 8
+rank = 5
 kind = "feature"
 status = "open"
 size = "L"
 title = "Struct-pointer prerequisite: method calls + base-subobject bindings"
-summary = "W2.19's named prerequisite: route p->m() through the working p->x deref path (small), add a base-subobject binding kind to PointerRegion (large), teach peelPointerCast CK_DerivedToBase, re-sync the ItemColoring screens."
+summary = "W2.19's named prerequisite -- and per W2.26's census it now gates the WHOLE destructor-family cascade payoff (tinyxml2 11/11 roots need pointers/heap/dispatch). Route p->m() through the working p->x deref path (small); base-subobject binding kind in PointerRegion (large); CK_DerivedToBase peel; ItemColoring re-sync."
 blocked_by = []
 anchor = "FR-120"
 
 [[items]]
 id = "W2.19a"
-rank = 9
+rank = 7
 kind = "feature"
 status = "spiked"
 size = "M"
@@ -145,7 +145,7 @@ anchor = "W2.19"
 
 [[items]]
 id = "W2.19b"
-rank = 10
+rank = 8
 kind = "feature"
 status = "spiked"
 size = "M"

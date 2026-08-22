@@ -12025,29 +12025,62 @@ whole-program demand.
   residue is what this wave is actually sized against. **NOT SPIKED.**
 
 
-- [ ] W2.26 (NEW WAVE) POLYMORPHIC RAII -- a class with a virtual
-  destructor, or a base class carrying a destructor. **This is the
-  measured root under the Track 5 cascade, and FR-112's spike is what
-  identified it**: attributing all 180 of tinyxml2's cascaded methods
-  to their owning classes puts `base class with a destructor` and
-  `virtual destructor` at five of the six biggest roots, and jsoncpp
-  has 34 destructor-family roots against 4 operator ones. It is the
-  33.4% row of the demand table, and the destructor half of it was on
-  no wave at all. It is genuinely CLASS-level -- destruction is
-  implicit, so FR-112's containment criterion ("safe iff every use is
-  an explicit AST node") explicitly does NOT apply, and W2.18 measured
-  the concrete channel: a merely-inheriting derived class does not
-  answer `hasUserDeclaredDestructor`, so every W2.17 use-site drop
-  gate misses it and the emitted struct keeps a `Copy` it must not
-  have (rustc E0204). W2.19's spike additionally measured that
-  W2.18's empty-base SKIP silently loses `~Base` entirely once a base
-  destructor exists -- currently masked by the very rejection this
-  wave would remove, so that guard is load-bearing and this wave must
-  either keep it or materialize the base field. Sequencing: this is
-  the front with the most real demand behind it, but it is also the
-  one whose soundness argument is hardest, and it should be spiked
-  only after FR-117/FR-118 clean up the ordering it depends on.
-  **NOT SPIKED.**
+- [ ] W2.26 POLYMORPHIC RAII -- a class with a virtual destructor, or
+  a base class carrying a destructor. Spike verdict
+  **GO-WITH-CONSTRAINTS on the value-only subset's implementability,
+  PAIRED WITH A MEASURED DEMAND CORRECTION** (2026-08-22): the
+  tinyxml2 unlock number for that subset is **0 of 11**
+  destructor-family roots, so if this wave's justification is the
+  Track 5 cascade, the honest sequencing is NO-GO-until-W2.19c+FR-120
+  for that payoff. Census, per class: MemPool and XMLVisitor are
+  abstract/dispatched hierarchies (W2.19c); XMLAttribute is
+  placement-new from pools (FR-120 + new/delete); XMLNode has virtual
+  methods and pointer traversal; the five leaf node classes are
+  private-ctor heap-only over an unimportable base; XMLPrinter is the
+  ONE real stack value and it is immediately upcast into Accept().
+  FR-112's opening-one-gate-exposes-the-next prediction holds 11/11.
+  WHAT THE SPIKE PROVED CLEAN (all byte-identical, zero new ops):
+  (1) `~B` base + `~D` derived as locals -- **the feared drop-order
+  inversion DOES NOT EXIST for the body-vs-base case**: Rust runs
+  D's drop BODY, then fields in declaration order, which is exactly
+  C++'s derived-body-then-base; measured at one, two and three
+  levels including a droppy root under a dtor-less middle class
+  (the transitivity must recurse the whole base chain).
+  (2) THE MERELY-INHERITING ANSWER: a derived class with no `~D` of
+  its own needs ONLY a transitive `emitrust.has_drop` on its
+  struct_def -- no impl Drop, no dtor func; Rust's field-drop glue
+  runs `~B` exactly once, and the forgotten-case backstop is
+  fail-loud E0204 (negative-controlled).
+  (3) A droppy MEMBER beside a droppy base DIVERGES (native
+  `~D ~M ~B`, image `~D ~B ~M`) -- the member gate stays, and note
+  every W2.17 use-site gate keys on `userDeclaredDestructor`, which
+  answers FALSE for merely-inheriting classes, so **the transitive
+  predicate is a soundness prerequisite for the existing gates, not
+  a nicety**.
+  (4) THE EMPTY-BASE TRAP verified live at HEAD and its fix image
+  measured: materializing the empty droppy base as a real zero-field
+  struct_def is byte-identical and renders today; the current
+  importer image for an empty record is a `[u8; 1]` blob, so wave-1
+  either ships the materialization or keeps the rejection.
+  (5) VIRTUAL DESTRUCTOR ON A VALUE: sound, and by FR-112's own
+  criterion -- destruction of a value is static, and every site
+  where dynamism could be observed (new, upcast, virtual member
+  call) is an explicit AST node that is ALREADY a located rejection.
+  The vptr/sizeof caveat is W2.19a's, carried unchanged. Practical
+  reach: only classes whose SOLE virtual member is the dtor.
+  Anchors for the implementer: the transitive predicate beside
+  `userDeclaredDestructor` (ImportCAggregates.cpp:738) with seven
+  call sites to switch; gates to lift at :872-874 and :928; the
+  empty-base skip at :884; has_drop synthesis makes the emitter side
+  free (the five liveness guards and Copy suppression key on the
+  has_drop set); re-sync the duplicated screen at
+  ItemColoring.cpp:557 in the same commit.
+  UNRESOLVED: jsoncpp's 34 destructor-family roots are unclassified
+  (tinyxml2 says 0 value-only; jsoncpp could differ); no corpus entry
+  flips on this subset alone.
+  SEQUENCED: after FR-120 on demand grounds -- its real value is as
+  the destruction substrate W2.19c's Box<dyn> leg already assumes,
+  plus closing the E0204 and empty-base trap channels.
 ## Track 5 Third-party validation (external demand signal)
 
 Track 4's corpus is authored by this project. That has now produced two
