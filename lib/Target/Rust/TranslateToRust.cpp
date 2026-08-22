@@ -2888,6 +2888,20 @@ LogicalResult RustEmitter::emitDefaultValue(Location loc, Type type) {
       os << "Vec::new()";
       return success();
     }
+    // W2.20: the same defensive arm for the ordered associative
+    // families. Like the Vec/String arms above these are dead for every
+    // program the importer produces (`emitStlConstruct` always follows a
+    // map/set local with an explicit `emitrust.assign` of
+    // `BTreeMap::new()`), but the empty container is the right default
+    // for a no-initializer declaration and matches C++'s default ctor.
+    if (opaqueType.getValue().starts_with("BTreeMap<")) {
+      os << "BTreeMap::new()";
+      return success();
+    }
+    if (opaqueType.getValue().starts_with("BTreeSet<")) {
+      os << "BTreeSet::new()";
+      return success();
+    }
     // The C99-43 C1 Option-of-cursor cell (`Option<i64>`, the staged
     // out-cell temp of a single-global-or-NULL call): the default is the
     // C null pointer, mirroring `!emitrust.fn_ptr`'s None above.

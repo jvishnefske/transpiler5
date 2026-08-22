@@ -506,7 +506,149 @@ bool CImporter::isStlOpaqueType(Type type) {
   auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
   return opaque && (opaque.getValue() == "String" ||
                     opaque.getValue().starts_with("Vec<") ||
-                    opaque.getValue().starts_with("Option<"));
+                    opaque.getValue().starts_with("Option<") ||
+                    opaque.getValue().starts_with("BTreeMap<") ||
+                    opaque.getValue().starts_with("BTreeSet<"));
+}
+
+bool CImporter::isStlMapOpaque(Type type) {
+  auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
+  return opaque && opaque.getValue().starts_with("BTreeMap<");
+}
+
+bool CImporter::isStlSetOpaque(Type type) {
+  auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
+  return opaque && opaque.getValue().starts_with("BTreeSet<");
+}
+
+llvm::StringRef CImporter::stlOpaqueDisplayName(emitrust::OpaqueType opaque) {
+  llvm::StringRef spelling = opaque.getValue();
+  if (spelling == "String")
+    return "std::string";
+  if (spelling.starts_with("Vec<"))
+    return "std::vector";
+  if (spelling.starts_with("Option<"))
+    return "std::optional";
+  if (spelling.starts_with("BTreeMap<"))
+    return "std::map";
+  if (spelling.starts_with("BTreeSet<"))
+    return "std::set";
+  return "std::";
+}
+
+/// W2.20: splits a `BTreeMap<K, V>` opaque's inner argument list at the
+/// TOP-LEVEL comma. A positional split would break the moment either
+/// argument is itself generic, so the scan tracks angle-bracket depth.
+static bool splitStlMapArgs(llvm::StringRef inner, llvm::StringRef &key,
+                            llvm::StringRef &value) {
+  unsigned depth = 0;
+  for (size_t i = 0; i < inner.size(); ++i) {
+    char c = inner[i];
+    if (c == '<')
+      ++depth;
+    else if (c == '>')
+      --depth;
+    else if (c == ',' && depth == 0) {
+      key = inner.substr(0, i);
+      value = inner.substr(i + 1).ltrim();
+      return !key.empty() && !value.empty();
+    }
+  }
+  return false;
+}
+
+bool CImporter::stlMapKeyValueTypes(emitrust::OpaqueType mapType, Type &key,
+                                    Type &value) {
+  llvm::StringRef spelling = mapType.getValue();
+  if (!spelling.starts_with("BTreeMap<") || !spelling.ends_with(">"))
+    return false;
+  llvm::StringRef inner =
+      spelling.substr(9, spelling.size() - 10);
+  llvm::StringRef keySpelling;
+  llvm::StringRef valueSpelling;
+  if (!splitStlMapArgs(inner, keySpelling, valueSpelling))
+    return false;
+  key = parseStlElementType(keySpelling);
+  value = parseStlElementType(valueSpelling);
+  return key && value;
+}
+
+Type CImporter::stlSetElementType(emitrust::OpaqueType setType) {
+  llvm::StringRef spelling = setType.getValue();
+  if (!spelling.starts_with("BTreeSet<") || !spelling.ends_with(">"))
+    return Type();
+  return parseStlElementType(spelling.substr(9, spelling.size() - 10));
+}
+
+/// W2.20: the ORD screen. Rust's `BTreeMap`/`BTreeSet` require `Ord` on
+/// the key; `f32`/`f64` implement only `PartialOrd`, and a synthesized
+/// struct or data enum derives neither. Without this screen those keys
+/// sail through `rustSpellingForElementType` and surface as a DEFERRED
+/// rustc `error[E0277]: the trait bound `f64: Ord` is not satisfied`
+/// instead of a located rejection (measured 2026-08-21). Integers (both
+/// signednesses, every C width) and `bool` order identically on both
+/// sides. `String` keys ORDER identically too (measured byte-for-byte on
+/// an 11-key adversarial set including \x7f, \xC8 and \xFF — libstdc++
+/// `char_traits` compares unsigned), but `BTreeMap::entry(&mut m, k)`
+/// MOVES the key, so admitting them needs an inserted clone; out this
+/// wave.
+static bool isOrdKeyType(Type type) {
+  return llvm::isa<IntegerType>(type);
+}
+
+/// W2.20: the DEFAULT screen. The `operator[]` lowering is
+/// `*m.entry(k).or_default()`, which needs the value type to implement
+/// Rust's `Default` AND to agree with C++'s value-initialization. Both
+/// hold for the integer widths (0), `bool` (false) and the floats (0.0).
+/// A `std::variant` alternative (a synthesized data enum) derives no
+/// `Default`, and a nested container value raises a move/clone question
+/// at the load site that is out of subset this wave.
+static bool isDefaultableValueType(Type type) {
+  return llvm::isa<IntegerType>(type) || llvm::isa<FloatType>(type);
+}
+
+/// W2.20: whether `comp` is exactly `std::less<key>` — the DEFAULT
+/// comparator. A `std::map<int,int,Rev>` keeps the RecordDecl name "map"
+/// (AST-confirmed), so the comparator argument is the only thing that
+/// distinguishes a reversed or custom ordering from the one BTreeMap
+/// reproduces.
+/// W2.20: emits a module-level `emitrust.use` for `path` exactly once
+/// per module, keeping first-mention order (each new one lands after the
+/// last existing `use`, ahead of every item). The BTreeMap/BTreeSet
+/// spellings are the only unqualified std paths the importer emits, so
+/// the crate needs the import to compile at all.
+void CImporter::requireModuleUse(llvm::StringRef path) {
+  if (!emittedModuleUses.insert(path).second)
+    return;
+  Block *body = module.getBody();
+  Operation *lastUse = nullptr;
+  for (Operation &op : *body)
+    if (llvm::isa<emitrust::UseOp>(&op))
+      lastUse = &op;
+  OpBuilder moduleBuilder(module.getContext());
+  if (lastUse)
+    moduleBuilder.setInsertionPointAfter(lastUse);
+  else
+    moduleBuilder.setInsertionPointToStart(body);
+  moduleBuilder.create<emitrust::UseOp>(module.getLoc(),
+                                        moduleBuilder.getStringAttr(path));
+}
+
+bool CImporter::isStdLessComparator(clang::QualType comp,
+                                    clang::QualType key) {
+  const auto *record = comp.getCanonicalType()->getAs<clang::RecordType>();
+  if (!record)
+    return false;
+  const auto *spec =
+      llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record->getDecl());
+  if (!spec || !spec->isInStdNamespace() || !spec->getIdentifier() ||
+      spec->getName() != "less")
+    return false;
+  const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+  return args.size() == 1 &&
+         args[0].getKind() == clang::TemplateArgument::Type &&
+         astContext().hasSameType(args[0].getAsType().getCanonicalType(),
+                                  key.getCanonicalType());
 }
 
 FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
@@ -707,6 +849,70 @@ FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
     }
     return Type(emitrust::DataEnumType::get(builder.getContext(), enumName));
   }
+  // W2.20: `std::map<K, V>` -> `!emitrust.opaque<"BTreeMap<K, V>">` and
+  // `std::set<K>` -> `!emitrust.opaque<"BTreeSet<K>">`.
+  //
+  // BTreeMap/BTreeSet, not HashMap/HashSet: std::map and std::set are
+  // ORDERED and their iteration order is OBSERVABLE in stdout, so the
+  // byte-diff oracle demands the ordered Rust container. Measured
+  // 2026-08-21: libstdc++ `std::map<std::string,int>` and Rust
+  // `BTreeMap<String,i32>` agree byte-for-byte on an 11-key adversarial
+  // set including \x7f, \xC8 and \xFF. `std::unordered_map` has no such
+  // image at all and stays a PERMANENT located rejection below.
+  //
+  // Three screens, all new code — nothing existing rejects any of them:
+  //  * the comparator must be the default `std::less<K>` (a custom or
+  //    reversed ordering keeps the RecordDecl name "map"),
+  //  * the key must be Ord in Rust (floats are only PartialOrd; a
+  //    synthesized struct/data enum derives neither), and
+  //  * the value must be Default (the `entry(k).or_default()` place that
+  //    reproduces C++'s default-inserting `operator[]` needs it).
+  if ((name == "map" || name == "set") && spec) {
+    bool isMap = name == "map";
+    const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+    unsigned arity = isMap ? 4 : 3;
+    if (args.size() != arity ||
+        args[0].getKind() != clang::TemplateArgument::Type ||
+        (isMap && args[1].getKind() != clang::TemplateArgument::Type))
+      return emitError(loc) << "unsupported: std::" << name.str()
+                            << " shape could not be determined";
+    clang::QualType keyType = args[0].getAsType();
+    unsigned comparatorIndex = isMap ? 2 : 1;
+    if (args[comparatorIndex].getKind() != clang::TemplateArgument::Type ||
+        !isStdLessComparator(args[comparatorIndex].getAsType(), keyType))
+      return emitError(loc) << "unsupported: std::" << name.str()
+                            << " with a comparator other than std::less";
+    FailureOr<Type> mappedKey = mapType(keyType, loc);
+    if (failed(mappedKey))
+      return failure();
+    std::optional<std::string> keySpelling =
+        rustSpellingForElementType(*mappedKey);
+    if (!keySpelling || !isOrdKeyType(*mappedKey))
+      return emitError(loc)
+             << "unsupported: std::" << name.str() << " key type '"
+             << keyType.getAsString()
+             << "' is not in the supported ordered key set";
+    if (!isMap) {
+      requireModuleUse("std::collections::BTreeSet");
+      return Type(emitrust::OpaqueType::get(builder.getContext(),
+                                            "BTreeSet<" + *keySpelling + ">"));
+    }
+    clang::QualType valueType = args[1].getAsType();
+    FailureOr<Type> mappedValue = mapType(valueType, loc);
+    if (failed(mappedValue))
+      return failure();
+    std::optional<std::string> valueSpelling =
+        rustSpellingForElementType(*mappedValue);
+    if (!valueSpelling || !isDefaultableValueType(*mappedValue))
+      return emitError(loc)
+             << "unsupported: std::map value type '"
+             << valueType.getAsString()
+             << "' is not in the supported value set";
+    requireModuleUse("std::collections::BTreeMap");
+    return Type(emitrust::OpaqueType::get(
+        builder.getContext(),
+        "BTreeMap<" + *keySpelling + ", " + *valueSpelling + ">"));
+  }
   if (name == "basic_string") {
     if (spec) {
       const clang::TemplateArgumentList &args = spec->getTemplateArgs();
@@ -720,6 +926,33 @@ FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
            << "unsupported: std::basic_string with a non-char character "
               "type";
   }
+  // W2.20: the unordered containers are a PERMANENT rejection, not a
+  // backlog item, and they get their own wording so the ledger can tell
+  // "deliberately, permanently out" from "not done yet": their iteration
+  // order is UNSPECIFIED, so no Rust container reproduces them byte for
+  // byte and admitting them would be a silent nondeterminism channel.
+  if (name == "unordered_map" || name == "unordered_set" ||
+      name == "unordered_multimap" || name == "unordered_multiset")
+    return emitError(loc) << "unsupported: std::" << name.str()
+                          << " iteration order is unspecified; no Rust "
+                             "container reproduces it byte for byte";
+  // W2.20: the multi- containers hold DUPLICATE keys; neither BTreeMap
+  // nor BTreeSet does, and the Rust standard library has no equivalent.
+  if (name == "multimap" || name == "multiset")
+    return emitError(loc) << "unsupported: std::" << name.str()
+                          << " stores duplicate keys; no Rust standard "
+                             "container reproduces it";
+  // W2.20: a map/set ITERATOR type. Only the whole `find(k) != end()`
+  // idiom is recognized, and it never materializes an iterator; anything
+  // that names one (`std::map<K,V>::iterator it;`) would otherwise leak a
+  // standard-library-INTERNAL spelling into the diagnostic
+  // (`std::_Rb_tree_iterator` on libstdc++, `std::__map_iterator` on
+  // libc++), which no portable test could pin.
+  if (name == "_Rb_tree_iterator" || name == "_Rb_tree_const_iterator" ||
+      name == "__map_iterator" || name == "__map_const_iterator" ||
+      name == "__tree_iterator" || name == "__tree_const_iterator")
+    return emitError(loc) << "unsupported: std::map/std::set iterators are "
+                             "only recognized in the find(k) != end() idiom";
   return emitError(loc) << "unsupported: std::" << name.str()
                         << " is not a recognized STL type";
 }

@@ -391,6 +391,22 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("is not a recognized std::ostream manipulator", "cxx-ostream-manipulator"),
     ("std::ostream << string literal", "cxx-ostream-string-literal"),
     ("std::ostream << operand", "cxx-ostream-operand-type"),
+    # W2.20 std::map / std::set frontier; mirrors
+    # lib/ImportC/RejectionLedger.cpp. Every row sits BEFORE the three
+    # generic STL rows below so first-match keeps them distinguishable.
+    # The first two are PERMANENT rejections, not backlog items: an
+    # unordered container's iteration order is unspecified and a multi-
+    # container holds duplicate keys, so no Rust container reproduces
+    # either byte for byte.
+    ("iteration order is unspecified", "stl-unordered-container"),
+    ("stores duplicate keys", "stl-multi-container"),
+    ("with a comparator other than std::less", "stl-map-comparator"),
+    ("is not in the supported ordered key set", "stl-map-key-type"),
+    ("is not in the supported value set", "stl-map-value-type"),
+    ("does not overwrite an existing key", "stl-map-insert"),
+    ("iterators are only recognized in the find(k) != end() idiom", "stl-map-iterator"),
+    ("is a read-only place", "stl-map-at-write"),
+    ("requires a structured binding", "stl-map-ranged-for"),
     ("is not a recognized STL type", "stl-unrecognized-type"),
     ("is not a recognized STL method", "stl-unrecognized-method"),
     ("receiver is not a recognized STL", "stl-unrecognized-receiver"),

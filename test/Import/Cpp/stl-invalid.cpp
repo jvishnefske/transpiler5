@@ -1,6 +1,6 @@
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/vector-bad-element.cpp 2>&1 | FileCheck %s --check-prefix=BADELEM
-// RUN: not emitrust-import-c %t/unsupported-entity-map.cpp 2>&1 | FileCheck %s --check-prefix=BADMAP
+// RUN: not emitrust-import-c %t/unsupported-entity-deque.cpp 2>&1 | FileCheck %s --check-prefix=BADDEQUE
 // RUN: not emitrust-import-c %t/unsupported-entity-clog.cpp 2>&1 | FileCheck %s --check-prefix=BADCLOG
 // RUN: not emitrust-import-c %t/bad-string-char.cpp 2>&1 | FileCheck %s --check-prefix=BADWCHAR
 // RUN: not emitrust-import-c %t/bad-vector-method.cpp 2>&1 | FileCheck %s --check-prefix=BADMETHOD
@@ -50,11 +50,16 @@ int use(void) {
   return 0;
 }
 
-//--- unsupported-entity-map.cpp
-#include <map>
-// BADMAP: unsupported-entity-map.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::map is not a recognized STL type
+//--- unsupported-entity-deque.cpp
+#include <deque>
+// The generic "unrecognized std entity" tail. This pin USED to be
+// `std::map`, which W2.20 admitted (`BTreeMap<i32, i32>`; see
+// stl-map.cpp) — the pin moved forward to a container that is still
+// genuinely unrecognized rather than being deleted, so the tail itself
+// stays covered.
+// BADDEQUE: unsupported-entity-deque.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: std::deque is not a recognized STL type
 int use(void) {
-  std::map<int, int> m;
+  std::deque<int> d;
   return 0;
 }
 

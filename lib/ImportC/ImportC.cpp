@@ -5686,11 +5686,31 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
       auto opaqueType = lvalueType ? llvm::dyn_cast<emitrust::OpaqueType>(
                                          lvalueType.getValueType())
                                    : emitrust::OpaqueType();
+      // W2.20: a `std::map` receiver takes the DEFAULT-INSERTING entry
+      // place (`*m.entry(k).or_default()`), never `emitrust.subscript`.
+      // This is the SAME place the read, the write, the compound and the
+      // missing-key read all use, because in C++ all four MUTATE.
+      if (opaqueType && isStlMapOpaque(opaqueType))
+        return emitStlMapEntryPlace(*receiver, opaqueType, opCall->getArg(1),
+                                    loc);
       if (!opaqueType || !isStlOpaqueType(opaqueType) ||
-          !opaqueType.getValue().starts_with("Vec<"))
-        return emitError(loc)
-               << "unsupported: std::string::operator[] is not a recognized "
-                  "STL method (bytes indexing is not supported this wave)";
+          !opaqueType.getValue().starts_with("Vec<")) {
+        // W2.20: this fall-through used to hardcode "std::string" for
+        // every non-Vec receiver, which becomes actively misleading now
+        // that a map or set can reach it. A genuine std::string keeps the
+        // historical wording, which names the real reason.
+        if (opaqueType && opaqueType.getValue() == "String")
+          return emitError(loc)
+                 << "unsupported: std::string::operator[] is not a "
+                    "recognized STL method (bytes indexing is not supported "
+                    "this wave)";
+        if (opaqueType && isStlOpaqueType(opaqueType))
+          return emitError(loc)
+                 << "unsupported: " << stlOpaqueDisplayName(opaqueType)
+                 << "::operator[] is not a recognized STL method";
+        return emitError(loc) << "unsupported: operator[] receiver is not a "
+                                 "recognized STL type";
+      }
       return emitStlVectorIndexPlace(*receiver, opaqueType,
                                      opCall->getArg(1), loc, "operator[]");
     }
@@ -5721,11 +5741,26 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
       auto opaqueType = lvalueType ? llvm::dyn_cast<emitrust::OpaqueType>(
                                          lvalueType.getValueType())
                                    : emitrust::OpaqueType();
+      // W2.20: `m.at(k)` over a recognized std::map is the READ-ONLY
+      // `*std::ops::Index::index(&m, &k)` place. Rust's panic on a
+      // missing key refines C++'s std::out_of_range throw exactly the way
+      // W2.6 argued for vector front()/back() on an empty vector.
+      if (opaqueType && isAt && isStlMapOpaque(opaqueType))
+        return emitStlMapIndexPlace(*receiver, opaqueType,
+                                    memberCall->getArg(0), loc);
       if (!opaqueType || !isStlOpaqueType(opaqueType) ||
-          !opaqueType.getValue().starts_with("Vec<"))
+          !opaqueType.getValue().starts_with("Vec<")) {
+        // W2.20: the historical wording named std::vector for EVERY
+        // receiver; a map/set/string/optional receiver now names itself.
+        if (opaqueType && isStlOpaqueType(opaqueType))
+          return emitError(loc)
+                 << "unsupported: " << stlOpaqueDisplayName(opaqueType)
+                 << "::" << stlPlaceMethod
+                 << " is not a recognized STL method";
         return emitError(loc)
                << "unsupported: member call receiver is not a recognized "
                   "std::vector";
+      }
       if (isAt)
         return emitStlVectorIndexPlace(*receiver, opaqueType,
                                        memberCall->getArg(0), loc, "at");
