@@ -7264,17 +7264,81 @@ piece and becomes FR-45.
   cpp-conversion-function.cpp; test/Project/coloring-cpp-class-gates.cpp)
 
 - [ ] FR-113 DEFECT: a rejected scoped enum still emits a cast to
-  itself and the VERIFIER destroys the whole crate -- `--incremental`
-  yields no crate at all, AFTER full recovery. All 8 spdlog units in
-  the external corpus die identically. Four-line repro:
-  `enum class PT : unsigned char { none, dec, hex };` plus a struct
-  holding a `PT` and a function doing `s.type = static_cast<PT>(t);`
-  gives `warning: unsupported: scoped enumeration` and then
-  `error: 'emitrust.cast' op cast to enum type '!emitrust.enum<"Pt">'
-  requires a visible emitrust.enum_def`. This is the "recovery stops
-  at the import boundary" successor to FR-53 that this file already
-  names as the leading recovery blocker, now with a minimal repro.
-  **NOT SPIKED.**
+  itself and the VERIFIER destroys the whole crate. Spike verdict
+  **GO-WITH-CONSTRAINTS** (2026-08-22): ship BOTH routes -- recovery
+  hardening (mandatory, tiny, closes the FR-42/FR-52 contract
+  violation for EVERY enum-rejection path) AND scoped-enum admission
+  (demand is real and it is byte-diff clean for the common shapes) --
+  and the spdlog kill turned out to be TWO stacked defects, with a
+  third pre-existing silent miscompile found on the way.
+  THE MECHANISM, measured: (1) **failure-blind memoization** --
+  `importEnum` inserts into `importedEnums` BEFORE any rejection
+  check, so every failure path (scoped, keyword name, >i32 value,
+  empty, cross-TU shape conflict) leaves the definition looking
+  already-imported; the second visit via `mapType`'s enum branch gets
+  the memoized success and returns `!emitrust.enum<"Pt">` with no
+  `enum_def` in the module. FR-118's cache-poison shape, enum flavor,
+  and NOT scoped-specific (fmt's keyword-named `enum class type`
+  poisons identically). Every type channel funnels through ONE
+  `mapType` branch plus `emitEnumConstant`, so the fix is one choke
+  point. (2) **`emitrust.impl` is a SymbolTable and the emitter's enum
+  lookups use `lookupNearestSymbolFrom`, which stops at the closest
+  table** -- a cast-to-enum inside ANY C++ method can never see a
+  module-level `enum_def`, proven with hand-written IR. FR-84 already
+  gave StructDefOp/DataEnumDefOp/GlobalOp a module-table `lookupFrom`;
+  `EnumDefOp` is the ONE def kind that never got it. Independent of
+  scoped enums -- fires for admitted unscoped enums in C++ classes
+  too -- and it is why admission alone left spdlog at 0/7.
+  STAGE RESULTS (throwaway patch, reverted): hardening alone takes the
+  repro to a building crate with
+  `dropped 'Spec' [rejected-type-cascade] unsupported: enum 'PT' was
+  rejected, so a type naming it cannot be imported` at the field's
+  location -- the existing record-cascade machinery picked the wording
+  up with zero new plumbing. Admission is deleting the `isScoped()`
+  gate; all other importEnum gates already do the right located thing.
+  Byte-diffs: enumerator access, all comparisons, switch with case
+  labels, static_cast both directions, enum params/returns/fields --
+  BYTE-IDENTICAL except one line, which is the third defect:
+  **NARROW-UNDERLYING TRUNCATION, pre-existing at HEAD for unscoped
+  enums**: `static_cast<PT>(301)` with underlying `unsigned char`
+  prints 45 natively, 301 from the crate (enum_def storage is fixed
+  u32/i32). The fix is an importer-inserted intermediate cast
+  rendering `Pt(v0 as u8 as u32)` -- round-tripped by hand IR, no new
+  ops, no emitter change. C2: do NOT ship admission without it.
+  SPDLOG ORACLE (pinned f5f173a1; the tree has 7 units in src/, not
+  this entry's 8): HEAD 0/7 crates; hardening only 7/7 emitted, 1/7
+  build; +admission+impl-lookup 7/7 emitted, ported 32 -> 44/466. The
+  6 build failures are ONE uniform downstream defect, newly reachable
+  now that crates emit at all -- see FR-121.
+  CONSTRAINTS: C1 -- `Color c = Color::Green;`, the most common scoped
+  idiom, rejects with the misleading `assigned value type does not
+  match the place` (ImportCExpressions.cpp:141-153 hardcodes C
+  semantics: bare enumerator -> castEnumToI32, while in C++ the
+  expression HAS the enum type); pre-existing for unscoped C++ enums
+  too; the wave ships the C++-side fix or at minimum a believable
+  located wording, and the retired Stage-D golden's replacement pins
+  whichever. C2 as above. C3 -- the emitter fix is
+  `EnumDefOp::lookupFrom` mirroring the FR-84 pattern, used at both
+  render sites; audit the third `lookupNearestSymbolFrom<StructDefOp>`
+  site in the same sweep, and RUN THE FULL SUITE -- the widened FR-63
+  `lookupEnumDef` can newly enable identity-cast dropping inside
+  impls, which the fast tier alone cannot see. C4 -- stays LOCATED:
+  enum-typed globals with enumerator initializers, keyword-named
+  enums/enumerators, >i32 values, and C1's shape if its fix slips.
+  C5 -- the scoped drop tabulates [other]: mint a tag for whatever
+  stays rejected; ItemColoring:1116's comment is stale in a direction
+  admission makes TRUE again; the keyword-enum false GREEN
+  (screen admits all enums unconditionally) is pre-existing,
+  allowed direction. C6 -- FR-41 probe blindness confirmed (the
+  FR-116 class): a module-level render kill is a cross-item property
+  the per-item probe structurally cannot express; after hardening,
+  every failure is per-item and attributable, which IS the fix for
+  the --search starvation.
+  Suite signal from the spike: the only real casualty is
+  test/Import/Cpp/cpp-enum-class-invalid.cpp, the Stage-D golden that
+  pins the scoped rejection wording -- retired BY DESIGN under
+  admission, replaced per C1.
+  **SPIKED.**
 
 - [ ] FR-114 DEFECT: same-arity overloaded CONSTRUCTORS and FREE
   functions collide in the emitted symbol, and the diagnostic blames
@@ -7331,6 +7395,15 @@ piece and becomes FR-45.
   `PointerRegion`, the `peelPointerCast` `CK_DerivedToBase` case, and
   the ItemColoring screen re-sync). W2.19b and W2.19c are blocked on
   it; W2.19a is not. **SPIKED (as part of W2.19's spike).**
+
+- [ ] FR-121 DEFECT (found by FR-113's spike, the next uniform
+  spdlog blocker): a deferred `[i8; N]` binding (a `__FILE__`-derived
+  path string) is mutably borrowed via `&mut v[0]` without `mut` --
+  rustc E0596, twice per spdlog unit, 6 of 7 units. The FR-105
+  (E0384) sibling in the same deferred-binding machinery: FR-105
+  taught loop-assigned deferred bindings to take `mut`; this is the
+  borrow-position analogue. Loud direction, never silent. Root cause
+  not yet isolated. **NOT SPIKED.**
 
 - [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
   the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and

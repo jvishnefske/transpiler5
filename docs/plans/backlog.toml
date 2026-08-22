@@ -70,10 +70,10 @@ anchor = "W2.26"
 id = "FR-113"
 rank = 2
 kind = "defect"
-status = "open"
+status = "spiked"
 size = "M"
-title = "Rejected scoped enum emits a cast to itself; verifier kills the crate"
-summary = "All 8 spdlog units die after full recovery; the FR-53 successor with a 4-line repro."
+title = "Scoped enums: recovery hardening + admission (two stacked defects)"
+summary = "GO: failure-blind importEnum memoization (FR-118's cache poison, enum flavor) + EnumDefOp missing the FR-84 lookupFrom (impl is a SymbolTable, casts in methods never see module enum_defs). Ship both + the C2 truncation cast. spdlog 0/7 -> 7/7 crates."
 blocked_by = []
 anchor = "FR-113 DEFECT"
 
@@ -98,6 +98,17 @@ title = "Free non-member operator emits `fn (...)` -- exit 0, unbuildable crate"
 summary = "Escapes FR-117's CXXMethodDecl-scoped backstops; violates fail-loudly. Symbol-spelling fix with byte-identity consequences."
 blocked_by = []
 anchor = "FR-119 DEFECT"
+
+[[items]]
+id = "FR-121"
+rank = 21
+kind = "defect"
+status = "open"
+size = "S"
+title = "Deferred [i8;N] binding borrowed &mut without mut (E0596)"
+summary = "FR-105's sibling in the deferred-binding machinery; 2x per spdlog unit, 6/7 units, the next blocker once FR-113 lets crates emit. Loud, never silent."
+blocked_by = ["FR-113"]
+anchor = "FR-121 DEFECT"
 
 [[items]]
 id = "FR-115"
