@@ -219,6 +219,25 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("cxx-references")},
     {llvm::StringLiteral("reference types are not yet supported"),
      llvm::StringLiteral("cxx-references")},
+    // W2.22 admitted `std::cout`/`std::cerr` `<<` chains in statement
+    // position; the wordings below are the residual frontier around that
+    // subset, each with its own tag so the backlog can rank the ostream
+    // front instead of collapsing it into `other`. Every one is emitted
+    // only from `CImporter::emitOstreamChain` or the two value-use guards
+    // that feed it, so a C program can never match one.
+    {llvm::StringLiteral("result of a std::ostream << chain must be unused"),
+     llvm::StringLiteral("cxx-ostream-value-use")},
+    {llvm::StringLiteral("pointer std::ostream << operand prints a "
+                         "nondeterministic address"),
+     llvm::StringLiteral("cxx-ostream-pointer-operand")},
+    {llvm::StringLiteral("std::ostream << operand must be a string literal"),
+     llvm::StringLiteral("cxx-ostream-cstr-operand")},
+    {llvm::StringLiteral("is not a recognized std::ostream manipulator"),
+     llvm::StringLiteral("cxx-ostream-manipulator")},
+    {llvm::StringLiteral("std::ostream << string literal"),
+     llvm::StringLiteral("cxx-ostream-string-literal")},
+    {llvm::StringLiteral("std::ostream << operand"),
+     llvm::StringLiteral("cxx-ostream-operand-type")},
     {llvm::StringLiteral("is not a recognized STL type"),
      llvm::StringLiteral("stl-unrecognized-type")},
     {llvm::StringLiteral("is not a recognized STL method"),

@@ -2052,6 +2052,18 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   // intercepted before the ordinary free-function dispatch below, which
   // would otherwise reject it as a call to an unimported function.
   if (const auto *opCall = llvm::dyn_cast<clang::CXXOperatorCallExpr>(call)) {
+    // W2.22: a `std::cout`/`std::cerr` `<<` chain lowers to the Rust print
+    // macros in STATEMENT position only (`emitCallStmt`). Reaching
+    // `emitCall` means the chain's ostream result is being USED, and there
+    // is no ostream value to hand back — the printf precedent
+    // ("printf return value must be unused") applies verbatim.
+    {
+      llvm::StringRef stream;
+      llvm::SmallVector<const clang::CXXOperatorCallExpr *> links;
+      if (matchOstreamChain(opCall, stream, links))
+        return emitError(loc) << "unsupported: the result of a std::ostream "
+                                 "<< chain must be unused";
+    }
     const auto *opMethod = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(
         opCall->getDirectCallee());
     if (opMethod && opMethod->getParent()->isInStdNamespace())

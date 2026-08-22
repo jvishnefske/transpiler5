@@ -4626,8 +4626,59 @@ private:
   /// `println!("")` (which would trip `clippy::println_empty_string`). All
   /// printf-family emission sites route through here so the macro choice is
   /// centralized.
+  /// `toStderr` selects the stderr twins `eprint!`/`eprintln!` (W2.22's
+  /// `std::cerr` chains); the trailing-newline folding and the bare
+  /// `eprintln!()` case are identical (clippy's `print_with_newline` /
+  /// `println_empty_string` lints have `eprint`-spelled twins).
   void emitPrintMacro(Location loc, std::string rustFormat,
-                      ValueRange operands);
+                      ValueRange operands, bool toStderr = false);
+
+  /// W2.22: names the `std::cout`/`std::cerr` global that `expr` refers to,
+  /// or an empty string for anything else. Recognition is BY NAME (a
+  /// `VarDecl` spelled exactly `cout`/`cerr` in namespace `std`), never by
+  /// type: an "is it an ostream?" test would wrongly admit `std::clog`
+  /// (whose flush discipline this wave does not model) and every
+  /// user-declared ostream, all of which keep their located rejections.
+  static llvm::StringRef stdOstreamGlobalName(const clang::Expr *expr);
+
+  /// W2.22: recognizes a `std::cout`/`std::cerr` `<<` chain and flattens it.
+  /// The AST is LEFT-NESTED (`((cout << a) << b) << c`), so the walk
+  /// descends argument 0 rather than recursing through `emitLValue`, which
+  /// has no place for an ostream. On success `stream` is `"cout"`/`"cerr"`
+  /// and `links` holds one `<<` node per operand in SOURCE (left-to-right)
+  /// order. Both member `operator<<` overloads (int/double/bool/`std::endl`)
+  /// and the ADL FREE `std::operator<<` overloads (`const char *`, `char`,
+  /// `std::string`, ...) are accepted: the operator token plus the chain
+  /// base is the discriminator, not the member/free distinction.
+  static bool matchOstreamChain(
+      const clang::CXXOperatorCallExpr *call, llvm::StringRef &stream,
+      llvm::SmallVectorImpl<const clang::CXXOperatorCallExpr *> &links);
+
+  /// W2.22: lowers a statement-position `std::cout`/`std::cerr` `<<` chain
+  /// into `print!`/`println!` (`eprint!`/`eprintln!` for `cerr`) calls.
+  ///
+  /// The chain is FUSED into as few macro calls as the sequencing allows —
+  /// which is NOT unconditionally one. C++17 sequences `E1 << E2`
+  /// left-to-right AND writes E1's output BEFORE E2 is evaluated, so
+  /// hoisting every operand into `let`s ahead of a single `print!` reorders
+  /// output whenever an operand has a side effect that writes to a stream
+  /// (measured: `cout << "a" << g(argc) << "b"` printed `<X1>a2b` fused
+  /// where C++ prints `a<X1>2b`). The walk therefore FLUSHES the pending
+  /// segment before evaluating a side-effecting operand, exactly as
+  /// `translatePrintfFormat`'s argv bypass flushes around a raw `*_out`
+  /// call. `char` operands flush for the same reason: they are raw byte
+  /// writes, not format holes.
+  ///
+  /// `std::endl` appends a newline, which `emitPrintMacro` folds into
+  /// `println!`. Its flush is unobservable here: the EndToEnd oracle diffs
+  /// stdout and stderr as SEPARATE files (so no interleaving is visible),
+  /// Rust's stdout `LineWriter` flushes on the newline anyway, and a
+  /// trailing un-flushed `print!` still reaches the pipe across
+  /// `std::process::exit` (measured).
+  ///
+  /// Statement position only: there is no ostream value, so every value use
+  /// of a chain is a located rejection (`emitCall`/`emitLValue`).
+  LogicalResult emitOstreamChain(const clang::CXXOperatorCallExpr *call);
 
   /// Translates the C printf-family format string `literal` into a Rust
   /// format string, consuming the directive arguments of `call` starting
@@ -6479,6 +6530,13 @@ private:
   /// True once the `__emitrust_byte_out` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool byteOutHelperEmitted = false;
+  /// True once a `char`/`signed char`/`unsigned char` operand of a
+  /// `std::cerr <<` chain has been imported (W2.22); triggers emission of
+  /// `__emitrust_byte_err`, the stderr twin of `__emitrust_byte_out`.
+  bool needsByteErrHelper = false;
+  /// True once the `__emitrust_byte_err` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool byteErrHelperEmitted = false;
   /// True once a signed integer printf directive outside the 1:1 Rust
   /// format-spec subset (precision or '+'/' ' flags) has been imported;
   /// triggers emission of the `__emitrust_fmt_i64` wrapper (plus the

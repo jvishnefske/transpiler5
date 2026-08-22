@@ -1,7 +1,7 @@
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/vector-bad-element.cpp 2>&1 | FileCheck %s --check-prefix=BADELEM
 // RUN: not emitrust-import-c %t/unsupported-entity-map.cpp 2>&1 | FileCheck %s --check-prefix=BADMAP
-// RUN: not emitrust-import-c %t/unsupported-entity-cout.cpp 2>&1 | FileCheck %s --check-prefix=BADCOUT
+// RUN: not emitrust-import-c %t/unsupported-entity-clog.cpp 2>&1 | FileCheck %s --check-prefix=BADCLOG
 // RUN: not emitrust-import-c %t/bad-string-char.cpp 2>&1 | FileCheck %s --check-prefix=BADWCHAR
 // RUN: not emitrust-import-c %t/bad-vector-method.cpp 2>&1 | FileCheck %s --check-prefix=BADMETHOD
 // RUN: not emitrust-import-c %t/bad-string-method.cpp 2>&1 | FileCheck %s --check-prefix=BADSTRMETHOD
@@ -58,15 +58,23 @@ int use(void) {
   return 0;
 }
 
-//--- unsupported-entity-cout.cpp
+//--- unsupported-entity-clog.cpp
 #include <iostream>
-// std::cout is a global VarDecl the importer never imports (unused
+// A std::ostream global is a VarDecl the importer never imports (unused
 // system-header decl, per the existing SKIP); a reference to it hits the
 // pre-existing system-header-reference rejection BEFORE `mapType` (and
 // thus `mapStdLibraryType`) ever runs on its type.
-// BADCOUT: unsupported-entity-cout.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: reference to 'cout' declared in a system header; not part of the supported C subset
+//
+// W2.22 MOVED this pin off `std::cout`: cout/cerr `<<` chains are now
+// admitted (see ostream-print.cpp), so the section used to screen a
+// rejection that no longer happens. `std::clog` is the right screen now --
+// W2.22's recognizer keys on the base VarDecl's NAME being exactly
+// `cout`/`cerr`, precisely so every other stream (clog, cin, wcout, any
+// user-declared ostream) keeps this diagnostic instead of being admitted
+// on an "is it an ostream?" type test.
+// BADCLOG: unsupported-entity-clog.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: reference to 'clog' declared in a system header; not part of the supported C subset
 int use(void) {
-  std::cout << 1;
+  std::clog << 1;
   return 0;
 }
 

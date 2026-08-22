@@ -10615,7 +10615,7 @@ the subset boundary is honest today, nothing silently miscompiles):
 | `template <typename T> struct Box` | LANDED W2.16 (was `unsupported top-level declaration`) |
 | user destructor `~R()` | LANDED W2.17 (non-virtual, defined in this TU) |
 | `struct D : Base` | LANDED W2.18 (single, public, non-virtual) |
-| `std::cout << x` | `unsupported assignable expression: CXXOperatorCallExpr` |
+| `std::cout << x` | LANDED W2.22 (admitted operand set) |
 | `std::make_unique<int>` | `unsupported: std::unique_ptr is not a recognized STL type` |
 | `std::map<int,int>` | `unsupported: std::map is not a recognized STL type` |
 
@@ -11035,8 +11035,95 @@ whole-program demand.
 - [ ] W2.21 `std::unique_ptr` -> `Box<T>`, `std::make_unique` ->
   `Box::new`. **NOT SPIKED.**
 
-- [ ] W2.22 `std::cout`/`std::cerr` `<<` chains -> `print!`/`eprint!`
-  with `std::endl` as a newline plus flush. **NOT SPIKED.**
+- [x] W2.22 `std::cout`/`std::cerr` `<<` chains -> `print!`/`eprint!`.
+  Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21). Taken OUT of
+  roadmap order deliberately: W2.18 measured that `Base *p = &d;` is
+  already blocked by pre-existing pointer machinery, so W2.19's virtual
+  dispatch is gated behind work not yet done, while iostream is the
+  highest-frequency construct in real C++ -- every corpus entry before
+  this wave had to declare `extern "C" int printf(...)` because there
+  was no other way to produce output.
+  THE WAVE'S CENTRAL FINDING, and it is a MISCOMPILE the obvious
+  lowering would have shipped: **naive fusion reorders output.** C++17
+  sequences `E1 << E2` left to right AND WRITES E1's OUTPUT BEFORE E2 IS
+  EVALUATED, so hoisting every operand into `let` bindings ahead of one
+  fused `print!` is wrong whenever an operand's own side effect writes
+  to a stream. Measured with an operand that itself prints:
+  `std::cout << "a" << g(argc) << "b" << std::endl;` gives native
+  `a<X1>2b`, naive fusion `<X1>a2b`. With two side-effecting operands:
+  native `<F1>2<G1>3mid<F9>18end`, fusion
+  `<F1><G1><F9>23mid18end`. The printf path is NOT exposed to this
+  (C evaluates all arguments before the call), so reusing `emitPrintf`'s
+  shape would have inherited a hazard that path never had. The shipped
+  algorithm walks the flattened operand list left to right and FLUSHES
+  the pending segment as its own `print!` before evaluating any operand
+  with side effects -- reusing `translatePrintfFormat`'s existing
+  argv-bypass segment-flushing machinery rather than inventing one.
+  TWO PLACES THE WAVE'S OWN BRIEF WAS WRONG, both corrected by
+  measurement rather than argued:
+  (a) **FLOATS NEED NOT BE REJECTED.** The brief assumed libstdc++'s
+  %g-with-6-significant-digits could not be reproduced. It already is:
+  `__emitrust_fmt_float(x, 2, -1, 0, 0)` is the project's own C-compatible
+  %g. A 47-value differential -- 1.0, 1/3, 1e6, 999999.5, 999999.4,
+  1e-5, -0.0, 5e-324 subnormal, DBL_MAX, 1e300, 1e21, +inf, -inf, nan --
+  is BYTE-IDENTICAL, as is a 20-value f32 battery through `x as f64`.
+  For contrast Rust's `{}` diverges badly (1/3 -> `0.3333333333333333`,
+  1e300 -> 301 digits) and neither `{:.6}` nor `{:e}` closes it.
+  (b) **THE `signed char`/`unsigned char` PREMISE WAS INVERTED.** The
+  brief said C++ prints those as NUMBERS; measured, libstdc++ has
+  character overloads for both, so `(unsigned char)200` writes ONE RAW
+  BYTE 0xC8. That matters because Rust's `200u8 as char` writes TWO
+  UTF-8 bytes -- so every `char`-family operand routes through the
+  existing byte-exact `__emitrust_byte_out` (and a new
+  `__emitrust_byte_err` twin) rather than any Display funnel, and forces
+  a segment flush exactly like a side-effecting operand.
+  `std::endl` IS UNOBSERVABLE AS A FLUSH, measured twice: a trailing
+  `print!` with no newline survives `std::process::exit` (native and
+  crate produced identical piped bytes), and Rust's stdout LineWriter
+  flushes on newline anyway, so `println!` reproduces it. The helpers
+  share the same buffered handle `print!` locks, so mid-line segment
+  ordering holds.
+  ADMITTED OPERANDS, keyed on the RESOLVED overload's parameter type
+  rather than the source expression's type (verified necessary:
+  `size_t` resolves to `operator<<(unsigned long)`, an unscoped enum and
+  `wchar_t` BOTH resolve to `operator<<(int)` and so print the NUMBER):
+  bool as `1`/`0`, every integer width and signedness at extremes,
+  `float`/`double` through the %g funnel, the `char` family through the
+  byte funnel, string LITERALS folded into the format string,
+  `std::basic_string<char>`, and `std::endl`.
+  REJECTED, each LOCATED: a `<<` chain whose RESULT is used; a runtime
+  (non-literal) `const char *` operand; a pointer operand (address is
+  nondeterministic, consistent with `%p` staying rejected by design);
+  `std::hex`/`std::flush` and every other manipulator; `long double`
+  (the importer maps it to f64, and `std::cout << 1e400L` prints
+  `1e+400`, which f64 cannot represent -- a pre-existing lossy mapping
+  shared with `%Lg`); `std::string_view` and `std::setw`; and
+  non-printable, non-ASCII or NUL bytes in a literal. Seven wordings,
+  six tags mirrored into `RejectionLedger.cpp` AND
+  `test/RealWorld/run_realworld.py`. Already-fenced shapes re-pinned
+  unchanged: `std::clog`/`std::cin`/`std::wcout`, an `std::ostream&`
+  parameter, a user-defined `operator<<` overload, and
+  `std::ostringstream`.
+  NO new dialect ops and NOTHING new imported: `basic_ostream` was
+  deliberately NOT added to `mapStdLibraryType`, so the FR-40 item graph
+  and the CSymbolNaming byte-identity invariant are untouched -- the
+  full suite staying green with no golden byte shifted is the evidence.
+  DEVIATION, chosen for safety over reach: the spike proved a runtime
+  `const char *` operand works through `__emitrust_cstr_out`, but
+  wiring it needed ~90 lines of forked slice-producing tail; it is a
+  LOCATED rejection instead (`must be a string literal`), which keeps
+  the frontier clean and guarantees no Display funnel can inherit the
+  >=128 double-encode.
+  Gates: full meson suite 715/715 (fast 511 + slow/EndToEnd 204), 0
+  failures, no OOM signature. Cpp17Suite ratchets 27 -> 28 (`01005.cpp`)
+  at `total=31 transpiled=28 passed=28 miscompiled=0 unsupported=3`;
+  CTestSuite 220/220/0/0 unchanged. The EndToEnd leg is a NEW SHAPE for
+  this project -- it diffs BOTH stdout (261 B) and stderr (43 B) against
+  the `clang++ -std=c++17` native, including raw 0xC8/0xC7 bytes.
+  (test/Import/Cpp/ostream-print.cpp, ostream-invalid.cpp;
+  test/EndToEnd/cpp-iostream.cpp; test/Cpp17Suite/Inputs/01005.cpp;
+  repointed the stale BADCOUT pin of test/Import/Cpp/stl-invalid.cpp to
+  std::clog)
 
 - [ ] W2.23 Copy constructors and C++ value semantics (the 00801
   sensor). **NOT SPIKED.**

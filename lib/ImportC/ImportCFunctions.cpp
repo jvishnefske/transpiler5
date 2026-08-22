@@ -2192,6 +2192,24 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
             ".expect(\"stdout write failed\");\n"
             "}"));
   }
+  if (needsByteErrHelper && !byteErrHelperEmitted) {
+    byteErrHelperEmitted = true;
+    // W2.22: the stderr twin of `__emitrust_byte_out`, for a `char` operand
+    // of a `std::cerr <<` chain. Identical body on the stderr handle, and
+    // identical rationale: libstdc++ writes ONE raw byte for every
+    // `char`/`signed char`/`unsigned char` value, where the
+    // `__emitrust_fmt_c` char widening would emit two-byte UTF-8 for
+    // 128..=255. Emitted once per module, after all imported items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_byte_err(b: i8) {\n"
+            "    use std::io::Write;\n"
+            "    std::io::stderr().write_all(&[b as u8])"
+            ".expect(\"stderr write failed\");\n"
+            "}"));
+  }
   // FR-92: the on-demand `__emitrust_chunk_<R>x<C>` reshaping helpers,
   // one per (rows, cols) shape a 2D-array-pointer cast argument used
   // (`Cipher((state_t*)buf, ...)`): `as_chunks_mut::<C>()` views the

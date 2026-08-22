@@ -1,0 +1,12 @@
+i=39 l=39000000 u=4000000039
+ll=-39000000000000 ull=39000000000000
+sh=-61 ush=60039
+on=1 off=0
+c=N hi=È sc=È uc=Ç
+s=abcde
+third=13 big=3.9e+13 tiny=3.9e-08 f=9.75
+braces={} pct=%d tab:	here
+
+seq:<b1>1,<b2>12,<b3>123 trace=123
+tail:39
+no-newline-tail:39
