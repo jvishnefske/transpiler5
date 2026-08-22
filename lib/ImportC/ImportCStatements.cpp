@@ -1136,8 +1136,15 @@ CImporter::emitStlConstruct(Type stlType,
   // ctor — see `isVacuousDefaultConstruct` — since neither's default ctor
   // is trivial).
   if (construct->getNumArgs() == 0) {
-    llvm::StringRef callee = opaque.getValue() == "String" ? "String::new"
-                                                           : "Vec::new";
+    // W2.20: the map/set families join the same zero-argument
+    // construction shape (`let vN: BTreeMap<K, V> = BTreeMap::new();`).
+    llvm::StringRef callee = "Vec::new";
+    if (opaque.getValue() == "String")
+      callee = "String::new";
+    else if (opaque.getValue().starts_with("BTreeMap<"))
+      callee = "BTreeMap::new";
+    else if (opaque.getValue().starts_with("BTreeSet<"))
+      callee = "BTreeSet::new";
     return builder
         .create<emitrust::CallOpaqueOp>(loc, TypeRange{stlType},
                                         builder.getStringAttr(callee),
@@ -3500,22 +3507,38 @@ CImporter::emitCXXForRangeStmt(const clang::CXXForRangeStmt *stmt) {
            << "unsupported: ranged-for range must be a named local "
               "container";
   Value rangePlace = symbolIt->second;
+  // W2.20: the container's OWN place, kept because `rangePlace` is
+  // rebound to the ordered key snapshot below and the per-iteration value
+  // lookup still has to index the map.
+  Value mapPlace = rangePlace;
   auto rangeLValue =
       llvm::dyn_cast<emitrust::LValueType>(rangePlace.getType());
   if (!rangeLValue)
     return emitError(loc)
            << "unsupported: ranged-for range must be a named local "
               "container";
-  // Element type: a Vec<T> opaque or a std::array-mapped !emitrust.array.
+  // Element type: a Vec<T> opaque, a std::array-mapped !emitrust.array,
+  // or (W2.20) a BTreeMap/BTreeSet opaque.
   auto vecType =
       llvm::dyn_cast<emitrust::OpaqueType>(rangeLValue.getValueType());
   auto arrayType =
       llvm::dyn_cast<emitrust::ArrayType>(rangeLValue.getValueType());
+  emitrust::OpaqueType containerType = vecType;
+  bool isMapRange = vecType && isStlMapOpaque(vecType);
+  bool isSetRange = vecType && isStlSetOpaque(vecType);
   Type elementType;
+  Type mapValueType;
   if (vecType && isStlOpaqueType(vecType) &&
       vecType.getValue().starts_with("Vec<")) {
     llvm::StringRef spelling = vecType.getValue();
     elementType = parseStlElementType(spelling.substr(4, spelling.size() - 5));
+    if (!elementType)
+      return emitError(loc) << "unsupported: ranged-for element type";
+  } else if (isMapRange) {
+    if (!stlMapKeyValueTypes(vecType, elementType, mapValueType))
+      return emitError(loc) << "unsupported: ranged-for element type";
+  } else if (isSetRange) {
+    elementType = stlSetElementType(vecType);
     if (!elementType)
       return emitError(loc) << "unsupported: ranged-for element type";
   } else if (arrayType) {
@@ -3531,7 +3554,24 @@ CImporter::emitCXXForRangeStmt(const clang::CXXForRangeStmt *stmt) {
   if (!loopVar)
     return emitError(loc) << "unsupported: ranged-for loop variable shape";
   bool byReference = loopVar->getType()->isReferenceType();
-  if (!byReference) {
+  // W2.20: a ranged-for over a std::map yields `std::pair<const K, V>`.
+  // Only the STRUCTURED-BINDING form is admitted: `for (auto &kv : m)`
+  // would need a Vec of synthesized Pair structs (materially more work
+  // than two scalar places), and the by-reference binding form aliases
+  // the source object, which the per-binding copies here cannot model.
+  const clang::DecompositionDecl *decomp = nullptr;
+  if (isMapRange) {
+    decomp = llvm::dyn_cast<clang::DecompositionDecl>(loopVar);
+    if (!decomp)
+      return emitError(loc)
+             << "unsupported: a ranged-for over a std::map requires a "
+                "structured binding (`for (auto [k, v] : m)`)";
+    if (decomp->getType()->isReferenceType())
+      return emitError(loc) << "unsupported: structured binding by reference";
+    if (llvm::size(decomp->bindings()) != 2)
+      return emitError(loc) << "unsupported: ranged-for loop variable shape";
+    byReference = false;
+  } else if (!byReference) {
     FailureOr<Type> mappedVar = mapType(loopVar->getType(), loc);
     if (failed(mappedVar))
       return failure();
@@ -3539,6 +3579,74 @@ CImporter::emitCXXForRangeStmt(const clang::CXXForRangeStmt *stmt) {
       return emitError(loc)
              << "unsupported: ranged-for loop variable type does not match "
                 "the element type";
+  }
+
+  // W2.20: BTreeMap/BTreeSet have no positional index, so W2.10's index
+  // desugar cannot walk them directly. The lowering takes an ORDERED KEY
+  // SNAPSHOT first — `Vec::from_iter(BTreeMap::keys(&m).cloned())`, whose
+  // every intermediate iterator type is NAMEABLE (the emitter's `let`
+  // prologue demands an explicit annotation) — and then runs the EXISTING
+  // index loop over that Vec unchanged. Ordered traversal is the whole
+  // reason BTree is the right container, and the snapshot preserves it.
+  // The snapshot also decouples the loop from the map's own borrow, which
+  // the per-iteration value lookup needs.
+  if (isMapRange || isSetRange) {
+    std::optional<std::string> keySpelling =
+        rustSpellingForElementType(elementType);
+    if (!keySpelling)
+      return emitError(loc) << "unsupported: ranged-for element type";
+    std::string iterSpelling;
+    llvm::StringRef iterCallee;
+    if (isMapRange) {
+      std::optional<std::string> valueSpelling =
+          rustSpellingForElementType(mapValueType);
+      if (!valueSpelling)
+        return emitError(loc) << "unsupported: ranged-for element type";
+      iterSpelling = "std::collections::btree_map::Keys<'_, " + *keySpelling +
+                     ", " + *valueSpelling + ">";
+      iterCallee = "std::collections::BTreeMap::keys";
+    } else {
+      iterSpelling =
+          "std::collections::btree_set::Iter<'_, " + *keySpelling + ">";
+      iterCallee = "std::collections::BTreeSet::iter";
+    }
+    MLIRContext *context = builder.getContext();
+    Value containerRef =
+        builder
+            .create<emitrust::AddrOfOp>(loc,
+                                        emitrust::RefType::get(containerType),
+                                        rangePlace, /*is_mut=*/false)
+            .getResult();
+    Value iter = builder
+                     .create<emitrust::CallOpaqueOp>(
+                         loc,
+                         TypeRange{emitrust::OpaqueType::get(context,
+                                                             iterSpelling)},
+                         builder.getStringAttr(iterCallee),
+                         /*args=*/ArrayAttr(), ValueRange{containerRef})
+                     .getResult(0);
+    Value cloned =
+        builder
+            .create<emitrust::CallOpaqueOp>(
+                loc,
+                TypeRange{emitrust::OpaqueType::get(
+                    context, "std::iter::Cloned<" + iterSpelling + ">")},
+                builder.getStringAttr("std::iter::Iterator::cloned"),
+                /*args=*/ArrayAttr(), ValueRange{iter})
+            .getResult(0);
+    auto snapshotType =
+        emitrust::OpaqueType::get(context, "Vec<" + *keySpelling + ">");
+    Value snapshot = builder
+                         .create<emitrust::CallOpaqueOp>(
+                             loc, TypeRange{snapshotType},
+                             builder.getStringAttr("Vec::from_iter"),
+                             /*args=*/ArrayAttr(), ValueRange{cloned})
+                         .getResult(0);
+    Value snapshotPlace = createVariablePlace(loc, snapshotType);
+    if (failed(storeToPlace(loc, snapshotPlace, snapshot)))
+      return failure();
+    rangePlace = snapshotPlace;
+    vecType = snapshotType;
   }
 
   // i = 0; while (i < len) { <bind loop var to element i>; body; i += 1 }
@@ -3591,7 +3699,59 @@ CImporter::emitCXXForRangeStmt(const clang::CXXForRangeStmt *stmt) {
               loc, emitrust::LValueType::get(elementType), rangePlace,
               bodyIndex)
           .getResult();
-  if (byReference) {
+  if (isMapRange) {
+    // W2.20: the two structured-binding places. The key binding is a
+    // fresh per-iteration COPY of the snapshot element (writing it must
+    // not touch the container, and C++'s `auto [k, v]` binds to a copy of
+    // the pair too); the value binding is looked up in the map by that
+    // key — `*std::ops::Index::index(&m, &snapshot[i])` — and copied the
+    // same way. Registering each BindingDecl in `symbols` is exactly what
+    // `emitDecompositionDecl` does for the non-loop form.
+    auto bindings = decomp->bindings();
+    const clang::BindingDecl *keyBinding = bindings[0];
+    const clang::BindingDecl *valueBinding = bindings[1];
+    Value keyValue = loadPlace(loc, elementPlace);
+    Value keyPlace = createVariablePlace(
+        loc, elementType,
+        keyBinding->getName().empty()
+            ? std::string()
+            : mangleMemberName(keyBinding->getName()));
+    if (failed(storeToPlace(loc, keyPlace, keyValue)))
+      return failure();
+    Value mapRef =
+        builder
+            .create<emitrust::AddrOfOp>(loc,
+                                        emitrust::RefType::get(containerType),
+                                        mapPlace, /*is_mut=*/false)
+            .getResult();
+    Value keyRef =
+        builder
+            .create<emitrust::AddrOfOp>(loc,
+                                        emitrust::RefType::get(elementType),
+                                        elementPlace, /*is_mut=*/false)
+            .getResult();
+    Value slot = builder
+                     .create<emitrust::CallOpaqueOp>(
+                         loc, TypeRange{emitrust::RefType::get(mapValueType)},
+                         builder.getStringAttr("std::ops::Index::index"),
+                         /*args=*/ArrayAttr(), ValueRange{mapRef, keyRef})
+                     .getResult(0);
+    Value slotPlace =
+        builder
+            .create<emitrust::DerefOp>(
+                loc, emitrust::LValueType::get(mapValueType), slot)
+            .getResult();
+    Value valueValue = loadPlace(loc, slotPlace);
+    Value valuePlace = createVariablePlace(
+        loc, mapValueType,
+        valueBinding->getName().empty()
+            ? std::string()
+            : mangleMemberName(valueBinding->getName()));
+    if (failed(storeToPlace(loc, valuePlace, valueValue)))
+      return failure();
+    symbols[keyBinding] = keyPlace;
+    symbols[valueBinding] = valuePlace;
+  } else if (byReference) {
     // The reference loop variable IS the element place: reads load it,
     // writes assign through it, exactly like a C++ reference local. The
     // subscript re-executes per iteration at runtime, so every use in the
@@ -4497,6 +4657,47 @@ CImporter::emitVoidConditionalStmt(const clang::ConditionalOperator *op) {
   return success();
 }
 
+/// W2.20: whether `e` is a `std::map` `operator[]` call — a SYNTACTIC
+/// screen (the resolved operator method's parent record is `std::map`),
+/// so it costs nothing and never triggers a type mapping.
+static bool isStlMapSubscriptExpr(const clang::Expr *e) {
+  const auto *opCall =
+      llvm::dyn_cast<clang::CXXOperatorCallExpr>(e->IgnoreParenImpCasts());
+  if (!opCall || opCall->getOperator() != clang::OO_Subscript)
+    return false;
+  const auto *method =
+      llvm::dyn_cast_or_null<clang::CXXMethodDecl>(opCall->getDirectCallee());
+  return method && method->getParent()->isInStdNamespace() &&
+         method->getParent()->getIdentifier() &&
+         method->getParent()->getName() == "map";
+}
+
+/// W2.20: whether `e` is a `std::map::at()` call. Its place is a SHARED
+/// reference (`*std::ops::Index::index(&m, &k)`), so a store through it
+/// would reach rustc as a deferred E0594 — the three write positions
+/// reject it here instead. C++'s at() does return `V&`; a later wave
+/// that wants the write form needs an `IndexMut` place, not a widening
+/// of this one.
+static bool isStlMapAtExpr(const clang::Expr *e) {
+  const auto *memberCall =
+      llvm::dyn_cast<clang::CXXMemberCallExpr>(e->IgnoreParenImpCasts());
+  if (!memberCall)
+    return false;
+  const clang::CXXMethodDecl *method = memberCall->getMethodDecl();
+  return method && method->getDeclName().isIdentifier() &&
+         method->getName() == "at" && method->getParent()->isInStdNamespace() &&
+         method->getParent()->getIdentifier() &&
+         method->getParent()->getName() == "map";
+}
+
+LogicalResult CImporter::rejectStlMapAtWrite(const clang::Expr *lhs,
+                                             Location loc) {
+  if (!isStlMapAtExpr(lhs))
+    return success();
+  return emitError(loc) << "unsupported: std::map::at() is a read-only place; "
+                           "assignment through it is not supported";
+}
+
 LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
   // FR-94: a whole-record assignment of an ADMITTED FAM record has no
@@ -4638,6 +4839,44 @@ LogicalResult CImporter::emitAssign(const clang::BinaryOperator *op) {
 FailureOr<Value>
 CImporter::emitAssignToPlace(const clang::BinaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  if (failed(rejectStlMapAtWrite(op->getLHS(), loc)))
+    return failure();
+  // W2.20: `m[k] = rhs` MUST evaluate the right-hand side to a value
+  // BEFORE the entry place is created, and this is a CORRECTNESS
+  // requirement, not a style choice. Two independent reasons:
+  //  * C++17 (P0145R3) sequences E2 before E1 in `E1 = E2`, and the map
+  //    place has an OBSERVABLE side effect (a default insert). Measured
+  //    on clang++ 21.1.8 and g++ 15: `std::map<int,int> a; a[1] =
+  //    (int)a.size();` prints `a[1]==0` and `a.size()==1` — the size is
+  //    read BEFORE the insert. The historical LHS-place-first order would
+  //    print 1.
+  //  * `BTreeMap::entry(&mut m, k)` holds a MUTABLE borrow of the map for
+  //    as long as the place lives, so an LHS place built first and a
+  //    right-hand side that touches the same map is rustc E0499
+  //    ("cannot borrow `m` as mutable more than once at a time").
+  //    Right-hand-side-first kills the read borrow under NLL before the
+  //    write borrow is taken.
+  if (isStlMapSubscriptExpr(op->getLHS())) {
+    FailureOr<Value> value = emitRValue(op->getRHS());
+    if (failed(value))
+      return failure();
+    FailureOr<Value> place = emitLValue(op->getLHS());
+    if (failed(place))
+      return failure();
+    Value toStore = *value;
+    if (auto lvalueType =
+            llvm::dyn_cast<emitrust::LValueType>((*place).getType());
+        lvalueType && lvalueType.getValueType() != toStore.getType()) {
+      FailureOr<Value> converted =
+          convertScalarValue(loc, toStore, lvalueType.getValueType());
+      if (failed(converted))
+        return failure();
+      toStore = *converted;
+    }
+    if (failed(storeToPlace(loc, *place, toStore)))
+      return failure();
+    return place;
+  }
   // A decomposed pointer has no place to re-load the assigned value from;
   // a function pointer is an ordinary value with an ordinary place.
   if (isPointerType(op->getLHS()->getType()) &&
@@ -4788,6 +5027,28 @@ CImporter::emitCompoundAssign(const clang::CompoundAssignOperator *op) {
 FailureOr<Value>
 CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  if (failed(rejectStlMapAtWrite(op->getLHS(), loc)))
+    return failure();
+  // W2.20: `m[k] op= rhs` takes the same mandatory right-hand-side-first
+  // order as the plain assignment above — C++17 sequences E2 before E1 in
+  // `E1 op= E2` too, and the entry place's mutable borrow would otherwise
+  // collide with any read of the same map on the right.
+  if (isStlMapSubscriptExpr(op->getLHS())) {
+    FailureOr<Value> rhs = emitRValue(op->getRHS());
+    if (failed(rhs))
+      return failure();
+    FailureOr<Value> place = emitLValue(op->getLHS());
+    if (failed(place))
+      return failure();
+    Value current = loadPlace(loc, *place);
+    FailureOr<Value> result =
+        buildCompoundAssignValue(loc, op, current, *rhs);
+    if (failed(result))
+      return failure();
+    if (failed(storeToPlace(loc, *place, *result)))
+      return failure();
+    return place;
+  }
   // A decomposed pointer has no place to re-load the assigned value from.
   if (isPointerType(op->getLHS()->getType()))
     return emitError(loc)
@@ -4873,7 +5134,8 @@ CImporter::emitCompoundAssignToPlace(const clang::CompoundAssignOperator *op) {
 }
 
 FailureOr<Value> CImporter::buildCompoundAssignValue(
-    Location loc, const clang::CompoundAssignOperator *op, Value current) {
+    Location loc, const clang::CompoundAssignOperator *op, Value current,
+    Value precomputedRhs) {
   Type storedType = current.getType();
   FailureOr<Type> computeType = mapType(op->getComputationLHSType(), loc);
   if (failed(computeType))
@@ -4884,12 +5146,18 @@ FailureOr<Value> CImporter::buildCompoundAssignValue(
   FailureOr<Value> widened = convertScalarValue(loc, current, *computeType);
   if (failed(widened))
     return failure();
-  FailureOr<Value> rhs = emitRValue(op->getRHS());
-  if (failed(rhs))
-    return failure();
+  // W2.20: the std::map subscript path evaluates the right-hand side
+  // BEFORE the (mutably borrowing, default-inserting) entry place and
+  // hands the value in here; every other caller emits it in place.
+  Value rhsValue = precomputedRhs;
+  if (!rhsValue) {
+    FailureOr<Value> rhs = emitRValue(op->getRHS());
+    if (failed(rhs))
+      return failure();
+    rhsValue = *rhs;
+  }
   clang::BinaryOperatorKind opcode =
       clang::BinaryOperator::getOpForCompoundAssignment(op->getOpcode());
-  Value rhsValue = *rhs;
   // The shift amount's C type is independent of the shifted operand's, so
   // `<<=`/`>>=` normalize the right operand to the (widened) left
   // operand's width; every other compound assignment meets its RHS at the
@@ -4960,6 +5228,8 @@ LogicalResult CImporter::emitIncDec(const clang::UnaryOperator *op) {
 
 FailureOr<Value> CImporter::emitIncDecValue(const clang::UnaryOperator *op) {
   Location loc = translateLoc(op->getOperatorLoc());
+  if (failed(rejectStlMapAtWrite(op->getSubExpr(), loc)))
+    return failure();
   // Pointer ++/-- value forms are consumed by `emitPointerRValue`; a
   // pointer value reaching this scalar path has no representation.
   if (isPointerType(op->getSubExpr()->getType()))

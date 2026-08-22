@@ -238,6 +238,32 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("cxx-ostream-string-literal")},
     {llvm::StringLiteral("std::ostream << operand"),
      llvm::StringLiteral("cxx-ostream-operand-type")},
+    // W2.20 std::map / std::set frontier. Every row here sits BEFORE the
+    // three generic STL rows below so first-match keeps them
+    // distinguishable in the ledger; mirrored into
+    // test/RealWorld/run_realworld.py. The first two are PERMANENT
+    // rejections, not backlog items: an unordered container's iteration
+    // order is unspecified and a multi- container holds duplicate keys,
+    // so no Rust container reproduces either byte for byte.
+    {llvm::StringLiteral("iteration order is unspecified"),
+     llvm::StringLiteral("stl-unordered-container")},
+    {llvm::StringLiteral("stores duplicate keys"),
+     llvm::StringLiteral("stl-multi-container")},
+    {llvm::StringLiteral("with a comparator other than std::less"),
+     llvm::StringLiteral("stl-map-comparator")},
+    {llvm::StringLiteral("is not in the supported ordered key set"),
+     llvm::StringLiteral("stl-map-key-type")},
+    {llvm::StringLiteral("is not in the supported value set"),
+     llvm::StringLiteral("stl-map-value-type")},
+    {llvm::StringLiteral("does not overwrite an existing key"),
+     llvm::StringLiteral("stl-map-insert")},
+    {llvm::StringLiteral(
+         "iterators are only recognized in the find(k) != end() idiom"),
+     llvm::StringLiteral("stl-map-iterator")},
+    {llvm::StringLiteral("is a read-only place"),
+     llvm::StringLiteral("stl-map-at-write")},
+    {llvm::StringLiteral("requires a structured binding"),
+     llvm::StringLiteral("stl-map-ranged-for")},
     {llvm::StringLiteral("is not a recognized STL type"),
      llvm::StringLiteral("stl-unrecognized-type")},
     {llvm::StringLiteral("is not a recognized STL method"),

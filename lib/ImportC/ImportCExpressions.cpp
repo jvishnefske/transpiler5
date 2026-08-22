@@ -2036,6 +2036,12 @@ FailureOr<Value> CImporter::emitLambdaLocalCall(
   return callOp->getResult(0);
 }
 
+/// W2.20: forward declaration — the `m.find(k) != m.end()` matcher is
+/// defined beside the map lowering it feeds, but `emitCall` below is the
+/// interception point (before any operand type is mapped).
+static const clang::CXXMemberCallExpr *
+matchStlFindEndIdiom(const clang::CXXOperatorCallExpr *call);
+
 FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
   // W2.2: a genuine C++ instance-method call (`obj.method(args)` or
@@ -2064,6 +2070,16 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
         return emitError(loc) << "unsupported: the result of a std::ostream "
                                  "<< chain must be unused";
     }
+    // W2.20: `m.find(k) != m.end()` is the ONE std::map/std::set iterator
+    // shape the wave admits, and it lowers to `contains_key(&k)` without
+    // materializing an iterator. It must be intercepted HERE, before any
+    // operand type is mapped: `operator!=` over map iterators is a FREE
+    // function template (so the std-member dispatch below never sees it),
+    // and mapping either operand's type would reject on the iterator
+    // first.
+    if (const clang::CXXMemberCallExpr *findCall =
+            matchStlFindEndIdiom(opCall))
+      return emitStlFindEndTest(opCall, findCall);
     const auto *opMethod = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(
         opCall->getDirectCallee());
     if (opMethod && opMethod->getParent()->isInStdNamespace())
@@ -2876,6 +2892,247 @@ CImporter::emitStlVectorEndPlace(Value receiver,
       .getResult();
 }
 
+/// W2.20: peels the wrappers clang puts between an `operator!=` argument
+/// and the member call underneath it — the materialized temporary for the
+/// by-const-reference iterator parameter, plus the parens/implicit casts.
+static const clang::Expr *peelStlIteratorOperand(const clang::Expr *e) {
+  e = e->IgnoreParenImpCasts();
+  while (const auto *materialize =
+             llvm::dyn_cast<clang::MaterializeTemporaryExpr>(e))
+    e = materialize->getSubExpr()->IgnoreParenImpCasts();
+  return e;
+}
+
+/// W2.20: the `m.find(k) != m.end()` / `m.find(k) == m.end()` idiom — the
+/// ONE iterator shape the wave admits, and the only one that lowers
+/// without materializing an iterator at all. Matches a free
+/// `operator==`/`operator!=` whose two operands are, after peeling, member
+/// calls named `find` and `end` on the SAME bare local, and hands back the
+/// find call. Recognized BEFORE the operands' types are ever mapped: the
+/// iterator type would reject first otherwise.
+static const clang::CXXMemberCallExpr *
+matchStlFindEndIdiom(const clang::CXXOperatorCallExpr *call) {
+  if (call->getOperator() != clang::OO_ExclaimEqual &&
+      call->getOperator() != clang::OO_EqualEqual)
+    return nullptr;
+  if (call->getNumArgs() != 2)
+    return nullptr;
+  const auto *lhs = llvm::dyn_cast<clang::CXXMemberCallExpr>(
+      peelStlIteratorOperand(call->getArg(0)));
+  const auto *rhs = llvm::dyn_cast<clang::CXXMemberCallExpr>(
+      peelStlIteratorOperand(call->getArg(1)));
+  if (!lhs || !rhs)
+    return nullptr;
+  auto memberName = [](const clang::CXXMemberCallExpr *member) {
+    const clang::CXXMethodDecl *method = member->getMethodDecl();
+    return method && method->getDeclName().isIdentifier()
+               ? method->getName()
+               : llvm::StringRef();
+  };
+  const clang::CXXMemberCallExpr *findCall = nullptr;
+  const clang::CXXMemberCallExpr *endCall = nullptr;
+  if (memberName(lhs) == "find" && memberName(rhs) == "end") {
+    findCall = lhs;
+    endCall = rhs;
+  } else if (memberName(lhs) == "end" && memberName(rhs) == "find") {
+    findCall = rhs;
+    endCall = lhs;
+  } else {
+    return nullptr;
+  }
+  if (findCall->getNumArgs() != 1 || endCall->getNumArgs() != 0)
+    return nullptr;
+  const clang::CXXMethodDecl *method = findCall->getMethodDecl();
+  if (!method || !method->getParent()->isInStdNamespace() ||
+      !method->getParent()->getIdentifier())
+    return nullptr;
+  llvm::StringRef container = method->getParent()->getName();
+  if (container != "map" && container != "set")
+    return nullptr;
+  // Both calls must name the SAME container object, spelled as a bare
+  // local both times — anything else (two different maps, a temporary)
+  // is not the idiom.
+  const auto *findRef = llvm::dyn_cast<clang::DeclRefExpr>(
+      findCall->getImplicitObjectArgument()->IgnoreParenImpCasts());
+  const auto *endRef = llvm::dyn_cast<clang::DeclRefExpr>(
+      endCall->getImplicitObjectArgument()->IgnoreParenImpCasts());
+  if (!findRef || !endRef || findRef->getDecl() != endRef->getDecl())
+    return nullptr;
+  return findCall;
+}
+
+FailureOr<Value>
+CImporter::emitStlFindEndTest(const clang::CXXOperatorCallExpr *call,
+                              const clang::CXXMemberCallExpr *findCall) {
+  Location loc = translateLoc(call->getBeginLoc());
+  FailureOr<Value> receiver = emitLValue(
+      findCall->getImplicitObjectArgument()->IgnoreParenImpCasts());
+  if (failed(receiver))
+    return failure();
+  auto receiverLValueType =
+      llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+  auto opaque = receiverLValueType
+                    ? llvm::dyn_cast<emitrust::OpaqueType>(
+                          receiverLValueType.getValueType())
+                    : emitrust::OpaqueType();
+  bool isMap = opaque && isStlMapOpaque(opaque);
+  bool isSet = opaque && isStlSetOpaque(opaque);
+  if (!isMap && !isSet)
+    return emitError(loc)
+           << "unsupported: find() receiver is not a recognized STL type";
+  Type keyType;
+  Type valueType;
+  if (isMap) {
+    if (!stlMapKeyValueTypes(opaque, keyType, valueType))
+      return emitError(loc) << "unsupported: std::map element type";
+  } else {
+    keyType = stlSetElementType(opaque);
+    if (!keyType)
+      return emitError(loc) << "unsupported: std::set element type";
+  }
+  FailureOr<Value> keyRef = emitStlKeyRef(findCall->getArg(0), keyType, loc);
+  if (failed(keyRef))
+    return failure();
+  Value found =
+      builder
+          .create<emitrust::MethodCallOp>(
+              loc, TypeRange{builder.getI1Type()}, *receiver,
+              builder.getStringAttr(isMap ? "contains_key" : "contains"),
+              ValueRange{*keyRef})
+          .getResult(0);
+  // `find(k) == end()` is "absent", the negation of `contains_key`.
+  if (call->getOperator() == clang::OO_EqualEqual) {
+    Value truth = createBoolConstant(loc, true);
+    found = builder.create<arith::XOrIOp>(loc, found, truth).getResult();
+  }
+  return extendBool(loc, found, call->getType());
+}
+
+FailureOr<Value> CImporter::emitStlKeyValue(const clang::Expr *keyExpr,
+                                           Type keyType, Location loc) {
+  FailureOr<Value> key = emitRValue(keyExpr);
+  if (failed(key))
+    return failure();
+  if ((*key).getType() == keyType)
+    return *key;
+  auto intType = llvm::dyn_cast<IntegerType>(keyType);
+  if (!intType || !llvm::isa<IntegerType>((*key).getType()))
+    return emitError(loc)
+           << "unsupported: std::map/std::set key argument type";
+  return castToIntType(loc, *key, intType);
+}
+
+FailureOr<Value> CImporter::emitStlKeyRef(const clang::Expr *keyExpr,
+                                          Type keyType, Location loc) {
+  // Rust's `contains_key`/`contains`/`remove` and `std::ops::Index::index`
+  // all take the key BY REFERENCE, and `&<temporary>` has no place to
+  // borrow from in this IR — so the key is materialized into its own
+  // local first and the shared reference is taken from that place.
+  FailureOr<Value> key = emitStlKeyValue(keyExpr, keyType, loc);
+  if (failed(key))
+    return failure();
+  Value cell = createVariablePlace(loc, keyType);
+  if (failed(storeToPlace(loc, cell, *key)))
+    return failure();
+  return builder
+      .create<emitrust::AddrOfOp>(loc, emitrust::RefType::get(keyType), cell,
+                                  /*is_mut=*/false)
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitStlMapEntryPlace(Value receiver, emitrust::OpaqueType mapType,
+                                const clang::Expr *keyExpr, Location loc) {
+  // W2.20: THE map place. C++'s `m[k]` on a MISSING key DEFAULT-INSERTS
+  // and returns a reference to the new element, so `m[k]` is a MUTATION
+  // even in a read position (`int miss = m[99];` inserts 99 and
+  // `m.size()` observes it — measured on clang++ and g++ 2026-08-21).
+  // Rust's `Index` PANICS on a missing key, so a plain subscript place
+  // would be a miscompile in exactly that case. `*m.entry(k).or_default()`
+  // reproduces all FOUR spellings — read, write, compound, missing-key
+  // read — with one place.
+  //
+  // The UFCS free-call spelling is deliberate: `emitrust.method_call`
+  // renders `place.method(args)` and requires an LVALUE receiver, so
+  // `m.entry(k).or_default()` is not expressible as method_calls at all;
+  // `Entry::or_default(BTreeMap::entry(&mut m, k))` is two plain
+  // `emitrust.call_opaque` ops feeding an `emitrust.deref`.
+  Type keyType;
+  Type valueType;
+  if (!stlMapKeyValueTypes(mapType, keyType, valueType))
+    return emitError(loc) << "unsupported: std::map element type";
+  std::optional<std::string> keySpelling = rustSpellingForElementType(keyType);
+  std::optional<std::string> valueSpelling =
+      rustSpellingForElementType(valueType);
+  if (!keySpelling || !valueSpelling)
+    return emitError(loc) << "unsupported: std::map element type";
+  FailureOr<Value> key = emitStlKeyValue(keyExpr, keyType, loc);
+  if (failed(key))
+    return failure();
+  Value mutRef =
+      builder
+          .create<emitrust::AddrOfOp>(
+              loc, emitrust::MutRefType::get(mapType), receiver, /*is_mut=*/true)
+          .getResult();
+  auto entryType = emitrust::OpaqueType::get(
+      builder.getContext(), "std::collections::btree_map::Entry<'_, " +
+                                *keySpelling + ", " + *valueSpelling + ">");
+  Value entry =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{entryType},
+              builder.getStringAttr("std::collections::BTreeMap::entry"),
+              /*args=*/ArrayAttr(), ValueRange{mutRef, *key})
+          .getResult(0);
+  Value slot =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{emitrust::MutRefType::get(valueType)},
+              builder.getStringAttr(
+                  "std::collections::btree_map::Entry::or_default"),
+              /*args=*/ArrayAttr(), ValueRange{entry})
+          .getResult(0);
+  return builder
+      .create<emitrust::DerefOp>(loc, emitrust::LValueType::get(valueType),
+                                 slot)
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitStlMapIndexPlace(Value receiver, emitrust::OpaqueType mapType,
+                                const clang::Expr *keyExpr, Location loc) {
+  // W2.20: `m.at(k)` -> `*std::ops::Index::index(&m, &k)`. C++'s at()
+  // THROWS std::out_of_range on a missing key; exceptions are out of the
+  // subset, so Rust's panic is a safe refinement — the identical argument
+  // W2.6 used for vector front()/back() on an empty vector. Unlike the
+  // entry place above this one is a SHARED reference and never inserts,
+  // which is exactly at()'s contract; it is read-only, and the three
+  // write positions reject a store through it (`rejectStlMapAtWrite`)
+  // rather than let it reach rustc as a deferred E0594.
+  Type keyType;
+  Type valueType;
+  if (!stlMapKeyValueTypes(mapType, keyType, valueType))
+    return emitError(loc) << "unsupported: std::map element type";
+  Value mapRef =
+      builder
+          .create<emitrust::AddrOfOp>(loc, emitrust::RefType::get(mapType),
+                                      receiver, /*is_mut=*/false)
+          .getResult();
+  FailureOr<Value> keyRef = emitStlKeyRef(keyExpr, keyType, loc);
+  if (failed(keyRef))
+    return failure();
+  Value slot = builder
+                   .create<emitrust::CallOpaqueOp>(
+                       loc, TypeRange{emitrust::RefType::get(valueType)},
+                       builder.getStringAttr("std::ops::Index::index"),
+                       /*args=*/ArrayAttr(), ValueRange{mapRef, *keyRef})
+                   .getResult(0);
+  return builder
+      .create<emitrust::DerefOp>(loc, emitrust::LValueType::get(valueType),
+                                 slot)
+      .getResult();
+}
+
 FailureOr<Value>
 CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
@@ -2969,6 +3226,8 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
               "type";
   llvm::StringRef typeSpelling = opaque.getValue();
   bool isVector = typeSpelling.starts_with("Vec<");
+  bool isMap = typeSpelling.starts_with("BTreeMap<");
+  bool isSet = typeSpelling.starts_with("BTreeSet<");
 
   // size()/length(): C's declared result type is int/size_t; the real
   // `.len()` returns `usize` (`index`), so the result is cast to whatever
@@ -3062,6 +3321,130 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
       return Value();
     }
     return emitError(loc) << "unsupported: std::vector::" << methodName
+                          << " is not a recognized STL method";
+  }
+  // W2.20: std::map / std::set. size()/empty() reuse the family-agnostic
+  // lambdas above verbatim. count()/erase() take the key BY REFERENCE and
+  // return a COUNT (0 or 1), not a bool — hence the `contains_key` probe
+  // in front of the discarded `remove`, which is two lookups but exact.
+  // at() is the read-only `Index::index` place. std::set::insert matches
+  // Rust's `BTreeSet::insert` EXACTLY (neither replaces an existing
+  // element, and both report whether the set changed).
+  //
+  // std::map::insert is the wave's other miscompile trap and is REJECTED:
+  // C++'s `map::insert` does NOT overwrite an existing key while Rust's
+  // `BTreeMap::insert` DOES (measured 2026-08-21: after `m[1]=10`,
+  // `m.insert({1,99})` leaves m[1]==10 and returns false). Mapping
+  // insert -> insert would be silent wrong code.
+  if (isMap || isSet) {
+    Type keyType;
+    Type valueType;
+    if (isMap) {
+      if (!stlMapKeyValueTypes(opaque, keyType, valueType))
+        return emitError(loc) << "unsupported: std::map element type";
+    } else {
+      keyType = stlSetElementType(opaque);
+      if (!keyType)
+        return emitError(loc) << "unsupported: std::set element type";
+    }
+    llvm::StringRef family = isMap ? "std::map" : "std::set";
+    if (methodName == "size")
+      return emitLenCall();
+    if (methodName == "empty")
+      return emitEmptyCall();
+    if (methodName == "clear") {
+      if (call->getNumArgs() != 0)
+        return emitError(loc) << "unsupported: clear takes no arguments";
+      builder.create<emitrust::MethodCallOp>(loc, TypeRange(), *receiver,
+                                             builder.getStringAttr("clear"),
+                                             ValueRange{});
+      return Value();
+    }
+    if (methodName == "count" || methodName == "contains" ||
+        methodName == "erase") {
+      if (call->getNumArgs() != 1)
+        return emitError(loc) << "unsupported: " << methodName
+                              << " requires exactly one argument";
+      FailureOr<Value> keyRef = emitStlKeyRef(call->getArg(0), keyType, loc);
+      if (failed(keyRef))
+        return failure();
+      Value found =
+          builder
+              .create<emitrust::MethodCallOp>(
+                  loc, TypeRange{builder.getI1Type()}, *receiver,
+                  builder.getStringAttr(isMap ? "contains_key" : "contains"),
+                  ValueRange{*keyRef})
+              .getResult(0);
+      if (methodName == "erase") {
+        // The removal's own result is DISCARDED: C++ erase(key) reports
+        // the count, which the probe above already holds. Giving the op a
+        // result (typed `Option<V>` for a map, `bool` for a set) rather
+        // than none keeps the emitter's `_vN` naming, which absorbs
+        // `Option`'s #[must_use].
+        std::optional<std::string> valueSpelling =
+            isMap ? rustSpellingForElementType(valueType) : std::nullopt;
+        if (isMap && !valueSpelling)
+          return emitError(loc) << "unsupported: std::map element type";
+        Type removeResult =
+            isMap ? Type(emitrust::OpaqueType::get(builder.getContext(),
+                                                   "Option<" + *valueSpelling +
+                                                       ">"))
+                  : Type(builder.getI1Type());
+        builder.create<emitrust::MethodCallOp>(
+            loc, TypeRange{removeResult}, *receiver,
+            builder.getStringAttr("remove"), ValueRange{*keyRef});
+      }
+      FailureOr<Type> resultType = mapType(call->getType(), loc);
+      if (failed(resultType))
+        return failure();
+      if (llvm::isa<IntegerType>(*resultType) &&
+          *resultType != builder.getI1Type())
+        return builder.create<emitrust::CastOp>(loc, *resultType, found)
+            .getResult();
+      if (*resultType == builder.getI1Type())
+        return found;
+      return emitError(loc) << "unsupported: " << methodName
+                            << " result type";
+    }
+    if (isMap && methodName == "at") {
+      if (call->getNumArgs() != 1)
+        return emitError(loc)
+               << "unsupported: at requires exactly one argument";
+      FailureOr<Value> place =
+          emitStlMapIndexPlace(*receiver, opaque, call->getArg(0), loc);
+      if (failed(place))
+        return failure();
+      return loadPlace(loc, *place);
+    }
+    if (isSet && methodName == "insert") {
+      if (call->getNumArgs() != 1)
+        return emitError(loc)
+               << "unsupported: insert requires exactly one argument";
+      FailureOr<Value> element =
+          emitStlKeyValue(call->getArg(0), keyType, loc);
+      if (failed(element))
+        return failure();
+      builder.create<emitrust::MethodCallOp>(loc, TypeRange(), *receiver,
+                                             builder.getStringAttr("insert"),
+                                             ValueRange{*element});
+      return Value();
+    }
+    if (isMap && (methodName == "insert" || methodName == "emplace" ||
+                  methodName == "try_emplace"))
+      return emitError(loc)
+             << "unsupported: std::map::" << methodName
+             << " does not overwrite an existing key while Rust's "
+                "BTreeMap::insert does";
+    if (methodName == "find" || methodName == "begin" || methodName == "end" ||
+        methodName == "cbegin" || methodName == "cend" ||
+        methodName == "rbegin" || methodName == "rend" ||
+        methodName == "crbegin" || methodName == "crend" ||
+        methodName == "lower_bound" || methodName == "upper_bound" ||
+        methodName == "equal_range" || methodName == "emplace_hint")
+      return emitError(loc) << "unsupported: std::map/std::set iterators are "
+                               "only recognized in the find(k) != end() "
+                               "idiom";
+    return emitError(loc) << "unsupported: " << family << "::" << methodName
                           << " is not a recognized STL method";
   }
   // W2.11: std::optional. `has_value()` -> `is_some()` (a genuine bool on
@@ -3302,14 +3685,35 @@ CImporter::emitStlOperatorCall(const clang::CXXOperatorCallExpr *call) {
 
   switch (call->getOperator()) {
   case clang::OO_Subscript: {
-    if (!isVector)
-      return emitError(loc)
-             << "unsupported: std::string::operator[] is not a recognized "
-                "STL method (bytes indexing is not supported this wave)";
     if (call->getNumArgs() != 2)
       return emitError(loc)
              << "unsupported: operator[] requires exactly one index "
                 "argument";
+    // W2.20: a std::map receiver takes the DEFAULT-INSERTING entry place,
+    // never `emitrust.subscript` (which renders `m[i as usize]`). This
+    // read-position spelling is a MUTATION in C++ too, so it shares the
+    // one place with the write and compound spellings.
+    if (isStlMapOpaque(opaque)) {
+      FailureOr<Value> place =
+          emitStlMapEntryPlace(*receiver, opaque, call->getArg(1), loc);
+      if (failed(place))
+        return failure();
+      return loadPlace(loc, *place);
+    }
+    if (!isVector) {
+      // W2.20: this fall-through used to hardcode "std::string" for EVERY
+      // non-Vec opaque, which becomes actively misleading now that a map
+      // or set receiver can reach it. The std::string wording is kept
+      // verbatim for a genuine std::string receiver (it names the real
+      // reason — byte indexing).
+      if (opaque.getValue() == "String")
+        return emitError(loc)
+               << "unsupported: std::string::operator[] is not a recognized "
+                  "STL method (bytes indexing is not supported this wave)";
+      return emitError(loc)
+             << "unsupported: " << stlOpaqueDisplayName(opaque)
+             << "::operator[] is not a recognized STL method";
+    }
     FailureOr<Value> place = emitStlVectorIndexPlace(
         *receiver, opaque, call->getArg(1), loc, "operator[]");
     if (failed(place))
@@ -3321,6 +3725,12 @@ CImporter::emitStlOperatorCall(const clang::CXXOperatorCallExpr *call) {
       return emitError(loc)
              << "unsupported: std::vector::operator+= is not a recognized "
                 "STL method";
+    // W2.20: same rewording as operator[] above — a map/set receiver must
+    // not be reported as a std::string.
+    if (isStlMapOpaque(opaque) || isStlSetOpaque(opaque))
+      return emitError(loc)
+             << "unsupported: " << stlOpaqueDisplayName(opaque)
+             << "::operator+= is not a recognized STL method";
     if (call->getNumArgs() != 2)
       return emitError(loc)
              << "unsupported: operator+= requires exactly one argument";

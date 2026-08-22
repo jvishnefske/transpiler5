@@ -2943,6 +2943,41 @@ private:
   /// produces.
   static bool isStlOpaqueType(Type type);
 
+  /// W2.20: whether `type` is the `BTreeMap<K, V>` / `BTreeSet<K>` opaque
+  /// family `std::map` / `std::set` map to. Split out from
+  /// `isStlOpaqueType` because every family gate that used to read
+  /// "vector or string" now has three answers, and the map/set answers
+  /// diverge on the SEMANTICS of `operator[]`, not just the method table.
+  static bool isStlMapOpaque(Type type);
+  static bool isStlSetOpaque(Type type);
+
+  /// W2.20: the C++ spelling of a recognized STL opaque family, for
+  /// diagnostics. Before this wave the non-`Vec<` fall-through in the
+  /// subscript and at() paths hardcoded "std::string", which becomes
+  /// actively misleading the moment a map or set can reach it.
+  static llvm::StringRef stlOpaqueDisplayName(emitrust::OpaqueType opaque);
+
+  /// W2.20: decomposes a `BTreeMap<K, V>` opaque into its mapped key and
+  /// value types (an angle-bracket-depth-aware split at the top-level
+  /// comma, then `parseStlElementType` on each half). Returns false if
+  /// either half fails to round-trip.
+  bool stlMapKeyValueTypes(emitrust::OpaqueType mapType, Type &key,
+                           Type &value);
+
+  /// W2.20: the mapped element type of a `BTreeSet<K>` opaque, or a null
+  /// Type if the spelling fails to round-trip.
+  Type stlSetElementType(emitrust::OpaqueType setType);
+
+  /// W2.20: whether `comp` is exactly the DEFAULT `std::less<key>`
+  /// comparator. `std::map<int,int,Rev>` keeps the RecordDecl name "map",
+  /// so the comparator template argument is the only screen that catches
+  /// a custom or reversed ordering, which `BTreeMap` does not reproduce.
+  bool isStdLessComparator(clang::QualType comp, clang::QualType key);
+
+  /// W2.20: emits a module-level `emitrust.use "path"` exactly once,
+  /// preserving first-mention order.
+  void requireModuleUse(llvm::StringRef path);
+
   /// W2.3: the Rust spelling of a MAPPED element type `T` for composing
   /// `"Vec<" + spelling + ">"` — the inverse of `parseStlElementType`.
   /// Handles exactly the supported vector-element set: signed/unsigned
@@ -3012,6 +3047,54 @@ private:
   FailureOr<Value> emitStlVectorEndPlace(Value receiver,
                                          emitrust::OpaqueType vectorType,
                                          bool isFront, Location loc);
+
+  /// W2.20: THE `std::map` place — `*m.entry(k).or_default()`, built from
+  /// `emitrust.addr_of mut` + two `emitrust.call_opaque`s + an
+  /// `emitrust.deref`. C++'s `m[k]` DEFAULT-INSERTS on a missing key and
+  /// returns a reference to the new element, so the read, the write, the
+  /// compound and the missing-key read are ALL mutations and all share
+  /// this one place. It must never be an `emitrust.subscript` (which
+  /// renders `m[i as usize]` and is a panic-miscompile for a missing key).
+  FailureOr<Value> emitStlMapEntryPlace(Value receiver,
+                                        emitrust::OpaqueType mapType,
+                                        const clang::Expr *keyExpr,
+                                        Location loc);
+
+  /// W2.20: the READ-ONLY `m.at(k)` place —
+  /// `*std::ops::Index::index(&m, &k)`. Rust's panic on a missing key
+  /// refines C++'s std::out_of_range throw (the W2.6 argument for vector
+  /// front()/back()). Read position only: the three write positions
+  /// reject through `rejectStlMapAtWrite`.
+  FailureOr<Value> emitStlMapIndexPlace(Value receiver,
+                                        emitrust::OpaqueType mapType,
+                                        const clang::Expr *keyExpr,
+                                        Location loc);
+
+  /// W2.20: the key ARGUMENT of a map/set call, converted to the
+  /// container's mapped key type.
+  FailureOr<Value> emitStlKeyValue(const clang::Expr *keyExpr, Type keyType,
+                                   Location loc);
+
+  /// W2.20: a SHARED REFERENCE to the key argument. Rust's
+  /// `contains_key`/`contains`/`remove` and `std::ops::Index::index` all
+  /// take `&K`, and `&<temporary>` has no place to borrow from in this
+  /// IR, so the key is materialized into its own local first.
+  FailureOr<Value> emitStlKeyRef(const clang::Expr *keyExpr, Type keyType,
+                                 Location loc);
+
+  /// W2.20: lowers the `m.find(k) != m.end()` / `== m.end()` idiom — the
+  /// ONE iterator shape the wave admits — to `contains_key(&k)` (negated
+  /// for the `==` spelling), without ever materializing an iterator.
+  /// `findCall` is the matched `find` member call.
+  FailureOr<Value> emitStlFindEndTest(const clang::CXXOperatorCallExpr *call,
+                                      const clang::CXXMemberCallExpr *findCall);
+
+  /// W2.20: rejects a store through a `std::map::at()` place, whose Rust
+  /// image is a SHARED reference. Called from the three write positions
+  /// (`emitAssignToPlace`, `emitCompoundAssignToPlace`,
+  /// `emitIncDecValue`) so the store never reaches rustc as a deferred
+  /// E0594.
+  LogicalResult rejectStlMapAtWrite(const clang::Expr *lhs, Location loc);
 
   /// W2.7: whether `type` is a `std::array<T, N>` specialization (the one
   /// std-namespace record that maps to a non-opaque type,
@@ -4564,7 +4647,7 @@ private:
   FailureOr<Value>
   buildCompoundAssignValue(Location loc,
                            const clang::CompoundAssignOperator *op,
-                           Value current);
+                           Value current, Value precomputedRhs = Value());
 
   /// Converts a scalar `value` to `target` following C's conversion
   /// rules: integer-to-integer via `castToIntType`, `arith`
@@ -5852,6 +5935,10 @@ private:
   /// by `variantAltIndex` (construction/assignment/get selection) and
   /// `createVariantMatch` (per-arm payload types).
   llvm::StringMap<llvm::SmallVector<Type, 2>> variantEnumAlternatives;
+
+  /// W2.20: the module-level `use` paths already emitted, so a second
+  /// `std::map` mention does not emit a duplicate `use` line.
+  llvm::StringSet<> emittedModuleUses;
   //===--------------------------------------------------------------------===//
   // Recoverable import (FR-42) state
   //===--------------------------------------------------------------------===//
