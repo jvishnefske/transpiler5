@@ -1,0 +1,25 @@
+scalar=4
+ctor 11/1
+field=11 tag=1
+bump -> 13
+method=13
+bump -> 18
+deref=18
+assigned=19
+ctor 101/0
+bump -> 101
+loop 0 -> 101
+dtor 101
+ctor 102/1
+bump -> 103
+loop 1 -> 103
+dtor 103
+after loop
+ctor 201/9
+branch=201
+dtor 201
+after branch
+before fn end
+dtor 19
+total=23
+main end

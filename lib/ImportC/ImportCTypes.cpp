@@ -395,8 +395,22 @@ FailureOr<Type> CImporter::mapType(clang::QualType type, Location loc) {
 
 std::optional<std::string>
 CImporter::rustSpellingForElementType(Type type) {
-  if (auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type))
+  if (auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type)) {
+    // W2.21: a `Box<T>` (std::unique_ptr) NEVER composes into another
+    // recognized container. This is the wave's mandatory CONTAINER SCREEN
+    // and it is deliberately central: every other family
+    // (vector/pair/optional/map value) reaches its element spelling
+    // through this one function, so refusing `Box<` here keeps
+    // `std::vector<std::unique_ptr<T>>`, `std::optional<std::unique_ptr<T>>`
+    // and `std::pair<int, std::unique_ptr<T>>` located rejections instead
+    // of silently admitting `Vec<Box<T>>`-shaped surface the wave never
+    // spiked (the move/clone question at every element read is real and
+    // unanswered). `std::array` maps its element directly and needs its
+    // own copy of this screen.
+    if (opaque.getValue().starts_with("Box<"))
+      return std::nullopt;
     return opaque.getValue().str();
+  }
   if (auto structType = llvm::dyn_cast<emitrust::StructType>(type))
     return structType.getName().str();
   if (llvm::isa<Float32Type>(type))
@@ -425,7 +439,16 @@ CImporter::rustSpellingForElementType(Type type) {
 
 Type CImporter::parseStlElementType(llvm::StringRef spelling) {
   MLIRContext *context = builder.getContext();
-  if (spelling == "String" || spelling.starts_with("Vec<"))
+  // W2.21: EVERY opaque family `rustSpellingForElementType` can produce
+  // must round-trip back to an `OpaqueType` here. Before this wave only
+  // `String`/`Vec<` did; `Option<`, `BTreeMap<` and `BTreeSet<` fell into
+  // the "trusted to be a struct name" tail below and would have come back
+  // as a bogus `!emitrust.struct<"Option<i32>">`. Not reachable as a bug
+  // before (no container ever nested one), but `Box<` would have inherited
+  // it, so the whole set is listed rather than a fourth special case added.
+  if (spelling == "String" || spelling.starts_with("Vec<") ||
+      spelling.starts_with("Option<") || spelling.starts_with("BTreeMap<") ||
+      spelling.starts_with("BTreeSet<") || spelling.starts_with("Box<"))
     return emitrust::OpaqueType::get(context, spelling);
   if (spelling == "bool")
     return builder.getI1Type();
@@ -464,6 +487,20 @@ bool CImporter::isStdArrayRecordType(clang::QualType type) {
   const clang::RecordDecl *decl = record->getDecl();
   return decl->isInStdNamespace() && decl->getIdentifier() &&
          decl->getName() == "array";
+}
+
+/// W2.21: whether `type` is a `std::unique_ptr<T, D>` specialization. The
+/// libstdc++-15 spelling a `auto p = std::make_unique<T>(...)` VarDecl
+/// carries is the alias sugar `__detail::__unique_ptr_t<T>`, so the probe
+/// always goes through the CANONICAL record (whose name is still
+/// "unique_ptr").
+bool CImporter::isStdUniquePtrRecordType(clang::QualType type) {
+  const auto *record = type.getCanonicalType()->getAs<clang::RecordType>();
+  if (!record)
+    return false;
+  const clang::RecordDecl *decl = record->getDecl();
+  return decl->isInStdNamespace() && decl->getIdentifier() &&
+         decl->getName() == "unique_ptr";
 }
 
 bool CImporter::isStdPairRecordType(clang::QualType type) {
@@ -508,7 +545,26 @@ bool CImporter::isStlOpaqueType(Type type) {
                     opaque.getValue().starts_with("Vec<") ||
                     opaque.getValue().starts_with("Option<") ||
                     opaque.getValue().starts_with("BTreeMap<") ||
-                    opaque.getValue().starts_with("BTreeSet<"));
+                    opaque.getValue().starts_with("BTreeSet<") ||
+                    opaque.getValue().starts_with("Box<"));
+}
+
+/// W2.21: whether `type` is the `Box<T>` opaque `std::unique_ptr<T>` maps
+/// to. Split out for the same reason `isStlMapOpaque` was: the family gates
+/// answer differently for a Box (its "methods" are the payload's, reached
+/// through Deref, not a container vocabulary).
+bool CImporter::isStlBoxOpaque(Type type) {
+  auto opaque = llvm::dyn_cast<emitrust::OpaqueType>(type);
+  return opaque && opaque.getValue().starts_with("Box<");
+}
+
+/// W2.21: the mapped payload type of a `Box<T>` opaque, or a null Type if
+/// the spelling fails to round-trip.
+Type CImporter::stlBoxPayloadType(emitrust::OpaqueType boxType) {
+  llvm::StringRef spelling = boxType.getValue();
+  if (!spelling.starts_with("Box<") || !spelling.ends_with(">"))
+    return Type();
+  return parseStlElementType(spelling.substr(4, spelling.size() - 5));
 }
 
 bool CImporter::isStlMapOpaque(Type type) {
@@ -533,6 +589,8 @@ llvm::StringRef CImporter::stlOpaqueDisplayName(emitrust::OpaqueType opaque) {
     return "std::map";
   if (spelling.starts_with("BTreeSet<"))
     return "std::set";
+  if (spelling.starts_with("Box<"))
+    return "std::unique_ptr";
   return "std::";
 }
 
@@ -651,6 +709,29 @@ bool CImporter::isStdLessComparator(clang::QualType comp,
                                   key.getCanonicalType());
 }
 
+/// W2.21: whether `deleter` is exactly `std::default_delete<payload>` —
+/// the DEFAULT deleter, and the only one whose behavior `Box<T>`'s own drop
+/// reproduces. A custom deleter (`std::unique_ptr<int, D>`) keeps the
+/// RecordDecl name "unique_ptr" (AST-confirmed), so the deleter template
+/// argument is the only screen that catches it. Modeled verbatim on
+/// `isStdLessComparator` above.
+bool CImporter::isStdDefaultDeleter(clang::QualType deleter,
+                                    clang::QualType payload) {
+  const auto *record = deleter.getCanonicalType()->getAs<clang::RecordType>();
+  if (!record)
+    return false;
+  const auto *spec =
+      llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record->getDecl());
+  if (!spec || !spec->isInStdNamespace() || !spec->getIdentifier() ||
+      spec->getName() != "default_delete")
+    return false;
+  const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+  return args.size() == 1 &&
+         args[0].getKind() == clang::TemplateArgument::Type &&
+         astContext().hasSameType(args[0].getAsType().getCanonicalType(),
+                                  payload.getCanonicalType());
+}
+
 FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
                                              Location loc) {
   llvm::StringRef name = decl->getName();
@@ -691,6 +772,17 @@ FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
     FailureOr<Type> element = mapType(args[0].getAsType(), loc);
     if (failed(element))
       return failure();
+    // W2.21: std::array maps its element DIRECTLY (no
+    // `rustSpellingForElementType` round-trip), so it needs its own copy of
+    // the container screen — and it additionally dodges the W2.17
+    // destructor gate, because `userDeclaredDestructor` strips CLANG array
+    // types, not `std::array`. Without this, `std::array<std::unique_ptr<T>,
+    // N>` would be the one position that silently admits an unspiked
+    // `[Box<T>; N]`.
+    if (isStlBoxOpaque(*element))
+      return emitError(loc)
+             << "unsupported: std::array<std::unique_ptr<...>, N> element "
+                "type is not in the supported STL element set";
     uint64_t size = args[1].getAsIntegral().getZExtValue();
     if (size == 0)
       return emitError(loc) << "unsupported: zero-length std::array";
@@ -926,6 +1018,76 @@ FailureOr<Type> CImporter::mapStdLibraryType(const clang::RecordDecl *decl,
            << "unsupported: std::basic_string with a non-char character "
               "type";
   }
+  // W2.21: `std::unique_ptr<T>` -> `!emitrust.opaque<"Box<T>">`.
+  //
+  // Box<T>, NOT Option<Box<T>>: both images were measured byte-identical
+  // against clang++ -std=c++17 during the spike, so the choice is cost, not
+  // correctness — and `Option<Box<T>>` forces `(**o.as_ref().unwrap())` at
+  // every dereference a never-null program never needed. This follows
+  // FR-99's precedent verbatim (design.md: "the local stays the bare
+  // struct"): the ALWAYS-INITIALIZED subset is admitted as the bare owned
+  // value and every nullable shape — default construction, `= nullptr`,
+  // `if (p)`, `p == nullptr`, `reset()` — takes a located rejection naming
+  // the real reason (a Rust `Box<T>` cannot be null).
+  //
+  // Four screens, all new code:
+  //  * the ARRAY form `std::unique_ptr<T[]>` (template argument 0 is a
+  //    clang ArrayType; the record name is unchanged) destroys with
+  //    `delete[]` and would need `Box<[T]>`, a different representation,
+  //  * a CUSTOM DELETER (template argument 1 is not `std::default_delete<T>`;
+  //    the record name is unchanged) runs user code at drop that `Box`'s
+  //    own drop does not,
+  //  * a CONST payload has no writable place image, and
+  //  * the PAYLOAD must be a scalar or an imported struct — a nested
+  //    container payload is exactly the unspiked `Box<Vec<...>>` surface
+  //    the container screen in `rustSpellingForElementType` refuses from
+  //    the other direction.
+  if (name == "unique_ptr" && spec) {
+    const clang::TemplateArgumentList &args = spec->getTemplateArgs();
+    if (args.size() < 1 || args[0].getKind() != clang::TemplateArgument::Type)
+      return emitError(loc)
+             << "unsupported: std::unique_ptr shape could not be determined";
+    clang::QualType payload = args[0].getAsType();
+    if (payload->isArrayType())
+      return emitError(loc)
+             << "unsupported: the std::unique_ptr<T[]> array form has no Box "
+                "image (Box<[T]> is a different, unspiked representation)";
+    if (args.size() < 2 || args[1].getKind() != clang::TemplateArgument::Type ||
+        !isStdDefaultDeleter(args[1].getAsType(), payload))
+      return emitError(loc) << "unsupported: std::unique_ptr with a deleter "
+                               "other than std::default_delete";
+    if (payload.isConstQualified())
+      return emitError(loc)
+             << "unsupported: std::unique_ptr payload type '"
+             << payload.getAsString()
+             << "' is not in the supported payload set";
+    FailureOr<Type> mappedPayload = mapType(payload, loc);
+    if (failed(mappedPayload))
+      return failure();
+    std::optional<std::string> spelling =
+        rustSpellingForElementType(*mappedPayload);
+    bool admissible = llvm::isa<IntegerType, FloatType, emitrust::StructType>(
+        *mappedPayload);
+    if (!spelling || !admissible)
+      return emitError(loc)
+             << "unsupported: std::unique_ptr payload type '"
+             << payload.getAsString()
+             << "' is not in the supported payload set";
+    return Type(emitrust::OpaqueType::get(builder.getContext(),
+                                          "Box<" + *spelling + ">"));
+  }
+  // W2.21: the SHARED-ownership smart pointers get their own wording rather
+  // than staying on the generic tail below, because the reason they are out
+  // is a MODEL gap and not a backlog item: `Rc`/`Arc` have different
+  // aliasing rules from `shared_ptr` (interior mutability is required for
+  // any write through them, and `Rc` is not `Send`), and this subset has no
+  // representation for shared ownership at all. `std::weak_ptr` names the
+  // same missing model from the non-owning side.
+  if (name == "shared_ptr" || name == "weak_ptr")
+    return emitError(loc)
+           << "unsupported: std::" << name.str()
+           << " has no Rust image; Rc/Arc have different aliasing and this "
+              "subset has no model for shared ownership";
   // W2.20: the unordered containers are a PERMANENT rejection, not a
   // backlog item, and they get their own wording so the ledger can tell
   // "deliberately, permanently out" from "not done yet": their iteration

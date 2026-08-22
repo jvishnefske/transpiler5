@@ -116,6 +116,18 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   // lifetime, which needs no code.
   if (const auto *constant = llvm::dyn_cast<clang::ConstantExpr>(e))
     return emitRValue(constant->getSubExpr());
+  // W2.21: a std::unique_ptr TEMPORARY (`std::make_unique<T>(a);` as a
+  // statement, `*std::make_unique<T>(a)`, an argument, ...) is wrapped in a
+  // CXXBindTemporaryExpr because the temporary has a destructor. There is
+  // no binding for its Box to live in and therefore no drop point to place,
+  // so the whole shape is out of subset; without this screen it falls to
+  // the generic "unsupported expression: CXXBindTemporaryExpr" tail, which
+  // names the AST node instead of the reason.
+  if (const auto *bindTemp = llvm::dyn_cast<clang::CXXBindTemporaryExpr>(e))
+    if (isStdUniquePtrRecordType(bindTemp->getType()))
+      return emitError(loc)
+             << "unsupported: std::make_unique is only recognized as the "
+                "initializer of a local std::unique_ptr variable";
   if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e))
     return emitRValue(cleanups->getSubExpr());
   // W2.3: a prvalue bound to a by-value/rvalue-reference parameter (e.g.
@@ -762,6 +774,18 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
         .getResult();
   }
   default:
+    // W2.21: `if (p)` / `if (!p)` / `(bool)p` over a std::unique_ptr is a
+    // CK_UserDefinedConversion wrapping the `operator bool` member call, so
+    // the cast rejects before the member dispatch ever names unique_ptr.
+    // The reason is the wave's central boundary, not a missing cast kind.
+    if (cast->getCastKind() == clang::CK_UserDefinedConversion)
+      if (const auto *conversion =
+              llvm::dyn_cast<clang::CXXMemberCallExpr>(sub->IgnoreImpCasts()))
+        if (isStdUniquePtrRecordType(
+                conversion->getImplicitObjectArgument()->getType()))
+          return emitError(loc)
+                 << "unsupported: a Box<T> cannot be null, so testing a "
+                    "std::unique_ptr for emptiness has no image";
     return emitError(loc) << "unsupported cast ("
                           << cast->getCastKindName() << ")";
   }
@@ -2084,6 +2108,21 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
         opCall->getDirectCallee());
     if (opMethod && opMethod->getParent()->isInStdNamespace())
       return emitStlOperatorCall(opCall);
+    // W2.21: `p == nullptr` / `nullptr != p` over a std::unique_ptr
+    // resolve to a FREE ADL `operator==`/`operator!=` in namespace std, so
+    // neither the member dispatch above nor the identifier-named
+    // free-function dispatch below ever sees them (an operator has no
+    // identifier name, so the generic path rejects it as "unsupported
+    // callee" and hides the real reason). A Rust `Box<T>` cannot be null
+    // and the wave admits only the always-initialized subset, so the null
+    // test names exactly that.
+    if (const clang::FunctionDecl *opFn = opCall->getDirectCallee();
+        opFn && opFn->isInStdNamespace())
+      for (const clang::Expr *arg : opCall->arguments())
+        if (isStdUniquePtrRecordType(arg->getType()))
+          return emitError(loc)
+                 << "unsupported: a Box<T> cannot be null, so comparing a "
+                    "std::unique_ptr against nullptr has no image";
     // W2.13: a direct `f(args)` operator() call on a RECOGNIZED lifted
     // lambda local rewrites to `lifted(frozen..., args...)`. Any other
     // lambda call shape (an unregistered local means its declaration
@@ -2141,6 +2180,30 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     if (stdName == "visit")
       return emitError(loc)
              << "unsupported: std::visit is not a recognized STL function";
+    // W2.21: the std::unique_ptr FREE-function vocabulary.
+    //
+    // `std::make_unique` is admitted ONLY as the initializer of a local
+    // std::unique_ptr variable (`emitStlBoxLocalInit`); every other
+    // position — an argument, a return, a bare statement — would need an
+    // owned Box temporary with no binding to drop it at the right point.
+    //
+    // `std::move` is THE unique_ptr idiom and Rust's move semantics match
+    // it exactly, but only in one direction: C++ leaves the moved-from
+    // unique_ptr NULL and testable (`q = std::move(p); if (!p)` is
+    // well-defined and prints something), and Rust cannot read a moved-from
+    // binding at all. Since the wave's Box image has no null state, the
+    // moved-from OBSERVATION has no representation, so the transfer
+    // rejects rather than silently dropping the observable.
+    if (stdName == "make_unique" || stdName == "make_unique_for_overwrite")
+      return emitError(loc)
+             << "unsupported: std::make_unique is only recognized as the "
+                "initializer of a local std::unique_ptr variable";
+    if (stdName == "move" || stdName == "forward")
+      for (const clang::Expr *arg : call->arguments())
+        if (isStdUniquePtrRecordType(arg->getType()))
+          return emitError(loc)
+                 << "unsupported: a moved-from std::unique_ptr is null and "
+                    "testable, but Rust cannot read a moved-from binding";
   }
   // The hosted (definition-less) printf lowering is statement-position
   // only; a project-supplied printf definition is an ordinary imported
@@ -2695,6 +2758,21 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   // unimported method".
   if (method->getParent()->isInStdNamespace())
     return emitStlMemberCall(call);
+  // W2.21: `p->m()` / `(*p).m()` over a recognized std::unique_ptr. The
+  // method belongs to the PAYLOAD class, so the implicit object argument
+  // is the `operator->`/`operator*` call and the generic path below would
+  // hand `emitLValue` an expression with no struct place.
+  //
+  // It lowers to an `emitrust.method_call` DIRECTLY on the Box place
+  // (Rust's auto-deref resolves `p.node_bump(2)` for a `Box<Node>`), NOT
+  // through the payload borrow the field places take. The split is
+  // load-bearing, not cosmetic: the generic path builds the receiver's
+  // `&mut` BEFORE the argument values, so `p->bump(p->get())` through a
+  // borrowed receiver is rustc E0502 (measured in the spike). Arguments
+  // emitted first and bound as ordinary values cannot collide.
+  if (const clang::Expr *boxBase =
+          matchStlBoxDerefBase(call->getImplicitObjectArgument()))
+    return emitStlBoxMethodCall(call, boxBase, loc);
   // W2.18: the implicit object argument of an INHERITED call is wrapped in
   // an implicit derived-to-base conversion, which is NOT a
   // qualification-only adjustment -- it names a different object (the base
@@ -3133,6 +3211,163 @@ CImporter::emitStlMapIndexPlace(Value receiver, emitrust::OpaqueType mapType,
       .getResult();
 }
 
+//===----------------------------------------------------------------------===//
+// W2.21: std::unique_ptr -> Box<T>
+//===----------------------------------------------------------------------===//
+
+llvm::StringRef
+CImporter::matchStlBoxRawPointerCall(const clang::Expr *expr) {
+  const auto *call =
+      llvm::dyn_cast<clang::CXXMemberCallExpr>(expr->IgnoreParenImpCasts());
+  if (!call)
+    return llvm::StringRef();
+  const clang::CXXMethodDecl *method = call->getMethodDecl();
+  if (!method || !method->getParent()->isInStdNamespace() ||
+      !method->getDeclName().isIdentifier())
+    return llvm::StringRef();
+  llvm::StringRef name = method->getName();
+  if (name != "get" && name != "release")
+    return llvm::StringRef();
+  if (!isStdUniquePtrRecordType(
+          call->getImplicitObjectArgument()->getType()))
+    return llvm::StringRef();
+  return name;
+}
+
+const clang::Expr *CImporter::matchStlBoxDerefBase(const clang::Expr *expr) {
+  const auto *opCall =
+      llvm::dyn_cast<clang::CXXOperatorCallExpr>(expr->IgnoreParenImpCasts());
+  if (!opCall || opCall->getNumArgs() != 1)
+    return nullptr;
+  if (opCall->getOperator() != clang::OO_Star &&
+      opCall->getOperator() != clang::OO_Arrow)
+    return nullptr;
+  const auto *method =
+      llvm::dyn_cast_or_null<clang::CXXMethodDecl>(opCall->getDirectCallee());
+  if (!method || !method->getParent()->isInStdNamespace())
+    return nullptr;
+  const clang::Expr *base = opCall->getArg(0)->IgnoreParenImpCasts();
+  if (!isStdUniquePtrRecordType(base->getType()))
+    return nullptr;
+  return base;
+}
+
+bool CImporter::isStlBoxWriteExpr(const clang::Expr *expr) {
+  const clang::Expr *e = expr->IgnoreParens();
+  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e);
+      member && member->isArrow())
+    return matchStlBoxDerefBase(member->getBase()) != nullptr;
+  return matchStlBoxDerefBase(e) != nullptr;
+}
+
+FailureOr<Value> CImporter::emitStlBoxDerefRef(Value receiver,
+                                               emitrust::OpaqueType boxType,
+                                               bool wantMut, Location loc) {
+  // W2.21: the UFCS free-call spelling is deliberate and mirrors
+  // `emitStlMapEntryPlace`: `emitrust.method_call` renders
+  // `place.method(args)` and a Box's `Deref` is a TRAIT method, so
+  // `std::ops::Deref::deref(&p)` is one `emitrust.call_opaque` over one
+  // `emitrust.addr_of`. Rust's own auto-deref would render `*p` directly,
+  // but `emitrust.deref` only accepts a ref/mut_ref operand
+  // (EmitRustOps.td) and `emitrust.member` only a struct lvalue
+  // (EmitRustOps.cpp `MemberOp::verify`), so the borrow is what turns the
+  // opaque into a place either op will take.
+  Type payload = stlBoxPayloadType(boxType);
+  if (!payload)
+    return emitError(loc) << "unsupported: std::unique_ptr payload type";
+  Type refType = wantMut ? Type(emitrust::MutRefType::get(boxType))
+                         : Type(emitrust::RefType::get(boxType));
+  Value borrow = builder
+                     .create<emitrust::AddrOfOp>(loc, refType, receiver,
+                                                 /*is_mut=*/wantMut)
+                     .getResult();
+  Type payloadRef = wantMut ? Type(emitrust::MutRefType::get(payload))
+                            : Type(emitrust::RefType::get(payload));
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{payloadRef},
+          builder.getStringAttr(wantMut ? "std::ops::DerefMut::deref_mut"
+                                        : "std::ops::Deref::deref"),
+          /*args=*/ArrayAttr(), ValueRange{borrow})
+      .getResult(0);
+}
+
+FailureOr<Value> CImporter::emitStlBoxDerefPlace(Value receiver,
+                                                 emitrust::OpaqueType boxType,
+                                                 bool wantMut, Location loc) {
+  FailureOr<Value> borrow =
+      emitStlBoxDerefRef(receiver, boxType, wantMut, loc);
+  if (failed(borrow))
+    return failure();
+  Type payload = stlBoxPayloadType(boxType);
+  return builder
+      .create<emitrust::DerefOp>(loc, emitrust::LValueType::get(payload),
+                                 *borrow)
+      .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitStlBoxMethodCall(const clang::CXXMemberCallExpr *call,
+                                const clang::Expr *boxBase, Location loc) {
+  const clang::CXXMethodDecl *method = call->getMethodDecl();
+  FailureOr<Value> receiver = emitLValue(boxBase);
+  if (failed(receiver))
+    return failure();
+  auto lvalueType =
+      llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+  auto boxType = lvalueType ? llvm::dyn_cast<emitrust::OpaqueType>(
+                                  lvalueType.getValueType())
+                            : emitrust::OpaqueType();
+  if (!boxType || !isStlBoxOpaque(boxType))
+    return emitError(loc)
+           << "unsupported: member call receiver is not a recognized STL "
+              "type";
+  std::string name = cxxMethodMangledName(method);
+  func::FuncOp target = functions.lookup(name);
+  if (!target)
+    return emitError(loc) << "unsupported: call to unimported method '"
+                          << name << "'";
+  FunctionType targetType = target.getFunctionType();
+  if (call->getNumArgs() + 1 != targetType.getNumInputs())
+    return emitError(loc) << "unsupported: call argument count mismatch";
+  // The receiver slot of the imported method must be a plain borrow of the
+  // Box's own payload struct: `p.node_bump(..)` is only the same call as
+  // `Node::node_bump(&mut *p, ..)` when the two agree.
+  Type payload = stlBoxPayloadType(boxType);
+  Type selfInput = targetType.getInput(0);
+  Type selfPointee;
+  if (auto mutRef = llvm::dyn_cast<emitrust::MutRefType>(selfInput))
+    selfPointee = mutRef.getPointee();
+  else if (auto sharedRef = llvm::dyn_cast<emitrust::RefType>(selfInput))
+    selfPointee = sharedRef.getPointee();
+  if (!payload || selfPointee != payload)
+    return emitError(loc)
+           << "unsupported: std::unique_ptr payload does not match the "
+              "method receiver";
+  SmallVector<Value> arguments;
+  for (auto [index, argExpr] : llvm::enumerate(call->arguments())) {
+    Type input = targetType.getInput(index + 1);
+    // A reference PARAMETER would need a second borrow live across the
+    // Box's own auto-deref borrow; out of subset this wave.
+    if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(input))
+      return emitError(loc)
+             << "unsupported: reference argument to a method called through "
+                "a std::unique_ptr";
+    FailureOr<Value> value = emitRValue(argExpr);
+    if (failed(value))
+      return failure();
+    if ((*value).getType() != input)
+      return emitError(loc) << "unsupported: call argument type mismatch";
+    arguments.push_back(*value);
+  }
+  auto callOp = builder.create<emitrust::MethodCallOp>(
+      loc, targetType.getResults(), *receiver, builder.getStringAttr(name),
+      arguments);
+  if (callOp->getNumResults() == 0)
+    return Value();
+  return callOp->getResult(0);
+}
+
 FailureOr<Value>
 CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
@@ -3228,6 +3463,37 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
   bool isVector = typeSpelling.starts_with("Vec<");
   bool isMap = typeSpelling.starts_with("BTreeMap<");
   bool isSet = typeSpelling.starts_with("BTreeSet<");
+
+  // W2.21: a `std::unique_ptr` receiver. The Box image admits NO member
+  // vocabulary of its own this wave — the whole access surface is the
+  // PAYLOAD's, reached through `operator*`/`operator->` — so every method
+  // named here is a located rejection, and the three that would otherwise
+  // be tempting get wordings that name the real blocker instead of the
+  // generic "not recognized" tail:
+  //  * get()/release() hand out a RAW POINTER into the Box. The project's
+  //    pointer model scalarizes a raw `T *` to a local away entirely
+  //    (measured), so there is no value to hand back, and release()
+  //    additionally LEAKS unless the caller captures and frees it.
+  //  * reset() (with or without an argument) and `operator bool` are
+  //    NULLABILITY: a Rust `Box<T>` cannot be null, which is exactly the
+  //    boundary this wave draws (see mapStdLibraryType).
+  if (typeSpelling.starts_with("Box<")) {
+    if (methodName == "get" || methodName == "release")
+      return emitError(loc)
+             << "unsupported: std::unique_ptr::" << methodName
+             << "() hands out a raw pointer to the payload, which has no "
+                "place in this model";
+    if (methodName == "reset")
+      return emitError(loc)
+             << "unsupported: a Box<T> cannot be null, so std::unique_ptr::"
+                "reset() has no image";
+    if (!method->getDeclName().isIdentifier())
+      return emitError(loc)
+             << "unsupported: a Box<T> cannot be null, so testing a "
+                "std::unique_ptr for emptiness has no image";
+    return emitError(loc) << "unsupported: std::unique_ptr::" << methodName
+                          << " is not a recognized STL method";
+  }
 
   // size()/length(): C's declared result type is int/size_t; the real
   // `.len()` returns `usize` (`index`), so the result is cast to whatever
@@ -3682,6 +3948,38 @@ CImporter::emitStlOperatorCall(const clang::CXXOperatorCallExpr *call) {
            << "unsupported: operator call receiver is not a recognized STL "
               "type";
   bool isVector = opaque.getValue().starts_with("Vec<");
+
+  // W2.21: a `std::unique_ptr` receiver. `*p` and `p->` are the WHOLE
+  // admitted operator surface; both resolve to the payload through the
+  // Deref borrow, and `p->x` hands the BORROW back (not a place) because
+  // `emitMemberBasePlace`'s arrow branch expects a ref/mut_ref and builds
+  // the `emitrust.deref` itself, exactly as it does for a `&mut S`
+  // parameter. Assignment and equality are the NULLABILITY / MOVE
+  // boundaries and name themselves.
+  if (isStlBoxOpaque(opaque)) {
+    if (call->getOperator() == clang::OO_Star) {
+      FailureOr<Value> place =
+          emitStlBoxDerefPlace(*receiver, opaque, stlBoxWriteContext, loc);
+      if (failed(place))
+        return failure();
+      return loadPlace(loc, *place);
+    }
+    if (call->getOperator() == clang::OO_Arrow)
+      return emitStlBoxDerefRef(*receiver, opaque, stlBoxWriteContext, loc);
+    if (call->getOperator() == clang::OO_Equal && call->getNumArgs() == 2) {
+      const clang::Expr *rhs = call->getArg(1)->IgnoreParenImpCasts();
+      if (isStdUniquePtrRecordType(rhs->getType()))
+        return emitError(loc)
+               << "unsupported: a moved-from std::unique_ptr is null and "
+                  "testable, but Rust cannot read a moved-from binding";
+      return emitError(loc)
+             << "unsupported: a Box<T> cannot be null, so assigning nullptr "
+                "to a std::unique_ptr has no image";
+    }
+    return emitError(loc) << "unsupported: std::unique_ptr::operator"
+                          << clang::getOperatorSpelling(call->getOperator())
+                          << " is not a recognized STL method";
+  }
 
   switch (call->getOperator()) {
   case clang::OO_Subscript: {

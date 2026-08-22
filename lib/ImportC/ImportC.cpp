@@ -5602,6 +5602,28 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
   // in ExprWithCleanups (C99-13); nothing to emit for the "cleanup".
   if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e))
     return emitLValue(cleanups->getSubExpr(), writeback);
+  // W2.21: the place of a std::unique_ptr TEMPORARY (`*std::make_unique<T>
+  // (a)`). Same reason as the rvalue screen in `emitRValue`: no binding
+  // exists to own the Box, so there is no drop point for it.
+  if (const auto *bindTemp = llvm::dyn_cast<clang::CXXBindTemporaryExpr>(e))
+    if (isStdUniquePtrRecordType(bindTemp->getType()))
+      return emitError(loc)
+             << "unsupported: std::make_unique is only recognized as the "
+                "initializer of a local std::unique_ptr variable";
+  // W2.21: `*std::move(p)`. `std::move` yields an XVALUE CallExpr, which
+  // has no place, so it reaches here and would report the AST node class
+  // ("unsupported assignable expression: CallExpr") instead of the
+  // ownership-transfer boundary. Mirrors the `emitCall` interception.
+  if (const auto *stdCall = llvm::dyn_cast<clang::CallExpr>(e))
+    if (const clang::FunctionDecl *callee = stdCall->getDirectCallee();
+        callee && callee->isInStdNamespace() &&
+        callee->getDeclName().isIdentifier() &&
+        (callee->getName() == "move" || callee->getName() == "forward"))
+      for (const clang::Expr *arg : stdCall->arguments())
+        if (isStdUniquePtrRecordType(arg->getType()))
+          return emitError(loc)
+                 << "unsupported: a moved-from std::unique_ptr is null and "
+                    "testable, but Rust cannot read a moved-from binding";
   if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e))
     return emitDeclRefLValue(ref, loc, writeback);
   if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e))
@@ -5634,6 +5656,32 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
   // spellings stay indistinguishable downstream.
   if (llvm::isa<clang::CXXThisExpr>(e))
     return emitCxxThisPlace(loc);
+  // W2.21: `*p` over a recognized `std::unique_ptr` is a genuine C++ place
+  // (`operator*` returns `T&`), so a scalar value read (`int a = *n;`)
+  // wraps it in a `CK_LValueToRValue` cast whose `emitCast` case calls
+  // `emitLValue` here, and `*n += 1` reaches here as the compound
+  // assignment's LHS. The payload place is the `Deref` borrow refined by an
+  // `emitrust.deref`; the three WRITE positions set `stlBoxWriteContext` so
+  // the borrow is `DerefMut` instead (two live `&mut` borrows of one Box in
+  // one expression is rustc E0499, so reads must stay shared).
+  if (const auto *opCall = llvm::dyn_cast<clang::CXXOperatorCallExpr>(e);
+      opCall && opCall->getOperator() == clang::OO_Star)
+    if (const clang::Expr *boxBase = matchStlBoxDerefBase(e)) {
+      FailureOr<Value> receiver = emitLValue(boxBase);
+      if (failed(receiver))
+        return failure();
+      auto lvalueType =
+          llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+      auto boxType = lvalueType ? llvm::dyn_cast<emitrust::OpaqueType>(
+                                      lvalueType.getValueType())
+                                : emitrust::OpaqueType();
+      if (!boxType || !isStlBoxOpaque(boxType))
+        return emitError(loc)
+               << "unsupported: operator* receiver is not a recognized STL "
+                  "type";
+      return emitStlBoxDerefPlace(*receiver, boxType, stlBoxWriteContext,
+                                  loc);
+    }
   // W2.3: `v[i]` / `v.at(i)` over a recognized `std::vector<T>` receiver
   // both return `T&` in real C++ — a genuine place — so a plain scalar VALUE
   // read (`int x = v[i];`) wraps the call in an implicit `CK_LValueToRValue`
@@ -6121,7 +6169,16 @@ CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
     if (failed(staged))
       return failure();
     basePlace = *staged;
-  } else if (member->isArrow() && isDecomposedPointerExpr(member->getBase())) {
+  } else if (member->isArrow() &&
+             isDecomposedPointerExpr(member->getBase()) &&
+             // W2.21: `p->field` over a recognized std::unique_ptr. The `->`
+             // operator call's own TYPE is `T *`, so
+             // `isDecomposedPointerExpr` claims it for the C pointer
+             // decomposition (measured: "unsupported pointer expression:
+             // CXXOperatorCallExpr"). It is not a C pointer at all — the
+             // generic arrow branch below emits the Deref/DerefMut borrow
+             // and refines it into the payload struct place.
+             !matchStlBoxDerefBase(member->getBase())) {
     // `p->f` through a decomposed pointer: resolve the pointer to its
     // place (the base object itself, or an element of the base array)
     // and refine it with the member access below.

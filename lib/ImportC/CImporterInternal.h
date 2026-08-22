@@ -2951,6 +2951,86 @@ private:
   static bool isStlMapOpaque(Type type);
   static bool isStlSetOpaque(Type type);
 
+  /// W2.21: whether `type` is the `Box<T>` opaque `std::unique_ptr<T>`
+  /// maps to.
+  static bool isStlBoxOpaque(Type type);
+
+  /// W2.21: the mapped payload type of a `Box<T>` opaque, or a null Type
+  /// if the spelling fails to round-trip.
+  Type stlBoxPayloadType(emitrust::OpaqueType boxType);
+
+  /// W2.21: whether `deleter` is exactly `std::default_delete<payload>`.
+  /// A custom deleter keeps the RecordDecl name "unique_ptr", so this is
+  /// the only screen that catches it (`isStdLessComparator`'s model).
+  bool isStdDefaultDeleter(clang::QualType deleter, clang::QualType payload);
+
+  /// W2.21: whether `type` is a `std::unique_ptr<T, D>` specialization,
+  /// probed through the CANONICAL record (libstdc++ 15 spells the
+  /// make_unique result type with the alias sugar
+  /// `__detail::__unique_ptr_t<T>`).
+  bool isStdUniquePtrRecordType(clang::QualType type);
+
+  /// W2.21: the name of the `get`/`release` member call on a recognized
+  /// std::unique_ptr that `expr` is, or an empty StringRef. Both hand out a
+  /// RAW POINTER into the Box, which this model has no representation for
+  /// (a raw `T *` local is scalarized away entirely); release() would
+  /// additionally leak. Consulted at the pointer-local declaration too,
+  /// because the pointer planner claims `int *q = p.get();` before
+  /// `emitStlMemberCall` ever runs.
+  llvm::StringRef matchStlBoxRawPointerCall(const clang::Expr *expr);
+
+  /// W2.21: the `p` sub-expression of a `*p` / `p->x` spelling whose
+  /// receiver is a `std::unique_ptr`, or null when `expr` is not one. A
+  /// purely AST-side probe (no IR is emitted), so every caller can consult
+  /// it before deciding which lowering to take.
+  const clang::Expr *matchStlBoxDerefBase(const clang::Expr *expr);
+
+  /// W2.21: a `&Box<T>` / `&mut Box<T>` borrow forwarded through
+  /// `Deref::deref` / `DerefMut::deref_mut`, yielding a reference to the
+  /// PAYLOAD. The UFCS free-call spelling is `emitStlMapEntryPlace`'s
+  /// verbatim: a trait method on an opaque receiver is not expressible as
+  /// an `emitrust.method_call`.
+  FailureOr<Value> emitStlBoxDerefRef(Value receiver,
+                                      emitrust::OpaqueType boxType,
+                                      bool wantMut, Location loc);
+
+  /// W2.21: the payload PLACE of a recognized `std::unique_ptr` — the
+  /// borrow above refined by an `emitrust.deref`. `*p` and `p->field` both
+  /// resolve here. Reads take the SHARED borrow and writes the mutable one
+  /// (`stlBoxWriteContext`): two live `&mut` borrows of one Box in a single
+  /// expression is rustc E0499, and a read chain is genuinely shared.
+  FailureOr<Value> emitStlBoxDerefPlace(Value receiver,
+                                        emitrust::OpaqueType boxType,
+                                        bool wantMut, Location loc);
+
+  /// W2.21: whether the place `expr` designates is rooted in a recognized
+  /// `std::unique_ptr` dereference (`*p` or `p->field`). The three WRITE
+  /// positions consult it to (a) take the mutable borrow and (b) evaluate
+  /// the right-hand side FIRST, exactly as W2.20's map places must.
+  bool isStlBoxWriteExpr(const clang::Expr *expr);
+
+  /// W2.21: set while the LHS place of an assignment / compound assignment
+  /// / ++ / -- is being emitted, so a Box payload place takes
+  /// `DerefMut::deref_mut` instead of `Deref::deref`.
+  bool stlBoxWriteContext = false;
+
+  /// W2.21: imports `p->m(args)` / `(*p).m(args)` over a recognized
+  /// std::unique_ptr as an `emitrust.method_call` on the Box place itself
+  /// (Rust auto-deref), rather than through the payload borrow the FIELD
+  /// places take. `boxBase` is the `p` sub-expression.
+  FailureOr<Value> emitStlBoxMethodCall(const clang::CXXMemberCallExpr *call,
+                                        const clang::Expr *boxBase,
+                                        Location loc);
+
+  /// W2.21: imports `auto p = std::make_unique<T>(args);` into the
+  /// already-created Box place. A scalar payload is one `Box::new(v)`; a
+  /// struct payload is the W2.17 two-step `Box::new(T::default())` followed
+  /// by the constructor run as an ordinary `&mut self` method on the Box
+  /// place (Rust auto-deref). Every other initializer shape is a located
+  /// rejection.
+  LogicalResult emitStlBoxLocalInit(Value place, emitrust::OpaqueType boxType,
+                                    const clang::Expr *init, Location loc);
+
   /// W2.20: the C++ spelling of a recognized STL opaque family, for
   /// diagnostics. Before this wave the non-`Vec<` fall-through in the
   /// subscript and at() paths hardcoded "std::string", which becomes
@@ -3103,6 +3183,7 @@ private:
   /// struct-wrapper peel — since the mapped type alone is
   /// indistinguishable from a C array's.
   bool isStdArrayRecordType(clang::QualType type);
+
 
   /// W2.8: whether `type` is a `std::pair<T1, T2>` specialization (which
   /// imports as a synthesized real struct; see mapStdLibraryType's pair

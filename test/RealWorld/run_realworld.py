@@ -407,6 +407,30 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("iterators are only recognized in the find(k) != end() idiom", "stl-map-iterator"),
     ("is a read-only place", "stl-map-at-write"),
     ("requires a structured binding", "stl-map-ranged-for"),
+    # W2.21 std::unique_ptr frontier; mirrors
+    # lib/ImportC/RejectionLedger.cpp. Every row sits BEFORE the three
+    # generic STL rows below so first-match keeps them distinguishable.
+    # stl-shared-ptr is a PERMANENT rejection (Rc/Arc have different
+    # aliasing and the subset has no shared-ownership model);
+    # stl-unique-ptr-nullable is THE wave boundary (a bare Box<T> cannot be
+    # null), and its count is the ranking signal for a later
+    # Option<Box<T>> wave.
+    ("the std::unique_ptr<T[]> array form", "stl-unique-ptr-array-form"),
+    ("with a deleter other than std::default_delete", "stl-unique-ptr-deleter"),
+    ("is not in the supported payload set", "stl-unique-ptr-payload-type"),
+    ("std::unique_ptr payload does not match", "stl-unique-ptr-payload-type"),
+    ("no model for shared ownership", "stl-shared-ptr"),
+    ("a Box<T> cannot be null", "stl-unique-ptr-nullable"),
+    ("moved-from std::unique_ptr", "stl-unique-ptr-move"),
+    ("hands out a raw pointer to the payload", "stl-unique-ptr-raw-pointer"),
+    ("std::make_unique is only recognized as the initializer", "stl-make-unique-position"),
+    ("std::make_unique argument type does not match", "stl-make-unique-argument"),
+    ("this std::unique_ptr initializer shape", "stl-unique-ptr-construct"),
+    ("std::unique_ptr shape could not be determined", "stl-unique-ptr-construct"),
+    ("std::make_unique of a class with in-class member initializers", "stl-unique-ptr-construct"),
+    ("std::make_unique constructor", "stl-unique-ptr-construct"),
+    ("called through a std::unique_ptr", "stl-unique-ptr-ref-argument"),
+    ("called through std::make_unique", "stl-unique-ptr-ref-argument"),
     ("is not a recognized STL type", "stl-unrecognized-type"),
     ("is not a recognized STL method", "stl-unrecognized-method"),
     ("receiver is not a recognized STL", "stl-unrecognized-receiver"),
