@@ -196,6 +196,14 @@ imported printf calls become Rust print macro invocations.
 
 ## MVP Functional Requirements
 
+> **Queue index.** The open items below (and in every later FR/wave
+> section) are indexed in `docs/plans/backlog.toml` with status, rank and
+> dependency edges; query with `python3 docs/plans/plan.py next|brief|json`.
+> design.md remains the authoritative evidence ledger — the index carries
+> no rationale, only ordering — and `plan.py check` (run by the fast lit
+> tier) fails the gate if the two drift.
+
+
 Every FR below is an implementation detail of one of the product epics
 (see "Product" above); the epic carries the product intent, the FR
 carries the verification. Check a box only when the referenced
@@ -7255,6 +7263,46 @@ piece and becomes FR-45.
   test/EndToEnd/cpp-rejected-class-no-trace.cpp,
   cpp-conversion-function.cpp; test/Project/coloring-cpp-class-gates.cpp)
 
+- [ ] FR-113 DEFECT: a rejected scoped enum still emits a cast to
+  itself and the VERIFIER destroys the whole crate -- `--incremental`
+  yields no crate at all, AFTER full recovery. All 8 spdlog units in
+  the external corpus die identically. Four-line repro:
+  `enum class PT : unsigned char { none, dec, hex };` plus a struct
+  holding a `PT` and a function doing `s.type = static_cast<PT>(t);`
+  gives `warning: unsupported: scoped enumeration` and then
+  `error: 'emitrust.cast' op cast to enum type '!emitrust.enum<"Pt">'
+  requires a visible emitrust.enum_def`. This is the "recovery stops
+  at the import boundary" successor to FR-53 that this file already
+  names as the leading recovery blocker, now with a minimal repro.
+  **NOT SPIKED.**
+
+- [ ] FR-114 DEFECT: same-arity overloaded CONSTRUCTORS and FREE
+  functions collide in the emitted symbol, and the diagnostic blames
+  the wrong thing. `S(double,double)` and `S(const S&, const S&)` both
+  mangle to `s_new_xx` and give `unsupported: conflicting definition
+  of 's_new_xx' (already defined in another translation unit)` -- in a
+  SINGLE TU. The class is then rejected and cascades; this is what
+  kills `interval` in raytracing.github.io. Free functions too:
+  `int g(int)` beside `int g(double)` gives the same wrong wording
+  PLUS a spurious `call argument type mismatch` at the call site.
+  Overloaded MEMBER functions are fine, because they route through
+  `cxxMethodMangledName`; constructors and free functions do not.
+  Note W2.23's spike found the same root from the other side: the
+  fallback overload code `x` cannot distinguish `T(const T&)` from
+  `T(const U&)`. **NOT SPIKED.**
+
+- [ ] FR-115 DEFECT: a rejected C++ record never says WHY. `struct 'X'
+  was rejected` is raised at every use site while X's own item carries
+  `blocker: ""`, `diagnostic: ""`. Corpus-wide, 6193 of 8851 graph
+  items (70%) are status `missing` with NO diagnostic at all -- 2835
+  records, 1110 globals, 701 functions after dedup. FR-42's "rejection
+  is a feature, with LOCATED diagnostics" contract holds for what
+  recovery REPORTS, but on the C++ path the MAJORITY of unported items
+  are silent: rooting the Track 5 cascade required a second
+  `--emit=coloring` run plus hand-built repros. This is a
+  measurability defect, and it is why the ranked table below needed
+  two tools instead of one. **NOT SPIKED.**
+
 - [ ] FR-119 DEFECT (found by FR-117/118's gate, pre-existing, ZERO
   oracle coverage): a free NON-MEMBER `operator` declaration escapes
   every backstop and emits a syntactically invalid crate, silently.
@@ -7273,6 +7321,16 @@ piece and becomes FR-45.
   commit: the fix is a symbol-spelling change for non-identifier
   `DeclarationName`s and therefore has byte-identity consequences
   through CSymbolNaming. **SPIKED by measurement.**
+
+- [ ] FR-120 Struct-pointer prerequisite: method calls and
+  base-subobject bindings through struct pointers. This is the
+  PREREQUISITE FR named by W2.19's NO-GO verdict, given its own number
+  so it can be sequenced and tracked; the four measured items and all
+  evidence live in the W2.19 entry (the small `emitCXXMemberCall`
+  routing item, the LARGE base-subobject binding-kind item in
+  `PointerRegion`, the `peelPointerCast` `CK_DerivedToBase` case, and
+  the ItemColoring screen re-sync). W2.19b and W2.19c are blocked on
+  it; W2.19a is not. **SPIKED (as part of W2.19's spike).**
 
 - [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
   the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and
@@ -12494,6 +12552,10 @@ fully-qualified UFCS everywhere and a hand-rolled counted loop -- and
 default clippy has no lint for either, so **the metric has a blind spot
 and must not be the sole quality oracle**. And the biggest idiomaticity
 gap in emitted C++, FR-110, is invisible to it entirely.
+
+One tooling follow-up: the harness should freeze **epoch 4** over the
+union corpus -- epoch-3 froze 144 EndToEnd `.c` files, there are now
+167, and the 52 measurable C++ crates are covered by no epoch at all.
 
 
 ## Track 4 RealWorld corpus (demand signal)
