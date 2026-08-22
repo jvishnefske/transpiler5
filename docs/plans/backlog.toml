@@ -80,10 +80,10 @@ anchor = "FR-113 DEFECT"
 id = "FR-114"
 rank = 3
 kind = "defect"
-status = "open"
+status = "spiked"
 size = "M"
-title = "Same-arity ctor/free-fn overloads collide with a wrong diagnostic"
-summary = "s_new_xx collision blames 'another translation unit' in a single TU; kills raytracing's interval. Same root as W2.23's overload-code finding."
+title = "Overload collisions: widen the x-fallback, suffix free fns, honest wording"
+summary = "GO, zero golden churn: frozen W2.2 codes stay, x-fallback delegates to W2.15's table with an r-reference arm, free fns get the per-param suffix inside cFunctionSymbolName (item graph agrees by construction). Raytracing +2; interval exposes a 4-gate stack."
 blocked_by = []
 anchor = "FR-114 DEFECT"
 

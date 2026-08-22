@@ -7390,18 +7390,63 @@ piece and becomes FR-45.
 
 - [ ] FR-114 DEFECT: same-arity overloaded CONSTRUCTORS and FREE
   functions collide in the emitted symbol, and the diagnostic blames
-  the wrong thing. `S(double,double)` and `S(const S&, const S&)` both
-  mangle to `s_new_xx` and give `unsupported: conflicting definition
-  of 's_new_xx' (already defined in another translation unit)` -- in a
-  SINGLE TU. The class is then rejected and cascades; this is what
-  kills `interval` in raytracing.github.io. Free functions too:
-  `int g(int)` beside `int g(double)` gives the same wrong wording
-  PLUS a spurious `call argument type mismatch` at the call site.
-  Overloaded MEMBER functions are fine, because they route through
-  `cxxMethodMangledName`; constructors and free functions do not.
-  Note W2.23's spike found the same root from the other side: the
-  fallback overload code `x` cannot distinguish `T(const T&)` from
-  `T(const U&)`. **NOT SPIKED.**
+  the wrong thing. Spike verdict **GO** (2026-08-22), fix shape (b) --
+  the zero-golden-churn one, measured against the alternatives:
+  keep the byte-frozen W2.2 codes (`b`, `i`) and widen ONLY the
+  `x`-fallback (plus an enum carve-out) by delegating to W2.15's
+  `templateArgTypeCode`, with an `r`-prefixed reference arm; give FREE
+  functions the W2.15-style `_<code>`-per-param suffix INSIDE
+  `cFunctionSymbolName` (so the FR-40 item graph and the FR-41 probe
+  compute the identical suffix BY CONSTRUCTION -- confirmed
+  empirically, raytracing's progress JSON grew a `random_double_d_d`
+  node); and replace the cross-TU wording with an honest overload-set
+  wording for same-TU collisions
+  (`C++ overload set for 'h' maps two overloads onto one emitted
+  symbol 'm_h_i' ...`), discriminated by `DeclContext::lookup`, no
+  TU-tracking needed. Option (a), wholesale switch to the wide table,
+  would move exactly 2 pinned files for no benefit; option (b) moves
+  ZERO -- full suite green under the spike patch with no golden byte
+  shifted.
+  COLLISION-SPACE MAP, all measured: double/float, `P*`/`Q*`,
+  `const P&`/`const Q&`, and the motivating
+  `S(double,double)`/`S(const S&,const S&)` pair all disambiguate and
+  byte-diff clean (`S_new_dd`/`S_new_rsrs`). STILL COLLIDING BY
+  DESIGN, now with the honest wording: same-integer-class pairs
+  (int/long, int/unsigned -- the `i` code is frozen by W2.2 CHECK
+  pins), and two fn-pointer/closure params (both `x` under the wide
+  table too). The free-fn spurious `call argument type mismatch` --
+  which was STUBBING c_main under --incremental -- dies with the fix.
+  RAYTRACING ORACLE (pinned 0ab7db4): collision gone, +2 ported
+  (random_double_d_d, and random_int un-stubbed). `interval` itself
+  STILL DROPS -- the naming fix removes gate 1 of ~4 and exposes the
+  stack honestly: interval.h:23 `unsupported assignable expression:
+  ConditionalOperator` (pre-existing, FR-worthy alone), behind it
+  `constructor in value position` (the W2.23 `return T(args)` item),
+  and predicted behind those the static-const members and the free
+  `operator+` pair (FR-119 territory). The FR-113/spdlog stacked-gate
+  pattern, third instance.
+  TWO PRE-EXISTING GAPS PROVED INDEPENDENT of naming (unpatched-tool
+  probes): a struct lvalue passed to a `const T&` CONSTRUCTOR
+  parameter fails where the method-call path already inserts
+  `addr_of` (small mirror fix, separate increment); and an
+  enum-argument method call (`m.h(A)`) fails on an argument-type
+  mismatch with no overloading involved -- possibly unfiled, worth
+  its own FR.
+  CONSTRAINTS for the implementer: member codes concatenate WITHOUT
+  separators, so multi-char record codes can alias across different
+  overloads (`h(a,bi)` vs `h(ab,i)` -> both `_abi`) -- not silent,
+  lands in the collision guard, but adopt per-arg separators or
+  document the guard as backstop; the `!isDefinition -> success` path
+  can silently merge prototype-only overloads whose suffix AND MLIR
+  signature both coincide (rare; the cross-TU "referenced but not
+  defined" failure catches realistic cases loudly -- extend the guard
+  or record the acceptance); ItemColoring has no screen for
+  still-colliding sets (false GREEN, the tolerated direction; a
+  duplicate-suffix screen is AST-pure and cheap if wanted); zero-param
+  overloads keep the bare name on both paths; and the `r`-prefixed
+  record codes resolve W2.23's noted `T(const T&)`/`T(const U&)`
+  hazard for free once copy ctors are admitted.
+  **SPIKED.**
 
 - [ ] FR-115 DEFECT: a rejected C++ record never says WHY. `struct 'X'
   was rejected` is raised at every use site while X's own item carries
