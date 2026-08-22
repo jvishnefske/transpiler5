@@ -7130,80 +7130,149 @@ piece and becomes FR-45.
   golden byte (the spike patch was env-gated, so untested in the on
   state against goldens).
 
-- [ ] FR-117 DEFECT (found by FR-112's spike, and it is LIVE TODAY on
-  unpatched HEAD, independent of any containment work):
-  `cxxMethodBaseName` (ImportCFunctions.cpp:57) falls through to
-  `mangleMemberName(method->getName())` for a DeclarationName that is
-  NOT an identifier. Conversion functions bypass the W2.2 member-shape
-  gate entirely, because `isOverloadedOperator()` is FALSE for a
-  `CXXConversionDecl`. Measured: `struct C { int v; operator int()
-  const {...} };` emits `pub fn c_(&self)` -- an EMPTY method name --
-  and two conversion functions in one class give
-  `unsupported: conflicting definition of 'c_'`. The fix is to reject
-  or omit a non-identifier DeclarationName explicitly; conversion
-  functions are the natural first entry on FR-112's omission list,
-  since every use of one is ALREADY a `UserDefinedConversion`
-  rejection and importing one emits uncallable dead code. Must land
-  BEFORE FR-112, which widens the blast radius: the overload-count
-  loop walks every method of the class, so one operator-carrying class
-  drags all its siblings through this path. **SPIKED by measurement.**
+- [x] FR-117 DEFECT: `cxxMethodBaseName` called `getName()` on a
+  non-identifier `DeclarationName`. Spike verdict
+  **GO-WITH-CONSTRAINTS** (2026-08-21). CONFIRMED NOT A MISCOMPILE,
+  by adversarial sweep rather than assumption: all 14
+  implicit-conversion contexts (if, `?:`, arithmetic, return, argument,
+  switch, while, `!`, `&&`, `==`, init-list, assign, unary minus,
+  subscript) give located rejections -- 13 x
+  `unsupported cast (UserDefinedConversion)` plus one InitListExpr --
+  and all 6 union-operator contexts give located `unsupported callee`,
+  INCLUDING a user-defined union `operator=`, the one silent-bitwise-copy
+  channel worth fearing, which yields `unimplemented!()` rather than a
+  copy. Every survivor is a loud stub.
+  THE SCOPE WAS BROADER THAN THIS ENTRY STATED, measured by
+  instrumenting the call site: THREE DeclarationName kinds reach
+  `getName()`, and `CXXDestructorName` has **13 hits in the SHIPPING
+  test/EndToEnd/cpp-destructor.cpp** (`~Box` x4, `~Guard` x2,
+  `~Manual` x2, `~Outl` x3, `~R` x2). The in-code comment claiming
+  otherwise was factually wrong, and W2.17's destructors have relied on
+  the assert being off since they shipped. Latent only in this
+  configuration -- LLVM is built assertions-OFF and meson uses
+  `b_ndebug=if-release` -- but `getName()` is a HEADER inline, so it
+  uses OUR NDEBUG: an `emitrust` debug build fires it on the existing
+  destructor path.
+  THE UNION BYPASS IS BROADER THAN CONVERSION FUNCTIONS: a union takes
+  the `collectUnionSlot` branch, so the W2.2 member-shape gate never
+  runs at all. Measured: a struct `operator+` rejects, while a union
+  `operator+` imported as `func @U_`.
+  Landed: `cxxMethodBaseName` returns an empty string for a
+  non-identifier name and the overload-count loop skips those;
+  `isImportable` OMITS them (FR-112's disposition, taken now because
+  every use is already a located rejection and importing one emits
+  uncallable dead code); `importFunction` refuses a non-identifier
+  `CXXMethodDecl`; `cName` no longer calls `getName()` on a
+  non-identifier, which closes the latent assert on the live destructor
+  path; the union branch now raises `unsupported: overloaded operator`;
+  and the member-call path rejects before mangling so the diagnostic no
+  longer LEAKS the empty base name `'C_'`.
+  ONE MEASURED REGRESSION, accepted: the explicit spelling
+  `c.operator int()` degrades from working code to
+  `unsupported: conversion function`. No test relied on it. This also
+  FALSIFIES a claim in FR-112's spike -- that a conversion function
+  hits `UserDefinedConversion` on every implicit AND explicit use; the
+  explicit spelling is a member call, not a cast.
+  A two-conversion-function class now imports in STRICT mode (it was
+  `conflicting definition of 'C_'`) and byte-diffs clean.
 
-- [ ] FR-118 DEFECT (found by FR-112's spike): W2.2's "a rejected
-  class never half-imports" invariant IS ALREADY VIOLATED on unpatched
-  HEAD. `importCXXMethods` runs AFTER the `StructDefOp` is created and
-  after `structSymbolName` assigns the name, and NEITHER IS UNDONE
-  when it fails. Measured: a class whose method body fails to import
-  emits `pub struct C { pub v: i32 }` into the crate while the record
-  is marked rejected and all three of its using functions cascade.
-  Also observed in a real artifact -- tinyxml2's `StrPair` reaches the
-  copy/move gate, is put in `rejectedRecords`, yet the emitted crate
-  contains its `struct_def`, an `impl Drop` and three methods, while a
-  user still reports "struct 'NsTinyxml2StrPair' was rejected".
-  Fix: move the copy/move/delegating-constructor check into
-  `collectRecordFields` alongside the other class-level gates, and
-  audit `importCXXMethods` so nothing left in it can fail the record.
-  This is FR-112's constraint C3 and is worth doing on its own.
-  **SPIKED by measurement.**
+- [x] FR-118 DEFECT: W2.2's "a rejected class never half-imports"
+  invariant was violated. Spike verdict **GO-WITH-CONSTRAINTS**
+  (2026-08-21), and the two corrections below matter more than the fix.
+  **CORRECTION 1: THIS IS A SILENT MISCOMPILE, not dead weight.** This
+  entry, and my briefing of it, said "not believed to be a silent
+  miscompile"; the spike checked instead of assuming and found
+  otherwise. Byte-diff on clean HEAD, two TUs under `--recover`: the
+  only diagnostic is
+  `warning: unsupported: copy/move/delegating constructor (recovered:
+  item dropped)`, clang++ prints `use 1`, and the emitted crate prints
+  `use 1` PLUS `dtor C 1`. MECHANISM: TU a's rejected class leaves its
+  `struct_def` (carrying `emitrust.has_drop`) in the module; TU b's
+  unrelated POD `struct c` idiomatic-renames to `C`, the shapes match,
+  the two MERGE, and the POD INHERITS THE REJECTED CLASS'S `Drop`. The
+  crate runs a destructor clang++ never runs, with no diagnostic. That
+  violates the FR-42 recovery contract directly.
+  **CORRECTION 2: THE FIX THIS ENTRY PROPOSED IS INSUFFICIENT.** It
+  said "move the copy/move check into `collectRecordFields` and audit
+  `importCXXMethods` so nothing left in it can fail the record."
+  Measured: swapping the copy constructor for a failing method BODY
+  reproduces a BYTE-IDENTICAL miscompile. `importFunction` imports an
+  arbitrary body and can fail on any unsupported construct, so NO
+  FINITE CLASS-LEVEL PREDICATE HOISTS IT and the audit is not
+  achievable. Hoisting alone leaves the miscompile intact.
+  WHAT SHIPPED IS THE UNDO: on the `importCXXMethods` failure path,
+  erase the class's method `func::FuncOp`s by mangled name, reset
+  per-function state, erase the `struct_def`, and erase all eight
+  naming/shape caches (`importedRecordShapes`, `emittedStructNames`,
+  `structDefRecords`, `structNameOwnerTuTags`, `assignedStructNames`,
+  `localRecordNames`, `anonRecordNames`, `anonRecordShapeNames`),
+  deliberately KEEPING `importedRecords` so `rejectedRecords` still
+  drives the cascade.
+  A BONUS FIX FELL OUT: a class that fails a gate no longer CLAIMS the
+  emitted name, so an importable sibling `struct c` that used to be
+  dropped as a `record-name-clash` (two items lost) now imports.
+  TWO ANCHOR-SHEET PREDICTIONS CORRECTED. The predicted corrupted-symbol
+  hazard from erasing `assignedStructNames` does NOT materialize -- it
+  lands on the existing `unsupported: method of an unimported class`
+  gate, whose comment "Defensive; the class was already imported"
+  becomes LOAD-BEARING. And the tinyxml2 `StrPair` artifact this entry
+  cited does NOT reproduce on unpatched HEAD: `StrPair` fails at the
+  CLASS level and never half-imports. That observation came from an
+  FR-112-patched build; `XMLUtil` is the real HEAD instance.
+  MEASURED COST, AND IT IS SUITE-INVISIBLE: tinyxml2's emitted crate
+  goes 260 -> 84 lines, because `XMLUtil` -- its largest imported class,
+  which fails on a returned-pointer SIGNATURE inside
+  `importCXXMethods` -- is now dropped whole along with the runtime
+  helpers it pulled in. The ledger goes 227 -> 229 and cascaded methods
+  180 -> 198. This is the correct trade (a smaller crate that is right
+  beats a larger one that runs a destructor it must not), and it is
+  exactly the front FR-112 exists to reclaim.
+  THE CONTAINMENT ALTERNATIVE WAS MEASURED AND REJECTED FOR THIS WAVE:
+  dropping a failing method body under recovery restores the full
+  260-line tinyxml2 crate, but on the body-fail probe yields
+  `error: empty block: expect at least a terminator` and the TU emits
+  NO crate at all. That is FR-112's constraint C2 (the fixpoint
+  requirement) live -- containment is not a cheap add-on here.
+  SCREEN-VS-IMPORTER DIVERGENCE, both directions, pre-existing, closed
+  in the same change -- and explicitly NOT the FR-116 plan-vs-IR kind,
+  since neither FR touches a planner or IR the FR-41 probe is blind to.
+  FALSE GREEN: a copy-constructor class screened `admissible` while the
+  importer rejects it (`probeRecord` had no copy/move/delegating
+  screen). FALSE RED: a union with an `operator+` screened Red while
+  the importer ADMITTED it -- the direction `ItemColoring.h` says it
+  may not get wrong. `ItemGraph.cpp` needed no change, confirmed.
+  Three ledger tags minted and mirrored (`cxx-conversion-function`,
+  `cxx-user-conversion`, `cxx-copy-ctor`); the last two previously
+  tabulated as `other`, which is FR-112's C6 blinding concern being
+  paid down rather than added to.
+  Gates for BOTH FRs: full meson suite 733/733 (fast 523 + slow 210), 0
+  failures. CTestSuite 220/220/0/0, Cpp17Suite 30/33, RealWorld C and
+  C++ ledgers all unchanged. The miscompile was confirmed by NEGATIVE
+  CONTROL: with the undo removed and everything else identical, the new
+  EndToEnd leg fails with exactly `1a2 > lib dtor C 1`.
+  (test/Import/Cpp/cpp-rejected-class-no-trace.cpp,
+  cpp-conversion-function.cpp, cpp-conversion-function-invalid.cpp;
+  test/EndToEnd/cpp-rejected-class-no-trace.cpp,
+  cpp-conversion-function.cpp; test/Project/coloring-cpp-class-gates.cpp)
 
-- [ ] FR-113 DEFECT: a rejected scoped enum still emits a cast to
-  itself and the VERIFIER destroys the whole crate -- `--incremental`
-  yields no crate at all, AFTER full recovery. All 8 spdlog units in
-  the external corpus die identically. Four-line repro:
-  `enum class PT : unsigned char { none, dec, hex };` plus a struct
-  holding a `PT` and a function doing `s.type = static_cast<PT>(t);`
-  gives `warning: unsupported: scoped enumeration` and then
-  `error: 'emitrust.cast' op cast to enum type '!emitrust.enum<"Pt">'
-  requires a visible emitrust.enum_def`. This is the "recovery stops
-  at the import boundary" successor to FR-53 that this file already
-  names as the leading recovery blocker, now with a minimal repro.
-  **NOT SPIKED.**
-
-- [ ] FR-114 DEFECT: same-arity overloaded CONSTRUCTORS and FREE
-  functions collide in the emitted symbol, and the diagnostic blames
-  the wrong thing. `S(double,double)` and `S(const S&, const S&)` both
-  mangle to `s_new_xx` and give `unsupported: conflicting definition
-  of 's_new_xx' (already defined in another translation unit)` -- in a
-  SINGLE TU. The class is then rejected and cascades; this is what
-  kills `interval` in raytracing.github.io. Free functions too:
-  `int g(int)` beside `int g(double)` gives the same wrong wording
-  PLUS a spurious `call argument type mismatch` at the call site.
-  Overloaded MEMBER functions are fine, because they route through
-  `cxxMethodMangledName`; constructors and free functions do not.
-  Note W2.23's spike found the same root from the other side: the
-  fallback overload code `x` cannot distinguish `T(const T&)` from
-  `T(const U&)`. **NOT SPIKED.**
-
-- [ ] FR-115 DEFECT: a rejected C++ record never says WHY. `struct 'X'
-  was rejected` is raised at every use site while X's own item carries
-  `blocker: ""`, `diagnostic: ""`. Corpus-wide, 6193 of 8851 graph
-  items (70%) are status `missing` with NO diagnostic at all -- 2835
-  records, 1110 globals, 701 functions after dedup. FR-42's "rejection
-  is a feature, with LOCATED diagnostics" contract holds for what
-  recovery REPORTS, but on the C++ path the MAJORITY of unported items
-  are silent: rooting the Track 5 cascade required a second
-  `--emit=coloring` run plus hand-built repros. This is a
-  measurability defect, and it is why the ranked table below needed
-  two tools instead of one. **NOT SPIKED.**
+- [ ] FR-119 DEFECT (found by FR-117/118's gate, pre-existing, ZERO
+  oracle coverage): a free NON-MEMBER `operator` declaration escapes
+  every backstop and emits a syntactically invalid crate, silently.
+  ```cpp
+  struct A { int x; };
+  int operator+(A a, int b) { return a.x + b; }
+  ```
+  `emitrust-cc --emit=crate` exits **0 with no diagnostic** and emits
+  `fn (v0: A, b: i32) -> i32 {` -- `cargo build` then fails with
+  `error: expected identifier, found '('`. A call site is separately
+  rejected (`unsupported callee`), so this is the DECLARATION-only
+  path. FR-117's backstops are scoped to `CXXMethodDecl` and do not
+  cover a free operator. This violates CLAUDE.md's rule that an
+  unresolved item must fail loudly at emission -- it is exit-0,
+  unbuildable, and undiagnosed. Deliberately NOT folded into FR-117's
+  commit: the fix is a symbol-spelling change for non-identifier
+  `DeclarationName`s and therefore has byte-identity consequences
+  through CSymbolNaming. **SPIKED by measurement.**
 
 - [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
   the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and

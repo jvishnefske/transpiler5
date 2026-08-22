@@ -243,6 +243,8 @@ constexpr llvm::StringLiteral VirtualMethod = "virtual-method";
 constexpr llvm::StringLiteral Destructor = "destructor";
 /// A user-declared overloaded operator.
 constexpr llvm::StringLiteral OverloadedOperator = "overloaded-operator";
+/// A user-declared copy, move, or delegating constructor.
+constexpr llvm::StringLiteral CopyMoveConstructor = "copy-move-constructor";
 /// An lvalue or rvalue reference anywhere in a type.
 constexpr llvm::StringLiteral ReferenceType = "reference-type";
 /// An `_Atomic`-qualified type anywhere in a type.
@@ -616,6 +618,26 @@ void AdmissibilityProbe::probeRecord(const clang::RecordDecl *record,
       if (method->isOverloadedOperator())
         verdicts.reject(symbol, tag::OverloadedOperator,
                         /*signatureLevel=*/false);
+      // FR-118: the screen this probe was MISSING, measured as a live FALSE
+      // GREEN -- the importer rejects a copy/move/delegating constructor
+      // (`CImporter::importCXXMethods`, which is why FR-118 had to undo the
+      // struct_def it had already emitted) while this probe called the class
+      // `admissible`. Mirrors the importer's predicate EXACTLY, including
+      // that a `= default`ed copy constructor is rejected too (the importer
+      // gate runs on the broader user-DECLARED shape; see
+      // test/Import/Cpp/cpp-defaulted-ctor-invalid.cpp), and that a
+      // std-namespace record is exempt because the importer never walks its
+      // methods at all.
+      //
+      // A CONVERSION FUNCTION is deliberately NOT screened: FR-117 OMITS one
+      // and keeps the class importable, so screening it would mint a fresh
+      // false red -- this probe's unsafe direction.
+      if (!cxxRecord->isInStdNamespace())
+        if (const auto *ctor =
+                llvm::dyn_cast<clang::CXXConstructorDecl>(method))
+          if (ctor->isCopyOrMoveConstructor() || ctor->isDelegatingConstructor())
+            verdicts.reject(symbol, tag::CopyMoveConstructor,
+                            /*signatureLevel=*/false);
     }
   }
   for (const clang::FieldDecl *field : record->fields()) {

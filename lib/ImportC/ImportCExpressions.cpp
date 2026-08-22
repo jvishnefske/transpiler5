@@ -2790,6 +2790,22 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
       return emitError(loc)
              << "unsupported: inherited member of an empty base class";
   }
+  // FR-117: a member whose `DeclarationName` is not an ordinary identifier
+  // is OMITTED from the class's import, so it has no symbol. Reject at the
+  // call rather than falling through to the lookup below: the mangled
+  // spelling of an omitted member is `<Struct>_` with an EMPTY base name, so
+  // the generic "call to unimported method" wording would leak `'C_'` and
+  // name nothing. The explicit `c.operator int()` spelling is the one
+  // conversion-function channel that USED to work (it lowered to a correct
+  // call to the empty-named method); withdrawing it is what buys the class
+  // importing at all, and it is pinned as a deliberate frontier move in
+  // test/Import/Cpp/cpp-conversion-function-invalid.cpp.
+  if (!method->getDeclName().isIdentifier() &&
+      !llvm::isa<clang::CXXConstructorDecl>(method) &&
+      !llvm::isa<clang::CXXDestructorDecl>(method))
+    return emitError(loc) << (llvm::isa<clang::CXXConversionDecl>(method)
+                                  ? "unsupported: conversion function"
+                                  : "unsupported: overloaded operator");
   std::string name = cxxMethodMangledName(method);
   func::FuncOp target = functions.lookup(name);
   if (!target)

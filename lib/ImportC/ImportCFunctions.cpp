@@ -54,6 +54,20 @@ static std::string cxxMethodBaseName(const clang::CXXMethodDecl *method) {
   // separately renamed to `drop` by `convert-func-to-emitrust`.
   if (llvm::isa<clang::CXXDestructorDecl>(method))
     return "dtor";
+  // FR-117: every REMAINING `DeclarationName` kind a `CXXMethodDecl` can
+  // carry that is not an ordinary identifier -- `CXXConversionFunctionName`
+  // (`operator int()`) and `CXXOperatorName` (`operator+`) -- has NO
+  // spelling to mangle. Falling through to `getName()` here was a live
+  // defect: it asserts in clang/AST/Decl.h (`Name is not a simple
+  // identifier`), and with that assert compiled out by our release NDEBUG
+  // build it returned the EMPTY STRING, so the class emitted a method
+  // literally named `<Struct>_` -- a symbol nobody can call, and one that
+  // two conversion functions in the same class collided on outright. The
+  // empty return is the OMISSION marker: `importCXXMethods` skips such a
+  // method, `cxxMethodMangledName`'s overload counter ignores it, and
+  // `importFunction` refuses it outright, so it can never reach a symbol.
+  if (!method->getDeclName().isIdentifier())
+    return std::string();
   return mangleMemberName(method->getName());
 }
 
@@ -92,7 +106,16 @@ CImporter::cxxMethodMangledName(const clang::CXXMethodDecl *method) const {
     if (candidate->isImplicit() || candidate->isDeleted() ||
         llvm::isa<clang::CXXDestructorDecl>(candidate))
       continue;
-    if (cxxMethodBaseName(candidate) == baseName)
+    // FR-117: an OMITTED member (empty base name) is not part of any
+    // overload set — it has no symbol at all — so it must not perturb the
+    // suffixing of the siblings that do. This loop is the reason FR-117 had
+    // to land before any wave that admits more member shapes: it walks
+    // EVERY method of the class, so one omitted member is enough to drag
+    // all of them through this path.
+    std::string candidateName = cxxMethodBaseName(candidate);
+    if (candidateName.empty())
+      continue;
+    if (candidateName == baseName)
       ++sharingCount;
   }
   std::string mangled = structName + "_" + baseName;
@@ -140,16 +163,57 @@ static bool isSliceRefinementOf(FunctionType earlier, FunctionType later) {
 LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
                                         bool signatureOnly) {
   Location loc = translateLoc(func->getLocation());
-  // W2.2: a constructor's `DeclarationName` has no ordinary identifier
-  // spelling (`CXXConstructorName` is a distinct `DeclarationName::NameKind`),
-  // so `getName()` cannot be called on one directly; every OTHER
-  // `CXXMethodDecl` this function ever sees has an ordinary identifier
-  // (destructors, virtual methods, and operator overloads are rejected in
-  // `collectRecordFields`, before any method of the class imports).
+  // FR-117 corrects what this comment used to claim. A constructor's
+  // `DeclarationName` has no ordinary identifier spelling
+  // (`CXXConstructorName` is a distinct `DeclarationName::NameKind`), and it
+  // is NOT the only one: the old text asserted that "every OTHER
+  // `CXXMethodDecl` this function ever sees has an ordinary identifier",
+  // which was measurably false for DESTRUCTORS (13 hits on the shipping
+  // test/EndToEnd/cpp-destructor.cpp alone), for conversion functions, for a
+  // UNION's overloaded operators (the union import path never runs the W2.2
+  // member-shape gate), and for a NON-MEMBER `operator+`, which is an
+  // ordinary top-level `FunctionDecl` and never went near a record gate at
+  // all. `getName()` asserts on every one of them
+  // (clang/AST/Decl.h: "Name is not a simple identifier"); our release
+  // NDEBUG build compiles that assert out and returns "", so instead of
+  // failing they produced unnamed symbols -- the free operator emitted
+  // `emitrust.func @<<INVALID EMPTY SYMBOL>>` and the literally unparseable
+  // Rust `pub fn (v0: A, b: i32) -> i32`, a crate that cannot build, with no
+  // diagnostic anywhere.
+  //
+  // So the identifier test is asked ONCE, of the `DeclarationName` itself,
+  // and `cName` is left EMPTY rather than asking `getName()`, for every one
+  // of them.
+  //
+  // The located refusal below is scoped to `CXXMethodDecl`s, which is
+  // FR-117's subject: it is the backstop for the omission
+  // `importCXXMethods` performs, so that a conversion function reached any
+  // OTHER way (an out-of-line definition, which is a top-level item in its
+  // own right) fails loudly instead of emitting an unnamed symbol. A
+  // NON-MEMBER operator is deliberately left alone here: it is a separate
+  // (and still open) defect -- measured, it emits
+  // `emitrust.func @<<INVALID EMPTY SYMBOL>>` and the unparseable Rust
+  // `pub fn (v0: A, b: i32) -> i32` -- but every free operator the suite
+  // exercises today is ALREADY fenced by a more specific diagnostic raised
+  // later on the same item (`std::basic_ostream is not a recognized STL
+  // type` in test/Import/Cpp/ostream-invalid.cpp, the map key-set screen in
+  // stl-map-invalid.cpp), and refusing it here would replace those pins
+  // with a vaguer wording. Fixing it needs a real symbol spelling for a
+  // non-identifier name, which is a naming change with byte-identity
+  // consequences, not a one-line guard.
   const auto *cxxMethod = llvm::dyn_cast<clang::CXXMethodDecl>(func);
   bool cxxIsCtor =
       cxxMethod && llvm::isa<clang::CXXConstructorDecl>(cxxMethod);
-  llvm::StringRef cName = cxxIsCtor ? llvm::StringRef() : func->getName();
+  const bool cxxIsDtor =
+      cxxMethod && llvm::isa<clang::CXXDestructorDecl>(cxxMethod);
+  const bool namedByIdentifier = func->getDeclName().isIdentifier();
+  if (cxxMethod && !namedByIdentifier && !cxxIsCtor && !cxxIsDtor)
+    return emitError(loc)
+           << (llvm::isa<clang::CXXConversionDecl>(func)
+                   ? "unsupported: conversion function"
+                   : "unsupported: overloaded operator");
+  llvm::StringRef cName =
+      namedByIdentifier ? func->getName() : llvm::StringRef();
 
   // Recovery stub retry (FR-42): a variadic function has no Rust signature
   // at all — its named parameters do not describe its call sites — so there
@@ -340,7 +404,14 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
     // cxxMethodMangledName).
     std::string ownerName =
         assignedStructNames.lookup(cxxMethod->getParent());
-    if (ownerName.empty()) // Defensive; the class was already imported.
+    // LOAD-BEARING since FR-118, no longer merely defensive: when a class
+    // fails a class-level gate the undo in `importRecordUncached` ERASES its
+    // `assignedStructNames` entry, so an OUT-OF-LINE definition of one of its
+    // methods (a top-level item, not gated by `rejectedRecords`) arrives here
+    // with no owner name. Without this check it would mangle `""_get` and
+    // emit a method onto a struct that no longer exists. Do not "simplify" it
+    // away: test/Import/Cpp/cpp-rejected-class-no-trace.cpp pins it.
+    if (ownerName.empty())
       return emitError(loc) << "unsupported: method of an unimported class";
     cxxOwnerStructType =
         emitrust::StructType::get(builder.getContext(), ownerName);

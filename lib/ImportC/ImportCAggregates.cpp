@@ -319,14 +319,33 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
     // destructor` wording (and the `cxx-destructor` tag) is retained for.
     if (const auto *cxxUnion =
             llvm::dyn_cast<clang::CXXRecordDecl>(definition))
-      for (const clang::CXXMethodDecl *method : cxxUnion->methods())
-        if (!method->isImplicit() && !method->isDeleted() &&
-            llvm::isa<clang::CXXDestructorDecl>(method)) {
+      for (const clang::CXXMethodDecl *method : cxxUnion->methods()) {
+        if (method->isImplicit() || method->isDeleted())
+          continue;
+        if (llvm::isa<clang::CXXDestructorDecl>(method)) {
           assignedStructNames.erase(definition);
           localRecordNames.erase(definition);
           return emitError(translateLoc(method->getLocation()))
                  << "unsupported: user-declared destructor";
         }
+        // FR-117: the same bypass, for the OVERLOADED OPERATOR half of the
+        // W2.2 member-shape gate. Measured on unpatched HEAD: a `struct`
+        // carrying `operator+` was rejected here with the wording below,
+        // while the identical `union` was ADMITTED and imported the operator
+        // as an empty-named method -- and FR-41's coloring probe screened
+        // that same union Red, which is the FALSE RED direction
+        // ItemColoring's doctrine forbids. Raising the struct path's own
+        // wording is what makes the screen and the importer agree, at no
+        // cost in new vocabulary (see test/Project/coloring-cpp-class-gates.cpp).
+        // A union cannot have a virtual member, so the gate's third arm has
+        // nothing to mirror here.
+        if (method->isOverloadedOperator()) {
+          assignedStructNames.erase(definition);
+          localRecordNames.erase(definition);
+          return emitError(translateLoc(method->getLocation()))
+                 << "unsupported: overloaded operator";
+        }
+      }
     if (failed(collectUnionSlot(definition, fieldNames, fieldTypes))) {
       assignedStructNames.erase(definition);
       localRecordNames.erase(definition);
@@ -560,8 +579,67 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   // must not run on one.
   if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(definition))
     if (!cxxRecord->isInStdNamespace())
-      if (failed(importCXXMethods(cxxRecord)))
+      if (failed(importCXXMethods(cxxRecord))) {
+        // FR-118: THE record is the failing item, so it must leave no trace.
+        //
+        // W2.2's comments claimed "a rejected class never half-imports", but
+        // the code did not hold it: every gate `importCXXMethods` raises
+        // fires AFTER the struct_def above is in the module and after the
+        // name registries were claimed, and neither was undone. Measured on
+        // unpatched HEAD that is a SILENT MISCOMPILE, not dead weight: a
+        // plain POD in ANOTHER translation unit whose emitted name and field
+        // shape coincide with the rejected class merges onto the leftover
+        // struct_def and inherits its `emitrust.has_drop`, so the crate runs
+        // a destructor the C++ program never runs
+        // (test/EndToEnd/cpp-rejected-class-no-trace.cpp). Single-TU it also
+        // STARVED an importable sibling that wanted the same emitted name.
+        // It is the FR-42 contract stated at the top of ImportCRecovery.cpp
+        // ("a rejected item must leave NO trace in the module"), which
+        // `rollbackTo` deliberately does not cover for aggregates -- that
+        // exemption is right for a type pulled in ON DEMAND by another item,
+        // and wrong for exactly this case.
+        //
+        // Hoisting the gates ahead of the struct_def, which design.md's
+        // FR-118 entry proposed, is NOT sufficient and cannot be made
+        // sufficient: pass 2 of `importCXXMethods` imports an ARBITRARY
+        // method body and can fail on any unsupported construct in the
+        // language, reproducing the byte-identical divergence with no
+        // class-level predicate to hoist (pinned as `body-fail` in
+        // test/Import/Cpp/cpp-rejected-class-no-trace.cpp).
+        //
+        // `importedRecords` deliberately stays inserted: the caller
+        // (`importRecord`) adds this record to `rejectedRecords`, and that is
+        // what turns every later use into the located
+        // `struct 'X' was rejected` cascade rather than a silent re-import.
+        // Method funcs are erased BY NAME rather than by position so that a
+        // type or global this class's bodies pulled in on demand -- which is
+        // `rollbackTo`'s legitimately-exempt category -- is left alone.
+        for (const clang::CXXMethodDecl *method : cxxRecord->methods()) {
+          if (method->isImplicit() || method->isDeleted())
+            continue;
+          func::FuncOp emitted =
+              functions.lookup(cxxMethodMangledName(method));
+          if (!emitted)
+            continue;
+          functions.erase(emitted.getName());
+          eraseTopLevelOp(emitted.getOperation());
+        }
+        // Points into the bodies just erased.
+        resetPerFunctionState();
+        eraseTopLevelOp(structDef.getOperation());
+        importedRecordShapes.erase(structName);
+        emittedStructNames.erase(structName);
+        structDefRecords.erase(structName);
+        structNameOwnerTuTags.erase(structName);
+        assignedStructNames.erase(definition);
+        localRecordNames.erase(definition);
+        anonRecordNames.erase(definition);
+        if (auto anonShape = anonRecordShapeNames.find(shape);
+            anonShape != anonRecordShapeNames.end() &&
+            anonShape->second == structName)
+          anonRecordShapeNames.erase(anonShape);
         return failure();
+      }
   return success();
 }
 
@@ -580,6 +658,22 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
     // imported function body. The copy/move/delegating rejection below runs
     // on the broader "user-declared" predicate so a *defaulted* copy/move
     // ctor is still rejected rather than silently skipped here.
+    // FR-117: a member whose `DeclarationName` is NOT an ordinary identifier
+    // -- a conversion function (`operator int()`) or, on the union path
+    // where the W2.2 member-shape gate never ran, an overloaded operator --
+    // has no spelling to mangle and used to import as `<Struct>_`, an
+    // EMPTY method name nobody can call (two of them in one class collided
+    // outright). It is OMITTED rather than made class-level fatal, which is
+    // sound because every USE of one is already a located rejection:
+    // implicit and `static_cast` uses are
+    // `unsupported cast (UserDefinedConversion)`, the explicit
+    // `c.operator int()` spelling and an out-of-line definition are
+    // `unsupported: conversion function`. Constructors and destructors keep
+    // their FIXED base names (`new`, `dtor`) and are unaffected.
+    if (!method->getDeclName().isIdentifier() &&
+        !llvm::isa<clang::CXXConstructorDecl>(method) &&
+        !llvm::isa<clang::CXXDestructorDecl>(method))
+      return false;
     return !method->isImplicit() && !method->isDeleted() &&
            !method->isDefaulted();
   };

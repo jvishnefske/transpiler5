@@ -372,6 +372,18 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("virtual or unresolved member call", "cxx-virtual-call"),
     ("unsupported: virtual method", "cxx-virtual"),
     ("overloaded operator", "cxx-operator-overload"),
+    # FR-117: a user-defined conversion function. The member is OMITTED from
+    # the class, but its residual use positions (the explicit
+    # `c.operator int()` spelling, an out-of-line definition) are located
+    # rejections; the implicit and static_cast uses arrive as
+    # CK_UserDefinedConversion. Both were untagged (catch-all `other`) before
+    # FR-117 shifted mass into them. Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("unsupported: conversion function", "cxx-conversion-function"),
+    ("unsupported cast (UserDefinedConversion)", "cxx-user-conversion"),
+    # FR-118: the class-level gate whose late position was the half-import
+    # miscompile; also previously untagged.
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("copy/move/delegating constructor", "cxx-copy-ctor"),
     # FR-48 landed reference PARAMETERS; the four wordings below are the
     # residual reference positions, all still tagged `cxx-references` so the
     # backlog keeps ranking them as one blocker. "rvalue reference types are
