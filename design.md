@@ -6974,6 +6974,141 @@ piece and becomes FR-45.
   test/Import/C/struct-name-collide-invalid.c;
   test/Project/item-graph-namespace-record.cpp)
 
+- [ ] FR-109 QUALITY: `clippy::manual_unwrap_or_default`, 12
+  warnings across 12 crates (9 C++ + 3 C), ONE emitter site, zero
+  variance -- the most replicated non-off-limits lint in either
+  corpus, and the FR-63 harness's own `signals.py` ranks it #1 for
+  C++ unprompted. The `needsFloatFormatExtHelper` verbatim prelude
+  (ImportCFunctions.cpp:2361-2364) emits
+  `let ev: i32 = match e.parse() { Ok(v) => v, Err(_) => 0, };`.
+  Use `.unwrap_or(0)`, NOT `.unwrap_or_default()`: line 2368 of the
+  SAME helper already writes `te.parse().unwrap_or(0)` and measured
+  zero warnings, so it is the proven-clean spelling. Golden churn is
+  essentially nil (the one golden touching this helper pins the
+  signature line, not the body). The sweep already verified the
+  patch: lint gone, stdout byte-identical to the unpatched crate AND
+  to the clang-built native. **SPIKED by measurement.**
+
+- [ ] FR-110 QUALITY, DESIGN-LEVEL: every emitted C++ method carries
+  its class name. `bi.box_i32_get()` inside `impl BoxI32`, and
+  `let mut bi = BoxI32::default(); bi.box_i32_new(x);` where a Rust
+  programmer would write `BoxI32::new(x)`. This is the biggest
+  idiomaticity gap in the emitted C++ and clippy CANNOT SEE IT -- it
+  affects every class, not just templates. It cannot be fixed at
+  `cxxMethodMangledName` (ImportCFunctions.cpp:98), because that name
+  is the free-standing module symbol and de-prefixing would collide
+  two classes' `get`. The correct hook is the impl-move rename that
+  W2.17 ALREADY BUILT for destructors
+  (FuncToEmitRust.cpp:192, `isDropImpl ? "drop" : funcOp.getName()`),
+  plus a matching strip in `emitMethodCall`. Two coordinated sites,
+  heavy golden churn, and it touches the CSymbolNaming byte-identity
+  contract. **NOT SPIKED.**
+
+- [ ] FR-111 QUALITY: the `field_reassign_with_default` fuse is
+  OVER-gated for Drop types. TranslateToRust.cpp:2440 bails on
+  `bindingHasDrop`, because a `..S::default()` functional-update base
+  would construct and drop a spurious `S` (W2.17, measured). But the
+  fuse already computes `coversAllFields` at :2504-2510 and drops the
+  base entirely in that case, so the guard can narrow to "has Drop
+  AND not all-fields". Worth 2 warnings; removes a hazard class.
+  **NOT SPIKED.**
+
+- [ ] FR-112 CONTAINMENT -- keep the record, reject at the access
+  site. **RANKED #1 BY THE MEASURED C++ DEMAND SIGNAL** (see Track 5).
+  59.2% of all blocked items in the external corpus -- 3949 of 6669 --
+  never had their own construct examined: their diagnostic is `method
+  of an unimported class` (2315) or `struct 'X' was rejected, so a
+  type naming it cannot be imported` (1634). ONE unsupported member
+  function rejects the ENTIRE class. Six-line repro:
+  a struct with two scalar fields and one `bool operator==` also
+  drops `int plain(C a){ return a.v; }`, a function that never touches
+  the operator. Substituting an ordinary `const char *name() const`
+  for the operator gives the identical outcome, so it is the MEMBER,
+  not the layout. design.md ALREADY reached the right disposition for
+  C in the C99-43 spike -- keep the record, reject at the access
+  site -- and it has no C++ counterpart. This is containment, not
+  feature work, and it is worth more than every named C++ wave
+  combined: it turns 1625 of the operator family and 502 of the
+  unrooted-method family back into candidates WITHOUT translating a
+  single operator. The thing it must invert is W2.2's deliberate
+  ordering ("a rejected class never half-imports"), so the wave must
+  establish what that ordering was protecting and classify every
+  class-level rejection as genuinely CLASS-level (a base the importer
+  cannot model, a virtual method implying a vtable, a destructor whose
+  Drop timing is unreproducible) versus merely MEMBER-level (an
+  overloaded operator, a method using an unsupported statement -- the
+  record's DATA is perfectly representable). CAUTION design.md records
+  three times (FR-102, FR-107) and which holds here: opening a root
+  does not port what sits behind it; the C precedent measured cascade
+  -96% but functions ported only 8.3% -> 11.7%. **SPIKE IN FLIGHT.**
+
+- [ ] FR-113 DEFECT: a rejected scoped enum still emits a cast to
+  itself and the VERIFIER destroys the whole crate -- `--incremental`
+  yields no crate at all, AFTER full recovery. All 8 spdlog units in
+  the external corpus die identically. Four-line repro:
+  `enum class PT : unsigned char { none, dec, hex };` plus a struct
+  holding a `PT` and a function doing `s.type = static_cast<PT>(t);`
+  gives `warning: unsupported: scoped enumeration` and then
+  `error: 'emitrust.cast' op cast to enum type '!emitrust.enum<"Pt">'
+  requires a visible emitrust.enum_def`. This is the "recovery stops
+  at the import boundary" successor to FR-53 that this file already
+  names as the leading recovery blocker, now with a minimal repro.
+  **NOT SPIKED.**
+
+- [ ] FR-114 DEFECT: same-arity overloaded CONSTRUCTORS and FREE
+  functions collide in the emitted symbol, and the diagnostic blames
+  the wrong thing. `S(double,double)` and `S(const S&, const S&)` both
+  mangle to `s_new_xx` and give `unsupported: conflicting definition
+  of 's_new_xx' (already defined in another translation unit)` -- in a
+  SINGLE TU. The class is then rejected and cascades; this is what
+  kills `interval` in raytracing.github.io. Free functions too:
+  `int g(int)` beside `int g(double)` gives the same wrong wording
+  PLUS a spurious `call argument type mismatch` at the call site.
+  Overloaded MEMBER functions are fine, because they route through
+  `cxxMethodMangledName`; constructors and free functions do not.
+  Note W2.23's spike found the same root from the other side: the
+  fallback overload code `x` cannot distinguish `T(const T&)` from
+  `T(const U&)`. **NOT SPIKED.**
+
+- [ ] FR-115 DEFECT: a rejected C++ record never says WHY. `struct 'X'
+  was rejected` is raised at every use site while X's own item carries
+  `blocker: ""`, `diagnostic: ""`. Corpus-wide, 6193 of 8851 graph
+  items (70%) are status `missing` with NO diagnostic at all -- 2835
+  records, 1110 globals, 701 functions after dedup. FR-42's "rejection
+  is a feature, with LOCATED diagnostics" contract holds for what
+  recovery REPORTS, but on the C++ path the MAJORITY of unported items
+  are silent: rooting the Track 5 cascade required a second
+  `--emit=coloring` run plus hand-built repros. This is a
+  measurability defect, and it is why the ranked table below needed
+  two tools instead of one. **NOT SPIKED.**
+
+- [ ] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
+  the crate. Found by W2.23's spike; no committed test can see it,
+  because W2.17's destructor corpus observes side effects via `printf`
+  and never via a global counter. Three-line repro:
+  `int g = 7; struct S { int v; S(int x) : v(x) {} int peek() { return
+  g + v; } };` gives `error: 'emitrust.global_load' op 'G' does not
+  reference a valid emitrust.global`, on both `--emit=rust` and
+  `--emit=crate`. `--actor-lift=false` works perfectly (the global
+  becomes a thread_local Cell and the method reads it).
+  ROOT CAUSE, located: the ActorPlan is built entirely from the FR-40
+  item graph's `ReadsGlobal`/`WritesGlobal` edges
+  (tools/emitrust-cc/ActorPlan.cpp:161-167), and the item graph
+  DELIBERATELY SKIPS every `CXXMethodDecl`
+  (lib/Project/ItemGraph.cpp:775 and :1324, "C++ member functions are
+  not items"). So a global touched only from a method body has no
+  access edge, the planner concludes `c_main` owns it and localizes
+  it, and the impl's `global_load` dangles. THE FIX HAS AN IN-TREE
+  PRECEDENT: the cell path already carries exactly this guard
+  (tools/emitrust-cc/ActorLiftPlan.cpp:64-72, "an owner METHOD inside
+  an impl is out of scope"); only the actor path lacks it. A second
+  manifestation is a global bumped by a free function called from a
+  method, which emits a call to a bare `bump()` the lift renamed --
+  rustc E0425. Both manifestations are LOUD, never silent: a blocker,
+  not a miscompile hazard. Real C++ classes read globals constantly,
+  and this also blocks 00801. **SPIKED by measurement (W2.23).**
+
+
 Everything the importer must handle before it can claim full C99 language
 support, grouped by area. The same validation policy applies as for the
 functional requirements: a box is ticked only when a lit regression test
@@ -11028,7 +11163,104 @@ whole-program demand.
   test/EndToEnd/incremental-builds.cpp)
 
 - [ ] W2.19 Virtual dispatch through a base pointer (flips 00901).
-  **NOT SPIKED.**
+  Spike verdict **NO-GO AS SCOPED** (2026-08-21), with a measured
+  wave-sized fallback and a named prerequisite.
+  THE DOMINANT FINDING: 00901 with `virtual` and the virtual
+  destructor MECHANICALLY DELETED still fails --
+  `p11_00901_devirt.cpp:15:14: error: unsupported: pointer assigned a
+  non-address value`, which is `&t` in `Shape *s = &t;`. Nothing
+  virtual remains in the input. **The corpus's virtual-dispatch marker
+  does not transpile even after virtual dispatch is solved.**
+  WHAT THE POINTER MACHINERY ADMITS FOR STRUCT POINTERS TODAY: a
+  pointer is admitted only when it is (a) a PARAMETER, rendered as a
+  borrow (reads and writes both work, even for `const S*`), or (b) a
+  LOCAL statically resolvable to EXACTLY ONE object, in which case the
+  pointer is COMPILE-TIME ERASED (`S *p = &s; p->x` emits `s.x`).
+  Neither admits a method call (`unsupported use of pointer variable`
+  for a local, `pointer variable used as an assignable place` for a
+  parameter). Neither admits an upcast. And (b) is precisely the model
+  that DESTROYS the information virtual dispatch needs.
+  THE UPCAST IS NOT A ONE-LINE PEEL. `peelPointerCast` handles only
+  `CK_NoOp`/`CK_BitCast`, but the obvious fix -- treat `Base *p = &d;`
+  as the already-working member binding `&d.base` -- does not map onto
+  the machinery: `PointerBaseBinding::member` and `PointerBaseKey::member`
+  are `const clang::FieldDecl *`, and a C++ BASE SUBOBJECT HAS NO
+  `FieldDecl`; W2.18's `base` field is a synthesized NAME STRING from
+  `collectRecordFields`, not an AST decl, and `regionElementType` reads
+  `member->getType()`, which has no source either. This needs a THIRD
+  BINDING KIND in `PointerRegion` -- a data-structure change.
+  LEG A, TRAIT OBJECTS: byte-identical on the full matrix (dynamic
+  dispatch, value call, non-virtual through a base pointer, inherited
+  data read, three-level `override`/`final`, pure-virtual base) under
+  the real deny-lint contract. Three forced constraints: `&dyn Trait`
+  HAS NO FIELDS, so an inherited DATA read needs a synthesized
+  `fn __base_<Root>(&self) -> &Root;` per hierarchy; a non-virtual base
+  method through a base pointer must be a trait DEFAULT that no impl
+  overrides, with the derived's same-named method INHERENT (inherent
+  beats trait in Rust resolution); and Rust traits do not inherit
+  impls, so every concrete class needs a FORWARDING entry for every
+  transitively-reachable virtual method it does not override.
+  MEASURED SILENT MISCOMPILE for the third: deleting ONE forwarding
+  entry compiles CLEAN under the deny lints and prints `33 9` where the
+  native prints `33 63` -- the call silently binds the trait default,
+  i.e. the hierarchy ROOT's body.
+  DIALECT: W2.17's `trait_name` does NOT generalize -- the verifier
+  hard-locks it (`trait impl names '"ShapeVirt"', but 'Drop' is the
+  only modeled trait`). `emitrust.trait_def` renders ASSOCIATED
+  FUNCTIONS with no `self` and, being attribute-only, cannot carry
+  default bodies, so it cannot spell a virtual trait. The UPCAST SITE
+  has no op. The PARAMETER and CALL positions, however, ride the W2.3
+  opaque escape hatch with no new op at all.
+  LEG B, CLOSED-WORLD ENUM DISPATCH: NO-GO on its own merits, three
+  independent reasons. The payload must be a BORROW (a C++ `Shape *`
+  does not own its object) and `data_enum_def` rejects a ref payload,
+  while an enum of VALUES would copy and lose writes. It needs
+  `enum ShapeDyn<'a>` and the emitter has NO LIFETIME VOCABULARY. And
+  the closed world IS NOT DECIDABLE PER-TU -- measured with a two-TU
+  probe, and `test/RealWorld/Cpp/Inputs/shapes/` is built that way ON
+  PURPOSE so the dispatch loop cannot see the derived classes.
+  LEG D, THE SURPRISE: 00901 needs NO dispatch mechanism at all. Its
+  base pointer binds exactly one object whose most-derived type the
+  importer already knows, so the call resolves at compile time --
+  DEVIRTUALIZATION, byte-identical, no trait, no enum, no new op, no
+  lifetime. An adversarial probe is also byte-identical: through one
+  base pointer a VIRTUAL call resolves by the object's dynamic type
+  while a NON-VIRTUAL call resolves by the POINTER's static type.
+  Soundness is ALREADY enforced -- the "pointer bound to multiple
+  objects with a non-scalar element type" rejection fires the moment a
+  struct pointer can designate more than one object, so
+  devirtualization can never silently pick wrong. But it is a strict
+  local optimization: it cannot touch a base-pointer PARAMETER, cannot
+  touch the `shapes` corpus (an ARRAY of base pointers consumed via
+  `Shape *const *` in another TU), and does not implement polymorphism.
+  VIRTUAL DESTRUCTORS: `Box<dyn Trait>` + `drop()` reproduces `delete`
+  through a `Base*` byte-identically, reusing W2.17's `impl Drop` and
+  getting `~Derived`-then-`~Base` free from W2.18's base-as-first-field
+  -- but it unblocks NOTHING, because `new`/`delete` is unsupported
+  outright. See the W2.18 empty-base note below, which this leg found.
+  SEQUENCE: a PREREQUISITE FR ("method calls and base-subobject
+  bindings through struct pointers") with four measured items --
+  (1) route `emitCXXMemberCall`'s receiver through the same `->`-base
+  deref path `emitMemberBasePlace` already uses for `p->x`, which works
+  today in both positions (the small item); (2) a base-subobject
+  binding kind in `PointerRegion` (the large item); (3) teach
+  `peelPointerCast` `CK_DerivedToBase`; (4) re-sync
+  `ItemColoring.cpp:614`, which DUPLICATES the virtual screen -- W2.18's
+  stale-screen finding applies verbatim and its test will not fail on
+  its own. THEN: **W2.19a** virtual methods on VALUES only (needs ZERO
+  pointer work); **W2.19b** devirtualized single-object base pointer,
+  which flips 00901 (needs items 1-3); **W2.19c** trait objects, the
+  only image that reaches `shapes` (needs a user-trait verifier
+  contract, a real trait-DEFINITION op with `&self` and default bodies,
+  an upcast op, and the `__base_<Root>` + forwarding synthesis whose
+  omission is the measured `33 9` miscompile).
+  UNRESOLVED: whether three impls per struct (inherent + Drop + a user
+  trait) survive `getOrCreateImpl`'s (struct, trait) keying and the
+  four impl-by-struct-name lookups (blocked by the Drop-only verifier
+  lock); cross-TU merge of a struct gaining a trait impl in one TU
+  only; covariant returns, `dynamic_cast`/RTTI, virtual inheritance,
+  and a virtual call INSIDE A CONSTRUCTOR (C++ dispatches to the BASE's
+  override -- a classic trap that should get an explicit rejection).
 
 - [x] W2.20 `std::map`/`std::set` -> `BTreeMap`/`BTreeSet`. Spike
   verdict **GO-WITH-CONSTRAINTS** (2026-08-21). BTree, not Hash:
@@ -11291,12 +11523,191 @@ whole-program demand.
   std::clog)
 
 - [ ] W2.23 Copy constructors and C++ value semantics (the 00801
-  sensor). **NOT SPIKED.**
+  sensor). Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21), with
+  00801 STAYING A SENSOR unless FR-116 lands in the same wave.
+  The copy core is SAFER than W2.17's destructor wave: every admitted
+  shape is byte-identical against `clang++` AND `g++` AND under
+  `-fno-elide-constructors`, with no new dialect op, no new trait and
+  no verifier change.
+  ELISION STABILITY is the axis that decides the subset boundary, and
+  it resolves sharply: EXACTLY ONE shape is implementation-defined --
+  a `return` of a named local whose `ReturnStmt::getNRVOCandidate()` is
+  non-null (0 copies by default, 1 under `-fno-elide-constructors`, on
+  BOTH compilers). Everything else is fixed by the standard: `T b = a;`
+  = 1, `take(a)` = 1, a prvalue argument = 0, a prvalue factory return
+  = 0, a TWO-return-object function = 1, returning a by-value parameter
+  = 2, `b = a;` through the implicit `operator=` = 0 copies. So W2.17's
+  NRVO note generalizes PRECISELY and no more broadly -- a named-local
+  return is not per se unfixed, and the two-return-object case is
+  admissible, contra a naive reading.
+  THE AST IS ALREADY THE ORACLE: C++17 guaranteed elision appears as
+  ABSENT NODES -- a prvalue factory return and a prvalue argument
+  contain NO copy node at all -- so "emit a copy at every AST copy
+  point" automatically yields zero. Copy-construction and
+  copy-ASSIGNMENT are DIFFERENT AST nodes (the latter a
+  `CXXOperatorCallExpr '='`), so they must be lowered differently.
+  RULE THAT MEASURED CLEAN: one copy-constructor call per syntactic
+  copy point whose enclosing `ReturnStmt` has a NULL NRVO candidate;
+  reject where it is non-null.
+  THE IMAGE IS NOT `derive(Clone)` + `.clone()` -- it is the W2.2
+  constructor-call shape already emitted for `Tracer c(5);`, with the
+  copy ctor imported as an ordinary `&mut self` void method taking
+  `&Tracer`. A by-value argument is the same shape into a temp place
+  then moved in (the W2.8 `std::pair` precedent). No `Clone`, no new
+  op; hand IR round-trips using only `variable`/`method_call`/`load`/
+  `return`. A real `impl Clone` is blocked by the SAME Drop-only
+  verifier lock W2.19 hit.
+  ONE MANDATORY EMITTER DELTA: drop `Copy` from the derive when the
+  class has a user copy ctor, one line beside W2.17's `has_drop` line.
+  WITHOUT IT the by-value case is a COMPILE-CLEAN MISCOMPILE -- 0
+  copies where C++ has 1.
+  W2.17's BLOCKER (a) DOES NOT RECUR: the dead-store machinery cannot
+  eat a copy, because a copy is a CALL, not a store (measured with a
+  destination that is never read).
+  MUST STAY REJECTED: NRVO-candidate returns; move constructors (move
+  counts are elision-dependent too, and there is no xvalue/last-use
+  model); the "move because the source is dead" optimization (compiles
+  clean, prints 0 copies against native 1); `.clone()` at a copy
+  ASSIGNMENT (prints 1 against native 0 -- C++ runs `operator=`;
+  memberwise assignment IS byte-identical); a user `operator=`; arrays
+  (E0277 once `Copy` is dropped, the same boundary W2.17 drew); a copy
+  ctor taking non-const `T&`; and the implicit copy ctor of an
+  aggregate with a copy-ctor member -- whose image IS byte-identical
+  but requires SYNTHESIZING a constructor the AST does not contain.
+  NAMING HAZARD: `cxxMethodMangledName` gives a copy ctor the base name
+  `new`, same as the value ctor, so the class becomes an overload set;
+  adding one RENAMES the existing `tracer_new` symbol (harmless, only
+  newly-admitted programs), and the fallback code `x` cannot
+  distinguish `T(const T&)` from `T(const U&)` -- the same root as
+  FR-114.
+  FREE WINS THIS SPIKE SURFACED, rejected today but trivially correct:
+  `Plain b = a;` for a POD with no user copy ctor is rejected at the
+  PLACE-INIT path while the RVALUE path already unwraps a trivial copy,
+  and the identical C program works; and whole-object `c = a;` reports
+  the generic, misleading `unsupported callee` because `operator=`'s
+  `DeclarationName` is not an identifier, when the correct lowering is
+  memberwise and measured byte-identical.
+  00801 NEEDS THREE INDEPENDENT UNBLOCKS, only one of which is copies:
+  the copy-ctor declaration admission; `return Tracer(v);`, today
+  `unsupported cast (ConstructorConversion)`, whose fix MIRRORS the
+  existing `std::optional` recursion one line above; and FR-116. An
+  00801-shaped probe emits, builds and prints `value=41 copies=0`,
+  byte-identical to the committed reference -- but only with
+  `--actor-lift=false`. DO NOT flip 00801 by editing its source to
+  remove the global; that retires the sensor the file exists to be.
 
-- [ ] W2.24 `try`/`throw`/`catch` (flips 00902). Ranked last: the
-  Rust image (Result threading vs unwind) is a genuine design question,
-  not an implementation detail. **NOT SPIKED.**
+- [ ] W2.24 `try`/`throw`/`catch` (flips 00902). Spike verdict
+  **GO-WITH-CONSTRAINTS -- IMAGE A, Result threading rendered as a
+  synthesized closed data enum** (2026-08-21). Ranked last on DEMAND,
+  not on uncertainty: the design question now has an answer, but a grep
+  over the whole `test/RealWorld/Cpp/Inputs/` corpus finds ZERO
+  `throw`/`try`/`catch`, 00902 is the only Cpp17Suite entry using
+  exceptions, and the Track 5 external measurement ranks exceptions
+  12th at 11 deduped items (0.2%). The wave buys exactly one flip.
+  CORRECTION TO W2.0 AND TO THIS FILE'S FRONTIER TABLE: 00902 does NOT
+  die with `unsupported statement: CXXTryStmt`. Measured, it dies with
+  `00902.cpp:8:5: error: unsupported expression: CXXThrowExpr` --
+  `checked_div` is declared before `main`, so the THROW is reached
+  first, and `CXXTryStmt` is only reachable when the enclosing TU has
+  no earlier throw. A wave-1 test pinning the documented wording would
+  pin something that never fires.
+  IMAGE B (panic + `catch_unwind`) IS A MEASURED NO-GO ON SEMANTIC
+  GROUNDS, not ergonomic ones: `catch (...)` under `catch_unwind`
+  CANNOT DISTINGUISH a C++ exception from a Rust panic THE TRANSPILER
+  ITSELF MINTED, so it silently swallows this project's own UB
+  refinements. Probe -- a `catch (...)` whose try block contains an
+  out-of-bounds index, which project policy refines to a deterministic
+  panic: image B gives rc 0, `caught=9`, EMPTY stderr; image A gives
+  rc 101 and `index out of bounds: the len is 4 but the index is 7`.
+  Image B converts a loud crash into a silent successful run, exactly
+  CLAUDE.md's prohibited direction. Image A is STRUCTURALLY IMMUNE -- a
+  panic is not a value of the synthesized enum, so no handler can
+  observe it: immunity by construction, not a mitigation that can
+  regress. Three further B costs: default panic stderr carries a
+  NONDETERMINISTIC OS thread id, unpinnable by byte-diff or FileCheck;
+  a blanket `set_hook` restores byte-exactness but swallows every panic
+  message in the program, including the ones
+  `test/EndToEnd/actor-mode-threaded-panic.c` pins; and a scoped
+  thread-local hook still loses a deliberate panic INSIDE a try region,
+  because hooks run at panic time, before `resume_unwind`.
+  `panic = "abort"` is NOT an obstacle -- `renderCargoToml` emits no
+  `[profile]` table at all, so both profiles keep rustc's default
+  unwind. IMAGE C is not a distinct image: measured, it IS image A
+  restricted to call depth 1 and produces the same crate.
+  BYTE-IDENTICAL LEGS (stdout AND stderr AND exit code, real
+  `cargo build --release` under the deny lints): 00902 itself, a throw
+  at call depth 3, a bare `throw;` rethrow, `catch (...)` with a
+  `double` payload, a Drop object destroyed during unwinding, and a
+  throw from inside a loop in a try. DROP DURING UNWINDING IS NOT A
+  DISCRIMINATOR -- both images reproduce it byte-for-byte, and W2.17
+  needs no change, because image A's early `return Err` drops callee
+  locals at the return and try-region locals at region exit, in the
+  same order C++ unwinding does. ONE DIVERGENCE, IMAGE-INDEPENDENT: for
+  an UNCAUGHT throw the native prints NOTHING to stdout (printf to a
+  pipe is fully buffered and `abort()` does not flush) while Rust's
+  `println!` flushes on the newline. A stdio-model difference, not an
+  exception-image one, and the project has never been exposed because
+  `abort()` is itself unsupported today.
+  NO NEW DIALECT OPS -- the W2.14 route-(a) precedent reused verbatim:
+  one synthesized `data_enum_def`, `enum_variant`, and `match` in
+  statement mode at a propagating call site and RESULT mode at a
+  handler. Four measured constraints: `emitrust.return` is
+  `HasParent<"FuncOp">`, so `Err(e) => return Err(e)` is UNSPELLABLE
+  and propagation must go through the existing structurizer's
+  if/else-plus-tail-expression pyramid (confirmed: a three-early-return
+  C function already renders as three nesting levels); `?` and
+  try-blocks are doubly unavailable, since `?` needs a Result-returning
+  enclosing function and there is no closure-emitting op (W2.13 LIFTS
+  lambdas rather than emitting them); the deny-lint contract FORCES
+  result-mode match at handlers; and the enum must be `ThrowsI32`, the
+  same `non_camel_case_types` constraint W2.14 measured.
+  THE REAL COST IS THE INTERPROCEDURAL ANALYSIS, and the
+  highest-severity finding is a TRAP. There is no call graph today, but
+  the one exceptions needs is FAR SMALLER than the actor RFC's -- only
+  "does symbol S reach a `CXXThrowExpr` over direct calls", pure
+  syntactic reachability, and every ingredient already exists in
+  `forEachDataPointerCallArg`'s body. THE TRAP: the obvious scaffold to
+  reuse, `collectPassAFunctionDefinitions` (shared by 8 planners),
+  walks `unit->decls()` ONLY. A `CXXMethodDecl` lives in its record's
+  `DeclContext` and a namespaced function in the `NamespaceDecl` --
+  neither is a TU-level decl, while the IMPORTER's own walk DOES
+  recurse into both (confirmed empirically). A can-throw planner built
+  on that scaffold would conclude "cannot throw" for a namespaced or
+  method throw and SILENTLY DROP THE EXCEPTION. Any spec must mandate a
+  NEW RECURSIVE WALK, not scaffold reuse.
+  ONE EXISTING-MACHINERY CONFLICT image A creates and B does not:
+  `ItemColoring.cpp:415-421` classifies exceptions as a BODY-level
+  construct, commented "a function whose BODY contains one of these can
+  still be replaced by a stub with its original signature, so the
+  caller stays Yellow". Under Result threading that is FALSE -- the
+  signature changes and the transitive caller set turns Red. It must be
+  reclassified as part of the wave. `noexcept` is a natural closure
+  boundary that BOUNDS the virality, since the throw specification is
+  part of the type: a throw propagating into a `noexcept` function
+  lowers to the terminate helper and the signature rewrite stops there.
+  00902 CAN FLIP -- traced against a wave-1 gate and byte-diff proven.
+  MUST STAY REJECTED: more than one thrown payload type in a TU; catch
+  of a class type or by reference (measured blocker -- a struct payload
+  RIDES the enum fine, but reading its field in the arm has no op,
+  since `emitrust.member` needs an lvalue and a match case binds an SSA
+  value); any unresolvable edge in the can-throw closure (indirect,
+  virtual, variadic, declared-not-defined, or address-taken); A THROW
+  INSIDE A METHOD OR NAMESPACED FUNCTION until the Pass-A walk is
+  recursive -- a SILENT-MISCOMPILE risk, so an explicit reject, not an
+  omission; an uncaught throw; `noexcept` with a reachable throw; and a
+  throw inside a constructor or destructor.
 
+- [ ] W2.25 (NEW WAVE) Operator overloading. **The single biggest
+  construct in the measured external corpus -- 2212 deduped blocked
+  items, 33.2%, across 76 of 105 units and 8 of 11 projects -- and it
+  was on no numbered wave at all**, deferred in prose by W2.0 and W2.2
+  and never picked up. Value classes with `operator==`, `operator[]`,
+  `operator<<` and arithmetic operators are how real C++ spells its
+  data types. IMPORTANT SEQUENCING: only 587 of those 2212 are the
+  operators themselves; 1625 are CASCADE from class poisoning, so
+  **FR-112 must land first** -- it converts three quarters of this
+  front into candidates without translating a single operator, and the
+  residue is what this wave is actually sized against. **NOT SPIKED.**
 
 ## Track 5 Third-party validation (external demand signal)
 
@@ -11704,6 +12115,90 @@ FR-53/54/55; the small-libs table above is the current state).
    delta. The lessons are captured here against current data; if the paper's
    External Validation section is written into `paper/paper.tex`, it must draw
    from the re-measured Track 5 numbers above, not from that commit.
+
+
+### The C++ demand measurement, 2026-08-21 (and what it says about the roadmap)
+
+Track 5's methodology, run for the first time on C++. Eleven pinned
+repos -- tinyxml2, pugixml, jsoncpp, 2048.cpp, CHIP-8-Emulator, cxxopts,
+docopt.cpp, spdlog, unordered_dense, tinyrenderer,
+raytracing.github.io -- 105 translation units, every one parsing clean
+under `clang++ -std=c++17` before measurement. Per unit:
+`--emit=crate --crate-type=lib --incremental` for the progress JSON,
+plus `--emit=coloring` to root the cascades FR-49 leaves unattributed.
+Counts are DEDUPED by (project, source location, symbol), so a header
+item shared by 43 pugixml TUs counts once.
+
+Outcome: **0 of 105 TRANSLATED_FULL**, 95 PARTIAL, 10 NO_CRATE.
+2020 of 8851 graph items ported (22.8%). 6669 deduped blocked items
+across 97 distinct wordings. The ranking is stable under three
+weightings (corpus-wide, projects-equal-weighted, pugixml-excluded), so
+pugixml's 42 units do not manufacture it.
+
+| construct | items | % | root or cascade | wave |
+|---|---|---|---|---|
+| overloaded operator on a value class | 2212 | 33.2% | root 587 + cascade 1625 | W2.25 (new) |
+| base class with a destructor and/or virtuals | 2229 | 33.4% | root | partly W2.19; the destructor half was on NO wave |
+| method of an unimported class | 502 | 7.5% | pure cascade | FR-112 |
+| destructor / value-semantics use sites | 343 | 5.1% | root, 80 of 105 units | W2.17 follow-on |
+| `struct X was rejected` where X is probe-green | 284 | 4.3% | cascade, unreported root | mostly FR-102/FR-107 |
+| virtual method, no base involved | 295 | 4.4% | root | W2.19 -- and this is ALL it buys alone |
+| C pointer model | 113 | 1.7% | root | C-side |
+| references | 70 | 1.0% | root | -- |
+| STL not recognized (ostream 20, tuple 18, istream 16, shared_ptr 6) | 62 | 0.9% | root | partly W2.21 |
+| exceptions | 11 | 0.2% | root | W2.24 |
+| copy/move constructor semantics | 4 | 0.06% | root | W2.23 |
+| **`std::unique_ptr` / `make_unique`** | **0** | **0%** | -- | **W2.21** |
+
+**THE HEADLINE, and it is the thing naive counting gets wrong: 59.2% of
+all blocked items -- 3949 of 6669 -- never had their own construct
+examined.** Their diagnostic is `method of an unimported class` or
+`struct 'X' was rejected`. ONE unsupported member function rejects the
+ENTIRE class; see FR-112, which is now the top-ranked open item.
+
+**THE ROADMAP WAS AIMED AT 4.7% OF MEASURED DEMAND.** W2.19 + W2.21 +
+W2.23 + W2.24 together are 316 of 6669 items. `std::unique_ptr` appears
+in ZERO diagnostics across 105 real C++17 units; it shipped anyway
+(W2.21) because it was already in flight and the work is correct, but
+the sequencing was wrong and this table is why the order changed.
+
+TWO CAVEATS, both in the honest direction. Cascade shadowing
+UNDERSTATES the later waves: raytracing.github.io is built on
+`shared_ptr<hittable>` throughout yet yields ONE `shared_ptr`
+diagnostic, because its classes die at inheritance and `vec3`'s
+operators first. And the FR-41 probe's root tag is the ALPHABETIC
+MINIMUM of a class's tag set (`base-class` < `destructor` <
+`overloaded-operator` < `virtual-method`), so every reported root
+shadows the constructs after it. 4.7% measures what is REACHABLE today,
+not eventual need.
+
+The run also produced FR-113, FR-114 and FR-115 as minimal repros, and
+FR-115 is the reason this table needed two tools instead of one: 6193
+of 8851 items (70%) are status `missing` with no diagnostic at all.
+
+### Emitted-Rust quality, measured 2026-08-21 (the clippy metric)
+
+First measurement of the C++ surface, and a regression check on C. The
+frozen epoch-3 slices reproduce EXACTLY -- train 283 = 283 and held-out
+98 = 98, with identical per-lint breakdowns -- so FR-101..FR-107 and
+W2.15..W2.22 are clippy-neutral on emitted C.
+
+C++: 52 crates (29 Cpp17Suite entries + 23 EndToEnd), 71 warnings, ZERO
+rustc errors, and 14 of 29 suite crates completely clean. Normalized and
+excluding the off-limits `needless_late_init`, C++ is 0.10 warnings per
+crate against C's 0.15 -- **the new C++ lowerings are as clean as or
+cleaner than the mature C path.** Inheritance emits idiomatic
+`struct Derived { base: Base, y: i32 }` with no Deref hack; `impl Drop`
+is clean and correctly separate from the inherent impl; and the
+`std::cout` chains FUSE into `println!("i={} l={}", i, l)`, segmenting
+only where sequencing demands it.
+
+Two findings the metric itself cannot express. The `std::map`
+ordered-key-snapshot loop is the least idiomatic code in the corpus --
+fully-qualified UFCS everywhere and a hand-rolled counted loop -- and
+default clippy has no lint for either, so **the metric has a blind spot
+and must not be the sole quality oracle**. And the biggest idiomaticity
+gap in emitted C++, FR-110, is invisible to it entirely.
 
 
 ## Track 4 RealWorld corpus (demand signal)
