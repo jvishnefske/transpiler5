@@ -2906,8 +2906,45 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   // conversion SILENTLY, so before W2.18 an inherited call would have
   // borrowed the DERIVED place and handed it to the base method's `&Base`
   // parameter.
-  FailureOr<Value> receiver =
-      emitLValue(receiverExprPeeled->IgnoreParenImpCasts());
+  // FR-120: a receiver reached through a struct POINTER (`p->m()`,
+  // `(*p).m()`) resolves through the same pointer-place machinery
+  // `emitMemberBasePlace`'s `->` branch uses for `p->x`, instead of
+  // landing on the pointer decl inside `emitLValue` (whose blanket
+  // "unsupported use of pointer variable" rejection used to fire here).
+  // E0502 cannot recur structurally on this path (unlike W2.21's Box
+  // receiver, intercepted above): each argument renders as its own `let`
+  // and the receiver borrow is an inline autoref under two-phase
+  // borrows, so `p->bump(p->get())` is measured clean.
+  FailureOr<Value> receiver = [&]() -> FailureOr<Value> {
+    const clang::Expr *stripped = receiverExprPeeled->IgnoreParenImpCasts();
+    // `p->m()`: the implicit object argument IS the pointer (keep the
+    // implicit casts on — `isDecomposedPointerExpr`'s parameter check
+    // needs the LValueToRValue wrapper).
+    const clang::Expr *pointerExpr = nullptr;
+    if (isDataPointer(stripped->getType()))
+      pointerExpr = receiverExprPeeled;
+    // `(*p).m()`: peel the explicit dereference to the pointer.
+    else if (const auto *unary =
+                 llvm::dyn_cast<clang::UnaryOperator>(stripped);
+             unary && unary->getOpcode() == clang::UO_Deref &&
+             isDataPointer(unary->getSubExpr()->getType()))
+      pointerExpr = unary->getSubExpr();
+    if (!pointerExpr)
+      return emitLValue(stripped);
+    const clang::VarDecl *regionBase = nullptr;
+    FailureOr<Value> place =
+        emitStructPointerPlace(pointerExpr, loc, /*writeback=*/nullptr,
+                               &regionBase);
+    if (failed(place))
+      return failure();
+    // A GLOBAL region base resolves through a staged copy, and the call
+    // path has no writeback machinery: a mutating method's effect on the
+    // copy would be silently dropped. Reject rather than miscompile.
+    if (regionBase && !regionBase->hasLocalStorage() && !method->isConst())
+      return emitError(loc) << "unsupported: mutating method call through a "
+                               "pointer to a global object";
+    return place;
+  }();
   if (failed(receiver))
     return failure();
   auto receiverLValueType =

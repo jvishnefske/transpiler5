@@ -6099,6 +6099,83 @@ CImporter::projectBaseHops(Value place, llvm::ArrayRef<clang::QualType> hops,
   return place;
 }
 
+// FR-120: the upcast-binding soundness line — see the declaration comment.
+// The hop walk is the SAME `uniquePublicSingleBaseHops` that gated the
+// peel in `peelPointerCast`, so a binding the planner admitted can never
+// fail to reconcile except through a genuinely unreachable pair (kept as
+// a located rejection rather than an assert, since this is also called
+// with viewed types the peel never saw, e.g. a `D *` member access after
+// a same-type binding, where the fast type-equality exit applies).
+FailureOr<Value>
+CImporter::reconcileUpcastPlace(Value place, clang::QualType baseObjectType,
+                                clang::QualType viewedPointee, Location loc) {
+  auto lvalue = llvm::dyn_cast<emitrust::LValueType>(place.getType());
+  if (!lvalue || !llvm::isa<emitrust::StructType>(lvalue.getValueType()))
+    return place; // Non-struct places have no base subobjects.
+  if (!viewedPointee.getCanonicalType()->getAsCXXRecordDecl())
+    return place;
+  FailureOr<Type> viewedType = mapType(viewedPointee, loc);
+  if (failed(viewedType))
+    return failure();
+  if (*viewedType == lvalue.getValueType())
+    return place; // Types agree; no upcast to reconcile.
+  // The place's struct differs from the viewed base struct: the binding
+  // was an upcast. Recompute the (unique, by admission) hop path from the
+  // bound object's record and project one `base` field per hop.
+  llvm::SmallVector<clang::QualType, 2> hops;
+  if (!uniquePublicSingleBaseHops(baseObjectType, viewedPointee, &hops))
+    return emitError(loc) << "unsupported: base subobject pointer with no "
+                             "unique base path";
+  return projectBaseHops(place, hops, loc);
+}
+
+// FR-120: shared pointer-receiver/pointer-member resolution — see the
+// declaration comment.
+FailureOr<Value>
+CImporter::emitStructPointerPlace(const clang::Expr *pointerExpr, Location loc,
+                                  GlobalWriteback *writeback,
+                                  const clang::VarDecl **outBase) {
+  clang::QualType pointeeQt =
+      pointerExpr->getType().getCanonicalType()->getPointeeType();
+  // Capture the VIEWED pointee first (it names the base subobject the
+  // use sees), then peel the transparent casts — qualification NoOps
+  // (const-method receivers) and the FR-120 derived-to-base peel — so
+  // the parameter/local classification below sees the bare shape.
+  pointerExpr = stripTrivia(pointerExpr);
+  while (const clang::Expr *sub = peelPointerCast(astContext(), pointerExpr))
+    pointerExpr = stripTrivia(sub);
+  if (isDecomposedPointerExpr(pointerExpr) &&
+      !matchStlBoxDerefBase(pointerExpr)) {
+    FailureOr<PtrExprValue> pointer = emitPointerRValue(pointerExpr);
+    if (failed(pointer))
+      return failure();
+    if (outBase)
+      *outBase = pointer->base;
+    FailureOr<Type> pointeeType = mapType(pointeeQt, loc);
+    if (failed(pointeeType))
+      return failure();
+    FailureOr<Value> place =
+        emitPointerPlace(loc, *pointer, *pointeeType, writeback);
+    if (failed(place))
+      return failure();
+    if (pointer->base)
+      return reconcileUpcastPlace(*place, pointer->base->getType(), pointeeQt,
+                                  loc);
+    return place;
+  }
+  FailureOr<Value> base = emitRValue(pointerExpr);
+  if (failed(base))
+    return failure();
+  Type pointee = borrowPointee((*base).getType());
+  if (!pointee)
+    return emitError(loc)
+           << "unsupported: '->' base is not a supported pointer";
+  return builder
+      .create<emitrust::DerefOp>(loc, emitrust::LValueType::get(pointee),
+                                 *base)
+      .getResult();
+}
+
 FailureOr<Value>
 CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
                                GlobalWriteback *writeback) {
@@ -6127,6 +6204,14 @@ CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
         place = emitCxxThisPlace(loc);
       else if (!member->isArrow())
         place = emitLValue(inner, writeback);
+      else if (isDataPointer(inner->getType()))
+        // FR-120: `p->x` for an inherited `x` — resolve the pointer to
+        // its (upcast-reconciled) pointee place, then project the
+        // explicit hops below. This replaces the W2.18 "inherited member
+        // through a pointer to a derived class" rejection for data
+        // pointers; the wording survives for the residual non-pointer
+        // arrow bases (e.g. a Box pointee, which stays rejected).
+        place = emitStructPointerPlace(inner, loc, writeback);
       else
         return emitError(loc)
                << "unsupported: inherited member through a pointer to a "
@@ -6193,6 +6278,20 @@ CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
         emitPointerPlace(loc, *pointer, *pointeeType, writeback);
     if (failed(place))
       return failure();
+    // FR-120: an UPCAST binding leaves the resolved place at the
+    // DERIVED struct while the member lives on the base; project the
+    // unique `base` hop chain so the member op below lands on the right
+    // subobject. Without this the member op VERIFIES (no field-existence
+    // check) and the miss surfaces only as rustc E0609 — or, under a
+    // shadowed field, as a silently wrong subobject.
+    if (pointer->base) {
+      place = reconcileUpcastPlace(
+          *place, pointer->base->getType(),
+          member->getBase()->getType().getCanonicalType()->getPointeeType(),
+          loc);
+      if (failed(place))
+        return failure();
+    }
     basePlace = *place;
   } else if (member->isArrow()) {
     FailureOr<Value> base = emitRValue(member->getBase());

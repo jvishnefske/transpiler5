@@ -5815,6 +5815,38 @@ private:
                                    llvm::ArrayRef<clang::QualType> hops,
                                    Location loc);
 
+  /// FR-120: resolves a struct-pointer expression (`p` in `p->m()` /
+  /// `p->x` / `(*p).m()`) to the pointee's place — the decomposed-pointer
+  /// path (`emitPointerRValue` + `emitPointerPlace`) for region-tracked
+  /// locals, the borrow-deref path for reference-typed pointer
+  /// parameters — and reconciles an UPCAST binding (region base object
+  /// more derived than the pointer's static pointee) by projecting
+  /// `member ["base"]` hops. `outBase` (optional) receives the region
+  /// base VarDecl when the decomposed path resolved one, so callers can
+  /// screen global bases.
+  FailureOr<Value> emitStructPointerPlace(const clang::Expr *pointerExpr,
+                                          Location loc,
+                                          GlobalWriteback *writeback,
+                                          const clang::VarDecl **outBase =
+                                              nullptr);
+
+  /// FR-120: if `place` is a struct place whose type differs from the
+  /// mapped `viewedPointee` struct, recomputes the unique single public
+  /// non-virtual base chain from `baseObjectType`'s record to
+  /// `viewedPointee`'s record (`uniquePublicSingleBaseHops`) and projects
+  /// one `member ["base"]` per hop; rejects (located) when no such chain
+  /// exists. THIS IS THE SOUNDNESS LINE for upcast bindings: without it
+  /// the peel hands consumers the DERIVED place — `emitPointerPlace` has
+  /// no pointee type check and `emitrust.member` no field-existence
+  /// check, so a missing reconcile surfaces only as rustc E0609, or, when
+  /// the derived class SHADOWS a base field, as a silently wrong
+  /// subobject (measured; the byte-diff leg in
+  /// test/EndToEnd/cpp-upcast-pointer.cpp pins it).
+  FailureOr<Value> reconcileUpcastPlace(Value place,
+                                        clang::QualType baseObjectType,
+                                        clang::QualType viewedPointee,
+                                        Location loc);
+
   /// Reads the current value of a place produced by `emitLValue`.
   Value loadPlace(Location loc, Value place);
 
@@ -7419,12 +7451,99 @@ pointerArrayMemberType(const clang::ASTContext &context, clang::QualType type) {
 /// (`(char *)&x`) and integer-to-pointer casts are never peeled: the
 /// decomposition's element unit would change, so those shapes keep their
 /// located rejections.
+/// FR-120: collects the base-hop path from `fromRecordTy`'s record to
+/// `toRecordTy`'s record when — and only when — it runs through SINGLE,
+/// public, non-virtual, NON-POLYMORPHIC bases, i.e. the exact shape
+/// W2.18's admission guard lowers as a first field named `base`. Returns
+/// false (leaving `hops` untouched) for every other shape.
+///
+/// THE CORRECTNESS OF FR-120's WHOLE-OBJECT UPCAST BINDING RESTS ON THIS
+/// PREDICATE. Because the admitted chain is single and public, the hop
+/// path from the bound derived record to any viewed base record is UNIQUE
+/// and recomputable from the two types alone, so an upcast pointer can
+/// bind the WHOLE derived object (ordinary null-member binding, no stored
+/// path) and every use site reconciles by re-deriving the hops
+/// (`reconcileUpcastPlace`). If the admission guard ever widens to
+/// MULTIPLE inheritance, that argument collapses — the path stops being
+/// unique, hops stop being recomputable, and a stored-path binding kind
+/// becomes necessary. Assert this predicate against that day: it must
+/// keep answering false for any record with more than one base.
+///
+/// POLYMORPHIC chains are excluded HERE, not upstream: since W2.26 a
+/// class whose sole virtual member is its destructor is ADMITTED at class
+/// level (it imports, its direct base hops project), so no class-level
+/// rejection backstops "virtual anything" once `peelPointerCast` learns
+/// derived-to-base. Without this check `V *p = &w;` over a virtual-dtor
+/// chain would silently bind and `p->get()` would statically bind through
+/// the value subset — the dynamism a base POINTER exists to observe.
+static inline bool
+uniquePublicSingleBaseHops(clang::QualType fromRecordTy,
+                           clang::QualType toRecordTy,
+                           llvm::SmallVectorImpl<clang::QualType> *hops) {
+  const clang::CXXRecordDecl *record =
+      fromRecordTy.getCanonicalType()->getAsCXXRecordDecl();
+  const clang::CXXRecordDecl *target =
+      toRecordTy.getCanonicalType()->getAsCXXRecordDecl();
+  if (!record || !target)
+    return false;
+  const clang::CXXRecordDecl *targetCanon = target->getCanonicalDecl();
+  if (record->getCanonicalDecl() == targetCanon)
+    return false; // Same record: nothing to peel; callers use type equality.
+  llvm::SmallVector<clang::QualType, 2> path;
+  int depth = 0;
+  while (record && record->getCanonicalDecl() != targetCanon) {
+    record = record->getDefinition();
+    if (!record || record->getNumBases() != 1 || record->isPolymorphic() ||
+        ++depth > 64)
+      return false;
+    const clang::CXXBaseSpecifier &spec = *record->bases_begin();
+    if (spec.isVirtual() || spec.getAccessSpecifier() != clang::AS_public)
+      return false;
+    path.push_back(spec.getType());
+    record = spec.getType()->getAsCXXRecordDecl();
+  }
+  if (!record || record->getCanonicalDecl() != targetCanon)
+    return false;
+  const clang::CXXRecordDecl *targetDef = record->getDefinition();
+  if (!targetDef || targetDef->isPolymorphic())
+    return false;
+  if (hops)
+    hops->append(path.begin(), path.end());
+  return true;
+}
+
+/// FR-120: the predicate spelling of `uniquePublicSingleBaseHops`, for
+/// gate sites (`peelPointerCast`, `emitPointerLocal`) that only need the
+/// yes/no answer.
+static inline bool uniquePublicSingleBaseChain(clang::QualType fromRecordTy,
+                                               clang::QualType toRecordTy) {
+  return uniquePublicSingleBaseHops(fromRecordTy, toRecordTy,
+                                    /*hops=*/nullptr);
+}
+
 static inline const clang::Expr *peelPointerCast(clang::ASTContext &context,
                                           const clang::Expr *expr) {
   const auto *cast = llvm::dyn_cast<clang::CastExpr>(expr);
   if (!cast || (!llvm::isa<clang::CStyleCastExpr>(cast) &&
                 !llvm::isa<clang::ImplicitCastExpr>(cast)))
     return nullptr;
+  // FR-120: a derived-to-base pointer upcast over a unique single public
+  // non-virtual non-polymorphic chain is transparent to the whole-object
+  // binding — the region binds the DERIVED object (ordinary null-member
+  // binding, no third binding kind) and every struct-place use site
+  // reconciles the viewed base type by re-deriving the hop path
+  // (`reconcileUpcastPlace`). Keyed on the cast KIND, not the spelling:
+  // an explicit `(A *)&d` C-style cast wraps the same CK_DerivedToBase
+  // node. Chains the predicate refuses fall through to the CK gate below
+  // and keep the planner's non-address rejection.
+  if ((cast->getCastKind() == clang::CK_DerivedToBase ||
+       cast->getCastKind() == clang::CK_UncheckedDerivedToBase) &&
+      isDataPointer(cast->getType()) &&
+      isDataPointer(cast->getSubExpr()->getType()) &&
+      uniquePublicSingleBaseChain(
+          cast->getSubExpr()->getType().getCanonicalType()->getPointeeType(),
+          cast->getType().getCanonicalType()->getPointeeType()))
+    return cast->getSubExpr();
   if (cast->getCastKind() != clang::CK_NoOp &&
       cast->getCastKind() != clang::CK_BitCast)
     return nullptr;
@@ -7960,9 +8079,27 @@ static inline void collectSliceParamsImpl(
     if (unary->getOpcode() == clang::UO_Deref &&
         asPointerParamRef(unary->getSubExpr()))
       return; // Benign direct dereference; do not descend into the read.
-  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(stmt))
-    if (member->isArrow() && asPointerParamRef(member->getBase()))
+  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(stmt)) {
+    // FR-120: a CONST method through a non-const pointer receiver stacks
+    // a NoOp qualification cast OVER the LValueToRValue read (`p->get()`
+    // for `Counter *p` binding the method's implicit `const Counter *`),
+    // which the single-peel `asPointerParamRef` misses — so the parameter
+    // used to classify SLICE and every call site died with the
+    // scalar-as-slice wording. Peel the NoOp stack HERE, scoped to the
+    // benign-arrow screen: looping the peel inside the SHARED
+    // `asPointerParamRef` was measured to break the FR-100 CONSTPTR pin
+    // (test/Import/C/scalar-out-param-forward-invalid.c), whose
+    // slice-forwarding proof deliberately requires a BARE parameter ref.
+    const clang::Expr *arrowBase = stripTrivia(member->getBase());
+    while (const auto *cast =
+               llvm::dyn_cast<clang::ImplicitCastExpr>(arrowBase)) {
+      if (cast->getCastKind() != clang::CK_NoOp)
+        break;
+      arrowBase = stripTrivia(cast->getSubExpr());
+    }
+    if (member->isArrow() && asPointerParamRef(arrowBase))
       return; // Benign arrow access; the base has no other children.
+  }
   if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
     // FR-100: a USABLE callee is a direct, in-TU definition with a body,
     // non-variadic, of matching arity. Anything else (an indirect call, a

@@ -150,12 +150,11 @@ anchor = "W2.25"
 
 [[items]]
 id = "FR-120"
-rank = 5
 kind = "feature"
-status = "spiked"
+status = "landed"
 size = "M"
-title = "Struct-pointer method calls + upcast bindings (no third binding kind needed)"
-summary = "GO: hops are recomputable under the single-base guard, so the region binds the whole derived object and consumers reconcile via projectBaseHops. Open question answered YES by byte-diff. Honest unlocks: 00901 still blocked (empty base), tinyxml2 delta ZERO -- necessary, not sufficient."
+title = "Struct-pointer method calls + upcast bindings"
+summary = "Landed 2026-08-22: p->m() through locals/params, Base* upcast bindings with reconcileUpcastPlace as the soundness line (shadowed-field silent miscompile pinned by byte-diff), scoped slice-screen fix, polymorphic-chain exclusion. W2.19b unblocked."
 blocked_by = []
 anchor = "FR-120"
 

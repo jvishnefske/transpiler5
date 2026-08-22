@@ -7629,7 +7629,7 @@ piece and becomes FR-45.
   test/Import/Cpp/ostream-invalid.cpp)
 
 
-- [ ] FR-120 Struct-pointer prerequisite: method calls and
+- [x] FR-120 Struct-pointer prerequisite: method calls and
   base-subobject bindings through struct pointers. Spike verdict
   **GO-WITH-CONSTRAINTS** (2026-08-22), and the LARGE item came back
   MATERIALLY SIMPLER than W2.19's NO-GO predicted: **no third binding
@@ -7704,6 +7704,52 @@ piece and becomes FR-45.
   recomputable-hops argument collapses and the stored-path third kind
   becomes real -- assert the predicate against that day.
   **SPIKED.**
+  LANDED 2026-08-22 after a re-spike at HEAD (W2.26 landed between
+  spike and implementation and CHANGED one measured wall: an empty
+  droppy base now HAS a materialized base field, so the empty-base
+  probes were re-measured rather than trusted -- the AST-isEmpty()
+  SCREEN still rejects, deliberately, but it is now a screen, not a
+  field-absence fact). The re-spike also found the post-W2.26
+  POLYMORPHIC-CHAIN EXCLUSION: a sole-virtual-dtor class V and its
+  derived W are now class-ADMITTED with working direct hop projection,
+  so NO class-level rejection backstops the V* upcast once the peel
+  learns CK_DerivedToBase -- `uniquePublicSingleBaseChain` must answer
+  FALSE for polymorphic chains, and does; the VUPCAST pin's wording is
+  unchanged but its enforcement moved into the predicate, recorded in
+  the pin's comment.
+  THE SOUNDNESS LINE WAS PROVEN SHARPER THAN THE FIRST SPIKE KNEW:
+  naive-peel IR passes emitrust-opt verify (MemberOp has no
+  field-existence check), legalizes through the whole cc pipeline,
+  and translates -- and the SHADOWED-FIELD variant (Derived and Base
+  both declaring `x`) COMPILES CLEAN and prints the wrong subobject.
+  Only the byte-diff catches it, so the missing-reconcile regression
+  pin is a shadowed-field EndToEnd leg, not an E0609 expectation.
+  `reconcileUpcastPlace` guards all three consumer sites; the
+  DERIVEDPTR rejection is replaced by the reconcile (its wording
+  survives only for non-pointer arrow bases, e.g. Box pointees).
+  Landed exactly as re-spiked: the hop-collecting predicate with the
+  multiple-inheritance collapse warning in comment AND here; the
+  emitCXXMemberCall receiver interception (E0502 pinned structurally
+  impossible: argument-per-let + inline autoref); the SCOPED
+  benign-arrow slice-screen fix with FR-100's CONSTPTR pin intact; the
+  new `mutating method call through a pointer to a global object`
+  wording (tag cxx-method-global-receiver, mirrored) while the
+  CONST-method read through a global pointer is newly ADMITTED with
+  its own positive byte-diff leg; REBIND pinned to joinReject.
+  UPPTR and DERIVEDPTR frontier pins moved forward into positives with
+  the trail. Fences all pinned surviving THROUGH the new paths.
+  Gates: full meson suite 760/760 (fast 540 + slow/EndToEnd 220), run
+  twice, 0 failures; CTestSuite 220/220/0/0 (the peel is provably
+  invisible to C, held); Cpp17Suite 31/34 unchanged -- 00901 confirmed
+  no-flip per the spike's empty-base finding; RealWorld unchanged.
+  W2.19b's blocked_by is now satisfied; its receiver design note
+  (reconcile toward the devirt TARGET's class) carries forward.
+  (test/EndToEnd/cpp-struct-pointer-methods.cpp,
+  cpp-upcast-pointer.cpp; test/Import/Cpp/struct-pointer-methods.cpp,
+  struct-pointer-methods-invalid.cpp, inheritance-upcast.cpp; UPPTR/
+  DERIVEDPTR moved forward from inheritance-invalid.cpp, UPCAST from
+  inheritance-drop-invalid.cpp)
+
 
 - [ ] FR-121 DEFECT (found by FR-113's spike, the next uniform
   spdlog blocker): a deferred `[i8; N]` binding (a `__FILE__`-derived

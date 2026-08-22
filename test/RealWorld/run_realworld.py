@@ -367,6 +367,11 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("inherited member of an empty base class", "cxx-inheritance-empty-base"),
     ("constructor of an empty base class", "cxx-inheritance-empty-base"),
     ("inherited member through a pointer to a derived class", "cxx-inheritance-upcast"),
+    # FR-120 admitted method calls/upcast bindings through LOCAL struct
+    # pointers; a mutating method through a pointer to a GLOBAL object has
+    # no writeback flush and keeps its own wording.
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("mutating method call through a pointer to a global object", "cxx-method-global-receiver"),
     ("inherited access through a non-struct place", "cxx-inheritance"),
     ("base constructor initializer", "cxx-inheritance"),
     # W2.17 admitted the non-virtual, same-TU-defined destructor; the generic

@@ -11,7 +11,6 @@
 // RUN: not emitrust-import-c %t/virtual-dtor-plus-method.cpp 2>&1 | FileCheck %s --check-prefix=MULTIVIRT
 // RUN: not emitrust-import-c %t/empty-droppy-base-ctor.cpp 2>&1 | FileCheck %s --check-prefix=EMPTYCTOR
 // RUN: not emitrust-import-c %t/empty-droppy-base-call.cpp 2>&1 | FileCheck %s --check-prefix=EMPTYHOP
-// RUN: not emitrust-import-c %t/upcast-pointer-droppy.cpp 2>&1 | FileCheck %s --check-prefix=UPCAST
 // RUN: not emitrust-import-c %t/upcast-pointer-virtual.cpp 2>&1 | FileCheck %s --check-prefix=VUPCAST
 // RUN: not emitrust-import-c %t/sizeof-polymorphic.cpp 2>&1 | FileCheck %s --check-prefix=SIZEOFPOLY
 
@@ -55,9 +54,13 @@
 // * an inherited member reached THROUGH an empty droppy base: kept as the
 //   conservative W2.18 rejection this wave (the hop screens key on the
 //   AST's isEmpty(), which materialization does not change).
-// * every UPCAST spelling stays blocked by pre-existing rejections
-//   (`Base *p = &d;` below); delete-through-base-pointer is unreachable
-//   (new/delete are themselves rejections).
+// * the droppy-base UPCAST (`B *p = &d;` for a non-virtual droppy
+//   chain) was pinned here as UPCAST until FR-120 flipped it positive:
+//   the pin moved FORWARD into the byte-diff oracle
+//   test/EndToEnd/cpp-upcast-pointer.cpp (its RB/RD legs).
+//   delete-through-base-pointer stays unreachable (new/delete are
+//   themselves rejections), and the POLYMORPHIC upcast below stays a
+//   located rejection.
 // * sizeof/alignof of a POLYMORPHIC class: clang folds the vptr-carrying
 //   native layout (16 for `V` below) while the emitted struct has no
 //   vptr (4 bytes) -- the same promise-a-layout-Rust-never-keeps screen
@@ -277,25 +280,6 @@ int use(int n) {
   return c.id() + c.r;
 }
 
-//--- upcast-pointer-droppy.cpp
-extern "C" int printf(const char *, ...);
-struct B {
-  int x;
-  B(int v) : x(v) {}
-  int get() const { return x; }
-  ~B() { printf("~B %d\n", x); }
-};
-struct D : B {
-  int y;
-  D(int v) : B(v), y(v) {}
-};
-// UPCAST: upcast-pointer-droppy.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer assigned a non-address value
-int use(int n) {
-  D d(n);
-  B *p = &d;
-  return p->get();
-}
-
 //--- upcast-pointer-virtual.cpp
 extern "C" int printf(const char *, ...);
 struct V {
@@ -309,9 +293,14 @@ struct W : V {
   W(int i) : V(i), w(i) {}
 };
 // A virtual destructor plus a BASE-POINTER use: the one pairing where the
-// dynamism the value subset ignores could be observed. Blocked by the
-// same pre-existing pointer rejection as the non-virtual upcast above
-// (and delete-through-base is unreachable: new/delete are rejections).
+// dynamism the value subset ignores could be observed. Since FR-120
+// taught `peelPointerCast` derived-to-base, NOTHING class-level backstops
+// this shape -- `V` and `W` are both ADMITTED classes (W2.26's
+// sole-virtual-dtor carve-out) with working direct hop projection -- so
+// the fence is `uniquePublicSingleBaseChain` itself answering FALSE for
+// polymorphic chains. Without that exclusion the binding would silently
+// admit and `p->get()` would statically bind through the value subset.
+// The refused peel falls through to the planner's non-address rejection.
 // VUPCAST: upcast-pointer-virtual.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer assigned a non-address value
 int use(int n) {
   W obj(n);
