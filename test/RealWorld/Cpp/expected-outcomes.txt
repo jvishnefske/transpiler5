@@ -31,5 +31,5 @@ extern-plugin LIB_BUILT  # ported 7/7
 fixed-stats TRANSPILED  # ported 11/11
 polygon REJECTED unsupported-stmt:CXXForRangeStmt  # ported 4/8
 ringbuf-lib LIB_BUILT  # ported 12/12
-shapes REJECTED cxx-virtual-destructor  # ported 1/7
+shapes REJECTED cxx-destructor-no-body  # ported 1/7
 tokenizer TRANSPILED  # ported 5/5

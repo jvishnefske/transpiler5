@@ -49,7 +49,9 @@ LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   // is NEVER dropped -- and the emitter localizes such storage into a
   // function-scope binding whose drop then runs at the WRONG time
   // (measured: `dtor 99 / dtor 0` in C++ against `dtor 0 / dtor 99`).
-  if (userDeclaredDestructor(astContext(), var->getType()))
+  // W2.26: transitive -- a global of a droppy-DERIVED class loses its
+  // inherited destructor the same way.
+  if (userOrInheritedDestructor(astContext(), var->getType()))
     return emitError(loc) << "unsupported: global or static object of a class "
                              "with a destructor";
 

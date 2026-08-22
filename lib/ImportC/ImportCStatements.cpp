@@ -370,7 +370,9 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   // drops; an ARRAY is destroyed in reverse index order by C++ and forward
   // order by Rust (and `[X; N]` repeat is rustc E0277 once `Copy` is gone);
   // an unmodeled scope moves the drop point (see `checkDropLocalScope`).
-  if (userDeclaredDestructor(astContext(), var->getType())) {
+  // W2.26: transitive -- a droppy-DERIVED local (its class merely inherits
+  // the destructor) takes every one of these gates identically.
+  if (userOrInheritedDestructor(astContext(), var->getType())) {
     if (!var->hasLocalStorage())
       return emitError(loc) << "unsupported: global or static object of a "
                                "class with a destructor";

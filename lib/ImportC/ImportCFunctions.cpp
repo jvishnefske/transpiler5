@@ -411,12 +411,14 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // Checked on the signature, ahead of every parameter-classification path,
   // so a prototype and its definition reject identically. The receiver is
   // not a parameter here (it is a reference, added below) and so is exempt.
+  // W2.26: transitive -- a droppy-DERIVED class crossing by value has the
+  // same two-runs-vs-one divergence through its inherited destructor.
   for (const clang::ParmVarDecl *param : func->parameters())
-    if (userDeclaredDestructor(astContext(), param->getType()))
+    if (userOrInheritedDestructor(astContext(), param->getType()))
       return emitError(translateLoc(param->getLocation()))
              << "unsupported: class with a destructor passed or returned by "
                 "value";
-  if (userDeclaredDestructor(astContext(), func->getReturnType()))
+  if (userOrInheritedDestructor(astContext(), func->getReturnType()))
     return emitError(loc)
            << "unsupported: class with a destructor passed or returned by "
               "value";

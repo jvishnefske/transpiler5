@@ -166,13 +166,12 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
     // its own tag so the backlog can rank them separately -- the same
     // discipline W2.17 applied to the destructor family.
     //
-    // A base carrying a destructor belongs to the DROP family, not the
-    // inheritance one: the divergence is a drop that never happens (the
-    // derived class does not answer `hasUserDeclaredDestructor`, so no
-    // W2.17 use-site gate fires) plus a `Copy` derive the class must not
-    // have.
-    {llvm::StringLiteral("base class with a destructor"),
-     llvm::StringLiteral("cxx-drop-base")},
+    // W2.26 retired `cxx-drop-base` and `cxx-virtual-destructor`: a
+    // destructor-carrying single public base and a sole-virtual-dtor class
+    // are ADMITTED (the transitive drop predicate closes the lost-drop and
+    // E0204 channels), and each wording had exactly one emitter, so both
+    // rows went with their gates. A virtual destructor beside any OTHER
+    // virtual method still rejects -- at that method, under `cxx-virtual`.
     // An empty base carries no field to project through: both wordings are
     // the residual accesses that would otherwise name a field that does
     // not exist, or drop a base constructor body.
@@ -192,8 +191,6 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
     // destructor), and every measured miscompile channel around the
     // admitted subset gets its own tag so the backlog can rank them
     // separately instead of collapsing them into one `cxx-destructor`.
-    {llvm::StringLiteral("virtual destructor"),
-     llvm::StringLiteral("cxx-virtual-destructor")},
     {llvm::StringLiteral("destructor with no definition in this translation "
                          "unit"),
      llvm::StringLiteral("cxx-destructor-no-body")},

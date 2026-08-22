@@ -420,6 +420,32 @@ static inline bool typeContainsLongDouble(clang::QualType type) {
   return false;
 }
 
+/// W2.26: returns whether `type` is, or contains (through record fields,
+/// base classes and array elements, never through pointers), a POLYMORPHIC
+/// C++ class. Used to refuse `sizeof`/`alignof` folds over such types: the
+/// C fold counts the vptr (16 for a sole-virtual-dtor class holding one
+/// int on x86-64) while the emitted Rust struct carries no vptr at all
+/// (4 bytes) -- a layout the emitted code never keeps, the same reasoning
+/// as the bit-field and long double screens above.
+static inline bool typeContainsPolymorphicRecord(clang::QualType type) {
+  const clang::Type *canonical = type.getCanonicalType().getTypePtr();
+  while (const auto *array = llvm::dyn_cast<clang::ArrayType>(canonical))
+    canonical = array->getElementType().getCanonicalType().getTypePtr();
+  const clang::RecordDecl *record = canonical->getAsRecordDecl();
+  if (!record)
+    return false;
+  record = record->getDefinition();
+  if (!record)
+    return false;
+  if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(record))
+    if (cxxRecord->isPolymorphic())
+      return true;
+  for (const clang::FieldDecl *field : record->fields())
+    if (typeContainsPolymorphicRecord(field->getType()))
+      return true;
+  return false;
+}
+
 /// Builds a FloatAttr of `type` from `value`, converting the APFloat to
 /// the type's semantics when they differ. The only differing source is a
 /// `long double` constant (x87 80-bit extended on the x86-64 target),
@@ -1099,6 +1125,19 @@ bool mutatesVar(const clang::Stmt *stmt, const clang::VarDecl *var);
 /// shared with the local/global/parameter/expression admission checks.
 const clang::CXXDestructorDecl *userDeclaredDestructor(clang::ASTContext &context,
                                                        clang::QualType type);
+
+/// W2.26: the TRANSITIVE form of `userDeclaredDestructor` -- the class's own
+/// user-declared destructor, or the nearest one INHERITED down the
+/// single-public-non-virtual-base chain (the only chain shape the importer
+/// admits as a `base` field), or null. This is what every use-site drop
+/// gate and the `emitrust.has_drop` synthesis key on: a merely-inheriting
+/// derived class answers FALSE to `hasUserDeclaredDestructor`, so without
+/// the recursion none of W2.17's gates could see a droppy-DERIVED object at
+/// all and the emitted struct would keep a `Copy` derive beside a base
+/// field that implements `Drop` (rustc E0204, measured). Defined in
+/// ImportCAggregates.cpp.
+const clang::CXXDestructorDecl *
+userOrInheritedDestructor(clang::ASTContext &context, clang::QualType type);
 
 /// W2.18: peels the implicit derived-to-base conversion clang wraps around
 /// the receiver of an INHERITED access, appending one entry to `hops` per

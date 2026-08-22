@@ -360,7 +360,10 @@ _CXX_BLOCKER_SUBSTRINGS = [
     # specialization base). The wordings below are the measured miscompile
     # channels around the admitted subset, each with its own tag.
     # Mirrors lib/ImportC/RejectionLedger.cpp.
-    ("base class with a destructor", "cxx-drop-base"),
+    # W2.26 retired "base class with a destructor"/cxx-drop-base and
+    # "virtual destructor"/cxx-virtual-destructor: both shapes are admitted
+    # (transitive drop predicate) and each wording had exactly one emitter.
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
     ("inherited member of an empty base class", "cxx-inheritance-empty-base"),
     ("constructor of an empty base class", "cxx-inheritance-empty-base"),
     ("inherited member through a pointer to a derived class", "cxx-inheritance-upcast"),
@@ -370,7 +373,6 @@ _CXX_BLOCKER_SUBSTRINGS = [
     # wording is retained for the residual (union) shape, and every measured
     # miscompile channel around the admitted subset gets its own tag.
     # Mirrors lib/ImportC/RejectionLedger.cpp.
-    ("virtual destructor", "cxx-virtual-destructor"),
     ("destructor with no definition in this translation unit", "cxx-destructor-no-body"),
     ("destructor collides with the member function 'dtor'", "cxx-destructor-name-clash"),
     ("struct member of a class with a destructor", "cxx-drop-member"),

@@ -37,6 +37,23 @@
 // importer gate in `collectRecordFields`. Green-with-omission next to
 // red-for-virtual is exactly the line FR-112 draws.
 //
+// W2.26 re-drew the destructor/inheritance boundary and this file moved
+// WITH it (the same stale-screen lesson, third application): a base class
+// carrying a destructor no longer disqualifies `admitsSingleBaseAsField`
+// (`Inherits` below is Green -- a merely-inheriting class gets a
+// TRANSITIVE has_drop and imports), a class whose SOLE virtual member is
+// its destructor is admissible (`SoleVirt` Green), and the virtual-method
+// screen must EXCLUDE the destructor or a sole-virtual-dtor class stays
+// falsely Red -- the FR-41 forbidden direction (`MultiVirt` pins the
+// residual: any OTHER virtual method still rejects, and its construct tag
+// must be `virtual-method`, not a double-tagged `destructor`). The wave
+// also closes a false GREEN the base-screen removal would have widened: a
+// field whose class carries a destructor -- its OWN or an inherited one
+// -- is an importer rejection (`struct member of a class with a
+// destructor`, the measured member-vs-base drop-order divergence), so the
+// probe now screens droppy FIELDS transitively (`MemberBesideBase`,
+// `HoldsInherits`).
+//
 // A CONVERSION FUNCTION is deliberately NOT screened: FR-117 omits it and
 // keeps the class importable, so screening it would mint a fresh false red.
 // `Conv` pinned Green is that agreement.
@@ -107,17 +124,66 @@ struct Conv {
   operator int() const { return v; }
 };
 
+/// Green: a destructor defined in this TU is admitted (W2.17), and stays
+/// the anchor for the inheritance cases below.
+struct DropBase {
+  int v;
+  ~DropBase() { v = 0; }
+};
+
+/// Green since W2.26: merely inheriting over a droppy base -- the importer
+/// synthesizes a transitive has_drop, no impl Drop of its own.
+struct Inherits : public DropBase {
+  int extra;
+};
+
+/// Green since W2.26: the SOLE virtual member is the destructor.
+struct SoleVirt {
+  int v;
+  virtual ~SoleVirt() { v = 0; }
+};
+
+/// Red, and under `virtual-method`: a virtual destructor beside ANOTHER
+/// virtual method. The pin would read `construct=destructor` if the
+/// virtual-method screen forgot to exclude the destructor (the coloring
+/// method loop, unlike the importer's, does not `continue` after the
+/// destructor branch).
+struct MultiVirt {
+  int v;
+  virtual ~MultiVirt() { v = 0; }
+  virtual int get() const;
+};
+
+/// Red: a droppy MEMBER beside a droppy base is the measured drop-order
+/// divergence (~D ~M ~B native vs ~D ~B ~M image); the importer's member
+/// gate stays, so the probe screens it too.
+struct MemberBesideBase : public DropBase {
+  DropBase again;
+};
+
+/// Red THROUGH the transitive predicate: the member's class has no
+/// destructor of its own, only an inherited one.
+struct HoldsInherits {
+  Inherits h;
+};
+
 int main() { return 0; }
 
 // CHECK:      item Conv kind=record color=green reason=admissible
 // CHECK-NEXT: item Copyable kind=record color=red reason=inadmissible construct=copy-move-constructor
 // CHECK-NEXT: item DefaultedCopy kind=record color=red reason=inadmissible construct=copy-move-constructor
 // CHECK-NEXT: item Delegating kind=record color=red reason=inadmissible construct=copy-move-constructor
+// CHECK-NEXT: item DropBase kind=record color=green reason=admissible
+// CHECK-NEXT: item HoldsInherits kind=record color=red reason=inadmissible construct=destructor
+// CHECK-NEXT: item Inherits kind=record color=green reason=admissible
+// CHECK-NEXT: item MemberBesideBase kind=record color=red reason=inadmissible construct=destructor
 // CHECK-NEXT: item Movable kind=record color=red reason=inadmissible construct=copy-move-constructor
+// CHECK-NEXT: item MultiVirt kind=record color=red reason=inadmissible construct=virtual-method
 // CHECK-NEXT: item OpStruct kind=record color=green reason=admissible
 // CHECK-NEXT: item Plain kind=record color=green reason=admissible
+// CHECK-NEXT: item SoleVirt kind=record color=green reason=admissible
 // CHECK-NEXT: item UnionOp kind=record color=green reason=admissible
 // CHECK-NEXT: item VirtMethod kind=record color=red reason=inadmissible construct=virtual-method
 // CHECK-NEXT: item c_main kind=function color=green reason=admissible
-// CHECK-NEXT: tally green=5 yellow=0 red=5
+// CHECK-NEXT: tally green=8 yellow=0 red=8
 // CHECK-NOT:  item

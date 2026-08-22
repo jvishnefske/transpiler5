@@ -33,15 +33,18 @@ struct Counter {
 
 int total(int a, int b) { return a + b; }
 
-// --- Out of subset: a base class with a user-declared destructor, and a
-// --- derived class. Both are DROPPED, taking their members with them.
+// --- Out of subset: a class whose destructor has no body in this TU, and
+// --- a PRIVATELY derived class. Both are DROPPED, taking their members
+// --- with them. (W2.26 admitted the virtual destructor itself and the
+// --- droppy PUBLIC base, so the body-less dtor and the private
+// --- inheritance are what keep these two out now.)
 class Base {
 public:
   virtual ~Base();
   int seed;
 };
 
-class Derived : public Base {
+class Derived : Base {
 public:
   int extra;
 };
@@ -87,34 +90,32 @@ int main(void) {
 // PORTING-DAG: | reference-type |
 //
 // PORTING: ## Direct blockers, as reported
-// W2.17 moved this pin FORWARD, not loosened it: a non-virtual,
-// same-TU-defined destructor is now ADMITTED (it becomes `impl Drop`), so
-// `virtual ~Base()` above reports under the newly minted, more specific
-// `cxx-virtual-destructor` tag -- and the item rows, which are ordered by
-// that tag, reorder with it. The ROOT attribution is unchanged
-// (`destructor` still ranks the item in the table above), which is the
-// property this test exists to pin.
+// W2.17, then W2.26, moved the `Base` pin FORWARD, never loosened it:
+// W2.17 admitted the non-virtual same-TU-defined destructor (the tag
+// moved to `cxx-virtual-destructor`), and W2.26 admitted the
+// sole-virtual-dtor class itself, so what reports now is the destructor's
+// missing BODY, under `cxx-destructor-no-body` -- and the item rows,
+// which are ordered by that tag, reorder with it. The ROOT attribution is
+// unchanged (`destructor` still ranks the item in the table above), which
+// is the property this test exists to pin.
 //
-// W2.18 moved the `Derived` row forward the same way: a single public
-// non-virtual base is now ADMITTED as a first field, so what keeps
-// `Derived` out is no longer inheritance itself but the DESTRUCTOR its
-// base carries -- a drop-family miscompile channel (a merely inheriting
-// class does not answer `hasUserDeclaredDestructor`, so none of W2.17's
-// use-site drop gates fires for it, and the emitted struct would keep a
-// `Copy` derive it must not have). It reports under `cxx-drop-base`, which
-// sorts ahead of `cxx-references` exactly as `cxx-inheritance` did, so the
-// item-row order is unchanged. The root attribution is still `base-class`.
-// PORTING-DAG: | cxx-drop-base |
+// W2.18 and then W2.26 moved the `Derived` row forward the same way: a
+// single public non-virtual base is admitted as a first field, and a
+// droppy PUBLIC base now imports too (the old `cxx-drop-base` tag retired
+// with the transitive drop predicate), so what keeps `Derived` out is its
+// PRIVATE inheritance, under the generic `cxx-inheritance` wording. The
+// root attribution is still `base-class`.
+// PORTING-DAG: | cxx-destructor-no-body |
+// PORTING-DAG: | cxx-inheritance |
 // PORTING-DAG: | cxx-references |
-// PORTING-DAG: | cxx-virtual-destructor |
 //
 // PORTING: ## Project items
-// PORTING: | dropped | red | `Derived` | record | base-class | Derived | cxx-drop-base |
+// PORTING: | dropped | red | `Base` | record | destructor | Base | cxx-destructor-no-body |
+// PORTING: | dropped | red | `Derived` | record | base-class | Derived | cxx-inheritance |
 // PORTING: | dropped | red | `pick` | function | reference-type | pick | cxx-references |
-// PORTING: | dropped | red | `Base` | record | destructor | Base | cxx-virtual-destructor |
 // PORTING: | ported | green | `Counter` | record |
 // PORTING: | ported | green | `c_main` | function |
 // PORTING: | ported | green | `total` | function |
 // PORTING: | declared | grey | `printf` | function |
 
-// STRICT: error: unsupported: virtual destructor
+// STRICT: error: unsupported: destructor with no definition in this translation unit

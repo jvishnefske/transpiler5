@@ -12508,7 +12508,7 @@ whole-program demand.
   residue is what this wave is actually sized against. **NOT SPIKED.**
 
 
-- [ ] W2.26 POLYMORPHIC RAII -- a class with a virtual destructor, or
+- [x] W2.26 POLYMORPHIC RAII -- a class with a virtual destructor, or
   a base class carrying a destructor. Spike verdict
   **GO-WITH-CONSTRAINTS on the value-only subset's implementability,
   PAIRED WITH A MEASURED DEMAND CORRECTION** (2026-08-22): the
@@ -12542,9 +12542,11 @@ whole-program demand.
   a nicety**.
   (4) THE EMPTY-BASE TRAP verified live at HEAD and its fix image
   measured: materializing the empty droppy base as a real zero-field
-  struct_def is byte-identical and renders today; the current
-  importer image for an empty record is a `[u8; 1]` blob, so wave-1
-  either ships the materialization or keeps the rejection.
+  struct_def is byte-identical and renders today; (CORRECTION,
+  re-measured at implementation: the `[u8; 1]`-blob claim was wrong for
+  any class with a user-declared method -- a standalone empty droppy
+  class already imports as a zero-field struct_def; only the SKIP at
+  the base-field site needed the gate flipped.)
   (5) VIRTUAL DESTRUCTOR ON A VALUE: sound, and by FR-112's own
   criterion -- destruction of a value is static, and every site
   where dynamism could be observed (new, upcast, virtual member
@@ -12564,6 +12566,50 @@ whole-program demand.
   SEQUENCED: after FR-120 on demand grounds -- its real value is as
   the destruction substrate W2.19c's Box<dyn> leg already assumes,
   plus closing the E0204 and empty-base trap channels.
+  LANDED 2026-08-22. The transitive predicate is
+  `userOrInheritedDestructor`, recursing the single public non-virtual
+  base chain, switched in at all seven use-site gates AND the member
+  gate AND the has_drop synthesis. The merely-inheriting synthesis is
+  exactly as spiked: has_drop only, no impl Drop, no dtor func --
+  pinned positively and with the E0204 negative control. The empty
+  droppy base MATERIALIZED (measured cheaper: the skip becomes
+  `isEmpty() && !droppy`, the ctor-initializer trivial-skips stay
+  byte-correct under the default-init-then-assign model, and the two
+  isEmpty hop rejections stay as conservative located fences). The
+  virtual-dtor gate lifted with the sole-virtual-dtor restriction
+  falling out of the existing loop structure. Drop order pinned to
+  three levels and a mixed chain (~M then ~A); the droppy-member
+  divergence pinned as still-rejected.
+  ONE DEVIATION THE SPIKE COULD NOT SEE, found by the suite: the raw
+  transitive recursion regressed two Cpp17Suite entries, because
+  gcc-15's `std::pair` publicly inherits `__pair_base` whose
+  `~__pair_base() = default` is user-DECLARED -- the recursion now
+  counts only user-PROVIDED inherited dtors (own-class semantics
+  unchanged), mirrored identically in ItemColoring. The host-toolchain
+  drift memory's __pair_base note strikes again, one layer deeper.
+  ItemColoring took FOUR edits, not one -- including excluding
+  CXXDestructorDecl from the VirtualMethod screen (the no-continue
+  double-tag trap: virtual dtors would have stayed falsely red, the
+  forbidden direction) and a NEW transitive droppy-member field screen
+  so the lifted base screen does not mint a false green (constraint 4,
+  closed rather than recorded). A new `sizeof/alignof of a polymorphic
+  class` screen ships with the wave (the quantified caveat: native 16
+  vs emitted 4 bytes -- the same fold-vs-layout family as the
+  bit-field and long-double screens). RealWorld `shapes` re-tags
+  cxx-virtual-destructor -> cxx-destructor-no-body (its dtor is
+  body-less, now the honest root).
+  Gates: full meson suite 755/755 (fast 537 + slow/EndToEnd 218), 0
+  failures; Cpp17Suite ratchets 30 -> 31 (`01008.cpp`) at
+  total=34 transpiled=31 passed=31 miscompiled=0; CTestSuite
+  220/220/0/0 unchanged.
+  (test/Import/Cpp/inheritance-drop.cpp, inheritance-drop-invalid.cpp;
+  test/EndToEnd/cpp-inheritance-drop.cpp;
+  test/Cpp17Suite/Inputs/01008.cpp; frontier legs moved forward in
+  destructors-invalid.cpp, inheritance-invalid.cpp,
+  incremental-root-blockers.cpp, incremental-builds.cpp;
+  test/Project/coloring-cpp-class-gates.cpp)
+
+
 ## Track 5 Third-party validation (external demand signal)
 
 Track 4's corpus is authored by this project. That has now produced two
