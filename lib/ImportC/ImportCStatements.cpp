@@ -3002,8 +3002,15 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
     if (region->hasArithmetic)
       return emitError(translateLoc(region->arithmeticLoc))
              << "unsupported: arithmetic on the address of a scalar object";
+    // FR-120: an UPCAST binding (`Base *p = &d;`) keeps the whole
+    // DERIVED object as the region base; every struct-place use site
+    // reconciles the viewed base type by re-deriving the `base` hop
+    // chain (`reconcileUpcastPlace`), so a unique single public
+    // non-virtual non-polymorphic chain admits here alongside exact
+    // type equality.
     if (!wildcard &&
-        !astContext().hasSameUnqualifiedType(pointee, base->getType()))
+        !astContext().hasSameUnqualifiedType(pointee, base->getType()) &&
+        !uniquePublicSingleBaseChain(base->getType(), pointee))
       return emitError(bindLoc)
              << "unsupported: pointer type does not match its target object";
   }

@@ -10,9 +10,7 @@
 // RUN: not emitrust-import-c %t/empty-base-ctor.cpp 2>&1 | FileCheck %s --check-prefix=EMPTYCTOR
 // RUN: not emitrust-import-c %t/slice-argument.cpp 2>&1 | FileCheck %s --check-prefix=SLICEARG
 // RUN: not emitrust-import-c %t/slice-copy-init.cpp 2>&1 | FileCheck %s --check-prefix=SLICECOPY
-// RUN: not emitrust-import-c %t/upcast-pointer.cpp 2>&1 | FileCheck %s --check-prefix=UPPTR
 // RUN: not emitrust-import-c %t/upcast-reference.cpp 2>&1 | FileCheck %s --check-prefix=UPREF
-// RUN: not emitrust-import-c %t/derived-pointer-member.cpp 2>&1 | FileCheck %s --check-prefix=DERIVEDPTR
 
 // W2.18 located-rejection ledger for single non-virtual inheritance. The
 // wave admitted exactly ONE shape -- a single PUBLIC, NON-VIRTUAL base,
@@ -72,13 +70,16 @@
 //   moved the ENTIRE Derived. Deliberately NOT given a `DerivedToBase`
 //   case in `emitCast` -- that one line is what would turn this located
 //   rejection into a silent whole-object move.
-// * every UPCAST spelling (`Base *p = &d;`, `Base &r = d;`): the
-//   borrow-of-the-first-field image needs pointer/reference machinery this
-//   subset does not have, and both are blocked by pre-existing rejections
-//   rather than new ones -- recorded here so the frontier is visible.
-// * an inherited member reached through a POINTER to the derived class
-//   (`p->x` for `Derived *p`): the peel deliberately does not fire, so the
-//   pointer's own place can never be borrowed as if it were the struct.
+// * the UPCAST REFERENCE (`Base &r = d;`): still blocked by the
+//   pre-existing reference rejection. The UPCAST POINTER (`Base *p =
+//   &d;`) and the inherited member through a DERIVED-class pointer were
+//   pinned here as UPPTR/DERIVEDPTR until FR-120 flipped both to
+//   positives: the pins moved FORWARD into inheritance-upcast.cpp and
+//   the byte-diff oracle test/EndToEnd/cpp-upcast-pointer.cpp; the
+//   residual pointer fences (multi-object regions, joins, globals,
+//   base-pointer params/members/arrays) live in
+//   struct-pointer-methods-invalid.cpp, and the polymorphic-chain fence
+//   in inheritance-drop-invalid.cpp's VUPCAST arm.
 //
 // An UNDEFINED base needs no importer wording and has none: clang
 // hard-errors `base class has incomplete type` before the importer ever
@@ -189,23 +190,6 @@ int use() {
   return b.get();
 }
 
-//--- upcast-pointer.cpp
-struct A {
-  int a;
-  A(int v) : a(v) {}
-  int get() const { return a; }
-};
-struct D : A {
-  int c;
-  D(int v) : A(v), c(v) {}
-};
-// UPPTR: upcast-pointer.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer assigned a non-address value
-int use() {
-  D d(1);
-  A *p = &d;
-  return p->get();
-}
-
 //--- upcast-reference.cpp
 struct A {
   int a;
@@ -221,20 +205,4 @@ int use() {
   D d(1);
   A &r = d;
   return r.get();
-}
-
-//--- derived-pointer-member.cpp
-struct A {
-  int a;
-  A(int v) : a(v) {}
-};
-struct D : A {
-  int c;
-  D(int v) : A(v), c(v) {}
-};
-// DERIVEDPTR: derived-pointer-member.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: inherited member through a pointer to a derived class
-int use() {
-  D d(1);
-  D *p = &d;
-  return p->a;
 }

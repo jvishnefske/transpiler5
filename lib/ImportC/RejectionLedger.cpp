@@ -182,6 +182,14 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
     {llvm::StringLiteral("inherited member through a pointer to a derived "
                          "class"),
      llvm::StringLiteral("cxx-inheritance-upcast")},
+    // FR-120 admitted method calls and upcast bindings through LOCAL
+    // struct pointers; a pointer to a GLOBAL object resolves through a
+    // staged copy and the method-call path has no writeback flush, so a
+    // mutating method's effect on the copy would be silently dropped —
+    // rejected with its own wording instead of miscompiled.
+    {llvm::StringLiteral("mutating method call through a pointer to a "
+                         "global object"),
+     llvm::StringLiteral("cxx-method-global-receiver")},
     {llvm::StringLiteral("inherited access through a non-struct place"),
      llvm::StringLiteral("cxx-inheritance")},
     {llvm::StringLiteral("base constructor initializer"),
