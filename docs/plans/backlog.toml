@@ -90,10 +90,10 @@ anchor = "FR-114 DEFECT"
 id = "FR-119"
 rank = 4
 kind = "defect"
-status = "open"
+status = "spiked"
 size = "S"
-title = "Free non-member operator emits `fn (...)` -- exit 0, unbuildable crate"
-summary = "Escapes FR-117's CXXMethodDecl-scoped backstops; violates fail-loudly. Symbol-spelling fix with byte-identity consequences."
+title = "Free operators: located rejection + empty-sym_name verifier backstop"
+summary = "GO: channel fully mapped (empty name from getName under NDEBUG, verifier never checked sym_name, broken print->parse). Backstop costs zero. Zero corpus TUs hit it TODAY but the channel arms as admission widens. Admission is W2.25's, behind FR-114."
 blocked_by = []
 anchor = "FR-119 DEFECT"
 

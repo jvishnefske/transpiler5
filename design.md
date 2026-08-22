@@ -7506,24 +7506,69 @@ piece and becomes FR-45.
   measurability defect, and it is why the ranked table below needed
   two tools instead of one. **NOT SPIKED.**
 
-- [ ] FR-119 DEFECT (found by FR-117/118's gate, pre-existing, ZERO
-  oracle coverage): a free NON-MEMBER `operator` declaration escapes
+- [ ] FR-119 DEFECT: a free NON-MEMBER `operator` declaration escapes
   every backstop and emits a syntactically invalid crate, silently.
-  ```cpp
-  struct A { int x; };
-  int operator+(A a, int b) { return a.x + b; }
-  ```
-  `emitrust-cc --emit=crate` exits **0 with no diagnostic** and emits
-  `fn (v0: A, b: i32) -> i32 {` -- `cargo build` then fails with
-  `error: expected identifier, found '('`. A call site is separately
-  rejected (`unsupported callee`), so this is the DECLARATION-only
-  path. FR-117's backstops are scoped to `CXXMethodDecl` and do not
-  cover a free operator. This violates CLAUDE.md's rule that an
-  unresolved item must fail loudly at emission -- it is exit-0,
-  unbuildable, and undiagnosed. Deliberately NOT folded into FR-117's
-  commit: the fix is a symbol-spelling change for non-identifier
-  `DeclarationName`s and therefore has byte-identity consequences
-  through CSymbolNaming. **SPIKED by measurement.**
+  Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-22): fix shape (a),
+  located rejection PLUS the dialect verifier backstop, both proven at
+  HEAD with the full suite green modulo one predicted pin-wording edit.
+  THE CHANNEL, mapped end to end: FR-117's refusal is gated on
+  `cxxMethod &&` -- a free operator is a plain FunctionDecl and falls
+  through (the FR-117 comment explicitly documents leaving it open);
+  `cFunctionSymbolName` calls `getName()` on the non-identifier name
+  (the assert compiled out under NDEBUG) and returns the EMPTY STRING;
+  MLIR core accepts an empty sym_name and `FuncOp::verify` never
+  checked it -- the printer renders `@<<INVALID EMPTY SYMBOL>>` and the
+  print->parse round-trip is BROKEN while the in-memory module
+  verifies clean; the renderer trusts blindly and emits `fn (`; and
+  `--recover` does not save you -- the call site stubs but the
+  recovered crate still carries the nameless fn, measured unbuildable
+  with every use rejected. The silent shape needs EXACTLY ONE free
+  operator over an admitted class: two of them collide loudly in the
+  FR-108 guard (leaking `conflicting definition of ''`).
+  THE VERIFIER BACKSTOP: 2 lines in FuncOp::verify, measured cost
+  ZERO (no legitimate op in the entire suite carries an empty symbol),
+  and it fires LOCATED at the C source loc in strict, recover, AND
+  standalone-translate modes -- closing the whole future class of
+  empty-name defects at emission, per the CLAUDE.md contract. It does
+  not cover the pre-lowering func.func stage; the importer guard does.
+  SHAPE (b) OMIT was rejected on measured precedent: friend operators
+  defined inline in a class are ALREADY silently omitted today, zero
+  diagnostics, invisible to every ledger -- exactly the FR-115
+  measurability hole, and a separate pre-existing channel worth its
+  own FR. SHAPE (c) ADMIT is real but is W2.25's job and is BLOCKED
+  BEHIND FR-114: raytracing's vec3.h has THREE free `operator*`
+  overloads that all map to one symbol without FR-114's per-param
+  suffixes. A member/free discriminator exists at the call site, so
+  free admission does not conflict with FR-112's member-operator
+  rejections -- recorded for W2.25.
+  BLAST RADIUS, measured: ZERO corpus TUs currently emit an invalid
+  crate through this channel -- every real free operator is fenced
+  earlier, chiefly by rejected-type-cascade on its value-class
+  parameter. **The channel ARMS as admission progresses** -- the
+  minimal repro is precisely "free operator over a fully admitted
+  class," today's rarity and tomorrow's norm as FR-112-style
+  containment widens. Patched, the corpus items re-attribute honestly
+  (raytracing +6/+11/+11 cxx-operator-overload per TU), riding the
+  EXISTING tag so FR-112's C6 blinding concern does not apply.
+  GRAPH SIDE: ItemGraph nodes the free operator via
+  cFunctionSymbolName -> key "" -- two operators DEDUPE INTO ONE
+  EMPTY-NAMED NODE, and the coloring prints a false GREEN with an
+  empty name. The wave must make ItemGraph skip non-identifier free
+  FunctionDecls with a matching ItemColoring screen (AST-pure, no
+  byte-identity impact), which also closes the latent debug-build
+  assert path through the graph.
+  CONSTRAINTS: the importer guard sits AFTER the referenced-only
+  prototype skip (naively widening FR-117's guard breaks two pins;
+  the relocated guard costs exactly one -- ostream-invalid USEROP's
+  wording becomes the more precise `unsupported: overloaded
+  operator`); unreferenced body-less operator prototypes stay
+  silently skipped by design; literal operators ride the same guard;
+  FR-114 adjacency is merge-safe (no file overlap). Tests: the 2-line
+  strict repro, recover-drops-and-builds, the literal operator, the
+  two-operator collision (pins the '' leak's disappearance), the
+  empty-sym_name verifier test, and a negative pin that friend-inline
+  operators still omit (the separate channel, recorded).
+  **SPIKED.**
 
 - [ ] FR-120 Struct-pointer prerequisite: method calls and
   base-subobject bindings through struct pointers. This is the
