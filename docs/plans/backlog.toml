@@ -271,12 +271,11 @@ anchor = "W2.23 Copy constructors"
 
 [[items]]
 id = "FR-111"
-rank = 13
 kind = "quality"
-status = "in-flight"
+status = "landed"
 size = "S"
-title = "field_reassign_with_default fuse over-gated for Drop types"
-summary = "Narrow the bindingHasDrop guard to 'has Drop AND not all-fields'."
+title = "field_reassign_with_default fuse narrowed for Drop types (all-fields only)"
+summary = "Landed 2026-08-23: coverage recomputed at the analysis site via module-level lookup (entry's in-place reuse impossible -- different function); droppy unresolved-def polarity fixed to never-fuse; W2.17 partial fence pinned for the first time. Clippy -2 exactly as filed."
 blocked_by = []
 anchor = "FR-111 QUALITY"
 

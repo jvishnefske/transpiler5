@@ -2496,12 +2496,6 @@ void RustEmitter::computeFieldInitFuses(emitrust::FuncOp funcOp) {
         deferredInits.count(varOp) || unreachableOps.count(varOp))
       return;
     Value result = variableOp.getResult();
-    // W2.17: never fuse a destructor-carrying struct. The fuse renders
-    // `S { f: v, ..Default::default() }`, whose functional-update BASE is a
-    // whole extra `S` -- constructed, moved out of field-wise, and then
-    // DROPPED. Measured: one spurious `dtor 0 0` line ahead of the real one.
-    if (bindingHasDrop(result))
-      return;
     if (!isa<emitrust::StructType>(
             cast<emitrust::LValueType>(result.getType()).getValueType()))
       return;
@@ -2535,6 +2529,30 @@ void RustEmitter::computeFieldInitFuses(emitrust::FuncOp funcOp) {
     }
     if (fused.empty())
       return;
+    // W2.17 x FR-111: a destructor-carrying struct fuses ONLY when the
+    // prefix covers EVERY field, because that is exactly the case whose
+    // rendering drops the `..S::default()` functional-update base
+    // (emitFusedFieldInit). A kept base is a whole extra `S` -- constructed,
+    // moved out of field-wise, and then DROPPED; measured: one spurious
+    // `dtor 0 0` line ahead of the real one. `seenFields` keeps the prefix
+    // distinct, so the size compare is exact. The struct_def is a
+    // module-level symbol and `emitrust.impl` is itself a SymbolTable (a
+    // `lookupNearestSymbolFrom` from a method body would miss it): resolve
+    // in the enclosing module directly, like the emission side does. An
+    // UNRESOLVED def must NOT fuse here -- emission's fallback keeps the
+    // base, which has the wrong polarity for Drop types.
+    if (bindingHasDrop(result)) {
+      auto structType = cast<emitrust::StructType>(
+          cast<emitrust::LValueType>(result.getType()).getValueType());
+      emitrust::StructDefOp structDef;
+      if (auto module = varOp->getParentOfType<ModuleOp>())
+        structDef = dyn_cast_or_null<emitrust::StructDefOp>(
+            SymbolTable::lookupSymbolIn(
+                module, StringAttr::get(varOp->getContext(),
+                                        structType.getName())));
+      if (!structDef || fused.size() != structDef.getFieldNames().size())
+        return;
+    }
     for (emitrust::AssignOp assign : fused)
       fusedAssignOwner[assign.getOperation()] = varOp;
     fieldInitFuses[varOp] = std::move(fused);
