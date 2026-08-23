@@ -70,12 +70,11 @@ anchor = "W2.26"
 
 [[items]]
 id = "W2.27"
-rank = 6
 kind = "feature"
-status = "in-flight"
+status = "no-go"
 size = "M"
-title = "Droppy globals (atexit / end-of-main drop scope)"
-summary = "#4 in the re-sweep at 936 items, on no wave -- but 930/936 is pugixml (equal-weighted 1.9%). One construct, one wording; the exit-time-drop image is the design question."
+title = "Droppy globals: NO-GO -- four measured silent channels, zero corpus items reachable"
+summary = "NO-GO 2026-08-22: only untouched+constant-init+fielded shape is byte-correct and it matches 0 of 948 items (all dynamic-init, re-root upstream). Four silent miscompiles measured under a gate lift incl. the exit() drop-skip. Gate stays; future oracle set recorded in the entry."
 blocked_by = []
 anchor = "W2.27"
 
