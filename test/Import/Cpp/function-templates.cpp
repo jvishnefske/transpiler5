@@ -47,8 +47,10 @@
 //   non_snake_case lint rejects outright.
 //
 // Rejections that stay rejections (see function-templates-invalid.cpp):
-// explicit specializations, non-type template arguments, and template
-// parameter packs. Class templates compose with this scheme rather than
+// template parameter packs and non-INTEGRAL non-type arguments
+// (declaration-kind NTTPs, template-template arguments). W2.28 admitted
+// INTEGRAL non-type arguments (value codes, pinned below) and explicit
+// specializations. Class templates compose with this scheme rather than
 // extending it: W2.16 reuses `templateArgTypeCode` VERBATIM for the
 // struct-name suffix (`Box<int>` -> `Box_i32`), so one argument codes the
 // same way whichever kind of template it instantiates — pinned in
@@ -165,3 +167,70 @@ int use(int n) {
 // NOPATTERN-NOT: func.func @deref(
 // NOPATTERN-NOT: func.func @nonnull(
 // NOPATTERN-NOT: func.func @ns_geo_twice(
+
+// ---- W2.28: the value-suffix extension ----
+//
+// An INTEGRAL non-type argument codes by VALUE with a `v` prefix
+// (`templateArgIntegralCode` in EmitRust/CSymbolNaming.h): `v5`, `vn3`
+// for a negative. The prefix keeps the code one word under EVERY casing
+// — bare digits are snake-safe but die under the UpperCamel record
+// rename (`Grid<1,23>`/`Grid<12,3>` both camel to `Grid123`; measured as
+// a silent method-fusion miscompile, see class-templates-invalid.cpp
+// decision 3). `ident<1>`/`ident<2>` below is exactly W2.15's
+// `nttp-unused` rejection input, now imported as TWO functions — the
+// value code is what retired that pin.
+template <int N>
+int ident(int x) {
+  return x;
+}
+
+// CHECK-DAG: func.func @ident_v1(
+// CHECK-DAG: func.func @ident_v2(
+
+template <int N>
+int addN(int x) {
+  return x + N;
+}
+
+// CHECK-DAG: func.func @addN_v5(
+// CHECK-DAG: func.func @addN_vn3(
+
+// A MIXED parameter list concatenates type and value codes in
+// declaration order, exactly like two type codes.
+template <typename T, int N>
+T mulN(T v) {
+  return v * (T)N;
+}
+
+// CHECK-DAG: func.func @mulN_i32_v3(
+
+// An EXPLICIT specialization imports its HAND-WRITTEN body under the
+// same suffixed symbol the displaced implicit instantiation would have
+// used (clang never also instantiates the primary at that argument
+// list, so there is exactly one definition and no dispatch decision);
+// neighbouring instantiations keep the primary's body.
+template <typename T>
+int codeOf(T v) {
+  return 1 + (int)v;
+}
+
+template <>
+int codeOf<int>(int v) {
+  return 100 + v;
+}
+
+// CHECK-DAG: func.func @codeOf_i32(
+// CHECK-DAG: func.func @codeOf_i8(
+
+int use2(int n) {
+  int a = ident<1>(n) + ident<2>(n);
+  int b = addN<5>(n) + addN<-3>(n);
+  int c = (int)mulN<int, 3>(n);
+  int d = codeOf(n) + codeOf((char)n);
+  return a + b + c + d;
+}
+
+// NOPATTERN-NOT: func.func @ident(
+// NOPATTERN-NOT: func.func @addN(
+// NOPATTERN-NOT: func.func @mulN(
+// NOPATTERN-NOT: func.func @codeOf(

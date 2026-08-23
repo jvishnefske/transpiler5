@@ -116,6 +116,15 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   // lifetime, which needs no code.
   if (const auto *constant = llvm::dyn_cast<clang::ConstantExpr>(e))
     return emitRValue(constant->getSubExpr());
+  // W2.28: inside an instantiated template body, a mention of a non-type
+  // template parameter (`return x + N;`) is wrapped in a
+  // SubstNonTypeTemplateParmExpr whose replacement is the already
+  // substituted CONSTANT for this specialization. The wrapper marks the
+  // substitution point for tooling; the value underneath is the whole
+  // meaning, so it imports exactly like the unwrapped expression.
+  if (const auto *substNttp =
+          llvm::dyn_cast<clang::SubstNonTypeTemplateParmExpr>(e))
+    return emitRValue(substNttp->getReplacement());
   // W2.21: a std::unique_ptr TEMPORARY (`std::make_unique<T>(a);` as a
   // statement, `*std::make_unique<T>(a)`, an argument, ...) is wrapped in a
   // CXXBindTemporaryExpr because the temporary has a destructor. There is

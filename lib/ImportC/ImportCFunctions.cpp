@@ -1983,7 +1983,7 @@ LogicalResult CImporter::importDeclsIn(const clang::DeclContext *context) {
 
 /// W2.15: the located rejection a function-template specialization whose
 /// template ARGUMENTS are outside the admitted subset earns, or success
-/// when every argument is a plain type.
+/// when every argument is a plain type or (W2.28) an integral value.
 ///
 /// Driven off the `TemplateArgument` kind rather than off anything in the
 /// body, which is not a stylistic choice: a body-driven check is
@@ -2005,7 +2005,13 @@ static LogicalResult checkTemplateArguments(const clang::FunctionDecl *spec,
       return emitError(loc)
              << "unsupported: variadic function template (template "
                 "parameter pack)";
-    if (arg.getKind() != clang::TemplateArgument::Type)
+    // W2.28: an INTEGRAL non-type argument is admitted — it codes by
+    // value in the symbol suffix (`templateArgIntegralCode`), so two
+    // instantiations cannot fuse. Every other non-type kind (declaration,
+    // nullptr, template-template) still codes as the `x` placeholder and
+    // stays rejected here.
+    if (arg.getKind() != clang::TemplateArgument::Type &&
+        arg.getKind() != clang::TemplateArgument::Integral)
       return emitError(loc) << "unsupported: non-type template argument in "
                                "function template instantiation";
   }
@@ -2126,10 +2132,12 @@ LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
       // is accepted (there is no better source position for generated
       // code) and is why the lit pins match line/column loosely.
       Location specLoc = translateLoc(spec->getLocation());
-      if (spec->getTemplateSpecializationKind() ==
-          clang::TSK_ExplicitSpecialization)
-        return emitError(specLoc)
-               << "unsupported: explicit function template specialization";
+      // W2.28: an EXPLICIT specialization is admitted through the very
+      // same path as an implicit instantiation — it is a concrete
+      // `FunctionDecl` whose body is the hand-written one, and clang
+      // never also creates the implicit instantiation it displaces, so
+      // it imports under the identical suffixed symbol with no collision
+      // and no dispatch decision to make.
       // FR-126: FR-115-shape per-specialization capture, so a failed
       // sibling's own cause reaches the ledger under ITS symbol (the outer
       // recovery only records the TEMPLATE's name, off-graph).
@@ -2219,16 +2227,15 @@ LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
     return success();
   }
   if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
-    // W2.15: an EXPLICIT SPECIALIZATION is visited twice — once through
-    // its template's `specializations()` list above, once here as an
-    // ordinary top-level declaration. Rejecting at both sites is what
-    // makes the rejection effective under FR-42 recovery, where dropping
-    // the template item would otherwise leave this visit free to admit
-    // the specialization's hand-written body silently.
-    if (func->getTemplateSpecializationKind() ==
-        clang::TSK_ExplicitSpecialization)
-      return emitError(translateLoc(func->getLocation()))
-             << "unsupported: explicit function template specialization";
+    // W2.15/W2.28: an EXPLICIT SPECIALIZATION is visited twice — once
+    // through its template's `specializations()` list above (which now
+    // imports it), once here as an ordinary top-level declaration; like
+    // any other specialization kind it must not import twice. Under
+    // FR-42 recovery, dropping the template item leaves the spec simply
+    // unimported and a call fails loudly at the call site ("call to
+    // unimported function") — never a silent admission under the wrong
+    // (unsuffixed) name, because this arm skips every specialization
+    // kind.
     // An implicit or explicit INSTANTIATION belongs to the template arm
     // above, which already imported it; importing it again here would
     // collide with itself.
@@ -2237,6 +2244,21 @@ LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
     return importFunction(func);
   }
   if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
+    // W2.28: a partial-specialization PATTERN (`template <typename T>
+    // struct W<T*> {...}`) is a dependent record with no concrete layout
+    // — the exact analogue of the uninstantiated template pattern the
+    // class-template arm above never touches, so it is skipped
+    // STRUCTURALLY rather than rejected. Its INSTANTIATIONS are fully
+    // concrete `ClassTemplateSpecializationDecl`s carrying the partial's
+    // substituted body, reach `importRecord` through the walk above or on
+    // demand from `mapType`, and import like any other specialization
+    // (their template args are the PRIMARY template's concrete argument
+    // list, so the W2.15/W2.16 suffix already names them uniquely —
+    // `W<int*>` is `w_pi32`). Without this skip the pattern falls to
+    // `importRecord`'s dependent-type guard and one never-used partial
+    // aborts the whole TU.
+    if (llvm::isa<clang::ClassTemplatePartialSpecializationDecl>(record))
+      return success();
     // W2.16: a `ClassTemplateSpecializationDecl` IS-A `RecordDecl` and
     // reaches HERE as well as through the class-template arm above (an
     // explicit specialization is listed in both places, and this visit is

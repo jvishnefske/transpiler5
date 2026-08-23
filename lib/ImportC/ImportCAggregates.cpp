@@ -271,22 +271,39 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
 /// and it was measured emitting struct_defs for rejected shapes.
 static LogicalResult checkClassTemplateSpecialization(
     const clang::ClassTemplateSpecializationDecl *spec, Location loc) {
-  if (spec->getSpecializationKind() == clang::TSK_ExplicitSpecialization)
-    return emitError(loc)
-           << "unsupported: explicit class template specialization";
-  // An instantiation whose pattern is a PARTIAL specialization is fully
-  // concrete (not dependent, so `importRecord`'s dependent-type guard does
-  // not see it) and would otherwise be admitted carrying the partial's
-  // body under a name computed from the primary template.
-  if (llvm::isa<clang::ClassTemplatePartialSpecializationDecl *>(
-          spec->getSpecializedTemplateOrPartial()))
+  // A partial-specialization PATTERN (`template <typename T> struct
+  // W<T*>`) IS-A `ClassTemplateSpecializationDecl`; the top-level walk
+  // skips it structurally (see `importTopLevelDecl`), so this guard is
+  // defensive: if any OTHER route ever hands the dependent pattern in,
+  // it must stay a located rejection, never fall through to a body
+  // import. Checked by NODE KIND, not specialization kind — a partial
+  // reports `TSK_ExplicitSpecialization`, and explicit (full) specs are
+  // admitted below.
+  if (llvm::isa<clang::ClassTemplatePartialSpecializationDecl>(spec))
     return emitError(loc)
            << "unsupported: partial class template specialization";
+  // W2.28: an instantiation whose pattern is a PARTIAL specialization is
+  // fully concrete — clang substituted the partial's body when it
+  // instantiated — and its template args are the PRIMARY template's
+  // concrete argument list, so the ordinary record path imports it under
+  // a unique suffixed name with no extra dispatch (byte-diffed in
+  // test/EndToEnd/cpp-template-partial-spec.cpp). Only the dependent
+  // PATTERN above is out of subset.
+  // W2.28: an EXPLICIT (full) specialization is no longer rejected here —
+  // it is a concrete record whose fields and methods are the hand-written
+  // ones, and it imports through the ordinary record path under the same
+  // suffixed name its implicit instantiation would have used (clang never
+  // creates the instantiation it displaces).
   for (const clang::TemplateArgument &arg : spec->getTemplateArgs().asArray()) {
     if (arg.getKind() == clang::TemplateArgument::Pack)
       return emitError(loc) << "unsupported: variadic class template "
                                "(template parameter pack)";
-    if (arg.getKind() != clang::TemplateArgument::Type)
+    // W2.28: an INTEGRAL non-type argument codes by value in the record
+    // suffix (`templateArgIntegralCode`), so `Fixed<3>` and `Fixed<40>`
+    // stay two structs. Every other non-type kind still codes `x` and
+    // stays rejected.
+    if (arg.getKind() != clang::TemplateArgument::Type &&
+        arg.getKind() != clang::TemplateArgument::Integral)
       return emitError(loc) << "unsupported: non-type template argument in "
                                "class template instantiation";
   }

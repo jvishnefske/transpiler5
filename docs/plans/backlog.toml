@@ -81,12 +81,11 @@ anchor = "W2.27"
 
 [[items]]
 id = "W2.28"
-rank = 7
 kind = "feature"
-status = "in-flight"
+status = "landed"
 size = "L"
-title = "Template residue: NTTPs, partial/explicit specializations, packs"
-summary = "~249 items once FR-115 made them visible; no template wave existed. NTTPs (31) may be a cheap W2.15-style value-suffix extension; spike demand-vs-cost."
+title = "Template residue: NTTP + explicit + partial specs landed; packs NO-GO-for-now"
+summary = "Landed 2026-08-22 split: NTTP value suffix (v-prefix load-bearing -- bare digits measured a silent UpperCamel fusion miscompile), espec pure gate removal, partial specs cheap (entry's L prediction falsified). Packs NO-GO with measured ladder. Corpus: family 608 -> 4 rows, ported +59, 12 units gained, zero regressed."
 blocked_by = []
 anchor = "W2.28"
 
