@@ -7892,6 +7892,14 @@ piece and becomes FR-45.
   (test/Import/C/pointers-param-literal-scalar-mut.c,
   test/Target/Rust/literal-backing-mut-borrow.mlir,
   test/EndToEnd/literal-scalar-mut-arg.c)
+  PAIR VERIFICATION (2026-08-22, second session, merged tree at
+  cc6a6c5): re-emitting and cargo-building all 9 spdlog units with
+  the committed binary -- **cargo errors 0 on every unit, spdlog
+  0/9 -> 9/9 buildable crates**. The FR-121 worktree measurement
+  predated FR-124's landing, so its per-unit residuals (E0204) are
+  gone on the merged tree; the pair compounds exactly as W2.23's
+  re-probe note predicted. C build-sweep ratchet unchanged (42/44,
+  known-fails pinned).
 
 - [x] FR-122 DEFECT: the cross-TU record dedup key is
   FIELD-SHAPE-ONLY, and colliding records silently exchange member
