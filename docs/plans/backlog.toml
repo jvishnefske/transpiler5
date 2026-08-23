@@ -150,6 +150,17 @@ blocked_by = []
 anchor = "FR-124 DEFECT"
 
 [[items]]
+id = "FR-128"
+rank = 5
+kind = "defect"
+status = "in-flight"
+size = "S"
+title = "W2.25 regression: unresolved reference from an admitted operator is crate-fatal in recovery"
+summary = "Filed 2026-08-23: admitted operator bodies plan unimported callees into FR-52 extern markers whose only failure is crate-fatal at emission; all 8 spdlog units + example NO_CRATE (emitted at the pre-W2.25 baseline). Recovery must drop/stub the referencing item instead. Claimed by the second session."
+blocked_by = []
+anchor = "FR-128 DEFECT"
+
+[[items]]
 id = "FR-127"
 kind = "defect"
 status = "landed"

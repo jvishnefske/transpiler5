@@ -8133,6 +8133,34 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-ns-case-fold-invalid.cpp,
   test/Driver/incremental-camelcase-namespace.cpp)
 
+- [ ] FR-128 DEFECT (found 2026-08-23 by the post-W2.25 external
+  re-probe; REGRESSION introduced by W2.25, exposed at depth by
+  FR-127): an admitted operator body referencing an UNIMPORTED
+  function lets the reference survive to EMISSION, where the FR-52
+  loud-failure kills the whole crate under --incremental --
+  `error: unsupported: function 'ns_fmt_ns_v12_ns_detail_basic_fp_
+  u64_new_ii' is referenced but not defined in any translation unit`
+  (spdlog's bundled fmt, format.h:1650). ALL EIGHT spdlog src units
+  + example went NO_CRATE; they emitted at the pre-W2.25 baseline
+  (out-w228new sweep at 429ce33, post-FR-127) -- attribution is
+  clean, not inferred. spdlog's crate history this week is the whole
+  story of the recovery frontier: 9/9 cargo-clean at FR-121, broken
+  by W2.24 (TU-fatal planner, unmeasured at the time), restored by
+  FR-127, broken again by W2.25 one layer down. The recovery
+  contract point: in --incremental, a reference that cannot resolve
+  must drop/stub the REFERENCING item inside recovery (the
+  "call to unimported method/constructor" channel) -- it must never
+  be planned into an FR-52 extern marker whose only failure mode is
+  crate-fatal at emission. Strict mode keeps the loud emission
+  failure byte-for-byte (that contract is deliberate and stays).
+  ACCEPTANCE: a minimal repro (admitted operator whose body calls an
+  unimportable ctor/function) emits a crate with the operator
+  dropped/stubbed located; the 8 spdlog units + example regain
+  crates (honest counts); a Driver lit test pins the recovery-mode
+  containment; strict mode unchanged; the emission loud-failure pin
+  (emitrust.extern_decl marker contract) stays green. **NOT
+  SPIKED.**
+
 - [x] FR-127 DEFECT (found 2026-08-23 by the second session's
   post-FR-125 offender re-check; REGRESSION introduced by W2.24): a
   class-payload `throw` in a FREE function aborts the whole TU under
