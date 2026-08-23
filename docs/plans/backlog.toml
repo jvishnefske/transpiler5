@@ -128,12 +128,11 @@ anchor = "FR-122 DEFECT"
 
 [[items]]
 id = "FR-115"
-rank = 9
 kind = "defect"
-status = "spiked"
+status = "landed"
 size = "S"
-title = "Silent unported items: two broken joins, not a schema gap"
-summary = "GO: baseline re-measured 70% -> 41.3%; ~880 items are a ledger-symbol join miss, 624 a discarded coloring root; schema needs nothing. The ranking MOVES when fixed (template invisible -> #3). Four pinned spellings churn."
+title = "Silent unported items: joins fixed, unreached tagged, c1 adopted"
+summary = "Landed 2026-08-22: fully-silent 2145 -> 0 on the corpus, denominator deflated by 633 double-counts, ranking moved as spiked (template #3, copy-move #2). Track 5 table stale-marked. Five join-key goldens."
 blocked_by = []
 anchor = "FR-115 DEFECT"
 

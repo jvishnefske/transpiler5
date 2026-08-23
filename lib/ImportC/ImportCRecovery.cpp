@@ -382,15 +382,25 @@ CImporter::recoverPlannerRejection(const clang::Decl *attribution,
 // The FR-43 admitted-set filter
 //===----------------------------------------------------------------------===//
 
-std::string CImporter::frontierExcludedSymbol(const clang::Decl *decl) const {
-  if (!excludedItems || excludedItems->empty())
-    return {};
-  // The key derivation MIRRORS `ItemGraphBuilder::collectItems` decision for
-  // decision, including its skips: a declaration the graph does not turn into
-  // a node has no key, so it cannot be named by a search state and is left
-  // alone here. Keeping the two in the same shape (same order of kinds, same
-  // guards) is what makes "the graph's vocabulary" a real invariant rather
-  // than a coincidence.
+// FR-115: the graph-key derivation, factored so the recovery ledger
+// can share it. MIRRORS `ItemGraphBuilder::collectItems` decision for
+// decision (see frontierExcludedSymbol's original comment), with two
+// deliberate divergences from the graph's own edge cases:
+//
+// - Records: `ItemGraphBuilder::recordSymbolFor` additionally consults the
+//   graph's pass-0 ordinary-name set and renames a colliding tag to
+//   `typeRustName("Struct_" + base)`. The importer does not carry that set,
+//   so this helper returns plain `recordRustName` and the rare
+//   Struct_-renamed record degrades to the pre-FR-115 off-graph behavior
+//   (the rejection is still located and counted, just not joined to its
+//   node) rather than joining under a wrong key.
+// - Enums: the graph key is `ItemGraphBuilder::enumSymbolFor` =
+//   `enumTypeRustName(name)` (UpperCamel under the idiomatic rename).
+//   frontierExcludedSymbol's pre-FR-115 arm used the raw `getName()`, a
+//   latent case mismatch: the FR-43 excluded set holds graph keys, so a
+//   raw spelling could only ever match a name that was already UpperCamel.
+//   This helper uses the graph's derivation for both callers.
+std::string CImporter::graphItemSymbol(const clang::Decl *decl) const {
   std::string symbol;
   if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
     // C++ member functions are not graph items (their emitted name depends on
@@ -409,12 +419,19 @@ std::string CImporter::frontierExcludedSymbol(const clang::Decl *decl) const {
     const clang::EnumDecl *definition = enumDecl->getDefinition();
     if (!definition)
       return {};
-    symbol = definition->getName().str();
+    symbol = enumTypeRustName(definition->getName());
   } else if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
     symbol = cGlobalSymbolName(var, currentTuTag);
   } else {
     return {};
   }
+  return symbol;
+}
+
+std::string CImporter::frontierExcludedSymbol(const clang::Decl *decl) const {
+  if (!excludedItems || excludedItems->empty())
+    return {};
+  std::string symbol = graphItemSymbol(decl);
   if (symbol.empty() || !excludedItems->count(symbol))
     return {};
   return symbol;
@@ -512,7 +529,14 @@ CImporter::importTopLevelDeclRecovering(const clang::Decl *decl) {
   // without a fallback approximation, because a stub whose signature differed
   // from the real one would mis-compile every caller instead of rejecting it.
   bool stubbed = false;
-  std::string symbol = declLedgerName(decl);
+  // FR-115: key the ledger by the GRAPH key when the graph models this
+  // declaration, so the rejection joins its node instead of falling off-graph
+  // (raw C spellings diverge for namespaced records, statics, and globals
+  // under idiomatic rename). Fall back to the old spelling for decls the
+  // graph does not model.
+  std::string symbol = graphItemSymbol(decl);
+  if (symbol.empty())
+    symbol = declLedgerName(decl);
   if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
     RecoveryCheckpoint stubCheckpoint = checkpointModule();
     activeCheckpoint = &stubCheckpoint;
@@ -541,7 +565,15 @@ CImporter::importTopLevelDeclRecovering(const clang::Decl *decl) {
     activeCheckpoint = previousCheckpoint;
   }
 
-  if (rejectionLedger)
+  // FR-115: a top-level record's failure runs through `importRecord`,
+  // which now ledgers graph-modelled records itself at the moment of
+  // memoization; recording it again here would duplicate the stderr summary
+  // line and double-count the blocker tally.
+  bool alreadyLedgered = false;
+  if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl))
+    if (const clang::RecordDecl *definition = record->getDefinition())
+      alreadyLedgered = ledgerRecordedRecords.contains(definition);
+  if (rejectionLedger && !alreadyLedgered)
     rejectionLedger->record(RejectedItem{symbol, loc, reason,
                                          classifyBlocker(reason, loc), stubbed,
                                          declOwnerSymbol(decl)});

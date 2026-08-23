@@ -1966,6 +1966,12 @@ private:
   /// \returns the excluded item's key, or an empty string.
   std::string frontierExcludedSymbol(const clang::Decl *decl) const;
 
+  /// FR-115: the FR-40 item-graph node key of `decl`, or the empty
+  /// string when the graph would not model it. Factored out of
+  /// `frontierExcludedSymbol` so the recovery ledger can key rejections by
+  /// the same vocabulary the graph uses.
+  std::string graphItemSymbol(const clang::Decl *decl) const;
+
   /// Emits a stub for a rejected function: a `func::FuncOp` carrying the
   /// real mapped signature whose whole body is
   /// `unimplemented!("<reason>")`. Called by
@@ -6653,6 +6659,13 @@ private:
   /// by `importRecord` so that naming a rejected type fails at the use site
   /// rather than emitting a reference to a struct that was never defined.
   llvm::SmallPtrSet<const clang::RecordDecl *, 4> rejectedRecords;
+
+  /// FR-115: record definitions whose rejection `importRecord` already
+  /// pushed into the ledger, so `importTopLevelDeclRecovering` does not
+  /// record the SAME rejection a second time (the JSON report collapses
+  /// duplicates by symbol+loc, but the stderr recovery summary and the
+  /// blocker tally count raw ledger entries).
+  llvm::SmallPtrSet<const clang::RecordDecl *, 4> ledgerRecordedRecords;
   /// Enum definitions already imported (keyed on the defining decl).
   llvm::SmallPtrSet<const clang::EnumDecl *, 8> importedEnums;
   /// Enum definitions whose import was REJECTED (keyed on the defining

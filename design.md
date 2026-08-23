@@ -7527,7 +7527,7 @@ piece and becomes FR-45.
   cpp-ctor-overload.cpp)
 
 
-- [ ] FR-115 DEFECT: a rejected C++ record never says WHY. Spike
+- [x] FR-115 DEFECT: a rejected C++ record never says WHY. Spike
   verdict **GO-WITH-CONSTRAINTS** (2026-08-22), with the baseline
   RE-MEASURED first because the filed 70% predates eleven landed
   increments: at HEAD the silent fraction is **41.3%** (2145 of 5193
@@ -7580,6 +7580,50 @@ piece and becomes FR-45.
   FULL suite -- the spike ran fast-tier only, with byte-identity
   spot-proven on 11 corpus TUs rather than the 102 EndToEnd inputs.
   **SPIKED.**
+  LANDED 2026-08-22, with ONE SCOPE EXPANSION adopted mid-flight: the
+  c1 channel (per-specialization recording at the importRecord
+  memoization site) shipped IN this change rather than as the planned
+  follow-on -- a parallel implementation lane had already built it
+  soundly, and it carries its own pin (`dropped 'BoxI32'` with
+  WARN-NOT on the sibling). All three specced fixes landed: the ledger
+  keyed by the graph-vocabulary symbol via a `graphItemSymbol` factored
+  from `frontierExcludedSymbol` (with the enum arm CORRECTED to
+  `enumTypeRustName` -- which also fixes the frontier filter's own
+  latent case-mismatch, since the helper is shared); the
+  discarded-coloring-root fix in `attributeRoot`; and the
+  `unreached-by-import` tag on never-visited missing items (verified
+  UNMIRRORABLE into either ledger table -- the tally iterates recorded
+  items only, and run_realworld parses stderr lines; vocabulary note
+  only). The Struct_-rename collision degradation is documented in
+  comment and here: plain recordRustName lacks the graph's
+  ordinaryNameTaken state, so that rare case degrades to today's
+  off-graph behavior.
+  GOLDEN CHURN: the four predicted spellings PLUS a fifth the spike
+  could not see -- test/EndToEnd/planner-rejection-builds.c
+  (`fill` -> `tu0_fill`), a ledger-spelling pin in the tier the spike
+  never ran; expected in kind, flagged per the red-flag rule, all five
+  carrying join-key intent notes.
+  CORPUS DELTAS with the real implementation (11 TUs): unported
+  denominator 5193 -> 4560 (633 double-counted off-graph rows merge
+  away -- the old denominator was inflated); fully-silent 2145 -> 0,
+  with the residual 1265 now honestly self-rooted as
+  unreached-by-import; 377 missing rows gain REAL roots from the
+  coloring (template 344). THE RANKING MOVED AS THE SPIKE MEASURED:
+  rejected-type-cascade 496 -> 317, template 440 (#3 from invisible),
+  copy-move-constructor 538 (#2), and unreached-by-import tops the
+  table at 1265 -- covering the template-specialization residual
+  literally (import never visits those decls) until a per-instantiation
+  attribution lands.
+  Gates: full meson suite 768/768 (fast 546 + slow/EndToEnd 222, the
+  slow tier a genuine first run under the patch); emitted Rust
+  byte-identical (reporting-only, exactly as FR-49 promised);
+  CTestSuite 220/220/0/0, Cpp17Suite 33/36, RealWorld ledgers all
+  unchanged.
+  (test/Driver/incremental-rejected-record-diagnostic.cpp,
+  incremental-unreached-by-import.cpp,
+  incremental-on-demand-record-diagnostic.cpp; the five join-key
+  golden updates)
+
 
 - [x] FR-119 DEFECT: a free NON-MEMBER `operator` declaration escapes
   every backstop and emits a syntactically invalid crate, silently.
@@ -13222,6 +13266,13 @@ pugixml's 42 units do not manufacture it.
 | exceptions | 11 | 0.2% | root | W2.24 |
 | copy/move constructor semantics | 4 | 0.06% | root | W2.23 |
 | **`std::unique_ptr` / `make_unique`** | **0** | **0%** | -- | **W2.21** |
+
+**STALE-MARKER (2026-08-22): this table predates FR-115.** The
+attribution defect FR-115 closed was skewing every count below --
+re-measured post-fix, `template` re-enters at #3, copy-move at #2, and
+the cascade bucket collapses toward true roots (FR-115's entry has the
+numbers). Re-run the full 11-repo sweep before sizing any new wave off
+this table.
 
 **THE HEADLINE, and it is the thing naive counting gets wrong: 59.2% of
 all blocked items -- 3949 of 6669 -- never had their own construct

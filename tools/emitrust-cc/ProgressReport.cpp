@@ -116,14 +116,25 @@ const ColoredItem *lookupColor(const ColorIndex &index,
 /// item with no usable chain is its own root, so `rootBlockerTag` mirrors the
 /// direct tag rather than reading `unknown`.
 ///
-/// `item.blockerTag` must already be set, and the whole function is a no-op
-/// for an item that was never rejected (its root, chain, and attribution are
-/// all empty, exactly like its blocker tag).
+/// `item.blockerTag` need NOT be set (FR-115): an item with no ledger entry
+/// of its own — a `missing` template instantiation whose one located
+/// rejection joined a different symbol — can still sit on a computed poison
+/// chain, and discarding that chain is how 624 corpus items used to read
+/// blank. When the tag is empty the item still takes the coloring's root and
+/// chain if one exists; only an item with neither a tag nor a color is left
+/// with everything empty.
 void attributeRoot(emitrustcc::ProgressItem &item, const ColoredItem *own,
                    const ColoredItem *ownerColor,
                    llvm::StringRef ownerSymbol) {
-  if (item.blockerTag.empty())
+  if (item.blockerTag.empty()) {
+    // FR-115: a silent item (never in the ledger) still gets the coloring's
+    // root when the coloring has one, instead of staying blank.
+    if (own && !own->construct.empty()) {
+      item.rootBlockerTag = own->construct;
+      item.blameChain = own->chain;
+    }
     return;
+  }
   if (own && !own->construct.empty()) {
     item.rootBlockerTag = own->construct;
     item.blameChain = own->chain;
@@ -510,6 +521,16 @@ ProgressReport buildProgressReport(llvm::StringRef crateName,
         item.status = ItemStatus::Ported;
       } else {
         item.status = ItemStatus::Missing;
+        // FR-115: a definition node with no ledger row and no emitted symbol
+        // was never VISITED by the import — it was only ever demanded from
+        // code that was itself rejected first. The tag is an honest
+        // attribution of that fact, not a fabricated diagnostic: `blocker`
+        // gets the tag, `diagnostic` stays empty (nothing was ever
+        // diagnosed), and `attributeRoot` below either credits a real root
+        // from the item's poison chain or self-roots it as unreached. Rides
+        // the existing schema; the 5-value `status` vocabulary the RealWorld
+        // ratchet parses is untouched.
+        item.blockerTag = "unreached-by-import";
       }
       // FR-49: a graph item has its own chain, so it needs no owner.
       attributeRoot(item, lookupColor(colors, node.symbol),

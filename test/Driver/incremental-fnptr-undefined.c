@@ -51,7 +51,10 @@ int offset(int x);
 int main(void) { return describe(offset(3)); }
 
 // The driver exits 0 and the summary attributes the drop to the global.
-// WARN: dropped 'g_rng' [fnptr-undefined-target] unsupported: taking the address of undefined function 'default_csprng'
+// FR-115: the ledger spelling is the report's JOIN KEY, so the dropped
+// static global prints under its graph node key `TU0_G_RNG`
+// (`cGlobalSymbolName`: TU tag + idiomatic SCREAMING_SNAKE), not `g_rng`.
+// WARN: dropped 'TU0_G_RNG' [fnptr-undefined-target] unsupported: taking the address of undefined function 'default_csprng'
 
 // Every translatable item reaches the crate -- including the companion TU's
 // `offset` -- and the readers of the dropped global recover as stubs rather

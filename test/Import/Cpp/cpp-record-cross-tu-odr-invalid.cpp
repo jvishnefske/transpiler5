@@ -193,6 +193,9 @@ int main(int argc, char **) {
 // the drop, and the FR-52 cascade on the function that named the dropped
 // type.
 // RECDIAG: pod.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: conflicting definition of struct 'C' with a different shape in another translation unit (recovered: item dropped)
-// RECDIAG: dropped 'c' [struct-shape-conflict] unsupported: conflicting definition of struct 'C' with a different shape in another translation unit
+// FR-115: the ledger spelling is the report's JOIN KEY, so the dropped
+// record prints under its graph node key `C` (`recordRustName`, UpperCamel
+// under the idiomatic rename), not its lowercase C spelling `c`.
+// RECDIAG: dropped 'C' [struct-shape-conflict] unsupported: conflicting definition of struct 'C' with a different shape in another translation unit
 // RECDIAG: stubbed 'use_pod' [rejected-type-cascade]
 // RECDIAG-NOT: error:

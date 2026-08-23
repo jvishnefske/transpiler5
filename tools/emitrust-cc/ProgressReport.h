@@ -270,19 +270,28 @@ struct ProgressItem {
   /// What became of it.
   ItemStatus status;
   /// The FR-42 blocker tag of the diagnostic this item actually raised — the
-  /// SYMPTOM. Empty unless the item was rejected.
+  /// SYMPTOM. Empty unless the item was rejected, with one FR-115 exception:
+  /// a `missing` item (a definition node the import never visited) carries
+  /// the synthetic tag `unreached-by-import`, an honest attribution of the
+  /// non-visit rather than a diagnostic tag.
   std::string blockerTag;
-  /// The verbatim importer diagnostic; empty unless the item was rejected.
+  /// The verbatim importer diagnostic; empty unless the item was rejected
+  /// (in particular, empty for `unreached-by-import` — nothing was ever
+  /// diagnosed).
   std::string diagnostic;
   /// FR-49: the construct at the end of this item's blame chain — the one
   /// construct whose support would unblock it. Taken from the FR-41
   /// coloring's `construct` when a chain was available (and then in the
   /// PROBE's vocabulary: `base-class`, `destructor`, ...); otherwise equal to
-  /// `blockerTag`, because an item with no chain is its own root. Empty
-  /// exactly when `blockerTag` is.
+  /// `blockerTag`, because an item with no chain is its own root. Since
+  /// FR-115 this is no longer empty exactly when `blockerTag` is: an item
+  /// with no ledger row of its own still publishes the coloring's root when
+  /// the poison chain reached it, and a `missing` item self-roots as
+  /// `unreached-by-import`. Empty only when there is neither a tag nor a
+  /// color.
   std::string rootBlockerTag;
   /// FR-49: the audit trail for `rootBlockerTag` — symbols from this item to
-  /// the root. Empty when the item was not rejected; `{symbol}` when the item
+  /// the root. Empty when `rootBlockerTag` is; `{symbol}` when the item
   /// is its own root; for an off-graph item, `symbol` followed by its
   /// enclosing class's own chain.
   std::vector<std::string> blameChain;
