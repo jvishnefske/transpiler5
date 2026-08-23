@@ -72,7 +72,9 @@ int main(void) { return sum(1, 2) + use_pick(); }
 // variadic definition is indistinguishable from one the importer never
 // supported, so the existing rejection covers every caller for free.
 // WARN: recovered 3 rejected top-level items:
-// WARN: dropped 'pick' [other] unsupported: va_copy
+// FR-115: the ledger spelling is the report's JOIN KEY, so the dropped
+// static prints under its graph node key `tu0_pick`, not its C spelling.
+// WARN: dropped 'tu0_pick' [other] unsupported: va_copy
 // WARN: stubbed 'use_pick' [variadic-cross-tu] unsupported: call to a variadic function
 // WARN: stubbed 'tu0_taker' [other] unsupported: address of variadic definition
 

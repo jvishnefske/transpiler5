@@ -167,9 +167,77 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
                                     : rejectedName)
            << "' was rejected, so a type naming it cannot be imported";
   }
-  LogicalResult imported = importRecordUncached(definition);
-  if (failed(imported))
+  // FR-115: capture the record's OWN rejection at the moment it is
+  // memoized, so the cause reaches the ledger even when this import runs
+  // on demand inside a function body (where the per-use "struct 'X' was
+  // rejected" restatement is all that used to survive). Same capture shape
+  // as the FR-112 method path below. The captured errors are re-emitted on
+  // the way out, so outer handlers (a function's recovery capture, strict
+  // mode's printer) observe exactly what they did before.
+  struct Fr115Captured {
+    Location loc;
+    DiagnosticSeverity severity;
+    std::string message;
+  };
+  SmallVector<Fr115Captured> captured;
+  auto capture = [&captured](Diagnostic &diag) -> LogicalResult {
+    if (diag.getSeverity() != DiagnosticSeverity::Error)
+      return failure();
+    captured.push_back({diag.getLocation(), diag.getSeverity(), diag.str()});
+    for (Diagnostic &note : diag.getNotes())
+      captured.push_back(
+          {note.getLocation(), DiagnosticSeverity::Note, note.str()});
+    return success();
+  };
+  LogicalResult imported = failure();
+  {
+    ScopedDiagnosticHandler handler(builder.getContext(), capture);
+    imported = importRecordUncached(definition);
+  }
+  if (failed(imported)) {
     rejectedRecords.insert(definition);
+    // Ledger ONLY records the graph models (file-scope, named): those are
+    // the nodes that would otherwise read `missing` with no diagnostic.
+    // A nested or block-scope record is not a node; its rejection already
+    // reaches the report through whoever imported it (the enclosing record
+    // or function captures this error), so a ledger entry here would only
+    // inflate the blocker tally with an off-graph restatement.
+    // `recoveryStubOnly` guard: a stub retry runs with ALL diagnostics
+    // silenced (it is a best-effort restatement of an already-reported
+    // item); a ledger entry from inside it would leak a rejection the
+    // recovery contract says is discarded (measured: search-red.c grew a
+    // spurious `learn ... rejected=Atom tag=other` line without this).
+    std::string sym = graphItemSymbol(definition);
+    if (rejectionLedger && !sym.empty() && !recoveryStubOnly) {
+      Location diagLoc = captured.empty()
+                             ? translateLoc(definition->getLocation())
+                             : captured.front().loc;
+      std::string reason = captured.empty()
+                               ? std::string("unsupported declaration")
+                               : captured.front().message;
+      rejectionLedger->record(emitrust::RejectedItem{
+          sym, diagLoc, reason, emitrust::classifyBlocker(reason, diagLoc),
+          /*stubbed=*/false, /*ownerSymbol=*/""});
+      ledgerRecordedRecords.insert(definition);
+    }
+  }
+  // Re-emit what was captured, preserving the error/attached-note structure
+  // so outer observers (strict mode's printer, a function's recovery
+  // capture) see byte-identical diagnostics.
+  {
+    std::optional<InFlightDiagnostic> active;
+    for (const Fr115Captured &diag : captured) {
+      if (diag.severity == DiagnosticSeverity::Error) {
+        if (active)
+          active->report();
+        active.emplace(emitError(diag.loc) << diag.message);
+      } else if (active) {
+        active->attachNote(diag.loc) << diag.message;
+      }
+    }
+    if (active)
+      active->report();
+  }
   return imported;
 }
 

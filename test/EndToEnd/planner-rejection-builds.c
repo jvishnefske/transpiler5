@@ -51,4 +51,6 @@ int main(void) {
 
 // WARN: warning: unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape (recovered: item dropped)
 // WARN: recovered 1 rejected top-level item:
-// WARN: dropped 'fill' [ptr-to-ptr-shape-escape]
+// FR-115: the ledger spelling is the report's JOIN KEY, so the dropped
+// static prints under its graph node key `tu0_fill`, not its C spelling.
+// WARN: dropped 'tu0_fill' [ptr-to-ptr-shape-escape]

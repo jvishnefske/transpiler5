@@ -47,7 +47,7 @@ int main(void) { return helper(1); }
 
 // The driver exits 0 and summarizes what it dropped.
 // WARN: recovered 1 rejected top-level item:
-// WARN: dropped 'consume' [ptr-to-ptr-shape-escape] unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape
+// WARN: dropped 'tu0_consume' [ptr-to-ptr-shape-escape] unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape
 
 // Both translatable items reach the crate; the rejected one leaves no trace.
 // RUST: fn tu0_helper(x: i32) -> i32 {
@@ -59,31 +59,25 @@ int main(void) { return helper(1); }
 // construct that cost the third, so the crate ships with an honest account of
 // itself instead of not shipping at all.
 //
-// `consume` lands in the OFF-GRAPH table rather than as a `dropped` graph item.
-// That is a pre-existing FR-44 join gap, not an FR-53 behavior: the ledger
-// records a dropped item under its C spelling (`declLedgerName`) while the
-// item graph keys an internal-linkage function under its TU-tagged emitted
-// name (`tu0_consume`), so the two never join and the graph row stays
-// `missing`. It reproduces identically for a function dropped by an ordinary
-// `importFunction` rejection (a `static` returning `_Complex double`), on a
-// build with no FR-53 change in it at all. Pinned here as-is so that whoever
-// closes the join gap sees this test, and so this test is not silently
-// asserting that the gap is correct.
+// FR-115 closed the FR-44 join gap this test used to pin: the recovery
+// ledger now keys a dropped item by the item graph's own vocabulary
+// (`graphItemSymbol`, the same `cFunctionSymbolName(func, tuTag)` the graph
+// uses), so `consume` joins its `tu0_consume` node as a `dropped` graph row
+// with its blocker and diagnostic, and the off-graph table is empty.
 // PORTING: **2 of 3 items ported (66.6%).**
 // PORTING: | ported | 2 |
 // PORTING-NEXT: | stubbed | 0 |
 // PORTING: | root blocker | items |
 // PORTING: | ptr-to-ptr-shape-escape | 1 |
-// PORTING: ## Rejected items outside the item graph
-// PORTING: | dropped | red | `consume` | - | ptr-to-ptr-shape-escape | consume | ptr-to-ptr-shape-escape | unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape |
+// PORTING: | dropped | red | `tu0_consume` | function | ptr-to-ptr-shape-escape | tu0_consume | ptr-to-ptr-shape-escape | unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape |
+// PORTING-NOT: ## Rejected items outside the item graph
 
 // JSON: "graph_items": 3
 // JSON-NEXT: "ported": 2
 // JSON-NEXT: "stubbed": 0
 // JSON: { "tag": "ptr-to-ptr-shape-escape", "count": 1 }
-// JSON: "off_graph_items": [
-// JSON-NEXT: {
-// JSON-NEXT: "symbol": "consume"
+// JSON: "symbol": "tu0_consume"
 // JSON: "status": "dropped"
+// JSON: "off_graph_items": []
 
 // STRICT: error: unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape
