@@ -7848,14 +7848,50 @@ piece and becomes FR-45.
   inheritance-drop-invalid.cpp)
 
 
-- [ ] FR-121 DEFECT (found by FR-113's spike, the next uniform
+- [x] FR-121 DEFECT (found by FR-113's spike, the next uniform
   spdlog blocker): a deferred `[i8; N]` binding (a `__FILE__`-derived
   path string) is mutably borrowed via `&mut v[0]` without `mut` --
   rustc E0596, twice per spdlog unit, 6 of 7 units. The FR-105
   (E0384) sibling in the same deferred-binding machinery: FR-105
   taught loop-assigned deferred bindings to take `mut`; this is the
-  borrow-position analogue. Loud direction, never silent. Root cause
-  not yet isolated. **NOT SPIKED.**
+  borrow-position analogue. Loud direction, never silent.
+  LANDED 2026-08-22 (spike GO), and **THIS ENTRY'S MECHANISM WAS
+  WRONG -- the correction is the useful part.** The binding is NOT
+  deferred and FR-105's machinery is uninvolved (a VariableOp with an
+  init attr returns early from computeDeferredInits; the deferred-let
+  mut decision already handles borrow positions). The real defect is
+  an importer-authored const/mut CONTRADICTION on literal backings:
+  getOrCreateLiteralBacking caches the literal as `emitrust.variable
+  const`; mapParamType's ScalarRef arm maps deref-only `const char*`
+  to `&mut i8` (the deliberate FR-55 non-u8 rule); the scalar-ref
+  argument path then builds `addr_of mut` on a subscript of the CONST
+  backing, and the emitter's `!isConst && lvalueIsMutated` correctly
+  refuses the mut -- E0596. The emitter needs ZERO changes
+  (lvalueIsMutated already sees the borrow through the subscript;
+  pinned by the new Target test); the fix is importer-only: in the
+  scalar-ref path, `literalBacking && isMutParam` rematerializes a
+  fresh `isConst=false` per-call copy from the cached backing's init
+  attr -- the exact model and UB rationale of the mutable-slice
+  branch (writing through a pointer to a string literal is UB, so the
+  copy is unobservable); the cached const backing is untouched for
+  shared readers, at the accepted cost of a dead `let _vN` when the
+  mut call was its only consumer (dropping it needs proof-of-no-read).
+  Adversarial probes all byte-identical vs clang native: two calls =
+  two independent copies, advanced-cursor `p+2` reads the right byte,
+  shared `*p` reader of the same literal coexists, both argument
+  spellings. FR-55's u8 rule and every shared-borrow rejection are
+  untouched (isMutParam-guarded); `(const unsigned char*)` casts stay
+  located rejections. SPDLOG RE-PROBE, honest numbers: measured
+  baseline 12 E0596 across 6 of 9 units (not this entry's "6 of 7"
+  nor the re-sweep's "7 of 8" -- tool vintages differ) -> 0
+  everywhere; async.cpp and cfg.cpp flip fully cargo-clean; every
+  residual error is FR-124's E0204 overlap, which landed the same
+  day -- the pair is complete. Gates: full meson suite green in the
+  worktree (fast 553 + EndToEnd 225) and on the merged FR-124+FR-121
+  main tree.
+  (test/Import/C/pointers-param-literal-scalar-mut.c,
+  test/Target/Rust/literal-backing-mut-borrow.mlir,
+  test/EndToEnd/literal-scalar-mut-arg.c)
 
 - [x] FR-122 DEFECT: the cross-TU record dedup key is
   FIELD-SHAPE-ONLY, and colliding records silently exchange member

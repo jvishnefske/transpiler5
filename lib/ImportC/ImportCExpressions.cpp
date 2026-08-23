@@ -6247,6 +6247,33 @@ FailureOr<Value> CImporter::emitBorrowArgument(
       }
       return rejectGlobalPointerArgument(loc, pointer->base);
     }
+    // FR-121: a string-literal element handed to a MUTABLE scalar-reference
+    // parameter (`sink(__FILE__, ..)` against `fn sink(v0: &mut i8, ..)`,
+    // the spdlog assert-fail shape) rematerializes a FRESH mutable backing
+    // for this call, exactly as the mutable-slice branch above does for the
+    // sliced form of the same argument. Borrowing the shared const backing
+    // mutably instead emits `&mut v[i]` against a non-`mut` `let` — rustc
+    // E0596, an emitted crate that cannot compile. The per-call copy is
+    // sound for the same reason as the slice branch: writing through a
+    // pointer to a string literal is undefined behavior, so no defined
+    // program can observe that the callee got a copy; and the cached const
+    // backing itself is untouched, so shared readers of the same literal
+    // keep borrowing the original.
+    if (pointer->literalBacking && isMutParam) {
+      auto sourceVar =
+          pointer->literalBacking.getDefiningOp<emitrust::VariableOp>();
+      if (!sourceVar)
+        return emitError(loc)
+               << "unsupported: string-literal argument to a mutable "
+                  "reference parameter has no backing to copy";
+      pointer->literalBacking =
+          builder
+              .create<emitrust::VariableOp>(loc,
+                                            pointer->literalBacking.getType(),
+                                            sourceVar.getInitAttr(),
+                                            /*isConst=*/false)
+              .getResult();
+    }
     FailureOr<Value> place = emitPointerPlace(loc, *pointer, pointee);
     if (failed(place))
       return failure();
