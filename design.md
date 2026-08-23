@@ -13255,6 +13255,15 @@ whole-program demand.
   cpp-operator-member.cpp, cpp-operator-copy-ctor.cpp; flips forward
   in free-operator-invalid.cpp, methods-invalid.cpp,
   cpp-contained-member-invalid.cpp, free-operator-graph.cpp)
+  EXTERNAL RE-PROBE, post-FR-128 (2026-08-23, second session, the
+  honest number after the regression this wave introduced was fixed):
+  the FR-125+FR-127+W2.25+FR-128 cluster nets corpus ported
+  589 -> 619 (+30; fn-only 151 -> 154), with +141 more graph items
+  visible from deeper import reach, silent still 0 everywhere, and
+  NO_CRATE back to the three pre-existing units. The interim
+  post-W2.25 sweep that looked like a collapse (5746 items / 481
+  ported) was the FR-128 spdlog hole, not this wave's semantics --
+  recorded so the ledger explains its own dip.
 
 
 - [x] W2.26 POLYMORPHIC RAII -- a class with a virtual destructor, or
