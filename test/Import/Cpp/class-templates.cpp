@@ -171,3 +171,84 @@ int use_stl(int n) {
 // NOPATTERN-NOT: func.func @Box_new(
 // NOPATTERN-NOT: func.func @Box_get(
 // NOPATTERN-NOT: func.func @Pair2_first(
+
+// ---- W2.28: the class-side frontier widening ----
+//
+// An INTEGRAL non-type argument codes by VALUE through the same
+// `templateArgIntegralCode` the function suffix uses (`v3`, `vn3` for a
+// negative; the `v` prefix is what survives the UpperCamel rename —
+// see class-templates-invalid.cpp decision 3). `Fixed<3>`/`Fixed<40>`
+// was W2.16's nttp-unused rejection input; the value code is what
+// retired that pin: two instantiations, two structs, two method sets.
+template <int N>
+struct FixedW {
+  int v;
+  int cap() { return N; }
+};
+
+// CHECK-DAG: emitrust.struct_def @FixedW_v3 ["v"] [i32]
+// CHECK-DAG: emitrust.struct_def @FixedW_v40 ["v"] [i32]
+// CHECK-DAG: func.func @FixedW_v3_cap(
+// CHECK-DAG: func.func @FixedW_v40_cap(
+
+// An EXPLICIT full specialization imports its HAND-WRITTEN class body —
+// including a field set that disagrees with the primary's — under the
+// suffixed name its displaced instantiation would have used.
+template <typename T>
+struct TagW {
+  T v;
+  int id() { return 1; }
+};
+
+template <>
+struct TagW<int> {
+  int v;
+  int bonus;
+  int id() { return v + bonus; }
+};
+
+// CHECK-DAG: emitrust.struct_def @TagW_i32 ["v", "bonus"] [i32, i32]
+// CHECK-DAG: emitrust.struct_def @TagW_i8 ["v"] [i8]
+
+// An instantiation whose pattern is a PARTIAL specialization is fully
+// concrete and imports carrying the PARTIAL's body (its own field set,
+// its own methods) under the PRIMARY template's argument suffix — the
+// partial PATTERN itself is dependent and is skipped structurally, never
+// imported, never rejected.
+template <typename T>
+struct PW {
+  int t;
+  int k() { return 1; }
+};
+
+template <typename T>
+struct PW<T *> {
+  T *p;
+  int k() { return 2; }
+};
+
+// CHECK-DAG: emitrust.struct_def @PW_i32 ["t"] [i32]
+// CHECK-DAG: emitrust.struct_def @PW_pi32 ["p"]
+// CHECK-DAG: func.func @PW_i32_k(
+// CHECK-DAG: func.func @PW_pi32_k(
+
+int use2(int n) {
+  FixedW<3> f3;
+  FixedW<40> f40;
+  f3.v = n;
+  f40.v = n;
+  TagW<int> ti;
+  ti.v = n;
+  ti.bonus = 40;
+  TagW<char> tc;
+  tc.v = (char)n;
+  PW<int> w1;
+  w1.t = n;
+  PW<int *> w2;
+  w2.p = &n;
+  return f3.cap() + f40.cap() + ti.id() + tc.id() + w1.k() + w2.k();
+}
+
+// NOPATTERN-NOT: emitrust.struct_def @FixedW {{\[}}
+// NOPATTERN-NOT: emitrust.struct_def @TagW {{\[}}
+// NOPATTERN-NOT: emitrust.struct_def @PW {{\[}}

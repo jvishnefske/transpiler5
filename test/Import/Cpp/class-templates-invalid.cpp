@@ -1,22 +1,24 @@
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/explicit-spec.cpp 2>&1 | FileCheck %s --check-prefix=EXPLSPEC
-// RUN: not emitrust-import-c %t/partial-spec.cpp 2>&1 | FileCheck %s --check-prefix=PARTIAL
-// RUN: not emitrust-import-c %t/nttp.cpp 2>&1 | FileCheck %s --check-prefix=NTTP
-// RUN: not emitrust-import-c %t/nttp-unused.cpp 2>&1 | FileCheck %s --check-prefix=NTTPUNUSED
+// RUN: not emitrust-import-c %t/nttp-decl.cpp 2>&1 | FileCheck %s --check-prefix=NTTPDECL
 // RUN: not emitrust-import-c %t/variadic.cpp 2>&1 | FileCheck %s --check-prefix=VARIADIC
 // RUN: not emitrust-import-c %t/member-fn-template.cpp 2>&1 | FileCheck %s --check-prefix=MEMFN
 // RUN: not emitrust-import-c %t/static-data-member.cpp 2>&1 | FileCheck %s --check-prefix=STATICMEM
 // RUN: not emitrust-import-c %t/collide-template-first.cpp 2>&1 | FileCheck %s --check-prefix=COLTMPL
 // RUN: not emitrust-import-c %t/collide-handwritten-first.cpp 2>&1 | FileCheck %s --check-prefix=COLHAND
-// RUN: emitrust-cc --recover --emit=rust %t/explicit-spec.cpp | FileCheck %s --check-prefix=EXPLSPECREC --implicit-check-not="v * 2" --implicit-check-not="struct BoxI8"
-// RUN: emitrust-cc --recover --emit=rust %t/explicit-spec.cpp 2>&1 >/dev/null | FileCheck %s --check-prefix=EXPLSPECRECDIAG
+// RUN: emitrust-cc --recover --emit=rust %t/nttp-decl.cpp | FileCheck %s --check-prefix=NTTPDECLREC --implicit-check-not="struct RX"
 
-// W2.16 located-rejection ledger for class templates. W2.16 admits
-// exactly ONE shape — a class template whose parameters are all plain
-// TYPE parameters, monomorphized by clang into concrete instantiations of
-// the PRIMARY template (see class-templates.cpp). Everything else on the
-// class-template frontier must stay a LOCATED rejection, and this file is
-// the ledger that says so.
+// W2.16/W2.28 located-rejection ledger for class templates. W2.16
+// admitted plain TYPE arguments monomorphized from the PRIMARY template;
+// W2.28 widened the frontier with INTEGRAL non-type arguments
+// (value-coded suffixes), EXPLICIT full specializations (the hand-written
+// class body imports under the suffixed name its displaced instantiation
+// would have used) and instantiations of PARTIAL specializations (fully
+// concrete, named by the PRIMARY's argument list) — all pinned
+// positively in class-templates.cpp and byte-diffed in
+// test/EndToEnd/cpp-template-{nttp,explicit-spec,partial-spec}.cpp.
+// Everything still outside — parameter packs, non-INTEGRAL non-type
+// arguments — must stay a LOCATED rejection, and this file is the ledger
+// that says so.
 //
 // Three design decisions are pinned here, all load-bearing:
 //
@@ -28,18 +30,19 @@
 //    IS-A `RecordDecl`), and (c) ON DEMAND from `mapType` when a local, a
 //    member or a parameter names the type. Route (c) is reachable even
 //    when FR-42 recovery has dropped (a) and (b), and it was measured
-//    emitting `struct Box_i8` / `struct Fixed_x` for shapes the strict
-//    mode rejects. Putting the verdict on the record import itself is
-//    what makes all three routes agree.
+//    emitting `struct Fixed_x` for shapes the strict mode rejects.
+//    Putting the verdict on the record import itself is what makes all
+//    three routes agree — the recovery RUN line above pins route (c) for
+//    the one class-side shape still rejected on argument kind.
 //
 // 2. THE REJECTIONS ARE DRIVEN OFF THE SPECIALIZATION's
-//    `TemplateArgument` KIND AND ITS SPECIALIZED-FROM LINK, NEVER OFF
-//    ANYTHING IN A BODY. `nttp-unused` below is the regression pin that
-//    matters most: `N` appears nowhere in the class, so a body-driven or
-//    field-driven check sees an ordinary struct and admits it — under a
-//    symbol whose suffix codes the non-type argument as the `x`
-//    placeholder, so `Fixed<3>` and `Fixed<40>` SILENTLY MERGE into one
-//    struct with one set of methods.
+//    `TemplateArgument` KIND, NEVER OFF ANYTHING IN A BODY. The
+//    `nttp-decl` section below is the current form of that pin: `P` may
+//    appear nowhere in the class body, yet two instantiations at two
+//    different globals would both code the `x` placeholder and SILENTLY
+//    MERGE into one struct. (W2.28 retired the INTEGRAL twin of this pin
+//    by giving values a real code — `Fixed<3>`/`Fixed<40>` are now
+//    `Fixed_v3`/`Fixed_v40`, pinned in class-templates.cpp.)
 //
 // 3. A NAME CLASH INVOLVING AN INSTANTIATION IS A HARD REJECTION, NOT A
 //    MERGE. The FR-58 shape dedup keys on the emitted NAME, so a
@@ -55,114 +58,35 @@
 //    merging (pinned by test/EndToEnd and the corpus), and two
 //    instantiations of the SAME pattern whose arguments alias onto one
 //    type code (`Box<char>`/`Box<signed char>`) must keep merging too —
-//    they emit literally the same code.
-//
-//    FR-108 RETIRED THE THIRD `collide-*` SECTION. `collide-namespace`
-//    pinned `::Box<int>` beside `ns::Box<int>` as a rejection, on the
-//    grounds that record names carried NO namespace prefix and so the two
-//    patterns composed one spelling. FR-108 gave record names the same
-//    `namespacePrefix` `cFunctionSymbolName` has always applied, so those
-//    two now COEXIST as `BoxI32` and `NsNsBoxI32` with their own method
-//    sets. The rejection was SUPERSEDED, not dropped: its exact input is
-//    now a byte-diff EndToEnd leg,
-//    test/EndToEnd/cpp-namespace-class-template.cpp. The two sections
-//    that remain involve no namespace and must keep failing.
+//    they emit literally the same code. The W2.28 value codes carry a
+//    `v` prefix for exactly this family of reasons: a bare-digit code
+//    survives snake_case but dies under the UpperCamel record rename,
+//    where `Grid<1,23>` and `Grid<12,3>` both camel to `Grid123` and the
+//    same-shaped pair was measured dispatching both to one method body
+//    (see templateArgIntegralCode and the Duo pin in
+//    test/EndToEnd/cpp-template-nttp.cpp).
 //
 // A note on locations: an IMPLICIT instantiation reports the PATTERN's
 // `getLocation()`, so all instantiations of one template necessarily
 // share one diagnostic location. That is why every check below matches
 // the line and column loosely — the file/wording pair is the contract.
 
-//--- explicit-spec.cpp
-// An explicit specialization supplies a hand-written class body for one
-// argument list, so it is NOT the clang-monomorphized pattern W2.16
-// admits: its fields and methods can disagree arbitrarily with the
-// primary template's, while both want the same composed struct name.
-// REJECT.
-// EXPLSPEC: explicit-spec.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: explicit class template specialization
-template <typename T>
-struct Box {
-  T v;
-  Box(T x) : v(x) {}
-  T get() const { return v; }
-};
+//--- nttp-decl.cpp
+// W2.28 admits INTEGRAL non-type arguments only: they code by VALUE. A
+// DECLARATION-kind argument (a pointer NTTP naming a global) has no such
+// spelling — two distinct globals would both code `x` and fuse — so the
+// kind check keeps rejecting it with the W2.16 wording.
+// NTTPDECL: nttp-decl.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-type template argument in class template instantiation
+int g = 0;
 
-template <>
-struct Box<char> {
-  char v;
-  Box(char x) : v(x) {}
-  char get() const { return (char)(v * 2); }
+template <int *P>
+struct R {
+  int get() { return *P; }
 };
 
 int use(void) {
-  Box<char> b('A');
-  return (int)b.get();
-}
-
-//--- partial-spec.cpp
-// A partial specialization is a second PATTERN, selected by argument
-// shape. The instantiation `Box<int *>` that hangs off the primary
-// template's `specializations()` list is fully concrete and would
-// otherwise be admitted as `Box_pi32` — carrying the PARTIAL's body under
-// a name computed from the primary. Discriminated on
-// `getSpecializedTemplateOrPartial()`, not on dependence (the
-// instantiation is not dependent).
-// PARTIAL: partial-spec.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: partial class template specialization
-template <typename T>
-struct Box {
-  T v;
-  Box(T x) : v(x) {}
-  int get() const { return 1; }
-};
-
-template <typename T>
-struct Box<T *> {
-  T *v;
-  Box(T *x) : v(x) {}
-  int get() const { return 2; }
-};
-
-int use(int n) {
-  Box<int *> b(&n);
-  return b.get();
-}
-
-//--- nttp.cpp
-// A non-type template parameter is a compile-time VALUE, not a type: the
-// suffix scheme codes types only, so two instantiations differing only in
-// `N` would fuse onto one struct. REJECT on the argument kind.
-// NTTP: nttp.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-type template argument in class template instantiation
-template <int N>
-struct Fixed {
-  int v;
-  Fixed(int x) : v(x + N) {}
-  int get() const { return v; }
-};
-
-int use(int n) {
-  Fixed<3> a(n);
-  Fixed<40> b(n);
-  return a.get() + b.get();
-}
-
-//--- nttp-unused.cpp
-// REGRESSION PIN. `N` is mentioned NOWHERE in the class, so a field- or
-// body-driven rejection sees an ordinary struct and SILENTLY IMPORTS it —
-// with a name that does not encode `N`, so `Fixed<3>` and `Fixed<40>` are
-// one struct with one constructor. The rejection must come from the
-// argument KIND.
-// NTTPUNUSED: nttp-unused.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-type template argument in class template instantiation
-template <int N>
-struct Fixed {
-  int v;
-  Fixed(int x) : v(x) {}
-  int get() const { return v; }
-};
-
-int use(int n) {
-  Fixed<3> a(n);
-  Fixed<40> b(n);
-  return a.get() + b.get();
+  R<&g> r;
+  return r.get();
 }
 
 //--- variadic.cpp
@@ -283,23 +207,9 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-// The FR-42 recovery half. The recovered crate must contain a LOUD stub
-// and NOTHING of the explicit specialization: the `v * 2` its hand-written
-// body spells must not reach emitted Rust under any mode (the two
-// `--implicit-check-not`s on the RUN line scan the WHOLE crate for it, not
-// just a region), and no `BoxI8` struct may be emitted behind the dropped
-// item's back through the on-demand `mapType` route — which is precisely
-// what putting the verdict on `importRecordUncached` buys: route (c) hits
-// the same rejection, so the recovered crate carries a cascade stub
-// instead of a fieldful struct with no methods.
-// EXPLSPECREC: unimplemented!("unsupported: struct 'BoxI8' was rejected, so a type naming it cannot be imported")
-
-// All THREE visits reject, and each is LOCATED. The first diagnostic is
-// the specialization's own verdict (the `specializations()` walk); the
-// second is the ordinary top-level `RecordDecl` visit of the same decl,
-// which — because the first visit recorded the rejection — reports the
-// cascade wording rather than silently admitting the hand-written body
-// (measured pre-guard: it DID admit it, emitting a working
-// `Box_i8::box_i8_get` returning `v * 2`).
-// EXPLSPECRECDIAG: explicit-spec.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: explicit class template specialization (recovered: item dropped)
-// EXPLSPECRECDIAG: explicit-spec.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: struct 'BoxI8' was rejected, so a type naming it cannot be imported
+// The FR-42 recovery half of decision 1: the still-rejected NTTP kind is
+// dropped and the recovered crate must contain a LOUD cascade stub, never
+// a struct emitted behind the dropped item's back through the on-demand
+// `mapType` route (the `--implicit-check-not` scans the whole crate for
+// the instantiation's would-be spelling).
+// NTTPDECLREC: unimplemented!("unsupported: struct 'RX' was rejected, so a type naming it cannot be imported")

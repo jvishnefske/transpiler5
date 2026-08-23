@@ -368,6 +368,49 @@ static inline std::string templateArgTypeCode(clang::QualType type) {
   return "x";
 }
 
+/// W2.28 non-type (integral) template-argument code: `v` + the decimal
+/// value, with `n` for a negative sign (`Fixed<3>` -> `fixed_v3` ->
+/// `FixedV3`, `addN<-3>` -> `add_n_vn3`). Bool, char and enum non-type
+/// arguments are `TemplateArgument::Integral` too and code by VALUE the
+/// same way — two distinct enumerators of one enum are two distinct
+/// instantiations, and the numeric value is the only spelling that is
+/// total (an enumerator has a name; `Fixed<3 + 4>` does not).
+///
+/// The `v` prefix is NOT decoration — it is what keeps the code one word
+/// under EVERY casing. A bare-digit code is snake-safe but dies under the
+/// FR-53 UpperCamelCase record rename, which erases underscores between
+/// chunks: `Grid<1,23>` and `Grid<12,3>` both camel to `Grid123`, and the
+/// probe measured that fusing two same-shaped specializations SILENTLY
+/// dispatches both to whichever method body was imported first (the
+/// shape-conflict guard only catches the differently-shaped case). With
+/// the prefix they are `GridV1V23` and `GridV12V3`. Pinned in
+/// test/EndToEnd/cpp-template-nttp.cpp.
+static inline std::string
+templateArgIntegralCode(const llvm::APSInt &value) {
+  llvm::SmallString<32> digits;
+  value.toString(digits, /*Radix=*/10);
+  std::string code(digits.begin(), digits.end());
+  if (!code.empty() && code.front() == '-')
+    code = "n" + code.substr(1);
+  return "v" + code;
+}
+
+/// W2.15/W2.28 shared per-argument code: type arguments through the
+/// W2.15 type table, integral non-type arguments through the W2.28 value
+/// code, everything else (declaration, nullptr, template-template,
+/// packs) the `x` placeholder. Total by construction for the item
+/// graph's sake; the importer gates (`checkTemplateArguments`,
+/// `checkClassTemplateSpecialization`) reject every `x`-coded kind with
+/// a located diagnostic before any such symbol is emitted.
+static inline std::string
+templateArgCode(const clang::TemplateArgument &arg) {
+  if (arg.getKind() == clang::TemplateArgument::Type)
+    return templateArgTypeCode(arg.getAsType());
+  if (arg.getKind() == clang::TemplateArgument::Integral)
+    return templateArgIntegralCode(arg.getAsIntegral());
+  return "x";
+}
+
 /// W2.15 template-argument suffix: `""` for an ordinary function, and
 /// `"_" + code` per template argument, in template-parameter declaration
 /// order, for a function-template specialization.
@@ -384,11 +427,12 @@ static inline std::string templateArgTypeCode(clang::QualType type) {
 /// keeps the CLAUDE.md byte-identity invariant (importer and item graph
 /// agree on a symbol) intact for free.
 ///
-/// A NON-type argument codes as the `x` fallback rather than asserting:
-/// this must stay a total function of the AST for the item graph's sake.
-/// The importer never emits such a symbol — non-type arguments and
-/// parameter packs are LOCATED rejections in
-/// `CImporter::importTopLevelDecl` before any naming happens.
+/// An INTEGRAL non-type argument codes by value (W2.28); every other
+/// non-type kind codes as the `x` fallback rather than asserting: this
+/// must stay a total function of the AST for the item graph's sake. The
+/// importer never emits an `x`-coded symbol — those kinds and parameter
+/// packs are LOCATED rejections in `CImporter::importTopLevelDecl`
+/// before any naming happens.
 static inline std::string
 templateArgSuffix(const clang::FunctionDecl *func) {
   const clang::TemplateArgumentList *args =
@@ -398,9 +442,7 @@ templateArgSuffix(const clang::FunctionDecl *func) {
   std::string suffix;
   for (const clang::TemplateArgument &arg : args->asArray()) {
     suffix += "_";
-    suffix += arg.getKind() == clang::TemplateArgument::Type
-                  ? templateArgTypeCode(arg.getAsType())
-                  : std::string("x");
+    suffix += templateArgCode(arg);
   }
   return suffix;
 }
@@ -423,11 +465,12 @@ templateArgSuffix(const clang::FunctionDecl *func) {
 /// UNSUFFIXED type, and a local of type `Box<int>` would resolve to
 /// nothing.
 ///
-/// A NON-type argument codes as the `x` fallback rather than asserting:
-/// this must stay a total function of the AST for the item graph's sake.
-/// The importer never emits such a symbol — non-type arguments and
-/// parameter packs are LOCATED rejections in
-/// `CImporter::importRecordUncached` before any struct_def is created.
+/// An INTEGRAL non-type argument codes by value (W2.28); every other
+/// non-type kind codes as the `x` fallback rather than asserting: this
+/// must stay a total function of the AST for the item graph's sake. The
+/// importer never emits an `x`-coded symbol — those kinds and parameter
+/// packs are LOCATED rejections in `CImporter::importRecordUncached`
+/// before any struct_def is created.
 static inline std::string templateArgSuffix(const clang::RecordDecl *record) {
   const auto *spec =
       llvm::dyn_cast<clang::ClassTemplateSpecializationDecl>(record);
@@ -436,9 +479,7 @@ static inline std::string templateArgSuffix(const clang::RecordDecl *record) {
   std::string suffix;
   for (const clang::TemplateArgument &arg : spec->getTemplateArgs().asArray()) {
     suffix += "_";
-    suffix += arg.getKind() == clang::TemplateArgument::Type
-                  ? templateArgTypeCode(arg.getAsType())
-                  : std::string("x");
+    suffix += templateArgCode(arg);
   }
   return suffix;
 }

@@ -1,18 +1,22 @@
 // RUN: split-file %s %t
-// RUN: not emitrust-import-c %t/explicit-spec.cpp 2>&1 | FileCheck %s --check-prefix=EXPLSPEC
-// RUN: not emitrust-import-c %t/nttp.cpp 2>&1 | FileCheck %s --check-prefix=NTTP
-// RUN: not emitrust-import-c %t/nttp-unused.cpp 2>&1 | FileCheck %s --check-prefix=NTTPUNUSED
 // RUN: not emitrust-import-c %t/variadic.cpp 2>&1 | FileCheck %s --check-prefix=VARIADIC
 // RUN: not emitrust-import-c %t/variadic-no-pack-expr.cpp 2>&1 | FileCheck %s --check-prefix=VARNOPACK
+// RUN: not emitrust-import-c %t/nttp-decl.cpp 2>&1 | FileCheck %s --check-prefix=NTTPDECL
+// RUN: not emitrust-import-c %t/template-template.cpp 2>&1 | FileCheck %s --check-prefix=TMPLTMPL
+// RUN: not emitrust-import-c %t/nttp-recursive.cpp 2>&1 | FileCheck %s --check-prefix=NTTPREC
 // RUN: not emitrust-import-c %t/collide-template-first.cpp 2>&1 | FileCheck %s --check-prefix=COLTMPL
 // RUN: not emitrust-import-c %t/collide-handwritten-first.cpp 2>&1 | FileCheck %s --check-prefix=COLHAND
-// RUN: emitrust-cc --recover --emit=rust %t/explicit-spec.cpp | FileCheck %s --check-prefix=EXPLSPECREC
+// RUN: emitrust-cc --recover --emit=rust %t/variadic-explicit-spec.cpp | FileCheck %s --check-prefix=PACKSPECREC --implicit-check-not="a * b"
 
-// W2.15 located-rejection ledger for function templates. W2.15 admits
-// exactly ONE shape — a template whose parameters are all plain TYPE
-// parameters, monomorphized by clang into concrete instantiations (see
-// function-templates.cpp). Everything else on the template frontier must
-// stay a LOCATED rejection, and this file is the ledger that says so.
+// W2.15/W2.28 located-rejection ledger for function templates. W2.15
+// admitted plain TYPE arguments; W2.28 widened the frontier with INTEGRAL
+// non-type arguments (value-coded suffixes, see function-templates.cpp)
+// and EXPLICIT specializations (the hand-written body imports under the
+// same suffixed symbol the displaced instantiation would have used).
+// Everything still outside — parameter packs, non-INTEGRAL non-type
+// arguments (a declaration/pointer NTTP, a template-template argument),
+// and self-referential instantiation chains — must stay a LOCATED
+// rejection, and this file is the ledger that says so.
 //
 // Two design decisions are pinned here, both load-bearing:
 //
@@ -24,87 +28,38 @@
 //    tuple-protocol overload — importing exactly as it did before W2.15).
 //
 // 2. THE REJECTIONS ARE DRIVEN OFF THE `TemplateArgument` KIND, NOT OFF
-//    ANYTHING IN THE BODY. A body-driven check is measurably insufficient:
-//    the `nttp-unused` and `variadic-no-pack-expr` sections below are the
-//    two shapes that SILENTLY IMPORTED under a body-only rejection (a pack
-//    with no `sizeof...` in the body, and an NTTP whose `N` is never
-//    mentioned), each emitting a symbol carrying a placeholder code that
-//    two instantiations would then collide on. They are the regression
-//    pins that matter most in this file.
+//    ANYTHING IN THE BODY. A body-driven check is measurably
+//    insufficient: `variadic-no-pack-expr` below is the shape that
+//    SILENTLY IMPORTED under a body-only rejection (a pack with no pack
+//    expression in the body), emitting a symbol carrying a placeholder
+//    code that two instantiations then collide on. W2.28 retired the
+//    NTTP twin of this pin by giving integral values a REAL code
+//    (`ident<1>`/`ident<2>` are now `ident_v1`/`ident_v2`, pinned in
+//    function-templates.cpp) — the `x` placeholder now stands only for
+//    the kinds this file keeps rejecting.
 //
-// The last RUN line is the FR-42 recovery half of decision 1's corollary.
-// An explicit specialization is reached TWICE; under `--recover` the
-// template item is dropped, and without a guard on the ordinary
-// top-level `FunctionDecl` visit the specialization's hand-written body
-// would then be admitted SILENTLY (measured: the recovered crate
-// contained a working `fn add_i32 { a * b }`). Recovery must fail loudly
-// instead, per CLAUDE.md's "a recovered item that reaches emission
-// unresolved must fail loudly there".
+// The last RUN line is the FR-42 recovery half of the frontier: a
+// hand-written EXPLICIT specialization OF A VARIADIC template is dropped
+// with its template, and the recovered crate must carry a loud stub at
+// the call — never the specialization's hand-written body admitted
+// through the ordinary top-level `FunctionDecl` visit (that visit skips
+// every specialization kind; the `--implicit-check-not` scans the whole
+// crate for the body's `a * b`).
 //
 // A note on locations: an IMPLICIT instantiation reports the PATTERN's
 // `getLocation()`, so all instantiations of one template necessarily share
 // one diagnostic location. That is why every check below matches the line
 // and column loosely — the file/wording pair is the contract.
 
-//--- explicit-spec.cpp
-// An explicit specialization supplies a hand-written body for one
-// argument list, so it is NOT the clang-monomorphized pattern W2.15
-// admits: emitting it would need the specialization's own body imported
-// under the generic instantiation's symbol, and the two can disagree
-// arbitrarily. REJECT. The specialization decl is visited TWICE (once
-// through the template's `specializations()` list, once as an ordinary
-// top-level `FunctionDecl`), and BOTH visits reject — a guard that
-// matters under `--recover`, where dropping the template item would
-// otherwise let the ordinary visit silently admit the specialization.
-// EXPLSPEC: explicit-spec.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: explicit function template specialization
-template <typename T>
-T add(T a, T b) {
-  return a + b;
-}
-
-template <>
-int add<int>(int a, int b) {
-  return a * b;
-}
-
-int use(void) {
-  return add<int>(2, 3);
-}
-
-//--- nttp.cpp
-// A non-type template parameter is a compile-time VALUE, not a type: the
-// suffix scheme codes types only, so two instantiations differing only in
-// `N` would fuse. REJECT on the argument kind.
-// NTTP: nttp.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-type template argument in function template instantiation
-template <int N>
-int scale(int x) {
-  return x * N;
-}
-
-int use(void) {
-  return scale<3>(4) + scale<5>(4);
-}
-
-//--- nttp-unused.cpp
-// REGRESSION PIN. `N` is never mentioned in the body, so a body-driven
-// rejection sees nothing wrong and this SILENTLY IMPORTS — with a symbol
-// that does not encode `N`, so `ident<1>` and `ident<2>` are one function.
-// The rejection must therefore come from the argument KIND.
-// NTTPUNUSED: nttp-unused.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-type template argument in function template instantiation
-template <int N>
-int ident(int x) {
-  return x;
-}
-
-int use(void) {
-  return ident<1>(4) + ident<2>(4);
-}
-
 //--- variadic.cpp
 // A template parameter pack is a variable-arity argument list: the pack
 // expands into a single `TemplateArgument` of kind `Pack`, which the
 // suffix scheme has no code for, and the emitted signature would have to
-// vary in arity per instantiation. REJECT.
+// vary in arity per instantiation. REJECT. (The W2.28 spike measured the
+// admission ladder — flattened pack suffixes import the trivial case, but
+// the body's `SizeOfPackExpr` is unhandled and recursive expansion
+// `sum(rest...)` trips the same-template import-order gap pinned in
+// `nttp-recursive.cpp` — so the pack stays rejected as a package.)
 // VARIADIC: variadic.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: variadic function template (template parameter pack)
 template <typename... Ts>
 int count(Ts... ts) {
@@ -116,10 +71,10 @@ int use(void) {
 }
 
 //--- variadic-no-pack-expr.cpp
-// REGRESSION PIN, the pack twin of `nttp-unused`. The body contains no
-// pack expression at all (`ts` is never expanded, no `sizeof...`), so a
-// body-driven rejection sees an ordinary function and SILENTLY IMPORTS
-// it; the two instantiations then differ only in the pack and collide.
+// REGRESSION PIN. The body contains no pack expression at all (`ts` is
+// never expanded, no `sizeof...`), so a body-driven rejection sees an
+// ordinary function and SILENTLY IMPORTS it; the two instantiations then
+// differ only in the pack and collide.
 // VARNOPACK: variadic-no-pack-expr.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: variadic function template (template parameter pack)
 template <typename... Ts>
 int first(int a, Ts... ts) {
@@ -128,6 +83,67 @@ int first(int a, Ts... ts) {
 
 int use(void) {
   return first(1, 2) + first(1, 2, 3);
+}
+
+//--- nttp-decl.cpp
+// W2.28 admits INTEGRAL non-type arguments only: they code by VALUE. A
+// DECLARATION-kind argument (a pointer/reference NTTP naming a global)
+// has no such spelling — two distinct globals would both code `x` and
+// fuse — so the kind check keeps rejecting it with the W2.15 wording.
+// NTTPDECL: nttp-decl.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-type template argument in function template instantiation
+int g = 0;
+
+template <int *P>
+int readp(void) {
+  return *P;
+}
+
+int use(void) {
+  return readp<&g>();
+}
+
+//--- template-template.cpp
+// A template-template argument is a PATTERN, not a type or a value:
+// there is nothing monomorphic to code. Same kind-driven rejection.
+// TMPLTMPL: template-template.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: non-type template argument in function template instantiation
+template <typename T>
+struct Box {
+  T v;
+};
+
+template <template <typename> class C>
+int probe(void) {
+  C<int> c;
+  c.v = 1;
+  return c.v;
+}
+
+int use(void) {
+  return probe<Box>();
+}
+
+//--- nttp-recursive.cpp
+// KNOWN GAP, recorded rather than left silent: a SELF-REFERENTIAL
+// instantiation chain (`fact<5>` calls `fact<4>`) lists the OUTERMOST
+// specialization first in `specializations()`, so its body is imported
+// before the specialization it calls exists, and the call site rejects
+// with the pre-existing unimported-function wording — loud and located,
+// which is all this wave promises for it. (The same walk-order gap is
+// why `extern template` declarations surface at their call sites; see
+// the W2.15 KNOWN GAPS comment in `importTopLevelDecl`.)
+// NTTPREC: nttp-recursive.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to unimported function 'fact_v4'
+template <int N>
+int fact(int seed) {
+  return N <= 1 ? seed : N * fact<N - 1>(seed);
+}
+
+template <>
+int fact<1>(int seed) {
+  return seed;
+}
+
+int use(int n) {
+  return fact<5>(n);
 }
 
 //--- collide-template-first.cpp
@@ -172,9 +188,25 @@ int use(void) {
   return add(2, 3) + add_i32(2, 3);
 }
 
-// The recovered crate must contain a LOUD stub for the specialization,
-// never its hand-written body: the `a * b` the explicit specialization
-// spells must not reach emitted Rust under any mode.
-// EXPLSPECREC: pub fn add_i32
-// EXPLSPECREC-NEXT: unimplemented!("unsupported: explicit function template specialization")
-// EXPLSPECREC-NOT: a * b
+//--- variadic-explicit-spec.cpp
+// The recovery pin: the pack template is dropped, and the explicit
+// specialization's hand-written body must NOT be admitted through the
+// ordinary top-level visit — the recovered crate carries a loud stub at
+// the call instead. (The `count_x` spelling is the pack's `x`
+// placeholder code: the symbol exists only inside this rejection
+// wording, never as an emitted function.)
+// PACKSPECREC: pub fn use_
+// PACKSPECREC: unimplemented!("unsupported: call to unimported function 'count_x'")
+template <typename... Ts>
+int count(Ts... ts) {
+  return 0;
+}
+
+template <>
+int count<int, int>(int a, int b) {
+  return a * b;
+}
+
+int use(void) {
+  return count(1, 2);
+}

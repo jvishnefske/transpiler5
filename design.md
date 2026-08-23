@@ -13143,7 +13143,7 @@ whole-program demand.
   says it is the biggest single uncovered construct by raw count.
   **NOT SPIKED.**
 
-- [ ] W2.28 (NEW WAVE, from the 2026-08-22 re-sweep) Template
+- [x] W2.28 (NEW WAVE, from the 2026-08-22 re-sweep) Template
   residue: the family re-entered at ~249 items once FR-115 made it
   visible (spdlog 107, tinyrenderer 16, unordered_dense 15; nttp 31,
   partial-spec 36, explicit-spec 14, pack 6) and **no template wave
@@ -13152,7 +13152,53 @@ whole-program demand.
   (non-type template params, partial/explicit specializations,
   packs). Needs its own demand-vs-cost spike; NTTPs alone (31) may be
   a cheap W2.15-style extension (a value suffix beside the type
-  suffix). **NOT SPIKED.**
+  suffix).
+  LANDED 2026-08-22 as a SPLIT verdict (spike GO-WITH-CONSTRAINTS):
+  **NTTP + explicit specs + partial specs admitted; packs NO-GO-for-
+  now with a measured ladder.** Two entry premises corrected by
+  measurement: the 31/36/14/6 shape counts were class-side-only tags
+  (real per-shape demand by wording: nttp 84, espec 54, partial 37,
+  pack 19; the family's per-project spread is spdlog 186 of 249),
+  and partial specs were NOT the predicted L -- the only blocker was
+  the partial PATTERN reaching importRecord and aborting the TU as
+  "dependent class template"; skipping the pattern structurally (the
+  exact analogue of the untouched uninstantiated-template pattern)
+  admits fully-concrete instantiations named by the PRIMARY's
+  argument list (W<int*> -> w_pi32). NTTPs are the W2.15-style value
+  suffix (mul_n_i32_v3, declaration order; APSInt-faithful incl.
+  bool/char/enum/u64-max/negatives as vn3). THE SPIKE'S ADVERSARIAL
+  CASING PROBE CAUGHT A SILENT MISCOMPILE BY CONSTRUCTION: bare-digit
+  value codes fuse under the FR-53 UpperCamel record rename --
+  Grid<1,23> and Grid<12,3> both camel to Grid123, and the SAME-shape
+  pair fused silently (native "124 1204", emitted "124 124", both
+  objects dispatched to one method body). The "v" prefix in
+  templateArgIntegralCode is therefore LOAD-BEARING, pinned by the
+  Duo pair in test/EndToEnd/cpp-template-nttp.cpp -- a cleanup to
+  bare digits fails that byte-diff. Explicit specs are pure gate
+  removals (clang never instantiates what the spec displaces; the
+  hand-written body imports under the identical suffixed symbol).
+  STAYS LOCATED this wave, all pinned: packs (recursion into the
+  same template is real machinery -- the ladder measured: gate
+  recursion + suffix flattening cheap, SizeOfPackExpr mechanical,
+  same-template walk-order gap REAL; folds already import), non-
+  integral NTTP kinds, template-template args, recursive NTTP chains
+  (fact<5> -> "call to unimported function 'fact_v4'", the
+  pre-existing W2.15 walk-order boundary), member fn templates,
+  static data members. CORPUS DIFFERENTIAL (same-generation
+  binaries, 107 units): family rejections 608 -> 4 deduped rows (the
+  4 are non-integral kinds); ported 2917 -> 2976 (+59); 12 units
+  gained, ZERO units regressed; pack rows grew 84 -> 94 as imports
+  reach deeper (consistent with the NO-GO + low demand). Follow-up
+  fodder recorded, not filed (numbering-race discipline): fn-side
+  NTTP wording has no ledger tag (roots as 'other'), fn-side pack
+  rejections mis-tag as 'variadic-cross-tu' via the substring table.
+  Gates: full meson suite 785/785 on the merged tree (fast 556 +
+  EndToEnd 229, three new byte-diff tests, every value argc-derived).
+  (test/EndToEnd/cpp-template-nttp.cpp,
+  cpp-template-explicit-spec.cpp, cpp-template-partial-spec.cpp;
+  function-templates.cpp / class-templates.cpp positive arms;
+  function-templates-invalid.cpp / class-templates-invalid.cpp
+  located-rejection pins incl. NTTPREC/NTTPDECL/TMPLTMPL/VARIADIC)
 
 ## Track 5 Third-party validation (external demand signal)
 
