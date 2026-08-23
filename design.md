@@ -8133,7 +8133,7 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-ns-case-fold-invalid.cpp,
   test/Driver/incremental-camelcase-namespace.cpp)
 
-- [ ] FR-128 DEFECT (found 2026-08-23 by the post-W2.25 external
+- [x] FR-128 DEFECT (found 2026-08-23 by the post-W2.25 external
   re-probe; REGRESSION introduced by W2.25, exposed at depth by
   FR-127): an admitted operator body referencing an UNIMPORTED
   function lets the reference survive to EMISSION, where the FR-52
@@ -8158,8 +8158,39 @@ piece and becomes FR-45.
   dropped/stubbed located; the 8 spdlog units + example regain
   crates (honest counts); a Driver lit test pins the recovery-mode
   containment; strict mode unchanged; the emission loud-failure pin
-  (emitrust.extern_decl marker contract) stays green. **NOT
-  SPIKED.**
+  (emitrust.extern_decl marker contract) stays green.
+  LANDED 2026-08-23 (spike GO), and BOTH of this entry's filed
+  hypotheses were WRONG -- the correction is the finding. Not a
+  permissive W2.25 lookup, not an FR-52 planning step (no
+  extern_decl marker is involved under --incremental at all): the
+  single erasedExternalClones capture site (ImportCFunctions.cpp,
+  definition reconciliation) unconditionally cloned EVERY prototype
+  erased during reconciliation, and rollbackTo re-materialized those
+  clones after an item failure -- including FR-47 pass-1 method
+  stubs BORN INSIDE the failed item. Later admitted bodies (the
+  W2.25-widened surface) found the body-less stub via
+  functions.lookup, bypassed the "call to an unimported
+  constructor/method" containment, and died crate-fatally at
+  finalize. THE FIX IS ONE GUARDED push_back: skip the clone when
+  the prototype postdates the active checkpoint's anchor
+  (bornInsideItem = !anchor || anchor->isBeforeInBlock(existingOp));
+  a prototype that IS the anchor pre-dates the item and stays
+  captured for free. rollbackTo, finalize, and strict mode are
+  byte-untouched; the two legitimate clone-restore paths (cross-item
+  C prototypes, out-of-line methods of succeeded classes) are
+  regression-pinned. Containment wording observed, not assumed: the
+  operator body itself contains via "constructor in value position",
+  plain callers via "call to an unimported constructor". ACCEPTANCE
+  MET: minimal repro emits with every referencing item contained
+  located (honest 6-item ledger); ALL 8 spdlog units + example
+  regain crates with ported counts EQUAL to the pre-W2.25 baseline
+  per unit (50/63/45/52/51/99/52/137); full bundled format.h header
+  also imports (1.21s / 162MB on the heaviest unit); differential
+  byte-diffs clean on healthy inputs. Gates: full meson suite
+  803/803 (fast 567 + EndToEnd 236; three new tests).
+  (test/Driver/incremental-rollback-stub-containment.cpp,
+  incremental-prototype-restore.cpp,
+  test/EndToEnd/incremental-leaked-stub-containment.cpp)
 
 - [x] FR-127 DEFECT (found 2026-08-23 by the second session's
   post-FR-125 offender re-check; REGRESSION introduced by W2.24): a

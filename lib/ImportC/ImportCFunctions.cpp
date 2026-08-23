@@ -853,9 +853,25 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
     // a call already imported against the prototype does not lose its
     // callee; `eraseTopLevelOp` also keeps the live checkpoint's anchor
     // valid when the prototype happens to be the last module operation.
-    if (activeCheckpoint)
-      activeCheckpoint->erasedExternalClones.push_back(
-          existing.getOperation()->clone());
+    // FR-128: only prototypes that PRE-DATE the item's checkpoint are worth
+    // restoring on rollback. A prototype born INSIDE the item (an FR-47
+    // pass-1 method stub of this very item) must not be re-materialized by
+    // the rollback: no surviving call can reference it (everything after
+    // the anchor is erased), and restoring it hands later items a body-less
+    // callee that `functions.lookup` finds, bypassing the "call to an
+    // unimported constructor/method" containment and dying crate-fatally at
+    // finalize instead. A null anchor means the checkpoint opened on an
+    // empty module, so every reconciled prototype is intra-item; a
+    // prototype that IS the anchor pre-dates the item and stays captured
+    // (`isBeforeInBlock` on itself is false).
+    if (activeCheckpoint) {
+      Operation *existingOp = existing.getOperation();
+      bool bornInsideItem =
+          !activeCheckpoint->anchor ||
+          activeCheckpoint->anchor->isBeforeInBlock(existingOp);
+      if (!bornInsideItem)
+        activeCheckpoint->erasedExternalClones.push_back(existingOp->clone());
+    }
     eraseTopLevelOp(existing.getOperation());
     functions.erase(name);
   }
