@@ -10,6 +10,14 @@
 // mut-ness is recomputed WITHOUT the fused stores -- a fused-only binding
 // loses `mut` (deny(unused_mut) makes a stale one a hard build failure),
 // while a binding with a surviving store keeps it.
+//
+// FR-111 narrows the W2.17 Drop gate: a `has_drop` struct fuses ONLY when
+// the prefix covers EVERY field (the rendering then has no functional-update
+// base, so no spurious construct+drop of the base S). Any droppy shape that
+// would keep a `..S::default()` base -- partial coverage, or a prefix broken
+// before coverage -- stays fully un-fused: that base is a whole extra S,
+// constructed and DROPPED (W2.17's measured spurious `dtor 0 0`), so the
+// fence is a correctness invariant, not a style choice.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
 
 emitrust.struct_def @Point ["x", "y", "z"] [i32, i32, i32]
@@ -181,6 +189,67 @@ emitrust.func @keeps_mut(%arg0: i32, %arg1: i32) -> i32 {
   %b = emitrust.member %q["b"] : (!emitrust.lvalue<!emitrust.struct<"Pair">>) -> !emitrust.lvalue<i32>
   emitrust.assign %b = %s : !emitrust.lvalue<i32>
   %b2 = emitrust.member %q["b"] : (!emitrust.lvalue<!emitrust.struct<"Pair">>) -> !emitrust.lvalue<i32>
+  %r = emitrust.load %b2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %r : i32
+}
+
+emitrust.struct_def @Noisy ["a", "b"] [i32, i32] {emitrust.has_drop}
+
+// FR-111: a has_drop struct with FULL field coverage fuses base-free -- the
+// rendering is byte-identical to the non-droppy all_fields shape (including
+// the lost `mut` and the trailing `, `), so no `..Noisy::default()` base
+// ever exists to be spuriously dropped.
+// CHECK-LABEL: fn droppy_all_fields(v0: i32, v1: i32) -> i32 {
+// CHECK-NEXT:    let d: Noisy = Noisy { a: v0, b: v1, };
+// CHECK-NEXT:    d.a
+// CHECK-NEXT:  }
+emitrust.func @droppy_all_fields(%arg0: i32, %arg1: i32) -> i32 {
+  %d = emitrust.variable named "d" : !emitrust.lvalue<!emitrust.struct<"Noisy">>
+  %a = emitrust.member %d["a"] : (!emitrust.lvalue<!emitrust.struct<"Noisy">>) -> !emitrust.lvalue<i32>
+  emitrust.assign %a = %arg0 : !emitrust.lvalue<i32>
+  %b = emitrust.member %d["b"] : (!emitrust.lvalue<!emitrust.struct<"Noisy">>) -> !emitrust.lvalue<i32>
+  emitrust.assign %b = %arg1 : !emitrust.lvalue<i32>
+  %a2 = emitrust.member %d["a"] : (!emitrust.lvalue<!emitrust.struct<"Noisy">>) -> !emitrust.lvalue<i32>
+  %r = emitrust.load %a2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %r : i32
+}
+
+// FR-111 / W2.17 fence: PARTIAL coverage of a has_drop struct must stay
+// fully un-fused (no partial literal, no base) -- a kept base would be a
+// spurious construct+drop of a whole extra Noisy.
+// CHECK-LABEL: fn droppy_partial(v0: i32) -> i32 {
+// CHECK-NEXT:    let mut d: Noisy = Noisy::default();
+// CHECK-NEXT:    d.a = v0;
+// CHECK-NEXT:    d.a
+// CHECK-NEXT:  }
+emitrust.func @droppy_partial(%arg0: i32) -> i32 {
+  %d = emitrust.variable named "d" : !emitrust.lvalue<!emitrust.struct<"Noisy">>
+  %a = emitrust.member %d["a"] : (!emitrust.lvalue<!emitrust.struct<"Noisy">>) -> !emitrust.lvalue<i32>
+  emitrust.assign %a = %arg0 : !emitrust.lvalue<i32>
+  %a2 = emitrust.member %d["a"] : (!emitrust.lvalue<!emitrust.struct<"Noisy">>) -> !emitrust.lvalue<i32>
+  %r = emitrust.load %a2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %r : i32
+}
+
+// FR-111 / W2.17 fence: a droppy prefix broken BEFORE full coverage (the
+// repeated `d.a` ends the prefix at one of two fields) stays fully un-fused
+// too -- coverage is judged on the fusable prefix, not on the whole body.
+// CHECK-LABEL: fn droppy_repeat(v0: i32, v1: i32) -> i32 {
+// CHECK-NEXT:    let mut d: Noisy = Noisy::default();
+// CHECK-NEXT:    d.a = v0;
+// CHECK-NEXT:    d.a = v1;
+// CHECK-NEXT:    d.b = v0;
+// CHECK-NEXT:    d.b
+// CHECK-NEXT:  }
+emitrust.func @droppy_repeat(%arg0: i32, %arg1: i32) -> i32 {
+  %d = emitrust.variable named "d" : !emitrust.lvalue<!emitrust.struct<"Noisy">>
+  %a = emitrust.member %d["a"] : (!emitrust.lvalue<!emitrust.struct<"Noisy">>) -> !emitrust.lvalue<i32>
+  emitrust.assign %a = %arg0 : !emitrust.lvalue<i32>
+  %a3 = emitrust.member %d["a"] : (!emitrust.lvalue<!emitrust.struct<"Noisy">>) -> !emitrust.lvalue<i32>
+  emitrust.assign %a3 = %arg1 : !emitrust.lvalue<i32>
+  %b = emitrust.member %d["b"] : (!emitrust.lvalue<!emitrust.struct<"Noisy">>) -> !emitrust.lvalue<i32>
+  emitrust.assign %b = %arg0 : !emitrust.lvalue<i32>
+  %b2 = emitrust.member %d["b"] : (!emitrust.lvalue<!emitrust.struct<"Noisy">>) -> !emitrust.lvalue<i32>
   %r = emitrust.load %b2 : (!emitrust.lvalue<i32>) -> i32
   emitrust.return %r : i32
 }

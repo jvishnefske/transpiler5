@@ -18,6 +18,10 @@
 //
 // Both the function-scope object and the branch-body object are covered,
 // and every value derives from argc.
+//
+// Since FR-111 both sites render as the base-free all-fields fuse
+// (`let a: R = R { id: .. };`) -- the store is folded into the literal, not
+// dropped, and this byte-diff is the oracle that the drop still fires.
 // RUN: emitrust-cc --emit=crate %s -o %t.crate --build
 // RUN: clang++ -std=c++17 %s -o %t.native
 // RUN: %t.native > %t.native.out
