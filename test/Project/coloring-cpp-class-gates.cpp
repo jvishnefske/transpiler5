@@ -30,23 +30,27 @@
 // FR-41's "false reds remain zero" contract and starving FR-43's
 // `--search`, whose roots must be Green|Yellow.
 //
-// `VirtMethod` pins the boundary: FR-112 deliberately kept
-// `unsupported: virtual method` CLASS-level (the vptr is real storage the
-// emitted struct lacks -- `sizeof` folds 16 for a struct the emitter
-// renders as 4 bytes), so the isVirtual screen must STAY, mirroring the
-// importer gate in `collectRecordFields`. Green-with-omission next to
-// red-for-virtual is exactly the line FR-112 draws.
+// `VirtMethod` pins the boundary, RE-DRAWN by W2.19a: the importer's
+// class-level `virtual method` gate is GONE -- a class with virtual
+// methods is admitted, calls on VALUES statically bind, and every
+// dynamic channel (a pointer-shaped receiver, the polymorphic upcast,
+// sizeof/alignof) is a CALL-SITE/expr-site located rejection with no
+// record-level restatement. So the isVirtual screen went WITH the gate
+// (the fourth application of the stale-screen lesson): keeping it would
+// color every virtual-method class falsely Red, the FR-41 forbidden
+// direction. The accepted residual is a false GREEN -- a method body
+// containing `p->virt()` colors green here and rejects at import --
+// which is exactly the under-approximation side coloring's
+// false-red-only contract permits.
 //
 // W2.26 re-drew the destructor/inheritance boundary and this file moved
 // WITH it (the same stale-screen lesson, third application): a base class
 // carrying a destructor no longer disqualifies `admitsSingleBaseAsField`
 // (`Inherits` below is Green -- a merely-inheriting class gets a
 // TRANSITIVE has_drop and imports), a class whose SOLE virtual member is
-// its destructor is admissible (`SoleVirt` Green), and the virtual-method
-// screen must EXCLUDE the destructor or a sole-virtual-dtor class stays
-// falsely Red -- the FR-41 forbidden direction (`MultiVirt` pins the
-// residual: any OTHER virtual method still rejects, and its construct tag
-// must be `virtual-method`, not a double-tagged `destructor`). The wave
+// its destructor is admissible (`SoleVirt` Green -- and since W2.19a
+// `MultiVirt`, a virtual dtor beside another virtual method, is Green
+// too: only its dynamic USES reject, at the site). The wave
 // also closes a false GREEN the base-screen removal would have widened: a
 // field whose class carries a destructor -- its OWN or an inherited one
 // -- is an importer rejection (`struct member of a class with a
@@ -112,7 +116,8 @@ struct OpStruct {
   int operator+(int x) const { return v + x; }
 };
 
-/// Red: the virtual-method gate stays class-level this wave.
+/// Green since W2.19a: virtual methods no longer disqualify the class --
+/// value uses statically bind; dynamic uses reject at the site.
 struct VirtMethod {
   int v;
   virtual int get() const;
@@ -143,11 +148,12 @@ struct SoleVirt {
   virtual ~SoleVirt() { v = 0; }
 };
 
-/// Red, and under `virtual-method`: a virtual destructor beside ANOTHER
-/// virtual method. The pin would read `construct=destructor` if the
-/// virtual-method screen forgot to exclude the destructor (the coloring
-/// method loop, unlike the importer's, does not `continue` after the
-/// destructor branch).
+/// Green since W2.19a: a virtual destructor beside ANOTHER virtual
+/// method. Was the W2.26 residual Red; with the class-level virtual gate
+/// gone the destructor-as-Drop admission (its dtor has a body) is all
+/// that is probed, and it passes. Pinned so the screen removal cannot
+/// half-happen: if either the dtor-exclusion or the screen itself crept
+/// back, this line would go Red under `virtual-method` or `destructor`.
 struct MultiVirt {
   int v;
   virtual ~MultiVirt() { v = 0; }
@@ -178,12 +184,12 @@ int main() { return 0; }
 // CHECK-NEXT: item Inherits kind=record color=green reason=admissible
 // CHECK-NEXT: item MemberBesideBase kind=record color=red reason=inadmissible construct=destructor
 // CHECK-NEXT: item Movable kind=record color=red reason=inadmissible construct=copy-move-constructor
-// CHECK-NEXT: item MultiVirt kind=record color=red reason=inadmissible construct=virtual-method
+// CHECK-NEXT: item MultiVirt kind=record color=green reason=admissible
 // CHECK-NEXT: item OpStruct kind=record color=green reason=admissible
 // CHECK-NEXT: item Plain kind=record color=green reason=admissible
 // CHECK-NEXT: item SoleVirt kind=record color=green reason=admissible
 // CHECK-NEXT: item UnionOp kind=record color=green reason=admissible
-// CHECK-NEXT: item VirtMethod kind=record color=red reason=inadmissible construct=virtual-method
+// CHECK-NEXT: item VirtMethod kind=record color=green reason=admissible
 // CHECK-NEXT: item c_main kind=function color=green reason=admissible
-// CHECK-NEXT: tally green=8 yellow=0 red=8
+// CHECK-NEXT: tally green=10 yellow=0 red=6
 // CHECK-NOT:  item

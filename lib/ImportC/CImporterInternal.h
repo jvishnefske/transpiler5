@@ -2945,15 +2945,17 @@ private:
   LogicalResult importFunction(const clang::FunctionDecl *func,
                                bool signatureOnly = false);
 
-  /// W2.2: imports every user-declared, non-virtual, non-deleted method of
-  /// `record` — plain methods, const methods, static methods, and
+  /// W2.2: imports every user-declared, non-deleted method of `record` —
+  /// plain methods, const methods, static methods, virtual methods (since
+  /// W2.19a: they import as ordinary methods; value calls statically bind
+  /// and pointer-receiver calls are fenced at the call site), and
   /// non-delegating, non-copy/move constructors — onto the
   /// `emitrust.impl`/`emitrust.method_of` surface via `importFunction`.
   /// Implicitly-defined special members (default ctor/dtor/copy/move the
-  /// class did not declare) are skipped. A destructor, virtual method, or
-  /// overloaded operator is rejected earlier, in `collectRecordFields`
-  /// (before any field — or method — of the class imports), so none of
-  /// those three shapes ever reaches this walk.
+  /// class did not declare) are skipped. A destructor outside the W2.17
+  /// subset is rejected earlier, in `collectRecordFields` (before any
+  /// field — or method — of the class imports); an overloaded operator is
+  /// OMITTED by this walk's own non-identifier-name check (FR-112).
   ///
   /// FR-47: runs in TWO passes over the same method set — every signature
   /// first (`importFunction(method, /*signatureOnly=*/true)`), then every

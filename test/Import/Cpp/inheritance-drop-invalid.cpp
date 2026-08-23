@@ -43,10 +43,13 @@
 //   double-vs-single destructor run across a call boundary, copy lowered
 //   to a move, flattened scope moving the drop point) -- each must fire
 //   for a merely-inheriting class exactly as for a directly-droppy one.
-// * a virtual destructor PLUS another virtual method: only the
-//   sole-virtual-dtor class is admitted; any other virtual member keeps
-//   the class-level `virtual method` rejection (the vptr is real storage
-//   the emitted struct lacks).
+// * a virtual destructor PLUS another virtual method: ADMITTED as a
+//   VALUE since W2.19a (the class-level `virtual method` gate is gone;
+//   static binding on a value is exact C++ semantics). The arm pins the
+//   dynamic residual instead: a virtual member call through a pointer,
+//   which is the one channel where the vptr the emitted struct lacks
+//   could be observed (the vptr LAYOUT residual stays screened at
+//   sizeof/alignof, below).
 // * a NON-TRIVIAL constructor of an empty droppy base: the emitted image
 //   default-initializes the zero-field base field, so a user ctor body
 //   would be silently dropped. The trivial construction is elided, same
@@ -235,17 +238,21 @@ int use(int n) {
 }
 
 //--- virtual-dtor-plus-method.cpp
+// W2.19a admits this class as a value (`s.get()` statically binds, and
+// destruction of a value is static -- both exact); the pin moved FORWARD
+// to the pointer call, where dynamism could actually be observed.
 extern "C" int printf(const char *, ...);
 struct S {
   int id;
   virtual ~S() { printf("~S %d\n", id); }
-  // MULTIVIRT: virtual-dtor-plus-method.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: virtual method
   virtual int get() const { return id; }
 };
+// MULTIVIRT: virtual-dtor-plus-method.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: virtual method call through a pointer
 int use(int n) {
   S s;
   s.id = n;
-  return s.id;
+  S *p = &s;
+  return p->get();
 }
 
 //--- empty-droppy-base-ctor.cpp

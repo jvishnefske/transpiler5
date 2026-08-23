@@ -170,8 +170,12 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
     // destructor-carrying single public base and a sole-virtual-dtor class
     // are ADMITTED (the transitive drop predicate closes the lost-drop and
     // E0204 channels), and each wording had exactly one emitter, so both
-    // rows went with their gates. A virtual destructor beside any OTHER
-    // virtual method still rejects -- at that method, under `cxx-virtual`.
+    // rows went with their gates. W2.19a retired `cxx-virtual` the same
+    // way: the class-level `virtual method` gate is gone (virtual methods
+    // on VALUES statically bind), and the dynamic residual -- a virtual
+    // call through any pointer-shaped receiver, including implicit `this`
+    // -- is a call-site fence with its own wording, tagged below beside
+    // the unresolved-callee wording it was split from.
     // An empty base carries no field to project through: both wordings are
     // the residual accesses that would otherwise name a field that does
     // not exist, or drop a base constructor body.
@@ -223,10 +227,10 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("cxx-drop-scope")},
     {llvm::StringLiteral("user-declared destructor"),
      llvm::StringLiteral("cxx-destructor")},
+    {llvm::StringLiteral("virtual method call through a pointer"),
+     llvm::StringLiteral("cxx-virtual-call")},
     {llvm::StringLiteral("virtual or unresolved member call"),
      llvm::StringLiteral("cxx-virtual-call")},
-    {llvm::StringLiteral("unsupported: virtual method"),
-     llvm::StringLiteral("cxx-virtual")},
     // FR-112 containment: a member-level shape no longer rejects the CLASS;
     // the member is omitted and its USES are the rejections. Both wordings
     // below are those use sites -- the spelled/implicit operator call

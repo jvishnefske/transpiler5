@@ -2830,7 +2830,14 @@ FailureOr<Value>
 CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
   const clang::CXXMethodDecl *method = call->getMethodDecl();
-  if (!method || method->isVirtual())
+  // W2.19a split this gate: `method->isVirtual()` no longer rejects here.
+  // On a VALUE receiver the static bind below is exact C++ semantics
+  // (static type == dynamic type), and `getMethodDecl()` already names
+  // the receiver's own type's override; the pointer-shaped receivers,
+  // where the bind would be an assumption, are fenced in the receiver
+  // lambda below. The wording is retained for the residual !method arm
+  // (a callee clang could not resolve to a concrete method).
+  if (!method)
     return emitError(loc) << "unsupported: virtual or unresolved member call";
   // W2.3: a method declared in namespace `std` (`std::vector<T>`'s /
   // `std::string`'s own inherent methods) never has an imported func — no
@@ -2852,8 +2859,21 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   // borrowed receiver is rustc E0502 (measured in the spike). Arguments
   // emitted first and bound as ordinary values cannot collide.
   if (const clang::Expr *boxBase =
-          matchStlBoxDerefBase(call->getImplicitObjectArgument()))
+          matchStlBoxDerefBase(call->getImplicitObjectArgument())) {
+    // W2.19a: the Box interception sits ABOVE the receiver lambda, so it
+    // would bypass the pointer fence below -- and a unique_ptr IS a
+    // pointer-shaped receiver. Today the payload type is exact (only the
+    // same-T `std::make_unique<T>` initializer is recognized, so no
+    // derived object can hide behind a `unique_ptr<Base>`), which would
+    // make the static bind accidentally correct -- the same
+    // measured-but-unpinned status the fence deliberately over-rejects
+    // for same-type raw pointers. Reject rather than lean on an
+    // invariant no byte-diff oracle guards.
+    if (method->isVirtual())
+      return emitError(loc)
+             << "unsupported: virtual method call through a pointer";
     return emitStlBoxMethodCall(call, boxBase, loc);
+  }
   // W2.18: the implicit object argument of an INHERITED call is wrapped in
   // an implicit derived-to-base conversion, which is NOT a
   // qualification-only adjustment -- it names a different object (the base
@@ -2929,6 +2949,30 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
              unary && unary->getOpcode() == clang::UO_Deref &&
              isDataPointer(unary->getSubExpr()->getType()))
       pointerExpr = unary->getSubExpr();
+    // W2.19a's soundness fence, NOT a defensive check: a VIRTUAL call is
+    // admitted only on a value receiver, where the static bind is exact.
+    // Through any pointer-shaped receiver the pointee's dynamic type is
+    // an assumption, and the fence sits HERE -- after `pointerExpr` is
+    // computed -- so every pointer spelling funnels through one check:
+    // `p->f()`, `(*p).f()`, a pointer parameter, and explicit or IMPLICIT
+    // `this` (a `CXXThisExpr` is pointer-typed and lands in the branch
+    // above). The `this` case is the measured miscompile the W2.19a spike
+    // pinned: without it, `d.callf()` -- where `B::callf` returns
+    // `this->f()` and `D` overrides `f` -- compiles clean and prints the
+    // BASE's answer, because the call-site hop projection upcasts the
+    // receiver in a way `uniquePublicSingleBaseHops` never sees. Three
+    // shapes this fence over-rejects were measured accidentally correct
+    // and stay rejected deliberately: a same-type local pointer (W2.19b's
+    // devirtualization scope), a same-type pointer parameter (unsound
+    // across callers in principle), and a ctor-body virtual call (C++
+    // ctor semantics equal the static bind -- a future carve-out).
+    // Inside an importable method body this rejection rides the FR-112
+    // omission channel like any other body failure; in a constructor it
+    // is fatal at the call, the explicit ctor rejection W2.19's spike
+    // record asked for.
+    if (pointerExpr && method->isVirtual())
+      return emitError(loc)
+             << "unsupported: virtual method call through a pointer";
     if (!pointerExpr)
       return emitLValue(stripped);
     const clang::VarDecl *regionBase = nullptr;

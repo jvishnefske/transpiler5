@@ -1,21 +1,22 @@
 // FR-41: the C++ half of the admissibility probe.
 //
-// Five of the eleven screened constructs are C++-only and four of those five
-// are RECORD-level, which is the interesting part: a C++ member function is
-// not an item graph node (it is declared inside the record, and its emitted
-// name depends on the class's assigned struct name), so a `virtual` method or
-// a user-declared destructor has no node of its own to be Red. It is probed as
-// part of the ENCLOSING RECORD instead — which is a node, and which is exactly
-// the item that will not be emitted because of it.
+// Several of the screened constructs are C++-only and RECORD-level, which
+// is the interesting part: a C++ member function is not an item graph node
+// (it is declared inside the record, and its emitted name depends on the
+// class's assigned struct name), so a user-declared destructor has no node
+// of its own to be Red. It is probed as part of the ENCLOSING RECORD
+// instead — which is a node, and which is exactly the item that will not
+// be emitted because of it.
 //
-// Three of the four record-level screens mirror rejections
+// The record-level screens mirror rejections
 // `CImporter::collectRecordFields` raises before it collects a single
-// field: base classes, user-declared destructors, and virtual methods.
-// (Overloaded operators were screened here too until FR-112 made the
-// importer OMIT them, member by member, instead of rejecting the class --
-// see `Eq` below.) The fifth screened construct, a reference type, is
-// `CImporter::mapType`'s and is signature-level, so it costs its callers
-// Red rather than Yellow.
+// field: base classes and user-declared destructors. (Overloaded
+// operators were screened here too until FR-112 made the importer OMIT
+// them, member by member, instead of rejecting the class -- see `Eq`
+// below. Virtual methods were screened until W2.19a removed the
+// importer's class-level gate outright -- see `Virt` below.) The
+// reference-type screen is `CImporter::mapType`'s and is
+// signature-level, so it costs its callers Red rather than Yellow.
 //
 // Three of those five screens are now POSITION- or SHAPE-dependent rather
 // than unconditional, and BOTH halves of each are pinned below, because
@@ -63,7 +64,12 @@ public:
   int extra;
 };
 
-/// `unsupported: virtual method` — no vtable, no dynamic dispatch.
+/// Green since W2.19a: the importer's class-level `virtual method` gate
+/// is gone -- a virtual-method class is admitted, VALUE calls statically
+/// bind, and the dynamic channels (pointer receivers, polymorphic
+/// upcasts, sizeof/alignof) reject at the site, none of them
+/// record-level. Screening it here would color a portable item Red --
+/// the probe's forbidden direction.
 class Virt {
 public:
   virtual int area() const;
@@ -84,9 +90,7 @@ public:
 
 /// Green since FR-112: an overloaded operator is OMITTED from the imported
 /// class (every use is a located rejection at the call), so screening it
-/// would color a portable item Red -- the probe's unsafe direction. The
-/// virtual-method screen right above stays: FR-112 deliberately kept
-/// `virtual` class-level (the vptr is storage the emitted struct lacks).
+/// would color a portable item Red -- the probe's unsafe direction.
 class Eq {
 public:
   bool operator==(int rhs) const;
@@ -107,7 +111,9 @@ int by_ref_param(const Plain &p);
 
 int calls_by_ref() { return by_ref(Plain()).v + by_ref_param(Plain()); }
 
-/// A Red record in the signature: same effect, reached through the record.
+/// Green with its record: `Virt` in the signature no longer poisons the
+/// caller now that the record itself is admissible (before W2.19a this
+/// was the Red-record-in-the-signature case, red-type via=Virt).
 int uses_virt(Virt *v);
 
 /// A Red record in the body only: Red, but still stubbable, so its caller is
@@ -126,7 +132,7 @@ int main() { return calls_by_ref() + calls_uses_owned(); }
 // CHECK-NEXT: item Flat kind=record color=green reason=admissible
 // CHECK-NEXT: item Owned kind=record color=red reason=inadmissible construct=destructor
 // CHECK-NEXT: item Plain kind=record color=green reason=admissible
-// CHECK-NEXT: item Virt kind=record color=red reason=inadmissible construct=virtual-method
+// CHECK-NEXT: item Virt kind=record color=green reason=admissible
 // CHECK-NEXT: item by_ref kind=function color=red reason=inadmissible construct=reference-type
 // CHECK-NEXT: item by_ref_param kind=function color=green reason=admissible
 // `calls_by_ref` is Red (its callee has no stub) but its OWN signature is
@@ -136,6 +142,6 @@ int main() { return calls_by_ref() + calls_uses_owned(); }
 // CHECK-NEXT: item calls_by_ref kind=function color=red reason=red-callee via=by_ref edge=Calls chain=calls_by_ref->by_ref construct=reference-type
 // CHECK-NEXT: item calls_uses_owned kind=function color=yellow reason=stub-callee via=uses_owned edge=Calls chain=calls_uses_owned->uses_owned->Owned construct=destructor
 // CHECK-NEXT: item uses_owned kind=function color=red reason=red-type via=Owned edge=BodyType chain=uses_owned->Owned construct=destructor
-// CHECK-NEXT: item uses_virt kind=function color=red reason=red-type via=Virt edge=SigType chain=uses_virt->Virt construct=virtual-method
-// CHECK-NEXT: tally green=4 yellow=2 red=7
+// CHECK-NEXT: item uses_virt kind=function color=green reason=admissible
+// CHECK-NEXT: tally green=6 yellow=2 red=5
 // CHECK-NOT:  item

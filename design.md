@@ -12105,6 +12105,59 @@ whole-program demand.
   only; covariant returns, `dynamic_cast`/RTTI, virtual inheritance,
   and a virtual call INSIDE A CONSTRUCTOR (C++ dispatches to the BASE's
   override -- a classic trap that should get an explicit rejection).
+  **W2.19a LANDED 2026-08-22** (the entry stays open for W2.19b/c).
+  Virtual methods on VALUES ship with static dispatch -- which for a
+  value is always correct, since static type equals dynamic type. The
+  class-level `virtual method` gate is DELETED; the emitted shape is
+  today's ordinary method_call, zero new ops, no dyn, no trait
+  (pinned with RUST-NOT). Override binds hop-free to the object's own
+  class; an inherited virtual binds through the W2.18 hop chain; a
+  qualified `l.Base::calc()` binds statically, which is what C++
+  qualified calls mean.
+  THE FENCE IS SOUNDNESS-CRITICAL, NOT DEFENSIVE -- the spike's
+  no-fence build measured a SILENT MISCOMPILE: `struct B { virtual f;
+  int callf() { return f(); } }` with D overriding f -- `d.callf()`
+  natively prints 3, the unfenced image compiles clean and prints 1,
+  because the call-site hop projection is an upcast the VUPCAST
+  predicate never sees and `this->f()` inside B::callf binds
+  statically. The fence sits in emitCXXMemberCall's receiver lambda
+  AFTER pointerExpr is computed, covering `p->`, `(*p).`, pointer
+  params, explicit AND implicit this, and ctor bodies in one place
+  (CXXThisExpr is pointer-typed, measured). It deliberately
+  OVER-rejects three measured-accidentally-correct shapes -- same-type
+  local-pointer calls (W2.19b's scope), same-type parameter calls,
+  and ctor-body virtual calls (C++ ctor semantics happen to equal
+  static bind; a future carve-out candidate) -- all pinned as located
+  rejections. A SECOND copy of the fence guards the W2.21 Box path,
+  found during implementation: `unique_ptr<B>` payload virtual calls
+  bypassed the receiver lambda entirely.
+  PURE VIRTUAL ships AS-IS with zero new code: an abstract base
+  imports as a plain struct_def under base-as-field, the body-less
+  pure method is omitted, a qualified call to it fails LOUDLY at
+  emission via FR-52, and direct instantiation is clang's own
+  abstract-class error. Every channel located or loud, measured.
+  POST-LIFT INVARIANT recorded: `uniquePublicSingleBaseHops`'
+  isPolymorphic refusal is now the SOLE fence keeping pointer static
+  type == pointee dynamic type -- the invariant that makes value-side
+  static binding sound. Do not relax it before W2.19b replaces it
+  with devirtualization.
+  ItemColoring's VirtualMethod record screen removed entirely (the
+  importer keeps no class-level virtual rejection; residuals are
+  call-site). Accepted residual false-green recorded: a method body
+  containing `p->virt()` colors green and rejects at import -- the
+  false-red-only contract permits it. Ledger: `cxx-virtual` retired,
+  `cxx-virtual-call` minted for the fence wording, mirrored.
+  Gates: full meson suite 763/763 (fast 542 + slow/EndToEnd 221);
+  Cpp17Suite ratchets 31 -> 32 (`01009.cpp`) at total=35
+  transpiled=32 passed=32 miscompiled=0; 00901 does NOT flip
+  (confirmed still rejecting at its Shape* line -- W2.19b's job);
+  CTestSuite 220/220/0/0 unchanged; zero golden shifts.
+  (test/Cpp17Suite/Inputs/01009.cpp;
+  test/EndToEnd/cpp-virtual-methods-values.cpp;
+  test/Import/Cpp/virtual-methods-values.cpp,
+  virtual-methods-values-invalid.cpp; reworked VIRTMETHOD/MULTIVIRT/
+  VIRTSIB/VIRTUAL arms and both coloring goldens)
+
 
 - [x] W2.20 `std::map`/`std::set` -> `BTreeMap`/`BTreeSet`. Spike
   verdict **GO-WITH-CONSTRAINTS** (2026-08-21). BTree, not Hash:

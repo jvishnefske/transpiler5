@@ -48,9 +48,12 @@
 //   rejections around the admitted chain (droppy member BESIDE a droppy
 //   base, arrays/globals/by-value/copies/bare-block objects of a
 //   droppy-DERIVED class) are pinned in inheritance-drop-invalid.cpp.
-// * any VIRTUAL METHOD in the chain: no vtable, no dynamic dispatch. Not
-//   a new rejection -- the base class's own import raises it first, at the
-//   method, which is where the real blocker is. W2.19's job.
+// * any VIRTUAL METHOD in the chain: ADMITTED on VALUES since W2.19a
+//   (calls statically bind the receiver's own type's override, which for
+//   a value is exact C++ semantics -- virtual-methods-values.cpp). What
+//   the arm pins now is the residual DYNAMIC channel: a virtual call
+//   through a pointer, even a same-type DERIVED pointer whose hop
+//   projection the upcast fence never sees. W2.19b's job.
 // * a derived member literally spelled `base`: it would collide with the
 //   synthesized field. Caught by `appendField`'s pre-existing duplicate-
 //   final-name guard, which works ONLY because the base field is
@@ -118,15 +121,25 @@ struct D : Box<int> { int c; };
 int use() { D d; d.c = 1; return d.c; }
 
 //--- virtual-method-base.cpp
-// The base's own import raises this, at the method, before the derived
-// class's base loop is ever reached.
+// W2.19a ADMITS this chain on values (`d.get()` flattens through the
+// base field and statically binds `A::get` -- exact for a value). The
+// pin moved FORWARD to the dynamic residual: an inherited VIRTUAL call
+// through a pointer -- here a SAME-TYPE derived pointer, so the
+// polymorphic-upcast fence never fires and the call-site fence in
+// `emitCXXMemberCall` is the only thing standing. Through a pointer the
+// static bind would be an assumption, not a fact (W2.19b's scope).
 struct A {
   int a;
-  // VIRTMETHOD: virtual-method-base.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: virtual method
   virtual int get() const { return a; }
 };
 struct D : A { int c; };
-int use() { D d; d.c = 1; return d.c; }
+// VIRTMETHOD: virtual-method-base.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: virtual method call through a pointer
+int use() {
+  D d;
+  d.c = 1;
+  D *p = &d;
+  return p->get() + d.c;
+}
 
 //--- base-field-collision.cpp
 struct A { int a; };
