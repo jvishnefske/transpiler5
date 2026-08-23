@@ -95,6 +95,22 @@ createDefaultInitializedLets(OpTy op, const TypeConverter *typeConverter,
         defaultValue = emitrust::OpaqueAttr::get(
             structType.getContext(),
             (structType.getName() + "::default()").str());
+    // W2.24: a DATA-ENUM result -- the synthesized exception carrier
+    // (`ThrowsI32`) threading a two-return throwing function yields the
+    // enum through the scf.if; without this arm the lowering was a
+    // measured NON-located `failed to legalize 'scf.if'` on the exact
+    // pipeline. Same opaque `Name::default()` image as the struct arm
+    // above, with the OPPOSITE backstop: data enums deliberately derive
+    // no Default (W2.14), so a placeholder that ever survives to the
+    // crate is a LOUD rustc E0599 -- the safe failure direction -- while
+    // the FR-61/FR-105 deferred-binding machinery elides it for every
+    // measured shape. Never mint a compilable variant spelling here: a
+    // readable `ThrowsI32::Ok0{v:0}` would be a silent wrong value.
+    if (!defaultValue)
+      if (auto dataEnumType = dyn_cast<emitrust::DataEnumType>(resultType))
+        defaultValue = emitrust::OpaqueAttr::get(
+            dataEnumType.getContext(),
+            (dataEnumType.getName() + "::default()").str());
     if (!defaultValue)
       return rewriter.notifyMatchFailure(
           op, "no default value for the result type");

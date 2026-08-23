@@ -2870,6 +2870,15 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   }
 
   auto callOp = builder.create<func::CallOp>(loc, target, arguments);
+  // W2.24: a call to a can-throw-closure member returns the synthesized
+  // carrier; unwrap it here (two RESULT-mode matches + the early-return
+  // cf pattern — see unwrapThrowsResult). The planner's closure gates
+  // (arithmetic parameters only, payload-typed return) guarantee such a
+  // callee never took the cursor/owner/cell-slice call paths above, so
+  // this generic call op is the only one that can carry the carrier.
+  if (throwsPlanActive &&
+      throwsClosure.contains(callee->getCanonicalDecl()))
+    return unwrapThrowsResult(loc, callOp->getResult(0));
   // CTS-BR (00216): staged byte-region-global slice arguments store their
   // (possibly mutated) images back immediately after the call — the
   // load-modify-store shape of every staged global access.

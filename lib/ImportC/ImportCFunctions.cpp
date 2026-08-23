@@ -652,6 +652,27 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       resultTypes.push_back(*mapped);
     }
   }
+  // W2.24: a function in the can-throw closure returns the synthesized
+  // carrier enum instead of its declared type. `planThrows` proved the
+  // declared return type IS the thrown payload type (so Ok0 and Err0
+  // share one payload and call sites unwrap with a single payload match);
+  // the checks below are defensive nets against plan/import divergence.
+  // Applied to prototypes and definitions alike — both consult the same
+  // canonical-decl-keyed closure, so they build one signature.
+  bool functionThrows =
+      throwsPlanActive && throwsClosure.contains(func->getCanonicalDecl());
+  Type throwsOkType;
+  if (functionThrows) {
+    FailureOr<emitrust::DataEnumType> carrier = getOrCreateThrowsEnum(loc);
+    if (failed(carrier))
+      return failure();
+    if (resultTypes.size() != 1 ||
+        resultTypes.front() != throwsPayloadMappedType)
+      return emitError(loc) << "unsupported: a potentially-throwing "
+                               "function must return the thrown payload type";
+    throwsOkType = resultTypes.front();
+    resultTypes.front() = *carrier;
+  }
   FunctionType functionType = builder.getFunctionType(inputTypes, resultTypes);
 
   // Reconcile with an earlier import of the same symbol. Across TUs an
@@ -813,6 +834,14 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       methodOwner && ownerIndexReturns.contains(func->getCanonicalDecl());
   currentCxxThisRef = Value();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
+  // W2.24: `emitReturnStmt` wraps a closure member's declared return value
+  // in Ok0; try/catch is admitted only in TU-level functions (wave-1
+  // gate), and both stacks are per-function.
+  currentFunctionThrows = functionThrows;
+  currentThrowsOkType = throwsOkType;
+  currentTryAllowed = !cxxMethod;
+  tryContexts.clear();
+  catchPayloadPlaces.clear();
   currentFamOptionPayload = famOptionReturnPayload(func, currentReturnType);
   famOptionTemps.clear();
   // An erased single-global-base pointer return (CTS-S, 00089): return
@@ -1365,6 +1394,13 @@ CImporter::importLiftedLambdaBody(const PendingLiftedLambda &pending) {
   FunctionType functionType = funcOp.getFunctionType();
   currentReturnType =
       functionType.getNumResults() ? functionType.getResult(0) : Type();
+  // W2.24: a lifted lambda is never in the can-throw closure and admits
+  // no try/catch; a throw inside one rejects loudly.
+  currentFunctionThrows = false;
+  currentThrowsOkType = Type();
+  currentTryAllowed = false;
+  tryContexts.clear();
+  catchPayloadPlaces.clear();
   currentFamOptionPayload = Type(); // FR-99: no C++ lambda is a FAM allocator.
   famOptionTemps.clear();
   currentErasedReturnBase = nullptr;
@@ -1711,6 +1747,13 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentOwnerIndexReturn = false;
   currentCxxThisRef = Value();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
+  // W2.24: a lifted lambda / va clone is never in the can-throw closure
+  // and admits no try/catch; a throw inside one rejects loudly.
+  currentFunctionThrows = false;
+  currentThrowsOkType = Type();
+  currentTryAllowed = false;
+  tryContexts.clear();
+  catchPayloadPlaces.clear();
   currentFamOptionPayload = famOptionReturnPayload(func, currentReturnType);
   famOptionTemps.clear();
   currentErasedReturnBase = nullptr;
@@ -2321,6 +2364,13 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // (FR-76) so the owner planner can consult `addressTakenFunctions` —
   // an address-taken function cannot become an owner method.
   planFnPtrAliases(unit);
+  // W2.24 Pass A: the can-throw closure (exceptions as Result threading).
+  // Pure-AST and provably inert for C (the walk never runs — C has no
+  // throw); its located gate rejections must beat every import-time
+  // diagnostic, and the closure it computes drives the carrier-enum
+  // signature rewrite in `importFunction`.
+  if (failed(planThrows(unit)))
+    return failure();
   // Phase-4 Pass A: pure-AST owner planning over every function definition
   // before any IR is built; Pass B below consults the plans.
   planOwners(unit, soleTranslationUnit);

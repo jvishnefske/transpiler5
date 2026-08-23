@@ -4079,3 +4079,213 @@ void CImporter::planFnPtrMembers(const clang::TranslationUnitDecl *unit) {
     fnPtrMemberTypes[field] = context.getPointerType(target->getType());
   }
 }
+
+//===----------------------------------------------------------------------===//
+// W2.24: the can-throw closure (exceptions as Result threading)
+//===----------------------------------------------------------------------===//
+
+LogicalResult CImporter::planThrows(const clang::TranslationUnitDecl *unit) {
+  throwsPlanActive = false;
+  throwsClosure.clear();
+  throwsPayloadClangType = clang::QualType();
+  throwsPayloadMappedType = Type();
+  throwsEnumName.clear();
+  // C has no throw: the walk never runs, so the plan is provably inert for
+  // every C translation unit (CTestSuite 220/220 must not move).
+  if (!astContext().getLangOpts().CPlusPlus)
+    return success();
+
+  // The definitions the closure ranges over: TU-LEVEL functions, collected
+  // through the same transparent containers `importDeclsIn` recurses
+  // (LinkageSpecDecl, NamespaceDecl). Deliberately NOT
+  // `collectPassAFunctionDefinitions`: its `unit->decls()`-only walk plus
+  // its variadic and system-header filters would conclude "cannot throw"
+  // for a namespaced throw and SILENTLY DROP the exception — the measured
+  // W2.24 spike trap. Methods are NOT collected: a method never joins the
+  // closure, and a throw (or a call to a closure member) inside one stays
+  // a loud located rejection at its own import (FR-112 omission +
+  // call-site error), so no edge into a method can lose an exception.
+  llvm::SmallVector<const clang::FunctionDecl *, 16> definitions;
+  std::function<void(const clang::DeclContext *)> collect =
+      [&](const clang::DeclContext *context) {
+        for (const clang::Decl *decl : context->decls()) {
+          if (decl->isImplicit() || isSystemHeaderDecl(decl))
+            continue;
+          if (const auto *linkageSpec =
+                  llvm::dyn_cast<clang::LinkageSpecDecl>(decl)) {
+            collect(linkageSpec);
+            continue;
+          }
+          if (const auto *ns = llvm::dyn_cast<clang::NamespaceDecl>(decl)) {
+            collect(ns);
+            continue;
+          }
+          const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl);
+          if (func && !llvm::isa<clang::CXXMethodDecl>(func) &&
+              func->doesThisDeclarationHaveABody())
+            definitions.push_back(func);
+        }
+      };
+  collect(unit);
+
+  struct ThrowFacts {
+    bool directThrow = false;
+    llvm::SmallVector<const clang::FunctionDecl *, 4> unprotectedCallees;
+  };
+  llvm::DenseMap<const clang::FunctionDecl *, ThrowFacts> facts;
+  llvm::DenseMap<const clang::FunctionDecl *, clang::SourceLocation>
+      fnAddressUses;
+  bool sawThrow = false;
+
+  // Lexical scan. `protectedDepth` counts enclosing try BLOCKS; a handler
+  // is scanned at the TRY'S OWN depth, because a throw (or rethrow) inside
+  // a catch handler escapes that try and propagates. The emission mirrors
+  // this exactly (emitTryStmt pops its context before the handler), which
+  // is the correctness condition between plan and import.
+  std::function<LogicalResult(const clang::Stmt *, ThrowFacts &, unsigned)>
+      scan = [&](const clang::Stmt *stmt, ThrowFacts &f,
+                 unsigned protectedDepth) -> LogicalResult {
+    if (!stmt)
+      return success();
+    if (const auto *tryStmt = llvm::dyn_cast<clang::CXXTryStmt>(stmt)) {
+      if (failed(scan(tryStmt->getTryBlock(), f, protectedDepth + 1)))
+        return failure();
+      for (unsigned i = 0; i < tryStmt->getNumHandlers(); ++i)
+        if (failed(scan(tryStmt->getHandler(i)->getHandlerBlock(), f,
+                        protectedDepth)))
+          return failure();
+      return success();
+    }
+    if (const auto *throwExpr = llvm::dyn_cast<clang::CXXThrowExpr>(stmt)) {
+      sawThrow = true;
+      if (protectedDepth == 0)
+        f.directThrow = true;
+      if (const clang::Expr *sub = throwExpr->getSubExpr()) {
+        clang::QualType payload = astContext()
+                                      .getCanonicalType(sub->getType())
+                                      .getUnqualifiedType();
+        // Scalars only: the payload must ride the W2.14 data-enum machinery
+        // (and a class payload could not be READ in a match arm anyway —
+        // emitrust.member needs an lvalue, an arm binds an SSA value).
+        if (!payload->isArithmeticType())
+          return emitError(translateLoc(throwExpr->getThrowLoc()))
+                 << "unsupported: thrown exception payload must be a "
+                    "supported scalar type";
+        if (throwsPayloadClangType.isNull())
+          throwsPayloadClangType = payload;
+        else if (!astContext().hasSameUnqualifiedType(throwsPayloadClangType,
+                                                      payload))
+          return emitError(translateLoc(throwExpr->getThrowLoc()))
+                 << "unsupported: more than one thrown exception payload "
+                    "type in a translation unit";
+        return scan(sub, f, protectedDepth);
+      }
+      return success();
+    }
+    // A lambda's body imports separately; a throw inside one rejects
+    // there (loudly), and must not put the ENCLOSING function — whose own
+    // emitted body never throws — into the closure.
+    if (llvm::isa<clang::LambdaExpr>(stmt))
+      return success();
+    if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt)) {
+      if (const clang::FunctionDecl *callee = call->getDirectCallee()) {
+        if (!llvm::isa<clang::CXXMethodDecl>(callee) && protectedDepth == 0)
+          f.unprotectedCallees.push_back(callee->getCanonicalDecl());
+        // The callee reference of a DIRECT call is not an address-taking
+        // use; scan only the arguments.
+        for (const clang::Expr *arg : call->arguments())
+          if (failed(scan(arg, f, protectedDepth)))
+            return failure();
+        return success();
+      }
+    }
+    if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+      if (const auto *fn =
+              llvm::dyn_cast<clang::FunctionDecl>(ref->getDecl()))
+        fnAddressUses.try_emplace(fn->getCanonicalDecl(), ref->getLocation());
+    for (const clang::Stmt *child : stmt->children())
+      if (failed(scan(child, f, protectedDepth)))
+        return failure();
+    return success();
+  };
+
+  for (const clang::FunctionDecl *func : definitions)
+    if (failed(scan(func->getBody(), facts[func->getCanonicalDecl()], 0)))
+      return failure();
+
+  if (!sawThrow)
+    return success();
+  // A rethrow-only TU carries no payload type to build a carrier from;
+  // its throws keep their generic located rejections.
+  if (throwsPayloadClangType.isNull())
+    return success();
+
+  // Fixed point of "can deliver an exception to its caller" over direct
+  // TU-level call edges. `main` can never rewrite its signature: it stays
+  // OUT, and any unprotected throw or closure call inside it rejects at
+  // emission with the uncaught-exception wordings — emission never drops
+  // a throw, which is the backstop that keeps this syntactic closure safe.
+  llvm::DenseSet<const clang::FunctionDecl *> closure;
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (const clang::FunctionDecl *func : definitions) {
+      const clang::FunctionDecl *canonical = func->getCanonicalDecl();
+      if (closure.contains(canonical) || func->isMain())
+        continue;
+      const ThrowFacts &f = facts[canonical];
+      bool canThrowOut =
+          f.directThrow ||
+          llvm::any_of(f.unprotectedCallees,
+                       [&](const clang::FunctionDecl *callee) {
+                         return closure.contains(callee);
+                       });
+      if (canThrowOut) {
+        closure.insert(canonical);
+        changed = true;
+      }
+    }
+  }
+
+  // Wave-1 gates over every closure member, each a located rejection.
+  for (const clang::FunctionDecl *func : definitions) {
+    const clang::FunctionDecl *canonical = func->getCanonicalDecl();
+    if (!closure.contains(canonical))
+      continue;
+    Location loc = translateLoc(func->getLocation());
+    // noexcept is the closure boundary: a throw reaching one is
+    // std::terminate, and the terminate helper is wave-2.
+    if (const auto *proto = func->getType()->getAs<clang::FunctionProtoType>();
+        proto && proto->isNothrow())
+      return emitError(loc) << "unsupported: a throw reaching a noexcept "
+                               "function (std::terminate has no image)";
+    if (func->isVariadic())
+      return emitError(loc) << "unsupported: a potentially-throwing "
+                               "function with a variadic signature";
+    // Ok0 and Err0 share ONE payload type (the single-payload-match unwrap
+    // the spike byte-diffed), so a closure member must return it.
+    if (!astContext().hasSameUnqualifiedType(
+            astContext().getCanonicalType(func->getReturnType()),
+            throwsPayloadClangType))
+      return emitError(loc) << "unsupported: a potentially-throwing "
+                               "function must return the thrown payload type";
+    // Arithmetic parameters only: a closure member must never meet the
+    // pointer-decomposition planners (cursor/owner/cell machinery), whose
+    // call paths would bypass the carrier unwrap in emitCall.
+    for (const clang::ParmVarDecl *param : func->parameters())
+      if (!param->getType()->isArithmeticType())
+        return emitError(translateLoc(param->getLocation()))
+               << "unsupported: a potentially-throwing function with "
+                  "non-scalar parameters";
+    // An address-taken closure member is THE unresolvable-edge shape: a
+    // call through the pointer would bypass the signature rewrite.
+    if (auto it = fnAddressUses.find(canonical); it != fnAddressUses.end())
+      return emitError(translateLoc(it->second))
+             << "unsupported: the address of a potentially-throwing "
+                "function is taken";
+  }
+
+  throwsClosure = std::move(closure);
+  throwsPlanActive = true;
+  return success();
+}
