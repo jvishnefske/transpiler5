@@ -13055,6 +13055,14 @@ whole-program demand.
   (test/Import/Cpp/exceptions.cpp, exceptions-invalid.cpp;
   test/EndToEnd/cpp-exceptions.cpp, cpp-exceptions-drop.cpp;
   test/Project/coloring-cpp-exceptions.cpp)
+  INDEPENDENT VERIFICATION (2026-08-22, second session): 00902 passes
+  differentially in an isolated single-test mini-suite run
+  (transpiled=1 passed=1 against the committed clang-native expected
+  output); full meson suite re-run 790/790; C build-sweep ratchet
+  unchanged (42/44, both known-fails pinned). With 00901 (W2.19b),
+  00801 (W2.23), and 00902 (W2.24) all flipped on 2026-08-22, the
+  Cpp17Suite frontier-marker list is EMPTY -- the ledger reads 35/35
+  transpiled/passed with zero quarantined miscompiles.
 
 
 - [ ] W2.25 (NEW WAVE) Operator overloading. **The single biggest
