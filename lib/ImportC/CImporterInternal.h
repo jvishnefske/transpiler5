@@ -6240,6 +6240,20 @@ private:
   /// later declaration; without it a prototype-only `static int _set(int)`
   /// would be silently "satisfied" by a same-TU `set` definition.
   llvm::StringMap<std::string> ordinaryTuNameOwners;
+  /// FR-125: the QUALIFIED C++ spelling (`Game::f`) that first claimed
+  /// each composed ordinary name in this TU's pre-scan, keyed like
+  /// `ordinaryTuNameOwners`. Backs the case-fold collision guard: the
+  /// idiomatic rename folds namespace segments and free-function base
+  /// names to snake_case, so two DIFFERENT qualified spellings can
+  /// compose to one emitted symbol (`Game::f` and `game::f` both ->
+  /// `ns_game_f`; `n::myFunc` beside `n::my_func`). The raw-base-keyed
+  /// FR-73 map cannot see these (both raw spellings are `f`), and the
+  /// reconciliation's `!isDefinition` early-success would silently bind
+  /// a prototype-only spelling's calls to the other spelling's body
+  /// (measured at the member level pre-FR-125: `n::myFunc(1)` compiled
+  /// into a call to `ns_n_my_func`, exit 0). `importFunction` rejects
+  /// the later declaration located.
+  llvm::StringMap<std::string> ordinaryTuQualifiedOwners;
   /// Symbol name assigned to each struct definition by `structSymbolName`,
   /// keyed on the defining declaration (per-TU decls are distinct; cross-TU
   /// unification still happens by final name through

@@ -151,12 +151,11 @@ anchor = "FR-124 DEFECT"
 
 [[items]]
 id = "FR-125"
-rank = 8
 kind = "defect"
-status = "in-flight"
+status = "landed"
 size = "M"
-title = "CamelCase namespaces trip non_snake_case: exit-0 unbuildable (x33)"
-summary = "ns_<Namespace> preserves capitalization against the deny set. Fix is a byte-identity design decision, not a rename. 9 corpus crates; 5-line repro saved."
+title = "CamelCase namespaces: per-segment snake fold at the naming primitive"
+summary = "Landed 2026-08-22: golden-shift fear falsified (zero files); fold gated on idiomaticRenameEnabled at namespacePrefix; FR-115 join agrees by construction. Adversarial probe found a pre-existing member-level silent fusion at HEAD -- subsumed by the new qualified-owner guard. 9 crates build, 33 snake errors -> 0."
 blocked_by = []
 anchor = "FR-125 DEFECT"
 

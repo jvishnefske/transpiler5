@@ -258,6 +258,19 @@ static inline std::string joinSymbolPrefix(llvm::StringRef prefix,
 /// walking up and contributes nothing, matching C linkage's unchanged-name
 /// contract. Returns the empty string for plain C input, where no
 /// `NamespaceDecl` ever appears in a `DeclContext` chain.
+///
+/// FR-125: under the idiomatic rename each SEGMENT folds to snake_case
+/// (`namespace Game` -> `ns_game_`), exactly as `mangleMemberName` folds
+/// the base name -- a verbatim CamelCase segment fails the emitted
+/// crate's denied `non_snake_case` lint (`ns_Game_score` was exit-0
+/// unbuildable; measured 33 errors across 9 corpus crates). The fold is
+/// per-segment inside the loop so nested chains (`ns_game_ns_input_`)
+/// and the tuTag prefix compose unchanged, and it is GATED on
+/// `idiomaticRenameEnabled()` so `--preserve-c-names` and
+/// `emitrust-import-c` keep the verbatim spelling byte-for-byte. Two
+/// namespaces distinguished only by case (`Game::f`, `game::f`) now fold
+/// onto one symbol; the qualified-owner guard in `importFunction`
+/// rejects that located, never merging (see `ordinaryTuQualifiedOwners`).
 static inline std::string namespacePrefix(const clang::DeclContext *context) {
   llvm::SmallVector<const clang::NamespaceDecl *, 4> chain;
   for (; context && !context->isTranslationUnit();
@@ -267,7 +280,11 @@ static inline std::string namespacePrefix(const clang::DeclContext *context) {
   std::string prefix;
   for (const clang::NamespaceDecl *ns : llvm::reverse(chain)) {
     prefix += "ns_";
-    prefix += ns->isAnonymousNamespace() ? "anon" : ns->getName().str();
+    if (ns->isAnonymousNamespace())
+      prefix += "anon";
+    else
+      prefix += idiomaticRenameEnabled() ? toSnakeCase(ns->getName())
+                                         : ns->getName().str();
     prefix += "_";
   }
   return prefix;

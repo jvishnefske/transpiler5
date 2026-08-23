@@ -8086,7 +8086,7 @@ piece and becomes FR-45.
   test/EndToEnd/cpp-derive-copy-fixpoint.cpp)
 
 
-- [ ] FR-125 DEFECT (found by the 2026-08-22 re-sweep):
+- [x] FR-125 DEFECT (found by the 2026-08-22 re-sweep):
   **CamelCase namespaces break the non_snake_case deny -- 33 errors
   across 9 crates** (2048.cpp's `namespace Game`, jsoncpp's
   `namespace Json`): the `ns_<Namespace>` symbol prefix preserves
@@ -8096,7 +8096,42 @@ piece and becomes FR-45.
   DECISION, not a casual rename: emitted symbol names are the
   CSymbolNaming byte-identity contract shared with the FR-40 item
   graph, so lowercasing the prefix shifts every namespaced golden.
-  **NOT SPIKED.**
+  LANDED 2026-08-22 (spike GO for mechanism (a), the honest rename).
+  The design decision was DECIDED BY MEASUREMENT, and the entry's
+  golden-shift fear was falsified: no existing golden spells a
+  CamelCase namespace segment, so the measured shift is ZERO files.
+  The fold is per-segment `toSnakeCase` at the ONE primitive
+  (`namespacePrefix`, CSymbolNaming.h), gated on
+  `idiomaticRenameEnabled()` exactly like `mangleMemberName` -- so
+  emitrust-import-c and `--preserve-c-names` keep verbatim spellings
+  (both pinned), nesting and the tu-tag compose per-segment
+  (`ns_game_ns_input_*`, `tu0_ns_game_clamp`), record UpperCamel and
+  global SCREAMING spellings are invariant, and the FR-115 join
+  agrees by construction (pinned live through the progress JSON).
+  Rejected alternatives, both measured: (b) allow(non_snake_case)
+  reverses the recorded FR-106 deny-promotion direction and
+  duplicates the --preserve-c-names escape hatch; (c) reject-located
+  regresses 9 currently-transpiling crates. THE SPIKE'S ADVERSARIAL
+  COLLISION PROBES FOUND A PRE-EXISTING SILENT FUSION AT HEAD,
+  SUBSUMED BY THIS FIX: a declared-only `n::myFunc()` CALLED, with
+  `n::my_func{}` defined, silently bound the folded sibling's body
+  (exit 0, wrong output where the native link-fails) -- the
+  member-level base-name-fold family, live before this FR. The new
+  qualified-owner guard (`ordinaryTuQualifiedOwners`, populated at
+  the pre-scan claimant sites) rejects ALL case-fold collisions
+  located at the later declaration, defs and prototype-fusion paths
+  alike, with an honest wording: `function 'game::f' emits as
+  'ns_game_f', which collides with 'Game::f' (the idiomatic rename
+  folds both spellings onto one symbol)`; the record guard already
+  fired correctly and is regression-pinned. CORPUS: all 9 offender
+  units transpile and cargo-build clean, snake errors 33 -> 0, zero
+  `ns_[A-Z]` spellings in any emitted lib.rs. Gates: worktree full
+  suite green; main-tree full suite 794/794 (fast 562 + EndToEnd 232)
+  with the diff applied at 2b1df91.
+  (test/EndToEnd/cpp-namespace-camelcase.cpp,
+  test/Import/Cpp/cpp-ns-camelcase.cpp,
+  test/Import/Cpp/cpp-ns-case-fold-invalid.cpp,
+  test/Driver/incremental-camelcase-namespace.cpp)
 
 - [x] FR-126 ATTRIBUTION FOLLOW-ON (the ~28%): two channels FR-115
   deliberately left, now sized by the re-sweep. (1)

@@ -401,6 +401,31 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
              << "unsupported: function name '" << cName << "' emits as '"
              << name << "', which collides with '" << firstRaw
              << "' (leading underscores fold into the symbol prefix)";
+    // FR-125: the idiomatic rename folds namespace segments and free-
+    // function base names to snake_case, so two DIFFERENT qualified C++
+    // spellings can compose to one emitted symbol (`Game::f` and
+    // `game::f` both -> `ns_game_f`; `n::myFunc` beside `n::my_func`).
+    // The fold must never merge them: the reconciliation's
+    // `!isDefinition` early-success cannot tell a redeclaration from a
+    // case-fold alias, so a prototype-only `Game::f` would be silently
+    // "satisfied" by `game::f`'s body and every call would run the wrong
+    // code (measured pre-FR-125 at the member level, exit 0). Keyed on
+    // the EMITTED name, so it is mode-sensitive by construction: with
+    // the rename off the spellings never collide and both import.
+    // Template instantiations are exempt on either side of the clash --
+    // their aliasing is the suffix table's, diagnosed with the W2.15
+    // wording at reconciliation.
+    if (!func->getTemplateSpecializationArgs() &&
+        !templateSpecSymbolNames.contains(name)) {
+      std::string firstQualified = ordinaryTuQualifiedOwners.lookup(name);
+      std::string qualified = func->getQualifiedNameAsString();
+      if (!firstQualified.empty() && firstQualified != qualified)
+        return emitError(loc)
+               << "unsupported: function '" << qualified << "' emits as '"
+               << name << "', which collides with '" << firstQualified
+               << "' (the idiomatic rename folds both spellings onto one "
+                  "symbol)";
+    }
   }
 
   // W2.17: a destructor-carrying class crossing a call boundary BY VALUE is
