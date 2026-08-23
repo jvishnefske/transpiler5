@@ -60,9 +60,10 @@
 //   virtual member is the destructor (destruction of a value is static,
 //   and every site where dynamism could be observed is already a located
 //   rejection) -- the pin moved FORWARD to
-//   test/Import/Cpp/inheritance-drop.cpp, and the residual (a virtual
-//   destructor beside any OTHER virtual method) is pinned in
-//   inheritance-drop-invalid.cpp under the `virtual method` wording.
+//   test/Import/Cpp/inheritance-drop.cpp. W2.19a widened the admission
+//   to virtual METHODS beside the destructor (values only); the dynamic
+//   residual (a virtual call through a pointer) is pinned in
+//   inheritance-drop-invalid.cpp and virtual-methods-values-invalid.cpp.
 // * a destructor with no definition in THIS translation unit: an
 //   uncalled, undefined method is silently DROPPED from emission, and
 //   nothing ever calls a destructor -- so the class would emit with NO

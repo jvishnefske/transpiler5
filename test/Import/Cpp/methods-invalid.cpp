@@ -66,14 +66,16 @@
 // test/Import/Cpp/class-templates-invalid.cpp.
 
 //--- virtual.cpp
-// A virtual method is out of scope this wave (no vtable/dynamic dispatch):
-// REJECT at the method's own declaration.
-// VIRTUAL: virtual.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: virtual method
+// W2.19a admits the class (virtual methods on VALUES statically bind);
+// the rejection moved from the method's declaration to the DYNAMIC use:
+// a virtual call through a pointer receiver, where the pointee's dynamic
+// type is not knowable, stays a located rejection at the call.
 class Base2 {
 public:
   virtual int f() { return 1; }
 };
 
+// VIRTUAL: virtual.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: virtual method call through a pointer
 int use(Base2 *b) {
   return b->f();
 }

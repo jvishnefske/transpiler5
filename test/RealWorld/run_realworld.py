@@ -388,8 +388,12 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("outside a function, loop, or branch body", "cxx-drop-scope"),
     ("in a loop whose increment has side effects", "cxx-drop-scope"),
     ("user-declared destructor", "cxx-destructor"),
+    # W2.19a retired "unsupported: virtual method"/cxx-virtual: the
+    # class-level gate is gone (virtual methods on values statically
+    # bind); the dynamic residual is the call-site pointer fence.
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("virtual method call through a pointer", "cxx-virtual-call"),
     ("virtual or unresolved member call", "cxx-virtual-call"),
-    ("unsupported: virtual method", "cxx-virtual"),
     # FR-112 containment: an omitted member's USE sites. The first needle
     # must sit ABOVE the "overloaded operator" row (its message contains
     # both substrings; first match wins). Mirrors

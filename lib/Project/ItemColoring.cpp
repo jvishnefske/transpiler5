@@ -67,7 +67,7 @@
 /// direction only by the under-approximation discipline for constructs the
 /// probe stays silent about; for the eleven it does screen, the mitigation is
 /// that each one is a by-design rejection with a single unconditional check
-/// in the importer (`base classes are not supported`, `virtual method`,
+/// in the importer (`base classes are not supported`,
 /// `user-declared destructor`, `overloaded operator`, `_Atomic-qualified
 /// type`) or a construct the importer has no code for at all (templates,
 /// exceptions, inline asm, lambdas, `new`/`delete`). The C++ REFERENCE screen
@@ -237,8 +237,6 @@ namespace tag {
 constexpr llvm::StringLiteral Template = "template";
 /// A C++ record with at least one direct base class.
 constexpr llvm::StringLiteral BaseClass = "base-class";
-/// A user-declared `virtual` member function.
-constexpr llvm::StringLiteral VirtualMethod = "virtual-method";
 /// A user-declared destructor.
 constexpr llvm::StringLiteral Destructor = "destructor";
 /// A user-declared copy, move, or delegating constructor.
@@ -602,10 +600,10 @@ static bool typeHasTransitiveDestructor(clang::ASTContext &context,
 static bool admitsDestructorAsDrop(const clang::CXXRecordDecl *record,
                                    const clang::CXXMethodDecl *destructor) {
   // W2.26: `isVirtual` alone no longer disqualifies -- the sole-virtual-
-  // dtor class is admitted as a value. A virtual destructor beside any
-  // OTHER virtual method is still red, via the virtual-method screen in
-  // `probeRecord` (which must in turn EXCLUDE destructors, or every
-  // admitted virtual dtor would stay falsely red through the double tag).
+  // dtor class is admitted as a value. (W2.19a then removed the
+  // virtual-method screen from `probeRecord` altogether: virtual METHODS
+  // beside the destructor are admitted too, so nothing record-level is
+  // left to double-tag.)
   if (record->isUnion())
     return false;
   // An uncalled, undefined method is silently dropped from emission, so a
@@ -652,19 +650,18 @@ void AdmissibilityProbe::probeRecord(const clang::RecordDecl *record,
       if (llvm::isa<clang::CXXDestructorDecl>(method) &&
           !admitsDestructorAsDrop(cxxRecord, method))
         verdicts.reject(symbol, tag::Destructor, /*signatureLevel=*/false);
-      // FR-112 kept this screen while REMOVING the overloaded-operator one
-      // that used to sit under it: the importer still rejects a virtual
-      // method at the class (the vptr is real storage the emitted struct
-      // lacks; no use-site rejection can repair a layout), so the screen
-      // mirrors `collectRecordFields` exactly. An overloaded operator, by
-      // contrast, is now OMITTED member-by-member -- on the struct AND
-      // union paths -- with the class importable and every use a located
-      // rejection, so screening it was measured as three FALSE REDS on
-      // FR-112's motivating repro: the direction that breaks FR-41's
-      // "false reds remain zero" contract and starves FR-43's `--search`
-      // (test/Project/coloring-cpp-class-gates.cpp pins both halves).
-      if (method->isVirtual() && !llvm::isa<clang::CXXDestructorDecl>(method))
-        verdicts.reject(symbol, tag::VirtualMethod, /*signatureLevel=*/false);
+      // The VIRTUAL-METHOD screen that sat here was removed by W2.19a
+      // with the importer's class-level gate it mirrored: a virtual
+      // method no longer disqualifies the class at all (value calls
+      // statically bind; every dynamic channel is a CALL-SITE/expr-site
+      // rejection -- pointer receivers, polymorphic upcasts,
+      // sizeof/alignof -- with no record-level restatement to mirror).
+      // Keeping it would color every virtual-method class falsely Red,
+      // the FR-41 forbidden direction. The accepted residual is a false
+      // GREEN: a method body containing `p->virt()` colors green here
+      // and rejects at import, the under-approximation side the probe's
+      // contract permits (test/Project/coloring-cpp-class-gates.cpp pins
+      // both halves).
       // FR-118: the screen this probe was MISSING, measured as a live FALSE
       // GREEN -- the importer rejects a copy/move/delegating constructor
       // (`CImporter::importCXXMethods`, which is why FR-118 had to undo the

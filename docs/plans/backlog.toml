@@ -160,12 +160,11 @@ anchor = "FR-120"
 
 [[items]]
 id = "W2.19a"
-rank = 7
 kind = "feature"
-status = "spiked"
+status = "landed"
 size = "M"
 title = "Virtual methods on values only (static dispatch)"
-summary = "Needs zero pointer work; byte-diffed by the W2.19 spike's value-call legs. Rejects every base-pointer/reference use, LOCATED."
+summary = "Landed 2026-08-22: class gate deleted, soundness-critical pointer fence (the no-fence build measured a silent this->virtual miscompile), Box-path fence copy, pure virtual as-is. Cpp17Suite 31 -> 32; 00901 awaits W2.19b."
 blocked_by = []
 anchor = "W2.19"
 

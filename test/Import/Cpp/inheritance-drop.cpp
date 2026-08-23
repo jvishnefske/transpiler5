@@ -30,9 +30,11 @@
 //    derived object would never run `~Shape` at all).
 // 5. A class whose SOLE virtual member is the destructor is admitted as a
 //    value (destruction of a value is static; every site where dynamism
-//    could be observed -- new, upcast, virtual member call -- is already
-//    a located rejection). Any other virtual method still rejects
-//    (inheritance-drop-invalid.cpp).
+//    could be observed -- new, upcast, virtual member call through a
+//    pointer -- is already a located rejection). Since W2.19a other
+//    virtual methods no longer reject the class either
+//    (virtual-methods-values.cpp); the dynamic uses stay pinned in
+//    inheritance-drop-invalid.cpp.
 
 extern "C" int printf(const char *, ...);
 

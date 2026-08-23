@@ -19,11 +19,17 @@
 
 //--- virtual-sibling.cpp
 // A sibling call through implicit `this` does NOT open virtual dispatch.
-// The class is rejected at the virtual member's own declaration, in
-// `collectRecordFields`, before any field or method imports — so the
-// rejection lands on the declaration, not on the (perfectly ordinary)
-// call site, and no half-imported class survives.
-// VIRTSIB: virtual-sibling.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: virtual method
+// Since W2.19a the class itself IMPORTS (virtual methods on values are
+// admitted, statically bound), but a VIRTUAL sibling call rides the
+// pointer-shaped receiver `this`, where the static bind would be an
+// assumption: reached through a derived value's hop projection, `this`
+// really can point at a derived object and binding `step` statically is
+// the spike's measured miscompile. So the call hits the W2.19a fence in
+// `emitCXXMemberCall`; inside a method body that failure is an FR-112
+// containment -- `run` is OMITTED (warning below), `step` and the class
+// import, and the USE of the omitted method is the located error.
+// VIRTSIB: virtual-sibling.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: virtual method call through a pointer (omitted: method 'run' of class 'Dispatching')
+// VIRTSIB: virtual-sibling.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to unimported method 'Dispatching_run'
 class Dispatching {
 public:
   virtual int step() { return 1; }

@@ -59,7 +59,7 @@
 /// ## Two vocabularies, deliberately not merged
 ///
 /// A root tag comes from the FR-41 probe's construct vocabulary
-/// (`base-class`, `destructor`, `virtual-method`, `template`, ...); a direct
+/// (`base-class`, `destructor`, `copy-move-constructor`, `template`, ...); a direct
 /// tag comes from FR-42's `classifyBlocker` (`cxx-inheritance`,
 /// `cxx-destructor`, `dynamic-memory`, ...). They are different vocabularies
 /// with different provenance — one is a syntactic screen over the AST, the

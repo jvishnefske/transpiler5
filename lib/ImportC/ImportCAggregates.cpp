@@ -734,9 +734,10 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
     return !method->isImplicit() && !method->isDeleted() &&
            !method->isDefaulted();
   };
-  // Destructors outside the W2.17 subset and virtual methods were already
-  // rejected in `collectRecordFields`, before this class's struct_def (and
-  // so before this walk) ever ran; a copy/move/delegating constructor is
+  // Destructors outside the W2.17 subset were already rejected in
+  // `collectRecordFields`, before this class's struct_def (and so before
+  // this walk) ever ran (virtual methods import like any other method
+  // since W2.19a); a copy/move/delegating constructor is
   // out of the method wave's scope too (no value/aliasing semantics modeled
   // for it) and is rejected here, the first point a constructor is
   // inspected individually. Kept ahead of BOTH passes so a rejected class
@@ -1150,12 +1151,13 @@ LogicalResult CImporter::collectRecordFields(
         if (llvm::isa<clang::CXXDestructorDecl>(method)) {
           // W2.26 admits a VIRTUAL destructor here: destruction of a value
           // is static, and every site where the dynamism could be observed
-          // (new, upcast, virtual member call) is an explicit AST node that
-          // is already a located rejection. The practical reach is exactly
-          // the class whose SOLE virtual member is the destructor: this
-          // branch `continue`s, so any OTHER virtual method still hits the
-          // class-level `virtual method` rejection below. The vptr the
-          // native layout carries is refused where it could be observed --
+          // (new, upcast, virtual member call through a pointer) is an
+          // explicit AST node that is already a located rejection. W2.26's
+          // practical reach was the class whose SOLE virtual member is the
+          // destructor; since W2.19a removed the class-level `virtual
+          // method` gate below, virtual methods beside the destructor are
+          // admitted on the same value-only terms. The vptr the native
+          // layout carries is refused where it could be observed --
           // `emitSizeofAlignof` screens polymorphic operands.
           // A union's members are not independently alive, so "destroy the
           // members in reverse order" has no meaning to reproduce; this is
@@ -1186,15 +1188,25 @@ LogicalResult CImporter::collectRecordFields(
                         "function 'dtor'";
           continue;
         }
-        // FR-112 kept this gate CLASS-level on purpose while retiring the
-        // overloaded-operator one below it: every virtual CALL is already a
-        // located rejection at the site, but the vptr is real storage the
-        // emitted struct lacks -- `sizeof(C)` folds faithfully (16) from
-        // clang's ASTContext for a struct the emitter renders as 4 bytes,
-        // so any program sizing a buffer from it would be internally
-        // inconsistent. No use-site rejection can repair a layout.
-        if (method->isVirtual())
-          return emitError(methodLoc) << "unsupported: virtual method";
+        // W2.19a: a virtual method no longer rejects the CLASS. On a VALUE
+        // the C++ static type IS the dynamic type, so `getMethodDecl()`'s
+        // statically named override is the exact method C++ dispatches to
+        // (byte-diffed against the devirtualized twin in the W2.19 spike);
+        // the virtual method imports as an ordinary method and value calls
+        // bind it directly. Every channel where static and dynamic type
+        // COULD diverge stays a located rejection at the site: any
+        // pointer-shaped receiver -- including implicit `this` -- hits the
+        // fence in `emitCXXMemberCall` (the spike measured the silent
+        // miscompile that fence prevents), the polymorphic upcast is
+        // refused inside `uniquePublicSingleBaseHops`, base references and
+        // new/delete keep their pre-existing rejections, and FR-112's
+        // sizeof concern (clang folds the vptr-carrying native layout for
+        // a struct the emitter renders without one) is screened at the
+        // fold by W2.26's `emitSizeofAlignof` polymorphic-operand check.
+        // A PURE virtual method needs no gate of its own: it has no body,
+        // so it rides the FR-47 stub channel (silently dropped when
+        // uncalled, FR-52-loud when referenced), and a pure-virtual VALUE
+        // cannot exist -- clang rejects abstract instantiation upstream.
         // An overloaded operator is NOT rejected here since FR-112: it is
         // OMITTED by `importCXXMethods` (non-identifier `DeclarationName`,
         // same channel as FR-117's conversion functions), and every use --
