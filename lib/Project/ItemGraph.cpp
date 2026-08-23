@@ -652,9 +652,20 @@ void ItemGraphBuilder::collectOrdinaryNames(const clang::DeclContext *context) {
       continue;
     }
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
-      if (!func->getDeclName().isIdentifier())
+      // W2.25: an ADMITTED free operator now claims its synthesized
+      // spelling (`op_eq`) like any ordinary function; every other
+      // non-identifier shape (literal operators, non-admitted kinds)
+      // composes the empty symbol and claims nothing — mirroring the
+      // importer's `collectOrdinaryNamesFrom`. An out-of-line MEMBER
+      // operator's real symbol is `<Struct>_op_*`, so it must not claim
+      // the free spelling (identifier out-of-line methods keep their
+      // historical claim unchanged).
+      if (llvm::isa<clang::CXXMethodDecl>(func) &&
+          !func->getDeclName().isIdentifier())
         continue;
       std::string symbol = cFunctionSymbolName(func, tuTag);
+      if (symbol.empty())
+        continue;
       if (func->hasBody())
         collectStaticLocalNames(func->getBody(), symbol);
       tuOrdinaryNames[tuIndex].insert(std::move(symbol));
@@ -774,16 +785,21 @@ void ItemGraphBuilder::collectItems(const clang::DeclContext *context) {
       // appear here at item scope, and is skipped for the same reason.
       if (llvm::isa<clang::CXXMethodDecl>(func))
         continue;
-      // FR-119: a free operator (or literal operator) has no identifier
-      // spelling, so `cFunctionSymbolName` would key it as "" -- two such
-      // operators deduped into ONE empty-named node, and getName() asserts
-      // in debug builds. The importer rejects the item located
-      // (`unsupported: overloaded operator`); the graph skips it AST-pure,
-      // BEFORE any naming call, mirroring the tuOrdinaryNames collector's
-      // existing screen.
-      if (!func->getDeclName().isIdentifier())
+      // FR-119, narrowed by W2.25: a free operator of an ADMITTED kind now
+      // has a synthesized identifier spelling (`op_eq`, with FR-114's
+      // per-parameter suffixes) and mints a node exactly like an ordinary
+      // function — in lockstep with the importer's admission, so the graph
+      // and the emitted module agree on the item set. Every other
+      // non-identifier shape (literal operators, operator templates,
+      // non-admitted kinds) still composes the EMPTY symbol — the importer
+      // rejects it located (`unsupported: overloaded operator`) and the
+      // graph skips it, never minting an empty-named node (getName() is no
+      // longer reached: `cFunctionSymbolName` screens the DeclarationName
+      // itself).
+      std::string symbol = cFunctionSymbolName(func, tuTag);
+      if (symbol.empty())
         continue;
-      addNode({cFunctionSymbolName(func, tuTag), ItemKind::Function,
+      addNode({std::move(symbol), ItemKind::Function,
                func->isThisDeclarationADefinition(), linkageOf(func), tuIndex,
                std::move(file), line, column});
       continue;

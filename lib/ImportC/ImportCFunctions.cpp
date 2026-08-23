@@ -54,20 +54,32 @@ static std::string cxxMethodBaseName(const clang::CXXMethodDecl *method) {
   // separately renamed to `drop` by `convert-func-to-emitrust`.
   if (llvm::isa<clang::CXXDestructorDecl>(method))
     return "dtor";
+  // W2.25: an overloaded operator of an ADMITTED kind takes its synthesized
+  // identifier base (`operator==` -> `op_eq`, the shared table in
+  // CSymbolNaming.h), composing to `<Struct>_op_eq` exactly like a named
+  // method. The synthesized spelling deliberately can collide with a user
+  // method literally named `op_eq` — `importFunction`'s W2.25 sibling walk
+  // rejects that located, never merging the two into one overload set (see
+  // the name-kind guard in `cxxMethodMangledName`'s counter below).
   // FR-117: every REMAINING `DeclarationName` kind a `CXXMethodDecl` can
   // carry that is not an ordinary identifier -- `CXXConversionFunctionName`
-  // (`operator int()`) and `CXXOperatorName` (`operator+`) -- has NO
-  // spelling to mangle. Falling through to `getName()` here was a live
-  // defect: it asserts in clang/AST/Decl.h (`Name is not a simple
-  // identifier`), and with that assert compiled out by our release NDEBUG
-  // build it returned the EMPTY STRING, so the class emitted a method
-  // literally named `<Struct>_` -- a symbol nobody can call, and one that
-  // two conversion functions in the same class collided on outright. The
-  // empty return is the OMISSION marker: `importCXXMethods` skips such a
-  // method, `cxxMethodMangledName`'s overload counter ignores it, and
-  // `importFunction` refuses it outright, so it can never reach a symbol.
-  if (!method->getDeclName().isIdentifier())
+  // (`operator int()`) and `CXXOperatorName` for a NON-admitted kind
+  // (`operator=`) -- has NO spelling to mangle. Falling through to
+  // `getName()` here was a live defect: it asserts in clang/AST/Decl.h
+  // (`Name is not a simple identifier`), and with that assert compiled out
+  // by our release NDEBUG build it returned the EMPTY STRING, so the class
+  // emitted a method literally named `<Struct>_` -- a symbol nobody can
+  // call, and one that two conversion functions in the same class collided
+  // on outright. The empty return is the OMISSION marker:
+  // `importCXXMethods` skips such a method, `cxxMethodMangledName`'s
+  // overload counter ignores it, and `importFunction` refuses it outright,
+  // so it can never reach a symbol.
+  if (!method->getDeclName().isIdentifier()) {
+    std::string opBase = emitrust::operatorSymbolBaseName(method);
+    if (!opBase.empty())
+      return opBase;
     return std::string();
+  }
   return mangleMemberName(method->getName());
 }
 
@@ -161,6 +173,17 @@ CImporter::cxxMethodMangledName(const clang::CXXMethodDecl *method) const {
     std::string candidateName = cxxMethodBaseName(candidate);
     if (candidateName.empty())
       continue;
+    // W2.25: a synthesized operator base (`op_eq`) and a user method
+    // literally spelled `op_eq` are DIFFERENT DeclarationName shapes and
+    // never form one overload set — counting them together would suffix
+    // both and silently fuse two unrelated functions into one set. They
+    // collide on the bare symbol instead, and `importFunction`'s W2.25
+    // sibling walk rejects that located. Identifier-vs-identifier and
+    // operator-vs-operator counting is unchanged (constructors share the
+    // fixed `new` base through the same non-identifier arm as before).
+    if (candidate->getDeclName().isIdentifier() !=
+        method->getDeclName().isIdentifier())
+      continue;
     if (candidateName == baseName)
       ++sharingCount;
   }
@@ -251,7 +274,13 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   const bool cxxIsDtor =
       cxxMethod && llvm::isa<clang::CXXDestructorDecl>(cxxMethod);
   const bool namedByIdentifier = func->getDeclName().isIdentifier();
-  if (cxxMethod && !namedByIdentifier && !cxxIsCtor && !cxxIsDtor)
+  // W2.25: a member operator of an ADMITTED kind (non-empty synthesized
+  // base name) falls through — its symbol is `cxxMethodMangledName`'s
+  // `<Struct>_op_*`, so an out-of-line definition imports exactly like an
+  // out-of-line named method. Conversion functions and non-admitted
+  // operator kinds keep FR-117's located refusal.
+  if (cxxMethod && !namedByIdentifier && !cxxIsCtor && !cxxIsDtor &&
+      cxxMethodBaseName(cxxMethod).empty())
     return emitError(loc)
            << (llvm::isa<clang::CXXConversionDecl>(func)
                    ? "unsupported: conversion function"
@@ -324,7 +353,17 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // drops as its own item. The emitrust.func verifier's empty-sym_name
   // check is the emission-side backstop for whatever this guard cannot
   // see.
-  if (!cxxMethod && !namedByIdentifier)
+  //
+  // W2.25 narrowed this guard: a free operator of an ADMITTED kind
+  // (`operatorSymbolBaseName` non-empty — by-value comparison/arithmetic
+  // kinds, never templates or literal operators) falls through and imports
+  // under its synthesized identifier spelling with FR-114's per-parameter
+  // suffixes (`op_mul_rv_i32`), which is exactly the shape FR-119's
+  // raytracing note recorded for this wave. Everything else — literal
+  // operators, operator templates, non-admitted kinds like a user
+  // `operator<<` — keeps the located rejection.
+  if (!cxxMethod && !namedByIdentifier &&
+      emitrust::operatorSymbolBaseName(func).empty())
     return emitError(loc) << "unsupported: overloaded operator";
 
   // FR-47: `signatureOnly` forces the body-less path for a declaration that
@@ -424,6 +463,43 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
                << "unsupported: function '" << qualified << "' emits as '"
                << name << "', which collides with '" << firstQualified
                << "' (the idiomatic rename folds both spellings onto one "
+                  "symbol)";
+    }
+  }
+  // W2.25: the MEMBER half of the synthesized-spelling collision guard. A
+  // class can declare both `operator==` (which now emits as `S_op_eq`) and
+  // a user method literally named `op_eq` (which always emitted as
+  // `S_op_eq`); the overload counter above deliberately refuses to fuse
+  // them into one suffixed set (they are different DeclarationName
+  // shapes), so both compose the SAME symbol and, without this walk, the
+  // second definition would land on the misleading cross-TU "conflicting
+  // definition" wording — or, worse, two signature-identical prototypes
+  // would merge silently in the FR-47 prepass reconciliation. The walk
+  // fires on BOTH colliders (each sees the other as its sibling), so both
+  // join the FR-112 omitted set with this wording and every use stays a
+  // located rejection. Scoped to pairs where exactly ONE side is an
+  // operator: same-spelling-kind collisions keep the pre-existing overload
+  // machinery and its wordings.
+  if (cxxMethod) {
+    bool thisIsOperator = func->getDeclName().getNameKind() ==
+                          clang::DeclarationName::CXXOperatorName;
+    for (const clang::CXXMethodDecl *sibling : cxxMethod->getParent()->methods()) {
+      if (sibling->isImplicit() || sibling->isDeleted())
+        continue;
+      if (sibling->getCanonicalDecl() == cxxMethod->getCanonicalDecl())
+        continue;
+      bool siblingIsOperator = sibling->getDeclName().getNameKind() ==
+                               clang::DeclarationName::CXXOperatorName;
+      if (thisIsOperator == siblingIsOperator)
+        continue;
+      if (cxxMethodBaseName(sibling).empty())
+        continue;
+      if (cxxMethodMangledName(sibling) == name)
+        return emitError(loc)
+               << "unsupported: method '" << func->getDeclName().getAsString()
+               << "' emits as '" << name << "', which collides with '"
+               << sibling->getDeclName().getAsString()
+               << "' (the synthesized operator spelling folds both onto one "
                   "symbol)";
     }
   }

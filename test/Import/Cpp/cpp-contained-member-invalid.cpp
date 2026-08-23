@@ -57,16 +57,23 @@
 // exercised here through the non-const `P(P&)` copy ctor).
 
 //--- op-call.cpp
-// OPCALL: op-call.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to overloaded operator 'operator+' omitted from class 'Vec2'
+// W2.25 moved this pin forward: by-value `operator+` now IMPORTS
+// (test/Import/Cpp/operator-overload.cpp), so the omitted-member channel
+// is pinned through `operator+=`, a kind outside the admitted table.
+// OPCALL: op-call.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to overloaded operator 'operator+=' omitted from class 'Vec2'
 struct Vec2 {
   int x;
-  int operator+(const Vec2 &o) const { return x + o.x; }
+  Vec2 &operator+=(const Vec2 &o) {
+    x = x + o.x;
+    return *this;
+  }
 };
 int use(int n) {
   Vec2 a, b;
   a.x = n;
   b.x = n + 1;
-  return a + b;
+  a += b;
+  return a.x;
 }
 
 //--- member-assign.cpp
@@ -109,19 +116,26 @@ int use(int n) {
 }
 
 //--- explicit-spelling.cpp
-// The explicit member-call spelling of an operator keeps FR-117's wording
-// (raised in the member-call dispatch, ahead of the mangled lookup that
-// would otherwise leak the empty-base-name symbol `'Vec2_'`).
+// The explicit member-call spelling of an OMITTED operator keeps FR-117's
+// wording (raised in the member-call dispatch, ahead of the mangled lookup
+// that would otherwise leak the empty-base-name symbol `'Vec2_'`). W2.25:
+// an admitted, actually-imported operator's explicit spelling now resolves
+// (operator-overload.cpp pins `s1.operator==(s2)` positive), so the fence
+// is pinned through the non-admitted `operator+=`.
 // EXPLICIT: explicit-spelling.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: overloaded operator
 struct Vec2 {
   int x;
-  int operator+(const Vec2 &o) const { return x + o.x; }
+  Vec2 &operator+=(const Vec2 &o) {
+    x = x + o.x;
+    return *this;
+  }
 };
 int use(int n) {
   Vec2 a, b;
   a.x = n;
   b.x = n + 1;
-  return a.operator+(b);
+  a.operator+=(b);
+  return a.x;
 }
 
 //--- body-fail-use.cpp

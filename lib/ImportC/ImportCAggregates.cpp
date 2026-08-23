@@ -78,6 +78,11 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
       for (const clang::FunctionDecl *spec : tmpl->specializations()) {
         if (!spec->isThisDeclarationADefinition())
           continue;
+        // W2.25: an OPERATOR template's specializations have no emitted
+        // symbol (operator templates stay FR-119 rejections) and no raw
+        // spelling to claim — `getName()` would assert on them.
+        if (!spec->getDeclName().isIdentifier())
+          continue;
         std::string specName = mlirFuncName(spec);
         ordinaryTuNames.insert(specName);
         ordinaryRawTuNames.insert(spec->getName());
@@ -90,14 +95,38 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
       continue;
     }
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
+      // W2.25: an out-of-line MEMBER operator definition is a TU-scope
+      // decl whose `cFunctionSymbolName` would now be the FREE synthesized
+      // spelling (`op_eq`), not its real `<Struct>_op_eq` symbol — letting
+      // it claim `op_eq` here would falsely reject a genuine free
+      // `operator==` in the same TU. Skipped entirely (it used to claim
+      // only the empty string). Identifier out-of-line methods keep their
+      // historical claim unchanged.
+      if (llvm::isa<clang::CXXMethodDecl>(func) &&
+          !func->getDeclName().isIdentifier())
+        continue;
       std::string funcName = mlirFuncName(func);
+      // W2.25: a non-admitted free operator (or literal operator) has no
+      // emitted symbol at all — `cFunctionSymbolName` returns the empty
+      // string instead of asserting — and claims nothing.
+      if (funcName.empty())
+        continue;
       ordinaryTuNames.insert(funcName);
-      ordinaryRawTuNames.insert(func->getName());
+      if (func->getDeclName().isIdentifier())
+        ordinaryRawTuNames.insert(func->getName());
       // FR-73: remember which raw spelling claimed the composed name
       // first (try_emplace keeps the first claimant; redeclarations of
       // the same raw name agree), so the underscore-fold guard in
       // importFunction can reject a DIFFERENT spelling folding onto it.
-      ordinaryTuNameOwners.try_emplace(funcName, func->getName().str());
+      // W2.25: an admitted free operator has no raw C spelling; it claims
+      // the owner slot with the EMPTY raw name (the FR-73 guard skips
+      // empty claimants) while the FR-125 qualified-owner record below
+      // carries its honest `operator==` spelling for the cross-spelling
+      // collision wording.
+      ordinaryTuNameOwners.try_emplace(
+          funcName, func->getDeclName().isIdentifier()
+                        ? func->getName().str()
+                        : std::string());
       // FR-125: same first-claimant record, qualified spelling, for the
       // case-fold collision guard in importFunction.
       ordinaryTuQualifiedOwners.try_emplace(funcName,
@@ -840,9 +869,18 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
     // ...` at the call dispatch's non-identifier-callee guard. Constructors
     // and destructors keep their FIXED base names (`new`, `dtor`) and are
     // unaffected.
+    // W2.25 narrowed the omission: an overloaded operator of an ADMITTED
+    // kind (`operatorSymbolBaseName` non-empty — the shared table in
+    // CSymbolNaming.h) imports like any named method under its synthesized
+    // `<Struct>_op_*` symbol. Shape failures inside the admitted kinds
+    // (a reference return, an unsupported body) are NOT screened here:
+    // `importFunction` is the shape oracle and its failure rides the
+    // FR-112 containment fixpoint below, so the method is omitted with its
+    // own located diagnostic and every use stays a located rejection.
     if (!method->getDeclName().isIdentifier() &&
         !llvm::isa<clang::CXXConstructorDecl>(method) &&
-        !llvm::isa<clang::CXXDestructorDecl>(method))
+        !llvm::isa<clang::CXXDestructorDecl>(method) &&
+        emitrust::operatorSymbolBaseName(method).empty())
       return false;
     return !method->isImplicit() && !method->isDeleted() &&
            !method->isDefaulted();
@@ -1027,13 +1065,15 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
         std::string reason = captured.empty()
                                  ? std::string("unsupported declaration")
                                  : captured.front().message;
-        // `getName()` is safe here: a containable, importable method always
-        // has an ordinary identifier `DeclarationName` (non-identifier
-        // members were omitted by `isImportable` without ever importing).
+        // W2.25: a containable method may now be an admitted overloaded
+        // operator, whose `DeclarationName` has no identifier for
+        // `getName()` (it would assert); `getNameAsString()` prints the
+        // identical spelling for named methods and the honest
+        // `operator==` for operators.
         InFlightDiagnostic warning = emitWarning(loc)
                                      << reason << " (omitted: method '"
-                                     << method->getName() << "' of class '"
-                                     << className << "')";
+                                     << method->getNameAsString()
+                                     << "' of class '" << className << "')";
         for (const CapturedDiagnostic &diag : llvm::drop_begin(captured))
           warning.attachNote(diag.loc) << diag.message;
         // One ledger entry per omitted member, carrying the member's OWN
