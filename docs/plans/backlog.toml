@@ -15,6 +15,10 @@
 #         landed    = box checked in design.md (kept only when another item's
 #                     blocked_by references it)
 #         deferred  = deliberately parked, with the reason in design.md
+#         in-flight = claimed by a live session (wave in the main tree or a
+#                     running spike); `plan.py next` skips it -- the
+#                     cross-session double-pick guard. Set it when you
+#                     launch, move to spiked/landed when done.
 # rank:   ascending priority among non-landed items; derived from the Track 5
 #         demand measurement (2026-08-21) and the safe-failure rule (defects
 #         that can miscompile outrank features).
@@ -79,7 +83,7 @@ anchor = "W2.27"
 id = "W2.28"
 rank = 7
 kind = "feature"
-status = "open"
+status = "in-flight"
 size = "L"
 title = "Template residue: NTTPs, partial/explicit specializations, packs"
 summary = "~249 items once FR-115 made them visible; no template wave existed. NTTPs (31) may be a cheap W2.15-style value-suffix extension; spike demand-vs-cost."
@@ -309,7 +313,7 @@ anchor = "FR-82 Interior-member addresses"
 id = "W2.24"
 rank = 18
 kind = "feature"
-status = "spiked"
+status = "in-flight"
 size = "L"
 title = "Exceptions as Result threading (synthesized closed data enum)"
 summary = "GO on image A; image B measured NO-GO (catch_unwind swallows the project's own UB-refinement panics). Demand is nil (0 in RealWorld, 11 items in Track 5) -- stays last."

@@ -27,7 +27,7 @@ import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent.parent
-OPEN_STATUSES = {"open", "spiked", "deferred"}
+OPEN_STATUSES = {"open", "spiked", "deferred", "in-flight"}
 ALL_STATUSES = OPEN_STATUSES | {"landed", "no-go"}
 
 
@@ -52,6 +52,8 @@ def cmd_next(items, args):
     ready = [
         it
         for it in items
+        # in-flight = claimed by a live session's wave/spike; skip so a
+        # second session pulling from `next` cannot double-pick it.
         if it["status"] in ("open", "spiked") and unblocked(it, idx)
     ]
     ready.sort(key=lambda it: it.get("rank", 10**6))
