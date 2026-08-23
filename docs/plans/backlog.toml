@@ -118,12 +118,11 @@ anchor = "FR-119 DEFECT"
 
 [[items]]
 id = "FR-121"
-rank = 3
 kind = "defect"
-status = "open"
+status = "landed"
 size = "S"
-title = "Deferred [i8;N] binding borrowed &mut without mut (E0596)"
-summary = "Re-sweep confirmed exactly as filed: 2x E0596 in 7 of 8 spdlog units, zero elsewhere. Alone unblocks only 2 units -- 5 also carry FR-124; land the pair together."
+title = "Literal backing borrowed &mut while cached const (E0596; not deferred-binding)"
+summary = "Landed 2026-08-22: filed mechanism was wrong -- importer const/mut contradiction on literal backings, not FR-105 machinery. Per-call non-const copy (mutable-slice model); spdlog E0596 12 -> 0, async/cfg fully cargo-clean; FR-124 pair complete."
 blocked_by = ["FR-113"]
 anchor = "FR-121 DEFECT"
 
