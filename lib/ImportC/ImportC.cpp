@@ -6903,6 +6903,16 @@ LogicalResult CImporter::finalizeProject() {
                        moduleBuilder.getUnitAttr());
         continue;
       }
+      // FR-103: under recovery the missing definition costs the items that
+      // still reference the symbol, never the crate — the referencing
+      // functions are stubbed (and a use-less pending entry is forgiven
+      // outright). This arm runs strictly AFTER the defer and requirement
+      // arms above, so those routes are untouched; when containment cannot
+      // promise a well-formed crate (a surviving use outside a defined
+      // function), it declines and the hard rejection below stands.
+      if (recoverFromRejections &&
+          succeeded(containUndefinedExternGlobal(entry.getKey())))
+        continue;
       return emitError(firstSymbolUseLoc(entry.getKey(), entry.getValue().loc))
              << "unsupported: extern global variable '" << entry.getKey()
              << "' is referenced but not defined in any translation unit";
@@ -6987,6 +6997,68 @@ LogicalResult CImporter::finalizeProject() {
              << "unsupported: function '" << func.getSymName()
              << "' is referenced but not defined in any translation unit";
     }
+  return success();
+}
+
+LogicalResult CImporter::containUndefinedExternGlobal(llvm::StringRef symbol) {
+  // Attribute every surviving use to its top-level item FIRST, before any
+  // mutation: a single non-containable owner means the whole entry keeps
+  // the caller's hard rejection, and a half-stubbed module must not be
+  // left behind it.
+  auto uses = SymbolTable::getSymbolUses(
+      StringAttr::get(module.getContext(), symbol), module.getOperation());
+  llvm::SetVector<Operation *> owners;
+  llvm::DenseMap<Operation *, Location> firstUse;
+  if (uses)
+    for (SymbolTable::SymbolUse use : *uses) {
+      Operation *owner = use.getUser();
+      while (owner->getParentOp() != module.getOperation())
+        owner = owner->getParentOp();
+      // Only a DEFINED function can be contained — its body is replaced by
+      // the same stub the per-item recovery emits, so its own callers keep
+      // a resolvable, honestly-failing symbol. A use owned by anything
+      // else (a global's initializer region, an external declaration's
+      // attribute) has no stub shape; dropping the owner instead could
+      // dangle the owner's readers, so decline and let the hard rejection
+      // stand (rejection is the safe failure direction).
+      auto funcOwner = llvm::dyn_cast<func::FuncOp>(owner);
+      if (!funcOwner || funcOwner.isExternal())
+        return failure();
+      if (owners.insert(owner))
+        firstUse.try_emplace(owner, use.getUser()->getLoc());
+    }
+  for (Operation *owner : owners) {
+    auto funcOp = llvm::cast<func::FuncOp>(owner);
+    Location useLoc = firstUse.at(owner);
+    // The reason is the exact strict-mode wording: a recovered build and a
+    // hard-failing build must report the same string (the ledger contract),
+    // and `classifyBlocker` keys the undefined-extern-global tag off it.
+    std::string reason =
+        ("unsupported: extern global variable '" + symbol +
+         "' is referenced but not defined in any translation unit")
+            .str();
+    // Replace the body with the standard recovery stub. The blocks must go
+    // first: `emitRecoveryStub` builds a fresh entry block, and unlike the
+    // mid-import call sites this function already has one.
+    funcOp.getBody().dropAllReferences();
+    funcOp.getBody().getBlocks().clear();
+    recoveryStubReason = reason;
+    LogicalResult stub = emitRecoveryStub(funcOp, useLoc);
+    recoveryStubReason.clear();
+    if (failed(stub))
+      return failure();
+    if (rejectionLedger)
+      rejectionLedger->record(emitrust::RejectedItem{
+          funcOp.getSymName().str(), useLoc, reason,
+          emitrust::classifyBlocker(reason, useLoc), /*stubbed=*/true,
+          /*ownerSymbol=*/std::string(),
+          /*cascadeSourceSymbol=*/std::string()});
+    // Re-reported as a WARNING, exactly like the per-item recovery path:
+    // the item's body is gone, but the compile as a whole succeeds.
+    emitWarning(useLoc) << reason
+                        << " (recovered: emitted an unimplemented!() stub "
+                           "with the mapped signature)";
+  }
   return success();
 }
 

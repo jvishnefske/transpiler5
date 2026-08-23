@@ -126,6 +126,12 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
     // global initializer, typically) carries the blocker.
     {llvm::StringLiteral("address of undefined function"),
      llvm::StringLiteral("fnptr-undefined-target")},
+    // FR-103: an extern global no TU defines costs each item still
+    // referencing it at finalize (stubbed with the finalize wording); the
+    // needle also catches the single-TU "without a definition" spelling,
+    // which is the same front. Previously tabulated [other].
+    {llvm::StringLiteral("extern global variable"),
+     llvm::StringLiteral("undefined-extern-global")},
     // FR-113 admitted scoped enums; the RESIDUAL enum-definition gates
     // (keyword-named enums and enumerators, values outside i32, an empty
     // enum, a cross-TU shape conflict) previously tabulated [other]. The

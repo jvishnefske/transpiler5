@@ -328,6 +328,10 @@ _BLOCKER_SUBSTRINGS = [
     # FR-77: a fn-ptr constant naming a function no TU defines is refused at
     # the address-taking site, so the containing item carries the blocker.
     ("address of undefined function", "fnptr-undefined-target"),
+    # FR-103: an extern global no TU defines costs each referencing item
+    # (stubbed at finalize); also catches the single-TU "without a
+    # definition" spelling. Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("extern global variable", "undefined-extern-global"),
     # FR-113 admitted scoped enums; the residual enum-definition gates
     # (keyword names/enumerators, values outside i32, empty, cross-TU shape
     # conflict) previously tabulated [other].
