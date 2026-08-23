@@ -523,6 +523,73 @@ static inline std::string overloadArgTypeCode(clang::QualType type) {
   return templateArgTypeCode(type);
 }
 
+/// W2.25: the synthesized identifier base name of an ADMITTED overloaded
+/// operator kind, or the empty StringRef for every kind outside the wave's
+/// subset. The table is the single source of truth for which operator
+/// KINDS may take a symbol at all — the importer's def gates, the member
+/// omission screen, the FR-40 item graph and the FR-41 coloring probe all
+/// consult it through `operatorSymbolBaseName` below, so admission can
+/// never diverge between them. Deliberately absent, each with its own
+/// fence elsewhere: `operator=` (W2.23's implicit-copy-assign special case
+/// interplay), `++`/`--` (the canonical `S r = *this` body has no image),
+/// `<<`/`>>` (stream territory), compound assignments and `->`/`&`/`,`
+/// (unspiked). A kind outside this table keeps its historical located
+/// rejection ("unsupported: overloaded operator" at the def, "omitted from
+/// class" at a member call).
+static inline llvm::StringRef
+overloadedOperatorSymbolBaseName(clang::OverloadedOperatorKind kind) {
+  switch (kind) {
+  case clang::OO_EqualEqual:
+    return "op_eq";
+  case clang::OO_ExclaimEqual:
+    return "op_ne";
+  case clang::OO_Less:
+    return "op_lt";
+  case clang::OO_LessEqual:
+    return "op_le";
+  case clang::OO_Greater:
+    return "op_gt";
+  case clang::OO_GreaterEqual:
+    return "op_ge";
+  case clang::OO_Plus:
+    return "op_add";
+  case clang::OO_Minus:
+    return "op_sub";
+  case clang::OO_Star:
+    return "op_mul";
+  case clang::OO_Slash:
+    return "op_div";
+  case clang::OO_Percent:
+    return "op_rem";
+  case clang::OO_Exclaim:
+    return "op_not";
+  case clang::OO_Call:
+    return "op_call";
+  case clang::OO_Subscript:
+    return "op_index";
+  default:
+    return llvm::StringRef();
+  }
+}
+
+/// W2.25: the synthesized base name `func` emits under, when `func` is an
+/// overloaded operator of an admitted kind — empty for every other
+/// DeclarationName shape. Literal operators (`operator""_kb`) are a
+/// different DeclarationName kind and return empty; an operator TEMPLATE
+/// (pattern or specialization) is excluded the way `overloadParamSuffix`
+/// excludes specializations — the W2.15 suffix rules were never spiked
+/// against synthesized spellings, so templates keep FR-119's rejection.
+static inline std::string
+operatorSymbolBaseName(const clang::FunctionDecl *func) {
+  if (func->getDeclName().getNameKind() !=
+      clang::DeclarationName::CXXOperatorName)
+    return std::string();
+  if (func->getDescribedFunctionTemplate() ||
+      func->getTemplateSpecializationArgs())
+    return std::string();
+  return overloadedOperatorSymbolBaseName(func->getOverloadedOperator()).str();
+}
+
 /// FR-114: the size of the same-TU overload set `func` belongs to — the
 /// number of same-named, non-template FunctionDecls its (transparent-
 /// context-skipping) declaration context declares. Redeclarations
@@ -538,7 +605,15 @@ static inline std::string overloadArgTypeCode(clang::QualType type) {
 /// `importFunction`'s collision wording shares this free-function half of
 /// the overload-set test.
 static inline unsigned overloadSetSize(const clang::FunctionDecl *func) {
-  if (!func->getDeclName().isIdentifier())
+  // W2.25 lifted the blanket non-identifier exclusion here: an ADMITTED
+  // free operator counts its same-DeclarationName siblings exactly like an
+  // identifier function (three free `operator*` overloads are the measured
+  // FR-119 raytracing shape, and without the count they all map to one
+  // `op_mul`). A user function literally named `op_eq` is a DIFFERENT
+  // DeclarationName and never joins the set — the cross-spelling collision
+  // rejects located through the FR-125 qualified-owner guard instead.
+  if (!func->getDeclName().isIdentifier() &&
+      operatorSymbolBaseName(func).empty())
     return 1;
   const clang::DeclContext *context =
       func->getDeclContext()->getRedeclContext();
@@ -575,8 +650,11 @@ static inline unsigned overloadSetSize(const clang::FunctionDecl *func) {
 ///  - a template specialization is excluded (its `templateArgSuffix`
 ///    already separates instantiations; the pattern's name is claimed by
 ///    the hand-written/instantiation collision rules, W2.15);
-///  - a non-identifier name (a free `operator+`) is excluded — those are
-///    FR-119 territory and are rejected before naming matters;
+///  - a non-identifier name is excluded through `overloadSetSize` UNLESS
+///    it is a W2.25-admitted free operator (`operatorSymbolBaseName`
+///    non-empty), which suffixes exactly like an identifier overload set;
+///    every other shape (literal operators, non-admitted kinds) stays
+///    FR-119 territory and is rejected before naming matters;
 ///  - a method never arrives here (see `overloadSetSize`), so the member
 ///    scheme's frozen W2.2 codes are untouched.
 static inline std::string
@@ -634,11 +712,27 @@ overloadParamSuffix(const clang::FunctionDecl *func) {
 /// \returns the emitted module symbol name.
 static inline std::string cFunctionSymbolName(const clang::FunctionDecl *func,
                                               llvm::StringRef tuTag) {
-  llvm::StringRef cName = func->getName();
-  if (cName == "main")
-    return "c_main";
+  // W2.25: an admitted overloaded operator has no identifier spelling at
+  // all — its base name is SYNTHESIZED from the operator kind (`operator==`
+  // -> `op_eq`) and then composes with the very same namespace prefix,
+  // FR-114 overload suffix and linkage tag an identifier function takes. A
+  // non-identifier name OUTSIDE the admitted table returns the EMPTY string
+  // (never asserting in `getName()`), which every consumer treats as "this
+  // declaration emits no symbol": the importer rejects it located (FR-119)
+  // and the FR-40 graph/coloring skip it.
+  std::string mangledBase;
+  if (func->getDeclName().isIdentifier()) {
+    llvm::StringRef cName = func->getName();
+    if (cName == "main")
+      return "c_main";
+    mangledBase = mangleMemberName(cName);
+  } else {
+    mangledBase = operatorSymbolBaseName(func);
+    if (mangledBase.empty())
+      return std::string();
+  }
   std::string base = joinSymbolPrefix(namespacePrefix(func->getDeclContext()),
-                                      mangleMemberName(cName));
+                                      mangledBase);
   //  - FR-114: a member of a free-function OVERLOAD SET appends one type
   //    code per parameter (`overloadParamSuffix`, empty for every sole
   //    owner of a name), so `g(int)`/`g(double)` emit `g_i32`/`g_d`

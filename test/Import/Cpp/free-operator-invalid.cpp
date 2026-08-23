@@ -28,16 +28,25 @@
 // stl-map-invalid.cpp's free `operator<`, keeps skipping silently BY
 // DESIGN), rides the existing `cxx-operator-overload` ledger tag, and
 // covers literal operators through the same DeclarationName test.
+//
+// W2.25 moved the pin FORWARD: free operators of the ADMITTED by-value
+// kinds (+, -, *, /, ==, ... — the table in CSymbolNaming.h) now import
+// under synthesized identifier spellings (test/Import/Cpp/
+// operator-overload.cpp pins the positive half), so every shape in this
+// file uses a kind OUTSIDE the table (`<<`, `>>`, a literal operator) —
+// the guard itself, its recovery drop, and its ledger tag are unchanged
+// for everything the wave did not admit.
 
 //--- strict.cpp
 // The 2-line silent shape: exactly ONE free operator over an admitted
 // class used to emit `func.func @<<INVALID EMPTY SYMBOL>>` and exit 0.
-// Now: located error at the declaration, no module printed.
+// Now: located error at the declaration, no module printed. (`<<` is a
+// non-admitted kind — W2.25 flipped the original `operator+` positive.)
 // STRICT: strict.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: overloaded operator
 struct A {
   int v;
 };
-int operator+(A a, int b) { return a.v + b; }
+int operator<<(A a, int b) { return a.v << b; }
 
 //--- twoops.cpp
 // TWO free operators used to collide in the FR-108 cross-TU guard and leak
@@ -48,8 +57,8 @@ int operator+(A a, int b) { return a.v + b; }
 struct A {
   int v;
 };
-int operator+(A a, int b) { return a.v + b; }
-int operator-(A a, int b) { return a.v - b; }
+int operator<<(A a, int b) { return a.v << b; }
+int operator>>(A a, int b) { return a.v >> b; }
 
 //--- litop.cpp
 // A literal operator (operator""_kb) is the same non-identifier
@@ -69,12 +78,12 @@ int main(void) { return (int)2_kb; }
 // REC: fn use_
 // REC: unimplemented!("unsupported callee")
 // REC: fn c_main
-// RECDIAG: dropped 'operator+' [cxx-operator-overload] unsupported: overloaded operator
+// RECDIAG: dropped 'operator<<' [cxx-operator-overload] unsupported: overloaded operator
 struct A {
   int v;
 };
-int operator+(A a, int b) { return a.v + b; }
-int use(A a) { return a + 5; }
+int operator<<(A a, int b) { return a.v << b; }
+int use(A a) { return a << 5; }
 int main(void) {
   A a;
   a.v = 1;

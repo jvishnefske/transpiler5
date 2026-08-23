@@ -2287,6 +2287,22 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
           methodCallee->isCopyAssignmentOperator())
         return emitError(loc)
                << "unsupported: implicit copy assignment in value position";
+      // W2.25: a member operator of an ADMITTED kind whose method actually
+      // IMPORTED (its `<Struct>_op_*` func exists — the class walk may
+      // still have omitted it for a shape failure, e.g. a reference
+      // return) lowers through the method-call machinery with argument 0
+      // as the receiver. The lookup gate keeps every OMITTED operator on
+      // the honest FR-112 wording below, so still-fenced shapes never
+      // silently change their diagnostic.
+      if (const auto *memberOpCall =
+              llvm::dyn_cast<clang::CXXOperatorCallExpr>(call);
+          memberOpCall && !methodCallee->isImplicit() &&
+          memberOpCall->getNumArgs() >= 1 &&
+          !emitrust::operatorSymbolBaseName(methodCallee).empty())
+        if (func::FuncOp target =
+                functions.lookup(cxxMethodMangledName(methodCallee)))
+          return emitCXXOperatorMemberCall(memberOpCall, methodCallee,
+                                           target);
       const clang::RecordDecl *ownerDefinition =
           methodCallee->getParent()->getDefinition();
       std::string ownerName =
@@ -2298,7 +2314,22 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
                                    : llvm::StringRef(ownerName))
              << "'";
     }
-    return emitError(loc) << "unsupported callee";
+    // W2.25: an admitted FREE operator resolves to its synthesized
+    // FR-114-suffixed symbol and lowers through the ordinary free-function
+    // dispatch below — the same borrow-argument machinery, the same
+    // reconciliation, byte-identical to the renamed-twin differential the
+    // wave's spike measured. std-namespace and system-header operators
+    // stay out (their types are STL territory and their defs never
+    // import), as do lambdas' `operator()` and every member operator
+    // (handled or rejected above), so nothing changes its wording here
+    // but the admitted free shapes.
+    if (!llvm::isa<clang::CXXMethodDecl>(callee) &&
+        !callee->isInStdNamespace() && !isSystemHeaderDecl(callee) &&
+        !emitrust::operatorSymbolBaseName(callee).empty()) {
+      // Falls through to the ordinary dispatch below.
+    } else {
+      return emitError(loc) << "unsupported callee";
+    }
   }
   // W2.14: the std::variant FREE-function vocabulary — the first
   // std-namespace free-function interception in this dispatch (members
@@ -2348,23 +2379,30 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
                  << "unsupported: a moved-from std::unique_ptr is null and "
                     "testable, but Rust cannot read a moved-from binding";
   }
+  // W2.25: an admitted free operator reaches this dispatch with a
+  // non-identifier DeclarationName, where `getName()` would assert; every
+  // by-name interception below reads this guarded spelling instead (empty
+  // for an operator, so none of them can fire on one).
+  llvm::StringRef calleeName = callee->getDeclName().isIdentifier()
+                                   ? callee->getName()
+                                   : llvm::StringRef();
   // The hosted (definition-less) printf lowering is statement-position
   // only; a project-supplied printf definition is an ordinary imported
   // function whose result is an ordinary value in every position.
-  if (callee->getName() == "printf" && !callee->getDefinition())
+  if (calleeName == "printf" && !callee->getDefinition())
     return emitError(loc) << "unsupported: printf return value must be unused";
   // Statement-position puts/putchar are lowered by name (emitCallStmt);
   // their int result has no representation there, so a value use of a
   // definition-less puts/putchar is rejected.
-  if ((callee->getName() == "puts" || callee->getName() == "putchar") &&
+  if ((calleeName == "puts" || calleeName == "putchar") &&
       !callee->getDefinition())
-    return emitError(loc) << "unsupported: " << callee->getName()
+    return emitError(loc) << "unsupported: " << calleeName
                           << " return value must be unused";
   // A definition-less strlen is lowered by name like printf/puts: its
   // supported argument shape is a pointer into a string-literal region,
   // rendered through the `__emitrust_strlen` helper. A user-defined strlen
   // is an ordinary call.
-  if (callee->getName() == "strlen" && !callee->getDefinition())
+  if (calleeName == "strlen" && !callee->getDefinition())
     return emitStrlenCall(call);
   // Hosted <string.h> comparisons (design.md C99-48, CTS-L1) are lowered
   // by name, like strlen; their int result is an ordinary value. The
@@ -2373,7 +2411,7 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   // strchr/strrchr result is consumed by the printf %s and null-comparison
   // interceptions before reaching this point.
   if (!callee->getDefinition()) {
-    llvm::StringRef name = callee->getName();
+    llvm::StringRef name = calleeName;
     // A definition-less sprintf is lowered by name (design.md CTS-P9,
     // 00186): the literal format translates through the shared printf
     // grammar into a `format!` String and the `__emitrust_sprintf`
@@ -3032,9 +3070,17 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   // call to the empty-named method); withdrawing it is what buys the class
   // importing at all, and it is pinned as a deliberate frontier move in
   // test/Import/Cpp/cpp-conversion-function-invalid.cpp.
+  // W2.25: the explicit member spelling of an ADMITTED, actually-imported
+  // operator (`s.operator==(o)`) resolves through the same synthesized
+  // `<Struct>_op_*` symbol the operator syntax uses, so it falls through
+  // to the ordinary member-call lowering below. The imported-func gate
+  // keeps every OMITTED operator (non-admitted kind, or an admitted kind
+  // whose shape failed, e.g. a reference return) on FR-117's wording.
   if (!method->getDeclName().isIdentifier() &&
       !llvm::isa<clang::CXXConstructorDecl>(method) &&
-      !llvm::isa<clang::CXXDestructorDecl>(method))
+      !llvm::isa<clang::CXXDestructorDecl>(method) &&
+      (emitrust::operatorSymbolBaseName(method).empty() ||
+       !functions.lookup(cxxMethodMangledName(method))))
     return emitError(loc) << (llvm::isa<clang::CXXConversionDecl>(method)
                                   ? "unsupported: conversion function"
                                   : "unsupported: overloaded operator");
@@ -3282,6 +3328,125 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
     if (value.getType() != targetType.getInput(index))
       return emitError(loc) << "unsupported: call argument type mismatch";
 
+  auto callOp = builder.create<func::CallOp>(loc, target, arguments);
+  callOp->setAttr(emitrust::kMethodCallAttrName, builder.getUnitAttr());
+  if (callOp->getNumResults() == 0)
+    return Value();
+  return callOp->getResult(0);
+}
+
+FailureOr<Value> CImporter::emitCXXOperatorMemberCall(
+    const clang::CXXOperatorCallExpr *call, const clang::CXXMethodDecl *method,
+    func::FuncOp target) {
+  Location loc = translateLoc(call->getBeginLoc());
+  FunctionType targetType = target.getFunctionType();
+  // A member operator's `CXXOperatorCallExpr` carries the receiver as
+  // argument 0 and the operator's parameters after it, which is exactly
+  // the imported signature's shape (receiver reference first).
+  if (call->getNumArgs() != targetType.getNumInputs())
+    return emitError(loc) << "unsupported: call argument count mismatch";
+  // W2.18 mirror: the receiver argument of an INHERITED operator wears an
+  // implicit derived-to-base conversion naming the base subobject; peel
+  // the hops and replay them as explicit `member ["base"]` projections so
+  // the base method never borrows the DERIVED place.
+  llvm::SmallVector<clang::QualType, 2> baseHops;
+  const clang::Expr *receiverExpr =
+      peelDerivedToBaseCasts(call->getArg(0), baseHops);
+  for (clang::QualType hop : baseHops) {
+    const clang::CXXRecordDecl *hopRecord = hop->getAsCXXRecordDecl();
+    if (hopRecord && hopRecord->hasDefinition() && hopRecord->isEmpty())
+      return emitError(loc)
+             << "unsupported: inherited member of an empty base class";
+  }
+  const clang::Expr *receiverStripped = receiverExpr->IgnoreParenImpCasts();
+  // W2.19a mirror: operator syntax normally spells a VALUE receiver, where
+  // the static bind is exact C++ semantics, but a dereference spelling
+  // (`*p == x`) still names a pointee whose dynamic type is an assumption,
+  // and no devirtualization gate runs on this path — a virtual operator
+  // through any pointer-shaped receiver keeps the fence.
+  if (method->isVirtual()) {
+    const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(receiverStripped);
+    if ((unary && unary->getOpcode() == clang::UO_Deref) ||
+        isDataPointer(receiverStripped->getType()))
+      return emitError(loc)
+             << "unsupported: virtual method call through a pointer";
+  }
+  FailureOr<Value> receiver = emitLValue(receiverStripped);
+  if (failed(receiver))
+    return failure();
+  auto receiverLValueType =
+      llvm::dyn_cast<emitrust::LValueType>((*receiver).getType());
+  if (!receiverLValueType ||
+      !llvm::isa<emitrust::StructType>(receiverLValueType.getValueType()))
+    return emitError(loc)
+           << "unsupported: member call receiver is not a struct place";
+  if (!baseHops.empty()) {
+    FailureOr<Value> baseReceiver = projectBaseHops(*receiver, baseHops, loc);
+    if (failed(baseReceiver))
+      return failure();
+    receiver = baseReceiver;
+  }
+  Value addrOf = builder
+                     .create<emitrust::AddrOfOp>(loc, targetType.getInput(0),
+                                                 *receiver,
+                                                 /*is_mut=*/!method->isConst())
+                     .getResult();
+  // FR-48 mirror: the receiver is one of the borrows the call holds at
+  // once, so `a.op(a)` shapes (`a == a` here) are checked exactly like
+  // `a.m(a)` — two borrows of one object are sound only if both are
+  // shared.
+  const clang::Expr *receiverIdExpr = call->getArg(0)->IgnoreParenImpCasts();
+  const clang::VarDecl *receiverRoot = placeExprRoot(receiverIdExpr);
+  bool receiverIsThis = rootsAtCxxThis(receiverIdExpr);
+  bool receiverIsMut = !method->isConst();
+  SmallVector<Value> arguments(targetType.getNumInputs(), Value());
+  arguments[0] = addrOf;
+  SmallVector<std::pair<const clang::VarDecl *, bool>, 4> heldBorrows;
+  bool borrowedThis = receiverIsThis;
+  bool borrowedThisIsMut = receiverIsThis && receiverIsMut;
+  if (receiverRoot)
+    heldBorrows.push_back({receiverRoot, receiverIsMut});
+  for (unsigned index = 1; index < call->getNumArgs(); ++index) {
+    const clang::Expr *argExpr = call->getArg(index);
+    Type input = targetType.getInput(index);
+    if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(input)) {
+      bool argIsMut = llvm::isa<emitrust::MutRefType>(input);
+      const clang::VarDecl *argRoot = placeExprRoot(argExpr);
+      bool argIsThis = rootsAtCxxThis(argExpr);
+      bool collides =
+          argIsThis && borrowedThis && (argIsMut || borrowedThisIsMut);
+      if (!collides && argRoot)
+        for (auto [heldRoot, heldIsMut] : heldBorrows)
+          if (heldRoot == argRoot && (argIsMut || heldIsMut)) {
+            collides = true;
+            break;
+          }
+      if (collides)
+        return emitError(loc)
+               << "unsupported: aliasing mutable reference argument and "
+                  "method receiver";
+      if (argRoot)
+        heldBorrows.push_back({argRoot, argIsMut});
+      if (argIsThis) {
+        borrowedThis = true;
+        borrowedThisIsMut = borrowedThisIsMut || argIsMut;
+      }
+      const clang::VarDecl *unusedRoot = nullptr;
+      FailureOr<Value> reference =
+          emitBorrowArgument(loc, argExpr, input, unusedRoot);
+      if (failed(reference))
+        return failure();
+      arguments[index] = *reference;
+      continue;
+    }
+    FailureOr<Value> value = emitRValue(argExpr);
+    if (failed(value))
+      return failure();
+    arguments[index] = *value;
+  }
+  for (auto [index, value] : llvm::enumerate(arguments))
+    if (value.getType() != targetType.getInput(index))
+      return emitError(loc) << "unsupported: call argument type mismatch";
   auto callOp = builder.create<func::CallOp>(loc, target, arguments);
   callOp->setAttr(emitrust::kMethodCallAttrName, builder.getUnitAttr());
   if (callOp->getNumResults() == 0)

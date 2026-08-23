@@ -201,12 +201,11 @@ anchor = "FR-115 DEFECT"
 
 [[items]]
 id = "W2.25"
-rank = 10
 kind = "feature"
-status = "in-flight"
+status = "landed"
 size = "L"
-title = "Operator overloading"
-summary = "Re-sweep residue: 183 (~47 free operators admissible via FR-114 machinery, 136 member out-of-line needing real semantics). Of 1,459 original operator locations only THREE are gone -- the rest re-rooted to copy-move behind them."
+title = "Operator overloading: free + member by-value flat-call subset"
+summary = "Landed 2026-08-23: free by-value ops via table-driven FR-119 narrowing + FR-114 suffixes; member <Struct>_op_* flat calls; W2.23 compounding byte-confirmed. operator= (70), ref-return (110), ++/--, streams stay located. ~106/243 addressable; cross-spelling collision guards both ways."
 blocked_by = ["FR-112"]
 anchor = "W2.25"
 

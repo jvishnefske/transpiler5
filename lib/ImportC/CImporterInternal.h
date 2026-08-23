@@ -3022,6 +3022,17 @@ private:
   /// a promoted owner place.
   FailureOr<Value> emitCXXMemberCall(const clang::CXXMemberCallExpr *call);
 
+  /// W2.25: imports an operator-syntax call (`a == b`, `f(x)`, `v[i]`)
+  /// whose callee is a MEMBER operator of an admitted kind that actually
+  /// imported under its synthesized `<Struct>_op_*` symbol (`target`).
+  /// Argument 0 of the `CXXOperatorCallExpr` is the receiver; the value-
+  /// receiver subset of `emitCXXMemberCall`'s lowering applies (W2.18 base
+  /// hops, W2.19a virtual-through-pointer fence, FR-48 borrow aliasing).
+  FailureOr<Value>
+  emitCXXOperatorMemberCall(const clang::CXXOperatorCallExpr *call,
+                            const clang::CXXMethodDecl *method,
+                            func::FuncOp target);
+
   /// W2.3 STL recognition: whether `type` is a recognized STL opaque type
   /// (an `!emitrust.opaque` whose value is exactly "String" or begins with
   /// "Vec<" or, since W2.11, "Option<") — the set `mapStdLibraryType` ever

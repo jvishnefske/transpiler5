@@ -13154,7 +13154,48 @@ whole-program demand.
   operators themselves; 1625 are CASCADE from class poisoning, so
   **FR-112 must land first** -- it converts three quarters of this
   front into candidates without translating a single operator, and the
-  residue is what this wave is actually sized against. **NOT SPIKED.**
+  residue is what this wave is actually sized against.
+  LANDED 2026-08-23 (spike GO-WITH-CONSTRAINTS via renamed-twin
+  differentials: operators renamed to their intended synthesized
+  identifiers, TODAY's importer emitted the crate, stdout byte-diffed
+  against the clang++ native of the OPERATOR spelling -- zero new
+  ops, zero worktree builds needed to prove the target IR). ADMITTED:
+  FREE by-value operators (the FR-119 gate narrowed to a table-driven
+  admission; the FR-114 suffixes split overload triples like
+  op_mul_rv_i32/op_mul_i32_rv/op_mul_rv_rv -- FR-119's recorded
+  raytracing blocker measured solved by existing machinery; chained
+  free ops work through ref-arg temporaries) and MEMBER by-value
+  flat-call operators (==,!=,<,<=,>,>=,!,(),by-value [] --
+  synthesized <Struct>_op_* via cxxMethodBaseName, dispatched by the
+  FR-48-mirrored emitCXXOperatorMemberCall; out-of-line defs, *this
+  bodies, explicit s.operator==(o) spelling, member overload sets).
+  The W2.23 compounding claim CONFIRMED byte-identical (copy-ctor +
+  operator in one class). FENCED this wave, every one located and
+  pinned in operator-overload-invalid.cpp's ten sections: operator=
+  (70 of the 183 -- the W2.23 implicit-copy-assign interplay),
+  ref/ptr-return members (104+6, riding the existing reference-return
+  omission), ++/-- (the *this-copy fence), streams, compound assigns,
+  operator templates, UDLs, chained MEMBER ops, const/non-const
+  same-suffix pairs (the overload-set guard, with the omitted-side
+  call failing LOUDLY at the mut-marker verifier -- measured, no
+  silent-wrong-body channel), std/system operators. NEW cross-
+  spelling collision guards both ways (user op_eq vs synthesized
+  operator==; the FR-125 wording family), both colliders omitted.
+  SUFFIX-NUMBERING byte-identity risk from the overload counter
+  pinned frozen (class M golden). Graph/coloring un-skip in lockstep
+  (the W2.26 re-sync precedent). Addressable measured ~106 of 243
+  operator rows (44%) all-kinds, 0 function-only (the corpus's
+  operator demand is all off-graph/kind-less rows); Cpp17Suite
+  ratchet 0 flips -- this wave is corpus-facing, not frontier-facing.
+  Rust-trait mapping (impl PartialEq/Index/Add) stays recorded future
+  work; synthesized plain methods only, byte-diff decided
+  correctness. Gates: full meson suite 800/800 (fast 565 + EndToEnd
+  235, three new byte-diff tests at two argv variants each).
+  (test/Import/Cpp/operator-overload.cpp,
+  operator-overload-invalid.cpp; test/EndToEnd/cpp-operator-free.cpp,
+  cpp-operator-member.cpp, cpp-operator-copy-ctor.cpp; flips forward
+  in free-operator-invalid.cpp, methods-invalid.cpp,
+  cpp-contained-member-invalid.cpp, free-operator-graph.cpp)
 
 
 - [x] W2.26 POLYMORPHIC RAII -- a class with a virtual destructor, or

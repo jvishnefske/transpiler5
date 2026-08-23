@@ -129,11 +129,17 @@ int use(void) {
 // its siblings intact -- cpp-contained-member.cpp), and the spelled use
 // rejects with a wording that names the omitted member and its class,
 // rather than W2.2's class-level rejection or the pre-W2.2 bare
-// "unsupported callee".
-// OPERATOR: operator.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to overloaded operator 'operator+' omitted from class 'Vec2'
+// "unsupported callee". W2.25 moved the pin forward again: `operator+`
+// (by value) now IMPORTS (test/Import/Cpp/operator-overload.cpp), so the
+// omission channel is pinned through `operator+=`, a kind outside the
+// wave's admitted table.
+// OPERATOR: operator.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to overloaded operator 'operator+=' omitted from class 'Vec2'
 struct Vec2 {
   int x;
-  int operator+(const Vec2 &o) const { return x + o.x; }
+  Vec2 &operator+=(const Vec2 &o) {
+    x = x + o.x;
+    return *this;
+  }
 };
 
 int use(void) {
@@ -141,7 +147,8 @@ int use(void) {
   a.x = 1;
   Vec2 b;
   b.x = 2;
-  return a + b;
+  a += b;
+  return a.x;
 }
 
 //--- refmember.cpp
