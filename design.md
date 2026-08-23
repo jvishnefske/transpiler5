@@ -7958,6 +7958,67 @@ piece and becomes FR-45.
   struct_def and c_main with zero diagnostics), so any change to its
   behavior fails a test and must come through this FR. **NOT SPIKED.**
 
+- [ ] FR-124 DEFECT (found by the 2026-08-22 re-sweep, filed-ready
+  with a 10-line repro): **derive(Copy) emitted over a non-Copy base
+  field -- exit 0, unbuildable crate, 60 E0204 errors across 8
+  corpus crates** (raytracing main.cc x3, five spdlog units -- 53 in
+  spdlog.cpp alone). The emission is internally inconsistent: the
+  BASE is admitted non-Copy (`#[derive(Clone, Default)]` -- virtual
+  dtor, W2.26's suppression working), but the DERIVED still gets
+  `derive(Clone, Copy, Default)`. Likely a W2.19/W2.26 interaction:
+  the derived class's Copy suppression checks its own droppiness but
+  not its base FIELD's Copy-ness once polymorphic (non-droppy) bases
+  became admissible. THE CHANNEL ARMED AS ADMISSION WIDENED -- exactly
+  FR-119's recorded pattern. Repro:
+  scratchpad/cxx-demand-2/repro-e2004.cpp (virtual-dtor base, derived
+  with a double, one by-value use). Loud at cargo, silent at exit --
+  violates fail-loudly. **NOT SPIKED** (repro measured; fix not).
+
+- [ ] FR-125 DEFECT (found by the 2026-08-22 re-sweep):
+  **CamelCase namespaces break the non_snake_case deny -- 33 errors
+  across 9 crates** (2048.cpp's `namespace Game`, jsoncpp's
+  `namespace Json`): the `ns_<Namespace>` symbol prefix preserves
+  source capitalization (`ns_Game_score`) while the emitted crate
+  denies non_snake_case. Exit 0, unbuildable. 5-line repro:
+  scratchpad/cxx-demand-2/repro-snake.cpp. THE FIX IS A DESIGN
+  DECISION, not a casual rename: emitted symbol names are the
+  CSymbolNaming byte-identity contract shared with the FR-40 item
+  graph, so lowercasing the prefix shifts every namespaced golden.
+  **NOT SPIKED.**
+
+- [ ] FR-126 ATTRIBUTION FOLLOW-ON (the ~28%): two channels FR-115
+  deliberately left, now sized by the re-sweep. (1)
+  `rejected-type-cascade` 1,434 items whose chains are ALL length 1
+  with empty attributed_via -- the rejected TYPE's own root is never
+  computed, so the cascade stops one hop short of the answer; the fix
+  is recording the type's rejection root at the importRecord/importEnum
+  sites and threading it through the cascade wording. (2)
+  `unreached-by-import` 1,234 -- the honest c2 tag; per-instantiation
+  attribution for the template one-decl-to-many residue (FR-115's c1
+  landed for records reached by import; the never-visited
+  specializations still self-root). Together ~28% of measured demand
+  is one attribution hop from actionable. Also owns the question of
+  jsoncpp's 505-item destructor residue -- likely W2.17-gate positions
+  visible only after (1) computes the real roots. **NOT SPIKED.**
+
+- [ ] FR-124 DEFECT (filed 2026-08-22 by the post-FR-115 full 11-repo
+  re-sweep): template-heavy code self-roots as `unreached-by-import` --
+  honest, but not actionable. On the 110-unit re-sweep the tag is the
+  FUNCTION-ONLY #1 at 448 of 1494 blocked function items (30.0%),
+  concentrated 63% in spdlog (283) + pugixml (82) + cxxopts (60): a
+  used template's member functions live on instantiation decls the
+  import never visits, so FR-115 tags them unreached instead of
+  attributing the instantiation's actual blocker. Until this lands,
+  the fn-only ranking is 30% blind and the W2.23-vs-W2.26 fine
+  ordering cannot be trusted (their measured gap -- copy-move 121 vs
+  drop-family 168 -- is inside this residual). ACCEPTANCE: a driver
+  lit test pinning that an instantiated class template's method items
+  carry a real root (not unreached-by-import) in
+  emitrust-progress.json; on the external re-probe the fn-only
+  unreached-by-import share drops materially (record the honest
+  number), with the residue being genuinely-unreferenced decls.
+  **NOT SPIKED.**
+
 - [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
   the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and
   the increment came out SMALLER than either shape this entry
@@ -12837,6 +12898,30 @@ whole-program demand.
   test/Project/coloring-cpp-class-gates.cpp)
 
 
+- [ ] W2.27 (NEW WAVE, from the 2026-08-22 re-sweep) Droppy globals:
+  `global or static object of a class with a destructor` is **#4 in
+  the re-measured demand table at 936 items and is on no wave** --
+  though 930 of 936 are pugixml's TEST-runner globals, so
+  equal-weighted it is 1.9%: one uniform construct, one wording,
+  heavily concentrated. The C++ image question is real (a global's
+  destructor runs at exit -- Rust statics never drop; the honest
+  images are libc::atexit registration, an explicit end-of-main drop
+  scope for provably-main-only globals, or continued rejection with
+  the count recorded). W2.17 gated this deliberately; the re-sweep
+  says it is the biggest single uncovered construct by raw count.
+  **NOT SPIKED.**
+
+- [ ] W2.28 (NEW WAVE, from the 2026-08-22 re-sweep) Template
+  residue: the family re-entered at ~249 items once FR-115 made it
+  visible (spdlog 107, tinyrenderer 16, unordered_dense 15; nttp 31,
+  partial-spec 36, explicit-spec 14, pack 6) and **no template wave
+  exists on the backlog** -- W2.15/16 landed monomorphization for the
+  shapes clang instantiates, and the residue is the REJECTED shapes
+  (non-type template params, partial/explicit specializations,
+  packs). Needs its own demand-vs-cost spike; NTTPs alone (31) may be
+  a cheap W2.15-style extension (a value suffix beside the type
+  suffix). **NOT SPIKED.**
+
 ## Track 5 Third-party validation (external demand signal)
 
 Track 4's corpus is authored by this project. That has now produced two
@@ -13278,12 +13363,10 @@ pugixml's 42 units do not manufacture it.
 | copy/move constructor semantics | 4 | 0.06% | root | W2.23 |
 | **`std::unique_ptr` / `make_unique`** | **0** | **0%** | -- | **W2.21** |
 
-**STALE-MARKER (2026-08-22): this table predates FR-115.** The
-attribution defect FR-115 closed was skewing every count below --
-re-measured post-fix, `template` re-enters at #3, copy-move at #2, and
-the cascade bucket collapses toward true roots (FR-115's entry has the
-numbers). Re-run the full 11-repo sweep before sizing any new wave off
-this table.
+**SUPERSEDED (2026-08-22): the full 11-repo re-sweep below replaces
+this table.** It predates fifteen landed increments AND the FR-115
+attribution fix that was skewing every count. Kept for the audit trail;
+size nothing off it.
 
 **THE HEADLINE, and it is the thing naive counting gets wrong: 59.2% of
 all blocked items -- 3949 of 6669 -- never had their own construct
@@ -13324,6 +13407,61 @@ not eventual need.
 The run also produced FR-113, FR-114 and FR-115 as minimal repros, and
 FR-115 is the reason this table needed two tools instead of one: 6193
 of 8851 items (70%) are status `missing` with no diagnostic at all.
+
+### Re-measurement, 2026-08-22 (post-FR-115, fifteen increments later)
+
+Same 11 repos, same SHAs, same 105 TUs, ONE tool run per TU -- FR-115's
+premise held: every unported item now carries `root_blocker`, so the
+second `--emit=coloring` pass and the hand repros the original sweep
+needed are gone. The before column is the original results re-crunched
+under identical rules. Artifacts: scratchpad `cxx-demand-2/`.
+
+HEADLINES. Crates: 0 FULL / 95 PARTIAL / 10 NO_CRATE -> **0 / 103 / 2**
+(all 8 fallen NO_CRATEs are spdlog = FR-113's effect; the remaining 2
+are one environmental fuzz header and one FR-103-class extern global --
+FR-103 makes real NO_CRATE zero). Ported: 22.8% -> 22.9% flat ONLY
+because spdlog's 3,369-item denominator arrived at 13.9%;
+**ex-spdlog 22.8% -> 26.3%, +3.4pp real**. Movers: spdlog 0 -> 13.9%,
+tinyrenderer +8.7pp, docopt +6.2pp, tinyxml2 +4.5pp (FR-112),
+raytracing +2.9pp with its overload collisions at ZERO (FR-114). Two
+repos moved DOWN (jsoncpp -1.5pp, unordered_dense -3.3pp) -- plausibly
+FR-118/FR-122 converting silently-wrong merges into loud rejections,
+correctness-positive, not root-caused: flagged honestly.
+
+THE NEW RANKING (deduped, n=9,598; silent mass 4,647 -> **ZERO**):
+copy-move-constructor **2,389 = 24.9% #1** (was 4 items in the original
+table!); rejected-type-cascade 1,434 (chain-length-1 residue -- the
+rejected type's own root still uncomputed); unreached-by-import 1,234
+(the honest c2 tag awaiting per-instantiation attribution -- together
+~28% of demand still opaque, the FR-115 follow-on); **cxx-drop-global
+936 #4, ON NO WAVE** (930/936 is pugixml's TEST-runner globals --
+equal-weighted only 1.9%, size with that caveat); cxx-cascaded-method
+843 (grew because spdlog became measurable); destructor 745 (jsoncpp
+505 -- the residue no open item owns); cxx-operator-overload **183**
+(was 587+1,459: of the 1,459 old operator locations only THREE are
+actually gone -- the mass re-rooted to copy-move behind them, confirming
+FR-112's cascade-artifact correction); template family ~249, NO template
+wave exists; virtual-method **0** (W2.19a/b); cxx-drop-base **0**
+(W2.26); exceptions 40, still last.
+
+VERIFICATIONS: the raytracing shared_ptr shadowing is FIXED (1 corpus
+diagnostic -> 41 root items, 4 projects); the alphabetic-minimum
+root-tag artifact is FIXED (base-class 236 -> 36 while destructor
+106 -> 745).
+
+WAVE-SIZING: W2.23 is the #1 front under every weighting -- promoted,
+and in flight as this is written. W2.25's true residue is 183
+(~47 FREE operators admissible via FR-114's machinery per FR-119's
+note; 136 member out-of-line needing real semantics) -- demoted
+accordingly. FR-121 confirmed exactly as filed (2x E0596 in 7 of 8
+spdlog units, zero elsewhere) but unblocks only 2 units alone -- the
+other 5 also carry FR-124.
+
+DEFECT WATCH: 19 of 103 emitted crates are exit-0-but-unbuildable, in
+four shapes: **FR-124** (NEW, 60 errors/8 crates), **FR-125** (NEW, 33
+errors/9 crates), FR-121 (14, as filed), FR-106's class (2). No
+verifier kills survived recovery, no importer crashes -- the FR-113/
+FR-119 backstops held.
 
 ### Emitted-Rust quality, measured 2026-08-21 (the clippy metric)
 
