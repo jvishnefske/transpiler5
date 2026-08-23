@@ -65,6 +65,28 @@ blocked_by = ["FR-118"]
 anchor = "W2.26"
 
 [[items]]
+id = "W2.27"
+rank = 6
+kind = "feature"
+status = "open"
+size = "M"
+title = "Droppy globals (atexit / end-of-main drop scope)"
+summary = "#4 in the re-sweep at 936 items, on no wave -- but 930/936 is pugixml (equal-weighted 1.9%). One construct, one wording; the exit-time-drop image is the design question."
+blocked_by = []
+anchor = "W2.27"
+
+[[items]]
+id = "W2.28"
+rank = 7
+kind = "feature"
+status = "open"
+size = "L"
+title = "Template residue: NTTPs, partial/explicit specializations, packs"
+summary = "~249 items once FR-115 made them visible; no template wave existed. NTTPs (31) may be a cheap W2.15-style value-suffix extension; spike demand-vs-cost."
+blocked_by = []
+anchor = "W2.28"
+
+[[items]]
 id = "FR-113"
 kind = "defect"
 status = "landed"
@@ -96,12 +118,12 @@ anchor = "FR-119 DEFECT"
 
 [[items]]
 id = "FR-121"
-rank = 21
+rank = 3
 kind = "defect"
 status = "open"
 size = "S"
 title = "Deferred [i8;N] binding borrowed &mut without mut (E0596)"
-summary = "FR-105's sibling in the deferred-binding machinery; 2x per spdlog unit, 6/7 units, the next blocker once FR-113 lets crates emit. Loud, never silent."
+summary = "Re-sweep confirmed exactly as filed: 2x E0596 in 7 of 8 spdlog units, zero elsewhere. Alone unblocks only 2 units -- 5 also carry FR-124; land the pair together."
 blocked_by = ["FR-113"]
 anchor = "FR-121 DEFECT"
 
@@ -115,6 +137,39 @@ title = "Friend operator defined inline in a class is silently omitted"
 summary = "Dead-code loss, not wrong code (uses reject located), but zero diagnostics -- the FR-115 hole in miniature. Channel pinned as-is by free-operator-invalid.cpp's FRIEND section."
 blocked_by = []
 anchor = "FR-123 DEFECT"
+
+[[items]]
+id = "FR-124"
+rank = 1
+kind = "defect"
+status = "open"
+size = "S"
+title = "derive(Copy) over a non-Copy base field: exit-0 unbuildable (E0204 x60)"
+summary = "The derived class's Copy suppression misses its base FIELD's non-Copy-ness now that polymorphic bases admit. Armed as admission widened (FR-119's pattern). 8 corpus crates; 10-line repro saved."
+blocked_by = []
+anchor = "FR-124 DEFECT"
+
+[[items]]
+id = "FR-125"
+rank = 8
+kind = "defect"
+status = "open"
+size = "M"
+title = "CamelCase namespaces trip non_snake_case: exit-0 unbuildable (x33)"
+summary = "ns_<Namespace> preserves capitalization against the deny set. Fix is a byte-identity design decision, not a rename. 9 corpus crates; 5-line repro saved."
+blocked_by = []
+anchor = "FR-125 DEFECT"
+
+[[items]]
+id = "FR-126"
+rank = 2
+kind = "defect"
+status = "open"
+size = "M"
+title = "Attribution follow-on: cascade roots one hop short + unreached instantiations (~28%)"
+summary = "1,434 cascade items with length-1 chains (the rejected type's own root never computed) + 1,234 unreached: together 28% of demand one hop from actionable. Owns the jsoncpp destructor-residue question."
+blocked_by = []
+anchor = "FR-126 ATTRIBUTION"
 
 [[items]]
 id = "FR-122"
@@ -143,7 +198,7 @@ kind = "feature"
 status = "open"
 size = "L"
 title = "Operator overloading"
-summary = "Biggest single construct (2212 items) but 1625 of those are cascade; FR-112 first, then size against the 587-item residue."
+summary = "Re-sweep residue: 183 (~47 free operators admissible via FR-114 machinery, 136 member out-of-line needing real semantics). Of 1,459 original operator locations only THREE are gone -- the rest re-rooted to copy-move behind them."
 blocked_by = ["FR-112"]
 anchor = "W2.25"
 
