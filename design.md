@@ -7999,25 +7999,19 @@ piece and becomes FR-45.
   specializations still self-root). Together ~28% of measured demand
   is one attribution hop from actionable. Also owns the question of
   jsoncpp's 505-item destructor residue -- likely W2.17-gate positions
-  visible only after (1) computes the real roots. **NOT SPIKED.**
-
-- [ ] FR-124 DEFECT (filed 2026-08-22 by the post-FR-115 full 11-repo
-  re-sweep): template-heavy code self-roots as `unreached-by-import` --
-  honest, but not actionable. On the 110-unit re-sweep the tag is the
-  FUNCTION-ONLY #1 at 448 of 1494 blocked function items (30.0%),
-  concentrated 63% in spdlog (283) + pugixml (82) + cxxopts (60): a
-  used template's member functions live on instantiation decls the
-  import never visits, so FR-115 tags them unreached instead of
-  attributing the instantiation's actual blocker. Until this lands,
-  the fn-only ranking is 30% blind and the W2.23-vs-W2.26 fine
-  ordering cannot be trusted (their measured gap -- copy-move 121 vs
-  drop-family 168 -- is inside this residual). ACCEPTANCE: a driver
-  lit test pinning that an instantiated class template's method items
-  carry a real root (not unreached-by-import) in
-  emitrust-progress.json; on the external re-probe the fn-only
-  unreached-by-import share drops materially (record the honest
-  number), with the residue being genuinely-unreferenced decls.
-  **NOT SPIKED.**
+  visible only after (1) computes the real roots. FUNCTION-ONLY
+  STAKES (independent HEAD-rev sweep, second session, same day):
+  unreached-by-import is the fn-only #1 at 448 of 1494 blocked
+  function items (30.0%), 63% concentrated in spdlog/pugixml/cxxopts
+  -- so the standing-rule ranking is 30% blind, and the
+  W2.23-vs-W2.26 fine ordering (copy-move 121 vs drop-family 168
+  fn-only, a gap inside this residual) cannot be trusted until
+  channel (2) lands. ACCEPTANCE for (2): a driver lit test pinning
+  that an instantiated class template's method items carry a real
+  root (not unreached-by-import) in emitrust-progress.json, plus an
+  external re-probe where the fn-only unreached share drops
+  materially (record the honest number; the residue must be
+  genuinely-unreferenced decls). **NOT SPIKED.**
 
 - [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
   the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and
@@ -13415,6 +13409,16 @@ premise held: every unported item now carries `root_blocker`, so the
 second `--emit=coloring` pass and the hand repros the original sweep
 needed are gone. The before column is the original results re-crunched
 under identical rules. Artifacts: scratchpad `cxx-demand-2/`.
+
+INDEPENDENT CORROBORATION (same day, second session, deliberately
+different method: current upstream HEADs not the pinned SHAs, 110
+qualifying TUs not 105, rankings from the JSON `root_blocker` alone):
+silent items 0 at full corpus scale; the operator collapse reproduces
+(183 all-kinds, 0 function-only on that unit set); the top actionable
+cluster is the same {copy-move-constructor, rejected-type-cascade,
+unreached-by-import}. Ranking-level agreement under both rev sets and
+both unit sets -- the steering below does not hinge on either sweep's
+particulars. (Artifacts: scratchpad `cpp-corpus/`.)
 
 HEADLINES. Crates: 0 FULL / 95 PARTIAL / 10 NO_CRATE -> **0 / 103 / 2**
 (all 8 fallen NO_CRATEs are spdlog = FR-113's effect; the remaining 2
