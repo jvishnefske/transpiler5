@@ -7958,21 +7958,66 @@ piece and becomes FR-45.
   struct_def and c_main with zero diagnostics), so any change to its
   behavior fails a test and must come through this FR. **NOT SPIKED.**
 
-- [ ] FR-124 DEFECT (found by the 2026-08-22 re-sweep, filed-ready
-  with a 10-line repro): **derive(Copy) emitted over a non-Copy base
-  field -- exit 0, unbuildable crate, 60 E0204 errors across 8
-  corpus crates** (raytracing main.cc x3, five spdlog units -- 53 in
-  spdlog.cpp alone). The emission is internally inconsistent: the
-  BASE is admitted non-Copy (`#[derive(Clone, Default)]` -- virtual
-  dtor, W2.26's suppression working), but the DERIVED still gets
-  `derive(Clone, Copy, Default)`. Likely a W2.19/W2.26 interaction:
-  the derived class's Copy suppression checks its own droppiness but
-  not its base FIELD's Copy-ness once polymorphic (non-droppy) bases
-  became admissible. THE CHANNEL ARMED AS ADMISSION WIDENED -- exactly
-  FR-119's recorded pattern. Repro:
-  scratchpad/cxx-demand-2/repro-e2004.cpp (virtual-dtor base, derived
-  with a double, one by-value use). Loud at cargo, silent at exit --
-  violates fail-loudly. **NOT SPIKED** (repro measured; fix not).
+- [ ] FR-124 DEFECT: derive(Copy) emitted over a non-Copy base field
+  -- exit-0 unbuildable, E0204 x60 across 8 corpus crates. Spike
+  verdict **GO** (2026-08-22), and THE FILED HYPOTHESIS WAS WRONG IN
+  DETAIL: not a W2.19/W2.26 predicate-vs-emitter disagreement, but an
+  importer-internal asymmetry inside ONE function.
+  `userOrInheritedDestructor`'s OWN-class arm counts a user-DECLARED
+  dtor (so `virtual ~B() = default` sets has_drop on B and suppresses
+  B's Copy), while its INHERITED walk counts only user-PROVIDED dtors
+  -- the deliberate `__pair_base` filter -- so D over that B is not
+  droppy, keeps `derive(Clone, Copy, Default)`, and contains the
+  non-Copy field `base: B`. Both predicates are CORRECT about dropping
+  (D destroys nothing); the defect is purely that the emitter's
+  per-struct Copy decision never looks at FIELD Copy-ness. The corpus
+  arm is exactly `virtual ~X() = default`, pervasive in spdlog and
+  raytracing (53 of the 60 errors are spdlog.cpp's formatter
+  hierarchy).
+  CANDIDATE MAP, measured: the W2.19a multi-virtual no-dtor base is
+  NOT a channel (both sides legally Copy in the vptr-less image); a
+  user-provided `~B() {}` is consistent (transitive predicate works);
+  the non-virtual `= default` dtor and the user-copy-ctor base are
+  fenced today -- but the latter ARMS THE MOMENT W2.23 LANDS unless
+  its trigger folds into this fix's seed.
+  THE FIX, hand-driven and validated: emission-side only -- a
+  `nonCopyStructNames` set beside `dropStructNames`, seeded by the two
+  existing local triggers (FR-94 Vec/String opaque fields, W2.17
+  has_drop) factored into one lambda, then FIXPOINT-CLOSED over
+  struct-typed fields (arrays peeled; fields form a DAG). The IR
+  already carries everything; zero new ops, zero importer changes.
+  Differential emission deltas are EXACTLY the derive lines (1 on
+  raytracing main.cc, 53 on spdlog.cpp, no other byte moves); the
+  repro byte-diffs clean against native; all 60 E0204s gone; full
+  suite 768/768 with ZERO golden shifts -- structurally guaranteed,
+  since any struct the closure newly de-Copies could never have built.
+  Failure direction if a by-value use of a newly non-Copy struct
+  appears: E0382, loud.
+  WHY EMITTER, NOT IMPORTER: propagating has_drop to D would be
+  semantically FALSE and would drag seven use-site gates and five
+  liveness guards along; the FR-94 trigger is emitter-only knowledge;
+  the emitter sees the whole module at the one decision point.
+  W2.23 COMPOSITION, verified against the live tree: its emitter
+  delta does not exist yet, so its mandated one-liner should land as
+  ONE MORE DISJUNCT IN THE SEED lambda (or be relocated there if it
+  lands first -- a one-line move, no conflict), after which the
+  closure automatically covers derived-over-copy-ctor-base -- the
+  NEXT sweep's E0204 refiling, pre-empted.
+  BACKSTOP VERDICT (the FR-119 question): a separate derive-consistency
+  verifier is redundant BY CONSTRUCTION -- the derive decision IS the
+  bottom-up consistency computation; the structural guard is that
+  emitStructDef consults ONLY the set, so any future trigger added
+  elsewhere fails review, not rustc. THE REAL FUTURE GAP:
+  `data_enum_def` derives Copy unconditionally, safe only while
+  payloads are scalar-gated -- any wave admitting struct payloads must
+  extend the closure there.
+  UNMASKED RESIDUALS (rustc aborts before late lints, so these were
+  invisible behind E0204): the spdlog E0596 pair is FR-121 as filed;
+  the stbi `__`-name non_snake_case mass joins FR-125's family. Six of
+  the eight units stay red for those unrelated reasons.
+  DO NOT: remove the `isUserProvided` filter (regresses std::pair);
+  drop own-class has_drop for `= default` dtors (widens seven gates).
+  **SPIKED** -- the working patch sits in the spike worktree.
 
 - [ ] FR-125 DEFECT (found by the 2026-08-22 re-sweep):
   **CamelCase namespaces break the non_snake_case deny -- 33 errors

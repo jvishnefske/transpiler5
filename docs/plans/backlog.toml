@@ -142,10 +142,10 @@ anchor = "FR-123 DEFECT"
 id = "FR-124"
 rank = 1
 kind = "defect"
-status = "open"
+status = "spiked"
 size = "S"
-title = "derive(Copy) over a non-Copy base field: exit-0 unbuildable (E0204 x60)"
-summary = "The derived class's Copy suppression misses its base FIELD's non-Copy-ness now that polymorphic bases admit. Armed as admission widened (FR-119's pattern). 8 corpus crates; 10-line repro saved."
+title = "derive(Copy) over a non-Copy base field: fixpoint the derive decision"
+summary = "GO: the real channel is the declared-vs-provided asymmetry in userOrInheritedDestructor; fix is an emitter-side nonCopyStructNames fixpoint over struct fields. Zero golden shifts structurally. W2.23's trigger folds into the seed."
 blocked_by = []
 anchor = "FR-124 DEFECT"
 
