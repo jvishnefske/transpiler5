@@ -5164,6 +5164,55 @@ LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
         return emitError(loc) << "unsupported: the address of a scalar "
                                  "object cannot be an owner-index return";
       value = pointer->cursor;
+    } else if (currentParamCursorReturn) {
+      // FR-104 parameter-cursor return: the returned pointer decomposes
+      // exactly like the Stage-1 owner-index return above, but the proof
+      // roots at ONE slice parameter and the cursor is RELATIVE to that
+      // slice (a slice parameter's own coordinates start at 0, so the
+      // decomposed cursor IS the return value). Value-preserving pointer
+      // casts (`return (char *)s;`) are peeled exactly as the planner
+      // peeled them. With the nullable lift, a null-constant site emits
+      // the `None` literal and a cursor site wraps in `Some(...)`. The
+      // checks below are defensive nets; `planParamCursorReturns` proved
+      // every site.
+      if (currentParamCursorReturnNullable &&
+          isNullPointerConstantExpr(retValue)) {
+        value = builder
+                    .create<emitrust::LiteralOp>(
+                        loc, currentReturnType, builder.getStringAttr("None"))
+                    .getResult();
+      } else {
+        const clang::Expr *peeled = stripTrivia(retValue);
+        while (const clang::Expr *sub = peelPointerCast(astContext(), peeled))
+          peeled = stripTrivia(sub);
+        FailureOr<PtrExprValue> pointer = emitPointerRValue(peeled);
+        if (failed(pointer))
+          return failure();
+        if (pointer->base != currentParamCursorReturn || pointer->member ||
+            pointer->baseIndex)
+          return emitError(loc)
+                 << "unsupported: returned pointer value (the return site "
+                    "does not root in the proven parameter region)";
+        if (pointer->nonNull) // Defensive; the plan's null sites are the
+                              // null CONSTANTS, never a nullable region
+                              // (resolveArgRoot excludes those).
+          return emitError(loc)
+                 << "unsupported: possibly-null pointer returned from a "
+                    "parameter-cursor function";
+        if (!pointer->cursor) // Defensive; a slice base always has one.
+          return emitError(loc)
+                 << "unsupported: the address of a scalar object cannot "
+                    "be a parameter-cursor return";
+        if (currentParamCursorReturnNullable)
+          value = builder
+                      .create<emitrust::CallOpaqueOp>(
+                          loc, TypeRange{currentReturnType},
+                          builder.getStringAttr("Some"),
+                          /*args=*/ArrayAttr(), ValueRange{pointer->cursor})
+                      .getResult(0);
+        else
+          value = pointer->cursor;
+      }
     } else if (isDataPointer(retValue->getType()) &&
         currentReturnType == builder.getIntegerType(64)) {
       // An integer-carrier pointer return (CTS-P3): the function's return

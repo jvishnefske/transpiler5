@@ -6590,7 +6590,7 @@ piece and becomes FR-45.
   incremental-extern-global-undefined-bin.c; ledger needle
   undefined-extern-global mirrored in run_realworld.py)
 
-- [ ] FR-104 Returned cursors into a PARAMETER region (the #2
+- [x] FR-104 Returned cursors into a PARAMETER region (the #2
   corpus family, 97 items — but only its decidable sub-family is
   proposed here).
   "returned pointer value" is one diagnostic covering three
@@ -6630,8 +6630,47 @@ piece and becomes FR-45.
   invented. Returns of a global-region cursor (`log_level_string`'s
   static string table) and of callee-local or heap regions stay
   out.
-  **NOT SPIKED** — the family separation and the instances are
-  measured; the cursor-return representation is a proposal.
+  ~~NOT SPIKED~~ LANDED 2026-08-23 (spike GO-with-constraints,
+  BOTH halves: plain cursor + Option-of-cursor). The entry's
+  proposed signature was corrected by measurement: NO extra cursor
+  parameter -- slice params already use RELATIVE coordinates, so
+  the return is a relative i64 and the caller computes
+  argCursor + ret (the +0 case canonicalizes away); the
+  owner-promoted path keeps its absolute-i64 Stage-1 convention,
+  and the two conventions never mix (chosen by the existing param
+  classification). The spike's frontier probes found the REAL gap:
+  the lskip shape minus its `(char*)` cast already promoted via
+  owner Stage-1 -- the cast ALONE broke return-root resolution, so
+  cast transparency (peelPointerCast at the return-site proof) is
+  half the increment, and the slice-param generalization (two
+  caller regions) is the other half. The const->mut adversarial
+  passes because the returned i64 carries no borrow (the callee
+  borrow dies at return, NLL). Option-of-cursor rides FR-99's
+  exact op set with an i64 payload (opaque Option<i64>, None
+  literal, Some call, is_some/unwrap_or at the caller), zero new
+  ops, proven by hand-written target MLIR through the exact driver
+  pipeline before any importer code. HONEST SCOPE CORRECTIONS:
+  ini_rstrip is NOT unlocked -- its blocker is argument-side
+  ("comparison of pointers into different objects", two pointer
+  params one region; deferred to a same-region param-join
+  follow-up); family (ii) is 8 of 109 unique returned-pointer
+  symbols (~7%) on the current sweep -- the mass is family (iii)
+  cJSON heap-tree borrows (~70), correctly out of scope. Expected
+  flips: inih +2 (lskip, strncpy0), jsmn +1 (alloc_token, the
+  Option half), lwip ntoa_r family candidates. Multi-base,
+  global-table, callee-local, param/local-mix, and bodyless-heap
+  returns keep located rejections (5 pins); new defensive wordings
+  are "returned pointer value"-prefixed so the ledger family is
+  unchanged. Cross-TU/shard keeps the rejection this wave (FR-58
+  precedent; all canonical instances are static, so the boundary
+  does not gate acceptance). Gates: full meson suite 813/813
+  (fast 573 + EndToEnd 240; both new EndToEnd tests byte-identical
+  incl. the Some->None mid-loop boundary and
+  caller-writes-through-const-walked-result).
+  (test/Import/C/pointers-return-param-cursor.c,
+  pointers-return-param-cursor-invalid.c;
+  test/EndToEnd/param-cursor-return.c,
+  param-cursor-return-nullable.c)
   Ranked SECOND, after FR-102.
 
 - [x] FR-105 DEFECT: a loop-assigned deferred binding is emitted

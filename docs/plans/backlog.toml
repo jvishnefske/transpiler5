@@ -291,12 +291,11 @@ anchor = "FR-103 Undefined extern globals"
 
 [[items]]
 id = "FR-104"
-rank = 15
 kind = "feature"
-status = "in-flight"
+status = "landed"
 size = "L"
-title = "Returned cursors into a PARAMETER region (decidable sub-family)"
-summary = "The #2 C corpus family (97 items); only the caller-supplied-region shape is proposed."
+title = "Returned cursors into a parameter region: relative-i64 return + Option-of-cursor"
+summary = "Landed 2026-08-23: cast transparency + slice-param generalization (entry's extra-cursor-param signature corrected); Option half on FR-99 ops with i64 payload. ini_rstrip deferred (argument-side blocker); family (ii) honestly ~7% of returned-pointer mass. 5 rejection pins unchanged."
 blocked_by = []
 anchor = "FR-104 Returned cursors"
 
