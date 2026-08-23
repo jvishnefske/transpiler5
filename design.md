@@ -8133,29 +8133,49 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-ns-case-fold-invalid.cpp,
   test/Driver/incremental-camelcase-namespace.cpp)
 
-- [ ] FR-127 DEFECT (found 2026-08-23 by the second session's
+- [x] FR-127 DEFECT (found 2026-08-23 by the second session's
   post-FR-125 offender re-check; REGRESSION introduced by W2.24): a
   class-payload `throw` in a FREE function aborts the whole TU under
-  `--incremental` recovery -- `unsupported: thrown exception payload
-  must be a supported scalar type` (ImportCStatements.cpp:1673/:1930)
-  escapes the per-decl recovery scope, exit 2, NO crate. Minimal
-  repro: `struct E{int c;E(int);}; void thrower(int c){throw E(c);}
-  int keep(int);` -- recovery should DROP `thrower` located and emit
-  `keep`; instead nothing is emitted. Pre-W2.24 these bodies rode the
-  recovery/omission channel: FR-125's acceptance (base 11de90d,
-  pre-W2.24) measured jsoncpp json_value.cpp transpile+cargo CLEAN;
-  at cfeed14 (post-W2.24) the same unit and at least 2048.cpp's
-  menu/statistics emit NO crate -- a measured external-corpus
-  regression the curated suite cannot see (no lit test throws a
-  class payload in recovery mode). The recovery contract (FR-42/
-  FR-52/FR-112) is that a body-level unsupported construct drops the
-  ITEM, located, and the TU continues; W2.24's payload check likely
-  fires in the Result-threading pre-pass outside the recovering
-  scope. ACCEPTANCE: the minimal repro emits a crate with `thrower`
-  dropped (ledgered, located) and `keep` ported, strict mode still
-  rejects located; jsoncpp json_value.cpp and 2048.cpp menu.cpp/
-  statistics.cpp regain their crates (honest count recorded); a
-  Driver lit test pins the recovery-mode drop. **NOT SPIKED.**
+  `--incremental` recovery. Minimal repro: `struct E{int c;E(int);};
+  void thrower(int c){throw E(c);} int keep(int);` -- recovery
+  should drop `thrower` located and emit `keep`; instead nothing is
+  emitted. The curated suite cannot see this (no lit test threw a
+  class payload in recovery mode); the external re-probe caught it
+  within the hour.
+  LANDED 2026-08-23 (spike GO), with THREE corrections to this
+  entry's own filing, recorded per protocol: (1) the raise site is
+  NOT ImportCStatements.cpp:1673/:1930 (those are recovery-safe
+  per-decl copies -- a METHOD throwing a class payload recovered
+  fine all along); it is `planThrows`, the W2.24 Result-threading
+  planner pre-pass at ImportCPlanning.cpp:4171, called raw ahead of
+  the per-decl recovery scopes -- and ALL SEVEN of its rejection
+  sites were TU-fatal in recovery (payload, two-payloads, noexcept,
+  variadic, return-mismatch, non-scalar-param, address-taken),
+  measured, not just the filed one. (2) Exit code is 1, not 2.
+  (3) The 2048.cpp menu/statistics claim was a bug in the filing
+  probe's flag lookup, not a regression -- they pass at HEAD with
+  zero throw statements; jsoncpp-shaped TUs (free-function throwers)
+  were the real casualty class. THE FIX: planThrows body extracted
+  as planThrowsOnce; the new wrapper is a recoverFromRejections-
+  gated replan loop on the planVaMonomorph precedent (no snapshot --
+  all plan state is local or reset at entry, so replan-from-scratch
+  is idempotent); collect() skips plannerRejections decls; the
+  culprit definition is credited via pendingPlannerAttribution
+  (second-seen thrower for the two-payload site = first-payload-wins
+  replan). A rejected thrower gets no facts entry, never seeds the
+  Result closure, and callers keep calling the loud stub -- FR-52-
+  conformant. Strict mode is byte-identical (the untouched
+  planThrowsOnce path; exceptions-invalid.cpp pins green).
+  ACCEPTANCE MET: repro emits (keep + E ported, thrower STUBBED --
+  not dropped, its signature maps -- ledgered located, crate
+  cargo-clean); jsoncpp json_value.cpp regains its crate, honest
+  counts 51 graph items, 11 ported, 5 stubbed, 35 dropped, 0
+  missing, both namespaced throwers stubbed located at 237:3/240:3
+  with the multi-round replan exercised (247 recovered items);
+  2048 menu/statistics confirmed unaffected. Gates: worktree full
+  suite 795/795; main-tree full suite 795/795 (fast 563 + EndToEnd
+  232) with the diff applied at e42cbce.
+  (test/Driver/incremental-throw-payload.cpp)
 
 - [x] FR-126 ATTRIBUTION FOLLOW-ON (the ~28%): two channels FR-115
   deliberately left, now sized by the re-sweep. (1)

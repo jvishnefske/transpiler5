@@ -4085,6 +4085,40 @@ void CImporter::planFnPtrMembers(const clang::TranslationUnitDecl *unit) {
 //===----------------------------------------------------------------------===//
 
 LogicalResult CImporter::planThrows(const clang::TranslationUnitDecl *unit) {
+  if (!recoverFromRejections)
+    return planThrowsOnce(unit);
+  // FR-127 (FR-53 under recovery): REPLAN from scratch after each attributed
+  // rejection, exactly as `planVaMonomorph` does. Dropping a thrower changes
+  // the can-throw closure fixpoint -- its callers may leave the closure, and
+  // the wave-1 gates range over that closure -- so no local patch of the
+  // half-built plan can be trusted; the plan the import finally consults must
+  // be, by construction, the plan a non-recovering run over exactly the
+  // surviving declarations would have produced. Unlike `planVaMonomorph`
+  // there is no cross-TU plan state to snapshot and restore: every member
+  // this pass writes (`throwsPlanActive`, `throwsClosure`, the payload
+  // types, the enum name) is reset at the top of `planThrowsOnce`.
+  for (;;) {
+    pendingPlannerAttribution = nullptr;
+    size_t recordedBefore = plannerRejections.size();
+    switch (recoverPlannerRejection(
+        /*attribution=*/nullptr, [&] { return planThrowsOnce(unit); })) {
+    case PlannerRecovery::Planned:
+      return success();
+    case PlannerRecovery::Recorded:
+      // Termination: every rejection site credits a definition the next
+      // round's collect() skips, so a round that records nothing new cannot
+      // happen -- but a `for (;;)` deserves the check, not the argument.
+      if (plannerRejections.size() == recordedBefore)
+        return failure();
+      continue;
+    case PlannerRecovery::Unattributable:
+      return failure();
+    }
+  }
+}
+
+LogicalResult
+CImporter::planThrowsOnce(const clang::TranslationUnitDecl *unit) {
   throwsPlanActive = false;
   throwsClosure.clear();
   throwsPayloadClangType = clang::QualType();
@@ -4109,7 +4143,11 @@ LogicalResult CImporter::planThrows(const clang::TranslationUnitDecl *unit) {
   std::function<void(const clang::DeclContext *)> collect =
       [&](const clang::DeclContext *context) {
         for (const clang::Decl *decl : context->decls()) {
-          if (decl->isImplicit() || isSystemHeaderDecl(decl))
+          // FR-127: a declaration a planner already rejected is absent from
+          // the replan, so it never seeds the closure; its callers stay
+          // unrewritten and call the loud stub the declaration walk leaves.
+          if (decl->isImplicit() || isSystemHeaderDecl(decl) ||
+              plannerRejections.contains(decl))
             continue;
           if (const auto *linkageSpec =
                   llvm::dyn_cast<clang::LinkageSpecDecl>(decl)) {
@@ -4209,9 +4247,16 @@ LogicalResult CImporter::planThrows(const clang::TranslationUnitDecl *unit) {
     return success();
   };
 
-  for (const clang::FunctionDecl *func : definitions)
+  for (const clang::FunctionDecl *func : definitions) {
+    // FR-127: the scan's rejections (a non-scalar payload, a second payload
+    // type) are facts about THIS definition's own throw statements, so it is
+    // the declaration recovery drops. For the payload-conflict rejection
+    // this credits the SECOND-seen thrower: the first payload wins, which is
+    // exactly the plan the replan over the survivors rebuilds.
+    pendingPlannerAttribution = func;
     if (failed(scan(func->getBody(), facts[func->getCanonicalDecl()], 0)))
       return failure();
+  }
 
   if (!sawThrow)
     return success();
@@ -4252,6 +4297,11 @@ LogicalResult CImporter::planThrows(const clang::TranslationUnitDecl *unit) {
     const clang::FunctionDecl *canonical = func->getCanonicalDecl();
     if (!closure.contains(canonical))
       continue;
+    // FR-127: every gate below is a fact about this closure MEMBER (for the
+    // taken-address gate the use site may sit in another function, but the
+    // member whose address is taken is still the declaration whose absence
+    // dissolves the rejection), so it is the one recovery credits.
+    pendingPlannerAttribution = func;
     Location loc = translateLoc(func->getLocation());
     // noexcept is the closure boundary: a throw reaching one is
     // std::terminate, and the terminate helper is wave-2.

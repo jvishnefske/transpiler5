@@ -3489,6 +3489,13 @@ private:
   /// provably inert for C (no walk runs at all — C has no throw).
   LogicalResult planThrows(const clang::TranslationUnitDecl *unit);
 
+  /// One non-recovering round of `planThrows`. Every plan member it writes
+  /// is reset on entry, so under FR-53 recovery `planThrows` re-runs it from
+  /// scratch after each attributed rejection (FR-127) -- the closure is a
+  /// fixpoint, and dropping a thrower can only be answered by replanning
+  /// over the surviving declarations, never by patching the half-built plan.
+  LogicalResult planThrowsOnce(const clang::TranslationUnitDecl *unit);
+
   /// Maps the TU's thrown payload clang type once, validating the W2.14
   /// scalar set (signless integers and floats — the arith-constructible
   /// payloads), and derives the carrier enum name (`Throws_i32`;
