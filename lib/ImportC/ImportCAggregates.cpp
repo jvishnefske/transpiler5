@@ -1193,12 +1193,19 @@ LogicalResult CImporter::collectRecordFields(
         // statically named override is the exact method C++ dispatches to
         // (byte-diffed against the devirtualized twin in the W2.19 spike);
         // the virtual method imports as an ordinary method and value calls
-        // bind it directly. Every channel where static and dynamic type
-        // COULD diverge stays a located rejection at the site: any
-        // pointer-shaped receiver -- including implicit `this` -- hits the
-        // fence in `emitCXXMemberCall` (the spike measured the silent
-        // miscompile that fence prevents), the polymorphic upcast is
-        // refused inside `uniquePublicSingleBaseHops`, base references and
+        // bind it directly. W2.19b widened the admitted set once more: a
+        // pointer whose region binds EXACTLY ONE local object carries a
+        // statically known dynamic type, so the polymorphic upcast BINDS
+        // (`peelPointerCast` admits polymorphic chains; the planner's
+        // JOIN/MULTIOBJ walls keep multi-object regions out) and a
+        // virtual call through such a pointer DEVIRTUALIZES to the bound
+        // object's final overrider. Every channel where the dynamic type
+        // is genuinely unknown stays a located rejection at the site:
+        // pointer parameters, implicit `this`, ctor bodies, nullable and
+        // multi-object regions, global objects, qualified calls, and the
+        // W2.21 Box payload all hit the fence in `emitCXXMemberCall`
+        // (the spike measured the silent miscompile that fence
+        // prevents), base references and
         // new/delete keep their pre-existing rejections, and FR-112's
         // sizeof concern (clang folds the vptr-carrying native layout for
         // a struct the emitter renders without one) is screened at the

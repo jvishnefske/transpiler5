@@ -170,12 +170,11 @@ anchor = "W2.19"
 
 [[items]]
 id = "W2.19b"
-rank = 8
 kind = "feature"
-status = "spiked"
+status = "landed"
 size = "M"
-title = "Devirtualized single-object base pointer (flips 00901)"
-summary = "Leg D: byte-identical; soundness already enforced by the multi-object rejection. Needs FR-120 items 1-3."
+title = "Devirtualized single-object base pointer (flipped 00901)"
+summary = "Landed 2026-08-22: 00901 UNSUPPORTED -> PASS, the first frontier marker to fall. Devirt gated on the single-object region fact; JOIN/MULTIOBJ floors pinned; the new test caught a double-hop bug pre-green."
 blocked_by = ["FR-120"]
 anchor = "W2.19"
 

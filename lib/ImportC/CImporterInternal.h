@@ -5825,12 +5825,34 @@ private:
   /// more derived than the pointer's static pointee) by projecting
   /// `member ["base"]` hops. `outBase` (optional) receives the region
   /// base VarDecl when the decomposed path resolved one, so callers can
-  /// screen global bases.
+  /// screen global bases. `reconcileToward` (W2.19b), when non-null,
+  /// replaces the pointer's static pointee as the reconcile target: a
+  /// DEVIRTUALIZED call's resolved method belongs to a class the
+  /// pointer's static type never names (the bound object's own class for
+  /// an override — NO hop — or the declaring class for an inherited
+  /// virtual), so the receiver must reconcile toward the devirt TARGET's
+  /// class, not the viewed pointee (FR-120's carry-forward note).
   FailureOr<Value> emitStructPointerPlace(const clang::Expr *pointerExpr,
                                           Location loc,
                                           GlobalWriteback *writeback,
                                           const clang::VarDecl **outBase =
-                                              nullptr);
+                                              nullptr,
+                                          clang::QualType reconcileToward =
+                                              clang::QualType());
+
+  /// W2.19b: the single-object region fact, as a gate. Returns the ONE
+  /// local object `pointerExpr`'s region binds — a plain degenerate
+  /// whole-object binding of a LOCAL pointer variable to a LOCAL object
+  /// (no member root, no cursor, no null constant, no multi-base
+  /// discriminant, no literal/allocation backing) — or null when the
+  /// fact does not hold. This is the admission condition for
+  /// devirtualizing a virtual call through the pointer: exactly one
+  /// object means the pointee's dynamic type is `base->getType()`,
+  /// statically. Pointer PARAMETERS are excluded by name (their caller
+  /// set is open; a slice-classified parameter is its own base and
+  /// would fail the record-type check anyway).
+  const clang::VarDecl *
+  singleObjectLocalPointerBase(const clang::Expr *pointerExpr);
 
   /// FR-120: if `place` is a struct place whose type differs from the
   /// mapped `viewedPointee` struct, recomputes the unique single public
@@ -7471,17 +7493,26 @@ pointerArrayMemberType(const clang::ASTContext &context, clang::QualType type) {
 /// becomes necessary. Assert this predicate against that day: it must
 /// keep answering false for any record with more than one base.
 ///
-/// POLYMORPHIC chains are excluded HERE, not upstream: since W2.26 a
-/// class whose sole virtual member is its destructor is ADMITTED at class
-/// level (it imports, its direct base hops project), so no class-level
-/// rejection backstops "virtual anything" once `peelPointerCast` learns
-/// derived-to-base. Without this check `V *p = &w;` over a virtual-dtor
-/// chain would silently bind and `p->get()` would statically bind through
-/// the value subset — the dynamism a base POINTER exists to observe.
+/// POLYMORPHIC chains are excluded by DEFAULT, not upstream: since W2.26
+/// a class whose sole virtual member is its destructor is ADMITTED at
+/// class level (it imports, its direct base hops project), so no
+/// class-level rejection backstops "virtual anything" once
+/// `peelPointerCast` learns derived-to-base. W2.19b parameterizes the
+/// exclusion: `allowPolymorphic` may be passed ONLY where the
+/// single-object region fact holds (a pointer region binding EXACTLY ONE
+/// local object, `PtrExprValue::base` / `PointerRegion::bases.size() ==
+/// 1`), because then the pointee's dynamic type is statically known —
+/// non-virtual uses statically bind (exact C++ semantics) and virtual
+/// calls DEVIRTUALIZE against the bound object's type in
+/// `emitCXXMemberCall` (or keep the W2.19a fence). Without that fact a
+/// polymorphic chain must keep answering false: `V *p` over a
+/// virtual-method chain bound to an unknown object would statically bind
+/// the dynamism a base POINTER exists to observe.
 static inline bool
 uniquePublicSingleBaseHops(clang::QualType fromRecordTy,
                            clang::QualType toRecordTy,
-                           llvm::SmallVectorImpl<clang::QualType> *hops) {
+                           llvm::SmallVectorImpl<clang::QualType> *hops,
+                           bool allowPolymorphic = false) {
   const clang::CXXRecordDecl *record =
       fromRecordTy.getCanonicalType()->getAsCXXRecordDecl();
   const clang::CXXRecordDecl *target =
@@ -7495,8 +7526,8 @@ uniquePublicSingleBaseHops(clang::QualType fromRecordTy,
   int depth = 0;
   while (record && record->getCanonicalDecl() != targetCanon) {
     record = record->getDefinition();
-    if (!record || record->getNumBases() != 1 || record->isPolymorphic() ||
-        ++depth > 64)
+    if (!record || record->getNumBases() != 1 ||
+        (record->isPolymorphic() && !allowPolymorphic) || ++depth > 64)
       return false;
     const clang::CXXBaseSpecifier &spec = *record->bases_begin();
     if (spec.isVirtual() || spec.getAccessSpecifier() != clang::AS_public)
@@ -7507,7 +7538,7 @@ uniquePublicSingleBaseHops(clang::QualType fromRecordTy,
   if (!record || record->getCanonicalDecl() != targetCanon)
     return false;
   const clang::CXXRecordDecl *targetDef = record->getDefinition();
-  if (!targetDef || targetDef->isPolymorphic())
+  if (!targetDef || (targetDef->isPolymorphic() && !allowPolymorphic))
     return false;
   if (hops)
     hops->append(path.begin(), path.end());
@@ -7518,9 +7549,10 @@ uniquePublicSingleBaseHops(clang::QualType fromRecordTy,
 /// gate sites (`peelPointerCast`, `emitPointerLocal`) that only need the
 /// yes/no answer.
 static inline bool uniquePublicSingleBaseChain(clang::QualType fromRecordTy,
-                                               clang::QualType toRecordTy) {
+                                               clang::QualType toRecordTy,
+                                               bool allowPolymorphic = false) {
   return uniquePublicSingleBaseHops(fromRecordTy, toRecordTy,
-                                    /*hops=*/nullptr);
+                                    /*hops=*/nullptr, allowPolymorphic);
 }
 
 static inline const clang::Expr *peelPointerCast(clang::ASTContext &context,
@@ -7530,21 +7562,34 @@ static inline const clang::Expr *peelPointerCast(clang::ASTContext &context,
                 !llvm::isa<clang::ImplicitCastExpr>(cast)))
     return nullptr;
   // FR-120: a derived-to-base pointer upcast over a unique single public
-  // non-virtual non-polymorphic chain is transparent to the whole-object
-  // binding — the region binds the DERIVED object (ordinary null-member
-  // binding, no third binding kind) and every struct-place use site
-  // reconciles the viewed base type by re-deriving the hop path
+  // non-virtual chain is transparent to the whole-object binding — the
+  // region binds the DERIVED object (ordinary null-member binding, no
+  // third binding kind) and every struct-place use site reconciles the
+  // viewed base type by re-deriving the hop path
   // (`reconcileUpcastPlace`). Keyed on the cast KIND, not the spelling:
   // an explicit `(A *)&d` C-style cast wraps the same CK_DerivedToBase
   // node. Chains the predicate refuses fall through to the CK gate below
   // and keep the planner's non-address rejection.
+  //
+  // W2.19b: the peel is context-free, so it admits POLYMORPHIC chains
+  // unconditionally and soundness is re-established downstream, where
+  // the region facts live — a peeled binding lands in the SAME planner
+  // walls as a non-polymorphic upcast (two objects: the JOIN/MULTIOBJ
+  // rejections, measured; the multi-base uniformity check refuses
+  // derived objects viewed as the base), a VIRTUAL call through the
+  // bound pointer either devirtualizes against the region's single
+  // object or keeps the W2.19a fence (`emitCXXMemberCall`), non-virtual
+  // uses statically bind (exact C++ semantics under any binding), the
+  // globals planner keeps its own unrelaxed exact-type check, and
+  // pointer PARAMETERS never enter the region model at all.
   if ((cast->getCastKind() == clang::CK_DerivedToBase ||
        cast->getCastKind() == clang::CK_UncheckedDerivedToBase) &&
       isDataPointer(cast->getType()) &&
       isDataPointer(cast->getSubExpr()->getType()) &&
       uniquePublicSingleBaseChain(
           cast->getSubExpr()->getType().getCanonicalType()->getPointeeType(),
-          cast->getType().getCanonicalType()->getPointeeType()))
+          cast->getType().getCanonicalType()->getPointeeType(),
+          /*allowPolymorphic=*/true))
     return cast->getSubExpr();
   if (cast->getCastKind() != clang::CK_NoOp &&
       cast->getCastKind() != clang::CK_BitCast)

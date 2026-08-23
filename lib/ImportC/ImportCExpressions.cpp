@@ -2826,6 +2826,50 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   return callOp->getResult(0);
 }
 
+// W2.19b: whether `candidate` is `target` or overrides it, transitively —
+// the C++ final-overrider relation restricted to the single-inheritance
+// chains the import subset admits.
+static bool overridesMethodTransitively(const clang::CXXMethodDecl *candidate,
+                                        const clang::CXXMethodDecl *target) {
+  if (candidate->getCanonicalDecl() == target->getCanonicalDecl())
+    return true;
+  for (const clang::CXXMethodDecl *overridden :
+       candidate->overridden_methods())
+    if (overridesMethodTransitively(overridden, target))
+      return true;
+  return false;
+}
+
+// W2.19b: resolves the FINAL OVERRIDER of virtual `method` for an object
+// whose most-derived class is `mostDerived` — the devirtualization target
+// (the spike's resolved-override approach). Walks the single-base chain
+// DOWNWARD from the most-derived class and returns the first method that
+// is (or transitively overrides) `method`; reaching `method`'s own class
+// with no override in between yields `method` itself. Returns null on any
+// shape outside the walk (a multi-base class before the declaring class
+// is found), which callers must keep fenced — never guess a binding.
+static const clang::CXXMethodDecl *
+resolveDevirtualizedTarget(const clang::CXXMethodDecl *method,
+                           const clang::CXXRecordDecl *mostDerived) {
+  const clang::CXXRecordDecl *methodClass =
+      method->getParent()->getCanonicalDecl();
+  const clang::CXXRecordDecl *record = mostDerived->getDefinition();
+  int depth = 0;
+  while (record) {
+    for (const clang::CXXMethodDecl *candidate : record->methods())
+      if (candidate->isVirtual() &&
+          overridesMethodTransitively(candidate, method))
+        return candidate;
+    if (record->getCanonicalDecl() == methodClass)
+      return method;
+    if (record->getNumBases() != 1 || ++depth > 64)
+      return nullptr;
+    record = record->bases_begin()->getType()->getAsCXXRecordDecl();
+    record = record ? record->getDefinition() : nullptr;
+  }
+  return nullptr;
+}
+
 FailureOr<Value>
 CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   Location loc = translateLoc(call->getBeginLoc());
@@ -2865,10 +2909,14 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
     // pointer-shaped receiver. Today the payload type is exact (only the
     // same-T `std::make_unique<T>` initializer is recognized, so no
     // derived object can hide behind a `unique_ptr<Base>`), which would
-    // make the static bind accidentally correct -- the same
-    // measured-but-unpinned status the fence deliberately over-rejects
-    // for same-type raw pointers. Reject rather than lean on an
-    // invariant no byte-diff oracle guards.
+    // make the static bind accidentally correct. W2.19b DELIBERATELY did
+    // not extend devirtualization here: its gate is the single-object
+    // REGION fact, and a Box has no region -- a Box bind's soundness
+    // would rest solely on the W2.21 same-T recognition invariant, which
+    // no byte-diff oracle guards. If this fence is ever lifted, that
+    // coupling must be pinned first (an admitted `unique_ptr<Base>` from
+    // `make_unique<Derived>` would turn the lift into a silent
+    // miscompile). Reject rather than lean on an unguarded invariant.
     if (method->isVirtual())
       return emitError(loc)
              << "unsupported: virtual method call through a pointer";
@@ -2907,6 +2955,75 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
     return emitError(loc) << (llvm::isa<clang::CXXConversionDecl>(method)
                                   ? "unsupported: conversion function"
                                   : "unsupported: overloaded operator");
+  // W2.19b: DEVIRTUALIZATION, ahead of the mangled-name lookup because a
+  // successful resolution REPLACES the callee. The pointer-shaped
+  // receiver classification is hoisted out of the receiver lambda below
+  // so the gate and the fence see the same expression. A VIRTUAL call
+  // through a pointer whose region binds EXACTLY ONE local object (the
+  // FR-120 single-object fact, `singleObjectLocalPointerBase`) resolves
+  // at compile time against that object's most-derived type: the object
+  // IS the pointee, so its dynamic type is statically known and the
+  // final overrider is exact C++ semantics — no dispatch machinery, no
+  // new ops (byte-diffed in the W2.19 spike; the oracle is
+  // test/EndToEnd/cpp-devirt-base-pointer.cpp). The receiver then
+  // reconciles toward the devirt TARGET's class, not the pointer's
+  // static pointee (FR-120's carry-forward): an override binds the
+  // derived place with NO hop, an inherited virtual binds the declaring
+  // class's place through the recomputed hop chain. A QUALIFIED callee
+  // (`p->B::f()`) never devirtualizes — C++ binds it statically, so the
+  // override would be the WRONG body; it keeps the fence below. The
+  // NON-virtual half of the legD4 rule needs no code here: it already
+  // binds the pointer's STATIC type through the ordinary reconcile.
+  const clang::Expr *receiverStripped =
+      receiverExprPeeled->IgnoreParenImpCasts();
+  // `p->m()`: the implicit object argument IS the pointer (keep the
+  // implicit casts on — `isDecomposedPointerExpr`'s parameter check
+  // needs the LValueToRValue wrapper).
+  const clang::Expr *pointerExpr = nullptr;
+  if (isDataPointer(receiverStripped->getType()))
+    pointerExpr = receiverExprPeeled;
+  // `(*p).m()`: peel the explicit dereference to the pointer.
+  else if (const auto *unary =
+               llvm::dyn_cast<clang::UnaryOperator>(receiverStripped);
+           unary && unary->getOpcode() == clang::UO_Deref &&
+           isDataPointer(unary->getSubExpr()->getType()))
+    pointerExpr = unary->getSubExpr();
+  bool devirtualized = false;
+  clang::QualType devirtReceiverClass;
+  if (pointerExpr && method->isVirtual()) {
+    const auto *callee =
+        llvm::dyn_cast<clang::MemberExpr>(call->getCallee()->IgnoreParens());
+    if (!(callee && callee->hasQualifier()))
+      if (const clang::VarDecl *object =
+              singleObjectLocalPointerBase(pointerExpr))
+        if (const clang::CXXRecordDecl *mostDerived =
+                object->getType().getCanonicalType()->getAsCXXRecordDecl())
+          if (const clang::CXXMethodDecl *resolved =
+                  resolveDevirtualizedTarget(method, mostDerived)) {
+            clang::QualType targetClass =
+                astContext().getRecordType(resolved->getParent());
+            // The receiver hop chain (most-derived -> declaring class)
+            // must exist for the inherited-virtual case; refusing here
+            // keeps the fence, never a wrong bind.
+            if (resolved->getParent()->getCanonicalDecl() ==
+                    mostDerived->getCanonicalDecl() ||
+                uniquePublicSingleBaseChain(object->getType(), targetClass,
+                                            /*allowPolymorphic=*/true)) {
+              method = resolved;
+              devirtReceiverClass = targetClass;
+              devirtualized = true;
+              // Devirt owns the WHOLE receiver projection: the reconcile
+              // walks from the bound object's most-derived class to the
+              // target's class. The call-site hops peeled above describe
+              // the POINTER's static view (`pd->geta()` for a `D2 *`
+              // wraps a pointer-form DerivedToBase cast) and replaying
+              // them on the reconciled place would double-project
+              // (measured: `member ["base"]` on the base's own place --
+              // no field-existence check catches it before rustc).
+              baseHops.clear();
+            }
+          }
+  }
   std::string name = cxxMethodMangledName(method);
   func::FuncOp target = functions.lookup(name);
   if (!target)
@@ -2936,49 +3053,39 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
   // and the receiver borrow is an inline autoref under two-phase
   // borrows, so `p->bump(p->get())` is measured clean.
   FailureOr<Value> receiver = [&]() -> FailureOr<Value> {
-    const clang::Expr *stripped = receiverExprPeeled->IgnoreParenImpCasts();
-    // `p->m()`: the implicit object argument IS the pointer (keep the
-    // implicit casts on — `isDecomposedPointerExpr`'s parameter check
-    // needs the LValueToRValue wrapper).
-    const clang::Expr *pointerExpr = nullptr;
-    if (isDataPointer(stripped->getType()))
-      pointerExpr = receiverExprPeeled;
-    // `(*p).m()`: peel the explicit dereference to the pointer.
-    else if (const auto *unary =
-                 llvm::dyn_cast<clang::UnaryOperator>(stripped);
-             unary && unary->getOpcode() == clang::UO_Deref &&
-             isDataPointer(unary->getSubExpr()->getType()))
-      pointerExpr = unary->getSubExpr();
     // W2.19a's soundness fence, NOT a defensive check: a VIRTUAL call is
-    // admitted only on a value receiver, where the static bind is exact.
-    // Through any pointer-shaped receiver the pointee's dynamic type is
-    // an assumption, and the fence sits HERE -- after `pointerExpr` is
-    // computed -- so every pointer spelling funnels through one check:
-    // `p->f()`, `(*p).f()`, a pointer parameter, and explicit or IMPLICIT
-    // `this` (a `CXXThisExpr` is pointer-typed and lands in the branch
-    // above). The `this` case is the measured miscompile the W2.19a spike
-    // pinned: without it, `d.callf()` -- where `B::callf` returns
-    // `this->f()` and `D` overrides `f` -- compiles clean and prints the
-    // BASE's answer, because the call-site hop projection upcasts the
-    // receiver in a way `uniquePublicSingleBaseHops` never sees. Three
-    // shapes this fence over-rejects were measured accidentally correct
-    // and stay rejected deliberately: a same-type local pointer (W2.19b's
-    // devirtualization scope), a same-type pointer parameter (unsound
-    // across callers in principle), and a ctor-body virtual call (C++
-    // ctor semantics equal the static bind -- a future carve-out).
+    // admitted on a value receiver, where the static bind is exact, and
+    // (since W2.19b) on a pointer the devirtualization gate above
+    // resolved -- where the single-object region fact makes the dynamic
+    // type static. Through every OTHER pointer-shaped receiver the
+    // pointee's dynamic type is an assumption, and the fence sits HERE
+    // -- after `pointerExpr` is computed -- so every pointer spelling
+    // funnels through one check: `p->f()`, `(*p).f()`, a pointer
+    // parameter, and explicit or IMPLICIT `this` (a `CXXThisExpr` is
+    // pointer-typed). The `this` case is the measured miscompile the
+    // W2.19a spike pinned: without it, `d.callf()` -- where `B::callf`
+    // returns `this->f()` and `D` overrides `f` -- compiles clean and
+    // prints the BASE's answer, because the call-site hop projection
+    // upcasts the receiver in a way `uniquePublicSingleBaseHops` never
+    // sees. Shapes the fence still deliberately over-rejects: a
+    // same-type pointer parameter (unsound across callers in principle),
+    // a ctor-body virtual call (C++ ctor semantics equal the static bind
+    // -- a future carve-out), a qualified `p->B::f()` (the static bind
+    // is a future carve-out; devirt would be WRONG), and nullable /
+    // multi-object / global-object regions (no single-object fact).
     // Inside an importable method body this rejection rides the FR-112
     // omission channel like any other body failure; in a constructor it
     // is fatal at the call, the explicit ctor rejection W2.19's spike
     // record asked for.
-    if (pointerExpr && method->isVirtual())
+    if (pointerExpr && method->isVirtual() && !devirtualized)
       return emitError(loc)
              << "unsupported: virtual method call through a pointer";
     if (!pointerExpr)
-      return emitLValue(stripped);
+      return emitLValue(receiverStripped);
     const clang::VarDecl *regionBase = nullptr;
     FailureOr<Value> place =
         emitStructPointerPlace(pointerExpr, loc, /*writeback=*/nullptr,
-                               &regionBase);
+                               &regionBase, devirtReceiverClass);
     if (failed(place))
       return failure();
     // A GLOBAL region base resolves through a staged copy, and the call
@@ -2997,7 +3104,12 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
       !llvm::isa<emitrust::StructType>(receiverLValueType.getValueType()))
     return emitError(loc)
            << "unsupported: member call receiver is not a struct place";
-  if (!baseHops.empty()) {
+  // W2.19b: a devirtualized receiver was already reconciled to the devirt
+  // TARGET's class inside `emitStructPointerPlace` (the recomputed
+  // most-derived -> declaring-class chain); the hops peeled from the AST
+  // describe that SAME conversion, so replaying them here would project a
+  // second `member ["base"]` off a place that has no such field.
+  if (!baseHops.empty() && !devirtualized) {
     FailureOr<Value> baseReceiver = projectBaseHops(*receiver, baseHops, loc);
     if (failed(baseReceiver))
       return failure();
