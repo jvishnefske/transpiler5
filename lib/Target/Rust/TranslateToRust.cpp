@@ -542,6 +542,18 @@ private:
   /// The emission knobs this translation runs under.
   emitrust::RustEmitOptions options;
 
+  /// FR-110: mangled impl-member symbol -> (impl struct name, in-impl Rust
+  /// spelling), collected once per module (`emitModule`) from the
+  /// `emitrust.method_rust_name` attributes C++ method members carry. The
+  /// strip is PRINT-time only -- the IR, the receiver-mutability query, and
+  /// FR-52's shared call/impl symbol namespace all keep the module-unique
+  /// mangled names (module-level symbol uniqueness is what makes this flat
+  /// map sound; a receiver-TYPE lookup is not, measured: a make_unique
+  /// constructor's method_call receiver is `!emitrust.opaque<"Box<T>">`).
+  /// Builtin method spellings (`unwrap`, `len`, ...) and Phase-4 C owner
+  /// methods never appear as keys, so they pass through verbatim.
+  llvm::StringMap<std::pair<llvm::StringRef, llvm::StringRef>> methodRustNames;
+
   /// Per-function map from SSA values to their Rust binding names.
   DenseMap<Value, std::string> valueNames;
 
@@ -3353,6 +3365,16 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
            << "': the module must be linked against the defining translation "
               "unit before Rust emission";
   }
+  // FR-110: collect every C++ method member's in-impl spelling up front --
+  // method_call and qualified call_opaque sites print through this map, and
+  // both can appear in functions emitted BEFORE the impl that owns the
+  // member (the impls are appended at the end of the module).
+  for (auto implOp : moduleOp.getOps<emitrust::ImplOp>())
+    for (auto funcOp : implOp.getBody().front().getOps<emitrust::FuncOp>())
+      if (auto rustName = funcOp->getAttrOfType<StringAttr>(
+              emitrust::kMethodRustNameAttrName))
+        methodRustNames[SymbolTable::getSymbolName(funcOp).getValue()] = {
+            implOp.getStructName(), rustName.getValue()};
   // FR-70: a module reaching emission with an external-requirement GLOBAL
   // still marked skipped `emitrust-lower-external-requirements`. Unlike a
   // marked FUNCTION (body-less, so translation dies naturally), a
@@ -3908,8 +3930,18 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
     if (isAsyncHandleCall(call))
       isAsyncFn = true;
   });
+  // FR-110: a C++ method member prints its in-impl spelling (`fn get`, not
+  // `fn box_i32_get`) while KEEPING the mangled symbol in the IR --
+  // visibility, the mutability query, and FR-52's symbol namespace all
+  // still key on `symbol`. Attribute-keyed, never prefix-parsed (a Phase-4
+  // C owner method shares `method_of` but its symbol was never
+  // struct-prefixed).
+  StringRef printedName = symbol;
+  if (auto rustName =
+          op->getAttrOfType<StringAttr>(emitrust::kMethodRustNameAttrName))
+    printedName = rustName.getValue();
   os << (inTraitImpl ? StringRef("") : itemVisibility(symbol))
-     << (isAsyncFn ? "async fn " : "fn ") << symbol;
+     << (isAsyncFn ? "async fn " : "fn ") << printedName;
   // FR-52: a function in the transitive closure of a caller of an external
   // requirement is generic over the requirement trait. Everything else keeps
   // the signature it always had, so a project with no requirements is
@@ -4037,7 +4069,21 @@ LogicalResult RustEmitter::emitCallOpaque(emitrust::CallOpaqueOp callOp) {
     os << ") = ";
   }
 
-  os << callOp.getCallee() << "(";
+  // FR-110: a qualified static-method call carries the importer's
+  // mangled-on-both-sides `"<Struct>::<mangled>"` spelling (the methods.cpp
+  // RED-pinned scheme); print the right half's in-impl spelling instead
+  // (`BoxI32::origin(`), and ONLY when the left half is that member's own
+  // impl -- `println!`/`assert!`, `Struct::default`, and a foreign-struct
+  // qualification are not two-part mapped spellings and pass through
+  // verbatim.
+  StringRef callee = callOp.getCallee();
+  auto [qualifier, memberSymbol] = callee.split("::");
+  auto mappedMember = methodRustNames.find(memberSymbol);
+  if (!memberSymbol.empty() && mappedMember != methodRustNames.end() &&
+      mappedMember->second.first == qualifier)
+    os << qualifier << "::" << mappedMember->second.second << "(";
+  else
+    os << callee << "(";
   bool first = true;
   if (std::optional<ArrayAttr> args = callOp.getArgs()) {
     for (Attribute arg : *args) {
@@ -4109,7 +4155,16 @@ LogicalResult RustEmitter::emitMethodCall(emitrust::MethodCallOp callOp) {
     if (failed(emitPlaceExpr(loc, receiver, /*derefNeedsParens=*/true)))
       return failure();
   }
-  os << "." << callOp.getMethod() << "(";
+  // FR-110: a call whose method attribute is a mapped C++ member symbol
+  // prints the member's in-impl spelling (`.get(`, not `.box_i32_get(`).
+  // Builtin spellings and C owner methods are never map keys and pass
+  // through verbatim; the IR keeps the mangled symbol either way.
+  StringRef method = callOp.getMethod();
+  auto strippedMethod = methodRustNames.find(method);
+  os << "."
+     << (strippedMethod == methodRustNames.end() ? method
+                                                 : strippedMethod->second.second)
+     << "(";
   bool first = true;
   for (Value argument : callOp.getArgs()) {
     if (!first)

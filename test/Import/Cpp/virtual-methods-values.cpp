@@ -121,11 +121,11 @@ int pure_value(int n) {
 // The emitted Rust is ordinary inherent-method calls on values -- the
 // same surface non-virtual methods use. Nothing dynamic exists to emit.
 // RUST-LABEL: fn calls(
-// RUST: d.dog_noise()
-// RUST: d.base.animal_weight()
-// RUST: p.puppy_noise()
-// RUST: p.puppy_weight()
-// RUST: p.base.base.animal_tag()
+// RUST: d.noise()
+// RUST: d.base.weight()
+// RUST: p.noise()
+// RUST: p.weight()
+// RUST: p.base.base.tag()
 // RUST-NOT: dyn
 // RUST-NOT: trait
 // RUST-NOT: Box

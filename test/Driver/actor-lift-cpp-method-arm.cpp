@@ -18,15 +18,18 @@
 // RUN: FileCheck %s --check-prefix=WARN < %t.err
 // RUN: FileCheck %s --check-prefix=RUST --implicit-check-not=GActor < %t.rs
 //
-// WARN: actor-lift-cpp-method-arm.cpp:[[#@LINE+25]]:{{[0-9]+}}: warning: actor lift: demoted GActor: arm 'bump' is referenced from a method body
+// WARN: actor-lift-cpp-method-arm.cpp:[[#@LINE+28]]:{{[0-9]+}}: warning: actor lift: demoted GActor: arm 'bump' is referenced from a method body
 //
 // RUST: thread_local!
 // RUST: static G: std::cell::Cell<i32>
 // RUST: fn bump(d: i32) -> i32
 // RUST: struct SoloActor
 // RUST: impl SoloActor
+// FR-110 asymmetry pin: the actor-lift member keeps its own un-prefixed
+// symbol (`solo_bump` -- a Phase-4 owner method, never struct-prefixed,
+// never stripped), while the genuine C++ method sheds its `s_` mangle.
 // RUST: fn solo_bump(&mut self, d: i32) -> i32
-// RUST: fn s_step(&mut self) -> i32
+// RUST: fn step(&mut self) -> i32
 // RUST: bump(self.v)
 
 extern "C" int printf(const char *, ...);

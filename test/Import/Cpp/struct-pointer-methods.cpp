@@ -52,8 +52,8 @@ struct Counter {
 // CHECK-NEXT: %[[GOT:.*]] = call @Counter_get(%[[AREF]]) {emitrust.method_call}
 // CHECK-NEXT: call @Counter_bump(%[[MREF]], %[[GOT]]) {emitrust.method_call}
 // RUST-LABEL: fn tu0_via_mut_param(p: &mut Counter)
-// RUST-NEXT: let v{{[0-9]+}}: i32 = p.counter_get();
-// RUST-NEXT: p.counter_bump(v{{[0-9]+}});
+// RUST-NEXT: let v{{[0-9]+}}: i32 = p.get();
+// RUST-NEXT: p.bump(v{{[0-9]+}});
 static void via_mut_param(Counter *p) { p->bump(p->get()); }
 
 // The local receiver: the pointer is ERASED. Every call lands directly on

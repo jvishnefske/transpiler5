@@ -73,7 +73,7 @@ int use(int n) {
 // CHECK: func.func @use_(
 
 // RUST: impl Vec2 {
-// RUST: pub fn vec2_set(&mut self,
-// RUST: pub fn vec2_sum(&self) -> i32 {
+// RUST: pub fn set(&mut self,
+// RUST: pub fn sum(&self) -> i32 {
 // RUST: impl UOp {
-// RUST: pub fn u_op_get(&self) -> i32 {
+// RUST: pub fn get(&self) -> i32 {

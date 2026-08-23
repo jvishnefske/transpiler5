@@ -23,7 +23,7 @@
 //
 // RUST: thread_local!
 // RUST: static G: std::cell::Cell<i32>
-// RUST: fn s_peek(&mut self) -> i32
+// RUST: fn peek(&mut self) -> i32
 // RUST: G.with(
 
 extern "C" int printf(const char *, ...);

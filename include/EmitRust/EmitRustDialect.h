@@ -107,6 +107,26 @@ inline constexpr llvm::StringLiteral kHasCopyCtorAttrName =
 /// and nothing in the subset ever calls a destructor.
 inline constexpr llvm::StringLiteral kDropImplAttrName = "emitrust.drop_impl";
 
+/// FR-110: name of the discardable `func.func`/`emitrust.func` StringAttr
+/// the C importer attaches to a genuine C++ method (never a destructor --
+/// W2.17's `drop` rename owns that member -- and never a Phase-4 C owner
+/// method, whose symbol was never struct-prefixed): the method's IN-IMPL
+/// Rust spelling, i.e. the mangled module symbol minus the `<Struct>_`
+/// prefix (`fnRustName(<base>[_<overload codes>])`, `box_i32_get` ->
+/// `get`). Consumed at Rust PRINT time only: TranslateToRust renders the
+/// impl member's `fn <name>`, the `.method(` of every
+/// `emitrust.method_call` whose method attribute is the mangled symbol,
+/// and the right half of a qualified static `call_opaque
+/// "<Struct>::<mangled>"` from it. Everything else -- the
+/// receiver-mutability query, FR-52's shared call/impl symbol namespace
+/// (LowerExternalRequirements' `calleeOf`), shard bytecode, and the
+/// ledger/item-graph keys -- keeps joining on the module-unique mangled
+/// symbol; a rename baked into the IR would collide two classes' `get`.
+/// The spelling sorts after `emitrust.method_of` in the printed dict, so
+/// open-brace `{emitrust.method_of = "..."` golden pins survive.
+inline constexpr llvm::StringLiteral kMethodRustNameAttrName =
+    "emitrust.method_rust_name";
+
 //===----------------------------------------------------------------------===//
 // FR-52 -- external requirements
 //===----------------------------------------------------------------------===//
