@@ -7623,6 +7623,17 @@ piece and becomes FR-45.
   incremental-unreached-by-import.cpp,
   incremental-on-demand-record-diagnostic.cpp; the five join-key
   golden updates)
+  INDEPENDENT VERIFICATION (2026-08-22, second session, own sweep on
+  the 44-unit C build-sweep corpus, fresh clones): full meson suite
+  re-run 768/768; build sweep still matches its ledger (42/44, the two
+  heatshrink known-fails unchanged). Silent items (unported, empty
+  diagnostic AND empty blocker) 323 -> 0 -- functions-only 165 -> 0;
+  off-graph rows 337 -> 1; status `missing` 323 -> 55, all 55 now
+  tagged unreached-by-import; `dropped` 158 -> 442 as the reattributed
+  mass lands with real blockers. The C-corpus ranking moved the same
+  direction the C++ measurement did: returned-pointer 47 -> 134,
+  rejected-type-cascade 60 -> 126 -- independent confirmation that the
+  pre-FR-115 demand rankings were skewed on the C side too.
 
 
 - [x] FR-119 DEFECT: a free NON-MEMBER `operator` declaration escapes
