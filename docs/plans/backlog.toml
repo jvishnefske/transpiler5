@@ -140,12 +140,11 @@ anchor = "FR-123 DEFECT"
 
 [[items]]
 id = "FR-124"
-rank = 1
 kind = "defect"
-status = "spiked"
+status = "landed"
 size = "S"
-title = "derive(Copy) over a non-Copy base field: fixpoint the derive decision"
-summary = "GO: the real channel is the declared-vs-provided asymmetry in userOrInheritedDestructor; fix is an emitter-side nonCopyStructNames fixpoint over struct fields. Zero golden shifts structurally. W2.23's trigger folds into the seed."
+title = "derive(Copy) over a non-Copy base field: derive decision is a field fixpoint"
+summary = "Landed 2026-08-22: three-disjunct seed + fixpoint over struct fields, W2.23's trigger relocated in, invariant comment guards the class. All 60 E0204s dead; 2 more corpus units build; residuals are exactly FR-121/FR-125."
 blocked_by = []
 anchor = "FR-124 DEFECT"
 
