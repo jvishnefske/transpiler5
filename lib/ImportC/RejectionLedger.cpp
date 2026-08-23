@@ -436,6 +436,35 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
     // located rejection.
     {llvm::StringLiteral("collides with the emitted name of a different struct"),
      llvm::StringLiteral("record-name-clash")},
+    // W2.24 exceptions-as-Result-threading frontier. Every wording is
+    // emitted only from the C++-only throw plan (planThrows) or the
+    // try/throw emission paths, so a C program can never match one. The
+    // uncaught row sits FIRST: the call-outside-try wording contains both
+    // "potentially-throwing function" and "cannot propagate exceptions",
+    // and first-match must file it under the uncaught tag. Mirrored into
+    // test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("cannot propagate exceptions"),
+     llvm::StringLiteral("cxx-exception-uncaught")},
+    {llvm::StringLiteral("thrown exception payload"),
+     llvm::StringLiteral("cxx-exception-payload")},
+    {llvm::StringLiteral("potentially-throwing function"),
+     llvm::StringLiteral("cxx-exception-closure")},
+    {llvm::StringLiteral("a throw reaching a noexcept function"),
+     llvm::StringLiteral("cxx-exception-noexcept")},
+    {llvm::StringLiteral("catch by reference"),
+     llvm::StringLiteral("cxx-exception-catch")},
+    {llvm::StringLiteral("catch of a type other than"),
+     llvm::StringLiteral("cxx-exception-catch")},
+    {llvm::StringLiteral("more than one catch handler"),
+     llvm::StringLiteral("cxx-exception-catch")},
+    {llvm::StringLiteral("nested inside another try or catch"),
+     llvm::StringLiteral("cxx-exception-catch")},
+    {llvm::StringLiteral("rethrow outside a catch handler"),
+     llvm::StringLiteral("cxx-exception-catch")},
+    {llvm::StringLiteral("try/catch outside a translation-unit-level"),
+     llvm::StringLiteral("cxx-exception-catch")},
+    {llvm::StringLiteral("declared inside a try statement"),
+     llvm::StringLiteral("cxx-exception-catch")},
     {llvm::StringLiteral("unsupported top-level declaration"),
      llvm::StringLiteral("unsupported-top-level-decl")},
 };

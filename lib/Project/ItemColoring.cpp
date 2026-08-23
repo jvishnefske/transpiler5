@@ -403,27 +403,38 @@ bool isTemplated(const clang::Decl *decl) {
   return decl->isTemplated();
 }
 
-/// Records the body-level construct tags reachable from `stmt` through
-/// `note`.
+/// Records the construct tags reachable from `stmt` through `note`,
+/// each with its level.
 ///
-/// Body-level, not signature-level: a function whose BODY contains one of
-/// these can still be replaced by a stub with its original signature, so the
-/// caller stays Yellow. That distinction is the whole reason the probe reports
-/// the two levels separately.
-void noteBodyConstructs(const clang::Stmt *stmt,
-                        llvm::function_ref<void(llvm::StringRef)> note) {
+/// Most body constructs are body-level, not signature-level: a function
+/// whose BODY contains one can still be replaced by a stub with its
+/// original signature, so the caller stays Yellow. That distinction is the
+/// whole reason the probe reports the two levels separately.
+///
+/// W2.24 carved out the one exception: a THROW is SIGNATURE-level. Under
+/// Result threading the importer rewrites a throwing function to return
+/// the synthesized carrier enum, so no stub with the original signature
+/// can be written and the caller goes Red — the old body-level
+/// classification ("the caller stays Yellow") was measured FALSE for this
+/// tag. A TRY/CATCH-only body stays body-level: a function that handles
+/// everything locally keeps its declared signature, and moving it up
+/// would be a false Red, the probe's forbidden direction.
+void noteBodyConstructs(
+    const clang::Stmt *stmt,
+    llvm::function_ref<void(llvm::StringRef, bool signatureLevel)> note) {
   if (!stmt)
     return;
-  if (llvm::isa<clang::CXXThrowExpr>(stmt) ||
-      llvm::isa<clang::CXXTryStmt>(stmt))
-    note(tag::Exceptions);
+  if (llvm::isa<clang::CXXThrowExpr>(stmt))
+    note(tag::Exceptions, /*signatureLevel=*/true);
+  else if (llvm::isa<clang::CXXTryStmt>(stmt))
+    note(tag::Exceptions, /*signatureLevel=*/false);
   else if (llvm::isa<clang::AsmStmt>(stmt))
-    note(tag::InlineAsm);
+    note(tag::InlineAsm, /*signatureLevel=*/false);
   else if (llvm::isa<clang::LambdaExpr>(stmt))
-    note(tag::Lambda);
+    note(tag::Lambda, /*signatureLevel=*/false);
   else if (llvm::isa<clang::CXXNewExpr>(stmt) ||
            llvm::isa<clang::CXXDeleteExpr>(stmt))
-    note(tag::NewDelete);
+    note(tag::NewDelete, /*signatureLevel=*/false);
   // Bounded by the source's statement nesting; the AST is a tree, so no
   // visited set is needed.
   for (const clang::Stmt *child : stmt->children())
@@ -520,12 +531,15 @@ void AdmissibilityProbe::probeFunction(const clang::FunctionDecl *func) {
     if (!paramTag.empty())
       verdicts.reject(symbol, paramTag, /*signatureLevel=*/true);
   }
-  // The BODY is not: a function whose body throws still has a writable
-  // signature, so FR-42 would stub it and its callers only go Yellow.
+  // The BODY is mostly not — a stub can replace it — with the W2.24
+  // exception: a throwing body's signature is rewritten to the carrier
+  // enum, so `noteBodyConstructs` reports the level per construct
+  // (throw: signature; everything else, try/catch included: body).
   if (func->isThisDeclarationADefinition())
-    noteBodyConstructs(func->getBody(), [&](llvm::StringRef bodyTag) {
-      verdicts.reject(symbol, bodyTag, /*signatureLevel=*/false);
-    });
+    noteBodyConstructs(func->getBody(),
+                       [&](llvm::StringRef bodyTag, bool signatureLevel) {
+                         verdicts.reject(symbol, bodyTag, signatureLevel);
+                       });
 }
 
 /// W2.18: whether the SINGLE base of `record` is one the importer admits as

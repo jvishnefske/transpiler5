@@ -3468,6 +3468,87 @@ private:
   /// stays a located rejection.
   FailureOr<Value> emitVariantGet(const clang::CallExpr *call);
 
+  //===--------------------------------------------------------------------===//
+  // W2.24: exceptions as Result threading
+  //===--------------------------------------------------------------------===//
+
+  /// W2.24 Pass A: the can-throw closure — "does symbol S deliver a
+  /// `CXXThrowExpr` to its caller over direct calls", pure syntactic
+  /// reachability. Collects TU-LEVEL function definitions through the same
+  /// transparent containers `importDeclsIn` recurses (`extern "C"` linkage
+  /// specs and namespaces) — deliberately NOT
+  /// `collectPassAFunctionDefinitions`, whose `unit->decls()`-only walk
+  /// plus variadic/system-header filters would conclude "cannot throw"
+  /// for a namespaced throw and SILENTLY DROP the exception (the measured
+  /// spike trap). Methods are deliberately NOT collected: a method never
+  /// joins the closure, and a throw inside one stays a loud located
+  /// rejection at its own import (FR-112 omission + call-site error).
+  /// Validates the wave-1 gates over every closure member (one scalar
+  /// payload type per TU, payload-typed returns, arithmetic parameters,
+  /// no variadics, no noexcept, no taken addresses) with located errors;
+  /// provably inert for C (no walk runs at all — C has no throw).
+  LogicalResult planThrows(const clang::TranslationUnitDecl *unit);
+
+  /// Maps the TU's thrown payload clang type once, validating the W2.14
+  /// scalar set (signless integers and floats — the arith-constructible
+  /// payloads), and derives the carrier enum name (`Throws_i32`;
+  /// `ThrowsI32` under the idiomatic rename, the same non_camel_case_types
+  /// constraint W2.14 measured).
+  FailureOr<Type> throwsPayloadMlir(Location loc);
+
+  /// Creates (once per module) the synthesized carrier
+  /// `emitrust.data_enum_def` — variants `Ok0`/`Err0`, one payload field
+  /// "v" each, both of the payload type (the wave-1 return-type gate makes
+  /// Ok and Err share it, which is what lets call sites unwrap with a
+  /// SINGLE payload match) — and returns its type.
+  FailureOr<emitrust::DataEnumType> getOrCreateThrowsEnum(Location loc);
+
+  /// Constructs the carrier value tagging `payload` as Ok0 or Err0.
+  Value createThrowsValue(Location loc, bool isErr, Value payload);
+
+  /// Creates a two-arm RESULT-mode `emitrust.match` over a carrier value;
+  /// both arms bind the shared payload type. `buildArm` mirrors
+  /// `createVariantMatch`'s contract.
+  emitrust::MatchOp createThrowsMatch(
+      Location loc, Value scrutinee, Type resultType,
+      llvm::function_ref<void(unsigned index, Value payload)> buildArm);
+
+  /// Whether the current insertion context can deliver an exception: a
+  /// lexically enclosing try block, or a current function in the can-throw
+  /// closure (whose signature already carries the carrier).
+  bool throwsDeliveryAvailable() const;
+
+  /// Delivers a thrown payload from the CURRENT block: assign-and-branch
+  /// into the innermost try's catch block, or construct `Err0` and return
+  /// it. The caller checked `throwsDeliveryAvailable()` (with its own
+  /// construct-specific wording) and repositions the builder afterwards.
+  LogicalResult deliverThrow(Location loc, Value payload);
+
+  /// Unwraps a carrier-typed call result: two RESULT-mode matches (the i1
+  /// discriminant and the shared payload) plus the early-return cf
+  /// pattern. `emitrust.return` is HasParent<FuncOp>, so
+  /// `Err(e) => return Err(e)` is UNSPELLABLE inside a match arm, and the
+  /// single-slot statement-mode spelling is denied by unused_assignments
+  /// (both measured, design.md W2.24) — this two-match + cf.cond_br shape
+  /// is the byte-diff-verified route, structurized by lift-cf-to-scf into
+  /// the existing if/else-plus-tail pyramid. Returns the Ok payload value
+  /// with the builder positioned in the continuation block.
+  FailureOr<Value> unwrapThrowsResult(Location loc, Value result);
+
+  /// W2.24: `try { ... } catch (T v) { ... }` over the wave-1 gate (one
+  /// handler; catch by value of the payload type, or catch(...)). The
+  /// caught payload lives in an ordinary variable place bound to the catch
+  /// parameter; throws and unwrapped calls in the try block deliver into
+  /// the catch block through `deliverThrow`.
+  LogicalResult emitTryStmt(const clang::CXXTryStmt *tryStmt);
+
+  /// W2.24: `throw x;` / `throw;` in statement position. A rethrow reloads
+  /// the innermost handler's payload place. Contexts that cannot deliver
+  /// (main outside a try, methods, lambdas — anything outside the planned
+  /// closure) stay located rejections: emission never drops a throw, which
+  /// is the backstop that makes the planner's syntactic closure safe.
+  LogicalResult emitThrowStmt(const clang::CXXThrowExpr *expr);
+
   /// W2.2: lowers `place`'s initialization from a non-trivial
   /// `CXXConstructExpr` by invoking the matching constructor method
   /// (imported as an ordinary `&mut self` method by `importCXXMethods`,
@@ -6176,6 +6257,50 @@ private:
   /// by `variantAltIndex` (construction/assignment/get selection) and
   /// `createVariantMatch` (per-arm payload types).
   llvm::StringMap<llvm::SmallVector<Type, 2>> variantEnumAlternatives;
+
+  //===--------------------------------------------------------------------===//
+  // W2.24: exceptions-as-Result-threading state
+  //===--------------------------------------------------------------------===//
+
+  /// TU scope (planThrows resets): the can-throw closure over direct
+  /// TU-level calls, keyed by canonical declaration. A member's signature
+  /// imports with the carrier enum result; a call to one unwraps through
+  /// `unwrapThrowsResult`. `main` never joins (it cannot rewrite its
+  /// signature), so its unprotected throws/calls reject at emission.
+  llvm::DenseSet<const clang::FunctionDecl *> throwsClosure;
+  /// TU scope: the ONE thrown payload type (canonical, unqualified) the
+  /// planner admitted, null when the TU throws nothing.
+  clang::QualType throwsPayloadClangType;
+  /// TU scope: true when the TU has at least one typed TU-level throw and
+  /// planning succeeded — the gate on every try/throw emission path, so a
+  /// throw-free try keeps the historical generic rejection.
+  bool throwsPlanActive = false;
+  /// TU scope, resolved lazily by `throwsPayloadMlir`: the mapped payload
+  /// type and the carrier enum's symbol name.
+  Type throwsPayloadMappedType;
+  std::string throwsEnumName;
+  /// Module scope (never reset): carrier names whose
+  /// `emitrust.data_enum_def` was already emitted — a second throwing TU
+  /// with the same payload type reuses the one definition.
+  llvm::StringSet<> throwsEnumsEmitted;
+  /// Per-function: the stack of lexically enclosing try blocks (innermost
+  /// last). `payloadPlace` is null when the handler neither binds a
+  /// variable nor rethrows.
+  struct ThrowsTryContext {
+    Value payloadPlace;
+    Block *catchBlock;
+  };
+  llvm::SmallVector<ThrowsTryContext, 2> tryContexts;
+  /// Per-function: the payload places of lexically enclosing catch
+  /// handlers (for `throw;` rethrow), innermost last.
+  llvm::SmallVector<Value, 2> catchPayloadPlaces;
+  /// Per-function: current function is in the can-throw closure; its
+  /// original mapped return type (the Ok0 payload `emitReturnStmt` wraps).
+  bool currentFunctionThrows = false;
+  Type currentThrowsOkType;
+  /// Per-function: try/catch is admitted only in TU-level functions
+  /// (false in methods, lifted lambdas and va clones — wave-1 gate).
+  bool currentTryAllowed = false;
 
   /// W2.20: the module-level `use` paths already emitted, so a second
   /// `std::map` mention does not emit a duplicate `use` line.

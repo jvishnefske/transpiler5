@@ -128,6 +128,12 @@ LogicalResult CImporter::emitStmt(const clang::Stmt *stmt) {
   }
   if (const auto *ret = llvm::dyn_cast<clang::ReturnStmt>(stmt))
     return emitReturnStmt(ret);
+  // W2.24: try/catch — only when the TU-level throw plan is active, so a
+  // throw-free try keeps the historical generic statement fallback below
+  // (pinned in test/Import/Cpp/exceptions-invalid.cpp).
+  if (const auto *tryStmt = llvm::dyn_cast<clang::CXXTryStmt>(stmt);
+      tryStmt && throwsPlanActive)
+    return emitTryStmt(tryStmt);
   if (const auto *ifStmt = llvm::dyn_cast<clang::IfStmt>(stmt))
     return emitIfStmt(ifStmt);
   if (const auto *whileStmt = llvm::dyn_cast<clang::WhileStmt>(stmt))
@@ -1645,6 +1651,289 @@ CImporter::emitVariantConstruct(Type variantType,
   return emitError(loc)
          << "unsupported: this std::variant constructor shape is not "
             "supported";
+}
+
+//===----------------------------------------------------------------------===//
+// W2.24: exceptions as Result threading
+//===----------------------------------------------------------------------===//
+
+FailureOr<Type> CImporter::throwsPayloadMlir(Location loc) {
+  if (throwsPayloadMappedType)
+    return throwsPayloadMappedType;
+  FailureOr<Type> mapped = mapType(throwsPayloadClangType, loc);
+  if (failed(mapped))
+    return failure();
+  // The W2.14 scalar set: floats and SIGNLESS (signed-C) integers — the
+  // payloads whose arith constants back the discriminant match's yields.
+  auto intType = llvm::dyn_cast<IntegerType>(*mapped);
+  bool scalar =
+      llvm::isa<FloatType>(*mapped) || (intType && intType.isSignless());
+  std::optional<std::string> spelling = rustSpellingForElementType(*mapped);
+  if (!scalar || !spelling)
+    return emitError(loc) << "unsupported: thrown exception payload must be "
+                             "a supported scalar type";
+  throwsPayloadMappedType = *mapped;
+  // `Throws_i32` — `ThrowsI32` under the idiomatic rename: the same
+  // non_camel_case_types deny constraint W2.14 measured.
+  throwsEnumName = typeRustName("Throws_" + *spelling);
+  return throwsPayloadMappedType;
+}
+
+FailureOr<emitrust::DataEnumType>
+CImporter::getOrCreateThrowsEnum(Location loc) {
+  FailureOr<Type> payload = throwsPayloadMlir(loc);
+  if (failed(payload))
+    return failure();
+  auto enumType =
+      emitrust::DataEnumType::get(builder.getContext(), throwsEnumName);
+  if (throwsEnumsEmitted.insert(throwsEnumName).second) {
+    // Ok0/Err0 is a pinned FREE choice (W2.14's precedent spells V0/V1);
+    // both variants carry one payload field "v" of the SHARED payload
+    // type — the wave-1 return-type gate is what makes Ok and Err agree,
+    // and the single-payload-match unwrap depends on it.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::DataEnumDefOp>(
+        loc, moduleBuilder.getStringAttr(throwsEnumName),
+        moduleBuilder.getStrArrayAttr({"Ok0", "Err0"}),
+        moduleBuilder.getArrayAttr({moduleBuilder.getStrArrayAttr({"v"}),
+                                    moduleBuilder.getStrArrayAttr({"v"})}),
+        moduleBuilder.getArrayAttr(
+            {moduleBuilder.getTypeArrayAttr({*payload}),
+             moduleBuilder.getTypeArrayAttr({*payload})}));
+  }
+  return enumType;
+}
+
+Value CImporter::createThrowsValue(Location loc, bool isErr, Value payload) {
+  auto enumType =
+      emitrust::DataEnumType::get(builder.getContext(), throwsEnumName);
+  return builder
+      .create<emitrust::EnumVariantOp>(
+          loc, enumType,
+          FlatSymbolRefAttr::get(builder.getContext(), throwsEnumName),
+          builder.getStringAttr(isErr ? "Err0" : "Ok0"), ValueRange{payload})
+      .getResult();
+}
+
+emitrust::MatchOp CImporter::createThrowsMatch(
+    Location loc, Value scrutinee, Type resultType,
+    llvm::function_ref<void(unsigned index, Value payload)> buildArm) {
+  auto match = builder.create<emitrust::MatchOp>(
+      loc, resultType ? TypeRange{resultType} : TypeRange{}, scrutinee,
+      builder.getStrArrayAttr({"Ok0", "Err0"}), /*caseRegionsCount=*/2);
+  OpBuilder::InsertionGuard guard(builder);
+  for (unsigned index = 0; index < 2; ++index) {
+    Block &block = match.getCaseRegions()[index].emplaceBlock();
+    Value payload = block.addArgument(throwsPayloadMappedType, loc);
+    builder.setInsertionPointToStart(&block);
+    buildArm(index, payload);
+  }
+  return match;
+}
+
+bool CImporter::throwsDeliveryAvailable() const {
+  return !tryContexts.empty() || currentFunctionThrows;
+}
+
+LogicalResult CImporter::deliverThrow(Location loc, Value payload) {
+  if (!tryContexts.empty()) {
+    const ThrowsTryContext &context = tryContexts.back();
+    if (context.payloadPlace)
+      builder.create<emitrust::AssignOp>(loc, context.payloadPlace, payload);
+    builder.create<cf::BranchOp>(loc, context.catchBlock);
+    return success();
+  }
+  // Propagation: construct Err0 and return it — the pyramid's seed.
+  // `emitrust.return` is HasParent<FuncOp>, so this func.return in a cf
+  // block (structurized later by lift-cf-to-scf) is the ONLY spellable
+  // route; the closure gates guarantee no cursor writebacks exist.
+  Value err = createThrowsValue(loc, /*isErr=*/true, payload);
+  emitCursorWritebacks(loc);
+  builder.create<func::ReturnOp>(loc, err);
+  return success();
+}
+
+FailureOr<Value> CImporter::unwrapThrowsResult(Location loc, Value result) {
+  if (!throwsDeliveryAvailable())
+    return emitError(loc)
+           << "unsupported: call to a potentially-throwing function outside "
+              "a try block in a function that cannot propagate exceptions";
+  // TWO result-mode matches over the Copy carrier, NOT one statement-mode
+  // match assigning a payload slot: the single-slot spelling is denied by
+  // unused_assignments (measured — TranslateToRust's analyzeControl never
+  // proves a match writes, so the dead initializer survives; design.md
+  // W2.24 constraint 2, resolution (a): zero emitter change).
+  Value disc = createThrowsMatch(loc, result, builder.getI1Type(),
+                                 [&](unsigned index, Value payload) {
+                                   builder.create<emitrust::YieldOp>(
+                                       loc, ValueRange{createBoolConstant(
+                                                loc, index == 1)});
+                                 })
+                   .getResult();
+  Value pay = createThrowsMatch(loc, result, throwsPayloadMappedType,
+                                [&](unsigned index, Value payload) {
+                                  builder.create<emitrust::YieldOp>(
+                                      loc, ValueRange{payload});
+                                })
+                  .getResult();
+  Block *errBlock = createBlock();
+  Block *contBlock = createBlock();
+  builder.create<cf::CondBranchOp>(loc, disc, errBlock, ValueRange(),
+                                   contBlock, ValueRange());
+  builder.setInsertionPointToEnd(errBlock);
+  if (failed(deliverThrow(loc, pay)))
+    return failure();
+  builder.setInsertionPointToEnd(contBlock);
+  return pay;
+}
+
+/// Whether `stmt` lexically contains a bare `throw;` rethrow (nested try
+/// statements cannot occur below: emitTryStmt rejects nesting first).
+static bool stmtContainsRethrow(const clang::Stmt *stmt) {
+  if (!stmt)
+    return false;
+  if (const auto *throwExpr = llvm::dyn_cast<clang::CXXThrowExpr>(stmt))
+    if (!throwExpr->getSubExpr())
+      return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (stmtContainsRethrow(child))
+      return true;
+  return false;
+}
+
+/// The first destructor-carrying local declared under `stmt`, or null.
+/// W2.24 divergence gate: C++ destroys a try-block local at try exit
+/// (BEFORE the handler runs); the image's variable places are
+/// function-scoped after structurization, so an observable destructor
+/// would fire at function exit instead — rejected, never diverged.
+static const clang::VarDecl *
+findDestructorLocalIn(clang::ASTContext &context, const clang::Stmt *stmt) {
+  if (!stmt)
+    return nullptr;
+  if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(stmt))
+    for (const clang::Decl *decl : declStmt->decls())
+      if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
+        if (userOrInheritedDestructor(context, var->getType()))
+          return var;
+  for (const clang::Stmt *child : stmt->children())
+    if (const clang::VarDecl *var = findDestructorLocalIn(context, child))
+      return var;
+  return nullptr;
+}
+
+LogicalResult CImporter::emitTryStmt(const clang::CXXTryStmt *tryStmt) {
+  Location loc = translateLoc(tryStmt->getTryLoc());
+  // Wave-1 gates, each a located rejection.
+  if (!currentTryAllowed)
+    return emitError(loc) << "unsupported: try/catch outside a "
+                             "translation-unit-level function";
+  if (!tryContexts.empty() || !catchPayloadPlaces.empty())
+    return emitError(loc) << "unsupported: a try statement nested inside "
+                             "another try or catch";
+  if (tryStmt->getNumHandlers() != 1)
+    return emitError(loc) << "unsupported: a try statement with more than "
+                             "one catch handler";
+  const clang::CXXCatchStmt *handler = tryStmt->getHandler(0);
+  const clang::VarDecl *exceptionVar = handler->getExceptionDecl();
+  if (exceptionVar) {
+    clang::QualType caughtType = exceptionVar->getType();
+    if (caughtType->isReferenceType())
+      return emitError(translateLoc(exceptionVar->getLocation()))
+             << "unsupported: catch by reference";
+    if (!astContext().hasSameUnqualifiedType(
+            astContext().getCanonicalType(caughtType),
+            throwsPayloadClangType))
+      return emitError(translateLoc(exceptionVar->getLocation()))
+             << "unsupported: catch of a type other than the thrown "
+                "payload type";
+  }
+  if (const clang::VarDecl *droppy =
+          findDestructorLocalIn(astContext(), tryStmt))
+    return emitError(translateLoc(droppy->getLocation()))
+           << "unsupported: a class with a destructor declared inside a "
+              "try statement";
+  FailureOr<Type> payloadType = throwsPayloadMlir(loc);
+  if (failed(payloadType))
+    return failure();
+  // The caught payload lives in an ordinary variable place, bound to the
+  // catch parameter; a payload-less handler (catch(...) with no rethrow)
+  // needs no place at all — delivery is control-only, and an unread
+  // store must never survive to fight the deny lints.
+  bool handlerRethrows = stmtContainsRethrow(handler->getHandlerBlock());
+  Value payloadPlace;
+  if (exceptionVar || handlerRethrows)
+    payloadPlace = createVariablePlace(
+        loc, *payloadType,
+        exceptionVar && !exceptionVar->getName().empty()
+            ? mangleMemberName(exceptionVar->getName())
+            : std::string());
+  Block *catchBlock = createBlock();
+  Block *contBlock = createBlock();
+  tryContexts.push_back({payloadPlace, catchBlock});
+  LogicalResult bodyResult = emitStmt(tryStmt->getTryBlock());
+  // Popped BEFORE the handler imports: a throw inside a catch handler
+  // escapes this try (the planner's scan mirrors this exactly).
+  tryContexts.pop_back();
+  if (failed(bodyResult))
+    return failure();
+  if (!isTerminated(builder.getInsertionBlock()))
+    builder.create<cf::BranchOp>(loc, contBlock);
+  builder.setInsertionPointToEnd(catchBlock);
+  if (exceptionVar)
+    symbols[exceptionVar] = payloadPlace;
+  catchPayloadPlaces.push_back(payloadPlace);
+  LogicalResult handlerResult = emitStmt(handler->getHandlerBlock());
+  catchPayloadPlaces.pop_back();
+  if (failed(handlerResult))
+    return failure();
+  if (!isTerminated(builder.getInsertionBlock()))
+    builder.create<cf::BranchOp>(loc, contBlock);
+  builder.setInsertionPointToEnd(contBlock);
+  return success();
+}
+
+LogicalResult CImporter::emitThrowStmt(const clang::CXXThrowExpr *expr) {
+  Location loc = translateLoc(expr->getThrowLoc());
+  const clang::Expr *sub = expr->getSubExpr();
+  if (!sub) {
+    // `throw;` — rethrow: reload the innermost handler's payload and
+    // deliver it onward (to an outer try in a caller, or as Err0).
+    if (catchPayloadPlaces.empty() || !catchPayloadPlaces.back())
+      return emitError(loc) << "unsupported: rethrow outside a catch "
+                               "handler";
+    if (!throwsDeliveryAvailable())
+      return emitError(loc)
+             << "unsupported: throw outside a try block in a function that "
+                "cannot propagate exceptions";
+    Value payload = loadPlace(loc, catchPayloadPlaces.back());
+    if (failed(deliverThrow(loc, payload)))
+      return failure();
+    builder.setInsertionPointToEnd(createBlock());
+    return success();
+  }
+  // The context check comes FIRST (before the payload evaluates): the
+  // uncaught-exception rejection must be deterministic, and emission never
+  // drops a throw — this backstop is what keeps the planner's syntactic
+  // closure safe for every context it skips (methods, lambdas, main).
+  if (!throwsDeliveryAvailable())
+    return emitError(loc)
+           << "unsupported: throw outside a try block in a function that "
+              "cannot propagate exceptions";
+  FailureOr<Type> payloadType = throwsPayloadMlir(loc);
+  if (failed(payloadType))
+    return failure();
+  FailureOr<Value> payload = emitRValue(sub);
+  if (failed(payload))
+    return failure();
+  if ((*payload).getType() != *payloadType) // Defensive; planThrows pinned
+                                            // one payload type per TU.
+    return emitError(loc) << "unsupported: thrown exception payload must "
+                             "be a supported scalar type";
+  if (failed(deliverThrow(loc, *payload)))
+    return failure();
+  // Continue in a fresh block; if it stays unreachable it is erased later.
+  builder.setInsertionPointToEnd(createBlock());
+  return success();
 }
 
 void CImporter::collectVoidFnPtrHolders(const clang::Stmt *body) {
@@ -4977,6 +5266,13 @@ LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
     }
     if (failed(value))
       return failure();
+    // W2.24: a can-throw-closure member's declared return value wraps in
+    // the carrier's Ok0 variant (its signature already carries the enum).
+    if (currentFunctionThrows) {
+      if ((*value).getType() != currentThrowsOkType)
+        return emitError(loc) << "unsupported: return value type mismatch";
+      value = createThrowsValue(loc, /*isErr=*/false, *value);
+    }
     if ((*value).getType() != currentReturnType)
       return emitError(loc) << "unsupported: return value type mismatch";
     emitCursorWritebacks(loc);
@@ -5002,6 +5298,12 @@ LogicalResult CImporter::emitExprStmt(const clang::Expr *expr) {
   // statement lowerings (the by-name printf intercept in particular).
   if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(e))
     return emitExprStmt(cleanups->getSubExpr());
+  // W2.24: `throw x;` / `throw;` in statement position, only under an
+  // active throw plan — every other context (a throw-free-plan TU, a
+  // value-position throw) keeps the generic located expression rejection.
+  if (const auto *throwExpr = llvm::dyn_cast<clang::CXXThrowExpr>(e);
+      throwExpr && throwsPlanActive)
+    return emitThrowStmt(throwExpr);
   if (const auto *compound = llvm::dyn_cast<clang::CompoundAssignOperator>(e))
     return emitCompoundAssign(compound);
   if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e)) {

@@ -499,6 +499,22 @@ _CXX_BLOCKER_SUBSTRINGS = [
     # FR-108 record-name clash (language-agnostic; mirrors
     # lib/ImportC/RejectionLedger.cpp).
     ("collides with the emitted name of a different struct", "record-name-clash"),
+    # W2.24 exceptions-as-Result-threading frontier. The uncaught row sits
+    # FIRST: the call-outside-try wording contains both "potentially-
+    # throwing function" and "cannot propagate exceptions", and first-match
+    # must file it under the uncaught tag. Mirrors
+    # lib/ImportC/RejectionLedger.cpp.
+    ("cannot propagate exceptions", "cxx-exception-uncaught"),
+    ("thrown exception payload", "cxx-exception-payload"),
+    ("potentially-throwing function", "cxx-exception-closure"),
+    ("a throw reaching a noexcept function", "cxx-exception-noexcept"),
+    ("catch by reference", "cxx-exception-catch"),
+    ("catch of a type other than", "cxx-exception-catch"),
+    ("more than one catch handler", "cxx-exception-catch"),
+    ("nested inside another try or catch", "cxx-exception-catch"),
+    ("rethrow outside a catch handler", "cxx-exception-catch"),
+    ("try/catch outside a translation-unit-level", "cxx-exception-catch"),
+    ("declared inside a try statement", "cxx-exception-catch"),
     ("unsupported top-level declaration", "unsupported-top-level-decl"),
 ]
 # Generic dispatch fallbacks that name the offending AST node class. These are

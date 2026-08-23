@@ -1,6 +1,7 @@
-// Cpp17Suite 00902: frontier marker (corpus-only, no task) -- try/throw/
-// catch of an int. Pins the W2.0 baseline "unsupported statement:
-// CXXTryStmt" frontier as an UNSUPPORTED corpus entry.
+// Cpp17Suite 00902: try/throw/catch of an int. UNSUPPORTED from the W2.0
+// baseline until W2.24 flipped it (exceptions as Result threading through
+// a synthesized closed data enum) -- the LAST frontier marker; the ledger
+// stands complete at 35/35.
 extern "C" int printf(const char *, ...);
 
 int checked_div(int num, int den) {

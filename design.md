@@ -11900,12 +11900,16 @@ STL surface (vector/string/array/pair/optional/string_view/variant, by-value
 lambdas, structured bindings, ranged-for). At the time this roadmap was
 written the Cpp17Suite ledger stood at 23/26 with three frontier markers
 left: 00801 (copy constructor / elision sensor), 00901 (inheritance +
-virtual dispatch), 00902 (exceptions). The W2.15+ waves have since added
-nine corpus entries; **W2.19b flipped 00901** (devirtualization) and
-**W2.23 flipped 00801** (copy semantics -- the elision sensor printing
-copies=0 through C++17 guaranteed elision, exactly what it was built to
-verify). As of W2.23 the ledger stands at 34/35, and **00902
-(exceptions, W2.24) is the LAST frontier marker standing.**
+virtual dispatch), 00902 (exceptions). The W2.15+ waves added nine
+corpus entries; W2.19b flipped 00901 (devirtualization), W2.23 flipped
+00801 (guaranteed-elision copies=0), and **W2.24 flipped 00902 --
+THE FRONTIER LIST IS EMPTY. Cpp17Suite stands 35/35: every corpus
+entry transpiles byte-identically against its clang++ native.** The
+markers did their job for two years of waves: each one fell to the
+construct it was built to sense, none was ever edited to pass, and the
+one MISCOMPILE quarantine file is still empty. The C++ subset's
+frontier is now wherever the external demand measurement says it is,
+not where this corpus can see.
 
 Measured frontier, 2026-08-21, one probe per construct through
 `build/tools/emitrust-cc --emit=rust` (every one is a LOCATED rejection --
@@ -12914,7 +12918,7 @@ whole-program demand.
   this wave.
 
 
-- [ ] W2.24 `try`/`throw`/`catch` (flips 00902). Spike verdict
+- [x] W2.24 `try`/`throw`/`catch` (flips 00902). Spike verdict
   **GO-WITH-CONSTRAINTS -- IMAGE A, Result threading rendered as a
   synthesized closed data enum** (2026-08-21). Ranked last on DEMAND,
   not on uncertainty: the design question now has an answer, but a grep
@@ -13014,6 +13018,44 @@ whole-program demand.
   recursive -- a SILENT-MISCOMPILE risk, so an explicit reject, not an
   omission; an uncaught throw; `noexcept` with a reachable throw; and a
   throw inside a constructor or destructor.
+  LANDED 2026-08-22 -- **00902 FLIPS. Cpp17Suite 35/35 COMPLETE**
+  (total=35 transpiled=35 passed=35 miscompiled=0 unsupported=0).
+  The re-verification (eighteen increments after the spike) found two
+  walls the original could not see, both resolved: (1) the synthesized
+  ThrowsI32 could NOT legalize -- createDefaultInitializedLets had no
+  DataEnumType arm and every resulted scf.if died non-located; the arm
+  ships with the opaque `<Name>::default()` spelling, whose surviving
+  placeholder is a LOUD E0599 (data enums deliberately derive no
+  Default) -- the legal failure direction -- and whose elision was
+  verified in every built crate. (2) The single-payload-slot
+  propagation spelling is DENIED by unused_assignments, because
+  analyzeControl's MatchOp falls to the conservative no-write-guarantee
+  fallback; the shipped shape is TWO result-mode matches on the Copy
+  scrutinee (disc + payload), byte-diffed at depth 3 under the full
+  deny table -- the zero-emitter-change resolution, chosen over
+  teaching analyzeControl MatchOp (a byte-shift risk only the full
+  suite could clear).
+  THE CAN-THROW WALK is planThrows, a NEW recursive walk per the
+  spike's trap (collectPassAFunctionDefinitions ALSO filters variadic
+  and system-header decls -- a second silent-drop vector the original
+  spike did not list); provably inert for C (early-return for non-C++,
+  CTestSuite unchanged). Namespaced throwers ADMITTED (the walk
+  reaches them -- pinned by @ns_deep_inner); method throws stay out
+  via the FR-112 warning+error PAIR (the drifted pin shape);
+  devirtualized edges stay OUT of the closure in wave 1 per the
+  spike's recommendation. Drop-during-unwind byte-diffed (f64 payload
+  + W2.17 ctor/dtor ordering); throw-in-loop, depth-3, rethrow,
+  catch(...) all byte-identical with stderr diffed per the W2.22
+  precedent. ItemColoring now reports LEVEL PER CONSTRUCT: throw is
+  signature-level (transitive callers Red one hop), try-only is
+  body-level -- the falsely-commented block corrected with its
+  coloring golden. Five ledger tags mirrored.
+  Gates: full meson suite 790/790 (fast 559 + slow/EndToEnd 231), zero
+  golden shifts beyond the ratchet; CTestSuite 220/220/0/0.
+  (test/Import/Cpp/exceptions.cpp, exceptions-invalid.cpp;
+  test/EndToEnd/cpp-exceptions.cpp, cpp-exceptions-drop.cpp;
+  test/Project/coloring-cpp-exceptions.cpp)
+
 
 - [ ] W2.25 (NEW WAVE) Operator overloading. **The single biggest
   construct in the measured external corpus -- 2212 deduped blocked

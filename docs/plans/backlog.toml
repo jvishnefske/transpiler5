@@ -309,12 +309,11 @@ anchor = "FR-82 Interior-member addresses"
 
 [[items]]
 id = "W2.24"
-rank = 18
 kind = "feature"
-status = "in-flight"
+status = "landed"
 size = "L"
 title = "Exceptions as Result threading (synthesized closed data enum)"
-summary = "GO on image A; image B measured NO-GO (catch_unwind swallows the project's own UB-refinement panics). Demand is nil (0 in RealWorld, 11 items in Track 5) -- stays last."
+summary = "Landed 2026-08-22: 00902 flips, Cpp17Suite 35/35 COMPLETE. planThrows recursive walk, two-match propagation (deny-lint-safe), DataEnumType default arm in SCF lowering. The frontier list is empty."
 blocked_by = []
 anchor = "W2.24"
 
