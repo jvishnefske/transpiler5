@@ -79,6 +79,22 @@ createDefaultInitializedLets(OpTy op, const TypeConverter *typeConverter,
     if (!resultType)
       return rewriter.notifyMatchFailure(op, "result type conversion failed");
     Attribute defaultValue = getDefaultValueAttr(resultType);
+    // W2.23: a STRUCT result -- the early-return structurization of a
+    // struct-returning function (`if (pick) return p; return q;`, the
+    // two-return copy shape) yields the struct through the scf.if -- takes
+    // `Name::default()`, the exact FR-113 enum precedent one paragraph up
+    // in getDefaultValueAttr: every emitted struct_def carries a Default
+    // (derived or explicit), and the placeholder is dead -- the lowering
+    // overwrites it on every branch, and for a droppy struct the
+    // FR-61/FR-105 deferred-binding machinery elides the dead initializer
+    // rather than dropping it (byte-diffed: no phantom destructor run;
+    // test/EndToEnd/cpp-copy-dtor.cpp). Kept local to the SCF lowering so
+    // `ub.poison` of struct type stays unsupported.
+    if (!defaultValue)
+      if (auto structType = dyn_cast<emitrust::StructType>(resultType))
+        defaultValue = emitrust::OpaqueAttr::get(
+            structType.getContext(),
+            (structType.getName() + "::default()").str());
     if (!defaultValue)
       return rewriter.notifyMatchFailure(
           op, "no default value for the result type");

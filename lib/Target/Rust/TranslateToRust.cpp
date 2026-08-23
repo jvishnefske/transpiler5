@@ -1613,15 +1613,33 @@ void RustEmitter::computeDeferredInits(Block &block) {
     } else {
       return;
     }
-    // W2.17: a binding whose struct carries a `Drop` impl is NEVER deferred.
-    // `let x: T;` is an uninitialized Rust binding and is never dropped, so
-    // deferring the initializer deletes the destructor's side effects
-    // outright -- a compile-clean miscompile. (`drop()` is a read of the
-    // whole object on every path, so the initializer is by definition live.)
-    if (bindingHasDrop(binding))
-      return;
+    // W2.17: a binding whose struct carries a `Drop` impl is (almost) never
+    // deferred. `let x: T;` is an uninitialized Rust binding and is never
+    // dropped, so deferring the initializer deletes the destructor's side
+    // effects outright -- a compile-clean miscompile. (`drop()` is a read
+    // of the whole object on every path, so the initializer is by
+    // definition live.)
+    //
+    // W2.23 carves out the ONE shape where the placeholder itself is the
+    // miscompile: a droppy binding whose first touch on EVERY path is a
+    // WHOLE-value assignment (`Loud lt = loud_two(..)`, and the SCF
+    // result-lets of a two-return copy function). There the synthesized
+    // `Loud::default()` stands in for an object the C++ program never
+    // constructed, and the whole assignment DROPS it -- a phantom `dtor 0`
+    // against nothing in native (measured). Deferring is exactly correct:
+    // definite assignment on every fall-through path (`writtenAtExit`, or
+    // a diverging path on which native constructs nothing either)
+    // reproduces "the object exists from its constructing assignment".
+    // Every W2.17 shape keeps its placeholder: a constructor call is a
+    // &mut borrow (a READ, so `readFirst` holds), a never-touched guard
+    // binding has no whole write (`writtenAtExit` fails), and the
+    // reassignment/loop-carry shapes the importer never emits for droppy
+    // bindings stay conservatively undeferred.
+    bool hasDrop = bindingHasDrop(binding);
     // Only worth deferring when the binding is actually read; an unread
-    // binding is `_`-prefixed instead (its dead init then draws no warning).
+    // binding is `_`-prefixed instead (its dead init then draws no
+    // warning). A droppy binding proceeds regardless: its scope-end drop
+    // is an observable read no user list shows.
     bool isRead = false;
     for (Operation *user : binding.getUsers()) {
       if (unreachableOps.count(user) || droppedOps.count(user) ||
@@ -1630,7 +1648,7 @@ void RustEmitter::computeDeferredInits(Block &block) {
       isRead = true;
       break;
     }
-    if (!isRead)
+    if (!isRead && !hasDrop)
       return;
     Liveness info =
         analyzeSeq(std::next(op->getIterator()), op->getBlock()->end(), binding,
@@ -1638,6 +1656,9 @@ void RustEmitter::computeDeferredInits(Block &block) {
                    /*brk=*/nullptr, /*partialWriteBlocks=*/true);
     if (info.readFirst)
       return; // the initializer is live: some path reads before writing
+    if (hasDrop && (!(info.writtenAtExit || info.diverges) ||
+                    info.maxWrites >= 2 || info.loopReassign))
+      return; // W2.17 posture for every shape but the proven one above
     // `mut` is needed when a path assigns more than once, when the binding is
     // reassigned across loop iterations, or when it is mutably borrowed after
     // its (single) initializing assignment.
@@ -5253,6 +5274,14 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   // rule above. No existing golden can shift: no pre-W2.17 module can carry
   // the marker, because a user-declared destructor was a hard rejection.
   copyable = copyable && !structDefOp->hasAttr(emitrust::kHasDropAttrName);
+  // W2.23: a class with a user copy constructor loses `Copy` too -- the
+  // imported ctor call is the ONLY copy point, and a bitwise `Copy` at a
+  // by-value pass would silently substitute for the user's constructor
+  // (0 copies observed where C++ mandates 1; the spike's compile-clean
+  // miscompile). Same plumbing as the has_drop line above, different
+  // trigger; the attr is load-bearing exactly for the
+  // copy-ctor-without-destructor class, the only kind admitted by value.
+  copyable = copyable && !structDefOp->hasAttr(emitrust::kHasCopyCtorAttrName);
   os << "#[derive(Clone" << (copyable ? ", Copy" : "")
      << (derivable ? ", Default" : "") << ")]\n";
   // A field-less struct_def (C's `struct T {};`) prints unit-like with an

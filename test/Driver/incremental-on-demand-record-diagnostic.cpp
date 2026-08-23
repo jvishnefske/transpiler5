@@ -24,11 +24,12 @@
 // RUN: not emitrust-cc --emit=crate %s -o %t.strict 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=STRICT
 
-// --- Rejected instantiation, reached only from use_box's body. Graph node
-// --- `BoxI32`.
+// --- Rejected instantiation (MOVE ctor -- the pre-W2.23 copy-ctor specimen
+// --- is admitted now, same gate and wording), reached only from use_box's
+// --- body. Graph node `BoxI32`.
 template <typename T> struct Box {
   T v;
-  Box(const Box &o) : v(o.v) {}
+  Box(Box &&o) : v(o.v) {}
 };
 int use_box() {
   Box<int> *b = 0;
@@ -41,7 +42,7 @@ int use_box() {
 struct Outer {
   struct Inner {
     int v;
-    Inner(const Inner &o) : v(o.v) {}
+    Inner(Inner &&o) : v(o.v) {}
   };
   Inner field;
 };

@@ -281,6 +281,28 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
     // why the tinyxml2/jsoncpp cascade attribution could not see it.
     {llvm::StringLiteral("copy/move/delegating constructor"),
      llvm::StringLiteral("cxx-copy-ctor")},
+    // W2.23 admitted the user-provided `T(const T&)` copy constructor;
+    // the broad "copy constructor" needle below catches every residual
+    // wording of the wave in one row -- the non-const-`T&` shape
+    // ("copy constructor taking a non-const reference"), the
+    // implementation-defined NRVO-candidate return ("NRVO-candidate
+    // return of a class with a copy constructor"), and the E0277 array
+    // boundary ("array of a class with a copy constructor"). No earlier
+    // needle is a substring of any of them (the droppy array row says
+    // "destructor"), and the combined-gate wording above still matches
+    // first for the move/delegating/defaulted rejections. Mirrored into
+    // test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("copy constructor"),
+     llvm::StringLiteral("cxx-copy-ctor")},
+    // W2.23's other half: whole-object assignment. The IMPLICIT copy
+    // assignment lowers memberwise in statement position; the residual
+    // shapes (non-scalar members, a value use of the `T&` result) carry
+    // this honest wording -- replacing the misleading "omitted from
+    // class" message an implicit member used to borrow. Tagged apart from
+    // cxx-copy-ctor because copy-ASSIGNMENT is a different AST node and a
+    // different backlog item. Mirrored into test/RealWorld/run_realworld.py.
+    {llvm::StringLiteral("implicit copy assignment"),
+     llvm::StringLiteral("cxx-copy-assign")},
     // FR-48 landed reference PARAMETERS; the four wordings below are the
     // residual reference positions, all still tagged `cxx-references` so
     // the backlog keeps ranking them as one blocker. "rvalue reference

@@ -597,6 +597,28 @@ static bool typeHasTransitiveDestructor(clang::ASTContext &context,
 /// destructor-carrying member, array, global, by-value parameter or return,
 /// or an unmodelled scope) are raised where the OBJECT is declared and have
 /// no record-level screen at all, so they are not restated here.
+/// W2.23: deliberate clone of the copy-constructor half of the importer's
+/// class gate (`CImporter::importCXXMethods`) and of
+/// `admittedCopyConstructor` in lib/ImportC/ImportCAggregates.cpp -- same
+/// same-header reason as `admitsSingleBaseAsField` above; the two must
+/// move together. A user-provided single-parameter const non-volatile
+/// lvalue-reference copy constructor is ADMITTED (it imports as an
+/// ordinary method); everything else the gate inspects -- move,
+/// delegating, `= default`ed copy, non-const `T&` copy -- stays a
+/// class-level rejection, so the screen keeps tagging it. Screening the
+/// admitted shape would mint a false Red on every copy-ctor class, the
+/// probe's forbidden direction
+/// (test/Project/coloring-cpp-class-gates.cpp pins both halves).
+static bool admitsCopyConstructorAsMethod(const clang::CXXConstructorDecl *ctor) {
+  if (!ctor->isCopyConstructor() || !ctor->isUserProvided() ||
+      !ctor->isDefined() || ctor->getNumParams() != 1)
+    return false;
+  const auto *reference =
+      ctor->getParamDecl(0)->getType()->getAs<clang::LValueReferenceType>();
+  return reference && reference->getPointeeType().isConstQualified() &&
+         !reference->getPointeeType().isVolatileQualified();
+}
+
 static bool admitsDestructorAsDrop(const clang::CXXRecordDecl *record,
                                    const clang::CXXMethodDecl *destructor) {
   // W2.26: `isVirtual` alone no longer disqualifies -- the sole-virtual-
@@ -676,10 +698,16 @@ void AdmissibilityProbe::probeRecord(const clang::RecordDecl *record,
       // A CONVERSION FUNCTION is deliberately NOT screened: FR-117 OMITS one
       // and keeps the class importable, so screening it would mint a fresh
       // false red -- this probe's unsafe direction.
+      // W2.23 narrowed the importer's gate -- the user-provided
+      // `T(const T&)` copy ctor imports -- and this screen narrowed in
+      // lockstep (`admitsCopyConstructorAsMethod` above), or every
+      // admitted copy-ctor class would mint a fresh false Red.
       if (!cxxRecord->isInStdNamespace())
         if (const auto *ctor =
                 llvm::dyn_cast<clang::CXXConstructorDecl>(method))
-          if (ctor->isCopyOrMoveConstructor() || ctor->isDelegatingConstructor())
+          if ((ctor->isCopyOrMoveConstructor() ||
+               ctor->isDelegatingConstructor()) &&
+              !admitsCopyConstructorAsMethod(ctor))
             verdicts.reject(symbol, tag::CopyMoveConstructor,
                             /*signatureLevel=*/false);
     }

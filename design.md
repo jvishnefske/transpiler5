@@ -11776,11 +11776,11 @@ lambdas, structured bindings, ranged-for). At the time this roadmap was
 written the Cpp17Suite ledger stood at 23/26 with three frontier markers
 left: 00801 (copy constructor / elision sensor), 00901 (inheritance +
 virtual dispatch), 00902 (exceptions). The W2.15+ waves have since added
-nine corpus entries, and **W2.19b flipped 00901 itself** -- the first
-frontier MARKER to fall, via devirtualization of the single-object base
-pointer. As of W2.19b the ledger stands at 33/36, with 00801 (copy
-semantics, W2.23's sensor) and 00902 (exceptions, W2.24) the two markers
-still out.
+nine corpus entries; **W2.19b flipped 00901** (devirtualization) and
+**W2.23 flipped 00801** (copy semantics -- the elision sensor printing
+copies=0 through C++17 guaranteed elision, exactly what it was built to
+verify). As of W2.23 the ledger stands at 34/35, and **00902
+(exceptions, W2.24) is the LAST frontier marker standing.**
 
 Measured frontier, 2026-08-21, one probe per construct through
 `build/tools/emitrust-cc --emit=rust` (every one is a LOCATED rejection --
@@ -12647,7 +12647,7 @@ whole-program demand.
   repointed the stale BADCOUT pin of test/Import/Cpp/stl-invalid.cpp to
   std::clog)
 
-- [ ] W2.23 Copy constructors and C++ value semantics (the 00801
+- [x] W2.23 Copy constructors and C++ value semantics (the 00801
   sensor). Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21), with
   00801 STAYING A SENSOR unless FR-116 lands in the same wave.
   The copy core is SAFER than W2.17's destructor wave: every admitted
@@ -12720,6 +12720,63 @@ whole-program demand.
   byte-identical to the committed reference -- but only with
   `--actor-lift=false`. DO NOT flip 00801 by editing its source to
   remove the global; that retires the sensor the file exists to be.
+  LANDED 2026-08-22 -- **00801 FLIPS**, the second frontier marker to
+  fall, printing copies=0 through C++17 guaranteed elision with its
+  source untouched: the sensor did exactly what it was built for. The
+  re-spike refined the admitted table with one ADVERSARIAL correction:
+  a by-value argument of a copy+DESTRUCTOR class must stay rejected --
+  native destroys the parameter temp at the END OF THE CALLER'S
+  FULL-EXPRESSION while the move-into-callee image drops inside the
+  callee, a compile-clean divergence measured on both compilers. So
+  by-value arguments admit only for copy-ctor-WITHOUT-dtor classes,
+  and the W2.17 wording stays ahead of every new admission.
+  Landed: the copy ctor imports as an ordinary `&mut self` method
+  taking `&T`, named by FR-114's machinery as `<class>_new_r<snake>`
+  (the spike's `_rs` spelling was wrong -- verified live as
+  `Tracer_new_rtracer`); a new `emitrust.has_copy_ctor` struct_def
+  attribute with the Copy-suppression one-liner sharing W2.17's
+  plumbing (and slotted to fold into FR-124's seed); by-value
+  arguments and return copies as temp-place + copy call + move-in
+  (drop order correct BY CONSTRUCTION -- moved-out temps never drop);
+  the implicit copy-assignment as memberwise field assigns (scalar
+  members only this wave); the ConstructorConversion unwrap
+  generalizing the W2.8 pair temp-place branch (larger than the
+  spike's one-line-mirror claim, as the re-spike measured); and the
+  NRVO gate as new code in emitReturnStmt -- clang marks
+  nrvo_candidate on exactly single-named-local returns, and the
+  entire admitted table carries ZERO nrvo flags, so the gate never
+  fires on admitted shapes.
+  TWO UN-BRIEFED EMITTER DELTAS WERE LOAD-BEARING: the scf.if
+  STRUCT-result placeholder (FR-113's enum precedent extended -- any
+  struct-returning early return died at a pre-existing legalization
+  hole), and a NARROWING of W2.17's never-defer rule in
+  computeDeferredInits: a droppy binding whose first touch on every
+  path is a whole-value assignment now defers, because the
+  placeholder + assign produced a measured phantom `dtor 0`. Tightly
+  gated (no cross-iteration liveness -- the thrice-failed front stays
+  closed); every W2.17 shape keeps its placeholder; byte-diffed by
+  both new legs plus every droppy EndToEnd test.
+  Admission requires isDefined() (a bodiless copy-ctor declaration
+  stays class-level rejected); five new wordings pinned incl. the
+  honest `implicit copy assignment` pair replacing the misleading
+  operator= wording; two tags (cxx-copy-ctor promoted to real use,
+  cxx-copy-assign minted), mirrored; the FR-118/FR-115 pins that used
+  copy-ctor specimens switched to move ctors so they keep pinning
+  what they existed to pin; ItemColoring narrowed in lockstep with a
+  new NonConstCopy red.
+  STAYS REJECTED, pinned: NRVO-candidate returns; move ctors; user
+  operator=; non-const T& copy ctors; defaulted/bodiless copy ctors;
+  arrays (new parallel wording); aggregate-with-copy-member implicit
+  copies; by-value pass of copy+dtor; self-copy `T b = b` (free via
+  the aliasing-receiver rejection).
+  Gates: full meson suite 772/772 (fast 548 + slow/EndToEnd 224).
+  Cpp17Suite `total=35 transpiled=34 passed=34 miscompiled=0
+  unsupported=1` -- **00902 alone remains**. CTestSuite 220/220/0/0
+  unchanged.
+  (test/Import/Cpp/copy-ctor.cpp, copy-ctor-invalid.cpp;
+  test/EndToEnd/cpp-copy-ctor.cpp, cpp-copy-dtor.cpp; the ratchet adds
+  00801.cpp; six frontier pins moved forward)
+
 
 - [ ] W2.24 `try`/`throw`/`catch` (flips 00902). Spike verdict
   **GO-WITH-CONSTRAINTS -- IMAGE A, Result threading rendered as a

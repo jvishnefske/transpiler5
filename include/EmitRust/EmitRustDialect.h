@@ -84,6 +84,19 @@ inline constexpr llvm::StringLiteral kPrivateFieldsAttrName =
 ///   destructor's side effects -- a compile-clean miscompile (measured).
 inline constexpr llvm::StringLiteral kHasDropAttrName = "emitrust.has_drop";
 
+/// W2.23: name of the discardable `emitrust.struct_def` unit attribute the C
+/// importer attaches to a class with an ADMITTED user copy constructor (the
+/// user-provided `T(const T&)` shape). Its single consumer is the emitter's
+/// derive list: `Copy` drops out, exactly the `has_drop` mechanism above
+/// with a different trigger. This is load-bearing precisely for the
+/// copy-ctor-WITHOUT-destructor class -- the only kind admitted BY VALUE --
+/// where a bitwise Rust `Copy` at a by-value pass would silently substitute
+/// for the user's constructor: 0 copies observed where C++ mandates 1, a
+/// compile-clean miscompile (measured in the W2.23 spike). A copy+dtor
+/// class carries both attributes; either alone already suppresses `Copy`.
+inline constexpr llvm::StringLiteral kHasCopyCtorAttrName =
+    "emitrust.has_copy_ctor";
+
 /// W2.17: name of the discardable `func.func`/`emitrust.func` unit attribute
 /// the C importer attaches to an imported C++ destructor body (the W2.2
 /// `emitrust.static_method` precedent). `convert-func-to-emitrust` consumes

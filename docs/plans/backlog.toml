@@ -245,12 +245,11 @@ anchor = "FR-110 QUALITY"
 
 [[items]]
 id = "W2.23"
-rank = 12
 kind = "feature"
-status = "spiked"
+status = "landed"
 size = "M"
-title = "Copy constructors / value semantics"
-summary = "GO: only the NRVO-candidate return is implementation-defined; AST already encodes guaranteed elision as absent nodes. 00801 additionally needs the ConstructorConversion unwrap (FR-116 already landed). Demand: 4 items."
+title = "Copy constructors / value semantics (flipped 00801)"
+summary = "Landed 2026-08-22: 00801 flips (copies=0 via guaranteed elision, source untouched). By-value + dtor stays rejected (full-expression vs callee drop timing, measured). has_copy_ctor attr folds into FR-124's seed. Re-sweep says this was the #1 front at 24.9%."
 blocked_by = ["FR-116"]
 anchor = "W2.23 Copy constructors"
 

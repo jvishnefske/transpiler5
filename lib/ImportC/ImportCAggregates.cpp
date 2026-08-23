@@ -673,6 +673,17 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   if (userOrInheritedDestructor(astContext(),
                                 astContext().getRecordType(definition)))
     structDef->setAttr(emitrust::kHasDropAttrName, moduleBuilder.getUnitAttr());
+  // W2.23: the class has an admitted user copy constructor, so the emitted
+  // struct loses `Copy` (same mechanism as has_drop above, different
+  // trigger; a copy+dtor class carries both). Load-bearing exactly for the
+  // copy-ctor-WITHOUT-destructor class -- the only kind admitted by value
+  // -- where a bitwise `Copy` at a by-value pass would silently substitute
+  // for the user's constructor: 0 copies where C++ mandates 1 (measured,
+  // the spike's compile-clean miscompile).
+  if (const auto *cxxRecord = llvm::dyn_cast<clang::CXXRecordDecl>(definition))
+    if (admittedCopyConstructor(cxxRecord))
+      structDef->setAttr(emitrust::kHasCopyCtorAttrName,
+                         moduleBuilder.getUnitAttr());
   // W2.2: a genuine C++ class's non-static-data-member methods (mutating,
   // const, static, and non-delegating constructors) import onto the
   // `emitrust.impl`/`emitrust.method_of` surface right after the struct
@@ -805,16 +816,27 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
   // Destructors outside the W2.17 subset were already rejected in
   // `collectRecordFields`, before this class's struct_def (and so before
   // this walk) ever ran (virtual methods import like any other method
-  // since W2.19a); a copy/move/delegating constructor is
-  // out of the method wave's scope too (no value/aliasing semantics modeled
-  // for it) and is rejected here, the first point a constructor is
-  // inspected individually. Kept ahead of BOTH passes so a rejected class
-  // never half-imports. It CANNOT become an FR-112 omission: a copy/move/
-  // delegating constructor is invoked implicitly at by-value pass, return
+  // since W2.19a); a move or delegating constructor is out of the method
+  // wave's scope (no xvalue/last-use model, and move counts are
+  // elision-dependent) and is rejected here, the first point a constructor
+  // is inspected individually. Kept ahead of BOTH passes so a rejected
+  // class never half-imports. It CANNOT become an FR-112 omission: a
+  // copy/move constructor is invoked implicitly at by-value pass, return
   // and init -- there is no call node to reject -- and omitting one
   // substitutes Rust's bitwise Copy for the user's constructor (measured:
   // a copy ctor that sets `v=99` prints `1 99` natively and `1 1` when
   // omitted).
+  //
+  // W2.23 NARROWED the copy half of this gate: the user-provided
+  // `T(const T&)` copy constructor is ADMITTED -- it imports as an
+  // ordinary `&mut self` method below and `emitrust.has_copy_ctor` strips
+  // `Copy` from the emitted derive, so no bitwise substitution channel is
+  // left open. Everything else keeps a located rejection: a `= default`ed
+  // copy ctor has no body to import (and no user semantics to lose --
+  // pinned in cpp-defaulted-ctor-invalid.cpp), and a copy ctor taking
+  // non-const `T&` is outside the FR-48 shared-borrow image (the receiver
+  // already holds the &mut). The FR-41 coloring screen
+  // (lib/Project/ItemColoring.cpp) mirrors this predicate EXACTLY.
   for (const clang::CXXMethodDecl *method : record->methods()) {
     // Broader than `isImportable`: a copy/move/delegating constructor is
     // rejected even when `= default`, whereas `isImportable` (used by the two
@@ -823,10 +845,29 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
     // shapes and are skipped.
     if (method->isImplicit() || method->isDeleted())
       continue;
-    if (const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method))
-      if (ctor->isCopyOrMoveConstructor() || ctor->isDelegatingConstructor())
+    if (const auto *ctor = llvm::dyn_cast<clang::CXXConstructorDecl>(method)) {
+      if (ctor->isMoveConstructor() || ctor->isDelegatingConstructor())
         return emitError(translateLoc(ctor->getLocation()))
                << "unsupported: copy/move/delegating constructor";
+      if (ctor->isCopyConstructor()) {
+        // A bodiless declaration (`T(const T&);` with no definition in
+        // this TU) keeps the historical class-level wording, exactly the
+        // W2.17 "destructor with no definition" posture: nothing could be
+        // imported for its call sites, and admitting the class would leave
+        // every copy point a dangling lookup.
+        if (!ctor->isUserProvided() || !ctor->isDefined() ||
+            ctor->getNumParams() != 1)
+          return emitError(translateLoc(ctor->getLocation()))
+                 << "unsupported: copy/move/delegating constructor";
+        const auto *reference =
+            ctor->getParamDecl(0)->getType()->getAs<clang::LValueReferenceType>();
+        if (!reference || !reference->getPointeeType().isConstQualified() ||
+            reference->getPointeeType().isVolatileQualified())
+          return emitError(translateLoc(ctor->getLocation()))
+                 << "unsupported: copy constructor taking a non-const "
+                    "reference";
+      }
+    }
   }
   // FR-47, pass 1: register every method's SIGNATURE as an external stub
   // before any body imports. A C++ member function body is a
@@ -1039,6 +1080,43 @@ userOrInheritedDestructor(clang::ASTContext &context, clang::QualType type) {
   if (inherited && !inherited->isUserProvided())
     return nullptr;
   return inherited;
+}
+
+/// Declared in CImporterInternal.h: W2.23's admission predicate for the
+/// user copy constructor. Answering non-null here must coincide exactly
+/// with `importCXXMethods` NOT rejecting the class for a constructor
+/// shape: a move/delegating/defaulted/non-const-ref sibling anywhere on
+/// the class makes the WHOLE class a located rejection there, so this
+/// returns null for it and every consumer (the by-value-return signature
+/// gate, the has_copy_ctor attr, the FR-41 coloring clone) agrees with
+/// the gate. The std-namespace exemption mirrors the method walk, which
+/// never runs on a std record at all (and gcc-15's std::pair DECLARES a
+/// defaulted copy ctor -- marking it would strip `Copy` from every
+/// emitted pair, a golden byte shift).
+const clang::CXXConstructorDecl *
+admittedCopyConstructor(const clang::CXXRecordDecl *record) {
+  if (!record || !record->hasDefinition() || record->isInStdNamespace())
+    return nullptr;
+  record = record->getDefinition();
+  const clang::CXXConstructorDecl *admitted = nullptr;
+  for (const clang::CXXConstructorDecl *ctor : record->ctors()) {
+    if (ctor->isImplicit() || ctor->isDeleted())
+      continue;
+    if (ctor->isMoveConstructor() || ctor->isDelegatingConstructor())
+      return nullptr;
+    if (!ctor->isCopyConstructor())
+      continue;
+    if (!ctor->isUserProvided() || !ctor->isDefined() ||
+        ctor->getNumParams() != 1)
+      return nullptr;
+    const auto *reference =
+        ctor->getParamDecl(0)->getType()->getAs<clang::LValueReferenceType>();
+    if (!reference || !reference->getPointeeType().isConstQualified() ||
+        reference->getPointeeType().isVolatileQualified())
+      return nullptr;
+    admitted = ctor;
+  }
+  return admitted;
 }
 
 /// Declared in CImporterInternal.h: shared with FR-41's admissibility probe

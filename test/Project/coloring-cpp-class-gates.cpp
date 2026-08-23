@@ -14,7 +14,10 @@
 // `probeRecord` had no screen for it and colored the class `green
 // reason=admissible`. A false green is the recoverable direction -- the
 // import simply rejects later -- but it makes FR-49's root attribution
-// credit the wrong construct.
+// credit the wrong construct. W2.23 NARROWED that gate -- the
+// user-provided `T(const T&)` copy constructor now imports -- and this
+// screen narrowed in lockstep (`Copyable` flipped Green, `NonConstCopy`
+// pins the shape that stays Red), the same move-together discipline.
 //
 // FALSE RED, closed on the IMPORTER side by FR-117 and then RE-DECIDED by
 // FR-112: a UNION carrying an overloaded operator was screened Red here
@@ -69,12 +72,23 @@ struct Plain {
   int get() const { return v; }
 };
 
-/// `unsupported: copy/move/delegating constructor`, raised on the copy
-/// constructor.
+/// Green since W2.23: the user-provided `T(const T&)` copy constructor is
+/// ADMITTED (it imports as an ordinary &mut-self method; see
+/// test/Import/Cpp/copy-ctor.cpp), so the screen narrowed in lockstep with
+/// the importer's gate -- keeping it would mint a false Red on every
+/// admitted copy-ctor class, the probe's forbidden direction.
 struct Copyable {
   int v;
   Copyable() : v(0) {}
   Copyable(const Copyable &o) : v(o.v) {}
+};
+
+/// Red: a copy ctor taking non-const `T&` stays outside the admitted
+/// shape (`unsupported: copy constructor taking a non-const reference`).
+struct NonConstCopy {
+  int v;
+  NonConstCopy() : v(0) {}
+  NonConstCopy(NonConstCopy &o) : v(o.v) {}
 };
 
 /// Same gate through the MOVE constructor.
@@ -176,7 +190,7 @@ struct HoldsInherits {
 int main() { return 0; }
 
 // CHECK:      item Conv kind=record color=green reason=admissible
-// CHECK-NEXT: item Copyable kind=record color=red reason=inadmissible construct=copy-move-constructor
+// CHECK-NEXT: item Copyable kind=record color=green reason=admissible
 // CHECK-NEXT: item DefaultedCopy kind=record color=red reason=inadmissible construct=copy-move-constructor
 // CHECK-NEXT: item Delegating kind=record color=red reason=inadmissible construct=copy-move-constructor
 // CHECK-NEXT: item DropBase kind=record color=green reason=admissible
@@ -185,11 +199,12 @@ int main() { return 0; }
 // CHECK-NEXT: item MemberBesideBase kind=record color=red reason=inadmissible construct=destructor
 // CHECK-NEXT: item Movable kind=record color=red reason=inadmissible construct=copy-move-constructor
 // CHECK-NEXT: item MultiVirt kind=record color=green reason=admissible
+// CHECK-NEXT: item NonConstCopy kind=record color=red reason=inadmissible construct=copy-move-constructor
 // CHECK-NEXT: item OpStruct kind=record color=green reason=admissible
 // CHECK-NEXT: item Plain kind=record color=green reason=admissible
 // CHECK-NEXT: item SoleVirt kind=record color=green reason=admissible
 // CHECK-NEXT: item UnionOp kind=record color=green reason=admissible
 // CHECK-NEXT: item VirtMethod kind=record color=green reason=admissible
 // CHECK-NEXT: item c_main kind=function color=green reason=admissible
-// CHECK-NEXT: tally green=10 yellow=0 red=6
+// CHECK-NEXT: tally green=11 yellow=0 red=6
 // CHECK-NOT:  item

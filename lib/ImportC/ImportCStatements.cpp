@@ -382,6 +382,20 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
     if (failed(checkDropLocalScope(var, loc)))
       return failure();
   }
+  // W2.23: an array of a copy-ctor class is the same boundary W2.17 drew
+  // for droppy arrays, one wave later: once `Copy` leaves the derive
+  // (emitrust.has_copy_ctor), the `[T; N]` repeat initializer is rustc
+  // E0277 -- caught here as a located rejection instead. The droppy-array
+  // wording above stays first for the copy+dtor class.
+  if (astContext().getAsArrayType(var->getType())) {
+    clang::QualType element = var->getType();
+    while (const clang::ArrayType *arrayType =
+               astContext().getAsArrayType(element.getCanonicalType()))
+      element = arrayType->getElementType();
+    if (admittedCopyConstructor(element->getAsCXXRecordDecl()))
+      return emitError(loc)
+             << "unsupported: array of a class with a copy constructor";
+  }
   if (!var->hasLocalStorage()) {
     if (var->isStaticLocal()) {
       // A function-local static is module-level state initialized once at
@@ -710,8 +724,44 @@ CImporter::emitCXXConstructInit(Value place,
                                 const clang::CXXConstructExpr *construct,
                                 Location loc) {
   const clang::CXXConstructorDecl *ctor = construct->getConstructor();
-  if (!ctor || ctor->isCopyOrMoveConstructor())
+  if (!ctor)
     return emitError(loc) << "unsupported: copy/move construction";
+  if (ctor->isCopyOrMoveConstructor()) {
+    // W2.23: `Plain b = a;` -- the place-init spelling of the TRIVIAL
+    // whole-struct copy the rvalue path has always unwrapped -- stores the
+    // loaded source whole. Gated off droppy classes (a Rust load is a MOVE
+    // once `Copy` is gone: one destructor run where C++ has two -- the
+    // same reason as the rvalue path's refusal) and off the
+    // derived-to-base SLICE (`A b = d;` copies a base SUBOBJECT, not a
+    // whole object; pinned in inheritance-invalid.cpp).
+    const clang::Expr *source =
+        construct->getNumArgs() == 1 ? construct->getArg(0)->IgnoreParens()
+                                     : nullptr;
+    bool slices = false;
+    if (const auto *sourceCast =
+            llvm::dyn_cast_or_null<clang::ImplicitCastExpr>(source))
+      slices =
+          sourceCast->getCastKind() == clang::CK_DerivedToBase ||
+          sourceCast->getCastKind() == clang::CK_UncheckedDerivedToBase;
+    if (ctor->isTrivial() && source && !slices &&
+        !userOrInheritedDestructor(astContext(), construct->getType())) {
+      FailureOr<Value> whole = emitRValue(construct->getArg(0));
+      if (failed(whole))
+        return failure();
+      return storeToPlace(loc, place, *whole);
+    }
+    // W2.23: the ADMITTED user copy constructor (`T b = a;`, 1 copy by the
+    // standard in every mode -- byte-diffed in
+    // test/EndToEnd/cpp-copy-ctor.cpp) is an ordinary imported method and
+    // falls through to the constructor-call path below. Everything else --
+    // a move construct, an IMPLICIT copy ctor made non-trivial by a
+    // copy-ctor member or base (synthesizing a constructor the AST does
+    // not contain is recorded and deferred), a droppy trivial copy --
+    // keeps the located rejection.
+    if (!(ctor->isCopyConstructor() && ctor->isUserProvided() &&
+          functions.lookup(cxxMethodMangledName(ctor))))
+      return emitError(loc) << "unsupported: copy/move construction";
+  }
   // A default construction (0 args) whose constructor is NOT user-provided —
   // an implicit or `= default` default ctor made non-trivial only by in-class
   // member initializers (NSDMIs) — is never imported as a function (the
@@ -748,6 +798,45 @@ CImporter::emitCXXConstructInit(Value place,
   SmallVector<Value> arguments(targetType.getNumInputs(), Value());
   arguments[0] = addrOf;
   for (auto [index, argExpr] : llvm::enumerate(construct->arguments())) {
+    Type input = targetType.getInput(index + 1);
+    // FR-48 mirror (W2.23): a reference parameter on a CONSTRUCTOR takes
+    // exactly the borrow argument a method's does -- same
+    // `emitBorrowArgument`, same `emitrust.addr_of`. This is what lets the
+    // admitted copy constructor's `const T&` (and any user ctor's
+    // reference parameter) bind a bare lvalue; before W2.23 this loop
+    // passed every argument by value, which is why a struct lvalue into a
+    // ctor's `const T&` was the "call argument type mismatch" rejection.
+    // The one collision possible here is with the RECEIVER -- the place
+    // under construction already holds slot 0's &mut borrow, so the
+    // self-copy `T b = b;` is exactly the aliasing shape the method path
+    // rejects.
+    if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(input)) {
+      // `return t;` marks the copy's source XVALUE (`const T` xvalue NoOp
+      // -- clang's implicit-move overload resolution, which then still
+      // selects the copy ctor since the class declares no move ctor), so
+      // FR-48's is-an-lvalue discriminator inside emitBorrowArgument
+      // would miss it; the NoOp peel recovers the named object, which is
+      // all the shared borrow reads.
+      const clang::Expr *borrowExpr = argExpr;
+      while (const auto *noOp =
+                 llvm::dyn_cast<clang::ImplicitCastExpr>(borrowExpr)) {
+        if (noOp->getCastKind() != clang::CK_NoOp)
+          break;
+        borrowExpr = noOp->getSubExpr();
+      }
+      if (const clang::VarDecl *argRoot = placeExprRoot(borrowExpr))
+        if (symbols.lookup(argRoot) == place)
+          return emitError(loc)
+                 << "unsupported: aliasing mutable reference argument and "
+                    "method receiver";
+      const clang::VarDecl *unusedRoot = nullptr;
+      FailureOr<Value> reference =
+          emitBorrowArgument(loc, borrowExpr, input, unusedRoot);
+      if (failed(reference))
+        return failure();
+      arguments[index + 1] = *reference;
+      continue;
+    }
     FailureOr<Value> value = emitRValue(argExpr);
     if (failed(value))
       return failure();
@@ -1099,6 +1188,71 @@ CImporter::emitPairConstructInit(Value place,
   }
   if (index != construct->getNumArgs())
     return emitError(loc) << "unsupported: std::pair constructor arity";
+  return success();
+}
+
+LogicalResult
+CImporter::emitImplicitCopyAssign(const clang::CXXOperatorCallExpr *call) {
+  Location loc = translateLoc(call->getOperatorLoc());
+  const auto *method =
+      llvm::cast<clang::CXXMethodDecl>(call->getDirectCallee());
+  const clang::RecordDecl *definition = method->getParent()->getDefinition();
+  // Scalar fields only. A RECORD member would need the member's OWN
+  // assignment semantics recursively -- which is exactly the FR-112
+  // enclosing-operator= channel: a member with a user `operator=` is what
+  // makes this implicit operator= non-trivial and materializes it as a
+  // callee in the first place (cpp-contained-member-invalid.cpp pins it).
+  // Arrays, pointers, unions and bit-fields keep the same located
+  // rejection; the wording says what the construct IS, replacing the
+  // pre-W2.23 "omitted from class" message the spike flagged as
+  // misleading (an implicit member was never omitted).
+  bool memberwise = definition && !definition->isUnion();
+  if (memberwise)
+    for (const clang::FieldDecl *field : definition->fields()) {
+      clang::QualType fieldType = field->getType().getCanonicalType();
+      if (!(fieldType->isArithmeticType() || fieldType->isEnumeralType()) ||
+          field->isBitField() || field->getName().empty()) {
+        memberwise = false;
+        break;
+      }
+    }
+  if (!memberwise)
+    return emitError(loc) << "unsupported: implicit copy assignment of a "
+                             "class with non-scalar members";
+  // The right-hand side arrives wrapped in the `const T` NoOp cast its
+  // `const T&` parameter binding added; the named place underneath is what
+  // the memberwise reads borrow.
+  FailureOr<Value> target = emitLValue(stripLValueNoOp(call->getArg(0)));
+  if (failed(target))
+    return failure();
+  FailureOr<Value> source = emitLValue(stripLValueNoOp(call->getArg(1)));
+  if (failed(source))
+    return failure();
+  // Memberwise, in declaration order (the order the implicit operator=
+  // assigns; observable only through field side effects, of which scalar
+  // fields have none -- but the emitted Rust reads naturally this way).
+  // Self-assignment (`m = m;`) degenerates to `m.f = m.f`, which is
+  // exactly what the native memberwise operator= does.
+  for (const clang::FieldDecl *field : definition->fields()) {
+    FailureOr<Type> fieldType = mapType(field->getType(), loc);
+    if (failed(fieldType))
+      return failure();
+    Value sourceField =
+        builder
+            .create<emitrust::MemberOp>(
+                loc, emitrust::LValueType::get(*fieldType), *source,
+                builder.getStringAttr(field->getName()))
+            .getResult();
+    Value fieldValue = loadPlace(loc, sourceField);
+    Value targetField =
+        builder
+            .create<emitrust::MemberOp>(
+                loc, emitrust::LValueType::get(*fieldType), *target,
+                builder.getStringAttr(field->getName()))
+            .getResult();
+    if (failed(storeToPlace(loc, targetField, fieldValue)))
+      return failure();
+  }
   return success();
 }
 
@@ -4661,6 +4815,25 @@ LogicalResult CImporter::emitDispatchSwitch(const clang::SwitchStmt *stmt,
   return success();
 }
 
+const clang::CXXConstructExpr *
+CImporter::admittedCopyConstructReturn(const clang::Expr *retValue) {
+  const clang::Expr *inner = retValue->IgnoreParens();
+  // A full expression with a materialized temporary wraps in
+  // ExprWithCleanups; the copy's source is an lvalue, so nothing else
+  // stands between the ReturnStmt and its construct node (measured on the
+  // whole admitted table).
+  if (const auto *cleanups = llvm::dyn_cast<clang::ExprWithCleanups>(inner))
+    inner = cleanups->getSubExpr()->IgnoreParens();
+  const auto *construct = llvm::dyn_cast<clang::CXXConstructExpr>(inner);
+  if (!construct)
+    return nullptr;
+  const clang::CXXConstructorDecl *ctor = construct->getConstructor();
+  if (!ctor || !ctor->isCopyConstructor() || !ctor->isUserProvided() ||
+      !functions.lookup(cxxMethodMangledName(ctor)))
+    return nullptr;
+  return construct;
+}
+
 LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
   Location loc = translateLoc(stmt->getReturnLoc());
   if (const clang::Expr *retValue = stmt->getRetValue()) {
@@ -4769,6 +4942,36 @@ LogicalResult CImporter::emitReturnStmt(const clang::ReturnStmt *stmt) {
       value = builder
                   .create<emitrust::LoadOp>(loc, currentReturnType, ownedPlace)
                   .getResult();
+    } else if (const clang::CXXConstructExpr *copyReturn =
+                   admittedCopyConstructReturn(retValue)) {
+      // W2.23: `return x;` through the ADMITTED user copy constructor.
+      // Intercepted BEFORE the generic rvalue walk because the copy+dtor
+      // class must be admitted HERE while its by-value ARGUMENT stays
+      // refused there (emitRValue's droppy value-copy gate): the return
+      // temp is moved out and never drops in the callee, so there is no
+      // drop-point divergence a return can express -- unlike the
+      // parameter temp, whose caller-vs-callee drop point measured
+      // divergent (the spike's twocall probe).
+      //
+      // THE ONE IMPLEMENTATION-DEFINED SHAPE in the spike's elision table
+      // is rejected here, on clang's own oracle: a non-null
+      // `getNRVOCandidate()` marks exactly the single-named-local return,
+      // which runs 0 copies by default and 1 under
+      // -fno-elide-constructors on BOTH clang++ and g++ -- no emission is
+      // byte-diff-clean against every conforming compiler. Every admitted
+      // row (two-return functions, param returns) carries a NULL
+      // candidate, measured.
+      if (stmt->getNRVOCandidate())
+        return emitError(loc)
+               << "unsupported: NRVO-candidate return of a class with a "
+                  "copy constructor";
+      FailureOr<Type> structType = mapType(copyReturn->getType(), loc);
+      if (failed(structType))
+        return failure();
+      Value copyPlace = createVariablePlace(loc, *structType, std::string());
+      if (failed(emitCXXConstructInit(copyPlace, copyReturn, loc)))
+        return failure();
+      value = loadPlace(loc, copyPlace);
     } else {
       value = emitRValue(retValue);
     }
@@ -5653,6 +5856,23 @@ LogicalResult CImporter::emitCallStmt(const clang::CallExpr *call) {
     llvm::SmallVector<const clang::CXXOperatorCallExpr *> links;
     if (matchOstreamChain(opCall, stream, links))
       return emitOstreamChain(opCall);
+    // W2.23: whole-object `m = a;` through the IMPLICIT copy-assignment
+    // operator lowers memberwise -- C++ runs operator=, NOT the copy
+    // constructor, so the copy count at an assignment is 0 in every mode
+    // (a `.clone()` here measured 1 against native 0, the spike's
+    // miscompile probe). Statement position is the only position: the
+    // `T&` result has no representation, so a value use keeps a located
+    // rejection in `emitCall`. A USER `operator=` stays an FR-112
+    // omission and falls through to the honest omitted-member wording.
+    if (opCall->getOperator() == clang::OO_Equal) {
+      const auto *method = llvm::dyn_cast_or_null<clang::CXXMethodDecl>(
+          opCall->getDirectCallee());
+      if (method && method->isImplicit() &&
+          method->isCopyAssignmentOperator() &&
+          !method->getParent()->isLambda() &&
+          !method->getParent()->isInStdNamespace())
+        return emitImplicitCopyAssign(opCall);
+    }
   }
   const clang::FunctionDecl *callee = call->getDirectCallee();
   // va_start/va_end inside a monomorphization clone (CTS 00204):
