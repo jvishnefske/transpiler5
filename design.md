@@ -7958,7 +7958,7 @@ piece and becomes FR-45.
   struct_def and c_main with zero diagnostics), so any change to its
   behavior fails a test and must come through this FR. **NOT SPIKED.**
 
-- [ ] FR-124 DEFECT: derive(Copy) emitted over a non-Copy base field
+- [x] FR-124 DEFECT: derive(Copy) emitted over a non-Copy base field
   -- exit-0 unbuildable, E0204 x60 across 8 corpus crates. Spike
   verdict **GO** (2026-08-22), and THE FILED HYPOTHESIS WAS WRONG IN
   DETAIL: not a W2.19/W2.26 predicate-vs-emitter disagreement, but an
@@ -8018,6 +8018,29 @@ piece and becomes FR-45.
   DO NOT: remove the `isUserProvided` filter (regresses std::pair);
   drop own-class has_drop for `= default` dtors (widens seven gates).
   **SPIKED** -- the working patch sits in the spike worktree.
+  LANDED 2026-08-22 exactly as re-spiked at post-W2.23 HEAD. The
+  fixpoint block sits after the dropStructNames pre-pass with the
+  three-disjunct seed (has_drop, the RELOCATED W2.23 has_copy_ctor
+  trigger, FR-94 Vec/String opaque fields); emitStructDef's Copy
+  decision is the single set lookup carrying the INVARIANT comment (no
+  per-struct suppression logic may live there -- new triggers go in
+  the seed or fail review); the emitDataEnumDef future-gap comment is
+  in. W2.23's own eight tests green after the relocation. One
+  measurement refined the failure-direction claim: a by-value use of a
+  newly non-Copy derived is ALREADY a located import rejection
+  (CXXBindTemporaryExpr), so E0382 is the second-line backstop, not
+  the frontline -- pinned that way. Differential deltas held exactly
+  (53 derive lines on spdlog.cpp, 1 on raytracing); all 60 corpus
+  E0204s dead with zero E0382 introduced; raytracing InOneWeekend and
+  spdlog example.cpp now cargo-build clean, and the six units still
+  red carry exactly the recorded FR-121/FR-125 residuals.
+  Gates: full meson suite 779/779 (fast 554 + slow/EndToEnd 225), zero
+  golden shifts, all corpus ledgers unchanged.
+  (test/Import/Cpp/derive-copy-fixpoint.cpp,
+  derive-copy-fixpoint-invalid.cpp;
+  test/Target/Rust/derive-copy-fixpoint.mlir;
+  test/EndToEnd/cpp-derive-copy-fixpoint.cpp)
+
 
 - [ ] FR-125 DEFECT (found by the 2026-08-22 re-sweep):
   **CamelCase namespaces break the non_snake_case deny -- 33 errors

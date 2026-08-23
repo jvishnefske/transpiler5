@@ -433,9 +433,12 @@ private:
   /// op is only ever created for a library crate in the first place.
   LogicalResult emitTraitDef(emitrust::TraitDefOp traitDefOp);
   /// Emits a `#[derive(Clone, Copy, Default)]` struct item with its fields.
-  /// When some field type is outside the reach of the `Default` derive
-  /// (`derivedDefaultCovers`), `Default` drops out of the derive list and an
-  /// explicit, value-identical `impl Default` follows the item instead.
+  /// `Copy` drops out when the struct's name is in `nonCopyStructNames`
+  /// (FR-124: the module pre-pass fixpoint over local triggers and
+  /// struct-typed fields). When some field type is outside the reach of the
+  /// `Default` derive (`derivedDefaultCovers`), `Default` drops out of the
+  /// derive list and an explicit, value-identical `impl Default` follows the
+  /// item instead.
   LogicalResult emitStructDef(emitrust::StructDefOp structDefOp);
   /// Emits a C enum as a value-preserving open enum: a
   /// `#[repr(transparent)]` tuple struct over the storage integer (`i32`,
@@ -584,6 +587,14 @@ private:
   /// destructor's side effects. Measured: clang++ printed `dtor 5`, the
   /// hand-driven Rust printed nothing, and the crate compiled clean.
   llvm::StringSet<> dropStructNames;
+
+  /// FR-124: names of every struct_def whose emitted item must NOT
+  /// derive `Copy` -- the local triggers (FR-94 owned-tail opaque field,
+  /// W2.17 has_drop, W2.23 has_copy_ctor) closed transitively over
+  /// struct-typed fields, because `derive(Copy)` over a non-Copy field is
+  /// rustc E0204 (the derived-over-`virtual ~B() = default`-base channel).
+  /// Computed once per module in the same pre-pass as dropStructNames.
+  llvm::StringSet<> nonCopyStructNames;
 
   /// Whether `binding`'s (possibly lvalue-wrapped, possibly array-element)
   /// type is a struct that carries `emitrust.has_drop`.
@@ -3460,6 +3471,55 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   for (auto structDefOp : moduleOp.getOps<emitrust::StructDefOp>())
     if (structDefOp->hasAttr(emitrust::kHasDropAttrName))
       dropStructNames.insert(structDefOp.getSymName());
+  // FR-124: the non-Copy struct set. Seed with the per-struct local
+  // triggers (the exact predicates emitStructDef used before this pass),
+  // then propagate through struct-typed fields to a fixpoint: a struct
+  // with a non-Copy field cannot derive Copy (E0204). Fields form a DAG
+  // in the emitted image, so the fixpoint terminates trivially.
+  nonCopyStructNames.clear();
+  {
+    llvm::SmallVector<emitrust::StructDefOp> structDefs(
+        moduleOp.getOps<emitrust::StructDefOp>());
+    auto locallyNonCopy = [](emitrust::StructDefOp def) {
+      if (def->hasAttr(emitrust::kHasDropAttrName))
+        return true;
+      // W2.23: a class with a user copy constructor loses `Copy` too -- the
+      // imported ctor call is the ONLY copy point, and a bitwise `Copy` at a
+      // by-value pass would silently substitute for the user's constructor.
+      if (def->hasAttr(emitrust::kHasCopyCtorAttrName))
+        return true;
+      return llvm::any_of(def.getFieldTypes(), [](Attribute a) {
+        auto opaque =
+            dyn_cast<emitrust::OpaqueType>(cast<TypeAttr>(a).getValue());
+        return opaque && (opaque.getValue().starts_with("Vec<") ||
+                          opaque.getValue() == "String");
+      });
+    };
+    for (auto def : structDefs)
+      if (locallyNonCopy(def))
+        nonCopyStructNames.insert(def.getSymName());
+    bool changed = true;
+    while (changed) {
+      changed = false;
+      for (auto def : structDefs) {
+        if (nonCopyStructNames.contains(def.getSymName()))
+          continue;
+        bool fieldNonCopy =
+            llvm::any_of(def.getFieldTypes(), [&](Attribute a) {
+              Type type = cast<TypeAttr>(a).getValue();
+              while (auto arrayType = dyn_cast<emitrust::ArrayType>(type))
+                type = arrayType.getElementType();
+              auto structType = dyn_cast<emitrust::StructType>(type);
+              return structType &&
+                     nonCopyStructNames.contains(structType.getName());
+            });
+        if (fieldNonCopy) {
+          nonCopyStructNames.insert(def.getSymName());
+          changed = true;
+        }
+      }
+    }
+  }
   // FR-62 slice 5c: the shared `mod actor_rt` epilogue exists once per
   // crate and its text is flavor-specific, so every anchor in one module
   // must agree on the mode. The driver never produces a mixed module
@@ -5257,31 +5317,18 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   bool derivable = llvm::all_of(structDefOp.getFieldTypes(), [](Attribute a) {
     return derivedDefaultCovers(cast<TypeAttr>(a).getValue());
   });
-  // FR-94: `Copy` drops from the derive when a field is a non-Copy opaque —
-  // the owned `Vec<u8>` FAM tail (or a `String`). Every other opaque the
-  // importer synthesizes as a field (`Option<usize>`, W4.2e Part B) is Copy,
-  // and every non-opaque field type EmitRust admits is Copy, so the derive
-  // stays byte-identical for every struct without an owned tail. Measured:
-  // deriving Copy on a Vec-carrying struct is rustc E0204.
-  bool copyable = llvm::none_of(structDefOp.getFieldTypes(), [](Attribute a) {
-    auto opaque = dyn_cast<emitrust::OpaqueType>(cast<TypeAttr>(a).getValue());
-    return opaque && (opaque.getValue().starts_with("Vec<") ||
-                      opaque.getValue() == "String");
-  });
-  // W2.17: a struct rendered with an `impl Drop` cannot be `Copy` -- measured
-  // rustc "error[E0184]: the trait `Copy` cannot be implemented for this
-  // type; the type has a destructor". Same direction as FR-94's opaque-tail
-  // rule above. No existing golden can shift: no pre-W2.17 module can carry
-  // the marker, because a user-declared destructor was a hard rejection.
-  copyable = copyable && !structDefOp->hasAttr(emitrust::kHasDropAttrName);
-  // W2.23: a class with a user copy constructor loses `Copy` too -- the
-  // imported ctor call is the ONLY copy point, and a bitwise `Copy` at a
-  // by-value pass would silently substitute for the user's constructor
-  // (0 copies observed where C++ mandates 1; the spike's compile-clean
-  // miscompile). Same plumbing as the has_drop line above, different
-  // trigger; the attr is load-bearing exactly for the
-  // copy-ctor-without-destructor class, the only kind admitted by value.
-  copyable = copyable && !structDefOp->hasAttr(emitrust::kHasCopyCtorAttrName);
+  // FR-124: the Copy decision consults ONLY nonCopyStructNames — the
+  // emitModule pre-pass owns every local trigger (FR-94 owned-tail opaque
+  // `Vec<`/`String` field, W2.17 has_drop, W2.23 has_copy_ctor) plus the
+  // transitive closure over struct-typed fields, because `derive(Copy)`
+  // beside any non-Copy field is rustc E0204 — for a struct that is itself
+  // clean but embeds a non-Copy struct just as much as for the seeds
+  // (measured: the derived-over-`virtual ~B() = default`-base corpus
+  // channel). INVARIANT: no per-struct Copy-suppression logic may live
+  // here; add new triggers to locallyNonCopy in emitModule so the fixpoint
+  // propagates them to embedding structs, or the failure surfaces as rustc
+  // E0204 instead of failing review.
+  bool copyable = !nonCopyStructNames.contains(structDefOp.getSymName());
   os << "#[derive(Clone" << (copyable ? ", Copy" : "")
      << (derivable ? ", Default" : "") << ")]\n";
   // A field-less struct_def (C's `struct T {};`) prints unit-like with an
@@ -5373,6 +5420,12 @@ LogicalResult RustEmitter::emitDataEnumDef(emitrust::DataEnumDefOp defOp) {
   // payload type is `Copy` — but no `Default` (a closed enum has no
   // canonical default variant, in contrast to struct_def's unconditional
   // one) and no `PartialEq` (a struct payload field derives none).
+  // FR-124 RECORDED FUTURE GAP: this unconditional `Copy` is safe ONLY
+  // while data-enum payloads are scalar-gated at import. Any wave that
+  // admits struct-typed payloads must extend the nonCopyStructNames
+  // closure (emitModule's pre-pass) to walk variant payload fields here
+  // too, or a non-Copy payload resurrects rustc E0204 under a derive the
+  // emitter chose.
   os << "#[derive(Clone, Copy)]\n";
   StringRef pub = typePartVisibility();
   os << pub << "enum " << defOp.getSymName() << " {\n";
