@@ -49,11 +49,12 @@
 //   base, arrays/globals/by-value/copies/bare-block objects of a
 //   droppy-DERIVED class) are pinned in inheritance-drop-invalid.cpp.
 // * any VIRTUAL METHOD in the chain: ADMITTED on VALUES since W2.19a
-//   (calls statically bind the receiver's own type's override, which for
-//   a value is exact C++ semantics -- virtual-methods-values.cpp). What
-//   the arm pins now is the residual DYNAMIC channel: a virtual call
-//   through a pointer, even a same-type DERIVED pointer whose hop
-//   projection the upcast fence never sees. W2.19b's job.
+//   (virtual-methods-values.cpp), and through a LOCAL pointer bound to
+//   exactly one object since W2.19b (the call devirtualizes --
+//   virtual-methods-devirt.cpp, which absorbed this arm's old same-type
+//   local-pointer shape). What the arm pins now is the residual DYNAMIC
+//   channel: a virtual call through a pointer PARAMETER, whose caller
+//   set is open.
 // * a derived member literally spelled `base`: it would collide with the
 //   synthesized field. Caught by `appendField`'s pre-existing duplicate-
 //   final-name guard, which works ONLY because the base field is
@@ -134,11 +135,8 @@ struct A {
 };
 struct D : A { int c; };
 // VIRTMETHOD: virtual-method-base.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: virtual method call through a pointer
-int use() {
-  D d;
-  d.c = 1;
-  D *p = &d;
-  return p->get() + d.c;
+int use(D *p) {
+  return p->get() + p->c;
 }
 
 //--- base-field-collision.cpp

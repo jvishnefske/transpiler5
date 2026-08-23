@@ -11,7 +11,6 @@
 // RUN: not emitrust-import-c %t/virtual-dtor-plus-method.cpp 2>&1 | FileCheck %s --check-prefix=MULTIVIRT
 // RUN: not emitrust-import-c %t/empty-droppy-base-ctor.cpp 2>&1 | FileCheck %s --check-prefix=EMPTYCTOR
 // RUN: not emitrust-import-c %t/empty-droppy-base-call.cpp 2>&1 | FileCheck %s --check-prefix=EMPTYHOP
-// RUN: not emitrust-import-c %t/upcast-pointer-virtual.cpp 2>&1 | FileCheck %s --check-prefix=VUPCAST
 // RUN: not emitrust-import-c %t/sizeof-polymorphic.cpp 2>&1 | FileCheck %s --check-prefix=SIZEOFPOLY
 
 // W2.26 located-rejection ledger for the polymorphic-RAII value subset.
@@ -44,12 +43,13 @@
 //   to a move, flattened scope moving the drop point) -- each must fire
 //   for a merely-inheriting class exactly as for a directly-droppy one.
 // * a virtual destructor PLUS another virtual method: ADMITTED as a
-//   VALUE since W2.19a (the class-level `virtual method` gate is gone;
-//   static binding on a value is exact C++ semantics). The arm pins the
-//   dynamic residual instead: a virtual member call through a pointer,
-//   which is the one channel where the vptr the emitted struct lacks
-//   could be observed (the vptr LAYOUT residual stays screened at
-//   sizeof/alignof, below).
+//   VALUE since W2.19a, and since W2.19b the virtual call is admitted
+//   even through a LOCAL pointer bound to exactly one object (the call
+//   devirtualizes -- virtual-methods-devirt.cpp). The arm pins the
+//   remaining dynamic residual: a virtual call through a pointer
+//   PARAMETER, whose caller set is open -- the one channel left where
+//   the vptr the emitted struct lacks could be observed (the vptr
+//   LAYOUT residual stays screened at sizeof/alignof, below).
 // * a NON-TRIVIAL constructor of an empty droppy base: the emitted image
 //   default-initializes the zero-field base field, so a user ctor body
 //   would be silently dropped. The trivial construction is elided, same
@@ -62,8 +62,13 @@
 //   the pin moved FORWARD into the byte-diff oracle
 //   test/EndToEnd/cpp-upcast-pointer.cpp (its RB/RD legs).
 //   delete-through-base-pointer stays unreachable (new/delete are
-//   themselves rejections), and the POLYMORPHIC upcast below stays a
-//   located rejection.
+//   themselves rejections). The POLYMORPHIC upcast (the former VUPCAST
+//   arm) flipped positive in W2.19b: the single-object region fact
+//   makes the static bind exact, so the pin moved FORWARD to
+//   virtual-methods-devirt.cpp and the byte-diff oracle
+//   test/EndToEnd/cpp-devirt-base-pointer.cpp; the residual fences for
+//   pointers WITHOUT that fact are pinned in
+//   virtual-methods-values-invalid.cpp.
 // * sizeof/alignof of a POLYMORPHIC class: clang folds the vptr-carrying
 //   native layout (16 for `V` below) while the emitted struct has no
 //   vptr (4 bytes) -- the same promise-a-layout-Rust-never-keeps screen
@@ -238,9 +243,11 @@ int use(int n) {
 }
 
 //--- virtual-dtor-plus-method.cpp
-// W2.19a admits this class as a value (`s.get()` statically binds, and
-// destruction of a value is static -- both exact); the pin moved FORWARD
-// to the pointer call, where dynamism could actually be observed.
+// W2.19a admits this class as a value and W2.19b admits the local
+// single-object pointer call (it devirtualizes); the pin moved FORWARD
+// again, to the pointer PARAMETER -- the caller set is open, so the
+// pointee's dynamic type is genuinely unknown and the call stays a
+// located rejection.
 extern "C" int printf(const char *, ...);
 struct S {
   int id;
@@ -248,10 +255,7 @@ struct S {
   virtual int get() const { return id; }
 };
 // MULTIVIRT: virtual-dtor-plus-method.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: virtual method call through a pointer
-int use(int n) {
-  S s;
-  s.id = n;
-  S *p = &s;
+int use(S *p) {
   return p->get();
 }
 
@@ -285,34 +289,6 @@ struct Circle : Shape {
 int use(int n) {
   Circle c(n);
   return c.id() + c.r;
-}
-
-//--- upcast-pointer-virtual.cpp
-extern "C" int printf(const char *, ...);
-struct V {
-  int id;
-  V(int i) : id(i) {}
-  int get() const { return id; }
-  virtual ~V() { printf("~V %d\n", id); }
-};
-struct W : V {
-  int w;
-  W(int i) : V(i), w(i) {}
-};
-// A virtual destructor plus a BASE-POINTER use: the one pairing where the
-// dynamism the value subset ignores could be observed. Since FR-120
-// taught `peelPointerCast` derived-to-base, NOTHING class-level backstops
-// this shape -- `V` and `W` are both ADMITTED classes (W2.26's
-// sole-virtual-dtor carve-out) with working direct hop projection -- so
-// the fence is `uniquePublicSingleBaseChain` itself answering FALSE for
-// polymorphic chains. Without that exclusion the binding would silently
-// admit and `p->get()` would statically bind through the value subset.
-// The refused peel falls through to the planner's non-address rejection.
-// VUPCAST: upcast-pointer-virtual.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: pointer assigned a non-address value
-int use(int n) {
-  W obj(n);
-  V *p = &obj;
-  return p->get();
 }
 
 //--- sizeof-polymorphic.cpp

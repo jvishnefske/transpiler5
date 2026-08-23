@@ -6106,6 +6106,13 @@ CImporter::projectBaseHops(Value place, llvm::ArrayRef<clang::QualType> hops,
 // a located rejection rather than an assert, since this is also called
 // with viewed types the peel never saw, e.g. a `D *` member access after
 // a same-type binding, where the fast type-equality exit applies).
+// W2.19b: the walk runs with `allowPolymorphic` — sound HERE because
+// every caller passes a `baseObjectType` taken from `PtrExprValue::base`,
+// which is non-null exactly for single-object regions: the bound
+// object's dynamic type is statically known, so a static projection
+// through a polymorphic chain is exact (virtual CALLS never rely on this
+// reconcile blindly — they devirtualize or keep the fence upstream in
+// `emitCXXMemberCall`).
 FailureOr<Value>
 CImporter::reconcileUpcastPlace(Value place, clang::QualType baseObjectType,
                                 clang::QualType viewedPointee, Location loc) {
@@ -6123,7 +6130,8 @@ CImporter::reconcileUpcastPlace(Value place, clang::QualType baseObjectType,
   // was an upcast. Recompute the (unique, by admission) hop path from the
   // bound object's record and project one `base` field per hop.
   llvm::SmallVector<clang::QualType, 2> hops;
-  if (!uniquePublicSingleBaseHops(baseObjectType, viewedPointee, &hops))
+  if (!uniquePublicSingleBaseHops(baseObjectType, viewedPointee, &hops,
+                                  /*allowPolymorphic=*/true))
     return emitError(loc) << "unsupported: base subobject pointer with no "
                              "unique base path";
   return projectBaseHops(place, hops, loc);
@@ -6134,7 +6142,8 @@ CImporter::reconcileUpcastPlace(Value place, clang::QualType baseObjectType,
 FailureOr<Value>
 CImporter::emitStructPointerPlace(const clang::Expr *pointerExpr, Location loc,
                                   GlobalWriteback *writeback,
-                                  const clang::VarDecl **outBase) {
+                                  const clang::VarDecl **outBase,
+                                  clang::QualType reconcileToward) {
   clang::QualType pointeeQt =
       pointerExpr->getType().getCanonicalType()->getPointeeType();
   // Capture the VIEWED pointee first (it names the base subobject the
@@ -6159,7 +6168,12 @@ CImporter::emitStructPointerPlace(const clang::Expr *pointerExpr, Location loc,
     if (failed(place))
       return failure();
     if (pointer->base)
-      return reconcileUpcastPlace(*place, pointer->base->getType(), pointeeQt,
+      // W2.19b: a devirtualized call overrides the reconcile target with
+      // the resolved method's own class (see the declaration comment);
+      // every other use reconciles toward the pointer's static pointee.
+      return reconcileUpcastPlace(*place, pointer->base->getType(),
+                                  reconcileToward.isNull() ? pointeeQt
+                                                           : reconcileToward,
                                   loc);
     return place;
   }
@@ -6174,6 +6188,35 @@ CImporter::emitStructPointerPlace(const clang::Expr *pointerExpr, Location loc,
       .create<emitrust::DerefOp>(loc, emitrust::LValueType::get(pointee),
                                  *base)
       .getResult();
+}
+
+// W2.19b: the single-object devirtualization gate — see the declaration
+// comment. Mirrors `emitStructPointerPlace`'s peel so both classify one
+// pointer expression identically, then demands the plainest region shape
+// the planner produces: one local object, whole-object, degenerate.
+const clang::VarDecl *
+CImporter::singleObjectLocalPointerBase(const clang::Expr *pointerExpr) {
+  const clang::Expr *expr = stripTrivia(pointerExpr);
+  while (const clang::Expr *sub = peelPointerCast(astContext(), expr))
+    expr = stripTrivia(sub);
+  const auto *ref =
+      llvm::dyn_cast<clang::DeclRefExpr>(expr->IgnoreParenImpCasts());
+  if (!ref)
+    return nullptr;
+  const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+  if (!var || llvm::isa<clang::ParmVarDecl>(var) || !var->hasLocalStorage())
+    return nullptr;
+  auto it = pointerLocals.find(var);
+  if (it == pointerLocals.end())
+    return nullptr;
+  const PointerLocalInfo &info = it->second;
+  if (!info.base || info.member || info.cursorCell || info.nonNullCell ||
+      info.baseIndexCell || !info.multiBases.empty() || info.literalBacking ||
+      info.backing)
+    return nullptr;
+  if (!info.base->hasLocalStorage())
+    return nullptr;
+  return info.base;
 }
 
 FailureOr<Value>

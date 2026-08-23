@@ -3006,11 +3006,19 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
     // DERIVED object as the region base; every struct-place use site
     // reconciles the viewed base type by re-deriving the `base` hop
     // chain (`reconcileUpcastPlace`), so a unique single public
-    // non-virtual non-polymorphic chain admits here alongside exact
-    // type equality.
+    // non-virtual chain admits here alongside exact type equality.
+    // W2.19b: the chain check runs with `allowPolymorphic` — this is the
+    // single-base degenerate branch (`region->bases.front()`), i.e. the
+    // single-object region fact holds by construction: the bound
+    // object's dynamic type is statically known, non-virtual uses
+    // statically bind (exact), and virtual calls devirtualize against it
+    // or keep the fence in `emitCXXMemberCall`. Multi-object regions
+    // never reach here (the `bases.size() >= 2` model above keeps its
+    // strict element-type uniformity and JOIN rejection).
     if (!wildcard &&
         !astContext().hasSameUnqualifiedType(pointee, base->getType()) &&
-        !uniquePublicSingleBaseChain(base->getType(), pointee))
+        !uniquePublicSingleBaseChain(base->getType(), pointee,
+                                     /*allowPolymorphic=*/true))
       return emitError(bindLoc)
              << "unsupported: pointer type does not match its target object";
   }

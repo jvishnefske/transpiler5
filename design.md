@@ -11578,13 +11578,12 @@ STL surface (vector/string/array/pair/optional/string_view/variant, by-value
 lambdas, structured bindings, ranged-for). At the time this roadmap was
 written the Cpp17Suite ledger stood at 23/26 with three frontier markers
 left: 00801 (copy constructor / elision sensor), 00901 (inheritance +
-virtual dispatch), 00902 (exceptions). W2.15-W2.18 have since added four
-corpus entries and W2.20/W2.21/W2.22 three more; as of W2.21 it stands
-at 30/33,
-the same three markers still out --
-each wave adds its own entry rather than flipping a marker, because the
-markers sit behind copy semantics, virtual dispatch and exceptions
-specifically.
+virtual dispatch), 00902 (exceptions). The W2.15+ waves have since added
+nine corpus entries, and **W2.19b flipped 00901 itself** -- the first
+frontier MARKER to fall, via devirtualization of the single-object base
+pointer. As of W2.19b the ledger stands at 33/36, with 00801 (copy
+semantics, W2.23's sensor) and 00902 (exceptions, W2.24) the two markers
+still out.
 
 Measured frontier, 2026-08-21, one probe per construct through
 `build/tools/emitrust-cc --emit=rust` (every one is a LOCATED rejection --
@@ -12157,6 +12156,38 @@ whole-program demand.
   test/Import/Cpp/virtual-methods-values.cpp,
   virtual-methods-values-invalid.cpp; reworked VIRTMETHOD/MULTIVIRT/
   VIRTSIB/VIRTUAL arms and both coloring goldens)
+  **W2.19b LANDED 2026-08-22 -- 00901 FLIPS UNSUPPORTED -> PASS**, the
+  first frontier marker to fall. When a base pointer binds exactly one
+  object of known most-derived type, a virtual call devirtualizes to
+  that object's override on the object's own place (no hop for
+  overrides -- FR-120's reconcile-toward-the-TARGET note routing around
+  the empty-base wall exactly as recorded), while a NON-virtual call
+  through the same pointer keeps its static bind through the hop chain
+  -- both legD4 rules in one byte-diffed EndToEnd leg. The relaxation
+  is gated on the SAME single-object region fact that makes it sound
+  (`allowPolymorphic` parameterizes the hop walk; callers pass the
+  non-null-only-for-single-object PtrExprValue::base), and the
+  soundness floor held with a wording refinement the spike measured:
+  a two-object DIFFERENT-dynamic-type pointer dies at the JOIN wording
+  (the planner fence), while only the exact-type twin reaches
+  MULTIOBJ -- both pinned. peelPointerCast admits polymorphic chains
+  context-free with the measured downstream walls named in its
+  comment; the invalid suites across all 20 peel call sites ran in the
+  full gate. W2.19a's same-type local-pointer carve-out admits via
+  devirt; parameter/ctor-body/global/Box fences stay, with the Box
+  same-T coupling recorded. ONE BUG THE NEW TEST CAUGHT PRE-GREEN:
+  devirt through a DERIVED-typed pointer replayed the call-site hops
+  on the already-reconciled place -- a double base projection nothing
+  before rustc would have caught; devirt now clears the peeled hops.
+  Gates: full meson suite 765/765 (fast 543 + slow/EndToEnd 222);
+  Cpp17Suite ratchets 32 -> 33 (**00901.cpp**) at total=35
+  transpiled=33 passed=33 miscompiled=0; CTestSuite 220/220/0/0
+  unchanged. W2.19c's blockers are now fully satisfied; it stays
+  DEFERRED by design (user-trait verifier contract + trait-def op).
+  (test/Import/Cpp/virtual-methods-devirt.cpp;
+  test/EndToEnd/cpp-devirt-base-pointer.cpp; PTRLOCAL/PTRDEREF/
+  VUPCASTM/VUPCAST pins flipped forward; TWOOBJ/EXACTVIRT/EXACTNONV/
+  GLOBALVIRT/NULLABLEPTR/QUALPTR arms new)
 
 
 - [x] W2.20 `std::map`/`std::set` -> `BTreeMap`/`BTreeSet`. Spike
