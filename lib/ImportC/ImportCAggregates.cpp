@@ -47,6 +47,7 @@ void CImporter::collectOrdinaryNames(const clang::TranslationUnitDecl *unit) {
   ordinaryTuNames.clear();
   ordinaryRawTuNames.clear();
   ordinaryTuNameOwners.clear();
+  ordinaryTuQualifiedOwners.clear();
   collectOrdinaryNamesFrom(unit);
 }
 
@@ -81,6 +82,8 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
         ordinaryTuNames.insert(specName);
         ordinaryRawTuNames.insert(spec->getName());
         ordinaryTuNameOwners.try_emplace(specName, spec->getName().str());
+        ordinaryTuQualifiedOwners.try_emplace(specName,
+                                              spec->getQualifiedNameAsString());
         if (spec->hasBody())
           collectStaticLocalNames(spec->getBody(), specName);
       }
@@ -95,6 +98,10 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
       // the same raw name agree), so the underscore-fold guard in
       // importFunction can reject a DIFFERENT spelling folding onto it.
       ordinaryTuNameOwners.try_emplace(funcName, func->getName().str());
+      // FR-125: same first-claimant record, qualified spelling, for the
+      // case-fold collision guard in importFunction.
+      ordinaryTuQualifiedOwners.try_emplace(funcName,
+                                            func->getQualifiedNameAsString());
       // Function-local statics surface at module level under their
       // `<function>_<name>` mangle (see emitLocalVar), claiming that
       // spelling in the ordinary namespace.
@@ -109,6 +116,8 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
       // FR-73: same first-claimant record as the function branch, for the
       // underscore-fold guard in importGlobalVar.
       ordinaryTuNameOwners.try_emplace(varName, var->getName().str());
+      ordinaryTuQualifiedOwners.try_emplace(varName,
+                                            var->getQualifiedNameAsString());
     }
   }
 }
