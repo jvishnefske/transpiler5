@@ -13141,7 +13141,36 @@ whole-program demand.
   scope for provably-main-only globals, or continued rejection with
   the count recorded). W2.17 gated this deliberately; the re-sweep
   says it is the biggest single uncovered construct by raw count.
-  **NOT SPIKED.**
+  **NO-GO (2026-08-22), spiked with a gate-lift experiment and the
+  byte-diff oracle deciding.** The entry's "Rust statics never drop"
+  rationale is STALE -- post-ActorLift there are no statics; lifted
+  globals become c_main locals (drop reverse = C++ order) or actor
+  fields/thread_local Cells. Under a bare gate lift the ONLY
+  byte-correct shape is an untouched, constant-init, fielded droppy
+  global (measured byte-identical, including the two-global
+  ordering-pressure probe whose dtors traffic through a shared
+  demoted global) -- and that shape matches ZERO of the 948 corpus
+  items, all of which are dynamic-init (930 pugixml test-runner
+  registration globals needing dynamic init + virtual dispatch; the
+  18 others dynamic-init too) and would merely re-root to the
+  upstream `non-constant global initializer` fence for zero gain.
+  FOUR SILENT MISCOMPILES measured end-to-end (probe files in the
+  session scratchpad w227-spike/, each a compile-clean crate with
+  wrong stdout): fieldless droppy global emits an uninitialized
+  binding and loses the dtor line; a main-touched droppy global's
+  whole-struct temp-copy moves reproduce W2.17's measured drop-order
+  bug with today's machinery; the helper-touched actor shape's
+  default-then-assign init drops a placeholder (spurious `dtor 0`);
+  and `exit()` maps to std::process::exit which runs NO drops where
+  C++ runs global dtors. The gate at ImportCGlobals.cpp:54-56 stays,
+  wording and cxx-drop-global tag unchanged; libc::atexit is NOT the
+  future image (conflicts with the dependency-free manifest policy,
+  and c_main-return drops already give correct order). A future lift
+  must close all four channels loudly first and its EndToEnd oracle
+  set is recorded: multi-global reverse order + interleave, cross-dtor
+  global traffic, the fieldless struct, the actor shape, and an
+  exit()-rejection pin. Existing rejection pins already cover the
+  shapes that stay out; nothing new pinned this wave.
 
 - [x] W2.28 (NEW WAVE, from the 2026-08-22 re-sweep) Template
   residue: the family re-entered at ~249 items once FR-115 made it
