@@ -130,10 +130,10 @@ anchor = "FR-122 DEFECT"
 id = "FR-115"
 rank = 9
 kind = "defect"
-status = "open"
-size = "M"
-title = "Rejected C++ records carry no diagnostic (70% of unported items silent)"
-summary = "Measurability defect: cascade rooting needed a second tool. FR-112 pays part of this down for contained shapes."
+status = "spiked"
+size = "S"
+title = "Silent unported items: two broken joins, not a schema gap"
+summary = "GO: baseline re-measured 70% -> 41.3%; ~880 items are a ledger-symbol join miss, 624 a discarded coloring root; schema needs nothing. The ranking MOVES when fixed (template invisible -> #3). Four pinned spellings churn."
 blocked_by = []
 anchor = "FR-115 DEFECT"
 

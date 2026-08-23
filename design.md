@@ -7527,17 +7527,59 @@ piece and becomes FR-45.
   cpp-ctor-overload.cpp)
 
 
-- [ ] FR-115 DEFECT: a rejected C++ record never says WHY. `struct 'X'
-  was rejected` is raised at every use site while X's own item carries
-  `blocker: ""`, `diagnostic: ""`. Corpus-wide, 6193 of 8851 graph
-  items (70%) are status `missing` with NO diagnostic at all -- 2835
-  records, 1110 globals, 701 functions after dedup. FR-42's "rejection
-  is a feature, with LOCATED diagnostics" contract holds for what
-  recovery REPORTS, but on the C++ path the MAJORITY of unported items
-  are silent: rooting the Track 5 cascade required a second
-  `--emit=coloring` run plus hand-built repros. This is a
-  measurability defect, and it is why the ranked table below needed
-  two tools instead of one. **NOT SPIKED.**
+- [ ] FR-115 DEFECT: a rejected C++ record never says WHY. Spike
+  verdict **GO-WITH-CONSTRAINTS** (2026-08-22), with the baseline
+  RE-MEASURED first because the filed 70% predates eleven landed
+  increments: at HEAD the silent fraction is **41.3%** (2145 of 5193
+  unported rows over tinyxml2+jsoncpp+spdlog) -- FR-112 and the waves
+  since paid down a large share -- and the structure is stark: every
+  dropped/stubbed item now carries a FULL diagnostic and root (100%);
+  the silent mass is ENTIRELY status `missing`.
+  THE CHANNEL MAP, measured with counts: (a) ~880 items are a
+  LEDGER-SYMBOL JOIN MISS -- the rejection exists, located and tagged,
+  but `declLedgerName` records the raw clang spelling (`StrPair`)
+  while the report joins on graph keys (`NsTinyxml2StrPair`), so the
+  rejection lands off-graph and the node reads blank; FR-51 fixed this
+  for exactly one symbol (main -> c_main) and the doc comment already
+  calls the field a JOIN KEY. (b) 624 items where the COLORING already
+  computed construct+chain but `attributeRoot` early-returns on an
+  empty blockerTag and discards it -- an 8-line report-side fix.
+  (c1) 662 residual: ONE rejection of a template pattern covers N
+  per-instantiation nodes; a same-location ledger row exists for 100%
+  of them but the joining decl is not the specialization. (c2) 603
+  residual: never visited at all -- items only demanded from code that
+  was itself rejected; legitimately un-rejected, needs an honest
+  `unreached-by-import` tag, NOT a fabricated diagnostic. (d) THE
+  SCHEMA NEEDS NOTHING: emitrust-progress/1 already has root_blocker,
+  blame_chain, attributed_via -- the second-tool-run cost that made
+  Track 5 expensive is purely the two broken joins.
+  THE VALUE TEST CONFIRMED THE FR'S PREMISE: with the throwaway patch,
+  silent drops 2145 -> 1265, 655 double-counted rows merge away (the
+  current denominator is quietly inflated), emitted Rust is
+  byte-identical across all 11 corpus TUs -- and **the root-blocker
+  ranking MOVES**: `template` jumps from below-cutoff to #3 (440),
+  `destructor` +54%, `copy-move-constructor` #4 -> #2, and
+  `rejected-type-cascade` collapses 496 -> 317 as cascade mass
+  re-attributes to true roots. The demand re-ranking has been steering
+  on incomplete data, which is exactly what this FR alleged.
+  GOLDEN CHURN, enumerated: exactly four pinned ledger-print spellings
+  become the honest graph key (incremental-planner-rejection.c
+  `consume` -> `tu0_consume`, incremental-planner-va.c,
+  incremental-fnptr-undefined.c, cpp-record-cross-tu-odr-invalid.cpp
+  `c` -> `C`); the RealWorld expected-items ratchet gate PASSES
+  unchanged.
+  CONSTRAINTS: reuse or document divergence from
+  `ItemGraphBuilder::recordSymbolFor`'s collision path (plain
+  recordRustName degrades to today's off-graph behavior in the rare
+  Struct_-rename case); (c1) wants per-specialization recording at the
+  importRecord rejection site, NOT a same-location report join that
+  would conflate instantiations; (c2) gets the additive tag riding the
+  existing schema without touching the 5-value status vocabulary the
+  ratchet parses; existing ledger tags cover the newly-visible mass
+  (direct `other` did not balloon, 541 -> 531); the wave needs the
+  FULL suite -- the spike ran fast-tier only, with byte-identity
+  spot-proven on 11 corpus TUs rather than the 102 EndToEnd inputs.
+  **SPIKED.**
 
 - [x] FR-119 DEFECT: a free NON-MEMBER `operator` declaration escapes
   every backstop and emits a syntactically invalid crate, silently.
