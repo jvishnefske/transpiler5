@@ -58,5 +58,5 @@ int use(int n) {
 // CHECK: func.func @use_(
 
 // RUST: impl C {
-// RUST: pub fn c_get(&self) -> i32 {
-// RUST: pub fn c_set(&mut self, n: i32) {
+// RUST: pub fn get(&self) -> i32 {
+// RUST: pub fn set(&mut self, n: i32) {

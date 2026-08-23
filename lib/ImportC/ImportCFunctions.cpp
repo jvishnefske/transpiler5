@@ -146,13 +146,9 @@ static bool isSameTUOverloadSet(const clang::FunctionDecl *func) {
   return emitrust::overloadSetSize(func) > 1;
 }
 
-std::string
-CImporter::cxxMethodMangledName(const clang::CXXMethodDecl *method) const {
+std::string CImporter::cxxMethodSuffixedBaseName(
+    const clang::CXXMethodDecl *method) const {
   const clang::CXXRecordDecl *record = method->getParent();
-  // `lookup` returns the mapped std::string BY VALUE; binding it to a
-  // StringRef would dangle the moment the temporary dies (observed as
-  // garbage bytes in mangled names under the dylib build).
-  std::string structName = assignedStructNames.lookup(record);
   std::string baseName = cxxMethodBaseName(method);
   // The overload suffix is present only when the class declares MORE THAN
   // ONE method (or constructor) sharing this base name (a genuine C++
@@ -187,7 +183,6 @@ CImporter::cxxMethodMangledName(const clang::CXXMethodDecl *method) const {
     if (candidateName == baseName)
       ++sharingCount;
   }
-  std::string mangled = structName + "_" + baseName;
   if (sharingCount > 1) {
     std::string codes;
     for (const clang::ParmVarDecl *param : method->parameters())
@@ -197,12 +192,28 @@ CImporter::cxxMethodMangledName(const clang::CXXMethodDecl *method) const {
     // trailing suffix (methods.cpp's binding worked example: `Counter_get`
     // for the 0-arg overload, `Counter_get_i` for the 1-arg one).
     if (!codes.empty())
-      mangled += ("_" + codes);
+      baseName += ("_" + codes);
   }
+  return baseName;
+}
+
+std::string
+CImporter::cxxMethodMangledName(const clang::CXXMethodDecl *method) const {
+  // `lookup` returns the mapped std::string BY VALUE; binding it to a
+  // StringRef would dangle the moment the temporary dies (observed as
+  // garbage bytes in mangled names under the dylib build).
+  std::string structName = assignedStructNames.lookup(method->getParent());
   // The `<Class>_<method>[_codes]` symbol is a free-standing function name, so
   // it takes the function spelling (snake_case under the idiomatic rename,
-  // folding the UpperCamel class prefix back to snake).
-  return fnRustName(mangled);
+  // folding the UpperCamel class prefix back to snake). FR-110: the fold is
+  // char-local, so `fnRustName(S + "_" + B) == fnRustName(S) + "_" +
+  // fnRustName(B)` exactly -- the in-impl spelling
+  // (`fnRustName(cxxMethodSuffixedBaseName(..))`, the method_rust_name
+  // attribute) stays a literal suffix of this module symbol in both rename
+  // modes, and a module-symbol collision implies (and is implied by) an
+  // in-impl collision, so per-class member uniqueness follows from the
+  // module-level uniqueness importFunction already rejects on.
+  return fnRustName(structName + "_" + cxxMethodSuffixedBaseName(method));
 }
 
 /// Returns whether `later` differs from `earlier` only by refining
@@ -896,6 +907,18 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
     // route it into a SECOND, trait-carrying impl and rename it to `drop`.
     if (llvm::isa<clang::CXXDestructorDecl>(cxxMethod))
       funcOp->setAttr(emitrust::kDropImplAttrName, builder.getUnitAttr());
+    // FR-110: every OTHER genuine C++ method carries its in-impl Rust
+    // spelling (the mangled symbol minus the `<Struct>_` prefix), the
+    // print-time name the Rust emitter renders for the impl member and its
+    // call sites. Attribute-keyed on purpose: a Phase-4 C owner method
+    // shares `method_of` but its symbol was never struct-prefixed (an impl
+    // legitimately holds both `counter_actor_get` and `get`, measured), so
+    // a name-prefix strip anywhere downstream would be unsound.
+    else
+      funcOp->setAttr(
+          emitrust::kMethodRustNameAttrName,
+          builder.getStringAttr(fnRustName(cxxMethodSuffixedBaseName(
+              cxxMethod))));
   }
   functions[name] = funcOp;
   // Recovery stub retry (FR-42): the signature above is the one the real

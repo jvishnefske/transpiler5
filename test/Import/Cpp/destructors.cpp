@@ -96,18 +96,23 @@ int main(void) {
 // RUST: #[derive(Clone, Default)]
 // RUST-NEXT: struct Guard {}
 // RUST: impl Tracer {
-// RUST: fn tracer_new(&mut self, i: i32) {
-// RUST: fn tracer_bump(&mut self, d: i32) {
+// RUST: fn new(&mut self, i: i32) {
+// RUST: fn bump(&mut self, d: i32) {
 // RUST: impl Drop for Tracer {
 // RUST-NEXT: fn drop(&mut self) {
 // RUST-NEXT: println!("dtor {}", self.id);
 // RUST: impl Drop for Guard {
 // RUST-NEXT: fn drop(&mut self) {
 // RUST-NEXT: println!("guard dtor");
-// The user `drop` and the destructor coexist as two distinct items: the
-// inherent one keeps its mangled spelling, the trait one is bare `drop`.
+// The user `drop` and the destructor coexist as two distinct items --
+// and FR-110 makes them SPELLING-collide on purpose: the user method's
+// module symbol stays `manual_drop`, but its printed in-impl name strips
+// to `drop`, an INHERENT `fn drop` beside `impl Drop for Manual`. Legal
+// Rust, correct binding (an explicit `.drop()` call resolves to the
+// inherent method, RAII still runs `Drop::drop`; byte-diff-proven in
+// test/EndToEnd/cpp-method-names.cpp), never a silent misbinding.
 // RUST: impl Manual {
-// RUST-NEXT: fn manual_drop(&mut self) {
+// RUST-NEXT: fn drop(&mut self) {
 // RUST: impl Drop for Manual {
 // RUST-NEXT: fn drop(&mut self) {
 // RUST-NEXT: println!("manual dtor {}", self.id);

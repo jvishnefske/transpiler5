@@ -251,12 +251,11 @@ anchor = "W2.19"
 
 [[items]]
 id = "FR-110"
-rank = 11
 kind = "quality"
-status = "in-flight"
+status = "landed"
 size = "L"
-title = "Emitted C++ methods carry their class name (bi.box_i32_get())"
-summary = "Biggest idiomaticity gap, clippy-blind; fix at the W2.17 impl-move rename hook, NOT the mangler. Heavy golden churn, byte-identity contract."
+title = "Emitted C++ methods drop the class prefix (bi.get(), BoxA::origin())"
+summary = "Landed 2026-08-23: importer attr + print-time strip at three translate sites (the entry's FuncToEmitRust hook measured unsound -- shard bytecode + shared-namespace contract). Analyses read unstripped IR; drop/clone collision shapes byte-proven; ctor-to-associated-fn split off (kills the 2 remaining clippy warnings/class)."
 blocked_by = []
 anchor = "FR-110 QUALITY"
 

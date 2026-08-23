@@ -96,7 +96,15 @@ int main(int argc, char **argv) {
 // RENAME-DAG: struct NsANsBPt {
 // RENAME-DAG: struct NsAnonTally {
 // RENAME-DAG: struct NsCfgnsCfg {
-// RENAME-DAG: fn box_get(
-// RENAME-DAG: fn ns_ns_box_get(
-// RENAME-DAG: fn ns_a_ns_b_pt_get(
-// RENAME-DAG: fn ns_anon_tally_get(
+// FR-110: the namespace flattening lives in the STRUCT/impl names; the
+// members themselves print the bare in-impl spelling `get` inside each
+// class's own (still-distinct) impl. The four mangled module symbols
+// (`ns_ns_box_get`, ...) remain the IR/symbol-surface names above.
+// RENAME: impl Box {
+// RENAME-NEXT: fn get(
+// RENAME: impl NsNsBox {
+// RENAME-NEXT: fn get(
+// RENAME: impl NsANsBPt {
+// RENAME-NEXT: fn get(
+// RENAME: impl NsAnonTally {
+// RENAME-NEXT: fn get(

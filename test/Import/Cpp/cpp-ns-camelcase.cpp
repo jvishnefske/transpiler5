@@ -57,7 +57,7 @@ int main() {
 
 // RENAME-DAG: struct NsGameBox {
 // RENAME-DAG: static TU0_NS_GAME_HIGH: i32 = 7;
-// RENAME-DAG: fn ns_game_box_get(
+// RENAME-DAG: fn get(
 // RENAME-DAG: fn ns_game_ns_input_poll(
 // RENAME-DAG: fn ns_game_score(
 // RENAME-DAG: fn ns_pre_game_setup_init(

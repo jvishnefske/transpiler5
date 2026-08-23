@@ -165,27 +165,27 @@ int main() {
 // RUST: struct Tagged {
 // RUST-NEXT: v: i32,
 // RUST: impl Derived {
-// RUST: fn derived_new(&mut self, a: i32, b: i32) {
-// RUST-NEXT: self.base.base_new(a);
+// RUST: fn new(&mut self, a: i32, b: i32) {
+// RUST-NEXT: self.base.new(a);
 // RUST-NEXT: self.y = b;
-// RUST: fn derived_sum(&self) -> i32 {
-// RUST-NEXT: let v0: i32 = self.base.base_get();
+// RUST: fn sum(&self) -> i32 {
+// RUST-NEXT: let v0: i32 = self.base.get();
 // RUST-NEXT: v0 + self.y
-// RUST: fn derived_scaled(&self) -> i32 {
+// RUST: fn scaled(&self) -> i32 {
 // RUST-NEXT: self.base.x * 3i32 + self.y
-// RUST: fn derived_grow(&mut self, d: i32) {
+// RUST: fn grow(&mut self, d: i32) {
 // RUST-NEXT: self.base.x += d;
-// RUST-NEXT: self.base.base_bump(d);
+// RUST-NEXT: self.base.bump(d);
 // RUST-NEXT: self.y += d;
-// RUST: fn derived_via_this(&self) -> i32 {
-// RUST-NEXT: let v0: i32 = self.base.base_get();
+// RUST: fn via_this(&self) -> i32 {
+// RUST-NEXT: let v0: i32 = self.base.get();
 // RUST-NEXT: v0 + self.base.x
-// RUST: fn derived_via_qualified(&self) -> i32 {
-// RUST-NEXT: self.base.base_get()
+// RUST: fn via_qualified(&self) -> i32 {
+// RUST-NEXT: self.base.get()
 // RUST: impl Third {
-// RUST: fn third_new(&mut self, a: i32, b: i32, c: i32) {
-// RUST-NEXT: self.base.derived_new(a, b);
+// RUST: fn new(&mut self, a: i32, b: i32, c: i32) {
+// RUST-NEXT: self.base.new(a, b);
 // RUST-NEXT: self.z = c;
-// RUST: fn third_total(&self) -> i32 {
-// RUST-NEXT: let v0: i32 = self.base.base.base_get();
+// RUST: fn total(&self) -> i32 {
+// RUST-NEXT: let v0: i32 = self.base.base.get();
 // RUST-NEXT: v0 + self.base.base.x + self.base.y + self.z

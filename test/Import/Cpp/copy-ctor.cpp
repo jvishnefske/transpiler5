@@ -164,7 +164,7 @@ int main() {
 // The copy ctor is an ordinary &mut self method taking &T, named under
 // FR-114's r-code (NOT the spike's predicted `_rs` -- the code is the
 // record's snake tag name).
-// RUST: fn tracer_new_i(&mut self, v: i32) {
-// RUST: fn tracer_new_rtracer(&mut self, other: &Tracer) {
-// RUST: fn loud_new_rloud(&mut self, o: &Loud) {
+// RUST: fn new_i(&mut self, v: i32) {
+// RUST: fn new_rtracer(&mut self, other: &Tracer) {
+// RUST: fn new_rloud(&mut self, o: &Loud) {
 // RUST: impl Drop for Loud {

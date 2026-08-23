@@ -3015,6 +3015,16 @@ private:
   /// file-static function share `clang::SC_Static` for unrelated reasons).
   std::string cxxMethodMangledName(const clang::CXXMethodDecl *method) const;
 
+  /// FR-110: `method`'s suffixed base name -- the mangled name WITHOUT the
+  /// `<StructName>_` prefix and before the `fnRustName` fold: the
+  /// `cxxMethodBaseName` spelling plus the overload-code suffix when the
+  /// class declares a genuine overload set on that base. `fnRustName` of
+  /// this is the method's in-impl spelling (the value of the
+  /// `emitrust.method_rust_name` attribute); `fnRustName(<Struct>_<this>)`
+  /// is the module symbol, so the two stay consistent by construction.
+  std::string
+  cxxMethodSuffixedBaseName(const clang::CXXMethodDecl *method) const;
+
   /// W2.2: imports a `CXXMemberCallExpr` (`obj.method(args)` /
   /// `obj->method(args)`) as an `emitrust.method_call` on the (possibly
   /// const) receiver place, mirroring the Phase-4 method-call lowering

@@ -53,8 +53,8 @@ int use_it(S s) { return s.get(); }
 // RUST-DAG: unimplemented!("unsupported builtin type 'unsigned __int128'")
 // RUST-DAG: pub fn g(x: i32) -> i32 {
 // RUST-DAG: pub struct S {
-// RUST-DAG: pub fn s_get(&self) -> i32 {
-// RUST-DAG: s.s_get()
+// RUST-DAG: pub fn get(&self) -> i32 {
+// RUST-DAG: s.get()
 
 // STRICT: error: unsupported builtin type 'unsigned __int128'
 // STRICT-NOT: referenced but not defined

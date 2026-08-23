@@ -208,6 +208,6 @@ int main(int argc, char **argv) {
 // RENAMEREC: fn c_main
 // RENAMEREC: unimplemented!("unsupported: struct 'BoxI32' was rejected, so a type naming it cannot be imported")
 // RENAMEREC: impl BoxI32 {
-// RENAMEREC: fn box_i32_get(&self) -> i32 {
+// RENAMEREC: fn get(&self) -> i32 {
 // RENAMEREC: self.v + 100i32
 // RENAMEREC-NOT: struct BoxI32 {

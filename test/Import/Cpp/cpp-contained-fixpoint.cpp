@@ -67,7 +67,7 @@ int use(int n) {
 // INSTDIAG: instance.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: call to unimported method 'Chain_bad' (omitted: method 'lead' of class 'Chain')
 
 // RUST: impl Chain {
-// RUST: pub fn chain_good(&mut self, n: i32) -> i32 {
+// RUST: pub fn good(&mut self, n: i32) -> i32 {
 
 //--- static.cpp
 struct SChain {

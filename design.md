@@ -7003,7 +7003,7 @@ piece and becomes FR-45.
   shift, confirming the prediction that the one golden touching this
   helper pins its signature line and not its body.
 
-- [ ] FR-110 QUALITY, DESIGN-LEVEL: every emitted C++ method carries
+- [x] FR-110 QUALITY, DESIGN-LEVEL: every emitted C++ method carries
   its class name. `bi.box_i32_get()` inside `impl BoxI32`, and
   `let mut bi = BoxI32::default(); bi.box_i32_new(x);` where a Rust
   programmer would write `BoxI32::new(x)`. This is the biggest
@@ -7016,7 +7016,46 @@ piece and becomes FR-45.
   (FuncToEmitRust.cpp:192, `isDropImpl ? "drop" : funcOp.getName()`),
   plus a matching strip in `emitMethodCall`. Two coordinated sites,
   heavy golden churn, and it touches the CSymbolNaming byte-identity
-  contract. **NOT SPIKED.**
+  contract.
+  LANDED 2026-08-23 (spike GO-WITH-CONSTRAINTS), with this entry's
+  proposed hook CORRECTED by measurement: the FuncToEmitRust-side
+  rename is ruled out (it would bake stripped names into shard
+  bytecode and break LowerExternalRequirements' shared-namespace
+  contract), and blind prefix-stripping is measured UNSOUND (an
+  actor-lifted C impl legitimately holds both counter_actor_get and
+  get; a make_unique receiver is an opaque Box type, so
+  receiver-type lookup is unsound too). The landed design: the
+  importer attaches `emitrust.method_rust_name` (the suffixed base
+  name) on C++ method funcs only -- named to sort after
+  emitrust.method_of, which kept 29 open-brace CHECK pins alive --
+  and the strip happens at TranslateToRust PRINT time at exactly
+  three sites (member def, method call, the two-part call_opaque
+  Struct::member form). Every analysis (mutability query incl. the
+  W2.21 Box branch, opDiverges, borrow machinery, ledger/graph/
+  FR-112 keys) reads unstripped IR; reporting stays on mangled
+  names. `bi.get()`, `s.op_eq(&o)`, `BoxA::origin()` render; two
+  impls both owning `get` coexist with struct-scoped mutability
+  proven. NO new rejections: a user C++ method literally named
+  drop/clone strips to an inherent method BESIDE impl Drop /
+  derive(Clone) with correct binding, byte-identical including RAII
+  interleaving (the EndToEnd test is built around that hazard);
+  new/default/delete are C++ keywords so the surfaces are closed by
+  construction. Ctor policy: C_new strips to `fn new(&mut self,..)`
+  -- behavior-correct, byte-identical, but +2 clippy warnings/class
+  (new_ret_no_self, wrong_self_convention); the ctor-to-ASSOCIATED-
+  fn shape (BoxI32::new(x), receiver rewriting, kills both warnings)
+  is the recorded split increment. Instance/static/operator/drop/
+  clone strips are clippy-neutral (measured 0->0). Golden churn:
+  larger than the spike counted (12 extra files with RUST-prefix
+  pins on mangled names) but ALL mechanical; C-owner members
+  (attr-less) pinned non-stripped. Cross-TU is moot today --
+  emitrust-clang side-emits only language=="c", so no C++ method
+  symbol exists on the shard surface (measured, by design). Gates:
+  full meson suite 806/806 (fast 569 + EndToEnd 237).
+  (test/Target/Rust/impl-method-rust-name.mlir,
+  test/Driver/cpp-method-names-rust.cpp,
+  test/EndToEnd/cpp-method-names.cpp; 18 goldens renamed
+  mechanically, prose in methods.cpp/destructors.cpp updated)
 
 - [ ] FR-111 QUALITY: the `field_reassign_with_default` fuse is
   OVER-gated for Drop types. TranslateToRust.cpp:2440 bails on

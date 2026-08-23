@@ -60,12 +60,16 @@
 // "<StructName>::<mangled-callee-symbol>" — e.g. `"Counter::Counter_origin"`.
 // This intentionally reuses the already-mangled MLIR symbol on BOTH sides
 // of the `::` (rather than recovering the original unmangled spelling)
-// so the qualified string is always self-consistent with whatever name
-// the Rust emitter later prints for that same function inside its `impl`
-// block, with zero extra bookkeeping: it is uglier Rust
-// (`Counter::Counter_origin()` instead of `Counter::origin()`) but it is
-// unambiguous, deterministic, and requires no additional design beyond
-// picking the mangled name once at method-import time.
+// so the qualified string stays unambiguous and deterministic at the
+// import surface. FR-110: the redundancy no longer reaches the emitted
+// Rust -- every genuine C++ method (ctor included, dtor excluded: W2.17's
+// `drop` rename owns that member) ALSO carries its in-impl spelling as
+// the `emitrust.method_rust_name` StringAttr (the mangled symbol minus
+// the `<Struct>_` prefix, overload suffix kept: `origin`, `get_i`), and
+// the Rust emitter strips at PRINT time only -- `Counter::origin()`,
+// `c.get()`, `fn inc` -- while the module symbol namespace, every
+// analysis, and every ledger key keep joining on the mangled names
+// pinned below.
 //
 // Constructor lowering shape (binding; the spike's Counter used a plain
 // body assignment `{ value = start; }`, never a member-initializer list,
@@ -123,7 +127,7 @@ int use_counters(void) {
 // zero-parameter overload keeps the bare name.
 // CHECK-LABEL: func.func @Counter_new
 // CHECK-SAME: (%[[NDSELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Counter">>)
-// CHECK-SAME: attributes {emitrust.method_of = "Counter"
+// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.method_rust_name = "new"
 // CHECK: %[[NDRCV:.*]] = emitrust.deref %[[NDSELF]] : (!emitrust.mut_ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[NDFLD:.*]] = emitrust.member %[[NDRCV]]["value"] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<i32>
 // CHECK: %[[NDZERO:.*]] = arith.constant 0 : i32
@@ -135,7 +139,7 @@ int use_counters(void) {
 // the same way, binding the incoming parameter instead of a constant.
 // CHECK-LABEL: func.func @Counter_new_i
 // CHECK-SAME: (%[[NISELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Counter">>, %[[START:.*]]: i32)
-// CHECK-SAME: attributes {emitrust.method_of = "Counter"
+// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.method_rust_name = "new_i"
 // CHECK: %[[NIRCV:.*]] = emitrust.deref %[[NISELF]] : (!emitrust.mut_ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[NIFLD:.*]] = emitrust.member %[[NIRCV]]["value"] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[NIFLD]] = %[[START]] : !emitrust.lvalue<i32>
@@ -146,7 +150,7 @@ int use_counters(void) {
 // `value = value + d;` is an implicit `this->value` read-modify-write.
 // CHECK-LABEL: func.func @Counter_inc
 // CHECK-SAME: (%[[INCSELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Counter">>, %[[D:.*]]: i32)
-// CHECK-SAME: attributes {emitrust.method_of = "Counter"
+// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.method_rust_name = "inc"
 // CHECK: %[[INCRCV:.*]] = emitrust.deref %[[INCSELF]] : (!emitrust.mut_ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[INCFLD:.*]] = emitrust.member %[[INCRCV]]["value"] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[INCFLD]] = %{{.*}} : !emitrust.lvalue<i32>
@@ -156,7 +160,7 @@ int use_counters(void) {
 // pin. Bare name (empty parameter type-code suffix).
 // CHECK-LABEL: func.func @Counter_get
 // CHECK-SAME: (%[[GSELF:.*]]: !emitrust.ref<!emitrust.struct<"Counter">>) -> i32
-// CHECK-SAME: attributes {emitrust.method_of = "Counter"
+// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.method_rust_name = "get"
 // CHECK: %[[GRCV:.*]] = emitrust.deref %[[GSELF]] : (!emitrust.ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: emitrust.member %[[GRCV]]["value"]
 
@@ -167,14 +171,14 @@ int use_counters(void) {
 // place shape.
 // CHECK-LABEL: func.func @Counter_get_i
 // CHECK-SAME: (%[[GISELF:.*]]: !emitrust.ref<!emitrust.struct<"Counter">>, %[[OFFSET:.*]]: i32) -> i32
-// CHECK-SAME: attributes {emitrust.method_of = "Counter"
+// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.method_rust_name = "get_i"
 // CHECK: %[[GIRCV:.*]] = emitrust.deref %[[GISELF]] : (!emitrust.ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: emitrust.member %[[GIRCV]]["value"]
 
 // Static method: no receiver argument at all, and the `static_method`
 // marker sits alongside `method_of` in the attribute dict.
 // CHECK-LABEL: func.func @Counter_origin() -> i32
-// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.static_method}
+// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.method_rust_name = "origin", emitrust.static_method}
 // CHECK: arith.constant 0 : i32
 
 // `Other`'s independent, differently-owned `get` — distinct symbol from
@@ -183,7 +187,7 @@ int use_counters(void) {
 // CHECK: emitrust.struct_def @Other ["v"] [i32]
 // CHECK-LABEL: func.func @Other_get
 // CHECK-SAME: (%[[OSELF:.*]]: !emitrust.ref<!emitrust.struct<"Other">>) -> i32
-// CHECK-SAME: attributes {emitrust.method_of = "Other"
+// CHECK-SAME: attributes {emitrust.method_of = "Other", emitrust.method_rust_name = "get"
 // CHECK: emitrust.member %{{.*}}["v"]
 
 // The driver: every call-site shape in one place.

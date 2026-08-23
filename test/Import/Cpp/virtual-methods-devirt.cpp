@@ -164,13 +164,13 @@ int dtor_chain(int n) {
 // object -- the same surface value calls use. Nothing dynamic exists,
 // and no pointer survives to emission.
 // RUST-LABEL: fn through_base(
-// RUST: d.der_calc()
-// RUST: d.base.base_fixed()
-// RUST: d.base.base_tag()
+// RUST: d.calc()
+// RUST: d.base.fixed()
+// RUST: d.base.tag()
 // RUST-LABEL: fn same_type(
-// RUST: s.s_f()
+// RUST: s.f()
 // RUST-LABEL: fn derived_ptr(
-// RUST: d2.base.a2_geta()
+// RUST: d2.base.geta()
 // RUST-NOT: dyn
 // RUST-NOT: trait
 // RUST-NOT: Box
