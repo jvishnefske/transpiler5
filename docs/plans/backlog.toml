@@ -150,6 +150,17 @@ blocked_by = []
 anchor = "FR-124 DEFECT"
 
 [[items]]
+id = "FR-127"
+rank = 4
+kind = "defect"
+status = "in-flight"
+size = "S"
+title = "W2.24 regression: class-payload throw in a free fn aborts the TU in recovery"
+summary = "Filed 2026-08-23: the thrown-payload rejection escapes the per-decl recovery scope (likely the Result-threading pre-pass); jsoncpp json_value + 2048.cpp menu/statistics lost their crates post-W2.24. Minimal repro in the entry; claimed by the second session."
+blocked_by = []
+anchor = "FR-127 DEFECT"
+
+[[items]]
 id = "FR-125"
 kind = "defect"
 status = "landed"

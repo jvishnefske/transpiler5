@@ -8133,6 +8133,30 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-ns-case-fold-invalid.cpp,
   test/Driver/incremental-camelcase-namespace.cpp)
 
+- [ ] FR-127 DEFECT (found 2026-08-23 by the second session's
+  post-FR-125 offender re-check; REGRESSION introduced by W2.24): a
+  class-payload `throw` in a FREE function aborts the whole TU under
+  `--incremental` recovery -- `unsupported: thrown exception payload
+  must be a supported scalar type` (ImportCStatements.cpp:1673/:1930)
+  escapes the per-decl recovery scope, exit 2, NO crate. Minimal
+  repro: `struct E{int c;E(int);}; void thrower(int c){throw E(c);}
+  int keep(int);` -- recovery should DROP `thrower` located and emit
+  `keep`; instead nothing is emitted. Pre-W2.24 these bodies rode the
+  recovery/omission channel: FR-125's acceptance (base 11de90d,
+  pre-W2.24) measured jsoncpp json_value.cpp transpile+cargo CLEAN;
+  at cfeed14 (post-W2.24) the same unit and at least 2048.cpp's
+  menu/statistics emit NO crate -- a measured external-corpus
+  regression the curated suite cannot see (no lit test throws a
+  class payload in recovery mode). The recovery contract (FR-42/
+  FR-52/FR-112) is that a body-level unsupported construct drops the
+  ITEM, located, and the TU continues; W2.24's payload check likely
+  fires in the Result-threading pre-pass outside the recovering
+  scope. ACCEPTANCE: the minimal repro emits a crate with `thrower`
+  dropped (ledgered, located) and `keep` ported, strict mode still
+  rejects located; jsoncpp json_value.cpp and 2048.cpp menu.cpp/
+  statistics.cpp regain their crates (honest count recorded); a
+  Driver lit test pins the recovery-mode drop. **NOT SPIKED.**
+
 - [x] FR-126 ATTRIBUTION FOLLOW-ON (the ~28%): two channels FR-115
   deliberately left, now sized by the re-sweep. (1)
   `rejected-type-cascade` 1,434 items whose chains are ALL length 1
