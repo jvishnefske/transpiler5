@@ -162,12 +162,11 @@ anchor = "FR-125 DEFECT"
 
 [[items]]
 id = "FR-126"
-rank = 2
 kind = "defect"
-status = "open"
+status = "landed"
 size = "M"
 title = "Attribution follow-on: cascade roots one hop short + unreached instantiations (~28%)"
-summary = "1,434 cascade items with length-1 chains (the rejected type's own root never computed) + 1,234 unreached: together 28% of demand one hop from actionable. Owns the jsoncpp destructor-residue question."
+summary = "Landed 2026-08-22: one cascadeSourceSymbol mechanism for both channels. Cascade length-1 79.7% -> 5.2%, fn-only unreached 30.0% -> 1.4%, emission-wins guard pinned multi-TU, FR-115 WARN-NOT doctrine overturned for the template-walk shape. jsoncpp destructor residue genuine (54%, W2.26 demand)."
 blocked_by = []
 anchor = "FR-126 ATTRIBUTION"
 

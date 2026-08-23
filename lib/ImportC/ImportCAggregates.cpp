@@ -161,11 +161,18 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
   // `importedRecords` memo cannot answer this.
   if (rejectedRecords.contains(definition)) {
     std::string rejectedName = recordRustName(definition);
-    return emitError(loc)
-           << "unsupported: struct '"
-           << (rejectedName.empty() ? llvm::StringRef("<anonymous>")
-                                    : rejectedName)
-           << "' was rejected, so a type naming it cannot be imported";
+    std::string message =
+        (llvm::Twine("unsupported: struct '") +
+         (rejectedName.empty() ? llvm::StringRef("<anonymous>")
+                               : llvm::StringRef(rejectedName)) +
+         "' was rejected, so a type naming it cannot be imported")
+            .str();
+    // FR-126: remember which TYPE this restatement names, keyed by
+    // the verbatim message, so the ledger record sites can thread it.
+    std::string sourceSym = graphItemSymbol(definition);
+    if (!sourceSym.empty())
+      cascadeSourceByMessage[message] = sourceSym;
+    return emitError(loc) << message;
   }
   // FR-115: capture the record's OWN rejection at the moment it is
   // memoized, so the cause reaches the ledger even when this import runs
@@ -217,7 +224,8 @@ LogicalResult CImporter::importRecord(const clang::RecordDecl *record,
                                : captured.front().message;
       rejectionLedger->record(emitrust::RejectedItem{
           sym, diagLoc, reason, emitrust::classifyBlocker(reason, diagLoc),
-          /*stubbed=*/false, /*ownerSymbol=*/""});
+          /*stubbed=*/false, /*ownerSymbol=*/"",
+          cascadeSourceForReason(reason)});
       ledgerRecordedRecords.insert(definition);
     }
   }
@@ -1859,10 +1867,17 @@ LogicalResult CImporter::importEnum(const clang::EnumDecl *enumDecl,
   // no `Match` anywhere, E0425 with zero attribution). Mirrors
   // `importRecord`'s rejectedRecords wrapper; see CImporterInternal.h for
   // why the ordinary `importedEnums` memo cannot answer this.
-  if (rejectedEnums.contains(definition))
-    return emitError(loc)
-           << "unsupported: enum '" << definition->getName()
-           << "' was rejected, so a type naming it cannot be imported";
+  if (rejectedEnums.contains(definition)) {
+    std::string message =
+        (llvm::Twine("unsupported: enum '") + definition->getName() +
+         "' was rejected, so a type naming it cannot be imported")
+            .str();
+    // FR-126: same source-symbol memo as the record cascade above.
+    std::string sourceSym = graphItemSymbol(definition);
+    if (!sourceSym.empty())
+      cascadeSourceByMessage[message] = sourceSym;
+    return emitError(loc) << message;
+  }
   if (!importedEnums.insert(definition).second)
     return success();
   LogicalResult imported = importEnumUncached(definition);

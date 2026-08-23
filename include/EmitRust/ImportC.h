@@ -82,6 +82,12 @@ struct RejectedItem {
   /// because the name cannot be recovered: nothing in `area_x100` says
   /// `Rect`.
   std::string ownerSymbol;
+  /// FR-126: when this rejection is a rejected-type-cascade
+  /// restatement ("struct 'X' was rejected, so a type naming it..."), the
+  /// graph key of the rejected TYPE itself, recorded by the importer at the
+  /// cascade emit site; empty otherwise. Report-side attribution follows
+  /// this key to the type's own ledger row / coloring to find the real root.
+  std::string cascadeSourceSymbol;
 };
 
 /// Maps one verbatim importer diagnostic to a coarse blocker category.

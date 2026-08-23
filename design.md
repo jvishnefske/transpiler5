@@ -8031,7 +8031,7 @@ piece and becomes FR-45.
   graph, so lowercasing the prefix shifts every namespaced golden.
   **NOT SPIKED.**
 
-- [ ] FR-126 ATTRIBUTION FOLLOW-ON (the ~28%): two channels FR-115
+- [x] FR-126 ATTRIBUTION FOLLOW-ON (the ~28%): two channels FR-115
   deliberately left, now sized by the re-sweep. (1)
   `rejected-type-cascade` 1,434 items whose chains are ALL length 1
   with empty attributed_via -- the rejected TYPE's own root is never
@@ -8056,7 +8056,58 @@ piece and becomes FR-45.
   root (not unreached-by-import) in emitrust-progress.json, plus an
   external re-probe where the fn-only unreached share drops
   materially (record the honest number; the residue must be
-  genuinely-unreferenced decls). **NOT SPIKED.**
+  genuinely-unreferenced decls). ACCEPTANCE for (1): a cascade item's
+  root reaches the rejected type's OWN root -- chain length > 1 with
+  real attributed_via -- pinned by a driver lit test in the
+  incremental-root-blockers.cpp style (this criterion previously
+  lived only in the dispatch spec; recorded here per the spike's
+  discrepancy note). Channel-2 acceptance corrected in kind: the
+  pinned rows are fn-template-spec and class-spec RECORD rows --
+  methods are not graph nodes, so "method items" was the wrong noun.
+  LANDED 2026-08-22 (spike GO-WITH-CONSTRAINTS, worktree prototype
+  414 lines measured before implementation). ONE shared mechanism
+  covers both channels: `RejectedItem::cascadeSourceSymbol`,
+  populated at the importRecord/importEnum cascade emit sites
+  (wording byte-unchanged -- the kernel ratchet's 31932-count needle
+  and run_realworld.py's classifier survive untouched) and at the two
+  template walk-abort loops (new located wording `specialization was
+  not reached: sibling specialization '<sym>' of the same template
+  was rejected first`, tag template-sibling-not-reached), resolved
+  report-side by a cycle-guarded `resolveCascadeRoot` that fires only
+  on length<=1 chains. DOCTRINE OVERTURNED, explicitly: FR-115's
+  "an invented ledger row would be a fabricated diagnostic" sentence
+  (pinned by the old incremental-unreached-by-import.cpp WARN-NOT) is
+  withdrawn for the template-walk shape -- the sibling row is not a
+  fabricated diagnostic, it is a located statement of WHY the walk
+  never reached the sibling, and the status-changing variant is what
+  landed. The spike's adversarial probe found the naive version LYING
+  in multi-TU builds (a sibling row from TU1 misreported an item TU2
+  emitted); the report-side EMISSION-WINS guard is therefore
+  non-optional and pinned by incremental-template-sibling-multi-tu.cpp.
+  MEASURED (110-unit HEAD corpus, in-spike, machinery unchanged at
+  landing): cascade length-1-empty-via rows 2218 -> 144 of blocked
+  items (79.7% -> 5.2%; residue is on-demand-only enum rejections and
+  empty-graph-key symbols, still located, never silent); fn-only
+  unreached-by-import 448/1494 (30.0%) -> 21/1505 (1.4%), residue
+  genuinely-unreferenced (tinyxml2 XMLTest overload-set specs);
+  all-kinds unreached 1330 -> 579 (555 records: never-demanded
+  class-spec instantiations, routes outside the two walk loops).
+  jsoncpp QUESTION ANSWERED: with real roots the destructor residue
+  is genuine demand, 228 of 425 deduped blocked items (54%) -- W2.26
+  territory, not misattribution. NEXT-FR FODDER this attribution
+  exposes: fn-only #1 root is now `other` at 479 (31.9%), dominated
+  by two unclassified wordings -- `unsupported pointer expression:
+  CXXThisExpr` (931 chain-resolved all-kinds) and `unsupported:
+  pointer type outside a parameter position` (520). Emitted Rust
+  byte-identical (three --recover byte-identity diffs pinned in the
+  new tests; shard round-trip proven, old artifacts degrade to empty
+  cascade_source). Gates: full meson suite 775/775 on the merged
+  W2.23+FR-126 tree.
+  (test/Driver/incremental-cascade-source-root.cpp,
+  incremental-template-sibling-not-reached.cpp,
+  incremental-template-sibling-multi-tu.cpp, the
+  incremental-unreached-by-import.cpp pin FLIP, and the
+  link-merge-rejections.c cascade_source shard pins)
 
 - [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
   the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and

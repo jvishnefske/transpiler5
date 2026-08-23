@@ -123,6 +123,8 @@ inline void attachShardMetadata(ModuleOp module, llvm::StringRef itemGraphText,
          StringAttr::get(context, item.blockerTag)},
         {StringAttr::get(context, "owner"),
          StringAttr::get(context, item.ownerSymbol)},
+        {StringAttr::get(context, "cascade_source"),
+         StringAttr::get(context, item.cascadeSourceSymbol)},
         {StringAttr::get(context, "stubbed"),
          BoolAttr::get(context, item.stubbed)},
         {StringAttr::get(context, "loc"), locAttr},
@@ -173,7 +175,8 @@ inline llvm::SmallVector<RejectedItem> getShardRejections(ModuleOp module) {
     items.push_back(RejectedItem{stringField("symbol"), loc,
                                  stringField("diagnostic"),
                                  stringField("tag"), stubbed,
-                                 stringField("owner")});
+                                 stringField("owner"),
+                                 stringField("cascade_source")});
   }
   return items;
 }

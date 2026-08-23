@@ -273,7 +273,9 @@ struct ProgressItem {
   /// SYMPTOM. Empty unless the item was rejected, with one FR-115 exception:
   /// a `missing` item (a definition node the import never visited) carries
   /// the synthetic tag `unreached-by-import`, an honest attribution of the
-  /// non-visit rather than a diagnostic tag.
+  /// non-visit rather than a diagnostic tag. (Since FR-126 the template-walk
+  /// shape of that bucket is ledgered as `template-sibling-not-reached`
+  /// instead, a located row naming the sibling that aborted the walk.)
   std::string blockerTag;
   /// The verbatim importer diagnostic; empty unless the item was rejected
   /// (in particular, empty for `unreached-by-import` — nothing was ever
@@ -295,9 +297,11 @@ struct ProgressItem {
   /// is its own root; for an off-graph item, `symbol` followed by its
   /// enclosing class's own chain.
   std::vector<std::string> blameChain;
-  /// FR-49: the graph node whose chain was borrowed, set only for an
-  /// off-graph item attributed through its enclosing class. Empty otherwise,
-  /// including for every graph item (which uses its own chain).
+  /// FR-49: the graph node whose chain was borrowed, set for an off-graph
+  /// item attributed through its enclosing class; since FR-126 also the
+  /// rejected TYPE (or failed template sibling) a cascade's chain was
+  /// resolved through when the coloring had no chain of its own. Empty
+  /// otherwise, including for every graph item that used its own chain.
   std::string attributedVia;
   /// Where to look: the item's declaration for a ported item, the rejection's
   /// own location for a rejected one (so it points at the offending

@@ -156,6 +156,8 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
 /// the STL recognition table), so a C input can never match one and the C
 /// corpus's tabulation is unaffected by this table's existence.
 constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
+    {llvm::StringLiteral("was not reached: sibling specialization"),
+     llvm::StringLiteral("template-sibling-not-reached")},
     {llvm::StringLiteral("base classes are not supported"),
      llvm::StringLiteral("cxx-inheritance")},
     // W2.18 admitted the SINGLE public non-virtual base as an ordinary

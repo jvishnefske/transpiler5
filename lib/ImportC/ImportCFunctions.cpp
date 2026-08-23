@@ -2052,8 +2052,41 @@ LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
       // instantiation of one template shares a diagnostic location. That
       // is accepted (there is no better source position for generated
       // code) and is why the lit pins match line/column loosely.
-      if (failed(importRecord(spec, translateLoc(spec->getLocation()))))
+      if (failed(importRecord(spec, translateLoc(spec->getLocation())))) {
+        // FR-126 (channel 2, class arm): same not-reached attribution
+        // as the function-template loop below; the failing spec's own row
+        // is already ledgered by importRecord (FR-115), so only the
+        // never-visited later siblings need rows. A sibling that a body
+        // later demands on demand imports anyway and the report's
+        // emission-wins guard keeps it Ported.
+        std::string failedSym = graphItemSymbol(spec);
+        if (rejectionLedger && !recoveryStubOnly && !failedSym.empty()) {
+          bool after = false;
+          for (const clang::ClassTemplateSpecializationDecl *later :
+               classTmpl->specializations()) {
+            if (later == spec) {
+              after = true;
+              continue;
+            }
+            if (!after || !later->isThisDeclarationADefinition())
+              continue;
+            std::string laterSym = graphItemSymbol(later);
+            if (laterSym.empty())
+              continue;
+            Location laterLoc = translateLoc(later->getLocation());
+            std::string message =
+                (llvm::Twine("unsupported: specialization was not reached: "
+                             "sibling specialization '") +
+                 failedSym + "' of the same template was rejected first")
+                    .str();
+            rejectionLedger->record(emitrust::RejectedItem{
+                laterSym, laterLoc, message,
+                emitrust::classifyBlocker(message, laterLoc),
+                /*stubbed=*/false, /*ownerSymbol=*/"", failedSym});
+          }
+        }
         return failure();
+      }
     }
     return success();
   }
@@ -2097,10 +2130,91 @@ LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
           clang::TSK_ExplicitSpecialization)
         return emitError(specLoc)
                << "unsupported: explicit function template specialization";
-      if (failed(checkTemplateArguments(spec, specLoc)))
+      // FR-126: FR-115-shape per-specialization capture, so a failed
+      // sibling's own cause reaches the ledger under ITS symbol (the outer
+      // recovery only records the TEMPLATE's name, off-graph).
+      struct SpecCaptured {
+        Location loc;
+        DiagnosticSeverity severity;
+        std::string message;
+      };
+      SmallVector<SpecCaptured> specCaptured;
+      auto specCapture = [&specCaptured](Diagnostic &diag) -> LogicalResult {
+        if (diag.getSeverity() != DiagnosticSeverity::Error)
+          return failure();
+        specCaptured.push_back(
+            {diag.getLocation(), diag.getSeverity(), diag.str()});
+        for (Diagnostic &note : diag.getNotes())
+          specCaptured.push_back(
+              {note.getLocation(), DiagnosticSeverity::Note, note.str()});
+        return success();
+      };
+      LogicalResult specImported = failure();
+      {
+        ScopedDiagnosticHandler specHandler(builder.getContext(),
+                                            specCapture);
+        specImported = failed(checkTemplateArguments(spec, specLoc))
+                           ? failure()
+                           : importFunction(spec);
+      }
+      {
+        std::optional<InFlightDiagnostic> active;
+        for (const SpecCaptured &diag : specCaptured) {
+          if (diag.severity == DiagnosticSeverity::Error) {
+            if (active)
+              active->report();
+            active.emplace(emitError(diag.loc) << diag.message);
+          } else if (active) {
+            active->attachNote(diag.loc) << diag.message;
+          }
+        }
+        if (active)
+          active->report();
+      }
+      if (failed(specImported)) {
+        // FR-126 (channel 2): the walk aborts on the first failed
+        // sibling, so every LATER specialization of this template is never
+        // visited and would read `unreached-by-import` with no root. Ledger
+        // each one against the sibling that aborted the walk, so the report
+        // can attribute through it.
+        std::string failedSym = graphItemSymbol(spec);
+        if (rejectionLedger && !recoveryStubOnly && !failedSym.empty()) {
+          Location failLoc = specCaptured.empty()
+                                 ? specLoc
+                                 : specCaptured.front().loc;
+          std::string failReason =
+              specCaptured.empty() ? std::string("unsupported declaration")
+                                   : specCaptured.front().message;
+          rejectionLedger->record(emitrust::RejectedItem{
+              failedSym, failLoc, failReason,
+              emitrust::classifyBlocker(failReason, failLoc),
+              /*stubbed=*/false, /*ownerSymbol=*/"",
+              cascadeSourceForReason(failReason)});
+          bool after = false;
+          for (const clang::FunctionDecl *later : tmpl->specializations()) {
+            if (later == spec) {
+              after = true;
+              continue;
+            }
+            if (!after || !later->isThisDeclarationADefinition())
+              continue;
+            std::string laterSym = graphItemSymbol(later);
+            if (laterSym.empty())
+              continue;
+            Location laterLoc = translateLoc(later->getLocation());
+            std::string message =
+                (llvm::Twine("unsupported: specialization was not reached: "
+                             "sibling specialization '") +
+                 failedSym + "' of the same template was rejected first")
+                    .str();
+            rejectionLedger->record(emitrust::RejectedItem{
+                laterSym, laterLoc, message,
+                emitrust::classifyBlocker(message, laterLoc),
+                /*stubbed=*/false, /*ownerSymbol=*/"", failedSym});
+          }
+        }
         return failure();
-      if (failed(importFunction(spec)))
-        return failure();
+      }
     }
     return success();
   }

@@ -576,7 +576,8 @@ CImporter::importTopLevelDeclRecovering(const clang::Decl *decl) {
   if (rejectionLedger && !alreadyLedgered)
     rejectionLedger->record(RejectedItem{symbol, loc, reason,
                                          classifyBlocker(reason, loc), stubbed,
-                                         declOwnerSymbol(decl)});
+                                         declOwnerSymbol(decl),
+                                         cascadeSourceForReason(reason)});
   // The rejection is re-reported as a WARNING: the item is gone from the
   // module, but the compile as a whole succeeded, and a driver that exits 0
   // with a partial module must not have printed an error on the way.
