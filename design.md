@@ -6671,6 +6671,18 @@ piece and becomes FR-45.
   pointers-return-param-cursor-invalid.c;
   test/EndToEnd/param-cursor-return.c,
   param-cursor-return-nullable.c)
+  EXTERNAL RE-PROBE, post-landing honest numbers (same day, second
+  session, committed binary): jsmn_alloc_token PORTED (the
+  Option-of-cursor works on real jsmn, jsondump.c 4/11 fn items)
+  and ini_strncpy0 PORTED -- but the CANONICAL ini_lskip is STUBBED
+  on real inih (ini.c 1/10 fn ported): `unsupported pointer cast
+  (LValueToRValue)` at ini.c:60:18, the `return (char*)s;` return
+  site. The in-test cast-transparency shape passes; the real
+  spelling reaches a different cast-handling switch (the rejection
+  at ImportC.cpp:~3708 prints the kind name, distinct from the
+  handled LValueToRValue variable-read arm). So the predicted
+  inih +2 is measured +1, and the gap is a residual peel site, not
+  the model. Filed for the loop rather than hand-patched.
   Ranked SECOND, after FR-102.
 
 - [x] FR-105 DEFECT: a loop-assigned deferred binding is emitted
