@@ -1211,6 +1211,21 @@ public:
   /// rejection.
   std::function<bool(const clang::FunctionDecl *)> ownerIndexReturnQuery;
 
+  /// Optional query telling the walk whether a direct call to `callee` is
+  /// a free function proven to return an i64 cursor into the region of
+  /// ONE of its own slice parameters (FR-104, the free-function analog of
+  /// `ownerIndexReturnQuery`), returning {rooted parameter index,
+  /// nullable} when so. Such a call is a region source exactly like a
+  /// copy from that parameter: `recordPointerWrite` re-classifies the
+  /// call's rooted argument, and a NULLABLE callee (a reachable `return
+  /// NULL`, the Option-of-cursor lift) additionally marks the region
+  /// nullable so the CTS-P8 flag cell carries the discriminant. Left
+  /// unset (the pure-AST planning passes), every call source keeps the
+  /// historical non-address rejection, which is conservative.
+  std::function<std::optional<std::pair<unsigned, bool>>(
+      const clang::FunctionDecl *)>
+      paramCursorReturnQuery;
+
   /// Optional query telling the walk whether `field` is a (candidate or
   /// proven) array-member self-referential pointer field (Stage 2/4 of the
   /// owner-struct self-reference extension, design.md FR-30 follow-on):
@@ -2240,6 +2255,24 @@ private:
   /// pass runs independently per TU in a project import.
   void planOwners(const clang::TranslationUnitDecl *unit,
                   bool soleTranslationUnit);
+
+  /// FR-104: pure-AST recognition of free functions whose pointer return
+  /// is a cursor into a PARAMETER region — every return site's operand
+  /// resolves (through `resolveArgRoot`, the SAME interprocedural root
+  /// resolution call arguments and Stage-1 owner-index returns use, with
+  /// value-preserving pointer casts peeled first) to ONE single
+  /// slice-classified pointer parameter of the function, all-or-nothing.
+  /// Such a function returns a plain i64 cursor RELATIVE to that slice
+  /// parameter (or, with reachable `return NULL` sites, an
+  /// `Option<i64>`), and the caller re-slices the argument region it
+  /// already holds. Strictly additive: any function outside the decidable
+  /// sub-family keeps `classifyPointerReturn`'s historical rejections
+  /// verbatim. Runs after every planner whose claims it must not overlap
+  /// (owner methods, FAM allocators, malloc pools, cursor-param plans)
+  /// and consults `classifyPointerParams` — safe at that point because
+  /// all of that classification's planner inputs are final.
+  void planParamCursorReturns(const clang::TranslationUnitDecl *unit,
+                              bool soleTranslationUnit);
 
   /// Stage 2 of the owner-struct self-reference extension (design.md
   /// FR-30 follow-on): pure-AST pass, run immediately after `planOwners`
@@ -6739,6 +6772,27 @@ private:
   /// return classifications), which never apply to a method (methods never
   /// reach `classifyPointerReturn`).
   llvm::DenseSet<const clang::FunctionDecl *> ownerIndexReturns;
+  /// FR-104: a free function's parameter-cursor return plan — every
+  /// return site was proven at `planParamCursorReturns` time to root in
+  /// the single slice parameter at `paramIndex` (value-preserving pointer
+  /// casts peeled), so the function returns a plain i64 cursor RELATIVE
+  /// to that slice parameter; with `nullable` (reachable `return NULL`
+  /// sites) the result lifts to `Option<i64>` — `None` at the null sites,
+  /// `Some(cursor)` otherwise. The free-function generalization of the
+  /// Stage-1 `ownerIndexReturns` precedent: no lifetime, no new value
+  /// kind — only the cursor crosses the return, and the caller re-slices
+  /// the argument region it already holds.
+  struct ParamCursorReturnPlan {
+    unsigned paramIndex = 0;
+    bool nullable = false;
+  };
+  /// FR-104: proven parameter-cursor-returning functions, keyed by
+  /// canonical declaration; disjoint from `ownerIndexReturns` (owner
+  /// promotion wins first), `famOwnedReturnFns`, and
+  /// `pointerReturnKinds` (a planned function never reaches
+  /// `classifyPointerReturn`).
+  llvm::DenseMap<const clang::FunctionDecl *, ParamCursorReturnPlan>
+      paramCursorReturns;
   /// Per-function owner struct places (populated in the owning function
   /// only), keyed by the promoted base variable; feeds method-call
   /// receivers. The struct place is only ever borrowed, never loaded.
@@ -6868,6 +6922,31 @@ private:
   /// path, even though both classify to a plain i64 result type. Always
   /// false outside a method (`currentMethodOwner` null).
   bool currentOwnerIndexReturn = false;
+  /// FR-104: the rooted slice parameter of the parameter-cursor-return
+  /// function currently being imported (null otherwise): `emitReturnStmt`
+  /// routes its return sites through the `emitPointerRValue`/cursor path,
+  /// checking the decomposition roots at exactly this parameter.
+  const clang::ParmVarDecl *currentParamCursorReturn = nullptr;
+  /// FR-104: whether the current parameter-cursor-return function is
+  /// NULLABLE (returns `Option<i64>`): null-constant return sites emit
+  /// the `None` literal and cursor sites wrap in `Some(...)`.
+  bool currentParamCursorReturnNullable = false;
+  /// FR-104: the active caller-side capture channel. Before emitting a
+  /// call to a parameter-cursor-returning callee in pointer-rvalue
+  /// position, `emitPointerRValue`'s CallExpr arm arms this with the call
+  /// and the plan's rooted argument index; `emitCall`'s borrow loop fills
+  /// in the rooted argument's region base and reslice cursor as it
+  /// materializes that argument (the single argument-materialization
+  /// pass, so the argument is evaluated exactly once). Saved/restored
+  /// around the nested `emitCall` so inner calls cannot clobber an outer
+  /// capture.
+  struct ParamCursorCallCapture {
+    const clang::CallExpr *call = nullptr;
+    unsigned argIndex = 0;
+    const clang::VarDecl *base = nullptr;
+    Value cursor;
+  };
+  ParamCursorCallCapture paramCursorCallCapture;
   /// W2.2: the raw entry-block receiver argument (an
   /// `!emitrust.mut_ref<!emitrust.struct<...>>` or
   /// `!emitrust.ref<!emitrust.struct<...>>`) while importing a genuine C++

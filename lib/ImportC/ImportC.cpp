@@ -1255,6 +1255,25 @@ void PointerRegionAnalysis::recordPointerWrite(const clang::VarDecl *ptr,
                            "unsupported: owner-index-returning call has no "
                            "pointer argument to root the result at");
       }
+      // `p = f(...)` on a free function proven to return an i64 cursor
+      // into the region of ONE of its own slice parameters (FR-104): the
+      // call is a region source exactly like copying from that
+      // parameter, so `p` joins the ROOTED argument's region. A NULLABLE
+      // callee (reachable `return NULL`, the Option-of-cursor lift)
+      // additionally marks the region nullable — the CTS-P8 flag cell
+      // carries the discriminant the caller's null checks read.
+      if (paramCursorReturnQuery) {
+        if (std::optional<std::pair<unsigned, bool>> plan =
+                paramCursorReturnQuery(callee)) {
+          if (plan->first >= call->getNumArgs())
+            return markInvalid(ptr, loc,
+                               "unsupported: pointer assigned a "
+                               "non-address value");
+          if (plan->second)
+            recordNullable(ptr, loc);
+          return recordPointerWrite(ptr, call->getArg(plan->first));
+        }
+      }
     }
 
   if (const auto *cast = llvm::dyn_cast<clang::ImplicitCastExpr>(e)) {
@@ -3966,6 +3985,69 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
                  << "unsupported: owner-index-returning call has no pointer "
                     "argument to root the result at";
         return PtrExprValue{argBase, *result};
+      }
+      // `f(...)` on a free function proven to return an i64 cursor into
+      // the region of ONE of its own slice parameters (FR-104): the call
+      // IS the pointer's (base, cursor) decomposition. Slice-parameter
+      // coordinates are RELATIVE (emitBorrowArgument reslices the
+      // argument's region AT its cursor), so the pointer's cursor is
+      // argument-cursor-at-call + the returned relative cursor, and its
+      // base is the rooted argument's own region. The capture channel is
+      // filled by `emitCall`'s single argument-materialization pass, so
+      // the argument is evaluated exactly once.
+      if (auto planIt = paramCursorReturns.find(canonical);
+          planIt != paramCursorReturns.end()) {
+        ParamCursorReturnPlan plan = planIt->second;
+        ParamCursorCallCapture saved = paramCursorCallCapture;
+        paramCursorCallCapture = ParamCursorCallCapture();
+        paramCursorCallCapture.call = call;
+        paramCursorCallCapture.argIndex = plan.paramIndex;
+        FailureOr<Value> result = emitCall(call);
+        ParamCursorCallCapture captured = paramCursorCallCapture;
+        paramCursorCallCapture = saved;
+        if (failed(result))
+          return failure();
+        // The re-slice needs a caller-local single-object region behind
+        // the rooted argument (a string-literal backing, a staged global
+        // copy, or a member window has no whole-region place the
+        // returned cursor could re-index).
+        if (!captured.base || !captured.cursor)
+          return emitError(loc)
+                 << "unsupported: returned pointer value (the rooted "
+                    "region argument is not a caller-local region)";
+        IntegerType cursorType = builder.getIntegerType(64);
+        if (plan.nullable) {
+          // Option-of-cursor (FR-99's op set with an i64 payload): the
+          // result lands in a temp place, the discriminant is `is_some`
+          // (the CTS-P8 flag), and the payload reads `unwrap_or(0)` —
+          // dead while the flag is false, so the 0 is unobservable in a
+          // defined program (dereferencing NULL is UB).
+          Value temp = createVariablePlace(loc, Type(optionCursorType()));
+          builder.create<emitrust::AssignOp>(loc, temp, *result);
+          Value flag = builder
+                           .create<emitrust::MethodCallOp>(
+                               loc, TypeRange{builder.getI1Type()}, temp,
+                               builder.getStringAttr("is_some"),
+                               ValueRange{})
+                           .getResult(0);
+          Value zero = createIntConstant(loc, cursorType, 0);
+          Value payload = builder
+                              .create<emitrust::MethodCallOp>(
+                                  loc, TypeRange{cursorType}, temp,
+                                  builder.getStringAttr("unwrap_or"),
+                                  ValueRange{zero})
+                              .getResult(0);
+          Value cursor =
+              builder.create<arith::AddIOp>(loc, captured.cursor, payload)
+                  .getResult();
+          PtrExprValue value{captured.base, cursor};
+          value.nonNull = flag;
+          return value;
+        }
+        Value cursor =
+            builder.create<arith::AddIOp>(loc, captured.cursor, *result)
+                .getResult();
+        return PtrExprValue{captured.base, cursor};
       }
     }
   }

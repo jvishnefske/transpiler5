@@ -746,6 +746,33 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       // representation for a pointer into a parameter/callee-local region
       // (its own historical rejection for exactly this shape).
       resultTypes.push_back(builder.getIntegerType(64));
+    } else if (auto planIt =
+                   paramCursorReturns.find(func->getCanonicalDecl());
+               isDataPointer(returnType) && !methodOwner &&
+               planIt != paramCursorReturns.end()) {
+      // FR-104 parameter-cursor return: `planParamCursorReturns` proved
+      // every return site roots in the single slice parameter at
+      // `paramIndex`, so the result is a plain i64 cursor RELATIVE to
+      // that parameter's slice (or Option<i64> when NULL sites exist) —
+      // never routed through `classifyPointerReturn`, exactly like the
+      // Stage-1 owner-index branch above. The slice-input check is a
+      // defensive net against plan/signature divergence.
+      unsigned rooted = planIt->second.paramIndex;
+      Type rootedInput =
+          rooted < inputTypes.size() ? inputTypes[rooted] : Type();
+      Type rootedPointee;
+      if (auto mutRef =
+              llvm::dyn_cast_or_null<emitrust::MutRefType>(rootedInput))
+        rootedPointee = mutRef.getPointee();
+      else if (auto sharedRef =
+                   llvm::dyn_cast_or_null<emitrust::RefType>(rootedInput))
+        rootedPointee = sharedRef.getPointee();
+      if (!rootedPointee || !llvm::isa<emitrust::SliceType>(rootedPointee))
+        return emitError(loc) << "unsupported: pointer return type";
+      if (planIt->second.nullable)
+        resultTypes.push_back(optionCursorType());
+      else
+        resultTypes.push_back(builder.getIntegerType(64));
     } else if (isDataPointer(returnType)) {
       // A data-pointer return classifies by its return sites (CTS-P2):
       // the fn-address kind returns the plain fn_ptr value, and the
@@ -972,6 +999,20 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   currentMethodOwner = nullptr;
   currentOwnerIndexReturn =
       methodOwner && ownerIndexReturns.contains(func->getCanonicalDecl());
+  // FR-104: a parameter-cursor-return function routes its return sites
+  // through the `emitPointerRValue`/cursor path against exactly this
+  // parameter (the free-function analog of `currentOwnerIndexReturn`).
+  currentParamCursorReturn = nullptr;
+  currentParamCursorReturnNullable = false;
+  if (!methodOwner) {
+    auto planIt = paramCursorReturns.find(func->getCanonicalDecl());
+    if (planIt != paramCursorReturns.end() &&
+        planIt->second.paramIndex < func->getNumParams()) {
+      currentParamCursorReturn =
+          func->getParamDecl(planIt->second.paramIndex);
+      currentParamCursorReturnNullable = planIt->second.nullable;
+    }
+  }
   currentCxxThisRef = Value();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
   // W2.24: `emitReturnStmt` wraps a closure member's declared return value
@@ -1010,6 +1051,18 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       [this](const clang::FunctionDecl *callee) {
         return ownerIndexReturns.contains(callee->getCanonicalDecl());
       };
+  // FR-104: calls to parameter-cursor-returning free functions are region
+  // sources of the rooted argument's region (and mark it nullable for the
+  // Option-of-cursor lift), the free-function analog of the owner-index
+  // wiring above.
+  pointerRegions.paramCursorReturnQuery =
+      [this](const clang::FunctionDecl *callee)
+      -> std::optional<std::pair<unsigned, bool>> {
+    auto it = paramCursorReturns.find(callee->getCanonicalDecl());
+    if (it == paramCursorReturns.end())
+      return std::nullopt;
+    return std::make_pair(it->second.paramIndex, it->second.nullable);
+  };
   // A local assigned from an array-member field read (Stage 4, B3, e.g.
   // `parent = node->parent;`) joins the arrow base's owner class; by
   // emission time every field's `arrayMemberPtrBindings` entry (if any)
@@ -1530,6 +1583,8 @@ CImporter::importLiftedLambdaBody(const PendingLiftedLambda &pending) {
   currentPoolPlace = Value();
   currentMethodOwner = nullptr;
   currentOwnerIndexReturn = false;
+  currentParamCursorReturn = nullptr;
+  currentParamCursorReturnNullable = false;
   currentCxxThisRef = Value();
   FunctionType functionType = funcOp.getFunctionType();
   currentReturnType =
@@ -1885,6 +1940,8 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentPoolPlace = Value();
   currentMethodOwner = nullptr;
   currentOwnerIndexReturn = false;
+  currentParamCursorReturn = nullptr;
+  currentParamCursorReturnNullable = false;
   currentCxxThisRef = Value();
   currentReturnType = resultTypes.empty() ? Type() : resultTypes.front();
   // W2.24: a lifted lambda / va clone is never in the can-throw closure
@@ -1913,6 +1970,18 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
       [this](const clang::FunctionDecl *callee) {
         return ownerIndexReturns.contains(callee->getCanonicalDecl());
       };
+  // FR-104: calls to parameter-cursor-returning free functions are region
+  // sources of the rooted argument's region (and mark it nullable for the
+  // Option-of-cursor lift), the free-function analog of the owner-index
+  // wiring above.
+  pointerRegions.paramCursorReturnQuery =
+      [this](const clang::FunctionDecl *callee)
+      -> std::optional<std::pair<unsigned, bool>> {
+    auto it = paramCursorReturns.find(callee->getCanonicalDecl());
+    if (it == paramCursorReturns.end())
+      return std::nullopt;
+    return std::make_pair(it->second.paramIndex, it->second.nullable);
+  };
   // See the non-clone prologue above for why this mirrors
   // `ownerIndexReturnQuery`'s clone-path duplication (Stage 4, B3).
   pointerRegions.arrayMemberFieldQuery =
@@ -2556,6 +2625,14 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // fn_ptr members; declaration-type record uses gate the eager import
   // of empty structs.
   planFnPtrMembers(unit);
+  // FR-104 Pass A: pure-AST recognition of free functions returning a
+  // cursor into ONE of their own slice parameters. Runs after every
+  // planner whose claims it must stay disjoint from (owners, FAM lift,
+  // malloc pools, cursor params) so its `classifyPointerParams`
+  // consultation sees the same final classification the signature
+  // builder will; strictly additive (a declined function keeps
+  // `classifyPointerReturn`'s historical rejections verbatim).
+  planParamCursorReturns(unit, soleTranslationUnit);
   collectDeclTypeRecords(unit);
   if (failed(importDeclsIn(unit)))
     return failure();

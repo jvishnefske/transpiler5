@@ -450,6 +450,157 @@ void CImporter::planOwners(const clang::TranslationUnitDecl *unit,
 }
 
 //===----------------------------------------------------------------------===//
+// Parameter-cursor return planning (design.md FR-104)
+//===----------------------------------------------------------------------===//
+
+void CImporter::planParamCursorReturns(const clang::TranslationUnitDecl *unit,
+                                       bool soleTranslationUnit) {
+  // C-only: the plan generalizes the C pointer-region decomposition, and
+  // the canonical instances (inih's ini_lskip, jsmn's jsmn_alloc_token)
+  // are C. C++ keeps every emission byte-for-byte.
+  if (astContext().getLangOpts().CPlusPlus)
+    return;
+  // Same whole-program visibility helper as `planOwners` (W3.3 G3): an
+  // externally visible function is admissible only when every reference
+  // to it provably lives in one TU.
+  auto externalFnFullyVisible = [&](const clang::FunctionDecl *fn) -> bool {
+    std::string sym = mlirFuncName(fn);
+    int seenTu = -1;
+    auto onlyOneTu = [&](const llvm::SmallVectorImpl<unsigned> &tus) -> bool {
+      for (unsigned tu : tus) {
+        if (seenTu < 0)
+          seenTu = static_cast<int>(tu);
+        else if (static_cast<int>(tu) != seenTu)
+          return false;
+      }
+      return true;
+    };
+    auto callIt = wholeProgram.calleeToCallerTus.find(sym);
+    if (callIt != wholeProgram.calleeToCallerTus.end() &&
+        !onlyOneTu(callIt->second))
+      return false;
+    auto addrIt = wholeProgram.fnAddressTakenTus.find(sym);
+    if (addrIt != wholeProgram.fnAddressTakenTus.end() &&
+        !onlyOneTu(addrIt->second))
+      return false;
+    return true;
+  };
+  for (const clang::Decl *decl : unit->decls()) {
+    const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl);
+    // The proof is a property of the definition's body (the cross-TU
+    // bodyless-declaration cliff keeps `classifyPointerReturn`'s
+    // "unsupported: pointer return type").
+    if (!func || !func->doesThisDeclarationHaveABody())
+      continue;
+    clang::QualType returnType = func->getReturnType();
+    if (!isPointerType(returnType) || isFunctionPointer(returnType))
+      continue;
+    const clang::FunctionDecl *canonical = func->getCanonicalDecl();
+    // Disjointness: earlier planners' claims win. An owner method already
+    // returns an ABSOLUTE i64 owner index (Stage 1); a FAM allocator
+    // returns the record by value (FR-94/99); a malloc-pool promoter has
+    // its own handle model (W4.2e). `main` never transforms, and an
+    // address-taken function's signature is pinned by the fn-ptr
+    // component types it is bound into (the FR-76 forcing).
+    if (methodPlans.contains(canonical) ||
+        ownerIndexReturns.contains(canonical) ||
+        famOwnedReturnFns.contains(canonical) ||
+        mallocPools.contains(canonical) ||
+        llvm::isa<clang::CXXMethodDecl>(func) || func->isVariadic() ||
+        func->getName() == "main" ||
+        llvm::is_contained(addressTakenFunctions, canonical))
+      continue;
+    // The caller-side re-slice needs every call site visible: an
+    // externally visible function qualifies when this TU is the whole
+    // program OR the whole-program facts prove no other TU references it
+    // (the same W3.3 G3 gate `planOwners` uses; shard/defer mode keeps
+    // the historical rejection, the FR-58 precedent).
+    if (func->isExternallyVisible() && !soleTranslationUnit &&
+        !externalFnFullyVisible(func))
+      continue;
+    // A planned cursor parameter changes the whole call protocol
+    // (emitCursorParamCall); such functions stay out.
+    if (llvm::any_of(func->parameters(), [&](const clang::ParmVarDecl *p) {
+          return cursorParams.contains(p) || pairedCursorParams.contains(p) ||
+                 globalCursorParams.contains(p);
+        }))
+      continue;
+    SmallVector<const clang::ReturnStmt *> returns;
+    collectReturnStmts(func->getBody(), returns);
+    if (returns.empty())
+      continue;
+    // Per-return root proof, all-or-nothing: the SAME interprocedural
+    // resolution call arguments and Stage-1 owner-index returns use.
+    // Value-preserving pointer casts (`return (char *)s;` — verbatim
+    // inih ini_lskip crossing constness) are peeled first: the returned
+    // i64 carries no borrow, so the re-slice inherits the CALLER's own
+    // mutability and the cast never crosses the emitted boundary.
+    PointerRegionAnalysis regions;
+    regions.literalTemps = &literalTemps;
+    regions.analyze(astContext(), func->getBody());
+    const clang::ParmVarDecl *rootParam = nullptr;
+    bool nullable = false;
+    bool qualifies = true;
+    for (const clang::ReturnStmt *ret : returns) {
+      const clang::Expr *value = ret->getRetValue();
+      if (!value) {
+        qualifies = false;
+        break;
+      }
+      if (isNullPointerConstantExpr(value)) {
+        nullable = true;
+        continue;
+      }
+      const clang::Expr *peeled = stripTrivia(value);
+      while (const clang::Expr *sub = peelPointerCast(astContext(), peeled))
+        peeled = stripTrivia(sub);
+      const auto *param = llvm::dyn_cast_or_null<clang::ParmVarDecl>(
+          resolveArgRoot(regions, peeled));
+      if (!param || (rootParam && rootParam != param)) {
+        // Multi-parameter return sites, parameter/local mixes, global
+        // tables, and unresolvable operands all keep
+        // `classifyPointerReturn`'s verbatim rejections.
+        qualifies = false;
+        break;
+      }
+      rootParam = param;
+    }
+    if (!qualifies || !rootParam)
+      continue;
+    auto params = func->parameters();
+    const auto *found = llvm::find(params, rootParam);
+    if (found == params.end())
+      continue;
+    unsigned index = found - params.begin();
+    // The rooted parameter must lower to a slice — the caller-reslice
+    // protocol's coordinate system. Scalar references, carriers,
+    // nullable byte params, owned records, and cell slices stay out, as
+    // do the byte-offset coordinate systems (void pointees, byte-region
+    // aggregates) and any pointee mismatch between the return and the
+    // parameter (the cursor unit must be the same element on both
+    // sides).
+    ArrayRef<ParamKind> kinds = classifyPointerParams(func);
+    if (index >= kinds.size() || kinds[index] != ParamKind::Slice)
+      continue;
+    clang::QualType pointee =
+        rootParam->getType().getCanonicalType()->getPointeeType();
+    clang::QualType retPointee =
+        returnType.getCanonicalType()->getPointeeType();
+    if (pointee->isVoidType() || isByteRegionAggregate(pointee) ||
+        !astContext().hasSameUnqualifiedType(retPointee, pointee))
+      continue;
+    // A flexible-array-record pointee rides the FAM ownership model
+    // (FR-94/96/99), not the region decomposition: a "returned parameter"
+    // there is a borrow of an OWNED record, and its frontier wordings are
+    // pinned (flexible-array-nullable-return-invalid.c's ret-param arm).
+    if (const clang::RecordDecl *record = pointee->getAsRecordDecl();
+        record && famTailField(record))
+      continue;
+    paramCursorReturns[canonical] = ParamCursorReturnPlan{index, nullable};
+  }
+}
+
+//===----------------------------------------------------------------------===//
 // Array-member-pointer planning (Stage 2 of the owner-struct
 // self-reference extension, design.md FR-30 follow-on)
 //===----------------------------------------------------------------------===//
@@ -3398,7 +3549,7 @@ LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
       continue;
     for (const PointerBaseBinding &binding : region->bases)
       if (const auto *param =
-              llvm::dyn_cast_if_present<clang::ParmVarDecl>(binding.base);
+              llvm::dyn_cast_or_null<clang::ParmVarDecl>(binding.base);
           param && candidates.contains(param))
         return emitError(translateLoc(region->writeThroughLoc))
                << "unsupported: write through a cursor parameter";
@@ -3493,7 +3644,7 @@ LogicalResult CImporter::planCursorParamsFor(const clang::FunctionDecl *func) {
       continue;
     }
     const clang::VarDecl *root = resolveArgRoot(analysis, rhs);
-    const auto *coParam = llvm::dyn_cast_if_present<clang::ParmVarDecl>(root);
+    const auto *coParam = llvm::dyn_cast_or_null<clang::ParmVarDecl>(root);
     bool admissible = coParam && coParam != param &&
                       !isDataPointerPointerType(coParam->getType()) &&
                       sliceParams.contains(coParam) &&

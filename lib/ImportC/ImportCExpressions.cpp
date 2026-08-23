@@ -2817,6 +2817,22 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
         emitBorrowArgument(loc, borrow.expr, borrowType, root, &rootPath);
     if (failed(reference))
       return failure();
+    // FR-104: an armed parameter-cursor-return capture records the rooted
+    // argument's region base and reslice cursor for `emitPointerRValue`'s
+    // CallExpr arm — but only for a whole-object caller-LOCAL region (an
+    // empty member path) whose borrow is the ordinary `slice_of`: a
+    // string-literal backing, a staged global copy, or a member window
+    // has no whole-region place the returned cursor could re-index, so
+    // the capture stays unfilled and the arm rejects located.
+    if (paramCursorCallCapture.call == call &&
+        paramCursorCallCapture.argIndex == borrow.index && root &&
+        rootPath.empty() && root->hasLocalStorage() && !nullableSlot) {
+      if (auto sliceOf =
+              (*reference).getDefiningOp<emitrust::SliceOfOp>()) {
+        paramCursorCallCapture.base = root;
+        paramCursorCallCapture.cursor = sliceOf.getIndex();
+      }
+    }
     if (root) {
       for (const auto &held : borrowRoots) {
         if (held.first != root)
