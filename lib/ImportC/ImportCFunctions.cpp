@@ -418,7 +418,20 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
       return emitError(translateLoc(param->getLocation()))
              << "unsupported: class with a destructor passed or returned by "
                 "value";
-  if (userOrInheritedDestructor(astContext(), func->getReturnType()))
+  // W2.23 narrowed the RETURN half only: a droppy class WITH an admitted
+  // copy constructor may be returned by value -- the return copy lowers
+  // into a temp place that is MOVED out (never dropped in the callee), so
+  // there is no second destructor run to lose, while the named locals drop
+  // in reverse declaration order exactly as C++ destroys them after the
+  // return copy (byte-diffed in test/EndToEnd/cpp-copy-dtor.cpp). The
+  // PARAMETER half stays wholesale: native destroys the parameter temp at
+  // the end of the CALLER's full-expression, the move-into-callee image
+  // inside the callee -- measured divergent with two calls in one
+  // expression (the spike's twocall probe), so no copy ctor can make the
+  // drop POINTS agree.
+  if (userOrInheritedDestructor(astContext(), func->getReturnType()) &&
+      !admittedCopyConstructor(
+          func->getReturnType().getCanonicalType()->getAsCXXRecordDecl()))
     return emitError(loc)
            << "unsupported: class with a destructor passed or returned by "
               "value";

@@ -312,6 +312,18 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   // construction with no single source to copy (a default or multi-argument
   // construct); those materialize a temporary only the declaration position
   // (`emitCXXConstructInit`) has a place for.
+  // W2.23: a call returning a copy-ctor droppy class wraps its prvalue in
+  // `CXXBindTemporaryExpr` (the temporary's destructor runs at
+  // full-expression end). Consumed as a value, the prvalue MOVES into its
+  // consumer -- the temporary never exists apart from it, exactly C++17's
+  // guaranteed elision, and a discarded one drops at the Rust statement
+  // end, which IS the native full-expression end -- so the binding node
+  // itself needs no code. Scoped to the admitted copy-ctor class: before
+  // W2.23 no droppy value could cross a signature at all, and every other
+  // dtor-carrying temporary keeps its located rejection.
+  if (const auto *bindTemp = llvm::dyn_cast<clang::CXXBindTemporaryExpr>(e))
+    if (admittedCopyConstructor(bindTemp->getType()->getAsCXXRecordDecl()))
+      return emitRValue(bindTemp->getSubExpr());
   if (const auto *construct = llvm::dyn_cast<clang::CXXConstructExpr>(e)) {
     const clang::CXXConstructorDecl *ctor = construct->getConstructor();
     // W2.11: a std::optional VALUE construction — `return v;` /
@@ -373,6 +385,31 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
         return failure();
       return loadPlace(loc, place);
     }
+    // W2.23: a value-position construction through an IMPORTED
+    // user-provided constructor generalizes the W2.8 pair shape above --
+    // an anonymous temp place, the ordinary constructor call on it, and a
+    // whole load that MOVES the temp into its consumer. This is the
+    // by-value argument (`take(a)`: 1 copy through the copy ctor) and the
+    // prvalue argument / prvalue factory return (`take(T(x))`,
+    // `return T(x);`: the VALUE ctor with NO copy node at all -- C++17
+    // guaranteed elision as absent AST nodes, so the temp-and-move models
+    // the same single construction). The W2.17 droppy refusal ABOVE stays
+    // ahead of this admission: a copy+dtor class never crosses by value
+    // (the measured caller-vs-callee parameter-temp drop divergence);
+    // its RETURN copies are intercepted in emitReturnStmt instead. The
+    // user-provided + imported gate keeps `sum(Point())` (an implicit,
+    // never-imported default ctor) on the located rejection below --
+    // cpp-byvalue-struct-invalid.cpp pins it.
+    if (ctor && ctor->isUserProvided() &&
+        functions.lookup(cxxMethodMangledName(ctor))) {
+      FailureOr<Type> structType = mapType(construct->getType(), loc);
+      if (failed(structType))
+        return failure();
+      Value place = createVariablePlace(loc, *structType, std::string());
+      if (failed(emitCXXConstructInit(place, construct, loc)))
+        return failure();
+      return loadPlace(loc, place);
+    }
     return emitError(loc) << "unsupported: constructor in value position "
                              "(only a trivial copy or move is modeled)";
   }
@@ -407,6 +444,21 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     // conversion keeps the located rejection below.
     if (isStdOptionalRecordType(cast->getType()))
       return emitRValue(sub);
+    // W2.23: `return Tracer(v);` -- the prvalue factory, 00801's exact
+    // shape -- wraps its CXXConstructExpr in this cast kind too; recurse
+    // (mirroring the optional line above) so emitRValue's temp-place
+    // branch sees the construct. Gated on an imported user-provided
+    // constructor of a NON-droppy class, so the droppy prvalue factory
+    // keeps this located rejection (a droppy class crosses a value
+    // boundary only through the emitReturnStmt copy interception).
+    if (const auto *construct =
+            llvm::dyn_cast<clang::CXXConstructExpr>(sub->IgnoreParens())) {
+      const clang::CXXConstructorDecl *ctor = construct->getConstructor();
+      if (ctor && ctor->isUserProvided() &&
+          !userOrInheritedDestructor(astContext(), construct->getType()) &&
+          functions.lookup(cxxMethodMangledName(ctor)))
+        return emitRValue(sub);
+    }
     return emitError(loc) << "unsupported cast ("
                           << cast->getCastKindName() << ")";
   case clang::CK_FunctionToPointerDecay:
@@ -2204,7 +2256,11 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     // ENCLOSING-`operator=` channel (a member with a user `operator=` makes
     // the enclosing class's implicit copy-assignment non-trivial, so
     // `outer1 = outer2` arrives here as a CXXOperatorCallExpr naming it)
-    // lands on this guard. Lambdas keep the generic wording (their
+    // lands on this guard -- though since W2.23 the statement-position
+    // implicit copy-assignment is intercepted in emitCallStmt first
+    // (memberwise for scalar fields, an honest located rejection
+    // otherwise), so only value uses of it still reach here, and they
+    // take the implicit-specific wording below. Lambdas keep the generic wording (their
     // `operator()` is the closure-call frontier, not an omitted member),
     // and so do std-namespace records (their methods are intercepted, never
     // imported, so "omitted" would misreport the boundary).
@@ -2213,6 +2269,15 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
         methodCallee && methodCallee->isOverloadedOperator() &&
         !methodCallee->getParent()->isLambda() &&
         !methodCallee->getParent()->isInStdNamespace()) {
+      // W2.23: the IMPLICIT copy-assignment operator was never "omitted"
+      // -- statement position now lowers it memberwise
+      // (emitImplicitCopyAssign) -- so the residual VALUE use (`(a = b)`
+      // consumed for its T& result) says what it is instead of borrowing
+      // the omitted-member wording below.
+      if (methodCallee->isImplicit() &&
+          methodCallee->isCopyAssignmentOperator())
+        return emitError(loc)
+               << "unsupported: implicit copy assignment in value position";
       const clang::RecordDecl *ownerDefinition =
           methodCallee->getParent()->getDefinition();
       std::string ownerName =

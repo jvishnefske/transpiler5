@@ -37,13 +37,15 @@
 // RUN: emitrust-cc --emit=crate --recover %s -o %t.recover.crate 2>/dev/null
 // RUN: diff -r %t.crate/src %t.recover.crate/src
 
-// --- The cause: rejected on its copy constructor. Graph key `NsGeoGadget`,
-// --- raw spelling `Gadget` -- the divergence that used to lose the join.
+// --- The cause: rejected on its MOVE constructor (the pre-W2.23 copy-ctor
+// --- specimen is admitted now; the class-level gate and its wording are
+// --- identical). Graph key `NsGeoGadget`, raw spelling `Gadget` -- the
+// --- divergence that used to lose the join.
 namespace geo {
 struct Gadget {
   int v;
   Gadget() : v(0) {}
-  Gadget(const Gadget &other) : v(other.v) {}
+  Gadget(Gadget &&other) : v(other.v) {}
 };
 }
 

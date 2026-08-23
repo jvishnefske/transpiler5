@@ -69,12 +69,15 @@
 //--- class-gate.cpp
 extern "C" int printf(const char *, ...);
 
-// Rejected at the class level (the copy constructor), i.e. from inside
-// `importCXXMethods`, AFTER the struct_def already exists.
+// Rejected at the class level (the MOVE constructor -- the copy ctor
+// specimen this section used before W2.23 is admitted now, and a move
+// ctor is the same in-`importCXXMethods`, after-the-struct_def gate),
+// i.e. from inside `importCXXMethods`, AFTER the struct_def already
+// exists.
 struct C {
   int v;
   C() : v(1) {}
-  C(const C &o) : v(2) {}
+  C(C &&o) : v(2) {}
   int get() const;
   ~C();
 };
@@ -154,13 +157,14 @@ int survivor(int n) { return n + 4; }
 // DTORFAILDIAG: dtor-body-fail.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: struct 'C' was rejected, so a type naming it cannot be imported (recovered: emitted an unimplemented!() stub with the mapped signature)
 
 //--- name-claim.cpp
-// `C` is rejected; `struct c` idiomatically renames to the SAME emitted
-// name. On HEAD the rejected class kept the claim and this importable POD
-// was dropped as a name clash.
+// `C` is rejected (move ctor -- the W2.23-admitted copy ctor no longer
+// serves as the specimen); `struct c` idiomatically renames to the SAME
+// emitted name. On HEAD the rejected class kept the claim and this
+// importable POD was dropped as a name clash.
 struct C {
   int v;
   C() : v(1) {}
-  C(const C &o) : v(2) {}
+  C(C &&o) : v(2) {}
 };
 
 struct c {

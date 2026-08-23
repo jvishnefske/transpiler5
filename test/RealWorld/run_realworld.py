@@ -420,6 +420,14 @@ _CXX_BLOCKER_SUBSTRINGS = [
     # miscompile; also previously untagged.
     # Mirrors lib/ImportC/RejectionLedger.cpp.
     ("copy/move/delegating constructor", "cxx-copy-ctor"),
+    # W2.23 admitted the user-provided `T(const T&)` copy constructor; the
+    # broad needle catches the wave's residual wordings in one row (the
+    # non-const-`T&` shape, the NRVO-candidate return, the E0277 array
+    # boundary), and the honest implicit-copy-assignment wordings get their
+    # own tag (copy-ASSIGNMENT is a different AST node and a different
+    # backlog item). Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("copy constructor", "cxx-copy-ctor"),
+    ("implicit copy assignment", "cxx-copy-assign"),
     # FR-48 landed reference PARAMETERS; the four wordings below are the
     # residual reference positions, all still tagged `cxx-references` so the
     # backlog keeps ranking them as one blocker. "rvalue reference types are

@@ -28,8 +28,13 @@
 // before this wave: a user `operator=` reached through an ENCLOSING class's
 // IMPLICIT copy-assignment (`b = a` on a class whose MEMBER declares the
 // operator) still surfaces as a `CXXOperatorCallExpr` naming the enclosing
-// class's implicit `operator=` -- an explicit AST node at the assignment,
-// caught by the same guard.
+// class's implicit `operator=` -- an explicit AST node at the assignment.
+// W2.23 gave the implicit copy-assignment its own honest lowering path
+// (memberwise, scalar fields only): this channel now rejects there, with a
+// wording that says what it IS -- the implicit operator= was never
+// "omitted", the pre-W2.23 wording the spike flagged as misleading -- and
+// the member's own user `operator=` is exactly the non-scalar recursion
+// the memberwise image refuses.
 //
 // `body-fail-use` / `static-fail-use` are the containment channels proper: a
 // method whose body fails to import is omitted with its own per-construct
@@ -45,8 +50,11 @@
 // init -- there is NO CALL NODE to reject -- so omitting one would
 // substitute Rust's bitwise Copy for the user's constructor. On exactly this
 // input the native binary prints `1 99`; a contained import would print
-// `1 1`. It must NEVER import, neither wholesale nor contained, which is why
-// the class-level gate stays.
+// `1 1`. It must NEVER be an omission -- which since W2.23 means either a
+// REAL import (the admitted user-provided `T(const T&)` shape now emits a
+// genuine method call at every copy point; test/Import/Cpp/copy-ctor.cpp
+// pins it) or the class-level gate (every other constructor shape,
+// exercised here through the non-const `P(P&)` copy ctor).
 
 //--- op-call.cpp
 // OPCALL: op-call.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to overloaded operator 'operator+' omitted from class 'Vec2'
@@ -79,7 +87,7 @@ int use(int n) {
 }
 
 //--- implicit-assign.cpp
-// IMPLASSIGN: implicit-assign.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to overloaded operator 'operator=' omitted from class 'Outer'
+// IMPLASSIGN: implicit-assign.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: implicit copy assignment of a class with non-scalar members
 struct Inner {
   int v;
   Inner &operator=(const Inner &o) {
@@ -142,12 +150,12 @@ struct Calc {
 int use(int n) { return Calc::helper(n); }
 
 //--- copy-ctor.cpp
-// COPYCTOR: copy-ctor.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: copy/move/delegating constructor
+// COPYCTOR: copy-ctor.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: copy constructor taking a non-const reference
 extern "C" int printf(const char *, ...);
 struct P {
   int v;
   P() : v(1) {}
-  P(const P &o) : v(99) {}
+  P(P &o) : v(99) {}
 };
 int main() {
   P a;

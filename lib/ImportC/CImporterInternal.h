@@ -1139,6 +1139,22 @@ const clang::CXXDestructorDecl *userDeclaredDestructor(clang::ASTContext &contex
 const clang::CXXDestructorDecl *
 userOrInheritedDestructor(clang::ASTContext &context, clang::QualType type);
 
+/// W2.23: the class's ADMITTED user copy constructor, or null. Admitted
+/// means: user-provided (a real body -- `= default` never imports and stays
+/// rejected), exactly one parameter of const, non-volatile lvalue-reference
+/// type, on a non-std-namespace class that declares NO move or non-admitted
+/// copy constructor (any of those makes the whole class a located rejection
+/// at `importCXXMethods`, so this predicate answers null and the signature/
+/// attr/coloring consumers agree with the gate). The std-namespace
+/// exemption is load-bearing: gcc-15's std::pair DECLARES its copy ctor
+/// (`= default`), and marking it would strip `Copy` from every emitted
+/// pair -- a byte shift in pre-W2.23 goldens. Defined in
+/// ImportCAggregates.cpp; the FR-41 coloring probe keeps its own
+/// deliberate clone (lib/Project/ItemColoring.cpp) that must move in
+/// lockstep.
+const clang::CXXConstructorDecl *
+admittedCopyConstructor(const clang::CXXRecordDecl *record);
+
 /// W2.18: peels the implicit derived-to-base conversion clang wraps around
 /// the receiver of an INHERITED access, appending one entry to `hops` per
 /// base traversed and returning the innermost expression (the derived-class
@@ -3472,6 +3488,27 @@ private:
   LogicalResult emitDefaultConstructInit(Value place,
                                          const clang::CXXConstructorDecl *ctor,
                                          Location loc);
+
+  /// W2.23: lowers a statement-position whole-object assignment through the
+  /// IMPLICIT copy-assignment operator (`m = a;` arriving as a
+  /// `CXXOperatorCallExpr` naming the implicit `operator=`) as a memberwise
+  /// field assign -- C++ runs operator=, NOT the copy constructor, so this
+  /// emits ZERO constructor calls (a `.clone()` here measured 1 copy
+  /// against native 0, the spike's miscompile probe). Scalar fields only: a
+  /// record member would need the member's own assignment semantics
+  /// recursively (the FR-112 enclosing-operator= channel), and keeps a
+  /// located rejection that says what the construct IS -- the implicit
+  /// operator= was never "omitted".
+  LogicalResult emitImplicitCopyAssign(const clang::CXXOperatorCallExpr *call);
+
+  /// W2.23: the `CXXConstructExpr` under `retValue` when -- and only when
+  /// -- it invokes an ADMITTED, already-imported user copy constructor
+  /// (`return x;` on a copy-ctor class), else null. `emitReturnStmt` uses
+  /// it to intercept the return copy AHEAD of the generic rvalue walk,
+  /// which is what admits the copy+dtor class at RETURN position while its
+  /// by-value ARGUMENT keeps the droppy value-copy refusal.
+  const clang::CXXConstructExpr *
+  admittedCopyConstructReturn(const clang::Expr *retValue);
 
   /// CTS 00204 Pass A: plans the per-call-site monomorphization of every
   /// variadic definition whose body uses va_list. Scope checks reject

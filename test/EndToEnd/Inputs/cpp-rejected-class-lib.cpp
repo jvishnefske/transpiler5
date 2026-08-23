@@ -17,12 +17,13 @@
 // live body-failure channel to pin.
 extern "C" int printf(const char *, ...);
 
-// Class-level gate: a copy constructor. Rejected inside `importCXXMethods`,
-// after the struct_def is already in the module.
+// Class-level gate: a MOVE constructor (the pre-W2.23 copy-ctor specimen
+// is admitted now; the gate and its wording are unchanged). Rejected inside
+// `importCXXMethods`, after the struct_def is already in the module.
 struct C {
   int v;
   C() : v(1) {}
-  C(const C &o) : v(2) {}
+  C(C &&o) : v(2) {}
   ~C();
 };
 
