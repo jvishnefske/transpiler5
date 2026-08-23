@@ -2008,6 +2008,28 @@ private:
   /// module would not verify — exactly the callers the stub is for.)
   LogicalResult emitRecoveryStub(func::FuncOp funcOp, Location loc);
 
+  /// FR-103: finalize-time containment for one pending `extern` global that
+  /// no translation unit defined and that neither the FR-57a defer arm nor
+  /// the FR-52/70/79/81 requirement arm admitted. Called ONLY under
+  /// `recoverFromRejections` — the strict finalize rejection is unchanged.
+  ///
+  /// The missing definition costs the ITEMS that still reference the
+  /// symbol, never the crate: every surviving symbol use is attributed to
+  /// its top-level `func.func`, whose body is replaced with the standard
+  /// `emitRecoveryStub` shape (STUBBED, never erased — erasing a referenced
+  /// function orphans its clean callers into the crate-fatal
+  /// "function ... referenced but not defined" channel below, the measured
+  /// FR-103 cascade hazard), ledgered and re-reported as a warning located
+  /// at the use. A pending entry with NO surviving uses (its users were
+  /// already dropped by per-item recovery, each under its own ledger entry
+  /// — the dominant lwIP `ip_data` case) is forgiven outright.
+  ///
+  /// Returns failure without touching the module when any surviving use
+  /// lives outside a defined function (e.g. a global initializer region):
+  /// dropping a non-function item here could dangle ITS readers, so the
+  /// safe failure direction is the caller's hard rejection.
+  LogicalResult containUndefinedExternGlobal(llvm::StringRef symbol);
+
   /// Located rejection for a main-file use of a declaration that
   /// `importTranslationUnit` skipped because it lives in a system header.
   /// `what` describes the use ("call to", "reference to", ...); `name` is

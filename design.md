@@ -6522,7 +6522,7 @@ piece and becomes FR-45.
   preserving probe, and getting one is the spike's first job.
   **NOT SPIKED.**
 
-- [ ] FR-103 Undefined extern globals: recover instead of failing
+- [x] FR-103 Undefined extern globals: recover instead of failing
   the TU (measured 2026-08-20, ranked BELOW FR-102).
   Both lwIP units that fail to import AT ALL — `tcp_in.c` and
   `udp.c`, the only 2 of 20 — die on the same single cause:
@@ -6554,7 +6554,41 @@ piece and becomes FR-45.
   payoff is therefore mostly gated behind FR-102 and it should be
   sequenced after it — recorded here so the measurement is not
   redone.
-  **NOT SPIKED.**
+  LANDED 2026-08-23 (spike GO-with-constraints), framing (a) only;
+  framing (b) untouched. TWO entry claims corrected by measurement:
+  (1) the failing shape is the ADDRESS-TAKEN mutable extern struct
+  -- plain reads/writes already pass through FR-81's Externals
+  trait; and even with every address-taker already contained
+  mid-import, the TU still died at the finalize pending-globals
+  loop. (2) The "gated behind FR-102" caveat is FALSIFIED: with the
+  containment landed, tcp_in.c/udp.c's dominant root blocker is
+  "pointer type outside a parameter position" on TcpPcb/UdpPcb's
+  intrusive next-pointer fields (rejected-type-cascade, 22 items in
+  tcp_in) -- pointer-typed struct FIELDS, not callbacks; that is
+  the candidate follow-up FR. DESIGN DECIDED BY PROBES: finalize-
+  time containment, NOT an FR-127-style planner replan (definition
+  presence is whole-project knowledge -- a per-TU pre-pass would
+  wrongly reject the multi-TU case, which imports byte-identical
+  today and stays untouched); STUB, never erase (erasing a
+  referencing item orphans its clean callers into the crate-fatal
+  channel -- measured; stubbing keeps the symbol defined, zero
+  cascade, no fixpoint). Zero-surviving-uses entries are forgiven
+  outright -- the dominant lwIP case (the error located at the
+  DECL). Surviving uses attribute via SymbolTable::getSymbolUses to
+  the owning top-level func, body cleared, emitRecoveryStub reason
+  ledgered [undefined-extern-global] located at the first use; any
+  non-func owner declines and the hard rejection stands. Strict
+  mode verbatim on BOTH channels (finalize wording + the
+  emitrust-import-c single-TU wording), exit 1, no crate. lwIP:
+  27/29 -> 29/29 core+ipv4 units importing (the filed 18/20 ->
+  20/20 on the original unit set), honest counts tcp_in 1 ported /
+  5 stubbed / 34 dropped of 40 fn items, udp 1/5/30 of 36. FR-52
+  Externals-trait, defer, and link-merge pins all green (13/13
+  baseline re-run). Gates: full meson suite 809/809 (fast 571 +
+  EndToEnd 238).
+  (test/Driver/incremental-extern-global-undefined.c,
+  incremental-extern-global-undefined-bin.c; ledger needle
+  undefined-extern-global mirrored in run_realworld.py)
 
 - [ ] FR-104 Returned cursors into a PARAMETER region (the #2
   corpus family, 97 items — but only its decidable sub-family is
