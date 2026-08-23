@@ -8108,6 +8108,13 @@ piece and becomes FR-45.
   incremental-template-sibling-multi-tu.cpp, the
   incremental-unreached-by-import.cpp pin FLIP, and the
   link-merge-rejections.c cascade_source shard pins)
+  INDEPENDENT VERIFICATION (2026-08-22, second session, committed
+  binary at c08fd6b, fresh 110-unit sweep): silent 0 graph / 0
+  fn-only / 0 off-graph; all-kinds unreached-by-import 579 (spike
+  measured 579 exactly); fn-only unreached 26 of 1504 (~1.7%, was
+  30.0%); rejected-type-cascade absent from both top-15 rankings;
+  fn-only #1 `other` 478 (31.8%, spike 479/31.9%). The C build-sweep
+  ratchet is unchanged (42/44, both known-fails pinned).
 
 - [x] FR-116 DEFECT: a global touched from a C++ METHOD BODY breaks
   the crate. Spike verdict **GO-WITH-CONSTRAINTS** (2026-08-21) and
@@ -12827,6 +12834,17 @@ whole-program demand.
   (test/Import/Cpp/copy-ctor.cpp, copy-ctor-invalid.cpp;
   test/EndToEnd/cpp-copy-ctor.cpp, cpp-copy-dtor.cpp; the ratchet adds
   00801.cpp; six frontier pins moved forward)
+  EXTERNAL RE-PROBE (2026-08-22, second session, 110-unit C++ corpus,
+  post-W2.23+FR-126 HEAD): corpus ported moved 588 -> 589 (+1). The
+  honest read: 00801 flipped in the curated suite, but the external
+  copy-move demand barely budged -- root copy-move-constructor is
+  STILL the all-kinds #1 at 2372 of 9779 blocked items (24.3%), so
+  the corpus's copy shapes overwhelmingly sit outside the admitted
+  subset (aggregate members, bases, and the ctor forms still fenced).
+  The wave's external value is expected to arrive compounded with the
+  fences it arms (FR-124's fixpoint) rather than alone; re-measure
+  after the next copy-adjacent increment before crediting or blaming
+  this wave.
 
 
 - [ ] W2.24 `try`/`throw`/`catch` (flips 00902). Spike verdict
