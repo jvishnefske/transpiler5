@@ -58,3 +58,28 @@
 int lib_good(int x);
 
 int main(void) { return lib_good(41); }
+//
+// FR-126: a rejected-type-cascade recorded inside a shim import carries the
+// rejected TYPE's graph key (`cascade_source`) through the shard artifact,
+// so link-time attribution can resolve the cascade to the type's own root
+// without re-parsing any C. The field rides the same `emitrust.rejections`
+// module attribute as the rest of the ledger row; an artifact produced
+// before FR-126 simply decodes it as empty (the stringField contract), so
+// old shards keep linking.
+// RUN: env EMITRUST_REAL_CC=clang emitrust-clang -c %S/Inputs/link-merge-cascade-lib.c -o %t.casc.o
+//
+// The serialized shard holds the source key on the cascade row -- and only
+// there: the rejected type's own row stays empty.
+// RUN: emitrust-opt %t.casc.o.emitrust.mlirbc | FileCheck %s --check-prefix=CASCATTR
+// CASCATTR: cascade_source = "", diagnostic = "unsupported: volatile-qualified type"
+// CASCATTR-SAME: symbol = "S"
+// CASCATTR: cascade_source = "S", diagnostic = "unsupported: struct 'S' was rejected, so a type naming it cannot be imported"
+// CASCATTR-SAME: symbol = "use_s"
+//
+// The link decodes the extended rows and surfaces them exactly as before:
+// the field is additive, the summary format does not move.
+// RUN: emitrust-cc --link %t.main.o %t.lib.o %t.casc.o --emit=rust -o %t.casc.rs 2>%t.casc.err
+// RUN: FileCheck %s --check-prefix=CASCLINK < %t.casc.err
+// CASCLINK: shard '{{.*}}.casc.o': recovered 2 rejected top-level items:
+// CASCLINK: dropped 'S' [other] unsupported: volatile-qualified type
+// CASCLINK: dropped 'use_s' [rejected-type-cascade] unsupported: struct 'S' was rejected, so a type naming it cannot be imported

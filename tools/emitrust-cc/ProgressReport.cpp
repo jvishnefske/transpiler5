@@ -57,6 +57,8 @@ struct CollapsedRejection {
   /// FR-49's join key to the coloring for an off-graph item: the item-graph
   /// node key of the enclosing C++ class, empty for everything else.
   std::string ownerSymbol;
+  /// FR-126: the graph key of the rejected TYPE a cascade restates.
+  std::string cascadeSourceSymbol;
 };
 
 /// Collapses `rejected` on (symbol, file, line, column), keeping the first
@@ -78,7 +80,8 @@ collapseRejections(llvm::ArrayRef<RejectedItem> rejected) {
       continue;
     }
     collapsed.push_back({item.symbol, file, line, column, item.diagnostic,
-                         item.blockerTag, item.stubbed, item.ownerSymbol});
+                         item.blockerTag, item.stubbed, item.ownerSymbol,
+                         item.cascadeSourceSymbol});
   }
   return collapsed;
 }
@@ -155,6 +158,52 @@ void attributeRoot(emitrustcc::ProgressItem &item, const ColoredItem *own,
   // No chain: the item is its own root.
   item.rootBlockerTag = item.blockerTag;
   item.blameChain.push_back(item.symbol);
+}
+
+/// FR-126: an item whose primary rejection is a cascade restatement
+/// (or a not-reached sibling) carries the source TYPE's/sibling's graph key;
+/// when the coloring gave the item no chain of its own, follow that key —
+/// through the source's coloring if it has one, else through the source's
+/// own ledger row, transitively — so the chain reaches the real root instead
+/// of stopping one hop short.
+void resolveCascadeRoot(
+    emitrustcc::ProgressItem &item, const CollapsedRejection *entry,
+    const llvm::StringMap<const CollapsedRejection *> &primaryBySymbol,
+    const ColorIndex &colors) {
+  if (!entry || entry->cascadeSourceSymbol.empty())
+    return;
+  if (item.blameChain.size() > 1)
+    return; // The coloring already produced a real chain; keep it.
+  std::vector<std::string> chain{item.symbol};
+  llvm::StringSet<> visited;
+  visited.insert(item.symbol);
+  std::string cur = entry->cascadeSourceSymbol;
+  std::string root;
+  while (!cur.empty() && visited.insert(cur).second) {
+    chain.push_back(cur);
+    if (const ColoredItem *color = lookupColor(colors, cur);
+        color && !color->construct.empty()) {
+      root = color->construct;
+      for (size_t i = 1; i < color->chain.size(); ++i)
+        chain.push_back(color->chain[i]);
+      break;
+    }
+    auto found = primaryBySymbol.find(cur);
+    if (found == primaryBySymbol.end())
+      break;
+    const CollapsedRejection *row = found->second;
+    if (row->cascadeSourceSymbol.empty()) {
+      root = row->blockerTag;
+      break;
+    }
+    cur = row->cascadeSourceSymbol;
+  }
+  if (chain.size() <= 1)
+    return;
+  item.blameChain = std::move(chain);
+  item.attributedVia = entry->cascadeSourceSymbol;
+  if (!root.empty())
+    item.rootBlockerTag = root;
 }
 
 /// Escapes `text` for a JSON string literal: the two mandatory escapes, the
@@ -466,6 +515,12 @@ ProgressReport buildProgressReport(llvm::StringRef crateName,
     for (const ItemNode &node : graph->nodes)
       nodeSymbols.insert(node.symbol);
 
+  // FR-126: first collapsed row per symbol, graph or not — the join
+  // target a cascade's source key resolves through.
+  llvm::StringMap<const CollapsedRejection *> primaryBySymbol;
+  for (const CollapsedRejection &entry : collapsed)
+    primaryBySymbol.try_emplace(entry.symbol, &entry);
+
   llvm::StringMap<std::vector<const CollapsedRejection *>> bySymbol;
   for (const CollapsedRejection &entry : collapsed) {
     if (graph && nodeSymbols.contains(entry.symbol)) {
@@ -486,6 +541,7 @@ ProgressReport buildProgressReport(llvm::StringRef crateName,
     // sibling classes may share.
     attributeRoot(item, /*own=*/nullptr,
                   lookupColor(colors, entry.ownerSymbol), entry.ownerSymbol);
+    resolveCascadeRoot(item, &entry, primaryBySymbol, colors);
     report.offGraphItems.push_back(std::move(item));
   }
 
@@ -501,6 +557,17 @@ ProgressReport buildProgressReport(llvm::StringRef crateName,
       item.column = node.column;
 
       auto found = bySymbol.find(node.symbol);
+      // FR-126: a "not reached: sibling specialization" row is a
+      // per-TU fact — another TU whose walk got past the failing sibling
+      // may have emitted this very specialization. Emission wins: the row
+      // only describes why THIS TU never visited the item, not a defect of
+      // the item itself. (A real rejection row alongside an emitted symbol
+      // keeps its pre-existing dropped/stubbed reading.)
+      if (found != bySymbol.end() && emittedSymbols.contains(node.symbol) &&
+          llvm::all_of(found->second, [](const CollapsedRejection *e) {
+            return e->blockerTag == "template-sibling-not-reached";
+          }))
+        found = bySymbol.end();
       if (found != bySymbol.end()) {
         const std::vector<const CollapsedRejection *> &entries = found->second;
         bool stubbed = llvm::any_of(
@@ -535,6 +602,9 @@ ProgressReport buildProgressReport(llvm::StringRef crateName,
       // FR-49: a graph item has its own chain, so it needs no owner.
       attributeRoot(item, lookupColor(colors, node.symbol),
                     /*ownerColor=*/nullptr, /*ownerSymbol=*/"");
+      if (found != bySymbol.end())
+        resolveCascadeRoot(item, found->second.front(), primaryBySymbol,
+                           colors);
       report.items.push_back(std::move(item));
     }
   }

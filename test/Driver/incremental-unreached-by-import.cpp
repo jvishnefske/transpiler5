@@ -1,18 +1,25 @@
-// FR-115: an item the import NEVER VISITED says so, honestly.
+// FR-115, then FR-126 (channel 2): an item the import never visited
+// because its TEMPLATE WALK died on an earlier sibling now says WHY, with
+// a located row attributed through that sibling.
 //
-// The defect this exists to prevent: a graph definition node with no ledger
-// row and no emitted symbol used to read `status: missing` with blocker "",
-// diagnostic "", root_blocker "" -- indistinguishable from a reporting bug.
-// Measured corpus-wide those rows were the single largest silent bucket,
-// and every one is an item only ever DEMANDED from code that was itself
-// rejected first, so the import legitimately never reached it and has no
-// diagnostic to report. Fabricating one would violate the
-// located-diagnostics contract; instead the row carries the additive
-// blocker tag `unreached-by-import` on the existing `missing` status (the
-// 5-value status vocabulary the RealWorld ratchet parses is untouched), the
-// diagnostic stays EMPTY (nothing was ever diagnosed), and FR-49 self-roots
-// the item so the root ranking counts the unreached mass under its own
-// honest bucket instead of scattering blanks.
+// The FR-115 frontier this test used to pin: a graph definition node no
+// import path ever visited read `status: missing` with the additive
+// blocker tag `unreached-by-import`, an honestly EMPTY diagnostic, and a
+// self-rooted chain -- on the doctrine that the import never diagnosed
+// anything for it and an invented ledger row would be a fabricated
+// diagnostic. Measured on the 110-unit C++ corpus that bucket was the
+// fn-only #1 blocker at 30.0% (448 of 1494), which is an attribution
+// dead-end: "we never looked" ranks nothing. FR-126 moves the pin
+// FORWARD for the template-walk shape: the walk's abort on a failed
+// sibling instantiation is itself a located, mechanical FACT, so the
+// importer ledgers each never-visited later sibling against the sibling
+// that aborted the walk (`template-sibling-not-reached`), and FR-49's
+// chain resolves through it to the real root. The row is not fabricated:
+// its location is the specialization's own point of instantiation and its
+// message states exactly what happened. After the flip the corpus fn-only
+// unreached share is 1.4% (21 of 1505); what remains of
+// `unreached-by-import` (genuinely undemanded items outside the two
+// template walk loops) keeps the FR-115 reading.
 //
 // The construction (the fmt-header shape, minimized): the W2.15 template
 // walk imports a class template's specializations in ONE loop that aborts
@@ -21,8 +28,8 @@
 // LATER one (`Box<long>`). The only other demand for `Box<long>` sits in
 // the body of a planner-dropped variadic (`va_copy`), which the import
 // never enters. Net: `BoxI64` is a graph definition node no import path
-// ever visited -- no rejection, no emission, nothing to report but the
-// non-visit itself.
+// ever visited -- and the ONLY thing known about it is the walk abort the
+// new row records.
 //
 // RUN: emitrust-cc --emit=crate --incremental %s -o %t.crate 2>%t.err
 // RUN: FileCheck %s --check-prefix=WARN --input-file=%t.err
@@ -45,8 +52,8 @@ struct Nasty {
 };
 
 // --- Importable if it were ever reached with a clean argument; nothing
-// --- about Box<long> itself is rejected, which is exactly why no
-// --- diagnostic exists for it.
+// --- about Box<long> itself is rejected. The sibling row does not claim
+// --- otherwise: it reports the WALK ABORT, not a defect of Box<long>.
 template <typename T> struct Box {
   T v;
 };
@@ -75,24 +82,24 @@ int use_pick(void) { return pick(2, 3, 4); }
 // --- In subset, so the crate is not empty.
 int fine(int a) { return a + 1; }
 
-// The unreached item is NOT in the ledger: it was never rejected, and an
-// invented ledger row would be a fabricated diagnostic. (Its rejected
-// SIBLING is: `BoxNasty` joins its node through the FR-115 graph-key
-// ledger, and the pattern `Box` stays off-graph residue.)
+// The never-visited sibling is IN the ledger now, named against the
+// sibling whose failure ended the walk. (Its rejected sibling `BoxNasty`
+// still joins its node through the FR-115 graph-key ledger, and the
+// pattern `Box` stays off-graph residue.)
 // WARN: recovered
-// WARN-NOT: 'BoxI64'
+// WARN: dropped 'BoxNasty' [rejected-type-cascade] unsupported: struct 'Nasty' was rejected, so a type naming it cannot be imported
+// WARN: dropped 'BoxI64' [template-sibling-not-reached] unsupported: specialization was not reached: sibling specialization 'BoxNasty' of the same template was rejected first
 
-// The missing row carries the tag in the blocker column, its root column
-// reads the same tag (self-rooted: no poison chain reaches an item nothing
-// imported ever depended on), and its diagnostic cell is honestly empty.
+// The row is dropped-with-a-cause instead of missing-with-a-blank, and its
+// chain walks through the failed sibling to the sibling's own root.
 // PORTING: | dropped | red | `BoxNasty` | record | copy-move-constructor | BoxNasty -> Nasty | rejected-type-cascade | unsupported: struct 'Nasty' was rejected, so a type naming it cannot be imported |
-// PORTING: | missing | orange | `BoxI64` | record | unreached-by-import | BoxI64 | unreached-by-import | - |
+// PORTING: | dropped | red | `BoxI64` | record | copy-move-constructor | BoxI64 -> BoxNasty -> Nasty | template-sibling-not-reached | unsupported: specialization was not reached: sibling specialization 'BoxNasty' of the same template was rejected first |
 
-// JSON: "missing": 1
+// JSON: "missing": 0
 // JSON: "symbol": "BoxI64"
-// JSON: "status": "missing"
-// JSON: "blocker": "unreached-by-import"
-// JSON-NEXT: "diagnostic": ""
-// JSON-NEXT: "root_blocker": "unreached-by-import"
-// JSON-NEXT: "attributed_via": ""
-// JSON-NEXT: "blame_chain": ["BoxI64"]
+// JSON: "status": "dropped"
+// JSON: "blocker": "template-sibling-not-reached"
+// JSON-NEXT: "diagnostic": "unsupported: specialization was not reached: sibling specialization 'BoxNasty' of the same template was rejected first"
+// JSON-NEXT: "root_blocker": "copy-move-constructor"
+// JSON-NEXT: "attributed_via": "BoxNasty"
+// JSON-NEXT: "blame_chain": ["BoxI64", "BoxNasty", "Nasty"]

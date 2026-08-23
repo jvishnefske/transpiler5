@@ -6703,6 +6703,15 @@ private:
   /// duplicates by symbol+loc, but the stderr recovery summary and the
   /// blocker tally count raw ledger entries).
   llvm::SmallPtrSet<const clang::RecordDecl *, 4> ledgerRecordedRecords;
+  /// FR-126: verbatim cascade-restatement message -> graph key of the
+  /// rejected type it names, populated at the cascade emit sites so the
+  /// recovery/ledger record sites (which only hold the message) can thread
+  /// the source symbol into RejectedItem::cascadeSourceSymbol.
+  llvm::StringMap<std::string> cascadeSourceByMessage;
+  std::string cascadeSourceForReason(llvm::StringRef reason) const {
+    auto it = cascadeSourceByMessage.find(reason);
+    return it == cascadeSourceByMessage.end() ? std::string() : it->second;
+  }
   /// Enum definitions already imported (keyed on the defining decl).
   llvm::SmallPtrSet<const clang::EnumDecl *, 8> importedEnums;
   /// Enum definitions whose import was REJECTED (keyed on the defining
