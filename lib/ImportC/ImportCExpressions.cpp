@@ -1743,9 +1743,85 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
   return emitError(loc) << "unsupported comparison operand type";
 }
 
+void CImporter::scanLocaleFence(const clang::TranslationUnitDecl *unit) {
+  if (!localeInstallCall.empty())
+    return;
+  for (const clang::Decl *decl : unit->decls()) {
+    const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl);
+    if (!func || !func->doesThisDeclarationHaveABody())
+      continue;
+    SmallVector<const clang::Stmt *> worklist{func->getBody()};
+    while (!worklist.empty()) {
+      const clang::Stmt *current = worklist.pop_back_val();
+      if (!current)
+        continue;
+      if (const auto *call = llvm::dyn_cast<clang::CallExpr>(current))
+        if (const clang::FunctionDecl *callee = call->getDirectCallee();
+            callee && callee->getDeclName().isIdentifier()) {
+          llvm::StringRef name = callee->getName();
+          // `setlocale` installs a locale for the whole process; `uselocale`
+          // installs one for the calling thread. Either one can move the
+          // `<ctype.h>` answers off the "C"-locale ASCII rule this mapping
+          // was measured against, so either one fences the whole import.
+          if (name == "setlocale" || name == "uselocale") {
+            localeInstallCall = name.str();
+            return;
+          }
+        }
+      for (const clang::Stmt *child : current->children())
+        worklist.push_back(child);
+    }
+  }
+}
+
+FailureOr<Value> CImporter::emitCtypeClassifier(const CtypeClassifierUse &use,
+                                                Location loc) {
+  FailureOr<Value> argument = emitRValue(use.arg);
+  if (failed(argument))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>((*argument).getType());
+  if (!intType)
+    return emitError(loc) << "unsupported: <ctype.h> classifier on a "
+                             "non-integer argument";
+  // C requires the argument to be EOF or representable as `unsigned char`;
+  // anything else is undefined. The `as u8` image is exact for the
+  // `unsigned char` range and maps EOF (-1) to 255, which no classifier
+  // accepts -- which is exactly what glibc answers for EOF.
+  auto byteType =
+      IntegerType::get(builder.getContext(), 8, IntegerType::Unsigned);
+  Value byte = castToIntType(loc, *argument, byteType);
+  neededCtypeHelpers.insert(use.helper);
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getI1Type()},
+          builder.getStringAttr(use.helper), /*args=*/ArrayAttr(),
+          ValueRange{byte})
+      .getResult(0);
+}
+
 FailureOr<Value> CImporter::emitCondition(const clang::Expr *expr) {
   const clang::Expr *e = expr->IgnoreParens();
   Location loc = translateLoc(e->getBeginLoc());
+
+  // FR-129 half (b): a glibc `<ctype.h>` CLASSIFIER, admitted HERE AND
+  // NOWHERE ELSE. C guarantees only "nonzero if true", but glibc's macro
+  // yields the `_IS*` MASK -- a program that PRINTS `isspace(' ')` prints
+  // 8192 -- so the Rust image is byte-identical only where the exact
+  // nonzero value is unobservable. `emitCondition` is precisely that set:
+  // `if`/`while`/`for` conditions, the `!` operand, the `&&`/`||` operands,
+  // and the ternary condition. Every other use (a value, an argument, a
+  // printed result) never reaches here and keeps the half-(a) located
+  // ctype-table rejection.
+  if (std::optional<CtypeClassifierUse> classifier =
+          matchCtypeClassifier(e, astContext())) {
+    if (!localeInstallCall.empty())
+      return emitError(loc)
+             << "unsupported: <ctype.h> classifier in a translation unit "
+                "that calls '"
+             << localeInstallCall
+             << "' (the ASCII image is measured only in the \"C\" locale)";
+    return emitCtypeClassifier(*classifier, loc);
+  }
 
   if (const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e)) {
     if (binary->isComparisonOp())

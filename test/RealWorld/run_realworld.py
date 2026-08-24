@@ -336,6 +336,10 @@ _BLOCKER_SUBSTRINGS = [
     # locale table reached through __ctype_b_loc(); previously [other].
     # Mirrors lib/ImportC/RejectionLedger.cpp.
     ("locale ctype table lookup", "ctype-table"),
+    # FR-129 half (b): a translation unit that installs a locale keeps the
+    # classifier rejection, under its own tag.
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("classifier in a translation unit that calls", "ctype-locale"),
     # FR-113 admitted scoped enums; the residual enum-definition gates
     # (keyword names/enumerators, values outside i32, empty, cross-TU shape
     # conflict) previously tabulated [other].

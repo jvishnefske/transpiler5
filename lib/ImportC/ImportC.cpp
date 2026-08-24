@@ -2368,6 +2368,14 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
   astContextPtr = &context;
   const clang::TranslationUnitDecl *unit = context.getTranslationUnitDecl();
 
+  // FR-129 half (b): the C locale is PROCESS-global, so a `setlocale` in ANY
+  // translation unit invalidates the ASCII image of every `<ctype.h>`
+  // classifier in the project. Scanning here — the one pass that runs over
+  // every TU before the first one imports — makes the fence order-
+  // independent (`importTranslationUnit` scans too, which covers the
+  // single-AST entry point that never reaches this pass).
+  scanLocaleFence(unit);
+
   // The externally visible global object an address expression binds to, as a
   // module symbol name, or empty: peels a leading address-of and any
   // element/member selections down to the object root, then requires an
@@ -2996,35 +3004,6 @@ static std::string neBytesTypeName(IntegerType type) {
   return ((type.isUnsigned() ? llvm::Twine("u") : llvm::Twine("i")) +
           llvm::Twine(type.getWidth()))
       .str();
-}
-
-// FR-129: the name of the glibc locale-table accessor `expr` reads through,
-// or empty when it reads through none. The `<ctype.h>` classifiers are
-// MACROS, not calls: `isspace(c)` expands to
-// `(*__ctype_b_loc())[(int)(c)] & _ISspace`, a subscript into the
-// dereference of a pointer a hosted extern function returned. That pointer
-// has no region the model tracks, so the read is unsupported — but the
-// generic pointer-cast wording lands on a source line whose text contains
-// no pointer and no cast, which is a diagnostic the reader cannot act on.
-// Callers use this to name the ctype table instead. Matching on the three
-// glibc accessor names is deliberate: they ARE the ABI (a program calling
-// them directly means the same thing), and nothing else in the model
-// reaches a call-returned pointer, so a broader shape rule would claim
-// diagnostics it cannot explain.
-static llvm::StringRef ctypeTableAccessorName(const clang::Expr *expr) {
-  const clang::Expr *e = expr->IgnoreParenImpCasts();
-  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e);
-      unary && unary->getOpcode() == clang::UO_Deref)
-    e = unary->getSubExpr()->IgnoreParenImpCasts();
-  const auto *call = llvm::dyn_cast<clang::CallExpr>(e);
-  const clang::FunctionDecl *callee = call ? call->getDirectCallee() : nullptr;
-  if (!callee || !callee->getDeclName().isIdentifier())
-    return {};
-  llvm::StringRef name = callee->getName();
-  if (name == "__ctype_b_loc" || name == "__ctype_tolower_loc" ||
-      name == "__ctype_toupper_loc")
-    return name;
-  return {};
 }
 
 FailureOr<Value> CImporter::emitWideByteLoad(const WideByteAccess &access,

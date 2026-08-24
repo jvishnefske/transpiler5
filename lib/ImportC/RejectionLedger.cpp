@@ -138,6 +138,13 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
     // hid a ubiquitous C idiom inside the corpus's largest junk bucket.
     {llvm::StringLiteral("locale ctype table lookup"),
      llvm::StringLiteral("ctype-table")},
+    // FR-129 half (b): the classifier family is admitted in boolean context
+    // only, and ONLY when nothing installs a locale -- the ASCII image was
+    // measured in the "C" locale. A fenced TU's classifiers get their own
+    // tag so the ledger distinguishes "we cannot lift this shape" from "we
+    // will not lift it here".
+    {llvm::StringLiteral("classifier in a translation unit that calls"),
+     llvm::StringLiteral("ctype-locale")},
     // FR-113 admitted scoped enums; the RESIDUAL enum-definition gates
     // (keyword-named enums and enumerators, values outside i32, an empty
     // enum, a cross-TU shape conflict) previously tabulated [other]. The

@@ -2561,6 +2561,12 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   // identifier namespace will claim, so struct tag naming
   // (`structSymbolName`) is independent of declaration order.
   collectOrdinaryNames(unit);
+  // FR-129 half (b): record a locale-installing call anywhere in this TU
+  // BEFORE any body imports, so every `<ctype.h>` classifier in it stays
+  // fenced back to its located rejection (the ASCII image was measured only
+  // in the "C" locale). Sticky across TUs; the project entry point scans
+  // every TU up front in `collectWholeProgramInfo` for order-independence.
+  scanLocaleFence(unit);
   // FR-101 Pass 0: borrow-bundle scalarization rewrites the clang AST
   // itself, so it must run before EVERY planner and every analysis — they
   // must all see the scalarized form and never the bundle. A no-op unless
@@ -3541,6 +3547,93 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
         emittedFileHelpers.contains(helper.name))
       continue;
     emittedFileHelpers.insert(helper.name);
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(helper.source));
+  }
+  // FR-129 half (b): `<ctype.h>` classifier helpers, one per admitted
+  // `_IS*` mask, emitted once per module in mask order. Each body is the
+  // C-locale ASCII rule the classifier denotes, MEASURED equal to glibc's
+  // answer on all 256 `unsigned char` values (design.md FR-129). Nine of
+  // the twelve are exactly a `u8` inherent predicate; `isspace`, `isblank`,
+  // and `isprint` are spelled out because Rust has no method with C's
+  // meaning (see `__emitrust_isspace` for the one that BITES).
+  static const struct {
+    llvm::StringRef name;
+    llvm::StringRef source;
+  } kCtypeHelpers[] = {
+      {"__emitrust_isblank",
+       "/// C `isblank` in the \"C\" locale: space or horizontal tab.\n"
+       "fn __emitrust_isblank(c: u8) -> bool {\n"
+       "    matches!(c, b' ' | b'\\t')\n"
+       "}"},
+      {"__emitrust_iscntrl",
+       "/// C `iscntrl` in the \"C\" locale.\n"
+       "fn __emitrust_iscntrl(c: u8) -> bool {\n"
+       "    c.is_ascii_control()\n"
+       "}"},
+      {"__emitrust_ispunct",
+       "/// C `ispunct` in the \"C\" locale.\n"
+       "fn __emitrust_ispunct(c: u8) -> bool {\n"
+       "    c.is_ascii_punctuation()\n"
+       "}"},
+      {"__emitrust_isalnum",
+       "/// C `isalnum` in the \"C\" locale.\n"
+       "fn __emitrust_isalnum(c: u8) -> bool {\n"
+       "    c.is_ascii_alphanumeric()\n"
+       "}"},
+      {"__emitrust_isupper",
+       "/// C `isupper` in the \"C\" locale.\n"
+       "fn __emitrust_isupper(c: u8) -> bool {\n"
+       "    c.is_ascii_uppercase()\n"
+       "}"},
+      {"__emitrust_islower",
+       "/// C `islower` in the \"C\" locale.\n"
+       "fn __emitrust_islower(c: u8) -> bool {\n"
+       "    c.is_ascii_lowercase()\n"
+       "}"},
+      {"__emitrust_isalpha",
+       "/// C `isalpha` in the \"C\" locale.\n"
+       "fn __emitrust_isalpha(c: u8) -> bool {\n"
+       "    c.is_ascii_alphabetic()\n"
+       "}"},
+      {"__emitrust_isdigit",
+       "/// C `isdigit` in the \"C\" locale.\n"
+       "fn __emitrust_isdigit(c: u8) -> bool {\n"
+       "    c.is_ascii_digit()\n"
+       "}"},
+      {"__emitrust_isxdigit",
+       "/// C `isxdigit` in the \"C\" locale.\n"
+       "fn __emitrust_isxdigit(c: u8) -> bool {\n"
+       "    c.is_ascii_hexdigit()\n"
+       "}"},
+      {"__emitrust_isspace",
+       "/// C `isspace` in the \"C\" locale: space and \\t \\n \\v \\f \\r.\n"
+       "/// NOT `is_ascii_whitespace`, which follows the WhatWG definition\n"
+       "/// and EXCLUDES U+000B VERTICAL TAB -- the single value on which\n"
+       "/// Rust's predicate and C's classifier disagree (measured over all\n"
+       "/// 256 `unsigned char` values, design.md FR-129).\n"
+       "fn __emitrust_isspace(c: u8) -> bool {\n"
+       "    matches!(c, b'\\t'..=b'\\r' | b' ')\n"
+       "}"},
+      {"__emitrust_isprint",
+       "/// C `isprint` in the \"C\" locale: the graphic characters plus\n"
+       "/// the space (Rust has no `is_ascii_printable`).\n"
+       "fn __emitrust_isprint(c: u8) -> bool {\n"
+       "    matches!(c, b' '..=b'~')\n"
+       "}"},
+      {"__emitrust_isgraph",
+       "/// C `isgraph` in the \"C\" locale.\n"
+       "fn __emitrust_isgraph(c: u8) -> bool {\n"
+       "    c.is_ascii_graphic()\n"
+       "}"},
+  };
+  for (const auto &helper : kCtypeHelpers) {
+    if (!neededCtypeHelpers.contains(helper.name) ||
+        emittedCtypeHelpers.contains(helper.name))
+      continue;
+    emittedCtypeHelpers.insert(helper.name);
     OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
     moduleBuilder.create<emitrust::VerbatimOp>(
         UnknownLoc::get(builder.getContext()),

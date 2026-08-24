@@ -153,10 +153,10 @@ anchor = "FR-124 DEFECT"
 id = "FR-129"
 rank = 12
 kind = "defect"
-status = "spiked"
+status = "landed"
 size = "M"
-title = "ctype family unsupported under glibc; rejection names the mechanism, not the cause"
-summary = "Half (a) LANDED 2026-08-23. Half (b) SPIKED GO, narrower: locale caveat dissolved by measurement (0 mismatches over 256 values + EOF), tolower/toupper split off (statement-expression wrapping a real call), admit in BOOLEAN CONTEXT ONLY so glibc mask values never enter emitted Rust. Ready to implement."
+title = "ctype: classifiers admitted in boolean context; tolower/toupper stay fenced"
+summary = "Both halves LANDED 2026-08-23. All 12 classifiers admitted in boolean context via verbatim helpers (zero new ops); locale fence covers setlocale+uselocale. The exhaustive 256-value oracle caught Rust is_ascii_whitespace excluding vertical tab. Entry's 3-item demand figure corrected to 1 (the lwIP pair shares the generic wording from another cause)."
 blocked_by = []
 anchor = "FR-129 DEFECT"
 
