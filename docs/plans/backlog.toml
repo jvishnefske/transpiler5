@@ -314,10 +314,10 @@ anchor = "FR-104 Returned cursors"
 id = "FR-106"
 rank = 16
 kind = "defect"
-status = "in-flight"
+status = "spiked"
 size = "M"
 title = "unused_assignments deny fires on real code"
-summary = "The emitted-crate lint tripwire rejects legitimate programs; see entry for the measured shapes."
+summary = "SPIKED 2026-08-23: direction (c) REFUTED on the real shape -- the flagged store is dead only via the continue path's next-iteration overwrite or loop exit, both cross-iteration. New direction (d) identified and unfenced: a per-function #[allow] cannot miscompile because it never deletes a store. Spike (d); do not attempt (a)."
 blocked_by = []
 anchor = "FR-106 DEFECT"
 
