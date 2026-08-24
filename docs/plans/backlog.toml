@@ -150,6 +150,17 @@ blocked_by = []
 anchor = "FR-124 DEFECT"
 
 [[items]]
+id = "FR-129"
+rank = 12
+kind = "defect"
+status = "open"
+size = "M"
+title = "ctype family unsupported under glibc; rejection names the mechanism, not the cause"
+summary = "isspace expands to a __ctype_b_loc() locale-table read, rejected as 'unsupported pointer cast' on lines with no pointer. Half (a) diagnostic is cheap and owed by the FR-115 doctrine; half (b) ASCII mapping must settle locale semantics against the byte-diff oracle. 3 items direct, 4 of 10 corpus projects use ctype."
+blocked_by = []
+anchor = "FR-129 DEFECT"
+
+[[items]]
 id = "FR-128"
 kind = "defect"
 status = "landed"
