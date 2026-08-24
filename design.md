@@ -6895,7 +6895,44 @@ piece and becomes FR-45.
   Gates: the heatshrink encoder crate must BUILD + the elision
   arms already pinned must not shift a byte + EndToEnd byte-diff
   of the search-loop shape + full lit 100%.
-  **NOT SPIKED.**
+  **SPIKED 2026-08-23, and the proof this entry demanded comes
+  back NEGATIVE: direction (c) is REFUTED on the real shape.**
+  Measured, not diagrammed. rustc flags `len = 0` (emitted
+  lib.rs:564) and names `len = 1` (:573) as the overwrite, and
+  those two ARE same-iteration -- which is exactly the trap this
+  entry warned about, because that pair is only rustc's example
+  span, not its proof. `unused_assignments` is an all-paths
+  liveness result, so the store is dead only if it is dead on the
+  OTHER path too: the `pospoint[match_maxlen] != needlepoint[...]`
+  arm, which `continue`s without touching `len` again. On that
+  path the next access is the NEXT ITERATION's `len = 0`, or, if
+  the loop exits, no access at all -- verified by reading the
+  emitted function: `len`'s last reference anywhere is :596,
+  INSIDE the loop, and nothing after the loop reads it. Both
+  justifications are cross-iteration/loop-exit facts, so
+  same-iteration reasoning ALONE cannot establish this store's
+  deadness. Direction (c) does not apply to `find_longest_match`.
+  **THE REFRAME THAT SURVIVES IT, and it is the useful part:
+  (a)'s danger is not liveness reasoning per se -- it is DELETING
+  A STORE. An analysis that is wrong in the unsafe direction
+  removes code C would have executed, which is the measured
+  three-time miscompile CLAUDE.md fences. But emitting
+  `#[allow(unused_assignments)]` on the specific FUNCTION cannot
+  miscompile ANYTHING: it adds an attribute, never removes a
+  store, so a wrong answer costs only a suppressed lint on one
+  function.** That makes a new direction (d) available that this
+  entry did not list and that the fence does not reach: a cheap,
+  deliberately conservative detector in the emitter -- "this body
+  contains a store to a local followed on SOME path by another
+  store with no intervening read" -- gating a per-function allow.
+  Its false-positive direction is harmless (a redundant allow),
+  it keeps the crate-wide deny and therefore the tripwire on
+  every other function, and it needs none of the soundness (a)
+  needs. (b) remains available but still deletes the tripwire
+  wholesale. RECOMMENDATION: spike (d); do not attempt (a).
+  Nothing implemented this wave -- the deliverable is the
+  refutation and the reframe. The two heatshrink crates stay on
+  the build-sweep known-fail ledger, honestly.
   **DELIVERED (2026-08-21) — wave 1, type admission only. The
   value is SMALL, it was measured cleanly, and measuring it
   exposed a flaw in how this whole file has been ranking work.**
