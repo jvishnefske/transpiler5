@@ -6677,12 +6677,17 @@ piece and becomes FR-45.
   and ini_strncpy0 PORTED -- but the CANONICAL ini_lskip is STUBBED
   on real inih (ini.c 1/10 fn ported): `unsupported pointer cast
   (LValueToRValue)` at ini.c:60:18, the `return (char*)s;` return
-  site. The in-test cast-transparency shape passes; the real
-  spelling reaches a different cast-handling switch (the rejection
-  at ImportC.cpp:~3708 prints the kind name, distinct from the
-  handled LValueToRValue variable-read arm). So the predicted
-  inih +2 is measured +1, and the gap is a residual peel site, not
-  the model. Filed for the loop rather than hand-patched.
+  site.
+  **CORRECTION, same day, by token-level bisection: that
+  attribution was WRONG and the residual is NOT an FR-104 gap.**
+  ini.c:60 is the `while` line, not the return. The blocker is
+  `isspace`: a probe with NO pointer anywhere (`char c;
+  isspace((unsigned char)c)`) stubs identically, and real-shaped
+  `ini_lskip` with `isspace` replaced by a plain comparison PORTS
+  -- FR-104's return-cast transparency works on the real spelling.
+  The cause is glibc's ctype macro expansion, filed as FR-129. The
+  honest FR-104 delta stands at +1 measured (jsmn alloc_token, inih
+  strncpy0); lskip is blocked by an unrelated defect.
   Ranked SECOND, after FR-102.
 
 - [x] FR-105 DEFECT: a loop-assigned deferred binding is emitted
@@ -8279,6 +8284,47 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-ns-camelcase.cpp,
   test/Import/Cpp/cpp-ns-case-fold-invalid.cpp,
   test/Driver/incremental-camelcase-namespace.cpp)
+
+- [ ] FR-129 DEFECT + FEATURE (found 2026-08-23 by bisecting the
+  FR-104 re-probe residual; the FR-104 attribution it corrects is
+  recorded in that entry): **the `<ctype.h>` family is unsupported
+  under glibc, and its rejection names the mechanism instead of the
+  cause.** glibc expands `isspace(c)` to
+  `(*__ctype_b_loc())[(int)(c)] & _ISspace` -- a locale-table read
+  through a pointer returned by a hosted extern function -- so the
+  importer rejects the table read with `unsupported pointer cast
+  (LValueToRValue)`, located on a source line whose text contains
+  NO pointer and NO cast. Measured: a probe with no pointer
+  anywhere (`char c = ...; isspace((unsigned char)c)`) reproduces
+  it; the same function with `isspace` replaced by a comparison
+  ports. TWO HALVES, separable:
+  (a) DIAGNOSTIC (cheap, and the FR-115/FR-126 doctrine says it is
+  owed): recognize the `__ctype_b_loc` / `__ctype_tolower_loc` /
+  `__ctype_toupper_loc` table-read shape and reject it LOCATED with
+  a wording that names the real cause (the ctype macro), so the
+  ledger stops filing these as generic pointer casts. Today three
+  corpus function items root at `other` on a wording that misleads.
+  (b) SUPPORT (the feature): map the ASCII-decidable predicates
+  (`isspace`/`isalpha`/`isdigit`/`isupper`/`islower`/`isalnum`/
+  `tolower`/`toupper`) onto Rust's `u8`/`char` methods. THE CATCH,
+  and it must be settled by the byte-diff oracle before any
+  mapping lands: C's ctype is LOCALE-DEPENDENT and its argument is
+  an `int` that must be `EOF` or representable as `unsigned char`
+  (anything else is UB), whereas `is_ascii_whitespace` and friends
+  are fixed ASCII -- identical only in the "C" locale over
+  0..=127. A mapping is honest only if it either (i) restricts to
+  the C-locale/ASCII subset and REJECTS non-ASCII-decidable inputs
+  located, or (ii) is proven byte-identical against the
+  clang-built native for the full `unsigned char` range, which the
+  EndToEnd oracle can do exhaustively (256 values, argc-seeded).
+  HONEST DEMAND: 3 function items carry the wording directly
+  (inih ini_lskip, lwip dns, lwip memp), but 4 of the 10 C corpus
+  projects use ctype (inih, cJSON, cJSON_Utils, tinyexpr) -- the
+  others die earlier on unrelated causes, so the true unlock is
+  larger than 3 and smaller than the whole ctype user set; inih's
+  lskip/rstrip/find_chars_or_comment are the measured instances
+  and inih sits at 1/10 function items. Half (a) is worth doing
+  regardless of (b). **NOT SPIKED.**
 
 - [x] FR-128 DEFECT (found 2026-08-23 by the post-W2.25 external
   re-probe; REGRESSION introduced by W2.25, exposed at depth by
