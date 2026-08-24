@@ -62,6 +62,7 @@
 #include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
+#include "EmitRust/Conversion/LoweringPipeline.h"
 #include "EmitRust/ImportC.h"
 #include "EmitRust/Project/ItemGraph.h"
 #include "EmitRust/ShardMetadata.h"
@@ -327,21 +328,21 @@ classifyCompileJobs(llvm::ArrayRef<const char *> args, llvm::StringRef realCC,
   return jobs;
 }
 
-/// Runs the pinned emitrust-cc lowering pipeline on `module`:
-/// lower-containers, mem2reg, canonicalize, lift-cf-to-scf, canonicalize,
-/// convert-to-emitrust — so the artifact holds the fully converted
-/// emitrust-dialect module (`emitrust.func` bodies), the same stage
-/// `emitrust-cc --emit=mlir` writes and the stage the FR-58 link step will
-/// materialize Rust from.
+/// Runs the pinned lowering pipeline on `module` — FR-130's
+/// `buildLoweringPipeline`, the same definition emitrust-cc runs — so the
+/// artifact holds the fully converted emitrust-dialect module
+/// (`emitrust.func` bodies), the same stage `emitrust-cc --emit=mlir` writes
+/// and the stage the FR-58 link step will materialize Rust from.
+///
+/// Both options stay OFF, and that is a decision, not the old copy-paste
+/// drift: the range check is emitrust-cc's opt-in verification stage, and the
+/// FR-52 lowering must NOT run here because this artifact is an FR-58 shard
+/// — its unresolved externals are the link step's input, so resolving them
+/// per-shard would resolve them too early.
 static mlir::LogicalResult runPipeline(mlir::ModuleOp module) {
   mlir::PassManager pm(module.getContext(),
                        mlir::ModuleOp::getOperationName());
-  pm.addPass(mlir::emitrust::createEmitRustLowerContainers());
-  pm.addPass(mlir::createMem2Reg());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createLiftControlFlowToSCFPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::emitrust::createConvertToEmitRust());
+  mlir::emitrust::buildLoweringPipeline(pm);
   return pm.run(module);
 }
 

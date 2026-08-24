@@ -150,6 +150,17 @@ blocked_by = []
 anchor = "FR-124 DEFECT"
 
 [[items]]
+id = "FR-130"
+rank = 13
+kind = "feature"
+status = "in-flight"
+size = "M"
+title = "Standard simplification on emitted code (C and C++)"
+summary = "Increment 1 LANDED 2026-08-24: the pinned lowering pipeline is one definition (buildLoweringPipeline) both drivers call, registered as emitrust-opt --emitrust-lowering and pinned by test/Conversion/lowering-pipeline.mlir; byte-inert. NO-GO recorded for all four stock MLIR passes (cse +80 lines, sccp 0, licm +2, remove-dead-values SEGFAULTs on 5 inputs incl. 4 C++) -- do not re-add. Increment 2 (dead-binding elimination, 113 sites across 34 C + 4 C++ files) in flight; increment 3 (string-literal inlining) still needs its spike."
+blocked_by = []
+anchor = "FR-130 SIMPLIFICATION"
+
+[[items]]
 id = "FR-129"
 rank = 12
 kind = "defect"

@@ -79,6 +79,7 @@
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/Conversion/LowerExternalRequirements.h"
+#include "EmitRust/Conversion/LoweringPipeline.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 #include "EmitRust/ImportC.h"
 #include "EmitRust/Project/FrontierSearch.h"
@@ -620,22 +621,14 @@ static void printDiagnostic(mlir::Diagnostic &diag) {
 static mlir::LogicalResult runPipeline(mlir::ModuleOp module) {
   mlir::PassManager pm(module.getContext(),
                        mlir::ModuleOp::getOperationName());
-  // Lower the high-level container ops (the FR-39 node pool) to the concrete
-  // `[T;CAP]` array + cursor shape FIRST, before mem2reg promotes the cursor,
-  // so all downstream lowering is identical to inlining the pool directly.
-  pm.addPass(mlir::emitrust::createEmitRustLowerContainers());
-  pm.addPass(mlir::createMem2Reg());
-  pm.addPass(mlir::createCanonicalizerPass());
-  pm.addPass(mlir::createLiftControlFlowToSCFPass());
-  pm.addPass(mlir::createCanonicalizerPass());
-  if (checkRangeRefinement)
-    pm.addPass(mlir::emitrust::createEmitRustRangeRefinementCheck());
-  pm.addPass(mlir::emitrust::createConvertToEmitRust());
-  // FR-52: strictly after the conversion, because the trait is expressed in
-  // the EMITTED names and in the opaque string callees the conversion
-  // produces. A no-op unless the importer marked an unresolved external,
-  // which is why every existing crate stays byte-identical.
-  pm.addPass(mlir::emitrust::createEmitRustLowerExternalRequirements());
+  // FR-130: the stage list lives in ONE place (buildLoweringPipeline); this
+  // driver's only say over it is the two option fields.
+  mlir::emitrust::LoweringPipelineOptions options;
+  options.checkRangeRefinement = checkRangeRefinement;
+  // emitrust-cc emits a FINAL crate, so FR-52 resolves its unresolved
+  // externals here rather than deferring them to a link step.
+  options.lowerExternalRequirements = true;
+  mlir::emitrust::buildLoweringPipeline(pm, options);
   return pm.run(module);
 }
 

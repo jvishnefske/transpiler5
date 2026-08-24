@@ -47,6 +47,11 @@ build-pdll/
 # Meson build directory
 build-meson/
 
+# Meson native file pinning llvm-config to the devshell's LLVM (written by
+# scripts/spike-worktree-setup.sh). It holds a machine-specific nix store
+# path, so it is per-checkout state, never committed.
+build-native.ini
+
 # Claude Code session worktrees and editor swap files
 .claude/worktrees/
 .*.swp

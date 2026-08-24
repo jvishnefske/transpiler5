@@ -14,6 +14,9 @@
 /// emitrust-actor-lift, emitrust-actor-thread,
 /// emitrust-range-refinement-check, and
 /// emitrust-value-identity-check passes with the global pass registry.
+///
+/// Also declares `buildLoweringPipeline`, the ONE definition of the pinned
+/// import-to-emitrust lowering pipeline every driver runs (FR-130).
 //
 //===----------------------------------------------------------------------===//
 
@@ -27,6 +30,7 @@
 #include "EmitRust/Conversion/FuncToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/Conversion/LowerExternalRequirements.h"
+#include "EmitRust/Conversion/LoweringPipeline.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 #include "EmitRust/Conversion/SCFToEmitRust.h"
 #include "EmitRust/Conversion/UBToEmitRust.h"
