@@ -1657,6 +1657,10 @@ struct RangeFor {
   bool inclusive;           ///< `i <= HI` (renders `..=`) vs `i < HI`
 };
 
+/// FR-129 half (b): one recognized `<ctype.h>` classifier use (defined with
+/// `matchCtypeClassifier` in the AST-helpers section below).
+struct CtypeClassifierUse;
+
 class CImporter {
 public:
   /// Creates an importer that appends to `module`. The translation-unit
@@ -5270,6 +5274,19 @@ private:
   /// fgets additionally pull in the fgetc primitive they call).
   void requestFileHelper(llvm::StringRef name);
 
+  /// FR-129 half (b): pre-scan for a locale-installing call anywhere in
+  /// `unit`, recording it in `localeInstallCall`. Runs before any body is
+  /// imported so the fence is complete when the first classifier is met.
+  void scanLocaleFence(const clang::TranslationUnitDecl *unit);
+
+  /// FR-129 half (b): lowers one BOOLEAN-CONTEXT `<ctype.h>` classifier use
+  /// to `__emitrust_is*(arg as u8)`, an i1. The `u8` cast is C's own domain
+  /// rule (the argument must be `EOF` or representable as `unsigned char`),
+  /// and `EOF as u8` is 255, which no classifier accepts -- exactly C's
+  /// answer.
+  FailureOr<Value> emitCtypeClassifier(const CtypeClassifierUse &use,
+                                       Location loc);
+
   /// Emits a `FILE *` local as an owned-handle `emitrust.variable` place
   /// (registered in `fileLocals`), lowering an `= fopen(...)` initializer
   /// through `emitFileOpenInto`.
@@ -7227,12 +7244,112 @@ private:
   /// FILE* helpers already emitted, so a multi-TU import never emits one
   /// twice.
   llvm::StringSet<> emittedFileHelpers;
+  /// FR-129 half (b): `<ctype.h>` classifier helpers requested by admitted
+  /// boolean-context uses; each is emitted once per module, in the fixed
+  /// mask order of the `kCtypeHelpers` table.
+  llvm::StringSet<> neededCtypeHelpers;
+  /// Ctype helpers already emitted, so a multi-TU import never emits one
+  /// twice.
+  llvm::StringSet<> emittedCtypeHelpers;
+  /// FR-129 half (b): the locale-installing libc function this import has
+  /// seen called (`setlocale`/`uselocale`), or empty. The `<ctype.h>` ->
+  /// ASCII mapping is only valid in the "C" locale, so ANY such call fences
+  /// every classifier back to its located rejection. Sticky: once a TU is
+  /// seen to install a locale, later TUs of the same import stay fenced.
+  std::string localeInstallCall;
 };
 
 
 //===----------------------------------------------------------------------===//
 // AST helpers
 //===----------------------------------------------------------------------===//
+
+/// FR-129 half (a): the glibc `<ctype.h>` locale-table accessor whose table
+/// `expr` reads, or an empty name. Every `<ctype.h>` macro expands to a read
+/// through one of exactly three accessors -- those names ARE the glibc ABI --
+/// so matching them (rather than a broader "call-returned pointer" rule)
+/// claims only diagnostics the importer can explain. Accepts both the bare
+/// call and the `*call()` dereference the subscript base carries.
+static inline llvm::StringRef ctypeTableAccessorName(const clang::Expr *expr) {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e);
+      unary && unary->getOpcode() == clang::UO_Deref)
+    e = unary->getSubExpr()->IgnoreParenImpCasts();
+  const auto *call = llvm::dyn_cast<clang::CallExpr>(e);
+  const clang::FunctionDecl *callee = call ? call->getDirectCallee() : nullptr;
+  if (!callee || !callee->getDeclName().isIdentifier())
+    return {};
+  llvm::StringRef name = callee->getName();
+  if (name == "__ctype_b_loc" || name == "__ctype_tolower_loc" ||
+      name == "__ctype_toupper_loc")
+    return name;
+  return {};
+}
+
+/// FR-129 half (b): one recognized `<ctype.h>` CLASSIFIER use, decomposed.
+/// glibc expands every classifier macro to `(*__ctype_b_loc())[(int)(c)] &
+/// MASK`, where MASK is a fixed-ABI `_IS*` bit; `arg` is the subscript index
+/// (C's already-promoted argument) and `helper` names the emitted Rust
+/// function that images the predicate.
+struct CtypeClassifierUse {
+  const clang::Expr *arg;
+  llvm::StringRef helper;
+};
+
+/// FR-129 half (b): the `<ctype.h>` classifier `expr` spells, or nullopt.
+///
+/// The mask -> predicate table is glibc's `_IS*` ABI (verified against the
+/// installed <ctype.h>), and each Rust image was MEASURED equal to glibc's
+/// answer on all 256 `unsigned char` values in the "C" locale. `tolower`/
+/// `toupper` are deliberately absent: they do not have this shape (glibc
+/// wraps them in a statement expression that calls the real function), so
+/// they keep their located rejection.
+static inline std::optional<CtypeClassifierUse>
+matchCtypeClassifier(const clang::Expr *expr, clang::ASTContext &context) {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  const auto *binary = llvm::dyn_cast<clang::BinaryOperator>(e);
+  if (!binary || binary->getOpcode() != clang::BO_And)
+    return std::nullopt;
+  const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(
+      binary->getLHS()->IgnoreParenImpCasts());
+  if (!subscript)
+    return std::nullopt;
+  // Only the CLASSIFIER table (`__ctype_b_loc`) has the mask shape; a read
+  // of the tolower/toupper tables falls through to the half-(a) rejection.
+  if (ctypeTableAccessorName(subscript->getBase()) != "__ctype_b_loc")
+    return std::nullopt;
+  clang::Expr::EvalResult mask;
+  if (!binary->getRHS()->EvaluateAsInt(mask, context))
+    return std::nullopt;
+  if (!mask.Val.getInt().isRepresentableByInt64())
+    return std::nullopt;
+  // glibc's `_IS*` bits (ctype.h `_ISbit`), each paired with the emitted
+  // Rust helper that reproduces it. A mask that is not exactly one of these
+  // (a combined `_ISupper|_ISlower`, say) has no proven image and falls
+  // through to the located ctype-table rejection.
+  static constexpr struct {
+    int64_t mask;
+    llvm::StringLiteral helper;
+  } kClassifiers[] = {
+      {1, llvm::StringLiteral("__emitrust_isblank")},
+      {2, llvm::StringLiteral("__emitrust_iscntrl")},
+      {4, llvm::StringLiteral("__emitrust_ispunct")},
+      {8, llvm::StringLiteral("__emitrust_isalnum")},
+      {256, llvm::StringLiteral("__emitrust_isupper")},
+      {512, llvm::StringLiteral("__emitrust_islower")},
+      {1024, llvm::StringLiteral("__emitrust_isalpha")},
+      {2048, llvm::StringLiteral("__emitrust_isdigit")},
+      {4096, llvm::StringLiteral("__emitrust_isxdigit")},
+      {8192, llvm::StringLiteral("__emitrust_isspace")},
+      {16384, llvm::StringLiteral("__emitrust_isprint")},
+      {32768, llvm::StringLiteral("__emitrust_isgraph")},
+  };
+  int64_t value = mask.Val.getInt().getExtValue();
+  for (const auto &entry : kClassifiers)
+    if (entry.mask == value)
+      return CtypeClassifierUse{subscript->getIdx(), entry.helper};
+  return std::nullopt;
+}
 
 /// Returns true if the statement tree rooted at `stmt` contains any C label
 /// (`LabelStmt`). Iterative worklist traversal over the AST.

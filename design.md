@@ -8285,7 +8285,7 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-ns-case-fold-invalid.cpp,
   test/Driver/incremental-camelcase-namespace.cpp)
 
-- [ ] FR-129 DEFECT + FEATURE (found 2026-08-23 by bisecting the
+- [x] FR-129 DEFECT + FEATURE (found 2026-08-23 by bisecting the
   FR-104 re-probe residual; the FR-104 attribution it corrects is
   recorded in that entry): **the `<ctype.h>` family is unsupported
   under glibc, and its rejection names the mechanism instead of the
@@ -8387,6 +8387,55 @@ piece and becomes FR-45.
   wording; inih's `ini_lskip` PORTS (the honest corpus number
   recorded, with `ini_rstrip` still blocked by its own
   argument-side pointer comparison per FR-104).
+  **HALF (b) LANDED 2026-08-23, all twelve classifiers, and the
+  exhaustive oracle EARNED ITS KEEP by catching a defect in this
+  entry's own proposed mapping.** Rust's `is_ascii_whitespace` is
+  NOT C's `isspace`: it follows the WhatWG definition and EXCLUDES
+  U+000B VERTICAL TAB. Measured as exactly one mismatch at value 11
+  over the 256-value sweep, with every other `is_ascii_*` matching
+  glibc exactly; the emitted image is therefore
+  `matches!(c, b'\t'..=b'\r' | b' ')` and the byte-diff test prints
+  value 11 explicitly. Had this landed on a spot-check instead of
+  the exhaustive walk, it would have been a silent wrong answer on
+  one input in 256.
+  TWO MORE CORRECTIONS TO THIS ENTRY, both measured:
+  (i) the spike's claim that `tolower`/`toupper` expand to a
+  `__builtin_constant_p` statement-expression holds only at `-O2`;
+  at the default `-O0` glibc declares them as ORDINARY FUNCTIONS,
+  so they reject with the system-header wording, not the half-(a)
+  table wording. Both spellings are pinned. They stay out either
+  way, but the recorded reason was wrong.
+  (ii) THE DEMAND FIGURE ABOVE WAS AN OVER-CLAIM. This entry said
+  three corpus function items carried the ctype wording (inih
+  `ini_lskip`, lwip dns, lwip memp). Re-measured: only inih's was
+  ctype. The two lwIP items share the GENERIC `unsupported pointer
+  cast (LValueToRValue)` wording from an unrelated cause -- which
+  is itself the residual half-(a) lesson: that wording is still a
+  junk bucket covering several distinct fronts, and the next
+  attribution pass should split it. Honest unlock: ONE corpus
+  function item (inih 1/10 -> 2/10 function items ported), plus
+  zero ctype-tagged items remaining anywhere in the C corpus.
+  IMPLEMENTATION as landed: `emitCondition` turned out to BE the
+  admitted set exactly -- all of its call sites are boolean
+  contexts, so the hook needed no new context plumbing. Emission
+  reuses the established verbatim-helper mechanism (the
+  `__emitrust_strlen`/`__emitrust_fgetc` precedent), one
+  `fn __emitrust_is*(c: u8) -> bool` per used classifier,
+  deduplicated across TUs: ZERO new dialect ops and zero translator
+  changes, because `MethodCallOp` requires an lvalue struct/opaque
+  receiver and a `u8` cannot be one. The locale fence covers
+  `uselocale` as well as `setlocale` (strictly more conservative)
+  and is scanned whole-program so it is order-independent; fenced
+  classifiers get their own `ctype-locale` tag, distinguishing
+  "cannot lift this shape" from "will not lift it here". An
+  `isspace(c) == 0` comparison operand stays rejected -- a
+  comparison against the mask value would be silently wrong.
+  Gates: full meson suite 817/817 (fast 576 + EndToEnd 241,
+  independently re-run; the byte-diff regenerates identical from a
+  wiped Output dir); C build-sweep ratchet unchanged (45/47, the
+  two known heatshrink fails).
+  (test/Import/C/ctype-classifiers.c,
+  ctype-classifier-invalid.c; test/EndToEnd/ctype-classifiers.c)
   (test/Import/C/ctype-table-invalid.c; ledger needle mirrored in
   run_realworld.py)
 
