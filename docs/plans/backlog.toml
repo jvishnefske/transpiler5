@@ -153,10 +153,10 @@ anchor = "FR-124 DEFECT"
 id = "FR-129"
 rank = 12
 kind = "defect"
-status = "open"
+status = "spiked"
 size = "M"
 title = "ctype family unsupported under glibc; rejection names the mechanism, not the cause"
-summary = "Half (a) LANDED 2026-08-23: rejection names the table, ledger tags ctype-table (was other), strict+recover both pinned; nothing newly admitted. Half (b) OPEN -- the ASCII mapping must first settle C's locale-dependent semantics against the byte-diff oracle over the full unsigned char range."
+summary = "Half (a) LANDED 2026-08-23. Half (b) SPIKED GO, narrower: locale caveat dissolved by measurement (0 mismatches over 256 values + EOF), tolower/toupper split off (statement-expression wrapping a real call), admit in BOOLEAN CONTEXT ONLY so glibc mask values never enter emitted Rust. Ready to implement."
 blocked_by = []
 anchor = "FR-129 DEFECT"
 

@@ -8343,7 +8343,50 @@ piece and becomes FR-45.
   located rejection, exactly as before, only legible. Gates: full
   meson suite 814/814 (fast 574 + EndToEnd 240); C build-sweep
   ratchet unchanged.
-  HALF (b) REMAINS OPEN with its locale caveat intact.
+  **HALF (b) SPIKED 2026-08-23, verdict GO for a NARROWER subset
+  than this entry proposed; not yet implemented.** Three measured
+  findings reshape it:
+  (1) THE LOCALE CAVEAT DISSOLVES, measured not argued: over the
+  full `unsigned char` range in the C locale, glibc `isspace`
+  agrees with the fixed ASCII rule on all 256 values with ZERO
+  mismatches, and `isspace(EOF)` is 0 -- which the obvious Rust
+  image reproduces for free, since `-1 as u8` is 255 and no ASCII
+  predicate accepts it. Values outside `EOF`/`unsigned char` are UB
+  in C, so any behavior is conforming. A TU that calls `setlocale`
+  must still be fenced (the C locale is the guarantee this rests
+  on).
+  (2) `tolower`/`toupper` SPLIT OFF and stay fenced: they do NOT
+  expand to the clean table read the classifiers use. glibc wraps
+  them in a GNU statement-expression that branches on
+  `__builtin_constant_p` and CALLS THE REAL FUNCTION on the
+  non-constant arm -- a materially harder shape with a hosted call
+  inside it. Only the classifier family (`isspace`, `isalpha`,
+  `isdigit`, `isupper`, `islower`, `isalnum`, `ispunct`,
+  `isxdigit`, `isblank`, `iscntrl`, `isprint`, `isgraph`) has the
+  `(*__ctype_b_loc())[c] & MASK` shape. Masks are fixed glibc ABI,
+  read from the header and verified: space 8192, alpha 1024, digit
+  2048, upper 256, lower 512, alnum 8, punct 4, xdigit 4096, blank
+  1, cntrl 2, print 16384, graph 32768.
+  (3) ADMIT IN BOOLEAN CONTEXT ONLY -- the design decision that
+  keeps byte-identity free. C says only "nonzero if true"; glibc
+  returns the MASK, so a program that PRINTS `isspace(' ')` prints
+  8192, and any Rust image returning 1 would fail the byte-diff
+  oracle. Rather than bake glibc mask constants into emitted Rust,
+  admit the shape only where the exact nonzero value is
+  unobservable (`if`/`while`/`for` conditions, `!`, `&&`/`||`
+  operands, ternary conditions) and keep the located
+  `ctype-table` rejection everywhere else. This covers the measured
+  corpus usage exactly -- inih's `while (*s && isspace(...))` and
+  `if (isspace(c))` are all boolean-context.
+  ACCEPTANCE for the implementation: an EndToEnd byte-diff that
+  walks all 256 `unsigned char` values through every admitted
+  classifier and diffs against the clang-built native (the oracle
+  can be exhaustive here, so it should be); a `setlocale` fence
+  pinned located; non-boolean-context uses pinned still-rejected;
+  `tolower`/`toupper` pinned still-rejected with the half-(a)
+  wording; inih's `ini_lskip` PORTS (the honest corpus number
+  recorded, with `ini_rstrip` still blocked by its own
+  argument-side pointer comparison per FR-104).
   (test/Import/C/ctype-table-invalid.c; ledger needle mirrored in
   run_realworld.py)
 
