@@ -8324,7 +8324,28 @@ piece and becomes FR-45.
   larger than 3 and smaller than the whole ctype user set; inih's
   lskip/rstrip/find_chars_or_comment are the measured instances
   and inih sits at 1/10 function items. Half (a) is worth doing
-  regardless of (b). **NOT SPIKED.**
+  regardless of (b).
+  **HALF (a) LANDED 2026-08-23** (bisected, not spiked separately --
+  the bisection that found the cause is the evidence). The rejection
+  now names the table: `unsupported: locale ctype table lookup
+  through '__ctype_b_loc' (the <ctype.h> classifiers are macros over
+  a locale table)`, and the ledger tags it `ctype-table` instead of
+  burying it in `other`. Detection matches the three glibc accessor
+  names (`__ctype_b_loc`, `__ctype_tolower_loc`,
+  `__ctype_toupper_loc`) rather than a structural
+  call-returned-pointer rule: those names ARE the ABI, and a broader
+  rule would claim diagnostics it cannot explain. Verified on both
+  the hermetic AST shape and real glibc `isspace`. The pin needed
+  BOTH directions because the accessor's own declaration is rejected
+  first (a pointer return type), so the body wording is reachable
+  only under recovery -- strict stops at the declaration, and the
+  test pins each. Nothing is newly admitted: the read stays a
+  located rejection, exactly as before, only legible. Gates: full
+  meson suite 814/814 (fast 574 + EndToEnd 240); C build-sweep
+  ratchet unchanged.
+  HALF (b) REMAINS OPEN with its locale caveat intact.
+  (test/Import/C/ctype-table-invalid.c; ledger needle mirrored in
+  run_realworld.py)
 
 - [x] FR-128 DEFECT (found 2026-08-23 by the post-W2.25 external
   re-probe; REGRESSION introduced by W2.25, exposed at depth by

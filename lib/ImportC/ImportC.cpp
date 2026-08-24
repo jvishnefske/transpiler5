@@ -2998,6 +2998,35 @@ static std::string neBytesTypeName(IntegerType type) {
       .str();
 }
 
+// FR-129: the name of the glibc locale-table accessor `expr` reads through,
+// or empty when it reads through none. The `<ctype.h>` classifiers are
+// MACROS, not calls: `isspace(c)` expands to
+// `(*__ctype_b_loc())[(int)(c)] & _ISspace`, a subscript into the
+// dereference of a pointer a hosted extern function returned. That pointer
+// has no region the model tracks, so the read is unsupported — but the
+// generic pointer-cast wording lands on a source line whose text contains
+// no pointer and no cast, which is a diagnostic the reader cannot act on.
+// Callers use this to name the ctype table instead. Matching on the three
+// glibc accessor names is deliberate: they ARE the ABI (a program calling
+// them directly means the same thing), and nothing else in the model
+// reaches a call-returned pointer, so a broader shape rule would claim
+// diagnostics it cannot explain.
+static llvm::StringRef ctypeTableAccessorName(const clang::Expr *expr) {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e);
+      unary && unary->getOpcode() == clang::UO_Deref)
+    e = unary->getSubExpr()->IgnoreParenImpCasts();
+  const auto *call = llvm::dyn_cast<clang::CallExpr>(e);
+  const clang::FunctionDecl *callee = call ? call->getDirectCallee() : nullptr;
+  if (!callee || !callee->getDeclName().isIdentifier())
+    return {};
+  llvm::StringRef name = callee->getName();
+  if (name == "__ctype_b_loc" || name == "__ctype_tolower_loc" ||
+      name == "__ctype_toupper_loc")
+    return name;
+  return {};
+}
+
 FailureOr<Value> CImporter::emitWideByteLoad(const WideByteAccess &access,
                                              Location loc) {
   auto u8Type = IntegerType::get(builder.getContext(), 8,
@@ -3705,6 +3734,14 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
     default:
       break;
     }
+    // FR-129: name the ctype locale table before falling back to the
+    // mechanism wording — see ctypeTableAccessorName.
+    if (llvm::StringRef accessor =
+            ctypeTableAccessorName(cast->getSubExpr());
+        !accessor.empty())
+      return emitError(loc)
+             << "unsupported: locale ctype table lookup through '" << accessor
+             << "' (the <ctype.h> classifiers are macros over a locale table)";
     return emitError(loc) << "unsupported pointer cast ("
                           << cast->getCastKindName() << ")";
   }

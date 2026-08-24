@@ -132,6 +132,12 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
     // which is the same front. Previously tabulated [other].
     {llvm::StringLiteral("extern global variable"),
      llvm::StringLiteral("undefined-extern-global")},
+    // FR-129 half (a): glibc's <ctype.h> classifiers are macros over a
+    // locale table reached through __ctype_b_loc(); the read previously
+    // tabulated [other] behind the generic pointer-cast wording, which
+    // hid a ubiquitous C idiom inside the corpus's largest junk bucket.
+    {llvm::StringLiteral("locale ctype table lookup"),
+     llvm::StringLiteral("ctype-table")},
     // FR-113 admitted scoped enums; the RESIDUAL enum-definition gates
     // (keyword-named enums and enumerators, values outside i32, an empty
     // enum, a cross-TU shape conflict) previously tabulated [other]. The

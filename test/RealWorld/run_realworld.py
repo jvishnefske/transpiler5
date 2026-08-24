@@ -332,6 +332,10 @@ _BLOCKER_SUBSTRINGS = [
     # (stubbed at finalize); also catches the single-TU "without a
     # definition" spelling. Mirrors lib/ImportC/RejectionLedger.cpp.
     ("extern global variable", "undefined-extern-global"),
+    # FR-129 half (a): glibc's <ctype.h> classifiers are macros over a
+    # locale table reached through __ctype_b_loc(); previously [other].
+    # Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("locale ctype table lookup", "ctype-table"),
     # FR-113 admitted scoped enums; the residual enum-definition gates
     # (keyword names/enumerators, values outside i32, empty, cross-TU shape
     # conflict) previously tabulated [other].
