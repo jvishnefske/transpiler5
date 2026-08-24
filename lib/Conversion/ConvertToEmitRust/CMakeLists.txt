@@ -3,8 +3,14 @@
 # emitrust-range-refinement-check differentially re-derives integer ranges
 # across that pipeline, and emitrust-value-identity-check differentially
 # interprets both stages concretely (the lost-copy class).
+# FR-130: LoweringPipeline.cpp is the ONE definition of the pinned
+# import-to-emitrust pipeline both drivers run, so this library also links the
+# two stages that live outside it (MLIRLowerContainers and the FR-52
+# MLIREmitRustLowerExternalRequirements) plus the upstream mem2reg/canonicalize
+# (MLIRTransforms) and lift-cf-to-scf (MLIRControlFlowToSCF) passes it names.
 add_mlir_conversion_library(MLIRConvertToEmitRust
   ConvertToEmitRust.cpp
+  LoweringPipeline.cpp
   RangeRefinementCheck.cpp
   ValueIdentityCheck.cpp
 
@@ -20,6 +26,10 @@ add_mlir_conversion_library(MLIRConvertToEmitRust
   MLIRArithToEmitRust
   MLIRFuncToEmitRust
   MLIRSCFToEmitRust
+  MLIRLowerContainers
+  MLIREmitRustLowerExternalRequirements
+  MLIRControlFlowToSCF
+  MLIRTransforms
   MLIREmitRustDialect
   MLIRArithDialect
   MLIRControlFlowDialect

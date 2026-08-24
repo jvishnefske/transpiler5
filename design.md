@@ -8322,6 +8322,103 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-ns-case-fold-invalid.cpp,
   test/Driver/incremental-camelcase-namespace.cpp)
 
+- [ ] FR-130 SIMPLIFICATION ON EMITTED CODE (C and C++). Run standard
+  simplification algorithms somewhere in the path, for both language
+  tracks. Both tracks already share one path -- `lib/ImportC/` handles C
+  and C++ alike, language divergence ends at
+  `ClangProjectParser.cpp:153` (`-x c++ -std=c++17` vs `-std=c11`), and
+  everything downstream is one `ModuleOp` with no language flag -- so
+  anything landed here is shared BY CONSTRUCTION. The work is choosing
+  what and where, not doing it twice.
+  SPIKE (NO-GO on the obvious answer -- the four stock MLIR passes;
+  re-measured 2026-08-24 by splicing each into the hoisted pipeline
+  after the SCF lift and re-emitting all 221 emittable EndToEnd inputs,
+  22101 baseline lines):
+  | pass | files changed | net lines | verdict |
+  |---|---|---|---|
+  | `cse` | 47 | **+80** (+65 `let`) | WORSE |
+  | `sccp` | 17 | **0** | pure SSA renumber churn |
+  | `loop-invariant-code-motion` | 2 | +2 | noise |
+  | `remove-dead-values` | 8 | -909 | **SEGFAULTS on 5 inputs** |
+  The cause is architectural, not tuning: `computeInlineCandidates`
+  (TranslateToRust.cpp:2158) is a deliberate expression-RE-duplication
+  engine -- it collapses ~98% of measured bindings by rendering
+  single-use pure values inline at their consumer -- and its gate at
+  :2238 is `if (realUses.size() > 1) return;`. CSE merging two
+  single-use ops produces one two-use op, which falls OUT of the inline
+  set and materializes a `let` that did not exist before. Prepending CSE
+  to a backend whose defining transform is the inverse of CSE cannot be
+  net-positive except by accident. Two anchors, both reproduced:
+  on `test/RealWorld/Inputs/base64.c` a self-describing
+  `if v38 + 1i32 < 12i32` degrades into an opaque `if v42` plus
+  `let v41 = v38 + 1i32; let v42 = v41 < 12i32;`; on
+  `flexible-array-owned-typed-tail.c` CSE merges a value across the
+  `scf.while` boundary and a clean 4-line `while` becomes a 23-line
+  `loop { ... if !v13 { break } }`. `remove-dead-values` additionally
+  emits null-operand IR and crashes the driver (SIGSEGV) on
+  `value-exprs.c` plus FOUR C++ inputs (`cpp-exceptions.cpp`,
+  `cpp-exceptions-drop.cpp`, `cpp-template-nttp.cpp`,
+  `stl-variant.cpp`) -- the C++ track is where it is least safe -- and
+  it mutates signatures, colliding with the FR-40 item-graph symbol
+  contract, the FR-58 cross-TU shards and the FR-52 trait. `symbol-dce`
+  is refused separately: it inverts deliberate policy
+  (CrateEmitter.cpp:32 keeps rejected items' definitions under
+  `allow(dead_code)`) and would silently lower the FR-44 ported-item
+  score. Post-conversion canonicalization is refused too: the emitrust
+  dialect has 0 folders and 3 non-terminator `Pure` ops, and
+  `test/Dialect/EmitRust/canonicalize.mlir` exists to FORBID exactly the
+  DCE that marking ops `Pure` would enable. **Do not re-add these
+  passes on the theory that a stock simplifier must help.** The real
+  win is the same standard algorithm (dead-code elimination) applied at
+  the altitude where this project's simplification bank actually lives:
+  the emitter. Three increments:
+  (1) LANDED 2026-08-24 -- pipeline de-duplication, zero output change.
+  The pass pipeline was hand-copied into emitrust-cc and
+  emitrust-clang, and no test could see the difference between the two
+  copies. Hoisted into one `emitrust::buildLoweringPipeline`
+  (include/EmitRust/Conversion/LoweringPipeline.h), whose two optional
+  stages are the COMPLETE statement of how one driver may differ from
+  another. The audited difference is correct and is now explicit rather
+  than accidental: emitrust-clang leaves the FR-52 lowering off because
+  it imports with `deferExternals` (emitrust-clang.cpp:600), so its
+  unresolved externals are deliberately FR-58 link obligations and
+  resolving them per-shard would resolve them too early -- see FR-57a,
+  "defer takes precedence over the FR-52 trait policy". Also registered
+  as emitrust-opt's `--emitrust-lowering`, so the drivers' exact
+  pipeline is directly testable for the first time
+  (test/Conversion/lowering-pipeline.mlir pins every mandatory stage
+  AND that both optional stages default off). Byte-inert: full suite
+  818/818 with zero golden edits, EndToEnd 241/241.
+  (2) OPEN -- dead-binding elimination, the measured win. 113 bindings
+  across 38 EndToEnd files (34 C, 4 C++) that the emitter ALREADY knows
+  are never read -- that is why `claimName` (TranslateToRust.cpp:961)
+  `_`-prefixes them -- but cannot drop, because `computeDroppedOps`
+  (:2065) bails when `letHasEmittedAssign` is true: dropping the binding
+  would orphan its assigns (E0425). The new idea, and why it is OUTSIDE
+  the cross-iteration-liveness miscompile fence: do NOT extend dead-store
+  liveness into nested regions (that is the analysis CLAUDE.md fences
+  after three miscompiles). Instead use a STRONGER and cheaper fact the
+  emitter already computes -- if `valueIsRead(binding)` is false over the
+  whole function, the binding is never read anywhere on any path, so
+  every assign to it is trivially dead with no liveness reasoning at all.
+  This is the maximal form of the doctrine's "PROVES no read on any
+  path", not a relaxation of it. NOTE the plan's originally-specified
+  purity gate `isPureRenderedValue` (:4397) is INERT here and must not
+  be used: it returns true for anything outside `inlineExprs`, and
+  `computeDroppedOps` (:3918) runs BEFORE `computeInlineCandidates`
+  (:3919), so `inlineExprs` is empty at decision time. The silent-failure
+  direction (dropping an assign whose RHS has a side effect) therefore
+  needs a purpose-built gate and its own byte-diff leg;
+  `deny(unused_variables)` cannot help, because `claimName` already
+  `_`-prefixed these bindings and rustc is structurally blind to the
+  shape.
+  (3) OPEN, spike first, may be a NO-GO -- string-literal inlining. 17
+  `let vNN: &'static str = "..."` bindings exist because
+  `emitrust.literal` is outside `isPureProducer` (:1940). The doc
+  comment states that exclusion as a DECISION ("Calls, literals,
+  borrows, selects, and the global/cell accessors (FR-61d-2) stay
+  out"), so the spike's first job is to find out why before touching
+  it. A recorded NO-GO with the reason is a fine outcome.
 - [x] FR-129 DEFECT + FEATURE (found 2026-08-23 by bisecting the
   FR-104 re-probe residual; the FR-104 attribution it corrects is
   recorded in that entry): **the `<ctype.h>` family is unsupported

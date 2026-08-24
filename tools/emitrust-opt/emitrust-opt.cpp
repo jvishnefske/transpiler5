@@ -18,6 +18,10 @@
 int main(int argc, char **argv) {
   mlir::registerAllPasses();
   mlir::emitrust::registerEmitRustConversionPasses();
+  // FR-130: exposes the drivers' pinned pipeline as `--emitrust-lowering`, so
+  // lit can pin the pipeline itself rather than only its effect through a
+  // driver -- which is what makes the two drivers' shared definition testable.
+  mlir::emitrust::registerEmitRustLoweringPipeline();
 
   mlir::DialectRegistry registry;
   mlir::registerAllDialects(registry);

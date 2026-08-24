@@ -51,23 +51,29 @@ lib_lower_containers = static_library('MLIRLowerContainers',
   link_with: [libemitrust_dialect],
   dependencies: common_deps)
 
-lib_convert_to_emitrust = static_library('MLIRConvertToEmitRust',
-  'Conversion/ConvertToEmitRust/ConvertToEmitRust.cpp',
-  'Conversion/ConvertToEmitRust/RangeRefinementCheck.cpp',
-  'Conversion/ConvertToEmitRust/ValueIdentityCheck.cpp',
-  include_directories: emitrust_inc,
-  cpp_args: emitrust_cpp_args,
-  link_with: [lib_ub_to_emitrust, lib_arith_to_emitrust,
-              lib_func_to_emitrust, lib_scf_to_emitrust,
-              libemitrust_dialect],
-  dependencies: common_deps)
-
 lib_lower_external_requirements = static_library(
   'MLIREmitRustLowerExternalRequirements',
   'Conversion/LowerExternalRequirements/LowerExternalRequirements.cpp',
   include_directories: emitrust_inc,
   cpp_args: emitrust_cpp_args,
   link_with: [libemitrust_dialect],
+  dependencies: common_deps)
+
+# FR-130: LoweringPipeline.cpp names every stage of the pinned pipeline, so
+# this library now links the two stages that live outside it (lower-containers
+# and the FR-52 lowering). Neither depends on this library, so there is no
+# cycle -- but both must be DEFINED above this point for meson to see them.
+lib_convert_to_emitrust = static_library('MLIRConvertToEmitRust',
+  'Conversion/ConvertToEmitRust/ConvertToEmitRust.cpp',
+  'Conversion/ConvertToEmitRust/LoweringPipeline.cpp',
+  'Conversion/ConvertToEmitRust/RangeRefinementCheck.cpp',
+  'Conversion/ConvertToEmitRust/ValueIdentityCheck.cpp',
+  include_directories: emitrust_inc,
+  cpp_args: emitrust_cpp_args,
+  link_with: [lib_ub_to_emitrust, lib_arith_to_emitrust,
+              lib_func_to_emitrust, lib_scf_to_emitrust,
+              lib_lower_containers, lib_lower_external_requirements,
+              libemitrust_dialect],
   dependencies: common_deps)
 
 lib_actor_lift = static_library('MLIREmitRustActorLift',
