@@ -2730,13 +2730,69 @@ of references or inheritance, so it precedes both.
     test/EndToEnd/range-for.c (byte-diff: accumulator `+=`, array fill, step 2,
     `i <= n` while-fallback), test/Target/Rust/compound-assign-place.mlir (the
     place fold + its non-self-ref negative), test/Import/C/arrays.c goldens.
-    STILL OUT after 61f-4 -- see the MEASURED clause distribution in that
-    entry, which re-ranks this list: the `i = LO` assignment-form init
-    (BY FAR the dominant blocker), non-`int` inductions, bodies touching
-    pointers/floats/structs, bodies touching globals/statics, bodies
-    containing control flow, and descending (`.rev()`); plus a residual
-    +11 place-accumulator `needless_late_init` for NON-constant inits a
-    later late-init-merge fold could clean.
+    STILL OUT after 61f-5, re-measured on the POST-widening tree (338
+    distinct EndToEnd `for` statements): ~111 non-`int` induction (the NEW
+    dominant blocker -- mostly pointer-walking heads `for (p = head; p; p
+    = p->next)` and `unsigned`/`size_t`/`long` counters), ~68 body touches
+    pointer/float/struct, ~44 body touches a global/static, ~35 body has
+    control flow (any nested loop included), ~4 induction not dead after
+    the loop, ~2 non-`<`/`<=` condition. Descending (`.rev()`) also
+    remains. Note the dead-after analysis is NOT the limiting factor (4+3
+    rejections across both corpora) -- non-`int` inductions are, and that
+    needs the `AllTypesMatch` width story on `emitrust.for`, so it is a
+    design decision, not a widening. Plus a residual place-accumulator
+    `needless_late_init` for NON-constant inits a later late-init-merge
+    fold could clean.
+    LANDED 61f-5 (2026-08-24): the ASSIGNMENT-FORM init `for (i = LO; i <
+    HI; i += K)`, induction declared OUTSIDE the loop. Clause 1 accepted
+    only the DeclStmt form because an init-declared induction is
+    loop-scoped in C, so "nothing reads it after" held for free; Rust's
+    `for i in LO..HI` binds loop-scoped too, so the assignment form is
+    sound only when the induction is provably DEAD AFTER the loop. The
+    obligation is ONE-DIRECTIONAL and that shapes the whole design: a
+    wrong "dead" answer SILENTLY drops a value (no rustc diagnostic can
+    see it), a wrong "live" answer merely keeps today's `while` -- so the
+    analysis refuses by default. The exit value is deliberately NOT
+    written back: for step K it is LO + ceil((HI-LO)/K)*K, not HI, and it
+    is only defined if the loop ran to completion.
+    There is NO CFG or liveness facility in lib/ImportC/ (verified), so
+    the proof is a hand-rolled AST walk: `readsVar` (every DeclRefExpr is
+    a read EXCEPT the LHS of a plain `BO_Assign`, so `i++`/`i+=K`/`&i`/
+    `sizeof(i)` all count as reads), `effectOn` (Kill only for the two
+    shapes whose redefinition unconditionally dominates -- a bare `i = E;`
+    and a `for (i = E; ...)` init), and a sibling walk that is transparent
+    through if/switch, treats an enclosing loop as "any read anywhere
+    refuses" (it re-executes statements textually BEFORE the target), and
+    refuses outright on any unknown construct, on `NotFound`, and on ANY
+    goto/label/&&label in the function.
+    TWO DEFECTS were found by the spike and are part of the design, not
+    polish. (1) A MEASURED MISCOMPILE: stopping the sibling scan at a
+    `break`/`return` and concluding "dead" drops reads later in the same
+    compound. `for(i=0;i<n;i++){s+=i;} if(c){return s;} return s*100+i;`
+    printed 300 where clang printed 303 -- and THE CRATE COMPILED CLEAN,
+    so only the byte-diff oracle saw it. A control transfer must stop the
+    scan TRUSTING later kills while still counting later reads. (2) A
+    dominance error: `emitRangeFor` registered
+    `inductionValues[iv] = <region block arg>` and never unregistered it;
+    with the DeclStmt form the VarDecl died with the loop so the stale
+    entry was unreachable, but an outside-declared induction read after a
+    later kill picked up a value defined INSIDE the region ("operand does
+    not dominate this use"). Fixed by save/restore around the body, which
+    is correct rather than merely safe because the analysis guarantees
+    every post-loop read is dominated by an emitted redefinition.
+    MEASURED: EndToEnd `for .. in` 45 -> 76 (4 of the 31 are this entry's
+    own tests, so ~27 corpus-intrinsic), `while` 222 -> 196, lines 22368
+    -> 22342. c-testsuite 0 -> 12 `for .. in` on a corpus that had NONE
+    (it is C89-style throughout, so the assignment form is the only form
+    it uses). Cpp17Suite unchanged (no assignment-form `int` loops).
+    Full suite 822/822, EndToEnd 244/244 byte-diff, CTestSuite 220,
+    Cpp17Suite 35, ZERO golden edits -- all 8 changed emitted files are
+    EndToEnd byte-diff, each verified. Test:
+    test/EndToEnd/range-for-assign-init.c pins the lift, the read-after
+    refusal, the reuse-by-a-later-loop shape (the most common real one --
+    the second loop's `i = 0` is a Kill, not a read, so BOTH lift), the
+    `&i` refusal, and BOTH defect shapes; the miscompile leg was verified
+    to fail (102 vs 100) when the fix is reverted.
     LANDED 61f-4 (2026-08-24): the PARAMETER widening -- a range-eligible
     body may now read (and write) a plain integer-scalar parameter. The
     whitelist rejected every parameter via `!var->isLocalVarDecl()`
@@ -2776,9 +2832,13 @@ of references or inheritance, so it precedes both.
     `for(;;)` and ZERO past clause 1 -- it is C89-style throughout, so
     every body-side widening is provably worth 0 there. So this widening
     is worth +3 loops on EndToEnd and +1 on Cpp17Suite; the `i = LO`
-    assignment-form init is worth roughly ~270 across both corpora and is
-    the increment to rank first. Recorded so the next session does not
-    re-rank by intuition. Corpus: 39 -> 45 emitted `for .. in` (3 of the 6
+    assignment-form init looked like ~270 across both corpora and was
+    ranked first on that basis. CORRECTED by 61f-5, which measured it:
+    clause 1 was MASKING the later clauses, not gating them -- widening it
+    hands those loops to the body/induction clauses, which reject ~85% of
+    them. The real harvest was 38 loops, not ~270. The lesson is that a
+    rejection count for an EARLY clause is an upper bound and nothing
+    more; only widening it and re-measuring gives the true yield. Corpus: 39 -> 45 emitted `for .. in` (3 of the 6
     are this entry's own new tests), `while` 225 -> 222. Full suite
     821/821, EndToEnd 243/243 byte-diff, CTestSuite 220, Cpp17Suite 35,
     clippy 489 -> 490 and the +1 is NOT a regression: `range-for.c` is the

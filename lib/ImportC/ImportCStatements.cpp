@@ -4664,6 +4664,211 @@ void collectRefVars(const clang::Stmt *stmt,
     collectRefVars(child, out);
 }
 
+//===--------------------------------------------------------------------===//
+// FR-61f-5 SPIKE: assignment-form init (`for (i = LO; ...)`), guarded by an
+// AST "induction is dead after the loop" proof.
+//===--------------------------------------------------------------------===//
+
+/// Whether `stmt` READS `var`. Every `DeclRefExpr` to `var` counts as a read
+/// EXCEPT the LHS of a simple assignment `var = E` (a pure definition).
+/// `var++`, `var += K` and `&var` all count as reads, deliberately: the
+/// obligation is one-directional (a wrong "dead" answer silently drops a
+/// value), so anything not provably a pure definition is a read.
+bool readsVar(const clang::Stmt *stmt, const clang::VarDecl *var) {
+  if (!stmt)
+    return false;
+  if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(stmt))
+    if (bo->getOpcode() == clang::BO_Assign && isRefTo(bo->getLHS(), var))
+      return readsVar(bo->getRHS(), var);
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    return ref->getDecl() == var;
+  for (const clang::Stmt *child : stmt->children())
+    if (readsVar(child, var))
+      return true;
+  return false;
+}
+
+/// `readsVar` over `stmt` with the whole `skip` subtree excluded.
+bool readsVarOutside(const clang::Stmt *stmt, const clang::Stmt *skip,
+                     const clang::VarDecl *var) {
+  if (!stmt || stmt == skip)
+    return false;
+  if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(stmt))
+    if (bo->getOpcode() == clang::BO_Assign && isRefTo(bo->getLHS(), var))
+      return readsVarOutside(bo->getRHS(), skip, var);
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(stmt))
+    return ref->getDecl() == var;
+  for (const clang::Stmt *child : stmt->children())
+    if (readsVarOutside(child, skip, var))
+      return true;
+  return false;
+}
+
+/// Whether `needle` occurs anywhere in `stmt`.
+bool containsStmt(const clang::Stmt *stmt, const clang::Stmt *needle) {
+  if (!stmt)
+    return false;
+  if (stmt == needle)
+    return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (containsStmt(child, needle))
+      return true;
+  return false;
+}
+
+/// Any construct that can move control out of the straight-line sibling
+/// sequence. The sibling walk stops (conservatively, without concluding
+/// "dead") when it meets one, because a statement it skips may be the very
+/// redefinition the walk would otherwise have counted as a kill.
+bool transfersControl(const clang::Stmt *stmt) {
+  if (!stmt)
+    return false;
+  if (llvm::isa<clang::BreakStmt, clang::ContinueStmt, clang::ReturnStmt,
+                clang::GotoStmt, clang::IndirectGotoStmt>(stmt))
+    return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (transfersControl(child))
+      return true;
+  return false;
+}
+
+/// A `goto`, a label, or `&&label` anywhere in the function invalidates the
+/// syntactic "what runs after" argument entirely: refuse outright.
+bool containsJumpMachinery(const clang::Stmt *stmt) {
+  if (!stmt)
+    return false;
+  if (llvm::isa<clang::GotoStmt, clang::IndirectGotoStmt, clang::LabelStmt,
+                clang::AddrLabelExpr>(stmt))
+    return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (containsJumpMachinery(child))
+      return true;
+  return false;
+}
+
+/// The effect of executing `stmt` on `var`'s liveness at the point just
+/// before `stmt`. `Kill` means: on EVERY path through `stmt`, `var` is
+/// redefined before it is read -- only the two shapes whose redefinition
+/// unconditionally dominates the statement qualify, namely a bare
+/// `var = E;` and a `for (var = E; ...)` whose init runs exactly once,
+/// first, on entry.
+enum class VarEffect { Pass, Kill, Read };
+
+VarEffect effectOn(const clang::Stmt *stmt, const clang::VarDecl *var) {
+  if (!stmt)
+    return VarEffect::Pass;
+  const clang::Stmt *head = stmt;
+  if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt))
+    head = forStmt->getInit();
+  if (const auto *headExpr = llvm::dyn_cast_or_null<clang::Expr>(head))
+    if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(
+            headExpr->IgnoreParenImpCasts()))
+      if (bo->getOpcode() == clang::BO_Assign && isRefTo(bo->getLHS(), var) &&
+          !readsVar(bo->getRHS(), var))
+        return VarEffect::Kill;
+  return readsVar(stmt, var) ? VarEffect::Read : VarEffect::Pass;
+}
+
+/// Outcome of the walk that locates `target` in the function body and then
+/// inspects everything that can run after it.
+///   NotFound -- `target` is not in this subtree.
+///   Open     -- found, and nothing seen so far reads `var`; the enclosing
+///               scope must keep looking.
+///   Dead     -- found, and a redefinition of `var` dominates every later
+///               read: stop, the lift is safe.
+///   Refuse   -- found, and something that may run afterwards reads `var`
+///               (or the construct is not modelled).
+enum class DeadWalk { NotFound, Open, Dead, Refuse };
+
+DeadWalk walkAfter(const clang::Stmt *stmt, const clang::ForStmt *target,
+                   const clang::VarDecl *var) {
+  if (!stmt)
+    return DeadWalk::NotFound;
+  if (stmt == target)
+    return DeadWalk::Open;
+
+  if (const auto *comp = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {
+    for (auto it = comp->body_begin(), end = comp->body_end(); it != end;
+         ++it) {
+      DeadWalk inner = walkAfter(*it, target, var);
+      if (inner == DeadWalk::NotFound)
+        continue;
+      if (inner != DeadWalk::Open)
+        return inner;
+      // A `break`/`continue`/`return`/`goto` in a later sibling can skip the
+      // statements between it and the end of this compound, so a
+      // redefinition placed after it no longer dominates the reads that
+      // follow. Once one is seen, keep scanning for READS (they still refuse)
+      // but stop trusting KILLS. Abandoning the scan instead was the spike's
+      // measured miscompile: `for (i=0;i<n;i++){s+=i;} if (c) return s;
+      // return s*100+i;` lifted and printed 300 where clang printed 303.
+      bool killsUnreliable = false;
+      for (auto rest = std::next(it); rest != end; ++rest) {
+        VarEffect effect = effectOn(*rest, var);
+        if (effect == VarEffect::Read)
+          return DeadWalk::Refuse;
+        if (effect == VarEffect::Kill && !killsUnreliable)
+          return DeadWalk::Dead;
+        if (transfersControl(*rest))
+          killsUnreliable = true;
+      }
+      return DeadWalk::Open;
+    }
+    return DeadWalk::NotFound;
+  }
+
+  // Transparent: nothing inside the other arm / the condition runs after the
+  // target, so the enclosing compound's sibling walk is the whole story.
+  if (const auto *ifStmt = llvm::dyn_cast<clang::IfStmt>(stmt)) {
+    for (const clang::Stmt *arm : {ifStmt->getThen(), ifStmt->getElse()}) {
+      DeadWalk inner = walkAfter(arm, target, var);
+      if (inner != DeadWalk::NotFound)
+        return inner;
+    }
+    return containsStmt(ifStmt, target) ? DeadWalk::Refuse
+                                        : DeadWalk::NotFound;
+  }
+  if (const auto *sw = llvm::dyn_cast<clang::SwitchStmt>(stmt)) {
+    DeadWalk inner = walkAfter(sw->getBody(), target, var);
+    if (inner != DeadWalk::NotFound)
+      return inner;
+    return containsStmt(sw, target) ? DeadWalk::Refuse : DeadWalk::NotFound;
+  }
+  if (const auto *caseStmt = llvm::dyn_cast<clang::SwitchCase>(stmt)) {
+    DeadWalk inner = walkAfter(caseStmt->getSubStmt(), target, var);
+    if (inner != DeadWalk::NotFound)
+      return inner;
+    return DeadWalk::NotFound;
+  }
+
+  // An ENCLOSING loop re-runs everything it contains, so every read of `var`
+  // anywhere in it (outside the target) happens after the target on some
+  // path. No kill reasoning applies here -- a kill that precedes the target
+  // in program order does not kill the value the target leaves behind.
+  if (llvm::isa<clang::ForStmt, clang::WhileStmt, clang::DoStmt,
+                clang::CXXForRangeStmt>(stmt)) {
+    if (!containsStmt(stmt, target))
+      return DeadWalk::NotFound;
+    if (readsVarOutside(stmt, target, var))
+      return DeadWalk::Refuse;
+    return DeadWalk::Open;
+  }
+
+  // Anything else that contains the target is not modelled: refuse.
+  return containsStmt(stmt, target) ? DeadWalk::Refuse : DeadWalk::NotFound;
+}
+
+/// Clause 6 for the assignment form: `var` is provably never read again once
+/// `target` exits. Refuses by default on everything it cannot prove.
+bool inductionDeadAfter(const clang::Stmt *funcBody,
+                        const clang::ForStmt *target,
+                        const clang::VarDecl *var) {
+  if (!funcBody || containsJumpMachinery(funcBody))
+    return false;
+  DeadWalk result = walkAfter(funcBody, target, var);
+  return result == DeadWalk::Dead || result == DeadWalk::Open;
+}
+
 /// Whether emitting `stmt` would create cf basic blocks in the function
 /// region (nested control flow, short-circuit `&&`/`||`, `?:`, statement
 /// expressions) or install a loop exit/jump edge (`break`/`continue`/`goto`/
@@ -4692,6 +4897,7 @@ bool blocksRangeForLift(const clang::Stmt *stmt) {
 
 } // namespace
 
+
 std::optional<RangeFor>
 CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   const clang::Stmt *init = stmt->getInit();
@@ -4701,23 +4907,52 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   if (!init || !cond || !inc || !body)
     return std::nullopt;
 
-  // Clause 1 (+6): the init declares the induction `int i = LO;`. Only the
-  // DeclStmt form is accepted in v1 -- an init-declared `i` is loop-scoped in
-  // C, so it cannot be referenced after the loop and clause 6 (no escape)
-  // holds for free. The assignment form `i = LO;` (i declared outside) could
-  // escape and falls back to the CFG `while`.
-  const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(init);
-  if (!declStmt || !declStmt->isSingleDecl())
+  // Clause 1 (+6): the init supplies the induction and LO. Two forms:
+  //   (a) the DeclStmt form `int i = LO;` -- `i` is loop-scoped in C, so it
+  //       cannot be referenced after the loop and clause 6 holds for free.
+  //   (b) FR-61f-5, the assignment form `i = LO;` with `i` declared outside.
+  //       `for i in LO..HI` binds `i` LOOP-SCOPED in Rust, so this form is
+  //       behaviour-neutral only when `i` is provably never read again after
+  //       the loop; `inductionDeadAfter` proves that or refuses.
+  const clang::VarDecl *iv = nullptr;
+  const clang::Expr *lo = nullptr;
+  if (const auto *declStmt = llvm::dyn_cast<clang::DeclStmt>(init)) {
+    if (!declStmt->isSingleDecl())
+      return std::nullopt;
+    iv = llvm::dyn_cast<clang::VarDecl>(declStmt->getSingleDecl());
+    if (!iv || !iv->isLocalVarDecl())
+      return std::nullopt;
+    lo = iv->getInit();
+  } else if (const auto *initExpr = llvm::dyn_cast<clang::Expr>(init)) {
+    const auto *assign = llvm::dyn_cast<clang::BinaryOperator>(
+        initExpr->IgnoreParenImpCasts());
+    if (!assign || assign->getOpcode() != clang::BO_Assign)
+      return std::nullopt;
+    const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+        assign->getLHS()->IgnoreParenImpCasts());
+    if (!ref)
+      return std::nullopt;
+    iv = llvm::dyn_cast<clang::VarDecl>(ref->getDecl());
+    // Automatic-storage local only: a global, a function-local `static` and
+    // a parameter all fail one of these two and keep the `while` lowering.
+    if (!iv || !iv->isLocalVarDecl() || !iv->hasLocalStorage())
+      return std::nullopt;
+    lo = assign->getRHS();
+    // LO must not read the induction: `emitRangeFor` evaluates LO before the
+    // loop, where a stale `inductionValues` entry from an earlier lifted
+    // loop over the same decl would otherwise be consulted.
+    if (readsVar(lo, iv))
+      return std::nullopt;
+    if (!inductionDeadAfter(currentFunctionBody, stmt, iv))
+      return std::nullopt;
+  } else {
     return std::nullopt;
-  const auto *iv = llvm::dyn_cast<clang::VarDecl>(declStmt->getSingleDecl());
-  if (!iv || !iv->isLocalVarDecl())
-    return std::nullopt;
+  }
   // The induction must be exactly `int` (i32): this guarantees the bounds and
   // step share the ForOp's single operand type (AllTypesMatch) with no width
   // juggling.
   if (iv->getType().getCanonicalType() != astContext().IntTy)
     return std::nullopt;
-  const clang::Expr *lo = iv->getInit();
   if (!lo)
     return std::nullopt;
 
@@ -4858,10 +5093,27 @@ LogicalResult CImporter::emitRangeFor(const RangeFor &range,
   // store, no redundant `let i` binding. `emitRValue`'s scalar-read entry
   // consults `inductionValues` before the ordinary place path. The entry
   // stays registered while a nested loop body emits (a nested body may read
-  // this induction) and is cleared per function.
+  // this induction) and is RESTORED on the way out.
+  //
+  // FR-61f-5: the restore is load-bearing for the assignment form, where the
+  // same `VarDecl` outlives the loop. The matcher proves the induction is
+  // dead after the loop, which means every later read is dominated by a
+  // redefinition (`i = 0; while (i < n) ...`) -- and that redefinition
+  // stores to the variable's PLACE. Leaving the block argument mapped made
+  // those reads pick up the region-local SSA value instead; the spike hit
+  // exactly that as `error: operand #0 does not dominate this use`.
+  std::optional<Value> savedInduction;
+  if (auto existing = inductionValues.find(range.iv);
+      existing != inductionValues.end())
+    savedInduction = existing->second;
   inductionValues[range.iv] = bodyBlock->getArgument(0);
 
-  if (failed(emitStmt(stmt->getBody())))
+  LogicalResult bodyResult = emitStmt(stmt->getBody());
+  if (savedInduction)
+    inductionValues[range.iv] = *savedInduction;
+  else
+    inductionValues.erase(range.iv);
+  if (failed(bodyResult))
     return failure();
 
   if (!isTerminated(builder.getInsertionBlock()))
