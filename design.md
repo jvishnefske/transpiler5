@@ -8322,7 +8322,7 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-ns-case-fold-invalid.cpp,
   test/Driver/incremental-camelcase-namespace.cpp)
 
-- [ ] FR-130 SIMPLIFICATION ON EMITTED CODE (C and C++). Run standard
+- [x] FR-130 SIMPLIFICATION ON EMITTED CODE (C and C++). Run standard
   simplification algorithms somewhere in the path, for both language
   tracks. Both tracks already share one path -- `lib/ImportC/` handles C
   and C++ alike, language divergence ends at
@@ -8389,7 +8389,8 @@ piece and becomes FR-45.
   (test/Conversion/lowering-pipeline.mlir pins every mandatory stage
   AND that both optional stages default off). Byte-inert: full suite
   818/818 with zero golden edits, EndToEnd 241/241.
-  (2) OPEN -- dead-binding elimination, the measured win. 113 bindings
+  (2) LANDED 2026-08-24 -- dead-binding elimination, the measured win.
+  113 bindings
   across 38 EndToEnd files (34 C, 4 C++) that the emitter ALREADY knows
   are never read -- that is why `claimName` (TranslateToRust.cpp:961)
   `_`-prefixes them -- but cannot drop, because `computeDroppedOps`
@@ -8412,13 +8413,54 @@ piece and becomes FR-45.
   `deny(unused_variables)` cannot help, because `claimName` already
   `_`-prefixed these bindings and rustc is structurally blind to the
   shape.
-  (3) OPEN, spike first, may be a NO-GO -- string-literal inlining. 17
-  `let vNN: &'static str = "..."` bindings exist because
-  `emitrust.literal` is outside `isPureProducer` (:1940). The doc
-  comment states that exclusion as a DECISION ("Calls, literals,
-  borrows, selects, and the global/cell accessors (FR-61d-2) stay
-  out"), so the spike's first job is to find out why before touching
-  it. A recorded NO-GO with the reason is a fine outcome.
+  IMPLEMENTED as `isEffectFreeDropCandidate` +
+  `collectDroppableBindingWrites`: refuse-by-default (a write's value must
+  be a block argument or an effect-free producer), the binding's own
+  INITIALIZER gated identically because it vanishes with the `let`, any
+  non-whole-binding user (a place projection) refusing outright, and one
+  refusing write keeping the WHOLE binding -- no partial drops. The
+  dropped writes are recorded in the EXISTING `deadStores` set, which
+  already means "this assign emits nothing" and which all nine
+  consumption sites already consult (:1153, :1326, :1534, :1811, :2208,
+  :2260, :2518, :4349, :4512); a parallel set would have to be threaded
+  through all nine and would silently miscompile at any site that missed
+  one. Insertion is safe there because every `deadStores` PRODUCER runs
+  before `computeDroppedOps`. `computeDroppedOps` became a monotone
+  fixpoint sweep: dropping a binding also deletes writes whose RHS sits
+  LATER in program order than the `let`, which the single reverse sweep
+  had already passed. The `deferredInits` bail is KEPT and is
+  load-bearing -- the spike found the one silent-miscompile shape, an
+  if-expression binding whose arms carry calls, and `ifExprBindings` is a
+  subset of `deferredInits` by construction, so that one clause contains
+  the whole hazard. MEASURED: 113 -> 0 never-read `let mut _v` bindings
+  (C 96 -> 0, C++ 17 -> 0) across 38 files; emitted corpus 22101 -> 21835
+  lines (-266) over the fixed 221-file set, every one of the 38 changed
+  files smaller. The purity gate is DEFENSIVE, not load-bearing today: 0
+  of 151 corpus assign RHS are impure (108 SSA names, 43 constants).
+  Full suite 820/820, EndToEnd 242/242 byte-diff, CTestSuite 220,
+  Cpp17Suite 35, clippy 489 -> 489 (flat). One golden moved and it was
+  NOT a rubber-stamp: test/Target/Rust/statements.mlir's `@bindings` had
+  every binding dead, so FR-130 dropped the whole body and cascaded the
+  PARAMETER to `_v0` -- correct, but it erased the very `let mut` +
+  plain-assign rendering the file exists to pin, so `@bindings_live` was
+  added to carry that FR-6 trio on a binding that IS read. Tests:
+  test/Target/Rust/dead-binding.mlir (the win plus THREE refusal legs --
+  impure write, impure initializer, W2.17 has_drop destructor),
+  test/EndToEnd/dead-binding-impure-rhs.c (byte-diff leg for the silent
+  direction: a Duff's-device switch whose carried writes take `bump()`
+  call results, with an observable side-effect accumulator).
+  (3) NOT PURSUED (parked 2026-08-24, never spiked) -- string-literal
+  inlining. 29 `let vNN: &'static str = "..."` bindings exist because
+  `emitrust.literal` is outside `isPureProducer` (:1940), and that
+  exclusion is stated as a DECISION ("Calls, literals, borrows, selects,
+  and the global/cell accessors (FR-61d-2) stay out"), so a spike would
+  have had to establish whether it is load-bearing before touching it.
+  Parked deliberately: measuring the emitted corpus for THIS entry
+  surfaced a far larger and more visible simplification gap in the same
+  output -- only 39 of 332 corpus C `for` statements (~12%) reach a Rust
+  `for .. in`, the rest falling back to `while` -- which is FR-61f's
+  recorded remainder, not a new FR. The 29 literal bindings are not worth
+  a wave while that is open. Re-open under FR-61d if it ever matters.
 - [x] FR-129 DEFECT + FEATURE (found 2026-08-23 by bisecting the
   FR-104 re-probe residual; the FR-104 attribution it corrects is
   recorded in that entry): **the `<ctype.h>` family is unsupported

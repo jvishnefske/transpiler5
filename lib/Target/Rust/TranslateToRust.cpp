@@ -849,6 +849,27 @@ private:
   /// `computeInlineCandidates`.
   void computeDroppedOps(emitrust::FuncOp funcOp);
 
+  /// FR-130: whether `value` renders without performing any side effect, so
+  /// deleting the statement that carries it deletes no effect. Purpose-built
+  /// and REFUSE-BY-DEFAULT: a bare name (block argument) and the effect-free
+  /// producers pass, everything else -- calls above all -- refuses.
+  ///
+  /// `isPureRenderedValue` is deliberately NOT reused here: it is keyed on
+  /// `inlineExprs`, which `computeInlineCandidates` fills only AFTER
+  /// `computeDroppedOps` has run, so at this point it would answer `true`
+  /// unconditionally and gate nothing.
+  bool isEffectFreeDropCandidate(Value value) const;
+
+  /// FR-130 increment 2: collects into `writes` every `emitrust.assign` that
+  /// would have to be deleted along with the never-read binding `letOp`, and
+  /// answers whether deleting them is provably effect-free. Refuses -- and
+  /// then NOTHING is dropped for this binding, no partial drops -- when the
+  /// initializer or any write carries a value that is not effect-free, or
+  /// when the binding has a surviving use that is not a whole-binding write
+  /// (a place projection, say: dropping the `let` under it would be E0425).
+  bool collectDroppableBindingWrites(emitrust::LetOp letOp,
+                                     SmallVectorImpl<Operation *> &writes);
+
   /// Fills `inlinedOps` for the current function. Must run AFTER
   /// `tailFoldCandidate` is selected (the candidate itself is excluded)
   /// and after `computeDroppedOps` (dropped consumers are not real uses).
@@ -2046,6 +2067,50 @@ inlineConstantTextLength(emitrust::ConstantOp constant) {
   return std::nullopt;
 }
 
+bool RustEmitter::isEffectFreeDropCandidate(Value value) const {
+  Operation *def = value.getDefiningOp();
+  // A block argument (parameter, loop-carried value) renders as a bare name:
+  // reading it costs nothing and deleting the read deletes nothing.
+  if (!def)
+    return true;
+  // The pure-producer set is exactly "renders one side-effect-free
+  // `let <name> = <rhs>;`" -- constants, arithmetic, casts, scalar compares,
+  // loads, nested lets. Calls, borrows, selects and the cell accessors are
+  // deliberately outside it.
+  if (isPureProducer(def))
+    return true;
+  // Two more effect-free renderings that predate the pure set: a global read
+  // and a literal (both are FR-61d-2 inline candidates, never statements).
+  return isa<emitrust::GlobalLoadOp, emitrust::LiteralOp>(def);
+}
+
+bool RustEmitter::collectDroppableBindingWrites(
+    emitrust::LetOp letOp, SmallVectorImpl<Operation *> &writes) {
+  Value result = letOp.getResult();
+  // The initializer disappears with the `let`, so it is gated exactly like a
+  // write.
+  if (!isEffectFreeDropCandidate(letOp.getInit()))
+    return false;
+  for (OpOperand &use : result.getUses()) {
+    Operation *owner = use.getOwner();
+    // Uses that already emit nothing need no handling: they are not going to
+    // be orphaned by dropping the binding.
+    if (unreachableOps.count(owner) || deadStores.count(owner) ||
+        droppedOps.count(owner) || isVacuousAssert(owner))
+      continue;
+    // Refuse-by-default on the USE side too: only a whole-binding write is a
+    // shape we know how to delete. A place projection (`v.x = ..`, `v[i]`) is
+    // NOT a read by `valueIsRead`'s reckoning, yet it renders the binding's
+    // name -- dropping the `let` under one would be a hard E0425.
+    if (!isBindingWrite(owner, result))
+      return false;
+    if (!isEffectFreeDropCandidate(cast<emitrust::AssignOp>(owner).getValue()))
+      return false;
+    writes.push_back(owner);
+  }
+  return true;
+}
+
 void RustEmitter::computeDroppedOps(emitrust::FuncOp funcOp) {
   // Reverse program order: users always render after their defs (nested
   // users belong to later parent ops), so one reverse sweep sees every
@@ -2053,31 +2118,76 @@ void RustEmitter::computeDroppedOps(emitrust::FuncOp funcOp) {
   // single pass. The default post-order walk visits nested ops before
   // their parent; reversed, parents come first, which still keeps every
   // user ahead of its def.
+  //
+  // FR-130 broke the single-pass property in ONE direction: dropping a
+  // never-read binding also deletes its WRITES, and a write's right-hand
+  // side sits LATER in program order than the `let` (so the reverse sweep
+  // already passed it). Re-sweep while anything changed. The sets only ever
+  // grow -- an op never leaves `droppedOps`/`deadStores` -- so the fixpoint
+  // is monotone and terminates; in practice one extra confirming sweep is
+  // all it costs.
   SmallVector<Operation *> ops;
   funcOp->walk([&](Operation *op) { ops.push_back(op); });
-  for (Operation *op : llvm::reverse(ops)) {
-    if (op->getNumResults() != 1 || !isPureProducer(op))
-      continue;
-    if (unreachableOps.count(op))
-      continue; // already never emitted; dropping would double-count
-    if (auto letOp = dyn_cast<emitrust::LetOp>(op)) {
-      // A mutable or deferred `let` has assignments; dropping the binding
-      // would orphan them (E0425). Only the plain alias form can drop.
-      if (letOp.getIsMut() || deferredInits.count(op) ||
-          letHasEmittedAssign(letOp.getResult()))
+  bool changed = true;
+  while (changed) {
+    changed = false;
+    for (Operation *op : llvm::reverse(ops)) {
+      if (op->getNumResults() != 1 || !isPureProducer(op))
         continue;
-      // W2.17: a destructor-carrying binding is observable even when never
-      // read -- dropping it deletes the destructor's side effects.
-      if (bindingHasDrop(letOp.getResult()))
-        continue;
-    }
-    // `valueIsRead` (with the droppedOps guard active) is the proof of "no
-    // emitted read". The cache is cleared each round because every new drop
-    // can un-read further values upstream.
-    valueReadCache.clear();
-    if (!valueIsRead(op->getResult(0))) {
-      droppedOps.insert(op);
-      ++dropCount;
+      if (droppedOps.count(op))
+        continue; // decided on an earlier sweep
+      if (unreachableOps.count(op))
+        continue; // already never emitted; dropping would double-count
+      // FR-130: the whole-binding writes that must be deleted along with a
+      // never-read `let`. Empty for every other droppable op.
+      SmallVector<Operation *> deadBindingWrites;
+      if (auto letOp = dyn_cast<emitrust::LetOp>(op)) {
+        // W2.17: a destructor-carrying binding is observable even when never
+        // read -- dropping it deletes the destructor's side effects.
+        if (bindingHasDrop(letOp.getResult()))
+          continue;
+        // A deferred `let` renders its declaration and its initializing write
+        // at two different program points; joint elimination of that shape is
+        // out of scope here.
+        if (deferredInits.count(op))
+          continue;
+        if (letOp.getIsMut() || letHasEmittedAssign(letOp.getResult())) {
+          // FR-130 increment 2 (dead-binding elimination): a binding with
+          // assignments used to be undroppable outright, because dropping it
+          // alone would orphan them (E0425). Drop them TOGETHER instead. This
+          // is not the forbidden cross-iteration dead-store reasoning and
+          // computes no liveness at all: `valueIsRead` classifies an assignment
+          // DESTINATION as a write and never as a read, so the `!valueIsRead`
+          // proof below means the binding is read on NO path in NO region --
+          // every write to it is trivially dead. The only real risk is deleting
+          // an EFFECT along with a write, which the refuse-by-default purity
+          // gate in `collectDroppableBindingWrites` rules out; one refusing
+          // write keeps the entire binding (no partial drops).
+          if (!collectDroppableBindingWrites(letOp, deadBindingWrites))
+            continue;
+        }
+      }
+      // `valueIsRead` (with the droppedOps guard active) is the proof of "no
+      // emitted read". The cache is cleared each round because every new drop
+      // can un-read further values upstream.
+      valueReadCache.clear();
+      if (!valueIsRead(op->getResult(0))) {
+        droppedOps.insert(op);
+        ++dropCount;
+        // The joint-dropped writes are recorded in `deadStores`, which means
+        // exactly "this assign emits nothing" and which all nine consumption
+        // sites already consult (valueIsRead, lvalueIsMutated, the path-liveness
+        // scan, the FR-105 loop extension, computeInlineCandidates' real-use
+        // count and its barrier scan, computeFieldInitFuses, letHasEmittedAssign
+        // and emitAssign). A parallel set would have to be threaded through all
+        // nine and would silently miscompile at any site that missed it.
+        // Extending the set HERE is safe: every `deadStores` producer
+        // (`computeDeadStores` and its loop-body extension) has already run, so
+        // a late insertion cannot invalidate an earlier producer's decision.
+        for (Operation *write : deadBindingWrites)
+          deadStores.insert(write);
+        changed = true;
+      }
     }
   }
   // Later phases (naming, mut/`_` decisions) must see read-ness with the

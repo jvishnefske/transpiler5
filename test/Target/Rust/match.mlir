@@ -79,19 +79,19 @@ emitrust.func @usize_match(%arg0: index) {
 
 // Nested statements inside arms: an if and assignments in a case, multiple
 // statements in the default arm, and an empty default arm elsewhere.
-// FR-61d: the single-use constants inline into the binding and the arm
-// assignments (with literal suffixes, consuming v2/v4/v5 as numbering
-// gaps); the unused arm constant drops.
+// FR-130: nothing in this function is ever READ, so the arm assignments'
+// destination binding drops together with every write to it, and the
+// constants those writes carried cascade away behind them (the fixpoint
+// sweep: a write's right-hand side sits after the `let` in program order).
+// The match arms are left empty -- the structure stays, only the dead
+// bindings go.
 // CHECK-LABEL: fn nested_match(v0: i32, v1: bool) {
-// CHECK-NEXT:    let mut _v3: i32 = 0i32;
 // CHECK-NEXT:    match v0 {
 // CHECK-NEXT:        1 => {
 // CHECK-NEXT:            if v1 {
-// CHECK-NEXT:                _v3 = 5i32;
 // CHECK-NEXT:            }
 // CHECK-NEXT:        }
 // CHECK-NEXT:        _ => {
-// CHECK-NEXT:            _v3 = 7i32;
 // CHECK-NEXT:        }
 // CHECK-NEXT:    }
 // CHECK-NEXT:    match v0 {
