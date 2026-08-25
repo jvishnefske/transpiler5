@@ -4776,8 +4776,13 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   //   - the induction (materialized by emitRangeFor itself);
   //   - an automatic integer local (placed);
   //   - an automatic integer-element array (already an `emitrust` place).
-  // Everything else -- parameters (memref cells), decomposed pointers (i64
-  // cursor cells), globals/statics, floats, structs -- rejects to the CFG
+  //   - an integer-scalar PARAMETER (FR-61f B1): `bindOrdinaryParam` would
+  //     otherwise give a plain signed scalar an un-promotable cell, so
+  //     `collectRangeForPlaceScalars` marks it too and the parameter
+  //     materializes as an `emitrust.variable` place (the unsigned and
+  //     address-taken parameter classes already took that branch).
+  // Everything else -- decomposed pointers (i64 cursor cells),
+  // globals/statics, floats, structs -- rejects to the CFG
   // `while` lowering. Deliberately narrow: a green suite with partial
   // coverage beats a broad matcher that miscompiles.
   llvm::SmallPtrSet<const clang::VarDecl *, 8> bodyVars;
@@ -4785,7 +4790,9 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   for (const clang::VarDecl *var : bodyVars) {
     if (var == iv)
       continue;
-    if (!var->isLocalVarDecl() || !var->hasLocalStorage())
+    // Automatic storage duration: locals and parameters, never a global or
+    // a function-local `static` (both fail hasLocalStorage()).
+    if (!var->hasLocalStorage())
       return std::nullopt;
     clang::QualType varType = var->getType().getCanonicalType();
     if (varType->isIntegerType())
@@ -4870,12 +4877,14 @@ void CImporter::collectRangeForPlaceScalars(const clang::Stmt *stmt) {
       llvm::SmallPtrSet<const clang::VarDecl *, 8> refs;
       collectRefVars(forStmt->getBody(), refs);
       for (const clang::VarDecl *var : refs) {
-        // The induction is materialized by `emitRangeFor` itself; params are
-        // SSA block args and globals are already places -- only body-local
-        // integer scalars would otherwise take the un-promotable
-        // `memref.alloca` cell path.
-        if (var == range->iv || !var->isLocalVarDecl() ||
-            !var->hasLocalStorage() || !var->getType()->isIntegerType())
+        // The induction is materialized by `emitRangeFor` itself and globals
+        // are already places. Everything else with automatic storage --
+        // body-local integer scalars AND plain integer-scalar PARAMETERS
+        // (which `bindOrdinaryParam` binds to a `memref.alloca` cell, not to
+        // the raw block arg) -- would otherwise take the un-promotable cell
+        // path inside the single-block region.
+        if (var == range->iv || !var->hasLocalStorage() ||
+            !var->getType()->isIntegerType())
           continue;
         placeBackedScalars.insert(var);
       }

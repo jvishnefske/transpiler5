@@ -1670,7 +1670,11 @@ LogicalResult CImporter::bindLiftedCaptureValue(const clang::VarDecl *var,
   // address-taken captures copy into a named `emitrust.variable` shadow
   // (a memref cell of either would break mem2reg — see bindOrdinaryParam);
   // plain signed/float scalars take a promotable rank-0 cell.
-  if (isUnsignedInt(type) || addressTaken.contains(var)) {
+  // FR-61f B1: a capture a range-eligible `for` body touches must be a place
+  // too -- its cell would land inside the single-block region and
+  // `convert-to-emitrust` rejects the leftover alloca.
+  if (isUnsignedInt(type) || addressTaken.contains(var) ||
+      placeBackedScalars.contains(var)) {
     Value place = builder
                       .create<emitrust::VariableOp>(
                           loc, emitrust::LValueType::get(type),
@@ -1730,7 +1734,8 @@ LogicalResult CImporter::bindOrdinaryParam(const clang::ParmVarDecl *param,
   }
   if (llvm::isa<emitrust::StructType, emitrust::EnumType,
                 emitrust::FnPtrType, emitrust::OpaqueType>(type) ||
-      isUnsignedInt(type) || addressTaken.contains(param)) {
+      isUnsignedInt(type) || addressTaken.contains(param) ||
+      placeBackedScalars.contains(param)) {
     // By-value struct, enum, function pointer, opaque (FR-88's
     // `Option<&[u8]>` nullable byte-slice parameter), or unsigned
     // scalar, or an address-taken scalar: copy into a Rust variable

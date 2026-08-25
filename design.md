@@ -2730,10 +2730,73 @@ of references or inheritance, so it precedes both.
     test/EndToEnd/range-for.c (byte-diff: accumulator `+=`, array fill, step 2,
     `i <= n` while-fallback), test/Target/Rust/compound-assign-place.mlir (the
     place fold + its non-self-ref negative), test/Import/C/arrays.c goldens.
-    STILL OUT (future widening): descending (`.rev()`), the
-    `i = LO` assignment-form init, and bodies touching params/pointers (place
-    those too); plus a residual +11 place-accumulator `needless_late_init` for
-    NON-constant inits a later late-init-merge fold could clean.
+    STILL OUT after 61f-4 -- see the MEASURED clause distribution in that
+    entry, which re-ranks this list: the `i = LO` assignment-form init
+    (BY FAR the dominant blocker), non-`int` inductions, bodies touching
+    pointers/floats/structs, bodies touching globals/statics, bodies
+    containing control flow, and descending (`.rev()`); plus a residual
+    +11 place-accumulator `needless_late_init` for NON-constant inits a
+    later late-init-merge fold could clean.
+    LANDED 61f-4 (2026-08-24): the PARAMETER widening -- a range-eligible
+    body may now read (and write) a plain integer-scalar parameter. The
+    whitelist rejected every parameter via `!var->isLocalVarDecl()`
+    (`ParmVarDecl::isLocalVarDecl()` is false), and the reason was real,
+    not caution: `bindOrdinaryParam` binds a plain signed scalar to a
+    `memref.alloca` cell, mem2reg cannot promote a cell whose load lives
+    inside the single-block `emitrust.for` region, and
+    `convert-to-emitrust` then rejects the leftover alloca. Fix mirrors
+    the existing local-var precedent exactly: `collectRangeForPlaceScalars`
+    marks such parameters into `placeBackedScalars` and the binder routes
+    them to the `emitrust.variable` place branch that the unsigned,
+    address-taken, struct, enum and fn-ptr parameter classes ALREADY took
+    -- so the newly-admitted class is the only behaviour change, and the
+    gate becomes plain `hasLocalStorage()` (globals and function-local
+    `static`s still reject, and are still the same class as before).
+    A FOURTH binder had to change and it was NOT obvious:
+    `bindLiftedCaptureValue` (the C++ by-value lambda capture) is a third
+    cell producer, and the hazard was LATENT at HEAD -- a lambda's own
+    parameter rejected the loop first, so a capture's cell could never
+    reach a region. Admitting parameters removes that shield, and without
+    the same `placeBackedScalars` consultation a previously-transpiling
+    lambda fails with `failed to legalize operation 'memref.alloca'`.
+    That is the SAFE direction (a located hard error, never a
+    miscompile), but it is a regression against accepted C++, so it ships
+    here with its own byte-diff leg. The three cell producers
+    (`emitLocalVar`, `bindOrdinaryParam`, `bindLiftedCaptureValue`) are
+    now audited to all consult the set.
+    MEASURED, and this is the entry's real value: instrumenting every
+    `return std::nullopt` in `matchRangeFor` with a clause tag and
+    sweeping both corpora shows the parameter clause was NOT the
+    bottleneck it looked like. Per loop (call counts halved --
+    `matchRangeFor` runs twice per ForStmt), EndToEnd `*.c` + `*.cpp`:
+    ~200 init-not-a-DeclStmt, ~38 already accepted, ~27 body global/static,
+    ~24 non-`int` induction, ~23 body pointer/float/struct, ~18 body
+    control flow, and only ~3 body-reads-a-parameter. The full 220-file
+    c-testsuite corpus rejects ~70 loops on the init clause and ~13 on
+    `for(;;)` and ZERO past clause 1 -- it is C89-style throughout, so
+    every body-side widening is provably worth 0 there. So this widening
+    is worth +3 loops on EndToEnd and +1 on Cpp17Suite; the `i = LO`
+    assignment-form init is worth roughly ~270 across both corpora and is
+    the increment to rank first. Recorded so the next session does not
+    re-rank by intuition. Corpus: 39 -> 45 emitted `for .. in` (3 of the 6
+    are this entry's own new tests), `while` 225 -> 222. Full suite
+    821/821, EndToEnd 243/243 byte-diff, CTestSuite 220, Cpp17Suite 35,
+    clippy 489 -> 490 and the +1 is NOT a regression: `range-for.c` is the
+    only LINTED crate whose emitted Rust changed at all (every other C
+    crate is byte-identical), so the single warning is this entry's own
+    new test function showing the place form's late-init shape
+    (`let k_1: i32; k_1 = k;`) -- inherent to a non-constant init, the
+    same residual 61f-2 already records, and not worth hiding by
+    contriving the test. Zero golden edits (238/240 emitted crates byte-identical; the two that
+    moved -- cpp-function-template, cpp-template-nttp -- flipped a
+    read-only-param loop to `for` and were verified correct). Tests:
+    test/EndToEnd/range-for.c (param read in body; param WRITTEN in body
+    and read after, which is sound because the place lives in the
+    enclosing block, not the region -- writing the INDUCTION is still
+    refused by clause 4),
+    test/EndToEnd/cpp-lambda-capture-range-for.cpp (the capture-binder
+    leg; verified to fail with the exact alloca-legalization error when
+    that one edit is reverted).
     LANDED 61f-3 (2026-08-10): the `i <= HI` inclusive widening. `emitrust.for`
     gained an `inclusive` UnitAttr (round-trips through the existing optional
     attr-dict — no custom-syntax change), `emitFor` renders `LO..=HI` when set
