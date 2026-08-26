@@ -129,6 +129,17 @@ blocked_by = ["FR-113"]
 anchor = "FR-121 DEFECT"
 
 [[items]]
+id = "FR-131"
+rank = 18
+kind = "defect"
+status = "open"
+size = "S"
+title = "printf with an empty format string emits invalid print!()"
+summary = "Exit-0 unbuildable: `printf(\"\")` emits `print!()`, which rustc rejects with 'requires at least a format string argument'. Two-line repro. `puts(\"\")` is fine, so it is the format-string fold dropping a zero-length literal instead of keeping `print!(\"\")`. Safe direction (hard error, never a miscompile) but rejection-is-a-feature says emit it correctly or diagnose it located. Found while writing FR-61f-8's test; no corpus unit calls printf with an empty format, which is why no ledger sees it."
+blocked_by = []
+anchor = "FR-131 DEFECT"
+
+[[items]]
 id = "FR-123"
 rank = 22
 kind = "defect"
@@ -379,7 +390,7 @@ anchor = "epoch 4"
 # A first-failure rejection count is an UPPER BOUND on a clause's yield, not
 # its yield -- widening an early clause just hands those loops to a later one.
 # Every yield below is what a single-kind widening actually unlocks. Prose:
-# design.md, the "STILL OUT after 61f-6" block under the 61f entry.
+# design.md, the "STILL OUT after 61f-10" block under the 61f entry.
 
 [[items]]
 id = "FR-61f-d"
@@ -388,9 +399,9 @@ kind = "feature"
 status = "open"
 size = "M"
 title = "Range-for: structured control flow in the body, and descending -> .rev()"
-summary = "The nested-loop leg landed in 61f-6; the `if`/`?:`/&&/|| leg is what still holds the last 6 loop{} degradations in struct-long-arrays.c, so it is worth more than its raw count. emitrust.if exists, so structured emission inside the for body is the plausible route. break/continue/goto/return STAY FENCED -- emitrust.for has no exit edge, so admitting them is an op-design change. Descending is self-contained; (lo..hi).rev() is NOT hi..lo, and 61f-3's INT_MIN/UB reasoning applies."
+summary = "84 first-failure rejections on the post-61f-10 tree. The nested-loop leg landed in 61f-6; the `if`/`?:`/&&/|| leg is what still holds the last 6 loop{} degradations in struct-long-arrays.c, so it is worth more than its count. emitrust.if exists, so structured emission inside the for body is the plausible route. break/continue/goto/return STAY FENCED -- emitrust.for has no exit edge, so admitting them is an op-design change. Descending (12) is a SEPARATE and smaller item, and is NOT the self-contained importer change earlier entries called it: it needs a new emitrust.for attribute plus emitter support, because (lo..hi).rev() is NOT hi..lo -- C's `i > LO; i -= K` is ((LO+1)..=HI).rev().step_by(K), and that LO+1 risks overflow at the type max."
 blocked_by = []
-anchor = "STILL OUT after 61f-6"
+anchor = "STILL OUT after 61f-10"
 
 [[items]]
 id = "FR-61f-c"
@@ -399,6 +410,6 @@ kind = "feature"
 status = "open"
 size = "L"
 title = "Range-for: a body may touch a pointer (needs its own design pass)"
-summary = "Biggest remainder -- 71 only-offender loops, 58 of the 92 offending instances being parameters -- and a CHECKPOINT, not a foregone conclusion. A pointer local never reaches the place/cell decision: emitLocalVar diverts to emitPointerLocal, which allocates raw memref cells on every arm, held as PointerLocalInfo::cursorCell, so placeBackedScalars is never consulted and CANNOT be (the cursor is a synthesized cell whose type is unrelated to the variable's mapped type). Liftability means teaching the pointer-region model to emit its cursor, its nullable discriminant and the CTS-P7 enum-of-bases discriminant as emitrust.variable places, then auditing every memref.load/store consumer. Core machinery: design pass before any code."
+summary = "Biggest remainder by a wide margin: 201 of the 400 first-failure rejections on the post-61f-10 tree (121 body-touches-a-pointer + 80 non-comparison conditions, which are the pointer-walking heads `for (p = head; p; p = p->next)` and need a truthiness condition and a `p = p->next` step besides). A CHECKPOINT, not a foregone conclusion, and the ONE remainder where the cell-story-never-applied argument that carried 61f-6 and 61f-10 is genuinely FALSE -- here the cells are real. A pointer local never reaches the place/cell decision: emitLocalVar diverts to emitPointerLocal, which allocates raw memref cells on every arm, held as PointerLocalInfo::cursorCell, so placeBackedScalars is never consulted and CANNOT be (the cursor is a synthesized cell whose type is unrelated to the variable's mapped type). Liftability means teaching the pointer-region model to emit its cursor, its nullable discriminant and the CTS-P7 enum-of-bases discriminant as emitrust.variable places, then auditing every memref.load/store consumer. Core machinery: design pass before any code."
 blocked_by = []
-anchor = "STILL OUT after 61f-6"
+anchor = "STILL OUT after 61f-10"

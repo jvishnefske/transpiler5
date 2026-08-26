@@ -2730,7 +2730,7 @@ of references or inheritance, so it precedes both.
     test/EndToEnd/range-for.c (byte-diff: accumulator `+=`, array fill, step 2,
     `i <= n` while-fallback), test/Target/Rust/compound-assign-place.mlir (the
     place fold + its non-self-ref negative), test/Import/C/arrays.c goldens.
-    STILL OUT after 61f-6, RE-RANKED BY ONLY-OFFENDER MEASUREMENT. The
+    STILL OUT after 61f-10, RE-RANKED BY MEASUREMENT (twice). The
     headline numbers in this FR were wrong twice, in the same way both
     times, and the reason is structural: `matchRangeFor` evaluates its
     clauses in a fixed order and reports only the FIRST failure, so a
@@ -2774,33 +2774,61 @@ of references or inheritance, so it precedes both.
           widening to move that corpus at all). What REMAINS is the
           address-taken global, which is unreachable today because the
           importer rejects `&g` outright.
-      (c) POINTERS IN THE BODY -- 71 only-offender loops (25 `int`
-          induction + 46 non-`int`), 58 of the 92 offending instances being
-          parameters. THIS IS A CHECKPOINT, NOT A FOREGONE CONCLUSION. A
-          pointer local never reaches the place/cell decision at all:
+      RE-MEASURED 2026-08-26 on the post-61f-10 tree by tagging every
+      `return std::nullopt` in `matchRangeFor` and sweeping both corpora
+      (EndToEnd + the 220-file c-testsuite). These are FIRST-FAILURE counts,
+      so every one is an UPPER BOUND on its clause's yield -- the whole point
+      of this ledger. 547 acceptances against:
+        121  body touches a POINTER          -> (c)
+         84  body has control flow           -> (d)
+         80  cond is not a comparison at all -> (c); this is the
+             pointer-walking head `for (p = head; p; p = p->next)`, whose
+             condition is the pointer itself, so it belongs to (c) and makes
+             (c) the dominant remainder by a wide margin (201 of 400)
+         72  induction type refused by clause 1b (the narrow-rank and
+             unsigned-runtime-step fences 61f-7 put in deliberately)
+         24  assignment-form induction not provably dead after the loop
+         15  init is neither a DeclStmt nor an assignment (`for(;;)`)
+         12  DESCENDING                      -> (e)
+          6  body touches a float SCALAR     (was 0 before the widenings)
+          6  bound not provably unreachable to a callee (61f-8's fence)
+      (c) POINTERS IN THE BODY, AND POINTER-WALKING HEADS -- 201 of the 400
+          remaining rejections, and STILL A CHECKPOINT, not a foregone
+          conclusion. A pointer local never reaches the place/cell decision:
           `emitLocalVar` diverts to `emitPointerLocal`, which allocates raw
           memref cells on EVERY arm (pool handle index + non-null, literal
           region) held as `PointerLocalInfo::cursorCell`, so
-          `placeBackedScalars` is never consulted and CANNOT be -- the
-          cursor is a synthesized cell whose type is unrelated to the
-          variable's mapped type. Liftability means teaching the
-          pointer-region model to emit its cursor, its nullable
+          `placeBackedScalars` is never consulted and CANNOT be -- the cursor
+          is a synthesized cell whose type is unrelated to the variable's
+          mapped type. Note this is the ONE remainder where the "the cell
+          story never applied" argument that carried 61f-6 and 61f-10 is
+          genuinely false: here the cells are real. Liftability means teaching
+          the pointer-region model to emit its cursor, its nullable
           discriminant and the CTS-P7 enum-of-bases discriminant as
-          `emitrust.variable` places, then auditing every consumer that
-          does `memref.load`/`memref.store` on them. Core machinery: its
-          own design pass before any code.
-      (d) CONTROL FLOW IN THE BODY -- `if`/`?:`/`&&`/`||`/StmtExpr still
-          block (`emitrust.if` exists, so structured emission inside the
-          for body is the plausible route). `break`/`continue`/`goto`/
-          `return` STAY FENCED regardless: `emitrust.for` has no exit edge,
-          so admitting them is an op-design change, not a widening. 61f-6
-          already took the NESTED-LOOP leg of this remainder (below); the
-          `if` leg is what still holds the last 6 `loop {` degradations in
-          test/EndToEnd/struct-long-arrays.c, so it is now worth more than
-          its raw count suggests.
-      (e) DESCENDING loops -> `.rev()`, self-contained; mind that
-          `(lo..hi).rev()` is NOT `hi..lo`, and the INT_MIN/UB reasoning
-          61f-3 used for `..=`.
+          `emitrust.variable` places, then auditing every consumer that does
+          `memref.load`/`memref.store` on them. Core machinery: its own design
+          pass before any code. The 80 non-comparison conditions ride along
+          with it -- `for (p = head; p; p = p->next)` also needs a truthiness
+          condition and a `p = p->next` step, neither of which the current
+          three clauses model.
+      (d) CONTROL FLOW IN THE BODY -- 84. `if`/`?:`/`&&`/`||`/StmtExpr still
+          block; `emitrust.if` exists, so structured emission inside the for
+          body is the plausible route. `break`/`continue`/`goto`/`return`
+          STAY FENCED regardless: `emitrust.for` has no exit edge, so
+          admitting them is an op-design change, not a widening. 61f-6 took
+          the NESTED-LOOP leg of this remainder already. The `if` leg is
+          worth more than 84 suggests: it is what still holds the last 6
+          `loop {` degradations in test/EndToEnd/struct-long-arrays.c.
+      (e) DESCENDING -> `.rev()` -- 12, and SMALLER THAN IT LOOKS AND BIGGER
+          THAN IT COSTS, so measure before building. It is not the
+          self-contained importer change earlier entries called it: it needs
+          a new attribute on `emitrust.for` plus emitter support, because
+          `(lo..hi).rev()` is NOT `hi..lo`. The mapping is exact but
+          off-by-one in both directions -- C's `for (i = HI; i > LO; i -= K)`
+          walks HI, HI-K, ... which is `((LO+1)..=HI).rev().step_by(K)`, and
+          `i >= LO` is `(LO..=HI).rev().step_by(K)` -- and the `LO+1` risks
+          overflow at the type max, which is the same INT_MIN/UB reasoning
+          61f-3 used for `..=` running the other way.
     NOT WORTH DOING: float/double body SCALARS block 0 corpus loops. They
     genuinely ARE cell-backed and the fix is the same one-line shape as
     61f-4, but nothing is blocked by one -- fold it in only as a by-product
@@ -8608,6 +8636,24 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-record-cross-tu-merge.cpp with
   DROPPY/TWIN/ALIAS legs)
 
+
+- [ ] FR-131 DEFECT (found by FR-61f-8's spike, pre-existing, SEPARATE
+  channel): `printf("")` with an EMPTY format string and no arguments
+  emits `print!()`, which is not valid Rust -- rustc rejects it with
+  "requires at least a format string argument" and the crate fails to
+  build. Minimal repro is two lines:
+      int printf(const char *, ...);
+      int main(void) { printf(""); return 0; }
+  `puts("")` on the same path is fine (it goes through a `&'static str`
+  binding and `println!("{}", v)`), so this is specific to the
+  format-string fold dropping a zero-length literal instead of keeping
+  `print!("")`. Exit-0 unbuildable, which is the SAFE direction (a hard
+  rustc error, never a miscompile) but still the rejection-is-a-feature
+  policy violated: it should either emit `print!("")` or be a LOCATED
+  diagnostic. Found while writing FR-61f-8's test, where a body needed a
+  call that did nothing observable; nothing in either corpus calls
+  `printf` with an empty format, which is why no ledger sees it.
+  **NOT SPIKED.**
 
 - [ ] FR-123 DEFECT (found by FR-119's spike, pre-existing, SEPARATE
   channel): a FRIEND operator defined INLINE in a class is silently
