@@ -5235,17 +5235,26 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   // type so the matcher never has to run `mapType` (which imports records
   // and would shift struct_def emission order).
   // Everything else -- decomposed pointers (i64 cursor cells), floats,
-  // globals/statics -- rejects to the CFG `while` lowering. Deliberately
-  // narrow: a green suite with partial coverage beats a broad matcher that
-  // miscompiles.
+  // `va_list`s -- rejects to the CFG `while` lowering. Deliberately narrow: a
+  // green suite with partial coverage beats a broad matcher that miscompiles.
   llvm::SmallPtrSet<const clang::VarDecl *, 8> bodyVars;
   collectRefVars(body, bodyVars);
   for (const clang::VarDecl *var : bodyVars) {
     if (var == iv)
       continue;
-    // Automatic storage duration: locals and parameters, never a global or
-    // a function-local `static` (both fail hasLocalStorage()).
-    if (!var->hasLocalStorage())
+    // FR-61f-10: a global or a function-local `static` is admitted too, and
+    // for the same reason the aggregates were -- the cell story never applied
+    // to it. A global is not a frame slot at all: a read is an
+    // `emitrust.global_load` and a write an `emitrust.global_store`, both
+    // plain SSA ops that sit inside a region as happily as anywhere else, and
+    // no `memref.alloca` is involved on any arm. A function-local `static` is
+    // module-level state that `emitLocalVar` routes to `createGlobal` under a
+    // `<function>_<name>` mangling, so it is the same op pair.
+    //
+    // The one exception is an ADDRESS-TAKEN global. `&g` pulls in the
+    // `emitrust.global_addr` / `emitrust.global_cells` machinery (the FR-80
+    // requirement-global path), which stages real cells; that stays out.
+    if (!var->hasLocalStorage() && addressTaken.contains(var))
       return std::nullopt;
     if (!rangeForBodyVarIsPlaceBacked(var))
       return std::nullopt;
