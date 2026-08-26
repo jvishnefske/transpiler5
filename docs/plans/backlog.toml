@@ -382,17 +382,6 @@ anchor = "epoch 4"
 # design.md, the "STILL OUT after 61f-6" block under the 61f entry.
 
 [[items]]
-id = "FR-61f-b"
-rank = 21
-kind = "feature"
-status = "open"
-size = "M"
-title = "Range-for: a body may touch a global or a file-scope static"
-summary = "Only-offender yield 42 loops; all 50 offending instances are file-scope, ZERO function-local statics in the corpus. Separate mechanism from placeBackedScalars -- module symbols and staged copies -- so it needs its own spike."
-blocked_by = []
-anchor = "STILL OUT after 61f-6"
-
-[[items]]
 id = "FR-61f-d"
 rank = 23
 kind = "feature"

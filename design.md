@@ -2767,10 +2767,13 @@ of references or inheritance, so it precedes both.
           shape), and C wraparound on a narrow induction is DEFINED --
           `for (uint8_t i = 0; i < 300; i++)` never terminates in C but
           would terminate under an i32 range.
-      (b) GLOBALS AND `static`s IN THE BODY -- 42 only-offender loops; all
-          50 offending instances are file-scope, ZERO function-local
-          `static`s in the corpus. A separate mechanism (module symbols and
-          staged copies, not `placeBackedScalars`); needs its own spike.
+      (b) GLOBALS AND `static`s IN THE BODY -- LANDED as 61f-10 below. The
+          "separate mechanism (module symbols and staged copies)" this entry
+          predicted was NOT needed; the estimate of 42 was close (real
+          harvest 38 on EndToEnd, and 11 on c-testsuite, the FIRST body-side
+          widening to move that corpus at all). What REMAINS is the
+          address-taken global, which is unreachable today because the
+          importer rejects `&g` outright.
       (c) POINTERS IN THE BODY -- 71 only-offender loops (25 `int`
           induction + 46 non-`int`), 58 of the 92 offending instances being
           parameters. THIS IS A CHECKPOINT, NOT A FOREGONE CONCLUSION. A
@@ -2804,6 +2807,44 @@ of references or inheritance, so it precedes both.
     of a general non-integer-scalar relaxation, never as its own increment.
     Plus the standing residual place-accumulator `needless_late_init` for
     NON-constant inits that a later late-init-merge fold could clean.
+    LANDED 61f-10 (2026-08-26): a range-eligible body may touch a GLOBAL or a
+    function-local `static`. The predicted "separate mechanism -- module
+    symbols and staged copies rather than `placeBackedScalars`" was NOT
+    needed, and the reason is 61f-6's reason a second time: the cell story
+    never applied. A global is not a frame slot at all. A read is an
+    `emitrust.global_load` and a write an `emitrust.global_store`, both plain
+    SSA ops that sit inside a region as happily as anywhere else, and no
+    `memref.alloca` is involved on any arm. A function-local `static` is
+    module-level state that `emitLocalVar` routes to `createGlobal` under a
+    `<function>_<name>` mangling, so it is the same op pair -- and the corpus
+    claim that there are ZERO function-local `static`s in this position is
+    beside the point, since supporting them cost nothing.
+    The ONE exception kept out is an ADDRESS-TAKEN global: `&g` pulls in the
+    `emitrust.global_addr` / `emitrust.global_cells` machinery (the FR-80
+    requirement-global path), which does stage real cells. That guard is
+    defensive and deliberately NOT pinned by a test -- the importer rejects
+    `&g` outright today ("unsupported: taking the address of a global
+    variable"), so no such input reaches the matcher; whoever lands FR-80/82
+    owns pinning it.
+    Landing it also required 61f-8 first, which the spike found rather than
+    predicted: with globals in the body, a bound that reads a global while the
+    body calls a function is common rather than exotic.
+    MEASURED: `for .. in` 165 -> 203 (+38, against an estimate of 42), `while`
+    141 -> 103, `loop {` flat at 143, lines 21970 -> 21890. c-testsuite 14 ->
+    25 (+11) and 18127 -> 18107 lines -- THE FIRST BODY-SIDE WIDENING TO MOVE
+    THAT CORPUS AT ALL, which is worth noting because 61f-4, 61f-6 and 61f-7
+    were each provably worth 0 there. C89 code keeps its state in file-scope
+    globals, so this is the widening that fits it.
+    Full suite 827/827, EndToEnd 248/248 byte-diff, CTestSuite 220,
+    Cpp17Suite 35, ZERO golden edits, ZERO new rejections and zero crashes on
+    either corpus. Clippy 516 -> 517, the +1 being one more
+    `clippy::needless_late_init` with every other lint flat to the unit.
+    Test: test/EndToEnd/range-for-globals.c byte-diffs at three argument
+    values over a global array, a global unsigned scalar, a global WRITTEN in
+    the region and read after it, a global struct, and a function-local
+    `static` carried across two calls. Its pins live in one ordered block
+    rather than beside each function, because the emitter groups
+    global-touching functions into one actor impl and emits them in ITS order.
     LANDED 61f-9 (2026-08-26), a CRASH REGRESSION from 61f-6's own aggregate
     widening -- and the exact "latent shield removed" shape 61f-4 warned
     about, one wave later. `va_list` is `struct __va_list_tag[1]` on the SysV
