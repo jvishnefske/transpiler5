@@ -382,17 +382,6 @@ anchor = "epoch 4"
 # design.md, the "STILL OUT after 61f-6" block under the 61f entry.
 
 [[items]]
-id = "FR-61f-a"
-rank = 18
-kind = "feature"
-status = "spiked"
-size = "S"
-title = "Range-for: emit the ForOp at the induction's own MLIR type"
-summary = "Only-offender yield 25 loops on EndToEnd, 0 on c-testsuite. Importer-only, NOT an op change: AllTypesMatch says the three operands agree with EACH OTHER, the constraint is already AnyTypeOf<[AnyInteger, Index]>, and emitFor is type-agnostic -- the i32-ness is emitRangeFor hardcoding getI32Type(). All 107 corpus inductions in this bucket are UNSIGNED, so it is width/signedness work. Two miscompile vectors fence the cast-to-i32 shortcut: a runtime size_t bound above INT_MAX truncates the trip count, and C wraparound on a narrow induction is DEFINED (for (uint8_t i = 0; i < 300; i++) never terminates in C)."
-blocked_by = []
-anchor = "STILL OUT after 61f-6"
-
-[[items]]
 id = "FR-61f-b"
 rank = 21
 kind = "feature"

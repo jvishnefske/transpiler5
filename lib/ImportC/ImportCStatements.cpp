@@ -4979,6 +4979,102 @@ bool CImporter::rangeForBodyVarIsPlaceBacked(const clang::VarDecl *var) {
   return false;
 }
 
+/// True when `bound` can be carried at the induction's own type `type`
+/// WITHOUT narrowing: it is either an integer constant representable there,
+/// or an expression already of exactly that type.
+bool CImporter::rangeForBoundFitsType(const clang::Expr *bound,
+                                      clang::QualType type) {
+  unsigned bits = astContext().getIntWidth(type);
+  bool isUnsigned = type->isUnsignedIntegerType();
+  if (std::optional<llvm::APSInt> constant =
+          bound->getIntegerConstantExpr(astContext())) {
+    if (isUnsigned)
+      return !constant->isNegative() && constant->getActiveBits() <= bits;
+    return constant->getSignificantBits() <= bits;
+  }
+  return bound->IgnoreParenImpCasts()->getType().getCanonicalType() ==
+         type.getCanonicalType();
+}
+
+/// FR-61f-7, clause 1b: whether the loop may be emitted at the INDUCTION'S
+/// OWN type rather than the historical i32.
+///
+/// This was recorded as "a design decision needing an op-signature change".
+/// It is not: `AllTypesMatch<["lowerBound","upperBound","step"]>` says only
+/// that the three operands agree WITH EACH OTHER, the operand constraint is
+/// already `AnyTypeOf<[AnyInteger, Index]>`, and `emitFor` is type-agnostic.
+/// The i32-ness was purely `emitRangeFor` hardcoding `getI32Type()`.
+///
+/// `int` keeps exactly its historical acceptance -- the status quo that 823
+/// tests already pin -- so this predicate only ever ADDS shapes. For every
+/// other type it is deliberately narrow, because emitting at a narrower or
+/// unsigned type opens THREE divergences from C that a cast-and-hope
+/// implementation would walk straight into:
+///
+///  (1) TRUNCATION. A runtime `size_t`/`unsigned long` bound above INT_MAX
+///      cast down to i32 changes the trip count outright
+///      (test/EndToEnd/borrow-bundle-scalarize.c:118 is that shape). Fixed at
+///      the root: the bound is never narrowed, it is required to fit.
+///
+///  (2) INTEGER PROMOTION. In C, `i < HI` on a narrow `i` compares at `int`,
+///      not at `i`'s type -- which is why `for (uint8_t i = 0; i < 300; i++)`
+///      NEVER TERMINATES in C while a u8 range would. Fixed by refusing any
+///      type narrower than `int`: at rank >= int there is no promotion, so
+///      the C comparison and the Rust range agree by construction.
+///
+///  (3) DEFINED WRAPAROUND. Signed overflow is UB, which is what let 61f-3
+///      refine `i <= INT_MAX` into a cleanly-terminating `..=`. UNSIGNED
+///      wraparound is DEFINED, so the same move would be a behaviour change:
+///      `for (unsigned i = 0; i <= UINT_MAX; i++)` loops forever in C. So an
+///      unsigned induction must additionally prove the increment PAST the
+///      last iteration cannot wrap.
+bool CImporter::rangeForInductionTypeOk(const clang::VarDecl *iv,
+                                        const clang::Expr *lo,
+                                        const clang::Expr *hi, int64_t step,
+                                        bool inclusive) {
+  clang::QualType type = iv->getType().getCanonicalType();
+  // Exactly the historical acceptance, bit for bit: `int` inductions keep
+  // today's behaviour including today's bound casting, so this widening is
+  // additive and every existing lift is byte-inert.
+  if (type == astContext().IntTy)
+    return true;
+  // Enums map to `!emitrust.enum` and `_Bool` to i1; neither is a counter.
+  if (!type->isIntegerType() || type->isBooleanType() ||
+      type->isEnumeralType())
+    return false;
+  // Divergence (2): no type of lower rank than `int`, so C's integer
+  // promotion never widens the comparison out from under us.
+  if (astContext().getTypeSize(type) < astContext().getTypeSize(
+                                           astContext().IntTy))
+    return false;
+  // Divergence (1): both bounds and the step must be carried at `type`
+  // without narrowing.
+  if (!rangeForBoundFitsType(lo, type) || !rangeForBoundFitsType(hi, type))
+    return false;
+  unsigned bits = astContext().getIntWidth(type);
+  if (step <= 0)
+    return false;
+  if (!type->isUnsignedIntegerType())
+    return static_cast<uint64_t>(step) < (uint64_t(1) << (bits - 1));
+  // Divergence (3), unsigned only. The loop's LAST act is the increment that
+  // carries the induction past the bound; if THAT wraps, C restarts and Rust
+  // stops.
+  //   - a constant bound C is safe iff C + step still fits;
+  //   - a runtime bound of the induction's own type is safe only for the
+  //     half-open unit-step shape, where the final value is exactly the bound
+  //     and the bound is a value of the type by construction.
+  uint64_t max = bits >= 64 ? std::numeric_limits<uint64_t>::max()
+                            : ((uint64_t(1) << bits) - 1);
+  if (static_cast<uint64_t>(step) > max)
+    return false;
+  if (std::optional<llvm::APSInt> constant =
+          hi->getIntegerConstantExpr(astContext())) {
+    uint64_t bound = constant->getZExtValue();
+    return bound <= max - static_cast<uint64_t>(step);
+  }
+  return step == 1 && !inclusive;
+}
+
 std::optional<RangeFor>
 CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   const clang::Stmt *init = stmt->getInit();
@@ -5029,11 +5125,6 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   } else {
     return std::nullopt;
   }
-  // The induction must be exactly `int` (i32): this guarantees the bounds and
-  // step share the ForOp's single operand type (AllTypesMatch) with no width
-  // juggling.
-  if (iv->getType().getCanonicalType() != astContext().IntTy)
-    return std::nullopt;
   if (!lo)
     return std::nullopt;
 
@@ -5056,6 +5147,13 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   // positive integer constant.
   int64_t step = 0;
   if (!matchStep(inc, iv, astContext(), step))
+    return std::nullopt;
+
+  // Clause 1b (FR-61f-7): the induction's TYPE. It used to have to be exactly
+  // `int`; it now only has to be one the ForOp can carry losslessly. The
+  // check lives here, after clauses 2 and 3, because its soundness depends on
+  // the step and on whether the range is inclusive.
+  if (!rangeForInductionTypeOk(iv, lo, hi, step, inclusive))
     return std::nullopt;
 
   // Clause 4: `i` is body-immutable -- never written in the body and `&i`
@@ -5114,24 +5212,55 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
 LogicalResult CImporter::emitRangeFor(const RangeFor &range,
                                       const clang::ForStmt *stmt) {
   Location loc = translateLoc(stmt->getForLoc());
-  Type intType = builder.getI32Type();
+  // FR-61f-7: the ForOp carries the INDUCTION'S OWN type. `AllTypesMatch`
+  // only ties the three operands to each other and the operand constraint
+  // already admits any integer width and signedness, so nothing about the op
+  // had to change -- this line was the whole i32 restriction.
+  // `matchRangeFor`'s clause 1b guarantees the bounds reach this type without
+  // narrowing, so the coercions below only ever widen a literal.
+  FailureOr<Type> inductionType = mapType(range.iv->getType(), loc);
+  if (failed(inductionType))
+    return failure();
+  Type intType = *inductionType;
 
   // Bounds are evaluated once, in the current block, before the loop.
-  FailureOr<Value> lo = emitRValue(range.lo);
+  //
+  // On the non-`int` path a CONSTANT bound is materialized directly at the
+  // induction's type rather than emitted at its own and cast: `emitRValue`
+  // gives an `int` literal an i32, and casting that would render the head as
+  // `for i in 0i32 as u32..n` instead of `for i in 0u32..n`. Clause 1b
+  // already proved the constant is representable, so this is a spelling
+  // choice, not a value change. The `int` path deliberately does NOT take the
+  // shortcut: it must stay byte-identical to what 823 tests already pin.
+  bool ownType = range.iv->getType().getCanonicalType() != astContext().IntTy;
+  auto emitBound = [&](const clang::Expr *expr) -> FailureOr<Value> {
+    if (ownType)
+      if (std::optional<llvm::APSInt> constant =
+              expr->getIntegerConstantExpr(astContext()))
+        return createScalarIntConstant(loc, intType,
+                                       constant->getExtValue());
+    return emitRValue(expr);
+  };
+  FailureOr<Value> lo = emitBound(range.lo);
   if (failed(lo))
     return failure();
-  FailureOr<Value> hi = emitRValue(range.hi);
+  FailureOr<Value> hi = emitBound(range.hi);
   if (failed(hi))
     return failure();
   Value loValue = *lo;
   Value hiValue = *hi;
-  // The induction is `int`; coerce any differently-typed bound to i32 so the
-  // ForOp's three operands share a type (AllTypesMatch).
+  // Coerce any differently-typed bound to the induction's type so the ForOp's
+  // three operands share one (AllTypesMatch). For an `int` induction this is
+  // the historical i32 coercion, unchanged; for any other it can only be the
+  // widening of a literal, because clause 1b already refused every bound that
+  // would have to narrow.
   if (loValue.getType() != intType)
     loValue = builder.create<emitrust::CastOp>(loc, intType, loValue);
   if (hiValue.getType() != intType)
     hiValue = builder.create<emitrust::CastOp>(loc, intType, hiValue);
-  Value stepValue = createIntConstant(loc, intType, range.step);
+  // An unsigned step must be an `emitrust.constant`: `arith.constant`
+  // requires a signless type.
+  Value stepValue = createScalarIntConstant(loc, intType, range.step);
 
   auto forOp =
       builder.create<emitrust::ForOp>(loc, loValue, hiValue, stepValue,
