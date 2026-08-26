@@ -2804,6 +2804,32 @@ of references or inheritance, so it precedes both.
     of a general non-integer-scalar relaxation, never as its own increment.
     Plus the standing residual place-accumulator `needless_late_init` for
     NON-constant inits that a later late-init-merge fold could clean.
+    LANDED 61f-9 (2026-08-26), a CRASH REGRESSION from 61f-6's own aggregate
+    widening -- and the exact "latent shield removed" shape 61f-4 warned
+    about, one wave later. `va_list` is `struct __va_list_tag[1]` on the SysV
+    ABI, a ConstantArrayType, so admitting an array of ANY element type made a
+    body that walks a `va_list` range-eligible. `va_arg` lowers to control
+    flow of its own (the register-save-area walk), which cannot live in the
+    single-block region: the result was a SEGFAULT inside MLIR's
+    `verifyNSuccessors`, not a located diagnostic.
+    IT WAS LATENT AT THE COMMIT THAT INTRODUCED IT, and that is the lesson
+    worth keeping. The only corpus instance,
+    test/EndToEnd/actor-lift-variadic.c, accumulates into a GLOBAL, and
+    globals were still rejected EARLIER in the clause chain -- so 823/823
+    stayed green over a compiler that crashed on a file differing from it only
+    in accumulating into a LOCAL. Spiking remainder (b) removed the shield and
+    the crash surfaced on the first corpus sweep. A green suite proves the
+    clause chain's FIRST failure is safe; it says nothing about the clauses
+    behind it, which is the same asymmetry that makes a first-failure
+    rejection count an upper bound rather than a yield.
+    Two fences, deliberately both: `blocksRangeForLift` refuses `VAArgExpr`
+    (a statement about the EXPRESSION -- the hazard is the walk, not the
+    `va_list`), and the body whitelist refuses the `va_list` TYPE (a statement
+    about the VARIABLE, which also covers `va_start`/`va_end` naming `ap`).
+    Byte-inert on both corpora (zero emitted files change). Full suite
+    826/826. Test: test/EndToEnd/range-for-va-arg.c, whose crashing leg
+    segfaults the pre-fix binary, and whose second function pins that ordinary
+    arrays still lift so 61f-6 is not walked back.
     LANDED 61f-8 (2026-08-26), a DEFECT and the reason the widenings above
     are worth having a byte-diff oracle for: clause 5's "HI is loop-
     invariant" proof was purely SYNTACTIC and could not see a write the body

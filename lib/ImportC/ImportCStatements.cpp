@@ -4899,13 +4899,20 @@ bool CImporter::blocksRangeForLift(const clang::Stmt *stmt) {
     return false;
   if (const auto *nested = llvm::dyn_cast<clang::ForStmt>(stmt))
     return !matchRangeFor(nested).has_value();
+  // `clang::VAArgExpr`: `va_arg` lowers to control flow of its own (the
+  // register-save-area walk), so it cannot live in the single-block region.
+  // It is listed here rather than left to the body whitelist because the
+  // whitelist is a statement about VARIABLES and this is a statement about an
+  // EXPRESSION -- `va_arg(ap, int)` names `ap`, but the hazard is the walk,
+  // not the `va_list`. (The whitelist fences the `va_list` too; both fire,
+  // and both are meant to.)
   if (llvm::isa<clang::IfStmt, clang::WhileStmt,
                 clang::DoStmt, clang::SwitchStmt, clang::CXXForRangeStmt,
                 clang::BreakStmt, clang::ContinueStmt, clang::GotoStmt,
                 clang::IndirectGotoStmt, clang::ReturnStmt, clang::LabelStmt,
                 clang::CaseStmt, clang::DefaultStmt,
                 clang::ConditionalOperator, clang::BinaryConditionalOperator,
-                clang::StmtExpr>(stmt))
+                clang::VAArgExpr, clang::StmtExpr>(stmt))
     return true;
   if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(stmt))
     if (bo->getOpcode() == clang::BO_LAnd ||
@@ -4946,6 +4953,16 @@ bool CImporter::rangeForBodyVarIsPlaceBacked(const clang::VarDecl *var) {
   // were always places on every arm.
   if (type->isEnumeralType() || type->isFunctionPointerType())
     return true;
+  // A `va_list` is `struct __va_list_tag[1]` on the SysV ABI, so it would
+  // sail through the array arm below -- and a body that walks it emits the
+  // register-save-area control flow, which broke the region verifier
+  // outright (a SEGFAULT in `verifyNSuccessors`, not a diagnostic). This was
+  // a real regression from the aggregate widening, latent only because the
+  // one corpus instance also touched a global and so was rejected earlier in
+  // the chain; the c-testsuite `<stdarg.h>` cases reach it directly.
+  if (!astContext().getBuiltinVaListType().isNull() &&
+      type == astContext().getBuiltinVaListType().getCanonicalType())
+    return false;
   // A CONSTANT array of ANY element type maps to `!emitrust.array`
   // (`mapType` recurses through every dimension), which `emitLocalVar`
   // routes to `createVariablePlace` via `isAggregate` -- so `int[3][4]`,
