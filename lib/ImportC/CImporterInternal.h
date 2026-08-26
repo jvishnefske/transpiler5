@@ -4904,6 +4904,20 @@ private:
   /// falls through to the already-correct CFG `while` lowering.
   std::optional<RangeFor> matchRangeFor(const clang::ForStmt *stmt);
 
+  /// FR-61f: true when emitting `stmt` inside an `emitrust.for` body would
+  /// create cf basic blocks or a jump edge. A nested `for` that itself
+  /// matches `matchRangeFor` is the one exception -- it emits a nested
+  /// region op, not cf blocks.
+  bool blocksRangeForLift(const clang::Stmt *stmt);
+
+  /// FR-61f: the body whitelist. True iff an automatic-storage variable a
+  /// range-eligible `for` body touches materializes as an
+  /// `emitrust.variable` PLACE rather than a `memref.alloca` cell (which
+  /// mem2reg cannot promote across the region op). Stated on the clang
+  /// type so the speculative matcher never runs `mapType`, whose record
+  /// import is a side effect on the module.
+  bool rangeForBodyVarIsPlaceBacked(const clang::VarDecl *var);
+
   /// FR-61f: emits a matched `RangeFor` as an `emitrust.for` with the
   /// induction seeded from the region's block argument into a place.
   LogicalResult emitRangeFor(const RangeFor &range,

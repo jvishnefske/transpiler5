@@ -4869,15 +4869,37 @@ bool inductionDeadAfter(const clang::Stmt *funcBody,
   return result == DeadWalk::Dead || result == DeadWalk::Open;
 }
 
+} // namespace
+
 /// Whether emitting `stmt` would create cf basic blocks in the function
 /// region (nested control flow, short-circuit `&&`/`||`, `?:`, statement
 /// expressions) or install a loop exit/jump edge (`break`/`continue`/`goto`/
 /// `return`/labels/`case`). An `emitrust.for` body is a single-block region,
 /// so any of these in the body makes the loop non-liftable in this slice.
-bool blocksRangeForLift(const clang::Stmt *stmt) {
+///
+/// THE ONE EXCEPTION is a nested `for` that ITSELF lifts. A lifted loop emits
+/// a REGION OP, not cf blocks, and `emitrust.for` regions nest by
+/// construction -- `emitRangeFor` already saves and restores its
+/// `inductionValues` entry precisely so a nested body may read the enclosing
+/// induction. A nested loop that does NOT lift still blocks, because it would
+/// emit the cf `while` lowering inside the single-block region.
+///
+/// This is what keeps the aggregate widening from being a net loss. Without
+/// it, lifting an INNER loop drags the OUTER loop's induction into
+/// `placeBackedScalars`; the outer loop then has no SSA loop-carried value
+/// for `lift-cf-to-scf` to recognize and degrades from a clean `while` to
+/// `loop { let c = ..; if c { .. } if !c { break; } }`. Measured: 12 such
+/// degradations across the EndToEnd corpus. Lifting the outer loop too turns
+/// each of them into a `for` head instead.
+///
+/// Recursion terminates: the nested `matchRangeFor` runs on a STRICTLY more
+/// deeply nested statement.
+bool CImporter::blocksRangeForLift(const clang::Stmt *stmt) {
   if (!stmt)
     return false;
-  if (llvm::isa<clang::IfStmt, clang::WhileStmt, clang::ForStmt,
+  if (const auto *nested = llvm::dyn_cast<clang::ForStmt>(stmt))
+    return !matchRangeFor(nested).has_value();
+  if (llvm::isa<clang::IfStmt, clang::WhileStmt,
                 clang::DoStmt, clang::SwitchStmt, clang::CXXForRangeStmt,
                 clang::BreakStmt, clang::ContinueStmt, clang::GotoStmt,
                 clang::IndirectGotoStmt, clang::ReturnStmt, clang::LabelStmt,
@@ -4895,8 +4917,67 @@ bool blocksRangeForLift(const clang::Stmt *stmt) {
   return false;
 }
 
-} // namespace
+// True when an automatic-storage variable a range-eligible `for` body
+// touches materializes as an `emitrust.variable` PLACE rather than a
+// `memref.alloca` cell. A cell inside the single-block `emitrust.for`
+// region is un-promotable by mem2reg and `convert-to-emitrust` then
+// rejects it (spike 61f-0), so this predicate IS the body whitelist.
+//
+// It mirrors, in clang-type terms, the place/cell decision the three cell
+// producers actually make -- `emitLocalVar` (isAggregate || isPlaceOnly ||
+// unsigned || address-taken || placeBackedScalars),
+// `bindOrdinaryParam` (StructType/EnumType/FnPtrType/OpaqueType || ...)
+// and `bindLiftedCaptureValue`. It is stated on the AST type ON PURPOSE:
+// `mapType` imports records as a side effect, and calling it from a
+// speculative matcher (which runs twice per ForStmt, and once more from
+// `collectRangeForPlaceScalars` before any body is emitted) would shift
+// `struct_def` emission order in the module.
+bool CImporter::rangeForBodyVarIsPlaceBacked(const clang::VarDecl *var) {
+  clang::QualType type = var->getType().getCanonicalType();
 
+  // Integer scalars (chars and `_Bool` included): a local or a plain
+  // signed PARAMETER gets its place from `placeBackedScalars`, which
+  // `collectRangeForPlaceScalars` fills for exactly this set; unsigned and
+  // address-taken scalars were already places.
+  if (type->isIntegerType())
+    return true;
+  // Enums map to `!emitrust.enum` and function pointers to
+  // `!emitrust.fn_ptr`; a memref of a dialect type is illegal, so both
+  // were always places on every arm.
+  if (type->isEnumeralType() || type->isFunctionPointerType())
+    return true;
+  // A CONSTANT array of ANY element type maps to `!emitrust.array`
+  // (`mapType` recurses through every dimension), which `emitLocalVar`
+  // routes to `createVariablePlace` via `isAggregate` -- so `int[3][4]`,
+  // `struct P[4]` and `double[5]` are places exactly as `int[8]` is. The
+  // old gate demanded an INTEGER element and rejected all three for a
+  // reason that never applied to them.
+  //
+  // A parameter of array type cannot occur in C (the type decays to a
+  // pointer, and `bindOrdinaryParam` has no ArrayType arm), so the place
+  // claim is a local's claim: require one.
+  if (astContext().getAsConstantArrayType(type))
+    return llvm::isa<clang::VarDecl>(var) && !llvm::isa<clang::ParmVarDecl>(var);
+  // A complete struct or union maps to `!emitrust.struct` (a union imports
+  // as a one-field struct, a u8-only aggregate as a byte-region
+  // `!emitrust.array`) and takes the same `isAggregate` place branch; a
+  // by-value struct parameter takes `bindOrdinaryParam`'s StructType arm
+  // independently. Records in namespace `std` are EXCLUDED: `mapType`
+  // diverts them to `mapStdLibraryType`, and a literal-initialized
+  // `std::string_view` local decomposes into i64 cursor CELLS instead of a
+  // place -- exactly the hazard this predicate exists to keep out.
+  if (const auto *record = type->getAsRecordDecl()) {
+    if (!record->getDefinition())
+      return false;
+    if (record->isInStdNamespace())
+      return false;
+    return true;
+  }
+  // Floats, decomposed pointers (i64 cursor cells), and anything else:
+  // reject to the CFG `while` lowering. A float SCALAR is genuinely
+  // cell-backed; no corpus loop is blocked by one.
+  return false;
+}
 
 std::optional<RangeFor>
 CImporter::matchRangeFor(const clang::ForStmt *stmt) {
@@ -5004,22 +5085,16 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   // The body is a single-block region: nothing it touches may be backed by a
   // `memref.alloca` cell, because mem2reg cannot promote a cell whose
   // load/store lives inside the region op and `convert-to-emitrust` then
-  // rejects the leftover alloca (spike 61f-0). The one exception is an
-  // automatic-storage integer local, which `collectRangeForPlaceScalars`
-  // pre-marks into `placeBackedScalars` so it materializes as an
-  // `emitrust.variable` place instead of a cell. Whitelist accordingly:
-  //   - the induction (materialized by emitRangeFor itself);
-  //   - an automatic integer local (placed);
-  //   - an automatic integer-element array (already an `emitrust` place).
-  //   - an integer-scalar PARAMETER (FR-61f B1): `bindOrdinaryParam` would
-  //     otherwise give a plain signed scalar an un-promotable cell, so
-  //     `collectRangeForPlaceScalars` marks it too and the parameter
-  //     materializes as an `emitrust.variable` place (the unsigned and
-  //     address-taken parameter classes already took that branch).
-  // Everything else -- decomposed pointers (i64 cursor cells),
-  // globals/statics, floats, structs -- rejects to the CFG
-  // `while` lowering. Deliberately narrow: a green suite with partial
-  // coverage beats a broad matcher that miscompiles.
+  // rejects the leftover alloca (spike 61f-0). So the whitelist admits
+  // exactly the automatic-storage variables that reach an
+  // `emitrust.variable` PLACE instead of a cell, and
+  // `rangeForBodyVarIsPlaceBacked` is that predicate, stated on the clang
+  // type so the matcher never has to run `mapType` (which imports records
+  // and would shift struct_def emission order).
+  // Everything else -- decomposed pointers (i64 cursor cells), floats,
+  // globals/statics -- rejects to the CFG `while` lowering. Deliberately
+  // narrow: a green suite with partial coverage beats a broad matcher that
+  // miscompiles.
   llvm::SmallPtrSet<const clang::VarDecl *, 8> bodyVars;
   collectRefVars(body, bodyVars);
   for (const clang::VarDecl *var : bodyVars) {
@@ -5029,13 +5104,8 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
     // a function-local `static` (both fail hasLocalStorage()).
     if (!var->hasLocalStorage())
       return std::nullopt;
-    clang::QualType varType = var->getType().getCanonicalType();
-    if (varType->isIntegerType())
-      continue;
-    if (const clang::ArrayType *array = astContext().getAsArrayType(varType))
-      if (array->getElementType().getCanonicalType()->isIntegerType())
-        continue;
-    return std::nullopt;
+    if (!rangeForBodyVarIsPlaceBacked(var))
+      return std::nullopt;
   }
 
   return RangeFor{iv, lo, hi, step, inclusive};
