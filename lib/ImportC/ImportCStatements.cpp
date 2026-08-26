@@ -5169,8 +5169,36 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   if (!hi->getIntegerConstantExpr(astContext())) {
     llvm::SmallPtrSet<const clang::VarDecl *, 8> hiVars;
     collectRefVars(hi, hiVars);
+    // FR-61f-8 DEFECT FIX. `stmtWritesVar` is a SYNTACTIC walk over the body,
+    // so on its own it proves nothing about a write the body makes THROUGH A
+    // CALL. That was a measured miscompile, not a theoretical one:
+    //
+    //   int limit = 5;
+    //   void shrink(void) { if (limit > 2) limit--; }
+    //   for (i = 0; i < limit; i++) { s += i; shrink(); }
+    //
+    // lifted to `for i in 0..limit`, which snapshots the bound and runs 5
+    // times where C re-reads it and runs 3. The crate COMPILED CLEAN; only
+    // the byte-diff oracle saw it (603 from clang, 1505 from the crate).
+    //
+    // So once the body can call anything, the bound must be proved
+    // UNREACHABLE to the callee, not merely unwritten in the body's own text.
+    // The proof admitted here is the narrowest one that keeps the common
+    // `for (i = 0; i < n; i++) { printf(..); }` shape: every variable the
+    // bound reads is an automatic-storage, non-address-taken INTEGER. Such a
+    // variable has no name and no address outside this frame, so no callee
+    // can reach it. Anything else -- a global, a `static`, an address-taken
+    // local, or any indirection at all (`*p`, `a[k]`, `s.n`, whose bases are
+    // pointer/array/record and so not integers) -- refuses to the `while`
+    // lowering, which re-reads the bound every iteration and is therefore
+    // correct for all of them.
+    bool bodyCalls = stmtContainsCall(body);
     for (const clang::VarDecl *var : hiVars) {
       if (var == iv || stmtWritesVar(body, var))
+        return std::nullopt;
+      if (bodyCalls &&
+          (!var->hasLocalStorage() || addressTaken.contains(var) ||
+           !var->getType().getCanonicalType()->isIntegerType()))
         return std::nullopt;
     }
   }
