@@ -2744,7 +2744,12 @@ of references or inheritance, so it precedes both.
     port of the chain, calibrated against the instrumented build to within
     ~4%). Every remainder below therefore states an ONLY-OFFENDER yield --
     what a single-kind widening actually unlocks:
-      (a) NON-`int` INDUCTIONS -- 25 loops on EndToEnd, 0 on c-testsuite.
+      (a) NON-`int` INDUCTIONS -- LANDED as 61f-7 below; the estimate of 25
+          undershot badly (real harvest 41, plus 41 `loop {` retired). What
+          REMAINS of it is the deliberate rank fence: no induction narrower
+          than `int` lifts, and an unsigned induction with a runtime bound
+          lifts only in the half-open unit-step shape. Original entry:
+          25 loops on EndToEnd, 0 on c-testsuite.
           Earlier called "a design decision needing an op-signature
           change"; that was WRONG. `AllTypesMatch<["lowerBound",
           "upperBound","step"]>` (EmitRustOps.td:2194) says only that the
@@ -2799,6 +2804,70 @@ of references or inheritance, so it precedes both.
     of a general non-integer-scalar relaxation, never as its own increment.
     Plus the standing residual place-accumulator `needless_late_init` for
     NON-constant inits that a later late-init-merge fold could clean.
+    LANDED 61f-7 (2026-08-26): the `emitrust.for` now carries the
+    INDUCTION'S OWN type instead of the historical i32. NOTHING ABOUT THE OP
+    HAD TO CHANGE, and the earlier record calling this "a design decision
+    needing an op-signature change" was simply wrong:
+    `AllTypesMatch<["lowerBound","upperBound","step"]>` says only that the
+    three operands agree WITH EACH OTHER, the operand constraint is already
+    `AnyTypeOf<[AnyInteger, Index]>`, and `emitFor` is type-agnostic. The
+    whole restriction was one line of `emitRangeFor` -- `Type intType =
+    builder.getI32Type()` -- plus a clause demanding
+    `iv->getType() == astContext().IntTy`.
+    THE CHEAP VERSION OF THIS CHANGE IS A MISCOMPILE, so clause 1b
+    (`rangeForInductionTypeOk`) fences THREE divergences from C, and `int`
+    keeps EXACTLY its historical acceptance so every existing lift stays
+    byte-inert and the widening is purely additive:
+      (1) TRUNCATION. A runtime `size_t`/`unsigned long` bound above INT_MAX
+          cast down to i32 changes the trip count outright. Fenced at the
+          root rather than by a wider cast: a bound is never narrowed, it
+          must FIT -- either an integer constant representable in the
+          induction's type, or an expression already of that type. The named
+          shape, test/EndToEnd/borrow-bundle-scalarize.c:118, now emits
+          `for i in 0u64..n`.
+      (2) INTEGER PROMOTION, which the plan did not name and which is the
+          reason a narrow induction is refused ON ITS RANK rather than on
+          its bound. In C, `i < HI` on a narrow `i` compares at `int`, not at
+          `i`'s type: `for (uint8_t i = 0; i < 300; i++)` NEVER TERMINATES in
+          C, while a u8 range stops at 255. Refusing every type of lower rank
+          than `int` makes the C comparison and the Rust range agree by
+          construction -- no bound analysis required, and no way to get it
+          subtly wrong. It costs the `uint8_t` (11) and `uint16_t`/`unsigned
+          short` (16) buckets; ZERO corpus loops are blocked only by it.
+      (3) DEFINED WRAPAROUND. 61f-3 refined `i <= INT_MAX` into a
+          terminating `..=` because SIGNED overflow is UB. Unsigned
+          wraparound is DEFINED, so the same move would be a behaviour
+          change: the increment that carries the induction PAST the bound
+          must be proved not to wrap. A constant bound C is admitted iff
+          C + step still fits; a runtime bound only in the half-open
+          unit-step shape, where the final value is exactly the bound and
+          the bound is a value of the type by construction.
+    A constant bound on the non-`int` path is MATERIALIZED at the induction's
+    type rather than emitted at its own and cast, or the head would render
+    `for i in 0i32 as u32..n`. The `int` path deliberately does not take that
+    shortcut -- it must stay byte-identical to what the suite already pins.
+    The step uses `createScalarIntConstant`, since `arith.constant` requires
+    a signless type and an unsigned step needs `emitrust.constant`.
+    MEASURED, and the estimate of 25 undershot by 64%: `for .. in` 125 ->
+    166 (+41), `loop {` 183 -> 142 (-41), `while` flat at 141, lines 22319 ->
+    21961 (-358). The `loop {` collapse is the real story and was not
+    predicted: non-`int` inductions were not sitting in clean `while` loops
+    waiting to be upgraded, they were in the DEGENERATE `loop { .. break }`
+    form, which is where the -358 lines come from. c-testsuite unchanged at
+    14 -- that corpus is C89-style and has no such counters.
+    Full suite 824/824, EndToEnd 246/246 byte-diff, CTestSuite 220,
+    Cpp17Suite 35, ZERO golden edits, ZERO new rejections on either corpus.
+    Clippy 508 -> 515 apples-to-apples on this tree; all +7 are
+    `clippy::needless_late_init` with every other lint flat to the unit, and
+    this entry's own test contributes 8 both before and after (net 0), so
+    the rise is entirely the standing place-accumulator residual.
+    Test: test/EndToEnd/range-for-induction-type.c byte-diffs at three
+    argument values and pins each of the three fences FROM BOTH SIDES --
+    u32/u64/i64 heads and bounds above INT_MAX that lift, against a `uint8_t`
+    loop that never terminates in C, a `uint8_t` loop whose bound DOES fit
+    (still refused: the fence is on the type, not the bound), a constant
+    bound whose `+= 7` wraps, and a runtime unsigned bound with a non-unit
+    step and with `<=`.
     LANDED 61f-6 (2026-08-26): the AGGREGATE widening plus the NESTED-LOOP
     relaxation, which SHIP TOGETHER because measuring the first alone said
     they must.

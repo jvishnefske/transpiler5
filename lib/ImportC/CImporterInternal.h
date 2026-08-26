@@ -4918,6 +4918,20 @@ private:
   /// import is a side effect on the module.
   bool rangeForBodyVarIsPlaceBacked(const clang::VarDecl *var);
 
+  /// FR-61f-7: whether `bound` reaches `type` without narrowing (an integer
+  /// constant representable there, or an expression already of that type).
+  bool rangeForBoundFitsType(const clang::Expr *bound, clang::QualType type);
+
+  /// FR-61f-7, clause 1b: whether the loop may be emitted at the INDUCTION'S
+  /// OWN type instead of the historical i32. `int` keeps exactly its
+  /// historical acceptance; every other type must additionally prove it
+  /// cannot truncate a bound, cannot be reshaped by C's integer promotion,
+  /// and (when unsigned, where wraparound is DEFINED rather than UB) cannot
+  /// wrap on the increment past the last iteration.
+  bool rangeForInductionTypeOk(const clang::VarDecl *iv,
+                               const clang::Expr *lo, const clang::Expr *hi,
+                               int64_t step, bool inclusive);
+
   /// FR-61f: emits a matched `RangeFor` as an `emitrust.for` with the
   /// induction seeded from the region's block argument into a place.
   LogicalResult emitRangeFor(const RangeFor &range,
