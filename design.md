@@ -2730,19 +2730,148 @@ of references or inheritance, so it precedes both.
     test/EndToEnd/range-for.c (byte-diff: accumulator `+=`, array fill, step 2,
     `i <= n` while-fallback), test/Target/Rust/compound-assign-place.mlir (the
     place fold + its non-self-ref negative), test/Import/C/arrays.c goldens.
-    STILL OUT after 61f-5, re-measured on the POST-widening tree (338
-    distinct EndToEnd `for` statements): ~111 non-`int` induction (the NEW
-    dominant blocker -- mostly pointer-walking heads `for (p = head; p; p
-    = p->next)` and `unsigned`/`size_t`/`long` counters), ~68 body touches
-    pointer/float/struct, ~44 body touches a global/static, ~35 body has
-    control flow (any nested loop included), ~4 induction not dead after
-    the loop, ~2 non-`<`/`<=` condition. Descending (`.rev()`) also
-    remains. Note the dead-after analysis is NOT the limiting factor (4+3
-    rejections across both corpora) -- non-`int` inductions are, and that
-    needs the `AllTypesMatch` width story on `emitrust.for`, so it is a
-    design decision, not a widening. Plus a residual place-accumulator
-    `needless_late_init` for NON-constant inits a later late-init-merge
-    fold could clean.
+    STILL OUT after 61f-6, RE-RANKED BY ONLY-OFFENDER MEASUREMENT. The
+    headline numbers in this FR were wrong twice, in the same way both
+    times, and the reason is structural: `matchRangeFor` evaluates its
+    clauses in a fixed order and reports only the FIRST failure, so a
+    rejection count for an EARLY clause is an UPPER BOUND on that clause's
+    yield, never its yield -- widening it just hands those loops to a later
+    clause. "Assignment-form init is worth ~270" harvested 38; "non-`int`
+    induction is worth ~111" harvests 25 on EndToEnd and 0 on c-testsuite,
+    because 82 of the 107 genuine counting loops in that bucket fail a
+    LATER clause anyway. Both were re-measured by simulating the WHOLE
+    clause chain over the corpus (`clang -Xclang -ast-dump=json` + a Python
+    port of the chain, calibrated against the instrumented build to within
+    ~4%). Every remainder below therefore states an ONLY-OFFENDER yield --
+    what a single-kind widening actually unlocks:
+      (a) NON-`int` INDUCTIONS -- 25 loops on EndToEnd, 0 on c-testsuite.
+          Earlier called "a design decision needing an op-signature
+          change"; that was WRONG. `AllTypesMatch<["lowerBound",
+          "upperBound","step"]>` (EmitRustOps.td:2194) says only that the
+          three agree WITH EACH OTHER, the operand constraint is already
+          `AnyTypeOf<[AnyInteger, Index]>`, and `emitFor` is type-agnostic.
+          The i32-ness is purely the importer's: `emitRangeFor` hardcodes
+          `getI32Type()` and casts the bounds. Emit the ForOp at the
+          induction's OWN type. All 107 category-(A) inductions in the
+          corpus are UNSIGNED (`unsigned int` 73, `uint8_t` 11, `uint16_t`
+          8, `unsigned short` 8, `size_t` 6, `unsigned long` 1), so this is
+          width/signedness work, not sign extension. TWO MISCOMPILE VECTORS
+          fence the cheap cast-to-i32 shortcut: a runtime `size_t` bound
+          above INT_MAX truncates and changes the trip count
+          (test/EndToEnd/borrow-bundle-scalarize.c:118 is exactly that
+          shape), and C wraparound on a narrow induction is DEFINED --
+          `for (uint8_t i = 0; i < 300; i++)` never terminates in C but
+          would terminate under an i32 range.
+      (b) GLOBALS AND `static`s IN THE BODY -- 42 only-offender loops; all
+          50 offending instances are file-scope, ZERO function-local
+          `static`s in the corpus. A separate mechanism (module symbols and
+          staged copies, not `placeBackedScalars`); needs its own spike.
+      (c) POINTERS IN THE BODY -- 71 only-offender loops (25 `int`
+          induction + 46 non-`int`), 58 of the 92 offending instances being
+          parameters. THIS IS A CHECKPOINT, NOT A FOREGONE CONCLUSION. A
+          pointer local never reaches the place/cell decision at all:
+          `emitLocalVar` diverts to `emitPointerLocal`, which allocates raw
+          memref cells on EVERY arm (pool handle index + non-null, literal
+          region) held as `PointerLocalInfo::cursorCell`, so
+          `placeBackedScalars` is never consulted and CANNOT be -- the
+          cursor is a synthesized cell whose type is unrelated to the
+          variable's mapped type. Liftability means teaching the
+          pointer-region model to emit its cursor, its nullable
+          discriminant and the CTS-P7 enum-of-bases discriminant as
+          `emitrust.variable` places, then auditing every consumer that
+          does `memref.load`/`memref.store` on them. Core machinery: its
+          own design pass before any code.
+      (d) CONTROL FLOW IN THE BODY -- `if`/`?:`/`&&`/`||`/StmtExpr still
+          block (`emitrust.if` exists, so structured emission inside the
+          for body is the plausible route). `break`/`continue`/`goto`/
+          `return` STAY FENCED regardless: `emitrust.for` has no exit edge,
+          so admitting them is an op-design change, not a widening. 61f-6
+          already took the NESTED-LOOP leg of this remainder (below); the
+          `if` leg is what still holds the last 6 `loop {` degradations in
+          test/EndToEnd/struct-long-arrays.c, so it is now worth more than
+          its raw count suggests.
+      (e) DESCENDING loops -> `.rev()`, self-contained; mind that
+          `(lo..hi).rev()` is NOT `hi..lo`, and the INT_MIN/UB reasoning
+          61f-3 used for `..=`.
+    NOT WORTH DOING: float/double body SCALARS block 0 corpus loops. They
+    genuinely ARE cell-backed and the fix is the same one-line shape as
+    61f-4, but nothing is blocked by one -- fold it in only as a by-product
+    of a general non-integer-scalar relaxation, never as its own increment.
+    Plus the standing residual place-accumulator `needless_late_init` for
+    NON-constant inits that a later late-init-merge fold could clean.
+    LANDED 61f-6 (2026-08-26): the AGGREGATE widening plus the NESTED-LOOP
+    relaxation, which SHIP TOGETHER because measuring the first alone said
+    they must.
+    (i) The body whitelist was simply STALE. It rejected a body touching a
+    by-value struct/union, an array-of-struct, a multi-dim array, an
+    array-of-double or a function pointer, and its stated reason was that
+    such a variable would be backed by a `memref.alloca` cell inside the
+    single-block region. That reason never held for these types:
+    `emitLocalVar` computes `isAggregate` from `isa<StructType,
+    ArrayType>`, and `mapType` sends EVERY complete record (union included
+    -- it imports as a one-field struct) and EVERY `ConstantArrayType`
+    regardless of element type to exactly those two, so all of them already
+    took the `createVariablePlace` branch and never produced an alloca;
+    function pointers likewise via `isPlaceOnly`, and a by-value struct
+    PARAMETER via `bindOrdinaryParam`'s StructType arm. So: a gate
+    relaxation with NO new place-emission machinery. The array clause was
+    also needlessly narrow -- it demanded an INTEGER element, which rejects
+    `int[3][4]` (element `int[4]` is not integer) and every array of
+    struct, both already `ArrayType` places. The gate is now the named
+    predicate `rangeForBodyVarIsPlaceBacked`, stated on the CLANG type on
+    purpose: `mapType` imports records as a side effect, and calling it
+    from a matcher that runs speculatively (twice per ForStmt, and again
+    from `collectRangeForPlaceScalars` before any body is emitted) would
+    shift `struct_def` emission order in the module. Records in namespace
+    `std` are excluded because a literal-initialized `std::string_view`
+    local decomposes into i64 cursor CELLS -- exactly the hazard the
+    predicate exists to keep out.
+    (ii) MEASURED, and this is why the increment is a PAIR: the aggregate
+    widening ALONE lifted 39 corpus loops (`for .. in` 76 -> 115) but
+    DEGRADED 12 ENCLOSING loops from a clean `while` to `loop { let c = ..;
+    if c { .. } if !c { break; } }` -- `loop {` 177 -> 189, lines 22342 ->
+    22377 (a NET GROWTH). The mechanism: lifting an INNER loop drags the
+    OUTER loop's induction into `placeBackedScalars`, and a place leaves
+    `lift-cf-to-scf` no SSA loop-carried value to build an `scf.while`
+    from. A for-loop count that rises while `loop {` rises with it is not a
+    win, and only measuring all THREE loop forms shows that.
+    (iii) The fix is to let the outer loop lift too. `blocksRangeForLift`
+    rejected every nested `ForStmt` unconditionally; a nested `for` that
+    ITSELF matches emits a nested REGION op, not cf blocks, and
+    `emitrust.for` regions nest by construction -- `emitRangeFor` already
+    saves and restores its `inductionValues` entry precisely so a nested
+    body may read the enclosing induction. So the clause becomes
+    `!matchRangeFor(nested).has_value()`, which recurses on a STRICTLY more
+    deeply nested statement and therefore terminates. A nested loop that
+    does NOT lift still blocks (it would emit the cf `while` lowering
+    inside the single-block region). `blocksRangeForLift` moved out of the
+    anonymous namespace into `CImporter` to reach `matchRangeFor`. This is
+    sound only because `matchRangeFor` is a pure function of the AST plus
+    the pre-pass `addressTaken` set -- it never reads `placeBackedScalars`
+    -- so the pre-pass and emission always agree.
+    MEASURED (corpus-intrinsic, excluding this entry's own test):
+    `for .. in` 76 -> 125, `while` 196 -> 141, `loop {` 177 -> 183, lines
+    22342 -> 22319 (a NET SHRINK, where part (i) alone grew it).
+    c-testsuite 12 -> 14 `for .. in`, 18142 -> 18127 lines -- small, as
+    predicted: that corpus is C89-style throughout, so body-side widenings
+    are worth nearly 0 there. The 6 remaining `loop {` are all in
+    test/EndToEnd/struct-long-arrays.c, whose loops have an `if` in the
+    body and so are held by remainder (d), not by this one.
+    Full suite 823/823, EndToEnd 245/245 byte-diff, CTestSuite 220,
+    Cpp17Suite 35, ZERO golden edits and ZERO new rejections on either
+    corpus (each increment must check for new REJECTIONS, not only new
+    acceptances). Clippy 494 -> 500 measured apples-to-apples on this tree;
+    ALL +6 are `clippy::needless_late_init` and every other lint is flat to
+    the unit, so it is the standing place-accumulator residual above (a
+    place-backed scalar with a non-constant init emits `let mut s: i32; s =
+    <expr>;`), one of the 6 being this entry's own test. NOT the ratchet
+    baseline of 331, which was set at 114 crates and now stands at 158.
+    Test: test/EndToEnd/range-for-aggregates.c byte-diffs at three argument
+    values (so nothing constant-folds) across by-value struct, array of
+    struct, multi-dim array, array of double, union, function-pointer swap,
+    and a both-levels-lift nested pair -- and pins BOTH frontiers from the
+    other side: a float SCALAR (genuinely cell-backed) and a nested loop
+    whose inner body has an `if` (so neither level may lift).
     LANDED 61f-5 (2026-08-24): the ASSIGNMENT-FORM init `for (i = LO; i <
     HI; i += K)`, induction declared OUTSIDE the loop. Clause 1 accepted
     only the DeclStmt form because an init-declared induction is

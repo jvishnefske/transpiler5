@@ -374,3 +374,53 @@ title = "Harness epoch 4: freeze the union corpus (grown C + first C++)"
 summary = "epoch-3 froze 144 EndToEnd .c files; there are now 167 plus 52 measurable C++ crates no epoch covers."
 blocked_by = []
 anchor = "epoch 4"
+
+# ---- FR-61f remainders, re-ranked by ONLY-OFFENDER measurement (2026-08-26).
+# A first-failure rejection count is an UPPER BOUND on a clause's yield, not
+# its yield -- widening an early clause just hands those loops to a later one.
+# Every yield below is what a single-kind widening actually unlocks. Prose:
+# design.md, the "STILL OUT after 61f-6" block under the 61f entry.
+
+[[items]]
+id = "FR-61f-a"
+rank = 18
+kind = "feature"
+status = "spiked"
+size = "S"
+title = "Range-for: emit the ForOp at the induction's own MLIR type"
+summary = "Only-offender yield 25 loops on EndToEnd, 0 on c-testsuite. Importer-only, NOT an op change: AllTypesMatch says the three operands agree with EACH OTHER, the constraint is already AnyTypeOf<[AnyInteger, Index]>, and emitFor is type-agnostic -- the i32-ness is emitRangeFor hardcoding getI32Type(). All 107 corpus inductions in this bucket are UNSIGNED, so it is width/signedness work. Two miscompile vectors fence the cast-to-i32 shortcut: a runtime size_t bound above INT_MAX truncates the trip count, and C wraparound on a narrow induction is DEFINED (for (uint8_t i = 0; i < 300; i++) never terminates in C)."
+blocked_by = []
+anchor = "STILL OUT after 61f-6"
+
+[[items]]
+id = "FR-61f-b"
+rank = 21
+kind = "feature"
+status = "open"
+size = "M"
+title = "Range-for: a body may touch a global or a file-scope static"
+summary = "Only-offender yield 42 loops; all 50 offending instances are file-scope, ZERO function-local statics in the corpus. Separate mechanism from placeBackedScalars -- module symbols and staged copies -- so it needs its own spike."
+blocked_by = []
+anchor = "STILL OUT after 61f-6"
+
+[[items]]
+id = "FR-61f-d"
+rank = 23
+kind = "feature"
+status = "open"
+size = "M"
+title = "Range-for: structured control flow in the body, and descending -> .rev()"
+summary = "The nested-loop leg landed in 61f-6; the `if`/`?:`/&&/|| leg is what still holds the last 6 loop{} degradations in struct-long-arrays.c, so it is worth more than its raw count. emitrust.if exists, so structured emission inside the for body is the plausible route. break/continue/goto/return STAY FENCED -- emitrust.for has no exit edge, so admitting them is an op-design change. Descending is self-contained; (lo..hi).rev() is NOT hi..lo, and 61f-3's INT_MIN/UB reasoning applies."
+blocked_by = []
+anchor = "STILL OUT after 61f-6"
+
+[[items]]
+id = "FR-61f-c"
+rank = 24
+kind = "feature"
+status = "open"
+size = "L"
+title = "Range-for: a body may touch a pointer (needs its own design pass)"
+summary = "Biggest remainder -- 71 only-offender loops, 58 of the 92 offending instances being parameters -- and a CHECKPOINT, not a foregone conclusion. A pointer local never reaches the place/cell decision: emitLocalVar diverts to emitPointerLocal, which allocates raw memref cells on every arm, held as PointerLocalInfo::cursorCell, so placeBackedScalars is never consulted and CANNOT be (the cursor is a synthesized cell whose type is unrelated to the variable's mapped type). Liftability means teaching the pointer-region model to emit its cursor, its nullable discriminant and the CTS-P7 enum-of-bases discriminant as emitrust.variable places, then auditing every memref.load/store consumer. Core machinery: design pass before any code."
+blocked_by = []
+anchor = "STILL OUT after 61f-6"
