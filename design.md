@@ -2804,6 +2804,47 @@ of references or inheritance, so it precedes both.
     of a general non-integer-scalar relaxation, never as its own increment.
     Plus the standing residual place-accumulator `needless_late_init` for
     NON-constant inits that a later late-init-merge fold could clean.
+    LANDED 61f-8 (2026-08-26), a DEFECT and the reason the widenings above
+    are worth having a byte-diff oracle for: clause 5's "HI is loop-
+    invariant" proof was purely SYNTACTIC and could not see a write the body
+    makes THROUGH A CALL. `emitrust.for` evaluates its bound ONCE, before the
+    loop; C's `for` re-reads it every iteration; clause 5 bridged that with
+    `stmtWritesVar(body, var)`, a walk over the body's own text, to which a
+    call is opaque.
+    A MEASURED MISCOMPILE, found by spiking remainder (b) rather than by any
+    test:
+        int limit = 5;
+        void shrink(void) { if (limit > 2) limit--; }
+        for (i = 0; i < limit; i++) { s += i; shrink(); }
+    lifted to `for i in 0..limit`, snapshotting the bound and running 5 times
+    where C re-reads it and runs 3 -- clang printed 603, the crate printed
+    1505. THE CRATE COMPILED CLEAN, so only the byte-diff saw it; this is the
+    same class as 61f-5's, and it PREDATES both 61f-6 and 61f-7 (a body may
+    contain a call and a bound may read a global independently of anything
+    those two widened).
+    The proof now admitted is the narrowest one that keeps the common
+    `for (i = 0; i < n; i++) { printf(..); }` shape: once the body can call
+    anything, every variable the bound reads must be an automatic-storage,
+    NON-ADDRESS-TAKEN INTEGER -- such a variable has no name and no address
+    outside the frame, so no callee can reach it. A global, a `static`, an
+    address-taken local, or any indirection (`*p`, `a[k]`, `s.n`, whose bases
+    are pointer/array/record and so not integers) falls back to the `while`
+    lowering, which re-reads the bound every iteration and is correct for all
+    of them. A CONSTANT bound is unaffected: there is nothing to re-read.
+    COST: exactly ONE corpus loop, and it is the fix earning its keep on real
+    code rather than on the probe -- test/EndToEnd/borrow-bundle-scalarize.c's
+    `for (i = 0; i < n; i++) { printf(..); }`, where `n` is address-taken
+    (`poll(&buf[off], .., &n, argc)`) and the body calls. `for .. in` 166 ->
+    165, c-testsuite unchanged. Clippy went DOWN, 519 -> 516, and one of the
+    three was `clippy::mut_range_bound` going 1 -> 0: clippy independently
+    flags a range bound mutated inside the loop, so it had been pointing at
+    this exact bug all along, invisible inside an aggregate ratchet total.
+    Full suite 825/825, EndToEnd 247/247 byte-diff, CTestSuite 220,
+    Cpp17Suite 35, zero golden edits. Test:
+    test/EndToEnd/range-for-bound-aliasing.c pins the global-written-by-callee
+    shape and the address-taken-bound shape as refusals, and the plain-local
+    bound and the constant bound as still lifting; with the fix reverted its
+    byte-diff leg fails 603 vs 1505 and 32 vs 101.
     LANDED 61f-7 (2026-08-26): the `emitrust.for` now carries the
     INDUCTION'S OWN type instead of the historical i32. NOTHING ABOUT THE OP
     HAD TO CHANGE, and the earlier record calling this "a design decision
