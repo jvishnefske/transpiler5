@@ -66,4 +66,4 @@ public:
 // C3: the method's cast-to-enum resolves the module-level enum_def from
 // inside the impl and renders the constructor form.
 // RUST: impl Holder {
-// RUST: c = Color(self.n);
+// RUST: let c: Color = Color(self.n);

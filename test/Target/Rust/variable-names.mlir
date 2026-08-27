@@ -65,12 +65,13 @@ emitrust.func @counter_skip() -> i32 {
 // Two same-named locals in one function: the second uniquifies to `x_1`;
 // no shadowing re-`let` is ever emitted. (Both bindings defer their dead
 // synthesized defaults -- the FR-61b deferral machinery names through the
-// same path.)
+// same path -- and FR-132 then merges each declaration with its initializing
+// write. Names are claimed function-uniquely, so sinking a declaration can
+// never turn the second binding into a shadow of the first: `x_1` stays
+// `x_1`.)
 // CHECK-LABEL: fn same_name(v0: i32) -> i32 {
-// CHECK-NEXT:    let x: i32;
-// CHECK-NEXT:    let x_1: i32;
-// CHECK-NEXT:    x = v0;
-// CHECK-NEXT:    x_1 = v0;
+// CHECK-NEXT:    let x: i32 = v0;
+// CHECK-NEXT:    let x_1: i32 = v0;
 // CHECK-NEXT:    x + x_1
 // CHECK-NEXT:  }
 emitrust.func @same_name(%arg0: i32) -> i32 {

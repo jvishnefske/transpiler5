@@ -130,11 +130,11 @@ emitrust.func @impure_operand0_stays(%arg0: i32, %arg1: i32) -> i32 {
 }
 
 // NON-fold: distinct bindings. Neither operand is the target, so the assign
-// keeps its plain form (the SSA analogue of compound-assign-place's
-// `notself`; the dead literal init is dropped into the deferred-init `let`).
+// keeps its plain form -- no `+=` (the SSA analogue of compound-assign-place's
+// `notself`; the dead literal init is dropped, and FR-132 then merges the
+// deferred declaration with its initializing write).
 // CHECK-LABEL: fn distinct_stays(v0: i32, v1: i32) -> i32 {
-// CHECK-NEXT:    let v3: i32;
-// CHECK-NEXT:    v3 = v0 + v1;
+// CHECK-NEXT:    let v3: i32 = v0 + v1;
 // CHECK-NEXT:    v3
 // CHECK-NEXT:  }
 emitrust.func @distinct_stays(%arg0: i32, %arg1: i32) -> i32 {

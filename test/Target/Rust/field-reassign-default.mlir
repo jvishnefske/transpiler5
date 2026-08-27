@@ -121,11 +121,13 @@ emitrust.func @indexed_place(%arg0: i32, %arg1: i32) -> i32 {
   emitrust.return %r : i32
 }
 
-// A deferred-init binding (`let p; p = ..`) is out of the fuse's scope: its
-// rendering is byte-identical to the pre-FR-63 one.
+// A deferred-init binding (`let p; p = ..`) is out of the FUSE's scope: the
+// `p.x` store stays a statement instead of becoming a functional-update field.
+// (FR-132 separately merges the declaration with its initializing write, which
+// is a different fold at a different program point and leaves the refusal --
+// the surviving `p.x = v1;` statement -- intact.)
 // CHECK-LABEL: fn deferred_untouched(v0: Point, v1: i32) -> i32 {
-// CHECK-NEXT:    let mut p: Point;
-// CHECK-NEXT:    p = v0;
+// CHECK-NEXT:    let mut p: Point = v0;
 // CHECK-NEXT:    p.x = v1;
 // CHECK-NEXT:    p.x
 // CHECK-NEXT:  }
