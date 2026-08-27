@@ -5162,11 +5162,6 @@ bool CImporter::rangeForInductionTypeOk(const clang::VarDecl *iv,
   if (!type->isIntegerType() || type->isBooleanType() ||
       type->isEnumeralType())
     return false;
-  // Divergence (2): no type of lower rank than `int`, so C's integer
-  // promotion never widens the comparison out from under us.
-  if (astContext().getTypeSize(type) < astContext().getTypeSize(
-                                           astContext().IntTy))
-    return false;
   // Divergence (1): both bounds and the step must be carried at `type`
   // without narrowing.
   if (!rangeForBoundFitsType(lo, type) || !rangeForBoundFitsType(hi, type))
@@ -5174,6 +5169,51 @@ bool CImporter::rangeForInductionTypeOk(const clang::VarDecl *iv,
   unsigned bits = astContext().getIntWidth(type);
   if (step <= 0)
     return false;
+  // Divergence (2), the PROMOTION case: a type of lower rank than `int`.
+  //
+  // 61f-7 refused these outright, on the type's rank, and said so: "it costs
+  // the `uint8_t` (11) and `uint16_t`/`unsigned short` (16) buckets; ZERO
+  // corpus loops are blocked only by it". The first half was right and the
+  // second was measured wrong later -- the induction-type clause is 34 unique
+  // sites, the second-largest remainder there is. So the fence is refined
+  // here rather than kept, and refined rather than dropped, because the
+  // hazard it named is real: in C, `i < HI` on a narrow `i` compares at
+  // `int`, which is why `for (uint8_t i = 0; i < 300; i++)` NEVER TERMINATES
+  // while a u8 range stops at 255.
+  //
+  // The exact condition. Promotion is harmless whenever every value the loop
+  // can produce is inside T's range, because then the comparison at `int` and
+  // the comparison at T agree on every iteration and no conversion back to T
+  // is ever out of range. Two obligations give that:
+  //
+  //   - HI must be a COMPILE-TIME CONSTANT. A runtime bound is unbounded from
+  //     the matcher's view even when its TYPE is T: a `uint8_t` HI may be 255,
+  //     and then C's final `i += 1` wraps to 0 and loops forever where Rust's
+  //     `0..255` simply ends. `rangeForBoundFitsType` accepts an
+  //     expression-already-of-type-T, which is sound for a wide type and is
+  //     precisely the trap for a narrow one -- so narrow types need the
+  //     stricter test, not the shared one.
+  //   - HI + step must fit T, so the increment PAST the last iteration cannot
+  //     leave the range. That is the same obligation the unsigned arm below
+  //     carries, applied here to signed narrow types too: converting an
+  //     out-of-range value to a narrow signed type is implementation-defined,
+  //     not the plain UB that let 61f-3 refine `..=`, so it earns no
+  //     exemption.
+  //
+  // LO may still be a runtime expression of type T: its value is in range by
+  // construction, and a LO past HI just means the loop does not run.
+  if (astContext().getTypeSize(type) <
+      astContext().getTypeSize(astContext().IntTy)) {
+    std::optional<llvm::APSInt> bound = hi->getIntegerConstantExpr(astContext());
+    if (!bound || bound->isNegative())
+      return false;
+    bool isUnsigned = type->isUnsignedIntegerType();
+    uint64_t typeMax = isUnsigned ? ((uint64_t(1) << bits) - 1)
+                                  : ((uint64_t(1) << (bits - 1)) - 1);
+    if (static_cast<uint64_t>(step) > typeMax)
+      return false;
+    return bound->getZExtValue() <= typeMax - static_cast<uint64_t>(step);
+  }
   if (!type->isUnsignedIntegerType())
     return static_cast<uint64_t>(step) < (uint64_t(1) << (bits - 1));
   // Divergence (3), unsigned only. The loop's LAST act is the increment that

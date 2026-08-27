@@ -2923,6 +2923,48 @@ of references or inheritance, so it precedes both.
     `static` carried across two calls. Its pins live in one ordered block
     rather than beside each function, because the emitter groups
     global-touching functions into one actor impl and emits them in ITS order.
+    LANDED 61f-13 (2026-08-27): the NARROW-INDUCTION refinement. 61f-7
+    refused every induction of lower rank than `int` OUTRIGHT, on the type,
+    and justified it as costless. It was not: the induction-type clause is 34
+    unique sites, the second-largest remainder after the pointer bucket.
+    The hazard 61f-7 named is real and is NOT dropped here -- in C, `i < HI`
+    on a narrow `i` compares at `int`, which is why
+    `for (uint8_t i = 0; i < 300; i++)` never terminates while a u8 range
+    stops at 255. What changes is that the fence becomes the EXACT condition
+    instead of a proxy for it. Promotion is harmless whenever every value the
+    loop can produce is inside T's range, and two obligations give that:
+      - HI must be a COMPILE-TIME CONSTANT. A runtime bound is unbounded from
+        the matcher's view even when its TYPE is T -- a `uint8_t` HI may be
+        255, and then C's final `i += 1` wraps to 0 and loops forever where
+        Rust's `0..255` simply ends. `rangeForBoundFitsType` accepts an
+        expression-already-of-type-T, which is sound for a WIDE type and is
+        precisely the trap for a narrow one, so narrow types take a stricter
+        test rather than the shared one.
+      - HI + step must fit T, so the increment PAST the last iteration cannot
+        leave the range. Applied to narrow SIGNED types too: converting an
+        out-of-range value to a narrow signed type is implementation-defined,
+        not the plain UB that let 61f-3 refine `..=`, so it earns no
+        exemption. Deliberately conservative in one place: the true worst
+        case is HI + step - 1, but LO may be a runtime value, so the bound is
+        taken at HI + step.
+    LO may still be a runtime expression of type T -- its value is in range by
+    construction, and a LO past HI just means the loop does not run.
+    MEASURED against HEAD 170f211: EndToEnd `for .. in` 210 -> 218 (+8),
+    `loop {` 139 -> 131 (-8), `while` flat at 100, lines 21060 -> 20977 (-83).
+    These were DEGENERATE `loop {}` forms, not clean `while`s. c-testsuite
+    completely unchanged (26), and only TWO corpus files move
+    (array-2d-pointer.c, flexible-array-member-tail-local.c). Realized yield
+    is 8 of the clause's 34 unique sites -- about 24%, better than the ~12%
+    the `if` leg realized but still far under the raw count, which is the
+    fourth independent confirmation of this FR's standing lesson.
+    Full suite 835/835, zero new rejections on either corpus, clippy flat at
+    68 (the ratchet is meaningful since its 2026-08-26 re-basing, so flat
+    means something). Test: test/EndToEnd/range-for-induction-type.c, whose
+    `u8_fits_still_refused` case is RENAMED and its pin INVERTED rather than
+    deleted -- it now pins `for i in 0u8..100u8`, and three new legs pin the
+    refined frontier from the other side (a constant bound AT the type max, a
+    runtime bound of the narrow type, and a narrow SIGNED induction that does
+    lift).
     LANDED 61f-12 (2026-08-26): a range-eligible `for` body may contain
     structured `if`/`else`. `emitIfStmt` gained a second arm, gated on a new
     `liftedForDepth` counter, that emits an `emitrust.if` REGION PAIR instead
@@ -3102,7 +3144,14 @@ of references or inheritance, so it precedes both.
           than `int` makes the C comparison and the Rust range agree by
           construction -- no bound analysis required, and no way to get it
           subtly wrong. It costs the `uint8_t` (11) and `uint16_t`/`unsigned
-          short` (16) buckets; ZERO corpus loops are blocked only by it.
+          short` (16) buckets.
+          THE "ZERO corpus loops are blocked only by it" THIS ENTRY ORIGINALLY
+          CLAIMED WAS WRONG, and was corrected by measurement twice over: the
+          induction-type clause is 34 UNIQUE sites, the second-largest
+          remainder, and refining the fence (61f-13 below) realized 8 of them.
+          The claim came from reading a pre-widening bucket count as a
+          post-widening blocker count -- the same upper-bound error this FR
+          keeps re-learning.
       (3) DEFINED WRAPAROUND. 61f-3 refined `i <= INT_MAX` into a
           terminating `..=` because SIGNED overflow is UB. Unsigned
           wraparound is DEFINED, so the same move would be a behaviour

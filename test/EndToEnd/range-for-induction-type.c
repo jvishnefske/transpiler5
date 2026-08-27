@@ -19,9 +19,16 @@
 //      never narrowed, it must fit.
 //  (2) INTEGER PROMOTION -- in C, `i < HI` on a narrow `i` compares at `int`,
 //      which is why `for (uint8_t i = 0; i < 300; i++)` NEVER TERMINATES in C
-//      while a u8 range would stop at 255. Fenced by refusing every type of
-//      lower rank than `int`: at rank >= int there is no promotion, so the C
-//      comparison and the Rust range agree by construction.
+//      while a u8 range would stop at 255. FR-61f-7 fenced this by refusing
+//      every type of lower rank than `int` outright; FR-61f-13 REFINED that to
+//      the exact condition, because the blanket refusal was measured as the
+//      second-largest remaining blocker (34 unique sites), not the "zero
+//      corpus loops" this file originally claimed. Promotion is harmless
+//      whenever every value the loop can produce is inside T's range, and two
+//      obligations give that: HI must be a compile-time CONSTANT (a runtime
+//      `uint8_t` bound may be 255, and then C's final `i += 1` wraps to 0 and
+//      loops forever where Rust's `0..255` simply ends), and HI + step must
+//      fit T so the increment past the last iteration cannot leave the range.
 //  (3) DEFINED WRAPAROUND -- signed overflow is UB, which is what let 61f-3
 //      refine `i <= INT_MAX` into a terminating `..=`. UNSIGNED wraparound is
 //      DEFINED, so an unsigned induction must additionally prove the
@@ -108,15 +115,59 @@ int u8_promotes(int cap) {
   return hits;
 }
 
-// (2) The same fence from the other side: this bound DOES fit in u8, so the
-// loop is perfectly ordinary -- and it is still refused, because the fence is
-// on the type and not on the bound. A deliberately conservative frontier; the
-// corpus has no loop blocked only by it.
-// CHECK-LABEL: fn u8_fits_still_refused
-// CHECK-NOT:     for {{.*}} in
-int u8_fits_still_refused(int k) {
+// (2) THE SAME FENCE FROM THE OTHER SIDE, AND THE PIN THAT FLIPPED. This bound
+// DOES fit in u8, so the loop is perfectly ordinary. FR-61f-7 refused it
+// anyway -- the fence was on the TYPE, not on the bound -- and this file
+// asserted that was costless. It was not: the induction-type clause was later
+// measured at 34 unique blocked sites. FR-61f-13 refines the fence to the
+// exact condition and this loop now lifts, at u8, with `100 + 1 <= 255`.
+// The pin is INVERTED rather than deleted: what it guards is that the
+// refinement did not simply drop the fence, which `u8_promotes` above and
+// `u8_bound_at_max` below pin from the other direction.
+// CHECK-LABEL: fn u8_fits_now_lifts
+// CHECK:         for {{i|_i}} in 0u8..100u8
+int u8_fits_now_lifts(int k) {
   int s = 0;
   for (uint8_t i = 0; i < 100; i++)
+    s += i + k;
+  return s;
+}
+
+// (2c) A constant bound AT the type maximum: the final `i++` wraps to 0 in C
+// and loops forever, while a `250u8..255u8` range ends. `HI + step <= max(T)`
+// is exactly what refuses it. Guarded so the test halts.
+// CHECK-LABEL: fn u8_bound_at_max
+// CHECK-NOT:     for {{.*}} in
+int u8_bound_at_max(int cap) {
+  int hits = 0;
+  for (uint8_t i = 250; i < 255; i++) {
+    hits++;
+    if (hits >= cap)
+      break;
+  }
+  return hits;
+}
+
+// (2d) A narrow induction with a RUNTIME bound of its own type. The value is
+// in range by construction, but the matcher cannot bound it, so the final
+// increment cannot be proved not to wrap. Refused.
+// CHECK-LABEL: fn u8_runtime_bound
+// CHECK-NOT:     for {{.*}} in
+int u8_runtime_bound(unsigned char n, int k) {
+  int s = 0;
+  for (unsigned char i = 0; i < n; i++)
+    s += i + k;
+  return s;
+}
+
+// (2e) A narrow SIGNED induction, constant bound: same rule, no exemption for
+// signed. Converting an out-of-range value to a narrow signed type is
+// implementation-defined, not the plain UB that let FR-61f-3 refine `..=`.
+// CHECK-LABEL: fn s16_fits
+// CHECK:         for {{i|_i}} in 0i16..200i16
+int s16_fits(int k) {
+  int s = 0;
+  for (short i = 0; i < 200; i++)
     s += i + k;
   return s;
 }
@@ -167,7 +218,10 @@ int main(int argc, char **argv) {
                                             (size_t)3000000000UL + n));
   printf("%ld\n", l_count((long)n));
   printf("%d\n", u8_promotes(argc + 400));
-  printf("%d\n", u8_fits_still_refused(argc));
+  printf("%d\n", u8_fits_now_lifts(argc));
+  printf("%d\n", u8_bound_at_max(argc + 9));
+  printf("%d\n", u8_runtime_bound((unsigned char)(argc + 7), argc));
+  printf("%d\n", s16_fits(argc));
   printf("%u\n", u_step_wraps(n));
   printf("%u\n", u_runtime_step2(n * 3u));
   printf("%u\n", u_runtime_inclusive(n));
