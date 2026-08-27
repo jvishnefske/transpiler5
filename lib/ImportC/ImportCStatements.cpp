@@ -4877,6 +4877,30 @@ bool inductionDeadAfter(const clang::Stmt *funcBody,
 /// `return`/labels/`case`). An `emitrust.for` body is a single-block region,
 /// so any of these in the body makes the loop non-liftable in this slice.
 ///
+/// THIS IS A BLOCKLIST, AND BLOCKLISTS LEAK. Two entries have now been found
+/// the hard way, both by crashing the MLIR verifier rather than by a
+/// diagnostic: `va_arg` (FR-61f-9) and a call to a can-throw-closure function
+/// (here). So the invariant is written down. The complete set of emitters in
+/// lib/ImportC that call `createBlock`/`getLabelBlock` or create a
+/// `cf::BranchOp`/`cf::CondBranchOp`/`cf::SwitchOp` is:
+///
+///   emitIfStmt, emitWhileStmt, emitDoStmt, emitForStmt, emitSwitchStmt,
+///   emitDispatchSwitch, emitMultiBaseDispatch, emitReturnStmt, emitStmt
+///   (break/continue/goto/label), emitShortCircuit, emitConditionalOperator,
+///   emitVaArg, emitThrowStmt, emitTryStmt, unwrapThrowsResult,
+///   storePointerAssign, emitGlobalCursorWrite, getLabelBlock.
+///
+/// Every one is either fenced below or unreachable inside a lifted body, and
+/// the two that are NOT fenced are unreachable for a stated reason:
+///   - emitForStmt routes to `emitRangeFor` (a region op) when the nested loop
+///     itself lifts, and is fenced by the dyn_cast above when it does not.
+///   - storePointerAssign, emitGlobalCursorWrite, emitMultiBaseDispatch and
+///     emitDispatchSwitch all need a POINTER or REFERENCE variable in the
+///     body, which `rangeForBodyVarIsPlaceBacked` refuses outright.
+///
+/// Anything added to lib/ImportC that creates a block belongs on that list or
+/// in this fence.
+///
 /// THE ONE EXCEPTION is a nested `for` that ITSELF lifts. A lifted loop emits
 /// a REGION OP, not cf blocks, and `emitrust.for` regions nest by
 /// construction -- `emitRangeFor` already saves and restores its
@@ -4906,14 +4930,35 @@ bool CImporter::blocksRangeForLift(const clang::Stmt *stmt) {
   // EXPRESSION -- `va_arg(ap, int)` names `ap`, but the hazard is the walk,
   // not the `va_list`. (The whitelist fences the `va_list` too; both fire,
   // and both are meant to.)
+  //
+  // `clang::CXXThrowExpr` / `clang::CXXTryStmt`: `emitThrowStmt` and
+  // `emitTryStmt` build the W2.24 Result-threading cf pattern, which is cf
+  // blocks in the function region like any other.
   if (llvm::isa<clang::IfStmt, clang::WhileStmt,
                 clang::DoStmt, clang::SwitchStmt, clang::CXXForRangeStmt,
                 clang::BreakStmt, clang::ContinueStmt, clang::GotoStmt,
                 clang::IndirectGotoStmt, clang::ReturnStmt, clang::LabelStmt,
                 clang::CaseStmt, clang::DefaultStmt,
                 clang::ConditionalOperator, clang::BinaryConditionalOperator,
-                clang::VAArgExpr, clang::StmtExpr>(stmt))
+                clang::VAArgExpr, clang::StmtExpr,
+                clang::CXXThrowExpr, clang::CXXTryStmt>(stmt))
     return true;
+  // A CALL to a can-throw-closure function is a block-creating construct too,
+  // and NOTHING ABOUT ITS SPELLING SAYS SO -- which is exactly why this
+  // blocklist was missing it. `unwrapThrowsResult` emits two `createBlock()`s
+  // and a `cf::CondBranchOp` for the early-return pattern, and `createBlock`
+  // appends to the FUNCTION region; with the insertion point inside the
+  // single-block `emitrust.for` region the resulting `cf.cond_br` names
+  // successors that are not in it, and the MLIR verifier faults on the null
+  // successor. `throwsClosure` is a module-level planning result, stable
+  // across the pre-pass and emission, so reading it here preserves
+  // `matchRangeFor`'s purity the same way `addressTaken` does; the predicate
+  // mirrors the call site in `emitCallExpr`.
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt))
+    if (throwsPlanActive)
+      if (const clang::FunctionDecl *callee = call->getDirectCallee())
+        if (throwsClosure.contains(callee->getCanonicalDecl()))
+          return true;
   if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(stmt))
     if (bo->getOpcode() == clang::BO_LAnd ||
         bo->getOpcode() == clang::BO_LOr)
