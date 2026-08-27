@@ -159,6 +159,17 @@ blocked_by = []
 anchor = "FR-136 NO-GO (2026-08-26)"
 
 [[items]]
+id = "FR-137"
+rank = 15
+kind = "defect"
+status = "open"
+size = "M"
+title = "CRASH: importing antirez/sds segfaults in clang's constant evaluator"
+summary = "Highest-severity class: an abort with no diagnostic, no partial credit, no recovery. Found by the TRACTOR readiness sweep 2026-08-27 -- one crash in 13 unseen external units. Offending decl is SDS_NOINIT (const char *g = \"...\"), call site is recordPointerGlobalFileScopeDetail's var->evaluateValue() at lib/ImportC/ImportC.cpp:2460; the fault is INSIDE clang (evaluateValue -> evaluateValueImpl -> EvaluateAsInitializer). NOT a stack overflow (survives ulimit -s unlimited), NOT a parse error (clang -fsyntax-only gives zero errors), and the call site's own null/lvalue guard is correct. Every import path crashes; both pre-import analyses (item-graph, coloring) are clean. No reduced repro yet -- the isolated two-line version imports fine, so context matters. Ranked above the feature queue: fix before any external evaluation."
+blocked_by = []
+anchor = "FR-137 DEFECT (CRASH on unseen external C"
+
+[[items]]
 id = "FR-135"
 rank = 26
 kind = "defect"

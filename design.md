@@ -8996,6 +8996,39 @@ piece and becomes FR-45.
   induction-type and 29 blocks-lift sites are both larger than anything
   points-to touches.
 
+- [ ] FR-137 DEFECT (CRASH on unseen external C, found by the TRACTOR
+  readiness sweep 2026-08-27): importing antirez/sds `sds.c` SEGFAULTS
+  inside clang's constant evaluator. This is the highest-severity defect
+  class this project has -- not a rejection, which is a feature here, but an
+  abort with NO diagnostic, no partial credit and no recovery.
+  LOCALIZED: the offending declaration is `SDS_NOINIT` (`const char
+  *SDS_NOINIT = "SDS_NOINIT";`, sds.c:42) and the call site is
+  `recordPointerGlobalFileScopeDetail`'s `var->evaluateValue()` at
+  lib/ImportC/ImportC.cpp:2460 (W3.2 COMMIT B's cross-TU pointer-global
+  reconstruction). The stack is
+  `VarDecl::evaluateValue -> evaluateValueImpl ->
+  Expr::EvaluateAsInitializer`, i.e. the fault is INSIDE clang, reached from
+  our call.
+  MEASURED PROPERTIES, all of which narrow the fix:
+    - NOT a stack overflow: it still segfaults with `ulimit -s unlimited`.
+    - NOT a parse error: `clang -fsyntax-only` accepts sds.c with ZERO
+      errors, so the decl is well-formed.
+    - The call site's own guard is correct (`if (!value || !value->isLValue()
+      || value->isNullPointer()) return;`) -- the fault is before it returns.
+    - Every IMPORT path crashes (`--emit=import`, `--emit=mlir`,
+      `--emit=rust`, `--emit=crate` with `--recover` or `--incremental`),
+      while both PRE-IMPORT analyses (`--emit=item-graph`, `--emit=coloring`)
+      are clean. So the FR-40/41 project analyses survive an input the
+      importer cannot, which is worth knowing for triage.
+    - NOT reproducible in isolation: `const char *g = "s"; int use(void) {
+      return g[0]; }` imports fine at every stage. The crash needs sds.c's
+      surrounding context, so a reduced repro is still OWED. Reproduce with a
+      shallow clone of github.com/antirez/sds and
+      `emitrust-cc --emit=import sds.c -o /dev/null -I<dir>`.
+  **NOT SPIKED.** Fix before any external evaluation: a crash on an
+  evaluation input is unrecoverable, and the readiness sweep hit one in 13
+  unseen units.
+
 - [ ] FR-135 DEFECT (UPSTREAM, found by FR-134's spike): MLIR's `cf.switch`
   CUSTOM assembly cannot round-trip a negative case value, so
   `emitrust-cc --emit=import` output is not always re-parsable by
