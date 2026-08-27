@@ -2873,6 +2873,37 @@ of references or inheritance, so it precedes both.
     `static` carried across two calls. Its pins live in one ordered block
     rather than beside each function, because the emitter groups
     global-touching functions into one actor impl and emits them in ITS order.
+    LANDED 61f-11 (2026-08-26), a PRE-EXISTING CRASH found by the 61f-d
+    spike -- older than this whole wave, reproducing at fe4a231 before any of
+    it. A C++ exception construct in a range-eligible `for` body crashes the
+    MLIR verifier. Three shapes, all confirmed at HEAD and all fixed here:
+      - a CALL to a can-throw-closure function (NO `if` anywhere);
+      - a bare `throw` in the body;
+      - a `try`/`catch` in the body.
+    Cause: `unwrapThrowsResult` lowers a throwing call to two `createBlock()`s
+    plus a `cf::CondBranchOp`, `emitThrowStmt`/`emitTryStmt` build the W2.24
+    Result-threading cf pattern, and `createBlock` appends to the FUNCTION
+    region. With the insertion point inside the single-block `emitrust.for`
+    region the resulting `cf.cond_br` names successors that are not in it, and
+    `mlir::OpTrait::impl::verifyOneSuccessor` dereferences a null successor
+    ("PLEASE submit a bug report to llvm-project").
+    THE CALL CASE IS THE ONE THAT MATTERS, because nothing about its spelling
+    says it creates blocks -- it is an ordinary `CallExpr` -- which is exactly
+    why `blocksRangeForLift` was missing it. `throwsClosure` is a module-level
+    planning result, stable across the pre-pass and emission, so reading it
+    from the matcher preserves `matchRangeFor`'s purity the same way
+    `addressTaken` does.
+    THE STANDING LESSON, now written into the code: `blocksRangeForLift` IS A
+    BLOCKLIST, AND BLOCKLISTS LEAK. Two entries have been found the hard way
+    and both announced themselves as verifier crashes rather than diagnostics
+    (`va_arg` in 61f-9, the throws family here). Its doc comment now carries
+    the complete list of lib/ImportC emitters that call
+    `createBlock`/`getLabelBlock` or create a `cf::BranchOp`/`cf::CondBranchOp`/
+    `cf::SwitchOp`, each either fenced or unreachable-for-a-stated-reason, so
+    the next block-creating emitter has somewhere to be checked against.
+    BYTE-INERT: zero of the 249 emitted EndToEnd files change. Full suite
+    829/829. Test: test/Import/Cpp/range-for-throwing-call.cpp pins all three
+    shapes as refusals; each crashes the pre-fix binary.
     LANDED 61f-9 (2026-08-26), a CRASH REGRESSION from 61f-6's own aggregate
     widening -- and the exact "latent shield removed" shape 61f-4 warned
     about, one wave later. `va_list` is `struct __va_list_tag[1]` on the SysV
