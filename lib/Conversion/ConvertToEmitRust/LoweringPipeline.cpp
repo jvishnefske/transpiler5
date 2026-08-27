@@ -21,6 +21,7 @@
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"
 #include "EmitRust/Conversion/LowerExternalRequirements.h"
+#include "EmitRust/Conversion/CanonicalRoundTrip.h"
 #include "EmitRust/Conversion/RangeRefinementCheck.h"
 
 #include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
@@ -31,6 +32,12 @@ namespace emitrust {
 
 void buildLoweringPipeline(OpPassManager &pm,
                            const LoweringPipelineOptions &options) {
+  // FR-134: BEFORE every lowering stage, so what it certifies is the FRONT
+  // END's module -- at this point a round-trip failure is still attributable
+  // to the importer. Mutates nothing: it either passes silently or fails the
+  // compile with its located diagnostic.
+  if (options.canonicalRoundTrip)
+    pm.addPass(createEmitRustCanonicalRoundTrip());
   // Lower the high-level container ops (the FR-39 node pool) to the concrete
   // `[T;CAP]` array + cursor shape FIRST, before mem2reg promotes the cursor,
   // so all downstream lowering is identical to inlining the pool directly.

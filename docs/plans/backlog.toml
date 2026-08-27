@@ -139,6 +139,27 @@ blocked_by = []
 anchor = "FR-132 THE LATE-INIT MERGE"
 
 [[items]]
+id = "FR-134"
+kind = "feature"
+status = "landed"
+size = "M"
+title = "The optional canonicalization pipe, slice 1: front-end round-trip"
+summary = "Landed 2026-08-26: --check-canonical-roundtrip adds emitrust-canonical-roundtrip as stage 0 of the pinned pipeline (before every lowering stage, so failures are attributable to the importer). Prints the live module to MLIR's canonical GENERIC form, reparses into a FRESH context, re-prints, and fails with a located diagnostic naming the first differing line. Mutates nothing. Generic form not pretty, because upstream cf.switch's custom assembly cannot round-trip a negative case value (FR-135). Unregistered dialects stay FORBIDDEN in the fresh context -- allowing them would let unknown ops compare equal as opaque text and silently pass -- so the dialect set is enumerated. 251/251 EndToEnd and 220/220 c-testsuite pass with ZERO byte differences flag-on vs flag-off. Scaffolding slice only: no semantic change. The monadic IR, whole-program points-to, type lattice, actor slicing and idempotency-envelope work all sit behind this harness."
+blocked_by = []
+anchor = "FR-134 THE OPTIONAL CANONICALIZATION PIPE"
+
+[[items]]
+id = "FR-135"
+rank = 26
+kind = "defect"
+status = "open"
+size = "S"
+title = "UPSTREAM: cf.switch custom assembly cannot round-trip a negative case value"
+summary = "Found by FR-134's spike. MLIR prints a negative cf.switch case value as an unsigned decimal (-2 -> 18446744073709551614) and its own parser then rejects it as 'integer value too large', so emitrust-cc --emit=import output is not always re-parsable by emitrust-opt. Confirmed UPSTREAM by a two-line hand-written probe; our IR is correct and its generic form round-trips fine. Debugging workflow only -- both affected corpus units (switch-general.c, unsigned.c) emit correct Rust and byte-diff green, because the pipeline never re-parses its own text, which is also why the suite is blind to it. Workaround: --mlir-print-op-generic. Fix belongs upstream in cf.switch's printer."
+blocked_by = []
+anchor = "FR-135 DEFECT (UPSTREAM, found by FR-134's spike)"
+
+[[items]]
 id = "FR-133"
 rank = 25
 kind = "feature"

@@ -26,6 +26,7 @@
 #include "EmitRust/Conversion/ActorLift.h"
 #include "EmitRust/Conversion/ActorThread.h"
 #include "EmitRust/Conversion/ArithToEmitRust.h"
+#include "EmitRust/Conversion/CanonicalRoundTrip.h"
 #include "EmitRust/Conversion/ConvertToEmitRust.h"
 #include "EmitRust/Conversion/FuncToEmitRust.h"
 #include "EmitRust/Conversion/LowerContainers.h"

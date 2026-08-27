@@ -9,6 +9,7 @@
 # MLIREmitRustLowerExternalRequirements) plus the upstream mem2reg/canonicalize
 # (MLIRTransforms) and lift-cf-to-scf (MLIRControlFlowToSCF) passes it names.
 add_mlir_conversion_library(MLIRConvertToEmitRust
+  CanonicalRoundTrip.cpp
   ConvertToEmitRust.cpp
   LoweringPipeline.cpp
   RangeRefinementCheck.cpp
