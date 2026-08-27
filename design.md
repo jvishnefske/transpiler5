@@ -8996,6 +8996,61 @@ piece and becomes FR-45.
   induction-type and 29 blocks-lift sites are both larger than anything
   points-to touches.
 
+- [ ] FR-138 TRACTOR EVALUATION READINESS. Measured baseline against the
+  real corpus (github.com/DARPA-TRACTOR-Program/PUBLIC-Test-Corpus,
+  2026-08-27), recorded here because this is the evidence ledger and the
+  numbers must not live only in a session.
+  THE RUBRIC IS NOT COVERAGE. Scored: (a) behavioural equivalence of whole
+  programs against test vectors, (b) memory safety / zero `unsafe`, (c) the
+  crate builds. PARTIAL CREDIT IS NOT SCORED, which inverts this project's
+  usual measurement instinct: `--incremental` implies `--recover`, so a crate
+  that is mostly `unimplemented!()` stubs still "imports" and scores ZERO.
+  Every number below is therefore STRICT (no `--recover`).
+  CORPUS SHAPE: 252 public test cases in four bundles (B01_organic 38,
+  B01_synthetic 85, P00_perlin_noise 1, P01_sphincs_plus 128) with 2612 test
+  vectors. 127 of the 252 ship as EMPTY `test_case` directories from a public
+  clone (all but one of the sphincs variants), so only 125 are evaluable
+  without intranet access -- a fact worth knowing before quoting any
+  denominator. Submission shape per case is a `translated_rust/` cargo
+  project the corpus's own `run-rust.sh` builds and drives with the SAME
+  vectors: an executable for exec cases, and for a `_lib` case a SHARED
+  LIBRARY the Rust runner links against, which means the emitted crate must
+  export the C ABI symbols the runner expects. That last obligation is
+  UNVERIFIED here and is the next thing to check.
+  MEASURED, and each figure is the corrected one:
+    - CRASHES: ZERO across all 252 cases. This was the priority and it is
+      the good news. Contrast the same sweep over four small UNSEEN GitHub
+      C projects (inih, parson, log.c, sds): 1 crash in 13 units, which is
+      FR-137. TRACTOR's corpus is closer to the supported subset than
+      arbitrary real-world C, so crash-freedom here is weaker evidence than
+      it looks; keep sweeping unseen code.
+    - STRICT WHOLE-CASE TRANSLATION: 41 of the 125 evaluable cases (33%).
+    - BUILD: 39 of those 41 crates build; 2 fail
+      (B01_organic/float2half_lib, half2float_lib).
+    - `unsafe`: ZERO occurrences in any emitted crate, as the design posture
+      predicts -- the project rejects rather than emitting unsafe, so
+      criterion (b) is satisfied by construction and the cost is paid in (a).
+    - BEHAVIOURAL EQUIVALENCE: NOT YET MEASURED. It is the primary criterion
+      and needs the corpus runner wired to `translated_rust/`. Until that
+      exists, 39 "builds" is a well-formedness claim, not a correctness one
+      -- exactly the LIB_BUILT-vs-TRANSPILED distinction
+      test/RealWorld/run_realworld.py already draws.
+  RANKED REJECTION BLOCKERS over the 84 real rejections: variadic call 9,
+  pointer assigned a non-address value 8, address-of-scalar-not-a-string-
+  region 6, use of main's `argv` 5, address of a global 4, pointer with no
+  known target object 4, FILE* not a function-local variable 4,
+  CStyleCastExpr in a pointer expression 4, aliasing mutable pointer
+  arguments 3, CallExpr in a pointer expression 3.
+  A MEASUREMENT ERROR CAUGHT IN FLIGHT, recorded because this ledger keeps
+  finding the same class: the first sweep reported 168/252 translating. It
+  was wrong -- a case with ZERO source files ran the per-source loop zero
+  times and fell through to "all sources passed". 127 empty cases were
+  counted as successes. The build sweep exposed it (39+2=41, not 168), which
+  is the second time an independent cross-check has caught an inflated
+  numerator in this ledger.
+  **NOT SPIKED.** Next: wire `translated_rust/` + the corpus runner to get a
+  real (a) number, verify the `_lib` C-ABI export obligation, and fix FR-137.
+
 - [ ] FR-137 DEFECT (CRASH on unseen external C, found by the TRACTOR
   readiness sweep 2026-08-27): importing antirez/sds `sds.c` SEGFAULTS
   inside clang's constant evaluator. This is the highest-severity defect
