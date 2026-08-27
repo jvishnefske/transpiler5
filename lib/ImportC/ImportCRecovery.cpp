@@ -105,6 +105,9 @@ void CImporter::resetPerFunctionState() {
   symbols.clear();
   addressTaken.clear();
   placeBackedScalars.clear();
+  // FR-61f-d: a body that failed mid-emit must not leave the structured-if
+  // mode latched on for the NEXT function.
+  liftedForDepth = 0;
   inductionValues.clear();
   fileLocals.clear();
   pointerLocals.clear();

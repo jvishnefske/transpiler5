@@ -6557,6 +6557,19 @@ private:
   /// directly -- no place, no seed store, no `let i` binding. An outer
   /// induction stays registered while a nested loop body emits.
   llvm::DenseMap<const clang::VarDecl *, mlir::Value> inductionValues;
+  /// FR-61f-d: nesting DEPTH of the lifted `emitrust.for` bodies currently
+  /// being emitted. Nonzero means the insertion point is inside an
+  /// `emitrust.for` region, so `emitIfStmt` must emit a structured
+  /// `emitrust.if` region pair instead of cf blocks -- `createBlock` appends
+  /// to the FUNCTION region, and a `cf.cond_br` inside the for region would
+  /// name successors that are not in it (the MLIR verifier faults on the null
+  /// successor). A COUNTER, not a flag: an `if` inside a nested lifted `for`
+  /// is a supported shape, so the inner loop's decrement must not clear the
+  /// outer loop's mode. Reset with `placeBackedScalars`/`inductionValues` on
+  /// every per-function entry AND on FR-52 recovery, or a body that fails
+  /// mid-emit leaves the counter nonzero and the NEXT function emits
+  /// `emitrust.if` at function scope.
+  unsigned liftedForDepth = 0;
   /// Per-function pointer region analysis (Phase-1a decomposition).
   PointerRegionAnalysis pointerRegions;
   /// Program-wide registry of synthesized compound-literal backing

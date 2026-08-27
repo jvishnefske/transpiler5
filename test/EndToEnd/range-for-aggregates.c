@@ -27,9 +27,12 @@
 // Corpus effect of the pair: `for .. in` 76 -> 125, `while` 196 -> 141,
 // `loop {` 177 -> 183, lines 22342 -> 22319.
 //
-// A float SCALAR is genuinely cell-backed and still falls back, and so does a
-// nested loop that does NOT itself lift: those are the frontiers this test
-// pins from the other side.
+// A float SCALAR is genuinely cell-backed and still falls back: that is the
+// frontier this test pins from the other side. A nested loop that does NOT
+// itself lift still blocks its enclosing loop too, but the `if`-bodied case
+// that used to demonstrate it here lifts as of FR-61f-d (see
+// `nested_inner_if` below); the surviving jump/`?:`/`switch` frontiers are
+// pinned in test/EndToEnd/range-for-if-body.c.
 //
 // Every case is byte-diffed against the clang-built native at several argument
 // values, so nothing constant-folds and a lift that dropped or reordered a
@@ -184,14 +187,24 @@ int nested_pair(int n) {
   return s;
 }
 
-// THE OTHER FRONTIER: the inner loop has an `if` in its body, so the inner
-// loop does not lift -- and therefore the OUTER loop must not lift either,
-// because the inner one would emit the cf `while` lowering inside the outer
-// single-block region. Both fall back.
-// CHECK-LABEL: fn nested_inner_blocked
-// CHECK-NOT:     for {{.*}} in
-// CHECK:         while
-int nested_inner_blocked(int n) {
+// WAS THE OTHER FRONTIER, UNBLOCKED BY FR-61f-d: the inner loop has an `if` in
+// its body. That used to sink both loops -- the `if` refused the inner lift,
+// and a non-lifting inner loop would emit the cf `while` lowering inside the
+// outer single-block region, so the outer had to fall back too. `emitIfStmt`
+// now has a structured arm that emits an `emitrust.if` REGION inside a lifted
+// for body, so the `if` costs no cf blocks and BOTH loops lift. The pin is
+// inverted here rather than deleted: the nesting is the load-bearing part, and
+// the outer head must not silently regress to `while` again.
+//
+// The nested-loop frontier itself is unchanged and still real -- a nested `for`
+// that does not ITSELF lift still blocks the outer one. `emitrust.for` has no
+// exit edge, so `break`/`continue`/`return`/`goto` in the body stay fenced too;
+// those are pinned in test/EndToEnd/range-for-if-body.c.
+// CHECK-LABEL: fn nested_inner_if
+// CHECK:         for {{i|_i}} in 0i32..
+// CHECK:         for {{j|_j}} in 0i32..
+// CHECK-NOT:     while
+int nested_inner_if(int n) {
   int g[4][6];
   int s = 0;
   for (int i = 0; i < 4; i++) {
@@ -214,6 +227,6 @@ int main(int argc, char **argv) {
   printf("%d\n", fnptr_swap(n));
   printf("%.3f\n", float_scalar_falls_back(n));
   printf("%d\n", nested_pair(n));
-  printf("%d\n", nested_inner_blocked(n));
+  printf("%d\n", nested_inner_if(n));
   return 0;
 }

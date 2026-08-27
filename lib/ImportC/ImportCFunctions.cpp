@@ -993,6 +993,9 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   currentHasLabels = containsLabelStmt(func->getBody());
   currentFunctionBody = func->getBody();
   placeBackedScalars.clear();
+  // FR-61f-d: a body that failed mid-emit must not leave the structured-if
+  // mode latched on for the NEXT function.
+  liftedForDepth = 0;
   inductionValues.clear();
   currentReceiverPlace = Value();
   currentPoolPlace = Value();
@@ -1578,6 +1581,9 @@ CImporter::importLiftedLambdaBody(const PendingLiftedLambda &pending) {
   currentHasLabels = containsLabelStmt(body);
   currentFunctionBody = body;
   placeBackedScalars.clear();
+  // FR-61f-d: a body that failed mid-emit must not leave the structured-if
+  // mode latched on for the NEXT function.
+  liftedForDepth = 0;
   inductionValues.clear();
   currentReceiverPlace = Value();
   currentPoolPlace = Value();
@@ -1940,6 +1946,9 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentHasLabels = containsLabelStmt(func->getBody());
   currentFunctionBody = func->getBody();
   placeBackedScalars.clear();
+  // FR-61f-d: a body that failed mid-emit must not leave the structured-if
+  // mode latched on for the NEXT function.
+  liftedForDepth = 0;
   inductionValues.clear();
   currentReceiverPlace = Value();
   currentPoolPlace = Value();
