@@ -1,17 +1,20 @@
 {
   "corpus": "test/EndToEnd",
-  "crates_linted": 114,
-  "crates_skipped": 14,
-  "total_warnings": 331,
+  "crates_linted": 164,
+  "crates_skipped": 16,
+  "total_warnings": 68,
   "by_lint": {
-    "clippy::needless_late_init": 310,
+    "clippy::needless_late_init": 31,
+    "clippy::precedence": 8,
+    "clippy::unnecessary_literal_unwrap": 8,
     "clippy::approx_constant": 5,
     "clippy::needless_else": 3,
     "clippy::if_same_then_else": 3,
-    "clippy::precedence": 2,
+    "clippy::single_match": 2,
     "clippy::type_complexity": 2,
     "clippy::manual_range_contains": 2,
-    "clippy::manual_unwrap_or_default": 2,
+    "clippy::manual_is_multiple_of": 1,
+    "clippy::collapsible_if": 1,
     "clippy::useless_format": 1,
     "clippy::assign_op_pattern": 1
   }
