@@ -149,6 +149,16 @@ blocked_by = []
 anchor = "FR-134 THE OPTIONAL CANONICALIZATION PIPE"
 
 [[items]]
+id = "FR-136"
+kind = "feature"
+status = "no-go"
+size = "L"
+title = "Whole-program points-to as slice 2 of the canonicalization pipe"
+summary = "NO-GO 2026-08-26, measured. Mechanism fine, justification false. Yield against FR-61f-c is structurally ZERO: rangeForBodyVarIsPlaceBacked is a pure QualType predicate that consults no aliasing, and 35 of the 69 blocked sites already have perfect single-base points-to and still do not lift. The 201 cited was raw rejection EVENTS, ~2.45x inflated vs 82 unique sites. Steensgaard would have REGRESSED precision -- multiBases is already an inclusion set and the tree emits q[0] as exactly b[0] where unification would merge it. Report would over-claim: the four ownership categories need 3-4 analyses. Implementation PARKED on branch spike/FR-136-points-to (2113 lines, correctly chose Andersen). What (c) actually needs is the cursor-as-place representation change."
+blocked_by = []
+anchor = "FR-136 NO-GO (2026-08-26)"
+
+[[items]]
 id = "FR-135"
 rank = 26
 kind = "defect"

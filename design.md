@@ -2778,7 +2778,23 @@ of references or inheritance, so it precedes both.
       `return std::nullopt` in `matchRangeFor` and sweeping both corpora
       (EndToEnd + the 220-file c-testsuite). These are FIRST-FAILURE counts,
       so every one is an UPPER BOUND on its clause's yield -- the whole point
-      of this ledger. 547 acceptances against:
+      of this ledger.
+      CORRECTED 2026-08-26 BY FR-136's SPIKE, and the correction is the same
+      mistake this ledger exists to warn about, made one level down. The
+      numbers below are rejection EVENTS, not SITES, and they are ~2.45x
+      inflated: `matchRangeFor` runs 2-3x per ForStmt (twice speculatively,
+      once more from `collectRangeForPlaceScalars`, and again through
+      61f-6's `blocksRangeForLift` recursion), and varargs monomorphization
+      re-imports a body once per signature -- 78 raw events came from 4
+      sites. Against 410 raw events there are 167 UNIQUE ForStmt sites, and
+      the per-site histogram is: 69 body-var-not-place, 34 induction-type,
+      29 blocks-lift, 13 cond-not-comparison, 10 induction-live-after, 8
+      no-parts, 3 bound-not-frame-local, 1 step-unmatched. An independent
+      check confirms the site framing and refutes the event framing: a
+      syntactic scan counts 427 `for` statements across both corpora, and
+      272 emitted `for .. in` + 167 unique rejections fits that, while
+      272 + 410 cannot. READ THE HISTOGRAM BELOW AS EVENTS AND DIVIDE.
+      547 acceptances against:
         121  body touches a POINTER          -> (c)
          84  body has control flow           -> (d)
          80  cond is not a comparison at all -> (c); this is the
@@ -2792,25 +2808,42 @@ of references or inheritance, so it precedes both.
          12  DESCENDING                      -> (e)
           6  body touches a float SCALAR     (was 0 before the widenings)
           6  bound not provably unreachable to a callee (61f-8's fence)
-      (c) POINTERS IN THE BODY, AND POINTER-WALKING HEADS -- 201 of the 400
-          remaining rejections, and STILL A CHECKPOINT, not a foregone
-          conclusion. A pointer local never reaches the place/cell decision:
-          `emitLocalVar` diverts to `emitPointerLocal`, which allocates raw
-          memref cells on EVERY arm (pool handle index + non-null, literal
-          region) held as `PointerLocalInfo::cursorCell`, so
-          `placeBackedScalars` is never consulted and CANNOT be -- the cursor
-          is a synthesized cell whose type is unrelated to the variable's
-          mapped type. Note this is the ONE remainder where the "the cell
-          story never applied" argument that carried 61f-6 and 61f-10 is
-          genuinely false: here the cells are real. Liftability means teaching
-          the pointer-region model to emit its cursor, its nullable
-          discriminant and the CTS-P7 enum-of-bases discriminant as
-          `emitrust.variable` places, then auditing every consumer that does
-          `memref.load`/`memref.store` on them. Core machinery: its own design
-          pass before any code. The 80 non-comparison conditions ride along
-          with it -- `for (p = head; p; p = p->next)` also needs a truthiness
-          condition and a `p = p->next` step, neither of which the current
-          three clauses model.
+      (c) POINTERS IN THE BODY -- 82 UNIQUE sites (69 body-var + 13
+          cond-not-comparison), not the 201 first recorded here; 49% of the
+          167, so still the dominant remainder, and still a CHECKPOINT.
+          REDIRECTED 2026-08-26 by FR-136's spike, which measured the thing
+          this entry got wrong: THE BLOCKER IS REPRESENTATION, NOT ALIASING.
+          `rangeForBodyVarIsPlaceBacked` (ImportCStatements.cpp) is a pure
+          `clang::QualType` predicate -- it takes a `VarDecl*`, looks only at
+          the TYPE, and a pointer falls through every branch to its terminal
+          `return false`. It consults no aliasing information and there is
+          none for it to consult, so NO points-to solution at ANY precision
+          changes its answer. Measured on the 69 body-var sites: 35 are
+          already all-SINGLETON (perfect points-to today) and still do not
+          lift; 26 are parameter-bound cursor/slice params resolved by a
+          different mechanism and still do not lift; the 3 MULTIBASE sites
+          were each inspected and are GENUINE may-point-to sets of size 2
+          ("runtime-selected rebinding between two arrays"), which no solver
+          collapses. Demonstrated end to end: `for (i=0;i<n;i++) s+=a[i];`
+          with `a` a fully owner-promoted SINGLETON pointer still emits
+          `while`, because the cursor is a `memref.alloca` and mem2reg cannot
+          promote it across the region op.
+          So what (c) needs is exactly what this entry already said in its
+          second half and what the ledger then mis-ranked: teach the
+          pointer-region model to emit its CURSOR, its nullable discriminant
+          and the CTS-P7 enum-of-bases discriminant as `emitrust.variable`
+          PLACES, then audit every `memref.load`/`memref.store` consumer.
+          Core machinery, its own design pass, and the ONE remainder where
+          the cell-story-never-applied argument that carried 61f-6 and
+          61f-10 is genuinely false -- here the cells are real.
+          The 13 cond-not-comparison sites are a SEPARATE feature and do not
+          belong in (c) at all: 12 of 13 are integer-typed conditions, and
+          the dominant shape (4 unique sites, 78 raw events) is the
+          NUL-terminated string walk `for (p = s; *p; p++)`, an iterator /
+          `take_while` lift. The pointer-walking list head
+          `for (p = head; p; p = p->next)` this ledger named as the dominant
+          case is measured at exactly ONE site (test/EndToEnd/linked-list.c),
+          and is a `while let`. Neither is a counted loop.
       (d) CONTROL FLOW IN THE BODY -- the `if` LEG LANDED as 61f-12 below;
           `?:`/`&&`/`||`/StmtExpr/`switch` and every jump remain.
           `break`/`continue`/`goto`/`return` STAY FENCED regardless:
@@ -8860,6 +8893,59 @@ piece and becomes FR-45.
   test/Conversion/canonical-roundtrip-invalid.mlir (the non-vacuity leg),
   test/Driver/canonical-roundtrip-flag.c (byte-inertness through the driver,
   by diff rather than by CHECK, plus the `--link` rejection).
+
+- [x] FR-136 NO-GO (2026-08-26), recorded per the malloc-pool template: a
+  whole-program points-to analysis as slice 2 of the FR-134 pipe. The
+  MECHANISM is fine -- a byte-inert `--emit=points-to` report is
+  implementable exactly as FR-40/41 are, and the inertness guarantee is even
+  stronger than FR-134's (the `EmitKind` enum is driver-local, never
+  serialized, and the project-analysis branch returns before any MLIRContext
+  exists). The JUSTIFICATION is what failed, and it was MINE:
+  (1) MEASURED YIELD AGAINST FR-61f-c: ZERO, and structurally so, not
+      marginally. The gate that rejects pointers takes no aliasing input --
+      see the redirected remainder (c) above. 35 of the 69 blocked body-var
+      sites already have PERFECT single-base points-to and still do not lift.
+      A solution cannot unblock a predicate that never asks it a question.
+  (2) THE 201 I CITED WAS RAW REJECTION EVENTS, ~2.45x inflated against 82
+      unique sites, and I introduced that error myself in the re-ranking
+      commit by counting events as sites -- the identical mistake the
+      first-failure lesson warns about, one level down. Corrected above.
+  (3) THE ALGORITHM I SPECIFIED WOULD HAVE BEEN A PRECISION REGRESSION.
+      I named Steensgaard on the "near-linear, and the codebase thinks in
+      union-find" rationale. The codebase does NOT: `PointerLocalInfo::
+      multiBases` is a `SmallVector<PointerBaseKey, 2>`, an INCLUSION set,
+      and the incumbent per-TU model already achieves Andersen-like
+      precision. Verified on an adversarial probe (`int *p=a,*q=b; if (c)
+      p=q;`): the tree emits `q[0]` as exactly `b[0]` while `p[0]` becomes a
+      runtime select over `a[0]`/`b[0]`. Symmetric unification merges the two
+      classes and LOSES the `q -> {b}` fact the tree currently has and emits
+      correctly. Any future attempt must be inclusion-based, with union-find
+      used only for cycle collapse.
+  (4) THE REPORT WOULD OVER-CLAIM. The brief's four ownership categories are
+      not one analysis: read-only/out-param are MOD/REF facts, array+length
+      is a pairing heuristic, shared-mutable is escape + concurrency and
+      already exists as FR-62's actor plan. Points-to is one input of three
+      or four.
+  SUBSUMPTION, the other stated benefit, is 0 this wave by construction
+  (byte-inert consumes nothing). The future ceiling is also smaller than it
+  looks and the surface is LARGER: SEVEN interprocedural hooks, not the three
+  I named -- the callee-side `carrierReturnQuery`/`ownerIndexReturnQuery`/
+  `paramCursorReturnQuery` plus the call-argument-side `cursorParamQuery`/
+  `cursorArgQuery`/`pairedArgQuery`/`globalCursorArgQuery` -- and only two
+  (carrierReturnQuery, pairedArgQuery) are cleanly points-to-derivable. The
+  rest carry non-aliasing payloads: a promoted-owner-method property, a
+  NULLABLE bit, a planned cursor shape.
+  DISPOSITION: the implementation is PARKED, not discarded, on the local
+  branch `spike/FR-136-points-to` (2113 lines; it correctly chose Andersen
+  over the Steensgaard I specified after measuring the above). Start there if
+  a MEASURED consumer ever appears. Do not land it on the strength of
+  planning value alone -- that is the unmeasured justification this entry
+  exists to refuse.
+  WHAT TO DO INSTEAD, in measured order: the cursor-as-place representation
+  change is what (c) actually needs; the string-walk iterator lift is a
+  separate and self-contained feature worth 4 sites; and the 34 unique
+  induction-type and 29 blocks-lift sites are both larger than anything
+  points-to touches.
 
 - [ ] FR-135 DEFECT (UPSTREAM, found by FR-134's spike): MLIR's `cf.switch`
   CUSTOM assembly cannot round-trip a negative case value, so
