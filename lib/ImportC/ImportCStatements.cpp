@@ -4118,6 +4118,59 @@ LogicalResult CImporter::emitIfStmt(const clang::IfStmt *stmt) {
   if (failed(condition))
     return failure();
 
+  // FR-61f-12: inside a lifted `emitrust.for` body the cf lowering below is
+  // UNAVAILABLE -- `createBlock` appends to the FUNCTION region, so the
+  // `cf.cond_br` would name successors outside the region it lives in and the
+  // verifier faults on a null successor. Emit the structured form instead:
+  // `emitrust.if` is `SingleBlockImplicitTerminator<"emitrust::YieldOp">` with
+  // `results = (outs)`, so both arms are statement-mode regions and nothing
+  // flows out as a value. Nothing further is needed, because
+  // `collectRangeForPlaceScalars` has already routed every automatic-storage
+  // integer scalar the body names to an `emitrust.variable` place: a read or
+  // write inside an arm is a plain `emitrust.load`/`emitrust.assign` pair, not
+  // a `memref.alloca` that mem2reg could not promote across the region op.
+  //
+  // The placement matters. This sits AFTER the C++17 init/condition-variable
+  // hoist and AFTER the constant-condition arm elision, both of which are
+  // correct in either mode; and `emitCondition` already yields an i1, which
+  // feeds `$condition` with no cast.
+  if (liftedForDepth > 0) {
+    // FR-99's deferred payload unwrap lands in the cf CONTINUATION, which the
+    // structured form does not have. `rangeForBodyVarIsPlaceBacked` refuses
+    // the nullable-FAM POINTER local before the `if` is ever examined, so this
+    // is argued unreachable -- but a deferred item that reaches emission
+    // unresolved must fail LOUDLY rather than be silently dropped (the
+    // `emitrust.extern_decl` / FR-52 marker contract).
+    if (const clang::VarDecl *bound = famNullableGuards.lookup(stmt))
+      if (famOptionTemps.contains(bound))
+        return emitError(loc)
+               << "unsupported: flexible-array null guard inside a lifted "
+                  "range-for body";
+    auto ifOp = builder.create<emitrust::IfOp>(loc, *condition);
+    {
+      OpBuilder::InsertionGuard guard(builder);
+      Block *thenBody = builder.createBlock(&ifOp.getThenRegion());
+      builder.setInsertionPointToEnd(thenBody);
+      if (failed(emitStmt(stmt->getThen())))
+        return failure();
+      // Belt and braces: every terminator-producing statement (`break`,
+      // `continue`, `goto`, `return`) is fenced out of a lifted body by
+      // `blocksRangeForLift`, so the arm cannot already be terminated.
+      if (!isTerminated(builder.getInsertionBlock()))
+        builder.create<emitrust::YieldOp>(loc);
+    }
+    if (const clang::Stmt *elseStmt = stmt->getElse()) {
+      OpBuilder::InsertionGuard guard(builder);
+      Block *elseBody = builder.createBlock(&ifOp.getElseRegion());
+      builder.setInsertionPointToEnd(elseBody);
+      if (failed(emitStmt(elseStmt)))
+        return failure();
+      if (!isTerminated(builder.getInsertionBlock()))
+        builder.create<emitrust::YieldOp>(loc);
+    }
+    return success();
+  }
+
   Block *thenBlock = createBlock();
   Block *elseBlock = stmt->getElse() ? createBlock() : nullptr;
   Block *contBlock = createBlock();
@@ -4891,7 +4944,12 @@ bool inductionDeadAfter(const clang::Stmt *funcBody,
 ///   storePointerAssign, emitGlobalCursorWrite, getLabelBlock.
 ///
 /// Every one is either fenced below or unreachable inside a lifted body, and
-/// the two that are NOT fenced are unreachable for a stated reason:
+/// the ones that are NOT fenced are safe for a stated reason:
+///   - emitIfStmt: as of FR-61f-12 it has a second, STRUCTURED arm (gated on
+///     `liftedForDepth`) that emits an `emitrust.if` region pair and creates
+///     no cf blocks at all. `clang::IfStmt` is therefore off the list, and the
+///     generic child recursion below still fences anything hazardous nested
+///     inside the arms -- a `break` in an `if` blocks exactly as before.
 ///   - emitForStmt routes to `emitRangeFor` (a region op) when the nested loop
 ///     itself lifts, and is fenced by the dyn_cast above when it does not.
 ///   - storePointerAssign, emitGlobalCursorWrite, emitMultiBaseDispatch and
@@ -4934,7 +4992,7 @@ bool CImporter::blocksRangeForLift(const clang::Stmt *stmt) {
   // `clang::CXXThrowExpr` / `clang::CXXTryStmt`: `emitThrowStmt` and
   // `emitTryStmt` build the W2.24 Result-threading cf pattern, which is cf
   // blocks in the function region like any other.
-  if (llvm::isa<clang::IfStmt, clang::WhileStmt,
+  if (llvm::isa<clang::WhileStmt,
                 clang::DoStmt, clang::SwitchStmt, clang::CXXForRangeStmt,
                 clang::BreakStmt, clang::ContinueStmt, clang::GotoStmt,
                 clang::IndirectGotoStmt, clang::ReturnStmt, clang::LabelStmt,
@@ -5406,7 +5464,13 @@ LogicalResult CImporter::emitRangeFor(const RangeFor &range,
     savedInduction = existing->second;
   inductionValues[range.iv] = bodyBlock->getArgument(0);
 
+  // FR-61f-12: the insertion point is now inside the `emitrust.for` region, so
+  // `emitIfStmt` must take its structured arm. A COUNTER, not a flag: an `if`
+  // inside a NESTED lifted `for` is a supported shape, so the inner loop's
+  // decrement must not clear the outer loop's mode.
+  ++liftedForDepth;
   LogicalResult bodyResult = emitStmt(stmt->getBody());
+  --liftedForDepth;
   if (savedInduction)
     inductionValues[range.iv] = *savedInduction;
   else

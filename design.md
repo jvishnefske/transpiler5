@@ -2811,14 +2811,29 @@ of references or inheritance, so it precedes both.
           with it -- `for (p = head; p; p = p->next)` also needs a truthiness
           condition and a `p = p->next` step, neither of which the current
           three clauses model.
-      (d) CONTROL FLOW IN THE BODY -- 84. `if`/`?:`/`&&`/`||`/StmtExpr still
-          block; `emitrust.if` exists, so structured emission inside the for
-          body is the plausible route. `break`/`continue`/`goto`/`return`
-          STAY FENCED regardless: `emitrust.for` has no exit edge, so
-          admitting them is an op-design change, not a widening. 61f-6 took
-          the NESTED-LOOP leg of this remainder already. The `if` leg is
-          worth more than 84 suggests: it is what still holds the last 6
-          `loop {` degradations in test/EndToEnd/struct-long-arrays.c.
+      (d) CONTROL FLOW IN THE BODY -- the `if` LEG LANDED as 61f-12 below;
+          `?:`/`&&`/`||`/StmtExpr/`switch` and every jump remain.
+          `break`/`continue`/`goto`/`return` STAY FENCED regardless:
+          `emitrust.for` has no exit edge, so admitting them is an op-design
+          change, not a widening. 61f-6 took the nested-loop leg.
+          A CORRECTION TO THIS ENTRY'S OWN ARITHMETIC, caught by 61f-12's
+          spike: it read "the last 6 `loop {` degradations in
+          test/EndToEnd/struct-long-arrays.c", which conflated two different
+          numbers. +6 was the CORPUS-WIDE net `loop {` delta from 61f-6; that
+          FILE has EIGHT. 61f-12 clears four of the eight. The remaining four
+          are not (d) cases at all -- see (f).
+      (f) INDUCTION REUSE ACROSS A SECOND NESTED PAIR -- the clause-6
+          (`inductionDeadAfter`) residue, and a NEW, well-scoped, cheap-looking
+          follow-on isolated by a differential probe rather than inferred. Two
+          nested `i`/`j` loop pairs in one function:
+            - with FRESH inductions in the second pair, ALL FOUR loops lift
+              (0 `loop {`);
+            - with the SAME `i`/`j` reused, only two lift and two stay
+              `loop {`.
+          That is exactly the shape of the last four `loop {` in
+          struct-long-arrays.c, and the assignment-form dead-after analysis is
+          the only clause that inspects induction reuse. Worth measuring
+          before building, per this ledger's standing lesson.
       (e) DESCENDING -> `.rev()` -- 12, and SMALLER THAN IT LOOKS AND BIGGER
           THAN IT COSTS, so measure before building. It is not the
           self-contained importer change earlier entries called it: it needs
@@ -2873,6 +2888,58 @@ of references or inheritance, so it precedes both.
     `static` carried across two calls. Its pins live in one ordered block
     rather than beside each function, because the emitter groups
     global-touching functions into one actor impl and emits them in ITS order.
+    LANDED 61f-12 (2026-08-26): a range-eligible `for` body may contain
+    structured `if`/`else`. `emitIfStmt` gained a second arm, gated on a new
+    `liftedForDepth` counter, that emits an `emitrust.if` REGION PAIR instead
+    of cf blocks; `clang::IfStmt` leaves `blocksRangeForLift`'s fence list, and
+    the generic child recursion still fences anything hazardous nested inside
+    the arms -- a `break` in an `if` blocks exactly as before.
+    NO NEW OPS, NO DIALECT CHANGE, NO CONVERSION PATTERN. `emitrust.if` is
+    already `SingleBlockImplicitTerminator<"emitrust::YieldOp">` with
+    `results = (outs)`, so both arms are statement-mode regions and nothing
+    flows out as a value; the EmitRust dialect is wholesale legal in
+    `convert-to-emitrust`. And nothing further was needed inside the arms,
+    because `collectRangeForPlaceScalars` has already routed every
+    automatic-storage integer scalar the body names to an `emitrust.variable`
+    place -- a read or write in an arm is an `emitrust.load`/`emitrust.assign`
+    pair, never a `memref.alloca` mem2reg could not promote across the region.
+    `liftedForDepth` is a COUNTER, not a flag (an `if` inside a NESTED lifted
+    `for` is a supported shape, so the inner decrement must not clear the outer
+    mode), and it is reset with `placeBackedScalars`/`inductionValues` at all
+    four per-function entry points INCLUDING FR-52 recovery -- otherwise a body
+    that fails mid-emit latches the mode on and the next function emits
+    `emitrust.if` at function scope.
+    MEASURED, and the third confirmation of this ledger's standing lesson: the
+    clause carried 82 first-failure rejections and the REALIZED YIELD IS +7 --
+    about 8%. Re-tagging after the widening shows why: of the 82, 34 clear the
+    clause, 12 die immediately on the very next clause (a body var is not
+    place-backed), and only a fraction of the rest survive to emission. A
+    first-failure count is an upper bound, and the ratio is now measured three
+    times at roughly one in eight.
+    EndToEnd `for .. in` 203 -> 210, `while` 103 -> 100, `loop {` 143 -> 139,
+    lines 21890 -> 21790 (-100). ALL THREE LOOP FORMS MOVE THE RIGHT WAY, which
+    is the check 61f-6 failed: an `if` in the body drags no new induction into
+    `placeBackedScalars`, so there is no enclosing-loop degradation and
+    `loop {` goes DOWN. c-testsuite 25 -> 26, 18107 -> 18104 lines. Only 5
+    EndToEnd files change at all; the motivating one,
+    test/EndToEnd/struct-long-arrays.c, goes 259 -> 166 lines with `for .. in`
+    10 -> 14 and `loop {` 8 -> 4.
+    Full suite 830/830, zero new rejections and zero crashes on either corpus.
+    Clippy 523 -> 529, and the split matters: +4 is this entry's OWN new test
+    (3 `needless_late_init` and the single `clippy::collapsible_if`, which
+    comes from a deliberately nested-`if` case in the test), leaving +2
+    corpus-intrinsic, both the standing place-accumulator residual. The
+    `collapsible_if` is a NEW lint class for this FR and is reported as such
+    rather than folded into the residual.
+    Tests: test/EndToEnd/range-for-if-body.c (byte-diff at three argument
+    values over plain `if`, `if`/`else`, nested and else-if chains, decls in
+    arms, globals and arrays written in an arm, and the surviving
+    jump/`?:`/`switch` frontiers pinned as refusals);
+    test/Import/C/range-for-if.c (the `emitrust.if`-inside-`emitrust.for`
+    shape at the IR level). test/EndToEnd/range-for-aggregates.c's
+    `nested_inner_blocked` case is RENAMED and its pin INVERTED rather than
+    deleted -- the loop now lifts, and the nesting is the load-bearing part, so
+    it keeps pinning that the outer head does not silently regress to `while`.
     LANDED 61f-11 (2026-08-26), a PRE-EXISTING CRASH found by the 61f-d
     spike -- older than this whole wave, reproducing at fe4a231 before any of
     it. A C++ exception construct in a range-eligible `for` body crashes the

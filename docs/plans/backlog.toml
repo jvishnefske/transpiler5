@@ -399,7 +399,18 @@ kind = "feature"
 status = "open"
 size = "M"
 title = "Range-for: structured control flow in the body, and descending -> .rev()"
-summary = "84 first-failure rejections on the post-61f-10 tree. The nested-loop leg landed in 61f-6; the `if`/`?:`/&&/|| leg is what still holds the last 6 loop{} degradations in struct-long-arrays.c, so it is worth more than its count. emitrust.if exists, so structured emission inside the for body is the plausible route. break/continue/goto/return STAY FENCED -- emitrust.for has no exit edge, so admitting them is an op-design change. Descending (12) is a SEPARATE and smaller item, and is NOT the self-contained importer change earlier entries called it: it needs a new emitrust.for attribute plus emitter support, because (lo..hi).rev() is NOT hi..lo -- C's `i > LO; i -= K` is ((LO+1)..=HI).rev().step_by(K), and that LO+1 risks overflow at the type max."
+summary = "The `if` leg LANDED as 61f-12 (82 first-failure rejections, realized yield +7 -- about 8%, the third confirmation of the upper-bound lesson); the nested-loop leg landed in 61f-6. What REMAINS is `?:`/&&/||/StmtExpr/switch and every jump. break/continue/goto/return STAY FENCED -- emitrust.for has no exit edge, so admitting them is an op-design change, not a widening. Descending (12) is a SEPARATE and smaller item, and is NOT the self-contained importer change earlier entries called it: it needs a new emitrust.for attribute plus emitter support, because (lo..hi).rev() is NOT hi..lo -- C's `i > LO; i -= K` is ((LO+1)..=HI).rev().step_by(K), and that LO+1 risks overflow at the type max."
+blocked_by = []
+anchor = "STILL OUT after 61f-10"
+
+[[items]]
+id = "FR-61f-f"
+rank = 21
+kind = "feature"
+status = "spiked"
+size = "S"
+title = "Range-for: induction reuse across a second nested pair blocks the lift"
+summary = "Isolated by differential probe during 61f-12, not inferred. Two nested i/j loop pairs in one function: with FRESH inductions in the second pair ALL FOUR loops lift (0 loop{}); with the SAME i/j reused, only two lift and two stay loop{}. That is exactly the shape of the last four loop{} in test/EndToEnd/struct-long-arrays.c, which 61f-12 could not clear. The assignment-form dead-after analysis (inductionDeadAfter/walkAfter/effectOn) is the only clause that inspects induction reuse, so that is where to look. Cheap-looking and well-scoped -- but measure the realized yield before building: this FR has now measured the first-failure-to-realized ratio at roughly one in eight, three times."
 blocked_by = []
 anchor = "STILL OUT after 61f-10"
 
