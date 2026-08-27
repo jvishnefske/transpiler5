@@ -159,6 +159,17 @@ blocked_by = []
 anchor = "FR-136 NO-GO (2026-08-26)"
 
 [[items]]
+id = "FR-138"
+rank = 14
+kind = "tooling"
+status = "open"
+size = "L"
+title = "TRACTOR evaluation readiness: wire the corpus runner, verify the lib C-ABI"
+summary = "Baseline measured 2026-08-27 against github.com/DARPA-TRACTOR-Program/PUBLIC-Test-Corpus. Rubric is behavioural equivalence + zero unsafe + builds; PARTIAL CREDIT IS NOT SCORED, so every number must be STRICT (no --recover). 252 public cases, 127 ship empty from a public clone, so 125 evaluable. ZERO crashes across all 252 (the priority). 41/125 translate strictly, 39 of those build, ZERO unsafe anywhere. Behavioural equivalence NOT yet measured and it is the primary criterion -- needs translated_rust/ wired to the corpus run-rust.sh. Also unverified: a _lib case is linked as a SHARED LIBRARY by the Rust runner, so the emitted crate must export the C ABI symbols. Top blockers over the 84 real rejections: variadic call 9, pointer-assigned-non-address 8, address-of-scalar 6, main argv 5."
+blocked_by = []
+anchor = "FR-138 TRACTOR EVALUATION READINESS"
+
+[[items]]
 id = "FR-137"
 rank = 15
 kind = "defect"
