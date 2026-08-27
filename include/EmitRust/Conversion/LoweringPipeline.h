@@ -35,6 +35,14 @@ struct LoweringPipelineOptions {
   /// a lowering stage.
   bool checkRangeRefinement = false;
 
+  /// FR-134: run emitrust-canonical-roundtrip FIRST, before any lowering
+  /// stage (emitrust-cc's `--check-canonical-roundtrip`): certifies that the
+  /// FRONT END's module survives a round-trip through MLIR's canonical
+  /// generic form unchanged. Off by default -- it is a verification stage,
+  /// not a lowering stage, and it mutates nothing, so turning it on can only
+  /// pass silently or fail the compilation loudly.
+  bool canonicalRoundTrip = false;
+
   /// Run emitrust-lower-external-requirements (FR-52) after the conversion.
   /// A no-op unless the importer marked an unresolved external, which is why
   /// enabling it leaves every existing crate byte-identical.
@@ -53,6 +61,10 @@ struct LoweringPipelineOptions {
 ///
 /// The stage order is load-bearing and is stated once, here, rather than in
 /// each driver:
+///  0. [optional] emitrust-canonical-roundtrip BEFORE everything, so what it
+///     certifies is the FRONT END's output -- the point at which a failure is
+///     still attributable to the importer rather than to a lowering stage. It
+///     mutates nothing.
 ///  1. emitrust-lower-containers FIRST, before mem2reg promotes the free
 ///     cursor, so all downstream lowering is identical to inlining the FR-39
 ///     node pool directly.

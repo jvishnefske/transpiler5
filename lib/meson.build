@@ -66,6 +66,7 @@ lib_lower_external_requirements = static_library(
 lib_convert_to_emitrust = static_library('MLIRConvertToEmitRust',
   'Conversion/ConvertToEmitRust/ConvertToEmitRust.cpp',
   'Conversion/ConvertToEmitRust/LoweringPipeline.cpp',
+  'Conversion/ConvertToEmitRust/CanonicalRoundTrip.cpp',
   'Conversion/ConvertToEmitRust/RangeRefinementCheck.cpp',
   'Conversion/ConvertToEmitRust/ValueIdentityCheck.cpp',
   include_directories: emitrust_inc,

@@ -8805,6 +8805,82 @@ piece and becomes FR-45.
   counts over the gapped, `mut`, dead-store-first, struct and region-write
   shapes).
 
+- [x] FR-134 THE OPTIONAL CANONICALIZATION PIPE, slice 1: a round-trip
+  verification stage over the FRONT END's module. Opt-in
+  (`--check-canonical-roundtrip`, off by default), byte-inert by
+  construction, and placed FIRST in the pinned pipeline -- stage 0, before
+  `lower-containers` -- so what it certifies is the importer's output, the
+  point at which a failure is still attributable to the importer rather than
+  to a lowering stage. The pass prints the live module to MLIR's canonical
+  GENERIC form, parses that text into a FRESH `MLIRContext`, re-prints it,
+  and fails with a located diagnostic naming the first differing generic-form
+  line. It mutates nothing and marks all analyses preserved, so enabling it
+  can only pass silently or fail the compile loudly.
+  SCOPE, deliberately: this is the SCAFFOLDING slice and carries NO semantic
+  change. The wider program it opens -- monadic/state-threaded IR, whole-
+  program points-to (Andersen/Steensgaard), lattice-and-unification type
+  mapping over ownership capabilities, actor slicing by graph partitioning,
+  idempotency envelopes -- all sits behind this same harness, and each of
+  those becomes safe to attempt only because there is now a differential that
+  can say "the front end's IR still means the same thing". Note how much of
+  the surrounding architecture ALREADY exists and is not this FR: ingestion
+  (lib/ImportC), the SSA/structured canonical form (mem2reg + lift-cf-to-scf
+  inside `buildLoweringPipeline`, whose stock-simplification-pass NO-GOs
+  FR-130 already measured), actor slicing (`--actor-lift`, `--actor-mode`),
+  and a capability lattice (FR-41's three-color item-graph coloring).
+  THE SPIKE PAID FOR ITSELF IN ITS FIRST RUN by finding a real, pre-existing,
+  latent defect -- see FR-135 -- and that finding is what chose the design.
+  GENERIC FORM, NOT PRETTY, and the distinction is load-bearing rather than a
+  preference: upstream `cf.switch`'s CUSTOM assembly cannot round-trip a
+  negative case value (it prints `-2` as `18446744073709551614`, which its own
+  parser then rejects as "integer value too large"), while the same op's
+  GENERIC form prints `case_values = dense<-2>` and round-trips cleanly.
+  Checking the pretty form would have reported an upstream cosmetic bug as a
+  project defect on two corpus units. Round-tripping IN PROCESS from the live
+  module is the same decision: it never routes the IR through the pretty text
+  the upstream bug corrupts.
+  UNREGISTERED DIALECTS STAY FORBIDDEN in the fresh context, and that is what
+  makes the check non-vacuous. `allowUnregisteredDialects(true)` would let an
+  unknown op survive as opaque generic text and compare EQUAL, so every
+  construct outside the known universe would silently pass. The project's
+  dialect set is therefore ENUMERATED (`registerProjectDialects`: emitrust,
+  arith, cf, func, memref, scf, ub) rather than copied from the live context
+  -- which would not work anyway, since the drivers `loadDialect<>()` straight
+  into their context and leave `getDialectRegistry()` empty. Enumerating has
+  the better failure mode: a future dialect fails LOUDLY naming itself instead
+  of degrading the oracle, and test/Conversion/canonical-roundtrip-invalid.mlir
+  pins exactly that.
+  MEASURED: the check passes on 251/251 EndToEnd units and 220/220
+  c-testsuite units, with ZERO byte differences in emitted Rust between the
+  flag on and off on either corpus -- byte-inertness verified by diffing the
+  two emissions per unit, not by asserting on text. Full suite 835/835.
+  Tests: test/Conversion/canonical-roundtrip.mlir (the contract, including the
+  negative-`cf.switch`-case shape that must PASS, and a region op whose
+  implicit `emitrust.yield` is elided in pretty form but not in generic),
+  test/Conversion/canonical-roundtrip-invalid.mlir (the non-vacuity leg),
+  test/Driver/canonical-roundtrip-flag.c (byte-inertness through the driver,
+  by diff rather than by CHECK, plus the `--link` rejection).
+
+- [ ] FR-135 DEFECT (UPSTREAM, found by FR-134's spike): MLIR's `cf.switch`
+  CUSTOM assembly cannot round-trip a negative case value, so
+  `emitrust-cc --emit=import` output is not always re-parsable by
+  `emitrust-opt`. The printer emits the case value as an unsigned decimal
+  (`-2` becomes `18446744073709551614`) and the parser then rejects it as
+  "custom op 'cf.switch' integer value too large". Confirmed as UPSTREAM and
+  not ours by a two-line hand-written probe: a `cf.switch` with case `-2`
+  parses, then prints back in a form it cannot re-read. Our IR is correct --
+  the generic form prints `case_values = dense<-2>` and round-trips fine.
+  REACH: debugging workflow only. Two corpus units produce such IR
+  (test/EndToEnd/switch-general.c and test/EndToEnd/unsigned.c, the latter's
+  header explicitly advertising "a ui64 case label above i64::MAX"), both
+  emit correct Rust and both byte-diff green, because the pipeline never
+  re-parses its own text -- the module goes from import to the passes in
+  memory. That is also why the whole suite is blind to it.
+  WORKAROUND: `--mlir-print-op-generic` when a dumped module must be fed
+  back. FIX would be upstream in `cf.switch`'s printer (print signed when the
+  case type is signless-with-negative-values, or always print via the
+  attribute). **NOT SPIKED.**
+
 - [ ] FR-133 A NULLABLE FN-PTR LOCAL initialized from a literal `Some` needs
   no `Option` at all. Surfaced by FR-132, which made the shape visible to
   clippy rather than creating it: `let cp: Option<fn(i32)->i32> = Some(addc);

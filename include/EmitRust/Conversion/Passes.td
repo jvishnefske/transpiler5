@@ -131,6 +131,50 @@ def ConvertToEmitRust : Pass<"convert-to-emitrust", "ModuleOp"> {
 }
 
 //===----------------------------------------------------------------------===//
+// EmitRustCanonicalRoundTrip
+//===----------------------------------------------------------------------===//
+
+// Note: like the two differential checkers below, this is a verification
+// (analysis-only) pass rather than a conversion; it lives here because this is
+// the project's only pass TableGen file.
+def EmitRustCanonicalRoundTrip
+    : Pass<"emitrust-canonical-roundtrip", "ModuleOp"> {
+  let summary = "Round-trip the module through MLIR's canonical generic form";
+  let description = [{
+    FR-134, the first slice of the optional canonicalization pipe. Prints the
+    module to MLIR's GENERIC form, parses that text back into a fresh
+    `MLIRContext` carrying the same dialect registry, re-prints the reparsed
+    module, and reports a hard error unless the two texts are identical.
+
+    The pass MUTATES NOTHING. It marks all analyses preserved and leaves the
+    module exactly as it found it, so enabling it can never change emitted
+    Rust -- it either passes silently or fails the compilation loudly. That is
+    the whole contract: a verification stage, not a lowering stage.
+
+    WHY THE GENERIC FORM AND NOT THE PRETTY ONE. The generic form is MLIR's
+    canonical serialization: no custom assembly is involved, so a round-trip
+    failure is a real defect in a type, an attribute, or a region structure
+    rather than a cosmetic printer asymmetry. The distinction is not
+    hypothetical -- the FR-134 spike found that upstream `cf.switch`'s CUSTOM
+    assembly cannot round-trip a negative case value (it prints `-2` as
+    `18446744073709551614`, which its own parser then rejects as "integer
+    value too large"), while the same op's GENERIC form prints
+    `case_values = dense<-2>` and round-trips cleanly. Checking the pretty
+    form would report that upstream cosmetic bug as a project defect; checking
+    the generic form reports what actually threatens correctness.
+
+    Round-tripping IN PROCESS, from the live module, is deliberate for the
+    same reason: it never routes the IR through the pretty text that the
+    upstream bug corrupts.
+
+    Placed FIRST in the pinned lowering pipeline, so what it certifies is the
+    FRONT END's output -- the point where an importer bug is still
+    attributable to the importer.
+  }];
+  let dependentDialects = ["emitrust::EmitRustDialect"];
+}
+
+//===----------------------------------------------------------------------===//
 // EmitRustRangeRefinementCheck
 //===----------------------------------------------------------------------===//
 

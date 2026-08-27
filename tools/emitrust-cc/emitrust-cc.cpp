@@ -557,6 +557,19 @@ static llvm::cl::opt<std::string> searchTracePath(
                    "the output and this flag is unnecessary"),
     llvm::cl::value_desc("path"), llvm::cl::init(""));
 
+static llvm::cl::opt<bool> checkCanonicalRoundTrip(
+    "check-canonical-roundtrip",
+    llvm::cl::desc(
+        "Run the emitrust-canonical-roundtrip verification pass FIRST, on "
+        "the front end's module before any lowering stage: prints it to "
+        "MLIR's canonical generic form, parses that back into a fresh "
+        "context, re-prints it, and fails the compile with a located "
+        "diagnostic naming the first differing line if the two texts are "
+        "not identical. Mutates nothing, so it can only pass silently or "
+        "fail loudly -- emitted Rust is byte-identical either way (off by "
+        "default)"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<bool> checkRangeRefinement(
     "check-range-refinement",
     llvm::cl::desc(
@@ -624,6 +637,7 @@ static mlir::LogicalResult runPipeline(mlir::ModuleOp module) {
   // FR-130: the stage list lives in ONE place (buildLoweringPipeline); this
   // driver's only say over it is the two option fields.
   mlir::emitrust::LoweringPipelineOptions options;
+  options.canonicalRoundTrip = checkCanonicalRoundTrip;
   options.checkRangeRefinement = checkRangeRefinement;
   // emitrust-cc emits a FINAL crate, so FR-52 resolves its unresolved
   // externals here rather than deferring them to a link step.
@@ -2379,11 +2393,12 @@ int main(int argc, char **argv) {
   }
   if (linkFlag &&
       (!compilationDatabasePath.empty() || recoverFlag || incrementalFlag ||
-       searchFlag || deferExternalsFlag || checkRangeRefinement)) {
+       searchFlag || deferExternalsFlag || checkRangeRefinement ||
+       checkCanonicalRoundTrip)) {
     llvm::errs() << "error: --link takes object/shard files, not C sources; "
                     "--compdb, --recover, --incremental, --search, "
-                    "--defer-externals and --check-range-refinement do not "
-                    "apply\n";
+                    "--defer-externals, --check-range-refinement and "
+                    "--check-canonical-roundtrip do not apply\n";
     return 1;
   }
   if (incrementalFlag && emitKind != EmitKind::Crate) {
