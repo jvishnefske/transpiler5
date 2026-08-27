@@ -129,6 +129,27 @@ blocked_by = ["FR-113"]
 anchor = "FR-121 DEFECT"
 
 [[items]]
+id = "FR-132"
+kind = "feature"
+status = "landed"
+size = "M"
+title = "The late-init merge (clippy::needless_late_init)"
+summary = "Landed 2026-08-26: a deferred binding's declaration and its initializing write fold into one `let [mut] x: T = rhs;` rendered at the assign. NOT a liveness change -- computeDeferredInits' decision is untouched, only WHERE the declaration renders moves -- which is the new idea the FR-63 contract's item-6 escape clause asked for. Rule is SCOPE not adjacency (the common shape has intervening statements). Spike found the one real blocker: Rust drops in reverse DECLARATION order, so sinking a may-drop decl past another flips destructors -- measured under rustc, both crates compiling clean. clippy 532 -> 68 total, needless_late_init 503 -> 31; corpus -761 lines over 133 files with zero non-fold hunks and zero vNN renumbering. Accepted new debt: unnecessary_literal_unwrap 0 -> 8, clippy newly const-tracing Some(f) through the merged let (see FR-133)."
+blocked_by = []
+anchor = "FR-132 THE LATE-INIT MERGE"
+
+[[items]]
+id = "FR-133"
+rank = 25
+kind = "feature"
+status = "open"
+size = "S"
+title = "A nullable fn-ptr local initialized from a literal Some needs no Option"
+summary = "Surfaced by FR-132, which made the shape visible to clippy: `let cp: Option<fn(i32)->i32> = Some(addc); .. cp.expect(\"null function pointer\")(i)` draws clippy::unnecessary_literal_unwrap (8 corpus instances, fn-pointers.c contributing 3). The .expect was always redundant; the pre-FR-132 two-program-point rendering simply hid it from clippy's const tracing. When a fn-ptr local is initialized from a literal Some and never reassigned or compared against null, the Option wrapper can be dropped entirely and every use site loses its unwrap. Not a regression -- the emitted code got strictly shorter -- but real newly-visible debt."
+blocked_by = []
+anchor = "FR-133 A NULLABLE FN-PTR LOCAL"
+
+[[items]]
 id = "FR-131"
 rank = 18
 kind = "defect"

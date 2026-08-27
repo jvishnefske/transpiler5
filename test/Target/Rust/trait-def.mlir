@@ -72,8 +72,7 @@ emitrust.func @bump(%arg0: i32) -> i32
 // CHECK:      struct S {
 // CHECK:      fn read_cfg<E: Externals>() -> i32 {
 // CHECK-NEXT:     let v0: S = E::cfg();
-// CHECK-NEXT:     let v1: S;
-// CHECK-NEXT:     v1 = v0;
+// CHECK-NEXT:     let v1: S = v0;
 // CHECK-NEXT:     v1.x
 // CHECK-NEXT: }
 emitrust.struct_def @S ["x", "y"] [i32, i32]
@@ -95,9 +94,8 @@ emitrust.func @read_cfg() -> i32
 // statement is never an elision candidate; external storage stays
 // observable).
 // CHECK:      fn write_cfg<E: Externals>(v0: i32) {
-// CHECK-NEXT:     let mut v1: S;
 // CHECK-NEXT:     let v2: S = E::cfg();
-// CHECK-NEXT:     v1 = v2;
+// CHECK-NEXT:     let mut v1: S = v2;
 // CHECK-NEXT:     v1.x = v0;
 // CHECK-NEXT:     E::set_cfg(v1);
 // CHECK-NEXT: }
@@ -145,8 +143,7 @@ emitrust.func @read_any() -> i32
 // environment-owned storage.
 // CHECK:      fn eth_first<E: Externals>() -> i32 {
 // CHECK-NEXT:     let v0: [u8; 6] = E::ethbroadcast();
-// CHECK-NEXT:     let v1: [u8; 6];
-// CHECK-NEXT:     v1 = v0;
+// CHECK-NEXT:     let v1: [u8; 6] = v0;
 // CHECK-NEXT:     let v3: &[u8] = &v1[0i64 as usize..];
 // CHECK-NEXT:     E::eth_out(v3);
 // CHECK-NEXT:     v1[0i64 as usize] as i32

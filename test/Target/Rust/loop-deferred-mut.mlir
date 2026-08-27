@@ -17,6 +17,14 @@
 // "variable does not need to be mutable". The bare-`let` arms are therefore
 // regression pins of equal standing with the `mut` arms, not mere leftovers.
 //
+// FR-132 note: the three arms whose ONLY write is in the SAME BLOCK as the
+// declaration now render merged (`let j: i32 = v0;` instead of `let j: i32;`
+// followed by `j = v0;`). What those arms pin is unchanged and unweakened --
+// the ABSENCE of `mut` -- and the merged spelling pins it just as hard, since
+// a wrongly-added `mut` would read `let mut j: i32 = v0;`. Every arm whose
+// write is inside a loop or `if` region keeps the bare declaration, because
+// sinking it into the region would move the binding out of scope.
+//
 // The ANY-write state is loop-SCOPED: it is reseeded false at every loop-body
 // entry, so a write from BEFORE a loop can never be attributed to that loop's
 // back edge (@write_before_nested_loops is that guard -- the naive unscoped
@@ -350,7 +358,7 @@ emitrust.func @for_write_break(%lo: index, %hi: index, %st: index, %c: i1, %v: i
 // function, which builds today, would fail with `error: variable does not need
 // to be mutable` under the emitted crate's own `deny(unused_mut)`.
 // CHECK-LABEL: fn write_before_nested_loops(v0: i32, v1: bool, v2: bool) {
-// CHECK-NEXT:    let j: i32;
+// CHECK-NEXT:    let j: i32 = v0;
 emitrust.func @write_before_nested_loops(%arg0: i32, %arg1: i1, %arg2: i1) {
   %j = emitrust.variable named "j" : !emitrust.lvalue<i32>
   emitrust.assign %j = %arg0 : !emitrust.lvalue<i32>
@@ -372,7 +380,7 @@ emitrust.func @write_before_nested_loops(%arg0: i32, %arg1: i1, %arg2: i1) {
 // The same guard on the `continue` recorder: the pre-loop write must not be
 // attributed to a `continue` that merely passes through it.
 // CHECK-LABEL: fn write_before_continue(v0: i32, v1: bool, v2: bool) {
-// CHECK-NEXT:    let j: i32;
+// CHECK-NEXT:    let j: i32 = v0;
 emitrust.func @write_before_continue(%arg0: i32, %arg1: i1, %arg2: i1) {
   %j = emitrust.variable named "j" : !emitrust.lvalue<i32>
   emitrust.assign %j = %arg0 : !emitrust.lvalue<i32>
@@ -392,7 +400,7 @@ emitrust.func @write_before_continue(%arg0: i32, %arg1: i1, %arg2: i1) {
 // A single write before a loop that only READS the binding: the plainest form
 // of the same guard.
 // CHECK-LABEL: fn write_before_loop_read_in(v0: i32, v1: bool) {
-// CHECK-NEXT:    let j: i32;
+// CHECK-NEXT:    let j: i32 = v0;
 emitrust.func @write_before_loop_read_in(%v: i32, %c: i1) {
   %j = emitrust.variable named "j" : !emitrust.lvalue<i32>
   emitrust.assign %j = %v : !emitrust.lvalue<i32>

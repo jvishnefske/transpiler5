@@ -188,8 +188,7 @@ emitrust.func @enum_ops(%arg0: !emitrust.enum<"Color">, %arg1: !emitrust.enum<"C
 emitrust.enum_def @Mode ["Off", "On"] [0, 1] {unsigned_underlying}
 
 // CHECK-LABEL: fn enum_from_int(v0: i32) -> u32 {
-// CHECK-NEXT:    let mut v1: Mode;
-// CHECK-NEXT:    v1 = Mode(v0 as u32);
+// CHECK-NEXT:    let mut v1: Mode = Mode(v0 as u32);
 // CHECK-NEXT:    let v3: &mut u32 = &mut v1.0;
 // CHECK-NEXT:    *v3
 // CHECK-NEXT:  }

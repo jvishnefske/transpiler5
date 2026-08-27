@@ -49,8 +49,7 @@ emitrust.func @unused_param(%arg0: i32)
 // A body local spelled like the parameter uniquifies to `x_1`; the
 // parameter, named first, keeps the bare spelling.
 // CHECK-LABEL: fn param_local_clash(x: i32) -> i32 {
-// CHECK-NEXT:    let x_1: i32;
-// CHECK-NEXT:    x_1 = x;
+// CHECK-NEXT:    let x_1: i32 = x;
 // CHECK-NEXT:    x_1 + x
 // CHECK-NEXT:  }
 emitrust.func @param_local_clash(%arg0: i32) -> i32

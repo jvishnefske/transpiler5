@@ -795,6 +795,37 @@ private:
   /// `fieldInitFuses`); called from `emitAssign` at the fuse's last assign.
   LogicalResult emitFusedFieldInit(emitrust::VariableOp variableOp);
 
+  // --- FR-132: the late-init merge (clippy::needless_late_init) ---
+
+  /// Deferred declaration -> the SAME-BLOCK `emitrust.assign` that renders the
+  /// whole `let [mut] x: T = rhs;` in its place. The declaration itself then
+  /// renders nothing at all, so the binding has ONE program point instead of
+  /// two. Sound because `computeDeferredInits` has already proved nothing
+  /// reads the binding before that write (rustc E0381 would reject today's
+  /// output otherwise): a declaration that emits no code, sunk past statements
+  /// that cannot observe it, is inert.
+  DenseMap<Operation *, Operation *> lateInitMerges;
+
+  /// Reverse map: merging assign -> its declaration. `emitAssign` looks the
+  /// assign up here exactly as it looks up `fusedAssignOwner`.
+  DenseMap<Operation *, Operation *> lateInitOwner;
+
+  /// Fills `lateInitMerges`/`lateInitOwner`. Must run LAST -- after
+  /// `computeIfExprBindings` (FR-61b keeps priority), `computeDroppedOps`,
+  /// `computeInlineCandidates`, `computeDeadStores` and
+  /// `computeFieldInitFuses` -- because the gap scan asks which ops render.
+  void computeLateInitMerges(emitrust::FuncOp funcOp);
+
+  /// Conservative "a binding of this type may own drop glue" test, used by the
+  /// merge's drop-order gate. Deliberately WIDER than `bindingHasDrop`, which
+  /// only sees `emitrust.has_drop` structs and misses `Box<T>`/STL owners.
+  bool typeMayDrop(Type type) const;
+
+  /// Emits the merged `let [mut] <name>: <T> = <rhs>;` at `assignOp`, on
+  /// behalf of the declaration `declOp` that rendered nothing.
+  LogicalResult emitMergedLateInit(Operation *declOp,
+                                   emitrust::AssignOp assignOp);
+
   // --- FR-61d: single-use expression inlining + unused-pure-value drops ---
 
   /// Ops whose single-real-use result renders inline at its consumer
@@ -2669,6 +2700,119 @@ void RustEmitter::computeFieldInitFuses(emitrust::FuncOp funcOp) {
   });
 }
 
+/// Whether `op` or anything nested in its regions uses `v` as an operand.
+static bool opTouchesValue(Operation *op, Value v) {
+  bool found = false;
+  op->walk([&](Operation *nested) {
+    for (Value operand : nested->getOperands())
+      if (operand == v)
+        found = true;
+  });
+  return found;
+}
+
+bool RustEmitter::typeMayDrop(Type type) const {
+  if (auto lvalueType = dyn_cast<emitrust::LValueType>(type))
+    type = lvalueType.getValueType();
+  while (auto arrayType = dyn_cast<emitrust::ArrayType>(type))
+    type = arrayType.getElementType();
+  // An opaque type is a hand-written Rust spelling (`Box<T>`, `String`,
+  // `Vec<T>`, an STL owner, ..): assume it owns. A data enum carries payloads.
+  if (isa<emitrust::OpaqueType, emitrust::DataEnumType>(type))
+    return true;
+  if (auto structType = dyn_cast<emitrust::StructType>(type))
+    return nonCopyStructNames.contains(structType.getName()) ||
+           dropStructNames.contains(structType.getName());
+  return false;
+}
+
+/// FR-132: find, for each deferred binding, the assignment that may render its
+/// whole `let`. The gate is SCOPE, not adjacency -- intervening statements that
+/// cannot observe the binding are the common case.
+void RustEmitter::computeLateInitMerges(emitrust::FuncOp funcOp) {
+  funcOp->walk([&](Operation *op) {
+    if (!deferredInits.count(op))
+      return;
+    // FR-61b keeps priority: an if-expression binding already folds both
+    // program points, and into a strictly better rendering.
+    if (ifExprBindings.count(op))
+      return;
+    // A declaration that renders nothing (or renders as the function's tail)
+    // has no two points to merge.
+    if (unreachableOps.count(op) || droppedOps.count(op) ||
+        inlinedOps.count(op) || op == tailFoldCandidate)
+      return;
+    Value binding = op->getResult(0);
+    // Walk forward IN THE SAME BLOCK. Leaving the block is not an option: the
+    // initializing write inside an `if`/`match`/`loop` region would sink the
+    // declaration into that region and put the binding out of scope for every
+    // read after it.
+    for (Operation *cur = op->getNextNode(); cur; cur = cur->getNextNode()) {
+      if (isBindingWrite(cur, binding)) {
+        // A dead store renders nothing, so it is not the program point the
+        // declaration would move to; keep scanning for the surviving write.
+        if (deadStores.count(cur))
+          continue;
+        if (unreachableOps.count(cur) || droppedOps.count(cur) ||
+            fusedAssignOwner.count(cur) || lateInitOwner.count(cur))
+          return;
+        // DROP ORDER. Rust drops in reverse DECLARATION order, so sinking a
+        // may-drop declaration past ANOTHER may-drop declaration flips two
+        // destructors. Measured on the two hand-written orderings of one
+        // program under rustc -O: `dtor 1; dtor 2` became `dtor 2; dtor 1`,
+        // and BOTH crates compiled clean -- a miscompile no build can see.
+        if (typeMayDrop(binding.getType())) {
+          for (Operation *gap = op->getNextNode(); gap != cur;
+               gap = gap->getNextNode()) {
+            // Skip what renders no binding of its own at this point.
+            if (isPlaceProjection(gap) || inlinedOps.count(gap) ||
+                droppedOps.count(gap))
+              continue;
+            for (Value res : gap->getResults())
+              if (typeMayDrop(res.getType()))
+                return;
+          }
+        }
+        lateInitMerges[op] = cur;
+        lateInitOwner[cur] = op;
+        return;
+      }
+      // ANY other mention of the binding before its initializing write -- a
+      // read, a projection, or a write nested in a region op -- refuses.
+      // Refusing on the mention rather than reasoning about which mentions
+      // render is what keeps the scope rule a rule.
+      if (opTouchesValue(cur, binding))
+        return;
+      // Emission stops at a diverging op; nothing after it renders.
+      if (opDiverges(cur))
+        return;
+    }
+  });
+}
+
+LogicalResult RustEmitter::emitMergedLateInit(Operation *declOp,
+                                              emitrust::AssignOp assignOp) {
+  Value binding = assignOp.getVar();
+  Type valueType = binding.getType();
+  if (auto lvalueType = dyn_cast<emitrust::LValueType>(valueType))
+    valueType = lvalueType.getValueType();
+  os << "let ";
+  // `deferredInits`'s mapped bool stays the single source of truth for `mut`:
+  // the merging assign is still the initializing write, so it must not be
+  // subtracted from the mutation count the way a fused field store is.
+  if (deferredInits.lookup(declOp))
+    os << "mut ";
+  os << assignName(binding) << ": ";
+  if (failed(emitType(assignOp.getLoc(), valueType)))
+    return failure();
+  os << " = ";
+  if (failed(
+          emitOperand(assignOp.getLoc(), assignOp.getValue(), ExprPos::stmt())))
+    return failure();
+  os << ";\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitFusedFieldInit(emitrust::VariableOp variableOp) {
   Operation *op = variableOp.getOperation();
   Value result = variableOp.getResult();
@@ -3962,6 +4106,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   pendingInlineCapture = false;
   fieldInitFuses.clear();
   fusedAssignOwner.clear();
+  lateInitMerges.clear();
+  lateInitOwner.clear();
 
   Region &body = fn.getFunctionBody();
   if (body.empty())
@@ -4030,6 +4176,10 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // FR-63 (field_reassign_with_default): after the inline/drop sets — the
   // fuse's statement scan skips exactly the ops those passes silenced.
   computeFieldInitFuses(funcOp);
+  // FR-132 (clippy::needless_late_init): LAST -- the gap scan asks which ops
+  // render, so every set that silences an op must already be populated, and
+  // `ifExprBindings` must already have claimed the bindings it folds better.
+  computeLateInitMerges(funcOp);
   // A function directly inside an `emitrust.impl` is a method, UNLESS it
   // carries the `static_method` marker (W2.2), in which case it is a
   // receiverless associated function (`Struct::name(...)`) and every
@@ -4371,6 +4521,14 @@ LogicalResult RustEmitter::emitDeferredBinding(Operation *op, Value result,
   // instead of the `let x: T;` + statement-`if` pair.
   if (auto ifOp = ifExprBindings.lookup(op))
     return emitIfExprBinding(op, result, type, ifOp);
+  // FR-132: the declaration of a merged binding renders NOTHING -- its
+  // initializing assign renders the whole `let`. The name is assigned
+  // unconditionally so v-numbering stays stable even when the binding folds
+  // away.
+  if (lateInitMerges.count(op)) {
+    assignName(result);
+    return success();
+  }
   os << "let ";
   if (deferredInits.lookup(op))
     os << "mut ";
@@ -4630,6 +4788,11 @@ LogicalResult RustEmitter::emitAssign(emitrust::AssignOp assignOp) {
       return success();
     return emitFusedFieldInit(cast<emitrust::VariableOp>(owner));
   }
+  // FR-132 (clippy::needless_late_init): this assign is the initializing write
+  // of a deferred binding whose declaration rendered nothing, so it renders the
+  // whole `let [mut] x: T = rhs;` here (see `computeLateInitMerges`).
+  if (Operation *declOp = lateInitOwner.lookup(op))
+    return emitMergedLateInit(declOp, assignOp);
   Location loc = op->getLoc();
   Value var = assignOp.getVar();
 

@@ -2849,7 +2849,9 @@ of references or inheritance, so it precedes both.
     61f-4, but nothing is blocked by one -- fold it in only as a by-product
     of a general non-integer-scalar relaxation, never as its own increment.
     Plus the standing residual place-accumulator `needless_late_init` for
-    NON-constant inits that a later late-init-merge fold could clean.
+    NON-constant inits that a later late-init-merge fold could clean. THAT
+    FOLD LANDED as FR-132 (2026-08-26): every widening in this FR added to
+    that residual, and FR-132 removed 472 of the 503 it had grown to.
     LANDED 61f-10 (2026-08-26): a range-eligible body may touch a GLOBAL or a
     function-local `static`. The predicted "separate mechanism -- module
     symbols and staged copies rather than `placeBackedScalars`" was NOT
@@ -4381,7 +4383,14 @@ piece and becomes FR-45.
   c-testsuite, kernel); (5) held-out generalization — a train-only improvement
   that regresses held-out is rejected (anti-Goodhart); (6) off-limits without a
   human + a new idea: cross-iteration loop liveness (miscompiled 3×) and
-  `needless_late_init` (a liveness change, not a spelling one); (7)
+  `needless_late_init` -- the latter DISCHARGED by FR-132 (2026-08-26) via
+  exactly the escape this clause names. The parenthetical reason recorded
+  here, "a liveness change, not a spelling one", was true of the obvious
+  attack (keep the initializer, which re-opens the deferral decision) and
+  false of the one that worked: FR-132 leaves `computeDeferredInits`'
+  decision untouched and moves only WHERE the declaration renders. It stays
+  off-limits TO THE AUTONOMOUS OPTIMIZER regardless -- the fold needed a
+  drop-order soundness gate that no lint-count objective would have found; (7)
   human-gated: `git push`, `flake.nix`, external side effects, any design
   decision (record an FR spike NO-GO). The ARCHITECTURE is a load-bearing
   split: a deterministic Python CONTROLLER (`nix/harness/controller.py`, no
@@ -4448,7 +4457,7 @@ piece and becomes FR-45.
   train-only overfit (train↓ held-out↑) is rejected by `score` with exit 2. The
   remaining `assign_op_pattern` (SCF-hoisted accumulators, LValue-place targets)
   and the deeper quality tail are the next iterations; `needless_late_init`
-  stays off-limits.
+  stayed off-limits to the harness and was discharged by hand as FR-132.
 
   RUN RECORD 2 (2026-08-14, same epoch-1). Champion first RE-ESTABLISHED at
   the current emitter (out-of-band W2.9-W2.14 + FR-61f changes since the
@@ -4477,7 +4486,8 @@ piece and becomes FR-45.
   idiomatic std-const substitution changes the emitted float value — a
   miscompile — and an allow-attribute is contract-banned; the exact literal
   is the only correct spelling); needless_late_init (257, now 94% of the
-  train residue) stays off-limits without a human + a new idea; the rest is
+  train residue) stays off-limits without a human + a new idea -- supplied by
+  FR-132, which cleared 94% of it corpus-wide; the rest is
   a <=3-count per-program long tail. Harness infra hardened this run:
   controller auto-detects meson vs CMake build trees (`52b2c6a`).
   EPOCH-2 CODA (same day): the seed-2 re-split (`fd2130a`) moved
@@ -8734,6 +8744,79 @@ piece and becomes FR-45.
   test/Import/Cpp/cpp-record-cross-tu-merge.cpp with
   DROPPY/TWIN/ALIAS legs)
 
+
+- [x] FR-132 THE LATE-INIT MERGE: a deferred binding rendered `let s: i32;`
+  at its declaration and `s = <rhs>;` at its initializing write -- two program
+  points -- and `clippy::needless_late_init` counted every one of them. It was
+  503 of the 532 corpus warnings, 94% of the emitter's entire idiomatic-Rust
+  debt, and ONE shape. Fold the two points into `let [mut] s: i32 = <rhs>;`
+  rendered at the ASSIGN, with the declaration rendering nothing.
+  THE NEW IDEA, which is what the harness contract's item-6 escape clause
+  asked for: this is NOT a liveness change. The obvious attack -- keep the
+  initializer -- re-opens the deferral decision and is exactly the liveness
+  reasoning that miscompiled three times. FR-132 leaves
+  `computeDeferredInits`' decision completely untouched and changes only
+  WHERE the declaration renders. Between `let x: T;` and its first write the
+  binding is uninitialized, so no emitted statement can read it -- rustc
+  E0381 would already have rejected such output -- and a declaration that
+  emits no code, sunk past statements that provably cannot observe it, is
+  inert.
+  THE RULE IS SCOPE, NOT ADJACENCY, and that distinction is the whole design:
+  the motivating instance in test/EndToEnd/switch-enum.c is
+  `let s: i32; let v10: i32 = classify(c, i); s = v10;` -- an intervening
+  statement, which is the COMMON case -- so an "immediately following" rule
+  would have missed the real shape. The merging write must be in the SAME
+  BLOCK (inside an `if`/`match`/`loop` region, sinking would move the binding
+  out of scope for every later read), must be whole and direct
+  (`isBindingWrite`, so a projection `v.x =` fails it), and any other mention
+  of the binding in the gap refuses. FR-61b's if-expression binding keeps
+  priority where both apply, because it folds into a strictly better shape.
+  THE ONE REAL BLOCKER, found by the spike and NOT predicted: DROP ORDER.
+  Rust drops in reverse DECLARATION order, so sinking a may-drop declaration
+  past another may-drop declaration FLIPS TWO DESTRUCTORS. Measured under
+  rustc -O on the two orderings of one program: `dtor 2; dtor 1` became
+  `dtor 1; dtor 2`, AND BOTH CRATES COMPILED CLEAN -- the compile-clean
+  miscompile class again. It is reachable from hand-written IR today and not
+  from C/C++ source (both source shapes are located rejections), so the
+  UNGATED fold still byte-diffs green; that is precisely why the gate is
+  recorded rather than skipped. `typeMayDrop` is deliberately WIDER than
+  `bindingHasDrop` -- it must catch `Box<T>`/STL owners, not just
+  `emitrust.has_drop` structs. The gate costs 41 of 802 merges (5%) and
+  exactly one clippy warning.
+  MEASURED, apples-to-apples on 164 linted crates: clippy 532 -> 68 total,
+  `needless_late_init` 503 -> 31 (-472). Emitted EndToEnd corpus 23083 ->
+  22322 lines (-761) across 133 files, and a structural diff of every changed
+  file found ZERO hunks that are not exactly the fold shape and ZERO vNN
+  renumbering -- the unconditional `assignName` in the folded declaration path
+  is what buys that, and it is why the golden churn was 8 files instead of the
+  predicted 36+. ACCEPTED NEW DEBT: `clippy::unnecessary_literal_unwrap`
+  0 -> 8, and it is the same phenomenon as FR-61f-12's `collapsible_if` --
+  the code did not get worse, clippy can now CONST-TRACE `Some(f)` through the
+  merged `let` into a later `.expect(..)` that the two-point form hid from it.
+  A real follow-on (a nullable fn-ptr local initialized from a literal `Some`
+  and never reassigned needs no Option at all), not a regression.
+  Residual 31 are the SCF-destruction shape (`let v: i32; .. match { v = .. }`)
+  and need an FR-61b-style match/if-expression generalization, not this fold.
+  Full suite 832/832, EndToEnd 251/251 byte-diff, CTestSuite 220, Cpp17Suite
+  35. Tests: test/Target/Rust/late-init-merge.mlir (8 win legs, 6 refusal legs,
+  including `drop_order` paired with `drop_order_scalar_twin` -- byte-identical
+  IR but for the type, so the gate's REASON is pinned and not merely its
+  effect) and test/EndToEnd/late-init-merge.c (byte-diff at three argument
+  counts over the gapped, `mut`, dead-store-first, struct and region-write
+  shapes).
+
+- [ ] FR-133 A NULLABLE FN-PTR LOCAL initialized from a literal `Some` needs
+  no `Option` at all. Surfaced by FR-132, which made the shape visible to
+  clippy rather than creating it: `let cp: Option<fn(i32)->i32> = Some(addc);
+  .. cp.expect("null function pointer")(i)` draws
+  `clippy::unnecessary_literal_unwrap` (8 corpus instances, fn-pointers.c
+  contributing 3). The `.expect` was ALWAYS redundant there; the two-program-
+  point rendering FR-132 removed is simply what hid it from clippy's const
+  tracing, so this is newly-visible debt and not a regression -- the emitted
+  code got strictly shorter in the same change. When a fn-ptr local is
+  initialized from a literal `Some` and is never reassigned nor compared
+  against null, the `Option` wrapper can be dropped and every use site loses
+  its unwrap. **NOT SPIKED.**
 
 - [ ] FR-131 DEFECT (found by FR-61f-8's spike, pre-existing, SEPARATE
   channel): `printf("")` with an EMPTY format string and no arguments
