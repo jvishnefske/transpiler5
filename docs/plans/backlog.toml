@@ -173,10 +173,10 @@ anchor = "FR-138 TRACTOR EVALUATION READINESS"
 id = "FR-137"
 rank = 15
 kind = "defect"
-status = "open"
+status = "landed"
 size = "M"
 title = "CRASH: importing antirez/sds segfaults in clang's constant evaluator"
-summary = "Highest-severity class: an abort with no diagnostic, no partial credit, no recovery. Found by the TRACTOR readiness sweep 2026-08-27 -- one crash in 13 unseen external units. Offending decl is SDS_NOINIT (const char *g = \"...\"), call site is recordPointerGlobalFileScopeDetail's var->evaluateValue() at lib/ImportC/ImportC.cpp:2460; the fault is INSIDE clang (evaluateValue -> evaluateValueImpl -> EvaluateAsInitializer). NOT a stack overflow (survives ulimit -s unlimited), NOT a parse error (clang -fsyntax-only gives zero errors), and the call site's own null/lvalue guard is correct. Every import path crashes; both pre-import analyses (item-graph, coloring) are clean. No reduced repro yet -- the isolated two-line version imports fine, so context matters. Ranked above the feature queue: fix before any external evaluation."
+summary = "FIXED 2026-08-28. The whole-program pre-scan gated a DECL-LOCAL evaluateValue() with the REDECL-CHAIN-WIDE getAnyInitializer(), so a bare `extern T *g;` declaration in the same TU as the definition reached clang with a null getInit() and segfaulted in EvaluateAsInitializer. Reduced repro is two lines (extern decl + definition of an externally-visible pointer global); order-independent. Fix passes the initializer-owning decl from the two-arg getAnyInitializer(initDecl), plus a decl-local guard; a second masked defect (importGlobalVar redeclaration idempotency checked `globals` but a pointer global registers in `pointerGlobals`) was fixed with it. Emitted MLIR is byte-identical to the no-extern spelling, so the recorded CTS-P4 cursor fact is preserved, not skipped. Pinned by 3 Import tests + an EndToEnd byte-diff. Sibling audit: the other four evaluateValue sites are not reachable."
 blocked_by = []
 anchor = "FR-137 DEFECT (CRASH on unseen external C"
 

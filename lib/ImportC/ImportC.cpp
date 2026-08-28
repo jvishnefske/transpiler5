@@ -2457,6 +2457,15 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
   // pointee type) records nothing, so `deferExternGlobal` keeps the
   // historical unconditional rejection for those shapes.
   auto recordPointerGlobalFileScopeDetail = [&](const clang::VarDecl *var) {
+    // FR-137: `evaluateValue` is DECL-LOCAL (clang's `evaluateValueImpl`
+    // reads `getInit()`), while the caller's redeclaration test
+    // `getAnyInitializer()` is REDECL-CHAIN-WIDE. Handing a bare
+    // `extern T *g;` declaration to it dereferenced a null initializer
+    // inside `Expr::EvaluateAsInitializer` and killed the process with no
+    // diagnostic. Callers must pass the initializer-OWNING declaration; this
+    // guard is defence in depth so no future one can resurrect the crash.
+    if (!var || !var->getInit())
+      return;
     const clang::APValue *value = var->evaluateValue();
     if (!value || !value->isLValue() || value->isNullPointer())
       return;
@@ -2623,14 +2632,23 @@ void CImporter::collectWholeProgramInfo(clang::ASTContext &context,
       // `&arr` address-taken fact.
       if (var->hasGlobalStorage() && var->isExternallyVisible()) {
         clang::QualType type = var->getType().getCanonicalType();
-        if (type->isPointerType() && !type->isFunctionPointerType())
-          if (const clang::Expr *init = var->getAnyInitializer()) {
+        if (type->isPointerType() && !type->isFunctionPointerType()) {
+          // FR-137: `getAnyInitializer` is redecl-chain-wide, so it answers
+          // yes on a bare `extern T *g;` declaration whose OWN `getInit()`
+          // is null. Take the initializer-owning decl out with it (the
+          // ImportCGlobals.cpp `deferExternGlobal` idiom) and hand THAT to
+          // `recordPointerGlobalFileScopeDetail`, whose `evaluateValue` is
+          // decl-local. The symbol key stays `var`'s: same entity, same
+          // symbol, whichever declaration the walk happened to reach.
+          const clang::VarDecl *initDecl = nullptr;
+          if (const clang::Expr *init = var->getAnyInitializer(initDecl)) {
             std::string base = addressBoundGlobal(init);
             if (!base.empty())
               wholeProgram.pointerGlobalBases[globalVarSymbolName(var)].insert(
                   base);
-            recordPointerGlobalFileScopeDetail(var);
+            recordPointerGlobalFileScopeDetail(initDecl);
           }
+        }
         // Extern-array composite merge (W3.2 COMMIT B): record this TU's
         // COMPLETE mapped type for a bounded array definition, so
         // `deferExternGlobal` can resolve another TU's `extern int a[];`

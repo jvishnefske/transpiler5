@@ -36,6 +36,15 @@ LogicalResult CImporter::importGlobalVar(const clang::VarDecl *var) {
   const clang::VarDecl *canonical = var->getCanonicalDecl();
   if (globals.contains(canonical))
     return success(); // Redeclaration of an already imported global.
+  // FR-137: the same idempotency for a POINTER global, which registers in
+  // `pointerGlobals` (its cursor/backing decomposition, CTS-P4) and never in
+  // `globals`. Without this, a TU holding both `extern T *g;` and the real
+  // `T *g = ...;` -- the header/.c idiom -- imported the same entity once per
+  // declaration and the second pass hit `checkFreshSymbol`'s "collides with
+  // an existing symbol". Keyed on the canonical decl, like every
+  // `pointerGlobals` lookup.
+  if (pointerGlobals.contains(canonical))
+    return success();
   // A devirtualized function-pointer alias (CTS-S, 00189) materializes no
   // global at all; every use lowers against its target.
   if (fnPtrAliases.contains(canonical))
