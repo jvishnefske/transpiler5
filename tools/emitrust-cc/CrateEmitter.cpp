@@ -21,6 +21,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/SymbolTable.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -143,6 +144,17 @@ llvm::StringRef crateRootFileName(CrateType type) {
   return type == CrateType::Bin ? "main.rs" : "lib.rs";
 }
 
+bool isUsableCrateName(llvm::StringRef name) {
+  if (name.empty())
+    return false;
+  if (name.front() >= '0' && name.front() <= '9')
+    return false;
+  return llvm::all_of(name, [](char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_';
+  });
+}
+
 std::string sanitizeCrateName(llvm::StringRef stem) {
   std::string name;
   name.reserve(stem.size());
@@ -186,19 +198,50 @@ static unsigned cMainInputCount(mlir::ModuleOp module) {
   return funcOp ? funcOp.getFunctionType().getNumInputs() : 0;
 }
 
+/// FR-139: would rustc's `non_snake_case` lint fire on a CRATE named `name`?
+///
+/// Mirrors rustc's own `is_snake_case`: leading and trailing underscores are
+/// ignored, and what remains may hold no uppercase letter and no doubled
+/// underscore. The predicate exists so the emitted manifest's own deny table
+/// cannot veto the crate name the caller asked for -- see `renderCargoToml`.
+static bool crateNameTripsNonSnakeCase(llvm::StringRef name) {
+  llvm::StringRef core = name.trim('_');
+  if (core.empty())
+    return false;
+  bool previousWasUnderscore = false;
+  for (char c : core) {
+    if (c >= 'A' && c <= 'Z')
+      return true;
+    if (c == '_') {
+      if (previousWasUnderscore)
+        return true;
+      previousWasUnderscore = true;
+    } else {
+      previousWasUnderscore = false;
+    }
+  }
+  return false;
+}
+
 std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
-                            bool asyncActorRuntime) {
+                            bool asyncActorRuntime, bool cAbiExports) {
   std::string toml;
   llvm::raw_string_ostream os(toml);
   os << "[package]\n"
      << "name = \"" << crateName << "\"\n"
      << "version = \"0.1.0\"\n"
      << "edition = \"2021\"\n";
-  if (type == CrateType::Lib)
+  if (type == CrateType::Lib) {
     os << "\n"
        << "[lib]\n"
        << "name = \"" << crateName << "\"\n"
        << "path = \"src/lib.rs\"\n";
+    // FR-139: the crate is only dlopen-able if cargo actually builds a shared
+    // object for it. Default-off, so every crate emitted before this flag
+    // existed keeps its rlib manifest byte for byte.
+    if (cAbiExports)
+      os << "crate-type = [\"cdylib\"]\n";
+  }
   // FR-53: the lints the old blanket allow header silenced are now DENIED, so
   // any regression in the emitter's warning-clean codegen fails `cargo build`.
   // Only `dead_code` stays allowed in the crate root (see `kAllowHeader`);
@@ -214,10 +257,19 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
      << "unused_mut = \"deny\"\n"
      << "unused_parens = \"deny\"\n"
      << "unpredictable_function_pointer_comparisons = \"deny\"\n";
-  if (mlir::emitrust::idiomaticRenameEnabled())
-    os << "non_snake_case = \"deny\"\n"
-       << "non_upper_case_globals = \"deny\"\n"
+  // FR-139: `non_snake_case` also applies to the CRATE NAME, which is the
+  // caller's and not the emitter's -- a `--crate-name=Sieve` crate died on
+  // `error: crate 'Sieve' should have a snake case name` requested by this
+  // very table, and a CamelCase library name is exactly what a host looking
+  // for `libSieve.so` needs. The tripwire relaxes EXACTLY where it must:
+  // when the name itself would trip it, and nowhere else. The two sibling
+  // lints never see the crate name, so they are never dropped.
+  if (mlir::emitrust::idiomaticRenameEnabled()) {
+    if (!crateNameTripsNonSnakeCase(crateName))
+      os << "non_snake_case = \"deny\"\n";
+    os << "non_upper_case_globals = \"deny\"\n"
        << "non_camel_case_types = \"deny\"\n";
+  }
   // FR-62 slice 5c: the ASYNC crate flavor (E4) appends its tokio
   // dependency UNCONDITIONALLY — never behind a cargo feature, whose mere
   // declaration breaks `cargo build --offline` (the measured NO-GO) — and
@@ -233,19 +285,25 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
 }
 
 mlir::FailureOr<std::string> renderCrateRoot(mlir::ModuleOp module,
-                                             CrateType type) {
-  return renderCrateRoot(module, type, /*depCrates=*/{});
+                                             CrateType type,
+                                             bool cAbiExports) {
+  return renderCrateRoot(module, type, /*depCrates=*/{}, cAbiExports);
 }
 
 mlir::FailureOr<std::string>
 renderCrateRoot(mlir::ModuleOp module, CrateType type,
-                llvm::ArrayRef<std::string> depCrates) {
+                llvm::ArrayRef<std::string> depCrates, bool cAbiExports) {
   const bool wrapMain = type == CrateType::Bin;
   mlir::emitrust::RustEmitOptions emitOptions;
   // FR-51: only a library crate exports anything. A binary crate's items stay
   // private, which is both what they were and what keeps this rendering
   // byte-identical to every crate emitted before FR-51.
   emitOptions.exportItems = type == CrateType::Lib;
+  // FR-139: the C-ABI shape is a property of an EXPORTED item, so it rides on
+  // top of `exportItems` and is meaningless without it. The driver rejects
+  // `--c-abi-exports` on a binary crate before ever getting here; the `&&`
+  // makes the invariant local anyway.
+  emitOptions.cAbiExports = cAbiExports && emitOptions.exportItems;
   std::string source;
   llvm::raw_string_ostream os(source);
   llvm::StringRef header = mlir::emitrust::idiomaticRenameEnabled()

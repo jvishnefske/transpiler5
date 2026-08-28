@@ -9128,51 +9128,74 @@ piece and becomes FR-45.
   a real criterion-(a) number is still NOT done and remains this entry's
   open half.
 
-- [ ] FR-139 FEATURE (the TRACTOR `_lib` submission packaging layer, split
-  out of FR-138's 2026-08-28 spike, which supplies ALL the evidence below --
-  do not re-measure it): emit a crate that the corpus's `cando` harness can
-  actually dlopen and dlsym. Three pieces, and only the first two are in
-  scope here:
-    (1) `crate-type = ["cdylib"]` in the emitted `[lib]` section, under a new
-        opt-in (no existing crate may shift a byte -- `--emit=crate` output is
-        golden-pinned, so this must NOT become the default shape).
-    (2) `#[no_mangle] pub extern "C"` on exported functions, RESTRICTED TO THE
-        ALL-SCALAR SIGNATURES (bucket A). An all-scalar `extern "C"` entry
-        point needs no `unsafe` and no shim, so this is free of the safety
-        tension that blocks the rest.
-    (3) OUT OF SCOPE, deliberately: any pointer-taking export. See FR-138 --
-        a slice param compiles with only a warning and then miscompiles
-        ACROSS THE FFI BOUNDARY (crc16 measured: native 27235, cdylib 0),
-        which is the failure class this repo forbids. A pointer export needs
-        a generated (ptr,len) shim in `unsafe`, which spends rubric criterion
-        (b) to buy (a); that trade is a decision, not an implementation
-        detail, and it gets its own entry.
-  ALREADY SOLVED, needs no work: `--crate-name=` sets both `[package] name`
-  and `[lib] name`, so `lib<LIBRARY>.so` is reachable today. The symbol and
-  library names are NOT derivable from the case directory -- 42 of the 80
-  `_lib` runners (all of B01_synthetic) pin `library:`/`symbol:` explicitly
-  and the other 38 derive it -- so the caller supplies them; the emitter must
-  not guess.
-  MEASURED PAYOFF, built and byte-diffed, not projected: 19 of the 80
-  evaluable `_lib` cases go from unscoreable to byte-identical against the
-  clang-built native. 21 are bucket A; 2 of those are blocked by a
-  SELF-INFLICTED gate worth fixing here -- the emitted manifest's own
-  `[lints.rust] non_snake_case = "deny"` rejects the CamelCase `[lib] name`
-  that `004_nineality_sieve_lib` (library `Sieve`) requires, with
-  `error: crate 'Sieve' should have a snake case name`. Reproduced directly.
-  Relaxing that lint for an explicitly-requested crate name lifts 19 to 21.
-  `--actor-lift=false` would add 3 more (FR-62 lifts those targets to
-  `&mut self` methods), but whether that flag preserves the state-persistence
-  the harness exercises across repeated `run()` calls is UNMEASURED, so those
-  3 are not claimed.
-  GATES: no existing golden shifts a byte (the opt-in is what guarantees it);
-  a lit test pinning the cdylib manifest + `#[no_mangle] pub extern "C"` for
-  an all-scalar export; an EndToEnd-class test that actually BUILDS the
-  cdylib, dlopens it from a C driver declaring the C signature, and byte-diffs
-  against the clang-built native -- compile-clean is not evidence here, and
-  the whole point of this FR is behaviour across a boundary the existing
-  oracles never cross; full lit 100%.
-  **SPIKED via FR-138 2026-08-28. GO for (1)+(2), measured NO-GO for (3).**
+- [x] FR-139 FEATURE (the TRACTOR `_lib` submission packaging layer, split
+  out of FR-138's 2026-08-28 spike; LANDED 2026-08-28): emit a crate the
+  corpus's `cando` harness can actually dlopen and dlsym.
+  DELIVERED, behind the opt-in `--c-abi-exports` (default OFF, which is what
+  guarantees every existing golden stays byte-identical):
+    - `[lib]` gains `crate-type = ["cdylib"]`, so cargo produces a real `.so`.
+    - An EXPORTED function whose signature is ALL-SCALAR is emitted
+      `#[no_mangle] pub extern "C" fn`. All-scalar means every input and
+      result is a builtin `IntegerType`/`FloatType`; every emitrust dialect
+      type (Slice, Ref, MutRef, Struct, FnPtr, ...) disqualifies.
+  THE RESTRICTION IS THE WHOLE SAFETY ARGUMENT, not a simplification: an
+  all-scalar `extern "C"` entry point needs no `unsafe` and no shim, so this
+  buys criterion (a) without spending (b). A pointer-taking export is
+  deliberately NOT emitted -- see FR-138 for the measurement (a slice param
+  compiles with only an FFI-safety warning and then miscompiles across the
+  boundary; crc16 native 27235 vs cdylib 0).
+  VERIFIED END TO END, not by inspection: `--c-abi-exports --crate-name=Sieve`
+  on a two-function input produces `libSieve.so` exporting exactly
+  `T add_two` (the all-scalar one, dlsym-able), while the slice-taking
+  `sum_bytes` is absent from the dynamic symbol table and stays a plain
+  `pub fn`. The oracle is test/EndToEnd/c-abi-exports-dlopen.c: a clang-built
+  host dlopens the emitted `.so`, dlsyms the bare symbol and calls it through
+  the C signature, byte-diffed against the clang-built native of the same
+  source. Proven non-vacuous by a negative control -- perturbing one constant
+  in the emitted crate made the diff fail.
+  A NON-EXPORTABLE EXPORTED FUNCTION IS LOUD, never silently missing: it
+  keeps `pub fn` and emits a LOCATED warning naming it and why, so a dlsym
+  miss at evaluation time is not a mystery. A warning and not an error on
+  purpose -- a crate holds many functions and only one is the target, so
+  erroring would reject crates that otherwise work. Two further blockers got
+  their own wordings: an `async fn` (FR-62 slice 5c -- `extern "C" async fn`
+  is not Rust) and an FR-52 externals-generic function (`#[no_mangle]` on a
+  generic item has no single symbol). `--c-abi-exports` is refused under
+  `--partition` (a workspace member is a path dependency of its siblings,
+  which a cdylib cannot be) and with a binary crate.
+  THE MANIFEST GATE FR-139 WAS FILED TO CLEAR, and the fix was not where the
+  entry assumed: `[lints.rust] non_snake_case = "deny"` did veto a CamelCase
+  crate name, but `--crate-name` could never PRODUCE one -- `sanitizeCrateName`
+  lowercases, so `--crate-name=Sieve` became `sieve` and the lint never fired.
+  Both halves were needed: an explicit `--crate-name` that is already a usable
+  Rust identifier now passes through VERBATIM (derived names -- input stem,
+  `-o` stem -- still go through the sanitizer unchanged), and the deny is
+  omitted only when the crate name itself would trip it.
+  BYTE-NEUTRALITY OF THAT CHANGE WAS AUDITED, not assumed: all 16 pre-existing
+  `--crate-name` values in the tree are already lowercase identifiers, and
+  `my-lib` (a hyphen) is not a usable identifier so it still routes through
+  the sanitizer. Nothing shifts. A whole-tree sweep of every source file
+  through a mirror of sanitizeCrateName + rustc's `is_snake_case` found ZERO
+  files whose derived name trips the lint, so the omission branch is
+  unreachable for every existing test and the c-testsuite/Cpp17Suite ratchets
+  cannot move.
+  KNOWN RESIDUAL, recorded rather than papered over: `non_snake_case` is
+  warn-by-default in rustc, so a CamelCase crate builds with one warning
+  instead of failing. The crate BUILDS, which is what scoring needs, but it is
+  not warning-clean -- and the only way to silence it is a crate-root
+  `#![allow(non_snake_case)]`, which would disarm the tripwire for every
+  identifier in the crate. A single warning on an externally-mandated name is
+  the narrower trade.
+  Pinned by test/Driver/c-abi-exports.c (manifest + attribute + the
+  no-flag byte-identity guard + the located warning),
+  c-abi-exports-invalid.c (the three refusals),
+  crate-name-non-snake-case.c (both directions, so the tripwire relaxes
+  exactly where it must), and the EndToEnd dlopen oracle above.
+  MEASURED PAYOFF stands as FR-138 recorded it: 19 of the 80 evaluable `_lib`
+  cases go from unscoreable to byte-identical, 21 once the manifest gate is
+  clear. Converting that into a real criterion-(a) number needs FR-138's
+  remaining half -- the corpus runner wired to `translated_rust/` -- which is
+  still open.
 
 - [x] FR-137 DEFECT (CRASH on unseen external C, found by the TRACTOR
   readiness sweep 2026-08-27; ROOT-CAUSED AND FIXED 2026-08-28): importing

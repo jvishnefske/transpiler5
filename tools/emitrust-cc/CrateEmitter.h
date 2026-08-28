@@ -94,6 +94,20 @@ CrateType selectCrateType(CrateTypeRequest request, mlir::ModuleOp module);
 /// \returns the basename, without the `src/` directory.
 llvm::StringRef crateRootFileName(CrateType type);
 
+/// FR-139: is `name` usable verbatim as a cargo package / `[lib]` name?
+///
+/// True for a nonempty string over `[A-Za-z0-9_]` that does not start with a
+/// digit. `sanitizeCrateName` maps every OTHER spelling into this set, so an
+/// EXPLICIT `--crate-name` that already satisfies this can pass through
+/// untouched — which is how a CamelCase library name (`libSieve.so`) survives
+/// to the manifest, where the sanitizer's lowercasing used to destroy it.
+/// DERIVED names (an input stem, an output-directory stem) always go through
+/// the sanitizer regardless.
+///
+/// \param name the candidate crate name.
+/// \returns true when the name needs no sanitization.
+bool isUsableCrateName(llvm::StringRef name);
+
 /// Derives a cargo package name from an input file's basename stem.
 ///
 /// Uppercase ASCII letters are lowered, characters outside `[a-z0-9_]` are
@@ -154,12 +168,29 @@ bool hasAsyncActorRuntime(mlir::ModuleOp module);
 /// macro). Its offline build fails loudly at resolution — the correct
 /// failure direction.
 ///
-/// \param crateName the sanitized package name.
+/// FR-139: `cAbiExports` (default false) adds `crate-type = ["cdylib"]` to
+/// the `[lib]` section, so cargo builds a real shared object a C host can
+/// dlopen. It is meaningful only for `CrateType::Lib` and is ignored for a
+/// binary crate, whose manifest has no `[lib]` section at all.
+///
+/// FR-139, independently of that flag: the `non_snake_case = "deny"` line is
+/// OMITTED when `crateName` would itself trip the lint. rustc applies
+/// `non_snake_case` to the CRATE NAME too, so the emitted manifest was
+/// vetoing names the caller explicitly asked for
+/// (`error: crate 'Sieve' should have a snake case name`, reproduced) — and a
+/// CamelCase `[lib] name` is exactly what a host that dlopens `libSieve.so`
+/// requires. The relaxation is as narrow as the problem: only that one lint,
+/// only for a name that would fail, and only ever for the name — the deny
+/// still governs every identifier the emitter itself produces.
+///
+/// \param crateName the package name.
 /// \param type the crate shape.
 /// \param asyncActorRuntime append the async flavor's tokio dependency.
+/// \param cAbiExports build the library as a cdylib.
 /// \returns the manifest text.
 std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
-                            bool asyncActorRuntime = false);
+                            bool asyncActorRuntime = false,
+                            bool cAbiExports = false);
 
 /// Renders the crate-root Rust source for `module` (`src/main.rs` for a
 /// binary crate, `src/lib.rs` for a library one).
@@ -178,12 +209,21 @@ std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
 /// `RustEmitOptions::exportItems`, so its external-linkage functions and its
 /// types are `pub`.
 ///
+/// FR-139: `cAbiExports` (default false) additionally emits every ALL-SCALAR
+/// exported function as `#[no_mangle] pub extern "C" fn`, so a C host can
+/// dlsym the bare symbol; a non-scalar exported signature keeps its `pub fn`
+/// and is reported with a located warning (see `RustEmitOptions::cAbiExports`
+/// for why that restriction is not negotiable). The flag rides on top of the
+/// library export set and does nothing for a binary crate.
+///
 /// \param module the fully converted EmitRust module to translate.
 /// \param type the crate shape.
+/// \param cAbiExports give all-scalar exports the C ABI and a bare symbol.
 /// \returns the Rust source text, or failure with diagnostics already
 ///          emitted through the module's context.
 mlir::FailureOr<std::string> renderCrateRoot(mlir::ModuleOp module,
-                                             CrateType type);
+                                             CrateType type,
+                                             bool cAbiExports = false);
 
 /// FR-59: `renderCrateRoot` for a WORKSPACE MEMBER that depends on
 /// `depCrates`. With an empty list this is byte-for-byte the overload
@@ -196,10 +236,15 @@ mlir::FailureOr<std::string> renderCrateRoot(mlir::ModuleOp module,
 /// \param module the member's converted module slice.
 /// \param type the member's crate shape.
 /// \param depCrates the package names of the member's path dependencies.
+/// \param cAbiExports FR-139: give all-scalar exports the C ABI. The driver
+///        refuses `--c-abi-exports` under `--partition` (a workspace member is
+///        a path dependency of its siblings, which a cdylib cannot be), so
+///        this is false on every workspace path today.
 /// \returns the Rust source text, or failure with diagnostics emitted.
 mlir::FailureOr<std::string>
 renderCrateRoot(mlir::ModuleOp module, CrateType type,
-                llvm::ArrayRef<std::string> depCrates);
+                llvm::ArrayRef<std::string> depCrates,
+                bool cAbiExports = false);
 
 /// FR-59: the member manifest — `renderCargoToml` plus a `[dependencies]`
 /// table of path dependencies (`<dep> = { path = "../<dep>" }`), one per

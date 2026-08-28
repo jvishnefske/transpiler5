@@ -4078,6 +4078,29 @@ LogicalResult RustEmitter::emitVerbatim(emitrust::VerbatimOp verbatimOp) {
   return success();
 }
 
+/// FR-139: is `type` a type that crosses the C ABI unchanged, needing neither
+/// an `unsafe` shim nor a repr promise?
+///
+/// Exactly the BUILTIN scalars: `mlir::IntegerType` (`i32`, `u8`, ...) and
+/// `mlir::FloatType` (`f32`, `f64`). Every EmitRust dialect type is excluded
+/// on purpose -- `!emitrust.slice` is a two-register fat pointer, `!emitrust.
+/// struct` carries no `#[repr(C)]`, `!emitrust.opaque` is whatever the
+/// importer could not model -- and so is every other builtin (an `index` has
+/// no C spelling). Widening this predicate widens the FFI surface, which is
+/// the one thing FR-139 must not do.
+static bool isCAbiScalarType(Type type) {
+  return isa<IntegerType>(type) || isa<FloatType>(type);
+}
+
+/// FR-139: true when every input and every result of `type` is a C-ABI scalar.
+///
+/// A zero-result (void) function and a zero-parameter one both qualify
+/// vacuously, which is correct: `extern "C" fn f()` is a complete C signature.
+static bool hasAllScalarSignature(FunctionType type) {
+  return llvm::all_of(type.getInputs(), isCAbiScalarType) &&
+         llvm::all_of(type.getResults(), isCAbiScalarType);
+}
+
 LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   Operation *op = funcOp.getOperation();
   auto fn = cast<FunctionOpInterface>(op);
@@ -4218,7 +4241,45 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   if (auto rustName =
           op->getAttrOfType<StringAttr>(emitrust::kMethodRustNameAttrName))
     printedName = rustName.getValue();
+  // FR-139: an EXPORTED function whose whole signature is C-ABI scalar is
+  // additionally given a bare C symbol, so a dlopen/dlsym host can call it
+  // through an ordinary C declaration. Everything else keeps the plain
+  // `pub fn` it has always had -- and says why, because the alternative
+  // failure mode is a dlsym that returns null in somebody else's harness
+  // with no explanation anywhere. A warning rather than an error: a crate
+  // holds many functions and typically only one of them is the target.
+  //
+  // The blockers below are not stylistic. `extern "C"` on a `&[T]` parameter
+  // compiles with only a non-FFI-safe warning and then MISCOMPILES across
+  // the boundary (FR-138, measured). `#[no_mangle]` on a generic item has no
+  // single symbol to name. `extern "C" async fn` is not Rust at all.
+  bool cAbiExport = false;
+  if (options.cAbiExports && !inTraitImpl && !itemVisibility(symbol).empty()) {
+    StringRef blocker;
+    if (isAsyncFn)
+      blocker = "it is an async fn, which has no C calling convention";
+    else if (op->hasAttr(emitrust::kExternalsGenericAttrName))
+      blocker = "it is generic over the external-requirements trait (FR-52), "
+                "so it has no single symbol to name";
+    else if (!hasAllScalarSignature(funcOp.getFunctionType()))
+      blocker = "its signature is not all-scalar (a C-ABI entry point may "
+                "only take and return builtin integer and floating-point "
+                "types)";
+    if (blocker.empty())
+      cAbiExport = true;
+    else
+      // On the LOCATION, not the op: this is a message for the person who
+      // wrote the C, and attaching it to the operation makes MLIR dump the
+      // whole `emitrust.func` after it.
+      mlir::emitWarning(op->getLoc())
+          << "--c-abi-exports: no C-ABI export for '" << symbol
+          << "': " << blocker
+          << "; it stays a plain 'pub fn' and is not reachable by dlsym";
+  }
+  if (cAbiExport)
+    os << "#[no_mangle]\n";
   os << (inTraitImpl ? StringRef("") : itemVisibility(symbol))
+     << (cAbiExport ? "extern \"C\" " : "")
      << (isAsyncFn ? "async fn " : "fn ") << printedName;
   // FR-52: a function in the transitive closure of a caller of an external
   // requirement is generic over the requirement trait. Everything else keeps
