@@ -162,7 +162,7 @@ anchor = "FR-136 NO-GO (2026-08-26)"
 id = "FR-139"
 rank = 13
 kind = "feature"
-status = "spiked"
+status = "landed"
 size = "M"
 title = "TRACTOR _lib submission packaging: cdylib + no_mangle C-ABI exports"
 summary = "Split out of FR-138's 2026-08-28 spike, which supplies all the evidence. Emit crate-type=[\"cdylib\"] and #[no_mangle] pub extern \"C\" on exported functions, RESTRICTED to all-scalar signatures (those need no unsafe). Both behind an opt-in: --emit=crate output is golden-pinned and no existing crate may shift a byte. --crate-name= already sets [package] and [lib] name, so naming needs no new machinery. MEASURED payoff, built and byte-diffed against the clang native, not projected: 19 of the 80 evaluable _lib cases go from unscoreable to byte-identical; 21 are eligible but 2 are blocked by the emitted manifest's own [lints.rust] non_snake_case = \"deny\" rejecting the CamelCase [lib] name a case requires (error: crate 'Sieve' should have a snake case name), so relaxing that for an explicit --crate-name lifts 19 to 21. OUT OF SCOPE and a measured NO-GO: pointer-taking exports -- a slice param compiles with only an FFI-safety warning and then miscompiles across the boundary (crc16: native 27235, cdylib 0), and a (ptr,len) shim needs unsafe, spending rubric criterion (b) to buy (a). Gate needs a test that actually builds the cdylib, dlopens it from a C driver, and byte-diffs -- compile-clean is not evidence across an FFI boundary."

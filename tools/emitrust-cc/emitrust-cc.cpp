@@ -301,6 +301,23 @@ static llvm::cl::opt<emitrustcc::CrateTypeRequest> crateTypeOpt(
                    "('c_main') rather than the crate's entry point")),
     llvm::cl::init(emitrustcc::CrateTypeRequest::Auto));
 
+static llvm::cl::opt<bool> cAbiExportsFlag(
+    "c-abi-exports",
+    llvm::cl::desc(
+        "FR-139: make the emitted LIBRARY crate reachable from a C host. "
+        "Adds crate-type = [\"cdylib\"] to the [lib] section so cargo builds "
+        "a real shared object, and emits every ALL-SCALAR exported function "
+        "as '#[no_mangle] pub extern \"C\" fn' so there is a bare symbol to "
+        "dlsym. All-scalar means every parameter and result is a builtin "
+        "integer or floating-point type -- the subset that crosses the C ABI "
+        "with no 'unsafe' and no shim. An exported function that is NOT "
+        "all-scalar keeps its plain 'pub fn' and is reported with a located "
+        "warning; it is never given a C signature it does not match, because "
+        "rustc accepts the mismatch with only a warning and then miscompiles "
+        "across the boundary. Off by default: with the flag absent every "
+        "emitted crate is byte-identical to before it existed"),
+    llvm::cl::init(false));
+
 static llvm::cl::opt<std::string>
     outputPath("o",
                llvm::cl::desc("Output file for --emit=import/mlir/rust "
@@ -721,15 +738,19 @@ static mlir::LogicalResult writeModule(mlir::ModuleOp module,
 /// \param module the fully converted module; must define `c_main` when
 ///        `type` is `CrateType::Bin`.
 /// \param outDir the crate directory to create and populate.
-/// \param crateName the sanitized cargo package name.
+/// \param crateName the cargo package name.
 /// \param type the crate shape to emit.
+/// \param cAbiExports FR-139: emit the cdylib manifest and give the
+///        all-scalar exports the C ABI. Already validated to be false unless
+///        `type` is `CrateType::Lib`.
 /// \returns success if the whole crate was written.
 static mlir::LogicalResult emitCrate(mlir::ModuleOp module,
                                      llvm::StringRef outDir,
                                      llvm::StringRef crateName,
-                                     emitrustcc::CrateType type) {
+                                     emitrustcc::CrateType type,
+                                     bool cAbiExports) {
   mlir::FailureOr<std::string> rootRs =
-      emitrustcc::renderCrateRoot(module, type);
+      emitrustcc::renderCrateRoot(module, type, cAbiExports);
   if (mlir::failed(rootRs))
     return mlir::failure();
   // FR-62 slice 5c: an async actor runtime anchor selects the tokio
@@ -737,7 +758,7 @@ static mlir::LogicalResult emitCrate(mlir::ModuleOp module,
   // the module, so a run whose every actor demoted keeps the default,
   // offline-buildable manifest.
   std::string cargoToml = emitrustcc::renderCargoToml(
-      crateName, type, emitrustcc::hasAsyncActorRuntime(module));
+      crateName, type, emitrustcc::hasAsyncActorRuntime(module), cAbiExports);
 
   llvm::SmallString<256> srcDir(outDir);
   llvm::sys::path::append(srcDir, "src");
@@ -777,6 +798,35 @@ static mlir::LogicalResult diagnoseCrateType(mlir::ModuleOp module,
       << "cannot emit a binary crate: the input does not define a 'main' "
          "function (imported as 'c_main'). Drop --crate-type=bin to emit a "
          "library crate instead";
+  return mlir::failure();
+}
+
+/// FR-139: reports `--c-abi-exports` asked of a BINARY crate.
+///
+/// A binary crate exports nothing at all — FR-51 keeps every one of its items
+/// private, which is what makes the pre-FR-51 output byte-identical — so there
+/// is no surface for a C-ABI symbol to sit on, and the cdylib manifest line
+/// has no `[lib]` section to join. Silently ignoring the flag would hand back
+/// an executable and let the user discover at dlsym time, in some other
+/// harness, that nothing was exported; so this is an error, located on the
+/// module, that names the way out.
+///
+/// The flag's mode-level validation (`--emit=crate`/`--emit=rust`, and the
+/// `--partition` conflict) has already run on the command line; only the
+/// shape, which needs the module, is left to here.
+///
+/// \param module the fully converted module.
+/// \param type the selected crate shape.
+/// \param cAbiExports whether `--c-abi-exports` was requested.
+/// \returns success unless a C-ABI export set was asked of a binary crate.
+static mlir::LogicalResult
+diagnoseCAbiExports(mlir::ModuleOp module, emitrustcc::CrateType type,
+                    bool cAbiExports) {
+  if (!cAbiExports || type != emitrustcc::CrateType::Bin)
+    return mlir::success();
+  module.emitError()
+      << "--c-abi-exports needs a library crate, but this input emits a "
+         "BINARY one. Pass --crate-type=lib to export its functions instead";
   return mlir::failure();
 }
 
@@ -1722,13 +1772,23 @@ probeSearchState(const mlir::emitrust::SearchInputs &inputs,
   return outcome;
 }
 
-/// The sanitized cargo package name for this invocation: `--crate-name` when
-/// given; otherwise, for a single input its stem (historical behavior), and
-/// for several inputs the `-o` crate-directory stem (the input stems are
+/// The cargo package name for this invocation: `--crate-name` when given;
+/// otherwise, for a single input its stem (historical behavior), and for
+/// several inputs the `-o` crate-directory stem (the input stems are
 /// ambiguous). A `--compdb` run with no positional inputs takes the same
 /// crate-directory stem: the database's file list is a project, not one
 /// nameable input.
+///
+/// FR-139: an EXPLICIT `--crate-name` that is already a usable name is taken
+/// VERBATIM; every derived name, and every explicit name that is not usable,
+/// still goes through `sanitizeCrateName`. The sanitizer lowercases, so
+/// `--crate-name=Sieve` used to become `sieve` and the `libSieve.so` a
+/// dlopen host asks for by name could not be produced at all. Nothing that
+/// exists today shifts: every name the sanitizer already accepts unchanged
+/// is by construction usable, so the two paths agree on it.
 static std::string deducedCrateName(llvm::ArrayRef<std::string> inputs) {
+  if (!crateNameOpt.empty() && emitrustcc::isUsableCrateName(crateNameOpt))
+    return crateNameOpt;
   llvm::StringRef stem = !crateNameOpt.empty() ? llvm::StringRef(crateNameOpt)
                          : inputs.size() == 1
                              ? llvm::sys::path::stem(inputs.front())
@@ -2276,6 +2336,18 @@ int main(int argc, char **argv) {
                     "--emit=actor-plan apply\n";
     return 1;
   }
+  // FR-139: the C-ABI export shape is a property of ONE library crate. A
+  // workspace member is a PATH DEPENDENCY of its siblings, and a cdylib
+  // cannot be linked as one, so the combination would either break the
+  // workspace or silently ignore half of what was asked. Checked before the
+  // --partition validation below so the diagnostic names the real conflict
+  // rather than whichever other precondition --partition also wants.
+  if (cAbiExportsFlag && partitionFlag) {
+    llvm::errs() << "error: --c-abi-exports does not apply under --partition: "
+                    "a workspace member is a path dependency of its siblings, "
+                    "which a cdylib cannot be\n";
+    return 1;
+  }
   // FR-59: partitioning is a link-time, crate-emitting operation only —
   // plus FR-60's ratchet, whose manifest records the partition facts.
   if (partitionFlag &&
@@ -2411,6 +2483,16 @@ int main(int argc, char **argv) {
       emitKind != EmitKind::Crate && emitKind != EmitKind::Rust) {
     llvm::errs() << "error: --crate-type is only valid with --emit=crate or "
                     "--emit=rust\n";
+    return 1;
+  }
+  // FR-139: same reasoning for --c-abi-exports, which changes the crate ROOT
+  // and the manifest and so is meaningful exactly where one of them is
+  // produced. The other half of its validation -- that the resolved shape is
+  // a LIBRARY -- needs the module and lives with `diagnoseCAbiExports`.
+  if (cAbiExportsFlag && emitKind != EmitKind::Crate &&
+      emitKind != EmitKind::Rust) {
+    llvm::errs() << "error: --c-abi-exports is only valid with --emit=crate "
+                    "or --emit=rust\n";
     return 1;
   }
   if (emitKind == EmitKind::Crate && outputPath == "-") {
@@ -2761,8 +2843,10 @@ int main(int argc, char **argv) {
         emitrustcc::selectCrateType(crateTypeOpt, *module);
     if (mlir::failed(diagnoseCrateType(*module, type)))
       return 1;
+    if (mlir::failed(diagnoseCAbiExports(*module, type, cAbiExportsFlag)))
+      return 1;
     mlir::FailureOr<std::string> source =
-        emitrustcc::renderCrateRoot(*module, type);
+        emitrustcc::renderCrateRoot(*module, type, cAbiExportsFlag);
     if (mlir::failed(source))
       return 1;
     return mlir::failed(writeFile(outputPath, *source)) ? 1 : 0;
@@ -2772,13 +2856,16 @@ int main(int argc, char **argv) {
         emitrustcc::selectCrateType(crateTypeOpt, *module);
     if (mlir::failed(diagnoseCrateType(*module, type)))
       return 1;
+    if (mlir::failed(diagnoseCAbiExports(*module, type, cAbiExportsFlag)))
+      return 1;
     std::string crateName = deducedCrateName(inputs);
     // FR-44: the emitted symbol table is read BEFORE the crate is written,
     // because it is evidence about the very module being rendered.
     llvm::StringSet<> emittedSymbols;
     if (incrementalFlag)
       emittedSymbols = emitrustcc::collectEmittedSymbols(*module);
-    if (mlir::failed(emitCrate(*module, outputPath, crateName, type)))
+    if (mlir::failed(
+            emitCrate(*module, outputPath, crateName, type, cAbiExportsFlag)))
       return 1;
     if (incrementalFlag) {
       // The DENOMINATOR comes from the FR-40 item graph, which is a second,

@@ -73,6 +73,34 @@ struct RustEmitOptions {
   /// than one of its own, which would export a variable that was never even
   /// file-scope in C.
   bool exportItems = false;
+
+  /// FR-139: additionally give every ALL-SCALAR exported function the C ABI:
+  /// `#[no_mangle] pub extern "C" fn` instead of `pub fn`.
+  ///
+  /// Meaningful only together with `exportItems` (the emitter never gives a
+  /// C-ABI symbol to an item it is not exporting in the first place), and
+  /// opt-in: default-constructed, this reproduces the pre-FR-139 output byte
+  /// for byte, which is what keeps every `--emit=crate` golden pinned.
+  ///
+  /// The reason it exists: a dlopen/dlsym host — the shape the TRACTOR
+  /// corpus's `cando` harness takes, and the shape any C consumer of a
+  /// transpiled library takes — can only call a BARE C symbol through a C
+  /// signature. An rlib of Rust-ABI, Rust-mangled `pub fn` is unreachable
+  /// from one, whatever the quality of the translation.
+  ///
+  /// ALL-SCALAR is the whole safety argument and MUST NOT be loosened. Every
+  /// input and every result of the function type has to be a BUILTIN
+  /// `IntegerType` or `FloatType`; every EmitRust dialect type disqualifies.
+  /// An all-scalar `extern "C"` entry point needs no `unsafe` and no shim, so
+  /// the C declaration and the Rust definition agree by construction. A
+  /// `&[T]` parameter, by contrast, is a two-register fat pointer that rustc
+  /// accepts under `extern "C"` with only a non-FFI-safe WARNING and that
+  /// then shifts every later argument — measured across the boundary on the
+  /// real crc16 case (clang native 27235, cdylib 0). That is the
+  /// silently-wrong-code class this project forbids, so a non-scalar
+  /// signature keeps its plain `pub fn` and is REPORTED with a located
+  /// warning rather than exported wrongly or dropped in silence.
+  bool cAbiExports = false;
 };
 
 /// Translates `op` to Rust source code written to `os` under `options`.
