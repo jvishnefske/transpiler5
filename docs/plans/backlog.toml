@@ -170,10 +170,21 @@ blocked_by = []
 anchor = "FR-139 FEATURE (the TRACTOR `_lib` submission packaging layer"
 
 [[items]]
+id = "FR-140"
+rank = 15
+kind = "defect"
+status = "open"
+size = "S"
+title = "A double-underscore C identifier emits a crate that fails its own lint table"
+summary = "Found by FR-138's corpus sweep 2026-08-28. `static int m__base;` emits `tu0_m__base` and the manifest's [lints.rust] non_snake_case = \"deny\" rejects it -- exit 0, unbuildable, no diagnostic. Reproduced directly and it is TWO errors, not one (synthesized FIELD and local VARIABLE both trip it), on a BINARY crate, so this is not specific to FR-139's cdylib path. rustc's is_snake_case forbids a doubled underscore anywhere in the name core; m__base is legal C and the corpus's float2half_lib/half2float_lib both carry it (2 of FR-138's BUILD_FAIL cases). FR-139's known residual covers the CRATE NAME only; this is wider. Directions: (a) collapse underscore runs in the idiomatic-rename path -- byte-shifting, every golden pins spellings; (b) omit the deny when the emitter knows it produced a tripping name -- narrow and byte-neutral, but disarms the tripwire crate-wide; (c) reject with a located diagnostic -- honest and cheapest, converts 2 BUILD_FAIL into EMIT_FAIL without gaining a point. NOT SPIKED."
+blocked_by = []
+anchor = "FR-140 DEFECT (found by FR-138's corpus sweep"
+
+[[items]]
 id = "FR-138"
 rank = 14
 kind = "tooling"
-status = "open"
+status = "landed"
 size = "L"
 title = "TRACTOR evaluation readiness: wire the corpus runner for a real equivalence number"
 summary = "Baseline measured 2026-08-27; the _lib C-ABI half SPIKED 2026-08-28. Rubric is behavioural equivalence + zero unsafe + builds; PARTIAL CREDIT IS NOT SCORED. 252 public cases, 127 ship empty from a public clone, so 125 evaluable -- and 80 of those (64%) are _lib. THE _lib ANSWER IS BAD: today ZERO of the 80 can score whatever the translation quality, because no crate emits crate-type=[\"cdylib\"] (cargo builds an rlib, nothing to dlopen) and functions are emitted `pub fn` (Rust ABI, mangled, nothing to dlsym). Contract read from the corpus's own runner: exec cases need a binary named `driver`; _lib cases dlopen lib<LIBRARY>.so and dlsym a bare symbol called through an `unsafe extern \"C\" fn`. Symbol/library names are NOT uniformly derivable -- 42 of 80 runners (all B01_synthetic) pin them explicitly. Of the 37 that emit a crate: 21 all-scalar (ABI-ready), 12 pointer-mismatch, 4 other; 43 of 80 are rejections. 19 unlocked by packaging alone, BUILT and byte-diffed identical -- see FR-139. Bucket B is architecturally blocked: a slice param compiles with only a warning then miscompiles across the FFI boundary. Still open: wiring translated_rust/ to run-rust.sh for a real criterion-(a) number."

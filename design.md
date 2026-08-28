@@ -8996,137 +8996,132 @@ piece and becomes FR-45.
   induction-type and 29 blocks-lift sites are both larger than anything
   points-to touches.
 
-- [ ] FR-138 TRACTOR EVALUATION READINESS. Measured baseline against the
-  real corpus (github.com/DARPA-TRACTOR-Program/PUBLIC-Test-Corpus,
-  2026-08-27), recorded here because this is the evidence ledger and the
-  numbers must not live only in a session.
+- [x] FR-138 TRACTOR EVALUATION READINESS (baseline 2026-08-27; `_lib` C-ABI
+  contract spiked 2026-08-28; CORPUS RUNNER WIRED and criterion (a) MEASURED
+  2026-08-28). Harness: `scripts/tractor-eval.py`, which takes the corpus root
+  as an argument (the corpus is NOT vendored) and drives the corpus's OWN
+  oracle rather than reimplementing vector comparison.
   THE RUBRIC IS NOT COVERAGE. Scored: (a) behavioural equivalence of whole
   programs against test vectors, (b) memory safety / zero `unsafe`, (c) the
-  crate builds. PARTIAL CREDIT IS NOT SCORED, which inverts this project's
-  usual measurement instinct: `--incremental` implies `--recover`, so a crate
-  that is mostly `unimplemented!()` stubs still "imports" and scores ZERO.
-  Every number below is therefore STRICT (no `--recover`).
-  CORPUS SHAPE: 252 public test cases in four bundles (B01_organic 38,
-  B01_synthetic 85, P00_perlin_noise 1, P01_sphincs_plus 128) with 2612 test
-  vectors. 127 of the 252 ship as EMPTY `test_case` directories from a public
-  clone (all but one of the sphincs variants), so only 125 are evaluable
-  without intranet access -- a fact worth knowing before quoting any
-  denominator. Submission shape per case is a `translated_rust/` cargo
-  project the corpus's own `run-rust.sh` builds and drives with the SAME
-  vectors: an executable for exec cases, and for a `_lib` case a SHARED
-  LIBRARY the Rust runner links against, which means the emitted crate must
-  export the C ABI symbols the runner expects. That last obligation is
-  UNVERIFIED here and is the next thing to check.
-  MEASURED, and each figure is the corrected one:
-    - CRASHES: ZERO across all 252 cases. This was the priority and it is
-      the good news. Contrast the same sweep over four small UNSEEN GitHub
-      C projects (inih, parson, log.c, sds): 1 crash in 13 units, which is
-      FR-137. TRACTOR's corpus is closer to the supported subset than
-      arbitrary real-world C, so crash-freedom here is weaker evidence than
-      it looks; keep sweeping unseen code.
-    - STRICT WHOLE-CASE TRANSLATION: 41 of the 125 evaluable cases (33%).
-    - BUILD: 39 of those 41 crates build; 2 fail
-      (B01_organic/float2half_lib, half2float_lib).
-    - `unsafe`: ZERO occurrences in any emitted crate, as the design posture
-      predicts -- the project rejects rather than emitting unsafe, so
-      criterion (b) is satisfied by construction and the cost is paid in (a).
-    - BEHAVIOURAL EQUIVALENCE: NOT YET MEASURED. It is the primary criterion
-      and needs the corpus runner wired to `translated_rust/`. Until that
-      exists, 39 "builds" is a well-formedness claim, not a correctness one
-      -- exactly the LIB_BUILT-vs-TRANSPILED distinction
-      test/RealWorld/run_realworld.py already draws.
-  RANKED REJECTION BLOCKERS over the 84 real rejections: variadic call 9,
-  pointer assigned a non-address value 8, address-of-scalar-not-a-string-
-  region 6, use of main's `argv` 5, address of a global 4, pointer with no
-  known target object 4, FILE* not a function-local variable 4,
-  CStyleCastExpr in a pointer expression 4, aliasing mutable pointer
-  arguments 3, CallExpr in a pointer expression 3.
-  A MEASUREMENT ERROR CAUGHT IN FLIGHT, recorded because this ledger keeps
-  finding the same class: the first sweep reported 168/252 translating. It
-  was wrong -- a case with ZERO source files ran the per-source loop zero
-  times and fell through to "all sources passed". 127 empty cases were
-  counted as successes. The build sweep exposed it (39+2=41, not 168), which
-  is the second time an independent cross-check has caught an inflated
-  numerator in this ledger.
-  **SPIKED 2026-08-28 for the `_lib` C-ABI half, and the answer is worse than
-  this entry assumed.** The submission contract was read out of the corpus's
-  OWN runner code, not inferred:
-    - `discovery/rust.py:17-20`: build dir is `<case>/translated_rust`,
-      artifacts at `translated_rust/target/release`.
-    - `runners/exec_runner.py:59`: an exec case runs `<release>/driver`.
-      THE BINARY MUST BE NAMED `driver`; we name it after the source stem.
-      Packaging-only gap.
-    - `runners/lib_runner.py` + `tools/cando2/src/lib.rs:391-418,160-163`: a
-      `_lib` case DLOPENs `lib<LIBRARY>.so` and DLSYMs a BARE symbol, then
-      calls it through an `unsafe extern "C" fn(...)` signature written in
-      that case's own `runner/src/main.rs`.
-    - `build.py:132` docstring, verbatim: "The corresponding Cargo.toml
-      should build a cdylib". The README repeats it for C2Rust users.
-  THE SYMBOL AND LIBRARY NAMES ARE NOT UNIFORMLY DERIVABLE, and assuming they
-  were would have produced non-identifiers for half the corpus. Measured over
-  the 80 evaluable `_lib` cases: 42 (ALL of B01_synthetic) use the long
-  `harness!` form with EXPLICIT `library:`/`symbol:` -- e.g.
-  `001_helloworld_lib` wants library `hello`, symbol `helloworld`, and
-  `004_nineality_sieve_lib` wants library `Sieve`, symbol `sieve`. Only the
-  38 B01_organic cases derive the symbol as the case dir minus `_lib`. The
-  split is exactly on the bundle boundary.
-  SCALE: of the 125 evaluable cases, 80 (64%) are `_lib`. TODAY ZERO OF THEM
-  CAN SCORE, whatever the translation quality: no crate emits
-  `crate-type = ["cdylib"]`, so cargo builds an rlib and there is no `.so` to
-  dlopen; and functions are emitted `pub fn` (Rust ABI, Rust-mangled) so
-  there is no bare C symbol to dlsym. The "39 crates build" figure above is a
-  well-formedness claim that, for the `_lib` majority, does not bear on
-  scoring at all.
-  MEASURED DISTANCE over the 80 (per-case data in the spike run): 37 emit a
-  crate, 43 are LOCATED rejections (ranked: 12 libc/libm subset gaps, 2
-  printf, 29 the pointer/provenance model). Of the 37 emitted, bucketed by
-  how far the emitted signature is from the runner's declared one:
-    - A, ABI-COMPATIBLE-ALREADY (all-scalar params and return): 21.
-    - B, POINTER MISMATCH: 12 -- 9 with a real `&[T]`/`&mut [T]` slice, and 3
-      where the only pointer is a thin `&T`/`&mut T`.
-    - C, OTHER: 4 (3 are the FR-62 actor lift emitting the target as a
-      `&mut self` METHOD; `--actor-lift=false` restores the free-fn shape for
-      all three. The 4th is struct-by-value.)
-  THE FREE WIN IS REAL AND WAS BUILT, NOT ARGUED: hand-patching the 21
-  bucket-A crates with `#[no_mangle] pub extern "C"` + `crate-type=["cdylib"]`
-  + a corrected `[lib] name` produced 19 working cdylibs exporting the right
-  bare symbol, and their output BYTE-DIFFED IDENTICAL to the clang-built
-  native. So 19 of 80 are unlocked by packaging alone, with ZERO `unsafe`
-  (an all-scalar `extern "C"` entry point needs none). Two of the 21 fail on
-  a self-inflicted gate: the emitted manifest's own
-  `[lints.rust] non_snake_case = "deny"` REJECTS a CamelCase crate name
-  (`error: crate 'Sieve' should have a snake case name`), which is exactly
-  the name `004_nineality_sieve_lib` requires. Reproduced directly.
-  `--crate-name=` already sets both `[package]` and `[lib]` name, so the
-  naming half needs no new machinery.
-  THE BLOCKER FOR BUCKET B IS ARCHITECTURAL, NOT PACKAGING. `&[u8]` is 16
-  bytes (ptr+len), `*const u8` is 8 -- measured, not assumed. Putting
-  `#[no_mangle] extern "C"` on a slice-taking fn is NOT a fix: rustc COMPILES
-  it, emitting only `warning: extern fn uses type [u8], which is not
-  FFI-safe`, and the slice then consumes TWO argument registers so every
-  later parameter is shifted. The observed outcome is signature-dependent and
-  NOT RELIABLY LOUD: `crc16_lib` silently returned a wrong value (native
-  27235, cdylib 0), while a minimal `sum_bytes(&[u8], u32)` probe aborted
-  with an out-of-bounds panic. A silent wrong answer across an FFI boundary
-  is precisely the class this repo forbids, so bucket B must NOT be
-  "fixed" by adding `no_mangle`.
-  Any C-ABI entry point that RECEIVES A POINTER must rebuild the slice from
-  `(ptr,len)` inside `unsafe`. So criteria (a) and (b) are IN TENSION here,
-  which this entry's earlier "criterion (b) is satisfied by construction and
-  the cost is paid in (a)" line did not anticipate: buying (a) on the
-  pointer-taking cases spends (b).
-  A SEPARATE, INDEPENDENT BLOCKER found while probing bucket B-thin: emitted
-  structs carry no `#[repr(C)]` while the runner's `state_member!` macro
-  stamps `#[repr(C)]` on its side. On `flac_validate_lib` rustc reordered
-  fields (same size 28, different offsets: `channel_mode` at 16 vs 20) and
-  270 of 3000 probe lines came back wrong, COMPILING CLEANLY. So the three
-  B-thin cases are blocked by struct repr, not by the fat-pointer question,
-  and `to_barycentric_lib`'s struct-by-value layouts coincide today only by
-  luck.
-  Next: FR-139 for the packaging layer (the measured 19-21), then the
-  pointer-export question on its own evidence. The corpus runner wiring for
-  a real criterion-(a) number is still NOT done and remains this entry's
-  open half.
+  crate builds. PARTIAL CREDIT IS NOT SCORED, so every figure below is STRICT
+  (no `--recover`, no `--incremental`).
+  ** THE DENOMINATOR IN THE 2026-08-27 BASELINE WAS WRONG, AND SO WAS THE
+  2026-08-28 RECOUNT THAT "CONFIRMED" IT. ALL 252 CASES ARE EVALUABLE, NOT
+  125.** The 127 cases recorded as "shipping EMPTY from a public clone" have
+  a `test_case` that is a SYMLINK into a sibling's tree -- the whole SPHINCS+
+  bundle is ONE source tree compiled 128 ways, the variants selected by
+  `CMakePresets.json` cache vars that become `-D` macros. `find <case>/test_case
+  -name '*.c'` does not follow symlinks, so it reports zero; `find -L` reports
+  28. Measured: 127 symlinked `test_case` dirs, 0 vs 28 `.c` files on the same
+  case with and without `-L`.
+  THE SECOND COUNT IS THE LESSON, not the first: the 2026-08-28 recount used
+  the SAME symlink-blind `find` and got 127/125, and its agreement with the
+  baseline was read as corroboration. Two instances of one bug agreeing is not
+  independent confirmation -- an independent check must differ in METHOD, not
+  merely in who runs it. This is the THIRD inflated/deflated figure this ledger
+  has had to correct, after the 168/252 empty-case fallthrough.
+  CORRECTED CORPUS SHAPE: 252 cases, ALL evaluable -- 160 `_lib` (63%) and 92
+  exec. (Superseding "125 evaluable, 80 `_lib`, 45 exec" wherever this file
+  says it.)
+  CRITERION (a), MEASURED FOR THE FIRST TIME -- 25 of 252 cases (9.9%) pass
+  EVERY one of their test vectors, which is the figure that counts because the
+  rubric has no partial credit. Split: exec 4/92, `_lib` 21/160. Per-vector:
+  345 passed, 184 failed, 36 skipped by the corpus itself (`has_ub`).
+    - PASS 25 / VACUOUS_PASS 1 / VECTOR_FAIL 0 / SYMBOL_MISSING 13 /
+      BUILD_FAIL 2 / EMIT_FAIL 211.
+  **ZERO MISCOMPILES, AND THAT IS THE MORE IMPORTANT FINDING THAN THE SCORE.**
+  Every case that emitted, built, exported its symbol and ran matched the
+  corpus's expected bytes on every vector. All 184 failing vectors belong to
+  the 13 SYMBOL_MISSING cases -- they never ran emitted code at all.
+  TWO HONESTY GUARDS THAT MOVED THE NUMBER, both recorded because this ledger
+  keeps finding this class:
+    - `update_md5_lib` is a VACUOUS PASS: its only vector is `has_ub`, so
+      nothing executed, and its symbol is not even exported. Counting it gives
+      26; the honest figure is 25.
+    - The corpus's `LibRunner` reports a dlsym PANIC as an ordinary vector
+      failure, with the same "cando state mismatch" text a WRONG ANSWER
+      produces. The first pass classified 13 cases as wrong-output. `nm -D` on
+      each artifact shows the symbol absent in all 13, so they are
+      SYMBOL_MISSING -- "never ran", not "ran wrong". Without that check this
+      entry would have claimed 13 miscompiles that do not exist.
+  FR-139's ESTIMATE HELD EXACTLY, which is worth recording because it was
+  mine: it predicted 19 of those 80 B01 `_lib` cases, 21 once the manifest gate
+  cleared. Measured over the same 80: 21 PASS. The estimate was not optimistic;
+  its DENOMINATOR was understated (21/160 over the true `_lib` count, because
+  all 80 SPHINCS+ `_lib` cases reject at emit).
+  CEILING CHECK: 13 further B01 `_lib` cases build and run but export nothing
+  dlsym-able -- exactly FR-139's all-scalar restriction. Lifting it safely
+  would take 21/80 -> 34/80, which is the size of the prize behind the
+  pointer-export question FR-139 deliberately left open.
+  RANKED BLOCKERS over the 211 emit failures: aliasing mutable pointer
+  arguments 80 (the ENTIRE SPHINCS+ `_lib` bundle, all from ONE shared
+  `app/src/utils.c:79` -- a single fix moves 80 cases), unsupported pointer
+  cast (ArrayToPointerDecay) 36, pointer into a global passed to a function
+  12, variadic call 9, pointer assigned a non-address value 8, address of a
+  scalar not a string region 6, `main`'s `argv` 5, then 4 each for `FILE*`
+  shape / no known target object / address of a global / CStyleCastExpr.
+  THREE DEFECTS SURFACED BY THE SWEEP, graded by what was actually reproduced:
+    1. CONFIRMED, and filed as FR-140: a legal C identifier containing a
+       DOUBLE UNDERSCORE makes the emitted crate unbuildable against its own
+       lint table.
+    2. NOT CONFIRMED, recorded so nobody re-derives it: the sweep reported
+       that handing `emitrust-cc` the same TU twice yields a bare
+       `error: failed to parse one or more C inputs` with NO located
+       diagnostic. It does not reproduce -- the duplicate-TU case gives a
+       properly located `conflicting definition of 'f'`, and both a syntax
+       error and a missing header give located clang diagnostics. Whatever was
+       seen needed a corpus-specific condition that was not isolated.
+    3. MEASURED BY THE HARNESS, and a real hazard for any submission pipeline:
+       `wcscat_lib` did not panic like its 12 SYMBOL_MISSING siblings -- it
+       SEGFAULTED (rc -11). `libloading`'s dlsym searches the cdylib's
+       DEPENDENCY CHAIN, so the absent `wcscat` resolved to LIBC's `wcscat`
+       and was called through a 3-argument signature. A dlsym that "succeeds"
+       is NOT evidence the emitted function was called; a post-build `nm -D`
+       check is mandatory.
+  ENVIRONMENT: 48 SPHINCS+ exec cases need `<openssl/*.h>`, absent on this
+  host; supplied from the nix store via the harness's `--extra-cflags`, so
+  their failures are genuine transpiler rejections rather than
+  missing-dependency noise. All 252 cases went through the compile-database
+  path (`emitrust-cc --compdb=`); the glob fallback never fired.
+  Reports: `results.{json,tsv}` + the corpus's own `junit.xml`. Verified
+  idempotent (two consecutive runs byte-identical) and stable across three
+  full sweeps.
+
+- [ ] FR-140 DEFECT (found by FR-138's corpus sweep 2026-08-28): a legal C
+  identifier containing a DOUBLE UNDERSCORE produces a crate that fails its
+  OWN lint table -- exit 0, unbuildable. Two-line repro, and note it is a
+  BINARY crate, so this is not specific to FR-139's cdylib path:
+      static int m__base = 3;
+      int get(void){ return m__base; }
+  emits `tu0_m__base` and the manifest's `[lints.rust] non_snake_case = "deny"`
+  rejects it. Reproduced directly, and it is TWO errors, not the one the sweep
+  reported -- the synthesized FIELD and the local VARIABLE both trip it:
+      error: structure field `tu0_m__base` should have a snake case name
+      error: variable `tu0_m__base_actor` should have a snake case name
+  rustc's `is_snake_case` forbids a doubled underscore anywhere in the core of
+  the name, and `m__base` is perfectly legal C (the corpus's `float2half_lib`
+  and `half2float_lib` both carry it; they are 2 of FR-138's BUILD_FAIL cases).
+  Exit-0 unbuildable is the SAFE direction -- a hard rustc error, never a
+  miscompile -- but it is the rejection-is-a-feature policy violated: the
+  emitter produced code it knows its own manifest forbids, with no diagnostic.
+  FR-139's recorded "known residual" covers the CRATE NAME only; this is
+  different and wider (synthesized fields, locals, and the FR-62 actor
+  prefixing that manufactures `tu0_` names on top of the C spelling).
+  DIRECTIONS, none chosen:
+    (a) collapse runs of underscores in the idiomatic-rename path, which is
+        where the emitted spelling is already being chosen -- but renaming is
+        observable in emitted bytes and every golden pins them, so this is a
+        byte-shift needing the full suite, not a local fix.
+    (b) omit `non_snake_case = "deny"` when the emitter KNOWS it produced a
+        name that trips it -- narrow and byte-neutral for every crate that
+        does not, and the same shape as the FR-139 crate-name fix, but it
+        disarms the tripwire for that whole crate.
+    (c) reject with a located diagnostic instead of emitting unbuildable code.
+        Honest, and cheapest, but converts two currently-BUILD_FAIL corpus
+        cases into EMIT_FAIL without gaining a point.
+  Gates: the two heatshrink-adjacent corpus crates build + no emitted byte
+  shifts for any name that does NOT trip the lint + full lit 100%.
+  **NOT SPIKED.**
 
 - [x] FR-139 FEATURE (the TRACTOR `_lib` submission packaging layer, split
   out of FR-138's 2026-08-28 spike; LANDED 2026-08-28): emit a crate the
@@ -9191,9 +9186,14 @@ piece and becomes FR-45.
   c-abi-exports-invalid.c (the three refusals),
   crate-name-non-snake-case.c (both directions, so the tripwire relaxes
   exactly where it must), and the EndToEnd dlopen oracle above.
-  MEASURED PAYOFF stands as FR-138 recorded it: 19 of the 80 evaluable `_lib`
-  cases go from unscoreable to byte-identical, 21 once the manifest gate is
-  clear. Converting that into a real criterion-(a) number needs FR-138's
+  MEASURED PAYOFF, and FR-138's 2026-08-28 corpus run CONFIRMED the estimate
+  exactly: predicted 19 of those 80 B01 `_lib` cases, 21 once the manifest
+  gate cleared; measured 21 PASS over the same 80. The DENOMINATOR here was
+  understated though -- see FR-138: all 252 corpus cases are evaluable and 160
+  are `_lib`, so this is 21/160, the other 80 being the SPHINCS+ bundle which
+  rejects at emit. A further 13 B01 `_lib` cases build and run but export
+  nothing dlsym-able, exactly this FR's all-scalar restriction: lifting it
+  safely is worth 21/80 -> 34/80. Converting that into a real criterion-(a) number needs FR-138's
   remaining half -- the corpus runner wired to `translated_rust/` -- which is
   still open.
 
@@ -9302,7 +9302,10 @@ piece and becomes FR-45.
   UNDERCOUNT. linenoise read as a clean "ok" until it was given
   `_GNU_SOURCE`. `emitrust-cc` accepts no `-D` flag, and an unknown argument
   makes it exit 1 having done NOTHING -- which reads exactly like a pass. Use
-  a `#define X` + `#include "unit.c"` shim, and count parse failures
+  a `#define X` + `#include "unit.c"` shim -- or, better for a real
+  project, `--compdb=<compile_commands.json>`, which is the SUPPORTED
+  vehicle for macros and include paths and is what FR-138's corpus
+  harness uses for all 252 cases. Count parse failures
   separately from passes.
   sds.c now stops with a LOCATED diagnostic on an unrelated unsupported
   construct (`sds.c:886:10: pointer-to-pointer parameter escapes the
