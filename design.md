@@ -9049,40 +9049,123 @@ piece and becomes FR-45.
   is the second time an independent cross-check has caught an inflated
   numerator in this ledger.
   **NOT SPIKED.** Next: wire `translated_rust/` + the corpus runner to get a
-  real (a) number, verify the `_lib` C-ABI export obligation, and fix FR-137.
+  real (a) number and verify the `_lib` C-ABI export obligation. FR-137 is
+  FIXED (2026-08-28); note that its "1 crash in 13 unseen units" figure
+  above UNDERSTATES the defect -- see FR-137 for the corrected measurement
+  and for why a crash sweep over unconfigured repos systematically
+  undercounts.
 
-- [ ] FR-137 DEFECT (CRASH on unseen external C, found by the TRACTOR
-  readiness sweep 2026-08-27): importing antirez/sds `sds.c` SEGFAULTS
-  inside clang's constant evaluator. This is the highest-severity defect
-  class this project has -- not a rejection, which is a feature here, but an
-  abort with NO diagnostic, no partial credit and no recovery.
-  LOCALIZED: the offending declaration is `SDS_NOINIT` (`const char
-  *SDS_NOINIT = "SDS_NOINIT";`, sds.c:42) and the call site is
-  `recordPointerGlobalFileScopeDetail`'s `var->evaluateValue()` at
-  lib/ImportC/ImportC.cpp:2460 (W3.2 COMMIT B's cross-TU pointer-global
-  reconstruction). The stack is
-  `VarDecl::evaluateValue -> evaluateValueImpl ->
-  Expr::EvaluateAsInitializer`, i.e. the fault is INSIDE clang, reached from
-  our call.
-  MEASURED PROPERTIES, all of which narrow the fix:
-    - NOT a stack overflow: it still segfaults with `ulimit -s unlimited`.
-    - NOT a parse error: `clang -fsyntax-only` accepts sds.c with ZERO
-      errors, so the decl is well-formed.
-    - The call site's own guard is correct (`if (!value || !value->isLValue()
-      || value->isNullPointer()) return;`) -- the fault is before it returns.
-    - Every IMPORT path crashes (`--emit=import`, `--emit=mlir`,
-      `--emit=rust`, `--emit=crate` with `--recover` or `--incremental`),
-      while both PRE-IMPORT analyses (`--emit=item-graph`, `--emit=coloring`)
-      are clean. So the FR-40/41 project analyses survive an input the
-      importer cannot, which is worth knowing for triage.
-    - NOT reproducible in isolation: `const char *g = "s"; int use(void) {
-      return g[0]; }` imports fine at every stage. The crash needs sds.c's
-      surrounding context, so a reduced repro is still OWED. Reproduce with a
-      shallow clone of github.com/antirez/sds and
-      `emitrust-cc --emit=import sds.c -o /dev/null -I<dir>`.
-  **NOT SPIKED.** Fix before any external evaluation: a crash on an
-  evaluation input is unrecoverable, and the readiness sweep hit one in 13
-  unseen units.
+- [x] FR-137 DEFECT (CRASH on unseen external C, found by the TRACTOR
+  readiness sweep 2026-08-27; ROOT-CAUSED AND FIXED 2026-08-28): importing
+  antirez/sds `sds.c` SEGFAULTED inside clang's constant evaluator. The
+  highest-severity defect class this project has -- not a rejection, which is
+  a feature here, but an abort with NO diagnostic, no partial credit and no
+  recovery.
+  ROOT CAUSE, and it is OURS, not clang's. The whole-program pre-scan
+  `collectWholeProgramInfo` walks EVERY decl of the TU, so a redeclaration
+  chain is visited once per declaration. Its pointer-global filter decided
+  "this global has an initializer" with the REDECL-CHAIN-WIDE
+  `VarDecl::getAnyInitializer()`, then handed the VISITED declaration to
+  `recordPointerGlobalFileScopeDetail`, whose `VarDecl::evaluateValue()` is
+  DECL-LOCAL (clang's `evaluateValueImpl` reads `getInit()`). On a bare
+  `extern T *g;` declaration that is null, so clang dereferenced a null
+  initializer inside `Expr::EvaluateAsInitializer`. The fault was inside
+  clang; the null was ours.
+  THE REDUCED REPRO THIS ENTRY PREVIOUSLY OWED -- two lines. The earlier
+  "NOT reproducible in isolation" note was simply WRONG; what the isolated
+  probe was missing was not sds.c's surrounding context but the second
+  DECLARATION:
+      extern const char *g;
+      const char *g = "s";
+  Order-independent: definition-then-`extern` crashes identically, so decl
+  order was never what saved anyone.
+  DIFFERENTIAL CONTROL that isolated it: the same program with the `extern`
+  declaration in a `-isystem` header does NOT crash (`isSystemHeaderDecl`
+  skips that decl, so the walk never reaches it); via `-I` it segfaults
+  (rc=139). `-isystem` IS accepted by the driver -- verified against the
+  unknown-flag signature, which it does not produce.
+  TRIGGER BOUNDARY, measured, and it tracks the pre-scan's guard chain
+  exactly:
+    - CRASHES: pointer global `extern`+def; struct-pointer global
+      `extern`+def; two `extern` decls + def.
+    - CLEAN: definition alone (no `extern`); `static` (the
+      `isExternallyVisible()` gate); FUNCTION-pointer global (explicitly
+      excluded); non-pointer and array globals; `extern int *g; int *g;`
+      (a tentative definition, no initializer anywhere in the chain).
+  THE FIX IS TWO PARTS, and the second was a defect the crash had been
+  MASKING:
+    (1) The pre-scan takes the initializer-OWNING decl out of the two-argument
+        `getAnyInitializer(initDecl)` -- the idiom already used in
+        `importGlobalVar` -- and passes THAT to the decl-local consumer, plus
+        a `!var->getInit()` guard inside
+        `recordPointerGlobalFileScopeDetail` as defence in depth. The symbol
+        key stays the visited decl's: same entity, same symbol.
+    (2) Removing the abort exposed `importGlobalVar` guarding redeclaration
+        idempotency with `globals.contains(canonical)` ONLY, while a pointer
+        global registers in `pointerGlobals` (the CTS-P4 cursor/backing
+        decomposition) and never in `globals`. The header/.c idiom therefore
+        imported the same entity once per declaration and died on
+        `checkFreshSymbol`'s "collides with an existing symbol". Fixed with
+        the matching `pointerGlobals.contains(canonical)` guard; every
+        `pointerGlobals` read AND write is canonical-decl keyed, so the key
+        is sound.
+  FACT PRESERVATION IS THE REAL ORACLE HERE, not crash-freedom: the fix had
+  to keep RECORDING the CTS-P4 binding, not merely skip the extern decl. The
+  emitted module for `extern int arr[4]; extern int *g; int arr[4];
+  int *g = &arr[1];` is BYTE-IDENTICAL (652 bytes, `diff` clean) to the same
+  program with the two `extern` lines deleted, cursor start 1 intact.
+  Pinned by test/Import/C/globals-pointer-extern-redecl{,-reversed,-literal}.c
+  and -- because those are FileCheck-on-`--emit=import` tests that pin
+  importer TEXT, not runtime behaviour -- by the byte-diff oracle in
+  test/EndToEnd/globals-pointer-extern-redecl.c, which carries both decl
+  orders on two globals at NONZERO cursor starts (`@CURSOR <3 : i64>`,
+  `@TAIL <5 : i64>`) plus the literal-backed sds shape, all argc-seeded so
+  folding cannot hide a clobbered start. Sensitivity was demonstrated by
+  mutation: rewriting `&table[3]`/`&other[5]` to index 0 -- exactly what a
+  dropped recorded cursor would mean -- changes the printed bytes.
+  The Import tests use `emitrust-cc --emit=import`, not `emitrust-import-c`:
+  the pre-scan runs only on the project import path, which
+  `emitrust-import-c` reaches only with >=2 inputs, so the obvious spelling
+  does not reproduce the crash at all.
+  SIBLING AUDIT, so this class is closed and not just this instance: there
+  are exactly FIVE `evaluateValue()` call sites and FOUR `getAnyInitializer()`
+  call sites repo-wide. The other four evaluateValue sites are all
+  NOT-REACHABLE -- `importPointerGlobal` via the two-arg
+  `getAnyInitializer(initDecl)`, `createGlobal` and `convertGlobalInit`
+  behind `significantInit` (decl-local, and it only NARROWS), and
+  `createByteRegionGlobal` behind a plain decl-local `getInit()` test.
+  LATENT LANDMINE recorded and deliberately NOT patched: `convertGlobalInit`
+  contemplates a null init (`initLoc = init ? ... : loc`) and guards its
+  string-literal path with `if (init)`, but that block CLOSES before the
+  function-pointer path, which does `stripTrivia(init)` and dereferences the
+  result, and before its own bare `decl->evaluateValue()`. It is unreachable
+  only because its single caller gates on `significantInit`. A future second
+  caller gating on a chain-wide predicate resurrects this bug verbatim there.
+  Not patched because unreachable code cannot be tested and this ledger does
+  not record unverifiable changes -- but a guard is the right move the moment
+  a second caller appears.
+  MEASURED, 20 unseen GitHub C repos: pre-fix 1 crash / 115 units, post-fix
+  0 / 115. THAT DENOMINATOR IS MISLEADING AND THE HONEST FIGURE IS SMALLER:
+  only THREE units in the whole corpus contain the trigger shape at all, and
+  of the two that can be brought to a parseable state BOTH crashed --
+  sds/sds.c and linenoise/linenoise.c (a SECOND wild instance this entry did
+  not know about, `linenoise.h:48` + `linenoise.c:1855`).
+  json-c/json_object.c has the shape but will not parse without its
+  autoconf-generated config headers, so it stays unevaluated. This is a
+  deterministic crash on the ordinary header/.c idiom, not a rare edge case,
+  and FR-138's "1 crash in 13 unseen units" framing understates it.
+  METHODOLOGY NOTE, recorded because it will bite the next sweep: a unit that
+  fails to PARSE never reaches the pre-scan and so can never crash, which
+  makes a crash sweep over unconfigured real-world repos systematically
+  UNDERCOUNT. linenoise read as a clean "ok" until it was given
+  `_GNU_SOURCE`. `emitrust-cc` accepts no `-D` flag, and an unknown argument
+  makes it exit 1 having done NOTHING -- which reads exactly like a pass. Use
+  a `#define X` + `#include "unit.c"` shim, and count parse failures
+  separately from passes.
+  sds.c now stops with a LOCATED diagnostic on an unrelated unsupported
+  construct (`sds.c:886:10: pointer-to-pointer parameter escapes the
+  cursor-parameter shape`) -- crash converted to rejection, as the repo
+  contract requires.
 
 - [ ] FR-135 DEFECT (UPSTREAM, found by FR-134's spike): MLIR's `cf.switch`
   CUSTOM assembly cannot round-trip a negative case value, so
