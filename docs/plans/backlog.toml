@@ -159,13 +159,24 @@ blocked_by = []
 anchor = "FR-136 NO-GO (2026-08-26)"
 
 [[items]]
+id = "FR-139"
+rank = 13
+kind = "feature"
+status = "spiked"
+size = "M"
+title = "TRACTOR _lib submission packaging: cdylib + no_mangle C-ABI exports"
+summary = "Split out of FR-138's 2026-08-28 spike, which supplies all the evidence. Emit crate-type=[\"cdylib\"] and #[no_mangle] pub extern \"C\" on exported functions, RESTRICTED to all-scalar signatures (those need no unsafe). Both behind an opt-in: --emit=crate output is golden-pinned and no existing crate may shift a byte. --crate-name= already sets [package] and [lib] name, so naming needs no new machinery. MEASURED payoff, built and byte-diffed against the clang native, not projected: 19 of the 80 evaluable _lib cases go from unscoreable to byte-identical; 21 are eligible but 2 are blocked by the emitted manifest's own [lints.rust] non_snake_case = \"deny\" rejecting the CamelCase [lib] name a case requires (error: crate 'Sieve' should have a snake case name), so relaxing that for an explicit --crate-name lifts 19 to 21. OUT OF SCOPE and a measured NO-GO: pointer-taking exports -- a slice param compiles with only an FFI-safety warning and then miscompiles across the boundary (crc16: native 27235, cdylib 0), and a (ptr,len) shim needs unsafe, spending rubric criterion (b) to buy (a). Gate needs a test that actually builds the cdylib, dlopens it from a C driver, and byte-diffs -- compile-clean is not evidence across an FFI boundary."
+blocked_by = []
+anchor = "FR-139 FEATURE (the TRACTOR `_lib` submission packaging layer"
+
+[[items]]
 id = "FR-138"
 rank = 14
 kind = "tooling"
 status = "open"
 size = "L"
-title = "TRACTOR evaluation readiness: wire the corpus runner, verify the lib C-ABI"
-summary = "Baseline measured 2026-08-27 against github.com/DARPA-TRACTOR-Program/PUBLIC-Test-Corpus. Rubric is behavioural equivalence + zero unsafe + builds; PARTIAL CREDIT IS NOT SCORED, so every number must be STRICT (no --recover). 252 public cases, 127 ship empty from a public clone, so 125 evaluable. ZERO crashes across all 252 (the priority). 41/125 translate strictly, 39 of those build, ZERO unsafe anywhere. Behavioural equivalence NOT yet measured and it is the primary criterion -- needs translated_rust/ wired to the corpus run-rust.sh. Also unverified: a _lib case is linked as a SHARED LIBRARY by the Rust runner, so the emitted crate must export the C ABI symbols. Top blockers over the 84 real rejections: variadic call 9, pointer-assigned-non-address 8, address-of-scalar 6, main argv 5."
+title = "TRACTOR evaluation readiness: wire the corpus runner for a real equivalence number"
+summary = "Baseline measured 2026-08-27; the _lib C-ABI half SPIKED 2026-08-28. Rubric is behavioural equivalence + zero unsafe + builds; PARTIAL CREDIT IS NOT SCORED. 252 public cases, 127 ship empty from a public clone, so 125 evaluable -- and 80 of those (64%) are _lib. THE _lib ANSWER IS BAD: today ZERO of the 80 can score whatever the translation quality, because no crate emits crate-type=[\"cdylib\"] (cargo builds an rlib, nothing to dlopen) and functions are emitted `pub fn` (Rust ABI, mangled, nothing to dlsym). Contract read from the corpus's own runner: exec cases need a binary named `driver`; _lib cases dlopen lib<LIBRARY>.so and dlsym a bare symbol called through an `unsafe extern \"C\" fn`. Symbol/library names are NOT uniformly derivable -- 42 of 80 runners (all B01_synthetic) pin them explicitly. Of the 37 that emit a crate: 21 all-scalar (ABI-ready), 12 pointer-mismatch, 4 other; 43 of 80 are rejections. 19 unlocked by packaging alone, BUILT and byte-diffed identical -- see FR-139. Bucket B is architecturally blocked: a slice param compiles with only a warning then miscompiles across the FFI boundary. Still open: wiring translated_rust/ to run-rust.sh for a real criterion-(a) number."
 blocked_by = []
 anchor = "FR-138 TRACTOR EVALUATION READINESS"
 
