@@ -5089,9 +5089,11 @@ private:
   /// supplies one SSA value per `{}` placeholder, in order. The degenerate
   /// bare `println!()` case (format is exactly `"\n"` with no operands) is
   /// emitted with an empty args array so it renders `println!()` rather than
-  /// `println!("")` (which would trip `clippy::println_empty_string`). All
-  /// printf-family emission sites route through here so the macro choice is
-  /// centralized.
+  /// `println!("")` (which would trip `clippy::println_empty_string`). That
+  /// shortcut is gated on the newline fold having HAPPENED (FR-131): an
+  /// already-empty format keeps `print!`, which needs its zero-length
+  /// literal because `print!()` is not valid Rust. All printf-family
+  /// emission sites route through here so the macro choice is centralized.
   /// `toStderr` selects the stderr twins `eprint!`/`eprintln!` (W2.22's
   /// `std::cerr` chains); the trailing-newline folding and the bare
   /// `eprintln!()` case are identical (clippy's `print_with_newline` /

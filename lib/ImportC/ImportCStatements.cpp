@@ -7061,14 +7061,28 @@ void CImporter::emitPrintMacro(Location loc, std::string rustFormat,
   // keeps `print!`. W2.22's `std::cerr` chains select the stderr twins,
   // whose macro contract (and clippy lints) are identical.
   StringRef macro = toStderr ? "eprint!" : "print!";
+  bool foldedNewline = false;
   if (!rustFormat.empty() && rustFormat.back() == '\n') {
     rustFormat.pop_back();
     macro = toStderr ? "eprintln!" : "println!";
+    foldedNewline = true;
   }
   // A bare `println!()` (the whole format was a lone newline, no holes)
   // renders from an empty args array; `println!("")` would trip
   // clippy::println_empty_string.
-  if (rustFormat.empty() && operands.empty()) {
+  //
+  // FR-131: the shortcut's PRECONDITION is the fold, not the emptiness. It
+  // is sound only for the `ln` variants, whose macro still writes the
+  // newline the fold consumed. A format that was ALREADY empty keeps the
+  // non-`ln` macro, and `print!()` is not valid Rust -- rustc rejects it
+  // with "requires at least a format string argument" and the whole crate
+  // fails to build (`printf("")` used to emit exactly that). So an
+  // unfolded empty format falls through to the normal path and keeps its
+  // zero-length literal: `print!("")` compiles clean, writes zero bytes
+  // (byte-identical to C's `printf("")`) and trips no clippy lint --
+  // measured under clippy::all + clippy::pedantic, which has a
+  // `println_empty_string` but no non-`ln` analogue.
+  if (foldedNewline && rustFormat.empty() && operands.empty()) {
     builder.create<emitrust::CallOpaqueOp>(
         loc, TypeRange(), builder.getStringAttr(macro),
         builder.getArrayAttr({}), ValueRange());
