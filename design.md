@@ -9048,12 +9048,131 @@ piece and becomes FR-45.
   counted as successes. The build sweep exposed it (39+2=41, not 168), which
   is the second time an independent cross-check has caught an inflated
   numerator in this ledger.
-  **NOT SPIKED.** Next: wire `translated_rust/` + the corpus runner to get a
-  real (a) number and verify the `_lib` C-ABI export obligation. FR-137 is
-  FIXED (2026-08-28); note that its "1 crash in 13 unseen units" figure
-  above UNDERSTATES the defect -- see FR-137 for the corrected measurement
-  and for why a crash sweep over unconfigured repos systematically
-  undercounts.
+  **SPIKED 2026-08-28 for the `_lib` C-ABI half, and the answer is worse than
+  this entry assumed.** The submission contract was read out of the corpus's
+  OWN runner code, not inferred:
+    - `discovery/rust.py:17-20`: build dir is `<case>/translated_rust`,
+      artifacts at `translated_rust/target/release`.
+    - `runners/exec_runner.py:59`: an exec case runs `<release>/driver`.
+      THE BINARY MUST BE NAMED `driver`; we name it after the source stem.
+      Packaging-only gap.
+    - `runners/lib_runner.py` + `tools/cando2/src/lib.rs:391-418,160-163`: a
+      `_lib` case DLOPENs `lib<LIBRARY>.so` and DLSYMs a BARE symbol, then
+      calls it through an `unsafe extern "C" fn(...)` signature written in
+      that case's own `runner/src/main.rs`.
+    - `build.py:132` docstring, verbatim: "The corresponding Cargo.toml
+      should build a cdylib". The README repeats it for C2Rust users.
+  THE SYMBOL AND LIBRARY NAMES ARE NOT UNIFORMLY DERIVABLE, and assuming they
+  were would have produced non-identifiers for half the corpus. Measured over
+  the 80 evaluable `_lib` cases: 42 (ALL of B01_synthetic) use the long
+  `harness!` form with EXPLICIT `library:`/`symbol:` -- e.g.
+  `001_helloworld_lib` wants library `hello`, symbol `helloworld`, and
+  `004_nineality_sieve_lib` wants library `Sieve`, symbol `sieve`. Only the
+  38 B01_organic cases derive the symbol as the case dir minus `_lib`. The
+  split is exactly on the bundle boundary.
+  SCALE: of the 125 evaluable cases, 80 (64%) are `_lib`. TODAY ZERO OF THEM
+  CAN SCORE, whatever the translation quality: no crate emits
+  `crate-type = ["cdylib"]`, so cargo builds an rlib and there is no `.so` to
+  dlopen; and functions are emitted `pub fn` (Rust ABI, Rust-mangled) so
+  there is no bare C symbol to dlsym. The "39 crates build" figure above is a
+  well-formedness claim that, for the `_lib` majority, does not bear on
+  scoring at all.
+  MEASURED DISTANCE over the 80 (per-case data in the spike run): 37 emit a
+  crate, 43 are LOCATED rejections (ranked: 12 libc/libm subset gaps, 2
+  printf, 29 the pointer/provenance model). Of the 37 emitted, bucketed by
+  how far the emitted signature is from the runner's declared one:
+    - A, ABI-COMPATIBLE-ALREADY (all-scalar params and return): 21.
+    - B, POINTER MISMATCH: 12 -- 9 with a real `&[T]`/`&mut [T]` slice, and 3
+      where the only pointer is a thin `&T`/`&mut T`.
+    - C, OTHER: 4 (3 are the FR-62 actor lift emitting the target as a
+      `&mut self` METHOD; `--actor-lift=false` restores the free-fn shape for
+      all three. The 4th is struct-by-value.)
+  THE FREE WIN IS REAL AND WAS BUILT, NOT ARGUED: hand-patching the 21
+  bucket-A crates with `#[no_mangle] pub extern "C"` + `crate-type=["cdylib"]`
+  + a corrected `[lib] name` produced 19 working cdylibs exporting the right
+  bare symbol, and their output BYTE-DIFFED IDENTICAL to the clang-built
+  native. So 19 of 80 are unlocked by packaging alone, with ZERO `unsafe`
+  (an all-scalar `extern "C"` entry point needs none). Two of the 21 fail on
+  a self-inflicted gate: the emitted manifest's own
+  `[lints.rust] non_snake_case = "deny"` REJECTS a CamelCase crate name
+  (`error: crate 'Sieve' should have a snake case name`), which is exactly
+  the name `004_nineality_sieve_lib` requires. Reproduced directly.
+  `--crate-name=` already sets both `[package]` and `[lib]` name, so the
+  naming half needs no new machinery.
+  THE BLOCKER FOR BUCKET B IS ARCHITECTURAL, NOT PACKAGING. `&[u8]` is 16
+  bytes (ptr+len), `*const u8` is 8 -- measured, not assumed. Putting
+  `#[no_mangle] extern "C"` on a slice-taking fn is NOT a fix: rustc COMPILES
+  it, emitting only `warning: extern fn uses type [u8], which is not
+  FFI-safe`, and the slice then consumes TWO argument registers so every
+  later parameter is shifted. The observed outcome is signature-dependent and
+  NOT RELIABLY LOUD: `crc16_lib` silently returned a wrong value (native
+  27235, cdylib 0), while a minimal `sum_bytes(&[u8], u32)` probe aborted
+  with an out-of-bounds panic. A silent wrong answer across an FFI boundary
+  is precisely the class this repo forbids, so bucket B must NOT be
+  "fixed" by adding `no_mangle`.
+  Any C-ABI entry point that RECEIVES A POINTER must rebuild the slice from
+  `(ptr,len)` inside `unsafe`. So criteria (a) and (b) are IN TENSION here,
+  which this entry's earlier "criterion (b) is satisfied by construction and
+  the cost is paid in (a)" line did not anticipate: buying (a) on the
+  pointer-taking cases spends (b).
+  A SEPARATE, INDEPENDENT BLOCKER found while probing bucket B-thin: emitted
+  structs carry no `#[repr(C)]` while the runner's `state_member!` macro
+  stamps `#[repr(C)]` on its side. On `flac_validate_lib` rustc reordered
+  fields (same size 28, different offsets: `channel_mode` at 16 vs 20) and
+  270 of 3000 probe lines came back wrong, COMPILING CLEANLY. So the three
+  B-thin cases are blocked by struct repr, not by the fat-pointer question,
+  and `to_barycentric_lib`'s struct-by-value layouts coincide today only by
+  luck.
+  Next: FR-139 for the packaging layer (the measured 19-21), then the
+  pointer-export question on its own evidence. The corpus runner wiring for
+  a real criterion-(a) number is still NOT done and remains this entry's
+  open half.
+
+- [ ] FR-139 FEATURE (the TRACTOR `_lib` submission packaging layer, split
+  out of FR-138's 2026-08-28 spike, which supplies ALL the evidence below --
+  do not re-measure it): emit a crate that the corpus's `cando` harness can
+  actually dlopen and dlsym. Three pieces, and only the first two are in
+  scope here:
+    (1) `crate-type = ["cdylib"]` in the emitted `[lib]` section, under a new
+        opt-in (no existing crate may shift a byte -- `--emit=crate` output is
+        golden-pinned, so this must NOT become the default shape).
+    (2) `#[no_mangle] pub extern "C"` on exported functions, RESTRICTED TO THE
+        ALL-SCALAR SIGNATURES (bucket A). An all-scalar `extern "C"` entry
+        point needs no `unsafe` and no shim, so this is free of the safety
+        tension that blocks the rest.
+    (3) OUT OF SCOPE, deliberately: any pointer-taking export. See FR-138 --
+        a slice param compiles with only a warning and then miscompiles
+        ACROSS THE FFI BOUNDARY (crc16 measured: native 27235, cdylib 0),
+        which is the failure class this repo forbids. A pointer export needs
+        a generated (ptr,len) shim in `unsafe`, which spends rubric criterion
+        (b) to buy (a); that trade is a decision, not an implementation
+        detail, and it gets its own entry.
+  ALREADY SOLVED, needs no work: `--crate-name=` sets both `[package] name`
+  and `[lib] name`, so `lib<LIBRARY>.so` is reachable today. The symbol and
+  library names are NOT derivable from the case directory -- 42 of the 80
+  `_lib` runners (all of B01_synthetic) pin `library:`/`symbol:` explicitly
+  and the other 38 derive it -- so the caller supplies them; the emitter must
+  not guess.
+  MEASURED PAYOFF, built and byte-diffed, not projected: 19 of the 80
+  evaluable `_lib` cases go from unscoreable to byte-identical against the
+  clang-built native. 21 are bucket A; 2 of those are blocked by a
+  SELF-INFLICTED gate worth fixing here -- the emitted manifest's own
+  `[lints.rust] non_snake_case = "deny"` rejects the CamelCase `[lib] name`
+  that `004_nineality_sieve_lib` (library `Sieve`) requires, with
+  `error: crate 'Sieve' should have a snake case name`. Reproduced directly.
+  Relaxing that lint for an explicitly-requested crate name lifts 19 to 21.
+  `--actor-lift=false` would add 3 more (FR-62 lifts those targets to
+  `&mut self` methods), but whether that flag preserves the state-persistence
+  the harness exercises across repeated `run()` calls is UNMEASURED, so those
+  3 are not claimed.
+  GATES: no existing golden shifts a byte (the opt-in is what guarantees it);
+  a lit test pinning the cdylib manifest + `#[no_mangle] pub extern "C"` for
+  an all-scalar export; an EndToEnd-class test that actually BUILDS the
+  cdylib, dlopens it from a C driver declaring the C signature, and byte-diffs
+  against the clang-built native -- compile-clean is not evidence here, and
+  the whole point of this FR is behaviour across a boundary the existing
+  oracles never cross; full lit 100%.
+  **SPIKED via FR-138 2026-08-28. GO for (1)+(2), measured NO-GO for (3).**
 
 - [x] FR-137 DEFECT (CRASH on unseen external C, found by the TRACTOR
   readiness sweep 2026-08-27; ROOT-CAUSED AND FIXED 2026-08-28): importing
