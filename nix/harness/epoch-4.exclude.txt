@@ -1,0 +1,53 @@
+# epoch-4 EXCLUSIONS -- files that are UNMEASURABLE at emitter rev 556677d.
+#
+# Criterion (epoch.py module docstring): a file is measurable only if
+# `emitrust-cc --emit=crate` produces a crate for it. Every path below fails
+# that step, so no crate exists for clippy to lint and the epoch's metric is
+# undefined for it; clippy_eval would silently skip it anyway. Each is a
+# LOCATED `error: unsupported:` rejection -- the designed behaviour, not a
+# crash -- and is recorded here as provenance for the frozen population.
+#
+# Measurability is a property of THIS revision. A file that starts
+# transpiling later does not join epoch-4; that is a new population, i.e. a
+# new epoch.
+
+# unsupported: function 'bump1' is referenced but not defined in any translation unit
+test/EndToEnd/actor-link-lift.c
+# unsupported: extern global variable 'X_COUNT' is referenced but not defined in any translation unit
+test/EndToEnd/actor-partition-lift.c
+# fatal error: 'keep.h' file not found -- a split-file lit test, not a standalone TU
+test/EndToEnd/cpp-cross-tu-record-odr.cpp
+# unsupported: taking the address of undefined function 'default_csprng'
+test/EndToEnd/fnptr-extern-def.c
+# unsupported: function 'offset' is referenced but not defined in any translation unit
+test/EndToEnd/fnptr-undefined-recover.c
+# unsupported: destructor with no definition in this translation unit
+test/EndToEnd/incremental-builds.cpp
+# unsupported builtin type 'unsigned __int128'
+test/EndToEnd/incremental-leaked-stub-containment.cpp
+# unsupported: extern global variable 'SHARED_COUNTER' is referenced but not defined in any translation unit
+test/EndToEnd/link-merge-e2e.c
+# unsupported: pointer-typed global variable
+test/EndToEnd/link-reimport-e2e.c
+# unsupported: function 'ping' is referenced but not defined in any translation unit
+test/EndToEnd/link-workspace-cycle-e2e.c
+# unsupported: function 'calc' is referenced but not defined in any translation unit
+test/EndToEnd/link-workspace-e2e.c
+# unsupported: function 'unrelated_g1' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu-gate-g1-fnptr-result-erasure.c
+# unsupported: function 'unrelated_g3' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu-gate-g3-owner-fallback.c
+# unsupported: function 'reset_region' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu-gate-g5-region-api.c
+# unsupported: function 'use_sum4' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu-gate-g6-cellslice-fn-external.c
+# unsupported: function 'unrelated_g8' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu-gate-g8-ptr-global-external.c
+# unsupported: pointer-typed global variable
+test/EndToEnd/multi-tu-gate-g8-shared-header.c
+# unsupported: extern global variable 'SHARED_COUNTER' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu.c
+# unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape
+test/EndToEnd/planner-rejection-builds.c
+# unsupported: volatile-qualified type
+test/EndToEnd/recover-partial.cpp
