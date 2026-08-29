@@ -206,7 +206,7 @@ anchor = "FR-142 DEFECT (found by FR-106's 473-crate build sweep"
 id = "FR-143"
 rank = 17
 kind = "defect"
-status = "open"
+status = "landed"
 size = "S"
 title = "No owner method has ever been counted as ported"
 summary = "Found while landing FR-141, pre-existing and independent. collectEmittedSymbols (ProgressReport.cpp:487-493) iterates only module.getBody()->getOperations(), so a method inside an emitrust.impl is never in the emitted set -- a correctly ported owner method reports status=missing in emitrust-progress.json while its body is in the crate. Same artifact untruth FR-141 fixed, opposite direction: FR-141 was emitted-but-reported-missing for a BROKEN item, this is emitted-and-correct-but-reported-missing for a WORKING one. Consequence: every ported count recorded in this ledger understates the owner-promotion path, and FR-60 blame ranking cannot see those items. Any cross-wave ported-count comparison where owner promotion changed is suspect. Gates: a reached owner method must report ported; FR-141's negative control must flip missing->ported in the same change; measure the c-testsuite/Cpp17Suite ratchets before and after, since a ported-count change can move a ledger. NOT SPIKED."

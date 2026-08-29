@@ -15,6 +15,8 @@
 
 #include "ProgressReport.h"
 
+#include "EmitRust/EmitRustOps.h"
+
 #include "mlir/IR/Location.h"
 #include "mlir/IR/SymbolTable.h"
 
@@ -486,9 +488,43 @@ ProgressReport::rootBlockerRanking() const {
 
 llvm::StringSet<> collectEmittedSymbols(ModuleOp module) {
   llvm::StringSet<> symbols;
-  for (Operation &op : module.getBody()->getOperations())
+  for (Operation &op : module.getBody()->getOperations()) {
     if (auto symbol = llvm::dyn_cast<SymbolOpInterface>(&op))
       symbols.insert(symbol.getName());
+    // FR-143: an emitted item does not have to be a DIRECT child of the
+    // module. FR-30 owner promotion, the actor lift and C++ method import all
+    // move an `emitrust.func` into the `emitrust.impl` of its owning struct,
+    // and `emitrust.impl` is a nested SymbolTable -- so the method is
+    // invisible to a module-body-only walk. Every such method was therefore
+    // reported `missing` while its body sat in the crate, and no owner method
+    // had ever been counted as ported (measured: RealWorld union-find read
+    // 2/6 ported and is in fact 6/6).
+    //
+    // Descending is sound for an INHERENT impl because the nested name is the
+    // same name the join keys on: FuncToEmitRust moves the function in under
+    // its existing symbol (`tu0_fill` for an FR-30-promoted static,
+    // `cxxMethodMangledName`'s `<Class>_<method>` for a C++ method, both
+    // unique across the module), and the shorter in-impl spelling the emitter
+    // prints lives in a separate attribute.
+    //
+    // A TRAIT impl is deliberately EXCLUDED, because it is the one place that
+    // is NOT true: FuncToEmitRust RENAMES an imported C++ destructor to the
+    // bare `drop` the `Drop` trait requires. That name is a trait member, not
+    // an item symbol, so admitting it could credit a graph node that happens
+    // to be spelled `drop` with evidence belonging to some class's
+    // destructor. Nothing is lost by the exclusion: a destructor is not a
+    // graph node (ItemGraph.h), and every item that IS one is promoted into
+    // an inherent impl. Over-reporting here would be the same class of
+    // artifact untruth FR-143 exists to remove, so the exclusion errs toward
+    // the pre-FR-143 reading rather than toward a claim the crate cannot
+    // back.
+    auto implOp = llvm::dyn_cast<emitrust::ImplOp>(&op);
+    if (!implOp || implOp.getTraitName())
+      continue;
+    for (Operation &nested : implOp.getBody().front())
+      if (auto symbol = llvm::dyn_cast<SymbolOpInterface>(&nested))
+        symbols.insert(symbol.getName());
+  }
   return symbols;
 }
 
