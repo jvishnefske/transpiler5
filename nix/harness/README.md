@@ -75,10 +75,10 @@ python3 nix/harness/epoch.py ledger-show --id 1      # the descent
 pin the union of several roots and extensions:
 
 ```bash
-python3 nix/harness/epoch.py freeze --id 4 \
+python3 nix/harness/epoch.py freeze --id 5 \
     --corpus test/EndToEnd --ext .c --ext .cpp \
-    --exclude nix/harness/epoch-4.exclude.txt
-python3 nix/harness/epoch.py split --id 4 --seed 4 --held-out-frac 0.25
+    --exclude nix/harness/epoch-5.exclude.txt
+python3 nix/harness/epoch.py split --id 5 --seed 5 --held-out-frac 0.25
 ```
 
 Only **measurable** files may be pinned: the file must transpile to a crate
@@ -117,11 +117,18 @@ python3 nix/harness/epoch.py status     # LIVE / CLOSED per epoch
 `close` writes only `epoch-status.json` (when, at which rev, why, and each
 drifted file with its blame); the frozen `epoch-N.json` is left byte for byte
 alone. A closed epoch fails `verify` and is refused by every comparison, so
-its numbers can be read but never extended. Epochs 1–3 are closed history —
+its numbers can be read but never extended. Epochs 1–4 are closed history —
 their ledger trajectories are real measurements of a moving population, which
-is exactly why nothing may extend them.
+is exactly why nothing may extend them. Epoch-4 is the mechanism working as
+designed rather than a defect: FR-61f-c legitimately edited pinned
+`test/EndToEnd/deferred-mut-slice-index.c` on 2026-08-29, `verify --id 4`
+went red, and the response was to freeze **epoch-5** (the same union corpus,
+measurability re-probed at `f734fed`: 244 files, the same 20 exclusions) and
+close epoch-4 — never to re-freeze it or `--update` its baseline. Epoch-5's
+numbers are therefore **not** a continuation of epoch-4's: the population
+changed, so the two totals are not a trajectory.
 
-The committed clippy ratchet is likewise pinned: `clippy-baseline-epoch4.json`
+The committed clippy ratchet is likewise pinned: `clippy-baseline-epoch5.json`
 carries `epoch_id` + `corpus_hash`, the default `clippy_eval.py` invocation
 measures **the epoch's file list** (not whatever `.c` is in the directory),
 and an unpinned baseline is refused. The three consumers of "which baseline is

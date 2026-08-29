@@ -73,6 +73,24 @@
           "last_changed": "a308e45 2026-08-24 feat(import): FR-61f-4 -- range-for bodies may touch parameters"
         }
       ]
+    },
+    "4": {
+      "epoch_id": 4,
+      "closed_at": "2026-08-29T10:36:58",
+      "closed_at_rev": "f734fed1190ac260185171b07a5f8ea3557dbce7",
+      "reason": "drifted: pinned EndToEnd test test/EndToEnd/deferred-mut-slice-index.c was legitimately edited by FR-61f-c on 2026-08-29 (f734fed); a delta measured over a moved population is attributable to nothing",
+      "note": "superseded by epoch-5 (same union corpus test/EndToEnd x {.c,.cpp}, re-probed measurability at f734fed: 244 files, same 20 exclusions). Deliberately NOT re-frozen -- re-freezing would make verify pass and destroy the evidence that the population moved (FR-144).",
+      "corpus_root": "test/EndToEnd",
+      "corpus_hash": "sha256:28f71ffa30aad95e9b0068db3e2a6244be93ebf4f0134542e3ef0ba7312f8d19",
+      "file_count": 238,
+      "drifted": true,
+      "drifted_files": [
+        {
+          "path": "test/EndToEnd/deferred-mut-slice-index.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "f734fed 2026-08-29 feat(import): FR-61f-c slices 1+2 -- hoist a body-invariant pointer cell"
+        }
+      ]
     }
   }
 }

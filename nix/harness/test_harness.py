@@ -25,11 +25,16 @@ refusal:
 
 Hermetic: every mutating case runs against a synthetic corpus in a tempdir
 with the module's HERE/LEDGER/STATUS paths redirected. The only assertions
-against the real tree are read-only and stable (epochs 1-3 recorded closed,
-the three consumer constants agreeing). It deliberately does NOT assert
-`verify --id 4` passes: legitimately editing a pinned EndToEnd test would then
-fail the lit gate, whereas the correct response to that is to freeze a new
-epoch.
+against the real tree are read-only and stable (the retired epochs recorded
+closed, the three consumer constants agreeing, exactly one LIVE epoch and the
+ratchet pinned to it). It deliberately does NOT assert that the live epoch's
+`verify` passes: legitimately editing a pinned EndToEnd test would then fail
+the lit gate, whereas the correct response to that is to freeze a NEW epoch --
+which is exactly what happened on 2026-08-29, when FR-61f-c edited pinned
+`test/EndToEnd/deferred-mut-slice-index.c`, epoch-4 was closed as drifted and
+epoch-5 (244 files) took over. The assertions below are therefore written
+against "the epoch the authoritative baseline names" rather than a hard-coded
+number, so rolling an epoch does not require rewriting them.
 """
 import io
 import json
@@ -275,21 +280,44 @@ class TestCrateDirCollision(unittest.TestCase):
                          "range_for")
 
 
+# Epochs retired to history, each closed BECAUSE its pinned population had
+# moved: 1-3 by FR-144's audit (2026-08-28), 4 when FR-61f-c legitimately
+# edited pinned test/EndToEnd/deferred-mut-slice-index.c (2026-08-29). Listed
+# explicitly because each is a recorded historical fact, not a derived one.
+DRIFTED_CLOSED_EPOCHS = (1, 2, 3, 4)
+
+
+def _live_epoch_id():
+    """The epoch the authoritative ratchet baseline is pinned to."""
+    with open(clippy_mod.DEFAULT_BASELINE) as f:
+        return json.load(f)["epoch_id"]
+
+
 class TestCommittedState(unittest.TestCase):
     """Read-only assertions over the real tree."""
 
-    def test_epochs_1_to_3_are_recorded_closed(self):
-        for eid in (1, 2, 3):
+    def test_retired_epochs_are_recorded_closed_as_drifted(self):
+        for eid in DRIFTED_CLOSED_EPOCHS:
             st = epoch_mod.epoch_state(eid)
             self.assertIsNotNone(st, f"epoch-{eid} must be closed history")
             self.assertTrue(st["drifted"], f"epoch-{eid} closed as drifted")
             self.assertTrue(st["drifted_files"])
 
-    def test_epoch_4_is_open(self):
-        self.assertIsNone(epoch_mod.epoch_state(4))
+    def test_the_live_epoch_is_open(self):
+        self.assertIsNone(epoch_mod.epoch_state(_live_epoch_id()))
+
+    def test_every_earlier_epoch_is_closed(self):
+        """Exactly one epoch may be live: the one the ratchet is pinned to.
+        A superseded epoch left open would let a stale baseline keep
+        measuring against a population the loop has already moved past."""
+        live = _live_epoch_id()
+        for eid in range(1, live):
+            self.assertIsNotNone(
+                epoch_mod.epoch_state(eid),
+                f"epoch-{eid} predates the live epoch-{live} but is not closed")
 
     def test_closed_epochs_are_refused_for_comparison(self):
-        for eid in (1, 2, 3):
+        for eid in DRIFTED_CLOSED_EPOCHS:
             with self.assertRaises(SystemExit) as cm:
                 epoch_mod.assert_comparable(eid)
             self.assertIn("CLOSED", str(cm.exception))
@@ -322,7 +350,7 @@ class TestCommittedState(unittest.TestCase):
         """A closure records the hash the epoch had when it was closed. If a
         later re-freeze rewrote the document, that hash would no longer match
         -- which would destroy the historical record the closure preserves."""
-        for eid in (1, 2, 3):
+        for eid in DRIFTED_CLOSED_EPOCHS:
             st = epoch_mod.epoch_state(eid)
             doc = epoch_mod.load_epoch(eid)
             self.assertEqual(st["corpus_hash"], doc["corpus_hash"],

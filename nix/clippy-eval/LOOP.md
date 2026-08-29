@@ -19,14 +19,16 @@ sufficient evidence (a codegen change cannot be trusted on compile-clean alone).
 ## One iteration
 
 1. **Measure.** `python3 nix/clippy-eval/clippy_eval.py` prints the ranked
-   tally and the ratchet delta vs `clippy-baseline-epoch4.json` — the
-   **epoch-pinned** baseline. The measured population is epoch-4's frozen file
+   tally and the ratchet delta vs `clippy-baseline-epoch5.json` — the
+   **epoch-pinned** baseline. The measured population is epoch-5's frozen file
    list, not whatever `.c` happens to be in `test/EndToEnd`, so the delta is a
    paired comparison attributable to the emitter alone; the tool re-hashes the
    pinned files first and refuses (exit 2) if the epoch drifted, was closed, or
    does not match the hash the baseline was measured under (FR-144).
    `clippy-baseline.json` is the pre-FR-144 unpinned document, kept as history
-   and refused as a ratchet baseline.
+   and refused as a ratchet baseline; `clippy-baseline-epoch4.json` is epoch-4's
+   final measurement, also history (epoch-4 was closed when FR-61f-c edited a
+   pinned test) and NOT comparable to epoch-5's number.
 2. **Pick** the top lint (highest count = widest systematic pattern).
 3. **Locate** where the emitter produces it (usually `lib/Target/Rust/
    TranslateToRust.cpp` or a `lib/ImportC` lowering) and change it to emit the
@@ -39,9 +41,9 @@ sufficient evidence (a codegen change cannot be trusted on compile-clean alone).
    is green AND the total dropped, commit the emitter change; otherwise revert
    (the loop never regresses).
 6. **Ratchet.** `clippy_eval.py --update` to lower the committed baseline
-   (`clippy-baseline-epoch4.json` — the same path `signals.py` ranks and
+   (`clippy-baseline-epoch5.json` — the same path `signals.py` ranks and
    `controller.py accept` commits; all three must agree), and commit it. Adding
-   EndToEnd tests does NOT change this number: they are not in epoch-4. When
+   EndToEnd tests does NOT change this number: they are not in epoch-5. When
    the corpus should grow, freeze a NEW epoch, `close` the old one, and
    re-`--update` — never compare across epochs.
 

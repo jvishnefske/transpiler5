@@ -1,0 +1,80 @@
+{
+  "_comment": "Clippy baseline pinned to epoch-5 (nix/harness/epoch-5.json): the UNION corpus test/EndToEnd x {.c,.cpp}, measurable files only, re-probed at f734fed. Epoch-4 was CLOSED (a pinned test, test/EndToEnd/deferred-mut-slice-index.c, was legitimately edited by FR-61f-c on 2026-08-29), so clippy-baseline-epoch4.json is history and is left byte-untouched. NOT comparable to clippy-baseline-epoch4.json or clippy-baseline.json: those measured different populations (238 files / .c-only unpinned), so the totals are NOT a trajectory. total_warnings == train + held_out; the split is the anti-Goodhart guard (FR-63.3).",
+  "epoch_id": 5,
+  "corpus": "test/EndToEnd",
+  "corpus_roots": [
+    "test/EndToEnd"
+  ],
+  "extensions": [
+    ".c",
+    ".cpp"
+  ],
+  "corpus_hash": "sha256:132e5e39cd833549b525da00a926215f3b12c9a039ad179dda87962b4f206726",
+  "split": {
+    "seed": 5,
+    "held_out_frac": 0.25
+  },
+  "emitter_rev": "f734fed1190ac260185171b07a5f8ea3557dbce7",
+  "crates_linted": 244,
+  "crates_skipped": 0,
+  "total_warnings": 231,
+  "by_lint": {
+    "clippy::wrong_self_convention": 64,
+    "clippy::new_ret_no_self": 64,
+    "clippy::needless_late_init": 46,
+    "clippy::borrowed_box": 19,
+    "clippy::precedence": 9,
+    "clippy::approx_constant": 5,
+    "clippy::if_same_then_else": 4,
+    "clippy::borrow_deref_ref": 3,
+    "clippy::needless_else": 3,
+    "clippy::single_match": 2,
+    "clippy::unnecessary_literal_unwrap": 2,
+    "clippy::type_complexity": 2,
+    "clippy::manual_range_contains": 2,
+    "clippy::too_many_arguments": 1,
+    "clippy::field_reassign_with_default": 1,
+    "clippy::manual_swap": 1,
+    "clippy::collapsible_if": 1,
+    "clippy::useless_format": 1,
+    "clippy::assign_op_pattern": 1
+  },
+  "train": {
+    "crates_linted": 183,
+    "crates_skipped": 0,
+    "total_warnings": 180,
+    "by_lint": {
+      "clippy::wrong_self_convention": 51,
+      "clippy::new_ret_no_self": 51,
+      "clippy::needless_late_init": 31,
+      "clippy::borrowed_box": 19,
+      "clippy::precedence": 6,
+      "clippy::approx_constant": 5,
+      "clippy::if_same_then_else": 4,
+      "clippy::borrow_deref_ref": 3,
+      "clippy::needless_else": 3,
+      "clippy::manual_range_contains": 2,
+      "clippy::field_reassign_with_default": 1,
+      "clippy::manual_swap": 1,
+      "clippy::unnecessary_literal_unwrap": 1,
+      "clippy::collapsible_if": 1,
+      "clippy::assign_op_pattern": 1
+    }
+  },
+  "held_out": {
+    "crates_linted": 61,
+    "crates_skipped": 0,
+    "total_warnings": 51,
+    "by_lint": {
+      "clippy::needless_late_init": 15,
+      "clippy::wrong_self_convention": 13,
+      "clippy::new_ret_no_self": 13,
+      "clippy::precedence": 3,
+      "clippy::single_match": 2,
+      "clippy::type_complexity": 2,
+      "clippy::too_many_arguments": 1,
+      "clippy::unnecessary_literal_unwrap": 1,
+      "clippy::useless_format": 1
+    }
+  }
+}
