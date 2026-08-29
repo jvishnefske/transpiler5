@@ -967,6 +967,7 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   addressTaken.clear();
   fileLocals.clear();
   pointerLocals.clear();
+  allocRegionBackings.clear();
   stringViewLocals.clear();
   pointerPointerLocals.clear();
   carrierLocals.clear();
@@ -1560,6 +1561,7 @@ CImporter::importLiftedLambdaBody(const PendingLiftedLambda &pending) {
   addressTaken.clear();
   fileLocals.clear();
   pointerLocals.clear();
+  allocRegionBackings.clear();
   stringViewLocals.clear();
   lambdaLocals.clear();
   pointerPointerLocals.clear();
@@ -1928,6 +1930,7 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   addressTaken.clear();
   fileLocals.clear();
   pointerLocals.clear();
+  allocRegionBackings.clear();
   stringViewLocals.clear();
   pointerPointerLocals.clear();
   carrierLocals.clear();

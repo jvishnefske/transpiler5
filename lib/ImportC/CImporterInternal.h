@@ -4840,7 +4840,8 @@ private:
 
   /// Borrows the char region of a decomposed pointer as a byte slice from
   /// its cursor: `emitrust.slice_of` of the region's place — the literal
-  /// backing, the base object's own place, or (FR-72) a byte-slice
+  /// backing, the base object's own place, (FR-146) a heap allocation's
+  /// synthesized MUTABLE backing array, or (FR-72) a byte-slice
   /// PARAMETER's deref'd backing (`!emitrust.lvalue<!emitrust.slice<i8|
   /// ui8>>`, resliced at the cursor exactly like the general slice-param
   /// call machinery) — typed `!emitrust.ref<!emitrust.slice<i8|ui8>>`
@@ -4849,8 +4850,10 @@ private:
   /// parameter (a `const` pointee; rustc E0596 would be the only
   /// downstream catch), a ui8 parameter region unless the caller's
   /// helper family has u8 images (`allowUnsignedByte` — the str*-family
-  /// helpers are i8-typed), and any base whose place is neither a char
-  /// array nor a byte-slice parameter (all located diagnostics); the
+  /// helpers are i8-typed), a pointer with no region at all (null-only,
+  /// multi-base, or degenerate — FR-146; the base-less shapes once
+  /// crashed here), and any base whose place is neither a char array nor
+  /// a byte-slice parameter (all located diagnostics); the
   /// array's compile-time-known size — or the slice's own length — is
   /// what makes every helper access bounds-checked safe Rust.
   FailureOr<Value> emitCharRegionSlice(Location loc,
@@ -6645,6 +6648,13 @@ private:
   /// Per-function decomposition of each accepted pointer local and each
   /// slice-classified pointer parameter, keyed by its declaration.
   llvm::DenseMap<const clang::VarDecl *, PointerLocalInfo> pointerLocals;
+  /// FR-146: the ONE synthesized backing array of each heap-allocation
+  /// region (W4.2e Part A), keyed by the region's alloc site. Every
+  /// pointer local the region analysis UNITES into that region
+  /// decomposes against this same place; a per-variable backing made
+  /// `char *q = p;` a silent miscompile (q got a private zeroed array).
+  /// Cleared with `pointerLocals` at every function boundary.
+  llvm::DenseMap<const clang::Expr *, Value> allocRegionBackings;
   /// W2.12: per-function decomposition of each literal-initialized
   /// `std::string_view` local (see `emitStringViewLocal`): the literal's
   /// shared read-only backing byte array place plus two entry

@@ -473,6 +473,23 @@ FailureOr<Value> CImporter::emitCharRegionSlice(Location loc,
   // like the FR-72 deref'd backing it is.
   if (!place)
     place = pointer.slicePlace;
+  // FR-146: a HEAP-ALLOCATION region (W4.2e Part A) borrows exactly like
+  // a local array region. Its backing is a synthesized entry-block
+  // MUTABLE `!emitrust.lvalue<!emitrust.array<CAP x T>>` local — the same
+  // place shape a `char a[N]` region resolves to, and writable, so both
+  // the shared and the mutable borrow are legal — subscripted at the
+  // pointer's own cursor. A node-pool handle's backing is an
+  // `emitrust.collection` (`!emitrust.lvalue<!emitrust.opaque<
+  // "__emitrust_collection">>`) instead: it is not an array place, so it
+  // declines to the char-array rejection below rather than being
+  // borrowed. Before this branch existed an allocation-backed pointer
+  // fell through to the base lookup with a NULL `base` and crashed
+  // dereferencing it (FR-146).
+  if (!place)
+    place = pointer.backing;
+  if (!place && !pointer.base)
+    return emitError(loc) << "unsupported: string function argument over a "
+                             "pointer with no importable region";
   if (!place) {
     auto it = symbols.find(pointer.base);
     if (it == symbols.end())
@@ -481,6 +498,12 @@ FailureOr<Value> CImporter::emitCharRegionSlice(Location loc,
              << "' is not an importable place";
     place = it->second;
   }
+  // Every region place below is subscripted at the pointer's cursor; a
+  // degenerate (cursor-less) pointer has no element to start at.
+  // (Defensive: `emitCharRegionArg` already rejects that shape.)
+  if (!pointer.cursor)
+    return emitError(loc) << "unsupported: string function argument over a "
+                             "pointer with no region cursor";
   auto lvalueType = llvm::dyn_cast<emitrust::LValueType>(place.getType());
   Type i8Type = builder.getIntegerType(8);
   Type ui8Type =
@@ -645,6 +668,14 @@ LogicalResult CImporter::emitStringCopyCall(const clang::CallExpr *call,
            << "unsupported: " << name
            << " source and destination point into the same object '"
            << dst->base->getName() << "'";
+  // FR-146: two regions of the SAME heap allocation have no named base to
+  // collide on — their shared identity is the synthesized backing place.
+  // Borrowing it mutably and shared at once is rustc E0502, so the pair
+  // rejects here rather than after emission.
+  if (dst->backing && dst->backing == src->backing)
+    return emitError(loc)
+           << "unsupported: " << name
+           << " source and destination point into the same allocation";
   Value count;
   if (hasCount) {
     FailureOr<Value> n = emitRValue(call->getArg(2));
@@ -937,6 +968,17 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
       return success();
     }
   }
+  // FR-146: two regions of the SAME heap allocation share no named base
+  // (both roots are null), so the (root, path) key above cannot see the
+  // collision; their identity is the synthesized backing place. The
+  // `copy_within` refinement above needs a PROVABLE whole region, which a
+  // pointer's cursor into an allocation is not, so the pair rejects
+  // rather than emitting the two-borrow form (rustc E0502).
+  if (!dst->isMember() && !src->isMember() && dst->pointer.backing &&
+      dst->pointer.backing == src->pointer.backing)
+    return emitError(loc) << "unsupported: " << name
+                          << " source and destination point into the same "
+                             "allocation";
   FailureOr<Value> dstSlice = emitByteRegionSlice(loc, *dst, /*isMut=*/true,
                                                   /*allowUnsignedByte=*/true);
   if (failed(dstSlice))
