@@ -2239,9 +2239,44 @@ LogicalResult CImporter::importDeclsIn(const clang::DeclContext *context) {
     if (recoverFromRejections) {
       if (failed(importTopLevelDeclRecovering(decl)))
         return failure();
+    } else if (failed(importTopLevelDecl(decl))) {
+      return failure();
+    }
+    // FR-123: a friend function DEFINED INLINE in a class is an item of
+    // this same scope -- its semantic declaration context IS this one, so
+    // it names and is named exactly like a free function -- but it is
+    // reachable only through the record's LEXICAL member list, so the
+    // `decls()` walk above cannot see it. Before this it was SILENTLY
+    // OMITTED: no diagnostic, no item, no trace, and (because the FR-40
+    // item graph mirrors this walk) `--incremental` scored the program
+    // 1000 permille having lost a function. Routed through the SAME
+    // per-item dispatch, immediately after the record it is declared in,
+    // so the admitted W2.25 by-value kinds import byte-identically to
+    // their free spelling and every other shape earns FR-119's located
+    // rejection here instead of vanishing. See
+    // `emitrust::collectFriendDefinitions` for the selection rule (and
+    // for the shapes it deliberately still declines).
+    if (failed(importFriendDefinitionsIn(decl)))
+      return failure();
+  }
+  return success();
+}
+
+LogicalResult CImporter::importFriendDefinitionsIn(const clang::Decl *decl) {
+  llvm::SmallVector<const clang::FunctionDecl *, 4> friends;
+  emitrust::collectFriendDefinitions(decl, friends);
+  for (const clang::FunctionDecl *func : friends) {
+    // The same system-header screen the walk applies to its own
+    // declarations: a friend defined inside a system-header class is not
+    // this project's item.
+    if (isSystemHeaderDecl(func))
+      continue;
+    if (recoverFromRejections) {
+      if (failed(importTopLevelDeclRecovering(func)))
+        return failure();
       continue;
     }
-    if (failed(importTopLevelDecl(decl)))
+    if (failed(importTopLevelDecl(func)))
       return failure();
   }
   return success();

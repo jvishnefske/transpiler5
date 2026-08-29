@@ -16,6 +16,9 @@
 // RUN: emitrust-import-c %t/friend.cpp 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=FRIEND \
 // RUN:     --implicit-check-not="error" --implicit-check-not="INVALID EMPTY SYMBOL"
+// RUN: not emitrust-import-c %t/friendbad.cpp 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=FRIENDBAD \
+// RUN:     --implicit-check-not="INVALID EMPTY SYMBOL" --implicit-check-not="module"
 
 // FR-119: a free NON-MEMBER operator is an ordinary top-level FunctionDecl,
 // so it slipped past FR-117's `cxxMethod &&`-gated refusal; its
@@ -32,10 +35,17 @@
 // W2.25 moved the pin FORWARD: free operators of the ADMITTED by-value
 // kinds (+, -, *, /, ==, ... — the table in CSymbolNaming.h) now import
 // under synthesized identifier spellings (test/Import/Cpp/
-// operator-overload.cpp pins the positive half), so every shape in this
-// file uses a kind OUTSIDE the table (`<<`, `>>`, a literal operator) —
-// the guard itself, its recovery drop, and its ledger tag are unchanged
-// for everything the wave did not admit.
+// operator-overload.cpp pins the positive half), so every REJECTING shape
+// in this file uses a kind OUTSIDE the table (`<<`, `>>`, a literal
+// operator) — the guard itself, its recovery drop, and its ledger tag are
+// unchanged for everything the wave did not admit.
+//
+// FR-123 moved the pin forward AGAIN, in the FRIEND sections below: a
+// friend function DEFINED INLINE in a class never reached the guard at
+// all, because it never reached the item walk at all. It does now, so the
+// admitted kinds import (FRIEND) and the non-admitted kinds reach this
+// file's own guard and reject located (FRIENDBAD), where both used to be
+// silently omitted.
 
 //--- strict.cpp
 // The 2-line silent shape: exactly ONE free operator over an admitted
@@ -91,17 +101,53 @@ int main(void) {
 }
 
 //--- friend.cpp
-// NEGATIVE PIN, deliberately unchanged by FR-119: a friend operator defined
+// THE PIN THIS FR MOVED. It used to read: "a friend operator defined
 // INLINE in the class is still silently omitted (the class imports, the
-// operator leaves no trace, zero diagnostics). That is a SEPARATE
-// pre-existing channel -- it never reaches `importFunction` at item scope
-// -- filed as its own FR (FR-123); this pin keeps the channel measured
-// as-is until that FR moves it.
+// operator leaves no trace, zero diagnostics) ... a SEPARATE pre-existing
+// channel -- it never reaches `importFunction` at item scope -- filed as
+// its own FR (FR-123); this pin keeps the channel measured as-is until
+// that FR moves it."
+//
+// FR-123 moved it. The channel was never an unsupported CONSTRUCT: the
+// same `operator+` written at namespace scope imports today under W2.25's
+// admitted by-value table, so the friend spelling was merely NEVER
+// REACHED -- its `FunctionDecl` hangs off a `FriendDecl` inside the
+// `CXXRecordDecl` and is absent from the TU's own `decls()`. So the fix
+// makes it WORK rather than adding a diagnostic: a definition-carrying
+// friend is routed through the same arm a top-level `FunctionDecl` takes,
+// and this admitted `operator+` now emits `op_add` exactly as the free
+// spelling does. The positive half (byte-identical friend-vs-free
+// emission, overload suffixes, the no-double-import prototype rule) is
+// pinned in test/Import/Cpp/friend-inline-definition.cpp; the ledger half
+// -- the operator is now IN the `--incremental` denominator, where a
+// missing function used to read 1000 permille -- in
+// test/Driver/incremental-friend-operator.cpp.
 // FRIEND: emitrust.struct_def @B
+// FRIEND: func.func @op_add(
 // FRIEND: func.func @c_main
 struct B {
   int v;
   friend int operator+(B a, int b) { return a.v + b; }
+};
+int main(void) {
+  B b;
+  b.v = 2;
+  return b.v;
+}
+
+//--- friendbad.cpp
+// The other half of the same move, and the one that keeps this file's
+// charter: a friend operator whose kind is OUTSIDE the admitted table now
+// reaches THIS FILE'S guard instead of being dropped on the floor. Before
+// FR-123 this program exited 0 with a module containing `B` and `c_main`,
+// no operator and NO DIAGNOSTIC -- a silent loss the ledger scored as
+// fully ported. Now it is the same located `unsupported: overloaded
+// operator` a free `operator<<` earns, on the same `cxx-operator-overload`
+// ledger tag, and no module is printed.
+// FRIENDBAD: friendbad.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: overloaded operator
+struct B {
+  int v;
+  friend int operator<<(B a, int b) { return a.v << b; }
 };
 int main(void) {
   B b;

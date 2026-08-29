@@ -671,6 +671,23 @@ void ItemGraphBuilder::collectOrdinaryNames(const clang::DeclContext *context) {
       tuOrdinaryNames[tuIndex].insert(std::move(symbol));
       continue;
     }
+    // FR-123: a friend function defined inline in a class claims an
+    // ordinary module symbol like the free function it is, but is absent
+    // from `decls()`; mirroring `CImporter::collectOrdinaryNamesFrom`'s
+    // own FR-123 arm keeps this pre-scan the same set the importer's is.
+    if (llvm::isa<clang::CXXRecordDecl>(decl)) {
+      llvm::SmallVector<const clang::FunctionDecl *, 4> friends;
+      collectFriendDefinitions(decl, friends);
+      for (const clang::FunctionDecl *func : friends) {
+        std::string symbol = cFunctionSymbolName(func, tuTag);
+        if (symbol.empty())
+          continue;
+        if (func->hasBody())
+          collectStaticLocalNames(func->getBody(), symbol);
+        tuOrdinaryNames[tuIndex].insert(std::move(symbol));
+      }
+      continue;
+    }
     if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl))
       tuOrdinaryNames[tuIndex].insert(cGlobalSymbolName(var, tuTag));
   }
@@ -803,6 +820,32 @@ void ItemGraphBuilder::collectItems(const clang::DeclContext *context) {
                func->isThisDeclarationADefinition(), linkageOf(func), tuIndex,
                std::move(file), line, column});
       continue;
+    }
+    // FR-123: the friend functions DEFINED INLINE in this class are items
+    // of THIS scope — their semantic declaration context is this one, so
+    // they name exactly like free functions — reachable only through the
+    // record's lexical member list. Without this arm the graph would be
+    // missing an item the crate DOES emit, which is the denominator half
+    // of the defect: `--incremental` scored a program that had silently
+    // lost a function at `graph_items: 2, ported: 2, permille 1000`. The
+    // arm runs BEFORE the record arm below and does not consume `decl`,
+    // so the record still mints its own node; the selection rule is shared
+    // with `CImporter::importDeclsIn` so the two agree by construction.
+    if (llvm::isa<clang::CXXRecordDecl>(decl)) {
+      llvm::SmallVector<const clang::FunctionDecl *, 4> friends;
+      collectFriendDefinitions(decl, friends);
+      for (const clang::FunctionDecl *func : friends) {
+        std::string symbol = cFunctionSymbolName(func, tuTag);
+        if (symbol.empty())
+          continue;
+        clang::PresumedLoc friendLoc =
+            sourceManager->getPresumedLoc(func->getLocation());
+        addNode({std::move(symbol), ItemKind::Function,
+                 /*isDefinition=*/true, linkageOf(func), tuIndex,
+                 friendLoc.isValid() ? friendLoc.getFilename() : "",
+                 friendLoc.isValid() ? friendLoc.getLine() : 0,
+                 friendLoc.isValid() ? friendLoc.getColumn() : 0});
+      }
     }
     if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
       // Only a complete definition is an item; a forward declaration emits
@@ -1366,6 +1409,19 @@ void ItemGraphBuilder::collectDependencies(const clang::DeclContext *context) {
           collectRecordDependencies(spec, symbol);
       }
       continue;
+    }
+    // FR-123: edges out of a hidden friend's own body and signature, the
+    // pass-2 twin of the node arm above. Without it the friend would have
+    // a node with no `Calls`/`SigType` edges and the coloring could not
+    // propagate an inadmissible type through it.
+    if (llvm::isa<clang::CXXRecordDecl>(decl)) {
+      llvm::SmallVector<const clang::FunctionDecl *, 4> friends;
+      collectFriendDefinitions(decl, friends);
+      for (const clang::FunctionDecl *func : friends) {
+        std::string symbol = cFunctionSymbolName(func, tuTag);
+        if (!symbol.empty())
+          collectFunctionDependencies(func, symbol);
+      }
     }
     if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
       const clang::RecordDecl *definition = record->getDefinition();

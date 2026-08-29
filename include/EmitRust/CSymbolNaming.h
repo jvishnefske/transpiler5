@@ -50,6 +50,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
 #include "clang/AST/DeclCXX.h"
+#include "clang/AST/DeclFriend.h"
 #include "clang/AST/DeclTemplate.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -771,6 +772,92 @@ static inline std::string cGlobalSymbolName(const clang::VarDecl *var,
   // `ns_shapes_base` -> `NS_SHAPES_BASE`); the linkage predicate in
   // CSymbolLinkage.h recognizes the uppercased tags.
   return idiomaticRenameEnabled() ? toScreamingSnakeCase(full) : full;
+}
+
+/// FR-123: the friend functions DEFINED INLINE in the class definition
+/// `record`, in declaration order — the item-scope declarations that the
+/// walks over a `TranslationUnitDecl`'s `decls()` structurally cannot see.
+///
+/// A friend function's `FunctionDecl` hangs off a `FriendDecl` inside the
+/// `CXXRecordDecl`; its SEMANTIC declaration context is the enclosing
+/// namespace (so it names, and is named, exactly like a free function),
+/// but it is reachable only through the record's LEXICAL member list. So
+/// every walk that must agree on the program's item set — the importer's
+/// `importDeclsIn` and `collectOrdinaryNamesFrom`, the item graph's three
+/// passes, the FR-41 admissibility probe — has to ask for these
+/// explicitly. It lives HERE, beside `cFunctionSymbolName`, for the same
+/// reason the naming primitives do: five walks agreeing by construction
+/// rather than by discipline. A walk that admitted a different friend set
+/// than the importer would put items in the graph the crate never emits,
+/// or (the direction FR-123 exists to close) leave an emitted function out
+/// of the denominator and report 1000 permille for incomplete output.
+///
+/// The selection rule, clause by clause:
+///  * DEFINITION-CARRYING ONLY. A body-less friend PROTOTYPE is skipped:
+///    its out-of-class definition is already a top-level declaration every
+///    walk reaches, so admitting the prototype here would double-import
+///    it. (An unreferenced body-less prototype with no definition anywhere
+///    keeps skipping silently, which is `importFunction`'s deliberate
+///    referenced-only policy.)
+///  * NON-MEMBER ONLY. `friend void Other::f();` names another class's
+///    method; it carries no body at the friend site, and members are
+///    screened out explicitly besides — a method's symbol needs its
+///    class's assigned struct name, which this header deliberately does
+///    not model.
+///  * NON-TEMPLATE ONLY. A friend function template's `getFriendDecl` is a
+///    `FunctionTemplateDecl` (not a `FunctionDecl`) and is skipped by the
+///    cast; an explicit/implicit specialization is skipped by the
+///    specialization-kind clause. RECORDED GAP, not silence: a use still
+///    fails loudly at its call site with "call to unimported function".
+///    The same holds for a hidden friend of a CLASS template, which is
+///    reached only through the class-template arm's `specializations()`
+///    and is deliberately not walked — one hidden-friend symbol per
+///    instantiation carries no suffix distinguishing the instantiations,
+///    so `Box<int>` and `Box<long>` would both claim `op_add`.
+///  * A friend TYPE declaration (`friend class W;`) has no `FunctionDecl`
+///    at all and contributes nothing: it grants access and declares no
+///    code.
+///
+/// Nested classes are not recursed into: a nested record is itself a loud
+/// rejection at import ("unsupported: struct definition outside file or
+/// function scope"), so no friend hides silently behind one.
+///
+/// \param record the class definition to scan; a non-definition (a forward
+///        declaration) contributes nothing, which is what keeps a record
+///        declared twice at file scope from yielding its friends twice.
+/// \param out receives the selected friend definitions, appended.
+static inline void collectFriendDefinitions(
+    const clang::CXXRecordDecl *record,
+    llvm::SmallVectorImpl<const clang::FunctionDecl *> &out) {
+  if (!record || !record->isCompleteDefinition())
+    return;
+  for (const clang::Decl *member : record->decls()) {
+    if (member->isImplicit())
+      continue;
+    const auto *friendDecl = llvm::dyn_cast<clang::FriendDecl>(member);
+    if (!friendDecl)
+      continue;
+    const clang::NamedDecl *named = friendDecl->getFriendDecl();
+    if (!named)
+      continue; // A friend TYPE: `getFriendType` is the populated half.
+    const auto *func = llvm::dyn_cast<clang::FunctionDecl>(named);
+    if (!func || llvm::isa<clang::CXXMethodDecl>(func))
+      continue;
+    if (!func->doesThisDeclarationHaveABody())
+      continue;
+    if (func->getDescribedFunctionTemplate() ||
+        func->getTemplateSpecializationKind() != clang::TSK_Undeclared)
+      continue;
+    out.push_back(func);
+  }
+}
+
+/// The `collectFriendDefinitions` overload for a walk that holds a plain
+/// `clang::Decl *`: yields nothing unless `decl` is a class DEFINITION.
+static inline void collectFriendDefinitions(
+    const clang::Decl *decl,
+    llvm::SmallVectorImpl<const clang::FunctionDecl *> &out) {
+  collectFriendDefinitions(llvm::dyn_cast<clang::CXXRecordDecl>(decl), out);
 }
 
 } // namespace emitrust
