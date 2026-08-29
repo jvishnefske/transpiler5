@@ -5829,6 +5829,25 @@ private:
   /// representation type of every imported enum).
   Value castEnumToI32(Location loc, Value value);
 
+  /// FR-149: emits a user-written SUBSCRIPT INDEX expression, normalizing a
+  /// named-enum index to its i32 discriminant. This is the single seam every
+  /// index expression passes through, in place of a bare `emitRValue`, so no
+  /// subscript-building site can be reached with an `!emitrust.enum` value:
+  /// `emitrust.subscript`'s index operand is constrained to integer-or-index,
+  /// and the byte-region cursor paths feed `castToIntType`, which casts the
+  /// source to `IntegerType` unconditionally. C indexes by the enumerator's
+  /// integer value, and `castEnumToI32` -- the importer's universal
+  /// enum-to-integer conversion, shared with comparisons, truthiness and
+  /// arithmetic -- is value-preserving here because every imported enumerator
+  /// is required to fit in i32. An ANONYMOUS enum never reaches this branch:
+  /// `mapType` already gives it a plain `i32`, which is why this defect hid
+  /// behind four synthetic reductions that all used one. A
+  /// `!emitrust.data_enum` (the C++ tagged-union type) has no integer
+  /// discriminant and is deliberately NOT converted; it keeps reaching its
+  /// caller's located rejection.
+  FailureOr<Value> emitSubscriptIndexRValue(const clang::Expr *idxExpr,
+                                            Location loc);
+
   /// Emits a pointer-typed expression in the decomposed representation:
   /// reads of pointer locals load their cursor cell, `&x` yields the
   /// degenerate (cursor-less) form, `&arr[i]` and array decay yield the

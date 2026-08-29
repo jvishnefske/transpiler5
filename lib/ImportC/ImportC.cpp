@@ -3248,9 +3248,12 @@ CImporter::resolveOpaqueArmByteView(const clang::Expr *expr, Location loc,
                   static_cast<int64_t>(elementSize);
       continue;
     }
-    FailureOr<Value> index = emitRValue(subscript->getIdx());
+    FailureOr<Value> index =
+        emitSubscriptIndexRValue(subscript->getIdx(), loc); // FR-149
     if (failed(index))
       return failure();
+    if (!llvm::isa<IntegerType>((*index).getType()))
+      return emitError(loc) << "unsupported subscript index type";
     Value index64 = castToIntType(loc, *index, cursorType);
     if (elementSize != 1) {
       Value scale = createIntConstant(loc, cursorType,
@@ -4112,7 +4115,9 @@ CImporter::emitSubscriptPointer(const clang::ArraySubscriptExpr *subscript) {
     return emitError(loc) << "unsupported: arithmetic on the address "
                              "of a scalar object";
   }
-  FailureOr<Value> index = emitRValue(subscript->getIdx());
+  // FR-149: an enum-typed index normalizes to its i32 discriminant before
+  // it is scaled and folded into the pointer's flat cursor.
+  FailureOr<Value> index = emitSubscriptIndexRValue(subscript->getIdx(), loc);
   if (failed(index))
     return failure();
   if (!llvm::isa<IntegerType>((*index).getType()))
@@ -4908,9 +4913,12 @@ CImporter::resolveByteRegionRef(const clang::Expr *expr,
                         static_cast<int64_t>(elementSize);
       return base;
     }
-    FailureOr<Value> index = emitRValue(subscript->getIdx());
+    FailureOr<Value> index =
+        emitSubscriptIndexRValue(subscript->getIdx(), loc); // FR-149
     if (failed(index))
       return failure();
+    if (!llvm::isa<IntegerType>((*index).getType()))
+      return emitError(loc) << "unsupported subscript index type";
     Value index64 = castToIntType(loc, *index, builder.getIntegerType(64));
     if (elementSize != 1) {
       Value scale = createIntConstant(loc, builder.getIntegerType(64),
@@ -5835,7 +5843,8 @@ FailureOr<Value> CImporter::emitLValue(const clang::Expr *expr,
               lvalueType ? llvm::dyn_cast<emitrust::ArrayType>(
                                lvalueType.getValueType())
                          : emitrust::ArrayType()) {
-        FailureOr<Value> index = emitRValue(opCall->getArg(1));
+        FailureOr<Value> index =
+            emitSubscriptIndexRValue(opCall->getArg(1), loc); // FR-149
         if (failed(index))
           return failure();
         if (!llvm::isa<IntegerType>((*index).getType()))
@@ -6818,9 +6827,16 @@ CImporter::emitSubscriptLValue(const clang::ArraySubscriptExpr *subscript,
   auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(baseType.getValueType());
   if (!arrayType)
     return emitError(loc) << "unsupported subscript base";
-  FailureOr<Value> index = emitRValue(subscript->getIdx());
+  // FR-149: an enum-typed index normalizes to its i32 discriminant here.
+  FailureOr<Value> index = emitSubscriptIndexRValue(subscript->getIdx(), loc);
   if (failed(index))
     return failure();
+  // Rejection is a feature: anything the normalization did not leave as an
+  // integer (an `!emitrust.data_enum`, say) gets a LOCATED diagnostic in the
+  // same words the pointer-subscript path uses, rather than tripping the
+  // op verifier and aborting the whole translation unit.
+  if (!llvm::isa<IntegerType, IndexType>((*index).getType()))
+    return emitError(loc) << "unsupported subscript index type";
   return builder
       .create<emitrust::SubscriptOp>(
           loc, emitrust::LValueType::get(arrayType.getElementType()),
