@@ -5654,7 +5654,7 @@ piece and becomes FR-45.
   recorded as the FR-82 candidate. lwIP baseline 13 failing units
   -> 12. Full suite 614/614.
 
-- [ ] FR-82 Interior-member addresses of requirement globals (the
+- [x] FR-82 NO-GO (2026-08-15) Interior-member addresses of requirement globals (the
   measured residue of the IP_DATA front: 9 lwIP units take
   `&ip_data.<member>` via the ip.h macro family — ip6 61x, tcp_in
   73x, udp 32x — and FR-81's address-taken gate rightly rejects
