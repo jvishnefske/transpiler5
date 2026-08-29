@@ -3216,7 +3216,29 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
         return failure();
       Type backingType = emitrust::ArrayType::get(
           builder.getContext(), region->allocCount, *elementType);
-      Value backing = createVariablePlace(loc, backingType);
+      // FR-146: every pointer local UNITED into one allocation region
+      // shares ONE backing. `char *q = p;` unites q with p (the region
+      // analysis is union-find over the sources), and a per-VARIABLE
+      // backing gave q a private zeroed array — writes through one
+      // pointer were invisible through the other, a silent miscompile
+      // that reached emission. The region's alloc site is its stable
+      // identity here; a second pointer whose pointee maps to a
+      // different element type would reinterpret the same storage and
+      // rejects located instead.
+      Value backing;
+      auto sharedIt = allocRegionBackings.find(region->allocSite);
+      if (sharedIt != allocRegionBackings.end()) {
+        backing = sharedIt->second;
+        if (llvm::cast<emitrust::LValueType>(backing.getType())
+                .getValueType() != backingType)
+          return emitError(loc)
+                 << "unsupported: pointer '" << var->getName()
+                 << "' reinterprets a heap allocation at a different "
+                    "element type";
+      } else {
+        backing = createVariablePlace(loc, backingType);
+        allocRegionBackings[region->allocSite] = backing;
+      }
       Value cursorCell = createEntryAlloca(loc, builder.getIntegerType(64));
       PointerLocalInfo info;
       info.cursorCell = cursorCell;

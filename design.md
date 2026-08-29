@@ -9356,31 +9356,105 @@ piece and becomes FR-45.
   is readable in one place), and incremental-owner-struct-reached.c -- THE
   NEGATIVE CONTROL, which fails if the sweep is ever widened.
 
-- [ ] FR-146 DEFECT (CRASH, found as a side finding by FR-61f-d's spike
-  2026-08-28, PRE-EXISTING at clean HEAD and unrelated to the range lift):
-  `--recover` SEGFAULTS on two external files. Highest-severity class, same as
-  FR-137: an abort with no diagnostic, no recovery.
-  REPRODUCE (corpora already cloned under scratchpad/probe):
-      emitrust-cc --recover --emit=rust uthash/tests/test89.c \
-        -Iuthash/tests -Iuthash -Iuthash/include -o /dev/null      # rc 139
-      emitrust-cc --recover --emit=rust cJSON/tests/minify_tests.c \
-        -I<dir> -I<..> -I<../include> -o /dev/null                 # rc 139
-  MEASURED PROPERTIES, each of which narrows the fix:
-    - NOT a stack overflow: still segfaults under `ulimit -s unlimited`
-      (the same control FR-137 used, and the same answer).
-    - `--recover`-DEPENDENT, which is the whole shape of it: WITHOUT
-      `--recover` the same input exits 1 cleanly with a located rejection. So
-      the fault is on the RECOVERY path, after a series of recovered pointer
-      rejections -- not in the ordinary import.
-    - The stack has NO MLIR frames; the fault is inside `emitrust-cc` itself.
-      Frames 5 and 7 are the SAME address with one frame between them, i.e. a
-      RECURSION CYCLE -- combined with the ulimit control, that points at
-      unbounded recursion over a structure the recovery path mutates, not at
-      depth alone.
-  This is the FR-137 contract violated a second time, and it lands in exactly
-  the mode FR-138 measured as scoring ZERO anyway -- so the cost is not a lost
-  point, it is that recovery, whose entire purpose is to survive bad input,
-  does not.
+- [x] FR-146 DEFECT (CRASH, found as a side finding by FR-61f-d's spike
+  2026-08-28; SPIKED AND FIXED 2026-08-29): a null `VarDecl` dereference on a
+  base-less ALLOCATION region. Highest-severity class: an abort with no
+  diagnostic.
+  **THIS ENTRY WAS FILED WRONG ON THREE POINTS, all of them mine, all corrected
+  by measurement:**
+    1. NOT `--recover`-dependent, and NOT "on the recovery path". The reduced
+       repro crashes in PLAIN STRICT MODE with no flags. The external file only
+       LOOKED recovery-dependent because strict mode rejects something else in
+       it first, MASKING the crash. This is a crash on ordinary C.
+    2. NOT a recursion cycle. The repeated stack frame is `emitStmt` nesting
+       through a for loop -- ordinary, not unbounded recursion. (The `ulimit -s
+       unlimited` control was right; the inference drawn from it was not.)
+    3. NOT ONE CRASH. It is TWO crash sites of ONE CLASS, and the class had a
+       known precedent that had been fixed for string literals only.
+  THE REPRO IS FOUR LINES, no flags, and `--emit=import` crashes too, so it is
+  the IMPORTER, not emission:
+      int f(void){ char *p = (char *)malloc(8); strcpy(p, "abc"); return p[0]; }
+  Controls isolate it exactly: a STACK array + `strcpy` is clean, and malloc
+  with a plain subscript store is clean. The trigger is a string/memory builtin
+  (`strcpy`/`memcpy`/`memset`) writing into an ALLOCATION-BACKED region.
+  ROOT CAUSE, and the irony is worth recording: `emitCharRegionSlice`
+  (ImportCHosted.cpp:476-484) resolved a region place from `literalBacking`,
+  `slicePlace`, then the named base -- and NEVER from `PtrExprValue::backing`.
+  An allocation-backed pointer has `base == nullptr` BY DESIGN
+  (CImporterInternal.h:481 documents it), so it fell through to the base lookup
+  and dereferenced the null `VarDecl` **while formatting its own rejection
+  message** (`<< pointer.base->getName()`). The crash was IN THE ERROR PATH.
+  gdb confirms it exactly: `rax=0`, faulting on the `DeclarationName` load
+  inside `NamedDecl::getName()`.
+  SITE 1 -> SUPPORTED, not merely diagnosed, because the shape IS
+  representable: `region->allocSite` regions already synthesize an
+  `!emitrust.lvalue<!emitrust.array<CAP x T>>` place (ImportCStatements.cpp
+  :3213-3231), structurally identical to the `char a[N]` place that already
+  worked. Pool handles are not array places and decline to the existing
+  char-array rejection.
+  SITE 2 -> LOCATED REJECTION, chosen deliberately and stated as a cost.
+  `emitBorrowArgument` (ImportCExpressions.cpp:6218-6222) has the identical
+  null-base deref -- its own comment already names "the historical null-base
+  SIGSEGV"; `backing` was simply never added there. Supporting it is
+  representable, but the caller's aliasing guard is keyed on the argument's
+  `VarDecl` ROOT, which an allocation region has none of, so `f(p,p)` or
+  `f(p,q)` after `q=p` would emit two borrows of one backing and fail as rustc
+  E0499/E0502. Re-keying `root` to the pointer's own `VarDecl` feeds
+  `paramCursorCallCapture` (FR-104), which would then build a `base`-rooted
+  `PtrExprValue` for a heap region -- a MISCOMPILE path. So the rejection
+  stands. Corpus cost: ZERO regression (every one of these shapes crashed
+  before), but the common "pass a malloc'd buffer to a helper" idiom stays
+  unsupported -- cJSON's minify_tests.c hits it 4x, which is the measured value
+  of FR-147.
+  **A SILENT MISCOMPILE THE CRASH WAS MASKING, and this is the load-bearing
+  judgement of the whole fix.** The region analysis is union-find, so
+  `char *q = p;` unites q into p's region -- but `emitPointerLocal` created the
+  backing PER VARIABLE, so q got a private ZEROED array. At HEAD,
+  `char *p=malloc(8); p[0]=7; char *q=p; return q[0];` emitted Rust returning
+  **0** where C returns **7**: pre-existing, compile-clean, no string function
+  involved. Fixing site 1 ALONE would have converted q-side crashes into THAT
+  -- and crash -> silent wrong code is a REGRESSION IN KIND, not a fix. So the
+  backing is now one per `region->allocSite`. Verified: emitted crate exits 7,
+  clang native exits 7.
+  Five rejection wordings pinned, all probed from the built tool and all
+  located, including two same-allocation aliasing guards
+  (`memcpy source and destination point into the same allocation`) that the
+  crash had made unreachable. Two further guards are deliberately defensive and
+  unreachable today; they exist because the failure without them is an MLIR
+  builder crash rather than a diagnostic.
+  GATES: the 4-line repro emits and its crate exits 97 against a clang native
+  that exits 97. Both original external files stop crashing -- uthash
+  `--recover` 139 -> 0, cJSON `--recover` 139 -> 1, where the surviving 1 is
+  unrelated (an undefined `unity_begin`). Corpus emission delta over
+  test/EndToEnd: ZERO byte differences, identical exit codes. Clippy, paired
+  against the epoch-4 pin: 238 -> 238 (+0). Ledgers unmoved.
+  Pinned by test/Import/C/malloc-region-string-fn{,-invalid}.c,
+  malloc-local-alias.c (the miscompile), and
+  test/EndToEnd/malloc-region-string-fn.c.
+
+- [ ] FR-147 FEATURE (split out of FR-146's fix 2026-08-29, with its cost
+  already measured): pass an ALLOCATION-BACKED pointer to a user-defined
+  function. FR-146 turned this from a SEGFAULT into the located rejection
+  `unsupported: passing a pointer into a heap allocation as a slice argument`,
+  which was the honest outcome there but leaves the ordinary "malloc a buffer,
+  hand it to a helper" idiom unsupported.
+  WHY IT WAS NOT DONE IN FR-146, measured rather than assumed: the shape is
+  representable, but `emitBorrowArgument`'s aliasing guard is keyed on the
+  argument's `VarDecl` ROOT, and an allocation region has none. Without a key,
+  `f(p,p)`, `f(p,p+1)` or `f(p,q)` after `q=p` emit two borrows of one backing
+  and fail as rustc E0499/E0502 -- the safe direction, but a broken crate.
+  Re-keying `root` to the POINTER's own `VarDecl` is the tempting shortcut and
+  is WRONG: it feeds `paramCursorCallCapture` (FR-104), which would then build
+  a `base`-rooted `PtrExprValue` for a heap region -- a miscompile path, not a
+  build failure.
+  THE DIRECTION: give the aliasing guard a BACKING-KEYED identity (the
+  `region->allocSite` the FR-146 fix already made canonical, one backing per
+  region), then flip the rejection. FR-146 also made that key exist.
+  MEASURED VALUE: cJSON's `tests/minify_tests.c` hits this rejection 4x under
+  `--recover`; it is the last FR-146-class blocker in that file.
+  Gates: the aliasing shapes (`f(p,p)`, `f(p,p+1)`, `f(p,q)` after `q=p`) must
+  each be a LOCATED rejection or correct code, never an E0499/E0502 crate;
+  EndToEnd byte-diff of the admitted shape; full lit 100%.
   **NOT SPIKED.**
 
 - [ ] FR-145 TOOLING (the class-level guard, distilled from FR-140, FR-141 and

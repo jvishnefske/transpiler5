@@ -111,6 +111,7 @@ void CImporter::resetPerFunctionState() {
   inductionValues.clear();
   fileLocals.clear();
   pointerLocals.clear();
+  allocRegionBackings.clear();
   stringViewLocals.clear();
   pointerPointerLocals.clear();
   carrierLocals.clear();

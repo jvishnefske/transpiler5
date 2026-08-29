@@ -6138,6 +6138,22 @@ FailureOr<Value> CImporter::emitBorrowArgument(
                                        /*is_mut=*/isMutParam)
           .getResult();
     }
+    // FR-146: a pointer into a HEAP ALLOCATION (W4.2e Part A) is the
+    // other base-less region, and like `literalBacking` above it must be
+    // handled BEFORE the base-keyed paths below dereference the null
+    // `base` — passing a malloc'd buffer to a user-defined function
+    // SEGFAULTED the importer here (the same null-base crash class the
+    // literal branch above records). The region IS representable as a
+    // reslice of the synthesized backing, but the caller's aliasing
+    // guard is keyed on the argument's `VarDecl` root, which an
+    // allocation region does not have: two arguments into one allocation
+    // (`f(p, p)`, `f(p, p + 1)`, or `f(p, q)` after `q = p`) would emit a
+    // mutable and a second borrow of one backing array and fail only as
+    // rustc E0499/E0502 in the emitted crate. Rejection is a feature, so
+    // the shape rejects located here until that key exists.
+    if (pointer->backing)
+      return emitError(loc) << "unsupported: passing a pointer into a heap "
+                               "allocation as a slice argument";
     root = pointer->base;
     // A multi-base pointer has no single region base to reslice; the
     // callee would need the enum-of-bases discriminant, which a slice
