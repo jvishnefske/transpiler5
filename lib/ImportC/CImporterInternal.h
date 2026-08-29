@@ -5567,10 +5567,27 @@ private:
   /// argument shape leaves the path empty (a whole-object borrow, which
   /// collides with everything under the same root — the historical
   /// behavior).
+  ///
+  /// FR-147: `allocBacking` is the SECOND, backing-keyed half of that
+  /// aliasing key, and it doubles as the caller's OPT-IN to the
+  /// allocation-backed slice argument. A pointer into a heap allocation
+  /// (W4.2e Part A) has NO `VarDecl` root — `root` stays null — so a
+  /// caller that only keys on `root` cannot see two arguments into one
+  /// allocation and would emit an E0499/E0502 crate. Passing a non-null
+  /// `allocBacking` asserts the caller keys on the returned backing
+  /// place too (one backing per allocation region since FR-146, so
+  /// pointer identity on this Value IS allocation identity); it then
+  /// receives the region's backing array place for an
+  /// allocation-backed slice argument, and stays null for every other
+  /// shape. A caller that passes nullptr keeps FR-146's located
+  /// `passing a pointer into a heap allocation as a slice argument`
+  /// rejection verbatim — refusing is safe, emitting an unkeyed
+  /// aliasing pair is not.
   FailureOr<Value> emitBorrowArgument(
       Location loc, const clang::Expr *argument, Type paramType,
       const clang::VarDecl *&root,
-      SmallVectorImpl<const clang::FieldDecl *> *rootPath = nullptr);
+      SmallVectorImpl<const clang::FieldDecl *> *rootPath = nullptr,
+      Value *allocBacking = nullptr);
 
   /// FR-74: matches a member-array slice ARGUMENT — a dot/arrow
   /// projection chain ending at a fixed-extent array-typed field —

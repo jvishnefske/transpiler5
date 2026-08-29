@@ -3250,6 +3250,21 @@ LogicalResult CImporter::emitPointerLocal(const clang::VarDecl *var,
       builder.create<memref::StoreOp>(
           loc, createIntConstant(loc, builder.getIntegerType(64), 0),
           cursorCell);
+      // FR-147 (defect found while admitting allocation-backed slice
+      // ARGUMENTS): a SECOND pointer united into this allocation region
+      // (`char *q = p + 3;`, `const char *z = walk(p);`) declares here
+      // too, and the cursor-0 store above is its ONLY binding — its
+      // initializer was silently DROPPED, so `q` read the allocation
+      // from offset 0 instead of 3. That is a wrong-answer miscompile a
+      // byte diff sees and `cargo build` cannot. The allocating
+      // declaration itself keeps the store-0-and-stop path byte for
+      // byte (the malloc call IS the binding, and re-running it through
+      // `storePointerAssign` would emit a redundant re-zero); every
+      // other initializer is now stored exactly like the assignment
+      // form `q = p + 3` already was.
+      if (const clang::Expr *init = var->getInit())
+        if (!asAllocCall(init))
+          return storePointerAssign(loc, var, init);
       return success();
     }
     // An integer-carrier region (CTS-P3): the pointer never addresses a

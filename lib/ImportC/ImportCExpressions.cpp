@@ -2870,12 +2870,27 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   // shape over sibling fields is legal Rust (rustc-verified in the FR-74
   // spike). Non-member borrows keep an empty path, preserving the
   // historical whole-object collision behavior byte-for-byte.
+  //
+  // FR-147: a borrow of a HEAP ALLOCATION has no `VarDecl` root at all,
+  // so it carries the SECOND, disjoint half of the key — the region's
+  // backing array place, one per allocation region since FR-146. The two
+  // key spaces never overlap (a synthesized backing is nobody's declared
+  // object), so they are checked independently. A backing borrow runs
+  // OPEN-ENDED from its cursor to the end of the allocation, so any two
+  // borrows of one backing overlap by construction (`g(p, p)`,
+  // `g(p, p + 1)`, and `g(p, q)` after `q = p` all land here) and the
+  // pair rejects located rather than emitting a rustc E0499/E0502 crate.
+  // The diagnostic names the ALLOCATION and never a decl: a heap region's
+  // root is null, and formatting `root->getName()` on one is exactly the
+  // null dereference FR-146 was opened to fix.
   SmallVector<std::pair<const clang::VarDecl *,
                         SmallVector<const clang::FieldDecl *, 2>>,
               4>
       borrowRoots;
+  SmallVector<Value, 4> borrowBackings;
   for (const PendingBorrow &borrow : borrows) {
     const clang::VarDecl *root = nullptr;
+    Value allocBacking;
     SmallVector<const clang::FieldDecl *, 2> rootPath;
     // FR-88: a nullable parameter's argument borrows the SHARED byte
     // slice its Option wraps — the ordinary `&[u8]` slice-argument
@@ -2890,7 +2905,8 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
                       builder.getContext(), 8, IntegerType::Unsigned))))
             : input;
     FailureOr<Value> reference =
-        emitBorrowArgument(loc, borrow.expr, borrowType, root, &rootPath);
+        emitBorrowArgument(loc, borrow.expr, borrowType, root, &rootPath,
+                           &allocBacking);
     if (failed(reference))
       return failure();
     // FR-104: an armed parameter-cursor-return capture records the rooted
@@ -2922,6 +2938,13 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
                  << root->getName() << "')";
       }
       borrowRoots.push_back({root, rootPath});
+    }
+    if (allocBacking) {
+      if (llvm::is_contained(borrowBackings, allocBacking))
+        return emitError(loc)
+               << "unsupported: aliasing mutable pointer arguments (two "
+                  "arguments borrow the same heap allocation)";
+      borrowBackings.push_back(allocBacking);
     }
     if (nullableSlot)
       reference = builder
@@ -5903,8 +5926,11 @@ peelVoidMediatedArgumentCast(clang::ASTContext &context,
 FailureOr<Value> CImporter::emitBorrowArgument(
     Location loc, const clang::Expr *argument, Type paramType,
     const clang::VarDecl *&root,
-    SmallVectorImpl<const clang::FieldDecl *> *rootPath) {
+    SmallVectorImpl<const clang::FieldDecl *> *rootPath,
+    Value *allocBacking) {
   root = nullptr;
+  if (allocBacking)
+    *allocBacking = Value();
   // Shared byte-slice parameters (`const unsigned char *`, CTS-BR 00216)
   // and `const T&` parameters (FR-48) borrow immutably; everything else
   // borrows mutably.
@@ -6151,9 +6177,44 @@ FailureOr<Value> CImporter::emitBorrowArgument(
     // mutable and a second borrow of one backing array and fail only as
     // rustc E0499/E0502 in the emitted crate. Rejection is a feature, so
     // the shape rejects located here until that key exists.
-    if (pointer->backing)
-      return emitError(loc) << "unsupported: passing a pointer into a heap "
-                               "allocation as a slice argument";
+    // FR-147 flips that rejection for callers that CAN key the borrow.
+    // The region is the reslice of its backing at the pointer's cursor —
+    // the same `slice_of` shape a local array's decay produces — and the
+    // missing half of the aliasing key is the backing PLACE itself:
+    // FR-146 made exactly one backing per allocation region (keyed on the
+    // region's `allocSite`), so pointer identity on this Value is
+    // allocation identity, and `q = p` shares the Value by construction.
+    // The caller reports whether it keys on it by passing `allocBacking`;
+    // a caller that does not keeps the FR-146 rejection, because an
+    // unkeyed pair (`g(p, p)`, `g(p, p + 1)`, `g(p, q)`) would emit two
+    // borrows of one backing array and fail only as rustc E0499/E0502 in
+    // the emitted crate. NOTE that `root` deliberately stays NULL here: it
+    // feeds `paramCursorCallCapture` (FR-104) immediately above the
+    // aliasing guard, and a `base`-rooted `PtrExprValue` for a base-less
+    // heap region is a miscompile path, not a build failure.
+    if (pointer->backing) {
+      if (!allocBacking || !pointer->cursor || pointer->nonNull ||
+          pointer->baseIndex)
+        return emitError(loc) << "unsupported: passing a pointer into a heap "
+                                 "allocation as a slice argument";
+      auto backingLValue =
+          llvm::dyn_cast<emitrust::LValueType>(pointer->backing.getType());
+      auto backingArray =
+          backingLValue ? llvm::dyn_cast<emitrust::ArrayType>(
+                              backingLValue.getValueType())
+                        : emitrust::ArrayType();
+      if (!backingArray)
+        return emitError(loc) << "unsupported: passing a pointer into a heap "
+                                 "allocation as a slice argument";
+      if (backingArray.getElementType() != sliceType.getElementType())
+        return emitError(loc) << "unsupported: argument element type does not "
+                                 "match the slice parameter";
+      *allocBacking = pointer->backing;
+      return builder
+          .create<emitrust::SliceOfOp>(loc, paramType, pointer->backing,
+                                       pointer->cursor, /*is_mut=*/isMutParam)
+          .getResult();
+    }
     root = pointer->base;
     // A multi-base pointer has no single region base to reslice; the
     // callee would need the enum-of-bases discriminant, which a slice
