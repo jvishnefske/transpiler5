@@ -591,9 +591,9 @@ anchor = "STILL OUT after 61f-10"
 id = "FR-61f-c"
 rank = 24
 kind = "feature"
-status = "open"
+status = "spiked"
 size = "L"
-title = "Range-for: a body may touch a pointer (needs its own design pass)"
+title = "Range-for: pointer body -- slices 1+2 LANDED; slice 3 (place conversion) deferred, ceiling +19"
 summary = "Biggest remainder by a wide margin: 201 of the 400 first-failure rejections on the post-61f-10 tree (121 body-touches-a-pointer + 80 non-comparison conditions, which are the pointer-walking heads `for (p = head; p; p = p->next)` and need a truthiness condition and a `p = p->next` step besides). A CHECKPOINT, not a foregone conclusion, and the ONE remainder where the cell-story-never-applied argument that carried 61f-6 and 61f-10 is genuinely FALSE -- here the cells are real. A pointer local never reaches the place/cell decision: emitLocalVar diverts to emitPointerLocal, which allocates raw memref cells on every arm, held as PointerLocalInfo::cursorCell, so placeBackedScalars is never consulted and CANNOT be (the cursor is a synthesized cell whose type is unrelated to the variable's mapped type). Liftability means teaching the pointer-region model to emit its cursor, its nullable discriminant and the CTS-P7 enum-of-bases discriminant as emitrust.variable places, then auditing every memref.load/store consumer. Core machinery: design pass before any code."
 blocked_by = []
 anchor = "STILL OUT after 61f-10"

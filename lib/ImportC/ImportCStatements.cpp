@@ -4730,6 +4730,23 @@ bool stmtWritesVar(const clang::Stmt *stmt, const clang::VarDecl *var) {
   return false;
 }
 
+/// FR-61f-c: whether the subtree DECLARES `var` (a `DeclStmt` naming it).
+/// A pointer declared inside the loop body has its initializing store INSIDE
+/// the `emitrust.for` region, so its cursor cannot be hoisted to a value that
+/// dominates the region -- there is nothing to load yet.
+bool stmtDeclaresVar(const clang::Stmt *stmt, const clang::VarDecl *var) {
+  if (!stmt)
+    return false;
+  if (const auto *decls = llvm::dyn_cast<clang::DeclStmt>(stmt))
+    for (const clang::Decl *decl : decls->decls())
+      if (llvm::dyn_cast_or_null<clang::VarDecl>(decl) == var)
+        return true;
+  for (const clang::Stmt *child : stmt->children())
+    if (stmtDeclaresVar(child, var))
+      return true;
+  return false;
+}
+
 /// Whether the subtree contains a call (used to keep `HI` side-effect free).
 bool stmtContainsCall(const clang::Stmt *stmt) {
   if (!stmt)
@@ -5215,6 +5232,75 @@ bool CImporter::rangeForBodyVarIsPlaceBacked(const clang::VarDecl *var) {
   return false;
 }
 
+// FR-61f-c slice 1. A pointer is the one body-variable class that is
+// deliberately NOT routed to a place: it decomposes into i64/i1/i32 entry-block
+// CELLS (`PointerLocalInfo`), and design.md's prescription -- convert those
+// cells into `emitrust.variable` places -- was measured WORSE than the
+// alternative taken here. A place is opaque to `canonicalize`, so the
+// converted form renders a dead `let` plus unfolded cursor arithmetic; the
+// same head-improves/body-degrades shape that made the FR-61f (d) `?:` slice
+// net negative.
+//
+// The mechanism used instead is HOISTING: load the cells ONCE, in the
+// enclosing block, and use the SSA value inside the region. `canonicalize`
+// then folds the `+ 0` away, so the head AND the body improve. That is only
+// sound when the pointer's state cannot change across iterations, which is
+// exactly what this predicate proves.
+//
+// It is stated on the clang AST alone -- no `pointerLocals`, no `regionOf` --
+// for a hard ordering reason: `matchRangeFor` runs once from
+// `collectRangeForPlaceScalars`, which every function-emission entry calls
+// BEFORE `pointerRegions.analyze`, so `pointerLocals` is empty there. A
+// predicate that consulted it would answer differently in the pre-pass than at
+// emission and desynchronize `placeBackedScalars` from the lift decision. It
+// also costs nothing: 125 of the 161 corpus sites blocked by a pointer body
+// var have no `PointerRegion` at all (a read-only cursor PARAMETER walked by
+// index is never *bound*, so the region model never sees it), and gating on
+// the region model yields +12 where body-invariance yields +142.
+bool CImporter::rangeForBodyPointerIsHoistable(const clang::VarDecl *var,
+                                               const clang::Stmt *body) {
+  clang::QualType type = var->getType().getCanonicalType();
+  if (!type->isPointerType())
+    return false;
+  // A function pointer is already a place (`!emitrust.fn_ptr`) and is handled
+  // by `rangeForBodyVarIsPlaceBacked`; nothing to hoist.
+  if (type->isFunctionPointerType())
+    return false;
+  // A pointer-to-pointer LOCAL lives in `pointerPointerLocals`, a separate
+  // registry with its own cell that `emitRangeFor` cannot reach through
+  // `pointerLocals`. Admitting one would lift the loop and then leave its cell
+  // read inside the region -- the located `memref.alloca` legalization error,
+  // not a miscompile, but a regression against the working `while` lowering it
+  // has today. `pointers-ptr-to-ptr.c` is the corpus instance. A `T **`
+  // PARAMETER is a different animal: `emitPointerPointerLocal` is the only
+  // writer of `pointerPointerLocals` and it runs off a `DeclStmt`, so a
+  // parameter (`char **argv`) decomposes through the ordinary `pointerLocals`
+  // cursor cell and hoists like any other.
+  if (type->getPointeeType().getCanonicalType()->isPointerType() &&
+      !llvm::isa<clang::ParmVarDecl>(var))
+    return false;
+  // A pointer DECLARED INSIDE the body has its initializing store inside the
+  // region, so there is no value to load before it. This is the FR-61f-c
+  // slice-3 residue (~19 sites across four corpora); it keeps the `while`
+  // lowering it works under today.
+  if (stmtDeclaresVar(body, var))
+    return false;
+  // The invariance proof. `stmtWritesVar` RECURSES, so a mutation in the inner
+  // loop of a nested pair refuses the outer lift too; `addressTaken` is
+  // function-wide, so it fences every write reached through a callee (`&p`
+  // escaping) and every second-order write (`*pp = q`, pointers-ptr-to-ptr.c).
+  //
+  // This clause is also the FENCE for a fourth `blocksRangeForLift` leak.
+  // `blocksRangeForLift` is a statement-shape blocklist and cannot see that a
+  // pointer REBINDING (nullable / multi-base dispatch) emits cf blocks inside
+  // the region; admitting a mutated pointer segfaults
+  // `mlir::OpTrait::impl::verifyNSuccessors` on `compound-literals.c`,
+  // `pointers-member-base.c` and `pointers-multi-base.c` -- measured: zero
+  // crashes over 460 EndToEnd files at this gate, three the moment mutation is
+  // admitted. Any later widening must fix that leak FIRST.
+  return !stmtWritesVar(body, var) && !addressTaken.contains(var);
+}
+
 /// True when `bound` can be carried at the induction's own type `type`
 /// WITHOUT narrowing: it is either an integer constant representable there,
 /// or an expression already of exactly that type.
@@ -5498,6 +5584,7 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
   // green suite with partial coverage beats a broad matcher that miscompiles.
   llvm::SmallPtrSet<const clang::VarDecl *, 8> bodyVars;
   collectRefVars(body, bodyVars);
+  llvm::SmallVector<const clang::VarDecl *, 4> hoistPointers;
   for (const clang::VarDecl *var : bodyVars) {
     if (var == iv)
       continue;
@@ -5515,11 +5602,27 @@ CImporter::matchRangeFor(const clang::ForStmt *stmt) {
     // requirement-global path), which stages real cells; that stays out.
     if (!var->hasLocalStorage() && addressTaken.contains(var))
       return std::nullopt;
+    // FR-61f-c slice 1: a BODY-INVARIANT pointer is admitted without being a
+    // place. Its cells are hoisted to SSA values in front of the region by
+    // `emitRangeFor`; see `rangeForBodyPointerIsHoistable`.
+    if (rangeForBodyPointerIsHoistable(var, body)) {
+      hoistPointers.push_back(var);
+      continue;
+    }
     if (!rangeForBodyVarIsPlaceBacked(var))
       return std::nullopt;
   }
+  // `bodyVars` is a pointer-keyed set, so its iteration order is the
+  // allocator's. Sort the hoist list into source order: it drives the order of
+  // the emitted `memref.load`s, and an unstable one would make the emitted
+  // crate non-reproducible.
+  llvm::sort(hoistPointers,
+             [](const clang::VarDecl *a, const clang::VarDecl *b) {
+               return a->getLocation().getRawEncoding() <
+                      b->getLocation().getRawEncoding();
+             });
 
-  return RangeFor{iv, lo, hi, step, inclusive};
+  return RangeFor{iv, lo, hi, step, inclusive, hoistPointers};
 }
 
 LogicalResult CImporter::emitRangeFor(const RangeFor &range,
@@ -5574,6 +5677,74 @@ LogicalResult CImporter::emitRangeFor(const RangeFor &range,
   // An unsigned step must be an `emitrust.constant`: `arith.constant`
   // requires a signless type.
   Value stepValue = createScalarIntConstant(loc, intType, range.step);
+
+  // FR-61f-c slice 1: HOIST the decomposition cells of every body-invariant
+  // pointer the matcher admitted, loading each ONCE here -- in the enclosing
+  // block, where mem2reg can still see the whole live range of the slot -- and
+  // registering the loaded SSA value in `hoistedCells` so that `loadPlace`
+  // returns it instead of emitting a `memref.load` inside the region. Without
+  // this the loop lifts and then fails legalization: mem2reg will not promote
+  // an alloca whose uses live in a nested region unless the parent implements
+  // `PromotableRegionOpInterface`, and `emitrust.for` implements none.
+  //
+  // ALL THREE cells go together (cursor, nullable discriminant, enum-of-bases
+  // discriminant): every one of them is read through the single `loadPlace`
+  // seam, so a nullable pointer's `assert!` and a multi-base pointer's dispatch
+  // come free. Any cell that stays a `memref.load` -- because the load is dead
+  // here, say -- is DCE'd after mem2reg promotes the slot.
+  //
+  // `pointerLocals` may legitimately have no entry (a pointer whose region
+  // analysis declined it). Skipping it is safe in the LOUD direction: the read
+  // stays a `memref.load`, the alloca survives, and `convert-to-emitrust`
+  // emits its existing located error. Incompleteness never becomes a wrong
+  // answer.
+  //
+  // The set is TRANSITIVE over `PointerLocalInfo::base`. A member-array decay
+  // (`int16_t *const ring = w->ring;`) subscripts the ROOT's element run at the
+  // root's own cursor on every use (ImportC.cpp's root-cursor path), so reading
+  // the decayed local inside the region also reads `w`'s cell -- and `w` need
+  // not appear in the body at all, so the matcher never saw it. Each root is
+  // re-proved invariant on its own terms before it is hoisted; a root that
+  // fails is simply not hoisted, and the located legalization error stands.
+  llvm::SmallVector<Value, 6> hoistedHere;
+  llvm::SmallPtrSet<const clang::VarDecl *, 8> visited;
+  llvm::SmallVector<const clang::VarDecl *, 8> worklist(
+      range.hoistPointers.begin(), range.hoistPointers.end());
+  while (!worklist.empty()) {
+    const clang::VarDecl *var = worklist.pop_back_val();
+    if (!visited.insert(var).second)
+      continue;
+    auto info = pointerLocals.find(var);
+    if (info == pointerLocals.end())
+      continue;
+    for (Value cell : {info->second.cursorCell, info->second.nonNullCell,
+                       info->second.baseIndexCell}) {
+      // An outer lifted `for` may already have hoisted this cell; its value
+      // dominates this block too, so reuse it and leave the outer loop owning
+      // the restore.
+      if (!cell || !llvm::isa<MemRefType>(cell.getType()) ||
+          hoistedCells.contains(cell))
+        continue;
+      hoistedCells[cell] =
+          builder.create<memref::LoadOp>(loc, cell, ValueRange()).getResult();
+      hoistedHere.push_back(cell);
+    }
+    if (const clang::VarDecl *base = info->second.base)
+      if (base->getType().getCanonicalType()->isPointerType() &&
+          !stmtWritesVar(stmt->getBody(), base) &&
+          !addressTaken.contains(base))
+        worklist.push_back(base);
+  }
+  // Every entry maps a `Value` of the function being emitted. It must be gone
+  // before this call returns on ANY path -- success, body failure, or the
+  // staleness error below. Under `--recover` the failed function's ops are
+  // ERASED, so a surviving entry is a dangling `Value` the next function's
+  // first `loadPlace` would hand out: a measured segfault on `antirez/sds.c`,
+  // not a theoretical one.
+  auto dropHoists = [&] {
+    for (Value cell : hoistedHere)
+      hoistedCells.erase(cell);
+  };
 
   auto forOp =
       builder.create<emitrust::ForOp>(loc, loValue, hiValue, stepValue,
@@ -5631,8 +5802,30 @@ LogicalResult CImporter::emitRangeFor(const RangeFor &range,
     inductionValues[range.iv] = *savedInduction;
   else
     inductionValues.erase(range.iv);
-  if (failed(bodyResult))
+  if (failed(bodyResult)) {
+    dropHoists();
     return failure();
+  }
+
+  // The marker contract: a hoisted value is read once and reused for every
+  // iteration, so a STORE to a hoisted cell inside the region would make it
+  // stale -- the one way this mechanism could silently miscompile. The
+  // matcher's invariance clause is supposed to make that unreachable; prove it
+  // at emission rather than trust it, because the failure mode is a wrong
+  // answer that compiles clean.
+  bool stale = forOp.getRegion()
+                   .walk([&](memref::StoreOp store) {
+                     return hoistedCells.contains(store.getMemRef())
+                                ? WalkResult::interrupt()
+                                : WalkResult::advance();
+                   })
+                   .wasInterrupted();
+  if (stale) {
+    dropHoists();
+    return emitError(loc) << "unsupported: loop-invariant pointer state is "
+                             "written inside the lifted `for` body";
+  }
+  dropHoists();
 
   if (!isTerminated(builder.getInsertionBlock()))
     builder.create<emitrust::YieldOp>(loc);

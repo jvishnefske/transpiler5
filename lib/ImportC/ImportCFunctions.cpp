@@ -994,6 +994,9 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   currentHasLabels = containsLabelStmt(func->getBody());
   currentFunctionBody = func->getBody();
   placeBackedScalars.clear();
+  // FR-61f-c: a hoisted cell value never outlives the function it was loaded
+  // in (see `resetPerFunctionState`).
+  hoistedCells.clear();
   // FR-61f-d: a body that failed mid-emit must not leave the structured-if
   // mode latched on for the NEXT function.
   liftedForDepth = 0;
@@ -1583,6 +1586,9 @@ CImporter::importLiftedLambdaBody(const PendingLiftedLambda &pending) {
   currentHasLabels = containsLabelStmt(body);
   currentFunctionBody = body;
   placeBackedScalars.clear();
+  // FR-61f-c: a hoisted cell value never outlives the function it was loaded
+  // in (see `resetPerFunctionState`).
+  hoistedCells.clear();
   // FR-61f-d: a body that failed mid-emit must not leave the structured-if
   // mode latched on for the NEXT function.
   liftedForDepth = 0;
@@ -1949,6 +1955,9 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
   currentHasLabels = containsLabelStmt(func->getBody());
   currentFunctionBody = func->getBody();
   placeBackedScalars.clear();
+  // FR-61f-c: a hoisted cell value never outlives the function it was loaded
+  // in (see `resetPerFunctionState`).
+  hoistedCells.clear();
   // FR-61f-d: a body that failed mid-emit must not leave the structured-if
   // mode latched on for the NEXT function.
   liftedForDepth = 0;

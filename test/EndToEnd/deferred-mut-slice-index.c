@@ -110,8 +110,20 @@ static long switch_index(char *s, unsigned long avail, unsigned long len) {
 // the narrowed borrow test must leave that alone. Emitting this without `mut`
 // is rustc E0384, so `--build` is the pin; the walking cursor also makes the
 // stdout diff sensitive to the offset actually used at each iteration.
+//
+// FR-61f-c slice 1 moved this function's RENDERING forward and the pin moves
+// with it, unweakened. The body reads the pointer parameter `s`, which used to
+// force the whole loop down the cf `while` lowering; `s` is body-invariant, so
+// the loop now lifts to `emitrust.for` and the counter is the range head
+// instead of a loop-carried value -- `loop { ... }` with a carried `v17`
+// became `for _i_1 in 0u64..len`. The cursor is therefore no longer an
+// SSA-carried temporary but the named place `off`, which is exactly why the
+// binding name and the initializer form below had to change. What the guard
+// asserts has not: the binding that indexes the mutable borrow still carries
+// `mut`, and it is still the SAME binding at both program points.
 // CHECK-LABEL: fn tu0_loop_index
-// CHECK:         let mut [[CUR:v[0-9]+]]: i64 = v
+// CHECK:         let mut [[CUR:[A-Za-z_0-9]+]]: i64;
+// CHECK:         for {{.*}} in 0u64..len {
 // CHECK:         &mut (*s)[
 // CHECK-SAME:    [[CUR]] as usize..];
 static long loop_index(char *s, unsigned long avail, unsigned long len) {

@@ -1655,6 +1655,14 @@ struct RangeFor {
   const clang::Expr *hi;    ///< HI: upper bound (loop-invariant)
   int64_t step;             ///< K: positive constant step
   bool inclusive;           ///< `i <= HI` (renders `..=`) vs `i < HI`
+  /// FR-61f-c slice 1: the pointer-typed body variables the matcher admitted
+  /// under the BODY-INVARIANCE clause (never written in the body, address
+  /// never taken). `emitRangeFor` pre-loads each one's decomposition cells
+  /// into `hoistedCells` before it creates the `emitrust.for`, so every read
+  /// inside the region is an SSA value instead of a `memref.load` MLIR's
+  /// mem2reg cannot promote out of a nested region. Kept in source order so
+  /// the emitted load sequence is deterministic.
+  llvm::SmallVector<const clang::VarDecl *, 4> hoistPointers;
 };
 
 /// FR-129 half (b): one recognized `<ctype.h>` classifier use (defined with
@@ -4970,6 +4978,16 @@ private:
   /// falls through to the already-correct CFG `while` lowering.
   std::optional<RangeFor> matchRangeFor(const clang::ForStmt *stmt);
 
+  /// FR-61f-c slice 1: whether `var`, a variable the range-`for` `body`
+  /// references, is a pointer whose decomposition state is provably
+  /// LOOP-INVARIANT and therefore hoistable out of the `emitrust.for` region.
+  /// Purely syntactic on the clang AST (plus the function-wide `addressTaken`
+  /// set), because `matchRangeFor` runs once in the `collectRangeForPlaceScalars`
+  /// PRE-PASS -- before `pointerRegions.analyze`, when `pointerLocals` is still
+  /// empty -- and must return the same answer both times.
+  bool rangeForBodyPointerIsHoistable(const clang::VarDecl *var,
+                                      const clang::Stmt *body);
+
   /// FR-61f: true when emitting `stmt` inside an `emitrust.for` body would
   /// create cf basic blocks or a jump edge. A nested `for` that itself
   /// matches `matchRangeFor` is the one exception -- it emits a nested
@@ -6642,6 +6660,24 @@ private:
   /// directly -- no place, no seed store, no `let i` binding. An outer
   /// induction stays registered while a nested loop body emits.
   llvm::DenseMap<const clang::VarDecl *, mlir::Value> inductionValues;
+  /// FR-61f-c slice 1: entry-block pointer cell (`memref<...>`) mapped to the
+  /// value LOADED OUT OF IT once, immediately before the enclosing
+  /// `emitrust.for` was created. `loadPlace` returns the mapped value instead
+  /// of emitting a `memref.load`, which is the whole mechanism: MLIR's mem2reg
+  /// refuses to promote a slot whose uses live in a nested region unless the
+  /// parent op implements `PromotableRegionOpInterface`, and `emitrust.for`
+  /// implements none -- so a cursor read inside the region leaves a
+  /// `memref.alloca` that `convert-to-emitrust` rejects outright. Populated
+  /// only for pointers `matchRangeFor` proved body-INVARIANT, so the single
+  /// load is sound; `emitRangeFor` asserts that by walking the finished region
+  /// for a store to any hoisted cell.
+  ///
+  /// Every entry is a `Value` into the function CURRENTLY being emitted, so it
+  /// MUST be restored on every exit from `emitRangeFor` and cleared at every
+  /// function boundary -- including the FR-52 recovery reset, which ERASES the
+  /// failed function's ops and would otherwise leave dangling values here for
+  /// the next item that reads a place.
+  llvm::DenseMap<mlir::Value, mlir::Value> hoistedCells;
   /// FR-61f-d: nesting DEPTH of the lifted `emitrust.for` bodies currently
   /// being emitted. Nonzero means the insertion point is inside an
   /// `emitrust.for` region, so `emitIfStmt` must emit a structured
