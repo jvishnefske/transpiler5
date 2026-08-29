@@ -55,12 +55,15 @@ import epoch as epoch_mod  # noqa: E402  (the epoch/drift authority is shared)
 
 EMITRUST_CC = os.environ.get("EMITRUST_CC", "./build/bin/emitrust-cc")
 
-# The authoritative ratchet baseline. Pinned to epoch-4 (the union corpus
-# test/EndToEnd x {.c,.cpp}, measurability-filtered). THREE consumers must
+# The authoritative ratchet baseline. Pinned to epoch-5 (the union corpus
+# test/EndToEnd x {.c,.cpp}, measurability-filtered, re-probed at f734fed).
+# Epoch-4 was CLOSED when FR-61f-c legitimately edited a pinned EndToEnd test;
+# its baseline document stays byte-untouched as history and the two totals are
+# NOT a trajectory (different populations). THREE consumers must
 # name this same document -- this default, signals.py's DEFAULT_CLIPPY, and
 # controller.py's CLIPPY_BASELINE, which `--update`s and COMMITS it. If they
 # diverge, the controller commits a file the ratchet never reads.
-DEFAULT_BASELINE = os.path.join(HERE, "clippy-baseline-epoch4.json")
+DEFAULT_BASELINE = os.path.join(HERE, "clippy-baseline-epoch5.json")
 
 
 class PinError(Exception):
@@ -111,7 +114,8 @@ def crate_dir_name(cfile):
     corpus can hold `foo.c` and `foo.cpp`: keyed by stem alone the second
     would overwrite the first in the shared workdir and one file's warnings
     would vanish from the tally with nothing to show for it. (Measured 0 stem
-    collisions across epoch-4's 238 files, so this is a latent hazard closed
+    collisions across epoch-4's 238 files and epoch-5's 244, so this is a
+    latent hazard closed
     before it fires, not a live bug fix. The crate NAME is unchanged, so no
     emitted byte moves.)
     """

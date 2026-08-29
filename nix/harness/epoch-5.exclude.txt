@@ -1,0 +1,63 @@
+# epoch-5 EXCLUSIONS -- files that are UNMEASURABLE at emitter rev f734fed.
+#
+# Criterion (epoch.py module docstring, unchanged from epoch-4): a file is
+# measurable only if (a) `emitrust-cc --emit=crate` produces a crate AND
+# (b) `cargo clippy` on that crate yields a COMPLETE tally -- it may fail on a
+# deny-by-default clippy lint (that failure IS the tally) but must not fail on
+# a rustc error, which truncates the count. Every path below fails step (a),
+# so no crate exists for clippy to lint and the epoch's metric is undefined
+# for it; clippy_eval would silently skip it anyway. Each is a LOCATED
+# `error: unsupported:` rejection (or a split-file lit test that is not a
+# standalone TU) -- the designed behaviour, not a crash.
+#
+# RE-PROBED AT f734fed over all 264 test/EndToEnd {.c,.cpp} files, not copied
+# from epoch-4: 244 measurable, 20 unmeasurable. The list is IDENTICAL to
+# epoch-4's, with identical diagnostics -- no epoch-4 file lost measurability,
+# and no epoch-4 exclusion gained it. Zero files failed step (b): the only two
+# crates whose `cargo clippy` exits non-zero (math-sin.c, printf-formats.c) do
+# so on deny-by-default `clippy::approx_constant`, which IS the tally.
+#
+# Measurability is a property of THIS revision. A file that starts
+# transpiling later does not join epoch-5; that is a new population, i.e. a
+# new epoch.
+
+# unsupported: function 'bump1' is referenced but not defined in any translation unit
+test/EndToEnd/actor-link-lift.c
+# unsupported: extern global variable 'X_COUNT' is referenced but not defined in any translation unit
+test/EndToEnd/actor-partition-lift.c
+# fatal error: 'keep.h' file not found -- a split-file lit test, not a standalone TU
+test/EndToEnd/cpp-cross-tu-record-odr.cpp
+# unsupported: taking the address of undefined function 'default_csprng'
+test/EndToEnd/fnptr-extern-def.c
+# unsupported: function 'offset' is referenced but not defined in any translation unit
+test/EndToEnd/fnptr-undefined-recover.c
+# unsupported: destructor with no definition in this translation unit
+test/EndToEnd/incremental-builds.cpp
+# unsupported builtin type 'unsigned __int128'
+test/EndToEnd/incremental-leaked-stub-containment.cpp
+# unsupported: extern global variable 'SHARED_COUNTER' is referenced but not defined in any translation unit
+test/EndToEnd/link-merge-e2e.c
+# unsupported: pointer-typed global variable
+test/EndToEnd/link-reimport-e2e.c
+# unsupported: function 'ping' is referenced but not defined in any translation unit
+test/EndToEnd/link-workspace-cycle-e2e.c
+# unsupported: function 'calc' is referenced but not defined in any translation unit
+test/EndToEnd/link-workspace-e2e.c
+# unsupported: function 'unrelated_g1' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu-gate-g1-fnptr-result-erasure.c
+# unsupported: function 'unrelated_g3' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu-gate-g3-owner-fallback.c
+# unsupported: function 'reset_region' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu-gate-g5-region-api.c
+# unsupported: function 'use_sum4' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu-gate-g6-cellslice-fn-external.c
+# unsupported: function 'unrelated_g8' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu-gate-g8-ptr-global-external.c
+# unsupported: pointer-typed global variable
+test/EndToEnd/multi-tu-gate-g8-shared-header.c
+# unsupported: extern global variable 'SHARED_COUNTER' is referenced but not defined in any translation unit
+test/EndToEnd/multi-tu.c
+# unsupported: pointer-to-pointer parameter escapes the cursor-parameter shape
+test/EndToEnd/planner-rejection-builds.c
+# unsupported: volatile-qualified type
+test/EndToEnd/recover-partial.cpp
