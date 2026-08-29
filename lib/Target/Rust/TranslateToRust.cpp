@@ -49,6 +49,7 @@
 #include "EmitRust/EmitRustDialect.h"
 #include "EmitRust/EmitRustOps.h"
 #include "EmitRust/EmitRustTypes.h"
+#include "EmitRust/RustCasing.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -69,6 +70,7 @@
 #include "llvm/ADT/Twine.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include <cassert>
@@ -246,6 +248,61 @@ private:
   /// Returns the Rust name previously bound to `value`, or a located error
   /// if the value has not been defined yet.
   FailureOr<std::string> lookupName(Location loc, Value value);
+
+  /// FR-140: records that `name` is being RENDERED as a binding (an item
+  /// name, a parameter, a `let`) inside the item currently being emitted,
+  /// so that item can be given `#[allow(non_snake_case)]` if rustc would
+  /// otherwise reject the spelling. A doubled underscore is perfectly legal
+  /// C (`m__em`) and the emitter preserves the C spelling verbatim, so
+  /// without this the emitted crate failed its OWN denied lint table: exit
+  /// 0, unbuildable, no diagnostic anywhere.
+  ///
+  /// Only under the idiomatic rename: `--preserve-c-names` allows the three
+  /// naming lints in the crate root instead of denying them (verbatim C
+  /// spellings legitimately trip them, and keeping them is the flag's whole
+  /// point), so a per-item attribute there would be redundant noise on
+  /// every existing golden.
+  void noteBoundName(StringRef name) {
+    if (noteBoundNames && emitrust::idiomaticRenameEnabled() &&
+        emitrust::tripsNonSnakeCase(name))
+      itemTripsNonSnakeCase = true;
+  }
+
+  /// FR-140: opens the `#[allow(non_snake_case)]` scope of an item whose
+  /// tripping names are only discovered while its BODY is rendered (a
+  /// function: its locals). Returns the buffer offset the item starts at,
+  /// for `closeNonSnakeCaseScope`. Items whose names are all known up front
+  /// (a struct's fields, a trait's methods) test `tripsNonSnakeCase`
+  /// directly and never open a scope.
+  size_t openNonSnakeCaseScope() {
+    os.flush();
+    itemTripsNonSnakeCase = false;
+    return buffer.size();
+  }
+
+  /// FR-140: prefixes the item rendered from `itemStart` onward with
+  /// `#[allow(non_snake_case)]` when it bound a name rustc's lint would
+  /// reject. The attribute goes on the ITEM because that is where rustc
+  /// honours it: measured, an allow on a struct FIELD is ignored outright
+  /// and the lint still fires, while one on the struct, on the fn, or on
+  /// the let works. The item's own indentation is copied off its first
+  /// rendered line, so a method nested in an `emitrust.impl` lines up.
+  ///
+  /// This ADDS an attribute and removes nothing -- the reason the direction
+  /// was chosen over collapsing the underscore run, which would need a
+  /// uniquifier and a collision diagnostic (`m__base` -> `m_base` against a
+  /// C source that also spells `m_base`). The worst a wrong answer here can
+  /// do is suppress one lint on one item; it cannot miscompile.
+  void closeNonSnakeCaseScope(size_t itemStart) {
+    if (!itemTripsNonSnakeCase)
+      return;
+    itemTripsNonSnakeCase = false;
+    os.flush();
+    StringRef item = StringRef(buffer).substr(itemStart);
+    size_t indent = item.size() - item.ltrim(' ').size();
+    buffer.insert(itemStart,
+                  std::string(indent, ' ') + "#[allow(non_snake_case)]\n");
+  }
 
   /// Emits `value` at the syntactic position `pos`: its captured inline
   /// expression (parenthesized per `needsParens`) when FR-61d inlined it,
@@ -553,6 +610,18 @@ private:
   /// Builtin method spellings (`unwrap`, `len`, ...) and Phase-4 C owner
   /// methods never appear as keys, so they pass through verbatim.
   llvm::StringMap<std::pair<llvm::StringRef, llvm::StringRef>> methodRustNames;
+
+  /// FR-140: set when a name RENDERED inside the item under emission would
+  /// trip rustc's `non_snake_case` lint; consumed (and reset) by
+  /// `closeNonSnakeCaseScope`.
+  bool itemTripsNonSnakeCase = false;
+
+  /// FR-140: cleared around the `assignName` calls that name a binding which
+  /// is known NOT to render -- an FR-61a tail fold, an FR-61d inline capture
+  /// or drop, all of which still claim a name so the surviving v-numbering is
+  /// unchanged. A spelling that never reaches the output cannot trip a lint,
+  /// and an attribute nobody needs is a byte shift in a golden.
+  bool noteBoundNames = true;
 
   /// Per-function map from SSA values to their Rust binding names.
   DenseMap<Value, std::string> valueNames;
@@ -1016,6 +1085,11 @@ std::string RustEmitter::claimName(Value value, StringRef base) {
     candidate = (stem + "_" + Twine(i)).str();
   usedBindingNames.insert(candidate);
   valueNames[value] = candidate;
+  // FR-140: the ONLY producer of a binding spelling that can trip
+  // `non_snake_case` -- a generated `vN`/`_vN` never can -- so noting it
+  // here covers every named local, named parameter, loop induction variable
+  // and match payload binding at once.
+  noteBoundName(candidate);
   return candidate;
 }
 
@@ -3289,6 +3363,11 @@ void RustEmitter::emitEscapedStringLiteral(StringRef value) {
 }
 
 LogicalResult RustEmitter::emitLetPrologue(Value result, bool isMut) {
+  // FR-140: the two folds below assign a name that never renders; read the
+  // pending flags BEFORE `assignName` so such a name cannot force an
+  // `#[allow(non_snake_case)]` onto the enclosing function.
+  llvm::SaveAndRestore<bool> notes(noteBoundNames,
+                                   !pendingTailFold && !pendingInlineCapture);
   std::string name = assignName(result);
   // FR-61a fold: the binding never renders -- the right-hand side that
   // follows becomes the function's tail expression (its trailing `;` is
@@ -3364,6 +3443,9 @@ FailureOr<bool> RustEmitter::emitDropOrCapture(Operation &op) {
   // FR-61d: a dropped pure op emits nothing. Its result is still named so
   // the surviving v-numbering matches the un-dropped rendering exactly.
   if (droppedOps.count(&op)) {
+    // FR-140: a dropped op renders nothing at all, so its name cannot trip a
+    // lint either.
+    llvm::SaveAndRestore<bool> notes(noteBoundNames, false);
     assignName(op.getResult(0));
     return true;
   }
@@ -4105,6 +4187,15 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   Operation *op = funcOp.getOperation();
   auto fn = cast<FunctionOpInterface>(op);
 
+  // FR-140: a function is the item that carries the allow for its OWN name,
+  // its parameters and its locals -- all three are `non_snake_case` sites and
+  // rustc honours the attribute on the fn for all of them. Which locals exist
+  // is only known once the body has been walked, so the item is rendered into
+  // the emitter's buffer first and the attribute inserted ahead of it after
+  // the fact; deciding up front would mean guessing, and a guess that says
+  // "yes" too often is a byte shift in a golden.
+  const size_t itemStart = openNonSnakeCaseScope();
+
   // Each function opens a fresh value-naming scope: v0, v1, ...
   valueNames.clear();
   valueCount = 0;
@@ -4241,6 +4332,10 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   if (auto rustName =
           op->getAttrOfType<StringAttr>(emitrust::kMethodRustNameAttrName))
     printedName = rustName.getValue();
+  // FR-140: the function's own name. A file-static's FR-73 per-TU prefix
+  // composes onto the C spelling (`tu0_mix__up`), so a name that was clean
+  // in C can still arrive here tripping.
+  noteBoundName(printedName);
   // FR-139: an EXPORTED function whose whole signature is C-ABI scalar is
   // additionally given a bare C symbol, so a dlopen/dlsym host can call it
   // through an ordinary C declaration. Everything else keeps the plain
@@ -4333,6 +4428,7 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
     return failure();
   decreaseIndent();
   os << "}\n";
+  closeNonSnakeCaseScope(itemStart);
   return success();
 }
 
@@ -4605,7 +4701,9 @@ LogicalResult RustEmitter::emitIfExprBinding(Operation *op, Value result,
                                              emitrust::IfOp ifOp) {
   (void)op;
   // The name is assigned unconditionally so v-numbering stays stable even
-  // when the binding folds away.
+  // when the binding folds away. FR-140: when it does fold away it never
+  // renders, so it must not pull an `#[allow(non_snake_case)]` onto the fn.
+  llvm::SaveAndRestore<bool> notes(noteBoundNames, !pendingTailFold);
   std::string name = assignName(result);
   // FR-61d slice 3: when this binding is the tail-fold candidate the `let`
   // prefix never renders -- the if-expression itself becomes the
@@ -5645,6 +5743,16 @@ LogicalResult RustEmitter::emitMatch(emitrust::MatchOp matchOp) {
 
 LogicalResult RustEmitter::emitTraitDef(emitrust::TraitDefOp traitDefOp) {
   Location loc = traitDefOp.getLoc();
+  // FR-140: an FR-52 requirement trait declares its methods under the C
+  // function spellings that must satisfy them, so a `__` in the C name lands
+  // on a trait method declaration -- a `non_snake_case` site. The binder
+  // names the declaration synthesizes are `v0, v1, ...` and never trip.
+  if (emitrust::idiomaticRenameEnabled() &&
+      llvm::any_of(traitDefOp.getFnNames(), [](Attribute nameAttr) {
+        return emitrust::tripsNonSnakeCase(
+            cast<StringAttr>(nameAttr).getValue());
+      }))
+    os << "#[allow(non_snake_case)]\n";
   os << "pub trait " << traitDefOp.getSymName() << " {\n";
   increaseIndent();
   for (auto [nameAttr, typeAttr] : llvm::zip_equal(traitDefOp.getFnNames(),
@@ -5736,6 +5844,19 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   // propagates them to embedding structs, or the failure surfaces as rustc
   // E0204 instead of failing review.
   bool copyable = !nonCopyStructNames.contains(structDefOp.getSymName());
+  // FR-140: a FIELD spelled with an interior double underscore (C's `m__em`,
+  // kept verbatim) trips rustc's denied `non_snake_case`, and the allow is
+  // IGNORED on the field itself (measured -- the lint still fires); it is
+  // honoured on the struct, which covers every field at once. The struct's
+  // own name cannot trip: type names go through `toUpperCamelCase`, which
+  // drops underscores entirely. Emitted only when some field trips, so a
+  // struct of clean names stays byte-identical.
+  if (emitrust::idiomaticRenameEnabled() &&
+      llvm::any_of(structDefOp.getFieldNames(), [](Attribute nameAttr) {
+        return emitrust::tripsNonSnakeCase(
+            cast<StringAttr>(nameAttr).getValue());
+      }))
+    os << "#[allow(non_snake_case)]\n";
   os << "#[derive(Clone" << (copyable ? ", Copy" : "")
      << (derivable ? ", Default" : "") << ")]\n";
   // A field-less struct_def (C's `struct T {};`) prints unit-like with an
@@ -5833,6 +5954,15 @@ LogicalResult RustEmitter::emitDataEnumDef(emitrust::DataEnumDefOp defOp) {
   // closure (emitModule's pre-pass) to walk variant payload fields here
   // too, or a non-Copy payload resurrects rustc E0204 under a derive the
   // emitter chose.
+  // FR-140 RECORDED NON-GAP: a data variant's payload FIELDS would be
+  // `non_snake_case` sites exactly like a struct's, but no C or C++ spelling
+  // can reach one today -- both producers hard-code the field name "v"
+  // (`CImporter::getOrCreateThrowsEnum` and the std::variant mapping in
+  // ImportCTypes), as they do the variant names V0/V1 and Ok0/Err0. So there
+  // is deliberately NO allow here: it would be emitter code no test could
+  // reach. A wave that admits a SOURCE-SPELLED payload field name must add
+  // one, the same shape as `emitStructDef`'s, or resurrect the exit-0
+  // unbuildable crate this FR exists to remove.
   os << "#[derive(Clone, Copy)]\n";
   StringRef pub = typePartVisibility();
   os << pub << "enum " << defOp.getSymName() << " {\n";

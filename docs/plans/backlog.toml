@@ -173,7 +173,7 @@ anchor = "FR-139 FEATURE (the TRACTOR `_lib` submission packaging layer"
 id = "FR-140"
 rank = 15
 kind = "defect"
-status = "open"
+status = "landed"
 size = "S"
 title = "A double-underscore C identifier emits a crate that fails its own lint table"
 summary = "Found by FR-138's corpus sweep 2026-08-28. `static int m__base;` emits `tu0_m__base` and the manifest's [lints.rust] non_snake_case = \"deny\" rejects it -- exit 0, unbuildable, no diagnostic. Reproduced directly and it is TWO errors, not one (synthesized FIELD and local VARIABLE both trip it), on a BINARY crate, so this is not specific to FR-139's cdylib path. rustc's is_snake_case forbids a doubled underscore anywhere in the name core; m__base is legal C and the corpus's float2half_lib/half2float_lib both carry it (2 of FR-138's BUILD_FAIL cases). FR-139's known residual covers the CRATE NAME only; this is wider. Directions: (a) collapse underscore runs in the idiomatic-rename path -- byte-shifting, every golden pins spellings; (b) omit the deny when the emitter knows it produced a tripping name -- narrow and byte-neutral, but disarms the tripwire crate-wide; (c) reject with a located diagnostic -- honest and cheapest, converts 2 BUILD_FAIL into EMIT_FAIL without gaining a point. NOT SPIKED."

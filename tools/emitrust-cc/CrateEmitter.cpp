@@ -199,28 +199,15 @@ static unsigned cMainInputCount(mlir::ModuleOp module) {
 }
 
 /// FR-139: would rustc's `non_snake_case` lint fire on a CRATE named `name`?
+/// The predicate exists so the emitted manifest's own deny table cannot veto
+/// the crate name the caller asked for -- see `renderCargoToml`.
 ///
-/// Mirrors rustc's own `is_snake_case`: leading and trailing underscores are
-/// ignored, and what remains may hold no uppercase letter and no doubled
-/// underscore. The predicate exists so the emitted manifest's own deny table
-/// cannot veto the crate name the caller asked for -- see `renderCargoToml`.
+/// FR-140 moved the body to `EmitRust/RustCasing.h` and shares it with the
+/// Rust emitter, which asks the SAME question about every item name it
+/// renders. Two spellings of "would rustc reject this?" that could drift is
+/// precisely the failure this crate's naming headers exist to prevent.
 static bool crateNameTripsNonSnakeCase(llvm::StringRef name) {
-  llvm::StringRef core = name.trim('_');
-  if (core.empty())
-    return false;
-  bool previousWasUnderscore = false;
-  for (char c : core) {
-    if (c >= 'A' && c <= 'Z')
-      return true;
-    if (c == '_') {
-      if (previousWasUnderscore)
-        return true;
-      previousWasUnderscore = true;
-    } else {
-      previousWasUnderscore = false;
-    }
-  }
-  return false;
+  return mlir::emitrust::tripsNonSnakeCase(name);
 }
 
 std::string renderCargoToml(llvm::StringRef crateName, CrateType type,
