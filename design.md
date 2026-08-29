@@ -9661,24 +9661,68 @@ piece and becomes FR-45.
   file is referenced by no lit test, so re-measuring the kernel corpus is a
   separate act; the count is stale until someone does it.
 
-- [ ] FR-150 DEFECT (found by the systemd probe 2026-08-28): an emitted type
-  whose C name collides with the RUST PRELUDE shadows it and breaks the crate.
-  systemd's `src/shared/options.h:45` ends `} Option;`, so the importer emits
-  `pub struct Option { .. }` -- after which every `Option<fn()>` the emitter
-  writes for a function pointer parses as that struct:
-      error[E0107]: struct takes 0 generic arguments but 1 generic argument
-                    was supplied
-  **123 of the 158 build failures in the systemd corpus are this one bug.**
-  It generalizes: ANY C project with a type named `Option`, `Result`, `Box`,
-  `String` or `Vec` hits it. Exit-0 unbuildable with no diagnostic -- the same
-  class as FR-140/141/142/146, and the reason `scripts/external-probe.py`'s
-  16-repo corpus never saw it is simply that none of those repos names a type
-  `Option`.
-  DIRECTION: rename or qualify emitted items that collide with the prelude.
-  Note the emitter's own `Option<...>` spellings are unqualified today, so
-  either the emitted type is renamed or the emitter's uses become
-  `::core::option::Option`.
-  **NOT SPIKED.**
+- [x] FR-150 DEFECT (found by the systemd probe 2026-08-28; SPIKED AND FIXED
+  2026-08-29): an emitted type whose name collides with the RUST PRELUDE shadows
+  it and breaks the crate. systemd's `src/shared/options.h` ends `} Option;`, so
+  the importer emits `pub struct Option { .. }` and every `Option<fn()>` the
+  emitter writes then parses as that struct (E0107, E0599, E0308). Exit-0
+  unbuildable with no diagnostic -- the FR-140/141/142/146 class.
+  **SYSTEMD: 1427/1585 -> 1532/1585 crates build clean. 105 crates recovered
+  from one change.** After it, the ONLY remaining error code across all 1585 is
+  E0596 (53 crates), the separate pre-existing borrow defect filed as FR-153.
+  **MY OWN CAVEAT WAS WRONG, AND MEASURING SETTLED IT.** I predicted the "123
+  crates" figure would OVERCOUNT because FR-133 (landed the day before) drops
+  the `Option` wrapper for a fn-ptr LOCAL, and my first repro -- which used
+  exactly that shape -- did build clean. Re-measured at HEAD, post-FR-133: all
+  123 still failed. FR-133 masks the collision ONLY for locals, and systemd's
+  bites at PARAMETERS, STRUCT MEMBERS and GLOBALS, which FR-133 deliberately
+  left wrapped. The prediction was reasonable and false; the number stands.
+  FOUR PRELUDE NAMES, not one, and the exclusions were probed rather than
+  assumed: `Option`, `Box`, `String`, `Vec` are the four the emitter genuinely
+  writes. `Result` is written zero times. `Some`/`None` live in the VALUE
+  namespace -- a braced `struct Some { .. }` does not shadow the tuple-variant
+  constructor. `Clone`/`Copy`/`Default` live in the MACRO namespace --
+  `struct Clone {}` plus `#[derive(Clone)]` builds clean. Each was probed; none
+  needed covering.
+  Detection is on the EMITTED name (walking StructDefOp/EnumDefOp/DataEnumDefOp),
+  so `my_option` -> `MyOption` is safe while `option`/`OPTION`/`Option` all
+  collide, and struct/enum/union/typedef are covered because all land in one of
+  those three ops. Each name is decided independently; an empty shadow set makes
+  every rewrite the identity BY CONSTRUCTION.
+  QUALIFIED CONDITIONALLY, and the two alternatives were rejected for stated
+  reasons: unconditional qualification would shift emitted bytes across the
+  whole corpus and make every fn-ptr signature unreadable for a defect affecting
+  a handful of crates; renaming the user's type is user-visible in a way
+  qualification is not, since `pub struct Option` is part of the emitted API
+  surface that FR-139's `--c-abi-exports` and the lib-crate story depend on.
+  **THE SPEC'S SUGGESTED PATHS WERE WRONG and the implementation corrected
+  them**: `::alloc::boxed::Box` does NOT resolve, because `alloc` is not in the
+  extern prelude of a std crate without `extern crate alloc;`. Emitted crates
+  are unconditionally std (`std::process::exit`, `println!`), so all four use
+  `::std::` with a leading `::` to stay absolute. Both spellings were
+  rustc-verified beside shadowing structs before the choice was made.
+  TWO NARROWINGS ARE LOAD-BEARING: the token rewriter skips double-quoted
+  string literals (a C program printing "Vec" must keep printing it) and any
+  identifier already preceded by `::` or `.`; and the call-callee rewrite is
+  gated on a CLOSED ALLOWLIST, because `Node::default()` is emitted through the
+  identical code path as `Box::new(..)` in every `unique_ptr` crate -- a blanket
+  first-segment rewrite would have broken user static methods. Both are pinned
+  in one golden function.
+  SAFETY POSTURE: a site the rewrite does not reach keeps today's behaviour,
+  which is a LOUD rustc error. The change can only turn unbuildable crates into
+  buildable ones; it cannot miscompile.
+  BYTE-NEUTRAL WHERE NOTHING SHADOWS, verified directly: a crate emitting
+  `Option<` three times but shadowing nothing keeps all three BARE with zero
+  qualified paths. Corpus delta measured with two separately built binaries --
+  521 EndToEnd crate roots: 5 files differ, all 5 the new tests; a wider 319-unit
+  sweep over Driver/Import/Project/RealWorld/Kernel/Fuzz: 1 differs, the new
+  Driver golden. **Zero pre-existing files gained a qualified path.**
+  RECORDED FOR THE NEXT WAVE: the emitted `mod actor_rt` block is a nested
+  module with no `use super::*`, so its own
+  `Option<std::thread::JoinHandle<()>>` resolves against the real prelude and is
+  deliberately left unqualified.
+  Clippy, paired against the epoch-5 pin: 231 -> 231 (+0). External build
+  oracle: 0 BUILD_FAIL.
 
 - [ ] FR-151 DEFECT (found by the systemd probe 2026-08-28): ANONYMOUS STRUCT
   NAMES ARE NOT TU-UNIQUE, so the FR-58 `--link` shard merge collides.

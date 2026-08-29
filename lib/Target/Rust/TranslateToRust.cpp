@@ -50,6 +50,7 @@
 #include "EmitRust/EmitRustOps.h"
 #include "EmitRust/EmitRustTypes.h"
 #include "EmitRust/RustCasing.h"
+#include "EmitRust/RustPreludeShadow.h"
 
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -677,6 +678,28 @@ private:
   /// rustc E0204 (the derived-over-`virtual ~B() = default`-base channel).
   /// Computed once per module in the same pre-pass as dropStructNames.
   llvm::StringSet<> nonCopyStructNames;
+
+  /// FR-150: the Rust PRELUDE names this module's own emitted type items
+  /// shadow (`Option`, `Box`, `String`, `Vec` -- the four the emitter
+  /// writes). Collected once per module in `emitModule`; EMPTY for every
+  /// crate that shadows nothing, which is what keeps the corpus
+  /// byte-identical. See include/EmitRust/RustPreludeShadow.h for why
+  /// qualification is conditional rather than unconditional, and why the
+  /// user's type is never renamed.
+  llvm::StringSet<> shadowedPreludeNames;
+
+  /// FR-150: how the emitter must spell prelude name `name` in THIS module --
+  /// bare when nothing shadows it, fully qualified when something does.
+  llvm::StringRef preludeSpelling(llvm::StringRef name) const {
+    return emitrust::preludeSpelling(name, shadowedPreludeNames);
+  }
+
+  /// FR-150: the same decision over an emitter-owned Rust FRAGMENT (an opaque
+  /// type spelling, a verbatim runtime helper), token by token. Returns the
+  /// text unchanged when nothing is shadowed.
+  std::string qualifyPrelude(llvm::StringRef text) const {
+    return emitrust::qualifyShadowedPreludeNames(text, shadowedPreludeNames);
+  }
 
   /// Whether `binding`'s (possibly lvalue-wrapped, possibly array-element)
   /// type is a struct that carries `emitrust.has_drop`.
@@ -3393,7 +3416,10 @@ LogicalResult RustEmitter::emitType(Location loc, Type type) {
     return success();
   }
   if (auto opaqueType = dyn_cast<emitrust::OpaqueType>(type)) {
-    os << opaqueType.getValue();
+    // FR-150: an opaque spelling is emitter-owned Rust text (`Vec<i8>`,
+    // `Box<Node>`, `Option<i64>`, `String`), so a shadowed prelude name in it
+    // is qualified; with nothing shadowed this is the value verbatim.
+    os << qualifyPrelude(opaqueType.getValue());
     return success();
   }
   if (auto refType = dyn_cast<emitrust::RefType>(type)) {
@@ -3432,7 +3458,7 @@ LogicalResult RustEmitter::emitType(Location loc, Type type) {
     // C99-43 C3: the argv table parameter — one owned NUL-terminated byte
     // vector per command-line argument, borrowed shared. The reference is
     // part of the rendering (the type only ever appears as a parameter).
-    os << "&[Vec<i8>]";
+    os << "&[" << preludeSpelling("Vec") << "<i8>]";
     return success();
   }
   if (auto structType = dyn_cast<emitrust::StructType>(type)) {
@@ -3452,7 +3478,7 @@ LogicalResult RustEmitter::emitType(Location loc, Type type) {
     // sentinel is ever needed. FR-133's proved-non-null LOCALS render the
     // inner signature alone through `emitBindingType`; every other position
     // (parameter, result, struct field, global, temporary) keeps the wrapper.
-    os << "Option<";
+    os << preludeSpelling("Option") << "<";
     if (failed(emitFnPtrSignature(loc, fnPtrType)))
       return failure();
     os << ">";
@@ -3699,7 +3725,7 @@ LogicalResult RustEmitter::emitDefaultValue(Location loc, Type type) {
     // but `emitVariable` renders it unconditionally for every
     // no-initializer `emitrust.variable`.
     if (opaqueType.getValue() == "String") {
-      os << "String::new()";
+      os << preludeSpelling("String") << "::new()";
       return success();
     }
     if (opaqueType.getValue() == "__EmitrustFile") {
@@ -3707,7 +3733,7 @@ LogicalResult RustEmitter::emitDefaultValue(Location loc, Type type) {
       return success();
     }
     if (opaqueType.getValue().starts_with("Vec<")) {
-      os << "Vec::new()";
+      os << preludeSpelling("Vec") << "::new()";
       return success();
     }
     // W2.20: the same defensive arm for the ordered associative
@@ -4265,6 +4291,12 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   // then propagate through struct-typed fields to a fixpoint: a struct
   // with a non-Copy field cannot derive Copy (E0204). Fields form a DAG
   // in the emitted image, so the fixpoint terminates trivially.
+  // FR-150: the shadowed-prelude set, collected before ANY item is rendered
+  // because the very first struct_def may already carry a fn-ptr field whose
+  // `Option<..>` needs the qualified spelling. A module that shadows nothing
+  // leaves this empty and every rendering below is byte-identical to what it
+  // was before this FR.
+  shadowedPreludeNames = emitrust::collectShadowedPreludeNames(moduleOp);
   nonCopyStructNames.clear();
   {
     llvm::SmallVector<emitrust::StructDefOp> structDefs(
@@ -4569,7 +4601,13 @@ LogicalResult RustEmitter::emitUse(emitrust::UseOp useOp) {
 }
 
 LogicalResult RustEmitter::emitVerbatim(emitrust::VerbatimOp verbatimOp) {
-  os << verbatimOp.getValue() << "\n";
+  // FR-150: every verbatim op in the image is one of the importer's fixed
+  // `__emitrust_*` runtime helpers (ImportCFunctions.cpp is the only producer),
+  // so its text is emitter-owned boilerplate -- and several of them spell
+  // `String` and `Vec<u8>`, which shadow like everything else. The rewrite
+  // skips string literals, so a helper's panic message and its output bytes
+  // are untouched.
+  os << qualifyPrelude(verbatimOp.getValue()) << "\n";
   return success();
 }
 
@@ -4955,6 +4993,16 @@ LogicalResult RustEmitter::emitCallOpaque(emitrust::CallOpaqueOp callOp) {
   if (!memberSymbol.empty() && mappedMember != methodRustNames.end() &&
       mappedMember->second.first == qualifier)
     os << qualifier << "::" << mappedMember->second.second << "(";
+  else if (shadowedPreludeNames.contains(qualifier) &&
+           emitrust::isEmitterPreludePath(callee))
+    // FR-150: `Box::new` / `String::from` / `Vec::new` and friends -- the
+    // closed set of associated paths the importer and emitter mint for the
+    // prelude families. The check is on the WHOLE callee, not just its first
+    // segment, because a USER static method prints through this very branch:
+    // `Node::default()` sits beside `Box::new(..)` in every unique_ptr crate,
+    // and a C++ class named `box` keeps its own `Box::<method>` calls.
+    os << emitrust::preludeQualifiedPath(qualifier) << "::" << memberSymbol
+       << "(";
   else
     os << callee << "(";
   bool first = true;

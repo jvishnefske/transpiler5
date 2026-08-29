@@ -17,6 +17,7 @@
 
 #include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/EmitRustOps.h"
+#include "EmitRust/RustPreludeShadow.h"
 #include "EmitRust/Target/TranslateToRust.h"
 
 #include "mlir/IR/BuiltinOps.h"
@@ -337,7 +338,16 @@ renderCrateRoot(mlir::ModuleOp module, CrateType type,
       wrapper = asyncMain ? kMainWrapperAsync : kMainWrapper;
       break;
     }
-    os << "\n" << wrapper;
+    // FR-150: the wrapper text is rendered HERE, outside the emitter, and the
+    // argv flavor spells `let __emitrust_argv: Vec<Vec<i8>>`. A crate whose
+    // own items shadow `Vec` shadows it for the wrapper too, so the same
+    // conditional qualification the emitter applies to its items applies to
+    // this last block. Byte-neutral for every crate that shadows nothing --
+    // `qualifyShadowedPreludeNames` returns the text unchanged on an empty
+    // set, which is every crate in the corpus.
+    os << "\n"
+       << mlir::emitrust::qualifyShadowedPreludeNames(
+              wrapper, mlir::emitrust::collectShadowedPreludeNames(module));
   }
   return source;
 }
