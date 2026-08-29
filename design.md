@@ -9546,6 +9546,128 @@ piece and becomes FR-45.
   delta over all 262 EndToEnd inputs: EXACTLY ONE file differs, the new test,
   which did not emit before.
 
+- [x] T-SYSTEMD EXTERNAL PROBE (measured 2026-08-28 on branch `probe/systemd`,
+  cherry-picked into the main line 2026-08-29): systemd `39cf979` (v262 dev),
+  1600 translation units, configured with meson under a nix shell so all 58
+  generated sources resolve. **The largest external corpus this project has
+  measured -- roughly 19x the 85-unit probe set and 6x TRACTOR.**
+  TOOLING CHERRY-PICKED: `scripts/compdb-probe/{measure,aggregate,buildall,
+  shards}.py`, 242 lines, ZERO systemd references -- they drive off a
+  `compile_commands.json`, so they generalize to any configured C project. They
+  complement what already exists rather than duplicating it:
+  `scripts/external-probe.py` (FR-145) enumerates repos by DIRECTORY and needs
+  no build system; these need a compile database and reach projects that
+  require one. `shards.py` covers the FR-58 `--link` whole-program path, which
+  nothing committed reached before. `measure.py` already carries the
+  FUNCTION-items ranking lesson in its docstring.
+  NOT CHERRY-PICKED, deliberately and consistently with the standing stance
+  that corpora and generated output are not vendored (FR-145, FR-138): the 24M
+  archive of 1585 emitted crates, 2.2M of unpacked exemplars, a 1.4M
+  build-oracle record, and an 8.1M VM harness tree. They remain in the
+  worktree `.claude/worktrees/systemd-probe`.
+  IMPORT COVERAGE, deduped by symbol+file+line -- the raw per-TU totals count a
+  header record once per including TU and measure header fan-out, not progress:
+  record 820/1045 (78.5%), enum 565/595 (95.0%), global 802/6675 (12.0%),
+  **FUNCTION (defined) 1618/26084 (6.2%)**. Functions defined in the unit's own
+  `.c` (excluding `static inline` from headers): 1154 ported over 434 of 1585
+  crates -- **1151 crates port no function of their own at all.**
+  By directory: src/basic 442/2922 (15.1%), src/shared 325/3683 (8.8%),
+  src/core 47/3079 (1.5%), src/systemd 4/1464 (0.3%).
+  BUILD ORACLE (`cargo build --release --offline`, every crate): **1427/1585
+  build clean. The 158 failures are THREE emitter bugs, not 158** -- which is
+  the FR-145 build-oracle thesis confirmed on a corpus 19x larger, and the
+  reason a per-crate failure count is a misleading headline.
+  RANKED FOLLOW-UPS, filed as FR-149..FR-153 below:
+    1. enum-valued array subscript (5 units) -- gates `log.c`, and `log.c`
+       gates EVERY whole-program link.
+    2. prelude-name collision for emitted types (123 crates).
+    3. TU-unique anonymous struct names (blocks the 493-shard merge).
+    4. `scf.while` legalization in gperf lookup code (7 units).
+    5. E0596 mutable-borrow-through-shared (35 crates).
+  Items 1-3 are narrow and mechanical. **6.2% function coverage is the deep
+  front and it is pointer-model work** -- incomplete struct types 3964,
+  pointer-to-pointer parameter 1878 + shape-escape 1775, address-of-pointer
+  1735, void pointer parameter 1453 -- not one increment.
+  RUNNING THE OUTPUT, recorded because it is the strongest end-to-end evidence
+  this project has: the probe's `vm/` boots a 6.18.46 kernel under QEMU with a
+  Rust PID 1 that links six emitted crates and calls transpiled `src/basic`
+  functions on the live kernel (13/13 checks pass), then runs a Rust TCP echo
+  service the host tests byte-exactly over a forwarded port. It is NOT systemd
+  -- nothing here links into an init system -- but it is emitted Rust EXECUTING
+  on a real kernel rather than only compiling.
+
+- [ ] FR-149 DEFECT (found by the systemd probe 2026-08-28, REPRODUCED at HEAD
+  2026-08-29): an ENUM-VALUED ARRAY SUBSCRIPT fails to verify.
+  `src/basic/log.c:1427` is `return log_target_max_level[target];` with
+  `LogTarget target`, and the importer produces:
+      error: 'emitrust.subscript' op operand #1 must be integer or index,
+             but got '!emitrust.enum<"LogTarget">'
+      note: %59 = "emitrust.subscript"(%56, %58) :
+            (!emitrust.lvalue<!emitrust.array<4xi32>>,
+             !emitrust.enum<"LogTarget">) -> !emitrust.lvalue<i32>
+  **THIS IS THE HIGHEST-LEVERAGE ITEM THE PROBE FOUND**: it is 5 units directly
+  (`log.c`, `dissect-image.c`, `logind-session.c`, `resolved`, `repart`), but
+  `log.c` is what every systemd TU pulls in for `assert()` -> `log_assert_failed`,
+  so this ONE bug is why NO SUBSET OF SYSTEMD LINKS, down to two files.
+  DIRECTION: insert the enum->integer cast at `emitrust.subscript`.
+  DOES NOT REDUCE SYNTHETICALLY, and the failed attempts are recorded so nobody
+  repeats them: a named `typedef enum` subscripting a `static const int[]`, the
+  same with a `switch` over the enum, an enum-typed global, and an enum struct
+  member ALL lower the enum to `i32` and emit fine. The `!emitrust.enum` path
+  needs something those shapes lack. **Use the real input** -- systemd is on
+  disk with a configured build; the one-line repro command is in FR-149's
+  reproduce note below. Per the standing lesson, INSTRUMENT the type-mapping
+  decision rather than guessing at a fourth reduction.
+  Reproduce: from `<systemd>/build-sd`,
+  `emitrust-cc --compdb . --emit=crate --crate-type=lib --incremental
+   ../src/basic/log.c -o <out>`.
+  **NOT SPIKED.**
+
+- [ ] FR-150 DEFECT (found by the systemd probe 2026-08-28): an emitted type
+  whose C name collides with the RUST PRELUDE shadows it and breaks the crate.
+  systemd's `src/shared/options.h:45` ends `} Option;`, so the importer emits
+  `pub struct Option { .. }` -- after which every `Option<fn()>` the emitter
+  writes for a function pointer parses as that struct:
+      error[E0107]: struct takes 0 generic arguments but 1 generic argument
+                    was supplied
+  **123 of the 158 build failures in the systemd corpus are this one bug.**
+  It generalizes: ANY C project with a type named `Option`, `Result`, `Box`,
+  `String` or `Vec` hits it. Exit-0 unbuildable with no diagnostic -- the same
+  class as FR-140/141/142/146, and the reason `scripts/external-probe.py`'s
+  16-repo corpus never saw it is simply that none of those repos names a type
+  `Option`.
+  DIRECTION: rename or qualify emitted items that collide with the prelude.
+  Note the emitter's own `Option<...>` spellings are unqualified today, so
+  either the emitted type is renamed or the emitter's uses become
+  `::core::option::Option`.
+  **NOT SPIKED.**
+
+- [ ] FR-151 DEFECT (found by the systemd probe 2026-08-28): ANONYMOUS STRUCT
+  NAMES ARE NOT TU-UNIQUE, so the FR-58 `--link` shard merge collides.
+  `error: conflicting definitions of 'Anon0' at link: the shards disagree on
+  its shape` -- anonymous structs are minted per TU as `Anon0`, `Anon1`, …
+  WITHOUT the per-TU tag that internal-linkage symbols get (`tu0_`), so
+  `siginfo_t`'s anonymous struct and an unrelated one in `architecture.c`
+  collide. Blocks the 493-shard `systemd-detect-virt` merge.
+  DIRECTION: give anonymous struct names the same per-TU tag internal-linkage
+  names already carry. Narrow and mechanical.
+  **NOT SPIKED.**
+
+- [ ] FR-152 DEFECT (found by the systemd probe 2026-08-28): `failed to
+  legalize operation 'scf.while'` on 7 units, all gperf-GENERATED lookup tables
+  (`af-from-name.gperf:51`, `errno-from-name`, …). Machine-generated C is a
+  distinct shape class from hand-written C and this is the first time the
+  project has measured it at scale.
+  **NOT SPIKED.**
+
+- [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28): 35 crates fail
+  `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`
+  (src/core/manager, src/coredump/coredumpctl-journal, …). Exit-0 unbuildable,
+  the FR-145 class again. Ranked last of the five because it is the only one
+  that is not obviously narrow: it is a borrow-model question, not a naming or
+  cast fix.
+  **NOT SPIKED.**
+
 - [x] FR-148 DEFECT (MISCOMPILE, found while implementing FR-147 2026-08-29,
   PRE-EXISTING at HEAD and independent of it; FIXED in the same commit): a
   second pointer local DECLARED with an initializer inside an allocation region
