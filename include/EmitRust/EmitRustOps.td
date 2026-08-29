@@ -388,6 +388,13 @@ def EmitRust_CallIndirectOp : EmitRust_Op<"call_indirect"> {
     function pointer is undefined behavior, which this rendering refines
     into a deterministic panic.
 
+    FR-133: when the callee is a load of a LOCAL the emitter has proved to
+    hold a literal `Some(<fn>)` -- initialized once from that constant,
+    never reassigned, never compared against null, and only ever called --
+    the local renders as a bare `fn(...)` with no `Option` at all, and this
+    operation renders as the plain call `callee(args)`. There is no null to
+    refine there, and the `.expect` was always redundant.
+
     Example:
 
     ```mlir

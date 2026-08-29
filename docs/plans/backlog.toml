@@ -305,7 +305,7 @@ anchor = "FR-135 DEFECT (UPSTREAM, found by FR-134's spike)"
 id = "FR-133"
 rank = 25
 kind = "feature"
-status = "open"
+status = "landed"
 size = "S"
 title = "A nullable fn-ptr local initialized from a literal Some needs no Option"
 summary = "Surfaced by FR-132, which made the shape visible to clippy: `let cp: Option<fn(i32)->i32> = Some(addc); .. cp.expect(\"null function pointer\")(i)` draws clippy::unnecessary_literal_unwrap (8 corpus instances, fn-pointers.c contributing 3). The .expect was always redundant; the pre-FR-132 two-program-point rendering simply hid it from clippy's const tracing. When a fn-ptr local is initialized from a literal Some and never reassigned or compared against null, the Option wrapper can be dropped entirely and every use site loses its unwrap. Not a regression -- the emitted code got strictly shorter -- but real newly-visible debt."
