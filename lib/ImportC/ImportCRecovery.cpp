@@ -105,6 +105,12 @@ void CImporter::resetPerFunctionState() {
   symbols.clear();
   addressTaken.clear();
   placeBackedScalars.clear();
+  // FR-61f-c: every value in here points into the body that is being ERASED.
+  // Leaving one behind is precisely the use-after-free this comment warns
+  // about: the next function's first pointer read would get a dangling
+  // `Value` back out of `loadPlace` (measured as a segfault on `antirez/sds.c`
+  // under `--recover`).
+  hoistedCells.clear();
   // FR-61f-d: a body that failed mid-emit must not leave the structured-if
   // mode latched on for the NEXT function.
   liftedForDepth = 0;

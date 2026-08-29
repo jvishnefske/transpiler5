@@ -6903,9 +6903,21 @@ FailureOr<Value> CImporter::emitDerefLValue(const clang::UnaryOperator *unary,
 }
 
 Value CImporter::loadPlace(Location loc, Value place) {
-  if (llvm::isa<MemRefType>(place.getType()))
+  if (llvm::isa<MemRefType>(place.getType())) {
+    // FR-61f-c slice 1: inside a lifted `emitrust.for`, a body-INVARIANT
+    // pointer's cells were already loaded once in front of the region (see
+    // `emitRangeFor`). Hand back that SSA value: a `memref.load` here would
+    // leave an alloca mem2reg cannot promote out of the nested region, which
+    // `convert-to-emitrust` then rejects. This is the ONE seam every pointer
+    // cell read goes through -- cursor, nullable discriminant and
+    // enum-of-bases discriminant alike -- which is why the whole mechanism is
+    // three lines wide instead of an audit of every memref consumer.
+    auto hoisted = hoistedCells.find(place);
+    if (hoisted != hoistedCells.end())
+      return hoisted->second;
     return builder.create<memref::LoadOp>(loc, place, ValueRange())
         .getResult();
+  }
   auto lvalueType = llvm::cast<emitrust::LValueType>(place.getType());
   return builder
       .create<emitrust::LoadOp>(loc, lvalueType.getValueType(), place)

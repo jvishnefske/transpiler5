@@ -2808,42 +2808,97 @@ of references or inheritance, so it precedes both.
          12  DESCENDING                      -> (e)
           6  body touches a float SCALAR     (was 0 before the widenings)
           6  bound not provably unreachable to a callee (61f-8's fence)
-      (c) POINTERS IN THE BODY -- 82 UNIQUE sites (69 body-var + 13
-          cond-not-comparison), not the 201 first recorded here; 49% of the
-          167, so still the dominant remainder, and still a CHECKPOINT.
-          REDIRECTED 2026-08-26 by FR-136's spike, which measured the thing
-          this entry got wrong: THE BLOCKER IS REPRESENTATION, NOT ALIASING.
-          `rangeForBodyVarIsPlaceBacked` (ImportCStatements.cpp) is a pure
-          `clang::QualType` predicate -- it takes a `VarDecl*`, looks only at
-          the TYPE, and a pointer falls through every branch to its terminal
-          `return false`. It consults no aliasing information and there is
-          none for it to consult, so NO points-to solution at ANY precision
-          changes its answer. Measured on the 69 body-var sites: 35 are
-          already all-SINGLETON (perfect points-to today) and still do not
-          lift; 26 are parameter-bound cursor/slice params resolved by a
-          different mechanism and still do not lift; the 3 MULTIBASE sites
-          were each inspected and are GENUINE may-point-to sets of size 2
-          ("runtime-selected rebinding between two arrays"), which no solver
-          collapses. Demonstrated end to end: `for (i=0;i<n;i++) s+=a[i];`
-          with `a` a fully owner-promoted SINGLETON pointer still emits
-          `while`, because the cursor is a `memref.alloca` and mem2reg cannot
-          promote it across the region op.
-          So what (c) needs is exactly what this entry already said in its
-          second half and what the ledger then mis-ranked: teach the
-          pointer-region model to emit its CURSOR, its nullable discriminant
-          and the CTS-P7 enum-of-bases discriminant as `emitrust.variable`
-          PLACES, then audit every `memref.load`/`memref.store` consumer.
-          Core machinery, its own design pass, and the ONE remainder where
-          the cell-story-never-applied argument that carried 61f-6 and
-          61f-10 is genuinely false -- here the cells are real.
-          The 13 cond-not-comparison sites are a SEPARATE feature and do not
-          belong in (c) at all: 12 of 13 are integer-typed conditions, and
-          the dominant shape (4 unique sites, 78 raw events) is the
-          NUL-terminated string walk `for (p = s; *p; p++)`, an iterator /
-          `take_while` lift. The pointer-walking list head
-          `for (p = head; p; p = p->next)` this ledger named as the dominant
-          case is measured at exactly ONE site (test/EndToEnd/linked-list.c),
-          and is a `while let`. Neither is a counted loop.
+      (c) POINTERS IN THE BODY -- **SLICES 1 AND 2 LANDED 2026-08-29.** A
+          counted `for` whose body READS a pointer now lifts to a range head.
+          82 unique sites, 49% of the remainder, and the largest single item in
+          this FR: measured +161 only-offender against +8 for all five
+          control-flow shapes combined.
+          REDIRECTED 2026-08-26 by FR-136's spike, which measured the thing this
+          entry got wrong: THE BLOCKER IS REPRESENTATION, NOT ALIASING.
+          `rangeForBodyVarIsPlaceBacked` is a pure `clang::QualType` predicate;
+          a data pointer falls through every arm to the terminal `return false`,
+          grouped with floats. It asks no aliasing question, so no points-to
+          solution at any precision changes its answer. Mechanism confirmed
+          exactly: `createEntryAlloca` hoists every cell to the entry block, and
+          MLIR mem2reg refuses to promote a slot whose uses are in a nested
+          region unless the parent implements `PromotableRegionOpInterface` --
+          `emitrust.for` implements none -- so the surviving `memref.alloca`
+          fails `convert-to-emitrust`. A LOCATED hard error, not a miscompile.
+          **AND THE PRESCRIPTION IN THIS ENTRY WAS ALSO WRONG.** It said to
+          convert the cursor, the nullable discriminant and the CTS-P7
+          enum-of-bases discriminant into `emitrust.variable` PLACES and audit
+          ~51 memref consumers. Measured:
+            - 125 of the 161 sites (78%) have NO `PointerRegion` AT ALL. The
+              dominant shape is a read-only cursor/slice PARAMETER walked by
+              index -- never assigned, so invisible to the region model.
+              Teaching that model anything does not reach them. This entry's own
+              "26 are parameter-bound cursor/slice params resolved by a
+              different mechanism" was the MAJORITY class, not a footnote.
+            - THE CELLS DO NOT NEED TO BECOME PLACES; THEY NEED TO BE HOISTED.
+              Hand-written IR through the real pipeline: the place conversion
+              renders but leaves a dead `let` and unfolded cursor arithmetic
+              (a place is opaque to canonicalize) -- improving the head while
+              DEGRADING the body, the same shape that made (d)'s `?:` net move
+              the wrong way. Loading the cell ONCE before the region and using
+              the SSA value inside renders AND lets canonicalize fold the `+0`
+              away. Strictly better Rust, and no new ops on either path.
+            - THE REAL CONSUMER COUNT IS ONE, not 51: every read of every
+              pointer cell goes through `loadPlace` (ImportC.cpp:6905), a single
+              type-dispatched seam. Verified: ZERO direct `memref::LoadOp` on
+              `cursorCell`/`nonNullCell`/`baseIndexCell` across all five
+              importer files. So all three runtime pieces came free at once.
+          SLICE 1 = hoist body-invariant pointer cells, admitted by
+          `!stmtWritesVar(body,var) && !addressTaken.contains(var)` -- both
+          predicates already existed and were already used for the induction.
+          SLICE 2 (transitive root cursors, following `PointerLocalInfo::base`)
+          landed in the same increment because it was needed to reach a green
+          gate; each root is re-proved invariant before it is hoisted.
+          **THE PLAN FOR THIS WORK WAS INTERNALLY INCONSISTENT, and the
+          correction is recorded because it will recur.** With the admission
+          clause EXACTLY as specified, six EndToEnd files that emit today became
+          the located `memref.alloca` error -- so "Slice 1 alone" and "full gate
+          100%" could not both hold. Three syntactic refusals close the gap
+          (a function pointer, already a place; a `T**` NON-parameter local,
+          which lives in `pointerPointerLocals`; and a pointer DECLARED inside
+          the body, whose initializing store is inside the region). `T**`
+          PARAMETERS are admitted, which is what recovers `argv-echo.c`.
+          MEASURED, 243 EndToEnd files emitted by both builds:
+            `for … in` 282 -> **354** (+72);  `while` 143 -> 106;
+            `loop {` 153 -> **118** -- DOWN 35, so the 61f-6 while->`loop {`
+            regression this FR warned about did NOT transfer;  lines -417.
+            External repos (47 crates): `for … in` 4 -> 15, lines -62.
+          ORACLE: **37/37 byte-diffs pass** -- 36 existing EndToEnd files whose
+          emission changed plus the new test, each built and diffed against the
+          clang native over EVERY argument set in its RUN lines, including
+          `pointers-global.c` (CTS-P4), all four `malloc-*` (FR-146/147),
+          `nullable-slice-param.c` and `argv-echo.c`. Six adversarial probes
+          re-run: `p++` and inner-loop mutation REFUSED, nullable / write-through
+          / string-literal / heap-backing ADMITTED, all byte-identical.
+          **THE `--recover` USE-AFTER-FREE IS SUBTLER THAN THE PLAN SAID, twice
+          over.** The plan named two lines (restore before the failure return,
+          and clear in `ImportCRecovery.cpp`); measured, `sds.c` did NOT crash
+          with only those -- the LOAD-BEARING clear is the one in the three
+          `importFunction` PROLOGUES, with the recovery clear as second defence.
+          And the ONE-CELL form of the reproducer does not crash either (the
+          freed `Operation` address is not recycled); it takes EIGHT hoisted
+          cells in the rejected function plus three later readers to fault
+          deterministically. Both facts are in the test's intent comment so
+          nobody simplifies it back into a test that cannot fail.
+          A staleness hard-error (`loop-invariant pointer state is written
+          inside the lifted `for` body`) guards the one silent-miscompile path.
+          It is UNREACHABLE by construction -- every write to a hoisted cell
+          needs either a syntactic assignment `stmtWritesVar` sees or an `&p`
+          `addressTaken` sees -- so it is an unpinned emission-time assertion,
+          per the marker contract.
+          RESIDUE, and it is what remains of design.md's original prescription:
+          pointers declared inside the body and genuinely WALKED pointers
+          (`p++`). Ceiling **+19** for the 51-site place conversion, against
+          +133 realized for the 1-site hoist. It must also first fix the FOURTH
+          `blocksRangeForLift` leak -- admitting a MUTATED pointer segfaults
+          `verifyNSuccessors` on three real files, a pointer-shaped leak the
+          statement blocklist cannot see. Slice 1's invariance clause fences it
+          by construction. **Do not do the place conversion on the strength of
+          the entry alone.**
       (d) CONTROL FLOW IN THE BODY -- the `if` LEG LANDED as 61f-12 below;
           `?:`/`&&`/`||`/StmtExpr/`switch` and every jump remain.
           `break`/`continue`/`goto`/`return` STAY FENCED regardless:
