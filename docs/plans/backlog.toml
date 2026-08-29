@@ -544,17 +544,6 @@ blocked_by = []
 anchor = "STILL OUT after 61f-10"
 
 [[items]]
-id = "FR-61f-f"
-rank = 21
-kind = "feature"
-status = "spiked"
-size = "S"
-title = "Range-for: induction reuse across a second nested pair blocks the lift"
-summary = "Isolated by differential probe during 61f-12, not inferred. Two nested i/j loop pairs in one function: with FRESH inductions in the second pair ALL FOUR loops lift (0 loop{}); with the SAME i/j reused, only two lift and two stay loop{}. That is exactly the shape of the last four loop{} in test/EndToEnd/struct-long-arrays.c, which 61f-12 could not clear. The assignment-form dead-after analysis (inductionDeadAfter/walkAfter/effectOn) is the only clause that inspects induction reuse, so that is where to look. Cheap-looking and well-scoped -- but measure the realized yield before building: this FR has now measured the first-failure-to-realized ratio at roughly one in eight, three times."
-blocked_by = []
-anchor = "STILL OUT after 61f-10"
-
-[[items]]
 id = "FR-61f-c"
 rank = 24
 kind = "feature"

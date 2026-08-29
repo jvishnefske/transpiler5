@@ -2855,18 +2855,61 @@ of references or inheritance, so it precedes both.
           numbers. +6 was the CORPUS-WIDE net `loop {` delta from 61f-6; that
           FILE has EIGHT. 61f-12 clears four of the eight. The remaining four
           are not (d) cases at all -- see (f).
-      (f) INDUCTION REUSE ACROSS A SECOND NESTED PAIR -- the clause-6
-          (`inductionDeadAfter`) residue, and a NEW, well-scoped, cheap-looking
-          follow-on isolated by a differential probe rather than inferred. Two
-          nested `i`/`j` loop pairs in one function:
-            - with FRESH inductions in the second pair, ALL FOUR loops lift
-              (0 `loop {`);
-            - with the SAME `i`/`j` reused, only two lift and two stay
-              `loop {`.
-          That is exactly the shape of the last four `loop {` in
-          struct-long-arrays.c, and the assignment-form dead-after analysis is
-          the only clause that inspects induction reuse. Worth measuring
-          before building, per this ledger's standing lesson.
+      (f) INDUCTION REUSE ACROSS A SECOND NESTED PAIR -- **LANDED 2026-08-28.**
+          The clause-6 (`inductionDeadAfter`) residue. The differential probe
+          this entry asked for was re-run and reproduced exactly: two nested
+          `i`/`j` pairs in one function lift ALL FOUR with fresh inductions in
+          the second pair, but only two when `i`/`j` are reused.
+          **THE ROOT CAUSE RECORDED IN THE SPEC FOR THIS WORK WAS WRONG, and
+          the fix it prescribed would have been a NO-OP as written and UNSOUND
+          if naively extended.** Recorded because the ledger's standing lesson
+          is exactly this. The spec claimed a following `for (i = 0; ...)` was
+          being classified as a Read of `i`; it was not. `effectOn` ALREADY did
+          `head = forStmt->getInit()` (pre-change ImportCStatements.cpp:4814)
+          and already returned `Kill` for that shape.
+          THE ACTUAL BLOCKED INDUCTION IS THE INNER ONE, `j`, isolated by two
+          new single-variable probes: reusing only `i` (fresh inner) lifts all
+          four TODAY; reusing only `j` does not. `j`'s kill lives one level
+          deeper -- in the second pair's INNER `for (j = 0; ...)` init, inside
+          the second OUTER loop's body -- so `effectOn(secondOuterFor, j)` fell
+          through to `readsVar` and answered Read. The inner refusal then
+          dragged the outer one down through `blocksRangeForLift`.
+          WHY THE OBVIOUS EXTENSION IS A MISCOMPILE: classifying that outer
+          `for` as a KILL of `j` is unsound, because the outer loop's body may
+          run ZERO times -- the nested init never executes, `j` keeps the first
+          pair's exit value, and the sibling scan would `return Dead` and stop,
+          missing a later `s += j;`. That is the same class as the 300-vs-303
+          miscompile already recorded at the sibling scan.
+          WHAT LANDED IS THE WEAKER JUDGEMENT: `observesIncomingValue(stmt,
+          var)` -- "can `stmt` read the value `var` ARRIVES with?" A `false`
+          answer only ever downgrades `Read` -> `Pass` (keep scanning
+          siblings); it NEVER promotes anything to `Kill`. So the set of
+          statements that can end `walkAfter` with "dead" is byte-for-byte what
+          it was, and the `killsUnreliable`/`transfersControl` reasoning is
+          untouched. Modelled: `CompoundStmt` (in order; a first up-front kill
+          ends the question) and a `ForStmt` whose init/cond/inc are var-free
+          (recurse into the body). `while`, `do`, `if`, `switch`,
+          `CXXForRangeStmt` and everything else answer TRUE = refuse.
+          MEASURED: reuse 2 `loop {`/2 lifted -> **0/4**; readafter (a genuine
+          `s += i + j;` between the pairs) UNCHANGED at 2/2, which is the
+          over-relaxation guard. Corpus-wide emission delta over all of
+          test/EndToEnd: exactly TWO files change -- the new test, and
+          struct-long-arrays.c, where two real nested pairs (3x48 over
+          `s.slots[i].tail[j]`) go from `loop {` to range heads. That is the
+          existing byte-diff test this entry predicted, and it stays GREEN
+          untouched. Everything else byte-identical.
+          Pinned by test/EndToEnd/range-for-nested-reuse.c, six functions
+          byte-diffed against `clang -std=c11` at three argc seeds: the lift,
+          the read-between guard, a `while` (no init slot), a compound init
+          (`for (j -= 4; ...)` reads before it writes), and TWO the spec did
+          not ask for -- `pass_is_not_a_kill`, the direct analogue of the
+          300/303 miscompile (at argc 1 the outer loop runs zero times and the
+          induction keeps its earlier value, so a Pass wrongly promoted to a
+          Kill prints the wrong number and the byte-diff catches it at that
+          exact seed), and a read placed BEFORE the nested kill.
+          Clippy, now a PAIRED comparison against the epoch-4 pin: 238 -> 238
+          (+0), 0 skipped, top lints unchanged. Adding a new EndToEnd file does
+          not drift the pinned population.
       (e) DESCENDING -> `.rev()` -- 12, and SMALLER THAN IT LOOKS AND BIGGER
           THAN IT COSTS, so measure before building. It is not the
           self-contained importer change earlier entries called it: it needs
