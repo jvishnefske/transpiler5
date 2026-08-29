@@ -94,6 +94,22 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
       }
       continue;
     }
+    // FR-123: a friend function DEFINED INLINE in a class claims an
+    // ordinary module symbol exactly like the free function it is (its
+    // semantic declaration context is this one), but hangs off a
+    // `FriendDecl` in the record's lexical member list, so this walk
+    // cannot see it. It is asked for explicitly, through the selection
+    // rule `importDeclsIn` shares — otherwise `structSymbolName`'s
+    // ordinary-name collision check and the FR-73 underscore-fold guard
+    // would be blind to every hidden friend in the TU and could hand a
+    // struct tag a name a friend already owns.
+    if (llvm::isa<clang::CXXRecordDecl>(decl)) {
+      llvm::SmallVector<const clang::FunctionDecl *, 4> friends;
+      emitrust::collectFriendDefinitions(decl, friends);
+      for (const clang::FunctionDecl *func : friends)
+        claimOrdinaryFunctionName(func);
+      continue;
+    }
     if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
       // W2.25: an out-of-line MEMBER operator definition is a TU-scope
       // decl whose `cFunctionSymbolName` would now be the FREE synthesized
@@ -105,37 +121,7 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
       if (llvm::isa<clang::CXXMethodDecl>(func) &&
           !func->getDeclName().isIdentifier())
         continue;
-      std::string funcName = mlirFuncName(func);
-      // W2.25: a non-admitted free operator (or literal operator) has no
-      // emitted symbol at all — `cFunctionSymbolName` returns the empty
-      // string instead of asserting — and claims nothing.
-      if (funcName.empty())
-        continue;
-      ordinaryTuNames.insert(funcName);
-      if (func->getDeclName().isIdentifier())
-        ordinaryRawTuNames.insert(func->getName());
-      // FR-73: remember which raw spelling claimed the composed name
-      // first (try_emplace keeps the first claimant; redeclarations of
-      // the same raw name agree), so the underscore-fold guard in
-      // importFunction can reject a DIFFERENT spelling folding onto it.
-      // W2.25: an admitted free operator has no raw C spelling; it claims
-      // the owner slot with the EMPTY raw name (the FR-73 guard skips
-      // empty claimants) while the FR-125 qualified-owner record below
-      // carries its honest `operator==` spelling for the cross-spelling
-      // collision wording.
-      ordinaryTuNameOwners.try_emplace(
-          funcName, func->getDeclName().isIdentifier()
-                        ? func->getName().str()
-                        : std::string());
-      // FR-125: same first-claimant record, qualified spelling, for the
-      // case-fold collision guard in importFunction.
-      ordinaryTuQualifiedOwners.try_emplace(funcName,
-                                            func->getQualifiedNameAsString());
-      // Function-local statics surface at module level under their
-      // `<function>_<name>` mangle (see emitLocalVar), claiming that
-      // spelling in the ordinary namespace.
-      if (func->hasBody())
-        collectStaticLocalNames(func->getBody(), funcName);
+      claimOrdinaryFunctionName(func);
       continue;
     }
     if (const auto *var = llvm::dyn_cast<clang::VarDecl>(decl)) {
@@ -149,6 +135,39 @@ void CImporter::collectOrdinaryNamesFrom(const clang::DeclContext *context) {
                                             var->getQualifiedNameAsString());
     }
   }
+}
+
+void CImporter::claimOrdinaryFunctionName(const clang::FunctionDecl *func) {
+  std::string funcName = mlirFuncName(func);
+  // W2.25: a non-admitted free operator (or literal operator) has no
+  // emitted symbol at all — `cFunctionSymbolName` returns the empty
+  // string instead of asserting — and claims nothing.
+  if (funcName.empty())
+    return;
+  ordinaryTuNames.insert(funcName);
+  if (func->getDeclName().isIdentifier())
+    ordinaryRawTuNames.insert(func->getName());
+  // FR-73: remember which raw spelling claimed the composed name first
+  // (try_emplace keeps the first claimant; redeclarations of the same raw
+  // name agree), so the underscore-fold guard in importFunction can reject
+  // a DIFFERENT spelling folding onto it. W2.25: an admitted free operator
+  // has no raw C spelling; it claims the owner slot with the EMPTY raw
+  // name (the FR-73 guard skips empty claimants) while the FR-125
+  // qualified-owner record below carries its honest `operator==` spelling
+  // for the cross-spelling collision wording.
+  ordinaryTuNameOwners.try_emplace(funcName,
+                                   func->getDeclName().isIdentifier()
+                                       ? func->getName().str()
+                                       : std::string());
+  // FR-125: same first-claimant record, qualified spelling, for the
+  // case-fold collision guard in importFunction.
+  ordinaryTuQualifiedOwners.try_emplace(funcName,
+                                        func->getQualifiedNameAsString());
+  // Function-local statics surface at module level under their
+  // `<function>_<name>` mangle (see emitLocalVar), claiming that spelling
+  // in the ordinary namespace.
+  if (func->hasBody())
+    collectStaticLocalNames(func->getBody(), funcName);
 }
 
 FailureOr<std::string>

@@ -9827,16 +9827,85 @@ piece and becomes FR-45.
   failed with 8x "requires at least a format string argument" before any
   diff could run, i.e. the crate did not compile at all.
 
-- [ ] FR-123 DEFECT (found by FR-119's spike, pre-existing, SEPARATE
-  channel): a FRIEND operator defined INLINE in a class is silently
-  omitted -- zero diagnostics, invisible to every ledger, exactly the
-  FR-115 measurability hole in miniature. Uses of it still reject
-  located (`unsupported callee`), so it is dead code loss rather than
-  wrong code, but the policy is rejection-is-a-feature and located.
-  The channel is pinned AS-IS by the FRIEND section of
-  test/Import/Cpp/free-operator-invalid.cpp (module contains the
-  struct_def and c_main with zero diagnostics), so any change to its
-  behavior fails a test and must come through this FR. **NOT SPIKED.**
+- [x] FR-123 DEFECT (found by FR-119's spike, pre-existing, SEPARATE channel;
+  SPIKED AND FIXED 2026-08-28): a FRIEND operator defined INLINE in a class was
+  silently omitted -- zero diagnostics, invisible to every ledger.
+  **THIS ENTRY'S PRESCRIPTION WAS WRONG AND THE SPIKE OVERTURNED IT.** It said
+  "the policy is rejection-is-a-feature and located", i.e. close the hole with
+  a DIAGNOSTIC. Measured: THE CONSTRUCT WAS ALREADY FULLY SUPPORTED. The
+  identical operator written at NAMESPACE scope imports today as
+  `fn op_add(a: &V, b: &V) -> V` with zero diagnostics and `a + b` resolves --
+  W2.25's admitted by-value free-operator path. The friend spelling was not an
+  unsupported construct, it was simply NEVER REACHED: a friend defined inline
+  lives as a `FriendDecl` inside the `CXXRecordDecl`, so its `FunctionDecl` is
+  not in the TU's top-level `decls()` and the item walk never visits it. So the
+  fix is to MAKE IT WORK, not to apologise for it.
+  IT WAS ALSO WORSE THAN "INVISIBLE TO EVERY LEDGER" -- THE LEDGER REPORTED
+  SUCCESS. Under `--incremental` a program whose friend operator was dropped
+  read `graph_items 2, ported 2, missing 0, ported_permille 1000`: the operator
+  was not in the item graph at all, so it was not even in the DENOMINATOR. That
+  is FR-143's artifact-untruth class in its most dangerous direction -- 100%
+  ported certified for output that had lost a function. After the fix the same
+  program reads `graph_items 3 ... ['V','c_main','op_add']`: still 1000
+  permille, but now for the whole program.
+  THE ACCEPTANCE CRITERION WAS AVAILABLE FOR FREE because the correct answer
+  already existed elsewhere in the tree: the friend and free spellings must
+  emit the SAME thing. They now `diff` BYTE-IDENTICAL, not merely equivalent,
+  and that diff is a RUN line so it stays pinned. Same for a NAMED friend
+  function (`fn total(a: &V) -> i32`).
+  Friend definitions are routed through the SAME per-item dispatch a free
+  function takes (recovering or strict), via one shared
+  `collectFriendDefinitions` selection rule used by the importer, the FR-40
+  item graph (all three passes) and the FR-41 coloring probe -- so the walks
+  cannot drift apart.
+  SCOPE DECISIONS, each MEASURED rather than assumed:
+    - NON-OPERATOR friend functions: ADMITTED. Measured as the identical silent
+      channel pre-fix; they are ordinary `FunctionDecl`s the free path already
+      handles, and friend/free emission is byte-identical.
+    - FRIEND CLASSES: UNCHANGED, deliberately. `friend class W;` already
+      imports fine and loses no code -- it grants access and declares none --
+      and `getFriendDecl()` is null for it. Pinned with a `FCLASS-NOT:
+      func.func` so the friend walk cannot start minting items for access
+      grants.
+    - FRIEND TEMPLATES / friends of class templates: DECLINED and recorded as a
+      gap. A hidden friend of a class template would claim ONE un-suffixed
+      symbol per instantiation (`Box<int>` and `Box<long>` both -> `op_add`),
+      a naming problem this FR cannot test its way out of. Measured before and
+      after: a use still fails LOUDLY at the call site, never a silent wrong
+      symbol.
+    - FRIENDS OF NESTED CLASSES: not recursed into -- a nested record is
+      already a loud rejection, so nothing hides behind one.
+    - A shape OUTSIDE the admitted table now gets the located rejection on the
+      existing `cxx-operator-overload` tag (`error: unsupported: overloaded
+      operator`), and under `--incremental` the artifact carries
+      `off_graph_rejected: 1` where it previously carried NOTHING AT ALL.
+  A PRE-EXISTING GAP IS NOW REACHED, not introduced: a hidden friend defined in
+  a header included by two TUs hits FR-58's vague-linkage hole
+  (`conflicting definition of 'op_add' (already defined in another translation
+  unit)`). Pinned side by side with an `inline` free-function control that
+  produces the identical error, so the shared cause is visible.
+  THE PASS-A PLANNERS were deliberately NOT widened -- they still walk
+  `unit->decls()` only, so a hidden friend's body is unplanned. Safe in the
+  documented direction (an unplanned function takes the conservative historical
+  path), and the one construct where blindness could matter, `throw`, has an
+  emission-side backstop that rejects loudly. The byte-identical friend/free
+  emission is the evidence no planner divergence surfaces for admitted shapes.
+  TWO PINS MOVED, both deliberately and both naming FR-123 as their mover in
+  their own comments: free-operator-invalid.cpp's FRIEND section (kept its
+  shape, now pins the POSITIVE, with a new FRIENDBAD section carrying the
+  located-rejection half so the file keeps its charter) and
+  operator-overload-invalid.cpp's friend-call section (flipped forward to pin
+  that the CALL and the DEFINITION compose the SAME symbol -- the real
+  invariant it guarded, since the pre-fix error proved the call site already
+  spelled `op_add` while nothing emitted it).
+  Pinned by test/Import/Cpp/friend-inline-definition.cpp (including the
+  friend-vs-free byte-diffs), test/EndToEnd/cpp-operator-friend.cpp (byte-diff
+  against `clang++ -std=c++17` at two argc seeds, values moving with argc so
+  folding cannot hide a wrong operator), and
+  test/Driver/incremental-friend-operator.cpp (the ledger half).
+  Corpus-wide emission delta over all 260 test/EndToEnd inputs: the ONLY
+  difference is the new test file; zero movement across all 259 pre-existing
+  inputs. Clippy, paired against the epoch-4 pin: 238 -> 238 (+0).
 
 - [x] FR-124 DEFECT: derive(Copy) emitted over a non-Copy base field
   -- exit-0 unbuildable, E0204 x60 across 8 corpus crates. Spike

@@ -787,6 +787,20 @@ void AdmissibilityProbe::probeDeclsIn(const clang::DeclContext *context) {
       probeFunction(func);
       continue;
     }
+    // FR-123: a friend function DEFINED INLINE in this class is an item
+    // graph node (its semantic declaration context is this one, so it
+    // names like a free function), but it is absent from `decls()` and had
+    // to be asked for explicitly through the shared selection rule. It is
+    // probed like the free function it is; a verdict on it now keys a real
+    // node, where before FR-123 neither the node nor the emitted item
+    // existed at all. The arm does not consume `decl` — the record below
+    // is still probed as itself.
+    if (llvm::isa<clang::CXXRecordDecl>(decl)) {
+      llvm::SmallVector<const clang::FunctionDecl *, 4> friends;
+      collectFriendDefinitions(decl, friends);
+      for (const clang::FunctionDecl *func : friends)
+        probeFunction(func);
+    }
     if (const auto *record = llvm::dyn_cast<clang::RecordDecl>(decl)) {
       const clang::RecordDecl *definition = record->getDefinition();
       if (!definition)

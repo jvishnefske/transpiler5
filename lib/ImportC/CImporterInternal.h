@@ -1859,6 +1859,24 @@ private:
   /// W2.0 leaves method import untouched.
   LogicalResult importDeclsIn(const clang::DeclContext *context);
 
+  /// FR-123: imports the friend functions DEFINED INLINE in `decl` (a
+  /// no-op unless `decl` is a class definition), through the very same
+  /// per-item dispatch `importDeclsIn` gives its own declarations.
+  ///
+  /// Such a function's `FunctionDecl` hangs off a `FriendDecl` in the
+  /// record's LEXICAL member list and is absent from the translation
+  /// unit's `decls()`, so the walk above structurally cannot reach it —
+  /// which is why it used to be silently omitted, with no diagnostic and
+  /// no item anywhere. Its SEMANTIC declaration context is the enclosing
+  /// namespace, so it names exactly like a free function
+  /// (`cFunctionSymbolName`, including `overloadSetSize`'s suffixes, which
+  /// `DeclContext::lookup` already saw a hidden friend through — that is
+  /// what made the pre-fix call site compose `op_add` for a symbol nothing
+  /// emitted). `emitrust::collectFriendDefinitions` owns the selection
+  /// rule, shared with the item graph and the FR-41 probe so all of them
+  /// agree on the item set by construction.
+  LogicalResult importFriendDefinitionsIn(const clang::Decl *decl);
+
   /// Imports ONE top-level declaration: the per-kind dispatch that
   /// `importDeclsIn` used to inline. Split out so recoverable import
   /// (FR-42) has a single call it can wrap, checkpoint, and roll back.
@@ -3003,6 +3021,17 @@ private:
   /// `importDeclsIn` does for the real import, so the pre-scanned name set
   /// matches what will actually be emitted (W2.0).
   void collectOrdinaryNamesFrom(const clang::DeclContext *context);
+
+  /// Records the module symbol `func` claims in the ordinary identifier
+  /// namespace, plus its FR-73/FR-125 first-claimant records and the
+  /// `<function>_<name>` mangles of its function-local statics.
+  ///
+  /// Extracted from `collectOrdinaryNamesFrom`'s `FunctionDecl` arm so
+  /// that FR-123's hidden-friend arm claims through the IDENTICAL code
+  /// rather than a copy: a friend defined inline in a class is an ordinary
+  /// free function as far as naming is concerned, and a second
+  /// implementation of the claim could drift from this one silently.
+  void claimOrdinaryFunctionName(const clang::FunctionDecl *func);
 
   /// Walks a function body and records the `<function>_<name>` mangled
   /// spelling of every function-local static in `ordinaryTuNames`.

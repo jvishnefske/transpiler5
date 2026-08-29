@@ -17,8 +17,8 @@
 // RUN:   | FileCheck %s --check-prefix=COLLIDEREV
 // RUN: not emitrust-import-c %t/const-pair.cpp 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=CONSTPAIR
-// RUN: not emitrust-import-c %t/friend-call.cpp 2>&1 \
-// RUN:   | FileCheck %s --check-prefix=FRIENDCALL
+// RUN: emitrust-import-c %t/friend-call.cpp 2>&1 \
+// RUN:   | FileCheck %s --check-prefix=FRIENDCALL --implicit-check-not="error"
 
 // W2.25: the FENCES around the admitted operator subset. Admission is
 // TABLE-DRIVEN (overloadedOperatorSymbolBaseName in CSymbolNaming.h), so
@@ -55,12 +55,21 @@
 //    `emitrust.addr_of` mut-marker verifier — measured identical to the
 //    identifier-method twin (`get`/`get const`), never a silent
 //    wrong-body call.
-//  - friend-call: a friend operator defined INLINE in the class is still
-//    the FR-123 silent-omission channel (its DEF leaves no trace — pinned
+//  - friend-call: NOT a fence any more, and deliberately so. It used to
+//    read "a friend operator defined INLINE in the class is still the
+//    FR-123 silent-omission channel (its DEF leaves no trace — pinned
 //    as-is by free-operator-invalid.cpp's FRIEND section), but a CALL to
 //    one of an admitted kind now names the missing synthesized symbol
-//    instead of the old bare "unsupported callee" — the channel stays a
-//    located error in every mode, only more rankable.
+//    instead of the old bare 'unsupported callee'". FR-123 moved that
+//    channel forward: the definition is now REACHED (a friend carrying a
+//    body is routed through the same item dispatch a top-level function
+//    takes), so an admitted kind imports and the call resolves. Kept here
+//    rather than deleted, because the fence this section really guards is
+//    that the CALL and the DEFINITION compose the SAME symbol — the
+//    pre-FR-123 error proved the call site already spelled `op_add` while
+//    nothing emitted it, and this pin is what keeps the two sides from
+//    drifting apart again. The non-admitted friend kinds keep their
+//    located rejection (free-operator-invalid.cpp's FRIENDBAD section).
 
 //--- shl.cpp
 // SHL: shl.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: overloaded operator
@@ -194,7 +203,13 @@ struct S {
 int use(const S s) { return s(1); }
 
 //--- friend-call.cpp
-// FRIENDCALL: friend-call.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: call to unimported function 'op_add'
+// Pre-FR-123 this read
+//   `error: unsupported: call to unimported function 'op_add'`
+// -- the call site composed the right symbol for a definition the item
+// walk never visited. Now both sides agree AND the definition exists.
+// FRIENDCALL: func.func @op_add(
+// FRIENDCALL: func.func @use_
+// FRIENDCALL: call @op_add(
 struct B {
   int v;
   friend int operator+(B a, int b) { return a.v + b; }
