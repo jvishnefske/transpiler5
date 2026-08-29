@@ -20,6 +20,9 @@
 
 #include "CImporterInternal.h"
 
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/xxhash.h"
+
 using namespace mlir;
 
 bool CImporter::ordinaryNameTaken(llvm::StringRef name) const {
@@ -516,7 +519,7 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   // cross-TU dedup below, which exists solely to merge the same file-scope
   // definition reached through a shared header in several TUs. A bare
   // anonymous record has no tag to mangle and is excluded: whatever its
-  // scope, it takes the shape-keyed `Anon<n>` path below, where the
+  // scope, it takes the shape-keyed `Anon<hash>` path below, where the
   // defining decl is already the identity and the shape is the name key.
   if (localScopeRecord) {
     // The name was decided above; a MISSING entry means no enclosing
@@ -555,7 +558,7 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
     // FR-78: every opaque union shares one blob field shape
     // (`opaque:[u8;N]`), but the C arm types are the real identity — fold
     // them into the shape key so two structurally different anonymous
-    // opaque unions never merge under the shape-keyed `Anon<n>` naming,
+    // opaque unions never merge under the shape-keyed `Anon<hash>` naming,
     // while the same union reached through a shared header in several TUs
     // still dedups to one struct_def.
     if (opaqueUnions.contains(definition))
@@ -616,25 +619,54 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
     structName = assignedStorage;
 
   // A bare anonymous struct (no tag, no typedef name) gets a synthesized
-  // `Anon<n>` name that is a deterministic function of its field shape:
-  // the shape is the key, so the same anonymous shape anywhere in the
+  // `Anon<hash>` name that is a deterministic function of its field shape:
+  // the 12 UPPERCASE hex digits of the TOP 12 nibbles (bits 63..16) of
+  // `llvm::xxh3_64bits(shape)`. `shape`, built just above, is already the
+  // exact cross-TU dedup key, so hashing it preserves both naming
+  // properties by construction -- the same anonymous shape anywhere in the
   // project reuses one name (and, through the shape dedup below, one
-  // struct_def), while distinct shapes always get distinct names. The
-  // counter only orders first encounters; it never influences which name a
-  // given shape maps to within an import. `anonRecordShapeNames` is
-  // consulted only for anonymous structs, so a named struct with the same
-  // shape keeps its own Rust type.
+  // struct_def), while distinct shapes get distinct names.
+  // `anonRecordShapeNames` is consulted only for anonymous structs, so a
+  // named struct with the same shape keeps its own Rust type.
+  //
+  // FR-151: the name has to be a function of the CONTENT, not of
+  // first-encounter ORDER. The old per-import `Anon<n>` counter made
+  // independent imports disagree -- TU A's `Anon0` was one shape and TU B's
+  // `Anon0` another -- so every FR-58 shard link that saw two different
+  // anonymous shapes died in `mergeShards` (which dedups module-level defs
+  // by NAME under structural equivalence) with `conflicting definitions of
+  // 'Anon0' at link`; measured on the 501-object `systemd-detect-virt`
+  // link, at siginfo_t.h's anonymous member. Tagging the name per TU is NOT
+  // the fix: a wrapper record's `field_types` embeds the anonymous name, so
+  // a per-TU tag makes the WRAPPER structurally differ between shards and
+  // turns a working shared-header link into a conflict on the wrapper
+  // instead. test/Driver/link-merge-anon-struct.c pins both halves.
+  //
+  // Uppercase hex with no separator so the emitted Rust type name is
+  // already CamelCase-shaped and never trips rustc's
+  // `non_camel_case_types`.
+  //
+  // A name already claimed elsewhere is a LOCATED rejection, never a bump:
+  // bumping is exactly the order dependence this fix removes (TU A may see
+  // a collision TU B does not, silently reintroducing the bug), so the
+  // incompleteness fails loud instead. `importedRecordShapes` is
+  // deliberately NOT consulted here -- the `existingShape` block
+  // immediately below already resolves a record-name coincidence
+  // correctly: an identical shape dedups (the whole point of the naming),
+  // and a different one is that block's loud cross-TU conflict diagnostic.
   if (structName.empty()) {
     auto known = anonRecordShapeNames.find(shape);
     if (known != anonRecordShapeNames.end()) {
       structName = known->second;
     } else {
-      std::string synthesized;
-      do {
-        synthesized = ("Anon" + llvm::Twine(anonStructCounter++)).str();
-      } while (importedRecordShapes.contains(synthesized) ||
-               importedEnumShapes.contains(synthesized) ||
-               ordinaryNameTaken(synthesized));
+      std::string synthesized =
+          "Anon" + llvm::utohexstr(llvm::xxh3_64bits(shape) >> 16,
+                                   /*LowerCase=*/false, /*Width=*/12);
+      if (importedEnumShapes.contains(synthesized) ||
+          ordinaryNameTaken(synthesized))
+        return emitError(defLoc)
+               << "unsupported: synthesized anonymous struct name '"
+               << synthesized << "' is already taken";
       structName =
           anonRecordShapeNames.try_emplace(shape, synthesized).first->second;
     }
@@ -700,7 +732,7 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
       // which `--preserve-c-names` already emits; the guard keys off the
       // EMITTED name, so that mode keeps transpiling these unharmed.
       //
-      // Gated on a USER-WRITTEN name: the shape-keyed `Anon<n>` path
+      // Gated on a USER-WRITTEN name: the shape-keyed `Anon<hash>` path
       // above merges two same-shape anonymous records ON PURPOSE
       // (CTS-R1) and must not be caught.
       if (!thisSpec && !ownerSpec && !recordRustName(definition).empty())

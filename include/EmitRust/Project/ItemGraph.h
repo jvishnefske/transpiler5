@@ -71,7 +71,7 @@
 ///    spelling is claimed (a program the importer rejects outright) the
 ///    record is skipped rather than given a wrong key. Still NOT reproduced,
 ///    because they depend on accumulated import state: the shape-keyed
-///    `Anon<n>` naming of bare anonymous records and the `<function>_<tag>`
+///    `Anon<hash>` naming of bare anonymous records and the `<function>_<tag>`
 ///    block-scope mangle. Consequently only NAMED, FILE-SCOPE records and
 ///    enums become nodes; an anonymous or block-scope one is skipped
 ///    entirely rather than given a name that might not match the emitted

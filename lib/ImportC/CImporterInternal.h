@@ -1721,7 +1721,7 @@ public:
 
   /// Imports every supported top-level declaration of `context`'s translation
   /// unit into the module: complete struct definitions (bare anonymous
-  /// structs under synthesized shape-keyed `Anon<n>` names), function
+  /// structs under synthesized shape-keyed `Anon<hash>` names), function
   /// declarations or definitions, and file-scope variables (as module-level
   /// `emitrust.global`s). Other declarations are rejected, with one
   /// exception: declarations whose expansion location lies in a system
@@ -2849,7 +2849,7 @@ private:
   /// name/shape deduplication; a block-scope record is its own type per
   /// defining decl and is emitted under a mangled name (see
   /// `localRecordNames`). A bare anonymous struct (no tag, no typedef
-  /// name) receives a synthesized `Anon<n>` name keyed by its field shape
+  /// name) receives a synthesized `Anon<hash>` name keyed by its field shape
   /// (see `anonRecordShapeNames`); repeated occurrences of the same
   /// anonymous shape share one struct_def. An empty member list
   /// (`struct T {};`) imports as a field-less struct_def. The field list
@@ -2988,7 +2988,7 @@ private:
   /// Returns the Rust type name `definition` was imported under: the
   /// mangled block-scope name recorded by `importRecord`, the
   /// collision-resolved name assigned by `structSymbolName` for a
-  /// file-scope record, the synthesized `Anon<n>` name for a bare
+  /// file-scope record, the synthesized `Anon<hash>` name for a bare
   /// anonymous struct, or the tag (or anonymous-typedef) name as the
   /// fallback. Empty only for an anonymous struct that was never imported.
   std::string emittedRecordName(const clang::RecordDecl *definition) const;
@@ -6369,17 +6369,20 @@ private:
   /// dedup. Living in its own map (never keyed by a user-written name) is
   /// the anonymity marker: an anonymous struct whose shape matches a named
   /// struct's still gets its own Rust type, because C type identity is by
-  /// declaration, not by shape. The name is a deterministic function of the
-  /// shape, so the same anonymous shape in two translation units maps to
-  /// one Rust type and two different shapes never collide.
+  /// declaration, not by shape. FR-151: the name is the CONTENT HASH of
+  /// that same key -- `Anon` plus 12 uppercase hex digits of
+  /// `xxh3_64bits(shape)` -- and not a first-encounter counter, so the same
+  /// anonymous shape maps to one Rust type not just across the translation
+  /// units of ONE import but across INDEPENDENT imports (the FR-58 shard
+  /// path runs a separate process per TU), while two different shapes never
+  /// collide. This map is the same-shape-reuse cache and the undo target of
+  /// the FR-118 rollback in `importRecordUncached`; it no longer decides
+  /// the spelling.
   llvm::StringMap<std::string> anonRecordShapeNames;
   /// Synthesized name of every imported bare anonymous struct, keyed by its
   /// defining declaration; populated by `importRecord` and consulted by
   /// `emittedRecordName`.
   llvm::DenseMap<const clang::RecordDecl *, std::string> anonRecordNames;
-  /// Next `Anon<n>` suffix to try when a new anonymous shape needs a name;
-  /// names are assigned in first-encounter order per import.
-  unsigned anonStructCounter = 0;
   /// Union arm -> the first arm's leaf field, whose spelling names the
   /// single flattened storage slot every arm aliases; populated by
   /// `collectRecordFields` (anonymous union members) and
