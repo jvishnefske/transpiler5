@@ -8,7 +8,7 @@
 // the implicit intermediate access Sema synthesizes, and initializer
 // lists (block-scope assigns and constant global attributes alike)
 // land on the flattened fields. Distinct from CTS-R1's bare anonymous
-// struct declarations, which keep their own `Anon<n>` Rust types.
+// struct declarations, which keep their own `Anon<hash>` Rust types.
 // RUN: split-file %s %t
 // RUN: emitrust-import-c %t/flatten.c | FileCheck %s
 // RUN: emitrust-import-c %t/union-slot.c | FileCheck %s --check-prefix=SLOT

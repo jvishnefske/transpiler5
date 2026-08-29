@@ -12,8 +12,9 @@
 // The negative control matters as much as the rejection: the guard is
 // gated on the record having a USER-WRITTEN name, because two same-shape
 // ANONYMOUS file-scope records legitimately share one synthesized
-// `Anon<n>` type (CTS-R1, structs-anon-bare.c). Without that gate this
-// guard rejects `struct { int v; } g1; struct { int v; } g2;` — measured.
+// `Anon<hash>` type -- the uppercase hex content hash of the field shape
+// (CTS-R1/FR-151, structs-anon-bare.c). Without that gate this guard
+// rejects `struct { int v; } g1; struct { int v; } g2;` — measured.
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/typedef-first.c 2>&1 | FileCheck %s --check-prefix=TYPEDEF
 // RUN: not emitrust-import-c %t/tag-first.c 2>&1 | FileCheck %s --check-prefix=TAGFIRST
@@ -49,10 +50,12 @@ int use(void) {
 
 //--- anon-pair.c
 // NEGATIVE CONTROL. Two same-shape file-scope anonymous records still
-// merge onto ONE `Anon0`: they have no user-written name, the emitted
-// name is a deterministic function of the field shape, and the merge is
+// merge onto ONE anonymous type: they have no user-written name, the
+// emitted name is the content hash of the field shape, and the merge is
 // the documented CTS-R1 behavior. This is the regression the guard's
-// `recordRustName(definition).empty()` gate exists to prevent.
+// `recordRustName(definition).empty()` gate exists to prevent. The name
+// is captured, never spelled: FR-151 made it a hash, and the property
+// pinned here is the SHARING, not the spelling.
 struct { int v; } g1;
 struct { int v; } g2;
 
@@ -62,7 +65,7 @@ int use(void) {
   return g1.v + g2.v;
 }
 
-// ANON: emitrust.struct_def @Anon0 ["v"] [i32]
+// ANON: emitrust.struct_def @[[V:Anon[0-9A-F]+]] ["v"] [i32]
 // ANON-NOT: emitrust.struct_def @Anon
-// ANON-DAG: emitrust.global @g1 : !emitrust.struct<"Anon0">
-// ANON-DAG: emitrust.global @g2 : !emitrust.struct<"Anon0">
+// ANON-DAG: emitrust.global @g1 : !emitrust.struct<"[[V]]">
+// ANON-DAG: emitrust.global @g2 : !emitrust.struct<"[[V]]">

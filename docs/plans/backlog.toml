@@ -294,21 +294,21 @@ anchor = "FR-150 DEFECT (found by the systemd probe"
 id = "FR-151"
 rank = 12
 kind = "defect"
-status = "open"
+status = "landed"
 size = "S"
 title = "Anonymous struct names are not TU-unique, so the --link shard merge collides"
-summary = "Found by the systemd probe 2026-08-28. error: conflicting definitions of 'Anon0' at link: the shards disagree on its shape. Anonymous structs are minted per TU as Anon0/Anon1/... WITHOUT the per-TU tag internal-linkage symbols get (tu0_), so siginfo_t's anonymous struct and an unrelated one in architecture.c collide. Blocks the 493-shard systemd-detect-virt merge. Direction: give anonymous struct names the same per-TU tag. Narrow and mechanical. NOT SPIKED."
+summary = "LANDED 2026-08-29. Anonymous struct names were a function of first-encounter ORDER (a per-import Anon<n> counter), not of content, so independent shard imports disagreed and mergeShards reported 'conflicting definitions of Anon0'. The entry's prescribed per-TU tag was measured WRONG: it would make wrappers whose field_types embed the anon name diverge between shards, converting a working shared-header link into a conflict on the wrapper. Fix: the name is Anon + 12 uppercase hex digits of xxh3_64bits(shape), the cross-TU dedup key already computed; bump-on-collision removed in favour of a located rejection. On the 501-object systemd-detect-virt link, 8 of the 9 names carrying divergent shapes were this defect; the link now advances to the 9th (FR-154). Gate 892/892."
 blocked_by = []
 anchor = "FR-151 DEFECT (found by the systemd probe"
 
 [[items]]
 id = "FR-152"
-rank = 21
+rank = 13
 kind = "defect"
 status = "open"
 size = "M"
 title = "scf.while legalization fails on gperf-generated lookup tables"
-summary = "Found by the systemd probe 2026-08-28. failed to legalize operation 'scf.while' on 7 units, all gperf-GENERATED lookup tables (af-from-name.gperf:51, errno-from-name, ...). Machine-generated C is a distinct shape class from hand-written C and this is the first time the project has measured it at scale. NOT SPIKED."
+summary = "Found by the systemd probe 2026-08-28. failed to legalize operation 'scf.while' on 7 units, all gperf-GENERATED lookup tables (af-from-name.gperf:51, errno-from-name, ...). Machine-generated C is a distinct shape class from hand-written C and this is the first time the project has measured it at scale. NOT SPIKED. REPRICED 2026-08-29 by the FR-151 spike: this is THE GATE ON THE WHOLE-PROGRAM --link PATH -- all six systemd-detect-virt objects that still yield no shard are gperf tables, and with FR-154 excluded the link's only remaining error is unresolved external capability_set_from_string. Also measured dead: the report's log_assert_failed blocker, since assert-util.c now recovers it as a stub definition."
 blocked_by = []
 anchor = "FR-152 DEFECT (found by the systemd probe"
 
@@ -322,6 +322,17 @@ title = "E0596 mutable borrow through a shared reference (35 crates)"
 summary = "Found by the systemd probe 2026-08-28. 35 crates fail error[E0596]: cannot borrow *p or p[_] as mutable, behind a & reference (src/core/manager, src/coredump/coredumpctl-journal, ...). Exit-0 unbuildable, the FR-145 class again. Ranked last of the five systemd findings because it is the only one that is not obviously narrow: a borrow-model question, not a naming or cast fix. NOT SPIKED."
 blocked_by = []
 anchor = "FR-153 DEFECT (found by the systemd probe"
+
+[[items]]
+id = "FR-154"
+rank = 14
+kind = "defect"
+status = "open"
+size = "M"
+title = "Two unrelated file-local record tags in different TUs compute one emitted name"
+summary = "Found by the FR-151 spike 2026-08-29. src/basic/hashmap.c:119 struct swap_entries idiomatic-renames to SwapEntries and collides at link with src/shared/hibernate-util.c:177 typedef struct SwapEntries; neither is header-shared. FR-108's same-name guard is keyed on currentTuTag so it only fires within ONE import, and under the shard path the two TUs never meet until mergeShards, which sees only names and shapes. This is the one of nine conflicting names in the 495-shard systemd-detect-virt scan that FR-151 does not fix, and it is now the first error that link reports. Directions: (a) link-time retag of a divergent name whose uses are shard-local, which is AST-independent and so does not disturb the CSymbolNaming byte-identity invariant that made FR-108 choose reject over rename; (b) keep rejecting but name both source locations. NOT SPIKED."
+blocked_by = []
+anchor = "FR-154 DEFECT (found by the FR-151 spike"
 
 [[items]]
 id = "FR-138"

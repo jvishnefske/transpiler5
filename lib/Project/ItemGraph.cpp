@@ -56,7 +56,7 @@
 /// imported-symbol component (equivalent for every importable program: a
 /// TU's pre-scan is exactly the set of ordinary module symbols it goes on
 /// to claim). What still cannot be followed is naming that DOES depend on
-/// import state (the `Anon<n>` shape keying, the block-scope
+/// import state (the `Anon<hash>` shape keying, the block-scope
 /// `<function>_<tag>` mangle); records and enums whose emitted name would
 /// depend on it are NOT nodes at all (see `recordSymbolFor`). A missing
 /// node is a visible, honest gap; a wrong node key would silently corrupt
@@ -548,7 +548,7 @@ private:
   /// namespace claims the tag spelling (FR-62 — the fix for the
   /// `struct G` / global `g` node-key collision). Empty when the graph
   /// deliberately declines to name it: an anonymous record (the importer
-  /// would assign a shape-keyed `Anon<n>`), a non-file-scope one (the
+  /// would assign a shape-keyed `Anon<hash>`), a non-file-scope one (the
   /// importer would apply the `<function>_<tag>` block-scope mangle) —
   /// both namings depend on accumulated import state the graph does not
   /// carry — or a record whose renamed spelling is ALSO claimed, which

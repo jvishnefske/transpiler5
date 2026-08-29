@@ -122,7 +122,7 @@ int whole(void) {
 
 //--- anon-distinct.c
 // Two structurally DIFFERENT anonymous-type opaque unions with the SAME
-// blob size must not merge under the shape-keyed `Anon<n>` naming: the
+// blob size must not merge under the shape-keyed `Anon<hash>` naming: the
 // blob field shape is identical (["opaque"], [u8;8]), so the C arm types
 // are folded into the shape key. Two struct_defs carrying the marker pin
 // the no-merge invariant (each CHECK-DAG must match a distinct line).
@@ -157,10 +157,14 @@ struct RecB {
   } u;
 };
 
-// ANON-DAG: emitrust.struct_def @{{Anon[0-9]+}} ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
-// ANON-DAG: emitrust.struct_def @{{Anon[0-9]+}} ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
-// ANON-DAG: emitrust.struct_def @{{([A-Za-z0-9_]+_)?}}RecA ["u"] [!emitrust.struct<"Anon{{[0-9]+}}">]
-// ANON-DAG: emitrust.struct_def @{{([A-Za-z0-9_]+_)?}}RecB ["u"] [!emitrust.struct<"Anon{{[0-9]+}}">]
+// FR-151 widened the synthesized spelling from a counter to uppercase hex
+// of the shape hash; the property pinned here is unchanged -- TWO DISTINCT
+// anonymous opaque unions (two DAG matches of the same pattern cannot land
+// on one line), one per record.
+// ANON-DAG: emitrust.struct_def @{{Anon[0-9A-F]+}} ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
+// ANON-DAG: emitrust.struct_def @{{Anon[0-9A-F]+}} ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
+// ANON-DAG: emitrust.struct_def @{{([A-Za-z0-9_]+_)?}}RecA ["u"] [!emitrust.struct<"Anon{{[0-9A-F]+}}">]
+// ANON-DAG: emitrust.struct_def @{{([A-Za-z0-9_]+_)?}}RecB ["u"] [!emitrust.struct<"Anon{{[0-9A-F]+}}">]
 
 //--- global-zero.c
 // Constant globals: an ALL-ZERO union constant — whether the braces name

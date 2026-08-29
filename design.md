@@ -9724,22 +9724,72 @@ piece and becomes FR-45.
   Clippy, paired against the epoch-5 pin: 231 -> 231 (+0). External build
   oracle: 0 BUILD_FAIL.
 
-- [ ] FR-151 DEFECT (found by the systemd probe 2026-08-28): ANONYMOUS STRUCT
-  NAMES ARE NOT TU-UNIQUE, so the FR-58 `--link` shard merge collides.
+- [x] FR-151 DEFECT (found by the systemd probe 2026-08-28; SPIKED and FIXED
+  2026-08-29): ANONYMOUS STRUCT NAMES WERE A FUNCTION OF FIRST-ENCOUNTER
+  ORDER, NOT OF CONTENT, so the FR-58 `--link` shard merge collided.
   `error: conflicting definitions of 'Anon0' at link: the shards disagree on
-  its shape` -- anonymous structs are minted per TU as `Anon0`, `Anon1`, …
-  WITHOUT the per-TU tag that internal-linkage symbols get (`tu0_`), so
-  `siginfo_t`'s anonymous struct and an unrelated one in `architecture.c`
-  collide. Blocks the 493-shard `systemd-detect-virt` merge.
-  DIRECTION: give anonymous struct names the same per-TU tag internal-linkage
-  names already carry. Narrow and mechanical.
-  **NOT SPIKED.**
+  its shape`. `importRecordUncached` minted `Anon<n>` from a per-import
+  counter, so independent imports disagreed: TU A's `Anon0` was one shape,
+  TU B's another, and `mergeShards` dedups module-level defs by NAME under
+  structural `OperationEquivalence`.
+
+  THE ENTRY'S PRESCRIBED DIRECTION WAS MEASURABLY WRONG. It said to give
+  anonymous names the per-TU tag internal-linkage symbols carry
+  (`tu0_Anon0`). Measured at HEAD: two TUs including ONE header with ONE
+  anonymous shape link CLEANLY today, dedup to one `struct Anon0`, and the
+  wrapper's `field_types` attribute embeds `!emitrust.struct<"Anon0">`. A
+  per-TU tag therefore makes the WRAPPER structurally differ between shards
+  and converts that working link into `conflicting definitions of 'Outer'`
+  -- it trades one failure for a strictly worse one. The class comment at
+  `CImporterInternal.h:6370` already ASSERTED the invariant ("a deterministic
+  function of the shape, so the same anonymous shape in two translation units
+  maps to one Rust type") that the counter did not implement.
+
+  FIX: the name is the CONTENT HASH of the cross-TU dedup key that was
+  already being computed -- `Anon` plus the 12 uppercase hex digits of bits
+  63..16 of `llvm::xxh3_64bits(shape)`. Because `shape` IS the dedup key,
+  both naming properties hold by construction: same shape anywhere in the
+  project reuses one name, distinct shapes never share one. Uppercase hex
+  with no separator keeps the emitted Rust type CamelCase-shaped
+  (`non_camel_case_types` clean, verified by building an emitted crate). The
+  bump-on-collision loop and `anonStructCounter` are GONE: a bump is exactly
+  the order dependence being removed, since TU A may see a collision TU B
+  does not. A claimed name is now a located rejection.
+
+  MEASURED, on the real 501-object `systemd-detect-virt` link (495 units
+  yield a shard, up from the probe's 493 -- FR-146/FR-149 recovered two):
+  * Before: exactly one error, `conflicting definitions of 'Anon0'` at
+    `/usr/include/.../siginfo_t.h:56`.
+  * A scan of all 495 shards found NINE emitted names carrying more than one
+    shape: `Anon0..Anon5` (42 name/shape pairs, 29 distinct shape strings)
+    plus `SiginfoT` (4 shapes) and `SdBusVtable` (2), which diverge ONLY in
+    an embedded `!emitrust.struct<"AnonN">` field type. EIGHT of the nine are
+    this defect at one remove.
+  * After: the `Anon` conflict is gone and the link advances to the ninth
+    name, `SwapEntries` -- a genuinely different defect, filed as FR-154.
+  Full gate 892/892; no EndToEnd stdout moved, as expected for a change that
+  only respells synthesized type names.
 
 - [ ] FR-152 DEFECT (found by the systemd probe 2026-08-28): `failed to
   legalize operation 'scf.while'` on 7 units, all gperf-GENERATED lookup tables
   (`af-from-name.gperf:51`, `errno-from-name`, …). Machine-generated C is a
   distinct shape class from hand-written C and this is the first time the
   project has measured it at scale.
+  REPRICED 2026-08-29 by the FR-151 spike: this is no longer a 7-unit
+  coverage item, it is THE GATE ON THE WHOLE-PROGRAM `--link` PATH. After
+  FR-151, all SIX `systemd-detect-virt` objects that still yield no shard are
+  gperf tables (`af-list`, `arphrd-util`, `capability-list`, `errno-list`,
+  `dns-type`, `ip-protocol-list`), and with FR-154 excluded from the link
+  line the next and only error is `unresolved external
+  'capability_set_from_string' at link` (`capability-list.h:21`) -- i.e. the
+  gperf units are the last thing between the project and a linked 495-unit
+  systemd binary.
+  Also dead as of this measurement: the FR-58 external report's second
+  whole-program blocker, `unresolved external 'log_assert_failed'` ("no
+  subset of systemd links, down to two files"). `assert-util.c:39` now
+  RECOVERS the function as a stub (`unsupported: call to 'abort'`), and the
+  stub is a definition, so the obligation resolves. That claim should be
+  struck from the report.
   **NOT SPIKED.**
 
 - [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28): 35 crates fail
@@ -9748,6 +9798,37 @@ piece and becomes FR-45.
   the FR-145 class again. Ranked last of the five because it is the only one
   that is not obviously narrow: it is a borrow-model question, not a naming or
   cast fix.
+  **NOT SPIKED.**
+
+- [ ] FR-154 DEFECT (found by the FR-151 spike 2026-08-29): TWO UNRELATED
+  FILE-LOCAL RECORD TAGS IN DIFFERENT TUs COMPUTE ONE EMITTED NAME, and the
+  `--link` merge cannot tell them apart.
+  `src/basic/hashmap.c:119`'s `struct swap_entries` idiomatic-renames to
+  `SwapEntries` and collides with `src/shared/hibernate-util.c:177`'s
+  `typedef struct SwapEntries`. Neither type is shared through a header;
+  neither is visible to the other. Measured shapes:
+      SwapEntries ["e"] [array<2 x OrderedHashmapEntry>]        hashmap.c
+      SwapEntries ["swaps", "n_swaps"] [i64, ui64]              hibernate-util.c
+  This is the ONE of the nine conflicting names in the 495-shard
+  `systemd-detect-virt` scan that FR-151 does not fix, and it is now the
+  first error that link reports.
+  WHY THE EXISTING GUARD MISSES IT: FR-108's same-name/different-type guard
+  (`ImportCAggregates.cpp:664-733`) is keyed on `structNameOwnerTuTags` ==
+  `currentTuTag`, i.e. it only fires for two records in ONE import. Under the
+  shard path each TU is a separate `emitrust-clang -c` invocation, so the two
+  never meet until `mergeShards`, which sees only names and shapes.
+  DIRECTIONS, both untested:
+  (a) link-time disambiguation -- `mergeShards` detects a name with divergent
+      shapes where every referencing use is inside a single shard, and
+      retags both with that shard's tu tag, rewriting references within the
+      shard. AST-independent, so it does not disturb the CSymbolNaming.h
+      byte-identity invariant that made FR-108 choose REJECT over rename.
+  (b) keep rejecting, but make the diagnostic name both source locations and
+      say which TU each shape came from; today it names only one.
+  Note FR-108's recorded reason for rejecting a rename --
+  `ItemGraphBuilder::recordSymbolFor` and FR-41 coloring recompute record
+  symbols from the AST ALONE -- applies to (b)'s import-time renaming but
+  NOT to (a), which happens after all AST work is done.
   **NOT SPIKED.**
 
 - [x] FR-148 DEFECT (MISCOMPILE, found while implementing FR-147 2026-08-29,

@@ -35,9 +35,9 @@
 /// is the natural one: everything that is a pure function of the clang AST
 /// lives here and is shared; everything that depends on accumulated import
 /// state (the tag-versus-ordinary-identifier collision renaming in
-/// `structSymbolName`, the shape-keyed `Anon<n>` naming, block-scope record
-/// mangling) stays in `CImporter` and is deliberately NOT modelled by the
-/// graph — see `ItemGraph.h` for what that costs.
+/// `structSymbolName`, the shape-keyed `Anon<hash>` naming, block-scope
+/// record mangling) stays in `CImporter` and is deliberately NOT modelled
+/// by the graph — see `ItemGraph.h` for what that costs.
 //
 //===----------------------------------------------------------------------===//
 
@@ -150,7 +150,7 @@ static inline std::string enumVariantRustName(llvm::StringRef name) {
 /// Returns the C-declared Rust-facing name of a record: its tag name, or,
 /// for a tagless record declared through `typedef struct { ... } T;`, the
 /// typedef name. Returns an empty StringRef for a bare anonymous struct,
-/// for which `importRecord` synthesizes a shape-keyed `Anon<n>` name
+/// for which `importRecord` synthesizes a shape-keyed `Anon<hash>` name
 /// (retrieved through `CImporter::emittedRecordName`). The typedef name is
 /// the record's name for all mangling and cross-TU shape-dedup purposes,
 /// exactly like a tagged struct. This is the base spelling only: for

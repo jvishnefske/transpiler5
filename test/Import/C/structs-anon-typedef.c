@@ -2,8 +2,11 @@
 // name; the struct imports, and its fields read/write and pass to functions
 // exactly like a tagged struct. Across translation units the typedef name is
 // the dedup key: an identical shape imports once. A bare anonymous struct
-// with no typedef name gets a synthesized shape-keyed `Anon<n>` name instead
-// (CTS-R1; see structs-anon-bare.c).
+// with no typedef name gets a synthesized `Anon<hash>` name instead, the
+// uppercase hex content hash of its field shape (CTS-R1/FR-151; see
+// structs-anon-bare.c). The hash is never spelled out in a test -- it is
+// captured into a FileCheck variable -- so extending the shape key cannot
+// churn this golden.
 // RUN: split-file %s %t
 // RUN: emitrust-import-c %t/valid.c | FileCheck %s
 // RUN: emitrust-import-c %t/tu-a.c %t/tu-b.c | FileCheck %s --check-prefix=DEDUP
@@ -87,4 +90,5 @@ struct {
 } g;
 
 // A bare anonymous struct imports under a synthesized shape-keyed name.
-// BARE: emitrust.struct_def @Anon0 ["x"] [i32]
+// BARE: emitrust.struct_def @[[BAREX:Anon[0-9A-F]+]] ["x"] [i32]
+// BARE: emitrust.global @g : !emitrust.struct<"[[BAREX]]">
