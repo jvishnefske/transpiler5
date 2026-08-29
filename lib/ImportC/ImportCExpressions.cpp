@@ -92,9 +92,12 @@ CImporter::emitArgvByteLValue(const clang::ArraySubscriptExpr *subscript,
               loc, emitrust::LValueType::get(emitrust::SliceType::get(i8Type)),
               *slice)
           .getResult();
-  FailureOr<Value> byteIndex = emitRValue(subscript->getIdx());
+  FailureOr<Value> byteIndex =
+      emitSubscriptIndexRValue(subscript->getIdx(), loc); // FR-149
   if (failed(byteIndex))
     return failure();
+  if (!llvm::isa<IntegerType>((*byteIndex).getType()))
+    return emitError(loc) << "unsupported subscript index type";
   return builder
       .create<emitrust::SubscriptOp>(loc, emitrust::LValueType::get(i8Type),
                                      place, *byteIndex)
@@ -3580,7 +3583,7 @@ CImporter::emitStlVectorIndexPlace(Value receiver,
   Type elementType = parseStlElementType(inner);
   if (!elementType)
     return emitError(loc) << "unsupported: " << opName << " element type";
-  FailureOr<Value> index = emitRValue(idxExpr);
+  FailureOr<Value> index = emitSubscriptIndexRValue(idxExpr, loc); // FR-149
   if (failed(index))
     return failure();
   if (!llvm::isa<IntegerType>((*index).getType()))
@@ -4508,7 +4511,7 @@ CImporter::emitStringViewIndexPlace(const clang::VarDecl *var,
   // requires i < size() (UB otherwise), so Rust's bounds panic on an
   // out-of-range index is a safe refinement.
   const StringViewLocalInfo &info = stringViewLocals.find(var)->second;
-  FailureOr<Value> index = emitRValue(idxExpr);
+  FailureOr<Value> index = emitSubscriptIndexRValue(idxExpr, loc); // FR-149
   if (failed(index))
     return failure();
   if (!llvm::isa<IntegerType>((*index).getType()))
@@ -7318,6 +7321,29 @@ FailureOr<Value> CImporter::emitEnumOperand(const EnumOperand &operand,
 Value CImporter::castEnumToI32(Location loc, Value value) {
   return builder.create<emitrust::CastOp>(loc, builder.getI32Type(), value)
       .getResult();
+}
+
+FailureOr<Value>
+CImporter::emitSubscriptIndexRValue(const clang::Expr *idxExpr, Location loc) {
+  FailureOr<Value> index = emitRValue(idxExpr);
+  if (failed(index))
+    return failure();
+  // FR-149: C's `tbl[target]` on an enum-typed `target` indexes by the
+  // enumerator's integer value, but C (unlike C++'s converted `operator[]`
+  // argument) puts NO conversion node in the AST -- the index arrives still
+  // typed `!emitrust.enum<"Name">`. Normalizing here, at the one seam every
+  // user-written index passes through, keeps every downstream
+  // subscript-building site (the array place, the pointer cursor fold, the
+  // byte-region offset, the STL container places) free of the enum case; a
+  // per-site fix would leave the same abort reachable through the others.
+  // The conversion is the importer's universal `castEnumToI32`, and it is
+  // value-preserving: an enumerator outside the i32 range is already rejected
+  // at the enum's import. An ANONYMOUS enum is a plain `i32` from `mapType`
+  // and passes through untouched, as does an `!emitrust.data_enum`, whose
+  // tagged-union payload has no integer discriminant to index by.
+  if (llvm::isa<emitrust::EnumType>((*index).getType()))
+    return castEnumToI32(loc, *index);
+  return index;
 }
 
 bool CImporter::isDecomposedPointerExpr(const clang::Expr *expr) const {

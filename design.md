@@ -9596,32 +9596,70 @@ piece and becomes FR-45.
   -- nothing here links into an init system -- but it is emitted Rust EXECUTING
   on a real kernel rather than only compiling.
 
-- [ ] FR-149 DEFECT (found by the systemd probe 2026-08-28, REPRODUCED at HEAD
-  2026-08-29): an ENUM-VALUED ARRAY SUBSCRIPT fails to verify.
-  `src/basic/log.c:1427` is `return log_target_max_level[target];` with
-  `LogTarget target`, and the importer produces:
-      error: 'emitrust.subscript' op operand #1 must be integer or index,
-             but got '!emitrust.enum<"LogTarget">'
-      note: %59 = "emitrust.subscript"(%56, %58) :
-            (!emitrust.lvalue<!emitrust.array<4xi32>>,
-             !emitrust.enum<"LogTarget">) -> !emitrust.lvalue<i32>
-  **THIS IS THE HIGHEST-LEVERAGE ITEM THE PROBE FOUND**: it is 5 units directly
-  (`log.c`, `dissect-image.c`, `logind-session.c`, `resolved`, `repart`), but
-  `log.c` is what every systemd TU pulls in for `assert()` -> `log_assert_failed`,
-  so this ONE bug is why NO SUBSET OF SYSTEMD LINKS, down to two files.
-  DIRECTION: insert the enum->integer cast at `emitrust.subscript`.
-  DOES NOT REDUCE SYNTHETICALLY, and the failed attempts are recorded so nobody
-  repeats them: a named `typedef enum` subscripting a `static const int[]`, the
-  same with a `switch` over the enum, an enum-typed global, and an enum struct
-  member ALL lower the enum to `i32` and emit fine. The `!emitrust.enum` path
-  needs something those shapes lack. **Use the real input** -- systemd is on
-  disk with a configured build; the one-line repro command is in FR-149's
-  reproduce note below. Per the standing lesson, INSTRUMENT the type-mapping
-  decision rather than guessing at a fourth reduction.
-  Reproduce: from `<systemd>/build-sd`,
-  `emitrust-cc --compdb . --emit=crate --crate-type=lib --incremental
-   ../src/basic/log.c -o <out>`.
-  **NOT SPIKED.**
+- [x] FR-149 DEFECT (found by the systemd probe 2026-08-28; SPIKED AND FIXED
+  2026-08-29): an ENUM-VALUED ARRAY SUBSCRIPT failed to verify --
+  `'emitrust.subscript' op operand #1 must be integer or index, but got
+  '!emitrust.enum<"LogTarget">'`.
+  **THIS ENTRY SAID "DOES NOT REDUCE SYNTHETICALLY" AND THAT WAS WRONG.** It
+  reduces to FOUR LINES, and the reason the four earlier attempts failed is one
+  word:
+      typedef enum LogTarget { T_A=0, T_B=1, T_C=2 } LogTarget;
+      static const int tbl[3] = { 10, 20, 30 };
+      int max_level(LogTarget t) { return tbl[t]; }
+  Every earlier attempt wrote `typedef enum { … } LT;` -- an ANONYMOUS enum with
+  a typedef name. `mapType` (ImportCTypes.cpp:253-267) returns a plain `i32`
+  when `definition->getName().empty()`, so ONLY a real TAG maps to
+  `!emitrust.enum`. Reading the type-mapping decision took two minutes and
+  explained all four failures at once; a fifth guessed reduction would not have.
+  THE LEVERAGE, which is why this ranked first: 5 systemd units hit it directly,
+  but `log.c` is one of them and EVERY systemd TU pulls `log.c` in for
+  `assert()` -> `log_assert_failed`. **This one bug is why no subset of systemd
+  linked, down to two files.**
+  FIXED WITH MACHINERY THAT ALREADY EXISTED AND ALREADY DOCUMENTED THIS CASE:
+  `emitrust.cast`'s own description (EmitRustOps.td:2033) says an
+  `!emitrust.enum` source with an integer result "exposes its raw value through
+  field `0`, so the cast renders e.g. `.0 as i32`". No new op, no dialect
+  change. The repro now emits `let v4: i32 = t.0 as i32; v1[v4 as usize]`.
+  THE SEAM, which the spike deliberately left open and the implementation
+  settled: there is NO pre-existing common helper -- the index is prepared
+  per-site -- but all index-preparing sites share the shape
+  `emitRValue(<index expr>)`, so a shared helper IS the seam.
+  `emitSubscriptIndexRValue` (ImportCExpressions.cpp:7326) now serves all EIGHT
+  user-index sites, reusing the importer's universal `castEnumToI32` (already
+  shared with comparisons, truthiness and arithmetic). Value-preserving by
+  construction: an enumerator outside i32 is already rejected at enum import.
+  A PER-SITE FIX WOULD HAVE LEAKED, and the audit is the evidence: only ONE of
+  the eight was the reported verifier abort. One already had a located
+  rejection, three (`ImportC.cpp:3252`, `:4917`, `ImportCExpressions.cpp:96`)
+  had NO GUARD AT ALL and fed `castToIntType`'s unconditional
+  `cast<IntegerType>`, and three were C++ container paths with their own
+  hand-rolled integer checks. The existing checks were left exactly where they
+  were and simply now see an integer; the three unguarded sites gained the same
+  located wording.
+  THE ANONYMOUS PATH IS PINNED UNCHANGED (enum-array-index-anonymous.c) --
+  plain `i32`, no cast, byte-for-byte -- which is precisely the distinction the
+  four failed reductions turned on.
+  MEASURED ON THE REAL TARGET: `src/basic/log.c` now emits (rc 0, zero
+  `must be integer or index`) **and its crate `cargo build`s clean** (3
+  warnings, 0 errors). `dissect-image.c`, `logind-session.c` and ALL 33
+  `src/resolve/resolved*.c` + `resolvectl.c` emit with zero occurrences.
+  `repart` is a FINDING not a failure: it is absent from this build's
+  compile_commands.json (1649 entries, zero matching), i.e. this systemd was
+  configured without it -- unrelated to FR-149.
+  Corpus emission delta over all 265 EndToEnd units: EXACTLY ONE file differs,
+  the new test; the other 264 byte-identical in emitted Rust, stderr AND exit
+  code. Clippy, paired against the epoch-5 pin: 231 -> 231 (+0). External build
+  oracle: 0 BUILD_FAIL.
+  ONE DEFENSIVE GUARD IS UNPINNED, and honestly so: the `unsupported subscript
+  index type` wording at the four newly-guarded sites is unreachable from
+  admitted source -- a float index is a clang Sema error, a C++ user-defined
+  conversion is rejected earlier, and an `enum class`/data_enum cannot be
+  written in a subscript in valid C++. No test was fabricated for it.
+  KNOWN LEDGER DRIFT, recorded rather than silently corrected:
+  test/Kernel/linux-6.6.94-allnoconfig/rejection-report.txt:61 still records
+  `1x unsupported subscript index type`, which this change drives to 0. That
+  file is referenced by no lit test, so re-measuring the kernel corpus is a
+  separate act; the count is stale until someone does it.
 
 - [ ] FR-150 DEFECT (found by the systemd probe 2026-08-28): an emitted type
   whose C name collides with the RUST PRELUDE shadows it and breaks the crate.
