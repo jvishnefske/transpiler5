@@ -9243,6 +9243,50 @@ piece and becomes FR-45.
   is readable in one place), and incremental-owner-struct-reached.c -- THE
   NEGATIVE CONTROL, which fails if the sweep is ever widened.
 
+- [ ] FR-144 DEFECT (TOOLING, found by T-EPOCH4's freeze 2026-08-28): THE
+  IMPROVEMENT HARNESS'S FROZEN-CORPUS PREMISE IS BROKEN, in two places, and
+  nothing detects either. The epoch mechanism exists so a warning delta between
+  two emitter revisions is attributable to the emitter ALONE (a paired
+  comparison over a pinned population). Both of its consumers currently
+  violate that.
+  (1) EPOCHS 1, 2 AND 3 HAVE ALL DRIFTED. `epoch.py verify` returns 1 for each:
+      epoch-1 reports 3 CONTENT-CHANGED files
+      (`link-merge-e2e.c`, `planner-rejection-builds.c`, `preserve-c-names.c`),
+      epochs 2 and 3 report 2 each (`planner-rejection-builds.c`,
+      `range-for.c`). PRE-EXISTING and long-standing -- blamed to old commits
+      (e91c45c, d6ef2ad, 0afcbac, a308e45), none from the 2026-08-28 wave, and
+      CONFIRMED by running the PRE-PATCH `epoch.py` from `git show HEAD:`
+      against the same tree: identical CONTENT-CHANGED output. So every
+      trajectory recorded against epochs 1-3 was measured over a population
+      that had already moved.
+      WHY NOTHING NOTICED: `ledger_append` compares the epoch DOCUMENT's stored
+      hash against the ledger's, never against the files on disk. `verify` is
+      the only thing that would catch it and nothing calls it automatically.
+  (2) THE COMMITTED CLIPPY RATCHET IS MEASURING ACROSS A CHANGED POPULATION.
+      At HEAD it FIRES -- `ratchet: 68 -> 72 (+4)`, exit 1 -- but
+      `clippy-baseline.json` records 164 linted / 16 skipped over 180 `.c`
+      files while the corpus is now 186. The +4 is therefore NOT a paired
+      comparison and is not attributable to any emitter change; it may be
+      partly the same day's new tests. Note the ratchet is NOT part of the lit
+      gate, so this has not been blocking commits -- which is also why it went
+      unnoticed.
+  CONSEQUENCE: no clippy trajectory number recorded against epochs 1-3, and no
+  current ratchet delta, should be trusted as evidence about an emitter change
+  until re-based. Epoch 4 (frozen at 556677d, 238 files, measurability-filtered)
+  is the clean population to re-base on.
+  DIRECTIONS, none chosen: (a) make `ledger_append` and/or the ratchet CALL
+  `verify` and refuse to record against a drifted epoch -- cheap, and turns a
+  silent wrong number into a loud one; (b) re-base the committed ratchet onto
+  epoch 4 and pin its file list, so its population is frozen like an epoch's;
+  (c) treat epochs 1-3 as closed history, record the drift in the ledger, and
+  never compare against them again. (a)+(b) look complementary.
+  A LATENT HAZARD found in the same sweep and NOT hit today: `clippy_eval`'s
+  `crate_lints` derives the crate dir from the basename stem in a SHARED
+  tempdir, so a future `foo.c` + `foo.cpp` pair in a union corpus would collide
+  and one would silently overwrite the other. Measured: 0 stem collisions
+  across epoch 4's 238 files, so it is latent, not live.
+  **NOT SPIKED.**
+
 - [x] FR-143 DEFECT (found while landing FR-141, 2026-08-28; FIXED
   2026-08-28): NO OWNER METHOD HAD EVER BEEN COUNTED AS PORTED.
   `collectEmittedSymbols` (tools/emitrust-cc/ProgressReport.cpp:487-493)
@@ -16058,9 +16102,40 @@ default clippy has no lint for either, so **the metric has a blind spot
 and must not be the sole quality oracle**. And the biggest idiomaticity
 gap in emitted C++, FR-110, is invisible to it entirely.
 
-One tooling follow-up: the harness should freeze **epoch 4** over the
-union corpus -- epoch-3 froze 144 EndToEnd `.c` files, there are now
-167, and the 52 measurable C++ crates are covered by no epoch at all.
+One tooling follow-up, **DONE 2026-08-28: epoch 4 is frozen** over the union
+corpus. THE NUMBERS IN THIS NOTE WERE STALE IN THREE PLACES and the measured
+ones are: `test/EndToEnd` holds **186** `.c` (not 167) and **72** `.cpp`, of
+which **68** are measurable (not 52). Part of that growth is the same day's
+FR-140/141/142/143 test additions.
+MEASURABILITY, defined here because an epoch whose metric is undefined for
+some member is not frozen in any useful sense: a file is measurable iff
+`--emit=crate` produces a crate AND `cargo clippy` yields a COMPLETE tally --
+it may fail on a deny-by-default clippy lint (that failure IS the tally) but
+must not fail on a rustc error, which truncates the count. It is a property of
+the PINNING REV: a file that starts transpiling later does not join the epoch.
+All 258 files were probed individually. **20 excluded**, every one for
+criterion (a) -- no crate at all: 16 multi-TU/link tests fed as a single
+standalone TU, 1 split-file lit test that is not a standalone TU, and 3
+by-design rejections (`unsigned __int128`, a ptr-to-ptr escape, a volatile
+type). ZERO hit criterion (b), so nothing was quietly dropped; the reasons are
+recorded per file in `nix/harness/epoch-4.exclude.txt`.
+EPOCH 4: file_count **238** (170 `.c` + 68 `.cpp`), corpus_hash
+`sha256:28f71ffa...`, created_rev `556677d`, split seed=4 frac=0.25 ->
+**178 train / 60 held-out**, partition verified (178+60 = 238, overlap 0, union
+== the pinned set). Seed follows the ACTUAL convention in epochs 1/2/3, which
+is `seed == epoch_id`, not a fixed 3.
+CLIPPY AT EPOCH 4 (rev 556677d): train **166** warnings over 178 crates,
+held-out **72** over 60, union 238; ZERO skipped on either slice, which
+independently confirms the measurability filter did its job. Written to
+`nix/clippy-eval/clippy-baseline-epoch4.json` as a FRESH document --
+`clippy-baseline.json` is deliberately untouched, because overwriting it would
+silently redefine the committed ratchet's population.
+**These numbers are NOT comparable to epoch-3's** -- different population
+(union vs `.c`-only, measurable-filtered vs not). No trajectory claim is made
+in either direction, which is the whole reason the epoch mechanism exists.
+Worth noting for whoever optimizes next: `borrowed_box` (19 occurrences) lands
+ENTIRELY in held-out, so it is invisible to a train-only optimizer -- exactly
+the blind spot the held-out split is for.
 
 
 ## Track 4 RealWorld corpus (demand signal)

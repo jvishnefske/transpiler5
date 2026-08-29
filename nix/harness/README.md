@@ -27,6 +27,7 @@ guard.
 | `epoch.py` | epoch freeze (file list + content hash), train/held-out split, trajectory ledger |
 | `signals.py` | merge correctness / quality / demand into one ranked queue (`severity × leverage × 1/risk`, severity-tiered) |
 | `epoch-N.json` | the frozen epoch: pinned files + `corpus_hash` |
+| `epoch-N.exclude.txt` | paths omitted as UNMEASURABLE at the pinning rev, with reasons |
 | `epoch-N.{train,heldout}.txt` | the deterministic split (optimizer sees train only) |
 | `champion.json` | the current champion's train/held-out score + permitted allow-lines |
 | `ledger.json` | per-epoch trajectory: `(emitter_rev, metrics)` for each accepted revision |
@@ -65,5 +66,30 @@ python3 nix/harness/controller.py collect            # ranked queue
 python3 nix/harness/controller.py iterate --id 1 --note "assign_op_pattern"
 python3 nix/harness/epoch.py ledger-show --id 1      # the descent
 ```
+
+### Union corpora and measurability (epoch-4 and later)
+
+`epoch.py freeze` takes repeatable `--corpus` and `--ext`, so one epoch can
+pin the union of several roots and extensions:
+
+```bash
+python3 nix/harness/epoch.py freeze --id 4 \
+    --corpus test/EndToEnd --ext .c --ext .cpp \
+    --exclude nix/harness/epoch-4.exclude.txt
+python3 nix/harness/epoch.py split --id 4 --seed 4 --held-out-frac 0.25
+```
+
+Only **measurable** files may be pinned: the file must transpile to a crate
+(`emitrust-cc --emit=crate`) and `cargo clippy` on that crate must yield a
+COMPLETE tally — it may fail on a deny-by-default clippy lint (that failure
+*is* the tally), but not on a rustc error, which truncates the count and
+leaves the metric undefined. `clippy_eval` silently skips an unmeasurable
+file, so pinning one would only pad the denominator. Measurability is a
+property of the pinning revision; `--exclude` records the omissions as
+provenance, and a file that starts transpiling later does **not** join the
+epoch (that is a new population, i.e. a new epoch).
+
+Defaults reproduce the epoch-1..3 shape exactly (one root, `.c`,
+non-recursive), so those frozen documents are never rewritten.
 
 See `LOOP.md` for the full protocol and termination rules.

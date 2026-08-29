@@ -15,11 +15,34 @@ the descent is queryable (`ledger-show`).
 
 Subcommands::
 
-  epoch.py freeze  --corpus DIR --id N [--out FILE]
+  epoch.py freeze  --corpus DIR [--corpus DIR ...] [--ext .c --ext .cpp]
+                   [--recursive] [--exclude FILE] --id N [--out FILE]
   epoch.py verify  --id N            # recompute hashes, confirm the sample
   epoch.py split   --id N --held-out-frac F --seed K   # train/held-out lists
   epoch.py ledger-append --id N --rev R --metrics FILE [--note S]
   epoch.py ledger-show   --id N      # render the monotone descent
+
+UNION CORPORA (epoch-4 and later). ``--corpus`` and ``--ext`` both repeat, so
+one epoch can pin the union of several roots and several source extensions
+(e.g. ``test/EndToEnd`` x {.c, .cpp}). The union is deduplicated and sorted,
+so enumeration order never depends on ``os.listdir`` order, and the corpus
+hash still covers every pinned file's content -- editing any pinned file
+breaks ``verify``. Epochs 1-3 were frozen single-root/``.c``; the defaults
+reproduce exactly that behaviour, and those documents are frozen history that
+must never be rewritten.
+
+MEASURABILITY (what ``--exclude`` is for). The epoch's metric is a clippy
+tally over the crate each pinned file emits, so a file is *measurable* only if
+(a) ``emitrust-cc --emit=crate`` actually produces a crate, and (b) ``cargo
+clippy`` on that crate yields a COMPLETE tally -- it may fail on a
+deny-by-default clippy lint (that failure IS the tally) but must not fail on a
+rustc error, which would truncate the count and leave the metric undefined.
+An unmeasurable file must not be pinned: ``clippy_eval`` silently skips it, so
+pinning it would put a file in the denominator that contributes nothing.
+Measurability is a property of the pinning revision, and the exclusion list is
+recorded in the epoch document as provenance -- a file that starts
+transpiling later does NOT join this epoch (that would change the population,
+i.e. start a new epoch).
 
 Design constraints (CLAUDE.md): immutable-by-default (every write is a fresh
 JSON document), Result-style exit codes (non-zero on any inconsistency), no
@@ -45,9 +68,47 @@ def _sha256_file(path):
     return h.hexdigest()
 
 
+def _enumerate(roots, exts=(".c",), recursive=False, exclude=()):
+    """Deterministic union enumeration over one or more roots/extensions.
+
+    Returns a sorted, deduplicated path list. Sorted (not listdir order) so a
+    re-freeze of an unchanged tree reproduces the identical file list and
+    hence the identical corpus hash; deduplicated so overlapping roots cannot
+    double-count a file into the denominator.
+    """
+    exts = tuple(exts)
+    skip = {os.path.normpath(p) for p in exclude}
+    found = set()
+    for root in roots:
+        if recursive:
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames.sort()
+                for name in filenames:
+                    if name.endswith(exts):
+                        found.add(os.path.normpath(
+                            os.path.join(dirpath, name)))
+        else:
+            for name in os.listdir(root):
+                path = os.path.join(root, name)
+                if name.endswith(exts) and os.path.isfile(path):
+                    found.add(os.path.normpath(path))
+    return sorted(found - skip)
+
+
 def _enumerate_c(corpus):
-    return sorted(os.path.join(corpus, x) for x in os.listdir(corpus)
-                  if x.endswith(".c"))
+    """Epoch-1..3 behaviour: one directory, ``.c`` only, non-recursive."""
+    return _enumerate([corpus])
+
+
+def read_path_list(path):
+    """Newline-separated paths; ``#`` comments and blanks ignored.
+
+    Same convention as ``clippy_eval.py --file-list`` and the split slices, so
+    a held-out list can be fed straight back in as an exclusion list.
+    """
+    with open(path) as f:
+        return [ln.strip() for ln in f
+                if ln.strip() and not ln.lstrip().startswith("#")]
 
 
 def _git_rev():
@@ -73,24 +134,42 @@ def corpus_hash(entries):
     return "sha256:" + hashlib.sha256("\n".join(lines).encode()).hexdigest()
 
 
-def freeze(corpus, epoch_id, out=None):
-    files = _enumerate_c(corpus)
+def freeze(corpus, epoch_id, out=None, exts=None, recursive=False,
+           exclude=()):
+    """Pin a corpus. ``corpus`` is a root dir or a list of root dirs."""
+    roots = [corpus] if isinstance(corpus, str) else list(corpus)
+    # Canonicalize so the epoch DOCUMENT is a pure function of the sample too,
+    # not just its hash: --ext .cpp --ext .c and --ext .c --ext .cpp record
+    # the same thing.
+    exts = tuple(sorted(set(exts or (".c",))))
+    exclude = sorted({os.path.normpath(p) for p in exclude})
+    files = _enumerate(roots, exts, recursive, exclude)
     if not files:
-        raise SystemExit(f"no .c files under {corpus}")
+        raise SystemExit(
+            f"no {'/'.join(exts)} files under {', '.join(roots)}")
     entries = [{"path": f, "sha256": _sha256_file(f)} for f in files]
     doc = {
         "epoch_id": epoch_id,
-        "corpus_root": corpus,
+        # corpus_root stays a plain string for a single root (epoch-1..3
+        # shape, and what the ledger keys on); corpus_roots is the union.
+        "corpus_root": roots[0] if len(roots) == 1 else "+".join(roots),
+        "corpus_roots": roots,
+        "extensions": list(exts),
+        "recursive": recursive,
         "created_rev": _git_rev(),
         "corpus_hash": corpus_hash(entries),
         "file_count": len(entries),
+        "excluded_count": len(exclude),
+        "excluded": exclude,
         "files": entries,
     }
     out = out or epoch_path(epoch_id)
     with open(out, "w") as f:
         json.dump(doc, f, indent=2)
         f.write("\n")
-    print(f"epoch-{epoch_id} frozen: {len(entries)} files, {doc['corpus_hash']}")
+    print(f"epoch-{epoch_id} frozen: {len(entries)} files"
+          f"{f' (+{len(exclude)} excluded)' if exclude else ''}, "
+          f"{doc['corpus_hash']}")
     print(f"  written: {out}")
     return doc
 
@@ -238,7 +317,15 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("freeze")
-    p.add_argument("--corpus", required=True)
+    p.add_argument("--corpus", required=True, action="append",
+                   help="corpus root; repeat for a union corpus")
+    p.add_argument("--ext", action="append", default=None,
+                   help="source extension to pin (default .c); repeatable")
+    p.add_argument("--recursive", action="store_true",
+                   help="walk subdirectories of each root")
+    p.add_argument("--exclude", default=None,
+                   help="file of paths to omit (unmeasurable files); "
+                        "'#' comments ignored")
     p.add_argument("--id", type=int, required=True)
     p.add_argument("--out", default=None)
 
@@ -261,7 +348,9 @@ def main(argv=None):
 
     args = ap.parse_args(argv)
     if args.cmd == "freeze":
-        freeze(args.corpus, args.id, args.out)
+        excl = read_path_list(args.exclude) if args.exclude else ()
+        freeze(args.corpus, args.id, args.out, exts=args.ext,
+               recursive=args.recursive, exclude=excl)
         return 0
     if args.cmd == "verify":
         return verify(args.id)
