@@ -443,12 +443,12 @@ anchor = "FR-106 DEFECT"
 id = "FR-82"
 rank = 17
 kind = "feature"
-status = "open"
+status = "no-go"
 size = "M"
 title = "Interior-member addresses of requirement globals"
-summary = "Longstanding C-side front; see entry."
+summary = "SPIKE VERDICT: NO-GO (2026-08-15) with the measured table -- see design.md. A clang-AST place-projection automaton classified all 258 address-involving ip_data occurrences across the 9 lwIP units: FOLD-READ 177, FOLD-WRITE 34, PTRCMP-NULL 13, CALL-CONST 29, CALL-INDIRECT 1, ESCAPE-STORE 4; class (a)=0 and class (c) CALL-MUT=0. Decisive: 220/258 occurrences cross the u_addr union arm, which the FR-78 opaque model rejects BEFORE any requirement machinery, so admitting the maximal FR-82 subset flips ZERO of 9 units; the (b) temporary-borrow image was byte-diff MEASURED to diverge (native hazard=99 vs Rust 41); etharp ethbroadcast is a packed byte-region record with no StructDefOp. THE REDIRECT: the actionable next front is the FR-78 opaque-union model, after which the cheap folds alone flip ip6_frag. Kept open as a record, not as queued work."
 blocked_by = []
-anchor = "FR-82 Interior-member addresses"
+anchor = "FR-82 NO-GO (2026-08-15) Interior-member addresses"
 
 [[items]]
 id = "W2.24"
