@@ -9266,26 +9266,78 @@ piece and becomes FR-45.
   can move a ledger, so measure before and after); full lit 100%.
   **NOT SPIKED.**
 
-- [ ] FR-142 DEFECT (found by FR-106's 473-crate build sweep 2026-08-28): a
-  DEFERRED binding is emitted `let mut` and never reassigned, so the crate's
-  own `unused_mut = "deny"` rejects it. On kgabis/parson `parson.c`:
-      error: variable does not need to be mutable
-        --> let mut v30: i64;
-  This is the FR-105 `mut` decision mirrored onto the deferred-binding path:
-  the mutability is decided from the pre-deferral shape, then the initializer
-  is dropped and the binding is written once. Exit-0 unbuildable, safe
-  direction, same policy violation as FR-140/FR-141.
-  Reproduce: shallow-clone github.com/kgabis/parson, then
-  `emitrust-cc --emit=crate parson.c -o <out> --crate-type=lib` and
-  `cargo build --release`.
-  NOTE the shared shape across FR-140, FR-141 and FR-142: all three are the
-  emitter producing code its OWN manifest lint table or type environment
-  rejects. That is a class, not three coincidences, and a cheap standing guard
-  -- build every emitted crate in the external sweep and fail on any rustc
-  error -- would have caught all three. `scripts/tractor-eval.py` already
-  builds crates; extending the external probe loop to do the same is the
-  cheapest way to stop finding these one at a time.
-  **NOT SPIKED.**
+- [x] FR-142 DEFECT (found by FR-106's 473-crate build sweep 2026-08-28;
+  SPIKED AND FIXED 2026-08-28): a deferred binding was emitted `let mut` and
+  never reassigned, so the crate's own `unused_mut = "deny"` rejected it --
+  exit 0, unbuildable, no diagnostic.
+  **THE HYPOTHESIS THIS ENTRY WAS FILED WITH IS WRONG.** It said "the FR-105
+  `mut` decision mirrored onto the deferred-binding path: mutability decided
+  from the pre-deferral shape, then the initializer is dropped". Measured:
+  NOTHING about deferral ordering is involved. It is a missing operand-identity
+  check.
+  ROOT CAUSE, one line. lib/Target/Rust/TranslateToRust.cpp:1868-1869:
+      if (auto sliceOf = dyn_cast<emitrust::SliceOfOp>(user))
+        postInitMutation |= sliceOf.getIsMut();
+  `emitrust.slice_of` has TWO operands -- `$base` (an LValueType) and `$index`
+  (AnyInteger|Index), EmitRustOps.td:1724-1726 -- and `binding.getUsers()`
+  returns the op through EITHER. This branch never asked which, so
+  `&mut place[binding as usize..]`, where the binding is a pure READ used as
+  the start index, was scored as a mutable borrow OF THE BINDING.
+  The correct pattern was already adjacent IN THE SAME LOOP: the
+  `MethodCallOp` branch two lines below checks `call.getReceiver() == binding`,
+  and the comment at :1873-1875 states the rule verbatim -- "only when the
+  binding is the refined BASE, not a subscript index (`other[binding]` merely
+  reads it)". Fixed by adding `&& sliceOf.getBase() == binding`, plus the same
+  explicit check on the `AddrOfOp` line above (one operand, so safe by accident
+  today -- made explicit for hygiene).
+  HOW IT WAS FOUND, recorded because the method is the transferable part: SIX
+  blind reduction attempts failed, all lifted away into `if c { a } else { b }`
+  -- an early-return guard (which FOLDS AWAY, because a slice is never null), a
+  non-foldable integer guard, a return inside a loop, a three-arm if, a
+  multi-statement arm with opaque calls, and the binding used as a slice index.
+  The FR-141 spike had failed to reduce it independently. INSTRUMENTING the
+  decision site to print the three disjuncts separately answered it in ONE
+  build, and the repro then reduced to 14 lines on the first try, derived
+  BACKWARDS from the mechanism. Measure before reducing when a shape resists.
+  The instrumented line, verbatim:
+      maxWrites=1 loopReassign=0 postInitMutation=1 => needsMut=1
+      TRIGGER: %13 = emitrust.slice_of mut %2[%10]
+  -- `%10` is the binding, and it is the INDEX. `maxWrites` is path-aware
+  (`std::max` of the arms at :1586) and was correct all along.
+  WHY IT RESISTED REDUCTION: the misfire needs the binding to be a DIRECT SSA
+  `emitrust.let` result that is itself the index of a MUTABLE `slice_of`.
+  An lvalue-mode local (`emitrust.variable` + load) or a shared borrow both
+  dodge it.
+  SECOND-ORDER EFFECT, and it changes emitted bytes: clearing the flag lets
+  `computeIfExprBindings` (:2262-2266) see the binding, which SKIPS anything
+  still marked `mut`. On sds the temp lifts away entirely
+  (`let v8: i64 = if v4 < len { ... };`); on parson it does not (a `loop`
+  follows, so the `if` is not `getNextNode()`) and only the `mut ` disappears.
+  Both are correct. MEASURED over the 475-crate corpus: exactly 2 files differ,
+  -22 bytes total (sds -18, parson -4), ZERO EndToEnd crates, ZERO TRACTOR
+  crates, ZERO goldens.
+  INCIDENCE, counted not estimated: 2 misfires in 2766 deferred-binding
+  decisions corpus-wide, and those same 2 crates were the ONLY build failures
+  in all 475 -- 100% correlation, so one line explained every compile failure
+  in the corpus. Post-fix 475/475 build.
+  A NEIGHBOUR IS LATENT, NOT LIVE, and was deliberately NOT "hardened":
+  `lvalueIsMutated` (:1522) has the identical unguarded shape but cannot
+  misfire, because its `value` is always an lvalue and an lvalue can never be a
+  `slice_of` index. A blind narrowing there would DROP a `mut` a real mutable
+  borrow needs (E0596). Recorded in a comment at the site.
+  Pinned by test/Target/Rust/deferred-mut-slice-index.mlir -- THE INVARIANCE
+  GUARD, and the important test: it pins index-loses-mut AND base-KEEPS-mut in
+  one file, so the fix cannot become an over-relaxation. Plus
+  test/Import/C/deferred-mut-slice-cursor.c (the 14-line repro as a fast-tier
+  text golden, so the shape is in the inner loop) and
+  test/EndToEnd/deferred-mut-slice-index.c, which pre-fix failed at the
+  `--build` RUN line with two `unused_mut` errors before any diff could run.
+  REMAINING, unexplained and NOT chased: the instrumentation showed
+  `writtenAtExit=0` on bindings assigned in BOTH arms, where the merge at
+  :1584 should give 1. It does not affect this fix (deferral of a non-droppy
+  binding never consults it, and rustc's E0381 is the backstop) and did not
+  change under it -- but it is an unexplained reading in the same analysis and
+  will matter to whatever next depends on definite assignment.
 
 - [x] FR-140 DEFECT (found by FR-138's corpus sweep 2026-08-28; FIXED
   2026-08-28): a legal C identifier containing an INTERIOR double underscore
