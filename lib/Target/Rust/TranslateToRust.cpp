@@ -1519,6 +1519,12 @@ bool RustEmitter::lvalueIsMutated(Value value) {
         return true;
       continue;
     }
+    // No base/index identity test here, unlike the FR-142 guard in
+    // `computeDeferredInits`: `value` is always an LVALUE on this path, and an
+    // `emitrust.slice_of` INDEX is `AnyInteger|Index`, so an lvalue can never
+    // reach this branch as the index. The unguarded shape is latent, not live
+    // -- do not "harden" it blind, since a wrong narrowing here drops a `mut`
+    // that a real mutable borrow needs (rustc E0596).
     if (auto sliceOf = dyn_cast<emitrust::SliceOfOp>(owner)) {
       if (sliceOf.getIsMut())
         return true;
@@ -1863,10 +1869,23 @@ void RustEmitter::computeDeferredInits(Block &block) {
     for (Operation *user : binding.getUsers()) {
       if (unreachableOps.count(user))
         continue;
+      // `emitrust.addr_of` has a SINGLE operand, so a use through it is
+      // necessarily a borrow OF the binding; the identity test is spelled out
+      // anyway so this arm cannot rot into the `slice_of` defect below if the
+      // op ever grows an operand.
       if (auto addrOf = dyn_cast<emitrust::AddrOfOp>(user))
-        postInitMutation |= addrOf.getIsMut();
+        postInitMutation |= addrOf.getIsMut() && addrOf.getOperand() == binding;
+      // FR-142: `emitrust.slice_of` has TWO operands -- `$base` and `$index` --
+      // and `getUsers()` returns the op through EITHER. Only a mutable borrow
+      // of the BASE mutates the binding; `&mut other[binding as usize..]`
+      // merely READS the binding as the start index (the same rule the comment
+      // below states for projections, and the same identity test the
+      // `MethodCallOp` arm applies to its receiver). Scoring the index use as
+      // a mutation left the binding `let mut` with no reassignment anywhere,
+      // which the emitted crate's own `unused_mut = "deny"` rejects: exit 0,
+      // an unbuildable crate, and no diagnostic.
       if (auto sliceOf = dyn_cast<emitrust::SliceOfOp>(user))
-        postInitMutation |= sliceOf.getIsMut();
+        postInitMutation |= sliceOf.getIsMut() && sliceOf.getBase() == binding;
       if (auto call = dyn_cast<emitrust::MethodCallOp>(user))
         postInitMutation |=
             call.getReceiver() == binding && methodCallMutatesReceiver(call);
