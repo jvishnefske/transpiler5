@@ -181,6 +181,28 @@ blocked_by = []
 anchor = "FR-140 DEFECT (found by FR-138's corpus sweep"
 
 [[items]]
+id = "FR-141"
+rank = 15
+kind = "defect"
+status = "open"
+size = "M"
+title = "Emitter writes an impl for a type it never defines (sds)"
+summary = "Found by FR-106's 473-crate build sweep 2026-08-28. antirez/sds emits `impl OwnerSdsfromlonglongBuf {` for a type with no definition: error[E0425] cannot find type in this scope. Exit 0, unbuildable crate, NO diagnostic. Same contract-violation class as FR-140 and adjacent to FR-137 (the crash on the same input). The FR-62 actor/owner lift manufactures the owner type name; something admits the impl while the StructDefOp that would define it is dropped or never planned. A dropped owner type must either suppress its impl or be a LOCATED diagnostic. NOT SPIKED."
+blocked_by = []
+anchor = "FR-141 DEFECT (found by FR-106's 473-crate build sweep"
+
+[[items]]
+id = "FR-142"
+rank = 16
+kind = "defect"
+status = "open"
+size = "S"
+title = "Deferred binding emitted `let mut` and never reassigned (parson)"
+summary = "Found by FR-106's 473-crate build sweep 2026-08-28. kgabis/parson emits `let mut v30: i64;` for a deferred binding written once, and the crate's own unused_mut = \"deny\" rejects it: error: variable does not need to be mutable. The FR-105 mut decision mirrored onto the deferred-binding path -- mutability decided from the pre-deferral shape, then the initializer is dropped. Exit-0 unbuildable, safe direction, same policy violation as FR-140/FR-141. NOTE the shared class: FR-140, FR-141 and FR-142 are all the emitter producing code its OWN lint table or type environment rejects; a standing guard that builds every emitted crate in the external sweep and fails on any rustc error would have caught all three. NOT SPIKED."
+blocked_by = []
+anchor = "FR-142 DEFECT (found by FR-106's 473-crate build sweep"
+
+[[items]]
 id = "FR-138"
 rank = 14
 kind = "tooling"
@@ -432,7 +454,7 @@ anchor = "FR-104 Returned cursors"
 id = "FR-106"
 rank = 16
 kind = "defect"
-status = "spiked"
+status = "landed"
 size = "M"
 title = "unused_assignments deny fires on real code"
 summary = "SPIKED 2026-08-23: direction (c) REFUTED on the real shape -- the flagged store is dead only via the continue path's next-iteration overwrite or loop exit, both cross-iteration. New direction (d) identified and unfenced: a per-function #[allow] cannot miscompile because it never deletes a store. Spike (d); do not attempt (a)."

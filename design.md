@@ -7499,7 +7499,7 @@ piece and becomes FR-45.
   measured.
   Full suite 677/677, both tiers, Fail 0.
 
-- [ ] FR-106 DEFECT: the `unused_assignments` deny fires on
+- [x] FR-106 DEFECT: the `unused_assignments` deny fires on
   real-world code — a documented assumption is falsified
   (found by the same build oracle as FR-105).
   The second of the two non-building corpus crates is the
@@ -7651,6 +7651,85 @@ piece and becomes FR-45.
   are unaffected — heatshrink's 28/28 is 25/25 functions plus 3
   type items, so that claim stands as made — the distortion is
   specific to large multi-unit codebases with many shared types.
+  **DIRECTION (d) SPIKED AND LANDED 2026-08-28 -- GO, but NOT with the
+  predicate this entry proposed.** The entry recommended "a store to a local
+  followed on SOME path by another store with no intervening read". MEASURED
+  over 3507 emitted functions in 473 crates, with rustc 1.96.0 as ground truth
+  (it flags exactly 4 of the 3507, a 0.11% base rate):
+      some-path, forward only : marks 127  ->  31.8 : 1 over-application
+      some-path + back edge   : marks 147  ->  36.8 : 1
+      ALL-PATHS               : marks   4  ->   1.00 : 1
+  The some-path family would put an allow in 77+ crates -- one crate would
+  carry five -- which makes the crate-wide deny decorative. THAT IS DIRECTION
+  (b) IN DISGUISE, and (b) was rejected precisely because it deletes the
+  tripwire that FOUND this defect. The threshold (~3:1, or >1% of functions)
+  was written down BEFORE the measurement, so the verdict is not retrofitted.
+  Some-path also has WORSE RECALL, not just worse precision: it misses the
+  `stb_image` shape (a store dead at function end with no second store at all).
+  WHAT SHIPPED is the ALL-PATHS predicate: precision 1.00, recall 1.00, zero
+  residual `unused_assignments` corpus-wide, marked set == rustc's flagged set
+  exactly. It is the same question rustc asks -- spent on an ATTRIBUTE instead
+  of a deletion, which is the entire reason the CLAUDE.md fence does not reach
+  it. VERIFIED: the new code never writes `deadStores` (it only reads it), adds
+  no erase/remove/drop, and inserts one attribute line. A wrong "dead" costs a
+  redundant allow on one function; a wrong "live" costs the loud build error
+  that exists today.
+  BOTH GATE CRATES NOW BUILD, and one was misattributed in this ledger: the
+  encoder failed at `tu0_find_longest_match` (`len`), and the DECODER fails for
+  THE SAME LINT at `tu0_st_yield_backref` (`i`, lib.rs:339) -- this entry said
+  "the second of the two non-building corpus crates is the heatshrink ENCODER",
+  implying the other failed for some other reason. It did not. Each crate now
+  carries exactly ONE allow.
+  THREE EXCLUSIONS ARE LOAD-BEARING, and each was found by a MEASURED false
+  positive rather than by reasoning -- which is the reason to keep them:
+    1. `deferredInits` initializers are not stores (a deferred binding renders
+       `let x: T;` with the initializer dropped). Counting them marked 9 of
+       heatshrink-encoder's 14 functions for stores that never reach output.
+    2. `!valueIsRead(binding)` -> skip: `claimName` `_`-prefixes never-read
+       bindings, and rustc EXEMPTS `_`-prefixed locals from this lint outright.
+       Established with a 3-line rustc probe, not assumed.
+    3. `bindingIsBorrowed` -> skip; rustc's own liveness gives up there too.
+  A FOURTH IS THE SUBTLE ONE and is where review should look: `analyzeSeq`'s
+  `diverges` merges break/continue/return into ONE bit, so without re-deriving
+  which, store-then-`break` is a false positive -- `heatshrink_encoder_poll`
+  has `emitrust.assign; emitrust.break` whose value IS read after the loop.
+  Handled by re-deriving the exit kind and the enclosing loop.
+  THE IMPLEMENTATION TIGHTENED THE SPIKE'S OWN PROTOTYPE in two places, both in
+  the SAFE direction, and both worth recording: the detector runs LAST (after
+  `computeLateInitMerges`), because in the prototype the `droppedOps` guard was
+  VACUOUS -- that set is populated further down, so "this store renders
+  nothing" was not yet known; and the loop-exit scan happens BEFORE the
+  `writtenAtExit` short-circuit, which in the prototype skipped the exit-kind
+  analysis entirely and would OVER-MARK `x = A; if (c) break; x = B; use(x)`.
+  No C source reaching that second shape could be constructed (the structurizer
+  SSA-ifies it away), so it is precision-neutral today -- but the order is the
+  correct one and an over-mark is the unsafe direction for this rule.
+  EVERY UNKNOWN SHAPE ANSWERS "ASSUME A READ" (do not mark): multi-block nested
+  regions, a null enclosing loop for a break, a non-let store target, an
+  empty/multi-block `while` condition. So the failure direction stays the loud
+  build error.
+  THE CRATE-WIDE DENY STAYS. Its rationale comment now records that the
+  residual is handled PER FUNCTION and that moving the allow back into the
+  crate header would delete the tripwire.
+  BYTE-DIFF: every `.c`/`.cpp` under test/ emitted before and after -- ZERO
+  files differ (stdout, stderr and exit codes identical). Over the 473-crate
+  external corpus exactly 4 files differ, each by exactly one added
+  `#[allow(unused_assignments)]` line. Emission cost 0.13s -> 0.14s on the
+  largest input.
+  Pinned by test/EndToEnd/unused-assignment-allow.c (which also pins the FR-140
+  STACKING case -- a function whose locals carry an interior `__`, so both
+  allows must appear on one item with both lints denied),
+  cpp-unused-assignment-allow.cpp (the same shape as a C++ METHOD, so the
+  attribute lands inside an `impl` at 4-space indent), and two Driver fences:
+  unused-assignment-allow-negative.c and -clean.c. THE NEGATIVE TEST IS WHAT
+  PROTECTS THE 1.00:1 RATIO -- it pins that a conditional overwrite, a
+  store-then-break read after the loop, a loop-carried `prev`, and a
+  continue-path store that IS later read all draw ZERO marks. If a later wave
+  widens the predicate to some-path, that test fails, which is its whole job.
+  REMAINING, and NOT attempted: the base rate is 4 in 3507, so 1.00:1 rests on
+  four data points. A corpus with a different dead-store idiom could expose an
+  approximation not exercised here. The failure direction is bounded (redundant
+  allow, or the status-quo build error), which is why this is still a GO.
 
 - [x] FR-108 DEFECT: emitted record names are not injective, and
   two distinct records that collide silently SHARE METHODS.
@@ -9086,6 +9165,45 @@ piece and becomes FR-45.
   Reports: `results.{json,tsv}` + the corpus's own `junit.xml`. Verified
   idempotent (two consecutive runs byte-identical) and stable across three
   full sweeps.
+
+- [ ] FR-141 DEFECT (found by FR-106's 473-crate build sweep 2026-08-28): the
+  emitter writes an `impl` block for a type it never DEFINES -- exit 0,
+  unbuildable crate, no diagnostic. On antirez/sds `sds.c`:
+      error[E0425]: cannot find type `OwnerSdsfromlonglongBuf` in this scope
+        --> impl OwnerSdsfromlonglongBuf {
+  Same contract violation class as FR-140 (emitted code the crate's own
+  toolchain rejects, with nothing located to point at) and adjacent to FR-137,
+  which was the crash on the same input. The FR-62 actor/owner lift
+  manufactures the owner type name; something admits the impl while the
+  StructDefOp that would define it is dropped or never planned.
+  Reproduce: shallow-clone github.com/antirez/sds, then
+  `emitrust-cc --emit=crate sds.c -o <out> -I. --crate-type=lib` and
+  `cargo build --release`.
+  The safe failure direction (a hard rustc error, never a miscompile) but the
+  rejection-is-a-feature policy violated: a dropped owner type must either
+  suppress its impl or be a LOCATED diagnostic.
+  **NOT SPIKED.**
+
+- [ ] FR-142 DEFECT (found by FR-106's 473-crate build sweep 2026-08-28): a
+  DEFERRED binding is emitted `let mut` and never reassigned, so the crate's
+  own `unused_mut = "deny"` rejects it. On kgabis/parson `parson.c`:
+      error: variable does not need to be mutable
+        --> let mut v30: i64;
+  This is the FR-105 `mut` decision mirrored onto the deferred-binding path:
+  the mutability is decided from the pre-deferral shape, then the initializer
+  is dropped and the binding is written once. Exit-0 unbuildable, safe
+  direction, same policy violation as FR-140/FR-141.
+  Reproduce: shallow-clone github.com/kgabis/parson, then
+  `emitrust-cc --emit=crate parson.c -o <out> --crate-type=lib` and
+  `cargo build --release`.
+  NOTE the shared shape across FR-140, FR-141 and FR-142: all three are the
+  emitter producing code its OWN manifest lint table or type environment
+  rejects. That is a class, not three coincidences, and a cheap standing guard
+  -- build every emitted crate in the external sweep and fail on any rustc
+  error -- would have caught all three. `scripts/tractor-eval.py` already
+  builds crates; extending the external probe loop to do the same is the
+  cheapest way to stop finding these one at a time.
+  **NOT SPIKED.**
 
 - [x] FR-140 DEFECT (found by FR-138's corpus sweep 2026-08-28; FIXED
   2026-08-28): a legal C identifier containing an INTERIOR double underscore
