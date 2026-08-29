@@ -1868,6 +1868,40 @@ private:
   /// container being dropped as one unit.
   LogicalResult importTopLevelDecl(const clang::Decl *decl);
 
+  /// FR-141: the end-of-TU owner-method invariant. No surviving
+  /// `emitrust.method_of` may name a symbol the module has no
+  /// `emitrust.struct_def` for.
+  ///
+  /// The two halves of Phase-4 owner promotion are created at different
+  /// times: `planOwners` fixes the struct NAME and the method set before any
+  /// import runs (so `importFunction` tags every method unconditionally),
+  /// while the struct DEFINITION is synthesized lazily by `emitOwnerLocal`,
+  /// the first time the import walk reaches the promoted array's declaration
+  /// STATEMENT. Under recovering import (FR-42/FR-43) the owning function can
+  /// be rejected before that statement is ever reached — at its signature, on
+  /// a body-derived verdict raised before the first statement, or at an
+  /// earlier statement followed by a stub retry — and the methods then name a
+  /// struct that does not exist. `emitrust.impl` is materialized from the
+  /// attribute string alone (FuncToEmitRust) and the dialect deliberately
+  /// does not cross-check the name (EmitRustOps.td), so the result was an
+  /// `impl Foo` with no `struct Foo`: exit 0 and a crate that does not
+  /// compile.
+  ///
+  /// Stated as a module sweep rather than as a check at any one creation site
+  /// because the trigger is an ABSENCE, only knowable once the walk is over.
+  /// The C++ twin of the same bug is guarded eagerly in `importFunction`
+  /// ("method of an unimported class", FR-118) because there the owner's
+  /// absence is knowable at the method itself.
+  ///
+  /// Each orphan is routed through the ordinary rejection path — a warning
+  /// plus a ledger row under recovery, a located error otherwise — located at
+  /// the METHOD's own definition and naming the OWNING function, whose
+  /// blocker is the thing to go fix (the FR-60 ranking signal). Safe to run
+  /// per TU: `ownerPlans`/`methodPlans` accumulate across TUs but each TU's
+  /// declarations are distinct, and an orphan erased here is gone from the
+  /// module for good.
+  LogicalResult rejectOrphanOwnerMethods();
+
   //===--------------------------------------------------------------------===//
   // Recoverable import (FR-42)
   //===--------------------------------------------------------------------===//

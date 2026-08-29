@@ -184,7 +184,7 @@ anchor = "FR-140 DEFECT (found by FR-138's corpus sweep"
 id = "FR-141"
 rank = 15
 kind = "defect"
-status = "open"
+status = "landed"
 size = "M"
 title = "Emitter writes an impl for a type it never defines (sds)"
 summary = "Found by FR-106's 473-crate build sweep 2026-08-28. antirez/sds emits `impl OwnerSdsfromlonglongBuf {` for a type with no definition: error[E0425] cannot find type in this scope. Exit 0, unbuildable crate, NO diagnostic. Same contract-violation class as FR-140 and adjacent to FR-137 (the crash on the same input). The FR-62 actor/owner lift manufactures the owner type name; something admits the impl while the StructDefOp that would define it is dropped or never planned. A dropped owner type must either suppress its impl or be a LOCATED diagnostic. NOT SPIKED."
@@ -201,6 +201,17 @@ title = "Deferred binding emitted `let mut` and never reassigned (parson)"
 summary = "Found by FR-106's 473-crate build sweep 2026-08-28. kgabis/parson emits `let mut v30: i64;` for a deferred binding written once, and the crate's own unused_mut = \"deny\" rejects it: error: variable does not need to be mutable. The FR-105 mut decision mirrored onto the deferred-binding path -- mutability decided from the pre-deferral shape, then the initializer is dropped. Exit-0 unbuildable, safe direction, same policy violation as FR-140/FR-141. NOTE the shared class: FR-140, FR-141 and FR-142 are all the emitter producing code its OWN lint table or type environment rejects; a standing guard that builds every emitted crate in the external sweep and fails on any rustc error would have caught all three. NOT SPIKED."
 blocked_by = []
 anchor = "FR-142 DEFECT (found by FR-106's 473-crate build sweep"
+
+[[items]]
+id = "FR-143"
+rank = 17
+kind = "defect"
+status = "open"
+size = "S"
+title = "No owner method has ever been counted as ported"
+summary = "Found while landing FR-141, pre-existing and independent. collectEmittedSymbols (ProgressReport.cpp:487-493) iterates only module.getBody()->getOperations(), so a method inside an emitrust.impl is never in the emitted set -- a correctly ported owner method reports status=missing in emitrust-progress.json while its body is in the crate. Same artifact untruth FR-141 fixed, opposite direction: FR-141 was emitted-but-reported-missing for a BROKEN item, this is emitted-and-correct-but-reported-missing for a WORKING one. Consequence: every ported count recorded in this ledger understates the owner-promotion path, and FR-60 blame ranking cannot see those items. Any cross-wave ported-count comparison where owner promotion changed is suspect. Gates: a reached owner method must report ported; FR-141's negative control must flip missing->ported in the same change; measure the c-testsuite/Cpp17Suite ratchets before and after, since a ported-count change can move a ledger. NOT SPIKED."
+blocked_by = []
+anchor = "FR-143 DEFECT (found while landing FR-141"
 
 [[items]]
 id = "FR-138"

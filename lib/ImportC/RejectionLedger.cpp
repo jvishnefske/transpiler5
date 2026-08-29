@@ -577,6 +577,26 @@ std::string mlir::emitrust::classifyBlocker(llvm::StringRef diagnostic,
   if (diagnostic.contains(kUnimportedClassMethod))
     return "cxx-cascaded-method";
 
+  // FR-141: the C twin of the wording above, and outside the shared table
+  // for exactly the same reason. `rejectOrphanOwnerMethods` raises it when a
+  // Phase-4 owner method survives an import that never created its owner
+  // struct, which can only happen once the OWNING function has already been
+  // rejected and recovered from (FR-42/FR-43). A non-recovering whole-program
+  // run dies on the owner and never emits the method at all, so
+  // `classify_blocker` in run_realworld.py — which tags whole-PROGRAM
+  // rejections seen through a subprocess — can never observe this wording;
+  // putting it in the shared table would add an entry the Python twin could
+  // not exercise and would break that table's line-for-line correspondence.
+  //
+  // Like `cxx-cascaded-method` the tag names a SYMPTOM: the construct to
+  // blame is whatever sank the owning function, and the ledger row carries
+  // that function's graph key as its cascade source so FR-49's chain credits
+  // the real root.
+  static constexpr llvm::StringLiteral kOrphanOwnerMethod =
+      "method of an owner struct that was never created";
+  if (diagnostic.contains(kOrphanOwnerMethod))
+    return "owner-method-not-reached";
+
   // System-header rejections name the symbol they tripped over; the name is
   // the most informative tag available, so it is parsed out first
   // (`_SYS_HEADER_RE`). The wording is fixed by `rejectSystemHeaderUse`.
