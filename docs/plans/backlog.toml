@@ -225,6 +225,28 @@ blocked_by = []
 anchor = "FR-144 DEFECT (TOOLING, found by T-EPOCH4's freeze"
 
 [[items]]
+id = "FR-146"
+rank = 12
+kind = "defect"
+status = "open"
+size = "M"
+title = "CRASH: --recover segfaults on two external files"
+summary = "Found as a side finding by FR-61f-d's spike 2026-08-28, PRE-EXISTING at clean HEAD and unrelated to the range lift. Highest-severity class, same as FR-137: abort with no diagnostic. Repro: emitrust-cc --recover --emit=rust on scratchpad/probe/uthash/tests/test89.c or cJSON/tests/minify_tests.c -> rc 139. MEASURED: NOT a stack overflow (still segfaults under ulimit -s unlimited, the same control FR-137 used); --recover-DEPENDENT (without it the same input exits 1 with a located rejection, so the fault is on the RECOVERY path after a series of recovered pointer rejections); the stack has NO MLIR frames and shows a RECURSION CYCLE (frames 5 and 7 share an address), which with the ulimit control points at unbounded recursion over a structure recovery mutates, not at depth. Recovery exists to survive bad input and does not. NOT SPIKED."
+blocked_by = []
+anchor = "FR-146 DEFECT (CRASH, found as a side finding by FR-61f-d's spike"
+
+[[items]]
+id = "FR-145"
+rank = 13
+kind = "tooling"
+status = "open"
+size = "M"
+title = "Standing guard: an emitted crate must compile"
+summary = "The class-level guard distilled from FR-140, FR-141 and FR-142 -- three instances of ONE class found one at a time on 2026-08-28, all exit-0-unbuildable with no diagnostic, all found BY ACCIDENT as by-products of other FRs' corpus sweeps. The invariant to gate is that an emitted crate must COMPILE: not that the importer exited 0, not that lit is green -- all three passed the full lit suite. Not covered today because EndToEnd byte-diff only builds inputs written to be supportable, while all three came from external C reached through --incremental, a mode no gate exercises at scale. The machinery already exists TWICE and is committed neither time: the FR-142 spike's cargosweep.sh (475 crates in ~4 min at -P 8) and scripts/tractor-eval.py. Directions: (a) commit the sweep plus a manual protocol; (b) gate a small PINNED external set in lit; (c) fold it into tractor-eval.py at the corpus-sweep cadence. (a)+(c) complementary. FR-144's lesson applies: whatever population it measures must be PINNED or a rise is attributable to nothing. NOT SPIKED."
+blocked_by = []
+anchor = "FR-145 TOOLING (the class-level guard"
+
+[[items]]
 id = "FR-138"
 rank = 14
 kind = "tooling"
@@ -536,11 +558,11 @@ anchor = "epoch 4"
 id = "FR-61f-d"
 rank = 23
 kind = "feature"
-status = "open"
+status = "spiked"
 size = "M"
 title = "Range-for: structured control flow in the body, and descending -> .rev()"
 summary = "The `if` leg LANDED as 61f-12 (82 first-failure rejections, realized yield +7 -- about 8%, the third confirmation of the upper-bound lesson); the nested-loop leg landed in 61f-6. What REMAINS is `?:`/&&/||/StmtExpr/switch and every jump. break/continue/goto/return STAY FENCED -- emitrust.for has no exit edge, so admitting them is an op-design change, not a widening. Descending (12) is a SEPARATE and smaller item, and is NOT the self-contained importer change earlier entries called it: it needs a new emitrust.for attribute plus emitter support, because (lo..hi).rev() is NOT hi..lo -- C's `i > LO; i -= K` is ((LO+1)..=HI).rev().step_by(K), and that LO+1 risks overflow at the type max."
-blocked_by = []
+blocked_by = ["FR-61f-c"]
 anchor = "STILL OUT after 61f-10"
 
 [[items]]
