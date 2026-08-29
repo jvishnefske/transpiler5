@@ -1,0 +1,78 @@
+{
+  "epochs": {
+    "1": {
+      "epoch_id": 1,
+      "closed_at": "2026-08-28T21:53:31",
+      "closed_at_rev": "4d29a3933c91e63cf71caad022287414a2d0515c",
+      "reason": "drifted: pinned files edited after the freeze (found by FR-144, 2026-08-28); trajectories recorded against it were measured over a moved population",
+      "note": "superseded by epoch-4 (union corpus, measurability-filtered)",
+      "corpus_root": "test/EndToEnd",
+      "corpus_hash": "sha256:934b6ba698e9dd206e6dc062f5ad7434d570807bd660a481e5b278f629693d08",
+      "file_count": 125,
+      "drifted": true,
+      "drifted_files": [
+        {
+          "path": "test/EndToEnd/link-merge-e2e.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "e91c45c 2026-08-10 feat(driver): Mach-O __TEXT,__emitrust payload section + Darwin lit harness"
+        },
+        {
+          "path": "test/EndToEnd/planner-rejection-builds.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "d6ef2ad 2026-08-22 fix(recovery,report): FR-115 -- every unported item now says why (see design.md FR-115)"
+        },
+        {
+          "path": "test/EndToEnd/preserve-c-names.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "0afcbac 2026-08-04 feat(emit): FR-61e slice 3 \u2014 preserve C names for signed scalar locals"
+        }
+      ]
+    },
+    "2": {
+      "epoch_id": 2,
+      "closed_at": "2026-08-28T21:53:31",
+      "closed_at_rev": "4d29a3933c91e63cf71caad022287414a2d0515c",
+      "reason": "drifted: pinned files edited after the freeze (found by FR-144, 2026-08-28); trajectories recorded against it were measured over a moved population",
+      "note": "superseded by epoch-4 (union corpus, measurability-filtered)",
+      "corpus_root": "test/EndToEnd",
+      "corpus_hash": "sha256:2ccc9683d1fedcebddb9c5b3114bf4ccaa8dbbbc0d035f4853363f9fbe1cc84d",
+      "file_count": 128,
+      "drifted": true,
+      "drifted_files": [
+        {
+          "path": "test/EndToEnd/planner-rejection-builds.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "d6ef2ad 2026-08-22 fix(recovery,report): FR-115 -- every unported item now says why (see design.md FR-115)"
+        },
+        {
+          "path": "test/EndToEnd/range-for.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "a308e45 2026-08-24 feat(import): FR-61f-4 -- range-for bodies may touch parameters"
+        }
+      ]
+    },
+    "3": {
+      "epoch_id": 3,
+      "closed_at": "2026-08-28T21:53:31",
+      "closed_at_rev": "4d29a3933c91e63cf71caad022287414a2d0515c",
+      "reason": "drifted: pinned files edited after the freeze (found by FR-144, 2026-08-28); trajectories recorded against it were measured over a moved population",
+      "note": "superseded by epoch-4 (union corpus, measurability-filtered)",
+      "corpus_root": "test/EndToEnd",
+      "corpus_hash": "sha256:96b6124166e5b95ef5a143b522b8b185d8bda2f119084ab1545e6c1fef8e1fc4",
+      "file_count": 144,
+      "drifted": true,
+      "drifted_files": [
+        {
+          "path": "test/EndToEnd/planner-rejection-builds.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "d6ef2ad 2026-08-22 fix(recovery,report): FR-115 -- every unported item now says why (see design.md FR-115)"
+        },
+        {
+          "path": "test/EndToEnd/range-for.c",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "a308e45 2026-08-24 feat(import): FR-61f-4 -- range-for bodies may touch parameters"
+        }
+      ]
+    }
+  }
+}

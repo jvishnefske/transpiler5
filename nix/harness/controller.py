@@ -43,7 +43,13 @@ import signals as signals_mod      # noqa: E402
 
 REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 CLIPPY_EVAL = os.path.join(REPO, "nix", "clippy-eval", "clippy_eval.py")
-CLIPPY_BASELINE = os.path.join(REPO, "nix", "clippy-eval", "clippy-baseline.json")
+# FR-144: the epoch-pinned baseline is authoritative. `accept` --updates AND
+# commits this exact path, so it must equal clippy_eval.DEFAULT_BASELINE and
+# signals.DEFAULT_CLIPPY; otherwise the loop commits a document the ratchet
+# never reads (which is how the ratchet came to compare 170 crates against a
+# 164-crate baseline).
+CLIPPY_BASELINE = os.path.join(REPO, "nix", "clippy-eval",
+                               "clippy-baseline-epoch4.json")
 CHAMPION = os.path.join(HERE, "champion.json")
 def _default_emitrust_cc():
     # CMake trees put tools in build/bin/, meson trees in build/tools/.
@@ -153,8 +159,10 @@ def _measure_slice(corpus_root, file_list, tag):
     r = subprocess.run(cmd, cwd=REPO, env=env,
                        capture_output=True, text=True)
     if r.returncode not in (0, 1) or not os.path.exists(out):
-        # clippy_eval exits 1 only on a ratchet fire vs its OWN baseline arg,
-        # which we do not pass here; a missing report is a real failure.
+        # An explicit --file-list is a slice MEASUREMENT: clippy_eval reports
+        # and exits 0 without ratcheting (a slice is not the pinned
+        # population, so comparing it to the baseline would compare across
+        # populations). Anything else, or a missing report, is a real failure.
         sys.stderr.write(r.stdout + r.stderr)
         raise SystemExit(f"clippy_eval failed for {tag}")
     with open(out) as f:
@@ -176,7 +184,10 @@ def cmd_establish(args):
     """Measure the CURRENT (champion) emitter on train + held-out and record
     the champion score + the permitted allow-line set. This is the reference
     every candidate iteration is scored against."""
-    doc = epoch_mod.load_epoch(args.id)
+    # FR-144: re-hash the pinned population first. Establishing a champion
+    # over a corpus that has moved since the freeze makes every later paired
+    # comparison against it invalid.
+    doc = epoch_mod.assert_comparable(args.id)
     train_fl, held_fl = _slice_paths(args.id)
     train = _measure_slice(doc["corpus_root"], train_fl, "train")
     held = _measure_slice(doc["corpus_root"], held_fl, "heldout")
@@ -277,9 +288,15 @@ def cmd_score(args):
     champ = _load_champion_optional()
     if champ is None:
         raise SystemExit("no champion.json -- run `establish` first")
-    doc = epoch_mod.load_epoch(args.id)
+    # FR-144: the champion/epoch hash check below compares two DOCUMENTS; it
+    # cannot see that the files themselves moved. Re-hash them.
+    doc = epoch_mod.assert_comparable(args.id)
     if champ.get("corpus_hash") != doc["corpus_hash"]:
-        raise SystemExit("champion/epoch hash mismatch -- different epoch")
+        raise SystemExit(
+            f"champion/epoch hash mismatch -- champion.json was established "
+            f"on epoch-{champ.get('epoch_id')}, not epoch-{args.id}. Metrics "
+            "are never compared across epochs: run `establish --id "
+            f"{args.id}` first.")
     train_fl, held_fl = _slice_paths(args.id)
     train = _measure_slice(doc["corpus_root"], train_fl, "train")
     held = _measure_slice(doc["corpus_root"], held_fl, "heldout")
@@ -318,9 +335,12 @@ def cmd_accept(args):
     with open(cand_path) as f:
         cand = json.load(f)
 
-    # 1. lower the full-corpus clippy ratchet (the committed champion metric).
+    # 1. lower the pinned clippy ratchet (the committed champion metric). The
+    # population comes from the epoch the baseline is pinned to, so the
+    # committed number is a paired comparison against the previous one.
     env = dict(os.environ, EMITRUST_CC=EMITRUST_CC)
-    r = subprocess.run([sys.executable, CLIPPY_EVAL, "test/EndToEnd", "--update"],
+    r = subprocess.run([sys.executable, CLIPPY_EVAL,
+                        "--baseline", CLIPPY_BASELINE, "--update"],
                        cwd=REPO, env=env, capture_output=True, text=True)
     sys.stdout.write(r.stdout[-400:])
     if r.returncode != 0:
@@ -350,7 +370,7 @@ def cmd_accept(args):
     # uncommitted would leave the committed tree failing check-emitrust) AND
     # the ratchet baselines -- one atomic revision.
     sh(["git", "add", "-A", "lib", "tools", "include", "test",
-        "nix/clippy-eval/clippy-baseline.json", "nix/harness/champion.json"])
+        os.path.relpath(CLIPPY_BASELINE, REPO), "nix/harness/champion.json"])
     msg = (args.message or
            f"feat(quality): harness iteration -- clippy total -> {total} "
            f"(FR-63)\n\n{args.note}").strip()
