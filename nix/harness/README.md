@@ -29,6 +29,8 @@ guard.
 | `epoch-N.json` | the frozen epoch: pinned files + `corpus_hash` |
 | `epoch-N.exclude.txt` | paths omitted as UNMEASURABLE at the pinning rev, with reasons |
 | `epoch-N.{train,heldout}.txt` | the deterministic split (optimizer sees train only) |
+| `epoch-status.json` | which epochs are CLOSED history, when, why, and which files had drifted |
+| `test_harness.py` | the frozen-population guards, gated by `test/Driver/harness-drift-guard.c` |
 | `champion.json` | the current champion's train/held-out score + permitted allow-lines |
 | `ledger.json` | per-epoch trajectory: `(emitter_rev, metrics)` for each accepted revision |
 | `OPTIMIZER.md` / `LOOP.md` | the subagent spec and the loop protocol |
@@ -91,5 +93,40 @@ epoch (that is a new population, i.e. a new epoch).
 
 Defaults reproduce the epoch-1..3 shape exactly (one root, `.c`,
 non-recursive), so those frozen documents are never rewritten.
+
+### The drift guard and closed epochs (FR-144)
+
+The paired comparison is only valid while the pinned files still hold the
+pinned bytes. Until FR-144 nothing checked that: `ledger_append` compared the
+epoch *document*'s stored hash against the ledger's, never against the files
+on disk, and nothing called `verify` automatically — so epochs 1, 2 and 3 all
+drifted unnoticed and every trajectory recorded against them was measured
+over a population that had already moved. Now `epoch.assert_comparable`
+re-hashes the population and **refuses** (non-zero) on drift, and
+`ledger_append`, `controller establish/score` and the clippy ratchet all go
+through it.
+
+Drift is **not** repaired by re-freezing — that would rewrite the document
+the ledger's numbers were measured against. An epoch is instead *closed*:
+
+```bash
+python3 nix/harness/epoch.py close --id 3 --reason "drifted: ..."
+python3 nix/harness/epoch.py status     # LIVE / CLOSED per epoch
+```
+
+`close` writes only `epoch-status.json` (when, at which rev, why, and each
+drifted file with its blame); the frozen `epoch-N.json` is left byte for byte
+alone. A closed epoch fails `verify` and is refused by every comparison, so
+its numbers can be read but never extended. Epochs 1–3 are closed history —
+their ledger trajectories are real measurements of a moving population, which
+is exactly why nothing may extend them.
+
+The committed clippy ratchet is likewise pinned: `clippy-baseline-epoch4.json`
+carries `epoch_id` + `corpus_hash`, the default `clippy_eval.py` invocation
+measures **the epoch's file list** (not whatever `.c` is in the directory),
+and an unpinned baseline is refused. The three consumers of "which baseline is
+authoritative" — `clippy_eval.DEFAULT_BASELINE`, `signals.DEFAULT_CLIPPY` and
+`controller.CLIPPY_BASELINE` (which `--update`s and *commits* it) — must name
+the same file; `test_harness.py` fails if they diverge.
 
 See `LOOP.md` for the full protocol and termination rules.

@@ -19,8 +19,28 @@ Subcommands::
                    [--recursive] [--exclude FILE] --id N [--out FILE]
   epoch.py verify  --id N            # recompute hashes, confirm the sample
   epoch.py split   --id N --held-out-frac F --seed K   # train/held-out lists
+  epoch.py close   --id N --reason S # retire an epoch as history (FR-144)
+  epoch.py status                    # which epochs are live, which are closed
   epoch.py ledger-append --id N --rev R --metrics FILE [--note S]
   epoch.py ledger-show   --id N      # render the monotone descent
+
+THE DRIFT GUARD (FR-144). The paired comparison is only valid while the pinned
+files still hold the pinned bytes. Until FR-144, ``ledger_append`` compared the
+epoch DOCUMENT's stored hash against the ledger's -- never against the files on
+disk -- and nothing called ``verify`` automatically, so epochs 1, 2 and 3 all
+drifted unnoticed and every trajectory recorded against them was measured over
+a population that had already moved. ``assert_comparable`` closes that: it
+re-hashes the pinned files and REFUSES (non-zero, Result-style) if any moved,
+and ``ledger_append`` -- plus the controller's establish/score and the clippy
+ratchet -- call it before they record or compare. A wrong number nobody flags
+is worse than no number.
+
+CLOSED EPOCHS (FR-144). Drift is not repaired by re-freezing: rewriting a
+frozen document would destroy the record the ledger's numbers were measured
+against. An epoch is instead CLOSED -- retired to history in a separate
+document, ``epoch-status.json``, which records when, at which rev, why, and
+exactly which files had moved. A closed epoch fails ``verify`` and is refused
+by every comparison, so its numbers can be read but never extended.
 
 UNION CORPORA (epoch-4 and later). ``--corpus`` and ``--ext`` both repeat, so
 one epoch can pin the union of several roots and several source extensions
@@ -58,6 +78,10 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LEDGER = os.path.join(HERE, "ledger.json")
+# Closure record. A FRESH document (immutable-by-default): closing an epoch
+# must never edit the frozen epoch-N.json, which is the evidence the ledger's
+# numbers were measured against.
+STATUS = os.path.join(HERE, "epoch-status.json")
 
 
 def _sha256_file(path):
@@ -182,26 +206,178 @@ def load_epoch(epoch_id):
         return json.load(f)
 
 
-def verify(epoch_id):
-    doc = load_epoch(epoch_id)
+def drift(doc):
+    """Files of a frozen epoch that no longer hold their pinned bytes.
+
+    Returns ``[(path, "MISSING"|"CONTENT-CHANGED"), ...]``, empty when the
+    population is intact. This is the one place drift is decided; verify, the
+    close record and every comparison guard share it so they can never
+    disagree about whether an epoch has moved.
+    """
     bad = []
     for e in doc["files"]:
         if not os.path.exists(e["path"]):
             bad.append((e["path"], "MISSING"))
         elif _sha256_file(e["path"]) != e["sha256"]:
             bad.append((e["path"], "CONTENT-CHANGED"))
+    return bad
+
+
+def _format_drift(epoch_id, bad, limit=20):
+    lines = [f"epoch-{epoch_id} DRIFTED ({len(bad)} files no longer match "
+             f"the freeze):"]
+    lines += [f"  {why:16s} {path}" for path, why in bad[:limit]]
+    if len(bad) > limit:
+        lines.append(f"  ... and {len(bad) - limit} more")
+    return "\n".join(lines)
+
+
+def load_status():
+    """The closure record: which epochs are retired history, and why."""
+    if os.path.exists(STATUS):
+        with open(STATUS) as f:
+            return json.load(f)
+    return {"epochs": {}}
+
+
+def save_status(status):
+    with open(STATUS, "w") as f:
+        json.dump(status, f, indent=2)
+        f.write("\n")
+
+
+def epoch_state(epoch_id):
+    """The closure entry for an epoch, or None while it is still live."""
+    return load_status()["epochs"].get(str(epoch_id))
+
+
+def _last_change(path):
+    """`git log -1` for a drifted file -- the WHEN of the drift, recorded once
+    at closure time so the evidence survives the file's later history."""
+    try:
+        r = subprocess.run(["git", "log", "-1", "--date=short",
+                            "--format=%h %ad %s", "--", path],
+                           capture_output=True, text=True,
+                           cwd=os.path.abspath(os.path.join(HERE, "..", "..")))
+        return r.stdout.strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def close_epoch(epoch_id, reason, note="", timestamp=None):
+    """Retire an epoch to history. Writes epoch-status.json ONLY.
+
+    Closing is deliberately not repair: the frozen document is left byte for
+    byte alone (re-freezing it would rewrite the record that the ledger's
+    numbers were measured against), and any drift found at closure time is
+    recorded with its blame, so the reason a trajectory is untrustworthy stays
+    readable forever. A closure is itself history: re-closing is refused.
+    """
+    doc = load_epoch(epoch_id)
+    status = load_status()
+    key = str(epoch_id)
+    prior = status["epochs"].get(key)
+    if prior is not None:
+        raise SystemExit(
+            f"epoch-{epoch_id} is already closed ({prior['closed_at']}: "
+            f"{prior['reason']}) -- a closure is history and is never "
+            "rewritten.")
+    bad = drift(doc)
+    status["epochs"][key] = {
+        "epoch_id": epoch_id,
+        "closed_at": timestamp or datetime.datetime.now().isoformat(
+            timespec="seconds"),
+        "closed_at_rev": _git_rev(),
+        "reason": reason,
+        "note": note,
+        "corpus_root": doc["corpus_root"],
+        "corpus_hash": doc["corpus_hash"],
+        "file_count": doc["file_count"],
+        "drifted": bool(bad),
+        "drifted_files": [{"path": path, "state": why,
+                           "last_changed": _last_change(path)}
+                          for path, why in bad],
+    }
+    save_status(status)
+    print(f"epoch-{epoch_id} CLOSED: {reason}")
+    if bad:
+        print(f"  drifted at closure: {len(bad)} files")
+        for d in status["epochs"][key]["drifted_files"][:20]:
+            print(f"    {d['state']:16s} {d['path']}  [{d['last_changed']}]")
+    print(f"  written: {STATUS}")
+    return 0
+
+
+def assert_comparable(epoch_id):
+    """The guard every comparison must pass through.
+
+    Raises SystemExit (Result-style non-zero) unless the epoch is still a
+    valid population: live (not closed) AND its pinned files still hold their
+    pinned bytes. Returns the epoch document so callers can chain.
+    """
+    doc = load_epoch(epoch_id)
+    state = epoch_state(epoch_id)
+    if state is not None:
+        raise SystemExit(
+            f"epoch-{epoch_id} is CLOSED ({state['closed_at']}: "
+            f"{state['reason']}) -- refusing to measure or record against it. "
+            "Its numbers are history, not a baseline; freeze a NEW epoch.")
+    bad = drift(doc)
+    if bad:
+        raise SystemExit(
+            _format_drift(epoch_id, bad) + "\n"
+            "Refusing: a delta measured over a moved population is "
+            "attributable to nothing. Freeze a NEW epoch (and `close` this "
+            "one) rather than re-freezing this document.")
+    return doc
+
+
+def verify(epoch_id):
+    doc = load_epoch(epoch_id)
+    state = epoch_state(epoch_id)
+    bad = drift(doc)
     recomputed = corpus_hash([{"path": e["path"], "sha256": _sha256_file(e["path"])}
                               for e in doc["files"] if os.path.exists(e["path"])])
+    if state is not None:
+        print(f"epoch-{epoch_id} CLOSED {state['closed_at']} "
+              f"(rev {state['closed_at_rev'][:12]}): {state['reason']}")
+        print("  closed epochs are history -- nothing may compare against "
+              "them.")
+        if bad:
+            print(_format_drift(epoch_id, bad))
+        return 1
     if bad:
-        print(f"epoch-{epoch_id} DRIFTED ({len(bad)} files):")
-        for path, why in bad[:20]:
-            print(f"  {why:16s} {path}")
+        print(_format_drift(epoch_id, bad))
         return 1
     if recomputed != doc["corpus_hash"]:
         print(f"epoch-{epoch_id} hash mismatch: {recomputed} != {doc['corpus_hash']}")
         return 1
     print(f"epoch-{epoch_id} verified: {doc['file_count']} files reproduce "
           f"{doc['corpus_hash']}")
+    return 0
+
+
+def status_report():
+    """Which epochs exist, which are live, which are closed history."""
+    ids = sorted(int(n.split("-")[1].split(".")[0])
+                 for n in os.listdir(HERE)
+                 if n.startswith("epoch-") and n.endswith(".json")
+                 and n != "epoch-status.json")
+    status = load_status()
+    for eid in ids:
+        doc = load_epoch(eid)
+        state = status["epochs"].get(str(eid))
+        if state is None:
+            bad = drift(doc)
+            mark = "LIVE" if not bad else f"LIVE-BUT-DRIFTED({len(bad)})"
+            extra = ""
+        else:
+            mark = "CLOSED"
+            extra = (f"  {state['closed_at']}  {state['reason']}"
+                     + (f"  [{len(state['drifted_files'])} drifted]"
+                        if state["drifted"] else ""))
+        print(f"epoch-{eid:<3d} {mark:22s} {doc['file_count']:>4d} files"
+              f"  {doc['corpus_root']}{extra}")
     return 0
 
 
@@ -257,7 +433,10 @@ def save_ledger(ledger):
 
 
 def ledger_append(epoch_id, rev, metrics_path, note="", timestamp=None):
-    doc = load_epoch(epoch_id)
+    # FR-144: the stored-hash check below only proved the DOCUMENT had not
+    # changed; it never looked at the files. Re-hash the population first, so
+    # a trajectory can never be recorded over a corpus that has moved.
+    doc = assert_comparable(epoch_id)
     with open(metrics_path) as f:
         metrics = json.load(f)
     ledger = load_ledger()
@@ -292,6 +471,25 @@ def ledger_show(epoch_id):
         print(f"epoch-{epoch_id}: no recorded revisions")
         return 1
     print(f"epoch-{epoch_id}  corpus={ep['corpus_root']}  {ep['corpus_hash']}")
+    # A trajectory over a population that has since moved is history, not a
+    # baseline. Say so at the top of the descent rather than letting the
+    # numbers be read as current evidence (FR-144).
+    state = epoch_state(epoch_id)
+    if state is not None:
+        print(f"  CLOSED {state['closed_at']} "
+              f"(rev {state['closed_at_rev'][:12]}): {state['reason']}")
+        if state["drifted"]:
+            print(f"  {len(state['drifted_files'])} pinned files had drifted "
+                  "when it was closed -- these numbers were measured over a "
+                  "MOVING population and are not comparable to any other "
+                  "epoch's:")
+            for d in state["drifted_files"]:
+                print(f"    {d['state']:16s} {d['path']}  [{d['last_changed']}]")
+    elif os.path.exists(epoch_path(epoch_id)):
+        bad = drift(load_epoch(epoch_id))
+        if bad:
+            print(f"  WARNING: {len(bad)} pinned files have DRIFTED since the "
+                  "freeze -- `close` this epoch and freeze a new one.")
     print(f"{'rev':14s} {'total':>7s} {'delta':>7s}  {'held_out':>8s}  when")
     prev = None
     for r in ep["revisions"]:
@@ -337,6 +535,13 @@ def main(argv=None):
     p.add_argument("--held-out-frac", type=float, default=0.25)
     p.add_argument("--seed", type=int, default=1)
 
+    p = sub.add_parser("close")
+    p.add_argument("--id", type=int, required=True)
+    p.add_argument("--reason", required=True)
+    p.add_argument("--note", default="")
+
+    sub.add_parser("status")
+
     p = sub.add_parser("ledger-append")
     p.add_argument("--id", type=int, required=True)
     p.add_argument("--rev", required=True)
@@ -357,6 +562,10 @@ def main(argv=None):
     if args.cmd == "split":
         split(args.id, args.held_out_frac, args.seed)
         return 0
+    if args.cmd == "close":
+        return close_epoch(args.id, args.reason, args.note)
+    if args.cmd == "status":
+        return status_report()
     if args.cmd == "ledger-append":
         return ledger_append(args.id, args.rev, args.metrics, args.note)
     if args.cmd == "ledger-show":

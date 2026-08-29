@@ -12,7 +12,7 @@ output and prints a stable ranked JSON queue.
   correctness   nix/explore/explore.py --json              CRASH / HANG /
                                                            MISCOMPILE (bugs);
                                                            REJECT tags (demand)
-  quality       nix/clippy-eval/clippy-baseline.json       ranked by_lint debt
+  quality       nix/clippy-eval/clippy-baseline-epoch4.json ranked by_lint debt
   demand        REJECT tags (explore) + RealWorld blockers  unsupported
                                                            constructs
 
@@ -47,7 +47,13 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_CLIPPY = os.path.join(HERE, "..", "clippy-eval", "clippy-baseline.json")
+# The AUTHORITATIVE ratchet baseline (FR-144): epoch-pinned, so the ranked
+# debt this prioritizes came from a population that is provably the one the
+# ratchet compares against. Must stay equal to clippy_eval.DEFAULT_BASELINE and
+# controller.CLIPPY_BASELINE -- the controller `--update`s and COMMITS that
+# path, so a divergence would rank debt from a document nothing measures.
+DEFAULT_CLIPPY = os.path.join(HERE, "..", "clippy-eval",
+                              "clippy-baseline-epoch4.json")
 
 # Off-limits without a human + a new idea (CLAUDE.md, LOOP.md). needless_late_init
 # folds a decl into its initializer -- a liveness change; cross-iteration loop
