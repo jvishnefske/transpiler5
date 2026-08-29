@@ -59,6 +59,7 @@
 #include "mlir/Support/IndentedOstream.h"
 
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/StringExtras.h"
@@ -942,6 +943,36 @@ private:
   /// behalf of the declaration `declOp` that rendered nothing.
   LogicalResult emitMergedLateInit(Operation *declOp,
                                    emitrust::AssignOp assignOp);
+
+  // --- FR-133: the literal-Some fn-ptr local (clippy::unnecessary_literal_
+  // unwrap) ---
+
+  /// Values whose `!emitrust.fn_ptr` type renders WITHOUT the `Option`
+  /// wrapper: the `emitrust.variable` lvalue of a fn-ptr LOCAL proved to be
+  /// initialized once from a literal `Some(<fn>)` and only ever CALLED, plus
+  /// that initializer constant and every `emitrust.load` of the local. A
+  /// member's `Option<fn(..)>` becomes `fn(..)`, its `Some(f)` becomes `f`,
+  /// and its `emitrust.call_indirect` drops the `.expect("null function
+  /// pointer")` that was redundant the moment the literal was proved.
+  ///
+  /// RENDERING ONLY: no MLIR type changes, so `call_indirect` still verifies
+  /// against `!emitrust.fn_ptr` and the round-trip is untouched.
+  DenseSet<Value> unwrappedFnPtrs;
+
+  /// Fills `unwrappedFnPtrs`. Must run LAST, after `computeDeferredInits`
+  /// (only a deferred declaration is a candidate -- every other rendering of
+  /// a fn-ptr variable emits the synthesized `None` default, which has no
+  /// spelling without the `Option`), `computeDeadStores`, `computeDroppedOps`
+  /// and `computeLateInitMerges`.
+  void computeUnwrappedFnPtrs(emitrust::FuncOp funcOp);
+
+  /// Emits the bare `fn(A, B) -> R` spelling (no `Option` wrapper).
+  LogicalResult emitFnPtrSignature(Location loc, emitrust::FnPtrType type);
+
+  /// Emits `type` as the declared type of the binding `value`: the FR-133
+  /// unwrapped `fn(..)` when `value` is in `unwrappedFnPtrs`, `emitType`
+  /// otherwise.
+  LogicalResult emitBindingType(Location loc, Value value, Type type);
 
   // --- FR-61d: single-use expression inlining + unused-pure-value drops ---
 
@@ -3147,6 +3178,87 @@ void RustEmitter::computeLateInitMerges(emitrust::FuncOp funcOp) {
   });
 }
 
+/// FR-77's `Some(<identifier>)` reader, defined below alongside the dangling-
+/// target backstop; FR-133's admission test asks it the same question.
+static StringRef fnPtrConstantTargetIdent(Attribute attr);
+
+/// FR-133 (clippy::unnecessary_literal_unwrap): find the fn-ptr LOCALS that
+/// need no `Option` at all -- initialized from a LITERAL `Some(f)`, never
+/// reassigned, never compared against null.
+///
+/// The three conditions ARE the safety fence, and each is load-bearing: a
+/// reassignment could introduce `None`, and a null comparison needs the
+/// `Option` to have something to compare. They are checked here as one rule
+/// over the binding's USE SET, which is what makes them decidable rather than
+/// assumed -- every use must be either
+///   * the ONE whole-binding `emitrust.assign` whose value is an
+///     `emitrust.constant` carrying identifier-shaped `Some(<fn>)` opaque
+///     text and feeding nothing else, or
+///   * an `emitrust.load` whose every use is the CALLEE (operand 0) of an
+///     `emitrust.call_indirect`.
+/// A second assign refuses (even an all-literal one on the other arm of an
+/// `if`: that is a reassignment by this rule, and admitting it would need
+/// definite-assignment reasoning a rendering fold does not have). A load
+/// reaching an `emitrust.cmp` -- how `fp == 0` and `if (!fp)` arrive -- is not
+/// a callee, so it refuses. A load that ESCAPES into a call argument, a
+/// `return`, or a store refuses too: those positions are typed
+/// `Option<fn(..)>` and an unwrapped value would not fit them.
+///
+/// The declaration must also be a DEFERRED binding: every other rendering of
+/// a fn-ptr variable emits the synthesized `None` default
+/// (`emitDefaultValue`), which has no spelling once the `Option` is gone.
+///
+/// If any leg cannot be proved the binding KEEPS its `Option`. The safe
+/// direction is a redundant unwrap, never a dropped wrapper a later `None`
+/// needs.
+void RustEmitter::computeUnwrappedFnPtrs(emitrust::FuncOp funcOp) {
+  funcOp->walk([&](emitrust::VariableOp variableOp) {
+    Value binding = variableOp.getResult();
+    auto lvalueType = dyn_cast<emitrust::LValueType>(binding.getType());
+    if (!lvalueType || !isa<emitrust::FnPtrType>(lvalueType.getValueType()))
+      return;
+    Operation *declOp = variableOp.getOperation();
+    if (!deferredInits.count(declOp) || unreachableOps.count(declOp) ||
+        droppedOps.count(declOp) || ifExprBindings.count(declOp))
+      return;
+    emitrust::ConstantOp init;
+    SmallVector<Value> loadResults;
+    for (OpOperand &use : binding.getUses()) {
+      Operation *user = use.getOwner();
+      if (unreachableOps.count(user) || droppedOps.count(user))
+        return; // a use this emitter silences is still a use: refuse
+      if (auto assign = dyn_cast<emitrust::AssignOp>(user)) {
+        // A partial write reaches the binding through a projection, never
+        // through the assign itself, so `getVar() == binding` is the
+        // whole-binding test; `init` being set already is the SECOND write.
+        if (assign.getVar() != binding || init || deadStores.count(user))
+          return;
+        auto constant =
+            assign.getValue().getDefiningOp<emitrust::ConstantOp>();
+        if (!constant || !constant.getResult().hasOneUse() ||
+            fnPtrConstantTargetIdent(constant.getValue()).empty())
+          return;
+        init = constant;
+        continue;
+      }
+      auto load = dyn_cast<emitrust::LoadOp>(user);
+      if (!load || load.getOperand() != binding)
+        return;
+      for (OpOperand &loadUse : load.getResult().getUses()) {
+        auto call = dyn_cast<emitrust::CallIndirectOp>(loadUse.getOwner());
+        if (!call || loadUse.getOperandNumber() != 0)
+          return; // not a callee: the consuming position keeps the Option
+      }
+      loadResults.push_back(load.getResult());
+    }
+    if (!init)
+      return; // no literal initializer proved
+    unwrappedFnPtrs.insert(binding);
+    unwrappedFnPtrs.insert(init.getResult());
+    unwrappedFnPtrs.insert_range(loadResults);
+  });
+}
+
 LogicalResult RustEmitter::emitMergedLateInit(Operation *declOp,
                                               emitrust::AssignOp assignOp) {
   Value binding = assignOp.getVar();
@@ -3160,7 +3272,7 @@ LogicalResult RustEmitter::emitMergedLateInit(Operation *declOp,
   if (deferredInits.lookup(declOp))
     os << "mut ";
   os << assignName(binding) << ": ";
-  if (failed(emitType(assignOp.getLoc(), valueType)))
+  if (failed(emitBindingType(assignOp.getLoc(), binding, valueType)))
     return failure();
   os << " = ";
   if (failed(
@@ -3184,7 +3296,7 @@ LogicalResult RustEmitter::emitFusedFieldInit(emitrust::VariableOp variableOp) {
   // is E0596/E0384), never silent misbehavior.
   bool isMut = lvalueIsMutated(result);
   os << (isMut ? "let mut " : "let ") << assignName(result) << ": ";
-  if (failed(emitType(loc, valueType)))
+  if (failed(emitBindingType(loc, result, valueType)))
     return failure();
   // When the fused fields cover the whole struct the functional-update base
   // would be dead (clippy::needless_update), so it is dropped and the
@@ -3337,28 +3449,46 @@ LogicalResult RustEmitter::emitType(Location loc, Type type) {
   }
   if (auto fnPtrType = dyn_cast<emitrust::FnPtrType>(type)) {
     // Nullable function pointer: the C null pointer is None, so no unsafe
-    // sentinel is ever needed. The `-> R` clause is omitted for a void
-    // result, matching Rust's `fn(...)` spelling.
-    os << "Option<fn(";
-    bool first = true;
-    for (Type input : fnPtrType.getInputs()) {
-      if (!first)
-        os << ", ";
-      first = false;
-      if (failed(emitType(loc, input)))
-        return failure();
-    }
-    os << ")";
-    if (!fnPtrType.getResults().empty()) {
-      os << " -> ";
-      if (failed(emitType(loc, fnPtrType.getResults().front())))
-        return failure();
-    }
+    // sentinel is ever needed. FR-133's proved-non-null LOCALS render the
+    // inner signature alone through `emitBindingType`; every other position
+    // (parameter, result, struct field, global, temporary) keeps the wrapper.
+    os << "Option<";
+    if (failed(emitFnPtrSignature(loc, fnPtrType)))
+      return failure();
     os << ">";
     return success();
   }
   // Lvalue types are never rendered; they fall through to the error below.
   return emitError(loc) << "cannot translate type " << type;
+}
+
+LogicalResult RustEmitter::emitFnPtrSignature(Location loc,
+                                              emitrust::FnPtrType type) {
+  // The `-> R` clause is omitted for a void result, matching Rust's `fn(...)`
+  // spelling.
+  os << "fn(";
+  bool first = true;
+  for (Type input : type.getInputs()) {
+    if (!first)
+      os << ", ";
+    first = false;
+    if (failed(emitType(loc, input)))
+      return failure();
+  }
+  os << ")";
+  if (!type.getResults().empty()) {
+    os << " -> ";
+    if (failed(emitType(loc, type.getResults().front())))
+      return failure();
+  }
+  return success();
+}
+
+LogicalResult RustEmitter::emitBindingType(Location loc, Value value,
+                                           Type type) {
+  if (unwrappedFnPtrs.contains(value))
+    return emitFnPtrSignature(loc, cast<emitrust::FnPtrType>(type));
+  return emitType(loc, type);
 }
 
 LogicalResult RustEmitter::emitAttribute(Location loc, Attribute attr) {
@@ -3672,7 +3802,7 @@ LogicalResult RustEmitter::emitLetPrologue(Value result, bool isMut) {
   if (isMut)
     os << "mut ";
   os << name << ": ";
-  if (failed(emitType(result.getLoc(), result.getType())))
+  if (failed(emitBindingType(result.getLoc(), result, result.getType())))
     return failure();
   os << " = ";
   return success();
@@ -4506,6 +4636,7 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   fusedAssignOwner.clear();
   lateInitMerges.clear();
   lateInitOwner.clear();
+  unwrappedFnPtrs.clear();
 
   Region &body = fn.getFunctionBody();
   if (body.empty())
@@ -4578,6 +4709,10 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // render, so every set that silences an op must already be populated, and
   // `ifExprBindings` must already have claimed the bindings it folds better.
   computeLateInitMerges(funcOp);
+  // FR-133: after every set that decides how a binding renders -- the
+  // candidate must be a DEFERRED declaration, and its initializing store must
+  // be one that actually renders.
+  computeUnwrappedFnPtrs(funcOp);
   // FR-106: decided LAST, so every set that silences a store (`deadStores`,
   // `droppedOps`, `deferredInits`, the late-init merges) is already
   // populated and a store that never renders cannot be counted. The answer
@@ -4859,10 +4994,15 @@ LogicalResult RustEmitter::emitCallIndirect(emitrust::CallIndirectOp callOp) {
       failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
   // Calling a null C function pointer is undefined behavior; the expect
-  // refines it into a deterministic panic.
+  // refines it into a deterministic panic. FR-133: a callee proved to hold a
+  // literal `Some` carries no `Option` at all, so there is nothing to unwrap
+  // and no null to refine.
+  bool unwrapped = unwrappedFnPtrs.contains(callOp.getCallee());
   if (failed(emitOperand(loc, callOp.getCallee(), ExprPos::receiver())))
     return failure();
-  os << ".expect(\"null function pointer\")(";
+  if (!unwrapped)
+    os << ".expect(\"null function pointer\")";
+  os << "(";
   bool first = true;
   for (Value argument : callOp.getArgs()) {
     if (!first)
@@ -4924,8 +5064,17 @@ LogicalResult RustEmitter::emitMethodCall(emitrust::MethodCallOp callOp) {
 
 LogicalResult RustEmitter::emitConstant(emitrust::ConstantOp constantOp) {
   Operation *op = constantOp.getOperation();
-  if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
+  Value result = op->getResult(0);
+  if (failed(emitLetPrologue(result, /*isMut=*/false)))
     return failure();
+  // FR-133: the initializer of an unwrapped fn-ptr local renders as the bare
+  // function item -- `Some(addc)` would not fit the `fn(..)` type the binding
+  // now has. `computeUnwrappedFnPtrs` admitted this constant only after
+  // `fnPtrConstantTargetIdent` matched, so the payload is always there.
+  if (unwrappedFnPtrs.contains(result)) {
+    os << fnPtrConstantTargetIdent(constantOp.getValue()) << ";\n";
+    return success();
+  }
   if (failed(emitAttribute(op->getLoc(), constantOp.getValue())))
     return failure();
   os << ";\n";
@@ -4993,7 +5142,7 @@ LogicalResult RustEmitter::emitDeferredBinding(Operation *op, Value result,
   if (deferredInits.lookup(op))
     os << "mut ";
   os << assignName(result) << ": ";
-  if (failed(emitType(result.getLoc(), type)))
+  if (failed(emitBindingType(result.getLoc(), result, type)))
     return failure();
   os << ";\n";
   return success();
@@ -5017,7 +5166,7 @@ LogicalResult RustEmitter::emitIfExprBinding(Operation *op, Value result,
     tailFoldActive = true;
   } else {
     os << "let " << name << ": ";
-    if (failed(emitType(result.getLoc(), valueType)))
+    if (failed(emitBindingType(result.getLoc(), result, valueType)))
       return failure();
     os << " = ";
   }

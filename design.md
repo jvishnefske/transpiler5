@@ -10062,18 +10062,64 @@ piece and becomes FR-45.
   case type is signless-with-negative-values, or always print via the
   attribute). **NOT SPIKED.**
 
-- [ ] FR-133 A NULLABLE FN-PTR LOCAL initialized from a literal `Some` needs
-  no `Option` at all. Surfaced by FR-132, which made the shape visible to
-  clippy rather than creating it: `let cp: Option<fn(i32)->i32> = Some(addc);
-  .. cp.expect("null function pointer")(i)` draws
-  `clippy::unnecessary_literal_unwrap` (8 corpus instances, fn-pointers.c
-  contributing 3). The `.expect` was ALWAYS redundant there; the two-program-
-  point rendering FR-132 removed is simply what hid it from clippy's const
-  tracing, so this is newly-visible debt and not a regression -- the emitted
-  code got strictly shorter in the same change. When a fn-ptr local is
-  initialized from a literal `Some` and is never reassigned nor compared
-  against null, the `Option` wrapper can be dropped and every use site loses
-  its unwrap. **NOT SPIKED.**
+- [x] FR-133 A NULLABLE FN-PTR LOCAL initialized from a literal `Some` needs
+  no `Option` at all (LANDED 2026-08-29). Surfaced by FR-132, which made the
+  shape visible to clippy rather than creating it: the `.expect` was ALWAYS
+  redundant there, and the two-program-point rendering FR-132 removed is simply
+  what hid it from clippy's const tracing. Newly-visible debt, not a
+  regression -- the emitted code got strictly shorter in that change.
+  **THE FIRST ATTRIBUTABLE CLIPPY IMPROVEMENT THIS PROJECT HAS MEASURED.**
+  Before FR-144 pinned the ratchet to epoch 4 (the same day), a clippy delta
+  was measured across a drifting population and meant nothing. Paired against
+  the pin, over the same 238 files and the same corpus hash on both sides:
+      total 238 -> 230 (-8)
+      clippy::unnecessary_literal_unwrap 9 -> 1
+  and the -8 EXACTLY matches the lint drop -- every other lint is
+  byte-identical, none rose. Train slice 166 -> 158; held-out unchanged (none
+  of the nine was held out). The baseline was `--update`d DELIBERATELY, because
+  the baseline is the thing being improved and leaving it at 238 would let
+  those eight creep back silently.
+  THE SURVIVING ONE IS A DELIBERATE NON-FIX, and it is the fence working:
+  `int (*np)() = zero; if (np) ... np();` in fn-pointers.c is a literal-`Some`
+  local that IS null-compared, so `np.is_some()` needs the wrapper. Clippy sees
+  the const-propagated `Some(zero)` and asks for it to go; OBEYING WOULD DELETE
+  THE THING THE COMPARISON TESTS. Folding `if (np)` to a static `true` is a
+  dead-branch transform, not this FR. A lint is a signal, not an instruction.
+  THE THREE CONDITIONS ARE CHECKED AS ONE USE-SET RULE over the
+  `emitrust.variable`, which is what makes them decidable rather than assumed:
+  every use must be either the ONE whole-binding assign of an identifier-shaped
+  `Some(<fn>)` constant (reusing FR-77's existing reader, so the va-cursor
+  `Some(0i64)` and FR-52's `::`-qualified spellings can never be mistaken for
+  it), or a load whose EVERY use is the callee operand of an
+  `emitrust.call_indirect`. Literal-Some is the constant test; never-reassigned
+  is a second assign refusing; never-null-compared is a load reaching
+  `emitrust.cmp` not being a callee. It is STRICTLY STRONGER than the three
+  conditions -- escapes, borrows and projections refuse for the same reason.
+  ONE ADMISSION GATE BEYOND THE FR: the declaration must be a DEFERRED binding.
+  Every other rendering of a fn-ptr variable emits `emitDefaultValue`'s
+  synthesized `None`, which has NO SPELLING without the `Option` -- admitting it
+  would have been a hard rustc type error, not a lint win. Pinned.
+  THE MULTI-ARM SHAPE IS OUT OF SCOPE, deliberately: fn-pointers.c's deferred
+  local assigned `Some(add)`/`Some(sub)`/`Some(mul)` on three switch arms keeps
+  its `Option`. Two assigns is a reassignment by this entry's own second
+  condition; admitting it needs definite-assignment reasoning a RENDERING fold
+  does not have; and in the real corpus instance the value escapes through a
+  `return` typed `Option<fn(..)>` anyway. Pinned both ways.
+  Rendering-only -- no MLIR type changes, so `call_indirect` still verifies
+  against `!emitrust.fn_ptr` and dialect round-trips are unaffected.
+  CORPUS EMISSION DELTA: exactly FOUR files change, each purely the intended
+  removal (cpp-method-global-arm.cpp, fn-pointers.c, fnptr-noproto-infer.c,
+  fnptr-void-local.c). One detail worth keeping: in fn-pointers.c's
+  fn-returning-fn-ptr the RESULT type correctly KEEPS its `Option`
+  (`let p: fn(i32,i32) -> Option<fn(i32,i32) -> i32> = f1;`) because component
+  types are rendered by `emitType`, never by the new `emitBindingType`. No
+  existing CHECK line, golden or oracle was weakened.
+  Pinned by test/Target/Rust/fnptr-literal-unwrap.mlir (the win plus EVERY
+  refusal leg on hand-written IR) and test/EndToEnd/fnptr-literal-unwrap.c
+  (byte-diffed against the clang native at three argc seeds, with the
+  may-be-None case exercising BOTH the `None` and `Some` paths across seeds).
+  External build oracle unchanged at 47 BUILT / 0 BUILD_FAIL -- the check that
+  a load-bearing `Option` was not dropped.
 
 - [x] FR-131 DEFECT (found by FR-61f-8's spike, pre-existing, SEPARATE
   channel; FIXED 2026-08-28): `printf("")` with an EMPTY format string and
