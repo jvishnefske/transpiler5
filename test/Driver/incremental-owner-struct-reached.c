@@ -53,20 +53,35 @@ int make(long long v) {
 // RUST: impl OwnerMakeBuf {
 // RUST-NEXT: fn tu0_fill(&mut self, {{.*}}) -> i32 {
 
-// The method's progress row is byte-for-byte what it was before FR-141 --
-// pinned here precisely so a WIDENED sweep (one that dropped every owner
-// method of a rejected owner) would have to change it.
+// The method's progress row still proves that the sweep contributed
+// nothing here: it is the row of an item that is PRESENT, and a WIDENED
+// sweep (one that dropped every owner method of a rejected owner) would
+// have to change it.
 //
-// It reads `missing` / `unreached-by-import` even though the method IS
-// emitted, and that is a PRE-EXISTING, separately-owned reporting gap, not
-// FR-141's doing: `collectEmittedSymbols` (ProgressReport.cpp) walks only
-// the module body's direct children, so a method that lives inside an
-// `emitrust.impl` is never in the emitted set and no owner method has ever
-// been counted as ported. FR-141 fixes the OTHER direction of the same
-// artifact -- an item reported missing whose body really was in the crate
-// (see incremental-owner-orphan-impl.c) -- and deliberately leaves this one
-// alone.
+// FR-143 CHANGED THIS READING, deliberately, from `missing` /
+// `unreached-by-import` to `ported`. It used to say `missing` even though
+// the method IS emitted -- visible in the RUST checks above -- because
+// `collectEmittedSymbols` (ProgressReport.cpp) walked only the module
+// body's direct children, so a method living inside an `emitrust.impl` was
+// never in the emitted set and NO owner method had ever been counted as
+// ported. That was a pre-existing, separately-owned reporting gap which
+// FR-141 pinned unchanged rather than fix in passing; FR-143 makes the
+// collector descend into the module-level symbol tables, and the row now
+// agrees with the crate. (FR-141 fixed the OTHER direction of the same
+// artifact -- an item reported missing whose body really was in the crate;
+// see incremental-owner-orphan-impl.c.)
+//
+// The totals first: `make` stubs on tolower, `tu0_fill` is ported, and
+// nothing is missing. Before FR-143 this read ported 0 / missing 1.
+// JSON: "graph_items": 2
+// JSON-NEXT: "ported": 1
+// JSON-NEXT: "stubbed": 1
+// JSON-NEXT: "dropped": 0
+// JSON-NEXT: "missing": 0
+//
+// Then the row itself, in the items array below the totals.
 // JSON: "symbol": "tu0_fill"
 // JSON-NEXT: "kind": "function"
-// JSON-NEXT: "status": "missing"
-// JSON: "blocker": "unreached-by-import"
+// JSON-NEXT: "status": "ported"
+// JSON-NEXT: "color": "green"
+// JSON: "blocker": ""

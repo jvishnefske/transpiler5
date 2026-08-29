@@ -352,7 +352,7 @@ struct ProgressReport {
   std::vector<std::pair<std::string, unsigned>> rootBlockerRanking() const;
 };
 
-/// The names of every top-level symbol operation in `module`.
+/// The names of every emitted symbol operation in `module`.
 ///
 /// This is the evidence that an item really was emitted: `emitrust.func`,
 /// `emitrust.struct_def`, `emitrust.enum_def` and `emitrust.global` all carry
@@ -360,8 +360,19 @@ struct ProgressReport {
 /// name, so membership in this set is a direct answer to "did this item
 /// become Rust?".
 ///
+/// FR-143: "emitted" is not the same as "a direct child of the module body".
+/// An `emitrust.impl` is a nested symbol table, and FR-30 owner promotion,
+/// the actor lift and C++ method import all relocate an `emitrust.func` into
+/// one; the method keeps its unique module-level symbol there, so this walk
+/// descends one level into every INHERENT `emitrust.impl`. It did not, once,
+/// and the consequence was that no owner method had ever been counted as
+/// `ported` -- the report claimed `missing` for code that was in the crate.
+/// A TRAIT impl is skipped: its members are named after the trait (an
+/// imported destructor is renamed to the bare `drop`), so they are not item
+/// symbols and must not be read as evidence for one.
+///
 /// \param module the module about to be rendered into the crate.
-/// \returns the set of top-level symbol names.
+/// \returns the set of emitted symbol names, module-level and in-impl.
 llvm::StringSet<> collectEmittedSymbols(mlir::ModuleOp module);
 
 /// Joins the item graph, the rejection ledger, the emitted symbol table, and
