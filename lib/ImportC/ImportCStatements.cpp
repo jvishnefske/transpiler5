@@ -4799,27 +4799,106 @@ bool containsJumpMachinery(const clang::Stmt *stmt) {
   return false;
 }
 
+/// Whether `stmt` UNCONDITIONALLY rewrites the WHOLE of `var` on entry,
+/// before anything in `stmt` can read it. Exactly two shapes qualify: a bare
+/// `var = E;`, and a `for (var = E; ...)` whose init runs exactly once,
+/// first, on entry. `E` itself must not read `var`.
+bool killsVarUpFront(const clang::Stmt *stmt, const clang::VarDecl *var) {
+  if (!stmt)
+    return false;
+  const clang::Stmt *head = stmt;
+  if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt))
+    head = forStmt->getInit();
+  const auto *headExpr = llvm::dyn_cast_or_null<clang::Expr>(head);
+  if (!headExpr)
+    return false;
+  const auto *bo =
+      llvm::dyn_cast<clang::BinaryOperator>(headExpr->IgnoreParenImpCasts());
+  return bo && bo->getOpcode() == clang::BO_Assign &&
+         isRefTo(bo->getLHS(), var) && !readsVar(bo->getRHS(), var);
+}
+
+/// FR-61f-f. Whether `stmt` can read the value `var` holds on ENTRY to
+/// `stmt`. Strictly weaker than `readsVar`: a statement may name `var` many
+/// times and still never observe the INCOMING value, because a definition
+/// inside `stmt` dominates every one of those reads.
+///
+/// This is deliberately NOT a claim that `stmt` kills `var`. A nested
+/// definition need not execute at all (a `for` may run its body zero times),
+/// so a `false` answer here only ever downgrades a `Read` to a `Pass`, never
+/// promotes anything to a `Kill`. The set of statements that can END
+/// `walkAfter`'s scan with "dead" is therefore exactly what it was before,
+/// and the `killsUnreliable` reasoning below is untouched.
+///
+/// `goto` is not reasoned about here at all: `inductionDeadAfter` refuses
+/// outright on any function containing jump machinery, so the only control
+/// transfers that can reach this code are `break`/`continue`/`return`, which
+/// can SKIP statements but never introduce a read.
+///
+/// Anything not modelled answers `true` (observes), i.e. refuses to lift.
+bool observesIncomingValue(const clang::Stmt *stmt, const clang::VarDecl *var) {
+  if (!readsVar(stmt, var))
+    return false; // never names `var` as a read at all
+  if (killsVarUpFront(stmt, var))
+    return false; // the definition dominates the whole statement
+
+  // Sequenced and unconditional: scan in order. The first child that kills
+  // `var` outright ends the question -- nothing after it can see the incoming
+  // value -- and a child that merely does not observe it lets the scan
+  // continue to its siblings.
+  if (const auto *comp = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {
+    for (const clang::Stmt *child : comp->body()) {
+      if (killsVarUpFront(child, var))
+        return false;
+      if (observesIncomingValue(child, var))
+        return true;
+    }
+    return false;
+  }
+
+  // A `for` whose own init does NOT define `var`. Its init runs first and
+  // exactly once; cond, body and inc then run repeatedly. If none of
+  // init/cond/inc names `var`, every read of `var` in the statement is in the
+  // BODY, and the body is asked the same question. Repetition is harmless: a
+  // body that does not observe the value it is entered with cannot observe
+  // the loop's incoming value on the first pass, and on later passes it sees
+  // only what earlier passes left.
+  //
+  // This is the FR-61f-f case. `for (i = 0; i < 8; i++) for (j = 0; ..) ..`
+  // names `j` in three places, but all three are dominated by the INNER
+  // `j = 0`, so the outer statement does not observe the `j` that an earlier
+  // loop pair left behind -- even though it is not a kill of `j` either,
+  // because the outer loop may run zero times.
+  //
+  // `while` and `do` are absent on purpose. A `while` has no init slot, and
+  // its condition is evaluated BEFORE its body, so a definition in the body
+  // cannot dominate it; a `do` runs its body first but the same body-then-
+  // condition reasoning has not been shown correct here. Both fall through to
+  // `true` below and keep refusing.
+  if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt)) {
+    if (readsVar(forStmt->getInit(), var) ||
+        readsVar(forStmt->getCond(), var) || readsVar(forStmt->getInc(), var))
+      return true;
+    return observesIncomingValue(forStmt->getBody(), var);
+  }
+
+  return true;
+}
+
 /// The effect of executing `stmt` on `var`'s liveness at the point just
 /// before `stmt`. `Kill` means: on EVERY path through `stmt`, `var` is
 /// redefined before it is read -- only the two shapes whose redefinition
-/// unconditionally dominates the statement qualify, namely a bare
-/// `var = E;` and a `for (var = E; ...)` whose init runs exactly once,
-/// first, on entry.
+/// unconditionally dominates the statement qualify (see `killsVarUpFront`).
+/// `Pass` means `stmt` cannot observe the value `var` arrives with; `Read`
+/// means it may.
 enum class VarEffect { Pass, Kill, Read };
 
 VarEffect effectOn(const clang::Stmt *stmt, const clang::VarDecl *var) {
   if (!stmt)
     return VarEffect::Pass;
-  const clang::Stmt *head = stmt;
-  if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt))
-    head = forStmt->getInit();
-  if (const auto *headExpr = llvm::dyn_cast_or_null<clang::Expr>(head))
-    if (const auto *bo = llvm::dyn_cast<clang::BinaryOperator>(
-            headExpr->IgnoreParenImpCasts()))
-      if (bo->getOpcode() == clang::BO_Assign && isRefTo(bo->getLHS(), var) &&
-          !readsVar(bo->getRHS(), var))
-        return VarEffect::Kill;
-  return readsVar(stmt, var) ? VarEffect::Read : VarEffect::Pass;
+  if (killsVarUpFront(stmt, var))
+    return VarEffect::Kill;
+  return observesIncomingValue(stmt, var) ? VarEffect::Read : VarEffect::Pass;
 }
 
 /// Outcome of the walk that locates `target` in the function body and then
