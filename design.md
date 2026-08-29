@@ -9166,22 +9166,104 @@ piece and becomes FR-45.
   idempotent (two consecutive runs byte-identical) and stable across three
   full sweeps.
 
-- [ ] FR-141 DEFECT (found by FR-106's 473-crate build sweep 2026-08-28): the
-  emitter writes an `impl` block for a type it never DEFINES -- exit 0,
-  unbuildable crate, no diagnostic. On antirez/sds `sds.c`:
-      error[E0425]: cannot find type `OwnerSdsfromlonglongBuf` in this scope
-        --> impl OwnerSdsfromlonglongBuf {
-  Same contract violation class as FR-140 (emitted code the crate's own
-  toolchain rejects, with nothing located to point at) and adjacent to FR-137,
-  which was the crash on the same input. The FR-62 actor/owner lift
-  manufactures the owner type name; something admits the impl while the
-  StructDefOp that would define it is dropped or never planned.
-  Reproduce: shallow-clone github.com/antirez/sds, then
-  `emitrust-cc --emit=crate sds.c -o <out> -I. --crate-type=lib` and
-  `cargo build --release`.
-  The safe failure direction (a hard rustc error, never a miscompile) but the
-  rejection-is-a-feature policy violated: a dropped owner type must either
-  suppress its impl or be a LOCATED diagnostic.
+- [x] FR-141 DEFECT (found by FR-106's 473-crate build sweep 2026-08-28;
+  SPIKED AND FIXED 2026-08-28): the emitter wrote an `impl` block for a type it
+  never DEFINES -- exit 0, unbuildable crate, no diagnostic.
+  THE FILED HYPOTHESIS WAS WRONG, recorded so nobody re-derives it: this entry
+  blamed the FR-62 actor/owner lift, and the `demoted SDS_NOINIT` warning that
+  accompanies the sds run is a RED HERRING -- different mechanism
+  (`ActorLiftPlan.cpp`), different name space (`...Actor`, not `Owner...`). The
+  reduced repro has no globals, no actors and no actor-lift activity at all.
+  REDUCED FROM 1300 LINES TO EIGHT, and it needs `--incremental` (which implies
+  `--recover`); STRICT MODE IS IMMUNE, stopping earlier with a located error
+  and writing no crate:
+      static int fill(char *s, long long v) { s[0]=(char)('0'+(v%10)); return 1; }
+      void make(long long v, void *sink) { char buf[32]; fill(buf,v); (void)sink; }
+  emits exactly `impl OwnerMakeBuf { fn tu0_fill(...) }` and NO struct;
+  `cargo build` gives `error[E0425]: cannot find type 'OwnerMakeBuf'`.
+  ROOT CAUSE: the owner struct definition is created LAZILY, inside the owning
+  function's BODY import, while the methods naming it are created
+  UNCONDITIONALLY from a plan made BEFORE any import.
+    - `planOwners` (ImportCPlanning.cpp:443-447, pure-AST, pre-import) fixes
+      `structName` and sets `structDefCreated=false`; nothing checks the owning
+      function will import.
+    - `importFunction` (ImportCFunctions.cpp:576-580) builds the receiver type
+      from that name with no existence check, and tags
+      `emitrust.method_of` (:919-922).
+    - `emitOwnerLocal` (ImportCStatements.cpp:2144-2165) is the SOLE creator of
+      the StructDefOp, and it runs only when the walk reaches the owning
+      function's `char buf[N];` DECLARATION STATEMENT.
+    - `getOrCreateImpl` (FuncToEmitRust.cpp:135-150) materialises the impl from
+      the `method_of` string alone.
+  So the trigger is precisely "the owner-local declaration statement was never
+  REACHED" -- not "the item was dropped". Three sub-shapes reach it:
+  signature-level drop, body drop before the decl, and body STUB before the
+  decl. THE DISCRIMINATING CONTROL, which is what pins the mechanism: the same
+  program with the rejection moved AFTER the decl emits the struct and BUILDS.
+  `--search` (FR-43) is affected too, so a frontier search could score a
+  candidate state whose crate does not build.
+  NO VERIFIER WILL EVER CATCH THIS, by documented design: EmitRustOps.td:190
+  says the impl's struct name is deliberately not cross-checked (mirroring
+  `emitrust.member`), and a hand-written dangling `emitrust.impl` round-trips
+  through `emitrust-opt` and renders fine. The guard must be importer-side.
+  THE C++ PATH ALREADY HAD THIS GUARD; the C path did not. ImportCFunctions.cpp
+  :594-602 rejects `method of an unimported class`, and its comment already
+  says the alternative is to "emit a method onto a struct that no longer
+  exists" -- the identical bug, understood on one path only. C++ can check at
+  the creation site because the class rejection ERASES `assignedStructNames`;
+  the C name is fixed at plan time and the definition is lazy, so the C guard
+  must be a SWEEP: the trigger is an ABSENCE, only knowable once the walk ends.
+  FIXED with direction (c), a LOCATED rejection, as an END-OF-TU MODULE
+  INVARIANT (no surviving `emitrust.method_of` may name a symbol with no
+  StructDefOp), so it closes the class rather than the three known shapes.
+  Costs NOTHING in strict mode -- every repro already stops earlier -- so no
+  golden, EndToEnd byte-diff or corpus ratchet can move. FR-138 measured that
+  recovered crates score ZERO on the rubric, so trading an unbuildable crate
+  for a loud rejection loses no score.
+  THE ARGUMENT THAT DECIDED IT over direction (b) (synthesizing the struct,
+  which was PROVEN sound -- hand-inserting it makes both repros build): the
+  progress artifact ALREADY contradicted the crate, reporting the emitted
+  method as `"status": "missing", "blocker": "unreached-by-import"` while its
+  body sat in `src/lib.rs`. Rejecting makes the artifact TRUE; synthesizing
+  would make the item genuinely ported and would need the item-graph status
+  flipped in the same change to avoid a NEW inconsistency. (b) stays recorded
+  as a ported-item-count follow-up, not discarded.
+  Post-fix the artifact reads `"status": "dropped"`,
+  `"blocker": "owner-method-not-reached"`, `"attributed_via": "make"`,
+  `blame_chain ["tu0_fill","make"]` -- which is also the correct FR-60 ranking
+  signal: port `sdsfromlonglong`'s returned-pointer and you get `sdsll2str`
+  too. On sds the dangling impl is gone and the crate's ONE remaining error is
+  FR-142, confirmed independent.
+  INCIDENCE MEASURED, not estimated: 1 crate in 475 (EndToEnd 237 + TRACTOR 127
+  + external 57 + lwip/tinycrypt/tiny-AES 54). Rare shape, real contract
+  violation.
+  Pinned by test/Driver/incremental-owner-orphan-impl.c,
+  incremental-owner-orphan-shapes.c (the drop-before-decl and STUB-before-decl
+  families in one TU, so "the sweep keys on the fact, not the rejection shape"
+  is readable in one place), and incremental-owner-struct-reached.c -- THE
+  NEGATIVE CONTROL, which fails if the sweep is ever widened.
+
+- [ ] FR-143 DEFECT (found while landing FR-141, 2026-08-28, pre-existing and
+  INDEPENDENT of it): NO OWNER METHOD HAS EVER BEEN COUNTED AS PORTED.
+  `collectEmittedSymbols` (tools/emitrust-cc/ProgressReport.cpp:487-493)
+  iterates only `module.getBody()->getOperations()`, so a method living inside
+  an `emitrust.impl` is never in the emitted set. A correctly ported owner
+  method therefore reports `"status": "missing"` in
+  `emitrust-progress.json` while its body is in the crate.
+  This is the SAME artifact untruth FR-141 fixed, in the OTHER direction:
+  FR-141 was "emitted but reported missing" for a broken item; this is
+  "emitted and correct but reported missing" for a working one. Found because
+  FR-141's negative-control test expected `ported` and got `missing`; the
+  reading was pinned UNCHANGED with a comment, since it is pre-existing and
+  fixing it belongs here.
+  CONSEQUENCE beyond tidiness: every ported-count this ledger has recorded
+  UNDERSTATES the owner-promotion path, and FR-60 blame ranking cannot see
+  those items at all. Any measurement that compares ported counts across a
+  wave where owner promotion changed is suspect.
+  Gates: the progress artifact must report a reached owner method as `ported`;
+  FR-141's negative control must flip from `missing` to `ported` in the same
+  change; no c-testsuite/Cpp17Suite ratchet may move (a ported-count change
+  can move a ledger, so measure before and after); full lit 100%.
   **NOT SPIKED.**
 
 - [ ] FR-142 DEFECT (found by FR-106's 473-crate build sweep 2026-08-28): a

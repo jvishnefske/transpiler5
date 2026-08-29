@@ -2284,6 +2284,93 @@ static LogicalResult checkTemplateArguments(const clang::FunctionDecl *spec,
   return success();
 }
 
+LogicalResult CImporter::rejectOrphanOwnerMethods() {
+  // The invariant, checked directly: every `emitrust.method_of` must name a
+  // struct this module defines. Collect first, erase after — the walk and
+  // the erase cannot be interleaved over the same op range.
+  SmallVector<func::FuncOp> orphans;
+  for (auto funcOp : module.getOps<func::FuncOp>()) {
+    auto methodOf =
+        funcOp->getAttrOfType<StringAttr>(emitrust::kMethodOfAttrName);
+    if (!methodOf)
+      continue;
+    if (llvm::isa_and_nonnull<emitrust::StructDefOp>(
+            SymbolTable::lookupSymbolIn(module, methodOf.getValue())))
+      continue;
+    orphans.push_back(funcOp);
+  }
+  if (orphans.empty())
+    return success();
+
+  // Attribution index. `methodPlans` is keyed by the CANONICAL declaration
+  // and holds the promoted array; the array's parent function is the owner
+  // (the same derivation `planOwners` used to name the struct). The emitted
+  // symbol is `mlirFuncName`, which is what the module op is named, so the
+  // index joins the two sides by symbol without re-deriving anything.
+  llvm::StringMap<const clang::FunctionDecl *> methodBySymbol;
+  for (const auto &entry : methodPlans)
+    methodBySymbol[mlirFuncName(entry.first)] = entry.first;
+
+  LogicalResult result = success();
+  for (func::FuncOp funcOp : orphans) {
+    std::string symbol = funcOp.getSymName().str();
+    const clang::FunctionDecl *method = methodBySymbol.lookup(symbol);
+    const clang::VarDecl *base = method ? methodPlans.lookup(method) : nullptr;
+    const auto *owner =
+        base ? llvm::dyn_cast_if_present<clang::FunctionDecl>(
+                   base->getParentFunctionOrMethod())
+             : nullptr;
+    // A C++ method reaching here would mean FR-118's eager guard was
+    // bypassed; it has no owner plan, so the message states only the fact.
+    // Locating at the method's own definition (not at the owner) is what
+    // makes the row joinable to the method's item-graph node.
+    Location loc = method ? translateLoc(method->getLocation())
+                          : funcOp.getLoc();
+    std::string reason =
+        owner ? (llvm::Twine("unsupported: method of an owner struct that was "
+                             "never created: the owning function '") +
+                 owner->getName() +
+                 "' was rejected before its promoted local array '" +
+                 base->getName() + "' was imported")
+                    .str()
+              : (llvm::Twine("unsupported: method of an owner struct that was "
+                             "never created: no definition of '") +
+                 funcOp->getAttrOfType<StringAttr>(emitrust::kMethodOfAttrName)
+                     .getValue() +
+                 "' was emitted")
+                    .str();
+
+    if (!recoverFromRejections) {
+      // Strict mode never reaches here in practice — every shape that
+      // strands a method dies earlier, on the owning function's own
+      // rejection — but if it ever did, a hard located error is the only
+      // acceptable outcome: the alternative is emitting the unbuildable
+      // crate this guard exists to prevent.
+      result = failure();
+      emitError(loc) << reason;
+      continue;
+    }
+
+    std::string ledgerSymbol =
+        method ? graphItemSymbol(method) : std::string();
+    if (ledgerSymbol.empty())
+      ledgerSymbol = symbol;
+    // FR-126-style cascade source: the owning function's graph key, so the
+    // report's blame chain walks from the method to the blocker that
+    // actually has to be ported.
+    std::string ownerGraphSymbol =
+        owner ? graphItemSymbol(owner) : std::string();
+    if (rejectionLedger)
+      rejectionLedger->record(emitrust::RejectedItem{
+          ledgerSymbol, loc, reason, emitrust::classifyBlocker(reason, loc),
+          /*stubbed=*/false, /*ownerSymbol=*/"", ownerGraphSymbol});
+    emitWarning(loc) << reason << " (recovered: item dropped)";
+    eraseTopLevelOp(funcOp.getOperation());
+    functions.erase(symbol);
+  }
+  return result;
+}
+
 LogicalResult CImporter::importTopLevelDecl(const clang::Decl *decl) {
   // W2.16 class-template monomorphization, the record twin of W2.15's
   // arm below. Clang has already instantiated every specialization the
@@ -2655,6 +2742,12 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   planParamCursorReturns(unit, soleTranslationUnit);
   collectDeclTypeRecords(unit);
   if (failed(importDeclsIn(unit)))
+    return failure();
+  // FR-141: the walk is over, so an owner struct that was never synthesized
+  // never will be. Any method still tagged for one is an `impl` with no
+  // struct — a crate that exits 0 and does not compile — and is rejected
+  // here, located at the method and blamed on its owning function.
+  if (failed(rejectOrphanOwnerMethods()))
     return failure();
   if (needsFloatFormatHelper && !floatFormatHelperEmitted) {
     floatFormatHelperEmitted = true;
