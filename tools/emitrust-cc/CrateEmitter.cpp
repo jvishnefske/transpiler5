@@ -38,8 +38,15 @@ namespace emitrustcc {
 /// dead store inside a loop body, whose sound cross-iteration liveness would
 /// risk a miscompile and is deliberately not attempted. FR-61f lifts canonical
 /// C counting loops to `emitrust.for` range heads (no explicit backedge store),
-/// removing that residual; the lint is now DENIED in `Cargo.toml` like every
-/// other lint, so a regression fails the build instead of hiding.
+/// removing most of that residual; the lint is DENIED in `Cargo.toml` like
+/// every other lint, so a regression fails the build instead of hiding.
+/// The residual that survives FR-61f -- a store in a loop body that the
+/// fenced cross-iteration elision may not delete -- is handled PER FUNCTION
+/// and NOT re-allowed here: FR-106's all-path detector in `TranslateToRust`
+/// puts `#[allow(unused_assignments)]` on the individual `fn` it can prove
+/// holds such a store (measured: 4 of 3475 emitted functions across 472
+/// rustc-clean crates). Moving the allow back into this header would delete
+/// the tripwire on the other 3471.
 /// Every other lint the old blanket header silenced is now DENIED in
 /// `Cargo.toml`'s `[lints.rust]` table (see `renderCargoToml`), so a regression
 /// fails the build.

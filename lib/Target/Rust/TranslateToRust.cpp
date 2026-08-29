@@ -796,6 +796,54 @@ private:
   /// overwritten at the top of every iteration and is not live-out of the loop.
   void computeLoopBodyDeadStores(Block &entryBlock);
 
+  //===--------------------------------------------------------------===//
+  // FR-106: the `unused_assignments` risk detector.
+  //
+  // rustc's `unused_assignments` is an ALL-PATH liveness result, and the
+  // crate-wide `unused_assignments = "deny"` (FR-53) turns any residual
+  // into a hard build failure with no emitter diagnostic at all. The dead-
+  // store elision above cannot reach a store nested in a loop body --
+  // deciding that needs the back edge, and CLAUDE.md fences cross-iteration
+  // liveness because DELETING such a store miscompiled three times.
+  //
+  // This detector asks the same question and spends the answer on an
+  // ATTRIBUTE instead of a deletion: a marked function is given
+  // `#[allow(unused_assignments)]`. Nothing is elided, dropped or
+  // reordered, and `deadStores` is never written here -- so a wrong "dead"
+  // costs one redundant allow on ONE function, and a wrong "live" costs the
+  // loud build error that exists without the detector at all. The crate-
+  // wide deny, and therefore the tripwire on every other function, stays.
+  //
+  // The predicate is ALL-PATHS ("no continuation reads this store"), never
+  // some-path. Measured over 3475 emitted functions in 472 rustc-clean
+  // crates against rustc 1.96.0, which flags 4 of them: some-path marks
+  // 127 (forward only) to 147 (with the back edge) -- a 32-37:1
+  // over-application putting an allow in 77+ crates, which is the
+  // crate-wide re-allow the deny exists to prevent. All-paths marks exactly
+  // those 4 (precision 1.00, recall 1.00). Every shape the analysis does
+  // not understand must therefore ANSWER "assume a read" and NOT mark.
+  //===--------------------------------------------------------------===//
+
+  /// Set while the current item is rendered; consumed after the body walk.
+  bool itemAllowsUnusedAssign = false;
+
+  /// Whether `op` renders a store of the WHOLE `binding` at its own program
+  /// point.
+  bool uaStoresBinding(Operation *op, Value binding);
+
+  /// Whether ANY continuation of the program point just after `from` reads
+  /// `binding` before overwriting it -- following fall-through, the
+  /// enclosing construct's exit, a loop's BACK EDGE, and `break`/`continue`.
+  bool uaReadAfter(Operation *from, Value binding);
+
+  /// Whether an iteration entered at the TOP of `loopOp` (condition first,
+  /// for a `while`) reads `binding` before overwriting it.
+  bool uaReadFromLoopTop(Operation *loopOp, Value binding);
+
+  /// Whether the function holds a store rustc's `unused_assignments` may
+  /// flag: one with no read on ANY continuation.
+  bool uaFunctionAtRisk(Operation *funcOp);
+
   /// FR-61a: the function-final `emitrust.return` of the current function --
   /// the last op the entry-block walk emits -- rendered as a tail expression
   /// (operand only, no `return`, no `;`) or, when it has no operand, omitted.
@@ -1973,6 +2021,222 @@ void RustEmitter::computeLoopBodyDeadStores(Block &entryBlock) {
       deadStores.insert(&op);
     }
   }
+}
+
+//===----------------------------------------------------------------------===//
+// FR-106: the `unused_assignments` risk detector.
+//
+// The same all-path liveness question `computeDeadStores` asks, but over the
+// FULL continuation of a store -- outward through the enclosing `if`/`switch`
+// arm, and for a store inside a loop through the BACK EDGE and the post-loop
+// tail. That is cross-iteration reasoning, and it is admissible here for
+// exactly one reason: NOTHING IS DELETED. The answer gates an
+// `#[allow(unused_assignments)]` on the enclosing fn, so an error in the
+// "dead" direction costs a redundant allow on one function and an error in the
+// "live" direction costs the loud build failure that exists without it. If
+// this analysis is ever wired to an elision it becomes the fenced
+// cross-iteration dead-store deletion; it must not be.
+//===----------------------------------------------------------------------===//
+
+/// Whether `op` renders a store of the WHOLE `binding` at its own program
+/// point: an `emitrust.assign` to it, or the binding's own defining
+/// `let`/`variable` carrying an initializer (both render as `let x = ..`).
+///
+/// A DEFERRED initializer is NOT a store: `deferredInits` means the emitter
+/// renders `let x: T;` and drops the initializer, so counting it fires on
+/// every FR-61b if-expression binding there is -- measured on heatshrink's
+/// encoder, that marked 9 of 14 functions for stores that never reach the
+/// output.
+bool RustEmitter::uaStoresBinding(Operation *op, Value binding) {
+  if (auto assign = dyn_cast<emitrust::AssignOp>(op))
+    return assign.getVar() == binding;
+  if (auto letOp = dyn_cast<emitrust::LetOp>(op))
+    return letOp.getResult() == binding && !deferredInits.count(op);
+  if (auto var = dyn_cast<emitrust::VariableOp>(op))
+    return var.getResult() == binding && var.getInitAttr() &&
+           !deferredInits.count(op);
+  return false;
+}
+
+namespace {
+/// The ways a remaining statement sequence can leave its enclosing loop, so
+/// the read search can follow each one. `analyzeSeq` folds `break`, `continue`
+/// and `return` into ONE `diverges` bit, which is enough to decide a
+/// fall-through but not enough to decide where a path GOES -- the
+/// store-then-`break` shape (heatshrink's `heatshrink_encoder_poll` has
+/// `emitrust.assign %22 = %50` immediately before an `emitrust.break`, and the
+/// value IS read after the loop) is a false positive without this.
+struct UAExits {
+  bool brk = false;
+  bool cont = false;
+  /// A shape the scan cannot classify (a multi-block nested region). Forces
+  /// the caller to answer "assume a read".
+  bool unknown = false;
+};
+} // namespace
+
+/// Records which loop exits `[begin, end)` can take. A `break`/`continue`
+/// inside a NESTED loop binds to that loop and is not reported here.
+static void uaExitKinds(Block::iterator begin, Block::iterator end,
+                        UAExits &k) {
+  for (auto it = begin; it != end; ++it) {
+    Operation *op = &*it;
+    if (isa<emitrust::BreakOp>(op)) {
+      k.brk = true;
+      continue;
+    }
+    if (isa<emitrust::ContinueOp>(op)) {
+      k.cont = true;
+      continue;
+    }
+    if (isa<emitrust::ForOp, emitrust::WhileOp, emitrust::LoopOp>(op))
+      continue; // an inner loop swallows its own break/continue
+    for (Region &r : op->getRegions()) {
+      if (r.empty())
+        continue;
+      if (!r.hasOneBlock()) {
+        k.unknown = true;
+        continue;
+      }
+      uaExitKinds(r.front().begin(), r.front().end(), k);
+    }
+  }
+}
+
+/// The nearest enclosing loop op of `blk`, or null.
+static Operation *uaEnclosingLoop(Block *blk) {
+  for (Operation *p = blk->getParentOp(); p; p = p->getParentOp())
+    if (isa<emitrust::ForOp, emitrust::WhileOp, emitrust::LoopOp>(p))
+      return p;
+  return nullptr;
+}
+
+bool RustEmitter::uaReadFromLoopTop(Operation *loopOp, Value binding) {
+  bool isWhile = isa<emitrust::WhileOp>(loopOp);
+  if (isWhile) {
+    // `emitrust.while` keeps its condition in region 0 and its body in
+    // region 1; the condition runs first on every iteration.
+    Region &cond = loopOp->getRegion(0);
+    if (cond.empty() || !cond.hasOneBlock())
+      return true; // unknown shape: assume a read
+    Liveness c = analyzeSeq(cond.front().begin(), cond.front().end(), binding,
+                            /*enteringWritten=*/false,
+                            /*enteringAnyWrite=*/false, /*brk=*/nullptr,
+                            /*partialWriteBlocks=*/false);
+    if (c.readFirst)
+      return true;
+    // The condition already overwrote it (or never falls through into the
+    // body): the body cannot see the incoming value.
+    if (c.writtenAtExit || c.diverges)
+      return false;
+  }
+  Region &body = isWhile ? loopOp->getRegion(1) : loopOp->getRegion(0);
+  if (body.empty() || !body.hasOneBlock())
+    return true; // unknown shape: assume a read
+  return analyzeSeq(body.front().begin(), body.front().end(), binding,
+                    /*enteringWritten=*/false, /*enteringAnyWrite=*/false,
+                    /*brk=*/nullptr, /*partialWriteBlocks=*/false)
+      .readFirst;
+}
+
+bool RustEmitter::uaReadAfter(Operation *from, Value binding) {
+  // A loop head is asked about at most once: a `false` answer is a proof that
+  // no path from that head reads the binding first, and a `true` answer has
+  // already returned.
+  llvm::SmallPtrSet<Operation *, 16> loopTopsSeen;
+  llvm::SmallPtrSet<Operation *, 16> visited;
+  llvm::SmallVector<Operation *, 8> work{from};
+  auto loopTopReads = [&](Operation *loop) {
+    return loopTopsSeen.insert(loop).second && uaReadFromLoopTop(loop, binding);
+  };
+  while (!work.empty()) {
+    Operation *cur = work.pop_back_val();
+    if (!visited.insert(cur).second)
+      continue;
+    Block *blk = cur->getBlock();
+    // Unknown shape (no block, or a multi-block region whose successors this
+    // scan does not model): assume a read.
+    if (!blk || !blk->getParent() || !blk->getParent()->hasOneBlock())
+      return true;
+    Liveness l = analyzeSeq(std::next(cur->getIterator()), blk->end(), binding,
+                            /*enteringWritten=*/false,
+                            /*enteringAnyWrite=*/false, /*brk=*/nullptr,
+                            /*partialWriteBlocks=*/false);
+    if (l.readFirst)
+      return true; // SOME path reads it: the store is live, do not mark
+
+    // The loop exits are followed FIRST and independently of `writtenAtExit`:
+    // that flag summarizes the FALL-THROUGH paths only, and a `break` path
+    // that leaves before the overwrite still carries this store's value out
+    // of the loop.
+    UAExits k;
+    uaExitKinds(std::next(cur->getIterator()), blk->end(), k);
+    if (k.unknown)
+      return true;
+    if (k.brk || k.cont) {
+      Operation *loop = uaEnclosingLoop(blk);
+      if (!loop)
+        return true; // a break with no enclosing loop: assume a read
+      if (k.cont && loopTopReads(loop))
+        return true;
+      if (k.brk)
+        work.push_back(loop); // a `break` continues after the loop
+    }
+
+    if (l.writtenAtExit)
+      continue; // every fall-through path overwrote it first
+    Operation *parent = blk->getParentOp();
+    if (l.diverges || !parent || isa<emitrust::FuncOp>(parent))
+      continue; // no fall-through, or the function simply ends
+    // Falling out of a LOOP BODY is the back edge: the next iteration starts
+    // at the head, and its reads count. Falling past the loop op itself (the
+    // head's test failing) is covered by pushing the loop op.
+    if (isa<emitrust::ForOp, emitrust::WhileOp, emitrust::LoopOp>(parent) &&
+        loopTopReads(parent))
+      return true;
+    work.push_back(parent);
+  }
+  return false;
+}
+
+bool RustEmitter::uaFunctionAtRisk(Operation *funcOp) {
+  bool risk = false;
+  funcOp->walk([&](Operation *op) {
+    if (risk)
+      return;
+    Value binding;
+    if (auto assign = dyn_cast<emitrust::AssignOp>(op)) {
+      binding = assign.getVar();
+      Operation *def = binding.getDefiningOp();
+      // Only a local `let`/`variable` binding is an `unused_assignments`
+      // site the emitter owns. A store through a projection, a global cell
+      // or a parameter is left to answer "assume a read" -- the safe
+      // direction, since a missed mark is the loud build error.
+      if (!def || !isa<emitrust::LetOp, emitrust::VariableOp>(def))
+        return;
+    } else if (isa<emitrust::LetOp, emitrust::VariableOp>(op)) {
+      binding = op->getResult(0);
+      if (!uaStoresBinding(op, binding))
+        return;
+    } else {
+      return;
+    }
+    // Stores that render nothing cannot be flagged by rustc.
+    if (unreachableOps.count(op) || deadStores.count(op) || droppedOps.count(op))
+      return;
+    // A borrowed binding can be read through the reference, which this scan
+    // does not track; rustc's own liveness gives up on borrowed locals too.
+    if (bindingIsBorrowed(binding))
+      return;
+    // A never-read binding is emitted `_`-prefixed (`claimName`), and rustc
+    // EXEMPTS `_`-prefixed locals from `unused_assignments` outright --
+    // measured with a rustc probe, not assumed.
+    if (!valueIsRead(binding))
+      return;
+    if (!uaReadAfter(op, binding))
+      risk = true;
+  });
+  return risk;
 }
 
 /// FR-61b: returns the `emitrust.assign` to `binding` that is `region`'s
@@ -4217,6 +4481,7 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   inlineExprs.clear();
   inlineTreeReadsPlace.clear();
   droppedOps.clear();
+  itemAllowsUnusedAssign = false;
   pendingInlineCapture = false;
   fieldInitFuses.clear();
   fusedAssignOwner.clear();
@@ -4294,6 +4559,12 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // render, so every set that silences an op must already be populated, and
   // `ifExprBindings` must already have claimed the bindings it folds better.
   computeLateInitMerges(funcOp);
+  // FR-106: decided LAST, so every set that silences a store (`deadStores`,
+  // `droppedOps`, `deferredInits`, the late-init merges) is already
+  // populated and a store that never renders cannot be counted. The answer
+  // is applied to the ITEM after its body is rendered, because the attribute
+  // goes on the `fn` -- that is where rustc honours it.
+  itemAllowsUnusedAssign = uaFunctionAtRisk(op);
   // A function directly inside an `emitrust.impl` is a method, UNLESS it
   // carries the `static_method` marker (W2.2), in which case it is a
   // receiverless associated function (`Struct::name(...)`) and every
@@ -4428,6 +4699,19 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
     return failure();
   decreaseIndent();
   os << "}\n";
+  if (itemAllowsUnusedAssign) {
+    // FR-106 reuses FR-140's insertion mechanism: render the item, then
+    // prefix it at its OWN indentation, so a method inside an
+    // `emitrust.impl` lines up with its `fn`. Inserting before
+    // `closeNonSnakeCaseScope` keeps a stacked pair in a fixed order
+    // (`non_snake_case` first).
+    itemAllowsUnusedAssign = false;
+    os.flush();
+    StringRef item = StringRef(buffer).substr(itemStart);
+    size_t indent = item.size() - item.ltrim(' ').size();
+    buffer.insert(itemStart,
+                  std::string(indent, ' ') + "#[allow(unused_assignments)]\n");
+  }
   closeNonSnakeCaseScope(itemStart);
   return success();
 }
