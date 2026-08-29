@@ -269,6 +269,61 @@ blocked_by = []
 anchor = "FR-148 DEFECT (MISCOMPILE, found while implementing FR-147"
 
 [[items]]
+id = "FR-149"
+rank = 10
+kind = "defect"
+status = "open"
+size = "M"
+title = "Enum-valued array subscript fails to verify -- gates every systemd link"
+summary = "Found by the systemd probe 2026-08-28, REPRODUCED at HEAD. log.c:1427 `log_target_max_level[target]` with LogTarget target gives: 'emitrust.subscript' op operand #1 must be integer or index, but got !emitrust.enum<\"LogTarget\">. HIGHEST-LEVERAGE ITEM THE PROBE FOUND: 5 units directly, but log.c is what every systemd TU pulls in for assert() -> log_assert_failed, so this ONE bug is why NO SUBSET OF SYSTEMD LINKS, down to two files. Direction: insert the enum->integer cast at emitrust.subscript. DOES NOT REDUCE SYNTHETICALLY -- four shapes tried (named typedef enum subscripting a static const int[], the same with a switch, an enum-typed global, an enum struct member) ALL lower the enum to i32 and emit fine. Use the REAL input: systemd is on disk with a configured build. Instrument the type-mapping decision rather than guessing at a fifth reduction. NOT SPIKED."
+blocked_by = []
+anchor = "FR-149 DEFECT (found by the systemd probe"
+
+[[items]]
+id = "FR-150"
+rank = 11
+kind = "defect"
+status = "open"
+size = "M"
+title = "An emitted type colliding with the Rust prelude shadows it (Option)"
+summary = "Found by the systemd probe 2026-08-28. systemd's options.h ends with a type named Option, so the importer emits `pub struct Option`, after which every Option<fn()> the emitter writes parses as that struct: error[E0107] struct takes 0 generic arguments but 1 was supplied. 123 of the 158 systemd build failures are this ONE bug. Generalizes to any C project with a type named Option/Result/Box/String/Vec. Exit-0 unbuildable with no diagnostic -- the FR-140/141/142/146 class; external-probe.py's 16-repo corpus never saw it because none of those repos names a type Option. Direction: rename or qualify emitted items colliding with the prelude, or make the emitter's own Option spellings fully qualified. NOT SPIKED."
+blocked_by = []
+anchor = "FR-150 DEFECT (found by the systemd probe"
+
+[[items]]
+id = "FR-151"
+rank = 12
+kind = "defect"
+status = "open"
+size = "S"
+title = "Anonymous struct names are not TU-unique, so the --link shard merge collides"
+summary = "Found by the systemd probe 2026-08-28. error: conflicting definitions of 'Anon0' at link: the shards disagree on its shape. Anonymous structs are minted per TU as Anon0/Anon1/... WITHOUT the per-TU tag internal-linkage symbols get (tu0_), so siginfo_t's anonymous struct and an unrelated one in architecture.c collide. Blocks the 493-shard systemd-detect-virt merge. Direction: give anonymous struct names the same per-TU tag. Narrow and mechanical. NOT SPIKED."
+blocked_by = []
+anchor = "FR-151 DEFECT (found by the systemd probe"
+
+[[items]]
+id = "FR-152"
+rank = 21
+kind = "defect"
+status = "open"
+size = "M"
+title = "scf.while legalization fails on gperf-generated lookup tables"
+summary = "Found by the systemd probe 2026-08-28. failed to legalize operation 'scf.while' on 7 units, all gperf-GENERATED lookup tables (af-from-name.gperf:51, errno-from-name, ...). Machine-generated C is a distinct shape class from hand-written C and this is the first time the project has measured it at scale. NOT SPIKED."
+blocked_by = []
+anchor = "FR-152 DEFECT (found by the systemd probe"
+
+[[items]]
+id = "FR-153"
+rank = 20
+kind = "defect"
+status = "open"
+size = "L"
+title = "E0596 mutable borrow through a shared reference (35 crates)"
+summary = "Found by the systemd probe 2026-08-28. 35 crates fail error[E0596]: cannot borrow *p or p[_] as mutable, behind a & reference (src/core/manager, src/coredump/coredumpctl-journal, ...). Exit-0 unbuildable, the FR-145 class again. Ranked last of the five systemd findings because it is the only one that is not obviously narrow: a borrow-model question, not a naming or cast fix. NOT SPIKED."
+blocked_by = []
+anchor = "FR-153 DEFECT (found by the systemd probe"
+
+[[items]]
 id = "FR-138"
 rank = 14
 kind = "tooling"
