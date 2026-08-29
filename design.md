@@ -9457,40 +9457,68 @@ piece and becomes FR-45.
   EndToEnd byte-diff of the admitted shape; full lit 100%.
   **NOT SPIKED.**
 
-- [ ] FR-145 TOOLING (the class-level guard, distilled from FR-140, FR-141 and
-  FR-142, which were three instances of ONE class found one at a time over a
-  single day 2026-08-28): THE EMITTER CAN PRODUCE CODE ITS OWN TOOLCHAIN
-  REJECTS, AND NOTHING NOTICES.
-  All three were exit-0-unbuildable with NO diagnostic:
-    FR-140  a double-underscore C identifier trips the emitted manifest's own
-            `non_snake_case = "deny"`.
-    FR-141  an `impl` is written for a type the crate never defines (E0425).
-    FR-142  a deferred binding is `let mut` and never reassigned, tripping the
-            emitted manifest's own `unused_mut = "deny"`.
-  Each was found by ACCIDENT, as a by-product of some other FR's corpus sweep.
-  A standing guard would have caught all three at once, and the FR-142 spike
-  already wrote one: `scratchpad/fr142spike/cargosweep.sh` builds 475 emitted
-  crates in about 4 minutes at `-P 8` and reports per-crate FAIL with the
-  rustc error counts. `scripts/tractor-eval.py` (FR-138) already builds crates
-  too, so the machinery exists twice and is committed neither time.
-  THE INVARIANT TO GATE: an emitted crate must COMPILE. Not "the importer
-  exited 0", not "the lit suite is green" -- the emitted Rust must survive
-  `cargo check`. Every one of the three defects passed the full lit suite.
-  WHY THIS IS NOT ALREADY COVERED: EndToEnd byte-diff builds its crates, but it
-  only covers `test/EndToEnd` inputs, which are written to be supportable. The
-  three defects all came from EXTERNAL C (sds, parson, heatshrink) reached
-  through `--incremental`, a mode no gate exercises at scale.
-  DIRECTIONS, none chosen: (a) commit the sweep as a script plus a documented
-  manual protocol, like the external probe loop -- cheapest, but it only runs
-  when someone remembers; (b) gate a SMALL pinned set of external crates in
-  lit, accepting the cargo cost -- catches the class in CI but needs the corpus
-  vendored or fetched; (c) fold the check into `scripts/tractor-eval.py` and
-  run it in the same cadence as the corpus sweep -- no new machinery, but the
-  cadence is manual. (a)+(c) look complementary.
-  NOTE the epoch/pin lesson from FR-144 applies here too: whatever population
-  this guard measures must be PINNED, or a rise in failures is attributable to
-  nothing.
-  **NOT SPIKED.**
+- [x] FR-145 TOOLING (the class-level guard, distilled from FR-140, FR-141 and
+  FR-142; LANDED 2026-08-29): THE EMITTER CAN PRODUCE CODE ITS OWN TOOLCHAIN
+  REJECTS, AND NOTHING NOTICED. All three were exit-0-unbuildable with no
+  diagnostic, all found BY ACCIDENT as by-products of unrelated FRs' corpus
+  sweeps, and all passed the full lit suite.
+  **THE SPIKE MOVED THIS OFF ALL THREE DIRECTIONS THIS ENTRY PROPOSED.**
+  Measured: (b) is out because the corpus is deliberately NOT vendored; (c) is
+  already done -- `scripts/tractor-eval.py` classifies `BUILD_FAIL` distinctly
+  from `EMIT_FAIL` for the TRACTOR corpus; and the guess behind (a), that no
+  test builds an `--incremental` crate, is FALSE -- 13 lit tests already do
+  `--incremental` + `--build`. The mode was never the gap.
+  THE ACTUAL GAP WAS IN THIS PROJECT'S OWN MEMORY, which records the practice
+  AND the lesson -- "ADD A BUILD ORACLE (learned 2026-08-20). The progress-JSON
+  loop measures IMPORT only and is structurally blind to 'the emitted crate
+  does not compile'" -- and then adds "a `measure.py` template lives in session
+  scratchpads; recreate it from this description." So the sweep was REBUILT
+  FROM PROSE every session and thrown away with the scratchpad. That is exactly
+  why the three defects were found one at a time. The fix was not a new idea;
+  it was committing the one that kept being reinvented.
+  DELIVERED: `scripts/external-probe.py`. Corpus root as an argument (nothing
+  vendored, nothing cloned), per unit
+  `--emit=crate --crate-type=lib --incremental` then
+  `cargo build --release --offline`, machine-readable + human output, exit 0
+  only if every emitted crate compiled.
+  SEVEN OUTCOMES THAT ARE NEVER SUMMED, because conflating them is what hid the
+  class: `BUILT` (the only success), `BUILD_FAIL`, `BUILD_TIMEOUT`,
+  `BUILD_SKIPPED`, `EMIT_EMPTY`, `EMIT_FAIL`, `EMIT_TIMEOUT`. `EMIT_EMPTY`
+  exists specifically as the guard against the 168/252 fallthrough this ledger
+  already recorded: exit 0 with no `src/*.rs` is a FAILURE, not a success. A
+  missing cargo yields `BUILD_SKIPPED` with a loud warning, NEVER a success.
+  **THE ACCEPTANCE CRITERION DOUBLED AS PROOF THE CLASS IS CLOSED:** over the
+  85-unit probe corpus, **47 BUILT, 38 EMIT_FAIL, ZERO BUILD FAILURES** -- and
+  zero `BUILD_SKIPPED`, so cargo genuinely ran on all 47 and the oracle is not
+  vacuous. Earlier the same day this corpus carried several: sds and parson
+  (FR-142) and two segfaults (FR-146). Every one is closed.
+  THE ORACLE WAS PROVEN ABLE TO FAIL, which matters more than the zero: a
+  negative control injecting one bad function reproduces `BUILD_FAIL` and
+  classifies `non_snake_case`, `unused_mut` and `E0425` -- the exact signatures
+  of FR-140, FR-142 and FR-141. A guard that cannot fire is not a guard.
+  IT CARRIES THE TWO HARD-WON RANKING LESSONS so they stop being rediscovered:
+  RANK BY FUNCTION ITEMS, NOT TOTAL ITEMS (one record imported across 18 TUs
+  contributes 18 `ported` items; only ~25% of items are code, and this error
+  once invalidated a whole session's ranking), and rank on the per-item
+  `diagnostic` field, not `blocker`, which is mostly "other". Both figures are
+  reported side by side, never one instead of the other. Measured now: FUNCTION
+  289/1902 (15.2%) against all-kinds 598/2318 (25.8%), and the contrast is
+  visible in the ranking -- "pointer type outside a parameter position" is 6th
+  at 65 all-kinds but 13th at 17 function-only.
+  DENOMINATOR STATED, as this ledger requires: 85 units over 16 repos, with
+  each repo's git HEAD recorded (the FR-144 pinning lesson). FIVE repos
+  excluded WITH REASONS, never silently -- header-only libraries whose only
+  `.c` files are their own tests, plus two scratch dirs. Include dirs are
+  confined to the unit's own repo, because without that one repo's headers
+  silently satisfy another's `#include`.
+  Determinism verified (byte-identical results across `-j 12` and `-j 6`); the
+  script writes only under `--out` and refuses an `--out` inside the corpus
+  root. Not in the lit gate, and deliberately so -- it needs an external corpus
+  the repo does not vendor, which is the same reason `scripts/tractor-eval.py`
+  is not gated either. Two type errors (an `Optional[str]` cargo path reaching
+  `subprocess.run`, and `__doc__.splitlines()` which is None under `-OO`) were
+  fixed before commit; the cargo one was safe at runtime but only by a
+  correlation across two variables that nothing checked.
 
 - [x] FR-144 DEFECT (TOOLING, found by T-EPOCH4's freeze 2026-08-28; FIXED
   2026-08-28): THE IMPROVEMENT HARNESS'S FROZEN-CORPUS PREMISE WAS BROKEN in
