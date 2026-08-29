@@ -5,9 +5,6 @@
 // RUN: not emitrust-import-c %t/memcpy-same-alloc.c 2>&1 | FileCheck %s --check-prefix=MEMCPYSAME
 // RUN: not emitrust-import-c %t/strcpy-same-alloc.c 2>&1 | FileCheck %s --check-prefix=STRCPYSAME
 // RUN: not emitrust-import-c %t/strchr-alloc.c 2>&1 | FileCheck %s --check-prefix=STRCHRALLOC
-// RUN: not emitrust-import-c %t/slice-arg-shared.c 2>&1 | FileCheck %s --check-prefix=SLICEARGSHARED
-// RUN: not emitrust-import-c %t/slice-arg-mut.c 2>&1 | FileCheck %s --check-prefix=SLICEARGMUT
-// RUN: not emitrust-import-c %t/slice-arg-typed.c 2>&1 | FileCheck %s --check-prefix=SLICEARGTYPED
 
 // FR-146 frontier. Admitting ALLOCATION-BACKED regions as <string.h>
 // arguments admits exactly the byte-typed, distinct-allocation shapes the
@@ -125,44 +122,18 @@ int f(void) {
 }
 // STRCHRALLOC: strchr-alloc.c:7:18: error: unsupported: string function argument over a pointer with no importable region
 
-// Passing an allocation-backed pointer to a USER-DEFINED function is the
-// second null-base crash site (`emitBorrowArgument`): the same base-less
-// region, the same dereference of a null `VarDecl`. The region itself is
-// representable as a reslice of the backing, but the caller's aliasing
-// guard is keyed on the argument's `VarDecl` root, which an allocation
-// region has none of — `f(p, p)`, `f(p, p + 1)` and `f(p, q)` after
-// `q = p` would all emit two borrows of one backing array and fail only
-// as rustc E0499/E0502 in the emitted crate. So the shape rejects located
-// until that aliasing key exists: a diagnostic here is strictly better
-// than a crash, and strictly better than a crate that does not build.
-//--- slice-arg-shared.c
-#include <stdlib.h>
-int first(const char *b) { return b[0]; }
-int f(void) {
-  char *p = (char *)malloc(8);
-  p[0] = 7;
-  return first(p);
-}
-// SLICEARGSHARED: slice-arg-shared.c:6:10: error: unsupported: passing a pointer into a heap allocation as a slice argument
-
-// The mutable-parameter spelling reaches the same guard.
-//--- slice-arg-mut.c
-#include <stdlib.h>
-void fill(char *b) { b[0] = 3; }
-int f(void) {
-  char *p = (char *)malloc(8);
-  fill(p);
-  return p[0];
-}
-// SLICEARGMUT: slice-arg-mut.c:5:3: error: unsupported: passing a pointer into a heap allocation as a slice argument
-
-// So does a typed (non-byte) allocation.
-//--- slice-arg-typed.c
-#include <stdlib.h>
-int head(int *b) { return b[0]; }
-int f(void) {
-  int *p = (int *)malloc(8);
-  p[0] = 7;
-  return head(p);
-}
-// SLICEARGTYPED: slice-arg-typed.c:6:10: error: unsupported: passing a pointer into a heap allocation as a slice argument
+// The three splits that once lived here — passing an allocation-backed
+// pointer to a USER-DEFINED function, in its shared, mutable and typed
+// spellings — were the second null-base crash site (`emitBorrowArgument`)
+// and FR-146 pinned them as `unsupported: passing a pointer into a heap
+// allocation as a slice argument`, because the caller's aliasing guard is
+// keyed on the argument's `VarDecl` root and an allocation region has
+// none. FR-147 gave that guard a second, BACKING-keyed identity, so the
+// pin moved FORWARD rather than loosening: those exact inputs now import
+// (test/Import/C/malloc-region-slice-arg.c, with the byte diff in
+// test/EndToEnd/malloc-region-slice-arg.c), and every shape the new key
+// cannot separate — `f(p, p)`, `f(p, p + 1)`, `f(p, q)` after `q = p`, and
+// an indirect call, which does not key on the backing at all — is a
+// located rejection in test/Import/C/malloc-region-slice-arg-invalid.c.
+// Nothing about the crash regression is lost: a null `VarDecl` dereference
+// on those inputs fails those files exactly as loudly as it fails this one.

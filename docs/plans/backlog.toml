@@ -250,12 +250,23 @@ anchor = "FR-145 TOOLING (the class-level guard"
 id = "FR-147"
 rank = 14
 kind = "feature"
-status = "open"
+status = "landed"
 size = "M"
 title = "Pass an allocation-backed pointer to a user-defined function"
 summary = "Split out of FR-146's fix 2026-08-29 with its cost already measured. FR-146 turned this from a SEGFAULT into the located rejection `passing a pointer into a heap allocation as a slice argument`, which was honest there but leaves the ordinary malloc-a-buffer-hand-it-to-a-helper idiom unsupported. Not done in FR-146 because emitBorrowArgument's aliasing guard is keyed on the argument's VarDecl ROOT and an allocation region has none: without a key, f(p,p) / f(p,p+1) / f(p,q) after q=p emit two borrows of one backing and fail as rustc E0499/E0502. Re-keying root to the POINTER's own VarDecl is the tempting shortcut and is WRONG -- it feeds paramCursorCallCapture (FR-104), which would build a base-rooted PtrExprValue for a heap region, a miscompile path rather than a build failure. Direction: give the aliasing guard a BACKING-KEYED identity (the region->allocSite that FR-146's fix already made canonical, one backing per region), then flip the rejection. Measured value: cJSON tests/minify_tests.c hits this 4x under --recover and it is the last FR-146-class blocker in that file. NOT SPIKED."
 blocked_by = []
 anchor = "FR-147 FEATURE (split out of FR-146's fix"
+
+[[items]]
+id = "FR-148"
+rank = 15
+kind = "defect"
+status = "landed"
+size = "S"
+title = "MISCOMPILE: a declared pointer local in an alloc region dropped its initializer"
+summary = "Found while implementing FR-147 2026-08-29, pre-existing at HEAD and independent of it, fixed in the same commit. `char *p=malloc(8); p[3]=9; char *q=p+3; return q[0];` emitted 3 where clang gives 9 -- compile-clean wrong output. emitPointerLocal's alloc-region branch stored cursor 0 and returned success without consulting var->getInit(). The ASSIGNMENT spelling was already correct, so only the DECLARATION form was affected -- which is why it survived: the wrong shape is the one nobody writes in a test. Fixed by honouring the initializer, gated on !asAllocCall(init) so the allocating declaration keeps its emission byte-for-byte. FR-147 widens its channel (a heap pointer admitted as a slice argument would emit a slice at the wrong offset), so fixing it was a precondition, not a bonus."
+blocked_by = []
+anchor = "FR-148 DEFECT (MISCOMPILE, found while implementing FR-147"
 
 [[items]]
 id = "FR-138"

@@ -9432,30 +9432,88 @@ piece and becomes FR-45.
   malloc-local-alias.c (the miscompile), and
   test/EndToEnd/malloc-region-string-fn.c.
 
-- [ ] FR-147 FEATURE (split out of FR-146's fix 2026-08-29, with its cost
-  already measured): pass an ALLOCATION-BACKED pointer to a user-defined
-  function. FR-146 turned this from a SEGFAULT into the located rejection
-  `unsupported: passing a pointer into a heap allocation as a slice argument`,
-  which was the honest outcome there but leaves the ordinary "malloc a buffer,
-  hand it to a helper" idiom unsupported.
-  WHY IT WAS NOT DONE IN FR-146, measured rather than assumed: the shape is
-  representable, but `emitBorrowArgument`'s aliasing guard is keyed on the
-  argument's `VarDecl` ROOT, and an allocation region has none. Without a key,
-  `f(p,p)`, `f(p,p+1)` or `f(p,q)` after `q=p` emit two borrows of one backing
-  and fail as rustc E0499/E0502 -- the safe direction, but a broken crate.
-  Re-keying `root` to the POINTER's own `VarDecl` is the tempting shortcut and
-  is WRONG: it feeds `paramCursorCallCapture` (FR-104), which would then build
-  a `base`-rooted `PtrExprValue` for a heap region -- a miscompile path, not a
-  build failure.
-  THE DIRECTION: give the aliasing guard a BACKING-KEYED identity (the
-  `region->allocSite` the FR-146 fix already made canonical, one backing per
-  region), then flip the rejection. FR-146 also made that key exist.
-  MEASURED VALUE: cJSON's `tests/minify_tests.c` hits this rejection 4x under
-  `--recover`; it is the last FR-146-class blocker in that file.
-  Gates: the aliasing shapes (`f(p,p)`, `f(p,p+1)`, `f(p,q)` after `q=p`) must
-  each be a LOCATED rejection or correct code, never an E0499/E0502 crate;
-  EndToEnd byte-diff of the admitted shape; full lit 100%.
-  **NOT SPIKED.**
+- [x] FR-147 FEATURE (split out of FR-146's fix 2026-08-29 with its cost
+  already measured; LANDED 2026-08-29): pass an ALLOCATION-BACKED pointer to a
+  user-defined function. FR-146 had turned this from a SEGFAULT into a located
+  rejection; it is now admitted, with the aliasing shapes it was rejected for
+  each given an explicit verdict.
+  THE KEY, and the shortcut that was NOT taken: `borrowRoots` is keyed on a
+  `clang::VarDecl *`, and a heap region has NONE -- so `root` was null and THE
+  ENTIRE ALIASING BLOCK WAS SKIPPED (ImportCExpressions.cpp:2912-2925). There
+  was no weak detection for heap regions; there was none at all. The fix adds a
+  SECOND, PARALLEL key -- the single `emitrust.variable` backing FR-146 made
+  canonical per `region->allocSite`. Pointer identity on that `Value` IS
+  allocation identity, so `q = p` shares it by construction.
+  `borrowRoots` itself is unchanged. **`root` was deliberately NOT re-keyed to
+  the pointer's own `VarDecl`**: `paramCursorCallCapture.base = root` sits
+  IMMEDIATELY ABOVE that block and feeds FR-104, so a `base`-rooted
+  `PtrExprValue` for a heap region would be a MISCOMPILE path, not a build
+  failure. That gate is still keyed on `root`, is never filled for a heap
+  region, and is now pinned.
+  PER-SHAPE VERDICTS, each decided rather than defaulted: `g(p)` ADMITTED;
+  `g(p,p)`, `g(p,p+1)` and `g(p,q)` after `q=p` each a LOCATED REJECTION;
+  `g(p,r)` over DISTINCT mallocs ADMITTED (different alloc sites, disjoint
+  storage); named + heap and heap + literal ADMITTED (disjoint key spaces).
+  `g(p,p+1)` is refused even though the C windows are disjoint, because the
+  emitted borrow is open-ended from its cursor to the end of the array so the
+  two overlap in the EMITTED code -- narrowing was not attempted, and refusing
+  is the safe direction. Callers that do not key on the backing (indirect call,
+  cursor-param, method-call and the two C++ operator loops) pass no key and
+  KEEP the FR-146 rejection verbatim.
+  THE FR-146 TRAP DID NOT RETURN, and it was a real risk here: the existing
+  diagnostic formats `root->getName()`, and FR-146 WAS a null `VarDecl`
+  dereferenced while formatting a rejection message. The heap case gets its own
+  wording that names the allocation and formats no `VarDecl`
+  (`aliasing mutable pointer arguments (two arguments borrow the same heap
+  allocation)`), the `getName()` sites sit after an unconditional early return,
+  and five adversarial null-root probes all produced located rejections rather
+  than a crash.
+  **A PRE-EXISTING MISCOMPILE FOUND AND FIXED IN PASSING -- see FR-148.** It was
+  live at HEAD independently of this FR, but FR-147 WIDENS ITS CHANNEL: with
+  the argument admitted, `char *q = p + 1; g(q);` would have emitted a slice at
+  the WRONG OFFSET. Fixing it was a precondition, not a bonus.
+  **MY OWN SPEC'S GATE EXPECTATION WAS WRONG, and the correction matters for
+  how this loop measures.** I predicted `scripts/external-probe.py`'s
+  EMIT_FAIL count would DROP, since cJSON's minify_tests.c was quoted as
+  hitting this rejection. It did not, and COULD NOT: EMIT_FAIL is a UNIT-level
+  outcome while the FR-146 rejection is always an ITEM-level one, and that
+  file is pruned by the sweep's SKIP_DIRS anyway. Measured directly on the file
+  instead: 10 lines carrying the blocker BEFORE, 0 AFTER, with exactly FIVE
+  functions moving off it -- each onto its NEXT blocker (`null pointer constant
+  in a pointer expression`), so the file's ported count is UNCHANGED at 18/160
+  functions. The FR-146-class blocker is gone from that file; it was not the
+  last one there. The entry's earlier "hits it 4x" is superseded by the
+  measured 10/5.
+  GATES: full suite 874/874. External probe unchanged at 47 BUILT / 38
+  EMIT_FAIL / **0 BUILD_FAIL**, measured on BOTH sides by reverting and
+  re-applying the three lib files (no `git stash`, per the worktree rule).
+  Clippy, paired against the epoch-4 pin: 238 -> 238 (+0). Corpus emission
+  delta over all 262 EndToEnd inputs: EXACTLY ONE file differs, the new test,
+  which did not emit before.
+
+- [x] FR-148 DEFECT (MISCOMPILE, found while implementing FR-147 2026-08-29,
+  PRE-EXISTING at HEAD and independent of it; FIXED in the same commit): a
+  second pointer local DECLARED with an initializer inside an allocation region
+  silently dropped that initializer and bound at cursor 0.
+      char *p = (char *)malloc(8); p[3] = 9;
+      char *q = p + 3;      /* bound at cursor 0 */
+      return q[0];          /* emitted 3, clang gives 9 */
+  Compile-clean wrong output, which is the worst class this project has after a
+  crash. `emitPointerLocal`'s alloc-region branch (ImportCStatements.cpp:3250)
+  stored cursor 0 and returned success WITHOUT consulting `var->getInit()`.
+  THE ASSIGNMENT SPELLING WAS ALREADY CORRECT -- `char *q; q = p + 3;` emitted
+  the right cursor -- so only the DECLARATION form was affected, which is
+  exactly why it survived: the shape that is wrong is the one nobody writes in
+  a test, and the shape a test would write is the one that works.
+  Fixed by honouring the initializer, gated on `!asAllocCall(init)` so the
+  ALLOCATING declaration keeps its emission byte-for-byte. Verified: emitted
+  crate exits 9, clang native exits 9.
+  It was live independently of FR-147, but FR-147 widens its channel -- with a
+  heap pointer admitted as a slice argument, `char *q = p + 1; g(q);` would
+  have emitted a slice at the wrong offset. So fixing it was a precondition of
+  FR-147, not a bonus, and the EndToEnd oracle for FR-147 is what pins it:
+  without this fix the emitted `&mut v11[v45 as usize..]` would read
+  `&mut v11[0..]` and the byte-diff diverges at a nonzero seed.
 
 - [x] FR-145 TOOLING (the class-level guard, distilled from FR-140, FR-141 and
   FR-142; LANDED 2026-08-29): THE EMITTER CAN PRODUCE CODE ITS OWN TOOLCHAIN
