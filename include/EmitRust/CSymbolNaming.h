@@ -62,24 +62,14 @@
 namespace mlir {
 namespace emitrust {
 
-/// FR-53 idiomatic rename. Process-wide because the SAME naming primitives feed
-/// two independent driver paths that must agree byte-for-byte (see the file
-/// header): the importer that creates MLIR/Rust items, and the FR-40 item graph
-/// that runs its own clang parse with no importer in scope. A single source of
-/// truth makes drift between the two impossible; a per-call parameter threaded
-/// through both paths could silently diverge on a missed site. It is set once,
-/// at startup, by the driver (`emitrust-cc`; default = rename ON, disabled by
-/// `--preserve-c-names`). Tools that do not set it (e.g. `emitrust-import-c`)
-/// keep verbatim C spellings, so their golden tests are unaffected.
-inline bool &idiomaticRenameEnabled() {
-  static bool enabled = false;
-  return enabled;
-}
-
-// The casing primitives (`toSnakeCase`, `toScreamingSnakeCase`,
-// `toUpperCamelCase`) live in EmitRust/RustCasing.h, included above: they are
-// clang-free and the FR-70 lowering pass in lib/Conversion (MLIR-only) must
-// share the exact derivation. Everything below is a function of the clang AST.
+// The FR-53 idiomatic-rename flag (`idiomaticRenameEnabled()`), the casing
+// primitives (`toSnakeCase`, `toScreamingSnakeCase`, `toUpperCamelCase`) and
+// the `non_snake_case` lint predicate (`tripsNonSnakeCase`) live in
+// EmitRust/RustCasing.h, included above: they are clang-free, and consumers
+// that must share the EXACT derivation without clang in scope -- the FR-70
+// lowering pass in lib/Conversion, the FR-140 Rust emitter in lib/Target --
+// would otherwise have to duplicate them and could then silently drift.
+// Everything below is a function of the clang AST.
 
 /// Returns whether `name` is a Rust keyword (strict or reserved, editions
 /// 2015-2021, plus the contextual `union`) and thus unusable as a Rust item

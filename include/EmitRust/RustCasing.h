@@ -33,6 +33,62 @@
 namespace mlir {
 namespace emitrust {
 
+/// FR-53 idiomatic rename. Process-wide because the SAME naming primitives
+/// feed independent driver paths that must agree byte-for-byte: the importer
+/// that creates MLIR/Rust items, the FR-40 item graph that runs its own clang
+/// parse with no importer in scope, and (FR-140) the Rust emitter, which is
+/// clang-free and lives in lib/Target. A single source of truth makes drift
+/// between them impossible; a per-call parameter threaded through every path
+/// could silently diverge on a missed site. It is set once, at startup, by
+/// the driver (`emitrust-cc`; default = rename ON, disabled by
+/// `--preserve-c-names`). Tools that do not set it (e.g. `emitrust-import-c`)
+/// keep verbatim C spellings, so their golden tests are unaffected.
+///
+/// Declared here rather than in CSymbolNaming.h (its home until FR-140)
+/// because that header includes clang and the emitter must not; CSymbolNaming.h
+/// includes this one, so every existing caller is unaffected.
+inline bool &idiomaticRenameEnabled() {
+  static bool enabled = false;
+  return enabled;
+}
+
+/// Would rustc's `non_snake_case` lint fire on an item named `name`?
+///
+/// Mirrors rustc's own `is_snake_case`: leading and trailing underscores are
+/// ignored, and what remains may hold no uppercase letter and no DOUBLED
+/// underscore. The doubled-underscore half is the one that bites a faithful
+/// transpile -- `m__em` is perfectly legal C and the emitter preserves the C
+/// spelling verbatim -- so `a__` and `_lead` are clean while `m__em` is not.
+///
+/// Two consumers share it and must not drift (FR-140): `renderCargoToml`
+/// decides with it whether the emitted manifest may deny the lint on the
+/// CRATE NAME (FR-139), and the Rust emitter decides with it whether an item
+/// needs `#[allow(non_snake_case)]` for a name it renders inside.
+///
+/// The two sibling naming lints need no such predicate, measured: a type name
+/// goes through `toUpperCamelCase`, which DROPS every underscore, so
+/// `non_camel_case_types` can never see a doubled run; and
+/// `non_upper_case_globals` only ever complains about lowercase characters,
+/// which underscores are not.
+inline bool tripsNonSnakeCase(llvm::StringRef name) {
+  llvm::StringRef core = name.trim('_');
+  if (core.empty())
+    return false;
+  bool previousWasUnderscore = false;
+  for (char c : core) {
+    if (c >= 'A' && c <= 'Z')
+      return true;
+    if (c == '_') {
+      if (previousWasUnderscore)
+        return true;
+      previousWasUnderscore = true;
+    } else {
+      previousWasUnderscore = false;
+    }
+  }
+  return false;
+}
+
 /// Converts a C identifier to `snake_case`: a `_` is inserted before every
 /// uppercase letter that begins a new word (one following a lowercase letter
 /// or a digit, or one that ends an acronym -- an uppercase followed by a

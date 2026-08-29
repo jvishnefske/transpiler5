@@ -9087,41 +9087,76 @@ piece and becomes FR-45.
   idempotent (two consecutive runs byte-identical) and stable across three
   full sweeps.
 
-- [ ] FR-140 DEFECT (found by FR-138's corpus sweep 2026-08-28): a legal C
-  identifier containing a DOUBLE UNDERSCORE produces a crate that fails its
-  OWN lint table -- exit 0, unbuildable. Two-line repro, and note it is a
-  BINARY crate, so this is not specific to FR-139's cdylib path:
-      static int m__base = 3;
-      int get(void){ return m__base; }
-  emits `tu0_m__base` and the manifest's `[lints.rust] non_snake_case = "deny"`
-  rejects it. Reproduced directly, and it is TWO errors, not the one the sweep
-  reported -- the synthesized FIELD and the local VARIABLE both trip it:
-      error: structure field `tu0_m__base` should have a snake case name
-      error: variable `tu0_m__base_actor` should have a snake case name
-  rustc's `is_snake_case` forbids a doubled underscore anywhere in the core of
-  the name, and `m__base` is perfectly legal C (the corpus's `float2half_lib`
-  and `half2float_lib` both carry it; they are 2 of FR-138's BUILD_FAIL cases).
-  Exit-0 unbuildable is the SAFE direction -- a hard rustc error, never a
-  miscompile -- but it is the rejection-is-a-feature policy violated: the
-  emitter produced code it knows its own manifest forbids, with no diagnostic.
-  FR-139's recorded "known residual" covers the CRATE NAME only; this is
-  different and wider (synthesized fields, locals, and the FR-62 actor
-  prefixing that manufactures `tu0_` names on top of the C spelling).
-  DIRECTIONS, none chosen:
-    (a) collapse runs of underscores in the idiomatic-rename path, which is
-        where the emitted spelling is already being chosen -- but renaming is
-        observable in emitted bytes and every golden pins them, so this is a
-        byte-shift needing the full suite, not a local fix.
-    (b) omit `non_snake_case = "deny"` when the emitter KNOWS it produced a
-        name that trips it -- narrow and byte-neutral for every crate that
-        does not, and the same shape as the FR-139 crate-name fix, but it
-        disarms the tripwire for that whole crate.
-    (c) reject with a located diagnostic instead of emitting unbuildable code.
-        Honest, and cheapest, but converts two currently-BUILD_FAIL corpus
-        cases into EMIT_FAIL without gaining a point.
-  Gates: the two heatshrink-adjacent corpus crates build + no emitted byte
-  shifts for any name that does NOT trip the lint + full lit 100%.
-  **NOT SPIKED.**
+- [x] FR-140 DEFECT (found by FR-138's corpus sweep 2026-08-28; FIXED
+  2026-08-28): a legal C identifier containing an INTERIOR double underscore
+  produced a crate that fails its OWN lint table -- exit 0, unbuildable, no
+  diagnostic.
+  WIDER THAN FILED. The entry said "2 corpus cases"; measured, the C spellings
+  are preserved verbatim under the idiomatic rename, so EVERY identifier kind
+  is affected. This five-line binary crate emitted 7 rustc errors:
+      int g__global = 1;
+      int f__unc(int a__b) { int l__ocal = a__b + g__global; return l__ocal; }
+      struct s__t { int m__em; };
+      int use__it(void){ struct s__t v__ar; v__ar.m__em = f__unc(2);
+                         return v__ar.m__em; }
+      int main(void){ return use__it(); }
+  Struct fields, method names, parameters and locals all trip; rustc's
+  `is_snake_case` forbids a doubled underscore anywhere in the name core.
+  DIRECTION TAKEN: (d), a per-item `#[allow(non_snake_case)]`, which this
+  entry did not list. It ADDS AN ATTRIBUTE and removes nothing, so a wrong
+  answer costs a suppressed lint on one item and can never miscompile -- the
+  same safety argument FR-106's spike established for its own direction (d).
+  WHY NOT (a), COLLAPSING THE UNDERSCORES, despite the precedent: FR-73
+  already folds `tu0_` + `_helper` -> `tu0_helper` (pinned by
+  test/Import/C/static-underscore-prefix.c), so the house answer to an emitted
+  `__` IS to collapse it. But that fold is at the PREFIX BOUNDARY, where
+  collapsing cannot collide. Collapsing an INTERIOR `__` can: `m__base` ->
+  `m_base` against a source that already declares `m_base`. That needs a
+  uniquifier and a collision diagnostic, which is a larger change than this
+  defect is sized for and a real one to take deliberately, not in passing.
+  FR-73's fold is left ALONE where it applies -- verified still collapsing to
+  `tu0_helper`/`tu0_twice`/`tu0_g`/`tu1_helper`, not papered over with an
+  attribute.
+  THE MEASUREMENT THAT DECIDES THE IMPLEMENTATION, and it is not the obvious
+  placement: `#[allow(non_snake_case)]` on a struct FIELD IS IGNORED -- the
+  lint fires anyway. It is honoured on the STRUCT, on the FN, and on a LET
+  statement. So a tripping field puts the allow on its struct, and a tripping
+  local/param/method name puts it on the enclosing fn. Pinned with
+  `CHECK-NEXT` so an attribute drifting onto a field fails the test.
+  Locals are only known AFTER the body walk, so the emitter renders the item
+  into its existing buffer and inserts the attribute at the item offset,
+  matching the item's own indentation; anything decided up front would be a
+  guess, and a guess that says yes too often is a golden byte shift.
+  ONE SITE BEYOND THE FIVE-LINE SHAPE, found while implementing and real: an
+  FR-52 requirement trait. `extern int host__scale(int);` in a library TU
+  emitted `pub trait Externals { fn host__scale(v0: i32) -> i32; }` and rustc
+  rejected it with `trait method 'host__scale' should have a snake case name`.
+  Covered and verified: the lib crate now builds.
+  THE OTHER TWO DENIED NAMING LINTS ARE UNREACHABLE, measured rather than
+  assumed, so neither is covered and neither is a latent gap:
+    - `non_camel_case_types`: type names go through `toUpperCamelCase`, which
+      DROPS every underscore (`s__t`->`ST`, `t__d`->`TD`, `u__n`->`UN`,
+      `e__n`->`EN`). A `__` cannot survive into a type name.
+    - `non_upper_case_globals`: the lint complains only about lowercase
+      characters; underscores are irrelevant to it. `static TU0_C__ONST`,
+      `const E__ONE` and a `thread_local!` `G__SEED` all compile clean under
+      the deny table.
+  RECORDED NON-GAP, with the guard deliberately NOT written: data-enum variant
+  payload fields cannot trip, because both `emitrust.data_enum_def` producers
+  hard-code the payload name `"v"` (ImportCTypes.cpp, ImportCStatements.cpp)
+  and `emitrust-translate` never enables the idiomatic rename, so no test could
+  reach it. A future wave admitting source-spelled payload fields must add it;
+  the note lives in `emitDataEnumDef`.
+  BYTE-NEUTRAL for every name that does NOT trip -- verified directly: the
+  same program with single underscores emits ZERO allow attributes, and
+  `fn main()` in the tripping program carries none either. `--preserve-c-names`
+  is unaffected (it allows the three naming lints in the crate root already).
+  Pinned by test/Driver/double-underscore-names.c (placement, including the
+  trait via Inputs/double-underscore-externs.c),
+  double-underscore-names-neutral.c (the byte-identity baseline, whose job is
+  to FAIL if a stray attribute ever appears), and the oracle
+  test/EndToEnd/double-underscore-names.c -- which pre-fix failed at the
+  `--build` RUN line with 12 rustc errors before any diff could run.
 
 - [x] FR-139 FEATURE (the TRACTOR `_lib` submission packaging layer, split
   out of FR-138's 2026-08-28 spike; LANDED 2026-08-28): emit a crate the
