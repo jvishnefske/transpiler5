@@ -2855,6 +2855,53 @@ of references or inheritance, so it precedes both.
           numbers. +6 was the CORPUS-WIDE net `loop {` delta from 61f-6; that
           FILE has EIGHT. 61f-12 clears four of the eight. The remaining four
           are not (d) cases at all -- see (f).
+          **SPIKED 2026-08-28: DEFER ALL OF (d) BEHIND REMAINDER (c). The
+          only-offender yields are tiny and (c) is worth 20x all of them
+          COMBINED while also being their multiplier.** Measured over 858
+          unique for-sites in four corpora (EndToEnd 444, c-testsuite 44,
+          TRACTOR 78, external repos 292; 339 lift today):
+            `?:` +4   `&&`/`||` +1   StmtExpr +0   `switch` +0   descending +1
+            all five jointly +8       the POINTER clause (c) alone +162
+          and post-(c) the five rise only to +11/+4/+0/+0/+8. TRACTOR yields
+          ZERO for every shape. THREE of the eight joint gains are this
+          ledger's OWN frontier pins -- tests that exist to pin the refusal --
+          so the genuinely-new-code harvest is THREE SITES.
+          THE METHOD IS THE PART TO REUSE: not a rejection count, but an
+          observation-only probe that relaxes exactly ONE clause and runs the
+          WHOLE chain per site, with emission always at mask 0 (a 460-file
+          sweep proved byte-inertness). It calibrates exactly -- the probe's
+          base column equals the emitted range-head count -- and for the FIRST
+          TIME IN THIS FR the estimate matched the realized harvest of a real
+          prototype to the loop. Previous estimates here were wrong by 7x and
+          4.4x because they counted FIRST failures.
+          A THIRD BLOCKLIST LEAK FOUND, and `blocksRangeForLift`'s doc comment
+          claims a COMPLETE list of block-creating emitters: it omits
+          `emitVoidConditionalStmt`, which creates three cf blocks. Measured --
+          with a structured `emitConditionalOperator` in place, a void-context
+          `?:` in a loop body still SEGFAULTS the verifier. So admitting `?:`
+          needs a structured arm in TWO emitters, and `?:`/`&&`/StmtExpr must
+          be ONE increment or the widening ships a segfault. (An audit of the
+          rest of lib/ImportC found no other genuine omission.)
+          NO NEW OPS ARE NEEDED for `?:`/`&&`/`||`/StmtExpr -- 61f-12's
+          `emitrust.if` + `emitrust.variable` suffice, byte-diffed against
+          clang over 10 seeds including side-effect ORDERING and the float
+          case. StmtExpr is the odd one: it creates no blocks at all, only an
+          unpromotable cell, so its fix is one line and its solo yield is 0
+          because GNU statement-expression macros are `?:` carriers.
+          THE COST THAT IS NOT OBVIOUS: `emitrust.if` has no results, so the
+          structured arm can only emit LATE-INIT, where today's `while`
+          fallback gets a real Rust if-EXPRESSION. Measured on the one real
+          c-testsuite gain: clippy 0 -> 1 `needless_late_init`, and corpus
+          lines 23050 -> 23053 (+3) DESPITE +3 range heads. This widening
+          improves the loop head and degrades the body, and the net moves the
+          WRONG way -- the check 61f-6 failed and 61f-12 passed. Whether
+          FR-132's late-init-merge fold can see through an `emitrust.if` pair
+          is the obvious next probe and would change (d)'s cost side.
+          PER-SHAPE VERDICT: `?:` GO-with-constraints but deferred behind (c);
+          `&&`/`||` GO only as a rider on `?:`, never its own increment;
+          StmtExpr a one-line rider, never alone; **`switch` NO-GO** (+0 today
+          and +0 post-(c), because every real C switch in a loop body contains
+          `break`, which is fenced).
       (f) INDUCTION REUSE ACROSS A SECOND NESTED PAIR -- **LANDED 2026-08-28.**
           The clause-6 (`inductionDeadAfter`) residue. The differential probe
           this entry asked for was re-run and reproduced exactly: two nested
@@ -2910,16 +2957,39 @@ of references or inheritance, so it precedes both.
           Clippy, now a PAIRED comparison against the epoch-4 pin: 238 -> 238
           (+0), 0 skipped, top lints unchanged. Adding a new EndToEnd file does
           not drift the pinned population.
-      (e) DESCENDING -> `.rev()` -- 12, and SMALLER THAN IT LOOKS AND BIGGER
-          THAN IT COSTS, so measure before building. It is not the
-          self-contained importer change earlier entries called it: it needs
-          a new attribute on `emitrust.for` plus emitter support, because
-          `(lo..hi).rev()` is NOT `hi..lo`. The mapping is exact but
-          off-by-one in both directions -- C's `for (i = HI; i > LO; i -= K)`
-          walks HI, HI-K, ... which is `((LO+1)..=HI).rev().step_by(K)`, and
-          `i >= LO` is `(LO..=HI).rev().step_by(K)` -- and the `LO+1` risks
-          overflow at the type max, which is the same INT_MIN/UB reasoning
-          61f-3 used for `..=` running the other way.
+      (e) DESCENDING -> `.rev()` -- **SPIKED 2026-08-28: NO-GO THIS WAVE.**
+          It is not blocked on soundness; it is blocked on yield-per-cost.
+          THE NAIVE ADMISSION IS A MEASURED, COMPILE-CLEAN SILENT MISCOMPILE:
+          `emitRangeFor` has no descending notion, so `for (i=8;i>0;i--)`
+          emits `for i in 8i32..0i32` and the byte-diff reads clang 36/36/18
+          against an emitted 0/0/0, with `cargo build` CLEAN. That is why (e)
+          cannot share a verdict with the (d) shapes -- those announce
+          themselves with a verifier fault, this one announces itself with
+          wrong numbers.
+          YIELD: **1 of 858** today (`test/EndToEnd/range-for.c:95`, which is
+          61f-3's own pin), 8 post-(c). This entry's "12" was a FIRST-FAILURE
+          event count -- a ~12x overestimate. The 18 non-gaining descending
+          sites die on the fenced things: `continue`, `break`, pointer cursors
+          (`buf++`), and pointer/`->` token walks.
+          THE OVERFLOW IS SOUNDLY FENCEABLE, and the two directions are NOT
+          symmetric, which this entry did not record: `i >= LO` is
+          `(LO..=HI).rev().step_by(K)` with NO `+1` and no overflow at all
+          (its obligation is instead the 61f-7 mirror -- for an UNSIGNED
+          induction the final decrement below `LO` wraps and C loops forever,
+          so require `LO >= K`); only `i > LO` needs `((LO+1)..=HI)`, and there
+          a RUNTIME `LO` must refuse because `LO == typeMax` is representable
+          and wraps to a colossal range -- require a compile-time constant
+          strictly below the type max, which folds the `+1` at import. That
+          fence is nearly free: 16 of the 19 corpus sites use `> 0` or `>= 0`.
+          Also `.rev()` must precede `.step_by()`; `(a..=b).step_by(K).rev()`
+          walks the wrong residues.
+          COST IS WORSE THAN THIS ENTRY STATED IN ONE RESPECT: a hand-written
+          `emitrust.for … {descending}` round-trips through
+          `emitrust-translate --mlir-to-rust` and is SILENTLY DROPPED, so the
+          attribute must be DECLARED in ODS and `emitFor` taught it -- there is
+          no "add the attribute now, teach the emitter later" path, and an
+          undeclared marker reaching emission unresolved would violate the
+          FR-52 contract.
     NOT WORTH DOING: float/double body SCALARS block 0 corpus loops. They
     genuinely ARE cell-backed and the fix is the same one-line shape as
     61f-4, but nothing is blocked by one -- fold it in only as a by-product
@@ -9285,6 +9355,68 @@ piece and becomes FR-45.
   families in one TU, so "the sweep keys on the fact, not the rejection shape"
   is readable in one place), and incremental-owner-struct-reached.c -- THE
   NEGATIVE CONTROL, which fails if the sweep is ever widened.
+
+- [ ] FR-146 DEFECT (CRASH, found as a side finding by FR-61f-d's spike
+  2026-08-28, PRE-EXISTING at clean HEAD and unrelated to the range lift):
+  `--recover` SEGFAULTS on two external files. Highest-severity class, same as
+  FR-137: an abort with no diagnostic, no recovery.
+  REPRODUCE (corpora already cloned under scratchpad/probe):
+      emitrust-cc --recover --emit=rust uthash/tests/test89.c \
+        -Iuthash/tests -Iuthash -Iuthash/include -o /dev/null      # rc 139
+      emitrust-cc --recover --emit=rust cJSON/tests/minify_tests.c \
+        -I<dir> -I<..> -I<../include> -o /dev/null                 # rc 139
+  MEASURED PROPERTIES, each of which narrows the fix:
+    - NOT a stack overflow: still segfaults under `ulimit -s unlimited`
+      (the same control FR-137 used, and the same answer).
+    - `--recover`-DEPENDENT, which is the whole shape of it: WITHOUT
+      `--recover` the same input exits 1 cleanly with a located rejection. So
+      the fault is on the RECOVERY path, after a series of recovered pointer
+      rejections -- not in the ordinary import.
+    - The stack has NO MLIR frames; the fault is inside `emitrust-cc` itself.
+      Frames 5 and 7 are the SAME address with one frame between them, i.e. a
+      RECURSION CYCLE -- combined with the ulimit control, that points at
+      unbounded recursion over a structure the recovery path mutates, not at
+      depth alone.
+  This is the FR-137 contract violated a second time, and it lands in exactly
+  the mode FR-138 measured as scoring ZERO anyway -- so the cost is not a lost
+  point, it is that recovery, whose entire purpose is to survive bad input,
+  does not.
+  **NOT SPIKED.**
+
+- [ ] FR-145 TOOLING (the class-level guard, distilled from FR-140, FR-141 and
+  FR-142, which were three instances of ONE class found one at a time over a
+  single day 2026-08-28): THE EMITTER CAN PRODUCE CODE ITS OWN TOOLCHAIN
+  REJECTS, AND NOTHING NOTICES.
+  All three were exit-0-unbuildable with NO diagnostic:
+    FR-140  a double-underscore C identifier trips the emitted manifest's own
+            `non_snake_case = "deny"`.
+    FR-141  an `impl` is written for a type the crate never defines (E0425).
+    FR-142  a deferred binding is `let mut` and never reassigned, tripping the
+            emitted manifest's own `unused_mut = "deny"`.
+  Each was found by ACCIDENT, as a by-product of some other FR's corpus sweep.
+  A standing guard would have caught all three at once, and the FR-142 spike
+  already wrote one: `scratchpad/fr142spike/cargosweep.sh` builds 475 emitted
+  crates in about 4 minutes at `-P 8` and reports per-crate FAIL with the
+  rustc error counts. `scripts/tractor-eval.py` (FR-138) already builds crates
+  too, so the machinery exists twice and is committed neither time.
+  THE INVARIANT TO GATE: an emitted crate must COMPILE. Not "the importer
+  exited 0", not "the lit suite is green" -- the emitted Rust must survive
+  `cargo check`. Every one of the three defects passed the full lit suite.
+  WHY THIS IS NOT ALREADY COVERED: EndToEnd byte-diff builds its crates, but it
+  only covers `test/EndToEnd` inputs, which are written to be supportable. The
+  three defects all came from EXTERNAL C (sds, parson, heatshrink) reached
+  through `--incremental`, a mode no gate exercises at scale.
+  DIRECTIONS, none chosen: (a) commit the sweep as a script plus a documented
+  manual protocol, like the external probe loop -- cheapest, but it only runs
+  when someone remembers; (b) gate a SMALL pinned set of external crates in
+  lit, accepting the cargo cost -- catches the class in CI but needs the corpus
+  vendored or fetched; (c) fold the check into `scripts/tractor-eval.py` and
+  run it in the same cadence as the corpus sweep -- no new machinery, but the
+  cadence is manual. (a)+(c) look complementary.
+  NOTE the epoch/pin lesson from FR-144 applies here too: whatever population
+  this guard measures must be PINNED, or a rise in failures is attributable to
+  nothing.
+  **NOT SPIKED.**
 
 - [x] FR-144 DEFECT (TOOLING, found by T-EPOCH4's freeze 2026-08-28; FIXED
   2026-08-28): THE IMPROVEMENT HARNESS'S FROZEN-CORPUS PREMISE WAS BROKEN in
