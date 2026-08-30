@@ -561,10 +561,36 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
     // opaque unions never merge under the shape-keyed `Anon<hash>` naming,
     // while the same union reached through a shared header in several TUs
     // still dedups to one struct_def.
-    if (opaqueUnions.contains(definition))
-      for (const clang::FieldDecl *arm : definition->fields())
+    //
+    // FR-173 D1: the arm spelling must be TU-STABLE. clang's DEFAULT
+    // printing policy renders a TAGLESS arm as
+    // `(unnamed at <PATH>:<line>:<col>)`, and <PATH> is whatever THAT TU's
+    // SourceManager recorded -- absolute in one TU, `../src/...` in the
+    // next -- so the same C union hashed differently on nothing but an
+    // include-path spelling, giving two `Anon<hash>` blobs, two
+    // structurally different wrappers, and either a link rejection or a
+    // per-TU demotion of the wrapper (measured on systemd's
+    // `BusMatchNode`; test/Driver/link-opaque-union-header-spelling.c is
+    // the regression). Suppress anonymous tag LOCATIONS so no source path
+    // can reach the key, and restore the identity they were standing in
+    // for with the arm's own SIZE and ODR hash -- both TU-stable by
+    // construction, and together they keep two genuinely different tagless
+    // arms apart (the `anon-distinct.c` leg of
+    // test/Import/C/union-opaque-aggregate.c pins that side).
+    if (opaqueUnions.contains(definition)) {
+      clang::PrintingPolicy policy(astContext().getLangOpts());
+      policy.AnonymousTagLocations = false;
+      for (const clang::FieldDecl *arm : definition->fields()) {
         os << arm->getName() << '@'
-           << arm->getType().getCanonicalType().getAsString() << ';';
+           << arm->getType().getCanonicalType().getAsString(policy) << '#'
+           << astContext().getTypeSizeInChars(arm->getType()).getQuantity();
+        if (clang::RecordDecl *armRecord =
+                arm->getType().getCanonicalType()->getAsRecordDecl())
+          if (clang::RecordDecl *armDef = armRecord->getDefinition())
+            os << '/' << armDef->getODRHash();
+        os << ';';
+      }
+    }
     // FR-122: the field shape alone cannot see MEMBER semantics, so two
     // same-named records with identical fields but different member
     // surfaces merged silently -- and the merged struct_def carried
@@ -1605,33 +1631,103 @@ LogicalResult CImporter::collectRecordFields(
       // in CTS-R3 territory and rejects exactly as union types do
       // elsewhere.
       Location unionLoc = translateLoc(member->getBeginLoc());
-      const clang::FieldDecl *storage = nullptr;
-      Type slotType;
-      for (const clang::FieldDecl *arm : member->fields()) {
-        FailureOr<const clang::FieldDecl *> leaf =
-            anonymousUnionArmLeaf(arm, unionLoc);
-        if (failed(leaf))
-          return failure();
-        Location leafLoc = translateLoc((*leaf)->getLocation());
-        FailureOr<Type> leafType = mapType((*leaf)->getType(), leafLoc);
-        if (failed(leafType))
-          return failure();
-        if (!storage) {
-          storage = *leaf;
-          slotType = *leafType;
-          if (failed(appendField(
-                  internName(mangleMemberName(storage->getName())), slotType,
-                  leafLoc, storage->getName())))
+      SmallVector<const clang::FieldDecl *> trialAliases;
+      size_t savedFieldCount = fieldNames.size();
+      auto flatten = [&]() -> LogicalResult {
+        const clang::FieldDecl *storage = nullptr;
+        Type slotType;
+        for (const clang::FieldDecl *arm : member->fields()) {
+          FailureOr<const clang::FieldDecl *> leaf =
+              anonymousUnionArmLeaf(arm, unionLoc);
+          if (failed(leaf))
             return failure();
-          continue;
+          Location leafLoc = translateLoc((*leaf)->getLocation());
+          FailureOr<Type> leafType = mapType((*leaf)->getType(), leafLoc);
+          if (failed(leafType))
+            return failure();
+          if (!storage) {
+            storage = *leaf;
+            slotType = *leafType;
+            if (failed(appendField(
+                    internName(mangleMemberName(storage->getName())), slotType,
+                    leafLoc, storage->getName())))
+              return failure();
+            continue;
+          }
+          if (*leafType != slotType)
+            return emitError(unionLoc) << "unsupported: union type";
+          unionSlotStorage[*leaf] = storage;
+          trialAliases.push_back(*leaf);
         }
-        if (*leafType != slotType)
+        if (!storage) // An empty anonymous union has no representable slot.
           return emitError(unionLoc) << "unsupported: union type";
-        unionSlotStorage[*leaf] = storage;
+        return success();
+      };
+      // FR-167: C++ keeps the historical all-or-nothing flatten. The
+      // fallback below newly routes an anonymous union through
+      // `collectUnionSlot`, which in C++ sits next to the unmeasured
+      // destructor/copy-ctor member surface (`kHasDropAttrName`, `Copy`
+      // derivation); FR-78's opaque model already scopes C++ out for the
+      // same reason, so this matches it rather than widening it blind.
+      if (astContext().getLangOpts().CPlusPlus) {
+        if (failed(flatten()))
+          return failure();
+        continue;
       }
-      if (!storage) // An empty anonymous union has no representable slot.
-        return emitError(unionLoc) << "unsupported: union type";
-      continue;
+      // FR-167: the flatten is a TRIAL. A union that cannot flatten is not
+      // thereby unrepresentable -- FR-78's opaque diversion and the
+      // one-slot pun model both live behind `collectUnionSlot`, which is
+      // reached only for a union that has a TYPE. Before this, the
+      // anonymous spelling of a union the NAMED spelling imports fine
+      // (`};` vs `} u;`, one word apart) killed the entire containing
+      // record. So: run the flatten under a silencing handler, and on
+      // failure roll its state back and append the union as a
+      // synthesized-named member (`__u<n>`) through the ordinary
+      // `mapType` path. Only `fieldNames`/`fieldTypes` and the
+      // `unionSlotStorage` aliases are trial state; everything else the
+      // flatten touches (type/record caches) is idempotent.
+      SmallVector<std::pair<Location, std::string>> trialDiags;
+      LogicalResult flattened = failure();
+      {
+        ScopedDiagnosticHandler trialHandler(
+            builder.getContext(), [&](Diagnostic &diag) -> LogicalResult {
+              if (diag.getSeverity() != DiagnosticSeverity::Error)
+                return failure();
+              trialDiags.emplace_back(diag.getLocation(), diag.str());
+              return success();
+            });
+        flattened = flatten();
+      }
+      if (succeeded(flattened))
+        continue;
+      fieldNames.truncate(savedFieldCount);
+      fieldTypes.truncate(savedFieldCount);
+      for (const clang::FieldDecl *alias : trialAliases)
+        unionSlotStorage.erase(alias);
+      FailureOr<Type> unionType = failure();
+      {
+        // The retry's own diagnostics are DISCARDED: a shape neither model
+        // can take must keep the wording and location the flatten gave it
+        // (the union import would restate it at the union's `{`, in
+        // `collectUnionSlot`'s vocabulary, losing the arm location).
+        ScopedDiagnosticHandler retryHandler(
+            builder.getContext(),
+            [](Diagnostic &) -> LogicalResult { return success(); });
+        unionType = mapType(field->getType(), unionLoc);
+      }
+      if (succeeded(unionType)) {
+        llvm::StringRef blobName =
+            internName(("__u" + llvm::Twine(fieldNames.size())).str());
+        if (failed(appendField(blobName, *unionType, unionLoc, blobName)))
+          return failure();
+        anonymousUnionBlobNames[field] = blobName.str();
+        continue;
+      }
+      // Neither model: re-emit the TRIAL's diagnostics verbatim so the
+      // residual frontier keeps exactly the rejections it had before.
+      for (auto &trialDiag : trialDiags)
+        emitError(trialDiag.first) << trialDiag.second;
+      return failure();
     }
     if (field->getName().empty())
       return emitError(fieldLoc) << "unsupported: unnamed struct member";
@@ -1903,6 +1999,11 @@ CImporter::flattenedFieldStorage(const clang::FieldDecl *field) const {
 
 std::string
 CImporter::flattenedFieldName(const clang::FieldDecl *field) const {
+  // FR-167: a non-flattening anonymous union member has no storage arm to
+  // name -- it IS a field, under its synthesized spelling.
+  auto blob = anonymousUnionBlobNames.find(field);
+  if (blob != anonymousUnionBlobNames.end())
+    return blob->second;
   return mangleMemberName(flattenedFieldStorage(field)->getName());
 }
 
@@ -2015,6 +2116,16 @@ CImporter::importEnumUncached(const clang::EnumDecl *definition) {
                              << definition->getName()
                              << "' is a Rust keyword";
 
+  // FR-166: the emitted open enum's storage follows clang's underlying-type
+  // choice in BOTH signedness and width, so an enum that clang widened to 64
+  // bits because an enumerator falls outside the 32-bit range (systemd's
+  // `_SD_ENUM_FORCE_S64` macro exists to force exactly that, and every flags
+  // enum in sd-json.h / sd-varlink.h carries one) imports whole instead of
+  // being rejected enumerator by enumerator.
+  clang::QualType underlyingType = definition->getIntegerType();
+  bool unsignedUnderlying = underlyingType->isUnsignedIntegerType();
+  bool wideUnderlying = astContext().getTypeSize(underlyingType) > 32;
+
   SmallVector<std::string> variantNames;
   SmallVector<int64_t> variantValues;
   // Enumerator NAMES must stay unique (they become the tuple-struct's
@@ -2029,12 +2140,27 @@ CImporter::importEnumUncached(const clang::EnumDecl *definition) {
     if (isRustKeyword(name))
       return emitError(enumeratorLoc)
              << "unsupported: enumerator '" << name << "' is a Rust keyword";
+    // A wide underlying type admits the whole i64 range and NOTHING MORE:
+    // `DenseI64ArrayAttr` cannot represent a value above INT64_MAX, so those
+    // stay a located rejection. That bound is also what keeps the wide path
+    // honest -- every admitted value is <= INT64_MAX, where the signed
+    // comparisons the importer emits agree with C's unsigned ones.
     const llvm::APSInt &initValue = enumerator->getInitVal();
     if (!initValue.isRepresentableByInt64())
       return emitError(enumeratorLoc)
-             << "unsupported: enumerator value does not fit in i32";
+             << "unsupported: enumerator value does not fit in i64";
     int64_t value = initValue.getExtValue();
-    if (value < INT32_MIN || value > INT32_MAX)
+    // A 32-bit underlying type admits its own range and NOTHING MORE: the
+    // full u32 when it is unsigned, i32 when it is signed. The unsigned
+    // half is FR-166 PHASE 2, and it was held back deliberately until the
+    // enum-to-integer conversions stopped discarding signedness: while
+    // `castEnumToI32` was on every path, an admitted `M_MAX = 4294967295u`
+    // became `-1` at every comparison and every widening. FR-169 phases A
+    // (relational/floating, via `castEnumToPromotedInt`) and C (the
+    // enumerator reference, via `mapType(ref->getType())`) are what make
+    // this safe, so the three cannot be split apart again.
+    if (!wideUnderlying && !(unsignedUnderlying ? llvm::isUInt<32>(value)
+                                                : llvm::isInt<32>(value)))
       return emitError(enumeratorLoc)
              << "unsupported: enumerator value does not fit in i32";
     variantNames.push_back(enumVariantRustName(name));
@@ -2043,23 +2169,25 @@ CImporter::importEnumUncached(const clang::EnumDecl *definition) {
   if (variantNames.empty())
     return emitError(defLoc) << "unsupported: enum with no enumerators";
 
-  // The storage of the emitted open enum follows clang's underlying type
-  // choice (unsigned when every enumerator is non-negative), so that the
-  // raw-representation place (`emitrust.enum_raw`) and enum/integer
-  // conversions meet C's unsigned semantics at the right type.
-  bool unsignedUnderlying =
-      definition->getIntegerType()->isUnsignedIntegerType();
-
   // Cross-TU deduplication by symbol name (see importRecord): identical shape
   // is skipped, a name reused with a different variant shape is a diagnostic.
-  // The underlying signedness is derived from the values, so the value list
-  // determines it and the shape key needs no extra component.
+  //
+  // FR-166: the key used to be the `name=value;` list alone, on the premise
+  // that "the underlying signedness is derived from the values". A C++ FIXED
+  // underlying type falsifies that outright -- `enum G : int` and
+  // `enum G : unsigned int` have identical values and different storage --
+  // and the two TUs deduped SILENTLY, the second unit's storage simply
+  // dropped. The hole was latent only because signed and unsigned diverge
+  // above 2^31 and such values were rejected wholesale; admitting wide
+  // enums makes it live, so the storage joins the key and a mismatch is
+  // now the same located "conflicting definition" a value mismatch is.
   std::string shape;
   {
     llvm::raw_string_ostream os(shape);
     for (auto [variantName, variantValue] :
          llvm::zip(variantNames, variantValues))
       os << variantName << '=' << variantValue << ';';
+    os << (unsignedUnderlying ? 'u' : 'i') << (wideUnderlying ? 64 : 32);
   }
   auto existingShape = importedEnumShapes.find(definition->getName());
   if (existingShape != importedEnumShapes.end()) {
@@ -2079,7 +2207,8 @@ CImporter::importEnumUncached(const clang::EnumDecl *definition) {
       defLoc,
       moduleBuilder.getStringAttr(enumTypeRustName(definition->getName())),
       moduleBuilder.getStrArrayAttr(variantNameRefs),
-      moduleBuilder.getDenseI64ArrayAttr(variantValues), unsignedUnderlying);
+      moduleBuilder.getDenseI64ArrayAttr(variantValues), unsignedUnderlying,
+      wideUnderlying);
   return success();
 }
 

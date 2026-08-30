@@ -790,8 +790,9 @@ def EmitRust_EnumDefOp : EmitRust_Op<"enum_def", [
     level. The variant names and variant values are given as two arrays of
     the same non-zero length; names must be non-empty and unique and are
     emitted verbatim (the importer supplies valid Rust identifiers), values
-    must be unique and within the `i32` range. Values of the enum are
-    referenced through the `!emitrust.enum` type carrying the same name.
+    must be unique and within the range of the enum's storage integer (see
+    the markers below). Values of the enum are referenced through the
+    `!emitrust.enum` type carrying the same name.
 
     A C enum object holds any value of its underlying integer type, not
     just the declared enumerators (C99 6.7.2.2), so the definition is
@@ -799,10 +800,19 @@ def EmitRust_EnumDefOp : EmitRust_Op<"enum_def", [
     tuple struct wrapping the storage integer, with one associated
     constant per declared enumerator and an explicit `Default`
     implementation returning the first variant (mirroring the previous
-    fieldless-enum default). The storage type is `i32`, or `u32` with the
-    `unsigned_underlying` marker (set by the importer when clang assigns
-    the C enum an unsigned underlying type, which requires every variant
-    value to be non-negative).
+    fieldless-enum default). The storage type is chosen by two independent
+    unit markers, both set by the importer from clang's underlying-type
+    choice for the C enum:
+
+    * `unsigned_underlying` -- unsigned storage, which requires every
+      variant value to be non-negative;
+    * `wide_underlying` (FR-166) -- 64-bit storage instead of 32-bit,
+      which clang picks when an enumerator falls outside the 32-bit range
+      (systemd's `_SD_ENUM_FORCE_S64` macro exists to force exactly this).
+
+    So the storage spells `i32` bare, `u32`, `i64`, or `u64`. Absent both
+    markers the op prints no attr-dict at all, which keeps every enum that
+    predates the wide storage byte-identical.
 
     This op models the OPEN C enum only and must not grow payloads: the
     CLOSED Rust data-carrying enum — a real `enum` item with exhaustive
@@ -835,7 +845,8 @@ def EmitRust_EnumDefOp : EmitRust_Op<"enum_def", [
   let arguments = (ins SymbolNameAttr:$sym_name,
                        StrArrayAttr:$variant_names,
                        DenseI64ArrayAttr:$variant_values,
-                       UnitAttr:$unsigned_underlying);
+                       UnitAttr:$unsigned_underlying,
+                       UnitAttr:$wide_underlying);
   let results = (outs);
 
   let assemblyFormat = "$sym_name $variant_names $variant_values attr-dict";

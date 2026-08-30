@@ -6,8 +6,10 @@
 // genuinely TRANSLATION-UNIT-LOCAL that error is too strong: C99 6.2.7 makes
 // two file-scope tags in different TUs distinct types unless something makes
 // them meet, so the honest Rust rendering is two PATHS, not one name. The
-// later definition is sunk into `mod tu<N> { ... }` and every reference to it
-// inside its own shard is repathed; the link succeeds.
+// later definition is sunk into a module named after its own source file
+// (FR-159 phase 2: `sink-b.c` gives `mod sink_b { ... }`, so the name is a
+// function of the SOURCES and not of the link-line order) and every reference
+// to it inside its own shard is repathed; the link succeeds.
 //
 // The sink is sound only while NOTHING outside the owning TU can name the
 // record, so this file pins the guard as hard as it pins the feature. All
@@ -20,7 +22,7 @@
 //             signature. The guard must therefore be TRANSITIVE through
 //             `mut_ref`/`ref`/`slice`/`array`/`fn_ptr`, not a top-level
 //             by-value check (the real systemd users are
-//             `&mut [tu314::SwapEntries]`).
+//             `&mut [hibernate_util::SwapEntries]`).
 //   FIELD  -- reached through the FIELD of a struct that itself dedups
 //             across the shards. That wrapper is ONE Rust type for the whole
 //             crate, so its field cannot be repathed for one shard only.
@@ -32,7 +34,7 @@
 //   DUP  -- two TUs with an IDENTICAL file-scope `struct P` shared through
 //           an extern-by-value function. C makes these the SAME type and the
 //           link works TODAY; bucketing them per TU would give rustc
-//           `expected tu0::P, found tu1::P`. Records stay at crate root and
+//           `expected dup_a::P, found dup_b::P`. Records stay at crate root and
 //           shape-dedup as they always have; ONLY a shape-CONFLICTING,
 //           non-escaping record sinks.
 //   SINK -- the positive: same-named TU-local records of different shapes,
@@ -69,9 +71,9 @@
 // The sunk record's uses inside its OWN shard are repathed, at the ABSOLUTE
 // path -- a relative `tu1::Buf` is module-relative and rustc E0433 the
 // moment anything renders inside a module.
-//      SINK: fn tu1_local_use(v0: crate::tu1::Buf) -> i32 {
-//      SINK: let b: crate::tu1::Buf = crate::tu1::Buf { a:
-//      SINK: mod tu1 {
+//      SINK: fn tu1_local_use(v0: crate::sink_b::Buf) -> i32 {
+//      SINK: let b: crate::sink_b::Buf = crate::sink_b::Buf { a:
+//      SINK: mod sink_b {
 // SINK-NEXT:     #[derive(Clone, Copy, Default)]
 // SINK-NEXT:     pub(crate) struct Buf {
 // SINK-NEXT:         pub(crate) a: i32,
@@ -120,7 +122,7 @@
 // RUN: FileCheck %s --check-prefix=DUP < %t.dup.rs
 // DUP-COUNT-1: struct P {
 // DUP-NOT: struct P {
-// DUP-NOT: mod tu
+// DUP-NOT: mod 
 
 //--- sink-a.c
 struct Buf {

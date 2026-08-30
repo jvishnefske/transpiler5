@@ -348,6 +348,39 @@ emitrust.func @enum_open(%arg0: i32) {
   emitrust.return
 }
 
+// FR-166: the 64-bit storage width is an explicit `wide_underlying` unit
+// marker, orthogonal to `unsigned_underlying`, and the two print in the
+// attr-dict in that (alphabetical) order. A def WITHOUT the marker prints no
+// marker at all, which is why every pre-FR-166 enum_def golden in the suite
+// is byte-unchanged.
+// CHECK: emitrust.enum_def @Jt ["A", "B", "Big"] [0, 1, 5000000000] {wide_underlying}
+emitrust.enum_def @Jt ["A", "B", "Big"] [0, 1, 5000000000] {wide_underlying}
+
+// CHECK: emitrust.enum_def @Uw ["A", "Big"] [0, 5000000000] {unsigned_underlying, wide_underlying}
+emitrust.enum_def @Uw ["A", "Big"] [0, 5000000000] {unsigned_underlying, wide_underlying}
+
+// FR-166 PHASE 2: a NON-wide def carrying `unsigned_underlying` stores 32
+// bits UNSIGNED, so its admitted variant range is the full u32 -- 4294967295
+// is in range here and out of range for the same def without the marker
+// (test/Dialect/EmitRust/invalid.mlir pins that half). The value stays
+// printed as the signed i64 the `DenseI64ArrayAttr` holds, which is why the
+// emitter, not the attribute, is what has to know the storage is u32.
+// CHECK: emitrust.enum_def @U32 ["A", "Mid", "Max"] [1, 2147483648, 4294967295] {unsigned_underlying}
+emitrust.enum_def @U32 ["A", "Mid", "Max"] [1, 2147483648, 4294967295] {unsigned_underlying}
+
+// CHECK-LABEL: emitrust.func @enum_open_wide
+emitrust.func @enum_open_wide(%arg0: i64) {
+  %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Uw">>
+  // CHECK: emitrust.cast %{{.*}} : i64 to !emitrust.enum<"Uw">
+  %1 = emitrust.cast %arg0 : i64 to !emitrust.enum<"Uw">
+  emitrust.assign %0 = %1 : !emitrust.lvalue<!emitrust.enum<"Uw">>
+  // CHECK: emitrust.enum_raw %{{.*}} : (!emitrust.lvalue<!emitrust.enum<"Uw">>) -> !emitrust.lvalue<ui64>
+  %2 = emitrust.enum_raw %0 : (!emitrust.lvalue<!emitrust.enum<"Uw">>) -> !emitrust.lvalue<ui64>
+  // CHECK: emitrust.addr_of mut %{{.*}} : (!emitrust.lvalue<ui64>) -> !emitrust.mut_ref<ui64>
+  %3 = emitrust.addr_of mut %2 : (!emitrust.lvalue<ui64>) -> !emitrust.mut_ref<ui64>
+  emitrust.return
+}
+
 // CHECK: emitrust.global @counter <0 : i32> : i32
 emitrust.global @counter <0 : i32> : i32
 

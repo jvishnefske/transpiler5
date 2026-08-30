@@ -150,17 +150,29 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   if (const auto *materialize =
           llvm::dyn_cast<clang::MaterializeTemporaryExpr>(e))
     return emitRValue(materialize->getSubExpr());
-  // An enumerator used as a plain expression has type `int` in C: a named
-  // enum's constant is rendered as its Rust variant cast to i32, while an
-  // anonymous enum's constant is a plain i32 value. In C++ the reference
+  // An enumerator used as a plain expression has the type CLANG gave the
+  // reference: `int` for every value representable as one (C17 6.4.4.3),
+  // which is every enumerator of a signed-underlying enum and every
+  // in-range enumerator of an unsigned one. A named enum's constant is
+  // rendered as its Rust variant cast to that type, while an anonymous
+  // enum's constant is already a plain integer value. In C++ the reference
   // HAS the enum type (both scoped and unscoped), so the enum-typed
   // constant is returned as-is (FR-113 C1): the enclosing context is
   // either enum-typed itself (assignment, return, call argument, a CK_NoOp
   // `static_cast<Color>(Blue)`) or an explicit IntegralCast node that
-  // emits the enum-to-integer conversion — forcing i32 here instead made
-  // `Color c = Color::Green;` reject with the misleading "assigned value
-  // type does not match the place". The type test keeps the C path
-  // byte-identical, because a C enumerator reference is int-typed.
+  // emits the enum-to-integer conversion — forcing an integer here instead
+  // made `Color c = Color::Green;` reject with the misleading "assigned
+  // value type does not match the place".
+  //
+  // FR-169 phase C: this used to hard-cast to i32, which matched clang for
+  // every enumerator the importer would admit — until FR-166 phase 2 opened
+  // the enumerator range to the full u32, at which point clang types an
+  // out-of-`int`-range enumerator's reference `unsigned int`. Forcing THAT
+  // through i32 is a silent miscompile the moment it is widened:
+  // `(unsigned long)M_MAX` emitted `M::M_MAX.0 as i32 as u64` and printed
+  // 18446744073709551615 instead of 4294967295, because `as i32` makes it
+  // -1 and the widening sign-extends. Every in-range enumerator is
+  // byte-identical, since `mapType` sends clang's `int` to i32.
   if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e))
     if (const auto *enumerator =
             llvm::dyn_cast<clang::EnumConstantDecl>(ref->getDecl())) {
@@ -168,8 +180,18 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
       if (failed(constant))
         return failure();
       if (llvm::isa<emitrust::EnumType>((*constant).getType()) &&
-          !namedEnumDeclOf(ref->getType()))
+          !namedEnumDeclOf(ref->getType())) {
+        FailureOr<Type> refType = mapType(ref->getType(), loc);
+        if (failed(refType))
+          return failure();
+        // A non-integer mapping is not a shape this seam can normalize;
+        // fall back to the historical i32 rather than emit a cast the op
+        // verifier would reject.
+        if (llvm::isa<IntegerType>(*refType))
+          return builder.create<emitrust::CastOp>(loc, *refType, *constant)
+              .getResult();
         return castEnumToI32(loc, *constant);
+      }
       return constant;
     }
   // W2.3: an lvalue bound to a C++ reference parameter (e.g. `const T&`)
@@ -788,6 +810,15 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     FailureOr<Type> mapped = mapType(cast->getType(), loc);
     if (failed(mapped))
       return failure();
+    // FR-169: an enum source arrives here STILL ENUM-TYPED -- C puts no
+    // integer conversion node between an enum operand and a floating
+    // destination -- and `arith.sitofp` then rejected it with a raw
+    // op-verifier error, unlocated for the implicit initializer form.
+    // Normalizing to the enum's promoted integer type both admits the
+    // construct and picks the right signedness: a no-negative-enumerator
+    // enum holding 3000000000 converts to 3000000000.0, not -1294967296.0.
+    if (llvm::isa<emitrust::EnumType>((*value).getType()))
+      *value = castEnumToPromotedInt(loc, *value);
     // Unsigned to float is an `emitrust.cast`: Rust's `u* as f*` performs
     // the same round-to-nearest conversion as C.
     if (isUnsignedInt((*value).getType()))
@@ -1607,8 +1638,41 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
         predicate = arith::CmpIPredicate::sge;
         break;
       }
-      Value lhsInt = castEnumToI32(loc, *lhsValue);
-      Value rhsInt = castEnumToI32(loc, *rhsValue);
+      // FR-169: relational comparison is the one enum site whose answer
+      // depends on the discriminant's SIGNEDNESS, so it normalizes to the
+      // enum's PROMOTED integer type rather than to a blanket i32. An enum
+      // with no negative enumerator has an unsigned underlying type and an
+      // object of it may hold any value of the unsigned range, including
+      // values above INT32_MAX that no enumerator names; `as i32` +
+      // `arith.cmpi slt` read those as negative and inverted the answer.
+      // `arith.cmpi` has no unsigned-TYPED form (its operands must be
+      // signless), so the unsigned case uses `emitrust.cmp`, which carries
+      // the comparison to Rust's signedness-bearing `<` on the `u32`/`u64`
+      // operands. Equality above never needed this -- it compares the enum
+      // values directly.
+      Value lhsInt = castEnumToPromotedInt(loc, *lhsValue);
+      Value rhsInt = castEnumToPromotedInt(loc, *rhsValue);
+      if (isUnsignedInt(lhsInt.getType())) {
+        emitrust::CmpPredicate rustPredicate;
+        switch (op->getOpcode()) {
+        case clang::BO_LT:
+          rustPredicate = emitrust::CmpPredicate::lt;
+          break;
+        case clang::BO_LE:
+          rustPredicate = emitrust::CmpPredicate::le;
+          break;
+        case clang::BO_GT:
+          rustPredicate = emitrust::CmpPredicate::gt;
+          break;
+        default:
+          rustPredicate = emitrust::CmpPredicate::ge;
+          break;
+        }
+        return builder
+            .create<emitrust::CmpOp>(loc, builder.getI1Type(), rustPredicate,
+                                     lhsInt, rhsInt)
+            .getResult();
+      }
       return builder.create<arith::CmpIOp>(loc, predicate, lhsInt, rhsInt)
           .getResult();
     }
@@ -1899,7 +1963,9 @@ FailureOr<Value> CImporter::emitCondition(const clang::Expr *expr) {
   // discriminant against zero.
   if (llvm::isa<emitrust::EnumType>(type)) {
     Value discriminant = castEnumToI32(loc, *value);
-    Value zero = createIntConstant(loc, builder.getI32Type(), 0);
+    // FR-166: the zero follows the discriminant's width (i64 for a wide
+    // enum), not a hard-coded i32, or `arith.cmpi` rejects the mismatch.
+    Value zero = createIntConstant(loc, discriminant.getType(), 0);
     return builder
         .create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, discriminant,
                                zero)
@@ -5034,6 +5100,32 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
   };
   SmallVector<StagedCursor, 2> stagedCursors;
   IntegerType i64Type = builder.getIntegerType(64);
+  // FR-153 fence R2: two cursor arguments in ONE call that walk the SAME
+  // region cannot both hand out a mutable region view — that is rustc
+  // E0499 in the emitted crate, discovered only after cargo runs. The
+  // region key is the cursor local's proven root: the caller's `VarDecl`
+  // base for an ordinary region, the backing PLACE for a literal-rooted
+  // one (which has no base at all). Rejection is a feature: this is a
+  // located diagnostic at the call instead of a crate that does not
+  // compile, and it can never silently emit wrong code.
+  for (unsigned i = 0, e = cursorArgs.size(); i != e; ++i) {
+    if (!llvm::isa<emitrust::MutRefType>(
+            targetType.getInput(slots[cursorArgs[i].index])))
+      continue;
+    const PointerLocalInfo &left =
+        pointerLocals.find(cursorArgs[i].pointer)->second;
+    for (unsigned j = 0; j != e; ++j) {
+      if (i == j)
+        continue;
+      const PointerLocalInfo &right =
+          pointerLocals.find(cursorArgs[j].pointer)->second;
+      if ((left.base && left.base == right.base) ||
+          (left.literalBacking && left.literalBacking == right.literalBacking))
+        return emitError(loc)
+               << "unsupported: two cursor arguments walk the same region "
+                  "and the callee needs a mutable region borrow";
+    }
+  }
   for (const PendingCursor &cursorArg : cursorArgs) {
     const PointerLocalInfo &info =
         pointerLocals.find(cursorArg.pointer)->second;
@@ -5042,7 +5134,27 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
       return emitError(loc)
              << "unsupported: a cursor argument must walk a single "
                 "whole region";
+    bool wantMutBase = llvm::isa<emitrust::MutRefType>(
+        targetType.getInput(slots[cursorArg.index]));
     Value basePlace = info.literalBacking;
+    // FR-153 fence R1: a MUTABLE region view over a string literal's
+    // read-only backing rematerializes a FRESH non-const backing, exactly
+    // as the ordinary mutable-slice-argument path already does (see
+    // `emitBorrowArgument`'s `literalBacking` branch). Writing through a
+    // pointer to a string literal is undefined behavior, so the per-call
+    // copy is unobservable to any defined program.
+    if (basePlace && wantMutBase) {
+      auto sourceVar = basePlace.getDefiningOp<emitrust::VariableOp>();
+      if (!sourceVar)
+        return emitError(loc)
+               << "unsupported: string-literal cursor argument to a mutable "
+                  "region parameter has no backing to copy";
+      basePlace = builder
+                      .create<emitrust::VariableOp>(loc, basePlace.getType(),
+                                                    sourceVar.getInitAttr(),
+                                                    /*isConst=*/false)
+                      .getResult();
+    }
     if (!basePlace) {
       auto it = symbols.find(info.base);
       if (it == symbols.end())
@@ -5066,20 +5178,23 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
     // (i8 for the historical char** byte cursor; the literal-backing
     // path stays byte-only by construction — a literal region is i8).
     unsigned slotIndex = slots[cursorArg.index];
+    Type calleeBase = targetType.getInput(slotIndex);
     auto calleeSlice = llvm::cast<emitrust::SliceType>(
-        llvm::cast<emitrust::RefType>(targetType.getInput(slotIndex))
-            .getPointee());
+        llvm::isa<emitrust::MutRefType>(calleeBase)
+            ? llvm::cast<emitrust::MutRefType>(calleeBase).getPointee()
+            : llvm::cast<emitrust::RefType>(calleeBase).getPointee());
     if (elementType != calleeSlice.getElementType())
       return emitError(loc) << "unsupported: a cursor argument must walk "
                                "a region of the parameter's element type";
-    // Shared whole-region slice: the callee only reads bytes; the cursor
-    // travels separately, so the slice starts at element zero and both
-    // sides speak absolute positions.
+    // Whole-region slice: the cursor travels separately, so the slice
+    // starts at element zero and both sides speak absolute positions.
+    // FR-153: the view's mutability FOLLOWS THE CALLEE'S SLOT — never a
+    // local choice — so the caller and the callee's own reborrows agree.
     Value zero = createIntConstant(loc, i64Type, 0);
     arguments[slotIndex] =
         builder
-            .create<emitrust::SliceOfOp>(loc, targetType.getInput(slotIndex),
-                                         basePlace, zero, /*is_mut=*/false)
+            .create<emitrust::SliceOfOp>(loc, calleeBase, basePlace, zero,
+                                         /*is_mut=*/wantMutBase)
             .getResult();
     // The in-out cursor stages through a temp the callee writes; the
     // caller's cursor cell takes the advanced value back after the call.
@@ -7319,8 +7434,40 @@ FailureOr<Value> CImporter::emitEnumOperand(const EnumOperand &operand,
 }
 
 Value CImporter::castEnumToI32(Location loc, Value value) {
-  return builder.create<emitrust::CastOp>(loc, builder.getI32Type(), value)
-      .getResult();
+  // FR-166: an enum whose storage is 64 bits wide converts at i64, not i32 --
+  // truncating here would silently read the low half of every enumerator
+  // (`5000000000 as i32` is 705032704, `INT64_MAX as i32` is -1), which
+  // compiles cleanly and miscompiles at runtime. Anything narrower keeps
+  // today's i32 target byte for byte; an anonymous enum is already a plain
+  // i32 from `mapType` and never reaches here.
+  Type target = builder.getI32Type();
+  if (auto enumType = llvm::dyn_cast<emitrust::EnumType>(value.getType()))
+    if (auto def = emitrust::EnumDefOp::lookupFrom(module.getOperation(),
+                                                   enumType.getName()))
+      if (def.getWideUnderlying())
+        target = builder.getI64Type();
+  return builder.create<emitrust::CastOp>(loc, target, value).getResult();
+}
+
+Value CImporter::castEnumToPromotedInt(Location loc, Value value) {
+  // FR-169: the SIGNEDNESS-aware sibling of `castEnumToI32`. Width follows
+  // `wide_underlying` for the same FR-166 reason; signedness follows
+  // `unsigned_underlying`, the marker recorded from clang's choice of
+  // underlying type at the enum's import. A non-enum value passes through
+  // the default (signless, 32-bit) only if it is already an integer, which
+  // every caller guarantees.
+  unsigned width = 32;
+  bool isUnsigned = false;
+  if (auto enumType = llvm::dyn_cast<emitrust::EnumType>(value.getType()))
+    if (auto def = emitrust::EnumDefOp::lookupFrom(module.getOperation(),
+                                                   enumType.getName())) {
+      if (def.getWideUnderlying())
+        width = 64;
+      isUnsigned = def.getUnsignedUnderlying();
+    }
+  Type target = isUnsigned ? builder.getIntegerType(width, /*isSigned=*/false)
+                           : builder.getIntegerType(width);
+  return builder.create<emitrust::CastOp>(loc, target, value).getResult();
 }
 
 FailureOr<Value>

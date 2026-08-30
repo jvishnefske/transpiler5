@@ -29,12 +29,18 @@
 #include "EmitRust/EmitRustTypes.h"
 
 #include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+
+#include <cstdint>
+#include <limits>
 
 namespace mlir {
 namespace emitrust {
@@ -233,6 +239,89 @@ struct HoistEscapingLoopPlacesPass
   }
 };
 
+/// FR-170: reject a `switch` case label of `i64::MAX` — with a diagnostic
+/// that is TRUE.
+///
+/// `lift-cf-to-scf` turns a `cf.switch` into an `scf.index_switch` whose
+/// `cases` array holds each label's ZERO-extended value as an `int64_t`
+/// (`ControlFlowToSCF.cpp` calls `apInt.getZExtValue()`).
+/// `scf::IndexSwitchOp::verify` then collects those values in a
+/// `DenseSet<int64_t>` — and `DenseMapInfo<T>::getEmptyKey()` for an integral
+/// `T` is `std::numeric_limits<T>::max()`. Inserting `i64::MAX` therefore
+/// probes a bucket that compares equal to the EMPTY key, `insert().second`
+/// comes back false, and the compile dies on
+///
+///   error: 'scf.index_switch' op has duplicate case value: 9223372036854775807
+///
+/// for a switch that has no duplicate at all. The message is located, so the
+/// only thing wrong with it is that it is FALSE: it sends the reader looking
+/// for a second `case` label that does not exist.
+///
+/// We cannot patch upstream, so the fence runs BEFORE the lift and says what
+/// is actually wrong. Deliberately NOT worked around by shifting or remapping
+/// the label: that is a silent representation change on the correctness-
+/// sensitive path, and this project's rule is that an unsupported construct
+/// gets a located rejection rather than quietly different code.
+///
+/// The fence is exactly ONE value wide, and that is measured, not assumed:
+/// `i64::MIN` and `i64::MAX - 1` (which IS the `DenseMapInfo` TOMBSTONE key
+/// for `int64_t` on LP64, where `int64_t` is `long`) both compile and are
+/// byte-diffed against the clang-built native by
+/// test/EndToEnd/switch-case-int64-boundary.c. A wider "reserved keys" fence
+/// would have rejected working programs.
+///
+/// Reachability is not hypothetical: `_SD_ENUM_FORCE_S64` plants exactly
+/// `INT64_MAX` as an enumerator, so a switch over such an enum's maximum
+/// enumerator hits this from ordinary systemd headers.
+struct RejectUnrepresentableSwitchCasesPass
+    : public PassWrapper<RejectUnrepresentableSwitchCasesPass,
+                         OperationPass<func::FuncOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
+      RejectUnrepresentableSwitchCasesPass)
+
+  StringRef getArgument() const final {
+    return "emitrust-reject-unrepresentable-switch-cases";
+  }
+  StringRef getDescription() const final {
+    return "FR-170: reject a cf.switch case label of i64::MAX, which the "
+           "upstream scf.index_switch verifier misreports as a duplicate";
+  }
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<cf::ControlFlowDialect>();
+  }
+
+  void runOnOperation() override {
+    bool rejected = false;
+    getOperation().walk([&](cf::SwitchOp switchOp) {
+      std::optional<DenseIntElementsAttr> caseValues = switchOp.getCaseValues();
+      if (!caseValues)
+        return;
+      for (const llvm::APInt &value : caseValues->getValues<llvm::APInt>()) {
+        // The comparison is against the value the LIFT will store, which is
+        // the zero-extension: an `unsigned long long` label of
+        // `0x7FFFFFFFFFFFFFFF` is the same empty key as the `long long` one.
+        if (value.getActiveBits() > 64 ||
+            value.getZExtValue() !=
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+          continue;
+        InFlightDiagnostic diag =
+            switchOp.emitError()
+            << "unsupported: switch case value " << value.getZExtValue()
+            << " is i64::MAX, which the upstream 'scf.index_switch' verifier "
+               "cannot represent";
+        diag.attachNote()
+            << "MLIR's scf::IndexSwitchOp::verify collects case values in a "
+               "DenseSet<int64_t> whose EMPTY KEY is i64::MAX, so the value "
+               "is reported as a duplicate even when the switch has none";
+        rejected = true;
+        break;
+      }
+    });
+    if (rejected)
+      signalPassFailure();
+  }
+};
+
 } // namespace
 
 void buildLoweringPipeline(OpPassManager &pm,
@@ -249,6 +338,12 @@ void buildLoweringPipeline(OpPassManager &pm,
   pm.addPass(createEmitRustLowerContainers());
   pm.addPass(mlir::createMem2Reg());
   pm.addPass(mlir::createCanonicalizerPass());
+  // FR-170: strictly BEFORE the lift, which is what builds the
+  // `scf.index_switch` whose verifier misreports an `i64::MAX` case label as
+  // a duplicate. After the canonicalizer above, so a switch that folded away
+  // is never rejected for a label no longer in the IR.
+  pm.addNestedPass<func::FuncOp>(
+      std::make_unique<RejectUnrepresentableSwitchCasesPass>());
   pm.addPass(mlir::createLiftControlFlowToSCFPass());
   // FR-152: strictly BETWEEN the lift and the canonicalizer. The lift is what
   // creates the `!emitrust.lvalue<T>`-typed loop-carried value, and the
@@ -273,6 +368,10 @@ void registerEmitRustLoweringPipeline() {
   // FR-152: also expose the hoist on its own, so lit can pin the IR shape it
   // produces instead of only its effect through the whole pipeline.
   static PassRegistration<HoistEscapingLoopPlacesPass> hoistEscapingLoopPlaces;
+  // FR-170: likewise exposed on its own so lit can pin the fence's exact
+  // width at IR level, not only through the whole pipeline.
+  static PassRegistration<RejectUnrepresentableSwitchCasesPass>
+      rejectUnrepresentableSwitchCases;
   PassPipelineRegistration<>(
       "emitrust-lowering",
       "The pinned import-to-emitrust lowering pipeline the drivers run",
