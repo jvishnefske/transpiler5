@@ -12230,19 +12230,38 @@ piece and becomes FR-45.
   `CHECK-NOT` on the unreadable spelling.
   **LANDED.**
 
-- [ ] FR-175 (opened 2026-08-30 by the FR-170 implementer): OUR OWN
-  `emitrust::SwitchOp::verify` CARRIES THE SAME UPSTREAM BUG.
-  `lib/EmitRust/EmitRustOps.cpp:1688` uses `llvm::DenseSet<int64_t>`, whose
-  empty key is `i64::MAX`, so hand-written `emitrust.switch` IR with
-  `case 9223372036854775807` fed to `emitrust-opt` gets OUR OWN false
-  `has duplicate case value` -- the exact diagnostic FR-170 just stopped
-  telling users.
-  UNREACHABLE FROM C SOURCE, because FR-170's fence fires first; it bites
-  only hand-written IR. Left out of scope deliberately to keep that change
-  small.
-  Worth doing if the honesty invariant should hold for hand-written IR too --
-  and it is a one-line fix (a `std::set` or an explicit sentinel check).
-  **NOT SPIKED.**
+- [x] FR-175 DEFECT (FIXED 2026-08-30; opened the same day by the FR-170
+  implementer): OUR OWN `emitrust::SwitchOp::verify` CARRIED THE SAME
+  SENTINEL-KEY BUG -- but NOT with the trigger the entry claimed.
+  `lib/EmitRust/EmitRustOps.cpp:1688` collected case values in an
+  `llvm::DenseSet<int64_t>`, whose empty key is `i64::MAX` and whose
+  tombstone is `i64::MIN`.
+  AS FILED: "hand-written IR with `case 9223372036854775807` fed to
+  `emitrust-opt` gets OUR OWN false `has duplicate case value`".
+  MEASURED, and the entry is WRONG: that exact input is ACCEPTED. The defect
+  is ORDER-DEPENDENT. A default-constructed `DenseMap` has ZERO buckets, so
+  `LookupBucketFor` early-returns "not found" for any key at all and a
+  FIRST-position `i64::MAX` inserts cleanly. It is only reached with a bucket
+  array already allocated that it matches an empty bucket BY VALUE:
+    `case 9223372036854775807` alone            -> accepted, no diagnostic
+    `case 1` then `case 9223372036854775807`    -> FALSE "duplicate case value"
+    `case 1` then `case -9223372036854775808`   -> accepted
+  `i64::MIN` never fired at all, because nothing is ever erased from this set
+  and so no bucket ever holds the tombstone -- it is one `erase` away from the
+  same false report. In an assertions-enabled build BOTH sentinels abort
+  inside `LookupBucketFor` rather than diagnosing anything, so the release
+  symptom is the mild face of this.
+  UNREACHABLE FROM C SOURCE, as the entry said and as I re-confirmed after the
+  fix: FR-170's `RejectUnrepresentableSwitchCasesPass` fires first with its
+  located diagnostic. This bites hand-written IR only.
+  FIXED with `std::set<int64_t>`, which reserves no values; a switch's case
+  list is short enough that the cost is irrelevant in a verifier. A "skip the
+  sentinels" spelling would have opened a REAL hole, so invalid.mlir gained
+  two legs pinning that a genuine duplicate AT each sentinel is still refused.
+  The positive verdict needed a round-trip oracle rather than a diagnostic
+  one: `test/Dialect/EmitRust/switch-sentinel-case.mlir` pins all four
+  positions. SWEPT: `DenseSet<int64_t>` had exactly ONE remaining use in
+  `lib/`, `tools/` and `include/`, and this was it. Gate 945/945.
 
 - [x] FR-133 A NULLABLE FN-PTR LOCAL initialized from a literal `Some` needs
   no `Option` at all (LANDED 2026-08-29). Surfaced by FR-132, which made the
