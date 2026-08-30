@@ -9,7 +9,7 @@ valid.
 ## One iteration
 
 ```bash
-export EMITRUST_CC=./build/bin/emitrust-cc      # or the nix-built binary
+export EMITRUST_CC=./build/tools/emitrust-cc      # or the nix-built binary
 
 # 1. collect — the ranked queue over all three signals
 python3 nix/harness/controller.py collect --explore <explore.json> ...

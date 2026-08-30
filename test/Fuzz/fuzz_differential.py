@@ -33,7 +33,7 @@ target dirs.  differ.py handles both layouts.
 
 Example campaign:
     nix develop -c python3 test/Fuzz/fuzz_differential.py \\
-        --emitrust-cc build/bin/emitrust-cc \\
+        --emitrust-cc build/tools/emitrust-cc \\
         --start 0 --count 5000 --jobs 8 --artifacts /tmp/fuzz-out
 """
 

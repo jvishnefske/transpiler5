@@ -60,7 +60,7 @@ optimizer spec enforces 6–7.
 ## Quickstart
 
 ```bash
-export EMITRUST_CC=./build/bin/emitrust-cc
+export EMITRUST_CC=./build/tools/emitrust-cc
 python3 nix/harness/controller.py freeze --id 1 --corpus test/EndToEnd --split
 python3 nix/harness/controller.py establish --id 1
 python3 nix/harness/controller.py collect            # ranked queue

@@ -91,7 +91,7 @@ Python's %-formatting reproduces for these argument ranges).
 ## Running a big campaign
 
     nix develop -c python3 test/Fuzz/fuzz_differential.py \
-        --emitrust-cc build/bin/emitrust-cc \
+        --emitrust-cc build/tools/emitrust-cc \
         --start 0 --count 5000 --jobs 8 --artifacts /tmp/fuzz-out
 
 Useful flags: `--fail-on-miscompile` (CI mode), `--workdir DIR` (keep
@@ -129,7 +129,7 @@ whenever the seed→program mapping changes.
 1. **Minimize**: shrink the diverging program at the grammar level:
 
        nix develop -c python3 test/Fuzz/minimize.py \
-           --seed <seed> --emitrust-cc build/bin/emitrust-cc \
+           --seed <seed> --emitrust-cc build/tools/emitrust-cc \
            --workdir /tmp/shrink-<seed> --output /tmp/min-<seed>.c
 
 2. **Pin**: land the minimized program as a differential regression

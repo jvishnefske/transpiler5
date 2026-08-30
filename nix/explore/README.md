@@ -11,7 +11,7 @@ stops.
 
 ```
 # flat corpus, no flags needed:
-nix develop -c bash -c 'export EMITRUST_CC=./build/bin/emitrust-cc CLANG=clang; \
+nix develop -c bash -c 'export EMITRUST_CC=./build/tools/emitrust-cc CLANG=clang; \
   python3 nix/explore/explore.py test/Import/C --seconds 60'
 
 # a project tree that needs include/target flags (appended to every run):

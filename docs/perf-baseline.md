@@ -24,7 +24,7 @@ variadic printf format dispatch.
 ## How to reproduce
 
 ```
-nix develop -c bash tools/bench-transpile.sh build/bin/emitrust-cc 5
+nix develop -c bash tools/bench-transpile.sh build/tools/emitrust-cc 5
 ```
 
 The script writes only to a self-cleaning `mktemp -d` workdir; it never
