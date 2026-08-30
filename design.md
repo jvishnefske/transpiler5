@@ -9960,7 +9960,20 @@ piece and becomes FR-45.
   mismatch. It converts 6538 rustc errors into one link error. It makes the
   systemd link FAIL again -- honestly, rather than emitting an artifact that
   cannot build.
-  **NOT SPIKED.**
+
+  DEPRIORITIZED BELOW FR-158 on 2026-08-29, deliberately and against the
+  backlog rank, for two reasons worth recording.
+  (1) The repo's OWN rule (CLAUDE.md, the dead-store paragraph) is that "the
+  safe failure direction is a hard rustc error, never silent behavior
+  change". An unbuildable crate IS that safe direction -- it is loud, just
+  LATE and unlocalized. So the FR-145 "exit-0-unbuildable" framing overstates
+  this one: FR-157 buys diagnostic LOCALITY, not safety.
+  (2) Landing FR-157 alone would take the 501-object systemd link from exit 0
+  back to failing, trading a working whole-program link for a better error
+  message. That is the wrong order. If FR-158 reconciles the models, FR-157
+  becomes a backstop for a case that no longer occurs; it should be judged on
+  whether it still earns its keep AFTER that, not before.
+  **NOT SPIKED; held behind FR-158.**
 
 - [ ] FR-158 (found by building the FR-156 whole-program link 2026-08-29):
   RECONCILE THE CROSS-SHARD POINTER MODEL so the whole-program crate actually
@@ -9981,7 +9994,39 @@ piece and becomes FR-45.
   caller and callee agree by construction. The defect exists only where two
   independently-imported units meet, which is why nothing before the
   whole-program link could see it.
-  **NOT SPIKED.**
+
+  ROOT CAUSE LOCATED 2026-08-29 (the entry's own hypothesis above was CLOSE
+  BUT WRONG). It is not "the definition's body reveals the parameter indexed
+  or walked". `collectSliceParams` (`ImportCTypes.cpp:1494-1498`,
+  `ImportCPlanning.cpp:3564-3565`, contract at `CImporterInternal.h:8723`)
+  walks the BODY and promotes a pointer parameter to `mut_ref<slice<T>>` when
+  the body merely REFERENCES it -- indexing is not required. Measured:
+      void g(const char *s);            -> mut_ref<i8>            (no body)
+      void g(const char *s) { }         -> mut_ref<i8>            (unreferenced)
+      void g(const char *s) { (void)s; }-> mut_ref<slice<i8>>     (referenced)
+      { sink = s[0]; } / { printf(s); } -> mut_ref<slice<i8>>
+  So the discriminator is REFERENCED-AT-ALL, and a declaration always takes
+  the default because it has no body to consult. This is NOT the
+  `cursorParams` Shape-S mechanism (`ImportCPlanning.cpp:3668`), which is
+  about `T **`.
+
+  AND THE DEFECT IS NARROWER THAN THE 6538 COUNT SUGGESTS. Four small
+  reproductions, each carrying the IR-level divergence (verified in the shard
+  signatures directly), ALL LINK AND BUILD CLEAN: a string-literal argument, a
+  forwarded `const char *` parameter, and a file-static `char buf[8]`. (A
+  fourth, `buf + k` into a GLOBAL, is vacuous -- the caller is stubbed with
+  `unsupported: passing a pointer into a global variable to a function`, so no
+  call is emitted.) Something downstream reconciles the common shapes; the
+  surviving failure needs the caller to have ALREADY BOUND a cursor into a
+  LOCAL at a computed offset, which is exactly the emitted systemd shape:
+      let mut v16: [i8; 130] = [ /* __FILE__ */ ];
+      let v17: &mut i8 = &mut v16[3u64.wrapping_sub(1u64).wrapping_add(1) as usize];
+      log_assert_failed(v8, v17, 98i32, v20);
+  Note the caller demonstrably HAS the array and the offset, so `&mut v16[off..]`
+  would satisfy the callee -- the information is present; only the callee's
+  signature is unknown at import time. Finding what reconciles the easy cases,
+  and where it gives up, is the spike's central question.
+  **SPIKING.**
 
 - [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28): 35 crates fail
   `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`

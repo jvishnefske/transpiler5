@@ -358,23 +358,23 @@ anchor = "FR-156 DEFECT (found by the FR-152 whole-program link"
 
 [[items]]
 id = "FR-157"
-rank = 10
+rank = 22
 kind = "defect"
 status = "open"
 size = "S"
 title = "The merge resolves an external obligation by name alone, never comparing signatures"
-summary = "Found by building the FR-156 whole-program link 2026-08-29. mergeShards step 2 erases a declaration on a NAME hit with no type check, so a cross-shard pointer-model divergence becomes an exit-0-unbuildable crate. Measured: log_assert_failed is declared !emitrust.mut_ref<i8> in caller shards and defined !emitrust.mut_ref<slice<i8>> in assert-util, giving rustc 'expected &mut [i8], found &mut i8' at 2827 call sites; 6538 E0308 in total across ~40 functions, 99.9% of all errors in the merged crate. The small correct half: compare the obligation's signature with the definition's and emit a located diagnostic naming both shards and both types. Converts 6538 rustc errors into one link error, and makes the systemd link fail honestly rather than emit an unbuildable artifact. NOT SPIKED."
+summary = "DEPRIORITIZED below FR-158 2026-08-29: the repo rule says a hard rustc error IS the safe failure direction, so this buys diagnostic LOCALITY not safety, and landing it alone would take the 501-object systemd link from exit 0 back to failing. Judge it as a backstop AFTER FR-158. Found by building the FR-156 whole-program link 2026-08-29. mergeShards step 2 erases a declaration on a NAME hit with no type check, so a cross-shard pointer-model divergence becomes an exit-0-unbuildable crate. Measured: log_assert_failed is declared !emitrust.mut_ref<i8> in caller shards and defined !emitrust.mut_ref<slice<i8>> in assert-util, giving rustc 'expected &mut [i8], found &mut i8' at 2827 call sites; 6538 E0308 in total across ~40 functions, 99.9% of all errors in the merged crate. The small correct half: compare the obligation's signature with the definition's and emit a located diagnostic naming both shards and both types. Converts 6538 rustc errors into one link error, and makes the systemd link fail honestly rather than emit an unbuildable artifact. NOT SPIKED."
 blocked_by = []
 anchor = "FR-157 DEFECT (found by building the FR-156 whole-program link"
 
 [[items]]
 id = "FR-158"
-rank = 18
+rank = 10
 kind = "feature"
-status = "open"
+status = "spiked"
 size = "L"
 title = "Reconcile the cross-shard pointer model so the whole-program crate builds"
-summary = "Found by building the FR-156 whole-program link 2026-08-29. The real prize behind FR-157. UNTESTED HYPOTHESIS: a definition has a body so the importer sees the parameter indexed and picks the slice model, while a bare header prototype has no body evidence and defaults to the single-object cursor mut_ref<i8>; if so the divergence is predictable from declaration-vs-definition alone and could be fixed by giving the declaration path the model the definition will choose, or by deferring the choice to link. MEASURE IT FIRST -- it is the entry's own guess. Note the per-UNIT crates never show this, because within one unit the callee is an FR-52 obligation carrying the caller's own inferred signature, so the two agree by construction; only two independently-imported units meeting can expose it. NOT SPIKED."
+summary = "ROOT CAUSE LOCATED 2026-08-29; the entry hypothesis was close but wrong. collectSliceParams walks the BODY and promotes a pointer parameter to slice when the body merely REFERENCES it -- indexing is not required -- so a declaration always takes the scalar default for want of a body. Narrower than 6538 suggests: four small repros carrying the IR divergence all link and BUILD CLEAN; the surviving failure needs a cursor already bound into a LOCAL at a computed offset. Found by building the FR-156 whole-program link 2026-08-29. The real prize behind FR-157. UNTESTED HYPOTHESIS: a definition has a body so the importer sees the parameter indexed and picks the slice model, while a bare header prototype has no body evidence and defaults to the single-object cursor mut_ref<i8>; if so the divergence is predictable from declaration-vs-definition alone and could be fixed by giving the declaration path the model the definition will choose, or by deferring the choice to link. MEASURE IT FIRST -- it is the entry's own guess. Note the per-UNIT crates never show this, because within one unit the callee is an FR-52 obligation carrying the caller's own inferred signature, so the two agree by construction; only two independently-imported units meeting can expose it. NOT SPIKED."
 blocked_by = []
 anchor = "FR-158 (found by building the FR-156 whole-program link"
 
