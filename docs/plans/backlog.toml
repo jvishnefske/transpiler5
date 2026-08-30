@@ -401,7 +401,7 @@ blocked_by = []
 anchor = "FR-159 (opened by the repo owner 2026-08-29"
 
 [[items]]
-id = "FR-160"
+id = "FR-162"
 rank = 30
 kind = "quality"
 status = "open"
@@ -409,7 +409,7 @@ size = "S"
 title = "Repo LICENSE is AGPL-3.0 but 54 source files carry Apache-2.0 WITH LLVM-exception"
 summary = "Opened 2026-08-29 after LICENSE (AGPL-3.0-or-later) landed in b65d75c. 54 files under lib/, include/ and tools/ still carry the LLVM-convention header SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception, which now contradicts the repo licence. NOT a mechanical sweep -- it is a legal decision for the copyright holder. Options: relicense the headers to AGPL-3.0-or-later; declare a deliberate split (tooling AGPL, dialect/runtime pieces stay Apache-2.0-WITH-LLVM-exception so downstream users of EMITTED crates are unencumbered -- note AGPL on the transpiler does not reach the emitted Rust, but a header on a runtime-support file might); or leave LICENSE governing, the weakest position. No distribution blocker today: MLIR/clang are Apache-2.0 WITH LLVM-exception, compatible with AGPL-3.0 for a combined work. NEEDS AN OWNER DECISION."
 blocked_by = []
-anchor = "FR-160 (opened 2026-08-29): the repository LICENSE is"
+anchor = "FR-162 (opened 2026-08-29, renumbered from FR-160 on the main merge"
 
 [[items]]
 id = "FR-161"
