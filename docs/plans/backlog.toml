@@ -503,23 +503,23 @@ anchor = "FR-170 UPSTREAM (found by the FR-166 spike 2026-08-30, reproduced on"
 id = "FR-171"
 rank = 15
 kind = "defect"
-status = "open"
+status = "deferred"
 size = "L"
 title = "127 cause-asymmetric function symbols will hard-error once their declarations import"
-summary = "Opened 2026-08-30 by the FR-168 spike corpus sizing. sd_bus_call, sd_bus_add_match, memstream_finalize and 124 others have a declaration side dropped by rejected-type-cascade and a definition side with an independent blocker, mostly pointer-to-pointer parameter escapes the cursor-parameter shape. FR-168 slice 1 deliberately does not help them: they HAVE surviving call sites so orphan-dropping is unsound, and after ConvertToEmitRust a call is emitrust.call_opaque with a string callee, not a symbol ref, so unreferenced cannot be decided for a function. Every FR-165 root-type fix touching SdBus turns these into hard unresolved externals. Directions: fix the definition-side blocker, which is the pointer-model front; or give the link a stub cascade materializing an unimplemented!() body under the FR-52 marker contract instead of erroring -- the second is the general answer and is what makes every FR-165 root-type fix safe to land. NOT SPIKED."
+summary = "NO-GO 2026-08-30, POPULATION ZERO. The entry premise is FALSE: the 83 (not 127) cannot become obligations because their declaration side is blocked TWICE -- a body-less declaration never reaches cursor-parameter planning and hits an unconditional pointer-to-pointer rejection instead, so fixing SdBus changes the recorded reason but not the outcome. Measured counterfactual: zero hard errors. Also measured: 0 record symbols rejected in one shard and imported in another, closing the other route. AND the proposed discriminator is UNSOUND -- joining on the ledger bare symbol swallows the honest unresolved external, reproduced in 9 lines, and THE FULL 928-TEST GATE PASSED WITH THE HOLE OPEN. The stub cascade itself is sound but unneeded; it would change the failure mode from refuse-to-emit to build-green-abort-at-runtime, a policy decision. Landed instead: FR-172 batching plus a tripwire test pinning the rejection that keeps the 83 safe. Revisit only if that tripwire flips. Opened 2026-08-30 by the FR-168 spike corpus sizing. sd_bus_call, sd_bus_add_match, memstream_finalize and 124 others have a declaration side dropped by rejected-type-cascade and a definition side with an independent blocker, mostly pointer-to-pointer parameter escapes the cursor-parameter shape. FR-168 slice 1 deliberately does not help them: they HAVE surviving call sites so orphan-dropping is unsound, and after ConvertToEmitRust a call is emitrust.call_opaque with a string callee, not a symbol ref, so unreferenced cannot be decided for a function. Every FR-165 root-type fix touching SdBus turns these into hard unresolved externals. Directions: fix the definition-side blocker, which is the pointer-model front; or give the link a stub cascade materializing an unimplemented!() body under the FR-52 marker contract instead of erroring -- the second is the general answer and is what makes every FR-165 root-type fix safe to land. NOT SPIKED."
 blocked_by = []
-anchor = "FR-171 (opened 2026-08-30 by the FR-168 spike's corpus sizing): 127"
+anchor = "FR-171 NO-GO 2026-08-30, POPULATION ZERO (opened the same day by the FR-168"
 
 [[items]]
 id = "FR-172"
 rank = 19
 kind = "quality"
-status = "open"
+status = "landed"
 size = "S"
 title = "The unresolved-external report is not batched"
 summary = "Opened 2026-08-30 by the FR-168 spike. LinkMerge.cpp:1068 returns on the FIRST unresolved external, while the FR-158 signature-divergence path directly above it reports every diverging obligation before giving up. On a 501-object link that turns one diagnosis into a 12-iteration exclude-and-retry loop, which is exactly what the FR-166 spike had to do to reach a building crate. Small, mechanical, and it pays for itself the next time a wave makes a cascaded type importable. NOT SPIKED."
 blocked_by = []
-anchor = "FR-172 (opened 2026-08-30 by the FR-168 spike): the unresolved-external"
+anchor = "FR-172 LANDED 2026-08-30 (opened the same day by the FR-168 spike): the unresolved-external"
 
 [[items]]
 id = "FR-173"

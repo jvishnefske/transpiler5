@@ -10782,7 +10782,7 @@ piece and becomes FR-45.
   **SLICE 1 LANDED. Slice 2 (link-side defence in depth for stale shards)
   remains optional.**
 
-- [ ] FR-171 (opened 2026-08-30 by the FR-168 spike's corpus sizing): 127
+- [ ] FR-171 NO-GO 2026-08-30, POPULATION ZERO (opened the same day by the FR-168 spike's corpus sizing): 127
   CAUSE-ASYMMETRIC FUNCTION SYMBOLS with real call sites will become hard
   `unresolved external`s as soon as their declaration side becomes
   importable. `sd_bus_call`, `sd_bus_add_match`, `memstream_finalize`, ...
@@ -10793,14 +10793,75 @@ piece and becomes FR-45.
   sites, so orphan-dropping is unsound, and after `ConvertToEmitRust` a call
   is `emitrust.call_opaque "name"` -- a string, not a symbol ref -- so
   "unreferenced" cannot be decided for a function at all.
-  DIRECTIONS: fix the definition-side blocker (which is the pointer-model
-  front, FR-165's 5,589 distinct drops), or give the link a stub cascade that
-  materializes an `unimplemented!()` body under the FR-52 marker contract
-  rather than erroring. The second is the general answer and is what makes
-  every FR-165 root-type fix safe to land.
-  **NOT SPIKED.**
+  SPIKED 2026-08-30: **NO-GO, and the entry's central premise is FALSE.**
 
-- [ ] FR-172 (opened 2026-08-30 by the FR-168 spike): the unresolved-external
+  THE 83 (not 127) CANNOT BECOME OBLIGATIONS, because their declaration side
+  is blocked TWICE. `planCursorParamsFor` (`ImportCPlanning.cpp:3513`) only
+  runs on `func->getBody()`, so a BODY-LESS declaration never reaches
+  cursor-parameter planning; it hits `ImportCTypes.cpp:1242` instead, which
+  rejects a data `T**` parameter UNCONDITIONALLY. All 83 of 83 carry such a
+  parameter. Fixing `SdBus` changes the recorded REASON from
+  `rejected-type-cascade` to `ptr-to-ptr`; the symbol stays dropped and no
+  obligation is created.
+  MEASURED COUNTERFACTUAL: "if `SdBus` became importable tomorrow, how many
+  hard errors appear?" -- **zero**. Its 105 cascade-only items revive on both
+  sides; its 34 ptr-to-ptr items stay dropped on both sides. Also measured
+  and closing the other route: **0 record/enum symbols are rejected in one
+  shard and imported in another**, so record importability is TU-invariant
+  across the corpus and no root fix can be partial across TUs.
+  I verified the double block myself: with a fully importable `struct MS` and
+  no cascade anywhere, `int mf(struct MS *, char **, unsigned long *);` still
+  rejects.
+
+  AND THE DISCRIMINATOR I PROPOSED IS UNSOUND. Joining on the ledger's bare
+  symbol SWALLOWS THE HONEST `unresolved external`: an opaque forward
+  declaration in one header and a complete one in another is everyday C, and
+  it makes a genuinely missing library symbol silently stub. Reproduced in 9
+  lines -- `a.o` alone errors, `a.o b.o` returns rc=0 with a silent
+  `unimplemented!()`. **THE FULL 928-TEST GATE PASSED WITH THAT HOLE OPEN**,
+  because `link-merge-errors.c`'s shard carries no rejections at all. Same
+  shape that killed FR-154's rename: gate-green and wrong.
+  Root cause of the unsoundness: `RejectedItem` (`include/EmitRust/ImportC.h:47`)
+  cannot distinguish a rejected DEFINITION from a rejected body-less
+  DECLARATION. Two sound repairs exist if this ever becomes live -- join on
+  the item graph's `kind=function def=1`, which is ALREADY serialized and
+  ALREADY parsed at link time (`emitrust-cc.cpp:1530`) and needs no artifact
+  change; or add a `bool definition` ledger field where old shards decode
+  `false` and degrade to today's hard error.
+
+  THE STUB CASCADE ITSELF IS SOUND BUT UNNEEDED. Prototyped: gate 928/928,
+  whole-program crate byte-identical, and `unimplemented!()` has type `!` so
+  there is no path to a wrong VALUE -- only diverge-at-runtime or
+  fail-to-compile. Byte-diffed: a stub that IS called panics loudly
+  (exit 101) where the native prints `8`; a stub NOT called is byte-identical,
+  including a `Some(g)` fn-pointer target. It also exposed a real defect to
+  carry forward: two shards holding an obligation for one symbol materialize
+  two stubs and hit `redefinition of symbol named 'dd'`.
+  WHAT IT WOULD CHANGE is the failure mode -- "the toolchain refuses to emit"
+  becomes "the crate builds green and aborts at runtime" -- which is a POLICY
+  decision, not a correctness one, and it must carry a located warning per
+  stub or the porting ledger lies.
+
+  LANDED INSTEAD, per the spike's recommendation: FR-172 batching, plus a
+  TRIPWIRE test (`test/Driver/ptr-to-ptr-decl-no-link-obligation.c`) pinning
+  the `ImportCTypes.cpp:1242` rejection that makes the 83 safe. **The day the
+  pointer-model front lifts that for body-less declarations without lifting
+  the definition side, the tripwire flips and FR-171 becomes live work** --
+  gated on 1242, not on FR-165.
+  TWO CORRECTIONS TO MY OWN VERIFICATION, both found by the implementer and
+  both strengthening the argument: I quoted the declaration-side wording as
+  `escapes the cursor-parameter shape`, but that is
+  `ImportCPlanning.cpp:3532` and in my own probe it came from `use`, the
+  DEFINITION -- the declaration gets the unconditional type-level
+  `unsupported: pointer-to-pointer parameter`. And in my probe shape the
+  caller is DROPPED, not stubbed, because forwarding `b` is itself a
+  cursor-shape escape, so my probe never demonstrated the
+  callee-dropped -> caller-stubbed edge at all; the test sources its `char **`
+  from a decayed file-static instead.
+  **NO-GO, POPULATION ZERO. Fence landed; revisit only if the tripwire flips.**
+
+
+- [x] FR-172 LANDED 2026-08-30 (opened the same day by the FR-168 spike): the unresolved-external
   report is NOT BATCHED. `tools/emitrust-cc/LinkMerge.cpp:1068` returns on the
   FIRST one, while the FR-158 signature-divergence path directly above it
   reports every diverging obligation before giving up. On a 501-object link
@@ -10808,7 +10869,14 @@ piece and becomes FR-45.
   is exactly what the FR-166 spike had to do to reach a building crate.
   Small, mechanical, and it pays for itself the next time a wave makes a
   cascaded type importable.
-  **NOT SPIKED.**
+  LANDED 2026-08-30, 16 insertions. The unresolved arm now joins the FR-158
+  accumulator instead of returning. Verified myself: four missing symbols
+  reported 1 before, **4 after**. `obligations` is a `SmallVector`, so report
+  order is declaration order and deterministic -- the test pins it ordered,
+  not `-DAG`. Gate 930/930; `link-merge-errors.c`, `link-merge-fnptr.c` and
+  `link-orphan-extern-global.c` all pin the single-symbol wording and pass
+  verbatim. Corpus byte-identical at 12,413,334 with cargo 0 errors.
+  **LANDED.**
 
 - [ ] FR-169 DEFECT (MISCOMPILE, found by the FR-166 spike 2026-08-30;
   currently UNREACHABLE, and that is the only reason it is not live):

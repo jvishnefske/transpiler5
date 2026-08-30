@@ -1026,7 +1026,14 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
   // else is a located link rejection. Every diverging obligation is
   // reported before the merge gives up -- a whole-program link that stops
   // at the first of hundreds turns porting into a one-at-a-time loop.
-  bool reconciliationFailed = false;
+  //
+  // FR-172: the undefined-symbol arm below obeys the same rule. It used to
+  // `return` on the FIRST unresolved external, so enumerating N missing
+  // symbols cost N link runs (exclude one, re-link, learn the next). Now
+  // every unresolved obligation is reported, located at its own recorded
+  // declaration, and the merge fails once at the end. What a missing symbol
+  // DOES is unchanged -- only how many are reported per run.
+  bool linkFailed = false;
   // One fence per merge: its proofs are keyed on definition operations that
   // stay live for the whole reconciliation, and the same (callee, slot) is
   // asked about once per diverging call site.
@@ -1051,25 +1058,27 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
               << " but the defining translation unit defines it as "
               << defFn.getFunctionType();
           diag.attachNote(it->second->getLoc()) << "defined here";
-          reconciliationFailed = true;
+          linkFailed = true;
           continue;
         }
         auto shard = op->getParentOfType<ModuleOp>();
         if (mlir::failed(adaptSliceRefinedCalls(shard, it->second, name,
                                                 *slots, declType, defType,
                                                 elementZeroFence))) {
-          reconciliationFailed = true;
+          linkFailed = true;
           continue;
         }
       }
       toErase.push_back(op);
       continue;
     }
-    return op->emitError() << "unresolved external '" << name << "' at link";
+    op->emitError() << "unresolved external '" << name << "' at link";
+    linkFailed = true;
   }
-  // A shard left half-reconciled must never reach the splice or the
-  // verifier: the located rejections above are the report.
-  if (reconciliationFailed)
+  // A shard left half-reconciled, or one still carrying an obligation
+  // nobody defines, must never reach the splice or the verifier: the
+  // located rejections above are the report.
+  if (linkFailed)
     return failure();
 
   for (Operation *op : toErase)
