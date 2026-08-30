@@ -9831,6 +9831,58 @@ piece and becomes FR-45.
   NOT to (a), which happens after all AST work is done.
   **NOT SPIKED.**
 
+- [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
+  the same day): A DEAD `goto` SILENTLY CHANGED A FUNCTION'S ANSWER. A
+  place-backed scalar declared inside a loop body lost its per-iteration
+  reset whenever the enclosing function contained ANY label.
+      int total = 0;
+      for (int i = 0; i < 3; i++) { int s = 0; s += i; total += s; }
+      if (total < 0) goto done;      /* delete these two lines and the */
+      done:                          /* answer changes back           */
+      printf("%d\n", total);
+  clang prints 3; the emitted crate printed 4. Compile-clean wrong output --
+  the worst class this project has. Delete the label pair and both print 3.
+  The whole emitted delta is one line: `let mut s: i32 = 0;` moves OUT of the
+  loop, so `s` accumulates 0,1,3 instead of resetting.
+
+  ROOT CAUSE, two independently-correct mechanisms that compose wrongly.
+  `createVariablePlace` (`ImportCFunctions.cpp:3864`) hoists the
+  `emitrust.variable` op to the function ENTRY BLOCK whenever
+  `currentHasLabels`, so a `goto` over a declaration cannot leave a later use
+  undominated. FR-61f separately attaches a compile-time-constant initializer
+  TO THE OP (`ImportCStatements.cpp:534`) to avoid
+  `clippy::needless_late_init`. When both fire the hoist carries the
+  INITIALIZER out of the loop along with the declaration.
+
+  FIX: the constant-init fast path additionally requires `!currentHasLabels`.
+  The general path below it creates the place with no init and a
+  `storeToPlace` at the CURRENT insertion point -- inside the loop -- which
+  is correct. The cosmetic clippy win is deliberately surrendered in
+  labelled functions; only the labelled case pays.
+
+  SCOPE, measured by byte-diff against the clang native, both at HEAD and
+  after the fix: four adversarial companions with the same dead-label shape
+  MATCH in BOTH states, so the defect is confined to the constant-init
+  place-backed scalar and these are non-regression companions, not further
+  bugs -- an aggregate `struct S s = {1,2};`, an array `int a[3] = {1,2,3};`,
+  an `unsigned s = 5;` (excluded from the fast path by `isUnsignedInt`, so no
+  init attribute is ever attached) and a non-constant `int s = k;` (excluded
+  because `getIntegerConstantExpr` fails). `ImportCStatements.cpp:534` is the
+  ONLY `createVariablePlace` call site that passes an init attribute; the
+  other eight pass none, and the direct `builder.create<emitrust::VariableOp>`
+  sites are not hoisted at all.
+  ALSO MEASURED, not a second channel: a droppy C++ local in a loop in a
+  labelled function is already a LOCATED rejection (`unsupported: object of a
+  class with a destructor outside a function, loop, or branch body`), so the
+  hoist opens no drop-timing hole.
+  Gate 894/894 (892 + the two new tests), zero golden churn.
+  HOW IT WAS FOUND, worth keeping: the FR-152 spike was told to measure what
+  the existing `currentHasLabels` hoist COSTS IN EMITTED BYTES, on the
+  premise that the path was correct and only its output shape was in
+  question. The premise was false. A differential probe -- the same function
+  body with and without a dead label -- is what exposed it, and no
+  byte-counting exercise would have.
+
 - [x] FR-148 DEFECT (MISCOMPILE, found while implementing FR-147 2026-08-29,
   PRE-EXISTING at HEAD and independent of it; FIXED in the same commit): a
   second pointer local DECLARED with an initializer inside an allocation region
