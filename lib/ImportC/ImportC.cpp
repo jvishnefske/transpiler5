@@ -2149,7 +2149,7 @@ FailureOr<Type> CImporter::getOrCreateArrayMemberEnumType(
         loc, moduleBuilder.getStringAttr(symbol),
         moduleBuilder.getStrArrayAttr(variantNames),
         moduleBuilder.getDenseI64ArrayAttr(variantValues),
-        /*unsigned_underlying=*/true);
+        /*unsigned_underlying=*/true, /*wide_underlying=*/false);
     facts.enumSymbol = symbol;
   }
   return Type(emitrust::EnumType::get(builder.getContext(), facts.enumSymbol));
@@ -6172,8 +6172,26 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   // intermediate access Sema synthesizes for `parent.leaf` designates
   // the parent place itself; the leaf below then selects its flattened
   // (possibly union-slot-aliased) name on that place.
-  if (field->isAnonymousStructOrUnion())
-    return basePlace;
+  if (field->isAnonymousStructOrUnion()) {
+    // FR-167: EXCEPT an anonymous union whose arms could not flatten --
+    // it lives as a synthesized-named member of the parent, so its
+    // implicit access is one real projection, not a transparent peel.
+    // Peeling it transparently would aim the arm's own selection (FR-83's
+    // `opaque` byte view) at the PARENT struct_def, which has no such
+    // field: FR-173's emitter backstop catches that as "member 'opaque'
+    // does not exist on struct '<parent>'".
+    auto blob = anonymousUnionBlobNames.find(field);
+    if (blob == anonymousUnionBlobNames.end())
+      return basePlace;
+    FailureOr<Type> unionType = mapType(field->getType(), loc);
+    if (failed(unionType))
+      return failure();
+    return builder
+        .create<emitrust::MemberOp>(loc, emitrust::LValueType::get(*unionType),
+                                    basePlace,
+                                    builder.getStringAttr(blob->second))
+        .getResult();
+  }
   // A union arm designates its storage slot: the member selects the
   // slot's name at the slot's type. A pun arm's (differently-signed
   // integer, or float over an integer slot and vice versa) bit-exact
@@ -7008,6 +7026,37 @@ LogicalResult CImporter::finalizeProject() {
       // value type, marked for the FR-58 link step; the Rust emitter refuses
       // a module still carrying the marker.
       if (deferExternals) {
+        // FR-168: but only for a symbol the module still REFERENCES. The
+        // pending entry is a side effect of importing the body that read the
+        // global, and `rollbackTo` does not undo it (`RecoveryCheckpoint`
+        // tracks only the anchor and the erased external clones), so a body
+        // rejected AFTER its read was imported leaves the registration
+        // behind with no IR use left. Materializing an obligation for that
+        // orphan makes the FR-58 link demand a definition NOTHING in the
+        // whole program asks for — measured over 501 systemd shards, 67 of
+        // the 281 obligation symbols were such orphans and the 62 that
+        // hard-errored at link were exactly them.
+        //
+        // The query is sound at this point because it runs on the
+        // pre-lowering `func` IR, where every reference to a global is a
+        // real `FlatSymbolRefAttr` symbol use (`emitrust.global_load` /
+        // `global_store` / `global_addr` / `global_place`) — the same basis
+        // `firstSymbolUseLoc` and `containUndefinedExternGlobal` already
+        // rely on. The one opaque-text initializer the importer builds is a
+        // fn-ptr `Some(<name>)`, which names a FUNCTION, never a global. A
+        // `nullopt` result means the walk hit an op it could not analyze;
+        // that stays conservative and keeps the obligation.
+        //
+        // Deliberately globals only: after `ConvertToEmitRust` a call is
+        // `emitrust.call_opaque "name"`, a STRING and not a symbol use, so
+        // "unreferenced" cannot be decided soundly for a FUNCTION
+        // obligation. Those keep the hard rejection (see the func loop
+        // below and test/Driver/link-merge-errors.c).
+        std::optional<SymbolTable::UseRange> uses = SymbolTable::getSymbolUses(
+            StringAttr::get(module.getContext(), entry.getKey()),
+            module.getOperation());
+        if (uses && uses->empty())
+          continue;
         OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
         auto declOp = moduleBuilder.create<emitrust::GlobalOp>(
             entry.getValue().loc, moduleBuilder.getStringAttr(entry.getKey()),
@@ -7689,4 +7738,60 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
                                MLIRContext &context) {
   return importCProject(paths, extraClangArgs,
                         /*compilationDatabasePath=*/"", context);
+}
+
+//===----------------------------------------------------------------------===//
+// Printing an imported module (FR-135)
+//===----------------------------------------------------------------------===//
+
+/// The first `cf.switch` case label in `module` that MLIR's CUSTOM `cf.switch`
+/// assembly cannot spell round-trippably, or a null op when there is none.
+///
+/// `printSwitchOpCases` prints `APInt::getLimitedValue()` — the ZERO-extended
+/// label — and `parseSwitchOpCases` reads it back with
+/// `parseInteger(int64_t)`. A label that fits in 63 bits therefore always
+/// survives (an `i32` label of `-2` prints `4294967294`, parses as
+/// `4294967294` and is truncated back to `-2`); a label that needs the 64th
+/// bit prints as a decimal above `i64::MAX` that the parser refuses outright.
+static cf::SwitchOp findUnreadableSwitchCase(ModuleOp module,
+                                             uint64_t &offendingValue) {
+  cf::SwitchOp offender;
+  module.walk([&](cf::SwitchOp switchOp) {
+    std::optional<DenseIntElementsAttr> caseValues = switchOp.getCaseValues();
+    if (!caseValues)
+      return WalkResult::advance();
+    for (const llvm::APInt &value : caseValues->getValues<llvm::APInt>()) {
+      if (value.getActiveBits() <= 63)
+        continue;
+      offender = switchOp;
+      offendingValue = value.getLimitedValue();
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return offender;
+}
+
+void mlir::emitrust::printRoundTrippableModule(ModuleOp module,
+                                               llvm::raw_ostream &os) {
+  uint64_t offendingValue = 0;
+  cf::SwitchOp offender = findUnreadableSwitchCase(module, offendingValue);
+  if (!offender) {
+    module.print(os);
+    return;
+  }
+  {
+    InFlightDiagnostic diag =
+        offender.emitRemark()
+        << "switch case value " << offendingValue
+        << " has no round-trippable spelling in the custom 'cf.switch' "
+           "assembly, so this module is printed in MLIR's generic form";
+    diag.attachNote()
+        << "upstream cf.switch prints case values unsigned and parses them "
+           "signed, so the custom form would not re-read; the generic form "
+           "is lossless";
+  }
+  OpPrintingFlags flags;
+  flags.printGenericOpForm();
+  module.print(os, flags);
 }

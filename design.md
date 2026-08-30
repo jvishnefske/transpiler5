@@ -10155,7 +10155,114 @@ piece and becomes FR-45.
   LLVM-exception, which is compatible with AGPL-3.0 for a combined work.
   **NEEDS AN OWNER DECISION.**
 
-- [ ] FR-161 (FR-158 Phase 3, split out 2026-08-29 so the remaining work is
+- [ ] FR-164 (proposed 2026-08-29; OWNER DECIDED 2026-08-30 -- "everything is
+  meson forever"): MIGRATE THE BUILD FROM CMAKE TO MESON.
+  PHASE 1 LANDED 2026-08-30. The deciding question below was answered NO --
+  this project will not build against a non-monolithic MLIR -- so the migrate
+  branch is the live one. What landed, and what is measured:
+  * `install: true` on the five executables in `tools/meson.build` (meson
+    installed NOTHING before this; it was the only real gap), and `flake.nix`
+    swapping cmake for meson plus `llvmPackages.llvm.dev` for `llvm-config`.
+  * `.github/workflows/ci.yml` switched: `meson setup/compile/test -C build`
+    replaces cmake+ninja+check-emitrust, and the c-testsuite ledger step now
+    points at `build/tools/emitrust-cc` (the meson layout) instead of
+    `build/bin/`.
+  * CLAUDE.md's Build section rewritten: meson is canonical, the CMakeLists
+    are explicitly NOT and must not receive new sources.
+  * VALIDATED: `nix build .#emitrust` through the meson derivation exits 0 and
+    installs all five tools under the same names, so `nix/corpus`'s contract
+    (`${emitrust}/bin/emitrust-cc`) still holds and the binary runs; the full
+    gate is 944/944 (650 fast + 294 EndToEnd), zero failures.
+  REMAINING, deliberately not in this increment: delete the 27 CMakeLists.txt
+  once CI has been green for a few days; decide PDLL explicitly
+  (`EMITRUST_ENABLE_PDLL` is CMake-only and default OFF, so it dies with them
+  unless ported); sweep the residual `build/bin/` defaults in
+  `test/Fuzz/*`, `nix/explore/*`, `nix/clippy-eval/*` (all env-overridable,
+  none load-bearing).
+  THE ORIGINAL ANALYSIS, kept because the reasoning is the record:
+  MEASURED, in a nix sandbox from a clean HEAD export (a genuine cold build):
+  a meson-based derivation builds and installs all FIVE tools under the SAME
+  names, so `nix/corpus`'s only contract (`${emitrust}/bin/emitrust-cc` and
+  `emitrust` on PATH) is satisfied. Total change is TWO files: `install: true`
+  on the five executables in `tools/meson.build` (today meson installs
+  NOTHING -- that was the only real gap), and `flake.nix` swapping cmake for
+  meson plus `llvmPackages.llvm.dev` for `llvm-config`. Patch preserved at
+  `<scratchpad>/meson-migration.patch`.
+  THE ARGUMENT CUTS BOTH WAYS, and FR-163 is the evidence. CMake caught a real
+  link defect that meson structurally cannot see -- but that defect EXISTS
+  ONLY BECAUSE CMake demands hand-maintained per-component lists. Under meson
+  there is no `MLIRParser` line to forget; the dependency is one dylib. CMake
+  did not detect a bug in the code, it detected a bug in its own bookkeeping,
+  which it also created.
+  WHAT WOULD GENUINELY BE LOST: the ability to build against an MLIR with no
+  monolithic dylib. `meson.build:61-67` globs for `libMLIR.so*` and hard-errors
+  if absent; Debian/Fedora MLIR packages commonly ship only per-component
+  static archives. That costs nothing while everything is nix, but it
+  forecloses `apt install libmlir-dev` builds permanently. Note you never fully
+  escape CMake either -- meson reads `MLIR_INSTALL_PREFIX` out of
+  `MLIRConfig.cmake` (`meson.build:55`).
+  SO THE DECIDING QUESTION IS NOT CMAKE-VS-MESON. It is: will this project ever
+  need to build against a non-monolithic MLIR?
+  * No, nix forever -> migrate. Order: land the 2-file patch (additive and
+    reversible, CMake keeps working) -> switch CI (`.github/workflows/ci.yml`
+    is CMake-only, 3 steps plus the c-testsuite runner, all already inside
+    `nix develop`) -> run both green for a few days -> delete the CMake files
+    -> decide PDLL EXPLICITLY (`EMITRUST_ENABLE_PDLL` is CMake-only and
+    default OFF; `CMakeLists.txt:19` already calls the C++ patterns "the
+    shipping default", so it dies with CMake unless ported) -> update
+    CLAUDE.md, which still says "CMake stays canonical for CI".
+  * Yes or unsure -> keep CMake and take the cheap guard instead: a scan for
+    "source includes an MLIR component header, CMakeLists omits the
+    component", wired into the fast lit tier. It runs in under a second and
+    would have caught FR-163 before it reached a build.
+  UNVERIFIED: an actual `nix build .#<corpus>` end to end (only the contract
+  SHAPE was checked), and `meson test` inside CI's nix environment.
+  **NEEDS AN OWNER DECISION.**
+
+- [x] FR-163 DEFECT (found 2026-08-29 by an agent diagnosing a nix build
+  failure; FIXED the same day): THE CMAKE BUILD -- which CLAUDE.md names as
+  CANONICAL FOR CI -- DID NOT LINK. `emitrust-clang` failed with
+      undefined reference to `mlir::parseSourceString(llvm::StringRef,
+        mlir::Block*, mlir::ParserConfig const&, llvm::StringRef, ...)`
+  `lib/Conversion/ConvertToEmitRust/CanonicalRoundTrip.cpp:26` includes
+  `mlir/Parser/Parser.h` and calls `parseSourceString` at :128, but that
+  library's `CMakeLists.txt` never declared `MLIRParser`. Latent since FR-134
+  (`75ad4a8`) landed the canonicalization pipe.
+  FIX: one line -- `MLIRParser` in that library's `LINK_LIBS PUBLIC`.
+
+  WHY THE 910-TEST GATE CANNOT SEE THIS, and it is a real hole in the oracle
+  hierarchy rather than a one-off: meson links the MONOLITHIC `libMLIR.so`
+  (`meson.build:61-73`, resolved by glob), which already contains
+  `parseSourceString`, so a missing per-COMPONENT dependency is structurally
+  invisible to every test we run. CMake links per-component archives, where
+  it is fatal. The entire suite can be green while CI is broken.
+
+  TWO CONTROLS OF MINE WERE INVALID BEFORE ONE WAS RIGHT, both worth
+  recording because the failure mode is subtle:
+  * I first tested `emitrust-opt` and got a clean link, and concluded the
+    diagnosis was wrong. `emitrust-opt` is IMMUNE -- it links `MLIROptLib`,
+    which pulls the parser transitively. I had tested the wrong target.
+  * A hand-rolled `python -c` revert silently did not write, so a later
+    "control without the fix" still HAD the fix and returned a meaningless
+    green. Confirm a revert with `grep -c` or `git diff --stat`; prefer
+    `git checkout -- <file>`.
+  Only with `MLIRParser` verifiably absent (`grep -c` = 0) and a forced
+  relink does `emitrust-clang` fail. That is the measurement the fix rests on.
+
+  THE PROPOSED PATCH WAS ONE LINE TOO LONG. It also added `MLIRParser` to
+  `tools/emitrust-clang/CMakeLists.txt`, on the claim that PUBLIC propagation
+  does not reach an explicit `set(LIBS ...)` + `target_link_libraries(PRIVATE
+  ${LIBS})` line and that the tool-level edit "is the one that actually fixes
+  the link". Measured false: the library-level declaration ALONE links
+  `emitrust-clang` at rc=0, and it is the principled fix -- declare the
+  dependency where the code uses it. All five CMake tools build.
+  A tree scan for the same defect class (source includes an MLIR component
+  header, CMakeLists omits the component) found exactly this one instance.
+  RECORDED, NOT ACTED ON: a cheap guard for this class -- scan sources for
+  MLIR component includes and diff against the CMakeLists -- would have
+  caught it in the fast tier. Worth wiring in if CMake is kept.
+
+- [x] FR-161 PHASE 1 LANDED 2026-08-29 (FR-158 Phase 3, split out so the remaining work is
   indexed): A SCALAR-OBJECT ARGUMENT AT A SLICE PARAMETER. `f(&x)` where `x`
   is a scalar local or a struct field and the defining TU classifies that
   parameter as a slice. This is the ENTIRE residue of FR-158 Phases 1+2 --
@@ -10173,39 +10280,1025 @@ piece and becomes FR-45.
   `reimportFactStarvedGroups` rescues the pair by joint re-import and the
   divergence never materializes.
 
-  DIRECTIONS. The FR-158 spike listed three and preferred stubbing; I think
-  it mis-ranked them, on semantics:
-  * `::std::slice::from_mut(&mut x)` is SEMANTICALLY EXACT, not a
-    workaround. C's `f(&x)` passes a pointer to ONE object and the callee
-    may legally touch only `p[0]`; a one-element slice is precisely that
-    range, and `p[1]` becomes a Rust PANIC where C has undefined behaviour
-    -- the safe failure direction this project already prefers. The open
-    question is purely mechanical: `emitrust.slice_of`'s verifier accepts
-    `lvalue<array>` and `lvalue<slice>` bases only
-    (`lib/EmitRust/EmitRustOps.cpp:1343-1385`), so this needs either a
-    widened verifier or a new op. The emitter already renders `::std::`
-    paths since FR-150, so the rendering side is precedented.
-  * Stub the enclosing caller at the merge under the FR-52 marker contract.
-    The spike measured this SUFFICIENT to make the whole systemd crate
-    compile, but it silently deletes 55 functions' behaviour, and
-    `--link --incremental` does NOT recover at the merge (measured under
-    FR-158), so there is no existing recovery path to hang it on.
-  * Import the caller's scalar as a one-element array: unbounded blast
-    radius on every caller. Rejected by the spike; I agree.
+  SPIKED GO-with-constraints 2026-08-29, in a FENCED form stronger than this
+  entry proposed. Phase 1 in TDD.
 
-  OPEN QUESTION TO SETTLE FIRST, because it may merge two backlog items:
-  FR-158's Phase 4 residue (7 functions, `&mut (*p)[v..]` reborrowed through
-  a `&`-typed slice parameter) may be THE SAME DEFECT as FR-153 (E0596
-  mutable borrow through a shared reference, 35 crates). Check before
-  spiking either.
-  **NOT SPIKED.**
+  MY SEMANTIC ARGUMENT ABOVE WAS OVERRULED BY THE PROJECT'S OWN RECORD, and
+  that is the most useful thing the spike found. I claimed a `p[1]` panic is
+  the safe failure direction because it turns C UB into a defined abort. This
+  project has decided the OPPOSITE for this exact shape TWICE: FR-75's landed
+  record says "the previously-ACCEPTED trait shape `helper(&x, 1)` (address of
+  a scalar) deliberately flips to the located address-of-scalar rejection --
+  fidelity over coverage, recorded", and `test/Import/C/pointers-param-invalid.c`
+  pins precisely `int first(int *a){return a[0]+a[1];}` called as `first(&x)`
+  as a rejection. Measured unfenced: C prints `1 2` at rc 0, Rust prints
+  nothing and panics `index out of bounds: the len is 1 but the index is 1` at
+  rc 101. My argument is right for a DEFINED C program; the project's is right
+  for a callee that may WALK. The fence is the synthesis.
 
-- [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28): 35 crates fail
-  `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`
+  THE FENCE: admit the rewrite only when the definition's own parameter
+  provably touches ELEMENT 0 ONLY, following forwards TRANSITIVELY
+  (`deref -> subscript[0]`, and `deref -> slice_of[0] -> call_opaque` when the
+  forwarded slot also passes; memoised, cycle-safe). Everything else --
+  dynamic or non-zero index, `call_indirect`, `addr_of`, an `args`-remapped
+  call, a missing definition -- declines to the existing located rejection.
+  A SHALLOW fence is insufficient, measured: it rejects 3 of 60
+  (`parse_sec`, `pidfd_get_pid`, `read_attr_at`, which FORWARD the parameter)
+  and the crate then does not emit at all. The transitive fence admits 60/60
+  and yields a BYTE-IDENTICAL `lib.rs` to the unfenced version -- i.e. the
+  fence costs nothing and buys the whole behaviour guarantee.
+
+  MECHANISM, and this entry's central mechanical claim was WRONG: I wrote that
+  `slice_of`'s verifier accepts array/slice bases only "so this needs either a
+  widened verifier or a new op". Neither. `emitrust.call_opaque
+  "::std::slice::from_mut"` already carries results and prints an unknown
+  callee verbatim (`TranslateToRust.cpp:5117-5134`; the FR-110 `::` split and
+  FR-150's `shadowedPreludeNames` branch both miss the name). Zero dialect
+  change, ~120 lines in `LinkMerge.cpp` alone.
+  TWO SPELLING FACTS, both load-bearing: `::core::slice::from_mut` builds
+  under cargo but FAILS under bare `rustc` with E0433, and lit's EndToEnd
+  tests use rustc directly -- so `::std::` is the only safe spelling. The
+  LEADING `::` is required too, because FR-159 sinks items into `mod tu<N>`
+  where a relative `std::` could be shadowed. My "FR-150 already renders
+  `::std::` paths" was misleading: FR-150 renders PRELUDE-family paths through
+  `preludeQualifiedPath`; no `::std::` emission existed before this.
+
+  MEASURED: systemd 501-object link goes from NOT EMITTING (60 located
+  rejections) to emitting 12,265,476 bytes with 60 `from_mut`, and cargo drops
+  from 63 errors to SEVEN -- all E0596, all FR-153. Gate 910/910 with ZERO
+  golden shift, which means the coverage is the deliverable, not a formality.
+  Byte-diffed positive: the motivating repro (`q5`) and a write-through
+  out-parameter through a 3-object link (`11 22 8`), covering a scalar local
+  AND a struct field -- writes propagate back through `from_mut`.
+  An aliasing probe `f(&x,&x)` at two slice slots never reaches the merge; the
+  importer's existing located aliasing rejection catches it, so no new E0499.
+
+  DURABILITY, stated honestly: 28 of the 30 admitted callees pass the fence
+  because they are currently FR-52 `unimplemented!` stubs with no uses. As
+  later waves implement them the fence will re-reject some. 60/60 is not a
+  stable number; the decay direction is a located rejection, never a panic.
+
+  FR-161 ALONE DOES NOT PRODUCE A BUILDING WHOLE-PROGRAM CRATE. FR-161 +
+  FR-153 does.
+  PHASE 3, deferred with its own fence: the single-TU twin at
+  `ImportCExpressions.cpp:6296` ("the address of a scalar object cannot be
+  passed as a slice parameter"), worth ~124 `unimplemented!` sites across 46
+  of the 501 TUs. It collides head-on with FR-75 and with
+  `pointers-param-invalid.c`, so it needs an in-TU-definition requirement
+  (excluding body-less external requirements, so FR-75's NOREGION rejection
+  survives) plus the element-0 body scan. Do NOT bundle it with Phase 1.
+  PHASE 1 LANDED 2026-08-29. Gate 912/912 (910 + 2 new tests), ZERO existing
+  goldens shifted -- no byte of any emitted-Rust golden moved.
+
+  **THE 501-OBJECT SYSTEMD WHOLE-PROGRAM CRATE NOW EMITS**: rc=0, zero link
+  errors, 12,265,476 bytes, exactly 60 `::std::slice::from_mut` sites. cargo
+  drops from 63 errors to SEVEN, all E0596, all FR-153. Verified
+  independently, not on the agent's report.
+
+  THE FENCE WAS PROVED LOAD-BEARING BY ABLATION, which is the right way to
+  settle the argument I lost above. With the fence short-circuited to `true`,
+  both `link-slice-model-scalar.c` and `link-slice-model-invalid.c` fail, and
+  the non-zero-index program emits exactly the FR-75-forbidden shape:
+      pub fn first(a: &mut [i32], n: i32) -> i32 { a[0..] + a[1..] + n }
+      let v3: &mut [i32] = ::std::slice::from_mut(v2); first(v3, 1i32)
+  -- a guaranteed `index out of bounds` panic. Demonstrated, not asserted.
+
+  IMPLEMENTATION: `ElementZeroFence`, a memoised cycle-safe forward walk over
+  the definition's own parameter, constructed once per merge over the existing
+  `definitions` map (the prototype's global static was dropped and the map
+  threaded through instead). One improvement over the prototype: the forward
+  step checks EVERY operand position the borrow lands in, not just the first
+  match.
+  EMITTED FORM, measured -- the brief's implied `from_mut(&mut x)` never
+  appears, because the emitter always binds the `addr_of` to a `let` first:
+      let vN: &mut u32 = &mut x;
+      let vM: &mut [u32] = ::std::slice::from_mut(vN);
+  The tests pin that two-line form with a captured variable rather than a
+  substring, which is strictly tighter. Negative spellings (`core::`, a
+  relative `std::`) are asserted in a separate all-`-NOT` FileCheck run,
+  because inline NOTs only scan between ordered matches.
+
+  BYTE-DIFF, 3-object link, values seeded from argc, all three diffs empty:
+      k=0  11 22 8 34 5  rc=80     k=1  12 23 8 35 5  rc=83
+      k=2  13 24 8 36 5  rc=86
+  Writes propagate back through `from_mut` for both a scalar local and a
+  struct field, and the neighbouring field `s.b` stays 8 while `guard` stays
+  5 -- so the one-element view really is one element wide.
+  **PHASE 1 LANDED. FR-153 is now the only thing between this project and a
+  whole-program systemd crate that compiles.**
+
+- [x] FR-153 PHASE 1 LANDED 2026-08-30 (found by the systemd probe 2026-08-28; ROOT CAUSE FOUND
+  and MERGED WITH FR-158 PHASE 4 by the FR-161 spike 2026-08-29): 35 crates
+  fail `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`
   (src/core/manager, src/coredump/coredumpctl-journal, …). Exit-0 unbuildable,
   the FR-145 class again. Ranked last of the five because it is the only one
   that is not obviously narrow: it is a borrow-model question, not a naming or
   cast fix.
+
+  SAME DEFECT AS FR-158 PHASE 4 -- one item, not two. The 35-crate FR-153 set
+  carries 36 E0596 diagnostics whose enclosing functions are
+  `notify_on_cleanup`, `sd_journal_closep`, `sd_bus_creds_unrefp`,
+  `sd_netlink_message_unrefp`, `sd_lldp_neighbor_unrefp` -- systemd's
+  `DEFINE_TRIVIAL_CLEANUP_FUNC` idiom. FR-158 Phase 4's 7 link-mode functions
+  are the SAME FIVE NAMES with the SAME source text.
+
+  ROOT CAUSE, minimised to ELEVEN LINES in a single TU with no `--link` at
+  all: a C `T **p` parameter is a CTS-00204 CURSOR PARAMETER and lowers to TWO
+  inputs -- a SHARED region slice plus an `&mut i64` -- at
+  `lib/ImportC/ImportCFunctions.cpp:679-686`, where the base is pushed as
+  `emitrust::RefType::get(*sliceType)`. The body then has to reborrow that
+  shared base MUTABLY to hand the region to a callee whose slice parameter is
+  `&mut [T]`. Shapes: `let v3: &mut [i8] = &mut (*p)[v2 as usize..];` x19 and
+  `let v2: &mut SdJournal = &mut p[v1 as usize];` x13, plus 4 singletons.
+  CONSTNESS IS NOT THE TRIGGER, measured: `char **p` and `const char **p`
+  emit identically.
+  THIS IS WHAT MAKES THE WHOLE-PROGRAM CRATE BUILD. After FR-161 Phase 1 the
+  501-object systemd crate has SEVEN rustc errors and all seven are this.
+  Rank it immediately after FR-161 Phase 1.
+
+  PHASE 1 LANDED 2026-08-30, and it does. **THE 501-OBJECT `systemd-detect-virt`
+  WHOLE-PROGRAM CRATE NOW COMPILES**: `cargo build --release --offline` exits
+  0 with ZERO errors, producing a 23,431,416-byte `librlib` from 265,920 lines
+  of emitted Rust.
+
+  QUALIFY THAT IMMEDIATELY, because "it compiles" is weaker than it sounds and
+  I first reported it without this. Of the crate's 34,418 top-level functions,
+  **16,538 (48.1%) contain an `unimplemented!` stub** and would panic if
+  called; **17,880 (51.9%) have real bodies**. Zero `todo!` and zero bare
+  `panic!`. So the whole-program path is now END-TO-END TRAVERSABLE -- import,
+  merge, link, rustc -- on a real 501-TU program, which is what was actually
+  achieved. It is NOT a working systemd, and compiling is not behavioural
+  equivalence. The stubs are the FR-52 marker contract doing its job: loud,
+  located, never a silent wrong answer. Verified independently by regenerating all 501 shards with
+  the patched importer -- `--link` reads pre-built sidecars and does NOT re-run
+  the importer, so an importer patch measures byte-identical against a stale
+  shard directory. Gate 917/917 (912 + 5 new tests), ZERO golden churn.
+
+  NEITHER DIRECTION I PROPOSED WAS RIGHT. A third was measured and ships.
+  * (A) unconditional `RefType` -> `MutRefType`: fixes systemd 7->0 and 35/35
+    units with no regressions and one golden -- but hands `&mut` to all 888
+    cursor regions to buy what 816 need, with no proof attached. Two probes
+    price it: two cursor parameters over one region emit two simultaneously
+    live `&mut buf[0..]` (E0499), and a string-literal backing local gives
+    E0596.
+  * (B) honour const on slice parameters: NO-GO on three measured counts. It
+    fixes AT MOST 2 OF THE 7 -- five are struct-element cleanup handlers over
+    genuinely non-const callees (`sd_journal_close`, `sd_bus_creds_unref`,
+    `sd_netlink_message_unref`), which const fidelity cannot reach by
+    construction. B1 alone is a NET REGRESSION: 64 of 357 previously-clean
+    systemd units break. And it collides fatally with FR-158 --
+    `sliceRefinedSlots` requires `MutRefType` on BOTH sides, so the link
+    fails with 3458 errors across 114 symbols, minimally reproduced by the
+    in-tree `EndToEnd/link-slice-order-e2e.c`. Note the cost is NOT where I
+    guessed: golden churn is 11 tests, small; the expense is the link.
+  * (C) DEMAND-DRIVEN, which ships: the cursor region borrows mutably IFF the
+    callee's own body demands it -- the only admitted demand being `*p`
+    passed onward to a slot that maps to `MutRefType`. Writes through the
+    cursor are already a located rejection. MISSING A DEMAND IS THE SAFE
+    DIRECTION: it leaves today's behaviour and today's E0596, never a
+    miscompile. 816 signatures widen and ZERO body or call-site lines change
+    in the 12.27 MB crate.
+
+  TWO FENCES COMPLETE IT.
+  * R1 -- a string-literal backing rematerializes a fresh non-const
+    `VariableOp`, byte-for-byte the pattern that already existed for ordinary
+    mutable slice arguments at `ImportCExpressions.cpp:6149-6174`; the
+    cursor-argument path simply never got it.
+  * R2 -- two cursor arguments over one region with a mutating callee is a
+    LOCATED rejection ("two cursor arguments walk the same region and the
+    callee needs a mutable region borrow"), replacing a silent downstream
+    E0499/E0596. Zero false positives across 749 units.
+
+  MY FRAMING OF THE ALIASING CASE WAS WRONG: two `&mut` is E0499, a COMPILE
+  ERROR, not UB -- safe Rust cannot alias `&mut`. So it argues against (A) by
+  cost, not soundness, and it was not even the decisive reason; the
+  string-literal backing is a second, independent, and fixable one.
+
+  DELIBERATE OVER-REJECTION, recorded: R2 also refuses two cursors over one
+  string literal, which R1 could in principle admit (each argument would get
+  its own copy, unobservable since writing through a literal pointer is UB).
+  Kept because the zero-false-positive measurement was taken against that
+  predicate and the extra rejection is the safe direction.
+  COVERAGE LIMIT, recorded: across 1427 clean units, 911 DEFINE a
+  cursor-parameter function and ZERO CALL one, so the caller-side work (R1,
+  R2, the `is_mut` propagation) is INVISIBLE to the systemd oracle. All
+  caller evidence comes from the lit tests and hand-built probes. A green
+  whole-program build must not be read as covering it.
+  DEFERRED with a comment at the decision site: whether the demand scan should
+  follow a region through a local copy (`q = *p; g(q);`). Not hit in 749 units
+  or 917 lit tests; missing it leaves today's E0596.
+  **PHASE 1 LANDED. Phase 2 (B2 + extending `sliceRefinedSlots` to classify
+  `mut_ref<T> -> ref<slice<T>>` with a `from_ref` twin of FR-161's fenced
+  `from_mut`, both in ONE increment or the link fails 3461 ways) remains
+  optional -- it buys const fidelity, not a build.**
+
+- [x] FR-165 ANSWERED 2026-08-30 (opened the same day from the first whole-program stub census):
+  THE 16,538 STUBS ARE NOW THE RANKING SIGNAL for what to fix next, and this
+  is the first time the project can measure them over a WHOLE PROGRAM rather
+  than per unit. Census over the 501-object systemd crate, reasons normalised
+  by replacing quoted names with 'X':
+      5265  call to unimported function 'X'
+      2898  declaration inside a function body
+      1700  null pointer constant in a pointer expression
+      1174  pointer expression: CallExpr
+       666  array parameter
+       642  comparison of pointers into different objects
+       509  call to 'X' declared in a system header
+       455  pointer assigned a non-address value
+       370  pointer parameter used outside a direct dereference
+       329  taking the address of a pointer variable
+       273  pointer struct member 'X' outside the static-binding model
+       196  call to a variadic function
+       188  pointer cast (ArrayToPointerDecay)
+  ANSWERED 2026-08-30 by measurement, and THE CENSUS ABOVE IS WRONG -- not by
+  a little. It counted RAW stub sites in the emitted lib.rs, which is a
+  per-TU tally: a construct in a header is counted once per INCLUDING TU.
+  Deduplicating the link ledger by (file:line:col, symbol) collapses 77,105
+  raw item lines to **13,673 distinct items -- a 5.6x fan-out factor**, and
+  it inverts the ranking. Per-entry corrections:
+      call to unimported function   5265 raw ->  452 distinct  (11.6x)
+      declaration in a function body 2898 raw ->  187 distinct  (15.5x)
+      null pointer constant          1700 raw ->  114 distinct  (14.9x)
+  I flagged the second as "suspiciously large for what sounds like a parser
+  limitation". It was, and the reason was fan-out, not the cascade I guessed.
+
+  THE DEDUPED RANKING. 10,721 distinct DROPPED, 2,952 distinct STUBBED:
+      dropped                              stubbed
+      3294  rejected-type-cascade           452  call to unimported function
+      1866  ptr-to-ptr-shape-escape         389  pointer-local-nonaddress
+      1636  ptr-to-ptr                      326  address of a pointer variable
+      1449  incomplete struct type          259  pointer expression: CallExpr
+      1086  returned-pointer                193  variadic-cross-tu
+       658  void pointer parameter          187  declaration in a function body
+       343  pointer type outside a param    139  self-ref-pointer-member
+  The POINTER MODEL is the deep front, exactly as the original probe said, and
+  now with a defensible number: ptr-to-ptr-shape-escape + ptr-to-ptr +
+  returned-pointer + void-pointer-param + pointer-outside-param =
+  **5,589 distinct drops, 52% of all drops.** Second is `incomplete struct
+  type` at 1,449.
+
+  THE LEVERAGE RESULT, and it is the actionable one: the LARGEST deduped drop
+  category is `rejected-type-cascade` at 3,294 -- items dropped only because a
+  TYPE they name was rejected first -- and **86 DISTINCT ROOT TYPES ACCOUNT
+  FOR ALL OF THEM.** The top twelve explain 2,423 (74%):
+      700 SdVarlinkSymbol   358 SdBus        188 JournalFile   179 SdDevice
+      152 SdVarlink         151 HashOps      143 SdEventSource 137 NlaPolicy
+      126 JsonStream        110 SdVarlinkInterface  105 SdJsonVariant
+       74 SdVarlinkServer
+  So ~30% of all drops are downstream of 86 structs, and one struct
+  (`SdVarlinkSymbol`) gates 700 items by itself. That is the highest
+  leverage ratio this project has measured. The next question -- unanswered
+  here -- is WHY those 86 are rejected; if they root in `incomplete struct
+  type` or the pointer model, the two fronts are one.
+  METHOD, now confirmed rather than warned about: a raw stub count is not a
+  defect count. Dedupe by location before ranking anything. This is the third
+  time the project has been bitten by reading per-occurrence counts as yields
+  (FR-61f twice, at 7x and 4.4x; this at 5.6x aggregate and 15x on a single
+  entry).
+  ROOT-CAUSED 2026-08-30, and the answer changes the ranking again. Of the 86
+  roots, 59 have their own rejection in the ledger; those 59 gate 2,315 items:
+      1226  pointer type outside a parameter position
+       550  union type
+       253  enumerator value does not fit in i32
+       188  volatile-qualified type
+       977  (root's own rejection not present in this log -- unresolved)
+  So the two fronts are PARTLY one: the largest cascade root IS a pointer-model
+  limitation. But #2 and #3 are not, and they are the interesting ones.
+
+  THE TRANSITIVE-CLOSURE RANKING (direct drops + everything each root gates)
+  INVERTS THE RAW ORDER for exactly the items a naive ranking buries:
+      TOTAL  direct  gated  reason
+       1866    1866      0  ptr-to-ptr parameter escapes the cursor shape
+       1636    1636      0  ptr-to-ptr parameter
+       1576     350   1226  pointer type outside a parameter position   (4.5x)
+       1449    1449      0  incomplete struct type
+        796     788      8  returned pointer value
+        658     658      0  void pointer parameter
+        574      24    550  **union type**                              (23x)
+        452     452      0  call to unimported function
+        278      25    253  **enumerator value does not fit in i32**    (11x)
+  The top two are LEAF blockers on functions -- zero amplification. The two
+  starred rows are type-level and massively amplified: by direct count they
+  rank 24th and 25th, near the bottom; by transitive weight they are 7th and
+  9th. That inversion is the entire point of the exercise.
+  **ANSWERED. Follow-ons filed as FR-166 (enum width) and FR-167 (union
+  type), chosen for leverage-per-effort, not raw frequency.**
+
+- [x] FR-166 PHASE 1 LANDED 2026-08-30 (opened the same day from the FR-165 root-cause pass): AN ENUM WITH
+  ANY ENUMERATOR OUTSIDE i32 RANGE IS REJECTED WHOLE, gating 278 items (25
+  direct + 253 cascaded, 11x amplification) across 19 distinct enums.
+  `lib/ImportC/ImportCAggregates.cpp:2034-2039` refuses the enum if any
+  enumerator is outside `[INT32_MIN, INT32_MAX]`.
+  THE C IS DELIBERATE AND IDIOMATIC, not exotic: systemd's
+  `_SD_ENUM_FORCE_S64(JSON_FORMAT_FLAGS)` macro appends an out-of-range
+  enumerator precisely to force the enum to 64-bit width. Every flags enum in
+  `sd-json.h`, `sd-varlink.h` etc. carries it, which is why 19 enums and the
+  `SdJsonVariant` / `SdVarlink*` type families all fall over.
+  WHY IT LOOKS TRACTABLE: `variantValues` is ALREADY `SmallVector<int64_t>`,
+  so the value survives; and the comment immediately below the rejection says
+  the emitted enum's storage "follows clang's underlying type choice", so a
+  width notion already exists. The likely work is widening the emitted
+  backing type and the `emitrust.enum_raw` place, not inventing a
+  representation.
+  SPIKED 2026-08-30: **GO for a WIDE-ONLY Phase 1, but it CANNOT LAND ALONE.**
+  11 sites assume 32-bit storage; 8 need changing, 3 are width-agnostic
+  (verified by reading, not assumed). Prototype 212 lines / 6 files.
+  MEASURED PAYOFF, over identical 501-shard regenerations with the ledger
+  deduped: **471 items resolved** (20 direct + 451 cascaded), **146 newly
+  surfaced** second-layer blockers that were previously unreachable, **net
+  -325**. My 278 projection was low on resolved and high on net. Direct drops
+  are 20, not 25; the "19 distinct enums" figure was right.
+  Byte identity holds: 281/281 EndToEnd byte-diffs pass, all crate goldens
+  pass, zero emitted bytes move. The only 3 failures are the negative tests
+  that pin the very rejection being removed -- they are rewrites, not repairs.
+  Byte-diff oracle with a wide enumerator USED at runtime (`wide.c`, the
+  verbatim force-macro shape over assignment, comparison, switch, truncating
+  casts, by-value params and `sizeof`): BYTE-IDENTICAL to the clang native.
+
+  **BLOCKER, and it is the reason this cannot ship alone: FR-166 BREAKS THE
+  501-OBJECT WHOLE-PROGRAM LINK.** At HEAD both the `extern` declaration of
+  `VL_INTERFACE_IO_SYSTEMD` and its definition are dropped as
+  `rejected-type-cascade` on `SdVarlinkInterface` -- symmetric, so no
+  obligation exists. Once `SdVarlinkInterface` imports, the DECLARATION
+  becomes a real `emitrust.extern_decl` obligation while the DEFINITION is
+  still dropped for an unrelated reason (`non-constant global initializer`),
+  and the asymmetry is a hard `unresolved external`. 48 of 501 shards had to
+  be excluded to get a building crate. That is FR-52's marker contract
+  working as designed; it is filed as FR-168 and gates this.
+
+  A MISCOMPILE IN THE OBVIOUS EXTENSION, measured, and the reason Phase 2 is
+  split out: relaxing the 32-bit UNSIGNED range without first fixing
+  `castEnumToI32` is a byte-diff miscompile.
+      enum M { M_A = 1, M_MID = 2147483648u, M_MAX = 4294967295u };
+      native: cmp 1 1 1        rust: cmp 1 0 1
+  `castEnumToI32` (`ImportCExpressions.cpp:7370`, 8 call sites) casts BOTH
+  relational operands to SIGNED i32 regardless of the enum's unsigned
+  underlying type, so `4294967295 as i32 == -1`. HEAD is safe only because
+  the range guard makes such a value unreachable. Filed as FR-169.
+  The WIDE path is not exposed: values above `INT64_MAX` stay rejected by
+  `isRepresentableByInt64`, so signed-at-i64 comparison always agrees with
+  unsigned (verified).
+
+  PREMISE OF THIS ENTRY FALSIFIED: the guard is not about 64-bit values at
+  all. It rejects `value < INT32_MIN || value > INT32_MAX` EVEN WHEN THE
+  STORAGE IS ALREADY u32, so `enum M { M_MAX = 0xFFFFFFFFU }` -- which fits
+  today's storage exactly -- is refused. glibc's `EPOLL_EVENTS`
+  (`EPOLLET = 1u<<31`) is rejected for that reason, not the 64-bit one.
+  ALSO FALSIFIED: FR-149/anonymous enums are very nearly a NON-issue. A wide
+  enumerator that is DECLARED BUT NOT REFERENCED in an anonymous enum already
+  works at HEAD, because `mapType` returns plain i32 before `importEnum` is
+  ever called. Only a REFERENCED wide anonymous enumerator is rejected, at a
+  different line (`ImportCExpressions.cpp:7343`). Separate, smaller, stays.
+
+  CROSS-TU SHAPE KEY: the entry's comment ("signedness is derived from the
+  values") is FALSE for C++ fixed underlying types, and measurably so -- two
+  TUs declaring `enum G : int` and `enum G : unsigned int` dedup SILENTLY at
+  HEAD into one `enum_def @G` with no signedness attribute. I verified this
+  myself and must QUALIFY the spike's framing: it is LATENT, NOT LIVE.
+  Signed and unsigned representations diverge only above 2^31, and those
+  values are rejected today by the very guard FR-166 removes. So it is not a
+  bug to fix BEFORE FR-166; it is a fence that must land WITH it (add
+  signedness+width to the key, one line).
+
+  OPERATIONAL, for whoever implements: adding any inherent attribute to
+  `EnumDefOp` INVALIDATES every previously-emitted `.o.emitrust.mlirbc`
+  shard -- measured, `error: attempting to parse a byte at the end of the
+  bytecode`. `--link` gives no compatibility warning, just a parse error.
+  Shards must be regenerated whenever the dialect changes.
+  PHASE 1 LANDED 2026-08-30, once FR-168 cleared the orphan-obligation
+  blocker. Gate **923/923**, 501 shards, **zero exclusions**, whole-program
+  crate 12,371,799 bytes, `cargo build --release --offline` **0 errors** --
+  all verified independently by regenerating every shard, not on the agent's
+  report. `does not fit in i32` occurrences: **1165 -> 6**. Ledger
+  13,922 -> 13,597: resolved 469, newly surfaced 144, **net -325**.
+  **17 `_SD_ENUM_FORCE_S64` enums now emit** (`SdJsonVariantTypeT(pub i64)`,
+  the `SdVarlink*FlagsT` family) against ZERO at HEAD, and zero cross-TU enum
+  conflicts were introduced across 501 TUs -- the shape-key change is
+  additive on the real corpus.
+
+  **THE SPIKE'S OWN PROTOTYPE CONTRADICTED THE CONSTRAINT, and the
+  implementer caught it.** `fr166-proto.patch` relaxed the non-wide gate to
+  `unsignedUnderlying ? isUInt<32> : isInt<32>` -- which IS the FR-169
+  relaxation. That is also the real reason the spike's logs recorded a
+  fast-tier FAIL it had reported as "3 negative tests": the prototype
+  silently admitted `enum Big { HUGE_V = 3000000000 }` (clang types it
+  `unsigned int`). The shipped version keeps the non-wide gate at SIGNED
+  `isInt<32>` in both the importer and `EnumDefOp::verify`, so 6 systemd
+  enums (`epoll.h`'s `EPOLLET = 1u<<31`, `barrier.h`, `bus-creds.c`) stay
+  REJECTED rather than being admitted as u32 and miscompiled through
+  `castEnumToI32`'s `as i32`. Following the stated invariant over the
+  reference implementation is what kept FR-169 out of the tree.
+
+  BYTE IDENTITY, measured rather than argued: `--emit=rust` AND `--emit=mlir`
+  hashed for all **992** C/C++/H sources under `test/` before and after --
+  **exactly 2 of 992 differ, both the new tests.**
+  The 144 newly-surfaced items are downstream of admission, not regressions:
+  types that never got imported now reach the pointer gates (`ptr-to-ptr` 39,
+  `returned-pointer` 20, ...).
+  The `enum_raw` verifier wording changed (`a 32-bit` -> `a 32- or 64-bit`)
+  and its `invalid.mlir` leg moved from `i64`, now legal, to `i16`.
+
+  OPERATIONAL LESSON worth keeping: **`git apply -3` STAGES its result**, so
+  a following `git checkout -- <file>` is a silent no-op that restores the
+  patched file and invalidates any control run. Correct spelling is
+  `git restore --staged` first, or `git checkout HEAD -- <file>`. Caught by
+  `grep -c` on a marker before trusting the control -- the same discipline
+  recorded after an earlier failed revert this session.
+  **PHASE 1 LANDED. Phase 2 (the 32-bit unsigned range) stays blocked on
+  FR-169's miscompile.**
+
+- [x] FR-168 SLICE 1 LANDED 2026-08-30 (found by the FR-166 spike): AN
+  `emitrust.extern_decl` OBLIGATION CAN OUTLIVE THE REJECTION OF ITS OWN
+  DEFINITION, turning a symmetric pair of drops into a spurious
+  `unresolved external` at link.
+  A symbol whose declaration AND definition are both dropped is harmless --
+  no obligation, no reference. But if anything makes the DECLARATION
+  importable while the DEFINITION is still dropped for an unrelated reason,
+  the obligation becomes a hard link error with no escape hatch
+  (`tools/emitrust-cc/LinkMerge.cpp:1068`).
+  Measured on `VL_INTERFACE_IO_SYSTEMD` (`varlink-io.systemd.h:6:35`): at HEAD
+  both sides cascade off `struct SdVarlinkInterface`, so the link is clean;
+  under FR-166 the declaration imports and the definition still fails
+  `unsupported: non-constant global initializer`
+  (`varlink-io.systemd.c:20:1`), and the 501-object whole-program link dies.
+  48 shards had to be excluded to get a building crate.
+  THIS GATES FR-166 and will gate every future fix that makes a previously
+  cascaded type importable -- which is the whole point of the FR-165 leverage
+  work, so it will recur.
+  TWO DIRECTIONS, neither prototyped:
+  (a) LINK POLICY -- when a shard records that a symbol's DEFINITION was
+      rejected, the merge should demote the matching obligation to a
+      drop-with-cascade rather than a hard error. The shards already carry
+      per-item rejection ledgers, so the fact is available at merge time.
+      This is the general fix and the one I would try first.
+  (b) fix `non-constant global initializer` for the
+      `SD_VARLINK_DEFINE_INTERFACE` shape -- narrower, and it only moves the
+      problem to the next asymmetric symbol.
+
+  SPIKED AND SLICE 1 LANDED 2026-08-30. Gate 919/919, zero golden churn, and
+  the 501-object whole-program crate is BYTE-IDENTICAL (md5
+  94212b085d286af18045a3e5005ce388, 12,268,740 bytes) -- verified myself by
+  regenerating all 501 shards, not on the agent's report.
+
+  **MY ROOT CAUSE ABOVE IS WRONG, and so was my severity.** The obligation
+  does not outlive the rejection of its DEFINITION; it outlives the rejection
+  of its **USE**, and the definition side is incidental. `pendingExternGlobals
+  .try_emplace` (`ImportCGlobals.cpp:602`) is a permanent side effect;
+  `RecoveryCheckpoint` (`CImporterInternal.h:1937`) holds only `anchor` and
+  `erasedExternalClones`, so `rollbackTo` (`ImportCRecovery.cpp:156`) erases
+  the func ops but leaves the registration; `finalizeProject`
+  (`ImportC.cpp:7003`) then materializes the obligation UNCONDITIONALLY. Its
+  own comment ("falling back to the declaration when no IR use survives")
+  shows the case was known and unhandled. The obligation is an ORPHAN --
+  nothing in the whole program references it.
+
+  **AND IT IS A LIVE HEAD DEFECT, not a future risk gating FR-166.** I filed
+  it as the latter. A NINE-LINE SINGLE-TU C FILE reproduces at plain HEAD,
+  which I verified myself:
+      struct Iface { int x; };
+      extern const struct Iface vl_iface;
+      int use_it(int n) { int r = vl_iface.x + n; __asm__ volatile ("nop"); return r; }
+      int main(void) { return 0; }
+      -> error: unresolved external 'VL_IFACE' at link
+  I TOLD THE SPIKE NOT TO HAND-REDUCE, having failed three times myself. It
+  reduced it anyway. The two ingredients I kept missing: the rejection must
+  land AFTER the body has registered the global (a signature-time rejection
+  never registers it), and the symbol must be a GLOBAL -- an extern FUNCTION
+  prototype is correctly restored by `erasedExternalClones`. All three of my
+  attempts used the wrong shape.
+
+  FIX (slice 1, 31 lines, importer-side): `finalizeProject` skips
+  materializing a deferred `extern_decl` GLOBAL whose symbol has no surviving
+  IR use, queried on the pre-lowering func IR where the reference is still a
+  real symbol use. Fixes it at the source, so shard artifacts, the item graph
+  and the rejection report all stay honest and no link policy changes.
+
+  THE CONSTRAINT THAT BROKE THE SPIKE'S FIRST PROTOTYPE: a function pointer
+  in a global initializer is raw Rust text (`#emitrust.opaque<"Some(f)">`),
+  invisible to symbol tables -- `Driver/link-merge-fnptr.c` caught it. The
+  shipped predicate is globals-only, and the implementer CONFIRMED BY
+  ENUMERATION (every `OpaqueAttr::get` site in the importer) that a
+  pointer-to-GLOBAL never becomes opaque text: those paths fall out at
+  `non-constant global initializer` first. FUNCTION obligations stay hard
+  rejections, which is also what keeps `link-merge-errors.c`'s `add` leg an
+  error -- the predicate separates the two cleanly, unlike FR-154's rename.
+
+  CORPUS SIZING, the number that matters for planning: at HEAD there are ZERO
+  unresolved obligations, but **3,095 symbols** have a drop on both the
+  declaration and definition side and are defined in no shard -- the
+  population that becomes an obligation the moment the declaration side
+  becomes importable. 857 cascade on both sides (roots `SdVarlinkSymbol` 115,
+  `SdBus` 105, `SdDevice` 57, ...) and revive together; **127 are already
+  cause-asymmetric FUNCTIONS with real call sites** (`sd_bus_call`,
+  `sd_bus_add_match`, ...) which this fix deliberately does NOT help. Every
+  FR-165 root-type fix touching `SdBus` turns those into hard errors. Filed
+  as FR-171.
+  Shard churn measured 6 of 501, each differing by exactly one removed
+  `emitrust.global ... {emitrust.extern_decl}` line -- exactly the
+  orphan-bearing units. (The spike's 18 was measured under the FR-166
+  prototype, which admits more units; the implementer caught and explained
+  the discrepancy rather than matching my number.)
+  ALSO RECORDED, not fixed: `LinkMerge.cpp:1068` returns on the FIRST
+  unresolved external, unlike the FR-158 divergence path directly above it
+  which reports all of them -- that is what forced a 12-iteration exclusion
+  loop during the spike. Filed as FR-172.
+  **SLICE 1 LANDED. Slice 2 (link-side defence in depth for stale shards)
+  remains optional.**
+
+- [ ] FR-171 NO-GO 2026-08-30, POPULATION ZERO (opened the same day by the FR-168 spike's corpus sizing): 127
+  CAUSE-ASYMMETRIC FUNCTION SYMBOLS with real call sites will become hard
+  `unresolved external`s as soon as their declaration side becomes
+  importable. `sd_bus_call`, `sd_bus_add_match`, `memstream_finalize`, ...
+  Their declaration side is dropped by `rejected-type-cascade` while their
+  definition side has an independent blocker, mostly `pointer-to-pointer
+  parameter escapes the cursor-parameter shape`.
+  FR-168 slice 1 deliberately does NOT help these: they HAVE surviving call
+  sites, so orphan-dropping is unsound, and after `ConvertToEmitRust` a call
+  is `emitrust.call_opaque "name"` -- a string, not a symbol ref -- so
+  "unreferenced" cannot be decided for a function at all.
+  SPIKED 2026-08-30: **NO-GO, and the entry's central premise is FALSE.**
+
+  THE 83 (not 127) CANNOT BECOME OBLIGATIONS, because their declaration side
+  is blocked TWICE. `planCursorParamsFor` (`ImportCPlanning.cpp:3513`) only
+  runs on `func->getBody()`, so a BODY-LESS declaration never reaches
+  cursor-parameter planning; it hits `ImportCTypes.cpp:1242` instead, which
+  rejects a data `T**` parameter UNCONDITIONALLY. All 83 of 83 carry such a
+  parameter. Fixing `SdBus` changes the recorded REASON from
+  `rejected-type-cascade` to `ptr-to-ptr`; the symbol stays dropped and no
+  obligation is created.
+  MEASURED COUNTERFACTUAL: "if `SdBus` became importable tomorrow, how many
+  hard errors appear?" -- **zero**. Its 105 cascade-only items revive on both
+  sides; its 34 ptr-to-ptr items stay dropped on both sides. Also measured
+  and closing the other route: **0 record/enum symbols are rejected in one
+  shard and imported in another**, so record importability is TU-invariant
+  across the corpus and no root fix can be partial across TUs.
+  I verified the double block myself: with a fully importable `struct MS` and
+  no cascade anywhere, `int mf(struct MS *, char **, unsigned long *);` still
+  rejects.
+
+  AND THE DISCRIMINATOR I PROPOSED IS UNSOUND. Joining on the ledger's bare
+  symbol SWALLOWS THE HONEST `unresolved external`: an opaque forward
+  declaration in one header and a complete one in another is everyday C, and
+  it makes a genuinely missing library symbol silently stub. Reproduced in 9
+  lines -- `a.o` alone errors, `a.o b.o` returns rc=0 with a silent
+  `unimplemented!()`. **THE FULL 928-TEST GATE PASSED WITH THAT HOLE OPEN**,
+  because `link-merge-errors.c`'s shard carries no rejections at all. Same
+  shape that killed FR-154's rename: gate-green and wrong.
+  Root cause of the unsoundness: `RejectedItem` (`include/EmitRust/ImportC.h:47`)
+  cannot distinguish a rejected DEFINITION from a rejected body-less
+  DECLARATION. Two sound repairs exist if this ever becomes live -- join on
+  the item graph's `kind=function def=1`, which is ALREADY serialized and
+  ALREADY parsed at link time (`emitrust-cc.cpp:1530`) and needs no artifact
+  change; or add a `bool definition` ledger field where old shards decode
+  `false` and degrade to today's hard error.
+
+  THE STUB CASCADE ITSELF IS SOUND BUT UNNEEDED. Prototyped: gate 928/928,
+  whole-program crate byte-identical, and `unimplemented!()` has type `!` so
+  there is no path to a wrong VALUE -- only diverge-at-runtime or
+  fail-to-compile. Byte-diffed: a stub that IS called panics loudly
+  (exit 101) where the native prints `8`; a stub NOT called is byte-identical,
+  including a `Some(g)` fn-pointer target. It also exposed a real defect to
+  carry forward: two shards holding an obligation for one symbol materialize
+  two stubs and hit `redefinition of symbol named 'dd'`.
+  WHAT IT WOULD CHANGE is the failure mode -- "the toolchain refuses to emit"
+  becomes "the crate builds green and aborts at runtime" -- which is a POLICY
+  decision, not a correctness one, and it must carry a located warning per
+  stub or the porting ledger lies.
+
+  LANDED INSTEAD, per the spike's recommendation: FR-172 batching, plus a
+  TRIPWIRE test (`test/Driver/ptr-to-ptr-decl-no-link-obligation.c`) pinning
+  the `ImportCTypes.cpp:1242` rejection that makes the 83 safe. **The day the
+  pointer-model front lifts that for body-less declarations without lifting
+  the definition side, the tripwire flips and FR-171 becomes live work** --
+  gated on 1242, not on FR-165.
+  TWO CORRECTIONS TO MY OWN VERIFICATION, both found by the implementer and
+  both strengthening the argument: I quoted the declaration-side wording as
+  `escapes the cursor-parameter shape`, but that is
+  `ImportCPlanning.cpp:3532` and in my own probe it came from `use`, the
+  DEFINITION -- the declaration gets the unconditional type-level
+  `unsupported: pointer-to-pointer parameter`. And in my probe shape the
+  caller is DROPPED, not stubbed, because forwarding `b` is itself a
+  cursor-shape escape, so my probe never demonstrated the
+  callee-dropped -> caller-stubbed edge at all; the test sources its `char **`
+  from a decayed file-static instead.
+  **NO-GO, POPULATION ZERO. Fence landed; revisit only if the tripwire flips.**
+
+
+- [x] FR-172 LANDED 2026-08-30 (opened the same day by the FR-168 spike): the unresolved-external
+  report is NOT BATCHED. `tools/emitrust-cc/LinkMerge.cpp:1068` returns on the
+  FIRST one, while the FR-158 signature-divergence path directly above it
+  reports every diverging obligation before giving up. On a 501-object link
+  that turns one diagnosis into a 12-iteration exclude-and-retry loop, which
+  is exactly what the FR-166 spike had to do to reach a building crate.
+  Small, mechanical, and it pays for itself the next time a wave makes a
+  cascaded type importable.
+  LANDED 2026-08-30, 16 insertions. The unresolved arm now joins the FR-158
+  accumulator instead of returning. Verified myself: four missing symbols
+  reported 1 before, **4 after**. `obligations` is a `SmallVector`, so report
+  order is declaration order and deterministic -- the test pins it ordered,
+  not `-DAG`. Gate 930/930; `link-merge-errors.c`, `link-merge-fnptr.c` and
+  `link-orphan-extern-global.c` all pin the single-symbol wording and pass
+  verbatim. Corpus byte-identical at 12,413,334 with cargo 0 errors.
+  **LANDED.**
+
+- [x] FR-169 PHASES A+B LANDED 2026-08-30 (MISCOMPILE, found by the FR-166 spike;
+  I FILED IT AS UNREACHABLE AND THAT WAS FALSE -- it was LIVE AT HEAD):
+  `castEnumToI32` THROWS AWAY THE ENUM'S SIGNEDNESS at 8 call sites
+  (`lib/ImportC/ImportCExpressions.cpp:7370`, called from `:172, 845, 1610,
+  1611, 1901, 7394`, `ImportCStatements.cpp:5927`, `ImportC.cpp:2194`),
+  casting BOTH relational operands to signed i32 whatever the underlying
+  type. Measured byte-diff once the range is opened:
+      enum M { M_A = 1, M_MID = 2147483648u, M_MAX = 4294967295u };
+      native: cmp 1 1 1     rust: cmp 1 0 1        (4294967295 as i32 == -1)
+  HEAD is safe ONLY because the i32-range guard makes such a value
+  unreachable -- i.e. the guard FR-166 removes is load-bearing for
+  correctness, not merely for representation. This must be fixed BEFORE any
+  32-bit-unsigned range relaxation: the relational path needs an unsigned
+  `emitrust.cmp` rather than a signed `arith.cmpi`.
+  Payoff inside systemd is ~2 items, but `EPOLL_EVENTS` is a GLIBC enum, so
+  the reach past systemd is much wider.
+
+  **THE "UNREACHABLE" PREMISE WAS FALSE. THIS WAS A LIVE MISCOMPILE AT HEAD**,
+  and I verified the refutation myself:
+      enum M { M_A = 1, M_B = 2 };          /* BOTH enumerators in i32 range */
+      enum M x = (enum M)(argc > 100 ? 1u : 3000000000u);
+      printf("%d %d %d\n", x > y, x < y, x == y);
+      native: 1 0 0        emitted crate: 0 1 0
+  No out-of-range enumerator, no FR-166 patch, ordinary well-defined C.
+  MY REASONING ERROR, stated plainly so it is not repeated: I assumed the
+  i32-range guard on ENUMERATORS bounded the values an enum-typed OBJECT can
+  hold. It does not. C17 6.7.2.2 makes the enum type compatible with an
+  implementation-chosen integer type and clang picks `unsigned int` whenever
+  no enumerator is negative, so storing 3e9 into a two-enumerator enum is
+  legal C. The guard is load-bearing for the ENUMERATOR half only.
+  Scale: a 16-shape value-driven battery shows **5 of 16 shapes miscompile at
+  HEAD**, all of them enum-vs-enum relational (`<`, `>`, `<=`, `>=`, in
+  expressions, in `while`, in `for`). The other 11 -- call arg, widening and
+  narrowing casts, `_Bool`, shifts, bitwise, unary minus, `~`, `+`, ternary,
+  `&&` -- are correct at HEAD and stay correct.
+
+  FIX (Phase A): `castEnumToPromotedInt` beside `castEnumToI32`, used at
+  `ImportCExpressions.cpp:1631-1632` ONLY, emitting `emitrust.cmp lt/le/gt/ge`
+  when the promoted type is unsigned. Signedness comes from the `EnumDefOp`'s
+  `unsigned_underlying` marker, NOT from clang's promoted type -- clang
+  promotes a no-negative-enumerator enum object to `unsigned int` even when
+  every value fits `int`, so a promoted-type-driven cast would have moved
+  bytes for every such enum. Casting to `ui32` also lets `isIdentityCastTail`
+  fire, so the tail COLLAPSES and the output gets SHORTER:
+      (state.0 as i32) > BusState::BUS_UNSET.0 as i32   ->   state.0 > BusState::BUS_UNSET.0
+
+  ALL SIX OTHER SITES LEFT ALONE, each with a measured reason: `:172` is
+  CORRECT today (C17 6.4.4.3 gives an enumeration constant type `int`,
+  confirmed by AST dump) and only breaks under Phase 2; `:854`/`:1943` are
+  `!= 0`, signedness-neutral; `:7470` is an array index where out-of-range is
+  UB either way; `ImportCStatements.cpp:5927` is safe by accident because the
+  emitter's `as i32 as u32 as usize` chain is BIT-PRESERVING, verified at
+  3000000000 and 4294967295; `ImportC.cpp:2194` is synthetic with variants
+  `0..N-1`.
+
+  PHASE B, a NINTH seam the audit missed: `ImportCExpressions.cpp:799`
+  (`CK_IntegralToFloating`) never normalized an enum source, so `arith.sitofp`
+  got an enum operand. Now fixed through the same helper.
+  QUALIFY MY OWN CLAIM: I called that error "unlocated". Only HALF true --
+  the implicit form (`double d = x;`) is unlocated, the explicit `(double)x`
+  IS located. The implementer measured both and pinned the working behaviour
+  rather than a rejection wording.
+
+  CHURN, which I had called the main risk: **1 lit golden**
+  (`test/Import/C/enums.c`, a deliberate rewrite from `arith.cmpi slt` to
+  `emitrust.cmp lt`), 1 of 986 sources, and the 501-object corpus goes
+  **12,413,334 -> 12,412,646 bytes (-688)** with cargo 0 errors -- 43 changed
+  line-pairs across exactly two enums (`BusState`, `UnifiedSection`). Smaller
+  output, not larger.
+  ALSO CORRECTED BY MEASUREMENT: the truth-test shape was ALREADY `ui32` at
+  HEAD, because clang inserts its own promotion ahead of
+  `CK_IntegralToBoolean`, so `:854`'s enum branch is never reached for it. A
+  CHECK asserting otherwise failed AFTER the fix and was corrected.
+  Gate 934/934. Byte-diffed at 4 argc seeds over both enum flavours, plus the
+  16-case battery, all clean.
+  PHASE C LANDED 2026-08-30 TOGETHER WITH FR-166 PHASE 2, in one increment
+  because Phase 2 alone is a measured silent miscompile. Gate **938/938**;
+  corpus 12,412,646 -> 12,415,236 bytes, cargo **0 errors**.
+  Site `:172` now casts to `mapType(ref->getType())` rather than hard i32,
+  falling back to `castEnumToI32` when the mapping is not an `IntegerType`.
+  Verified myself after landing: `(unsigned long)M_MAX` gives 4294967295 in
+  both native and crate, where the Phase-2-only build gave
+  18446744073709551615.
+  THE MIXED FAILURE DIRECTION WAS REPRODUCED before fixing, exactly as
+  predicted: with Phase C reverted, one shape miscompiles silently while
+  three others fail as located rejections (`assigned value type does not
+  match the place`, `conditional operator arm type mismatch`). That is why
+  the two could not be staged separately.
+
+  THE ENTIRE CORPUS DELTA IS `EPOLL_EVENTS` BEING ADMITTED -- 84 lines, the
+  `EpollEvents` type plus `poll_events_to_epoll` / `epoll_events_to_poll`
+  going from `unimplemented!` stubs to real bodies. Ratchet moves monotone
+  forward: admitted 33,620 -> 33,623, rejected 74,918 -> 74,916,
+  `enum-def-rejected` 6 -> 5.
+
+  FOUR THINGS MY BRIEF GOT WRONG, all caught by measurement:
+  * THREE pins flipped, not one. Besides `u32max.c`, `isUInt<32>` also admits
+    `enums-invalid.c`'s BIG leg (`HUGE_V = 3000000000`) and
+    `cpp-enum-class-invalid.cpp`'s BIGVAL leg -- the latter was a LIVE
+    fast-tier failure. All three flipped forward to positive CHECKs.
+  * **The `does not fit in i32` diagnostic is now UNREACHABLE from C and
+    C++.** Clang widens the underlying type rather than hand the importer a
+    32-bit enum with an out-of-range enumerator, and
+    `enum class E : int { V = <out of int> }` is a hard clang error. The i32
+    leg survives only at the DIALECT VERIFIER, so new `@U32NoMarker` /
+    `@U32TooBig` pins were added to `invalid.mlir`.
+  * **Verifier check ORDERING had to change.** With the relaxation as
+    prototyped, `enum_def @Neg ["A"] [-1] {unsigned_underlying}` hit the range
+    check first and degraded the pinned negativity wording. The implementer
+    fixed the IMPLEMENTATION (negativity check ahead of range), not the test.
+  * **Phase C is NOT byte-identical for WIDE unsigned enums**, contrary to my
+    "byte-identical for every in-range enumerator". Clang gives the
+    DeclRefExpr the enum's PROMOTION type, which for
+    `enum WU { WU_B = 5000000000ULL }` is `unsigned long` -- so those
+    references move from signless `i64` to `ui64`. Every admitted wide value
+    is <= INT64_MAX so the bits agree; the new shape is pinned.
+  Also added, unasked and correctly: a C++ EndToEnd test, because the gate is
+  shared and C++ reaches enum-to-integer conversion through a DIFFERENT seam
+  (a C++ enumerator reference has the enum type, so Phase C never fires for
+  it) -- measured byte-clean rather than argued by analogy.
+  **THE ENUM ARC IS COMPLETE: FR-166 phases 1+2 and FR-169 phases A+B+C all
+  landed. Values above INT64_MAX remain a located rejection.**
+
+- [ ] FR-174 (opened 2026-08-30 from the closing whole-program measurement):
+  THE POINTER MODEL IS NOW 66% OF EVERYTHING, and it has never been a filed
+  item -- it is the "deep front" the original systemd probe named in prose and
+  nobody indexed.
+  MEASURED at HEAD after the enum and union waves, 501-object corpus, ledger
+  deduped by `(file:line:col, symbol)` and weighted by transitive closure:
+      TOTAL  direct  gated  reason
+       1866    1866      0  pointer-to-pointer parameter escapes the cursor shape
+       1701    1701      0  pointer-to-pointer parameter
+       1592     353   1239  pointer type outside a parameter position
+       1463    1463      0  incomplete struct type
+        853     845      8  returned pointer value
+        713     713      0  void pointer parameter
+        629     629      0  non-constant global initializer
+        442     442      0  pointer assigned a non-address value
+        365     365      0  taking the address of a pointer variable
+  **Pointer-family weighted total: 8,775 of 13,342 distinct items (66%).**
+
+  THE LEVERAGE ARC IS DONE, and this is the evidence: cascade ROOT TYPES fell
+  from **86 gating 3,294** (FR-165's opening census) to **57 gating 2,004**.
+  FR-166 and FR-167 phase 1 between them retired 29 root types and ~1,290
+  gated items. There is no remaining type-level fix with 20x amplification;
+  the cheap leverage is spent and what is left is the front itself.
+
+  DECOMPOSITION, because "fix the pointer model" is a wish, not an item. The
+  8,775 split into at least five distinct mechanisms that should be spiked
+  SEPARATELY and are NOT one fix:
+  * `T**` parameters (3,567 combined) -- the cursor-parameter shape and its
+    escape. Note `ImportCTypes.cpp:1242` rejects a data `T**` on a BODY-LESS
+    declaration unconditionally, which is what FR-171 measured as
+    load-bearing; any change here must keep FR-171's tripwire honest.
+  * `pointer type outside a parameter position` (1,592, and the ONLY one with
+    real amplification at 3.5x) -- the highest leverage-per-effort candidate
+    remaining, and the natural successor to FR-166/FR-167.
+  * `incomplete struct type` (1,463) -- opaque-pointer idiom; note FR-168
+    measured that a TU which only sees the forward declaration never names
+    the type, so this may be narrower than it looks.
+  * `returned pointer value` / `pointer return type` (853+).
+  * `void pointer parameter` (713).
+  PRIOR ART THAT CONSTRAINS THIS: FR-136 recorded a measured NO-GO on the
+  points-to analysis that was meant to unlock the `T**` family, and FR-61f-c
+  established that the blocker there is REPRESENTATION, not aliasing. Do not
+  re-attempt points-to without a new idea AND the byte-diff suite in the loop.
+  RANK: `pointer type outside a parameter position` first, on amplification.
+  **NOT SPIKED.**
+
+- [x] FR-170 LANDED 2026-08-30 (found by the FR-166 spike, reproduced on
+  unmodified HEAD): `scf.index_switch` REJECTS `case INT64_MAX` as a
+  duplicate, with no enum or emitrust code involved.
+      switch (t) { case 0: ...; case 9223372036854775807LL: ...; }
+      error: 'scf.index_switch' op has duplicate case value: 9223372036854775807
+  ROOT CAUSE, verified in the LLVM source rather than guessed:
+  `scf::IndexSwitchOp::verify` (`mlir/lib/Dialect/SCF/IR/SCF.cpp:3778`) uses a
+  `DenseSet<int64_t>`, and `DenseMapInfo<T>::getEmptyKey()` for an integral
+  `T` is `std::numeric_limits<T>::max()`
+  (`llvm/include/llvm/ADT/DenseMapInfo.h:113`). Inserting `INT64_MAX` probes
+  an empty bucket, `isEqual(Val, EmptyKey)` fires, and `insert().second`
+  returns false. `INT64_MIN` is fine; `INT64_MAX - 1` (the tombstone)
+  happens to survive.
+  Reproducers `<scratchpad>/fr166/sw4.c` (fails) and `sw5.c` (control).
+  Real systemd never writes `case _SD_..._INT64_MAX:`, so it did not affect
+  any corpus measurement -- but INT64_MAX is exactly the value the
+  `_SD_ENUM_FORCE_S64` macro plants, so an FR-166 test that switches over one
+  of those enums will hit it. Same class as FR-135 (upstream cf.switch
+  negative case value).
+  LANDED 2026-08-30. We cannot patch LLVM, so the fix makes our tooling stop
+  LYING: a new func-nested pass ahead of `lift-cf-to-scf` detects the value
+  and emits an honest located diagnostic naming the real cause, with a note
+  explaining the `DenseSet` empty key. **The old message was located but
+  FACTUALLY WRONG** -- it told the user to look for a duplicate that does not
+  exist. Deliberately NOT worked around by remapping case values: that would
+  be a silent representation change on a correctness-sensitive path.
+  FENCE IS EXACTLY ONE VALUE WIDE, pinned by two byte-diffed controls:
+  `INT64_MIN` and `INT64_MAX - 1` both still emit and match the native.
+  MY TOMBSTONE REASONING REFINED: the `DenseMapInfo` tombstone for `int64_t`
+  is `max()-1` rather than `min()` specifically because `int64_t` is `long`
+  on LP64 and `DenseMapInfo` special-cases `long` -- so the observation was
+  right for the reason given, and both neighbours are now pinned.
+  Cannot reject anything that previously compiled: `lib/Conversion` has NO
+  conversion pattern for `cf::SwitchOp`, so every such switch already failed,
+  either with the false duplicate or with a legalization failure.
+  Reach verified rather than parroted: the `_SD_ENUM_FORCE_S64` shape
+  (`_H_FORCE = 0x7fffffffffffffff` plus a switch over it) hits the fence with
+  the new wording, so FR-166 phase 2 made this reachable from ordinary
+  systemd headers.
+  **LANDED.**
+
+- [x] FR-167 PHASE 1 LANDED 2026-08-30 (opened the same day from the FR-165 root-cause pass): THE `union
+  type` REJECTION gates 574 items (24 direct + 550 cascaded, **23x
+  amplification -- the highest measured in the corpus**).
+  By direct count it is 24th and would never be picked; by transitive weight
+  it is the 7th largest blocker in a 501-TU program. FR-78 already built an
+  opaque-union representation, so the question is not "can unions be
+  represented" but WHICH unions still take this rejection and why -- start by
+  splitting the 24 direct sites by message (`union with a pointer arm` 12,
+  `union with an unnamed arm` 4, and a bare `union type` remainder are all
+  visible in the deduped ledger) rather than treating it as one item.
+  SPIKED 2026-08-30: **GO-with-constraints, in two phases behind a PHASE 0 of
+  three HEAD defects the spike measured on the way.** Amplification re-measured
+  on the post-FR-166 ledger and unchanged: 574 total, 24 direct, 550 gated.
+
+  **MY MECHANISM STORY WAS WRONG, and the correction makes this far smaller.**
+  FR-78's opaque diversion lives INSIDE `collectUnionSlot`
+  (`ImportCAggregates.cpp:1868`), reached only for a union that has a TYPE --
+  a named member. The anonymous-union flattening path in
+  `collectRecordFields` NEVER CALLS IT. So the fix is a ROUTING change -- stop
+  flattening a union that cannot flatten, and let the ordinary union import
+  handle it -- not a widening of `allArmsAggregate`. Proof: six systemd union
+  shapes rewritten as NAMED members, and FOUR OF SIX already import today,
+  unchanged, via FR-78.
+
+  MY REFRAMING ("550 are cascades that only need representability") is
+  DIRECTIONALLY RIGHT BUT NUMERICALLY WRONG. Measured: 317 items really do
+  unblock (`HashmapBase` 70, `DnsResourceRecord` 59, `Hashmap` 41,
+  `OrderedHashmap` 36, `HwAddrData` 35, `Set` 34, ...) and they do NOT
+  re-reject on arm access, so the core claim holds. But 226 then hit a second,
+  unrelated blocker, overwhelmingly the pointer model (`void pointer
+  parameter` 55, `returned pointer value` 40, `ptr-to-ptr` 29). Net ledger
+  movement 91 (phase 1) / 127 (phase 2); symbols going blocked -> clean 23/44.
+  My 550 is a ~1.7x overcount at the unblock layer and ~6x at the net layer.
+  Both phases: cargo build 0 errors; raw `unsupported: union type` 118 -> 7 -> 2.
+
+  ALSO FALSIFIED: FOUR bare-`union type` sites, not three (1629, 1633, 1730
+  and 1738, `anonymousUnionArmLeaf`'s empty-arm case); 16 symbols at 11
+  locations, not 14; and `--link` does NOT accept `--incremental`.
+
+  **METHOD CORRECTION, and it invalidates something I have been relying on:
+  the 992-source hash sweep is BLIND TO `split-file` SUB-UNITS.** It reported
+  0 of 992 changed while SIX lit tests flipped, every one a `split-file` test.
+  Good first filter; only the lit suite detects that class. Never report
+  "zero golden churn" from the sweep alone.
+
+  PHASE 1 (smallest): run the existing flatten as a TRIAL under a
+  `ScopedDiagnosticHandler` (the idiom already at `:261` and `:1102`); on
+  failure roll back `fieldNames`/`fieldTypes`/`unionSlotStorage` and append
+  the union as a synthesized-named member via ordinary `mapType`, re-emitting
+  the captured trial diagnostics verbatim if the union import ALSO fails so
+  every residual rejection keeps its exact location and wording. No new op, no
+  new attribute, no change to `collectUnionSlot` or `allArmsAggregate`.
+  PHASE 2: the same trial/rollback INSIDE `collectUnionSlot`, falling back to
+  the sizeof blob when the union is C, non-empty, and has no bit-field or
+  incomplete-array arm -- this subsumes all four widening candidates at once.
+  Byte identity holds by construction: the fallback only runs where today's
+  code returns `failure()`.
+  Phase 2's own cost, to weigh: it converts 131 items into a NEW blocker class
+  (`global initializer for this type`), because FR-78 admits only the all-zero
+  constant on a blob. Still nets better than phase 1.
+  C++ stays EXCLUDED, and phase 1 should gate on `!CPlusPlus` too even though
+  it measured clean, because `collectRecordFields` is shared and a
+  non-flattening anonymous union would newly reach `collectUnionSlot`.
+  PHASE 1 LANDED 2026-08-30, once FR-173 cleared phase 0. Gate **928/928**,
+  cargo **0 errors**, ledger net **-95**, **23 symbols blocked -> clean and
+  ZERO clean -> blocked**, crate 12,371,799 -> 12,413,334 bytes. Resolved: 20
+  direct `union type` plus the cascades they gated (`HashmapBase` 71,
+  `DnsResourceRecord` 59, `Hashmap` 41, `OrderedHashmap` 36, `HwAddrData` 35,
+  `Set` 34, `BusMatchNode` 12, `Sha256Ctx` 7, `Object` 5).
+  My own five-line reproduction now imports in BOTH spellings; the asymmetry
+  is gone.
+
+  THE DIAGNOSTIC RE-EMISSION EARNED ITS KEEP IMMEDIATELY. Because the trial's
+  diagnostics are replayed verbatim when the retry also fails, the WIDE leg I
+  had listed as needing a rewrite did NOT need one -- it keeps
+  `unsupported: union type` byte-for-byte at the same location. Shapes phase 1
+  cannot help keep their exact original vocabulary AND arm locations
+  (`union with a bit-field arm` still points at the ARM, not the union's `{`),
+  pinned by new `-NOT` lines that would fail if `collectUnionSlot`'s
+  vocabulary leaked through.
+
+  FR-173's BACKSTOP WORKED AS A DEVELOPMENT SIGNAL, exactly as predicted when
+  it landed an hour earlier. Short-circuiting the blob lookup and rebuilding
+  produces `error: member 'opaque' does not exist on struct 'S'` -- the
+  differential proof that the `ImportC.cpp:6175` peel half is load-bearing.
+  Without FR-173 that would have been a silent E0609 in a 12 MB crate.
+
+  **A PREMISE I PUT IN THE BRIEF WAS FALSE, and it invalidates a method I have
+  been using all session: LINK ORDER CHANGES EMITTED BYTES.** I wrote that
+  `fr173/objs.txt` reproduces the baseline exactly. It does not -- the same
+  501 shards in a different order give **12,373,168** instead of
+  **12,371,799**, same shard set, same 268,083 lines. Order drives `tu<N>_`
+  ordinals and first-occurrence-wins dedup. Any before/after corpus comparison
+  must use the SAME order on both sides or the delta is noise; the order that
+  reproduces the stored baselines is a shard directory's `_link-line.txt`
+  (whose lines carry stray `\x1b[K` escapes), not a globbed or reconstructed
+  object list. The implementer caught this and re-ran both sides in the
+  spike's order, so the numbers above are apples-to-apples.
+  Ledger net is -95 here vs the spike's -91; the order-independent figures
+  (9,224 -> 9,201 symbols, 23 unblocked, 0 newly blocked, 12,413,334 bytes)
+  match exactly, so that is dedup-key drift, not behaviour.
+  RECORDED: the synthesized field is `__u<n>`, matching the file's `__bits<n>`
+  convention, and it goes through `appendField` -- so a real C member spelled
+  `__u1` is a located collision, never a silent shadow.
+  **PHASE 1 LANDED. Phase 2 (the trial/rollback inside `collectUnionSlot`)
+  remains optional and carries its own 131-item `global initializer for this
+  type` cost.**
+
+- [x] FR-173 LANDED 2026-08-30 (opened the same day by the FR-167 spike): THREE DEFECTS AT HEAD,
+  all found while spiking unions, all independently worth fixing, and together
+  they are FR-167's phase 0.
+  (D1) FR-78's CROSS-TU OPAQUE-UNION SHAPE KEY IS NOT TU-STABLE.
+  `ImportCAggregates.cpp:566-570` folds
+  `arm->getType().getCanonicalType().getAsString()` into the dedup key, and
+  for a TAGLESS arm clang prints the path AS THAT TU's SourceManager RECORDED
+  IT. Measured, the same C union in two systemd TUs:
+      value@struct BusMatchNode::(unnamed at /tmp/.../build-sd/../src/...:54:17);
+      value@struct BusMatchNode::(unnamed at ../src/...:54:17);
+  -> `AnonD68F12F12597` vs `Anon33A9A5B7AD69`, both literally
+  `{opaque: [u8;16]}` -> the FR-58 merge sees the WRAPPER as structurally
+  different -> shape conflict -> TU-local demotion. Absolute-vs-relative
+  DIRECTORY prefix, not basename. Fix: location-free `PrintingPolicy` plus arm
+  size plus arm `getODRHash()`. Measured: per-TU modules 8 -> 1 (the HEAD
+  baseline), cargo 24 errors -> 0. LATENT SINCE FR-78.
+  (D2) A DEMOTED PER-TU MODULE EMITS NO `use super::*;`.
+  `TranslateToRust.cpp:4532` emits `mod <tuN> {` with no import, so any
+  demoted struct naming a crate-level type is rustc E0425. REPRODUCED AT HEAD
+  with unpatched tools in two C files. FR-167 does not create this; it makes
+  it reachable (7 extra demotions, 24 E0425s).
+  (D3) THE EMITTER ACCEPTS A BOGUS MEMBER SELECTION SILENTLY.
+  FR-78's marker check only inspects member ops whose BASE TYPE is the marked
+  union struct, so an `emitrust.member %0["opaque"]` emitted against the
+  PARENT struct passes and the crate dies at rustc E0609 (`no field 'opaque'
+  on type 'S'`). At HEAD `emitrust-translate` accepts the bogus selection with
+  rc=0. Needs a GENERAL structural backstop: every `emitrust.member` whose
+  base is a struct_def of this module must name a field that def actually has.
+  **It must run AFTER the FR-78 marker check** -- placed before, it shadows
+  the FR-78 wording and breaks `test/Target/Rust/errors.mlir:130`.
+  D3 MATTERS MOST: it is a MISSING BACKSTOP, so it silently admits a whole
+  class rather than one shape.
+
+  ALL THREE LANDED 2026-08-30. Gate **926/926** (923 + 3 new tests), zero
+  existing tests changed or shifted. D3 and D2 verified live at HEAD by me
+  before dispatch, and verified fixed after:
+      error: member 'opaque' does not exist on struct 'S'     (D3, was rc=0)
+      mod tu2 { use super::*;                                  (D2, was E0425)
+
+  THE ORDERING CONSTRAINT WAS MEASURED, NOT ASSUMED. The implementer built a
+  variant with the two emitter checks swapped and confirmed
+  `errors.mlir:130` breaks exactly as predicted, then pinned the ordering
+  in-tree with an `--implicit-check-not`, so a future reorder fails loudly
+  instead of silently shadowing the FR-78 wording.
+
+  D2's FIX IS CONDITIONAL, and that is a correction to my brief, which asked
+  for an unconditional import. Unconditional shifts the bytes of EVERY
+  existing `mod tu<N>` golden -- `module-items.mlir:59`,
+  `link-merge-module-sink.c:74`, `link-module-sink-e2e.c:33`,
+  `rust-module-fnptr-e2e.c:31` all use `CHECK-NEXT` right after `mod tuN {`
+  -- and rustc warns `unused import: 'super::*'` for a glob that brings in
+  nothing used. So the import is emitted only when the module reaches a
+  crate-root name it does not itself define, scanning the same reference
+  carriers FR-159's escape analysis enumerates.
+
+  ANSWER TO THE FR-159 QUESTION: it is the SAME CODE PATH. The emitter has
+  exactly one `mod` emission site, so "demoted per-TU module" and "FR-159
+  phase 1 sunk record" are the same thing -- the D2 reproducer IS an FR-159
+  sink. The existing sink tests keep passing only because their sunk `Buf`
+  has i32 fields and names nothing at the root; systemd's `mod tu314`
+  (`SwapEntries {swaps: i64, n_swaps: u64}`) is likewise a true negative.
+
+  CORPUS: 501 shards regenerated, crate **12,371,799 bytes -- exactly the
+  baseline**. D1 moves a hash input, so 86 of 501 shard `.mlirbc` files
+  changed and the crates differ by 123 lines that are ENTIRELY six
+  `Anon<hash>` renames; canonicalizing all 32 `Anon` names makes them
+  byte-identical. Link ledgers byte-identical modulo the shard directory
+  prefix. `cargo build` 0 errors on both.
+  D1's minimal reproducer is LOUDER than systemd's symptom: there the
+  divergence causes an outright `conflicting definitions of 'Node' at link`
+  rather than a TU-local demotion, because `Node` escapes through an
+  external-linkage signature so FR-159 cannot sink it. Same root cause.
+  RECORDED, not fixed: `EmitRustOps.td`'s `MemberOp` description still says
+  the named field is not cross-checked against the `struct_def` -- true of
+  the VERIFIER, which still does not; only the EMITTER now does.
+  HOUSEKEEPING: the canonical 501-object list moved to
+  `<scratchpad>/fr173/objs.txt`; the long-cited `fr151/objs.txt` was cleaned
+  up mid-session and briefs citing it will fail.
+  **LANDED.**
+
   **NOT SPIKED.**
 
 - [x] FR-154 DEFECT (found by the FR-151 spike 2026-08-29; DISSOLVED by
@@ -10437,8 +11530,62 @@ piece and becomes FR-45.
   had.
   RECORDED GAP for Phase 3, flagged at the emission site: FR-51 export mode
   still emits NO visibility on globals at all.
-  **PHASE 1 LANDED. Phase 2 (source-stem module names) and Phase 3 (statics
-  into modules, HELD behind FR-157/FR-158) remain.**
+  PHASE 2 SPIKED AND LANDED 2026-08-30: **GO**, with three guards the entry
+  did not name. Measured before dispatch, on the rebuilt 501-object
+  `systemd-detect-virt` link (12,415,236 bytes, exit 0):
+  * The crate contains exactly ONE module, and it is `mod tu314` == object
+    index 314 == `src/shared/hibernate-util.c`. So phase 2's realized effect
+    on the largest real link is ONE rename, `tu314` -> `hibernate_util`. The
+    entry's "798 modules called tu0..tu797" is a PHASE 3 figure and phase 3
+    is held; do not read it as this phase's prize. What phase 2 actually buys
+    is POSITION-INDEPENDENCE: the module name stops being a link-line
+    ordinal, so reordering the link line no longer renames a module.
+  * Stem uniqueness confirmed at 497/501, and all four duplicates
+    (`btrfs-util`, `label-util`, `mkdir`, `tmpfile-util`) are genuinely
+    different files separated by exactly ONE parent component
+    (`src/basic/mkdir.c` vs `src/shared/mkdir.c`), so climbing one directory
+    rank disambiguates every one of them WITHOUT falling back to an ordinal.
+  THREE GUARDS, each from a rustc probe rather than from reasoning:
+  * A module lives in the TYPE namespace: root `struct Buf` + `mod Buf` is
+    `error[E0428]: the name 'Buf' is defined multiple times`. But root
+    `fn mkdir` + `mod mkdir` COMPILES, and so does `static v` + `mod v`.
+    The reserved set is therefore struct/enum/data_enum/trait names ONLY --
+    reserving function and global names as well would have pushed a real
+    stem like `mkdir` back to an ordinal for no reason.
+  * `mod loop {}` is `error: expected identifier, found keyword 'loop'`, so a
+    keyword stem must fall back.
+  * The `tu<digits>` SHAPE is reserved: a source file named `tu3.c` must not
+    be able to steal shard 3's fallback name.
+  ONE DESIGN DECISION worth recording because the obvious alternative is
+  wrong: the ladder is climbed ONLY to break a genuine duplicate, never to
+  repair an invalid name. A rank>0 name embeds an enclosing DIRECTORY name,
+  which in the lit suite is an unstable temp path; climbing to fix a keyword
+  would have made goldens nondeterministic. Invalid at rank 0 => ordinal.
+  ALSO FOUND: `mergeLinkShards` step 0 calls `stripShardMetadata` BEFORE the
+  classify loop, so `getShardSource` must be read in that same loop -- the
+  source path is gone by the time the sink runs.
+  AS LANDED (274 lines in `LinkMerge.cpp`, one new Driver test with six legs
+  and one EndToEnd byte-diff; gate 944/944, up from 942 by exactly those two
+  files): VERIFIED INDEPENDENTLY on the 501-object link -- `mod tu314` ->
+  `mod hibernate_util`, 12,415,236 -> 12,415,263 bytes, and a
+  rename-substituted diff of the two crates is EMPTY, so the delta is exactly
+  3 occurrences x 9 characters and nothing else moved. The `tu314_*` STATIC
+  tags are untouched, which is the phase-3 boundary holding.
+  Two findings from the implementation, neither in the spike:
+  * The `tu<N>` shape guard was untested by the four legs the brief named,
+    so a TUSHAPE leg was added: a source named `tu0.c` at link position 1
+    emits `mod tu1`, not `mod tu0`. Without the guard it would have stolen
+    shard 0's fallback name.
+  * A CAPITALIZED stem now yields a capitalized module (`Gadget.c` ->
+    `mod Gadget`), a rustc `non_snake_case` WARNING in the emitted crate --
+    never an error, and the clippy ratchet stayed green. Lowercasing was
+    deliberately NOT done: it would manufacture collisions (`Mkdir.c` vs
+    `mkdir.c`) the ladder would then have to break.
+  The ROOTTYPE leg was checked with a NEGATIVE CONTROL -- renaming its file
+  `Widget.c` -> `Gadget.c` gives `mod Gadget` -- so it falls back because
+  `Widget` is in the reserved type set, not because the stem is capitalized.
+  **PHASES 1 AND 2 LANDED. Phase 3 (statics into modules) stays HELD behind
+  FR-157/FR-158.**
 
 - [ ] FR-160 FEATURE (opened by the repo owner 2026-08-29 out of the systemd
   probe): A C PROJECT'S OWN TEST SUITE IS A DIFFERENTIAL ORACLE THE EMITTER
@@ -11168,7 +12315,7 @@ piece and becomes FR-45.
   cursor-parameter shape`) -- crash converted to rejection, as the repo
   contract requires.
 
-- [ ] FR-135 DEFECT (UPSTREAM, found by FR-134's spike): MLIR's `cf.switch`
+- [x] FR-135 LANDED 2026-08-30 (UPSTREAM, found by FR-134's spike): MLIR's `cf.switch`
   CUSTOM assembly cannot round-trip a negative case value, so
   `emitrust-cc --emit=import` output is not always re-parsable by
   `emitrust-opt`. The printer emits the case value as an unsigned decimal
@@ -11187,6 +12334,43 @@ piece and becomes FR-45.
   back. FIX would be upstream in `cf.switch`'s printer (print signed when the
   case type is signless-with-negative-values, or always print via the
   attribute). **NOT SPIKED.**
+  LANDED 2026-08-30, direction (a) -- the output is now always re-parsable --
+  chosen ONLY AFTER measuring the blast radius, because MLIR's printing flags
+  are MODULE-WIDE (`AsmPrinter::printOperation` consults
+  `shouldPrintGenericOpForm()`, with no per-op escape). Scan of every `.c`
+  and `.cpp` under `test/` plus `third_party/c-testsuite`, 220 files, each
+  printed module fed back to `emitrust-opt`: **THREE** units produce a
+  non-round-trippable `cf.switch` (the entry said two -- the third is
+  `test/Import/C/switch-unsigned64.c`), and exactly ONE golden checks the
+  printed form. One file of churn is small, so (a).
+  The predicate is EXACT, not conservative: `APInt::getActiveBits() > 63`,
+  because `printSwitchOpCases` prints `getLimitedValue()` zero-extended while
+  `parseSwitchOpCases` reads `parseInteger(int64_t)`, so any label needing
+  <= 63 bits always survives -- verified empirically that an i32 `-2` prints
+  `4294967294` and re-parses back to `-2`, which the round-trip test pins as
+  byte-unchanged.
+  The fix covers `emitrust-import-c` too, not just `emitrust-cc --emit=import`
+  -- both print the same module and leaving them divergent would have been a
+  new inconsistency. `--emit=mlir` is unaffected because a `cf.switch` can
+  never reach it (no conversion pattern; it fails to legalize first).
+  The one golden was STRENGTHENED, not weakened: it previously carried the
+  comment "deliberately has no reparse pipe" and now has one, plus a
+  `CHECK-NOT` on the unreadable spelling.
+  **LANDED.**
+
+- [ ] FR-175 (opened 2026-08-30 by the FR-170 implementer): OUR OWN
+  `emitrust::SwitchOp::verify` CARRIES THE SAME UPSTREAM BUG.
+  `lib/EmitRust/EmitRustOps.cpp:1688` uses `llvm::DenseSet<int64_t>`, whose
+  empty key is `i64::MAX`, so hand-written `emitrust.switch` IR with
+  `case 9223372036854775807` fed to `emitrust-opt` gets OUR OWN false
+  `has duplicate case value` -- the exact diagnostic FR-170 just stopped
+  telling users.
+  UNREACHABLE FROM C SOURCE, because FR-170's fence fires first; it bites
+  only hand-written IR. Left out of scope deliberately to keep that change
+  small.
+  Worth doing if the honesty invariant should hold for hand-written IR too --
+  and it is a one-line fix (a `std::set` or an explicit sentinel check).
+  **NOT SPIKED.**
 
 - [x] FR-133 A NULLABLE FN-PTR LOCAL initialized from a literal `Some` needs
   no `Option` at all (LANDED 2026-08-29). Surfaced by FR-132, which made the

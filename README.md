@@ -44,7 +44,7 @@ no cleverness.
 ```sh
 nix develop                                            # LLVM/MLIR/Clang 21.1.8 + cargo, pinned
 cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DLLVM_EXTERNAL_LIT=$(which lit) && ninja -C build
-build/bin/emitrust-cc --emit=crate src/*.c -Iinclude -o mycrate --build
+build/tools/emitrust-cc --emit=crate src/*.c -Iinclude -o mycrate --build
 ```
 
 The third line is the whole transpiler: it imports every translation unit, merges them

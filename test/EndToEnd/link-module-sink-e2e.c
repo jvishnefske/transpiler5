@@ -8,13 +8,15 @@
 // The program deliberately holds BOTH halves of the rule at once:
 //   * `struct Buf` is defined in two TUs with DIFFERENT shapes and is used
 //     only from internal-linkage statics. The later definition is sunk into
-//     `mod tu1`, so the crate carries two distinct `Buf` types on two paths,
-//     and each TU's arithmetic must still come out with its own shape's
-//     fields. Any confusion between the two is directly visible in stdout.
+//     a module named after its own source file -- FR-159 phase 2 makes that
+//     `mod b`, from `b.c` -- so the crate carries two distinct `Buf` types on
+//     two paths, and each TU's arithmetic must still come out with its own
+//     shape's fields. Any confusion between the two is directly visible in
+//     stdout.
 //   * `struct P` is defined IDENTICALLY in two TUs and crosses a TU boundary
 //     by value through the external function `consume`. C99 6.2.7 makes
 //     those the SAME type; bucketing records per TU as a matter of course
-//     would give rustc `expected tu0::P, found tu1::P`, so this leg pins
+//     would give rustc `expected a::P, found b::P`, so this leg pins
 //     that records stay at crate root and shape-dedup exactly as before.
 // Both must hold in the SAME crate: the sink may not disturb the dedup.
 //
@@ -30,7 +32,7 @@
 // The sink actually happened -- otherwise this file would be pinning the
 // dedup path and nothing else:
 // RUN: FileCheck %s --check-prefix=SUNK < %t.crate/src/main.rs
-// SUNK: mod tu1 {
+// SUNK: mod b {
 // SUNK-NEXT: #[derive(Clone, Copy, Default)]
 // SUNK-NEXT: pub(crate) struct Buf {
 //

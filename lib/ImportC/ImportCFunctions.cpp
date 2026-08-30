@@ -680,7 +680,19 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
         FailureOr<Type> sliceType = mapCursorParamSliceType(param);
         if (failed(sliceType))
           return failure();
-        inputTypes.push_back(emitrust::RefType::get(*sliceType));
+        // FR-153: the region view is shared by default and MUTABLE only
+        // when the definition's own body demands it (it forwards `*p` to
+        // a mutable parameter). Keyed on the DEFINITION's parameter so a
+        // prototype visit builds the identical signature.
+        const clang::ParmVarDecl *defParam = param;
+        if (definition && index < definition->getNumParams())
+          defParam = definition->getParamDecl(index);
+        bool needsMut =
+            definition && definition->getBody() &&
+            cursorRegionNeedsMutBorrow(definition->getBody(), defParam);
+        inputTypes.push_back(
+            needsMut ? Type(emitrust::MutRefType::get(*sliceType))
+                     : Type(emitrust::RefType::get(*sliceType)));
         inputTypes.push_back(
             emitrust::MutRefType::get(builder.getIntegerType(64)));
         continue;
@@ -1790,6 +1802,47 @@ LogicalResult CImporter::bindOrdinaryParam(const clang::ParmVarDecl *param,
   return success();
 }
 
+bool CImporter::cursorRegionNeedsMutBorrow(const clang::Stmt *stmt,
+                                           const clang::ParmVarDecl *param) {
+  // FR-153: the only admitted mutable demand is a DIRECT `*p` argument
+  // whose callee slot maps to a mutable borrow. See the header for why a
+  // demand reached through a local copy is deliberately left unadmitted.
+  if (!stmt)
+    return false;
+  if (const auto *call = llvm::dyn_cast<clang::CallExpr>(stmt))
+    if (const clang::FunctionDecl *callee = call->getDirectCallee()) {
+      ArrayRef<ParamKind> kinds = classifyPointerParams(callee);
+      for (unsigned index = 0, end = call->getNumArgs(); index != end;
+           ++index) {
+        if (index >= callee->getNumParams())
+          break;
+        const clang::Expr *arg = call->getArg(index)->IgnoreParenImpCasts();
+        const auto *deref = llvm::dyn_cast<clang::UnaryOperator>(arg);
+        if (!deref || deref->getOpcode() != clang::UO_Deref)
+          continue;
+        const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(
+            deref->getSubExpr()->IgnoreParenImpCasts());
+        if (!ref || ref->getDecl() != param)
+          continue;
+        // The callee's slot decides, not the argument: `const unsigned
+        // char *` maps to a SHARED byte slice (CTS-BR), so forwarding to
+        // it is not a demand.
+        const clang::ParmVarDecl *calleeParam = callee->getParamDecl(index);
+        FailureOr<Type> mapped = mapParamType(
+            calleeParam->getType(), translateLoc(calleeParam->getLocation()),
+            index < kinds.size() ? kinds[index] : ParamKind::ScalarRef,
+            voidByteSliceElem(callee, index),
+            requirementSharedConstStructParam(callee, calleeParam));
+        if (succeeded(mapped) && llvm::isa<emitrust::MutRefType>(*mapped))
+          return true;
+      }
+    }
+  for (const clang::Stmt *child : stmt->children())
+    if (child && cursorRegionNeedsMutBorrow(child, param))
+      return true;
+  return false;
+}
+
 FailureOr<Type> CImporter::mapCursorParamSliceType(
     const clang::ParmVarDecl *param) {
   // The element run a `T **` cursor parameter walks is a run of T; the
@@ -1814,8 +1867,12 @@ LogicalResult CImporter::bindCursorParam(const clang::ParmVarDecl *param,
   // place, exactly like a slice parameter's; reads render
   // `(*base)[i as usize]` and never hold a borrow across statements.
   // The element type rides in on the signature the caller built.
+  // FR-153: the base arrives shared or mutable depending on the demand
+  // scan, and the deref is the same either way.
   auto sliceType = llvm::cast<emitrust::SliceType>(
-      llvm::cast<emitrust::RefType>(baseArg.getType()).getPointee());
+      llvm::isa<emitrust::MutRefType>(baseArg.getType())
+          ? llvm::cast<emitrust::MutRefType>(baseArg.getType()).getPointee()
+          : llvm::cast<emitrust::RefType>(baseArg.getType()).getPointee());
   Value basePlace =
       builder
           .create<emitrust::DerefOp>(
@@ -1882,7 +1939,13 @@ LogicalResult CImporter::emitVaClone(const clang::FunctionDecl *func,
       FailureOr<Type> sliceType = mapCursorParamSliceType(param);
       if (failed(sliceType))
         return failure();
-      inputTypes.push_back(emitrust::RefType::get(*sliceType));
+      // FR-153: a clone's body is the original's, so the demand scan
+      // answers identically and the clone's signature stays in step.
+      bool needsMut =
+          func->getBody() && cursorRegionNeedsMutBorrow(func->getBody(), param);
+      inputTypes.push_back(needsMut
+                               ? Type(emitrust::MutRefType::get(*sliceType))
+                               : Type(emitrust::RefType::get(*sliceType)));
       inputTypes.push_back(
           emitrust::MutRefType::get(builder.getIntegerType(64)));
       continue;

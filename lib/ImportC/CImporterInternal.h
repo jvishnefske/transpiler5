@@ -3842,6 +3842,30 @@ private:
   LogicalResult bindOrdinaryParam(const clang::ParmVarDecl *param,
                                   Value blockArg, Location paramLoc);
 
+  /// FR-153: does a planned `T **` cursor parameter's REGION have to be
+  /// borrowed MUTABLY, rather than as the historical shared slice?
+  ///
+  /// The two-input cursor lowering hands the callee a view of the
+  /// caller's region plus an in-out cursor. That view used to be
+  /// unconditionally shared, which broke every body that forwards `*p`
+  /// on to a parameter mapping to a mutable borrow: the body reborrowed
+  /// the shared base mutably and the emitted crate died with
+  /// `error[E0596]`. Making every cursor region mutable instead would
+  /// price in two fresh hazards (two cursors over one region become
+  /// E0499, and a literal-backed region becomes E0596 at the caller) for
+  /// regions nothing writes, so the mutability is DEMAND-DRIVEN.
+  ///
+  /// The only admitted demand is forwarding `*p` directly to a callee
+  /// parameter that maps to a mutable borrow. Writes THROUGH the cursor
+  /// are already a located rejection in planning
+  /// (`planCursorParamsFor`), so they need no handling here.
+  /// Deliberately NOT admitted: a demand reached through a local copy
+  /// (`q = *p; g(q);`) — unobserved across the corpora, and missing a
+  /// demand is the SAFE direction, since it leaves the historical shared
+  /// base and its rustc E0596 rather than any silent behavior change.
+  bool cursorRegionNeedsMutBorrow(const clang::Stmt *stmt,
+                                  const clang::ParmVarDecl *param);
+
   /// Maps a planned `T **` cursor parameter's element run to its slice
   /// type `!emitrust.slice<T'>` (C99-43 slice 1: T' = mapType(T), i8 for
   /// the historical char** string cursor). An element type the slice
@@ -5829,6 +5853,27 @@ private:
   /// representation type of every imported enum).
   Value castEnumToI32(Location loc, Value value);
 
+  /// FR-169: like `castEnumToI32`, but targets the enum's PROMOTED C integer
+  /// type -- unsigned (`ui32`/`ui64`) when the `emitrust.enum_def` carries
+  /// `unsigned_underlying`, signless (`i32`/`i64`) otherwise, with the width
+  /// taken from `wide_underlying` exactly as `castEnumToI32` does. C17
+  /// 6.7.2.2 makes an enumerated type compatible with an
+  /// implementation-chosen integer type, and clang picks an unsigned one when
+  /// no enumerator is negative, so an enum-typed OBJECT of such a type may
+  /// hold any value of the unsigned range -- the i32-range guard on import
+  /// bounds ENUMERATOR values, not object values. Use this wherever the
+  /// SIGNEDNESS of the normalized discriminant is observable (relational
+  /// comparison, conversion to a floating type); `castEnumToI32` remains
+  /// correct, and byte-identical, for the bit-preserving sites (`!= 0`, the
+  /// switch discriminant, a subscript index).
+  ///
+  /// The signedness deliberately comes from the definition's marker and NOT
+  /// from clang's promoted type: clang promotes an enum-typed object of a
+  /// no-negative-enumerator enum to `unsigned int` even when every value fits
+  /// `int`, so a promoted-type-driven rule would move emitted bytes for every
+  /// such enum without fixing anything.
+  Value castEnumToPromotedInt(Location loc, Value value);
+
   /// FR-149: emits a user-written SUBSCRIPT INDEX expression, normalizing a
   /// named-enum index to its i32 discriminant. This is the single seam every
   /// index expression passes through, in place of a bare `emitRValue`, so no
@@ -6421,6 +6466,16 @@ private:
   /// Every arm FieldDecl of every union in `opaqueUnions`; consulted by
   /// the access-site rejections listed there.
   llvm::SmallPtrSet<const clang::FieldDecl *, 8> opaqueUnionArms;
+  /// FR-167: the synthesized parent-struct field spelling (`__u<n>`) of an
+  /// anonymous union MEMBER whose arms could not flatten into the parent
+  /// and which was therefore imported as its own union type. Such a member
+  /// is NOT transparent: `emitMemberLValue`'s implicit anonymous hop must
+  /// project this field instead of returning the parent place, and
+  /// `flattenedFieldName` answers with it. Empty for every anonymous union
+  /// that DID flatten (those keep the one-slot aliasing model), and empty
+  /// in C++ (this routing is gated to C, matching FR-78).
+  llvm::DenseMap<const clang::FieldDecl *, std::string>
+      anonymousUnionBlobNames;
   /// The C99-45 accessor geometry of one bit-field member: the window
   /// `[offset, offset + width)` of the synthesized unsigned backing field
   /// `backingName` (of type `backingType`) in its flattened parent

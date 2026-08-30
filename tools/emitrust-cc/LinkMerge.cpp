@@ -25,14 +25,19 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/IR/Verifier.h"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -601,6 +606,141 @@ static Operation *findSliceRefinedSymbolEscape(ModuleOp shard,
   return escape;
 }
 
+/// The Rust path the FR-161 one-element view is spelled with.
+///
+/// `::std::`, NOT `::core::`: `core::slice::from_mut` resolves under cargo
+/// but is E0433 under a bare `rustc`, which the lit EndToEnd tests invoke
+/// directly. The LEADING `::` is load-bearing too -- FR-159 sinks items
+/// into `mod tu<N>`, where a relative `std::` can be shadowed by a
+/// TU-local item. Both spellings were measured, not chosen.
+static constexpr llvm::StringLiteral kSliceFromMutPath =
+    "::std::slice::from_mut";
+
+/// FR-161: proves that a DEFINITION's own pointer parameter touches only
+/// element ZERO of the region it is lent.
+///
+/// This is the admission fence for the one-element view. C's `f(&x)` lends
+/// the callee a one-element region and `::std::slice::from_mut(&mut x)` is
+/// exactly that region in Rust -- but only while the callee stays inside
+/// it. Where C reading `p[1]` is undefined behaviour, Rust reading it is a
+/// PANIC, and this project has already decided which side of that trade it
+/// takes: FR-75 deliberately flipped the previously-ACCEPTED
+/// `helper(&x, 1)` shape to the located address-of-scalar rejection, and
+/// `test/Import/C/pointers-param-invalid.c` pins
+/// `int first(int *a){return a[0]+a[1];}` called as `first(&x)` as a
+/// rejection. Measured on that very program: unfenced, C prints `1 2` and
+/// the emitted crate panics `index out of bounds: the len is 1 but the
+/// index is 1`. So an unproven parameter keeps its located rejection.
+///
+/// The proof is a forward walk over the parameter's uses, and it must be
+/// TRANSITIVE. `deref` + `subscript[0]` is the direct touch; `deref` +
+/// `slice_of[0]` handed to another call is a FORWARD, admitted only when
+/// the receiving parameter also passes. That leg is not a nicety: of the
+/// 60 residual argument slots measured over the 501-object systemd link,
+/// 3 (`parse_sec`, `pidfd_get_pid`, `read_attr_at`) forward instead of
+/// subscripting -- `parse_sec` hands `&mut (*ret)[0..]` to `parse_time` --
+/// and a shallow fence rejects them, after which the crate does not emit
+/// at all. Anything else fails: a non-zero or dynamic index, an
+/// `addr_of`, an `emitrust.call_indirect`, an `args`-remapped call (where
+/// operand index is not argument position), or a callee this link has no
+/// definition for.
+///
+/// Durability, deliberately NOT claimed to be stable: 28 of the 30
+/// currently admitted systemd callees pass because they are today FR-52
+/// `unimplemented!` stubs with no body uses. As later waves give them
+/// bodies the fence will re-reject some of them. That is the correct
+/// direction -- a located link rejection, never a runtime panic.
+class ElementZeroFence {
+public:
+  explicit ElementZeroFence(const llvm::StringMap<Operation *> &definitions)
+      : definitions(definitions) {}
+
+  /// True when parameter `slot` of `definition` provably touches only
+  /// element zero of the region it is lent.
+  bool touchesOnlyElementZero(Operation *definition, unsigned slot) {
+    Query query{definition, slot};
+    auto cached = cache.find(query);
+    if (cached != cache.end())
+      return cached->second;
+    // Fresh per top-level query: the in-flight set doubles as this query's
+    // memo, and a `true` it hands back for a cycle is an ASSUMPTION, not a
+    // result, so it must not outlive the query that made it.
+    llvm::DenseSet<Query> inFlight;
+    bool admitted = walk(definition, slot, inFlight);
+    cache[query] = admitted;
+    return admitted;
+  }
+
+private:
+  using Query = std::pair<Operation *, unsigned>;
+
+  static bool isElementZero(Value index) {
+    auto constant = index.getDefiningOp<emitrust::ConstantOp>();
+    auto value =
+        constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
+    return value && value.getValue().isZero();
+  }
+
+  /// `borrow` is a `[0..]` tail borrow of a fenced parameter, so every call
+  /// it reaches must itself stay inside element zero at the slot it lands
+  /// in.
+  bool forwardStaysInElementZero(Value borrow,
+                                 llvm::DenseSet<Query> &inFlight) {
+    for (Operation *user : borrow.getUsers()) {
+      auto call = dyn_cast<emitrust::CallOpaqueOp>(user);
+      if (!call || call.getArgs())
+        return false;
+      auto callee = definitions.find(call.getCallee());
+      if (callee == definitions.end())
+        return false;
+      // One borrow may arrive at more than one parameter; all of them have
+      // to pass, so this does not stop at the first match.
+      for (auto [index, operand] : llvm::enumerate(call->getOperands()))
+        if (operand == borrow &&
+            !walk(callee->second, static_cast<unsigned>(index), inFlight))
+          return false;
+    }
+    return true;
+  }
+
+  bool walk(Operation *definition, unsigned slot,
+            llvm::DenseSet<Query> &inFlight) {
+    // A repeat within one query is either a cycle -- which contributes no
+    // new use -- or an already-proven parameter: a disproof would have
+    // unwound the walk before reaching here.
+    if (!inFlight.insert(Query{definition, slot}).second)
+      return true;
+    auto func = dyn_cast<emitrust::FuncOp>(definition);
+    if (!func || func.getBody().empty())
+      return false; // No body: nothing to prove anything from.
+    Block &entry = func.getBody().front();
+    if (slot >= entry.getNumArguments())
+      return false;
+    for (Operation *user : entry.getArgument(slot).getUsers()) {
+      // The reference itself may only be dereferenced. Passing it on
+      // whole, or taking its address, hands out the entire region.
+      auto deref = dyn_cast<emitrust::DerefOp>(user);
+      if (!deref)
+        return false;
+      for (Operation *place : deref.getResult().getUsers()) {
+        if (auto subscript = dyn_cast<emitrust::SubscriptOp>(place)) {
+          if (!isElementZero(subscript.getIndex()))
+            return false;
+          continue;
+        }
+        auto sliceOf = dyn_cast<emitrust::SliceOfOp>(place);
+        if (!sliceOf || !isElementZero(sliceOf.getIndex()) ||
+            !forwardStaysInElementZero(sliceOf.getResult(), inFlight))
+          return false;
+      }
+    }
+    return true;
+  }
+
+  const llvm::StringMap<Operation *> &definitions;
+  llvm::DenseMap<Query, bool> cache;
+};
+
 /// Re-shapes `shard`'s calls of `name` so that the arguments at `slots`
 /// carry the DEFINITION's slice model. The only admitted argument is the
 /// `addr_of mut (subscript base[index])` cursor a C `&arr[k]` / `&p[k]`
@@ -612,16 +752,25 @@ static Operation *findSliceRefinedSymbolEscape(ModuleOp shard,
 /// strictly less panicky than the form it replaces -- `k == len` yields a
 /// legal empty slice where `&mut arr[len]` panics.
 ///
-/// Everything else keeps a LOCATED rejection: the address of a scalar
-/// object or of a struct field (the measured 60-slot residue, which has no
-/// region to slice), and a call whose arguments are remapped positionally
-/// by the `args` attribute (where operand index is not argument position).
+/// FR-161: the argument may also be the address of a scalar OBJECT or of a
+/// struct FIELD -- the 60-slot residue that has no region to tail-borrow,
+/// and which is the C out-parameter idiom throughout. C's `f(&x)` lends a
+/// ONE-element region, so the argument is wrapped in the standard library's
+/// one-element view, `::std::slice::from_mut`. That wrap is admitted only
+/// behind `ElementZeroFence`, which must prove the definition never looks
+/// past element zero; see the fence for why an unproven parameter keeps
+/// its rejection rather than trading C's undefined behaviour for a panic.
+///
+/// Everything else keeps a LOCATED rejection: an argument the fence cannot
+/// clear, and a call whose arguments are remapped positionally by the
+/// `args` attribute (where operand index is not argument position).
 static LogicalResult adaptSliceRefinedCalls(ModuleOp shard,
                                             Operation *definition,
                                             llvm::StringRef name,
                                             llvm::ArrayRef<unsigned> slots,
                                             FunctionType declType,
-                                            FunctionType defType) {
+                                            FunctionType defType,
+                                            ElementZeroFence &fence) {
   if (Operation *escape = findSliceRefinedSymbolEscape(shard, name))
     return escape->emitError()
            << "unsupported: '" << name
@@ -664,6 +813,26 @@ static LogicalResult adaptSliceRefinedCalls(ModuleOp shard,
       auto declRef = dyn_cast<emitrust::MutRefType>(declType.getInput(slot));
       if (!addrOf || !addrOf.getIsMut() || !subscript || !declRef ||
           element != declRef.getPointee()) {
+        // FR-161: no region to slice, but a one-element view of the
+        // argument is exactly the region C lends. Admitted only when the
+        // definition provably stays inside element zero.
+        auto argRef = arg ? dyn_cast<emitrust::MutRefType>(arg.getType())
+                          : emitrust::MutRefType();
+        auto defRef = dyn_cast<emitrust::MutRefType>(defType.getInput(slot));
+        auto defSlice = defRef
+                            ? dyn_cast<emitrust::SliceType>(defRef.getPointee())
+                            : emitrust::SliceType();
+        if (argRef && defSlice &&
+            defSlice.getElementType() == argRef.getPointee() &&
+            fence.touchesOnlyElementZero(definition, slot)) {
+          OpBuilder builder(call);
+          auto view = builder.create<emitrust::CallOpaqueOp>(
+              call.getLoc(), TypeRange{defType.getInput(slot)},
+              builder.getStringAttr(kSliceFromMutPath),
+              /*args=*/ArrayAttr(), ValueRange{arg});
+          call->setOperand(slot, view.getResult(0));
+          continue;
+        }
         InFlightDiagnostic diag =
             call.emitError()
             << "unsupported: argument " << (slot + 1) << " of the call to '"
@@ -689,6 +858,231 @@ static LogicalResult adaptSliceRefinedCalls(ModuleOp shard,
   return success(!failed);
 }
 
+//===----------------------------------------------------------------------===//
+// FR-159 phase 2: naming a shard's per-TU module after its source file
+//===----------------------------------------------------------------------===//
+
+/// True for the characters a Rust identifier is made of. Everything else in
+/// a file or directory name becomes `_`, so `hibernate-util.c` can name a
+/// module at all (`mod hibernate-util` is a parse error).
+static bool isModuleNameChar(char c) { return llvm::isAlnum(c) || c == '_'; }
+
+/// `text` with every non-identifier character replaced by `_`.
+static std::string sanitizeModuleWord(llvm::StringRef text) {
+  std::string out;
+  out.reserve(text.size());
+  for (char c : text)
+    out.push_back(isModuleNameChar(c) ? c : '_');
+  return out;
+}
+
+/// True when `name` cannot be spelled as a Rust module name at all. The
+/// strict and reserved keyword lists are both here: `mod loop {}` is
+/// `error: expected identifier, found keyword 'loop'`, and a reserved word
+/// becomes the same error the day the edition that reserves it arrives, so
+/// a shard whose file is named after one takes the ordinal fallback instead.
+static bool isUnspellableModuleName(llvm::StringRef name) {
+  if (name.empty() || llvm::isDigit(name.front()))
+    return true;
+  return llvm::StringSwitch<bool>(name)
+      .Cases("as", "break", "const", "continue", true)
+      .Cases("crate", "dyn", "else", "enum", true)
+      .Cases("extern", "false", "fn", "for", true)
+      .Cases("if", "impl", "in", "let", true)
+      .Cases("loop", "match", "mod", "move", true)
+      .Cases("mut", "pub", "ref", "return", true)
+      .Cases("self", "Self", "static", "struct", true)
+      .Cases("super", "trait", "true", "type", true)
+      .Cases("unsafe", "use", "where", "while", true)
+      .Cases("async", "await", "abstract", "become", true)
+      .Cases("box", "do", "final", "macro", true)
+      .Cases("override", "priv", "typeof", "unsized", true)
+      .Cases("virtual", "yield", "try", "gen", true)
+      // `_` is a reserved identifier, not a name.
+      .Case("_", true)
+      .Default(false);
+}
+
+/// True for the `tu<N>` shape. That spelling is RESERVED for the ordinal
+/// fallback below, so the two naming schemes can never meet: a C file
+/// literally named `tu3.c` must not be able to claim shard 3's fallback
+/// name and leave two shards fighting over one module.
+static bool isOrdinalShapedName(llvm::StringRef name) {
+  if (!name.consume_front("tu") || name.empty())
+    return false;
+  return llvm::all_of(name, [](char c) { return llvm::isDigit(c); });
+}
+
+/// The candidate ladder for one source path, innermost first: rank 0 is the
+/// file's stem, and each further rank prepends one more enclosing directory
+/// component. Climbing is what distinguishes `src/basic/mkdir.c` from
+/// `src/shared/mkdir.c` -- in systemd's 501 objects, four stems repeat and
+/// every one of them is separated by exactly ONE directory component.
+static llvm::SmallVector<std::string> buildModuleNameLadder(
+    llvm::StringRef path) {
+  llvm::SmallVector<llvm::StringRef> components;
+  for (llvm::StringRef component :
+       llvm::make_range(llvm::sys::path::begin(path),
+                        llvm::sys::path::end(path))) {
+    // The root ("/") and the no-op components carry no name.
+    if (component == "/" || component == "\\" || component == "." ||
+        component == "..")
+      continue;
+    components.push_back(component);
+  }
+  llvm::SmallVector<std::string> ladder;
+  if (components.empty())
+    return ladder;
+  std::string suffix =
+      sanitizeModuleWord(llvm::sys::path::stem(components.back()));
+  ladder.push_back(suffix);
+  for (size_t depth = components.size() - 1; depth-- > 0;) {
+    suffix = sanitizeModuleWord(components[depth]) + "_" + suffix;
+    ladder.push_back(suffix);
+  }
+  return ladder;
+}
+
+/// FR-159 phase 2: one Rust module name per shard, parallel to `shards`.
+///
+/// Phase 1 named a sunk record's module after the shard's link-line ORDINAL.
+/// That is unique by construction but it is a property of the BUILD, not of
+/// the program: reorder the link line and every module is renamed, and `mod
+/// tu314` tells a reader nothing about which C file the type came from. The
+/// name here is derived from the shard's recorded source path instead, so the
+/// emitted crate is a function of the sources.
+///
+/// The ordinal name survives as the fallback, and every path that reaches it
+/// emits exactly the phase-1 bytes. A shard takes it when it records no
+/// source path, when its stem cannot be a Rust module name (a keyword, a
+/// digit-leading name, the reserved `tu<N>` shape, or a name that would
+/// collide with a crate-ROOT item), or when it shares a stem with another
+/// shard and the ladder runs out before they separate.
+///
+/// A stem that is merely INVALID does not climb: climbing is for breaking
+/// genuine duplicates, and a rank-1 name is built from the enclosing
+/// DIRECTORY, which for a lit temp tree or an out-of-tree build directory is
+/// not a stable part of the program. Falling back to the ordinal keeps such a
+/// shard's name a function of the link line alone rather than of where the
+/// tree happens to sit on disk.
+///
+/// The result depends only on (`sourcePaths`, `ordinals`, `reserved`) -- never
+/// on iteration order of a hash container -- so two links of the same objects
+/// emit the same crate.
+static llvm::SmallVector<std::string> computeShardModuleNames(
+    llvm::ArrayRef<std::string> sourcePaths, llvm::ArrayRef<unsigned> ordinals,
+    const llvm::StringSet<> &reserved) {
+  size_t count = sourcePaths.size();
+  llvm::SmallVector<std::string> names(count);
+  llvm::SmallVector<llvm::SmallVector<std::string>> ladders(count);
+  llvm::SmallVector<size_t> ranks(count, 0);
+  llvm::StringSet<> assigned;
+
+  auto takeOrdinal = [&](size_t index) {
+    names[index] = ("tu" + llvm::Twine(ordinals[index])).str();
+  };
+  auto usable = [&](llvm::StringRef candidate) {
+    return !isUnspellableModuleName(candidate) &&
+           !isOrdinalShapedName(candidate) && !reserved.contains(candidate) &&
+           !assigned.contains(candidate);
+  };
+
+  // Pass 1: everything that can never carry a stem name settles now, so the
+  // duplicate-breaking pool below holds only live candidates.
+  llvm::SmallVector<size_t> pool;
+  for (size_t index = 0; index < count; ++index) {
+    if (sourcePaths[index].empty()) {
+      takeOrdinal(index);
+      continue;
+    }
+    ladders[index] = buildModuleNameLadder(sourcePaths[index]);
+    if (ladders[index].empty() || !usable(ladders[index].front())) {
+      takeOrdinal(index);
+      continue;
+    }
+    pool.push_back(index);
+  }
+
+  // Pass 2: to fixpoint. A candidate that exactly one pool member wants, and
+  // that nothing has taken, is that member's name; every member of a
+  // contested candidate climbs one rank. Each round either removes a member
+  // from the pool or raises its rank, and ranks are bounded by the path
+  // depth, so this terminates.
+  while (!pool.empty()) {
+    llvm::StringMap<unsigned> claims;
+    for (size_t index : pool)
+      ++claims[ladders[index][ranks[index]]];
+    llvm::SmallVector<size_t> contested;
+    for (size_t index : pool) {
+      llvm::StringRef candidate = ladders[index][ranks[index]];
+      if (claims[candidate] == 1 && usable(candidate)) {
+        names[index] = candidate.str();
+        assigned.insert(candidate);
+        continue;
+      }
+      size_t next = ranks[index] + 1;
+      if (next >= ladders[index].size() || !usable(ladders[index][next])) {
+        takeOrdinal(index);
+        continue;
+      }
+      ranks[index] = next;
+      contested.push_back(index);
+    }
+    pool = std::move(contested);
+  }
+  return names;
+}
+
+/// The names a per-TU module may NOT take, collected over every shard before
+/// anything is sunk.
+///
+/// A Rust `mod` lives in the TYPE namespace, so root `struct Buf` next to
+/// `mod Buf` is `error[E0428]: the name 'Buf' is defined multiple times` --
+/// measured on rustc, and it loses the whole crate. Only type-namespace items
+/// are collected for that reason: root `fn mkdir` next to `mod mkdir`, and
+/// `static v` next to `mod v`, both COMPILE (different namespaces), and
+/// reserving function and global names would push real files like systemd's
+/// `mkdir.c` off their own stems for nothing.
+///
+/// Every identifier-shaped word of every `use` path joins the set too: `use
+/// std::collections::HashMap` reserves `std`, `collections` and `HashMap`. It
+/// is deliberately over-broad -- it costs at most an ordinal fallback -- and
+/// it closes the whole "a C file named Vec.c" hazard without teaching this
+/// code to parse Rust use-trees.
+static llvm::StringSet<> collectReservedModuleNames(
+    llvm::MutableArrayRef<OwningOpRef<ModuleOp>> shards) {
+  llvm::StringSet<> reserved;
+  // FR-62's actor runtime is a `mod actor_rt` the emitter appends as a raw
+  // string epilogue whenever an actor anchor exists. No op in any shard
+  // carries that name, so nothing above would ever find it.
+  reserved.insert("actor_rt");
+  for (OwningOpRef<ModuleOp> &shard : shards) {
+    for (Operation &op : shard->getBody()->getOperations()) {
+      if (isa<emitrust::StructDefOp, emitrust::EnumDefOp,
+              emitrust::DataEnumDefOp, emitrust::TraitDefOp>(op)) {
+        if (auto symbol = dyn_cast<SymbolOpInterface>(&op))
+          reserved.insert(symbol.getName());
+        continue;
+      }
+      auto use = dyn_cast<emitrust::UseOp>(op);
+      if (!use)
+        continue;
+      llvm::StringRef path = use.getPath();
+      for (size_t index = 0; index < path.size();) {
+        if (!isModuleNameChar(path[index])) {
+          ++index;
+          continue;
+        }
+        size_t start = index;
+        while (index < path.size() && isModuleNameChar(path[index]))
+          ++index;
+        reserved.insert(path.substr(start, index - start));
+      }
+    }
+  }
+  return reserved;
+}
+
 } // namespace
 
 FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
@@ -705,8 +1099,19 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
   // ledger, source facts) from every shard. It is a per-TU fact the caller
   // has already surfaced; the merged whole-program module must stay
   // byte-comparable to the joint import's, which never carries it.
-  for (OwningOpRef<ModuleOp> &shard : shards)
+  //
+  // FR-159 phase 2: the source path is READ OUT here, because the strip
+  // below is what destroys it and it is the only place a shard says which C
+  // file it came from. An artifact that predates source recording leaves an
+  // empty string, which the naming below reads as "ordinal fallback".
+  llvm::SmallVector<std::string> sourcePaths;
+  sourcePaths.reserve(shards.size());
+  for (OwningOpRef<ModuleOp> &shard : shards) {
+    std::optional<emitrust::ShardSource> source =
+        emitrust::getShardSource(*shard);
+    sourcePaths.push_back(source ? source->path : std::string());
     emitrust::stripShardMetadata(*shard);
+  }
 
   // Step 1: per-shard alpha-rename to global ordinals (the positional
   // default when the caller supplied no maps).
@@ -719,6 +1124,19 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
       return failure();
   }
 
+  // FR-159 phase 2: the per-TU module names, one per shard. This runs AFTER
+  // step 1 so the reserved set sees the symbol names the crate will actually
+  // carry, and BEFORE the classify loop so a sink has its name ready the
+  // moment it needs one.
+  llvm::SmallVector<unsigned> shardOrdinals;
+  shardOrdinals.reserve(shards.size());
+  for (size_t index = 0; index < shards.size(); ++index)
+    shardOrdinals.push_back(ordinalMaps.empty()
+                                ? static_cast<unsigned>(index)
+                                : ordinalMaps[index].front());
+  llvm::SmallVector<std::string> moduleNames = computeShardModuleNames(
+      sourcePaths, shardOrdinals, collectReservedModuleNames(shards));
+
   // One pass over every module-level op of every shard, in link-line order,
   // classifying: definitions (for steps 2 and 3), marked declarations
   // (step 2's obligations), and use/verbatim header ops (step 4).
@@ -727,13 +1145,15 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
   llvm::StringSet<> headerTexts;
   llvm::SmallVector<Operation *> toErase;
   for (auto [shardIndex, shard] : llvm::enumerate(shards)) {
-    // FR-159: the ordinal this shard's per-TU module is named after. It is
-    // the shard's own link-line position -- the same ordinal step 1 just
-    // renamed its `tu<N>_` tags to -- so `mod tu314` holds exactly the items
-    // `tu314_*` came from, and two shards can never claim one module.
-    unsigned tuOrdinal = ordinalMaps.empty()
-                             ? static_cast<unsigned>(shardIndex)
-                             : ordinalMaps[shardIndex].front();
+    // FR-159: the name of this shard's per-TU module. Phase 2 derives it
+    // from the shard's own SOURCE FILE (`hibernate-util.c` -> `mod
+    // hibernate_util`) rather than from its link-line position, so
+    // reordering the link line no longer renames modules and a reader can
+    // find the file a `mod` came from; a shard whose stem is unusable keeps
+    // the phase-1 ordinal name. Either way the assignment above is
+    // INJECTIVE, so the module holds exactly the items of one shard and two
+    // shards can never claim one module.
+    llvm::StringRef tuModuleName = moduleNames[shardIndex];
     // Computed lazily and once: a shape conflict is rare (exactly one across
     // the 501-object systemd link), and the walk is linear in the shard.
     llvm::StringMap<Operation *> escapes;
@@ -797,9 +1217,8 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
         }
         auto escapeIt = escapes.find(symbol.getName());
         if (!sinkDisabled && escapeIt == escapes.end()) {
-          std::string sunk = ("crate::tu" + llvm::Twine(tuOrdinal) +
-                              "::" + symbol.getName())
-                                 .str();
+          std::string sunk =
+              ("crate::" + tuModuleName + "::" + symbol.getName()).str();
           StringAttr sunkAttr = StringAttr::get(op.getContext(), sunk);
           llvm::StringRef recordName = symbol.getName();
           AttrTypeReplacer repath;
@@ -860,7 +1279,18 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
   // else is a located link rejection. Every diverging obligation is
   // reported before the merge gives up -- a whole-program link that stops
   // at the first of hundreds turns porting into a one-at-a-time loop.
-  bool reconciliationFailed = false;
+  //
+  // FR-172: the undefined-symbol arm below obeys the same rule. It used to
+  // `return` on the FIRST unresolved external, so enumerating N missing
+  // symbols cost N link runs (exclude one, re-link, learn the next). Now
+  // every unresolved obligation is reported, located at its own recorded
+  // declaration, and the merge fails once at the end. What a missing symbol
+  // DOES is unchanged -- only how many are reported per run.
+  bool linkFailed = false;
+  // One fence per merge: its proofs are keyed on definition operations that
+  // stay live for the whole reconciliation, and the same (callee, slot) is
+  // asked about once per diverging call site.
+  ElementZeroFence elementZeroFence(definitions);
   for (auto [name, op] : obligations) {
     auto it = definitions.find(name);
     if (it != definitions.end()) {
@@ -881,24 +1311,27 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
               << " but the defining translation unit defines it as "
               << defFn.getFunctionType();
           diag.attachNote(it->second->getLoc()) << "defined here";
-          reconciliationFailed = true;
+          linkFailed = true;
           continue;
         }
         auto shard = op->getParentOfType<ModuleOp>();
         if (mlir::failed(adaptSliceRefinedCalls(shard, it->second, name,
-                                                *slots, declType, defType))) {
-          reconciliationFailed = true;
+                                                *slots, declType, defType,
+                                                elementZeroFence))) {
+          linkFailed = true;
           continue;
         }
       }
       toErase.push_back(op);
       continue;
     }
-    return op->emitError() << "unresolved external '" << name << "' at link";
+    op->emitError() << "unresolved external '" << name << "' at link";
+    linkFailed = true;
   }
-  // A shard left half-reconciled must never reach the splice or the
-  // verifier: the located rejections above are the report.
-  if (reconciliationFailed)
+  // A shard left half-reconciled, or one still carrying an obligation
+  // nobody defines, must never reach the splice or the verifier: the
+  // located rejections above are the report.
+  if (linkFailed)
     return failure();
 
   for (Operation *op : toErase)

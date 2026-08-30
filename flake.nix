@@ -106,10 +106,11 @@
               src = ./.;
 
               nativeBuildInputs = [
-                pkgs.cmake
+                pkgs.meson
                 pkgs.ninja
                 pkgs.pkg-config
                 llvmPackages.tblgen
+                llvmPackages.llvm.dev
               ];
 
               buildInputs = [
@@ -123,11 +124,6 @@
               LLVM_DIR = "${llvmPackages.llvm.dev}/lib/cmake/llvm";
               Clang_DIR = "${llvmPackages.libclang.dev}/lib/cmake/clang";
               LIBCLANG_PATH = "${llvmPackages.libclang.lib}/lib";
-
-              postInstall = ''
-                mkdir -p $out/bin
-                cp bin/emitrust-* $out/bin/
-              '';
             };
             # Transpile-corpus derivations: run emitrust-cc against upstream
             # embedded C (CMSIS-DSP, lwIP, FreeRTOS) fetched directly, NOT from

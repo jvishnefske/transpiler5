@@ -159,7 +159,10 @@ int main(int argc, char **argv) {
     llvm::errs() << errorMessage << "\n";
     return 1;
   }
-  module->print(output->os());
+  // FR-135: the module has to be readable back by `emitrust-opt`, and the
+  // custom `cf.switch` assembly cannot spell a case label above `i64::MAX`;
+  // see `printRoundTrippableModule`.
+  mlir::emitrust::printRoundTrippableModule(*module, output->os());
   output->os() << "\n";
   output->keep();
   return 0;

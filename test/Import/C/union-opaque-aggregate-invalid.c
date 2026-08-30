@@ -14,9 +14,17 @@
 // non-zero global constant, compound literal — keep `unsupported: opaque
 // union arm initializer`; address-of an arm keeps the existing
 // union-member-address rejection (NOT probed in return position, where
-// the returned-pointer rejection preempts it); and the CTS-R2
-// anonymous-MEMBER union keeps its record-level `unsupported: union type`
-// rejection (the opaque model is for named/typed unions only).
+// the returned-pointer rejection preempts it); and — since FR-167 routed
+// the non-flattening ANONYMOUS-member union through the same opaque
+// import as the named one — an arm reached through the IMPLICIT
+// anonymous hop lands on exactly the same access-site rejections as the
+// named spelling, instead of the record dying at `unsupported: union
+// type` before any access is ever analyzed. That last leg is the one
+// that proves FR-167's synthesized-member PROJECTION is in place: if the
+// implicit hop still peeled transparently, the arm write would select
+// `opaque` on the PARENT struct and surface as FR-173's emitter backstop
+// ("member 'opaque' does not exist on struct 'S'") rather than as a
+// located importer rejection.
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/whole-arm-read.c 2>&1 | FileCheck %s --check-prefix=WHOLEARMREAD
 // RUN: not emitrust-import-c %t/whole-arm-write.c 2>&1 | FileCheck %s --check-prefix=WHOLEARMWRITE
@@ -36,7 +44,8 @@
 // INITLOCAL: init-local.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm initializer
 // INITGLOBAL: init-global.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm initializer
 // CLIT: compound-literal.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm initializer
-// ANONMEMBER: anon-member.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: union type
+// ANONMEMBER: anon-member.c:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: opaque union arm access
+// ANONMEMBER-NOT: does not exist on struct
 
 //--- whole-arm-read.c
 // A whole-ARM aggregate copy out of the union: the blob has no arm-typed
@@ -208,9 +217,12 @@ int clit(void) {
 }
 
 //--- anon-member.c
-// An anonymous-MEMBER union (unnamed field) with differing aggregate arms
-// keeps the CTS-R2 record-level rejection: its arms flatten into the
-// PARENT struct_def, so there is no union struct_def to make opaque.
+// An anonymous-MEMBER union (unnamed field) with differing aggregate
+// arms: the RECORD imports since FR-167 (the union becomes its own
+// opaque struct_def under a synthesized parent field), so the frontier
+// moves to the access site — a whole-ARM aggregate store through the
+// implicit anonymous hop keeps the same located rejection the named
+// spelling gets.
 struct A {
   int ax[10];
 };
@@ -228,4 +240,4 @@ struct S {
   };
 };
 
-struct S g;
+void anon_whole_arm_write(struct S *s, struct B b2) { s->b = b2; }

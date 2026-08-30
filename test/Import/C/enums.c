@@ -60,11 +60,21 @@ enum Color pick(enum Color a, enum Color b) {
 // CHECK: emitrust.constant <#emitrust.opaque<"Color::Red">> : !emitrust.enum<"Color">
 // CHECK: emitrust.cmp ne, %{{[0-9]+}}, %{{[0-9]+}} : (!emitrust.enum<"Color">, !emitrust.enum<"Color">) -> i1
 
-// Relational comparison has no derived Rust ordering; the i32 discriminants
-// are compared instead.
-// CHECK: emitrust.cast %{{[0-9]+}} : !emitrust.enum<"Color"> to i32
-// CHECK: emitrust.cast %{{[0-9]+}} : !emitrust.enum<"Color"> to i32
-// CHECK: arith.cmpi slt
+// Relational comparison has no derived Rust ordering, so the discriminants
+// are compared instead -- and FR-169 pins the SIGNEDNESS of that
+// comparison. `Color` has no negative enumerator, so C gives it an
+// unsigned underlying type and an object of that type may hold any value
+// of the unsigned range, including values above INT32_MAX that the
+// enumerator list never mentions. The discriminants therefore promote to
+// `ui32` and compare with `emitrust.cmp lt` (arith has no unsigned-typed
+// `cmpi`); the previous `as i32` + `arith.cmpi slt` shape read such a
+// value as negative and inverted the answer. Equality above is unaffected
+// -- it compares the enum values directly -- and `Temp`-style enums with a
+// negative enumerator keep the signed shape, pinned in
+// test/Import/C/enum-promoted-relational.c.
+// CHECK: emitrust.cast %{{[0-9]+}} : !emitrust.enum<"Color"> to ui32
+// CHECK: emitrust.cast %{{[0-9]+}} : !emitrust.enum<"Color"> to ui32
+// CHECK: emitrust.cmp lt
 
 // A switch over an enum switches on the i32 discriminant with the
 // enumerator values as case values.
