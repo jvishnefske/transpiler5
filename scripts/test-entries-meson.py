@@ -17,7 +17,9 @@ Every meson test declares `protocol: "exitcode"`, i.e. it passes iff the
 binary exits 0.  That is exactly `#[test]` semantics (panic = fail), so the
 oracle is inherited rather than invented.
 
-Output: one `<c-source-path>\t<symbol>` line per entry point, `#` comments.
+Output: one `<symbol>` per line, provenance in a trailing `#` comment --
+the format `emitrust-cc --test-entries=<file>` reads (symbol first, everything
+after the first whitespace ignored).
 By default the symbol is `main` -- correct for a project whose test binary is
 a plain `int main` running asserts.  For a project whose tests register
 through a table (systemd's TEST() macro writes into a linker section, so main
@@ -92,7 +94,7 @@ for name, srcs in rows:
                 stats["drop: no symbol matched --entry-regex"] += 1
                 continue
         for s in syms:
-            out.append(f"{src}\t{s}\t# meson test '{name}'")
+            out.append(f"{s}\t# meson test '{name}' ({os.path.basename(src)})")
             stats["entries"] += 1
 
 fh = sys.stdout if a.out == "-" else open(a.out, "w")
