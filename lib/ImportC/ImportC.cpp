@@ -7008,6 +7008,37 @@ LogicalResult CImporter::finalizeProject() {
       // value type, marked for the FR-58 link step; the Rust emitter refuses
       // a module still carrying the marker.
       if (deferExternals) {
+        // FR-168: but only for a symbol the module still REFERENCES. The
+        // pending entry is a side effect of importing the body that read the
+        // global, and `rollbackTo` does not undo it (`RecoveryCheckpoint`
+        // tracks only the anchor and the erased external clones), so a body
+        // rejected AFTER its read was imported leaves the registration
+        // behind with no IR use left. Materializing an obligation for that
+        // orphan makes the FR-58 link demand a definition NOTHING in the
+        // whole program asks for — measured over 501 systemd shards, 67 of
+        // the 281 obligation symbols were such orphans and the 62 that
+        // hard-errored at link were exactly them.
+        //
+        // The query is sound at this point because it runs on the
+        // pre-lowering `func` IR, where every reference to a global is a
+        // real `FlatSymbolRefAttr` symbol use (`emitrust.global_load` /
+        // `global_store` / `global_addr` / `global_place`) — the same basis
+        // `firstSymbolUseLoc` and `containUndefinedExternGlobal` already
+        // rely on. The one opaque-text initializer the importer builds is a
+        // fn-ptr `Some(<name>)`, which names a FUNCTION, never a global. A
+        // `nullopt` result means the walk hit an op it could not analyze;
+        // that stays conservative and keeps the obligation.
+        //
+        // Deliberately globals only: after `ConvertToEmitRust` a call is
+        // `emitrust.call_opaque "name"`, a STRING and not a symbol use, so
+        // "unreferenced" cannot be decided soundly for a FUNCTION
+        // obligation. Those keep the hard rejection (see the func loop
+        // below and test/Driver/link-merge-errors.c).
+        std::optional<SymbolTable::UseRange> uses = SymbolTable::getSymbolUses(
+            StringAttr::get(module.getContext(), entry.getKey()),
+            module.getOperation());
+        if (uses && uses->empty())
+          continue;
         OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
         auto declOp = moduleBuilder.create<emitrust::GlobalOp>(
             entry.getValue().loc, moduleBuilder.getStringAttr(entry.getKey()),

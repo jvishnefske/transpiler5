@@ -10644,7 +10644,7 @@ piece and becomes FR-45.
   Shards must be regenerated whenever the dialect changes.
   **SPIKED GO, BLOCKED ON FR-168.**
 
-- [ ] FR-168 DEFECT (found by the FR-166 spike 2026-08-30): AN
+- [x] FR-168 SLICE 1 LANDED 2026-08-30 (found by the FR-166 spike): AN
   `emitrust.extern_decl` OBLIGATION CAN OUTLIVE THE REJECTION OF ITS OWN
   DEFINITION, turning a symmetric pair of drops into a spurious
   `unresolved external` at link.
@@ -10671,6 +10671,103 @@ piece and becomes FR-45.
   (b) fix `non-constant global initializer` for the
       `SD_VARLINK_DEFINE_INTERFACE` shape -- narrower, and it only moves the
       problem to the next asymmetric symbol.
+
+  SPIKED AND SLICE 1 LANDED 2026-08-30. Gate 919/919, zero golden churn, and
+  the 501-object whole-program crate is BYTE-IDENTICAL (md5
+  94212b085d286af18045a3e5005ce388, 12,268,740 bytes) -- verified myself by
+  regenerating all 501 shards, not on the agent's report.
+
+  **MY ROOT CAUSE ABOVE IS WRONG, and so was my severity.** The obligation
+  does not outlive the rejection of its DEFINITION; it outlives the rejection
+  of its **USE**, and the definition side is incidental. `pendingExternGlobals
+  .try_emplace` (`ImportCGlobals.cpp:602`) is a permanent side effect;
+  `RecoveryCheckpoint` (`CImporterInternal.h:1937`) holds only `anchor` and
+  `erasedExternalClones`, so `rollbackTo` (`ImportCRecovery.cpp:156`) erases
+  the func ops but leaves the registration; `finalizeProject`
+  (`ImportC.cpp:7003`) then materializes the obligation UNCONDITIONALLY. Its
+  own comment ("falling back to the declaration when no IR use survives")
+  shows the case was known and unhandled. The obligation is an ORPHAN --
+  nothing in the whole program references it.
+
+  **AND IT IS A LIVE HEAD DEFECT, not a future risk gating FR-166.** I filed
+  it as the latter. A NINE-LINE SINGLE-TU C FILE reproduces at plain HEAD,
+  which I verified myself:
+      struct Iface { int x; };
+      extern const struct Iface vl_iface;
+      int use_it(int n) { int r = vl_iface.x + n; __asm__ volatile ("nop"); return r; }
+      int main(void) { return 0; }
+      -> error: unresolved external 'VL_IFACE' at link
+  I TOLD THE SPIKE NOT TO HAND-REDUCE, having failed three times myself. It
+  reduced it anyway. The two ingredients I kept missing: the rejection must
+  land AFTER the body has registered the global (a signature-time rejection
+  never registers it), and the symbol must be a GLOBAL -- an extern FUNCTION
+  prototype is correctly restored by `erasedExternalClones`. All three of my
+  attempts used the wrong shape.
+
+  FIX (slice 1, 31 lines, importer-side): `finalizeProject` skips
+  materializing a deferred `extern_decl` GLOBAL whose symbol has no surviving
+  IR use, queried on the pre-lowering func IR where the reference is still a
+  real symbol use. Fixes it at the source, so shard artifacts, the item graph
+  and the rejection report all stay honest and no link policy changes.
+
+  THE CONSTRAINT THAT BROKE THE SPIKE'S FIRST PROTOTYPE: a function pointer
+  in a global initializer is raw Rust text (`#emitrust.opaque<"Some(f)">`),
+  invisible to symbol tables -- `Driver/link-merge-fnptr.c` caught it. The
+  shipped predicate is globals-only, and the implementer CONFIRMED BY
+  ENUMERATION (every `OpaqueAttr::get` site in the importer) that a
+  pointer-to-GLOBAL never becomes opaque text: those paths fall out at
+  `non-constant global initializer` first. FUNCTION obligations stay hard
+  rejections, which is also what keeps `link-merge-errors.c`'s `add` leg an
+  error -- the predicate separates the two cleanly, unlike FR-154's rename.
+
+  CORPUS SIZING, the number that matters for planning: at HEAD there are ZERO
+  unresolved obligations, but **3,095 symbols** have a drop on both the
+  declaration and definition side and are defined in no shard -- the
+  population that becomes an obligation the moment the declaration side
+  becomes importable. 857 cascade on both sides (roots `SdVarlinkSymbol` 115,
+  `SdBus` 105, `SdDevice` 57, ...) and revive together; **127 are already
+  cause-asymmetric FUNCTIONS with real call sites** (`sd_bus_call`,
+  `sd_bus_add_match`, ...) which this fix deliberately does NOT help. Every
+  FR-165 root-type fix touching `SdBus` turns those into hard errors. Filed
+  as FR-171.
+  Shard churn measured 6 of 501, each differing by exactly one removed
+  `emitrust.global ... {emitrust.extern_decl}` line -- exactly the
+  orphan-bearing units. (The spike's 18 was measured under the FR-166
+  prototype, which admits more units; the implementer caught and explained
+  the discrepancy rather than matching my number.)
+  ALSO RECORDED, not fixed: `LinkMerge.cpp:1068` returns on the FIRST
+  unresolved external, unlike the FR-158 divergence path directly above it
+  which reports all of them -- that is what forced a 12-iteration exclusion
+  loop during the spike. Filed as FR-172.
+  **SLICE 1 LANDED. Slice 2 (link-side defence in depth for stale shards)
+  remains optional.**
+
+- [ ] FR-171 (opened 2026-08-30 by the FR-168 spike's corpus sizing): 127
+  CAUSE-ASYMMETRIC FUNCTION SYMBOLS with real call sites will become hard
+  `unresolved external`s as soon as their declaration side becomes
+  importable. `sd_bus_call`, `sd_bus_add_match`, `memstream_finalize`, ...
+  Their declaration side is dropped by `rejected-type-cascade` while their
+  definition side has an independent blocker, mostly `pointer-to-pointer
+  parameter escapes the cursor-parameter shape`.
+  FR-168 slice 1 deliberately does NOT help these: they HAVE surviving call
+  sites, so orphan-dropping is unsound, and after `ConvertToEmitRust` a call
+  is `emitrust.call_opaque "name"` -- a string, not a symbol ref -- so
+  "unreferenced" cannot be decided for a function at all.
+  DIRECTIONS: fix the definition-side blocker (which is the pointer-model
+  front, FR-165's 5,589 distinct drops), or give the link a stub cascade that
+  materializes an `unimplemented!()` body under the FR-52 marker contract
+  rather than erroring. The second is the general answer and is what makes
+  every FR-165 root-type fix safe to land.
+  **NOT SPIKED.**
+
+- [ ] FR-172 (opened 2026-08-30 by the FR-168 spike): the unresolved-external
+  report is NOT BATCHED. `tools/emitrust-cc/LinkMerge.cpp:1068` returns on the
+  FIRST one, while the FR-158 signature-divergence path directly above it
+  reports every diverging obligation before giving up. On a 501-object link
+  that turns one diagnosis into a 12-iteration exclude-and-retry loop, which
+  is exactly what the FR-166 spike had to do to reach a building crate.
+  Small, mechanical, and it pays for itself the next time a wave makes a
+  cascaded type importable.
   **NOT SPIKED.**
 
 - [ ] FR-169 DEFECT (MISCOMPILE, found by the FR-166 spike 2026-08-30;

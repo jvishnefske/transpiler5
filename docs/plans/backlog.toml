@@ -470,12 +470,12 @@ anchor = "FR-167 (opened 2026-08-30 from the FR-165 root-cause pass): THE"
 id = "FR-168"
 rank = 7
 kind = "defect"
-status = "open"
+status = "landed"
 size = "M"
 title = "An extern_decl obligation can outlive the rejection of its own definition"
-summary = "Found by the FR-166 spike 2026-08-30. A symbol whose declaration and definition are BOTH dropped is harmless, but if anything makes the declaration importable while the definition is still dropped for an unrelated reason, the obligation becomes a hard unresolved-external with no escape hatch at LinkMerge.cpp:1068. Measured on VL_INTERFACE_IO_SYSTEMD: at HEAD both sides cascade off SdVarlinkInterface so the link is clean; under FR-166 the declaration imports, the definition still fails non-constant global initializer, and the 501-object whole-program link dies -- 48 shards excluded to get a building crate. THIS GATES FR-166 and will gate every future fix that makes a previously cascaded type importable, which is the entire point of the FR-165 leverage work, so it will recur. Directions: (a) link policy -- when a shard records that a definition was rejected, demote the matching obligation to a drop-with-cascade rather than a hard error; the shards already carry per-item rejection ledgers so the fact is available at merge time. (b) fix the non-constant global initializer shape, narrower and only moves the problem to the next asymmetric symbol. NOT SPIKED."
+summary = "SLICE 1 LANDED 2026-08-30, gate 919/919, whole-program crate byte-identical. MY ROOT CAUSE AND SEVERITY WERE BOTH WRONG: the obligation outlives the rejection of its USE, not its definition -- pendingExternGlobals.try_emplace is a permanent side effect that rollbackTo never undoes -- and it is a LIVE HEAD defect reproducible in NINE lines, not a future risk gating FR-166. I told the spike not to hand-reduce after failing three times; it reduced it anyway, and the ingredients I missed were that the rejection must land after the body registers the global and that the symbol must be a GLOBAL, since extern function prototypes are correctly rolled back. Fix is 31 lines: skip materializing a deferred extern_decl global with no surviving IR use. Function obligations stay hard rejections, which is what keeps link-merge-errors.c passing. Corpus sizing: zero unresolved at HEAD but 3,095 symbols are one importer fix away, of which 127 are cause-asymmetric functions this fix does not help (FR-171). Found by the FR-166 spike 2026-08-30. A symbol whose declaration and definition are BOTH dropped is harmless, but if anything makes the declaration importable while the definition is still dropped for an unrelated reason, the obligation becomes a hard unresolved-external with no escape hatch at LinkMerge.cpp:1068. Measured on VL_INTERFACE_IO_SYSTEMD: at HEAD both sides cascade off SdVarlinkInterface so the link is clean; under FR-166 the declaration imports, the definition still fails non-constant global initializer, and the 501-object whole-program link dies -- 48 shards excluded to get a building crate. THIS GATES FR-166 and will gate every future fix that makes a previously cascaded type importable, which is the entire point of the FR-165 leverage work, so it will recur. Directions: (a) link policy -- when a shard records that a definition was rejected, demote the matching obligation to a drop-with-cascade rather than a hard error; the shards already carry per-item rejection ledgers so the fact is available at merge time. (b) fix the non-constant global initializer shape, narrower and only moves the problem to the next asymmetric symbol. NOT SPIKED."
 blocked_by = []
-anchor = "FR-168 DEFECT (found by the FR-166 spike 2026-08-30): AN"
+anchor = "FR-168 SLICE 1 LANDED 2026-08-30 (found by the FR-166 spike): AN"
 
 [[items]]
 id = "FR-169"
@@ -498,6 +498,28 @@ title = "UPSTREAM: scf.index_switch rejects case INT64_MAX as a duplicate"
 summary = "Found by the FR-166 spike 2026-08-30, reproduced on unmodified HEAD with no enum or emitrust code involved. scf::IndexSwitchOp::verify uses a DenseSet<int64_t>, and DenseMapInfo<T>::getEmptyKey() for integral T is numeric_limits<T>::max(), so inserting INT64_MAX probes an empty bucket, isEqual fires against the empty key, and insert().second returns false -- reported as a duplicate case value. Root cause verified in the LLVM source at SCF.cpp:3778 and DenseMapInfo.h:113, not guessed. INT64_MIN is fine and INT64_MAX-1 (the tombstone) happens to survive. Real systemd never writes case INT64_MAX so it affected no corpus measurement, but INT64_MAX is exactly the value the _SD_ENUM_FORCE_S64 macro plants, so an FR-166 test switching over one of those enums will hit it. Same class as FR-135. NOT SPIKED."
 blocked_by = []
 anchor = "FR-170 UPSTREAM (found by the FR-166 spike 2026-08-30, reproduced on"
+
+[[items]]
+id = "FR-171"
+rank = 15
+kind = "defect"
+status = "open"
+size = "L"
+title = "127 cause-asymmetric function symbols will hard-error once their declarations import"
+summary = "Opened 2026-08-30 by the FR-168 spike corpus sizing. sd_bus_call, sd_bus_add_match, memstream_finalize and 124 others have a declaration side dropped by rejected-type-cascade and a definition side with an independent blocker, mostly pointer-to-pointer parameter escapes the cursor-parameter shape. FR-168 slice 1 deliberately does not help them: they HAVE surviving call sites so orphan-dropping is unsound, and after ConvertToEmitRust a call is emitrust.call_opaque with a string callee, not a symbol ref, so unreferenced cannot be decided for a function. Every FR-165 root-type fix touching SdBus turns these into hard unresolved externals. Directions: fix the definition-side blocker, which is the pointer-model front; or give the link a stub cascade materializing an unimplemented!() body under the FR-52 marker contract instead of erroring -- the second is the general answer and is what makes every FR-165 root-type fix safe to land. NOT SPIKED."
+blocked_by = []
+anchor = "FR-171 (opened 2026-08-30 by the FR-168 spike's corpus sizing): 127"
+
+[[items]]
+id = "FR-172"
+rank = 19
+kind = "quality"
+status = "open"
+size = "S"
+title = "The unresolved-external report is not batched"
+summary = "Opened 2026-08-30 by the FR-168 spike. LinkMerge.cpp:1068 returns on the FIRST unresolved external, while the FR-158 signature-divergence path directly above it reports every diverging obligation before giving up. On a 501-object link that turns one diagnosis into a 12-iteration exclude-and-retry loop, which is exactly what the FR-166 spike had to do to reach a building crate. Small, mechanical, and it pays for itself the next time a wave makes a cascaded type importable. NOT SPIKED."
+blocked_by = []
+anchor = "FR-172 (opened 2026-08-30 by the FR-168 spike): the unresolved-external"
 
 [[items]]
 id = "FR-138"
