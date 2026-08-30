@@ -17,6 +17,7 @@
 
 #include "EmitRust/CSymbolNaming.h"
 #include "EmitRust/EmitRustOps.h"
+#include "EmitRust/RustCasing.h"
 #include "EmitRust/RustPreludeShadow.h"
 #include "EmitRust/Target/TranslateToRust.h"
 
@@ -25,6 +26,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/raw_ostream.h"
+
+#include <utility>
 
 namespace emitrustcc {
 
@@ -399,11 +402,145 @@ static std::string recoveredStubReason(mlir::emitrust::FuncOp fn) {
   return reason;
 }
 
+namespace {
+
+/// FR-160b: drops a leading `tu<N>_` internal-linkage tag, if there is one.
+///
+/// The tag is applied by `CSymbolNaming.h` to every `static` function, so an
+/// entry point spelled as C wrote it can miss for that reason ALONE, with no
+/// casing involved.
+llvm::StringRef stripTuTag(llvm::StringRef name) {
+  llvm::StringRef rest = name;
+  if (!rest.consume_front("tu"))
+    return name;
+  llvm::StringRef digits =
+      rest.take_while([](char c) { return c >= '0' && c <= '9'; });
+  if (digits.empty())
+    return name;
+  rest = rest.drop_front(digits.size());
+  if (!rest.consume_front("_"))
+    return name;
+  return rest;
+}
+
+/// FR-160b: the `emitrust.func` named `symbol` inside one of `module`'s
+/// `emitrust.impl` blocks, together with the impl that owns it.
+///
+/// `emitrust.impl` carries the `SymbolTable` trait and is a direct child of
+/// the `ModuleOp`, so the module-level `SymbolTable::lookupSymbolIn` this
+/// file was built on structurally CANNOT see an arm the FR-62 actor lift
+/// moved into one. That is what made the old `emitrust.method_of` arm dead
+/// code twice over: the conversion both NESTS the func and STRIPS the
+/// attribute the arm tested for, so the predicate was false on the one shape
+/// it was written for and the caller was told "no function of that name in
+/// this crate" -- a reason that is not true. One `getOps` loop and no walk,
+/// because the nesting is exactly one level deep by construction.
+std::pair<mlir::emitrust::ImplOp, mlir::emitrust::FuncOp>
+lookupImplMethod(mlir::ModuleOp module, llvm::StringRef symbol) {
+  for (auto impl : module.getOps<mlir::emitrust::ImplOp>())
+    if (auto fn = llvm::dyn_cast_if_present<mlir::emitrust::FuncOp>(
+            mlir::SymbolTable::lookupSymbolIn(impl, symbol)))
+      return {impl, fn};
+  return {mlir::emitrust::ImplOp(), mlir::emitrust::FuncOp()};
+}
+
+/// FR-160b: is `symbol` a member of this module's `Externals` trait?
+///
+/// This replaces an `isExternal()` arm that was UNREACHABLE by construction.
+/// A referenced extern is lowered to an `Externals` trait member and never to
+/// a module-level func; an unreferenced one is absent from the module
+/// entirely; and a module-level body-less `emitrust.func` cannot be RENDERED
+/// at all (the Rust translator refuses it, and the FR-52 marker contract
+/// rejects a deferred external), while this function runs only after
+/// rendering succeeded. So the only true statement left about an extern is
+/// the one below, and it is made from the trait.
+bool isExternalsTraitMember(mlir::ModuleOp module, llvm::StringRef symbol) {
+  for (auto trait : module.getOps<mlir::emitrust::TraitDefOp>()) {
+    if (trait.getSymName() != mlir::emitrust::kExternalsTraitName)
+      continue;
+    for (mlir::Attribute name : trait.getFnNames())
+      if (llvm::cast<mlir::StringAttr>(name).getValue() == symbol)
+        return true;
+  }
+  return false;
+}
+
+/// FR-160b: a function this crate DOES define whose emitted name is what the
+/// C spelling `entry` would have become -- FR-53's idiomatic rename, the
+/// `tu<N>_` internal-linkage tag, or both.
+///
+/// A HINT ONLY. Resolving the request through it was measured UNSOUND: two
+/// translation units, one defining `foo_bar` and one defining `fooBar`, both
+/// emit `foo_bar`, and a whole-project registry naming `fooBar` applied one
+/// TU at a time -- FR-160's actual mode -- would then wrap the wrong
+/// function. A wrong wrap in a differential oracle is a false RED or a false
+/// GREEN, strictly worse than the skip it would replace. The tag is ambiguous
+/// for the same reason under `--link`, where `tu0_test_foo` and
+/// `tu1_test_foo` can both exist. So the candidate goes into the diagnostic
+/// and nowhere else.
+mlir::emitrust::FuncOp renameCandidate(mlir::ModuleOp module,
+                                       llvm::StringRef entry) {
+  const std::string wanted = mlir::emitrust::toSnakeCase(entry);
+  auto matches = [&](mlir::emitrust::FuncOp fn) {
+    llvm::StringRef name = fn.getSymName();
+    return name != entry && stripTuTag(name) == wanted;
+  };
+  for (auto fn : module.getOps<mlir::emitrust::FuncOp>())
+    if (matches(fn))
+      return fn;
+  // An actor-lifted arm can be renamed too, and a registry naming it must not
+  // fall through to the bare "no function of that name" message.
+  for (auto impl : module.getOps<mlir::emitrust::ImplOp>())
+    for (auto fn : impl.getBody().getOps<mlir::emitrust::FuncOp>())
+      if (matches(fn))
+        return fn;
+  return {};
+}
+
+/// FR-160b: why `entry` names no module-level function, as truthfully as this
+/// module can say it.
+///
+/// `at` receives the operation to locate the diagnostic at, when there is a
+/// real definition worth pointing the caller at, and is left alone otherwise.
+/// A nonnull `at` also LIFTS the `--test-entries` file's silent-skip rule in
+/// the driver's fold: the file's rationale is "another unit owns this
+/// symbol", and a definition found right here is proof that it does not.
+std::string describeMissingEntry(mlir::ModuleOp module, llvm::StringRef entry,
+                                 mlir::Operation *&at) {
+  auto [impl, method] = lookupImplMethod(module, entry);
+  if (method) {
+    at = method.getOperation();
+    return "rendered as a method of impl '" + impl.getStructName().str() +
+           "', not callable as a free function; the FR-62 actor lift moved it "
+           "there because it touches a file-local global, and a "
+           "Default-constructed receiver would not carry that global's C "
+           "initializer";
+  }
+  if (isExternalsTraitMember(module, entry))
+    return "declared in this unit but defined in another; link the shards to "
+           "wrap it";
+  if (mlir::emitrust::FuncOp candidate = renameCandidate(module, entry)) {
+    at = candidate.getOperation();
+    return "no function of that name in this crate; did you mean '" +
+           candidate.getSymName().str() +
+           "'? A test entry is spelled as EMITTED, and the rename is not "
+           "reversed automatically because two C spellings can fold onto one "
+           "Rust name";
+  }
+  return "no function of that name in this crate";
+}
+
+} // namespace
+
 std::string renderTestModule(mlir::ModuleOp module,
                              llvm::ArrayRef<std::string> entries,
                              llvm::SmallVectorImpl<TestEntryReport> &reports) {
   struct Wrapped {
+    /// The generated `fn`'s name: the request, verbatim.
     std::string symbol;
+    /// The crate symbol it CALLS, which differs from the request only for the
+    /// `main` -> `c_main` alias below.
+    std::string callSymbol;
     bool returnsInt;
     std::string ignoreReason;
   };
@@ -412,24 +549,43 @@ std::string renderTestModule(mlir::ModuleOp module,
   for (const std::string &entry : entries) {
     TestEntryReport report;
     report.symbol = entry;
+    // The symbol the generated test CALLS. The request itself, except for the
+    // one alias below.
+    std::string callSymbol = entry;
     auto fn = llvm::dyn_cast_if_present<mlir::emitrust::FuncOp>(
         mlir::SymbolTable::lookupSymbolIn(module, entry));
+    if (!fn && entry == "main") {
+      // FR-160b: `main` is the ONE C name the emitter renames
+      // UNCONDITIONALLY -- `--preserve-c-names` does not turn it off -- and
+      // `c_main` is a RESERVED name: a unit defining both is rejected with a
+      // located error, so the mapping is injective on every path and this
+      // retry cannot reach the wrong function. That injectivity is exactly
+      // what the casing and `tu<N>_` aliases lack, which is why they hint
+      // and this one wraps.
+      //
+      // It is also the whole of the motivating path:
+      // `scripts/test-entries-meson.py`'s default mode writes the literal
+      // symbol `main` for every one-TU test, and consumed through
+      // `--test-entries` that yielded zero tests and zero words.
+      if (auto renamed = llvm::dyn_cast_if_present<mlir::emitrust::FuncOp>(
+              mlir::SymbolTable::lookupSymbolIn(module,
+                                                llvm::StringRef("c_main")))) {
+        fn = renamed;
+        callSymbol = "c_main";
+      }
+    }
     if (!fn) {
-      // NOT an error: an entries file describes a whole project and is
-      // applied one translation unit at a time.
-      report.skipReason = "no function of that name in this crate";
+      // NOT necessarily an error: an entries file describes a whole project
+      // and is applied one translation unit at a time. But the reason must be
+      // TRUE, and "no function of that name in this crate" was being told to
+      // callers whose function this crate does define -- under the emitted
+      // spelling, as an actor arm, or as an `Externals` trait member.
+      report.skipReason = describeMissingEntry(module, entry, report.op);
       reports.push_back(std::move(report));
       continue;
     }
     report.op = fn.getOperation();
-    if (fn.isExternal()) {
-      report.skipReason = "declared here but defined in another unit; link "
-                          "the shards to wrap it";
-    } else if (fn->hasAttr(mlir::emitrust::kMethodOfAttrName)) {
-      report.skipReason = "rendered as a method of an impl block (an actor "
-                          "arm or a C++ method), not callable as a free "
-                          "function";
-    } else if (fn->hasAttr(mlir::emitrust::kExternalsGenericAttrName)) {
+    if (fn->hasAttr(mlir::emitrust::kExternalsGenericAttrName)) {
       report.skipReason =
           "generic over the Externals trait -- its callees are undefined in "
           "a solo-TU import, so the test could only panic inside a trait "
@@ -446,7 +602,7 @@ std::string renderTestModule(mlir::ModuleOp module,
             "must return an integer or nothing";
       } else {
         report.ignoreReason = recoveredStubReason(fn);
-        wrapped.push_back({entry, returnsInt, report.ignoreReason});
+        wrapped.push_back({entry, callSymbol, returnsInt, report.ignoreReason});
       }
     }
     reports.push_back(std::move(report));
@@ -475,11 +631,14 @@ std::string renderTestModule(mlir::ModuleOp module,
       }
       os << "\"]\n";
     }
+    // The `fn` is named for the REQUEST and calls the resolved symbol, so
+    // requesting both `main` and `c_main` yields two distinctly named
+    // wrappers rather than the rustc E0428 two identical ones would be.
     os << "    fn " << entry.symbol << "() {\n";
     if (entry.returnsInt)
-      os << "        assert_eq!(super::" << entry.symbol << "(), 0);\n";
+      os << "        assert_eq!(super::" << entry.callSymbol << "(), 0);\n";
     else
-      os << "        super::" << entry.symbol << "();\n";
+      os << "        super::" << entry.callSymbol << "();\n";
     os << "    }\n";
   }
   os << "}\n";

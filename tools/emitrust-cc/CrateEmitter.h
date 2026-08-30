@@ -283,7 +283,14 @@ struct TestEntryReport {
   /// stub, whose body is an `unimplemented!`. The gap stays visible in
   /// `cargo test` output instead of vanishing.
   std::string ignoreReason;
-  /// The function, when one was found, for the diagnostic's location.
+  /// The definition to locate the diagnostic at, when there is one worth
+  /// pointing the caller at: the wrappable function itself, the actor-lifted
+  /// arm inside its `emitrust.impl`, or (FR-160b) the function this crate DOES
+  /// define under the emitted spelling of a C-spelled request. Null means
+  /// nothing in this module bears on the request, which is also what makes a
+  /// `--test-entries` file's entry silently skippable -- a nonnull `op` is
+  /// proof that "another unit owns this symbol" is false, and lifts that
+  /// suppression.
   mlir::Operation *op = nullptr;
 };
 
@@ -313,7 +320,10 @@ struct TestEntryReport {
 ///     this restriction, both disappear;
 ///   - it rendered as a method of an impl block (the FR-62 actor lift moves an
 ///     arm that touches a file-local global into one), so it is not callable
-///     as a free function;
+///     as a free function -- and the receiver could not be synthesized either,
+///     because the struct's C initializers are applied only inside `c_main`,
+///     so a `Default`-constructed one was measured to turn a passing program
+///     into a failing test;
 ///   - it returns something other than an integer or nothing.
 /// A recovered STUB is the one case that is emitted anyway, `#[ignore]`d with
 /// its rejection diagnostic, because "this test exists and does not run yet"
@@ -322,6 +332,17 @@ struct TestEntryReport {
 /// The generated module reaches its subjects through `super::`, so a
 /// file-local (non-`pub`) function -- which is what every `static` test body
 /// imports as -- is wrappable without changing its visibility.
+///
+/// FR-160b: AN ENTRY IS SPELLED AS THE CRATE EMITS IT. Exactly one C spelling
+/// is aliased back: `main`, which the emitter renames to `c_main`
+/// unconditionally and which is injective because `c_main` is a reserved name
+/// (a unit defining both is a located error). Every other rename -- FR-53's
+/// idiomatic casing, the `tu<N>_` internal-linkage tag -- is offered as a
+/// HINT in the skip reason and never resolved, because the reverse mapping is
+/// not injective: `foo_bar` and `fooBar` in two translation units both emit
+/// `foo_bar`, and a whole-project registry applied one TU at a time would wrap
+/// the wrong function. A wrong wrap in a differential oracle is a false RED or
+/// a false GREEN, strictly worse than the skip it replaces.
 ///
 /// \param module the fully converted module about to be rendered.
 /// \param entries the requested entry-point symbols, in order.
