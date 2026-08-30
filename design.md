@@ -10859,6 +10859,93 @@ piece and becomes FR-45.
   splitting the 24 direct sites by message (`union with a pointer arm` 12,
   `union with an unnamed arm` 4, and a bare `union type` remainder are all
   visible in the deduped ledger) rather than treating it as one item.
+  SPIKED 2026-08-30: **GO-with-constraints, in two phases behind a PHASE 0 of
+  three HEAD defects the spike measured on the way.** Amplification re-measured
+  on the post-FR-166 ledger and unchanged: 574 total, 24 direct, 550 gated.
+
+  **MY MECHANISM STORY WAS WRONG, and the correction makes this far smaller.**
+  FR-78's opaque diversion lives INSIDE `collectUnionSlot`
+  (`ImportCAggregates.cpp:1868`), reached only for a union that has a TYPE --
+  a named member. The anonymous-union flattening path in
+  `collectRecordFields` NEVER CALLS IT. So the fix is a ROUTING change -- stop
+  flattening a union that cannot flatten, and let the ordinary union import
+  handle it -- not a widening of `allArmsAggregate`. Proof: six systemd union
+  shapes rewritten as NAMED members, and FOUR OF SIX already import today,
+  unchanged, via FR-78.
+
+  MY REFRAMING ("550 are cascades that only need representability") is
+  DIRECTIONALLY RIGHT BUT NUMERICALLY WRONG. Measured: 317 items really do
+  unblock (`HashmapBase` 70, `DnsResourceRecord` 59, `Hashmap` 41,
+  `OrderedHashmap` 36, `HwAddrData` 35, `Set` 34, ...) and they do NOT
+  re-reject on arm access, so the core claim holds. But 226 then hit a second,
+  unrelated blocker, overwhelmingly the pointer model (`void pointer
+  parameter` 55, `returned pointer value` 40, `ptr-to-ptr` 29). Net ledger
+  movement 91 (phase 1) / 127 (phase 2); symbols going blocked -> clean 23/44.
+  My 550 is a ~1.7x overcount at the unblock layer and ~6x at the net layer.
+  Both phases: cargo build 0 errors; raw `unsupported: union type` 118 -> 7 -> 2.
+
+  ALSO FALSIFIED: FOUR bare-`union type` sites, not three (1629, 1633, 1730
+  and 1738, `anonymousUnionArmLeaf`'s empty-arm case); 16 symbols at 11
+  locations, not 14; and `--link` does NOT accept `--incremental`.
+
+  **METHOD CORRECTION, and it invalidates something I have been relying on:
+  the 992-source hash sweep is BLIND TO `split-file` SUB-UNITS.** It reported
+  0 of 992 changed while SIX lit tests flipped, every one a `split-file` test.
+  Good first filter; only the lit suite detects that class. Never report
+  "zero golden churn" from the sweep alone.
+
+  PHASE 1 (smallest): run the existing flatten as a TRIAL under a
+  `ScopedDiagnosticHandler` (the idiom already at `:261` and `:1102`); on
+  failure roll back `fieldNames`/`fieldTypes`/`unionSlotStorage` and append
+  the union as a synthesized-named member via ordinary `mapType`, re-emitting
+  the captured trial diagnostics verbatim if the union import ALSO fails so
+  every residual rejection keeps its exact location and wording. No new op, no
+  new attribute, no change to `collectUnionSlot` or `allArmsAggregate`.
+  PHASE 2: the same trial/rollback INSIDE `collectUnionSlot`, falling back to
+  the sizeof blob when the union is C, non-empty, and has no bit-field or
+  incomplete-array arm -- this subsumes all four widening candidates at once.
+  Byte identity holds by construction: the fallback only runs where today's
+  code returns `failure()`.
+  Phase 2's own cost, to weigh: it converts 131 items into a NEW blocker class
+  (`global initializer for this type`), because FR-78 admits only the all-zero
+  constant on a blob. Still nets better than phase 1.
+  C++ stays EXCLUDED, and phase 1 should gate on `!CPlusPlus` too even though
+  it measured clean, because `collectRecordFields` is shared and a
+  non-flattening anonymous union would newly reach `collectUnionSlot`.
+  **SPIKED GO; BLOCKED ON FR-173 (phase 0).**
+
+- [ ] FR-173 (opened 2026-08-30 by the FR-167 spike): THREE DEFECTS AT HEAD,
+  all found while spiking unions, all independently worth fixing, and together
+  they are FR-167's phase 0.
+  (D1) FR-78's CROSS-TU OPAQUE-UNION SHAPE KEY IS NOT TU-STABLE.
+  `ImportCAggregates.cpp:566-570` folds
+  `arm->getType().getCanonicalType().getAsString()` into the dedup key, and
+  for a TAGLESS arm clang prints the path AS THAT TU's SourceManager RECORDED
+  IT. Measured, the same C union in two systemd TUs:
+      value@struct BusMatchNode::(unnamed at /tmp/.../build-sd/../src/...:54:17);
+      value@struct BusMatchNode::(unnamed at ../src/...:54:17);
+  -> `AnonD68F12F12597` vs `Anon33A9A5B7AD69`, both literally
+  `{opaque: [u8;16]}` -> the FR-58 merge sees the WRAPPER as structurally
+  different -> shape conflict -> TU-local demotion. Absolute-vs-relative
+  DIRECTORY prefix, not basename. Fix: location-free `PrintingPolicy` plus arm
+  size plus arm `getODRHash()`. Measured: per-TU modules 8 -> 1 (the HEAD
+  baseline), cargo 24 errors -> 0. LATENT SINCE FR-78.
+  (D2) A DEMOTED PER-TU MODULE EMITS NO `use super::*;`.
+  `TranslateToRust.cpp:4532` emits `mod <tuN> {` with no import, so any
+  demoted struct naming a crate-level type is rustc E0425. REPRODUCED AT HEAD
+  with unpatched tools in two C files. FR-167 does not create this; it makes
+  it reachable (7 extra demotions, 24 E0425s).
+  (D3) THE EMITTER ACCEPTS A BOGUS MEMBER SELECTION SILENTLY.
+  FR-78's marker check only inspects member ops whose BASE TYPE is the marked
+  union struct, so an `emitrust.member %0["opaque"]` emitted against the
+  PARENT struct passes and the crate dies at rustc E0609 (`no field 'opaque'
+  on type 'S'`). At HEAD `emitrust-translate` accepts the bogus selection with
+  rc=0. Needs a GENERAL structural backstop: every `emitrust.member` whose
+  base is a struct_def of this module must name a field that def actually has.
+  **It must run AFTER the FR-78 marker check** -- placed before, it shadows
+  the FR-78 wording and breaks `test/Target/Rust/errors.mlir:130`.
+  D3 MATTERS MOST: it is a MISSING BACKSTOP, so it silently admits a whole
+  class rather than one shape.
   **NOT SPIKED.**
 
   **NOT SPIKED.**

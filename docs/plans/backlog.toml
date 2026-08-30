@@ -459,11 +459,11 @@ anchor = "FR-166 PHASE 1 LANDED 2026-08-30 (opened the same day from the"
 id = "FR-167"
 rank = 14
 kind = "defect"
-status = "open"
+status = "spiked"
 size = "M"
 title = "The union-type rejection gates 574 items at 23x amplification"
-summary = "Opened 2026-08-30 from the FR-165 root-cause pass. 24 direct drops but 550 cascaded, the HIGHEST amplification measured in the corpus. By direct count it ranks 24th and would never be picked; by transitive weight it is the 7th largest blocker in a 501-TU program. FR-78 already built an opaque-union representation, so the question is not whether unions can be represented but which ones still take this rejection -- split the 24 direct sites by message first (union with a pointer arm 12, union with an unnamed arm 4, bare union type remainder) rather than treating it as one item. NOT SPIKED."
-blocked_by = []
+summary = "SPIKED GO 2026-08-30, blocked on FR-173 phase 0. MY MECHANISM STORY WAS WRONG: FR-78 opaque diversion lives inside collectUnionSlot, which the anonymous-union flattening path NEVER CALLS, so the fix is a ROUTING change (stop flattening, let the ordinary union import handle it) not a widening of allArmsAggregate -- proven by rewriting six systemd shapes as named members, four of which already import unchanged. My 550-cascade reframing is directionally right but numerically wrong: 317 truly unblock and do not re-reject on arm access, but 226 hit a second blocker, overwhelmingly the pointer model; net 91 (phase 1) / 127 (phase 2), 23/44 symbols cleaned, cargo 0 errors both phases, raw union-type occurrences 118 to 7 to 2. Also falsified: four bare sites not three, 16 symbols not 14, and --link does not accept --incremental. METHOD CORRECTION: the 992-source hash sweep is blind to split-file sub-units, reporting 0/992 while six lit tests flipped. Opened 2026-08-30 from the FR-165 root-cause pass. 24 direct drops but 550 cascaded, the HIGHEST amplification measured in the corpus. By direct count it ranks 24th and would never be picked; by transitive weight it is the 7th largest blocker in a 501-TU program. FR-78 already built an opaque-union representation, so the question is not whether unions can be represented but which ones still take this rejection -- split the 24 direct sites by message first (union with a pointer arm 12, union with an unnamed arm 4, bare union type remainder) rather than treating it as one item. NOT SPIKED."
+blocked_by = ["FR-173"]
 anchor = "FR-167 (opened 2026-08-30 from the FR-165 root-cause pass): THE"
 
 [[items]]
@@ -520,6 +520,17 @@ title = "The unresolved-external report is not batched"
 summary = "Opened 2026-08-30 by the FR-168 spike. LinkMerge.cpp:1068 returns on the FIRST unresolved external, while the FR-158 signature-divergence path directly above it reports every diverging obligation before giving up. On a 501-object link that turns one diagnosis into a 12-iteration exclude-and-retry loop, which is exactly what the FR-166 spike had to do to reach a building crate. Small, mechanical, and it pays for itself the next time a wave makes a cascaded type importable. NOT SPIKED."
 blocked_by = []
 anchor = "FR-172 (opened 2026-08-30 by the FR-168 spike): the unresolved-external"
+
+[[items]]
+id = "FR-173"
+rank = 6
+kind = "defect"
+status = "open"
+size = "M"
+title = "Three HEAD defects found while spiking unions (FR-167 phase 0)"
+summary = "Opened 2026-08-30 by the FR-167 spike. D1: FR-78 cross-TU opaque-union shape key is not TU-stable -- it folds the canonical type string of a TAGLESS arm, which clang prints with the path as that TU recorded it, so the same union hashes differently on an absolute-vs-relative directory prefix and the FR-58 merge sees the WRAPPER as structurally different, causing TU-local demotion. Fix: location-free PrintingPolicy plus arm size plus arm ODR hash; measured per-TU modules 8 to 1 and cargo 24 errors to 0. Latent since FR-78. D2: a demoted per-TU module emits no use-super import, so any demoted struct naming a crate-level type is rustc E0425 -- reproduced at HEAD with unpatched tools in two C files. D3: the emitter accepts a bogus member selection SILENTLY, because the FR-78 marker check only inspects member ops whose base type is the marked union struct, so a member op against the PARENT struct passes and the crate dies at E0609; needs a general structural backstop that every emitrust.member naming a struct_def of this module names a field that def has, ordered AFTER the FR-78 marker check or it shadows that wording. D3 matters most: it is a missing backstop admitting a whole class. NOT SPIKED."
+blocked_by = []
+anchor = "FR-173 (opened 2026-08-30 by the FR-167 spike): THREE DEFECTS AT HEAD,"
 
 [[items]]
 id = "FR-138"
