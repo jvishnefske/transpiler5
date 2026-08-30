@@ -330,8 +330,8 @@ kind = "defect"
 status = "open"
 size = "M"
 title = "Two unrelated file-local record tags in different TUs compute one emitted name"
-summary = "Found by the FR-151 spike 2026-08-29. src/basic/hashmap.c:119 struct swap_entries idiomatic-renames to SwapEntries and collides at link with src/shared/hibernate-util.c:177 typedef struct SwapEntries; neither is header-shared. FR-108's same-name guard is keyed on currentTuTag so it only fires within ONE import, and under the shard path the two TUs never meet until mergeShards, which sees only names and shapes. This is the one of nine conflicting names in the 495-shard systemd-detect-virt scan that FR-151 does not fix, and it is now the first error that link reports. Directions: (a) link-time retag of a divergent name whose uses are shard-local, which is AST-independent and so does not disturb the CSymbolNaming byte-identity invariant that made FR-108 choose reject over rename; (b) keep rejecting but name both source locations. NOT SPIKED."
-blocked_by = []
+summary = "SPIKED 2026-08-29; superseded by FR-159. Three mechanisms measured. The entry direction (b) was already implemented -- the diagnostic already names both locations. (B) import-time TU tag: NO-GO, two blockers, including a correctness regression on legal C (two TUs with an identical file-scope struct P shared via an extern function link today; tagging makes that E0308). (A/A-prime) link-time shape-partition rename fenced to main-file records: measured WORKING, 501-object link exit 0 at 12,104,324 bytes, gate 901/902 -- but every rename mechanism flips link-merge-errors.c, whose Box inputs are structurally the same program as the systemd collision. (C) keep rejecting: cost is exactly one TU of 501. Repo owner chose none of the three: use Rust modules instead (FR-159). Also measured: --preserve-c-names does not exist on the shard path, so the rejection is terminal there."
+blocked_by = ["FR-159"]
 anchor = "FR-154 DEFECT (found by the FR-151 spike"
 
 [[items]]
@@ -377,6 +377,17 @@ title = "Reconcile the cross-shard pointer model so the whole-program crate buil
 summary = "Found by building the FR-156 whole-program link 2026-08-29. The real prize behind FR-157. UNTESTED HYPOTHESIS: a definition has a body so the importer sees the parameter indexed and picks the slice model, while a bare header prototype has no body evidence and defaults to the single-object cursor mut_ref<i8>; if so the divergence is predictable from declaration-vs-definition alone and could be fixed by giving the declaration path the model the definition will choose, or by deferring the choice to link. MEASURE IT FIRST -- it is the entry's own guess. Note the per-UNIT crates never show this, because within one unit the callee is an FR-52 obligation carrying the caller's own inferred signature, so the two agree by construction; only two independently-imported units meeting can expose it. NOT SPIKED."
 blocked_by = []
 anchor = "FR-158 (found by building the FR-156 whole-program link"
+
+[[items]]
+id = "FR-159"
+rank = 16
+kind = "feature"
+status = "open"
+size = "L"
+title = "Use Rust modules instead of tu<N>_ name mangling for TU-local items"
+summary = "Opened by the repo owner 2026-08-29 in place of FR-154's three measured mechanisms. Emit each TU's TU-local items into `mod tu<N>` and refer to them by path; header-shared types stay at crate root. Dissolves FR-154 by construction and replaces the whole mangling scheme with the language's actual mechanism. Measured starting point: the 12 MB whole-program crate has ZERO mod blocks and the emitter's only module is a hardcoded actor_rt epilogue, so this is a new capability. Modules do NOT escape FR-154's two constraints, they relocate them: the shape partition stays mandatory (or the legal identical-struct-P-via-extern idiom becomes E0308), and link-merge-errors.c still needs respecifying. Discriminator must be AST-pure per FR-108; SourceManager::isInMainFile measured sound. NOT on the critical path to a BUILDING whole-program crate -- that is FR-157/FR-158. SPIKING."
+blocked_by = []
+anchor = "FR-159 (opened by the repo owner 2026-08-29"
 
 [[items]]
 id = "FR-138"
