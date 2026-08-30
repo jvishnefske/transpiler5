@@ -335,6 +335,17 @@ blocked_by = []
 anchor = "FR-154 DEFECT (found by the FR-151 spike"
 
 [[items]]
+id = "FR-155"
+rank = 11
+kind = "defect"
+status = "landed"
+size = "S"
+title = "A dead goto silently changed a function's answer: loop-body place lost its per-iteration reset"
+summary = "LANDED 2026-08-29, found by the FR-152 spike. MISCOMPILE. createVariablePlace hoists the emitrust.variable op to the function entry block whenever currentHasLabels (so a goto over a declaration cannot leave a later use undominated), and FR-61f separately attaches a compile-time-constant initializer TO THE OP to avoid clippy::needless_late_init -- so the hoist carried the initializer out of the loop and the per-iteration reset was lost. clang printed 3, the crate printed 4; deleting the dead label pair changed the answer back. Fix: the constant-init fast path additionally requires !currentHasLabels, falling through to the general path whose storeToPlace lands inside the loop. Scope confirmed by byte-diff: aggregate, array, unsigned and non-constant-init companions MATCH both before and after. Gate 894/894, zero golden churn."
+blocked_by = []
+anchor = "FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike"
+
+[[items]]
 id = "FR-138"
 rank = 14
 kind = "tooling"

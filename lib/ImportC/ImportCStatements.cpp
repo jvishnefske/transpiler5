@@ -531,7 +531,24 @@ LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
     // renders `let mut s: i32 = 0;` instead of a late `let mut s; s = 0;`
     // (clippy::needless_late_init). Scoped to placeBackedScalars so no other
     // place local's golden shifts.
-    if (placeBackedScalars.contains(var) && !isUnsignedInt(*mlirType))
+    //
+    // FR-155: NOT in a function that has a label. There,
+    // `createVariablePlace` hoists the `emitrust.variable` op to the entry
+    // block (so a goto over a declaration cannot leave a later use
+    // undominated), and an init attribute rides on the OP -- so the hoist
+    // carries the initializer out of the loop with the declaration and the
+    // per-iteration reset is silently lost. Adding a dead `goto`/label to a
+    // function then changes its answer: `for (...) { int s = 0; s += i;
+    // total += s; }` accumulated 0,1,3 instead of resetting. Falling through
+    // to the general path below emits the place without an init and a
+    // `storeToPlace` at the CURRENT insertion point, i.e. inside the loop
+    // body, which is correct. The clippy::needless_late_init win is
+    // deliberately surrendered in labelled functions: correctness outranks
+    // the cosmetic, and only the labelled case pays. Pinned by
+    // test/EndToEnd/label-hoist-reinit.c (byte-diff) and
+    // test/Import/C/label-hoist-reinit.c (IR shape).
+    if (placeBackedScalars.contains(var) && !isUnsignedInt(*mlirType) &&
+        !currentHasLabels)
       if (const clang::Expr *init = significantInit(var))
         if (std::optional<llvm::APSInt> constant =
                 init->getIntegerConstantExpr(astContext())) {
