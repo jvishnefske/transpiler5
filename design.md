@@ -10295,6 +10295,94 @@ piece and becomes FR-45.
   **PHASE 1 LANDED. Phase 2 (source-stem module names) and Phase 3 (statics
   into modules, HELD behind FR-157/FR-158) remain.**
 
+- [ ] FR-160 FEATURE (opened by the repo owner 2026-08-29 out of the systemd
+  probe): A C PROJECT'S OWN TEST SUITE IS A DIFFERENTIAL ORACLE THE EMITTER
+  THROWS AWAY. Today an emitted crate is validated by "does it compile"
+  (FR-145) and, for this repo's corpus only, by the EndToEnd byte-diff. Every
+  third-party project with a test suite ships assertions about its own
+  behaviour; ported, they are a byte-free correctness oracle on code no
+  EndToEnd test will ever cover -- `cargo test` green means the C suite's own
+  assertions hold in the transpiled code. Measured on the systemd probe: 201
+  of 2283 `src/test` functions import (8.8%), and their bodies are emitted --
+  `test-hexdecoct` carries TEN real `fn tu0_test_hexchar<E: Externals>()`
+  bodies -- but nothing calls them. `cargo test` in that crate reports
+  `0 passed; 0 failed`, and `grep -c tu0_test_hexchar` is 1: the definition,
+  zero call sites. **The work is already imported and is 100% wasted.**
+  THE SEAM THAT KEEPS THIS GENERAL, and the reason it is one FR and not a
+  systemd feature: the EMITTER never learns what a build system is. It takes a
+  LIST OF SYMBOLS and wraps each one; turning a project into that list is an
+  out-of-emitter adapter under `scripts/`.
+  PHASE A (emitter, project-agnostic): `--test-entry=<sym>` (repeatable) and
+  `--test-entries=<file>`. Each named symbol gains an entry in a
+  `#[cfg(test)] mod emitrust_tests`:
+    - ported, callable with no arguments  -> `#[test] fn <sym>() { <call> }`
+    - ported, returns an integer (the C `main`/exit-code shape)
+                                          -> `#[test] { assert_eq!(<call>, 0) }`
+    - STUBBED -> `#[test] #[ignore = "<the rejection diagnostic>"]`, so the gap
+      is VISIBLE in `cargo test` output instead of silently absent
+    - dropped / never imported / needs arguments / generic over `Externals`
+      with no impl in scope -> NO test emitted, a LOCATED warning naming the
+      symbol and the reason, and a count in `emitrust-progress.json`
+  The `Externals` case is a REJECTION, not a stub: a test that panics inside
+  `Externals::x` proves nothing, and a green suite of vacuous passes is worse
+  than no suite. It becomes emittable exactly when the crate is `--link`ed and
+  the trait is gone -- which makes this a second consumer of FR-158/FR-159 and
+  a reason to finish them.
+  Off by default; with the flag absent the crate is BYTE-IDENTICAL, the
+  standing rule (cf. `--c-abi-exports`, FR-139).
+  PHASE B (discovery adapter, `scripts/`): meson introspection -> entries file.
+  MEASURED on systemd `39cf979` reconfigured with `-Dtests=true`:
+  4518 tests, **all `protocol: "exitcode"`** -- the pass criterion is exit
+  status 0, which maps 1:1 onto `#[test]` (panic = fail), so the oracle needs
+  no invention; 771 whose `cmd[0]` is a meson-built target; **337 built from
+  exactly ONE `.c` file** (a clean TU <-> test-binary mapping needing no link
+  step), 333 of which take no extra argv; 335 of the 337 already emit a crate.
+  `meson-info/intro-tests.json` is the artifact -- NOT `add_test_setup`, which
+  only configures the default setup's wrapper and suite exclusions. Verified
+  the `exe_wrapper` (systemd's `tools/test-crash-trace.sh`) does NOT appear in
+  the introspected `cmd`: meson applies it at run time, so introspection hands
+  back the bare executable. A CTest adapter is the same shape
+  (`ctest --show-only=json-v1`); that equivalence is the generality claim.
+  PHASE B IS WRITTEN AND MEASURED ON THIS BRANCH (`scripts/test-entries-meson.py`,
+  2026-08-29; the EMITTER side is still unbuilt). Run against systemd's
+  configured tree it selects 337 of 4518 tests (3747 have a non-target `cmd[0]`
+  -- clang-tidy, header and script tests; 431 are multi-source and need
+  `--link`; 3 have no C source) and emits `<source>\t<symbol>` pairs. In
+  default mode that is 337 `main` entries, of which ONE has a real body. In
+  `--entry-regex '^tu0_test_'` mode -- the bridge for a table-registered suite,
+  reading the symbol list out of the already-emitted crate -- it yields
+  **2444 candidate test bodies across 289 units** (46 units match nothing, 2
+  have no crate). 2444 vs 1 is the whole argument for wrapping bodies rather
+  than mains, and it is measured, not estimated.
+  WHY `main` IS THE WRONG ENTRY POINT, measured before proposing it: of the 337
+  one-TU meson tests, 47 crates carry a `main`/`c_main` and **exactly ONE has a
+  real body** -- the other 46 are `unimplemented!` stubs. `src/shared/tests.h`
+  :106-142 is why: `TEST(name)` registers through
+  `_section_("SYSTEMD_TEST_TABLE")` and `DEFINE_TEST_MAIN` runs
+  `run_test_table(__start_SYSTEMD_TEST_TABLE, __stop_SYSTEMD_TEST_TABLE)`.
+  main's whole body is "walk a linker-section array between two
+  linker-provided boundary symbols", which has no Rust representation -- it is
+  the dangling `tu0_dispatch_void_func(f: &mut [Option<fn()>])` in the emitted
+  crate. So Phase A must accept a list naming the TEST BODIES, and a later
+  Phase C could recognise the section-table registration pattern and synthesise
+  that list with no build system in the loop. The substitution is the point:
+  the section table is a registration mechanism and cargo's harness IS a
+  registration mechanism, so we swap one for the other rather than emulate.
+  ACCEPTANCE CRITERIA:
+    1. flag absent -> emitted crate byte-identical (Driver golden).
+    2. ported no-arg void entry -> a `#[test]` `cargo test` runs and passes.
+    3. ported `int f(void)` -> `assert_eq!(f(), 0)`; a nonzero return FAILS.
+    4. stubbed entry -> reported `ignored` with the diagnostic, never `passed`.
+    5. dropped/absent/needs-args/Externals-generic -> no test, located warning,
+       counted in the progress JSON.
+    6. the meson adapter over a configured project emits only symbols that
+       exist in the emitted crates (round-trip on this repo's own corpus, NOT
+       on systemd -- systemd is the demand signal, not the test fixture).
+  **NOT SPIKED.** Spike questions, in order: does a `#[cfg(test)] mod` survive
+  the emitted crate's `[lints.rust] deny` block; is `cargo test` on an emitted
+  crate green today (baseline measured: yes, 0 tests, exit 0); and on a merged
+  `--link` crate, is `Externals` actually gone so a test body is callable.
+
 - [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
   the same day): A DEAD `goto` SILENTLY CHANGED A FUNCTION'S ANSWER. A
   place-backed scalar declared inside a loop body lost its per-iteration
