@@ -561,10 +561,36 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
     // opaque unions never merge under the shape-keyed `Anon<hash>` naming,
     // while the same union reached through a shared header in several TUs
     // still dedups to one struct_def.
-    if (opaqueUnions.contains(definition))
-      for (const clang::FieldDecl *arm : definition->fields())
+    //
+    // FR-173 D1: the arm spelling must be TU-STABLE. clang's DEFAULT
+    // printing policy renders a TAGLESS arm as
+    // `(unnamed at <PATH>:<line>:<col>)`, and <PATH> is whatever THAT TU's
+    // SourceManager recorded -- absolute in one TU, `../src/...` in the
+    // next -- so the same C union hashed differently on nothing but an
+    // include-path spelling, giving two `Anon<hash>` blobs, two
+    // structurally different wrappers, and either a link rejection or a
+    // per-TU demotion of the wrapper (measured on systemd's
+    // `BusMatchNode`; test/Driver/link-opaque-union-header-spelling.c is
+    // the regression). Suppress anonymous tag LOCATIONS so no source path
+    // can reach the key, and restore the identity they were standing in
+    // for with the arm's own SIZE and ODR hash -- both TU-stable by
+    // construction, and together they keep two genuinely different tagless
+    // arms apart (the `anon-distinct.c` leg of
+    // test/Import/C/union-opaque-aggregate.c pins that side).
+    if (opaqueUnions.contains(definition)) {
+      clang::PrintingPolicy policy(astContext().getLangOpts());
+      policy.AnonymousTagLocations = false;
+      for (const clang::FieldDecl *arm : definition->fields()) {
         os << arm->getName() << '@'
-           << arm->getType().getCanonicalType().getAsString() << ';';
+           << arm->getType().getCanonicalType().getAsString(policy) << '#'
+           << astContext().getTypeSizeInChars(arm->getType()).getQuantity();
+        if (clang::RecordDecl *armRecord =
+                arm->getType().getCanonicalType()->getAsRecordDecl())
+          if (clang::RecordDecl *armDef = armRecord->getDefinition())
+            os << '/' << armDef->getODRHash();
+        os << ';';
+      }
+    }
     // FR-122: the field shape alone cannot see MEMBER semantics, so two
     // same-named records with identical fields but different member
     // surfaces merged silently -- and the merged struct_def carried

@@ -4346,6 +4346,55 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
              << "' member access leaked to emission; the importer must "
                 "reject this at the access site";
   }
+  // FR-173: the GENERAL structural backstop the marker check above is one
+  // special case of. FR-78 only inspects member ops whose BASE TYPE is the
+  // marked union, so a selection made against the PARENT struct sailed
+  // straight through -- measured at HEAD, a module selecting "opaque" on a
+  // `struct S` with fields ["cmd", "u"] translated with rc=0 and rendered
+  // `v0.opaque[...]`, which is the very rustc E0609 whole-crate loss FR-78
+  // exists to prevent, just reached by a different route. So cross-check
+  // EVERY `emitrust.member` whose base names a struct_def OF THIS MODULE
+  // against that def's field list; a struct type this module carries no
+  // def for (an extern or opaque record) has no field list here and is not
+  // this check's business.
+  //
+  // ORDER IS LOAD-BEARING: this runs AFTER the marker check, never before.
+  // An ARM selection on a marked union violates both rules at once, and
+  // FR-78's wording is the one that names the broken contract and the
+  // importer's obligation (test/Target/Rust/errors.mlir pins it, and
+  // test/Target/Rust/member-field-backstop.mlir pins the ordering).
+  {
+    llvm::StringMap<llvm::StringSet<>> structFields;
+    for (auto structDefOp : moduleOp.getOps<emitrust::StructDefOp>()) {
+      llvm::StringSet<> &names = structFields[structDefOp.getSymName()];
+      for (Attribute nameAttr : structDefOp.getFieldNames())
+        if (auto str = dyn_cast<StringAttr>(nameAttr))
+          names.insert(str.getValue());
+    }
+    emitrust::MemberOp bad;
+    llvm::StringRef badStruct;
+    moduleOp.walk([&](emitrust::MemberOp memberOp) {
+      auto lvalueType =
+          dyn_cast<emitrust::LValueType>(memberOp.getOperand().getType());
+      auto structType =
+          lvalueType ? dyn_cast<emitrust::StructType>(lvalueType.getValueType())
+                     : emitrust::StructType();
+      if (!structType)
+        return WalkResult::advance();
+      auto it = structFields.find(structType.getName());
+      if (it == structFields.end())
+        return WalkResult::advance();
+      if (it->second.contains(memberOp.getMember()))
+        return WalkResult::advance();
+      bad = memberOp;
+      badStruct = structType.getName();
+      return WalkResult::interrupt();
+    });
+    if (bad)
+      return bad.emitError()
+             << "member '" << bad.getMember() << "' does not exist on struct '"
+             << badStruct << "'";
+  }
   // FR-77: a fn-ptr constant is rendered by writing its opaque
   // `Some(<name>)` text verbatim, and that name is NOT a symbol use — no
   // verifier, no walk, nothing structural keeps a planner change from
@@ -4490,11 +4539,106 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
     if (failed(emitOperation(op)))
       return failure();
   }
+  // FR-173 D2: a module item may still NAME a crate-ROOT item, and inside
+  // `mod tu<N>` a bare name resolves in the MODULE's namespace. The
+  // measured case is the FR-159 sink itself: only a shape-CONFLICTING
+  // record sinks, so a sunk `struct S { struct P p; }` leaves `P` at the
+  // root and the emitted `pub(crate) p: P` is rustc
+  // `error[E0425]: cannot find type 'P' in this scope` -- the whole crate
+  // lost to a rustc error with no source location, which is the direction
+  // FR-159's own escape guard exists to refuse. `use super::*;` at the head
+  // of the module resolves the whole class at once, and a module item's own
+  // name still wins over it (an explicit item shadows a glob import), which
+  // is exactly what the sink needs.
+  //
+  // The import is emitted only for a module that actually REACHES a root
+  // name: an unused `use super::*;` is a rustc `unused_imports` warning
+  // (measured), and every module the emitter produced before FR-173 names
+  // nothing at the root and so keeps its bytes exactly
+  // (test/Target/Rust/module-items.mlir,
+  // test/Driver/link-merge-module-sink.c,
+  // test/EndToEnd/link-module-sink-e2e.c).
+  llvm::StringSet<> rootItemNames;
+  if (!modulePaths.empty())
+    for (Operation &op : *moduleOp.getBody())
+      if (StringAttr symbol = SymbolTable::getSymbolName(&op))
+        if (itemModulePath(symbol.getValue()).empty())
+          rootItemNames.insert(symbol.getValue());
+  // Whether any item of `path` names a crate-root item that the module does
+  // not itself define. The carriers are the same ones FR-159's escape
+  // analysis enumerates: named TYPES (however deeply nested), symbol
+  // references, and the plain-TEXT payloads (`emitrust.call_opaque`
+  // callees, `emitrust.opaque` attributes, an impl's struct name) that no
+  // structural rewrite can reach.
+  auto moduleNeedsRootImport = [&](StringRef path) {
+    llvm::StringSet<> owned;
+    for (Operation *item : moduleItems[path])
+      if (StringAttr symbol = SymbolTable::getSymbolName(item))
+        owned.insert(itemLeafName(symbol.getValue()));
+    bool needs = false;
+    auto note = [&](StringRef name) {
+      if (name.empty() || name.contains("::") || owned.contains(name))
+        return;
+      if (rootItemNames.contains(name))
+        needs = true;
+    };
+    auto noteNamedType = [&](Type sub) {
+      if (auto structType = dyn_cast<emitrust::StructType>(sub))
+        note(structType.getName());
+      else if (auto enumType = dyn_cast<emitrust::EnumType>(sub))
+        note(enumType.getName());
+      else if (auto dataEnumType = dyn_cast<emitrust::DataEnumType>(sub))
+        note(dataEnumType.getName());
+    };
+    // Whole identifiers of a plain-text carrier, skipping any that is
+    // already `::`-qualified: `Some(crate::tu0::add1)` names nothing at the
+    // root even when the root happens to define an `add1`.
+    auto noteText = [&](StringRef text) {
+      auto isIdentChar = [](char c) { return llvm::isAlnum(c) || c == '_'; };
+      size_t index = 0;
+      while (index < text.size()) {
+        if (!isIdentChar(text[index])) {
+          ++index;
+          continue;
+        }
+        size_t start = index;
+        while (index < text.size() && isIdentChar(text[index]))
+          ++index;
+        bool qualified =
+            start >= 2 && text[start - 1] == ':' && text[start - 2] == ':';
+        if (!qualified)
+          note(text.substr(start, index - start));
+      }
+    };
+    for (Operation *item : moduleItems[path])
+      item->walk([&](Operation *inner) {
+        for (Type type : inner->getOperandTypes())
+          type.walk(noteNamedType);
+        for (Type type : inner->getResultTypes())
+          type.walk(noteNamedType);
+        if (auto call = dyn_cast<emitrust::CallOpaqueOp>(inner))
+          noteText(call.getCallee());
+        if (auto implOp = dyn_cast<emitrust::ImplOp>(inner))
+          noteText(implOp.getStructName());
+        for (NamedAttribute attr : inner->getAttrs()) {
+          attr.getValue().walk(noteNamedType);
+          attr.getValue().walk([&](Attribute sub) {
+            if (auto symbol = dyn_cast<FlatSymbolRefAttr>(sub))
+              note(symbol.getValue());
+            else if (auto opaque = dyn_cast<emitrust::OpaqueAttr>(sub))
+              noteText(opaque.getValue());
+          });
+        }
+      });
+    return needs;
+  };
   // One `mod` per distinct path, as an epilogue in first-appearance order,
   // each item in the order it had at the top level.
   for (StringRef path : modulePaths) {
     os << "mod " << path << " {\n";
     increaseIndent();
+    if (moduleNeedsRootImport(path))
+      os << "use super::*;\n";
     llvm::SaveAndRestore moduleScope(moduleItemVisibility,
                                      StringRef("pub(crate) "));
     for (Operation *item : moduleItems[path])
