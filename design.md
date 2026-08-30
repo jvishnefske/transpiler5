@@ -11797,7 +11797,11 @@ piece and becomes FR-45.
   dep-less lib member and the BIN member -- and the clang-built native runner
   agrees exactly, failure included.
 
-- [x] FR-161 DEFECT (found by the FR-160 `--partition` spike 2026-08-29;
+- [x] FR-176 DEFECT (opened 2026-08-29 as FR-161 on the probe line; RENUMBERED
+  2026-08-30 when the rebase onto the trunk met the trunk's own FR-161
+  (FR-158 Phase 3), which is cited by commits that are already immutable
+  on main -- the same tiebreak that made the licence item FR-162; found by
+  the FR-160 `--partition` spike 2026-08-29;
   SPIKED AND FIXED 2026-08-30): SILENT REQUEST-IGNORE SURFACES IN LANDED
   FR-160 CODE. Each took a request and produced neither the thing asked for
   nor a word about it, which is precisely what FR-160 exists to forbid.
@@ -11884,7 +11888,7 @@ piece and becomes FR-45.
   side anyway, but a file a human reads should not repeat itself.
   **FR-160 IS COMPLETE**: Phase A (wrap named symbols), Phase B (meson
   discovery + this pin), Phase C (`--test-entry-section`, no build system in
-  the loop), the `--partition` workspace path, and FR-161's cleanup of the
+  the loop), the `--partition` workspace path, and FR-176's cleanup of the
   silent request-ignore surfaces.
 
 - [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
