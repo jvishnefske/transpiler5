@@ -199,23 +199,69 @@ static std::string printOpToString(Operation *op) {
   return text;
 }
 
+/// Rewrites every whole-identifier occurrence of a `renames` key in `text`,
+/// leaving everything else — punctuation, and identifiers the map does not
+/// name — byte-for-byte alone. Whole-identifier, not substring: an
+/// `emitrust.opaque` payload spells targets as `Some(tu0_p_a)`, and a
+/// substring rewrite of `tu0_p_a` would also eat the prefix of a sibling
+/// `tu0_p_ab`. That is precisely the silent-miscompile direction — both
+/// names denote well-typed functions of the same signature, so a table
+/// entry retargeted at the wrong one still compiles and just returns the
+/// wrong number.
+static std::string renameIdentifiersInText(
+    llvm::StringRef text, const llvm::StringMap<std::string> &renames) {
+  auto isIdentChar = [](char c) {
+    return llvm::isAlnum(c) || c == '_';
+  };
+  std::string out;
+  out.reserve(text.size());
+  size_t index = 0;
+  while (index < text.size()) {
+    if (!isIdentChar(text[index])) {
+      out += text[index++];
+      continue;
+    }
+    size_t start = index;
+    while (index < text.size() && isIdentChar(text[index]))
+      ++index;
+    llvm::StringRef word = text.substr(start, index - start);
+    auto it = renames.find(word);
+    out += it == renames.end() ? word : llvm::StringRef(it->second);
+  }
+  return out;
+}
+
 /// Step 1: alpha-renames the per-TU tags on `shard`'s module-level symbols
 /// per `ordinalMap` (internal ordinal k renames to global ordinal
-/// `ordinalMap[k]`), rewriting symbol uses (globals are referenced by
-/// `FlatSymbolRefAttr`) and `emitrust.call_opaque` callees (which
-/// reference functions by plain string, not by symbol use, so
-/// `SymbolTable::replaceAllSymbolUses` cannot see them). A solo shard's
+/// `ordinalMap[k]`), rewriting THREE carriers of a tagged name: symbol uses
+/// (globals are referenced by `FlatSymbolRefAttr`), `emitrust.call_opaque`
+/// callees, and `emitrust.opaque` attribute payloads. The last two name
+/// functions by plain string, not by symbol use, so
+/// `SymbolTable::replaceAllSymbolUses` cannot see them. A solo shard's
 /// map is the single element [ordinal]; a re-imported group's map lists
 /// its members' link-line positions.
+///
+/// FR-156: the opaque carrier was the one originally missed, and it made a
+/// shard's emitted output depend on its POSITION on the link line. The
+/// importer spells a fn-ptr target as `#emitrust.opaque<"Some(<symbol>)">`
+/// both in an `emitrust.global`'s init (a file-static dispatch table, the
+/// systemd src/basic/rlimit-util.c:222 shape) and in a body-level
+/// `emitrust.constant`; at position 0 the shard's own `tu0_` tags were
+/// already right and the link worked, while at any other position the
+/// functions were retagged and the strings were not, so emission died at
+/// the dangling-fn-ptr-target check. Payloads that are NOT symbols (`None`,
+/// an `Enum::VARIANT` path, `Name::default()`) name nothing in the map and
+/// pass through untouched; records and enums carry no per-TU tag at all.
 ///
 /// Collision freedom: the map is required strictly increasing, so every
 /// target ordinal is >= its source (a TU's link-line position counts at
 /// least its group-internal predecessors), and the renames are applied in
 /// DESCENDING source-ordinal order — by the time source k renames to
 /// map[k], any source tag with a higher ordinal (which map[k] might equal)
-/// has already been renamed away. Callee strings are rewritten from a map
-/// keyed by ORIGINAL names after all symbol renames, so they cannot be
-/// captured by a name that became someone else's target in between.
+/// has already been renamed away. The plain-string carriers are rewritten
+/// from a map keyed by ORIGINAL names after all symbol renames, so they
+/// cannot be captured by a name that became someone else's target in
+/// between.
 static LogicalResult renameShardTags(ModuleOp shard,
                                      llvm::ArrayRef<unsigned> ordinalMap) {
   for (size_t k = 1; k < ordinalMap.size(); ++k)
@@ -229,7 +275,7 @@ static LogicalResult renameShardTags(ModuleOp shard,
     std::string newName;
   };
   llvm::SmallVector<Rename> renames;
-  llvm::StringMap<std::string> calleeRenames;
+  llvm::StringMap<std::string> textRenames;
   for (Operation &op : shard.getBody()->getOperations()) {
     auto symbol = dyn_cast<SymbolOpInterface>(&op);
     if (!symbol)
@@ -249,7 +295,7 @@ static LogicalResult renameShardTags(ModuleOp shard,
     std::string newName = ((tag->upper ? "TU" : "tu") + llvm::Twine(target) +
                            "_" + tag->rest)
                               .str();
-    calleeRenames[name] = newName;
+    textRenames[name] = newName;
     renames.push_back({&op, tag->ordinal, std::move(newName)});
   }
   if (renames.empty())
@@ -267,10 +313,25 @@ static LogicalResult renameShardTags(ModuleOp shard,
     SymbolTable::setSymbolName(rename.op, newName);
   }
   shard.walk([&](emitrust::CallOpaqueOp call) {
-    auto it = calleeRenames.find(call.getCallee());
-    if (it != calleeRenames.end())
+    auto it = textRenames.find(call.getCallee());
+    if (it != textRenames.end())
       call.setCallee(it->second);
   });
+  AttrTypeReplacer opaqueReplacer;
+  opaqueReplacer.addReplacement(
+      [&](emitrust::OpaqueAttr opaque) -> std::optional<Attribute> {
+        std::string rewritten =
+            renameIdentifiersInText(opaque.getValue(), textRenames);
+        if (rewritten == opaque.getValue())
+          return std::nullopt;
+        return emitrust::OpaqueAttr::get(opaque.getContext(), rewritten);
+      });
+  // Attributes only: an `!emitrust.opaque` TYPE spells a Rust type
+  // (`Option<...>`), never a per-TU-tagged item symbol, and locations are
+  // source facts.
+  opaqueReplacer.recursivelyReplaceElementsIn(shard, /*replaceAttrs=*/true,
+                                              /*replaceLocs=*/false,
+                                              /*replaceTypes=*/false);
   return success();
 }
 
