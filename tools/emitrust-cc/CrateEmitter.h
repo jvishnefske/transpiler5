@@ -44,6 +44,7 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Support/LLVM.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <string>
@@ -265,6 +266,70 @@ std::string renderMemberCargoToml(llvm::StringRef crateName, CrateType type,
 /// \param members the member directory/package names, in plan order.
 /// \returns the manifest text.
 std::string renderWorkspaceToml(llvm::ArrayRef<std::string> members);
+
+/// FR-160: what became of one requested test entry point.
+///
+/// The functional core decides the fate and records it here; the imperative
+/// shell turns a nonempty `skipReason` into a LOCATED warning. That split is
+/// the same one `selectCrateType` follows, and it is what lets a whole-project
+/// entries file be applied to one translation unit: a symbol this module does
+/// not define is not an error, it belongs to a different unit.
+struct TestEntryReport {
+  /// The symbol as requested.
+  std::string symbol;
+  /// Empty when a `#[test]` was emitted; otherwise why it was not.
+  std::string skipReason;
+  /// Set when a test WAS emitted but carries `#[ignore = ...]` -- a recovered
+  /// stub, whose body is an `unimplemented!`. The gap stays visible in
+  /// `cargo test` output instead of vanishing.
+  std::string ignoreReason;
+  /// The function, when one was found, for the diagnostic's location.
+  mlir::Operation *op = nullptr;
+};
+
+/// FR-160: renders the `#[cfg(test)] mod emitrust_tests` block wrapping each
+/// of `entries` that can be called, or "" when none can.
+///
+/// A C project's test suite is an oracle the emitter otherwise throws away.
+/// This turns each named entry point into a `#[test]`, so `cargo test` green
+/// means the C suite's own assertions hold in the transpiled code -- a
+/// DIFFERENTIAL oracle over code no hand-written EndToEnd test will cover.
+///
+/// The shape follows what meson and CTest already agree on: a test passes iff
+/// it exits 0. So an entry returning an integer becomes
+/// `assert_eq!(sym(), 0)`, and one returning nothing is run for its panics --
+/// a weaker oracle, but not a vacuous one, because a transpiled body's
+/// failure mode IS a panic (a bounds check, a null function pointer, an
+/// `unimplemented!`).
+///
+/// NEVER A VACUOUS PASS is the governing rule. An entry is SKIPPED, not
+/// wrapped, when calling it would prove nothing or would not compile:
+///   - no function of that name in this module (it belongs to another unit);
+///   - it takes arguments (nothing models argv, and meson's own registry says
+///     333 of systemd's 337 one-TU tests take none);
+///   - it is generic over the `Externals` trait, i.e. its callees are
+///     undefined in a solo-TU import -- a test that panics inside
+///     `Externals::x` proves nothing. `--link` the shards and the trait, and
+///     this restriction, both disappear;
+///   - it rendered as a method of an impl block (the FR-62 actor lift moves an
+///     arm that touches a file-local global into one), so it is not callable
+///     as a free function;
+///   - it returns something other than an integer or nothing.
+/// A recovered STUB is the one case that is emitted anyway, `#[ignore]`d with
+/// its rejection diagnostic, because "this test exists and does not run yet"
+/// is information and silence is not.
+///
+/// The generated module reaches its subjects through `super::`, so a
+/// file-local (non-`pub`) function -- which is what every `static` test body
+/// imports as -- is wrappable without changing its visibility.
+///
+/// \param module the fully converted module about to be rendered.
+/// \param entries the requested entry-point symbols, in order.
+/// \param reports out: one entry per request, in the same order.
+/// \returns the Rust text to append to the crate root, or "" if empty.
+std::string renderTestModule(mlir::ModuleOp module,
+                             llvm::ArrayRef<std::string> entries,
+                             llvm::SmallVectorImpl<TestEntryReport> &reports);
 
 } // namespace emitrustcc
 

@@ -318,6 +318,39 @@ static llvm::cl::opt<bool> cAbiExportsFlag(
         "emitted crate is byte-identical to before it existed"),
     llvm::cl::init(false));
 
+static llvm::cl::list<std::string> testEntryFlag(
+    "test-entry",
+    llvm::cl::desc(
+        "FR-160: wrap this function in a generated '#[test]', so a C "
+        "project's own test suite becomes a DIFFERENTIAL oracle -- 'cargo "
+        "test' green means the C suite's assertions hold in the transpiled "
+        "code. Repeatable. An entry returning an integer becomes "
+        "assert_eq!(sym(), 0), the exit-code criterion meson and CTest "
+        "already use; one returning nothing is run for its panics, which is "
+        "how a transpiled body fails. An entry that cannot be called -- it "
+        "takes arguments, it is generic over the Externals trait (link the "
+        "shards first), it rendered as a method of an impl block, or it "
+        "returns something that is not an exit code -- is NOT wrapped and is "
+        "reported with a located warning, because a test that cannot fail is "
+        "worse than no test. A recovered STUB is wrapped and '#[ignore]'d "
+        "with its rejection diagnostic, so the gap is named in 'cargo test' "
+        "output instead of being silently absent. Off by default: with no "
+        "entry requested every emitted crate is byte-identical"),
+    llvm::cl::value_desc("symbol"));
+
+static llvm::cl::opt<std::string> testEntriesFlag(
+    "test-entries",
+    llvm::cl::desc(
+        "FR-160: read --test-entry symbols from <file>, one per line; '#' "
+        "starts a comment and anything after the first whitespace is "
+        "ignored, so a discovery adapter can carry its provenance on the "
+        "line. A symbol this module does not define is skipped SILENTLY "
+        "(a file describes a whole project and is applied one translation "
+        "unit at a time), whereas a symbol named by an explicit "
+        "--test-entry is always reported. scripts/test-entries-meson.py "
+        "generates this from a meson project's test registry"),
+    llvm::cl::value_desc("file"), llvm::cl::init(""));
+
 static llvm::cl::opt<std::string>
     outputPath("o",
                llvm::cl::desc("Output file for --emit=import/mlir/rust "
@@ -744,6 +777,62 @@ static mlir::LogicalResult writeModule(mlir::ModuleOp module,
 ///        all-scalar exports the C ABI. Already validated to be false unless
 ///        `type` is `CrateType::Lib`.
 /// \returns success if the whole crate was written.
+/// FR-160: the requested test entry points, `--test-entry` first, then the
+/// `--test-entries` file's. `fromFile` receives the file's symbols, which are
+/// skipped silently when this module does not define them.
+static llvm::SmallVector<std::string>
+collectTestEntries(llvm::StringSet<> &fromFile) {
+  llvm::SmallVector<std::string> entries(testEntryFlag.begin(),
+                                         testEntryFlag.end());
+  if (testEntriesFlag.empty())
+    return entries;
+  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
+      llvm::MemoryBuffer::getFile(testEntriesFlag);
+  if (!buffer) {
+    llvm::errs() << "error: cannot read --test-entries file '"
+                 << testEntriesFlag << "': " << buffer.getError().message()
+                 << "\n";
+    return entries;
+  }
+  llvm::SmallVector<llvm::StringRef> lines;
+  (*buffer)->getBuffer().split(lines, '\n');
+  for (llvm::StringRef line : lines) {
+    llvm::StringRef symbol = line.split('#').first.trim();
+    symbol = symbol.split(' ').first.split('\t').first;
+    if (symbol.empty())
+      continue;
+    fromFile.insert(symbol);
+    entries.push_back(symbol.str());
+  }
+  return entries;
+}
+
+/// FR-160: appends the generated `#[cfg(test)] mod` to `source` and reports
+/// every entry point that could not be wrapped.
+///
+/// With no entry requested this returns before touching `source`, which is
+/// what keeps every crate emitted without the flag byte-identical.
+static void appendTestModule(mlir::ModuleOp module, std::string &source) {
+  if (testEntryFlag.empty() && testEntriesFlag.empty())
+    return;
+  llvm::StringSet<> fromFile;
+  llvm::SmallVector<std::string> entries = collectTestEntries(fromFile);
+  llvm::SmallVector<emitrustcc::TestEntryReport> reports;
+  source += emitrustcc::renderTestModule(module, entries, reports);
+  for (const emitrustcc::TestEntryReport &report : reports) {
+    if (report.skipReason.empty())
+      continue;
+    // A whole-project entries file names every unit's tests; only the ones
+    // the caller asked for by hand are worth a diagnostic when absent.
+    if (!report.op && fromFile.contains(report.symbol))
+      continue;
+    mlir::Location loc = report.op ? report.op->getLoc()
+                                   : module->getLoc();
+    mlir::emitWarning(loc) << "FR-160: no test emitted for '" << report.symbol
+                           << "': " << report.skipReason;
+  }
+}
+
 static mlir::LogicalResult emitCrate(mlir::ModuleOp module,
                                      llvm::StringRef outDir,
                                      llvm::StringRef crateName,
@@ -753,6 +842,7 @@ static mlir::LogicalResult emitCrate(mlir::ModuleOp module,
       emitrustcc::renderCrateRoot(module, type, cAbiExports);
   if (mlir::failed(rootRs))
     return mlir::failure();
+  appendTestModule(module, *rootRs);
   // FR-62 slice 5c: an async actor runtime anchor selects the tokio
   // manifest flavor (unconditional dependency, E4); the manifest tracks
   // the module, so a run whose every actor demoted keeps the default,
@@ -2849,6 +2939,7 @@ int main(int argc, char **argv) {
         emitrustcc::renderCrateRoot(*module, type, cAbiExportsFlag);
     if (mlir::failed(source))
       return 1;
+    appendTestModule(*module, *source);
     return mlir::failed(writeFile(outputPath, *source)) ? 1 : 0;
   }
   case EmitKind::Crate: {
