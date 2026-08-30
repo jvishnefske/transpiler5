@@ -10152,6 +10152,50 @@ piece and becomes FR-45.
   LLVM-exception, which is compatible with AGPL-3.0 for a combined work.
   **NEEDS AN OWNER DECISION.**
 
+- [ ] FR-164 (proposed 2026-08-29 by an agent, NOT requested and NOT acted on;
+  recorded so the measurement is not lost): MIGRATE THE BUILD FROM CMAKE TO
+  MESON, or decide deliberately not to.
+  NEEDS AN OWNER DECISION -- this is an architectural change, not a loop item,
+  and nothing here has been applied.
+  MEASURED, in a nix sandbox from a clean HEAD export (a genuine cold build):
+  a meson-based derivation builds and installs all FIVE tools under the SAME
+  names, so `nix/corpus`'s only contract (`${emitrust}/bin/emitrust-cc` and
+  `emitrust` on PATH) is satisfied. Total change is TWO files: `install: true`
+  on the five executables in `tools/meson.build` (today meson installs
+  NOTHING -- that was the only real gap), and `flake.nix` swapping cmake for
+  meson plus `llvmPackages.llvm.dev` for `llvm-config`. Patch preserved at
+  `<scratchpad>/meson-migration.patch`.
+  THE ARGUMENT CUTS BOTH WAYS, and FR-163 is the evidence. CMake caught a real
+  link defect that meson structurally cannot see -- but that defect EXISTS
+  ONLY BECAUSE CMake demands hand-maintained per-component lists. Under meson
+  there is no `MLIRParser` line to forget; the dependency is one dylib. CMake
+  did not detect a bug in the code, it detected a bug in its own bookkeeping,
+  which it also created.
+  WHAT WOULD GENUINELY BE LOST: the ability to build against an MLIR with no
+  monolithic dylib. `meson.build:61-67` globs for `libMLIR.so*` and hard-errors
+  if absent; Debian/Fedora MLIR packages commonly ship only per-component
+  static archives. That costs nothing while everything is nix, but it
+  forecloses `apt install libmlir-dev` builds permanently. Note you never fully
+  escape CMake either -- meson reads `MLIR_INSTALL_PREFIX` out of
+  `MLIRConfig.cmake` (`meson.build:55`).
+  SO THE DECIDING QUESTION IS NOT CMAKE-VS-MESON. It is: will this project ever
+  need to build against a non-monolithic MLIR?
+  * No, nix forever -> migrate. Order: land the 2-file patch (additive and
+    reversible, CMake keeps working) -> switch CI (`.github/workflows/ci.yml`
+    is CMake-only, 3 steps plus the c-testsuite runner, all already inside
+    `nix develop`) -> run both green for a few days -> delete the CMake files
+    -> decide PDLL EXPLICITLY (`EMITRUST_ENABLE_PDLL` is CMake-only and
+    default OFF; `CMakeLists.txt:19` already calls the C++ patterns "the
+    shipping default", so it dies with CMake unless ported) -> update
+    CLAUDE.md, which still says "CMake stays canonical for CI".
+  * Yes or unsure -> keep CMake and take the cheap guard instead: a scan for
+    "source includes an MLIR component header, CMakeLists omits the
+    component", wired into the fast lit tier. It runs in under a second and
+    would have caught FR-163 before it reached a build.
+  UNVERIFIED: an actual `nix build .#<corpus>` end to end (only the contract
+  SHAPE was checked), and `meson test` inside CI's nix environment.
+  **NEEDS AN OWNER DECISION.**
+
 - [x] FR-163 DEFECT (found 2026-08-29 by an agent diagnosing a nix build
   failure; FIXED the same day): THE CMAKE BUILD -- which CLAUDE.md names as
   CANONICAL FOR CI -- DID NOT LINK. `emitrust-clang` failed with
