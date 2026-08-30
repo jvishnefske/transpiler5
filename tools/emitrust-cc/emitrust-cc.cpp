@@ -721,7 +721,11 @@ static mlir::LogicalResult writeModule(mlir::ModuleOp module,
                                        llvm::StringRef path) {
   std::string text;
   llvm::raw_string_ostream os(text);
-  module.print(os);
+  // FR-135: not `module.print(os)`. Everything we write as MLIR text has to
+  // be readable back by `emitrust-opt`, and the custom `cf.switch` assembly
+  // cannot spell a case label above `i64::MAX`; see
+  // `printRoundTrippableModule`.
+  mlir::emitrust::printRoundTrippableModule(module, os);
   os << "\n";
   return writeFile(path, text);
 }

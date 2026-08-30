@@ -352,6 +352,34 @@ OwningOpRef<ModuleOp> importC(llvm::StringRef path,
                               llvm::ArrayRef<std::string> extraClangArgs,
                               MLIRContext &context);
 
+//===----------------------------------------------------------------------===//
+// Printing an imported module (FR-135)
+//===----------------------------------------------------------------------===//
+
+/// Prints `module` as MLIR text that can be READ BACK, and reports it when
+/// that costs a change of form.
+///
+/// `--emit=import` (and `emitrust-import-c`) exist so a person or a bisecting
+/// script can re-read the front end's module. That was not always possible:
+/// MLIR's `cf.switch` CUSTOM assembly prints each case label with
+/// `APInt::getLimitedValue()`, i.e. UNSIGNED, while its own parser reads
+/// labels with `parseInteger(int64_t)` — so a label whose zero-extension
+/// needs the 64th bit prints as a decimal the same parser then rejects with
+/// `custom op 'cf.switch' integer value too large`. The defect is UPSTREAM
+/// and the IR is correct: the GENERIC form of the same op prints
+/// `case_values = dense<-2>` and round-trips exactly.
+///
+/// So when the module contains such a label this prints the whole module in
+/// the generic form — MLIR's printing flags are module-wide, there is no
+/// per-op escape — and emits a LOCATED remark saying so. A module with no
+/// such label is printed exactly as it always was, byte for byte; the
+/// fallback must never reach the common path, which is why
+/// `test/Driver/emit-import-roundtrip.c` pins both halves.
+///
+/// \param module the module to print.
+/// \param os the stream to print it to.
+void printRoundTrippableModule(ModuleOp module, llvm::raw_ostream &os);
+
 /// Overload importing a single file whose clang command line comes from a
 /// `compile_commands.json` (FR-45).
 ///

@@ -7739,3 +7739,59 @@ mlir::emitrust::importCProject(llvm::ArrayRef<std::string> paths,
   return importCProject(paths, extraClangArgs,
                         /*compilationDatabasePath=*/"", context);
 }
+
+//===----------------------------------------------------------------------===//
+// Printing an imported module (FR-135)
+//===----------------------------------------------------------------------===//
+
+/// The first `cf.switch` case label in `module` that MLIR's CUSTOM `cf.switch`
+/// assembly cannot spell round-trippably, or a null op when there is none.
+///
+/// `printSwitchOpCases` prints `APInt::getLimitedValue()` — the ZERO-extended
+/// label — and `parseSwitchOpCases` reads it back with
+/// `parseInteger(int64_t)`. A label that fits in 63 bits therefore always
+/// survives (an `i32` label of `-2` prints `4294967294`, parses as
+/// `4294967294` and is truncated back to `-2`); a label that needs the 64th
+/// bit prints as a decimal above `i64::MAX` that the parser refuses outright.
+static cf::SwitchOp findUnreadableSwitchCase(ModuleOp module,
+                                             uint64_t &offendingValue) {
+  cf::SwitchOp offender;
+  module.walk([&](cf::SwitchOp switchOp) {
+    std::optional<DenseIntElementsAttr> caseValues = switchOp.getCaseValues();
+    if (!caseValues)
+      return WalkResult::advance();
+    for (const llvm::APInt &value : caseValues->getValues<llvm::APInt>()) {
+      if (value.getActiveBits() <= 63)
+        continue;
+      offender = switchOp;
+      offendingValue = value.getLimitedValue();
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
+  return offender;
+}
+
+void mlir::emitrust::printRoundTrippableModule(ModuleOp module,
+                                               llvm::raw_ostream &os) {
+  uint64_t offendingValue = 0;
+  cf::SwitchOp offender = findUnreadableSwitchCase(module, offendingValue);
+  if (!offender) {
+    module.print(os);
+    return;
+  }
+  {
+    InFlightDiagnostic diag =
+        offender.emitRemark()
+        << "switch case value " << offendingValue
+        << " has no round-trippable spelling in the custom 'cf.switch' "
+           "assembly, so this module is printed in MLIR's generic form";
+    diag.attachNote()
+        << "upstream cf.switch prints case values unsigned and parses them "
+           "signed, so the custom form would not re-read; the generic form "
+           "is lossless";
+  }
+  OpPrintingFlags flags;
+  flags.printGenericOpForm();
+  module.print(os, flags);
+}

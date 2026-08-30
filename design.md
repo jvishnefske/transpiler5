@@ -11047,7 +11047,7 @@ piece and becomes FR-45.
   RANK: `pointer type outside a parameter position` first, on amplification.
   **NOT SPIKED.**
 
-- [ ] FR-170 UPSTREAM (found by the FR-166 spike 2026-08-30, reproduced on
+- [x] FR-170 LANDED 2026-08-30 (found by the FR-166 spike, reproduced on
   unmodified HEAD): `scf.index_switch` REJECTS `case INT64_MAX` as a
   duplicate, with no enum or emitrust code involved.
       switch (t) { case 0: ...; case 9223372036854775807LL: ...; }
@@ -11066,7 +11066,27 @@ piece and becomes FR-45.
   `_SD_ENUM_FORCE_S64` macro plants, so an FR-166 test that switches over one
   of those enums will hit it. Same class as FR-135 (upstream cf.switch
   negative case value).
-  **NOT SPIKED.**
+  LANDED 2026-08-30. We cannot patch LLVM, so the fix makes our tooling stop
+  LYING: a new func-nested pass ahead of `lift-cf-to-scf` detects the value
+  and emits an honest located diagnostic naming the real cause, with a note
+  explaining the `DenseSet` empty key. **The old message was located but
+  FACTUALLY WRONG** -- it told the user to look for a duplicate that does not
+  exist. Deliberately NOT worked around by remapping case values: that would
+  be a silent representation change on a correctness-sensitive path.
+  FENCE IS EXACTLY ONE VALUE WIDE, pinned by two byte-diffed controls:
+  `INT64_MIN` and `INT64_MAX - 1` both still emit and match the native.
+  MY TOMBSTONE REASONING REFINED: the `DenseMapInfo` tombstone for `int64_t`
+  is `max()-1` rather than `min()` specifically because `int64_t` is `long`
+  on LP64 and `DenseMapInfo` special-cases `long` -- so the observation was
+  right for the reason given, and both neighbours are now pinned.
+  Cannot reject anything that previously compiled: `lib/Conversion` has NO
+  conversion pattern for `cf::SwitchOp`, so every such switch already failed,
+  either with the false duplicate or with a legalization failure.
+  Reach verified rather than parroted: the `_SD_ENUM_FORCE_S64` shape
+  (`_H_FORCE = 0x7fffffffffffffff` plus a switch over it) hits the fence with
+  the new wording, so FR-166 phase 2 made this reachable from ordinary
+  systemd headers.
+  **LANDED.**
 
 - [x] FR-167 PHASE 1 LANDED 2026-08-30 (opened the same day from the FR-165 root-cause pass): THE `union
   type` REJECTION gates 574 items (24 direct + 550 cascaded, **23x
@@ -12093,7 +12113,7 @@ piece and becomes FR-45.
   cursor-parameter shape`) -- crash converted to rejection, as the repo
   contract requires.
 
-- [ ] FR-135 DEFECT (UPSTREAM, found by FR-134's spike): MLIR's `cf.switch`
+- [x] FR-135 LANDED 2026-08-30 (UPSTREAM, found by FR-134's spike): MLIR's `cf.switch`
   CUSTOM assembly cannot round-trip a negative case value, so
   `emitrust-cc --emit=import` output is not always re-parsable by
   `emitrust-opt`. The printer emits the case value as an unsigned decimal
@@ -12112,6 +12132,43 @@ piece and becomes FR-45.
   back. FIX would be upstream in `cf.switch`'s printer (print signed when the
   case type is signless-with-negative-values, or always print via the
   attribute). **NOT SPIKED.**
+  LANDED 2026-08-30, direction (a) -- the output is now always re-parsable --
+  chosen ONLY AFTER measuring the blast radius, because MLIR's printing flags
+  are MODULE-WIDE (`AsmPrinter::printOperation` consults
+  `shouldPrintGenericOpForm()`, with no per-op escape). Scan of every `.c`
+  and `.cpp` under `test/` plus `third_party/c-testsuite`, 220 files, each
+  printed module fed back to `emitrust-opt`: **THREE** units produce a
+  non-round-trippable `cf.switch` (the entry said two -- the third is
+  `test/Import/C/switch-unsigned64.c`), and exactly ONE golden checks the
+  printed form. One file of churn is small, so (a).
+  The predicate is EXACT, not conservative: `APInt::getActiveBits() > 63`,
+  because `printSwitchOpCases` prints `getLimitedValue()` zero-extended while
+  `parseSwitchOpCases` reads `parseInteger(int64_t)`, so any label needing
+  <= 63 bits always survives -- verified empirically that an i32 `-2` prints
+  `4294967294` and re-parses back to `-2`, which the round-trip test pins as
+  byte-unchanged.
+  The fix covers `emitrust-import-c` too, not just `emitrust-cc --emit=import`
+  -- both print the same module and leaving them divergent would have been a
+  new inconsistency. `--emit=mlir` is unaffected because a `cf.switch` can
+  never reach it (no conversion pattern; it fails to legalize first).
+  The one golden was STRENGTHENED, not weakened: it previously carried the
+  comment "deliberately has no reparse pipe" and now has one, plus a
+  `CHECK-NOT` on the unreadable spelling.
+  **LANDED.**
+
+- [ ] FR-175 (opened 2026-08-30 by the FR-170 implementer): OUR OWN
+  `emitrust::SwitchOp::verify` CARRIES THE SAME UPSTREAM BUG.
+  `lib/EmitRust/EmitRustOps.cpp:1688` uses `llvm::DenseSet<int64_t>`, whose
+  empty key is `i64::MAX`, so hand-written `emitrust.switch` IR with
+  `case 9223372036854775807` fed to `emitrust-opt` gets OUR OWN false
+  `has duplicate case value` -- the exact diagnostic FR-170 just stopped
+  telling users.
+  UNREACHABLE FROM C SOURCE, because FR-170's fence fires first; it bites
+  only hand-written IR. Left out of scope deliberately to keep that change
+  small.
+  Worth doing if the honesty invariant should hold for hand-written IR too --
+  and it is a one-line fix (a `std::set` or an explicit sentinel check).
+  **NOT SPIKED.**
 
 - [x] FR-133 A NULLABLE FN-PTR LOCAL initialized from a literal `Some` needs
   no `Option` at all (LANDED 2026-08-29). Surfaced by FR-132, which made the

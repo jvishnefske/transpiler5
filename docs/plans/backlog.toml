@@ -492,12 +492,12 @@ anchor = "FR-169 PHASES A+B LANDED 2026-08-30 (MISCOMPILE, found by the FR-166 s
 id = "FR-170"
 rank = 27
 kind = "defect"
-status = "open"
+status = "landed"
 size = "S"
 title = "UPSTREAM: scf.index_switch rejects case INT64_MAX as a duplicate"
 summary = "Found by the FR-166 spike 2026-08-30, reproduced on unmodified HEAD with no enum or emitrust code involved. scf::IndexSwitchOp::verify uses a DenseSet<int64_t>, and DenseMapInfo<T>::getEmptyKey() for integral T is numeric_limits<T>::max(), so inserting INT64_MAX probes an empty bucket, isEqual fires against the empty key, and insert().second returns false -- reported as a duplicate case value. Root cause verified in the LLVM source at SCF.cpp:3778 and DenseMapInfo.h:113, not guessed. INT64_MIN is fine and INT64_MAX-1 (the tombstone) happens to survive. Real systemd never writes case INT64_MAX so it affected no corpus measurement, but INT64_MAX is exactly the value the _SD_ENUM_FORCE_S64 macro plants, so an FR-166 test switching over one of those enums will hit it. Same class as FR-135. NOT SPIKED."
 blocked_by = []
-anchor = "FR-170 UPSTREAM (found by the FR-166 spike 2026-08-30, reproduced on"
+anchor = "FR-170 LANDED 2026-08-30 (found by the FR-166 spike, reproduced on"
 
 [[items]]
 id = "FR-171"
@@ -544,6 +544,17 @@ blocked_by = []
 anchor = "FR-174 (opened 2026-08-30 from the closing whole-program measurement)"
 
 [[items]]
+id = "FR-175"
+rank = 28
+kind = "defect"
+status = "open"
+size = "S"
+title = "emitrust.switch verify carries the same DenseSet empty-key bug FR-170 just fenced"
+summary = "Opened 2026-08-30 by the FR-170 implementer. lib/EmitRust/EmitRustOps.cpp:1688 uses llvm::DenseSet<int64_t>, whose empty key is i64::MAX, so hand-written emitrust.switch IR with case 9223372036854775807 fed to emitrust-opt gets OUR OWN false has-duplicate-case-value -- the exact diagnostic FR-170 just stopped telling users. Unreachable from C source because FR-170s fence fires first; it bites only hand-written IR, which is why it was left out of scope to keep that change small. One-line fix (std::set or an explicit sentinel check) if the honesty invariant should hold for hand-written IR too. NOT SPIKED."
+blocked_by = []
+anchor = "FR-175 (opened 2026-08-30 by the FR-170 implementer): OUR OWN"
+
+[[items]]
 id = "FR-138"
 rank = 14
 kind = "tooling"
@@ -569,12 +580,12 @@ anchor = "FR-137 DEFECT (CRASH on unseen external C"
 id = "FR-135"
 rank = 26
 kind = "defect"
-status = "open"
+status = "landed"
 size = "S"
 title = "UPSTREAM: cf.switch custom assembly cannot round-trip a negative case value"
 summary = "Found by FR-134's spike. MLIR prints a negative cf.switch case value as an unsigned decimal (-2 -> 18446744073709551614) and its own parser then rejects it as 'integer value too large', so emitrust-cc --emit=import output is not always re-parsable by emitrust-opt. Confirmed UPSTREAM by a two-line hand-written probe; our IR is correct and its generic form round-trips fine. Debugging workflow only -- both affected corpus units (switch-general.c, unsigned.c) emit correct Rust and byte-diff green, because the pipeline never re-parses its own text, which is also why the suite is blind to it. Workaround: --mlir-print-op-generic. Fix belongs upstream in cf.switch's printer."
 blocked_by = []
-anchor = "FR-135 DEFECT (UPSTREAM, found by FR-134's spike)"
+anchor = "FR-135 LANDED 2026-08-30 (UPSTREAM, found by FR-134's spike)"
 
 [[items]]
 id = "FR-133"
