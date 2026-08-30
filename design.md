@@ -10532,8 +10532,69 @@ piece and becomes FR-45.
   time the project has been bitten by reading per-occurrence counts as yields
   (FR-61f twice, at 7x and 4.4x; this at 5.6x aggregate and 15x on a single
   entry).
-  **ANSWERED (analysis, no code change). The follow-on is: root-cause the 86
-  types.**
+  ROOT-CAUSED 2026-08-30, and the answer changes the ranking again. Of the 86
+  roots, 59 have their own rejection in the ledger; those 59 gate 2,315 items:
+      1226  pointer type outside a parameter position
+       550  union type
+       253  enumerator value does not fit in i32
+       188  volatile-qualified type
+       977  (root's own rejection not present in this log -- unresolved)
+  So the two fronts are PARTLY one: the largest cascade root IS a pointer-model
+  limitation. But #2 and #3 are not, and they are the interesting ones.
+
+  THE TRANSITIVE-CLOSURE RANKING (direct drops + everything each root gates)
+  INVERTS THE RAW ORDER for exactly the items a naive ranking buries:
+      TOTAL  direct  gated  reason
+       1866    1866      0  ptr-to-ptr parameter escapes the cursor shape
+       1636    1636      0  ptr-to-ptr parameter
+       1576     350   1226  pointer type outside a parameter position   (4.5x)
+       1449    1449      0  incomplete struct type
+        796     788      8  returned pointer value
+        658     658      0  void pointer parameter
+        574      24    550  **union type**                              (23x)
+        452     452      0  call to unimported function
+        278      25    253  **enumerator value does not fit in i32**    (11x)
+  The top two are LEAF blockers on functions -- zero amplification. The two
+  starred rows are type-level and massively amplified: by direct count they
+  rank 24th and 25th, near the bottom; by transitive weight they are 7th and
+  9th. That inversion is the entire point of the exercise.
+  **ANSWERED. Follow-ons filed as FR-166 (enum width) and FR-167 (union
+  type), chosen for leverage-per-effort, not raw frequency.**
+
+- [ ] FR-166 (opened 2026-08-30 from the FR-165 root-cause pass): AN ENUM WITH
+  ANY ENUMERATOR OUTSIDE i32 RANGE IS REJECTED WHOLE, gating 278 items (25
+  direct + 253 cascaded, 11x amplification) across 19 distinct enums.
+  `lib/ImportC/ImportCAggregates.cpp:2034-2039` refuses the enum if any
+  enumerator is outside `[INT32_MIN, INT32_MAX]`.
+  THE C IS DELIBERATE AND IDIOMATIC, not exotic: systemd's
+  `_SD_ENUM_FORCE_S64(JSON_FORMAT_FLAGS)` macro appends an out-of-range
+  enumerator precisely to force the enum to 64-bit width. Every flags enum in
+  `sd-json.h`, `sd-varlink.h` etc. carries it, which is why 19 enums and the
+  `SdJsonVariant` / `SdVarlink*` type families all fall over.
+  WHY IT LOOKS TRACTABLE: `variantValues` is ALREADY `SmallVector<int64_t>`,
+  so the value survives; and the comment immediately below the rejection says
+  the emitted enum's storage "follows clang's underlying type choice", so a
+  width notion already exists. The likely work is widening the emitted
+  backing type and the `emitrust.enum_raw` place, not inventing a
+  representation.
+  DO NOT ASSUME THAT. The two rejections are separated by an
+  `isRepresentableByInt64` guard, and this project's entries have been wrong
+  about their own mechanism in five of the last six cases -- measure the
+  dialect and emitter constraints before pricing.
+  **NOT SPIKED.**
+
+- [ ] FR-167 (opened 2026-08-30 from the FR-165 root-cause pass): THE `union
+  type` REJECTION gates 574 items (24 direct + 550 cascaded, **23x
+  amplification -- the highest measured in the corpus**).
+  By direct count it is 24th and would never be picked; by transitive weight
+  it is the 7th largest blocker in a 501-TU program. FR-78 already built an
+  opaque-union representation, so the question is not "can unions be
+  represented" but WHICH unions still take this rejection and why -- start by
+  splitting the 24 direct sites by message (`union with a pointer arm` 12,
+  `union with an unnamed arm` 4, and a bare `union type` remainder are all
+  visible in the deduped ledger) rather than treating it as one item.
+  **NOT SPIKED.**
+
   **NOT SPIKED.**
 
 - [x] FR-154 DEFECT (found by the FR-151 spike 2026-08-29; DISSOLVED by
