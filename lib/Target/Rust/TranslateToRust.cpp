@@ -85,6 +85,69 @@ using namespace mlir;
 
 namespace {
 
+/// FR-159: the module PATH of an emitted item symbol, or an empty StringRef
+/// when the symbol is a plain item name.
+///
+/// A module-level item may carry the ABSOLUTE Rust path
+/// `crate::<module>::<leaf>` as its symbol; `emitModule` then renders it
+/// inside `mod <module> { ... }` under `<leaf>` while every USE site keeps
+/// spelling the whole path, unchanged. Absolute is a requirement, not a
+/// style choice: paths written inside a `mod` are module-relative, so a
+/// relative `tu0::add1` is rustc E0433 in precisely the position where it
+/// matters most -- an fn-ptr TABLE payload, which renders INSIDE the module.
+static StringRef itemModulePath(StringRef symbol) {
+  if (!symbol.consume_front("crate::"))
+    return StringRef();
+  size_t leafSep = symbol.rfind("::");
+  if (leafSep == StringRef::npos)
+    return StringRef();
+  return symbol.take_front(leafSep);
+}
+
+/// FR-159: the LEAF of an emitted item symbol -- the text after its last
+/// `::`, or the whole symbol when it carries no path.
+///
+/// Only DEFINITION sites print this. Everything keyed BY symbol name -- the
+/// Copy/Drop fixpoints, the fn-item set the dangling-target backstop
+/// consults, every `SymbolTable` lookup -- keeps using the whole symbol, so
+/// a module item whose leaf collides with a root item's name (the entire
+/// point of the link-time sink) can never be mistaken for it.
+static StringRef itemLeafName(StringRef symbol) {
+  size_t leafSep = symbol.rfind("::");
+  return leafSep == StringRef::npos ? symbol : symbol.drop_front(leafSep + 2);
+}
+
+/// FR-159: whether `text` is a Rust ITEM PATH -- one or more `::`-separated
+/// identifier segments (`helper`, `tu0_helper`, `crate::tu0::helper`).
+///
+/// This is the shape of an importer-produced fn-ptr payload's `Some(<t>)`
+/// target. It exists because three predicates each spelled the test inline
+/// as "alphanumerics and underscores only", and so silently no-opped the
+/// moment an item symbol grew a path: the FR-77 dangling-target backstop
+/// stopped diagnosing entirely (measured: `Some(crate::tu0::nope)` was
+/// emitted into the crate with NO diagnostic, while `Some(tu0_nope)` was
+/// refused), and FR-63's const-block decision and FR-133's fn-ptr unwrap
+/// both quietly changed emitted bytes. A digit-led segment still fails,
+/// which is what keeps the va-cursor spelling `Some(0i64)` out, and any
+/// other punctuation still fails, which keeps FR-52's `Some(f::<E>)`
+/// requirement rewrite out.
+static bool isRustItemPath(StringRef text) {
+  if (text.empty())
+    return false;
+  while (true) {
+    auto [segment, rest] = text.split("::");
+    if (segment.empty() || llvm::isDigit(segment.front()) ||
+        !llvm::all_of(segment,
+                      [](char c) { return llvm::isAlnum(c) || c == '_'; }))
+      return false;
+    if (rest.empty())
+      // A trailing `::` splits to an empty rest but leaves `text` longer
+      // than the segment; that is not a path.
+      return text.size() == segment.size();
+    text = rest;
+  }
+}
+
 /// FR-61d: the precedence rank of a rendered Rust expression, mirroring the
 /// Rust reference's operator table exactly (higher binds tighter). An
 /// inlined expression carries its rank so a consumer position can decide
@@ -570,10 +633,26 @@ private:
   /// \param symbol the emitted item name, consulted only for its
   ///        internal-linkage marker.
   StringRef itemVisibility(StringRef symbol) const {
+    // FR-159: inside a `mod tu<N>` the visibility is fixed and uniform (see
+    // `moduleItemVisibility`); the FR-51 export decision does not apply,
+    // because a per-TU module holds exactly the items whose C linkage was
+    // INTERNAL and which therefore have no business in a library surface.
+    if (!moduleItemVisibility.empty())
+      return moduleItemVisibility;
     if (!options.exportItems || emitrust::isInternalLinkageSymbolName(symbol))
       return "";
     return "pub ";
   }
+
+  /// FR-159: the visibility every item rendered inside a `mod tu<N> { .. }`
+  /// carries -- `pub(crate) ` while such a module is open, empty otherwise.
+  ///
+  /// MEASURED, not reasoned: it must be `pub(crate)` on the item AND on a
+  /// struct's FIELDS. The crate root constructs a sunk record by naming its
+  /// fields, and a private field there is rustc E0616; `pub` would be a
+  /// lie about a translation-unit-local item and `pub(super)` does not
+  /// reach a root item nested any deeper.
+  StringRef moduleItemVisibility;
 
   /// The `pub ` prefix for a part of an exported TYPE — a struct field, a
   /// tuple element, an enum variant constant. Unlike `itemVisibility` this
@@ -581,6 +660,8 @@ private:
   /// (see `RustEmitOptions::exportItems` for why), so their parts must be
   /// reachable too or the type is exported but unusable.
   StringRef typePartVisibility() const {
+    if (!moduleItemVisibility.empty())
+      return moduleItemVisibility;
     return options.exportItems ? "pub " : "";
   }
 
@@ -4070,10 +4151,13 @@ static constexpr char kActorRtModuleAsync[] =
 /// FR-77 backstop, the parse-back half: the fn-item identifier inside an
 /// importer-produced fn-ptr constant spelling `Some(<identifier>)`, or an
 /// empty StringRef for every other opaque text. Deliberately restricted to
-/// IDENTIFIER-shaped payloads on fn_ptr-typed positions: the va-cursor
-/// spelling `Some(0i64)` (digit-led) and the FR-52 requirement rewrite's
-/// `::`-qualified spelling are other contracts' opaque text and must pass
-/// untouched.
+/// ITEM-PATH-shaped payloads on fn_ptr-typed positions (`isRustItemPath`):
+/// the va-cursor spelling `Some(0i64)` (digit-led) and the FR-52
+/// requirement rewrite's `Some(f::<E>)` spelling are other contracts'
+/// opaque text and must pass untouched. FR-159 widened the accepted shape
+/// from a bare identifier to a PATH, because an item rendered inside a
+/// per-TU module is named `crate::tu0::helper` and the narrow test switched
+/// this whole backstop off for it, silently.
 static StringRef fnPtrConstantTargetIdent(Attribute attr) {
   auto opaque = dyn_cast_if_present<emitrust::OpaqueAttr>(attr);
   if (!opaque)
@@ -4081,11 +4165,8 @@ static StringRef fnPtrConstantTargetIdent(Attribute attr) {
   StringRef text = opaque.getValue();
   if (!text.consume_front("Some(") || !text.consume_back(")"))
     return StringRef();
-  if (text.empty() || llvm::isDigit(text.front()))
+  if (!isRustItemPath(text))
     return StringRef();
-  for (char c : text)
-    if (!llvm::isAlnum(c) && c != '_')
-      return StringRef();
   return text;
 }
 
@@ -4359,14 +4440,53 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
              << firstAnchor.getActor()
              << "': one module carries one actor_rt runtime flavor";
   }
+  // FR-159: per-TU Rust modules. A top-level item whose SYMBOL is the
+  // absolute path `crate::<module>::<leaf>` is bucketed here and rendered
+  // below inside `mod <module> { .. }` under its leaf name; use sites
+  // already spell the whole path, so nothing else in the emitter changes. A
+  // module whose symbols carry no path leaves both containers empty and
+  // takes the historical flat path, byte for byte.
+  llvm::SmallVector<StringRef> modulePaths;
+  llvm::StringMap<llvm::SmallVector<Operation *>> moduleItems;
   for (Operation &op : *moduleOp.getBody()) {
     if (!isa<emitrust::UseOp, emitrust::VerbatimOp, emitrust::FuncOp,
              emitrust::ImplOp, emitrust::StructDefOp, emitrust::EnumDefOp,
              emitrust::DataEnumDefOp, emitrust::GlobalOp,
              emitrust::TraitDefOp, emitrust::ActorRuntimeOp>(&op))
       return op.emitOpError("unable to translate op");
+    StringAttr symbol = SymbolTable::getSymbolName(&op);
+    StringRef path = symbol ? itemModulePath(symbol.getValue()) : StringRef();
+    if (!path.empty()) {
+      // Only the item kinds whose emitters print `itemLeafName` may be
+      // bucketed. Anything else would render its FULL path where an item
+      // name belongs (`fn crate::tu0::add1`), which is not Rust -- refuse
+      // it here with a location rather than emit it.
+      if (!isa<emitrust::FuncOp, emitrust::StructDefOp, emitrust::EnumDefOp,
+               emitrust::DataEnumDefOp, emitrust::GlobalOp>(&op))
+        return op.emitOpError()
+               << "cannot render '" << symbol.getValue()
+               << "' inside a Rust module: this item kind has no module form";
+      auto [it, inserted] = moduleItems.try_emplace(path);
+      if (inserted)
+        modulePaths.push_back(it->first());
+      it->second.push_back(&op);
+      continue;
+    }
     if (failed(emitOperation(op)))
       return failure();
+  }
+  // One `mod` per distinct path, as an epilogue in first-appearance order,
+  // each item in the order it had at the top level.
+  for (StringRef path : modulePaths) {
+    os << "mod " << path << " {\n";
+    increaseIndent();
+    llvm::SaveAndRestore moduleScope(moduleItemVisibility,
+                                     StringRef("pub(crate) "));
+    for (Operation *item : moduleItems[path])
+      if (failed(emitOperation(*item)))
+        return failure();
+    decreaseIndent();
+    os << "}\n";
   }
   // FR-62 slice 5b: the shared actor runtime — Handle<M>, the synchronous
   // call protocol, and the reap/shutdown panic-provenance plumbing — is one
@@ -4791,7 +4911,10 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // still key on `symbol`. Attribute-keyed, never prefix-parsed (a Phase-4
   // C owner method shares `method_of` but its symbol was never
   // struct-prefixed).
-  StringRef printedName = symbol;
+  // FR-159: an item rendered inside `mod tu<N>` prints its LEAF name; the
+  // symbol keeps the whole path, so every use site, every lookup and every
+  // linkage query above still sees `crate::tu0::helper`.
+  StringRef printedName = itemLeafName(symbol);
   if (auto rustName =
           op->getAttrOfType<StringAttr>(emitrust::kMethodRustNameAttrName))
     printedName = rustName.getValue();
@@ -4812,7 +4935,11 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // the boundary (FR-138, measured). `#[no_mangle]` on a generic item has no
   // single symbol to name. `extern "C" async fn` is not Rust at all.
   bool cAbiExport = false;
-  if (options.cAbiExports && !inTraitImpl && !itemVisibility(symbol).empty()) {
+  // FR-159: never for an item inside a per-TU module. Such an item is
+  // translation-unit-local by construction, so a `#[no_mangle] extern "C"`
+  // symbol for it would export a name C never had.
+  if (options.cAbiExports && !inTraitImpl && moduleItemVisibility.empty() &&
+      !itemVisibility(symbol).empty()) {
     StringRef blocker;
     if (isAsyncFn)
       blocker = "it is an async fn, which has no C calling convention";
@@ -6364,8 +6491,8 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   // construction working exactly as for the non-empty shape. (A struct with
   // no fields is always derivable, so it never reaches the explicit impl.)
   if (structDefOp.getFieldNames().empty()) {
-    os << typePartVisibility() << "struct " << structDefOp.getSymName()
-       << " {}\n";
+    os << typePartVisibility() << "struct "
+       << itemLeafName(structDefOp.getSymName()) << " {}\n";
     return success();
   }
   // FR-62 F2: an exported owner struct (`emitrust.private_fields`) keeps
@@ -6377,7 +6504,10 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
       structDefOp->hasAttr(emitrust::kPrivateFieldsAttrName)
           ? ""
           : typePartVisibility();
-  StringRef name = structDefOp.getSymName();
+  // FR-159: the printed name is the LEAF; `nonCopyStructNames` and
+  // `dropStructNames` above are keyed by the WHOLE symbol, which is what
+  // keeps a sunk `crate::tu1::Buf` from inheriting a root `Buf`'s verdict.
+  StringRef name = itemLeafName(structDefOp.getSymName());
   os << typePartVisibility() << "struct " << name << " {\n";
   increaseIndent();
   for (auto [nameAttr, typeAttr] :
@@ -6416,7 +6546,7 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
 }
 
 LogicalResult RustEmitter::emitEnumDef(emitrust::EnumDefOp enumDefOp) {
-  StringRef name = enumDefOp.getSymName();
+  StringRef name = itemLeafName(enumDefOp.getSymName()); // FR-159
   StringRef storage = enumDefOp.getUnsignedUnderlying() ? "u32" : "i32";
   os << "#[repr(transparent)]\n";
   os << "#[derive(Clone, Copy, PartialEq)]\n";
@@ -6465,7 +6595,7 @@ LogicalResult RustEmitter::emitDataEnumDef(emitrust::DataEnumDefOp defOp) {
   // unbuildable crate this FR exists to remove.
   os << "#[derive(Clone, Copy)]\n";
   StringRef pub = typePartVisibility();
-  os << pub << "enum " << defOp.getSymName() << " {\n";
+  os << pub << "enum " << itemLeafName(defOp.getSymName()) << " {\n"; // FR-159
   increaseIndent();
   for (auto [nameAttr, fieldNamesAttr, fieldTypesAttr] :
        llvm::zip_equal(defOp.getVariantNames(), defOp.getVariantFieldNames(),
@@ -6579,10 +6709,13 @@ static bool isConstEvaluableInit(Operation *op, Attribute init, Type type) {
     StringRef text = opaque.getValue();
     if (text == "None")
       return true;
+    // FR-159: an item PATH, not just a bare identifier -- a target rendered
+    // inside a per-TU module is `crate::tu0::helper`, and the narrow test
+    // dropped the `const { .. }` wrapper from every such table: an
+    // emitted-byte change plus a clippy::missing_const_for_thread_local
+    // regression, with nothing to notice either.
     if (text.consume_front("Some(") && text.consume_back(")"))
-      return !text.empty() && !llvm::isDigit(text.front()) &&
-             llvm::all_of(text,
-                          [](char c) { return llvm::isAlnum(c) || c == '_'; });
+      return isRustItemPath(text);
     return false;
   }
   // Aggregate list initializers (emitAggregateInit): an array or struct
@@ -6631,7 +6764,13 @@ LogicalResult RustEmitter::emitGlobal(emitrust::GlobalOp globalOp) {
     // Never-written global: a plain static item read directly. The
     // verifier guarantees the type is a scalar or array, whose default and
     // initializer expressions are const-evaluable.
-    os << "static " << globalOp.getSymName() << ": ";
+    // FR-159: `moduleItemVisibility` is the only visibility a global takes
+    // today -- FR-51 export mode still emits none at all, a RECORDED GAP
+    // (an exported crate's globals are unreachable from outside it). Phase
+    // 1 does not need it; the phase that moves globals into the library
+    // surface must close it.
+    os << moduleItemVisibility << "static "
+       << itemLeafName(globalOp.getSymName()) << ": ";
     if (failed(emitType(loc, type)))
       return failure();
     os << " = ";
@@ -6651,7 +6790,8 @@ LogicalResult RustEmitter::emitGlobal(emitrust::GlobalOp globalOp) {
                                         globalOp.getInitAttr(), type);
   os << "thread_local! {\n";
   increaseIndent();
-  os << "static " << globalOp.getSymName() << ": std::cell::Cell<";
+  os << moduleItemVisibility << "static "
+     << itemLeafName(globalOp.getSymName()) << ": std::cell::Cell<";
   if (failed(emitType(loc, type)))
     return failure();
   os << "> = ";

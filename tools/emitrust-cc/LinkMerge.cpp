@@ -18,6 +18,7 @@
 #include "EmitRust/EmitRustOps.h"
 #include "EmitRust/ShardMetadata.h"
 
+#include "mlir/IR/AttrTypeSubElements.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/SymbolTable.h"
@@ -184,6 +185,169 @@ static std::optional<TuTag> parseTuTag(llvm::StringRef name) {
   if (name.take_front(digits).getAsInteger(10, ordinal))
     return std::nullopt;
   return TuTag{ordinal, upper, name.drop_front(digits + 1)};
+}
+
+/// FR-159: the records of `shard` that must NOT be sunk into a per-TU Rust
+/// module, each mapped to the op that makes it escape (which anchors the
+/// note on the rejection). An empty map means every record in the shard is
+/// translation-unit-local as far as this shard can tell.
+///
+/// The sink turns two same-named, differently-shaped records into two Rust
+/// PATHS. That is faithful only while NOTHING outside the owning translation
+/// unit can name the record: an internal-linkage name cannot cross a TU
+/// boundary, so a record mentioned only from internal-linkage items (and
+/// from function BODIES, which are private to their function whatever its
+/// linkage) is safely repathed along with them. Everything else pins it:
+///
+///  * the SIGNATURE of an external-linkage function, or the TYPE of an
+///    external-linkage global. This is the FR-58 `struct Box` case
+///    (test/Driver/link-merge-errors.c) and the header-ODR case, and the
+///    reachability is TRANSITIVE -- a record behind `mut_ref`, `slice`,
+///    `array` or `fn_ptr` is just as reachable as one passed by value (the
+///    real systemd users are `&mut [tu314::SwapEntries]`), which is why the
+///    types are WALKED rather than pattern-matched at the top level;
+///  * a FIELD of any other record. That record dedups across the shards
+///    into ONE crate-wide Rust type, so its field cannot be repathed for
+///    one shard alone -- doing so hands rustc an E0308 with no source
+///    location, exactly the silent degradation this guard exists to stop;
+///  * any PLAIN-TEXT mention: an `emitrust.opaque` payload (`Some(f)`,
+///    `Enum::VARIANT`, `Name::default()`) or an `emitrust.call_opaque`
+///    callee. Those are strings, not symbol uses and not types, so the
+///    repath below cannot reach them at all;
+///  * anything an `emitrust.impl`, `emitrust.trait_def`,
+///    `emitrust.actor_runtime`, `emitrust.use` or `emitrust.verbatim`
+///    mentions, for the same reason.
+///
+/// An unrecognized top-level op kind disables the sink for the whole shard
+/// (`sinkDisabled`): a new item kind is a new way for a name to escape, and
+/// the safe default is the historical link rejection.
+static llvm::StringMap<Operation *>
+collectNonSinkableRecords(ModuleOp shard, bool &sinkDisabled) {
+  llvm::StringMap<Operation *> escapes;
+  sinkDisabled = false;
+
+  // Every record/enum name reachable from `type`, however deeply nested.
+  auto noteTypes = [&](Type type, Operation *site, llvm::StringRef except) {
+    if (!type)
+      return;
+    type.walk([&](Type sub) {
+      llvm::StringRef name;
+      if (auto structType = dyn_cast<emitrust::StructType>(sub))
+        name = structType.getName();
+      else if (auto enumType = dyn_cast<emitrust::EnumType>(sub))
+        name = enumType.getName();
+      else if (auto dataEnumType = dyn_cast<emitrust::DataEnumType>(sub))
+        name = dataEnumType.getName();
+      if (!name.empty() && name != except)
+        escapes.try_emplace(name, site);
+    });
+  };
+  // Every WHOLE identifier in a plain-text carrier. Whole-identifier, not
+  // substring: `SwapEntries` must not be pinned by a mention of
+  // `SwapEntriesX`, and conversely a record whose name really is a token of
+  // the text is pinned however that text spells it.
+  auto noteText = [&](llvm::StringRef text, Operation *site) {
+    auto isIdentChar = [](char c) { return llvm::isAlnum(c) || c == '_'; };
+    size_t index = 0;
+    while (index < text.size()) {
+      if (!isIdentChar(text[index])) {
+        ++index;
+        continue;
+      }
+      size_t start = index;
+      while (index < text.size() && isIdentChar(text[index]))
+        ++index;
+      escapes.try_emplace(text.substr(start, index - start), site);
+    }
+  };
+  auto noteAttrText = [&](Attribute attr, Operation *site) {
+    if (!attr)
+      return;
+    attr.walk([&](Attribute sub) {
+      if (auto opaque = dyn_cast<emitrust::OpaqueAttr>(sub))
+        noteText(opaque.getValue(), site);
+    });
+  };
+
+  // Plain-text carriers, anywhere in the shard including inside a tagged
+  // function's body: these are exactly the carriers `renameShardTags`
+  // documents, and none of them is rewritten by the repath.
+  shard.walk([&](Operation *inner) {
+    if (auto call = dyn_cast<emitrust::CallOpaqueOp>(inner))
+      noteText(call.getCallee(), inner);
+    else if (auto constant = dyn_cast<emitrust::ConstantOp>(inner))
+      noteAttrText(constant.getValue(), inner);
+    else if (auto global = dyn_cast<emitrust::GlobalOp>(inner))
+      noteAttrText(global.getInitAttr(), inner);
+  });
+
+  for (Operation &op : shard.getBody()->getOperations()) {
+    Operation *site = &op;
+    StringAttr symbol = SymbolTable::getSymbolName(&op);
+    bool internalLinkage = symbol && parseTuTag(symbol.getValue()).has_value();
+    if (auto fn = dyn_cast<FunctionOpInterface>(&op)) {
+      // A file-static function's signature is TU-local and is repathed with
+      // the record; an external one's is the cross-TU interface. A BODY is
+      // private either way, so it is deliberately not walked here.
+      if (internalLinkage)
+        continue;
+      for (Type type : fn.getArgumentTypes())
+        noteTypes(type, site, /*except=*/"");
+      for (Type type : fn.getResultTypes())
+        noteTypes(type, site, /*except=*/"");
+      continue;
+    }
+    if (auto global = dyn_cast<emitrust::GlobalOp>(op)) {
+      if (!internalLinkage)
+        noteTypes(global.getType(), site, /*except=*/"");
+      continue;
+    }
+    if (auto structDef = dyn_cast<emitrust::StructDefOp>(op)) {
+      for (Attribute fieldType : structDef.getFieldTypes())
+        noteTypes(cast<TypeAttr>(fieldType).getValue(), site,
+                  /*except=*/structDef.getSymName());
+      continue;
+    }
+    if (auto dataEnumDef = dyn_cast<emitrust::DataEnumDefOp>(op)) {
+      for (Attribute variant : dataEnumDef.getVariantFieldTypes())
+        for (Attribute fieldType : cast<ArrayAttr>(variant))
+          noteTypes(cast<TypeAttr>(fieldType).getValue(), site,
+                    /*except=*/dataEnumDef.getSymName());
+      continue;
+    }
+    if (isa<emitrust::EnumDefOp>(op))
+      continue; // a C enum's variants are integers; it names no record
+    if (auto implOp = dyn_cast<emitrust::ImplOp>(op)) {
+      // An impl block names its struct by plain STRING, and its methods'
+      // signatures are reachable from wherever the impl's type is.
+      noteText(implOp.getStructName(), site);
+      implOp.walk([&](FunctionOpInterface method) {
+        for (Type type : method.getArgumentTypes())
+          noteTypes(type, site, /*except=*/"");
+        for (Type type : method.getResultTypes())
+          noteTypes(type, site, /*except=*/"");
+      });
+      continue;
+    }
+    if (auto traitDef = dyn_cast<emitrust::TraitDefOp>(op)) {
+      for (Attribute fnType : traitDef.getFnTypes())
+        noteTypes(cast<TypeAttr>(fnType).getValue(), site, /*except=*/"");
+      continue;
+    }
+    if (auto useOp = dyn_cast<emitrust::UseOp>(op)) {
+      noteText(useOp.getPath(), site);
+      continue;
+    }
+    if (auto verbatim = dyn_cast<emitrust::VerbatimOp>(op)) {
+      noteText(verbatim.getValue(), site);
+      continue;
+    }
+    if (isa<emitrust::ActorRuntimeOp>(op))
+      continue; // names an actor, never a record
+    sinkDisabled = true;
+    return escapes;
+  }
+  return escapes;
 }
 
 /// Prints `op` to a string with the default flags (no locations): the
@@ -372,7 +536,19 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
   llvm::SmallVector<std::pair<llvm::StringRef, Operation *>> obligations;
   llvm::StringSet<> headerTexts;
   llvm::SmallVector<Operation *> toErase;
-  for (OwningOpRef<ModuleOp> &shard : shards) {
+  for (auto [shardIndex, shard] : llvm::enumerate(shards)) {
+    // FR-159: the ordinal this shard's per-TU module is named after. It is
+    // the shard's own link-line position -- the same ordinal step 1 just
+    // renamed its `tu<N>_` tags to -- so `mod tu314` holds exactly the items
+    // `tu314_*` came from, and two shards can never claim one module.
+    unsigned tuOrdinal = ordinalMaps.empty()
+                             ? static_cast<unsigned>(shardIndex)
+                             : ordinalMaps[shardIndex].front();
+    // Computed lazily and once: a shape conflict is rare (exactly one across
+    // the 501-object systemd link), and the walk is linear in the shard.
+    llvm::StringMap<Operation *> escapes;
+    bool escapesComputed = false;
+    bool sinkDisabled = false;
     llvm::StringSet<> shardHeaderTexts;
     for (Operation &op : shard->getBody()->getOperations()) {
       if (isa<emitrust::UseOp, emitrust::VerbatimOp>(op)) {
@@ -416,6 +592,47 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
         toErase.push_back(&op);
         continue;
       }
+      // FR-159: a shape-CONFLICTING record that nothing outside this
+      // translation unit can name is not an error at all -- it is two C
+      // types sharing one tag, which Rust can spell as two PATHS. Sink it
+      // into this shard's per-TU module and repath every reference to it
+      // WITHIN this shard; the earlier shard's definition keeps the crate
+      // root. Anything that makes the record visible across a TU boundary
+      // keeps the historical rejection, with a note naming the site.
+      Operation *escapeSite = nullptr;
+      if (dedupable && isa<emitrust::StructDefOp>(op)) {
+        if (!escapesComputed) {
+          escapes = collectNonSinkableRecords(*shard, sinkDisabled);
+          escapesComputed = true;
+        }
+        auto escapeIt = escapes.find(symbol.getName());
+        if (!sinkDisabled && escapeIt == escapes.end()) {
+          std::string sunk = ("crate::tu" + llvm::Twine(tuOrdinal) +
+                              "::" + symbol.getName())
+                                 .str();
+          StringAttr sunkAttr = StringAttr::get(op.getContext(), sunk);
+          llvm::StringRef recordName = symbol.getName();
+          AttrTypeReplacer repath;
+          repath.addReplacement(
+              [&](emitrust::StructType structType) -> std::optional<Type> {
+                if (structType.getName() != recordName)
+                  return std::nullopt;
+                return emitrust::StructType::get(structType.getContext(),
+                                                 sunkAttr.getValue());
+              });
+          repath.recursivelyReplaceElementsIn(*shard, /*replaceAttrs=*/true,
+                                              /*replaceLocs=*/false,
+                                              /*replaceTypes=*/true);
+          if (failed(SymbolTable::replaceAllSymbolUses(&op, sunkAttr, *shard)))
+            return op.emitError()
+                   << "cannot repath uses of '" << recordName << "' at link";
+          SymbolTable::setSymbolName(&op, sunkAttr);
+          definitions.try_emplace(sunk, &op);
+          continue;
+        }
+        if (escapeIt != escapes.end())
+          escapeSite = escapeIt->second;
+      }
       InFlightDiagnostic diag =
           dedupable ? op.emitError()
                           << "conflicting definitions of '" << symbol.getName()
@@ -423,6 +640,18 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
                     : op.emitError() << "duplicate definition of '"
                                      << symbol.getName() << "' at link";
       diag.attachNote(first->getLoc()) << "first defined here";
+      if (escapeSite) {
+        StringAttr escapeSymbol = SymbolTable::getSymbolName(escapeSite);
+        diag.attachNote(escapeSite->getLoc())
+            << "'" << symbol.getName()
+            << "' appears in the cross-translation-unit interface of "
+            << (escapeSymbol
+                    ? (llvm::Twine("'") + escapeSymbol.getValue() + "'").str()
+                    : (llvm::Twine("this ") +
+                       escapeSite->getName().getStringRef())
+                          .str())
+            << ", so it cannot be made translation-unit-local";
+      }
       return failure();
     }
     for (const auto &entry : shardHeaderTexts)
