@@ -533,6 +533,17 @@ blocked_by = []
 anchor = "FR-173 LANDED 2026-08-30 (opened the same day by the FR-167 spike): THREE DEFECTS AT HEAD,"
 
 [[items]]
+id = "FR-174"
+rank = 12
+kind = "feature"
+status = "open"
+size = "L"
+title = "The pointer model is 66% of all remaining items and was never a filed item"
+summary = "Opened 2026-08-30 from the closing whole-program measurement. Weighted by transitive closure over the 501-object corpus, the pointer family is 8,775 of 13,342 distinct items (66 percent): ptr-to-ptr-escape 1866, ptr-to-ptr 1701, pointer-outside-parameter 1592 (353 direct + 1239 gated, the only one with real amplification at 3.5x), incomplete-struct 1463, returned-pointer 853, void-pointer-param 713, pointer-assigned-non-address 442, address-of-pointer 365. THE LEVERAGE ARC IS DONE: cascade root types fell from 86 gating 3,294 at FR-165s opening census to 57 gating 2,004, with FR-166 and FR-167 phase 1 retiring 29 roots and ~1,290 gated items; no remaining type-level fix has 20x amplification. Decomposes into at least five separate mechanisms that must be spiked separately, not as one fix. Prior art constrains it: FR-136 recorded a measured NO-GO on points-to, and FR-61f-c established the blocker is REPRESENTATION not aliasing -- do not re-attempt points-to without a new idea and the byte-diff suite in the loop. Rank pointer-outside-parameter first, on amplification. NOT SPIKED."
+blocked_by = []
+anchor = "FR-174 (opened 2026-08-30 from the closing whole-program measurement)"
+
+[[items]]
 id = "FR-138"
 rank = 14
 kind = "tooling"

@@ -11001,6 +11001,52 @@ piece and becomes FR-45.
   **THE ENUM ARC IS COMPLETE: FR-166 phases 1+2 and FR-169 phases A+B+C all
   landed. Values above INT64_MAX remain a located rejection.**
 
+- [ ] FR-174 (opened 2026-08-30 from the closing whole-program measurement):
+  THE POINTER MODEL IS NOW 66% OF EVERYTHING, and it has never been a filed
+  item -- it is the "deep front" the original systemd probe named in prose and
+  nobody indexed.
+  MEASURED at HEAD after the enum and union waves, 501-object corpus, ledger
+  deduped by `(file:line:col, symbol)` and weighted by transitive closure:
+      TOTAL  direct  gated  reason
+       1866    1866      0  pointer-to-pointer parameter escapes the cursor shape
+       1701    1701      0  pointer-to-pointer parameter
+       1592     353   1239  pointer type outside a parameter position
+       1463    1463      0  incomplete struct type
+        853     845      8  returned pointer value
+        713     713      0  void pointer parameter
+        629     629      0  non-constant global initializer
+        442     442      0  pointer assigned a non-address value
+        365     365      0  taking the address of a pointer variable
+  **Pointer-family weighted total: 8,775 of 13,342 distinct items (66%).**
+
+  THE LEVERAGE ARC IS DONE, and this is the evidence: cascade ROOT TYPES fell
+  from **86 gating 3,294** (FR-165's opening census) to **57 gating 2,004**.
+  FR-166 and FR-167 phase 1 between them retired 29 root types and ~1,290
+  gated items. There is no remaining type-level fix with 20x amplification;
+  the cheap leverage is spent and what is left is the front itself.
+
+  DECOMPOSITION, because "fix the pointer model" is a wish, not an item. The
+  8,775 split into at least five distinct mechanisms that should be spiked
+  SEPARATELY and are NOT one fix:
+  * `T**` parameters (3,567 combined) -- the cursor-parameter shape and its
+    escape. Note `ImportCTypes.cpp:1242` rejects a data `T**` on a BODY-LESS
+    declaration unconditionally, which is what FR-171 measured as
+    load-bearing; any change here must keep FR-171's tripwire honest.
+  * `pointer type outside a parameter position` (1,592, and the ONLY one with
+    real amplification at 3.5x) -- the highest leverage-per-effort candidate
+    remaining, and the natural successor to FR-166/FR-167.
+  * `incomplete struct type` (1,463) -- opaque-pointer idiom; note FR-168
+    measured that a TU which only sees the forward declaration never names
+    the type, so this may be narrower than it looks.
+  * `returned pointer value` / `pointer return type` (853+).
+  * `void pointer parameter` (713).
+  PRIOR ART THAT CONSTRAINS THIS: FR-136 recorded a measured NO-GO on the
+  points-to analysis that was meant to unlock the `T**` family, and FR-61f-c
+  established that the blocker there is REPRESENTATION, not aliasing. Do not
+  re-attempt points-to without a new idea AND the byte-diff suite in the loop.
+  RANK: `pointer type outside a parameter position` first, on amplification.
+  **NOT SPIKED.**
+
 - [ ] FR-170 UPSTREAM (found by the FR-166 spike 2026-08-30, reproduced on
   unmodified HEAD): `scf.index_switch` REJECTS `case INT64_MAX` as a
   duplicate, with no enum or emitrust code involved.
