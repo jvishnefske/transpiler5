@@ -85,6 +85,7 @@
 #include "EmitRust/Project/FrontierSearch.h"
 #include "EmitRust/Project/ItemColoring.h"
 #include "EmitRust/Project/ItemGraph.h"
+#include "EmitRust/Project/SectionTable.h"
 #include "EmitRust/ShardMetadata.h"
 
 #include "mlir/Conversion/ControlFlowToSCF/ControlFlowToSCF.h"
@@ -350,6 +351,28 @@ static llvm::cl::opt<std::string> testEntriesFlag(
         "--test-entry is always reported. scripts/test-entries-meson.py "
         "generates this from a meson project's test registry"),
     llvm::cl::value_desc("file"), llvm::cl::init(""));
+
+static llvm::cl::opt<std::string> testEntrySectionFlag(
+    "test-entry-section",
+    llvm::cl::desc(
+        "FR-160: derive the --test-entry list from the project's own "
+        "SECTION-REGISTERED test table, so a table-driven C suite needs no "
+        "build system and no hand-written symbol list. Scans the sources "
+        "again -- a second, purely analytical parse, exactly as the FR-40 "
+        "item graph takes -- for file-scope objects carrying "
+        "__attribute__((section(<name>))) and wraps every function whose "
+        "address their initializers mention; systemd's "
+        "_section_(\"SYSTEMD_TEST_TABLE\") registry is the motivating "
+        "shape. The registration cannot be read back out of the converted "
+        "module: the entry objects either sink into 'c_main' as locals or "
+        "are eaten by the FR-62 actor lift, and the section name -- the "
+        "only stable key, since the entry object's own name is "
+        "macro-generated -- survives neither. Derived symbols join the "
+        "--test-entry list and take all of its policy unchanged. A section "
+        "no object carries is a located warning, never a silent success. "
+        "Off by default: with no section requested every emitted crate is "
+        "byte-identical"),
+    llvm::cl::value_desc("name"), llvm::cl::init(""));
 
 static llvm::cl::opt<std::string>
     outputPath("o",
@@ -784,10 +807,35 @@ static mlir::LogicalResult writeModule(mlir::ModuleOp module,
 /// FR-160: the requested test entry points, `--test-entry` first, then the
 /// `--test-entries` file's. `fromFile` receives the file's symbols, which are
 /// skipped silently when this module does not define them.
+/// FR-160 Phase C: the symbols `--test-entry-section` derived from the
+/// project's registration table, resolved ONCE in `main` (where the input
+/// list and the clang arguments live) and read here, because both
+/// `appendTestModule` call sites see only a `ModuleOp`. Empty when the flag
+/// was not given, or when the scan matched no object.
+static llvm::SmallVector<std::string> sectionTestEntries;
+/// The number of objects that carried the requested section. Zero with the
+/// flag given is the "no such table" warning: the caller asked for a table
+/// and there is none, which is exactly the vacuous pass FR-160 forbids.
+static unsigned sectionTestObjects = 0;
+
 static llvm::SmallVector<std::string>
 collectTestEntries(llvm::StringSet<> &fromFile) {
-  llvm::SmallVector<std::string> entries(testEntryFlag.begin(),
-                                         testEntryFlag.end());
+  llvm::SmallVector<std::string> entries;
+  // DEDUP, on first occurrence, across all three sources. Not tidiness: two
+  // identically named `fn` items in the generated module is an unbuildable
+  // crate (rustc E0428). A section table arrives here already deduplicated,
+  // but the same function can be named by hand AND registered, and clang's
+  // double `InitListExpr` traversal plus FR-53 name folding both collapse
+  // distinct AST references onto one emitted symbol.
+  llvm::StringSet<> seen;
+  auto append = [&](llvm::StringRef symbol) {
+    if (seen.insert(symbol).second)
+      entries.push_back(symbol.str());
+  };
+  for (const std::string &symbol : testEntryFlag)
+    append(symbol);
+  for (const std::string &symbol : sectionTestEntries)
+    append(symbol);
   if (testEntriesFlag.empty())
     return entries;
   llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> buffer =
@@ -806,7 +854,7 @@ collectTestEntries(llvm::StringSet<> &fromFile) {
     if (symbol.empty())
       continue;
     fromFile.insert(symbol);
-    entries.push_back(symbol.str());
+    append(symbol);
   }
   return entries;
 }
@@ -817,8 +865,18 @@ collectTestEntries(llvm::StringSet<> &fromFile) {
 /// With no entry requested this returns before touching `source`, which is
 /// what keeps every crate emitted without the flag byte-identical.
 static void appendTestModule(mlir::ModuleOp module, std::string &source) {
-  if (testEntryFlag.empty() && testEntriesFlag.empty())
+  if (testEntryFlag.empty() && testEntriesFlag.empty() &&
+      testEntrySectionFlag.empty())
     return;
+  // FR-160 Phase C: a requested table that no object carries produces no
+  // report to hang a diagnostic on, so it gets its own. Reported here rather
+  // than at the scan so it is located in the module, like every other FR-160
+  // diagnostic.
+  if (!testEntrySectionFlag.empty() && sectionTestObjects == 0)
+    mlir::emitWarning(module->getLoc())
+        << "FR-160: --test-entry-section='" << testEntrySectionFlag
+        << "' matched no object; no test entry point was registered in that "
+           "section";
   llvm::StringSet<> fromFile;
   llvm::SmallVector<std::string> entries = collectTestEntries(fromFile);
   llvm::SmallVector<emitrustcc::TestEntryReport> reports;
@@ -2658,6 +2716,19 @@ int main(int argc, char **argv) {
                     "or --emit=rust\n";
     return 1;
   }
+  // FR-160 Phase C: the section scan is a parse of the C SOURCES, so it is
+  // meaningful exactly where a crate root is rendered from sources. Under
+  // --link the positional inputs are .o/.mlirbc shards clang cannot parse,
+  // and the merge alpha-renames each shard's `tu0_` tag to its link-line
+  // position, so even a source-side scan would derive wrong symbols.
+  if (!testEntrySectionFlag.empty() &&
+      (linkFlag ||
+       (emitKind != EmitKind::Crate && emitKind != EmitKind::Rust))) {
+    llvm::errs() << "error: --test-entry-section is only valid with "
+                    "--emit=crate or --emit=rust, and not with --link: it "
+                    "scans the C sources, which a link line does not name\n";
+    return 1;
+  }
   if (emitKind == EmitKind::Crate && outputPath == "-") {
     llvm::errs() << "error: --emit=crate requires -o <crate directory>\n";
     return 1;
@@ -2683,6 +2754,30 @@ int main(int argc, char **argv) {
   std::vector<std::string> inputs(inputFilenames.begin(),
                                   inputFilenames.end());
   std::vector<std::string> extra = collectExtraClangArgs();
+
+  // FR-160 Phase C: resolve the section-registered test table HERE, the one
+  // place the input list and the clang arguments exist, and stash it for
+  // `collectTestEntries` -- both `appendTestModule` call sites take only a
+  // `ModuleOp`, and `emitCrate` is reached only from this function. Gated on
+  // the flag, so a run without it pays no second parse.
+  if (!testEntrySectionFlag.empty()) {
+    std::string sectionError;
+    mlir::FailureOr<llvm::SmallVector<std::string>> derived =
+        mlir::emitrust::collectSectionTestEntries(
+            inputs, extra, compilationDatabasePath, testEntrySectionFlag,
+            sectionTestObjects, sectionError);
+    // LOUD, never an empty entry list: a scan that silently found nothing
+    // because the project did not parse is a vacuous `cargo test` pass.
+    if (mlir::failed(derived)) {
+      llvm::errs() << "error: --test-entry-section cannot parse the project "
+                      "to find the '"
+                   << testEntrySectionFlag << "' table"
+                   << (sectionError.empty() ? "" : ": ") << sectionError
+                   << "\n";
+      return 1;
+    }
+    sectionTestEntries = std::move(*derived);
+  }
 
   // FR-57d: under --link the item graph comes from the shards' stored
   // metadata, per shard in link-line order — no C is parsed at all.

@@ -17,6 +17,7 @@ add_mlir_library(MLIREmitRustProject
   FrontierSearch.cpp
   ItemColoring.cpp
   ItemGraph.cpp
+  SectionTable.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/EmitRust/Project

@@ -11708,9 +11708,64 @@ piece and becomes FR-45.
   function of that name in this crate" rather than the impl-block reason --
   the lift removes the free function, so the `emitrust.method_of` branch never
   sees it. Honest but less useful than it should be.
-  PHASE C REMAINS (recognise the section-table registration and synthesise the
-  entry list with no build system in the loop), as does applying the flag on
-  the `--partition` workspace path, which today ignores it.
+  **PHASE C LANDED 2026-08-29** -- `--test-entry-section=<name>`
+  (`lib/Project/SectionTable.cpp`, `include/EmitRust/Project/SectionTable.h`,
+  `test/Driver/test-entry-section.c`): derive the entry list from the
+  project's OWN registration table, no build system and no hand-written
+  symbol list in the loop.
+  THE SPIKE CORRECTED THE PREMISE THIS FR WAS OPENED ON, and the conclusion
+  survived for a better reason. The claim was that the registration objects
+  produce no item at all; measured, they produce TWO mutually exclusive
+  shapes -- with a `main` in the unit they sink into `c_main` as
+  `emitrust.variable` LOCALS (`let _tu0_e_alpha: TestFunc = TestFunc { f:
+  Some(tu0_t_alpha), name: 0, };`), and with no `main` the FR-62 actor lift
+  eats them into an `emitrust.struct_def @Tu0EAlphaActor`. The SECTION NAME
+  is destroyed on both paths, and it is the only stable key, because the
+  entry object's own name is macro-generated. So the table is unreadable from
+  the converted module not because the fact is missing but because it is
+  lift-dependent, and the second analytical parse -- the posture the FR-40
+  item graph already takes -- is required.
+  THE CONSTRAINT THAT MAKES OR BREAKS IT, settled by a differential
+  counterexample rather than by reading: the scan MUST map each function
+  through `cFunctionSymbolName` (CSymbolNaming.h:704) with the tuTag from
+  enumerating the same `buildProjectASTs` result. A hand-rolled
+  `tuTag + raw C name` derivation produced `tu0_CamelCase` where the module
+  defines `tu0_camel_case` -- FR-53's idiomatic fold -- and a per-file scan
+  that assumes `tu0_` is wrong outright: two TUs each defining `static int
+  t_one` emit `@tu0_t_one` and `@tu1_t_one`. Byte-identity of emitted symbol
+  names between importer and consumer is the invariant this repo already
+  names, and Phase C is now a third consumer of it.
+  MEASURED ON REAL systemd, whole corpus: 251 test TUs scanned, **203 carry a
+  table, 1390 unique symbols, 0 parse failures**; the second parse costs
+  0.061s against 0.144s for the whole emitrust-cc run of the same TU (~40%,
+  and only when the flag is given). End to end on 10 of those TUs: 81 derived
+  entries -> 67 `#[test]`s, 59 `#[ignore]`d with their own diagnostic, 8
+  runnable, 14 Externals-generic skips, and **ZERO "no function of that name
+  in this crate"** -- the mapping resolved 81/81.
+  THE ORACLE THAT MATTERS, because it is the whole point of the FR: a
+  systemd-shaped fixture with one deliberately failing test builds native to
+  rc=1 with `test_broken` failing, and its emitted crate's `cargo test`
+  reports `2 passed; 1 failed` failing EXACTLY
+  `emitrust_tests::tu0_test_broken` with `left: 1, right: 0`. **The C suite's
+  own pass/fail set is reproduced by the transpiled code.** That is a
+  differential oracle, not a compile check.
+  DELIBERATELY NOT ROUTED THROUGH THE FR-40 ITEM GRAPH: adding a `section`
+  field to `ItemNode` changes `ItemGraph::print`'s text, which the hidden
+  `--verify-item-graph-roundtrip` oracle and the test/Project goldens pin.
+  The standalone scan changes no printed format.
+  REJECTED UNDER `--link` as a located error: the merge alpha-renames each
+  shard's `tu0_` tag to its link-line position, so a source-side scan would
+  derive symbols the merged module does not have.
+  GATE NOTE, recorded because it cost a full-suite run: the two meson tiers
+  run CONCURRENTLY under a bare `meson test`, and together they exhausted the
+  20G `/tmp` tmpfs -- `clang++: IO failure on output stream: Disk quota
+  exceeded` (EDQUOT, not the OOM exit-137 signature), which the corpus
+  harnesses then reported as 5 ledger "regressions" with `miscompiled=0`, a
+  spurious classification. Run the tiers SERIALLY with `TMPDIR` off the
+  tmpfs: green, 909 tests, 0 failures.
+  REMAINING: the `--partition` workspace path (emitrust-cc.cpp:2256 renders
+  each member with no `appendTestModule` call), and Phase B's adapter has no
+  round-trip test of its own yet.
 
 - [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
   the same day): A DEAD `goto` SILENTLY CHANGED A FUNCTION'S ANSWER. A
