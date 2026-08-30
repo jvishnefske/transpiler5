@@ -168,6 +168,38 @@ emitrust.func @switch_duplicate_case(%arg0: i32) {
 
 // -----
 
+// FR-175: a REAL duplicate at a DenseMap sentinel value must still be
+// refused. The fix for the false positive on `i64::MAX` (see
+// switch-sentinel-case.mlir) could have been spelled as "skip the sentinels",
+// which would have opened this hole instead; this leg closes it.
+emitrust.func @switch_duplicate_case_i64_max(%arg0: i64) {
+  // expected-error @+1 {{has duplicate case value 9223372036854775807}}
+  emitrust.switch %arg0 : i64
+  case 9223372036854775807 {
+  }
+  case 9223372036854775807 {
+  }
+  default {
+  }
+  emitrust.return
+}
+
+// -----
+
+emitrust.func @switch_duplicate_case_i64_min(%arg0: i64) {
+  // expected-error @+1 {{has duplicate case value -9223372036854775808}}
+  emitrust.switch %arg0 : i64
+  case -9223372036854775808 {
+  }
+  case -9223372036854775808 {
+  }
+  default {
+  }
+  emitrust.return
+}
+
+// -----
+
 emitrust.func @enum_ordered_cmp(%arg0: !emitrust.enum<"Color">, %arg1: !emitrust.enum<"Color">) {
   // expected-error @+1 {{enum operands only support the eq and ne predicates}}
   %0 = emitrust.cmp lt, %arg0, %arg1 : (!emitrust.enum<"Color">, !emitrust.enum<"Color">) -> i1

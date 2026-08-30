@@ -26,10 +26,11 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
-#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/MathExtras.h"
+
+#include <set>
 
 using namespace mlir;
 using namespace mlir::emitrust;
@@ -1685,7 +1686,18 @@ LogicalResult SwitchOp::verify() {
            << getCaseRegions().size() << " case regions but "
            << caseValues.size() << " case values";
 
-  llvm::DenseSet<int64_t> seen;
+  // FR-175: NOT a `DenseSet<int64_t>`. `DenseMapInfo<int64_t>` reserves
+  // `i64::MAX` as its empty key and `i64::MIN` as its tombstone, so a case
+  // AT either value is indistinguishable from an unoccupied bucket: with a
+  // bucket array already allocated, `case 1, case i64::MAX` reported a
+  // duplicate the switch does not have, and an assertions-enabled build
+  // aborts inside `LookupBucketFor` instead of diagnosing at all. This is
+  // the same defect FR-170 fenced off in MLIR's own
+  // `scf::IndexSwitchOp::verify`; a verifier that exists to tell the truth
+  // about duplicates may not itself invent one. `std::set` has no reserved
+  // values, and a switch's case list is short enough that its cost is
+  // irrelevant here.
+  std::set<int64_t> seen;
   for (int64_t value : caseValues) {
     if (!seen.insert(value).second)
       return emitOpError("has duplicate case value ") << value;

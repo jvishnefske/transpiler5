@@ -558,12 +558,12 @@ anchor = "FR-174 (opened 2026-08-30 from the closing whole-program measurement)"
 id = "FR-175"
 rank = 28
 kind = "defect"
-status = "open"
+status = "landed"
 size = "S"
 title = "emitrust.switch verify carries the same DenseSet empty-key bug FR-170 just fenced"
-summary = "Opened 2026-08-30 by the FR-170 implementer. lib/EmitRust/EmitRustOps.cpp:1688 uses llvm::DenseSet<int64_t>, whose empty key is i64::MAX, so hand-written emitrust.switch IR with case 9223372036854775807 fed to emitrust-opt gets OUR OWN false has-duplicate-case-value -- the exact diagnostic FR-170 just stopped telling users. Unreachable from C source because FR-170s fence fires first; it bites only hand-written IR, which is why it was left out of scope to keep that change small. One-line fix (std::set or an explicit sentinel check) if the honesty invariant should hold for hand-written IR too. NOT SPIKED."
+summary = "FIXED 2026-08-30. emitrust::SwitchOp::verify collected case values in llvm::DenseSet<int64_t>, whose empty key is i64::MAX and tombstone is i64::MIN. The entry was WRONG about the trigger: a lone case 9223372036854775807 is ACCEPTED, because a default-constructed DenseMap has ZERO buckets and LookupBucketFor early-returns for any key. The defect is ORDER-DEPENDENT -- case 1 then case i64::MAX gives the false duplicate. i64::MIN never fired (nothing is erased, so no bucket holds the tombstone) but is one erase away; an assertions build aborts on both. Unreachable from C source, re-confirmed after the fix: FR-170 fences first. Fixed with std::set; invalid.mlir gained two legs so a REAL duplicate at each sentinel is still refused, closing the hole a skip-the-sentinels fix would have opened. Swept: this was the only remaining DenseSet<int64_t> in lib/tools/include. Gate 945/945."
 blocked_by = []
-anchor = "FR-175 (opened 2026-08-30 by the FR-170 implementer): OUR OWN"
+anchor = "FR-175 DEFECT (FIXED 2026-08-30; opened the same day by the FR-170"
 
 [[items]]
 id = "FR-138"
