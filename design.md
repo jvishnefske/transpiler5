@@ -9770,8 +9770,9 @@ piece and becomes FR-45.
   Full gate 892/892; no EndToEnd stdout moved, as expected for a change that
   only respells synthesized type names.
 
-- [ ] FR-152 DEFECT (found by the systemd probe 2026-08-28): `failed to
-  legalize operation 'scf.while'` on 7 units, all gperf-GENERATED lookup tables
+- [x] FR-152 DEFECT (found by the systemd probe 2026-08-28; SPIKED and FIXED
+  2026-08-29): reported as `failed to legalize operation 'scf.while'` on 7
+  units, all gperf-GENERATED lookup tables
   (`af-from-name.gperf:51`, `errno-from-name`, …). Machine-generated C is a
   distinct shape class from hand-written C and this is the first time the
   project has measured it at scale.
@@ -9790,6 +9791,96 @@ piece and becomes FR-45.
   RECOVERS the function as a stub (`unsupported: call to 'abort'`), and the
   stub is a definition, so the obligation resolves. That claim should be
   struck from the report.
+
+  THE ENTRY'S ROOT CAUSE WAS WRONG. "Machine-generated C is a distinct shape
+  class" is not the condition. Measured by differential probe, the exact
+  condition is: **a place-backed local DECLARED INSIDE an unbounded-loop body
+  whose value ESCAPES the loop** becomes an `!emitrust.lvalue<T>`-typed
+  loop-carried RESULT of `scf.while`, and `SCFToEmitRust`'s `WhileLowering`
+  has no default value for an lvalue type (`getDefaultValueAttr` returns null;
+  `createDefaultInitializedLets`, `SCFToEmitRust.cpp:67-124`). It is
+  type-independent: `unsigned char/short/int/long`, `enum`, `struct`,
+  address-taken scalars and function pointers ALL fail -- every category
+  `emitLocalVar` (`ImportCStatements.cpp:505-545`) routes to an
+  `emitrust.variable` place -- while signed ints and floats never do, because
+  they are never place-backed. Escape via `break` plus a use after the loop
+  fails identically, and so does `do/while`. gperf merely happens to write
+  `gperf_case_strcmp` in exactly this shape. A 10-line reproducer flips from
+  EMITS to FAILS by changing `int` to `unsigned char`.
+  Secondary finding, and it cost real triage time: the reported location
+  (`capability-from-name.gperf:51:7`) is MISLEADING. That line is literally
+  `CAP_DAC_OVERRIDE, CAP_DAC_OVERRIDE` in the keyword list; a `#line`
+  directive in the generated header remaps the skeleton onto unrelated
+  keyword-list lines.
+
+  FIX (spiked as mechanism (C), two rivals measured and rejected): a small
+  func-nested pass in the pinned pipeline, between `lift-cf-to-scf` and the
+  `canonicalize` that follows it, that MOVES an escaping, operand-free,
+  init-less `emitrust.variable` out of the `scf.while` region. Everything
+  downstream is existing machinery -- verified on hand-edited IR, not assumed:
+  the following canonicalize drops the now-loop-invariant carried value via
+  MLIR's own `RemoveLoopInvariantArgsFromBeforeBlock` /
+  `RemoveLoopInvariantValueYielded`, the result arity shrinks, and the
+  conversion renders `let mut c: u8; loop { ... }`. NO NEW OPS.
+
+  THE FENCE IS LOAD-BEARING. Unfenced, the hoist makes ONE binding serve the
+  whole loop instead of one per iteration, which for a droppy type silently
+  DELETES every drop but the last: measured on a `struct R` whose `~R`
+  prints, native emitted three `dtor` lines and the hoisted crate emitted
+  one. Any place whose type transitively reaches an `emitrust.has_drop`
+  struct_def -- plus `emitrust.opaque` unconditionally -- is refused with its
+  own located diagnostic naming the variable, rather than being left to fall
+  through to the useless `failed to legalize` wording.
+
+  RIVALS MEASURED AND REJECTED. (A) hoisting in the importer
+  (`createVariablePlace` always to the entry block): NO-GO -- 842/892 with
+  ELEVEN EndToEnd byte-diff divergences, and it is what exposed FR-155.
+  (B) hand-writing the carried-value removal inside `WhileLowering`:
+  GO-in-principle but redundant, since it reimplements the upstream
+  canonicalization (C) already gets for free, at identical risk.
+
+  MEASURED RESULT. All 7 systemd units import (before: every one
+  `failed to legalize 'scf.while'`). The `systemd-detect-virt` link now
+  produces 501/501 shards, up from 495. Gate 900/900 with ZERO golden churn
+  -- structural, not luck: a place can only escape an `scf.while` region as a
+  region RESULT, which must be lvalue-typed, which is exactly the shape that
+  hard-failed before. Byte-diff oracle: ten shapes at four argc values, plus
+  eight independent adversarial cases (re-init, uninitialised path, nesting,
+  shadowing, after-region use, break-escape, do/while, a faithful
+  `gperf_case_strcmp` over eight string pairs) all MATCH the clang native,
+  and both droppy cases are located rejections.
+
+  RESIDUE, deliberately left as a located rejection: a BOUNDED loop with an
+  inner `return` of a body-declared place fails with `ub.poison` instead --
+  `lift-cf-to-scf` nests the variable inside an `scf.if` in the before-region
+  and seeds the carried value with `ub.poison : !emitrust.lvalue<T>`, which
+  is NOT loop-invariant, so canonicalize cannot remove it and a generalized
+  hoist provably does not fix it (tried in the spike). Corpus cost of
+  deferring: ONE file across 1601 systemd TUs.
+
+- [ ] FR-156 DEFECT (found by the FR-152 whole-program link 2026-08-29): A
+  RECOVERED FUNCTION'S DEPENDENT GLOBAL SURVIVES IT, leaving a function
+  pointer with no target.
+  `error: dangling function pointer target 'tu0_rlimit_parse_sec': the module
+  defines no function with that name`, at
+  `src/basic/rlimit-util.c:222:20` -- a file-static dispatch table
+      static int (*const rlimit_parse_table[_RLIMIT_MAX])(const char *, rlim_t *) = {
+              [RLIMIT_CPU] = rlimit_parse_sec, ...
+      };
+  whose target `rlimit_parse_sec` was itself dropped by recovery. The table
+  global was emitted anyway and still names it.
+  This FAILS LOUDLY, so the FR-52 marker contract is working as designed --
+  the defect is that recovery drops an item without dropping the globals
+  whose initializers reference it, so the loud failure lands at LINK on a
+  whole program instead of at the point of the drop.
+  It is the current head of the `systemd-detect-virt` link, reached only
+  after FR-151 and FR-152 (and with FR-154's colliding unit excluded).
+  DIRECTION, untested: when recovery drops a function, walk the globals whose
+  initializer attributes name it and drop them too, cascading through the
+  existing `[rejected-type-cascade]` machinery so the progress report
+  attributes them; the alternative -- keeping the global and emitting a
+  located rejection at the DROP site -- is probably better UX for the
+  single-TU case but does not obviously compose with `--link`.
   **NOT SPIKED.**
 
 - [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28): 35 crates fail
