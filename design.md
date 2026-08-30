@@ -10152,6 +10152,51 @@ piece and becomes FR-45.
   LLVM-exception, which is compatible with AGPL-3.0 for a combined work.
   **NEEDS AN OWNER DECISION.**
 
+- [ ] FR-161 (FR-158 Phase 3, split out 2026-08-29 so the remaining work is
+  indexed): A SCALAR-OBJECT ARGUMENT AT A SLICE PARAMETER. `f(&x)` where `x`
+  is a scalar local or a struct field and the defining TU classifies that
+  parameter as a slice. This is the ENTIRE residue of FR-158 Phases 1+2 --
+  60 argument slots across 55 caller functions in 25 shards, top offender
+  `config_parse_unsigned_bounded` with 24 -- and it is what stands between
+  the systemd whole-program link and a crate that is emitted at all.
+  Reproduces in three files (located at the call site, as it should be):
+      /* sdef.c */ void take(const char *p, int n) { printf("%c%d\n", p[0], n); }
+      /* suse.c */ void take(const char *, int);
+                   int run(void) { char c = 'q'; take(&c, 5); return 0; }
+      suse.c:2:31: error: unsupported: argument 1 of the call to 'take' is a
+                   scalar reference but the defining translation unit
+                   classifies that parameter as a slice
+  A DISTINCT `-D` PER TU IS REQUIRED to reach the code at all -- otherwise
+  `reimportFactStarvedGroups` rescues the pair by joint re-import and the
+  divergence never materializes.
+
+  DIRECTIONS. The FR-158 spike listed three and preferred stubbing; I think
+  it mis-ranked them, on semantics:
+  * `::std::slice::from_mut(&mut x)` is SEMANTICALLY EXACT, not a
+    workaround. C's `f(&x)` passes a pointer to ONE object and the callee
+    may legally touch only `p[0]`; a one-element slice is precisely that
+    range, and `p[1]` becomes a Rust PANIC where C has undefined behaviour
+    -- the safe failure direction this project already prefers. The open
+    question is purely mechanical: `emitrust.slice_of`'s verifier accepts
+    `lvalue<array>` and `lvalue<slice>` bases only
+    (`lib/EmitRust/EmitRustOps.cpp:1343-1385`), so this needs either a
+    widened verifier or a new op. The emitter already renders `::std::`
+    paths since FR-150, so the rendering side is precedented.
+  * Stub the enclosing caller at the merge under the FR-52 marker contract.
+    The spike measured this SUFFICIENT to make the whole systemd crate
+    compile, but it silently deletes 55 functions' behaviour, and
+    `--link --incremental` does NOT recover at the merge (measured under
+    FR-158), so there is no existing recovery path to hang it on.
+  * Import the caller's scalar as a one-element array: unbounded blast
+    radius on every caller. Rejected by the spike; I agree.
+
+  OPEN QUESTION TO SETTLE FIRST, because it may merge two backlog items:
+  FR-158's Phase 4 residue (7 functions, `&mut (*p)[v..]` reborrowed through
+  a `&`-typed slice parameter) may be THE SAME DEFECT as FR-153 (E0596
+  mutable borrow through a shared reference, 35 crates). Check before
+  spiking either.
+  **NOT SPIKED.**
+
 - [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28): 35 crates fail
   `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`
   (src/core/manager, src/coredump/coredumpctl-journal, …). Exit-0 unbuildable,
