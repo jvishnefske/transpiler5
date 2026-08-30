@@ -10008,19 +10008,85 @@ piece and becomes FR-45.
   `currentTuTag`, i.e. it only fires for two records in ONE import. Under the
   shard path each TU is a separate `emitrust-clang -c` invocation, so the two
   never meet until `mergeShards`, which sees only names and shapes.
-  DIRECTIONS, both untested:
-  (a) link-time disambiguation -- `mergeShards` detects a name with divergent
-      shapes where every referencing use is inside a single shard, and
-      retags both with that shard's tu tag, rewriting references within the
-      shard. AST-independent, so it does not disturb the CSymbolNaming.h
-      byte-identity invariant that made FR-108 choose REJECT over rename.
-  (b) keep rejecting, but make the diagnostic name both source locations and
-      say which TU each shape came from; today it names only one.
-  Note FR-108's recorded reason for rejecting a rename --
-  `ItemGraphBuilder::recordSymbolFor` and FR-41 coloring recompute record
-  symbols from the AST ALONE -- applies to (b)'s import-time renaming but
-  NOT to (a), which happens after all AST work is done.
-  **NOT SPIKED.**
+  SPIKED 2026-08-29. THREE MECHANISMS MEASURED; the entry's own direction (b)
+  was already implemented -- the diagnostic ALREADY names both locations.
+
+  (B) import-time TU tag on main-file records: **NO-GO**, two blockers.
+  (B1) my premise that single-TU output would be unaffected is FALSE:
+  `emitrust-cc` always routes through `importCProject`
+  (`lib/ImportC/ImportC.cpp:7671`), so even a single-file `--emit=rust`
+  already emits `fn tu0_use_a(...)`. (B2) a CORRECTNESS REGRESSION on a legal
+  idiom that links today, both jointly and via `--link`: two `.c` files each
+  defining an identical file-scope `struct P` shared through an `extern`
+  function (C99 6.2.7 compatible types). Tagging gives `Tu0P` and `Tu1P` and
+  `consume` is called with the wrong one -- rustc E0308. 126 renames to fix
+  one collision is a bad trade; 126 renames that also break working code is
+  not a trade.
+
+  (A/A') link-time shape-partition rename, fenced to main-file-only records:
+  GO-with-constraints, and MEASURED WORKING -- 501-object link exit 0 at
+  12,104,324 bytes, one rename in 501 shards, three byte-identical crates,
+  zero dangling types, gate 901/902. But every rename mechanism flips
+  `test/Driver/link-merge-errors.c`: its `struct Box` inputs are
+  STRUCTURALLY THE SAME PROGRAM as hashmap.c + hibernate-util.c, so no
+  predicate can rename one and refuse the other.
+
+  (C) keep rejecting: cost is now precisely ONE TU of 501.
+
+  CORRECTION TO MY OWN CLAIM: I told the spike (A) was "inert on systemd".
+  Wrong -- I had compared on the 500-object line, which already excludes the
+  colliding unit. On the 501-object line (A) is exactly the difference
+  between a 500- and a 501-object link (+12,778 lines, the whole
+  hibernate-util TU).
+
+  DECISION (repo owner, 2026-08-29): none of the three. Use RUST'S OWN
+  NAMESPACING instead of any mangling or renaming -- see FR-159. FR-154 stays
+  open as the defect; FR-159 is the fix.
+
+  ALSO MEASURED, worth keeping: `--preserve-c-names`, the AST-pure injective
+  escape hatch FR-108 names as the remedy for this class, DOES NOT EXIST on
+  the shard path (`emitrust-clang --preserve-c-names` is
+  `clang: error: unknown argument`). It works on the joint import. So under
+  `--link` the rejection is terminal today: the user's only remedy is to drop
+  a translation unit from the link line.
+  **SPIKED; superseded by FR-159.**
+
+- [ ] FR-159 (opened by the repo owner 2026-08-29, in place of FR-154's three
+  measured mechanisms): USE RUST'S OWN NAMESPACING instead of `tu<N>_` name
+  mangling. Emit each translation unit's TU-LOCAL items into `mod tu<N>` and
+  refer to them by PATH; header-shared types stay at crate root.
+      mod tu314 { pub(crate) fn rlimit_parse_sec(..); pub(crate) struct SwapEntries {..} }
+      mod tu99  { pub(crate) struct SwapEntries {..} }   // distinct type, no mangling
+  This dissolves FR-154 by construction -- two TU-local types with one C tag
+  are two paths, not one name -- and replaces the whole mangling scheme with
+  the language's actual mechanism. Chosen over FR-154's (A') link-time rename
+  deliberately, as the better change rather than the cheaper one.
+
+  MEASURED STARTING POINT: the 12 MB whole-program crate contains ZERO `mod`
+  blocks; the emitter's only module is a hardcoded `actor_rt` raw-string
+  epilogue (`TranslateToRust.cpp:3977`, FR-62). There is no general per-item
+  module machinery. This is a new capability, not a configuration.
+
+  TWO CONSTRAINTS INHERITED FROM FR-154's MEASUREMENTS, and modules do NOT
+  escape either -- they relocate the problem, they do not remove it:
+  * THE SHAPE PARTITION IS MANDATORY. Two `.c` files each defining an
+    identical file-scope `struct P` shared through an `extern` function link
+    TODAY (C99 6.2.7). A naive module-per-TU scheme makes that `consume(
+    tu0::P)` called with `tu1::P` -- rustc E0308, the exact regression that
+    made the import-time tag a NO-GO. Identical shapes must still resolve to
+    ONE definition.
+  * THE PINNED REJECTION STILL MOVES. If TU-local same-name types coexist by
+    construction, `test/Driver/link-merge-errors.c`'s `struct Box` case stops
+    erroring, exactly as it would under a rename. The respec is owed either
+    way; it should NARROW the pinned rejection to a shared-header input
+    (the genuine ODR violation, which must keep its located diagnostic) and
+    add a positive test for the TU-local case.
+  The discriminator must be AST-PURE (FR-108: the item graph and FR-41's
+  coloring recompute record symbols from the AST alone);
+  `SourceManager::isInMainFile` is the candidate and was measured sound.
+  NOT on the critical path to a BUILDING whole-program crate -- that is
+  FR-157/FR-158, since the merged crate fails 6542 rustc errors regardless.
+  **SPIKING.**
 
 - [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
   the same day): A DEAD `goto` SILENTLY CHANGED A FUNCTION'S ANSWER. A
