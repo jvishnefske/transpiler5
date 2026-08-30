@@ -31,7 +31,7 @@
 //
 // Every skip is COUNTED and printed to stderr. An adapter that silently
 // dropped four fifths of a registry would be the same silent request-ignore
-// FR-161 had to clean up on the emitter side.
+// FR-176 had to clean up on the emitter side.
 //
 // RUN: %python %S/../../scripts/test-entries-meson.py \
 // RUN:   --build %S/Inputs/test-entries-meson > %t.entries 2> %t.stats
@@ -63,7 +63,7 @@
 // STATS-DAG: dedup: same symbol, another meson test       1
 // STATS-DAG: entries                                      1
 
-// The reader wraps `main` through the FR-161 alias: the emitted entry point
+// The reader wraps `main` through the FR-176 alias: the emitted entry point
 // of a C `main` is `c_main`, and that mapping is sound because `c_main` is a
 // reserved name.
 // ROUNDTRIP:      #[cfg(test)]

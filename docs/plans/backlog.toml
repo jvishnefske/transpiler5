@@ -319,10 +319,10 @@ title = "C test entry points become #[test] functions (cargo test as a different
 anchor = "FR-160 FEATURE (opened by the repo owner 2026-08-29 out of the systemd"
 
 [[items]]
-id = "FR-161"
+id = "FR-176"
 status = "landed"
 title = "FR-160 silent request-ignore surfaces"
-anchor = "FR-161 DEFECT (found by the FR-160 `--partition` spike"
+anchor = "FR-176 DEFECT (opened 2026-08-29 as FR-161 on the probe line; RENUMBERED"
 
 [[items]]
 id = "FR-153"
