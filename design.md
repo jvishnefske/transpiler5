@@ -10953,10 +10953,53 @@ piece and becomes FR-45.
   CHECK asserting otherwise failed AFTER the fix and was corrected.
   Gate 934/934. Byte-diffed at 4 argc seeds over both enum flavours, plus the
   16-case battery, all clean.
-  **PHASES A+B LANDED. Phase C (site `:172`, needed for FR-166 Phase 2) and
-  FR-166 Phase 2 itself remain -- do not land C before A+B, and note that
-  with the range open and `:172` unfixed, `(unsigned long)M_MAX` is a silent
-  miscompile.**
+  PHASE C LANDED 2026-08-30 TOGETHER WITH FR-166 PHASE 2, in one increment
+  because Phase 2 alone is a measured silent miscompile. Gate **938/938**;
+  corpus 12,412,646 -> 12,415,236 bytes, cargo **0 errors**.
+  Site `:172` now casts to `mapType(ref->getType())` rather than hard i32,
+  falling back to `castEnumToI32` when the mapping is not an `IntegerType`.
+  Verified myself after landing: `(unsigned long)M_MAX` gives 4294967295 in
+  both native and crate, where the Phase-2-only build gave
+  18446744073709551615.
+  THE MIXED FAILURE DIRECTION WAS REPRODUCED before fixing, exactly as
+  predicted: with Phase C reverted, one shape miscompiles silently while
+  three others fail as located rejections (`assigned value type does not
+  match the place`, `conditional operator arm type mismatch`). That is why
+  the two could not be staged separately.
+
+  THE ENTIRE CORPUS DELTA IS `EPOLL_EVENTS` BEING ADMITTED -- 84 lines, the
+  `EpollEvents` type plus `poll_events_to_epoll` / `epoll_events_to_poll`
+  going from `unimplemented!` stubs to real bodies. Ratchet moves monotone
+  forward: admitted 33,620 -> 33,623, rejected 74,918 -> 74,916,
+  `enum-def-rejected` 6 -> 5.
+
+  FOUR THINGS MY BRIEF GOT WRONG, all caught by measurement:
+  * THREE pins flipped, not one. Besides `u32max.c`, `isUInt<32>` also admits
+    `enums-invalid.c`'s BIG leg (`HUGE_V = 3000000000`) and
+    `cpp-enum-class-invalid.cpp`'s BIGVAL leg -- the latter was a LIVE
+    fast-tier failure. All three flipped forward to positive CHECKs.
+  * **The `does not fit in i32` diagnostic is now UNREACHABLE from C and
+    C++.** Clang widens the underlying type rather than hand the importer a
+    32-bit enum with an out-of-range enumerator, and
+    `enum class E : int { V = <out of int> }` is a hard clang error. The i32
+    leg survives only at the DIALECT VERIFIER, so new `@U32NoMarker` /
+    `@U32TooBig` pins were added to `invalid.mlir`.
+  * **Verifier check ORDERING had to change.** With the relaxation as
+    prototyped, `enum_def @Neg ["A"] [-1] {unsigned_underlying}` hit the range
+    check first and degraded the pinned negativity wording. The implementer
+    fixed the IMPLEMENTATION (negativity check ahead of range), not the test.
+  * **Phase C is NOT byte-identical for WIDE unsigned enums**, contrary to my
+    "byte-identical for every in-range enumerator". Clang gives the
+    DeclRefExpr the enum's PROMOTION type, which for
+    `enum WU { WU_B = 5000000000ULL }` is `unsigned long` -- so those
+    references move from signless `i64` to `ui64`. Every admitted wide value
+    is <= INT64_MAX so the bits agree; the new shape is pinned.
+  Also added, unasked and correctly: a C++ EndToEnd test, because the gate is
+  shared and C++ reaches enum-to-integer conversion through a DIFFERENT seam
+  (a C++ enumerator reference has the enum type, so Phase C never fires for
+  it) -- measured byte-clean rather than argued by analogy.
+  **THE ENUM ARC IS COMPLETE: FR-166 phases 1+2 and FR-169 phases A+B+C all
+  landed. Values above INT64_MAX remain a located rejection.**
 
 - [ ] FR-170 UPSTREAM (found by the FR-166 spike 2026-08-30, reproduced on
   unmodified HEAD): `scf.index_switch` REJECTS `case INT64_MAX` as a

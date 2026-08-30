@@ -230,6 +230,25 @@ emitrust.enum_def @WideNoMarker ["A", "Big"] [0, 5000000000]
 
 // -----
 
+// FR-166 PHASE 2: the 32-bit range a def admits is the range of its own
+// STORAGE -- u32 with `unsigned_underlying`, i32 without it. 4294967295 is
+// legal for the marked def (test/Dialect/EmitRust/ops.mlir) and stays a
+// loud verifier failure for the unmarked one, whose tuple struct has an
+// `i32` field that cannot hold it. The marker is the only thing that
+// unlocks it; deriving the signedness from the values instead would admit
+// this def silently.
+// expected-error @+1 {{variant value 4294967295 is out of the i32 range}}
+emitrust.enum_def @U32NoMarker ["A", "Max"] [1, 4294967295]
+
+// -----
+
+// The u32 bound is a real bound, not a hole: a value above it is rejected
+// even WITH the unsigned marker, because 32-bit storage is 32-bit storage.
+// expected-error @+1 {{variant value 4294967296 is out of the i32 range}}
+emitrust.enum_def @U32TooBig ["A", "Over"] [1, 4294967296] {unsigned_underlying}
+
+// -----
+
 emitrust.func @enum_raw_not_enum(%arg0: i32) {
   %0 = emitrust.variable : !emitrust.lvalue<i32>
   // expected-error @+1 {{operand must be an lvalue of !emitrust.enum type}}

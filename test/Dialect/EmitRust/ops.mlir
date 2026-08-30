@@ -359,6 +359,15 @@ emitrust.enum_def @Jt ["A", "B", "Big"] [0, 1, 5000000000] {wide_underlying}
 // CHECK: emitrust.enum_def @Uw ["A", "Big"] [0, 5000000000] {unsigned_underlying, wide_underlying}
 emitrust.enum_def @Uw ["A", "Big"] [0, 5000000000] {unsigned_underlying, wide_underlying}
 
+// FR-166 PHASE 2: a NON-wide def carrying `unsigned_underlying` stores 32
+// bits UNSIGNED, so its admitted variant range is the full u32 -- 4294967295
+// is in range here and out of range for the same def without the marker
+// (test/Dialect/EmitRust/invalid.mlir pins that half). The value stays
+// printed as the signed i64 the `DenseI64ArrayAttr` holds, which is why the
+// emitter, not the attribute, is what has to know the storage is u32.
+// CHECK: emitrust.enum_def @U32 ["A", "Mid", "Max"] [1, 2147483648, 4294967295] {unsigned_underlying}
+emitrust.enum_def @U32 ["A", "Mid", "Max"] [1, 2147483648, 4294967295] {unsigned_underlying}
+
 // CHECK-LABEL: emitrust.func @enum_open_wide
 emitrust.func @enum_open_wide(%arg0: i64) {
   %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Uw">>

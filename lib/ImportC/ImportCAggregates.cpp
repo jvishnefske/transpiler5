@@ -2150,12 +2150,17 @@ CImporter::importEnumUncached(const clang::EnumDecl *definition) {
       return emitError(enumeratorLoc)
              << "unsupported: enumerator value does not fit in i64";
     int64_t value = initValue.getExtValue();
-    // A 32-bit underlying type keeps the SIGNED i32 bound even when it is
-    // unsigned: `castEnumToI32` converts to a signless i32 and so discards
-    // the enum's signedness, which would turn an admitted `M_MAX =
-    // 4294967295u` into `-1` at every comparison. Widening this to the full
-    // u32 range is FR-169, and it has to fix that conversion first.
-    if (!wideUnderlying && !llvm::isInt<32>(value))
+    // A 32-bit underlying type admits its own range and NOTHING MORE: the
+    // full u32 when it is unsigned, i32 when it is signed. The unsigned
+    // half is FR-166 PHASE 2, and it was held back deliberately until the
+    // enum-to-integer conversions stopped discarding signedness: while
+    // `castEnumToI32` was on every path, an admitted `M_MAX = 4294967295u`
+    // became `-1` at every comparison and every widening. FR-169 phases A
+    // (relational/floating, via `castEnumToPromotedInt`) and C (the
+    // enumerator reference, via `mapType(ref->getType())`) are what make
+    // this safe, so the three cannot be split apart again.
+    if (!wideUnderlying && !(unsignedUnderlying ? llvm::isUInt<32>(value)
+                                                : llvm::isInt<32>(value)))
       return emitError(enumeratorLoc)
              << "unsupported: enumerator value does not fit in i32";
     variantNames.push_back(enumVariantRustName(name));

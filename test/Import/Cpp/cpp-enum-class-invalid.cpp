@@ -1,6 +1,6 @@
 // RUN: split-file %s %t
 // RUN: not emitrust-import-c %t/keyword-name.cpp 2>&1 | FileCheck %s --check-prefix=KWNAME
-// RUN: not emitrust-import-c %t/big-value.cpp 2>&1 | FileCheck %s --check-prefix=BIGVAL
+// RUN: emitrust-import-c %t/big-value.cpp | FileCheck %s --check-prefix=BIGVAL
 // RUN: not emitrust-import-c %t/huge-value.cpp 2>&1 | FileCheck %s --check-prefix=HUGEVAL
 // RUN: not emitrust-import-c %t/empty.cpp 2>&1 | FileCheck %s --check-prefix=EMPTY
 // RUN: not emitrust-import-c %t/nonliftable-default.cpp 2>&1 | FileCheck %s --check-prefix=NLDEFAULT
@@ -23,13 +23,27 @@
 // point of the feature -- systemd's `_SD_ENUM_FORCE_S64` shape), so the leg
 // that used to spell `enum class Big : long long { V = 3000000000LL }` is
 // replaced by the two gates that survive it:
-//   * BIGVAL -- a 32-BIT fixed underlying type still bounds its values by
-//     i32. `unsigned int` is deliberate: the enum-to-integer conversion
-//     still drops signedness, so an admitted UINT32_MAX enumerator would
-//     MISCOMPILE (FR-169), not merely widen.
+//   * BIGVAL -- a 32-bit fixed underlying type bounds its values by the
+//     range of ITS OWN storage. FR-166 PHASE 2 moved this leg forward in
+//     turn: `unsigned int` storage now admits the whole u32, so it is kept
+//     here as a POSITIVE check rather than deleted. It was held back
+//     through the FR-166 wave because the enum-to-integer conversions still
+//     dropped signedness then, so an admitted UINT32_MAX enumerator
+//     MISCOMPILED (measured on the C side: `(unsigned long)M_MAX` printed
+//     18446744073709551615) rather than merely widening. FR-169 phases A
+//     and C are what made the range safe to open;
+//     test/EndToEnd/cpp-enum-u32-fixed-underlying.cpp byte-diffs the C++
+//     half of it, which reaches the conversion through a different seam
+//     (a C++ enumerator reference has the ENUM type, so every conversion
+//     out of it is an explicit cast node).
+//     A fixed SIGNED 32-bit underlying type still bounds by i32 -- but no
+//     C++ program can reach that gate either, since a value outside `int`
+//     is a hard clang error on `enum class E : int`, so the i32 leg is
+//     pinned at the dialect verifier (test/Dialect/EmitRust/invalid.mlir).
 //   * HUGEVAL -- a 64-bit fixed underlying type is admitted, but a value
 //     above INT64_MAX exceeds `DenseI64ArrayAttr` and stays rejected with
-//     the i64 wording.
+//     the i64 wording. THAT bound does not move: it is a representation
+//     limit, not a policy.
 
 //--- keyword-name.cpp
 // KWNAME: keyword-name.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: enum name 'match' is a Rust keyword
@@ -39,7 +53,7 @@ int use(match m) {
 }
 
 //--- big-value.cpp
-// BIGVAL: big-value.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: enumerator value does not fit in i32
+// BIGVAL: emitrust.enum_def @Big ["V"] [3000000000] {unsigned_underlying}
 enum class Big : unsigned int { V = 3000000000u };
 int use(Big b) {
   return 0;

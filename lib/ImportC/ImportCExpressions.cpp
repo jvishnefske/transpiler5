@@ -150,17 +150,29 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
   if (const auto *materialize =
           llvm::dyn_cast<clang::MaterializeTemporaryExpr>(e))
     return emitRValue(materialize->getSubExpr());
-  // An enumerator used as a plain expression has type `int` in C: a named
-  // enum's constant is rendered as its Rust variant cast to i32, while an
-  // anonymous enum's constant is a plain i32 value. In C++ the reference
+  // An enumerator used as a plain expression has the type CLANG gave the
+  // reference: `int` for every value representable as one (C17 6.4.4.3),
+  // which is every enumerator of a signed-underlying enum and every
+  // in-range enumerator of an unsigned one. A named enum's constant is
+  // rendered as its Rust variant cast to that type, while an anonymous
+  // enum's constant is already a plain integer value. In C++ the reference
   // HAS the enum type (both scoped and unscoped), so the enum-typed
   // constant is returned as-is (FR-113 C1): the enclosing context is
   // either enum-typed itself (assignment, return, call argument, a CK_NoOp
   // `static_cast<Color>(Blue)`) or an explicit IntegralCast node that
-  // emits the enum-to-integer conversion — forcing i32 here instead made
-  // `Color c = Color::Green;` reject with the misleading "assigned value
-  // type does not match the place". The type test keeps the C path
-  // byte-identical, because a C enumerator reference is int-typed.
+  // emits the enum-to-integer conversion — forcing an integer here instead
+  // made `Color c = Color::Green;` reject with the misleading "assigned
+  // value type does not match the place".
+  //
+  // FR-169 phase C: this used to hard-cast to i32, which matched clang for
+  // every enumerator the importer would admit — until FR-166 phase 2 opened
+  // the enumerator range to the full u32, at which point clang types an
+  // out-of-`int`-range enumerator's reference `unsigned int`. Forcing THAT
+  // through i32 is a silent miscompile the moment it is widened:
+  // `(unsigned long)M_MAX` emitted `M::M_MAX.0 as i32 as u64` and printed
+  // 18446744073709551615 instead of 4294967295, because `as i32` makes it
+  // -1 and the widening sign-extends. Every in-range enumerator is
+  // byte-identical, since `mapType` sends clang's `int` to i32.
   if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e))
     if (const auto *enumerator =
             llvm::dyn_cast<clang::EnumConstantDecl>(ref->getDecl())) {
@@ -168,8 +180,18 @@ FailureOr<Value> CImporter::emitRValue(const clang::Expr *expr) {
       if (failed(constant))
         return failure();
       if (llvm::isa<emitrust::EnumType>((*constant).getType()) &&
-          !namedEnumDeclOf(ref->getType()))
+          !namedEnumDeclOf(ref->getType())) {
+        FailureOr<Type> refType = mapType(ref->getType(), loc);
+        if (failed(refType))
+          return failure();
+        // A non-integer mapping is not a shape this seam can normalize;
+        // fall back to the historical i32 rather than emit a cast the op
+        // verifier would reject.
+        if (llvm::isa<IntegerType>(*refType))
+          return builder.create<emitrust::CastOp>(loc, *refType, *constant)
+              .getResult();
         return castEnumToI32(loc, *constant);
+      }
       return constant;
     }
   // W2.3: an lvalue bound to a C++ reference parameter (e.g. `const T&`)

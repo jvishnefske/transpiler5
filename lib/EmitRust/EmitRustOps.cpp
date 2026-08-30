@@ -576,13 +576,25 @@ LogicalResult EnumDefOp::verify() {
       return emitOpError("variant names must not be empty");
     if (!seenNames.insert(name).second)
       return emitOpError("duplicate variant name \"") << name << "\"";
-    if (!getWideUnderlying() && !llvm::isInt<32>(value))
-      return emitOpError("variant value ")
-             << value << " is out of the i32 range";
+    // The NEGATIVE check runs first: a negative value on an unsigned def
+    // also fails the unsigned range test below, and "is negative but the
+    // enum has an unsigned underlying type" is the diagnostic that names
+    // the actual mistake. Reversing these two silently degrades that
+    // message to a range complaint.
     if (getUnsignedUnderlying() && value < 0)
       return emitOpError("variant value ")
              << value
              << " is negative but the enum has an unsigned underlying type";
+    // FR-166 phase 2: a NON-wide def stores 32 bits, and the range it
+    // admits is the range of its own storage -- u32 with the
+    // `unsigned_underlying` marker, i32 without it. Widening the unsigned
+    // half here without FR-169's signedness-preserving conversions in place
+    // is a measured miscompile, not a relaxation.
+    if (!getWideUnderlying() &&
+        !(getUnsignedUnderlying() ? llvm::isUInt<32>(value)
+                                  : llvm::isInt<32>(value)))
+      return emitOpError("variant value ")
+             << value << " is out of the i32 range";
   }
   return success();
 }
