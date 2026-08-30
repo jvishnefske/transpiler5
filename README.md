@@ -1,6 +1,6 @@
 # EmitRust
 
-**Turn C and C++ into Rust you can actually read — and prove it still does the same thing.**
+**Turn C and C++ into Rust you can actually read — and demonstrate it still does the same thing.**
 
 EmitRust is an out-of-tree [MLIR](https://mlir.llvm.org/) dialect and toolchain that
 transpiles C and a growing subset of C++17 into safe Rust. It is modeled on upstream
