@@ -324,6 +324,16 @@ anchor = "FR-160 FEATURE (opened by the repo owner 2026-08-29 out of the systemd
 blocked_by = ["FR-158", "FR-159"]
 
 [[items]]
+id = "FR-160b"
+rank = 21
+kind = "defect"
+status = "open"
+size = "S"
+title = "FR-160 has four silent request-ignore surfaces"
+summary = "Found by the FR-160 --partition spike 2026-08-29. (1) An entry must be spelled in EMITTED form -- --test-entry=camelCaseTest misses pub fn camel_case_test (FR-53 rename) -- and under --test-entries=<FILE> the silent-skip rule then suppresses the warning, so a registry of C names yields silently ZERO coverage for every non-snake_case symbol. (2) renderTestModule's kMethodOfAttrName arm is dead code: FuncToEmitRust.cpp:212 drops the attribute and :194-197 nests the func in the impl's own symbol table, so an actor-lifted arm reports the wrong reason. (3) The isExternal arm is likewise unreachable -- a referenced extern becomes an Externals trait member. (4) --emit=ratchet and --emit=rejection-report return from emitLinkArtifactQuery before the partition dispatch, so a request there exits 0 silently. Each takes a request and gives neither the thing nor a word about it, which is what FR-160 exists to forbid."
+anchor = "FR-160b DEFECT (found by the FR-160 `--partition` spike"
+
+[[items]]
 id = "FR-153"
 rank = 11
 kind = "defect"

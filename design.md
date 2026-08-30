@@ -11763,9 +11763,71 @@ piece and becomes FR-45.
   harnesses then reported as 5 ledger "regressions" with `miscompiled=0`, a
   spurious classification. Run the tiers SERIALLY with `TMPDIR` off the
   tmpfs: green, 909 tests, 0 failures.
-  REMAINING: the `--partition` workspace path (emitrust-cc.cpp:2256 renders
-  each member with no `appendTestModule` call), and Phase B's adapter has no
-  round-trip test of its own yet.
+  **`--partition` LANDED 2026-08-29.** The FR-59 workspace path rendered each
+  member with no `appendTestModule` call, so every `--test-entry`,
+  `--test-entries` and `--test-entry-section` request was SILENTLY IGNORED
+  there -- exit 0, no diagnostic, `cfg(test)` in no member. The fix is not the
+  missing call: the skip decision is per MEMBER but the diagnostic is a
+  whole-WORKSPACE judgement, because an entry symbol lives in exactly one
+  member and reporting per member would emit N-1 "no function of that name"
+  warnings for a symbol that is fine. `reportTestEntries` folds the reports
+  in ENTRY order (so output is a function of the request, not of member
+  order) in three tiers: wrapped somewhere -> silent; else found in some
+  module but unwrappable -> ONE warning at that definition's own location;
+  else found nowhere -> one warning at the MERGED module's location, or
+  silence when the symbol came from a `--test-entries` file.
+  THE HAZARD THE SPIKE MEASURED, and the reason per-member `lookupSymbolIn`
+  is load-bearing rather than incidental: a member root carries
+  `use <dep>::*;` glob imports, so a test block placed in the WRONG member
+  still compiles and PASSES. Appending liba's block to the binary member gave
+  `test_alpha ... ok`, `test_beta ... ok` in a crate that defines neither.
+  Rust name resolution will not catch a misattribution; only the symbol-table
+  lookup against the member's own module will. The control confirms it: the
+  same block in a dep-less member fails `error[E0425]`.
+  Also measured: condensation needs no special handling (`lookupSymbolIn`
+  follows it, so no source-directory assumption may be introduced), the
+  member module's `UnknownLoc` renders as `<unknown>:0:` and is useless for
+  the fold's diagnostic (hence the merged module's location), and
+  `--test-entry-section` stays REJECTED here for Phase C's reason --
+  `--partition` requires `--link`, and the merge alpha-renames each shard's
+  `tu<N>_` tag to its link-line position.
+  END-TO-END, not just emission: a hand-appended workspace builds and
+  `cargo test` reports test_alpha ok / tu0_test_static ok / test_fails FAILED
+  (left 7, right 0) / test_beta ok / c_main ok -- across a lib member, a
+  dep-less lib member and the BIN member -- and the clang-built native runner
+  agrees exactly, failure included.
+
+- [ ] FR-160b DEFECT (found by the FR-160 `--partition` spike 2026-08-29):
+  FOUR SILENT REQUEST-IGNORE SURFACES IN LANDED FR-160 CODE. Each one takes a
+  request and produces neither the thing asked for nor a word about it, which
+  is precisely what FR-160 exists to forbid.
+  1. **THE ENTRY MUST BE SPELLED IN EMITTED FORM AND NOTHING SAYS SO.**
+     `--test-entry=camelCaseTest` warns "no function of that name in this
+     crate" while the emitter writes `pub fn camel_case_test()` (FR-53's
+     idiomatic rename); `--test-entry=camel_case_test` wraps. Under
+     `--test-entries=<FILE>` the file's silent-skip rule then SUPPRESSES the
+     warning, so a registry of C names -- the motivating systemd path --
+     yields silently ZERO coverage for every non-snake_case symbol. Likely
+     fix: resolve an entry through the same `cFunctionSymbolName` mapping
+     Phase C already uses, or fall back to it before reporting absence.
+  2. `renderTestModule`'s `kMethodOfAttrName` arm (CrateEmitter.cpp:428) is
+     DEAD CODE: `FuncToEmitRust.cpp:212` excludes `emitrust.method_of` when
+     copying attributes and `:194-197` nests the func inside the
+     `emitrust.impl`'s own symbol table, so an actor-lifted arm is reported
+     "no function of that name" while the crate plainly contains
+     `impl Tu0HelperCountActor { fn test_alpha(&mut self) -> i32 }`. This is
+     the gap recorded at Phase A landing, now root-caused.
+  3. The `fn.isExternal()` arm (CrateEmitter.cpp:426) is likewise unreachable
+     for ordinary C externs: a referenced extern becomes an `Externals` trait
+     member, not a module-level func.
+  4. `--emit=ratchet` and `--emit=rejection-report` return from
+     `emitLinkArtifactQuery` (emitrust-cc.cpp:2871-2873) BEFORE the partition
+     dispatch, so a test-entry request on those paths exits 0 with no crate
+     root and no diagnostic.
+  **NOT SPIKED** as a fix; the defects themselves are measured above.
+
+  REMAINING FOR FR-160: Phase B's adapter (`scripts/test-entries-meson.py`)
+  has no round-trip test of its own -- acceptance criterion 6.
 
 - [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
   the same day): A DEAD `goto` SILENTLY CHANGED A FUNCTION'S ANSWER. A
