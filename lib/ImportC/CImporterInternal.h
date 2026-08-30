@@ -5853,6 +5853,27 @@ private:
   /// representation type of every imported enum).
   Value castEnumToI32(Location loc, Value value);
 
+  /// FR-169: like `castEnumToI32`, but targets the enum's PROMOTED C integer
+  /// type -- unsigned (`ui32`/`ui64`) when the `emitrust.enum_def` carries
+  /// `unsigned_underlying`, signless (`i32`/`i64`) otherwise, with the width
+  /// taken from `wide_underlying` exactly as `castEnumToI32` does. C17
+  /// 6.7.2.2 makes an enumerated type compatible with an
+  /// implementation-chosen integer type, and clang picks an unsigned one when
+  /// no enumerator is negative, so an enum-typed OBJECT of such a type may
+  /// hold any value of the unsigned range -- the i32-range guard on import
+  /// bounds ENUMERATOR values, not object values. Use this wherever the
+  /// SIGNEDNESS of the normalized discriminant is observable (relational
+  /// comparison, conversion to a floating type); `castEnumToI32` remains
+  /// correct, and byte-identical, for the bit-preserving sites (`!= 0`, the
+  /// switch discriminant, a subscript index).
+  ///
+  /// The signedness deliberately comes from the definition's marker and NOT
+  /// from clang's promoted type: clang promotes an enum-typed object of a
+  /// no-negative-enumerator enum to `unsigned int` even when every value fits
+  /// `int`, so a promoted-type-driven rule would move emitted bytes for every
+  /// such enum without fixing anything.
+  Value castEnumToPromotedInt(Location loc, Value value);
+
   /// FR-149: emits a user-written SUBSCRIPT INDEX expression, normalizing a
   /// named-enum index to its i32 discriminant. This is the single seam every
   /// index expression passes through, in place of a bare `emitRValue`, so no

@@ -788,6 +788,15 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     FailureOr<Type> mapped = mapType(cast->getType(), loc);
     if (failed(mapped))
       return failure();
+    // FR-169: an enum source arrives here STILL ENUM-TYPED -- C puts no
+    // integer conversion node between an enum operand and a floating
+    // destination -- and `arith.sitofp` then rejected it with a raw
+    // op-verifier error, unlocated for the implicit initializer form.
+    // Normalizing to the enum's promoted integer type both admits the
+    // construct and picks the right signedness: a no-negative-enumerator
+    // enum holding 3000000000 converts to 3000000000.0, not -1294967296.0.
+    if (llvm::isa<emitrust::EnumType>((*value).getType()))
+      *value = castEnumToPromotedInt(loc, *value);
     // Unsigned to float is an `emitrust.cast`: Rust's `u* as f*` performs
     // the same round-to-nearest conversion as C.
     if (isUnsignedInt((*value).getType()))
@@ -1607,8 +1616,41 @@ FailureOr<Value> CImporter::emitComparison(const clang::BinaryOperator *op) {
         predicate = arith::CmpIPredicate::sge;
         break;
       }
-      Value lhsInt = castEnumToI32(loc, *lhsValue);
-      Value rhsInt = castEnumToI32(loc, *rhsValue);
+      // FR-169: relational comparison is the one enum site whose answer
+      // depends on the discriminant's SIGNEDNESS, so it normalizes to the
+      // enum's PROMOTED integer type rather than to a blanket i32. An enum
+      // with no negative enumerator has an unsigned underlying type and an
+      // object of it may hold any value of the unsigned range, including
+      // values above INT32_MAX that no enumerator names; `as i32` +
+      // `arith.cmpi slt` read those as negative and inverted the answer.
+      // `arith.cmpi` has no unsigned-TYPED form (its operands must be
+      // signless), so the unsigned case uses `emitrust.cmp`, which carries
+      // the comparison to Rust's signedness-bearing `<` on the `u32`/`u64`
+      // operands. Equality above never needed this -- it compares the enum
+      // values directly.
+      Value lhsInt = castEnumToPromotedInt(loc, *lhsValue);
+      Value rhsInt = castEnumToPromotedInt(loc, *rhsValue);
+      if (isUnsignedInt(lhsInt.getType())) {
+        emitrust::CmpPredicate rustPredicate;
+        switch (op->getOpcode()) {
+        case clang::BO_LT:
+          rustPredicate = emitrust::CmpPredicate::lt;
+          break;
+        case clang::BO_LE:
+          rustPredicate = emitrust::CmpPredicate::le;
+          break;
+        case clang::BO_GT:
+          rustPredicate = emitrust::CmpPredicate::gt;
+          break;
+        default:
+          rustPredicate = emitrust::CmpPredicate::ge;
+          break;
+        }
+        return builder
+            .create<emitrust::CmpOp>(loc, builder.getI1Type(), rustPredicate,
+                                     lhsInt, rhsInt)
+            .getResult();
+      }
       return builder.create<arith::CmpIOp>(loc, predicate, lhsInt, rhsInt)
           .getResult();
     }
@@ -7382,6 +7424,27 @@ Value CImporter::castEnumToI32(Location loc, Value value) {
                                                    enumType.getName()))
       if (def.getWideUnderlying())
         target = builder.getI64Type();
+  return builder.create<emitrust::CastOp>(loc, target, value).getResult();
+}
+
+Value CImporter::castEnumToPromotedInt(Location loc, Value value) {
+  // FR-169: the SIGNEDNESS-aware sibling of `castEnumToI32`. Width follows
+  // `wide_underlying` for the same FR-166 reason; signedness follows
+  // `unsigned_underlying`, the marker recorded from clang's choice of
+  // underlying type at the enum's import. A non-enum value passes through
+  // the default (signless, 32-bit) only if it is already an integer, which
+  // every caller guarantees.
+  unsigned width = 32;
+  bool isUnsigned = false;
+  if (auto enumType = llvm::dyn_cast<emitrust::EnumType>(value.getType()))
+    if (auto def = emitrust::EnumDefOp::lookupFrom(module.getOperation(),
+                                                   enumType.getName())) {
+      if (def.getWideUnderlying())
+        width = 64;
+      isUnsigned = def.getUnsignedUnderlying();
+    }
+  Type target = isUnsigned ? builder.getIntegerType(width, /*isSigned=*/false)
+                           : builder.getIntegerType(width);
   return builder.create<emitrust::CastOp>(loc, target, value).getResult();
 }
 

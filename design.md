@@ -10878,8 +10878,8 @@ piece and becomes FR-45.
   verbatim. Corpus byte-identical at 12,413,334 with cargo 0 errors.
   **LANDED.**
 
-- [ ] FR-169 DEFECT (MISCOMPILE, found by the FR-166 spike 2026-08-30;
-  currently UNREACHABLE, and that is the only reason it is not live):
+- [x] FR-169 PHASES A+B LANDED 2026-08-30 (MISCOMPILE, found by the FR-166 spike;
+  I FILED IT AS UNREACHABLE AND THAT WAS FALSE -- it was LIVE AT HEAD):
   `castEnumToI32` THROWS AWAY THE ENUM'S SIGNEDNESS at 8 call sites
   (`lib/ImportC/ImportCExpressions.cpp:7370`, called from `:172, 845, 1610,
   1611, 1901, 7394`, `ImportCStatements.cpp:5927`, `ImportC.cpp:2194`),
@@ -10894,7 +10894,69 @@ piece and becomes FR-45.
   `emitrust.cmp` rather than a signed `arith.cmpi`.
   Payoff inside systemd is ~2 items, but `EPOLL_EVENTS` is a GLIBC enum, so
   the reach past systemd is much wider.
-  **NOT SPIKED.**
+
+  **THE "UNREACHABLE" PREMISE WAS FALSE. THIS WAS A LIVE MISCOMPILE AT HEAD**,
+  and I verified the refutation myself:
+      enum M { M_A = 1, M_B = 2 };          /* BOTH enumerators in i32 range */
+      enum M x = (enum M)(argc > 100 ? 1u : 3000000000u);
+      printf("%d %d %d\n", x > y, x < y, x == y);
+      native: 1 0 0        emitted crate: 0 1 0
+  No out-of-range enumerator, no FR-166 patch, ordinary well-defined C.
+  MY REASONING ERROR, stated plainly so it is not repeated: I assumed the
+  i32-range guard on ENUMERATORS bounded the values an enum-typed OBJECT can
+  hold. It does not. C17 6.7.2.2 makes the enum type compatible with an
+  implementation-chosen integer type and clang picks `unsigned int` whenever
+  no enumerator is negative, so storing 3e9 into a two-enumerator enum is
+  legal C. The guard is load-bearing for the ENUMERATOR half only.
+  Scale: a 16-shape value-driven battery shows **5 of 16 shapes miscompile at
+  HEAD**, all of them enum-vs-enum relational (`<`, `>`, `<=`, `>=`, in
+  expressions, in `while`, in `for`). The other 11 -- call arg, widening and
+  narrowing casts, `_Bool`, shifts, bitwise, unary minus, `~`, `+`, ternary,
+  `&&` -- are correct at HEAD and stay correct.
+
+  FIX (Phase A): `castEnumToPromotedInt` beside `castEnumToI32`, used at
+  `ImportCExpressions.cpp:1631-1632` ONLY, emitting `emitrust.cmp lt/le/gt/ge`
+  when the promoted type is unsigned. Signedness comes from the `EnumDefOp`'s
+  `unsigned_underlying` marker, NOT from clang's promoted type -- clang
+  promotes a no-negative-enumerator enum object to `unsigned int` even when
+  every value fits `int`, so a promoted-type-driven cast would have moved
+  bytes for every such enum. Casting to `ui32` also lets `isIdentityCastTail`
+  fire, so the tail COLLAPSES and the output gets SHORTER:
+      (state.0 as i32) > BusState::BUS_UNSET.0 as i32   ->   state.0 > BusState::BUS_UNSET.0
+
+  ALL SIX OTHER SITES LEFT ALONE, each with a measured reason: `:172` is
+  CORRECT today (C17 6.4.4.3 gives an enumeration constant type `int`,
+  confirmed by AST dump) and only breaks under Phase 2; `:854`/`:1943` are
+  `!= 0`, signedness-neutral; `:7470` is an array index where out-of-range is
+  UB either way; `ImportCStatements.cpp:5927` is safe by accident because the
+  emitter's `as i32 as u32 as usize` chain is BIT-PRESERVING, verified at
+  3000000000 and 4294967295; `ImportC.cpp:2194` is synthetic with variants
+  `0..N-1`.
+
+  PHASE B, a NINTH seam the audit missed: `ImportCExpressions.cpp:799`
+  (`CK_IntegralToFloating`) never normalized an enum source, so `arith.sitofp`
+  got an enum operand. Now fixed through the same helper.
+  QUALIFY MY OWN CLAIM: I called that error "unlocated". Only HALF true --
+  the implicit form (`double d = x;`) is unlocated, the explicit `(double)x`
+  IS located. The implementer measured both and pinned the working behaviour
+  rather than a rejection wording.
+
+  CHURN, which I had called the main risk: **1 lit golden**
+  (`test/Import/C/enums.c`, a deliberate rewrite from `arith.cmpi slt` to
+  `emitrust.cmp lt`), 1 of 986 sources, and the 501-object corpus goes
+  **12,413,334 -> 12,412,646 bytes (-688)** with cargo 0 errors -- 43 changed
+  line-pairs across exactly two enums (`BusState`, `UnifiedSection`). Smaller
+  output, not larger.
+  ALSO CORRECTED BY MEASUREMENT: the truth-test shape was ALREADY `ui32` at
+  HEAD, because clang inserts its own promotion ahead of
+  `CK_IntegralToBoolean`, so `:854`'s enum branch is never reached for it. A
+  CHECK asserting otherwise failed AFTER the fix and was corrected.
+  Gate 934/934. Byte-diffed at 4 argc seeds over both enum flavours, plus the
+  16-case battery, all clean.
+  **PHASES A+B LANDED. Phase C (site `:172`, needed for FR-166 Phase 2) and
+  FR-166 Phase 2 itself remain -- do not land C before A+B, and note that
+  with the range open and `:172` unfixed, `(unsigned long)M_MAX` is a silent
+  miscompile.**
 
 - [ ] FR-170 UPSTREAM (found by the FR-166 spike 2026-08-30, reproduced on
   unmodified HEAD): `scf.index_switch` REJECTS `case INT64_MAX` as a
