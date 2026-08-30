@@ -9991,7 +9991,8 @@ piece and becomes FR-45.
   cast fix.
   **NOT SPIKED.**
 
-- [ ] FR-154 DEFECT (found by the FR-151 spike 2026-08-29): TWO UNRELATED
+- [x] FR-154 DEFECT (found by the FR-151 spike 2026-08-29; DISSOLVED by
+  FR-159 Phase 1 the same day): TWO UNRELATED
   FILE-LOCAL RECORD TAGS IN DIFFERENT TUs COMPUTE ONE EMITTED NAME, and the
   `--link` merge cannot tell them apart.
   `src/basic/hashmap.c:119`'s `struct swap_entries` idiomatic-renames to
@@ -10172,7 +10173,55 @@ piece and becomes FR-45.
   NOT on the critical path to a BUILDING whole-program crate -- that is
   FR-157/FR-158, since the merged crate fails ~6,570 rustc errors regardless
   (the 501st TU adds 29 of the identical class).
-  **SPIKED GO; Phase 1 in TDD.**
+  PHASE 1 LANDED 2026-08-29. Gate 907/907 (902 + 5 new test files), ZERO
+  golden churn, `link-merge-errors.c` and `link-merge-anon-struct.c`
+  unmodified and passing. **THE FULL 501-OBJECT `systemd-detect-virt` LINK
+  NOW SUCCEEDS**: exit 0, zero errors, 12,104,392 bytes, one
+  `mod tu314 { pub(crate) struct SwapEntries { pub(crate) swaps: i64,
+  pub(crate) n_swaps: u64 } }` with its two users spelled
+  `&mut [crate::tu314::SwapEntries]`. Verified independently, not on the
+  agent's report.
+
+  FOUR THINGS THE IMPLEMENTATION FOUND THAT THE SPIKE'S PROTOTYPE HAD WRONG,
+  each a silent-miscompile or hard-error channel:
+  * A SECOND escape channel the C3 brief did not name: a conflicting record
+    reachable through the FIELD of a record that itself DEDUPS across the
+    shards. The wrapper is one crate-wide Rust type, so its field cannot be
+    repathed for one shard alone -- rustc E0308. Now an escape channel with
+    its own pinned test leg. Plain-TEXT carriers (`emitrust.opaque` payloads,
+    `emitrust.call_opaque` callees) are escape channels for the same reason:
+    the repath is a symbol+type rewrite and cannot reach a string.
+  * Only `StructDefOp` sinks. The prototype also sank `EnumDefOp`, but an
+    enum's variants are spelled `Name::VARIANT` in opaque TEXT the repath
+    cannot rewrite -- a silent-degradation hazard with no upside for FR-154,
+    since the measured conflict is a struct. Enum conflicts keep the
+    historical rejection.
+  * The prototype mutated `sym_name` at EMISSION time, which would have made
+    `emitStructDef`'s `nonCopyStructNames`/`dropStructNames` lookups query
+    the LEAF -- so a sunk non-Copy struct could inherit a root struct's Copy
+    verdict and give rustc E0204. Production prints `itemLeafName` at the
+    definition site while every name-keyed lookup keeps the whole symbol:
+    the IR stays flat, only the RENDERING nests.
+  * The prototype's two halves disagreed on C1 -- its merge half emitted the
+    relative `tu1::Buf` while its emitter half required `crate::`, so
+    together they would have emitted `struct tu1::Buf` at the root. The
+    14-byte delta between the spike's systemd output and the production one
+    is exactly that fix, across 501 real TUs.
+
+  C4/C5/C6 resolved as NOT REACHABLE in Phase 1, each checked rather than
+  assumed: only `StructDefOp` symbols and `StructType` names are rewritten,
+  so `emitrust.variable named` never sees a path (`verify(merged)` ran the
+  variable-name verifier over all 501 shards); `isInternalLinkageSymbolName`
+  has exactly one caller and the module override short-circuits before it, so
+  FR-51 export-mode blast radius stays zero; `parseTuTag` runs in merge step 1,
+  before any sink.
+  Also closed in-slice: `--c-abi-exports` is suppressed inside a module, so a
+  TU-local item can never be given a `#[no_mangle] extern "C"` symbol C never
+  had.
+  RECORDED GAP for Phase 3, flagged at the emission site: FR-51 export mode
+  still emits NO visibility on globals at all.
+  **PHASE 1 LANDED. Phase 2 (source-stem module names) and Phase 3 (statics
+  into modules, HELD behind FR-157/FR-158) remain.**
 
 - [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
   the same day): A DEAD `goto` SILENTLY CHANGED A FUNCTION'S ANSWER. A

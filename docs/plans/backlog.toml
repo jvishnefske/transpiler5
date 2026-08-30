@@ -327,11 +327,11 @@ anchor = "FR-153 DEFECT (found by the systemd probe"
 id = "FR-154"
 rank = 14
 kind = "defect"
-status = "open"
+status = "landed"
 size = "M"
 title = "Two unrelated file-local record tags in different TUs compute one emitted name"
-summary = "SPIKED 2026-08-29; superseded by FR-159. Three mechanisms measured. The entry direction (b) was already implemented -- the diagnostic already names both locations. (B) import-time TU tag: NO-GO, two blockers, including a correctness regression on legal C (two TUs with an identical file-scope struct P shared via an extern function link today; tagging makes that E0308). (A/A-prime) link-time shape-partition rename fenced to main-file records: measured WORKING, 501-object link exit 0 at 12,104,324 bytes, gate 901/902 -- but every rename mechanism flips link-merge-errors.c, whose Box inputs are structurally the same program as the systemd collision. (C) keep rejecting: cost is exactly one TU of 501. Repo owner chose none of the three: use Rust modules instead (FR-159). Also measured: --preserve-c-names does not exist on the shard path, so the rejection is terminal there."
-blocked_by = ["FR-159"]
+summary = "DISSOLVED by FR-159 Phase 1, 2026-08-29. SPIKED 2026-08-29; superseded by FR-159. Three mechanisms measured. The entry direction (b) was already implemented -- the diagnostic already names both locations. (B) import-time TU tag: NO-GO, two blockers, including a correctness regression on legal C (two TUs with an identical file-scope struct P shared via an extern function link today; tagging makes that E0308). (A/A-prime) link-time shape-partition rename fenced to main-file records: measured WORKING, 501-object link exit 0 at 12,104,324 bytes, gate 901/902 -- but every rename mechanism flips link-merge-errors.c, whose Box inputs are structurally the same program as the systemd collision. (C) keep rejecting: cost is exactly one TU of 501. Repo owner chose none of the three: use Rust modules instead (FR-159). Also measured: --preserve-c-names does not exist on the shard path, so the rejection is terminal there."
+blocked_by = []
 anchor = "FR-154 DEFECT (found by the FR-151 spike"
 
 [[items]]
