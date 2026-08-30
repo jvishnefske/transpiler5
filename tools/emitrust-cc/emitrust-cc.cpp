@@ -859,19 +859,103 @@ collectTestEntries(llvm::StringSet<> &fromFile) {
   return entries;
 }
 
+/// FR-160: was a generated test module requested at all?
+///
+/// The byte-identity guard for every emission path: with nothing requested,
+/// no entry list is collected and no crate root is touched, which is what
+/// keeps a run without the flags byte-identical to the run before this FR.
+static bool testEntriesRequested() {
+  return !testEntryFlag.empty() || !testEntriesFlag.empty() ||
+         !testEntrySectionFlag.empty();
+}
+
+/// FR-160: turns the collected per-entry reports into LOCATED warnings.
+///
+/// FR-160 slice 1 split this out of `appendTestModule` because under
+/// `--partition` the decision is per MEMBER while the judgement is
+/// whole-WORKSPACE. An entry-point symbol lives in exactly one member (every
+/// non-header op MOVES to exactly one crate module; only `emitrust.use` and
+/// `emitrust.verbatim` are cloned), so applying the entry list to every
+/// member and reporting per member would emit N-1 "no function of that name
+/// in this crate" warnings for a symbol that is perfectly fine. The fold is
+/// three tiers, keyed by symbol in ENTRY order so the output is a function of
+/// the request and not of member order:
+///
+///   T1 wrapped somewhere -- no warning at all.
+///   T2 else, found in some module but unwrappable -- one warning, against
+///      THAT definition's own location. At most one module can match.
+///   T3 else, found nowhere -- silent when the symbol came from a
+///      `--test-entries` file (a whole-project registry names every unit's
+///      tests), otherwise ONE warning at `foldLoc`.
+///
+/// \param foldLoc where a found-nowhere symbol is reported. Under
+///        `--partition` this must be the MERGED module's location: a member
+///        module is created with `UnknownLoc` and renders as `<unknown>:0:`,
+///        which is not located in any useful sense.
+/// \param entries the requested symbols, in request order.
+/// \param fromFile the symbols a `--test-entries` file contributed.
+/// \param reports every report from every module rendered, in any order.
+static void
+reportTestEntries(mlir::Location foldLoc,
+                  llvm::ArrayRef<std::string> entries,
+                  const llvm::StringSet<> &fromFile,
+                  llvm::ArrayRef<emitrustcc::TestEntryReport> reports) {
+  for (const std::string &entry : entries) {
+    const emitrustcc::TestEntryReport *located = nullptr;
+    const emitrustcc::TestEntryReport *absent = nullptr;
+    bool wrapped = false;
+    for (const emitrustcc::TestEntryReport &report : reports) {
+      if (report.symbol != entry)
+        continue;
+      if (report.skipReason.empty()) {
+        wrapped = true;
+        break;
+      }
+      if (report.op) {
+        if (!located)
+          located = &report;
+      } else if (!absent) {
+        absent = &report;
+      }
+    }
+    if (wrapped)
+      continue;
+    if (located) {
+      mlir::emitWarning(located->op->getLoc())
+          << "FR-160: no test emitted for '" << entry
+          << "': " << located->skipReason;
+      continue;
+    }
+    if (!absent)
+      continue;
+    // A whole-project entries file names every unit's tests; only the ones
+    // the caller asked for by hand are worth a diagnostic when absent.
+    if (fromFile.contains(entry))
+      continue;
+    mlir::emitWarning(foldLoc) << "FR-160: no test emitted for '" << entry
+                               << "': " << absent->skipReason;
+  }
+}
+
 /// FR-160: appends the generated `#[cfg(test)] mod` to `source` and reports
 /// every entry point that could not be wrapped.
+///
+/// The single-module shape: render and fold over exactly one module, so the
+/// fold above degenerates to "one report per entry" and the diagnostics are
+/// what Phase A emitted. The workspace shape lives in
+/// `emitPartitionedWorkspace`, which renders per member and folds once.
 ///
 /// With no entry requested this returns before touching `source`, which is
 /// what keeps every crate emitted without the flag byte-identical.
 static void appendTestModule(mlir::ModuleOp module, std::string &source) {
-  if (testEntryFlag.empty() && testEntriesFlag.empty() &&
-      testEntrySectionFlag.empty())
+  if (!testEntriesRequested())
     return;
   // FR-160 Phase C: a requested table that no object carries produces no
   // report to hang a diagnostic on, so it gets its own. Reported here rather
   // than at the scan so it is located in the module, like every other FR-160
-  // diagnostic.
+  // diagnostic. Deliberately NOT in the shared fold: the section flag is
+  // rejected under `--link`, and `--partition` requires `--link`, so this
+  // warning cannot arise on the workspace path at all.
   if (!testEntrySectionFlag.empty() && sectionTestObjects == 0)
     mlir::emitWarning(module->getLoc())
         << "FR-160: --test-entry-section='" << testEntrySectionFlag
@@ -881,18 +965,7 @@ static void appendTestModule(mlir::ModuleOp module, std::string &source) {
   llvm::SmallVector<std::string> entries = collectTestEntries(fromFile);
   llvm::SmallVector<emitrustcc::TestEntryReport> reports;
   source += emitrustcc::renderTestModule(module, entries, reports);
-  for (const emitrustcc::TestEntryReport &report : reports) {
-    if (report.skipReason.empty())
-      continue;
-    // A whole-project entries file names every unit's tests; only the ones
-    // the caller asked for by hand are worth a diagnostic when absent.
-    if (!report.op && fromFile.contains(report.symbol))
-      continue;
-    mlir::Location loc = report.op ? report.op->getLoc()
-                                   : module->getLoc();
-    mlir::emitWarning(loc) << "FR-160: no test emitted for '" << report.symbol
-                           << "': " << report.skipReason;
-  }
+  reportTestEntries(module->getLoc(), entries, fromFile, reports);
 }
 
 static mlir::LogicalResult emitCrate(mlir::ModuleOp module,
@@ -2371,6 +2444,18 @@ static int emitPartitionedWorkspace(llvm::ArrayRef<std::string> inputs,
           writeFile(rootToml, emitrustcc::renderWorkspaceToml(memberNames))))
     return 1;
 
+  // FR-160 slice 1: the entry list is a property of the REQUEST, not of a
+  // member, so it is collected ONCE for the whole workspace -- hoisted out of
+  // the loop because `collectTestEntries` re-reads the `--test-entries` file
+  // (and re-prints its read error) on every call. The reports accumulate
+  // across members and are folded after the loop; see `reportTestEntries`.
+  const bool wantTests = testEntriesRequested();
+  llvm::StringSet<> testEntriesFromFile;
+  llvm::SmallVector<std::string> testEntries;
+  if (wantTests)
+    testEntries = collectTestEntries(testEntriesFromFile);
+  llvm::SmallVector<emitrustcc::TestEntryReport> testReports;
+
   for (auto [index, crate] : llvm::enumerate(plan.crates)) {
     mlir::ModuleOp module = *crateModules[index];
     emitrustcc::CrateType type =
@@ -2387,6 +2472,13 @@ static int emitPartitionedWorkspace(llvm::ArrayRef<std::string> inputs,
         emitrustcc::renderCrateRoot(module, type, depNames);
     if (mlir::failed(rootRs))
       return 1;
+    // The lookup inside `renderTestModule` runs against THIS member's own
+    // symbol table, and that is a correctness gate rather than tidiness: the
+    // binary member's root carries `use <dep>::*;` for every dependency, so a
+    // test wrapping a sibling member's function would compile AND PASS there
+    // (measured). Placement follows the definition, and only the definition.
+    if (wantTests)
+      *rootRs += emitrustcc::renderTestModule(module, testEntries, testReports);
     llvm::SmallString<256> srcDir(outputPath);
     llvm::sys::path::append(srcDir, crate.name, "src");
     if (std::error_code ec = llvm::sys::fs::create_directories(srcDir)) {
@@ -2404,6 +2496,14 @@ static int emitPartitionedWorkspace(llvm::ArrayRef<std::string> inputs,
     if (mlir::failed(writeFile(rootPath, *rootRs)))
       return 1;
   }
+
+  // FR-160 slice 1: one whole-workspace judgement, after every member has had
+  // its say. The found-nowhere warnings hang off the MERGED module, which
+  // still carries shard 0's source location; a member module is created with
+  // `UnknownLoc` and would render as `<unknown>:0:`.
+  if (wantTests)
+    reportTestEntries((*merged)->getLoc(), testEntries, testEntriesFromFile,
+                      testReports);
 
   if (buildFlag && mlir::failed(buildCrate(outputPath)))
     return 1;
@@ -2727,6 +2827,20 @@ int main(int argc, char **argv) {
     llvm::errs() << "error: --test-entry-section is only valid with "
                     "--emit=crate or --emit=rust, and not with --link: it "
                     "scans the C sources, which a link line does not name\n";
+    return 1;
+  }
+  // FR-160 slice 1: the generated `#[cfg(test)] mod` is TEXT APPENDED TO A
+  // CRATE ROOT, so it is meaningful exactly where a crate root is rendered.
+  // Every other emission -- `--emit=mlir`, and under `--link` the pure
+  // artifact queries `--emit=ratchet` and `--emit=rejection-report`, which
+  // return before any root exists -- used to accept the flag, exit 0 and do
+  // nothing at all. A silently ignored request is the failure mode this FR
+  // forbids, so it is a hard error instead.
+  if ((!testEntryFlag.empty() || !testEntriesFlag.empty()) &&
+      emitKind != EmitKind::Crate && emitKind != EmitKind::Rust) {
+    llvm::errs() << "error: --test-entry/--test-entries is only valid with "
+                    "--emit=crate or --emit=rust: no other emission renders a "
+                    "crate root for the generated tests to be appended to\n";
     return 1;
   }
   if (emitKind == EmitKind::Crate && outputPath == "-") {
