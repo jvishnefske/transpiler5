@@ -10577,10 +10577,139 @@ piece and becomes FR-45.
   width notion already exists. The likely work is widening the emitted
   backing type and the `emitrust.enum_raw` place, not inventing a
   representation.
-  DO NOT ASSUME THAT. The two rejections are separated by an
-  `isRepresentableByInt64` guard, and this project's entries have been wrong
-  about their own mechanism in five of the last six cases -- measure the
-  dialect and emitter constraints before pricing.
+  SPIKED 2026-08-30: **GO for a WIDE-ONLY Phase 1, but it CANNOT LAND ALONE.**
+  11 sites assume 32-bit storage; 8 need changing, 3 are width-agnostic
+  (verified by reading, not assumed). Prototype 212 lines / 6 files.
+  MEASURED PAYOFF, over identical 501-shard regenerations with the ledger
+  deduped: **471 items resolved** (20 direct + 451 cascaded), **146 newly
+  surfaced** second-layer blockers that were previously unreachable, **net
+  -325**. My 278 projection was low on resolved and high on net. Direct drops
+  are 20, not 25; the "19 distinct enums" figure was right.
+  Byte identity holds: 281/281 EndToEnd byte-diffs pass, all crate goldens
+  pass, zero emitted bytes move. The only 3 failures are the negative tests
+  that pin the very rejection being removed -- they are rewrites, not repairs.
+  Byte-diff oracle with a wide enumerator USED at runtime (`wide.c`, the
+  verbatim force-macro shape over assignment, comparison, switch, truncating
+  casts, by-value params and `sizeof`): BYTE-IDENTICAL to the clang native.
+
+  **BLOCKER, and it is the reason this cannot ship alone: FR-166 BREAKS THE
+  501-OBJECT WHOLE-PROGRAM LINK.** At HEAD both the `extern` declaration of
+  `VL_INTERFACE_IO_SYSTEMD` and its definition are dropped as
+  `rejected-type-cascade` on `SdVarlinkInterface` -- symmetric, so no
+  obligation exists. Once `SdVarlinkInterface` imports, the DECLARATION
+  becomes a real `emitrust.extern_decl` obligation while the DEFINITION is
+  still dropped for an unrelated reason (`non-constant global initializer`),
+  and the asymmetry is a hard `unresolved external`. 48 of 501 shards had to
+  be excluded to get a building crate. That is FR-52's marker contract
+  working as designed; it is filed as FR-168 and gates this.
+
+  A MISCOMPILE IN THE OBVIOUS EXTENSION, measured, and the reason Phase 2 is
+  split out: relaxing the 32-bit UNSIGNED range without first fixing
+  `castEnumToI32` is a byte-diff miscompile.
+      enum M { M_A = 1, M_MID = 2147483648u, M_MAX = 4294967295u };
+      native: cmp 1 1 1        rust: cmp 1 0 1
+  `castEnumToI32` (`ImportCExpressions.cpp:7370`, 8 call sites) casts BOTH
+  relational operands to SIGNED i32 regardless of the enum's unsigned
+  underlying type, so `4294967295 as i32 == -1`. HEAD is safe only because
+  the range guard makes such a value unreachable. Filed as FR-169.
+  The WIDE path is not exposed: values above `INT64_MAX` stay rejected by
+  `isRepresentableByInt64`, so signed-at-i64 comparison always agrees with
+  unsigned (verified).
+
+  PREMISE OF THIS ENTRY FALSIFIED: the guard is not about 64-bit values at
+  all. It rejects `value < INT32_MIN || value > INT32_MAX` EVEN WHEN THE
+  STORAGE IS ALREADY u32, so `enum M { M_MAX = 0xFFFFFFFFU }` -- which fits
+  today's storage exactly -- is refused. glibc's `EPOLL_EVENTS`
+  (`EPOLLET = 1u<<31`) is rejected for that reason, not the 64-bit one.
+  ALSO FALSIFIED: FR-149/anonymous enums are very nearly a NON-issue. A wide
+  enumerator that is DECLARED BUT NOT REFERENCED in an anonymous enum already
+  works at HEAD, because `mapType` returns plain i32 before `importEnum` is
+  ever called. Only a REFERENCED wide anonymous enumerator is rejected, at a
+  different line (`ImportCExpressions.cpp:7343`). Separate, smaller, stays.
+
+  CROSS-TU SHAPE KEY: the entry's comment ("signedness is derived from the
+  values") is FALSE for C++ fixed underlying types, and measurably so -- two
+  TUs declaring `enum G : int` and `enum G : unsigned int` dedup SILENTLY at
+  HEAD into one `enum_def @G` with no signedness attribute. I verified this
+  myself and must QUALIFY the spike's framing: it is LATENT, NOT LIVE.
+  Signed and unsigned representations diverge only above 2^31, and those
+  values are rejected today by the very guard FR-166 removes. So it is not a
+  bug to fix BEFORE FR-166; it is a fence that must land WITH it (add
+  signedness+width to the key, one line).
+
+  OPERATIONAL, for whoever implements: adding any inherent attribute to
+  `EnumDefOp` INVALIDATES every previously-emitted `.o.emitrust.mlirbc`
+  shard -- measured, `error: attempting to parse a byte at the end of the
+  bytecode`. `--link` gives no compatibility warning, just a parse error.
+  Shards must be regenerated whenever the dialect changes.
+  **SPIKED GO, BLOCKED ON FR-168.**
+
+- [ ] FR-168 DEFECT (found by the FR-166 spike 2026-08-30): AN
+  `emitrust.extern_decl` OBLIGATION CAN OUTLIVE THE REJECTION OF ITS OWN
+  DEFINITION, turning a symmetric pair of drops into a spurious
+  `unresolved external` at link.
+  A symbol whose declaration AND definition are both dropped is harmless --
+  no obligation, no reference. But if anything makes the DECLARATION
+  importable while the DEFINITION is still dropped for an unrelated reason,
+  the obligation becomes a hard link error with no escape hatch
+  (`tools/emitrust-cc/LinkMerge.cpp:1068`).
+  Measured on `VL_INTERFACE_IO_SYSTEMD` (`varlink-io.systemd.h:6:35`): at HEAD
+  both sides cascade off `struct SdVarlinkInterface`, so the link is clean;
+  under FR-166 the declaration imports and the definition still fails
+  `unsupported: non-constant global initializer`
+  (`varlink-io.systemd.c:20:1`), and the 501-object whole-program link dies.
+  48 shards had to be excluded to get a building crate.
+  THIS GATES FR-166 and will gate every future fix that makes a previously
+  cascaded type importable -- which is the whole point of the FR-165 leverage
+  work, so it will recur.
+  TWO DIRECTIONS, neither prototyped:
+  (a) LINK POLICY -- when a shard records that a symbol's DEFINITION was
+      rejected, the merge should demote the matching obligation to a
+      drop-with-cascade rather than a hard error. The shards already carry
+      per-item rejection ledgers, so the fact is available at merge time.
+      This is the general fix and the one I would try first.
+  (b) fix `non-constant global initializer` for the
+      `SD_VARLINK_DEFINE_INTERFACE` shape -- narrower, and it only moves the
+      problem to the next asymmetric symbol.
+  **NOT SPIKED.**
+
+- [ ] FR-169 DEFECT (MISCOMPILE, found by the FR-166 spike 2026-08-30;
+  currently UNREACHABLE, and that is the only reason it is not live):
+  `castEnumToI32` THROWS AWAY THE ENUM'S SIGNEDNESS at 8 call sites
+  (`lib/ImportC/ImportCExpressions.cpp:7370`, called from `:172, 845, 1610,
+  1611, 1901, 7394`, `ImportCStatements.cpp:5927`, `ImportC.cpp:2194`),
+  casting BOTH relational operands to signed i32 whatever the underlying
+  type. Measured byte-diff once the range is opened:
+      enum M { M_A = 1, M_MID = 2147483648u, M_MAX = 4294967295u };
+      native: cmp 1 1 1     rust: cmp 1 0 1        (4294967295 as i32 == -1)
+  HEAD is safe ONLY because the i32-range guard makes such a value
+  unreachable -- i.e. the guard FR-166 removes is load-bearing for
+  correctness, not merely for representation. This must be fixed BEFORE any
+  32-bit-unsigned range relaxation: the relational path needs an unsigned
+  `emitrust.cmp` rather than a signed `arith.cmpi`.
+  Payoff inside systemd is ~2 items, but `EPOLL_EVENTS` is a GLIBC enum, so
+  the reach past systemd is much wider.
+  **NOT SPIKED.**
+
+- [ ] FR-170 UPSTREAM (found by the FR-166 spike 2026-08-30, reproduced on
+  unmodified HEAD): `scf.index_switch` REJECTS `case INT64_MAX` as a
+  duplicate, with no enum or emitrust code involved.
+      switch (t) { case 0: ...; case 9223372036854775807LL: ...; }
+      error: 'scf.index_switch' op has duplicate case value: 9223372036854775807
+  ROOT CAUSE, verified in the LLVM source rather than guessed:
+  `scf::IndexSwitchOp::verify` (`mlir/lib/Dialect/SCF/IR/SCF.cpp:3778`) uses a
+  `DenseSet<int64_t>`, and `DenseMapInfo<T>::getEmptyKey()` for an integral
+  `T` is `std::numeric_limits<T>::max()`
+  (`llvm/include/llvm/ADT/DenseMapInfo.h:113`). Inserting `INT64_MAX` probes
+  an empty bucket, `isEqual(Val, EmptyKey)` fires, and `insert().second`
+  returns false. `INT64_MIN` is fine; `INT64_MAX - 1` (the tombstone)
+  happens to survive.
+  Reproducers `<scratchpad>/fr166/sw4.c` (fails) and `sw5.c` (control).
+  Real systemd never writes `case _SD_..._INT64_MAX:`, so it did not affect
+  any corpus measurement -- but INT64_MAX is exactly the value the
+  `_SD_ENUM_FORCE_S64` macro plants, so an FR-166 test that switches over one
+  of those enums will hit it. Same class as FR-135 (upstream cf.switch
+  negative case value).
   **NOT SPIKED.**
 
 - [ ] FR-167 (opened 2026-08-30 from the FR-165 root-cause pass): THE `union
