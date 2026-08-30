@@ -10002,7 +10002,8 @@ piece and becomes FR-45.
   whether it still earns its keep AFTER that, not before.
   **WITHDRAWN; folded into FR-158 Phase 1.**
 
-- [ ] FR-158 (found by building the FR-156 whole-program link 2026-08-29):
+- [x] FR-158 PHASES 1+2 LANDED 2026-08-29 (found by building the FR-156
+  whole-program link the same day):
   RECONCILE THE CROSS-SHARD POINTER MODEL so the whole-program crate actually
   builds. This is the real prize behind FR-157 and it is large.
   HYPOTHESIS, explicitly untested: a function's DEFINITION has a body, so the
@@ -10053,7 +10054,103 @@ piece and becomes FR-45.
   would satisfy the callee -- the information is present; only the callee's
   signature is unknown at import time. Finding what reconciles the easy cases,
   and where it gives up, is the spike's central question.
-  **SPIKING.**
+  SPIKED GO, then PHASES 1+2 LANDED 2026-08-29. Gate 910/910 (907 + 3 new
+  tests), ZERO golden churn.
+
+  WHAT ACTUALLY RECONCILED MY "SUCCESSFUL" REDUCTIONS -- my leading guess was
+  wrong. The emitter adapts NOTHING: `emitrust.call_opaque` is a name-based,
+  UNTYPED call (`TranslateToRust.cpp:5075`, `emitCallOpaque` never consults a
+  callee signature), and a constant subscript fails exactly as hard as a
+  computed one. The rescuer is `findSignatureStarvedDecls` +
+  `reimportFactStarvedGroups`, which RE-IMPORTS the group jointly -- so
+  `linked.rs` matched `joint.rs` because it WAS a joint import. Two of the
+  three "clean" reductions were vacuous besides (callers stubbed with
+  `unsupported: passing a pointer into a global variable to a function`).
+
+  SCALE, measured across all 501 shards -- and my "~40 functions" was rustc's
+  error-grouping, not the truth: 142 distinct functions, 3796 diverging
+  declaration instances, 14363 mismatched argument slots.
+  * Divergence shape: `mut_ref<T>` -> `mut_ref<slice<T>>`, everything else
+    identical -- 3796 of 3796, ONE HUNDRED PERCENT. Zero arity, zero result,
+    zero other parameter differences.
+  * Argument producer: `addr_of mut (subscript base[idx])` -- 14303 of
+    14363, 99.58%. Residue is 50 `addr_of mut (variable)` and 10
+    `addr_of mut (member)`: the address of a scalar object or struct field.
+  * Zero block-args, zero pass-throughs, zero call results, zero
+    `call_indirect`, zero fn-pointer `Some(f)` payloads.
+
+  FIX: at the merge, rewrite the diverging slots from
+  `addr_of mut (subscript B[i])` to `slice_of mut B[i]`. `emitrust.slice_of`
+  ALREADY EXISTS and its verifier already accepts `lvalue<array>` and
+  `lvalue<slice>` bases -- no new op, no new type, no new metadata. Semantics
+  check: C's `f(&arr[k])` lets the callee touch `arr[k..]`, and
+  `&mut arr[k..]` is exactly that range and no wider; it is also strictly
+  LESS panicky than the scalar form, since `k == len` yields a legal empty
+  slice where `&mut arr[len]` panics.
+  Rivals rejected with numbers: defaulting DECLARATIONS to the slice model is
+  wrong for 7.8% of corpus pointer params (360 scalar vs 4242 slice) and, far
+  worse, changes the SOLO import of every declaration-only function in every
+  compile -- regressing the per-unit crates that are the main corpus.
+  `WholeProgramInfo` is a red herring: it is an import-side pre-scan needing
+  every TU's clang AST, and `--link` parses no C.
+
+  PHASE 2, and it fixes a defect nobody had logged: the re-import remedy was
+  LINK-LINE-ORDER DEPENDENT. `mn.o d.o u.o` built clean; `mn.o u.o d.o`
+  DROPPED THE DEFINITION and failed `unresolved external 'note' at link`. The
+  implementer rejected both my suggested predicates and measured its way to a
+  better one -- "the group module stopped defining an external function or
+  global its member shards defined", structural and wording-free. Ordering
+  definitions-first is provably wrong: `renameShardTags` REQUIRES a strictly
+  increasing ordinal map, and in a mutual-call cycle (`ca.c` defines `ff`
+  calls `gg`; `cb.c` defines `gg` calls `ff`) BOTH orders lose a definition,
+  so no such order need exist.
+
+  MEASURED RESULT, and the observable state change is worth stating plainly.
+  Before: systemd 501-object link exit 0, crate emitted, 6567 E0308 + 3 E0596.
+  After: **exit 1 with 60 LOCATED rejections at real C source lines**, all one
+  class, and NO crate. That is the repo's stated posture -- rejection is a
+  feature -- and 60 C-level diagnostics beat 6567 rustc errors for porting,
+  but it does cost the artifact. 14303 of 14363 slots are genuinely FIXED;
+  the 60 are the Phase-3 scalar-object class (top offender
+  `config_parse_unsigned_bounded`, 24 slots). With the rejection relaxed to a
+  warning the crate emits at 12,262,065 bytes (+1.30%) and rustc drops to 56
+  E0308 + 7 E0596 -- a 99.1% reduction -- which is what Phase 3 should
+  deliver properly.
+  MEASURED AND WORTH KNOWING: `--link --incremental` does NOT recover these.
+  Recovery is an import-stage mechanism; the merge has no equivalent, so the
+  usual escape hatch is unavailable and Phase 3 cannot lean on it.
+  The 7 residual E0596 are pre-existing and were merely UNMASKED -- rustc
+  skips borrowck for a body that failed type check. Confirmed structurally,
+  not on the spike's say-so: all 7 are `&mut (*p)[v..]` whose pre-image
+  `&mut (*p)[v]` contains the identical offending `&mut (*p)`.
+
+  CORRECTION to the figures above: this entry recorded 6542 total / 6538
+  E0308 from the spike. Re-measured at HEAD on the same 501-object line
+  (byte count identical, so the input matches): 6567 E0308 + 3 E0596. Same
+  mechanism, same order of magnitude, but the entry was off by ~29.
+
+  **PHASES 1+2 LANDED. Phase 3 (the 60 scalar-object slots, 55 functions)
+  and Phase 4 (the E0596 reborrow class, 7 functions) remain.**
+
+- [ ] FR-160 (opened 2026-08-29): the repository LICENSE is AGPL-3.0-or-later
+  (added in `b65d75c`) but 54 source files under `lib/`, `include/` and
+  `tools/` still carry the LLVM-convention header
+  `SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception`. The two
+  statements now contradict each other.
+  NOT a mechanical sweep -- this is a legal decision for the copyright
+  holder, and it NEEDS AN OWNER DECISION before anyone edits a header.
+  Options:
+  * relicense the headers to `AGPL-3.0-or-later`;
+  * declare a DELIBERATE SPLIT -- tooling AGPL, dialect/runtime pieces stay
+    Apache-2.0 WITH LLVM-exception. Worth real thought rather than a
+    default: AGPL on the TRANSPILER does not reach the EMITTED Rust, but a
+    header on a runtime-support file that gets copied into emitted crates
+    might, and the whole point of the emitted output is that downstream
+    users can use it;
+  * leave `LICENSE` governing and the headers stale, the weakest position.
+  No distribution blocker today: MLIR and clang are Apache-2.0 WITH
+  LLVM-exception, which is compatible with AGPL-3.0 for a combined work.
+  **NEEDS AN OWNER DECISION.**
 
 - [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28): 35 crates fail
   `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`

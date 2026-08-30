@@ -371,12 +371,12 @@ anchor = "FR-157 WITHDRAWN 2026-08-29, its central factual claim disproved"
 id = "FR-158"
 rank = 10
 kind = "feature"
-status = "spiked"
+status = "landed"
 size = "L"
 title = "Reconcile the cross-shard pointer model so the whole-program crate builds"
-summary = "ROOT CAUSE LOCATED 2026-08-29; the entry hypothesis was close but wrong. collectSliceParams walks the BODY and promotes a pointer parameter to slice when the body merely REFERENCES it -- indexing is not required -- so a declaration always takes the scalar default for want of a body. Narrower than 6538 suggests: four small repros carrying the IR divergence all link and BUILD CLEAN; the surviving failure needs a cursor already bound into a LOCAL at a computed offset. Found by building the FR-156 whole-program link 2026-08-29. The real prize behind FR-157. UNTESTED HYPOTHESIS: a definition has a body so the importer sees the parameter indexed and picks the slice model, while a bare header prototype has no body evidence and defaults to the single-object cursor mut_ref<i8>; if so the divergence is predictable from declaration-vs-definition alone and could be fixed by giving the declaration path the model the definition will choose, or by deferring the choice to link. MEASURE IT FIRST -- it is the entry's own guess. Note the per-UNIT crates never show this, because within one unit the callee is an FR-52 obligation carrying the caller's own inferred signature, so the two agree by construction; only two independently-imported units meeting can expose it. NOT SPIKED."
+summary = "PHASES 1+2 LANDED 2026-08-29, gate 910/910 zero churn. Divergence is 100 percent one shape (mut_ref<T> to mut_ref<slice<T>>) across 3796 declarations, and 99.58 percent of 14363 mismatched slots are addr_of(subscript), rewritten at the merge to the existing slice_of op -- no new op or metadata. Phase 2 fixed an unlogged order-dependence: the re-import dropped a DEFINITION when the caller came first; definitions-first ordering is provably impossible since a mutual-call cycle loses one either way. Systemd 501-object link goes from exit 0 with 6567 E0308 to exit 1 with 60 LOCATED rejections and no crate -- the repo posture, but it costs the artifact; relaxed to a warning the crate emits at +1.30 percent bytes with 56 E0308, a 99.1 percent reduction, which is Phase 3s job. Measured: --link --incremental does NOT recover these, recovery is import-stage only. ROOT CAUSE LOCATED 2026-08-29; the entry hypothesis was close but wrong. collectSliceParams walks the BODY and promotes a pointer parameter to slice when the body merely REFERENCES it -- indexing is not required -- so a declaration always takes the scalar default for want of a body. Narrower than 6538 suggests: four small repros carrying the IR divergence all link and BUILD CLEAN; the surviving failure needs a cursor already bound into a LOCAL at a computed offset. Found by building the FR-156 whole-program link 2026-08-29. The real prize behind FR-157. UNTESTED HYPOTHESIS: a definition has a body so the importer sees the parameter indexed and picks the slice model, while a bare header prototype has no body evidence and defaults to the single-object cursor mut_ref<i8>; if so the divergence is predictable from declaration-vs-definition alone and could be fixed by giving the declaration path the model the definition will choose, or by deferring the choice to link. MEASURE IT FIRST -- it is the entry's own guess. Note the per-UNIT crates never show this, because within one unit the callee is an FR-52 obligation carrying the caller's own inferred signature, so the two agree by construction; only two independently-imported units meeting can expose it. NOT SPIKED."
 blocked_by = []
-anchor = "FR-158 (found by building the FR-156 whole-program link"
+anchor = "FR-158 PHASES 1+2 LANDED 2026-08-29 (found by building the FR-156"
 
 [[items]]
 id = "FR-159"
@@ -388,6 +388,17 @@ title = "Use Rust modules instead of tu<N>_ name mangling for TU-local items"
 summary = "SPIKED GO 2026-08-29; Phase 1 in TDD. GO-with-constraints but under a DIFFERENT partition than first proposed: isInMainFile is exactly the A_dup regression and records cannot be bucketed by TU at all. What works is C linkage for functions/globals plus link-time shape CONFLICT with a non-escape guard for records. Measured: :: round-trips through the dialect with no new ops and use sites need zero emitter change; prototype 61+51 lines; gate 902/902 with ZERO golden churn; 501-object systemd link exit 0 at 12,104,378 bytes with one mod tu314; ten adversarial cases byte-diffed. Falsified FR-154 (A-prime) claim that no predicate separates link-merge-errors.c from the systemd collision -- an escape predicate does, and it is right on the merits. In-slice constraints: absolute paths (E0433), three predicates that silently no-op on paths including the FR-77 dangling-target backstop, a transitive escape guard, and the global-visibility gap. Phase 2 renames modules to source stems; Phase 3 (statics into modules, 93% of fns) is HELD behind FR-157/FR-158 since it delivers zero progress toward a building crate."
 blocked_by = []
 anchor = "FR-159 (opened by the repo owner 2026-08-29"
+
+[[items]]
+id = "FR-160"
+rank = 30
+kind = "quality"
+status = "open"
+size = "S"
+title = "Repo LICENSE is AGPL-3.0 but 54 source files carry Apache-2.0 WITH LLVM-exception"
+summary = "Opened 2026-08-29 after LICENSE (AGPL-3.0-or-later) landed in b65d75c. 54 files under lib/, include/ and tools/ still carry the LLVM-convention header SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception, which now contradicts the repo licence. NOT a mechanical sweep -- it is a legal decision for the copyright holder. Options: relicense the headers to AGPL-3.0-or-later; declare a deliberate split (tooling AGPL, dialect/runtime pieces stay Apache-2.0-WITH-LLVM-exception so downstream users of EMITTED crates are unencumbered -- note AGPL on the transpiler does not reach the emitted Rust, but a header on a runtime-support file might); or leave LICENSE governing, the weakest position. No distribution blocker today: MLIR/clang are Apache-2.0 WITH LLVM-exception, compatible with AGPL-3.0 for a combined work. NEEDS AN OWNER DECISION."
+blocked_by = []
+anchor = "FR-160 (opened 2026-08-29): the repository LICENSE is"
 
 [[items]]
 id = "FR-138"

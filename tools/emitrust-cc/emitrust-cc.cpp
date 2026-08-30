@@ -1021,6 +1021,40 @@ static bool loadLinkShards(llvm::ArrayRef<std::string> inputs,
   return true;
 }
 
+/// True when `name` carries a per-TU tag (`tu<N>_` / `TU<N>_`, the format
+/// LinkMerge's `parseTuTag` owns). A tagged symbol is INTERNAL to one
+/// translation unit and is numbered group-relatively in a re-imported group
+/// module, so its name is not comparable against a solo shard's.
+static bool hasPerTuTag(llvm::StringRef name) {
+  if (!name.consume_front("tu") && !name.consume_front("TU"))
+    return false;
+  size_t digits = 0;
+  while (digits < name.size() && llvm::isDigit(name[digits]))
+    ++digits;
+  return digits > 0 && digits < name.size() && name[digits] == '_';
+}
+
+/// Collects the EXTERNAL-linkage function and global symbols `module`
+/// DEFINES (a body-less `emitrust.extern_decl` is an obligation, not a
+/// definition). Nested definitions count: the FR-40 owner lift moves a
+/// function into an `impl` block without changing what it defines.
+/// Deliberately functions and globals only -- those are what the link
+/// resolves, and a record's generated name can legitimately differ between
+/// a solo and a joint import.
+static void collectExternalDefinitions(mlir::ModuleOp module,
+                                       std::set<std::string> &into) {
+  module.walk([&](mlir::Operation *op) {
+    if (op->hasAttr(mlir::emitrust::kExternDeclAttrName))
+      return;
+    if (!llvm::isa<mlir::FunctionOpInterface, mlir::emitrust::GlobalOp>(op))
+      return;
+    mlir::StringAttr symbol = mlir::SymbolTable::getSymbolName(op);
+    if (!symbol || hasPerTuTag(symbol.getValue()))
+      return;
+    into.insert(symbol.getValue().str());
+  });
+}
+
 /// FR-58 selective re-import of fact-starved items. A solo shard whose
 /// ledger carries a MEASURED fact-starvation rejection (an extern pointer
 /// global the solo import could not type; see design.md FR-58 SPIKE 2 and
@@ -1182,6 +1216,41 @@ static void reimportFactStarvedGroups(
     if (!reimportLedger.empty()) {
       llvm::errs() << "link-time re-import of " << groupLabel << ": ";
       reimportLedger.printSummary(llvm::errs());
+    }
+    // FR-158 phase 2: the joint re-import feeds the group's sources to the
+    // importer in LINK-LINE order, and that order is observable. With a
+    // caller TU ahead of the definition, the calls are imported from the
+    // bare prototype and the definition is then REFUSED the pointer-model
+    // refinement under them ("was called as ... before its definition
+    // refined the signature"); under the recovering import that DROPS the
+    // definition, and the merge fails with an unresolved external for a
+    // symbol the original shards define. Measured: `--link mn.o d.o u.o`
+    // links clean while `--link mn.o u.o d.o` does not.
+    //
+    // The predicate is the LOSS itself, not the wording that caused it: a
+    // group module that stops defining a symbol its members defined is
+    // strictly worse than the shards it replaces, whatever dropped it. Keep
+    // the originals; the merge's own slice-model reconciliation (phase 1)
+    // handles the divergence order-free.
+    {
+      std::set<std::string> before;
+      std::set<std::string> after;
+      for (unsigned position : group)
+        collectExternalDefinitions(*shards[position].module, before);
+      collectExternalDefinitions(*module, after);
+      llvm::SmallVector<llvm::StringRef> lost;
+      for (const std::string &symbol : before)
+        if (!after.count(symbol))
+          lost.push_back(symbol);
+      if (!lost.empty()) {
+        llvm::errs() << "warning: link-time re-import of " << groupLabel
+                     << " no longer defines ";
+        llvm::interleaveComma(lost, llvm::errs(), [](llvm::StringRef symbol) {
+          llvm::errs() << "'" << symbol << "'";
+        });
+        llvm::errs() << "; keeping the original shards\n";
+        continue;
+      }
     }
     groupModule[root] =
         LoadedShard{std::move(module), ("re-import(" + groupLabel + ")")};
