@@ -68,3 +68,7 @@ __pycache__/
 
 # clangd index cache
 .cache/
+
+# systemd probe (branch probe/systemd): read-only copies of the main tree's
+# built tools, used to measure a third-party project without building here
+probe-tools/
