@@ -6172,8 +6172,26 @@ FailureOr<Value> CImporter::emitMemberLValue(const clang::MemberExpr *member,
   // intermediate access Sema synthesizes for `parent.leaf` designates
   // the parent place itself; the leaf below then selects its flattened
   // (possibly union-slot-aliased) name on that place.
-  if (field->isAnonymousStructOrUnion())
-    return basePlace;
+  if (field->isAnonymousStructOrUnion()) {
+    // FR-167: EXCEPT an anonymous union whose arms could not flatten --
+    // it lives as a synthesized-named member of the parent, so its
+    // implicit access is one real projection, not a transparent peel.
+    // Peeling it transparently would aim the arm's own selection (FR-83's
+    // `opaque` byte view) at the PARENT struct_def, which has no such
+    // field: FR-173's emitter backstop catches that as "member 'opaque'
+    // does not exist on struct '<parent>'".
+    auto blob = anonymousUnionBlobNames.find(field);
+    if (blob == anonymousUnionBlobNames.end())
+      return basePlace;
+    FailureOr<Type> unionType = mapType(field->getType(), loc);
+    if (failed(unionType))
+      return failure();
+    return builder
+        .create<emitrust::MemberOp>(loc, emitrust::LValueType::get(*unionType),
+                                    basePlace,
+                                    builder.getStringAttr(blob->second))
+        .getResult();
+  }
   // A union arm designates its storage slot: the member selects the
   // slot's name at the slot's type. A pun arm's (differently-signed
   // integer, or float over an integer slot and vice versa) bit-exact

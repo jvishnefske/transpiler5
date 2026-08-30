@@ -1631,33 +1631,103 @@ LogicalResult CImporter::collectRecordFields(
       // in CTS-R3 territory and rejects exactly as union types do
       // elsewhere.
       Location unionLoc = translateLoc(member->getBeginLoc());
-      const clang::FieldDecl *storage = nullptr;
-      Type slotType;
-      for (const clang::FieldDecl *arm : member->fields()) {
-        FailureOr<const clang::FieldDecl *> leaf =
-            anonymousUnionArmLeaf(arm, unionLoc);
-        if (failed(leaf))
-          return failure();
-        Location leafLoc = translateLoc((*leaf)->getLocation());
-        FailureOr<Type> leafType = mapType((*leaf)->getType(), leafLoc);
-        if (failed(leafType))
-          return failure();
-        if (!storage) {
-          storage = *leaf;
-          slotType = *leafType;
-          if (failed(appendField(
-                  internName(mangleMemberName(storage->getName())), slotType,
-                  leafLoc, storage->getName())))
+      SmallVector<const clang::FieldDecl *> trialAliases;
+      size_t savedFieldCount = fieldNames.size();
+      auto flatten = [&]() -> LogicalResult {
+        const clang::FieldDecl *storage = nullptr;
+        Type slotType;
+        for (const clang::FieldDecl *arm : member->fields()) {
+          FailureOr<const clang::FieldDecl *> leaf =
+              anonymousUnionArmLeaf(arm, unionLoc);
+          if (failed(leaf))
             return failure();
-          continue;
+          Location leafLoc = translateLoc((*leaf)->getLocation());
+          FailureOr<Type> leafType = mapType((*leaf)->getType(), leafLoc);
+          if (failed(leafType))
+            return failure();
+          if (!storage) {
+            storage = *leaf;
+            slotType = *leafType;
+            if (failed(appendField(
+                    internName(mangleMemberName(storage->getName())), slotType,
+                    leafLoc, storage->getName())))
+              return failure();
+            continue;
+          }
+          if (*leafType != slotType)
+            return emitError(unionLoc) << "unsupported: union type";
+          unionSlotStorage[*leaf] = storage;
+          trialAliases.push_back(*leaf);
         }
-        if (*leafType != slotType)
+        if (!storage) // An empty anonymous union has no representable slot.
           return emitError(unionLoc) << "unsupported: union type";
-        unionSlotStorage[*leaf] = storage;
+        return success();
+      };
+      // FR-167: C++ keeps the historical all-or-nothing flatten. The
+      // fallback below newly routes an anonymous union through
+      // `collectUnionSlot`, which in C++ sits next to the unmeasured
+      // destructor/copy-ctor member surface (`kHasDropAttrName`, `Copy`
+      // derivation); FR-78's opaque model already scopes C++ out for the
+      // same reason, so this matches it rather than widening it blind.
+      if (astContext().getLangOpts().CPlusPlus) {
+        if (failed(flatten()))
+          return failure();
+        continue;
       }
-      if (!storage) // An empty anonymous union has no representable slot.
-        return emitError(unionLoc) << "unsupported: union type";
-      continue;
+      // FR-167: the flatten is a TRIAL. A union that cannot flatten is not
+      // thereby unrepresentable -- FR-78's opaque diversion and the
+      // one-slot pun model both live behind `collectUnionSlot`, which is
+      // reached only for a union that has a TYPE. Before this, the
+      // anonymous spelling of a union the NAMED spelling imports fine
+      // (`};` vs `} u;`, one word apart) killed the entire containing
+      // record. So: run the flatten under a silencing handler, and on
+      // failure roll its state back and append the union as a
+      // synthesized-named member (`__u<n>`) through the ordinary
+      // `mapType` path. Only `fieldNames`/`fieldTypes` and the
+      // `unionSlotStorage` aliases are trial state; everything else the
+      // flatten touches (type/record caches) is idempotent.
+      SmallVector<std::pair<Location, std::string>> trialDiags;
+      LogicalResult flattened = failure();
+      {
+        ScopedDiagnosticHandler trialHandler(
+            builder.getContext(), [&](Diagnostic &diag) -> LogicalResult {
+              if (diag.getSeverity() != DiagnosticSeverity::Error)
+                return failure();
+              trialDiags.emplace_back(diag.getLocation(), diag.str());
+              return success();
+            });
+        flattened = flatten();
+      }
+      if (succeeded(flattened))
+        continue;
+      fieldNames.truncate(savedFieldCount);
+      fieldTypes.truncate(savedFieldCount);
+      for (const clang::FieldDecl *alias : trialAliases)
+        unionSlotStorage.erase(alias);
+      FailureOr<Type> unionType = failure();
+      {
+        // The retry's own diagnostics are DISCARDED: a shape neither model
+        // can take must keep the wording and location the flatten gave it
+        // (the union import would restate it at the union's `{`, in
+        // `collectUnionSlot`'s vocabulary, losing the arm location).
+        ScopedDiagnosticHandler retryHandler(
+            builder.getContext(),
+            [](Diagnostic &) -> LogicalResult { return success(); });
+        unionType = mapType(field->getType(), unionLoc);
+      }
+      if (succeeded(unionType)) {
+        llvm::StringRef blobName =
+            internName(("__u" + llvm::Twine(fieldNames.size())).str());
+        if (failed(appendField(blobName, *unionType, unionLoc, blobName)))
+          return failure();
+        anonymousUnionBlobNames[field] = blobName.str();
+        continue;
+      }
+      // Neither model: re-emit the TRIAL's diagnostics verbatim so the
+      // residual frontier keeps exactly the rejections it had before.
+      for (auto &trialDiag : trialDiags)
+        emitError(trialDiag.first) << trialDiag.second;
+      return failure();
     }
     if (field->getName().empty())
       return emitError(fieldLoc) << "unsupported: unnamed struct member";
@@ -1929,6 +1999,11 @@ CImporter::flattenedFieldStorage(const clang::FieldDecl *field) const {
 
 std::string
 CImporter::flattenedFieldName(const clang::FieldDecl *field) const {
+  // FR-167: a non-flattening anonymous union member has no storage arm to
+  // name -- it IS a field, under its synthesized spelling.
+  auto blob = anonymousUnionBlobNames.find(field);
+  if (blob != anonymousUnionBlobNames.end())
+    return blob->second;
   return mangleMemberName(flattenedFieldStorage(field)->getName());
 }
 

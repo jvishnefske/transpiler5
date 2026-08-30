@@ -10849,7 +10849,7 @@ piece and becomes FR-45.
   negative case value).
   **NOT SPIKED.**
 
-- [ ] FR-167 (opened 2026-08-30 from the FR-165 root-cause pass): THE `union
+- [x] FR-167 PHASE 1 LANDED 2026-08-30 (opened the same day from the FR-165 root-cause pass): THE `union
   type` REJECTION gates 574 items (24 direct + 550 cascaded, **23x
   amplification -- the highest measured in the corpus**).
   By direct count it is 24th and would never be picked; by transitive weight
@@ -10912,7 +10912,50 @@ piece and becomes FR-45.
   C++ stays EXCLUDED, and phase 1 should gate on `!CPlusPlus` too even though
   it measured clean, because `collectRecordFields` is shared and a
   non-flattening anonymous union would newly reach `collectUnionSlot`.
-  **SPIKED GO; BLOCKED ON FR-173 (phase 0).**
+  PHASE 1 LANDED 2026-08-30, once FR-173 cleared phase 0. Gate **928/928**,
+  cargo **0 errors**, ledger net **-95**, **23 symbols blocked -> clean and
+  ZERO clean -> blocked**, crate 12,371,799 -> 12,413,334 bytes. Resolved: 20
+  direct `union type` plus the cascades they gated (`HashmapBase` 71,
+  `DnsResourceRecord` 59, `Hashmap` 41, `OrderedHashmap` 36, `HwAddrData` 35,
+  `Set` 34, `BusMatchNode` 12, `Sha256Ctx` 7, `Object` 5).
+  My own five-line reproduction now imports in BOTH spellings; the asymmetry
+  is gone.
+
+  THE DIAGNOSTIC RE-EMISSION EARNED ITS KEEP IMMEDIATELY. Because the trial's
+  diagnostics are replayed verbatim when the retry also fails, the WIDE leg I
+  had listed as needing a rewrite did NOT need one -- it keeps
+  `unsupported: union type` byte-for-byte at the same location. Shapes phase 1
+  cannot help keep their exact original vocabulary AND arm locations
+  (`union with a bit-field arm` still points at the ARM, not the union's `{`),
+  pinned by new `-NOT` lines that would fail if `collectUnionSlot`'s
+  vocabulary leaked through.
+
+  FR-173's BACKSTOP WORKED AS A DEVELOPMENT SIGNAL, exactly as predicted when
+  it landed an hour earlier. Short-circuiting the blob lookup and rebuilding
+  produces `error: member 'opaque' does not exist on struct 'S'` -- the
+  differential proof that the `ImportC.cpp:6175` peel half is load-bearing.
+  Without FR-173 that would have been a silent E0609 in a 12 MB crate.
+
+  **A PREMISE I PUT IN THE BRIEF WAS FALSE, and it invalidates a method I have
+  been using all session: LINK ORDER CHANGES EMITTED BYTES.** I wrote that
+  `fr173/objs.txt` reproduces the baseline exactly. It does not -- the same
+  501 shards in a different order give **12,373,168** instead of
+  **12,371,799**, same shard set, same 268,083 lines. Order drives `tu<N>_`
+  ordinals and first-occurrence-wins dedup. Any before/after corpus comparison
+  must use the SAME order on both sides or the delta is noise; the order that
+  reproduces the stored baselines is a shard directory's `_link-line.txt`
+  (whose lines carry stray `\x1b[K` escapes), not a globbed or reconstructed
+  object list. The implementer caught this and re-ran both sides in the
+  spike's order, so the numbers above are apples-to-apples.
+  Ledger net is -95 here vs the spike's -91; the order-independent figures
+  (9,224 -> 9,201 symbols, 23 unblocked, 0 newly blocked, 12,413,334 bytes)
+  match exactly, so that is dedup-key drift, not behaviour.
+  RECORDED: the synthesized field is `__u<n>`, matching the file's `__bits<n>`
+  convention, and it goes through `appendField` -- so a real C member spelled
+  `__u1` is a located collision, never a silent shadow.
+  **PHASE 1 LANDED. Phase 2 (the trial/rollback inside `collectUnionSlot`)
+  remains optional and carries its own 131-item `global initializer for this
+  type` cost.**
 
 - [x] FR-173 LANDED 2026-08-30 (opened the same day by the FR-167 spike): THREE DEFECTS AT HEAD,
   all found while spiking unions, all independently worth fixing, and together

@@ -6445,6 +6445,16 @@ private:
   /// Every arm FieldDecl of every union in `opaqueUnions`; consulted by
   /// the access-site rejections listed there.
   llvm::SmallPtrSet<const clang::FieldDecl *, 8> opaqueUnionArms;
+  /// FR-167: the synthesized parent-struct field spelling (`__u<n>`) of an
+  /// anonymous union MEMBER whose arms could not flatten into the parent
+  /// and which was therefore imported as its own union type. Such a member
+  /// is NOT transparent: `emitMemberLValue`'s implicit anonymous hop must
+  /// project this field instead of returning the parent place, and
+  /// `flattenedFieldName` answers with it. Empty for every anonymous union
+  /// that DID flatten (those keep the one-slot aliasing model), and empty
+  /// in C++ (this routing is gated to C, matching FR-78).
+  llvm::DenseMap<const clang::FieldDecl *, std::string>
+      anonymousUnionBlobNames;
   /// The C99-45 accessor geometry of one bit-field member: the window
   /// `[offset, offset + width)` of the synthesized unsigned backing field
   /// `backingName` (of type `backingType`) in its flattened parent
