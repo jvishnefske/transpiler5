@@ -44,7 +44,7 @@ import subprocess
 import threading
 import time
 
-EMITRUST_CC = os.environ.get("EMITRUST_CC", "./build/bin/emitrust-cc")
+EMITRUST_CC = os.environ.get("EMITRUST_CC", "./build/tools/emitrust-cc")
 CLANG = os.environ.get("CLANG", "clang")
 CRASH_MARKERS = ("PLEASE submit a bug report", "Stack dump", "UNREACHABLE",
                  "Assertion `", "LLVM ERROR")
