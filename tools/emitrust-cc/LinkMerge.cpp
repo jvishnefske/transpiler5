@@ -25,6 +25,8 @@
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/IR/Verifier.h"
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -601,6 +603,141 @@ static Operation *findSliceRefinedSymbolEscape(ModuleOp shard,
   return escape;
 }
 
+/// The Rust path the FR-161 one-element view is spelled with.
+///
+/// `::std::`, NOT `::core::`: `core::slice::from_mut` resolves under cargo
+/// but is E0433 under a bare `rustc`, which the lit EndToEnd tests invoke
+/// directly. The LEADING `::` is load-bearing too -- FR-159 sinks items
+/// into `mod tu<N>`, where a relative `std::` can be shadowed by a
+/// TU-local item. Both spellings were measured, not chosen.
+static constexpr llvm::StringLiteral kSliceFromMutPath =
+    "::std::slice::from_mut";
+
+/// FR-161: proves that a DEFINITION's own pointer parameter touches only
+/// element ZERO of the region it is lent.
+///
+/// This is the admission fence for the one-element view. C's `f(&x)` lends
+/// the callee a one-element region and `::std::slice::from_mut(&mut x)` is
+/// exactly that region in Rust -- but only while the callee stays inside
+/// it. Where C reading `p[1]` is undefined behaviour, Rust reading it is a
+/// PANIC, and this project has already decided which side of that trade it
+/// takes: FR-75 deliberately flipped the previously-ACCEPTED
+/// `helper(&x, 1)` shape to the located address-of-scalar rejection, and
+/// `test/Import/C/pointers-param-invalid.c` pins
+/// `int first(int *a){return a[0]+a[1];}` called as `first(&x)` as a
+/// rejection. Measured on that very program: unfenced, C prints `1 2` and
+/// the emitted crate panics `index out of bounds: the len is 1 but the
+/// index is 1`. So an unproven parameter keeps its located rejection.
+///
+/// The proof is a forward walk over the parameter's uses, and it must be
+/// TRANSITIVE. `deref` + `subscript[0]` is the direct touch; `deref` +
+/// `slice_of[0]` handed to another call is a FORWARD, admitted only when
+/// the receiving parameter also passes. That leg is not a nicety: of the
+/// 60 residual argument slots measured over the 501-object systemd link,
+/// 3 (`parse_sec`, `pidfd_get_pid`, `read_attr_at`) forward instead of
+/// subscripting -- `parse_sec` hands `&mut (*ret)[0..]` to `parse_time` --
+/// and a shallow fence rejects them, after which the crate does not emit
+/// at all. Anything else fails: a non-zero or dynamic index, an
+/// `addr_of`, an `emitrust.call_indirect`, an `args`-remapped call (where
+/// operand index is not argument position), or a callee this link has no
+/// definition for.
+///
+/// Durability, deliberately NOT claimed to be stable: 28 of the 30
+/// currently admitted systemd callees pass because they are today FR-52
+/// `unimplemented!` stubs with no body uses. As later waves give them
+/// bodies the fence will re-reject some of them. That is the correct
+/// direction -- a located link rejection, never a runtime panic.
+class ElementZeroFence {
+public:
+  explicit ElementZeroFence(const llvm::StringMap<Operation *> &definitions)
+      : definitions(definitions) {}
+
+  /// True when parameter `slot` of `definition` provably touches only
+  /// element zero of the region it is lent.
+  bool touchesOnlyElementZero(Operation *definition, unsigned slot) {
+    Query query{definition, slot};
+    auto cached = cache.find(query);
+    if (cached != cache.end())
+      return cached->second;
+    // Fresh per top-level query: the in-flight set doubles as this query's
+    // memo, and a `true` it hands back for a cycle is an ASSUMPTION, not a
+    // result, so it must not outlive the query that made it.
+    llvm::DenseSet<Query> inFlight;
+    bool admitted = walk(definition, slot, inFlight);
+    cache[query] = admitted;
+    return admitted;
+  }
+
+private:
+  using Query = std::pair<Operation *, unsigned>;
+
+  static bool isElementZero(Value index) {
+    auto constant = index.getDefiningOp<emitrust::ConstantOp>();
+    auto value =
+        constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
+    return value && value.getValue().isZero();
+  }
+
+  /// `borrow` is a `[0..]` tail borrow of a fenced parameter, so every call
+  /// it reaches must itself stay inside element zero at the slot it lands
+  /// in.
+  bool forwardStaysInElementZero(Value borrow,
+                                 llvm::DenseSet<Query> &inFlight) {
+    for (Operation *user : borrow.getUsers()) {
+      auto call = dyn_cast<emitrust::CallOpaqueOp>(user);
+      if (!call || call.getArgs())
+        return false;
+      auto callee = definitions.find(call.getCallee());
+      if (callee == definitions.end())
+        return false;
+      // One borrow may arrive at more than one parameter; all of them have
+      // to pass, so this does not stop at the first match.
+      for (auto [index, operand] : llvm::enumerate(call->getOperands()))
+        if (operand == borrow &&
+            !walk(callee->second, static_cast<unsigned>(index), inFlight))
+          return false;
+    }
+    return true;
+  }
+
+  bool walk(Operation *definition, unsigned slot,
+            llvm::DenseSet<Query> &inFlight) {
+    // A repeat within one query is either a cycle -- which contributes no
+    // new use -- or an already-proven parameter: a disproof would have
+    // unwound the walk before reaching here.
+    if (!inFlight.insert(Query{definition, slot}).second)
+      return true;
+    auto func = dyn_cast<emitrust::FuncOp>(definition);
+    if (!func || func.getBody().empty())
+      return false; // No body: nothing to prove anything from.
+    Block &entry = func.getBody().front();
+    if (slot >= entry.getNumArguments())
+      return false;
+    for (Operation *user : entry.getArgument(slot).getUsers()) {
+      // The reference itself may only be dereferenced. Passing it on
+      // whole, or taking its address, hands out the entire region.
+      auto deref = dyn_cast<emitrust::DerefOp>(user);
+      if (!deref)
+        return false;
+      for (Operation *place : deref.getResult().getUsers()) {
+        if (auto subscript = dyn_cast<emitrust::SubscriptOp>(place)) {
+          if (!isElementZero(subscript.getIndex()))
+            return false;
+          continue;
+        }
+        auto sliceOf = dyn_cast<emitrust::SliceOfOp>(place);
+        if (!sliceOf || !isElementZero(sliceOf.getIndex()) ||
+            !forwardStaysInElementZero(sliceOf.getResult(), inFlight))
+          return false;
+      }
+    }
+    return true;
+  }
+
+  const llvm::StringMap<Operation *> &definitions;
+  llvm::DenseMap<Query, bool> cache;
+};
+
 /// Re-shapes `shard`'s calls of `name` so that the arguments at `slots`
 /// carry the DEFINITION's slice model. The only admitted argument is the
 /// `addr_of mut (subscript base[index])` cursor a C `&arr[k]` / `&p[k]`
@@ -612,16 +749,25 @@ static Operation *findSliceRefinedSymbolEscape(ModuleOp shard,
 /// strictly less panicky than the form it replaces -- `k == len` yields a
 /// legal empty slice where `&mut arr[len]` panics.
 ///
-/// Everything else keeps a LOCATED rejection: the address of a scalar
-/// object or of a struct field (the measured 60-slot residue, which has no
-/// region to slice), and a call whose arguments are remapped positionally
-/// by the `args` attribute (where operand index is not argument position).
+/// FR-161: the argument may also be the address of a scalar OBJECT or of a
+/// struct FIELD -- the 60-slot residue that has no region to tail-borrow,
+/// and which is the C out-parameter idiom throughout. C's `f(&x)` lends a
+/// ONE-element region, so the argument is wrapped in the standard library's
+/// one-element view, `::std::slice::from_mut`. That wrap is admitted only
+/// behind `ElementZeroFence`, which must prove the definition never looks
+/// past element zero; see the fence for why an unproven parameter keeps
+/// its rejection rather than trading C's undefined behaviour for a panic.
+///
+/// Everything else keeps a LOCATED rejection: an argument the fence cannot
+/// clear, and a call whose arguments are remapped positionally by the
+/// `args` attribute (where operand index is not argument position).
 static LogicalResult adaptSliceRefinedCalls(ModuleOp shard,
                                             Operation *definition,
                                             llvm::StringRef name,
                                             llvm::ArrayRef<unsigned> slots,
                                             FunctionType declType,
-                                            FunctionType defType) {
+                                            FunctionType defType,
+                                            ElementZeroFence &fence) {
   if (Operation *escape = findSliceRefinedSymbolEscape(shard, name))
     return escape->emitError()
            << "unsupported: '" << name
@@ -664,6 +810,26 @@ static LogicalResult adaptSliceRefinedCalls(ModuleOp shard,
       auto declRef = dyn_cast<emitrust::MutRefType>(declType.getInput(slot));
       if (!addrOf || !addrOf.getIsMut() || !subscript || !declRef ||
           element != declRef.getPointee()) {
+        // FR-161: no region to slice, but a one-element view of the
+        // argument is exactly the region C lends. Admitted only when the
+        // definition provably stays inside element zero.
+        auto argRef = arg ? dyn_cast<emitrust::MutRefType>(arg.getType())
+                          : emitrust::MutRefType();
+        auto defRef = dyn_cast<emitrust::MutRefType>(defType.getInput(slot));
+        auto defSlice = defRef
+                            ? dyn_cast<emitrust::SliceType>(defRef.getPointee())
+                            : emitrust::SliceType();
+        if (argRef && defSlice &&
+            defSlice.getElementType() == argRef.getPointee() &&
+            fence.touchesOnlyElementZero(definition, slot)) {
+          OpBuilder builder(call);
+          auto view = builder.create<emitrust::CallOpaqueOp>(
+              call.getLoc(), TypeRange{defType.getInput(slot)},
+              builder.getStringAttr(kSliceFromMutPath),
+              /*args=*/ArrayAttr(), ValueRange{arg});
+          call->setOperand(slot, view.getResult(0));
+          continue;
+        }
         InFlightDiagnostic diag =
             call.emitError()
             << "unsupported: argument " << (slot + 1) << " of the call to '"
@@ -861,6 +1027,10 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
   // reported before the merge gives up -- a whole-program link that stops
   // at the first of hundreds turns porting into a one-at-a-time loop.
   bool reconciliationFailed = false;
+  // One fence per merge: its proofs are keyed on definition operations that
+  // stay live for the whole reconciliation, and the same (callee, slot) is
+  // asked about once per diverging call site.
+  ElementZeroFence elementZeroFence(definitions);
   for (auto [name, op] : obligations) {
     auto it = definitions.find(name);
     if (it != definitions.end()) {
@@ -886,7 +1056,8 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
         }
         auto shard = op->getParentOfType<ModuleOp>();
         if (mlir::failed(adaptSliceRefinedCalls(shard, it->second, name,
-                                                *slots, declType, defType))) {
+                                                *slots, declType, defType,
+                                                elementZeroFence))) {
           reconciliationFailed = true;
           continue;
         }

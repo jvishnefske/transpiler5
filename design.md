@@ -10195,7 +10195,7 @@ piece and becomes FR-45.
   MLIR component includes and diff against the CMakeLists -- would have
   caught it in the fast tier. Worth wiring in if CMake is kept.
 
-- [ ] FR-161 (FR-158 Phase 3, split out 2026-08-29 so the remaining work is
+- [x] FR-161 PHASE 1 LANDED 2026-08-29 (FR-158 Phase 3, split out so the remaining work is
   indexed): A SCALAR-OBJECT ARGUMENT AT A SLICE PARAMETER. `f(&x)` where `x`
   is a scalar local or a struct field and the defining TU classifies that
   parameter as a slice. This is the ENTIRE residue of FR-158 Phases 1+2 --
@@ -10280,7 +10280,45 @@ piece and becomes FR-45.
   `pointers-param-invalid.c`, so it needs an in-TU-definition requirement
   (excluding body-less external requirements, so FR-75's NOREGION rejection
   survives) plus the element-0 body scan. Do NOT bundle it with Phase 1.
-  **SPIKED GO; Phase 1 in TDD.**
+  PHASE 1 LANDED 2026-08-29. Gate 912/912 (910 + 2 new tests), ZERO existing
+  goldens shifted -- no byte of any emitted-Rust golden moved.
+
+  **THE 501-OBJECT SYSTEMD WHOLE-PROGRAM CRATE NOW EMITS**: rc=0, zero link
+  errors, 12,265,476 bytes, exactly 60 `::std::slice::from_mut` sites. cargo
+  drops from 63 errors to SEVEN, all E0596, all FR-153. Verified
+  independently, not on the agent's report.
+
+  THE FENCE WAS PROVED LOAD-BEARING BY ABLATION, which is the right way to
+  settle the argument I lost above. With the fence short-circuited to `true`,
+  both `link-slice-model-scalar.c` and `link-slice-model-invalid.c` fail, and
+  the non-zero-index program emits exactly the FR-75-forbidden shape:
+      pub fn first(a: &mut [i32], n: i32) -> i32 { a[0..] + a[1..] + n }
+      let v3: &mut [i32] = ::std::slice::from_mut(v2); first(v3, 1i32)
+  -- a guaranteed `index out of bounds` panic. Demonstrated, not asserted.
+
+  IMPLEMENTATION: `ElementZeroFence`, a memoised cycle-safe forward walk over
+  the definition's own parameter, constructed once per merge over the existing
+  `definitions` map (the prototype's global static was dropped and the map
+  threaded through instead). One improvement over the prototype: the forward
+  step checks EVERY operand position the borrow lands in, not just the first
+  match.
+  EMITTED FORM, measured -- the brief's implied `from_mut(&mut x)` never
+  appears, because the emitter always binds the `addr_of` to a `let` first:
+      let vN: &mut u32 = &mut x;
+      let vM: &mut [u32] = ::std::slice::from_mut(vN);
+  The tests pin that two-line form with a captured variable rather than a
+  substring, which is strictly tighter. Negative spellings (`core::`, a
+  relative `std::`) are asserted in a separate all-`-NOT` FileCheck run,
+  because inline NOTs only scan between ordered matches.
+
+  BYTE-DIFF, 3-object link, values seeded from argc, all three diffs empty:
+      k=0  11 22 8 34 5  rc=80     k=1  12 23 8 35 5  rc=83
+      k=2  13 24 8 36 5  rc=86
+  Writes propagate back through `from_mut` for both a scalar local and a
+  struct field, and the neighbouring field `s.b` stays 8 while `guard` stays
+  5 -- so the one-element view really is one element wide.
+  **PHASE 1 LANDED. FR-153 is now the only thing between this project and a
+  whole-program systemd crate that compiles.**
 
 - [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28; ROOT CAUSE FOUND
   and MERGED WITH FR-158 PHASE 4 by the FR-161 spike 2026-08-29): 35 crates
