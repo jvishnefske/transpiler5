@@ -9930,11 +9930,9 @@ piece and becomes FR-45.
   substring matching. The whole-identifier scanner is kept because it is the
   correct invariant and the guard for multi-entry `ordinalMap` shapes.
 
-- [ ] FR-157 DEFECT (found by building the FR-156 whole-program link
-  2026-08-29): THE MERGE RESOLVES AN FR-52 EXTERNAL OBLIGATION BY NAME ALONE,
-  never comparing the declaration's SIGNATURE against the definition's, so a
-  cross-shard pointer-model divergence becomes an exit-0-unbuildable crate
-  instead of a located diagnostic.
+- [ ] FR-157 WITHDRAWN 2026-08-29, its central factual claim disproved by the
+  FR-158 spike the same day. FILED AS: "the merge resolves an FR-52 external
+  obligation by name alone, never comparing signatures".
   `mergeShards` step 2 (`tools/emitrust-cc/LinkMerge.cpp`) is literally
       for (auto [name, op] : obligations) {
         if (definitions.contains(name)) { toErase.push_back(op); continue; }
@@ -9961,6 +9959,35 @@ piece and becomes FR-45.
   systemd link FAIL again -- honestly, rather than emitting an artifact that
   cannot build.
 
+  THE COMPARISON ALREADY EXISTS. `emitrustcc::findSignatureStarvedDecls`
+  (`tools/emitrust-cc/LinkMerge.cpp:725`, declared `LinkMerge.h:219-234`)
+  compares every body-less `extern_decl` function's type against the
+  definer's across all shards, and already drives a remedy --
+  `reimportFactStarvedGroups` (`emitrust-cc.cpp:1104-1113`), which unions the
+  declaring and defining shards and RE-IMPORTS the group jointly from C
+  source, where `isSliceRefinementOf` (`ImportCFunctions.cpp:872-887`)
+  reconciles the two models. Step 2's name-only erase is the SECOND line of
+  defence, not the only one. I wrote this entry from step 2's code without
+  looking for a prior check.
+  This also explains, retroactively, why three of my four attempted
+  reductions "built clean": the link output was byte-identical to the joint
+  import because it WAS a joint import. And two of those three were vacuous
+  besides -- the callers were stubbed with `unsupported: passing a pointer
+  into a global variable to a function`.
+
+  WHY SYSTEMD NEVER GOT THE REMEDY, measured: union-find collapses the
+  starved pairs into essentially one component, and the FIRST per-TU `-D`
+  difference vetoes the whole group (`emitrust-cc.cpp:1152-1160`). Across the
+  entire 501-object link, `link-time re-import:` fires ZERO times and
+  `cannot re-import` fires ONCE. Detection worked perfectly; the remedy does
+  not scale and never ran.
+
+  DISPOSITION: folded into FR-158 Phase 1, whose rejection path IS this entry
+  -- same site, same locality, better wording (it names the ARGUMENT and the
+  C call site, not just the two module types) -- and which arrives with
+  99.6% of the divergence actually FIXED rather than merely diagnosed.
+  The deprioritization note below stands and is why the order was right.
+
   DEPRIORITIZED BELOW FR-158 on 2026-08-29, deliberately and against the
   backlog rank, for two reasons worth recording.
   (1) The repo's OWN rule (CLAUDE.md, the dead-store paragraph) is that "the
@@ -9973,7 +10000,7 @@ piece and becomes FR-45.
   message. That is the wrong order. If FR-158 reconciles the models, FR-157
   becomes a backstop for a case that no longer occurs; it should be judged on
   whether it still earns its keep AFTER that, not before.
-  **NOT SPIKED; held behind FR-158.**
+  **WITHDRAWN; folded into FR-158 Phase 1.**
 
 - [ ] FR-158 (found by building the FR-156 whole-program link 2026-08-29):
   RECONCILE THE CROSS-SHARD POINTER MODEL so the whole-program crate actually
