@@ -10132,7 +10132,10 @@ piece and becomes FR-45.
   **PHASES 1+2 LANDED. Phase 3 (the 60 scalar-object slots, 55 functions)
   and Phase 4 (the E0596 reborrow class, 7 functions) remain.**
 
-- [ ] FR-160 (opened 2026-08-29): the repository LICENSE is AGPL-3.0-or-later
+- [ ] FR-162 (opened 2026-08-29 as FR-160; RENUMBERED when the probe line's
+  independently-allocated FR-160 met it on the trunk -- the code-bearing item
+  keeps the number because its commits and tests already cite it, and nothing
+  refers to this one): the repository LICENSE is AGPL-3.0-or-later
   (added in `b65d75c`) but 54 source files under `lib/`, `include/` and
   `tools/` still carry the LLVM-convention header
   `SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception`. The two
