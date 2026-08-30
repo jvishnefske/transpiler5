@@ -10487,19 +10487,53 @@ piece and becomes FR-45.
        273  pointer struct member 'X' outside the static-binding model
        196  call to a variadic function
        188  pointer cast (ArrayToPointerDecay)
-  READ THE TOP TWO CAREFULLY BEFORE RANKING -- neither is obviously what it
-  says. "call to unimported function" is almost certainly a CASCADE: the
-  callee was itself stubbed for one of the other reasons, so its 5265 is a
-  transitive count, not 5265 independent defects, and fixing a single deep
-  leaf may collapse thousands. "declaration inside a function body" at 2898 is
-  suspiciously large for what sounds like a parser limitation and should be
-  reduced to a concrete C shape before anyone prices it.
-  METHOD NOTE for whoever takes this: a stub count is NOT a defect count, and
-  this project has already been burned twice by reading first-failure
-  rejections as per-clause yields (FR-61f, twice, at 7x and 4.4x). Build the
-  callee->caller graph and rank by ROOT causes with their transitive closure,
-  not by raw frequency.
-  **NOT SPIKED.**
+  ANSWERED 2026-08-30 by measurement, and THE CENSUS ABOVE IS WRONG -- not by
+  a little. It counted RAW stub sites in the emitted lib.rs, which is a
+  per-TU tally: a construct in a header is counted once per INCLUDING TU.
+  Deduplicating the link ledger by (file:line:col, symbol) collapses 77,105
+  raw item lines to **13,673 distinct items -- a 5.6x fan-out factor**, and
+  it inverts the ranking. Per-entry corrections:
+      call to unimported function   5265 raw ->  452 distinct  (11.6x)
+      declaration in a function body 2898 raw ->  187 distinct  (15.5x)
+      null pointer constant          1700 raw ->  114 distinct  (14.9x)
+  I flagged the second as "suspiciously large for what sounds like a parser
+  limitation". It was, and the reason was fan-out, not the cascade I guessed.
+
+  THE DEDUPED RANKING. 10,721 distinct DROPPED, 2,952 distinct STUBBED:
+      dropped                              stubbed
+      3294  rejected-type-cascade           452  call to unimported function
+      1866  ptr-to-ptr-shape-escape         389  pointer-local-nonaddress
+      1636  ptr-to-ptr                      326  address of a pointer variable
+      1449  incomplete struct type          259  pointer expression: CallExpr
+      1086  returned-pointer                193  variadic-cross-tu
+       658  void pointer parameter          187  declaration in a function body
+       343  pointer type outside a param    139  self-ref-pointer-member
+  The POINTER MODEL is the deep front, exactly as the original probe said, and
+  now with a defensible number: ptr-to-ptr-shape-escape + ptr-to-ptr +
+  returned-pointer + void-pointer-param + pointer-outside-param =
+  **5,589 distinct drops, 52% of all drops.** Second is `incomplete struct
+  type` at 1,449.
+
+  THE LEVERAGE RESULT, and it is the actionable one: the LARGEST deduped drop
+  category is `rejected-type-cascade` at 3,294 -- items dropped only because a
+  TYPE they name was rejected first -- and **86 DISTINCT ROOT TYPES ACCOUNT
+  FOR ALL OF THEM.** The top twelve explain 2,423 (74%):
+      700 SdVarlinkSymbol   358 SdBus        188 JournalFile   179 SdDevice
+      152 SdVarlink         151 HashOps      143 SdEventSource 137 NlaPolicy
+      126 JsonStream        110 SdVarlinkInterface  105 SdJsonVariant
+       74 SdVarlinkServer
+  So ~30% of all drops are downstream of 86 structs, and one struct
+  (`SdVarlinkSymbol`) gates 700 items by itself. That is the highest
+  leverage ratio this project has measured. The next question -- unanswered
+  here -- is WHY those 86 are rejected; if they root in `incomplete struct
+  type` or the pointer model, the two fronts are one.
+  METHOD, now confirmed rather than warned about: a raw stub count is not a
+  defect count. Dedupe by location before ranking anything. This is the third
+  time the project has been bitten by reading per-occurrence counts as yields
+  (FR-61f twice, at 7x and 4.4x; this at 5.6x aggregate and 15x on a single
+  entry).
+  **ANSWERED (analysis, no code change). The follow-on is: root-cause the 86
+  types.**
   **NOT SPIKED.**
 
 - [x] FR-154 DEFECT (found by the FR-151 spike 2026-08-29; DISSOLVED by

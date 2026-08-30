@@ -437,10 +437,10 @@ anchor = "FR-164 (proposed 2026-08-29 by an agent, NOT requested"
 id = "FR-165"
 rank = 12
 kind = "feature"
-status = "open"
+status = "spiked"
 size = "L"
-title = "Rank the 16,538 whole-program stubs by root cause, not raw frequency"
-summary = "Opened 2026-08-30 from the first whole-program stub census, newly possible now that the 501-object systemd crate compiles. Of 34,418 top-level functions, 16,538 (48.1 percent) contain an unimplemented! stub and 17,880 have real bodies -- so the whole-program path is end-to-end traversable but the artifact is not a working systemd. Census: call to unimported function 5265, declaration inside a function body 2898, null pointer constant 1700, pointer expression CallExpr 1174, array parameter 666, pointer comparison across objects 642, system-header call 509, pointer assigned non-address 455, pointer param outside direct deref 370, address of pointer variable 329, pointer struct member 273, variadic call 196, ArrayToPointerDecay 188. The top entry is almost certainly a CASCADE -- the callee was stubbed for another reason -- so 5265 is transitive, not 5265 defects, and one deep leaf may collapse thousands. A stub count is not a defect count; this project has twice misread first-failure rejections as per-clause yields (FR-61f, 7x and 4.4x). Build the callee-caller graph and rank by root cause with transitive closure. NOT SPIKED."
+title = "Whole-program stub census: 86 root types gate 3294 cascade drops"
+summary = "ANSWERED 2026-08-30 by measurement, and the original census was wrong. It counted RAW per-TU stub sites; deduplicating the link ledger by file:line:col+symbol collapses 77,105 raw lines to 13,673 distinct items, a 5.6x fan-out factor, and inverts the ranking. Corrections: call-to-unimported 5265 to 452, declaration-in-body 2898 to 187, null-pointer-constant 1700 to 114. Deduped: 10,721 dropped, 2,952 stubbed. The pointer model is the deep front at 5,589 distinct drops, 52 percent of all drops. THE LEVERAGE RESULT: the largest deduped category is rejected-type-cascade at 3,294, and 86 DISTINCT ROOT TYPES account for all of them, with the top twelve explaining 2,423 and SdVarlinkSymbol alone gating 700. Roughly 30 percent of all drops are downstream of 86 structs. Follow-on: root-cause those 86; if they root in incomplete-struct-type or the pointer model, the two fronts are one. Method confirmed: dedupe by location before ranking -- third time this project has misread per-occurrence counts as yields."
 blocked_by = []
 anchor = "FR-165 (opened 2026-08-30 from the first whole-program stub census)"
 
