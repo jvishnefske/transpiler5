@@ -9858,30 +9858,70 @@ piece and becomes FR-45.
   hoist provably does not fix it (tried in the spike). Corpus cost of
   deferring: ONE file across 1601 systemd TUs.
 
-- [ ] FR-156 DEFECT (found by the FR-152 whole-program link 2026-08-29): A
-  RECOVERED FUNCTION'S DEPENDENT GLOBAL SURVIVES IT, leaving a function
-  pointer with no target.
+- [x] FR-156 DEFECT (found by the FR-152 whole-program link 2026-08-29;
+  SPIKED and FIXED the same day): THE SHARD RETAG MISSED A THIRD CARRIER OF
+  TAGGED NAMES, so a static function-pointer table broke whenever its shard
+  was not FIRST on the link line.
   `error: dangling function pointer target 'tu0_rlimit_parse_sec': the module
-  defines no function with that name`, at
-  `src/basic/rlimit-util.c:222:20` -- a file-static dispatch table
-      static int (*const rlimit_parse_table[_RLIMIT_MAX])(const char *, rlim_t *) = {
-              [RLIMIT_CPU] = rlimit_parse_sec, ...
-      };
-  whose target `rlimit_parse_sec` was itself dropped by recovery. The table
-  global was emitted anyway and still names it.
-  This FAILS LOUDLY, so the FR-52 marker contract is working as designed --
-  the defect is that recovery drops an item without dropping the globals
-  whose initializers reference it, so the loud failure lands at LINK on a
-  whole program instead of at the point of the drop.
-  It is the current head of the `systemd-detect-virt` link, reached only
-  after FR-151 and FR-152 (and with FR-154's colliding unit excluded).
-  DIRECTION, untested: when recovery drops a function, walk the globals whose
-  initializer attributes name it and drop them too, cascading through the
-  existing `[rejected-type-cascade]` machinery so the progress report
-  attributes them; the alternative -- keeping the global and emitting a
-  located rejection at the DROP site -- is probably better UX for the
-  single-TU case but does not obviously compose with `--link`.
-  **NOT SPIKED.**
+  defines no function with that name`, at `src/basic/rlimit-util.c:222:20`.
+
+  MY OWN FILED ROOT CAUSE WAS WRONG. The entry blamed recovery for dropping a
+  function without dropping the globals whose initializers reference it. That
+  cascade WORKS -- measured in single-TU mode, which drops the table with
+  `dropped 'TU0_TABLE' [other] unsupported: taking the address of unimported
+  function 'tu0_parse_sec'` -- and the rlimit shard genuinely DEFINES
+  `emitrust.func @tu0_rlimit_parse_sec`. Nothing was dropped.
+
+  The differential control is what found it: the same three shards, reordered
+  on the link line.
+      t1.o first  (position 0): links, 709 bytes emitted
+      t1.o second (position 1): error: dangling function pointer target 'tu0_p_a'
+  A position-dependent failure, so the defect is in the per-position retag.
+  `renameShardTags` (`tools/emitrust-cc/LinkMerge.cpp:219-275`) alpha-renames a
+  shard's `tu<k>_` tags to its link position and rewrites TWO carriers: symbol
+  uses via `SymbolTable::replaceAllSymbolUses`, and `emitrust.call_opaque`
+  callees, which name functions by plain STRING. Its own doc comment states
+  that the plain-string class exists. It enumerated that class incompletely:
+  an `emitrust.global`'s `init` array carries function-pointer targets as
+  `#emitrust.opaque<"Some(tu0_rlimit_parse_sec)">`, invisible to both. The
+  functions retagged to `tu99_`; the strings kept `tu0_`; the emitter's
+  dangling-target check (`TranslateToRust.cpp:4106`) fired -- correctly. The
+  check is not the bug; the missed rewrite is.
+
+  FIX: an `AttrTypeReplacer` over `emitrust::OpaqueAttr` payloads, keyed by
+  the SAME original-name map and applied after all symbol renames, preserving
+  the ordering discipline the existing comment explains. Whole-IDENTIFIER
+  matching (maximal `[A-Za-z0-9_]` runs, exact map hits only), never substring
+  -- `tu0_p_a` must not corrupt `tu0_p_ab`. Types and locations are excluded:
+  an `!emitrust.opaque` TYPE spells a Rust type, never an item symbol.
+
+  THE CLASS WAS ENUMERATED, not just the one instance: seven shard-visible
+  `OpaqueAttr` construction sites carry a taggable `Some(<fn>)` (global
+  fn-ptr init, const-evaluated global init, local and struct-member fn-ptr
+  init, two constant-expression sites, one importer site) and all are covered;
+  the `None` and `Enum::VARIANT` payloads are pass-through and pinned as such
+  (enums are never tu-tagged, `ItemGraph.h:78`); the conversion- and
+  actor-lift-stage sites are post-merge, so no shard tag can reach them.
+
+  MEASURED RESULT -- and this is the milestone: **the 500-shard
+  `systemd-detect-virt` link now SUCCEEDS.** Exit 0, zero errors, 12,074,571
+  bytes of emitted Rust, with the rlimit table self-consistent
+  (`static TU99_RLIMIT_PARSE_TABLE: [Option<fn(&mut [i8], &mut [u64]) -> i32>; 16]
+  = [Some(tu99_rlimit_parse_sec), ...]`). The remaining stderr is the ordinary
+  recovery ledger, not link failures. That is the first whole-program link of a
+  real ~500-TU C program in this project, reached this session through FR-151,
+  FR-152 and FR-156, with the single FR-154 unit excluded.
+  Gate 902/902, zero golden churn. Byte-diff oracle: an EndToEnd test links
+  the same shards in BOTH orders, builds both, and diffs each against the
+  clang-linked native at two argc values that dispatch different table
+  permutations, so an entry wired to the wrong same-signature function cannot
+  hide.
+  RECORDED, not fixed: as implemented today every tag in one shard shares a
+  source ordinal, so the transform is uniformly "bump the ordinal" and a naive
+  substring replace would coincidentally agree. The prefix-name test pins the
+  OUTCOME, not the algorithm; it would not today catch a regression to
+  substring matching. The whole-identifier scanner is kept because it is the
+  correct invariant and the guard for multi-entry `ordinalMap` shapes.
 
 - [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28): 35 crates fail
   `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`

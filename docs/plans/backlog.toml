@@ -349,10 +349,10 @@ anchor = "FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike"
 id = "FR-156"
 rank = 15
 kind = "defect"
-status = "open"
+status = "landed"
 size = "M"
-title = "A recovered function's dependent global survives it, leaving a dangling function pointer"
-summary = "Found by the FR-152 whole-program link 2026-08-29. error: dangling function pointer target 'tu0_rlimit_parse_sec': the module defines no function with that name, at src/basic/rlimit-util.c:222:20 -- a file-static dispatch table whose target was dropped by recovery, with the table global emitted anyway still naming it. Fails LOUDLY, so the FR-52 marker contract works; the defect is that recovery drops an item without dropping the globals whose initializers reference it, so the loud failure lands at LINK on a whole program instead of at the drop site. Current head of the systemd-detect-virt link, reached only after FR-151 and FR-152 with FR-154's colliding unit excluded. Direction: cascade the drop to referencing globals through the existing rejected-type-cascade machinery. NOT SPIKED."
+title = "The shard retag missed a third carrier of tagged names, breaking static fn-ptr tables off position 0"
+summary = "LANDED 2026-08-29. My own filed root cause was WRONG: recovery cascades correctly in single-TU mode and the shard genuinely defines the function. The differential control found it -- the same three shards reordered on the link line link at position 0 and fail at position 1. renameShardTags rewrites symbol uses and call_opaque callees but missed a third plain-string carrier: an emitrust.global init array carries fn-ptr targets as #emitrust.opaque<\"Some(tu0_f)\">. Fix: an AttrTypeReplacer over OpaqueAttr payloads keyed by the same original-name map, whole-identifier matching only. The class was enumerated -- seven shard-visible taggable sites covered, None/Enum payloads pass-through and pinned, conversion/actor-lift sites are post-merge. MILESTONE: the 500-shard systemd-detect-virt link now SUCCEEDS, exit 0, 12.07 MB of emitted Rust. Gate 902/902, zero churn."
 blocked_by = []
 anchor = "FR-156 DEFECT (found by the FR-152 whole-program link"
 
