@@ -499,6 +499,196 @@ static LogicalResult renameShardTags(ModuleOp shard,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// FR-158 slice-model reconciliation
+//===----------------------------------------------------------------------===//
+
+/// The parameter slots at which `declType` carries the SCALAR pointer model
+/// `!emitrust.mut_ref<T>` while `defType` carries the defining translation
+/// unit's SLICE model `!emitrust.mut_ref<!emitrust.slice<T>>`, or
+/// `std::nullopt` when the two function types differ in ANY other way (a
+/// different arity, a different result, a parameter whose difference is not
+/// that refinement).
+///
+/// This is the only divergence the merge knows how to reconcile, and it is
+/// the divergence a body-less declaration MUST produce: `collectSliceParams`
+/// promotes a pointer parameter to a slice from what the BODY does with it,
+/// and a declaration has no body, so the declaring shard shapes its call
+/// sites for `&mut T` while the definer's signature says `&mut [T]`.
+/// Measured over the 501-object systemd whole-program link: 3796 of 3796
+/// diverging declarations are exactly this shape, with zero arity and zero
+/// result differences.
+static std::optional<llvm::SmallVector<unsigned>>
+sliceRefinedSlots(FunctionType declType, FunctionType defType) {
+  if (declType.getNumInputs() != defType.getNumInputs() ||
+      declType.getResults() != defType.getResults())
+    return std::nullopt;
+  llvm::SmallVector<unsigned> slots;
+  for (unsigned i = 0, e = declType.getNumInputs(); i != e; ++i) {
+    Type declIn = declType.getInput(i);
+    Type defIn = defType.getInput(i);
+    if (declIn == defIn)
+      continue;
+    auto declRef = dyn_cast<emitrust::MutRefType>(declIn);
+    auto defRef = dyn_cast<emitrust::MutRefType>(defIn);
+    if (!declRef || !defRef)
+      return std::nullopt;
+    auto defSlice = dyn_cast<emitrust::SliceType>(defRef.getPointee());
+    if (!defSlice || defSlice.getElementType() != declRef.getPointee())
+      return std::nullopt;
+    slots.push_back(i);
+  }
+  return slots;
+}
+
+/// The operation in `shard` that uses `name` as a VALUE rather than as an
+/// `emitrust.call_opaque` callee, or null when there is none.
+///
+/// Reconciling a slice-refined function reshapes its CALLS. Any other use
+/// of the symbol carries a function-pointer TYPE built from the declaration
+/// -- an `#emitrust.opaque<"Some(f)">` payload in a dispatch table's
+/// initializer or in a body-level constant, or a symbol reference -- and
+/// nothing here can retype it. Those uses must be refused, not left behind:
+/// a table whose element type still says `fn(&mut T, i32)` while the
+/// definition says `fn(&mut [T], i32)` is rustc E0308 with no source
+/// location, which is the failure FR-158 exists to remove. systemd's link
+/// has ZERO of these, so the guard is untested by construction and is
+/// pinned by the synthetic FNPTR leg of Driver/link-slice-model-invalid.c.
+///
+/// The payload scan is WHOLE-IDENTIFIER, matching `renameShardTags`'s own
+/// text carriers: `note` must not be found inside `note_all`.
+///
+/// Deliberately an ATTRIBUTE walk over every operation rather than
+/// `SymbolTable::getSymbolUses`: that helper does not descend into nested
+/// symbol tables (an FR-159 sunk `mod tu<N>` module is one) and reports
+/// "unknown" for operations it cannot classify, and a MISSED use here is
+/// exactly the silent wrong-type emission this guard exists to prevent.
+static Operation *findSliceRefinedSymbolEscape(ModuleOp shard,
+                                               llvm::StringRef name) {
+  auto mentions = [&](llvm::StringRef text) {
+    auto isIdentChar = [](char c) { return llvm::isAlnum(c) || c == '_'; };
+    size_t index = 0;
+    while (index < text.size()) {
+      if (!isIdentChar(text[index])) {
+        ++index;
+        continue;
+      }
+      size_t start = index;
+      while (index < text.size() && isIdentChar(text[index]))
+        ++index;
+      if (text.substr(start, index - start) == name)
+        return true;
+    }
+    return false;
+  };
+  StringAttr nameAttr = StringAttr::get(shard.getContext(), name);
+  Operation *escape = nullptr;
+  shard.walk([&](Operation *inner) {
+    if (escape || inner->hasAttr(emitrust::kExternDeclAttrName))
+      return; // The declaration's own `sym_name` is not a use.
+    for (NamedAttribute attr : inner->getAttrs()) {
+      attr.getValue().walk([&](Attribute sub) {
+        if (auto opaque = dyn_cast<emitrust::OpaqueAttr>(sub)) {
+          if (mentions(opaque.getValue()))
+            escape = inner;
+        } else if (auto symbol = dyn_cast<FlatSymbolRefAttr>(sub)) {
+          if (symbol.getAttr() == nameAttr)
+            escape = inner;
+        }
+      });
+    }
+  });
+  return escape;
+}
+
+/// Re-shapes `shard`'s calls of `name` so that the arguments at `slots`
+/// carry the DEFINITION's slice model. The only admitted argument is the
+/// `addr_of mut (subscript base[index])` cursor a C `&arr[k]` / `&p[k]`
+/// argument imports to; it becomes the equivalent `slice_of mut base[index]`
+/// (`&mut base[index..]`).
+///
+/// Semantics: C's `f(&arr[k])` lends the callee `arr[k..]`, and
+/// `&mut arr[k..]` is exactly that range and no wider. The rewrite is also
+/// strictly less panicky than the form it replaces -- `k == len` yields a
+/// legal empty slice where `&mut arr[len]` panics.
+///
+/// Everything else keeps a LOCATED rejection: the address of a scalar
+/// object or of a struct field (the measured 60-slot residue, which has no
+/// region to slice), and a call whose arguments are remapped positionally
+/// by the `args` attribute (where operand index is not argument position).
+static LogicalResult adaptSliceRefinedCalls(ModuleOp shard,
+                                            Operation *definition,
+                                            llvm::StringRef name,
+                                            llvm::ArrayRef<unsigned> slots,
+                                            FunctionType declType,
+                                            FunctionType defType) {
+  if (Operation *escape = findSliceRefinedSymbolEscape(shard, name))
+    return escape->emitError()
+           << "unsupported: '" << name
+           << "' is used as a value here but the defining translation unit "
+              "classifies its parameter "
+           << (slots.front() + 1)
+           << " as a slice, so this use carries a function-pointer type the "
+              "definition does not have";
+
+  bool failed = false;
+  shard.walk([&](emitrust::CallOpaqueOp call) {
+    if (call.getCallee() != name)
+      return;
+    if (call.getArgs()) {
+      call.emitError() << "unsupported: the call to '" << name
+                       << "' remaps its arguments positionally, so it cannot "
+                          "be adapted to the defining translation unit's "
+                          "slice parameter model";
+      failed = true;
+      return;
+    }
+    for (unsigned slot : slots) {
+      Value arg = slot < call->getNumOperands() ? call->getOperand(slot)
+                                                : Value();
+      if (arg && arg.getType() == defType.getInput(slot))
+        continue; // Already the definition's model.
+      auto addrOf = arg ? arg.getDefiningOp<emitrust::AddrOfOp>()
+                        : emitrust::AddrOfOp();
+      auto subscript =
+          addrOf ? addrOf.getOperand().getDefiningOp<emitrust::SubscriptOp>()
+                 : emitrust::SubscriptOp();
+      // The element the cursor points at must be the pointee the
+      // DECLARATION promised; the module verifier would catch a mismatch
+      // downstream, but a link diagnostic beats a verifier failure.
+      Type element =
+          subscript
+              ? cast<emitrust::LValueType>(subscript.getResult().getType())
+                    .getValueType()
+              : Type();
+      auto declRef = dyn_cast<emitrust::MutRefType>(declType.getInput(slot));
+      if (!addrOf || !addrOf.getIsMut() || !subscript || !declRef ||
+          element != declRef.getPointee()) {
+        InFlightDiagnostic diag =
+            call.emitError()
+            << "unsupported: argument " << (slot + 1) << " of the call to '"
+            << name
+            << "' is a scalar reference but the defining translation unit "
+               "classifies that parameter as a slice";
+        diag.attachNote(definition->getLoc())
+            << "'" << name << "' is defined here as " << defType;
+        failed = true;
+        continue;
+      }
+      OpBuilder builder(addrOf);
+      auto sliced = builder.create<emitrust::SliceOfOp>(
+          addrOf.getLoc(), defType.getInput(slot), subscript.getArray(),
+          subscript.getIndex(), /*is_mut=*/true);
+      call->setOperand(slot, sliced.getResult());
+      // A shared cursor may still feed an UNREFINED callee, so the borrow
+      // is dropped only once nothing reads it.
+      if (addrOf.getResult().use_empty())
+        addrOf.erase();
+    }
+  });
+  return success(!failed);
+}
+
 } // namespace
 
 FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
@@ -660,13 +850,56 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
 
   // Step 2: declaration-for-definition replacement; an obligation nobody
   // defines is THE undefined-symbol link error.
+  //
+  // FR-158: an obligation whose type DIFFERS from the definition's cannot
+  // simply be dropped -- the declaring shard shaped its call sites for the
+  // type it declared, and handing them a definition of another type is
+  // rustc E0308 with no source location. When the difference is exactly the
+  // scalar/slice pointer-model refinement a body-less declaration must
+  // produce, the shard's call arguments are reconciled in place; anything
+  // else is a located link rejection. Every diverging obligation is
+  // reported before the merge gives up -- a whole-program link that stops
+  // at the first of hundreds turns porting into a one-at-a-time loop.
+  bool reconciliationFailed = false;
   for (auto [name, op] : obligations) {
-    if (definitions.contains(name)) {
+    auto it = definitions.find(name);
+    if (it != definitions.end()) {
+      auto declFn = dyn_cast<FunctionOpInterface>(op);
+      auto defFn = dyn_cast<FunctionOpInterface>(it->second);
+      if (declFn && defFn &&
+          declFn.getFunctionType() != defFn.getFunctionType()) {
+        auto declType = dyn_cast<FunctionType>(declFn.getFunctionType());
+        auto defType = dyn_cast<FunctionType>(defFn.getFunctionType());
+        std::optional<llvm::SmallVector<unsigned>> slots =
+            declType && defType ? sliceRefinedSlots(declType, defType)
+                                : std::nullopt;
+        if (!slots || slots->empty()) {
+          InFlightDiagnostic diag =
+              op->emitError()
+              << "unsupported: '" << name << "' is declared as "
+              << declFn.getFunctionType()
+              << " but the defining translation unit defines it as "
+              << defFn.getFunctionType();
+          diag.attachNote(it->second->getLoc()) << "defined here";
+          reconciliationFailed = true;
+          continue;
+        }
+        auto shard = op->getParentOfType<ModuleOp>();
+        if (mlir::failed(adaptSliceRefinedCalls(shard, it->second, name,
+                                                *slots, declType, defType))) {
+          reconciliationFailed = true;
+          continue;
+        }
+      }
       toErase.push_back(op);
       continue;
     }
     return op->emitError() << "unresolved external '" << name << "' at link";
   }
+  // A shard left half-reconciled must never reach the splice or the
+  // verifier: the located rejections above are the report.
+  if (reconciliationFailed)
+    return failure();
 
   for (Operation *op : toErase)
     op->erase();
