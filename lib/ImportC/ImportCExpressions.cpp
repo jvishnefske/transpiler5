@@ -1899,7 +1899,9 @@ FailureOr<Value> CImporter::emitCondition(const clang::Expr *expr) {
   // discriminant against zero.
   if (llvm::isa<emitrust::EnumType>(type)) {
     Value discriminant = castEnumToI32(loc, *value);
-    Value zero = createIntConstant(loc, builder.getI32Type(), 0);
+    // FR-166: the zero follows the discriminant's width (i64 for a wide
+    // enum), not a hard-coded i32, or `arith.cmpi` rejects the mismatch.
+    Value zero = createIntConstant(loc, discriminant.getType(), 0);
     return builder
         .create<arith::CmpIOp>(loc, arith::CmpIPredicate::ne, discriminant,
                                zero)
@@ -7368,8 +7370,19 @@ FailureOr<Value> CImporter::emitEnumOperand(const EnumOperand &operand,
 }
 
 Value CImporter::castEnumToI32(Location loc, Value value) {
-  return builder.create<emitrust::CastOp>(loc, builder.getI32Type(), value)
-      .getResult();
+  // FR-166: an enum whose storage is 64 bits wide converts at i64, not i32 --
+  // truncating here would silently read the low half of every enumerator
+  // (`5000000000 as i32` is 705032704, `INT64_MAX as i32` is -1), which
+  // compiles cleanly and miscompiles at runtime. Anything narrower keeps
+  // today's i32 target byte for byte; an anonymous enum is already a plain
+  // i32 from `mapType` and never reaches here.
+  Type target = builder.getI32Type();
+  if (auto enumType = llvm::dyn_cast<emitrust::EnumType>(value.getType()))
+    if (auto def = emitrust::EnumDefOp::lookupFrom(module.getOperation(),
+                                                   enumType.getName()))
+      if (def.getWideUnderlying())
+        target = builder.getI64Type();
+  return builder.create<emitrust::CastOp>(loc, target, value).getResult();
 }
 
 FailureOr<Value>

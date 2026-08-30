@@ -547,10 +547,18 @@ EnumDefOp EnumDefOp::lookupFrom(Operation *from, llvm::StringRef name) {
 
 /// Verifies that the variant name and value arrays have the same non-zero
 /// length, that variant names are non-empty and unique, that variant
-/// values are within the i32 range, and that an enum with the
-/// `unsigned_underlying` marker (u32 storage) has no negative value. Variant
-/// VALUES need not be distinct: a C `enum { A = 1, B = 1 }` lowers to two
-/// associated consts of equal value, which is valid Rust.
+/// values fit the storage the markers select, and that an enum with the
+/// `unsigned_underlying` marker (u32/u64 storage) has no negative value.
+/// Variant VALUES need not be distinct: a C `enum { A = 1, B = 1 }` lowers
+/// to two associated consts of equal value, which is valid Rust.
+///
+/// FR-166: the i32 bound applies only WITHOUT `wide_underlying`; a wide def
+/// stores 64 bits and the whole `DenseI64ArrayAttr` range fits it. The bound
+/// is deliberately signed on both halves of the narrow case: the importer's
+/// enum-to-integer conversion still targets a SIGNLESS integer and so drops
+/// the enum's signedness, which makes a u32 value above INT32_MAX a
+/// miscompile rather than a widening (FR-169 owns that, and owns fixing the
+/// conversion first).
 LogicalResult EnumDefOp::verify() {
   ArrayAttr names = getVariantNames();
   ArrayRef<int64_t> values = getVariantValues();
@@ -568,7 +576,7 @@ LogicalResult EnumDefOp::verify() {
       return emitOpError("variant names must not be empty");
     if (!seenNames.insert(name).second)
       return emitOpError("duplicate variant name \"") << name << "\"";
-    if (!llvm::isInt<32>(value))
+    if (!getWideUnderlying() && !llvm::isInt<32>(value))
       return emitOpError("variant value ")
              << value << " is out of the i32 range";
     if (getUnsignedUnderlying() && value < 0)
@@ -1224,7 +1232,9 @@ LogicalResult MemberOp::verify() {
 //===----------------------------------------------------------------------===//
 
 /// Verifies that the operand is an lvalue wrapping an enum type and the
-/// result an lvalue wrapping a 32-bit integer (the enum's storage type).
+/// result an lvalue wrapping the enum's storage integer, which FR-166 makes
+/// 32 OR 64 bits wide (the `wide_underlying` marker on the def picks); any
+/// other width is a hard error, since no open enum has that storage.
 LogicalResult EnumRawOp::verify() {
   Type valueType = cast<LValueType>(getOperand().getType()).getValueType();
   if (!isa<EnumType>(valueType))
@@ -1233,9 +1243,10 @@ LogicalResult EnumRawOp::verify() {
            << getOperand().getType();
   auto resultType = dyn_cast<IntegerType>(
       cast<LValueType>(getResult().getType()).getValueType());
-  if (!resultType || resultType.getWidth() != 32)
-    return emitOpError("result must be an lvalue of a 32-bit integer type, "
-                       "but got ")
+  if (!resultType ||
+      (resultType.getWidth() != 32 && resultType.getWidth() != 64))
+    return emitOpError("result must be an lvalue of a 32- or 64-bit integer "
+                       "type, but got ")
            << getResult().getType();
   return success();
 }

@@ -10561,7 +10561,7 @@ piece and becomes FR-45.
   **ANSWERED. Follow-ons filed as FR-166 (enum width) and FR-167 (union
   type), chosen for leverage-per-effort, not raw frequency.**
 
-- [ ] FR-166 (opened 2026-08-30 from the FR-165 root-cause pass): AN ENUM WITH
+- [x] FR-166 PHASE 1 LANDED 2026-08-30 (opened the same day from the FR-165 root-cause pass): AN ENUM WITH
   ANY ENUMERATOR OUTSIDE i32 RANGE IS REJECTED WHOLE, gating 278 items (25
   direct + 253 cascaded, 11x amplification) across 19 distinct enums.
   `lib/ImportC/ImportCAggregates.cpp:2034-2039` refuses the enum if any
@@ -10642,7 +10642,47 @@ piece and becomes FR-45.
   shard -- measured, `error: attempting to parse a byte at the end of the
   bytecode`. `--link` gives no compatibility warning, just a parse error.
   Shards must be regenerated whenever the dialect changes.
-  **SPIKED GO, BLOCKED ON FR-168.**
+  PHASE 1 LANDED 2026-08-30, once FR-168 cleared the orphan-obligation
+  blocker. Gate **923/923**, 501 shards, **zero exclusions**, whole-program
+  crate 12,371,799 bytes, `cargo build --release --offline` **0 errors** --
+  all verified independently by regenerating every shard, not on the agent's
+  report. `does not fit in i32` occurrences: **1165 -> 6**. Ledger
+  13,922 -> 13,597: resolved 469, newly surfaced 144, **net -325**.
+  **17 `_SD_ENUM_FORCE_S64` enums now emit** (`SdJsonVariantTypeT(pub i64)`,
+  the `SdVarlink*FlagsT` family) against ZERO at HEAD, and zero cross-TU enum
+  conflicts were introduced across 501 TUs -- the shape-key change is
+  additive on the real corpus.
+
+  **THE SPIKE'S OWN PROTOTYPE CONTRADICTED THE CONSTRAINT, and the
+  implementer caught it.** `fr166-proto.patch` relaxed the non-wide gate to
+  `unsignedUnderlying ? isUInt<32> : isInt<32>` -- which IS the FR-169
+  relaxation. That is also the real reason the spike's logs recorded a
+  fast-tier FAIL it had reported as "3 negative tests": the prototype
+  silently admitted `enum Big { HUGE_V = 3000000000 }` (clang types it
+  `unsigned int`). The shipped version keeps the non-wide gate at SIGNED
+  `isInt<32>` in both the importer and `EnumDefOp::verify`, so 6 systemd
+  enums (`epoll.h`'s `EPOLLET = 1u<<31`, `barrier.h`, `bus-creds.c`) stay
+  REJECTED rather than being admitted as u32 and miscompiled through
+  `castEnumToI32`'s `as i32`. Following the stated invariant over the
+  reference implementation is what kept FR-169 out of the tree.
+
+  BYTE IDENTITY, measured rather than argued: `--emit=rust` AND `--emit=mlir`
+  hashed for all **992** C/C++/H sources under `test/` before and after --
+  **exactly 2 of 992 differ, both the new tests.**
+  The 144 newly-surfaced items are downstream of admission, not regressions:
+  types that never got imported now reach the pointer gates (`ptr-to-ptr` 39,
+  `returned-pointer` 20, ...).
+  The `enum_raw` verifier wording changed (`a 32-bit` -> `a 32- or 64-bit`)
+  and its `invalid.mlir` leg moved from `i64`, now legal, to `i16`.
+
+  OPERATIONAL LESSON worth keeping: **`git apply -3` STAGES its result**, so
+  a following `git checkout -- <file>` is a silent no-op that restores the
+  patched file and invalidates any control run. Correct spelling is
+  `git restore --staged` first, or `git checkout HEAD -- <file>`. Caught by
+  `grep -c` on a marker before trusting the control -- the same discipline
+  recorded after an earlier failed revert this session.
+  **PHASE 1 LANDED. Phase 2 (the 32-bit unsigned range) stays blocked on
+  FR-169's miscompile.**
 
 - [x] FR-168 SLICE 1 LANDED 2026-08-30 (found by the FR-166 spike): AN
   `emitrust.extern_decl` OBLIGATION CAN OUTLIVE THE REJECTION OF ITS OWN

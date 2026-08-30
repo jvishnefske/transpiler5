@@ -1396,12 +1396,27 @@ static emitrust::EnumDefOp lookupEnumDef(Operation *op,
   return emitrust::EnumDefOp::lookupFrom(op, enumType.getName());
 }
 
+/// FR-166: the Rust spelling of the open enum's tuple-struct storage
+/// integer. The two unit markers on the def are orthogonal, so the storage
+/// is one of four: `i32` (neither marker, the pre-FR-166 default and hence
+/// the byte-identical path), `u32`, `i64`, `u64`. This is the SINGLE source
+/// of that spelling -- `emitEnumDef` declares the field with it and
+/// `emitCast`'s constructor branch converts to it, and the two must never
+/// disagree.
+static llvm::StringRef enumStorageSpelling(emitrust::EnumDefOp enumDef) {
+  if (enumDef.getWideUnderlying())
+    return enumDef.getUnsignedUnderlying() ? "u64" : "i64";
+  return enumDef.getUnsignedUnderlying() ? "u32" : "i32";
+}
+
 /// FR-63 (clippy::unnecessary_cast): whether `type` renders exactly as the
-/// open enum's tuple-struct raw field (`u32` under `unsigned_underlying`,
-/// else `i32` -- the two spellings `emitCast`'s constructor branch prints).
+/// open enum's tuple-struct raw field -- the spelling
+/// `enumStorageSpelling` prints, matched on both width (FR-166's
+/// `wide_underlying`) and signedness.
 static bool rendersAsEnumUnderlying(emitrust::EnumDefOp enumDef, Type type) {
   auto intType = dyn_cast<IntegerType>(type);
-  return intType && intType.getWidth() == 32 &&
+  unsigned storageWidth = enumDef.getWideUnderlying() ? 64 : 32;
+  return intType && intType.getWidth() == storageWidth &&
          intType.isUnsigned() == enumDef.getUnsignedUnderlying();
 }
 
@@ -6015,8 +6030,7 @@ LogicalResult RustEmitter::emitCast(emitrust::CastOp castOp) {
     if (failed(emitOperand(op->getLoc(), op->getOperand(0),
                            ExprPos::castSource())))
       return failure();
-    os << " as " << (enumDef.getUnsignedUnderlying() ? "u32" : "i32")
-       << ");\n";
+    os << " as " << enumStorageSpelling(enumDef) << ");\n";
     return success();
   }
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
@@ -6547,7 +6561,7 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
 
 LogicalResult RustEmitter::emitEnumDef(emitrust::EnumDefOp enumDefOp) {
   StringRef name = itemLeafName(enumDefOp.getSymName()); // FR-159
-  StringRef storage = enumDefOp.getUnsignedUnderlying() ? "u32" : "i32";
+  StringRef storage = enumStorageSpelling(enumDefOp);
   os << "#[repr(transparent)]\n";
   os << "#[derive(Clone, Copy, PartialEq)]\n";
   StringRef pub = typePartVisibility();

@@ -221,6 +221,15 @@ emitrust.enum_def @Neg ["A"] [-1] {unsigned_underlying}
 
 // -----
 
+// FR-166: the 64-bit variant range is unlocked by the `wide_underlying`
+// marker and by NOTHING ELSE. A def without it keeps the i32 bound, so a
+// producer that forgets the marker fails loudly here instead of emitting a
+// tuple struct whose `i32` field cannot hold its own associated const.
+// expected-error @+1 {{variant value 5000000000 is out of the i32 range}}
+emitrust.enum_def @WideNoMarker ["A", "Big"] [0, 5000000000]
+
+// -----
+
 emitrust.func @enum_raw_not_enum(%arg0: i32) {
   %0 = emitrust.variable : !emitrust.lvalue<i32>
   // expected-error @+1 {{operand must be an lvalue of !emitrust.enum type}}
@@ -230,10 +239,15 @@ emitrust.func @enum_raw_not_enum(%arg0: i32) {
 
 // -----
 
+// FR-166 MOVED THIS PIN FORWARD: an `!emitrust.lvalue<i64>` result is now
+// LEGAL (a `wide_underlying` enum stores 64 bits, so its raw place is i64 --
+// test/Target/Rust/enum-wide-underlying.mlir pins the emission). The two
+// storage widths an open enum has are 32 and 64, so any OTHER width is still
+// a hard error, and this leg pins the narrowed wording at i16.
 emitrust.func @enum_raw_bad_result() {
   %0 = emitrust.variable : !emitrust.lvalue<!emitrust.enum<"Color">>
-  // expected-error @+1 {{result must be an lvalue of a 32-bit integer type}}
-  %1 = emitrust.enum_raw %0 : (!emitrust.lvalue<!emitrust.enum<"Color">>) -> !emitrust.lvalue<i64>
+  // expected-error @+1 {{result must be an lvalue of a 32- or 64-bit integer type}}
+  %1 = emitrust.enum_raw %0 : (!emitrust.lvalue<!emitrust.enum<"Color">>) -> !emitrust.lvalue<i16>
   emitrust.return
 }
 

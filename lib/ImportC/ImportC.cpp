@@ -2149,7 +2149,7 @@ FailureOr<Type> CImporter::getOrCreateArrayMemberEnumType(
         loc, moduleBuilder.getStringAttr(symbol),
         moduleBuilder.getStrArrayAttr(variantNames),
         moduleBuilder.getDenseI64ArrayAttr(variantValues),
-        /*unsigned_underlying=*/true);
+        /*unsigned_underlying=*/true, /*wide_underlying=*/false);
     facts.enumSymbol = symbol;
   }
   return Type(emitrust::EnumType::get(builder.getContext(), facts.enumSymbol));

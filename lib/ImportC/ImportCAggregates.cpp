@@ -2015,6 +2015,16 @@ CImporter::importEnumUncached(const clang::EnumDecl *definition) {
                              << definition->getName()
                              << "' is a Rust keyword";
 
+  // FR-166: the emitted open enum's storage follows clang's underlying-type
+  // choice in BOTH signedness and width, so an enum that clang widened to 64
+  // bits because an enumerator falls outside the 32-bit range (systemd's
+  // `_SD_ENUM_FORCE_S64` macro exists to force exactly that, and every flags
+  // enum in sd-json.h / sd-varlink.h carries one) imports whole instead of
+  // being rejected enumerator by enumerator.
+  clang::QualType underlyingType = definition->getIntegerType();
+  bool unsignedUnderlying = underlyingType->isUnsignedIntegerType();
+  bool wideUnderlying = astContext().getTypeSize(underlyingType) > 32;
+
   SmallVector<std::string> variantNames;
   SmallVector<int64_t> variantValues;
   // Enumerator NAMES must stay unique (they become the tuple-struct's
@@ -2029,12 +2039,22 @@ CImporter::importEnumUncached(const clang::EnumDecl *definition) {
     if (isRustKeyword(name))
       return emitError(enumeratorLoc)
              << "unsupported: enumerator '" << name << "' is a Rust keyword";
+    // A wide underlying type admits the whole i64 range and NOTHING MORE:
+    // `DenseI64ArrayAttr` cannot represent a value above INT64_MAX, so those
+    // stay a located rejection. That bound is also what keeps the wide path
+    // honest -- every admitted value is <= INT64_MAX, where the signed
+    // comparisons the importer emits agree with C's unsigned ones.
     const llvm::APSInt &initValue = enumerator->getInitVal();
     if (!initValue.isRepresentableByInt64())
       return emitError(enumeratorLoc)
-             << "unsupported: enumerator value does not fit in i32";
+             << "unsupported: enumerator value does not fit in i64";
     int64_t value = initValue.getExtValue();
-    if (value < INT32_MIN || value > INT32_MAX)
+    // A 32-bit underlying type keeps the SIGNED i32 bound even when it is
+    // unsigned: `castEnumToI32` converts to a signless i32 and so discards
+    // the enum's signedness, which would turn an admitted `M_MAX =
+    // 4294967295u` into `-1` at every comparison. Widening this to the full
+    // u32 range is FR-169, and it has to fix that conversion first.
+    if (!wideUnderlying && !llvm::isInt<32>(value))
       return emitError(enumeratorLoc)
              << "unsupported: enumerator value does not fit in i32";
     variantNames.push_back(enumVariantRustName(name));
@@ -2043,23 +2063,25 @@ CImporter::importEnumUncached(const clang::EnumDecl *definition) {
   if (variantNames.empty())
     return emitError(defLoc) << "unsupported: enum with no enumerators";
 
-  // The storage of the emitted open enum follows clang's underlying type
-  // choice (unsigned when every enumerator is non-negative), so that the
-  // raw-representation place (`emitrust.enum_raw`) and enum/integer
-  // conversions meet C's unsigned semantics at the right type.
-  bool unsignedUnderlying =
-      definition->getIntegerType()->isUnsignedIntegerType();
-
   // Cross-TU deduplication by symbol name (see importRecord): identical shape
   // is skipped, a name reused with a different variant shape is a diagnostic.
-  // The underlying signedness is derived from the values, so the value list
-  // determines it and the shape key needs no extra component.
+  //
+  // FR-166: the key used to be the `name=value;` list alone, on the premise
+  // that "the underlying signedness is derived from the values". A C++ FIXED
+  // underlying type falsifies that outright -- `enum G : int` and
+  // `enum G : unsigned int` have identical values and different storage --
+  // and the two TUs deduped SILENTLY, the second unit's storage simply
+  // dropped. The hole was latent only because signed and unsigned diverge
+  // above 2^31 and such values were rejected wholesale; admitting wide
+  // enums makes it live, so the storage joins the key and a mismatch is
+  // now the same located "conflicting definition" a value mismatch is.
   std::string shape;
   {
     llvm::raw_string_ostream os(shape);
     for (auto [variantName, variantValue] :
          llvm::zip(variantNames, variantValues))
       os << variantName << '=' << variantValue << ';';
+    os << (unsignedUnderlying ? 'u' : 'i') << (wideUnderlying ? 64 : 32);
   }
   auto existingShape = importedEnumShapes.find(definition->getName());
   if (existingShape != importedEnumShapes.end()) {
@@ -2079,7 +2101,8 @@ CImporter::importEnumUncached(const clang::EnumDecl *definition) {
       defLoc,
       moduleBuilder.getStringAttr(enumTypeRustName(definition->getName())),
       moduleBuilder.getStrArrayAttr(variantNameRefs),
-      moduleBuilder.getDenseI64ArrayAttr(variantValues), unsignedUnderlying);
+      moduleBuilder.getDenseI64ArrayAttr(variantValues), unsignedUnderlying,
+      wideUnderlying);
   return success();
 }
 
