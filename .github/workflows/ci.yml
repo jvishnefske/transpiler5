@@ -25,23 +25,22 @@ jobs:
 
       - uses: DeterminateSystems/magic-nix-cache-action@v8
 
-      # The dev shell pins LLVM/MLIR/Clang 21.1.8 and the Rust toolchain.
-      # LLVM_EXTERNAL_LIT is required because the nixpkgs LLVM ships no
-      # llvm-lit; lit comes from the shell's python environment.
+      # The dev shell pins LLVM/MLIR/Clang 21.1.8 and the Rust toolchain,
+      # and exports the MLIR_DIR / Clang_DIR / LIBCLANG_PATH that
+      # meson.build's toolchain discovery reads. lit comes from the same
+      # shell's python environment; test/meson.build finds it on PATH.
       - name: Configure
-        run: |
-          nix develop -c bash -c 'cmake -G Ninja -S . -B build \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DLLVM_EXTERNAL_LIT="$(which lit)"'
+        run: nix develop -c meson setup build
 
       - name: Build
-        run: nix develop -c ninja -C build
+        run: nix develop -c meson compile -C build
 
-      # Full lit suite: dialect round-trips, conversions, importer,
-      # driver, differential end-to-end tests, and the c-testsuite
-      # ledger driver (test/CTestSuite/c-testsuite.c).
-      - name: Regression suite (check-emitrust)
-        run: nix develop -c ninja -C build check-emitrust
+      # Full lit suite, both tiers: dialect round-trips, conversions,
+      # importer, driver, differential end-to-end tests, and the
+      # c-testsuite ledger driver (test/CTestSuite/c-testsuite.c). This is
+      # the same suite the CMake `check-emitrust` target ran.
+      - name: Regression suite (lit, both tiers)
+        run: nix develop -c meson test -C build
 
       # Explicit conformance gate against the required-pass list.  Every
       # test named in test/CTestSuite/expected-pass.txt must transpile,
@@ -54,7 +53,7 @@ jobs:
       - name: c-testsuite required-pass ledger
         run: |
           nix develop -c python3 test/CTestSuite/run_c_testsuite.py \
-            --emitrust-cc build/bin/emitrust-cc \
+            --emitrust-cc build/tools/emitrust-cc \
             --suite third_party/c-testsuite \
             --manifest test/CTestSuite/expected-pass.txt \
             --known-miscompiles test/CTestSuite/known-miscompiles.txt \

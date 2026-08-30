@@ -428,10 +428,10 @@ rank = 40
 kind = "tooling"
 status = "open"
 size = "M"
-title = "Migrate the build from CMake to meson, or decide deliberately not to"
-summary = "Proposed 2026-08-29 by an agent, NOT requested and NOT acted on; recorded so the measurement survives. NEEDS AN OWNER DECISION -- architectural, not a loop item. Measured in a nix sandbox from a clean HEAD export: a meson derivation builds and installs all five tools under the same names, satisfying nix/corpus's only contract. Total change is TWO files -- install:true in tools/meson.build (meson installs nothing today, the only real gap) and flake.nix swapping cmake for meson plus llvm.dev. The argument cuts both ways and FR-163 is the evidence: CMake caught a link defect meson structurally cannot see, but that defect exists only because CMake demands hand-maintained per-component lists, so migrating deletes a hazard class rather than losing a safety net. What would genuinely be lost is the ability to build against a non-monolithic MLIR (meson.build globs libMLIR.so* and hard-errors if absent), which forecloses distro-package builds permanently. Deciding question: will this project ever build against a non-monolithic MLIR? If not, migrate and decide PDLL explicitly since it is CMake-only and default OFF. If unsure, keep CMake and wire the cheap component-scan guard into the fast tier instead."
+title = "Migrate the build from CMake to meson (owner decided; phase 1 landed, CMakeLists deletion pending)"
+summary = "OWNER DECIDED 2026-08-30: everything is meson forever. Phase 1 LANDED -- install:true on the five executables in tools/meson.build (meson installed nothing before), flake.nix swapping cmake for meson plus llvm.dev for llvm-config, CI switched to meson setup/compile/test with the c-testsuite ledger repointed at build/tools/emitrust-cc, and CLAUDE.md rewritten so the CMakeLists are explicitly non-canonical. VALIDATED: nix build .#emitrust through the meson derivation exits 0 and installs all five tools under the same names (nix/corpus contract holds, binary runs); full gate 944/944, zero failures. REMAINING: delete the 27 CMakeLists.txt after CI is green a few days; decide PDLL explicitly (EMITRUST_ENABLE_PDLL is CMake-only, default OFF, dies with them unless ported); sweep residual build/bin defaults in test/Fuzz, nix/explore, nix/clippy-eval (all env-overridable). Kept open until the deletion lands."
 blocked_by = []
-anchor = "FR-164 (proposed 2026-08-29 by an agent, NOT requested"
+anchor = "FR-164 (proposed 2026-08-29; OWNER DECIDED 2026-08-30"
 
 [[items]]
 id = "FR-165"

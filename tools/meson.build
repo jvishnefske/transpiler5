@@ -17,21 +17,24 @@ emitrust_opt = executable('emitrust-opt',
   link_with: [lib_convert_to_emitrust, lib_lower_containers,
               lib_lower_external_requirements, lib_actor_lift,
               lib_actor_thread],
-  dependencies: [llvm_dep, mlir_dep, tblgen_dep])
+  dependencies: [llvm_dep, mlir_dep, tblgen_dep],
+  install: true)
 
 emitrust_translate = executable('emitrust-translate',
   'emitrust-translate/emitrust-translate.cpp',
   include_directories: emitrust_inc,
   cpp_args: tool_link_args,
   link_with: [lib_target_rust],
-  dependencies: [llvm_dep, mlir_dep, tblgen_dep])
+  dependencies: [llvm_dep, mlir_dep, tblgen_dep],
+  install: true)
 
 emitrust_import_c = executable('emitrust-import-c',
   'emitrust-import-c/emitrust-import-c.cpp',
   include_directories: emitrust_inc,
   cpp_args: tool_link_args,
   link_with: [lib_importc],
-  dependencies: [llvm_dep, mlir_dep, clang_dep, tblgen_dep])
+  dependencies: [llvm_dep, mlir_dep, clang_dep, tblgen_dep],
+  install: true)
 
 emitrust_cc = executable('emitrust-cc',
   'emitrust-cc/emitrust-cc.cpp',
@@ -48,7 +51,8 @@ emitrust_cc = executable('emitrust-cc',
               lib_convert_to_emitrust, lib_lower_containers,
               lib_lower_external_requirements, lib_actor_lift,
               lib_actor_thread],
-  dependencies: [llvm_dep, mlir_dep, clang_dep, tblgen_dep])
+  dependencies: [llvm_dep, mlir_dep, clang_dep, tblgen_dep],
+  install: true)
 
 emitrust_clang = executable('emitrust-clang',
   'emitrust-clang/emitrust-clang.cpp',
@@ -56,7 +60,8 @@ emitrust_clang = executable('emitrust-clang',
   cpp_args: tool_link_args,
   link_with: [lib_project, lib_importc,
               lib_convert_to_emitrust, lib_lower_containers],
-  dependencies: [llvm_dep, mlir_dep, clang_dep, tblgen_dep])
+  dependencies: [llvm_dep, mlir_dep, clang_dep, tblgen_dep],
+  install: true)
 
 emitrust_tools = [emitrust_opt, emitrust_translate, emitrust_import_c,
                   emitrust_cc, emitrust_clang]

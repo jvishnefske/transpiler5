@@ -46,23 +46,23 @@
 
 ## Build
 
-- `nix develop -c ninja -C build` (tools land in `build/bin/`).
-- Meson (parallel build system; CMake stays canonical for CI):
-  `nix develop -c meson setup build-meson`, then
-  `nix develop -c meson compile -C build-meson` (tools land in
-  `build-meson/tools/`) and `nix develop -c meson test -C build-meson`
-  runs the same lit suite as check-emitrust. The suite is split into two
-  complementary meson suites: `meson test --suite fast` runs everything
-  except EndToEnd (~24% of the wall time — the inner-loop command;
-  `ninja check-emitrust-fast` is the CMake spelling), while plain
-  `meson test` runs both tiers and remains the pre-commit gate. Links the monolithic
-  libMLIR/libclang-cpp dylibs instead of static archives; the PDLL
-  showcase option is CMake-only. New tools/sources must be added to BOTH
-  the CMakeLists.txt and the meson.build files.
-- Adding a tool dir: `tools/<name>/CMakeLists.txt` + one line in
-  `tools/CMakeLists.txt`, then `nix develop -c cmake build` to reconfigure.
-- New lit-visible tools go in `test/lit.cfg.py` tools list AND
-  `test/CMakeLists.txt` EMITRUST_TEST_DEPENDS.
+- **Meson is the build system** (FR-164, owner decision 2026-08-30 —
+  "everything is meson forever"). `nix develop -c meson setup build`, then
+  `nix develop -c meson compile -C build` (tools land in `build/tools/`).
+  It links the monolithic libMLIR/libclang-cpp dylibs rather than
+  per-component static archives, so there are no component link lists to
+  keep in sync — the FR-163 class of defect cannot recur.
+- `nix develop -c meson test -C build` runs the full lit suite and is the
+  pre-commit gate. The suite is split into two complementary meson suites:
+  `meson test --suite fast` runs everything except EndToEnd (~24% of the
+  wall time — the inner-loop command), while plain `meson test` runs both
+  tiers.
+- The CMakeLists.txt files still exist but are NO LONGER CANONICAL and are
+  not built by CI; they are scheduled for deletion (FR-164). Do not add new
+  sources to them. The PDLL showcase (`EMITRUST_ENABLE_PDLL`) is CMake-only
+  and dies with them unless someone ports it.
+- Adding a tool dir: an `executable()` in `tools/meson.build`.
+- New lit-visible tools go in the `test/lit.cfg.py` tools list.
 
 ## Repo-specific rules
 

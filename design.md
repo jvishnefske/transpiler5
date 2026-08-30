@@ -10152,11 +10152,31 @@ piece and becomes FR-45.
   LLVM-exception, which is compatible with AGPL-3.0 for a combined work.
   **NEEDS AN OWNER DECISION.**
 
-- [ ] FR-164 (proposed 2026-08-29 by an agent, NOT requested and NOT acted on;
-  recorded so the measurement is not lost): MIGRATE THE BUILD FROM CMAKE TO
-  MESON, or decide deliberately not to.
-  NEEDS AN OWNER DECISION -- this is an architectural change, not a loop item,
-  and nothing here has been applied.
+- [ ] FR-164 (proposed 2026-08-29; OWNER DECIDED 2026-08-30 -- "everything is
+  meson forever"): MIGRATE THE BUILD FROM CMAKE TO MESON.
+  PHASE 1 LANDED 2026-08-30. The deciding question below was answered NO --
+  this project will not build against a non-monolithic MLIR -- so the migrate
+  branch is the live one. What landed, and what is measured:
+  * `install: true` on the five executables in `tools/meson.build` (meson
+    installed NOTHING before this; it was the only real gap), and `flake.nix`
+    swapping cmake for meson plus `llvmPackages.llvm.dev` for `llvm-config`.
+  * `.github/workflows/ci.yml` switched: `meson setup/compile/test -C build`
+    replaces cmake+ninja+check-emitrust, and the c-testsuite ledger step now
+    points at `build/tools/emitrust-cc` (the meson layout) instead of
+    `build/bin/`.
+  * CLAUDE.md's Build section rewritten: meson is canonical, the CMakeLists
+    are explicitly NOT and must not receive new sources.
+  * VALIDATED: `nix build .#emitrust` through the meson derivation exits 0 and
+    installs all five tools under the same names, so `nix/corpus`'s contract
+    (`${emitrust}/bin/emitrust-cc`) still holds and the binary runs; the full
+    gate is 944/944 (650 fast + 294 EndToEnd), zero failures.
+  REMAINING, deliberately not in this increment: delete the 27 CMakeLists.txt
+  once CI has been green for a few days; decide PDLL explicitly
+  (`EMITRUST_ENABLE_PDLL` is CMake-only and default OFF, so it dies with them
+  unless ported); sweep the residual `build/bin/` defaults in
+  `test/Fuzz/*`, `nix/explore/*`, `nix/clippy-eval/*` (all env-overridable,
+  none load-bearing).
+  THE ORIGINAL ANALYSIS, kept because the reasoning is the record:
   MEASURED, in a nix sandbox from a clean HEAD export (a genuine cold build):
   a meson-based derivation builds and installs all FIVE tools under the SAME
   names, so `nix/corpus`'s only contract (`${emitrust}/bin/emitrust-cc` and
