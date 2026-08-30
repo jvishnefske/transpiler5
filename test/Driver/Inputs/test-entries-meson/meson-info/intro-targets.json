@@ -1,0 +1,14 @@
+[
+  {
+    "name": "test-alpha",
+    "type": "executable",
+    "filename": ["/fixture/build/test-alpha"],
+    "target_sources": [{"language": "c", "sources": ["/fixture/src/test-alpha.c"]}]
+  },
+  {
+    "name": "test-multi",
+    "type": "executable",
+    "filename": ["/fixture/build/test-multi"],
+    "target_sources": [{"language": "c", "sources": ["/fixture/src/test-multi.c", "/fixture/src/helper.c"]}]
+  }
+]

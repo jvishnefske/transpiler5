@@ -1,0 +1,67 @@
+[
+  {
+    "name": "test-alpha",
+    "cmd": ["/fixture/build/test-alpha"],
+    "protocol": "exitcode",
+    "suite": ["proj"],
+    "timeout": 30,
+    "workdir": null,
+    "is_parallel": true,
+    "priority": 0,
+    "env": {},
+    "depends": [],
+    "extra_paths": []
+  },
+  {
+    "name": "test-multi",
+    "cmd": ["/fixture/build/test-multi"],
+    "protocol": "exitcode",
+    "suite": ["proj"],
+    "timeout": 30,
+    "workdir": null,
+    "is_parallel": true,
+    "priority": 0,
+    "env": {},
+    "depends": [],
+    "extra_paths": []
+  },
+  {
+    "name": "test-with-args",
+    "cmd": ["/fixture/build/test-alpha", "--seed", "7"],
+    "protocol": "exitcode",
+    "suite": ["proj"],
+    "timeout": 30,
+    "workdir": null,
+    "is_parallel": true,
+    "priority": 0,
+    "env": {},
+    "depends": [],
+    "extra_paths": []
+  },
+  {
+    "name": "script-test",
+    "cmd": ["/fixture/src/check.py", "run"],
+    "protocol": "exitcode",
+    "suite": ["proj"],
+    "timeout": 30,
+    "workdir": null,
+    "is_parallel": true,
+    "priority": 0,
+    "env": {},
+    "depends": [],
+    "extra_paths": []
+  },
+  {
+    "name": "tap-test",
+    "cmd": ["/fixture/build/test-alpha"],
+    "protocol": "tap",
+    "suite": ["proj"],
+    "timeout": 30,
+    "workdir": null,
+    "is_parallel": true,
+    "priority": 0,
+    "env": {},
+    "depends": [],
+    "extra_paths": []
+  }
+]
