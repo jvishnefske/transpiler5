@@ -9911,6 +9911,13 @@ piece and becomes FR-45.
   recovery ledger, not link failures. That is the first whole-program link of a
   real ~500-TU C program in this project, reached this session through FR-151,
   FR-152 and FR-156, with the single FR-154 unit excluded.
+  QUALIFY THAT CLAIM, measured immediately after: the merged crate EMITS but
+  does NOT BUILD. `cargo build --release --offline` over the 262,168-line
+  `src/lib.rs` exits 101 with 6542 errors -- 6538 E0308 and 3 E0596. So the
+  link step is fixed and the whole-program path is now REACHABLE, but the
+  artifact at the end of it is exit-0-unbuildable, which this project counts
+  as a defect class (FR-145), not as success. The 6538 are ONE mechanism,
+  filed as FR-157/FR-158.
   Gate 902/902, zero golden churn. Byte-diff oracle: an EndToEnd test links
   the same shards in BOTH orders, builds both, and diffs each against the
   clang-linked native at two argc values that dispatch different table
@@ -9922,6 +9929,59 @@ piece and becomes FR-45.
   OUTCOME, not the algorithm; it would not today catch a regression to
   substring matching. The whole-identifier scanner is kept because it is the
   correct invariant and the guard for multi-entry `ordinalMap` shapes.
+
+- [ ] FR-157 DEFECT (found by building the FR-156 whole-program link
+  2026-08-29): THE MERGE RESOLVES AN FR-52 EXTERNAL OBLIGATION BY NAME ALONE,
+  never comparing the declaration's SIGNATURE against the definition's, so a
+  cross-shard pointer-model divergence becomes an exit-0-unbuildable crate
+  instead of a located diagnostic.
+  `mergeShards` step 2 (`tools/emitrust-cc/LinkMerge.cpp`) is literally
+      for (auto [name, op] : obligations) {
+        if (definitions.contains(name)) { toErase.push_back(op); continue; }
+        return op->emitError() << "unresolved external '" << name << "' at link";
+      }
+  -- the declaration is erased on a NAME hit with no type check. Measured on
+  the same C function, `void log_assert_failed(const char *, const char *,
+  int, const char *)`:
+      caller shard  (alloc-util):  emitrust.func private @log_assert_failed(
+                                     !emitrust.mut_ref<i8>, ...)
+      defining shard (assert-util): emitrust.func @log_assert_failed(
+                                     !emitrust.mut_ref<!emitrust.slice<i8>>, ...)
+  `&mut i8` versus `&mut [i8]`. rustc then reports
+  `expected '&mut [i8]', found '&mut i8'` at every call site: 2827 for this one
+  function, and 6538 E0308 in total over ~40 functions
+  (`path_is_valid_full` 170, `safe_atou16_full` 122, `path_is_root_at` 122,
+  `read_boolean_file_at` 90, `filename_is_valid` 89, ...). That is 99.9% of
+  every error in the merged crate.
+  This entry is the SMALL, obviously-correct half: per the repo's own rule
+  that a deferred item reaching emission unresolved must fail LOUDLY, the
+  merge must compare the obligation's recorded signature with the definition's
+  and emit a located diagnostic naming both shards and both types on a
+  mismatch. It converts 6538 rustc errors into one link error. It makes the
+  systemd link FAIL again -- honestly, rather than emitting an artifact that
+  cannot build.
+  **NOT SPIKED.**
+
+- [ ] FR-158 (found by building the FR-156 whole-program link 2026-08-29):
+  RECONCILE THE CROSS-SHARD POINTER MODEL so the whole-program crate actually
+  builds. This is the real prize behind FR-157 and it is large.
+  HYPOTHESIS, explicitly untested: a function's DEFINITION has a body, so the
+  importer can see the parameter indexed or walked and picks the slice model;
+  a bare header PROTOTYPE has no body evidence and defaults to the
+  single-object cursor `mut_ref<i8>`. If that is right, the divergence is
+  systematic and predictable from declaration-vs-definition alone, not from
+  anything about the individual function -- which would make it fixable by
+  giving the declaration path the same model the definition path will choose,
+  or by deferring the model choice for a declaration-only function until link.
+  MEASURE IT FIRST. It is the entry's own guess and this session's record on
+  such guesses is poor.
+  Worth knowing before starting: the per-UNIT crates do not show this at all
+  (1427/1585 built before this session's fixes), because within one unit the
+  callee is an FR-52 obligation carrying the CALLER's inferred signature, so
+  caller and callee agree by construction. The defect exists only where two
+  independently-imported units meet, which is why nothing before the
+  whole-program link could see it.
+  **NOT SPIKED.**
 
 - [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28): 35 crates fail
   `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`
