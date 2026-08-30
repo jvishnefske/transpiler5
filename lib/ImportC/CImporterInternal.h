@@ -3842,6 +3842,30 @@ private:
   LogicalResult bindOrdinaryParam(const clang::ParmVarDecl *param,
                                   Value blockArg, Location paramLoc);
 
+  /// FR-153: does a planned `T **` cursor parameter's REGION have to be
+  /// borrowed MUTABLY, rather than as the historical shared slice?
+  ///
+  /// The two-input cursor lowering hands the callee a view of the
+  /// caller's region plus an in-out cursor. That view used to be
+  /// unconditionally shared, which broke every body that forwards `*p`
+  /// on to a parameter mapping to a mutable borrow: the body reborrowed
+  /// the shared base mutably and the emitted crate died with
+  /// `error[E0596]`. Making every cursor region mutable instead would
+  /// price in two fresh hazards (two cursors over one region become
+  /// E0499, and a literal-backed region becomes E0596 at the caller) for
+  /// regions nothing writes, so the mutability is DEMAND-DRIVEN.
+  ///
+  /// The only admitted demand is forwarding `*p` directly to a callee
+  /// parameter that maps to a mutable borrow. Writes THROUGH the cursor
+  /// are already a located rejection in planning
+  /// (`planCursorParamsFor`), so they need no handling here.
+  /// Deliberately NOT admitted: a demand reached through a local copy
+  /// (`q = *p; g(q);`) — unobserved across the corpora, and missing a
+  /// demand is the SAFE direction, since it leaves the historical shared
+  /// base and its rustc E0596 rather than any silent behavior change.
+  bool cursorRegionNeedsMutBorrow(const clang::Stmt *stmt,
+                                  const clang::ParmVarDecl *param);
+
   /// Maps a planned `T **` cursor parameter's element run to its slice
   /// type `!emitrust.slice<T'>` (C99-43 slice 1: T' = mapType(T), i8 for
   /// the historical char** string cursor). An element type the slice

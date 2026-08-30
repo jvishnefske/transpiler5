@@ -5034,6 +5034,32 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
   };
   SmallVector<StagedCursor, 2> stagedCursors;
   IntegerType i64Type = builder.getIntegerType(64);
+  // FR-153 fence R2: two cursor arguments in ONE call that walk the SAME
+  // region cannot both hand out a mutable region view — that is rustc
+  // E0499 in the emitted crate, discovered only after cargo runs. The
+  // region key is the cursor local's proven root: the caller's `VarDecl`
+  // base for an ordinary region, the backing PLACE for a literal-rooted
+  // one (which has no base at all). Rejection is a feature: this is a
+  // located diagnostic at the call instead of a crate that does not
+  // compile, and it can never silently emit wrong code.
+  for (unsigned i = 0, e = cursorArgs.size(); i != e; ++i) {
+    if (!llvm::isa<emitrust::MutRefType>(
+            targetType.getInput(slots[cursorArgs[i].index])))
+      continue;
+    const PointerLocalInfo &left =
+        pointerLocals.find(cursorArgs[i].pointer)->second;
+    for (unsigned j = 0; j != e; ++j) {
+      if (i == j)
+        continue;
+      const PointerLocalInfo &right =
+          pointerLocals.find(cursorArgs[j].pointer)->second;
+      if ((left.base && left.base == right.base) ||
+          (left.literalBacking && left.literalBacking == right.literalBacking))
+        return emitError(loc)
+               << "unsupported: two cursor arguments walk the same region "
+                  "and the callee needs a mutable region borrow";
+    }
+  }
   for (const PendingCursor &cursorArg : cursorArgs) {
     const PointerLocalInfo &info =
         pointerLocals.find(cursorArg.pointer)->second;
@@ -5042,7 +5068,27 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
       return emitError(loc)
              << "unsupported: a cursor argument must walk a single "
                 "whole region";
+    bool wantMutBase = llvm::isa<emitrust::MutRefType>(
+        targetType.getInput(slots[cursorArg.index]));
     Value basePlace = info.literalBacking;
+    // FR-153 fence R1: a MUTABLE region view over a string literal's
+    // read-only backing rematerializes a FRESH non-const backing, exactly
+    // as the ordinary mutable-slice-argument path already does (see
+    // `emitBorrowArgument`'s `literalBacking` branch). Writing through a
+    // pointer to a string literal is undefined behavior, so the per-call
+    // copy is unobservable to any defined program.
+    if (basePlace && wantMutBase) {
+      auto sourceVar = basePlace.getDefiningOp<emitrust::VariableOp>();
+      if (!sourceVar)
+        return emitError(loc)
+               << "unsupported: string-literal cursor argument to a mutable "
+                  "region parameter has no backing to copy";
+      basePlace = builder
+                      .create<emitrust::VariableOp>(loc, basePlace.getType(),
+                                                    sourceVar.getInitAttr(),
+                                                    /*isConst=*/false)
+                      .getResult();
+    }
     if (!basePlace) {
       auto it = symbols.find(info.base);
       if (it == symbols.end())
@@ -5066,20 +5112,23 @@ FailureOr<Value> CImporter::emitCursorParamCall(const clang::CallExpr *call,
     // (i8 for the historical char** byte cursor; the literal-backing
     // path stays byte-only by construction — a literal region is i8).
     unsigned slotIndex = slots[cursorArg.index];
+    Type calleeBase = targetType.getInput(slotIndex);
     auto calleeSlice = llvm::cast<emitrust::SliceType>(
-        llvm::cast<emitrust::RefType>(targetType.getInput(slotIndex))
-            .getPointee());
+        llvm::isa<emitrust::MutRefType>(calleeBase)
+            ? llvm::cast<emitrust::MutRefType>(calleeBase).getPointee()
+            : llvm::cast<emitrust::RefType>(calleeBase).getPointee());
     if (elementType != calleeSlice.getElementType())
       return emitError(loc) << "unsupported: a cursor argument must walk "
                                "a region of the parameter's element type";
-    // Shared whole-region slice: the callee only reads bytes; the cursor
-    // travels separately, so the slice starts at element zero and both
-    // sides speak absolute positions.
+    // Whole-region slice: the cursor travels separately, so the slice
+    // starts at element zero and both sides speak absolute positions.
+    // FR-153: the view's mutability FOLLOWS THE CALLEE'S SLOT — never a
+    // local choice — so the caller and the callee's own reborrows agree.
     Value zero = createIntConstant(loc, i64Type, 0);
     arguments[slotIndex] =
         builder
-            .create<emitrust::SliceOfOp>(loc, targetType.getInput(slotIndex),
-                                         basePlace, zero, /*is_mut=*/false)
+            .create<emitrust::SliceOfOp>(loc, calleeBase, basePlace, zero,
+                                         /*is_mut=*/wantMutBase)
             .getResult();
     // The in-out cursor stages through a temp the callee writes; the
     // caller's cursor cell takes the advanced value back after the call.

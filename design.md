@@ -10364,7 +10364,7 @@ piece and becomes FR-45.
   **PHASE 1 LANDED. FR-153 is now the only thing between this project and a
   whole-program systemd crate that compiles.**
 
-- [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28; ROOT CAUSE FOUND
+- [x] FR-153 PHASE 1 LANDED 2026-08-30 (found by the systemd probe 2026-08-28; ROOT CAUSE FOUND
   and MERGED WITH FR-158 PHASE 4 by the FR-161 spike 2026-08-29): 35 crates
   fail `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`
   (src/core/manager, src/coredump/coredumpctl-journal, …). Exit-0 unbuildable,
@@ -10392,6 +10392,72 @@ piece and becomes FR-45.
   THIS IS WHAT MAKES THE WHOLE-PROGRAM CRATE BUILD. After FR-161 Phase 1 the
   501-object systemd crate has SEVEN rustc errors and all seven are this.
   Rank it immediately after FR-161 Phase 1.
+
+  PHASE 1 LANDED 2026-08-30, and it does. **THE 501-OBJECT `systemd-detect-virt`
+  WHOLE-PROGRAM CRATE NOW COMPILES**: `cargo build --release --offline` exits
+  0 with ZERO errors, producing a 23,431,416-byte `librlib` from 265,920 lines
+  of emitted Rust. Verified independently by regenerating all 501 shards with
+  the patched importer -- `--link` reads pre-built sidecars and does NOT re-run
+  the importer, so an importer patch measures byte-identical against a stale
+  shard directory. Gate 917/917 (912 + 5 new tests), ZERO golden churn.
+
+  NEITHER DIRECTION I PROPOSED WAS RIGHT. A third was measured and ships.
+  * (A) unconditional `RefType` -> `MutRefType`: fixes systemd 7->0 and 35/35
+    units with no regressions and one golden -- but hands `&mut` to all 888
+    cursor regions to buy what 816 need, with no proof attached. Two probes
+    price it: two cursor parameters over one region emit two simultaneously
+    live `&mut buf[0..]` (E0499), and a string-literal backing local gives
+    E0596.
+  * (B) honour const on slice parameters: NO-GO on three measured counts. It
+    fixes AT MOST 2 OF THE 7 -- five are struct-element cleanup handlers over
+    genuinely non-const callees (`sd_journal_close`, `sd_bus_creds_unref`,
+    `sd_netlink_message_unref`), which const fidelity cannot reach by
+    construction. B1 alone is a NET REGRESSION: 64 of 357 previously-clean
+    systemd units break. And it collides fatally with FR-158 --
+    `sliceRefinedSlots` requires `MutRefType` on BOTH sides, so the link
+    fails with 3458 errors across 114 symbols, minimally reproduced by the
+    in-tree `EndToEnd/link-slice-order-e2e.c`. Note the cost is NOT where I
+    guessed: golden churn is 11 tests, small; the expense is the link.
+  * (C) DEMAND-DRIVEN, which ships: the cursor region borrows mutably IFF the
+    callee's own body demands it -- the only admitted demand being `*p`
+    passed onward to a slot that maps to `MutRefType`. Writes through the
+    cursor are already a located rejection. MISSING A DEMAND IS THE SAFE
+    DIRECTION: it leaves today's behaviour and today's E0596, never a
+    miscompile. 816 signatures widen and ZERO body or call-site lines change
+    in the 12.27 MB crate.
+
+  TWO FENCES COMPLETE IT.
+  * R1 -- a string-literal backing rematerializes a fresh non-const
+    `VariableOp`, byte-for-byte the pattern that already existed for ordinary
+    mutable slice arguments at `ImportCExpressions.cpp:6149-6174`; the
+    cursor-argument path simply never got it.
+  * R2 -- two cursor arguments over one region with a mutating callee is a
+    LOCATED rejection ("two cursor arguments walk the same region and the
+    callee needs a mutable region borrow"), replacing a silent downstream
+    E0499/E0596. Zero false positives across 749 units.
+
+  MY FRAMING OF THE ALIASING CASE WAS WRONG: two `&mut` is E0499, a COMPILE
+  ERROR, not UB -- safe Rust cannot alias `&mut`. So it argues against (A) by
+  cost, not soundness, and it was not even the decisive reason; the
+  string-literal backing is a second, independent, and fixable one.
+
+  DELIBERATE OVER-REJECTION, recorded: R2 also refuses two cursors over one
+  string literal, which R1 could in principle admit (each argument would get
+  its own copy, unobservable since writing through a literal pointer is UB).
+  Kept because the zero-false-positive measurement was taken against that
+  predicate and the extra rejection is the safe direction.
+  COVERAGE LIMIT, recorded: across 1427 clean units, 911 DEFINE a
+  cursor-parameter function and ZERO CALL one, so the caller-side work (R1,
+  R2, the `is_mut` propagation) is INVISIBLE to the systemd oracle. All
+  caller evidence comes from the lit tests and hand-built probes. A green
+  whole-program build must not be read as covering it.
+  DEFERRED with a comment at the decision site: whether the demand scan should
+  follow a region through a local copy (`q = *p; g(q);`). Not hit in 749 units
+  or 917 lit tests; missing it leaves today's E0596.
+  **PHASE 1 LANDED. Phase 2 (B2 + extending `sliceRefinedSlots` to classify
+  `mut_ref<T> -> ref<slice<T>>` with a `from_ref` twin of FR-161's fenced
+  `from_mut`, both in ONE increment or the link fails 3461 ways) remains
+  optional -- it buys const fidelity, not a build.**
   **NOT SPIKED.**
 
 - [x] FR-154 DEFECT (found by the FR-151 spike 2026-08-29; DISSOLVED by
