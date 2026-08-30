@@ -10520,10 +10520,47 @@ piece and becomes FR-45.
     6. the meson adapter over a configured project emits only symbols that
        exist in the emitted crates (round-trip on this repo's own corpus, NOT
        on systemd -- systemd is the demand signal, not the test fixture).
-  **NOT SPIKED.** Spike questions, in order: does a `#[cfg(test)] mod` survive
-  the emitted crate's `[lints.rust] deny` block; is `cargo test` on an emitted
-  crate green today (baseline measured: yes, 0 tests, exit 0); and on a merged
-  `--link` crate, is `Externals` actually gone so a test body is callable.
+  SPIKED GO 2026-08-29, all three questions answered by measurement on a
+  two-TU fixture (`lib.c` defining `hexchar`/`decchar`, `test.c` calling them):
+    Q1 does a `#[cfg(test)] mod` survive the emitted crate's `[lints.rust]`
+       deny block? YES -- hand-appended to a real emitted crate WITH the deny
+       table present, `cargo test` reported `2 passed; 1 failed; 1 ignored`,
+       the failure being the fixture's deliberate nonzero return.
+    Q2 is `cargo test` on an emitted crate green today? YES, 0 tests, exit 0 --
+       so the harness is reachable and simply has nothing to run.
+    Q3 after `--link`, is `Externals` gone? YES, and completely: the merged
+       crate has no trait at all and `test_decchar` is a plain
+       `pub fn test_decchar() -> i32`.
+  THE SPIKE ALSO FOUND WHAT THE PLAN HAD MISSED, which is why it was run: the
+  FR-62 ACTOR LIFT MOVES A TEST BODY THAT TOUCHES A FILE-LOCAL GLOBAL INTO AN
+  IMPL BLOCK. `test.c`'s `test_hexchar`, whose only failure signal is a
+  `static int failures` counter, merged as
+  `impl Tu1FailuresActor { pub fn test_hexchar(&mut self) }` -- not a free
+  function, and its counter is a PRIVATE field, so even calling it observes
+  nothing. Two consequences, both now policy: an entry point is not always a
+  free function, and a void test body's C-level assertion can be
+  unobservable. The void shape is still wrapped, but on the honest ground that
+  a transpiled body's failure mode is a PANIC (a bounds check, a null function
+  pointer, an `unimplemented!`) -- a weaker oracle than the integer shape, not
+  a vacuous one.
+  **PHASE A LANDED 2026-08-29** (`--test-entry`, `--test-entries`,
+  `renderTestModule` in CrateEmitter, `test/Driver/test-entry.c`). Measured on
+  the fixture: an integer entry becomes `assert_eq!(sym(), 0)` and a nonzero
+  return FAILS the test; a void entry is run for its panics; a recovered stub
+  is `#[ignore = "unsupported: call to 'strcasecmp' ..."]` and reported
+  `ignored`, never `passed`; an entry taking arguments, one generic over
+  `Externals`, and one absent from the module are each skipped with a located
+  warning; and a symbol from a `--test-entries` FILE that this unit does not
+  define is skipped SILENTLY, because a whole-project file is applied one
+  translation unit at a time. Byte-identity is pinned by diffing the flagged
+  crate root's first N lines against the unflagged one.
+  ONE MEASURED GAP in the skip diagnostics: an actor-lifted arm reports "no
+  function of that name in this crate" rather than the impl-block reason --
+  the lift removes the free function, so the `emitrust.method_of` branch never
+  sees it. Honest but less useful than it should be.
+  PHASE C REMAINS (recognise the section-table registration and synthesise the
+  entry list with no build system in the loop), as does applying the flag on
+  the `--partition` workspace path, which today ignores it.
 
 - [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
   the same day): A DEAD `goto` SILENTLY CHANGED A FUNCTION'S ANSWER. A
