@@ -11797,34 +11797,72 @@ piece and becomes FR-45.
   dep-less lib member and the BIN member -- and the clang-built native runner
   agrees exactly, failure included.
 
-- [ ] FR-160b DEFECT (found by the FR-160 `--partition` spike 2026-08-29):
-  FOUR SILENT REQUEST-IGNORE SURFACES IN LANDED FR-160 CODE. Each one takes a
-  request and produces neither the thing asked for nor a word about it, which
-  is precisely what FR-160 exists to forbid.
-  1. **THE ENTRY MUST BE SPELLED IN EMITTED FORM AND NOTHING SAYS SO.**
-     `--test-entry=camelCaseTest` warns "no function of that name in this
-     crate" while the emitter writes `pub fn camel_case_test()` (FR-53's
-     idiomatic rename); `--test-entry=camel_case_test` wraps. Under
-     `--test-entries=<FILE>` the file's silent-skip rule then SUPPRESSES the
-     warning, so a registry of C names -- the motivating systemd path --
-     yields silently ZERO coverage for every non-snake_case symbol. Likely
-     fix: resolve an entry through the same `cFunctionSymbolName` mapping
-     Phase C already uses, or fall back to it before reporting absence.
-  2. `renderTestModule`'s `kMethodOfAttrName` arm (CrateEmitter.cpp:428) is
-     DEAD CODE: `FuncToEmitRust.cpp:212` excludes `emitrust.method_of` when
-     copying attributes and `:194-197` nests the func inside the
-     `emitrust.impl`'s own symbol table, so an actor-lifted arm is reported
-     "no function of that name" while the crate plainly contains
-     `impl Tu0HelperCountActor { fn test_alpha(&mut self) -> i32 }`. This is
-     the gap recorded at Phase A landing, now root-caused.
-  3. The `fn.isExternal()` arm (CrateEmitter.cpp:426) is likewise unreachable
-     for ordinary C externs: a referenced extern becomes an `Externals` trait
-     member, not a module-level func.
-  4. `--emit=ratchet` and `--emit=rejection-report` return from
-     `emitLinkArtifactQuery` (emitrust-cc.cpp:2871-2873) BEFORE the partition
-     dispatch, so a test-entry request on those paths exits 0 with no crate
-     root and no diagnostic.
-  **NOT SPIKED** as a fix; the defects themselves are measured above.
+- [x] FR-161 DEFECT (found by the FR-160 `--partition` spike 2026-08-29;
+  SPIKED AND FIXED 2026-08-30): SILENT REQUEST-IGNORE SURFACES IN LANDED
+  FR-160 CODE. Each took a request and produced neither the thing asked for
+  nor a word about it, which is precisely what FR-160 exists to forbid.
+  **THE SPIKE NO-GO'd THREE OF THE FOUR OBVIOUS FIXES, WITH COUNTEREXAMPLES,
+  AND THAT IS THE ENTRY'S REAL CONTENT.** Every one of them would have turned
+  a silent skip into a WRONG WRAP, and in a differential oracle a wrong wrap
+  is a false RED or a false GREEN -- strictly worse than the silence it
+  replaces.
+    C1 NO SNAKE-CASE ALIAS WRAP. `hA.c` defining `int foo_bar(void)` and
+       `hB.c` defining `int fooBar(void)` BOTH emit `pub fn foo_bar()` when
+       compiled solo. A whole-project registry naming `fooBar`, applied
+       per-TU -- FR-160's actual mode -- would alias-resolve against hA and
+       wrap the WRONG function. Injectivity holds only per-crate: within one
+       TU the collision is caught (`ImportCFunctions.cpp:511`) and at link it
+       is `duplicate definition ... at link`, and NEITHER guard covers the
+       per-TU application of a project-wide file.
+    C2 NO TU-TAG ALIAS WRAP. A `static` function emits `tu0_test_foo` even
+       solo; under `--link` two TUs each with `static test_foo` emit
+       `tu0_test_foo` AND `tu1_test_foo`, so a bare `test_foo` request is
+       genuinely ambiguous and picking one is unsound.
+    C3 NO ACTOR-ARM WRAP. The lifted struct derives `Default`, but the C
+       static initializer is applied ONLY inside `c_main`. Measured:
+       `static int counter = 5; int test_beta(void){counter++; return
+       counter-6;}` exits 0 natively, and a `Default::default()` wrap FAILS
+       `left: -5, right: 0`. No reachable constructor carries the C
+       initializers, so the wrap is a false RED and its mirror a false GREEN.
+    C4 THE `main` -> `c_main` ALIAS IS PROVABLY SOUND, and is the one wrap
+       that landed. `c_main` is RESERVED: a C file defining both is rejected
+       (`ImportCFunctions.cpp:394`), with and without `--preserve-c-names`,
+       so the mapping is injective on every path. It must NOT be gated on
+       `idiomaticRenameEnabled()` -- the rename is unconditional
+       (CSymbolNaming.h:719-721).
+  WHAT LANDED, therefore: a NEAR-MISS HINT rather than an alias. A missing
+  entry now says `did you mean 'camel_case_test'?` (or `'tu0_test_static'`)
+  and states WHY the rename is not reversed automatically, the hint LIFTS the
+  `--test-entries` file's silent-skip suppression so a registry of C names can
+  no longer yield silently zero coverage, and `main` wraps as
+  `assert_eq!(super::c_main(), 0)`. That last one is the motivating systemd
+  path: `scripts/test-entries-meson.py` in default mode writes exactly `main`.
+  DEFECTS 2 AND 3 WERE DEAD CODE FOR A REASON WORTH RECORDING, and are now
+  reachable with reasons that are TRUE. `emitrust.impl` carries the
+  `SymbolTable` trait and is a direct child of the ModuleOp, so the
+  module-level lookup this file was built on structurally cannot see an arm
+  the FR-62 actor lift nested inside one -- and `FuncToEmitRust.cpp:212` also
+  STRIPS the `emitrust.method_of` attribute the old arm tested, so the
+  predicate was false on the one shape it was written for. One
+  `getOps<ImplOp>()` loop fixes it; the nesting is exactly one level by
+  construction. The `isExternal()` arm was unreachable BY CONSTRUCTION, proven
+  by pushing hand-written dialect IR straight through `emitrust-translate`: a
+  module-level body-less `emitrust.func` is refused by the RENDERER
+  (`TranslateToRust.cpp:4801`), and `appendTestModule` appends to
+  already-rendered text, so such a module can never reach `renderTestModule`.
+  A referenced extern becomes an `Externals` trait member instead, which is
+  now what the diagnostic says.
+  **DEFECT 4 WAS NOT A DEFECT -- THIS ENTRY WAS WRONG WHEN FILED.** The
+  `--emit=ratchet` / `--emit=rejection-report` silent-ignore had ALREADY been
+  closed by the `--partition` slice (16f5287): all four spellings exit 1 with
+  a diagnostic, and it is pinned at `test/Driver/test-entry-partition.c`'s
+  NOROOT prefix. Recorded rather than quietly dropped, because a stale defect
+  in the ledger costs the next reader the same measurement.
+  Full suite green: 913 tests, 0 failures. The new
+  `test/EndToEnd/test-entry-main.c` pair puts the `main` alias under the
+  BYTE-DIFF oracle including its RED half (a C main returning 1 makes the
+  wrapped test fail), so the one wrap that landed has correctness evidence
+  and not merely compile-clean evidence.
 
   REMAINING FOR FR-160: Phase B's adapter (`scripts/test-entries-meson.py`)
   has no round-trip test of its own -- acceptance criterion 6.

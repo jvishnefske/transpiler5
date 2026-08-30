@@ -883,10 +883,13 @@ static bool testEntriesRequested() {
 ///
 ///   T1 wrapped somewhere -- no warning at all.
 ///   T2 else, found in some module but unwrappable -- one warning, against
-///      THAT definition's own location. At most one module can match.
-///   T3 else, found nowhere -- silent when the symbol came from a
-///      `--test-entries` file (a whole-project registry names every unit's
-///      tests), otherwise ONE warning at `foldLoc`.
+///      THAT definition's own location. At most one module can define the
+///      symbol; FR-160b's rename HINT can in principle point at a candidate
+///      in more than one member, and the first in report order wins, so the
+///      output is still exactly one warning.
+///   T3 else, nothing in any module bears on the request -- silent when the
+///      symbol came from a `--test-entries` file (a whole-project registry
+///      names every unit's tests), otherwise ONE warning at `foldLoc`.
 ///
 /// \param foldLoc where a found-nowhere symbol is reported. Under
 ///        `--partition` this must be the MERGED module's location: a member
@@ -930,6 +933,13 @@ reportTestEntries(mlir::Location foldLoc,
       continue;
     // A whole-project entries file names every unit's tests; only the ones
     // the caller asked for by hand are worth a diagnostic when absent.
+    //
+    // FR-160b: this suppression is reached ONLY when no module had anything to
+    // say about the symbol (a located report takes the branch above). That is
+    // the fix for the worst of the silent request-ignores: a registry written
+    // in C spellings -- which is what scripts/test-entries-meson.py's default
+    // mode produces -- used to yield zero coverage and zero words for every
+    // renamed symbol, because the file source suppressed even the warning.
     if (fromFile.contains(entry))
       continue;
     mlir::emitWarning(foldLoc) << "FR-160: no test emitted for '" << entry

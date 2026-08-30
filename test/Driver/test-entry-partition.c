@@ -127,6 +127,13 @@
 // RUN: not emitrust-cc --emit=mlir %S/Inputs/test-entry-partition/liba/a.c \
 // RUN:   -o %t.mlir --test-entries=%t.entries 2>&1 \
 // RUN:   | FileCheck %s --check-prefix=NOROOT
+// The third artifact query that returns before any crate root exists. It is
+// named alongside --emit=ratchet in the guard's own comment and was pinned by
+// no RUN line until FR-160b. (It takes no --partition: that flag is itself
+// restricted to --emit=crate, so the two guards never meet.)
+// RUN: not emitrust-cc --link %t.a.o %t.b.o %t.main.o -o %t.rejrep \
+// RUN:   --crate-name papp --emit=rejection-report \
+// RUN:   --test-entry=test_alpha 2>&1 | FileCheck %s --check-prefix=NOROOT
 // NOROOT: error: --test-entry/--test-entries is only valid with --emit=crate or --emit=rust: no other emission renders a crate root for the generated tests to be appended to
 //
 // (8) byte identity, per member and per manifest. The requested run's crate
