@@ -434,6 +434,17 @@ blocked_by = []
 anchor = "FR-164 (proposed 2026-08-29 by an agent, NOT requested"
 
 [[items]]
+id = "FR-165"
+rank = 12
+kind = "feature"
+status = "open"
+size = "L"
+title = "Rank the 16,538 whole-program stubs by root cause, not raw frequency"
+summary = "Opened 2026-08-30 from the first whole-program stub census, newly possible now that the 501-object systemd crate compiles. Of 34,418 top-level functions, 16,538 (48.1 percent) contain an unimplemented! stub and 17,880 have real bodies -- so the whole-program path is end-to-end traversable but the artifact is not a working systemd. Census: call to unimported function 5265, declaration inside a function body 2898, null pointer constant 1700, pointer expression CallExpr 1174, array parameter 666, pointer comparison across objects 642, system-header call 509, pointer assigned non-address 455, pointer param outside direct deref 370, address of pointer variable 329, pointer struct member 273, variadic call 196, ArrayToPointerDecay 188. The top entry is almost certainly a CASCADE -- the callee was stubbed for another reason -- so 5265 is transitive, not 5265 defects, and one deep leaf may collapse thousands. A stub count is not a defect count; this project has twice misread first-failure rejections as per-clause yields (FR-61f, 7x and 4.4x). Build the callee-caller graph and rank by root cause with transitive closure. NOT SPIKED."
+blocked_by = []
+anchor = "FR-165 (opened 2026-08-30 from the first whole-program stub census)"
+
+[[items]]
 id = "FR-138"
 rank = 14
 kind = "tooling"

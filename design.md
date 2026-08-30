@@ -10396,7 +10396,17 @@ piece and becomes FR-45.
   PHASE 1 LANDED 2026-08-30, and it does. **THE 501-OBJECT `systemd-detect-virt`
   WHOLE-PROGRAM CRATE NOW COMPILES**: `cargo build --release --offline` exits
   0 with ZERO errors, producing a 23,431,416-byte `librlib` from 265,920 lines
-  of emitted Rust. Verified independently by regenerating all 501 shards with
+  of emitted Rust.
+
+  QUALIFY THAT IMMEDIATELY, because "it compiles" is weaker than it sounds and
+  I first reported it without this. Of the crate's 34,418 top-level functions,
+  **16,538 (48.1%) contain an `unimplemented!` stub** and would panic if
+  called; **17,880 (51.9%) have real bodies**. Zero `todo!` and zero bare
+  `panic!`. So the whole-program path is now END-TO-END TRAVERSABLE -- import,
+  merge, link, rustc -- on a real 501-TU program, which is what was actually
+  achieved. It is NOT a working systemd, and compiling is not behavioural
+  equivalence. The stubs are the FR-52 marker contract doing its job: loud,
+  located, never a silent wrong answer. Verified independently by regenerating all 501 shards with
   the patched importer -- `--link` reads pre-built sidecars and does NOT re-run
   the importer, so an importer patch measures byte-identical against a stale
   shard directory. Gate 917/917 (912 + 5 new tests), ZERO golden churn.
@@ -10458,6 +10468,38 @@ piece and becomes FR-45.
   `mut_ref<T> -> ref<slice<T>>` with a `from_ref` twin of FR-161's fenced
   `from_mut`, both in ONE increment or the link fails 3461 ways) remains
   optional -- it buys const fidelity, not a build.**
+
+- [ ] FR-165 (opened 2026-08-30 from the first whole-program stub census):
+  THE 16,538 STUBS ARE NOW THE RANKING SIGNAL for what to fix next, and this
+  is the first time the project can measure them over a WHOLE PROGRAM rather
+  than per unit. Census over the 501-object systemd crate, reasons normalised
+  by replacing quoted names with 'X':
+      5265  call to unimported function 'X'
+      2898  declaration inside a function body
+      1700  null pointer constant in a pointer expression
+      1174  pointer expression: CallExpr
+       666  array parameter
+       642  comparison of pointers into different objects
+       509  call to 'X' declared in a system header
+       455  pointer assigned a non-address value
+       370  pointer parameter used outside a direct dereference
+       329  taking the address of a pointer variable
+       273  pointer struct member 'X' outside the static-binding model
+       196  call to a variadic function
+       188  pointer cast (ArrayToPointerDecay)
+  READ THE TOP TWO CAREFULLY BEFORE RANKING -- neither is obviously what it
+  says. "call to unimported function" is almost certainly a CASCADE: the
+  callee was itself stubbed for one of the other reasons, so its 5265 is a
+  transitive count, not 5265 independent defects, and fixing a single deep
+  leaf may collapse thousands. "declaration inside a function body" at 2898 is
+  suspiciously large for what sounds like a parser limitation and should be
+  reduced to a concrete C shape before anyone prices it.
+  METHOD NOTE for whoever takes this: a stub count is NOT a defect count, and
+  this project has already been burned twice by reading first-failure
+  rejections as per-clause yields (FR-61f, twice, at 7x and 4.4x). Build the
+  callee->caller graph and rank by ROOT causes with their transitive closure,
+  not by raw frequency.
+  **NOT SPIKED.**
   **NOT SPIKED.**
 
 - [x] FR-154 DEFECT (found by the FR-151 spike 2026-08-29; DISSOLVED by
