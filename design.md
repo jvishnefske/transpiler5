@@ -11587,7 +11587,7 @@ piece and becomes FR-45.
   **PHASES 1 AND 2 LANDED. Phase 3 (statics into modules) stays HELD behind
   FR-157/FR-158.**
 
-- [ ] FR-160 FEATURE (opened by the repo owner 2026-08-29 out of the systemd
+- [x] FR-160 FEATURE (opened by the repo owner 2026-08-29 out of the systemd
   probe): A C PROJECT'S OWN TEST SUITE IS A DIFFERENTIAL ORACLE THE EMITTER
   THROWS AWAY. Today an emitted crate is validated by "does it compile"
   (FR-145) and, for this repo's corpus only, by the EndToEnd byte-diff. Every
@@ -11864,8 +11864,28 @@ piece and becomes FR-45.
   wrapped test fail), so the one wrap that landed has correctness evidence
   and not merely compile-clean evidence.
 
-  REMAINING FOR FR-160: Phase B's adapter (`scripts/test-entries-meson.py`)
-  has no round-trip test of its own -- acceptance criterion 6.
+  **PHASE B PINNED 2026-08-30** (acceptance criterion 6), closing FR-160:
+  `test/Driver/test-entries-meson.c` runs the adapter over a checked-in
+  `meson-info/` pair -- not a configured project, because the adapter is a
+  pure data transformation and testing it should need no meson, no compiler
+  and no network, and cannot then rot when a real project's build files move.
+  It pins the five selection rules (single-source built C target;
+  `protocol == exitcode`, since a `tap` test reports through stdout and
+  wrapping it would assert something it does not mean; script tests and
+  multi-source targets skipped, the latter because its symbols exist only
+  after `--link`), that every skip is COUNTED to stderr, and the ROUND TRIP:
+  the file it writes is fed straight to `--test-entries` and the emitted
+  crate contains `fn main() { assert_eq!(super::c_main(), 0); }`. The two
+  halves of Phase B are checked against each other rather than each against
+  a golden.
+  Also fixed there: the adapter emitted the SAME symbol once per meson test,
+  so a parameterized binary produced duplicate lines. They now collapse to
+  one entry carrying the count (`+1 more`) -- `--test-entries` dedups on its
+  side anyway, but a file a human reads should not repeat itself.
+  **FR-160 IS COMPLETE**: Phase A (wrap named symbols), Phase B (meson
+  discovery + this pin), Phase C (`--test-entry-section`, no build system in
+  the loop), the `--partition` workspace path, and FR-161's cleanup of the
+  silent request-ignore surfaces.
 
 - [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
   the same day): A DEAD `goto` SILENTLY CHANGED A FUNCTION'S ANSWER. A
