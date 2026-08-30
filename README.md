@@ -221,3 +221,18 @@ machine-readably in [docs/plans/backlog.toml](docs/plans/backlog.toml); query it
 `python3 docs/plans/plan.py next`. The theory underlying the pipeline's transformations
 (with citations and per-stage guarantees) is surveyed in
 [docs/transformation-theory.md](docs/transformation-theory.md).
+
+## License
+
+Copyright (C) 2026 John Vishnefske
+
+EmitRust is free software: you can redistribute it and/or modify it under the terms
+of the GNU Affero General Public License as published by the Free Software Foundation,
+either version 3 of the License, or (at your option) any later version. See
+[LICENSE](LICENSE) for the full text.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE. See the GNU Affero General Public License for more details.
+
+SPDX-License-Identifier: AGPL-3.0-or-later
