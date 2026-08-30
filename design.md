@@ -10469,7 +10469,7 @@ piece and becomes FR-45.
   `from_mut`, both in ONE increment or the link fails 3461 ways) remains
   optional -- it buys const fidelity, not a build.**
 
-- [ ] FR-165 (opened 2026-08-30 from the first whole-program stub census):
+- [x] FR-165 ANSWERED 2026-08-30 (opened the same day from the first whole-program stub census):
   THE 16,538 STUBS ARE NOW THE RANKING SIGNAL for what to fix next, and this
   is the first time the project can measure them over a WHOLE PROGRAM rather
   than per unit. Census over the 501-object systemd crate, reasons normalised

@@ -437,12 +437,12 @@ anchor = "FR-164 (proposed 2026-08-29 by an agent, NOT requested"
 id = "FR-165"
 rank = 12
 kind = "feature"
-status = "spiked"
+status = "landed"
 size = "L"
 title = "Whole-program stub census: 86 root types gate 3294 cascade drops"
 summary = "ANSWERED 2026-08-30 by measurement, and the original census was wrong. It counted RAW per-TU stub sites; deduplicating the link ledger by file:line:col+symbol collapses 77,105 raw lines to 13,673 distinct items, a 5.6x fan-out factor, and inverts the ranking. Corrections: call-to-unimported 5265 to 452, declaration-in-body 2898 to 187, null-pointer-constant 1700 to 114. Deduped: 10,721 dropped, 2,952 stubbed. The pointer model is the deep front at 5,589 distinct drops, 52 percent of all drops. THE LEVERAGE RESULT: the largest deduped category is rejected-type-cascade at 3,294, and 86 DISTINCT ROOT TYPES account for all of them, with the top twelve explaining 2,423 and SdVarlinkSymbol alone gating 700. Roughly 30 percent of all drops are downstream of 86 structs. Follow-on: root-cause those 86; if they root in incomplete-struct-type or the pointer model, the two fronts are one. Method confirmed: dedupe by location before ranking -- third time this project has misread per-occurrence counts as yields."
 blocked_by = []
-anchor = "FR-165 (opened 2026-08-30 from the first whole-program stub census)"
+anchor = "FR-165 ANSWERED 2026-08-30 (opened the same day from the first"
 
 [[items]]
 id = "FR-166"
@@ -452,7 +452,7 @@ status = "spiked"
 size = "M"
 title = "An enum with any enumerator outside i32 range is rejected whole (278 items, 11x)"
 summary = "SPIKED GO 2026-08-30 but CANNOT LAND ALONE -- blocked on FR-168. 11 sites assume 32-bit storage, 8 need changing. Measured: 471 items resolved, 146 newly-surfaced second-layer blockers, net -325; my 278 projection was low on resolved and high on net. Byte identity holds (281/281 EndToEnd, all crate goldens, zero bytes moved); the only 3 failures are negative tests pinning the removed rejection. BLOCKER: FR-166 breaks the 501-object whole-program link, because making SdVarlinkInterface importable turns a symmetric pair of drops into a live extern_decl obligation whose definition is still dropped -- 48 shards excluded to get a building crate. A MISCOMPILE sits in the obvious extension (FR-169): castEnumToI32 discards signedness, so relaxing the 32-bit UNSIGNED range gives native cmp 1 1 1 vs rust cmp 1 0 1. Entry premise falsified: the guard rejects values that fit u32 storage exactly, so glibc EPOLL_EVENTS is refused for that reason not the 64-bit one. Anonymous enums are nearly a non-issue. Operational: adding an EnumDefOp attribute invalidates every existing shard bytecode. Opened 2026-08-30 from the FR-165 root-cause pass. ImportCAggregates.cpp:2034-2039 refuses an entire enum if any enumerator falls outside INT32 range. Gates 278 items -- 25 direct plus 253 cascaded, 11x amplification -- across 19 distinct enums. The C is deliberate and idiomatic: systemd's _SD_ENUM_FORCE_S64 macro appends an out-of-range enumerator precisely to force 64-bit width, and every flags enum in sd-json.h and sd-varlink.h carries it, which is why the SdJsonVariant and SdVarlink type families all fall over. Looks tractable because variantValues is already SmallVector<int64_t> and the comment below the rejection says storage follows clang's underlying type choice, so a width notion exists -- but do not assume; measure the dialect and emitter constraints first. NOT SPIKED."
-blocked_by = ["FR-168"]
+blocked_by = []
 anchor = "FR-166 (opened 2026-08-30 from the FR-165 root-cause pass)"
 
 [[items]]
