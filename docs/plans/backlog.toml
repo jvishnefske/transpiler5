@@ -305,10 +305,10 @@ anchor = "FR-151 DEFECT (found by the systemd probe"
 id = "FR-152"
 rank = 13
 kind = "defect"
-status = "open"
+status = "landed"
 size = "M"
 title = "scf.while legalization fails on gperf-generated lookup tables"
-summary = "Found by the systemd probe 2026-08-28. failed to legalize operation 'scf.while' on 7 units, all gperf-GENERATED lookup tables (af-from-name.gperf:51, errno-from-name, ...). Machine-generated C is a distinct shape class from hand-written C and this is the first time the project has measured it at scale. NOT SPIKED. REPRICED 2026-08-29 by the FR-151 spike: this is THE GATE ON THE WHOLE-PROGRAM --link PATH -- all six systemd-detect-virt objects that still yield no shard are gperf tables, and with FR-154 excluded the link's only remaining error is unresolved external capability_set_from_string. Also measured dead: the report's log_assert_failed blocker, since assert-util.c now recovers it as a stub definition."
+summary = "LANDED 2026-08-29. The entry's root cause was WRONG -- not 'machine-generated C is a distinct shape class' but: a place-backed local declared INSIDE an unbounded-loop body whose value ESCAPES becomes an !emitrust.lvalue<T> loop-carried RESULT of scf.while, for which WhileLowering has no default value. Type-independent (unsigned, enum, struct, address-taken, fn-ptr all fail; signed ints never place-backed). Fix: a func-nested pass between lift-cf-to-scf and its canonicalize that moves the escaping operand-free emitrust.variable out of the region; the existing upstream canonicalization then drops the invariant carried value, no new ops. Fenced on emitrust.has_drop -- unfenced it deletes every drop but the last (measured). All 7 systemd units import; detect-virt now yields 501/501 shards, up from 495. Gate 900/900, zero golden churn. Residue left as a located rejection: the bounded-loop ub.poison sibling, 1 file across 1601 TUs."
 blocked_by = []
 anchor = "FR-152 DEFECT (found by the systemd probe"
 
@@ -344,6 +344,17 @@ title = "A dead goto silently changed a function's answer: loop-body place lost 
 summary = "LANDED 2026-08-29, found by the FR-152 spike. MISCOMPILE. createVariablePlace hoists the emitrust.variable op to the function entry block whenever currentHasLabels (so a goto over a declaration cannot leave a later use undominated), and FR-61f separately attaches a compile-time-constant initializer TO THE OP to avoid clippy::needless_late_init -- so the hoist carried the initializer out of the loop and the per-iteration reset was lost. clang printed 3, the crate printed 4; deleting the dead label pair changed the answer back. Fix: the constant-init fast path additionally requires !currentHasLabels, falling through to the general path whose storeToPlace lands inside the loop. Scope confirmed by byte-diff: aggregate, array, unsigned and non-constant-init companions MATCH both before and after. Gate 894/894, zero golden churn."
 blocked_by = []
 anchor = "FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike"
+
+[[items]]
+id = "FR-156"
+rank = 15
+kind = "defect"
+status = "open"
+size = "M"
+title = "A recovered function's dependent global survives it, leaving a dangling function pointer"
+summary = "Found by the FR-152 whole-program link 2026-08-29. error: dangling function pointer target 'tu0_rlimit_parse_sec': the module defines no function with that name, at src/basic/rlimit-util.c:222:20 -- a file-static dispatch table whose target was dropped by recovery, with the table global emitted anyway still naming it. Fails LOUDLY, so the FR-52 marker contract works; the defect is that recovery drops an item without dropping the globals whose initializers reference it, so the loud failure lands at LINK on a whole program instead of at the drop site. Current head of the systemd-detect-virt link, reached only after FR-151 and FR-152 with FR-154's colliding unit excluded. Direction: cascade the drop to referencing globals through the existing rejected-type-cascade machinery. NOT SPIKED."
+blocked_by = []
+anchor = "FR-156 DEFECT (found by the FR-152 whole-program link"
 
 [[items]]
 id = "FR-138"
