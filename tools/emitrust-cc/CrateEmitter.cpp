@@ -376,4 +376,114 @@ std::string renderWorkspaceToml(llvm::ArrayRef<std::string> members) {
   return toml;
 }
 
+/// FR-160: is `fn` a RECOVERED STUB, i.e. does its body contain the
+/// `unimplemented!` the `--recover` path emits for a construct it rejected?
+/// Returns the rejection diagnostic when so, and "" otherwise.
+///
+/// Any occurrence counts, not just a whole-body one: a call that reaches an
+/// `unimplemented!` panics, and a `#[test]` that panics fails. Wrapping such a
+/// body is still worth doing -- `#[ignore]`d, it reports the gap by name in
+/// `cargo test` output -- but it must never be counted as a passing test.
+static std::string recoveredStubReason(mlir::emitrust::FuncOp fn) {
+  std::string reason;
+  fn.walk([&](mlir::emitrust::CallOpaqueOp call) {
+    if (call.getCallee() != "unimplemented!" || !reason.empty())
+      return;
+    if (auto args = call->getAttrOfType<mlir::ArrayAttr>("args"))
+      if (!args.empty())
+        if (auto first = llvm::dyn_cast<mlir::StringAttr>(args[0]))
+          reason = first.getValue().str();
+    if (reason.empty())
+      reason = "recovered: this item was not imported";
+  });
+  return reason;
+}
+
+std::string renderTestModule(mlir::ModuleOp module,
+                             llvm::ArrayRef<std::string> entries,
+                             llvm::SmallVectorImpl<TestEntryReport> &reports) {
+  struct Wrapped {
+    std::string symbol;
+    bool returnsInt;
+    std::string ignoreReason;
+  };
+  llvm::SmallVector<Wrapped> wrapped;
+
+  for (const std::string &entry : entries) {
+    TestEntryReport report;
+    report.symbol = entry;
+    auto fn = llvm::dyn_cast_if_present<mlir::emitrust::FuncOp>(
+        mlir::SymbolTable::lookupSymbolIn(module, entry));
+    if (!fn) {
+      // NOT an error: an entries file describes a whole project and is
+      // applied one translation unit at a time.
+      report.skipReason = "no function of that name in this crate";
+      reports.push_back(std::move(report));
+      continue;
+    }
+    report.op = fn.getOperation();
+    if (fn.isExternal()) {
+      report.skipReason = "declared here but defined in another unit; link "
+                          "the shards to wrap it";
+    } else if (fn->hasAttr(mlir::emitrust::kMethodOfAttrName)) {
+      report.skipReason = "rendered as a method of an impl block (an actor "
+                          "arm or a C++ method), not callable as a free "
+                          "function";
+    } else if (fn->hasAttr(mlir::emitrust::kExternalsGenericAttrName)) {
+      report.skipReason =
+          "generic over the Externals trait -- its callees are undefined in "
+          "a solo-TU import, so the test could only panic inside a trait "
+          "method; link the shards first";
+    } else if (fn.getFunctionType().getNumInputs() != 0) {
+      report.skipReason = "takes arguments; a test entry point must take none";
+    } else {
+      llvm::ArrayRef<mlir::Type> results = fn.getFunctionType().getResults();
+      const bool returnsNothing = results.empty();
+      const bool returnsInt = results.size() == 1 && results[0].isIntOrIndex();
+      if (!returnsNothing && !returnsInt) {
+        report.skipReason =
+            "returns a value that is not an exit code; a test entry point "
+            "must return an integer or nothing";
+      } else {
+        report.ignoreReason = recoveredStubReason(fn);
+        wrapped.push_back({entry, returnsInt, report.ignoreReason});
+      }
+    }
+    reports.push_back(std::move(report));
+  }
+
+  if (wrapped.empty())
+    return "";
+
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  // `non_snake_case` is denied by the emitted manifest and a C test symbol
+  // need not be snake case; the allow is scoped to this generated module so
+  // the deny still governs every item the emitter itself writes.
+  os << "\n#[cfg(test)]\n#[allow(non_snake_case)]\nmod emitrust_tests {\n";
+  for (auto [index, entry] : llvm::enumerate(wrapped)) {
+    if (index)
+      os << "\n";
+    os << "    #[test]\n";
+    if (!entry.ignoreReason.empty()) {
+      os << "    #[ignore = \"";
+      // A diagnostic is emitter-authored prose, but it can quote C source.
+      for (char c : entry.ignoreReason) {
+        if (c == '"' || c == '\\')
+          os << '\\';
+        os << c;
+      }
+      os << "\"]\n";
+    }
+    os << "    fn " << entry.symbol << "() {\n";
+    if (entry.returnsInt)
+      os << "        assert_eq!(super::" << entry.symbol << "(), 0);\n";
+    else
+      os << "        super::" << entry.symbol << "();\n";
+    os << "    }\n";
+  }
+  os << "}\n";
+  return text;
+}
+
 } // namespace emitrustcc

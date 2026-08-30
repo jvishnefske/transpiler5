@@ -313,6 +313,17 @@ blocked_by = []
 anchor = "FR-152 DEFECT (found by the systemd probe"
 
 [[items]]
+id = "FR-160"
+rank = 18
+kind = "feature"
+status = "spiked"
+size = "L"
+title = "C test entry points become #[test] functions (cargo test as a differential oracle)"
+summary = "A C project's own test suite is an oracle the emitter throws away: systemd's test bodies ARE imported (ten real fn tu0_test_* in test-hexdecoct) and nothing calls them -- cargo test reports 0 passed. Phase A is project-agnostic (--test-entry/--test-entries wraps named symbols; ported -> #[test], stubbed -> #[test] #[ignore=diagnostic], dropped/Externals-generic -> located warning, never a vacuous pass; byte-identical without the flag). Phase B is an out-of-emitter meson adapter over meson-info/intro-tests.json (measured: 4518 tests all protocol=exitcode, 337 built from exactly one .c file); CTest is the same shape. main is the WRONG entry point -- of 337 one-TU tests only ONE has a real main body, because systemd's TEST() registers through a linker section. SPIKED GO and PHASE A LANDED 2026-08-29; the spike also found that the FR-62 actor lift moves a global-touching test body into an impl block, so an entry point is not always a free function. Phase C (recognise the section-table registration with no build system in the loop) and the --partition workspace path remain. FR-158/FR-159 are what make the Externals-free merged crate, which is where a solo-TU test body becomes callable."
+anchor = "FR-160 FEATURE (opened by the repo owner 2026-08-29 out of the systemd"
+blocked_by = ["FR-158", "FR-159"]
+
+[[items]]
 id = "FR-153"
 rank = 20
 kind = "defect"
