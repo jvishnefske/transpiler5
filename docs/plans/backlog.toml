@@ -314,12 +314,12 @@ anchor = "FR-152 DEFECT (found by the systemd probe"
 
 [[items]]
 id = "FR-153"
-rank = 20
+rank = 11
 kind = "defect"
 status = "open"
-size = "L"
+size = "M"
 title = "E0596 mutable borrow through a shared reference (35 crates)"
-summary = "Found by the systemd probe 2026-08-28. 35 crates fail error[E0596]: cannot borrow *p or p[_] as mutable, behind a & reference (src/core/manager, src/coredump/coredumpctl-journal, ...). Exit-0 unbuildable, the FR-145 class again. Ranked last of the five systemd findings because it is the only one that is not obviously narrow: a borrow-model question, not a naming or cast fix. NOT SPIKED."
+summary = "ROOT CAUSE FOUND 2026-08-29 by the FR-161 spike, and MERGED with FR-158 Phase 4 -- one defect, not two: the same five DEFINE_TRIVIAL_CLEANUP_FUNC functions with the same source text. A C T** parameter is a CTS-00204 cursor parameter lowering to TWO inputs, a SHARED region slice plus an &mut i64, at ImportCFunctions.cpp:679-686 where the base is pushed as RefType::get(sliceType); the body must then reborrow that shared base mutably to hand the region to a callee whose slice parameter is &mut [T]. Minimised to ELEVEN lines, single TU, no --link. Constness is NOT the trigger: char** and const char** emit identically. THIS IS WHAT MAKES THE WHOLE-PROGRAM CRATE BUILD -- after FR-161 Phase 1 the 501-object systemd crate has seven rustc errors and all seven are this. Found by the systemd probe 2026-08-28. 35 crates fail error[E0596]: cannot borrow *p or p[_] as mutable, behind a & reference (src/core/manager, src/coredump/coredumpctl-journal, ...). Exit-0 unbuildable, the FR-145 class again. Ranked last of the five systemd findings because it is the only one that is not obviously narrow: a borrow-model question, not a naming or cast fix. NOT SPIKED."
 blocked_by = []
 anchor = "FR-153 DEFECT (found by the systemd probe"
 
@@ -404,7 +404,7 @@ anchor = "FR-160 (opened 2026-08-29): the repository LICENSE is"
 id = "FR-161"
 rank = 9
 kind = "defect"
-status = "open"
+status = "spiked"
 size = "M"
 title = "A scalar-object argument at a slice parameter (FR-158 Phase 3)"
 summary = "Split out of FR-158 2026-08-29 so the remaining work is indexed. f(&x) where x is a scalar local or struct field and the defining TU classifies that parameter as a slice. The ENTIRE residue of FR-158 Phases 1+2: 60 slots, 55 caller functions, 25 shards, top offender config_parse_unsigned_bounded with 24 -- and it is what stands between the systemd whole-program link and a crate being emitted at all. Reproduces in three files; a distinct -D per TU is required or the joint re-import rescues the pair. Directions: ::std::slice::from_mut(&mut x) is semantically EXACT (C passes a pointer to ONE object, so a one-element slice is precisely the legal range, and p[1] becomes a panic where C has UB) but slice_of accepts only array/slice bases so it needs a widened verifier or a new op; stubbing the caller at the merge was the spikes preference but deletes 55 functions behaviour with no recovery path since --link --incremental does not recover at the merge; a one-element array import has unbounded blast radius. SETTLE FIRST whether FR-158 Phase 4 (7 functions) is the same defect as FR-153 (35 crates). NOT SPIKED."

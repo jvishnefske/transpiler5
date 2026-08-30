@@ -10170,39 +10170,103 @@ piece and becomes FR-45.
   `reimportFactStarvedGroups` rescues the pair by joint re-import and the
   divergence never materializes.
 
-  DIRECTIONS. The FR-158 spike listed three and preferred stubbing; I think
-  it mis-ranked them, on semantics:
-  * `::std::slice::from_mut(&mut x)` is SEMANTICALLY EXACT, not a
-    workaround. C's `f(&x)` passes a pointer to ONE object and the callee
-    may legally touch only `p[0]`; a one-element slice is precisely that
-    range, and `p[1]` becomes a Rust PANIC where C has undefined behaviour
-    -- the safe failure direction this project already prefers. The open
-    question is purely mechanical: `emitrust.slice_of`'s verifier accepts
-    `lvalue<array>` and `lvalue<slice>` bases only
-    (`lib/EmitRust/EmitRustOps.cpp:1343-1385`), so this needs either a
-    widened verifier or a new op. The emitter already renders `::std::`
-    paths since FR-150, so the rendering side is precedented.
-  * Stub the enclosing caller at the merge under the FR-52 marker contract.
-    The spike measured this SUFFICIENT to make the whole systemd crate
-    compile, but it silently deletes 55 functions' behaviour, and
-    `--link --incremental` does NOT recover at the merge (measured under
-    FR-158), so there is no existing recovery path to hang it on.
-  * Import the caller's scalar as a one-element array: unbounded blast
-    radius on every caller. Rejected by the spike; I agree.
+  SPIKED GO-with-constraints 2026-08-29, in a FENCED form stronger than this
+  entry proposed. Phase 1 in TDD.
 
-  OPEN QUESTION TO SETTLE FIRST, because it may merge two backlog items:
-  FR-158's Phase 4 residue (7 functions, `&mut (*p)[v..]` reborrowed through
-  a `&`-typed slice parameter) may be THE SAME DEFECT as FR-153 (E0596
-  mutable borrow through a shared reference, 35 crates). Check before
-  spiking either.
-  **NOT SPIKED.**
+  MY SEMANTIC ARGUMENT ABOVE WAS OVERRULED BY THE PROJECT'S OWN RECORD, and
+  that is the most useful thing the spike found. I claimed a `p[1]` panic is
+  the safe failure direction because it turns C UB into a defined abort. This
+  project has decided the OPPOSITE for this exact shape TWICE: FR-75's landed
+  record says "the previously-ACCEPTED trait shape `helper(&x, 1)` (address of
+  a scalar) deliberately flips to the located address-of-scalar rejection --
+  fidelity over coverage, recorded", and `test/Import/C/pointers-param-invalid.c`
+  pins precisely `int first(int *a){return a[0]+a[1];}` called as `first(&x)`
+  as a rejection. Measured unfenced: C prints `1 2` at rc 0, Rust prints
+  nothing and panics `index out of bounds: the len is 1 but the index is 1` at
+  rc 101. My argument is right for a DEFINED C program; the project's is right
+  for a callee that may WALK. The fence is the synthesis.
 
-- [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28): 35 crates fail
-  `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`
+  THE FENCE: admit the rewrite only when the definition's own parameter
+  provably touches ELEMENT 0 ONLY, following forwards TRANSITIVELY
+  (`deref -> subscript[0]`, and `deref -> slice_of[0] -> call_opaque` when the
+  forwarded slot also passes; memoised, cycle-safe). Everything else --
+  dynamic or non-zero index, `call_indirect`, `addr_of`, an `args`-remapped
+  call, a missing definition -- declines to the existing located rejection.
+  A SHALLOW fence is insufficient, measured: it rejects 3 of 60
+  (`parse_sec`, `pidfd_get_pid`, `read_attr_at`, which FORWARD the parameter)
+  and the crate then does not emit at all. The transitive fence admits 60/60
+  and yields a BYTE-IDENTICAL `lib.rs` to the unfenced version -- i.e. the
+  fence costs nothing and buys the whole behaviour guarantee.
+
+  MECHANISM, and this entry's central mechanical claim was WRONG: I wrote that
+  `slice_of`'s verifier accepts array/slice bases only "so this needs either a
+  widened verifier or a new op". Neither. `emitrust.call_opaque
+  "::std::slice::from_mut"` already carries results and prints an unknown
+  callee verbatim (`TranslateToRust.cpp:5117-5134`; the FR-110 `::` split and
+  FR-150's `shadowedPreludeNames` branch both miss the name). Zero dialect
+  change, ~120 lines in `LinkMerge.cpp` alone.
+  TWO SPELLING FACTS, both load-bearing: `::core::slice::from_mut` builds
+  under cargo but FAILS under bare `rustc` with E0433, and lit's EndToEnd
+  tests use rustc directly -- so `::std::` is the only safe spelling. The
+  LEADING `::` is required too, because FR-159 sinks items into `mod tu<N>`
+  where a relative `std::` could be shadowed. My "FR-150 already renders
+  `::std::` paths" was misleading: FR-150 renders PRELUDE-family paths through
+  `preludeQualifiedPath`; no `::std::` emission existed before this.
+
+  MEASURED: systemd 501-object link goes from NOT EMITTING (60 located
+  rejections) to emitting 12,265,476 bytes with 60 `from_mut`, and cargo drops
+  from 63 errors to SEVEN -- all E0596, all FR-153. Gate 910/910 with ZERO
+  golden shift, which means the coverage is the deliverable, not a formality.
+  Byte-diffed positive: the motivating repro (`q5`) and a write-through
+  out-parameter through a 3-object link (`11 22 8`), covering a scalar local
+  AND a struct field -- writes propagate back through `from_mut`.
+  An aliasing probe `f(&x,&x)` at two slice slots never reaches the merge; the
+  importer's existing located aliasing rejection catches it, so no new E0499.
+
+  DURABILITY, stated honestly: 28 of the 30 admitted callees pass the fence
+  because they are currently FR-52 `unimplemented!` stubs with no uses. As
+  later waves implement them the fence will re-reject some. 60/60 is not a
+  stable number; the decay direction is a located rejection, never a panic.
+
+  FR-161 ALONE DOES NOT PRODUCE A BUILDING WHOLE-PROGRAM CRATE. FR-161 +
+  FR-153 does.
+  PHASE 3, deferred with its own fence: the single-TU twin at
+  `ImportCExpressions.cpp:6296` ("the address of a scalar object cannot be
+  passed as a slice parameter"), worth ~124 `unimplemented!` sites across 46
+  of the 501 TUs. It collides head-on with FR-75 and with
+  `pointers-param-invalid.c`, so it needs an in-TU-definition requirement
+  (excluding body-less external requirements, so FR-75's NOREGION rejection
+  survives) plus the element-0 body scan. Do NOT bundle it with Phase 1.
+  **SPIKED GO; Phase 1 in TDD.**
+
+- [ ] FR-153 DEFECT (found by the systemd probe 2026-08-28; ROOT CAUSE FOUND
+  and MERGED WITH FR-158 PHASE 4 by the FR-161 spike 2026-08-29): 35 crates
+  fail `error[E0596]: cannot borrow *p / p[_] as mutable, behind a & reference`
   (src/core/manager, src/coredump/coredumpctl-journal, …). Exit-0 unbuildable,
   the FR-145 class again. Ranked last of the five because it is the only one
   that is not obviously narrow: it is a borrow-model question, not a naming or
   cast fix.
+
+  SAME DEFECT AS FR-158 PHASE 4 -- one item, not two. The 35-crate FR-153 set
+  carries 36 E0596 diagnostics whose enclosing functions are
+  `notify_on_cleanup`, `sd_journal_closep`, `sd_bus_creds_unrefp`,
+  `sd_netlink_message_unrefp`, `sd_lldp_neighbor_unrefp` -- systemd's
+  `DEFINE_TRIVIAL_CLEANUP_FUNC` idiom. FR-158 Phase 4's 7 link-mode functions
+  are the SAME FIVE NAMES with the SAME source text.
+
+  ROOT CAUSE, minimised to ELEVEN LINES in a single TU with no `--link` at
+  all: a C `T **p` parameter is a CTS-00204 CURSOR PARAMETER and lowers to TWO
+  inputs -- a SHARED region slice plus an `&mut i64` -- at
+  `lib/ImportC/ImportCFunctions.cpp:679-686`, where the base is pushed as
+  `emitrust::RefType::get(*sliceType)`. The body then has to reborrow that
+  shared base MUTABLY to hand the region to a callee whose slice parameter is
+  `&mut [T]`. Shapes: `let v3: &mut [i8] = &mut (*p)[v2 as usize..];` x19 and
+  `let v2: &mut SdJournal = &mut p[v1 as usize];` x13, plus 4 singletons.
+  CONSTNESS IS NOT THE TRIGGER, measured: `char **p` and `const char **p`
+  emit identically.
+  THIS IS WHAT MAKES THE WHOLE-PROGRAM CRATE BUILD. After FR-161 Phase 1 the
+  501-object systemd crate has SEVEN rustc errors and all seven are this.
+  Rank it immediately after FR-161 Phase 1.
   **NOT SPIKED.**
 
 - [x] FR-154 DEFECT (found by the FR-151 spike 2026-08-29; DISSOLVED by
