@@ -10049,6 +10049,24 @@ piece and becomes FR-45.
   `clang: error: unknown argument`). It works on the joint import. So under
   `--link` the rejection is terminal today: the user's only remedy is to drop
   a translation unit from the link line.
+
+  MY CLAIM ABOVE -- "no predicate can rename one and refuse the other" -- WAS
+  FALSIFIED by the FR-159 spike the next hour. The two programs differ in one
+  decidable, single-shard way:
+      link-merge-conflict-{a,b}.c : `int use_a(struct Box b)` -- the
+                                    conflicting record is used by an
+                                    EXTERNAL-LINKAGE function, by value
+      hashmap.c / hibernate-util.c: internal-linkage statics ONLY
+                                    (hashmap's definition has ZERO uses)
+  An ESCAPE PREDICATE -- does any external-linkage item mention this type? --
+  separates them, and it is the right discriminator on the merits, not a
+  gerrymander: a record reachable from an external signature is not TU-local
+  in C's type system at all (C99 6.2.7), so it MUST keep the located
+  rejection. With that guard the 501-object link succeeds AND
+  `link-merge-errors.c` fails verbatim, at 902/902 with ZERO golden churn.
+  (A') measured 901/902 only because it had no such guard.
+  This is the fourth entry of mine this session whose stated reasoning a
+  later measurement overturned; see [[design-md-prescriptions-are-hypotheses]].
   **SPIKED; superseded by FR-159.**
 
 - [ ] FR-159 (opened by the repo owner 2026-08-29, in place of FR-154's three
@@ -10081,12 +10099,80 @@ piece and becomes FR-45.
     way; it should NARROW the pinned rejection to a shared-header input
     (the genuine ODR violation, which must keep its located diagnostic) and
     add a positive test for the TU-local case.
-  The discriminator must be AST-PURE (FR-108: the item graph and FR-41's
-  coloring recompute record symbols from the AST alone);
-  `SourceManager::isInMainFile` is the candidate and was measured sound.
+  SPIKED 2026-08-29: **GO-with-constraints, but under a DIFFERENT PARTITION
+  than this entry proposed.** `isInMainFile` is exactly the A_dup regression
+  and cannot be the discriminator; records cannot be bucketed by TU at all.
+  What works: **C linkage** for functions/globals (a total, AST-pure,
+  provably-safe partition -- `static` means unreachable from another TU, with
+  no shape-compatibility escape hatch) and **link-time shape CONFLICT plus a
+  non-escape guard** for records (a link fact, which is allowed).
+
+  MEASURED: `::` round-trips through the dialect with no new ops, and USE
+  SITES already render correctly with ZERO emitter change -- only the
+  DEFINITION side needs bucketing. Prototype 61 lines in the emitter, 51 in
+  the merge; gate 902/902 with ZERO golden churn; 501-object systemd link
+  exit 0 at 12,104,378 bytes with one `mod tu314`. Ten adversarial cases
+  byte-diffed against the clang native, including the A_dup case that kills
+  naive bucketing (`expected tu0::P, found tu1::P`) and E_odr, which keeps
+  its located rejection.
+  Conflict scale: 774 distinct emitted type symbols, 435 in more than one
+  shard, but exactly ONE shape conflict across 501 shards.
+
+  CONSTRAINTS THAT MUST LAND IN-SLICE, not after:
+  * C1 paths must be ABSOLUTE (`crate::tu0::add1`); a relative path inside
+    the module is rustc E0433, hit on the fn-ptr table, which renders INSIDE
+    the module.
+  * C2 THREE PREDICATES SILENTLY NO-OP ON PATHS, and one is a safety
+    backstop. `fnPtrConstantTargetIdent` (`TranslateToRust.cpp:4085`) filters
+    to alnum/underscore, so `verifyFnPtrTargetsPresent` never fires: measured,
+    `Some(tu0_nope)` is a located `dangling function pointer target` and
+    `Some(crate::tu0::nope)` is NO DIAGNOSTIC AT ALL. The FR-77 backstop
+    switches itself off. `isConstEvaluableInit` (:6607) and FR-133's
+    `computeUnwrappedFnPtrs` (:3230) share the filter.
+  * C3 the escape guard must be TRANSITIVE -- through `mut_ref`/`ref`/
+    `slice`/`array`/`fn_ptr`, struct FIELDS and global types. The prototype
+    checks only top-level by-value and so lets `G_ptr` through to a rustc
+    E0308 instead of a located rejection; the real systemd users are
+    `&mut [tu314::SwapEntries]`, i.e. behind a slice, so the prototype's
+    guard fired on `link-merge-errors.c` only because that test passes by
+    value.
+  * C4 `emitrust.variable named` is verifier-checked to be a bare identifier
+    (`got "tu0::counter"`), so local bindings and actor-lift synthesized
+    names KEEP the mangle, permanently.
+  * C5/C6 `isInternalLinkageSymbolName` and `parseTuTag` parse a leading
+    `tu<N>_` and must learn the path form, or FR-51 export mode starts
+    exporting file-statics.
+  Visibility, measured: uniform `pub(crate)` on the sunk struct AND its
+  FIELDS (else E0616); the emitter writes NO visibility on globals today
+  (:6634, :6702), a gap Phase 3 forces.
+
+  PHASES.
+  * Phase 1 (in TDD): the link-time shape-conflict sink plus the emitter's
+    `mod` machinery, with C1/C2/C3 and the global-visibility gap in-slice.
+    Lands alone at 902/902 with zero churn, dissolves FR-154, and turns the
+    501-object link from exit 1 into exit 0. `link-merge-errors.c` and
+    `link-merge-anon-struct.c` keep their pinned rejections VERBATIM -- that
+    is the phase's central invariant.
+  * Phase 2: module names become SOURCE-FILE STEMS (`mod hibernate_util`,
+    not `mod tu314`). 497 of 501 objects have a unique stem. Same mechanical
+    cost, and it makes the module name position-independent, which is the
+    precondition for retiring the renumbering in `renameShardTags`. With
+    ordinal names you get 798 modules called `tu0`..`tu797` whose grouping
+    carries no meaning, so the readability case only lands with this phase.
+  * Phase 3 (HOLD): `static` functions and globals move into their module.
+    93% of top-level fns (31,932 of 34,418) carry a tag, so the prize is
+    large -- but it touches `CSymbolNaming.h`, `CSymbolLinkage.h`,
+    `ItemGraph.cpp`, `ItemColoring.cpp`, the importer, the merge and the
+    emitter, changes user-visible `--incremental` item names, and shifts
+    ~26 golden files (estimated from CHECK-line counts, so an UNDERCOUNT --
+    the item-graph goldens will move in ways grep cannot see). It delivers
+    ZERO progress toward a BUILDING whole-program crate, measured: 0 of
+    5,460 attributable E0308s involve a tagged symbol. Hold it behind
+    FR-157/FR-158.
   NOT on the critical path to a BUILDING whole-program crate -- that is
-  FR-157/FR-158, since the merged crate fails 6542 rustc errors regardless.
-  **SPIKING.**
+  FR-157/FR-158, since the merged crate fails ~6,570 rustc errors regardless
+  (the 501st TU adds 29 of the identical class).
+  **SPIKED GO; Phase 1 in TDD.**
 
 - [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
   the same day): A DEAD `goto` SILENTLY CHANGED A FUNCTION'S ANSWER. A

@@ -382,10 +382,10 @@ anchor = "FR-158 (found by building the FR-156 whole-program link"
 id = "FR-159"
 rank = 16
 kind = "feature"
-status = "open"
+status = "spiked"
 size = "L"
 title = "Use Rust modules instead of tu<N>_ name mangling for TU-local items"
-summary = "Opened by the repo owner 2026-08-29 in place of FR-154's three measured mechanisms. Emit each TU's TU-local items into `mod tu<N>` and refer to them by path; header-shared types stay at crate root. Dissolves FR-154 by construction and replaces the whole mangling scheme with the language's actual mechanism. Measured starting point: the 12 MB whole-program crate has ZERO mod blocks and the emitter's only module is a hardcoded actor_rt epilogue, so this is a new capability. Modules do NOT escape FR-154's two constraints, they relocate them: the shape partition stays mandatory (or the legal identical-struct-P-via-extern idiom becomes E0308), and link-merge-errors.c still needs respecifying. Discriminator must be AST-pure per FR-108; SourceManager::isInMainFile measured sound. NOT on the critical path to a BUILDING whole-program crate -- that is FR-157/FR-158. SPIKING."
+summary = "SPIKED GO 2026-08-29; Phase 1 in TDD. GO-with-constraints but under a DIFFERENT partition than first proposed: isInMainFile is exactly the A_dup regression and records cannot be bucketed by TU at all. What works is C linkage for functions/globals plus link-time shape CONFLICT with a non-escape guard for records. Measured: :: round-trips through the dialect with no new ops and use sites need zero emitter change; prototype 61+51 lines; gate 902/902 with ZERO golden churn; 501-object systemd link exit 0 at 12,104,378 bytes with one mod tu314; ten adversarial cases byte-diffed. Falsified FR-154 (A-prime) claim that no predicate separates link-merge-errors.c from the systemd collision -- an escape predicate does, and it is right on the merits. In-slice constraints: absolute paths (E0433), three predicates that silently no-op on paths including the FR-77 dangling-target backstop, a transitive escape guard, and the global-visibility gap. Phase 2 renames modules to source stems; Phase 3 (statics into modules, 93% of fns) is HELD behind FR-157/FR-158 since it delivers zero progress toward a building crate."
 blocked_by = []
 anchor = "FR-159 (opened by the repo owner 2026-08-29"
 
