@@ -38,6 +38,7 @@ add_mlir_conversion_library(MLIRConvertToEmitRust
   MLIRMemRefDialect
   MLIRSCFDialect
   MLIRUBDialect
+  MLIRParser
   MLIRPass
   MLIRTransformUtils
   )

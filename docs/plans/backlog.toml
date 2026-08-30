@@ -412,6 +412,17 @@ blocked_by = []
 anchor = "FR-161 (FR-158 Phase 3, split out 2026-08-29"
 
 [[items]]
+id = "FR-163"
+rank = 8
+kind = "defect"
+status = "landed"
+size = "S"
+title = "The CMake build did not link: ConvertToEmitRust omitted MLIRParser"
+summary = "LANDED 2026-08-29. emitrust-clang failed with undefined reference to mlir::parseSourceString; CanonicalRoundTrip.cpp includes mlir/Parser/Parser.h and calls it, but the library CMakeLists never declared MLIRParser. Latent since FR-134. Fix is one line in LINK_LIBS PUBLIC. The 910-test meson gate CANNOT see this class: meson links the monolithic libMLIR.so which already contains the symbol, so a missing per-component dependency is structurally invisible while CI (CMake, per-component archives) is broken. Two of my controls were invalid first: emitrust-opt is immune because MLIROptLib pulls the parser transitively, and a hand-rolled python revert silently did not write so a control still had the fix. The proposed patch was one line too long -- the tool-level edit is unnecessary, the library-level declaration alone links at rc=0. All five CMake tools build. A tree scan found exactly one instance of the class."
+blocked_by = []
+anchor = "FR-163 DEFECT (found 2026-08-29 by an agent diagnosing a nix build"
+
+[[items]]
 id = "FR-138"
 rank = 14
 kind = "tooling"
