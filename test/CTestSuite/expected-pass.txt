@@ -1,7 +1,7 @@
 # c-testsuite single-exec conformance ledger for emitrust-cc.
 # One passing test filename per line.  Regenerated via:
 #   run_c_testsuite.py ... --update
-# Generated against the current build/bin/emitrust-cc; the
+# Generated against the current build/tools/emitrust-cc; the
 # integration pass will regenerate this after the in-flight
 # switch/enum features land.
 00001.c

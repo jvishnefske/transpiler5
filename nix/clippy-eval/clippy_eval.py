@@ -53,7 +53,7 @@ if HARNESS not in sys.path:
     sys.path.insert(0, HARNESS)
 import epoch as epoch_mod  # noqa: E402  (the epoch/drift authority is shared)
 
-EMITRUST_CC = os.environ.get("EMITRUST_CC", "./build/bin/emitrust-cc")
+EMITRUST_CC = os.environ.get("EMITRUST_CC", "./build/tools/emitrust-cc")
 
 # The authoritative ratchet baseline. Pinned to epoch-5 (the union corpus
 # test/EndToEnd x {.c,.cpp}, measurability-filtered, re-probed at f734fed).

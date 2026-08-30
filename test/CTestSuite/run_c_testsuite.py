@@ -274,7 +274,7 @@ def write_manifest(path, passing):
             "# c-testsuite single-exec conformance ledger for emitrust-cc.\n"
             "# One passing test filename per line.  Regenerated via:\n"
             "#   run_c_testsuite.py ... --update\n"
-            "# Generated against the current build/bin/emitrust-cc; the\n"
+            "# Generated against the current build/tools/emitrust-cc; the\n"
             "# integration pass will regenerate this after the in-flight\n"
             "# switch/enum features land.\n"
         )
