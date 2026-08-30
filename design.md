@@ -11527,8 +11527,62 @@ piece and becomes FR-45.
   had.
   RECORDED GAP for Phase 3, flagged at the emission site: FR-51 export mode
   still emits NO visibility on globals at all.
-  **PHASE 1 LANDED. Phase 2 (source-stem module names) and Phase 3 (statics
-  into modules, HELD behind FR-157/FR-158) remain.**
+  PHASE 2 SPIKED AND LANDED 2026-08-30: **GO**, with three guards the entry
+  did not name. Measured before dispatch, on the rebuilt 501-object
+  `systemd-detect-virt` link (12,415,236 bytes, exit 0):
+  * The crate contains exactly ONE module, and it is `mod tu314` == object
+    index 314 == `src/shared/hibernate-util.c`. So phase 2's realized effect
+    on the largest real link is ONE rename, `tu314` -> `hibernate_util`. The
+    entry's "798 modules called tu0..tu797" is a PHASE 3 figure and phase 3
+    is held; do not read it as this phase's prize. What phase 2 actually buys
+    is POSITION-INDEPENDENCE: the module name stops being a link-line
+    ordinal, so reordering the link line no longer renames a module.
+  * Stem uniqueness confirmed at 497/501, and all four duplicates
+    (`btrfs-util`, `label-util`, `mkdir`, `tmpfile-util`) are genuinely
+    different files separated by exactly ONE parent component
+    (`src/basic/mkdir.c` vs `src/shared/mkdir.c`), so climbing one directory
+    rank disambiguates every one of them WITHOUT falling back to an ordinal.
+  THREE GUARDS, each from a rustc probe rather than from reasoning:
+  * A module lives in the TYPE namespace: root `struct Buf` + `mod Buf` is
+    `error[E0428]: the name 'Buf' is defined multiple times`. But root
+    `fn mkdir` + `mod mkdir` COMPILES, and so does `static v` + `mod v`.
+    The reserved set is therefore struct/enum/data_enum/trait names ONLY --
+    reserving function and global names as well would have pushed a real
+    stem like `mkdir` back to an ordinal for no reason.
+  * `mod loop {}` is `error: expected identifier, found keyword 'loop'`, so a
+    keyword stem must fall back.
+  * The `tu<digits>` SHAPE is reserved: a source file named `tu3.c` must not
+    be able to steal shard 3's fallback name.
+  ONE DESIGN DECISION worth recording because the obvious alternative is
+  wrong: the ladder is climbed ONLY to break a genuine duplicate, never to
+  repair an invalid name. A rank>0 name embeds an enclosing DIRECTORY name,
+  which in the lit suite is an unstable temp path; climbing to fix a keyword
+  would have made goldens nondeterministic. Invalid at rank 0 => ordinal.
+  ALSO FOUND: `mergeLinkShards` step 0 calls `stripShardMetadata` BEFORE the
+  classify loop, so `getShardSource` must be read in that same loop -- the
+  source path is gone by the time the sink runs.
+  AS LANDED (274 lines in `LinkMerge.cpp`, one new Driver test with six legs
+  and one EndToEnd byte-diff; gate 944/944, up from 942 by exactly those two
+  files): VERIFIED INDEPENDENTLY on the 501-object link -- `mod tu314` ->
+  `mod hibernate_util`, 12,415,236 -> 12,415,263 bytes, and a
+  rename-substituted diff of the two crates is EMPTY, so the delta is exactly
+  3 occurrences x 9 characters and nothing else moved. The `tu314_*` STATIC
+  tags are untouched, which is the phase-3 boundary holding.
+  Two findings from the implementation, neither in the spike:
+  * The `tu<N>` shape guard was untested by the four legs the brief named,
+    so a TUSHAPE leg was added: a source named `tu0.c` at link position 1
+    emits `mod tu1`, not `mod tu0`. Without the guard it would have stolen
+    shard 0's fallback name.
+  * A CAPITALIZED stem now yields a capitalized module (`Gadget.c` ->
+    `mod Gadget`), a rustc `non_snake_case` WARNING in the emitted crate --
+    never an error, and the clippy ratchet stayed green. Lowercasing was
+    deliberately NOT done: it would manufacture collisions (`Mkdir.c` vs
+    `mkdir.c`) the ladder would then have to break.
+  The ROOTTYPE leg was checked with a NEGATIVE CONTROL -- renaming its file
+  `Widget.c` -> `Gadget.c` gives `mod Gadget` -- so it falls back because
+  `Widget` is in the reserved type set, not because the stem is capitalized.
+  **PHASES 1 AND 2 LANDED. Phase 3 (statics into modules) stays HELD behind
+  FR-157/FR-158.**
 
 - [x] FR-155 DEFECT (MISCOMPILE, found by the FR-152 spike 2026-08-29, FIXED
   the same day): A DEAD `goto` SILENTLY CHANGED A FUNCTION'S ANSWER. A

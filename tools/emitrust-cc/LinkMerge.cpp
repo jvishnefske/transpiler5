@@ -28,13 +28,16 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/BinaryFormat/Magic.h"
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 using namespace mlir;
@@ -855,6 +858,231 @@ static LogicalResult adaptSliceRefinedCalls(ModuleOp shard,
   return success(!failed);
 }
 
+//===----------------------------------------------------------------------===//
+// FR-159 phase 2: naming a shard's per-TU module after its source file
+//===----------------------------------------------------------------------===//
+
+/// True for the characters a Rust identifier is made of. Everything else in
+/// a file or directory name becomes `_`, so `hibernate-util.c` can name a
+/// module at all (`mod hibernate-util` is a parse error).
+static bool isModuleNameChar(char c) { return llvm::isAlnum(c) || c == '_'; }
+
+/// `text` with every non-identifier character replaced by `_`.
+static std::string sanitizeModuleWord(llvm::StringRef text) {
+  std::string out;
+  out.reserve(text.size());
+  for (char c : text)
+    out.push_back(isModuleNameChar(c) ? c : '_');
+  return out;
+}
+
+/// True when `name` cannot be spelled as a Rust module name at all. The
+/// strict and reserved keyword lists are both here: `mod loop {}` is
+/// `error: expected identifier, found keyword 'loop'`, and a reserved word
+/// becomes the same error the day the edition that reserves it arrives, so
+/// a shard whose file is named after one takes the ordinal fallback instead.
+static bool isUnspellableModuleName(llvm::StringRef name) {
+  if (name.empty() || llvm::isDigit(name.front()))
+    return true;
+  return llvm::StringSwitch<bool>(name)
+      .Cases("as", "break", "const", "continue", true)
+      .Cases("crate", "dyn", "else", "enum", true)
+      .Cases("extern", "false", "fn", "for", true)
+      .Cases("if", "impl", "in", "let", true)
+      .Cases("loop", "match", "mod", "move", true)
+      .Cases("mut", "pub", "ref", "return", true)
+      .Cases("self", "Self", "static", "struct", true)
+      .Cases("super", "trait", "true", "type", true)
+      .Cases("unsafe", "use", "where", "while", true)
+      .Cases("async", "await", "abstract", "become", true)
+      .Cases("box", "do", "final", "macro", true)
+      .Cases("override", "priv", "typeof", "unsized", true)
+      .Cases("virtual", "yield", "try", "gen", true)
+      // `_` is a reserved identifier, not a name.
+      .Case("_", true)
+      .Default(false);
+}
+
+/// True for the `tu<N>` shape. That spelling is RESERVED for the ordinal
+/// fallback below, so the two naming schemes can never meet: a C file
+/// literally named `tu3.c` must not be able to claim shard 3's fallback
+/// name and leave two shards fighting over one module.
+static bool isOrdinalShapedName(llvm::StringRef name) {
+  if (!name.consume_front("tu") || name.empty())
+    return false;
+  return llvm::all_of(name, [](char c) { return llvm::isDigit(c); });
+}
+
+/// The candidate ladder for one source path, innermost first: rank 0 is the
+/// file's stem, and each further rank prepends one more enclosing directory
+/// component. Climbing is what distinguishes `src/basic/mkdir.c` from
+/// `src/shared/mkdir.c` -- in systemd's 501 objects, four stems repeat and
+/// every one of them is separated by exactly ONE directory component.
+static llvm::SmallVector<std::string> buildModuleNameLadder(
+    llvm::StringRef path) {
+  llvm::SmallVector<llvm::StringRef> components;
+  for (llvm::StringRef component :
+       llvm::make_range(llvm::sys::path::begin(path),
+                        llvm::sys::path::end(path))) {
+    // The root ("/") and the no-op components carry no name.
+    if (component == "/" || component == "\\" || component == "." ||
+        component == "..")
+      continue;
+    components.push_back(component);
+  }
+  llvm::SmallVector<std::string> ladder;
+  if (components.empty())
+    return ladder;
+  std::string suffix =
+      sanitizeModuleWord(llvm::sys::path::stem(components.back()));
+  ladder.push_back(suffix);
+  for (size_t depth = components.size() - 1; depth-- > 0;) {
+    suffix = sanitizeModuleWord(components[depth]) + "_" + suffix;
+    ladder.push_back(suffix);
+  }
+  return ladder;
+}
+
+/// FR-159 phase 2: one Rust module name per shard, parallel to `shards`.
+///
+/// Phase 1 named a sunk record's module after the shard's link-line ORDINAL.
+/// That is unique by construction but it is a property of the BUILD, not of
+/// the program: reorder the link line and every module is renamed, and `mod
+/// tu314` tells a reader nothing about which C file the type came from. The
+/// name here is derived from the shard's recorded source path instead, so the
+/// emitted crate is a function of the sources.
+///
+/// The ordinal name survives as the fallback, and every path that reaches it
+/// emits exactly the phase-1 bytes. A shard takes it when it records no
+/// source path, when its stem cannot be a Rust module name (a keyword, a
+/// digit-leading name, the reserved `tu<N>` shape, or a name that would
+/// collide with a crate-ROOT item), or when it shares a stem with another
+/// shard and the ladder runs out before they separate.
+///
+/// A stem that is merely INVALID does not climb: climbing is for breaking
+/// genuine duplicates, and a rank-1 name is built from the enclosing
+/// DIRECTORY, which for a lit temp tree or an out-of-tree build directory is
+/// not a stable part of the program. Falling back to the ordinal keeps such a
+/// shard's name a function of the link line alone rather than of where the
+/// tree happens to sit on disk.
+///
+/// The result depends only on (`sourcePaths`, `ordinals`, `reserved`) -- never
+/// on iteration order of a hash container -- so two links of the same objects
+/// emit the same crate.
+static llvm::SmallVector<std::string> computeShardModuleNames(
+    llvm::ArrayRef<std::string> sourcePaths, llvm::ArrayRef<unsigned> ordinals,
+    const llvm::StringSet<> &reserved) {
+  size_t count = sourcePaths.size();
+  llvm::SmallVector<std::string> names(count);
+  llvm::SmallVector<llvm::SmallVector<std::string>> ladders(count);
+  llvm::SmallVector<size_t> ranks(count, 0);
+  llvm::StringSet<> assigned;
+
+  auto takeOrdinal = [&](size_t index) {
+    names[index] = ("tu" + llvm::Twine(ordinals[index])).str();
+  };
+  auto usable = [&](llvm::StringRef candidate) {
+    return !isUnspellableModuleName(candidate) &&
+           !isOrdinalShapedName(candidate) && !reserved.contains(candidate) &&
+           !assigned.contains(candidate);
+  };
+
+  // Pass 1: everything that can never carry a stem name settles now, so the
+  // duplicate-breaking pool below holds only live candidates.
+  llvm::SmallVector<size_t> pool;
+  for (size_t index = 0; index < count; ++index) {
+    if (sourcePaths[index].empty()) {
+      takeOrdinal(index);
+      continue;
+    }
+    ladders[index] = buildModuleNameLadder(sourcePaths[index]);
+    if (ladders[index].empty() || !usable(ladders[index].front())) {
+      takeOrdinal(index);
+      continue;
+    }
+    pool.push_back(index);
+  }
+
+  // Pass 2: to fixpoint. A candidate that exactly one pool member wants, and
+  // that nothing has taken, is that member's name; every member of a
+  // contested candidate climbs one rank. Each round either removes a member
+  // from the pool or raises its rank, and ranks are bounded by the path
+  // depth, so this terminates.
+  while (!pool.empty()) {
+    llvm::StringMap<unsigned> claims;
+    for (size_t index : pool)
+      ++claims[ladders[index][ranks[index]]];
+    llvm::SmallVector<size_t> contested;
+    for (size_t index : pool) {
+      llvm::StringRef candidate = ladders[index][ranks[index]];
+      if (claims[candidate] == 1 && usable(candidate)) {
+        names[index] = candidate.str();
+        assigned.insert(candidate);
+        continue;
+      }
+      size_t next = ranks[index] + 1;
+      if (next >= ladders[index].size() || !usable(ladders[index][next])) {
+        takeOrdinal(index);
+        continue;
+      }
+      ranks[index] = next;
+      contested.push_back(index);
+    }
+    pool = std::move(contested);
+  }
+  return names;
+}
+
+/// The names a per-TU module may NOT take, collected over every shard before
+/// anything is sunk.
+///
+/// A Rust `mod` lives in the TYPE namespace, so root `struct Buf` next to
+/// `mod Buf` is `error[E0428]: the name 'Buf' is defined multiple times` --
+/// measured on rustc, and it loses the whole crate. Only type-namespace items
+/// are collected for that reason: root `fn mkdir` next to `mod mkdir`, and
+/// `static v` next to `mod v`, both COMPILE (different namespaces), and
+/// reserving function and global names would push real files like systemd's
+/// `mkdir.c` off their own stems for nothing.
+///
+/// Every identifier-shaped word of every `use` path joins the set too: `use
+/// std::collections::HashMap` reserves `std`, `collections` and `HashMap`. It
+/// is deliberately over-broad -- it costs at most an ordinal fallback -- and
+/// it closes the whole "a C file named Vec.c" hazard without teaching this
+/// code to parse Rust use-trees.
+static llvm::StringSet<> collectReservedModuleNames(
+    llvm::MutableArrayRef<OwningOpRef<ModuleOp>> shards) {
+  llvm::StringSet<> reserved;
+  // FR-62's actor runtime is a `mod actor_rt` the emitter appends as a raw
+  // string epilogue whenever an actor anchor exists. No op in any shard
+  // carries that name, so nothing above would ever find it.
+  reserved.insert("actor_rt");
+  for (OwningOpRef<ModuleOp> &shard : shards) {
+    for (Operation &op : shard->getBody()->getOperations()) {
+      if (isa<emitrust::StructDefOp, emitrust::EnumDefOp,
+              emitrust::DataEnumDefOp, emitrust::TraitDefOp>(op)) {
+        if (auto symbol = dyn_cast<SymbolOpInterface>(&op))
+          reserved.insert(symbol.getName());
+        continue;
+      }
+      auto use = dyn_cast<emitrust::UseOp>(op);
+      if (!use)
+        continue;
+      llvm::StringRef path = use.getPath();
+      for (size_t index = 0; index < path.size();) {
+        if (!isModuleNameChar(path[index])) {
+          ++index;
+          continue;
+        }
+        size_t start = index;
+        while (index < path.size() && isModuleNameChar(path[index]))
+          ++index;
+        reserved.insert(path.substr(start, index - start));
+      }
+    }
+  }
+  return reserved;
+}
+
 } // namespace
 
 FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
@@ -871,8 +1099,19 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
   // ledger, source facts) from every shard. It is a per-TU fact the caller
   // has already surfaced; the merged whole-program module must stay
   // byte-comparable to the joint import's, which never carries it.
-  for (OwningOpRef<ModuleOp> &shard : shards)
+  //
+  // FR-159 phase 2: the source path is READ OUT here, because the strip
+  // below is what destroys it and it is the only place a shard says which C
+  // file it came from. An artifact that predates source recording leaves an
+  // empty string, which the naming below reads as "ordinal fallback".
+  llvm::SmallVector<std::string> sourcePaths;
+  sourcePaths.reserve(shards.size());
+  for (OwningOpRef<ModuleOp> &shard : shards) {
+    std::optional<emitrust::ShardSource> source =
+        emitrust::getShardSource(*shard);
+    sourcePaths.push_back(source ? source->path : std::string());
     emitrust::stripShardMetadata(*shard);
+  }
 
   // Step 1: per-shard alpha-rename to global ordinals (the positional
   // default when the caller supplied no maps).
@@ -885,6 +1124,19 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
       return failure();
   }
 
+  // FR-159 phase 2: the per-TU module names, one per shard. This runs AFTER
+  // step 1 so the reserved set sees the symbol names the crate will actually
+  // carry, and BEFORE the classify loop so a sink has its name ready the
+  // moment it needs one.
+  llvm::SmallVector<unsigned> shardOrdinals;
+  shardOrdinals.reserve(shards.size());
+  for (size_t index = 0; index < shards.size(); ++index)
+    shardOrdinals.push_back(ordinalMaps.empty()
+                                ? static_cast<unsigned>(index)
+                                : ordinalMaps[index].front());
+  llvm::SmallVector<std::string> moduleNames = computeShardModuleNames(
+      sourcePaths, shardOrdinals, collectReservedModuleNames(shards));
+
   // One pass over every module-level op of every shard, in link-line order,
   // classifying: definitions (for steps 2 and 3), marked declarations
   // (step 2's obligations), and use/verbatim header ops (step 4).
@@ -893,13 +1145,15 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
   llvm::StringSet<> headerTexts;
   llvm::SmallVector<Operation *> toErase;
   for (auto [shardIndex, shard] : llvm::enumerate(shards)) {
-    // FR-159: the ordinal this shard's per-TU module is named after. It is
-    // the shard's own link-line position -- the same ordinal step 1 just
-    // renamed its `tu<N>_` tags to -- so `mod tu314` holds exactly the items
-    // `tu314_*` came from, and two shards can never claim one module.
-    unsigned tuOrdinal = ordinalMaps.empty()
-                             ? static_cast<unsigned>(shardIndex)
-                             : ordinalMaps[shardIndex].front();
+    // FR-159: the name of this shard's per-TU module. Phase 2 derives it
+    // from the shard's own SOURCE FILE (`hibernate-util.c` -> `mod
+    // hibernate_util`) rather than from its link-line position, so
+    // reordering the link line no longer renames modules and a reader can
+    // find the file a `mod` came from; a shard whose stem is unusable keeps
+    // the phase-1 ordinal name. Either way the assignment above is
+    // INJECTIVE, so the module holds exactly the items of one shard and two
+    // shards can never claim one module.
+    llvm::StringRef tuModuleName = moduleNames[shardIndex];
     // Computed lazily and once: a shape conflict is rare (exactly one across
     // the 501-object systemd link), and the walk is linear in the shard.
     llvm::StringMap<Operation *> escapes;
@@ -963,9 +1217,8 @@ FailureOr<OwningOpRef<ModuleOp>> emitrustcc::mergeLinkShards(
         }
         auto escapeIt = escapes.find(symbol.getName());
         if (!sinkDisabled && escapeIt == escapes.end()) {
-          std::string sunk = ("crate::tu" + llvm::Twine(tuOrdinal) +
-                              "::" + symbol.getName())
-                                 .str();
+          std::string sunk =
+              ("crate::" + tuModuleName + "::" + symbol.getName()).str();
           StringAttr sunkAttr = StringAttr::get(op.getContext(), sunk);
           llvm::StringRef recordName = symbol.getName();
           AttrTypeReplacer repath;

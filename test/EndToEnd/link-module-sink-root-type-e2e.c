@@ -2,17 +2,18 @@
 // FR-173 D2: a per-TU module emitted for a SUNK record must import the
 // crate root.
 //
-// FR-159 sinks a shape-conflicting, translation-unit-local record into
-// `mod tu<N> { ... }`. The sunk struct_def keeps its FIELD TYPES, and those
+// FR-159 sinks a shape-conflicting, translation-unit-local record into a
+// per-TU module -- named after the shard's source file since phase 2, so
+// `b.c` gives `mod b { ... }`. The sunk struct_def keeps its FIELD TYPES, and those
 // may name records that stayed at the crate ROOT -- here `struct P`, which
 // exists in only one shard and so never conflicts and never sinks. Inside
-// `mod tu1` the bare name `P` resolves in the MODULE's namespace, and
+// that module the bare name `P` resolves in the MODULE's namespace, and
 // rustc's answer is `error[E0425]: cannot find type 'P' in this scope`: the
 // whole crate is lost, with a rustc error rather than a located one, which
 // is precisely the silent-degradation direction FR-159's own guard exists
 // to prevent. Measured at HEAD on this very program, `emitrust-cc --link
-// ... --emit=rust` emitted `mod tu1 {` with no import at all and the crate
-// did not build.
+// ... --emit=rust` emitted the sunk module with no import at all and the
+// crate did not build.
 //
 // The fix is `use super::*;` at the head of the module. It is emitted only
 // when the module actually reaches a root name -- an unused `use super::*;`
@@ -35,7 +36,7 @@
 // The sink happened AND the module carries the import, at the module's own
 // indentation, ahead of every item:
 // RUN: FileCheck %s --check-prefix=SUNK --strict-whitespace < %t.crate/src/main.rs
-//      SUNK:mod tu1 {
+//      SUNK:mod b {
 // SUNK-NEXT:    use super::*;
 // SUNK-NEXT:    #[derive(Clone, Copy, Default)]
 // SUNK-NEXT:    pub(crate) struct S {
