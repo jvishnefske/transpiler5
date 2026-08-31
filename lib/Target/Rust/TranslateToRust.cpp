@@ -440,6 +440,14 @@ private:
   /// Emits `impl <name> { ... }` with the contained functions rendered as
   /// `&mut self` methods one indentation level deeper.
   LogicalResult emitImpl(emitrust::ImplOp implOp);
+  /// FR-179: emits the module-scope epilogue that makes an FR-62
+  /// actor-lifted C function reachable by dlsym again -- one thread_local
+  /// `RefCell<Owner>` singleton per owner struct, then one
+  /// `#[no_mangle] extern "C"` free function per collected wrapper that
+  /// borrows it and delegates to the `&mut self` method. Emits nothing at
+  /// all when `cAbiActorWrappers` is empty, which is every run without
+  /// `--c-abi-exports`.
+  LogicalResult emitCAbiActorWrappers();
   /// FR-62 slice 5b: emits the per-actor runtime an `emitrust.actor_runtime`
   /// anchor stands for, derived entirely from the referenced struct's impl —
   /// the `<Actor>Msg` enum (variant = UpperCamel(method), payload fields =
@@ -693,6 +701,43 @@ private:
   /// Builtin method spellings (`unwrap`, `len`, ...) and Phase-4 C owner
   /// methods never appear as keys, so they pass through verbatim.
   llvm::StringMap<std::pair<llvm::StringRef, llvm::StringRef>> methodRustNames;
+
+  /// FR-179: one pending `#[no_mangle] extern "C"` free-function wrapper
+  /// for an FR-62 actor-lifted C owner method, collected by `emitFunc`
+  /// (which is where the method's parameter SPELLINGS are known) and
+  /// rendered by `emitCAbiActorWrappers` as a module-scope epilogue. The
+  /// method itself is untouched, byte for byte.
+  struct CAbiActorWrapper {
+    /// The method's location, for the wrapper's type diagnostics.
+    Location loc;
+    /// The owner struct the FR-62 lift synthesized (`Tu0MBaseActor`).
+    StringRef owner;
+    /// The bare C symbol, which is also the exported function's name.
+    StringRef symbol;
+    /// The method's in-impl spelling, i.e. what the wrapper calls.
+    StringRef printedName;
+    /// The `pub ` the method itself carries.
+    StringRef visibility;
+    /// The non-receiver parameters, in order, exactly as the method
+    /// rendered them.
+    SmallVector<std::string> argNames;
+    SmallVector<Type> argTypes;
+    /// The single result type, or null for a void function.
+    Type resultType;
+  };
+  SmallVector<CAbiActorWrapper> cAbiActorWrappers;
+
+  /// FR-179: the owner structs an `emitrust.actor_runtime` anchor manages.
+  /// Such an owner's instance is the one the spawned mailbox loop holds, so
+  /// a second, thread_local instance beside it would be a SECOND copy of the
+  /// state -- the wrapper refuses those rather than export a symbol that
+  /// mutates the wrong actor.
+  llvm::StringSet<> actorRuntimeOwners;
+
+  /// FR-179: the module-scope singleton name for `owner`.
+  static std::string actorSingletonName(StringRef owner) {
+    return ("__EMITRUST_ACTOR_" + owner.upper());
+  }
 
   /// FR-140: set when a name RENDERED inside the item under emission would
   /// trip rustc's `non_snake_case` lint; consumed (and reset) by
@@ -4494,6 +4539,9 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   // other's wrappers.
   emitrust::ActorRuntimeOp firstAnchor;
   for (auto runtime : moduleOp.getOps<emitrust::ActorRuntimeOp>()) {
+    // FR-179: record every runtime-managed owner before any function is
+    // rendered -- the C-ABI wrapper decision in `emitFunc` needs it.
+    actorRuntimeOwners.insert(runtime.getActor());
     if (!firstAnchor) {
       firstAnchor = runtime;
       continue;
@@ -4647,6 +4695,12 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
     decreaseIndent();
     os << "}\n";
   }
+  // FR-179: the C-ABI wrappers for FR-62 actor-lifted owner methods, at
+  // MODULE scope (a `#[no_mangle] extern "C"` item cannot live inside an
+  // `impl`). Nothing is collected without `--c-abi-exports`, so a default
+  // run reaches this with an empty list and emits not one byte.
+  if (failed(emitCAbiActorWrappers()))
+    return failure();
   // FR-62 slice 5b: the shared actor runtime — Handle<M>, the synchronous
   // call protocol, and the reap/shutdown panic-provenance plumbing — is one
   // fixed, message-type-generic module, emitted once per crate when any
@@ -4679,6 +4733,82 @@ LogicalResult RustEmitter::emitImpl(emitrust::ImplOp implOp) {
   }
   decreaseIndent();
   os << "}\n";
+  return success();
+}
+
+LogicalResult RustEmitter::emitCAbiActorWrappers() {
+  if (cAbiActorWrappers.empty())
+    return success();
+  // ONE singleton per OWNER, in first-appearance order, shared by every
+  // wrapper on that owner: two exported methods of one C translation unit's
+  // lifted statics must see the SAME state, exactly as the C file-scope
+  // variables they came from did.
+  //
+  // `thread_local!` and not a process-global `Mutex` or a `static mut`: it
+  // is the same substrate this emitter already renders every mutable C
+  // file-scope global into (see `emitGlobal`), it is exact for the
+  // single-threaded programs the importer accepts, and it keeps the crate
+  // free of `unsafe`.
+  //
+  // `RefCell` makes the aliasing rule dynamic. A C callback that re-enters
+  // an exported symbol while the borrow is live PANICS ("already borrowed")
+  // inside an `extern "C"` frame, which aborts. That is loud and located,
+  // never silent state corruption -- the repo's required safe failure
+  // direction.
+  SmallVector<StringRef> owners;
+  llvm::StringSet<> seen;
+  for (const CAbiActorWrapper &wrapper : cAbiActorWrappers)
+    if (seen.insert(wrapper.owner).second)
+      owners.push_back(wrapper.owner);
+  for (StringRef owner : owners) {
+    std::string singleton = actorSingletonName(owner);
+    os << "thread_local! {\n";
+    increaseIndent();
+    os << "static " << singleton << ": std::cell::RefCell<" << owner
+       << "> = std::cell::RefCell::new(" << owner << "::new());\n";
+    decreaseIndent();
+    os << "}\n";
+  }
+  for (const CAbiActorWrapper &wrapper : cAbiActorWrappers) {
+    // FR-140: the wrapper binds the bare C name and the method's parameter
+    // spellings, either of which can trip `non_snake_case`; it opens its own
+    // allow-scope for the same reason the function item does.
+    const size_t itemStart = openNonSnakeCaseScope();
+    noteBoundName(wrapper.symbol);
+    for (const std::string &argName : wrapper.argNames)
+      noteBoundName(argName);
+    // The closure binding cannot collide with a parameter: `__`-leading
+    // spellings are reserved in C, but a name that arrived anyway would
+    // otherwise pass the ACTOR where an argument belongs.
+    std::string actorName = "__emitrust_actor";
+    while (llvm::is_contained(wrapper.argNames, actorName))
+      actorName += "_";
+    std::string singleton = actorSingletonName(wrapper.owner);
+    os << "#[no_mangle]\n"
+       << wrapper.visibility << "extern \"C\" fn " << wrapper.symbol << "(";
+    for (auto [index, argName] : llvm::enumerate(wrapper.argNames)) {
+      if (index)
+        os << ", ";
+      os << argName << ": ";
+      if (failed(emitType(wrapper.loc, wrapper.argTypes[index])))
+        return failure();
+    }
+    os << ")";
+    if (wrapper.resultType) {
+      os << " -> ";
+      if (failed(emitType(wrapper.loc, wrapper.resultType)))
+        return failure();
+    }
+    os << " {\n";
+    increaseIndent();
+    os << singleton << ".with(|" << actorName << "| " << actorName
+       << ".borrow_mut()." << wrapper.printedName << "(";
+    llvm::interleaveComma(wrapper.argNames, os);
+    os << "))\n";
+    decreaseIndent();
+    os << "}\n";
+    closeNonSnakeCaseScope(itemStart);
+  }
   return success();
 }
 
@@ -4913,6 +5043,38 @@ static bool hasAllScalarSignature(FunctionType type) {
          llvm::all_of(type.getResults(), isCAbiScalarType);
 }
 
+/// FR-179: the same predicate over the C signature of an FR-62 actor-lifted
+/// owner method, i.e. the method's signature with block argument 0 -- the
+/// SYNTHESIZED `&mut self` receiver, which the C function never had --
+/// dropped. `uint16_t float2half(float)` is all-scalar in C whether or not
+/// its lookup tables became fields of an owner struct.
+static bool hasAllScalarSignatureWithoutReceiver(FunctionType type) {
+  if (type.getNumInputs() < 1)
+    return false;
+  return llvm::all_of(type.getInputs().drop_front(), isCAbiScalarType) &&
+         llvm::all_of(type.getResults(), isCAbiScalarType);
+}
+
+/// FR-179: true when `implOp` holds the zero-argument associated `fn new()`
+/// the FR-62 lift synthesizes for an EXPORTED owner. Checked, never assumed:
+/// a non-exported actor's impl has no constructor at all, and a wrapper that
+/// named one would be a rustc error in the emitted crate.
+static bool ownerHasNullaryNew(emitrust::ImplOp implOp) {
+  if (!implOp)
+    return false;
+  for (auto fn : implOp.getBody().front().getOps<emitrust::FuncOp>()) {
+    StringAttr name = SymbolTable::getSymbolName(fn);
+    if (!name || name.getValue() != "new")
+      continue;
+    if (!fn->hasAttr(emitrust::kStaticMethodAttrName))
+      continue;
+    FunctionType type = fn.getFunctionType();
+    if (type.getNumInputs() == 0 && type.getNumResults() == 1)
+      return true;
+  }
+  return false;
+}
+
 LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   Operation *op = funcOp.getOperation();
   auto fn = cast<FunctionOpInterface>(op);
@@ -5094,6 +5256,21 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // the boundary (FR-138, measured). `#[no_mangle]` on a generic item has no
   // single symbol to name. `extern "C" async fn` is not Rust at all.
   bool cAbiExport = false;
+  // FR-179: set when this function is an FR-62 actor-lifted C owner method
+  // whose C signature (the receiver dropped) is all-scalar. The method
+  // itself keeps the `pub fn ...(&mut self, ...)` it has always had, byte
+  // for byte; a module-scope `#[no_mangle] extern "C"` wrapper delegating
+  // through a per-owner thread_local singleton is emitted for it instead.
+  bool cAbiActorWrapper = false;
+  // FR-179: the discriminator between the two kinds of impl member that
+  // reach here, attribute-keyed and never prefix-parsed (see FR-110 above).
+  // A genuine C++ member carries `emitrust.method_rust_name`; a receiverless
+  // C++ static member fails `isMethod`; an imported destructor lands in a
+  // TRAIT impl and fails `!inTraitImpl`. What is left is exactly the
+  // Phase-4 C owner method, whose symbol is still the bare C name -- the
+  // one case for which exporting that name is what the C source said.
+  bool isCOwnerMethod =
+      isMethod && !op->hasAttr(emitrust::kMethodRustNameAttrName);
   // FR-159: never for an item inside a per-TU module. Such an item is
   // translation-unit-local by construction, so a `#[no_mangle] extern "C"`
   // symbol for it would export a name C never had.
@@ -5105,13 +5282,34 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
     else if (op->hasAttr(emitrust::kExternalsGenericAttrName))
       blocker = "it is generic over the external-requirements trait (FR-52), "
                 "so it has no single symbol to name";
-    else if (!hasAllScalarSignature(funcOp.getFunctionType()))
+    else if (isCOwnerMethod) {
+      // FR-179: the FR-62 lift moved this C function onto an owner struct.
+      // The C signature it had is the method's minus the synthesized
+      // receiver, and refusing the export for the receiver alone would be a
+      // defect: the lifted STATE is real (the body reads and writes it), so
+      // "do not lift it" is not the alternative -- a singleton the wrapper
+      // borrows is.
+      if (!hasAllScalarSignatureWithoutReceiver(funcOp.getFunctionType()))
+        blocker = "its signature is not all-scalar (a C-ABI entry point may "
+                  "only take and return builtin integer and floating-point "
+                  "types)";
+      else if (actorRuntimeOwners.contains(parentImpl.getStructName()))
+        blocker = "its FR-62 owner struct is managed by an actor runtime, "
+                  "whose single instance lives in the spawned mailbox loop; "
+                  "a C-ABI singleton beside it would be a second copy of the "
+                  "state";
+      else if (!ownerHasNullaryNew(parentImpl))
+        blocker = "its FR-62 owner struct has no zero-argument new(), so a "
+                  "C-ABI singleton has nothing to construct from";
+      else
+        cAbiActorWrapper = true;
+    } else if (!hasAllScalarSignature(funcOp.getFunctionType()))
       blocker = "its signature is not all-scalar (a C-ABI entry point may "
                 "only take and return builtin integer and floating-point "
                 "types)";
-    if (blocker.empty())
+    if (blocker.empty() && !cAbiActorWrapper)
       cAbiExport = true;
-    else
+    else if (!blocker.empty())
       // On the LOCATION, not the op: this is a message for the person who
       // wrote the C, and attaching it to the operation makes MLIR dump the
       // whole `emitrust.func` after it.
@@ -5142,6 +5340,10 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // took the name, cursor inputs -- keep the generated vN.
   auto paramNames =
       op->getAttrOfType<ArrayAttr>(emitrust::kParamNamesAttrName);
+  // FR-179: the wrapper's parameters must be spelled exactly like the
+  // method's, so they are captured here rather than re-derived later.
+  SmallVector<std::string> wrapperArgNames;
+  SmallVector<Type> wrapperArgTypes;
   bool first = true;
   for (BlockArgument argument : entryBlock.getArguments()) {
     if (!first)
@@ -5159,11 +5361,15 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
       if (auto slot =
               dyn_cast<StringAttr>(paramNames[argument.getArgNumber()]))
         carried = slot.getValue();
-    os << (carried.empty() ? assignName(argument)
-                           : claimName(argument, carried))
-       << ": ";
+    std::string argName =
+        carried.empty() ? assignName(argument) : claimName(argument, carried);
+    os << argName << ": ";
     if (failed(emitType(argument.getLoc(), argument.getType())))
       return failure();
+    if (cAbiActorWrapper) {
+      wrapperArgNames.push_back(std::move(argName));
+      wrapperArgTypes.push_back(argument.getType());
+    }
   }
   os << ")";
   if (fn.getNumResults() == 1) {
@@ -5171,6 +5377,12 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
     if (failed(emitType(op->getLoc(), fn.getResultTypes().front())))
       return failure();
   }
+  if (cAbiActorWrapper)
+    cAbiActorWrappers.push_back(
+        {op->getLoc(), parentImpl.getStructName(), symbol, printedName,
+         itemVisibility(symbol), std::move(wrapperArgNames),
+         std::move(wrapperArgTypes),
+         fn.getNumResults() == 1 ? fn.getResultTypes().front() : Type()});
   os << " {\n";
   increaseIndent();
   if (failed(emitBlockBody(entryBlock)))

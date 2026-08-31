@@ -47,6 +47,15 @@
 // RUN: grep -c no_mangle %t.cabi/src/lib.rs > %t.cabi.count
 // RUN: FileCheck %s --check-prefix=COUNT --input-file=%t.cabi.count
 //
+// FR-179, the follow-on that wraps an FR-62 actor-lifted method in a
+// module-scope singleton (test/Driver/c-abi-exports-actor.c) must not reach a
+// crate that has no lifted state: nothing here is a method, so no singleton
+// and no delegating wrapper may appear. This narrows the pin above -- the
+// three exports are exactly the three direct ones -- and it is what keeps the
+// byte-for-byte diff below a diff of only the attribute and the ABI spelling.
+// RUN: not grep __EMITRUST_ACTOR %t.cabi/src/lib.rs
+// RUN: not grep thread_local %t.cabi/src/lib.rs
+//
 // The byte-identity guard: the SAME input without the flag is today's output.
 // RUN: emitrust-cc --emit=crate --crate-type=lib %s -o %t.plain 2>%t.plain.err
 // RUN: cat %t.plain/Cargo.toml | FileCheck %s --check-prefix=PLAINTOML

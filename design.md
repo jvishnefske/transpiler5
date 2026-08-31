@@ -11855,6 +11855,334 @@ piece and becomes FR-45.
   size) INDIVIDUALLY, because 32 cases is the first non-zero step and
   nothing below three fixes pays at all.
 
+- [ ] FR-178 (opened 2026-08-30 by the FR-177 implementation attempt, and it
+  CORRECTS FR-177 the way FR-177 corrected FR-138): **FR-177'S MARGINAL-YIELD
+  CURVE IS A CURVE OVER THE *EMIT* STAGE ONLY. EVERY CASE IT CLEARS THEN DIES
+  AT `dlsym`, SO THE SPHINCS+ BUNDLE IS WORTH ZERO PASSES AT ANY NUMBER OF
+  IMPORTER FIXES WHILE FR-139'S REFUSAL STANDS.**
+  FR-177 was right that a case clears only when its WHOLE blocker set clears,
+  and right to replace the first-failure histogram with the per-case set. But
+  the rubric is a THREE-stage pipeline -- emit, then `cargo build`, then
+  `dlopen` + `dlsym` of a BARE symbol -- and FR-177 measured only stage one.
+  A yield curve over one stage of three is the same error one stage further
+  on. That is the FIFTH instance in this ledger (FR-61f x2, FR-165, FR-138,
+  now FR-177). **Rank nothing on this corpus by any single-stage measurement.**
+  METHOD: cross-tabulate FR-177's own per-case blocker sets against the
+  corpus runner's case KIND, then read the four dlsym'd symbols out of the
+  harness and check them against the FR-139 gate at HEAD.
+  MEASURED, all 128 SPHINCS+ cases -- the cross-tab is perfectly clean:
+    blocker-set size  3 -> 32 cases, ALL `lib`
+    blocker-set size  5 -> 48 cases, ALL `lib`
+    blocker-set size 12 -> 36 cases, ALL `exec`
+    blocker-set size 13 -> 12 cases, ALL `exec`
+  So the 80 CHEAP cases (the +3 and +5 steps of FR-177's curve) are EXACTLY
+  the 80 `lib` cases, every one of which must export a bare dlsym-able
+  symbol; and the 48 `exec` cases -- the only SPHINCS+ population that needs
+  no exported symbol at all -- are EXACTLY the expensive 12-to-13-class half.
+  The corpus is arranged precisely against the cheap path.
+  The 80 `lib` cases dlsym one of four symbols, 20 parameter variants each:
+    SPX_initialize_hash_function(spx_ctx *)
+    SPX_prf_addr(unsigned char *, const spx_ctx *, const uint32_t [8])
+    SPX_gen_message_random(unsigned char *, const unsigned char *,
+                           const unsigned char *, const unsigned char *,
+                           unsigned long long, const spx_ctx *)
+    SPX_hash_message(unsigned char *, uint64_t *, uint32_t *, ...)
+  EVERY ONE TAKES POINTERS. Emitting case 101 at HEAD with `--c-abi-exports`
+  refuses all four BY NAME -- "its signature is not all-scalar (a C-ABI entry
+  point may only take and return builtin integer and floating-point types)"
+  -- and the emitted crate contains **ZERO** `#[no_mangle]`. The emitted form
+  is `pub fn spx_initialize_hash_function(ctx: &mut [u8])`: a Rust slice,
+  i.e. a FAT pointer, which is also why FR-139 refused it.
+  CONSEQUENCE: the three FR-177 fixes would move all 32 cases from EMIT_FAIL
+  to SYMBOL_MISSING and score **+0**. Under the standing "keep FR-139's
+  refusal" constraint the whole 128-case bundle is unreachable, and the
+  constraint and the "go for the 32-case prize" goal were in direct conflict
+  from the start. That conflict is a measured fact, not a judgement call.
+  WHAT IS ACTUALLY ON THE BOARD, re-ranked by PASS delta:
+    +3   actor-lifted functions that are ALL-SCALAR IN C -- needs NO FR-139
+         relaxation, no `unsafe`, no pointer export. See FR-179.
+    +1   `to_barycentric`, by-value structs, needs a `repr(C)` ABI promise.
+    +11  of the 15 SYMBOL_MISSING need a pointer C-ABI export.
+    +20  SPHINCS+ CEILING, and only with pointer export AND five import
+         fixes -- **NOT +32 and NOT +80.** FR-181 measured that 3 of the 4
+         dlsym'd symbols are multi-pointer and stay refused whatever the
+         import wall does, so only `SPX_initialize_hash_function` (a single
+         struct pointer, 20 of the 80 cases) is ever reachable. The +32/+80
+         figures on the line above were MINE and they were wrong for the
+         same reason FR-177's were: counting a stage instead of a case.
+  So FR-139, not the importer, gates the near board -- but the SPHINCS+ half
+  of it is worth a fifth of what this entry first claimed. OWNER DECISION 2026-08-30: spike the pointer export,
+  under the standing rule that coverage grows only where safety is proven.
+  The `crc16` miscompile recorded in `test/Driver/c-abi-exports.c` (native
+  27235 vs cdylib 0) is the ready-made repro and MUST be root-caused first;
+  it has never been, and its fat-pointer explanation is reasoning about the
+  shape with no trace, disassembly or reduced repro on record.
+
+- [ ] FR-180 (opened 2026-08-30; SPIKED the same day, GO-with-constraints):
+  **THE ALIASING RENDERING FR-177 CALLED ITS RISKIEST FIX IS ALREADY IN THE
+  TREE -- FOR SINGLE-TU INPUT. THE GAP IS CROSS-TU, NOT THE RENDERING.**
+  The SPHINCS+ shape is mut+shared and GENUINELY OVERLAPPING:
+  `thash(buffer + SPX_N, buffer, 2, ctx, addr)` and `thash(buffer, buffer,
+  2, ctx, addr)` (`app/src/utils.c:79` and `:83`), where `out` is a SUBSET
+  of `in`. `split_at_mut` cannot render either -- they are not disjoint --
+  and the mutness-blind key at `ImportCExpressions.cpp:2996-3011` is NOT the
+  obstacle, because a mutness bit relaxes shared+shared while mut+shared
+  overlap remains a real E0502.
+  THREE CANDIDATES, ALL BYTE-DIFFED AGAINST THE CLANG NATIVE:
+  (A) `split_at_mut` -- VIABLE only at the one genuinely disjoint site
+      (`lib/sha2/src/hash_sha2.c:96`, guarded by `SPX_N + mlen <
+      SPX_SHAX_BLOCK_BYTES`). Exact when the guard holds; PANICS when it is
+      violated (measured: `index out of bounds: the len is 8 but the index
+      is 8`). A loud refinement, but under a no-partial-credit rubric a
+      panic costs the case, so it is not preferred even where it fits.
+  (B) copy-to-temp -- **NOT VIABLE. MEASURED MISCOMPILE.** Counterexample: a
+      callee that writes `out` then re-reads `in`. native `000000001d242b32`
+      vs candidate B `03011f011d242b32`. B happens to be byte-identical on
+      `thash` itself, precisely because `thash` reads all of `in` before
+      writing `out` -- but that is an INTERPROCEDURAL property needing a
+      proof that must survive cross-TU callees and escapes, and candidate C
+      needs no proof at all. Dropped.
+  (C) per-call-site clone over ONE `&mut [u8]` region plus i64 offsets, so
+      every access inside the clone indexes the same slice exactly as C
+      does -- **VIABLE, EXACT, aliasing preserved BY CONSTRUCTION, no
+      interprocedural proof.** Validated twice: hand-written Rust byte-
+      identical to native across all three shapes (subset-at-offset,
+      subset-sharing-start, and `out == in` at a RUNTIME offset); and a
+      hand-written dialect-IR round-trip through `--emitrust-lowering` ->
+      `--mlir-to-rust` -> `rustc -O`, also byte-identical, using **ZERO new
+      ops**. `emitrust-cc --emit=rust` on a SINGLE-TU version of the shape
+      already emits exactly candidate C today (FR-40 owner promotion),
+      including transitive promotion of a nested callee.
+  THE THREE MEASURED GATES that stop the existing machinery firing on the
+  real corpus, each isolated by a differential probe:
+    G1 cross-TU: `planOwners` disqualifies on `!doesThisDeclarationHaveABody`
+       (`ImportCPlanning.cpp:334`). Same source in one TU promotes; split in
+       two, it rejects. All 32 cases are 4-TU with `thash` defined away from
+       `utils.c`, so this is unavoidable.
+    G2 single storage base: `info.storageBases.size() != 1`
+       (`ImportCPlanning.cpp:309`). In real `utils.c` both `compute_root::
+       buffer` and `treehash::stack` flow into `thash`, so the owner-struct
+       form can NEVER promote here even if G1 were solved. **This is why the
+       increment must be a per-call-site clone, not a `planOwners` relax.**
+    G3 `kMaxOwnerArrayElements = 32` (`ImportCPlanning.cpp:53`) -- `buffer
+       [2*SPX_N]` is 48 elements for the 16 `sha2_192*` cases. The clone form
+       has no owner struct and no `Default` derive, so it does NOT inherit
+       this cap. Recorded so nobody re-derives it as a blocker.
+  ALSO MEASURED: clearing aliasing EXPOSES two more aliasing sites that
+  function-level recovery currently hides -- `utils.c:83` and `utils.c:140`,
+  the latter `thash(stack + (offset-2)*SPX_N, stack + (offset-2)*SPX_N, 2,
+  ...)`, i.e. `out == in` at a RUNTIME offset into a VLA. So the aliasing fix
+  must land WITH the VLA fix and the region parameter must accept a
+  `Vec`-backed `&mut [u8]`.
+  COST: this would be the tree's FIRST cross-TU clone materialization; the
+  `vaMonomorphPlans`/`vaCallSiteClones` precedent explicitly REFUSES the
+  cross-TU case (W3.5). Budget for that, not for the rendering. `--link`
+  shard mode is out of scope (the per-TU shim path cannot supply the
+  whole-project pre-scan); TRACTOR uses `--compdb`, which routes to
+  `importCProject` with all ASTs alive, so this does not block the 32.
+  **NOT WORTH BUILDING YET.** Per FR-178 the 32 cases cannot score until the
+  pointer export question is settled, and this is a large increment whose
+  entire yield is downstream of that. Held pending the FR-139 spike.
+
+- [x] FR-179 (opened 2026-08-30 by FR-178's re-ranking; SPIKED AND LANDED the
+  same day): **FR-62'S ACTOR LIFT SILENTLY COST THREE TRACTOR CASES BY MAKING
+  AN ALL-SCALAR-IN-C FUNCTION UN-EXPORTABLE.**
+  `hasAllScalarSignature` (`TranslateToRust.cpp:4911`) tested the RUST
+  signature, which for a lifted function includes the SYNTHESIZED `&mut self`
+  receiver. C's `uint16_t float2half(float)` is all-scalar; its receiver is
+  not; so `--c-abi-exports` refused the export for a parameter the C function
+  never had. That is a correctness defect, not a policy: the emitted crate
+  held ZERO `#[no_mangle]` and the corpus's `dlsym` found nothing.
+  **"Do not lift it" is the WRONG fix, and measuring first is what showed
+  that.** `float2half`'s body genuinely READS the lifted state
+  (`self.tu0_m__base`, `self.tu0_m__shift`, the C file-scope lookup tables),
+  and `026_goto_and_static`'s `driver` genuinely WRITES it (`y = local_y`).
+  The state is real; only the RECEIVER is synthetic.
+  THE RENDERING, spiked by hand against the real oracle BEFORE implementing:
+  one module-scope `thread_local!` `RefCell<Owner>` singleton per owner
+  struct, plus a `#[no_mangle] extern "C"` FREE function per exported method
+  that borrows it and delegates. The method itself is untouched byte for
+  byte. **No `unsafe`.** `thread_local` and not a process-global `Mutex` or
+  `static mut`: it is the same substrate `emitGlobal` already renders every
+  mutable C file-scope global into, it is exact for the single-threaded
+  programs the importer accepts, and it keeps the crate `unsafe`-free, so
+  this buys rubric criterion (a) without spending (b).
+  MEASURED, the corpus's own oracle, before -> after:
+    float2half_lib, half2float_lib, 026_goto_and_static_lib
+    0/3 PASS (all SYMBOL_MISSING, 35 vectors failing) -> **3/3 PASS, 35/35
+    vectors**. Re-measured over the WHOLE 252-case corpus, not just the
+    three: **PASS 25 -> 28**, SYMBOL_MISSING 15 -> 12, EMIT_FAIL unchanged at
+    211, VACUOUS 1. Exactly +3 and no regression anywhere -- the first
+    movement in the external score since 2026-08-28.
+  BYTE-DIFF EVIDENCE taken by hand first, through a `dlopen`/`dlsym` C host
+  of the same shape the corpus harness uses, against the clang-built native:
+    - `float2half` (lifted state read-only): byte-identical over nine inputs
+      straddling every branch of the lookup tables.
+    - `026_goto_and_static` (lifted static MUTATED): byte-identical across a
+      four-call sequence that depends on state persisting between calls. **A
+      per-call fresh actor passes call 1 and fails call 2**, which is exactly
+      why the singleton is the design and a naive wrapper is not.
+    - re-entrancy characterised: a C callback re-entering the exported symbol
+      hits `RefCell already borrowed` -> `panic in a function that cannot
+      unwind` -> abort. LOUD, never silent state corruption -- the repo's
+      required safe failure direction, and the same posture as the accepted
+      `__emitrust_split_mut_u8` panic refinement.
+  TWO REFUSALS THE SPEC HAD NOT ANTICIPATED, both found by checking rather
+  than assuming, both now LOCATED rather than a bad export:
+    - an owner with no zero-argument `new()` (`ActorLift.cpp:559` synthesizes
+      one only for an EXPORTED owner, so a driver-constructed actor has none
+      and a wrapper naming it would be a rustc error in the emitted crate);
+    - an `emitrust.actor_runtime`-managed owner, whose single instance lives
+      in the spawned mailbox loop -- a thread_local beside it would be a
+      SECOND COPY OF THE STATE.
+  CONTAINMENT, verified adversarially and not from the comment alone: a
+  genuine C++ member carries `emitrust.method_rust_name`, a static member
+  fails `isMethod`, and a destructor lands in a TRAIT impl and fails
+  `!inTraitImpl`; what is left is exactly the Phase-4 C owner method, whose
+  symbol is still the bare C name. A C++ `struct Box { int step(int); }`,
+  all-scalar AFTER dropping its receiver, correctly gets no bare C symbol.
+  **FR-139's POINTER refusal is UNTOUCHED** -- an actor-lifted method with a
+  pointer signature keeps the historical "not all-scalar" wording, newly
+  pinned for the lifted case as well as the original. And emission with the
+  flag OFF is byte-identical BY CONSTRUCTION: nothing is collected outside
+  the `options.cAbiExports` block, so a default run renders not one byte of
+  this. `test/Driver/c-abi-exports.c` was narrowed ADDITIVELY (two new
+  negative assertions, no existing RUN line touched); the actor coverage
+  lives in a sibling file whose byte-identity oracle is STRONGER -- the
+  flagged crate with the thread_local epilogue elided must equal the
+  unflagged crate with no stripping at all, because the wrappers are a pure
+  module-scope append.
+  KNOWN LIMITATION, recorded rather than hidden: `thread_local` diverges from
+  C's process-global static if a host calls the exported symbol from more
+  than one thread. The corpus harness is single-threaded, and the importer
+  does not accept the threaded C that would notice.
+  Gate 955/955.
+
+- [ ] FR-181 (opened 2026-08-30 by FR-178's re-ranking; SPIKED the same day):
+  **THE POINTER C-ABI EXPORT IS A FOUR-CASE LEVER, NOT A NINETY-CASE ONE, AND
+  BOTH OBVIOUS INFERENCE RULES ARE MEASURABLY UNSOUND.**
+  ROOT CAUSE OF THE `crc16` RECORD, finally established with register-level
+  evidence rather than shape-reasoning. A `&[T]`/`&mut [T]` parameter occupies
+  TWO integer argument registers, so an `extern "C"` export shifts every later
+  argument one slot and synthesises the slice length out of the caller's next
+  argument. Probe: `extern "C" fn probe(d: &[u8], a: u32, b: u16)` called from
+  C as `probe(buf, 9, 2000)` -- C passes `ptr, 9, 2000`; Rust sees
+  `ptr, len=9, a=2000, b=0`. rustc emits only "uses type [u8], which is not
+  FFI-safe".
+  **TWO CORRECTIONS TO THE RECORD IN `test/Driver/c-abi-exports.c`:**
+  (a) the recorded datapoint (native 27235 vs cdylib 0) is a **PROCESS
+  ABORT**, not a silent wrong answer -- `index out of bounds: the len is 9 but
+  the index is 9` -> "panic in a function that cannot unwind" -> SIGABRT. The
+  corpus recorded 0 because the process DIED.
+  (b) the CLASS claim survives and was proved separately: when the shifted
+  length happens to be in range the failure IS silent -- `crc16(d, 2000, 9)`
+  over a 4096-byte buffer gives native 21983 vs export **25322**, exit 0, no
+  panic, no diagnostic.
+  **THE WORSE FINDING, WHICH IS NEW: `*mut T` OVER A DEFAULT-REPR STRUCT IS
+  SILENT AT BOTH COMPILE AND RUN TIME.** The slice case at least warns; this
+  one warns about nothing -- `improper_ctypes_definitions` does not fire for a
+  raw pointer to a non-`repr(C)` struct. `struct tflac` is size 28 in all
+  three renderings, so no size check can catch it, but the offsets differ
+  (emitted `channel_mode=20, partition_order=24, cur_blocksize=16`; clang and
+  `repr(C)` `16, 20, 24`). On `flac_validate` corpus vector 4: native
+  `cm=0 mrv=14 cbs=16` vs shim `cm=16 mrv=0 cbs=0`. Exit 0, ZERO diagnostics.
+  This is exactly the class the repo forbids and it is invisible to every
+  oracle except the byte-diff.
+  `#[repr(C)]` fixes it -- byte-identical on all 6 corpus vectors -- and a
+  BUILD-TIME BACKSTOP works: `const _: () = assert!(offset_of!(Tflac,
+  channel_mode) == 16);` turns a mismatch into `error[E0080]` at `cargo
+  build`, which is the repo's mandated hard-error direction.
+  **HARD NO-GO (multi-reference C-ABI export).** Two `&mut` parameters built
+  from two C pointers are `noalias` to LLVM and a C caller may legally pass
+  the same pointer twice. Measured at rustc 1.96.1 `-O3`, x86-64:
+  `kernel(a,b){let t=b[0]; a[0]=99.0; b[1]=t+b[0];}` exported as
+  `extern "C" fn(*mut f32, *mut f32)` and called with `a==b` returns
+  `b[1]==10` where the clang native returns `104`. Exit 0, no panic, no rustc
+  diagnostic. Honest caveat: `rgb_to_hsv` ITSELF did not manifest the UB at
+  `-O3`; the adversarial shape did. **No library can disprove that its caller
+  aliases**, so the rule must be structural: AT MOST ONE reference/slice
+  parameter, or the refusal stands. That single rule removes `md5_digest`,
+  `rgb_to_hsv`, `synth_pair`, `wcscat`, `colourblind` and `hdr_compare`
+  regardless of any bound analysis.
+  **NO-GO (pointer + length inference), counterexample from INSIDE this very
+  corpus.** `crc16` byte-diffs clean with the correct association, which is
+  the trap -- it works, so it looks derivable. `synth_pair(mp3d_sample_t *pcm,
+  int nch, const float *z)` kills it: `nch` is a CHANNEL COUNT and `pcm`'s
+  real bound is `16*nch + 1`, so the adjacency rule "the integer after a
+  pointer is its length" yields a 1-element slice and the shim aborts on
+  `index out of bounds: the len is 1 but the index is 16` where the native
+  writes `pcm[16]`. `wcscat(wchar_t *dst, size_t numElem, const wchar_t *src)`
+  kills it a second way: `src` carries NO length at all (NUL-terminated), and
+  the body opens `if (!dst || numElem == 0) return 22;` -- the author
+  documents NULL as legal, but a shim must construct the slice BEFORE that
+  check runs, and `from_raw_parts_mut(null, n)` is instant UB. Its vector 5
+  also has `dst.len()==11` while `numElem==4`, so `numElem` is a CAPACITY, not
+  a length. C spells the sound version (`T p[static N]`, VLA parameters); it
+  appears in ZERO of the 252 corpus cases.
+  **NO-GO this wave (statically sized array `T p[N]`)** -- I expected this to
+  be the strongest case and measured that it is not. The extent is destroyed
+  by the importer: `void md5_digest(const tflac_md5 *m, tflac_u8 out[16])`
+  imports as `!emitrust.mut_ref<!emitrust.slice<ui8>>`, the `16` gone before
+  the emitter ever sees it; and the case has two pointer parameters anyway.
+  Worth recording as language law: in C, `T p[N]` in a prototype IS `T *p` and
+  the `N` is not a guarantee. What IS a guarantee is "the body accesses
+  `p[0..N-1]` on every path" -- a must-access analysis, not a declarator rule.
+  **THE REAL CONSTRAINT ON `repr(C)`, AND IT IS AN IMPORTER PROBLEM.** A
+  pointer struct member keeps the historical i64 SLOT -- a data-pointer
+  CURSOR, not an address (`ImportCAggregates.cpp:1759-1766`). Measured: C
+  `tflac_u8 *buffer` -> IR `i64` -> Rust `pub buffer: i64`. Same size on LP64,
+  so `bitwriter_add` byte-diffs clean ONLY because it never reads that field.
+  **That is a SEMANTIC lie, not a layout one, and the emitter cannot see it**
+  -- the IR field type is indistinguishable from a genuine `int64_t`. Bit-field
+  runs are likewise deliberately not ABI-compatible (`:1572-1574`, which says
+  so in its own comment) and unions become opaque `[u8;N]` blobs. So
+  `repr(C)` must be gated on an IMPORTER-SET faithfulness marker and never
+  inferred at emission time.
+  YIELD, measured per case by byte-diffing hand-shimmed cdylibs against the
+  clang native using each case's OWN corpus vectors and expected outputs:
+    +4  `to_barycentric` (by-value `repr(C)` structs, NO pointers, zero
+        `unsafe`, the cheapest case on the board), `flac_validate` (6/6
+        vectors), `update_frame_header` (5/5), `bitwriter_add` (3/3).
+        That is **28 -> 32** on top of FR-179.
+    +1  `hdr_bitrate`, ONLY if a must-access-bound analysis is built. Costed
+        separately; it is worth exactly one case today.
+  SPHINCS+: **+0 today and +20 of 80 at the CEILING.** Re-confirmed at HEAD by
+  direct probe -- case 053 still stops at import (`utils.c:79:13 aliasing`,
+  no crate written), so the export gate is never reached, a second independent
+  confirmation of FR-177. And of the four dlsym'd symbols only
+  `SPX_initialize_hash_function(*mut Ctx)` is a single-struct-pointer GO shape
+  (20 cases); `SPX_prf_addr` (3 pointers), `SPX_gen_message_random` (5
+  pointers whose bounds live in `SPX_N` macros absent from the signature) and
+  `SPX_hash_message` (7 of 8 parameters pointers) are all multi-pointer
+  NO-GOs. **This corrects FR-178's own +32/+80 line.**
+  CRITERION (b) COST: zero `unsafe` for the by-value class; ONE line per
+  single-pointer wrapper (`unsafe extern "C" fn f(p: *mut T) -> R
+  { f_rs(&mut *p) }`). The translated body was textually unchanged in every
+  measured case -- nothing leaks past the generated wrapper.
+  GOLDEN IMPACT: gate everything on `--c-abi-exports` (already default OFF)
+  and NO golden moves. Emitting `#[repr(C)]` unconditionally would shift 100+
+  crate goldens for no benefit -- do not. No new ops and no new types are
+  needed; two discardable attributes round-trip through `emitrust-opt` and
+  `emitrust-translate` untouched, confirmed by hand-written IR.
+  RESIDUAL REFUSALS need PER-SHAPE wordings; today all twelve cases get the
+  single "not all-scalar" message, which is now factually wrong for most of
+  them.
+  **NOT MEASURED, stated plainly:** the corpus harness was NOT run (the yield
+  is per-case byte-diffs, not a `tractor-eval.py` figure); no lit run (no code
+  changed); `hdr_bitrate` and `md5_digest` were exercised on the spike's own
+  inputs, not the corpus's, so `hdr_bitrate`'s "would score" is a notch weaker
+  than the other four; the must-access analysis was not built; ONE platform
+  and toolchain (x86-64 SysV, rustc 1.96.1, clang 21.1.8) and the
+  `buffer: i64` coincidence is LP64-specific; and the faithfulness gate's real
+  coverage over every importer struct model (FAM `Option`, anonymous-union
+  blobs, `fn_ptr` members, nested structs) was not enumerated.
+  RECOMMENDED NEXT INCREMENT: the `repr(C)` tier ONLY -- by-value structs and
+  a single struct pointer, capped at one reference parameter, gated on an
+  importer-set faithfulness marker, with `offset_of!` const-assertions as the
+  build-time backstop. +4 cases, three one-statement `unsafe` wrappers, no new
+  ops, no golden movement, every measured counterexample left behind a
+  LOCATED refusal.
+
 - [x] FR-176 DEFECT (opened 2026-08-29 as FR-161 on the probe line; RENUMBERED
   2026-08-30 when the rebase onto the trunk met the trunk's own FR-161
   (FR-158 Phase 3), which is cited by commits that are already immutable

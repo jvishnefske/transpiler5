@@ -330,6 +330,49 @@ blocked_by = []
 anchor = "FR-177 (opened 2026-08-30 by a PMF-criterion re-ranking of the TRACTOR"
 
 [[items]]
+id = "FR-178"
+rank = 6
+kind = "feature"
+status = "open"
+size = "L"
+title = "TRACTOR: FR-177's yield curve measures EMIT only; every case it clears dies at dlsym"
+summary = "CORRECTS FR-177 the way FR-177 corrected FR-138. The rubric is a THREE-stage pipeline (emit, cargo build, dlopen+dlsym of a BARE symbol); FR-177 measured stage one and read it as a yield. FIFTH instance of a single-stage measurement read as a case count (FR-61f x2, FR-165, FR-138, FR-177). MEASURED cross-tab of FR-177's own per-case blocker sets against corpus case KIND, all 128 SPHINCS+, perfectly clean: size-3 -> 32 cases ALL lib; size-5 -> 48 ALL lib; size-12 -> 36 ALL exec; size-13 -> 12 ALL exec. The 80 CHEAP cases are exactly the 80 lib cases needing a dlsym-able symbol; the 48 exec cases needing no symbol are exactly the expensive 12-13-class half. The 80 lib cases dlsym one of four symbols (SPX_initialize_hash_function, SPX_prf_addr, SPX_gen_message_random, SPX_hash_message), EVERY ONE pointer-taking. Emitting case 101 at HEAD with --c-abi-exports refuses all four BY NAME and the crate holds ZERO #[no_mangle]; the emitted form is `pub fn spx_initialize_hash_function(ctx: &mut [u8])`. So the three FR-177 fixes move 32 cases EMIT_FAIL -> SYMBOL_MISSING and score +0, and under the standing keep-FR-139 constraint the whole 128-case bundle is unreachable. Re-ranked board by PASS delta: +3 actor-lifted all-scalar-in-C (no FR-139 relaxation, FR-179); +1 to_barycentric via repr(C); +11 of the 15 SYMBOL_MISSING need pointer export; +32 and +80 SPHINCS+ need pointer export AND the importer fixes. FR-139, not the importer, gates ~91 of the 227 non-passing cases. Owner decision 2026-08-30: spike the pointer export. The crc16 miscompile (native 27235 vs cdylib 0) is the repro and MUST be root-caused first -- it never has been."
+blocked_by = []
+anchor = "FR-178 (opened 2026-08-30 by the FR-177 implementation attempt, and it"
+
+[[items]]
+id = "FR-180"
+rank = 20
+kind = "feature"
+status = "spiked"
+size = "L"
+title = "Aliasing overlap rendering: candidate C (per-call-site region clone) is a GO; the gap is cross-TU"
+summary = "SPIKED 2026-08-30, GO-with-constraints. The SPHINCS+ shape is mut+shared and GENUINELY OVERLAPPING (out is a SUBSET of in) at utils.c:79 and :83, so split_at_mut cannot render it and the mutness-blind key at ImportCExpressions.cpp:2996-3011 is not the obstacle. Candidate B (copy-to-temp) is NOT VIABLE: measured miscompile on a callee that writes out then re-reads in, native 000000001d242b32 vs B 03011f011d242b32. Candidate A (split_at_mut) fits only the one disjoint site hash_sha2.c:96 and panics when its guard is violated, which costs the case under a no-partial-credit rubric. Candidate C -- per-call-site clone over ONE &mut [u8] region plus i64 offsets -- is exact, preserves aliasing BY CONSTRUCTION, needs no interprocedural proof, and validated twice (hand-written Rust byte-identical across all three shapes including out==in at a RUNTIME offset; hand-written dialect-IR round-trip through lowering and mlir-to-rust byte-identical using ZERO new ops). emitrust-cc already emits candidate C for SINGLE-TU input via FR-40 owner promotion. Three measured gates stop it on the real corpus: G1 cross-TU (planOwners needs a body, ImportCPlanning.cpp:334) -- all 32 cases are 4-TU with thash defined away from utils.c; G2 single storage base (ImportCPlanning.cpp:309) -- both compute_root::buffer and treehash::stack flow into thash, so the owner-struct form can never promote and the increment MUST be a per-call-site clone; G3 kMaxOwnerArrayElements=32 (ImportCPlanning.cpp:53) does NOT apply to the clone form. Clearing aliasing exposes two hidden sites, utils.c:83 and :140 (out==in at a runtime offset into a VLA), so this must land WITH the VLA fix. Would be the tree's first cross-TU clone materialization; the vaMonomorphPlans precedent explicitly refuses cross-TU (W3.5). --link shard mode out of scope. HELD: per FR-178 the whole yield is downstream of the FR-139 pointer-export question."
+blocked_by = ["FR-178"]
+anchor = "FR-180 (opened 2026-08-30; SPIKED the same day, GO-with-constraints):"
+
+[[items]]
+id = "FR-179"
+status = "landed"
+kind = "defect"
+size = "M"
+title = "FR-62's actor lift made all-scalar-in-C functions un-exportable, costing three TRACTOR cases"
+summary = "LANDED 2026-08-30. hasAllScalarSignature tested the RUST signature, which for a lifted function includes the SYNTHESIZED &mut self receiver, so --c-abi-exports refused the export for a parameter the C function never had and the crate held ZERO #[no_mangle]. Not a policy call, a defect. 'Do not lift it' is the WRONG fix and measuring showed it: float2half's body READS the lifted lookup tables and 026_goto_and_static's driver WRITES the lifted static -- the state is real, only the receiver is synthetic. Fix: one module-scope thread_local RefCell<Owner> singleton per owner plus a #[no_mangle] extern \"C\" free function delegating to the untouched method. NO unsafe, so this buys criterion (a) without spending (b). thread_local rather than a process-global Mutex or static mut because it is the substrate emitGlobal already uses for mutable C file-scope globals. MEASURED with the corpus oracle over the WHOLE 252-case corpus: PASS 25 -> 28, SYMBOL_MISSING 15 -> 12, EMIT_FAIL unchanged 211 -- exactly +3, no regression, and the first movement in the external score since 2026-08-28. Byte-diffed by hand through a dlopen/dlsym host before implementing: float2half identical over nine inputs; 026_goto_and_static identical across a four-call sequence depending on mutated state persisting (a per-call fresh actor passes call 1 and fails call 2). Re-entrancy is a loud abort, never silent corruption. Two unanticipated refusals found by checking: an owner with no zero-argument new() (synthesized only for an exported owner) and an actor_runtime-managed owner (whose instance lives in the spawned mailbox loop, so a thread_local beside it would be a second copy of the state). C++ containment verified adversarially. FR-139's POINTER refusal UNTOUCHED; flag-off emission byte-identical by construction. Known limitation: thread_local diverges from a process-global static under a multi-threaded host. Gate 955/955."
+blocked_by = []
+anchor = "FR-179 (opened 2026-08-30 by FR-178's re-ranking; SPIKED AND LANDED the"
+
+[[items]]
+id = "FR-181"
+rank = 7
+kind = "feature"
+status = "spiked"
+size = "M"
+title = "Pointer C-ABI export is a FOUR-case lever; both obvious inference rules are measurably unsound"
+summary = "SPIKED 2026-08-30. Root-caused the crc16 record at last: a slice parameter occupies TWO argument registers, so an extern \"C\" export shifts every later argument one slot and synthesises the length from the caller's next argument (probe(buf,9,2000) -> ptr,len=9,a=2000,b=0). TWO CORRECTIONS to test/Driver/c-abi-exports.c: the recorded 27235-vs-0 datapoint is a PROCESS ABORT, not a silent wrong answer; but the class claim survives separately -- crc16(d,2000,9) over a 4096-byte buffer gives native 21983 vs export 25322, exit 0, no diagnostic. NEW AND WORSE: *mut T over a default-repr struct is silent at BOTH compile and run time (improper_ctypes_definitions does not fire); struct tflac is size 28 in all three renderings but the offsets differ, and flac_validate vector 4 gives native cm=0 mrv=14 cbs=16 vs shim cm=16 mrv=0 cbs=0 with zero diagnostics. repr(C) fixes it (6/6 vectors) and offset_of! const-asserts turn a mismatch into E0080 at cargo build. HARD NO-GO on >=2 reference parameters: two &mut from two C pointers are noalias and a C caller may legally alias them -- measured rustc 1.96.1 -O3, aliased call returns b[1]=10 where native returns 104, exit 0, no diagnostic (honest caveat: rgb_to_hsv itself did not manifest; the adversarial shape did). NO-GO on pointer+length inference, counterexample from inside the corpus: synth_pair's nch is a channel count and pcm's bound is 16*nch+1, so adjacency aborts where native writes pcm[16]; wcscat's src has no length at all and its body documents NULL as legal. NO-GO this wave on T p[N]: the importer destroys the extent (md5_digest's out[16] -> mut_ref<slice<ui8>>). THE REAL repr(C) CONSTRAINT IS AN IMPORTER PROBLEM: a pointer struct member keeps an i64 CURSOR, not an address (ImportCAggregates.cpp:1759-1766) -- a SEMANTIC lie the emitter cannot see -- so repr(C) must be gated on an importer-set faithfulness marker. YIELD: +4 measured (to_barycentric, flac_validate, update_frame_header, bitwriter_add), i.e. 28 -> 32 on top of FR-179; +1 more (hdr_bitrate) only with a new must-access-bound analysis. SPHINCS+ is +0 today (case 053 still stops at import, re-confirming FR-177 by a second method) and +20 of 80 at the CEILING, not +80 -- 3 of the 4 symbols are multi-pointer. No new ops, no golden movement if gated on the default-OFF flag. NOT MEASURED: the harness was not run, no lit run, one platform/toolchain, the must-access analysis was not built, the faithfulness gate's coverage was not enumerated."
+blocked_by = []
+anchor = "FR-181 (opened 2026-08-30 by FR-178's re-ranking; SPIKED the same day):"
+
+[[items]]
 id = "FR-176"
 status = "landed"
 title = "FR-160 silent request-ignore surfaces"
