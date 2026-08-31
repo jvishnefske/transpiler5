@@ -319,6 +319,17 @@ title = "C test entry points become #[test] functions (cargo test as a different
 anchor = "FR-160 FEATURE (opened by the repo owner 2026-08-29 out of the systemd"
 
 [[items]]
+id = "FR-177"
+rank = 11
+kind = "feature"
+status = "open"
+size = "L"
+title = "TRACTOR: the SPHINCS+ bundle is a five-fix wall, not a one-fix lever"
+summary = "CORRECTS FR-138's top-ranked lever. FR-138 ranked the 211 EMIT_FAILs by FIRST-failure diagnostic and claimed 'a single fix moves 80 cases' for aliasing mutable pointer arguments. MEASURED over all 128 SPHINCS+ cases with --recover --incremental, collecting the per-case blocker SET rather than the first: aliasing is the only blocker in ZERO cases. Blocker-set sizes {3:32, 5:48, 12:36, 13:12}. Greedy marginal-yield curve: +1 aliasing = 0 cases, +2 string-function-argument = 0, +3 non-constant array size = 32, +4 address-of-scalar = 32, +5 ArrayToPointerDecay = 80, then a plateau at 80 through +12. Strict mode is the only mode the rubric scores (no partial credit), so a case clears only when its WHOLE set clears. Fourth time this ledger read a first-failure count as a yield. Baseline re-measured at HEAD f64e7d4: PASS 25 / VACUOUS 1 / SYMBOL_MISSING 15 / EMIT_FAIL 211 -- unchanged from 2026-08-28 except SYMBOL_MISSING 13->15, so ~26 commits moved the external score by zero. Corpus splits: SPHINCS+ 128 (all EMIT_FAIL, behind the wall) and non-SPHINCS 124 (25 PASS, 15 SYMBOL_MISSING, 83 EMIT_FAIL with a long flat tail, max 9). The 15 SYMBOL_MISSING already emit AND build and are blocked only by FR-139's all-scalar --c-abi-exports restriction -- highest confidence, but a direct criterion (a)-vs-(b) rubric conflict with a measured miscompile (crc16 native 27235 vs cdylib 0), so it needs its own spike. Next: cost aliasing, string-function-argument and non-constant array size INDIVIDUALLY; 32 cases is the first non-zero step."
+blocked_by = []
+anchor = "FR-177 (opened 2026-08-30 by a PMF-criterion re-ranking of the TRACTOR"
+
+[[items]]
 id = "FR-176"
 status = "landed"
 title = "FR-160 silent request-ignore surfaces"
