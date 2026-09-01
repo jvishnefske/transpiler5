@@ -543,6 +543,9 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
     if (opaqueUnions.contains(definition))
       structDef->setAttr(emitrust::kOpaqueUnionAttrName,
                          moduleBuilder.getUnitAttr());
+    // FR-182: the C-ABI faithfulness verdict and, when faithful, clang's own
+    // layout numbers. Every imported record carries one or the other.
+    annotateAbiFaithfulness(structDef, definition, fieldNames, fieldTypes);
     return success();
   }
 
@@ -771,6 +774,16 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
       return emitError(defLoc)
              << "unsupported: conflicting definition of struct '" << structName
              << "' with a different shape in another translation unit";
+    // FR-182: this TU's decl for the merged record still needs its OWN cache
+    // entry. The verdict is computed against the field arrays, which the
+    // shape check above has just proven identical to the surviving
+    // struct_def's, so the answer is the same one -- but the cache is keyed
+    // by DECL and a record of this TU that CONTAINS the merged one looks its
+    // member up here. Without this the containing record is refused for "no
+    // imported layout model", a safe direction but a measured loss of yield
+    // on any multi-TU project sharing a header (mtu probe, FR-182).
+    abiFaithfulnessCache[definition] =
+        abiFaithfulnessBlocker(definition, fieldNames, fieldTypes);
     return success();
   }
   // A file-scope tag that lands on a name already claimed by a mangled
@@ -800,6 +813,9 @@ CImporter::importRecordUncached(const clang::RecordDecl *definition) {
   if (opaqueUnions.contains(definition))
     structDef->setAttr(emitrust::kOpaqueUnionAttrName,
                        moduleBuilder.getUnitAttr());
+  // FR-182: the C-ABI faithfulness verdict and, when faithful, clang's own
+  // layout numbers. Every imported record carries one or the other.
+  annotateAbiFaithfulness(structDef, definition, fieldNames, fieldTypes);
   // W2.17: the class declared a destructor, so the emitted struct gets an
   // `impl Drop` -- which costs it `Copy` (rustc E0184) and makes every
   // binding of it unconditionally live (an uninitialized Rust binding is
@@ -1799,6 +1815,220 @@ LogicalResult CImporter::collectRecordFields(
       return failure();
   }
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// FR-182: C-ABI faithfulness of an imported record's layout model
+//===----------------------------------------------------------------------===//
+
+/// FR-182: the bit width the Rust primitive `mapped` renders as occupies, or
+/// 0 when `mapped` is not a scalar the C ABI has a spelling for. `i1` (C's
+/// `_Bool`) answers 1 and therefore never matches a C scalar's 8-bit width,
+/// which is deliberate: the whitelist admits only widths that MEASURE equal.
+static unsigned cAbiScalarBitWidth(Type mapped) {
+  if (auto intType = llvm::dyn_cast<IntegerType>(mapped))
+    return intType.getWidth();
+  if (llvm::isa<Float32Type>(mapped))
+    return 32;
+  if (llvm::isa<Float64Type>(mapped))
+    return 64;
+  return 0;
+}
+
+std::string CImporter::abiFaithfulMemberBlocker(clang::QualType type,
+                                                Type mapped,
+                                                llvm::StringRef memberName) {
+  clang::ASTContext &context = astContext();
+  clang::QualType canonical = type.getCanonicalType();
+  // Every POINTER shape first, because each one is a measured divergence and
+  // several of them are the same WIDTH as the C pointer they replace -- an
+  // offset assertion cannot catch a semantic lie.
+  if (canonical->isFunctionPointerType())
+    return ("the function-pointer member '" + memberName +
+            "', emitted as an Option<fn(..)> rather than a C function pointer")
+        .str();
+  if (canonical->isPointerType() || canonical->isReferenceType() ||
+      canonical->isMemberPointerType() || canonical->isBlockPointerType())
+    return ("the pointer member '" + memberName +
+            "', emitted as an i64 data-pointer cursor rather than an address")
+        .str();
+  if (canonical->isIncompleteArrayType())
+    return ("the flexible array member '" + memberName +
+            "', emitted as a trailing owned Vec")
+        .str();
+  // An enum member is conservatively out this wave. The emitted newtype is
+  // `#[repr(transparent)]`, so its layout is in fact the storage integer's,
+  // but nothing in the whitelist's target cases needs it and admitting a
+  // shape no test exercises is how a whitelist stops being one.
+  if (canonical->isEnumeralType())
+    return ("the enum-typed member '" + memberName + "'").str();
+  if (const clang::ConstantArrayType *array =
+          context.getAsConstantArrayType(canonical)) {
+    if (array->getSize().isZero())
+      return ("the zero-length array member '" + memberName +
+              "', dropped from the emitted field list")
+          .str();
+    auto mappedArray = llvm::dyn_cast<emitrust::ArrayType>(mapped);
+    if (!mappedArray ||
+        mappedArray.getSize() != array->getSize().getZExtValue())
+      return ("the array member '" + memberName +
+              "', whose emitted length is not C's")
+          .str();
+    return abiFaithfulMemberBlocker(array->getElementType(),
+                                    mappedArray.getElementType(), memberName);
+  }
+  if (canonical->isArrayType())
+    return ("the array member '" + memberName +
+            "', whose length is not a compile-time constant")
+        .str();
+  if (const clang::RecordDecl *record = canonical->getAsRecordDecl()) {
+    const clang::RecordDecl *nested = record->getDefinition();
+    if (!nested)
+      return ("the member '" + memberName +
+              "', whose record type is incomplete")
+          .str();
+    auto cached = abiFaithfulnessCache.find(nested);
+    if (cached == abiFaithfulnessCache.end())
+      return ("the member '" + memberName +
+              "', whose record type carries no imported layout model")
+          .str();
+    if (!cached->second.empty())
+      return ("the member '" + memberName +
+              "', whose own type is not ABI-faithful (" + cached->second + ")")
+          .str();
+    if (!llvm::isa<emitrust::StructType>(mapped))
+      return ("the member '" + memberName +
+              "', whose record type did not map to a named struct")
+          .str();
+    return "";
+  }
+  // The scalar leaf. Both the CLASS (integer vs floating-point) and the WIDTH
+  // must survive the mapping: `long double` maps to `f64`, an 80-bit C type
+  // silently narrowed to 64 bits, and `_Bool` maps to `i1`. Comparing clang's
+  // own `getTypeSize` against the emitted primitive is what refuses both.
+  bool isInteger = canonical->isIntegerType();
+  bool isFloat = canonical->isRealFloatingType();
+  if (!isInteger && !isFloat)
+    return ("the member '" + memberName +
+            "', whose C type is neither an integer nor a real "
+            "floating-point scalar")
+        .str();
+  unsigned emitted = cAbiScalarBitWidth(mapped);
+  uint64_t declared = context.getTypeSize(canonical);
+  if (emitted == 0 || emitted != declared)
+    return ("the member '" + memberName + "', which C gives " +
+            llvm::Twine(declared) +
+            " bits but the emitted Rust primitive "
+            "gives " +
+            llvm::Twine(emitted))
+        .str();
+  if (isFloat != llvm::isa<FloatType>(mapped))
+    return ("the member '" + memberName +
+            "', whose emitted primitive changes scalar class")
+        .str();
+  return "";
+}
+
+std::string
+CImporter::abiFaithfulnessBlocker(const clang::RecordDecl *definition,
+                                  llvm::ArrayRef<llvm::StringRef> fieldNames,
+                                  llvm::ArrayRef<Type> fieldTypes) {
+  if (auto cached = abiFaithfulnessCache.find(definition);
+      cached != abiFaithfulnessCache.end())
+    return cached->second;
+  if (!definition)
+    return "an incomplete record";
+  // A union is out WHOLESALE. It maps either to a one-field "slot" typed as a
+  // single arm (a reinterpretation of the other arms) or, when the arms
+  // differ structurally, to an opaque `[u8; N]` blob whose Rust alignment is
+  // 1 while the C union's is its widest arm's.
+  if (definition->isUnion())
+    return "a C union, modeled as a single-arm slot or an opaque byte blob "
+           "of alignment 1";
+  // C-ABI export is a C concept. A C++ record with a base, a destructor or a
+  // vtable is not one, and this wave does not try to make it one.
+  if (const auto *cxxRecord =
+          llvm::dyn_cast<clang::CXXRecordDecl>(definition)) {
+    if (cxxRecord->getNumBases() != 0)
+      return "a C++ base class";
+    if (cxxRecord->isPolymorphic())
+      return "a virtual method";
+    if (cxxRecord->hasUserDeclaredDestructor())
+      return "a C++ destructor";
+  }
+  // The structural screen runs over EVERY member first: each construct below
+  // perturbs the member-to-field correspondence, so none of them may be
+  // reached through the index-aligned walk that follows.
+  llvm::SmallVector<const clang::FieldDecl *> members;
+  for (const clang::FieldDecl *field : definition->fields()) {
+    if (field->isBitField())
+      return ("the bit-field run at member '" + field->getName() +
+              "', packed into a synthetic __bits backing field whose layout "
+              "is deliberately not ABI-compatible")
+          .str();
+    if (field->isAnonymousStructOrUnion() || field->getName().empty())
+      return "an anonymous struct or union member, flattened into the "
+             "parent's field list";
+    members.push_back(field);
+  }
+  if (members.size() != fieldNames.size() ||
+      members.size() != fieldTypes.size())
+    return "a field list that does not correspond one-to-one with the C "
+           "members";
+  for (auto [index, field] : llvm::enumerate(members)) {
+    std::string blocker = abiFaithfulMemberBlocker(
+        field->getType(), fieldTypes[index], fieldNames[index]);
+    if (!blocker.empty())
+      return blocker;
+  }
+  // A field-less record renders as Rust's `struct T {}`, which is ZERO-sized.
+  // C gives an empty struct size 0 too (the GNU extension clang accepts), so
+  // the two agree -- but C++ gives an empty CLASS size 1, and a `#[repr(C)]`
+  // over that disagreement is a guaranteed `error[E0080]` at `cargo build`.
+  // The backstop firing is the correct failure direction, but a shape that
+  // can only ever fail it has no business being called faithful.
+  if (members.empty() &&
+      astContext().getASTRecordLayout(definition).getSize().getQuantity() != 0)
+    return "an empty record, which C++ gives a size of 1 where the emitted "
+           "field-less Rust struct is zero-sized";
+  return "";
+}
+
+void CImporter::annotateAbiFaithfulness(
+    emitrust::StructDefOp structDef, const clang::RecordDecl *definition,
+    llvm::ArrayRef<llvm::StringRef> fieldNames,
+    llvm::ArrayRef<Type> fieldTypes) {
+  std::string blocker =
+      abiFaithfulnessBlocker(definition, fieldNames, fieldTypes);
+  abiFaithfulnessCache[definition] = blocker;
+  OpBuilder attrBuilder(structDef);
+  if (!blocker.empty()) {
+    structDef->setAttr(emitrust::kAbiUnfaithfulReasonAttrName,
+                       attrBuilder.getStringAttr(blocker));
+    return;
+  }
+  // Clang's OWN numbers, never re-derived here: the whole point of the
+  // emitted const-assertions is to compare what rustc lays out against what
+  // the C compiler laid out, so a second layout model on this side would only
+  // give the two ways to be wrong together.
+  const clang::ASTRecordLayout &layout =
+      astContext().getASTRecordLayout(definition);
+  llvm::SmallVector<int64_t> offsets;
+  for (const clang::FieldDecl *field : definition->fields())
+    offsets.push_back(static_cast<int64_t>(
+        layout.getFieldOffset(field->getFieldIndex()) / 8));
+  structDef->setAttr(emitrust::kAbiFaithfulAttrName, attrBuilder.getUnitAttr());
+  structDef->setAttr(
+      emitrust::kAbiLayoutAttrName,
+      attrBuilder.getDictionaryAttr(
+          {attrBuilder.getNamedAttr(
+               "size",
+               attrBuilder.getI64IntegerAttr(layout.getSize().getQuantity())),
+           attrBuilder.getNamedAttr("align",
+                                    attrBuilder.getI64IntegerAttr(
+                                        layout.getAlignment().getQuantity())),
+           attrBuilder.getNamedAttr("offsets",
+                                    attrBuilder.getI64ArrayAttr(offsets))}));
 }
 
 FailureOr<const clang::FieldDecl *>

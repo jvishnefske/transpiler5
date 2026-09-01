@@ -373,6 +373,27 @@ blocked_by = []
 anchor = "FR-181 (opened 2026-08-30 by FR-178's re-ranking; SPIKED the same day):"
 
 [[items]]
+id = "FR-182"
+status = "landed"
+kind = "feature"
+size = "L"
+title = "repr(C) C-ABI export tier: by-value and single-struct-pointer, behind an importer faithfulness whitelist"
+summary = "LANDED 2026-08-31 on FR-181's recommendation. Admits exactly two shapes -- class 0 (every param and result a scalar or ABI-faithful struct, plain extern \"C\", ZERO unsafe) and class 1 (exactly ONE ref/mut_ref to a faithful struct, a one-statement generated wrapper carrying the unsafe, translated body textually unchanged) -- under a HARD structural cap of at most ONE reference/slice parameter, because FR-181 measured that two &mut from two C pointers are noalias while a C caller may legally alias them. The faithfulness predicate is an importer-side WHITELIST, transitive: a width-checked scalar, a non-zero fixed array of a faithful type, or a faithful nested record. Refused BY NAME: pointer members, fn-ptr members, bit-field runs, flexible and zero-length arrays, unions anywhere, anonymous struct/union members, enum members, C++ bases/dtors/vtables. THE POINTER MEMBER IS WHY THE YIELD IS +3 AND NOT FR-181's +4: it keeps the historical i64 CURSOR, the same width on LP64, so no offset assertion can catch it -- struct tflac_bitwriter carries tflac_u8 *buffer, so bitwriter_add is REFUSED and is now a required negative test (FR-181 counted it, but its clean byte-diff held only because the function never reads that field). A second narrowing nothing else would have caught, found by comparing clang getTypeSize against the emitted primitive width: long double maps to f64, a 128-bit C type silently narrowed to 64; _Bool maps to i1. Build-time backstop: #[repr(C)] plus size_of/align_of/offset_of! const-asserts from clang's own numbers on every faithful struct transitively reachable from an admitted signature, so any residual divergence is E0080 at cargo build. THE ORACLE BITES: deleting the repr(C) lines gives wide_mix=11000.000000 vs native 7011.125000 and tflac fields=64 1000 67 0 1027 vs native 64 1000 3 4 67, exit 0 no diagnostic. Fixed a cross-TU dedup defect that left the second TU's decl with no cached verdict, refusing any record containing it. MEASURED: TRACTOR PASS 28 -> 31, SYMBOL_MISSING 12 -> 9, EMIT_FAIL unchanged 211. Flag OFF byte-identical; no emitted-Rust golden moved; 9 MLIR CHECK lines narrowed. Gate 961/961. NOT verified: non-LP64 targets, stale pre-FR-182 shards, clippy on a wrapper-bearing crate."
+blocked_by = []
+anchor = "FR-182 (opened and LANDED 2026-08-31 on the FR-181 spike's"
+
+[[items]]
+id = "FR-183"
+rank = 8
+kind = "feature"
+status = "open"
+size = "L"
+title = "After the export work the biggest TRACTOR lever is standard input, and it has no dlsym conflict"
+summary = "NOT SPIKED beyond this ranking. Measured with the FR-178 instrument: per-case blocker SETS over the 83 non-SPHINCS EMIT_FAILs, cross-tabbed with case KIND, then a greedy marginal-yield curve over the EXEC cases ONLY -- because an exec case needs no exported symbol, so for it a cleared emit set really IS a PASS. 77 of 83 measured; blocker-set sizes {0:3, 1:45, 2:28, 3:1}. Exec curve: +1 variadic call = 9, +2 FILE* stream argument = 13, +3 address-of-scalar-string-region = 16, +4 pointer-has-no-known-target = 18, +5 CStyleCastExpr = 20, +6 pointer-assigned-non-address = 22. THE FIRST TWO STEPS ARE ONE CAPABILITY, costed before ranking: the variadic blocker here is NOT printf (every hosted output variadic is already name-intercepted) but scanf/fscanf, and the FILE* blocker is stdin reaching emitFileHandleArg (ImportCHosted.cpp:130), which admits only an fopen-created function-local handle. There is no scanf, getchar or stdin recognition anywhere in lib/. The corpus really drives it: an exec vector is literally {\"argv\": [], \"stdin\": \"0\\n0\"}. So modelling standard input is worth 13 of the 34 exec cases with ZERO interaction with FR-139 or the dlsym stage. A second input capability sits beside it: 5 exec cases refused at main's argv -- but that is a FIRST-FAILURE number and therefore a CEILING, not a yield, because argv is rejected at signature import so --recover never walks the body and the rest of each blocker set is invisible until argv lands. argv machinery largely exists (argv_table type, argv_arg op, process wrapper, EndToEnd/argv-echo.c differential); the gap is the admission grammar argvUseAdmitted plus a bridge into emitCharRegionArg. TAKEN TOGETHER the exec half is gated on how a program receives its input, not on the pointer model that dominates the lib half. CAUTION: scanf is a PARSER whose failure modes C programs routinely ignore; a rendering that silently diverges on malformed input is the miscompile class this repo forbids, and the vectors are adversarial. Needs a real spike with a differential over malformed input."
+blocked_by = []
+anchor = "FR-183 (opened 2026-08-31 by the FR-182 wait, measured with the FR-178"
+
+[[items]]
 id = "FR-176"
 status = "landed"
 title = "FR-160 silent request-ignore surfaces"

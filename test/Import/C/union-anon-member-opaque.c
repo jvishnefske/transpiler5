@@ -55,7 +55,7 @@ struct T {
 struct T g;
 
 // ANON: emitrust.struct_def @Inner ["a", "b"] [i32, i32]
-// ANON: emitrust.struct_def @[[U:Anon[0-9A-F]+]] ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
+// ANON: emitrust.struct_def @[[U:Anon[0-9A-F]+]] ["opaque"] [!emitrust.array<8xui8>] {{.*}}emitrust.opaque_union}
 // ANON: emitrust.struct_def @T ["hdr", "__u1"] [i32, !emitrust.struct<"[[U]]">]
 // ANON: emitrust.global @g : !emitrust.struct<"T">
 
@@ -80,7 +80,7 @@ struct T {
 struct T g;
 
 // NAMED: emitrust.struct_def @Inner ["a", "b"] [i32, i32]
-// NAMED: emitrust.struct_def @[[U:Anon[0-9A-F]+]] ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
+// NAMED: emitrust.struct_def @[[U:Anon[0-9A-F]+]] ["opaque"] [!emitrust.array<8xui8>] {{.*}}emitrust.opaque_union}
 // NAMED: emitrust.struct_def @T ["hdr", "u"] [i32, !emitrust.struct<"[[U]]">]
 // NAMED: emitrust.global @g : !emitrust.struct<"T">
 

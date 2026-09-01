@@ -176,6 +176,61 @@ inline constexpr llvm::StringLiteral kExternDeclAttrName =
 inline constexpr llvm::StringLiteral kOpaqueUnionAttrName =
     "emitrust.opaque_union";
 
+/// FR-182: name of the discardable `emitrust.struct_def` UNIT attribute the C
+/// importer attaches to a record whose emitted Rust field list is ABI-FAITHFUL
+/// to the C record it came from — every member, transitively, is a scalar
+/// mapped to a same-width Rust primitive, a non-zero-length constant array of
+/// such, or a nested record that is itself faithful.
+///
+/// It is a WHITELIST, and it must stay one. The emitted field list diverges
+/// from C in several measured ways that are invisible to a size check: a
+/// bit-field run becomes a synthetic `__bitsN` backing field whose layout the
+/// importer's own comment calls "deliberately NOT ABI-compatible"; a data
+/// POINTER member becomes the historical i64 CURSOR, which is the same WIDTH
+/// as an LP64 pointer and therefore a SEMANTIC lie no offset assertion can
+/// catch; a union becomes either a single-arm reinterpretation or an opaque
+/// `[u8; N]` blob whose Rust alignment is 1; a flexible array member grows a
+/// trailing owned `Vec<T>`; a zero-length array member is skipped outright.
+/// Every one of those disqualifies the record.
+///
+/// The attribute is the ONLY licence the Rust emitter has to give a struct
+/// `#[repr(C)]` and to admit it into a `--c-abi-exports` signature (FR-182).
+inline constexpr llvm::StringLiteral kAbiFaithfulAttrName =
+    "emitrust.abi_faithful";
+
+/// FR-182: name of the discardable `emitrust.struct_def` DICTIONARY attribute
+/// carrying CLANG'S OWN layout numbers for an `emitrust.abi_faithful` record,
+/// read from `clang::ASTContext::getASTRecordLayout`:
+///
+///   `{align = <bytes>, offsets = [<byte offset per field>], size = <bytes>}`
+///
+/// `offsets` is index-aligned with the struct_def's `field_names`, which a
+/// faithful record's whitelist guarantees corresponds one-to-one with the C
+/// members (every construct that perturbs that correspondence — bit-field
+/// runs, anonymous-member flattening, dropped zero-length arrays, grown FAM
+/// tails — is a disqualifier).
+///
+/// The emitter renders these numbers as `const _: () = assert!(...)` items
+/// over `size_of`/`align_of`/`offset_of!`. That is a BUILD-TIME backstop with
+/// the repo's mandated failure direction: a layout the Rust compiler lays out
+/// differently from clang is `error[E0080]` at `cargo build`, never a silent
+/// wrong answer across the FFI boundary.
+inline constexpr llvm::StringLiteral kAbiLayoutAttrName = "emitrust.abi_layout";
+
+/// FR-182: name of the discardable `emitrust.struct_def` STRING attribute
+/// naming the FIRST reason a record is not ABI-faithful (see
+/// `kAbiFaithfulAttrName`). Exactly one of this and the faithful/layout pair
+/// rides every imported record.
+///
+/// Its consumer is the `--c-abi-exports` refusal diagnostic. Before FR-182
+/// every refused signature got the identical "not all-scalar" sentence, which
+/// is factually wrong for a struct-taking function; the whole diagnostic value
+/// of the faithfulness predicate is naming the ACTUAL divergence ("the pointer
+/// member 'buffer', emitted as an i64 data-pointer cursor rather than an
+/// address") at the C function's own location.
+inline constexpr llvm::StringLiteral kAbiUnfaithfulReasonAttrName =
+    "emitrust.abi_unfaithful_reason";
+
 /// FR-52: name of the discardable `emitrust.func` string attribute marking a
 /// function that is GENERIC over the external-requirement trait. Its value is
 /// the trait's name, so the emitter needs no module-level channel to render

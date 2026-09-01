@@ -64,7 +64,7 @@ int copy_rec(void) {
   return take_by_value(s);
 }
 
-// CONTAINED-DAG: emitrust.struct_def @[[U:([A-Za-z0-9_]+_)?U]] ["opaque"] [!emitrust.array<40xui8>] {emitrust.opaque_union}
+// CONTAINED-DAG: emitrust.struct_def @[[U:([A-Za-z0-9_]+_)?U]] ["opaque"] [!emitrust.array<40xui8>] {{.*}}emitrust.opaque_union}
 // CONTAINED-DAG: emitrust.struct_def @[[R:([A-Za-z0-9_]+_)?Rec]] ["before", "u", "after"] [i32, !emitrust.struct<"[[U]]">, i32]
 // CONTAINED-LABEL: func.func @sum_rec
 // CONTAINED-LABEL: func.func @make_rec
@@ -113,7 +113,7 @@ int whole(void) {
   return s.before + s.after;
 }
 
-// WHOLE-DAG: emitrust.struct_def @[[U:([A-Za-z0-9_]+_)?U]] ["opaque"] [!emitrust.array<40xui8>] {emitrust.opaque_union}
+// WHOLE-DAG: emitrust.struct_def @[[U:([A-Za-z0-9_]+_)?U]] ["opaque"] [!emitrust.array<40xui8>] {{.*}}emitrust.opaque_union}
 // WHOLE: func.func @pass(%{{[a-z0-9]+}}: !emitrust.struct<"[[U]]">) -> !emitrust.struct<"[[U]]">
 // WHOLE-LABEL: func.func @whole
 // WHOLE: emitrust.member %{{.*}}["u"] : (!emitrust.lvalue<!emitrust.struct<"{{([A-Za-z0-9_]+_)?}}Rec">>) -> !emitrust.lvalue<!emitrust.struct<"[[U]]">>
@@ -161,8 +161,8 @@ struct RecB {
 // of the shape hash; the property pinned here is unchanged -- TWO DISTINCT
 // anonymous opaque unions (two DAG matches of the same pattern cannot land
 // on one line), one per record.
-// ANON-DAG: emitrust.struct_def @{{Anon[0-9A-F]+}} ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
-// ANON-DAG: emitrust.struct_def @{{Anon[0-9A-F]+}} ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
+// ANON-DAG: emitrust.struct_def @{{Anon[0-9A-F]+}} ["opaque"] [!emitrust.array<8xui8>] {{.*}}emitrust.opaque_union}
+// ANON-DAG: emitrust.struct_def @{{Anon[0-9A-F]+}} ["opaque"] [!emitrust.array<8xui8>] {{.*}}emitrust.opaque_union}
 // ANON-DAG: emitrust.struct_def @{{([A-Za-z0-9_]+_)?}}RecA ["u"] [!emitrust.struct<"Anon{{[0-9A-F]+}}">]
 // ANON-DAG: emitrust.struct_def @{{([A-Za-z0-9_]+_)?}}RecB ["u"] [!emitrust.struct<"Anon{{[0-9A-F]+}}">]
 
@@ -197,7 +197,7 @@ struct Rec gr = {7};
 
 int read_globals(void) { return gr.before + gr.after; }
 
-// GLOBALZERO-DAG: emitrust.struct_def @[[U:([A-Za-z0-9_]+_)?U]] ["opaque"] [!emitrust.array<40xui8>] {emitrust.opaque_union}
+// GLOBALZERO-DAG: emitrust.struct_def @[[U:([A-Za-z0-9_]+_)?U]] ["opaque"] [!emitrust.array<40xui8>] {{.*}}emitrust.opaque_union}
 // GLOBALZERO-DAG: emitrust.global @gz <{{.*}}> : !emitrust.struct<"[[U]]">
 // GLOBALZERO-DAG: emitrust.global @gr <[7 : i32, {{.*}}, 0 : i32]> : !emitrust.struct<"{{([A-Za-z0-9_]+_)?}}Rec">
 // GLOBALZERO-LABEL: func.func @read_globals

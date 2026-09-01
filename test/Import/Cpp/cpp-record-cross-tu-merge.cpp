@@ -168,7 +168,7 @@ int main(int argc, char **argv) {
 }
 
 // One struct_def WITH the drop marker, one Drop body, one method body.
-// DROPPY-COUNT-1: emitrust.struct_def @Keeper ["v"] [i32] {emitrust.has_drop}
+// DROPPY-COUNT-1: emitrust.struct_def @Keeper ["v"] [i32] {{.*}}emitrust.has_drop}
 // DROPPY-NOT: emitrust.struct_def @Keeper
 // DROPPYFN-COUNT-1: func.func @Keeper_dtor
 // DROPPYFN-NOT: func.func @Keeper_dtor
