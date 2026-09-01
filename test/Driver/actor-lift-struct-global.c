@@ -44,14 +44,31 @@ int tap_sum(void) { return cal.taps[0] + cal.taps[1] + cal.taps[2]; }
 // NOTE: note: actor plan: exported CAL: owner handle 'CalActor' (construct with CalActor::new())
 
 // The owner struct holds the C global as a private field, and new() stages
-// the aggregate initializer in one `let` and assigns it whole — the
-// staged variable is the op the old nearest-table lookup could not verify.
+// the aggregate initializer in one `let` — the staged variable is the op
+// the old nearest-table lookup could not verify.
+//
+// FR-184 moved the two bytes after that staged `let`: the whole-member
+// assign `owner.cal = v0;` is gone, folded into the owner's own binding as
+// the FR-63 field-init fuse `CalActor { cal: v0, }`. The staged `let` used
+// to END the fuse's prefix, so this shape — every FR-62 owner `new()` with
+// an aggregate field initializer — fused for nothing; the staged variable is
+// now skipped because its init is an ATTRIBUTE (a compile-time constant that
+// cannot read the owner being built). Two consequences are pinned below and
+// are the whole point of the change: `cal` is CalActor's only field, so the
+// fuse covers the struct and the `..CalActor::default()` base drops (no
+// zero-filled Cal is materialized just to be overwritten), and with no store
+// surviving the binding is `let owner`, not `let mut owner` — a stale `mut`
+// would be a hard build failure under deny(unused_mut). The RUST-NEXT chain
+// from `pub fn new()` through the returned `owner` is deliberate: it pins
+// that the staged `let` still renders BEFORE the literal that names it.
 // RUST:      pub struct CalActor {
 // RUST-NEXT:     cal: Cal,
 // RUST-NEXT: }
 // RUST:      impl CalActor {
 // RUST-NEXT:     pub fn new() -> CalActor {
-// RUST:          let v0: Cal = Cal { base: -7, mask: 4000000000, scale: -1.25, taps: [2, -3, 0], };
-// RUST-NEXT:     owner.cal = v0;
+// RUST-NEXT:         let v0: Cal = Cal { base: -7, mask: 4000000000, scale: -1.25, taps: [2, -3, 0], };
+// RUST-NEXT:         let owner: CalActor = CalActor { cal: v0, };
+// RUST-NEXT:         owner
+// RUST-NEXT:     }
 // RUST:      pub fn shift_base(&mut self, by: i32) -> i32 {
 // RUST:      pub fn tap_sum(&mut self) -> i32 {

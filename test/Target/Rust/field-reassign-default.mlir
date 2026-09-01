@@ -18,7 +18,24 @@
 // before coverage -- stays fully un-fused: that base is a whole extra S,
 // constructed and DROPPED (W2.17's measured spurious `dtor 0 0`), so the
 // fence is a correctness invariant, not a style choice.
+//
+// FR-184 widens Gate 2's PREFIX (not its safety conditions): an
+// `emitrust.variable` carrying an init ATTRIBUTE -- a staged
+// `let vN: T = <literal>;` -- no longer ends the prefix. FR-62's actor-owner
+// `new()` stages every aggregate field initializer in its own `let` before
+// the whole-member assign, so the staged `let` sat between the default and
+// the stores and the fuse fired for ZERO instances of that shape (measured:
+// all 23 default+field-assign sites in the emitted-crate corpus were blocked
+// by a staged let). The skip is sound because an init ATTRIBUTE is a
+// compile-time constant, not an SSA value, so a staged variable structurally
+// CANNOT read the variable being built -- it needs no `valueTreeReachesPlace`
+// check of its own, unlike an assigned value. A staged variable with NO init
+// attribute is SSA-initialized from anything (including the target), so it
+// still ends the prefix. Ordering falls out for free: the staged `let`
+// renders at its own program point and the fused literal renders at the LAST
+// fused assign, so the literal always lands AFTER the lets it names.
 // RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s
+// RUN: emitrust-translate --mlir-to-rust %s | FileCheck %s --check-prefix=IMPL
 
 emitrust.struct_def @Point ["x", "y", "z"] [i32, i32, i32]
 emitrust.struct_def @Pair ["a", "b"] [i32, i32]
@@ -253,5 +270,175 @@ emitrust.func @droppy_repeat(%arg0: i32, %arg1: i32) -> i32 {
   emitrust.assign %b = %arg0 : !emitrust.lvalue<i32>
   %b2 = emitrust.member %d["b"] : (!emitrust.lvalue<!emitrust.struct<"Noisy">>) -> !emitrust.lvalue<i32>
   %r = emitrust.load %b2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %r : i32
+}
+
+emitrust.struct_def @Box ["arr", "n"] [!emitrust.array<2xi32>, i32]
+emitrust.struct_def @TwoArr ["p", "q"] [!emitrust.array<2xi32>, !emitrust.array<2xi32>]
+emitrust.struct_def @BigCfg ["arr", "big"] [!emitrust.array<2xi32>, !emitrust.array<40xi32>]
+emitrust.struct_def @NoisyArr ["arr", "n"] [!emitrust.array<2xi32>, i32] {emitrust.has_drop}
+
+// FR-184: a CONST STAGED aggregate variable between the default and the
+// field stores no longer ends the prefix -- this is FR-62's actor-owner
+// `new()` shape, which fused for nothing before. Both fields are covered, so
+// the `..Box::default()` base drops (and with it the zero array that was
+// materialized only to be overwritten), and with no surviving store the
+// binding loses `mut`. The staged `let v0` still renders at its own program
+// point, ahead of the literal that names it.
+// CHECK-LABEL: fn staged_all_fields() -> i32 {
+// CHECK-NEXT:    let v0: [i32; 2] = [1, 2];
+// CHECK-NEXT:    let b: Box = Box { arr: v0, n: 5i32, };
+// CHECK-NEXT:    b.n
+// CHECK-NEXT:  }
+emitrust.func @staged_all_fields() -> i32 {
+  %b = emitrust.variable named "b" : !emitrust.lvalue<!emitrust.struct<"Box">>
+  %arr = emitrust.member %b["arr"] : (!emitrust.lvalue<!emitrust.struct<"Box">>) -> !emitrust.lvalue<!emitrust.array<2xi32>>
+  %v = emitrust.variable const <[1 : i32, 2 : i32]> : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %l = emitrust.load %v : (!emitrust.lvalue<!emitrust.array<2xi32>>) -> !emitrust.array<2xi32>
+  emitrust.assign %arr = %l : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %n = emitrust.member %b["n"] : (!emitrust.lvalue<!emitrust.struct<"Box">>) -> !emitrust.lvalue<i32>
+  %c = emitrust.constant <5 : i32> : i32
+  emitrust.assign %n = %c : !emitrust.lvalue<i32>
+  %n2 = emitrust.member %b["n"] : (!emitrust.lvalue<!emitrust.struct<"Box">>) -> !emitrust.lvalue<i32>
+  %r = emitrust.load %n2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %r : i32
+}
+
+// FR-184 ordering pin: TWO staged variables feeding two fields both fuse,
+// and BOTH staged lets render BEFORE the single literal that names them --
+// the CHECK-NEXT chain is the ordering oracle, since a literal emitted ahead
+// of its staged let would not compile.
+// CHECK-LABEL: fn staged_two() -> i32 {
+// CHECK-NEXT:    let v0: [i32; 2] = [1, 2];
+// CHECK-NEXT:    let v2: [i32; 2] = [3, 4];
+// CHECK-NEXT:    let t: TwoArr = TwoArr { p: v0, q: v2, };
+// CHECK-NEXT:    t.q[0i32 as usize]
+// CHECK-NEXT:  }
+emitrust.func @staged_two() -> i32 {
+  %t = emitrust.variable named "t" : !emitrust.lvalue<!emitrust.struct<"TwoArr">>
+  %p = emitrust.member %t["p"] : (!emitrust.lvalue<!emitrust.struct<"TwoArr">>) -> !emitrust.lvalue<!emitrust.array<2xi32>>
+  %v0 = emitrust.variable const <[1 : i32, 2 : i32]> : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %l0 = emitrust.load %v0 : (!emitrust.lvalue<!emitrust.array<2xi32>>) -> !emitrust.array<2xi32>
+  emitrust.assign %p = %l0 : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %q = emitrust.member %t["q"] : (!emitrust.lvalue<!emitrust.struct<"TwoArr">>) -> !emitrust.lvalue<!emitrust.array<2xi32>>
+  %v1 = emitrust.variable const <[3 : i32, 4 : i32]> : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %l1 = emitrust.load %v1 : (!emitrust.lvalue<!emitrust.array<2xi32>>) -> !emitrust.array<2xi32>
+  emitrust.assign %q = %l1 : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %q2 = emitrust.member %t["q"] : (!emitrust.lvalue<!emitrust.struct<"TwoArr">>) -> !emitrust.lvalue<!emitrust.array<2xi32>>
+  %c0 = emitrust.constant <0 : i32> : i32
+  %e = emitrust.subscript %q2[%c0] : (!emitrust.lvalue<!emitrust.array<2xi32>>, i32) -> !emitrust.lvalue<i32>
+  %r = emitrust.load %e : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %r : i32
+}
+
+// FR-184 x the base rule: PARTIAL coverage through a staged variable keeps
+// the `..Holder::default()` base -- the widened prefix changes WHICH ops the
+// prefix may cross, never whether the base is needed.
+// CHECK-LABEL: fn staged_partial(_v0: Pair) -> i32 {
+// CHECK-NEXT:    let v1: [i32; 2] = [7, 8];
+// CHECK-NEXT:    let h: Holder = Holder { arr: v1, ..Holder::default() };
+// CHECK-NEXT:    h.inner.a
+// CHECK-NEXT:  }
+emitrust.func @staged_partial(%arg0: !emitrust.struct<"Pair">) -> i32 {
+  %h = emitrust.variable named "h" : !emitrust.lvalue<!emitrust.struct<"Holder">>
+  %arr = emitrust.member %h["arr"] : (!emitrust.lvalue<!emitrust.struct<"Holder">>) -> !emitrust.lvalue<!emitrust.array<2xi32>>
+  %v = emitrust.variable const <[7 : i32, 8 : i32]> : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %l = emitrust.load %v : (!emitrust.lvalue<!emitrust.array<2xi32>>) -> !emitrust.array<2xi32>
+  emitrust.assign %arr = %l : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %in = emitrust.member %h["inner"] : (!emitrust.lvalue<!emitrust.struct<"Holder">>) -> !emitrust.lvalue<!emitrust.struct<"Pair">>
+  %a = emitrust.member %in["a"] : (!emitrust.lvalue<!emitrust.struct<"Pair">>) -> !emitrust.lvalue<i32>
+  %r = emitrust.load %a : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %r : i32
+}
+
+// FR-184 x kMaxDerivedDefaultArrayLength: `BigCfg` holds a `[i32; 40]`, past
+// the length Rust's blanket `impl Default for [T; N]` covers, so it gets an
+// EXPLICIT `impl Default` instead of `#[derive(Default)]`. The surviving
+// `..BigCfg::default()` base must still resolve against that explicit impl --
+// the fuse is indifferent to how `Default` was obtained.
+// IMPL-LABEL: impl Default for BigCfg {
+// CHECK-LABEL: fn staged_big_default() -> i32 {
+// CHECK-NEXT:    let v0: [i32; 2] = [9, 10];
+// CHECK-NEXT:    let b: BigCfg = BigCfg { arr: v0, ..BigCfg::default() };
+// CHECK-NEXT:    b.arr[0i32 as usize]
+// CHECK-NEXT:  }
+emitrust.func @staged_big_default() -> i32 {
+  %b = emitrust.variable named "b" : !emitrust.lvalue<!emitrust.struct<"BigCfg">>
+  %arr = emitrust.member %b["arr"] : (!emitrust.lvalue<!emitrust.struct<"BigCfg">>) -> !emitrust.lvalue<!emitrust.array<2xi32>>
+  %v = emitrust.variable const <[9 : i32, 10 : i32]> : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %l = emitrust.load %v : (!emitrust.lvalue<!emitrust.array<2xi32>>) -> !emitrust.array<2xi32>
+  emitrust.assign %arr = %l : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %c0 = emitrust.constant <0 : i32> : i32
+  %e = emitrust.subscript %arr[%c0] : (!emitrust.lvalue<!emitrust.array<2xi32>>, i32) -> !emitrust.lvalue<i32>
+  %r = emitrust.load %e : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %r : i32
+}
+
+// FR-184 fence: a staged variable with NO init attribute still ENDS the
+// prefix. Its initializer is an SSA value that could read anything --
+// including the variable being built -- so the constant-attribute argument
+// that licenses the skip does not apply and nothing fuses. Byte-identical to
+// the pre-FR-184 rendering.
+// CHECK-LABEL: fn staged_no_init(v0: i32) -> i32 {
+// CHECK-NEXT:    let mut b: Box = Box::default();
+// CHECK-NEXT:    let v1: [i32; 2] = [0; 2];
+// CHECK-NEXT:    b.arr = v1;
+// CHECK-NEXT:    b.n = v0;
+// CHECK-NEXT:    b.n
+// CHECK-NEXT:  }
+emitrust.func @staged_no_init(%arg0: i32) -> i32 {
+  %b = emitrust.variable named "b" : !emitrust.lvalue<!emitrust.struct<"Box">>
+  %arr = emitrust.member %b["arr"] : (!emitrust.lvalue<!emitrust.struct<"Box">>) -> !emitrust.lvalue<!emitrust.array<2xi32>>
+  %v = emitrust.variable : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %l = emitrust.load %v : (!emitrust.lvalue<!emitrust.array<2xi32>>) -> !emitrust.array<2xi32>
+  emitrust.assign %arr = %l : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %n = emitrust.member %b["n"] : (!emitrust.lvalue<!emitrust.struct<"Box">>) -> !emitrust.lvalue<i32>
+  emitrust.assign %n = %arg0 : !emitrust.lvalue<i32>
+  %n2 = emitrust.member %b["n"] : (!emitrust.lvalue<!emitrust.struct<"Box">>) -> !emitrust.lvalue<i32>
+  %r = emitrust.load %n2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %r : i32
+}
+
+// FR-184 x FR-111: the widened prefix must NOT let a droppy PARTIAL-coverage
+// case start fusing. `NoisyArr` is has_drop and only `arr` is stored, so a
+// fuse would keep a `..NoisyArr::default()` base -- a whole extra NoisyArr,
+// constructed and then DROPPED (W2.17's measured spurious `dtor 0 0`). It
+// stays fully un-fused, exactly as before FR-184.
+// CHECK-LABEL: fn staged_droppy_partial() -> i32 {
+// CHECK-NEXT:    let mut d: NoisyArr = NoisyArr::default();
+// CHECK-NEXT:    let v0: [i32; 2] = [1, 2];
+// CHECK-NEXT:    d.arr = v0;
+// CHECK-NEXT:    d.n
+// CHECK-NEXT:  }
+emitrust.func @staged_droppy_partial() -> i32 {
+  %d = emitrust.variable named "d" : !emitrust.lvalue<!emitrust.struct<"NoisyArr">>
+  %arr = emitrust.member %d["arr"] : (!emitrust.lvalue<!emitrust.struct<"NoisyArr">>) -> !emitrust.lvalue<!emitrust.array<2xi32>>
+  %v = emitrust.variable const <[1 : i32, 2 : i32]> : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %l = emitrust.load %v : (!emitrust.lvalue<!emitrust.array<2xi32>>) -> !emitrust.array<2xi32>
+  emitrust.assign %arr = %l : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %n2 = emitrust.member %d["n"] : (!emitrust.lvalue<!emitrust.struct<"NoisyArr">>) -> !emitrust.lvalue<i32>
+  %r = emitrust.load %n2 : (!emitrust.lvalue<i32>) -> i32
+  emitrust.return %r : i32
+}
+
+// FR-184 x FR-111, the other polarity: a has_drop struct whose staged-variable
+// prefix covers EVERY field fuses base-free, so there is no extra NoisyArr to
+// construct and drop.
+// CHECK-LABEL: fn staged_droppy_all() -> i32 {
+// CHECK-NEXT:    let v0: [i32; 2] = [1, 2];
+// CHECK-NEXT:    let d: NoisyArr = NoisyArr { arr: v0, n: 6i32, };
+// CHECK-NEXT:    d.n
+// CHECK-NEXT:  }
+emitrust.func @staged_droppy_all() -> i32 {
+  %d = emitrust.variable named "d" : !emitrust.lvalue<!emitrust.struct<"NoisyArr">>
+  %arr = emitrust.member %d["arr"] : (!emitrust.lvalue<!emitrust.struct<"NoisyArr">>) -> !emitrust.lvalue<!emitrust.array<2xi32>>
+  %v = emitrust.variable const <[1 : i32, 2 : i32]> : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %l = emitrust.load %v : (!emitrust.lvalue<!emitrust.array<2xi32>>) -> !emitrust.array<2xi32>
+  emitrust.assign %arr = %l : !emitrust.lvalue<!emitrust.array<2xi32>>
+  %n = emitrust.member %d["n"] : (!emitrust.lvalue<!emitrust.struct<"NoisyArr">>) -> !emitrust.lvalue<i32>
+  %c = emitrust.constant <6 : i32> : i32
+  emitrust.assign %n = %c : !emitrust.lvalue<i32>
+  %n2 = emitrust.member %d["n"] : (!emitrust.lvalue<!emitrust.struct<"NoisyArr">>) -> !emitrust.lvalue<i32>
+  %r = emitrust.load %n2 : (!emitrust.lvalue<i32>) -> i32
   emitrust.return %r : i32
 }

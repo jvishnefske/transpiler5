@@ -12342,6 +12342,70 @@ piece and becomes FR-45.
   over malformed as well as well-formed input; the ranking above is NOT a
   GO.
 
+- [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
+  FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED
+  AGGREGATE `let` ENDED ITS PREFIX.**
+  `computeFieldInitFuses`' Gate-2 loop (`TranslateToRust.cpp:3268-3286`)
+  `continue`s past place projections, dropped ops and inlined ops, then
+  `break`s on anything that is not an `AssignOp`. FR-62's
+  `materializeFieldInit` (`ActorLift.cpp:846-848`) stages every AGGREGATE
+  field initializer in its own initialized variable, loads it once and
+  assigns the member whole, so a staged `let` always sits between the
+  default and the stores:
+      let mut owner: Tu0BaseActor = Tu0BaseActor::default();
+      let v0: [u16; 8] = [3, 5, 7, 11, 13, 17, 19, 23];   // prefix ends HERE
+      owner.tu0_base = v0;
+  MEASURED over the 710 emitted crates the suite writes under
+  `build/test/*/Output/**/src/*.rs`: 1118 `let X: T = T::default();` sites,
+  23 of them followed by field assigns, and **all 23 blocked** -- the fuse
+  fired for NONE of this shape (15 EndToEnd, 7 Driver, 1 CTestSuite).
+  FIX: the prefix scan also skips an `emitrust.variable` carrying an init
+  ATTRIBUTE.
+  **THE SAFETY ARGUMENT, which is what makes this sound and is recorded in
+  the code:** an init attribute is a COMPILE-TIME CONSTANT, not an SSA
+  value, so such a variable structurally CANNOT read the variable being
+  built -- which is why it needs no `valueTreeReachesPlace` check of its own,
+  unlike the assigned values. Nor can it be WRITTEN inside the prefix: any
+  store to it is an assign whose place is not a single-level member of the
+  target, and so ends the prefix. Its `let` renders at its own program point
+  while the fused literal renders at the LAST fused assign, so the literal
+  always lands after the bindings it names -- the ordering is automatic, not
+  arranged.
+  MEASURED RESULT: blocked 23 -> 9; 11 emitted crates changed and **every
+  hunk is the fuse**, verified against a byte snapshot of the pre-change
+  corpus. All four contract variations behave: full coverage drops the
+  `..T::default()` base and loses `mut`; partial coverage keeps both
+  (`NextSeedActor { seeds: v0, ..NextSeedActor::default() }`); a two-field
+  owner fuses to one literal; `mut` survives where a later store does.
+  Dropping the base also stops materializing a zero-filled aggregate purely
+  to overwrite it.
+  **THE 9 RESIDUALS VALIDATE THE RULE RATHER THAN LIMIT IT.** FOUR are
+  `let vN: i32 = <function call>;` -- SSA-initialized from a CALL, where
+  skipping would reorder a possibly side-effecting call against the owner's
+  construction. Those must never fuse and do not. Three are a non-inlined
+  `emitrust.constant` materializing its own `let`
+  (`Option<fn() -> i32> = Some(foo)`); the same position-independence
+  argument would license skipping that too, a possible follow-on, deliberately
+  not taken here. Two are variables with no init attribute.
+  **CLIPPY DID NOT MOVE, AND THAT WAS PREDICTED BEFORE MEASURING: 231 -> 231
+  (+0) against the epoch-5 pin.** `clippy::field_reassign_with_default`
+  requires the store to follow the default DIRECTLY, so it never flagged the
+  staged form -- the pin records exactly ONE such warning even though 15 of
+  the blocked sites live in that very corpus. **This is an EPIC-E readability
+  change, not a lint fix, and no clippy win should be claimed for it.**
+  SCOPE NOTE: the rule is broader than its motivating shape. `getInitAttr()`
+  is also true of scalar locals (`let mut s: i32 = 0;`), so
+  `range-for-aggregates.c` gained two fuses over plain C locals that have
+  nothing to do with actors. That is the rule as written and the byte-diff
+  oracle is green on it.
+  Gate 961/961; TRACTOR unchanged at 31/252 (a rendering change must not move
+  the external score, and did not).
+  (test/Target/Rust/field-reassign-default.mlir gains 7 cases including both
+  FR-111 Drop fences and the >32-array explicit-`impl Default` case;
+  test/Driver/actor-lift-struct-global.c is the moved golden;
+  test/Driver/c-abi-exports-actor.c gains a 3-line NARROWING over a
+  previously unpinned `new()` body.)
+
 - [x] FR-176 DEFECT (opened 2026-08-29 as FR-161 on the probe line; RENUMBERED
   2026-08-30 when the rebase onto the trunk met the trunk's own FR-161
   (FR-158 Phase 3), which is cited by commits that are already immutable
