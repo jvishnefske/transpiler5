@@ -39,9 +39,9 @@
 // RUN: emitrust-import-c -I %t/inc %t/a.c 2>/dev/null > %t/both.mlir
 // RUN: emitrust-import-c -I %t/inc/../inc %t/b.c 2>/dev/null >> %t/both.mlir
 // RUN: FileCheck %s --check-prefix=SAME < %t/both.mlir
-//      SAME: emitrust.struct_def @[[UNION:Anon[0-9A-F]+]] ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
+//      SAME: emitrust.struct_def @[[UNION:Anon[0-9A-F]+]] ["opaque"] [!emitrust.array<8xui8>] {{.*}}emitrust.opaque_union}
 //      SAME: emitrust.struct_def @Node ["type_", "u"] [i32, !emitrust.struct<"[[UNION]]">]
-//      SAME: emitrust.struct_def @[[UNION]] ["opaque"] [!emitrust.array<8xui8>] {emitrust.opaque_union}
+//      SAME: emitrust.struct_def @[[UNION]] ["opaque"] [!emitrust.array<8xui8>] {{.*}}emitrust.opaque_union}
 //      SAME: emitrust.struct_def @Node ["type_", "u"] [i32, !emitrust.struct<"[[UNION]]">]
 
 // The link half: the shards agree, so `Node` and the blob each dedup to

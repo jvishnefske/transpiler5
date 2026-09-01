@@ -448,6 +448,23 @@ private:
   /// all when `cAbiActorWrappers` is empty, which is every run without
   /// `--c-abi-exports`.
   LogicalResult emitCAbiActorWrappers();
+  /// FR-182: emits the module-scope epilogue that gives a C-ABI symbol to
+  /// each exported function taking exactly ONE pointer to an ABI-faithful
+  /// struct -- an `#[export_name = "<sym>"] unsafe extern "C"` wrapper whose
+  /// whole body is the single delegating call `f(&mut *p, ...)`. The
+  /// translated function is untouched, byte for byte, and the `unsafe` is
+  /// confined to the generated item. Emits nothing when
+  /// `cAbiPointerWrappers` is empty, which is every run without
+  /// `--c-abi-exports`.
+  LogicalResult emitCAbiPointerWrappers();
+  /// FR-182: emits the `const _: () = assert!(...)` items that pin a
+  /// `#[repr(C)]` struct's Rust layout to CLANG's -- size, alignment and
+  /// every field offset, from the importer's `emitrust.abi_layout`. A
+  /// divergence is `error[E0080]` at `cargo build`, which is the repo's
+  /// mandated hard-error direction; `cargo build` succeeding is otherwise
+  /// no evidence at all about an FFI boundary.
+  LogicalResult emitAbiLayoutAsserts(emitrust::StructDefOp structDefOp,
+                                     StringRef name);
   /// FR-62 slice 5b: emits the per-actor runtime an `emitrust.actor_runtime`
   /// anchor stands for, derived entirely from the referenced struct's impl —
   /// the `<Actor>Msg` enum (variant = UpperCamel(method), payload fields =
@@ -726,6 +743,53 @@ private:
     Type resultType;
   };
   SmallVector<CAbiActorWrapper> cAbiActorWrappers;
+
+  /// FR-182: one pending C-ABI wrapper for an exported function whose
+  /// signature is scalars plus exactly ONE reference to an ABI-faithful
+  /// struct (class 1). The wrapper cannot simply BE that function: its
+  /// parameter is a raw `*mut T` where the function's is `&mut T`, so the
+  /// two are distinct items and only the wrapper carries the C symbol
+  /// (`#[export_name]`, which is what lets the translated function keep its
+  /// own name and every internal call site keep its bytes).
+  ///
+  /// A HARD STRUCTURAL CAP rides this shape: at most ONE reference or slice
+  /// parameter, ever. Two references are `noalias` to LLVM and a C caller
+  /// may legally alias them -- measured at rustc 1.96.1 -O3, a two-`&mut`
+  /// kernel called with equal pointers returned 10 where the clang native
+  /// returned 104, exit 0, no diagnostic.
+  struct CAbiPointerWrapper {
+    /// The function's location, for the wrapper's type diagnostics.
+    Location loc;
+    /// The bare C symbol, which `#[export_name]` binds.
+    StringRef symbol;
+    /// The translated function's own name, i.e. what the wrapper calls.
+    StringRef printedName;
+    /// The `pub ` the function itself carries.
+    StringRef visibility;
+    /// The parameters, in order, exactly as the function rendered them.
+    SmallVector<std::string> argNames;
+    SmallVector<Type> argTypes;
+    /// The single result type, or null for a void function.
+    Type resultType;
+    /// Which parameter is the struct reference.
+    unsigned refIndex;
+    /// Whether that parameter is `&mut T` (`*mut T`) or `&T` (`*const T`).
+    bool refIsMut;
+    /// The struct_def symbol the reference points at.
+    StringRef refStructName;
+  };
+  SmallVector<CAbiPointerWrapper> cAbiPointerWrappers;
+
+  /// FR-182: the struct_def symbols rendered `#[repr(C)]` with clang's
+  /// layout asserted. Computed once in `emitModule`, before any item is
+  /// rendered, because a struct_def is emitted long before the exported
+  /// function that names it. It is the TRANSITIVE closure over the faithful
+  /// fields of every struct reachable from an admitted C-ABI signature: if
+  /// exported `A` contains `B`, A's layout depends on B's, so B must be
+  /// `#[repr(C)]` too -- a correctness requirement, not an optimisation.
+  /// Empty without `--c-abi-exports`, which is what keeps every existing
+  /// crate golden byte-identical.
+  llvm::StringSet<> cAbiReprCStructs;
 
   /// FR-179: the owner structs an `emitrust.actor_runtime` anchor manages.
   /// Such an owner's instance is the one the spawned mailbox loop holds, so
@@ -4276,6 +4340,210 @@ verifyFnPtrTargetsPresent(Operation *op, Attribute init, Type type,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// FR-182: the C-ABI export gate over the two admitted STRUCT shapes
+//===----------------------------------------------------------------------===//
+
+// Defined below, beside FR-139's own predicates; declared here because the
+// module pre-pass that decides which structs are rendered `#[repr(C)]` runs
+// before any item is emitted.
+static bool isCAbiScalarType(Type type);
+
+namespace {
+/// FR-182: what `--c-abi-exports` admits a function signature as.
+enum class CAbiClass {
+  /// Refused; the verdict's `blocker` says why, in that shape's own words.
+  Refused,
+  /// FR-139: every parameter and every result is a builtin scalar.
+  Scalar,
+  /// FR-182 class 0: scalars and ABI-faithful structs passed and returned BY
+  /// VALUE. A plain `#[no_mangle] extern "C"` item; ZERO `unsafe`.
+  ByValueStruct,
+  /// FR-182 class 1: exactly ONE parameter is a reference to an ABI-faithful
+  /// struct and every other parameter and the result is a scalar. A
+  /// one-statement `unsafe extern "C"` wrapper delegates to the untouched
+  /// translated function.
+  StructPointer
+};
+
+struct CAbiVerdict {
+  CAbiClass kind = CAbiClass::Refused;
+  /// Why not, phrased as the tail of "no C-ABI export for 'f': ...".
+  std::string blocker;
+  /// For `StructPointer`: which parameter carries the reference, whether it
+  /// is `&mut`, and the struct it points at.
+  unsigned refIndex = 0;
+  bool refIsMut = false;
+  StringRef refStructName;
+};
+} // namespace
+
+/// FR-139's original refusal sentence, kept VERBATIM for every shape FR-182
+/// did not widen. A slice parameter above all: it is a two-register fat
+/// pointer, rustc compiles the `extern "C"` mismatch with only a
+/// non-FFI-safe warning, and every later argument shifts (measured on crc16
+/// -- native 21983, export 25322, exit 0, no diagnostic). That wording is
+/// pinned by test/Driver/c-abi-exports.c and test/Driver/c-abi-exports-actor.c
+/// and must not drift.
+static constexpr llvm::StringLiteral kCAbiNotAllScalarBlocker =
+    "its signature is not all-scalar (a C-ABI entry point may only take and "
+    "return builtin integer and floating-point types)";
+
+/// FR-182: is the struct named `name` ABI-faithful, per the importer's
+/// whitelist? On `false`, `reason` receives the recorded divergence -- that
+/// string is the whole diagnostic value of the predicate, so it is never
+/// summarized here.
+static bool cAbiStructIsFaithful(Operation *from, StringRef name,
+                                 std::string &reason) {
+  emitrust::StructDefOp def = emitrust::StructDefOp::lookupFrom(from, name);
+  if (!def) {
+    reason = "this module carries no definition of it";
+    return false;
+  }
+  if (def->hasAttr(emitrust::kAbiFaithfulAttrName))
+    return true;
+  if (auto why = def->getAttrOfType<StringAttr>(
+          emitrust::kAbiUnfaithfulReasonAttrName))
+    reason = why.getValue().str();
+  else
+    reason = "no layout model was recorded for it at import";
+  return false;
+}
+
+/// FR-182: classifies `type` against the C ABI, naming the refusal per shape.
+///
+/// Before FR-182 every refused signature got FR-139's identical "not
+/// all-scalar" sentence, which is factually wrong for most of them. The
+/// residual classes each say what is actually in the way, because the whole
+/// point of the faithfulness predicate is that "the pointer member 'buffer',
+/// emitted as an i64 data-pointer cursor rather than an address" tells the
+/// person who wrote the C something the generic sentence never could.
+static CAbiVerdict classifyCAbiSignature(Operation *from, FunctionType type) {
+  CAbiVerdict verdict;
+  unsigned sliceCount = 0;
+  unsigned refCount = 0;
+  bool sawOther = false;
+  bool sawByValueStruct = false;
+  bool refIsStruct = false;
+  bool refFaithful = false;
+  StringRef refStructName;
+  std::string refBlocker;
+  std::string byValueBlocker;
+  StringRef byValueStructName;
+  bool byValueBlockerIsResult = false;
+
+  auto noteByValueStruct = [&](emitrust::StructType structType, bool isResult) {
+    sawByValueStruct = true;
+    std::string reason;
+    if (!cAbiStructIsFaithful(from, structType.getName(), reason) &&
+        byValueBlocker.empty()) {
+      byValueBlocker = reason;
+      byValueStructName = structType.getName();
+      byValueBlockerIsResult = isResult;
+    }
+  };
+
+  for (auto [index, input] : llvm::enumerate(type.getInputs())) {
+    if (isCAbiScalarType(input))
+      continue;
+    if (auto structType = dyn_cast<emitrust::StructType>(input)) {
+      noteByValueStruct(structType, /*isResult=*/false);
+      continue;
+    }
+    Type pointee;
+    bool isMut = false;
+    if (auto mutRef = dyn_cast<emitrust::MutRefType>(input)) {
+      pointee = mutRef.getPointee();
+      isMut = true;
+    } else if (auto ref = dyn_cast<emitrust::RefType>(input)) {
+      pointee = ref.getPointee();
+    }
+    if (!pointee) {
+      sawOther = true;
+      continue;
+    }
+    // A slice is a REFERENCE too, and counts against the same cap; it is
+    // separated here only so its refusal keeps FR-139's wording.
+    if (isa<emitrust::SliceType>(pointee)) {
+      ++sliceCount;
+      continue;
+    }
+    ++refCount;
+    verdict.refIndex = index;
+    verdict.refIsMut = isMut;
+    if (auto structType = dyn_cast<emitrust::StructType>(pointee)) {
+      refIsStruct = true;
+      refStructName = structType.getName();
+      refFaithful = cAbiStructIsFaithful(from, refStructName, refBlocker);
+    }
+  }
+  for (Type result : type.getResults()) {
+    if (isCAbiScalarType(result))
+      continue;
+    if (auto structType = dyn_cast<emitrust::StructType>(result)) {
+      noteByValueStruct(structType, /*isResult=*/true);
+      continue;
+    }
+    sawOther = true;
+  }
+
+  // A slice, and anything with no C spelling at all, keeps FR-139's wording
+  // whatever else is in the signature. (A slice beside a reference is also
+  // over the structural cap below; either refusal is correct and this one is
+  // the pinned one.)
+  if (sliceCount != 0 || sawOther) {
+    verdict.blocker = kCAbiNotAllScalarBlocker.str();
+    return verdict;
+  }
+  // THE structural cap: at most ONE reference parameter, ever. Two are
+  // `noalias` to LLVM and a C caller may legally alias them -- measured at
+  // rustc 1.96.1 -O3, `kernel(a,b)` called with `a == b` returned 10 where
+  // the clang native returned 104, exit 0, no diagnostic. No library can
+  // disprove that its caller aliases, so this is not relaxable by analysis.
+  if (refCount >= 2) {
+    verdict.blocker =
+        ("it takes " + llvm::Twine(refCount) +
+         " pointer arguments; a C caller may legally alias them, and two "
+         "&mut references built from aliased pointers miscompile (measured)")
+            .str();
+    return verdict;
+  }
+  if (refCount == 1) {
+    if (!refIsStruct) {
+      verdict.blocker = kCAbiNotAllScalarBlocker.str();
+      return verdict;
+    }
+    if (!refFaithful) {
+      verdict.blocker =
+          ("it takes a pointer to '" + refStructName +
+           "', whose layout model is not ABI-faithful (" + refBlocker + ")")
+              .str();
+      return verdict;
+    }
+    if (sawByValueStruct) {
+      verdict.blocker =
+          "it combines a pointer parameter with a by-value aggregate "
+          "elsewhere in the signature, a mixture this wave does not admit";
+      return verdict;
+    }
+    verdict.kind = CAbiClass::StructPointer;
+    verdict.refStructName = refStructName;
+    return verdict;
+  }
+  if (!byValueBlocker.empty()) {
+    verdict.blocker =
+        ("it " + llvm::Twine(byValueBlockerIsResult ? "returns" : "takes") +
+         " '" + byValueStructName +
+         "' by value, whose layout model is not ABI-faithful (" +
+         byValueBlocker + ")")
+            .str();
+    return verdict;
+  }
+  verdict.kind =
+      sawByValueStruct ? CAbiClass::ByValueStruct : CAbiClass::Scalar;
+  return verdict;
+}
+
 LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   // FR-57a: a module carrying an `emitrust.extern_decl`-marked declaration
   // is one translation unit's SHARD, not a program — the marked symbol's
@@ -4531,6 +4799,81 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
       }
     }
   }
+  // FR-182: the structs rendered `#[repr(C)]`, decided BEFORE any item is
+  // emitted -- a struct_def is rendered long before the exported function
+  // that names it, so the answer cannot be discovered in `emitFunc`.
+  //
+  // The closure is TRANSITIVE and that is a correctness requirement, not an
+  // optimisation: if exported `A` contains `B`, A's own field offsets depend
+  // on B's layout, so B must be `#[repr(C)]` too or A's asserted offsets are
+  // not the ones rustc will use. MEASURED (FR-181 spike): `#[repr(C)]` makes
+  // flac_validate byte-identical to the clang native on all 6 corpus
+  // vectors, where the default repr is WRONG and SILENT -- the struct is the
+  // same SIZE under both reprs, so no size check catches it, and
+  // `improper_ctypes_definitions` does not fire for a raw pointer to a
+  // non-`repr(C)` struct.
+  //
+  // Empty without `--c-abi-exports`; that is what keeps every crate golden
+  // byte-identical, and it is checked, not assumed
+  // (test/Driver/c-abi-exports-structs.c diffs the two roots).
+  cAbiReprCStructs.clear();
+  cAbiPointerWrappers.clear();
+  if (options.cAbiExports) {
+    llvm::StringMap<emitrust::StructDefOp> structDefsByName;
+    for (auto structDefOp : moduleOp.getOps<emitrust::StructDefOp>())
+      structDefsByName[structDefOp.getSymName()] = structDefOp;
+    llvm::SmallVector<StringRef> worklist;
+    auto noteReachable = [&](Type type) {
+      Type inner = type;
+      if (auto mutRef = dyn_cast<emitrust::MutRefType>(inner))
+        inner = mutRef.getPointee();
+      else if (auto ref = dyn_cast<emitrust::RefType>(inner))
+        inner = ref.getPointee();
+      while (auto arrayType = dyn_cast<emitrust::ArrayType>(inner))
+        inner = arrayType.getElementType();
+      if (auto structType = dyn_cast<emitrust::StructType>(inner))
+        if (cAbiReprCStructs.insert(structType.getName()).second)
+          worklist.push_back(structType.getName());
+    };
+    for (auto funcOp : moduleOp.getOps<emitrust::FuncOp>()) {
+      StringAttr symbolAttr = SymbolTable::getSymbolName(funcOp);
+      if (!symbolAttr)
+        continue;
+      StringRef symbol = symbolAttr.getValue();
+      // The same three gates `emitFunc` applies: a per-TU module item is
+      // translation-unit-local and never exported (FR-159), an unexported
+      // item has no C symbol to give, and a requirement-generic item has no
+      // single symbol at all (FR-52).
+      if (!itemModulePath(symbol).empty() || itemVisibility(symbol).empty() ||
+          funcOp->hasAttr(emitrust::kExternalsGenericAttrName))
+        continue;
+      // ...and FR-62 slice 5c's: an `async fn` has no C calling convention.
+      bool isAsyncFn = false;
+      funcOp->walk([&](emitrust::MethodCallOp call) {
+        if (isAsyncHandleCall(call))
+          isAsyncFn = true;
+      });
+      if (isAsyncFn)
+        continue;
+      CAbiVerdict verdict =
+          classifyCAbiSignature(funcOp, funcOp.getFunctionType());
+      if (verdict.kind == CAbiClass::Refused ||
+          verdict.kind == CAbiClass::Scalar)
+        continue;
+      for (Type input : funcOp.getFunctionType().getInputs())
+        noteReachable(input);
+      for (Type result : funcOp.getFunctionType().getResults())
+        noteReachable(result);
+    }
+    while (!worklist.empty()) {
+      StringRef name = worklist.pop_back_val();
+      auto found = structDefsByName.find(name);
+      if (found == structDefsByName.end())
+        continue;
+      for (Attribute typeAttr : found->second.getFieldTypes())
+        noteReachable(cast<TypeAttr>(typeAttr).getValue());
+    }
+  }
   // FR-62 slice 5c: the shared `mod actor_rt` epilogue exists once per
   // crate and its text is flavor-specific, so every anchor in one module
   // must agree on the mode. The driver never produces a mixed module
@@ -4701,6 +5044,12 @@ LogicalResult RustEmitter::emitModule(ModuleOp moduleOp) {
   // run reaches this with an empty list and emits not one byte.
   if (failed(emitCAbiActorWrappers()))
     return failure();
+  // FR-182: and the C-ABI wrappers for exported functions taking one pointer
+  // to an ABI-faithful struct, at MODULE scope for the same reason -- and,
+  // like the actor wrappers, a pure APPEND, so the default (flagless) crate
+  // root is reproduced byte for byte by deleting them.
+  if (failed(emitCAbiPointerWrappers()))
+    return failure();
   // FR-62 slice 5b: the shared actor runtime — Handle<M>, the synchronous
   // call protocol, and the reap/shutdown panic-provenance plumbing — is one
   // fixed, message-type-generic module, emitted once per crate when any
@@ -4805,6 +5154,68 @@ LogicalResult RustEmitter::emitCAbiActorWrappers() {
        << ".borrow_mut()." << wrapper.printedName << "(";
     llvm::interleaveComma(wrapper.argNames, os);
     os << "))\n";
+    decreaseIndent();
+    os << "}\n";
+    closeNonSnakeCaseScope(itemStart);
+  }
+  return success();
+}
+
+LogicalResult RustEmitter::emitCAbiPointerWrappers() {
+  for (const CAbiPointerWrapper &wrapper : cAbiPointerWrappers) {
+    // FR-140: the wrapper binds an item name derived from the bare C symbol
+    // and the function's own parameter spellings, either of which can trip
+    // `non_snake_case`; it opens its own allow-scope for exactly the reason
+    // the function item does.
+    const size_t itemStart = openNonSnakeCaseScope();
+    // The ITEM cannot be named for the C symbol: the translated function
+    // already holds that name at module scope and a second item of the same
+    // name is rustc E0428. `#[export_name]` supplies the BARE symbol a dlsym
+    // host needs while leaving the translated function -- and every internal
+    // call site -- byte for byte unchanged. The `__`-leading prefix is
+    // reserved in C, so the derived spelling cannot collide with an imported
+    // one.
+    std::string itemName = ("__emitrust_cabi_" + wrapper.symbol).str();
+    noteBoundName(itemName);
+    for (const std::string &argName : wrapper.argNames)
+      noteBoundName(argName);
+    os << "#[export_name = \"" << wrapper.symbol << "\"]\n"
+       << wrapper.visibility << "unsafe extern \"C\" fn " << itemName << "(";
+    StringRef pointeeName = itemLeafName(wrapper.refStructName);
+    for (auto [index, argName] : llvm::enumerate(wrapper.argNames)) {
+      if (index)
+        os << ", ";
+      os << argName << ": ";
+      if (index == wrapper.refIndex) {
+        // The C side has a POINTER here; the translated function has a Rust
+        // reference. Spelling the wrapper's parameter as the raw pointer is
+        // what makes the two agree, and it is the only reason the wrapper
+        // needs `unsafe` at all.
+        os << (wrapper.refIsMut ? "*mut " : "*const ") << pointeeName;
+        continue;
+      }
+      if (failed(emitType(wrapper.loc, wrapper.argTypes[index])))
+        return failure();
+    }
+    os << ")";
+    if (wrapper.resultType) {
+      os << " -> ";
+      if (failed(emitType(wrapper.loc, wrapper.resultType)))
+        return failure();
+    }
+    os << " {\n";
+    increaseIndent();
+    // ONE statement. Everything the function does stays in the function,
+    // which is what confines the `unsafe` to this generated item.
+    os << wrapper.printedName << "(";
+    for (auto [index, argName] : llvm::enumerate(wrapper.argNames)) {
+      if (index)
+        os << ", ";
+      if (index == wrapper.refIndex)
+        os << (wrapper.refIsMut ? "&mut *" : "&*");
+      os << argName;
+    }
+    os << ")\n";
     decreaseIndent();
     os << "}\n";
     closeNonSnakeCaseScope(itemStart);
@@ -5034,14 +5445,12 @@ static bool isCAbiScalarType(Type type) {
   return isa<IntegerType>(type) || isa<FloatType>(type);
 }
 
-/// FR-139: true when every input and every result of `type` is a C-ABI scalar.
-///
-/// A zero-result (void) function and a zero-parameter one both qualify
-/// vacuously, which is correct: `extern "C" fn f()` is a complete C signature.
-static bool hasAllScalarSignature(FunctionType type) {
-  return llvm::all_of(type.getInputs(), isCAbiScalarType) &&
-         llvm::all_of(type.getResults(), isCAbiScalarType);
-}
+// FR-139's `hasAllScalarSignature` lived here. FR-182 SUBSUMED it: the
+// all-scalar answer is `classifyCAbiSignature`'s `CAbiClass::Scalar`, which a
+// zero-result (void) function and a zero-parameter one still reach vacuously
+// -- `extern "C" fn f()` is a complete C signature. The receiver-dropping
+// variant below stays: the FR-179 actor path is all-scalar-only by design and
+// admits no struct shape.
 
 /// FR-179: the same predicate over the C signature of an FR-62 actor-lifted
 /// owner method, i.e. the method's signature with block argument 0 -- the
@@ -5262,6 +5671,16 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   // for byte; a module-scope `#[no_mangle] extern "C"` wrapper delegating
   // through a per-owner thread_local singleton is emitted for it instead.
   bool cAbiActorWrapper = false;
+  // FR-182: set when this function's signature is scalars plus exactly ONE
+  // reference to an ABI-faithful struct (class 1). The function itself keeps
+  // the `pub fn f(t: &mut T, ...)` it has always had, byte for byte; a
+  // module-scope `#[export_name] unsafe extern "C"` wrapper taking `*mut T`
+  // and delegating in one statement is emitted for it instead.
+  bool cAbiPointerWrapper = false;
+  // FR-182: the signature's classification, and the storage its per-shape
+  // refusal wording lives in (`blocker` is a StringRef).
+  CAbiVerdict cAbiVerdict;
+  std::string cAbiBlockerStorage;
   // FR-179: the discriminator between the two kinds of impl member that
   // reach here, attribute-keyed and never prefix-parsed (see FR-110 above).
   // A genuine C++ member carries `emitrust.method_rust_name`; a receiverless
@@ -5303,13 +5722,33 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
                   "C-ABI singleton has nothing to construct from";
       else
         cAbiActorWrapper = true;
-    } else if (!hasAllScalarSignature(funcOp.getFunctionType()))
-      blocker = "its signature is not all-scalar (a C-ABI entry point may "
-                "only take and return builtin integer and floating-point "
-                "types)";
-    if (blocker.empty() && !cAbiActorWrapper)
-      cAbiExport = true;
-    else if (!blocker.empty())
+    } else {
+      // FR-182 widens FR-139's all-scalar gate by exactly TWO struct shapes
+      // and refuses everything else PER SHAPE, in that shape's own words.
+      cAbiVerdict = classifyCAbiSignature(op, funcOp.getFunctionType());
+      // FR-182's two STRUCT classes are for MODULE-SCOPE free functions
+      // only. Inside an `emitrust.impl` the first argument is a synthesized
+      // receiver and not a C parameter at all, the emitted symbol is not a
+      // name C ever had, and a delegating wrapper would have no module-scope
+      // callee to name; the one impl member that does carry a real C
+      // signature is the FR-62 C owner method, and it took the actor path
+      // above. Such a member keeps FR-139's wording -- which is exactly what
+      // it got before FR-182 (pinned for `box_step` by
+      // test/Driver/c-abi-exports-actor-cxx.cpp).
+      if (isa<emitrust::ImplOp>(op->getParentOp()) &&
+          cAbiVerdict.kind != CAbiClass::Scalar)
+        cAbiVerdict = {CAbiClass::Refused, kCAbiNotAllScalarBlocker.str()};
+      if (cAbiVerdict.kind == CAbiClass::Refused) {
+        cAbiBlockerStorage = cAbiVerdict.blocker;
+        blocker = cAbiBlockerStorage;
+      }
+    }
+    if (blocker.empty() && !cAbiActorWrapper) {
+      // Class 1 gets a wrapper and NOT the C ABI on the function itself:
+      // its parameter is a Rust reference where C has a pointer.
+      cAbiPointerWrapper = cAbiVerdict.kind == CAbiClass::StructPointer;
+      cAbiExport = !cAbiPointerWrapper;
+    } else if (!blocker.empty())
       // On the LOCATION, not the op: this is a message for the person who
       // wrote the C, and attaching it to the operation makes MLIR dump the
       // whole `emitrust.func` after it.
@@ -5366,7 +5805,7 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
     os << argName << ": ";
     if (failed(emitType(argument.getLoc(), argument.getType())))
       return failure();
-    if (cAbiActorWrapper) {
+    if (cAbiActorWrapper || cAbiPointerWrapper) {
       wrapperArgNames.push_back(std::move(argName));
       wrapperArgTypes.push_back(argument.getType());
     }
@@ -5383,6 +5822,13 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
          itemVisibility(symbol), std::move(wrapperArgNames),
          std::move(wrapperArgTypes),
          fn.getNumResults() == 1 ? fn.getResultTypes().front() : Type()});
+  if (cAbiPointerWrapper)
+    cAbiPointerWrappers.push_back(
+        {op->getLoc(), symbol, printedName, itemVisibility(symbol),
+         std::move(wrapperArgNames), std::move(wrapperArgTypes),
+         fn.getNumResults() == 1 ? fn.getResultTypes().front() : Type(),
+         cAbiVerdict.refIndex, cAbiVerdict.refIsMut,
+         cAbiVerdict.refStructName});
   os << " {\n";
   increaseIndent();
   if (failed(emitBlockBody(entryBlock)))
@@ -6817,6 +7263,54 @@ static bool derivedDefaultCovers(Type type) {
   return true;
 }
 
+LogicalResult
+RustEmitter::emitAbiLayoutAsserts(emitrust::StructDefOp structDefOp,
+                                  StringRef name) {
+  // The numbers are CLANG'S, recorded at import from its own
+  // ASTRecordLayout; nothing here re-derives a layout, because two layout
+  // models on the emitter side would only give the two ways to be wrong
+  // together. A struct in `cAbiReprCStructs` is ABI-faithful by
+  // construction, so the attribute is always present -- refuse loudly rather
+  // than emit a `#[repr(C)]` with nothing backing it up if it ever is not.
+  auto layout =
+      structDefOp->getAttrOfType<DictionaryAttr>(emitrust::kAbiLayoutAttrName);
+  if (!layout)
+    return structDefOp.emitError()
+           << "struct '" << structDefOp.getSymName()
+           << "' is exported across the C ABI but carries no "
+           << emitrust::kAbiLayoutAttrName
+           << "; a #[repr(C)] with no asserted layout is an unbacked promise";
+  auto size = dyn_cast_or_null<IntegerAttr>(layout.get("size"));
+  auto align = dyn_cast_or_null<IntegerAttr>(layout.get("align"));
+  auto offsets = dyn_cast_or_null<ArrayAttr>(layout.get("offsets"));
+  if (!size || !align || !offsets ||
+      offsets.size() != structDefOp.getFieldNames().size())
+    return structDefOp.emitError()
+           << "struct '" << structDefOp.getSymName() << "' carries a malformed "
+           << emitrust::kAbiLayoutAttrName;
+  // `const _: () = assert!(..)` is evaluated at MONOMORPHIZATION-independent
+  // const time: a mismatch is `error[E0080]` at `cargo build`, never a wrong
+  // answer at run time. That is this repo's mandated safe failure direction,
+  // and it is the only thing that would catch a future rustc laying a
+  // `#[repr(C)]` struct out differently from the C compiler.
+  os << "const _: () = assert!(core::mem::size_of::<" << name
+     << ">() == " << size.getInt() << ");\n";
+  os << "const _: () = assert!(core::mem::align_of::<" << name
+     << ">() == " << align.getInt() << ");\n";
+  for (auto [nameAttr, offsetAttr] :
+       llvm::zip_equal(structDefOp.getFieldNames(), offsets)) {
+    auto offset = dyn_cast<IntegerAttr>(offsetAttr);
+    if (!offset)
+      return structDefOp.emitError()
+             << "struct '" << structDefOp.getSymName()
+             << "' carries a malformed " << emitrust::kAbiLayoutAttrName;
+    os << "const _: () = assert!(core::mem::offset_of!(" << name << ", "
+       << cast<StringAttr>(nameAttr).getValue() << ") == " << offset.getInt()
+       << ");\n";
+  }
+  return success();
+}
+
 LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   Location loc = structDefOp.getLoc();
   // FR-55: the `Default` derive is kept wherever it works — it is the
@@ -6854,6 +7348,17 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
             cast<StringAttr>(nameAttr).getValue());
       }))
     os << "#[allow(non_snake_case)]\n";
+  // FR-182: an ABI-faithful struct REACHABLE from a `--c-abi-exports`
+  // signature is laid out the way clang laid it out. `#[repr(C)]` is the
+  // only thing that promises that; the default Rust repr is free to reorder
+  // fields and MEASURABLY does (the FR-181 spike: `struct tflac` is the same
+  // SIZE under both reprs, so nothing catches the difference, but the field
+  // OFFSETS differ and flac_validate returned wrong answers across the
+  // boundary with exit 0 and no diagnostic). The set is empty without the
+  // flag, so no existing crate golden moves a byte.
+  const bool reprC = cAbiReprCStructs.contains(structDefOp.getSymName());
+  if (reprC)
+    os << "#[repr(C)]\n";
   os << "#[derive(Clone" << (copyable ? ", Copy" : "")
      << (derivable ? ", Default" : "") << ")]\n";
   // A field-less struct_def (C's `struct T {};`) prints unit-like with an
@@ -6863,6 +7368,9 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   if (structDefOp.getFieldNames().empty()) {
     os << typePartVisibility() << "struct "
        << itemLeafName(structDefOp.getSymName()) << " {}\n";
+    if (reprC)
+      return emitAbiLayoutAsserts(structDefOp,
+                                  itemLeafName(structDefOp.getSymName()));
     return success();
   }
   // FR-62 F2: an exported owner struct (`emitrust.private_fields`) keeps
@@ -6890,6 +7398,8 @@ LogicalResult RustEmitter::emitStructDef(emitrust::StructDefOp structDefOp) {
   }
   decreaseIndent();
   os << "}\n";
+  if (reprC && failed(emitAbiLayoutAsserts(structDefOp, name)))
+    return failure();
   if (derivable)
     return success();
   os << "impl Default for " << name << " {\n";

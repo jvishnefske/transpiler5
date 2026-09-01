@@ -12143,7 +12143,13 @@ piece and becomes FR-45.
     +4  `to_barycentric` (by-value `repr(C)` structs, NO pointers, zero
         `unsafe`, the cheapest case on the board), `flac_validate` (6/6
         vectors), `update_frame_header` (5/5), `bitwriter_add` (3/3).
-        That is **28 -> 32** on top of FR-179.
+        **CORRECTED BY FR-182 TO +3 (28 -> 31), NOT +4.** `bitwriter_add`'s
+        `struct tflac_bitwriter` carries a POINTER member (`tflac_u8
+        *buffer`), which the importer emits as an i64 cursor rather than an
+        address -- the same width on LP64, so the `offset_of!` backstop
+        cannot catch it. This spike's clean byte-diff for that case held only
+        because the function never reads that field, which is luck and not a
+        contract. It is refused, and is now a required negative test.
     +1  `hdr_bitrate`, ONLY if a must-access-bound analysis is built. Costed
         separately; it is worth exactly one case today.
   SPHINCS+: **+0 today and +20 of 80 at the CEILING.** Re-confirmed at HEAD by
@@ -12182,6 +12188,159 @@ piece and becomes FR-45.
   build-time backstop. +4 cases, three one-statement `unsafe` wrappers, no new
   ops, no golden movement, every measured counterexample left behind a
   LOCATED refusal.
+
+- [x] FR-182 (opened and LANDED 2026-08-31 on the FR-181 spike's
+  recommendation): **THE `repr(C)` C-ABI EXPORT TIER -- TWO STRUCT SHAPES,
+  AND A WHITELIST THAT REFUSES EVERYTHING ELSE BY NAME.**
+  FR-181 measured that the default Rust repr silently reorders fields and
+  that `*mut T` over a non-`repr(C)` struct warns about NOTHING at compile
+  or run time. This admits exactly two shapes and emits a layout contract
+  for them:
+    CLASS 0, by value -- every parameter and the result is a scalar or an
+      ABI-faithful struct. Plain `#[no_mangle] extern "C"`, **zero `unsafe`**.
+    CLASS 1, one struct pointer -- exactly ONE parameter is a ref/mut_ref to
+      an ABI-faithful struct, all others scalar. A generated wrapper carries
+      the `unsafe`, one statement, and the translated body is TEXTUALLY
+      UNCHANGED.
+  **A HARD STRUCTURAL CAP: at most ONE reference/slice parameter, ever.**
+  FR-181 measured that two `&mut` built from two C pointers are `noalias`
+  while a C caller may legally alias them, and no library can disprove that
+  from the inside. Slices stay refused in every position.
+  **THE FAITHFULNESS PREDICATE IS A WHITELIST, NOT A BLACKLIST**, computed
+  in the importer (which is the only place that can see the divergences) and
+  carried on `emitrust.struct_def` as discardable attributes. A record is
+  faithful only when every member, TRANSITIVELY, is a width-checked scalar,
+  a non-zero fixed array of a faithful type, or a faithful nested record.
+  Refused by name: pointer members (see below), function-pointer members,
+  bit-field runs, flexible and zero-length array members, unions anywhere,
+  anonymous struct/union members, enum members (conservative this wave),
+  C++ bases/destructors/vtables.
+  **THE MEMBER SHAPE THAT MATTERS MOST IS THE POINTER, AND IT IS WHY THE
+  YIELD IS +3 AND NOT FR-181's +4.** A pointer member keeps the historical
+  i64 SLOT -- a data-pointer CURSOR, not an address
+  (`ImportCAggregates.cpp:1759-1766`) -- which is the SAME WIDTH on LP64, so
+  **no offset assertion can ever catch it.** `struct tflac_bitwriter` carries
+  `tflac_u8 *buffer`, so `bitwriter_add` is REFUSED, naming that member.
+  FR-181 byte-diffed that case clean and counted it, but only because the
+  function never reads the field; that is luck, not a contract. It is now a
+  REQUIRED NEGATIVE TEST: if the predicate ever exports it, the predicate is
+  wrong.
+  **A SECOND SEMANTIC NARROWING NOTHING ELSE WOULD HAVE CAUGHT**, found by
+  comparing clang's own `getTypeSize` against the emitted Rust primitive's
+  width rather than trusting the mapping: **`long double` maps to `f64` -- a
+  128-bit C type silently narrowed to 64.** `_Bool` maps to `i1` (1 bit, not
+  8) and is refused by the same comparison. An empty C++ class is refused
+  too (C++ gives it size 1; a field-less `repr(C)` Rust struct is
+  zero-sized); an empty C struct stays faithful, 0 == 0.
+  **THE BUILD-TIME BACKSTOP.** For every faithful struct REACHABLE from an
+  admitted signature -- transitively, because A's layout depends on the
+  layout of any B it contains -- the emitter renders `#[repr(C)]` plus
+  `size_of`/`align_of`/`offset_of!` const assertions carrying clang's own
+  numbers. Any residual divergence is `error[E0080]` at `cargo build`, the
+  repo's mandated hard-error direction, never a silent one.
+  MEASURED, and the oracle BITES -- deleting the `#[repr(C)]` lines from the
+  emitted crate and rebuilding gives `wide_mix=11000.000000` where the clang
+  native gives `7011.125000`, and the `tflac` validator writes
+  `fields=64 1000 67 0 1027` where native writes `64 1000 3 4 67`, **exit 0,
+  no diagnostic**. Patching one offset by hand gives
+  `error[E0080]: ... assertion failed: core::mem::offset_of!(Wide, c) == 12`.
+  The exported crate builds with ZERO rustc warnings.
+  YIELD, corpus oracle: `to_barycentric` (class 0, zero `unsafe`),
+  `flac_validate` and `update_frame_header` (class 1) PASS; `bitwriter_add`
+  correctly stays SYMBOL_MISSING. **TRACTOR criterion (a): 28 -> 31 of 252.**
+  DEFECT FOUND AND FIXED IN PASSING: cross-TU dedup skips a record reached
+  through a shared header BEFORE any struct_def is built, so the second TU's
+  decl carried no cached verdict and any record of that TU CONTAINING it was
+  refused for "no imported layout model". Safe direction, but a real yield
+  loss on exactly the multi-TU shape this corpus is made of. The verdict is
+  now cached on the dedup path -- provably the same verdict, since the dedup
+  has just proven the field arrays identical -- and pinned by
+  `test/Driver/c-abi-exports-structs-multi-tu.c`.
+  The wrapper uses `#[export_name = "f"]` on a `__emitrust_cabi_`-prefixed
+  item rather than renaming the translated function: same bare `dlsym`
+  symbol, no rename of any internal call site, and the body really is
+  untouched. The `__` prefix is reserved in C so it cannot collide.
+  RESIDUAL REFUSALS now carry PER-SHAPE wordings naming the actual reason,
+  replacing the single "not all-scalar" message that was factually wrong for
+  most of the twelve refused cases. The slice wording is kept VERBATIM from
+  FR-139.
+  Flag OFF is byte-identical, proven by `diff` in three tests, and NO
+  emitted-Rust golden moved a byte. Nine MLIR CHECK lines were NARROWED (a
+  `{{.*}}` before the pinned attribute) because every `struct_def` now
+  carries a faithfulness attribute; name, field names, field types and the
+  pinned attribute all still hold. Gate 961/961.
+  NOT VERIFIED: non-x86-64/LP64 targets (every layout number here is
+  host-measured); a stale pre-FR-182 `--incremental`/`--link` shard, whose
+  struct_defs carry no attribute and therefore export nothing (safe
+  direction, unexercised); clippy on a wrapper-bearing crate; and a
+  root-scope export naming an FR-159 per-TU-module struct.
+
+- [ ] FR-183 (opened 2026-08-31 by the FR-182 wait, measured with the FR-178
+  instrument; **NOT SPIKED beyond this ranking**): **AFTER THE EXPORT WORK,
+  THE BIGGEST REMAINING TRACTOR LEVER IS STANDARD INPUT, AND IT HAS NO
+  `dlsym` CONFLICT AT ALL.**
+  METHOD, deliberately NOT first-failure (that error has now been made five
+  times): per-case blocker SETS over the 83 non-SPHINCS EMIT_FAILs with
+  `--recover --incremental`, cross-tabbed against case KIND and exported
+  symbol, then a greedy marginal-yield curve computed over the EXEC cases
+  ONLY -- because an exec case needs no exported symbol, so for it a cleared
+  emit set really IS a PASS. That last restriction is the whole point: it is
+  the stage-crossing FR-178 says to apply before ranking anything.
+  MEASURED, 77 of 83 cases (6 have no compile database):
+    blocker-set sizes -> cases ...... {0: 3, 1: 45, 2: 28, 3: 1}
+  GREEDY CURVE OVER THE 34 EXEC CASES (cumulative fixes -> cases cleared):
+    +1  call to a variadic function ......................  9
+    +2  a FILE* stream argument must be a function-local .. 13
+    +3  the address of a scalar object is not a string ..... 16
+    +4  pointer variable has no known target object ....... 18
+    +5  pointer expression: CStyleCastExpr ................ 20
+    +6  pointer assigned a non-address value .............. 22
+  **THE FIRST TWO STEPS ARE THE SAME CAPABILITY.** Costed before ranking, as
+  the protocol requires: the "variadic" blocker on these cases is NOT
+  `printf` (every hosted output variadic is already name-intercepted) -- it
+  is **`scanf` / `fscanf`**, and the FILE* blocker on the next four is
+  **`stdin`** reaching `emitFileHandleArg` (`ImportCHosted.cpp:130`), which
+  admits only an `fopen`-created function-local handle. There is no `scanf`,
+  no `getchar` and no `stdin` recognition anywhere in `lib/`.
+  AND THE CORPUS REALLY DRIVES IT: an exec case's vector is literally
+  `{"argv": [], "stdin": "0\n0"}`, so standard input is the input channel
+  these cases are scored on. Verified on `021_complex_goto`.
+  So the lever is ONE capability -- model standard input: `stdin` as a
+  readable stream, plus a `scanf`-family reader over it -- and it is worth
+  **13 of the 34 exec cases**, with ZERO interaction with FR-139, the
+  `dlsym` stage, or the pointer-export question that gates everything else
+  on the board. That makes it the largest conflict-free population left.
+  A SECOND INPUT CAPABILITY SITS BESIDE IT, and the honest count for it is a
+  CEILING rather than a yield. Five exec cases (`003_string_slicing`,
+  `004_nineality_sieve`, `005_static_loop`, `007_errno_pow`, `008_long_run`)
+  are refused at **main's `argv`**. They are the six my sweep could not
+  measure, and the reason is instructive: the argv rejection fires at
+  SIGNATURE import (`ImportCFunctions.cpp:648`), so `--recover` never walks
+  the body and the rest of each case's blocker set is INVISIBLE until argv
+  lands. **So 5 is a first-failure number and therefore an upper bound, not a
+  yield** -- the exact error this entry's method exists to avoid, reappearing
+  in the adjacent population. Do not spend it before it is measured.
+  Encouraging, though: argv is already supported end to end in two shapes
+  (`test/EndToEnd/argv-echo.c` is a real differential over four argument
+  vectors including `"two words"` and non-ASCII), with the
+  `!emitrust.argv_table` type, the `emitrust.argv_arg` op and the process
+  wrapper all present. The gap is the ADMISSION GRAMMAR (`argvUseAdmitted`,
+  `ImportCPlanning.cpp:3444-3472`, which today admits only `argv[i]` as a
+  direct-`printf` `%s` and `argv[i][j]` as a value) plus a short bridge into
+  `emitCharRegionArg` for `atoi(argv[1])`/`strcmp(argv[1], ...)`, for which
+  the FR-88 `slicePlace` socket already exists.
+  TAKEN TOGETHER: the EXEC half of the corpus (40 of the 83 non-SPHINCS
+  EMIT_FAILs) is gated substantially on **how a program receives its input**
+  -- stdin and argv -- and not on the pointer model that dominates the lib
+  half. That is a different shape of work from everything ranked before it.
+  CAUTION, recorded so it is not rediscovered as a surprise: `scanf` is a
+  PARSER with failure modes C programs routinely ignore (partial matches,
+  return-count checking, `%d` on non-numeric input, trailing whitespace
+  semantics). A rendering that silently diverges on malformed input would be
+  exactly the miscompile class this repo forbids, and the corpus vectors are
+  adversarial by construction. This needs a real spike with a differential
+  over malformed as well as well-formed input; the ranking above is NOT a
+  GO.
 
 - [x] FR-176 DEFECT (opened 2026-08-29 as FR-161 on the probe line; RENUMBERED
   2026-08-30 when the rebase onto the trunk met the trunk's own FR-161

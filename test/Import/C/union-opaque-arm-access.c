@@ -30,7 +30,7 @@ struct Rec {
 
 struct Rec g;
 
-// CHECK-DAG: emitrust.struct_def @[[U:([A-Za-z0-9_]+_)?U]] ["opaque"] [!emitrust.array<20xui8>] {emitrust.opaque_union}
+// CHECK-DAG: emitrust.struct_def @[[U:([A-Za-z0-9_]+_)?U]] ["opaque"] [!emitrust.array<20xui8>] {{.*}}emitrust.opaque_union}
 
 // Arrow read, const offset 0, 4-byte leaf: blob projection then a
 // from_ne_bytes combine; no arm name reaches the IR.

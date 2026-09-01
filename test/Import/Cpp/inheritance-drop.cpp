@@ -38,7 +38,7 @@
 
 extern "C" int printf(const char *, ...);
 
-// CHECK-DAG: emitrust.struct_def @B ["x"] [i32] {emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @B ["x"] [i32] {{.*}}emitrust.has_drop}
 struct B {
   int x;
   B(int v) : x(v) { printf("ctor B %d\n", x); }
@@ -46,14 +46,14 @@ struct B {
 };
 
 // Merely inheriting: transitive has_drop, no dtor func of its own.
-// CHECK-DAG: emitrust.struct_def @D ["base", "y"] [!emitrust.struct<"B">, i32] {emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @D ["base", "y"] [!emitrust.struct<"B">, i32] {{.*}}emitrust.has_drop}
 struct D : B {
   int y;
   D(int a, int b) : B(a), y(b) {}
 };
 
 // Derived WITH its own destructor: has_drop plus a real drop_impl.
-// CHECK-DAG: emitrust.struct_def @E ["base", "z"] [!emitrust.struct<"B">, i32] {emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @E ["base", "z"] [!emitrust.struct<"B">, i32] {{.*}}emitrust.has_drop}
 struct E : B {
   int z;
   E(int a, int b) : B(a), z(b) {}
@@ -61,8 +61,8 @@ struct E : B {
 };
 
 // Three levels, droppy ROOT only: the recursion walks the whole chain.
-// CHECK-DAG: emitrust.struct_def @M ["base", "m"] [!emitrust.struct<"B">, i32] {emitrust.has_drop}
-// CHECK-DAG: emitrust.struct_def @L ["base", "l"] [!emitrust.struct<"M">, i32] {emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @M ["base", "m"] [!emitrust.struct<"B">, i32] {{.*}}emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @L ["base", "l"] [!emitrust.struct<"M">, i32] {{.*}}emitrust.has_drop}
 struct M : B {
   int m;
   M(int a, int b) : B(a), m(b) {}
@@ -73,8 +73,8 @@ struct L : M {
 };
 
 // The EMPTY droppy base, materialized as a true zero-field struct.
-// CHECK-DAG: emitrust.struct_def @Shape [] [] {emitrust.has_drop}
-// CHECK-DAG: emitrust.struct_def @Circle ["base", "r"] [!emitrust.struct<"Shape">, i32] {emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @Shape [] [] {{.*}}emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @Circle ["base", "r"] [!emitrust.struct<"Shape">, i32] {{.*}}emitrust.has_drop}
 struct Shape {
   ~Shape() { printf("~Shape\n"); }
 };
@@ -84,7 +84,7 @@ struct Circle : Shape {
 };
 
 // Sole-virtual-destructor class as a VALUE.
-// CHECK-DAG: emitrust.struct_def @V ["id"] [i32] {emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @V ["id"] [i32] {{.*}}emitrust.has_drop}
 struct V {
   int id;
   V(int i) : id(i) {}

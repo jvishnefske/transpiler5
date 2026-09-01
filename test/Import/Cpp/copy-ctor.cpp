@@ -36,7 +36,7 @@
 
 extern "C" int printf(const char *, ...);
 
-// CHECK-DAG: emitrust.struct_def @Tracer ["value"] [i32] {emitrust.has_copy_ctor}
+// CHECK-DAG: emitrust.struct_def @Tracer ["value"] [i32] {{.*}}emitrust.has_copy_ctor}
 struct Tracer {
   int value;
   Tracer(int v) : value(v) {}
@@ -44,7 +44,7 @@ struct Tracer {
 };
 
 // A copy+dtor class carries BOTH markers (attr-dict prints alphabetically).
-// CHECK-DAG: emitrust.struct_def @Loud ["id"] [i32] {emitrust.has_copy_ctor, emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @Loud ["id"] [i32] {{.*}}emitrust.has_copy_ctor, emitrust.has_drop}
 struct Loud {
   int id;
   Loud(int i) : id(i) { printf("ctor %d\n", id); }

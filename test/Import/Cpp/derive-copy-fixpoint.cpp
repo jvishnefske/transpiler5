@@ -36,7 +36,7 @@
 
 extern "C" int printf(const char *, ...);
 
-// CHECK-DAG: emitrust.struct_def @B ["tag"] [i32] {emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @B ["tag"] [i32] {{.*}}emitrust.has_drop}
 struct B {
   int tag;
   virtual ~B() = default;
@@ -65,7 +65,7 @@ struct Pod {
   int b;
 };
 
-// CHECK-DAG: emitrust.struct_def @C ["v"] [i32] {emitrust.has_copy_ctor}
+// CHECK-DAG: emitrust.struct_def @C ["v"] [i32] {{.*}}emitrust.has_copy_ctor}
 struct C {
   int v;
   C() : v(0) {}

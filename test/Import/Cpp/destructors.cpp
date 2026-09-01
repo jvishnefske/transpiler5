@@ -37,7 +37,7 @@
 
 extern "C" int printf(const char *, ...);
 
-// CHECK-DAG: emitrust.struct_def @Tracer ["id"] [i32] {emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @Tracer ["id"] [i32] {{.*}}emitrust.has_drop}
 struct Tracer {
   int id;
   Tracer(int i) : id(i) { printf("ctor %d\n", id); }
@@ -49,7 +49,7 @@ struct Tracer {
 // `struct_def` (a field-less class WITH a method is not degraded to the
 // `[u8; 1]` placeholder a field-less AND method-less record gets), so the
 // guard idiom is representable.
-// CHECK-DAG: emitrust.struct_def @Guard [] [] {emitrust.has_drop}
+// CHECK-DAG: emitrust.struct_def @Guard [] [] {{.*}}emitrust.has_drop}
 struct Guard {
   Guard() { printf("guard ctor\n"); }
   ~Guard() { printf("guard dtor\n"); }

@@ -18,11 +18,15 @@
 //    `crate-type`, not one byte on stderr -- and the flagged crate root is
 //    diffed back against it with only those two additions undone.
 //
-// 3. A NON-scalar exported signature is NOT given `extern "C"`. This is the
-//    whole safety argument, not a limitation to be relaxed later: a `&[u8]`
-//    parameter is a two-register fat pointer, rustc compiles the mismatch with
-//    only a non-FFI-safe WARNING, and every later argument shifts (measured in
-//    the FR-138 spike on crc16: native 27235, cdylib 0). Silent wrong code
+// 3. A SLICE-taking exported signature is NOT given `extern "C"`. This is the
+//    whole safety argument, and this shape is not a limitation to be relaxed
+//    later: a `&[u8]` parameter is a two-register fat pointer, rustc compiles
+//    the mismatch with only a non-FFI-safe WARNING, and every later argument
+//    shifts (measured in the FR-138 spike on crc16: native 27235, cdylib 0).
+//    (FR-182 later widened the gate by two STRUCT classes -- by value and by
+//    single pointer, pinned in c-abi-exports-structs.c -- and left the slice
+//    refusal, and the sentence it is reported with, exactly where FR-138 put
+//    them.) Silent wrong code
 //    across the boundary is the class this repo forbids, so such a function
 //    keeps its plain `pub fn` -- and says so with a LOCATED warning, because a
 //    dlsym failing at evaluation time with no explanation is the other way to

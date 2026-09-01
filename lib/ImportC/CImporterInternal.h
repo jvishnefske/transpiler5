@@ -2911,6 +2911,38 @@ private:
                       SmallVectorImpl<Type> &fieldTypes,
                       unsigned &bitFieldRuns);
 
+  /// FR-182: attaches the C-ABI faithfulness verdict of `definition` to the
+  /// struct_def just built for it -- `emitrust.abi_faithful` plus the
+  /// `emitrust.abi_layout` numbers read from clang's own ASTRecordLayout, or
+  /// `emitrust.abi_unfaithful_reason` naming the first divergence. Every
+  /// imported record carries exactly one of the two shapes, so the emitter
+  /// never has to guess and its refusal can name the actual reason.
+  ///
+  /// `fieldNames`/`fieldTypes` are the arrays the struct_def was created
+  /// from; the verdict is computed against them, so a field list that does
+  /// not correspond one-to-one with the C members disqualifies the record on
+  /// its own (which is what keeps `abi_layout`'s offsets index-aligned).
+  void annotateAbiFaithfulness(emitrust::StructDefOp structDef,
+                               const clang::RecordDecl *definition,
+                               llvm::ArrayRef<llvm::StringRef> fieldNames,
+                               llvm::ArrayRef<Type> fieldTypes);
+
+  /// FR-182: the first reason `definition`'s emitted field list is not
+  /// ABI-faithful to the C record, or the empty string when it is. Memoized
+  /// per definition in `abiFaithfulnessCache`; a nested record's verdict is
+  /// read from that cache, which is sound because a member's record type is
+  /// imported (and so annotated) before the record that contains it.
+  std::string abiFaithfulnessBlocker(const clang::RecordDecl *definition,
+                                     llvm::ArrayRef<llvm::StringRef> fieldNames,
+                                     llvm::ArrayRef<Type> fieldTypes);
+
+  /// FR-182: the first reason the member `memberName`, declared with C type
+  /// `type` and emitted as `mapped`, is not ABI-faithful, or the empty
+  /// string. Recurses through constant arrays; a record-typed member defers
+  /// to `abiFaithfulnessCache`.
+  std::string abiFaithfulMemberBlocker(clang::QualType type, Type mapped,
+                                       llvm::StringRef memberName);
+
   /// Resolves one arm of an anonymous union member to its single
   /// flattened leaf field, descending through nested anonymous struct
   /// members. Fails — with the union-type rejection at `unionLoc` — when
@@ -6428,6 +6460,12 @@ private:
   /// defining declaration; populated by `importRecord` and consulted by
   /// `emittedRecordName`.
   llvm::DenseMap<const clang::RecordDecl *, std::string> anonRecordNames;
+  /// FR-182: per-definition memo of `abiFaithfulnessBlocker` -- the empty
+  /// string for an ABI-faithful record, the first divergence otherwise.
+  /// Filled when the record's struct_def is annotated, which is before any
+  /// record that CONTAINS it is annotated, so a nested member's verdict is
+  /// always already present.
+  llvm::DenseMap<const clang::RecordDecl *, std::string> abiFaithfulnessCache;
   /// Union arm -> the first arm's leaf field, whose spelling names the
   /// single flattened storage slot every arm aliases; populated by
   /// `collectRecordFields` (anonymous union members) and
