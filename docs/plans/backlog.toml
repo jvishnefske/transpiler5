@@ -394,6 +394,16 @@ blocked_by = []
 anchor = "FR-183 (opened 2026-08-31 by the FR-182 wait, measured with the FR-178"
 
 [[items]]
+id = "FR-184"
+status = "landed"
+kind = "defect"
+size = "S"
+title = "FR-63's struct-literal fuse fired for ZERO instances of FR-62's owner new(): the staged aggregate let ended its prefix"
+summary = "LANDED 2026-09-01. computeFieldInitFuses' Gate-2 prefix loop (TranslateToRust.cpp:3268-3286) breaks on anything that is not an AssignOp, and FR-62's materializeFieldInit (ActorLift.cpp:846-848) stages every AGGREGATE field initializer in its own initialized variable, so a staged `let` always sits between the default and the stores. MEASURED over the 710 emitted crates the suite writes under build/test: 1118 `let X: T = T::default();` sites, 23 followed by field assigns, ALL 23 blocked -- the fuse fired for none of this shape (15 EndToEnd, 7 Driver, 1 CTestSuite). Fix: the prefix scan also skips an emitrust.variable carrying an init ATTRIBUTE. SAFETY ARGUMENT (recorded in the code): an init attribute is a compile-time CONSTANT, not an SSA value, so such a variable structurally cannot read the variable being built and needs no valueTreeReachesPlace check; nor can it be written inside the prefix, since any store to it is an assign whose place is not a single-level member of the target and so ends the prefix; and its `let` renders at its own point while the literal renders at the LAST fused assign, so ordering is automatic. RESULT: blocked 23 -> 9, 11 emitted crates changed, every hunk the fuse (verified against a byte snapshot of the pre-change corpus). All four contract variations correct: full coverage drops the ..T::default() base and loses mut; partial keeps both; two-field fuses to one literal; mut survives where a later store does. THE 9 RESIDUALS VALIDATE THE RULE: four are `let vN: i32 = <call>;` where skipping would reorder a side-effecting call, three are a non-inlined emitrust.constant (possible follow-on), two have no init attribute. CLIPPY DID NOT MOVE, PREDICTED BEFORE MEASURING: 231 -> 231 (+0) at the epoch-5 pin, because clippy::field_reassign_with_default requires the store to follow the default DIRECTLY and never flagged the staged form (the pin records ONE such warning despite 15 staged sites in that corpus). This is an EPIC-E readability change, NOT a lint fix; claim no clippy win for it. Scope note: getInitAttr() also covers scalar locals, so range-for-aggregates.c gained two plain-C-local fuses. Gate 961/961; TRACTOR unchanged at 31/252."
+blocked_by = []
+anchor = "FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE"
+
+[[items]]
 id = "FR-176"
 status = "landed"
 title = "FR-160 silent request-ignore surfaces"

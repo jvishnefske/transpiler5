@@ -90,6 +90,21 @@ int sum_into(const unsigned char *p, int n) {
 // The lifted methods keep exactly the shape they had: no attribute, no
 // `extern "C"`, the receiver still first.
 // CABI:      impl Tu0BaseActor {
+// FR-184 narrows this block by three lines: the owner's synthesized `new()`
+// used to read `let mut owner: Tu0BaseActor = Tu0BaseActor::default();` /
+// `owner.tu0_base = v0;`, because the staged `let v0` ended the FR-63
+// field-init fuse's prefix. It no longer does (a const init ATTRIBUTE cannot
+// read the owner), so the default and the store collapse into one literal.
+// This is the measured representative of that shape, and the C-ABI tier is
+// where it matters most: the singleton initializer below calls this `new()`
+// in a `thread_local` const context. `tu0_base` is the struct's only field,
+// so the fuse covers it and no `..Tu0BaseActor::default()` base survives --
+// the zero-filled `[u16; 8]` is no longer materialized just to be
+// overwritten -- and with no store left the binding drops its `mut`.
+// CABI-NEXT:     pub fn new() -> Tu0BaseActor {
+// CABI-NEXT:         let v0: [u16; 8] = [3, 5, 7, 11, 13, 17, 19, 23];
+// CABI-NEXT:         let owner: Tu0BaseActor = Tu0BaseActor { tu0_base: v0, };
+// CABI-NEXT:         owner
 // CABI:          pub fn lookup(&mut self, i: i32) -> u16 {
 // CABI:      impl Tu0CounterActor {
 // CABI:          pub fn bump(&mut self, by: i32) -> i32 {

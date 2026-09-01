@@ -3261,16 +3261,41 @@ void RustEmitter::computeFieldInitFuses(emitrust::FuncOp funcOp) {
     // nothing at their own program point — place projections, inlined
     // single-use producers, dropped pure ops — are skipped: their renders
     // happen at consumers at-or-after the fuse point, where every field
-    // holds the same value as after the sequential stores. ANY other
-    // statement (a `let`, a call, a nested/indexed or whole-binding store,
-    // a dead store, a repeated field, a value that reads this variable)
-    // ends the prefix; everything from there on renders unchanged.
+    // holds the same value as after the sequential stores. A FR-184 staged
+    // `let` (a variable with a constant init attribute) is skipped too; it
+    // renders ahead of the fuse point and cannot read the variable being
+    // built. ANY other statement (an SSA-initialized `let`, a call, a
+    // nested/indexed or whole-binding store, a dead store, a repeated field,
+    // a value that reads this variable) ends the prefix; everything from
+    // there on renders unchanged.
     SmallVector<emitrust::AssignOp, 4> fused;
     llvm::StringSet<> seenFields;
     for (Operation *op = varOp->getNextNode(); op; op = op->getNextNode()) {
       if (isPlaceProjection(op) || droppedOps.count(op) ||
           inlinedOps.count(op))
         continue;
+      // FR-184: a STAGED `let vN: T = <literal>;` does not end the prefix.
+      // FR-62's actor-owner `new()` materializes every aggregate field
+      // initializer by staging it in its own initialized variable, loading
+      // it once, and assigning the member whole, so the staged `let` always
+      // sits between the default and the stores -- before this skip the fuse
+      // fired for NONE of that shape. The skip is safe because an init
+      // ATTRIBUTE is a compile-time constant, not an SSA value: such a
+      // variable structurally CANNOT read the variable being built, which is
+      // why it needs no `valueTreeReachesPlace` check of its own (unlike the
+      // assigned values, which are checked below). Nor can it be written
+      // inside the prefix -- any store to it is an assign whose place is not
+      // a single-level member of `result` and so ends the prefix. Its `let`
+      // renders at its own program point, ahead of the fused literal (which
+      // renders at the LAST fused assign), so the literal always lands after
+      // the bindings it names. A variable with NO init attribute is
+      // SSA-initialized from anything, including the target, and still ends
+      // the prefix.
+      if (auto staged = dyn_cast<emitrust::VariableOp>(op)) {
+        if (staged.getInitAttr())
+          continue;
+        break;
+      }
       auto assign = dyn_cast<emitrust::AssignOp>(op);
       if (!assign || deadStores.count(op))
         break;
