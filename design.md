@@ -12529,6 +12529,58 @@ piece and becomes FR-45.
   in the corpus tally), and float arithmetic under a bitwise parent (not
   expressible in Rust).
 
+- [ ] FR-187 (opened 2026-09-02): **THE `LOOP.md` SPELLING LOOP HAS REACHED
+  ITS DOCUMENTED STOPPING CONDITION AT 94. WHAT REMAINS IS NOT SPELLING.**
+  Two iterations ran to completion: FR-185 (231 -> 103) and FR-186
+  (103 -> 94). **clippy 231 -> 94, -59%, with the gate green and the
+  external TRACTOR score unmoved at 31/252 through both.** LOOP.md says to
+  stop "when the top remaining lint is no longer a systematic emitter
+  pattern"; it is, and here is the evidence per remaining item.
+    46  needless_late_init -- EXCLUDED BY NAME in LOOP.md, and rightly:
+        folding a declaration into its initializer is a LIVENESS change, not
+        a spelling one, and cross-iteration loop liveness has miscompiled in
+        this tree three times (see CLAUDE.md). Untouched.
+    19  borrowed_box -- **BLOCKED ON A DIALECT CONTRACT, NOT ON EFFORT.** The
+        shape is `let v6: &Box<i32> = &n; let v7: &i32 =
+        std::ops::Deref::deref(v6);` where idiomatic Rust is `&*n`. That
+        spelling is DELIBERATE and its reason is recorded at
+        `ImportCExpressions.cpp:3988-3995`: "Rust's own auto-deref would
+        render `*p` directly, but `emitrust.deref` only accepts a
+        ref/mut_ref operand and `emitrust.member` only a struct lvalue, so
+        the borrow is what turns the opaque into a place either op will
+        take." Retiring it means relaxing `DerefOp`'s verifier to accept an
+        `OpaqueType` receiver -- a contract change on a core op with real
+        blast radius -- which is a structural change, not the stdout-
+        preserving respelling this loop is scoped to. Its whole corpus
+        footprint is also ONE file (`stl-unique-ptr.cpp`), so the measured
+        payoff does not justify the contract change on its own.
+     5  approx_constant -- NOT a defect and must not be "fixed": these are
+        float literals carried over from C source. Substituting
+        `std::f64::consts::PI` would change the emitted BITS, which is a
+        behaviour change, and the byte-diff oracle would be right to fail
+        it. A false positive on transpiled code.
+     4  if_same_then_else -- two branches with identical bodies, faithful to
+        the C. Collapsing them is a structural change.
+     3/3/2/2/2/1... borrow_deref_ref, needless_else and the rest -- genuine
+        spelling, but this is exactly the "long tail of per-program lints
+        [that] is not worth an emitter change and should be left alone".
+  **WHAT THE TWO ITERATIONS ACTUALLY FOUND IS WORTH MORE THAN THE -137.**
+  Neither was a style nit once measured: FR-185's `new` was a Rust
+  convention violated in both of its rules and, when renamed, exposed a
+  SILENT-MERGE miscompile channel that the old name had hidden only by
+  accident of C++ grammar; FR-186's missing parentheses were a FIDELITY
+  regression -- the emitter was discarding parentheses the C author wrote.
+  In both cases the lint was the symptom and the defect was underneath, and
+  in both cases per-file attribution (`clippy_eval.measure(per_file=...)`)
+  rather than the ranked tally is what located it. **Rank the tally, but
+  never trust its shape: 64 + 64 was one pattern, not two.**
+  NEXT, IF THE LOOP IS RESUMED: the only item worth costing is
+  `borrowed_box`, and it should be opened as an ordinary dialect FR with its
+  own spike (does `DerefOp` accepting an opaque receiver break any existing
+  verifier contract?), NOT as a loop iteration. Freezing epoch-6 would also
+  clear the one known-stale comment FR-185 had to leave
+  (`test/EndToEnd/cpp-inheritance.cpp:7`).
+
 - [x] FR-176 DEFECT (opened 2026-08-29 as FR-161 on the probe line; RENUMBERED
   2026-08-30 when the rebase onto the trunk met the trunk's own FR-161
   (FR-158 Phase 3), which is cited by commits that are already immutable
