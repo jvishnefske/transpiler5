@@ -75,8 +75,8 @@ struct Impl : Pure {
 
 // CHECK-LABEL: func.func @calls(
 // CHECK: %[[D:.*]] = emitrust.variable named "d"
-// CHECK: call @Dog_new(
-// CHECK: call @Puppy_new(
+// CHECK: call @Dog_ctor(
+// CHECK: call @Puppy_ctor(
 // The override CASE: `d.noise()` binds Dog's own override, directly on
 // `d`'s place -- no hop, no dispatch machinery.
 // CHECK: %[[DREF:.*]] = emitrust.addr_of mut %[[D]] : (!emitrust.lvalue<!emitrust.struct<"Dog">>) -> !emitrust.mut_ref<!emitrust.struct<"Dog">>

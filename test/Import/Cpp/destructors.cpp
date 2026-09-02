@@ -58,7 +58,7 @@ struct Guard {
 // The raw import carries the PRE-rename spellings (`emitrust-cc` folds
 // them to snake_case later); what matters here is that the destructor is
 // an ordinary method-of-tagged function additionally marked drop_impl.
-// CHECK-DAG: func.func @Tracer_new({{.*}}) attributes {emitrust.method_of = "Tracer"
+// CHECK-DAG: func.func @Tracer_ctor({{.*}}) attributes {emitrust.method_of = "Tracer"
 // CHECK-DAG: func.func @Tracer_bump({{.*}}) attributes {emitrust.method_of = "Tracer"
 // CHECK-DAG: func.func @Tracer_dtor(%arg0: !emitrust.mut_ref<!emitrust.struct<"Tracer">>) attributes {emitrust.drop_impl, emitrust.method_of = "Tracer"}
 // CHECK-DAG: func.func @Guard_dtor(%arg0: !emitrust.mut_ref<!emitrust.struct<"Guard">>) attributes {emitrust.drop_impl, emitrust.method_of = "Guard"}
@@ -96,7 +96,7 @@ int main(void) {
 // RUST: #[derive(Clone, Default)]
 // RUST-NEXT: struct Guard {}
 // RUST: impl Tracer {
-// RUST: fn new(&mut self, i: i32) {
+// RUST: fn ctor(&mut self, i: i32) {
 // RUST: fn bump(&mut self, d: i32) {
 // RUST: impl Drop for Tracer {
 // RUST-NEXT: fn drop(&mut self) {

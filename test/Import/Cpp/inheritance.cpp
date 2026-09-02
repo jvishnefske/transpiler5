@@ -54,11 +54,11 @@ struct Derived : Base {
   // base's own imported constructor. NOT an `emitrust.assign` of a value
   // (the value-position constructor path rejects a class-typed
   // initializer, by design).
-  // CHECK-LABEL: func.func @Derived_new(
+  // CHECK-LABEL: func.func @Derived_ctor(
   // CHECK: %[[SELF:.*]] = emitrust.deref %arg0 : (!emitrust.mut_ref<!emitrust.struct<"Derived">>) -> !emitrust.lvalue<!emitrust.struct<"Derived">>
   // CHECK-NEXT: %[[BASE:.*]] = emitrust.member %[[SELF]]["base"] : (!emitrust.lvalue<!emitrust.struct<"Derived">>) -> !emitrust.lvalue<!emitrust.struct<"Base">>
   // CHECK-NEXT: %[[REF:.*]] = emitrust.addr_of mut %[[BASE]] : (!emitrust.lvalue<!emitrust.struct<"Base">>) -> !emitrust.mut_ref<!emitrust.struct<"Base">>
-  // CHECK: call @Base_new(%[[REF]], {{.*}}) {emitrust.method_call}
+  // CHECK: call @Base_ctor(%[[REF]], {{.*}}) {emitrust.method_call}
   // CHECK: emitrust.member {{.*}}["y"]
   Derived(int a, int b) : Base(a), y(b) {}
 
@@ -119,12 +119,12 @@ struct Third : Derived {
   int z;
 
   // A base initializer whose base is itself a derived class: the call is
-  // to `Derived_new`, not to `Base_new`, so the chain constructs one level
+  // to `Derived_ctor`, not to `Base_ctor`, so the chain constructs one level
   // at a time exactly like C++ does.
-  // CHECK-LABEL: func.func @Third_new(
+  // CHECK-LABEL: func.func @Third_ctor(
   // CHECK: %[[TB:.*]] = emitrust.member {{.*}}["base"] : (!emitrust.lvalue<!emitrust.struct<"Third">>) -> !emitrust.lvalue<!emitrust.struct<"Derived">>
   // CHECK-NEXT: %[[TR:.*]] = emitrust.addr_of mut %[[TB]]
-  // CHECK: call @Derived_new(%[[TR]], {{.*}}, {{.*}}) {emitrust.method_call}
+  // CHECK: call @Derived_ctor(%[[TR]], {{.*}}, {{.*}}) {emitrust.method_call}
   Third(int a, int b, int c) : Derived(a, b), z(c) {}
 
   // CHECK-LABEL: func.func @Third_total(
@@ -165,8 +165,8 @@ int main() {
 // RUST: struct Tagged {
 // RUST-NEXT: v: i32,
 // RUST: impl Derived {
-// RUST: fn new(&mut self, a: i32, b: i32) {
-// RUST-NEXT: self.base.new(a);
+// RUST: fn ctor(&mut self, a: i32, b: i32) {
+// RUST-NEXT: self.base.ctor(a);
 // RUST-NEXT: self.y = b;
 // RUST: fn sum(&self) -> i32 {
 // RUST-NEXT: let v0: i32 = self.base.get();
@@ -183,8 +183,8 @@ int main() {
 // RUST: fn via_qualified(&self) -> i32 {
 // RUST-NEXT: self.base.get()
 // RUST: impl Third {
-// RUST: fn new(&mut self, a: i32, b: i32, c: i32) {
-// RUST-NEXT: self.base.new(a, b);
+// RUST: fn ctor(&mut self, a: i32, b: i32, c: i32) {
+// RUST-NEXT: self.base.ctor(a, b);
 // RUST-NEXT: self.z = c;
 // RUST: fn total(&self) -> i32 {
 // RUST-NEXT: let v0: i32 = self.base.base.get();

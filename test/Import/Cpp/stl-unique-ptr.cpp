@@ -88,7 +88,7 @@ int use_zero(void) {
 // CHECK: %[[DEF:.*]] = emitrust.call_opaque "Node::default"() : () -> !emitrust.struct<"Node">
 // CHECK: %[[PB:.*]] = emitrust.call_opaque "Box::new"(%[[DEF]]) : (!emitrust.struct<"Node">) -> !emitrust.opaque<"Box<Node>">
 // CHECK: emitrust.assign %[[P]] = %[[PB]] : !emitrust.lvalue<!emitrust.opaque<"Box<Node>">>
-// CHECK: emitrust.method_call %[[P]]["Node_new"] (%{{.*}}, %{{.*}}) : (!emitrust.lvalue<!emitrust.opaque<"Box<Node>">>, i32, i32) -> ()
+// CHECK: emitrust.method_call %[[P]]["Node_ctor"] (%{{.*}}, %{{.*}}) : (!emitrust.lvalue<!emitrust.opaque<"Box<Node>">>, i32, i32) -> ()
 // `p->field` reads: the SHARED borrow refined into a struct place, then
 // an ordinary member projection. Two of them live at once in one printf.
 // CHECK: %[[FR:.*]] = emitrust.addr_of %[[P]] : (!emitrust.lvalue<!emitrust.opaque<"Box<Node>">>) -> !emitrust.ref<!emitrust.opaque<"Box<Node>">>

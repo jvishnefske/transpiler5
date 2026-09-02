@@ -58,7 +58,7 @@ inline int touch_other() {
 // --- call must hit the "unimported constructor" containment, because the
 // --- ctor's pass-1 stub no longer survives the template item's rollback.
 int use_it(int k) {
-  // WARN: :[[#@LINE+1]]:6: warning: unsupported: call to an unimported constructor 'basic_fp_u64_new_ii' (recovered: emitted an unimplemented!() stub with the mapped signature)
+  // WARN: :[[#@LINE+1]]:6: warning: unsupported: call to an unimported constructor 'basic_fp_u64_ctor_ii' (recovered: emitted an unimplemented!() stub with the mapped signature)
   Fp a{2ULL, 1};
   Fp b{3ULL, k};
   Fp c = a * b;
@@ -70,7 +70,7 @@ int use_it(int k) {
 // WARN: recovered 6 rejected top-level items:
 // WARN: stubbed 'op_mul' [other] unsupported: constructor in value position (only a trivial copy or move is modeled)
 // WARN: stubbed 'touch_other' [rejected-type-cascade] unsupported: struct 'BasicFpX' was rejected, so a type naming it cannot be imported
-// WARN: stubbed 'use_it' [other] unsupported: call to an unimported constructor 'basic_fp_u64_new_ii'
+// WARN: stubbed 'use_it' [other] unsupported: call to an unimported constructor 'basic_fp_u64_ctor_ii'
 // WARN-NOT: referenced but not defined in any translation unit
 
 // The u64 struct survives (FR-118 aggregate exemption), every referencing
@@ -80,8 +80,8 @@ int use_it(int k) {
 // RUST: pub fn op_mul(_v0: BasicFpU64, _v1: BasicFpU64) -> BasicFpU64 {
 // RUST-NEXT: unimplemented!("unsupported: constructor in value position (only a trivial copy or move is modeled)")
 // RUST: pub fn use_it(_v0: i32) -> i32 {
-// RUST-NEXT: unimplemented!("unsupported: call to an unimported constructor 'basic_fp_u64_new_ii'")
-// RUST-NOT: basic_fp_u64_new_ii(
+// RUST-NEXT: unimplemented!("unsupported: call to an unimported constructor 'basic_fp_u64_ctor_ii'")
+// RUST-NOT: basic_fp_u64_ctor_ii(
 
 // STRICT: error: unsupported builtin type 'unsigned __int128'
 // STRICT-NOT: referenced but not defined

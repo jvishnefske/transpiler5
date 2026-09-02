@@ -75,10 +75,10 @@ struct Box {
 
 // CHECK-DAG: emitrust.struct_def @Box_i32 ["v"] [i32]
 // CHECK-DAG: emitrust.struct_def @Box_d ["v"] [f64]
-// CHECK-DAG: func.func @Box_i32_new(
+// CHECK-DAG: func.func @Box_i32_ctor(
 // CHECK-DAG: func.func @Box_i32_get(
 // CHECK-DAG: func.func @Box_i32_bump(
-// CHECK-DAG: func.func @Box_d_new(
+// CHECK-DAG: func.func @Box_d_ctor(
 // CHECK-DAG: func.func @Box_d_get(
 // CHECK-DAG: func.func @Box_d_bump(
 
@@ -168,7 +168,7 @@ int use_stl(int n) {
 // mapping for; reaching one at all would be the bug.)
 // NOPATTERN-NOT: emitrust.struct_def @Box {{\[}}
 // NOPATTERN-NOT: emitrust.struct_def @Pair2 {{\[}}
-// NOPATTERN-NOT: func.func @Box_new(
+// NOPATTERN-NOT: func.func @Box_ctor(
 // NOPATTERN-NOT: func.func @Box_get(
 // NOPATTERN-NOT: func.func @Pair2_first(
 

@@ -184,7 +184,7 @@ int drive(void) {
 // the definition pass), so the constructor comes first even though it calls
 // a method defined two declarations later.
 // CHECK: emitrust.struct_def @Order ["v_"] [i32]
-// CHECK-LABEL: func.func @Order_new
+// CHECK-LABEL: func.func @Order_ctor
 // CHECK: call @Order_reset(%{{.*}}) {emitrust.method_call}
 // CHECK-LABEL: func.func @Order_start
 // CHECK: call @Order_later(%{{.*}}) {emitrust.method_call}

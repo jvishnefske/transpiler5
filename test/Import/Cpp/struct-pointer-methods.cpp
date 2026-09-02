@@ -61,7 +61,7 @@ static void via_mut_param(Counter *p) { p->bump(p->get()); }
 // mutating receiver takes `addr_of mut`, the const receiver `addr_of`.
 // CHECK-LABEL: func.func @use_(
 // CHECK: %[[C:.*]] = emitrust.variable named "c" : !emitrust.lvalue<!emitrust.struct<"Counter">>
-// CHECK: call @Counter_new(
+// CHECK: call @Counter_ctor(
 // CHECK: %[[M:.*]] = emitrust.addr_of mut %[[C]]
 // CHECK-NEXT: %[[R:.*]] = emitrust.addr_of %[[C]]
 // CHECK-NEXT: %[[V:.*]] = call @Counter_get(%[[R]]) {emitrust.method_call}
