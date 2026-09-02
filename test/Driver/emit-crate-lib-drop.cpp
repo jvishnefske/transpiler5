@@ -25,13 +25,14 @@ int use_it(int n) {
 }
 
 // The struct and its inherent methods are exported... (FR-110: the
-// members print their in-impl spellings -- `new`/`get`, not the mangled
-// `r_new`/`r_get` module symbols, which now live only in the IR)
+// members print their in-impl spellings -- `ctor`/`get` (FR-185 retired
+// the `new` spelling), not the mangled `r_ctor`/`r_get` module symbols,
+// which now live only in the IR)
 // CHECK: pub struct R {
 // CHECK: impl R {
-// CHECK: pub fn new(&mut self, i: i32) {
+// CHECK: pub fn ctor(&mut self, i: i32) {
 // CHECK: pub fn get(&self) -> i32 {
-// CHECK-NOT: fn r_new
+// CHECK-NOT: fn r_ctor
 // CHECK-NOT: fn r_get
 // ...and the Drop member is NOT (E0449).
 // CHECK: impl Drop for R {

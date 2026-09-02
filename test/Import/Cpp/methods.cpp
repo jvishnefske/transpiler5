@@ -29,7 +29,11 @@
 //   existing `mangleMemberName` keyword-escape exactly like a struct field
 //   (a method named e.g. `type` mangles to `type_` first). A constructor
 //   has no ordinary identifier (`CXXConstructorName` is a special
-//   `DeclarationName` kind) and uses the fixed base name `new`.
+//   `DeclarationName` kind) and uses the fixed base name `ctor` (FR-185
+//   retired the original `new` spelling: a Rust `new` must return `Self`
+//   and must not take a receiver, and this receiver-taking, void
+//   initializer does neither -- clippy reported it as `new_ret_no_self`
+//   plus `wrong_self_convention` on every emitted C++ class).
 // * `<overloadSuffix>` is present ONLY when the class declares more than
 //   one method (or constructor) sharing the same `<methodBaseName>` (a
 //   genuine C++ overload set). When present, it is `_` followed by the
@@ -51,8 +55,8 @@
 // `Other_get`: the struct-name prefix alone keeps it from colliding with
 // `Counter_get` even though clang gives both methods the identical
 // unqualified name `get`. `Counter`'s two constructors overload on arity
-// exactly like `get`: `Counter_new` (default, 0 args) and `Counter_new_i`
-// (1 `int` arg).
+// exactly like `get`: `Counter_ctor` (default, 0 args) and
+// `Counter_ctor_i` (1 `int` arg).
 //
 // A static method call site is NOT an ordinary `emitrust.method_call` (it
 // has no receiver to borrow): it is pinned as a direct
@@ -125,9 +129,9 @@ int use_counters(void) {
 // list `: value(0)` lowers to an ordinary member assignment ahead of the
 // (empty) body. Overloaded against the parameterized ctor below, but a
 // zero-parameter overload keeps the bare name.
-// CHECK-LABEL: func.func @Counter_new
+// CHECK-LABEL: func.func @Counter_ctor
 // CHECK-SAME: (%[[NDSELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Counter">>)
-// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.method_rust_name = "new"
+// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.method_rust_name = "ctor"
 // CHECK: %[[NDRCV:.*]] = emitrust.deref %[[NDSELF]] : (!emitrust.mut_ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[NDFLD:.*]] = emitrust.member %[[NDRCV]]["value"] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<i32>
 // CHECK: %[[NDZERO:.*]] = arith.constant 0 : i32
@@ -137,9 +141,9 @@ int use_counters(void) {
 // Parameterized constructor: one `int` parameter overloads it against the
 // default ctor above, so it gets the `_i` suffix. `: value(start)` lowers
 // the same way, binding the incoming parameter instead of a constant.
-// CHECK-LABEL: func.func @Counter_new_i
+// CHECK-LABEL: func.func @Counter_ctor_i
 // CHECK-SAME: (%[[NISELF:.*]]: !emitrust.mut_ref<!emitrust.struct<"Counter">>, %[[START:.*]]: i32)
-// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.method_rust_name = "new_i"
+// CHECK-SAME: attributes {emitrust.method_of = "Counter", emitrust.method_rust_name = "ctor_i"
 // CHECK: %[[NIRCV:.*]] = emitrust.deref %[[NISELF]] : (!emitrust.mut_ref<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[NIFLD:.*]] = emitrust.member %[[NIRCV]]["value"] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.lvalue<i32>
 // CHECK: emitrust.assign %[[NIFLD]] = %[[START]] : !emitrust.lvalue<i32>
@@ -193,14 +197,14 @@ int use_counters(void) {
 // The driver: every call-site shape in one place.
 // CHECK-LABEL: func.func @use_counters
 // Parameterized-constructor call site: default-init place, then a
-// mutable borrow feeds the "new_i" method as an ordinary method_call.
+// mutable borrow feeds the "ctor_i" method as an ordinary method_call.
 // CHECK: %[[C:.*]] = emitrust.variable named "c" : !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[CREF0:.*]] = emitrust.addr_of mut %[[C]] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.mut_ref<!emitrust.struct<"Counter">>
-// CHECK: call @Counter_new_i(%[[CREF0]], %{{.*}}) {emitrust.method_call}
+// CHECK: call @Counter_ctor_i(%[[CREF0]], %{{.*}}) {emitrust.method_call}
 // Default-constructor call site: same shape, no extra argument.
 // CHECK: %[[C2:.*]] = emitrust.variable named "c2" : !emitrust.lvalue<!emitrust.struct<"Counter">>
 // CHECK: %[[C2REF:.*]] = emitrust.addr_of mut %[[C2]] : (!emitrust.lvalue<!emitrust.struct<"Counter">>) -> !emitrust.mut_ref<!emitrust.struct<"Counter">>
-// CHECK: call @Counter_new(%[[C2REF]]) {emitrust.method_call}
+// CHECK: call @Counter_ctor(%[[C2REF]]) {emitrust.method_call}
 // Two mutating-method call sites (`c.inc(3)`, `c.inc(1)`): each borrows
 // `%[[C]]` mutably again.
 // CHECK: %[[CREF1:.*]] = emitrust.addr_of mut %[[C]]

@@ -25,8 +25,8 @@
 //    W2.17's `emitrust.has_drop`, different trigger; a copy+dtor class
 //    carries both.
 // 2. The copy ctor joins the constructor overload set under FR-114's suffix
-//    machinery: `Tracer_new_rtracer` (r + record snake tag), and the value
-//    ctor gains ITS suffix (`Tracer_new_i`) -- a rename that can only fire
+//    machinery: `Tracer_ctor_rtracer` (r + record snake tag), and the value
+//    ctor gains ITS suffix (`Tracer_ctor_i`) -- a rename that can only fire
 //    in newly-admitted programs, since any class with a user copy ctor was
 //    class-level fatal before this wave.
 // 3. A by-value argument / return copy is the same call shape into an
@@ -61,9 +61,9 @@ struct Plain {
 };
 
 // FR-114 names: the two constructors are a genuine overload set.
-// CHECK-DAG: func.func @Tracer_new_i(%arg0: !emitrust.mut_ref<!emitrust.struct<"Tracer">>, %arg1: i32) attributes {emitrust.method_of = "Tracer"
-// CHECK-DAG: func.func @Tracer_new_rtracer(%arg0: !emitrust.mut_ref<!emitrust.struct<"Tracer">>, %arg1: !emitrust.ref<!emitrust.struct<"Tracer">>) attributes {emitrust.method_of = "Tracer"
-// CHECK-DAG: func.func @Loud_new_rloud(%arg0: !emitrust.mut_ref<!emitrust.struct<"Loud">>, %arg1: !emitrust.ref<!emitrust.struct<"Loud">>) attributes {emitrust.method_of = "Loud"
+// CHECK-DAG: func.func @Tracer_ctor_i(%arg0: !emitrust.mut_ref<!emitrust.struct<"Tracer">>, %arg1: i32) attributes {emitrust.method_of = "Tracer"
+// CHECK-DAG: func.func @Tracer_ctor_rtracer(%arg0: !emitrust.mut_ref<!emitrust.struct<"Tracer">>, %arg1: !emitrust.ref<!emitrust.struct<"Tracer">>) attributes {emitrust.method_of = "Tracer"
+// CHECK-DAG: func.func @Loud_ctor_rloud(%arg0: !emitrust.mut_ref<!emitrust.struct<"Loud">>, %arg1: !emitrust.ref<!emitrust.struct<"Loud">>) attributes {emitrust.method_of = "Loud"
 // CHECK-DAG: func.func @Loud_dtor(%arg0: !emitrust.mut_ref<!emitrust.struct<"Loud">>) attributes {emitrust.drop_impl, emitrust.method_of = "Loud"}
 
 int take(Tracer t) { return t.value; }
@@ -73,8 +73,8 @@ int take(Tracer t) { return t.value; }
 // is NO copy node and NO copy call, just the value ctor into a temp place
 // that is moved out (this is 00801's exact shape).
 // CHECK-LABEL: func.func @factory
-// CHECK: call @Tracer_new_i
-// CHECK-NOT: call @Tracer_new_rtracer
+// CHECK: call @Tracer_ctor_i
+// CHECK-NOT: call @Tracer_ctor_rtracer
 Tracer factory(int x) { return Tracer(x); }
 
 // Returning a BY-VALUE PARAMETER is 1 copy at the return (plus 1 at each
@@ -82,7 +82,7 @@ Tracer factory(int x) { return Tracer(x); }
 // the standard, not implementation-defined.
 // CHECK-LABEL: func.func @through
 // CHECK: emitrust.addr_of
-// CHECK: call @Tracer_new_rtracer
+// CHECK: call @Tracer_ctor_rtracer
 Tracer through(Tracer t) { return t; }
 
 // A TWO-return-object function is admissible (1 copy): with two candidate
@@ -90,8 +90,8 @@ Tracer through(Tracer t) { return t; }
 // contra a naive reading of W2.17's NRVO note, which covers only the
 // single-named-local return (see copy-ctor-invalid.cpp).
 // CHECK-LABEL: func.func @two_ret
-// CHECK: call @Tracer_new_rtracer
-// CHECK: call @Tracer_new_rtracer
+// CHECK: call @Tracer_ctor_rtracer
+// CHECK: call @Tracer_ctor_rtracer
 Tracer two_ret(int pick, int x) {
   Tracer p(x);
   Tracer q(x + 1);
@@ -104,7 +104,7 @@ Tracer two_ret(int pick, int x) {
 // never drop, while p/q drop in reverse declaration order exactly as C++
 // destroys them after the return copy.
 // CHECK-LABEL: func.func @loud_two
-// CHECK: call @Loud_new_rloud
+// CHECK: call @Loud_ctor_rloud
 Loud loud_two(int pick, int x) {
   Loud p(x);
   Loud q(x + 1);
@@ -121,24 +121,24 @@ int main() {
   // loop, which is what lets the `const Tracer&` parameter bind a bare
   // lvalue at all.
   // CHECK: emitrust.addr_of
-  // CHECK: call @Tracer_new_rtracer
+  // CHECK: call @Tracer_ctor_rtracer
   Tracer b = a;
   // By-value argument: temp place + copy call + move in (1 copy).
-  // CHECK: call @Tracer_new_rtracer
+  // CHECK: call @Tracer_ctor_rtracer
   int r1 = take(a);
   // Prvalue argument: NO copy node in the AST, NO copy call emitted.
-  // CHECK: call @Tracer_new_i
+  // CHECK: call @Tracer_ctor_i
   int r2 = take(Tracer(5));
   Tracer f = factory(6);
   Tracer t2 = two_ret(1, 7);
   // `through(a)` copies once at the call (the by-value argument); the copy
   // at ITS return was already pinned inside @through above.
-  // CHECK: call @Tracer_new_rtracer
+  // CHECK: call @Tracer_ctor_rtracer
   Tracer th = through(a);
   Tracer m(9);
   // Whole-object copy-ASSIGNMENT through the implicit operator=: memberwise
   // field assign, ZERO constructor calls past this point.
-  // CHECK-NOT: call @Tracer_new_rtracer
+  // CHECK-NOT: call @Tracer_ctor_rtracer
   m = a;
   Plain pa;
   pa.x = 1;
@@ -164,7 +164,7 @@ int main() {
 // The copy ctor is an ordinary &mut self method taking &T, named under
 // FR-114's r-code (NOT the spike's predicted `_rs` -- the code is the
 // record's snake tag name).
-// RUST: fn new_i(&mut self, v: i32) {
-// RUST: fn new_rtracer(&mut self, other: &Tracer) {
-// RUST: fn new_rloud(&mut self, o: &Loud) {
+// RUST: fn ctor_i(&mut self, v: i32) {
+// RUST: fn ctor_rtracer(&mut self, other: &Tracer) {
+// RUST: fn ctor_rloud(&mut self, o: &Loud) {
 // RUST: impl Drop for Loud {

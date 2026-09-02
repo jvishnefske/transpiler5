@@ -3161,8 +3161,10 @@ private:
   /// `<StructName>_<methodBaseName>[_<overloadSuffix>]`. `<StructName>` is
   /// the class's already-assigned emitrust struct name (`assignedStructNames`,
   /// set by `structSymbolName` before any of its methods import).
-  /// `<methodBaseName>` is `"new"` for a constructor (whose
-  /// `DeclarationName` has no ordinary identifier spelling) or the method's
+  /// `<methodBaseName>` is `"ctor"` for a constructor (whose
+  /// `DeclarationName` has no ordinary identifier spelling; FR-185 —
+  /// deliberately not `"new"`, which Rust reserves for a receiverless
+  /// `-> Self` associated function) or the method's
   /// C++ name mangled through `mangleMemberName`, exactly like a struct
   /// field. `<overloadSuffix>` is present only when the class declares more
   /// than one method (or constructor) sharing the same base name: it is the

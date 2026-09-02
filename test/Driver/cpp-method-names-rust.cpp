@@ -3,8 +3,12 @@
 // method prints its in-impl spelling -- def AND call site -- while the
 // mangled module symbols (`box_i32_get`, `noisy_drop`, ...) never reach
 // the Rust text:
-//  * instance methods and the receiver-taking constructor: `fn new`,
-//    `fn get`, `fn set`, called as `bi.new(..)`/`bi.get()` (the
+//  * instance methods and the receiver-taking constructor: `fn ctor`,
+//    `fn get`, `fn set`, called as `bi.ctor(..)`/`bi.get()` (FR-185: the
+//    constructor's fixed base name is `ctor`, NOT `new` -- a Rust `new`
+//    must return `Self` and must not take a receiver, and this emitted
+//    initializer does neither, which is what tripped clippy's
+//    `new_ret_no_self` + `wrong_self_convention` on every C++ class; the
 //    `BoxI32::new(x)` associated-fn form needs receiver rewriting and is
 //    a separate increment);
 //  * a static method through the qualified call_opaque form:
@@ -56,27 +60,27 @@ int main(int argc, char **argv) {
 
 // The driver body: stripped call sites on the mangled-symbol IR.
 // CHECK: let mut bi: BoxI32 =
-// CHECK: bi.new(
+// CHECK: bi.ctor(
 // CHECK: bi.set(
 // CHECK: bi.get()
-// CHECK: b2.new(
+// CHECK: b2.ctor(
 // CHECK: bi.op_eq(
 // CHECK: BoxI32::origin()
 // CHECK-NOT: box_i32_
-// CHECK: n.new(
+// CHECK: n.ctor(
 // CHECK: n.drop();
 // CHECK: n.clone()
 // CHECK-NOT: noisy_
 
 // The impls: stripped member defs (appended at the end of the module).
 // CHECK: impl BoxI32 {
-// CHECK: fn new(&mut self, v: i32) {
+// CHECK: fn ctor(&mut self, v: i32) {
 // CHECK: fn get(&self) -> i32 {
 // CHECK: fn set(&mut self, v: i32) {
 // CHECK: fn origin() -> i32 {
 // CHECK: fn op_eq(&self, o: &BoxI32) -> bool {
 // CHECK: impl Noisy {
-// CHECK: fn new(&mut self, i: i32) {
+// CHECK: fn ctor(&mut self, i: i32) {
 // CHECK: fn drop(&mut self) {
 // CHECK: fn clone(&self) -> i32 {
 // CHECK: impl Drop for Noisy {

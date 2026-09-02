@@ -23,7 +23,7 @@ int w = 0;
 struct S {
   int v;
   // The constructor's member-initializer list reads the global.
-  // CHECK-LABEL: func.func @S_new
+  // CHECK-LABEL: func.func @S_ctor
   // CHECK: emitrust.global_load @g : i32
   S(int x) : v(x + g) {}
   // A const method reading it.

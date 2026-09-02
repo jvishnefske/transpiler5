@@ -25,6 +25,6 @@ int use() {
 // CHECK: emitrust.struct_def @C ["x"] [i32]
 // The real constructor imports as an ordinary &mut-self method; the
 // defaulted default ctor produces no function at all.
-// CHECK: func.func @C_new_i(%{{.*}}: !emitrust.mut_ref<!emitrust.struct<"C">>, %{{.*}}: i32)
+// CHECK: func.func @C_ctor_i(%{{.*}}: !emitrust.mut_ref<!emitrust.struct<"C">>, %{{.*}}: i32)
 // CHECK: func.func @use_()
-// CHECK: call @C_new_i(%{{.*}}, %{{.*}}) {emitrust.method_call}
+// CHECK: call @C_ctor_i(%{{.*}}, %{{.*}}) {emitrust.method_call}

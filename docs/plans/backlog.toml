@@ -404,6 +404,16 @@ blocked_by = []
 anchor = "FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE"
 
 [[items]]
+id = "FR-185"
+status = "landed"
+kind = "defect"
+size = "M"
+title = "A C++ constructor was named `new`, the one name Rust reserves for the opposite thing -- 55% of the clippy debt from one line"
+summary = "LANDED 2026-09-02, iteration 1 of the nix/clippy-eval/LOOP.md auto-improvement loop. A C++ constructor imports as an INITIALIZER method -- it takes the object as a receiver and returns nothing (`fn new(&mut self, i: i32)`) -- while Rust's `new` convention has two hard rules, returns Self and takes no receiver. The emitted method broke both, so default clippy reported new_ret_no_self AND wrong_self_convention on every emitted C++ class. METHOD: the ranked tally showed 64 and 64; rather than read that as two problems I attributed them per file by driving clippy_eval.measure(per_file=...) and found the SAME 23 files with IDENTICAL counts, every one a .cpp -- one emitter pattern firing two lints in lockstep, 128 of 231 warnings. FIX: cxxMethodBaseName (ImportCFunctions.cpp:45) returns \"ctor\" not \"new\", mirroring the destructor branch three lines below which has returned \"dtor\" since W2.17 for the same class of reason. MEASURED: clippy 231 -> 103 (-128), population hash intact, both lints gone; gate 962/962; EndToEnd byte-diff green. THE FINDING THAT MATTERS MORE THAN THE NUMBER: the rename OPENED a silent-merge miscompile channel, and the old name was safe only by accident of C++ grammar -- `new` is a KEYWORD so no member could be spelled it, but `void ctor()` is legal C++. Neither existing guard catches the pair: the overload-suffix counter SKIPS it (different DeclarationName kinds are never one overload set) and the W2.25 sibling walk is gated on operator-ness, so at equal signatures the FR-47 prepass would merge them with NO diagnostic and every ctor() call would run the constructor body. Closed with a class-level located rejection compared on the POST-FOLD in-impl spelling (so genuine overload sets are not over-rejected), ledger tag cxx-constructor-name-clash. COST: a class with a constructor and a member spelled `ctor` now rejects where it previously imported -- the direct analogue of dtor. FR-62/FR-179 actor new() verified untouched. KNOWN-STALE deliberately: test/EndToEnd/cpp-inheritance.cpp:7 prose says base_new, but editing it drifts and CLOSES epoch-5, forfeiting the paired ratchet; it goes in at the next epoch freeze. RESIDUAL: AdmissibilityProbe does not mirror the new clash screen, so it can report a false GREEN -- the probe's permitted under-approximation direction, follow-up."
+blocked_by = []
+anchor = "FR-185 (opened and LANDED 2026-09-02; iteration 1 of the"
+
+[[items]]
 id = "FR-176"
 status = "landed"
 title = "FR-160 silent request-ignore surfaces"

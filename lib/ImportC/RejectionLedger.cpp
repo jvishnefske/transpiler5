@@ -230,6 +230,11 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
     {llvm::StringLiteral("destructor collides with the member function "
                          "'dtor'"),
      llvm::StringLiteral("cxx-destructor-name-clash")},
+    // FR-185: the same hazard on the constructor side, live only since the
+    // constructor's fixed base name became `ctor` (a legal C++ member
+    // spelling, where `new` was a keyword and could never clash).
+    {llvm::StringLiteral("constructor collides with the member function "),
+     llvm::StringLiteral("cxx-constructor-name-clash")},
     {llvm::StringLiteral("struct member of a class with a destructor"),
      llvm::StringLiteral("cxx-drop-member")},
     {llvm::StringLiteral("array of a class with a destructor"),

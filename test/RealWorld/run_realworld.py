@@ -392,6 +392,9 @@ _CXX_BLOCKER_SUBSTRINGS = [
     # Mirrors lib/ImportC/RejectionLedger.cpp.
     ("destructor with no definition in this translation unit", "cxx-destructor-no-body"),
     ("destructor collides with the member function 'dtor'", "cxx-destructor-name-clash"),
+    # FR-185: the constructor twin, live since the constructor's fixed base
+    # name became `ctor` (a legal C++ member spelling; `new` was a keyword).
+    ("constructor collides with the member function ", "cxx-constructor-name-clash"),
     ("struct member of a class with a destructor", "cxx-drop-member"),
     ("array of a class with a destructor", "cxx-drop-array"),
     ("global or static object of a class with a destructor", "cxx-drop-global"),

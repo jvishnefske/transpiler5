@@ -127,7 +127,7 @@ int survivor(int n) { return n + 2; }
 // BODY: struct C {
 // BODY: fn survivor
 // BODY: impl C {
-// BODY: fn new
+// BODY: fn ctor
 // BODY: fn fine
 // BODYDIAG: body-fail.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported pointer expression: CStyleCastExpr (omitted: method 'bad' of class 'C')
 // BODYDIAG: body-fail.cpp:{{[0-9]+}}:{{[0-9]+}}: warning: unsupported: call to unimported method 'c_bad' (recovered: emitted an unimplemented!() stub with the mapped signature)

@@ -28,5 +28,5 @@ int main() {
 
 // RUN: emitrust-cc --emit=item-graph %s -o - | FileCheck %s --check-prefix=NOMEMBERS
 // NOMEMBERS-NOT: node tracer_dtor
-// NOMEMBERS-NOT: node tracer_new
+// NOMEMBERS-NOT: node tracer_ctor
 // NOMEMBERS-NOT: node drop kind=

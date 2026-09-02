@@ -29,13 +29,13 @@
 //    construction, so the bare name cannot collide.
 //
 // 3. WIDENED MEMBER x-FALLBACK: the frozen W2.2 member codes `b`/`i` are
-//    untouched (test/Import/Cpp/methods.cpp pins Counter_new_i and
+//    untouched (test/Import/Cpp/methods.cpp pins Counter_ctor_i and
 //    Counter_get_i byte-for-byte), but everything that previously fell to
 //    the `x` placeholder now delegates to templateArgTypeCode: `double`
 //    codes `d`, and a REFERENCE parameter takes a new `r` prefix over its
 //    referenced type's code (`const S &` -> `rs`). The motivating pair —
 //    interval's `S(double,double)` vs `S(const S&,const S&)`, both `xx`
-//    before FR-114 — disambiguates as S_new_dd / S_new_rsrs.
+//    before FR-114 — disambiguates as S_ctor_dd / S_ctor_rsrs.
 //
 // 4. ENUM CARVE-OUT: an enum satisfies `isIntegerType`, so without its
 //    own arm it would code `i` and collide with a genuine int overload.
@@ -99,10 +99,10 @@ public:
   S(double x, double y) : a(x), b(y) {}
   S(const S &p, const S &q) : a(p.a), b(q.b) {}
 };
-// CHECK-LABEL: func.func @S_new_dd(
+// CHECK-LABEL: func.func @S_ctor_dd(
 // CHECK-SAME: !emitrust.mut_ref<!emitrust.struct<"S">>
 // CHECK-SAME: f64, {{.*}}f64
-// CHECK-LABEL: func.func @S_new_rsrs(
+// CHECK-LABEL: func.func @S_ctor_rsrs(
 // CHECK-SAME: !emitrust.mut_ref<!emitrust.struct<"S">>
 // CHECK-SAME: !emitrust.ref<!emitrust.struct<"S">>
 // CHECK-SAME: !emitrust.ref<!emitrust.struct<"S">>
@@ -127,4 +127,4 @@ int use_all(int seed) {
 // CHECK: call @random_double_d_d(
 // CHECK: call @M_h_i(
 // CHECK: call @M_h_color(
-// CHECK: call @S_new_dd(
+// CHECK: call @S_ctor_dd(

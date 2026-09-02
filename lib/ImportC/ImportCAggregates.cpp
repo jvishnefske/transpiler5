@@ -960,7 +960,7 @@ CImporter::importCXXMethods(const clang::CXXRecordDecl *record) {
     // `unsupported: conversion function`, and a spelled or implicit
     // operator call is `call to overloaded operator ... omitted from class
     // ...` at the call dispatch's non-identifier-callee guard. Constructors
-    // and destructors keep their FIXED base names (`new`, `dtor`) and are
+    // and destructors keep their FIXED base names (`ctor`, `dtor`) and are
     // unaffected.
     // W2.25 narrowed the omission: an overloaded operator of an ADMITTED
     // kind (`operatorSymbolBaseName` non-empty — the shared table in
@@ -1500,6 +1500,44 @@ LogicalResult CImporter::collectRecordFields(
                      << "unsupported: destructor collides with the member "
                         "function 'dtor'";
           continue;
+        }
+        // FR-185: the destructor hazard's constructor twin. A constructor's
+        // module symbol is `<Struct>_ctor` (it stopped being `<Struct>_new`
+        // when the `new` spelling was retired -- a Rust `new` must return
+        // `Self` and must not take a receiver, and the emitted initializer
+        // does neither), and unlike `new`, `ctor` is a legal C++ member
+        // function name. The overload-suffix counter deliberately refuses
+        // to fuse a constructor with an identifier-named sibling (different
+        // `DeclarationName` shapes are never one overload set), so the two
+        // compose ONE symbol; at equal signatures the FR-47 prepass
+        // reconciliation would merge them SILENTLY and every `ctor()` call
+        // would run the constructor body. Compared on the post-fold in-impl
+        // spelling -- which is `fnRustName` of the suffixed base, a literal
+        // suffix of the module symbol (FR-110) -- so an overload set that
+        // genuinely separates (`S_ctor_i` beside a bare `S_ctor`) is not
+        // rejected, and the idiomatic rename's own fold (`Ctor` -> `ctor`)
+        // is covered in the mode where it exists. Class-level like the
+        // destructor's clash and for the same reason: a constructor is
+        // invoked implicitly, so there is no call node an FR-112 omission
+        // could attach a use-site rejection to.
+        if (const auto *ctorDecl =
+                llvm::dyn_cast<clang::CXXConstructorDecl>(method)) {
+          if (!ctorDecl->isDefaulted()) {
+            std::string ctorSpelling =
+                fnRustName(cxxMethodSuffixedBaseName(ctorDecl));
+            for (const clang::CXXMethodDecl *other : cxxRecord->methods()) {
+              if (other->isImplicit() || other->isDeleted() ||
+                  other->isDefaulted() ||
+                  !other->getDeclName().isIdentifier())
+                continue;
+              if (fnRustName(cxxMethodSuffixedBaseName(other)) != ctorSpelling)
+                continue;
+              return emitError(methodLoc)
+                     << "unsupported: constructor collides with the member "
+                        "function '"
+                     << other->getName() << "'";
+            }
+          }
         }
         // W2.19a: a virtual method no longer rejects the CLASS. On a VALUE
         // the C++ static type IS the dynamic type, so `getMethodDecl()`'s

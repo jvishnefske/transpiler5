@@ -37,14 +37,36 @@ std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
   return cFunctionSymbolName(func, currentTuTag);
 }
 
-/// W2.2: `method`'s un-suffixed mangled base name — the fixed spelling
-/// "new" for a constructor (whose `DeclarationName` is the special
-/// `CXXConstructorName` kind and has no ordinary identifier), or its C++
-/// spelling passed through the same keyword-escape a struct field name
-/// uses (`mangleMemberName`).
+/// W2.2: `method`'s un-suffixed mangled base name — a fixed spelling for a
+/// constructor or a destructor (whose `DeclarationName`s are the special
+/// `CXXConstructorName`/`CXXDestructorName` kinds and have no ordinary
+/// identifier), or its C++ spelling passed through the same keyword-escape
+/// a struct field name uses (`mangleMemberName`).
 static std::string cxxMethodBaseName(const clang::CXXMethodDecl *method) {
+  // FR-185: the constructor's fixed base name is `ctor`, deliberately NOT
+  // `new`, for the same two reasons the destructor's is `dtor` and not
+  // `drop` (see below).
+  //
+  // (a) `new` was WRONG about what this function is. A C++ constructor
+  // imports as an INITIALIZER method: it takes the object as a receiver
+  // and returns nothing (`fn new(&mut self, i: i32)`). Rust's `new` is a
+  // convention with two hard rules — it returns `Self` and it takes no
+  // receiver — and this method breaks both, which default clippy reports
+  // as `new_ret_no_self` plus `wrong_self_convention` on every emitted
+  // C++ class (measured: 128 of 231 warnings over the epoch-5 population,
+  // 23 files, the two lints firing in lockstep on the same members).
+  // `ctor` claims no convention and so carries no obligation.
+  //
+  // (b) `new` was unavailable to a user only by accident of C++ grammar,
+  // whereas a member function literally spelled `void ctor()` is legal
+  // C++ and would take the module symbol `<Struct>_ctor` — exactly the
+  // `dtor`/`drop` hazard. The overload-suffix counter below deliberately
+  // refuses to fuse the two (they are different `DeclarationName` shapes),
+  // so they would compose ONE symbol and, at equal signatures, merge
+  // silently. `collectRecordFields` rejects that pairing located, with the
+  // same class-level wording the destructor's clash uses.
   if (llvm::isa<clang::CXXConstructorDecl>(method))
-    return "new";
+    return "ctor";
   // W2.17: a destructor's `DeclarationName` is the special
   // `CXXDestructorName` kind and has no ordinary identifier, so `getName()`
   // would assert. The fixed base name is `dtor`, deliberately NOT `drop`:
@@ -176,7 +198,7 @@ std::string CImporter::cxxMethodSuffixedBaseName(
     // collide on the bare symbol instead, and `importFunction`'s W2.25
     // sibling walk rejects that located. Identifier-vs-identifier and
     // operator-vs-operator counting is unchanged (constructors share the
-    // fixed `new` base through the same non-identifier arm as before).
+    // fixed `ctor` base through the same non-identifier arm as before).
     if (candidate->getDeclName().isIdentifier() !=
         method->getDeclName().isIdentifier())
       continue;

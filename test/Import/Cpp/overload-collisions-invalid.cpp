@@ -25,7 +25,7 @@
 //   pointer arm nests its pointee, and a function prototype has no code
 //   of its own — the same `x` it has under W2.15's template table).
 // * member-int-long: the MEMBER integer code `i` is FROZEN by W2.2's
-//   byte-for-byte CHECK pins (Counter_new_i, Counter_get_i, C_new_i), so
+//   byte-for-byte CHECK pins (Counter_ctor_i, Counter_get_i, C_ctor_i), so
 //   int/long and int/unsigned stay collided on the member path even
 //   though the free path now splits int/long as _i32/_i64. A member
 //   collision is downgraded to warning + omission by the class importer
@@ -87,7 +87,7 @@ class S {
 public:
   long v;
   S(long x) : v(x) {}
-  // CTORI64: ctor-i64.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: C++ overload set for 'S' maps two overloads onto one emitted symbol 'S_new_i' (parameter types not distinguishable in the overload suffix)
+  // CTORI64: ctor-i64.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: C++ overload set for 'S' maps two overloads onto one emitted symbol 'S_ctor_i' (parameter types not distinguishable in the overload suffix)
   S(long long x) : v((long)x) {}
 };
 
