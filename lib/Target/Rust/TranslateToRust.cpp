@@ -194,6 +194,51 @@ struct ExprPos {
   static ExprPos binRhs(Prec rank) { return {Kind::BinRhs, rank}; }
 };
 
+/// FR-186: whether `p` is one of the bitwise-family ranks (`| ^ & << >>`).
+/// The complement among the infix ranks is the arithmetic family
+/// (`Prec::AddSub`, `Prec::MulDiv`); `Prec::Compare` is in neither.
+static constexpr bool isBitwiseFamily(Prec p) {
+  return p == Prec::BitOr || p == Prec::BitXor || p == Prec::BitAnd ||
+         p == Prec::Shift;
+}
+
+/// FR-186: whether `p` is one of the arithmetic-family ranks (`+ - * / %`).
+static constexpr bool isArithFamily(Prec p) {
+  return p == Prec::AddSub || p == Prec::MulDiv;
+}
+
+/// FR-186: whether an operand of rank `rank` under an infix parent of rank
+/// `parent` mixes the two precedence FAMILIES in a way that is faithful to
+/// parenthesize even though the grammar does not demand it.
+///
+/// This is a fidelity rule before it is a style rule. The C source of
+/// test/EndToEnd/enum-unsigned-object-relational.c writes
+/// `seeds[(argc - 1) & 3]`; because `-` binds tighter than `&` the pure
+/// rank rule left the operand bare and the emitter re-spelled the author's
+/// expression as `argc - 1i32 & 3i32`, DROPPING parentheses that were in
+/// the source. Restoring them is faithful, and it also retires
+/// `clippy::precedence` ("operator precedence might not be obvious").
+///
+/// The exact family rule was MEASURED against clippy 0.1.96 rather than
+/// assumed (probe: every ordered pair of the two families, both operand
+/// sides). Flagged: an arithmetic operand under a bitwise-family parent,
+/// LHS and RHS alike (`a - b & c`, `c & a - b`, `a + b << c`,
+/// `a << b + c`, `a % b ^ c`). NOT flagged, and therefore left bare here:
+/// a shift operand under a bitwise parent (`a << b & c` -- shift is IN the
+/// bitwise family), bitwise under bitwise, arithmetic under arithmetic,
+/// and a `Unary`, `Cast`, or method-call operand under anything. The
+/// reverse nesting (a bitwise operand under an arithmetic parent) is not
+/// flagged either and cannot arise bare regardless: every bitwise rank is
+/// looser than every arithmetic one, so the rank rule already wraps it.
+///
+/// Adding a paren pair is safe against the DENIED `unused_parens` lint:
+/// that lint watches the `Stmt`/`Cond`/`Delimited` positions, which never
+/// parenthesize structurally, and rustc measurably does not consider
+/// parens around a binary OPERAND redundant.
+static constexpr bool mixesPrecedenceFamilies(Prec rank, Prec parent) {
+  return isBitwiseFamily(parent) && isArithFamily(rank);
+}
+
 /// The whole parenthesization policy in one pure function. The `Stmt`,
 /// `Cond`, and `Delimited` positions are exactly the ones the DENIED
 /// `unused_parens` lint watches (see tools/emitrust-cc/CrateEmitter.cpp,
@@ -217,6 +262,13 @@ struct ExprPos {
 ///    expression, since a bare-rhs cast leaks to the end of any infix
 ///    text;
 ///  - BinRhs: equal-or-looser operands wrap (`a - (b - c)`).
+///
+/// On top of the rank rule, BOTH binary positions also wrap where the
+/// operand and the parent are in different precedence FAMILIES
+/// (`mixesPrecedenceFamilies`): `(argc - 1i32) & 3i32`, not
+/// `argc - 1i32 & 3i32`. That is a fidelity rule -- the C author wrote the
+/// parentheses -- and it fires only in BinLhs/BinRhs, never in the three
+/// positions the denied `unused_parens` lint watches.
 static bool needsParens(Prec rank, bool endsInCast, ExprPos pos) {
   switch (pos.kind) {
   case ExprPos::Kind::Stmt:
@@ -231,10 +283,14 @@ static bool needsParens(Prec rank, bool endsInCast, ExprPos pos) {
     if (endsInCast &&
         (pos.rank == Prec::Shift || pos.rank == Prec::Compare))
       return true; // `.. as T << ..` / `.. as T < ..`: generic-args misparse
+    if (mixesPrecedenceFamilies(rank, pos.rank))
+      return true; // `(a - b) & c`: obscure mix, and what the C author wrote
     return pos.rank == Prec::Compare
                ? precValue(rank) <= precValue(pos.rank)
                : precValue(rank) < precValue(pos.rank);
   case ExprPos::Kind::BinRhs:
+    if (mixesPrecedenceFamilies(rank, pos.rank))
+      return true; // `c & (a - b)`
     return precValue(rank) <= precValue(pos.rank);
   }
   llvm_unreachable("unknown expression position");

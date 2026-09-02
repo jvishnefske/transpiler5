@@ -397,9 +397,12 @@ emitrust.func @numbering_gap(%arg0: i32) -> i32 {
 
 // A short constant (suffixed text within the measured threshold) with
 // several classified uses duplicates its literal at EVERY use and the
-// binding vanishes; each use parenthesizes independently.
+// binding vanishes; each use parenthesizes independently. The multiply is
+// an ARITHMETIC operand of a BITWISE parent, so since FR-186 it carries a
+// second, family-mixing paren pair on top of the grammar-required one --
+// see test/Target/Rust/precedence-families.mlir.
 // CHECK-LABEL: fn dup_short(v0: i32) -> i32 {
-// CHECK-NEXT:    (v0 + 7i32) * 7i32 ^ 7i32
+// CHECK-NEXT:    ((v0 + 7i32) * 7i32) ^ 7i32
 // CHECK-NEXT:  }
 emitrust.func @dup_short(%arg0: i32) -> i32 {
   %c = emitrust.constant <7 : i32> : i32

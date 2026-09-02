@@ -414,6 +414,16 @@ blocked_by = []
 anchor = "FR-185 (opened and LANDED 2026-09-02; iteration 1 of the"
 
 [[items]]
+id = "FR-186"
+status = "landed"
+kind = "defect"
+size = "S"
+title = "The emitter dropped parentheses the C author wrote -- a fidelity regression that showed up as clippy::precedence"
+summary = "LANDED 2026-09-02, iteration 2 of the nix/clippy-eval/LOOP.md loop. test/EndToEnd/enum-unsigned-object-relational.c:55 writes seeds[(argc - 1) & 3]; because `-` binds tighter than `&` the pure rank rule in needsParens left the operand bare and the emitter re-spelled it as `argc - 1i32 & 3i32` -- correct but obscure, and NOT what the source said. clippy::precedence was reporting a real loss of information, so the lint was the symptom and the fidelity break was the defect. FIX: needsParens (TranslateToRust.cpp:220) gains one family rule -- an ARITHMETIC operand (+ - * / %) under a BITWISE-family parent (| ^ & << >>) wraps, in BinLhs and BinRhs only. THE FAMILY BOUNDARY WAS MEASURED against clippy 0.1.96 over every ordered pair, both operand sides, not assumed. Flagged: arithmetic under bitwise on both sides. NOT flagged and left bare: a SHIFT operand under a bitwise parent -- shift is IN the bitwise family, which the increment did not know going in -- plus bitwise-under-bitwise, arithmetic-under-arithmetic, and Unary/Cast/method-call operands. The rule is correctly one-directional: the reverse nesting is unreachable bare since every bitwise rank (2-5) is looser than every arithmetic rank (6-7). HAZARD DISCHARGED EMPIRICALLY: unused_parens is DENIED in emitted crates so a redundant paren is a HARD BUILD FAILURE; measured silent on every parenthesized binary operand including a deliberately redundant same-family one, because rustc's lint watches only the Stmt/Cond/Delimited positions that structurally never parenthesize. MEASURED: clippy 103 -> 94 (-9), precedence retired from the queue; gate 963/963; TRACTOR unchanged at 31/252. BYTE ACCOUNTING: the pre-change tool was rebuilt and --emit=rust diffed old-vs-new across all 298 EndToEnd files (paired; the same 30 skip both sides) -- 13 files, 17 lines, every differing line one newly added paren pair. NOT VERIFIED: a mixed operand under a COMPARISON parent, and float arithmetic under a bitwise parent (not expressible in Rust)."
+blocked_by = []
+anchor = "FR-186 (opened and LANDED 2026-09-02; iteration 2 of the"
+
+[[items]]
 id = "FR-176"
 status = "landed"
 title = "FR-160 silent request-ignore surfaces"

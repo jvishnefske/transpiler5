@@ -12478,6 +12478,57 @@ piece and becomes FR-45.
   two suffixing constructors beside a `ctor` member import -- the last
   pinning that the guard is not the naive literal test.)
 
+- [x] FR-186 (opened and LANDED 2026-09-02; iteration 2 of the
+  `nix/clippy-eval/LOOP.md` loop): **THE EMITTER WAS DROPPING PARENTHESES THE
+  C AUTHOR WROTE. A FIDELITY REGRESSION THAT HAPPENED TO SHOW UP AS A LINT.**
+  `test/EndToEnd/enum-unsigned-object-relational.c:55` writes
+  `seeds[(argc - 1) & 3]`. Because `-` binds tighter than `&`, the pure rank
+  rule in `needsParens` left the operand bare and the emitter re-spelled the
+  author's expression as `argc - 1i32 & 3i32` -- correct, but obscure, and
+  NOT what the source said. `clippy::precedence` ("operator precedence might
+  not be obvious") was reporting a real loss of information, so the lint was
+  a symptom and the fidelity break was the defect.
+  FIX: `needsParens` (`TranslateToRust.cpp:220`, "the whole parenthesization
+  policy in one pure function") gains one family rule -- an ARITHMETIC
+  operand (`+ - * / %`) under a BITWISE-family parent (`| ^ & << >>`) wraps,
+  in `BinLhs` and `BinRhs` only.
+  **THE FAMILY BOUNDARY WAS MEASURED AGAINST CLIPPY 0.1.96, NOT ASSUMED** --
+  probe crates over every ordered pair of the two families, both operand
+  sides. Flagged: arithmetic under bitwise, LHS and RHS alike (`a - b & c`,
+  `c & a - b`, `a + b << c`, `a << b + c`, `a % b ^ c`). NOT flagged and so
+  deliberately left bare: **a SHIFT operand under a bitwise parent
+  (`a << b & c`) -- shift is IN the bitwise family on both sides**, which the
+  increment did not know going in; plus bitwise-under-bitwise,
+  arithmetic-under-arithmetic, and `Unary`/`Cast`/method-call operands.
+  The rule is correctly ONE-DIRECTIONAL: the reverse nesting (a bitwise
+  operand under an arithmetic parent) is unreachable bare, because every
+  bitwise rank (2-5) is looser than every arithmetic rank (6-7) and the
+  pre-existing rank rule already wraps it. Pinned as `bitand_lhs_of_add` /
+  `shift_rhs_of_mul` so it stays visible that those parens come from rank,
+  not from this rule.
+  HAZARD DISCHARGED EMPIRICALLY, not by argument: `unused_parens` is DENIED
+  in the emitted crates' `[lints.rust]` table, so a paren rustc thinks is
+  redundant is a HARD BUILD FAILURE, not a warning. Measured silent on every
+  parenthesized binary operand including a deliberately redundant same-family
+  one (`(a - b) + c`) -- rustc's lint watches conditions, returns and
+  assigned values, which are exactly the `Stmt`/`Cond`/`Delimited` positions
+  that structurally never parenthesize. The new rule cannot reach them.
+  MEASURED: **clippy 103 -> 94 (-9)**, `clippy::precedence` retired from the
+  queue entirely; gate 963/963; TRACTOR unchanged at 31/252.
+  BYTE ACCOUNTING: the pre-change tool was rebuilt and `--emit=rust` diffed
+  old-vs-new across all 298 EndToEnd files (the same 30 skip on both sides,
+  so the comparison is paired). **13 files, 17 lines, and every differing
+  line is one newly added paren pair around an arithmetic operand of a
+  bitwise parent.** One line carries both directions at once:
+  `a__b * 7i32 + c__d ^ a__b << 2i32` gains parens around the add but leaves
+  `a__b << 2i32` bare -- the measured shift-is-bitwise result, visible in the
+  output. The named fidelity case now reads
+  `seeds[((argc - 1i32) & 3i32) as usize]`: the author's parentheses back.
+  NOT VERIFIED: whether clippy flags a mixed operand under a COMPARISON
+  parent (`Prec::Compare` is in neither family and no such warning appears
+  in the corpus tally), and float arithmetic under a bitwise parent (not
+  expressible in Rust).
+
 - [x] FR-176 DEFECT (opened 2026-08-29 as FR-161 on the probe line; RENUMBERED
   2026-08-30 when the rebase onto the trunk met the trunk's own FR-161
   (FR-158 Phase 3), which is cited by commits that are already immutable
