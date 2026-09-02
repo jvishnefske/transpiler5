@@ -424,6 +424,17 @@ blocked_by = []
 anchor = "FR-186 (opened and LANDED 2026-09-02; iteration 2 of the"
 
 [[items]]
+id = "FR-187"
+rank = 22
+kind = "feature"
+status = "open"
+size = "M"
+title = "The LOOP.md spelling loop reached its stopping condition at 94; what remains is not spelling"
+summary = "Opened 2026-09-02. Two iterations ran to completion, FR-185 (231->103) and FR-186 (103->94): clippy 231 -> 94, -59%, gate green and TRACTOR unmoved at 31/252 throughout. LOOP.md says stop when the top remaining lint is no longer a systematic emitter pattern; it is. Per item: needless_late_init 46 is EXCLUDED BY NAME (liveness, not spelling; 3 prior miscompiles in this tree). borrowed_box 19 is BLOCKED ON A DIALECT CONTRACT, not effort -- the `std::ops::Deref::deref(&p)` spelling is deliberate and recorded at ImportCExpressions.cpp:3988-3995 (emitrust.deref only accepts a ref/mut_ref operand and emitrust.member only a struct lvalue, so the borrow is what turns the opaque Box into a place); retiring it means relaxing DerefOp's verifier to accept an OpaqueType receiver, a structural change with real blast radius, and its whole footprint is one file. approx_constant 5 is a FALSE POSITIVE on transpiled code -- substituting std::f64::consts::PI would change the emitted bits, a behaviour change the byte-diff oracle would rightly fail. if_same_then_else 4 is faithful to the C. The rest is the long tail LOOP.md says to leave alone. THE FINDINGS OUTWEIGH THE -137: FR-185's `new` violated both of Rust's new() rules and, when renamed, exposed a silent-merge miscompile channel the old name had hidden only by accident of C++ grammar; FR-186's missing parens were a fidelity regression, the emitter discarding parentheses the C author wrote. In both the lint was the symptom and the defect was underneath, and in both PER-FILE ATTRIBUTION rather than the ranked tally located it -- 64+64 was ONE pattern, not two. NEXT IF RESUMED: cost borrowed_box as an ordinary dialect FR with its own spike, not as a loop iteration; and freezing epoch-6 would clear the known-stale comment FR-185 had to leave at test/EndToEnd/cpp-inheritance.cpp:7."
+blocked_by = []
+anchor = "FR-187 (opened 2026-09-02): **THE `LOOP.md` SPELLING LOOP HAS REACHED"
+
+[[items]]
 id = "FR-176"
 status = "landed"
 title = "FR-160 silent request-ignore surfaces"
