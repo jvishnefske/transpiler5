@@ -14,14 +14,13 @@
     "seed": 5,
     "held_out_frac": 0.25
   },
-  "emitter_rev": "acb6b48086003015e57a06a9332500c4ebfd5c65",
+  "emitter_rev": "dfd3092dca8636b74ee13b3cfed685568394fcd5",
   "crates_linted": 244,
   "crates_skipped": 0,
-  "total_warnings": 103,
+  "total_warnings": 94,
   "by_lint": {
     "clippy::needless_late_init": 46,
     "clippy::borrowed_box": 19,
-    "clippy::precedence": 9,
     "clippy::approx_constant": 5,
     "clippy::if_same_then_else": 4,
     "clippy::borrow_deref_ref": 3,
@@ -40,11 +39,10 @@
   "train": {
     "crates_linted": 183,
     "crates_skipped": 0,
-    "total_warnings": 78,
+    "total_warnings": 72,
     "by_lint": {
       "clippy::needless_late_init": 31,
       "clippy::borrowed_box": 19,
-      "clippy::precedence": 6,
       "clippy::approx_constant": 5,
       "clippy::if_same_then_else": 4,
       "clippy::borrow_deref_ref": 3,
@@ -60,10 +58,9 @@
   "held_out": {
     "crates_linted": 61,
     "crates_skipped": 0,
-    "total_warnings": 25,
+    "total_warnings": 22,
     "by_lint": {
       "clippy::needless_late_init": 15,
-      "clippy::precedence": 3,
       "clippy::single_match": 2,
       "clippy::type_complexity": 2,
       "clippy::too_many_arguments": 1,
