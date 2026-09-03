@@ -12341,6 +12341,105 @@ piece and becomes FR-45.
   adversarial by construction. This needs a real spike with a differential
   over malformed as well as well-formed input; the ranking above is NOT a
   GO.
+  **SPIKED 2026-09-03: GO WITH CONSTRAINTS. The killer risk is real, was
+  measured, and is solved; the yield is NINE cases, not thirteen; and the
+  hardest part of the feature turns out to be worth ZERO and can simply be
+  refused.**
+  THE RISK, ANSWERED: this entry warned that a failed `%d` does not consume
+  the offending characters and that a naive line-based Rust reader would
+  diverge permanently after. Measured: glibc's `scanf` is neither a line
+  reader nor `strtol` -- it is a greedy byte scanner with **exactly one
+  character of pushback** (C's single `ungetc` slot). Once that is the model
+  a safe-Rust rendering is byte-exact. The load-bearing edges, all measured
+  against clang/glibc: `-abc` returns 0 with the SIGN CONSUMED and only
+  `abc` left; `-` alone is a MATCHING failure (0), not EOF (-1);
+  `2147483647000` returns 1 with `a=-1000` (strtol on 64-bit long, then
+  truncate); `%u` on a huge NEGATIVE literal saturates to `ULONG_MAX`
+  regardless of sign -- that last one was the single divergence the first
+  candidate produced, out of 12427 cases, and it is exactly the class of
+  detail no amount of reasoning would have supplied.
+  ORACLE: a differential fuzz over 11 shapes -- including interleaved
+  `scanf` -> `fgets` -> `getchar` -> `fgets` -> `scanf` on ONE stream --
+  comparing return values, variables, exit status AND the exact residual
+  stream bytes: **26671 cases, 0 divergences.** Then the nine corpus cases
+  byte-diffed against their clang natives on their OWN vectors plus
+  ~1200-3000 adversarial stdins each: 0 divergences. Every mismatch anywhere
+  was on a `has_ub` vector the corpus runner skips.
+  **YIELD IS 9, NOT 13, AND THE ENTRY'S OWN NUMBER WAS OPTIMISTIC.** The
+  residual blocker set was measured by substituting each stdin call with an
+  equivalent local stub and re-importing: of 34 stdin-touching cases only
+  **009, 010, 017, 019, 021, 032, 040, 041, 043** come out clean. The other
+  25 carry a second blocker and score zero even with perfect stdin. This is
+  the FR-178 discipline applied to a lever before building it rather than
+  after.
+  **THE MOST VALUABLE FINDING IS A NEGATIVE ONE: `%f`/`%lf` IS WORTH ZERO
+  CASES.** The three cases that use it die on unrelated blockers
+  (`CStyleCastExpr`, `%a`, `__builtin_nanf`). So the hardest correctness risk
+  in the whole feature -- the C float grammar, hex floats (`0x1p3` -> 8,
+  measured), and `inf`/`infinity`/`nan(1)`, which glibc accepts and Rust's
+  `parse` does NOT -- can be a LOCATED REJECTION at zero cost. Likewise the
+  scanf RETURN VALUE (0 cases), `%u` (0), `%d %d %d` (0), and `&scanf(&arr[i])`
+  (0, and it must STAY rejected: `&arr[i]` routes through the FR-40 owner
+  rewrite, which cannot apply to a `call_opaque` helper).
+  RENDERING, no new ops and no new dialect surface: a chain of
+  `emitrust.call_opaque` over `mut_ref` operands threading an i32 state, with
+  `s >= 0` = running with `s` conversions and `s < 0` = stopped answering
+  `-s - 2`. That folds C's whole return rule -- count on matching failure,
+  EOF only when an input failure precedes the first conversion -- into pure
+  arithmetic, so no labelled break is needed, each helper no-ops when
+  stopped, and **only one `&mut` is live at a time**, so the aliasing
+  analysis is never engaged. `stdin` fits the existing `__EmitrustFile` model
+  as a STATELESS unit variant, which is what dissolves the ownership problem
+  this entry flagged: with no state to own, the importer materializes a fresh
+  temporary at each use site. Pushback is a process-wide `AtomicI32`, NOT a
+  `thread_local!` (which trips `clippy::missing_const_for_thread_local`, an
+  already-pinned FR-63 golden). Clippy on the candidate helpers: zero.
+  ADMITTED GRAMMAR (everything else stays a located rejection): a
+  definition-less `scanf`, or `fscanf` whose first argument is `stdin`;
+  ordinary string-literal format; directives exactly whitespace runs, `%d`,
+  `%u`, `%c` -- no length modifier, no width, no `*`, no literal-match
+  characters; conversion count == argument count; every argument `&L` for a
+  function-local scalar of exactly matching type.
+  **ONE SHAPE WOULD MISCOMPILE IF ADMITTED AND MUST BE REFUSED: `fclose(stdin)`.**
+  The stateless temporary makes it a silent no-op. Same for `FILE *f = stdin;`
+  (a variable holding `Stdin` is closable), and `fseek`/`rewind`/`ungetc`/
+  `feof`/`ferror` on stdin.
+  NOT MEASURED, and the honest gap: the importer was never patched, so
+  whether the FR-40 pointer-region planner reacts to `&x` inside a `scanf`
+  call is unknown (low risk -- `&x` to a user function already emits
+  `let mut x` + `&mut x` with no owner lift -- but only a build settles it).
+  All semantics are glibc/x86-64; the sign-not-pushed-back and
+  saturate-then-truncate rules are plausibly libc-specific, so portable
+  EndToEnd tests should pin only well-defined shapes and keep the glibc edges
+  in helper comments.
+
+- [ ] FR-191 DEFECT (opened 2026-09-03 by the FR-183 stdin spike, which found
+  it while building its own oracle): **`printf("%s", buf)` OF A `char` BUFFER
+  HOLDING A BYTE >= 0x80 EMITS UTF-8-EXPANDED OUTPUT. THIS IS A LIVE
+  MISCOMPILE ON TODAY'S TREE AND NEEDS NO NEW FEATURE TO REACH.**
+  Reproduced with `fopen` + `fgets` + `printf("%s")` alone:
+      native  : ff fe 81 7a 0a 0a
+      emitted : c3 bf c3 be c2 81 7a 0a 0a
+  Root cause is the `__emitrust_cstr` Latin-1 `Display` funnel
+  (`ImportCFunctions.cpp:2929`): every byte is rendered as a `char`, so
+  anything above 0x7f becomes a two-byte UTF-8 sequence.
+  **THE FIX ALREADY EXISTS AND IS SIMPLY GATED TOO NARROWLY.** The raw-bytes
+  bypass `__emitrust_cstr_out` (`ImportCFunctions.cpp:2951`) does exactly the
+  right thing, but its use site is guarded by `matchArgvWholeSubscript`
+  (`ImportCStatements.cpp:8090`) -- argv only. Widening that guard to any
+  whole-`char`-buffer `%s` argument is the repair.
+  It masked 484 of the spike's fuzz cases until the probe was switched to
+  raw-byte comparison, which is the tell: a Latin-1 round-trip looks correct
+  in a terminal and only a byte-diff catches it. The corpus never caught it
+  because every `%s` payload in the EndToEnd suite is ASCII.
+  ORTHOGONAL to FR-183 and it does not gate that GO (none of the nine yielded
+  cases has a non-ASCII `%s` payload), but **stdin support widens its
+  reachable set enormously** -- 002/009/017/028/029 all pipe arbitrary bytes
+  into a `char` buffer -- so it should land BEFORE or alongside.
+  Second, minor, also pre-existing: emitted `println!` line-flushes where C
+  stdio block-buffers on a pipe. Measured 46x slowdown on an 8.2M-line run
+  (0.245 s native vs 11.3 s Rust) with md5-identical output. No corpus vector
+  is near the timeout, but it is a latent `HARNESS_ERROR: timeout` source.
 
 - [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
   FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED
