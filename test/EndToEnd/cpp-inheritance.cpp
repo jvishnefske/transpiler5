@@ -4,7 +4,7 @@
 // diffed byte for byte against a `clang++ -std=c++17` build of the identical
 // source. Rust has no inheritance at all, so every inherited access in this
 // file is a REWRITE (`get()` -> `self.base.base_get()`, `x` ->
-// `self.base.x`, `Base(a)` -> `self.base.base_new(a)`) -- exactly the class
+// `self.base.x`, `Base(a)` -> `self.base.base_ctor(a)`) -- exactly the class
 // of change a compile-clean `cargo build` cannot see.
 //
 // Covered, all inside the admitted subset (see

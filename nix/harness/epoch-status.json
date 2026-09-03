@@ -91,6 +91,29 @@
           "last_changed": "f734fed 2026-08-29 feat(import): FR-61f-c slices 1+2 -- hoist a body-invariant pointer cell"
         }
       ]
+    },
+    "5": {
+      "epoch_id": 5,
+      "closed_at": "2026-09-03T02:14:48",
+      "closed_at_rev": "a69b8eb635bc8177a9db7d90e0790d80d0734466",
+      "reason": "drifted: pinned EndToEnd tests test/EndToEnd/stl-unique-ptr.cpp (FR-188, a69b8eb) and test/EndToEnd/cpp-inheritance.cpp (FR-185 stale-comment fix, deferred to this freeze) were legitimately edited; a delta measured over a moved population is attributable to nothing",
+      "note": "superseded by epoch-6 (same union corpus test/EndToEnd x {.c,.cpp}, re-probed at the FR-188 rev). The compiler change across the boundary was measured NEUTRAL in isolation (94 -> 94); the apparent +16 was corpus lines FR-188 added. Deliberately NOT re-frozen -- re-freezing would destroy the evidence that the population moved (FR-144).",
+      "corpus_root": "test/EndToEnd",
+      "corpus_hash": "sha256:132e5e39cd833549b525da00a926215f3b12c9a039ad179dda87962b4f206726",
+      "file_count": 244,
+      "drifted": true,
+      "drifted_files": [
+        {
+          "path": "test/EndToEnd/cpp-inheritance.cpp",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "47f5f2f 2026-08-21 feat(import): W2.18 -- single non-virtual inheritance as a base field (see design.md W2.18)"
+        },
+        {
+          "path": "test/EndToEnd/stl-unique-ptr.cpp",
+          "state": "CONTENT-CHANGED",
+          "last_changed": "a69b8eb 2026-09-03 fix(importer): FR-188 -- a unique_ptr payload by mutable reference emitted broken code, and one spelling emitted WRONG code"
+        }
+      ]
     }
   }
 }

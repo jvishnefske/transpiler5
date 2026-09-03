@@ -49,7 +49,7 @@ CLIPPY_EVAL = os.path.join(REPO, "nix", "clippy-eval", "clippy_eval.py")
 # never reads (which is how the ratchet came to compare 170 crates against a
 # 164-crate baseline).
 CLIPPY_BASELINE = os.path.join(REPO, "nix", "clippy-eval",
-                               "clippy-baseline-epoch5.json")
+                               "clippy-baseline-epoch6.json")
 CHAMPION = os.path.join(HERE, "champion.json")
 def _default_emitrust_cc():
     # CMake trees put tools in build/bin/, meson trees in build/tools/.
