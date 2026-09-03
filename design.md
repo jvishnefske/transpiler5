@@ -12580,6 +12580,32 @@ piece and becomes FR-45.
   verifier contract?), NOT as a loop iteration. Freezing epoch-6 would also
   clear the one known-stale comment FR-185 had to leave
   (`test/EndToEnd/cpp-inheritance.cpp:7`).
+  **ADDENDUM, 2026-09-03, resuming the loop: THE HARNESS WAS BLOCKED, NOT
+  BROKEN -- AND MY FIRST DIAGNOSIS OF IT WAS WRONG.**
+  `nix/harness/champion.json` was pinned to **epoch 3** while epochs 3 and 4
+  are CLOSED history and epoch-5 is current, so `controller iterate` could
+  not validly score anything. I first recorded this as a SILENT failure --
+  "nothing was checking that the champion belonged to the epoch being
+  measured". **That is false, and the correction matters more than the
+  original claim.** `cmd_score` (`controller.py:294`) already compares
+  `champion["corpus_hash"]` against the epoch document's and refuses:
+  "champion/epoch hash mismatch -- champion.json was established on epoch-3,
+  not epoch-5. Metrics are never compared across epochs: run `establish --id
+  5` first." The fence was there, correctly placed and correctly worded, and
+  it would have fired on the first `score`. I had proposed adding a guard
+  that already existed -- caught only by reading the code path before
+  writing it.
+  So the true state was: the loop was LOUDLY BLOCKED on a missing one-time
+  setup step, exactly as designed. Re-established at `6100471` with
+  `controller.py establish --id 5` (guarded by `assert_comparable`, which
+  re-hashes the population and refuses a closed or drifted epoch, and which
+  refuses outright if the champion emits any `unsafe`): **train 72 +
+  held-out 22 = 94**, exactly the ratchet total, `unsafe=0`, 244 crates, 0
+  skipped.
+  ONE REAL RESIDUAL, worth noting for whoever fixes `borrowed_box`: all 19
+  of its warnings are in the TRAIN slice, so contract clause 5 (held-out
+  generalization) cannot vouch for that fix -- held-out will be flat by
+  construction, not by evidence.
 
 - [x] FR-176 DEFECT (opened 2026-08-29 as FR-161 on the probe line; RENUMBERED
   2026-08-30 when the rebase onto the trunk met the trunk's own FR-161
