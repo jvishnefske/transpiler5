@@ -32,8 +32,13 @@ int main(void) {
 // The returned length participates in ordinary arithmetic.
 // CHECK: arith.addi %{{.*}}, %{{.*}} : i32
 
-// The filled buffer reads back through the existing %s machinery.
-// CHECK: emitrust.call_opaque "__emitrust_cstr"
+// The filled buffer reads back through the existing %s machinery -- since
+// FR-191 that is the RAW-BYTES funnel (the Latin-1 Display funnel it
+// replaced re-encoded every byte >= 0x80 as two UTF-8 bytes). Note the
+// asymmetry: `sprintf` itself keeps `format!`, because its result is copied
+// into a char buffer rather than written to stdout, so the stdout-only
+// `*_out` helpers are unavailable to it.
+// CHECK: emitrust.call_opaque "__emitrust_cstr_out"
 // CHECK: emitrust.call_opaque "println!"
 
 // The helper is emitted once at module level as safe Rust: it copies the

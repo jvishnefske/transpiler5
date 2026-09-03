@@ -1,10 +1,14 @@
-// RUN: emitrust-import-c %s | FileCheck %s
+// RUN: emitrust-import-c %s | FileCheck %s --implicit-check-not='"__emitrust_cstr"'
 
 // CTS-L2 (design.md): printf %s of a `char *` function parameter. A
 // slice-classified pointer parameter (FR-28, `mut_ref<slice<i8>>`) feeds
 // %s as an `emitrust.slice_of` of its deref'd slice base place at the
-// parameter's current cursor, rendered by the `__emitrust_cstr` helper
-// (stop-at-first-NUL, like C). A string-literal argument to a slice
+// parameter's current cursor. FR-191: that slice is written RAW through
+// `__emitrust_cstr_out` (stop-at-first-NUL, like C) rather than through the
+// Latin-1 `__emitrust_cstr` Display funnel, which re-encoded every byte
+// >= 0x80 as two UTF-8 bytes; the pending format text flushes as its own
+// `print!` so the raw write lands in program order. A string-literal argument
+// to a slice
 // parameter materializes a fresh mutable backing byte array (bytes plus
 // the terminating NUL) at the call site and passes a whole-array slice;
 // per-call copies are unobservable in defined C programs because writing
@@ -26,14 +30,16 @@ static void show(const char *s) {
 //   First %s: slice the base at the (zero) cursor, print through the helper.
 // CHECK: %[[C0:.*]] = memref.load %[[CUR]][] : memref<i64>
 // CHECK: %[[SL0:.*]] = emitrust.slice_of %[[BASE]][%[[C0]]] : (!emitrust.lvalue<!emitrust.slice<i8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>
-// CHECK: %[[STR0:.*]] = emitrust.call_opaque "__emitrust_cstr"(%[[SL0]]) : (!emitrust.ref<!emitrust.slice<i8>>) -> !emitrust.opaque<"String">
-// CHECK: emitrust.call_opaque "println!"(%[[STR0]]) {args = ["[{}]", 0 : index]}
+// CHECK: emitrust.call_opaque "print!"() {args = ["["]}
+// CHECK: emitrust.call_opaque "__emitrust_cstr_out"(%[[SL0]]) : (!emitrust.ref<!emitrust.slice<i8>>) -> ()
+// CHECK: emitrust.call_opaque "println!"() {args = ["]"]}
 //   s++ advances the cursor cell; the second %s slices from the new cursor.
 // CHECK: arith.addi
 // CHECK: %[[C1:.*]] = memref.load %[[CUR]][] : memref<i64>
 // CHECK: %[[SL1:.*]] = emitrust.slice_of %[[BASE]][%[[C1]]] : (!emitrust.lvalue<!emitrust.slice<i8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>
-// CHECK: %[[STR1:.*]] = emitrust.call_opaque "__emitrust_cstr"(%[[SL1]])
-// CHECK: emitrust.call_opaque "println!"(%[[STR1]])
+// CHECK: emitrust.call_opaque "print!"() {args = ["["]}
+// CHECK: emitrust.call_opaque "__emitrust_cstr_out"(%[[SL1]])
+// CHECK: emitrust.call_opaque "println!"() {args = ["]"]}
 
 int main(void) {
   char buf[4] = "ab";
@@ -51,5 +57,7 @@ int main(void) {
 // CHECK: %[[ASL:.*]] = emitrust.slice_of mut %{{.*}}[%{{.*}}] : (!emitrust.lvalue<!emitrust.array<4xi8>>, i64) -> !emitrust.mut_ref<!emitrust.slice<i8>>
 // CHECK: call @show(%[[ASL]])
 
-// The stop-at-first-NUL helper is emitted once at module level.
-// CHECK: emitrust.verbatim "fn __emitrust_cstr(s: &[i8]) -> String
+// The stop-at-first-NUL raw-bytes helper is emitted once at module level,
+// and the Display funnel it replaced is no longer requested at all (an
+// unused helper would be an `unused` deny in the emitted crate).
+// CHECK: emitrust.verbatim "fn __emitrust_cstr_out(s: &[i8]) {

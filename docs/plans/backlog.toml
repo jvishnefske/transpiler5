@@ -395,14 +395,24 @@ anchor = "FR-183 (opened 2026-08-31 by the FR-182 wait, measured with the FR-178
 
 [[items]]
 id = "FR-191"
-rank = 5
 kind = "defect"
-status = "open"
+status = "landed"
 size = "S"
 title = "printf(\"%s\") of a char buffer with a byte >= 0x80 emits UTF-8-expanded output -- a live miscompile, and the fix already exists"
 summary = "Opened 2026-09-03 by the FR-183 stdin spike, which found it while building its own oracle. Reproduced with fopen+fgets+printf(\"%s\") alone, no new feature needed: native ff fe 81 7a 0a 0a, emitted c3 bf c3 be c2 81 7a 0a 0a. Root cause is the __emitrust_cstr Latin-1 Display funnel (ImportCFunctions.cpp:2929) -- every byte renders as a char, so anything above 0x7f becomes two UTF-8 bytes. THE FIX ALREADY EXISTS AND IS GATED TOO NARROWLY: the raw-bytes bypass __emitrust_cstr_out (ImportCFunctions.cpp:2951) does the right thing but its use site is guarded by matchArgvWholeSubscript (ImportCStatements.cpp:8090) -- argv only. Widening that guard to any whole-char-buffer %s argument is the repair. It masked 484 of the spike fuzz cases until the probe switched to raw-byte comparison, which is the tell: a Latin-1 round-trip looks right in a terminal and only a byte-diff catches it; the corpus never caught it because every EndToEnd %s payload is ASCII. Orthogonal to FR-183 and does not gate its GO, but stdin widens the reachable set enormously (002/009/017/028/029 all pipe arbitrary bytes into a char buffer), so land it before or alongside. Second, minor, pre-existing: emitted println! line-flushes where C stdio block-buffers on a pipe -- 46x slowdown measured on an 8.2M-line run with md5-identical output, a latent HARNESS_ERROR timeout source."
 blocked_by = []
 anchor = "FR-191 DEFECT (opened 2026-09-03 by the FR-183 stdin spike, which found"
+
+[[items]]
+id = "FR-192"
+rank = 6
+kind = "defect"
+status = "open"
+size = "M"
+title = "A %s argument is materialized at argument-lowering time, not read at conversion time, so a later argument that writes the buffer is lost"
+summary = "Opened 2026-09-03 by FR-191, which found it and deliberately preserved it unchanged. printf(\"[%s] %d\\n\", buf, bump()) where bump() writes into buf: native prints [Bb] 1, the emitted crate prints [ab] 1. C evaluates every argument before printf writes anything and then converts %s by reading the pointer AT CONVERSION TIME, so the write is visible; the emitter snapshots the region when it lowers the argument, so it is not. REPRODUCES WITH PURE-ASCII PAYLOADS AND PREDATES FR-191 -- a different bug from the Latin-1 funnel that merely lives next door. FR-191 found it while fencing its own ordering hazard and preserved it exactly rather than stacking a second failure on top: its raw-bytes bypass is declined whenever a later argument has side effects, which keeps this shape on its existing wrong-but-unchanged path. The fix is a snapshot-vs-borrow decision that runs into Rust's borrow rules -- reading at conversion time means holding a borrow across the evaluation of an argument that mutably borrows the same buffer -- so it needs its own spike, not a patch."
+blocked_by = []
+anchor = "FR-192 DEFECT (opened 2026-09-03 by FR-191, which found it and"
 
 [[items]]
 id = "FR-184"

@@ -1,4 +1,4 @@
-// RUN: emitrust-import-c %s | FileCheck %s
+// RUN: emitrust-import-c %s | FileCheck %s --implicit-check-not='"__emitrust_cstr"'
 
 // CTS-P1: a `char *` bound to a string literal is a cursor into a
 // read-only region. The literal's bytes (plus the terminating NUL, which
@@ -49,8 +49,11 @@ int shared(void) {
 // CHECK: arith.subi
 
 // A literal-bound pointer feeds printf %s: the backing is sliced from the
-// cursor and rendered by the same __emitrust_cstr helper as char arrays
-// (both stop at the first NUL like C).
+// cursor and written RAW by the same __emitrust_cstr_out helper as char
+// arrays (both stop at the first NUL like C). FR-191 moved this shape off
+// the Latin-1 __emitrust_cstr Display funnel, which re-encoded every byte
+// >= 0x80 as two UTF-8 bytes; the format text around the hole flushes as
+// its own macro call so the raw write lands in program order.
 int printf(const char *, ...);
 void print_it(void) {
   char *p = "hi";
@@ -58,8 +61,8 @@ void print_it(void) {
 }
 // CHECK-LABEL: func.func @print_it
 // CHECK: %[[SLICE:.*]] = emitrust.slice_of %{{.*}}[%{{.*}}] : (!emitrust.lvalue<!emitrust.array<3xi8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>
-// CHECK: %[[STR:.*]] = emitrust.call_opaque "__emitrust_cstr"(%[[SLICE]])
-// CHECK: emitrust.call_opaque "println!"(%[[STR]])
+// CHECK: emitrust.call_opaque "__emitrust_cstr_out"(%[[SLICE]])
+// CHECK: emitrust.call_opaque "println!"() {args = []}
 
 // A definition-less strlen call over a literal-bound pointer counts bytes
 // up to the first NUL through the __emitrust_strlen helper, converted to
@@ -83,6 +86,7 @@ int not_null(void) {
 // CHECK: %[[FALSE:.*]] = arith.constant false
 // CHECK: arith.extui %[[FALSE]] : i1 to i32
 
-// The helpers are emitted once per module, after all imported items.
-// CHECK: emitrust.verbatim "fn __emitrust_cstr(s: &[i8]) -> String
+// The helpers are emitted once per module, after all imported items. The
+// Display funnel is no longer requested anywhere here.
+// CHECK: emitrust.verbatim "fn __emitrust_cstr_out(s: &[i8]) {
 // CHECK: emitrust.verbatim "fn __emitrust_strlen(s: &[i8]) -> i64

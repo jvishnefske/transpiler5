@@ -24,10 +24,14 @@ int main(void) {
   // CHECK: %[[SRC:.*]] = emitrust.slice_of %[[LIT]][%{{.*}}] : (!emitrust.lvalue<!emitrust.array<6xi8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>
   // CHECK: emitrust.call_opaque "__emitrust_strcpy"(%[[DST]], %[[SRC]])
 
-  // The copied-into array reads back through the %s machinery.
+  // The copied-into array reads back through the %s machinery. FR-191: a
+  // width-less %s over a char region writes its RAW BYTES, so the Latin-1
+  // __emitrust_cstr Display funnel (two UTF-8 bytes for every byte >= 0x80)
+  // is gone from every %s here; the whole format was consumed, so the
+  // trailing newline folds into a bare `println!()`.
   printf("%s\n", a);
-  // CHECK: emitrust.call_opaque "__emitrust_cstr"
-  // CHECK: emitrust.call_opaque "println!"
+  // CHECK: emitrust.call_opaque "__emitrust_cstr_out"
+  // CHECK: emitrust.call_opaque "println!"() {args = []}
 
   // strncpy carries its count as i64.
   strncpy(a, "gosh", 2);
@@ -48,12 +52,12 @@ int main(void) {
   // CHECK: emitrust.call_opaque "__emitrust_strlen"(%{{.*}}) : (!emitrust.ref<!emitrust.slice<i8>>) -> i64
 
   // strchr feeding %s: the helper's relative index offsets the argument's
-  // cursor and the region is re-sliced there for __emitrust_cstr.
+  // cursor and the region is re-sliced there for __emitrust_cstr_out.
   printf("%s\n", strchr(a, 'o'));
   // CHECK: %[[IDX:.*]] = emitrust.call_opaque "__emitrust_strchr"(%{{.*}}, %{{.*}}) : (!emitrust.ref<!emitrust.slice<i8>>, i32) -> i64
   // CHECK: %[[AT:.*]] = arith.addi %{{.*}}, %[[IDX]] : i64
   // CHECK: emitrust.slice_of %[[A]][%[[AT]]]
-  // CHECK: emitrust.call_opaque "__emitrust_cstr"
+  // CHECK: emitrust.call_opaque "__emitrust_cstr_out"
 
   // strrchr against NULL folds to an index test against -1.
   printf("%d\n", strrchr(a, 'x') == NULL);
@@ -64,7 +68,7 @@ int main(void) {
   // %s of a pointer to an array element slices from that element.
   printf("%s\n", &a[1]);
   // CHECK: emitrust.slice_of %[[A]][%{{.*}}] : (!emitrust.lvalue<!emitrust.array<10xi8>>, i64) -> !emitrust.ref<!emitrust.slice<i8>>
-  // CHECK: emitrust.call_opaque "__emitrust_cstr"
+  // CHECK: emitrust.call_opaque "__emitrust_cstr_out"
 
   // memset through a void* parameter strips the implicit bitcast and
   // borrows the destination mutably from &a[1]'s cursor.

@@ -12413,7 +12413,7 @@ piece and becomes FR-45.
   EndToEnd tests should pin only well-defined shapes and keep the glibc edges
   in helper comments.
 
-- [ ] FR-191 DEFECT (opened 2026-09-03 by the FR-183 stdin spike, which found
+- [x] FR-191 DEFECT (opened 2026-09-03 by the FR-183 stdin spike, which found
   it while building its own oracle): **`printf("%s", buf)` OF A `char` BUFFER
   HOLDING A BYTE >= 0x80 EMITS UTF-8-EXPANDED OUTPUT. THIS IS A LIVE
   MISCOMPILE ON TODAY'S TREE AND NEEDS NO NEW FEATURE TO REACH.**
@@ -12440,6 +12440,73 @@ piece and becomes FR-45.
   stdio block-buffers on a pipe. Measured 46x slowdown on an 8.2M-line run
   (0.245 s native vs 11.3 s Rust) with md5-identical output. No corpus vector
   is near the timeout, but it is a latent `HARNESS_ERROR: timeout` source.
+  **FIXED 2026-09-03.** Verified independently, byte for byte, on the minimal
+  repro: native `fe fe 81 7a 0a`, emitted (pre-fix) `c3 be c3 be c2 81 7a
+  0a`, emitted (post-fix) `fe fe 81 7a 0a`.
+  **A CORRECTION TO THIS ENTRY'S OWN DIAGNOSIS:** "merely gated too narrowly"
+  was wrong. The argv match was not the only gate -- `emitPrintfStringArg`
+  UNCONDITIONALLY wraps every region slice in `__emitrust_cstr` before the
+  caller ever sees it, so removing the argv match alone would have changed
+  nothing. The real fix is a `rawByteSlice` out-parameter that lets `wrapCStr`
+  hand back the unwrapped `&[i8]` when the caller is a raw-bytes position.
+  THE SAFE BOUNDARY WAS ESTABLISHED EMPIRICALLY, one probe per shape, and
+  splits three ways. Routed through the bypass: a whole local `char` array,
+  `&buf[i]` mid-buffer, a global `char` array's staged copy, a pointer into a
+  string-literal region, an FR-28 slice-classified `char *` parameter, and a
+  `strchr`/`strrchr` result. KEPT on the Display funnel deliberately: a direct
+  string literal (it returns a `&'static str` and never touched the funnel --
+  churning it would buy no correctness), and an FR-64 lifted `String` /
+  `c_str()` (a real `String`, not a byte funnel). Already-rejected and
+  therefore unreachable: a plain undecomposed `char *p = buf`, a
+  non-slice-classified `char *` parameter, and a `malloc`-backed `char *`.
+  `%.Ns` is IN via `__emitrust_cstr_n_out`; a bare field width `%10s` is OUT,
+  because a raw `write_all` cannot pad -- which is exactly the restriction the
+  argv planner already documents, and `printf("%10s", argv[1])` is a
+  rejection today rather than a silent width drop.
+  **AN ORDERING HAZARD THE SPEC DID NOT ANTICIPATE, FOUND AND FENCED.**
+  Flushing a segment mid-directive-scan moves this call's output BEFORE the
+  evaluation of arguments still to come, where C evaluates every argument
+  before printf writes anything. Measured: with
+  `printf("[%s] %d\n", buf, noisy())` where `noisy()` itself prints, native
+  and correct output is `<1>[ab] 1`; without the fence the emitted crate
+  writes `[ab]` first. The bypass is therefore declined when ANY later
+  argument of the same call has side effects. Pinned as observable bytes in
+  the EndToEnd test, not just in the IR.
+  **STATED PLAINLY RATHER THAN HALF-FIXED: `%s` inside `sprintf`/`snprintf`
+  IS STILL A MISCOMPILE for non-ASCII.** Those directives collapse into
+  `format!` -> `String` -> `__emitrust_sprintf`, and the `*_out` helpers write
+  stdout, so they are structurally unavailable. It needs a byte-level
+  `format!` replacement, which is a separate feature.
+  `puts` was included beyond the spec -- same funnel, same stdout position,
+  same measured defect, and no format hole or later argument to order
+  against; leaving it would have been a half-fix.
+  THE TEST THIS CLASS NEVER HAD: `test/EndToEnd/printf-string-nonascii.c`, a
+  byte-diff over seven non-ASCII shapes. Four Import goldens additionally
+  gained a whole-output `--implicit-check-not` they did not have before, so
+  the helper-request gating (a crate that no longer wraps must stop emitting
+  `__emitrust_cstr`) is now pinned rather than assumed. Gate 967/967; clippy
+  132 -> 132 (+0) on the same epoch-6 pin.
+
+- [ ] FR-192 DEFECT (opened 2026-09-03 by FR-191, which found it and
+  deliberately preserved it unchanged): **A `%s` ARGUMENT IS MATERIALIZED AT
+  ARGUMENT-LOWERING TIME, NOT READ AT CONVERSION TIME, SO A LATER ARGUMENT
+  THAT WRITES THE BUFFER IS LOST.**
+      printf("[%s] %d\n", buf, bump());   /* bump() writes into buf */
+      native : [Bb] 1
+      emitted: [ab] 1
+  C evaluates every argument before printf writes anything, then converts
+  `%s` by reading the pointer AT CONVERSION TIME -- so the write is visible.
+  The emitter snapshots the region when it lowers the argument, so it is not.
+  **This reproduces with PURE-ASCII payloads and predates FR-191**; it is a
+  different bug from the Latin-1 funnel that merely lives next door.
+  FR-191 found it while fencing its own ordering hazard and preserved it
+  EXACTLY rather than stacking a second failure on top -- the raw-bytes
+  bypass is declined whenever a later argument has side effects, which keeps
+  this shape on its existing (wrong, but unchanged) path.
+  The fix is a snapshot-vs-borrow decision that runs straight into Rust's
+  borrow rules -- reading the buffer at conversion time means holding a
+  borrow across the evaluation of an argument that mutably borrows the same
+  buffer -- so it is genuinely its own FR and needs a spike, not a patch.
 
 - [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
   FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED

@@ -1,4 +1,4 @@
-// RUN: emitrust-import-c %s | FileCheck %s
+// RUN: emitrust-import-c %s | FileCheck %s --implicit-check-not='"__emitrust_cstr_n"'
 
 // C99-47: integer precision, the '+'/' '/'#' flags, the h/hh/ll length
 // modifiers, %s precision/width, and %c width.
@@ -44,10 +44,15 @@ int main(void) {
   // CHECK: emitrust.literal "\22abc\22"
   // CHECK: emitrust.call_opaque "println!"(%{{.*}}) {args = ["{}", 0 : index]}
 
-  // %.Ns of a char array routes through __emitrust_cstr_n (stops at N
-  // bytes or the first NUL, whichever comes first).
+  // %.Ns of a char array routes through the raw-bytes __emitrust_cstr_n_out
+  // (stops at N bytes or the first NUL, whichever comes first). FR-191: the
+  // Display twin __emitrust_cstr_n mapped each byte to a Rust `char`, which
+  // re-encoded every byte >= 0x80 as two UTF-8 bytes where C writes one; the
+  // width-less %s/%.Ns holes over a char region therefore write raw bytes and
+  // the surrounding format text flushes as its own macro call.
   printf("%.4s\n", buf);
-  // CHECK: emitrust.call_opaque "__emitrust_cstr_n"(%{{.*}}, %{{.*}}) : (!emitrust.ref<!emitrust.slice<i8>>, i64) -> !emitrust.opaque<"String">
+  // CHECK: emitrust.call_opaque "__emitrust_cstr_n_out"(%{{.*}}, %{{.*}}) : (!emitrust.ref<!emitrust.slice<i8>>, i64) -> ()
+  // CHECK: emitrust.call_opaque "println!"() {args = []}
 
   // Width on %s and %c right-aligns by default (C's rule; Rust's string
   // formatting would left-align, so the alignment is explicit).
@@ -59,8 +64,10 @@ int main(void) {
 
 // The helper family is emitted once at module level: the bounded-%s
 // helper, then the shared integer core plus the signed and unsigned
-// wrappers.
-// CHECK: emitrust.verbatim "fn __emitrust_cstr_n(s: &[i8], n: i64) -> String
+// wrappers. Only the raw-bytes bounded helper is requested -- the Display
+// twin is unreferenced and must not be emitted (an unused helper is an
+// `unused` deny in the emitted crate).
+// CHECK: emitrust.verbatim "fn __emitrust_cstr_n_out(s: &[i8], n: i64) {
 // CHECK: emitrust.verbatim "fn __emitrust_fmt_int(neg: bool, mag: u64, base: i32, prec: i32,
 // CHECK: emitrust.verbatim "fn __emitrust_fmt_i64(x: i64, prec: i32, width: i32, flags: i32) -> String
 // CHECK-SAME: x.unsigned_abs()
