@@ -12607,6 +12607,108 @@ piece and becomes FR-45.
   generalization) cannot vouch for that fix -- held-out will be flat by
   construction, not by evidence.
 
+- [x] FR-188 (opened and LANDED 2026-09-03, found by the FR-187
+  `borrowed_box` spike): **A `std::unique_ptr` PAYLOAD PASSED BY MUTABLE
+  REFERENCE EMITTED A CRATE THAT DID NOT COMPILE -- AND, IN ONE SPELLING, ONE
+  THAT COMPILED CLEAN AND THREW THE CALLEE'S WRITE AWAY.**
+  The spike went looking for a clippy fold and found this instead. Probing
+  the space turned up THREE broken shapes where the spec described one:
+      h(*p)        with `Node &`   -> rustc E0596, unbuildable
+      hi(p->id)    with `int &`    -> rustc E0596, unbuildable
+      hi((*p).id)  with `int &`    -> **BUILT CLEAN, WRONG ANSWER**
+  The third is the one that matters. Measured: clang++ prints `id=101`, the
+  emitted crate prints `id=1`. `isStlBoxWriteExpr` recognised `*p` and the
+  ARROW member form but not the non-arrow `(*p).field`, so that spelling
+  loaded the whole payload into a staged local and handed the callee a
+  borrow of the **copy**; the write landed on the copy and was discarded.
+  **`cargo build` cannot see this**, which is exactly why the fix keys on
+  the AST place root rather than on the emitted borrow.
+  FIX: a located rejection at the `emitBorrowArgument` chokepoint, guarded by
+  `isMutParam`, over a new `matchStlBoxPayloadPlaceBase` that walks member and
+  subscript chains and accepts the non-arrow form the old predicate missed:
+      unsupported: mutable reference argument borrowed from a std::unique_ptr payload
+  Ledger tag `stl-unique-ptr-ref-argument`, REUSED rather than minted (all
+  three rows name the same future work), mirrored into `RejectionLedger.cpp`
+  and `run_realworld.py`; `--incremental` tabulates it.
+  **REJECTION, NOT WIDENING, IS RIGHT HERE**: making `h(*p)` take
+  `DerefMut::deref_mut` is driven by the CALLEE's parameter mutability, and a
+  `const Node &` parameter must keep the shared borrow. That is a separate
+  capability with its own spike; the safe failure direction meanwhile is a
+  loud located diagnostic, not a guessed borrow.
+  THE OVER-REJECTION GUARD IS THE LOAD-BEARING TEST, and it is verified
+  independently: `g(*p)` with `const Node &` and `gi(p->id)` with
+  `const int &` still IMPORT, and a by-value parameter still imports. A
+  predicate that rejected those would have cost working code to fix broken
+  code. `test/Import/Cpp/stl-unique-ptr-ref-argument.cpp` pins the import
+  side and `refargs` in `test/EndToEnd/stl-unique-ptr.cpp` pins the RUNTIME
+  side -- deliberately, because a FileCheck of the IR cannot tell a silent
+  miscompile from working code and a byte-diff can.
+  Gate 964/964; diff 207 insertions, ZERO deletions -- no oracle weakened, no
+  pinned rejection removed, no golden byte shifted.
+  EPOCH CONSEQUENCE, not a regression: `test/EndToEnd/stl-unique-ptr.cpp` is
+  in the FROZEN epoch-5 corpus, so `clippy_eval.py` now refuses with
+  `epoch-5 DRIFTED (CONTENT-CHANGED)`. That is the FR-144 freeze guard
+  working. Measured in isolation over the same 244 files: original content
+  94, new content 110 -- **the entire +16 is the ~20 corpus lines this
+  increment ADDED, and the compiler change itself is 94 -> 94 (+0)**. Epoch-5
+  must be closed and epoch-6 frozen; the numbers are not comparable across
+  that boundary.
+
+- [ ] FR-189 DEFECT (opened 2026-09-03 by FR-188, deliberately NOT fixed
+  there): **`(*p).field = v` ON A `std::unique_ptr` PAYLOAD IS A SILENT
+  MISCOMPILE TODAY, AND THE FIX IS WIDENING, NOT REJECTION.**
+  Same root cause as FR-188's third shape -- `isStlBoxWriteExpr` does not
+  recognise the non-arrow member form -- but the ASSIGNMENT spelling, which
+  FR-188's argument-side predicate does not cover. Measured: native
+  `id=6 tag=2`, emitted crate `id=0 tag=0`. Builds clean, wrong answer.
+  **It was left unfixed on purpose.** FR-188 could have rejected it in the
+  same breath, but rejection is the WRONG fix here: `p->field = v` already
+  works, so `(*p).field = v` is the identical operation spelled differently
+  and the correct repair is to teach `isStlBoxWriteExpr` the non-arrow form,
+  which KEEPS the capability. Rejecting would have bought a green gate by
+  deleting working-shaped code, and would have made the eventual widening
+  harder to justify.
+  A SECOND, INDEPENDENT DEFECT was found next to it and is also unfixed: a
+  non-arrow member READ, `constfield((*p).tag)`, does not build -- the read
+  loads the WHOLE payload out of the shared borrow, which is rustc E0507 as
+  soon as the payload is non-`Copy` (a destructor suffices). FR-188 refused
+  to pin that shape in its positive leg rather than pin something that does
+  not work.
+  Both are the FR-140/141/142/146 silent-unbuildable-or-wrong class. Neither
+  is reachable through the arrow spelling, which is why the corpus never
+  caught them.
+
+- [ ] FR-190 (opened 2026-09-03; SPIKED GO the same day): **FOLD
+  `std::ops::Deref::deref(&p)` TO `*p` AT EMISSION -- 19 WARNINGS, ZERO
+  GOLDENS MOVED, AND NO DIALECT CHANGE.**
+  Two routes were costed. **Route 2, relaxing `emitrust.deref` to take an
+  opaque receiver: NO-GO**, and for a reason worth recording because it is
+  not the obvious one. It is not a POINTEE relaxation at all but an operand-
+  KIND flip -- the Box place is `lvalue<opaque<"Box<T>">>`, not an opaque
+  value, and loading it would MOVE the box. Worse, `DerefOp::verify`'s only
+  invariant (result value type == operand pointee) **cannot be preserved**
+  for an opaque receiver: `opaque<"Box<i32>">` carries a rendered Rust type
+  STRING, not a structural pointee, so the dialect cannot know it derefs to
+  `i32`. Relaxing means deleting the check on exactly the shape that
+  motivated it. And it would erase the `emitrust.addr_of mut` that is the
+  ONLY IR record that a Box access is a mutable borrow -- read by
+  `bindingIsBorrowed` (which is what keeps a `Drop`-carrying binding out of
+  loop-body dead-store elision, the FR-105/FR-130 danger zone),
+  `isInlineNonBarrier`, and `postInitMutation`.
+  **Route 3, an emission-side fold, is GO** and strictly better: no dialect
+  change, no importer change, no new op, and `grep` finds exactly ONE test
+  pinning the spelling (`test/Import/Cpp/stl-unique-ptr.cpp`) which pins IR,
+  not Rust, so **zero goldens move**. Byte-identical to the clang native on
+  four inputs. Projects **94 -> 75 (-19)**, all 19 from one file.
+  CONSTRAINTS the implementation must carry: do NOT fold under a whole-value
+  load of a non-`Copy` payload (`*Deref::deref(&p)` can never move, `*p`
+  can -- that would turn a loud E0507 into a silent move-out that skips the
+  box's `Drop`); suppress the TEXT but keep the ops in the IR, so the three
+  analyses above still see their inputs, and do not reuse `droppedOps`
+  (gated on `isPureProducer`, which excludes both ops); fold only single-use
+  chains; do NOT fold `&*P` further to `P`; and leave the sibling
+  `Index::index` map fold alone this wave.
+
 - [x] FR-176 DEFECT (opened 2026-08-29 as FR-161 on the probe line; RENUMBERED
   2026-08-30 when the rebase onto the trunk met the trunk's own FR-161
   (FR-158 Phase 3), which is cited by commits that are already immutable

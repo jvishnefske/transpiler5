@@ -38,6 +38,10 @@
 // RUN: not emitrust-import-c %t/nsdmi-payload.cpp 2>&1 | FileCheck %s --check-prefix=NSDMI
 // RUN: not emitrust-import-c %t/reference-argument.cpp 2>&1 | FileCheck %s --check-prefix=REFARG
 // RUN: not emitrust-import-c %t/ctor-ambiguous.cpp 2>&1 | FileCheck %s --check-prefix=CTORAMBIG
+// RUN: not emitrust-import-c %t/free-ref-deref.cpp 2>&1 | FileCheck %s --check-prefix=FREEREFDEREF
+// RUN: not emitrust-import-c %t/free-ref-arrow-field.cpp 2>&1 | FileCheck %s --check-prefix=FREEREFARROW
+// RUN: not emitrust-import-c %t/free-ref-star-field.cpp 2>&1 | FileCheck %s --check-prefix=FREEREFSTAR
+// RUN: not emitrust-import-c %t/method-ref-payload-arg.cpp 2>&1 | FileCheck %s --check-prefix=METHODREFPAYLOAD
 
 // W2.21 located rejections: every construct explicitly OUT of the
 // std::unique_ptr surface this wave, plus the shapes that are out
@@ -417,3 +421,75 @@ struct R {
   ~R() {}
 };
 void use(int a) { auto p = std::make_unique<R>(a); }
+
+//--- free-ref-deref.cpp
+#include <memory>
+// FR-188. A MUTABLE reference argument bound to a std::unique_ptr payload
+// place. The payload borrow a READ takes is the SHARED
+// `Deref::deref` one (two live `&mut` borrows of one Box in one
+// expression is rustc E0499, so reads must stay shared -- see
+// stl-unique-ptr.cpp), and a `&mut` argument re-borrowed out of that
+// shared borrow is rustc E0596 "cannot borrow as mutable, as it is behind
+// a `&` reference". Before FR-188 this shape imported and emitted a crate
+// that exited 0 and did not compile, which is the FR-140/141/142/146
+// silent-unbuildable-output class this repo treats as a defect.
+//
+// It REJECTS rather than widening the borrow to `DerefMut` because the
+// callee's parameter mutability is what would have to drive that choice,
+// and the `const Node &` sibling in stl-unique-ptr-ref-argument.cpp must
+// keep the shared borrow -- so the widening is its own increment, and the
+// safe failure direction meanwhile is a located diagnostic.
+// FREEREFDEREF: free-ref-deref.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: mutable reference argument borrowed from a std::unique_ptr payload
+struct Node { int id; int tag; };
+static void h(Node &n) { n.id += 1; }
+void use(int a) { auto p = std::make_unique<Node>(); p->id = a; h(*p); }
+
+//--- free-ref-arrow-field.cpp
+#include <memory>
+// FR-188, the FIELD spelling of the same defect: `p->id` is the identical
+// shared-`Deref::deref` payload place, so a `&mut` argument out of it is
+// the same E0596. Pinned separately from the whole-payload leg above
+// because the two reach the borrow through different AST shapes (a
+// MemberExpr over the arrow operator call, versus the operator call
+// itself), and a predicate that saw only one of them would leave the
+// other silently emitting an unbuildable crate.
+// FREEREFARROW: free-ref-arrow-field.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: mutable reference argument borrowed from a std::unique_ptr payload
+struct Node { int id; int tag; };
+static void hi(int &x) { x += 1; }
+void use(int a) { auto p = std::make_unique<Node>(); p->id = a; hi(p->id); }
+
+//--- free-ref-star-field.cpp
+#include <memory>
+// FR-188, and the WORST leg of the three: `(*p).id` is a NON-arrow
+// MemberExpr whose base is the `*p` operator call, a shape the payload
+// place predicate did not recognize at all. It therefore did not even
+// produce the E0596 the two legs above do -- it loaded the whole payload
+// into a fresh staged local and borrowed a FIELD OF THE COPY, so the
+// crate BUILT CLEAN and threw the callee's write away. Measured on the
+// FR-188 repro: clang++ printed `id=101` and the emitted crate printed
+// `id=1`. That is a silent miscompile, which `cargo build` success cannot
+// see, so this leg is the reason the rejection keys on the AST place root
+// rather than on the emitted borrow.
+// FREEREFSTAR: free-ref-star-field.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: mutable reference argument borrowed from a std::unique_ptr payload
+struct Node { int id; int tag; };
+static void hi(int &x) { x += 1; }
+void use(int a) { auto p = std::make_unique<Node>(); p->id = a; hi((*p).id); }
+
+//--- method-ref-payload-arg.cpp
+#include <memory>
+// FR-188: a payload place passed by mutable reference to an ordinary
+// C++ METHOD on some other object takes the same borrow and the same
+// rejection. This is NOT the pre-existing reference-argument-to-a-
+// method-called-through-the-unique_ptr pin above (`p->into(z)`, the
+// REFARG leg): there the unique_ptr is the RECEIVER, here it is the
+// ARGUMENT, and the two must stay distinguishable because they name
+// different future work.
+// METHODREFPAYLOAD: method-ref-payload-arg.cpp:{{[0-9]+}}:{{[0-9]+}}: error: unsupported: mutable reference argument borrowed from a std::unique_ptr payload
+struct Node { int id; int tag; };
+struct Sink { int seen; void take(Node &n) { seen = n.id; } };
+void use(int a) {
+  auto p = std::make_unique<Node>();
+  p->id = a;
+  Sink s;
+  s.take(*p);
+}

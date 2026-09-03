@@ -502,6 +502,11 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("std::make_unique constructor", "stl-unique-ptr-construct"),
     ("called through a std::unique_ptr", "stl-unique-ptr-ref-argument"),
     ("called through std::make_unique", "stl-unique-ptr-ref-argument"),
+    # FR-188 shares the tag with the two rows above: all three name the same
+    # future work (the payload borrow following the callee's parameter
+    # mutability). Mirrors lib/ImportC/RejectionLedger.cpp.
+    ("mutable reference argument borrowed from a std::unique_ptr",
+     "stl-unique-ptr-ref-argument"),
     ("is not a recognized STL type", "stl-unrecognized-type"),
     ("is not a recognized STL method", "stl-unrecognized-method"),
     ("receiver is not a recognized STL", "stl-unrecognized-receiver"),

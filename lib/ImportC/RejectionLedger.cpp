@@ -431,6 +431,12 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("stl-unique-ptr-ref-argument")},
     {llvm::StringLiteral("called through std::make_unique"),
      llvm::StringLiteral("stl-unique-ptr-ref-argument")},
+    // FR-188 shares `stl-unique-ptr-ref-argument` with the two rows above
+    // rather than minting a tag: all three name the SAME future work (make
+    // the payload borrow follow the callee's parameter mutability), so
+    // splitting them would split one backlog item's ranking signal in two.
+    {llvm::StringLiteral("mutable reference argument borrowed from a std::unique_ptr"),
+     llvm::StringLiteral("stl-unique-ptr-ref-argument")},
     {llvm::StringLiteral("is not a recognized STL type"),
      llvm::StringLiteral("stl-unrecognized-type")},
     {llvm::StringLiteral("is not a recognized STL method"),
