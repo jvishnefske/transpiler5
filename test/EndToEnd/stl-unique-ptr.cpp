@@ -41,6 +41,17 @@
 //  - A CLASS-TEMPLATE payload (W2.16) must box the MONOMORPHIZED struct
 //    name, and a POD payload with no constructor at all must
 //    value-initialize to zero exactly as `new T()` does.
+//  - FR-188 REFERENCE ARGUMENTS out of the payload. `refargs` is the
+//    RUNTIME half of the over-rejection guard in
+//    test/Import/Cpp/stl-unique-ptr-ref-argument.cpp: a `const T &`
+//    parameter is faithfully served by the SHARED payload borrow, and a
+//    by-value parameter by a load, so both must keep importing AND keep
+//    printing what clang++ prints. The MUTABLE sibling (`h(*p)`) is a
+//    located rejection instead, because the shared borrow cannot satisfy
+//    it -- it emitted rustc E0596, or, for `(*p).field`, a crate that
+//    built clean and threw the callee's write away. A FileCheck of the IR
+//    cannot tell those two apart from working code; this diff can, which
+//    is why the positive legs live here and not only in the golden.
 //
 // Every value derives from argc, so no constant folding can pre-compute
 // the answers and hide a miscompile behind a compile-clean crate. argv is
@@ -76,6 +87,17 @@ struct Pod {
   int a;
   int b;
 };
+
+// FR-188 callees. `constsum`/`constfield` take SHARED references, which
+// the payload's shared borrow serves directly; `byvalsum` takes a
+// payload by value, which is a load and no borrow at all (a POD payload,
+// so the copy brings no destructor timing of its own into the diff).
+// Their mutable sibling `void h(Node &)` is a located rejection and so
+// cannot appear in a byte-diff test -- its pin is in
+// test/Import/Cpp/stl-unique-ptr-invalid.cpp.
+static int constsum(const Node &n) { return n.id * 2 + n.tag; }
+static int constfield(const int &x) { return x + 3; }
+static int byvalsum(Pod q) { return q.a + q.b * 5; }
 
 // Scalar payloads: read, compound write, whole write, and the
 // value-initializing zero-argument make_unique.
@@ -153,12 +175,46 @@ static int hold(int seed) {
   return first->get() + second->get();
 }
 
+// FR-188: the shapes that must SURVIVE the mutable-reference-argument
+// rejection. Every one of these reads the payload through the shared
+// `Deref::deref` borrow, which is exactly what `const T &` and a
+// by-value parameter mean, so the values printed here must match clang++
+// exactly. `seed` reaches every one of them, so nothing folds.
+//
+// The `(*p).field` READ spelling is deliberately absent: it is a
+// SEPARATE, pre-existing defect that FR-188 diagnosed but does not fix.
+// Because no payload-place predicate recognized the non-arrow member
+// form, `(*p).tag` loads the WHOLE payload out of the shared borrow into
+// a staged local before projecting, which is rustc E0507 the moment the
+// payload is not `Copy` (a user destructor is enough). Adding it here
+// would pin a shape that does not build. Its mutable-argument sibling IS
+// fixed here, by rejection, in stl-unique-ptr-invalid.cpp's
+// free-ref-star-field leg -- that one built clean and silently discarded
+// the callee's write, which is the worse failure and the one that could
+// not be left alone.
+static int refargs(int seed) {
+  auto p = std::make_unique<Node>(seed + 60, seed + 61);
+  printf("refargs const=%d\n", constsum(*p));
+  printf("refargs field=%d\n", constfield(p->id));
+  printf("refargs tagfield=%d\n", constfield(p->tag));
+  auto q = std::make_unique<Pod>();
+  q->a = seed + 62;
+  q->b = seed + 63;
+  printf("refargs byval=%d\n", byvalsum(*q));
+  auto s = std::make_unique<int>(seed + 70);
+  printf("refargs scalar=%d\n", constfield(*s));
+  printf("refargs untouched=%d,%d,%d,%d\n", p->id, p->tag, q->a, q->b);
+  printf("before refargs end\n");
+  return constsum(*p) + byvalsum(*q) + *s;
+}
+
 int main(int argc, char **) {
   printf("scalars=%d\n", scalars(argc));
   printf("pod=%d\n", pod(argc));
   printf("templated=%d\n", templated(argc));
   printf("timing=%d\n", timing(argc));
   printf("hold=%d\n", hold(argc));
+  printf("refargs=%d\n", refargs(argc));
   printf("main end\n");
   return 0;
 }

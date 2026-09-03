@@ -3255,6 +3255,15 @@ private:
   /// it before deciding which lowering to take.
   const clang::Expr *matchStlBoxDerefBase(const clang::Expr *expr);
 
+  /// FR-188: the `p` sub-expression of the recognized `std::unique_ptr`
+  /// whose PAYLOAD the place `expr` designates, or null. Unlike
+  /// `isStlBoxWriteExpr` this walks the whole member/subscript projection
+  /// chain and accepts the NON-arrow spelling `(*p).field` as well as
+  /// `p->field` and the bare `*p`, because all three resolve to the same
+  /// payload borrow and the argument rejection keyed on it must not have
+  /// a spelling-shaped hole. A purely AST-side probe; emits no IR.
+  const clang::Expr *matchStlBoxPayloadPlaceBase(const clang::Expr *expr);
+
   /// W2.21: a `&Box<T>` / `&mut Box<T>` borrow forwarded through
   /// `Deref::deref` / `DerefMut::deref_mut`, yielding a reference to the
   /// PAYLOAD. The UFCS free-call spelling is `emitStlMapEntryPlace`'s

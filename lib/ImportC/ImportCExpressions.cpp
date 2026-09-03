@@ -3974,6 +3974,33 @@ const clang::Expr *CImporter::matchStlBoxDerefBase(const clang::Expr *expr) {
   return base;
 }
 
+const clang::Expr *
+CImporter::matchStlBoxPayloadPlaceBase(const clang::Expr *expr) {
+  // FR-188. `isStlBoxWriteExpr` above answers the same question for the
+  // ASSIGNMENT positions and stops at one level (`*p` or an ARROW
+  // MemberExpr over it); this walks the projection chain instead, so
+  // `(*p).field`, `p->a.b` and `(*p).arr[i]` all report the payload they
+  // are carved out of. The distinction is load-bearing rather than
+  // cosmetic: `(*p).field` was the spelling whose missing recognition
+  // made a mutable reference argument load the payload into a staged
+  // local and borrow a field of the COPY, so the crate built clean and
+  // discarded the callee's write.
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  while (true) {
+    if (const clang::Expr *base = matchStlBoxDerefBase(e))
+      return base;
+    if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e)) {
+      e = member->getBase()->IgnoreParenImpCasts();
+      continue;
+    }
+    if (const auto *subscript = llvm::dyn_cast<clang::ArraySubscriptExpr>(e)) {
+      e = subscript->getBase()->IgnoreParenImpCasts();
+      continue;
+    }
+    return nullptr;
+  }
+}
+
 bool CImporter::isStlBoxWriteExpr(const clang::Expr *expr) {
   const clang::Expr *e = expr->IgnoreParens();
   if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e);
@@ -6107,6 +6134,34 @@ FailureOr<Value> CImporter::emitBorrowArgument(
           .create<emitrust::AddrOfOp>(loc, paramType, staged, isMutParam)
           .getResult();
     }
+    // FR-188: a MUTABLE reference argument carved out of a
+    // `std::unique_ptr` payload. A payload place is reached through a
+    // borrow of the Box, and a READ takes the SHARED `Deref::deref` one
+    // on purpose -- two live `&mut` borrows of one Box in a single
+    // expression is rustc E0499, so `printf("%d %d", p->a, p->b)` forces
+    // reads to be shared. A `&mut` argument re-borrowed out of that
+    // shared borrow is then rustc E0596 ("cannot borrow as mutable, as it
+    // is behind a `&` reference"), and for the `(*p).field` spelling --
+    // which no payload-place predicate recognized before this one -- it
+    // was worse than unbuildable: the payload was loaded into a staged
+    // local and a field of the COPY was borrowed, so the crate built
+    // clean and threw the callee's write away (measured: clang++ printed
+    // `id=101`, the emitted crate `id=1`).
+    //
+    // It REJECTS rather than taking `DerefMut::deref_mut` here because
+    // the choice is driven by the CALLEE's parameter mutability, which is
+    // exactly what a `const Node &` parameter must NOT trigger -- the
+    // shared borrow is the faithful image for it, and over-widening would
+    // turn working code into E0499. Making the borrow follow the
+    // parameter is its own increment; the safe failure direction
+    // meanwhile is this located diagnostic. The positive siblings that
+    // must keep importing are pinned in
+    // test/Import/Cpp/stl-unique-ptr-ref-argument.cpp and built by
+    // test/EndToEnd/stl-unique-ptr.cpp's `refargs`.
+    if (isMutParam && matchStlBoxPayloadPlaceBase(placeExpr))
+      return emitError(loc)
+             << "unsupported: mutable reference argument borrowed from a "
+                "std::unique_ptr payload";
     const clang::VarDecl *localRoot = placeExprRoot(placeExpr);
     if (localRoot && !localRoot->hasLocalStorage())
       return rejectGlobalPointerArgument(loc, localRoot);
