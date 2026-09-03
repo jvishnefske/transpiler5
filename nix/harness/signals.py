@@ -12,7 +12,7 @@ output and prints a stable ranked JSON queue.
   correctness   nix/explore/explore.py --json              CRASH / HANG /
                                                            MISCOMPILE (bugs);
                                                            REJECT tags (demand)
-  quality       nix/clippy-eval/clippy-baseline-epoch5.json ranked by_lint debt
+  quality       nix/clippy-eval/clippy-baseline-epoch6.json ranked by_lint debt
   demand        REJECT tags (explore) + RealWorld blockers  unsupported
                                                            constructs
 
@@ -53,7 +53,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # controller.CLIPPY_BASELINE -- the controller `--update`s and COMMITS that
 # path, so a divergence would rank debt from a document nothing measures.
 DEFAULT_CLIPPY = os.path.join(HERE, "..", "clippy-eval",
-                              "clippy-baseline-epoch5.json")
+                              "clippy-baseline-epoch6.json")
 
 # Off-limits without a human + a new idea (CLAUDE.md, LOOP.md). needless_late_init
 # folds a decl into its initializer -- a liveness change; cross-iteration loop

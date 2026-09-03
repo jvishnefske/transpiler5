@@ -12708,6 +12708,44 @@ piece and becomes FR-45.
   (gated on `isPureProducer`, which excludes both ops); fold only single-use
   chains; do NOT fold `&*P` further to `P`; and leave the sibling
   `Index::index` map fold alone this wave.
+  **EPOCH-6 FROZEN 2026-09-03, and the freeze itself nearly went wrong.**
+  FR-188 edited a pinned EndToEnd test, so the FR-144 drift guard fired and
+  forced the transition. Epoch-5 CLOSED with both drifted files recorded and
+  blamed (`stl-unique-ptr.cpp` by FR-188; `cpp-inheritance.cpp` by FR-185's
+  comment fix, deliberately deferred to exactly this moment).
+  **THE TRAP: `controller.py freeze` SILENTLY PINS `.c` ONLY.** Its argparse
+  exposes no `--ext` and no `--exclude`, and `epoch.freeze` defaults
+  `exts=(".c",)`, so `controller.py freeze --id 6 --corpus test/EndToEnd`
+  produced a 223-file epoch with NO exclusion list -- from a corpus of 298,
+  where epoch-5 had 244 -- and reported success. Establishing a champion on
+  it would have measured every later ratchet over the wrong population: the
+  precise failure FR-144 exists to prevent, reintroduced by TOOLING rather
+  than by drift, and invisible unless the file count is checked against the
+  corpus. The correct entry point is `epoch.py freeze`, which has both flags.
+  **`controller.py`'s wrapper should either forward `--ext`/`--exclude` or
+  refuse a multi-extension corpus; as it stands it is a loaded gun.**
+  Recorded rather than fixed here -- harness code, not emitter code, and it
+  deserves its own increment.
+  Redone correctly: measurability RE-PROBED over all 298 files with
+  `clippy_eval.crate_lints` (measurable only if a crate is emitted AND clippy
+  yields a complete tally) -> **268 measurable, 30 unmeasurable**; every one
+  of epoch-5's 20 exclusions is still excluded and the 10 additions are tests
+  added since. Frozen 268 (+30), split 201 train / 67 held-out. Champion
+  established: train 109 + held-out 23 = **132**, `unsafe=0`, 268 crates,
+  **0 skipped** -- the exclusion list is exactly right.
+  **132 IS NOT A REGRESSION FROM 94 AND THE TWO ARE NOT A TRAJECTORY**: the
+  population grew 244 -> 268, and the compiler change across the boundary was
+  separately measured NEUTRAL (94 -> 94 on the frozen epoch-5 population).
+  All THREE baseline consumers were repointed together -- `clippy_eval.py`'s
+  `DEFAULT_BASELINE`, `signals.py`'s `DEFAULT_CLIPPY`, `controller.py`'s
+  `CLIPPY_BASELINE` -- because the file's own comment warns that if they
+  diverge "the controller commits a file the ratchet never reads"; verified
+  afterwards that all three, the champion and the epoch document agree on one
+  `corpus_hash`.
+  NEW QUEUE at epoch-6: `needless_late_init` 60 (off-limits), `borrowed_box`
+  **31** (was 19 -- FR-190's fold is worth MORE now, not less),
+  `bool_comparison` 7 (new), `borrow_deref_ref` 6, `approx_constant` 5,
+  `if_same_then_else` 4.
 
 - [x] FR-176 DEFECT (opened 2026-08-29 as FR-161 on the probe line; RENUMBERED
   2026-08-30 when the rebase onto the trunk met the trunk's own FR-161

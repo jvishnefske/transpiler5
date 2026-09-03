@@ -1,0 +1,48 @@
+# epoch-6 EXCLUSIONS -- files that are UNMEASURABLE at emitter rev a69b8eb.
+#
+# Criterion (epoch.py module docstring, unchanged from epoch-4/5): a file is
+# measurable only if (a) `emitrust-cc --emit=crate` produces a crate AND
+# (b) `cargo clippy` on that crate yields a COMPLETE tally -- it may fail on a
+# deny-by-default clippy lint (that failure IS the tally) but must not fail on
+# a rustc error, which truncates the count. Every path below fails step (a),
+# so no crate exists for clippy to lint and the epoch's metric is undefined
+# for it; clippy_eval would silently skip it anyway. Each is a LOCATED
+# `error: unsupported:` rejection (or a split-file lit test that is not a
+# standalone TU) -- the designed behaviour, not a crash.
+#
+# RE-PROBED AT a69b8eb over all 298 test/EndToEnd {.c,.cpp} files, not copied
+# from epoch-5: 268 measurable, 30 unmeasurable. Every one of epoch-5's 20
+# exclusions is still excluded (0 became measurable); the 10 additions are
+# EndToEnd tests added since the epoch-5 freeze, plus the split-file legs
+# FR-188 introduced. The corpus GREW 244 -> 268, so epoch-6 totals are NOT
+# comparable to epoch-5's 94 -- that boundary is why epoch-5 was closed.
+test/EndToEnd/actor-link-lift.c
+test/EndToEnd/actor-partition-lift.c
+test/EndToEnd/cpp-cross-tu-record-odr.cpp
+test/EndToEnd/fnptr-extern-def.c
+test/EndToEnd/fnptr-undefined-recover.c
+test/EndToEnd/incremental-builds.cpp
+test/EndToEnd/incremental-leaked-stub-containment.cpp
+test/EndToEnd/link-fnptr-table-order-e2e.c
+test/EndToEnd/link-merge-e2e.c
+test/EndToEnd/link-module-sink-e2e.c
+test/EndToEnd/link-module-sink-name-e2e.c
+test/EndToEnd/link-module-sink-root-type-e2e.c
+test/EndToEnd/link-orphan-extern-global-e2e.c
+test/EndToEnd/link-reimport-e2e.c
+test/EndToEnd/link-slice-model-e2e.c
+test/EndToEnd/link-slice-order-e2e.c
+test/EndToEnd/link-slice-out-param-e2e.c
+test/EndToEnd/link-workspace-cycle-e2e.c
+test/EndToEnd/link-workspace-e2e.c
+test/EndToEnd/multi-tu-gate-g1-fnptr-result-erasure.c
+test/EndToEnd/multi-tu-gate-g3-owner-fallback.c
+test/EndToEnd/multi-tu-gate-g5-region-api.c
+test/EndToEnd/multi-tu-gate-g6-cellslice-fn-external.c
+test/EndToEnd/multi-tu-gate-g8-ptr-global-external.c
+test/EndToEnd/multi-tu-gate-g8-shared-header.c
+test/EndToEnd/multi-tu.c
+test/EndToEnd/planner-rejection-builds.c
+test/EndToEnd/recover-partial.cpp
+test/EndToEnd/rust-module-fnptr-e2e.c
+test/EndToEnd/test-entry-partition.c

@@ -55,15 +55,19 @@ import epoch as epoch_mod  # noqa: E402  (the epoch/drift authority is shared)
 
 EMITRUST_CC = os.environ.get("EMITRUST_CC", "./build/tools/emitrust-cc")
 
-# The authoritative ratchet baseline. Pinned to epoch-5 (the union corpus
-# test/EndToEnd x {.c,.cpp}, measurability-filtered, re-probed at f734fed).
-# Epoch-4 was CLOSED when FR-61f-c legitimately edited a pinned EndToEnd test;
-# its baseline document stays byte-untouched as history and the two totals are
-# NOT a trajectory (different populations). THREE consumers must
+# The authoritative ratchet baseline. Pinned to epoch-6 (the union corpus
+# test/EndToEnd x {.c,.cpp}, measurability-filtered, re-probed at the FR-188
+# rev: 268 files, 30 exclusions).
+# Epoch-5 was CLOSED when FR-188 legitimately edited a pinned EndToEnd test
+# (stl-unique-ptr.cpp) and FR-185's deferred comment fix touched another
+# (cpp-inheritance.cpp); like epoch-4 before it, its baseline document stays
+# byte-untouched as history and the totals are NOT a trajectory (the
+# population grew 244 -> 268, and the compiler change across the boundary was
+# separately measured NEUTRAL). THREE consumers must
 # name this same document -- this default, signals.py's DEFAULT_CLIPPY, and
 # controller.py's CLIPPY_BASELINE, which `--update`s and COMMITS it. If they
 # diverge, the controller commits a file the ratchet never reads.
-DEFAULT_BASELINE = os.path.join(HERE, "clippy-baseline-epoch5.json")
+DEFAULT_BASELINE = os.path.join(HERE, "clippy-baseline-epoch6.json")
 
 
 class PinError(Exception):

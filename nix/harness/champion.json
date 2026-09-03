@@ -1,34 +1,37 @@
 {
-  "epoch_id": 5,
+  "epoch_id": 6,
   "corpus_root": "test/EndToEnd",
-  "corpus_hash": "sha256:132e5e39cd833549b525da00a926215f3b12c9a039ad179dda87962b4f206726",
-  "emitter_rev": "6100471ed1d30612aea635f09e498d98340a82f9",
+  "corpus_hash": "sha256:5e1c3576c3377f0892e068ec4be3d30ee1dc6fb1ab5dd33d72f993a2ac1671f5",
+  "emitter_rev": "a69b8eb635bc8177a9db7d90e0790d80d0734466",
   "train": {
-    "total_warnings": 72,
+    "total_warnings": 109,
     "by_lint": {
-      "clippy::needless_late_init": 31,
-      "clippy::borrowed_box": 19,
-      "clippy::approx_constant": 5,
+      "clippy::needless_late_init": 43,
+      "clippy::borrowed_box": 31,
+      "clippy::bool_comparison": 7,
+      "clippy::borrow_deref_ref": 6,
       "clippy::if_same_then_else": 4,
-      "clippy::borrow_deref_ref": 3,
+      "clippy::approx_constant": 4,
       "clippy::needless_else": 3,
       "clippy::manual_range_contains": 2,
+      "clippy::type_complexity": 2,
+      "clippy::single_match": 1,
+      "clippy::too_many_arguments": 1,
       "clippy::field_reassign_with_default": 1,
       "clippy::manual_swap": 1,
-      "clippy::unnecessary_literal_unwrap": 1,
       "clippy::collapsible_if": 1,
+      "clippy::useless_format": 1,
       "clippy::assign_op_pattern": 1
     }
   },
   "held_out": {
-    "total_warnings": 22,
+    "total_warnings": 23,
     "by_lint": {
-      "clippy::needless_late_init": 15,
-      "clippy::single_match": 2,
+      "clippy::needless_late_init": 17,
+      "clippy::unnecessary_literal_unwrap": 2,
       "clippy::type_complexity": 2,
-      "clippy::too_many_arguments": 1,
-      "clippy::unnecessary_literal_unwrap": 1,
-      "clippy::useless_format": 1
+      "clippy::single_match": 1,
+      "clippy::approx_constant": 1
     }
   },
   "allow_lines": [
