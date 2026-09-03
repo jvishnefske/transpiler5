@@ -386,12 +386,23 @@ anchor = "FR-182 (opened and LANDED 2026-08-31 on the FR-181 spike's"
 id = "FR-183"
 rank = 8
 kind = "feature"
-status = "open"
+status = "spiked"
 size = "L"
 title = "After the export work the biggest TRACTOR lever is standard input, and it has no dlsym conflict"
 summary = "NOT SPIKED beyond this ranking. Measured with the FR-178 instrument: per-case blocker SETS over the 83 non-SPHINCS EMIT_FAILs, cross-tabbed with case KIND, then a greedy marginal-yield curve over the EXEC cases ONLY -- because an exec case needs no exported symbol, so for it a cleared emit set really IS a PASS. 77 of 83 measured; blocker-set sizes {0:3, 1:45, 2:28, 3:1}. Exec curve: +1 variadic call = 9, +2 FILE* stream argument = 13, +3 address-of-scalar-string-region = 16, +4 pointer-has-no-known-target = 18, +5 CStyleCastExpr = 20, +6 pointer-assigned-non-address = 22. THE FIRST TWO STEPS ARE ONE CAPABILITY, costed before ranking: the variadic blocker here is NOT printf (every hosted output variadic is already name-intercepted) but scanf/fscanf, and the FILE* blocker is stdin reaching emitFileHandleArg (ImportCHosted.cpp:130), which admits only an fopen-created function-local handle. There is no scanf, getchar or stdin recognition anywhere in lib/. The corpus really drives it: an exec vector is literally {\"argv\": [], \"stdin\": \"0\\n0\"}. So modelling standard input is worth 13 of the 34 exec cases with ZERO interaction with FR-139 or the dlsym stage. A second input capability sits beside it: 5 exec cases refused at main's argv -- but that is a FIRST-FAILURE number and therefore a CEILING, not a yield, because argv is rejected at signature import so --recover never walks the body and the rest of each blocker set is invisible until argv lands. argv machinery largely exists (argv_table type, argv_arg op, process wrapper, EndToEnd/argv-echo.c differential); the gap is the admission grammar argvUseAdmitted plus a bridge into emitCharRegionArg. TAKEN TOGETHER the exec half is gated on how a program receives its input, not on the pointer model that dominates the lib half. CAUTION: scanf is a PARSER whose failure modes C programs routinely ignore; a rendering that silently diverges on malformed input is the miscompile class this repo forbids, and the vectors are adversarial. Needs a real spike with a differential over malformed input."
 blocked_by = []
 anchor = "FR-183 (opened 2026-08-31 by the FR-182 wait, measured with the FR-178"
+
+[[items]]
+id = "FR-191"
+rank = 5
+kind = "defect"
+status = "open"
+size = "S"
+title = "printf(\"%s\") of a char buffer with a byte >= 0x80 emits UTF-8-expanded output -- a live miscompile, and the fix already exists"
+summary = "Opened 2026-09-03 by the FR-183 stdin spike, which found it while building its own oracle. Reproduced with fopen+fgets+printf(\"%s\") alone, no new feature needed: native ff fe 81 7a 0a 0a, emitted c3 bf c3 be c2 81 7a 0a 0a. Root cause is the __emitrust_cstr Latin-1 Display funnel (ImportCFunctions.cpp:2929) -- every byte renders as a char, so anything above 0x7f becomes two UTF-8 bytes. THE FIX ALREADY EXISTS AND IS GATED TOO NARROWLY: the raw-bytes bypass __emitrust_cstr_out (ImportCFunctions.cpp:2951) does the right thing but its use site is guarded by matchArgvWholeSubscript (ImportCStatements.cpp:8090) -- argv only. Widening that guard to any whole-char-buffer %s argument is the repair. It masked 484 of the spike fuzz cases until the probe switched to raw-byte comparison, which is the tell: a Latin-1 round-trip looks right in a terminal and only a byte-diff catches it; the corpus never caught it because every EndToEnd %s payload is ASCII. Orthogonal to FR-183 and does not gate its GO, but stdin widens the reachable set enormously (002/009/017/028/029 all pipe arbitrary bytes into a char buffer), so land it before or alongside. Second, minor, pre-existing: emitted println! line-flushes where C stdio block-buffers on a pipe -- 46x slowdown measured on an 8.2M-line run with md5-identical output, a latent HARNESS_ERROR timeout source."
+blocked_by = []
+anchor = "FR-191 DEFECT (opened 2026-09-03 by the FR-183 stdin spike, which found"
 
 [[items]]
 id = "FR-184"
