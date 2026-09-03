@@ -7458,10 +7458,22 @@ CImporter::emitAliasedPrintf(const clang::CallExpr *call,
            << "unsupported: printf format must be an ordinary string literal";
 
   SmallVector<Value> operands;
+  // FR-191: both routings this function serves — a printf ALIAS and the
+  // `fprintf(stdout, ...)` stdout swallow above — end in the very same
+  // buffered-stdout `print!` as `emitPrintf`, so a `%s` over a char region
+  // takes the same raw-bytes bypass here. (An alias whose target is not
+  // printf-shaped never reaches this point: its argument 0 is not an
+  // ordinary string literal and the check above rejects it.)
+  bool rawBypassed = false;
   FailureOr<std::string> rustFormat = translatePrintfFormat(
-      loc, call, literal, /*firstArgIndex=*/formatIndex + 1, operands);
+      loc, call, literal, /*firstArgIndex=*/formatIndex + 1, operands,
+      /*allowRawBypass=*/true, &rawBypassed);
   if (failed(rustFormat))
     return failure();
+
+  // A trailing bypass consumed the whole format tail: no residual segment.
+  if (rawBypassed && rustFormat->empty() && operands.empty())
+    return success();
 
   emitPrintMacro(loc, *rustFormat, operands);
   return success();
@@ -7478,19 +7490,20 @@ LogicalResult CImporter::emitPrintf(const clang::CallExpr *call) {
            << "unsupported: printf format must be an ordinary string literal";
 
   SmallVector<Value> operands;
-  // C99-43 C3: the stdout `print!` context is the only caller that permits an
-  // argv-fed `%s`/`%c` hole to bypass the Latin-1 Display funnels — the
-  // format is split into segments around the raw `*_out` helper calls.
-  bool argvBypassed = false;
+  // C99-43 C3 / FR-191: the stdout `print!` contexts are the only callers
+  // that permit a `%s`/`%c` hole over a raw byte run (an argv argument, a
+  // char region) to bypass the Latin-1 Display funnels — the format is
+  // split into segments around the raw `*_out` helper calls.
+  bool rawBypassed = false;
   FailureOr<std::string> rustFormat = translatePrintfFormat(
       loc, call, literal, /*firstArgIndex=*/1, operands,
-      /*allowArgvBypass=*/true, &argvBypassed);
+      /*allowRawBypass=*/true, &rawBypassed);
   if (failed(rustFormat))
     return failure();
 
   // When a trailing bypass consumed the whole format tail, there is no
   // residual segment to print; emitting `print!("")` would be dead output.
-  if (argvBypassed && rustFormat->empty() && operands.empty())
+  if (rawBypassed && rustFormat->empty() && operands.empty())
     return success();
 
   emitPrintMacro(loc, *rustFormat, operands);
@@ -7835,8 +7848,8 @@ CImporter::emitOstreamChain(const clang::CXXOperatorCallExpr *call) {
 FailureOr<std::string> CImporter::translatePrintfFormat(
     Location loc, const clang::CallExpr *call,
     const clang::StringLiteral *literal, unsigned firstArgIndex,
-    SmallVectorImpl<Value> &operands, bool allowArgvBypass,
-    bool *argvBypassed) {
+    SmallVectorImpl<Value> &operands, bool allowRawBypass,
+    bool *rawBypassed) {
   // Translate the C format string into a Rust format string. The literal's
   // bytes already have C escapes decoded (a "\n" is a real newline byte);
   // the StringAttr printer re-escapes them for the textual assembly.
@@ -8086,11 +8099,11 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
     // funnels (whose byte-to-char widening double-encodes non-ASCII argument
     // bytes) by flushing the pending format segment and writing the raw bytes
     // through the on-demand `*_out` helpers on the same buffered stdout handle.
-    if (allowArgvBypass && mainArgvTableValue) {
+    if (allowRawBypass && mainArgvTableValue) {
       if (spec == 's') {
         if (const clang::Expr *idxExpr = matchArgvWholeSubscript(argExpr)) {
-          if (argvBypassed)
-            *argvBypassed = true;
+          if (rawBypassed)
+            *rawBypassed = true;
           flushSegment();
           FailureOr<Value> slice = emitArgvArgSlice(loc, idxExpr);
           if (failed(slice))
@@ -8115,8 +8128,8 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
         }
       } else if (spec == 'c') {
         if (const clang::ArraySubscriptExpr *byte = matchArgvByteRead(argExpr)) {
-          if (argvBypassed)
-            *argvBypassed = true;
+          if (rawBypassed)
+            *rawBypassed = true;
           flushSegment();
           FailureOr<Value> place = emitArgvByteLValue(byte, loc);
           if (failed(place))
@@ -8136,9 +8149,55 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       std::optional<unsigned> stringPrecision;
       if (precision >= 0)
         stringPrecision = static_cast<unsigned>(precision);
-      FailureOr<Value> text = emitPrintfStringArg(argExpr, stringPrecision);
+      // FR-191: in a stdout `print!` context a `%s` over a char REGION
+      // prints its raw bytes, bypassing the `__emitrust_cstr` Latin-1
+      // Display funnel whose per-byte `u8 as char` widening re-encodes
+      // every byte >= 0x80 as TWO UTF-8 bytes (a measured miscompile:
+      // native `ff fe 81 7a` vs emitted `c3 bf c3 be c2 81 7a`). Two
+      // restrictions keep it byte-exact:
+      //   * a FIELD WIDTH pads to a byte count only the formatter knows,
+      //     and the raw write cannot pad — the same restriction the argv
+      //     planner already applies (`admittedPrintfStringArg`);
+      //   * flushing the pending segment moves this call's output BEFORE
+      //     the evaluation of the arguments still to come, where C
+      //     evaluates every argument before printf writes anything. A
+      //     later argument with side effects (it could write the very
+      //     buffer being printed) therefore declines the bypass.
+      // The argument is materialized either way — the ops are identical,
+      // only the wrapping differs — so nothing is evaluated twice and the
+      // C argument order is preserved.
+      bool wantRawBytes = allowRawBypass && width.empty();
+      if (wantRawBytes)
+        for (unsigned k = argIndex, e = call->getNumArgs(); k < e; ++k)
+          if (call->getArg(k)->HasSideEffects(astContext()))
+            wantRawBytes = false;
+      bool rawByteSlice = false;
+      FailureOr<Value> text = emitPrintfStringArg(
+          argExpr, stringPrecision, wantRawBytes ? &rawByteSlice : nullptr);
       if (failed(text))
         return failure();
+      if (rawByteSlice) {
+        if (rawBypassed)
+          *rawBypassed = true;
+        flushSegment();
+        if (stringPrecision) {
+          // `%.Ns`: at most N raw bytes, stopping earlier at a NUL.
+          needsCStrNOutHelper = true;
+          Value count =
+              createIntConstant(loc, builder.getIntegerType(64),
+                                static_cast<int64_t>(*stringPrecision));
+          builder.create<emitrust::CallOpaqueOp>(
+              loc, TypeRange(),
+              builder.getStringAttr("__emitrust_cstr_n_out"),
+              /*args=*/ArrayAttr(), ValueRange{*text, count});
+        } else {
+          needsCStrOutHelper = true;
+          builder.create<emitrust::CallOpaqueOp>(
+              loc, TypeRange(), builder.getStringAttr("__emitrust_cstr_out"),
+              /*args=*/ArrayAttr(), ValueRange{*text});
+        }
+        continue;
+      }
       operands.push_back(*text);
       rustFormat += textPlaceholder();
       continue;
@@ -8456,7 +8515,8 @@ static const clang::Expr *matchStlCStrCall(const clang::Expr *expr) {
 
 FailureOr<Value>
 CImporter::emitPrintfStringArg(const clang::Expr *expr,
-                               std::optional<unsigned> precision) {
+                               std::optional<unsigned> precision,
+                               bool *rawByteSlice) {
   // The array-to-pointer decay wrapping both supported shapes is implicit;
   // strip it (and parentheses) to see the underlying literal or lvalue.
   // A `__func__`-family predefined identifier prints its function-name
@@ -8524,6 +8584,21 @@ CImporter::emitPrintfStringArg(const clang::Expr *expr,
   // NUL, whichever comes first; C99 7.19.6.1p8 allows the array to lack a
   // terminator when the precision bounds the read).
   auto wrapCStr = [&](Location loc, Value slice) -> Value {
+    // FR-191: a caller that can consume RAW BYTES (a stdout `print!`
+    // position) takes the `&[i8]` unwrapped — the Latin-1 `u8 as char`
+    // widening inside these helpers re-encodes every byte >= 0x80 as two
+    // UTF-8 bytes, which is a miscompile against C's single byte. The
+    // element-type test is what makes the handoff sound: the raw `*_out`
+    // helpers are pinned to `&[i8]`, so any other element type keeps the
+    // Display funnel rather than being mistyped at the call.
+    if (rawByteSlice)
+      if (auto refType = llvm::dyn_cast<emitrust::RefType>(slice.getType()))
+        if (auto sliceType =
+                llvm::dyn_cast<emitrust::SliceType>(refType.getPointee()))
+          if (sliceType.getElementType() == builder.getIntegerType(8)) {
+            *rawByteSlice = true;
+            return slice;
+          }
     auto stringType =
         emitrust::OpaqueType::get(builder.getContext(), "String");
     if (precision) {
@@ -8700,11 +8775,31 @@ LogicalResult CImporter::emitPuts(const clang::CallExpr *call) {
   if (call->getNumArgs() != 1)
     return emitError(loc) << "unsupported: puts requires exactly one argument";
   // C's puts writes the string then a newline; println! of the %s-shaped
-  // value matches byte-for-byte (both supported shapes reject the bytes
-  // Rust could not reproduce).
-  FailureOr<Value> text = emitPrintfStringArg(call->getArg(0));
+  // value matches byte-for-byte.
+  //
+  // FR-191: `puts` is the SAME stdout position as a bare `printf("%s\n")`
+  // and had the same defect — a char region routed through the Latin-1
+  // `__emitrust_cstr` Display funnel prints two UTF-8 bytes for every byte
+  // >= 0x80 where C writes one. A region argument therefore writes its raw
+  // bytes and then the bare `println!()` that supplies puts' newline; there
+  // is no format hole and no later argument, so no ordering question
+  // arises. The shapes that never reached the funnel (a string literal, an
+  // FR-64 lifted `String`) keep the single `println!("{}", s)`.
+  bool rawByteSlice = false;
+  FailureOr<Value> text =
+      emitPrintfStringArg(call->getArg(0), std::nullopt, &rawByteSlice);
   if (failed(text))
     return failure();
+  if (rawByteSlice) {
+    needsCStrOutHelper = true;
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(), builder.getStringAttr("__emitrust_cstr_out"),
+        /*args=*/ArrayAttr(), ValueRange{*text});
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(), builder.getStringAttr("println!"),
+        builder.getArrayAttr({}), ValueRange());
+    return success();
+  }
   builder.create<emitrust::CallOpaqueOp>(
       loc, TypeRange(), builder.getStringAttr("println!"),
       builder.getArrayAttr(

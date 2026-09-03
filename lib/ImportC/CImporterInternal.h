@@ -5309,28 +5309,40 @@ private:
   /// unknown conversions keep their located rejections here so every
   /// caller enforces the same subset. Fails if `call` supplies too few or
   /// too many arguments for the directives.
-  /// C99-43 C3: with `allowArgvBypass` set (the stdout `print!` context
-  /// only — `emitPrintf`), an argv-fed `%s`/`%c` hole BYPASSES the
+  /// C99-43 C3, widened by FR-191: with `allowRawBypass` set (the stdout
+  /// `print!` contexts — `emitPrintf` and `emitAliasedPrintf`'s
+  /// printf-alias/`fprintf(stdout, ...)` routing), a `%s`/`%c` hole whose
+  /// argument designates a RAW BYTE RUN bypasses the
   /// `__emitrust_cstr`/`__emitrust_fmt_c` Display funnels, whose Latin-1
-  /// byte-to-char widening would double-encode any non-ASCII argument
-  /// byte: the pending format segment is flushed as its own `print!`
-  /// call, the hole renders through the raw on-demand helpers
+  /// byte-to-char widening would double-encode any byte >= 0x80 into two
+  /// UTF-8 bytes (measured: native `ff fe 81 7a` vs emitted
+  /// `c3 bf c3 be c2 81 7a`): the pending format segment is flushed as its
+  /// own `print!` call, the hole renders through the raw on-demand helpers
   /// (`__emitrust_cstr_out`/`__emitrust_cstr_n_out`/`__emitrust_byte_out`
   /// — NUL-scan + `write_all` on the SAME globally buffered stdout handle
   /// `print!` locks, so ordering holds even on block-buffered pipes), and
   /// translation continues into a fresh segment whose remainder the
-  /// caller prints. `*argvBypassed` reports whether any hole took the
-  /// bypass (so the caller can skip an empty trailing `print!`). Without
-  /// the flag an argv-fed hole is a located rejection in the historical
-  /// argv wording — planning admits argv only into the direct-printf
-  /// path, so reaching one here is the loud-failure direction.
+  /// caller prints. `*rawBypassed` reports whether any hole took the
+  /// bypass (so the caller can skip an empty trailing `print!`).
+  ///
+  /// TWO restrictions keep the bypass byte-exact. A FIELD WIDTH (`%10s`)
+  /// pads to a count only the formatter knows, so a width-bearing hole
+  /// keeps the Display funnel (the same restriction the argv planner
+  /// applies in `admittedPrintfStringArg`). And flushing mid-scan moves
+  /// output BEFORE the evaluation of the arguments still to come, where C
+  /// evaluates every argument before printf writes anything — so the
+  /// bypass is declined when any LATER argument of the same call has side
+  /// effects. Without the flag an argv-fed hole is a located rejection in
+  /// the historical argv wording — planning admits argv only into the
+  /// direct-printf path, so reaching one here is the loud-failure
+  /// direction — and a char-region `%s` simply keeps the Display funnel.
   FailureOr<std::string>
   translatePrintfFormat(Location loc, const clang::CallExpr *call,
                         const clang::StringLiteral *literal,
                         unsigned firstArgIndex,
                         SmallVectorImpl<Value> &operands,
-                        bool allowArgvBypass = false,
-                        bool *argvBypassed = nullptr);
+                        bool allowRawBypass = false,
+                        bool *rawBypassed = nullptr);
 
   /// Lowers a definition-less `sprintf(dest, fmt, ...)` call (CTS-P9,
   /// 00186). The format must be an ordinary string literal and translates
@@ -5385,9 +5397,20 @@ private:
   /// NUL, whichever comes first (a `.c_str()` argument does not support a
   /// precision — a located rejection — since it has no fixed byte count
   /// to bound at import time).
+  /// FR-191: when `rawByteSlice` is non-null the caller can consume RAW
+  /// BYTES instead of a `Display` value. Every shape that would have been
+  /// wrapped in `__emitrust_cstr`/`__emitrust_cstr_n` — the whole char
+  /// array, `&arr[i]`, a strchr result, and the decomposed-pointer regions
+  /// (literal backing, FR-28 slice parameter, staged global copy) — then
+  /// returns its `!emitrust.ref<!emitrust.slice<i8>>` UNWRAPPED and sets
+  /// `*rawByteSlice`. The shapes that never reached the Latin-1 funnel (a
+  /// string literal, an FR-64 lifted `String` local, `std::string::c_str()`)
+  /// are returned unchanged with the flag clear, so the caller falls back
+  /// to an ordinary `{}` hole.
   FailureOr<Value>
   emitPrintfStringArg(const clang::Expr *expr,
-                      std::optional<unsigned> precision = std::nullopt);
+                      std::optional<unsigned> precision = std::nullopt,
+                      bool *rawByteSlice = nullptr);
 
   /// Wraps an integer value for a `%c` directive: casts it to i32 and
   /// routes it through the `__emitrust_fmt_c` helper (C converts the
