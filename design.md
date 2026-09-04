@@ -12844,7 +12844,7 @@ piece and becomes FR-45.
   is reachable through the arrow spelling, which is why the corpus never
   caught them.
 
-- [ ] FR-190 (opened 2026-09-03; SPIKED GO the same day): **FOLD
+- [x] FR-190 (opened 2026-09-03; SPIKED GO and LANDED the same day): **FOLD
   `std::ops::Deref::deref(&p)` TO `*p` AT EMISSION -- 19 WARNINGS, ZERO
   GOLDENS MOVED, AND NO DIALECT CHANGE.**
   Two routes were costed. **Route 2, relaxing `emitrust.deref` to take an
@@ -12874,6 +12874,51 @@ piece and becomes FR-45.
   (gated on `isPureProducer`, which excludes both ops); fold only single-use
   chains; do NOT fold `&*P` further to `P`; and leave the sibling
   `Index::index` map fold alone this wave.
+  **LANDED 2026-09-03. Measured `132 -> 101 (-31)` at the epoch-6 pin;
+  `borrowed_box` 31 -> 0, gone from the queue entirely. ZERO goldens moved,
+  and the IR pin (`test/Import/Cpp/stl-unique-ptr.cpp`) did not shift a
+  byte -- exactly as the spike predicted, because the IR is never rewritten.**
+  Gate 968/968. `+168/-23` in ONE file, `TranslateToRust.cpp`; `lib/ImportC/*`
+  untouched, which independently confirms the spike's central claim that no
+  importer change is needed.
+  SHAPE: a per-function `computeBoxDerefFolds` matches the triple, records
+  `deref -> place`, and puts the two producers in a SEPARATE
+  `boxDerefSuppressedOps` set -- explicitly NOT `droppedOps`, per constraint 2
+  -- with suppression in `emitDropOrCapture` still calling `assignName` so
+  v-numbering is unchanged. Four of the five rendering sites unified behind a
+  new `emitAutoDerefBase`.
+  **THE SPIKE WAS WRONG ABOUT ONE THING AND THE INCREMENT CAUGHT IT.** The
+  spike recorded "`borrowed_box` 19 -> 0, no new lint of any kind". At
+  epoch-6 that is false: three sites move from `clippy::borrow_deref_ref`
+  (6 -> 3) to `clippy::explicit_auto_deref` (0 -> 3) -- the SAME three
+  borrows, relabelled, so the count is a wash and the whole -31 comes from
+  `borrowed_box`. All three are constraint-4 sites (`let v11: &Node = &*p;`,
+  clippy suggesting `&p`).
+  **So constraint 4's stated PREMISE -- "buys no lint" -- is measurably
+  false; it buys 3.** The DECISION may still be right, because `&p` relies on
+  deref coercion resolving against the annotation rather than on the
+  expression, which is the fragility the constraint was really about. The
+  increment reported this rather than overriding a constraint on its own
+  authority, which is the correct call; re-deciding it is a follow-up, and it
+  should be re-argued on fragility, not on the lint count that has now been
+  refuted.
+  TWO DELIBERATE TIGHTENINGS beyond the spec, both narrowing (they fold
+  LESS): constraint 1's gate is `isa<IntegerType, FloatType, IndexType>` OR
+  `StructType && !typeMayDrop(type)`, where `typeMayDrop` already consults
+  `nonCopyStructNames` AND `dropStructNames`, so it is the specified set plus
+  the drop-struct closure; and a fold requires
+  `addrOf.getIsMut() == (callee is deref_mut)`, so a mismatched pair (never
+  emitted today) keeps the old spelling rather than being guessed at.
+  LATENT HAZARD, found, reported, and deliberately LEFT UNGUARDED with a
+  reason: if a `deref_mut` chain's place were only READ -- never assigned,
+  never `&mut`-borrowed, never a mutating receiver -- the folded `*p` would
+  need only a shared borrow while `postInitMutation` (which constraint 2
+  requires to keep seeing `addr_of mut`) still emits `let mut p`, and the
+  emitted crate DENIES `unused_mut`, so it would be a hard rustc failure. It
+  does not occur: all 268 crates build and lint, and the importer rejects
+  rather than taking `deref_mut` for a read (`ImportCExpressions.cpp:6151`).
+  Guarding it would contradict constraint 2, and the failure direction is
+  LOUD, not silent -- so the right record is this note, not a fence.
   **EPOCH-6 FROZEN 2026-09-03, and the freeze itself nearly went wrong.**
   FR-188 edited a pinned EndToEnd test, so the FR-144 drift guard fired and
   forced the transition. Epoch-5 CLOSED with both drifted files recorded and

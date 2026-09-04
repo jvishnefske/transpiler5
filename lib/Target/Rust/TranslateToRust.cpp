@@ -456,6 +456,14 @@ private:
   LogicalResult emitPlaceExpr(Location loc, Value value,
                               bool derefNeedsParens);
 
+  /// FR-190: emits the BASE of a projection (`.field`, `[i]`, `.0`,
+  /// `.method(..)`) whose base place is the deref `derefOp`, with the `*`
+  /// dropped -- Rust's auto-deref re-adds it and `(*x).f` is exactly what
+  /// clippy::explicit_auto_deref rejects. An ordinary reference base renders
+  /// as the reference itself; an FR-190 folded Box base renders as the Box
+  /// PLACE, so `std::ops::Deref::deref(&p).f` becomes `p.f`.
+  LogicalResult emitAutoDerefBase(Location loc, emitrust::DerefOp derefOp);
+
   /// Emits the default value of `type`: `0` for integers and index, `0.0`
   /// for floats, `false` for `i1`, `Name::default()` for structs and
   /// enums, `None` for function pointers, and `[<element-default>; N]` for
@@ -1207,6 +1215,33 @@ private:
   /// merge's drop-order gate. Deliberately WIDER than `bindingHasDrop`, which
   /// only sees `emitrust.has_drop` structs and misses `Box<T>`/STL owners.
   bool typeMayDrop(Type type) const;
+
+  /// FR-190: the `emitrust.addr_of` and `emitrust.call_opaque
+  /// "std::ops::Deref[Mut]::deref[_mut]"` ops of a FOLDED Box payload access.
+  /// They print NOTHING at their own program point -- every consumer of the
+  /// `emitrust.deref` they feed renders the Box place (`*p`) instead -- but
+  /// they stay in the IR, and deliberately OUT of `droppedOps`. Three
+  /// analyses read them and all three must keep their inputs:
+  /// `AddrOfOp::getIsMut()` (`computeDeferredInits`'s `postInitMutation`) is
+  /// what makes `let mut p` correct, `bindingIsBorrowed` is what holds a
+  /// Drop-carrying Box out of loop-body dead-store elision (the FR-105/FR-130
+  /// danger zone), and `isInlineNonBarrier` is what stops a load's text moving
+  /// across the `&mut`. `droppedOps` could not carry them anyway: it is gated
+  /// on `isPureProducer`, which excludes both calls and borrows.
+  llvm::SmallPtrSet<Operation *, 8> boxDerefSuppressedOps;
+
+  /// FR-190: `emitrust.deref` -> the Box PLACE its folded rendering derefs.
+  /// A deref absent from this map keeps today's spelling in full.
+  DenseMap<Operation *, Value> boxDerefFoldedPlace;
+
+  /// FR-190: fills both maps above for the current function. Independent of
+  /// every other per-function set (the fold is decided on the IR shape alone),
+  /// but it must run BEFORE emission.
+  void computeBoxDerefFolds(emitrust::FuncOp funcOp);
+
+  /// FR-190 constraint 1: whether a WHOLE-VALUE load of a Box payload of
+  /// `type` is safe to render as `*p`.
+  bool boxPayloadIsCopy(Type type) const;
 
   /// Emits the merged `let [mut] <name>: <T> = <rhs>;` at `assignOp`, on
   /// behalf of the declaration `declOp` that rendered nothing.
@@ -3423,6 +3458,89 @@ bool RustEmitter::typeMayDrop(Type type) const {
   return false;
 }
 
+/// FR-190 constraint 1, the one that protects a destructor.
+/// `*std::ops::Deref::deref(&p)` can NEVER move -- rustc rejects it with a
+/// loud E0507 -- but `*p` on a `Box` CAN: `Box` is the one type whose
+/// deref-move is legal, and a move out deinitialises the Box and SKIPS its
+/// `Drop`. Folding a whole-value load of a non-`Copy` payload would therefore
+/// trade a compile error for a silently missing destructor line, the
+/// direction CLAUDE.md forbids. So the fold is allowed under a whole-value
+/// load only for a payload that is `Copy`: a scalar, or a struct the FR-124
+/// fixpoint left copyable (`nonCopyStructNames` already closes over W2.17
+/// `has_drop`, and `typeMayDrop` consults both sets). Everything else -- an
+/// opaque owner (`String`, `Vec<T>`, a nested `Box`), a data enum, an array,
+/// anything unrecognized -- refuses by default and keeps today's spelling.
+/// A FIELD read of a non-`Copy` payload still folds: `p.f` copies the field,
+/// it does not move the payload, so no `Drop` is at risk.
+bool RustEmitter::boxPayloadIsCopy(Type type) const {
+  if (isa<IntegerType, FloatType, IndexType>(type))
+    return true;
+  if (isa<emitrust::StructType>(type))
+    return !typeMayDrop(type);
+  return false;
+}
+
+/// FR-190: recognizes the importer's Box payload access -- the op triple
+///
+///   %r = emitrust.addr_of [mut] %P : lvalue<opaque<"Box<T>">> -> [mut_]ref
+///   %c = emitrust.call_opaque "std::ops::Deref[Mut]::deref[_mut]"(%r)
+///   %d = emitrust.deref %c                                  -> lvalue<T>
+///
+/// -- and records that `%d`'s place text is `*P`. The IR is NOT rewritten;
+/// only the rendering of the three ops changes (see `boxDerefSuppressedOps`).
+///
+/// The match is keyed on the CALLEE, never on "the operand is a reference":
+/// the sibling `std::ops::Index::index` place (W2.20's `m.at(k)`, two
+/// operands) and every ordinary reference deref must be untouched.
+void RustEmitter::computeBoxDerefFolds(emitrust::FuncOp funcOp) {
+  funcOp->walk([&](emitrust::DerefOp derefOp) {
+    auto call = derefOp.getOperand().getDefiningOp<emitrust::CallOpaqueOp>();
+    if (!call || call->getNumOperands() != 1 || call->getNumResults() != 1 ||
+        call.getArgs())
+      return;
+    StringRef callee = call.getCallee();
+    bool isMut = callee == "std::ops::DerefMut::deref_mut";
+    if (!isMut && callee != "std::ops::Deref::deref")
+      return;
+    auto addrOf = call->getOperand(0).getDefiningOp<emitrust::AddrOfOp>();
+    // The borrow's mutability must agree with the trait half it feeds; a
+    // mismatch is not a shape this emitter has ever produced, and guessing at
+    // it could turn a shared borrow into a mutable one.
+    if (!addrOf || addrOf.getIsMut() != isMut)
+      return;
+    // The borrowed place is the Box ITSELF: an lvalue of opaque type (the
+    // rendered Rust spelling `Box<T>`). A struct/scalar lvalue here would be
+    // some other trait use entirely.
+    auto lvalueType =
+        dyn_cast<emitrust::LValueType>(addrOf.getOperand().getType());
+    if (!lvalueType || !isa<emitrust::OpaqueType>(lvalueType.getValueType()))
+      return;
+    // CONSTRAINT 3, single-use chain. Suppressing the TEXT of an op whose
+    // result is read anywhere else orphans that read (rustc E0425), so any
+    // other shape keeps today's three lines in full.
+    if (!addrOf.getResult().hasOneUse() || !call->getResult(0).hasOneUse())
+      return;
+    // A place nothing consumes renders nowhere, so folding it would DELETE
+    // two statements rather than rewrite one. Out of scope: keep them.
+    if (derefOp.getResult().use_empty())
+      return;
+    // CONSTRAINT 1: no fold under a whole-value load of a non-`Copy` payload.
+    Type payload =
+        cast<emitrust::LValueType>(derefOp.getResult().getType())
+            .getValueType();
+    if (!boxPayloadIsCopy(payload)) {
+      for (Operation *user : derefOp.getResult().getUsers()) {
+        auto load = dyn_cast<emitrust::LoadOp>(user);
+        if (load && load.getOperand() == derefOp.getResult())
+          return;
+      }
+    }
+    boxDerefFoldedPlace[derefOp.getOperation()] = addrOf.getOperand();
+    boxDerefSuppressedOps.insert(addrOf.getOperation());
+    boxDerefSuppressedOps.insert(call.getOperation());
+  });
+}
+
 /// FR-132: find, for each deferred binding, the assignment that may render its
 /// whole `let`. The gate is SCOPE, not adjacency -- intervening statements that
 /// cannot observe the binding are the common case.
@@ -3871,6 +3989,18 @@ LogicalResult RustEmitter::emitFloatValue(Location loc, double value,
   return success();
 }
 
+LogicalResult RustEmitter::emitAutoDerefBase(Location loc,
+                                             emitrust::DerefOp derefOp) {
+  // FR-190: a folded Box payload deref has no reference binding to name -- the
+  // trait call printed nothing -- so the base is the Box place, which
+  // auto-derefs exactly like the reference did.
+  if (Value place = boxDerefFoldedPlace.lookup(derefOp.getOperation()))
+    return emitPlaceExpr(loc, place, /*derefNeedsParens=*/true);
+  // clippy::explicit_auto_deref: `(*x).f` -> `x.f`. The deref operand is
+  // always a reference (EmitRustOps.td), so Deref coercion re-adds the deref.
+  return emitOperand(loc, derefOp.getOperand(), ExprPos::receiver());
+}
+
 LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value,
                                          bool derefNeedsParens) {
   Operation *def = value.getDefiningOp();
@@ -3886,11 +4016,7 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value,
         // The base is followed by `.field`, so a deref base must parenthesize.
         Value base = memberOp.getOperand();
         if (auto derefOp = base.getDefiningOp<emitrust::DerefOp>()) {
-          // clippy::explicit_auto_deref: (*x).field -> x.field. The deref
-          // operand is always a reference (EmitRustOps.td), so Deref coercion
-          // re-adds the deref.
-          if (failed(emitOperand(loc, derefOp.getOperand(),
-                                 ExprPos::receiver())))
+          if (failed(emitAutoDerefBase(loc, derefOp)))
             return failure();
         } else {
           if (failed(emitPlaceExpr(loc, base, /*derefNeedsParens=*/true)))
@@ -3903,11 +4029,7 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value,
         // The base is followed by `[i]`, so a deref base must parenthesize.
         Value base = subscriptOp.getArray();
         if (auto derefOp = base.getDefiningOp<emitrust::DerefOp>()) {
-          // clippy::explicit_auto_deref: (*x)[i] -> x[i]. The deref operand is
-          // always a reference (EmitRustOps.td), so Deref coercion re-adds the
-          // deref.
-          if (failed(emitOperand(loc, derefOp.getOperand(),
-                                 ExprPos::receiver())))
+          if (failed(emitAutoDerefBase(loc, derefOp)))
             return failure();
         } else {
           if (failed(emitPlaceExpr(loc, base, /*derefNeedsParens=*/true)))
@@ -3929,11 +4051,22 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value,
       })
       .Case<emitrust::DerefOp>([&](emitrust::DerefOp derefOp) {
         os << (derefNeedsParens ? "(*" : "*");
-        // The `*` must bind the whole inlined expression: receiver-strength
-        // parenthesization.
-        if (failed(emitOperand(loc, derefOp.getOperand(),
-                               ExprPos::receiver())))
+        // FR-190: `*std::ops::Deref::deref(&p)` is spelled `*p`. The Box place
+        // renders here in full, at the CONSUMER's program point, which is
+        // where the old three-line spelling's read happened too. It is NOT
+        // folded further to `p`: deref coercion would make that compile, but
+        // it is fragile and buys no lint -- `&*p` is the clippy-clean
+        // spelling, and clippy::borrow_deref_ref fires only on `&*x` where `x`
+        // is ALREADY a reference, which is what the old spelling produced.
+        if (Value place = boxDerefFoldedPlace.lookup(derefOp.getOperation())) {
+          if (failed(emitPlaceExpr(loc, place, /*derefNeedsParens=*/false)))
+            return failure();
+          // Otherwise: the `*` must bind the whole inlined expression, so the
+          // operand renders at receiver-strength parenthesization.
+        } else if (failed(emitOperand(loc, derefOp.getOperand(),
+                                      ExprPos::receiver()))) {
           return failure();
+        }
         if (derefNeedsParens)
           os << ")";
         return success();
@@ -3942,11 +4075,7 @@ LogicalResult RustEmitter::emitPlaceExpr(Location loc, Value value,
         // The base is followed by `.0`, so a deref base must parenthesize.
         Value base = enumRawOp.getOperand();
         if (auto derefOp = base.getDefiningOp<emitrust::DerefOp>()) {
-          // clippy::explicit_auto_deref: (*x).0 -> x.0. The deref operand is
-          // always a reference (EmitRustOps.td), so Deref coercion re-adds the
-          // deref.
-          if (failed(emitOperand(loc, derefOp.getOperand(),
-                                 ExprPos::receiver())))
+          if (failed(emitAutoDerefBase(loc, derefOp)))
             return failure();
         } else {
           if (failed(emitPlaceExpr(loc, base, /*derefNeedsParens=*/true)))
@@ -4170,6 +4299,18 @@ FailureOr<bool> RustEmitter::emitDropOrCapture(Operation &op) {
   if (droppedOps.count(&op)) {
     // FR-140: a dropped op renders nothing at all, so its name cannot trip a
     // lint either.
+    llvm::SaveAndRestore<bool> notes(noteBoundNames, false);
+    assignName(op.getResult(0));
+    return true;
+  }
+  // FR-190: the borrow and the `Deref[Mut]` trait call of a folded Box payload
+  // access print NOTHING at their program point -- each consumer of the place
+  // they feed renders `*p` instead. Only the TEXT is suppressed: both ops stay
+  // in the IR and out of `droppedOps`, so the borrow analyses that decide
+  // `let mut`, dead-store elision and inline barriers still see them. The name
+  // is still claimed, so the surviving v-numbering matches the unfolded
+  // rendering exactly (the `droppedOps` precedent directly above).
+  if (boxDerefSuppressedOps.count(&op)) {
     llvm::SaveAndRestore<bool> notes(noteBoundNames, false);
     assignName(op.getResult(0));
     return true;
@@ -5599,6 +5740,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   inlineExprs.clear();
   inlineTreeReadsPlace.clear();
   droppedOps.clear();
+  boxDerefSuppressedOps.clear();
+  boxDerefFoldedPlace.clear();
   itemAllowsUnusedAssign = false;
   pendingInlineCapture = false;
   fieldInitFuses.clear();
@@ -5616,6 +5759,11 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   computeDeadStores(body.front());
   computeDeferredInits(body.front());
   computeIfExprBindings();
+  // FR-190: decided on the IR shape alone, so its position among the other
+  // per-function passes is free -- but it must precede emission, and it is
+  // placed before the drop/inline passes so that anything later which asks
+  // "does this op render?" can consult it.
+  computeBoxDerefFolds(funcOp);
   if (fn.getNumResults() > 1)
     return op->emitOpError(
         "cannot translate a function with more than one result");
@@ -6097,10 +6245,7 @@ LogicalResult RustEmitter::emitMethodCall(emitrust::MethodCallOp callOp) {
   // The receiver is followed by `.method(..)`, so a deref receiver needs parens.
   Value receiver = callOp.getReceiver();
   if (auto derefOp = receiver.getDefiningOp<emitrust::DerefOp>()) {
-    // clippy::explicit_auto_deref: (*x).method() -> x.method(). The deref
-    // operand is always a reference (EmitRustOps.td), so Deref coercion re-adds
-    // the deref.
-    if (failed(emitOperand(loc, derefOp.getOperand(), ExprPos::receiver())))
+    if (failed(emitAutoDerefBase(loc, derefOp)))
       return failure();
   } else {
     if (failed(emitPlaceExpr(loc, receiver, /*derefNeedsParens=*/true)))
