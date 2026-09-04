@@ -5506,7 +5506,23 @@ private:
   /// Borrows the FILE* handle argument `expr` (a function-local handle
   /// variable) as `&mut __EmitrustFile` (or `&` when `isMut` is false)
   /// for a helper call; anything but a tracked handle local is rejected.
-  FailureOr<Value> emitFileHandleArg(const clang::Expr *expr, bool isMut);
+  ///
+  /// FR-183: when `allowStdin` is set, the literal `stdin` is also
+  /// admitted and materializes a FRESH stateless handle temporary
+  /// (`emitStdinHandle`) instead of borrowing an owned local. Every other
+  /// use of a standard stream -- `stdout`/`stderr` where a reader is
+  /// wanted, `stdin` where a writer or `fclose` is wanted -- is a located
+  /// rejection: through a per-use temporary `fclose(stdin)` would be a
+  /// SILENT no-op, which is the one shape of this feature that would
+  /// miscompile.
+  FailureOr<Value> emitFileHandleArg(const clang::Expr *expr, bool isMut,
+                                     bool allowStdin = false);
+
+  /// FR-183: materializes a fresh `__EmitrustFile::Stdin` temporary and
+  /// borrows it for a stream helper call. The variant is STATELESS, so a
+  /// per-use temporary is observationally identical to a shared handle --
+  /// and nothing owns or aliases standard input.
+  FailureOr<Value> emitStdinHandle(Location loc, bool isMut);
 
   /// Lowers `fgetc(f)` / `getc(f)` to `__emitrust_fgetc(&mut f)`: the
   /// byte as i32, or -1 — C's EOF, which the surrounding `!= EOF`
@@ -5541,6 +5557,49 @@ private:
   /// variable's NULL test routes through `__emitrust_file_ok(&f)` (the
   /// `if (!f)` shape), and an fgets call tests its index against -1.
   FailureOr<Value> emitFileTruth(const clang::Expr *expr);
+
+  //===--------------------------------------------------------------------===//
+  // FR-183: standard input (scanf/fscanf/getchar over `stdin`)
+  //===--------------------------------------------------------------------===//
+
+  /// One directive of an admitted scanf format. The grammar is exactly
+  /// whitespace runs plus `%d`, `%u` and `%c`; everything else -- length
+  /// modifiers, field widths, `*`, literal-match characters, and every
+  /// other conversion (notably `%f`/`%lf`, whose glibc grammar accepts hex
+  /// floats and `inf`/`nan(1)` that Rust's `parse` does not) -- is a
+  /// located rejection.
+  enum class ScanKind { Whitespace, Int, Unsigned, Char };
+
+  /// Requests one `__emitrust_scan_*` / `__emitrust_stdin_*` helper (and
+  /// the primitives it calls), emitted once per module in `kScanHelpers`
+  /// order. Request-gated exactly like `requestFileHelper`, so a crate
+  /// that never touches standard input emits none of them.
+  void requestScanHelper(llvm::StringRef name);
+
+  /// Lowers a definition-less `scanf(fmt, ...)` (`formatIndex` 0) or
+  /// `fscanf(stdin, fmt, ...)` (`formatIndex` 1) to a CHAIN of
+  /// `emitrust.call_opaque` helpers threading a single i32 state, one call
+  /// per format directive and a closing `__emitrust_scan_done` that turns
+  /// the state into C's int return. State encoding: `s >= 0` is "running,
+  /// s conversions assigned", `s < 0` is "stopped, the answer is -s - 2".
+  /// That folds C's whole return rule into arithmetic, so no helper needs
+  /// to branch out of the chain and only ONE `&mut` is ever live.
+  FailureOr<Value> emitScanfCall(const clang::CallExpr *call,
+                                 unsigned formatIndex);
+
+  /// Borrows one scanf out-argument as `&mut <scalar>`. Admits exactly
+  /// `&L` for a function-local scalar `L` of the conversion's own type;
+  /// `&arr[i]`, `&s.f`, `&global`, a pointer variable and a cast all stay
+  /// rejected (an element address would route through the FR-40 owner
+  /// rewrite, which cannot apply to a `call_opaque` argument).
+  FailureOr<Value> emitScanArg(const clang::Expr *expr, ScanKind kind,
+                               llvm::StringRef &helper);
+
+  /// Lowers `getchar()` to the stdin byte primitive: one byte as 0..=255
+  /// or -1 at end of file, read through the same single-character
+  /// pushback slot the scan helpers use, so interleaved
+  /// `scanf`/`fgets`/`getchar` on the one stream stay in step.
+  FailureOr<Value> emitGetchar(const clang::CallExpr *call);
 
   //===--------------------------------------------------------------------===//
   // Expressions
@@ -7562,6 +7621,14 @@ private:
   /// FILE* helpers already emitted, so a multi-TU import never emits one
   /// twice.
   llvm::StringSet<> emittedFileHelpers;
+  /// FR-183: standard-input helpers requested by lowered scanf/getchar
+  /// calls (`requestScanHelper`); each is emitted once per module, in the
+  /// fixed order of the `kScanHelpers` table (the pushback slot and the
+  /// byte primitive first).
+  llvm::StringSet<> neededScanHelpers;
+  /// Scan helpers already emitted, so a multi-TU import never emits one
+  /// twice.
+  llvm::StringSet<> emittedScanHelpers;
   /// FR-129 half (b): `<ctype.h>` classifier helpers requested by admitted
   /// boolean-context uses; each is emitted once per module, in the fixed
   /// mask order of the `kCtypeHelpers` table.

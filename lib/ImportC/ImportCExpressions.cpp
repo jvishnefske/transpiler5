@@ -2650,6 +2650,24 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
     if (name == "fclose")
       return emitError(loc)
              << "unsupported: fclose return value must be unused";
+    // FR-183 (standard input): a definition-less `scanf`, or `fscanf` on
+    // the literal `stdin`, lowers to a chain of state-threading scan
+    // helpers -- one `emitrust.call_opaque` per format directive, closed
+    // by `__emitrust_scan_done`, whose i32 result IS C's return value.
+    // This must precede the variadic rejection below, which is what these
+    // calls hit today. `getchar` is the stdin byte primitive. `sscanf`
+    // parses a string rather than a stream and has no measured corpus
+    // demand: it keeps a located rejection of its own rather than falling
+    // through to the generic variadic one.
+    if (name == "scanf")
+      return emitScanfCall(call, /*formatIndex=*/0);
+    if (name == "fscanf")
+      return emitScanfCall(call, /*formatIndex=*/1);
+    if (name == "sscanf")
+      return emitError(loc) << "unsupported: 'sscanf' (only scanf and "
+                               "fscanf on stdin are supported)";
+    if (name == "getchar")
+      return emitGetchar(call);
   }
   // A variadic callee is supported when its definition imports as its
   // fixed prototype (a va_list-free body, see `importFunction`; the call

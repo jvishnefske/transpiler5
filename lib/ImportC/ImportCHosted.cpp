@@ -9,7 +9,9 @@
 /// CImporter's hosted-libc call emission: the <stdio.h> FILE* stream family
 /// (fileHandleType/requestFileHelper/emitFileLocal/emitFileOpenInto/
 /// emitFileHandleArg/emitFileGetc/emitFileReadWrite/emitFileGetsIndex/
-/// emitFileClose/emitFileTruth), the string.h family
+/// emitFileClose/emitFileTruth), the FR-183 standard-input family
+/// (emitStdinHandle/emitScanfCall/emitScanArg/emitGetchar), the string.h
+/// family
 /// (emitCharRegionSlice/requestStringHelper/emitStringCopyCall/
 /// emitMemsetCall/emitMemcpyCall/emitStrchrIndex), and the small
 /// stdlib.h/math.h/putchar family (emitPutchar/emitHostedMathCall/
@@ -36,8 +38,29 @@ void CImporter::requestFileHelper(llvm::StringRef name) {
   // the fgetc primitive.
   neededFileHelpers.insert("__EmitrustFile");
   if (name == "__emitrust_fread" || name == "__emitrust_fgets")
-    neededFileHelpers.insert("__emitrust_fgetc");
+    requestFileHelper("__emitrust_fgetc");
+  // FR-183: the fgetc primitive's `Stdin` arm reads standard input through
+  // the shared single-pushback byte reader, so requesting fgetc pulls that
+  // reader (and its slot) in too -- otherwise the emitted enum arm would
+  // name a function the crate never defines.
+  if (name == "__emitrust_fgetc")
+    requestScanHelper("__emitrust_stdin_getc");
   neededFileHelpers.insert(name);
+}
+
+void CImporter::requestScanHelper(llvm::StringRef name) {
+  // Every standard-input helper reads through the single-pushback byte
+  // primitive, so the slot and the reader come along with any of them.
+  neededScanHelpers.insert("__EMITRUST_STDIN_PUSHBACK");
+  neededScanHelpers.insert("__emitrust_stdin_getc");
+  // The three directives that skip leading whitespace also push a
+  // character back (C affords exactly one slot; see `__emitrust_scan_d`).
+  if (name == "__emitrust_scan_ws" || name == "__emitrust_scan_d" ||
+      name == "__emitrust_scan_u") {
+    neededScanHelpers.insert("__emitrust_stdin_ungetc");
+    neededScanHelpers.insert("__emitrust_scan_skip_ws");
+  }
+  neededScanHelpers.insert(name);
 }
 
 void CImporter::requestPoolHelpers() { neededPoolHelpers = true; }
@@ -114,7 +137,7 @@ LogicalResult CImporter::emitFileOpenInto(Value place,
 }
 
 FailureOr<Value> CImporter::emitFileHandleArg(const clang::Expr *expr,
-                                              bool isMut) {
+                                              bool isMut, bool allowStdin) {
   const clang::Expr *e = expr->IgnoreParenImpCasts();
   Location loc = translateLoc(e->getBeginLoc());
   const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(e);
@@ -127,9 +150,50 @@ FailureOr<Value> CImporter::emitFileHandleArg(const clang::Expr *expr,
     return emitError(loc) << "unsupported: FILE* cannot cross a "
                              "user-defined function boundary";
   Value place = var ? fileLocals.lookup(var) : Value();
-  if (!place)
+  if (!place) {
+    // FR-183: the standard streams are not owned handles. `stdin` is the
+    // STATELESS `Stdin` unit variant and materializes a fresh temporary at
+    // each use site, which is exactly what dissolves the ownership
+    // question a process-global FILE* would raise. Every other standard
+    // stream use is refused, and one of them would MISCOMPILE if admitted:
+    // `fclose(stdin)` writes Null through a per-use temporary and is a
+    // silent no-op, so a program that read past its own fclose would get
+    // bytes instead of undefined behavior.
+    if (var && var->getDeclName().isIdentifier() &&
+        isFilePtrType(var->getType())) {
+      llvm::StringRef stream = canonicalStreamName(var->getName());
+      if (stream == "stdin" || stream == "stdout" || stream == "stderr") {
+        if (stream == "stdin" && allowStdin)
+          return emitStdinHandle(loc, isMut);
+        return emitError(loc)
+               << "unsupported: '" << stream
+               << "' as a FILE* stream here (only sequential reads of "
+                  "'stdin' are supported)";
+      }
+    }
     return emitError(loc) << "unsupported: a FILE* stream argument must be "
                              "a function-local FILE* variable";
+  }
+  Type refType = isMut ? Type(emitrust::MutRefType::get(fileHandleType()))
+                       : Type(emitrust::RefType::get(fileHandleType()));
+  return builder.create<emitrust::AddrOfOp>(loc, refType, place, isMut)
+      .getResult();
+}
+
+FailureOr<Value> CImporter::emitStdinHandle(Location loc, bool isMut) {
+  requestFileHelper("__emitrust_stdin");
+  // A fresh place per use site: the variant carries no state, so two
+  // temporaries naming standard input are indistinguishable, and the
+  // borrow below is the only reference that ever exists to either.
+  Value place = createVariablePlace(loc, fileHandleType(), std::string());
+  Value handle =
+      builder
+          .create<emitrust::CallOpaqueOp>(
+              loc, TypeRange{fileHandleType()},
+              builder.getStringAttr("__emitrust_stdin"), /*args=*/ArrayAttr(),
+              ValueRange{})
+          .getResult(0);
+  builder.create<emitrust::AssignOp>(loc, place, handle);
   Type refType = isMut ? Type(emitrust::MutRefType::get(fileHandleType()))
                        : Type(emitrust::RefType::get(fileHandleType()));
   return builder.create<emitrust::AddrOfOp>(loc, refType, place, isMut)
@@ -141,7 +205,8 @@ FailureOr<Value> CImporter::emitFileGetc(const clang::CallExpr *call) {
   if (call->getNumArgs() != 1)
     return emitError(loc)
            << "unsupported: fgetc requires exactly one argument";
-  FailureOr<Value> handle = emitFileHandleArg(call->getArg(0), /*isMut=*/true);
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(0), /*isMut=*/true,
+                                              /*allowStdin=*/true);
   if (failed(handle))
     return failure();
   requestFileHelper("__emitrust_fgetc");
@@ -186,7 +251,10 @@ FailureOr<Value> CImporter::emitFileReadWrite(const clang::CallExpr *call,
                                                /*isMut=*/!isWrite);
   if (failed(slice))
     return failure();
-  FailureOr<Value> handle = emitFileHandleArg(call->getArg(3), /*isMut=*/true);
+  // FR-183: only the READ direction admits `stdin`; `fwrite` to it (and
+  // any reader on `stdout`/`stderr`) stays a located rejection.
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(3), /*isMut=*/true,
+                                              /*allowStdin=*/!isWrite);
   if (failed(handle))
     return failure();
   llvm::StringRef helper =
@@ -228,7 +296,8 @@ FailureOr<Value> CImporter::emitFileGetsIndex(const clang::CallExpr *call) {
   FailureOr<Value> slice = emitCharRegionSlice(loc, *region, /*isMut=*/true);
   if (failed(slice))
     return failure();
-  FailureOr<Value> handle = emitFileHandleArg(call->getArg(2), /*isMut=*/true);
+  FailureOr<Value> handle = emitFileHandleArg(call->getArg(2), /*isMut=*/true,
+                                              /*allowStdin=*/true);
   if (failed(handle))
     return failure();
   requestFileHelper("__emitrust_fgets");
@@ -294,6 +363,255 @@ FailureOr<Value> CImporter::emitFileTruth(const clang::Expr *expr) {
           loc, TypeRange{builder.getI1Type()},
           builder.getStringAttr("__emitrust_file_ok"), /*args=*/ArrayAttr(),
           ValueRange{*handle})
+      .getResult(0);
+}
+
+//===----------------------------------------------------------------------===//
+// FR-183: standard input (scanf / fscanf / getchar over `stdin`)
+//===----------------------------------------------------------------------===//
+
+/// C's whitespace set in the "C" locale: space plus the five control
+/// characters 9..=13. A run of these in a scanf format is one directive.
+static bool isScanSpace(char c) {
+  return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' ||
+         c == '\r';
+}
+
+FailureOr<Value> CImporter::emitScanArg(const clang::Expr *expr, ScanKind kind,
+                                        llvm::StringRef &helper) {
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  Location loc = translateLoc(e->getBeginLoc());
+  // Exactly `&L` for a function-local scalar. An explicit cast is NOT
+  // stripped here on purpose (`IgnoreParenImpCasts` leaves a
+  // CStyleCastExpr standing), and `&arr[i]` / `&s.f` / `&global` / a bare
+  // pointer variable all fall out of the DeclRefExpr test below: an
+  // element or member address routes through the FR-40 owner rewrite,
+  // which cannot apply to a `call_opaque` helper argument.
+  const auto *addrOf = llvm::dyn_cast<clang::UnaryOperator>(e);
+  const clang::DeclRefExpr *ref =
+      addrOf && addrOf->getOpcode() == clang::UO_AddrOf
+          ? llvm::dyn_cast<clang::DeclRefExpr>(
+                addrOf->getSubExpr()->IgnoreParenImpCasts())
+          : nullptr;
+  const auto *var =
+      ref ? llvm::dyn_cast<clang::VarDecl>(ref->getDecl()) : nullptr;
+  if (!var || !var->hasLocalStorage() || llvm::isa<clang::ParmVarDecl>(var) ||
+      !var->getType()->isScalarType())
+    return emitError(loc) << "unsupported: a scanf argument must be the "
+                             "address of a function-local scalar variable";
+  // The C type must be EXACTLY the conversion's own; scanf is variadic, so
+  // no implicit conversion ever fixes a mismatch and a wrong width would
+  // silently write the wrong bytes in C too.
+  clang::QualType argType = var->getType();
+  switch (kind) {
+  case ScanKind::Int:
+    if (!astContext().hasSameUnqualifiedType(argType, astContext().IntTy))
+      return emitError(loc)
+             << "unsupported: scanf conversion '%d' requires an 'int' "
+                "argument";
+    break;
+  case ScanKind::Unsigned:
+    if (!astContext().hasSameUnqualifiedType(argType,
+                                             astContext().UnsignedIntTy))
+      return emitError(loc)
+             << "unsupported: scanf conversion '%u' requires an 'unsigned "
+                "int' argument";
+    break;
+  case ScanKind::Char:
+    if (!astContext().hasSameUnqualifiedType(argType, astContext().CharTy) &&
+        !astContext().hasSameUnqualifiedType(argType,
+                                             astContext().SignedCharTy) &&
+        !astContext().hasSameUnqualifiedType(argType,
+                                             astContext().UnsignedCharTy))
+      return emitError(loc) << "unsupported: scanf conversion '%c' requires "
+                               "a character argument";
+    break;
+  case ScanKind::Whitespace:
+    llvm_unreachable("a whitespace directive consumes no argument");
+  }
+  FailureOr<Type> valueType = mapType(argType, loc);
+  if (failed(valueType))
+    return failure();
+  auto intType = llvm::dyn_cast<IntegerType>(*valueType);
+  if (!intType)
+    return emitError(loc) << "unsupported: a scanf argument must be the "
+                             "address of a function-local scalar variable";
+  switch (kind) {
+  case ScanKind::Int:
+    helper = "__emitrust_scan_d";
+    break;
+  case ScanKind::Unsigned:
+    helper = "__emitrust_scan_u";
+    break;
+  case ScanKind::Char:
+    // `char` is signed on some targets and unsigned on others; the helper
+    // pair keeps the out-reference's type EXACT either way rather than
+    // making `%c` a platform-dependent rejection.
+    helper = intType.isUnsigned() ? "__emitrust_scan_c_u"
+                                  : "__emitrust_scan_c";
+    break;
+  case ScanKind::Whitespace:
+    break;
+  }
+  FailureOr<Value> place = emitLValue(addrOf->getSubExpr());
+  if (failed(place))
+    return failure();
+  auto lvalueType = llvm::dyn_cast<emitrust::LValueType>((*place).getType());
+  if (!lvalueType || lvalueType.getValueType() != *valueType)
+    return emitError(loc) << "unsupported: a scanf argument must be the "
+                             "address of a function-local scalar variable";
+  return builder
+      .create<emitrust::AddrOfOp>(loc, emitrust::MutRefType::get(*valueType),
+                                  *place, /*is_mut=*/true)
+      .getResult();
+}
+
+FailureOr<Value> CImporter::emitScanfCall(const clang::CallExpr *call,
+                                          unsigned formatIndex) {
+  Location loc = translateLoc(call->getBeginLoc());
+  llvm::StringRef name = formatIndex == 0 ? "scanf" : "fscanf";
+  if (formatIndex > 0) {
+    if (call->getNumArgs() < 1)
+      return emitError(loc)
+             << "unsupported: fscanf without a stream argument";
+    // Only the literal `stdin` (canonicalized through Darwin's `__stdinp`
+    // spelling). A real FILE* stream would need the whole scanner over an
+    // owned handle, which no measured corpus case asks for.
+    const auto *stream = llvm::dyn_cast<clang::DeclRefExpr>(
+        call->getArg(0)->IgnoreParenImpCasts());
+    const clang::NamedDecl *streamDecl =
+        stream ? llvm::dyn_cast<clang::NamedDecl>(stream->getDecl()) : nullptr;
+    if (!streamDecl || !streamDecl->getDeclName().isIdentifier() ||
+        canonicalStreamName(streamDecl->getName()) != "stdin")
+      return emitError(translateLoc(call->getArg(0)->getBeginLoc()))
+             << "unsupported: fscanf on a FILE* stream other than stdin";
+  }
+  if (call->getNumArgs() <= formatIndex)
+    return emitError(loc) << "unsupported: " << name
+                          << " without a format string";
+  const auto *literal = llvm::dyn_cast<clang::StringLiteral>(
+      call->getArg(formatIndex)->IgnoreParenImpCasts());
+  if (!literal || !literal->isOrdinary())
+    return emitError(loc)
+           << "unsupported: scanf format must be an ordinary string literal";
+  llvm::StringRef format = literal->getString();
+  for (char c : format)
+    if (!isScanSpace(c) && (c < 0x20 || c > 0x7e))
+      return emitError(loc) << "unsupported: non-printable or non-ASCII byte "
+                               "in a scanf format";
+
+  // The admitted grammar: whitespace runs, `%d`, `%u`, `%c`. No length
+  // modifier, no field width, no assignment-suppressing `*`, no
+  // literal-match characters. `%f`/`%lf` is refused DELIBERATELY -- glibc
+  // accepts hex floats (`0x1p3` is 8) and `inf`/`infinity`/`nan(1)`, which
+  // Rust's `parse` does not, and FR-183 measured it worth zero corpus
+  // cases -- so admitting it would be the feature's largest correctness
+  // risk for no gain.
+  SmallVector<ScanKind> directives;
+  for (size_t i = 0; i < format.size();) {
+    if (isScanSpace(format[i])) {
+      while (i < format.size() && isScanSpace(format[i]))
+        ++i;
+      directives.push_back(ScanKind::Whitespace);
+      continue;
+    }
+    if (format[i] != '%')
+      return emitError(loc) << "unsupported: literal-match character '"
+                            << format[i] << "' in a scanf format";
+    size_t start = i++;
+    if (i >= format.size())
+      return emitError(loc)
+             << "unsupported: trailing '%' in a scanf format";
+    // The directive's spelling for the diagnostic: '%' through the first
+    // character that is not a flag, width digit or length modifier.
+    size_t end = i;
+    while (end < format.size() &&
+           (llvm::isDigit(format[end]) ||
+            llvm::StringRef("*hljztL").contains(format[end])))
+      ++end;
+    if (end < format.size())
+      ++end;
+    llvm::StringRef spelling = format.substr(start, end - start);
+    if (format[i] == '*')
+      return emitError(loc) << "unsupported: scanf assignment suppression in '"
+                            << spelling << "'";
+    if (llvm::isDigit(format[i]))
+      return emitError(loc)
+             << "unsupported: scanf field width in '" << spelling << "'";
+    if (llvm::StringRef("hljztL").contains(format[i]))
+      return emitError(loc)
+             << "unsupported: scanf length modifier in '" << spelling << "'";
+    char conversion = format[i++];
+    if (conversion == 'd')
+      directives.push_back(ScanKind::Int);
+    else if (conversion == 'u')
+      directives.push_back(ScanKind::Unsigned);
+    else if (conversion == 'c')
+      directives.push_back(ScanKind::Char);
+    else
+      return emitError(loc) << "unsupported: scanf conversion '%"
+                            << conversion
+                            << "' (only %d, %u and %c are supported)";
+  }
+
+  unsigned conversions = 0;
+  for (ScanKind kind : directives)
+    if (kind != ScanKind::Whitespace)
+      ++conversions;
+  if (conversions != call->getNumArgs() - formatIndex - 1)
+    return emitError(loc) << "unsupported: scanf conversion count does not "
+                             "match the argument count";
+
+  // The chain. `s >= 0` is "running, s conversions assigned"; `s < 0` is
+  // "stopped, the answer is -s - 2". Every helper no-ops on a stopped
+  // state, so C's early exit needs no control flow here -- and each helper
+  // takes at most one out-reference, so only ONE `&mut` is ever live.
+  Type stateType = builder.getI32Type();
+  Value state = createIntConstant(loc, stateType, 0);
+  unsigned argCursor = formatIndex + 1;
+  for (ScanKind kind : directives) {
+    llvm::StringRef helper = "__emitrust_scan_ws";
+    SmallVector<Value> operands{state};
+    if (kind != ScanKind::Whitespace) {
+      FailureOr<Value> outRef =
+          emitScanArg(call->getArg(argCursor++), kind, helper);
+      if (failed(outRef))
+        return failure();
+      operands.push_back(*outRef);
+    }
+    requestScanHelper(helper);
+    state = builder
+                .create<emitrust::CallOpaqueOp>(
+                    loc, TypeRange{stateType}, builder.getStringAttr(helper),
+                    /*args=*/ArrayAttr(), operands)
+                .getResult(0);
+  }
+  requestScanHelper("__emitrust_scan_done");
+  Value result = builder
+                     .create<emitrust::CallOpaqueOp>(
+                         loc, TypeRange{stateType},
+                         builder.getStringAttr("__emitrust_scan_done"),
+                         /*args=*/ArrayAttr(), ValueRange{state})
+                     .getResult(0);
+  // C's return type is `int`; convert only if a declaration says otherwise.
+  FailureOr<Type> resultType = mapType(call->getType(), loc);
+  if (succeeded(resultType))
+    if (auto intType = llvm::dyn_cast<IntegerType>(*resultType);
+        intType && intType != stateType)
+      return castToIntType(loc, result, intType);
+  return result;
+}
+
+FailureOr<Value> CImporter::emitGetchar(const clang::CallExpr *call) {
+  Location loc = translateLoc(call->getBeginLoc());
+  if (call->getNumArgs() != 0)
+    return emitError(loc) << "unsupported: getchar takes no arguments";
+  requestScanHelper("__emitrust_stdin_getc");
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{builder.getI32Type()},
+          builder.getStringAttr("__emitrust_stdin_getc"), /*args=*/ArrayAttr(),
+          ValueRange{})
       .getResult(0);
 }
 
