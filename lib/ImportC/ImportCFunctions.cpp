@@ -360,7 +360,8 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // statement-position calls are lowered by name (`emitPuts`/`emitPutchar`)
   // and never reference the symbol, and a body-less function would
   // otherwise be rejected by `finalizeProject`.
-  if ((cName == "puts" || cName == "putchar") && !func->getDefinition())
+  if ((cName == "puts" || cName == "putchar" || cName == "getchar") &&
+      !func->getDefinition())
     return success();
 
   // Referenced-only import of main-file prototypes (the same policy
@@ -3660,8 +3661,17 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "/// are sequential-only and byte-wise; using a Null or\n"
        "/// wrong-direction handle is C UB, refined into a deterministic\n"
        "/// panic by the helpers below.\n"
+       "///\n"
+       "/// `Stdin` (FR-183) is C's standard input, and it is STATELESS:\n"
+       "/// the reading position lives in the process, not in the value,\n"
+       "/// so the importer materializes a fresh temporary at every use\n"
+       "/// site and nothing ever owns or aliases the stream. That is also\n"
+       "/// why `fclose(stdin)` is an import-time rejection rather than a\n"
+       "/// helper: through a per-use temporary it would be a silent\n"
+       "/// no-op.\n"
        "enum __EmitrustFile {\n"
        "    Null,\n"
+       "    Stdin,\n"
        "    Read(std::fs::File),\n"
        "    Write(std::fs::File),\n"
        "}"},
@@ -3684,6 +3694,15 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "        Err(_) => __EmitrustFile::Null,\n"
        "    }\n"
        "}"},
+      {"__emitrust_stdin",
+       "/// C's `stdin` as a `FILE*` handle (FR-183). The variant carries\n"
+       "/// no state, so every use site gets its own temporary and two\n"
+       "/// such temporaries are indistinguishable -- the reading position\n"
+       "/// is the process's, shared with `getchar` and the scan helpers\n"
+       "/// through the single pushback slot.\n"
+       "fn __emitrust_stdin() -> __EmitrustFile {\n"
+       "    __EmitrustFile::Stdin\n"
+       "}"},
       {"__emitrust_file_ok",
        "/// The truth of a C `FILE*` handle: false exactly when it is\n"
        "/// NULL (the `if (!f)` check after fopen).\n"
@@ -3697,6 +3716,7 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
        "/// both panic deterministically.\n"
        "fn __emitrust_fgetc(f: &mut __EmitrustFile) -> i32 {\n"
        "    match f {\n"
+       "        __EmitrustFile::Stdin => __emitrust_stdin_getc(),\n"
        "        __EmitrustFile::Read(file) => {\n"
        "            let mut byte = [0u8; 1];\n"
        "            match std::io::Read::read(file, &mut byte) {\n"
@@ -3786,6 +3806,244 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
         emittedFileHelpers.contains(helper.name))
       continue;
     emittedFileHelpers.insert(helper.name);
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(helper.source));
+  }
+  // FR-183: standard-input helpers, request-gated exactly like
+  // `kFileHelpers` (a crate that never reads stdin emits none of them) and
+  // emitted once per module in this fixed order: the single-character
+  // pushback slot and the byte primitive first, then the per-directive
+  // scanners. The scanner semantics are glibc's, MEASURED against
+  // clang/glibc over 26671 differential cases including interleaved
+  // scanf/fgets/getchar on one stream (design.md FR-183); the load-bearing
+  // edges are spelled out on the helpers that implement them.
+  static const struct {
+    llvm::StringRef name;
+    llvm::StringRef source;
+  } kScanHelpers[] = {
+      {"__EMITRUST_STDIN_PUSHBACK",
+       "/// C's single `ungetc` slot for standard input (FR-183).\n"
+       "///\n"
+       "/// glibc's `scanf` is neither a line reader nor `strtol`: it is a greedy\n"
+       "/// byte scanner with EXACTLY ONE character of pushback, and every edge\n"
+       "/// that makes malformed input behave sanely follows from that one fact.\n"
+       "/// The slot is process-wide -- an `AtomicI32`, deliberately NOT a\n"
+       "/// `thread_local!`, which trips `clippy::missing_const_for_thread_local`\n"
+       "/// (an already-pinned FR-63 golden). -1 means empty.\n"
+       "static __EMITRUST_STDIN_PUSHBACK: std::sync::atomic::AtomicI32 =\n"
+       "    std::sync::atomic::AtomicI32::new(-1);"},
+      {"__emitrust_stdin_getc",
+       "/// One byte of standard input as 0..=255, or -1 at end of file, taking\n"
+       "/// the pushback slot first. This is C's `getchar()`, and it is also what\n"
+       "/// `fgetc(stdin)`/`fgets(.., stdin)` and every scan helper read through,\n"
+       "/// so `scanf` -> `fgets` -> `getchar` interleaved on the ONE stream stay\n"
+       "/// exactly in step.\n"
+       "fn __emitrust_stdin_getc() -> i32 {\n"
+       "    let pushed =\n"
+       "        __EMITRUST_STDIN_PUSHBACK.swap(-1, std::sync::atomic::Ordering::SeqCst);\n"
+       "    if pushed >= 0 {\n"
+       "        return pushed;\n"
+       "    }\n"
+       "    let mut byte = [0u8; 1];\n"
+       "    let mut input = std::io::stdin().lock();\n"
+       "    match std::io::Read::read(&mut input, &mut byte) {\n"
+       "        Ok(0) => -1,\n"
+       "        Ok(_) => byte[0] as i32,\n"
+       "        Err(e) => panic!(\"stdin read: {}\", e),\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_stdin_ungetc",
+       "/// Pushes one byte back onto standard input -- C's single `ungetc` slot,\n"
+       "/// and the reason a failed conversion leaves the stream where C leaves\n"
+       "/// it. A negative argument pushes NOTHING: EOF is not a character, which\n"
+       "/// is why `scanf(\"%d\")` on the single input byte `-` is a MATCHING\n"
+       "/// failure returning 0 rather than an input failure returning -1.\n"
+       "fn __emitrust_stdin_ungetc(c: i32) {\n"
+       "    if c >= 0 {\n"
+       "        __EMITRUST_STDIN_PUSHBACK.store(c, std::sync::atomic::Ordering::SeqCst);\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_scan_skip_ws",
+       "/// Consumes a whitespace run and returns the first byte that is not\n"
+       "/// whitespace, or -1 at end of file. C's \"C\"-locale whitespace set:\n"
+       "/// space, and the five control characters 9..=13.\n"
+       "fn __emitrust_scan_skip_ws() -> i32 {\n"
+       "    loop {\n"
+       "        let c = __emitrust_stdin_getc();\n"
+       "        if c != 32 && !(9..=13).contains(&c) {\n"
+       "            return c;\n"
+       "        }\n"
+       "    }\n"
+       "}"},
+      {"__emitrust_scan_ws",
+       "/// A whitespace directive: skips a (possibly empty) whitespace run and\n"
+       "/// can never fail, so the threaded state passes straight through. Hitting\n"
+       "/// end of file while skipping is NOT itself a failure -- the next\n"
+       "/// conversion is what reports the input failure.\n"
+       "fn __emitrust_scan_ws(s: i32) -> i32 {\n"
+       "    if s < 0 {\n"
+       "        return s;\n"
+       "    }\n"
+       "    let c = __emitrust_scan_skip_ws();\n"
+       "    __emitrust_stdin_ungetc(c);\n"
+       "    s\n"
+       "}"},
+      {"__emitrust_scan_d",
+       "/// `%d`: skip leading whitespace, then C's `strtol` grammar in base 10 on\n"
+       "/// a 64-bit `long`, truncated to `int`.\n"
+       "///\n"
+       "/// State encoding (FR-183): `s >= 0` is \"running, s conversions\n"
+       "/// assigned\"; `s < 0` is \"stopped, and the answer is -s - 2\". That folds\n"
+       "/// C's entire return rule -- the count on a matching failure, EOF (-1)\n"
+       "/// only when an input failure precedes the FIRST conversion -- into\n"
+       "/// arithmetic, so this helper never has to break out of anything.\n"
+       "///\n"
+       "/// The MEASURED glibc edges this reproduces, none of them guessable:\n"
+       "///   `abc`   -> 0, variable untouched, `abc` still unread;\n"
+       "///   `-abc`  -> 0, and THE SIGN IS CONSUMED: only `abc` is left, because\n"
+       "///              C affords exactly one character of pushback;\n"
+       "///   `--5`   -> 0, leaving `-5`;\n"
+       "///   `-`     -> 0, a MATCHING failure, NOT -1;\n"
+       "///   ``      -> -1, an input failure;\n"
+       "///   `0x10`  -> 1, value 0, leaving `x10` (base 10 only);\n"
+       "///   `2147483647000`        -> 1, value -1000 (64-bit long, THEN\n"
+       "///                            truncated to int);\n"
+       "///   `99999999999999999999` -> 1, value -1 (saturates at LONG_MAX, then\n"
+       "///                            truncates).\n"
+       "fn __emitrust_scan_d(s: i32, out: &mut i32) -> i32 {\n"
+       "    if s < 0 {\n"
+       "        return s;\n"
+       "    }\n"
+       "    let mut c = __emitrust_scan_skip_ws();\n"
+       "    if c < 0 {\n"
+       "        return if s == 0 { -1 } else { -s - 2 };\n"
+       "    }\n"
+       "    let mut negative = false;\n"
+       "    if c == 43 || c == 45 {\n"
+       "        negative = c == 45;\n"
+       "        c = __emitrust_stdin_getc();\n"
+       "    }\n"
+       "    if !(48..=57).contains(&c) {\n"
+       "        __emitrust_stdin_ungetc(c);\n"
+       "        return -s - 2;\n"
+       "    }\n"
+       "    let mut acc: i64 = 0;\n"
+       "    let mut overflow = false;\n"
+       "    while (48..=57).contains(&c) {\n"
+       "        let digit = (c - 48) as i64;\n"
+       "        match acc.checked_mul(10).and_then(|v| v.checked_add(digit)) {\n"
+       "            Some(v) => acc = v,\n"
+       "            None => overflow = true,\n"
+       "        }\n"
+       "        c = __emitrust_stdin_getc();\n"
+       "    }\n"
+       "    __emitrust_stdin_ungetc(c);\n"
+       "    let value: i64 = if overflow {\n"
+       "        if negative { i64::MIN } else { i64::MAX }\n"
+       "    } else if negative {\n"
+       "        -acc\n"
+       "    } else {\n"
+       "        acc\n"
+       "    };\n"
+       "    *out = value as i32;\n"
+       "    s + 1\n"
+       "}"},
+      {"__emitrust_scan_u",
+       "/// `%u`: C's `strtoul` in base 10, then truncated to `unsigned int`. A\n"
+       "/// leading sign IS accepted and a negative result is the two's-complement\n"
+       "/// negation modulo 2^64 -- measured, `-42` yields 4294967254.\n"
+       "///\n"
+       "/// AND OVERFLOW SATURATES TO `ULONG_MAX` REGARDLESS OF SIGN, so a huge\n"
+       "/// NEGATIVE literal yields 4294967295 rather than 1. That single edge was\n"
+       "/// the only divergence in FR-183's 12427-case differential against\n"
+       "/// clang/glibc, and it is encoded here deliberately.\n"
+       "fn __emitrust_scan_u(s: i32, out: &mut u32) -> i32 {\n"
+       "    if s < 0 {\n"
+       "        return s;\n"
+       "    }\n"
+       "    let mut c = __emitrust_scan_skip_ws();\n"
+       "    if c < 0 {\n"
+       "        return if s == 0 { -1 } else { -s - 2 };\n"
+       "    }\n"
+       "    let mut negative = false;\n"
+       "    if c == 43 || c == 45 {\n"
+       "        negative = c == 45;\n"
+       "        c = __emitrust_stdin_getc();\n"
+       "    }\n"
+       "    if !(48..=57).contains(&c) {\n"
+       "        __emitrust_stdin_ungetc(c);\n"
+       "        return -s - 2;\n"
+       "    }\n"
+       "    let mut acc: u64 = 0;\n"
+       "    let mut overflow = false;\n"
+       "    while (48..=57).contains(&c) {\n"
+       "        let digit = (c - 48) as u64;\n"
+       "        match acc.checked_mul(10).and_then(|v| v.checked_add(digit)) {\n"
+       "            Some(v) => acc = v,\n"
+       "            None => overflow = true,\n"
+       "        }\n"
+       "        c = __emitrust_stdin_getc();\n"
+       "    }\n"
+       "    __emitrust_stdin_ungetc(c);\n"
+       "    let value: u64 = if overflow {\n"
+       "        u64::MAX\n"
+       "    } else if negative {\n"
+       "        acc.wrapping_neg()\n"
+       "    } else {\n"
+       "        acc\n"
+       "    };\n"
+       "    *out = value as u32;\n"
+       "    s + 1\n"
+       "}"},
+      {"__emitrust_scan_c",
+       "/// `%c`: exactly one byte, and -- unlike `%d` and `%u` -- with NO leading\n"
+       "/// whitespace skip; it reads whatever byte the previous directive stopped\n"
+       "/// on. It cannot fail to MATCH, only to have input.\n"
+       "fn __emitrust_scan_c(s: i32, out: &mut i8) -> i32 {\n"
+       "    if s < 0 {\n"
+       "        return s;\n"
+       "    }\n"
+       "    let c = __emitrust_stdin_getc();\n"
+       "    if c < 0 {\n"
+       "        return if s == 0 { -1 } else { -s - 2 };\n"
+       "    }\n"
+       "    *out = c as i8;\n"
+       "    s + 1\n"
+       "}"},
+      {"__emitrust_scan_c_u",
+       "/// `%c` into an unsigned `char` (plain `char` is unsigned on some\n"
+       "/// targets): the same byte read, with the out-reference's type kept\n"
+       "/// EXACT rather than making `%c` a platform-dependent rejection.\n"
+       "fn __emitrust_scan_c_u(s: i32, out: &mut u8) -> i32 {\n"
+       "    if s < 0 {\n"
+       "        return s;\n"
+       "    }\n"
+       "    let c = __emitrust_stdin_getc();\n"
+       "    if c < 0 {\n"
+       "        return if s == 0 { -1 } else { -s - 2 };\n"
+       "    }\n"
+       "    *out = c as u8;\n"
+       "    s + 1\n"
+       "}"},
+      {"__emitrust_scan_done",
+       "/// Closes a scan chain: turns the threaded state into C's `int` return --\n"
+       "/// the number of conversions assigned, or EOF (-1) when an input failure\n"
+       "/// preceded the first conversion.\n"
+       "fn __emitrust_scan_done(s: i32) -> i32 {\n"
+       "    if s < 0 {\n"
+       "        -s - 2\n"
+       "    } else {\n"
+       "        s\n"
+       "    }\n"
+       "}"},
+  };
+  for (const auto &helper : kScanHelpers) {
+    if (!neededScanHelpers.contains(helper.name) ||
+        emittedScanHelpers.contains(helper.name))
+      continue;
+    emittedScanHelpers.insert(helper.name);
     OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
     moduleBuilder.create<emitrust::VerbatimOp>(
         UnknownLoc::get(builder.getContext()),

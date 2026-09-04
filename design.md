@@ -12275,7 +12275,7 @@ piece and becomes FR-45.
   direction, unexercised); clippy on a wrapper-bearing crate; and a
   root-scope export naming an FR-159 per-TU-module struct.
 
-- [ ] FR-183 (opened 2026-08-31 by the FR-182 wait, measured with the FR-178
+- [x] FR-183 (opened 2026-08-31 by the FR-182 wait, measured with the FR-178
   instrument; **NOT SPIKED beyond this ranking**): **AFTER THE EXPORT WORK,
   THE BIGGEST REMAINING TRACTOR LEVER IS STANDARD INPUT, AND IT HAS NO
   `dlsym` CONFLICT AT ALL.**
@@ -12412,6 +12412,46 @@ piece and becomes FR-45.
   saturate-then-truncate rules are plausibly libc-specific, so portable
   EndToEnd tests should pin only well-defined shapes and keep the glibc edges
   in helper comments.
+  **LANDED 2026-09-03. MEASURED: TRACTOR 31 -> 40 of 252, exec 4 -> 13 --
+  exactly the nine cases the spike predicted (009, 010, 017, 019, 021, 032,
+  040, 041, 043), with ZERO regressions.** Gate 972/972; clippy 101 -> 101
+  (+0) on the epoch-6 pin, and the new stdin crate itself lints at zero.
+  The spike's grammar held without amendment, and its one explicitly
+  unmeasured risk is now measured CLEAN: the FR-40 pointer-region planner
+  does NOT react to `&x` inside a `scanf` call -- the goldens show a plain
+  `emitrust.addr_of mut` with no owner lift.
+  ORACLE BEYOND THE COMMITTED TEST: a **7681-case differential fuzz** against
+  clang/glibc natives over the adversarial alphabet, comparing stdout, exit
+  status AND the residual stream bytes via a trailing `getchar` dump -- **0
+  divergences**. Every measured semantic in this entry reproduces exactly,
+  including the one that killed the spike's first candidate (`%u` on a huge
+  negative saturating to `ULONG_MAX` regardless of sign).
+  **THE DEVIATION THAT MATTERS: `%c` NEEDED A HELPER PAIR, NOT ONE.**
+  `__emitrust_scan_c(&mut i8)` AND `__emitrust_scan_c_u(&mut u8)`, selected
+  from the mapped type. A single `i8` helper would have made `%c` a
+  PLATFORM-DEPENDENT REJECTION wherever plain `char` is unsigned (ARM) --
+  a portability trap that the x86-64-only spike could not have surfaced and
+  that the specification did not anticipate.
+  TWO EMITTED CRATES legitimately gain bytes -- `stdio-file-roundtrip.c` and
+  `printf-string-nonascii.c` -- because requesting `__emitrust_fgetc` now
+  pulls the `Stdin` enum arm and its byte reader. Both byte-diffs still pass
+  and clippy did not move. No test golden's CHECKED bytes changed.
+  PORTABILITY WAS HANDLED BY SPLITTING THE EVIDENCE, which is the right shape
+  for a libc-measured feature: the committed EndToEnd differential pins only
+  C11-DEFINED shapes (a matching input, the single-offending-character
+  matching failure, EOF), while the glibc-specific edges -- sign consumption,
+  saturate-then-truncate -- live in helper comments and Import-level goldens
+  where the host libc is not the oracle. A differential encoding a glibc
+  quirk would fail on Darwin.
+  `fclose(stdin)` is refused as required, sharing its wording with
+  `fgetc(stdout)` / `fgets(..., stderr)` / `fread(..., stdout)` /
+  `fwrite(..., stdin)`. The pre-existing refusals around it (`FILE *f =
+  stdin;`, `fseek`/`rewind`, `ungetc`/`feof`/`ferror`) are pinned UNCHANGED
+  to prove nothing loosened.
+  NOT VERIFIED: non-glibc libc (all differentials ran on host glibc/x86-64);
+  a target where `int` is not 32-bit; and `%c` where the mapped char type is
+  neither `i8` nor `ui8` -- that last falls to a located rejection, which is
+  the safe direction.
 
 - [x] FR-191 DEFECT (opened 2026-09-03 by the FR-183 stdin spike, which found
   it while building its own oracle): **`printf("%s", buf)` OF A `char` BUFFER
