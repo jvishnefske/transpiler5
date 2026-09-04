@@ -12548,6 +12548,79 @@ piece and becomes FR-45.
   borrow across the evaluation of an argument that mutably borrows the same
   buffer -- so it is genuinely its own FR and needs a spike, not a patch.
 
+- [ ] FR-193 (opened 2026-09-04 by a 10-agent adversarial differential hunt,
+  33 agents / 997 probes / 0 errors): **THE CORRECTNESS SIGNAL WAS NOT CLEAN.
+  IT WAS CLEAN ON THE CORPORA WE GATE ON, WHICH IS THE BLIND SPOT.**
+  FR-187 recorded that the harness's correctness signal had no open items --
+  RealWorld's quarantine empty, c-testsuite 220/220, EndToEnd byte-diff 100%
+  -- and concluded new correctness information needed EXTERNAL CORPORA. That
+  was wrong in an instructive way: it needed new PROGRAMS, not new
+  repositories. 997 adversarially-constructed probes over ten partitioned
+  areas, each byte-diffed against a clang native, found a compiler HANG and
+  several silent miscompiles in a tree whose every gate was green.
+  METHOD, the part worth reusing: partition the surface, one agent per area,
+  `cargo build` declared INSUFFICIENT up front (all three miscompiles found
+  in the preceding two days built clean), then every finding handed to an
+  independent agent told to REFUTE it and to check well-definedness FIRST --
+  because the dominant failure mode of such a hunt is a prober writing UB,
+  seeing two compilers legally differ, and calling it a bug.
+  **HONEST CAVEAT: 0 of 23 were refuted.** From a default-to-refuted verifier
+  that is normally a rubber-stamp signature. Sampled verdicts are genuinely
+  rigorous (both sides rebuilt independently, three locales, hexdumps, exit
+  codes, explicit UB analysis), so the rate is probably real -- recorded here
+  rather than presented as clean confirmation.
+  **AND 23 FINDINGS ARE ~14 DISTINCT DEFECTS.** Seven are ONE root cause
+  reached through seven entry points. Counting reports as defects would
+  overstate by 60% -- the same error class as counting first-failures as case
+  yields (FR-177/FR-178), in a new disguise.
+  DEDUPED, ranked:
+   1. **`(x as u8) as char` UTF-8 expansion** in `__emitrust_fmt_c`
+      (`ImportCFunctions.cpp:2905-2910`). `Display for char` writes UTF-8, so
+      every byte >= 0x80 becomes two. Reached by `printf("%c")`, `putchar`,
+      `sprintf("%c")` (which also RETURNS 2 instead of 1), `std::string +=`,
+      and the C++ paths. A 256-value sweep: 256 native bytes vs 384 emitted,
+      first differing at 0x80. The source documents this out of scope
+      (C99-48) -- **but a documented limitation that emits silently wrong
+      bytes is still a defect under this repo's own rule that recovery must
+      never silently emit wrong code, and the correct primitive ALREADY
+      EXISTS**: `__emitrust_byte_out` (`:3005`) does `write_all(&[b as u8])`
+      for the argv path with exactly this rationale.
+   2. **`%s` with a FIELD WIDTH is Latin-1 re-encoded.** Precisely the path
+      FR-191 excluded, reasoning "a raw `write_all` cannot pad". The
+      reasoning was right; recording it as a SCOPE NOTE rather than a live
+      miscompile was wrong.
+   3. **Recover mode SILENTLY REBINDS a caller onto a colliding function.**
+      `Foo` and `foo` are distinct C identifiers; plain mode correctly
+      refuses with a located diagnostic, while `--incremental` drops one,
+      rebinds its callers onto the survivor, exits 0, builds clean, and
+      prints the wrong answer. FR-53's entire contract is that a dropped item
+      must never be silently observable.
+   4. `p[-1]` through a pointer parameter emits `p[(-1i64) as usize]` -- but
+      ONLY on the multi-object lowering; the owner-struct path is correct, so
+      this is a divergence BETWEEN the two pointer models.
+   5. Non-termination: exponential blowup in CF-to-SCF on a long
+      switch-fallthrough chain. The compiler HANGS rather than diagnosing.
+   6. Statements preceding a `break`/`return` in a loop body are hoisted PAST
+      the loop-body local's destructor -- C++ drop ORDER, the class W2.17 and
+      FR-111 exist to fence.
+   7. `v[i].f = x` through a `std::vector` element place is LOST. **The same
+      defect FR-189 fixed for `std::unique_ptr` one day earlier, reached
+      through a different container** -- FR-189's fix was correct but its
+      scope was too narrow; the shared root is "a payload place reached
+      through a container accessor stages a copy".
+   8. Unary minus on a float emitted as `0.0 - x`, losing the sign of zero
+      and turning `-inf` into `inf`.
+   9. `long double` silently emitted as `f64` (FR-182 caught this for
+      `repr(C)` via its width check; it is general).
+  Plus UNBUILDABLE shapes -- emitrust-cc exits 0 and rustc then refuses: a
+  keyword-named extern global emitted unescaped; the `mem*`/`str*` helpers
+  called with two cursors into one array, including on DISJOINT ranges;
+  `_Bool as f64`; a method call whose pointer argument aliases the receiver
+  (E0499); `s += s` on a `std::string` (E0502).
+  Repros on disk under `scratchpad/hunt/<area>/`. NOT yet triaged into
+  separate FRs; item 1 is taken first because it is ONE change behind seven
+  entry points and the primitive already exists.
+
 - [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
   FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED
   AGGREGATE `let` ENDED ITS PREFIX.**
