@@ -2903,18 +2903,55 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   }
   if (needsCharFormatHelper && !charFormatHelperEmitted) {
     charFormatHelperEmitted = true;
-    // C-compatible `%c`/putchar rendering: C converts the int argument to
-    // unsigned char and writes that byte; `(x as u8) as char` emits the
-    // identical byte for every ASCII value (0..=127). Values 128..=255
-    // would render as two-byte UTF-8 and are documented as out of scope
-    // (design.md C99-48). Emitted once per module, after all imported
-    // items.
+    // The LATIN-1 `%c` encoder: C converts the int argument to unsigned
+    // char, and `(x as u8) as char` maps that byte to the Unicode scalar
+    // with the same value.
+    //
+    // FR-194 narrowed where this may be used, because `Display for char`
+    // writes UTF-8: printing this value renders every byte >= 0x80 as TWO
+    // bytes, which is a miscompile against C's one. The stdout positions
+    // (`printf("%c")`, `putchar`, the `fprintf(stdout, ...)` alias) now
+    // write the raw byte through `__emitrust_byte_out` instead. What is
+    // left here is the BUFFER position — `sprintf`/`snprintf`, whose
+    // formatted `String` is decoded back one byte per `char` by
+    // `__emitrust_sprintf`, so the widening is inverted exactly and never
+    // observed — plus the one stdout case where the raw write would have
+    // reordered output against a later side-effecting argument.
+    // Emitted once per module, after all imported items.
     OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
     moduleBuilder.create<emitrust::VerbatimOp>(
         UnknownLoc::get(builder.getContext()),
         moduleBuilder.getStringAttr("fn __emitrust_fmt_c(x: i32) -> char {\n"
                                     "    (x as u8) as char\n"
                                     "}"));
+  }
+  if (needsAsciiCharHelper && !asciiCharHelperEmitted) {
+    asciiCharHelperEmitted = true;
+    // FR-194: the guarded `char` for a `std::string` PUSH (`s += c`,
+    // `s.push_back(c)`).
+    //
+    // A C++ `std::string` is a byte sequence and may hold any byte; a Rust
+    // `String` is UTF-8 BY INVARIANT and cannot hold a lone byte >= 0x80 at
+    // all — pushing `(x as u8) as char` stores the two-byte UTF-8 encoding,
+    // so `size()` (a `len()` over the encoding) reports 2 where C++ reports
+    // 1 and every downstream byte offset shifts. That is a REPRESENTATION
+    // limit of the chosen model, not a rendering bug, so there is nothing to
+    // encode differently; the only sound outcomes are rejection or a loud
+    // failure. A push whose value is a compile-time constant >= 0x80 is a
+    // located rejection at import (`wrapStringPushChar`). A runtime value
+    // cannot be decided there, so it is decided HERE, at the push: the crate
+    // aborts rather than silently storing two bytes for one. Emitted once
+    // per module, after all imported items.
+    OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
+    moduleBuilder.create<emitrust::VerbatimOp>(
+        UnknownLoc::get(builder.getContext()),
+        moduleBuilder.getStringAttr(
+            "fn __emitrust_ascii_char(x: i32) -> char {\n"
+            "    let b = x as u8;\n"
+            "    assert!(b < 0x80, \"std::string: a byte >= 0x80 is not "
+            "representable in a Rust String\");\n"
+            "    b as char\n"
+            "}"));
   }
   if (needsCStrHelper && !cStrHelperEmitted) {
     cStrHelperEmitted = true;
@@ -3296,29 +3333,47 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
   }
   if (needsSprintfHelper && !sprintfHelperEmitted) {
     sprintfHelperEmitted = true;
-    // C-compatible sprintf tail: copies the formatted ASCII bytes plus the
+    // C-compatible sprintf tail: copies the formatted bytes plus the
     // terminating NUL into the destination char region and returns the
     // written length (excluding the NUL), C's sprintf result. Every write
     // is a bounds-checked slice index, so a destination too small for the
     // bytes plus the NUL panics — C leaves that overflow undefined, and
     // the deterministic panic is a legal refinement. Emitted once per
     // module, after all imported items.
+    //
+    // FR-194: the copy walks CHARACTERS, not `as_bytes()`. The formatted
+    // `String` is a LATIN-1 string by construction — every piece of it
+    // came from a byte: the format literal is restricted to printable
+    // ASCII, the numeric conversions render ASCII digits, `%c` arrives as
+    // `__emitrust_fmt_c`'s `(x as u8) as char`, and `%s` arrives as
+    // `__emitrust_cstr`'s per-byte `(b as u8) as char`. `as_bytes()` then
+    // handed back the UTF-8 ENCODING of that string, so a `%c` or `%s`
+    // byte >= 0x80 was stored as two bytes AND counted twice in the
+    // returned length — the length error propagating into every
+    // computation downstream, not just into the buffer. One `char` per
+    // byte inverts the widening exactly. A code point above 0xff cannot
+    // reach here (no non-ASCII string data survives import), and if one
+    // ever did the assert stops the crate loudly instead of truncating.
     OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
     moduleBuilder.create<emitrust::VerbatimOp>(
         UnknownLoc::get(builder.getContext()),
         moduleBuilder.getStringAttr(
             "fn __emitrust_sprintf(dest: &mut [i8], s: &str) -> i32 {\n"
-            "    let bytes = s.as_bytes();\n"
-            "    for (i, &b) in bytes.iter().enumerate() {\n"
-            "        dest[i] = b as i8;\n"
+            "    let mut n = 0usize;\n"
+            "    for ch in s.chars() {\n"
+            "        let code = ch as u32;\n"
+            "        assert!(code < 256, \"sprintf: character outside the "
+            "byte range\");\n"
+            "        dest[n] = code as u8 as i8;\n"
+            "        n += 1;\n"
             "    }\n"
-            "    dest[bytes.len()] = 0;\n"
-            "    bytes.len() as i32\n"
+            "    dest[n] = 0;\n"
+            "    n as i32\n"
             "}"));
   }
   if (needsSnprintfHelper && !snprintfHelperEmitted) {
     snprintfHelperEmitted = true;
-    // C-compatible snprintf tail: writes at most `size - 1` formatted ASCII
+    // C-compatible snprintf tail: writes at most `size - 1` formatted
     // bytes plus a terminating NUL into the destination char region (C's
     // DEFINED truncation, unlike sprintf's overflow), and returns the full
     // formatted length excluding the NUL — the value C's snprintf returns
@@ -3327,23 +3382,33 @@ LogicalResult CImporter::importTranslationUnit(clang::ASTContext &context,
     // region (a genuine C buffer overflow, undefined) panics rather than
     // writing out of bounds. Emitted once per module, after all imported
     // items.
+    //
+    // FR-194: like `__emitrust_sprintf`, the copy and the returned length
+    // walk CHARACTERS of the Latin-1 formatted string rather than the bytes
+    // of its UTF-8 encoding, so a `%c`/`%s` byte >= 0x80 occupies one
+    // destination byte and counts once — both toward the truncation bound
+    // and toward the return value.
     OpBuilder moduleBuilder = OpBuilder::atBlockEnd(module.getBody());
     moduleBuilder.create<emitrust::VerbatimOp>(
         UnknownLoc::get(builder.getContext()),
         moduleBuilder.getStringAttr(
             "fn __emitrust_snprintf(dest: &mut [i8], size: i64, s: &str) -> "
             "i32 {\n"
-            "    let bytes = s.as_bytes();\n"
-            "    if size > 0 {\n"
-            "        let cap = (size as usize) - 1;\n"
-            "        let n = if bytes.len() < cap { bytes.len() } else { cap "
-            "};\n"
-            "        for i in 0..n {\n"
-            "            dest[i] = bytes[i] as i8;\n"
+            "    let cap = if size > 0 { (size as usize) - 1 } else { 0 };\n"
+            "    let mut n = 0usize;\n"
+            "    for ch in s.chars() {\n"
+            "        let code = ch as u32;\n"
+            "        assert!(code < 256, \"snprintf: character outside the "
+            "byte range\");\n"
+            "        if n < cap {\n"
+            "            dest[n] = code as u8 as i8;\n"
             "        }\n"
-            "        dest[n] = 0;\n"
+            "        n += 1;\n"
             "    }\n"
-            "    bytes.len() as i32\n"
+            "    if size > 0 {\n"
+            "        dest[if n < cap { n } else { cap }] = 0;\n"
+            "    }\n"
+            "    n as i32\n"
             "}"));
   }
   // Hosted <string.h> helpers (design.md C99-48, CTS-L1): each requested

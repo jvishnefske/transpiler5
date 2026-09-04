@@ -1,4 +1,4 @@
-// RUN: emitrust-import-c %s | FileCheck %s
+// RUN: emitrust-import-c %s | FileCheck %s --implicit-check-not='"__emitrust_fmt_c"'
 
 int printf(const char *fmt, ...);
 
@@ -33,17 +33,27 @@ int main(void) {
   // CHECK: emitrust.cast %{{.*}} : ui64 to i32
   // CHECK: emitrust.call_opaque "println!"(%{{.*}}) {args = ["{}", 0 : index]} : (i32) -> ()
 
-  // %c routes the int-promoted argument through the on-demand
-  // __emitrust_fmt_c helper (C converts to unsigned char and prints that
-  // byte; ASCII-only).
+  // FR-194: %c writes the argument truncated to ONE BYTE through the raw
+  // __emitrust_byte_out helper. C converts the argument to unsigned char and
+  // writes THAT ONE CHARACTER (C11 7.21.6.1p8) -- one byte for every value
+  // 0..255. The __emitrust_fmt_c Display funnel this replaced widened the
+  // byte to a Unicode scalar, and `Display for char` writes UTF-8, so every
+  // byte >= 0x80 came out as two (a 256-value sweep produced 384 emitted
+  // bytes against 256 native, first differing at offset 0x80). The pending
+  // format segment flushes around the raw write, so the trailing newline
+  // becomes its own bare println!().
   printf("%c\n", 65);
-  // CHECK: %[[C:.*]] = emitrust.call_opaque "__emitrust_fmt_c"(%{{.*}}) : (i32) -> !emitrust.opaque<"char">
-  // CHECK: emitrust.call_opaque "println!"(%[[C]]) {args = ["{}", 0 : index]}
+  // CHECK: %[[C:.*]] = arith.trunci %{{.*}} : i32 to i8
+  // CHECK: emitrust.call_opaque "__emitrust_byte_out"(%[[C]]) : (i8) -> ()
+  // CHECK: emitrust.call_opaque "println!"() {args = []}
 
   return 0;
 }
 
-// The %c helper is emitted once at module level and matches C's
-// unsigned-char conversion for ASCII values.
-// CHECK: emitrust.verbatim "fn __emitrust_fmt_c(x: i32) -> char
-// CHECK-SAME: (x as u8) as char
+// The raw byte helper is emitted once at module level and writes on the same
+// globally buffered stdout handle print! locks, so ordering holds. The
+// Display funnel it replaced is no longer requested at all -- an unused
+// helper is an `unused` deny in the emitted crate, which the RUN line's
+// whole-output --implicit-check-not enforces.
+// CHECK: emitrust.verbatim "fn __emitrust_byte_out(b: i8) {
+// CHECK-SAME: write_all(&[b as u8])

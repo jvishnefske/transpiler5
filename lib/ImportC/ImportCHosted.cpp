@@ -1560,14 +1560,21 @@ LogicalResult CImporter::emitPutchar(const clang::CallExpr *call) {
   if (!intType || intType.getWidth() == 1)
     return emitError(loc) << "unsupported: putchar argument must be an "
                              "integer";
-  // C's putchar writes the argument converted to unsigned char; the
-  // `__emitrust_fmt_c` helper performs that conversion (ASCII-only, see
-  // design.md C99-48).
+  // FR-194: C's putchar writes the argument converted to unsigned char --
+  // THAT ONE CHARACTER (C11 7.21.7.9), one byte for every value 0..255. The
+  // `__emitrust_fmt_c` Display funnel this used to go through is a Latin-1
+  // widening to a Unicode scalar, and `Display for char` writes UTF-8, so
+  // every byte >= 0x80 came out as two (measured: native `c8 ff`, emitted
+  // `c3 88 c3 bf`), silently doubling the length of a `getchar`/`putchar`
+  // cat loop over binary data. `__emitrust_byte_out` writes the raw byte on
+  // the SAME globally buffered stdout handle `print!` locks, so ordering
+  // holds; putchar is a statement position with one argument and no format
+  // hole, so no evaluation-order question arises.
+  Value byte = castToIntType(loc, *value, builder.getIntegerType(8));
+  needsByteOutHelper = true;
   builder.create<emitrust::CallOpaqueOp>(
-      loc, TypeRange(), builder.getStringAttr("print!"),
-      builder.getArrayAttr(
-          {builder.getStringAttr("{}"), builder.getIndexAttr(0)}),
-      ValueRange{wrapCharFormat(loc, *value)});
+      loc, TypeRange(), builder.getStringAttr("__emitrust_byte_out"),
+      /*args=*/ArrayAttr(), ValueRange{byte});
   return success();
 }
 

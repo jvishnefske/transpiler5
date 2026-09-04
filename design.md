@@ -12621,6 +12621,67 @@ piece and becomes FR-45.
   separate FRs; item 1 is taken first because it is ONE change behind seven
   entry points and the primitive already exists.
 
+- [x] FR-194 (opened and LANDED 2026-09-04; FR-193 item 1): **THE `%c`
+  LATIN-1 FUNNEL IS CLOSED ON THE STDOUT AND BUFFER PATHS, AND REFUSED WHERE
+  IT IS UNREPRESENTABLE. It also closed a miscompile FR-191 had recorded as
+  still open.**
+  Verified independently: a 256-value `putchar` sweep plus a `sprintf("%c")`
+  length check is BYTE-IDENTICAL to the clang native (266 bytes each), where
+  the cat loop previously turned a 512-byte binary stream into 768 bytes,
+  first differing at byte 27. Gate 978/978; clippy 101 -> 101 (+0); TRACTOR
+  unchanged at 40/252; neither corpus ratchet moved in either direction.
+  THE THREE ENTRY POINTS RESOLVED THREE DIFFERENT WAYS, which is the point:
+  1. **stdout `printf("%c")` / `putchar` / the `fprintf(stdout,..)` alias --
+     FIXED** via `__emitrust_byte_out`. **And the FIELD WIDTH came with it,
+     which `%s` could not manage**: `%c` pads ONE byte to a compile-time
+     constant column, so the padding becomes literal text in the `print!`
+     segments either side of the raw write (`printf("[%5c]")` renders
+     `print!("[    ")`, the byte write, then `println!("]")`). No formatter
+     is involved, so nothing can re-encode. FR-191's ordering fence was
+     REUSED rather than duplicated -- the raw write is declined when a later
+     argument of the same call has side effects.
+  2. **`sprintf`/`snprintf` `"%c"` -- FIXED, and the soundness argument is
+     the interesting part.** `__emitrust_byte_out` is indeed unavailable (it
+     writes stdout), so the fix is at the OTHER end: **the formatted `String`
+     is Latin-1 BY CONSTRUCTION.** The format literal is restricted to
+     printable ASCII (`translatePrintfFormat` rejects any other byte),
+     numeric conversions render ASCII, `%c` arrives as `(x as u8) as char`
+     and `%s` as `__emitrust_cstr`'s per-byte `(b as u8) as char`, and every
+     route by which non-ASCII string DATA could enter is already a located
+     rejection. So every `char` in that `String` is U+0000..U+00FF and
+     walking `s.chars()` instead of `s.as_bytes()` INVERTS the widening
+     exactly -- one destination byte per char, length counted once. An
+     `assert!(code < 256)` makes an unreachable code point a loud abort
+     rather than a silent truncation.
+     **BONUS, VERIFIED: this also fixes `%s` inside `sprintf`/`snprintf` for
+     non-ASCII -- the shape FR-191 explicitly recorded as STILL A
+     MISCOMPILE.** `sprintf(out,"<%s>",buf)` with `buf[0]=0xC8` now matches
+     native. FR-191 concluded the `*_out` helpers were "structurally
+     unavailable" and stopped there; it was looking at the wrong end of the
+     pipe.
+  3. **`std::string += c` -- REFUSED, correctly.** A Rust `String` is UTF-8
+     BY INVARIANT and cannot hold a lone `0xC8` at all; `size()` is `len()`
+     over the ENCODING, so it reports 2 where C++ reports 1. That is a
+     representation limit, not a rendering bug -- there is no encoding to
+     correct. Measured native 2, pre-fix emitted 3.
+     Split by decidability rather than refused wholesale: a CONSTANT operand
+     >= 0x80 is a located rejection at import; a RUNTIME operand is guarded
+     at the push and aborts loudly. **A blanket refusal would have rejected
+     all ASCII character-at-a-time string building and could only move the
+     Cpp17Suite ratchet DOWN, which is forbidden.** Noting honestly that a
+     runtime abort is not a located diagnostic -- it is the weaker of the two
+     failure modes, chosen only where the answer is undecidable at import.
+  RESIDUAL, inherited not introduced: `printf("%c", x, ...f())` where a LATER
+  argument has side effects still takes the Latin-1 funnel and is still wrong
+  for a byte >= 0x80. It is the exact `%s` residual FR-191 named, reached
+  through the same fence, and closing it needs the byte-level `format!`
+  replacement that was already filed as a separate feature. It is PINNED as
+  the declined path so it cannot be forgotten.
+  Also untouched deliberately: the pre-existing argv `%c` bypass
+  (`matchArgvByteRead`) ignores both the field width and the side-effect
+  fence; it is checked first so it wins for argv byte reads, and widening it
+  would have enlarged the blast radius on existing goldens.
+
 - [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
   FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED
   AGGREGATE `let` ENDED ITS PREFIX.**

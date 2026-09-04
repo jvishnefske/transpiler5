@@ -1073,3 +1073,13 @@ summary = "Opened 2026-09-04. 33 agents, 997 probes over ten partitioned areas o
 blocked_by = []
 anchor = "FR-193 (opened 2026-09-04 by a 10-agent adversarial differential hunt,"
 
+[[items]]
+id = "FR-194"
+kind = "defect"
+status = "landed"
+size = "M"
+title = "The %c Latin-1 funnel closed on stdout and buffer paths, refused where unrepresentable; also fixed a miscompile FR-191 left open"
+summary = "LANDED 2026-09-04, FR-193 item 1. Verified independently: a 256-value putchar sweep plus a sprintf(%c) length check is BYTE-IDENTICAL to clang (266 bytes each); the cat loop previously turned 512 bytes into 768, first differing at byte 27. Gate 978/978, clippy 101 -> 101 (+0), TRACTOR 40/252 unchanged, neither corpus ratchet moved. THREE ENTRY POINTS, THREE DIFFERENT RESOLUTIONS. (1) stdout printf(%c)/putchar/fprintf-alias FIXED via __emitrust_byte_out -- and the FIELD WIDTH came with it, which %s could not manage, because %c pads ONE byte to a compile-time-constant column so the padding becomes literal text in the print! segments either side of the raw write; FR-191's ordering fence was reused, not duplicated. (2) sprintf/snprintf %c FIXED, and the soundness argument is the interesting part: __emitrust_byte_out is unavailable, so the fix is at the OTHER end -- the formatted String is LATIN-1 BY CONSTRUCTION (format literal restricted to printable ASCII, numeric conversions ASCII, %c as (x as u8) as char, %s per-byte likewise, every non-ASCII data route already a located rejection), so walking s.chars() instead of s.as_bytes() inverts the widening exactly, with assert!(code < 256) as a loud backstop. BONUS VERIFIED: this also fixes %s inside sprintf for non-ASCII, the shape FR-191 recorded as STILL A MISCOMPILE -- FR-191 concluded the *_out helpers were structurally unavailable and stopped, but it was looking at the wrong end of the pipe. (3) std::string += c REFUSED correctly: a Rust String is UTF-8 by invariant and cannot hold a lone 0xC8; size() is len() over the ENCODING, reporting 2 where C++ reports 1 -- a representation limit, not a rendering bug. Split by decidability: constant operand is a located rejection, runtime operand aborts loudly; a blanket refusal would have rejected all ASCII char-at-a-time string building and could only move the Cpp17Suite ratchet DOWN. RESIDUAL inherited not introduced: printf(%c, x, ...f()) with a side-effecting later argument still takes the funnel -- the same residual FR-191 named, pinned as the declined path."
+blocked_by = []
+anchor = "FR-194 (opened and LANDED 2026-09-04; FR-193 item 1): **THE `%c`"
+
