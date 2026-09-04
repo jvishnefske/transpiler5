@@ -4020,11 +4020,20 @@ CImporter::matchStlBoxPayloadPlaceBase(const clang::Expr *expr) {
 }
 
 bool CImporter::isStlBoxWriteExpr(const clang::Expr *expr) {
-  const clang::Expr *e = expr->IgnoreParens();
-  if (const auto *member = llvm::dyn_cast<clang::MemberExpr>(e);
-      member && member->isArrow())
-    return matchStlBoxDerefBase(member->getBase()) != nullptr;
-  return matchStlBoxDerefBase(e) != nullptr;
+  // FR-189: ONE walker, shared with FR-188's argument-side rejection.
+  // This used to answer the question itself and stopped after one hop --
+  // a bare `*p`, or an ARROW MemberExpr directly over it -- so
+  // `(*p).field = v`, `p->a.b = v` and `(*p).arr[i] = v` all reported
+  // "not a payload write" and took the SHARED `Deref::deref` borrow.
+  // For the non-arrow spellings that was a SILENT MISCOMPILE (the store
+  // landed on a staged copy of the whole payload and was discarded:
+  // measured native `id=6 tag=2` against emitted `id=0 tag=0`), and for
+  // the nested arrow ones a deferred rustc E0594. Keying on
+  // `matchStlBoxPayloadPlaceBase` instead makes the predicate exactly the
+  // set of places carved out of a Box payload, which is the set that
+  // needs the mutable borrow -- and makes it IMPOSSIBLE for the two
+  // predicates to drift apart, which is how the hole opened.
+  return matchStlBoxPayloadPlaceBase(expr) != nullptr;
 }
 
 FailureOr<Value> CImporter::emitStlBoxDerefRef(Value receiver,

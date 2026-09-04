@@ -12860,7 +12860,7 @@ piece and becomes FR-45.
   must be closed and epoch-6 frozen; the numbers are not comparable across
   that boundary.
 
-- [ ] FR-189 DEFECT (opened 2026-09-03 by FR-188, deliberately NOT fixed
+- [x] FR-189 DEFECT (opened 2026-09-03 by FR-188, deliberately NOT fixed
   there): **`(*p).field = v` ON A `std::unique_ptr` PAYLOAD IS A SILENT
   MISCOMPILE TODAY, AND THE FIX IS WIDENING, NOT REJECTION.**
   Same root cause as FR-188's third shape -- `isStlBoxWriteExpr` does not
@@ -12883,6 +12883,49 @@ piece and becomes FR-45.
   Both are the FR-140/141/142/146 silent-unbuildable-or-wrong class. Neither
   is reachable through the arrow spelling, which is why the corpus never
   caught them.
+  **FIXED 2026-09-03 BY WIDENING, both halves. Verified independently: native
+  `id=6 tag=2`, emitted `id=6 tag=2`.** Gate 974/974; clippy 101 -> 101 (+0);
+  TRACTOR unchanged at 40/252.
+  **THE ROOT CAUSE WAS ONE LEVEL DEEPER THAN THIS ENTRY SAID, and the
+  increment is right that the specified fix was necessary but NOT
+  sufficient.** `*p` is a `CXXOperatorCallExpr`, which IS a
+  `clang::CallExpr`, so `emitMemberBasePlace`'s `f().m` branch claimed
+  `(*p).field` before anything else and staged a COPY of the whole payload:
+  `deref` -> `load` -> `variable` -> `assign` -> `member` on the copy.
+  Teaching `isStlBoxWriteExpr` the non-arrow form alone would have fixed the
+  borrow MUTABILITY but not the copy -- turning the silent miscompile into a
+  loud E0594, and leaving the read half at E0507. The second edit, a branch
+  in `emitMemberBasePlace` placed AHEAD of the CallExpr branch that routes
+  the base through `emitLValue`, is what deletes the copy and makes the two
+  spellings converge on ONE path, which is what this entry actually asked
+  for.
+  `isStlBoxWriteExpr` is now a thin wrapper over FR-188's
+  `matchStlBoxPayloadPlaceBase`, reusable exactly as-is, so no second walker
+  exists to drift out of agreement with the first.
+  **TWO MORE BROKEN SHAPES WERE FOUND BY PROBING, SAME ROOT CAUSE, ALSO
+  FIXED**: the ARROW nested and subscript writes `p->a.x = v` and
+  `p->arr[i] = v` were rustc E0594 ("cannot assign ... not declared as
+  mutable") whenever no other statement had already forced the Box binding
+  mutable. So the defect was never only about the non-arrow spelling.
+  ADDITIVITY PROVEN BY DIFFERENTIAL, not by assertion: the pre-fix tools were
+  built and snapshotted, then the fix re-applied (diff + checkout + apply -3,
+  never `git stash` -- the stash is shared across worktrees). Over ALL 1026
+  `.c`/`.cpp` files under `test/` plus all 220 `third_party/c-testsuite`
+  files: **changed = 2, and both are the new test files. Zero return-code
+  changes, zero IR-byte changes, no golden moved.** No previously-importing
+  program now rejects, and none newly imports -- the defect never rejected,
+  it EMITTED. What changed is downstream: crates that were unbuildable now
+  build, and the one that built clean with a wrong answer now gives the right
+  one.
+  Adversarial shapes probed and byte-diffed clean afterwards, including the
+  ones most likely to double-borrow: `(*p).arr[(*p).z] = v` (no E0499 -- the
+  write-context index read did not double-borrow), `(*p).z = p->arr[0]+2`
+  (mixed spellings in one statement), `(*p).arr[i] += (*p).z`, and
+  `(*p).z = (*p).m()`.
+  FR-188's rejections still fire byte-identically, re-probed against the
+  rebuilt tool including the NEWLY-REACHABLE chains `hi((*p).a.x)` and
+  `hi((*p).arr[1])`: **widening the PLACE did not widen the callee-driven
+  borrow mutability**, which remains FR-188's separately deferred increment.
 
 - [x] FR-190 (opened 2026-09-03; SPIKED GO and LANDED the same day): **FOLD
   `std::ops::Deref::deref(&p)` TO `*p` AT EMISSION -- 19 WARNINGS, ZERO

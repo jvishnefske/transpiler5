@@ -6496,6 +6496,28 @@ CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
                     .create<emitrust::DerefOp>(
                         loc, emitrust::LValueType::get(pointee), *base)
                     .getResult();
+  } else if (!member->isArrow() &&
+             matchStlBoxDerefBase(member->getBase()) != nullptr) {
+    // FR-189: `(*p).field` over a recognized std::unique_ptr. It MUST be
+    // intercepted ahead of the `f().m` branch below, because `*p` is a
+    // `CXXOperatorCallExpr` and therefore a `CallExpr`: that branch
+    // claimed it, LOADED the whole payload out of the Deref borrow and
+    // staged it into a fresh temporary. Reads of a non-`Copy` payload
+    // then failed as rustc E0507 (a user destructor is enough), and
+    // WRITES landed on the temporary and were silently discarded --
+    // measured native `id=6 tag=2` against emitted `id=0 tag=0`, on a
+    // crate that built clean.
+    //
+    // `p->field` was never affected because the arrow branch above hands
+    // the borrow itself back. Routing the non-arrow spelling through
+    // `emitLValue` converges the two on ONE payload place: the borrow
+    // (shared, or `DerefMut` under `stlBoxWriteContext`) refined by an
+    // `emitrust.deref`, with the member projection applied to it rather
+    // than to a copy.
+    FailureOr<Value> base = emitLValue(member->getBase(), writeback);
+    if (failed(base))
+      return failure();
+    basePlace = *base;
   } else if (const clang::CallExpr *call = [&]() -> const clang::CallExpr * {
                // `f().m`: clang wraps the struct-returning call's result
                // in a MaterializeTemporaryExpr; peel it to the call.
