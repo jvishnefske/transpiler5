@@ -3256,12 +3256,14 @@ private:
   const clang::Expr *matchStlBoxDerefBase(const clang::Expr *expr);
 
   /// FR-188: the `p` sub-expression of the recognized `std::unique_ptr`
-  /// whose PAYLOAD the place `expr` designates, or null. Unlike
-  /// `isStlBoxWriteExpr` this walks the whole member/subscript projection
-  /// chain and accepts the NON-arrow spelling `(*p).field` as well as
-  /// `p->field` and the bare `*p`, because all three resolve to the same
-  /// payload borrow and the argument rejection keyed on it must not have
-  /// a spelling-shaped hole. A purely AST-side probe; emits no IR.
+  /// whose PAYLOAD the place `expr` designates, or null. Walks the whole
+  /// member/subscript projection chain and accepts the NON-arrow spelling
+  /// `(*p).field` as well as `p->field` and the bare `*p`, because all
+  /// three resolve to the same payload borrow and a predicate over it
+  /// must not have a spelling-shaped hole. FR-189 made `isStlBoxWriteExpr`
+  /// defer to this one too, so there is exactly one answer in the
+  /// importer to "is this place carved out of a Box payload". A purely
+  /// AST-side probe; emits no IR.
   const clang::Expr *matchStlBoxPayloadPlaceBase(const clang::Expr *expr);
 
   /// W2.21: a `&Box<T>` / `&mut Box<T>` borrow forwarded through
@@ -3283,9 +3285,13 @@ private:
                                         bool wantMut, Location loc);
 
   /// W2.21: whether the place `expr` designates is rooted in a recognized
-  /// `std::unique_ptr` dereference (`*p` or `p->field`). The three WRITE
+  /// `std::unique_ptr` dereference (`*p`, `p->field`, `(*p).field`, and
+  /// the nested `p->a.b` / `(*p).arr[i]` chains). The three WRITE
   /// positions consult it to (a) take the mutable borrow and (b) evaluate
   /// the right-hand side FIRST, exactly as W2.20's map places must.
+  /// FR-189 made it a thin wrapper over `matchStlBoxPayloadPlaceBase` so
+  /// the write predicate and FR-188's argument predicate cannot disagree
+  /// about what a payload place is.
   bool isStlBoxWriteExpr(const clang::Expr *expr);
 
   /// W2.21: set while the LHS place of an assignment / compound assignment
