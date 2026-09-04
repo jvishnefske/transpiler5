@@ -8266,12 +8266,57 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
     bool isIntArgument = argIntType && argIntType.getWidth() > 1;
 
     if (spec == 'c') {
-      // C converts the argument to unsigned char and prints that byte;
-      // the i32 argument (chars arrive int-promoted) goes through the
-      // `__emitrust_fmt_c` helper (ASCII-only, see design.md C99-48).
+      // C converts the argument to unsigned char and writes THAT ONE
+      // CHARACTER (C11 7.21.6.1p8) — exactly one byte for every value
+      // 0..255.
       if (!isIntArgument)
         return emitError(loc) << "unsupported: printf argument " << argNumber
                               << " does not match its format specifier";
+      // FR-194: in a stdout `print!` context the byte goes out RAW, through
+      // the same `__emitrust_byte_out` helper the argv `%c` path and the
+      // `std::ostream << char` operand already use. The `__emitrust_fmt_c`
+      // Display funnel below is a Latin-1 widening to a Unicode scalar and
+      // `Display for char` writes UTF-8, so every byte >= 0x80 came out as
+      // TWO bytes (measured on a 256-value sweep: 256 native stdout bytes
+      // vs 384 emitted, first differing at offset 0x80).
+      //
+      // A FIELD WIDTH is no obstacle here, unlike `%s`: C pads the ONE byte
+      // to `width` columns with spaces, and `width` is a compile-time
+      // constant, so the padding is literal text in the format segments
+      // around the raw write and needs no formatter. What DOES decline the
+      // bypass is the ordering fence FR-191 established: flushing the
+      // pending segment (and writing this byte) moves output BEFORE the
+      // evaluation of the arguments still to come, where C evaluates every
+      // argument before printf writes anything. A later argument with side
+      // effects therefore keeps the whole call on the Display funnel — the
+      // same restriction, reusing the same mechanism, rather than a second
+      // one.
+      bool wantRawByte = allowRawBypass;
+      if (wantRawByte)
+        for (unsigned k = argIndex, e = call->getNumArgs(); k < e; ++k)
+          if (call->getArg(k)->HasSideEffects(astContext()))
+            wantRawByte = false;
+      if (wantRawByte) {
+        if (rawBypassed)
+          *rawBypassed = true;
+        std::string pad(widthValue > 1 ? widthValue - 1 : 0, ' ');
+        if (!leftAlign)
+          rustFormat += pad;
+        flushSegment();
+        Value byte = castToIntType(loc, *argument, builder.getIntegerType(8));
+        needsByteOutHelper = true;
+        builder.create<emitrust::CallOpaqueOp>(
+            loc, TypeRange(), builder.getStringAttr("__emitrust_byte_out"),
+            /*args=*/ArrayAttr(), ValueRange{byte});
+        if (leftAlign)
+          rustFormat += pad;
+        continue;
+      }
+      // A buffer context (`sprintf`/`snprintf`) and the declined-bypass
+      // stdout case keep the Latin-1 funnel: the i32 argument (chars arrive
+      // int-promoted) becomes the `char` whose code point IS the byte. In
+      // the buffer context that is exact, because `__emitrust_sprintf`
+      // decodes the formatted `String` back one byte per `char`.
       operands.push_back(wrapCharFormat(loc, *argument));
       rustFormat += textPlaceholder();
       continue;
@@ -8757,6 +8802,46 @@ CImporter::emitPrintfStringArg(const clang::Expr *expr,
   }
   return emitError(loc) << "unsupported: printf '%s' argument must be a "
                            "string literal or a char array";
+}
+
+FailureOr<Value> CImporter::wrapStringPushChar(Location loc,
+                                               const clang::Expr *argExpr,
+                                               Value value,
+                                               llvm::StringRef entity) {
+  // FR-194: this is a STORE, not a rendering. A C++ `std::string` is a byte
+  // sequence that may hold any byte; a Rust `String` is UTF-8 by invariant
+  // and cannot hold a lone byte >= 0x80 at all, so pushing the Latin-1
+  // `char` for such a byte stores its two-byte UTF-8 encoding and `size()`
+  // then reports 2 where C++ reports 1 (measured on `s += (char)0xc8`).
+  // There is no encoding that fixes that inside the current model, so the
+  // only outcomes available are rejection and a loud failure.
+  //
+  // A constant operand is decidable right here and gets the located
+  // rejection this repo prefers. A runtime operand is not, and rejecting
+  // every one of them would refuse the whole ASCII world of
+  // character-at-a-time string building for the sake of a value that may
+  // never occur, so it takes the runtime guard instead: silence is what is
+  // forbidden, not lateness.
+  clang::Expr::EvalResult constant;
+  if (argExpr->EvaluateAsInt(constant, astContext())) {
+    uint64_t byte = constant.Val.getInt().getExtValue() & 0xff;
+    if (byte >= 0x80)
+      return emitError(loc)
+             << "unsupported: " << entity
+             << " of a byte >= 0x80: a Rust String is UTF-8 and cannot "
+                "hold it";
+    // A constant that IS ASCII needs no guard at all.
+    return wrapCharFormat(loc, value);
+  }
+  needsAsciiCharHelper = true;
+  Value promoted = castToIntType(loc, value, builder.getI32Type());
+  auto charType = emitrust::OpaqueType::get(builder.getContext(), "char");
+  return builder
+      .create<emitrust::CallOpaqueOp>(
+          loc, TypeRange{charType},
+          builder.getStringAttr("__emitrust_ascii_char"),
+          /*args=*/ArrayAttr(), ValueRange{promoted})
+      .getResult(0);
 }
 
 Value CImporter::wrapCharFormat(Location loc, Value value) {

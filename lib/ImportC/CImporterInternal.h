@@ -5419,10 +5419,26 @@ private:
                       bool *rawByteSlice = nullptr);
 
   /// Wraps an integer value for a `%c` directive: casts it to i32 and
-  /// routes it through the `__emitrust_fmt_c` helper (C converts the
-  /// argument to unsigned char and prints that byte; the helper matches C
-  /// byte-for-byte for ASCII values, see design.md C99-48).
+  /// routes it through the `__emitrust_fmt_c` Latin-1 encoder (C converts
+  /// the argument to unsigned char; the helper maps that byte to the
+  /// Unicode scalar of the same value). FR-194: only a consumer that
+  /// DECODES that widening again may use this — `__emitrust_sprintf`
+  /// walking the formatted string one `char` per byte does; `print!`,
+  /// whose `Display for char` writes UTF-8, does not, and the stdout
+  /// positions take `__emitrust_byte_out` instead.
   Value wrapCharFormat(Location loc, Value value);
+
+  /// FR-194: wraps the char operand of a `std::string` push (`s += c`,
+  /// `s.push_back(c)`), which is NOT a formatting position — the byte is
+  /// STORED. A Rust `String` is UTF-8 by invariant and cannot hold a lone
+  /// byte >= 0x80 at all, so a constant operand outside 0..0x7f is a
+  /// located rejection here (`entity` names the C++ spelling for the
+  /// diagnostic) and a runtime operand is routed through
+  /// `__emitrust_ascii_char`, whose assert aborts the crate rather than
+  /// letting it store two bytes for one.
+  FailureOr<Value> wrapStringPushChar(Location loc,
+                                      const clang::Expr *argExpr, Value value,
+                                      llvm::StringRef entity);
 
   /// Lowers a statement-position `puts(s)` call to
   /// `emitrust.call_opaque "println!"` using the `%s` machinery
@@ -5430,10 +5446,11 @@ private:
   /// definition.
   LogicalResult emitPuts(const clang::CallExpr *call);
 
-  /// Lowers a statement-position `putchar(c)` call to
-  /// `emitrust.call_opaque "print!"` of the argument routed through
-  /// `__emitrust_fmt_c`. Only called when `putchar` has no user
-  /// definition.
+  /// Lowers a statement-position `putchar(c)` call to a raw
+  /// `__emitrust_byte_out` write of the argument truncated to one byte --
+  /// C writes `(unsigned char)c`, exactly one byte for every value
+  /// (C11 7.21.7.9), on the same buffered stdout handle `print!` locks
+  /// (FR-194). Only called when `putchar` has no user definition.
   LogicalResult emitPutchar(const clang::CallExpr *call);
 
   /// Maps a hosted `<math.h>` function name to the safe Rust callable it
@@ -7494,14 +7511,27 @@ private:
   /// True once the `__emitrust_fmt_f64` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool floatFormatHelperEmitted = false;
-  /// True once a `%c` printf directive (or a putchar call) has been
-  /// imported; triggers the one-per-module emission of the
-  /// `__emitrust_fmt_c` helper that renders the argument as C does
-  /// (converted to unsigned char; ASCII-only, see design.md C99-48).
+  /// True once a `%c` printf directive in a BUFFER context
+  /// (`sprintf`/`snprintf`), or a stdout one whose raw-byte write would
+  /// have reordered output against a later side-effecting argument, has
+  /// been imported; triggers the one-per-module emission of the
+  /// `__emitrust_fmt_c` Latin-1 encoder. FR-194: the ordinary stdout
+  /// positions no longer request it — they write the raw byte through
+  /// `__emitrust_byte_out`, because `Display for char` is UTF-8 and turns
+  /// every byte >= 0x80 into two.
   bool needsCharFormatHelper = false;
   /// True once the `__emitrust_fmt_c` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool charFormatHelperEmitted = false;
+  /// True once a `std::string` push (`s += c`, `s.push_back(c)`) of a
+  /// non-constant char has been imported; triggers the one-per-module
+  /// emission of the `__emitrust_ascii_char` helper, whose assert turns a
+  /// byte a Rust `String` cannot hold into a loud abort instead of a
+  /// silent two-byte store (FR-194).
+  bool needsAsciiCharHelper = false;
+  /// True once the `__emitrust_ascii_char` helper has been emitted, so a
+  /// multi-TU import never emits it twice.
+  bool asciiCharHelperEmitted = false;
   /// True once a `%s` char-array argument has been imported; triggers the
   /// one-per-module emission of the `__emitrust_cstr` helper that renders
   /// a char array up to its first NUL, matching C's `%s`.

@@ -1,4 +1,4 @@
-// RUN: emitrust-import-c %s | FileCheck %s --implicit-check-not='"__emitrust_cstr_n"'
+// RUN: emitrust-import-c %s | FileCheck %s --implicit-check-not='"__emitrust_cstr_n"' --implicit-check-not='"__emitrust_fmt_c"'
 
 // C99-47: integer precision, the '+'/' '/'#' flags, the h/hh/ll length
 // modifiers, %s precision/width, and %c width.
@@ -54,10 +54,22 @@ int main(void) {
   // CHECK: emitrust.call_opaque "__emitrust_cstr_n_out"(%{{.*}}, %{{.*}}) : (!emitrust.ref<!emitrust.slice<i8>>, i64) -> ()
   // CHECK: emitrust.call_opaque "println!"() {args = []}
 
-  // Width on %s and %c right-aligns by default (C's rule; Rust's string
-  // formatting would left-align, so the alignment is explicit).
+  // Width on %s right-aligns by default (C's rule; Rust's string formatting
+  // would left-align, so the alignment is explicit). FR-194: a WIDTH-BEARING
+  // %c still writes its raw byte, because C pads the ONE byte to the field
+  // with spaces and the width is a compile-time constant -- the padding is
+  // literal text in the segments AROUND the raw write, so no formatter is
+  // needed and no byte >= 0x80 ever reaches the UTF-8 `Display for char`.
+  // That is the difference from %s, whose padding depends on a length only
+  // the formatter knows at run time and which therefore keeps the funnel.
   printf("[%10s][%-10s][%5c][%-5c]\n", "x", "y", 65, 66);
-  // CHECK: emitrust.call_opaque "println!"({{.*}}) {args = ["[{:>10}][{:<10}][{:>5}][{:<5}]", 0 : index, 1 : index, 2 : index, 3 : index]}
+  // CHECK: emitrust.call_opaque "print!"(%{{.*}}, %{{.*}}) {args = ["[{:>10}][{:<10}][    ", 0 : index, 1 : index]}
+  // CHECK: %[[C65:.*]] = arith.trunci %{{.*}} : i32 to i8
+  // CHECK: emitrust.call_opaque "__emitrust_byte_out"(%[[C65]]) : (i8) -> ()
+  // CHECK: emitrust.call_opaque "print!"() {args = ["]["]}
+  // CHECK: %[[C66:.*]] = arith.trunci %{{.*}} : i32 to i8
+  // CHECK: emitrust.call_opaque "__emitrust_byte_out"(%[[C66]]) : (i8) -> ()
+  // CHECK: emitrust.call_opaque "println!"() {args = ["    ]"]}
 
   return 0;
 }
@@ -68,6 +80,7 @@ int main(void) {
 // twin is unreferenced and must not be emitted (an unused helper is an
 // `unused` deny in the emitted crate).
 // CHECK: emitrust.verbatim "fn __emitrust_cstr_n_out(s: &[i8], n: i64) {
+// CHECK: emitrust.verbatim "fn __emitrust_byte_out(b: i8) {
 // CHECK: emitrust.verbatim "fn __emitrust_fmt_int(neg: bool, mag: u64, base: i32, prec: i32,
 // CHECK: emitrust.verbatim "fn __emitrust_fmt_i64(x: i64, prec: i32, width: i32, flags: i32) -> String
 // CHECK-SAME: x.unsigned_abs()

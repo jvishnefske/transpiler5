@@ -4535,8 +4535,10 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
   if (methodName == "empty")
     return emitEmptyCall();
   // W2.6: push_back(c) is the method spelling of `+= 'c'` and reuses its
-  // exact emission (`push(c as char)` via the printf-'%c' ASCII policy in
-  // wrapCharFormat); clear() mirrors the vector spelling.
+  // exact emission (`push(c as char)`); clear() mirrors the vector
+  // spelling. FR-194: the char goes through `wrapStringPushChar`, because a
+  // Rust `String` is UTF-8 and physically cannot hold a byte >= 0x80 --
+  // storing one silently costs two bytes and a wrong `size()`.
   if (methodName == "push_back") {
     if (call->getNumArgs() != 1)
       return emitError(loc)
@@ -4547,10 +4549,13 @@ CImporter::emitStlMemberCall(const clang::CXXMemberCallExpr *call) {
     FailureOr<Value> argument = emitRValue(call->getArg(0));
     if (failed(argument))
       return failure();
-    Value character = wrapCharFormat(loc, *argument);
+    FailureOr<Value> character = wrapStringPushChar(
+        loc, call->getArg(0), *argument, "std::string::push_back");
+    if (failed(character))
+      return failure();
     builder.create<emitrust::MethodCallOp>(loc, TypeRange(), *receiver,
                                            builder.getStringAttr("push"),
-                                           ValueRange{character});
+                                           ValueRange{*character});
     return Value();
   }
   if (methodName == "clear") {
@@ -4855,15 +4860,20 @@ CImporter::emitStlOperatorCall(const clang::CXXOperatorCallExpr *call) {
       return Value();
     }
     if (rhsType->isIntegerType()) {
-      // `s += 'c'`: `push(c as char)`, reusing the printf '%c' char
-      // conversion (`wrapCharFormat`) — the same ASCII-only policy.
+      // `s += 'c'`: `push(c as char)`. FR-194: a Rust `String` is UTF-8 by
+      // invariant, so a byte >= 0x80 is not merely rendered wrong, it is
+      // UNREPRESENTABLE -- `wrapStringPushChar` rejects a constant one at
+      // import and guards a runtime one at the push.
       FailureOr<Value> rhsValue = emitRValue(rhs);
       if (failed(rhsValue))
         return failure();
-      Value character = wrapCharFormat(loc, *rhsValue);
+      FailureOr<Value> character =
+          wrapStringPushChar(loc, rhs, *rhsValue, "std::string::operator+=");
+      if (failed(character))
+        return failure();
       builder.create<emitrust::MethodCallOp>(loc, TypeRange(), *receiver,
                                              builder.getStringAttr("push"),
-                                             ValueRange{character});
+                                             ValueRange{*character});
       return Value();
     }
     return emitError(loc)

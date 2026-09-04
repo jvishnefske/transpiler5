@@ -1,4 +1,4 @@
-// RUN: emitrust-import-c %s | FileCheck %s --implicit-check-not='"__emitrust_cstr"'
+// RUN: emitrust-import-c %s | FileCheck %s --implicit-check-not='"__emitrust_cstr"' --implicit-check-not='"__emitrust_fmt_c"'
 
 int printf(const char *fmt, ...);
 int puts(const char *s);
@@ -56,18 +56,28 @@ int main(void) {
   // CHECK: emitrust.call_opaque "__emitrust_cstr_out"
   // CHECK: emitrust.call_opaque "println!"() {args = []}
 
-  // Definition-less putchar lowers to print! of the argument routed
-  // through __emitrust_fmt_c (C converts to unsigned char).
+  // FR-194: definition-less putchar writes the argument truncated to ONE
+  // BYTE through __emitrust_byte_out. C writes `(unsigned char)c` -- that one
+  // character (C11 7.21.7.9) -- for every value 0..255; the __emitrust_fmt_c
+  // Display funnel this replaced widened the byte to a Unicode scalar and
+  // `Display for char` writes UTF-8, so a byte >= 0x80 came out as two and a
+  // getchar/putchar cat loop silently doubled the length of any binary input
+  // (measured: native `c8 ff`, emitted `c3 88 c3 bf`). There is no format
+  // hole and no second argument, so no print! is emitted at all.
   putchar('A');
-  // CHECK: %[[CH:.*]] = emitrust.call_opaque "__emitrust_fmt_c"(%{{.*}}) : (i32) -> !emitrust.opaque<"char">
-  // CHECK: emitrust.call_opaque "print!"(%[[CH]]) {args = ["{}", 0 : index]}
+  // CHECK: %[[CH:.*]] = arith.trunci %{{.*}} : i32 to i8
+  // CHECK: emitrust.call_opaque "__emitrust_byte_out"(%[[CH]]) : (i8) -> ()
   return 0;
 }
 
-// Both helpers are emitted once at module level; __emitrust_cstr_out honors
-// C's stop-at-first-NUL semantics by scanning for the terminator, and the
-// Display funnel it replaced is no longer requested at all (an unused helper
-// is an `unused` deny in the emitted crate).
-// CHECK: emitrust.verbatim "fn __emitrust_fmt_c(x: i32) -> char
+// Both raw-bytes helpers are emitted once at module level, and both write on
+// the same globally buffered stdout handle print! locks; __emitrust_cstr_out
+// honors C's stop-at-first-NUL semantics by scanning for the terminator. The
+// two Display funnels they replaced (__emitrust_cstr, __emitrust_fmt_c) are
+// no longer requested at all -- an unused helper is an `unused` deny in the
+// emitted crate -- which the whole-output --implicit-check-not on the RUN
+// line pins for both.
 // CHECK: emitrust.verbatim "fn __emitrust_cstr_out(s: &[i8]) {
 // CHECK-SAME: position(|&b| b == 0)
+// CHECK: emitrust.verbatim "fn __emitrust_byte_out(b: i8) {
+// CHECK-SAME: write_all(&[b as u8])
