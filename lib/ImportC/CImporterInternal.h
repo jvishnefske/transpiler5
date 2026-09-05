@@ -3266,6 +3266,19 @@ private:
   /// AST-side probe; emits no IR.
   const clang::Expr *matchStlBoxPayloadPlaceBase(const clang::Expr *expr);
 
+  /// FR-196: the STL ELEMENT PLACE call `expr` is, or null. Exactly the
+  /// set of call spellings `emitLValue` already resolves to a genuine
+  /// place -- `v[i]` / `m[k]` (`operator[]` on a std class) and
+  /// `v.at(i)` / `v.front()` / `v.back()` -- restricted to the ones clang
+  /// types as an LVALUE, i.e. the ones that really return `T&`.
+  ///
+  /// It exists because every one of those spellings is a `clang::CallExpr`
+  /// (`operator[]` is a `CXXOperatorCallExpr`), so `emitMemberBasePlace`'s
+  /// `f().m` branch claimed `v[i].f` and staged a COPY of the element --
+  /// the identical trap FR-189 found one container over on `(*p).field`.
+  /// A purely AST-side probe; emits no IR.
+  const clang::Expr *matchStlElementPlaceCall(const clang::Expr *expr);
+
   /// W2.21: a `&Box<T>` / `&mut Box<T>` borrow forwarded through
   /// `Deref::deref` / `DerefMut::deref_mut`, yielding a reference to the
   /// PAYLOAD. The UFCS free-call spelling is `emitStlMapEntryPlace`'s

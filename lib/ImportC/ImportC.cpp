@@ -6523,6 +6523,35 @@ CImporter::emitMemberBasePlace(const clang::MemberExpr *member, Location loc,
     if (failed(base))
       return failure();
     basePlace = *base;
+  } else if (!member->isArrow() &&
+             matchStlElementPlaceCall(member->getBase()) != nullptr) {
+    // FR-196: `v[i].f`, `v.at(i).f`, `v.front().f`, `v.back().f` -- a
+    // member projected out of an STL ELEMENT place. Like FR-189's
+    // `(*p).field` one branch up, it MUST be intercepted ahead of the
+    // `f().m` branch below, because `v[i]` is a `CXXOperatorCallExpr` and
+    // `v.at(i)` a `CXXMemberCallExpr`: that branch claimed all of them,
+    // LOADED the whole element into a fresh temporary and projected the
+    // member out of the COPY.
+    //
+    // For a READ that is merely wasteful (and rustc E0507 once the
+    // element is not `Copy`). For a WRITE it was worse than FR-189's:
+    // there the store at least landed somewhere, on the copy; here the
+    // copy is never read back, so dead-store elimination deletes BOTH the
+    // staging load and the store and the assignment statement vanishes
+    // outright -- `v[0].x = 99` emitted as a bare `let _v6: P;`. Measured
+    // native `99`, emitted `1`, on a crate that built clean.
+    //
+    // `emitLValue` has resolved these element places since W2.3/W2.6 --
+    // which is why `v[i] = q` and a mutating range-for were always
+    // correct -- so routing the base there converges the whole-element
+    // and member-projection spellings on ONE place, exactly as FR-189
+    // converged `p->field` and `(*p).field`. Receivers `emitLValue`
+    // cannot resolve keep their located rejections there; nothing
+    // silently drops.
+    FailureOr<Value> base = emitLValue(member->getBase(), writeback);
+    if (failed(base))
+      return failure();
+    basePlace = *base;
   } else if (const clang::CallExpr *call = [&]() -> const clang::CallExpr * {
                // `f().m`: clang wraps the struct-returning call's result
                // in a MaterializeTemporaryExpr; peel it to the call.
