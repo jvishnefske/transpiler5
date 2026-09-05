@@ -51,6 +51,10 @@ void CImporter::collectOrdinaryNames(const clang::TranslationUnitDecl *unit) {
   ordinaryRawTuNames.clear();
   ordinaryTuNameOwners.clear();
   ordinaryTuQualifiedOwners.clear();
+  // FR-195: the collision reservations are keyed by declarations of the TU
+  // that is about to be scanned, so they die with the previous TU's AST.
+  collisionSymbols.clear();
+  reservedCollisionSymbols.clear();
   collectOrdinaryNamesFrom(unit);
 }
 

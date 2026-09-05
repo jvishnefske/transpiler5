@@ -1083,3 +1083,13 @@ summary = "LANDED 2026-09-04, FR-193 item 1. Verified independently: a 256-value
 blocked_by = []
 anchor = "FR-194 (opened and LANDED 2026-09-04; FR-193 item 1): **THE `%c`"
 
+[[items]]
+id = "FR-195"
+kind = "defect"
+status = "landed"
+size = "L"
+title = "Recovery dropped a name-collision loser and let its call sites fall onto the survivor; the naming pass had already computed the right answer"
+summary = "LANDED 2026-09-04, FR-193 item 3. Plain mode refuses the collision with a precise located diagnostic, so DETECTION was never the problem; under --recover the loser was classified DROPPED not STUBBED, nothing rewrote its call sites, and since the survivor already occupied the symbol the loser would have emitted as, every dangling call silently resolved onto it -- exit 0, zero warnings, wrong answer, a direct breach of the CLAUDE.md/FR-53 contract. The hunt's decisive observation: every OTHER recovered rejection already stubs and panics with exit 101, so one path had fallen out of an otherwise-sound design. MECHANISM: the loser now RESERVES a unique symbol (<name>_collision<N>) memoized by canonical decl, the stub emits under it, and boundFunctionSymbol routes every call AND every address-of through the memo; plain mode reserves nothing so its bytes are unchanged by construction. Reservation happens on the FIRST real import attempt, not the stub retry, so a loser the retry cannot rebuild is still recorded and the lookup FAILS CLOSED with a located diagnostic instead of binding to the survivor. THREE MORE CHANNELS of the identical rebind were found by probing and closed by the same mechanism: FR-73 underscore fold (_set/set, 2 4 -> was 2 3), keyword mangle (match_/match, 2 4 -> was 2 3), and va-clone names (Sum/sum). The fourth is a CAPABILITY FLIP not a rejection: a monomorphized variadic emits only per-call-site clones, and clone names were uniquified per-plan so Sum and sum both chose tu0_sum_1; making them mutually unique ACROSS plans makes both import correctly in plain mode, byte-neutral for anything working today. FUNCTION-POINTER IDENTITY restored -- three distinct Some(...) constants where a == b was previously true for two different functions, collapsing any fn-ptr-keyed dispatch table; this is the trap FR-52 already recorded once. One new deliberate rejection: a caller of a loser that cannot be stubbed now takes a located rejection rather than silently calling the survivor; no correct program regressed. Gate 983/983, clippy 101 (+0), both ratchets unmoved, TRACTOR measured 40/252 unchanged. NOT VERIFIED: C++ MEMBER collisions are excluded from reservation at every guard and were not probed for the same hazard."
+blocked_by = []
+anchor = "FR-195 (opened and LANDED 2026-09-04; FR-193 item 3): **RECOVERY WAS"
+

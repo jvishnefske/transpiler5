@@ -2737,6 +2737,16 @@ FailureOr<Value> CImporter::emitCall(const clang::CallExpr *call) {
   std::string name = staticMethod ? cxxMethodMangledName(staticMethod)
                      : vaClone     ? vaClone->name
                                    : mlirFuncName(callee);
+  // FR-195: a callee whose emitted name a DIFFERENT C spelling owns binds
+  // to ITS OWN reserved stub, never to the survivor that holds `name`.
+  // Without this the recovered crate compiled `foo()` into a call to
+  // `Foo`'s body -- exit 0, clean build, wrong answer.
+  {
+    FailureOr<std::string> bound = boundFunctionSymbol(callee, name, loc);
+    if (failed(bound))
+      return failure();
+    name = *bound;
+  }
   func::FuncOp target = functions.lookup(name);
   if (!target) {
     if (isSystemHeaderDecl(callee))
@@ -7368,6 +7378,19 @@ CImporter::resolveFunctionPointerDecl(const clang::FunctionDecl *callee,
     return emitError(loc)
            << "unsupported: taking the address of a variadic function";
   std::string name = mlirFuncName(callee);
+  // FR-195: FR-52 records the matching trap -- a function ADDRESS
+  // `Some(f)` is not a symbol use, so nothing downstream can see it. The
+  // emitted constant therefore has to name the right item HERE. A
+  // collision loser's address resolves to its own reserved stub, which is
+  // what keeps `a == b` FALSE for pointers to two different C functions;
+  // before FR-195 all three spellings of the `my_fn`/`myFn`/`MyFn` fold
+  // emitted `Some(tu0_my_fn)` and every pairwise comparison was true.
+  {
+    FailureOr<std::string> bound = boundFunctionSymbol(callee, name, loc);
+    if (failed(bound))
+      return failure();
+    name = *bound;
+  }
   func::FuncOp target = functions.lookup(name);
   if (!target) {
     if (isSystemHeaderDecl(callee))

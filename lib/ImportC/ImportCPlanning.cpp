@@ -3996,15 +3996,39 @@ CImporter::planVaMonomorphOnce(const clang::TranslationUnitDecl *unit) {
       // bumps the ordinal on a collision; the verbatim path keeps the historic
       // `__<n>` suffix with an appended `_` on collision.
       const std::string prefix = mlirFuncName(site.target);
+      // FR-195: the prefix is `mlirFuncName`, so two definitions whose C
+      // spellings FOLD onto one emitted name (`Sum` beside `sum`) generate
+      // their clones from the SAME prefix and, checking only the module and
+      // the TU's ordinary names, both picked `tu0_sum_1`. Emission then
+      // refused the second one ("monomorphization clone name ... collides
+      // with an existing symbol") -- and under recovery that dropped the
+      // loser while its call sites, which resolve through the clone NAME,
+      // silently executed the survivor's body (measured: native `3 1003`,
+      // emitted `3 3`, exit 0, clean cargo build). The bare folded symbol is
+      // never emitted for a monomorphized definition, so the clones are the
+      // only names that exist and making them mutually unique is all the
+      // fold needs: both definitions then import, correctly. Every plan is
+      // consulted, including the ones this TU inherited, and the plan maps
+      // are restored wholesale by the FR-53 replanning loop, so the
+      // numbering does not drift between recovery rounds.
+      auto cloneNameTaken = [&](llvm::StringRef candidate) {
+        for (const auto &planned : vaMonomorphPlans)
+          for (const VaClonePlan &existing : planned.second.clones)
+            if (existing.name == candidate)
+              return true;
+        return false;
+      };
       std::string name;
       if (idiomaticRenameEnabled()) {
         unsigned ordinal = plan.clones.size() + 1;
         name = prefix + "_" + std::to_string(ordinal);
-        while (ordinaryNameTaken(name) || functions.lookup(name))
+        while (ordinaryNameTaken(name) || functions.lookup(name) ||
+               cloneNameTaken(name))
           name = prefix + "_" + std::to_string(++ordinal);
       } else {
         name = prefix + "__" + std::to_string(plan.clones.size() + 1);
-        while (ordinaryNameTaken(name) || functions.lookup(name))
+        while (ordinaryNameTaken(name) || functions.lookup(name) ||
+               cloneNameTaken(name))
           name += "_";
       }
       plan.clones.push_back(VaClonePlan{name, extraTypes});
