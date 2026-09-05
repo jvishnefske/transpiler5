@@ -4029,6 +4029,49 @@ CImporter::matchStlBoxPayloadPlaceBase(const clang::Expr *expr) {
   }
 }
 
+const clang::Expr *
+CImporter::matchStlElementPlaceCall(const clang::Expr *expr) {
+  // FR-196. `emitLValue` already resolves `v[i]`, `v.at(i)`, `v.front()`,
+  // `v.back()` and `m[k]` to real places (an `emitrust.subscript` on the
+  // receiver's own place, or the map entry place) -- but every one of
+  // those spellings is a `clang::CallExpr`, so any consumer that
+  // dispatches on "is this a call?" before "is this a place?" claims them
+  // first. That is exactly how `v[i].f = x` came to stage a copy of the
+  // element and drop the store, one container over from FR-189's
+  // `(*p).field = v`.
+  //
+  // The `isLValue` guard is what keeps this from swallowing the genuine
+  // `f().m` shape: a std method that returns BY VALUE (a prvalue) has no
+  // place of its own and must keep the materialize-into-a-temporary
+  // path. Only the `T&`-returning element accessors are claimed here.
+  const clang::Expr *e = expr->IgnoreParenImpCasts();
+  if (const auto *materialize =
+          llvm::dyn_cast<clang::MaterializeTemporaryExpr>(e))
+    e = materialize->getSubExpr()->IgnoreParenImpCasts();
+  if (!e->isLValue())
+    return nullptr;
+  if (const auto *opCall = llvm::dyn_cast<clang::CXXOperatorCallExpr>(e)) {
+    if (opCall->getOperator() != clang::OO_Subscript)
+      return nullptr;
+    const auto *method =
+        llvm::dyn_cast_or_null<clang::CXXMethodDecl>(opCall->getDirectCallee());
+    if (!method || !method->getParent()->isInStdNamespace())
+      return nullptr;
+    return e;
+  }
+  if (const auto *memberCall = llvm::dyn_cast<clang::CXXMemberCallExpr>(e)) {
+    const clang::CXXMethodDecl *method = memberCall->getMethodDecl();
+    if (!method || !method->getParent()->isInStdNamespace() ||
+        !method->getDeclName().isIdentifier())
+      return nullptr;
+    llvm::StringRef name = method->getName();
+    if (name != "at" && name != "front" && name != "back")
+      return nullptr;
+    return e;
+  }
+  return nullptr;
+}
+
 bool CImporter::isStlBoxWriteExpr(const clang::Expr *expr) {
   // FR-189: ONE walker, shared with FR-188's argument-side rejection.
   // This used to answer the question itself and stopped after one hop --

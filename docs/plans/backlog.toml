@@ -1093,3 +1093,13 @@ summary = "LANDED 2026-09-04, FR-193 item 3. Plain mode refuses the collision wi
 blocked_by = []
 anchor = "FR-195 (opened and LANDED 2026-09-04; FR-193 item 3): **RECOVERY WAS"
 
+[[items]]
+id = "FR-196"
+kind = "defect"
+status = "landed"
+size = "M"
+title = "A store through a std::vector element's field was silently dropped -- FR-189's defect, same branch, same stage, one container over"
+summary = "LANDED 2026-09-04, FR-193 item 7. v[0].x = 99 gave native 99, emitted 1; the emitted Rust for the whole statement was `let _v6: P;`, a dead never-assigned binding, while RHS side effects still fired -- the quietest possible failure. THE HYPOTHESIS WAS CONFIRMED BY READING PRE-FIX IR, and the answer is better than 'same bug': the importer DOES emit the store, onto a throwaway temp nothing reads, and the emitter's dead-store pass then deletes both the staging load and the store. So 'wrong value' (FR-189) versus 'vanished statement' (here) is PURELY DOWNSTREAM -- whether DSE could prove the temp dead. Same emitMemberBasePlace f().m branch, same staging, nothing at a second stage; v[i] is a CXXOperatorCallExpr and at/front/back are CXXMemberCallExprs, so all were claimed by the branch FR-189 was inserted ahead of. FIX: one branch immediately after FR-189's and ahead of f().m, routing the base through emitLValue, via matchStlElementPlaceCall restricted to isLValue() -- that guard is load-bearing since a std method returning a prvalue must keep the materialize path. +85 lines, no deletions. Every spelling now byte-matches native including doubly-indexed g[i][j].f and the realistic loop (total=0 -> total=10); the four adjacent shapes that already worked still do. BONUS: std::array<P,N> a[i].f now works where it was a hard rejection. ADDITIVITY BY DIFFERENTIAL over all 1255 test/ + c-testsuite files: changed = 1, and it is an IMPROVEMENT (a pre-existing read stops staging two whole-element copies, 16 IR lines -> 10, still byte-matching native). A WORDING DEVIATION WAS DELIBERATELY NOT FIXED: a.at(1).x now reports the wrong container name, but run_realworld.py:511 buckets on the old substring and changing it would silently reclassify RealWorld progress buckets -- reasoning written into the test header. Gate 986/986, clippy 101 (+0), both ratchets unmoved, epoch-6 intact, TRACTOR 40/252."
+blocked_by = []
+anchor = "FR-196 (opened and LANDED 2026-09-04; FR-193 item 7): **A STORE THROUGH"
+
