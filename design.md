@@ -12682,6 +12682,74 @@ piece and becomes FR-45.
   fence; it is checked first so it wins for argv byte reads, and widening it
   would have enlarged the blast radius on existing goldens.
 
+- [x] FR-195 (opened and LANDED 2026-09-04; FR-193 item 3): **RECOVERY WAS
+  DROPPING A NAME-COLLISION LOSER AND LETTING ITS CALL SITES FALL ONTO THE
+  SURVIVOR. THE NAMING PASS HAD ALREADY COMPUTED THE RIGHT ANSWER AND
+  RECOVERY THREW IT AWAY.**
+  Plain mode refuses the collision with a precise located diagnostic, so
+  DETECTION was never the problem. Under `--recover` (implied by
+  `--incremental`) the loser was classified DROPPED rather than STUBBED and
+  nothing rewrote its call sites; since the survivor already occupied the
+  symbol the loser would have emitted as, every dangling call silently
+  resolved onto it. Exit 0, zero warnings, wrong answer -- a direct breach of
+  the contract in CLAUDE.md and FR-53 that "a recovered item that reaches
+  emission unresolved must fail loudly there".
+  The hunt's decisive observation was that **every OTHER recovered rejection
+  already behaved correctly** -- void* parameter, address-of-global,
+  ArraySubscriptExpr, address-of-pointer, colliding GLOBAL, unknown variable
+  and slice parameter all stub and panic with exit 101. ONE path had fallen
+  out of an otherwise-sound design, which is what made it tractable.
+  MECHANISM: under recovery the loser now RESERVES a unique symbol
+  (`<name>_collision<N>`, uniquified against `ordinaryTuNames`, the emitted
+  `functions` map and earlier reservations), memoized by CANONICAL DECL; the
+  stub emits under that symbol and `boundFunctionSymbol` routes every call
+  AND every address-of through the memo. **Plain mode reserves nothing, so
+  its bytes and diagnostics are unchanged by construction.**
+  Reservation happens on the FIRST, REAL import attempt rather than the stub
+  retry, so a loser the retry cannot rebuild is still recorded -- and the
+  lookup then FAILS CLOSED with a located diagnostic instead of binding to
+  the survivor.
+  **THREE MORE CHANNELS OF THE IDENTICAL SILENT REBIND were found by probing
+  and closed by the same mechanism.** The spec named only the FR-125 case
+  fold; leaving the rest would have been exactly the half-fix it warned
+  against:
+    FR-125 case fold   `Foo`/`foo`       native `1 2`    was `1 1`   now exit 101
+    FR-73 underscore   `_set`/`set`      native `2 4`    was `2 3`   now exit 101
+    keyword mangle     `match_`/`match`  native `2 4`    was `2 3`   now exit 101
+    va-clone name      `Sum`/`sum`       native `3 1003` was `3 3`   now BOTH IMPORT
+  **The fourth is different in kind and is a CAPABILITY FLIP, not a
+  rejection.** A monomorphized variadic never emits its bare folded symbol,
+  only its per-call-site clones, and each plan uniquified clone names only
+  against the module and the TU's ordinary names -- so `Sum` and `sum` both
+  chose `tu0_sum_1`. Making clone names mutually unique ACROSS plans is all
+  the fold needed, so both definitions now import correctly in PLAIN mode.
+  Byte-neutral for anything that works today: only same-prefix (already
+  colliding) plans can interact, and those were hard rejections.
+  FUNCTION-POINTER IDENTITY IS RESTORED -- the trap FR-52 had already
+  recorded once in a different context ("a function ADDRESS `Some(f)` is not
+  a symbol use"). The three-way fold now emits three DISTINCT constants
+  (`Some(tu0_my_fn)`, `Some(tu0_my_fn_collision1)`,
+  `Some(tu0_my_fn_collision2)`) and the identity line byte-matches native,
+  where `a == b` was previously TRUE for pointers to two different functions
+  and would collapse any dispatch table keyed on fn-ptr equality.
+  ONE NEW REJECTION SHAPE, deliberate: a caller of a loser that CANNOT be
+  stubbed (unmappable signature, or a va_list-free variadic) now takes a
+  located `use of function ... whose emitted symbol is owned by a different C
+  spelling` rejection and is itself recovered. Before, that caller imported
+  and silently called the survivor. **No correct program regressed.**
+  REPORT SHAPE CHANGED, intended: the loser is ledgered under its RESERVED
+  symbol, so the survivor's item-graph node now reads `ported` instead of the
+  old `dropped 'tu0_foo'` -- which was a report about the WRONG item.
+  Gate 983/983; clippy 101 -> 101 (+0); both corpus ratchets unmoved in BOTH
+  directions; TRACTOR measured 40/252, unchanged (the only strict-mode change
+  is the va-clone uniquifier, which converts a rejection into a success and
+  so can never lower it).
+  NOT VERIFIED, and a real residual: **C++ MEMBER functions are excluded from
+  reservation at every guard** (their collisions take W2.25/FR-112's own
+  paths), and whether a C++ METHOD collision carries the same silent-rebind
+  hazard was NOT probed. Multi-TU external-linkage collisions were checked by
+  hand and behave correctly but have no committed test.
+
 - [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
   FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED
   AGGREGATE `let` ENDED ITS PREFIX.**

@@ -547,6 +547,14 @@ CImporter::importTopLevelDeclRecovering(const clang::Decl *decl) {
   std::string symbol = graphItemSymbol(decl);
   if (symbol.empty())
     symbol = declLedgerName(decl);
+  // FR-195: a function whose emitted name a DIFFERENT C spelling owns is
+  // ledgered under the symbol RESERVED for it, never under the emitted name
+  // -- reporting `tu0_foo` dropped while `tu0_foo` is exactly the item that
+  // still works would be a report about the wrong item, and would collide
+  // with the survivor's own node in the FR-40 item graph.
+  if (const auto *collided = llvm::dyn_cast<clang::FunctionDecl>(decl))
+    if (std::string reserved = collisionSymbolFor(collided); !reserved.empty())
+      symbol = reserved;
   if (const auto *func = llvm::dyn_cast<clang::FunctionDecl>(decl)) {
     RecoveryCheckpoint stubCheckpoint = checkpointModule();
     activeCheckpoint = &stubCheckpoint;

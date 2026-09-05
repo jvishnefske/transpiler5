@@ -37,6 +37,61 @@ std::string CImporter::mlirFuncName(const clang::FunctionDecl *func) const {
   return cFunctionSymbolName(func, currentTuTag);
 }
 
+//===----------------------------------------------------------------------===//
+// FR-195: function-symbol collision losers under recovery
+//===----------------------------------------------------------------------===//
+
+std::string
+CImporter::collisionSymbolFor(const clang::FunctionDecl *func) const {
+  auto it = collisionSymbols.find(func->getCanonicalDecl());
+  return it == collisionSymbols.end() ? std::string() : it->second;
+}
+
+std::string CImporter::reserveCollisionSymbol(const clang::FunctionDecl *func,
+                                              llvm::StringRef name) {
+  const clang::FunctionDecl *canonical = func->getCanonicalDecl();
+  auto [it, inserted] = collisionSymbols.try_emplace(canonical, std::string());
+  if (!inserted)
+    return it->second;
+  // Source order fixes the numbering (declarations import in order and the
+  // reservation happens at the FIRST rejected declaration), so the emitted
+  // spelling is reproducible. The loop steps past anything the TU itself
+  // declares, anything already emitted, and any earlier reservation of the
+  // same name -- the three-way `my_fn`/`myFn`/`MyFn` fold hands out
+  // `_collision1` and `_collision2`.
+  unsigned index = 0;
+  std::string unique;
+  do {
+    unique = (name + "_collision" + llvm::Twine(++index)).str();
+  } while (ordinaryTuNames.contains(unique) || functions.contains(unique) ||
+           !reservedCollisionSymbols.insert(unique).second);
+  it->second = unique;
+  return unique;
+}
+
+FailureOr<std::string>
+CImporter::boundFunctionSymbol(const clang::FunctionDecl *func,
+                               std::string name, Location loc) {
+  std::string collision = collisionSymbolFor(func);
+  if (collision.empty())
+    return name;
+  // The loser's stub owns the reserved symbol: calls panic and fn-pointer
+  // constants stay DISTINCT from the survivor's, which is what keeps
+  // `a == b` false for pointers to two different C functions.
+  if (functions.contains(collision))
+    return collision;
+  // No stub was emitted (the retry could not rebuild the signature -- a
+  // variadic loser has none). Binding to `name` would resolve this
+  // reference onto the SURVIVOR's body, so the reference is refused where
+  // it appears; under recovery its own item is then dropped or stubbed and
+  // fails loudly instead.
+  return emitError(loc) << "unsupported: use of function '"
+                        << func->getQualifiedNameAsString()
+                        << "', whose emitted symbol '" << name
+                        << "' is owned by a different C spelling in this "
+                           "translation unit";
+}
+
 /// W2.2: `method`'s un-suffixed mangled base name — a fixed spelling for a
 /// constructor or a destructor (whose `DeclarationName`s are the special
 /// `CXXConstructorName`/`CXXDestructorName` kinds and have no ordinary
@@ -436,11 +491,28 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // must not silently merge two C symbols: a source declaration already
   // spelled with the mangled name rejects the keyword function where it
   // is declared.
+  //
+  // FR-195: under recovery the loser is not merely dropped -- it keeps a
+  // symbol OF ITS OWN (`reserveCollisionSymbol`) so that its calls and its
+  // fn-pointer constants bind to its `unimplemented!()` stub instead of
+  // silently executing the body of the C function that already owns the
+  // mangled spelling. The reservation is made HERE, at the rejection, not
+  // on the stub retry: a loser the retry cannot rebuild (a variadic one
+  // never reaches this point a second time) still needs its references
+  // refused rather than re-pointed.
+  std::string collisionStubName;
   if (isRustKeyword(cName) &&
-      ordinaryRawTuNames.contains((cName + "_").str()))
-    return emitError(loc) << "unsupported: function name '" << cName
-                          << "' mangles to '" << cName
-                          << "_', which collides with an existing symbol";
+      ordinaryRawTuNames.contains((cName + "_").str())) {
+    if (recoverFromRejections && !cxxMethod) {
+      collisionStubName = reserveCollisionSymbol(func, mlirFuncName(func));
+      if (!recoveryStubOnly)
+        collisionStubName.clear();
+    }
+    if (collisionStubName.empty())
+      return emitError(loc) << "unsupported: function name '" << cName
+                            << "' mangles to '" << cName
+                            << "_', which collides with an existing symbol";
+  }
   // W2.2: a genuine C++ method or constructor takes its own naming path
   // (`cxxMethodMangledName`), decoupled from `mlirFuncName`'s per-TU
   // static-storage-class tag — a C++ method and a C file-static function
@@ -449,6 +521,12 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
   // pick up that tag.
   std::string name =
       cxxMethod ? cxxMethodMangledName(cxxMethod) : mlirFuncName(func);
+  // FR-195: the keyword-mangle collision above reserved its replacement
+  // before the symbol was composed; adopt it now, so that the two folds
+  // below see a name no other spelling owns and the stub is emitted under
+  // it.
+  if (!collisionStubName.empty())
+    name = collisionStubName;
   // W2.15: remember that a function-template instantiation claimed this
   // composed spelling, so a LATER hand-written definition colliding with
   // it gets the template-aware wording below rather than the cross-TU one.
@@ -469,11 +547,23 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
     std::string firstRaw = ordinaryTuNameOwners.lookup(name);
     if (!firstRaw.empty() && firstRaw != cName &&
         (cName.starts_with("_") ||
-         llvm::StringRef(firstRaw).starts_with("_")))
-      return emitError(loc)
-             << "unsupported: function name '" << cName << "' emits as '"
-             << name << "', which collides with '" << firstRaw
-             << "' (leading underscores fold into the symbol prefix)";
+         llvm::StringRef(firstRaw).starts_with("_"))) {
+      // FR-195: same disposition as the keyword mangle above -- under
+      // recovery the loser is given its own symbol so no reference to it
+      // can resolve onto `firstRaw`'s body.
+      std::string reserved;
+      if (recoverFromRejections) {
+        reserved = reserveCollisionSymbol(func, name);
+        if (!recoveryStubOnly)
+          reserved.clear();
+      }
+      if (reserved.empty())
+        return emitError(loc)
+               << "unsupported: function name '" << cName << "' emits as '"
+               << name << "', which collides with '" << firstRaw
+               << "' (leading underscores fold into the symbol prefix)";
+      name = reserved;
+    }
     // FR-125: the idiomatic rename folds namespace segments and free-
     // function base names to snake_case, so two DIFFERENT qualified C++
     // spellings can compose to one emitted symbol (`Game::f` and
@@ -492,12 +582,25 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
         !templateSpecSymbolNames.contains(name)) {
       std::string firstQualified = ordinaryTuQualifiedOwners.lookup(name);
       std::string qualified = func->getQualifiedNameAsString();
-      if (!firstQualified.empty() && firstQualified != qualified)
-        return emitError(loc)
-               << "unsupported: function '" << qualified << "' emits as '"
-               << name << "', which collides with '" << firstQualified
-               << "' (the idiomatic rename folds both spellings onto one "
-                  "symbol)";
+      if (!firstQualified.empty() && firstQualified != qualified) {
+        // FR-195: same disposition as the two folds above. This is the
+        // channel the FR-193 hunt measured silently miscompiling -- `Foo`
+        // beside `foo`, exit 0, clean cargo build, wrong answer, and
+        // fn-ptr identity collapsed onto one item.
+        std::string reserved;
+        if (recoverFromRejections) {
+          reserved = reserveCollisionSymbol(func, name);
+          if (!recoveryStubOnly)
+            reserved.clear();
+        }
+        if (reserved.empty())
+          return emitError(loc)
+                 << "unsupported: function '" << qualified << "' emits as '"
+                 << name << "', which collides with '" << firstQualified
+                 << "' (the idiomatic rename folds both spellings onto one "
+                    "symbol)";
+        name = reserved;
+      }
     }
   }
   // W2.25: the MEMBER half of the synthesized-spelling collision guard. A

@@ -4008,7 +4008,12 @@ CImporter::emitPointerRValue(const clang::Expr *expr) {
       const clang::FunctionDecl *canonical = callee->getCanonicalDecl();
       if (ownerIndexReturns.contains(canonical)) {
         const clang::VarDecl *ownerBase = methodPlans.lookup(canonical);
-        func::FuncOp target = functions.lookup(mlirFuncName(callee));
+        // FR-195: never look a callee up under a name a DIFFERENT C
+        // spelling owns -- a collision loser reaching here must miss (and
+        // take the located rejection below), not land on the survivor.
+        std::string collision = collisionSymbolFor(callee);
+        func::FuncOp target = functions.lookup(
+            collision.empty() ? mlirFuncName(callee) : collision);
         if (!ownerBase || !target) // Defensive; every plan pairs the two.
           return emitError(loc)
                  << "unsupported: call to unimported owner-index method";

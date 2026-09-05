@@ -6488,6 +6488,44 @@ private:
   /// agree.
   std::string globalVarSymbolName(const clang::VarDecl *var) const;
 
+  /// FR-195: the UNIQUE module symbol a function whose emitted name is
+  /// already owned by a DIFFERENT C spelling is bound to under recovery, or
+  /// the empty string when `func` is not such a loser.
+  ///
+  /// Three guards fold two distinct C identifiers onto one emitted symbol
+  /// and reject the loser where it is declared: the keyword mangle
+  /// (`match` -> `match_`), the FR-73 leading-underscore fold, and the
+  /// FR-125 idiomatic case fold. In PLAIN mode the rejection ends the
+  /// compile and nothing more is needed. Under `--recover` the loser used
+  /// to be DROPPED with its emitted name left owned by the survivor, so
+  /// every `foo(...)` call and every `&foo` fn-pointer constant silently
+  /// re-pointed onto the survivor's body -- exit 0, clean cargo build,
+  /// wrong answer, and fn-ptr identity collapsed (two pointers to two
+  /// different functions compared equal). The loser therefore gets its own
+  /// reserved symbol, `reserveCollisionSymbol` assigns it AT THE REJECTION
+  /// (so a loser the stub retry cannot rebuild -- a variadic one -- is
+  /// still recorded), and `boundFunctionSymbol` routes every reference
+  /// through it: onto the loser's `unimplemented!()` stub if one exists,
+  /// and onto a located rejection if it does not. Never onto the survivor.
+  std::string collisionSymbolFor(const clang::FunctionDecl *func) const;
+
+  /// FR-195: reserves and memoizes the loser's unique symbol (see
+  /// `collisionSymbolFor`). Called only under recovery, from the three
+  /// name-collision guards in `importFunction`, and idempotent per
+  /// canonical declaration so a prototype and its definition agree.
+  std::string reserveCollisionSymbol(const clang::FunctionDecl *func,
+                                     llvm::StringRef name);
+
+  /// FR-195: the module symbol a REFERENCE to `func` (a call, or an
+  /// address-of that becomes a `Some(<name>)` constant) must bind to.
+  /// `name` is the symbol the reference computed for itself. Returns that
+  /// name unchanged for every ordinary function; for a collision loser it
+  /// returns the loser's own reserved symbol, or fails with a located
+  /// diagnostic when no item was emitted under it. Binding to `name` in
+  /// that case is exactly the silent miscompile FR-195 closes.
+  FailureOr<std::string> boundFunctionSymbol(const clang::FunctionDecl *func,
+                                             std::string name, Location loc);
+
   /// The clang AST currently being translated (borrowed, read-only). Rebound
   /// by each `importTranslationUnit` call so one importer can span TUs.
   clang::ASTContext *astContextPtr = nullptr;
@@ -6716,6 +6754,18 @@ private:
   /// into a call to `ns_n_my_func`, exit 0). `importFunction` rejects
   /// the later declaration located.
   llvm::StringMap<std::string> ordinaryTuQualifiedOwners;
+  /// FR-195: the unique symbol reserved for each function whose emitted
+  /// name a DIFFERENT C spelling in this TU already owns, keyed by
+  /// canonical declaration so a prototype and its definition agree.
+  /// Populated ONLY under recovery (`recoverFromRejections`), which is why
+  /// a non-recovering import emits exactly the bytes it always did.
+  llvm::DenseMap<const clang::FunctionDecl *, std::string>
+      collisionSymbols;
+  /// FR-195: the reserved spellings already handed out, so two losers of
+  /// the same emitted name never receive the same replacement (the
+  /// three-way `my_fn`/`myFn`/`MyFn` fold) and no replacement can land on
+  /// a symbol the TU itself declares.
+  llvm::StringSet<> reservedCollisionSymbols;
   /// Symbol name assigned to each struct definition by `structSymbolName`,
   /// keyed on the defining declaration (per-TU decls are distinct; cross-TU
   /// unification still happens by final name through
