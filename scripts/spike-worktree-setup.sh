@@ -30,7 +30,19 @@ else
 fi
 
 # --- 2. pin llvm-config to the devshell's LLVM -----------------------------
-llvm_config=$(nix develop "$main" -c sh -c 'command -v llvm-config')
+# `nix develop` prints the devshell BANNER on stdout (three lines: the shell
+# name, MLIR_DIR, LIBCLANG_PATH), so the command substitution captures four
+# lines, not one, and the naive form wrote a multi-line garbage value into
+# build-native.ini. meson then failed on it in a way that reads as a
+# toolchain problem rather than a quoting bug, which has cost real time more
+# than once. `tail -1` keeps only the path `command -v` actually printed.
+llvm_config=$(nix develop "$main" -c sh -c 'command -v llvm-config' | tail -1)
+case "$llvm_config" in
+  /*) ;;
+  *) echo "spike-worktree-setup: llvm-config did not resolve to an absolute" \
+          "path (got '$llvm_config'); refusing to write a corrupt native file" >&2
+     exit 1 ;;
+esac
 native_ini="$wt/build-native.ini"
 printf '[binaries]\nllvm-config = %s\n' "'$llvm_config'" > "$native_ini"
 echo "pinned llvm-config = $llvm_config ($native_ini)"
