@@ -260,6 +260,310 @@ enclosingBlock(clang::ASTContext &context, const clang::Stmt *node) {
   return nullptr;
 }
 
+/// FR-193 item 6 / W2.17: the LOOP-EXIT half of the drop-order fence.
+///
+/// `lift-cf-to-scf` structurizes the CFG. A block that is lexically inside a
+/// loop body but from which EVERY path leaves the loop is not on the cycle,
+/// so the lift places it AFTER the loop and dispatches it on an exit index.
+/// For C that is unobservable. For a loop body holding a destructor-carrying
+/// local it is a SILENT MISCOMPILE, because the local's Rust `Drop` runs at
+/// the end of the emitted loop-body region -- so a side effect C++ runs
+/// BEFORE the destructor is emitted AFTER it. Measured on
+/// `for (..) { T a(i); printf("body"); if (i==1) { printf("before break");
+/// break; } }`:
+///
+///   native : body 0 / dtor 0 / body 1 / before break / dtor 1 / after loop
+///   emitted: body 0 / dtor 0 / body 1 / dtor 1 / before break / after loop
+///
+/// `leavesLoop` answers "control always leaves the loop after this
+/// statement" in TWO conservative directions, because the fence needs both
+/// and they must be wrong in opposite directions:
+///
+///   * OVER-approximating (`couldAlwaysLeaveLoop`) drives the REJECTION, so
+///     being wrong costs a spurious rejection, never a miscompile;
+///   * UNDER-approximating (`mustLeaveLoop`) drives the opposite decision --
+///     "the body always leaves, so the loop has NO back edge, so there is no
+///     cycle for anything to be relocated out of". An unconditional `return`
+///     in a loop body is byte-identical today and must stay accepted, so this
+///     one may only claim a loop that certainly runs its body (a `do`) or a
+///     branch that certainly leaves.
+///
+/// `swallowers` counts the constructs between the statement and the loop in
+/// question that CATCH a `break` -- an inner loop or a `switch`. A `break`
+/// leaves the loop only at zero: a `switch` case's `break` inside a loop body
+/// and an inner loop's `break` are both byte-identical today.
+static bool leavesLoop(const clang::Stmt *stmt, unsigned swallowers,
+                       bool overApproximate) {
+  if (!stmt)
+    return false;
+  if (llvm::isa<clang::ReturnStmt>(stmt))
+    return true;
+  if (llvm::isa<clang::BreakStmt>(stmt))
+    return swallowers == 0;
+  if (llvm::isa<clang::ContinueStmt>(stmt))
+    return false; // the latch IS the cycle: nothing is relocated
+  if (llvm::isa<clang::GotoStmt, clang::IndirectGotoStmt>(stmt))
+    // A `goto` may jump back INTO the loop, so only the over-approximation
+    // may claim it leaves. The whole shape is already rejected anyway: a
+    // function carrying a label hoists its locals to function top (see
+    // `containsGotoOrLabel`).
+    return overApproximate;
+  if (const auto *compound = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {
+    for (const clang::Stmt *child : compound->body())
+      if (leavesLoop(child, swallowers, overApproximate))
+        return true;
+    return false;
+  }
+  if (const auto *ifStmt = llvm::dyn_cast<clang::IfStmt>(stmt))
+    return ifStmt->getElse() &&
+           leavesLoop(ifStmt->getThen(), swallowers, overApproximate) &&
+           leavesLoop(ifStmt->getElse(), swallowers, overApproximate);
+  // A label wrapper is transparent -- but it must be unwrapped by NAME, not
+  // by first child: a `CaseStmt`'s first child is its label EXPRESSION, so
+  // `child_begin()` would hand back `1` for `case 1: return i;` and answer
+  // "does not leave" for a case that always returns.
+  if (const auto *switchCase = llvm::dyn_cast<clang::SwitchCase>(stmt))
+    return leavesLoop(switchCase->getSubStmt(), swallowers, overApproximate);
+  if (const auto *label = llvm::dyn_cast<clang::LabelStmt>(stmt))
+    return leavesLoop(label->getSubStmt(), swallowers, overApproximate);
+  if (const auto *attributed = llvm::dyn_cast<clang::AttributedStmt>(stmt))
+    return leavesLoop(attributed->getSubStmt(), swallowers, overApproximate);
+  if (const auto *doStmt = llvm::dyn_cast<clang::DoStmt>(stmt))
+    // A do-while runs its body at least once, so both directions agree.
+    return leavesLoop(doStmt->getBody(), swallowers + 1, overApproximate);
+  if (llvm::isa<clang::ForStmt, clang::WhileStmt, clang::CXXForRangeStmt,
+                clang::SwitchStmt>(stmt)) {
+    // Entry is conditional, so "the body always leaves" does NOT prove the
+    // statement always leaves; only the over-approximation may say so.
+    if (!overApproximate)
+      return false;
+    const clang::Stmt *body = nullptr;
+    if (const auto *forStmt = llvm::dyn_cast<clang::ForStmt>(stmt))
+      body = forStmt->getBody();
+    else if (const auto *whileStmt = llvm::dyn_cast<clang::WhileStmt>(stmt))
+      body = whileStmt->getBody();
+    else if (const auto *rangeStmt =
+                 llvm::dyn_cast<clang::CXXForRangeStmt>(stmt))
+      body = rangeStmt->getBody();
+    else
+      body = llvm::cast<clang::SwitchStmt>(stmt)->getBody();
+    return leavesLoop(body, swallowers + 1, overApproximate);
+  }
+  return false;
+}
+
+static bool couldAlwaysLeaveLoop(const clang::Stmt *stmt,
+                                 unsigned swallowers) {
+  return leavesLoop(stmt, swallowers, /*overApproximate=*/true);
+}
+
+static bool mustLeaveLoop(const clang::Stmt *stmt, unsigned swallowers) {
+  return leavesLoop(stmt, swallowers, /*overApproximate=*/false);
+}
+
+/// Whether `target` names storage a destructor could read -- anything that is
+/// not a plain automatic local. A global store with NO call at all is a
+/// measured channel of this defect: `~T() { printf("%d", g_x); }` against
+/// `for (..) { T a(i); if (i==1) { g_x = 7; break; } }` prints the PRE-store
+/// value, so the `for`-increment gate's call-only screen is not enough here.
+static bool writesOutsideAutomaticLocal(const clang::Expr *target) {
+  if (!target)
+    return false;
+  const clang::Expr *bare = target->IgnoreParenImpCasts();
+  if (const auto *ref = llvm::dyn_cast<clang::DeclRefExpr>(bare))
+    if (const auto *var = llvm::dyn_cast<clang::VarDecl>(ref->getDecl()))
+      return !var->hasLocalStorage() || var->getType()->isReferenceType();
+  return true; // a field, a subscript, a dereference: assume observable
+}
+
+/// The first observable side effect anywhere under `stmt`, or null.
+static const clang::Stmt *observableEffect(const clang::Stmt *stmt) {
+  if (!stmt)
+    return nullptr;
+  if (llvm::isa<clang::CallExpr, clang::CXXConstructExpr, clang::CXXNewExpr,
+                clang::CXXDeleteExpr>(stmt))
+    return stmt;
+  if (const auto *bin = llvm::dyn_cast<clang::BinaryOperator>(stmt))
+    if (bin->isAssignmentOp() && writesOutsideAutomaticLocal(bin->getLHS()))
+      return stmt;
+  if (const auto *un = llvm::dyn_cast<clang::UnaryOperator>(stmt))
+    if (un->isIncrementDecrementOp() &&
+        writesOutsideAutomaticLocal(un->getSubExpr()))
+      return stmt;
+  for (const clang::Stmt *child : stmt->children())
+    if (const clang::Stmt *found = observableEffect(child))
+      return found;
+  return nullptr;
+}
+
+/// The first observable effect under `stmt` that the lift relocates PAST the
+/// enclosing loop -- one sitting on a path that only ever leaves it.
+/// `exitOnly` says the caller already proved that of `stmt` itself.
+static const clang::Stmt *relocatedEffect(const clang::Stmt *stmt,
+                                          unsigned swallowers, bool exitOnly) {
+  if (!stmt)
+    return nullptr;
+  if (exitOnly)
+    return observableEffect(stmt);
+  if (const auto *compound = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {
+    llvm::SmallVector<const clang::Stmt *, 8> children(compound->body());
+    for (size_t i = 0; i < children.size(); ++i) {
+      bool childExits = false;
+      for (size_t j = i + 1; j < children.size() && !childExits; ++j)
+        childExits = couldAlwaysLeaveLoop(children[j], swallowers);
+      if (const clang::Stmt *found =
+              relocatedEffect(children[i], swallowers, childExits))
+        return found;
+    }
+    return nullptr;
+  }
+  if (const auto *ifStmt = llvm::dyn_cast<clang::IfStmt>(stmt)) {
+    // The condition is evaluated BEFORE the decision, so its block still
+    // reaches the latch and is not relocated (measured byte-identical).
+    if (const clang::Stmt *found =
+            relocatedEffect(ifStmt->getCond(), swallowers, false))
+      return found;
+    for (const clang::Stmt *branch : {ifStmt->getThen(), ifStmt->getElse()})
+      if (const clang::Stmt *found = relocatedEffect(
+              branch, swallowers, couldAlwaysLeaveLoop(branch, swallowers)))
+        return found;
+    return nullptr;
+  }
+  if (const auto *ret = llvm::dyn_cast<clang::ReturnStmt>(stmt))
+    // C++ evaluates the operand and THEN destroys the locals; the emitted
+    // code carries the operand out with the rest of the exit path (measured:
+    // `return side(i)` prints AFTER the drop).
+    return relocatedEffect(ret->getRetValue(), swallowers, true);
+  if (llvm::isa<clang::ForStmt, clang::WhileStmt, clang::DoStmt,
+                clang::CXXForRangeStmt, clang::SwitchStmt>(stmt)) {
+    for (const clang::Stmt *child : stmt->children())
+      if (const clang::Stmt *found =
+              relocatedEffect(child, swallowers + 1, false))
+        return found;
+    return nullptr;
+  }
+  for (const clang::Stmt *child : stmt->children())
+    if (const clang::Stmt *found = relocatedEffect(child, swallowers, false))
+      return found;
+  return nullptr;
+}
+
+/// One level of the scope chain `checkDropLocalScope` walks outward, recorded
+/// so the loop-exit fence can walk back IN.
+struct DropScopeStep {
+  const clang::CompoundStmt *block; ///< the block `node` sits directly in
+  const clang::Stmt *node;          ///< the child of `block` we came from
+  bool ownerIsLoop;                 ///< `block` is that loop's body
+};
+
+/// FR-193 item 6: the offending side effect, or null if this declaration's
+/// drop order survives the lift.
+///
+/// `steps[0].block` is the declaration's own block; the chain grows outward.
+/// Two questions decide the answer:
+///
+///  1. WHICH loop relocates? The innermost enclosing one whose body does not
+///     always leave -- a body that always leaves has no back edge, so it is
+///     not a cycle and nothing can be placed "after" it.
+///  2. Does the DECLARATION travel with the relocated code? If the
+///     declaration itself already sits on an exit-only path, its `let` and
+///     everything after it move together and the internal order is preserved
+///     (measured byte-identical). Only effects that leave the loop while the
+///     declaration stays behind cross the drop.
+static const clang::Stmt *
+relocatedExitEffect(llvm::ArrayRef<DropScopeStep> steps,
+                    const clang::DeclStmt *declStmt) {
+  // (1) the innermost enclosing loop that is really a cycle.
+  size_t target = steps.size();
+  unsigned swallowersAtDecl = 0;
+  for (size_t i = 0; i < steps.size(); ++i) {
+    if (!steps[i].ownerIsLoop)
+      continue;
+    if (mustLeaveLoop(steps[i].block, 0)) {
+      // No back edge -- but it still catches a `break`.
+      ++swallowersAtDecl;
+      continue;
+    }
+    target = i;
+    break;
+  }
+  if (target == steps.size())
+    return nullptr; // no enclosing cycle: nothing is relocated out of scope
+
+  // The break-swallower count for a statement in `steps[i].block`, measured
+  // against the target loop.
+  auto swallowersAt = [&](size_t i) {
+    unsigned count = 0;
+    for (size_t j = i; j < target; ++j)
+      if (steps[j].ownerIsLoop)
+        ++count;
+    return count;
+  };
+
+  // (2) walk back IN, from the target loop's body to the declaration.
+  bool exitOnly = false;
+  for (size_t i = target + 1; i-- > 0;) {
+    unsigned swallowers = swallowersAt(i);
+    // Entering this block from the construct it belongs to: an `if` branch
+    // (or an inner, back-edge-free loop body) that always leaves the target
+    // loop is itself relocated.
+    //
+    // Both tests here use the UNDER-approximation, because this one flips
+    // the decision: claiming the declaration travels with the relocated code
+    // ACCEPTS the program, so it may only be claimed when certain. Measured:
+    // with the over-approximation, `switch (i) { case 1: printf(..); return
+    // i; }` in a droppy loop body was wrongly skipped and kept miscompiling
+    // (`case one` printed after `dtor 1`) -- a switch body's compound is not
+    // sequential, so "some statement in it leaves" does not prove the switch
+    // does.
+    if (i != target && !exitOnly)
+      exitOnly = mustLeaveLoop(steps[i].block, swallowers);
+    if (exitOnly)
+      break;
+    // Position inside the block: a later sibling that always leaves makes
+    // everything ahead of it exit-only too.
+    bool seen = false;
+    for (const clang::Stmt *child : steps[i].block->body()) {
+      if (child == steps[i].node) {
+        seen = true;
+        continue;
+      }
+      if (seen && mustLeaveLoop(child, swallowers)) {
+        exitOnly = true;
+        break;
+      }
+    }
+    if (exitOnly)
+      break;
+  }
+  if (exitOnly)
+    return nullptr; // the declaration travels with the relocated code
+
+  // (3) scan the declaration's own scope, from the declaration onward.
+  unsigned swallowers = swallowersAtDecl;
+  llvm::SmallVector<const clang::Stmt *, 8> children(steps[0].block->body());
+  size_t start = 0;
+  while (start < children.size() &&
+         children[start] != static_cast<const clang::Stmt *>(declStmt))
+    ++start;
+  for (size_t i = start; i < children.size(); ++i) {
+    bool childExits = false;
+    for (size_t j = i + 1; j < children.size() && !childExits; ++j)
+      childExits = couldAlwaysLeaveLoop(children[j], swallowers);
+    // The declaration ITSELF is never the offender: its constructor and its
+    // `let` are relocated together with the drop they pair with, so their
+    // relative order is preserved. (An OUTER droppy local sees that same
+    // constructor as a relocated effect -- and catches it -- through its own
+    // run of this check.)
+    if (i == start)
+      continue;
+    if (const clang::Stmt *found =
+            relocatedEffect(children[i], swallowers, childExits))
+      return found;
+  }
+  return nullptr;
+}
+
 LogicalResult CImporter::checkDropLocalScope(const clang::VarDecl *var,
                                              Location loc) {
   clang::ASTContext &context = astContext();
@@ -273,6 +577,11 @@ LogicalResult CImporter::checkDropLocalScope(const clang::VarDecl *var,
       declStmt = candidate;
   if (!declStmt)
     return rejectScope(); // a for-init condition variable, a catch handler, ...
+  // FR-193 item 6: the outward walk RECORDS itself, because the loop-exit
+  // fence below has to walk back IN -- from the loop whose exit paths get
+  // relocated, down to this declaration -- to decide whether the declaration
+  // travels with them.
+  llvm::SmallVector<DropScopeStep, 4> steps;
   const clang::Stmt *node = declStmt;
   // Walk outward one enclosing block at a time. Every step must land on a
   // block whose Rust rendering is a real `{ ... }` at the same nesting.
@@ -296,16 +605,22 @@ LogicalResult CImporter::checkDropLocalScope(const clang::VarDecl *var,
         return rejectScope();
       if (containsGotoOrLabel(funcParent->getBody()))
         return rejectScope();
-      return success();
+      break;
     }
     if (const auto *forStmt =
             llvm::dyn_cast_or_null<clang::ForStmt>(stmtParent)) {
       if (forStmt->getBody() != block)
         return rejectScope();
-      if (containsCall(forStmt->getInc()))
+      // FR-193 item 6 widened the screen from `containsCall` to the full
+      // observable-effect predicate: `for (i = 0; i < n; ++i, tick++)` with a
+      // destructor that reads the global `tick` printed `dtor 0 tick=1`
+      // against the native's `dtor 0 tick=0` -- the same miscompile this gate
+      // exists for, reached by a store instead of a call.
+      if (observableEffect(forStmt->getInc()))
         return emitError(loc)
                << "unsupported: object of a class with a destructor in a loop "
                   "whose increment has side effects";
+      steps.push_back({block, node, /*ownerIsLoop=*/true});
       node = forStmt;
       continue;
     }
@@ -313,6 +628,7 @@ LogicalResult CImporter::checkDropLocalScope(const clang::VarDecl *var,
             llvm::dyn_cast_or_null<clang::WhileStmt>(stmtParent)) {
       if (whileStmt->getBody() != block)
         return rejectScope();
+      steps.push_back({block, node, /*ownerIsLoop=*/true});
       node = whileStmt;
       continue;
     }
@@ -320,6 +636,19 @@ LogicalResult CImporter::checkDropLocalScope(const clang::VarDecl *var,
             llvm::dyn_cast_or_null<clang::DoStmt>(stmtParent)) {
       if (doStmt->getBody() != block)
         return rejectScope();
+      // FR-193 item 6: a do-while CONDITION is the `for` increment's twin --
+      // C++ destroys the body's locals BEFORE evaluating it, and the emitted
+      // loop renders it at the bottom of the body, AHEAD of the drop.
+      // Measured on `do { T a(i); printf("body"); ++i; } while (g(i) < n);`:
+      // the native's `body 0 / dtor 0 / cond 1` came out as
+      // `body 0 / cond 1 / dtor 0`. A plain `while` is NOT affected -- its
+      // condition runs at the top of the iteration, after the previous drop,
+      // and is byte-identical today.
+      if (observableEffect(doStmt->getCond()))
+        return emitError(loc)
+               << "unsupported: object of a class with a destructor in a "
+                  "do-while loop whose condition has side effects";
+      steps.push_back({block, node, /*ownerIsLoop=*/true});
       node = doStmt;
       continue;
     }
@@ -327,13 +656,28 @@ LogicalResult CImporter::checkDropLocalScope(const clang::VarDecl *var,
             llvm::dyn_cast_or_null<clang::IfStmt>(stmtParent)) {
       if (ifStmt->getThen() != block && ifStmt->getElse() != block)
         return rejectScope();
+      steps.push_back({block, node, /*ownerIsLoop=*/false});
       node = ifStmt;
       continue;
     }
     return rejectScope(); // bare nested block, switch case block, ...
   }
+  // FR-193 item 6: the scope is modelled, but the LIFT can still move a side
+  // effect across this object's drop. Rejection is a feature -- the
+  // alternative here is a compile-clean crate that prints the destructor
+  // trace in the wrong order.
+  if (const clang::Stmt *effect = relocatedExitEffect(steps, declStmt)) {
+    InFlightDiagnostic diag =
+        emitError(loc) << "unsupported: object of a class with a destructor in "
+                          "a loop whose exit path has side effects";
+    diag.attachNote(translateLoc(effect->getBeginLoc()))
+        << "this side effect runs before the destructor in C++, but it is on a "
+           "path that only leaves the loop, so it is emitted after the loop -- "
+           "past the drop";
+    return failure();
+  }
+  return success();
 }
-
 LogicalResult CImporter::emitLocalVar(const clang::VarDecl *var) {
   Location loc = translateLoc(var->getLocation());
   // A `va_list` local inside a monomorphization clone (CTS 00204) has no

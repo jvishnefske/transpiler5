@@ -402,6 +402,8 @@ _CXX_BLOCKER_SUBSTRINGS = [
     ("value copy of a class with a destructor", "cxx-drop-by-value"),
     ("outside a function, loop, or branch body", "cxx-drop-scope"),
     ("in a loop whose increment has side effects", "cxx-drop-scope"),
+    ("in a loop whose exit path has side effects", "cxx-drop-scope"),
+    ("do-while loop whose condition has side effects", "cxx-drop-scope"),
     ("user-declared destructor", "cxx-destructor"),
     # W2.19a retired "unsupported: virtual method"/cxx-virtual: the
     # class-level gate is gone (virtual methods on values statically

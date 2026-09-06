@@ -251,6 +251,16 @@ constexpr BlockerSubstring kCxxBlockerSubstrings[] = {
      llvm::StringLiteral("cxx-drop-scope")},
     {llvm::StringLiteral("in a loop whose increment has side effects"),
      llvm::StringLiteral("cxx-drop-scope")},
+    // FR-193 item 6: the same family one step further out -- the scope IS
+    // modelled, but the CF-to-SCF lift relocates a loop-exit path past the
+    // drop, so a side effect on it crosses the destructor.
+    {llvm::StringLiteral("in a loop whose exit path has side effects"),
+     llvm::StringLiteral("cxx-drop-scope")},
+    // FR-193 item 6: the do-while CONDITION, the `for` increment's twin --
+    // C++ destroys the body's locals before evaluating it, the emitted loop
+    // renders it ahead of the drop.
+    {llvm::StringLiteral("do-while loop whose condition has side effects"),
+     llvm::StringLiteral("cxx-drop-scope")},
     {llvm::StringLiteral("user-declared destructor"),
      llvm::StringLiteral("cxx-destructor")},
     {llvm::StringLiteral("virtual method call through a pointer"),
