@@ -1103,3 +1103,14 @@ summary = "LANDED 2026-09-04, FR-193 item 7. v[0].x = 99 gave native 99, emitted
 blocked_by = []
 anchor = "FR-196 (opened and LANDED 2026-09-04; FR-193 item 7): **A STORE THROUGH"
 
+[[items]]
+id = "FR-197"
+rank = 12
+kind = "defect"
+status = "spiked"
+size = "M"
+title = "The CF-to-SCF blowup is quadratic node splitting, not exponential search, and it is lift-cf-to-scf specifically"
+summary = "Opened 2026-09-05, FR-193 item 5, re-measured and the original diagnosis CORRECTED. FR-193 filed it as exponential; the component was right but the growth law was not, and the difference decides the fix -- exponential needs a different ALGORITHM, polynomial duplication needs STOP DUPLICATING, which has known linear answers. MEASURED on an N-case fallthrough ladder: raw import is LINEAR (133/189/245/357 at N=16/24/32/48, 0.03s flat) and stays linear through mem2reg+canonicalize (249 at N=48), then --lift-cf-to-scf alone takes 129 -> 1100 at N=24 and 249 -> 3920 at N=48. Output fits O(N^2.7), time O(N^3-4.7); an exponential 2^(N/6) UNDER-predicts measured time at N=48 (4.8s vs 8.0s). MECHANISM CONFIRMED STRUCTURALLY: counting each case constant in the emitted Rust gives a clean ramp -- case k appears about (N-k+1) times, summing to N^2/2, so every switch arm carries a full copy of the tail. Classical node splitting. TWO FURTHER CORRECTIONS: the importer is innocent, and the pipeline itself is fast (0.10s at N=48) -- the wall-clock hang is the RUST EMITTER's super-linear analyses over the already-quadratic IR. The CFG is a loop-free DAG ladder whose joins are not properly nested with its branches, so a tree-shaped target forces duplication or a selector. SOLUTIONS COSTED: (A) guarded linear sequence, the shape-specific optimum -- `if sel <= 0 {B0} if sel <= 1 {B1}...`, O(N), idiomatic, AST-recognisable, matches the house pattern and design.md's recorded recognition-at-the-AST NO-GO; (B) dispatch loop/state machine, universal and O(N) but precisely the museum-piece output EPIC E rejects, so a backstop not a target; (C) bound + located rejection, the MINIMUM bar since a compile that never returns violates the repo doctrine unconditionally; (D) SESE partitioning (Johnson/Pearson/Pingali PLDI 1994) does NOT help -- the ladder is a single SESE region, recorded so it is not retried; (E) map-reduce buys throughput not asymptotics, since structuring is inherently hierarchical within a region; (F) Ramsey, Beyond Relooper (ICFP 2022), dominator-directed with labelled forward breaks, linear output, an unusually good fit because Rust has labelled block break since 1.65 -- BUT BLOCKED: the dialect has emitrust.break and NO labelled block, and SCFToEmitRust handles only Condition/For/If/IndexSwitch/While/Yield. RECOMMENDATION: (C) now, then (A), (F) only if general unstructured CFG becomes a goal and only after the labelled-block op."
+blocked_by = []
+anchor = "FR-197 (opened 2026-09-05; FR-193 item 5, RE-MEASURED and the original"
+

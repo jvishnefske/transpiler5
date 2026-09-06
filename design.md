@@ -12812,6 +12812,104 @@ piece and becomes FR-45.
   members to project); and `m[k].f` on a `std::map` (the recognised value set
   contains no struct types, so the shape is unreachable today).
 
+- [ ] FR-197 (opened 2026-09-05; FR-193 item 5, RE-MEASURED and the original
+  diagnosis CORRECTED): **THE CF-TO-SCF BLOWUP IS QUADRATIC NODE SPLITTING,
+  NOT EXPONENTIAL SEARCH, AND IT IS `lift-cf-to-scf` SPECIFICALLY.**
+  FR-193 filed this as "exponential blowup in the CF-to-SCF structurizer".
+  The component was right; the growth law was not, and the difference decides
+  the fix -- exponential means a different ALGORITHM is required, polynomial
+  duplication means STOP DUPLICATING, which has known linear answers.
+  MEASURED, on a ladder of N fallthrough cases:
+    raw import (`emitrust-import-c`)     133 / 189 / 245 / 357 lines at
+                                         N=16/24/32/48 -- **LINEAR**, 0.03s flat
+    + mem2reg + canonicalize             129 / .. / .. / 249 -- still LINEAR
+    + `--lift-cf-to-scf`                 1100 at N=24, 3920 at N=48
+    full pipeline output                 2476 / 6944 / 14932 / 45564
+  Fitting: output is **O(N^2.7)**, wall time **O(N^3 - N^4.7)**. An
+  exponential `2^(N/6)` UNDER-predicts the measured time at N=48 (4.8s
+  predicted vs 8.0s measured), so the data fits a polynomial better than the
+  exponential the entry was filed under.
+  **THE MECHANISM, CONFIRMED STRUCTURALLY RATHER THAN INFERRED.** Counting
+  each case's constant in the emitted Rust at N=24 gives a clean linear ramp
+  -- case 24 appears once, case 23 twice, case 18 seven times, case 1
+  twenty-eight times. Case k appears about (N-k+1) times, summing to N^2/2:
+  **every switch arm carries a full copy of the tail.** That is classical
+  node splitting (Cocke; Hecht-Ullman), whose worst case is exponential but
+  which on this shape is exactly quadratic.
+  TWO FURTHER CORRECTIONS to the filing. The IMPORTER IS INNOCENT -- it is
+  linear and flat at 0.03s. And the pipeline itself is FAST (0.10s at N=48);
+  **the wall-clock hang is the RUST EMITTER's super-linear analyses running
+  over the already-quadratic IR** (8.0s at N=48). So there are two
+  multiplying costs, and only the first is the root.
+  THE CFG IS A DAG WITH NO LOOPS -- a "ladder": each `Bk` is entered from the
+  switch AND falls in from `B(k-1)`. Structured control flow nests as a TREE;
+  a ladder's joins are not properly nested with its branches, so a
+  tree-shaped target forces either duplication (what happens now) or a
+  selector.
+  SOLUTION SPACE, costed:
+  (A) **Guarded linear sequence -- the shape-specific optimum.** C fallthrough
+      means "entering at k executes k..N", whose structured equivalent is
+      `if sel <= 0 { B0 } if sel <= 1 { B1 } ...`: **O(N), no state variable,
+      no loop, and idiomatic.** Recognisable at the AST (a switch whose cases
+      lack `break` and fall in declaration order), which is exactly this
+      repo's house pattern -- `planStringFill`, `planVecLift`, `matchRangeFor`
+      are all AST recognition with a conservative fallback, and design.md's
+      own recorded NO-GO says recognition belongs at the AST, not the IR.
+  (B) **Dispatch loop / state machine -- the universal fallback.**
+      `let mut state = sel; loop { match state { 0 => { B0; state = 1; } ... } }`.
+      O(N) and handles ANY CFG including irreducible ones; this is Emscripten
+      Relooper's `Multiple` block and the standard decompiler fallback.
+      **But it is precisely the "museum piece" output EPIC E rejects** -- a
+      state variable and a dispatch loop is not Rust a person would write. It
+      is a correctness backstop, not a target.
+  (C) **Bound + located rejection.** Detect the shape (or the growth) and
+      refuse. The repo's doctrine is that rejection is a feature and that a
+      tool must never produce neither output nor a diagnostic; **a compile
+      that never returns violates that unconditionally.** This is the MINIMUM
+      bar and should ship regardless of which of A/B is chosen.
+  (D) **SESE-region partitioning** (Johnson/Pearson/Pingali, PLDI 1994 -- the
+      Program Structure Tree, linear-time canonical single-entry/single-exit
+      decomposition). Good general engineering: it bounds blowup per region
+      and enables incremental structuring. **It does NOT help THIS shape** --
+      the ladder is a single SESE region (entry the switch, exit the join),
+      so partitioning cannot split it. Recorded so it is not tried and
+      re-discovered.
+  (E) **Map-reduce / parallel structuring.** Structuring produces a nested
+      tree, so within a region the algorithm is inherently sequential; with
+      (D) it parallelises ACROSS regions, and it already parallelises across
+      functions. **That buys throughput, not asymptotics** -- it would make a
+      quadratic blowup arrive sooner, not go away.
+  (F) **A non-duplicating general algorithm -- the research answer.** Ramsey,
+      *"Beyond Relooper: recursive translation of unstructured control flow to
+      structured control flow"* (ICFP 2022) translates via the dominator tree
+      into `block`/`loop` scopes with labelled forward breaks, producing
+      **linear** output with no duplication. It is an unusually good fit for
+      Rust specifically, because Rust has had **labelled block break**
+      (`'a: { ... break 'a; }`) since 1.65 -- exactly the forward-jump-to-join
+      primitive such algorithms need, and the thing C `goto` has and
+      structured Rust otherwise lacks.
+      **BLOCKER, measured: the dialect cannot express it.** There is an
+      `emitrust.break` op but NO labelled block and no labelled break, and
+      `SCFToEmitRust` handles only `scf::{Condition,For,If,IndexSwitch,While,
+      Yield}`. Adopting (F) means a new op plus emitter support first.
+      (MLIR's `transformCFGToSCF` is, to my understanding, based on Bahmann
+      et al., *"Perfect Reconstructability of Control Flow from Demand
+      Dependence Graphs"*, TACO 2015 -- whose general method uses predicates
+      rather than duplication, which suggests the blowup is an implementation
+      choice rather than inherent. The shipped MLIR package is headers-only
+      so this was NOT verified against the source; treat it as a lead.)
+  **RECOMMENDATION: hybrid, in this order.** (C) immediately, because a hang
+  with no diagnostic is the one outcome the repo forbids outright and the fix
+  is cheap. Then (A), which is linear, idiomatic, matches the house
+  recognition pattern, and covers the measured shape. (F) only if general
+  unstructured control flow becomes a goal -- and it needs the labelled-block
+  op first. (B) is the backstop if (A)'s recogniser must fall back. (D) and
+  (E) are recorded as NOT applicable to this defect.
+  NOT MEASURED: whether the same ladder shape arises in any real corpus
+  program (the TRACTOR, RealWorld and c-testsuite corpora all compile fine
+  today, so this is a robustness/DoS defect rather than a scored one), and
+  the exact N at which the current pipeline crosses a practical timeout.
+
 - [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
   FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED
   AGGREGATE `let` ENDED ITS PREFIX.**
