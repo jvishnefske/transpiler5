@@ -1114,3 +1114,13 @@ summary = "Opened 2026-09-05, FR-193 item 5, re-measured and the original diagno
 blocked_by = []
 anchor = "FR-197 (opened 2026-09-05; FR-193 item 5, RE-MEASURED and the original"
 
+[[items]]
+id = "FR-198"
+kind = "feature"
+status = "landed"
+size = "L"
+title = "The switch ladder now lowers linearly and the unadmitted residue is bounded; the hang class is narrowed, not closed"
+summary = "LANDED 2026-09-05, implements FR-197. Three-way at emitSwitchStmt, decided at the AST: admitted ladder -> guarded sequence, not admitted and chain > 32 -> located rejection, else the existing cf.switch path untouched. TRANSFORM: one cf.switch whose every destination is the SAME first guard block carrying a section INDEX as a block argument, then entry <= k guarded diamonds -- because the index is a POSITION not a case value, sparse/negative/out-of-order labels and default: anywhere all work. LINEARITY PROVEN NOT ASSERTED: emitted lines are exactly 8N+10 (138/266/522/1034/2058 at N=16..256), fitted O(N^0.975), against the previous O(N^2.57) output and O(N^3.01) time; hang_min.c at N=100 went from >360s with NO OUTPUT to 0.10s, 813 lines, stdout byte-matching native. ZERO GOLDENS CHANGED and the reason matters: a sweep of 761 importable corpus files found the ladder shape in exactly THREE files, the three added here -- so clippy +0 and flat ratchets are mechanical, and this is a robustness fix with NO measured corpus effect. HAZARDS: declaration scope REFUSED not hoisted (stricter than needed, and the one most likely to miscompile silently since each guarded if is its own Rust scope); single evaluation pinned by a test whose controlling expression bumps a global; a break targeting this switch refuses but a break captured by an INNER loop/switch correctly does not. Added a shape clause the spec omitted -- every section must fall through -- else a 130-arm return table would have been rewritten into 130 guards where a match is already linear and idiomatic. Bound 32 chosen from the measured curve; boundary verified exactly (32 import, 33 reject). ORACLES: gate 990/990, a 120-program differential fuzz 120/120 byte-matching (101 ladder path, 428 fallback), controls byte-identical, both ratchets unmoved, clippy 101 (+0), TRACTOR 40/252. TWO RESIDUALS, both re-measured: the bound is enforced only on the PLAIN-body path, so a Duff's-device-shaped body routes to emitDispatchSwitch where the chain is not measured and can still reach the quadratic lowering unbounded; and the goto ladder is untouched -- goto_chain_blowup.c still takes 29.7s and emits 83,383 lines."
+blocked_by = []
+anchor = "FR-198 (opened and LANDED 2026-09-05; implements FR-197's"
+

@@ -5956,18 +5956,22 @@ LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
   // (consecutive case/default labels share one target) starts a section
   // holding the statements up to the next chain. Case values are constant
   // by C semantics; clang has already checked them.
+  //
+  // The partition is AST-ONLY -- no blocks are created here -- because
+  // FR-198's ladder recognition below reads it and picks one of two
+  // lowerings. Blocks are created inside whichever arm wins, in section
+  // order, so the block layout of the non-ladder arm is unchanged.
   struct Section {
-    Block *block;
     SmallVector<const clang::Stmt *, 4> stmts;
   };
   SmallVector<Section> sections;
   SmallVector<llvm::APInt> caseValues;
-  SmallVector<Block *> caseBlocks;
-  Block *defaultBlock = nullptr;
+  SmallVector<unsigned> caseSections;
+  std::optional<unsigned> defaultSection;
   for (const clang::Stmt *child : body->body()) {
     const clang::Stmt *statement = child;
     if (llvm::isa<clang::SwitchCase>(child)) {
-      sections.push_back({createBlock(), {}});
+      sections.push_back({});
       while (const auto *label = llvm::dyn_cast<clang::SwitchCase>(statement)) {
         Location labelLoc = translateLoc(label->getKeywordLoc());
         if (const auto *caseStmt = llvm::dyn_cast<clang::CaseStmt>(label)) {
@@ -5976,9 +5980,9 @@ LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
           llvm::APSInt value =
               caseStmt->getLHS()->EvaluateKnownConstInt(astContext());
           caseValues.push_back(value.extOrTrunc(flagType.getWidth()));
-          caseBlocks.push_back(sections.back().block);
+          caseSections.push_back(sections.size() - 1);
         } else {
-          defaultBlock = sections.back().block;
+          defaultSection = sections.size() - 1;
         }
         statement = label->getSubStmt();
       }
@@ -5988,6 +5992,174 @@ LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
     // inside `statement`.
     sections.back().stmts.push_back(statement);
   }
+
+  // FR-198. Measure the longest run of consecutive sections that fall into
+  // the next one. This is the quantity `lift-cf-to-scf` is quadratic in: it
+  // structurizes a fall-through chain by duplicating the tail into every
+  // arm, so case k of an N-chain is emitted about (N - k + 1) times.
+  unsigned longestChain = 1;
+  for (unsigned index = 0, run = 1; index + 1 < sections.size(); ++index) {
+    if (switchSectionFallsThrough(sections[index].stmts)) {
+      ++run;
+      longestChain = std::max(longestChain, run);
+    } else {
+      run = 1;
+    }
+  }
+
+  // FR-198. The LADDER shape: two or more sections, EVERY one of which falls
+  // into the next (so `longestChain` spans the whole body), carrying nothing
+  // that the guarded form cannot express.
+  //
+  // "Every section falls through" is what makes the body a ladder rather
+  // than an ordinary switch: it is a shape clause, not a size threshold, and
+  // there is deliberately no N-cutoff -- one construct gets one lowering, so
+  // the small case the tests exercise is the same code path the large case
+  // ships on. An ordinary `case k: ...; break;` switch, and the
+  // `case k: return ...;` table (which falls through nowhere), keep the
+  // `cf.switch` lowering below untouched.
+  const clang::Stmt *ladderRefusal = nullptr;
+  bool isLadder = sections.size() >= 2 && longestChain == sections.size();
+  for (unsigned index = 0; isLadder && index < sections.size(); ++index) {
+    for (auto [position, statement] : llvm::enumerate(sections[index].stmts)) {
+      // HAZARD 1: a declaration at switch-body scope. C keeps it in scope for
+      // every LATER case (C11 6.2.4p6 leaves it uninitialized when the
+      // dispatch jumps over it), but each guarded `if` is its own Rust scope,
+      // so a later section could not name it. Refused rather than hoisted:
+      // hoisting would have to reproduce the jumped-over-initializer rule as
+      // well, and the fallback lowering below already handles the shape
+      // correctly.
+      if (llvm::isa<clang::DeclStmt>(statement)) {
+        ladderRefusal = statement;
+        break;
+      }
+      // A `break` that is the FINAL top-level statement of the FINAL section
+      // branches to the exit the section would fall out to anyway, so it is
+      // a no-op and does not stop the chain. Every other `break` does.
+      if (index + 1 == sections.size() &&
+          position + 1 == sections[index].stmts.size() &&
+          llvm::isa<clang::BreakStmt>(statement))
+        continue;
+      // HAZARDS 2 and 3: `break` targeting this switch, and any label or
+      // `goto` (see `findLadderHazard`).
+      if (const clang::Stmt *hazard = findLadderHazard(statement, true)) {
+        ladderRefusal = hazard;
+        break;
+      }
+    }
+    if (ladderRefusal)
+      isLadder = false;
+  }
+
+  if (isLadder) {
+    // FR-198: the guarded linear form. `flag` -- the controlling expression,
+    // already evaluated EXACTLY ONCE above -- selects an entry INDEX, and the
+    // sections then run under `entry <= k` guards:
+    //
+    //   let entry = match flag { v0 => i0, ..., _ => D };
+    //   if entry <= 0 { B0 } if entry <= 1 { B1 } ... if entry <= M-1 { BM-1 }
+    //
+    // where `D` is the index of the section carrying `default:` (which may be
+    // anywhere in the body) or M when there is none, so an unmatched value
+    // runs nothing. Indices are section positions, not case values, so sparse,
+    // negative and out-of-order labels all work.
+    //
+    // Output is O(M): each section appears exactly once, and every guard is a
+    // properly nested single-entry/single-exit diamond that `lift-cf-to-scf`
+    // structurizes without duplicating anything.
+    Type stepType = builder.getI32Type();
+    SmallVector<Value> steps;
+    for (unsigned index = 0; index <= sections.size(); ++index)
+      steps.push_back(builder
+                          .create<arith::ConstantOp>(
+                              loc, builder.getIntegerAttr(stepType, index))
+                          .getResult());
+    llvm::ArrayRef<Value> stepRefs(steps);
+
+    SmallVector<Block *> guardBlocks;
+    SmallVector<Block *> bodyBlocks;
+    for (unsigned index = 0; index < sections.size(); ++index) {
+      guardBlocks.push_back(createBlock());
+      bodyBlocks.push_back(createBlock());
+    }
+    Block *exitBlock = createBlock();
+    // The entry index arrives as a block argument of the first guard, which
+    // dominates every later guard and body, so no cell and no mem2reg round
+    // trip is involved.
+    Value entry = guardBlocks.front()->addArgument(stepType, loc);
+
+    SmallVector<Block *> caseDestinations(caseValues.size(),
+                                          guardBlocks.front());
+    SmallVector<ValueRange> caseOperands;
+    for (unsigned section : caseSections)
+      caseOperands.push_back(stepRefs.slice(section, 1));
+    builder.create<cf::SwitchOp>(
+        loc, flag, guardBlocks.front(),
+        stepRefs.slice(defaultSection.value_or(sections.size()), 1),
+        llvm::ArrayRef<llvm::APInt>(caseValues), BlockRange(caseDestinations),
+        llvm::ArrayRef<ValueRange>(caseOperands));
+
+    // `break` targets the exit block -- only the admitted trailing one can
+    // reach it -- and `continue` keeps targeting the latch of the enclosing
+    // loop, so a `continue` or `return` inside a section abandons the rest of
+    // the guard chain exactly as it abandons the rest of the switch in C.
+    loopStack.push_back(
+        {exitBlock,
+         loopStack.empty() ? nullptr : loopStack.back().continueDest});
+    for (unsigned index = 0; index < sections.size(); ++index) {
+      Block *next =
+          index + 1 < sections.size() ? guardBlocks[index + 1] : exitBlock;
+      builder.setInsertionPointToEnd(guardBlocks[index]);
+      Value taken = builder
+                        .create<arith::CmpIOp>(loc, arith::CmpIPredicate::sle,
+                                               entry, steps[index])
+                        .getResult();
+      builder.create<cf::CondBranchOp>(loc, taken, bodyBlocks[index],
+                                       ValueRange(), next, ValueRange());
+      builder.setInsertionPointToEnd(bodyBlocks[index]);
+      LogicalResult sectionResult = success();
+      for (const clang::Stmt *statement : sections[index].stmts)
+        if (failed(sectionResult = emitStmt(statement)))
+          break;
+      if (failed(sectionResult)) {
+        loopStack.pop_back();
+        return failure();
+      }
+      if (!isTerminated(builder.getInsertionBlock()))
+        builder.create<cf::BranchOp>(loc, next);
+    }
+    loopStack.pop_back();
+    builder.setInsertionPointToEnd(exitBlock);
+    return success();
+  }
+
+  // FR-198. The shape was not admitted, so the body falls to the duplicating
+  // `cf.switch` lowering below. Past `kMaxSwitchFallThroughChain` that
+  // lowering stops finishing at all (>360s and NO output and NO diagnostic at
+  // a chain of 100), which is the one failure mode this repo forbids
+  // outright, so refuse with a located diagnostic instead. The note names the
+  // clause that cost the shape its linear lowering.
+  if (longestChain > kMaxSwitchFallThroughChain) {
+    InFlightDiagnostic diagnostic =
+        emitError(loc) << "unsupported: switch with a fall-through chain of "
+                       << longestChain << " cases (limit "
+                       << kMaxSwitchFallThroughChain
+                       << "); structurizing it duplicates the tail into every "
+                          "arm and does not finish";
+    if (ladderRefusal)
+      diagnostic.attachNote(translateLoc(ladderRefusal->getBeginLoc()))
+          << "this statement blocks the linear guarded lowering";
+    return diagnostic;
+  }
+
+  SmallVector<Block *> sectionBlocks;
+  for (unsigned index = 0; index < sections.size(); ++index)
+    sectionBlocks.push_back(createBlock());
+  SmallVector<Block *> caseBlocks;
+  for (unsigned section : caseSections)
+    caseBlocks.push_back(sectionBlocks[section]);
+  Block *defaultBlock =
+      defaultSection ? sectionBlocks[*defaultSection] : nullptr;
 
   Block *exitBlock = createBlock();
   SmallVector<ValueRange> caseOperands(caseBlocks.size(), ValueRange());
@@ -6003,7 +6175,7 @@ LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
   loopStack.push_back(
       {exitBlock, loopStack.empty() ? nullptr : loopStack.back().continueDest});
   for (auto [index, section] : llvm::enumerate(sections)) {
-    builder.setInsertionPointToEnd(section.block);
+    builder.setInsertionPointToEnd(sectionBlocks[index]);
     LogicalResult sectionResult = success();
     for (const clang::Stmt *statement : section.stmts)
       if (failed(sectionResult = emitStmt(statement)))
@@ -6014,7 +6186,7 @@ LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
     }
     if (!isTerminated(builder.getInsertionBlock())) {
       Block *next =
-          index + 1 < sections.size() ? sections[index + 1].block : exitBlock;
+          index + 1 < sections.size() ? sectionBlocks[index + 1] : exitBlock;
       builder.create<cf::BranchOp>(loc, next);
     }
   }

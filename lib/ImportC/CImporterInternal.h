@@ -8120,6 +8120,89 @@ static inline bool isPlainSwitchBody(const clang::CompoundStmt *body) {
   return true;
 }
 
+/// FR-198. Returns the first statement inside `stmt` that has no equivalent
+/// in the guarded-ladder lowering of a fall-through switch, or null.
+///
+/// The guarded form replaces `switch (sel) { case v0: B0; case v1: B1; ... }`
+/// (a chain in which every arm falls into the next) with
+/// `let e = match sel { v0 => 0, ... }; if e <= 0 { B0 } if e <= 1 { B1 } ...`.
+/// Each `if` is a SEPARATE Rust scope and each is entered independently, so
+/// three C constructs stop being expressible:
+///
+///  - `break` targeting THIS switch. It stops the chain at that arm, so the
+///    shape is no longer "entering at k executes k..N-1" and the guarded
+///    form would run the tail anyway -- a miscompile. Refused. (The one
+///    exception is a `break` that is the final top-level statement of the
+///    FINAL section, which is the no-op fall-out; the caller admits that one
+///    and never reaches this walk with it.)
+///  - `goto` and any label. A jump INTO the middle of a section has no
+///    guarded-form target at all, and a jump OUT of it would leave the
+///    remaining guards unexecuted only by accident of block layout. Refused
+///    at any depth.
+///
+/// `continue` and `return` are NOT hazards: both abandon the rest of the
+/// switch in C and abandon the rest of the guard chain in the guarded form,
+/// which is the same thing.
+///
+/// `breakIsHazard` turns off once the walk enters a construct that captures
+/// `break` itself (a nested loop or switch): a `break` there targets the
+/// inner construct, not this switch. Labels and gotos stay hazards
+/// throughout -- a label inside a nested loop is still a `goto` target from
+/// outside the ladder.
+static inline const clang::Stmt *findLadderHazard(const clang::Stmt *stmt,
+                                                  bool breakIsHazard) {
+  if (!stmt)
+    return nullptr;
+  if (llvm::isa<clang::LabelStmt, clang::GotoStmt, clang::IndirectGotoStmt>(
+          stmt))
+    return stmt;
+  if (breakIsHazard && llvm::isa<clang::BreakStmt>(stmt))
+    return stmt;
+  bool childBreakIsHazard =
+      breakIsHazard &&
+      !llvm::isa<clang::ForStmt, clang::WhileStmt, clang::DoStmt,
+                 clang::SwitchStmt, clang::CXXForRangeStmt>(stmt);
+  for (const clang::Stmt *child : stmt->children())
+    if (const clang::Stmt *found = findLadderHazard(child, childBreakIsHazard))
+      return found;
+  return nullptr;
+}
+
+/// FR-198. Whether a switch section made of `stmts` (the top-level
+/// statements between its label chain and the next one) can fall into the
+/// following section.
+///
+/// The test is SYNTACTIC on purpose: it drives the ladder SHAPE decision and
+/// the fall-through-chain bound, neither of which is a correctness clause
+/// (the guarded form is correct whether or not a section returns). Treating
+/// a conditionally-returning section as falling through therefore only makes
+/// the shape recognition and the bound slightly more inclusive, never wrong.
+static inline bool
+switchSectionFallsThrough(llvm::ArrayRef<const clang::Stmt *> stmts) {
+  if (stmts.empty())
+    return true;
+  return !llvm::isa<clang::ReturnStmt, clang::BreakStmt, clang::ContinueStmt,
+                    clang::GotoStmt, clang::IndirectGotoStmt>(stmts.back());
+}
+
+/// FR-198. The longest fall-through chain a switch body may carry before the
+/// importer refuses it outright.
+///
+/// `lift-cf-to-scf` structurizes a fall-through chain by DUPLICATING the tail
+/// into every arm, so a chain of N sections emits ~N^2/2 copies of the case
+/// bodies: FR-197 measured 445/2292/6572/14307/26523/44243 emitted lines and
+/// 0.04/0.06/0.21/0.86/2.87/7.93s at N=8/16/24/32/40/48, and >360s with no
+/// output and no diagnostic at N=100. A compile that never returns is the one
+/// outcome this repo forbids unconditionally, so a chain the guarded lowering
+/// cannot claim is rejected with a located diagnostic instead.
+///
+/// 32 is the largest measured point whose compile still finishes in about a
+/// second (0.86s; 40 is already 2.87s and 48 is 7.93s). Chains this long do
+/// not occur in any corpus -- every c-testsuite, Cpp17Suite, TRACTOR and
+/// RealWorld program compiles today -- and the ones that do occur in the
+/// ladder shape are now lowered linearly instead of being rejected.
+static constexpr unsigned kMaxSwitchFallThroughChain = 32;
+
 /// Returns true if `type` is an MLIR unsigned integer type (the mapping of
 /// the C unsigned integer types; signless types model the signed ones).
 static inline bool isUnsignedInt(Type type) {
