@@ -885,3 +885,17 @@ emitrust.impl "Owner" {
 "emitrust.func"() <{function_type = () -> (), sym_name = ""}> ({
   "emitrust.return"() : () -> ()
 }) : () -> ()
+
+// -----
+
+// `emitrust.neg` is the FLOAT-only IEEE negation (Rust's prefix `-` on
+// f32/f64). Integer unary minus keeps its `0 - x` subtraction lowering,
+// which is exact on two's complement, so an integer operand here would
+// mean the float fix leaked into the integer path. The type constraint
+// rejects it with a located diagnostic rather than emitting Rust that
+// silently changes overflow behaviour.
+emitrust.func @neg_integer(%arg0: i32) {
+  // expected-error @+1 {{'emitrust.neg' op operand #0 must be 32-bit float or 64-bit float, but got 'i32'}}
+  %0 = emitrust.neg %arg0 : i32
+  emitrust.return
+}

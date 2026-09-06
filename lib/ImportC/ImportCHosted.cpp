@@ -986,6 +986,27 @@ LogicalResult CImporter::emitStringCopyCall(const clang::CallExpr *call,
            << "unsupported: " << name
            << " source and destination point into the same object '"
            << dst->base->getName() << "'";
+  // Two DISTINCT parameter declarations of one Phase-4 owner method are
+  // still two cursors into ONE region (`planOwners` promotes over a
+  // single storage base, so every data-pointer parameter is an i64 index
+  // into the receiver's `self.data`), which the base check above keys on
+  // declarations and cannot see. The byte-family copies have a
+  // same-region image for exactly this — `__emitrust_memcpy_within`'s
+  // `copy_within` — but the str*-family copies do NOT: their helpers
+  // discover the length from the source's NUL while writing the
+  // destination, and no single-slice image of that exists in the tree.
+  // Emitting the two-slice form here is `&mut self.data[dst..]` next to
+  // `&self.data[src..]`: rustc E0502, a crate that does not build, after
+  // the tool exited 0. So the shape rejects LOUDLY and located instead.
+  // The diagnostic names the OWNER ARRAY, not a parameter: the parameters
+  // are cursors, the region is the owner's array. The COMPARISON members
+  // of the family never reach here — two shared borrows are legal Rust.
+  if (dst->base && src->base && isCurrentOwnerRegionRoot(dst->base) &&
+      isCurrentOwnerRegionRoot(src->base))
+    return emitError(loc) << "unsupported: " << name
+                          << " source and destination point into the same "
+                             "owner region '"
+                          << currentMethodOwner->getName() << "'";
   // FR-146: two regions of the SAME heap allocation have no named base to
   // collide on — their shared identity is the synthesized backing place.
   // Borrowing it mutably and shared at once is rustc E0502, so the pair
@@ -1285,6 +1306,70 @@ LogicalResult CImporter::emitMemcpyCall(const clang::CallExpr *call,
                      count});
       return success();
     }
+  }
+  // Two DISTINCT parameter declarations of one Phase-4 owner method are
+  // still two cursors into ONE region: `planOwners` promotes a class
+  // all-or-nothing over a single storage base
+  // (`info.storageBases.size() != 1` disqualifies otherwise), so every
+  // data-pointer parameter of the method is an i64 element index into the
+  // receiver's `self.data` and `symbols` maps them all to the SAME
+  // `receiverDataPlace`. The (root, field-path) key above keys on the
+  // DECLARATION, so it cannot see that, and the pair fell through to the
+  // two-slice image below: `&mut self.data[dst..]` alongside
+  // `&self.data[src..]`, rustc E0502, a crate that does not build, with
+  // the tool still exiting 0 (the FR-140/141/142/146 silent-unbuildable
+  // class). The FR-72 objection that made a same-PARAMETER copy reject —
+  // a parameter's extent is not provable — does not apply here: the
+  // extent IS provable, it is the owner's own array, and the cursors are
+  // ABSOLUTE offsets into it, which is exactly the condition the same-root
+  // array branch above rides `copy_within` on. So this joins that image
+  // (memmove semantics, refining C's undefined OVERLAPPING memcpy exactly
+  // as the same-root branch does; a count that runs off the region panics
+  // where C read out of bounds — the loud direction, never a wrong byte).
+  // Only the plain single-base pointer shape qualifies: a literal
+  // backing, a heap backing, an unwrapped nullable slice, a `&s.member`
+  // base or a multi-base cursor resolves through a place that is NOT the
+  // receiver data member, so those decline to the historical images.
+  if (!dst->isMember() && !src->isMember() && dstRoot && srcRoot &&
+      isCurrentOwnerRegionRoot(dstRoot) && isCurrentOwnerRegionRoot(srcRoot) &&
+      !dst->pointer.literalBacking && !src->pointer.literalBacking &&
+      !dst->pointer.backing && !src->pointer.backing &&
+      !dst->pointer.slicePlace && !src->pointer.slicePlace &&
+      !dst->pointer.member && !src->pointer.member &&
+      !dst->pointer.baseIndex && !src->pointer.baseIndex &&
+      dst->pointer.multiBases.empty() && src->pointer.multiBases.empty()) {
+    // Defensive: the shared region is only provable when both roots
+    // really resolve to one place. Every owner-region parameter is bound
+    // to `receiverDataPlace` in the method prologue, so this holds by
+    // construction; a mismatch would be a planning bug, and rejecting is
+    // safer than emitting a copy over the wrong region.
+    auto dstIt = symbols.find(dstRoot);
+    auto srcIt = symbols.find(srcRoot);
+    if (dstIt == symbols.end() || srcIt == symbols.end() ||
+        dstIt->second != srcIt->second)
+      return emitError(loc) << "unsupported: " << name
+                            << " source and destination point into the same "
+                               "owner region '"
+                            << currentMethodOwner->getName() << "'";
+    // The WHOLE receiver region is borrowed (cursor 0): the helper's
+    // dst/src cursors are absolute element offsets into it, so starting
+    // the slice at the dst cursor would shift the copy window.
+    PtrExprValue whole{dstRoot,
+                       createIntConstant(loc, builder.getIntegerType(64), 0),
+                       Value()};
+    FailureOr<Value> slice = emitCharRegionSlice(loc, whole, /*isMut=*/true,
+                                                 /*allowUnsignedByte=*/true);
+    if (failed(slice))
+      return failure();
+    llvm::StringRef helper = isUnsignedByteRegion(*slice)
+                                 ? "__emitrust_memcpy_within_u8"
+                                 : "__emitrust_memcpy_within";
+    requestStringHelper(helper);
+    builder.create<emitrust::CallOpaqueOp>(
+        loc, TypeRange(), builder.getStringAttr(helper),
+        /*args=*/ArrayAttr(),
+        ValueRange{*slice, dst->pointer.cursor, src->pointer.cursor, count});
+    return success();
   }
   // FR-146: two regions of the SAME heap allocation share no named base
   // (both roots are null), so the (root, path) key above cannot see the

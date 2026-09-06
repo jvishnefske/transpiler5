@@ -2657,6 +2657,22 @@ private:
   bool isArrayMemberOwnerRoot(const clang::VarDecl *root,
                               const clang::VarDecl *ownerArray) const;
 
+  /// Whether `root` designates the region of the owner method currently
+  /// being imported — the receiver's `self.data` place. Inside a Phase-4
+  /// method that is EVERY data-pointer parameter (`planOwners`'s
+  /// all-or-nothing rule unifies them all into the one class, whose
+  /// `storageBases` has exactly one member) plus the owner array itself.
+  /// Two such roots are two cursors into ONE provable whole region even
+  /// though their declarations differ, which is what lets a byte-family
+  /// copy between them ride the same-region `copy_within` image instead
+  /// of emitting a mutable and a shared borrow of one place (rustc
+  /// E0502 — a crate that does not build, written after a clean exit).
+  /// False outside a method (`currentMethodOwner` null).
+  bool isCurrentOwnerRegionRoot(const clang::VarDecl *root) const {
+    return currentMethodOwner &&
+           isArrayMemberOwnerRoot(root, currentMethodOwner);
+  }
+
   /// Collects the function definitions the Pass-A planners analyze: every
   /// function of `unit` whose body is defined here, is not variadic, and
   /// lives outside a system header — the shared traversal seed of

@@ -464,9 +464,18 @@ struct SelectOpConversion : public OpConversionPattern<arith::SelectOp> {
 };
 
 /// Converts `arith.negf` (C unary minus on a floating operand) into
-/// `emitrust.sub` against a zero constant of the operand type — the `0.0 - x`
-/// spelling, mirroring the `0 - x` lowering the importer uses for signless
-/// integer negation. EmitRust has no unary negation op of its own.
+/// `emitrust.neg`, Rust's prefix `-` on a float — `std::ops::Neg`, which is
+/// exactly IEEE-754 negation.
+///
+/// This op used to lower as `0.0 - x` (an `emitrust.sub` against a zero
+/// constant), mirroring the `0 - x` spelling the importer uses for integer
+/// negation. That was a MISCOMPILE on floats: IEEE says `0.0 - 0.0` is
+/// `+0.0` whereas `-(0.0)` is `-0.0`, so `printf("%f", -x)` on a zero `x`
+/// rendered "0.000000" against clang's "-0.000000"; and `0.0 - NaN`
+/// propagates the operand's sign bit while `-NaN` flips it, so the x86
+/// default negative QNaN printed "-nan" against clang's "nan". Infinities
+/// happen to agree under both spellings (`0.0 - inf` is `-inf`), which is
+/// why the defect survived the earlier float-negation coverage.
 struct NegFOpConversion : public OpConversionPattern<arith::NegFOp> {
   using OpConversionPattern<arith::NegFOp>::OpConversionPattern;
 
@@ -477,9 +486,7 @@ struct NegFOpConversion : public OpConversionPattern<arith::NegFOp> {
     auto floatType = dyn_cast_or_null<FloatType>(resultType);
     if (!floatType)
       return rewriter.notifyMatchFailure(op, "negf result is not a float type");
-    Value zero = rewriter.create<emitrust::ConstantOp>(
-        op.getLoc(), floatType, rewriter.getFloatAttr(floatType, 0.0));
-    rewriter.replaceOpWithNewOp<emitrust::SubOp>(op, resultType, zero,
+    rewriter.replaceOpWithNewOp<emitrust::NegOp>(op, resultType,
                                                  adaptor.getOperand());
     return success();
   }
