@@ -1124,3 +1124,23 @@ summary = "LANDED 2026-09-05, implements FR-197. Three-way at emitSwitchStmt, de
 blocked_by = []
 anchor = "FR-198 (opened and LANDED 2026-09-05; implements FR-197's"
 
+[[items]]
+id = "FR-200"
+kind = "defect"
+status = "landed"
+size = "M"
+title = "Unary minus on a float was emitted as 0.0 - x, losing the sign of zero; both spec predictions about its blast radius were wrong"
+summary = "LANDED 2026-09-05, FR-193 item 8. Root cause one layer BELOW the spec: the importer already emits arith.negf; NegFOpConversion rewrote it to emitrust.sub(0.0, x) because the dialect had no unary negation op. Fixed by adding emitrust.neg (F32/F64). THE SPEC WAS WRONG IN BOTH DIRECTIONS: it asserted infinities were also broken -- they were NOT, 0.0 - inf == -inf at both widths; and it dismissed NaN sign as 'if observable' when it WAS observable and broken the OPPOSITE way, since subtraction PROPAGATES the NaN sign bit while -x FLIPS it, so x86 inf-inf gave native nan vs emitted -nan. Verified independently after landing: signed zero, -inf, nan and integer -1 all byte-identical to clang. AN ADDITIVITY TRAP the spec did not anticipate: isLiftableConditionOp already allow-listed emitrust.sub, so a new op unregistered there would have made float negation in a while-condition SILENTLY stop lifting to emitrust.while -- same class as FR-190 constraint 2. Integer unary minus untouched and pinned. Gate 995/995, clippy 101 (+0), TRACTOR 40/252, both ratchets unmoved; one CHECK golden flipped forward deliberately, no crate byte-identity golden moved. NOT VERIFIED: non-x86 NaN-sign behaviour."
+blocked_by = []
+anchor = "FR-200 (opened and LANDED 2026-09-05; FR-193 item 8): **UNARY MINUS ON"
+
+[[items]]
+id = "FR-201"
+kind = "defect"
+status = "landed"
+size = "M"
+title = "The mem*/str* two-cursor unbuildable was borrow granularity in the Phase-4 owner lift, not aliasing"
+summary = "LANDED 2026-09-05, FR-193 items 10-12. Three reports, one root cause, and the DISJOINT cases were the tell: two cursors into strictly non-overlapping sub-ranges also failed, so genuine aliasing was never the issue. planOwners promotes all-or-nothing over a single storage base (ImportCPlanning.cpp:309), so inside a promoted method every data-pointer parameter is an i64 index into the ONE receiver region and all bind to the same receiverDataPlace; the hosted byte-family lowering keyed its same-region check on the DECLARATION (ImportCHosted.cpp:1209-1212), so two parameter decls looked like two regions and emitted &mut self.data[dst..] beside &self.data[src..] -- E0502 after exit 0. The existing __emitrust_memcpy_within machinery already covered it, and FR-72's 'a parameter's extent is not provable' objection does not apply because the extent is the owner's own array and the cursors are absolute; __emitrust_split_mut_u8 was not needed. memmove/memcpy (overlapping and disjoint, i8 and u8, constant and RUNTIME cursors) now work and byte-diff clean; strcpy/strncpy/strcat are a LOCATED REJECTION because their helpers are two-slice and discover length from the source NUL WHILE writing the destination, and no same-region image of that exists -- inventing __emitrust_strcpy_within is a separate increment. ADDITIVITY BY DIFFERENTIAL over 310 EndToEnd + 421 Import/RealWorld + 220 c-testsuite inputs: exactly 2 changed, both new files. SPHINCS+ does not move because its aliasing is at the CALL SITE (FR-180's cross-TU clone), not this owner-method shape. RECORDED not hidden: overlapping memcpy through owner params is now accepted with memmove semantics -- C UB, no defined native answer, matching the pre-existing same-root refinement but reaching a new set of programs. Gate 995/995, clippy 101 (+0), TRACTOR 40/252 paired with zero per-case changes, both ratchets unmoved. NOT VERIFIED: the Kernel ratchet."
+blocked_by = []
+anchor = "FR-201 (opened and LANDED 2026-09-05; FR-193 items 10-12): **THE"
+

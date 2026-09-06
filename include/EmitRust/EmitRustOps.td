@@ -35,6 +35,13 @@ def EmitRust_ArithmeticType
 // Types usable as loop bounds: any integer or index.
 def EmitRust_IntegerOrIndexType : AnyTypeOf<[AnyInteger, Index]>;
 
+// Types usable in floating-point negation: exactly the two float widths the
+// emitter models. Integers are deliberately EXCLUDED — C's unary minus on
+// an integer keeps its `0 - x` lowering (signless `arith.subi`, or the
+// wrapping `emitrust.sub` on `ui<N>`), which is exact there because a
+// two's-complement integer has no signed zero.
+def EmitRust_FloatType : AnyTypeOf<[F32, F64]>;
+
 // Types usable as comparison operands: any arithmetic type, an EmitRust
 // enum type, or an EmitRust fn_ptr type. Enum and fn_ptr operands are
 // restricted to the eq/ne predicates by the CmpOp verifier.
@@ -1977,6 +1984,44 @@ def EmitRust_ShrOp : EmitRust_BinaryOp<"shr"> {
     %u = emitrust.shr %c, %d : ui32
     ```
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// Unary arithmetic operations
+//===----------------------------------------------------------------------===//
+
+def EmitRust_NegOp : EmitRust_Op<"neg", [SameOperandsAndResultType]> {
+  let summary = "Floating-point negation operation";
+  let description = [{
+    The `emitrust.neg` operation is emitted as Rust's prefix `-` operator,
+    which on `f32`/`f64` is `std::ops::Neg` — IEEE-754 negation, a pure
+    sign-bit flip.
+
+    It exists because `0.0 - x` is a DIFFERENT operation and lowering C's
+    unary minus that way is a miscompile on two input classes:
+    `0.0 - 0.0` is `+0.0` where `-(0.0)` is `-0.0`, and `0.0 - NaN`
+    propagates the operand's sign bit where `-NaN` flips it. (Infinities
+    agree under both spellings, but only by coincidence.)
+
+    The operand and result must be `f32` or `f64`. Integer negation has no
+    such op: `-x` on an integer stays the `0 - x` subtraction, which is
+    exact because two's complement has no signed zero.
+
+    Example:
+
+    ```mlir
+    %r = emitrust.neg %a : f64
+    ```
+    ```rust
+    // Code emitted for the operation above.
+    let v1 = -v0;
+    ```
+  }];
+
+  let arguments = (ins EmitRust_FloatType:$operand);
+  let results = (outs EmitRust_FloatType:$result);
+
+  let assemblyFormat = "$operand attr-dict `:` type($result)";
 }
 
 //===----------------------------------------------------------------------===//

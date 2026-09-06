@@ -179,6 +179,7 @@ struct ExprPos {
     Delimited, ///< inside `( )`, `[ ]` (call args, index without cast)
     Receiver,  ///< before `.method(..)` or `[i]`
     CastSource, ///< before ` as T` (appended by the consumer)
+    UnaryOperand, ///< after a prefix `-` (`emitrust.neg`)
     BinLhs,    ///< left operand of the infix operator of rank `rank`
     BinRhs     ///< right operand of the infix operator of rank `rank`
   };
@@ -190,6 +191,7 @@ struct ExprPos {
   static ExprPos delimited() { return {Kind::Delimited, Prec::Postfix}; }
   static ExprPos receiver() { return {Kind::Receiver, Prec::Postfix}; }
   static ExprPos castSource() { return {Kind::CastSource, Prec::Postfix}; }
+  static ExprPos unaryOperand() { return {Kind::UnaryOperand, Prec::Postfix}; }
   static ExprPos binLhs(Prec rank) { return {Kind::BinLhs, rank}; }
   static ExprPos binRhs(Prec rank) { return {Kind::BinRhs, rank}; }
 };
@@ -279,6 +281,14 @@ static bool needsParens(Prec rank, bool endsInCast, ExprPos pos) {
     return precValue(rank) < precValue(Prec::Postfix);
   case ExprPos::Kind::CastSource:
     return rank != Prec::Postfix && rank != Prec::Cast;
+  case ExprPos::Kind::UnaryOperand:
+    // Prefix `-` takes a unary-expression, so `-a + b`, `-x as f64` and
+    // `-a.method()` would all re-associate: everything looser than an atom
+    // wraps. `Prec::Unary` wraps TOO -- `- -x` must not lex as `--x`, and
+    // parenthesising a `*p` deref costs nothing. rustc's denied
+    // `unused_parens` was MEASURED not to fire on `-(*r)`, `-(-1.5f64)`,
+    // or `-(p as f64)`.
+    return precValue(rank) < precValue(Prec::Postfix);
   case ExprPos::Kind::BinLhs:
     if (endsInCast &&
         (pos.rank == Prec::Shift || pos.rank == Prec::Compare))
@@ -576,6 +586,8 @@ private:
   LogicalResult emitAssign(emitrust::AssignOp assignOp);
   /// Emits `let vN: T = vA <symbol> vB;` for binary and comparison ops.
   LogicalResult emitBinary(Operation *op, StringRef symbol);
+  /// Emits `let vN: T = -vA;` for the float negation op.
+  LogicalResult emitNeg(emitrust::NegOp op);
   /// Emits `let vN: T = vA.<method>(vB);` for the method-call binary form.
   LogicalResult emitBinaryMethod(Operation *op, StringRef method);
   /// Emits an add/sub/mul: the `wrapping_*` method-call form when the
@@ -2707,9 +2719,9 @@ static bool isPureProducer(Operation *op) {
     return !op->getResult(0).getType().isInteger(1);
   return isa<emitrust::ConstantOp, emitrust::AddOp, emitrust::SubOp,
              emitrust::MulOp, emitrust::DivOp, emitrust::RemOp,
-             emitrust::AndOp, emitrust::OrOp, emitrust::XorOp,
-             emitrust::ShlOp, emitrust::ShrOp, emitrust::BitcastOp,
-             emitrust::LoadOp, emitrust::LetOp,
+             emitrust::NegOp, emitrust::AndOp, emitrust::OrOp,
+             emitrust::XorOp, emitrust::ShlOp, emitrust::ShrOp,
+             emitrust::BitcastOp, emitrust::LoadOp, emitrust::LetOp,
              emitrust::StringRepeatOp, emitrust::VecFillOp>(op);
 }
 
@@ -2726,10 +2738,11 @@ static bool isInlineNonBarrier(Operation *op) {
     return !sliceOf.getIsMut();
   return isa<emitrust::ConstantOp, emitrust::LiteralOp, emitrust::AddOp,
              emitrust::SubOp, emitrust::MulOp, emitrust::DivOp,
-             emitrust::RemOp, emitrust::AndOp, emitrust::OrOp,
-             emitrust::XorOp, emitrust::ShlOp, emitrust::ShrOp,
-             emitrust::CmpOp, emitrust::CastOp, emitrust::BitcastOp,
-             emitrust::LoadOp, emitrust::LetOp, emitrust::MemberOp,
+             emitrust::RemOp, emitrust::NegOp, emitrust::AndOp,
+             emitrust::OrOp, emitrust::XorOp, emitrust::ShlOp,
+             emitrust::ShrOp, emitrust::CmpOp, emitrust::CastOp,
+             emitrust::BitcastOp, emitrust::LoadOp, emitrust::LetOp,
+             emitrust::MemberOp,
              emitrust::SubscriptOp, emitrust::DerefOp, emitrust::EnumRawOp,
              emitrust::GlobalLoadOp, emitrust::CellGetOp,
              emitrust::VariableOp, emitrust::YieldOp>(op);
@@ -2946,10 +2959,11 @@ static bool isClassifiedConsumerUse(OpOperand &use) {
   Operation *owner = use.getOwner();
   return llvm::TypeSwitch<Operation *, bool>(owner)
       .Case<emitrust::AddOp, emitrust::SubOp, emitrust::MulOp,
-            emitrust::DivOp, emitrust::RemOp, emitrust::AndOp,
-            emitrust::OrOp, emitrust::XorOp, emitrust::ShlOp,
-            emitrust::ShrOp, emitrust::CastOp, emitrust::BitcastOp,
-            emitrust::LetOp, emitrust::ReturnOp, emitrust::CallOpaqueOp,
+            emitrust::DivOp, emitrust::RemOp, emitrust::NegOp,
+            emitrust::AndOp, emitrust::OrOp, emitrust::XorOp,
+            emitrust::ShlOp, emitrust::ShrOp, emitrust::CastOp,
+            emitrust::BitcastOp, emitrust::LetOp, emitrust::ReturnOp,
+            emitrust::CallOpaqueOp,
             emitrust::CallIndirectOp, emitrust::IfOp, emitrust::SelectOp,
             emitrust::SwitchOp, emitrust::GlobalStoreOp,
             emitrust::EnumVariantOp, emitrust::MatchOp, emitrust::YieldOp>(
@@ -3128,6 +3142,8 @@ Prec RustEmitter::capturedPrec(Operation *op, StringRef text) {
             return isa<emitrust::MulOp>(binary) ? Prec::MulDiv : Prec::AddSub;
           })
       .Case<emitrust::DivOp, emitrust::RemOp>([](auto) { return Prec::MulDiv; })
+      // `-x`: a prefix minus, exactly the rank a leading `-` literal carries.
+      .Case<emitrust::NegOp>([](auto) { return Prec::Unary; })
       .Case<emitrust::AndOp>([](auto) { return Prec::BitAnd; })
       .Case<emitrust::OrOp>([](auto) { return Prec::BitOr; })
       .Case<emitrust::XorOp>([](auto) { return Prec::BitXor; })
@@ -4285,9 +4301,10 @@ static bool isTailFoldableProducer(Operation *op) {
              emitrust::CallOpaqueOp, emitrust::CallIndirectOp,
              emitrust::MethodCallOp, emitrust::AddOp, emitrust::SubOp,
              emitrust::MulOp, emitrust::DivOp, emitrust::RemOp,
-             emitrust::AndOp, emitrust::OrOp, emitrust::XorOp,
-             emitrust::ShlOp, emitrust::ShrOp, emitrust::CmpOp,
-             emitrust::CastOp, emitrust::BitcastOp, emitrust::SelectOp,
+             emitrust::NegOp, emitrust::AndOp, emitrust::OrOp,
+             emitrust::XorOp, emitrust::ShlOp, emitrust::ShrOp,
+             emitrust::CmpOp, emitrust::CastOp, emitrust::BitcastOp,
+             emitrust::SelectOp,
              emitrust::GlobalLoadOp, emitrust::CellGetOp, emitrust::LoadOp,
              emitrust::AddrOfOp, emitrust::SliceOfOp,
              emitrust::EnumVariantOp, emitrust::MatchOp>(op);
@@ -6779,6 +6796,20 @@ LogicalResult RustEmitter::emitBinary(Operation *op, StringRef symbol) {
   return success();
 }
 
+LogicalResult RustEmitter::emitNeg(emitrust::NegOp op) {
+  // Rust's prefix `-` on f32/f64 is `std::ops::Neg` -- IEEE-754 negation,
+  // a sign-bit flip. The predecessor spelling `0.0 - x` was a miscompile
+  // on zeros (`0.0 - 0.0` is `+0.0`, `-(0.0)` is `-0.0`) and on NaN sign.
+  if (failed(emitLetPrologue(op.getResult(), /*isMut=*/false)))
+    return failure();
+  os << "-";
+  if (failed(emitOperand(op.getLoc(), op.getOperand(),
+                         ExprPos::unaryOperand())))
+    return failure();
+  os << ";\n";
+  return success();
+}
+
 LogicalResult RustEmitter::emitBinaryMethod(Operation *op, StringRef method) {
   if (failed(emitLetPrologue(op->getResult(0), /*isMut=*/false)))
     return failure();
@@ -8244,6 +8275,10 @@ LogicalResult RustEmitter::emitOperation(Operation &op) {
       .Case<emitrust::RemOp>([&](emitrust::RemOp remOp) {
         return emitBinary(remOp.getOperation(), "%");
       })
+      // The one UNARY arithmetic op: Rust's prefix `-` on a float, which is
+      // IEEE negation. `0.0 - x` is a different operation (see emitNeg).
+      .Case<emitrust::NegOp>(
+          [&](emitrust::NegOp negOp) { return emitNeg(negOp); })
       .Case<emitrust::AndOp>([&](emitrust::AndOp andOp) {
         return emitBinary(andOp.getOperation(), "&");
       })

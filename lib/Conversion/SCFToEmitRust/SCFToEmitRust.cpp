@@ -314,13 +314,16 @@ static bool isLiftableConditionOp(Operation *op) {
           arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp, arith::ConstantOp,
           arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp,
           arith::IndexCastOp, arith::AddFOp, arith::SubFOp, arith::MulFOp,
-          arith::DivFOp, arith::SIToFPOp, arith::FPToSIOp>(op))
+          arith::DivFOp, arith::NegFOp, arith::SIToFPOp, arith::FPToSIOp>(op))
     return true;
+  // `emitrust.neg` (C unary minus on a float) joins the set for the same
+  // reason its `0.0 - x` predecessor was in it as an `emitrust.sub`: the
+  // lowering change must not silently stop lifting a `while` condition.
   return isa<emitrust::ConstantOp, emitrust::AddOp, emitrust::SubOp,
              emitrust::MulOp, emitrust::DivOp, emitrust::RemOp,
-             emitrust::AndOp, emitrust::OrOp, emitrust::XorOp,
-             emitrust::ShlOp, emitrust::ShrOp, emitrust::CmpOp,
-             emitrust::CastOp, emitrust::BitcastOp>(op);
+             emitrust::NegOp, emitrust::AndOp, emitrust::OrOp,
+             emitrust::XorOp, emitrust::ShlOp, emitrust::ShrOp,
+             emitrust::CmpOp, emitrust::CastOp, emitrust::BitcastOp>(op);
 }
 
 /// Converts `scf.while`. A loop whose before-region is a pure single-use

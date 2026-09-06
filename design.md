@@ -12988,6 +12988,91 @@ piece and becomes FR-45.
   ladder arm (the top-level `DeclStmt` refusal only covers switch-body
   scope, and the fuzz corpus is C-only).
 
+- [x] FR-200 (opened and LANDED 2026-09-05; FR-193 item 8): **UNARY MINUS ON
+  A FLOAT WAS EMITTED AS `0.0 - x`, LOSING THE SIGN OF ZERO -- AND BOTH OF MY
+  PREDICTIONS ABOUT ITS BLAST RADIUS WERE WRONG.**
+  Root cause was one layer BELOW where the spec pointed. The importer is
+  already correct (`ImportCExpressions.cpp:1107` emits `arith.negf`); the
+  miscompile was in `NegFOpConversion`, which rewrote it to
+  `emitrust.sub(0.0, x)` **because the dialect had no unary negation op**.
+  Fixed by adding one (`emitrust.neg`, constrained to F32/F64), not by
+  patching the expression emitter.
+  **THE SPEC WAS WRONG IN BOTH DIRECTIONS, and that is this entry's real
+  content:**
+   - It asserted "it also breaks infinities -- confirm". **It does not.**
+     `0.0 - inf == -inf == -(inf)` at both widths and through `%f %g %e`.
+     The claim was measured FALSE rather than inherited.
+   - It listed NaN sign as "if observable". It **was** observable and **was**
+     broken, in the OPPOSITE direction: subtraction PROPAGATES the operand's
+     NaN sign bit while `-x` FLIPS it. x86's `inf - inf` is the negative
+     default QNaN, so C printed `nan` and the crate printed `-nan`.
+  Verified independently after landing: `-0.000000 -0 -0.000000e+00`, `-inf`,
+  `nan` and integer `-1` all byte-identical to the clang native.
+  **AN ADDITIVITY TRAP THE SPEC DID NOT ANTICIPATE**, caught by the
+  increment: `isLiftableConditionOp` (`SCFToEmitRust.cpp`) already
+  allow-listed `emitrust.sub`, so introducing a NEW op without registering it
+  there would have made a float negation in a `while` condition **silently
+  stop lifting** to `emitrust.while` -- a capability regression invisible to
+  the byte-diff. Same class as FR-190's constraint 2: an op's absence from an
+  analysis set silently changes behaviour elsewhere.
+  Integer unary minus is untouched and pinned (still `arith.subi`, still
+  renders `1i32 - argc`); FR-63's `zeroShiftLhs` fold is guarded on
+  `Shl`/`Shr` and can never see a `neg`.
+  Gate 995/995; clippy 101 -> 101 (+0); TRACTOR 40/252; both ratchets
+  unmoved. One CHECK-line golden flipped forward deliberately
+  (`arith-to-emitrust.mlir @float_neg`); no `--emit=crate` byte-identity
+  golden moved.
+  NOT VERIFIED: non-x86 NaN-sign behaviour. The `nan` line assumes
+  `inf - inf` yields the sign-set default QNaN -- true on x86-64 SSE and
+  self-consistent because both compilers hit the same hardware, but it is
+  architecture-sensitive.
+
+- [x] FR-201 (opened and LANDED 2026-09-05; FR-193 items 10-12): **THE
+  `mem*`/`str*` TWO-CURSOR UNBUILDABLE WAS NOT AN ALIASING PROBLEM AT ALL --
+  IT WAS BORROW GRANULARITY IN THE PHASE-4 OWNER LIFT.**
+  Three reports, one root cause, and **the DISJOINT cases were the tell**:
+  two cursors into strictly non-overlapping sub-ranges failed too, so genuine
+  aliasing was never the issue.
+  `planOwners` promotes a class ALL-OR-NOTHING over a single storage base
+  (`ImportCPlanning.cpp:309`), so inside a promoted method EVERY data-pointer
+  parameter is an i64 index into the ONE receiver region and
+  `ImportCFunctions.cpp:1457` binds them all to the same `receiverDataPlace`.
+  The hosted byte-family lowering keyed its same-region check on the
+  **declaration** (`ImportCHosted.cpp:1209-1212`), so two distinct parameter
+  decls looked like two distinct regions and produced
+  `&mut self.data[dst..]` beside `&self.data[src..]` -- rustc E0502 after
+  `emitrust-cc` exited 0.
+  **The existing `__emitrust_memcpy_within` machinery already covered it.**
+  FR-72's objection that makes a same-PARAMETER copy reject ("a parameter's
+  extent is not provable") does not apply: the extent is the owner's own
+  array and the cursors are absolute offsets into it, which is exactly the
+  condition the same-root array branch already rides `copy_within` on.
+  `__emitrust_split_mut_u8` was not needed.
+  `memmove` and `memcpy` -- overlapping and disjoint, i8 and u8, constant and
+  RUNTIME cursors -- now work and byte-diff clean.
+  **`strcpy`/`strncpy`/`strcat` are a LOCATED REJECTION, correctly**: their
+  helpers are two-slice and discover the length from the source's NUL WHILE
+  writing the destination, and no same-region image of that exists in the
+  tree. Inventing `__emitrust_strcpy_within` is a separate increment, not
+  something to improvise mid-fix.
+  ADDITIVITY PROVEN BY DIFFERENTIAL: `--emit=rust` diffed pre- vs post-fix
+  over 310 EndToEnd + 421 Import/RealWorld + 220 c-testsuite inputs -> exactly
+  2 changed, both new files. No existing golden shifted, no previously
+  importing program now rejects, and TRACTOR's 252 rejection details are
+  identical.
+  SPHINCS+ does NOT move, and the reason is worth recording: its aliasing is
+  at the CALL SITE (`thash(buffer + SPX_N, buffer, ...)`), which is FR-180's
+  cross-TU per-call-site clone, not this owner-method shape.
+  RECORDED, not hidden: overlapping `memcpy` through owner params is now
+  ACCEPTED and rendered with memmove semantics. That is C UB, so there is no
+  defined native answer to be right about; it matches the pre-existing
+  same-root-array refinement, so it is not a new policy -- but it IS a new
+  set of programs reaching that refinement.
+  Gate 995/995; clippy 101 -> 101 (+0); TRACTOR 40/252 paired with zero
+  per-case changes; both ratchets unmoved.
+  NOT VERIFIED: the Kernel ratchet (the Linux tree is not vendored and that
+  ratchet is not in the lit suite).
+
 - [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
   FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED
   AGGREGATE `let` ENDED ITS PREFIX.**

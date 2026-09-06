@@ -66,6 +66,19 @@ emitrust.func @binops(%arg0: i32, %arg1: i32) {
   emitrust.return
 }
 
+// Unary minus on a float is its OWN op, not a subtraction from zero:
+// Rust's prefix `-` on f32/f64 is IEEE-754 negation, and `0.0 - x`
+// disagrees with it on signed zero and on NaN sign. Round-tripped at both
+// widths the emitter models.
+// CHECK-LABEL: emitrust.func @float_neg
+emitrust.func @float_neg(%arg0: f64, %arg1: f32) {
+  // CHECK: emitrust.neg %{{.*}} : f64
+  %0 = emitrust.neg %arg0 : f64
+  // CHECK: emitrust.neg %{{.*}} : f32
+  %1 = emitrust.neg %arg1 : f32
+  emitrust.return
+}
+
 // CHECK-LABEL: emitrust.func @bitops
 emitrust.func @bitops(%arg0: i32, %arg1: i32) {
   // CHECK: emitrust.and %{{.*}}, %{{.*}} : i32

@@ -134,16 +134,18 @@ func.func @float_binops(%a: f64, %b: f64) -> (f64, f64, f64, f64) {
   return %0, %1, %2, %3 : f64, f64, f64, f64
 }
 
-// C unary minus on a float operand imports as arith.negf; EmitRust has no
-// unary negation op, so it lowers as `0.0 - x` — an emitrust.sub against a
-// zero constant of the operand type — mirroring the integer negation
-// spelling `0 - x` the importer uses for signless integers.
+// C unary minus on a float operand imports as arith.negf and lowers to
+// emitrust.neg — Rust's prefix `-`, which on f32/f64 is std::ops::Neg,
+// i.e. IEEE-754 negation. This pin MOVED: the lowering used to be
+// `0.0 - x` (an emitrust.sub against a zero constant), mirroring the
+// integer `0 - x` spelling, and that was a miscompile — `0.0 - 0.0` is
+// +0.0 where `-(0.0)` is -0.0, and `0.0 - NaN` keeps the operand's sign
+// bit where `-NaN` flips it. No zero constant may be materialised here.
 // CHECK-LABEL: func.func @float_neg
-// CHECK:         %[[Z64:.*]] = emitrust.constant <0.000000e+00 : f64> : f64
-// CHECK:         emitrust.sub %[[Z64]], %arg0 : f64
-// CHECK:         %[[Z32:.*]] = emitrust.constant <0.000000e+00 : f32> : f32
-// CHECK:         emitrust.sub %[[Z32]], %arg1 : f32
+// CHECK:         emitrust.neg %arg0 : f64
+// CHECK:         emitrust.neg %arg1 : f32
 // CHECK-NOT:     arith.negf
+// CHECK-NOT:     emitrust.constant <0.000000e+00
 func.func @float_neg(%a: f64, %b: f32) -> (f64, f32) {
   %0 = arith.negf %a : f64
   %1 = arith.negf %b : f32
