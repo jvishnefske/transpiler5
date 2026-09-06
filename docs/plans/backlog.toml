@@ -1144,3 +1144,13 @@ summary = "LANDED 2026-09-05, FR-193 items 10-12. Three reports, one root cause,
 blocked_by = []
 anchor = "FR-201 (opened and LANDED 2026-09-05; FR-193 items 10-12): **THE"
 
+[[items]]
+id = "FR-199"
+kind = "defect"
+status = "landed"
+size = "L"
+title = "Statements on a loop-exit path ran after the loop-body local's destructor; refused, not fixed, and the refusal is the right call"
+summary = "LANDED 2026-09-05, FR-193 items 16-17. THE NAMED LEAD WAS WRONG: HoistEscapingLoopPlacesPass already refuses droppy places. The cause is one level up in MLIR lift-cf-to-scf -- a block lexically inside the loop body from which EVERY path leaves is not on the cycle, so the structurizer places it AFTER the loop, while the loop-body local drops at the end of the loop-body region. Unobservable in C; a destructor makes it a silent reorder. REJECTION RATHER THAN FIX is the load-bearing judgement: correctness needs a break/return-flag CFG lowering routing exits through the loop header, which rewrites emitted Rust for EVERY droppy loop and sits in the cross-iteration loop-liveness area CLAUDE.md records as having miscompiled three times with an explicit do-not-retry. THE FENCE IS A SCALPEL: the analysis answers 'does control always leave this loop' in TWO conservative directions because the consumers need OPPOSITE errors -- over-approximation drives the rejection, under-approximation drives the skip; using one for both let `case 1: printf(); return i;` keep miscompiling in the first build, measured then fixed then pinned. 36 probes byte-diffed; 13 shapes stay accepted and byte-identical (continue, break with nothing observable, effect before the decision, switch-case break, inner-loop break, always-leaves body, decls in relocated regions). TWO ADJACENT MISCOMPILES closed beyond the brief: the do-while CONDITION (the for-increment's twin, only the increment was gated) and a for-increment global STORE (the gate screened only for calls). One existing golden moved forward not looser -- loop-escaping-place-opaque-reject.cpp now hits the import-time fence a stage earlier and names the source declaration plus a note instead of the IR place; CHECK-NOT retained and FR-152's wording still pinned by its struct_def sibling. CAPABILITY COST stated: programs that previously imported and were silently wrong now refuse. Gate 997/997, clippy 101 (+0), TRACTOR 40/252, both ratchets unmoved. NOT VERIFIED: the multi-exit skip is measured not proved (one adversarial data point); observableEffect treats reads as free so a relocated volatile read would slip through."
+blocked_by = []
+anchor = "FR-199 (opened and LANDED 2026-09-05; FR-193 items 16-17): **STATEMENTS"
+
