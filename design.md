@@ -12910,6 +12910,84 @@ piece and becomes FR-45.
   today, so this is a robustness/DoS defect rather than a scored one), and
   the exact N at which the current pipeline crosses a practical timeout.
 
+- [x] FR-198 (opened and LANDED 2026-09-05; implements FR-197's
+  recommendation): **THE LADDER NOW LOWERS LINEARLY, AND THE UNADMITTED
+  RESIDUE IS BOUNDED RATHER THAN LEFT TO HANG. THE HANG CLASS IS NARROWED,
+  NOT CLOSED -- TWO PATHS REMAIN AND ARE RECORDED BELOW.**
+  Three-way at `emitSwitchStmt`, decided entirely at the AST: admitted ladder
+  -> guarded sequence; not admitted and chain > 32 -> located rejection; else
+  the existing `cf.switch` path, untouched.
+  THE TRANSFORM: one `cf.switch` whose every destination is the SAME first
+  guard block, carrying a section INDEX as a block argument, then `entry <= k`
+  guarded diamonds. Because the index is a section POSITION rather than a case
+  value, sparse, negative and out-of-order labels and `default:` anywhere all
+  work; no `default:` gives D = M so nothing runs.
+  **LINEARITY PROVEN, NOT ASSERTED.** Emitted lines are exactly `8N + 10`
+  (measured 138 / 266 / 522 / 1034 / 2058 at N=16/32/64/128/256), fitted
+  O(N^0.975), against the previous O(N^2.57) output and O(N^3.01) time.
+  `hang_min.c` at N=100 went from **>360s with no output at all** to **0.10s,
+  813 lines, stdout 5049 byte-matching the clang native.**
+  **ZERO GOLDENS CHANGED, and the mechanical reason is the interesting part:**
+  a sweep of 761 importable corpus files (all 268 EndToEnd, every Import/C and
+  Import/Cpp golden, all 220 c-testsuite single-exec, all Cpp17Suite inputs)
+  with a detector for the new lowering found the ladder shape in exactly THREE
+  files -- the three added here. That is why clippy is +0 and both ratchets
+  are flat: the shape simply does not occur in the corpus. **So this is a
+  robustness fix with no measured corpus effect, and saying otherwise would
+  overstate it.**
+  HAZARDS, all three closed and tested:
+   1. **Declaration scope -- REFUSED, not hoisted.** Any `DeclStmt` at
+      switch-body scope kills the shape, which is stricter than "declared in
+      one case and used by a later one" and deliberately so. This was the
+      hazard most likely to miscompile silently, since each guarded `if` is
+      its own Rust scope.
+   2. Single evaluation: the guarded form consumes the ALREADY-evaluated
+      flag, pinned by a test whose controlling expression bumps a global.
+   3. A `break` targeting this switch refuses -- but a `break` captured by an
+      INNER loop or switch correctly does NOT, which is the distinction that
+      would have silently narrowed the feature.
+  `continue` and `return` are explicitly NOT hazards: both abandon the rest
+  of the chain in C and in the guarded form alike. One `break` is admitted --
+  the final top-level statement of the final section, which is what
+  `default: break;` is and what every repro needs.
+  A SHAPE CLAUSE THE SPEC DID NOT STATE, added and justified: **every section
+  must fall through.** Without it, `M >= 2` alone would have admitted a
+  130-arm return table (`p20_wide_switch.c`) and rewritten it into 130
+  sequential guards where a `match` is already both linear AND idiomatic.
+  Zero fallthrough edges means there is no ladder to collapse. A quality
+  filter, not a correctness one; the bound covers anything long it excludes.
+  BOUND: 32 sections, chosen from FR-197's curve (0.86s at 32, 7.93s at 48,
+  >360s at 100) as the largest point whose unadmitted compile still finishes
+  in about a second. The boundary was verified exactly -- 32 sections import,
+  33 reject, no off-by-one over-rejection -- and the diagnostic carries a
+  `note:` pointing at the statement that blocked the linear lowering.
+  ORACLES: gate 990/990; a **120-program differential fuzz** over mixed
+  fallthrough / break / return / continue / decl / nested-loop / nested-switch
+  shapes at three argc seeds each, **120/120 byte-matching** with 101
+  switches taking the ladder path and 428 the fallback; every `ft*` size plus
+  N=8..256 byte-matching native; controls `brk48`, `pair48`,
+  `p20_wide_switch` byte-identical to baseline; both ratchets unmoved;
+  clippy 101 -> 101 (+0); TRACTOR 40/252 with an identical outcome
+  distribution.
+  **TWO RESIDUALS -- THE HANG CLASS IS NARROWED, NOT ELIMINATED. Both
+  confirmed by re-measurement:**
+   1. **The bound is enforced only on the PLAIN-body path.** A
+      Duff's-device-shaped body, whose labels nest inside inner statements,
+      routes to `emitDispatchSwitch`, where the chain is not measured -- so a
+      pathological nested-label fall-through chain can still reach the
+      quadratic lowering with NO bound and NO diagnostic.
+   2. **The `goto` ladder is untouched**: `goto_chain_blowup.c` still takes
+      **29.7s and emits 83,383 lines** (re-measured after this change). Its
+      switch has a chain of 1, so neither the transform nor the bound applies.
+      FR-197's analysis covers it -- the same duplication, reached through
+      labels instead of fallthrough -- and closing it needs either the same
+      recognition generalised to label chains or option (F)'s labelled-block
+      lowering.
+  ALSO NOT VERIFIED: the ladder under `--incremental`/`--recover`; C++
+  destructor ordering for an object declared inside a NESTED compound in a
+  ladder arm (the top-level `DeclStmt` refusal only covers switch-body
+  scope, and the fuzz corpus is C-only).
+
 - [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
   FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED
   AGGREGATE `let` ENDED ITS PREFIX.**
