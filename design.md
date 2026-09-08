@@ -11917,6 +11917,74 @@ piece and becomes FR-45.
   27235 vs cdylib 0) is the ready-made repro and MUST be root-caused first;
   it has never been, and its fat-pointer explanation is reasoning about the
   shape with no trace, disassembly or reduced repro on record.
+  **RE-MEASURED 2026-09-08 at HEAD 85c58f4, after FR-182 and FR-202 landed.
+  THE NUMBER (+0) SURVIVES. THE STATED REASON HAS EXPIRED AND WAS
+  MISATTRIBUTED.** NO-GO reconfirmed.
+  FR-178 wrote that the bundle is worth zero "**while FR-139's refusal
+  stands**". That conditional is now DEAD -- FR-182 and FR-202 partially
+  lifted FR-139 -- and the bundle is STILL worth zero, for a different
+  reason than the one recorded.
+  **`spx_ctx` NEVER BECOMES A STRUCT AT ALL.** The 80 `lib` cases' context is
+  100% `uint8_t` arrays, which makes it a BYTE-REGION record:
+  `ImportCTypes.cpp:200-210` states a u8-only aggregate imports as a plain
+  `!emitrust.array<Nxui8>` and **no `struct_def` is ever emitted**; the
+  parameter branch at `:1252-1259` turns `struct X *` into `&mut [u8]`
+  regardless of anything else (predicate `isByteRegionAggregate`,
+  `ImportC.cpp:4607`). Confirmed by IR probe: zero `struct_def` in the
+  module. So FR-182's faithfulness WHITELIST IS NEVER REACHED, and FR-181's
+  whole `repr(C)`/`offset_of!` apparatus is irrelevant here -- there is no
+  struct to attach it to. Proven by differential: appending one `uint32_t`
+  removes the record from the byte-region class, and it then imports WITH
+  `emitrust.abi_faithful` and emits a full CLASS 1 export. **No member of
+  `spx_ctx` disqualifies it; the more uniformly byte-shaped a record is, the
+  LESS likely it is to reach the export tier.** That inversion is the
+  finding.
+  FR-178's causal sentence -- "emitted as `&mut [u8]`: a Rust slice, i.e. a
+  fat pointer, which is why FR-139 refused it" -- is verbatim still true as
+  an OBSERVATION and wrong as an EXPLANATION. The fat pointer is not a
+  signature-classification decision in the emitter; it is a MODEL decision in
+  the importer that happens before any struct exists.
+  **THIS IS A SIXTH VARIANT OF THE LEDGER'S RECURRING ERROR, one level below
+  the previous five.** FR-177 ranked by stage; FR-178 corrected that by
+  crossing stage with `kind`; and then reasoned about the EMITTED SIGNATURE'S
+  SHAPE without checking which importer MODEL produced it. The rule that
+  generalizes: cross the blocker measurement with `kind`, the exported
+  signature, **and the importer model behind that signature**.
+  ATTRIBUTION FR-177/FR-178 LEFT OPEN, now resolved: blocker-set 3 = the 32
+  sha2 lib cases, blocker-set 5 = the 48 blake lib cases. Of the 20
+  `initialize_hash_function` cases, 8 sit behind the 3-fix wall and 12 behind
+  the 5-fix wall, so **the cheapest first step is +8, not +20.** The +20
+  ceiling stands but costs ONE BLOCKER MORE than recorded -- see FR-208.
+  MEASURED OPPORTUNITY OUTSIDE SPHINCS+: **zero.** All 8 SYMBOL_MISSING
+  signatures were enumerated; not one is a single `&mut [u8]` over a
+  byte-region aggregate (one pointer-member struct, one unprovable bound, six
+  multi-reference). So no byte-region export widening reaches anything.
+  A type-driven "CLASS 3" byte-region export was spiked to completion anyway,
+  because a byte-region record's bound is `sizeof` -- a compile-time constant
+  C's own type system already owes, STRONGER than FR-202's must-access proof
+  and needing no proof at all. It works: byte-identical vs the clang native,
+  the oracle bites (bound patched 72->71 gives SIGABRT via panic-in-nounwind
+  with `cargo build` clean), no new ops (two discardable attributes
+  round-trip through `emitrust-opt`/`emitrust-translate` untouched), and a
+  real THREE-STAGE PASS on the corpus's own runner for case 101. **It is
+  still NO-GO this wave at +0 measured**, because every candidate is
+  EMIT_FAIL at stage one. Note FR-202's must-access route CANNOT reach this
+  shape -- the body is a reslice fed to a call, which class 2's op whitelist
+  refuses by construction -- so a class 3 would have to be type-driven.
+  LEVER A ("just make it a struct") is a NO-GO for a second, independent
+  reason: even with the byte-region model defeated, the entry point still
+  emits `&mut [SpxCtx]` because it DELEGATES to a helper. See FR-209.
+  CLOSED A FR-202 CAVEAT IN PASSING: "byte-region aggregate parameters reach
+  class 2 by construction but have no test" -- measured, they do;
+  `int ctx_probe(const small_ctx *)` emits `from_raw_parts(c, 18)` today.
+  NOT RESOLVED: the cost of the three sha2 emit blockers (never costed by
+  anyone; +8 is a projection, not a measurement); whether all 20 cases'
+  vectors pass at scale (one vector on one case was proven); and
+  **UNINITIALIZED-MEMORY SOUNDNESS** -- `from_raw_parts_mut(p, N)` over a C
+  object that is legally uninitialized on entry is Rust UB under strict
+  rules, and **FR-182's CLASS 1 already carries this exposure via `&mut *p`,
+  unrecorded there too.**
+
 
 - [ ] FR-180 (opened 2026-08-30; SPIKED the same day, GO-with-constraints):
   **THE ALIASING RENDERING FR-177 CALLED ITS RISKIEST FIX IS ALREADY IN THE
@@ -13448,6 +13516,74 @@ piece and becomes FR-45.
   `long double` with a located diagnostic, keeping the f64 mapping for
   storage, conversion, passing and printing. A real 80-bit type is not
   available -- Rust has no `f80`.
+
+- [ ] FR-208 DEFECT (opened 2026-09-08 by the FR-178 re-measurement spike):
+  **`--c-abi-exports` EXPORTS A SYMBOL THE C PROGRAM NEVER HAD, whenever the
+  C name is not already lowercase.**
+  The flag's whole contract is "there is a bare symbol to dlsym".
+  `#[export_name]` / `#[no_mangle]` are emitted from the **MLIR symbol**,
+  which is the FR-53 IDIOMATIC RENAME -- not the C spelling.
+  `lib/Target/Rust/TranslateToRust.cpp:5613` writes
+  `os << "#[export_name = \"" << wrapper.symbol << "\"]\n"` under a comment
+  calling `wrapper.symbol` "the BARE C symbol". It is not.
+  MEASURED: `int SPX_pair_sum(Pair *p)` emits
+  `#[export_name = "spx_pair_sum"]` where the C caller wants
+  `SPX_pair_sum`; CLASS 0 has it too -- `int SPX_add(int,int)` emits
+  `#[no_mangle] pub extern "C" fn spx_add`.
+  PROVEN END TO END TWICE: a link probe shows `nm -D` carrying
+  `T spx_initialize_hash_function` while the C host fails with
+  `undefined reference to 'SPX_initialize_hash_function'`; and a corpus-runner
+  NEGATIVE CONTROL -- the same case-101 crate with the export name changed to
+  what the emitter actually produces -- reports `Test Vectors Failed: 1`
+  (`cando state mismatch`), i.e. exactly the SYMBOL_MISSING bucket.
+  **THE FAILURE IS LOUD** (`dlsym` returns NULL), so this is not a
+  miscompile. It is a correctness gap in the flag's stated contract.
+  CORPUS COST TODAY: **+0.** The only five uppercase symbols the corpus
+  dlsyms are the four SPHINCS+ ones and `smallestValue`
+  (`020_stack_linked_list_lib`), and all five are EMIT_FAIL. So it is a
+  LATENT blocker -- which is precisely why it must be fixed before anyone
+  counts a SPHINCS+ win, since it would have silently eaten one.
+  `--preserve-c-names` avoids it (verified) but is a whole-crate mode switch
+  that disables idiomatic naming everywhere, so it is a workaround and not
+  the fix. The fix is to carry the ORIGINAL C spelling on the func op and use
+  that in `#[export_name]`; `--preserve-c-names` output proves the target
+  text. Note the adjacent name-FOLDING collision case is already handled
+  correctly and loudly (`error: unsupported: function 'foo' emits as 'foo',
+  which collides with 'FOO'`), so the machinery to reason about the two
+  spellings partly exists.
+
+- [ ] FR-209 (opened 2026-09-08 by the FR-178 re-measurement spike; a NAMED
+  CONSTRAINT that was previously invisible): **FR-100'S FORWARDING FIXPOINT
+  RECORDS AN EDGE ONLY FOR ARITHMETIC POINTEES, SO ANY ENTRY POINT THAT
+  DELEGATES ITS STRUCT POINTER TO A HELPER BECOMES `&mut [T]` AND IS REFUSED
+  BY EVERY C-ABI EXPORT CLASS.**
+  `include/EmitRust/CImporterInternal.h:9331-9335`, inside
+  `collectSliceParamsImpl`:
+  ```
+  if (!fwd->getType().getCanonicalType()->getPointeeType()
+           ->isArithmeticType())
+    continue;                  // <- no forwarding EDGE for a struct pointee
+  edges->emplace_back(fwd, calleeDef->getParamDecl(index));
+  ```
+  A struct pointee falls through to the conservative
+  `sliceParams.insert(param)` at `:9352`.
+  MINIMAL DIFFERENTIAL, three functions in one file:
+    `inner(c)`  -- member access only          -> `&mut Ctx`,   EXPORTED
+    `outer(c)`  -- forwards the whole pointer  -> `&mut [Ctx]`, REFUSED
+    `solo(c)`   -- control                     -> `&mut Ctx`,   EXPORTED
+  This is a GENERAL refusal of the "exported facade delegates to internals"
+  idiom, not a SPHINCS+ quirk, and it is the source of the
+  `unsupported: the address of a scalar object cannot be passed as a slice
+  parameter` blocker at the call site (reproduced in 8 lines).
+  **THE USER-FACING PART IS THE WORST PART:** the shape is currently reported
+  as "its signature is not all-scalar", which is factually true and
+  completely uninformative -- it names neither the delegation nor the
+  pointee-kind rule that actually decided it. At minimum this needs a LOCATED
+  diagnostic that says so.
+  WIDENING the edge to record pointees is NOT costed: it moves emitted
+  signatures repo-wide and would move goldens. Recorded here as a named
+  constraint so the next person measuring a C-ABI export lever does not
+  rediscover it from scratch.
 
 - [x] FR-207 (opened and LANDED 2026-09-08; closes FR-197's SECOND residual,
   the unbounded `emitDispatchSwitch` path): **THE WORST DISPATCH SHAPE IS NOT
