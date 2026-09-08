@@ -13577,6 +13577,38 @@ piece and becomes FR-45.
   storage, conversion, passing and printing. A real 80-bit type is not
   available -- Rust has no `f80`.
 
+- [ ] FR-212 (opened 2026-09-08 by the FR-178 re-measurement spike, which
+  surfaced it and could not pursue it): **`--c-abi-exports` CLASS 1 HANDS A
+  `&mut T` TO MEMORY A C CALLER IS ENTITLED TO LEAVE UNINITIALIZED -- IN
+  ALREADY-SHIPPED CODE.**
+  FR-182's CLASS 1 generates `unsafe { f_rs(&mut *p) }`. A C caller may
+  legally pass a pointer to an object it has NOT yet initialized, and that is
+  the single most common shape for an "initialize this struct for me" entry
+  point -- **which is precisely the shape the export tier exists to reach**
+  (`spx_ctx c; SPX_initialize_hash_function(&c);`). Creating a `&mut T` to
+  uninitialized memory is UB in Rust's model even when no read occurs.
+  FR-202's CLASS 2 builds a SHARED `&[u8]` via `from_raw_parts`, which is at
+  least as exposed and arguably worse, since a shared reference additionally
+  asserts no concurrent mutation. CLASS 0 takes scalars by value and is
+  presumably clean. None of this is recorded in FR-182 or FR-202.
+  **THIS IS NOT A KNOWN MISCOMPILE.** The TRACTOR case that exercised it
+  passed, because the harness's `state_member!` initializes before the call.
+  So the honest open question -- and the reason this is a spike rather than a
+  fix -- is the gap between three different things that this ledger has
+  conflated before: what the Rust reference and `MaybeUninit` docs GUARANTEE,
+  what Miri FLAGS, and what rustc/LLVM actually EXPLOIT at `-O3`. A latent
+  model violation nobody exploits is a different severity from a silent wrong
+  answer, and the entry that closes this must label which one it is.
+  THE OPTIONS ARE ALL COSTLY, which is why it needs measuring first:
+  recording it as a bounded divergence has precedent in this tree (FR-206 did
+  exactly that for `long double`, on the owner's decision); threading
+  `MaybeUninit` through the wrapper would break the **"the translated body is
+  TEXTUALLY UNCHANGED"** property FR-182 deliberately bought and pinned; and
+  refusing out-parameter shapes outright would refuse the very
+  `initialize_hash_function` shape the tier was built for.
+  Gated behind `--c-abi-exports`, which is default OFF, so nothing reaches a
+  default build.
+
 - [x] FR-210 (opened and LANDED 2026-09-08; FR-193 item 2 -- **THE LAST
   UNCLOSED ITEM OF THE 997-PROBE HUNT**): **`%s` WITH A FIELD WIDTH WAS
   LATIN-1 RE-ENCODED -- BUT THE PADDING WAS NEVER WRONG, WHICH IS WHY THE FIX
