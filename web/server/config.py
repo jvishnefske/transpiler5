@@ -87,4 +87,10 @@ CORS_ORIGINS = [
 # Trust X-Forwarded-* from the reverse proxy. On .202 the only ingress is
 # Traefik at 192.168.1.185, so this is safe; do not enable it on a box
 # reachable directly from the internet.
+#
+# INFORMATIONAL ONLY -- nothing reads this. The switch that actually matters
+# is uvicorn's `--proxy-headers --forwarded-allow-ips` in
+# web/deploy/emitrust-web.service; setting EMITRUST_TRUST_PROXY=0 does not
+# turn anything off. Kept (documented, not deleted) so the discrepancy is
+# visible rather than a knob that quietly lies.
 TRUST_PROXY_HEADERS = os.environ.get("EMITRUST_TRUST_PROXY", "1") == "1"

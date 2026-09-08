@@ -211,10 +211,24 @@ async def compile_endpoint(
         ) from None
 
     payload = result.to_json()
-    # A timeout is not a durable answer -- caching it would poison the free
-    # lane with a failure that a retry might not reproduce.
-    if result.exit_code != 124:
-        _cache.put(key, payload)
+    if result.exit_code == 124:
+        # A timeout is not a durable answer. It is not cached -- that would
+        # poison the free lane with a failure a retry might not reproduce --
+        # and because nothing was produced and nothing was stored, the trial
+        # unit goes back. Charging for a timeout would bill the user for our
+        # inability to answer. A non-zero exit that is NOT a timeout is a real
+        # answer (rejection is a feature here), so it is cached and charged.
+        _trial.refund(identity.subject)
+        allowance = _trial.check(identity.subject, identity.email)
+    else:
+        try:
+            _cache.put(key, payload)
+        except OSError:
+            # The deposit into the free lane failed (full or unwritable state
+            # directory). The user paid for this answer and it exists, so hand
+            # it over; only the "free for the next visitor" part is lost, and
+            # losing that must not also lose them the result and the unit.
+            log.exception("could not cache result %s", key)
 
     return JSONResponse(
         {

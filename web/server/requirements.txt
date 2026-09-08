@@ -2,4 +2,7 @@
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
 pydantic>=2.7,<3.0
-google-auth>=2.30,<3.0
+# The [requests] extra is NOT optional for us: verify_oauth2_token goes
+# through google.auth.transport.requests, which raises ImportError
+# without it -- and the service then answers 503 on every live compile.
+google-auth[requests]>=2.30,<3.0
