@@ -12687,7 +12687,8 @@ piece and becomes FR-45.
   the buffer is a loop-filled local array. Reproduces identically on the
   BASELINE tool, so it predates this work.
 
-- [ ] FR-193 (opened 2026-09-04 by a 10-agent adversarial differential hunt,
+- [x] FR-193 (opened 2026-09-04 by a 10-agent adversarial differential hunt;
+  FULLY DISCHARGED 2026-09-08,
   33 agents / 997 probes / 0 errors): **THE CORRECTNESS SIGNAL WAS NOT CLEAN.
   IT WAS CLEAN ON THE CORPORA WE GATE ON, WHICH IS THE BLIND SPOT.**
   FR-187 recorded that the harness's correctness signal had no open items --
@@ -12759,6 +12760,34 @@ piece and becomes FR-45.
   Repros on disk under `scratchpad/hunt/<area>/`. NOT yet triaged into
   separate FRs; item 1 is taken first because it is ONE change behind seven
   entry points and the primitive already exists.
+  **FULLY DISCHARGED 2026-09-08. Every item is closed**, across FR-194
+  (item 1, the `%c` Latin-1 funnel), FR-195 (item 3, recovery rebinding a
+  collision loser), FR-196 (item 7, the `std::vector` element-field store),
+  FR-199 (items 16-17, loop-exit drop order), FR-200 (item 8, float
+  negation), FR-201 (items 10-12, the mem*/str* two-cursor unbuildable),
+  FR-203 (the two borrow-conflict unbuildables), FR-204 (item 4, `p[-1]`),
+  FR-205 (`_Bool as f64` and the keyword global), FR-206 (item 9, `long
+  double`, recorded as a bounded divergence on the owner's decision),
+  FR-198/FR-207 (item 5, the CF-to-SCF hang), and FR-210 (item 2, `%s` with
+  a field width -- the last one).
+  **THE METHOD'S SCORECARD, now that it can be settled.** 23 findings became
+  ~14 distinct defects and closed as **12 FRs**, so this entry's own "counting
+  reports as defects would overstate by 60%" warning was accurate. The gate
+  went 961 -> 1021 with clippy flat at 101 throughout, and TRACTOR moved
+  40 -> 41 on unrelated work -- i.e. **none of the 12 fixes cost a single
+  corpus case**, which is the strongest available evidence that the hunt
+  found real defects rather than shapes the tree merely disliked.
+  **AND THE HONEST CAVEAT RESOLVED ITSELF THE OTHER WAY.** This entry
+  recorded "0 of 23 were refuted" and flagged that, from a default-to-refuted
+  verifier, this is normally a rubber-stamp signature. It was not: every one
+  of the 12 increments reproduced its defect against the clang native before
+  changing anything. What DID get refuted, repeatedly, was **this entry's own
+  account of the CAUSES** -- FR-204 (not an `as usize` bug at all), FR-205
+  (the keyword fence was never broken), FR-203 (the named blocker did not
+  exist), FR-210 (the padding was never wrong), FR-211 (irreducibility is not
+  the driver). The findings were sound; the diagnoses were not. That is the
+  lesson worth carrying: **a hunt should record what it MEASURED and hold its
+  explanations loosely.**
 
 - [x] FR-194 (opened and LANDED 2026-09-04; FR-193 item 1): **THE `%c`
   LATIN-1 FUNNEL IS CLOSED ON THE STDOUT AND BUFFER PATHS, AND REFUSED WHERE
@@ -12951,7 +12980,8 @@ piece and becomes FR-45.
   members to project); and `m[k].f` on a `std::map` (the recognised value set
   contains no struct types, so the shape is unreachable today).
 
-- [ ] FR-197 (opened 2026-09-05; FR-193 item 5, RE-MEASURED and the original
+- [x] FR-197 (opened 2026-09-05; FULLY DISCHARGED 2026-09-08;
+  FR-193 item 5, RE-MEASURED and the original
   diagnosis CORRECTED): **THE CF-TO-SCF BLOWUP IS QUADRATIC NODE SPLITTING,
   NOT EXPONENTIAL SEARCH, AND IT IS `lift-cf-to-scf` SPECIFICALLY.**
   FR-193 filed this as "exponential blowup in the CF-to-SCF structurizer".
@@ -13048,6 +13078,36 @@ piece and becomes FR-45.
   program (the TRACTOR, RealWorld and c-testsuite corpora all compile fine
   today, so this is a robustness/DoS defect rather than a scored one), and
   the exact N at which the current pipeline crosses a practical timeout.
+  **FULLY DISCHARGED 2026-09-08. All three paths are bounded**: FR-198 (the
+  plain switch fall-through ladder, lowered linearly), FR-207 (the
+  dispatch-routed path), FR-211 (the `goto` ladder).
+  **THE THREE INCREMENTS BETWEEN THEM CORRECTED EVERY STRUCTURAL CLAIM THIS
+  ENTRY MADE**, which is worth stating plainly rather than leaving the prose
+  standing:
+   - "Quadratic node splitting" is quadratic on the SWITCH paths only.
+     FR-211 measured the `goto` path as **CUBIC** -- a constant THIRD
+     difference of 2, against FR-207's constant second difference of 192.
+   - FR-207 refuted FR-198's framing of its residual: Duff's device is the
+     MILDER dispatch shape, not the worst; a plain ladder wrapped in one `if`
+     reproduces this entry's plain-path curve almost constant for constant.
+   - FR-211 refuted the irreducibility hypothesis outright: an irreducible
+     two-entry loop lowers to 52 lines FLAT in N, and adding a back edge
+     makes the ladder CHEAPER. Irreducibility is not the driver at all; the
+     acyclic fall-through ladder is, on all three paths.
+   - The mechanism claim ("every switch arm carries a full copy of the tail")
+     is only PARTLY confirmed -- FR-207 measured that section BODIES are not
+     duplicated, so the cost is the control-flow skeleton plus rematerialized
+     constants. That is also precisely why bounding a section COUNT works.
+   - "NOT MEASURED: the exact N at which the pipeline crosses a practical
+     timeout" is now measured on both remaining paths: dispatch N=100 and
+     `goto` N=100 each fail to finish in 400s, emitting NOTHING.
+  What survived intact was the DIRECTION -- bound it, diagnose it, never hang
+  -- and the insight that the cost is duplication rather than search.
+  Census headroom at the shipped bounds: 4x on the dispatch path, 6.4x on the
+  `goto` path. Both still lower super-linearly BELOW their bounds; making
+  either linear needs option (A) generalised to labels or option (F)'s
+  labelled-block op, and neither is done.
+
 
 - [x] FR-198 (opened and LANDED 2026-09-05; implements FR-197's
   recommendation): **THE LADDER NOW LOWERS LINEARLY, AND THE UNADMITTED
@@ -13516,6 +13576,128 @@ piece and becomes FR-45.
   `long double` with a located diagnostic, keeping the f64 mapping for
   storage, conversion, passing and printing. A real 80-bit type is not
   available -- Rust has no `f80`.
+
+- [x] FR-210 (opened and LANDED 2026-09-08; FR-193 item 2 -- **THE LAST
+  UNCLOSED ITEM OF THE 997-PROBE HUNT**): **`%s` WITH A FIELD WIDTH WAS
+  LATIN-1 RE-ENCODED -- BUT THE PADDING WAS NEVER WRONG, WHICH IS WHY THE FIX
+  REPRODUCES THE PAD ARITHMETIC RATHER THAN CORRECTING IT.**
+  The spec asserted "the padding is then computed against the wrong width
+  too". **It was not.** `__emitrust_cstr` yields exactly one Rust `char` per
+  C byte, and Rust's `{:>10}` pads by `chars().count()`, so the pad count
+  already agreed with C's byte count. Every measured shape shows the correct
+  number of spaces and only a re-encoded payload -- five pad bytes in both
+  the before and after of `%10s`. The defect was purely the payload.
+  FR-191's stated blocker -- "a raw `write_all` cannot pad" -- is true of
+  `write_all` alone and **false as a conclusion**: C pads to the byte length
+  of the converted run, which is precisely the length the helper's own NUL
+  scan already computes. So ONE helper does both.
+  MEASURED (buf = `81 8e 9b a8 7a`): `A[%10s]` native
+  `41 5b 20*5 81 8e 9b a8 7a 5d 0a` versus emitted
+  `41 5b 20*5 c281 c28e c29b c2a8 7a 5d 0a`; `%-10s`, `%10.3s`, `%3s`
+  (width < len), `%5s` (width == len) and `%-3s` all likewise. Totals native
+  127 B, before 150 B, after 127 B, `cmp` clean. `%.3s` alone was ALREADY
+  correct -- FR-191 fixed the precision path -- and every ASCII control was
+  already byte-identical, which is what localises the defect to the padded
+  non-ASCII payload.
+  A second probe over the other admitted regions (devirtualised
+  `fprintf(stdout,...)` with `%9s`/`%-9s`, `strchr`/`strrchr` results with
+  `%6s`/`%-6s`, two padded holes in one call, leading and trailing padded
+  holes): native 115 B, before 138 B, after 115 B, `cmp` clean.
+  WHY THE FIX IS SAFE TO SCOPE THIS TIGHTLY: `allowRawBypass` is set only at
+  the two stdout `print!` positions (`ImportCStatements.cpp:8019`, `:8049`),
+  so `wantRawBytes` could drop its `width.empty()` guard **without exposing
+  stderr or `sprintf`**. And because `'*'` width/precision and the `'0'` flag
+  on `%s` are already located rejections, width, precision and `'-'` are ALL
+  compile-time constants -- only the run length is runtime, and the NUL scan
+  has it. New one-per-module `__emitrust_cstr_pad_out(slice, prec, width,
+  flags)` emits padding and payload in a single `write_all`. FR-192's
+  `deferredStrings`/`laterArgSideEffects` ordering fence is untouched.
+  CAPABILITY COST: **none.** Nothing that imported before now refuses, and
+  nothing was rejected to buy this.
+  THREE PRE-EXISTING FILES SHIFTED (paired `--emit=rust` sweep over 1070
+  sources; emit-failure set byte-identical): `printf-formats.c`, whose
+  `%8.2s` moves to the padded raw path so `__emitrust_cstr_n` drops out of
+  the crate entirely; `printf-string-nonascii.c`, whose `[%10s][%-10s]` line
+  becomes two padded raw writes; and the deliberate pin flip in
+  `printf-string-raw-bytes.c`, where the `%10s` case moves from
+  `keeps_display_funnel` to `raw_bytes`. Runtime output unchanged in both
+  EndToEnd cases.
+  RESIDUALS, left tight and documented in source and test: **argv `%s` with a
+  width stays a located rejection**, now a SCOPE choice rather than a
+  representation limit -- widening `admittedPrintfStringArg` decides whether
+  `main` gets an argv table at all (corpus-ratchet blast radius), and the
+  argv bypass at `:8756` would need the padded form too or it would SILENTLY
+  DROP THE WIDTH. And FR-194's residual is unchanged: a padded non-ASCII
+  `%s` whose LATER argument has side effects still takes the Latin-1 funnel,
+  pinned as ASCII-only in the new EndToEnd test so the declined path stays
+  observable.
+  Gate 1021/1021 (combined with FR-211); clippy 101 -> 101 (+0); both
+  ratchets unmoved with manifests untouched; TRACTOR 41/252.
+
+- [x] FR-211 (opened and LANDED 2026-09-08; closes FR-197's THIRD AND LAST
+  residual, the `goto` ladder): **IRREDUCIBILITY IS NOT THE DRIVER -- ADDING
+  IT MAKES THE LOWERING *CHEAPER*. AND ON THIS PATH THE BLOWUP IS CUBIC, NOT
+  QUADRATIC.**
+  **THE LEAD WAS REFUTED, and the refutation is the finding.** The spec
+  proposed that an irreducible `goto` graph forces the same quadratic node
+  splitting. Measured: a genuinely irreducible two-entry loop lowers to **52
+  lines FLAT in N** (0.11-0.21s at N=4/16/64). And closing the ladder with a
+  back edge -- turning it into an N-entry loop, i.e. MORE irreducible --
+  makes it **cheaper**: 2638 lines / 0.21s at N=32 against 14344 / 1.11s for
+  the acyclic version, and merely quadratic. The driver is the **acyclic
+  fall-through ladder**, exactly as on the two switch paths.
+  **FR-197'S "QUADRATIC NODE SPLITTING" IS QUADRATIC ONLY ON THE SWITCH
+  PATHS.** On the `goto` path the emitted output is **CUBIC**: the THIRD
+  difference is exactly 2 and constant (44/76/120/178/252/344/456/590/748 at
+  N=2..10), closed form `L(N) = 44 + sum_{j=2}^{N-1}(j^2+7j+14)`, which
+  reproduces N=24 -> 6600 exactly. FR-207 pinned a constant SECOND difference
+  (192) on the dispatch path; here it is the third.
+  N=60 reproduces FR-197's recorded 83,383-line figure (83,448 measured).
+  Time: 1.11s/3.61s/8.92s/21.13s/47.76s/133.27s/268.09s at N=32..80, and
+  **N=100 does not finish in 400s and emits NOTHING -- no output, no
+  diagnostic.** That hang is the defect.
+  **FOUR CONTROLS, and they are what make the bound a scalpel:**
+   - `terminated` -- same switch, same 33 labels, same 33 `goto`s, every
+     section `return`s: **exactly `4N + 18` lines**, flat time to N=128. This
+     pins the bounded quantity as the CHAIN, not the label count.
+   - `untargeted` -- N consecutive fall-through labels that are not `goto`
+     targets: `N + 12` lines, flat. Pins that a label must be a JOIN.
+   - `iflad` -- **the same ladder with NO SWITCH AT ALL**, entered by
+     `if (sel==k) goto Lk;` (the C error-cleanup idiom): identical blowup,
+     13312 lines at N=32. **This is why the bound sits at FUNCTION scope**
+     (`ImportCFunctions.cpp`) rather than on any switch, and why
+     `ImportCStatements.cpp` is untouched.
+   - `irred` / `backw` -- the two refutations above.
+  Bound: `kMaxGotoLabelFallThroughChain = 32`, deliberately a NEW constant
+  rather than a reuse of FR-207's `kMaxSwitchFallThroughChain`, because the
+  growth law differs (cubic vs quadratic) even though the chosen value and
+  the "about a second at the limit" criterion coincide. Boundary exact: 32
+  imports, 33 rejects. `--recover` stubs it and terminates, verified.
+  CENSUS (temporary probe, removed and rebuilt before any gate run):
+  EndToEnd/Import/Driver/Project/Conversion/Kernel/Fuzz 963 files, max real
+  chain **1**; c-testsuite 220 files, max **5** (`00213.c`); Cpp17Suite and
+  RealWorld 52 files, max **0**; TRACTOR 184 files, max **2**
+  (`021_complex_goto`). **Largest real chain anywhere is 5 against a bound of
+  32 -- 6.4x headroom**, better than FR-207's 4x. Coverage was checked, not
+  assumed: 32 files contain a literal `goto`, 20 measured > 0, and the 12
+  that measured 0 were each verified to be split-file tests, deliberately
+  invalid tests, or `driver.c` files failing to import for unrelated reasons.
+  CAPABILITY COST, with the risk named up front: the kernel-style
+  `err_b: free(b); err_a: free(a);` cleanup ladder IS exactly this shape and
+  does blow up. Chains 33..81 went from "compiles in 0.1s-268s" to "rejected
+  in 0.1s"; chains past ~90 went from "never returns, no diagnostic" to
+  "rejected in 0.1s". The census says real ones are 5 or shorter, and that is
+  recorded in the constant's own comment. Nothing is silently truncated.
+  GOLDEN MOVEMENT ZERO, verified directly pre-patch binary vs patched over
+  1,419 corpus inputs: `same=927 moved=0 both-rejected=492 status-flips=0`,
+  using FR-207's corrected classification (both-reject != moved). Run twice,
+  identical.
+  NOT DONE: the path still lowers cubically BELOW the bound; making it linear
+  needs FR-197's option (A) generalised to labels, or option (F)'s
+  labelled-block op.
+  Gate 1021/1021 (combined with FR-210); clippy 101 -> 101 (+0); both
+  ratchets unmoved; TRACTOR 41/252. The EndToEnd test builds a 14,810-line
+  crate whose 126 lines of stdout are byte-identical to the clang native.
 
 - [ ] FR-208 DEFECT (opened 2026-09-08 by the FR-178 re-measurement spike):
   **`--c-abi-exports` EXPORTS A SYMBOL THE C PROGRAM NEVER HAD, whenever the

@@ -3414,6 +3414,14 @@ static bool scanPrintfArgDirectives(llvm::StringRef format,
 /// definition, mirroring the statement lowering's intercept) at a `%s`
 /// position with no field width. A precision (`%.Ns`) is admitted: the
 /// raw byte path bounds the scan without needing the padded length.
+/// FR-193 item 2 note: the field-width exclusion is no longer a
+/// REPRESENTATION limit -- `__emitrust_cstr_pad_out` pads a raw byte run
+/// from the C byte length, and the char-region `%s` path uses it. It is
+/// kept here as a deliberate scope choice: admitting argv here decides
+/// whether `main` gets an argv table at all, and the argv `%s` bypass in
+/// `translatePrintfFormat` would have to learn the padded form too. Until
+/// then `printf("%10s", argv[0])` stays a LOCATED rejection, never a
+/// silent width drop.
 static bool admittedPrintfStringArg(const clang::CallExpr *call,
                                     const clang::Stmt *argNode) {
   const clang::FunctionDecl *callee = call->getDirectCallee();

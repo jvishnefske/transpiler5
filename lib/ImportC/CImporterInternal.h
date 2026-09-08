@@ -5165,6 +5165,15 @@ private:
   LogicalResult emitDispatchSwitch(const clang::SwitchStmt *stmt, Value flag,
                                    IntegerType flagType, Location loc);
 
+  /// FR-197 (last residual). Refuses a function body whose `goto`-targeted
+  /// labels form a fall-through chain longer than
+  /// `kMaxGotoLabelFallThroughChain`, before any of it is emitted. Such a
+  /// body hands `lift-cf-to-scf` the same ladder the two switch bounds
+  /// already cover, reached through labels instead of `case`s, and it is
+  /// structurized by duplicating the tail into every entry -- cubically here
+  /// (see the constant's comment), until the compile stops returning at all.
+  LogicalResult checkGotoLabelChain(const clang::Stmt *body);
+
   /// Emits `return`, then continues in a fresh (dead) block so trailing
   /// statements still have an insertion point.
   LogicalResult emitReturnStmt(const clang::ReturnStmt *stmt);
@@ -7642,6 +7651,18 @@ private:
   /// True once the `__emitrust_cstr_n_out` helper has been emitted, so a
   /// multi-TU import never emits it twice.
   bool cStrNOutHelperEmitted = false;
+  /// True once a `%s` hole carrying a FIELD WIDTH has been imported in a
+  /// raw-bytes position (FR-193 item 2); triggers emission of the
+  /// `__emitrust_cstr_pad_out` helper, which pads from the C BYTE length
+  /// of the region and writes the padding and the payload as raw bytes.
+  /// FR-191 left this shape on the Latin-1 `__emitrust_cstr` funnel
+  /// because "a raw `write_all` cannot pad" — true of `write_all` alone,
+  /// but the length the pad needs is exactly the length the NUL scan
+  /// already computes, so the helper can do both.
+  bool needsCStrPadOutHelper = false;
+  /// True once the `__emitrust_cstr_pad_out` helper has been emitted, so
+  /// a multi-TU import never emits it twice.
+  bool cStrPadOutHelperEmitted = false;
   /// (rows, cols) shapes for which a 2D-array-pointer cast argument
   /// (FR-92, `Cipher((state_t*)buf, ...)`) has been imported; each
   /// triggers the one-per-module emission of the matching
@@ -8349,6 +8370,177 @@ nonPlainSwitchBodyBlocker(const clang::CompoundStmt *body,
 /// count, as the quantity to bound. 32 costs 1.11s here, matching the plain
 /// path's 0.86s, so the two paths share one limit and one justification.
 static constexpr unsigned kMaxSwitchFallThroughChain = 32;
+
+/// FR-197 (last residual, the `goto` ladder). Collects, in source order, one
+/// entry per `goto`-LABEL statement of a function body, each recording
+/// whether control can FALL INTO it from the statement textually before it.
+///
+/// This is the `goto` counterpart of `collectDispatchSwitchSections`. The
+/// shapes are the same defect wearing different syntax: a run of label
+/// sections that are each entered from somewhere else AND fall into the next
+/// hands `lift-cf-to-scf` a ladder, and it structurizes a ladder by
+/// duplicating the tail into every entry.
+///
+/// The fall-in flag is an OVER-approximation on the same terms FR-207 chose:
+/// false only where the preceding sibling PROVES control cannot arrive, true
+/// wherever the walk cannot tell. Over-approximating lengthens the measured
+/// chain, i.e. makes the bound stricter, and never lets a hang past.
+///
+/// Unlike the dispatch scan this one DESCENDS INTO `switch` statements: a C
+/// label inside a switch body is still a `goto` target and still forms this
+/// ladder, and the switch's own bound measures a different quantity (its
+/// `case` sections).
+static inline void collectGotoLabelSections(
+    const clang::Stmt *stmt, bool mayFallIn,
+    llvm::SmallVectorImpl<std::pair<const clang::LabelStmt *, bool>>
+        &sections) {
+  if (!stmt)
+    return;
+  if (const auto *label = llvm::dyn_cast<clang::LabelStmt>(stmt)) {
+    sections.push_back({label, mayFallIn});
+    // The section's own body is entered from the label, so it always "falls
+    // in"; any label found below it starts the NEXT section.
+    collectGotoLabelSections(label->getSubStmt(), /*mayFallIn=*/true, sections);
+    return;
+  }
+  if (const auto *compound = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {
+    const clang::Stmt *previous = nullptr;
+    for (const clang::Stmt *child : compound->body()) {
+      bool childFallsIn = true;
+      if (previous) {
+        // Peel any label chain (`L: case 0: break;`) off the predecessor so
+        // that a section ending the flow is recognised as ending it.
+        const clang::Stmt *tail = previous;
+        while (tail) {
+          if (const auto *inner = llvm::dyn_cast<clang::LabelStmt>(tail)) {
+            tail = inner->getSubStmt();
+            continue;
+          }
+          if (const auto *inner = llvm::dyn_cast<clang::SwitchCase>(tail)) {
+            tail = inner->getSubStmt();
+            continue;
+          }
+          break;
+        }
+        childFallsIn = tail && switchStmtFallsThrough(tail);
+      }
+      collectGotoLabelSections(child, childFallsIn, sections);
+      previous = child;
+    }
+    return;
+  }
+  for (const clang::Stmt *child : stmt->children())
+    collectGotoLabelSections(child, /*mayFallIn=*/true, sections);
+}
+
+/// FR-197. Every label a `goto` in `stmt` targets. A label nothing jumps to
+/// is not a join, so it cannot be duplicated into and is excluded from the
+/// chain below -- measured, N consecutive fall-through labels that no `goto`
+/// targets cost N + 12 emitted lines, flat time out to N = 128.
+static inline void
+collectGotoTargets(const clang::Stmt *stmt,
+                   llvm::SmallPtrSetImpl<const clang::LabelDecl *> &targets) {
+  SmallVector<const clang::Stmt *> worklist{stmt};
+  while (!worklist.empty()) {
+    const clang::Stmt *current = worklist.pop_back_val();
+    if (!current)
+      continue;
+    if (const auto *jump = llvm::dyn_cast<clang::GotoStmt>(current))
+      targets.insert(jump->getLabel());
+    for (const clang::Stmt *child : current->children())
+      worklist.push_back(child);
+  }
+}
+
+/// FR-197. The longest run of consecutive `goto`-targeted labels in `body`
+/// that can fall into one another, with `first`/`last` set to its endpoints
+/// for the diagnostic. Zero when the body has no such run.
+///
+/// A label in the run that no `goto` targets does NOT break it and does not
+/// count towards it: control still flows through it into the next join, so
+/// splitting the run there would under-measure the ladder.
+static inline unsigned
+gotoLabelFallThroughChain(const clang::Stmt *body,
+                          const clang::LabelStmt *&first,
+                          const clang::LabelStmt *&last) {
+  first = nullptr;
+  last = nullptr;
+  llvm::SmallPtrSet<const clang::LabelDecl *, 8> targets;
+  collectGotoTargets(body, targets);
+  if (targets.empty())
+    return 0;
+  llvm::SmallVector<std::pair<const clang::LabelStmt *, bool>> sections;
+  collectGotoLabelSections(body, /*mayFallIn=*/true, sections);
+  unsigned longest = 0;
+  unsigned run = 0;
+  const clang::LabelStmt *runFirst = nullptr;
+  for (auto [label, fallsIn] : sections) {
+    if (!fallsIn) {
+      run = 0;
+      runFirst = nullptr;
+    }
+    if (!targets.contains(label->getDecl()))
+      continue;
+    if (run == 0)
+      runFirst = label;
+    ++run;
+    if (run > longest) {
+      longest = run;
+      first = runFirst;
+      last = label;
+    }
+  }
+  return longest;
+}
+
+/// FR-197's LAST residual. The longest chain of `goto`-targeted labels
+/// falling into one another that a function body may carry before the
+/// importer refuses it outright.
+///
+/// FR-198 bounded the plain switch path and FR-207 the dispatch path; both
+/// left this one, and FR-198 re-measured it at 29.7s / 83,383 emitted lines.
+/// Re-measured here on `switch (sel) { case k: goto Lk; } L0: ... LN: ...`,
+/// the emitted output is CUBIC in the chain, not quadratic like the two
+/// switch paths -- 44/76/120/178/252/344/456/590/748 lines at N=2..10 has an
+/// exactly constant THIRD difference of 2 (L(N) ~ N^3/3) -- and wall time is
+/// worse again: 14344 lines / 1.11s at 32, 44296 / 8.92s at 48, 83448 /
+/// 47.76s at 60, 129788 / 133.27s at 70, 190728 / 268.09s at 80, and at 100
+/// nothing at all -- no output and no diagnostic in 400s (rc=124).
+///
+/// TWO CONTROLS say what to bound, and they are what make this a chain bound
+/// rather than a label-count or a `goto`-count bound:
+///   * the SAME switch, the SAME labels and the SAME gotos with every
+///     section ending in `return` is exactly linear -- 4N + 18 lines, flat
+///     time out to N = 128;
+///   * N consecutive fall-through labels that no `goto` targets is N + 12
+///     lines, flat to N = 128.
+/// The switch is not the driver either: the identical ladder entered by a
+/// chain of `if (sel == k) goto Lk;` -- the ordinary C error-cleanup idiom --
+/// blows up the same way (13312 lines / 1.21s at N=32). Nor is
+/// irreducibility, which the filing offered as the lead: a genuinely
+/// irreducible two-entry loop lowers to 52 lines flat in N, and closing the
+/// ladder with a back edge makes it CHEAPER (2638 lines / 0.21s at N=32),
+/// not worse.
+///
+/// 32 is the same limit the two switch paths use and is chosen the same way:
+/// the largest measured chain whose compile still finishes in about a second
+/// (1.11s here, against 1.11s on the dispatch path and 0.86s on the plain
+/// one).
+///
+/// WHERE IT BITES, censused rather than guessed (a temporary probe reported
+/// every function's chain; the hook was removed and the tool rebuilt before
+/// any gate run). Longest chain measured, per corpus:
+///   EndToEnd/Import/Driver/Project/Conversion/Kernel/Fuzz  963 files, max 1
+///   c-testsuite                        220 files, max 5 (`00213.c`)
+///   Cpp17Suite + RealWorld              52 files, max 0
+///   TRACTOR Public+Hidden-Tests        184 files, max 2 (`021_complex_goto`)
+/// The largest real chain anywhere is 5 against a bound of 32 -- 6x headroom.
+/// This matters more here than for the switch bounds, because `goto` ladders
+/// are NOT exotic: the C error-cleanup idiom (`err_b: free(b); err_a:
+/// free(a); return -1;`) is exactly this shape, and it blows up exactly the
+/// same way. The census says real ones are short; a hand-written function
+/// would need 33+ consecutive `goto`-targeted cleanup labels to be refused.
+static constexpr unsigned kMaxGotoLabelFallThroughChain = 32;
 
 /// Returns true if `type` is an MLIR unsigned integer type (the mapping of
 /// the C unsigned integer types; signless types model the signed ones).

@@ -8825,21 +8825,27 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       // prints its raw bytes, bypassing the `__emitrust_cstr` Latin-1
       // Display funnel whose per-byte `u8 as char` widening re-encodes
       // every byte >= 0x80 as TWO UTF-8 bytes (a measured miscompile:
-      // native `ff fe 81 7a` vs emitted `c3 bf c3 be c2 81 7a`). Two
-      // restrictions keep it byte-exact:
-      //   * a FIELD WIDTH pads to a byte count only the formatter knows,
-      //     and the raw write cannot pad — the same restriction the argv
-      //     planner already applies (`admittedPrintfStringArg`);
-      //   * flushing the pending segment moves this call's output BEFORE
-      //     the evaluation of the arguments still to come, where C
-      //     evaluates every argument before printf writes anything. A
-      //     later argument with side effects (it could write the very
-      //     buffer being printed) therefore declines the bypass.
+      // native `ff fe 81 7a` vs emitted `c3 bf c3 be c2 81 7a`). One
+      // restriction keeps it byte-exact: flushing the pending segment
+      // moves this call's output BEFORE the evaluation of the arguments
+      // still to come, where C evaluates every argument before printf
+      // writes anything. A later argument with side effects (it could
+      // write the very buffer being printed) therefore declines the
+      // bypass.
+      // FR-193 item 2 REMOVED the second restriction FR-191 recorded here,
+      // "a FIELD WIDTH pads to a byte count only the formatter knows, and
+      // the raw write cannot pad". The premise was true of `write_all`
+      // alone and the conclusion was wrong: C pads to the BYTE length of
+      // the converted run, which is precisely the length the helper's NUL
+      // scan already computes, so `__emitrust_cstr_pad_out` writes padding
+      // and payload as one raw run. Leaving the shape on the funnel was a
+      // live miscompile, not a scope note — `printf("%10s")` over `81 8e
+      // 9b a8 7a` emitted five correct pad bytes followed by NINE payload
+      // bytes where C writes five.
       // The argument is materialized either way — the ops are identical,
       // only the wrapping differs — so nothing is evaluated twice and the
       // C argument order is preserved.
-      bool wantRawBytes =
-          allowRawBypass && width.empty() && !laterArgSideEffects;
+      bool wantRawBytes = allowRawBypass && !laterArgSideEffects;
       // FR-192: with a side-effecting argument still to come, the region has
       // to be read AFTER that argument runs, so the whole `%s` lowering moves
       // to `materializeDeferredStrings` and only its operand slot is reserved
@@ -8874,7 +8880,26 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
           *rawBypassed = true;
         if (failed(flushSegment()))
           return failure();
-        if (stringPrecision) {
+        if (!width.empty()) {
+          // FR-193 item 2: a FIELD WIDTH pads to the C BYTE length of the
+          // converted run. The width, the precision and the '-' flag are
+          // all compile-time constants here ('*' width/precision and the
+          // '0' flag are located rejections above), so they travel as i32
+          // constants exactly like the `__emitrust_fmt_*` helpers'; only
+          // the run length is a runtime quantity, and the helper's own NUL
+          // scan already has it. `prec` < 0 spells "no precision".
+          needsCStrPadOutHelper = true;
+          Value precValue = createIntConstant(
+              loc, i32Type,
+              stringPrecision ? static_cast<int64_t>(*stringPrecision) : -1);
+          Value widthConst = createIntConstant(loc, i32Type, widthValue);
+          Value flagsValue = createIntConstant(loc, i32Type, flagsMask);
+          builder.create<emitrust::CallOpaqueOp>(
+              loc, TypeRange(),
+              builder.getStringAttr("__emitrust_cstr_pad_out"),
+              /*args=*/ArrayAttr(),
+              ValueRange{*text, precValue, widthConst, flagsValue});
+        } else if (stringPrecision) {
           // `%.Ns`: at most N raw bytes, stopping earlier at a NUL.
           needsCStrNOutHelper = true;
           Value count =
