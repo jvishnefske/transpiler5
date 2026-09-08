@@ -847,12 +847,22 @@ private:
     SmallVector<Type> argTypes;
     /// The single result type, or null for a void function.
     Type resultType;
-    /// Which parameter is the struct reference.
+    /// Which parameter is the struct reference, or (FR-202) the byte slice.
     unsigned refIndex;
     /// Whether that parameter is `&mut T` (`*mut T`) or `&T` (`*const T`).
     bool refIsMut;
     /// The struct_def symbol the reference points at.
     StringRef refStructName;
+    /// FR-202 class 2: when non-zero, the reference is a shared `&[T]` and
+    /// this is the PROVEN must-access bound. The wrapper takes `*const T` and
+    /// builds the slice with exactly this length, so the C caller passes ONE
+    /// register and no argument shifts. Zero means class 1 (a struct
+    /// pointer); a proven bound is never zero, because `from_raw_parts(p, 0)`
+    /// still requires `p` non-null while a C caller may legally pass NULL for
+    /// a pointer nothing reads.
+    uint64_t sliceBound = 0;
+    /// FR-202 class 2: the slice's element type, for the `*const T` spelling.
+    Type sliceElemType;
   };
   SmallVector<CAbiPointerWrapper> cAbiPointerWrappers;
 
@@ -4602,18 +4612,31 @@ enum class CAbiClass {
   /// struct and every other parameter and the result is a scalar. A
   /// one-statement `unsafe extern "C"` wrapper delegates to the untouched
   /// translated function.
-  StructPointer
+  StructPointer,
+  /// FR-202 class 2: exactly ONE parameter is a SHARED byte slice (`&[u8]`,
+  /// which is what the importer makes of a walked `const unsigned char *`),
+  /// every other parameter and the result is a scalar, AND the callee's
+  /// MUST-ACCESS BOUND is proven from its body. The wrapper takes the raw
+  /// `*const u8` C really passes -- ONE register, so no argument shifts --
+  /// and builds the slice with the proven length.
+  SliceBound
 };
 
 struct CAbiVerdict {
   CAbiClass kind = CAbiClass::Refused;
   /// Why not, phrased as the tail of "no C-ABI export for 'f': ...".
   std::string blocker;
-  /// For `StructPointer`: which parameter carries the reference, whether it
-  /// is `&mut`, and the struct it points at.
+  /// For `StructPointer` and `SliceBound`: which parameter carries the
+  /// reference. For `StructPointer` only: whether it is `&mut`, and the
+  /// struct it points at.
   unsigned refIndex = 0;
   bool refIsMut = false;
   StringRef refStructName;
+  /// For `SliceBound`: the PROVEN must-access bound, i.e. the slice length
+  /// the wrapper constructs. Never zero -- see `cAbiProvenSliceBound`.
+  uint64_t sliceBound = 0;
+  /// For `SliceBound`: the slice's element type, for the `*const T` spelling.
+  Type sliceElemType;
 };
 } // namespace
 
@@ -4649,6 +4672,148 @@ static bool cAbiStructIsFaithful(Operation *from, StringRef name,
   return false;
 }
 
+/// FR-202: is `type` the ONE slice element a bounded export admits -- an
+/// eight-bit integer?
+///
+/// The narrowness is measured, not timid. FR-182 found that an emitted Rust
+/// primitive is NOT always the width of the C type it came from: `long double`
+/// maps to `f64`, a 128-bit C type silently narrowed to 64, and `_Bool` maps
+/// to `i1`. A record carries the importer's verdict about that on
+/// `emitrust.abi_faithful`; a bare slice type carries nothing, so the emitter
+/// cannot tell `const double *` from `const long double *` and a wrong element
+/// STRIDE is a wrong answer with no diagnostic. One byte is the only width for
+/// which the emitted primitive is provably the C one.
+///
+/// It costs nothing today: the importer only ever produces a SHARED `&[u8]`
+/// for a walked `const unsigned char *` (ImportCTypes.cpp) -- every other
+/// pointer parameter becomes `&mut [T]`, which this class refuses anyway.
+static bool isCAbiOneByteElement(Type type) {
+  auto intType = dyn_cast<IntegerType>(type);
+  return intType && intType.getWidth() == 8;
+}
+
+/// FR-202: the operations a bounded-slice candidate's body may contain. A
+/// WHITELIST, never a blacklist, for FR-182's reason: the failure direction of
+/// a missed entry is a refusal, and the failure direction of a missed blacklist
+/// entry is an unsound bound.
+///
+/// What is deliberately absent is everything that can DIVERGE or let the
+/// pointer ESCAPE: every call form (`call_opaque`, `call_indirect`,
+/// `method_call` -- a callee may `exit()` before the later accesses run, and
+/// then the C caller never owed those bytes), every opaque-text form
+/// (`verbatim`, `literal`, `string_repeat`), `addr_of`/`slice_of` (which take
+/// a NEW borrow of a place and would carry the parameter out of this scan),
+/// and every region-carrying operation (checked separately, so a future op
+/// with a region cannot slip in by being added to this list).
+///
+/// Arithmetic IS admitted even though a Rust overflow, division by zero or
+/// out-of-range array index PANICS: every one of those is UNDEFINED in C, so a
+/// C program that reaches one was already broken before this transpiler saw
+/// it, and no bound is owed to it. Divergence that is DEFINED in C is exactly
+/// the call forms above, and they are refused.
+static bool cAbiBoundedBodyOpAdmitted(Operation *op) {
+  return isa<emitrust::ConstantOp, emitrust::DerefOp, emitrust::SubscriptOp,
+             emitrust::LoadOp, emitrust::AssignOp, emitrust::VariableOp,
+             emitrust::LetOp, emitrust::GlobalLoadOp, emitrust::MemberOp,
+             emitrust::EnumRawOp, emitrust::CastOp, emitrust::BitcastOp,
+             emitrust::NegOp, emitrust::CmpOp, emitrust::SelectOp,
+             emitrust::ReturnOp, emitrust::AddOp, emitrust::SubOp,
+             emitrust::MulOp, emitrust::DivOp, emitrust::RemOp,
+             emitrust::AndOp, emitrust::OrOp, emitrust::XorOp,
+             emitrust::ShlOp, emitrust::ShrOp>(op);
+}
+
+/// FR-202: the constant a subscript indexes with, or `std::nullopt` when the
+/// index is a value rather than a literal. A NEGATIVE constant is rejected
+/// outright: the slice the wrapper builds starts AT the pointer, so `p[-1]`
+/// would not be covered by any non-negative bound and max-index reasoning
+/// would silently miss it.
+static std::optional<uint64_t> cAbiConstantIndex(Value index) {
+  auto constant =
+      dyn_cast_if_present<emitrust::ConstantOp>(index.getDefiningOp());
+  if (!constant)
+    return std::nullopt;
+  auto value = dyn_cast<IntegerAttr>(constant.getValue());
+  if (!value)
+    return std::nullopt;
+  llvm::APInt raw = value.getValue();
+  if (raw.isNegative() || raw.getActiveBits() > 32)
+    return std::nullopt;
+  return raw.getZExtValue();
+}
+
+/// FR-202: the PROVEN must-access bound of the `&[u8]` parameter at
+/// `argIndex`, or `std::nullopt` when no bound can be proven.
+///
+/// THE PROOF OBLIGATION, and why an unproven bound must never be guessed.
+/// FR-181 measured that exporting a slice parameter directly makes rustc read
+/// the length out of the caller's NEXT argument and shift every later one --
+/// crc16 native 21983 against export 25322, exit 0, no panic, no diagnostic.
+/// It then killed the two obvious repairs with counterexamples from inside the
+/// corpus: `synth_pair`'s `nch` is a channel COUNT whose real bound is
+/// `16*nch + 1`, and `wcscat`'s `numElem` is a CAPACITY that its own vector 5
+/// has SMALLER than the string. So the length is never taken from the
+/// signature; it is read off the body or the export does not happen.
+///
+/// N is admitted only when the function provably reads `p[0..N)` and nothing
+/// else, ON EVERY PATH:
+///
+///   * the body is ONE block and no operation in it carries a region, so
+///     there is no path on which an access is skipped. An early `return` is
+///     the killer: `f(p, n) { if (!n) return 0; return p[0] + p[9]; }` lets a
+///     C caller pass one byte with `n == 0`, and a ten-byte slice built from
+///     that pointer is UB before the body runs;
+///   * every operation is on `cAbiBoundedBodyOpAdmitted`'s whitelist, which
+///     excludes every call form (a callee may `exit()`) and everything that
+///     could carry the pointer out of this scan;
+///   * every use of the parameter is a `deref`, every use of a deref result is
+///     a `subscript` at a CONSTANT non-negative index, and every use of a
+///     subscript result is a `load`. Reads only: a write would additionally
+///     need write validity, and the `&mut [T]` it implies is `noalias` to LLVM
+///     where a C caller may legally alias (FR-181's HARD NO-GO);
+///   * at least one access exists. A zero bound is refused because
+///     `from_raw_parts(p, 0)` still requires `p` to be non-null and aligned,
+///     while a C caller may legally pass NULL for a pointer nothing reads.
+///
+/// N is then max(index) + 1, and that is sound because C itself demands it: a
+/// C program that reads `p[N-1]` on every path must already give `p` at least
+/// N elements or it has UB of its own. Note that this reads the OPTIMISED
+/// body, so `p += 2; p[1]` is index 3 and the bound is 4 -- deriving anything
+/// from the DECLARATOR would be wrong, which is FR-181's language-law point
+/// that `T p[N]` in a C prototype is just `T *p`.
+static std::optional<uint64_t> cAbiProvenSliceBound(emitrust::FuncOp funcOp,
+                                                    unsigned argIndex) {
+  Region &body = funcOp.getBody();
+  if (body.empty() || !body.hasOneBlock())
+    return std::nullopt;
+  Block &entry = body.front();
+  if (argIndex >= entry.getNumArguments())
+    return std::nullopt;
+  for (Operation &op : entry)
+    if (op.getNumRegions() != 0 || !cAbiBoundedBodyOpAdmitted(&op))
+      return std::nullopt;
+
+  std::optional<uint64_t> bound;
+  for (Operation *user : entry.getArgument(argIndex).getUsers()) {
+    auto deref = dyn_cast<emitrust::DerefOp>(user);
+    if (!deref)
+      return std::nullopt;
+    for (Operation *placeUser : deref.getResult().getUsers()) {
+      auto subscript = dyn_cast<emitrust::SubscriptOp>(placeUser);
+      if (!subscript)
+        return std::nullopt;
+      std::optional<uint64_t> index = cAbiConstantIndex(subscript.getIndex());
+      if (!index)
+        return std::nullopt;
+      for (Operation *elementUser : subscript.getResult().getUsers())
+        if (!isa<emitrust::LoadOp>(elementUser))
+          return std::nullopt;
+      bound = std::max(bound.value_or(0), *index + 1);
+    }
+  }
+  return bound;
+}
+
 /// FR-182: classifies `type` against the C ABI, naming the refusal per shape.
 ///
 /// Before FR-182 every refused signature got FR-139's identical "not
@@ -4661,6 +4826,11 @@ static CAbiVerdict classifyCAbiSignature(Operation *from, FunctionType type) {
   CAbiVerdict verdict;
   unsigned sliceCount = 0;
   unsigned refCount = 0;
+  // FR-202: the LAST slice parameter seen, which is the only one when the
+  // class-2 attempt below runs (it requires `sliceCount == 1`).
+  unsigned sliceIndex = 0;
+  bool sliceIsShared = false;
+  Type sliceElem;
   bool sawOther = false;
   bool sawByValueStruct = false;
   bool refIsStruct = false;
@@ -4703,8 +4873,11 @@ static CAbiVerdict classifyCAbiSignature(Operation *from, FunctionType type) {
     }
     // A slice is a REFERENCE too, and counts against the same cap; it is
     // separated here only so its refusal keeps FR-139's wording.
-    if (isa<emitrust::SliceType>(pointee)) {
+    if (auto sliceType = dyn_cast<emitrust::SliceType>(pointee)) {
       ++sliceCount;
+      sliceIndex = index;
+      sliceIsShared = !isMut;
+      sliceElem = sliceType.getElementType();
       continue;
     }
     ++refCount;
@@ -4726,6 +4899,25 @@ static CAbiVerdict classifyCAbiSignature(Operation *from, FunctionType type) {
     sawOther = true;
   }
 
+  // FR-202 class 2: ONE shared byte slice, everything else scalar, and a
+  // must-access bound PROVEN from the body. This is checked before FR-139's
+  // blanket slice refusal below and narrows it by exactly this shape; every
+  // slice that fails any clause still lands there, with FR-139's sentence
+  // unchanged. The structural cap is respected rather than relaxed: the
+  // wrapper's parameter is a raw `*const u8`, ONE register, so nothing shifts
+  // and no second reference exists to alias.
+  if (sliceCount == 1 && refCount == 0 && !sawOther && !sawByValueStruct &&
+      sliceIsShared && isCAbiOneByteElement(sliceElem)) {
+    if (auto funcOp = dyn_cast<emitrust::FuncOp>(from))
+      if (std::optional<uint64_t> bound =
+              cAbiProvenSliceBound(funcOp, sliceIndex)) {
+        verdict.kind = CAbiClass::SliceBound;
+        verdict.refIndex = sliceIndex;
+        verdict.sliceBound = *bound;
+        verdict.sliceElemType = sliceElem;
+        return verdict;
+      }
+  }
   // A slice, and anything with no C spelling at all, keeps FR-139's wording
   // whatever else is in the signature. (A slice beside a reference is also
   // over the structural cap below; either refusal is correct and this one is
@@ -5420,7 +5612,11 @@ LogicalResult RustEmitter::emitCAbiPointerWrappers() {
       noteBoundName(argName);
     os << "#[export_name = \"" << wrapper.symbol << "\"]\n"
        << wrapper.visibility << "unsafe extern \"C\" fn " << itemName << "(";
-    StringRef pointeeName = itemLeafName(wrapper.refStructName);
+    // Class 1 only: a class-2 wrapper points at a scalar element and has no
+    // struct_def symbol to leaf-name.
+    StringRef pointeeName = wrapper.sliceBound == 0
+                                ? itemLeafName(wrapper.refStructName)
+                                : StringRef();
     for (auto [index, argName] : llvm::enumerate(wrapper.argNames)) {
       if (index)
         os << ", ";
@@ -5430,7 +5626,20 @@ LogicalResult RustEmitter::emitCAbiPointerWrappers() {
         // reference. Spelling the wrapper's parameter as the raw pointer is
         // what makes the two agree, and it is the only reason the wrapper
         // needs `unsafe` at all.
-        os << (wrapper.refIsMut ? "*mut " : "*const ") << pointeeName;
+        //
+        // FR-202: for a bounded byte slice it is also what keeps the ARGUMENT
+        // SLOTS right. `&[u8]` is a two-register fat pointer, so exporting it
+        // directly would make rustc read the length out of the caller's next
+        // argument and shift every later one -- measured on crc16 as native
+        // 21983 against export 25322, exit 0, no diagnostic. A `*const u8` is
+        // one register, exactly what C passes.
+        os << (wrapper.refIsMut ? "*mut " : "*const ");
+        if (wrapper.sliceBound != 0) {
+          if (failed(emitType(wrapper.loc, wrapper.sliceElemType)))
+            return failure();
+        } else {
+          os << pointeeName;
+        }
         continue;
       }
       if (failed(emitType(wrapper.loc, wrapper.argTypes[index])))
@@ -5450,9 +5659,20 @@ LogicalResult RustEmitter::emitCAbiPointerWrappers() {
     for (auto [index, argName] : llvm::enumerate(wrapper.argNames)) {
       if (index)
         os << ", ";
-      if (index == wrapper.refIndex)
-        os << (wrapper.refIsMut ? "&mut *" : "&*");
-      os << argName;
+      if (index != wrapper.refIndex) {
+        os << argName;
+        continue;
+      }
+      if (wrapper.sliceBound != 0) {
+        // FR-202: the length is a LITERAL the analysis proved out of the
+        // callee's body -- never the caller's next argument, which FR-181
+        // measured to be a silent wrong answer, and never the declarator,
+        // which in C says nothing (`T p[N]` in a prototype IS `T *p`).
+        os << "core::slice::from_raw_parts(" << argName << ", "
+           << wrapper.sliceBound << ")";
+        continue;
+      }
+      os << (wrapper.refIsMut ? "&mut *" : "&*") << argName;
     }
     os << ")\n";
     decreaseIndent();
@@ -5990,9 +6210,11 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
       }
     }
     if (blocker.empty() && !cAbiActorWrapper) {
-      // Class 1 gets a wrapper and NOT the C ABI on the function itself:
-      // its parameter is a Rust reference where C has a pointer.
-      cAbiPointerWrapper = cAbiVerdict.kind == CAbiClass::StructPointer;
+      // Classes 1 and 2 get a wrapper and NOT the C ABI on the function
+      // itself: their parameter is a Rust reference where C has a pointer,
+      // and for class 2 it is a TWO-register fat pointer where C has one.
+      cAbiPointerWrapper = cAbiVerdict.kind == CAbiClass::StructPointer ||
+                           cAbiVerdict.kind == CAbiClass::SliceBound;
       cAbiExport = !cAbiPointerWrapper;
     } else if (!blocker.empty())
       // On the LOCATION, not the op: this is a message for the person who
@@ -6074,7 +6296,8 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
          std::move(wrapperArgNames), std::move(wrapperArgTypes),
          fn.getNumResults() == 1 ? fn.getResultTypes().front() : Type(),
          cAbiVerdict.refIndex, cAbiVerdict.refIsMut,
-         cAbiVerdict.refStructName});
+         cAbiVerdict.refStructName, cAbiVerdict.sliceBound,
+         cAbiVerdict.sliceElemType});
   os << " {\n";
   increaseIndent();
   if (failed(emitBlockBody(entryBlock)))

@@ -5545,6 +5545,109 @@ CImporter::projectMemberPlace(Location loc, Value basePlace,
       .getResult();
 }
 
+/// Folds `value` to the compile-time integer it evaluates to, or nullopt
+/// when it is not provably constant. The shapes handled are exactly the
+/// ones the importer's OWN cursor arithmetic builds (`emitSubscriptPointer`
+/// and the pointer-arithmetic sites): integer constants, add/sub/mul of
+/// folded operands, sign/zero extensions, and a load of a rank-0
+/// `memref.alloca` cursor cell whose reaching store folds — either the
+/// last store ahead of the load in the load's own block (`p--; *p`) or,
+/// when the load takes its value across a block edge, the function's one
+/// and only store (the entry-block `cursor = 0` of a slice parameter,
+/// which is what makes a `p[-1]` cursor fold to -1). Anything else — a
+/// truncation, a loop-carried cell, a runtime value — folds to nullopt,
+/// so every consumer must treat "unknown" as "cannot prove", never as
+/// "zero".
+static std::optional<int64_t> foldCursorConstant(Value value,
+                                                 unsigned depth = 0) {
+  if (!value || depth > 16)
+    return std::nullopt;
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return std::nullopt;
+  if (auto constant = llvm::dyn_cast<arith::ConstantOp>(def)) {
+    if (auto intAttr = llvm::dyn_cast<IntegerAttr>(constant.getValue()))
+      return intAttr.getValue().getSExtValue();
+    return std::nullopt;
+  }
+  auto binary = [&](Value lhs, Value rhs)
+      -> std::optional<std::pair<int64_t, int64_t>> {
+    std::optional<int64_t> l = foldCursorConstant(lhs, depth + 1);
+    std::optional<int64_t> r = foldCursorConstant(rhs, depth + 1);
+    if (!l || !r)
+      return std::nullopt;
+    return std::make_pair(*l, *r);
+  };
+  if (auto add = llvm::dyn_cast<arith::AddIOp>(def)) {
+    if (auto pair = binary(add.getLhs(), add.getRhs()))
+      return pair->first + pair->second;
+    return std::nullopt;
+  }
+  if (auto sub = llvm::dyn_cast<arith::SubIOp>(def)) {
+    if (auto pair = binary(sub.getLhs(), sub.getRhs()))
+      return pair->first - pair->second;
+    return std::nullopt;
+  }
+  if (auto mul = llvm::dyn_cast<arith::MulIOp>(def)) {
+    if (auto pair = binary(mul.getLhs(), mul.getRhs()))
+      return pair->first * pair->second;
+    return std::nullopt;
+  }
+  if (auto ext = llvm::dyn_cast<arith::ExtSIOp>(def))
+    return foldCursorConstant(ext.getIn(), depth + 1);
+  if (auto ext = llvm::dyn_cast<arith::ExtUIOp>(def)) {
+    // A zero extension is never negative; mask the folded source to its
+    // own width rather than propagating a sign the cast erases.
+    std::optional<int64_t> source = foldCursorConstant(ext.getIn(), depth + 1);
+    if (!source)
+      return std::nullopt;
+    unsigned width = ext.getIn().getType().getIntOrFloatBitWidth();
+    if (width >= 64)
+      return std::nullopt;
+    return static_cast<int64_t>(static_cast<uint64_t>(*source) &
+                                ((uint64_t(1) << width) - 1));
+  }
+  if (auto load = llvm::dyn_cast<memref::LoadOp>(def)) {
+    Value memref = load.getMemRef();
+    if (!memref.getDefiningOp<memref::AllocaOp>())
+      return std::nullopt;
+    // The cell must be a plain scalar slot: any user that is not a load or
+    // a store could write it behind our back.
+    memref::StoreOp single;
+    unsigned storeCount = 0;
+    for (Operation *user : memref.getUsers()) {
+      if (llvm::isa<memref::LoadOp>(user))
+        continue;
+      auto store = llvm::dyn_cast<memref::StoreOp>(user);
+      if (!store)
+        return std::nullopt;
+      single = store;
+      ++storeCount;
+    }
+    // The LAST store to the cell that sits in the load's own block ahead of
+    // it is the value the load observes, whatever any predecessor wrote --
+    // which is what lets a straight-line `p--; *p` fold even though the
+    // cursor cell is written twice. Without such a store the value comes
+    // from a predecessor edge, and only a cell written exactly once in the
+    // whole function is knowable (a store that does not dominate the load
+    // would leave the load reading an undefined cell).
+    memref::StoreOp reaching;
+    for (Operation *op = load->getPrevNode(); op; op = op->getPrevNode())
+      if (auto store = llvm::dyn_cast<memref::StoreOp>(op);
+          store && store.getMemRef() == memref) {
+        reaching = store;
+        break;
+      }
+    if (!reaching) {
+      if (storeCount != 1)
+        return std::nullopt;
+      reaching = single;
+    }
+    return foldCursorConstant(reaching.getValueToStore(), depth + 1);
+  }
+  return std::nullopt;
+}
+
 FailureOr<Value> CImporter::refineElementPlace(Location loc, Value basePlace,
                                                Value cursor,
                                                Type pointeeType) {
@@ -5560,6 +5663,27 @@ FailureOr<Value> CImporter::refineElementPlace(Location loc, Value basePlace,
   // index and continues into the level with the remainder.
   Value place = basePlace;
   Type valueType = lvalueType.getValueType();
+  // The two pointer lowerings disagree about what a NEGATIVE displacement
+  // means, and only one of them can represent it. Under the owner model
+  // (`planOwners`) a pointer parameter is an i64 element CURSOR into the
+  // receiver's WHOLE data array, so `p[-1]` adds -1 to the cursor in i64
+  // and lands on a real element. Under the Phase-1b slice model the
+  // pointer's position is baked into the SLICE START at the call site
+  // (`&mut a[base..]`), the callee sees only the tail, and its own cursor
+  // restarts at 0 -- so a negative displacement addresses storage that is
+  // not in the slice at all and `[(-1i64) as usize]` wraps to a huge index.
+  // That built cleanly and panicked at RUN TIME on well-defined C, which is
+  // a wrong answer, not a safe failure. Refuse the shape here instead, with
+  // the access's own location. Only a PROVABLY negative cursor is refused:
+  // `foldCursorConstant` returning nullopt means "cannot prove", so a
+  // runtime index keeps its existing lowering.
+  if (llvm::isa<emitrust::SliceType>(valueType))
+    if (std::optional<int64_t> folded = foldCursorConstant(cursor);
+        folded && *folded < 0)
+      return emitError(loc)
+             << "unsupported: negative element index through a slice "
+                "parameter (the slice starts at the pointee, so elements "
+                "before it are unreachable)";
   while (valueType != pointeeType) {
     Type elementType;
     if (auto arrayType = llvm::dyn_cast<emitrust::ArrayType>(valueType))

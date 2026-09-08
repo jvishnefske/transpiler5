@@ -105,6 +105,14 @@ constexpr BlockerSubstring kBlockerSubstrings[] = {
      llvm::StringLiteral("ptr-to-ptr-shape-escape")},
     {llvm::StringLiteral("pointer-to-pointer"),
      llvm::StringLiteral("ptr-to-ptr")},
+    // A negative element index below a Phase-1b slice parameter's origin.
+    // The slice starts at the pointee, so the earlier elements the C code
+    // reads are not in it; the owner lowering (an i64 cursor into the whole
+    // object) represents the same access exactly, which makes this a model
+    // gap rather than a language gap and worth its own row. Mirrored into
+    // test/RealWorld/run_realworld.py at the same position.
+    {llvm::StringLiteral("negative element index through a slice parameter"),
+     llvm::StringLiteral("slice-param-negative-index")},
     {llvm::StringLiteral("returned pointer value"),
      llvm::StringLiteral("returned-pointer")},
     {llvm::StringLiteral("pointer return type"),

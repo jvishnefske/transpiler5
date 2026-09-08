@@ -111,9 +111,24 @@ ActorLiftAttachment emitrustcc::attachActorLiftAttributes(
   // FR-53's verbatim opt-out applies to every name DERIVED from a C
   // spelling; synthesized type/variable names are new names and keep the
   // idiomatic rules.
+  // A name derived here is MEMBER-class: it becomes an actor struct field
+  // or a `c_main` binding, and never leaves that namespace. So a spelling
+  // that lands on a Rust keyword takes `mangleMemberName`'s single
+  // trailing underscore rather than the file-scope REJECTION global names
+  // get. The rejection cannot cover this case anyway: the importer refuses
+  // a global whose emitted symbol is a keyword, but under the FR-53
+  // idiomatic rename `pub` emits as `PUB`, which is not one -- and
+  // `toSnakeCase` turns it straight back into `pub` here. Both lowerings
+  // then shipped a bare keyword and the crate failed to PARSE (measured:
+  // "expected identifier, found keyword `pub`" for both the demoted local
+  // `let mut pub: i32 = 5;` and the lifted field `struct PubActor { pub:
+  // i32 }`), the silently-unbuildable outcome the repo forbids.
   auto derivedName = [preserveCNames](llvm::StringRef symbol) {
-    return preserveCNames ? symbol.str()
-                          : mlir::emitrust::toSnakeCase(symbol);
+    std::string name =
+        preserveCNames ? symbol.str() : mlir::emitrust::toSnakeCase(symbol);
+    if (mlir::emitrust::isRustKeyword(name))
+      name += "_";
+    return name;
   };
 
   // -- Module indices.
@@ -482,6 +497,23 @@ ActorLiftAttachment emitrustcc::attachActorLiftAttributes(
     }
     for (const auto &[globalSymbol, field] : entry.fields)
       localGlobals.push_back({globalSymbol, derivedName(globalSymbol)});
+  }
+
+  // -- The keyword mangle above can make two distinct globals derive ONE
+  // binding name (`pub` and `pub_` both become `pub_`). Two globals must
+  // never share a `c_main` binding, so the later one keeps its module-level
+  // form instead of being silently merged into the earlier one -- the same
+  // "collision: keep today's shape" fallback the actor-field paths take
+  // (`fieldCollision` above, and the static-cell skip). The struct-field
+  // side needs no guard here: its collision checks already run before the
+  // driver-only split.
+  {
+    llvm::StringSet<> takenLocalNames;
+    llvm::SmallVector<std::pair<std::string, std::string>> guardedLocals;
+    for (auto &local : localGlobals)
+      if (takenLocalNames.insert(local.second).second)
+        guardedLocals.push_back(std::move(local));
+    localGlobals = std::move(guardedLocals);
   }
 
   // -- Attachment.
