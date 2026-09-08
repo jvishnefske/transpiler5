@@ -241,6 +241,31 @@ inline constexpr llvm::StringLiteral kAbiUnfaithfulReasonAttrName =
 inline constexpr llvm::StringLiteral kExternalsGenericAttrName =
     "emitrust.externals_generic";
 
+/// FR-208: name of the discardable `emitrust.func` string attribute carrying
+/// the function's ORIGINAL C LINKAGE SPELLING — the symbol a C caller
+/// actually links against — for the cases where the FR-53 idiomatic rename
+/// moved it. Its value is exactly what `--preserve-c-names` would have
+/// emitted (`cFunctionSymbolName` with the rename disabled), which is the
+/// oracle the FR names: `int SPX_add(int, int)` carries `"SPX_add"` while its
+/// emitted item is `spx_add`.
+///
+/// `--c-abi-exports` is the ONLY consumer. Its whole contract is "there is a
+/// bare symbol to dlsym", and before FR-208 both `#[no_mangle]` and
+/// `#[export_name]` were written from the MLIR symbol — so a C program with
+/// any non-snake_case name got a shared object exporting a name it never had
+/// (`nm -D` showing `T spx_initialize_hash_function` against the host's
+/// `undefined reference to 'SPX_initialize_hash_function'`, measured).
+///
+/// Set by the importer on exactly the declarations that can ever be exported
+/// AND whose spelling actually moved: externally visible, C language linkage
+/// (so a C++-linkage name — whose real symbol is an Itanium mangling neither
+/// spelling approximates — keeps the historical behavior untouched), and
+/// verbatim name != emitted symbol. Every other function carries no attribute
+/// at all, which is what keeps every pre-FR-208 module byte-identical: the
+/// emitter falls back to the item name and emits the same `#[no_mangle]` it
+/// always did.
+inline constexpr llvm::StringLiteral kCSymbolAttrName = "emitrust.c_symbol";
+
 /// FR-52: the name of the emitted trait. A project defining an item with this
 /// name is a located error rather than a silent clash — see
 /// `emitrust-lower-external-requirements`.
