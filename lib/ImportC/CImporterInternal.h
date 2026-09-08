@@ -8184,6 +8184,16 @@ static inline const clang::Stmt *findLadderHazard(const clang::Stmt *stmt,
   return nullptr;
 }
 
+/// Whether control leaving `stmt` can reach the statement that textually
+/// follows it. The list is the set of statements that transfer control
+/// unconditionally somewhere else; note that a `break` or `continue` here
+/// need not target the switch -- whatever it targets, the NEXT statement is
+/// not reached, which is the only question asked.
+static inline bool switchStmtFallsThrough(const clang::Stmt *stmt) {
+  return !llvm::isa<clang::ReturnStmt, clang::BreakStmt, clang::ContinueStmt,
+                    clang::GotoStmt, clang::IndirectGotoStmt>(stmt);
+}
+
 /// FR-198. Whether a switch section made of `stmts` (the top-level
 /// statements between its label chain and the next one) can fall into the
 /// following section.
@@ -8197,8 +8207,116 @@ static inline bool
 switchSectionFallsThrough(llvm::ArrayRef<const clang::Stmt *> stmts) {
   if (stmts.empty())
     return true;
-  return !llvm::isa<clang::ReturnStmt, clang::BreakStmt, clang::ContinueStmt,
-                    clang::GotoStmt, clang::IndirectGotoStmt>(stmts.back());
+  return switchStmtFallsThrough(stmts.back());
+}
+
+/// FR-207. Collects, in source order, one entry per label SECTION of the
+/// switch whose body is being walked, each entry recording whether control
+/// can FALL INTO that section from the statement textually before it.
+///
+/// This is the `emitDispatchSwitch` counterpart of the section partition
+/// `emitSwitchStmt` builds for a plain body. A plain body's labels are all
+/// top-level children of one compound, so the partition is a flat scan; a
+/// dispatch body's labels sit at arbitrary depth (Duff's device puts them
+/// inside a loop, and the common "ladder wrapped in an `if`" puts them one
+/// compound down), so the scan has to recurse.
+///
+/// The fall-in flag is an OVER-approximation on purpose: it is false only
+/// where a preceding sibling PROVES control cannot arrive (the sibling ends
+/// the flow), and true wherever the walk cannot tell -- a label that opens a
+/// compound, or one whose predecessor is itself a compound. Over-approximating
+/// can only make the measured chain longer, i.e. the bound below stricter,
+/// never a missed hang.
+///
+/// A chain of labels (`case 0: case 1: X;`) is ONE section, exactly as the
+/// plain path treats it, and a nested `switch` is skipped whole: its labels
+/// bind to it, not to this switch, so none of them appear in this switch's
+/// `getSwitchCaseList` either.
+static inline void
+collectDispatchSwitchSections(const clang::Stmt *stmt, bool mayFallIn,
+                              llvm::SmallVectorImpl<bool> &sections) {
+  if (!stmt || llvm::isa<clang::SwitchStmt>(stmt))
+    return;
+  if (const auto *label = llvm::dyn_cast<clang::SwitchCase>(stmt)) {
+    sections.push_back(mayFallIn);
+    const clang::Stmt *sub = label->getSubStmt();
+    while (const auto *inner =
+               llvm::dyn_cast_if_present<clang::SwitchCase>(sub))
+      sub = inner->getSubStmt();
+    // The section's own body is entered from the label, so it always "falls
+    // in"; any label found below it starts the NEXT section.
+    collectDispatchSwitchSections(sub, /*mayFallIn=*/true, sections);
+    return;
+  }
+  if (const auto *compound = llvm::dyn_cast<clang::CompoundStmt>(stmt)) {
+    const clang::Stmt *previous = nullptr;
+    for (const clang::Stmt *child : compound->body()) {
+      bool childFallsIn = true;
+      if (previous) {
+        // Peel a label chain off the predecessor so that `case 0: break;`
+        // is recognised as ending the flow, matching how the plain path
+        // measures a section whose statements are already peeled.
+        const clang::Stmt *tail = previous;
+        while (const auto *label = llvm::dyn_cast<clang::SwitchCase>(tail))
+          tail = label->getSubStmt();
+        childFallsIn = tail && switchStmtFallsThrough(tail);
+      }
+      collectDispatchSwitchSections(child, childFallsIn, sections);
+      previous = child;
+    }
+    return;
+  }
+  for (const clang::Stmt *child : stmt->children())
+    collectDispatchSwitchSections(child, /*mayFallIn=*/true, sections);
+}
+
+/// FR-207. The longest run of consecutive label sections of `stmt` that can
+/// fall into one another, measured over a body the structured path could not
+/// shape. This is the quantity `lift-cf-to-scf` duplicates in: a run of N
+/// emits about N^2/2 copies of the section bodies.
+static inline unsigned
+dispatchSwitchFallThroughChain(const clang::SwitchStmt *stmt) {
+  llvm::SmallVector<bool> sections;
+  collectDispatchSwitchSections(stmt->getBody(), /*mayFallIn=*/true, sections);
+  unsigned longest = sections.empty() ? 0 : 1;
+  for (unsigned index = 1, run = 1; index < sections.size(); ++index) {
+    run = sections[index] ? run + 1 : 1;
+    longest = std::max(longest, run);
+  }
+  return longest;
+}
+
+/// FR-207. The statement of `body` that costs the switch its structured
+/// lowering, for use as the `note:` of the fall-through-chain rejection. It
+/// covers `isPlainSwitchBody`'s two clauses and returns null when the body is
+/// in fact plain. `precedesFirstLabel` distinguishes them so the note can say
+/// WHICH clause fired.
+///
+/// The nested-label clause is tested FIRST for each child, and the location
+/// returned for it is the buried LABEL rather than the statement burying it:
+/// a body like `switch (x) { if (c) { case 0: ... } }` satisfies both clauses
+/// at once, and "the labels are nested" is the actionable half.
+static inline const clang::Stmt *
+nonPlainSwitchBodyBlocker(const clang::CompoundStmt *body,
+                          bool &precedesFirstLabel) {
+  precedesFirstLabel = false;
+  bool seenLabel = false;
+  for (const clang::Stmt *child : body->body()) {
+    const clang::Stmt *statement = child;
+    bool isLabel = llvm::isa<clang::SwitchCase>(child);
+    if (isLabel) {
+      seenLabel = true;
+      while (const auto *label = llvm::dyn_cast<clang::SwitchCase>(statement))
+        statement = label->getSubStmt();
+    }
+    if (const clang::Stmt *nested = findNestedSwitchLabel(statement))
+      return nested;
+    if (!isLabel && !seenLabel) {
+      precedesFirstLabel = true;
+      return child;
+    }
+  }
+  return nullptr;
 }
 
 /// FR-198. The longest fall-through chain a switch body may carry before the
@@ -8217,6 +8335,19 @@ switchSectionFallsThrough(llvm::ArrayRef<const clang::Stmt *> stmts) {
 /// not occur in any corpus -- every c-testsuite, Cpp17Suite, TRACTOR and
 /// RealWorld program compiles today -- and the ones that do occur in the
 /// ladder shape are now lowered linearly instead of being rejected.
+///
+/// FR-207 applies the SAME limit to the `emitDispatchSwitch` path, which
+/// FR-198 left unbounded. Re-measured there on a fall-through chain nested
+/// one compound down (`switch (x) { if (c) { case 0: ...; case 1: ...; } }`,
+/// the shape that routes to the dispatch lowering), the growth is the same
+/// law and very nearly the same constants: 438/2285/6565/14300/44236/100283
+/// emitted lines and 0.11/0.11/0.31/1.11/9.72/48.26s at N=8/16/24/32/48/64,
+/// against 445/2292/6572/14307/../44243 lines for the plain path FR-197
+/// measured -- i.e. the nesting changes the ROUTE, not the blowup. The same
+/// chain with a `break` in every section is exactly linear (3N + 11 lines,
+/// 0.11s flat at N=128), which is what pins the chain, and not the label
+/// count, as the quantity to bound. 32 costs 1.11s here, matching the plain
+/// path's 0.86s, so the two paths share one limit and one justification.
 static constexpr unsigned kMaxSwitchFallThroughChain = 32;
 
 /// Returns true if `type` is an MLIR unsigned integer type (the mapping of

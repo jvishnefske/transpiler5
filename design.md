@@ -12527,7 +12527,7 @@ piece and becomes FR-45.
   `__emitrust_cstr`) is now pinned rather than assumed. Gate 967/967; clippy
   132 -> 132 (+0) on the same epoch-6 pin.
 
-- [ ] FR-192 DEFECT (opened 2026-09-03 by FR-191, which found it and
+- [x] FR-192 DEFECT (opened 2026-09-03 by FR-191; LANDED 2026-09-08, and it
   deliberately preserved it unchanged): **A `%s` ARGUMENT IS MATERIALIZED AT
   ARGUMENT-LOWERING TIME, NOT READ AT CONVERSION TIME, SO A LATER ARGUMENT
   THAT WRITES THE BUFFER IS LOST.**
@@ -12547,6 +12547,59 @@ piece and becomes FR-45.
   borrow rules -- reading the buffer at conversion time means holding a
   borrow across the evaluation of an argument that mutably borrows the same
   buffer -- so it is genuinely its own FR and needs a spike, not a patch.
+  **LANDED 2026-09-08, AND THE PARAGRAPH ABOVE IS WRONG ABOUT ITS OWN
+  BLOCKER.** There is no borrow problem. Deferring the ENTIRE `%s` read --
+  not just the deref -- past the later arguments puts the shared borrow AFTER
+  the mutable one, so nothing spans anything:
+  `let v7 = buf.tu0_bump(0);` then `let v8: &[i8] = &buf.data[0..];` then
+  `__emitrust_cstr(v8)`. The snapshot-vs-borrow dilemma was imaginary; the
+  ordering was the whole problem.
+  **WELL-DEFINEDNESS CHECKED FIRST, and it is determinate C, not UB.** C17
+  6.5.2.2p10 leaves argument EVALUATION ORDER unspecified but places a
+  sequence point before the call, and the array-to-pointer decay of `buf`
+  does not ACCESS the array's stored value -- it only forms an address -- so
+  there is no unsequenced read/write conflict. All argument side effects
+  complete, then `printf` reads the pointee at conversion time. clang and gcc
+  agree: `[Bb] 1`. The contrast is pinned in the tests: a `%d` argument IS
+  read during argument evaluation, so a later argument writing that object
+  IS an unsequenced conflict and IS plain UB -- no such shape is pinned, and
+  only `%s` is reordered.
+  **IT IS THREE DEFECTS SHARING ONE PREDICATE, NOT ONE.** FR-191's ordering
+  fence was never applied to the ARGV bypass, for `%s` AND for `%c`, both of
+  which wrote raw bytes to stdout at argument-lowering time. That is an
+  output-order inversion that is wrong even for pure ASCII: native
+  `<1>[hello] 1` versus emitted `[hello<1>] 1`. Both were live miscompiles,
+  measured independently. The 12-shape test had 9 of 12 lines wrong at
+  baseline.
+  One shared `laterArgSideEffects` predicate now replaces three duplicated
+  loops and drives BOTH consequences (bypass declined / `%s` deferred). A
+  deferred `%s` reserves an operand slot filled by `materializeDeferredStrings`
+  at end-of-scan AND inside `flushSegment`, so a later directive's own raw
+  bypass can never flush a segment holding an unfilled slot (pinned as cases
+  11-12). A declined argv `%s` is DEFERRED rather than rejected, so no shape
+  is lost. Two exclusions keep the reordering minimal: a string literal or
+  `__func__` argument is immutable and never moves, and a `%s` argument with
+  its OWN side effects is left alone, because C leaves that order unspecified
+  and reordering would gratuitously diverge from the native.
+  CAPABILITY COST: **none.** No shape that imported before now refuses. The
+  only property given up is the raw-byte rendering for an argv `%s` in front
+  of a side-effecting argument, which falls back to the Latin-1
+  `__emitrust_cstr` funnel -- exactly the trade FR-191 already recorded, and
+  strictly better than the ordering inversion it replaces.
+  THREE PRE-EXISTING GOLDENS SHIFTED, all correct and all verified by a
+  paired `--emit=rust` sweep over 746 sources: FR-191's own
+  `printf-string-nonascii.c` and `printf-string-raw-bytes.c` contain the
+  FR-192 shape and now emit the call before the `cstr`; and
+  `stl-vector-element-member-write.cpp`, where `v[i]` is `operator[]` -- a
+  call -- so the predicate conservatively defers past seven vector reads.
+  Semantically inert, and the predicate was kept IDENTICAL to FR-191's rather
+  than loosened. The emit-failure set was byte-identical before and after.
+  Gate 1017/1017 (combined with FR-207); clippy 101 -> 101 (+0); both
+  ratchets unmoved; TRACTOR 41/252.
+  INCIDENTAL, ORTHOGONAL, NOT FIXED: a `const char *` slice parameter is
+  rejected in `%s` even as `f(const char *s) { printf("C[%s]", s); }` when
+  the buffer is a loop-filled local array. Reproduces identically on the
+  BASELINE tool, so it predates this work.
 
 - [ ] FR-193 (opened 2026-09-04 by a 10-agent adversarial differential hunt,
   33 agents / 997 probes / 0 errors): **THE CORRECTNESS SIGNAL WAS NOT CLEAN.
@@ -13377,6 +13430,93 @@ piece and becomes FR-45.
   `long double` with a located diagnostic, keeping the f64 mapping for
   storage, conversion, passing and printing. A real 80-bit type is not
   available -- Rust has no `f80`.
+
+- [x] FR-207 (opened and LANDED 2026-09-08; closes FR-197's SECOND residual,
+  the unbounded `emitDispatchSwitch` path): **THE WORST DISPATCH SHAPE IS NOT
+  DUFF'S DEVICE, AND THE BLOWUP IS NOT IN THE TAIL COPIES. BOTH OF THOSE
+  CORRECT THE PROSE THAT SENT ME HERE.**
+  FR-198 bounded the PLAIN switch path and left the dispatch path unbounded,
+  framing the residual as Duff-specific -- "a Duff's-device-shaped body, whose
+  labels nest inside inner statements". **MEASURED, DUFF IS THE MILDER
+  SHAPE.** The worst is an ordinary fall-through ladder wrapped in one `if`:
+  `switch (x) { if (c) { case 0: ...; case 1: ...; } }`, which reproduces
+  FR-197's PLAIN-path curve almost constant-for-constant (438 vs 445 emitted
+  lines at N=8; 14300 vs 14307 at N=32). The nesting changes the ROUTE, not
+  the blowup. Duff at N=32/40/48/64 is 0.41/0.91/2.11/6.32s where the wrapped
+  ladder at N=48/64/80 is 9.72/48.26/192.70s.
+  **FR-197's "NOT MEASURED: the exact N at which the pipeline crosses a
+  practical timeout" is now measured for this path.** N=80 finishes in
+  192.70s; **N=100 does not finish in 400s and emits NOTHING AT ALL -- no
+  output, no diagnostic, rc=124.** That is the defect: a hang, not a slow
+  compile.
+  Output growth is QUADRATIC, pinned by an exactly constant second difference
+  of 192 over the Duff series (232/624/1208/1984/2952/4112 at N=4..24). Wall
+  time is far worse than the output it produces -- N=48 -> 80 is 1.67x in N
+  for 19.8x in time (about N^5.8) -- consistent with FR-197's "two multiplying
+  costs" and with FR-197's own correction that the node splitting is
+  QUADRATIC, not exponential.
+  **THE DECISIVE CONTROL, which is what makes the bound a scalpel:** the same
+  nesting and the same label count with every section ending in `break` is
+  EXACTLY LINEAR -- `3N + 11` lines, 0.11s flat to N=128. So the quantity to
+  bound is the FALL-THROUGH CHAIN, not the label count. A label-count bound
+  would have over-rejected every large-but-linear switch, and the control is
+  the evidence that it would have.
+  `emitDispatchSwitch` now measures the longest run of consecutive label
+  sections that can fall into one another (`dispatchSwitchFallThroughChain`, a
+  recursive source-order scan, because dispatch-path labels sit at arbitrary
+  depth) and refuses past the SAME `kMaxSwitchFallThroughChain = 32` FR-198
+  chose. The fall-in flag is a deliberate OVER-approximation -- false only
+  where a preceding sibling proves control cannot arrive -- so the measured
+  chain can only be longer than reality, never shorter, and no hang slips
+  past. Boundary verified exactly: 32 imports, 33 rejects.
+  **FR-197's MECHANISM CLAIM IS ONLY PARTLY CONFIRMED.** Its constant-counting
+  reproduces (constants for cases 31/25/15/5/2 appear 3/15/36/57/64 times at
+  N=32, the (N-k+1) ramp), but section BODIES are not duplicated: 32 distinct
+  `printf` format strings each appear EXACTLY ONCE in the emitted Rust, and
+  growing each section body 16x costs almost nothing at the bound
+  (14300 -> 14301 lines for a non-collapsing xor chain; linear at ~64
+  lines/statement for side-effecting calls). The N^2/2 cost is in the
+  control-flow skeleton and small rematerialized constants, NOT in full tail
+  copies. This also settles the residual worry the increment opened with:
+  bounding section COUNT does bound the blowup, because section SIZE does not
+  multiply it.
+  WHERE THE BOUND BITES, censused rather than guessed (a temporary probe hook
+  set the limit to 1 so every dispatch switch reported its chain; the hook was
+  removed and the tool rebuilt before any gate run): EndToEnd/Import/Driver/
+  Link 4 switches with chain > 1, max 8; c-testsuite 2 (`00143.c`, `00213.c`),
+  max 8; Cpp17Suite/RealWorld 0; TRACTOR 0. **The largest real chain anywhere
+  is 8 against a bound of 32 -- 4x headroom.** To hit it a program needs 33+
+  consecutive fall-through sections whose labels are not top-level children of
+  the switch body: a Duff's device unrolled more than 32 ways (canonical is
+  8), or a 33+ case ladder wrapped in an `if`/loop/block or preceded by a
+  statement.
+  The error text is SHARED with FR-198's plain-path bound (same defect, same
+  limit, same justification); only the note differs, naming which construct
+  forced the duplicating dispatch lowering. Under `--recover`/`--incremental`
+  it degrades to a warning plus an `unimplemented!()` stub with the note
+  preserved, and TERMINATES -- that was on FR-198's own NOT VERIFIED list and
+  is verified here for the dispatch bound. Every RUN line carries
+  `timeout 120` so a regression to hanging fails fast instead of wedging the
+  suite until lit's 600s cap.
+  GOLDEN MOVEMENT ZERO, verified directly rather than inferred from passing
+  goldens: the pre-patch binary's emitted crate diffed against the patched
+  one over 1,284 corpus inputs -- 929 byte-identical, 355 rejected identically
+  by both, 0 moved, 0 status-flips. (A first sweep reported 355 false "MOVED"
+  by counting files both tools reject; the corrected sweep distinguishes
+  them, and the false alarm is recorded because the naive sweep is the
+  obvious thing for the next person to write.)
+  CAPABILITY COST, stated plainly: inputs with a dispatch-routed fall-through
+  chain above 32 that previously compiled -- slowly -- now hard-fail.
+  Concretely N=33..80 went from "compiles in 0.1s-193s" to "rejected". Nothing
+  is silently truncated; it is a located error, and `--recover` stubs it.
+  NOT DONE: the dispatch path still LOWERS quadratically below the bound;
+  making it linear needs the guarded-sequence recogniser generalised to labels
+  at arbitrary depth, which the corpus census says buys nothing measurable
+  today. **FR-197 remains OPEN on its last residual, the `goto` ladder at
+  29.7s/83k lines**, already re-measured twice and deliberately not touched
+  again here.
+  Gate 1015/1015; clippy 101 -> 101 (+0); CTestSuite 220/220 and Cpp17Suite
+  35/35 unmoved; TRACTOR 41/252 unchanged.
 
 - [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
   FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED
