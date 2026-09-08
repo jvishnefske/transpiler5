@@ -1,0 +1,62 @@
+# Traefik dynamic configuration, applied on the Traefik host (192.168.1.185).
+#
+# Topology:
+#   internet / LAN  ->  Traefik @ 192.168.1.185  ->  emitrust @ 192.168.1.202:8080
+#
+# The service binds 127.0.0.1 on .202 and is reached over the LAN through
+# whatever ingress you already terminate on .185; if .202's uvicorn must be
+# reachable from .185 directly, bind 0.0.0.0 there and firewall the port to
+# .185 only. Do not expose 8080 to the internet -- the app trusts
+# X-Forwarded-* headers.
+
+http:
+  routers:
+    emitrust:
+      rule: "Host(`vishnefske.com`) || Host(`www.vishnefske.com`)"
+      entryPoints:
+        - websecure
+      service: emitrust
+      middlewares:
+        - emitrust-headers
+        - emitrust-ratelimit
+      tls:
+        certResolver: letsencrypt
+
+  services:
+    emitrust:
+      loadBalancer:
+        servers:
+          - url: "http://192.168.1.202:8080"
+        passHostHeader: true
+        healthCheck:
+          path: /api/health
+          interval: "30s"
+          timeout: "5s"
+
+  middlewares:
+    emitrust-headers:
+      headers:
+        stsSeconds: 31536000
+        stsIncludeSubdomains: true
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        # Google Identity Services needs its script, frame and connect origins.
+        contentSecurityPolicy: >-
+          default-src 'self';
+          script-src 'self' https://accounts.google.com/gsi/client;
+          style-src 'self' 'unsafe-inline' https://fonts.googleapis.com;
+          font-src https://fonts.gstatic.com;
+          img-src 'self' data: https://lh3.googleusercontent.com;
+          connect-src 'self' https://accounts.google.com;
+          frame-src https://accounts.google.com;
+          base-uri 'none';
+          form-action 'self'
+
+    # A coarse backstop in front of the app's own per-account trial meter.
+    # This one bounds anonymous traffic, which the trial meter cannot see.
+    emitrust-ratelimit:
+      rateLimit:
+        average: 30
+        burst: 60
+        period: 1m

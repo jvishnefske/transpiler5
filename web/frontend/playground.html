@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>emitrust playground</title>
+<meta name="description" content="Paste C, get readable Rust. Every worked example is cached and free; compiling your own source starts a limited free trial.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,400;0,500;0,700;0,800;1,400&family=Source+Sans+3:ital,wght@0,400;0,600;1,400&display=swap">
+<link rel="stylesheet" href="/style.css">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>
+  /* A tool, not a document: summary before detail, state encoded in form. */
+
+  body { display: flex; flex-direction: column; min-height: 100vh; }
+
+  .shell {
+    flex: 1;
+    width: min(100% - 2rem, 1560px);
+    margin-inline: auto;
+    padding-block: 1.2rem 2rem;
+    display: grid;
+    grid-template-columns: 268px minmax(0, 1fr);
+    gap: 1.1rem;
+    align-items: start;
+  }
+  @media (max-width: 1080px) { .shell { grid-template-columns: 1fr; } }
+
+  /* ---- sidebar: the guided tour ---- */
+
+  .rail {
+    display: flex;
+    flex-direction: column;
+    gap: 0.9rem;
+    position: sticky;
+    top: 4.4rem;
+  }
+  @media (max-width: 1080px) { .rail { position: static; } }
+
+  .panel {
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+    overflow: hidden;
+  }
+
+  .panel__head {
+    padding: 0.6rem 0.85rem;
+    border-bottom: 1px solid var(--rule);
+    background: var(--surface-raised);
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--ink-muted);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .panel__body { padding: 0.7rem 0.85rem 0.9rem; }
+
+  .examples { display: flex; flex-direction: column; }
+
+  .example {
+    text-align: left;
+    background: none;
+    border: 0;
+    border-bottom: 1px solid var(--rule);
+    padding: 0.7rem 0.85rem;
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    transition: background 0.12s ease;
+  }
+  .example:last-child { border-bottom: 0; }
+  .example:hover { background: var(--accent-wash); }
+  .example[aria-current="true"] {
+    background: var(--accent-wash);
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
+
+  .example__title {
+    font-family: var(--font-code);
+    font-weight: 700;
+    font-size: var(--step--1);
+    letter-spacing: -0.01em;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .example__blurb { font-size: var(--step--1); color: var(--ink-muted); line-height: 1.45; }
+
+  .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--sig-ok);
+    flex: none;
+  }
+  .dot--live { background: var(--accent); }
+
+  /* ---- options ---- */
+
+  .opt { display: flex; flex-direction: column; gap: 0.3rem; margin-bottom: 0.8rem; }
+  .opt:last-child { margin-bottom: 0; }
+  .opt > label {
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    color: var(--ink-muted);
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+  }
+
+  select {
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    padding: 0.4rem 0.5rem;
+    border: 1px solid var(--rule-strong);
+    border-radius: var(--radius);
+    background: var(--surface-raised);
+    color: var(--ink);
+    width: 100%;
+  }
+
+  .checks { display: flex; flex-direction: column; gap: 0.42rem; }
+
+  .check {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    cursor: pointer;
+    line-height: 1.4;
+  }
+  .check input { margin-top: 0.15rem; accent-color: var(--accent); flex: none; }
+  .check span { color: var(--ink-muted); }
+  .check input:checked + span { color: var(--ink); }
+
+  /* ---- main workspace ---- */
+
+  .work { display: flex; flex-direction: column; gap: 0.9rem; min-width: 0; }
+
+  .actionbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.7rem;
+    padding: 0.7rem 0.85rem;
+    border: 1px solid var(--rule);
+    border-radius: var(--radius-lg);
+    background: var(--surface);
+  }
+
+  .actionbar__spacer { flex: 1; min-width: 0; }
+
+  .status {
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    color: var(--ink-muted);
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    min-width: 0;
+  }
+
+  .panes {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 0.9rem;
+    align-items: stretch;
+  }
+  @media (max-width: 1080px) { .panes { grid-template-columns: 1fr; } }
+
+  .editor {
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    line-height: 1.65;
+    tab-size: 4;
+    width: 100%;
+    min-height: 460px;
+    border: 0;
+    padding: 0.9rem;
+    background: transparent;
+    color: var(--ink);
+    resize: vertical;
+    outline: none;
+  }
+
+  .out { min-height: 460px; }
+  .out pre { margin: 0; }
+
+  .placeholder {
+    padding: 2.5rem 1.2rem;
+    text-align: center;
+    color: var(--ink-faint);
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    line-height: 1.7;
+  }
+
+  /* ---- the sign-in wall ---- */
+
+  .wall {
+    padding: 1.6rem 1.3rem 1.8rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.9rem;
+    text-align: center;
+  }
+  .wall h3 { font-size: var(--step-1); }
+  .wall p { color: var(--ink-muted); font-size: var(--step--1); line-height: 1.6; max-width: 46ch; }
+  .wall__why {
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    color: var(--ink-faint);
+    border-top: 1px solid var(--rule);
+    padding-top: 0.8rem;
+    margin-top: 0.3rem;
+    max-width: 48ch;
+  }
+
+  /* ---- account chip in the masthead ---- */
+
+  .account { display: flex; align-items: center; gap: 0.6rem; }
+  .avatar { width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--rule-strong); }
+  .meter {
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    color: var(--ink-muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .meter b { color: var(--accent); }
+
+  .filetabs { display: flex; gap: 0.3rem; flex-wrap: wrap; }
+  .filetab {
+    font-family: var(--font-code);
+    font-size: var(--step--1);
+    padding: 0.15rem 0.5rem;
+    border: 1px solid var(--rule);
+    border-radius: var(--radius);
+    background: var(--bg);
+    color: var(--ink-muted);
+    cursor: pointer;
+  }
+  .filetab[aria-selected="true"] { background: var(--accent-wash); color: var(--accent); border-color: var(--accent-edge); }
+
+  .spin {
+    width: 11px; height: 11px;
+    border: 2px solid var(--rule-strong);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+    flex: none;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header class="masthead">
+  <div class="wrap masthead__inner">
+    <a class="brand" href="/">emitrust<span class="brand__arrow">→</span>rs</a>
+    <div class="account">
+      <span class="meter" id="meter"></span>
+      <div id="gsi-button"></div>
+      <button class="btn btn--ghost" id="signout" hidden>Sign out</button>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+
+  <!-- Rail: the tour, then the option surface. -->
+  <aside class="rail">
+    <section class="panel">
+      <div class="panel__head">
+        <span>Examples</span>
+        <span class="chip chip--free">free</span>
+      </div>
+      <div class="examples" id="examples">
+        <div class="placeholder">loading…</div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel__head"><span>Output</span></div>
+      <div class="panel__body">
+        <div class="opt">
+          <label for="emit">emit</label>
+          <select id="emit">
+            <option value="rust">Rust source</option>
+            <option value="crate">Cargo crate</option>
+            <option value="mlir">MLIR (emitrust dialect)</option>
+            <option value="actor-plan">Actor plan</option>
+          </select>
+        </div>
+        <div class="opt">
+          <label for="language">language</label>
+          <select id="language">
+            <option value="c">C</option>
+            <option value="cpp">C++</option>
+          </select>
+        </div>
+        <div class="opt">
+          <label for="actor_mode">actor runtime</label>
+          <select id="actor_mode">
+            <option value="same-thread">same thread</option>
+            <option value="threaded">std::thread + mailbox</option>
+            <option value="async">tokio task</option>
+          </select>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel__head"><span>Flags</span></div>
+      <div class="panel__body checks">
+        <label class="check"><input type="checkbox" id="preserve_c_names"><span>preserve C names</span></label>
+        <label class="check"><input type="checkbox" id="recover"><span>recover past rejections</span></label>
+        <label class="check"><input type="checkbox" id="c_abi_exports"><span>C-ABI exports</span></label>
+        <label class="check"><input type="checkbox" id="incremental"><span>incremental (crate only)</span></label>
+        <label class="check"><input type="checkbox" id="no_actor_lift"><span>disable actor lift</span></label>
+      </div>
+    </section>
+  </aside>
+
+  <!-- Workspace -->
+  <main class="work">
+
+    <div class="actionbar">
+      <button class="btn" id="run">Transpile</button>
+      <div class="status" id="status">Pick an example, or paste your own C.</div>
+      <span class="actionbar__spacer"></span>
+      <span class="chip" id="lane" hidden></span>
+    </div>
+
+    <div class="panes">
+      <section class="codepane">
+        <div class="codepane__bar">
+          <span class="codepane__name" id="srcname">input.c</span>
+          <span id="srcmeta">editable</span>
+        </div>
+        <textarea class="editor" id="source" spellcheck="false"
+          aria-label="C or C++ source"></textarea>
+      </section>
+
+      <section class="codepane out">
+        <div class="codepane__bar">
+          <span class="codepane__name" id="outname">output</span>
+          <div class="filetabs" id="filetabs"></div>
+        </div>
+        <div class="codepane__body" id="output">
+          <div class="placeholder">
+            Choose an example on the left.<br>
+            Cached results appear instantly and cost nothing.
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <div id="diagnostics"></div>
+  </main>
+</div>
+
+<footer class="footer">
+  <div class="wrap" style="display:flex; flex-wrap:wrap; gap:1rem; justify-content:space-between;">
+    <span>Cached results are free and unmetered. Live compiles use your trial allowance.</span>
+    <a href="/">About emitrust</a>
+  </div>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>
