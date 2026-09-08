@@ -13731,7 +13731,8 @@ piece and becomes FR-45.
   ratchets unmoved; TRACTOR 41/252. The EndToEnd test builds a 14,810-line
   crate whose 126 lines of stdout are byte-identical to the clang native.
 
-- [ ] FR-208 DEFECT (opened 2026-09-08 by the FR-178 re-measurement spike):
+- [x] FR-208 DEFECT (opened and LANDED 2026-09-08; found by the FR-178
+  re-measurement spike):
   **`--c-abi-exports` EXPORTS A SYMBOL THE C PROGRAM NEVER HAD, whenever the
   C name is not already lowercase.**
   The flag's whole contract is "there is a bare symbol to dlsym".
@@ -13765,6 +13766,71 @@ piece and becomes FR-45.
   correctly and loudly (`error: unsupported: function 'foo' emits as 'foo',
   which collides with 'FOO'`), so the machinery to reason about the two
   spellings partly exists.
+  **LANDED 2026-09-08. A THIRD DEFECT SITE THE ENTRY DID NOT NAME**, plus one
+  correction to the fix it proposed.
+  The third site is `TranslateToRust.cpp:5567`, the FR-179 ACTOR wrapper,
+  which had the same `#[no_mangle]` + `wrapper.symbol` bug. Fixed and pinned
+  alongside the other two.
+  **THE PROPOSED FIX WAS SUBTLY WRONG: `func->getName()` is NOT the string to
+  carry.** The oracle this entry named -- `--preserve-c-names` -- and the raw
+  C identifier are different strings. The implementation therefore calls the
+  SAME `cFunctionSymbolName` with `idiomaticRenameEnabled()` temporarily off,
+  which is literally what preserve-c-names does, and so it preserves
+  `main` -> `c_main`, the Rust-keyword mangle, and FR-114's overload
+  suffixes. Carrying the raw name would have broken all three.
+  The C spelling was NOT already available: `emitrust.c_name` exists only on
+  `emitrust.variable` (`EmitRustOps.td:1420`), never on a func, so a new
+  `emitrust.c_symbol` attribute was genuinely necessary.
+  **THE ATTRIBUTE IS SET ONLY WHEN THE SPELLING DIFFERS, and that is what
+  keeps the goldens still.** FR-182 set `emitrust.abi_faithful`
+  unconditionally and moved goldens doing it; that was not available here.
+  Restricting to spelling-differs makes the attribute structurally invisible
+  to `emitrust-import-c`, which never enables the rename, so every
+  `test/Import` golden runs in verbatim mode where the two spellings are
+  equal by construction.
+  CLASS 0 had to change ATTRIBUTE KIND, not just its string: `#[no_mangle]`
+  can only export the item's own name, so a differing C spelling requires
+  `#[export_name]`.
+  **C++-LINKAGE FUNCTIONS ARE DELIBERATELY UNTOUCHED.** Their real symbol is
+  an Itanium mangling that NEITHER spelling approximates, and that is exactly
+  where a new collision could exist -- two C++ overloads can share a
+  spelling, two C functions in one program cannot. Restricting to
+  `isExternC()` removes the collision risk entirely.
+  `main` is excluded on purpose: the `main` -> `c_main` rename is
+  mode-independent, and a cdylib defining a dynamic `main` is a different
+  hazard.
+  MEASURED, `nm -D` on the cdylib: before `T spx_add  T spx_pair_sum`, after
+  `T SPX_add  T SPX_pair_sum`; a C host declaring the C spellings went from
+  `undefined reference to 'SPX_add'` / linker failure to linking, running,
+  printing `7 7`, exit 0. On the new EndToEnd test's own crate the unpatched
+  tool dies at `dlsym('SPX_add') failed: undefined symbol`, exit 1.
+  `--link` SHARDS HANDLED, NOT DEFERRED: the attribute survives shard
+  serialization (`emitrust-clang -c`, which forces the rename ON, then
+  `--link`, yields `#[export_name = "SPX_shard"]`), pinned by a SHARD leg.
+  And the collision it could have introduced DOES NOT EXIST: two distinct C
+  spellings folding onto one emitted symbol never reach the emitter, because
+  the merge already refuses them, located -- `error: duplicate definition of
+  'spx_alpha' at link` with a first-defined-here note. Since the C-name to
+  MLIR-symbol map is a function and MLIR symbols are unique per module,
+  export names are injective by construction. Pinned by a FOLD leg.
+  `--preserve-c-names` is now a NO-OP for the export name, proven at the
+  dlsym level rather than by reading text: the same host dlsyming the same C
+  spellings byte-diffs identically against the native for both crates.
+  GOLDEN MOVEMENT ZERO, measured as 2146 paired invocations per side over all
+  1073 `.c`/`.cpp` files under `test/`, in both flag states: **flag OFF (the
+  default, and what every golden uses) is 1073/1073 byte-identical**. Flag ON
+  shows 3 differences -- the intended `test-entry-rename.c` fix and two files
+  where the new attribute merely appears inside a diagnostic op-dump -- and
+  none of those three passes `--c-abi-exports`.
+  CAPABILITY COST, pinned so it cannot drift silently: a C name that is a
+  Rust KEYWORD still exports the mangled spelling (`match` exports `match_`).
+  The mangle applies in BOTH naming modes, so `--preserve-c-names` -- this
+  entry's own oracle -- produces `match_` too. Closing that needs a second,
+  mode-independent rule.
+  Gate 1023/1023; clippy 101 -> 101 (+0); both ratchets unmoved; **TRACTOR
+  41/252, unchanged -- which CONFIRMS the FR-178 census**: all five
+  uppercase-symbol cases are still EMIT_FAIL, so this fix scores +0 today
+  exactly as predicted.
 
 - [ ] FR-209 (opened 2026-09-08 by the FR-178 re-measurement spike; a NAMED
   CONSTRAINT that was previously invisible): **FR-100'S FORWARDING FIXPOINT

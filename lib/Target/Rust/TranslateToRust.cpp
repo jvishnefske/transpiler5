@@ -805,8 +805,12 @@ private:
     Location loc;
     /// The owner struct the FR-62 lift synthesized (`Tu0MBaseActor`).
     StringRef owner;
-    /// The bare C symbol, which is also the exported function's name.
+    /// The emitted symbol, which is also the wrapper ITEM's name.
     StringRef symbol;
+    /// FR-208: the symbol a C caller links against -- `symbol` unless the
+    /// FR-53 idiomatic rename moved the C spelling, in which case the
+    /// wrapper takes `#[export_name]` instead of `#[no_mangle]`.
+    StringRef cSymbol;
     /// The method's in-impl spelling, i.e. what the wrapper calls.
     StringRef printedName;
     /// The `pub ` the method itself carries.
@@ -836,8 +840,12 @@ private:
   struct CAbiPointerWrapper {
     /// The function's location, for the wrapper's type diagnostics.
     Location loc;
-    /// The bare C symbol, which `#[export_name]` binds.
+    /// The emitted symbol, from which the wrapper ITEM's name is derived.
     StringRef symbol;
+    /// FR-208: the symbol a C caller links against, which `#[export_name]`
+    /// binds -- `symbol` unless the FR-53 idiomatic rename moved the C
+    /// spelling.
+    StringRef cSymbol;
     /// The translated function's own name, i.e. what the wrapper calls.
     StringRef printedName;
     /// The `pub ` the function itself carries.
@@ -5564,8 +5572,16 @@ LogicalResult RustEmitter::emitCAbiActorWrappers() {
     while (llvm::is_contained(wrapper.argNames, actorName))
       actorName += "_";
     std::string singleton = actorSingletonName(wrapper.owner);
-    os << "#[no_mangle]\n"
-       << wrapper.visibility << "extern \"C\" fn " << wrapper.symbol << "(";
+    // FR-208: `#[no_mangle]` exports the ITEM's name, which is the FR-53
+    // idiomatic rename of the lifted C function. When the two spellings
+    // differ the wrapper takes `#[export_name]` with the C one instead, so
+    // the symbol a C caller links against is the one the C source declared;
+    // an unmoved name keeps the historical attribute byte for byte.
+    if (wrapper.cSymbol == wrapper.symbol)
+      os << "#[no_mangle]\n";
+    else
+      os << "#[export_name = \"" << wrapper.cSymbol << "\"]\n";
+    os << wrapper.visibility << "extern \"C\" fn " << wrapper.symbol << "(";
     for (auto [index, argName] : llvm::enumerate(wrapper.argNames)) {
       if (index)
         os << ", ";
@@ -5610,7 +5626,11 @@ LogicalResult RustEmitter::emitCAbiPointerWrappers() {
     noteBoundName(itemName);
     for (const std::string &argName : wrapper.argNames)
       noteBoundName(argName);
-    os << "#[export_name = \"" << wrapper.symbol << "\"]\n"
+    // FR-208: the exported SYMBOL is the C spelling (`wrapper.cSymbol`),
+    // which is `wrapper.symbol` unless the FR-53 idiomatic rename moved it;
+    // the ITEM's name stays derived from the emitted symbol so nothing else
+    // in the crate shifts.
+    os << "#[export_name = \"" << wrapper.cSymbol << "\"]\n"
        << wrapper.visibility << "unsafe extern \"C\" fn " << itemName << "(";
     // Class 1 only: a class-2 wrapper points at a scalar element and has no
     // struct_def symbol to leaf-name.
@@ -6114,6 +6134,13 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   if (auto rustName =
           op->getAttrOfType<StringAttr>(emitrust::kMethodRustNameAttrName))
     printedName = rustName.getValue();
+  // FR-208: the symbol a C caller actually links against. `emitrust.c_symbol`
+  // is present only where the FR-53 idiomatic rename MOVED the C spelling
+  // (see the attribute's own comment); absent it, the item name already IS
+  // the C symbol and the historical `#[no_mangle]` spelling is exact.
+  StringRef cAbiSymbol = printedName;
+  if (auto cSymbol = op->getAttrOfType<StringAttr>(emitrust::kCSymbolAttrName))
+    cAbiSymbol = cSymbol.getValue();
   // FR-140: the function's own name. A file-static's FR-73 per-TU prefix
   // composes onto the C spelling (`tu0_mix__up`), so a name that was clean
   // in C can still arrive here tripping.
@@ -6225,8 +6252,20 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
           << "': " << blocker
           << "; it stays a plain 'pub fn' and is not reachable by dlsym";
   }
-  if (cAbiExport)
-    os << "#[no_mangle]\n";
+  if (cAbiExport) {
+    // FR-208: `#[no_mangle]` exports the ITEM's name, and the item's name is
+    // the FR-53 idiomatic rename -- so `int SPX_add(int, int)` exported
+    // `spx_add`, a symbol the C program never had and no C caller can link
+    // against. When the importer carried the original C spelling (it does so
+    // only when the rename actually moved it), `#[export_name]` supplies THAT
+    // while the item, and every internal call site, stay byte for byte what
+    // they were. Equal spellings keep the historical `#[no_mangle]`, so every
+    // already-snake_case C program's crate is unchanged to the byte.
+    if (cAbiSymbol == printedName)
+      os << "#[no_mangle]\n";
+    else
+      os << "#[export_name = \"" << cAbiSymbol << "\"]\n";
+  }
   os << (inTraitImpl ? StringRef("") : itemVisibility(symbol))
      << (cAbiExport ? "extern \"C\" " : "")
      << (isAsyncFn ? "async fn " : "fn ") << printedName;
@@ -6286,13 +6325,13 @@ LogicalResult RustEmitter::emitFunc(emitrust::FuncOp funcOp) {
   }
   if (cAbiActorWrapper)
     cAbiActorWrappers.push_back(
-        {op->getLoc(), parentImpl.getStructName(), symbol, printedName,
-         itemVisibility(symbol), std::move(wrapperArgNames),
+        {op->getLoc(), parentImpl.getStructName(), symbol, cAbiSymbol,
+         printedName, itemVisibility(symbol), std::move(wrapperArgNames),
          std::move(wrapperArgTypes),
          fn.getNumResults() == 1 ? fn.getResultTypes().front() : Type()});
   if (cAbiPointerWrapper)
     cAbiPointerWrappers.push_back(
-        {op->getLoc(), symbol, printedName, itemVisibility(symbol),
+        {op->getLoc(), symbol, cAbiSymbol, printedName, itemVisibility(symbol),
          std::move(wrapperArgNames), std::move(wrapperArgTypes),
          fn.getNumResults() == 1 ? fn.getResultTypes().front() : Type(),
          cAbiVerdict.refIndex, cAbiVerdict.refIsMut,

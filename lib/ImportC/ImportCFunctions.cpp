@@ -1085,6 +1085,41 @@ LogicalResult CImporter::importFunction(const clang::FunctionDecl *func,
           builder.getStringAttr(fnRustName(cxxMethodSuffixedBaseName(
               cxxMethod))));
   }
+  // FR-208: carry the ORIGINAL C LINKAGE SPELLING when the FR-53 idiomatic
+  // rename moved it. `--c-abi-exports` writes `#[no_mangle]`/`#[export_name]`
+  // from the emitted symbol, and the emitted symbol is the RENAME — so
+  // `int SPX_add(int, int)` produced a shared object exporting `spx_add`, a
+  // name the C program never had, and the corpus host's dlsym returned null.
+  //
+  // The value is computed by the SAME `cFunctionSymbolName` with the rename
+  // switched off, not by a second naming rule: `--preserve-c-names` output is
+  // the FR's stated oracle for the target text, so deriving it from anything
+  // else would be a third spelling to keep in step. That also settles the
+  // shapes a hand-rolled `func->getName()` would get wrong -- `main` stays
+  // `c_main` (a mode-INDEPENDENT rename that preserve-c-names performs too,
+  // and a library crate has no business exporting `main`), a Rust-keyword C
+  // name keeps its `match_` mangle, and an FR-114 overload suffix survives.
+  //
+  // Attached only where it can ever matter, which is what keeps every
+  // pre-FR-208 module byte-identical:
+  //   * externally visible -- an internal-linkage function is never exported
+  //     (`--c-abi-exports` requires a non-empty item visibility);
+  //   * C language linkage -- a C++-linkage function's real symbol is an
+  //     Itanium mangling that NEITHER spelling approximates, so rewriting its
+  //     export name would be churn without a correctness gain, and it is also
+  //     where the new-collision risk lives (two C++ overloads share a C++
+  //     spelling; two C functions cannot share a C name in one program);
+  //   * the two spellings actually differ -- under `--preserve-c-names`, and
+  //     for every already-snake_case C name, there is nothing to carry.
+  if (func->isExternallyVisible() && func->isExternC()) {
+    bool savedRename = idiomaticRenameEnabled();
+    idiomaticRenameEnabled() = false;
+    std::string verbatim = cFunctionSymbolName(func, currentTuTag);
+    idiomaticRenameEnabled() = savedRename;
+    if (!verbatim.empty() && verbatim != name)
+      funcOp->setAttr(emitrust::kCSymbolAttrName,
+                      builder.getStringAttr(verbatim));
+  }
   functions[name] = funcOp;
   // Recovery stub retry (FR-42): the signature above is the one the real
   // import would have used — same pointer-parameter classification, same
