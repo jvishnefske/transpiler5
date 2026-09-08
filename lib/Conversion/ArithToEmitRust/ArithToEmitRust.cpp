@@ -333,13 +333,28 @@ struct CastOpConversion : public OpConversionPattern<ArithOp> {
   using OpConversionPattern<ArithOp>::OpConversionPattern;
 
   /// Rewrites the cast, keeping the source operand. Casts producing i1 are
-  /// left to the dedicated boolean patterns: Rust has no `as bool`.
+  /// left to the dedicated boolean patterns: Rust has no `as bool`. Casts
+  /// CONSUMING an i1 are refused for the mirror-image reason.
   LogicalResult
   matchAndRewrite(ArithOp op, typename ArithOp::Adaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     if (op.getType().isInteger(1))
       return rewriter.notifyMatchFailure(
           op, "casts to i1 have no Rust `as` equivalent");
+    // Every op this template is registered for whose source can be an i1
+    // (`extsi`, `sitofp`, `index_cast`) is SIGNED, so the i1 widens to
+    // 0/-1; Rust's `bool as T` widens to 0/1 instead, and for a floating
+    // destination `bool as f64` is not even a legal cast (rustc E0606, so
+    // the emitted crate would not build). Neither wrong-value nor
+    // unbuildable is an acceptable outcome, so the shape is refused here
+    // and producers hop through the promoted integer instead -- see the
+    // `arith.extui` in `CK_IntegralToFloating` and the width-1 arm of the
+    // integral-cast path in ImportCExpressions.cpp. Zero-extension from i1
+    // has its own pattern (`ExtUIOpConversion`), which is where the legal
+    // `bool as T` spelling lives.
+    if (adaptor.getIn().getType().isInteger(1))
+      return rewriter.notifyMatchFailure(
+          op, "signed casts from i1 have no Rust `as` equivalent");
     Type resultType = this->getTypeConverter()->convertType(op.getType());
     if (!resultType)
       return rewriter.notifyMatchFailure(op, "result type conversion failed");

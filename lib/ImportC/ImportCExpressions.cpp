@@ -819,6 +819,24 @@ FailureOr<Value> CImporter::emitCast(const clang::CastExpr *cast) {
     // enum holding 3000000000 converts to 3000000000.0, not -1294967296.0.
     if (llvm::isa<emitrust::EnumType>((*value).getType()))
       *value = castEnumToPromotedInt(loc, *value);
+    // A `_Bool` source hops through the promoted `int` first, for two
+    // independent reasons. (1) `arith.sitofp` is a SIGNED widening, so an
+    // i1 holding `true` would convert to -1.0 where C mandates 1.0 (C99
+    // 6.3.1.4 via 6.3.1.2: a `_Bool` holds exactly 0 or 1 and widens as an
+    // unsigned value). (2) Rust has no `bool as f32`/`bool as f64` at all
+    // -- rustc refuses the spelling outright (E0606) -- so the direct form
+    // reached `ArithToEmitRust`'s CastOpConversion and emitted a crate
+    // that could not be built. `arith.extui` is the same zero-extension
+    // the integral-cast arm above already applies to a width-1 source, and
+    // the resulting `v as i32 as f64` is byte-identical to what the usual
+    // arithmetic conversions already produced for `b * 2.5` (clang puts an
+    // explicit `_Bool` -> `int` node in front of the multiply, which is
+    // why that path was correct while the plain conversions were not).
+    if (auto boolSource = llvm::dyn_cast<IntegerType>((*value).getType());
+        boolSource && boolSource.getWidth() == 1)
+      *value = builder
+                   .create<arith::ExtUIOp>(loc, builder.getI32Type(), *value)
+                   .getResult();
     // Unsigned to float is an `emitrust.cast`: Rust's `u* as f*` performs
     // the same round-to-nearest conversion as C.
     if (isUnsignedInt((*value).getType()))
@@ -3503,8 +3521,14 @@ CImporter::emitCXXMemberCall(const clang::CXXMemberCallExpr *call) {
       // free function's arguments; the only thing this adds is that the
       // receiver counts as one of the borrows.
       bool argIsMut = llvm::isa<emitrust::MutRefType>(input);
-      const clang::VarDecl *argRoot = placeExprRoot(argExpr);
-      bool argIsThis = rootsAtCxxThis(argExpr);
+      // FR-202: `borrowArgumentRoot`, not `placeExprRoot`. A `T *`
+      // parameter maps to the same `&mut T` a `T &` parameter does, so the
+      // ADDRESS spelling `m(&x)` is one borrow of `x` exactly as `m(x)` is
+      // -- but the bare place walk bottoms out on the `&` and reported "no
+      // known root", which this loop reads as "cannot alias". `s.merge(&s)`
+      // therefore emitted two `&mut s` and the crate failed rustc E0499.
+      const clang::VarDecl *argRoot = borrowArgumentRoot(argExpr);
+      bool argIsThis = borrowArgumentRootsAtCxxThis(argExpr);
       bool collides = argIsThis && borrowedThis &&
                       (argIsMut || borrowedThisIsMut);
       if (!collides && argRoot)
@@ -3623,8 +3647,10 @@ FailureOr<Value> CImporter::emitCXXOperatorMemberCall(
     Type input = targetType.getInput(index);
     if (llvm::isa<emitrust::MutRefType, emitrust::RefType>(input)) {
       bool argIsMut = llvm::isa<emitrust::MutRefType>(input);
-      const clang::VarDecl *argRoot = placeExprRoot(argExpr);
-      bool argIsThis = rootsAtCxxThis(argExpr);
+      // FR-202 mirror: the `&`-spelled borrow argument roots at the object
+      // it takes the address of (see `emitCXXMemberCall`).
+      const clang::VarDecl *argRoot = borrowArgumentRoot(argExpr);
+      bool argIsThis = borrowArgumentRootsAtCxxThis(argExpr);
       bool collides =
           argIsThis && borrowedThis && (argIsMut || borrowedThisIsMut);
       if (!collides && argRoot)
@@ -4901,11 +4927,43 @@ CImporter::emitStlOperatorCall(const clang::CXXOperatorCallExpr *call) {
                   .getValue() != "String")
         return emitError(loc) << "unsupported: operator+= right-hand side "
                                  "is not a recognized std::string";
+      // FR-202: `s += s` (and any shape whose right-hand side shares a
+      // ROOT with the receiver, such as `v[0] += v[1]`) is well defined in
+      // C++ -- `basic_string::append` reads its argument before it grows
+      // -- but `s.push_str(&s)` is rustc E0502: the receiver's `&mut` and
+      // the argument's `&` are live at once. Neither this arm nor the
+      // FR-48 method-call check saw it, because the STL operator path has
+      // no borrow-collision check at all, so the defect reached rustc as
+      // an unbuildable crate rather than a located rejection.
+      //
+      // Staging the right-hand side through a CLONE is the correct
+      // lowering, not a fence: appending a copy of the operand is what the
+      // C++ semantics observe in every case, aliased or not. It is applied
+      // ONLY on a root collision so that every non-aliasing `s += t` keeps
+      // its exact prior bytes.
+      Value rhsSource = *rhsPlace;
+      const clang::VarDecl *recvRoot =
+          borrowArgumentRoot(call->getArg(0));
+      const clang::VarDecl *rhsRoot = borrowArgumentRoot(call->getArg(1));
+      bool aliases = (recvRoot && recvRoot == rhsRoot) ||
+                     (borrowArgumentRootsAtCxxThis(call->getArg(0)) &&
+                      borrowArgumentRootsAtCxxThis(call->getArg(1)));
+      if (aliases) {
+        Type stringType = rhsLValueType.getValueType();
+        Value clone = builder
+                          .create<emitrust::MethodCallOp>(
+                              loc, TypeRange{stringType}, *rhsPlace,
+                              builder.getStringAttr("clone"), ValueRange{})
+                          .getResult(0);
+        Value staged = createVariablePlace(loc, stringType);
+        builder.create<emitrust::AssignOp>(loc, staged, clone);
+        rhsSource = staged;
+      }
       Value rhsRef =
           builder
               .create<emitrust::AddrOfOp>(
                   loc, emitrust::RefType::get(rhsLValueType.getValueType()),
-                  *rhsPlace, /*is_mut=*/false)
+                  rhsSource, /*is_mut=*/false)
               .getResult();
       builder.create<emitrust::MethodCallOp>(
           loc, TypeRange(), *receiver, builder.getStringAttr("push_str"),

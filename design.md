@@ -13143,6 +13143,241 @@ piece and becomes FR-45.
   reads as free, so a relocated VOLATILE read would slip through (volatile
   locals are rejected elsewhere, so no live case could be built).
 
+- [x] FR-202 (opened and LANDED 2026-09-07; closes FR-181's LAST residue):
+  **CLASS 2 -- A PROVEN MUST-ACCESS BOUND, AND THE FIRST FR-181 PROJECTION
+  THAT WAS ACTUALLY WORTH ITS +1.**
+  FR-181 projected "+4 cases"; FR-182 landed three (`to_barycentric`,
+  `flac_validate`, `update_frame_header`, measured 28 -> 31) and `bitwriter_add`
+  was CORRECTLY refused (a pointer member the importer renders as an i64
+  cursor, so no `offset_of!` assertion can catch it). The entire residue was
+  `hdr_bitrate` alone.
+  **THE SPIKE'S OWN CAVEAT WAS CLOSED FIRST, AND THAT MATTERED.** FR-181
+  recorded that `hdr_bitrate` "was exercised on the spike's own inputs, not the
+  corpus's, so its 'would score' is a notch weaker". Re-tested on the corpus's
+  OWN runner with a hand-shim: `Test Vectors Passed: 103, Skipped: 14,
+  Failed: 0`. The bound is exactly 3 and the corpus harness declares
+  `h: [u8; 3]` -- the bound exactly. Only then was anything built.
+  `CAbiClass::SliceBound` admits an export only when ALL hold: exactly ONE
+  reference parameter and it is a SHARED `&[u8]`; element is an 8-bit integer
+  (the only width provably the C one absent an importer faithfulness marker);
+  every other parameter scalar, no by-value struct, scalar-or-void result; the
+  body is ONE block with NO region-carrying op and every op on a whitelist of
+  pure value ops; every use of the argument is a `deref`, every deref use a
+  `subscript` at a CONSTANT NON-NEGATIVE index, every subscript use a `load`;
+  and at least one access (bound 0 is refused -- `from_raw_parts(p, 0)` still
+  demands non-null). N = max index + 1.
+  SOUND BECAUSE C ALREADY DEMANDS IT: a program that reads `p[N-1]` on every
+  path already owes N elements. The wrapper takes `*const u8` -- ONE register,
+  so FR-181's argument-shift cannot arise -- and the length is a LITERAL, never
+  the caller's next argument.
+  **A MEASURED FACT WORTH RECORDING:** `ImportCTypes.cpp:1278-1284` gives a
+  shared `&[T]` only to a walked `const unsigned char *`; `const int *`,
+  `const short *` and `const double *` all import as `&mut [T]`. So class 2 is
+  `const unsigned char *`-shaped BY CONSTRUCTION, and the `long double` -> f64
+  width hazard (see FR-206) cannot reach it.
+  THE REGION RULE EARNS ITS KEEP: `c ? p[0] : p[9]`, `p[0] && p[9]` and
+  `p[0] || p[9]` all import as `emitrust.if` with regions and are refused --
+  they only LOOK straight-line. `p += 2; p[1]` constant-folds to index 3 ->
+  bound 4, so pointer arithmetic needed no special case.
+  **THE ORACLE WAS VERIFIED TO BITE IN BOTH DIRECTIONS**, which is the part
+  worth reusing. Bound patched 3 -> 2: `index out of bounds: the len is 2 but
+  the index is 2` -> "panic in a function that cannot unwind" -> SIGABRT
+  (exit 134), with `cargo build` CLEAN. And FR-181's silent shape reproduced
+  inside this very test: exporting `pub extern "C" fn(p: &[u8], k: i32)`
+  directly builds with only `warning: extern fn uses type [u8], which is not
+  FFI-safe` and yields `byte_pick=21` where native says `byte_pick=53`,
+  exit 0, no panic. Caught only by the byte-diff.
+  The one-reference cap is RESPECTED, not lifted; FR-181's multi-reference
+  HARD NO-GO stands. Everything stays behind `--c-abi-exports` (default OFF)
+  and no golden moved.
+  Gate 1013/1013; clippy 101 -> 101 (+0); both ratchets unmoved; **TRACTOR
+  40 -> 41/252** (lib 27 -> 28, SYMBOL_MISSING 9 -> 8), a whole-corpus stderr
+  diff showing EXACTLY ONE case changed and exactly one of 252 emitted crates
+  containing `from_raw_parts`.
+  CAPABILITY COST, stated plainly: a function that fails only the bound proof
+  is told "its signature is not all-scalar" -- factually true but
+  uninformative. FR-139's sentence was kept VERBATIM for all nine refusal
+  shapes rather than move two existing pins; per-shape wordings plus those two
+  pin moves are a follow-on. `&mut [T]` stays refused (writes would need
+  write-validity proof and re-open FR-181's `noalias` NO-GO); worth 0 corpus
+  cases today.
+  NOT VERIFIED: non-x86-64/LP64 targets; `--incremental`/`--link` shards (a
+  class-2 candidate split across shards was not exercised); byte-region
+  aggregate parameters (`const struct X *` -> `&[u8]` via
+  `ImportCTypes.cpp:1252`) reach class 2 by construction and are sound by the
+  same argument but have no test; a class-2 function also called internally
+  with a shorter slice is reasoning, not measurement.
+
+- [x] FR-203 (opened and LANDED 2026-09-07; FR-193's two borrow-conflict
+  unbuildables): **THE FR-48 ALIASING CHECK EXISTED AND MISSED, BECAUSE THE
+  ROOTING WALK NEVER PEELED `&`.**
+  Two shapes exited 0 and were then refused by rustc: `s.merge(&s)` (E0499)
+  and `s += s` on a `std::string` (E0502). They are NOT one root cause.
+  `emitCXXMemberCall` (`ImportCExpressions.cpp:3504-3519`) and its near-twin
+  at `:3624-3639` call `placeExprRoot` directly, and that walk
+  (`CImporterInternal.h:9846`) peels `MemberExpr` and `ArraySubscriptExpr` and
+  bottoms out at `DeclRefExpr` -- it never peels a `UnaryOperator`/`UO_AddrOf`.
+  So a pointer argument spelled `&s` yielded a NULL root, `if (!collides &&
+  argRoot)` was skipped, and the check silently did not fire. The composition
+  already existed one function away: `addressArgumentRoot` peels the
+  address-of and delegates. New `borrowArgumentPlace`/`borrowArgumentRoot`/
+  `borrowArgumentRootsAtCxxThis` helpers supply it at all three sites;
+  `placeExprRoot` itself was left ALONE (five other call sites, and `&x` is
+  not a place).
+  `s += s` never reached either check -- the STL `OO_PlusEqual` arm
+  (`:4855-4934`) had no aliasing check at all.
+  **THE THIRD SITE IS MOSTLY UNREACHABLE, which corrects the spec.**
+  `emitCXXOperatorMemberCall` cannot see an `&`-spelled argument for
+  `operator+=`: a member `operator+=(const S *)` is omitted at class-import
+  time whether or not it aliases. The reachable member-operator shape is
+  `operator()(const S *)`, i.e. `s(&s)`; that is what is pinned.
+  **`s += s` DID NOT NEED A FENCE.** `push_str(&rhs.clone())` staged through a
+  temp is always semantically equal to C++'s `append(rhs)` (which copies from
+  the operand), so it was MADE TO WORK: `abab 4` / `abQabQ 6`, byte-identical
+  to the clang++ native. The clone is gated on a root collision only, which is
+  why every non-aliasing `s += t` keeps its exact prior bytes and no golden
+  moved.
+  CAPABILITY COST: five shapes that previously imported now refuse --
+  `a.m(&a)`, `a.m(&a.field)`, `a.peek(&a)` on a CONST method, `s(&s)` via a
+  member `operator()`, and `merge(&*this)`/`&this->f` inside a method
+  (FR-112-contained: warning + omitted method + located error at the use).
+  Every one of them previously emitted a crate rustc REJECTED, so no working
+  program was lost. All reuse FR-48's existing sentence verbatim -- one rule,
+  one message.
+  **A SEPARATE DEFECT FOUND AND NOT FIXED:** `const S *` maps to
+  `!emitrust.mut_ref` -- pointee constness is not carried into the borrow --
+  which is the only reason the const-method case collides. It is over-strict
+  relative to an ideal lowering and becomes an ACCEPT if a later wave maps
+  pointer-to-const to `&S`. Worth its own FR.
+  Gate 1013/1013; clippy 101 -> 101 (+0); both ratchets unmoved.
+
+- [x] FR-204 (opened and LANDED 2026-09-07; FR-193 item 4): **`p[-1]` IS NOT AN
+  `as usize` BUG. THE TWO POINTER MODELS DISAGREE ABOUT WHAT THE BASE PLACE
+  IS, AND THE SLICE MODEL CANNOT NAME STORAGE BEFORE THE POINTEE.**
+  Confirmed the FR-193 claim by measurement before touching anything: ONE array
+  in the TU -> `7`, byte-identical; TWO arrays -> `cargo build` CLEAN then
+  `index out of bounds: the len is 2 but the index is 18446744073709551615`.
+  A divergence BETWEEN the models, exactly as recorded.
+  Both models carry an i64 cursor and both add the displacement in i64 BEFORE
+  the `as usize`, so the cast was never the cause. They differ in the BASE
+  PLACE. Owner model (`planOwners`, one storage base): the base is the
+  receiver's WHOLE array and the pointer parameter IS the cursor --
+  `prev(&a[1])` -> `a.tu0_prev(1i64)`, body `self.data[(p + -1i64) as usize]`,
+  and `1 + -1 = 0` hits a real element. Phase-1b slice model (>= 2 storage
+  bases, `ImportCPlanning.cpp:311`): the base offset is consumed AT THE CALL
+  SITE by `emitrust.slice_of mut %a[%base]` -> `&mut a[1..]`, and the callee's
+  cursor cell is re-initialised to 0 (`ImportCFunctions.cpp:1873-1875`). The
+  base place is the TAIL ONLY, so the element is not in the slice at all.
+  Fenced structurally on exactly that fact -- base value type is
+  `emitrust::SliceType` AND the cursor folds to a provably negative constant --
+  not on the symptom.
+  **THE FIRST FENCE WAS TOO WEAK AND THE SUITE DID NOT CATCH IT; A WIDENED
+  PROBE DID.** `p--; return *p;` still emitted `p[(-1i64) as usize]` because
+  the cursor cell has two stores and the initial single-store fold bailed.
+  Strengthened to the last store ahead of the load in the load's own block
+  (sound: that store is the last write on every path to the load), falling
+  back to the one-store rule across block edges.
+  `p[-1]` through a pointer LOCAL is FINE even with two arrays (it even folds
+  to `a[0]`), so the defect is pointer PARAMETERS specifically, not the
+  multi-object model. The genuinely-OOB case is now refused at import rather
+  than reading garbage -- the safe direction.
+  CAPABILITY COST: any element access through a slice-classified pointer
+  parameter at a cursor provably negative (`p[-c]`, `*(p - c)`,
+  `q = p - c; *q`, `p--; *p`) in a TU with >= 2 storage bases. Every one of
+  them previously PANICKED at run time, so no correct answer was lost.
+  **RESIDUE, STATED PLAINLY AND NOT PAPERED OVER:** `int k = -1; p[k]` and a
+  loop-carried `q--` still build clean and PANIC on well-defined C. No static
+  fold can prove those negative. The only fence that would catch them --
+  reject unless provably NON-negative -- was built and measured: **43 fast-tier
+  failures**, including `CTestSuite` (220 -> 216, regressing 00182, 00204,
+  00209, 00216), `RealWorld`, `search-never-worse`, and ~37 `Import/C` and
+  `Driver` goldens. It deletes the slice-parameter capability wholesale. It was
+  REVERTED, not shipped. Closing this needs the model change -- pass the
+  un-re-based slice plus an explicit i64 base offset, i.e. generalise the owner
+  model's cursor to the multi-base case -- which is a signature change on every
+  slice-parameter callee and every use of `p` inside them, each a
+  silent-miscompile risk if missed.
+  Gate 1013/1013; clippy 101 -> 101 (+0); both ratchets unmoved. New needle
+  tagged `slice-param-negative-index` in the ledger and its `run_realworld.py`
+  twin.
+
+- [x] FR-205 (opened and LANDED 2026-09-07; FR-193's `_Bool as f64` and
+  keyword-global unbuildables): **ONE OF THESE WOULD HAVE BEEN A SILENT
+  MISCOMPILE IF RESPELLED THE OBVIOUS WAY, AND THE OTHER'S FENCE DID FIRE --
+  THE IDIOMATIC RENAME JUST HANDED IT A NON-KEYWORD.**
+  `_Bool` in a float context emitted `bool as f64`/`bool as f32` (E0606).
+  **THE SEVERITY WAS UNDER-STATED IN THE SPEC.** The importer emits
+  `arith.sitofp %x : i1 to f64` -- a SIGNED widening, so `arith.sitofp i1`
+  means `true -> -1.0`. Merely respelling the cast (`bool as i8 as f64`) would
+  have BUILT and been a silent miscompile. The fix therefore belongs in the
+  importer, not the conversion pattern: a `_Bool` source now takes
+  `arith.extui` to i32 first, producing `v as i32 as f64` -- byte-identical to
+  the already-correct `b * 2.5` sibling, whose two-hop was the tell that the
+  paths differed. `UIToFPOp` is irrelevant: the importer never builds one
+  (`convertScalarValue`, `ImportCStatements.cpp:7545`, already hard-rejects i1
+  on either side), so `CK_IntegralToFloating` was the only reachable site.
+  Two guards added beyond the named site so the class cannot recur silently:
+  `CastOpConversion` now refuses an i1 SOURCE (every op it is registered for
+  that can have one -- `extsi`, `sitofp`, `index_cast` -- is signed, so
+  `bool as T` is wrong for all three; the legal spelling lives in
+  `ExtUIOpConversion`), and `emitrust.cast`'s verifier rejects i1 -> float
+  outright. Both are pure rejections and cost nothing in the suite.
+  **THE KEYWORD ITEM'S DIAGNOSIS IN THE SPEC WAS WRONG TWICE.** It is not a
+  struct-typed global bypassing `createGlobal`, and it is not two sites. Both
+  the demoted-global local binding and the FR-62 actor STRUCT FIELD come from
+  ONE function, `ActorLiftPlan.cpp:114 derivedName`. And the importer's
+  rejection (`ImportCGlobals.cpp:614`) was never broken -- under the FR-53
+  idiomatic rename `cGlobalSymbolName` emits `pub` as `PUB`, which is not a
+  keyword, and `derivedName` snake_cases it straight back to `pub`. Verified
+  both directions: `emitrust-import-c` and `emitrust-cc --preserve-c-names`
+  both still reject with `unsupported: global variable name 'pub' is a Rust
+  keyword`; only the RENAMED path leaked.
+  Escaping was measured to work correctly everywhere else first -- locals
+  (`match_`, `loop_`, `impl_`), parameters (`move_`) and ordinary struct
+  fields (`type_`, `ref_`) all byte-diff clean -- which is what localised the
+  defect to the file-scope lowerings. Fixed by appending `mangleMemberName`'s
+  single `_` in `derivedName`.
+  The collision hazard `mangleMemberName`'s own comment names (a TU declaring
+  both `pub` and `pub_`) was already handled on the actor path -- the mangle
+  merely makes it reachable -- and now warns and keeps both cells distinct.
+  **HONEST NOTE:** the guard added to the demoted-local list is defensive and
+  untested-by-construction; a `K`/`K_` pair always collides earlier on the
+  synthesised type name (`PubActor` twice), so no input reaches it.
+  GOLDEN MOVEMENT ZERO, and measured rather than assumed: a paired
+  `--emit=rust` snapshot over all 282 `test/EndToEnd/*.{c,cpp}` with reverted
+  vs patched tools differs in exactly 2 files, both new tests; the other 280
+  are byte-identical.
+  Gate 1013/1013; clippy 101 -> 101 (+0); both ratchets unmoved.
+
+- [ ] FR-206 (opened 2026-09-07; FR-193 item 9): **`long double` -> f64 IS A
+  KNOWN, BOUNDED, OWNER-ACCEPTED DIVERGENCE -- RECORDED, NOT FIXED.**
+  `ImportCTypes.cpp:153` maps `long double` to f64 as a DELIBERATE PINNED
+  POLICY (CTS 00204 / C99-8), asserting the substitution is unobservable
+  because "the supported shapes perform no long-double-only arithmetic",
+  pinned by `test/Import/C/long-double-f64.c`.
+  **THE ASSUMPTION IS TRUE OF THE CORPUS AND FALSE IN GENERAL.** Re-read at
+  HEAD: CTS 00204 only stores, copies and prints (`%.1Lf`); the pinned test
+  does conversions and a select; `varargs-monomorph.c` passes and prints. NO
+  GATED TEST PERFORMS LONG-DOUBLE ARITHMETIC. But a mantissa-bit count --
+  `while (1.0L + ld != 1.0L) { ld /= 2.0L; c++; }`, fully well-defined C, only
+  halving and an exact equality test -- measures **native 64 vs emitted 53**,
+  exit 0 on both sides, `cargo build` clean, ZERO diagnostics. It walks
+  through both existing fences (`sizeof`/`alignof` and `%La`/`%LA`), which
+  guard the width and the hex-float spelling but not arithmetic.
+  **OWNER DECISION 2026-09-07: LEAVE THE POLICY, RECORD THE DIVERGENCE.**
+  Widening the fence to reject long-double arithmetic was costed and would
+  very likely have moved nothing (no gated test does such arithmetic), but it
+  is a capability reduction against a pinned policy and was declined.
+  This entry is the record. It is deliberately an OPEN box: the divergence is
+  real and silent, and this is the one place in the tree where "recovery must
+  never silently emit wrong code" is knowingly suspended. Bounded by: the two
+  existing fences, and FR-202's class-2 export being `const unsigned char *`-
+  shaped by construction so the width hazard cannot reach the C ABI.
+  THE WAY OUT, if it ever matters: reject arithmetic whose operand type is
+  `long double` with a located diagnostic, keeping the f64 mapping for
+  storage, conversion, passing and printing. A real 80-bit type is not
+  available -- Rust has no `f80`.
+
 - [x] FR-184 (opened and LANDED 2026-09-01): **FR-63'S STRUCT-LITERAL FUSE
   FIRED FOR *ZERO* INSTANCES OF FR-62'S OWNER `new()`, BECAUSE THE STAGED
   AGGREGATE `let` ENDED ITS PREFIX.**

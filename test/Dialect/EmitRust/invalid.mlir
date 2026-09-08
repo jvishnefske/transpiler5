@@ -224,6 +224,25 @@ emitrust.func @cast_to_enum_from_bool(%arg0: i1) {
 
 // -----
 
+// The mirror of the i1 RESULT rejection: Rust has no `bool as f64` either
+// (rustc E0606). Reaching emission with this shape made `emitrust-cc` exit
+// 0 and the emitted crate fail to build, so it is refused here instead.
+emitrust.func @cast_bool_to_f64(%arg0: i1) {
+  // expected-error @+1 {{cannot cast an i1 source to a floating type; Rust has no `bool as f64`, so the value must be zero-extended to an integer first}}
+  %0 = emitrust.cast %arg0 : i1 to f64
+  emitrust.return
+}
+
+// -----
+
+emitrust.func @cast_bool_to_f32(%arg0: i1) {
+  // expected-error @+1 {{cannot cast an i1 source to a floating type; Rust has no `bool as f64`, so the value must be zero-extended to an integer first}}
+  %0 = emitrust.cast %arg0 : i1 to f32
+  emitrust.return
+}
+
+// -----
+
 emitrust.func @bitcast_int_to_int(%arg0: i32) {
   // expected-error @+1 {{requires one float operand or result and one integer of the same width}}
   %0 = emitrust.bitcast %arg0 : i32 to ui32

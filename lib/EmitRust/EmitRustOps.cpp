@@ -1461,9 +1461,24 @@ LogicalResult CmpOp::verify() {
 
 /// Verifies that an enum result (an integer-to-enum conversion, rendered
 /// as the enum's value-preserving tuple-struct constructor) has a non-`i1`
-/// integer source, and that neither side is a fn_ptr type
-/// (`Option<fn(...)>` supports no `as` conversion at all).
+/// integer source, that an `i1` source has no floating result, and that
+/// neither side is a fn_ptr type (`Option<fn(...)>` supports no `as`
+/// conversion at all).
 LogicalResult CastOp::verify() {
+  // Rust has no `bool as f32` / `bool as f64` -- rustc refuses the
+  // spelling outright (E0606) -- so this shape has no rendering at all.
+  // It is the mirror of the i1 RESULT the emitter already rejects (`as
+  // bool` does not exist either), and it is caught here rather than at
+  // emission because the failure it used to produce was the one this repo
+  // forbids: `emitrust-cc` exited 0 and the emitted crate would not
+  // build. Producers zero-extend to an integer first; see the
+  // `arith.extui` hop in `CK_IntegralToFloating`.
+  if (auto sourceInt = dyn_cast<IntegerType>(getSource().getType());
+      sourceInt && sourceInt.getWidth() == 1 &&
+      isa<FloatType>(getResult().getType()))
+    return emitOpError("cannot cast an i1 source to a floating type; Rust "
+                       "has no `bool as f64`, so the value must be "
+                       "zero-extended to an integer first");
   if (isa<EnumType>(getResult().getType())) {
     auto sourceType = dyn_cast<IntegerType>(getSource().getType());
     if (!sourceType || sourceType.getWidth() == 1)

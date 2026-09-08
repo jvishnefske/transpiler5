@@ -9902,6 +9902,42 @@ addressArgumentRoot(const clang::Expr *expr) {
   return placeExprRoot(unary->getSubExpr());
 }
 
+/// FR-202: the PLACE a borrow argument names, whichever way the call site
+/// spells it. A C++ reference parameter is bound by naming the place
+/// itself (`m(x)`); a pointer parameter that the importer maps to the very
+/// same `&mut T` is bound by naming its ADDRESS (`m(&x)`). Both spellings
+/// produce one borrow of one object, so the same-object aliasing checks
+/// must root them identically -- `placeExprRoot` alone bottoms out on the
+/// `UnaryOperator` and answers "no known root", which reads as "cannot
+/// alias" and let `s.merge(&s)` through to an unbuildable crate.
+///
+/// This composes rather than teaching `placeExprRoot` to peel `&`: that
+/// walk is also the answer to "which object does this PLACE name", and
+/// `&x` is not a place at all (its value is a pointer). Only the borrow
+/// checks want the two spellings collapsed.
+static inline const clang::Expr *
+borrowArgumentPlace(const clang::Expr *expr) {
+  const clang::Expr *e = stripLValueNoOp(expr);
+  if (const auto *unary = llvm::dyn_cast<clang::UnaryOperator>(e))
+    if (unary->getOpcode() == clang::UO_AddrOf)
+      return stripLValueNoOp(unary->getSubExpr());
+  return e;
+}
+
+/// FR-202: `placeExprRoot` over `borrowArgumentPlace` -- the root of the
+/// object a borrow argument names, `&`-spelled or not.
+static inline const clang::VarDecl *
+borrowArgumentRoot(const clang::Expr *expr) {
+  return placeExprRoot(borrowArgumentPlace(expr));
+}
+
+/// FR-202: `rootsAtCxxThis` over `borrowArgumentPlace` -- whether a borrow
+/// argument names the current method's receiver, `&`-spelled or not
+/// (`m(&this->f)` borrows the receiver exactly as `m(this->f)` does).
+static inline bool borrowArgumentRootsAtCxxThis(const clang::Expr *expr) {
+  return rootsAtCxxThis(borrowArgumentPlace(expr));
+}
+
 /// FR-48: the parameter list a call's arguments bind to, or null when the
 /// callee is not a resolved `FunctionDecl`. A `CXXMemberCallExpr`'s
 /// arguments line up with the method's parameters (the receiver is NOT an

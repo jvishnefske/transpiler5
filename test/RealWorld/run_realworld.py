@@ -317,6 +317,12 @@ _BLOCKER_SUBSTRINGS = [
     ("write must execute unconditionally", "ptr-to-ptr-shape-escape"),
     ("does not root in a sibling slice parameter", "ptr-to-ptr-shape-escape"),
     ("pointer-to-pointer", "ptr-to-ptr"),
+    # Mirrors the RejectionLedger.cpp row of the same position: a negative
+    # element index below a Phase-1b slice parameter's origin.
+    (
+        "negative element index through a slice parameter",
+        "slice-param-negative-index",
+    ),
     ("returned pointer value", "returned-pointer"),
     ("pointer return type", "returned-pointer"),
     ("return sites disagree", "returned-pointer"),
