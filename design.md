@@ -12058,7 +12058,8 @@ piece and becomes FR-45.
   does not accept the threaded C that would notice.
   Gate 955/955.
 
-- [ ] FR-181 (opened 2026-08-30 by FR-178's re-ranking; SPIKED the same day):
+- [x] FR-181 (opened 2026-08-30 by FR-178's re-ranking; SPIKED the same day;
+  FULLY DISCHARGED 2026-09-08):
   **THE POINTER C-ABI EXPORT IS A FOUR-CASE LEVER, NOT A NINETY-CASE ONE, AND
   BOTH OBVIOUS INFERENCE RULES ARE MEASURABLY UNSOUND.**
   ROOT CAUSE OF THE `crc16` RECORD, finally established with register-level
@@ -12188,6 +12189,23 @@ piece and becomes FR-45.
   build-time backstop. +4 cases, three one-statement `unsafe` wrappers, no new
   ops, no golden movement, every measured counterexample left behind a
   LOCATED refusal.
+  **DISCHARGED 2026-09-08, and the spike's "+4 cases" was right in total but
+  wrong in distribution -- which is worth recording because the error is the
+  same shape FR-177/FR-178 kept making.** FR-182 landed three
+  (`to_barycentric`, `flac_validate`, `update_frame_header`; measured
+  28 -> 31). `bitwriter_add` was **correctly refused**, not deferred: its
+  struct carries a pointer member the importer renders as an i64 cursor, so
+  no `offset_of!` assertion can catch the divergence -- the backstop this
+  spike proposed cannot see that shape at all. FR-202 then closed the last
+  one, `hdr_bitrate`, with the must-access-bound analysis this entry costed
+  as "worth exactly one case today"; that estimate held exactly.
+  FR-202 also closed this entry's own honesty caveat -- that `hdr_bitrate`
+  "was exercised on the spike's own inputs, not the corpus's, so its 'would
+  score' is a notch weaker" -- by re-testing on the corpus's OWN runner
+  before building anything: 103 vectors passed, 0 failed, and the required
+  bound is exactly 3, matching the corpus harness's `[u8; 3]` declaration.
+  The HARD NO-GO on multi-reference C-ABI export stands and was respected by
+  both FR-182 and FR-202: neither lifted the one-reference cap.
 
 - [x] FR-182 (opened and LANDED 2026-08-31 on the FR-181 spike's
   recommendation): **THE `repr(C)` C-ABI EXPORT TIER -- TWO STRUCT SHAPES,
