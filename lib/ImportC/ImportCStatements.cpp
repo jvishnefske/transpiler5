@@ -6543,6 +6543,39 @@ LogicalResult CImporter::emitSwitchStmt(const clang::SwitchStmt *stmt) {
 LogicalResult CImporter::emitDispatchSwitch(const clang::SwitchStmt *stmt,
                                             Value flag, IntegerType flagType,
                                             Location loc) {
+  // FR-207. This lowering hands `lift-cf-to-scf` a fall-through ladder just
+  // as the plain path's `cf.switch` fallback does, and it is quadratic in
+  // exactly the same way -- FR-198 bounded the plain path and left this one
+  // unbounded, so a chain nested one compound down (or inside a loop, as in
+  // Duff's device) still reached the blowup with NO bound and NO diagnostic.
+  // Re-measured here: 14300 lines / 1.11s at a chain of 32, 44236 / 9.72s at
+  // 48, 100283 / 48.26s at 64, and past that no output and no diagnostic at
+  // all. Refuse with a located diagnostic instead; the note says which clause
+  // cost the body its structured lowering, since that is what a user would
+  // have to change.
+  unsigned longestChain = dispatchSwitchFallThroughChain(stmt);
+  if (longestChain > kMaxSwitchFallThroughChain) {
+    InFlightDiagnostic diagnostic =
+        emitError(loc) << "unsupported: switch with a fall-through chain of "
+                       << longestChain << " cases (limit "
+                       << kMaxSwitchFallThroughChain
+                       << "); structurizing it duplicates the tail into every "
+                          "arm and does not finish";
+    if (const auto *body = llvm::dyn_cast_if_present<clang::CompoundStmt>(
+            stmt->getBody())) {
+      bool precedesFirstLabel = false;
+      if (const clang::Stmt *blocker =
+              nonPlainSwitchBodyBlocker(body, precedesFirstLabel))
+        diagnostic.attachNote(translateLoc(blocker->getBeginLoc()))
+            << (precedesFirstLabel
+                    ? "this statement precedes the first case label, so the "
+                      "switch takes the duplicating dispatch lowering"
+                    : "this label is nested inside a statement, so the switch "
+                      "takes the duplicating dispatch lowering");
+    }
+    return diagnostic;
+  }
+
   // Register one block per case/default label of this switch. Clang chains
   // a switch's own labels (wherever they nest inside the body) off
   // `getSwitchCaseList` in reverse source order; labels of nested switches
@@ -8373,16 +8406,96 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
   std::string rustFormat;
   rustFormat.reserve(format.size());
   unsigned argIndex = firstArgIndex;
+  // FR-192: a `%s` argument is CONVERTED -- the pointee read -- when printf
+  // reaches the directive, not when the argument is evaluated. C17 6.5.2.2p10
+  // places a sequence point before the call, and the array-to-pointer decay
+  // of a buffer does NOT access the array's stored value, so a LATER argument
+  // whose call writes that buffer is well defined and its store IS visible to
+  // the conversion (`printf("[%s] %d\n", buf, bump(buf))` prints `[Bb] 1`,
+  // both under clang and under gcc). Lowering the `%s` where it is written in
+  // the format string snapshots the region BEFORE that store and lost it -- a
+  // measured miscompile, native `5b42625d20310a` vs emitted `5b61625d20310a`.
+  //
+  // Such a `%s` is therefore DEFERRED: its operand takes a reserved slot in
+  // `operands` and the ops that read the region are created only once every
+  // later argument has been lowered. That is exactly C's order -- all side
+  // effects complete, then the conversions read -- and it is also what Rust's
+  // borrow rules want, because the shared borrow of the buffer is now created
+  // AFTER the mutable borrow the intervening call needs, instead of spanning
+  // it. (A `%d` argument is a different matter: its VALUE is read during
+  // argument evaluation, so a later argument writing that object is an
+  // unsequenced read/write conflict and plain UB. Only `%s` is reordered.)
+  struct DeferredString {
+    size_t slot;
+    const clang::Expr *argExpr;
+    std::optional<unsigned> precision;
+    // Non-null for an `argv[i]` argument, which the generic `%s` shapes do
+    // not admit: it reaches the format hole only through the argv table.
+    const clang::Expr *argvIndexExpr;
+  };
+  SmallVector<DeferredString> deferredStrings;
+  // Fills every reserved slot, in the order the directives appear. Called
+  // immediately before anything consumes `operands` -- a segment flush or the
+  // final `print!`/`format!` the caller builds -- and by then every argument
+  // that could write one of these regions has already been lowered.
+  auto materializeDeferredStrings = [&]() -> LogicalResult {
+    for (const DeferredString &deferred : deferredStrings) {
+      if (deferred.argvIndexExpr) {
+        // An argv element: the same byte run the raw bypass would have
+        // written, rendered instead through the Latin-1 `__emitrust_cstr`
+        // funnel because the write has to happen at print time, not here.
+        FailureOr<Value> slice =
+            emitArgvArgSlice(loc, deferred.argvIndexExpr);
+        if (failed(slice))
+          return failure();
+        auto stringType =
+            emitrust::OpaqueType::get(builder.getContext(), "String");
+        Value text;
+        if (deferred.precision) {
+          needsCStrNHelper = true;
+          Value count =
+              createIntConstant(loc, builder.getIntegerType(64),
+                                static_cast<int64_t>(*deferred.precision));
+          text = builder
+                     .create<emitrust::CallOpaqueOp>(
+                         loc, TypeRange{stringType},
+                         builder.getStringAttr("__emitrust_cstr_n"),
+                         /*args=*/ArrayAttr(), ValueRange{*slice, count})
+                     .getResult(0);
+        } else {
+          needsCStrHelper = true;
+          text = builder
+                     .create<emitrust::CallOpaqueOp>(
+                         loc, TypeRange{stringType},
+                         builder.getStringAttr("__emitrust_cstr"),
+                         /*args=*/ArrayAttr(), ValueRange{*slice})
+                     .getResult(0);
+        }
+        operands[deferred.slot] = text;
+        continue;
+      }
+      FailureOr<Value> text = emitPrintfStringArg(
+          deferred.argExpr, deferred.precision, /*rawByteSlice=*/nullptr);
+      if (failed(text))
+        return failure();
+      operands[deferred.slot] = *text;
+    }
+    deferredStrings.clear();
+    return success();
+  };
   // C99-43 C3: flushes the format accumulated so far as its own `print!`
   // call and starts a fresh segment, so a raw `*_out` helper call can be
   // sequenced in program order between two format segments. A no-op when the
   // pending segment is empty (avoids `print!("")`).
-  auto flushSegment = [&]() {
+  auto flushSegment = [&]() -> LogicalResult {
+    if (failed(materializeDeferredStrings()))
+      return failure();
     if (rustFormat.empty() && operands.empty())
-      return;
+      return success();
     emitPrintMacro(loc, rustFormat, operands);
     rustFormat.clear();
     operands.clear();
+    return success();
   };
   for (size_t i = 0, n = format.size(); i < n; ++i) {
     char c = format[i];
@@ -8610,17 +8723,41 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
     const clang::Expr *argExpr = call->getArg(argIndex);
     unsigned argNumber = argIndex++;
 
+    // Does any argument AFTER this one have side effects? C evaluates every
+    // argument, and completes every side effect, before printf writes a byte
+    // or converts a directive (C17 6.5.2.2p10), which has two consequences
+    // here and both are keyed off this one question:
+    //   * FR-191: a raw-bytes bypass WRITES OUTPUT at argument-lowering time,
+    //     which is before those effects run -- so the bypass is declined;
+    //   * FR-192: a `%s` READS ITS REGION at conversion time, which is after
+    //     those effects run -- so its materialization is deferred past them.
+    bool laterArgSideEffects = false;
+    for (unsigned k = argIndex, e = call->getNumArgs(); k < e; ++k)
+      if (call->getArg(k)->HasSideEffects(astContext())) {
+        laterArgSideEffects = true;
+        break;
+      }
+
     // C99-43 C3: an argv-fed `%s`/`%c` hole in the stdout `print!` context
     // bypasses the Latin-1 `__emitrust_cstr`/`__emitrust_fmt_c` Display
     // funnels (whose byte-to-char widening double-encodes non-ASCII argument
     // bytes) by flushing the pending format segment and writing the raw bytes
     // through the on-demand `*_out` helpers on the same buffered stdout handle.
-    if (allowRawBypass && mainArgvTableValue) {
+    //
+    // FR-192: this bypass predates FR-191's ordering fence and did NOT carry
+    // it, which was its own miscompile -- `printf("[%s] %d\n", argv[1],
+    // noisy())` with a stdout-writing `noisy()` printed `[hello<1>] 1` where
+    // the native prints `<1>[hello] 1`, because the raw write went out before
+    // the argument that produced `<1>` had even been evaluated. It now takes
+    // the same fence as the two bypasses below, and the declined call falls
+    // through to the deferred `%s` path.
+    if (allowRawBypass && mainArgvTableValue && !laterArgSideEffects) {
       if (spec == 's') {
         if (const clang::Expr *idxExpr = matchArgvWholeSubscript(argExpr)) {
           if (rawBypassed)
             *rawBypassed = true;
-          flushSegment();
+          if (failed(flushSegment()))
+            return failure();
           FailureOr<Value> slice = emitArgvArgSlice(loc, idxExpr);
           if (failed(slice))
             return failure();
@@ -8646,7 +8783,8 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
         if (const clang::ArraySubscriptExpr *byte = matchArgvByteRead(argExpr)) {
           if (rawBypassed)
             *rawBypassed = true;
-          flushSegment();
+          if (failed(flushSegment()))
+            return failure();
           FailureOr<Value> place = emitArgvByteLValue(byte, loc);
           if (failed(place))
             return failure();
@@ -8665,6 +8803,24 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       std::optional<unsigned> stringPrecision;
       if (precision >= 0)
         stringPrecision = static_cast<unsigned>(precision);
+      // FR-192: an argv `%s` whose bypass the fence above just declined has
+      // nowhere else to go -- `emitPrintfStringArg`'s shapes do not admit an
+      // argv element, which reaches a format hole only through the argv
+      // table. Rather than lose the shape to a rejection, it is deferred like
+      // any other `%s` and rendered through the Latin-1 `__emitrust_cstr`
+      // funnel at materialization time. Only the raw-byte property is given
+      // up, exactly the trade FR-191 already recorded for char regions; the
+      // ordering, which is what was actually wrong, is now right.
+      if (allowRawBypass && mainArgvTableValue && laterArgSideEffects &&
+          !argExpr->HasSideEffects(astContext()))
+        if (const clang::Expr *idxExpr = matchArgvWholeSubscript(argExpr)) {
+          deferredStrings.push_back(DeferredString{operands.size(),
+                                                   /*argExpr=*/nullptr,
+                                                   stringPrecision, idxExpr});
+          operands.push_back(Value());
+          rustFormat += textPlaceholder();
+          continue;
+        }
       // FR-191: in a stdout `print!` context a `%s` over a char REGION
       // prints its raw bytes, bypassing the `__emitrust_cstr` Latin-1
       // Display funnel whose per-byte `u8 as char` widening re-encodes
@@ -8682,11 +8838,32 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       // The argument is materialized either way — the ops are identical,
       // only the wrapping differs — so nothing is evaluated twice and the
       // C argument order is preserved.
-      bool wantRawBytes = allowRawBypass && width.empty();
-      if (wantRawBytes)
-        for (unsigned k = argIndex, e = call->getNumArgs(); k < e; ++k)
-          if (call->getArg(k)->HasSideEffects(astContext()))
-            wantRawBytes = false;
+      bool wantRawBytes =
+          allowRawBypass && width.empty() && !laterArgSideEffects;
+      // FR-192: with a side-effecting argument still to come, the region has
+      // to be read AFTER that argument runs, so the whole `%s` lowering moves
+      // to `materializeDeferredStrings` and only its operand slot is reserved
+      // here. Two exclusions keep the reordering to the cases that can
+      // actually observe a write:
+      //   * a STRING LITERAL argument (`__func__` included) is immutable in C
+      //     -- writing through it is undefined -- so nothing a later argument
+      //     does can change what the conversion reads. Moving it would be
+      //     pure churn in the emitted bytes for no semantic gain;
+      //   * an argument expression that itself has SIDE EFFECTS is left
+      //     alone: C leaves the relative order of two side-effecting
+      //     arguments unspecified, and reordering one would be a gratuitous
+      //     divergence from the native binary the byte-diff oracle compares
+      //     against.
+      if (laterArgSideEffects &&
+          !underlyingStringLiteral(argExpr->IgnoreParenImpCasts()) &&
+          !argExpr->HasSideEffects(astContext())) {
+        deferredStrings.push_back(DeferredString{operands.size(), argExpr,
+                                                 stringPrecision,
+                                                 /*argvIndexExpr=*/nullptr});
+        operands.push_back(Value());
+        rustFormat += textPlaceholder();
+        continue;
+      }
       bool rawByteSlice = false;
       FailureOr<Value> text = emitPrintfStringArg(
           argExpr, stringPrecision, wantRawBytes ? &rawByteSlice : nullptr);
@@ -8695,7 +8872,8 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       if (rawByteSlice) {
         if (rawBypassed)
           *rawBypassed = true;
-        flushSegment();
+        if (failed(flushSegment()))
+          return failure();
         if (stringPrecision) {
           // `%.Ns`: at most N raw bytes, stopping earlier at a NUL.
           needsCStrNOutHelper = true;
@@ -8807,18 +8985,15 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
       // effects therefore keeps the whole call on the Display funnel — the
       // same restriction, reusing the same mechanism, rather than a second
       // one.
-      bool wantRawByte = allowRawBypass;
-      if (wantRawByte)
-        for (unsigned k = argIndex, e = call->getNumArgs(); k < e; ++k)
-          if (call->getArg(k)->HasSideEffects(astContext()))
-            wantRawByte = false;
+      bool wantRawByte = allowRawBypass && !laterArgSideEffects;
       if (wantRawByte) {
         if (rawBypassed)
           *rawBypassed = true;
         std::string pad(widthValue > 1 ? widthValue - 1 : 0, ' ');
         if (!leftAlign)
           rustFormat += pad;
-        flushSegment();
+        if (failed(flushSegment()))
+          return failure();
         Value byte = castToIntType(loc, *argument, builder.getIntegerType(8));
         needsByteOutHelper = true;
         builder.create<emitrust::CallOpaqueOp>(
@@ -8920,6 +9095,11 @@ FailureOr<std::string> CImporter::translatePrintfFormat(
   }
   if (argIndex != call->getNumArgs())
     return emitError(loc) << "unsupported: too many arguments to printf";
+  // FR-192: every argument has now been lowered, so the deferred `%s` reads
+  // happen here -- after the last side effect, before the caller's
+  // `print!`/`format!` consumes `operands`.
+  if (failed(materializeDeferredStrings()))
+    return failure();
   return rustFormat;
 }
 
