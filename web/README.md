@@ -144,11 +144,30 @@ internet. Be honest about what protects what:
 `X-Forwarded-*` headers are trusted, so `:8080` must not be reachable from the
 internet — only from Traefik.
 
-## Not done yet
+## What is and is not verified
 
-- No test covers the FastAPI layer itself (routing, status codes, the auth
-  gate end to end). The smoke test covers everything under it. Adding
-  `httpx.ASGITransport` tests is the obvious next step.
+Verified against the real compiler (`web/tests/smoke.py`, all passing): the
+option whitelist, argv construction, cache keying, the trial meter's
+spend/refund/rollover, the sandbox limits, and every one of the ten catalog
+examples compiling — including that the rejection example really does produce
+a located `file:line:col` diagnostic and that `--recover` really does leave the
+other functions intact.
+
+Not verified:
+
+- **The FastAPI layer itself** — routing, status codes, and the auth gate end
+  to end. `fastapi` could not be installed on the development host, so
+  `main.py` has never been executed. The free/paid branch in `/api/compile` is
+  the most important logic in the service and it is currently reasoned about,
+  not tested. `httpx.ASGITransport` tests are the obvious next step and should
+  come before this is exposed publicly.
+- **The frontend at runtime.** `app.js` passes `node --check` and every
+  element id it looks up exists in `playground.html`, but no browser has run
+  it. The Google sign-in flow in particular has never executed against a real
+  client id.
+
+Known gaps, by design or by deferral:
+
 - The cache grows without bound and has no eviction.
 - The trial meter keys on the Google account only. One person with several
   accounts gets several allowances.
