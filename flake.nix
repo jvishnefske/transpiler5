@@ -63,8 +63,30 @@
 
               # lit test runner for FileCheck-style pattern tests; psutil
               # enables lit's per-test timeout -- without it a miscompiled
-              # non-terminating EndToEnd binary wedges check-emitrust forever
-              (pkgs.python3.withPackages (ps: [ ps.lit ps.psutil ]))
+              # non-terminating EndToEnd binary wedges check-emitrust forever.
+              # The remaining packages are web/'s runtime and test deps
+              # (web/server/requirements.txt): the service is part of this
+              # repo, so `nix develop -c python3 -m pytest web/tests` must
+              # work without a pip install. httpx is test-only -- it drives
+              # the ASGI app in-process via httpx.ASGITransport, so the API
+              # tests need no network and no live uvicorn.
+              (pkgs.python3.withPackages (ps: [
+                ps.lit
+                ps.psutil
+                ps.fastapi
+                ps.uvicorn
+                ps.pydantic
+                ps.google-auth
+                # google-auth's `transport.requests` module -- which
+                # verify_oauth2_token needs -- imports `requests` lazily and
+                # raises ImportError without it. Measured: without this the
+                # service answers every live compile 503 "google-auth is not
+                # installed on the server" while `import google.auth` works
+                # fine. It is the `google-auth[requests]` extra.
+                ps.requests
+                ps.httpx
+                ps.pytest
+              ]))
 
               # Rust toolchain for the differential end-to-end tests:
               # emitrust-cc emits a cargo crate that is built and executed

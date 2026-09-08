@@ -47,7 +47,8 @@ web/
 ## Running it
 
 ```bash
-# deps (not vendored)
+# deps (not vendored). Inside the repo's nix devshell they are already
+# present -- flake.nix carries them, so `nix develop -c ...` needs no venv.
 pip install -r web/server/requirements.txt
 
 # the transpiler links the nix devshell's LLVM/clang dylibs, so run inside it
@@ -61,15 +62,31 @@ explanation rather than pretending to be an auth failure.
 ### Tests
 
 ```bash
-nix develop -c python3 web/tests/smoke.py
+nix develop -c python3 -m pytest web/tests -q   # the API layer + the meter
+nix develop -c python3 web/tests/smoke.py       # the compiler wrapper
 ```
 
-This runs the real compiler, not mocks, and that matters. It exists because
-an `RLIMIT_NPROC` cap in the sandbox silently killed every `--emit=crate` and
-`--recover` run while letting trivial ones through — MLIR grows a verifier
-thread pool, and `RLIMIT_NPROC` is per-UID rather than per-process. A test that
-only compiled `hello.c` would have passed. Process count is now bounded by
-`TasksMax=` in the systemd unit, which is the correct mechanism.
+The pytest suite drives the real ASGI app in-process through
+`httpx.ASGITransport` — no network, no live uvicorn — and pins the free/paid
+boundary case by case: a cache hit is served to an anonymous caller without
+touching the meter, a miss is 401/503/429 with the exact wording the user
+sees, and a paid live compile deposits its result in the free lane so the next
+anonymous request for the same source is a hit. Where a test needs a real
+compile it runs the real `emitrust-cc` (and skips if the tree is not built).
+The compiler is *forbidden* by default in those tests, so "no compile ran" is
+checked rather than assumed.
+
+One trap worth knowing before you add a test: `config.py` reads the
+environment at IMPORT time, so `web/tests/conftest.py` sets `EMITRUST_*`
+before the first `web.server` import. That is why the fixtures live there.
+
+`smoke.py` runs the real compiler, not mocks, and that matters. It exists
+because an `RLIMIT_NPROC` cap in the sandbox silently killed every
+`--emit=crate` and `--recover` run while letting trivial ones through — MLIR
+grows a verifier thread pool, and `RLIMIT_NPROC` is per-UID rather than
+per-process. A test that only compiled `hello.c` would have passed. Process
+count is now bounded by `TasksMax=` in the systemd unit, which is the correct
+mechanism.
 
 ## Configuration
 
@@ -86,6 +103,7 @@ Everything is read once, in `config.py`. Nothing else touches `os.environ`.
 | `EMITRUST_TIMEOUT` | `20` | seconds per compile |
 | `EMITRUST_CONCURRENCY` | `4` | concurrent live compiles. Each invocation is itself multi-threaded, so this multiplies rather than adds — keep it well under core count. |
 | `EMITRUST_MAX_SOURCE` | `262144` | bytes |
+| `EMITRUST_TRUST_PROXY` | `1` | **informational only** — nothing reads it. Proxy-header trust is uvicorn's `--proxy-headers` in the systemd unit. |
 
 ## Deploying to 192.168.1.202
 
@@ -153,18 +171,43 @@ examples compiling — including that the rejection example really does produce
 a located `file:line:col` diagnostic and that `--recover` really does leave the
 other functions intact.
 
+Verified through the real ASGI app (`nix develop -c python3 -m pytest
+web/tests`, 72 tests, all passing):
+
+- **The free/paid boundary**, case by case — cache hit served anonymously with
+  the meter never consulted; miss with no credential 401; miss with an invalid
+  credential 401 (not 500); miss with a verified identity spends exactly one
+  unit; exhaustion 429 while cached results keep working for that same user;
+  and, with no `GOOGLE_CLIENT_ID`, 503 rather than a "sign in" that cannot
+  work. Every rejection body is asserted verbatim.
+- **The claim that a paid compile makes a result free for everyone** — a live
+  compile through the real `emitrust-cc`, then the same source requested with
+  no `Authorization` header at all, served from the cache with the compiler
+  patched to fail loudly if it ran.
+- **The refund policy** — a crash or a timeout hands the unit back and is not
+  cached; an unsupported program does not, because a located rejection is the
+  answer the user asked for, and it is cached so the next visitor gets it free.
+  A failed cache write does not cost the user their answer as well as the
+  deposit.
+- **Routing** — the `StaticFiles` mount at `/` does not shadow `/api/*`, and
+  `/`, `/playground` and the assets still serve.
+- **Startup** — a missing compiler, a compiler that raises, and an unwritable
+  state directory each degrade the service to "cached results only" instead of
+  preventing boot.
+- **`auth.verify` against the real google-auth**, including that a malformed
+  credential is rejected without an outbound request, that a Google outage is
+  503 rather than 401 or 500, and that the `google-auth[requests]` extra is
+  actually installed.
+
 Not verified:
 
-- **The FastAPI layer itself** — routing, status codes, and the auth gate end
-  to end. `fastapi` could not be installed on the development host, so
-  `main.py` has never been executed. The free/paid branch in `/api/compile` is
-  the most important logic in the service and it is currently reasoned about,
-  not tested. `httpx.ASGITransport` tests are the obvious next step and should
-  come before this is exposed publicly.
 - **The frontend at runtime.** `app.js` passes `node --check` and every
   element id it looks up exists in `playground.html`, but no browser has run
   it. The Google sign-in flow in particular has never executed against a real
-  client id.
+  client id — the ID-token path is exercised only against forged and malformed
+  tokens, never a genuine one.
+- **Concurrency.** `MAX_CONCURRENT_COMPILES` and the trial meter's
+  single-writer lock are argued, not measured under load.
 
 Known gaps, by design or by deferral:
 

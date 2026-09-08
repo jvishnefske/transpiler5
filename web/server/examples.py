@@ -206,18 +206,22 @@ async def warm_cache(cache: cache_mod.ResultCache) -> tuple[int, int]:
             continue
         try:
             result = await compiler.compile_source(source, options)
+            # A non-zero exit is a legitimate cached answer for the two
+            # examples that exist to SHOW a rejection; only a timeout is not
+            # durable.
+            if result.exit_code == 124:
+                log.warning("example %s timed out during warm", ex.slug)
+                failed += 1
+                continue
+            # Inside the try on purpose: an unwritable state directory is a
+            # plausible first-boot mistake, and it must degrade the service to
+            # "no warm examples" rather than stop it from starting at all.
+            cache.put(key, result.to_json())
         except Exception as exc:  # pragma: no cover - startup robustness
             log.warning("example %s failed to warm: %s", ex.slug, exc)
             failed += 1
             continue
 
-        # A non-zero exit is a legitimate cached answer for the two examples
-        # that exist to SHOW a rejection; only a timeout is not durable.
-        if result.exit_code == 124:
-            log.warning("example %s timed out during warm", ex.slug)
-            failed += 1
-            continue
-        cache.put(key, result.to_json())
         warmed += 1
         await asyncio.sleep(0)
     return (warmed, failed)

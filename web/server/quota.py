@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -118,7 +118,16 @@ class TrialStore:
             return self._allowance(row)
 
     def spend(self, subject: str, email: str | None = None) -> Allowance:
-        """Consume one unit if available. The returned allowance is post-spend.
+        """Consume one unit if available.
+
+        `allowed` answers "did THIS request get its unit?", and the counters
+        are post-spend. Those two are not the same question, and conflating
+        them cost a user their last unit every day: recomputing the
+        "is there budget left" predicate AFTER the decrement reports the final
+        unit of the allowance as a refusal -- so the caller was charged and
+        then handed a 429 for the compile it had just paid for. The daily
+        limit was effectively N-1 with the Nth unit silently burned. Use
+        check() to ask whether a FUTURE spend would be allowed.
 
         Check and decrement happen under one lock so two concurrent requests
         cannot both pass on the last remaining unit.
@@ -139,7 +148,7 @@ class TrialStore:
             row = self._conn.execute(
                 "SELECT * FROM trial WHERE subject = ?", (subject,)
             ).fetchone()
-            return self._allowance(row)
+            return replace(self._allowance(row), allowed=True, reason=None)
 
     def refund(self, subject: str) -> None:
         """Return a unit spent on a compile that failed for OUR reasons.
